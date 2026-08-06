@@ -1,0 +1,57 @@
+{
+  "name": "billion-context",
+  "version": "0.1.0",
+  "description": "Universal context-compression proxy for AI coding agents. Sits between any agent and its model API, rewriting Anthropic/OpenAI streams with acp-kernel compression. Any agent that can set a base URL (Claude Code, Codex, Cursor, Aider) works out of the box.",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "bili-proxy": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit --project tsconfig.build.json",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "start": "node dist/index.js"
+  },
+  "keywords": [
+    "context",
+    "compression",
+    "proxy",
+    "acp",
+    "ai",
+    "agent",
+    "claude-code",
+    "cursor",
+    "codex",
+    "aider",
+    "anthropic",
+    "openai"
+  ],
+  "license": "MIT",
+  "author": "ranxianglei",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ranxianglei/billion-context.git"
+  },
+  "homepage": "https://github.com/ranxianglei/billion-context#readme",
+  "bugs": {
+    "url": "https://github.com/ranxianglei/billion-context/issues"
+  },
+  "dependencies": {
+    "acp-kernel": "0.0.16"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsup": "^8.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ]
+}

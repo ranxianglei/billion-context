@@ -1,0 +1,6 @@
+data: {"id":"20260805130314dc9b3fb152004c86","created":1785906194,"object":"chat.completion.chunk","model":"glm-5.2","choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_09ba73f6ae4b4eab87dbda86","index":0,"type":"function","function":{"name":"bash","arguments":"{\"command\":\"echo capture-test\",\"description\":\"Print capture-test to stdout\"}"}}]}}]}
+
+data: {"id":"20260805130314dc9b3fb152004c86","created":1785906194,"object":"chat.completion.chunk","model":"glm-5.2","choices":[{"index":0,"finish_reason":"tool_calls","delta":{"role":"assistant","content":""}}],"usage":{"prompt_tokens":5330,"completion_tokens":23,"total_tokens":5353,"prompt_tokens_details":{"cached_tokens":5248},"completion_tokens_details":{"reasoning_tokens":0}}}
+
+data: [DONE]
+
