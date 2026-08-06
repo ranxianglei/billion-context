@@ -1,4 +1,5 @@
 import type { CoreMessage } from "acp-kernel";
+import { hashId } from "./util.js";
 
 export type AnthropicTextBlock = { type: "text"; text: string; cache_control?: unknown };
 export type AnthropicToolUse = {
@@ -190,7 +191,7 @@ export function deriveSessionId(body: AnthropicRequestBody, headerValue?: string
     if (headerValue && headerValue.trim()) return headerValue.trim();
     const firstUser = body.messages.find((m) => m.role === "user");
     const seed = firstUser ? JSON.stringify(firstUser.content).slice(0, 200) : "default";
-    return hash(seed);
+    return hashId(seed);
 }
 
 function safeStringify(v: unknown): string {
@@ -208,13 +209,4 @@ function safeParse(s: string | undefined): unknown {
     } catch {
         return {};
     }
-}
-
-function hash(s: string): string {
-    let h = 2166136261;
-    for (let i = 0; i < s.length; i++) {
-        h ^= s.charCodeAt(i);
-        h = Math.imul(h, 16777619);
-    }
-    return (h >>> 0).toString(36);
 }

@@ -1,5 +1,6 @@
 import type { CoreMessage } from "acp-kernel";
 import { condenseOldToolResults, type CondenseOptions, type CondenseResult } from "./anthropic.js";
+import { hashId } from "./util.js";
 
 export type OpenAIContentPart =
     | { type: "text"; text: string }
@@ -131,13 +132,6 @@ export function coreToOpenai(messages: CoreMessage[]): OpenAIMessage[] {
     return out;
 }
 
-export function extractOpenaiSystem(messages: OpenAIMessage[]): string {
-    return messages
-        .filter((m) => m.role === "system" || m.role === "developer")
-        .map((m) => stringContent(m.content))
-        .join("\n\n");
-}
-
 export function injectOpenaiSystem(messages: OpenAIMessage[], parts: string[]): OpenAIMessage[] {
     if (parts.length === 0) return messages;
     const extra = parts.join("\n\n");
@@ -152,34 +146,11 @@ export function injectOpenaiSystem(messages: OpenAIMessage[], parts: string[]): 
 
 export { condenseOldToolResults, type CondenseOptions, type CondenseResult };
 
-export function validateToolPairing(messages: OpenAIMessage[]): { ok: boolean; details: string[] } {
-    const callIds = new Set<string>();
-    const resultIds = new Set<string>();
-    for (const m of messages) {
-        if (m.role === "assistant" && Array.isArray(m.tool_calls)) {
-            for (const tc of m.tool_calls) {
-                if (tc.id) callIds.add(tc.id);
-            }
-        }
-        if (m.role === "tool" && m.tool_call_id) {
-            resultIds.add(m.tool_call_id);
-        }
-    }
-    const details: string[] = [];
-    for (const id of callIds) {
-        if (!resultIds.has(id)) details.push(`orphan tool_call ${id} (no result)`);
-    }
-    for (const id of resultIds) {
-        if (!callIds.has(id)) details.push(`orphan tool_result ${id} (no call)`);
-    }
-    return { ok: details.length === 0, details };
-}
-
 export function deriveSessionIdOpenai(body: OpenAIRequestBody, headerValue?: string): string {
     if (headerValue && headerValue.trim()) return headerValue.trim();
     const firstUser = body.messages.find((m) => m.role === "user");
     const seed = firstUser ? stringContent(firstUser.content).slice(0, 200) : "default";
-    return hash(seed);
+    return hashId(seed);
 }
 
 function stringContent(content: OpenAIMessage["content"]): string {
@@ -191,13 +162,4 @@ function stringContent(content: OpenAIMessage["content"]): string {
             .join("\n");
     }
     return "";
-}
-
-function hash(s: string): string {
-    let h = 2166136261;
-    for (let i = 0; i < s.length; i++) {
-        h ^= s.charCodeAt(i);
-        h = Math.imul(h, 16777619);
-    }
-    return (h >>> 0).toString(36);
 }
