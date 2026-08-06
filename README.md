@@ -38,14 +38,20 @@ npm install -g billion-context
 
 ## Usage
 
-Start the proxy (defaults to port 8787, upstream inferred from your API key):
+### Single provider
+
+Start the proxy pointing at one upstream (simplest):
 
 ```bash
-bili-proxy
-# or: billion-context
+UPSTREAM=https://api.anthropic.com bili-proxy
 ```
 
-Point your agent at the proxy.
+Then point your agent at the proxy.
+
+### Multiple providers (recommended)
+
+See [Configuration](#configuration) below for how to route to multiple
+providers by URL path — most users will want this.
 
 ### Claude Code
 
@@ -75,25 +81,70 @@ All config is via environment variables:
 |----------|---------|-------------|
 | `PORT` | `8787` | Proxy listen port |
 | `HOST` | `127.0.0.1` | Proxy listen host |
-| `UPSTREAM` | *(from API key)* | Upstream model API URL |
-| `MODEL_CONTEXT_LIMIT` | `200000` | Context window for compression triggering |
-| `ACP_DEBUG` | `0` | Set `1` to enable debug logging |
-| `ACP_LOG_FILE` | `stderr` | Log file path |
-| `ACP_PASSTHROUGH` | `0` | Set `1` to forward without compression (for debugging) |
+| `UPSTREAM` | `https://api.anthropic.com` | Default upstream when no route matches |
+| `ACP_PROVIDERS` | *(none)* | Path to a JSON file mapping provider names to root URLs (see below) |
+| `ACP_COMPRESS_TOOL` | `1` | Set `0` to disable injecting the compress tool |
+| `ACP_DEBUG` | `0` | Set `1` for verbose logging |
+| `ACP_PASSTHROUGH` | `0` | Set `1` to forward without compression |
 
-### Multiple upstreams
+### Multiple upstreams (URL path routing)
 
-Route to different providers by API key:
+Point any agent at the proxy using a provider name as a path segment. The
+proxy strips the name and forwards to that provider's root URL. **API keys
+are never stored in the proxy** — whatever key the agent sends is passed
+through untouched to the upstream.
 
-```bash
-ACP_ROUTES='{"sk-ant-key1":{"upstream":"https://api.anthropic.com","apiKey":"real-key"},"sk-openai-key2":{"upstream":"https://api.openai.com","apiKey":"real-key2"}}'
+Create a providers file (e.g. `~/.bili/providers.json`):
+
+```json
+{
+  "glm": "https://bigmodel.cn",
+  "anthropic": "https://api.anthropic.com",
+  "openai": "https://api.openai.com",
+  "deepseek": "https://api.deepseek.com"
+}
 ```
 
-The agent authenticates with the route key; the proxy swaps in the real key and forwards to that route's upstream.
+Then:
+
+```bash
+ACP_PROVIDERS=~/.bili/providers.json bili-proxy
+```
+
+Each agent only needs to change its base URL to include the provider name.
+The proxy figures out the rest, including the right context window for each
+model family (claude=200k, gpt-4o=128k, glm=128k, ...) via a built-in table.
+
+#### Claude Code (Anthropic)
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:8787/anthropic
+export ANTHROPIC_API_KEY=sk-ant-...   # real key — passed through as-is
+claude
+```
+
+#### Codex / any OpenAI-compatible agent (zhipu / openai / deepseek)
+
+```bash
+export OPENAI_BASE_URL=http://localhost:8787/v1/glm
+export OPENAI_API_KEY=<your real glm key>   # passed through as-is
+codex
+```
+
+The `/v1/glm` prefix tells the proxy to route to the `glm` provider; the
+remaining `/v1/chat/completions` path is preserved. Set the key to the real
+provider key — the proxy never reads or stores it.
+
+### Notes on provider names
+
+- Must start with a letter, contain only letters/digits/`-`/`_`.
+- Reserved words (`v1`, `chat`, `completions`, `messages`, `models`, `api`)
+  are rejected to avoid colliding with real API path segments.
+- The provider name can appear anywhere in the path; the longest match wins.
 
 ## Status
 
-Early. Protocol handling and compression work against mock tests (67 passing). Real-model integration testing is the next milestone. Expect rough edges.
+Early. Protocol handling and compression work against mock tests (79 passing). Real-model integration testing is the next milestone. Expect rough edges.
 
 See [billion-context-pi](https://github.com/ranxianglei/billion-context-pi) for the pi-extension mode (in-process, tighter integration, the reference implementation).
 

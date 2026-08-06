@@ -2,6 +2,7 @@ import http from "node:http";
 import fs from "node:fs";
 import { createCore, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, estimateTokensFast, renderNudgeText } from "acp-kernel";
 import type { ProxyOptions } from "./config.js";
+import { lookupContextLimit } from "./config.js";
 import {
     anthropicToCore,
     coreToAnthropic,
@@ -32,12 +33,32 @@ const UPSTREAM_HOP_HEADERS = new Set([
     "transfer-encoding",
 ]);
 
-function resolveUpstream(opts: ProxyOptions, authHeader: string | undefined): string | undefined {
-    if (!opts.routes.length || !authHeader) return undefined;
-    const token = authHeader.replace(/^Bearer\s+/i, "").trim();
-    if (!token) return undefined;
-    const match = opts.routes.find((r) => r.apiKey && r.apiKey === token);
-    return match?.baseURL.replace(/\/$/, "");
+export function resolveUpstream(opts: ProxyOptions, reqUrl: string): { upstream: string; rewrittenUrl: string; provider: string } | undefined {
+    const names = Object.keys(opts.routes);
+    if (names.length === 0) return undefined;
+    // Provider names that coincide with common API path segments are rejected
+    // so they can't swallow real segments. If a user really names a route
+    // "chat" or "v1" they'd collide with every request, so we treat those as
+    // configuration errors and skip them.
+    const RESERVED = new Set(["v1", "v2", "v4", "chat", "completions", "messages", "models", "api"]);
+    // Match a provider name as a standalone path segment anywhere in the URL.
+    // Examples: /v1/glm/chat/completions → glm; /anthropic/v1/messages → anthropic.
+    // Names are sorted longest-first so a name like "openai" can't be shadowed
+    // by a shorter segment it contains.
+    const sorted = [...names].sort((a, b) => b.length - a.length);
+    const segments = reqUrl.split("/");
+    for (const name of sorted) {
+        if (!/^[A-Za-z][A-Za-z0-9_-]*$/.test(name)) continue;
+        if (RESERVED.has(name.toLowerCase())) continue;
+        const idx = segments.indexOf(name);
+        if (idx < 0) continue;
+        const base = opts.routes[name].replace(/\/$/, "");
+        // Drop the single provider-name segment, keep the rest.
+        const rest = [...segments.slice(0, idx), ...segments.slice(idx + 1)].join("/");
+        const rewrittenUrl = base + rest;
+        return { upstream: base, rewrittenUrl, provider: name };
+    }
+    return undefined;
 }
 
 export function startServer(opts: ProxyOptions): http.Server {
@@ -58,7 +79,15 @@ export function startServer(opts: ProxyOptions): http.Server {
         }
     });
     server.listen(opts.port, opts.host, () => {
-        log("info", `acp-proxy listening on http://${opts.host}:${opts.port} → ${opts.upstream}`);
+        log(
+            "info",
+            `acp-proxy listening on http://${opts.host}:${opts.port}` +
+                (Object.keys(opts.routes).length
+                    ? ` — routes: ${Object.entries(opts.routes)
+                          .map(([n, u]) => `${n}=${u}`)
+                          .join(", ")}`
+                    : ` → ${opts.upstream}`),
+        );
     });
     return server;
 }
@@ -96,15 +125,28 @@ async function handle(
                   ? "anthropic"
                   : null
             : null;
+    // Per-request context limit: look up body.model in the built-in table.
+    // Lets the proxy run with the right window per model without asking the
+    // user to configure one. Falls back to the global default.
+    let reqConfig = config;
+    if (protocol && bodyBuffer.length > 0) {
+        const m = bodyBuffer.toString("utf8").match(/"model"\s*:\s*"([^"]+)"/);
+        if (m) {
+            const limit = lookupContextLimit(m[1]);
+            if (limit && limit !== config.modelContextLimit) {
+                reqConfig = { ...config, modelContextLimit: limit };
+            }
+        }
+    }
     const prepared = opts.passthrough
         ? null
         : protocol === "anthropic"
-            ? prepareAnthropic(bodyBuffer, req, opts, core, config, log)
+            ? prepareAnthropic(bodyBuffer, req, opts, core, reqConfig, log)
             : protocol === "openai"
-              ? prepareOpenai(bodyBuffer, req, opts, core, config, log)
+              ? prepareOpenai(bodyBuffer, req, opts, core, reqConfig, log)
               : null;
     const outBody: Buffer | string = prepared ? prepared.body : bodyBuffer;
-    await forward(req, res, opts, outBody, prepared, core, config, log);
+    await forward(req, res, opts, outBody, prepared, core, reqConfig, log);
 }
 
 const ACP_TAG_RE = /^\x3cacp [^>]*\x3e[^\x3c]*\x3c\/acp\x3e\n?/;
@@ -258,9 +300,9 @@ async function forward(
     config: Config,
     log: (level: string, msg: string) => void,
 ): Promise<void> {
-    const base = resolveUpstream(opts, req.headers.authorization) ?? opts.upstream;
-    const upstreamUrl = base + (req.url ?? "");
-    log("info", `forward ${req.method} ${req.url ?? ""} → ${upstreamUrl}`);
+    const route = resolveUpstream(opts, req.url ?? "");
+    const upstreamUrl = route ? route.rewrittenUrl : opts.upstream + (req.url ?? "");
+    log("info", `forward ${req.method} ${req.url ?? ""} → ${upstreamUrl}${route ? ` (${route.provider})` : ""}`);
     if (opts.debug && typeof body === "string") {
         try {
             const parsed = JSON.parse(body);
@@ -279,7 +321,7 @@ async function forward(
         if (UPSTREAM_HOP_HEADERS.has(k.toLowerCase()) || v === undefined) continue;
         headers[k] = Array.isArray(v) ? v.join(", ") : v;
     }
-    headers["host"] = new URL(base).host;
+    headers["host"] = new URL(route ? route.upstream : opts.upstream).host;
     const init: RequestInit = {
         method: req.method ?? "GET",
         headers,
