@@ -187,9 +187,20 @@ function prepareAnthropic(
         processedMessages = turn.messages;
         rebuiltMessages = coreToAnthropic(turn.messages);
 
-        systemOut = injectSystem(parsed, turn.nudge, opts);
+        systemOut = injectSystem(parsed, opts);
         if (opts.compress.injectTool) {
             toolsOut = injectTool(parsed.tools);
+        }
+        // Nudge as a separate trailing user message (cache-friendly): the
+        // system block stays byte-stable so the prefix cache survives.
+        if (turn.nudge?.shouldInject) {
+            try {
+                const rendered = renderNudgeText(turn.nudge);
+                if (rendered.text) {
+                    rebuiltMessages = [...rebuiltMessages, { role: "user", content: rendered.text }];
+                }
+            } catch {
+            }
         }
     } catch (err) {
         log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
@@ -231,18 +242,27 @@ function prepareOpenai(
         processedMessages = turn.messages;
         rebuiltMessages = coreToOpenai(turn.messages);
 
+        // ONLY the static compress prompt goes into the system message — the
+        // system prompt is the prefix-cache anchor and must be byte-stable
+        // across turns. The nudge (which changes every turn: token count,
+        // growth %, dynamic example) is appended as a trailing user message
+        // instead, mirroring pai-acp's design. Putting the nudge in system
+        // would invalidate the cache every turn.
         const sysParts: string[] = [];
         if (shouldInject) sysParts.push(buildCompressSystemPrompt());
-        if (turn.nudge?.shouldInject && shouldInject) {
-            try {
-                const rendered = renderNudgeText(turn.nudge);
-                if (rendered.text) sysParts.push(rendered.text);
-            } catch {
-            }
-        }
         rebuiltMessages = injectOpenaiSystem(rebuiltMessages, sysParts);
         if (shouldInject) {
             toolsOut = injectOpenaiTool(parsed.tools);
+        }
+        // Nudge as a separate trailing user message (cache-friendly).
+        if (turn.nudge?.shouldInject && shouldInject) {
+            try {
+                const rendered = renderNudgeText(turn.nudge);
+                if (rendered.text) {
+                    rebuiltMessages = [...rebuiltMessages, { role: "user", content: rendered.text }];
+                }
+            } catch {
+            }
         }
     } catch (err) {
         log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
@@ -255,19 +275,15 @@ function prepareOpenai(
 
 function injectSystem(
     parsed: AnthropicRequestBody,
-    nudge: NudgeDecision | undefined,
     opts: ProxyOptions,
 ): string | AnthropicRequestBody["system"] {
+    // ONLY the static compress prompt goes into the system block — it is the
+    // prefix-cache anchor and must stay byte-stable across turns. The nudge
+    // (which changes every turn) is appended as a trailing user message by
+    // the caller (prepareAnthropic), never merged into system.
     const baseText = extractSystem(parsed.system);
     const parts: string[] = [];
     if (opts.compress.injectTool) parts.push(buildCompressSystemPrompt());
-    if (nudge?.shouldInject) {
-        try {
-            const rendered = renderNudgeText(nudge);
-            if (rendered.text) parts.push(rendered.text);
-        } catch {
-        }
-    }
     if (parts.length === 0) return parsed.system;
     const full = baseText ? `${baseText}\n\n---\n\n${parts.join("\n\n")}` : parts.join("\n\n");
     return buildSystem(full, parsed.system);
