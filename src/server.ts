@@ -16,6 +16,8 @@ import {
     coreToOpenai,
     injectOpenaiSystem,
     deriveSessionIdOpenai,
+    condenseOldToolResults,
+    type CondenseOptions,
     type OpenAIRequestBody,
     type OpenAITool,
 } from "./openai.js";
@@ -101,6 +103,31 @@ type Prepared = {
     compressInjected: boolean;
 };
 
+/**
+ * Apply condense to the kernel-processed messages and record stats on the
+ * session. Previously `opts.condense` and `condenseOldToolResults` were wired
+ * into config but never invoked — leaving a whole feature as dead code. This
+ * is the single integration point for both protocols.
+ */
+function applyCondense(
+    messages: CoreMessage[],
+    opts: ProxyOptions,
+    session: Session,
+): CoreMessage[] {
+    const condenseOpts: CondenseOptions = {
+        enabled: opts.condense.enabled,
+        keepRecent: opts.condense.keepRecentToolResults,
+        minChars: opts.condense.minCharsToCondense,
+        maxKeptChars: opts.condense.maxKeptChars,
+    };
+    const { messages: out, condensedCount, charsSaved } = condenseOldToolResults(messages, condenseOpts);
+    if (condensedCount > 0) {
+        session.condensedToolResults += condensedCount;
+        session.tokensSaved += Math.ceil(charsSaved / 4);
+    }
+    return out;
+}
+
 async function handle(
     req: http.IncomingMessage,
     res: http.ServerResponse,
@@ -184,8 +211,8 @@ function prepareAnthropic(
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount });
         session.state = turn.state;
         stripToolTags(turn.messages);
-        processedMessages = turn.messages;
-        rebuiltMessages = coreToAnthropic(turn.messages);
+        processedMessages = applyCondense(turn.messages, opts, session);
+        rebuiltMessages = coreToAnthropic(processedMessages);
 
         systemOut = injectSystem(parsed, opts);
         if (opts.compress.injectTool) {
@@ -239,8 +266,8 @@ function prepareOpenai(
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount });
         session.state = turn.state;
         stripToolTags(turn.messages);
-        processedMessages = turn.messages;
-        rebuiltMessages = coreToOpenai(turn.messages);
+        processedMessages = applyCondense(turn.messages, opts, session);
+        rebuiltMessages = coreToOpenai(processedMessages);
 
         // ONLY the static compress prompt goes into the system message — the
         // system prompt is the prefix-cache anchor and must be byte-stable
@@ -354,10 +381,16 @@ async function forward(
         res.end();
         return;
     }
+    // We only rewrite when THIS request actually had the compress tool
+    // injected (per-request). For the OpenAI title-gen path
+    // (`compressInjected === false`) we must NOT route the stream into a
+    // rewriter — `rewriteSseStream` below is the *Anthropic* SSE rewriter
+    // and would mishandle OpenAI `choices[].delta` events. Plain passthrough
+    // is correct there.
     const useRewriter =
         prepared !== null &&
-        prepared.processedMessages.length > 0 &&
-        opts.compress.injectTool;
+        prepared.compressInjected &&
+        prepared.processedMessages.length > 0;
     if (!useRewriter || prepared === null) {
         await pipeThrough(upstream.body, res);
         return;
@@ -378,15 +411,7 @@ async function forward(
             streamToRead = a;
             dumpRaw = dumpStreamToFile(b, opts.dumpSse, `${Date.now()}-${prepared.session.id}-raw.sse`);
         }
-        const ctx: RewriteCtx = {
-            core,
-            config,
-            messages: prepared.processedMessages,
-            session: prepared.session,
-            log: (msg: string) => log("info", `[${prepared.session.id}] ${msg}`),
-            debug: opts.debug,
-        };
-        if (prepared.protocol === "openai" && prepared.compressInjected) {
+        if (prepared.protocol === "openai") {
             const parsedReq = JSON.parse(typeof body === "string" ? body : body.toString("utf8"));
             const reqHeaders: Record<string, string> = {};
             for (const [k, v] of Object.entries(headers)) {
