@@ -234,6 +234,35 @@ export const COMPRESS_TOOL_RESPONSES = {
     parameters: COMPRESS_TOOL_OPENAI.function.parameters,
 };
 
+export const DECOMPRESS_TOOL_RESPONSES = {
+    type: "function" as const,
+    name: DECOMPRESS_TOOL_OPENAI.function.name,
+    description: DECOMPRESS_TOOL_OPENAI.function.description,
+    parameters: DECOMPRESS_TOOL_OPENAI.function.parameters,
+};
+
+export const SEARCH_CONTEXT_TOOL_RESPONSES = {
+    type: "function" as const,
+    name: SEARCH_CONTEXT_TOOL_OPENAI.function.name,
+    description: SEARCH_CONTEXT_TOOL_OPENAI.function.description,
+    parameters: SEARCH_CONTEXT_TOOL_OPENAI.function.parameters,
+};
+
+export const ACP_STATUS_TOOL_RESPONSES = {
+    type: "function" as const,
+    name: ACP_STATUS_TOOL_OPENAI.function.name,
+    description: ACP_STATUS_TOOL_OPENAI.function.description,
+    parameters: ACP_STATUS_TOOL_OPENAI.function.parameters,
+};
+
+/** All ACP tools in Responses API flat format, matching PROXY_TOOL_NAMES. */
+export const ACP_TOOLS_RESPONSES = [
+    COMPRESS_TOOL_RESPONSES,
+    DECOMPRESS_TOOL_RESPONSES,
+    SEARCH_CONTEXT_TOOL_RESPONSES,
+    ACP_STATUS_TOOL_RESPONSES,
+] as const;
+
 export const PROXY_TOOL_NAMES: ReadonlySet<string> = new Set([
     COMPRESS_TOOL_NAME,
     DECOMPRESS_TOOL_NAME,

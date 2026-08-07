@@ -31,7 +31,7 @@ import {
     deriveSessionIdResponses,
 } from "./responses.js";
 import { getSession, listSessions, type Session } from "./session.js";
-import { COMPRESS_TOOL, COMPRESS_TOOL_RESPONSES, ACP_TOOLS_OPENAI, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressTextSystemPrompt } from "./compress-tool.js";
+import { COMPRESS_TOOL, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressTextSystemPrompt } from "./compress-tool.js";
 import { rewriteSseStream, rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { compressLoopStream } from "./compress-loop.js";
 import { compressLoopResponsesStream } from "./compress-loop-responses.js";
@@ -438,15 +438,18 @@ function injectOpenaiTool(tools: OpenAITool[] | undefined): OpenAITool[] {
  *  In text mode we keep `tools` untouched (undefined) so code_mode stays
  *  active, and detect the trigger in the output_text stream instead. */
 const TEXT_PROTOCOL = process.env.ACP_COMPRESS_PROTOCOL === "text";
+/** Inject all ACP tools (compress/decompress/search_context/acp_status) in
+ *  Responses API flat format, matching the PROXY_TOOL_NAMES set the compress
+ *  loop dispatches on. Idempotent. */
 function injectResponsesTool(tools: unknown[] | undefined): unknown[] {
-    if (!Array.isArray(tools)) return [COMPRESS_TOOL_RESPONSES];
+    if (!Array.isArray(tools)) return [...ACP_TOOLS_RESPONSES];
     const present = new Set(
         tools
             .map((t) => (t as { name?: string })?.name)
             .filter((n): n is string => typeof n === "string"),
     );
-    if (present.has(COMPRESS_TOOL_NAME)) return tools;
-    return [...tools, COMPRESS_TOOL_RESPONSES];
+    const additions = ACP_TOOLS_RESPONSES.filter((t) => !present.has(t.name));
+    return [...tools, ...additions];
 }
 
 async function forward(
