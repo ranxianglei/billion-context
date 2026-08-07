@@ -3,6 +3,7 @@ import fs from "node:fs";
 import { createCore, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, estimateTokensFast, renderNudgeText } from "acp-kernel";
 import type { ProxyOptions } from "./config.js";
 import { lookupContextLimit } from "./config.js";
+import { fetchWithTimeout, MAX_REQUEST_BYTES } from "./fetch-util.js";
 import {
     anthropicToCore,
     coreToAnthropic,
@@ -81,10 +82,12 @@ export function startServer(opts: ProxyOptions): http.Server {
         try {
             await handle(req, res, opts, core, config, log);
         } catch (err) {
-            log("error", String(err));
+            const msg = String(err);
+            log("error", msg);
             if (!res.headersSent) {
-                res.writeHead(502, { "content-type": "application/json" });
-                res.end(JSON.stringify({ error: "acp-proxy failure", detail: String(err) }));
+                const status = msg.includes("exceeds") ? 413 : 502;
+                res.writeHead(status, { "content-type": "application/json" });
+                res.end(JSON.stringify({ error: "acp-proxy failure", detail: msg }));
             } else {
                 res.end();
             }
@@ -485,7 +488,7 @@ async function forward(
         headers,
         body: req.method === "GET" || req.method === "HEAD" ? undefined : body,
     };
-    const upstream = await fetch(upstreamUrl, init);
+    const upstream = await fetchWithTimeout(upstreamUrl, init);
     const respHeaders: Record<string, string> = {};
     upstream.headers.forEach((v, k) => {
         if (UPSTREAM_HOP_HEADERS.has(k.toLowerCase())) return;
@@ -666,9 +669,21 @@ function headerValue(req: http.IncomingMessage, name: string): string | undefine
 function readBody(req: http.IncomingMessage): Promise<Buffer> {
     return new Promise((resolve, reject) => {
         const chunks: Buffer[] = [];
-        req.on("data", (c: Buffer) => chunks.push(c));
-        req.on("end", () => resolve(Buffer.concat(chunks)));
-        req.on("error", reject);
+        let size = 0;
+        let aborted = false;
+        req.on("data", (c: Buffer) => {
+            if (aborted) return;
+            size += c.length;
+            if (size > MAX_REQUEST_BYTES) {
+                aborted = true;
+                reject(new Error(`request body exceeds ${MAX_REQUEST_BYTES} bytes`));
+                req.destroy();
+                return;
+            }
+            chunks.push(c);
+        });
+        req.on("end", () => { if (!aborted) resolve(Buffer.concat(chunks)); });
+        req.on("error", (e) => { if (!aborted) reject(e); });
     });
 }
 

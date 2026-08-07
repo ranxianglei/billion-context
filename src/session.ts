@@ -10,6 +10,16 @@ export type Session = {
     tokensSaved: number;
 };
 
+// KNOWN LIMITATION: sessions live in process memory. A proxy restart (deploy /
+// crash) drops all compression state — clients then re-send full history and
+// compression rebuilds from scratch (correct, but wasteful). Multi-instance
+// deployments do NOT share state either.
+// TODO: persist state to disk (atomic temp+rename) on a debounce and reload on
+// boot, keyed by session id. Requires verifying CompressionState is fully
+// JSON-serializable (no Maps/Sets that lose on round-trip).
+// Session id defaults to a hash of the first user message (deriveSessionId*),
+// so two clients with the same opener collide into one state. Multi-tenant
+// deployments MUST send an explicit x-acp-session header to partition.
 const sessions = new Map<string, Session>();
 
 const MAX_SESSIONS = 256;

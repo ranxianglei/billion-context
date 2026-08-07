@@ -43,14 +43,20 @@ export type ParsedRange = {
 };
 
 export function parseCompressInput(input: unknown): ParsedRange[] {
-    if (!input || typeof input !== "object") return [];
+    if (!input || typeof input !== "object") {
+        console.error(`[acp-compress-input] rejected: not object (${typeof input})`);
+        return [];
+    }
     const obj = input as Record<string, unknown>;
     if (Array.isArray(obj.content)) {
-        return obj.content
+        const out = obj.content
             .map((r) => toRange(r as Record<string, unknown>))
             .filter((r): r is ParsedRange => r !== null);
+        if (out.length === 0) console.error(`[acp-compress-input] content array but 0 valid ranges. keys per item: ${obj.content.map((c) => Object.keys(c ?? {}).join(",")).join(" | ")}`);
+        return out;
     }
     const single = toRange(obj);
+    if (!single) console.error(`[acp-compress-input] no content array, single-parse failed. top keys: ${Object.keys(obj).join(",")}`);
     return single ? [single] : [];
 }
 

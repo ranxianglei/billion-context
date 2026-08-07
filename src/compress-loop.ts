@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import type { Session } from "./session.js";
 import { parseCompressInput, PROXY_TOOL_NAMES } from "./compress-tool.js";
 import { applyRanges } from "./stream.js";
+import { fetchWithTimeout } from "./fetch-util.js";
 
 interface CompressLoopCtx {
     core: CompressionCore;
@@ -372,7 +373,7 @@ export async function* compressLoopStream(
 
         requestBody.messages = messages;
 
-        const resp = await fetch(requestOptions.url, {
+        const resp = await fetchWithTimeout(requestOptions.url, {
             method: "POST",
             headers: requestOptions.headers,
             body: JSON.stringify(requestBody),

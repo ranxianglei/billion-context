@@ -14,6 +14,7 @@ import type { Session } from "./session.js";
 import { parseCompressInput, PROXY_TOOL_NAMES, COMPRESS_TOOL_NAME, ACP_TEXT_OPEN, ACP_TEXT_CLOSE } from "./compress-tool.js";
 import { applyRanges } from "./stream.js";
 import { buildVisibilityMarker } from "./compress-loop.js";
+import { fetchWithTimeout } from "./fetch-util.js";
 
 /** Text-protocol mode: the host (OpenAI Codex code_mode) cannot coexist with
  *  a declared `tools` array, so compression is triggered by a text marker the
@@ -360,6 +361,16 @@ export async function* compressLoopResponsesStream(
                     if (d.completed) {
                         completed = true;
                         responseObj = d.responseObj ?? null;
+                        const resp = d.responseObj ?? {};
+                        const usage = (resp as Record<string, unknown>).usage as Record<string, unknown> | undefined;
+                        if (usage) {
+                            const prompt = usage.input_tokens ?? usage.prompt_tokens ?? "?";
+                            const inDet = usage.input_tokens_details as Record<string, unknown> | undefined;
+                            const prDet = usage.prompt_tokens_details as Record<string, unknown> | undefined;
+                            const cached = inDet?.cached_tokens ?? prDet?.cached_tokens ?? "?";
+                            const out = usage.output_tokens ?? "?";
+                            console.error(`[acp-usage] round ${loopCount} input=${prompt} cached=${cached} output=${out}${cached !== "?" && cached !== 0 && prompt !== "?" ? ` (cache hit ${Math.round(Number(cached) / Number(prompt) * 100)}%)` : ""}`);
+                        }
                     }
                 }
             }
@@ -428,8 +439,12 @@ export async function* compressLoopResponsesStream(
             let args: Record<string, unknown> = {};
             try {
                 args = JSON.parse(fc.arguments) as Record<string, unknown>;
-            } catch {
+            } catch (e) {
+                console.error(`[acp-compress-args] ${fc.name} JSON.parse failed: ${String(e)}. raw arguments (len=${fc.arguments.length}): ${fc.arguments.slice(0, 300)}`);
                 args = {};
+            }
+            if (fc.name === "compress") {
+                console.error(`[acp-compress-args] compress args parsed: ${JSON.stringify(args).slice(0, 400)}`);
             }
             const result = executeProxyTool(fc.name, args, ctx);
             const preview = result.length > 120 ? result.slice(0, 120) + "..." : result;
@@ -449,7 +464,7 @@ export async function* compressLoopResponsesStream(
         requestBody.input = inputItems;
         if (!("stream" in requestBody)) requestBody.stream = true;
 
-        const resp = await fetch(requestOptions.url, {
+        const resp = await fetchWithTimeout(requestOptions.url, {
             method: "POST",
             headers: requestOptions.headers,
             body: JSON.stringify(requestBody),
