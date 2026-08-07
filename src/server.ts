@@ -21,11 +21,20 @@ import {
     type OpenAIRequestBody,
     type OpenAITool,
 } from "./openai.js";
+import {
+    type ResponsesRequestBody,
+    type ResponseInputItem,
+    responsesToCore,
+    coreToResponses,
+    injectResponsesInstructions,
+    deriveSessionIdResponses,
+} from "./responses.js";
 import { getSession, listSessions, type Session } from "./session.js";
-import { COMPRESS_TOOL, ACP_TOOLS_OPENAI, COMPRESS_TOOL_NAME, buildCompressSystemPrompt } from "./compress-tool.js";
+import { COMPRESS_TOOL, COMPRESS_TOOL_RESPONSES, ACP_TOOLS_OPENAI, COMPRESS_TOOL_NAME, buildCompressSystemPrompt } from "./compress-tool.js";
 import { rewriteSseStream, rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { compressLoopStream } from "./compress-loop.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
+import { rewriteResponsesSseStream, rewriteResponsesJsonResponse } from "./stream-responses.js";
 
 const UPSTREAM_HOP_HEADERS = new Set([
     "host",
@@ -98,7 +107,7 @@ type Prepared = {
     body: string;
     session: Session;
     processedMessages: CoreMessage[];
-    protocol: "anthropic" | "openai";
+    protocol: "anthropic" | "openai" | "responses";
     stream: boolean;
     compressInjected: boolean;
 };
@@ -144,13 +153,15 @@ async function handle(
     }
     const bodyBuffer = await readBody(req);
     const url = req.url ?? "";
-    const protocol: "anthropic" | "openai" | null =
+    const protocol: "anthropic" | "openai" | "responses" | null =
         req.method === "POST" && bodyBuffer.length > 0
             ? url.endsWith("/chat/completions")
                 ? "openai"
                 : url.endsWith("/v1/messages") || url.endsWith("/messages")
                   ? "anthropic"
-                  : null
+                  : url.endsWith("/responses")
+                    ? "responses"
+                    : null
             : null;
     // Per-request context limit: look up body.model in the built-in table.
     // Lets the proxy run with the right window per model without asking the
@@ -171,7 +182,9 @@ async function handle(
             ? prepareAnthropic(bodyBuffer, req, opts, core, reqConfig, log)
             : protocol === "openai"
               ? prepareOpenai(bodyBuffer, req, opts, core, reqConfig, log)
-              : null;
+              : protocol === "responses"
+                ? prepareResponses(bodyBuffer, req, opts, core, reqConfig, log)
+                : null;
     const outBody: Buffer | string = prepared ? prepared.body : bodyBuffer;
     await forward(req, res, opts, outBody, prepared, core, reqConfig, log);
 }
@@ -304,6 +317,60 @@ function prepareOpenai(
     return { body: JSON.stringify(rebuilt), session, processedMessages, protocol: "openai", stream, compressInjected: shouldInject };
 }
 
+function prepareResponses(
+    bodyBuffer: Buffer,
+    req: http.IncomingMessage,
+    opts: ProxyOptions,
+    core: CompressionCore,
+    config: Config,
+    log: (level: string, msg: string) => void,
+): Prepared {
+    const parsed = JSON.parse(bodyBuffer.toString("utf8")) as ResponsesRequestBody;
+    const stream = parsed.stream === true;
+    const sessionId = deriveSessionIdResponses(parsed, headerValue(req, opts.sessionHeader));
+    const session = getSession(sessionId);
+    session.requests++;
+
+    let processedMessages: CoreMessage[] = [];
+    let rebuiltInput: ResponseInputItem[] | string = parsed.input;
+    let toolsOut = parsed.tools;
+
+    const shouldInject = opts.compress.injectTool;
+
+    try {
+        const { msgs, systemParts } = responsesToCore(parsed);
+        const tokenCount = estimateTokensFast(msgs.map((m) => m.text ?? "").join("\n"));
+        const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
+        session.state = turn.state;
+        log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
+        processedMessages = applyCondense(turn.messages, opts, session);
+        rebuiltInput = coreToResponses(processedMessages);
+
+        if (shouldInject) {
+            const sysParts = [...systemParts];
+            sysParts.push(buildCompressSystemPrompt());
+            const newBody = injectResponsesInstructions(parsed, sysParts);
+            parsed.instructions = newBody.instructions;
+            toolsOut = injectResponsesTool(parsed.tools);
+        }
+        if (turn.nudge?.shouldInject && shouldInject) {
+            try {
+                const rendered = renderNudgeText(turn.nudge);
+                if (rendered.text) {
+                    rebuiltInput = [...rebuiltInput, { type: "message", role: "user", content: rendered.text }];
+                }
+            } catch {
+            }
+        }
+    } catch (err) {
+        log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
+        processedMessages = [];
+    }
+
+    const rebuilt: ResponsesRequestBody = { ...parsed, input: rebuiltInput, tools: toolsOut };
+    return { body: JSON.stringify(rebuilt), session, processedMessages, protocol: "responses", stream, compressInjected: shouldInject };
+}
+
 function injectSystem(
     parsed: AnthropicRequestBody,
     opts: ProxyOptions,
@@ -335,6 +402,18 @@ function injectOpenaiTool(tools: OpenAITool[] | undefined): OpenAITool[] {
     );
     const additions = ACP_TOOLS_OPENAI.filter((t) => !present.has(t.function.name));
     return [...tools, ...(additions as OpenAITool[])];
+}
+
+/** Inject compress tool in Responses API flat format. Idempotent. */
+function injectResponsesTool(tools: unknown[] | undefined): unknown[] {
+    if (!Array.isArray(tools)) return [COMPRESS_TOOL_RESPONSES];
+    const present = new Set(
+        tools
+            .map((t) => (t as { name?: string })?.name)
+            .filter((n): n is string => typeof n === "string"),
+    );
+    if (present.has(COMPRESS_TOOL_NAME)) return tools;
+    return [...tools, COMPRESS_TOOL_RESPONSES];
 }
 
 async function forward(
@@ -438,6 +517,17 @@ async function forward(
                 }
                 if (!res.write(chunk)) await new Promise<void>((r) => res.once("drain", () => r()));
             }
+        } else if (prepared.protocol === "responses") {
+            const rewriter = rewriteResponsesSseStream(streamToRead, ctx);
+            for await (const chunk of rewriter) {
+                {
+                    const s = chunk.toString("utf8");
+                    if (s.includes("\x3cacp ") || s.includes("\x3c/acp")) {
+                        log("warn", `[${prepared.session.id}] tag echo: responses response stream contains <acp tag`);
+                    }
+                }
+                if (!res.write(chunk)) await new Promise<void>((r) => res.once("drain", () => r()));
+            }
         } else {
             const rewriter = rewriteSseStream(streamToRead, ctx);
             for await (const chunk of rewriter) {
@@ -459,6 +549,8 @@ async function forward(
             const json = JSON.parse(text);
             if (prepared.protocol === "openai") {
                 rewriteOpenaiJsonResponse(json, ctx);
+            } else if (prepared.protocol === "responses") {
+                rewriteResponsesJsonResponse(json, ctx);
             } else {
                 rewriteJsonResponse(json, ctx);
             }

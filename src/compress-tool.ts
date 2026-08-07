@@ -181,6 +181,18 @@ export const ACP_TOOLS_OPENAI = [
     ACP_STATUS_TOOL_OPENAI,
 ] as const;
 
+/**
+ * Responses API tool format: flat shape {type:"function", name, parameters},
+ * NOT the chat completions nested {function:{name,...}} form.
+ * Only the compress tool is injected for now (matches the Anthropic path).
+ */
+export const COMPRESS_TOOL_RESPONSES = {
+    type: "function" as const,
+    name: COMPRESS_TOOL_NAME,
+    description: COMPRESS_TOOL.description,
+    parameters: COMPRESS_TOOL_OPENAI.function.parameters,
+};
+
 export const PROXY_TOOL_NAMES: ReadonlySet<string> = new Set([
     COMPRESS_TOOL_NAME,
     DECOMPRESS_TOOL_NAME,
