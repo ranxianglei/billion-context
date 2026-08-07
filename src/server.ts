@@ -176,6 +176,20 @@ async function handle(
     await forward(req, res, opts, outBody, prepared, core, reqConfig, log);
 }
 
+const ACP_TAG_MARK = "\x3cacp ";
+
+function diagTagSummary(messages: CoreMessage[], sessionId: string, strategy: string): string {
+    let textTagged = 0;
+    let toolTagged = 0;
+    for (const m of messages) {
+        const hasTag = (m.text ?? "").includes(ACP_TAG_MARK);
+        if (!hasTag) continue;
+        if (m.contentType === "tool-call" || m.contentType === "tool-result") toolTagged++;
+        else textTagged++;
+    }
+    return `[${sessionId}] processTurn: ${messages.length} msgs, renderTags=${strategy}, ${textTagged} text tagged, ${toolTagged} tool tagged (should be 0 with text-only)`;
+}
+
 function prepareAnthropic(
     bodyBuffer: Buffer,
     req: http.IncomingMessage,
@@ -200,6 +214,7 @@ function prepareAnthropic(
         const tokenCount = estimateTokensFast(msgs.map((m) => m.text ?? "").join("\n"));
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
+        log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         processedMessages = applyCondense(turn.messages, opts, session);
         rebuiltMessages = coreToAnthropic(processedMessages);
 
@@ -254,6 +269,7 @@ function prepareOpenai(
         const tokenCount = estimateTokensFast(msgs.map((m) => m.text ?? "").join("\n"));
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
+        log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         processedMessages = applyCondense(turn.messages, opts, session);
         rebuiltMessages = coreToOpenai(processedMessages);
 
@@ -414,11 +430,23 @@ async function forward(
                 { url: upstreamUrl, headers: reqHeaders },
             );
             for await (const chunk of loop) {
+                {
+                    const s = chunk.toString("utf8");
+                    if (s.includes("\x3cacp ") || s.includes("\x3c/acp")) {
+                        log("warn", `[${prepared.session.id}] tag echo: openai response stream contains <acp tag`);
+                    }
+                }
                 if (!res.write(chunk)) await new Promise<void>((r) => res.once("drain", () => r()));
             }
         } else {
             const rewriter = rewriteSseStream(streamToRead, ctx);
             for await (const chunk of rewriter) {
+                {
+                    const s = chunk.toString("utf8");
+                    if (s.includes("\x3cacp ") || s.includes("\x3c/acp")) {
+                        log("warn", `[${prepared.session.id}] tag echo: anthropic response stream contains <acp tag`);
+                    }
+                }
                 if (!res.write(chunk)) await new Promise<void>((r) => res.once("drain", () => r()));
             }
         }

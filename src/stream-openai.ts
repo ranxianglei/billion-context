@@ -197,6 +197,9 @@ export function rewriteOpenaiJsonResponse(body: unknown, ctx: RewriteCtx): unkno
             }
         }
     }
+    if (existingText && (existingText.includes("\x3cacp ") || existingText.includes("\x3c/acp"))) {
+        ctx.log(`[warn: tag echo] non-stream openai output contains <acp tag: ${existingText.slice(0, 120).replace(/\n/g, " ")}`);
+    }
     if (!converted) return body;
     const note = noteParts.join("\n");
     msg.content = existingText ? `${existingText}\n${note}` : note;

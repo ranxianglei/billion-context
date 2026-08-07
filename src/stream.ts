@@ -94,6 +94,10 @@ function routeEvent(
             if (typeof partial === "string") st.json += partial;
             return NOOP;
         }
+        const dt = (d as { delta?: { text?: string } }).delta;
+        if (dt?.text && (dt.text.includes("\x3cacp ") || dt.text.includes("\x3c/acp"))) {
+            ctx.log(`[warn: tag echo] model emitted <acp tag in text delta: ${dt.text.slice(0, 120).replace(/\n/g, " ")}`);
+        }
         return emitEvent(ev);
     }
     if (t === "content_block_stop") {
@@ -230,6 +234,12 @@ export function rewriteJsonResponse(body: unknown, ctx: RewriteCtx): unknown {
     }
     b.content = newContent;
     if (converted && !sawRealToolUse) b.stop_reason = "end_turn";
+    for (const blk of newContent) {
+        const t = (blk as { type?: string; text?: string }).text;
+        if (typeof t === "string" && (t.includes("\x3cacp ") || t.includes("\x3c/acp"))) {
+            ctx.log(`[warn: tag echo] non-stream model output contains <acp tag: ${t.slice(0, 120).replace(/\n/g, " ")}`);
+        }
+    }
     return body;
 }
 
