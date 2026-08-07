@@ -14,6 +14,7 @@ import type { Session } from "./session.js";
 import { parseCompressInput, PROXY_TOOL_NAMES } from "./compress-tool.js";
 import { applyRanges } from "./stream.js";
 import { fetchWithTimeout } from "./fetch-util.js";
+import { normalizeSseLineEndings } from "./sse-util.js";
 
 interface CompressLoopCtx {
     core: CompressionCore;
@@ -230,6 +231,7 @@ export async function* compressLoopStream(
     requestOptions: RequestOptions,
 ): AsyncGenerator<Buffer> {
     let upstream = initialUpstream;
+    let activeClearTimer: (() => void) | null = null;
     const model = (requestBody.model as string) ?? "unknown";
     let responseId = `chatcmpl-proxy-${Date.now()}`;
     const makeBase = () => ({
@@ -263,6 +265,7 @@ export async function* compressLoopStream(
                 const { done, value } = await reader.read();
                 if (done) break;
                 sseBuffer += decoder.decode(value, { stream: true });
+                sseBuffer = normalizeSseLineEndings(sseBuffer);
                 let sep: number;
                 while ((sep = sseBuffer.indexOf("\n\n")) >= 0) {
                     const eventStr = sseBuffer.slice(0, sep);
@@ -308,6 +311,38 @@ export async function* compressLoopStream(
                 }
             }
             sseBuffer += decoder.decode();
+            sseBuffer = normalizeSseLineEndings(sseBuffer);
+            // Drain any events still in the residual buffer (a well-formed
+            // stream ends with \n\n, but some upstreams omit the final
+            // blank line; processing the tail avoids losing the last event).
+            let resSep: number;
+            while ((resSep = sseBuffer.indexOf("\n\n")) >= 0) {
+                const eventStr = sseBuffer.slice(0, resSep);
+                sseBuffer = sseBuffer.slice(resSep + 2);
+                if (!eventStr.trim()) continue;
+                const d = classifySseEvent(eventStr);
+                if (d.done) continue;
+                if (isFirstRound) {
+                    if (d.yieldChunk) yield d.yieldChunk;
+                } else {
+                    if (d.contentDelta) yield Buffer.from(buildContentSse(responseId, model, d.contentDelta), "utf8");
+                }
+                if (d.contentDelta) contentText += d.contentDelta;
+                if (d.finishReason) finishReason = d.finishReason;
+                if (d.usage !== undefined) usage = d.usage;
+                if (d.toolCalls) {
+                    for (const tc of d.toolCalls) {
+                        const existing = toolCallByIndex.get(tc.index);
+                        if (existing) {
+                            if (tc.name) existing.name = tc.name;
+                            if (tc.id) existing.id = tc.id;
+                            existing.arguments += tc.arguments;
+                        } else {
+                            toolCallByIndex.set(tc.index, tc);
+                        }
+                    }
+                }
+            }
         } finally {
             reader.releaseLock();
         }
@@ -373,7 +408,7 @@ export async function* compressLoopStream(
 
         requestBody.messages = messages;
 
-        const resp = await fetchWithTimeout(requestOptions.url, {
+        const { response: resp, clearTimer } = await fetchWithTimeout(requestOptions.url, {
             method: "POST",
             headers: requestOptions.headers,
             body: JSON.stringify(requestBody),
@@ -399,5 +434,6 @@ export async function* compressLoopStream(
         }
 
         upstream = resp.body as ReadableStream<Uint8Array>;
+        activeClearTimer = clearTimer;
     }
 }

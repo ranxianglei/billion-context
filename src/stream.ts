@@ -1,6 +1,7 @@
 import type { CompressionCore, Config, CoreMessage, CompressionState } from "acp-kernel";
 import type { Session } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput } from "./compress-tool.js";
+import { normalizeSseLineEndings } from "./sse-util.js";
 
 export type RewriteCtx = {
     core: CompressionCore;
@@ -38,6 +39,7 @@ export async function* rewriteSseStream(
             const { done, value } = await reader.read();
             if (done) break;
             buf += decoder.decode(value, { stream: true });
+            buf = normalizeSseLineEndings(buf);
             let idx: number;
             while ((idx = buf.indexOf("\n\n")) !== -1) {
                 const rawEvent = buf.slice(0, idx);

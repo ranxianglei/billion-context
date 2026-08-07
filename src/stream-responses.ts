@@ -2,6 +2,7 @@ import type { CompressionCore, Config, CoreMessage } from "acp-kernel";
 import type { Session } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput, ACP_TEXT_OPEN, ACP_TEXT_CLOSE } from "./compress-tool.js";
 import { applyRanges, type RewriteCtx } from "./stream.js";
+import { normalizeSseLineEndings } from "./sse-util.js";
 
 /** Text-protocol mode mirrors the server flag so the rewriter only does text
  *  trigger detection when the host cannot coexist with a declared `tools`
@@ -120,6 +121,7 @@ export async function* rewriteResponsesSseStream(
             const { done, value } = await reader.read();
             if (done) break;
             buf += decoder.decode(value, { stream: true });
+            buf = normalizeSseLineEndings(buf);
             let idx: number;
             while ((idx = buf.indexOf("\n\n")) !== -1) {
                 const rawEvent = buf.slice(0, idx);

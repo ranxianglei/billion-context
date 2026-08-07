@@ -326,6 +326,7 @@ export async function* compressLoopResponsesStream(
     let upstream = initialUpstream;
     let loopCount = 0;
     let responseObj: Record<string, unknown> | null = null;
+    let activeClearTimer: (() => void) | null = null;
     let nextOutputIndex = 0;
 
     for (;;) {
@@ -416,6 +417,11 @@ export async function* compressLoopResponsesStream(
             }
         } finally {
             reader.releaseLock();
+            // Previous round's stream fully consumed → its fetch timer can go.
+            if (activeClearTimer) {
+                activeClearTimer();
+                activeClearTimer = null;
+            }
         }
 
         // Text protocol: pull <acp_compress> triggers out of the assistant
@@ -511,13 +517,14 @@ export async function* compressLoopResponsesStream(
         requestBody.input = inputItems;
         if (!("stream" in requestBody)) requestBody.stream = true;
 
-        const resp = await fetchWithTimeout(requestOptions.url, {
+        const { response: resp, clearTimer } = await fetchWithTimeout(requestOptions.url, {
             method: "POST",
             headers: requestOptions.headers,
             body: JSON.stringify(requestBody),
         });
 
         if (!resp.ok || !resp.body) {
+            clearTimer();
             const errText = await resp.text().catch(() => "upstream error");
             ctx.log(`[acp-proxy: responses compress loop upstream error ${resp.status}: ${errText.slice(0, 200)}]`);
             const errItemId = `msg_acp_err_${Date.now()}`;
@@ -530,5 +537,6 @@ export async function* compressLoopResponsesStream(
         }
 
         upstream = resp.body as ReadableStream<Uint8Array>;
+        activeClearTimer = clearTimer;
     }
 }

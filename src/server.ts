@@ -157,13 +157,16 @@ async function handle(
     }
     const bodyBuffer = await readBody(req);
     const url = req.url ?? "";
+    // Strip query string before matching path suffixes: a request like
+    // `/v1/responses?foo=1` must still be detected as the responses protocol.
+    const urlPath = url.split("?", 2)[0];
     const protocol: "anthropic" | "openai" | "responses" | null =
         req.method === "POST" && bodyBuffer.length > 0
-            ? url.endsWith("/chat/completions")
+            ? urlPath.endsWith("/chat/completions")
                 ? "openai"
-                : url.endsWith("/v1/messages") || url.endsWith("/messages")
+                : urlPath.endsWith("/v1/messages") || urlPath.endsWith("/messages")
                   ? "anthropic"
-                  : url.endsWith("/responses")
+                  : urlPath.endsWith("/responses")
                     ? "responses"
                     : null
             : null;
@@ -491,7 +494,7 @@ async function forward(
         headers,
         body: req.method === "GET" || req.method === "HEAD" ? undefined : body,
     };
-    const upstream = await fetchWithTimeout(upstreamUrl, init);
+    const { response: upstream, clearTimer: clearUpstreamTimer } = await fetchWithTimeout(upstreamUrl, init);
     const respHeaders: Record<string, string> = {};
     upstream.headers.forEach((v, k) => {
         if (UPSTREAM_HOP_HEADERS.has(k.toLowerCase())) return;
@@ -500,6 +503,7 @@ async function forward(
     res.writeHead(upstream.status, respHeaders);
     if (!upstream.body) {
         res.end();
+        clearUpstreamTimer();
         return;
     }
     // We only rewrite when THIS request actually had the compress tool
@@ -514,6 +518,7 @@ async function forward(
         prepared.processedMessages.length > 0;
     if (!useRewriter || prepared === null) {
         await pipeThrough(upstream.body, res);
+        clearUpstreamTimer();
         return;
     }
     const ctx: RewriteCtx = {
@@ -591,6 +596,7 @@ async function forward(
             }
         }
         res.end();
+        clearUpstreamTimer();
         if (dumpRaw) await dumpRaw;
     } else {
         const buf = await upstream.arrayBuffer();
@@ -608,6 +614,7 @@ async function forward(
         } catch {
             res.end(text);
         }
+        clearUpstreamTimer();
     }
 }
 
