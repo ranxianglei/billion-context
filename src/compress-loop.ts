@@ -197,7 +197,7 @@ function buildContentSse(
     })}\n\n`;
 }
 
-function buildVisibilityMarker(toolName: string, result: string): string {
+export function buildVisibilityMarker(toolName: string, result: string): string {
     const lines = result.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
     const failed = lines.some((l) =>
         l.includes("FAILED")

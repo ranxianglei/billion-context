@@ -33,6 +33,7 @@ import { getSession, listSessions, type Session } from "./session.js";
 import { COMPRESS_TOOL, COMPRESS_TOOL_RESPONSES, ACP_TOOLS_OPENAI, COMPRESS_TOOL_NAME, buildCompressSystemPrompt } from "./compress-tool.js";
 import { rewriteSseStream, rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { compressLoopStream } from "./compress-loop.js";
+import { compressLoopResponsesStream } from "./compress-loop-responses.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesSseStream, rewriteResponsesJsonResponse } from "./stream-responses.js";
 
@@ -518,8 +519,20 @@ async function forward(
                 if (!res.write(chunk)) await new Promise<void>((r) => res.once("drain", () => r()));
             }
         } else if (prepared.protocol === "responses") {
-            const rewriter = rewriteResponsesSseStream(streamToRead, ctx);
-            for await (const chunk of rewriter) {
+            const parsedReq = JSON.parse(typeof body === "string" ? body : body.toString("utf8"));
+            const reqHeaders: Record<string, string> = {};
+            for (const [k, v] of Object.entries(headers)) {
+                if (k.toLowerCase() === "content-length" || k.toLowerCase() === "host") continue;
+                reqHeaders[k] = v;
+            }
+            reqHeaders["content-type"] = "application/json";
+            const loop = compressLoopResponsesStream(
+                streamToRead,
+                { core, config, messages: prepared.processedMessages, session: prepared.session, log: ctx.log },
+                parsedReq,
+                { url: upstreamUrl, headers: reqHeaders },
+            );
+            for await (const chunk of loop) {
                 {
                     const s = chunk.toString("utf8");
                     if (s.includes("\x3cacp ") || s.includes("\x3c/acp")) {
