@@ -110,6 +110,7 @@ interface ResponsesEventDisposition {
     fcDone?: { itemId: string };
     completed?: boolean;
     responseObj?: Record<string, unknown> | null;
+    isMeta?: boolean;
 }
 
 function classifyResponsesSseEvent(eventStr: string): ResponsesEventDisposition {
@@ -126,9 +127,15 @@ function classifyResponsesSseEvent(eventStr: string): ResponsesEventDisposition 
     switch (type) {
         case "response.created":
         case "response.in_progress":
+            // Response-lifecycle meta events. Passed through only in round 1
+            // (to open the stream); suppressed in later rounds so the merged
+            // stream has exactly one response.created.
+            out.isMeta = true;
+            out.yieldChunk = Buffer.from(eventStr + "\n\n", "utf8");
+            return out;
         case "response.output_item.added": {
             const item = obj.item as Record<string, unknown> | undefined;
-            if (type === "response.output_item.added" && item?.type === "function_call") {
+            if (item?.type === "function_call") {
                 const name = typeof item.name === "string" ? item.name : "";
                 out.fcStart = {
                     itemId: typeof item.id === "string" ? item.id : "",
@@ -169,6 +176,9 @@ function classifyResponsesSseEvent(eventStr: string): ResponsesEventDisposition 
             return out;
         }
         case "response.completed":
+            // Meta: never auto-yielded. We capture the response object and emit
+            // our own single completion at the end of the merged stream.
+            out.isMeta = true;
             out.completed = true;
             out.responseObj = (obj.response as Record<string, unknown>) ?? null;
             return out;
@@ -178,13 +188,21 @@ function classifyResponsesSseEvent(eventStr: string): ResponsesEventDisposition 
     }
 }
 
-function buildOutputTextDelta(itemId: string, outputIndex: number, text: string): string {
-    return `event: response.output_text.delta\ndata: ${JSON.stringify({
-        type: "response.output_text.delta",
-        item_id: itemId,
-        output_index: outputIndex,
-        delta: text,
-    })}\n\n`;
+function buildMessageItemSequence(itemId: string, outputIndex: number, text: string): string {
+    // Full Responses message-item sequence: the client requires output_item.added
+    // + content_part.added BEFORE any output_text.delta, otherwise it errors
+    // "OutputTextDelta without active item".
+    const item = { type: "message", id: itemId, role: "assistant", content: [] as unknown[] };
+    const part = { type: "output_text", text: "" };
+    const doneItem = { type: "message", id: itemId, role: "assistant", content: [{ type: "output_text", text }] };
+    return [
+        `event: response.output_item.added\ndata: ${JSON.stringify({ type: "response.output_item.added", output_index: outputIndex, item })}\n\n`,
+        `event: response.content_part.added\ndata: ${JSON.stringify({ type: "response.content_part.added", item_id: itemId, output_index: outputIndex, part })}\n\n`,
+        `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", item_id: itemId, output_index: outputIndex, delta: text })}\n\n`,
+        `event: response.output_text.done\ndata: ${JSON.stringify({ type: "response.output_text.done", item_id: itemId, output_index: outputIndex, text })}\n\n`,
+        `event: response.content_part.done\ndata: ${JSON.stringify({ type: "response.content_part.done", item_id: itemId, output_index: outputIndex, part: { type: "output_text", text } })}\n\n`,
+        `event: response.output_item.done\ndata: ${JSON.stringify({ type: "response.output_item.done", output_index: outputIndex, item: doneItem })}\n\n`,
+    ].join("");
 }
 
 function buildFunctionCallEvents(
@@ -232,14 +250,14 @@ export async function* compressLoopResponsesStream(
     let upstream = initialUpstream;
     let loopCount = 0;
     let responseObj: Record<string, unknown> | null = null;
-    const msgItemId = `msg_acp_${Date.now()}`;
-    let outputIndexForContent = 0;
+    let nextOutputIndex = 0;
 
     for (;;) {
         loopCount++;
         if (loopCount > 5) {
             ctx.log("[acp-proxy: responses compress loop limit (5) reached, forwarding completion as-is]");
-            yield Buffer.from(buildOutputTextDelta(msgItemId, outputIndexForContent, "\n[acp-proxy: compress loop limit reached]\n"), "utf8");
+            const limItemId = `msg_acp_limit_${Date.now()}`;
+            yield Buffer.from(buildMessageItemSequence(limItemId, nextOutputIndex++, "\n[acp-proxy: compress loop limit reached]\n"), "utf8");
             yield Buffer.from(buildCompleted(responseObj), "utf8");
             return;
         }
@@ -263,12 +281,13 @@ export async function* compressLoopResponsesStream(
                     sseBuffer = sseBuffer.slice(sep + 2);
                     if (!eventStr.trim()) continue;
                     const d = classifyResponsesSseEvent(eventStr);
-                    if (isFirstRound) {
-                        if (d.yieldChunk) yield d.yieldChunk;
-                    } else {
-                        if (d.contentDelta) {
-                            yield Buffer.from(buildOutputTextDelta(msgItemId, outputIndexForContent, d.contentDelta), "utf8");
-                        }
+                    // Unified passthrough: yield content events in all rounds;
+                    // meta-start events (response.created/in_progress) only in
+                    // round 1 so the merged stream opens once. response.completed
+                    // is never auto-yielded (no yieldChunk) — we emit our own at
+                    // the end.
+                    if (d.yieldChunk && (isFirstRound || !d.isMeta)) {
+                        yield d.yieldChunk;
                     }
                     if (d.contentDelta) contentText += d.contentDelta;
                     if (d.fcStart) {
@@ -307,11 +326,12 @@ export async function* compressLoopResponsesStream(
         const hasOnlyProxy = proxyCalls.length > 0 && realCalls.length === 0;
 
         if (!hasOnlyProxy) {
-            let oi = outputIndexForContent;
+            let oi = nextOutputIndex;
             for (const fc of realCalls) {
                 yield Buffer.from(buildFunctionCallEvents(fc, oi), "utf8");
                 oi++;
             }
+            nextOutputIndex = oi;
             if (!completed && contentText.length === 0 && realCalls.length === 0) {
                 ctx.log("[acp-proxy: responses stream ended without completion]");
             }
@@ -349,8 +369,9 @@ export async function* compressLoopResponsesStream(
             const result = executeProxyTool(fc.name, args, ctx);
             const preview = result.length > 120 ? result.slice(0, 120) + "..." : result;
             ctx.log(`[acp-proxy: responses ${fc.name} (${fc.callId}) → ${preview.replace(/\n/g, " ")}]`);
+            const markerItemId = `msg_acp_${Date.now()}_${nextOutputIndex}`;
             yield Buffer.from(
-                buildOutputTextDelta(msgItemId, outputIndexForContent, buildVisibilityMarker(fc.name, result)),
+                buildMessageItemSequence(markerItemId, nextOutputIndex++, buildVisibilityMarker(fc.name, result)),
                 "utf8",
             );
             inputItems.push({
@@ -372,8 +393,9 @@ export async function* compressLoopResponsesStream(
         if (!resp.ok || !resp.body) {
             const errText = await resp.text().catch(() => "upstream error");
             ctx.log(`[acp-proxy: responses compress loop upstream error ${resp.status}: ${errText.slice(0, 200)}]`);
+            const errItemId = `msg_acp_err_${Date.now()}`;
             yield Buffer.from(
-                buildOutputTextDelta(msgItemId, outputIndexForContent, `\n[acp-proxy: upstream error ${resp.status}]\n`),
+                buildMessageItemSequence(errItemId, nextOutputIndex++, `\n[acp-proxy: upstream error ${resp.status}]\n`),
                 "utf8",
             );
             yield Buffer.from(buildCompleted(responseObj), "utf8");
