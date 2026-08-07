@@ -38,7 +38,7 @@
     "url": "https://github.com/ranxianglei/billion-context/issues"
   },
   "dependencies": {
-    "acp-kernel": "0.0.16"
+    "acp-kernel": "0.0.17"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
