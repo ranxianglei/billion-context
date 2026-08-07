@@ -11,9 +11,52 @@ import { writeFileSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import type { Session } from "./session.js";
-import { parseCompressInput, PROXY_TOOL_NAMES } from "./compress-tool.js";
+import { parseCompressInput, PROXY_TOOL_NAMES, COMPRESS_TOOL_NAME, ACP_TEXT_OPEN, ACP_TEXT_CLOSE } from "./compress-tool.js";
 import { applyRanges } from "./stream.js";
 import { buildVisibilityMarker } from "./compress-loop.js";
+
+/** Text-protocol mode: the host (OpenAI Codex code_mode) cannot coexist with
+ *  a declared `tools` array, so compression is triggered by a text marker the
+ *  model emits in its output_text. Detected here in the compress loop. */
+const TEXT_PROTOCOL = process.env.ACP_COMPRESS_PROTOCOL === "text";
+
+/** Extract <acp_compress>{json}</acp_compress> triggers from assistant text.
+ *  Returns the cleaned text (trigger removed) and synthesized function-call
+ *  accumulators so the existing compress loop can execute them like real tool
+ *  calls and loop again with the result. */
+function extractTextTriggers(text: string): { clean: string; calls: FunctionCallAccumulator[] } {
+    const calls: FunctionCallAccumulator[] = [];
+    let clean = "";
+    let i = 0;
+    let n = 0;
+    while (i < text.length) {
+        const open = text.indexOf(ACP_TEXT_OPEN, i);
+        if (open === -1) {
+            clean += text.slice(i);
+            break;
+        }
+        clean += text.slice(i, open);
+        const after = open + ACP_TEXT_OPEN.length;
+        const close = text.indexOf(ACP_TEXT_CLOSE, after);
+        if (close === -1) {
+            // malformed/incomplete trigger — pass through as plain text
+            clean += text.slice(open);
+            break;
+        }
+        const payload = text.slice(after, close).trim();
+        if (payload) {
+            const stamp = `${Date.now()}_${n++}`;
+            calls.push({
+                itemId: `fc_text_${stamp}`,
+                callId: `call_text_${stamp}`,
+                name: COMPRESS_TOOL_NAME,
+                arguments: payload,
+            });
+        }
+        i = close + ACP_TEXT_CLOSE.length;
+    }
+    return { clean, calls };
+}
 
 interface CompressLoopResponsesCtx {
     core: CompressionCore;
@@ -286,7 +329,11 @@ export async function* compressLoopResponsesStream(
                     // round 1 so the merged stream opens once. response.completed
                     // is never auto-yielded (no yieldChunk) — we emit our own at
                     // the end.
-                    if (d.yieldChunk && (isFirstRound || !d.isMeta)) {
+                    // Text protocol: suppress real-time content yields so we can
+                    // strip the <acp_compress> trigger before the client sees it;
+                    // we re-emit a clean message item at round end. Meta-start
+                    // events still open the stream in round 1.
+                    if (d.yieldChunk && (isFirstRound || !d.isMeta) && !(TEXT_PROTOCOL && !d.isMeta)) {
                         yield d.yieldChunk;
                     }
                     if (d.contentDelta) contentText += d.contentDelta;
@@ -320,9 +367,27 @@ export async function* compressLoopResponsesStream(
             reader.releaseLock();
         }
 
+        // Text protocol: pull <acp_compress> triggers out of the assistant
+        // text and treat them as proxy compress calls so the loop executes
+        // them and continues. The cleaned text replaces contentText so the
+        // client never sees the raw trigger.
+        if (TEXT_PROTOCOL) {
+            const extracted = extractTextTriggers(contentText);
+            contentText = extracted.clean;
+            for (const c of extracted.calls) {
+                fcByItemId.set(c.itemId, c);
+            }
+            // Emit the cleaned assistant text as a single message item.
+            if (contentText.trim()) {
+                const textItemId = `msg_acp_text_r${loopCount}_${Date.now()}`;
+                yield Buffer.from(buildMessageItemSequence(textItemId, nextOutputIndex++, contentText), "utf8");
+            }
+        }
         const allCalls = [...fcByItemId.values()].filter((c) => c.name.length > 0);
         const proxyCalls = allCalls.filter((c) => PROXY_TOOL_NAMES.has(c.name));
         const realCalls = allCalls.filter((c) => !PROXY_TOOL_NAMES.has(c.name));
+        // DIAG: log what tools the upstream returned this round.
+        console.error(`[acp-diag] round ${loopCount} allCalls=[${allCalls.map((c) => c.name).join(",")}] realCalls=[${realCalls.map((c) => c.name).join(",")}] text=${JSON.stringify(contentText.slice(0, 120))}`);
         const hasOnlyProxy = proxyCalls.length > 0 && realCalls.length === 0;
 
         if (!hasOnlyProxy) {

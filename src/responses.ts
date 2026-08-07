@@ -1,4 +1,5 @@
 import type { CoreMessage } from "acp-kernel";
+import { PROXY_TOOL_NAMES } from "./compress-tool.js";
 import { condenseOldToolResults, type CondenseOptions, type CondenseResult } from "./anthropic.js";
 import { hashId } from "./util.js";
 
@@ -56,7 +57,30 @@ export type ResponsesRequestBody = {
     [key: string]: unknown;
 };
 
-type Flat = { msgs: CoreMessage[]; systemParts: string[] };
+type Flat = { msgs: CoreMessage[]; systemParts: string[]; preamble: ResponseInputItem[] };
+
+/** Item types that are opaque host directives (tool definitions, reasoning,
+ *  computer calls, ...) and must be preserved verbatim — they are NOT
+ *  conversation history and must never be compressed or rewritten.
+ *  `additional_tools` in particular carries the Codex code_mode exec/wait
+ *  tool definitions and MUST stay at input[0] (see openai/codex client.rs
+ *  splice(0..0, prefix)). */
+const OPAQUE_ITEM_TYPES = new Set([
+    "additional_tools",
+    "reasoning",
+    "computer_call",
+    "computer_call_output",
+    "file_search_call",
+    "web_search_call",
+    "image_generation_call",
+    "code_interpreter_call",
+    "mcp_list_tools",
+    "mcp_call",
+]);
+
+function isOpaqueItem(it: ResponseInputItem): boolean {
+    return OPAQUE_ITEM_TYPES.has(it.type);
+}
 
 function partText(p: ResponseContentPart): string {
     if (p.type === "input_text" || p.type === "output_text") {
@@ -75,6 +99,7 @@ function messageContent(c: string | ResponseContentPart[]): string {
 export function responsesToCore(body: ResponsesRequestBody): Flat {
     const msgs: CoreMessage[] = [];
     const systemParts: string[] = [];
+    const preamble: ResponseInputItem[] = [];
     if (typeof body.instructions === "string" && body.instructions.trim()) {
         systemParts.push(body.instructions);
     }
@@ -83,9 +108,16 @@ export function responsesToCore(body: ResponsesRequestBody): Flat {
     if (typeof body.input === "string") {
         msgs.push({ id: `raw-${idx}`, role: "user", contentType: "text", text: body.input });
         idx++;
-        return { msgs, systemParts };
+        return { msgs, systemParts, preamble };
     }
     for (const it of items) {
+        // Preserve opaque host-directive items verbatim. They are never
+        // conversation history: capture them so the caller re-prepends them
+        // unchanged (additional_tools MUST stay at input[0]).
+        if (isOpaqueItem(it)) {
+            preamble.push(it);
+            continue;
+        }
         switch (it.type) {
             case "message": {
                 const m = it as ResponseInputMessage;
@@ -128,12 +160,40 @@ export function responsesToCore(body: ResponsesRequestBody): Flat {
                 idx++;
                 break;
             }
+            case "custom_tool_call": {
+                // code_mode exec/wait calls. Carried as conversation history so
+                // the model can see prior tool results and not loop. Fields are
+                // per OpenAI Responses API (input or arguments; status).
+                const ctc = it as { call_id?: string; name?: string; input?: string; arguments?: string };
+                msgs.push({
+                    id: `raw-${idx}`,
+                    role: "assistant",
+                    contentType: "tool-call",
+                    toolName: ctc.name ?? "custom",
+                    toolCallId: ctc.call_id ?? `call_${idx}`,
+                    text: ctc.input ?? ctc.arguments ?? "",
+                });
+                idx++;
+                break;
+            }
+            case "custom_tool_call_output": {
+                const ctco = it as { call_id?: string; output?: string };
+                msgs.push({
+                    id: `raw-${idx}`,
+                    role: "tool",
+                    contentType: "tool-result",
+                    toolCallId: ctco.call_id ?? `call_${idx}`,
+                    text: typeof ctco.output === "string" ? ctco.output : JSON.stringify(ctco.output ?? ""),
+                });
+                idx++;
+                break;
+            }
             default:
-                // Unknown item type (computer_call, reasoning, etc.) — drop.
+                // Unknown conversational item type — drop from compression.
                 break;
         }
     }
-    return { msgs, systemParts };
+    return { msgs, systemParts, preamble };
 }
 
 export function coreToResponses(messages: CoreMessage[]): ResponseInputItem[] {
@@ -147,19 +207,34 @@ export function coreToResponses(messages: CoreMessage[]): ResponseInputItem[] {
             if (m.contentType === "text") {
                 out.push({ type: "message", role: "assistant", content: m.text ?? "" });
             } else if (m.contentType === "tool-call") {
-                out.push({
-                    type: "function_call",
-                    call_id: m.toolCallId ?? `call_${m.id}`,
-                    name: m.toolName ?? "unknown",
-                    arguments: m.text ?? "",
-                });
+                // code_mode exec/wait are `custom` tools → emit custom_tool_call
+                // (with `input` field). Our injected compress tool is a function
+                // tool → function_call (with `arguments`).
+                if (PROXY_TOOL_NAMES.has(m.toolName ?? "")) {
+                    out.push({
+                        type: "function_call",
+                        call_id: m.toolCallId ?? `call_${m.id}`,
+                        name: m.toolName ?? "unknown",
+                        arguments: m.text ?? "",
+                    });
+                } else {
+                    out.push({
+                        type: "custom_tool_call",
+                        call_id: m.toolCallId ?? `call_${m.id}`,
+                        name: m.toolName ?? "unknown",
+                        input: m.text ?? "",
+                        status: "completed",
+                    } as ResponseInputItem);
+                }
             }
         } else if (m.role === "tool") {
+            // Match the tool-call format: function tools → function_call_output,
+            // custom tools → custom_tool_call_output.
             out.push({
-                type: "function_call_output",
+                type: "custom_tool_call_output",
                 call_id: m.toolCallId ?? "",
                 output: m.text ?? "",
-            });
+            } as ResponseInputItem);
         }
     }
     return out;

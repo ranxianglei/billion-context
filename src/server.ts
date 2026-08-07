@@ -30,7 +30,7 @@ import {
     deriveSessionIdResponses,
 } from "./responses.js";
 import { getSession, listSessions, type Session } from "./session.js";
-import { COMPRESS_TOOL, COMPRESS_TOOL_RESPONSES, ACP_TOOLS_OPENAI, COMPRESS_TOOL_NAME, buildCompressSystemPrompt } from "./compress-tool.js";
+import { COMPRESS_TOOL, COMPRESS_TOOL_RESPONSES, ACP_TOOLS_OPENAI, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressTextSystemPrompt } from "./compress-tool.js";
 import { rewriteSseStream, rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { compressLoopStream } from "./compress-loop.js";
 import { compressLoopResponsesStream } from "./compress-loop-responses.js";
@@ -339,30 +339,54 @@ function prepareResponses(
     const shouldInject = opts.compress.injectTool;
 
     try {
-        const { msgs, systemParts } = responsesToCore(parsed);
+        const { msgs, systemParts, preamble } = responsesToCore(parsed);
+        if (process.env.ACP_DEBUG) {
+            log("info", `[${sessionId}] input items: ${Array.isArray(parsed.input) ? parsed.input.map((i: ResponseInputItem) => i.type).join(",") : "(string)"}`);
+        }
         const tokenCount = estimateTokensFast(msgs.map((m) => m.text ?? "").join("\n"));
-        const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
+        const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" });
         session.state = turn.state;
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         processedMessages = applyCondense(turn.messages, opts, session);
-        rebuiltInput = coreToResponses(processedMessages);
+        // Rebuild input preserving the responses_lite contract:
+        //   input[0]   = additional_tools (host directive, verbatim)
+        //   input[1]   = developer message (base instructions + compress prompt)
+        //   input[2..] = conversation history (compressed)
+        //   top-level `instructions` is NEVER touched — it must stay empty for
+        //   responses_lite. Setting it non-empty breaks code_mode tool exposure.
+        const conversationItems = coreToResponses(processedMessages);
+        if (preamble.length > 0) {
+            log("info", `[${sessionId}] preserved ${preamble.length} opaque preamble item(s): ${preamble.map((p) => p.type).join(",")}`);
+        }
 
-        if (shouldInject) {
-            const sysParts = [...systemParts];
-            sysParts.push(buildCompressSystemPrompt());
-            const newBody = injectResponsesInstructions(parsed, sysParts);
-            parsed.instructions = newBody.instructions;
-            toolsOut = injectResponsesTool(parsed.tools);
+        const inputItems: ResponseInputItem[] = [...preamble];
+        if (shouldInject && !process.env.ACP_NO_COMPRESS_PROMPT) {
+            const sysParts = [...systemParts, buildCompressSystemPrompt()];
+            inputItems.push({ type: "message", role: "developer", content: sysParts.join("\n\n---\n\n") });
+            if (!process.env.ACP_NO_INJECT_TOOL) {
+                toolsOut = injectResponsesTool(parsed.tools);
+            }
+        } else if (systemParts.length > 0) {
+            // No compress injection, but still restore the base instructions
+            // that responsesToCore lifted out of the input.
+            inputItems.push({ type: "message", role: "developer", content: systemParts.join("\n\n---\n\n") });
+        }
+        inputItems.push(...conversationItems);
+        if (process.env.ACP_DEBUG) {
+            const ctcs = conversationItems.filter((i) => i.type === "custom_tool_call").length;
+            const ctcos = conversationItems.filter((i) => i.type === "custom_tool_call_output").length;
+            log("info", `[${sessionId}] rebuilt: msgs=${msgs.length} -> conv=${conversationItems.length} (custom_tool_call=${ctcs} custom_tool_call_output=${ctcos})`);
         }
         if (turn.nudge?.shouldInject && shouldInject) {
             try {
                 const rendered = renderNudgeText(turn.nudge);
                 if (rendered.text) {
-                    rebuiltInput = [...rebuiltInput, { type: "message", role: "user", content: rendered.text }];
+                    inputItems.push({ type: "message", role: "user", content: rendered.text });
                 }
             } catch {
             }
         }
+        rebuiltInput = inputItems;
     } catch (err) {
         log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
         processedMessages = [];
@@ -405,7 +429,12 @@ function injectOpenaiTool(tools: OpenAITool[] | undefined): OpenAITool[] {
     return [...tools, ...(additions as OpenAITool[])];
 }
 
-/** Inject compress tool in Responses API flat format. Idempotent. */
+/** When true, the Responses path teaches compression via a text trigger
+ *  instead of a function tool. Used for hosts (OpenAI Codex code_mode) whose
+ *  server-side tools are disabled the moment any `tools` entry is declared.
+ *  In text mode we keep `tools` untouched (undefined) so code_mode stays
+ *  active, and detect the trigger in the output_text stream instead. */
+const TEXT_PROTOCOL = process.env.ACP_COMPRESS_PROTOCOL === "text";
 function injectResponsesTool(tools: unknown[] | undefined): unknown[] {
     if (!Array.isArray(tools)) return [COMPRESS_TOOL_RESPONSES];
     const present = new Set(
@@ -438,9 +467,11 @@ async function forward(
                 return fn?.name ?? "?";
             });
             log("info", `[debug] tools=[${toolNames.join(",")}] msgs=${parsed.messages?.length ?? 0} stream=${parsed.stream ?? false} system_len=${JSON.stringify(parsed.messages?.find((m: Record<string, string>) => m.role === "system")?.content ?? "").length}`);
-            const out = `/tmp/acp-proxy-debug-req-${Date.now()}.json`;
-            fs.writeFileSync(out, body.slice(0, 50000));
-            log("info", `[debug] forwarded body written to ${out}`);
+            if (process.env.ACP_DUMP_REQ === "1") {
+                const out = `/tmp/acp-proxy-debug-req-${Date.now()}.json`;
+                fs.writeFileSync(out, body.slice(0, 50000));
+                log("info", `[debug] forwarded body written to ${out}`);
+            }
         } catch { /* best-effort */ }
     }
     const headers: Record<string, string> = {};

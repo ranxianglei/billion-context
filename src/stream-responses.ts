@@ -1,7 +1,12 @@
 import type { CompressionCore, Config, CoreMessage } from "acp-kernel";
 import type { Session } from "./session.js";
-import { COMPRESS_TOOL_NAME, parseCompressInput } from "./compress-tool.js";
+import { COMPRESS_TOOL_NAME, parseCompressInput, ACP_TEXT_OPEN, ACP_TEXT_CLOSE } from "./compress-tool.js";
 import { applyRanges, type RewriteCtx } from "./stream.js";
+
+/** Text-protocol mode mirrors the server flag so the rewriter only does text
+ *  trigger detection when the host cannot coexist with a declared `tools`
+ *  array (e.g. OpenAI Codex code_mode). */
+const TEXT_PROTOCOL = process.env.ACP_COMPRESS_PROTOCOL === "text";
 
 /**
  * Responses API streaming event rewriter.
@@ -31,6 +36,15 @@ type StreamState = {
     responseObj: Record<string, unknown> | null;
     done: boolean;
     /** latest emitted response sequence number (Responses events carry a `v` counter). */
+    // --- text-protocol state ---
+    /** Held-back output_text not yet safe to emit (may contain partial trigger). */
+    textPending: string;
+    /** Currently buffering a trigger between OPEN and CLOSE. */
+    inTrigger: boolean;
+    /** Accumulated trigger JSON content. */
+    triggerBuf: string;
+    /** Completed trigger payloads awaiting execution at end of stream. */
+    triggerPayloads: string[];
 };
 
 function newState(): StreamState {
@@ -41,7 +55,49 @@ function newState(): StreamState {
         sawRealTool: false,
         responseObj: null,
         done: false,
+        textPending: "",
+        inTrigger: false,
+        triggerBuf: "",
+        triggerPayloads: [],
     };
+}
+
+/** Drain safe-to-emit text from the pending buffer, holding back any partial
+ *  or complete trigger region. Completed triggers are pushed onto
+ *  state.triggerPayloads for execution at stream end. */
+function drainText(state: StreamState): string {
+    let out = "";
+    while (state.textPending) {
+        if (!state.inTrigger) {
+            const openIdx = state.textPending.indexOf(ACP_TEXT_OPEN);
+            if (openIdx === -1) {
+                // Hold back a tail in case a partial OPEN tag spans a delta.
+                const holdLen = Math.min(ACP_TEXT_OPEN.length - 1, state.textPending.length);
+                const cut = state.textPending.length - holdLen;
+                out += state.textPending.slice(0, cut);
+                state.textPending = state.textPending.slice(cut);
+                break;
+            }
+            out += state.textPending.slice(0, openIdx);
+            state.textPending = state.textPending.slice(openIdx + ACP_TEXT_OPEN.length);
+            state.inTrigger = true;
+        } else {
+            const closeIdx = state.textPending.indexOf(ACP_TEXT_CLOSE);
+            if (closeIdx === -1) {
+                // Keep buffering trigger content; cap to avoid unbounded growth.
+                const take = Math.min(state.textPending.length, 65536 - state.triggerBuf.length);
+                state.triggerBuf += state.textPending.slice(0, take);
+                state.textPending = state.textPending.slice(take);
+                break;
+            }
+            const payload = state.triggerBuf + state.textPending.slice(0, closeIdx);
+            state.triggerBuf = "";
+            state.textPending = state.textPending.slice(closeIdx + ACP_TEXT_CLOSE.length);
+            state.inTrigger = false;
+            if (payload.trim()) state.triggerPayloads.push(payload.trim());
+        }
+    }
+    return out;
 }
 
 export async function* rewriteResponsesSseStream(
@@ -142,14 +198,27 @@ function routeResponsesEvent(rawEvent: string, state: StreamState): string | nul
         return rawEvent + "\n\n";
     }
 
+    // Text-protocol: buffer ALL output_text deltas, suppress streaming, and
+    // process the full text once at stream end. This sacrifices streaming for
+    // correctness (trigger may span deltas; completion ordering). Acceptable
+    // for the feasibility test.
+    if (TEXT_PROTOCOL && t === "response.output_text.delta") {
+        const delta = obj.delta as string | undefined;
+        if (typeof delta === "string") state.textPending += delta;
+        return null;
+    }
+    if (TEXT_PROTOCOL && t === "response.output_text.done") {
+        return null;
+    }
+
     // Terminal event: capture the response object so we can forge a clean tail.
     if (t === "response.completed" || t === "response.incomplete") {
         state.responseObj = (obj.response as Record<string, unknown>) ?? null;
-        if (!state.converted) {
-            state.done = true;
-            return rawEvent + "\n\n";
-        }
         state.done = true;
+        // In text protocol we always re-emit completed at the tail (after
+        // flushing buffered text + executing triggers).
+        if (TEXT_PROTOCOL) return null;
+        if (!state.converted) return rawEvent + "\n\n";
         return null;
     }
 
@@ -157,10 +226,37 @@ function routeResponsesEvent(rawEvent: string, state: StreamState): string | nul
 }
 
 function buildResponsesTail(state: StreamState, ctx: RewriteCtx): string {
+    let out = "";
+    // Text protocol: drain buffered text (splitting out any trigger), execute
+    // triggers, then re-emit completion. Runs even without a trigger so the
+    // buffered text is flushed and a clean completed is emitted.
+    if (TEXT_PROTOCOL) {
+        const safeText = drainText(state);
+        if (safeText) {
+            out += sse("response.output_text.delta", { item_id: "msg_acp", output_index: 0, delta: safeText });
+        }
+        if (state.triggerPayloads.length > 0) {
+            for (const payload of state.triggerPayloads) {
+                let parsed: unknown = {};
+                try {
+                    parsed = JSON.parse(payload);
+                } catch {
+                    ctx.log(`text-trigger: malformed JSON payload, skipping`);
+                    continue;
+                }
+                const note = applyRanges(parseCompressInput(parsed), ctx);
+                ctx.log(`text-trigger: executed compress → ${note.split("\n")[0].slice(0, 80)}`);
+                out += sse("response.output_text.delta", { item_id: "msg_acp_note", output_index: 0, delta: "\n" + note + "\n" });
+            }
+        }
+        const base = (state.responseObj ?? { id: "resp_acp" }) as Record<string, unknown>;
+        const respId = typeof base.id === "string" ? base.id : "resp_acp";
+        out += sse("response.completed", { response: { ...base, id: respId, status: "completed", output: [] } });
+        return out;
+    }
     if (!state.converted) return "";
     const base = (state.responseObj ?? { id: "resp_acp" }) as Record<string, unknown>;
     const respId = typeof base.id === "string" ? base.id : "resp_acp";
-    let out = "";
     const ids = [...state.compressItemIds];
     for (const itemId of ids) {
         const raw = state.args[itemId] ?? "";
