@@ -100,7 +100,7 @@ ${HOW_TO_COMPRESS_RULES}
 
 ACP TAGS
 
-Each message in the conversation is annotated with a <acp tokens="2.1K" type="tool:bash">m00175</acp> tag showing its reference ID, approximate token size, and content type. Use these annotations to assess which messages are consuming the most context and prioritize compression accordingly. The token size is approximate — treat it as a relative guide, not an exact count.
+Each message in the conversation is annotated with a <acp tokens="2.1K" type="tool:bash">m00175</acp> tag showing its reference ID, approximate token size, and content type. These tags are system metadata injected by the proxy. NEVER echo, repeat, or reference these XML tags in your responses — the tags must not appear in your output. Use only the ref ID (e.g. m00005) inside compress calls, never the XML wrapper. The token size is approximate — treat it as a relative guide, not an exact count.
 
 TOOLS
 

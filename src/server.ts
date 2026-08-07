@@ -176,16 +176,6 @@ async function handle(
     await forward(req, res, opts, outBody, prepared, core, reqConfig, log);
 }
 
-const ACP_TAG_RE = /^\x3cacp [^>]*\x3e[^\x3c]*\x3c\/acp\x3e\n?/;
-
-function stripToolTags(messages: CoreMessage[]): void {
-    for (const m of messages) {
-        if (m.contentType === "tool-call" || m.contentType === "tool-result") {
-            m.text = (m.text ?? "").replace(ACP_TAG_RE, "");
-        }
-    }
-}
-
 function prepareAnthropic(
     bodyBuffer: Buffer,
     req: http.IncomingMessage,
@@ -208,9 +198,8 @@ function prepareAnthropic(
     try {
         const { msgs } = anthropicToCore(parsed);
         const tokenCount = estimateTokensFast(msgs.map((m) => m.text ?? "").join("\n"));
-        const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount });
+        const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
-        stripToolTags(turn.messages);
         processedMessages = applyCondense(turn.messages, opts, session);
         rebuiltMessages = coreToAnthropic(processedMessages);
 
@@ -263,9 +252,8 @@ function prepareOpenai(
     try {
         const { msgs } = openaiToCore(parsed);
         const tokenCount = estimateTokensFast(msgs.map((m) => m.text ?? "").join("\n"));
-        const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount });
+        const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
-        stripToolTags(turn.messages);
         processedMessages = applyCondense(turn.messages, opts, session);
         rebuiltMessages = coreToOpenai(processedMessages);
 
