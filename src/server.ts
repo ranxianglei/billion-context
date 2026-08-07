@@ -342,7 +342,7 @@ function prepareResponses(
     const shouldInject = opts.compress.injectTool;
 
     try {
-        const { msgs, systemParts, preamble } = responsesToCore(parsed);
+        const { msgs, systemParts, preamble, customToolCallIds } = responsesToCore(parsed);
         if (process.env.ACP_DEBUG) {
             log("info", `[${sessionId}] input items: ${Array.isArray(parsed.input) ? parsed.input.map((i: ResponseInputItem) => i.type).join(",") : "(string)"}`);
         }
@@ -357,7 +357,7 @@ function prepareResponses(
         //   input[2..] = conversation history (compressed)
         //   top-level `instructions` is NEVER touched — it must stay empty for
         //   responses_lite. Setting it non-empty breaks code_mode tool exposure.
-        const conversationItems = coreToResponses(processedMessages);
+        const conversationItems = coreToResponses(processedMessages, customToolCallIds);
         if (preamble.length > 0) {
             log("info", `[${sessionId}] preserved ${preamble.length} opaque preamble item(s): ${preamble.map((p) => p.type).join(",")}`);
         }

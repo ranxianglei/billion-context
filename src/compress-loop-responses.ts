@@ -140,10 +140,17 @@ function extractEventType(rawEvent: string): string | null {
 }
 
 function extractDataLine(rawEvent: string): string | null {
+    // Per SSE spec, consecutive `data:` lines are joined with "\n" to form
+    // the event data. A single leading space after "data:" is stripped.
+    const parts: string[] = [];
     for (const l of rawEvent.split("\n")) {
-        if (l.startsWith("data:")) return l.slice(5).trim();
+        if (l.startsWith("data:")) {
+            let v = l.slice(5);
+            if (v.startsWith(" ")) v = v.slice(1);
+            parts.push(v);
+        }
     }
-    return null;
+    return parts.length ? parts.join("\n") : null;
 }
 
 interface ResponsesEventDisposition {
@@ -152,7 +159,15 @@ interface ResponsesEventDisposition {
     fcStart?: { itemId: string; callId: string; name: string };
     fcArgs?: { itemId: string; delta: string };
     fcDone?: { itemId: string };
-    completed?: boolean;
+    /** Set when this event terminates the response stream. */
+    terminal?: boolean;
+    /** Kind of terminal event; determines whether we synthesize completion or
+     *  pass the original through (failed/incomplete must NOT be followed by a
+     *  fabricated response.completed — that gives the client a contradictory
+     *  state machine). */
+    terminalKind?: "completed" | "incomplete" | "failed" | "error";
+    /** Raw event text of a non-completed terminal, to replay verbatim. */
+    terminalRaw?: string;
     responseObj?: Record<string, unknown> | null;
     isMeta?: boolean;
 }
@@ -223,8 +238,25 @@ function classifyResponsesSseEvent(eventStr: string): ResponsesEventDisposition 
             // Meta: never auto-yielded. We capture the response object and emit
             // our own single completion at the end of the merged stream.
             out.isMeta = true;
-            out.completed = true;
+            out.terminal = true;
+            out.terminalKind = "completed";
             out.responseObj = (obj.response as Record<string, unknown>) ?? null;
+            return out;
+        case "response.incomplete":
+            // Terminal but NOT a success. Pass the original through; do NOT
+            // synthesize a response.completed after it.
+            out.isMeta = true;
+            out.terminal = true;
+            out.terminalKind = "incomplete";
+            out.terminalRaw = eventStr;
+            return out;
+        case "response.failed":
+        case "response.error":
+            // Terminal failure. Same handling as incomplete — replay verbatim.
+            out.isMeta = true;
+            out.terminal = true;
+            out.terminalKind = "failed";
+            out.terminalRaw = eventStr;
             return out;
         default:
             out.yieldChunk = Buffer.from(eventStr + "\n\n", "utf8");
@@ -309,6 +341,8 @@ export async function* compressLoopResponsesStream(
         const fcByItemId = new Map<string, FunctionCallAccumulator>();
         let contentText = "";
         let completed = false;
+        let terminalKind: "completed" | "incomplete" | "failed" | "error" | null = null;
+        let terminalRaw: string | null = null;
         const isFirstRound = loopCount === 1;
 
         const reader = upstream.getReader();
@@ -319,6 +353,10 @@ export async function* compressLoopResponsesStream(
                 const { done, value } = await reader.read();
                 if (done) break;
                 sseBuffer += decoder.decode(value, { stream: true });
+                // Normalize SSE line endings per spec: CRLF and lone CR are
+                // valid terminators. Without this, \r\n\r\n event separators
+                // would never match indexOf("\n\n") and whole events vanish.
+                if (sseBuffer.indexOf("\r") !== -1) sseBuffer = sseBuffer.replace(/\r\n|\r/g, "\n");
                 let sep: number;
                 while ((sep = sseBuffer.indexOf("\n\n")) >= 0) {
                     const eventStr = sseBuffer.slice(0, sep);
@@ -358,12 +396,14 @@ export async function* compressLoopResponsesStream(
                             existing.arguments = args;
                         }
                     }
-                    if (d.completed) {
+                    if (d.terminal) {
                         completed = true;
-                        responseObj = d.responseObj ?? null;
+                        terminalKind = d.terminalKind ?? null;
+                        terminalRaw = d.terminalRaw ?? null;
+                        responseObj = d.responseObj ?? responseObj;
                         const resp = d.responseObj ?? {};
                         const usage = (resp as Record<string, unknown>).usage as Record<string, unknown> | undefined;
-                        if (usage) {
+                        if (usage && d.terminalKind === "completed") {
                             const prompt = usage.input_tokens ?? usage.prompt_tokens ?? "?";
                             const inDet = usage.input_tokens_details as Record<string, unknown> | undefined;
                             const prDet = usage.prompt_tokens_details as Record<string, unknown> | undefined;
@@ -408,6 +448,13 @@ export async function* compressLoopResponsesStream(
                 oi++;
             }
             nextOutputIndex = oi;
+            // Terminal failure/incomplete: replay the original terminal event
+            // verbatim. We must NOT append a fabricated response.completed —
+            // that would tell the client both failed AND completed.
+            if (terminalKind && terminalKind !== "completed" && terminalRaw) {
+                yield Buffer.from(terminalRaw + "\n\n", "utf8");
+                return;
+            }
             if (!completed && contentText.length === 0 && realCalls.length === 0) {
                 ctx.log("[acp-proxy: responses stream ended without completion]");
             }

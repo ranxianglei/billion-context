@@ -1,5 +1,4 @@
 import type { CoreMessage } from "acp-kernel";
-import { PROXY_TOOL_NAMES } from "./compress-tool.js";
 import { condenseOldToolResults, type CondenseOptions, type CondenseResult } from "./anthropic.js";
 import { hashId } from "./util.js";
 
@@ -57,7 +56,16 @@ export type ResponsesRequestBody = {
     [key: string]: unknown;
 };
 
-type Flat = { msgs: CoreMessage[]; systemParts: string[]; preamble: ResponseInputItem[] };
+type Flat = {
+    msgs: CoreMessage[];
+    systemParts: string[];
+    preamble: ResponseInputItem[];
+    /** call_ids that arrived as custom_tool_call / custom_tool_call_output.
+     *  Used by coreToResponses to emit the correct item type on the way back
+     *  out — a standard `function_call` must NOT be rewritten as
+     *  `custom_tool_call` (different Responses API semantics). */
+    customToolCallIds: Set<string>;
+};
 
 /** Item types that are opaque host directives (tool definitions, reasoning,
  *  computer calls, ...) and must be preserved verbatim — they are NOT
@@ -100,6 +108,7 @@ export function responsesToCore(body: ResponsesRequestBody): Flat {
     const msgs: CoreMessage[] = [];
     const systemParts: string[] = [];
     const preamble: ResponseInputItem[] = [];
+    const customToolCallIds = new Set<string>();
     if (typeof body.instructions === "string" && body.instructions.trim()) {
         systemParts.push(body.instructions);
     }
@@ -108,7 +117,7 @@ export function responsesToCore(body: ResponsesRequestBody): Flat {
     if (typeof body.input === "string") {
         msgs.push({ id: `raw-${idx}`, role: "user", contentType: "text", text: body.input });
         idx++;
-        return { msgs, systemParts, preamble };
+        return { msgs, systemParts, preamble, customToolCallIds };
     }
     for (const it of items) {
         // Preserve opaque host-directive items verbatim. They are never
@@ -161,16 +170,15 @@ export function responsesToCore(body: ResponsesRequestBody): Flat {
                 break;
             }
             case "custom_tool_call": {
-                // code_mode exec/wait calls. Carried as conversation history so
-                // the model can see prior tool results and not loop. Fields are
-                // per OpenAI Responses API (input or arguments; status).
                 const ctc = it as { call_id?: string; name?: string; input?: string; arguments?: string };
+                const callId = ctc.call_id ?? `call_${idx}`;
+                customToolCallIds.add(callId);
                 msgs.push({
                     id: `raw-${idx}`,
                     role: "assistant",
                     contentType: "tool-call",
                     toolName: ctc.name ?? "custom",
-                    toolCallId: ctc.call_id ?? `call_${idx}`,
+                    toolCallId: callId,
                     text: ctc.input ?? ctc.arguments ?? "",
                 });
                 idx++;
@@ -178,25 +186,33 @@ export function responsesToCore(body: ResponsesRequestBody): Flat {
             }
             case "custom_tool_call_output": {
                 const ctco = it as { call_id?: string; output?: string };
+                const callId = ctco.call_id ?? `call_${idx}`;
+                customToolCallIds.add(callId);
                 msgs.push({
                     id: `raw-${idx}`,
                     role: "tool",
                     contentType: "tool-result",
-                    toolCallId: ctco.call_id ?? `call_${idx}`,
+                    toolCallId: callId,
                     text: typeof ctco.output === "string" ? ctco.output : JSON.stringify(ctco.output ?? ""),
                 });
                 idx++;
                 break;
             }
             default:
-                // Unknown conversational item type — drop from compression.
+                // Unknown / future item type (forward-compat): preserve verbatim
+                // rather than drop. Placed in preamble so it stays in the
+                // request uncompressed. Reordering is acceptable vs data loss.
+                preamble.push(it);
                 break;
         }
     }
-    return { msgs, systemParts, preamble };
+    return { msgs, systemParts, preamble, customToolCallIds };
 }
 
-export function coreToResponses(messages: CoreMessage[]): ResponseInputItem[] {
+export function coreToResponses(
+    messages: CoreMessage[],
+    customToolCallIds: Set<string> = new Set(),
+): ResponseInputItem[] {
     const out: ResponseInputItem[] = [];
     for (const m of messages) {
         if (m.role === "system") {
@@ -207,34 +223,44 @@ export function coreToResponses(messages: CoreMessage[]): ResponseInputItem[] {
             if (m.contentType === "text") {
                 out.push({ type: "message", role: "assistant", content: m.text ?? "" });
             } else if (m.contentType === "tool-call") {
-                // code_mode exec/wait are `custom` tools → emit custom_tool_call
-                // (with `input` field). Our injected compress tool is a function
-                // tool → function_call (with `arguments`).
-                if (PROXY_TOOL_NAMES.has(m.toolName ?? "")) {
-                    out.push({
-                        type: "function_call",
-                        call_id: m.toolCallId ?? `call_${m.id}`,
-                        name: m.toolName ?? "unknown",
-                        arguments: m.text ?? "",
-                    });
-                } else {
+                // Preserve the ORIGINAL item type by call_id membership: a host's
+                // standard function tool (e.g. get_weather) must stay
+                // function_call, not be rewritten as custom_tool_call (which
+                // changes Responses API semantics and may be rejected).
+                const callId = m.toolCallId ?? `call_${m.id}`;
+                if (customToolCallIds.has(callId)) {
                     out.push({
                         type: "custom_tool_call",
-                        call_id: m.toolCallId ?? `call_${m.id}`,
+                        call_id: callId,
                         name: m.toolName ?? "unknown",
                         input: m.text ?? "",
                         status: "completed",
                     } as ResponseInputItem);
+                } else {
+                    out.push({
+                        type: "function_call",
+                        call_id: callId,
+                        name: m.toolName ?? "unknown",
+                        arguments: m.text ?? "",
+                    });
                 }
             }
         } else if (m.role === "tool") {
-            // Match the tool-call format: function tools → function_call_output,
-            // custom tools → custom_tool_call_output.
-            out.push({
-                type: "custom_tool_call_output",
-                call_id: m.toolCallId ?? "",
-                output: m.text ?? "",
-            } as ResponseInputItem);
+            // Match the tool-call type by call_id so outputs pair correctly.
+            const callId = m.toolCallId ?? "";
+            if (customToolCallIds.has(callId)) {
+                out.push({
+                    type: "custom_tool_call_output",
+                    call_id: callId,
+                    output: m.text ?? "",
+                } as ResponseInputItem);
+            } else {
+                out.push({
+                    type: "function_call_output",
+                    call_id: callId,
+                    output: m.text ?? "",
+                });
+            }
         }
     }
     return out;
