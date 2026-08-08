@@ -16,6 +16,7 @@ import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import path from "node:path";
 import { cacheDir } from "./paths.js";
+import { log as loggerLog } from "./logger.js";
 
 const REGISTRY_BASE = "https://registry.npmjs.org";
 const CHECK_INTERVAL_MS = 3 * 60 * 1000;
@@ -79,38 +80,49 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
     inFlight = true;
     try {
         const now = Date.now();
-        if (!force && now - (await readLastCheck()) < CHECK_INTERVAL_MS) return;
+        const lastCheck = await readLastCheck();
+        if (!force && now - lastCheck < CHECK_INTERVAL_MS) {
+            loggerLog("info", `[update] check skipped (throttled, ${(CHECK_INTERVAL_MS - (now - lastCheck)) / 1000 | 0}s until next)`);
+            return;
+        }
         await writeLastCheck(now);
+        loggerLog("info", `[update] checking npm registry for ${opts.packageName}…`);
 
         const url = `${REGISTRY_BASE}/${opts.packageName}/latest`;
         const res = await fetch(url, {
             signal: AbortSignal.timeout(5000),
             headers: { Accept: "application/json" },
         });
-        if (!res.ok) return;
+        if (!res.ok) {
+            loggerLog("warn", `[update] registry returned ${res.status} ${res.statusText}, skipping`);
+            return;
+        }
         const data = (await res.json()) as { version?: string };
         const latest = data.version;
-        if (!latest || !isNewer(latest, opts.currentVersion)) return;
+        if (!latest) {
+            loggerLog("warn", `[update] registry response had no version, skipping`);
+            return;
+        }
+        if (!isNewer(latest, opts.currentVersion)) {
+            loggerLog("info", `[update] current=${opts.currentVersion} latest=${latest} (up to date)`);
+            return;
+        }
         // Already installed and notified about this version — don't loop.
-        if (notified.has(latest)) return;
+        if (notified.has(latest)) {
+            loggerLog("info", `[update] latest=${latest} already installed this run, awaiting restart`);
+            return;
+        }
+        loggerLog("info", `[update] new version found: ${opts.currentVersion} → ${latest}, installing…`);
 
         const installed = await installLatest(opts.packageName, latest);
+        notified.add(latest);
         if (installed) {
-            notified.add(latest);
-            // Green ✔ — the only notification channel for a headless server.
-            // eslint-disable-next-line no-console
-            console.error(
-                `\x1b[32m\u2714 ${opts.packageName} auto-updated ${opts.currentVersion} \u2192 ${latest}. Restart bili to finish.\x1b[0m`,
-            );
+            loggerLog("info", `[update] installed ${opts.packageName} ${opts.currentVersion} → ${latest}. Restart to finish.`);
         } else {
-            notified.add(latest);
-            // eslint-disable-next-line no-console
-            console.error(
-                `\x1b[33m${opts.packageName} ${latest} is available (you have ${opts.currentVersion}). Update with: npm install -g ${opts.packageName}@latest\x1b[0m`,
-            );
+            loggerLog("warn", `[update] install failed; run manually: npm install -g ${opts.packageName}@${latest}`);
         }
-    } catch {
-        // network/registry error — silent, will retry next interval
+    } catch (e) {
+        loggerLog("warn", `[update] check failed: ${String(e)}`);
     } finally {
         inFlight = false;
     }
@@ -134,10 +146,10 @@ async function installLatest(packageName: string, latest: string): Promise<boole
     }
 }
 
-/** Start the periodic check loop. Checks once shortly after start, then every 6h. */
 export function startAutoUpdate(opts: UpdateOptions): void {
     // First check after a short delay (don't block startup / don't race the
     // listening socket).
+    loggerLog("info", `[update] auto-update enabled (checking every ${CHECK_INTERVAL_MS / 1000 | 0}s)`);
     setTimeout(() => {
         void checkForUpdate(opts);
     }, 10_000);
