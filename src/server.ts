@@ -298,13 +298,18 @@ async function handle(
                   ? conversationSignalOpenai(parsed as OpenAIRequestBody, sessionHeader)
                   : conversationSignalResponses(parsed as ResponsesRequestBody, sessionHeader);
         const sessionId = deriveProxySessionId(req.headers, protocol, upstreamOrigin, conversation);
-        // Affinity token to forward upstream: prefer the client's own session
-        // header (opencode x-session-affinity, codex body.session_id); if the
-        // client sent none (pi), synthesize ses_<conversation> so upstream
-        // sticky-routing / cache pools still get a stable key. Also stored on
-        // the session as a human-readable label for the web UI / stats.
+        // Two separate uses of the conversation signal:
+        //  - `affinity`: header value forwarded upstream for sticky-routing /
+        //    cache pools. Synthesized as ses_<conversation> when the client
+        //    sent none (pi), so upstream still gets a stable key.
+        //  - `label`: human-readable display in the web UI / stats. We store
+        //    ONLY the client's own value (opencode x-session-affinity, codex
+        //    body.session_id) — never the synthetic one — so a user can tell
+        //    at a glance which client owns a session. pi sends nothing, so its
+        //    label stays empty (shown as "—" in the UI).
         const affinity = affinityToken(req.headers, conversation);
-        const session = getSession(sessionId, { protocol, upstreamOrigin, label: affinity });
+        const clientLabel = clientConversationHeader(req.headers);
+        const session = getSession(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? undefined });
         // Serialize per-session: prepare (processTurn mutates state) + forward
         // (stream rewriter mutates state via compress/decompress) must not
         // interleave across concurrent requests on the same session.
