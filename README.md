@@ -212,6 +212,15 @@ The config file is a single JSON object. Example:
 | `providers` | *(none)* | Provider routes — see below |
 | `compress` | *(see defaults)* | `{ injectTool, injectNudge }` |
 
+> **Choosing a `host`** (IPv6 / containers): the default `127.0.0.1` is
+> IPv4-only and loopback-only. Use `--host ::` (or `"host": "::"`) to listen
+> on **both** IPv4 and IPv6, which matters if your client resolves
+> `localhost` to `::1` first (some `/etc/hosts` files list `::1` before
+> `127.0.0.1`). Inside a **container**, `127.0.0.1` binds the container's own
+> loopback and is unreachable through a published port — use
+> `--host 0.0.0.0` there. ⚠️ `0.0.0.0` / `::` expose the proxy on **all**
+> interfaces; ensure you're on a trusted network or behind a firewall.
+
 ### Providers (URL routing + per-model context)
 
 `providers` maps a route name to either a bare URL string (simple) or an

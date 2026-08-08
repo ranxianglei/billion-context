@@ -163,11 +163,24 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         log("info", `${sig} received — flushing sessions…`);
         // Stop accepting new requests BEFORE flushing, otherwise a late request
         // could mutate state after its snapshot is taken and be lost.
-        server.close();
-        void flushAllSessions().finally(() => {
-            closeLogger();
-            process.exit(0);
+        // server.close(cb) waits for all keep-alive connections to drain
+        // before invoking cb, so in-flight SSE streams get a chance to finish
+        // rather than being yanked mid-chunk.
+        server.close(() => {
+            void flushAllSessions().finally(() => {
+                closeLogger();
+                process.exit(0);
+            });
         });
+        // Hard fallback: if connections hang (client never closes), don't
+        // block shutdown forever — force-exit after a grace window.
+        setTimeout(() => {
+            log("warn", "shutdown grace window elapsed; forcing exit");
+            void flushAllSessions().finally(() => {
+                closeLogger();
+                process.exit(0);
+            });
+        }, 10_000).unref?.();
     };
     process.on("SIGTERM", () => shutdown("SIGTERM"));
     process.on("SIGINT", () => shutdown("SIGINT"));

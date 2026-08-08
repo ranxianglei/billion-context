@@ -17,18 +17,33 @@ export type Logger = (level: string, msg: string) => void;
 
 let stream: WriteStream | undefined;
 let logPath: string | undefined;
+let bytesWritten = 0; // tracked so we can rotate at runtime, not just at startup
 
 function open(pathStr: string): WriteStream {
     mkdirSync(path.dirname(pathStr), { recursive: true });
     // Rotate if oversized.
+    let existingSize = 0;
     try {
-        if (statSync(pathStr).size >= MAX_BYTES) {
-            renameSync(pathStr, pathStr + ".old");
+        existingSize = statSync(pathStr).size;
+        if (existingSize >= MAX_BYTES) {
+            rotate(pathStr);
+            existingSize = 0;
         }
     } catch {
         // file doesn't exist yet — fine
     }
-    return createWriteStream(pathStr, { flags: "a" });
+    const s = createWriteStream(pathStr, { flags: "a" });
+    bytesWritten = existingSize;
+    return s;
+}
+
+function rotate(pathStr: string): void {
+    try {
+        renameSync(pathStr, pathStr + ".old");
+    } catch {
+        // rename can fail on Windows if .old is held open; best-effort,
+        // we keep writing to the same file and retry next rotation.
+    }
 }
 
 /**
@@ -53,8 +68,17 @@ export const log: Logger = (level, msg) => {
     // stderr (foreground terminal / shell redirect) — never throws.
     process.stderr.write(line);
     // file — durable record.
-    if (stream) {
+    if (stream && logPath) {
+        // Runtime rotation: if we've crossed the threshold since last check,
+        // reopen the file (rotates the old one out). This keeps a long-running
+        // proxy's log bounded without needing a restart.
+        if (bytesWritten >= MAX_BYTES) {
+            stream.end();
+            rotate(logPath);
+            stream = open(logPath);
+        }
         stream.write(line);
+        bytesWritten += Buffer.byteLength(line);
     }
 };
 
@@ -62,6 +86,7 @@ export const log: Logger = (level, msg) => {
 export function closeLogger(): void {
     stream?.end();
     stream = undefined;
+    bytesWritten = 0;
 }
 
 export function getLogPath(): string | undefined {
