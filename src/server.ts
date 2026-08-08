@@ -254,6 +254,20 @@ function diagTagSummary(messages: CoreMessage[], sessionId: string, strategy: st
     return `[${sessionId}] processTurn: ${messages.length} msgs, renderTags=${strategy}, ${textTagged} text tagged, ${toolTagged} tool tagged (should be 0 with text-only)`;
 }
 
+function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; contextUsage: number; tier: number | null; breakdown?: Record<string, number> } | null }, sessionId: string, tokenCount: number, limit: number): string {
+    const n = turn.nudge;
+    if (!n) return `[${sessionId}] nudge: unavailable`;
+    const b = n.breakdown ?? {};
+    const pct = limit > 0 ? `${Math.round((tokenCount / limit) * 100)}%` : "?";
+    const growth = b["growth"] ?? 0;
+    const floor = b["growthFloor"] ?? 0;
+    const interval = b["nudgeGrowthTokens"] ?? 0;
+    const pendingT1 = b["pendingT1"] ?? 0;
+    const ref = b["growthReference"] ?? 0;
+    const inject = n.shouldInject ? `INJECT T${n.tier ?? "?"}` : "idle";
+    return `[${sessionId}] nudge ${inject}: usage=${pct} (${tokenCount}/${limit}), growth=${growth}/${floor} (ref=${ref}, interval=${interval}), pendingT1=${pendingT1}/${interval}, reason="${n.reason.slice(0, 120)}"`;
+}
+
 function prepareAnthropic(
     bodyBuffer: Buffer,
     req: http.IncomingMessage,
@@ -282,6 +296,7 @@ function prepareAnthropic(
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
+        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit));
         processedMessages = applyCondense(turn.messages, opts, session);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = coreToAnthropic(processedMessages);
@@ -342,6 +357,7 @@ function prepareOpenai(
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
+        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit));
         processedMessages = applyCondense(turn.messages, opts, session);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = coreToOpenai(processedMessages);
@@ -410,6 +426,7 @@ function prepareResponses(
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" });
         session.state = turn.state;
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
+        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit));
         processedMessages = applyCondense(turn.messages, opts, session);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         // Rebuild input preserving the responses_lite contract:
