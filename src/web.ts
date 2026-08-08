@@ -328,7 +328,7 @@ function entries(obj) {
 function entries_models(obj) {
   if (!obj || typeof obj !== "object") return [];
   return Object.keys(obj).map(function(name){
-    return { name: name, context: obj[name].context||0, output: obj[name].output||0 };
+    return { name: name, context: obj[name].context||0 };
   });
 }
 
@@ -345,8 +345,7 @@ function renderProviders() {
       html += '<div class="sub-card">';
       html += '<div class="model-head"><span class="mname mono">'+esc(m.name)+'</span>';
       html += '<button class="btn danger small" onclick="removeModel('+i+','+j+')">Remove</button></div>';
-      html += '<div class="model-row"><label>context</label><input type="number" value="'+m.context+'" onchange="providers['+i+'].models['+j+'].context=parseInt(this.value)||0"></div>';
-      html += '<div class="model-row"><label>output</label><input type="number" value="'+m.output+'" onchange="providers['+i+'].models['+j+'].output=parseInt(this.value)||0"></div>';
+      html += '<div class="model-row"><label>context</label><input type="number" value="'+m.context+'" onchange="providers['+i+'].models['+j+'].context=parseInt(this.value)||0" placeholder="optional"></div>';
       html += '<div class="model-row"><label>name</label><input value="'+esc(m.name)+'" onchange="providers['+i+'].models['+j+'].name=this.value"></div>';
       html += '</div>';
     });
@@ -365,7 +364,7 @@ function removeProvider(i) {
   renderProviders();
 }
 function addModel(i) {
-  providers[i].models.push({ name: "model-name", context: 200000, output: 8192 });
+  providers[i].models.push({ name: "model-name", context: 0 });
   renderProviders();
 }
 function removeModel(i, j) {
@@ -402,7 +401,7 @@ async function saveProviders() {
     if (p.models.length === 0) { obj[p.name] = p.url; }
     else {
       var models = {};
-      p.models.forEach(function(m){ if(m.name) models[m.name] = { context: m.context, output: m.output }; });
+      p.models.forEach(function(m){ if(m.name) models[m.name] = { context: m.context }; });
       obj[p.name] = { url: p.url, models: models };
     }
   });

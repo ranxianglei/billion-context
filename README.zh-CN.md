@@ -141,7 +141,7 @@ base URL 的东西。
     "zhipu": {
       "url": "https://open.bigmodel.cn",
       "models": {
-        "glm-5.2": { "context": 1000000, "output": 131072 }
+        "glm-5.2": { "context": 1000000 }
       }
     },
     "anthropic": "https://api.anthropic.com"
@@ -282,8 +282,8 @@ bili --no-auto-update        # 本次启动禁用自动更新
     "zhipu": {
       "url": "https://open.bigmodel.cn",
       "models": {
-        "glm-5.2": { "context": 1000000, "output": 131072 },
-        "glm-5.1": { "context": 200000, "output": 131072 }
+        "glm-5.2": { "context": 1000000 },
+        "glm-5.1": { "context": 200000 }
       }
     },
     "anthropic": "https://api.anthropic.com",
@@ -329,14 +329,14 @@ bili --no-auto-update        # 本次启动禁用自动更新
   "zhipu": {
     "url": "https://open.bigmodel.cn",
     "models": {
-      "glm-5.2": { "context": 1000000, "output": 131072 },
+      "glm-5.2": { "context": 1000000 },
       "glm-5.1": { "context": 200000 }
     }
   }
 }
 ```
 
-同一个模型在不同 provider 后面可以有不同 context 窗口(例如 relay 把模型包成更大窗口)。`context` 是**输入 context 上限**(压缩器用它判断何时 nudge);`output` 是最大输出 token。两者都可选;缺失值回退到内置模型表,再回退到 `modelContextLimit`。
+同一个模型在不同 provider 后面可以有不同 context 窗口(例如 relay 把模型包成更大窗口)。`context` 是**输入 context 上限**(压缩器用它判断何时 nudge)。可选;缺失值回退到内置模型表,再回退到 `modelContextLimit`。**`output`(最大输出 token)已不再需要** —— proxy 原样透传客户端发的 `max_tokens`,客户端不发就让上游用默认值(Anthropic 客户端总会发,所以 Anthropic 路由自动覆盖)。config 里的 `output` 字段仍兼容接受,但已无效果。
 
 > **为什么要声明 context?** LLM 的 `/models` API **不返回** context 窗口(已跨 OpenAI、Anthropic、智谱、comfly 验证)。它们是文档级信息。值错了(例如把 GLM-5.2 猜成 128K 而非 1M)会导致频繁误触发压缩。按 provider + 模型声明能让代理匹配客户端自己用的注册表。
 
