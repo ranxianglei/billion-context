@@ -21,3 +21,27 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+
+  version-guard:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify version field only changes on release branches
+        run: |
+          set -euo pipefail
+          BRANCH="${GITHUB_HEAD_REF}"
+          # Release branches are allowed to bump version.
+          if [[ "$BRANCH" == *_release-v* ]]; then
+            echo "✓ release branch ($BRANCH) — version changes allowed"
+            exit 0
+          fi
+          # Non-release branches must NOT touch the "version" field.
+          if git diff origin/master...HEAD -- package.json | grep -Eq '^[+-][[:space:]]*"version"[[:space:]]*:'; then
+            echo "::error::\"version\" in package.json was changed on a non-release branch ($BRANCH)."
+            echo "Version bumps must go on a dedicated *_release-v* branch with an isolated 'release v{VERSION}' commit. See AGENTS.md §4 'Version Bumps'."
+            exit 1
+          fi
+          echo "✓ version field untouched on non-release branch ($BRANCH)"

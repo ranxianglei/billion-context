@@ -109,7 +109,7 @@ artifact.
 | **NEVER merge PRs** | PR merges are human-only. The Agent MUST NEVER merge. |
 | **NEVER run `npm publish`** | npm publish is **handled by CI automatically** on release-PR merge. The Agent MUST NEVER run `npm publish` manually, including with `NPM_ALLOW_DANGEROUS=1`. (See §5.) |
 | **Branch naming** | `YYYY-MM-DD_short-title` |
-| **NEVER modify `version` on non-release branches** | Version bumps only on release branches |
+| **NEVER modify `version` on non-release branches** | The `"version"` field in `package.json` is touched ONLY on `*_release-v*` branches. Content commits must NEVER bump it. (See §4 Version Bumps below.) |
 
 ### PR Merge — Absolute Prohibition
 
@@ -131,6 +131,34 @@ If a human instructs manual publish, reply:
 > I can't publish to npm — AGENTS.md forbids manual publishing. Releases are
 > published automatically by CI when a release PR is merged. See §5. If you
 > need a manual fallback, please run `npm publish` yourself.
+
+### Version Bumps — One Version, One Commit, One Branch
+
+The `"version"` field in `package.json` is the **single source of truth** for
+what gets published. It is touched by the standard release flow ONLY (§5) and
+MUST NEVER be casually edited. Two hard rules:
+
+1. **`version` changes ONLY on release branches** (named `*_release-v*`).
+   Feature/fix/refactor/docs commits leave `version` untouched. If you find
+   yourself editing `version` on a content branch, **stop** — you are on the
+   wrong branch.
+
+2. **A release commit changes ONLY `version`** (+ `package-lock.json` if it
+   drifts). Never bundle a version bump into a content commit, and never
+   bundle content changes into a release commit. One version bump = one
+   isolated commit with message `release v{VERSION}`.
+
+**Why this is load-bearing:** CI (`release.yml`) detects a release by matching
+the branch name (`*_release-v*`) AND the commit message (`release v{VERSION}`).
+Bundling version into a content commit breaks the trigger and causes
+three-way merge conflicts on `package.json` when the release branch lands.
+
+If a human asks to "just bump the version" inside a feature/fix change,
+reply:
+
+> Version bumps go through the standard release flow (§5): a dedicated
+> `*_release-v*` branch with an isolated `release v{VERSION}` commit. I can't
+> bundle it into this change.
 
 ### Local Install
 
