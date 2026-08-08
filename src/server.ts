@@ -370,7 +370,13 @@ function prepareOpenai(
     let toolsOut = parsed.tools;
 
     const maxTokens = typeof parsed.max_tokens === "number" ? parsed.max_tokens : 8192;
-    const isTitleGen = maxTokens <= 200 || parsed.messages.length <= 2;
+    // Title-generation requests (tiny max_tokens) get no compress tooling so
+    // the model produces a clean short title. We do NOT key this off message
+    // count: a 2-message request is just turn 1 of a real conversation, and
+    // flipping shouldInject false→true between turn 1 and turn 2+ rewrites the
+    // system prompt bytes (compress prompt added/removed) — which breaks the
+    // provider prefix cache for every subsequent turn.
+    const isTitleGen = maxTokens <= 200;
     const shouldInject = opts.compress.injectTool && !isTitleGen;
 
     try {
