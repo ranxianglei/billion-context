@@ -261,8 +261,23 @@ export class SessionStore {
         }
         const tmp = this.tempPath(session.id);
         const data = JSON.stringify(record);
-        await fs.writeFile(tmp, data, "utf8");
-        await fs.rename(tmp, file);
+        // Windows: fs.rename (MoveFileEx with MOVEFILE_REPLACE_EXISTING) can
+        // throw EPERM/EBUSY if the destination is held open (AV scan, search
+        // indexer, a concurrent flushSync, SMB share). Wrap so a failure cleans
+        // up the .tmp file and is reported, rather than propagating and
+        // leaving an orphan that the next write can collide with.
+        try {
+            await fs.writeFile(tmp, data, "utf8");
+            await fs.rename(tmp, file);
+        } catch (e) {
+            try {
+                await fs.unlink(tmp).catch(() => {});
+            } catch {
+                // best-effort cleanup
+            }
+            this.log("error", `[persist] write failed for ${session.id}: ${msg(e)}`);
+            throw e;
+        }
     }
 
     /** Synchronous flush for a single session. Used on memory eviction so a

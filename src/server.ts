@@ -1,5 +1,6 @@
 import http from "node:http";
 import fs from "node:fs";
+import { tmpdir } from "node:os";
 import { createCore, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, estimateTokensFast, renderNudgeText, deactivateBlock } from "acp-kernel";
 import type { ProxyOptions } from "./config.js";
 import { resolveContextLimit } from "./config.js";
@@ -123,6 +124,35 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                     : ` → ${opts.upstream}`),
         );
     });
+    // Listen errors (EADDRINUSE port taken, EACCES privileged port, EAFNOSUPPORT
+    // bad host) surface as an 'error' event on the server. Without a listener
+    // Node treats it as an unhandled 'error' and throws, aborting before the
+    // graceful-shutdown flush can run. Catch, log a human-readable message,
+    // flush sessions, and exit cleanly (exit code 1 so callers/scripts notice).
+    server.on("error", (err: NodeJS.ErrnoException) => {
+        const hint =
+            err.code === "EADDRINUSE"
+                ? ` — port ${opts.port} is already in use. Stop the other process or use --port <N>.`
+                : err.code === "EACCES"
+                  ? ` — port ${opts.port} requires privileges. Use a port >= 1024.`
+                  : "";
+        log("error", `listen failed: ${err.code ?? ""} ${err.message}${hint}`);
+        shuttingDown = true;
+        server.close();
+        void flushAllSessions().finally(() => {
+            closeLogger();
+            process.exit(1);
+        });
+    });
+    // Catch stray rejections/throws from background work (compress loops,
+    // auto-update, initSessions) that escape the per-request try/catch —
+    // Node 20+ aborts the process on these by default. Log loudly and flush.
+    process.on("uncaughtException", (err) => {
+        log("error", `uncaughtException: ${String(err?.stack ?? err)}`);
+    });
+    process.on("unhandledRejection", (reason) => {
+        log("error", `unhandledRejection: ${String(reason)}`);
+    });
     // Graceful shutdown: flush all dirty sessions to disk so a restart does
     // not lose recent compression state. SIGKILL/power loss cannot flush, but
     // debounced writes keep disk within ~500ms of in-memory state.
@@ -141,6 +171,12 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     };
     process.on("SIGTERM", () => shutdown("SIGTERM"));
     process.on("SIGINT", () => shutdown("SIGINT"));
+    // Windows never delivers SIGTERM (Node can listen but the kernel won't
+    // raise it). Ctrl+Break (and most service managers / `taskkill` / NSSM)
+    // raise SIGBREAK, so hook it to the same graceful-shutdown path there.
+    if (process.platform === "win32") {
+        process.on("SIGBREAK", () => shutdown("SIGBREAK"));
+    }
     return server;
 }
 
@@ -606,7 +642,7 @@ async function forward(
             });
             log("info", `[debug] tools=[${toolNames.join(",")}] msgs=${parsed.messages?.length ?? 0} stream=${parsed.stream ?? false} system_len=${JSON.stringify(parsed.messages?.find((m: Record<string, string>) => m.role === "system")?.content ?? "").length}`);
             if (process.env.ACP_DUMP_REQ === "1") {
-                const out = `/tmp/acp-proxy-debug-req-${Date.now()}.json`;
+                const out = `${tmpdir()}/acp-proxy-debug-req-${Date.now()}.json`;
                 fs.writeFileSync(out, body.slice(0, 50000));
                 log("info", `[debug] forwarded body written to ${out}`);
             }
