@@ -11,7 +11,7 @@ function makeCtx(log: (m: string) => void): { core: ReturnType<typeof createCore
         core: createCore(),
         config: { modelContextLimit: 200000 } as Config,
         messages: [] as CoreMessage[],
-        session: { id: "test", state: createInitialState(), createdAt: Date.now(), lastSeen: Date.now(), requests: 0, condensedToolResults: 0, tokensSaved: 0 },
+        session: { id: "test", state: createInitialState(), createdAt: Date.now(), lastSeen: Date.now(), requests: 0, condensedToolResults: 0, tokensSaved: 0, blockContents: new Map(), inFlight: 0, persisted: false },
         log,
     };
 }

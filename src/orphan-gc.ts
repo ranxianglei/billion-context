@@ -27,6 +27,12 @@ import type { Session } from "./session.js";
 
 const ORPHAN_THRESHOLD = 3;
 
+/** Streak counts live in a WeakMap keyed by the block object, so we don't
+ *  monkey-patch a foreign type (acp-kernel's Block) with an undocumented
+ *  property. If the kernel Block shape changes, TS still type-checks our code
+ *  here; and the counts are GC'd when a block object is dropped. */
+const orphanStreaks = new WeakMap<object, number>();
+
 /**
  * Scan active blocks and deactivate those that have been fully orphaned (no
  * effective message id present in `visible`) for ORPHAN_THRESHOLD consecutive
@@ -46,13 +52,11 @@ export function reapOrphanBlocks(
         if (!block.active) continue;
         const hasHit = block.effectiveMessageIds.some((id) => presentIds.has(id));
         if (hasHit) {
-            if ((block as unknown as { orphanStreak?: number }).orphanStreak) {
-                (block as unknown as { orphanStreak?: number }).orphanStreak = 0;
-            }
+            orphanStreaks.delete(block);
             continue;
         }
-        const streak = ((block as unknown as { orphanStreak?: number }).orphanStreak ?? 0) + 1;
-        (block as unknown as { orphanStreak?: number }).orphanStreak = streak;
+        const streak = (orphanStreaks.get(block) ?? 0) + 1;
+        orphanStreaks.set(block, streak);
         if (streak >= ORPHAN_THRESHOLD) {
             reaped.push(block.blockId);
         }

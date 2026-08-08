@@ -86,6 +86,10 @@ All config is via environment variables:
 | `ACP_COMPRESS_TOOL` | `1` | Set `0` to disable injecting the compress tool |
 | `ACP_DEBUG` | `0` | Set `1` for verbose logging |
 | `ACP_PASSTHROUGH` | `0` | Set `1` to forward without compression |
+| `BILI_PERSIST` | `1` | Set `0` to disable session persistence (in-memory only, lost on restart) |
+| `BILI_PERSIST_DEBOUNCE_MS` | `500` | Debounce window for writes to disk (milliseconds) |
+| `MAX_SESSIONS` | `256` | Max sessions held in memory (LRU eviction; disk is source of truth) |
+| `BILI_SESSIONS_DIR` | `~/.bili/sessions` | Directory for persisted session state |
 
 ### Multiple upstreams (URL path routing)
 
@@ -144,7 +148,7 @@ provider key — the proxy never reads or stores it.
 
 ## Status
 
-Early. Protocol handling and compression work against mock tests (79 passing). Real-model integration testing is the next milestone. Expect rough edges.
+Early. Protocol handling and compression work against mock tests (136 passing). Real-model integration testing is the next milestone. Expect rough edges.
 
 See [billion-context-pi](https://github.com/ranxianglei/billion-context-pi) for the pi-extension mode (in-process, tighter integration, the reference implementation).
 

@@ -512,6 +512,12 @@ export async function* compressLoopResponsesStream(
         }
 
         upstream = resp.body as ReadableStream<Uint8Array>;
+        // Clear the PREVIOUS round's timer before overwriting — otherwise the
+        // fetch-timeout timer from rounds 1..N-1 leaks (each would self-fire
+        // harmlessly after 10min, but the handles accumulate in the event loop
+        // over a long session). Only the final round's timer is cleared by the
+        // outer finally.
+        if (activeClearTimer) activeClearTimer();
         activeClearTimer = clearTimer;
     }
 }
