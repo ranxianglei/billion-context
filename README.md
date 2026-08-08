@@ -179,8 +179,9 @@ env_key = "OPENAI_API_KEY"   # Codex reads the key from this env var
 
 #### Other clients (Cursor / Aider / Continue …)
 
-Any client that lets you set a base URL works. Point it at
-`http://localhost:8787/<provider>` — the provider name you declared in Step 2.
+Not yet supported. The proxy currently speaks the Anthropic, OpenAI
+chat-completions, and OpenAI Responses protocols — if your client uses a
+different protocol or a non-standard auth header, it won't work yet.
 
 ### Verify
 

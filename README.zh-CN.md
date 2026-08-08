@@ -171,8 +171,8 @@ env_key = "OPENAI_API_KEY"   # Codex 从这个环境变量读 key
 
 #### 其他客户端(Cursor / Aider / Continue …)
 
-任何允许设置 base URL 的客户端都能用。指向
-`http://localhost:8787/<provider>` —— 第 2 步声明的 provider 名。
+暂不支持。代理目前说 Anthropic、OpenAI chat-completions、OpenAI Responses
+三种协议 —— 如果你的客户端用别的协议或非标准 auth header,还用不了。
 
 ### 验证
 
