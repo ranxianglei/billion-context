@@ -47,23 +47,41 @@ import type { Session, BlockContent } from "./session.js";
  *    lock should be added before promoting multi-agent concurrency as safe.
  */
 
-const PERSIST_VERSION = 1;
+const PERSIST_VERSION = 2;
 
 interface PersistedSession {
     version: number;
     savedAt: number;
     id: string;
-    /** Protocol + upstream origin, captured so the on-disk filename can be
-     *  namespaced by protocol/provider. Absent in files written before this
-     *  field existed; treated as unknown on load (file lives under _unknown/). */
+    /** Identity / descriptive metadata (v2+). Absent on v1 files; read via the
+     *  flat fallbacks below. */
+    meta?: {
+        protocol?: "anthropic" | "openai" | "responses";
+        upstreamOrigin?: string;
+        label?: string;
+        title?: string;
+    };
+    /** Cumulative usage stats (v2+). Absent on v1 files; read via the flat
+     *  fallbacks below. */
+    stats?: {
+        requests?: number;
+        tokensSaved?: number;
+        inputTokens?: number;
+        cachedTokens?: number;
+        outputTokens?: number;
+        cacheSamples?: number;
+        contextTokens?: number;
+    };
+    /** Free-form escape hatch (v2+). */
+    metadata?: Record<string, unknown>;
+    createdAt: number;
+    // Legacy flat fields (v1). Kept optional only so buildSession can read
+    // older files; v2 records emit grouped meta/stats instead.
     protocol?: "anthropic" | "openai" | "responses";
     upstreamOrigin?: string;
-    /** Human-readable conversation label (affinity token). Absent on files
-     *  written before this field existed. */
     label?: string;
-    createdAt: number;
-    requests: number;
-    tokensSaved: number;
+    requests?: number;
+    tokensSaved?: number;
     inputTokens?: number;
     cachedTokens?: number;
     outputTokens?: number;
@@ -200,8 +218,9 @@ export class SessionStore {
                 // current convention; the legacy form is tolerated so old
                 // files still load (and will be re-persisted under the new
                 // namespace on next dirty write).
-                const proto = parsed.protocol;
-                const origin = parsed.upstreamOrigin;
+                const pm = parsed.meta ?? {};
+                const proto = pm.protocol ?? parsed.protocol;
+                const origin = pm.upstreamOrigin ?? parsed.upstreamOrigin;
                 const expectedNamespaced = path.basename(relPathFor(parsed.id, proto, origin));
                 const expectedLegacy = legacyFileNameFor(parsed.id);
                 if (name !== expectedNamespaced && name !== expectedLegacy) {
@@ -262,7 +281,7 @@ export class SessionStore {
     async writeNow(session: Session): Promise<void> {
         if (!this.enabled) return;
         const record = buildRecord(session);
-        const file = this.filePath(session.id, session.protocol, session.upstreamOrigin);
+        const file = this.filePath(session.id, session.meta.protocol, session.meta.upstreamOrigin);
         try {
             await fs.mkdir(path.dirname(file), { recursive: true });
         } catch (e) {
@@ -302,7 +321,7 @@ export class SessionStore {
             this.timers.delete(session.id);
         }
         const record = buildRecord(session);
-        const file = this.filePath(session.id, session.protocol, session.upstreamOrigin);
+        const file = this.filePath(session.id, session.meta.protocol, session.meta.upstreamOrigin);
         try {
             mkdirSync(path.dirname(file), { recursive: true });
         } catch (e) {
@@ -362,19 +381,12 @@ function buildRecord(session: Session): PersistedSession {
         version: PERSIST_VERSION,
         savedAt: Date.now(),
         id: session.id,
-        protocol: session.protocol,
-        upstreamOrigin: session.upstreamOrigin,
-        label: session.label,
-        createdAt: session.createdAt,
-        requests: session.requests,
-        tokensSaved: session.tokensSaved,
-        inputTokens: session.inputTokens,
-        cachedTokens: session.cachedTokens,
-        outputTokens: session.outputTokens,
-        cacheSamples: session.cacheSamples,
-        contextTokens: session.contextTokens,
+        meta: { ...session.meta },
+        stats: { ...session.stats },
+        metadata: { ...session.metadata },
         state: session.state,
         blockContents: Object.fromEntries(session.blockContents),
+        createdAt: session.createdAt,
     };
 }
 
@@ -383,20 +395,30 @@ function buildSession(parsed: PersistedSession): Session {
     for (const [bid, content] of Object.entries(parsed.blockContents ?? {})) {
         if (content && typeof content === "object") blockContents.set(bid, content);
     }
+    // Read grouped shape (v2+); fall back to flat fields for v1 files.
+    const meta = parsed.meta ?? {};
+    const stats = parsed.stats ?? {};
     return {
         id: parsed.id,
-        protocol: parsed.protocol,
-        upstreamOrigin: parsed.upstreamOrigin,
+        meta: {
+            protocol: meta.protocol ?? parsed.protocol,
+            upstreamOrigin: meta.upstreamOrigin ?? parsed.upstreamOrigin,
+            label: meta.label ?? parsed.label,
+            title: meta.title,
+        },
+        stats: {
+            requests: stats.requests ?? parsed.requests ?? 0,
+            tokensSaved: stats.tokensSaved ?? parsed.tokensSaved ?? 0,
+            inputTokens: stats.inputTokens ?? parsed.inputTokens ?? 0,
+            cachedTokens: stats.cachedTokens ?? parsed.cachedTokens ?? 0,
+            outputTokens: stats.outputTokens ?? parsed.outputTokens ?? 0,
+            cacheSamples: stats.cacheSamples ?? parsed.cacheSamples ?? 0,
+            contextTokens: stats.contextTokens ?? parsed.contextTokens ?? 0,
+        },
+        metadata: parsed.metadata ?? {},
         state: mergeState(parsed.state),
         createdAt: parsed.createdAt ?? Date.now(),
         lastSeen: Date.now(),
-        requests: parsed.requests ?? 0,
-        tokensSaved: parsed.tokensSaved ?? 0,
-        inputTokens: parsed.inputTokens ?? 0,
-        cachedTokens: parsed.cachedTokens ?? 0,
-        outputTokens: parsed.outputTokens ?? 0,
-        cacheSamples: parsed.cacheSamples ?? 0,
-        contextTokens: parsed.contextTokens ?? 0,
         blockContents,
         inFlight: 0,
         persisted: true,

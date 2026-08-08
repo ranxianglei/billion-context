@@ -123,7 +123,7 @@ function routeEvent(
             const u = (d as { usage?: Record<string, unknown> }).usage;
             if (u) {
                 const out = u.output_tokens;
-                if (typeof out === "number") ctx.session.outputTokens += out;
+                if (typeof out === "number") ctx.session.stats.outputTokens += out;
             }
         }
         return getConverted() ? NOOP : emitEvent(ev);
@@ -134,16 +134,16 @@ function routeEvent(
             const inp = u.input_tokens;
             const cc = u.cache_creation_input_tokens;
             const cr = u.cache_read_input_tokens;
-            if (typeof inp === "number") ctx.session.inputTokens += inp;
+            if (typeof inp === "number") ctx.session.stats.inputTokens += inp;
             if (typeof cr === "number") {
-                ctx.session.cachedTokens += cr;
-                ctx.session.cacheSamples += 1;
+                ctx.session.stats.cachedTokens += cr;
+                ctx.session.stats.cacheSamples += 1;
             } else if (typeof inp === "number") {
-                ctx.session.cacheSamples += 1;
+                ctx.session.stats.cacheSamples += 1;
             }
             // Anthropic bills cache writes separately; track them under input
             // so the cumulative input reflects real prompt cost.
-            if (typeof cc === "number") ctx.session.inputTokens += cc;
+            if (typeof cc === "number") ctx.session.stats.inputTokens += cc;
         }
     }
     if (t === "message_stop") {

@@ -370,7 +370,7 @@ function prepareAnthropic(
 ): Prepared {
     const sessionId = session.id;
     const stream = parsed.stream === true;
-    session.requests++;
+    ++session.stats.requests;
 
     let processedMessages: CoreMessage[] = [];
     let rebuiltMessages = parsed.messages;
@@ -382,7 +382,11 @@ function prepareAnthropic(
         const tokenCount = estimateTokensFast(msgs.map((m) => m.text ?? "").join("\n"));
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
-        session.contextTokens = tokenCount;
+        session.stats.contextTokens = tokenCount;
+        if (!session.meta.title) {
+            const t = deriveTitle(msgs);
+            if (t) session.meta.title = t;
+        }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit));
         processedMessages = turn.messages;
@@ -425,7 +429,7 @@ function prepareOpenai(
 ): Prepared {
     const sessionId = session.id;
     const stream = parsed.stream === true;
-    session.requests++;
+    ++session.stats.requests;
 
     let processedMessages: CoreMessage[] = [];
     let rebuiltMessages = parsed.messages;
@@ -446,7 +450,11 @@ function prepareOpenai(
         const tokenCount = estimateTokensFast(msgs.map((m) => m.text ?? "").join("\n"));
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
-        session.contextTokens = tokenCount;
+        session.stats.contextTokens = tokenCount;
+        if (!session.meta.title) {
+            const t = deriveTitle(msgs);
+            if (t) session.meta.title = t;
+        }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit));
         processedMessages = turn.messages;
@@ -496,7 +504,7 @@ function prepareResponses(
 ): Prepared {
     const sessionId = session.id;
     const stream = parsed.stream === true;
-    session.requests++;
+    ++session.stats.requests;
 
     let processedMessages: CoreMessage[] = [];
     let rebuiltInput: ResponseInputItem[] | string = parsed.input;
@@ -512,7 +520,11 @@ function prepareResponses(
         const tokenCount = estimateTokensFast(msgs.map((m) => m.text ?? "").join("\n"));
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" });
         session.state = turn.state;
-        session.contextTokens = tokenCount;
+        session.stats.contextTokens = tokenCount;
+        if (!session.meta.title) {
+            const t = deriveTitle(msgs);
+            if (t) session.meta.title = t;
+        }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit));
         processedMessages = turn.messages;
@@ -883,19 +895,31 @@ async function dumpStreamToFile(stream: ReadableStream<Uint8Array>, dir: string,
     }
 }
 
+/** Derive a short human-readable title from the first user text message.
+ *  Used so the web UI can show "Fix auth bug" instead of an opaque hash. */
+function deriveTitle(messages: CoreMessage[]): string | undefined {
+    for (const m of messages) {
+        if (m.role !== "user" || m.contentType !== "text") continue;
+        const clean = (m.text ?? "").replace(/\s+/g, " ").trim();
+        if (clean) return clean.length > 60 ? clean.slice(0, 57) + "\u2026" : clean;
+    }
+    return undefined;
+}
+
 function sendStats(res: http.ServerResponse): void {
     const sessions = listSessions().map((s) => ({
         id: s.id,
-        protocol: s.protocol,
-        upstream: s.upstreamOrigin,
-        label: s.label,
-        requests: s.requests,
-        contextTokens: s.contextTokens,
-        inputTokens: s.inputTokens,
-        cachedTokens: s.cachedTokens,
-        outputTokens: s.outputTokens,
-        cacheSamples: s.cacheSamples,
-        cacheHitPct: s.cacheSamples > 0 ? Math.round(s.cachedTokens / s.inputTokens * 100) : null,
+        protocol: s.meta.protocol,
+        upstream: s.meta.upstreamOrigin,
+        label: s.meta.label,
+        title: s.meta.title,
+        requests: s.stats.requests,
+        contextTokens: s.stats.contextTokens,
+        inputTokens: s.stats.inputTokens,
+        cachedTokens: s.stats.cachedTokens,
+        outputTokens: s.stats.outputTokens,
+        cacheSamples: s.stats.cacheSamples,
+        cacheHitPct: s.stats.cacheSamples > 0 ? Math.round(s.stats.cachedTokens / s.stats.inputTokens * 100) : null,
         lastSeen: new Date(s.lastSeen).toISOString(),
     }));
     res.writeHead(200, { "content-type": "application/json" });

@@ -7,11 +7,12 @@ import type { Session } from "../src/session.ts";
 function makeSession(): Session {
     return {
         id: `test-${Math.random().toString(36).slice(2)}`,
+        meta: {},
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, contextTokens: 0 },
+        metadata: {},
         state: createInitialState(),
         createdAt: Date.now(),
         lastSeen: Date.now(),
-        requests: 0,
-        tokensSaved: 0,
         blockContents: new Map(),
         inFlight: 0,
         persisted: false,
