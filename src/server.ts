@@ -17,8 +17,6 @@ import {
     coreToOpenai,
     injectOpenaiSystem,
     conversationSignalOpenai,
-    condenseOldToolResults,
-    type CondenseOptions,
     type OpenAIRequestBody,
     type OpenAITool,
 } from "./openai.js";
@@ -154,31 +152,6 @@ type Prepared = {
     stream: boolean;
     compressInjected: boolean;
 };
-
-/**
- * Apply condense to the kernel-processed messages and record stats on the
- * session. Previously `opts.condense` and `condenseOldToolResults` were wired
- * into config but never invoked — leaving a whole feature as dead code. This
- * is the single integration point for both protocols.
- */
-function applyCondense(
-    messages: CoreMessage[],
-    opts: ProxyOptions,
-    session: Session,
-): CoreMessage[] {
-    const condenseOpts: CondenseOptions = {
-        enabled: opts.condense.enabled,
-        keepRecent: opts.condense.keepRecentToolResults,
-        minChars: opts.condense.minCharsToCondense,
-        maxKeptChars: opts.condense.maxKeptChars,
-    };
-    const { messages: out, condensedCount, charsSaved } = condenseOldToolResults(messages, condenseOpts);
-    if (condensedCount > 0) {
-        session.condensedToolResults += condensedCount;
-        session.tokensSaved += Math.ceil(charsSaved / 4);
-    }
-    return out;
-}
 
 async function handle(
     req: http.IncomingMessage,
@@ -350,7 +323,7 @@ function prepareAnthropic(
         session.state = turn.state;
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit));
-        processedMessages = applyCondense(turn.messages, opts, session);
+        processedMessages = turn.messages;
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = coreToAnthropic(processedMessages);
 
@@ -407,7 +380,7 @@ function prepareOpenai(
         session.state = turn.state;
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit));
-        processedMessages = applyCondense(turn.messages, opts, session);
+        processedMessages = turn.messages;
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = coreToOpenai(processedMessages);
 
@@ -472,7 +445,7 @@ function prepareResponses(
         session.state = turn.state;
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit));
-        processedMessages = applyCondense(turn.messages, opts, session);
+        processedMessages = turn.messages;
         reapOrphanBlocks(session, msgs, deactivateBlock);
         // Rebuild input preserving the responses_lite contract:
         //   input[0]   = additional_tools (host directive, verbatim)
@@ -844,7 +817,6 @@ function sendStats(res: http.ServerResponse): void {
     const sessions = listSessions().map((s) => ({
         id: s.id,
         requests: s.requests,
-        condensedToolResults: s.condensedToolResults,
         tokensSaved: s.tokensSaved,
         lastSeen: new Date(s.lastSeen).toISOString(),
     }));

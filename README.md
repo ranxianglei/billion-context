@@ -174,7 +174,6 @@ The config file is a single JSON object. Example:
 | `debug` | `false` | Verbose logging (same as `ACP_DEBUG=1`) |
 | `passthrough` | `false` | Forward without compression (same as `ACP_PASSTHROUGH=1`) |
 | `providers` | *(none)* | Provider routes — see below |
-| `condense` | *(see defaults)* | Tool-result condensing: `{ enabled, keepRecentToolResults, minCharsToCondense, maxKeptChars }` |
 | `compress` | *(see defaults)* | `{ injectTool, injectNudge }` |
 
 ### Providers (URL routing + per-model context)
