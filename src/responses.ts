@@ -1,5 +1,4 @@
 import type { CoreMessage } from "acp-kernel";
-import { condenseOldToolResults, type CondenseOptions, type CondenseResult } from "./anthropic.js";
 import { hashId } from "./util.js";
 import { ClusterCounter, deriveMessageId } from "./message-id.js";
 
@@ -300,8 +299,6 @@ export function injectResponsesInstructions(
         instructions: existing ? `${existing}\n\n---\n\n${extra}` : extra,
     };
 }
-
-export { condenseOldToolResults, type CondenseOptions, type CondenseResult };
 
 /** Extract the conversation dimension for Responses: a client-provided
  *  session header if present, else the previous_response_id chain (Responses'

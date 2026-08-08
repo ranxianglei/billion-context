@@ -3,7 +3,6 @@ import assert from "node:assert/strict";
 import {
     anthropicToCore,
     coreToAnthropic,
-    condenseOldToolResults,
     conversationSignalAnthropic,
     type AnthropicRequestBody,
 } from "../src/anthropic.js";
@@ -53,37 +52,36 @@ test("anthropicToCore + coreToAnthropic round-trips tool_use and tool_result", (
     assert.equal(tr.tool_use_id, "t1");
 });
 
-test("condenseOldToolResults condenses large old tool results, keeps recent verbatim", () => {
-    const { msgs } = anthropicToCore(bigToolResult("x".repeat(5000)));
-    const res = condenseOldToolResults(msgs, { keepRecent: 0, minChars: 1500, maxKeptChars: 400, enabled: true });
-    assert.equal(res.condensedCount, 1);
-    const tr = res.messages[2];
-    assert.ok(tr?.text?.includes("[acp-proxy: condensed"));
-});
-
-test("condenseOldToolResults leaves small tool results untouched", () => {
-    const { msgs } = anthropicToCore(bigToolResult("short"));
-    const res = condenseOldToolResults(msgs, { keepRecent: 0, minChars: 1500, maxKeptChars: 400, enabled: true });
-    assert.equal(res.condensedCount, 0);
-});
-
-test("condenseOldToolResults respects keepRecent", () => {
+test("cache_control survives the anthropicToCore → coreToAnthropic round-trip", () => {
     const body: AnthropicRequestBody = {
         messages: [
-            { role: "user" as const, content: "go" },
-            { role: "assistant" as const, content: [{ type: "tool_use", id: "a", name: "Bash", input: {} }] },
-            { role: "user" as const, content: [{ type: "tool_result", tool_use_id: "a", content: "y".repeat(3000) }] },
-            { role: "assistant" as const, content: [{ type: "tool_use", id: "b", name: "Bash", input: {} }] },
-            { role: "user" as const, content: [{ type: "tool_result", tool_use_id: "b", content: "z".repeat(3000) }] },
+            { role: "user" as const, content: [{ type: "text", text: "hello", cache_control: { type: "ephemeral" } }] },
+            { role: "assistant" as const, content: [{ type: "tool_use", id: "t1", name: "Bash", input: { cmd: "ls" }, cache_control: { type: "ephemeral" } }] },
+            { role: "user" as const, content: [{ type: "tool_result", tool_use_id: "t1", content: "ok", cache_control: { type: "ephemeral" } }] },
         ],
     };
+    const { msgs, cacheControls } = anthropicToCore(body);
+    assert.equal(cacheControls.size, 3);
+    for (const m of msgs) {
+        assert.ok(cacheControls.has(m.id), `message ${m.id} should have cache_control`);
+    }
+    const rebuilt = coreToAnthropic(msgs, cacheControls);
+    const textBlock = (rebuilt[0]!.content as unknown[])[0] as { cache_control?: unknown };
+    assert.deepEqual(textBlock.cache_control, { type: "ephemeral" });
+    const tuBlock = (rebuilt[1]!.content as unknown[])[0] as { cache_control?: unknown };
+    assert.deepEqual(tuBlock.cache_control, { type: "ephemeral" });
+    const trBlock = (rebuilt[2]!.content as unknown[])[0] as { cache_control?: unknown };
+    assert.deepEqual(trBlock.cache_control, { type: "ephemeral" });
+});
+
+test("coreToAnthropic without cacheControls produces no cache_control", () => {
+    const body: AnthropicRequestBody = {
+        messages: [{ role: "user" as const, content: [{ type: "text", text: "hi" }] }],
+    };
     const { msgs } = anthropicToCore(body);
-    const res = condenseOldToolResults(msgs, { keepRecent: 1, minChars: 1500, maxKeptChars: 100, enabled: true });
-    assert.equal(res.condensedCount, 1);
-    const first = res.messages[2]?.text ?? "";
-    const second = res.messages[4]?.text ?? "";
-    assert.ok(first.includes("[acp-proxy: condensed"));
-    assert.ok(!second.includes("[acp-proxy: condensed"));
+    const rebuilt = coreToAnthropic(msgs);
+    const block = (rebuilt[0]!.content as unknown[])[0] as { cache_control?: unknown };
+    assert.equal(block.cache_control, undefined);
 });
 
 test("conversationSignalAnthropic is stable for same first message, differs otherwise", () => {

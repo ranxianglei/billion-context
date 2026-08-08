@@ -18,7 +18,6 @@ export type Session = {
     createdAt: number;
     lastSeen: number;
     requests: number;
-    condensedToolResults: number;
     tokensSaved: number;
     /** Original content of compressed blocks, captured at compress time when
      *  the source messages are still present in the request. decompress reads
@@ -102,7 +101,6 @@ export function getSession(id: string, meta?: { protocol?: Session["protocol"]; 
         createdAt: Date.now(),
         lastSeen: Date.now(),
         requests: 0,
-        condensedToolResults: 0,
         tokensSaved: 0,
         blockContents: new Map(),
         inFlight: 0,

@@ -94,12 +94,6 @@ export type ProxyOptions = {
     routes: ProviderRoutes;
     modelContextLimit: number;
     kernelConfig: Config;
-    condense: {
-        keepRecentToolResults: number;
-        minCharsToCondense: number;
-        maxKeptChars: number;
-        enabled: boolean;
-    };
     compress: {
         injectTool: boolean;
         injectNudge: boolean;
@@ -110,6 +104,7 @@ export type ProxyOptions = {
     dumpSse?: string;
     passthrough: boolean;
     autoUpdate: boolean;
+    logFile?: string;
 };
 
 export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions {
@@ -142,10 +137,6 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         }
     }
     const modelContextLimit = parseInt(env.ACP_MODEL_CONTEXT_LIMIT ?? `${fileConfig.modelContextLimit ?? 200000}`, 10);
-    const enabled = (env.ACP_CONDENSE_ENABLED ?? (fileConfig.condense?.enabled === false ? "0" : "1")) !== "0";
-    const keepRecentToolResults = parseInt(env.ACP_KEEP_RECENT_TOOL_RESULTS ?? `${fileConfig.condense?.keepRecentToolResults ?? 6}`, 10);
-    const minCharsToCondense = parseInt(env.ACP_MIN_CHARS_TO_CONDENSE ?? `${fileConfig.condense?.minCharsToCondense ?? 1500}`, 10);
-    const maxKeptChars = parseInt(env.ACP_MAX_KEPT_CHARS ?? `${fileConfig.condense?.maxKeptChars ?? 400}`, 10);
     return {
         port: Number.isFinite(port) ? port : 8787,
         host,
@@ -153,7 +144,6 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         routes,
         modelContextLimit,
         kernelConfig: defaultConfig(modelContextLimit),
-        condense: { enabled, keepRecentToolResults, minCharsToCondense, maxKeptChars },
         compress: {
             injectTool: (env.ACP_COMPRESS_TOOL ?? (fileConfig.compress?.injectTool === false ? "0" : "1")) !== "0",
             injectNudge: (env.ACP_COMPRESS_NUDGE ?? (fileConfig.compress?.injectNudge === false ? "0" : "1")) !== "0",
@@ -164,6 +154,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         dumpSse: env.ACP_DUMP_SSE || fileConfig.dumpSse || undefined,
         passthrough: (env.ACP_PASSTHROUGH ?? (fileConfig.passthrough ? "1" : "0")) === "1",
         autoUpdate: (env.ACP_AUTO_UPDATE ?? (fileConfig.autoUpdate === false ? "0" : "1")) !== "0",
+        logFile: env.ACP_LOG_FILE !== undefined ? (env.ACP_LOG_FILE || undefined) : fileConfig.logFile,
     };
 }
 
@@ -184,7 +175,7 @@ type FileConfig = {
     dumpSse?: string;
     passthrough?: boolean;
     autoUpdate?: boolean;
-    condense?: { enabled?: boolean; keepRecentToolResults?: number; minCharsToCondense?: number; maxKeptChars?: number };
+    logFile?: string;
     compress?: { injectTool?: boolean; injectNudge?: boolean };
 };
 

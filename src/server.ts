@@ -17,8 +17,6 @@ import {
     coreToOpenai,
     injectOpenaiSystem,
     conversationSignalOpenai,
-    condenseOldToolResults,
-    type CondenseOptions,
     type OpenAIRequestBody,
     type OpenAITool,
 } from "./openai.js";
@@ -36,6 +34,8 @@ import { rewriteSseStream, rewriteJsonResponse, type RewriteCtx } from "./stream
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { getStore } from "./persist.js";
 import { compressLoopStream } from "./compress-loop.js";
+import { log as loggerLog, configureLogger, getLogPath, closeLogger } from "./logger.js";
+import { defaultLogFile } from "./paths.js";
 import { compressLoopResponsesStream } from "./compress-loop-responses.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesSseStream, rewriteResponsesJsonResponse } from "./stream-responses.js";
@@ -83,6 +83,9 @@ export function resolveUpstream(opts: ProxyOptions, reqUrl: string): { upstream:
 }
 
 export async function startServer(opts: ProxyOptions): Promise<http.Server> {
+    // Configure the tee logger (file + stderr) BEFORE any logging so the very
+    // first line (persist status) lands in the file too.
+    const filePath = configureLogger(opts.logFile ?? defaultLogFile());
     const core = createCore();
     const config: Config = opts.kernelConfig;
     const log = (level: string, msg: string) => logMsg(opts, level, msg);
@@ -91,6 +94,9 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // re-send oversized raw history and hang).
     await initSessions();
     log("info", `[persist] ${getStore().enabled ? "enabled" : "disabled"}`);
+    if (filePath) {
+        log("info", `[log] writing to ${filePath}`);
+    }
     const server = http.createServer(async (req, res) => {
         try {
             await handle(req, res, opts, core, config, log);
@@ -129,6 +135,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         // could mutate state after its snapshot is taken and be lost.
         server.close();
         void flushAllSessions().finally(() => {
+            closeLogger();
             process.exit(0);
         });
     };
@@ -145,31 +152,6 @@ type Prepared = {
     stream: boolean;
     compressInjected: boolean;
 };
-
-/**
- * Apply condense to the kernel-processed messages and record stats on the
- * session. Previously `opts.condense` and `condenseOldToolResults` were wired
- * into config but never invoked — leaving a whole feature as dead code. This
- * is the single integration point for both protocols.
- */
-function applyCondense(
-    messages: CoreMessage[],
-    opts: ProxyOptions,
-    session: Session,
-): CoreMessage[] {
-    const condenseOpts: CondenseOptions = {
-        enabled: opts.condense.enabled,
-        keepRecent: opts.condense.keepRecentToolResults,
-        minChars: opts.condense.minCharsToCondense,
-        maxKeptChars: opts.condense.maxKeptChars,
-    };
-    const { messages: out, condensedCount, charsSaved } = condenseOldToolResults(messages, condenseOpts);
-    if (condensedCount > 0) {
-        session.condensedToolResults += condensedCount;
-        session.tokensSaved += Math.ceil(charsSaved / 4);
-    }
-    return out;
-}
 
 async function handle(
     req: http.IncomingMessage,
@@ -335,15 +317,15 @@ function prepareAnthropic(
     let toolsOut = parsed.tools;
 
     try {
-        const { msgs } = anthropicToCore(parsed);
+        const { msgs, cacheControls } = anthropicToCore(parsed);
         const tokenCount = estimateTokensFast(msgs.map((m) => m.text ?? "").join("\n"));
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit));
-        processedMessages = applyCondense(turn.messages, opts, session);
+        processedMessages = turn.messages;
         reapOrphanBlocks(session, msgs, deactivateBlock);
-        rebuiltMessages = coreToAnthropic(processedMessages);
+        rebuiltMessages = coreToAnthropic(processedMessages, cacheControls);
 
         systemOut = injectSystem(parsed, opts);
         if (opts.compress.injectTool) {
@@ -388,7 +370,13 @@ function prepareOpenai(
     let toolsOut = parsed.tools;
 
     const maxTokens = typeof parsed.max_tokens === "number" ? parsed.max_tokens : 8192;
-    const isTitleGen = maxTokens <= 200 || parsed.messages.length <= 2;
+    // Title-generation requests (tiny max_tokens) get no compress tooling so
+    // the model produces a clean short title. We do NOT key this off message
+    // count: a 2-message request is just turn 1 of a real conversation, and
+    // flipping shouldInject false→true between turn 1 and turn 2+ rewrites the
+    // system prompt bytes (compress prompt added/removed) — which breaks the
+    // provider prefix cache for every subsequent turn.
+    const isTitleGen = maxTokens <= 200;
     const shouldInject = opts.compress.injectTool && !isTitleGen;
 
     try {
@@ -398,7 +386,7 @@ function prepareOpenai(
         session.state = turn.state;
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit));
-        processedMessages = applyCondense(turn.messages, opts, session);
+        processedMessages = turn.messages;
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = coreToOpenai(processedMessages);
 
@@ -463,7 +451,7 @@ function prepareResponses(
         session.state = turn.state;
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit));
-        processedMessages = applyCondense(turn.messages, opts, session);
+        processedMessages = turn.messages;
         reapOrphanBlocks(session, msgs, deactivateBlock);
         // Rebuild input preserving the responses_lite contract:
         //   input[0]   = additional_tools (host directive, verbatim)
@@ -835,7 +823,6 @@ function sendStats(res: http.ServerResponse): void {
     const sessions = listSessions().map((s) => ({
         id: s.id,
         requests: s.requests,
-        condensedToolResults: s.condensedToolResults,
         tokensSaved: s.tokensSaved,
         lastSeen: new Date(s.lastSeen).toISOString(),
     }));
@@ -886,6 +873,5 @@ export function readBody(req: http.IncomingMessage): Promise<Buffer> {
 
 function logMsg(opts: ProxyOptions, level: string, msg: string): void {
     if (!opts.log) return;
-    const ts = new Date().toISOString();
-    console.error(`${ts} [${level}] ${msg}`);
+    loggerLog(level, msg);
 }

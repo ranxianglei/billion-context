@@ -59,7 +59,6 @@ interface PersistedSession {
     upstreamOrigin?: string;
     createdAt: number;
     requests: number;
-    condensedToolResults: number;
     tokensSaved: number;
     state: CompressionState;
     /** blockContents serialized as a plain record (Maps do not survive JSON). */
@@ -343,7 +342,6 @@ function buildRecord(session: Session): PersistedSession {
         upstreamOrigin: session.upstreamOrigin,
         createdAt: session.createdAt,
         requests: session.requests,
-        condensedToolResults: session.condensedToolResults,
         tokensSaved: session.tokensSaved,
         state: session.state,
         blockContents: Object.fromEntries(session.blockContents),
@@ -363,7 +361,6 @@ function buildSession(parsed: PersistedSession): Session {
         createdAt: parsed.createdAt ?? Date.now(),
         lastSeen: Date.now(),
         requests: parsed.requests ?? 0,
-        condensedToolResults: parsed.condensedToolResults ?? 0,
         tokensSaved: parsed.tokensSaved ?? 0,
         blockContents,
         inFlight: 0,

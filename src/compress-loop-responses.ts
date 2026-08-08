@@ -9,6 +9,7 @@ import {
 } from "acp-kernel";
 import type { Session } from "./session.js";
 import { parseCompressInput, PROXY_TOOL_NAMES, COMPRESS_TOOL_NAME, ACP_TEXT_OPEN, ACP_TEXT_CLOSE } from "./compress-tool.js";
+import { log as loggerLog } from "./logger.js";
 import { applyRanges } from "./stream.js";
 import { resolveDecompress } from "./decompress-shared.js";
 import { buildVisibilityMarker } from "./compress-loop.js";
@@ -385,7 +386,7 @@ export async function* compressLoopResponsesStream(
                             const prDet = usage.prompt_tokens_details as Record<string, unknown> | undefined;
                             const cached = inDet?.cached_tokens ?? prDet?.cached_tokens ?? "?";
                             const out = usage.output_tokens ?? "?";
-                            console.error(`[acp-usage] round ${loopCount} input=${prompt} cached=${cached} output=${out}${cached !== "?" && cached !== 0 && prompt !== "?" ? ` (cache hit ${Math.round(Number(cached) / Number(prompt) * 100)}%)` : ""}`);
+                            loggerLog("info", `[acp-usage] round ${loopCount} input=${prompt} cached=${cached} output=${out}${cached !== "?" && cached !== 0 && prompt !== "?" ? ` (cache hit ${Math.round(Number(cached) / Number(prompt) * 100)}%)` : ""}`);
                         }
                     }
                 }

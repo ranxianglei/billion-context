@@ -27,7 +27,6 @@ function makeSession(id: string): Session {
         createdAt: Date.now(),
         lastSeen: Date.now(),
         requests: 0,
-        condensedToolResults: 0,
         tokensSaved: 0,
         blockContents: new Map(),
         inFlight: 0,

@@ -99,6 +99,23 @@ Verbose mode logs every `processTurn` (tag counts, token usage), the nudge
 decision (growth/usage/pendingT1/shouldInject), client headers, and SSE
 rewrites.
 
+### Log file
+
+All logs are **tee'd to a file by default**: `~/.local/state/billion-context/bili.log`
+(XDG state dir). They also still print to stderr so a foreground `bili start`
+shows them in the terminal.
+
+```bash
+bili start                # logs → ~/.local/state/billion-context/bili.log + terminal
+bili update               # (see below)
+# Config:  "logFile": "/custom/path.log"
+# Env:     ACP_LOG_FILE=/custom/path.log   (or ACP_LOG_FILE=off to disable the file)
+```
+
+The file auto-rotates at 10 MB (renamed to `bili.log.old`). Cache-hit stats
+per request are logged as `[acp-usage] round N input=X cached=Y (cache hit Z%)`
+so you can measure prefix-cache health directly from the log.
+
 ### Self-update
 
 The proxy checks npm for a newer version on startup and every 3 minutes. When a
@@ -157,7 +174,6 @@ The config file is a single JSON object. Example:
 | `debug` | `false` | Verbose logging (same as `ACP_DEBUG=1`) |
 | `passthrough` | `false` | Forward without compression (same as `ACP_PASSTHROUGH=1`) |
 | `providers` | *(none)* | Provider routes — see below |
-| `condense` | *(see defaults)* | Tool-result condensing: `{ enabled, keepRecentToolResults, minCharsToCondense, maxKeptChars }` |
 | `compress` | *(see defaults)* | `{ injectTool, injectNudge }` |
 
 ### Providers (URL routing + per-model context)

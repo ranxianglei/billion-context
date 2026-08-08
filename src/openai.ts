@@ -1,5 +1,4 @@
 import type { CoreMessage } from "acp-kernel";
-import { condenseOldToolResults, type CondenseOptions, type CondenseResult } from "./anthropic.js";
 import { hashId } from "./util.js";
 import { ClusterCounter, deriveMessageId } from "./message-id.js";
 
@@ -149,8 +148,6 @@ export function injectOpenaiSystem(messages: OpenAIMessage[], parts: string[]): 
     }
     return [{ role: "system", content: extra }, ...messages];
 }
-
-export { condenseOldToolResults, type CondenseOptions, type CondenseResult };
 
 /** Extract the conversation dimension for OpenAI Chat: a client-provided
  *  session header if present, else a content fingerprint of the first user
