@@ -5,6 +5,7 @@
   "type": "module",
   "main": "dist/index.js",
   "bin": {
+    "bili": "./dist/index.js",
     "bili-proxy": "./dist/index.js"
   },
   "scripts": {

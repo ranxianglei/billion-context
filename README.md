@@ -36,42 +36,68 @@ The proxy injects four context-management tools (`compress`, `decompress`, `sear
 npm install -g billion-context
 ```
 
+This installs the `bili` command (`bili-proxy` is kept as an alias).
+
 ## Usage
 
-### Single provider
-
-Start the proxy pointing at one upstream (simplest):
+### Start the proxy
 
 ```bash
-UPSTREAM=https://api.anthropic.com bili-proxy
+bili
 ```
 
-Then point your agent at the proxy.
+That's it. The proxy reads its config from `~/.config/billion-context/billion-context.json` (XDG) and listens on `127.0.0.1:8787`. If no config file exists yet, it uses sensible defaults and logs where it expects the file.
 
-### Multiple providers (recommended)
-
-See [Configuration](#configuration) below for how to route to multiple
-providers by URL path — most users will want this.
-
-### Claude Code
+### Quick overrides (flags)
 
 ```bash
-export ANTHROPIC_BASE_URL=http://localhost:8787
-export ANTHROPIC_API_KEY=sk-ant-...
+bili --port 9000              # change listen port
+bili --host 0.0.0.0           # listen on all interfaces
+bili --debug                 # verbose logging (also: set "debug": true in config)
+bili --passthrough           # forward without compression (smoke-test mode)
+bili --config ~/my-bili.json # use a different config file
+```
+
+Flags override the config file and env vars. `bili --help` lists them all.
+
+### Point your agent at the proxy
+
+The proxy routes by a **provider name in the URL path**. Set your agent's base URL to `http://localhost:8787/<provider>/...` and the proxy forwards to that provider (see [Configuration](#configuration) for how providers are declared).
+
+#### Claude Code (Anthropic)
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:8787/anthropic
+export ANTHROPIC_API_KEY=sk-ant-...   # real key — passed through as-is
 claude
 ```
 
-### Codex / any OpenAI-compatible agent
+#### Codex / any OpenAI-compatible agent (zhipu / openai / deepseek)
 
 ```bash
-export OPENAI_BASE_URL=http://localhost:8787/v1
-export OPENAI_API_KEY=sk-...
+export OPENAI_BASE_URL=http://localhost:8787/zhipu/api/coding/paas/v4
+export OPENAI_API_KEY=<your real glm key>   # passed through as-is
 codex
 ```
 
-### Cursor / Aider / others
+The `/zhipu/...` prefix tells the proxy to route to the `zhipu` provider; the
+remaining path is preserved.
 
-Set the base URL / API endpoint to `http://localhost:8787` (Anthropic) or `http://localhost:8787/v1` (OpenAI) in the agent's settings.
+#### Cursor / Aider / others
+
+Set the base URL to `http://localhost:8787/<provider>` in the agent's settings.
+
+### Debugging
+
+Three ways to enable verbose logging (priority: flag > env > config):
+
+1. **CLI flag** (quickest): `bili --debug`
+2. **Env var**: `ACP_DEBUG=1 bili`
+3. **Config file**: `"debug": true` in `billion-context.json`
+
+Verbose mode logs every `processTurn` (tag counts, token usage), the nudge
+decision (growth/usage/pendingT1/shouldInject), client headers, and SSE
+rewrites.
 
 ## Configuration
 

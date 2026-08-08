@@ -30,6 +30,8 @@ export function configDir(): string {
 
 /** Main config file path. */
 export function configFile(): string {
+    const env = process.env.BILI_CONFIG_FILE;
+    if (env && env.length > 0) return path.resolve(env);
     return path.join(configDir(), "billion-context.json");
 }
 
