@@ -59,6 +59,21 @@ bili
 [acp-config] created config template at ~/.config/billion-context/billion-context.json — edit it with your providers, then restart
 ```
 
+### 路由怎么工作
+
+代理按 **URL 路径里的 provider 名**路由 —— host 后面的第一段路径。它会
+剥离该名字,把剩余部分转发给那个 provider。名字之后的整段路径原样透传:
+
+```
+客户端 baseURL: http://localhost:8787/zhipu/api/coding/paas/v4
+                 └──────────┬──────────┘└────────┬────────┘
+                     代理 host            剩余路径
+                     + provider 名        (原样转发)
+```
+
+这就是为什么第 2 步让你声明带名字的 provider、第 3 步又让你把同样的名字
+放在客户端 base URL 的开头 —— 代理凭这个知道每条请求发到哪。
+
 ### 第 2 步 —— 编辑配置文件
 
 打开第 1 步创建的文件(`~/.config/billion-context/billion-context.json`),
@@ -345,26 +360,13 @@ bili --no-auto-update        # 本次启动禁用自动更新
 
 **API key 永远不存进代理** —— 助手发什么 key,原样透传给上游。
 
-### 路由
-
-用 provider 名作为路径段把任意助手指向代理。代理剥离该名字并转发到该 provider 的根 URL。完整的助手配置示例见[快速上手,第 2 步](#第-2-步--把助手指向代理);请求 URL 如何重写的机制:
-
-```
-助手 baseURL:   http://localhost:8787/zhipu/api/coding/paas/v4
-                 └──────────┬──────────┘└────────┬────────┘
-                     代理 host            剩余路径
-                     + provider 名        (原样转发)
-```
-
-**未配置任何 providers**(比如你清空了 `providers` 块)时,provider 名这步被跳过
-—— 每个请求按完整原始路径转发到默认 `upstream`。这是个边缘场景;
-正常流程是声明 providers 并按名字路由,见快速上手。
-
-### Provider 名注意事项
+### Provider 名规则
 
 - 必须以字母开头,只含字母/数字/`-`/`_`。
 - 保留字(`v1`、`chat`、`completions`、`messages`、`models`、`api`)被拒绝,以免与真实 API 路径段冲突。
 - provider 名可出现在路径任意位置;最长匹配优先。
+- **未声明任何 providers**(比如你清空了 `providers` 块)时,每个请求按完整
+  原始路径转发到默认 `upstream` —— 边缘场景,非正常流程。
 
 ## 会话机制
 

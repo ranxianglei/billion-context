@@ -62,6 +62,23 @@ so you don't have to invent the schema from scratch:
 [acp-config] created config template at ~/.config/billion-context/billion-context.json — edit it with your providers, then restart
 ```
 
+### How routing works
+
+The proxy routes by a **provider name in the URL path** — the first path
+segment after the host. It strips the name and forwards the rest to that
+provider. Everything after the name is passed through untouched:
+
+```
+client baseURL:  http://localhost:8787/zhipu/api/coding/paas/v4
+                  └──────────┬──────────┘└────────┬────────┘
+                      proxy host           remaining path
+                      + provider name      (forwarded as-is)
+```
+
+This is why Step 2 has you declare named providers, and Step 3 has you put that
+same name at the start of the client's base URL — it's how the proxy knows where
+to send each request.
+
 ### Step 2 — Edit the config file
 
 Open the file from Step 1 (`~/.config/billion-context/billion-context.json`)
@@ -381,31 +398,15 @@ built-in model table, then to `modelContextLimit`.
 **API keys are never stored in the proxy** — whatever key the agent sends is
 passed through untouched to the upstream.
 
-### Routing
-
-Point any agent at the proxy using a provider name as a path segment. The
-proxy strips the name and forwards to that provider's root URL. The complete
-agent-configuration examples are in [Quickstart, Step 2](#step-2--point-your-agent-at-the-proxy);
-the mechanics of how a request URL is rewritten:
-
-```
-agent baseURL:  http://localhost:8787/zhipu/api/coding/paas/v4
-                 └──────────┬──────────┘└────────┬────────┘
-                     proxy host           remaining path
-                     + provider name      (forwarded as-is)
-```
-
-With **no providers** configured (e.g. you emptied the `providers` block), the
-provider-name step is skipped — every request is forwarded to the default
-`upstream` with its full original path. This is an edge case; the normal flow
-is to declare providers and route by name as shown in the Quickstart.
-
-### Notes on provider names
+### Provider name rules
 
 - Must start with a letter, contain only letters/digits/`-`/`_`.
 - Reserved words (`v1`, `chat`, `completions`, `messages`, `models`, `api`)
   are rejected to avoid colliding with real API path segments.
 - The provider name can appear anywhere in the path; the longest match wins.
+- With **no providers** declared (e.g. you emptied the `providers` block),
+  every request is forwarded to the default `upstream` with its full path —
+  an edge case, not the normal flow.
 
 ## How sessions work
 
