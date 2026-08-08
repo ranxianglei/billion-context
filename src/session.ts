@@ -30,8 +30,10 @@ const MAX_SESSIONS = Number.parseInt(process.env.BILI_MAX_SESSIONS ?? "256", 10)
 /** Approximate per-session byte cap for blockContents originals. When exceeded
  *  the oldest block's contents are dropped (the block summary stays; decompress
  *  degrades to returning the summary instead of originals). Bounds memory for
- *  very long sessions. */
-const BLOCK_CONTENTS_BYTES_CAP = Number.parseInt(process.env.BILI_BLOCK_CACHE_BYTES ?? String(64 * 1024 * 1024), 10) || 64 * 1024 * 1024;
+ *  pathological sessions; disk persistence holds everything regardless. A large
+ *  default (512MB) so normal long sessions never hit it — disk is cheap, and
+ *  losing block originals silently degrades decompress quality. */
+const BLOCK_CONTENTS_BYTES_CAP = Number.parseInt(process.env.BILI_BLOCK_CACHE_BYTES ?? String(512 * 1024 * 1024), 10) || 512 * 1024 * 1024;
 
 let initialized = false;
 
