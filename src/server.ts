@@ -39,6 +39,7 @@ import { compressLoopStream } from "./compress-loop.js";
 import { compressLoopResponsesStream } from "./compress-loop-responses.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesSseStream, rewriteResponsesJsonResponse } from "./stream-responses.js";
+import { emitStreamError } from "./stream-error.js";
 
 const UPSTREAM_HOP_HEADERS = new Set([
     "host",
@@ -572,6 +573,16 @@ async function forward(
         clearUpstreamTimer();
         return;
     }
+    // P1.2: if the upstream returned a non-2xx (auth, rate-limit, context too
+    // long, ...), do NOT route the error body through the SSE rewriter — it has
+    // no SSE events and would be silently swallowed, leaving the client with
+    // an empty stream and no idea why. Pass status + body through verbatim.
+    if (!upstream.ok) {
+        res.writeHead(upstream.status, respHeaders);
+        await pipeThrough(upstream.body, res);
+        clearUpstreamTimer();
+        return;
+    }
     const ctx: RewriteCtx = {
         core,
         config,
@@ -588,6 +599,11 @@ async function forward(
             streamToRead = a;
             dumpRaw = dumpStreamToFile(b, opts.dumpSse, `${Date.now()}-${prepared.session.id}-raw.sse`);
         }
+        // P1.1: wrap the rewriter loops in try/catch. If a rewriter throws
+        // (decompress/search edge case, JSON.parse failure, fetch abort),
+        // emitStreamError sends a protocol-appropriate error + finish so the
+        // client ends cleanly instead of seeing a bare truncated stream.
+        try {
         if (prepared.protocol === "openai") {
             const parsedReq = JSON.parse(typeof body === "string" ? body : body.toString("utf8"));
             const reqHeaders: Record<string, string> = {};
@@ -647,8 +663,12 @@ async function forward(
             }
         }
         res.end();
-        clearUpstreamTimer();
-        if (dumpRaw) await dumpRaw;
+        } catch (e) {
+            emitStreamError(res, prepared.protocol, (e as Error)?.message ?? String(e), (m) => log("error", `[${prepared.session.id}] ${m}`));
+        } finally {
+            clearUpstreamTimer();
+            if (dumpRaw) await dumpRaw;
+        }
     } else {
         const buf = await upstream.arrayBuffer();
         const text = Buffer.from(buf).toString("utf8");

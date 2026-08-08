@@ -507,7 +507,7 @@ export async function* compressLoopResponsesStream(
             ctx.log(`[acp-proxy: responses compress loop upstream error ${resp.status}: ${errText.slice(0, 200)}]`);
             const errItemId = `msg_acp_err_${Date.now()}`;
             yield Buffer.from(
-                buildMessageItemSequence(errItemId, nextOutputIndex++, `\n[acp-proxy: upstream error ${resp.status}]\n`),
+                buildMessageItemSequence(errItemId, nextOutputIndex++, `\n[acp-proxy: upstream error ${resp.status}: ${errText.slice(0, 200)}]\n`),
                 "utf8",
             );
             yield Buffer.from(buildCompleted(responseObj), "utf8");
