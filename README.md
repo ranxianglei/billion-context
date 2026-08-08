@@ -86,7 +86,7 @@ to send each request. In the config below, `zhipu` corresponds to:
     "zhipu": {
       "url": "https://open.bigmodel.cn",
       "models": {
-        "glm-5.2": { "context": 1000000, "output": 131072 }
+        "glm-5.2": { "context": 1000000 }
       }
 ```
 
@@ -200,7 +200,7 @@ client's base URL in Step 3.
     "zhipu": {
       "url": "https://open.bigmodel.cn",
       "models": {
-        "glm-5.2": { "context": 1000000, "output": 131072 }
+        "glm-5.2": { "context": 1000000 }
       }
     },
     "anthropic": "https://api.anthropic.com"
@@ -343,8 +343,8 @@ The config file is a single JSON object. Example:
     "zhipu": {
       "url": "https://open.bigmodel.cn",
       "models": {
-        "glm-5.2": { "context": 1000000, "output": 131072 },
-        "glm-5.1": { "context": 200000, "output": 131072 }
+        "glm-5.2": { "context": 1000000 },
+        "glm-5.1": { "context": 200000 }
       }
     },
     "anthropic": "https://api.anthropic.com",
@@ -392,7 +392,7 @@ object with `url` + optional per-model context window (recommended).
   "zhipu": {
     "url": "https://open.bigmodel.cn",
     "models": {
-      "glm-5.2": { "context": 1000000, "output": 131072 },
+      "glm-5.2": { "context": 1000000 },
       "glm-5.1": { "context": 200000 }
     }
   }
@@ -403,7 +403,11 @@ The same model can have a different context window behind different providers
 (e.g. relay wraps a model with a larger window). `context` is the **input
 context limit** (used by the compressor to decide when to nudge); `output` is
 the max output tokens. Both are optional; missing values fall back to the
-built-in model table, then to `modelContextLimit`.
+built-in model table, then to `modelContextLimit`. **`output` is no longer
+needed** — the proxy forwards whatever `max_tokens` the client sends, and
+omits it otherwise so the upstream uses its own default (Anthropic clients
+always send it, so Anthropic routes are covered automatically). An `output`
+field is still accepted for backward compatibility but has no effect.
 
 > **Why declare context at all?** The LLM `/models` API does **not** return
 > context windows (verified across OpenAI, Anthropic, 智谱, comfly). They are
