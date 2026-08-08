@@ -65,7 +65,7 @@ Options (override config file / env):
   --no-auto-update              disable background self-update this run
 
 Config: ${defaultConfigFile()}
-  Set port/host/debug/providers/condense/compress/autoUpdate there. See README §Configuration.
+  Set port/host/debug/providers/compress/autoUpdate there. See README §Configuration.
   Env vars (ACP_*, BILI_*) also work and override the file; CLI flags win.
 
 Docs: https://github.com/ranxianglei/billion-context

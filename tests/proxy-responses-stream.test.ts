@@ -16,7 +16,6 @@ function makeCtx(log: (m: string) => void): { core: ReturnType<typeof createCore
             createdAt: Date.now(),
             lastSeen: Date.now(),
             requests: 0,
-            condensedToolResults: 0,
             tokensSaved: 0,
             blockContents: new Map(),
             inFlight: 0,

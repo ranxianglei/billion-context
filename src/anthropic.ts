@@ -42,7 +42,6 @@ export type AnthropicRequestBody = {
     [key: string]: unknown;
 };
 
-const CONDENSED_TAG = "[acp-proxy: condensed";
 
 export function extractSystem(system: AnthropicRequestBody["system"]): string {
     if (!system) return "";
@@ -157,45 +156,6 @@ export function coreToAnthropic(messages: CoreMessage[]): AnthropicMessage[] {
     }
     flush();
     return out;
-}
-
-export type CondenseOptions = {
-    keepRecent: number;
-    minChars: number;
-    maxKeptChars: number;
-    enabled: boolean;
-};
-
-export type CondenseResult = {
-    messages: CoreMessage[];
-    condensedCount: number;
-    charsSaved: number;
-};
-
-export function condenseOldToolResults(messages: CoreMessage[], opts: CondenseOptions): CondenseResult {
-    if (!opts.enabled) return { messages, condensedCount: 0, charsSaved: 0 };
-    const toolResultIndices: number[] = [];
-    for (let i = 0; i < messages.length; i++) {
-        const m = messages[i];
-        if (m && m.contentType === "tool-result") toolResultIndices.push(i);
-    }
-    if (toolResultIndices.length <= opts.keepRecent) {
-        return { messages, condensedCount: 0, charsSaved: 0 };
-    }
-    const toCondense = new Set(toolResultIndices.slice(0, toolResultIndices.length - opts.keepRecent));
-    let condensedCount = 0;
-    let charsSaved = 0;
-    const out = messages.map((m, i) => {
-        if (!toCondense.has(i)) return m;
-        const text = m.text ?? "";
-        if (text.length < opts.minChars) return m;
-        const head = text.slice(0, opts.maxKeptChars);
-        const stub = `${CONDENSED_TAG} ${text.length.toLocaleString()} chars]\n${head}\n[/acp-proxy]`;
-        charsSaved += text.length - stub.length;
-        condensedCount++;
-        return { ...m, text: stub };
-    });
-    return { messages: out, condensedCount, charsSaved };
 }
 
 /** Extract the conversation dimension for Anthropic: a client-provided
