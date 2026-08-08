@@ -40,54 +40,187 @@ npm install -g billion-context
 
 This installs the `bili` command (`bili-proxy` is kept as an alias).
 
-## Usage
+## Quickstart
 
-### Start the proxy
+Three steps: **start the proxy → edit the config file → point your client at it**.
+Compression is injected automatically — you only configure routing, never
+compression itself.
+
+### Step 1 — Start the proxy
 
 ```bash
 bili
 ```
 
-That's it. The proxy reads its config from `~/.config/billion-context/billion-context.json` (XDG) and listens on `127.0.0.1:8787`. If no config file exists yet, it uses sensible defaults and logs where it expects the file.
+It listens on `http://127.0.0.1:8787`. Keep this terminal open (or run in the
+background; see [Running the proxy](#running-the-proxy)).
 
-### Quick overrides (flags)
+On first run `bili` **auto-creates an empty config file** and tells you where:
+so you don't have to invent the schema from scratch:
+
+```
+[acp-config] created empty config at ~/.config/billion-context/billion-context.json — add your providers (see README Quickstart), then restart
+```
+
+### How routing works
+
+The proxy routes by a **provider name in the URL path** — the first path
+segment after the host. It strips the name and forwards the rest to that
+provider. Everything after the name is passed through untouched:
+
+```
+client baseURL:  http://localhost:8787/zhipu/api/coding/paas/v4
+                  └──────────┬──────────┘└────────┬────────┘
+                      proxy host           remaining path
+                      + provider name      (forwarded as-is)
+```
+
+This is why Step 2 has you declare named providers, and Step 3 has you put that
+same name at the start of the client's base URL — it's how the proxy knows where
+to send each request. In the config below, `zhipu` corresponds to:
+```json
+    "zhipu": {
+      "url": "https://open.bigmodel.cn",
+      "models": {
+        "glm-5.2": { "context": 1000000, "output": 131072 }
+      }
+```
+
+### Step 2 — Edit the config file
+
+Open the file from Step 1 (`~/.config/billion-context/billion-context.json`)
+and edit the `providers` block to match what you pay for. Each entry is a
+**name → URL** mapping; the name is what you'll put in the client's base URL in
+Step 3.
+
+```json
+{
+  "providers": {
+    "zhipu": {
+      "url": "https://open.bigmodel.cn",
+      "models": {
+        "glm-5.2": { "context": 1000000, "output": 131072 }
+      }
+    },
+    "anthropic": "https://api.anthropic.com"
+  }
+}
+```
+
+- Delete providers you don't use.
+- Add others (e.g. `"deepseek": "https://api.deepseek.com"`).
+- The API key is **not** here — it lives in the client; the proxy passes it
+  through untouched.
+
+After saving, **restart `bili`**. The startup banner lists your routes:
+
+```
+acp-proxy listening on http://127.0.0.1:8787 — routes: anthropic=https://api.anthropic.com, zhipu=https://open.bigmodel.cn
+```
+
+That confirms the proxy picked up your config. (Full schema — per-model context
+windows, optional fields — is in [Configuration](#configuration).)
+
+### Step 3 — Point your client at the proxy
+
+Edit the client's own config file so it sends requests to
+`http://localhost:8787/<provider>/...` (the provider name from Step 2 as the
+first path segment). Put your **real** API key in the client's config too —
+the proxy passes it through untouched.
+
+#### Pi (billion-context-pi)
+
+Open `~/.pi/agent/models.json` and change your existing provider's **`baseUrl` line** to point at the proxy — leave every other field alone:
+
+```jsonc
+// before:
+"baseUrl": "https://open.bigmodel.cn/api/coding/paas/v4",
+// after (swap the host for the proxy + the provider name you picked):
+"baseUrl": "http://localhost:8787/zhipu/api/coding/paas/v4",
+```
+
+`http://localhost:8787` is the proxy, `zhipu` is the name from Step 2, and the remaining path `/api/coding/paas/v4` is forwarded as-is to Zhipu. `apiKey`, `api`, and `models` stay unchanged.
+
+| `api` value | `baseUrl` should point at |
+|---|---|
+| `openai-completions` | an OpenAI-compatible endpoint (GLM/DeepSeek/OpenAI) → `…/zhipu/...` |
+| `anthropic-messages` | an Anthropic-compatible endpoint → `…/anthropic` |
+
+> If you use the `billion-context-pi` extension, run Pi in an isolated agent
+dir (`PI_CODING_AGENT_DIR=…`) so the client-side extension doesn't double-
+compress alongside the proxy. The `bili-test-pi` helper does this for you.
+
+#### OpenCode
+
+Open `~/.config/opencode/opencode.json` and change your existing provider's **`baseURL` line** to point at the proxy:
+
+```jsonc
+// before:
+"baseURL": "https://open.bigmodel.cn/api/coding/paas/v4"
+// after:
+"baseURL": "http://localhost:8787/zhipu/api/coding/paas/v4"
+```
+
+Everything else (`apiKey`, `models`) stays unchanged. For an Anthropic provider, change `baseURL` to `http://localhost:8787/anthropic`.
+
+#### Codex
+
+Open `~/.codex/config.toml` and change your existing provider's **`base_url` line** to point at the proxy:
+
+```toml
+# before:
+base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
+# after:
+base_url = "http://localhost:8787/zhipu/api/coding/paas/v4"
+```
+
+Everything else (`name`, `wire_api`, `env_key`) stays unchanged.
+
+> Codex's Responses API needs an upstream that speaks the Responses protocol.
+> Most regional OpenAI-compatible endpoints only speak `/chat/completions`; if
+> yours 404s on `/responses`, use a relay that speaks Responses, or the
+> official OpenAI API.
+
+#### Other clients (Cursor / Aider / Continue …)
+
+Not yet supported. The proxy currently speaks the Anthropic, OpenAI
+chat-completions, and OpenAI Responses protocols — if your client uses a
+different protocol or a non-standard auth header, it won't work yet.
+
+### Verify
+
+With the proxy running and your config saved, check it answers and that your
+first real request shows compression activity in the log:
+
+```bash
+# Health check (proxy up + where it forwards)
+curl -s http://localhost:8787/__acp/health
+# → {"ok":true,"upstream":"https://api.anthropic.com"}
+
+# Live session stats (after a real request)
+curl -s http://localhost:8787/__acp/stats
+```
+
+Then send one message from your client and watch the log
+(`~/.local/state/billion-context/bili.log`, also printed to stderr). You
+should see a `processTurn` line per request, and once the conversation grows,
+`[acp-usage] round N input=X cached=Y (cache hit Z%)` + a `compress` event.
+
+## Running the proxy
+
+### Flags
 
 ```bash
 bili --port 9000              # change listen port
-bili --host 0.0.0.0           # listen on all interfaces
+bili --host 0.0.0.0           # listen on all interfaces (see host note below)
 bili --debug                 # verbose logging (also: set "debug": true in config)
 bili --passthrough           # forward without compression (smoke-test mode)
 bili --config ~/my-bili.json # use a different config file
+bili update                  # check & install a newer version now (bypasses throttle)
+bili --no-auto-update        # disable self-update for this run
 ```
 
-Flags override the config file and env vars. `bili --help` lists them all.
-
-### Point your agent at the proxy
-
-The proxy routes by a **provider name in the URL path**. Set your agent's base URL to `http://localhost:8787/<provider>/...` and the proxy forwards to that provider (see [Configuration](#configuration) for how providers are declared).
-
-#### Claude Code (Anthropic)
-
-```bash
-export ANTHROPIC_BASE_URL=http://localhost:8787/anthropic
-export ANTHROPIC_API_KEY=sk-ant-...   # real key — passed through as-is
-claude
-```
-
-#### Codex / any OpenAI-compatible agent (zhipu / openai / deepseek)
-
-```bash
-export OPENAI_BASE_URL=http://localhost:8787/zhipu/api/coding/paas/v4
-export OPENAI_API_KEY=<your real glm key>   # passed through as-is
-codex
-```
-
-The `/zhipu/...` prefix tells the proxy to route to the `zhipu` provider; the
-remaining path is preserved.
-
-#### Cursor / Aider / others
-
-Set the base URL to `http://localhost:8787/<provider>` in the agent's settings.
+Flags override env vars and the config file. `bili --help` lists them all.
 
 ### Debugging
 
@@ -108,8 +241,6 @@ All logs are **tee'd to a file by default**: `~/.local/state/billion-context/bil
 shows them in the terminal.
 
 ```bash
-bili start                # logs → ~/.local/state/billion-context/bili.log + terminal
-bili update               # (see below)
 # Config:  "logFile": "/custom/path.log"
 # Env:     ACP_LOG_FILE=/custom/path.log   (or ACP_LOG_FILE=off to disable the file)
 ```
@@ -123,11 +254,6 @@ so you can measure prefix-cache health directly from the log.
 The proxy checks npm for a newer version on startup and every 3 minutes. When a
 newer version is found it installs it globally (`npm install -g`) and logs a
 notice — **restart `bili` to pick up the new version**.
-
-```bash
-bili update          # check & install now (manual, bypasses 3min throttle)
-bili --no-auto-update   # disable self-update for this run
-```
 
 Disable permanently via config (`"autoUpdate": false`) or env
 (`ACP_AUTO_UPDATE=0`).
@@ -259,43 +385,15 @@ built-in model table, then to `modelContextLimit`.
 **API keys are never stored in the proxy** — whatever key the agent sends is
 passed through untouched to the upstream.
 
-### Routing
-
-Point any agent at the proxy using a provider name as a path segment. The
-proxy strips the name and forwards to that provider's root URL.
-
-```
-agent baseURL:  http://localhost:8787/zhipu/api/coding/paas/v4
-                 └──────────┬──────────┘└────────┬────────┘
-                     proxy host           remaining path
-                     + provider name      (forwarded as-is)
-```
-
-#### Claude Code (Anthropic)
-
-```bash
-export ANTHROPIC_BASE_URL=http://localhost:8787/anthropic
-export ANTHROPIC_API_KEY=sk-ant-...   # real key — passed through as-is
-claude
-```
-
-#### Codex / any OpenAI-compatible agent (zhipu / openai / deepseek)
-
-```bash
-export OPENAI_BASE_URL=http://localhost:8787/zhipu/api/coding/paas/v4
-export OPENAI_API_KEY=<your real glm key>   # passed through as-is
-codex
-```
-
-The `/zhipu/...` prefix tells the proxy to route to the `zhipu` provider; the
-remaining `/api/coding/paas/v4/...` path is preserved.
-
-### Notes on provider names
+### Provider name rules
 
 - Must start with a letter, contain only letters/digits/`-`/`_`.
 - Reserved words (`v1`, `chat`, `completions`, `messages`, `models`, `api`)
   are rejected to avoid colliding with real API path segments.
 - The provider name can appear anywhere in the path; the longest match wins.
+- With **no providers** declared (e.g. you emptied the `providers` block),
+  every request is forwarded to the default `upstream` with its full path —
+  an edge case, not the normal flow.
 
 ## How sessions work
 

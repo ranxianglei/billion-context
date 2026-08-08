@@ -1,5 +1,6 @@
 import { defaultConfig, type Config } from "acp-kernel";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { configFile } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 
@@ -190,6 +191,32 @@ function loadConfigFile(): FileConfig {
         return parsed as FileConfig;
     }
     return {};
+}
+
+/** Template written on first run so the user has a file to edit instead
+ *  of having to invent the path/schema. Left empty on purpose: the proxy
+ *  can't guess your provider, so we don't put a fake one. Fill it in per
+ *  the README Quickstart, then restart `bili`. */
+const TEMPLATE_CONFIG = `{
+  "providers": {
+  }
+}`;
+
+/** On first run, seed a template config file next to where loadOptions reads.
+ *  Idempotent: never overwrites an existing file. Returns true if it created
+ *  one. Non-fatal: if the dir isn't writable, we fall through to defaults and
+ *  the proxy still runs. */
+export function ensureConfigTemplate(): boolean {
+    const p = configFile();
+    if (existsSync(p)) return false;
+    try {
+        mkdirSync(dirname(p), { recursive: true });
+        writeFileSync(p, TEMPLATE_CONFIG + "\n", "utf8");
+        loggerLog("info", `[acp-config] created empty config at ${p} — add your providers (see README Quickstart), then restart`);
+        return true;
+    } catch {
+        return false;
+    }
 }
 
 function parseRouteEntry(v: unknown): ProviderRoute | undefined {
