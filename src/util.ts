@@ -20,3 +20,13 @@ import { createHash } from "node:crypto";
 export function hashId(s: string): string {
     return createHash("sha256").update(s, "utf8").digest("hex").slice(0, 16);
 }
+
+/** Parse JSON without throwing; returns {} for empty/invalid input. Used to
+ *  tolerate malformed tool-call arguments and debug payloads. */
+export function safeJsonParse(s: string): unknown {
+    try {
+        return s ? JSON.parse(s) : {};
+    } catch {
+        return {};
+    }
+}

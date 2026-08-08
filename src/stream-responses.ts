@@ -3,6 +3,7 @@ import type { Session } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput, ACP_TEXT_OPEN, ACP_TEXT_CLOSE } from "./compress-tool.js";
 import { applyRanges, type RewriteCtx } from "./stream.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
+import { safeJsonParse } from "./util.js";
 
 /** Text-protocol mode mirrors the server flag so the rewriter only does text
  *  trigger detection when the host cannot coexist with a declared `tools`
@@ -307,14 +308,6 @@ function extractEventType(rawEvent: string): string | null {
         }
     }
     return null;
-}
-
-function safeJsonParse(s: string): unknown {
-    try {
-        return s ? JSON.parse(s) : {};
-    } catch {
-        return {};
-    }
 }
 
 export function rewriteResponsesJsonResponse(body: unknown, ctx: RewriteCtx): unknown {

@@ -7,9 +7,6 @@ import {
     type Config,
     type CoreMessage,
 } from "acp-kernel";
-import { writeFileSync, mkdirSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { tmpdir } from "node:os";
 import type { Session } from "./session.js";
 import { parseCompressInput, PROXY_TOOL_NAMES } from "./compress-tool.js";
 import { applyRanges } from "./stream.js";
@@ -206,6 +203,7 @@ export async function* compressLoopStream(
 ): AsyncGenerator<Buffer> {
     let upstream = initialUpstream;
     let activeClearTimer: (() => void) | null = null;
+    try {
     const model = (requestBody.model as string) ?? "unknown";
     let responseId = `chatcmpl-proxy-${Date.now()}`;
     const makeBase = () => ({
@@ -396,7 +394,7 @@ export async function* compressLoopStream(
                     ...makeBase(),
                     choices: [{
                         index: 0,
-                        delta: { content: `\n[acp-proxy: upstream error ${resp.status}]\n` },
+                        delta: { content: `\n[acp-proxy: upstream error ${resp.status}: ${errText.slice(0, 200)}]\n` },
                         finish_reason: null,
                     }],
                 })}\n\n`,
@@ -409,5 +407,14 @@ export async function* compressLoopStream(
 
         upstream = resp.body as ReadableStream<Uint8Array>;
         activeClearTimer = clearTimer;
+    }
+    } finally {
+        // Clear the fetch timeout timer on any exit (return / throw / normal
+        // completion) so it cannot leak across rounds or keep the event loop
+        // alive. Mirrors the responses-loop variant.
+        if (activeClearTimer) {
+            activeClearTimer();
+            activeClearTimer = null;
+        }
     }
 }

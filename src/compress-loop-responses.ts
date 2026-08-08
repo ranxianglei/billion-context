@@ -7,9 +7,6 @@ import {
     type Config,
     type CoreMessage,
 } from "acp-kernel";
-import { writeFileSync, mkdirSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { tmpdir } from "node:os";
 import type { Session } from "./session.js";
 import { parseCompressInput, PROXY_TOOL_NAMES, COMPRESS_TOOL_NAME, ACP_TEXT_OPEN, ACP_TEXT_CLOSE } from "./compress-tool.js";
 import { applyRanges } from "./stream.js";
@@ -507,7 +504,7 @@ export async function* compressLoopResponsesStream(
             ctx.log(`[acp-proxy: responses compress loop upstream error ${resp.status}: ${errText.slice(0, 200)}]`);
             const errItemId = `msg_acp_err_${Date.now()}`;
             yield Buffer.from(
-                buildMessageItemSequence(errItemId, nextOutputIndex++, `\n[acp-proxy: upstream error ${resp.status}]\n`),
+                buildMessageItemSequence(errItemId, nextOutputIndex++, `\n[acp-proxy: upstream error ${resp.status}: ${errText.slice(0, 200)}]\n`),
                 "utf8",
             );
             yield Buffer.from(buildCompleted(responseObj), "utf8");

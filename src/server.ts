@@ -7,7 +7,7 @@ import { fetchWithTimeout, MAX_REQUEST_BYTES } from "./fetch-util.js";
 import {
     anthropicToCore,
     coreToAnthropic,
-    deriveSessionId,
+    conversationSignalAnthropic,
     extractSystem,
     buildSystem,
     type AnthropicRequestBody,
@@ -16,7 +16,7 @@ import {
     openaiToCore,
     coreToOpenai,
     injectOpenaiSystem,
-    deriveSessionIdOpenai,
+    conversationSignalOpenai,
     condenseOldToolResults,
     type CondenseOptions,
     type OpenAIRequestBody,
@@ -28,16 +28,19 @@ import {
     responsesToCore,
     coreToResponses,
     injectResponsesInstructions,
-    deriveSessionIdResponses,
+    conversationSignalResponses,
 } from "./responses.js";
-import { getSession, listSessions, type Session } from "./session.js";
+import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight } from "./session.js";
 import { COMPRESS_TOOL, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressTextSystemPrompt } from "./compress-tool.js";
 import { rewriteSseStream, rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
+import { getStore } from "./persist.js";
 import { compressLoopStream } from "./compress-loop.js";
 import { compressLoopResponsesStream } from "./compress-loop-responses.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesSseStream, rewriteResponsesJsonResponse } from "./stream-responses.js";
+import { emitStreamError } from "./stream-error.js";
+import { deriveSessionId as deriveProxySessionId } from "./session-id.js";
 
 const UPSTREAM_HOP_HEADERS = new Set([
     "host",
@@ -79,10 +82,15 @@ export function resolveUpstream(opts: ProxyOptions, reqUrl: string): { upstream:
     return undefined;
 }
 
-export function startServer(opts: ProxyOptions): http.Server {
+export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     const core = createCore();
     const config: Config = opts.kernelConfig;
     const log = (level: string, msg: string) => logMsg(opts, level, msg);
+    // Reload persisted compression state before accepting traffic so sessions
+    // that survived a restart keep their folded view (otherwise long sessions
+    // re-send oversized raw history and hang).
+    await initSessions();
+    log("info", `[persist] ${getStore().enabled ? "enabled" : "disabled"}`);
     const server = http.createServer(async (req, res) => {
         try {
             await handle(req, res, opts, core, config, log);
@@ -109,6 +117,23 @@ export function startServer(opts: ProxyOptions): http.Server {
                     : ` → ${opts.upstream}`),
         );
     });
+    // Graceful shutdown: flush all dirty sessions to disk so a restart does
+    // not lose recent compression state. SIGKILL/power loss cannot flush, but
+    // debounced writes keep disk within ~500ms of in-memory state.
+    let shuttingDown = false;
+    const shutdown = (sig: string) => {
+        if (shuttingDown) return;
+        shuttingDown = true;
+        log("info", `${sig} received — flushing sessions…`);
+        // Stop accepting new requests BEFORE flushing, otherwise a late request
+        // could mutate state after its snapshot is taken and be lost.
+        server.close();
+        void flushAllSessions().finally(() => {
+            process.exit(0);
+        });
+    };
+    process.on("SIGTERM", () => shutdown("SIGTERM"));
+    process.on("SIGINT", () => shutdown("SIGINT"));
     return server;
 }
 
@@ -188,17 +213,28 @@ async function handle(
             }
         }
     }
+    // Resolve the upstream route once here so both the session id (needs the
+    // upstream ORIGIN for cross-provider isolation) and forward() (needs the
+    // full rewritten URL) use the same decision. Computed before prepare() so
+    // the session can embed the provider origin.
+    const route = resolveUpstream(opts, req.url ?? "");
+    const upstreamOrigin = route ? route.upstream : opts.upstream;
     const prepared = opts.passthrough
         ? null
         : protocol === "anthropic"
-            ? prepareAnthropic(bodyBuffer, req, opts, core, reqConfig, log)
+            ? prepareAnthropic(bodyBuffer, req, opts, core, reqConfig, log, protocol, upstreamOrigin)
             : protocol === "openai"
-              ? prepareOpenai(bodyBuffer, req, opts, core, reqConfig, log)
+              ? prepareOpenai(bodyBuffer, req, opts, core, reqConfig, log, protocol, upstreamOrigin)
               : protocol === "responses"
-                ? prepareResponses(bodyBuffer, req, opts, core, reqConfig, log)
+                ? prepareResponses(bodyBuffer, req, opts, core, reqConfig, log, protocol, upstreamOrigin)
                 : null;
     const outBody: Buffer | string = prepared ? prepared.body : bodyBuffer;
-    await forward(req, res, opts, outBody, prepared, core, reqConfig, log);
+    if (prepared) acquireInFlight(prepared.session);
+    try {
+        await forward(req, res, opts, outBody, prepared, core, reqConfig, log, route);
+    } finally {
+        if (prepared) releaseInFlight(prepared.session);
+    }
 }
 
 const ACP_TAG_MARK = "\x3cacp ";
@@ -222,11 +258,14 @@ function prepareAnthropic(
     core: CompressionCore,
     config: Config,
     log: (level: string, msg: string) => void,
+    protocol: "anthropic" | "openai" | "responses",
+    upstreamOrigin: string,
 ): Prepared {
     const parsed = JSON.parse(bodyBuffer.toString("utf8")) as AnthropicRequestBody;
     const stream = parsed.stream === true;
-    const sessionId = deriveSessionId(parsed, headerValue(req, opts.sessionHeader));
-    const session = getSession(sessionId);
+    const sessionHeader = headerValue(req, opts.sessionHeader);
+    const sessionId = deriveProxySessionId(req.headers, protocol, upstreamOrigin, "", { clientConversation: conversationSignalAnthropic(parsed, sessionHeader) });
+    const session = getSession(sessionId, { protocol, upstreamOrigin });
     session.requests++;
 
     let processedMessages: CoreMessage[] = [];
@@ -265,7 +304,8 @@ function prepareAnthropic(
     }
 
     const rebuilt: AnthropicRequestBody = { ...parsed, messages: rebuiltMessages, system: systemOut, tools: toolsOut };
-    return { body: JSON.stringify(rebuilt), session, processedMessages, protocol: "anthropic", stream, compressInjected: opts.compress.injectTool };
+    markDirty(session);
+    return { body: JSON.stringify(rebuilt), session, processedMessages, protocol: "anthropic", stream, compressInjected: opts.compress.injectTool } as Prepared;
 }
 
 function prepareOpenai(
@@ -275,11 +315,14 @@ function prepareOpenai(
     core: CompressionCore,
     config: Config,
     log: (level: string, msg: string) => void,
+    protocol: "anthropic" | "openai" | "responses",
+    upstreamOrigin: string,
 ): Prepared {
     const parsed = JSON.parse(bodyBuffer.toString("utf8")) as OpenAIRequestBody;
     const stream = parsed.stream === true;
-    const sessionId = deriveSessionIdOpenai(parsed, headerValue(req, opts.sessionHeader));
-    const session = getSession(sessionId);
+    const sessionHeader = headerValue(req, opts.sessionHeader);
+    const sessionId = deriveProxySessionId(req.headers, protocol, upstreamOrigin, "", { clientConversation: conversationSignalOpenai(parsed, sessionHeader) });
+    const session = getSession(sessionId, { protocol, upstreamOrigin });
     session.requests++;
 
     let processedMessages: CoreMessage[] = [];
@@ -328,7 +371,8 @@ function prepareOpenai(
     }
 
     const rebuilt: OpenAIRequestBody = { ...parsed, messages: rebuiltMessages, tools: toolsOut as OpenAITool[] | undefined };
-    return { body: JSON.stringify(rebuilt), session, processedMessages, protocol: "openai", stream, compressInjected: shouldInject };
+    markDirty(session);
+    return { body: JSON.stringify(rebuilt), session, processedMessages, protocol: "openai", stream, compressInjected: shouldInject } as Prepared;
 }
 
 function prepareResponses(
@@ -338,11 +382,14 @@ function prepareResponses(
     core: CompressionCore,
     config: Config,
     log: (level: string, msg: string) => void,
+    protocol: "anthropic" | "openai" | "responses",
+    upstreamOrigin: string,
 ): Prepared {
     const parsed = JSON.parse(bodyBuffer.toString("utf8")) as ResponsesRequestBody;
     const stream = parsed.stream === true;
-    const sessionId = deriveSessionIdResponses(parsed, headerValue(req, opts.sessionHeader));
-    const session = getSession(sessionId);
+    const sessionHeader = headerValue(req, opts.sessionHeader);
+    const sessionId = deriveProxySessionId(req.headers, protocol, upstreamOrigin, "", { clientConversation: conversationSignalResponses(parsed, sessionHeader) });
+    const session = getSession(sessionId, { protocol, upstreamOrigin });
     session.requests++;
 
     let processedMessages: CoreMessage[] = [];
@@ -418,7 +465,8 @@ function prepareResponses(
         });
         log("info", `[${sessionId}] responses forward tools=[${fwdTools.join(",")}] injectTool=${shouldInject} NO_INJECT_TOOL=${!!process.env.ACP_NO_INJECT_TOOL} NO_COMPRESS_PROMPT=${!!process.env.ACP_NO_COMPRESS_PROMPT}`);
     }
-    return { body: JSON.stringify(rebuilt), session, processedMessages, protocol: "responses", stream, compressInjected: shouldInject };
+    markDirty(session);
+    return { body: JSON.stringify(rebuilt), session, processedMessages, protocol: "responses", stream, compressInjected: shouldInject } as Prepared;
 }
 
 function injectSystem(
@@ -483,10 +531,26 @@ async function forward(
     core: CompressionCore,
     config: Config,
     log: (level: string, msg: string) => void,
+    route: ReturnType<typeof resolveUpstream>,
 ): Promise<void> {
-    const route = resolveUpstream(opts, req.url ?? "");
     const upstreamUrl = route ? route.rewrittenUrl : opts.upstream + (req.url ?? "");
     log("info", `forward ${req.method} ${req.url ?? ""} → ${upstreamUrl}${route ? ` (${route.provider})` : ""}`);
+    if (process.env.ACP_DEBUG && prepared) {
+        const sid = prepared.session.id;
+        const hdrKeys = Object.keys(req.headers);
+        log("info", `[${sid}] client headers: ${hdrKeys.join(",")}`);
+        for (const k of ["authorization", "x-api-key", "x-session-id", "x-session-affinity", "x-acp-session", "x-opencode-session", "prompt-cache-key", "anthropic-beta"]) {
+            const v = req.headers[k] ?? req.headers[k.toLowerCase()];
+            if (v) {
+                const s = Array.isArray(v) ? v.join(",") : String(v);
+                // Mask all but a short prefix so the header NAME is visible
+                // (so we know the key is sent and roughly how) without leaking
+                // the credential into the log.
+                const masked = /key|auth|token/i.test(k) ? s.slice(0, 8) + "..." + s.slice(-4) + ` (${s.length} chars)` : s.slice(0, 60);
+                log("info", `[${sid}] client hdr ${k}=${masked}`);
+            }
+        }
+    }
     if (opts.debug && typeof body === "string") {
         try {
             const parsed = JSON.parse(body);
@@ -541,6 +605,16 @@ async function forward(
         clearUpstreamTimer();
         return;
     }
+    // P1.2: if the upstream returned a non-2xx (auth, rate-limit, context too
+    // long, ...), do NOT route the error body through the SSE rewriter — it has
+    // no SSE events and would be silently swallowed, leaving the client with
+    // an empty stream and no idea why. Pass status + body through verbatim.
+    if (!upstream.ok) {
+        res.writeHead(upstream.status, respHeaders);
+        await pipeThrough(upstream.body, res);
+        clearUpstreamTimer();
+        return;
+    }
     const ctx: RewriteCtx = {
         core,
         config,
@@ -557,6 +631,11 @@ async function forward(
             streamToRead = a;
             dumpRaw = dumpStreamToFile(b, opts.dumpSse, `${Date.now()}-${prepared.session.id}-raw.sse`);
         }
+        // P1.1: wrap the rewriter loops in try/catch. If a rewriter throws
+        // (decompress/search edge case, JSON.parse failure, fetch abort),
+        // emitStreamError sends a protocol-appropriate error + finish so the
+        // client ends cleanly instead of seeing a bare truncated stream.
+        try {
         if (prepared.protocol === "openai") {
             const parsedReq = JSON.parse(typeof body === "string" ? body : body.toString("utf8"));
             const reqHeaders: Record<string, string> = {};
@@ -616,8 +695,12 @@ async function forward(
             }
         }
         res.end();
-        clearUpstreamTimer();
-        if (dumpRaw) await dumpRaw;
+        } catch (e) {
+            emitStreamError(res, prepared.protocol, (e as Error)?.message ?? String(e), (m) => log("error", `[${prepared.session.id}] ${m}`));
+        } finally {
+            clearUpstreamTimer();
+            if (dumpRaw) await dumpRaw;
+        }
     } else {
         const buf = await upstream.arrayBuffer();
         const text = Buffer.from(buf).toString("utf8");
@@ -636,6 +719,9 @@ async function forward(
         }
         clearUpstreamTimer();
     }
+    // State may have mutated during response streaming (compress created a
+    // block, decompress deactivated one) — persist the final snapshot.
+    markDirty(prepared.session);
 }
 
 async function pipeThrough(stream: ReadableStream<Uint8Array>, res: http.ServerResponse): Promise<void> {

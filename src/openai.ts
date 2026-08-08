@@ -152,7 +152,10 @@ export function injectOpenaiSystem(messages: OpenAIMessage[], parts: string[]): 
 
 export { condenseOldToolResults, type CondenseOptions, type CondenseResult };
 
-export function deriveSessionIdOpenai(body: OpenAIRequestBody, headerValue?: string): string {
+/** Extract the conversation dimension for OpenAI Chat: a client-provided
+ *  session header if present, else a content fingerprint of the first user
+ *  message. See conversationSignalAnthropic for the full rationale. */
+export function conversationSignalOpenai(body: OpenAIRequestBody, headerValue?: string): string {
     if (headerValue && headerValue.trim()) return headerValue.trim();
     const firstUser = body.messages.find((m) => m.role === "user");
     const seed = firstUser ? stringContent(firstUser.content).slice(0, 200) : "default";
