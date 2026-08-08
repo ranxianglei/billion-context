@@ -46,15 +46,6 @@ type StreamState = {
     triggerBuf: string;
     /** Completed trigger payloads awaiting execution at end of stream. */
     triggerPayloads: string[];
-    /** --- injected-tag echo stripper state --- */
-    /** Held-back output_text that may contain a partial or complete echoed
-     *  `<acp ...>...</acp>` metadata tag. The model should never emit these;
-     *  if it does, they are stripped before reaching the client. */
-    stripBuf: string;
-    /** Last seen message item_id / output_index for output_text deltas, reused
-     *  when flushing stripper remainder at stream end. */
-    lastTextItemId: string | null;
-    lastOutputIndex: number;
 };
 
 function newState(): StreamState {
@@ -69,65 +60,7 @@ function newState(): StreamState {
         inTrigger: false,
         triggerBuf: "",
         triggerPayloads: [],
-        stripBuf: "",
-        lastTextItemId: null,
-        lastOutputIndex: 0,
     };
-}
-
-// --- Injected-tag echo stripper ---
-// The proxy appends `<acp tokens=".." type="..">mNNNNN</acp>` metadata tags to
-// INPUT messages so the model can reference them. If the model echoes a tag in
-// its OUTPUT, it leaks system metadata to the client as noise. These helpers
-// strip echoed tags from the streaming output. The open marker `<acp ` (with a
-// trailing space) is distinct from the text-protocol trigger `<acp_compress>`,
-// and the close `</acp>` is distinct from `</acp_compress>`, so the two never
-// interfere.
-const TAG_OPEN = "<acp ";
-const TAG_CLOSE = "</acp>";
-
-/** Length of the longest suffix of `text` that is a prefix of TAG_OPEN, i.e. a
- *  run of chars that could still grow into an open marker in the next delta. */
-function partialOpenHoldLen(text: string): number {
-    const marker = TAG_OPEN;
-    for (let n = Math.min(text.length, marker.length - 1); n > 0; n--) {
-        if (marker.startsWith(text.slice(text.length - n))) return n;
-    }
-    return 0;
-}
-
-/** Feed a chunk of model output through the stripper. Returns text safe to emit;
- *  any complete echoed tag is dropped, and a potential partial open marker is
- *  held back in `state.stripBuf`. */
-function stripInjectedTagsFeed(state: StreamState, chunk: string): string {
-    state.stripBuf += chunk;
-    let out = "";
-    for (;;) {
-        const openIdx = state.stripBuf.indexOf(TAG_OPEN);
-        if (openIdx === -1) {
-            const hold = partialOpenHoldLen(state.stripBuf);
-            const cut = state.stripBuf.length - hold;
-            out += state.stripBuf.slice(0, cut);
-            state.stripBuf = state.stripBuf.slice(cut);
-            break;
-        }
-        out += state.stripBuf.slice(0, openIdx);
-        state.stripBuf = state.stripBuf.slice(openIdx);
-        const closeIdx = state.stripBuf.indexOf(TAG_CLOSE);
-        if (closeIdx === -1) break; // tag opened, not yet closed — hold back
-        state.stripBuf = state.stripBuf.slice(closeIdx + TAG_CLOSE.length);
-    }
-    return out;
-}
-
-/** At stream end, return any buffered text. An unclosed `<acp ...` fragment is
- *  dropped (malformed metadata, not model content); only the text before it is
- *  recovered. */
-function stripInjectedTagsFlush(state: StreamState): string {
-    const openIdx = state.stripBuf.indexOf(TAG_OPEN);
-    const rest = openIdx === -1 ? state.stripBuf : state.stripBuf.slice(0, openIdx);
-    state.stripBuf = "";
-    return rest;
 }
 
 /** Drain safe-to-emit text from the pending buffer, holding back any partial
@@ -215,17 +148,6 @@ export async function* rewriteResponsesSseStream(
                 if (output.length >= 8192) yield flush();
             }
         }
-        // Flush any text held back by the injected-tag stripper. An unclosed
-        // tag fragment is dropped; only the safe prefix is recovered. In text
-        // mode the remainder feeds the trigger buffer instead of emitting.
-        const flushed = stripInjectedTagsFlush(state);
-        if (flushed) {
-            if (TEXT_PROTOCOL) {
-                state.textPending += flushed;
-            } else if (state.lastTextItemId) {
-                output += sse("response.output_text.delta", { item_id: state.lastTextItemId, output_index: state.lastOutputIndex, delta: flushed });
-            }
-        }
         output += buildResponsesTail(state, ctx);
         if (output) yield flush();
     } finally {
@@ -278,28 +200,14 @@ function routeResponsesEvent(rawEvent: string, state: StreamState): string | nul
         return rawEvent + "\n\n";
     }
 
-    // Strip echoed `<acp ...>...</acp>` metadata tags from model output. The
-    // tags are injected into the INPUT so the model can reference messages;
-    // an echo in the OUTPUT leaks system metadata to the client. Runs in both
-    // modes: function mode emits the stripped text inline, text mode feeds the
-    // stripped text into the trigger buffer (so triggers still parse).
-    if (t === "response.output_text.delta") {
+    // Text-protocol: buffer ALL output_text deltas, suppress streaming, and
+    // process the full text once at stream end. This sacrifices streaming for
+    // correctness (trigger may span deltas; completion ordering). Acceptable
+    // for the feasibility test.
+    if (TEXT_PROTOCOL && t === "response.output_text.delta") {
         const delta = obj.delta as string | undefined;
-        const itemId = typeof obj.item_id === "string" ? obj.item_id : null;
-        if (itemId) {
-            state.lastTextItemId = itemId;
-            if (typeof obj.output_index === "number") state.lastOutputIndex = obj.output_index;
-        }
-        if (typeof delta !== "string" || delta.length === 0) {
-            return TEXT_PROTOCOL ? null : rawEvent + "\n\n";
-        }
-        const safe = stripInjectedTagsFeed(state, delta);
-        if (TEXT_PROTOCOL) {
-            state.textPending += safe;
-            return null;
-        }
-        if (safe.length === 0) return null;
-        return sse("response.output_text.delta", { ...obj, delta: safe });
+        if (typeof delta === "string") state.textPending += delta;
+        return null;
     }
     if (TEXT_PROTOCOL && t === "response.output_text.done") {
         return null;
@@ -416,18 +324,6 @@ export function rewriteResponsesJsonResponse(body: unknown, ctx: RewriteCtx): un
         status?: string;
     };
     if (!Array.isArray(b.output)) return body;
-    // Strip echoed `<acp ...>...</acp>` metadata tags from all output text,
-    // regardless of whether compress ran. The model should never emit these;
-    // if present they are echoes of injected metadata.
-    for (const item of b.output) {
-        if (item.type === "message" && Array.isArray(item.content)) {
-            for (const part of item.content) {
-                if (part && part.type === "output_text" && typeof part.text === "string") {
-                    part.text = part.text.replace(/<acp [^>]*>[\s\S]*?<\/acp>/g, "");
-                }
-            }
-        }
-    }
     let converted = false;
     let sawReal = false;
     const noteParts: string[] = [];
