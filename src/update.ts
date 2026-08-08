@@ -125,11 +125,11 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         loggerLog("info", `[update] new version found: ${opts.currentVersion} → ${latest}, installing…`);
 
         const installed = await installLatest(opts.packageName, latest);
-        notified.add(latest);
         if (installed) {
+            notified.add(latest);
             loggerLog("info", `[update] installed ${opts.packageName} ${opts.currentVersion} → ${latest}. Restart to finish.`);
         } else {
-            loggerLog("warn", `[update] install failed; run manually: npm install -g ${opts.packageName}@${latest}`);
+            loggerLog("warn", `[update] install failed; will retry next cycle. Or: npm install -g ${opts.packageName}@${latest}`);
         }
     } catch (e) {
         loggerLog("warn", `[update] check failed: ${String(e)}`);
