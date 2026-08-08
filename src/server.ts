@@ -185,7 +185,21 @@ async function handle(
         res.end(JSON.stringify({ ok: true, upstream: opts.upstream }));
         return;
     }
-    const bodyBuffer = await readBody(req);
+    let bodyBuffer: Buffer;
+    try {
+        bodyBuffer = await readBody(req);
+    } catch (err) {
+        if (err instanceof BodyTooLargeError) {
+            log("warn", `413: request body exceeds ${err.limit} bytes`);
+            res.writeHead(413, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: { type: "request_too_large", message: err.message } }));
+            return;
+        }
+        log("warn", `read body failed: ${String(err)}`);
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { type: "invalid_request", message: String(err) } }));
+        return;
+    }
     const url = req.url ?? "";
     // Strip query string before matching path suffixes: a request like
     // `/v1/responses?foo=1` must still be detected as the responses protocol.
@@ -837,7 +851,17 @@ function headerValue(req: http.IncomingMessage, name: string): string | undefine
     return undefined;
 }
 
-function readBody(req: http.IncomingMessage): Promise<Buffer> {
+/** A thrown BodyTooLargeError lets handle() respond 413 cleanly before
+ *  destroying the request. Avoids a bare req.destroy() that would reject
+ *  readBody but leave the client connection with no HTTP response. */
+export class BodyTooLargeError extends Error {
+    constructor(public readonly limit: number) {
+        super(`request body exceeds ${limit} bytes`);
+        this.name = "BodyTooLargeError";
+    }
+}
+
+export function readBody(req: http.IncomingMessage): Promise<Buffer> {
     return new Promise((resolve, reject) => {
         const chunks: Buffer[] = [];
         let size = 0;
@@ -847,8 +871,10 @@ function readBody(req: http.IncomingMessage): Promise<Buffer> {
             size += c.length;
             if (size > MAX_REQUEST_BYTES) {
                 aborted = true;
-                reject(new Error(`request body exceeds ${MAX_REQUEST_BYTES} bytes`));
-                req.destroy();
+                // Reject FIRST so handle() can write a 413 and return.
+                // Then drain remaining data so the socket can close
+                // cleanly instead of lingering mid-request.
+                reject(new BodyTooLargeError(MAX_REQUEST_BYTES));
                 return;
             }
             chunks.push(c);
