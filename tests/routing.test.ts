@@ -11,7 +11,7 @@ const writeRoutes = (name: string, obj: unknown) => {
     writeFileSync(p, JSON.stringify(obj));
     return p;
 };
-const OPTS = (routes: Record<string, string>): ProxyOptions => ({ ...loadOptions({}), routes });
+const OPTS = (routes: Record<string, string>): ProxyOptions => ({ ...loadOptions({}), routes: Object.fromEntries(Object.entries(routes).map(([k, v]) => [k, { url: v }])) });
 
 test("routes are parsed as an object map { provider: url }", () => {
     const opts = loadOptions({ ACP_PROVIDERS: writeRoutes("obj", {}) });
@@ -23,15 +23,24 @@ test("routes are parsed as an object map { provider: url }", () => {
 test("routes object strips trailing slashes from baseURLs", () => {
     const p = writeRoutes("slash", { glm: "https://bigmodel.cn/", anthropic: "https://api.anthropic.com/" });
     const opts = loadOptions({ ACP_PROVIDERS: p });
-    assert.equal(opts.routes.glm, "https://bigmodel.cn");
-    assert.equal(opts.routes.anthropic, "https://api.anthropic.com");
+    assert.equal(opts.routes.glm?.url, "https://bigmodel.cn");
+    assert.equal(opts.routes.anthropic?.url, "https://api.anthropic.com");
     unlinkSync(p);
 });
 
-test("routes ignore non-string entries (defensive)", () => {
-    const p = writeRoutes("defensive", { glm: "https://ok", bad: 123, also: null });
+test("routes accept object form { url, models }", () => {
+    const p = writeRoutes("obj-form", { glm: { url: "https://bigmodel.cn", models: { "glm-5.2": { context: 1000000 } } } });
     const opts = loadOptions({ ACP_PROVIDERS: p });
-    assert.equal(opts.routes.glm, "https://ok");
+    assert.equal(opts.routes.glm?.url, "https://bigmodel.cn");
+    assert.equal(opts.routes.glm?.models?.["glm-5.2"]?.context, 1000000);
+    unlinkSync(p);
+});
+
+test("routes ignore invalid entries (defensive)", () => {
+    const p = writeRoutes("defensive", { glm: "https://ok", bad: 123, also: null, obj: { url: "https://obj" } });
+    const opts = loadOptions({ ACP_PROVIDERS: p });
+    assert.equal(opts.routes.glm?.url, "https://ok");
+    assert.equal(opts.routes.obj?.url, "https://obj");
     assert.ok(!("bad" in opts.routes));
     assert.ok(!("also" in opts.routes));
     unlinkSync(p);
@@ -59,7 +68,7 @@ test("lookupContextLimit returns undefined for unknown models", () => {
 test("path-based routing does not require apiKey in route config", () => {
     const p = writeRoutes("nokey", { glm: "https://bigmodel.cn" });
     const opts = loadOptions({ ACP_PROVIDERS: p });
-    assert.equal(opts.routes.glm, "https://bigmodel.cn");
+    assert.equal(opts.routes.glm?.url, "https://bigmodel.cn");
     assert.ok(!("apiKey" in opts));
     assert.ok(!("apiKey" in opts.routes));
     unlinkSync(p);

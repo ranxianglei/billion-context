@@ -2,7 +2,7 @@ import http from "node:http";
 import fs from "node:fs";
 import { createCore, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, estimateTokensFast, renderNudgeText, deactivateBlock } from "acp-kernel";
 import type { ProxyOptions } from "./config.js";
-import { lookupContextLimit } from "./config.js";
+import { resolveContextLimit } from "./config.js";
 import { fetchWithTimeout, MAX_REQUEST_BYTES } from "./fetch-util.js";
 import {
     anthropicToCore,
@@ -73,7 +73,7 @@ export function resolveUpstream(opts: ProxyOptions, reqUrl: string): { upstream:
         if (RESERVED.has(name.toLowerCase())) continue;
         const idx = segments.indexOf(name);
         if (idx < 0) continue;
-        const base = opts.routes[name].replace(/\/$/, "");
+        const base = opts.routes[name].url.replace(/\/$/, "");
         // Drop the single provider-name segment, keep the rest.
         const rest = [...segments.slice(0, idx), ...segments.slice(idx + 1)].join("/");
         const rewrittenUrl = base + rest;
@@ -200,25 +200,26 @@ async function handle(
                     ? "responses"
                     : null
             : null;
-    // Per-request context limit: look up body.model in the built-in table.
-    // Lets the proxy run with the right window per model without asking the
-    // user to configure one. Falls back to the global default.
-    let reqConfig = config;
-    if (protocol && bodyBuffer.length > 0) {
-        const m = bodyBuffer.toString("utf8").match(/"model"\s*:\s*"([^"]+)"/);
-        if (m) {
-            const limit = lookupContextLimit(m[1]);
-            if (limit && limit !== config.modelContextLimit) {
-                reqConfig = { ...config, modelContextLimit: limit };
-            }
-        }
-    }
     // Resolve the upstream route once here so both the session id (needs the
     // upstream ORIGIN for cross-provider isolation) and forward() (needs the
     // full rewritten URL) use the same decision. Computed before prepare() so
     // the session can embed the provider origin.
     const route = resolveUpstream(opts, req.url ?? "");
     const upstreamOrigin = route ? route.upstream : opts.upstream;
+    // Per-request context limit: look up body.model against the per-route model
+    // declaration in providers.json first (same model can have different
+    // windows behind different relays), then the built-in table. Falls back to
+    // the global env default if neither matches.
+    let reqConfig = config;
+    if (protocol && bodyBuffer.length > 0) {
+        const m = bodyBuffer.toString("utf8").match(/"model"\s*:\s*"([^"]+)"/);
+        if (m) {
+            const limit = resolveContextLimit(opts.routes, route?.provider, m[1]);
+            if (limit && limit !== config.modelContextLimit) {
+                reqConfig = { ...config, modelContextLimit: limit };
+            }
+        }
+    }
     const prepared = opts.passthrough
         ? null
         : protocol === "anthropic"
