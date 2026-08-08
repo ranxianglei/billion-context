@@ -73,6 +73,15 @@ bili
 
 这就是为什么第 2 步让你声明带名字的 provider、第 3 步又让你把同样的名字
 放在客户端 base URL 的开头 —— 代理凭这个知道每条请求发到哪。
+稍后配置中`zhipu`被代表为 
+```json
+    "zhipu": {
+      "url": "https://open.bigmodel.cn",
+      "models": {
+        "glm-5.2": { "context": 1000000, "output": 131072 }
+      }
+```
+
 
 ### 第 2 步 —— 编辑配置文件
 
@@ -83,13 +92,13 @@ bili
 ```json
 {
   "providers": {
-    "anthropic": "https://api.anthropic.com",
     "zhipu": {
       "url": "https://open.bigmodel.cn",
       "models": {
         "glm-5.2": { "context": 1000000, "output": 131072 }
       }
-    }
+    }，
+    "anthropic": "https://api.anthropic.com",
   }
 }
 ```
@@ -97,19 +106,6 @@ bili
 - 删掉你不用的 provider。
 - 添加其他的(例如 `"deepseek": "https://api.deepseek.com"`)。
 - API key **不**写在这里 —— key 在客户端那边,代理原样透传。
-
-每个**左边的名字**就是代理在 URL 路径里要找的 key。名字是你随便起的
-—— 只是个标签 —— 但必须和第 3 步里用的路径一致:
-
-| 配置名字(第 2 步)| 对应第 3 步的路径段 |
-|---|---|
-| `"zhipu": ...` | `http://localhost:8787/zhipu/...` |
-| `"anthropic": ...` | `http://localhost:8787/anthropic` |
-| `"deepseek": ...` | `http://localhost:8787/deepseek` |
-
-所以 `http://localhost:8787/zhipu/api/coding/paas/v4` 的意思是:*路由到名为
-`zhipu` 的 provider(→ `https://open.bigmodel.cn`),剩余路径
-(`/api/coding/paas/v4`)原样转发*。
 
 保存后**重启 `bili`**。启动行列出你的路由:
 
@@ -126,6 +122,8 @@ acp-proxy listening on http://127.0.0.1:8787 — routes: anthropic=https://api.a
 第一段)。把你的**真实** API key 也填进客户端配置 —— 代理原样透传。
 
 #### Pi(billion-context-pi)
+
+！！！！这里写由什么改成什么 ，我理解只改1行 ！！！！！！！！
 
 `~/.pi/agent/models.json` —— 声明一个指向你 proxy 路由的 provider,然后在
 `settings.json` 里设为默认:
