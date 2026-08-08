@@ -2,7 +2,7 @@ import http from "node:http";
 import fs from "node:fs";
 import { createCore, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, estimateTokensFast, renderNudgeText, deactivateBlock } from "acp-kernel";
 import type { ProxyOptions } from "./config.js";
-import { lookupContextLimit } from "./config.js";
+import { resolveContextLimit } from "./config.js";
 import { fetchWithTimeout, MAX_REQUEST_BYTES } from "./fetch-util.js";
 import {
     anthropicToCore,
@@ -30,7 +30,7 @@ import {
     injectResponsesInstructions,
     conversationSignalResponses,
 } from "./responses.js";
-import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight } from "./session.js";
+import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, withSessionLock } from "./session.js";
 import { COMPRESS_TOOL, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressTextSystemPrompt } from "./compress-tool.js";
 import { rewriteSseStream, rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
@@ -40,7 +40,7 @@ import { compressLoopResponsesStream } from "./compress-loop-responses.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesSseStream, rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { emitStreamError } from "./stream-error.js";
-import { deriveSessionId as deriveProxySessionId } from "./session-id.js";
+import { deriveSessionId as deriveProxySessionId, affinityToken, clientConversationHeader } from "./session-id.js";
 
 const UPSTREAM_HOP_HEADERS = new Set([
     "host",
@@ -73,7 +73,7 @@ export function resolveUpstream(opts: ProxyOptions, reqUrl: string): { upstream:
         if (RESERVED.has(name.toLowerCase())) continue;
         const idx = segments.indexOf(name);
         if (idx < 0) continue;
-        const base = opts.routes[name].replace(/\/$/, "");
+        const base = opts.routes[name].url.replace(/\/$/, "");
         // Drop the single provider-name segment, keep the rest.
         const rest = [...segments.slice(0, idx), ...segments.slice(idx + 1)].join("/");
         const rewrittenUrl = base + rest;
@@ -185,7 +185,21 @@ async function handle(
         res.end(JSON.stringify({ ok: true, upstream: opts.upstream }));
         return;
     }
-    const bodyBuffer = await readBody(req);
+    let bodyBuffer: Buffer;
+    try {
+        bodyBuffer = await readBody(req);
+    } catch (err) {
+        if (err instanceof BodyTooLargeError) {
+            log("warn", `413: request body exceeds ${err.limit} bytes`);
+            res.writeHead(413, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: { type: "request_too_large", message: err.message } }));
+            return;
+        }
+        log("warn", `read body failed: ${String(err)}`);
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { type: "invalid_request", message: String(err) } }));
+        return;
+    }
     const url = req.url ?? "";
     // Strip query string before matching path suffixes: a request like
     // `/v1/responses?foo=1` must still be detected as the responses protocol.
@@ -200,40 +214,77 @@ async function handle(
                     ? "responses"
                     : null
             : null;
-    // Per-request context limit: look up body.model in the built-in table.
-    // Lets the proxy run with the right window per model without asking the
-    // user to configure one. Falls back to the global default.
-    let reqConfig = config;
-    if (protocol && bodyBuffer.length > 0) {
-        const m = bodyBuffer.toString("utf8").match(/"model"\s*:\s*"([^"]+)"/);
-        if (m) {
-            const limit = lookupContextLimit(m[1]);
-            if (limit && limit !== config.modelContextLimit) {
-                reqConfig = { ...config, modelContextLimit: limit };
-            }
-        }
-    }
     // Resolve the upstream route once here so both the session id (needs the
     // upstream ORIGIN for cross-provider isolation) and forward() (needs the
     // full rewritten URL) use the same decision. Computed before prepare() so
     // the session can embed the provider origin.
     const route = resolveUpstream(opts, req.url ?? "");
     const upstreamOrigin = route ? route.upstream : opts.upstream;
-    const prepared = opts.passthrough
-        ? null
-        : protocol === "anthropic"
-            ? prepareAnthropic(bodyBuffer, req, opts, core, reqConfig, log, protocol, upstreamOrigin)
-            : protocol === "openai"
-              ? prepareOpenai(bodyBuffer, req, opts, core, reqConfig, log, protocol, upstreamOrigin)
-              : protocol === "responses"
-                ? prepareResponses(bodyBuffer, req, opts, core, reqConfig, log, protocol, upstreamOrigin)
-                : null;
-    const outBody: Buffer | string = prepared ? prepared.body : bodyBuffer;
-    if (prepared) acquireInFlight(prepared.session);
-    try {
-        await forward(req, res, opts, outBody, prepared, core, reqConfig, log, route);
-    } finally {
-        if (prepared) releaseInFlight(prepared.session);
+    // Per-request context limit: look up body.model against the per-route model
+    // declaration in providers.json first (same model can have different
+    // windows behind different relays), then the built-in table. Falls back to
+    // the global env default if neither matches.
+    // Parse body once and reuse everywhere (fixes duplicate JSON.parse).
+    let parsed: unknown = null;
+    if (protocol && bodyBuffer.length > 0) {
+        try {
+            parsed = JSON.parse(bodyBuffer.toString("utf8"));
+        } catch {
+            parsed = null;
+        }
+    }
+    // Per-request context limit: look up body.model against the per-route
+    // model declaration first, then the built-in table.
+    let reqConfig = config;
+    if (parsed && typeof parsed === "object") {
+        const model = (parsed as { model?: string }).model;
+        if (model) {
+            const limit = resolveContextLimit(opts.routes, route?.provider, model);
+            if (limit && limit !== config.modelContextLimit) {
+                reqConfig = { ...config, modelContextLimit: limit };
+            }
+        }
+    }
+    let prepared: Prepared | null = null;
+    if (!opts.passthrough && protocol && parsed && typeof parsed === "object") {
+        const sessionHeader = headerValue(req, opts.sessionHeader);
+        const conversation =
+            protocol === "anthropic"
+                ? conversationSignalAnthropic(parsed as AnthropicRequestBody, sessionHeader)
+                : protocol === "openai"
+                  ? conversationSignalOpenai(parsed as OpenAIRequestBody, sessionHeader)
+                  : conversationSignalResponses(parsed as ResponsesRequestBody, sessionHeader);
+        const sessionId = deriveProxySessionId(req.headers, protocol, upstreamOrigin, conversation);
+        const session = getSession(sessionId, { protocol, upstreamOrigin });
+        // Affinity token to forward upstream: prefer the client's own session
+        // header (opencode x-session-affinity, codex body.session_id); if the
+        // client sent none (pi), synthesize ses_<conversation> so upstream
+        // sticky-routing / cache pools still get a stable key. See README
+        // "Session identity".
+        const affinity = affinityToken(req.headers, conversation);
+        // Serialize per-session: prepare (processTurn mutates state) + forward
+        // (stream rewriter mutates state via compress/decompress) must not
+        // interleave across concurrent requests on the same session.
+        await withSessionLock(session, async () => {
+            prepared =
+                protocol === "anthropic"
+                    ? prepareAnthropic(parsed as AnthropicRequestBody, req, opts, core, reqConfig, log, session)
+                    : protocol === "openai"
+                      ? prepareOpenai(parsed as OpenAIRequestBody, req, opts, core, reqConfig, log, session)
+                      : prepareResponses(parsed as ResponsesRequestBody, req, opts, core, reqConfig, log, session);
+            acquireInFlight(session);
+            try {
+                await forward(req, res, opts, prepared!.body, prepared!, core, reqConfig, log, route, affinity);
+            } finally {
+                releaseInFlight(session);
+            }
+        });
+    }
+    if (!prepared) {
+        if (protocol === null && !opts.passthrough) {
+            log("warn", `unrecognized path ${url} — not a known protocol (/chat/completions, /v1/messages, /responses); forwarding unchanged`);
+        }
+        await forward(req, res, opts, bodyBuffer, null, core, reqConfig, log, route, undefined);
     }
 }
 
@@ -251,21 +302,31 @@ function diagTagSummary(messages: CoreMessage[], sessionId: string, strategy: st
     return `[${sessionId}] processTurn: ${messages.length} msgs, renderTags=${strategy}, ${textTagged} text tagged, ${toolTagged} tool tagged (should be 0 with text-only)`;
 }
 
+function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; contextUsage: number; tier: number | null; breakdown?: Record<string, number> } | null }, sessionId: string, tokenCount: number, limit: number): string {
+    const n = turn.nudge;
+    if (!n) return `[${sessionId}] nudge: unavailable`;
+    const b = n.breakdown ?? {};
+    const pct = limit > 0 ? `${Math.round((tokenCount / limit) * 100)}%` : "?";
+    const growth = b["growth"] ?? 0;
+    const floor = b["growthFloor"] ?? 0;
+    const interval = b["nudgeGrowthTokens"] ?? 0;
+    const pendingT1 = b["pendingT1"] ?? 0;
+    const ref = b["growthReference"] ?? 0;
+    const inject = n.shouldInject ? `INJECT T${n.tier ?? "?"}` : "idle";
+    return `[${sessionId}] nudge ${inject}: usage=${pct} (${tokenCount}/${limit}), growth=${growth}/${floor} (ref=${ref}, interval=${interval}), pendingT1=${pendingT1}/${interval}, reason="${n.reason.slice(0, 120)}"`;
+}
+
 function prepareAnthropic(
-    bodyBuffer: Buffer,
+    parsed: AnthropicRequestBody,
     req: http.IncomingMessage,
     opts: ProxyOptions,
     core: CompressionCore,
     config: Config,
     log: (level: string, msg: string) => void,
-    protocol: "anthropic" | "openai" | "responses",
-    upstreamOrigin: string,
+    session: Session,
 ): Prepared {
-    const parsed = JSON.parse(bodyBuffer.toString("utf8")) as AnthropicRequestBody;
+    const sessionId = session.id;
     const stream = parsed.stream === true;
-    const sessionHeader = headerValue(req, opts.sessionHeader);
-    const sessionId = deriveProxySessionId(req.headers, protocol, upstreamOrigin, "", { clientConversation: conversationSignalAnthropic(parsed, sessionHeader) });
-    const session = getSession(sessionId, { protocol, upstreamOrigin });
     session.requests++;
 
     let processedMessages: CoreMessage[] = [];
@@ -279,6 +340,7 @@ function prepareAnthropic(
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
+        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit));
         processedMessages = applyCondense(turn.messages, opts, session);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = coreToAnthropic(processedMessages);
@@ -309,20 +371,16 @@ function prepareAnthropic(
 }
 
 function prepareOpenai(
-    bodyBuffer: Buffer,
+    parsed: OpenAIRequestBody,
     req: http.IncomingMessage,
     opts: ProxyOptions,
     core: CompressionCore,
     config: Config,
     log: (level: string, msg: string) => void,
-    protocol: "anthropic" | "openai" | "responses",
-    upstreamOrigin: string,
+    session: Session,
 ): Prepared {
-    const parsed = JSON.parse(bodyBuffer.toString("utf8")) as OpenAIRequestBody;
+    const sessionId = session.id;
     const stream = parsed.stream === true;
-    const sessionHeader = headerValue(req, opts.sessionHeader);
-    const sessionId = deriveProxySessionId(req.headers, protocol, upstreamOrigin, "", { clientConversation: conversationSignalOpenai(parsed, sessionHeader) });
-    const session = getSession(sessionId, { protocol, upstreamOrigin });
     session.requests++;
 
     let processedMessages: CoreMessage[] = [];
@@ -339,6 +397,7 @@ function prepareOpenai(
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
+        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit));
         processedMessages = applyCondense(turn.messages, opts, session);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = coreToOpenai(processedMessages);
@@ -376,20 +435,16 @@ function prepareOpenai(
 }
 
 function prepareResponses(
-    bodyBuffer: Buffer,
+    parsed: ResponsesRequestBody,
     req: http.IncomingMessage,
     opts: ProxyOptions,
     core: CompressionCore,
     config: Config,
     log: (level: string, msg: string) => void,
-    protocol: "anthropic" | "openai" | "responses",
-    upstreamOrigin: string,
+    session: Session,
 ): Prepared {
-    const parsed = JSON.parse(bodyBuffer.toString("utf8")) as ResponsesRequestBody;
+    const sessionId = session.id;
     const stream = parsed.stream === true;
-    const sessionHeader = headerValue(req, opts.sessionHeader);
-    const sessionId = deriveProxySessionId(req.headers, protocol, upstreamOrigin, "", { clientConversation: conversationSignalResponses(parsed, sessionHeader) });
-    const session = getSession(sessionId, { protocol, upstreamOrigin });
     session.requests++;
 
     let processedMessages: CoreMessage[] = [];
@@ -407,6 +462,7 @@ function prepareResponses(
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" });
         session.state = turn.state;
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
+        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit));
         processedMessages = applyCondense(turn.messages, opts, session);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         // Rebuild input preserving the responses_lite contract:
@@ -532,6 +588,7 @@ async function forward(
     config: Config,
     log: (level: string, msg: string) => void,
     route: ReturnType<typeof resolveUpstream>,
+    affinity?: string,
 ): Promise<void> {
     const upstreamUrl = route ? route.rewrittenUrl : opts.upstream + (req.url ?? "");
     log("info", `forward ${req.method} ${req.url ?? ""} → ${upstreamUrl}${route ? ` (${route.provider})` : ""}`);
@@ -573,6 +630,15 @@ async function forward(
         headers[k] = Array.isArray(v) ? v.join(", ") : v;
     }
     headers["host"] = new URL(route ? route.upstream : opts.upstream).host;
+    // Inject a synthesized session-affinity header for clients that send none
+    // (pi). opencode already sends x-session-affinity (passed through above);
+    // codex carries identity in body.session_id (passes through in the body).
+    // pi sends nothing, so upstream sticky-routing/cache pools would fall back
+    // to content fingerprinting — give them a stable key instead. Only inject
+    // when the client sent NO session header at all (don't shadow opencode's).
+    if (affinity && !clientConversationHeader(req.headers)) {
+        headers["x-session-id"] = affinity;
+    }
     const init: RequestInit = {
         method: req.method ?? "GET",
         headers,
@@ -584,6 +650,19 @@ async function forward(
         if (UPSTREAM_HOP_HEADERS.has(k.toLowerCase())) return;
         respHeaders[k] = v;
     });
+    // P1.2: if the upstream returned a non-2xx (auth, rate-limit, context too
+    // long, ...), do NOT route the error body through the SSE rewriter — it has
+    // no SSE events and would be silently swallowed, leaving the client with
+    // an empty stream and no idea why. Pass status + body through verbatim.
+    // (writeHead is done HERE, only in the error branch, so we never double-
+    // write headers when a later branch would also call writeHead.)
+    if (!upstream.ok) {
+        res.writeHead(upstream.status, respHeaders);
+        if (upstream.body) await pipeThrough(upstream.body, res);
+        clearUpstreamTimer();
+        return;
+    }
+    // 2xx path: now safe to commit the status + headers, then stream the body.
     res.writeHead(upstream.status, respHeaders);
     if (!upstream.body) {
         res.end();
@@ -601,16 +680,6 @@ async function forward(
         prepared.compressInjected &&
         prepared.processedMessages.length > 0;
     if (!useRewriter || prepared === null) {
-        await pipeThrough(upstream.body, res);
-        clearUpstreamTimer();
-        return;
-    }
-    // P1.2: if the upstream returned a non-2xx (auth, rate-limit, context too
-    // long, ...), do NOT route the error body through the SSE rewriter — it has
-    // no SSE events and would be silently swallowed, leaving the client with
-    // an empty stream and no idea why. Pass status + body through verbatim.
-    if (!upstream.ok) {
-        res.writeHead(upstream.status, respHeaders);
         await pipeThrough(upstream.body, res);
         clearUpstreamTimer();
         return;
@@ -782,7 +851,17 @@ function headerValue(req: http.IncomingMessage, name: string): string | undefine
     return undefined;
 }
 
-function readBody(req: http.IncomingMessage): Promise<Buffer> {
+/** A thrown BodyTooLargeError lets handle() respond 413 cleanly before
+ *  destroying the request. Avoids a bare req.destroy() that would reject
+ *  readBody but leave the client connection with no HTTP response. */
+export class BodyTooLargeError extends Error {
+    constructor(public readonly limit: number) {
+        super(`request body exceeds ${limit} bytes`);
+        this.name = "BodyTooLargeError";
+    }
+}
+
+export function readBody(req: http.IncomingMessage): Promise<Buffer> {
     return new Promise((resolve, reject) => {
         const chunks: Buffer[] = [];
         let size = 0;
@@ -792,8 +871,10 @@ function readBody(req: http.IncomingMessage): Promise<Buffer> {
             size += c.length;
             if (size > MAX_REQUEST_BYTES) {
                 aborted = true;
-                reject(new Error(`request body exceeds ${MAX_REQUEST_BYTES} bytes`));
-                req.destroy();
+                // Reject FIRST so handle() can write a 413 and return.
+                // Then drain remaining data so the socket can close
+                // cleanly instead of lingering mid-request.
+                reject(new BodyTooLargeError(MAX_REQUEST_BYTES));
                 return;
             }
             chunks.push(c);

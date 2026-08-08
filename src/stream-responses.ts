@@ -218,9 +218,12 @@ function routeResponsesEvent(rawEvent: string, state: StreamState): string | nul
     if (t === "response.completed" || t === "response.incomplete") {
         state.responseObj = (obj.response as Record<string, unknown>) ?? null;
         state.done = true;
-        // In text protocol we always re-emit completed at the tail (after
-        // flushing buffered text + executing triggers).
-        if (TEXT_PROTOCOL) return null;
+        // In text protocol: if NO trigger was detected, pass the original
+        // completion through verbatim (we buffered text but nothing to do).
+        // Only suppress+rebuild when we actually caught a trigger.
+        if (TEXT_PROTOCOL && state.triggerPayloads.length === 0) {
+            return rawEvent + "\n\n";
+        }
         if (!state.converted) return rawEvent + "\n\n";
         return null;
     }
@@ -230,27 +233,31 @@ function routeResponsesEvent(rawEvent: string, state: StreamState): string | nul
 
 function buildResponsesTail(state: StreamState, ctx: RewriteCtx): string {
     let out = "";
-    // Text protocol: drain buffered text (splitting out any trigger), execute
-    // triggers, then re-emit completion. Runs even without a trigger so the
-    // buffered text is flushed and a clean completed is emitted.
+    // Text protocol: only rebuild when a trigger was actually caught.
+    // If none was caught, routeResponsesEvent already passed everything
+    // through verbatim (including the original completed), so this tail is
+    // never reached for the no-trigger case — return empty for safety.
     if (TEXT_PROTOCOL) {
+        if (state.triggerPayloads.length === 0) {
+            // No trigger: nothing to rewrite. The original completion was
+            // already passed through; nothing else to emit.
+            return "";
+        }
         const safeText = drainText(state);
         if (safeText) {
             out += sse("response.output_text.delta", { item_id: "msg_acp", output_index: 0, delta: safeText });
         }
-        if (state.triggerPayloads.length > 0) {
-            for (const payload of state.triggerPayloads) {
-                let parsed: unknown = {};
-                try {
-                    parsed = JSON.parse(payload);
-                } catch {
-                    ctx.log(`text-trigger: malformed JSON payload, skipping`);
-                    continue;
-                }
-                const note = applyRanges(parseCompressInput(parsed), ctx);
-                ctx.log(`text-trigger: executed compress → ${note.split("\n")[0].slice(0, 80)}`);
-                out += sse("response.output_text.delta", { item_id: "msg_acp_note", output_index: 0, delta: "\n" + note + "\n" });
+        for (const payload of state.triggerPayloads) {
+            let parsed: unknown = {};
+            try {
+                parsed = JSON.parse(payload);
+            } catch {
+                ctx.log(`text-trigger: malformed JSON payload, skipping`);
+                continue;
             }
+            const note = applyRanges(parseCompressInput(parsed), ctx);
+            ctx.log(`text-trigger: executed compress → ${note.split("\n")[0].slice(0, 80)}`);
+            out += sse("response.output_text.delta", { item_id: "msg_acp_note", output_index: 0, delta: "\n" + note + "\n" });
         }
         const base = (state.responseObj ?? { id: "resp_acp" }) as Record<string, unknown>;
         const respId = typeof base.id === "string" ? base.id : "resp_acp";

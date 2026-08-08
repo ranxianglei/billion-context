@@ -53,6 +53,10 @@ export type ResponsesRequestBody = {
     instructions?: string;
     tools?: unknown[];
     stream?: boolean;
+    /** Codex 0.147+ sends a per-conversation UUID here. This is the most
+     *  explicit conversation identifier any client sends — prefer it over
+     *  previous_response_id and content hashing. */
+    session_id?: string;
     previous_response_id?: string;
     [key: string]: unknown;
 };
@@ -306,6 +310,13 @@ export { condenseOldToolResults, type CondenseOptions, type CondenseResult };
  *  rationale. */
 export function conversationSignalResponses(body: ResponsesRequestBody, headerValue?: string): string {
     if (headerValue && headerValue.trim()) return headerValue.trim();
+    // Codex 0.147+ sends body.session_id (a per-conversation UUID). Prefer it
+    // over previous_response_id (may be absent on the first turn) and over
+    // content hashing (collides on identical openers). See README "Session
+    // identity" for the per-client story.
+    if (typeof body.session_id === "string" && body.session_id.length > 0) {
+        return `codex-${body.session_id}`;
+    }
     if (typeof body.previous_response_id === "string" && body.previous_response_id.length > 0) {
         return `resp-${body.previous_response_id}`;
     }

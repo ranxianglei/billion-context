@@ -1,8 +1,8 @@
 import { promises as fs } from "node:fs";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import * as path from "node:path";
-import * as os from "node:os";
+import { sessionsDir } from "./paths.js";
 import { createInitialState, type CompressionState } from "acp-kernel";
 import type { Session, BlockContent } from "./session.js";
 
@@ -42,7 +42,8 @@ import type { Session, BlockContent } from "./session.js";
  *  - All writes within a process are serialized per-session by Node's single
  *    event loop; there is no per-session *request* serialization (two
  *    concurrent HTTP requests for the same session can interleave processTurn
- *    and corrupt in-memory state). See AGENTS.md.
+ *    and corrupt in-memory state). This is a known limitation; a per-session
+ *    lock should be added before promoting multi-agent concurrency as safe.
  */
 
 const PERSIST_VERSION = 1;
@@ -293,7 +294,7 @@ export class SessionStore {
             this.log("error", `[persist] flushSync FAILED for ${session.id}: ${msg(e)} — session NOT evicted to prevent loss`);
             // Best-effort: remove the orphan temp so it doesn't accumulate.
             try {
-                require("node:fs").unlinkSync(tmp);
+                unlinkSync(tmp);
             } catch {
                 /* ignore */
             }
@@ -381,9 +382,7 @@ function msg(e: unknown): string {
 }
 
 function defaultDir(): string {
-    const env = process.env.BILI_SESSIONS_DIR;
-    if (env) return env;
-    return path.join(os.homedir(), ".bili", "sessions");
+    return sessionsDir();
 }
 
 function defaultDebounce(): number {

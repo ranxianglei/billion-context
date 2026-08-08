@@ -9,8 +9,13 @@ function makeSession(): Session {
         id: `test-${Math.random().toString(36).slice(2)}`,
         state: createInitialState(),
         createdAt: Date.now(),
+        lastSeen: Date.now(),
         requests: 0,
+        condensedToolResults: 0,
+        tokensSaved: 0,
         blockContents: new Map(),
+        inFlight: 0,
+        persisted: false,
     };
 }
 
