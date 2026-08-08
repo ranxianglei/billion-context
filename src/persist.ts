@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileS
 import { createHash } from "node:crypto";
 import * as path from "node:path";
 import { sessionsDir } from "./paths.js";
+import { log as loggerLog } from "./logger.js";
 import { createInitialState, type CompressionState } from "acp-kernel";
 import type { Session, BlockContent } from "./session.js";
 
@@ -413,8 +414,10 @@ function persistEnabled(): boolean {
 }
 
 function defaultLogger(level: string, m: string): void {
-    // eslint-disable-next-line no-console
-    console.error(`[${level}] ${m}`);
+    // Route through the tee logger (file + stderr) when available; fall back
+    // to console.error only if the logger hasn't been configured yet (e.g.
+    // during early init or tests).
+    loggerLog(level, m);
 }
 
 /** Singleton store for the running proxy. */
@@ -422,7 +425,7 @@ let _store: SessionStore | null = null;
 
 export function getStore(): SessionStore {
     if (!_store) {
-        _store = new SessionStore({ enabled: persistEnabled() });
+        _store = new SessionStore({ enabled: persistEnabled(), log: defaultLogger });
     }
     return _store;
 }

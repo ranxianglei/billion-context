@@ -1,6 +1,7 @@
 import { defaultConfig, type Config } from "acp-kernel";
 import { readFileSync } from "node:fs";
 import { configFile } from "./paths.js";
+import { log as loggerLog } from "./logger.js";
 
 function safeReadJson(path: string): unknown {
     try {
@@ -14,7 +15,7 @@ function safeReadJson(path: string): unknown {
         // a malformed providers file would otherwise run the proxy with
         // defaults and the user would not know why routing is wrong.
         if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
-            console.error(`[acp-config] failed to parse ${path}: ${String(e)}`);
+            loggerLog("error", `[acp-config] failed to parse ${path}: ${String(e)}`);
         }
         return undefined;
     }

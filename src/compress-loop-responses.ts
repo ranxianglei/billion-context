@@ -420,7 +420,7 @@ export async function* compressLoopResponsesStream(
         const proxyCalls = allCalls.filter((c) => PROXY_TOOL_NAMES.has(c.name));
         const realCalls = allCalls.filter((c) => !PROXY_TOOL_NAMES.has(c.name));
         // DIAG: log what tools the upstream returned this round.
-        console.error(`[acp-diag] round ${loopCount} allCalls=[${allCalls.map((c) => c.name).join(",")}] realCalls=[${realCalls.map((c) => c.name).join(",")}] text=${JSON.stringify(contentText.slice(0, 120))}`);
+        loggerLog("debug", `[acp-diag] round ${loopCount} allCalls=[${allCalls.map((c) => c.name).join(",")}] realCalls=[${realCalls.map((c) => c.name).join(",")}] text=${JSON.stringify(contentText.slice(0, 120))}`);
         const hasOnlyProxy = proxyCalls.length > 0 && realCalls.length === 0;
 
         if (!hasOnlyProxy) {
@@ -469,11 +469,11 @@ export async function* compressLoopResponsesStream(
             try {
                 args = JSON.parse(fc.arguments) as Record<string, unknown>;
             } catch (e) {
-                console.error(`[acp-compress-args] ${fc.name} JSON.parse failed: ${String(e)}. raw arguments (len=${fc.arguments.length}): ${fc.arguments.slice(0, 300)}`);
+                loggerLog("warn", `[acp-compress-args] ${fc.name} JSON.parse failed: ${String(e)}. raw arguments (len=${fc.arguments.length}): ${fc.arguments.slice(0, 300)}`);
                 args = {};
             }
             if (fc.name === "compress") {
-                console.error(`[acp-compress-args] compress args parsed: ${JSON.stringify(args).slice(0, 400)}`);
+                loggerLog("debug", `[acp-compress-args] compress args parsed: ${JSON.stringify(args).slice(0, 400)}`);
             }
             const result = executeProxyTool(fc.name, args, ctx);
             const preview = result.length > 120 ? result.slice(0, 120) + "..." : result;
