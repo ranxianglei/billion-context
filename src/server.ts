@@ -30,7 +30,7 @@ import {
     injectResponsesInstructions,
     deriveSessionIdResponses,
 } from "./responses.js";
-import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions } from "./session.js";
+import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight } from "./session.js";
 import { COMPRESS_TOOL, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressTextSystemPrompt } from "./compress-tool.js";
 import { rewriteSseStream, rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
@@ -123,8 +123,10 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         if (shuttingDown) return;
         shuttingDown = true;
         log("info", `${sig} received — flushing sessions…`);
+        // Stop accepting new requests BEFORE flushing, otherwise a late request
+        // could mutate state after its snapshot is taken and be lost.
+        server.close();
         void flushAllSessions().finally(() => {
-            server.close();
             process.exit(0);
         });
     };
@@ -219,7 +221,12 @@ async function handle(
                 ? prepareResponses(bodyBuffer, req, opts, core, reqConfig, log)
                 : null;
     const outBody: Buffer | string = prepared ? prepared.body : bodyBuffer;
-    await forward(req, res, opts, outBody, prepared, core, reqConfig, log);
+    if (prepared) acquireInFlight(prepared.session);
+    try {
+        await forward(req, res, opts, outBody, prepared, core, reqConfig, log);
+    } finally {
+        if (prepared) releaseInFlight(prepared.session);
+    }
 }
 
 const ACP_TAG_MARK = "\x3cacp ";

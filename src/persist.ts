@@ -1,5 +1,6 @@
 import { promises as fs } from "node:fs";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import * as path from "node:path";
 import * as os from "node:os";
 import { createInitialState, type CompressionState } from "acp-kernel";
@@ -22,13 +23,26 @@ import type { Session, BlockContent } from "./session.js";
  *    source of truth. Evicting a session from memory flushes it to disk first;
  *    a later miss reloads it. So memory is bounded while ALL sessions persist.
  *  - One JSON file per session, atomic write (temp + rename) — survives a
- *    crash mid-write (the rename is atomic on posix; a partial temp is
- *    discarded on next load by the corrupt-file fallback).
+ *    *process* crash mid-write (rename is atomic on posix; a partial temp is
+ *    left behind and discarded on next load by the corrupt-file fallback).
+ *    Does NOT survive power loss (no fsync of the directory entry); the
+ *    debounced writes keep the on-disk state within ~debounce of in-memory.
  *  - Debounced async writes (default 500ms): the hot path never blocks on fs.
  *    Multiple mutations within the window coalesce into one write.
  *  - Forward-compat: `mergeInitialState` fills any fields missing on a file
  *    written by an older version, so a schema change never breaks old files.
  *  - Disable with BILI_PERSIST=0 for ephemeral/test runs.
+ *
+ * KNOWN LIMITATIONS:
+ *  - No fsync of temp file or directory entry — a power loss can lose the
+ *    most recent debounce window. Process crashes (SIGKILL) are safe up to
+ *    the last successful write.
+ *  - No cross-process lock — two proxy processes sharing BILI_SESSIONS_DIR
+ *    will clobber each other's writes. Single-instance only.
+ *  - All writes within a process are serialized per-session by Node's single
+ *    event loop; there is no per-session *request* serialization (two
+ *    concurrent HTTP requests for the same session can interleave processTurn
+ *    and corrupt in-memory state). See AGENTS.md.
  */
 
 const PERSIST_VERSION = 1;
@@ -46,6 +60,8 @@ interface PersistedSession {
     blockContents: Record<string, BlockContent>;
 }
 
+type Logger = (level: "info" | "warn" | "error", msg: string) => void;
+
 /** Forward-compat: merge a parsed state with a fresh one so missing fields
  *  (added in later versions) get sane defaults instead of `undefined`. */
 function mergeState(parsed: CompressionState): CompressionState {
@@ -60,12 +76,12 @@ function mergeState(parsed: CompressionState): CompressionState {
     };
 }
 
-/** Build a filesystem-safe filename from a session id. Session ids are hashes
- *  (deriveSessionId*) or arbitrary x-acp-session header values — sanitize to
- *  avoid path traversal, keep it readable. The real id is also stored inside
- *  the file so integrity can be verified on load. */
-function safeFileName(id: string): string {
-    return id.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 128) || "session";
+/** Deterministic, collision-resistant filename from a session id. Uses a
+ *  truncated sha256 so distinct ids never share a file (a naive sanitize would
+ *  collide e.g. "a/b" and "a_b"). The real id is stored inside the file body
+ *  and verified on load. */
+function fileNameFor(id: string): string {
+    return createHash("sha256").update(id, "utf8").digest("hex").slice(0, 24) + ".json";
 }
 
 export class SessionStore {
@@ -73,20 +89,32 @@ export class SessionStore {
     private readonly debounceMs: number;
     readonly enabled: boolean;
     private readonly timers = new Map<string, NodeJS.Timeout>();
+    /** Monotonic counter for unique temp filenames within a process. */
+    private tmpSeq = 0;
+    private readonly log: Logger;
 
-    constructor(opts?: { dir?: string; debounceMs?: number; enabled?: boolean }) {
+    constructor(opts?: { dir?: string; debounceMs?: number; enabled?: boolean; log?: Logger }) {
         this.dir = opts?.dir ?? defaultDir();
         this.debounceMs = opts?.debounceMs ?? defaultDebounce();
         this.enabled = (opts?.enabled ?? true) && this.debounceMs >= 0;
+        this.log = opts?.log ?? defaultLogger;
     }
 
     private filePath(id: string): string {
-        return path.join(this.dir, `${safeFileName(id)}.json`);
+        return path.join(this.dir, fileNameFor(id));
     }
 
-    /** Bulk-load every persisted session from disk into a map keyed by session
-     *  id. Called once at startup before the server accepts traffic. Corrupt
-     *  individual files are skipped (logged) — one bad file never blocks boot. */
+    /** A unique temp path per write (per process). Two overlapping writes for
+     *  the same session must not share a temp file, or one rename invalidates
+     *  the other. */
+    private tempPath(id: string): string {
+        return path.join(this.dir, `.tmp-${fileNameFor(id)}-${process.pid}-${this.tmpSeq++}`);
+    }
+
+    /** Bulk-load every persisted session from disk into a map keyed by the
+     *  REAL session id (read from the file body, not the filename). Called once
+     *  at startup before the server accepts traffic. Corrupt individual files
+     *  are skipped (logged) — one bad file never blocks boot. */
     async loadAll(): Promise<Map<string, Session>> {
         const out = new Map<string, Session>();
         if (!this.enabled) return out;
@@ -102,29 +130,19 @@ export class SessionStore {
             return out;
         }
         for (const name of names) {
-            if (!name.endsWith(".json")) continue;
+            if (!name.endsWith(".json") || name.startsWith(".tmp-")) continue;
             try {
-                const raw = await fs.readFile(path.join(this.dir, name), "utf8");
-                const parsed = JSON.parse(raw) as PersistedSession;
-                if (!parsed || typeof parsed.id !== "string" || !parsed.state || !Array.isArray(parsed.state.blocks)) {
+                const parsed = JSON.parse(await fs.readFile(path.join(this.dir, name), "utf8")) as PersistedSession;
+                if (!isValidRecord(parsed)) continue;
+                // Filename must match the body id — guards against a file that
+                // was copied/renamed by hand, or a stale temp that slipped in.
+                if (fileNameFor(parsed.id) !== name) {
+                    this.log("warn", `[persist] skipping ${name}: filename does not match body id (expected ${fileNameFor(parsed.id)})`);
                     continue;
                 }
-                const blockContents = new Map<string, BlockContent>();
-                for (const [bid, content] of Object.entries(parsed.blockContents ?? {})) {
-                    if (content && typeof content === "object") blockContents.set(bid, content);
-                }
-                out.set(parsed.id, {
-                    id: parsed.id,
-                    state: mergeState(parsed.state),
-                    createdAt: parsed.createdAt ?? Date.now(),
-                    lastSeen: Date.now(),
-                    requests: parsed.requests ?? 0,
-                    condensedToolResults: parsed.condensedToolResults ?? 0,
-                    tokensSaved: parsed.tokensSaved ?? 0,
-                    blockContents,
-                });
-            } catch {
-                // corrupt file — skip, do not poison startup
+                out.set(parsed.id, buildSession(parsed));
+            } catch (e) {
+                this.log("warn", `[persist] skipping corrupt session file ${name}: ${msg(e)}`);
             }
         }
         return out;
@@ -132,30 +150,18 @@ export class SessionStore {
 
     /** Synchronous reload of a single session. Used on a memory miss (after
      *  LRU eviction). Sync fs is acceptable here because a miss is rare and
-     *  reads a single small file (~1ms). Returns null if missing/corrupt. */
+     *  reads a single small file (~1ms). Returns null if missing/corrupt or the
+     *  body id does not match what we asked for. */
     loadSync(id: string): Session | null {
         if (!this.enabled) return null;
         const file = this.filePath(id);
         if (!existsSync(file)) return null;
         try {
-            const raw = readFileSync(file, "utf8");
-            const parsed = JSON.parse(raw) as PersistedSession;
-            if (!parsed || typeof parsed.id !== "string" || !parsed.state) return null;
-            const blockContents = new Map<string, BlockContent>();
-            for (const [bid, content] of Object.entries(parsed.blockContents ?? {})) {
-                if (content && typeof content === "object") blockContents.set(bid, content);
-            }
-            return {
-                id: parsed.id,
-                state: mergeState(parsed.state),
-                createdAt: parsed.createdAt ?? Date.now(),
-                lastSeen: Date.now(),
-                requests: parsed.requests ?? 0,
-                condensedToolResults: parsed.condensedToolResults ?? 0,
-                tokensSaved: parsed.tokensSaved ?? 0,
-                blockContents,
-            };
-        } catch {
+            const parsed = JSON.parse(readFileSync(file, "utf8")) as PersistedSession;
+            if (!isValidRecord(parsed) || parsed.id !== id) return null;
+            return buildSession(parsed);
+        } catch (e) {
+            this.log("warn", `[persist] failed to load session ${id}: ${msg(e)}`);
             return null;
         }
     }
@@ -168,34 +174,27 @@ export class SessionStore {
         if (existing) clearTimeout(existing);
         const timer = setTimeout(() => {
             this.timers.delete(session.id);
-            void this.writeNow(session).catch(() => {});
+            void this.writeNow(session).catch((e) => {
+                this.log("error", `[persist] debounced write failed for ${session.id}: ${msg(e)}`);
+            });
         }, this.debounceMs);
         // Don't keep the event loop alive solely for a pending write.
         timer.unref?.();
         this.timers.set(session.id, timer);
     }
 
-    /** Asynchronously persist a session right now (skips the debounce). */
+    /** Asynchronously persist a session right now (skips the debounce). Throws
+     *  on write failure so callers can react (e.g. avoid evicting). */
     async writeNow(session: Session): Promise<void> {
         if (!this.enabled) return;
-        const record: PersistedSession = {
-            version: PERSIST_VERSION,
-            savedAt: Date.now(),
-            id: session.id,
-            createdAt: session.createdAt,
-            requests: session.requests,
-            condensedToolResults: session.condensedToolResults,
-            tokensSaved: session.tokensSaved,
-            state: session.state,
-            blockContents: Object.fromEntries(session.blockContents),
-        };
+        const record = buildRecord(session);
         const file = this.filePath(session.id);
         try {
             await fs.mkdir(this.dir, { recursive: true });
-        } catch {
-            /* best-effort */
+        } catch (e) {
+            this.log("warn", `[persist] could not create session dir ${this.dir}: ${msg(e)}`);
         }
-        const tmp = path.join(this.dir, `.tmp-${safeFileName(session.id)}-${process.pid}`);
+        const tmp = this.tempPath(session.id);
         const data = JSON.stringify(record);
         await fs.writeFile(tmp, data, "utf8");
         await fs.rename(tmp, file);
@@ -203,52 +202,63 @@ export class SessionStore {
 
     /** Synchronous flush for a single session. Used on memory eviction so a
      *  dirty evicted session is not lost. Sync because eviction runs in the
-     *  sync getSession path; a single small write is acceptable. */
-    flushSync(session: Session): void {
-        if (!this.enabled) return;
+     *  sync getSession path; a single small write is acceptable.
+     *  Returns true on success, false on failure (caller must NOT evict on
+     *  failure for a never-persisted session or it is lost permanently). */
+    flushSync(session: Session): boolean {
+        if (!this.enabled) return true;
         const existing = this.timers.get(session.id);
         if (existing) {
             clearTimeout(existing);
             this.timers.delete(session.id);
         }
-        const record: PersistedSession = {
-            version: PERSIST_VERSION,
-            savedAt: Date.now(),
-            id: session.id,
-            createdAt: session.createdAt,
-            requests: session.requests,
-            condensedToolResults: session.condensedToolResults,
-            tokensSaved: session.tokensSaved,
-            state: session.state,
-            blockContents: Object.fromEntries(session.blockContents),
-        };
+        const record = buildRecord(session);
         const file = this.filePath(session.id);
         try {
             mkdirSync(this.dir, { recursive: true });
-        } catch {
-            /* best-effort */
+        } catch (e) {
+            this.log("warn", `[persist] could not create session dir ${this.dir}: ${msg(e)}`);
         }
-        const tmp = path.join(this.dir, `.tmp-${safeFileName(session.id)}-${process.pid}`);
+        const tmp = this.tempPath(session.id);
         try {
             writeFileSync(tmp, JSON.stringify(record), "utf8");
             renameSync(tmp, file);
-        } catch {
-            /* best-effort: if write fails the previous on-disk version remains */
+            return true;
+        } catch (e) {
+            this.log("error", `[persist] flushSync FAILED for ${session.id}: ${msg(e)} — session NOT evicted to prevent loss`);
+            // Best-effort: remove the orphan temp so it doesn't accumulate.
+            try {
+                require("node:fs").unlinkSync(tmp);
+            } catch {
+                /* ignore */
+            }
+            return false;
         }
     }
 
-    /** Flush all sessions with a pending debounce timer. Called on SIGTERM/
-     *  SIGINT for graceful shutdown. Fires timers immediately and awaits their
-     *  writes. */
+    /** Flush all dirty sessions with a pending debounce timer. Called on
+     *  SIGTERM/SIGINT for graceful shutdown. Clears timers first, then writes
+     *  every session that had a pending write. */
     async flushAll(sessions: Iterable<Session>): Promise<void> {
         if (!this.enabled) return;
-        const pending: Promise<void>[] = [];
+        const dirty = new Set(this.timers.keys());
         for (const timer of this.timers.values()) clearTimeout(timer);
         this.timers.clear();
+        const pending: Promise<void>[] = [];
         for (const s of sessions) {
-            pending.push(this.writeNow(s).catch(() => {}));
+            if (!dirty.has(s.id)) continue; // only flush sessions with pending writes
+            pending.push(
+                this.writeNow(s).catch((e) => {
+                    this.log("error", `[persist] shutdown flush failed for ${s.id}: ${msg(e)}`);
+                }),
+            );
         }
         await Promise.all(pending);
+    }
+
+    /** Whether a write is currently pending (debounce timer armed) for a id. */
+    hasPending(id: string): boolean {
+        return this.timers.has(id);
     }
 
     /** Cancel all pending writes without flushing (e.g. for tests). */
@@ -256,6 +266,49 @@ export class SessionStore {
         for (const timer of this.timers.values()) clearTimeout(timer);
         this.timers.clear();
     }
+}
+
+function buildRecord(session: Session): PersistedSession {
+    return {
+        version: PERSIST_VERSION,
+        savedAt: Date.now(),
+        id: session.id,
+        createdAt: session.createdAt,
+        requests: session.requests,
+        condensedToolResults: session.condensedToolResults,
+        tokensSaved: session.tokensSaved,
+        state: session.state,
+        blockContents: Object.fromEntries(session.blockContents),
+    };
+}
+
+function buildSession(parsed: PersistedSession): Session {
+    const blockContents = new Map<string, BlockContent>();
+    for (const [bid, content] of Object.entries(parsed.blockContents ?? {})) {
+        if (content && typeof content === "object") blockContents.set(bid, content);
+    }
+    return {
+        id: parsed.id,
+        state: mergeState(parsed.state),
+        createdAt: parsed.createdAt ?? Date.now(),
+        lastSeen: Date.now(),
+        requests: parsed.requests ?? 0,
+        condensedToolResults: parsed.condensedToolResults ?? 0,
+        tokensSaved: parsed.tokensSaved ?? 0,
+        blockContents,
+        inFlight: 0,
+        persisted: true,
+    };
+}
+
+function isValidRecord(parsed: unknown): parsed is PersistedSession {
+    if (!parsed || typeof parsed !== "object") return false;
+    const r = parsed as Partial<PersistedSession>;
+    return typeof r.id === "string" && typeof r.state === "object" && r.state !== null && Array.isArray(r.state.blocks);
+}
+
+function msg(e: unknown): string {
+    return e instanceof Error ? e.message : String(e);
 }
 
 function defaultDir(): string {
@@ -279,6 +332,11 @@ function persistEnabled(): boolean {
     return true;
 }
 
+function defaultLogger(level: string, m: string): void {
+    // eslint-disable-next-line no-console
+    console.error(`[${level}] ${m}`);
+}
+
 /** Singleton store for the running proxy. */
 let _store: SessionStore | null = null;
 
@@ -293,5 +351,3 @@ export function getStore(): SessionStore {
 export function _setStoreForTest(store: SessionStore): void {
     _store = store;
 }
-
-/** Avoid unused-import lint for future directory iteration. */

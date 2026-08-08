@@ -118,20 +118,25 @@ await withTempStore("flushAll flushes all pending debounce writes", async (store
 
 await withTempStore("corrupt file is skipped by loadAll (no crash)", async (store, dir) => {
     const { writeFileSync } = await import("node:fs");
-    writeFileSync(join(dir, "good.json"), JSON.stringify({ version: 1, id: "good", createdAt: 0, requests: 0, condensedToolResults: 0, tokensSaved: 0, state: createInitialState(), blockContents: {} }));
+    // Write a valid file via the store so the filename matches the body id
+    // (loadAll verifies fileNameFor(id) === name).
+    await store.writeNow(makeSession("good"));
     writeFileSync(join(dir, "corrupt.json"), "{ this is not valid json");
     const all = await store.loadAll();
     assert.equal(all.size, 1);
     assert.ok(all.has("good"));
 });
 
-await withTempStore("unsafe session id is sanitized in filename but preserved in content", async (store, dir) => {
-    const s = makeSession("../../etc/passwd"); // path-traversal attempt
-    await store.writeNow(s);
-    const files = readdirSync(dir);
-    assert.ok(files.every((f) => !f.includes("..")), "no traversal segments in filename");
-    const loaded = store.loadSync("../../etc/passwd");
-    assert.equal(loaded!.id, "../../etc/passwd", "real id preserved inside file");
+await withTempStore("collision-prone ids do NOT share a file (hashed names)", async (store, dir) => {
+    // A naive sanitizer would map both to "a_b" → one file, cross-contamination.
+    const s2 = makeSession("a_b");
+    const s3 = makeSession("a/b");
+    await store.writeNow(s2);
+    await store.writeNow(s3);
+    const jsonFiles = readdirSync(dir).filter((f) => f.endsWith(".json"));
+    assert.equal(jsonFiles.length, 2, "distinct ids → distinct files");
+    assert.ok(store.loadSync("a_b")!.id === "a_b");
+    assert.ok(store.loadSync("a/b")!.id === "a/b");
 });
 
 await withTempStore("disabled store writes nothing", async () => {
@@ -146,4 +151,54 @@ await withTempStore("disabled store writes nothing", async () => {
     } finally {
         rmSync(dir, { recursive: true, force: true });
     }
+});
+
+await withTempStore("flushSync returns true on success, false on failure", async (store, dir) => {
+    const s = makeSession("flush-bool");
+    assert.equal(store.flushSync(s), true, "returns true on success");
+    // Make the directory a file to force write failure.
+    const { rmSync, writeFileSync: wf } = await import("node:fs");
+    rmSync(dir, { recursive: true, force: true });
+    wf(dir, "block", "utf8"); // dir path is now a file → mkdir/write fails
+    assert.equal(store.flushSync(makeSession("flush-bool-2")), false, "returns false on write failure");
+});
+
+await withTempStore("loadSync returns null when body id does not match", async (store, dir) => {
+    const { writeFileSync: wf } = await import("node:fs");
+    // Hand-write a file whose name hashes to "real-id" but body says "fake-id".
+    const real = makeSession("real-id");
+    await store.writeNow(real);
+    const file = readdirSync(dir)[0];
+    const parsed = JSON.parse(readFileSync(join(dir, file), "utf8"));
+    parsed.id = "different-id";
+    wf(join(dir, file), JSON.stringify(parsed));
+    // Asking for "real-id" finds the file by hash, but body id mismatches → null.
+    assert.equal(store.loadSync("real-id"), null, "body id mismatch rejected");
+});
+
+await withTempStore("loadAll skips file whose filename does not match body id", async (store, dir) => {
+    const { renameSync: rn } = await import("node:fs");
+    await store.writeNow(makeSession("legit"));
+    // Rename the legit file to a name that doesn't match any body id.
+    const files = readdirSync(dir);
+    rn(join(dir, files[0]), join(dir, "mismatched.json"));
+    const all = await store.loadAll();
+    assert.equal(all.size, 0, "filename/body mismatch rejected at loadAll");
+});
+
+await withTempStore("temp files are unique per write (no rename collision)", async (store) => {
+    // Two rapid writeNow calls must not share a temp file.
+    const s = makeSession("uniq-tmp");
+    await Promise.all([store.writeNow(s), store.writeNow(s), store.writeNow(s)]);
+    // All three completed without throwing ENOENT on rename.
+    assert.ok(store.loadSync("uniq-tmp"));
+});
+
+await withTempStore("hasPending reflects the debounce timer", async (store) => {
+    const s = makeSession("pending-check");
+    assert.equal(store.hasPending(s.id), false);
+    store.scheduleSave(s);
+    assert.equal(store.hasPending(s.id), true);
+    await settle();
+    assert.equal(store.hasPending(s.id), false);
 });

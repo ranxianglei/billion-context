@@ -20,33 +20,46 @@ export type Session = {
      *  post-compression / folded view and loses originals across rounds).
      *  Two views are cached: `one` (one-level: direct messages + nested
      *  child summaries) and `full` (all original messages), matching the
-     *  collectBlockContent full flag semantics. */
+     *  collectBlockContent full flag semantics.
+     *  Unbounded in memory by design — block summaries are small relative to
+     *  the history they replace, and disk persistence keeps the source of
+     *  truth; the MAX_SESSIONS cap bounds the number of concurrent sessions
+     *  in memory. See persist.ts. */
     blockContents: Map<string, BlockContent>;
+    /** Number of in-flight requests using this session. A session with
+     *  inFlight > 0 must NOT be LRU-evicted: evicting it mid-stream flushes a
+     *  half-mutated snapshot and then a miss reloads a SECOND Session object,
+     *  causing split-brain writes to the same file. See persist.ts M5. */
+    inFlight: number;
+    /** False until the first successful write to disk. evictOldest will not
+     *  drop a never-persisted session on flush failure (that would be a
+     *  permanent loss). */
+    persisted: boolean;
 };
 
 const sessions = new Map<string, Session>();
 
 const MAX_SESSIONS = Number.parseInt(process.env.BILI_MAX_SESSIONS ?? "256", 10) || 256;
-/** Approximate per-session byte cap for blockContents originals. When exceeded
- *  the oldest block's contents are dropped (the block summary stays; decompress
- *  degrades to returning the summary instead of originals). Bounds memory for
- *  pathological sessions; disk persistence holds everything regardless. A large
- *  default (512MB) so normal long sessions never hit it — disk is cheap, and
- *  losing block originals silently degrades decompress quality. */
-const BLOCK_CONTENTS_BYTES_CAP = Number.parseInt(process.env.BILI_BLOCK_CACHE_BYTES ?? String(512 * 1024 * 1024), 10) || 512 * 1024 * 1024;
 
 let initialized = false;
 
-/** Bulk-load all persisted sessions from disk into the in-memory map. Called
- *  once at server startup before listening. Idempotent. */
+/** Bulk-load persisted sessions from disk into the in-memory map. Called once
+ *  at server startup before listening. Caps at MAX_SESSIONS by savedAt
+ *  (keeps the most recent) so a huge backlog cannot OOM on boot. Idempotent. */
 export async function initSessions(): Promise<void> {
     if (initialized) return;
     initialized = true;
     const store = getStore();
     if (!store.enabled) return;
     const loaded = await store.loadAll();
-    for (const [id, s] of loaded) {
-        if (!sessions.has(id)) sessions.set(id, s);
+    if (loaded.size > MAX_SESSIONS) {
+        const entries = [...loaded.entries()].sort((a, b) => (b[1].createdAt ?? 0) - (a[1].createdAt ?? 0));
+        for (const [id, s] of entries) {
+            if (sessions.size >= MAX_SESSIONS) break;
+            sessions.set(id, s);
+        }
+    } else {
+        for (const [id, s] of loaded) sessions.set(id, s);
     }
 }
 
@@ -56,11 +69,12 @@ export function getSession(id: string): Session {
         existing.lastSeen = Date.now();
         return existing;
     }
-    // Memory miss: try reload from disk (e.g. after LRU eviction + restart).
+    // Memory miss: try reload from disk (e.g. after LRU eviction).
     const store = getStore();
     const reloaded = store.loadSync(id);
     if (reloaded) {
         reloaded.lastSeen = Date.now();
+        reloaded.persisted = true;
         sessions.set(id, reloaded);
         return reloaded;
     }
@@ -74,9 +88,22 @@ export function getSession(id: string): Session {
         condensedToolResults: 0,
         tokensSaved: 0,
         blockContents: new Map(),
+        inFlight: 0,
+        persisted: false,
     };
     sessions.set(id, session);
     return session;
+}
+
+/** Mark a session as in-use by a request. Must be paired with releaseInFlight.
+ *  Prevents LRU eviction of a session mid-stream. */
+export function acquireInFlight(session: Session): void {
+    session.inFlight++;
+}
+
+/** Release an in-use marker. Decrements; the session becomes evictable again. */
+export function releaseInFlight(session: Session): void {
+    if (session.inFlight > 0) session.inFlight--;
 }
 
 export function listSessions(): Session[] {
@@ -89,51 +116,36 @@ export function markDirty(session: Session): void {
     getStore().scheduleSave(session);
 }
 
-/** Record original block content at compress time and enforce the per-session
- *  memory cap. When the cap is exceeded, the oldest block's contents are
- *  dropped (block summary stays active; decompress degrades to summary). */
+/** Record original block content at compress time. */
 export function cacheBlockContent(session: Session, blockId: string, content: BlockContent): void {
     session.blockContents.set(blockId, content);
-    enforceBlockCacheCap(session);
 }
 
-/** Flush a session to disk and drop it from memory (LRU eviction). */
+/** Flush a session to disk and drop it from memory (LRU eviction). Refuses to
+ *  evict sessions that are in-flight or whose flush failed (would lose a
+ *  never-persisted session permanently). */
 function evictOldest(): void {
     let oldestId: string | undefined;
     let oldestSeen = Infinity;
     for (const [id, s] of sessions) {
+        // Never evict a session being actively mutated by a request — flushing
+        // its half-mutated state then reloading a second object causes
+        // split-brain writes to the same file.
+        if (s.inFlight > 0) continue;
         if (s.lastSeen < oldestSeen) {
             oldestSeen = s.lastSeen;
             oldestId = id;
         }
     }
-    if (oldestId) {
-        const s = sessions.get(oldestId);
-        if (s) getStore().flushSync(s);
-        sessions.delete(oldestId);
+    if (!oldestId) return;
+    const s = sessions.get(oldestId)!;
+    const ok = getStore().flushSync(s);
+    if (!ok && !s.persisted) {
+        // Flush failed AND this session was never written to disk — evicting
+        // would permanently lose it. Keep it in memory instead.
+        return;
     }
-}
-
-/** Drop oldest blockContents entries until under the byte cap. */
-function enforceBlockCacheCap(session: Session): void {
-    if (session.blockContents.size === 0) return;
-    let bytes = 0;
-    for (const c of session.blockContents.values()) {
-        bytes += c.one.text.length + c.full.text.length;
-    }
-    if (bytes <= BLOCK_CONTENTS_BYTES_CAP) return;
-    // Evict oldest by createdAt of the block (fall back to insertion order).
-    const ordered = [...session.blockContents.entries()].sort(([, a], [, b]) => {
-        const ta = a.one.count + a.full.count;
-        const tb = b.one.count + b.full.count;
-        return ta - tb;
-    });
-    for (const [bid] of ordered) {
-        if (bytes <= BLOCK_CONTENTS_BYTES_CAP) break;
-        const c = session.blockContents.get(bid);
-        if (c) bytes -= c.one.text.length + c.full.text.length;
-        session.blockContents.delete(bid);
-    }
+    sessions.delete(oldestId);
 }
 
 /** Graceful shutdown: flush all sessions with pending writes. */
