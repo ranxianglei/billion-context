@@ -151,8 +151,3 @@ export async function main(): Promise<void> {
     const opts = loadOptions();
     await startServer(opts);
 }
-
-main().catch((err) => {
-    console.error("bili: failed to start:", err);
-    process.exit(1);
-});
