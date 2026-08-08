@@ -113,6 +113,35 @@ export type ProxyOptions = {
     logFile?: string;
 };
 
+/** Re-read ONLY the routes from the current config sources, returning a fresh
+ *  ProviderRoutes object. Used by the web UI's "Apply" (hot-reload) button so
+ *  provider/route changes take effect without restarting bili. Only routes are
+ *  re-read — port/host/upstream can't change on a running server (the listen
+ *  socket is already bound), so those stay as they were at startup. Mirrors the
+ *  exact precedence of loadOptions: external ACP_PROVIDERS path > inline
+ *  providers in the config file. */
+export function loadRoutes(env: NodeJS.ProcessEnv = process.env): ProviderRoutes {
+    const fileConfig = loadConfigFile();
+    const routes: ProviderRoutes = {};
+    const routesPath = env.ACP_PROVIDERS ?? fileConfig.providersPath ?? "";
+    if (routesPath) {
+        const parsed = safeReadJson(routesPath);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+                const route = parseRouteEntry(v);
+                if (route) routes[k] = route;
+            }
+        }
+    }
+    if (fileConfig.providers) {
+        for (const [k, v] of Object.entries(fileConfig.providers)) {
+            const route = parseRouteEntry(v);
+            if (route && !routes[k]) routes[k] = route;
+        }
+    }
+    return routes;
+}
+
 export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions {
     // --- Source 1: JSON config file (~/.config/billion-context/billion-context.json) ---
     // The canonical, user-editable config. Loaded first so env vars below can

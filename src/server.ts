@@ -3,6 +3,7 @@ import fs from "node:fs";
 import { tmpdir } from "node:os";
 import { createCore, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, estimateTokensFast, renderNudgeText, deactivateBlock } from "acp-kernel";
 import type { ProxyOptions } from "./config.js";
+import { loadRoutes } from "./config.js";
 import { resolveContextLimit } from "./config.js";
 import { fetchWithTimeout, MAX_REQUEST_BYTES } from "./fetch-util.js";
 import {
@@ -228,6 +229,7 @@ async function handle(
     }
     if (req.method === "GET" && req.url === "/__acp/config") return handleConfigGet(res);
     if (req.method === "PUT" && req.url === "/__acp/config") return handleConfigPut(req, res);
+    if (req.method === "POST" && req.url === "/__acp/config/reload") return handleConfigReload(opts, res, log);
     let bodyBuffer: Buffer;
     try {
         bodyBuffer = await readBody(req);
@@ -909,6 +911,22 @@ function deriveTitle(messages: CoreMessage[]): string | undefined {
         if (clean) return clean.length > 60 ? clean.slice(0, 57) + "\u2026" : clean;
     }
     return undefined;
+}
+
+function handleConfigReload(opts: ProxyOptions, res: http.ServerResponse, log: (level: string, msg: string) => void): void {
+    // Hot-reload routes from the config file into the running process — no
+    // restart needed. Only routes are re-read; port/host/upstream stay as-is
+    // (the listen socket is already bound). Mutates opts.routes in place so all
+    // in-flight handle() closures that captured `opts` see the new routes.
+    const fresh = loadRoutes();
+    // Clear and refill the SAME object reference so resolveUpstream/resolveContextLimit
+    // (which read opts.routes) pick up the new entries without needing reassignment.
+    for (const k of Object.keys(opts.routes)) delete opts.routes[k];
+    Object.assign(opts.routes, fresh);
+    const names = Object.keys(fresh);
+    log("info", `[acp-web] routes hot-reloaded (${names.length} providers): ${names.join(", ") || "(none)"}`);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true, count: names.length, routes: names }));
 }
 
 function sendStats(res: http.ServerResponse): void {
