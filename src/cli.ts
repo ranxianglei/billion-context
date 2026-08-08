@@ -20,6 +20,7 @@
 import { loadOptions } from "./config.js";
 import { startServer } from "./server.js";
 import { configFile as defaultConfigFile } from "./paths.js";
+import { checkForUpdate, startAutoUpdate } from "./update.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -36,10 +37,21 @@ const VERSION = (() => {
     }
 })();
 
+const PACKAGE_NAME = (() => {
+    try {
+        const here = fileURLToPath(import.meta.url);
+        const pkg = path.join(path.dirname(here), "..", "package.json");
+        return (JSON.parse(readFileSync(pkg, "utf8")).name as string) ?? "billion-context";
+    } catch {
+        return "billion-context";
+    }
+})();
+
 const HELP = `bili ${VERSION} — billion-context proxy
 
 Usage:
   bili [start] [options]        start the proxy (default: reads ${defaultConfigFile()})
+  bili update                   check for & install a newer version now
   bili --version                print version
   bili --help                   show this help
 
@@ -50,16 +62,17 @@ Options (override config file / env):
   --debug                       verbose logging
   --passthrough                 forward without compression
   --no-passthrough              force compression on (overrides config)
+  --no-auto-update              disable background self-update this run
 
 Config: ${defaultConfigFile()}
-  Set port/host/debug/providers/condense/compress there. See README §Configuration.
+  Set port/host/debug/providers/condense/compress/autoUpdate there. See README §Configuration.
   Env vars (ACP_*, BILI_*) also work and override the file; CLI flags win.
 
 Docs: https://github.com/ranxianglei/billion-context
 `;
 
 type Parsed = {
-    command: "start" | "help" | "version";
+    command: "start" | "update" | "help" | "version";
     overrides: Record<string, string | undefined>;
 };
 
@@ -81,6 +94,9 @@ function parseArgs(argv: string[]): Parsed {
                 break;
             case "--debug":
                 overrides.ACP_DEBUG = "1";
+                break;
+            case "--no-auto-update":
+                overrides.ACP_AUTO_UPDATE = "0";
                 break;
             case "--passthrough":
                 overrides.ACP_PASSTHROUGH = "1";
@@ -117,12 +133,14 @@ function parseArgs(argv: string[]): Parsed {
         }
     }
 
-    // First positional (if any) is the command. Only "start" is recognized;
+    // First positional (if any) is the command. "start" | "update" are recognized;
     // an unknown command is an error.
     if (positional.length > 0) {
         const cmd = positional[0]!;
         if (cmd === "start") {
             command = command === "help" || command === "version" ? command : "start";
+        } else if (cmd === "update") {
+            command = "update";
         } else {
             console.error(`bili: unknown command "${cmd}" (try "bili --help")`);
             process.exit(2);
@@ -142,6 +160,11 @@ export async function main(): Promise<void> {
         process.stdout.write(VERSION + "\n");
         return;
     }
+    if (command === "update") {
+        // Manual one-shot update — bypasses the 6h throttle.
+        await checkForUpdate({ packageName: PACKAGE_NAME, currentVersion: VERSION, autoUpdate: true }, true);
+        return;
+    }
 
     // CLI flags override env (which overrides the config file inside
     // loadOptions). Merge into process.env so loadOptions picks them up.
@@ -150,4 +173,10 @@ export async function main(): Promise<void> {
     }
     const opts = loadOptions();
     await startServer(opts);
+
+    // Start background auto-update after the server is listening so a slow
+    // registry check never delays startup or races the listen socket.
+    if (opts.autoUpdate) {
+        startAutoUpdate({ packageName: PACKAGE_NAME, currentVersion: VERSION, autoUpdate: true });
+    }
 }

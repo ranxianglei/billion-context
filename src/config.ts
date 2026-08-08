@@ -109,6 +109,7 @@ export type ProxyOptions = {
     debug: boolean;
     dumpSse?: string;
     passthrough: boolean;
+    autoUpdate: boolean;
 };
 
 export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions {
@@ -162,6 +163,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         debug: (env.ACP_DEBUG ?? (fileConfig.debug ? "1" : "0")) === "1",
         dumpSse: env.ACP_DUMP_SSE || fileConfig.dumpSse || undefined,
         passthrough: (env.ACP_PASSTHROUGH ?? (fileConfig.passthrough ? "1" : "0")) === "1",
+        autoUpdate: (env.ACP_AUTO_UPDATE ?? (fileConfig.autoUpdate === false ? "0" : "1")) !== "0",
     };
 }
 
@@ -181,6 +183,7 @@ type FileConfig = {
     debug?: boolean;
     dumpSse?: string;
     passthrough?: boolean;
+    autoUpdate?: boolean;
     condense?: { enabled?: boolean; keepRecentToolResults?: number; minCharsToCondense?: number; maxKeptChars?: number };
     compress?: { injectTool?: boolean; injectNudge?: boolean };
 };
