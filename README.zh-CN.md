@@ -62,6 +62,7 @@ bili
 
 <img width="2931" height="1519" alt="image" src="https://github.com/user-attachments/assets/c02278be-bc7a-4f14-8f58-0f2d83784d54" />
 
+> 不想用网页?也可以直接手编 JSON 文件,见下文[手动配置文件](#手动配置文件)。
 
 ### 第 3 步 —— 把客户端指向代理
 
@@ -125,6 +126,41 @@ base_url = "http://localhost:8787/zhipu/api/coding/paas/v4"
 
 暂不支持。代理目前说 Anthropic、OpenAI chat-completions、OpenAI Responses
 三种协议 —— 如果你的客户端用别的协议或非标准 auth header,还用不了。
+
+### 手动配置文件
+
+上面用网页配置。如果你不想用网页、想把配置纳入 git 管理、或者用脚本
+自动化部署,也可以直接手编 JSON 文件,效果完全一样。
+
+打开 `~/.config/billion-context/billion-context.json`,编辑 `providers` 块。
+每个条目是一个**名字 → URL** 映射;这个名字就是你在第 3 步里写进客户端
+base URL 的东西。
+
+```json
+{
+  "providers": {
+    "zhipu": {
+      "url": "https://open.bigmodel.cn",
+      "models": {
+        "glm-5.2": { "context": 1000000, "output": 131072 }
+      }
+    },
+    "anthropic": "https://api.anthropic.com"
+  }
+}
+```
+
+- 删掉你不用的 provider。
+- 添加其他的(例如 `"deepseek": "https://api.deepseek.com"`)。
+- API key **不**写在这里 —— key 在客户端那边,代理原样透传。
+
+保存后**重启 `bili`**。启动行列出你的路由:
+
+```
+acp-proxy listening on http://127.0.0.1:8787 — routes: anthropic=https://api.anthropic.com, zhipu=https://open.bigmodel.cn
+```
+
+这证明代理读到了你的配置。(完整 schema —— 按模型的 context 窗口、可选字段 —— 见[配置](#配置)。)
 
 ### 网页配置
 
