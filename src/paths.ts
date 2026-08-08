@@ -51,3 +51,13 @@ export function sessionsDir(): string {
 export function cacheDir(): string {
     return path.join(xdg("XDG_CACHE_HOME", ".cache"), "billion-context");
 }
+
+/** Root state dir: log files and other per-host state. */
+export function stateDir(): string {
+    return path.join(xdg("XDG_STATE_HOME", ".local/state"), "billion-context");
+}
+
+/** Default log file path. */
+export function defaultLogFile(): string {
+    return path.join(stateDir(), "bili.log");
+}
