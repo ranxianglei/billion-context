@@ -75,49 +75,100 @@ Set the base URL / API endpoint to `http://localhost:8787` (Anthropic) or `http:
 
 ## Configuration
 
-All config is via environment variables:
+Configuration is read from a JSON file with env-var overrides. Priority:
+**env var > config file > built-in default**.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PORT` | `8787` | Proxy listen port |
-| `HOST` | `127.0.0.1` | Proxy listen host |
-| `UPSTREAM` | `https://api.anthropic.com` | Default upstream when no route matches |
-| `ACP_PROVIDERS` | *(none)* | Path to a JSON file mapping provider names to root URLs (see below) |
-| `ACP_COMPRESS_TOOL` | `1` | Set `0` to disable injecting the compress tool |
-| `ACP_DEBUG` | `0` | Set `1` for verbose logging |
-| `ACP_PASSTHROUGH` | `0` | Set `1` to forward without compression |
-| `BILI_PERSIST` | `1` | Set `0` to disable session persistence (in-memory only, lost on restart) |
-| `BILI_PERSIST_DEBOUNCE_MS` | `500` | Debounce window for writes to disk (milliseconds) |
-| `MAX_SESSIONS` | `256` | Max sessions held in memory (LRU eviction; disk is source of truth) |
-| `BILI_SESSIONS_DIR` | `~/.bili/sessions` | Directory for persisted session state |
+### Config file
 
-### Multiple upstreams (URL path routing)
+Location (XDG Base Directory):
 
-Point any agent at the proxy using a provider name as a path segment. The
-proxy strips the name and forwards to that provider's root URL. **API keys
-are never stored in the proxy** — whatever key the agent sends is passed
-through untouched to the upstream.
+- **Linux:** `~/.config/billion-context/billion-context.json`
+- Override with `XDG_CONFIG_HOME` or `BILI_CONFIG_FILE`
 
-Create a providers file (e.g. `~/.bili/providers.json`):
+The config file is a single JSON object. Example:
 
 ```json
 {
-  "glm": "https://bigmodel.cn",
-  "anthropic": "https://api.anthropic.com",
-  "openai": "https://api.openai.com",
-  "deepseek": "https://api.deepseek.com"
+  "port": 8787,
+  "host": "127.0.0.1",
+  "providers": {
+    "zhipu": {
+      "url": "https://open.bigmodel.cn",
+      "models": {
+        "glm-5.2": { "context": 1000000, "output": 131072 },
+        "glm-5.1": { "context": 200000, "output": 131072 }
+      }
+    },
+    "anthropic": "https://api.anthropic.com",
+    "deepseek": "https://api.deepseek.com"
+  }
 }
 ```
 
-Then:
+### Top-level keys
 
-```bash
-ACP_PROVIDERS=~/.bili/providers.json bili-proxy
+| Key | Default | Description |
+|------|---------|-------------|
+| `port` | `8787` | Proxy listen port |
+| `host` | `127.0.0.1` | Proxy listen host |
+| `upstream` | `https://api.anthropic.com` | Default upstream when no route matches |
+| `sessionHeader` | `x-acp-session` | Header name clients may send to identify a conversation |
+| `log` | `true` | Enable request logging |
+| `debug` | `false` | Verbose logging (same as `ACP_DEBUG=1`) |
+| `passthrough` | `false` | Forward without compression (same as `ACP_PASSTHROUGH=1`) |
+| `providers` | *(none)* | Provider routes — see below |
+| `condense` | *(see defaults)* | Tool-result condensing: `{ enabled, keepRecentToolResults, minCharsToCondense, maxKeptChars }` |
+| `compress` | *(see defaults)* | `{ injectTool, injectNudge }` |
+
+### Providers (URL routing + per-model context)
+
+`providers` maps a route name to either a bare URL string (simple) or an
+object with `url` + optional per-model context window (recommended).
+
+**Simple form** — provider name → URL:
+```json
+{ "deepseek": "https://api.deepseek.com" }
 ```
 
-Each agent only needs to change its base URL to include the provider name.
-The proxy figures out the rest, including the right context window for each
-model family (claude=200k, gpt-4o=128k, glm=128k, ...) via a built-in table.
+**Full form** — provider name → `{ url, models }`:
+```json
+{
+  "zhipu": {
+    "url": "https://open.bigmodel.cn",
+    "models": {
+      "glm-5.2": { "context": 1000000, "output": 131072 },
+      "glm-5.1": { "context": 200000 }
+    }
+  }
+}
+```
+
+The same model can have a different context window behind different providers
+(e.g. relay wraps a model with a larger window). `context` is the **input
+context limit** (used by the compressor to decide when to nudge); `output` is
+the max output tokens. Both are optional; missing values fall back to the
+built-in model table, then to `modelContextLimit`.
+
+> **Why declare context at all?** The LLM `/models` API does **not** return
+> context windows (verified across OpenAI, Anthropic, 智谱, comfly). They are
+> document-level information. A wrong value (e.g. GLM-5.2 guessed as 128K
+> instead of 1M) causes spurious frequent compression. Declaring it per
+> provider + model makes the proxy match the registry the client itself uses.
+
+**API keys are never stored in the proxy** — whatever key the agent sends is
+passed through untouched to the upstream.
+
+### Routing
+
+Point any agent at the proxy using a provider name as a path segment. The
+proxy strips the name and forwards to that provider's root URL.
+
+```
+agent baseURL:  http://localhost:8787/zhipu/api/coding/paas/v4
+                 └──────────┬──────────┘└────────┬────────┘
+                     proxy host           remaining path
+                     + provider name      (forwarded as-is)
+```
 
 #### Claude Code (Anthropic)
 
@@ -130,14 +181,39 @@ claude
 #### Codex / any OpenAI-compatible agent (zhipu / openai / deepseek)
 
 ```bash
-export OPENAI_BASE_URL=http://localhost:8787/v1/glm
+export OPENAI_BASE_URL=http://localhost:8787/zhipu/api/coding/paas/v4
 export OPENAI_API_KEY=<your real glm key>   # passed through as-is
 codex
 ```
 
-The `/v1/glm` prefix tells the proxy to route to the `glm` provider; the
-remaining `/v1/chat/completions` path is preserved. Set the key to the real
-provider key — the proxy never reads or stores it.
+The `/zhipu/...` prefix tells the proxy to route to the `zhipu` provider; the
+remaining `/api/coding/paas/v4/...` path is preserved.
+
+### Environment variables (override the config file)
+
+Every config key has an env-var override. Set to override the file value.
+
+| Env | Default | Description |
+|-----|---------|-------------|
+| `ACP_PORT` / `PORT` | `8787` | Listen port |
+| `ACP_HOST` | `127.0.0.1` | Listen host |
+| `ACP_UPSTREAM` | `https://api.anthropic.com` | Default upstream |
+| `ACP_PROVIDERS` | *(none)* | Path to a legacy providers JSON file (overrides `providers` in config) |
+| `ACP_MODEL_CONTEXT_LIMIT` | `200000` | Global fallback context window (only used when no provider/model match) |
+| `ACP_SESSION_HEADER` | `x-acp-session` | Conversation-id header name |
+| `ACP_COMPRESS_TOOL` | `1` | Set `0` to disable injecting the compress tool |
+| `ACP_COMPRESS_NUDGE` | `1` | Set `0` to disable compression nudges |
+| `ACP_CONDENSE_ENABLED` | `1` | Set `0` to disable tool-result condensing |
+| `ACP_KEEP_RECENT_TOOL_RESULTS` | `6` | Tool results kept verbatim before condensing |
+| `ACP_MIN_CHARS_TO_CONDENSE` | `1500` | Condense tool results longer than this |
+| `ACP_MAX_KEPT_CHARS` | `400` | Max chars kept when condensing a tool result |
+| `ACP_DEBUG` | `0` | Set `1` for verbose logging |
+| `ACP_PASSTHROUGH` | `0` | Set `1` to forward without compression |
+| `ACP_DUMP_SSE` | *(none)* | Directory to dump SSE for debugging |
+| `BILI_PERSIST` | `1` | Set `0` to disable session persistence (in-memory only, lost on restart) |
+| `BILI_PERSIST_DEBOUNCE_MS` | `500` | Debounce window for writes to disk (ms) |
+| `BILI_MAX_SESSIONS` | `256` | Max sessions held in memory (LRU eviction; disk is source of truth) |
+| `BILI_SESSIONS_DIR` | *(XDG data dir)* | Directory for persisted session state |
 
 ### Notes on provider names
 
