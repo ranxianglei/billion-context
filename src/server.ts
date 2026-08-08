@@ -237,7 +237,7 @@ function prepareAnthropic(
         session.state = turn.state;
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         processedMessages = applyCondense(turn.messages, opts, session);
-        reapOrphanBlocks(session, turn.messages, deactivateBlock);
+        reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = coreToAnthropic(processedMessages);
 
         systemOut = injectSystem(parsed, opts);
@@ -293,7 +293,7 @@ function prepareOpenai(
         session.state = turn.state;
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         processedMessages = applyCondense(turn.messages, opts, session);
-        reapOrphanBlocks(session, turn.messages, deactivateBlock);
+        reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = coreToOpenai(processedMessages);
 
         // ONLY the static compress prompt goes into the system message — the
@@ -357,7 +357,7 @@ function prepareResponses(
         session.state = turn.state;
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         processedMessages = applyCondense(turn.messages, opts, session);
-        reapOrphanBlocks(session, turn.messages, deactivateBlock);
+        reapOrphanBlocks(session, msgs, deactivateBlock);
         // Rebuild input preserving the responses_lite contract:
         //   input[0]   = additional_tools (host directive, verbatim)
         //   input[1]   = developer message (base instructions + compress prompt)
@@ -403,6 +403,17 @@ function prepareResponses(
     }
 
     const rebuilt: ResponsesRequestBody = { ...parsed, input: rebuiltInput, tools: toolsOut };
+    // Log the final tools we forward upstream so we can confirm ACP tools are
+    // present. Distinguishes "compress" (top-level function) from Codex
+    // namespace items (type:namespace/custom).
+    if (process.env.ACP_DEBUG) {
+        const fwdTools = (Array.isArray(toolsOut) ? toolsOut : []).map((t) => {
+            const r = t as Record<string, unknown>;
+            const sub = Array.isArray(r.tools) ? `(${r.tools.length} sub)` : "";
+            return `${r.type as string}:${(r.name as string) ?? "?"}${sub}`;
+        });
+        log("info", `[${sessionId}] responses forward tools=[${fwdTools.join(",")}] injectTool=${shouldInject} NO_INJECT_TOOL=${!!process.env.ACP_NO_INJECT_TOOL} NO_COMPRESS_PROMPT=${!!process.env.ACP_NO_COMPRESS_PROMPT}`);
+    }
     return { body: JSON.stringify(rebuilt), session, processedMessages, protocol: "responses", stream, compressInjected: shouldInject };
 }
 
@@ -477,7 +488,8 @@ async function forward(
             const parsed = JSON.parse(body);
             const toolNames = (parsed.tools ?? []).map((t: Record<string, unknown>) => {
                 const fn = t.function as { name?: string } | undefined;
-                return fn?.name ?? "?";
+                // chat completions nests under `function`; Responses API is flat.
+                return fn?.name ?? (t.name as string | undefined) ?? "?";
             });
             log("info", `[debug] tools=[${toolNames.join(",")}] msgs=${parsed.messages?.length ?? 0} stream=${parsed.stream ?? false} system_len=${JSON.stringify(parsed.messages?.find((m: Record<string, string>) => m.role === "system")?.content ?? "").length}`);
             if (process.env.ACP_DUMP_REQ === "1") {
