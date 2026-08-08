@@ -24,6 +24,10 @@ const SEMVER_RE = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z-.]+)?$/;
 
 let timer: ReturnType<typeof setInterval> | undefined;
 let inFlight = false;
+/** Versions we've already installed + notified about this process. Prevents
+ *  repeated reinstall/notify loops every check cycle until the user restarts
+ *  (the running process keeps the old currentVersion until restart). */
+const notified = new Set<string>();
 
 function parseVersion(v: string): number[] {
     return v.replace(/^v/, "").split(".").map((n) => parseInt(n, 10) || 0);
@@ -87,15 +91,19 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         const data = (await res.json()) as { version?: string };
         const latest = data.version;
         if (!latest || !isNewer(latest, opts.currentVersion)) return;
+        // Already installed and notified about this version — don't loop.
+        if (notified.has(latest)) return;
 
         const installed = await installLatest(opts.packageName, latest);
         if (installed) {
+            notified.add(latest);
             // Green ✔ — the only notification channel for a headless server.
             // eslint-disable-next-line no-console
             console.error(
                 `\x1b[32m\u2714 ${opts.packageName} auto-updated ${opts.currentVersion} \u2192 ${latest}. Restart bili to finish.\x1b[0m`,
             );
         } else {
+            notified.add(latest);
             // eslint-disable-next-line no-console
             console.error(
                 `\x1b[33m${opts.packageName} ${latest} is available (you have ${opts.currentVersion}). Update with: npm install -g ${opts.packageName}@latest\x1b[0m`,
