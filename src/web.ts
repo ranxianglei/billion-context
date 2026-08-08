@@ -255,6 +255,7 @@ select { cursor: pointer; }
       <button class="btn" onclick="addProvider()">+ Add provider</button>
     </div>
     <div class="actions">
+      <button class="btn" onclick="applyProviders()">Apply</button>
       <button class="btn primary" onclick="saveProviders()">Save</button>
     </div>
   </div>
@@ -374,8 +375,23 @@ function removeModel(i, j) {
 function checkDirty() {
   var dirty = savedProviders !== null && JSON.stringify(providers) !== savedProviders;
   var n = el("restart-notice");
-  if (dirty) { n.style.display = "block"; n.textContent = "Unsaved changes — click Save to write to the config file, then restart bili to apply."; }
+  if (dirty) { n.style.display = "block"; n.textContent = "Unsaved changes — click Save to write to the config file, then click Apply to activate without restart."; }
   else { n.style.display = "none"; }
+}
+
+// ── apply (hot-reload routes into running process) ──
+async function applyProviders() {
+  // Apply always re-reads the config FILE, so require a Save first if dirty.
+  if (savedProviders !== JSON.stringify(providers)) {
+    toast("Save your changes first", true);
+    return;
+  }
+  try {
+    var r = await fetch("/__acp/config/reload", { method: "POST" });
+    var d = await r.json();
+    if (r.ok) { toast("Applied — " + d.count + " providers active (no restart needed)"); }
+    else { toast("Apply failed: " + (d.error || "unknown"), true); }
+  } catch(e) { toast("Apply failed: " + e, true); }
 }
 
 // ── save ──
@@ -393,7 +409,7 @@ async function saveProviders() {
   try {
     var r = await fetch("/__acp/config", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ providers: obj }) });
     var d = await r.json();
-    if (r.ok) { savedProviders = JSON.stringify(providers); checkDirty(); toast("Saved " + d.count + " providers — restart bili to apply"); }
+    if (r.ok) { savedProviders = JSON.stringify(providers); checkDirty(); toast("Saved " + d.count + " providers — click Apply to activate"); }
     else { toast("Error: " + (d.error || "unknown"), true); }
   } catch(e) { toast("Save failed: " + e, true); }
 }
