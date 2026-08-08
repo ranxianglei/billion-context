@@ -55,25 +55,16 @@ bili
 It listens on `http://127.0.0.1:8787`. Keep this terminal open (or run in the
 background; see [Running the proxy](#running-the-proxy)).
 
-On first run `bili` **auto-creates an empty config file** and tells you where:
-so you don't have to invent the schema from scratch:
+Click [http://localhost:8787/__acp/](http://localhost:8787/__acp/) to add your models:
+<img width="2908" height="1787" alt="image" src="https://github.com/user-attachments/assets/cacf4b64-e5c6-41f2-b270-fd2be02eab0c" />
 
-```
-[acp-config] created empty config at ~/.config/billion-context/billion-context.json — add your providers (see README Quickstart), then restart
-```
-
-**Or configure via the web UI** (easier): open `http://localhost:8787/__acp/` in
-a browser while the proxy is running — edit providers in a form, and get
-copy-ready config snippets for Pi / OpenCode / Codex. The startup banner prints
-this URL too:
+On first run `bili` **auto-creates an empty config file** and tells you where,
+so you don't have to invent the schema from scratch. The startup banner prints
+the web UI URL too:
 
 ```
 acp-proxy listening on http://localhost:8787 — web UI: http://localhost:8787/__acp/
 ```
-
-This is the recommended path for first-time setup. (Prefer editing the JSON
-file directly — e.g. for git-managed or scripted deployments? See
-[Manual config file](#manual-config-file) below.)
 
 ### How routing works
 
@@ -101,10 +92,13 @@ to send each request. In the config below, `zhipu` corresponds to:
 
 ### Step 2 — Configure your providers
 
-Open the **web UI** at `http://localhost:8787/__acp/` and add your providers
-there (add provider → fill name + URL + per-model context → Save). This writes
-to `~/.config/billion-context/billion-context.json` directly. Then **restart
-`bili`** — the startup banner lists your routes:
+Copy the content below:
+<img width="2931" height="1519" alt="image" src="https://github.com/user-attachments/assets/c02278be-bc7a-4f14-8f58-0f2d83784d54" />
+
+> Prefer not to use the web UI? You can also edit the JSON file directly — see
+> [Manual config file](#manual-config-file) below.
+
+Then **restart `bili`** — the startup banner lists your routes:
 
 ```
 acp-proxy listening on http://localhost:8787 — routes: anthropic=https://api.anthropic.com, zhipu=https://open.bigmodel.cn
