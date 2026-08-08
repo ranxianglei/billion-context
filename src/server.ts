@@ -7,7 +7,7 @@ import { fetchWithTimeout, MAX_REQUEST_BYTES } from "./fetch-util.js";
 import {
     anthropicToCore,
     coreToAnthropic,
-    deriveSessionId,
+    conversationSignalAnthropic,
     extractSystem,
     buildSystem,
     type AnthropicRequestBody,
@@ -16,7 +16,7 @@ import {
     openaiToCore,
     coreToOpenai,
     injectOpenaiSystem,
-    deriveSessionIdOpenai,
+    conversationSignalOpenai,
     condenseOldToolResults,
     type CondenseOptions,
     type OpenAIRequestBody,
@@ -28,7 +28,7 @@ import {
     responsesToCore,
     coreToResponses,
     injectResponsesInstructions,
-    deriveSessionIdResponses,
+    conversationSignalResponses,
 } from "./responses.js";
 import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight } from "./session.js";
 import { COMPRESS_TOOL, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressTextSystemPrompt } from "./compress-tool.js";
@@ -40,6 +40,7 @@ import { compressLoopResponsesStream } from "./compress-loop-responses.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesSseStream, rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { emitStreamError } from "./stream-error.js";
+import { deriveSessionId as deriveProxySessionId } from "./session-id.js";
 
 const UPSTREAM_HOP_HEADERS = new Set([
     "host",
@@ -212,19 +213,25 @@ async function handle(
             }
         }
     }
+    // Resolve the upstream route once here so both the session id (needs the
+    // upstream ORIGIN for cross-provider isolation) and forward() (needs the
+    // full rewritten URL) use the same decision. Computed before prepare() so
+    // the session can embed the provider origin.
+    const route = resolveUpstream(opts, req.url ?? "");
+    const upstreamOrigin = route ? route.upstream : opts.upstream;
     const prepared = opts.passthrough
         ? null
         : protocol === "anthropic"
-            ? prepareAnthropic(bodyBuffer, req, opts, core, reqConfig, log)
+            ? prepareAnthropic(bodyBuffer, req, opts, core, reqConfig, log, protocol, upstreamOrigin)
             : protocol === "openai"
-              ? prepareOpenai(bodyBuffer, req, opts, core, reqConfig, log)
+              ? prepareOpenai(bodyBuffer, req, opts, core, reqConfig, log, protocol, upstreamOrigin)
               : protocol === "responses"
-                ? prepareResponses(bodyBuffer, req, opts, core, reqConfig, log)
+                ? prepareResponses(bodyBuffer, req, opts, core, reqConfig, log, protocol, upstreamOrigin)
                 : null;
     const outBody: Buffer | string = prepared ? prepared.body : bodyBuffer;
     if (prepared) acquireInFlight(prepared.session);
     try {
-        await forward(req, res, opts, outBody, prepared, core, reqConfig, log);
+        await forward(req, res, opts, outBody, prepared, core, reqConfig, log, route);
     } finally {
         if (prepared) releaseInFlight(prepared.session);
     }
@@ -251,10 +258,13 @@ function prepareAnthropic(
     core: CompressionCore,
     config: Config,
     log: (level: string, msg: string) => void,
+    protocol: "anthropic" | "openai" | "responses",
+    upstreamOrigin: string,
 ): Prepared {
     const parsed = JSON.parse(bodyBuffer.toString("utf8")) as AnthropicRequestBody;
     const stream = parsed.stream === true;
-    const sessionId = deriveSessionId(parsed, headerValue(req, opts.sessionHeader));
+    const sessionHeader = headerValue(req, opts.sessionHeader);
+    const sessionId = deriveProxySessionId(req.headers, protocol, upstreamOrigin, "", { clientConversation: conversationSignalAnthropic(parsed, sessionHeader) });
     const session = getSession(sessionId);
     session.requests++;
 
@@ -305,10 +315,13 @@ function prepareOpenai(
     core: CompressionCore,
     config: Config,
     log: (level: string, msg: string) => void,
+    protocol: "anthropic" | "openai" | "responses",
+    upstreamOrigin: string,
 ): Prepared {
     const parsed = JSON.parse(bodyBuffer.toString("utf8")) as OpenAIRequestBody;
     const stream = parsed.stream === true;
-    const sessionId = deriveSessionIdOpenai(parsed, headerValue(req, opts.sessionHeader));
+    const sessionHeader = headerValue(req, opts.sessionHeader);
+    const sessionId = deriveProxySessionId(req.headers, protocol, upstreamOrigin, "", { clientConversation: conversationSignalOpenai(parsed, sessionHeader) });
     const session = getSession(sessionId);
     session.requests++;
 
@@ -369,10 +382,13 @@ function prepareResponses(
     core: CompressionCore,
     config: Config,
     log: (level: string, msg: string) => void,
+    protocol: "anthropic" | "openai" | "responses",
+    upstreamOrigin: string,
 ): Prepared {
     const parsed = JSON.parse(bodyBuffer.toString("utf8")) as ResponsesRequestBody;
     const stream = parsed.stream === true;
-    const sessionId = deriveSessionIdResponses(parsed, headerValue(req, opts.sessionHeader));
+    const sessionHeader = headerValue(req, opts.sessionHeader);
+    const sessionId = deriveProxySessionId(req.headers, protocol, upstreamOrigin, "", { clientConversation: conversationSignalResponses(parsed, sessionHeader) });
     const session = getSession(sessionId);
     session.requests++;
 
@@ -515,10 +531,26 @@ async function forward(
     core: CompressionCore,
     config: Config,
     log: (level: string, msg: string) => void,
+    route: ReturnType<typeof resolveUpstream>,
 ): Promise<void> {
-    const route = resolveUpstream(opts, req.url ?? "");
     const upstreamUrl = route ? route.rewrittenUrl : opts.upstream + (req.url ?? "");
     log("info", `forward ${req.method} ${req.url ?? ""} → ${upstreamUrl}${route ? ` (${route.provider})` : ""}`);
+    if (process.env.ACP_DEBUG && prepared) {
+        const sid = prepared.session.id;
+        const hdrKeys = Object.keys(req.headers);
+        log("info", `[${sid}] client headers: ${hdrKeys.join(",")}`);
+        for (const k of ["authorization", "x-api-key", "x-session-id", "x-session-affinity", "x-acp-session", "x-opencode-session", "prompt-cache-key", "anthropic-beta"]) {
+            const v = req.headers[k] ?? req.headers[k.toLowerCase()];
+            if (v) {
+                const s = Array.isArray(v) ? v.join(",") : String(v);
+                // Mask all but a short prefix so the header NAME is visible
+                // (so we know the key is sent and roughly how) without leaking
+                // the credential into the log.
+                const masked = /key|auth|token/i.test(k) ? s.slice(0, 8) + "..." + s.slice(-4) + ` (${s.length} chars)` : s.slice(0, 60);
+                log("info", `[${sid}] client hdr ${k}=${masked}`);
+            }
+        }
+    }
     if (opts.debug && typeof body === "string") {
         try {
             const parsed = JSON.parse(body);

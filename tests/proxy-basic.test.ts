@@ -4,7 +4,7 @@ import {
     anthropicToCore,
     coreToAnthropic,
     condenseOldToolResults,
-    deriveSessionId,
+    conversationSignalAnthropic,
     type AnthropicRequestBody,
 } from "../src/anthropic.js";
 import {
@@ -18,7 +18,7 @@ import {
     openaiToCore,
     coreToOpenai,
     injectOpenaiSystem,
-    deriveSessionIdOpenai,
+    conversationSignalOpenai,
     type OpenAIRequestBody,
 } from "../src/openai.js";
 
@@ -88,16 +88,16 @@ test("condenseOldToolResults respects keepRecent", () => {
 
 test("deriveSessionId is stable for same first message, differs otherwise", () => {
     const body = bigToolResult("hello");
-    const a = deriveSessionId(body);
-    const b = deriveSessionId(body);
+    const a = conversationSignalAnthropic(body);
+    const b = conversationSignalAnthropic(body);
     assert.equal(a, b);
     const other = { ...body, messages: [{ role: "user" as const, content: "different" }] };
-    assert.notEqual(a, deriveSessionId(other));
+    assert.notEqual(a, conversationSignalAnthropic(other));
 });
 
 test("deriveSessionId prefers explicit header", () => {
     const body = bigToolResult("hello");
-    const fromHeader = deriveSessionId(body, "my-session-id");
+    const fromHeader = conversationSignalAnthropic(body, "my-session-id");
     assert.equal(fromHeader, "my-session-id");
 });
 
@@ -221,13 +221,13 @@ test("COMPRESS_TOOL_OPENAI is function-wrapped and named compress", () => {
 });
 
 test("deriveSessionIdOpenai prefers explicit header", () => {
-    const id = deriveSessionIdOpenai(openaiBody(), "my-session");
+    const id = conversationSignalOpenai(openaiBody(), "my-session");
     assert.equal(id, "my-session");
 });
 
 test("deriveSessionIdOpenai is stable for same first-user content", () => {
-    const a = deriveSessionIdOpenai(openaiBody());
-    const b = deriveSessionIdOpenai(openaiBody());
+    const a = conversationSignalOpenai(openaiBody());
+    const b = conversationSignalOpenai(openaiBody());
     assert.equal(a, b);
     assert.ok(a.length > 0);
 });

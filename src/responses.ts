@@ -299,8 +299,16 @@ export function injectResponsesInstructions(
 
 export { condenseOldToolResults, type CondenseOptions, type CondenseResult };
 
-export function deriveSessionIdResponses(body: ResponsesRequestBody, headerValue?: string): string {
+/** Extract the conversation dimension for Responses: a client-provided
+ *  session header if present, else the previous_response_id chain (Responses'
+ *  native conversation linkage) if present, else a content fingerprint of
+ *  the first user input. See conversationSignalAnthropic for the full
+ *  rationale. */
+export function conversationSignalResponses(body: ResponsesRequestBody, headerValue?: string): string {
     if (headerValue && headerValue.trim()) return headerValue.trim();
+    if (typeof body.previous_response_id === "string" && body.previous_response_id.length > 0) {
+        return `resp-${body.previous_response_id}`;
+    }
     let seed = "default";
     if (Array.isArray(body.input)) {
         const firstUser = body.input.find(

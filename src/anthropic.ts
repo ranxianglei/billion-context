@@ -198,7 +198,12 @@ export function condenseOldToolResults(messages: CoreMessage[], opts: CondenseOp
     return { messages: out, condensedCount, charsSaved };
 }
 
-export function deriveSessionId(body: AnthropicRequestBody, headerValue?: string): string {
+/** Extract the conversation dimension for Anthropic: a client-provided
+ *  session header if present, else a content fingerprint of the first user
+ *  message. The protocol+upstream+key dimensions are mixed in by the caller
+ *  (server.ts) via deriveSessionId() — this function contributes only the
+ *  conversation axis. */
+export function conversationSignalAnthropic(body: AnthropicRequestBody, headerValue?: string): string {
     if (headerValue && headerValue.trim()) return headerValue.trim();
     const firstUser = body.messages.find((m) => m.role === "user");
     const seed = firstUser ? JSON.stringify(firstUser.content).slice(0, 200) : "default";
