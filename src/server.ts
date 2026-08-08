@@ -30,10 +30,11 @@ import {
     injectResponsesInstructions,
     deriveSessionIdResponses,
 } from "./responses.js";
-import { getSession, listSessions, type Session } from "./session.js";
+import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions } from "./session.js";
 import { COMPRESS_TOOL, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressTextSystemPrompt } from "./compress-tool.js";
 import { rewriteSseStream, rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
+import { getStore } from "./persist.js";
 import { compressLoopStream } from "./compress-loop.js";
 import { compressLoopResponsesStream } from "./compress-loop-responses.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
@@ -79,10 +80,15 @@ export function resolveUpstream(opts: ProxyOptions, reqUrl: string): { upstream:
     return undefined;
 }
 
-export function startServer(opts: ProxyOptions): http.Server {
+export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     const core = createCore();
     const config: Config = opts.kernelConfig;
     const log = (level: string, msg: string) => logMsg(opts, level, msg);
+    // Reload persisted compression state before accepting traffic so sessions
+    // that survived a restart keep their folded view (otherwise long sessions
+    // re-send oversized raw history and hang).
+    await initSessions();
+    log("info", `[persist] ${getStore().enabled ? "enabled" : "disabled"}`);
     const server = http.createServer(async (req, res) => {
         try {
             await handle(req, res, opts, core, config, log);
@@ -109,6 +115,21 @@ export function startServer(opts: ProxyOptions): http.Server {
                     : ` → ${opts.upstream}`),
         );
     });
+    // Graceful shutdown: flush all dirty sessions to disk so a restart does
+    // not lose recent compression state. SIGKILL/power loss cannot flush, but
+    // debounced writes keep disk within ~500ms of in-memory state.
+    let shuttingDown = false;
+    const shutdown = (sig: string) => {
+        if (shuttingDown) return;
+        shuttingDown = true;
+        log("info", `${sig} received — flushing sessions…`);
+        void flushAllSessions().finally(() => {
+            server.close();
+            process.exit(0);
+        });
+    };
+    process.on("SIGTERM", () => shutdown("SIGTERM"));
+    process.on("SIGINT", () => shutdown("SIGINT"));
     return server;
 }
 
@@ -265,7 +286,8 @@ function prepareAnthropic(
     }
 
     const rebuilt: AnthropicRequestBody = { ...parsed, messages: rebuiltMessages, system: systemOut, tools: toolsOut };
-    return { body: JSON.stringify(rebuilt), session, processedMessages, protocol: "anthropic", stream, compressInjected: opts.compress.injectTool };
+    markDirty(session);
+    return { body: JSON.stringify(rebuilt), session, processedMessages, protocol: "anthropic", stream, compressInjected: opts.compress.injectTool } as Prepared;
 }
 
 function prepareOpenai(
@@ -328,7 +350,8 @@ function prepareOpenai(
     }
 
     const rebuilt: OpenAIRequestBody = { ...parsed, messages: rebuiltMessages, tools: toolsOut as OpenAITool[] | undefined };
-    return { body: JSON.stringify(rebuilt), session, processedMessages, protocol: "openai", stream, compressInjected: shouldInject };
+    markDirty(session);
+    return { body: JSON.stringify(rebuilt), session, processedMessages, protocol: "openai", stream, compressInjected: shouldInject } as Prepared;
 }
 
 function prepareResponses(
@@ -418,7 +441,8 @@ function prepareResponses(
         });
         log("info", `[${sessionId}] responses forward tools=[${fwdTools.join(",")}] injectTool=${shouldInject} NO_INJECT_TOOL=${!!process.env.ACP_NO_INJECT_TOOL} NO_COMPRESS_PROMPT=${!!process.env.ACP_NO_COMPRESS_PROMPT}`);
     }
-    return { body: JSON.stringify(rebuilt), session, processedMessages, protocol: "responses", stream, compressInjected: shouldInject };
+    markDirty(session);
+    return { body: JSON.stringify(rebuilt), session, processedMessages, protocol: "responses", stream, compressInjected: shouldInject } as Prepared;
 }
 
 function injectSystem(
@@ -636,6 +660,9 @@ async function forward(
         }
         clearUpstreamTimer();
     }
+    // State may have mutated during response streaming (compress created a
+    // block, decompress deactivated one) — persist the final snapshot.
+    markDirty(prepared.session);
 }
 
 async function pipeThrough(stream: ReadableStream<Uint8Array>, res: http.ServerResponse): Promise<void> {

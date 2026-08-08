@@ -1,5 +1,5 @@
 import { collectBlockContent, type CompressionCore, type Config, type CoreMessage, type CompressionState } from "acp-kernel";
-import type { Session } from "./session.js";
+import { type Session, cacheBlockContent } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput } from "./compress-tool.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
 
@@ -177,7 +177,7 @@ export function applyRanges(ranges: ReturnType<typeof parseCompressInput>, ctx: 
             const full = collectBlockContent(res.state, b, ctx.messages, { full: true });
             const one = collectBlockContent(res.state, b, ctx.messages, { full: false });
             if (full.count > 0 || one.count > 0) {
-                ctx.session.blockContents.set(b.blockId, {
+                cacheBlockContent(ctx.session, b.blockId, {
                     one: { text: one.text, count: one.count },
                     full: { text: full.text, count: full.count },
                 });
