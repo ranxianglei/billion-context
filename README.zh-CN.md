@@ -98,6 +98,19 @@ bili
 - 添加其他的(例如 `"deepseek": "https://api.deepseek.com"`)。
 - API key **不**写在这里 —— key 在客户端那边,代理原样透传。
 
+每个**左边的名字**就是代理在 URL 路径里要找的 key。名字是你随便起的
+—— 只是个标签 —— 但必须和第 3 步里用的路径一致:
+
+| 配置名字(第 2 步)| 对应第 3 步的路径段 |
+|---|---|
+| `"zhipu": ...` | `http://localhost:8787/zhipu/...` |
+| `"anthropic": ...` | `http://localhost:8787/anthropic` |
+| `"deepseek": ...` | `http://localhost:8787/deepseek` |
+
+所以 `http://localhost:8787/zhipu/api/coding/paas/v4` 的意思是:*路由到名为
+`zhipu` 的 provider(→ `https://open.bigmodel.cn`),剩余路径
+(`/api/coding/paas/v4`)原样转发*。
+
 保存后**重启 `bili`**。启动行列出你的路由:
 
 ```

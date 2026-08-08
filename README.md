@@ -105,6 +105,20 @@ Step 3.
 - The API key is **not** here — it lives in the client; the proxy passes it
   through untouched.
 
+Each **name on the left** is the key the proxy looks for in the URL path.
+The name you choose is arbitrary — it's just a label — but it must match the
+path you use in Step 3:
+
+| config name (Step 2) | becomes the path segment in Step 3 |
+|---|---|
+| `"zhipu": ...` | `http://localhost:8787/zhipu/...` |
+| `"anthropic": ...` | `http://localhost:8787/anthropic` |
+| `"deepseek": ...` | `http://localhost:8787/deepseek` |
+
+So `http://localhost:8787/zhipu/api/coding/paas/v4` means: *route to the
+provider named `zhipu` (→ `https://open.bigmodel.cn`), and forward the rest of
+the path (`/api/coding/paas/v4`) as-is.*
+
 After saving, **restart `bili`**. The startup banner lists your routes:
 
 ```
