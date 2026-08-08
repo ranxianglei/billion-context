@@ -264,6 +264,47 @@ bili start --port 19195
 #   ✔ billion-context auto-updated 0.1.16 → 0.1.17. Restart bili to finish.
 ```
 
+### ⚠ Releasing changes to the auto-update mechanism itself
+
+**The auto-update code (`src/update.ts`) is load-bearing for every future
+upgrade.** If a release ships a broken auto-update, users who install it become
+**permanently stuck** — they can never auto-update again (the broken thing is
+the updater itself), and many will never notice to manually reinstall. This is
+strictly worse than a normal bug: a normal bug affects one feature; a broken
+updater silently bricks the upgrade path for everyone who hits it.
+
+**Therefore: any change to `src/update.ts` (the download / extract / install /
+version-check logic) MUST be validated with a no-op release BEFORE shipping the
+change.** The sequence is:
+
+1. **Ship a no-op release first** (pure version bump, zero code changes) — this
+   proves the *existing* upgrade path is healthy end-to-end: the currently-
+   installed version auto-updates to the no-op release using the *old* code.
+   - Branch: `YYYY-MM-DD_release-v{VERSION}` (same naming convention).
+   - Commit: `release v{VERSION}` (version bump only).
+   - PR body MUST state it is a no-op and why (validation release).
+2. **Only after the no-op release is confirmed on npm** (`npm view
+   billion-context version` returns it) AND a real upgrade has been observed
+   succeeding (the log shows `auto-updated OLD → NEW`), ship the actual change
+   as a separate subsequent release.
+3. If the no-op release's upgrade **fails**, STOP. Do not ship the updater
+   change. Investigate the existing-path failure first — the existing code is
+   the only known-good upgrade path, and shipping a change on top of an
+   already-broken path compounds the problem.
+
+**Why the indirection?** Because if the change-to-the-updater is itself buggy,
+   anyone who upgrades to it is bricked. The no-op release isolates the test:
+   it exercises the upgrade path using code we already trust, so a success
+   confirms the *plumbing* (registry, tarball, file copy, restart) works,
+   independent of the new code. Only then do we trust the new code to run on
+   the next hop.
+
+**Concrete example (v0.1.22):** the Windows auto-update fix (replacing
+`execFile("tar"/"cp")` with the `tar` npm package + `fs.cp`) was staged in
+PR#44 but NOT shipped directly. A no-op v0.1.22 (PR#46, version bump only)
+was released first to confirm the running v0.1.21 could self-upgrade. Only
+after that succeeded was the Windows fix shipped in a follow-up release.
+
 ## 6. Contributing
 
 ### Before Making Changes
