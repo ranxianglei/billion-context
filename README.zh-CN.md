@@ -196,6 +196,14 @@ bili --no-auto-update   # 本次启动禁用自动更新
 | `providers` | *(无)* | Provider 路由 —— 见下文 |
 | `compress` | *(见默认值)* | `{ injectTool, injectNudge }` |
 
+> **选择 `host`**(IPv6 / 容器):默认 `127.0.0.1` 只听 IPv4 且仅
+> loopback。用 `--host ::`(或 `"host": "::"`)可同时听 IPv4 和 IPv6
+> ——当你的客户端把 `localhost` 先解析成 `::1` 时(有些 `/etc/hosts`
+> 把 `::1` 排在 `127.0.0.1` 前)这就很关键。在**容器**内,`127.0.0.1`
+> 绑的是容器自己的 loopback,通过映射端口访问不到——这时用
+> `--host 0.0.0.0`。⚠️ `0.0.0.0` / `::` 会把代理暴露到**所有**网卡;
+> 确保你在可信网络或防火墙后面。
+
 ### Providers(URL 路由 + 按模型 context)
 
 `providers` 把路由名映射到一个纯 URL 字符串(简单)或一个带 `url` + 可选按模型 context 窗口的对象(推荐)。
