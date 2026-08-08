@@ -53,75 +53,15 @@ bili
 
 它监听 `http://127.0.0.1:8787`。保持这个终端开着(或后台运行,见[运行代理](#运行代理))。
 
-首次运行 `bili` 会**自动创建一份空的配置文件**,并告诉你路径:
-
-```
-[acp-config] created empty config at ~/.config/billion-context/billion-context.json — add your providers (see README Quickstart), then restart
-```
-
-**或者用网页配置**(更简单):代理跑着的时候,在浏览器打开
-`http://localhost:8787/__acp/` —— 用表单编辑 providers,还能直接复制 Pi / OpenCode /
-Codex 的配置片段。启动行也会打印这个 URL:
-
-```
-acp-proxy listening on http://localhost:8787 — web UI: http://localhost:8787/__acp/
-```
-
-### 路由怎么工作
-
-代理按 **URL 路径里的 provider 名**路由 —— host 后面的第一段路径。它会
-剥离该名字,把剩余部分转发给那个 provider。名字之后的整段路径原样透传:
-
-```
-客户端 baseURL: http://localhost:8787/zhipu/api/coding/paas/v4
-                 └──────────┬──────────┘└────────┬────────┘
-                     代理 host            剩余路径
-                     + provider 名        (原样转发)
-```
-
-这就是为什么第 2 步让你声明带名字的 provider、第 3 步又让你把同样的名字
-放在客户端 base URL 的开头 —— 代理凭这个知道每条请求发到哪。
-稍后在配置文件中,`zhipu` 对应的是:
-```json
-    "zhipu": {
-      "url": "https://open.bigmodel.cn",
-      "models": {
-        "glm-5.2": { "context": 1000000, "output": 131072 }
-      }
-```
-
+添加你的模型
+<img width="2908" height="1787" alt="image" src="https://github.com/user-attachments/assets/cacf4b64-e5c6-41f2-b270-fd2be02eab0c" />
 
 ### 第 2 步 —— 编辑配置文件
 
-打开第 1 步创建的文件(`~/.config/billion-context/billion-context.json`),
-编辑 `providers` 块,填入你付费使用的 provider。每个条目是一个
-**名字 → URL** 映射;这个名字就是你在第 3 步里写进客户端 base URL 的东西。
+复制以下内容
 
-```json
-{
-  "providers": {
-    "zhipu": {
-      "url": "https://open.bigmodel.cn",
-      "models": {
-        "glm-5.2": { "context": 1000000, "output": 131072 }
-      }
-    },
-    "anthropic": "https://api.anthropic.com",
-  }
-}
-```
+<img width="2931" height="1519" alt="image" src="https://github.com/user-attachments/assets/c02278be-bc7a-4f14-8f58-0f2d83784d54" />
 
-- 删掉你不用的 provider。
-- 添加其他的(例如 `"deepseek": "https://api.deepseek.com"`)。
-- API key **不**写在这里 —— key 在客户端那边,代理原样透传。
-
-保存后**重启 `bili`**。启动行列出你的路由:
-
-```
-acp-proxy listening on http://127.0.0.1:8787 — routes: anthropic=https://api.anthropic.com, zhipu=https://open.bigmodel.cn
-```
-
-这证明代理读到了你的配置。(完整 schema —— 按模型的 context 窗口、可选字段 —— 见[配置](#配置)。)
 
 ### 第 3 步 —— 把客户端指向代理
 
