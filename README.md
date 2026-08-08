@@ -99,6 +99,20 @@ Verbose mode logs every `processTurn` (tag counts, token usage), the nudge
 decision (growth/usage/pendingT1/shouldInject), client headers, and SSE
 rewrites.
 
+### Self-update
+
+The proxy checks npm for a newer version on startup and every 3 minutes. When a
+newer version is found it installs it globally (`npm install -g`) and logs a
+notice — **restart `bili` to pick up the new version**.
+
+```bash
+bili update          # check & install now (manual, bypasses 3min throttle)
+bili --no-auto-update   # disable self-update for this run
+```
+
+Disable permanently via config (`"autoUpdate": false`) or env
+(`ACP_AUTO_UPDATE=0`).
+
 ## Configuration
 
 Configuration is read from a JSON file with env-var overrides. Priority:

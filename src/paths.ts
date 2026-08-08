@@ -46,3 +46,8 @@ export function sessionsDir(): string {
     if (env && env.length > 0) return path.resolve(env);
     return path.join(dataDir(), "sessions");
 }
+
+/** Root cache dir: transient/ephemeral data (update-check throttle, etc.). */
+export function cacheDir(): string {
+    return path.join(xdg("XDG_CACHE_HOME", ".cache"), "billion-context");
+}
