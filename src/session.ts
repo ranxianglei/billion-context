@@ -8,6 +8,12 @@ export type BlockContent = {
 
 export type Session = {
     id: string;
+    /** Protocol + upstream origin this session belongs to. Captured at first
+     *  request and persisted, so the on-disk filename can be namespaced by
+     *  protocol/provider (e.g. sessions/anthropic/bailian_<hash>.json) and a
+     *  human can tell sessions apart at a glance. */
+    protocol?: "anthropic" | "openai" | "responses";
+    upstreamOrigin?: string;
     state: CompressionState;
     createdAt: number;
     lastSeen: number;
@@ -63,15 +69,19 @@ export async function initSessions(): Promise<void> {
     }
 }
 
-export function getSession(id: string): Session {
+export function getSession(id: string, meta?: { protocol?: Session["protocol"]; upstreamOrigin?: string }): Session {
     const existing = sessions.get(id);
     if (existing) {
         existing.lastSeen = Date.now();
+        // Fill in protocol/upstream meta on an existing session if the caller
+        // now knows it (e.g. a session was created by loadAll without meta).
+        if (meta?.protocol && !existing.protocol) existing.protocol = meta.protocol;
+        if (meta?.upstreamOrigin && !existing.upstreamOrigin) existing.upstreamOrigin = meta.upstreamOrigin;
         return existing;
     }
     // Memory miss: try reload from disk (e.g. after LRU eviction).
     const store = getStore();
-    const reloaded = store.loadSync(id);
+    const reloaded = store.loadSync(id, meta);
     if (reloaded) {
         reloaded.lastSeen = Date.now();
         reloaded.persisted = true;
@@ -81,6 +91,8 @@ export function getSession(id: string): Session {
     if (sessions.size >= MAX_SESSIONS) evictOldest();
     const session: Session = {
         id,
+        protocol: meta?.protocol,
+        upstreamOrigin: meta?.upstreamOrigin,
         state: createInitialState(),
         createdAt: Date.now(),
         lastSeen: Date.now(),

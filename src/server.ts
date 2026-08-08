@@ -265,7 +265,7 @@ function prepareAnthropic(
     const stream = parsed.stream === true;
     const sessionHeader = headerValue(req, opts.sessionHeader);
     const sessionId = deriveProxySessionId(req.headers, protocol, upstreamOrigin, "", { clientConversation: conversationSignalAnthropic(parsed, sessionHeader) });
-    const session = getSession(sessionId);
+    const session = getSession(sessionId, { protocol, upstreamOrigin });
     session.requests++;
 
     let processedMessages: CoreMessage[] = [];
@@ -322,7 +322,7 @@ function prepareOpenai(
     const stream = parsed.stream === true;
     const sessionHeader = headerValue(req, opts.sessionHeader);
     const sessionId = deriveProxySessionId(req.headers, protocol, upstreamOrigin, "", { clientConversation: conversationSignalOpenai(parsed, sessionHeader) });
-    const session = getSession(sessionId);
+    const session = getSession(sessionId, { protocol, upstreamOrigin });
     session.requests++;
 
     let processedMessages: CoreMessage[] = [];
@@ -389,7 +389,7 @@ function prepareResponses(
     const stream = parsed.stream === true;
     const sessionHeader = headerValue(req, opts.sessionHeader);
     const sessionId = deriveProxySessionId(req.headers, protocol, upstreamOrigin, "", { clientConversation: conversationSignalResponses(parsed, sessionHeader) });
-    const session = getSession(sessionId);
+    const session = getSession(sessionId, { protocol, upstreamOrigin });
     session.requests++;
 
     let processedMessages: CoreMessage[] = [];

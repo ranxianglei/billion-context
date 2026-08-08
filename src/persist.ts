@@ -51,6 +51,11 @@ interface PersistedSession {
     version: number;
     savedAt: number;
     id: string;
+    /** Protocol + upstream origin, captured so the on-disk filename can be
+     *  namespaced by protocol/provider. Absent in files written before this
+     *  field existed; treated as unknown on load (file lives under _unknown/). */
+    protocol?: "anthropic" | "openai" | "responses";
+    upstreamOrigin?: string;
     createdAt: number;
     requests: number;
     condensedToolResults: number;
@@ -76,11 +81,42 @@ function mergeState(parsed: CompressionState): CompressionState {
     };
 }
 
-/** Deterministic, collision-resistant filename from a session id. Uses a
- *  truncated sha256 so distinct ids never share a file (a naive sanitize would
- *  collide e.g. "a/b" and "a_b"). The real id is stored inside the file body
- *  and verified on load. */
-function fileNameFor(id: string): string {
+/** Extract a short host label from an upstream origin URL, safe for a
+ *  filename. Uses the full hostname (sanitized) rather than guessing the
+ *  registrable domain — a public-suffix-list lookup is overkill, and the full
+ *  host is unambiguous and grep-able. e.g.
+ *    "https://coding.dashscope.aliyuncs.com" -> "coding.dashscope.aliyuncs.com"
+ *  Falls back to a hash of the origin if parsing fails, so two distinct
+ *  origins never collide. */
+function hostLabel(upstreamOrigin?: string): string {
+    if (!upstreamOrigin) return "unknown";
+    try {
+        const host = new URL(upstreamOrigin).hostname || "unknown";
+        return host.replace(/[^a-zA-Z0-9.-]/g, "-").slice(0, 48) || "unknown";
+    } catch {
+        return "unknown-" + createHash("sha256").update(upstreamOrigin, "utf8").digest("hex").slice(0, 6);
+    }
+}
+
+/** Relative path (under the sessions dir) for a session, namespaced by
+ *  protocol and upstream host so a human can tell sessions apart at a glance:
+ *    anthropic/bailian_<hash>.json
+ *    openai/zhipu_<hash>.json
+ *    responses/comfly_<hash>.json
+ *  When protocol meta is absent (e.g. a session loaded from an old file
+ *  written before meta was captured), fall back to _unknown/ so it still
+ *  loads — it will be rewritten with the right namespace on next persist.
+ *  Deterministic from (id, protocol, upstreamOrigin), so loadAll can verify
+ *  the filename matches the body and loadSync can reverse-lookup. */
+function relPathFor(id: string, protocol?: string, upstreamOrigin?: string): string {
+    const proto = protocol ?? "_unknown";
+    const host = protocol ? hostLabel(upstreamOrigin) + "_" : "";
+    return path.join(proto, `${host}${createHash("sha256").update(id, "utf8").digest("hex").slice(0, 24)}.json`);
+}
+
+/** Legacy flat filename (pre-namespace). Kept only for loadAll to recognize
+ *  and migrate old files. */
+function legacyFileNameFor(id: string): string {
     return createHash("sha256").update(id, "utf8").digest("hex").slice(0, 24) + ".json";
 }
 
@@ -100,15 +136,15 @@ export class SessionStore {
         this.log = opts?.log ?? defaultLogger;
     }
 
-    private filePath(id: string): string {
-        return path.join(this.dir, fileNameFor(id));
+    private filePath(id: string, protocol?: string, upstreamOrigin?: string): string {
+        return path.join(this.dir, relPathFor(id, protocol, upstreamOrigin));
     }
 
     /** A unique temp path per write (per process). Two overlapping writes for
      *  the same session must not share a temp file, or one rename invalidates
      *  the other. */
     private tempPath(id: string): string {
-        return path.join(this.dir, `.tmp-${fileNameFor(id)}-${process.pid}-${this.tmpSeq++}`);
+        return path.join(this.dir, `.tmp-${legacyFileNameFor(id)}-${process.pid}-${this.tmpSeq++}`);
     }
 
     /** Bulk-load every persisted session from disk into a map keyed by the
@@ -123,26 +159,49 @@ export class SessionStore {
         } catch {
             return out;
         }
-        let names: string[];
-        try {
-            names = await fs.readdir(this.dir);
-        } catch {
-            return out;
-        }
-        for (const name of names) {
-            if (!name.endsWith(".json") || name.startsWith(".tmp-")) continue;
+        // Recursively walk the sessions dir to pick up the namespaced layout
+        // (sessions/<protocol>/<host>_<hash>.json) as well as legacy flat files
+        // (sessions/<hash>.json) written by older versions.
+        const files: string[] = [];
+        const walk = async (dir: string): Promise<void> => {
+            let entries: import("node:fs").Dirent[];
             try {
-                const parsed = JSON.parse(await fs.readFile(path.join(this.dir, name), "utf8")) as PersistedSession;
+                entries = await fs.readdir(dir, { withFileTypes: true });
+            } catch {
+                return;
+            }
+            for (const e of entries) {
+                if (e.name.startsWith(".tmp-")) continue;
+                const full = path.join(dir, e.name);
+                if (e.isDirectory()) {
+                    await walk(full);
+                } else if (e.isFile() && e.name.endsWith(".json")) {
+                    files.push(full);
+                }
+            }
+        };
+        await walk(this.dir);
+        for (const full of files) {
+            const name = path.basename(full);
+            try {
+                const parsed = JSON.parse(await fs.readFile(full, "utf8")) as PersistedSession;
                 if (!isValidRecord(parsed)) continue;
-                // Filename must match the body id — guards against a file that
-                // was copied/renamed by hand, or a stale temp that slipped in.
-                if (fileNameFor(parsed.id) !== name) {
-                    this.log("warn", `[persist] skipping ${name}: filename does not match body id (expected ${fileNameFor(parsed.id)})`);
+                // Accept the file if EITHER the namespaced name or the legacy
+                // flat name matches the body id. The namespaced form is the
+                // current convention; the legacy form is tolerated so old
+                // files still load (and will be re-persisted under the new
+                // namespace on next dirty write).
+                const proto = parsed.protocol;
+                const origin = parsed.upstreamOrigin;
+                const expectedNamespaced = path.basename(relPathFor(parsed.id, proto, origin));
+                const expectedLegacy = legacyFileNameFor(parsed.id);
+                if (name !== expectedNamespaced && name !== expectedLegacy) {
+                    this.log("warn", `[persist] skipping ${full}: filename does not match body id (expected ${expectedNamespaced})`);
                     continue;
                 }
                 out.set(parsed.id, buildSession(parsed));
             } catch (e) {
-                this.log("warn", `[persist] skipping corrupt session file ${name}: ${msg(e)}`);
+                this.log("warn", `[persist] skipping corrupt session file ${full}: ${msg(e)}`);
             }
         }
         return out;
@@ -152,18 +211,24 @@ export class SessionStore {
      *  LRU eviction). Sync fs is acceptable here because a miss is rare and
      *  reads a single small file (~1ms). Returns null if missing/corrupt or the
      *  body id does not match what we asked for. */
-    loadSync(id: string): Session | null {
+    loadSync(id: string, meta?: { protocol?: string; upstreamOrigin?: string }): Session | null {
         if (!this.enabled) return null;
-        const file = this.filePath(id);
-        if (!existsSync(file)) return null;
-        try {
-            const parsed = JSON.parse(readFileSync(file, "utf8")) as PersistedSession;
-            if (!isValidRecord(parsed) || parsed.id !== id) return null;
-            return buildSession(parsed);
-        } catch (e) {
-            this.log("warn", `[persist] failed to load session ${id}: ${msg(e)}`);
-            return null;
+        // Try the namespaced path first (current convention), then fall back to
+        // the _unknown/ legacy location for sessions persisted before protocol
+        // meta was captured.
+        const candidates = [this.filePath(id, meta?.protocol, meta?.upstreamOrigin)];
+        if (meta?.protocol) candidates.push(this.filePath(id)); // _unknown/ fallback
+        for (const file of candidates) {
+            if (!existsSync(file)) continue;
+            try {
+                const parsed = JSON.parse(readFileSync(file, "utf8")) as PersistedSession;
+                if (!isValidRecord(parsed) || parsed.id !== id) continue;
+                return buildSession(parsed);
+            } catch (e) {
+                this.log("warn", `[persist] failed to load session ${id}: ${msg(e)}`);
+            }
         }
+        return null;
     }
 
     /** Schedule a debounced write for a session. Multiple calls within the
@@ -188,9 +253,9 @@ export class SessionStore {
     async writeNow(session: Session): Promise<void> {
         if (!this.enabled) return;
         const record = buildRecord(session);
-        const file = this.filePath(session.id);
+        const file = this.filePath(session.id, session.protocol, session.upstreamOrigin);
         try {
-            await fs.mkdir(this.dir, { recursive: true });
+            await fs.mkdir(path.dirname(file), { recursive: true });
         } catch (e) {
             this.log("warn", `[persist] could not create session dir ${this.dir}: ${msg(e)}`);
         }
@@ -213,9 +278,9 @@ export class SessionStore {
             this.timers.delete(session.id);
         }
         const record = buildRecord(session);
-        const file = this.filePath(session.id);
+        const file = this.filePath(session.id, session.protocol, session.upstreamOrigin);
         try {
-            mkdirSync(this.dir, { recursive: true });
+            mkdirSync(path.dirname(file), { recursive: true });
         } catch (e) {
             this.log("warn", `[persist] could not create session dir ${this.dir}: ${msg(e)}`);
         }
@@ -273,6 +338,8 @@ function buildRecord(session: Session): PersistedSession {
         version: PERSIST_VERSION,
         savedAt: Date.now(),
         id: session.id,
+        protocol: session.protocol,
+        upstreamOrigin: session.upstreamOrigin,
         createdAt: session.createdAt,
         requests: session.requests,
         condensedToolResults: session.condensedToolResults,
@@ -289,6 +356,8 @@ function buildSession(parsed: PersistedSession): Session {
     }
     return {
         id: parsed.id,
+        protocol: parsed.protocol,
+        upstreamOrigin: parsed.upstreamOrigin,
         state: mergeState(parsed.state),
         createdAt: parsed.createdAt ?? Date.now(),
         lastSeen: Date.now(),
