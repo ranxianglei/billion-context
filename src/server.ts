@@ -689,7 +689,10 @@ async function forward(
     affinity?: string,
 ): Promise<void> {
     const upstreamUrl = route ? route.rewrittenUrl : opts.upstream + (req.url ?? "");
-    log("info", `forward ${req.method} ${req.url ?? ""} → ${upstreamUrl}${route ? ` (${route.provider})` : ""}`);
+    // Show the final proxied URL (where the request actually lands) as the
+    // primary signal. The provider label is appended only for named routes —
+    // zero-config (/p/) requests have no meaningful name, so we omit it.
+    log("info", `forward ${req.method} → ${upstreamUrl}${route && route.provider !== "p" ? `  [${route.provider}]` : ""}`);
     if (process.env.ACP_DEBUG && prepared) {
         const sid = prepared.session.id;
         const hdrKeys = Object.keys(req.headers);

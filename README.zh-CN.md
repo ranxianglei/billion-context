@@ -42,8 +42,31 @@ npm install -g billion-context
 
 ## 快速上手
 
-三步:**启动代理 → 编辑配置文件 → 把客户端指向它**。
+两种方式 —— 任选其一:
+
+- **零配置(最简单):** 在客户端 baseURL 前面加上代理地址 + `/p/`。无需配置文件 —— context 窗口自动从 [models.dev](https://models.dev) registry 查询。
+- **命名 provider:** 在配置文件里声明 provider,然后用更短的 `http://localhost:8787/<name>/...` URL。适合管理多个端点或需要显式指定按模型 context 的场景。
+
 压缩是自动注入的 —— 你只需配置路由,无需配置压缩本身。
+
+### 方式 A —— 零配置(`/p/` 前缀)
+
+启动代理:
+
+```bash
+bili
+```
+
+然后把客户端现有的 baseURL 前面加上 `http://localhost:8787/p/` 就行。完整上游 URL 嵌在路径里,proxy 无需任何配置就知道转发到哪:
+
+```
+客户端 baseURL 之前:  https://api.openai.com/v1
+客户端 baseURL 之后:  http://localhost:8787/p/https://api.openai.com/v1
+```
+
+就这样 —— 真实 API key 照常填在客户端配置里(proxy 原样透传)。context 窗口(gpt-5.1-codex=400K、glm-5.2=1M、claude-opus-4=200K ……)自动从 models.dev 查询。
+
+### 方式 B —— 命名 provider(配置文件)
 
 ### 第 1 步 —— 启动代理
 
