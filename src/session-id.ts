@@ -36,7 +36,7 @@ function extractKey(headers: Record<string, string | string[] | undefined>): str
 }
 
 /** Pull a client-provided conversation signal from headers, if any. */
-function clientConversationHeader(headers: Record<string, string | string[] | undefined>): string | undefined {
+export function clientConversationHeader(headers: Record<string, string | string[] | undefined>): string | undefined {
     const names = ["x-session-affinity", "x-acp-session", "x-session-id", "x-opencode-session"];
     for (const name of names) {
         const v = headers[name];
@@ -80,5 +80,3 @@ export function affinityToken(
     if (client) return client;
     return `ses_${conversation}`;
 }
-
-export { clientConversationHeader };

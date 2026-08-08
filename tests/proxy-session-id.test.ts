@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { deriveSessionId, affinityToken, clientConversationHeader } from "../src/session-id.ts";
+import { conversationSignalResponses } from "../src/responses.ts";
 
 /** Helper: build a minimal headers object. */
 function hdrs(auth?: string, sessionAffinity?: string): Record<string, string> {
@@ -102,4 +103,44 @@ test("affinityToken is safe to send upstream: does NOT embed the API key", () =>
     const withKeyA = affinityToken(hdrs("Bearer keyA"), "hello");
     const withKeyB = affinityToken(hdrs("Bearer keyB"), "hello");
     assert.equal(withKeyA, withKeyB, "affinity token identical regardless of key");
+});
+
+test("conversationSignalResponses: prefers codex body.session_id (UUID) over previous_response_id and content hash", () => {
+    // Codex 0.147+ sends body.session_id (a per-conversation UUID). It is the
+    // most explicit identifier and must win over the fallbacks.
+    const body = {
+        input: "hello",
+        session_id: "019fdc81-a420-7a00-bbd1-0a64e3eb772c",
+        previous_response_id: "resp_abc",
+    } as unknown as Parameters<typeof conversationSignalResponses>[0];
+    const sig = conversationSignalResponses(body, undefined);
+    assert.equal(sig, "codex-019fdc81-a420-7a00-bbd1-0a64e3eb772c");
+});
+
+test("conversationSignalResponses: header (opencode x-session-affinity) still wins over body.session_id", () => {
+    // A client-provided session header is the strongest signal (it is what
+    // the client itself uses to identify the conversation).
+    const body = {
+        input: "hello",
+        session_id: "019fdc81-a420-7a00-bbd1-0a64e3eb772c",
+    } as unknown as Parameters<typeof conversationSignalResponses>[0];
+    const sig = conversationSignalResponses(body, "ses_opencode-123");
+    assert.equal(sig, "ses_opencode-123");
+});
+
+test("conversationSignalResponses: falls back to previous_response_id when no session_id and no header", () => {
+    const body = {
+        input: "hello",
+        previous_response_id: "resp_xyz",
+    } as unknown as Parameters<typeof conversationSignalResponses>[0];
+    assert.equal(conversationSignalResponses(body, undefined), "resp-resp_xyz");
+});
+
+test("conversationSignalResponses: falls back to content hash when nothing else (pi path)", () => {
+    const body = { input: "hello world" } as unknown as Parameters<typeof conversationSignalResponses>[0];
+    // No header, no session_id, no previous_response_id → deterministic hash.
+    const a = conversationSignalResponses(body, undefined);
+    const b = conversationSignalResponses({ input: "hello world" } as never, undefined);
+    assert.equal(a, b);
+    assert.ok(/^[0-9a-f]{16}$/.test(a), `expected content-hash id, got ${a}`);
 });

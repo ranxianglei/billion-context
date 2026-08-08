@@ -146,9 +146,43 @@ provider key — the proxy never reads or stores it.
   are rejected to avoid colliding with real API path segments.
 - The provider name can appear anywhere in the path; the longest match wins.
 
+### Session identity
+
+The proxy needs a stable per-conversation identifier to isolate compression
+state across concurrent users/accounts. It derives one from four dimensions
+(see `src/session-id.ts`): **protocol × upstream origin × API key ×
+conversation**. The first three prevent cross-account / cross-provider
+bleeding; the conversation dimension comes from whatever the client sends.
+
+Clients differ in what they send:
+
+| Client | Sends conversation id? | Source | Safety |
+|---|---|---|---|
+| **Codex** (0.147+) | ✅ yes | `body.session_id` (per-conversation UUID) | ✅ safe |
+| **OpenCode** | ✅ yes | `x-session-affinity` header (`ses_…`) | ✅ safe |
+| **pi** | ❌ **no** | nothing | ⚠️ **collision risk** |
+
+When the client sends an explicit id, the proxy uses it directly. When it
+does not (pi), the proxy falls back to hashing the first user message — so
+two conversations that start with the same opener collapse onto the same
+session. This does **not** corrupt data (per-message refs use a separate
+content fingerprint that stays stable), but it can skew nudge/compression
+timing and occasionally over-eagerly reap a block. It is self-healing: the
+worst case is reduced compression efficiency, never data loss.
+
+For upstream sticky-routing, when the client sends no session header the
+proxy synthesizes one (`x-session-id: ses_<hash>`) so cache pools / load
+balancers still get a stable key.
+
+**Recommendation:** Codex and OpenCode are safe to run many concurrent
+conversations through the proxy. pi is fine for a single agent, but is **not
+recommended** for many concurrent conversations because of the collision
+risk — until pi grows its own session-id signal. For pi multi-agent use,
+pass an explicit `x-acp-session` header per conversation to avoid collisions.
+
 ## Status
 
-Early. Protocol handling and compression work against mock tests (136 passing). Real-model integration testing is the next milestone. Expect rough edges.
+Early. Protocol handling and compression work against mock tests (141 passing). Real-model integration testing is the next milestone. Expect rough edges.
 
 See [billion-context-pi](https://github.com/ranxianglei/billion-context-pi) for the pi-extension mode (in-process, tighter integration, the reference implementation).
 

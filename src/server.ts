@@ -40,7 +40,7 @@ import { compressLoopResponsesStream } from "./compress-loop-responses.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesSseStream, rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { emitStreamError } from "./stream-error.js";
-import { deriveSessionId as deriveProxySessionId } from "./session-id.js";
+import { deriveSessionId as deriveProxySessionId, affinityToken, clientConversationHeader } from "./session-id.js";
 
 const UPSTREAM_HOP_HEADERS = new Set([
     "host",
@@ -242,6 +242,12 @@ async function handle(
                   : conversationSignalResponses(parsed as ResponsesRequestBody, sessionHeader);
         const sessionId = deriveProxySessionId(req.headers, protocol, upstreamOrigin, conversation);
         const session = getSession(sessionId, { protocol, upstreamOrigin });
+        // Affinity token to forward upstream: prefer the client's own session
+        // header (opencode x-session-affinity, codex body.session_id); if the
+        // client sent none (pi), synthesize ses_<conversation> so upstream
+        // sticky-routing / cache pools still get a stable key. See README
+        // "Session identity".
+        const affinity = affinityToken(req.headers, conversation);
         // Serialize per-session: prepare (processTurn mutates state) + forward
         // (stream rewriter mutates state via compress/decompress) must not
         // interleave across concurrent requests on the same session.
@@ -254,7 +260,7 @@ async function handle(
                       : prepareResponses(parsed as ResponsesRequestBody, req, opts, core, reqConfig, log, session);
             acquireInFlight(session);
             try {
-                await forward(req, res, opts, prepared!.body, prepared!, core, reqConfig, log, route);
+                await forward(req, res, opts, prepared!.body, prepared!, core, reqConfig, log, route, affinity);
             } finally {
                 releaseInFlight(session);
             }
@@ -264,7 +270,7 @@ async function handle(
         if (protocol === null && !opts.passthrough) {
             log("warn", `unrecognized path ${url} — not a known protocol (/chat/completions, /v1/messages, /responses); forwarding unchanged`);
         }
-        await forward(req, res, opts, bodyBuffer, null, core, reqConfig, log, route);
+        await forward(req, res, opts, bodyBuffer, null, core, reqConfig, log, route, undefined);
     }
 }
 
@@ -568,6 +574,7 @@ async function forward(
     config: Config,
     log: (level: string, msg: string) => void,
     route: ReturnType<typeof resolveUpstream>,
+    affinity?: string,
 ): Promise<void> {
     const upstreamUrl = route ? route.rewrittenUrl : opts.upstream + (req.url ?? "");
     log("info", `forward ${req.method} ${req.url ?? ""} → ${upstreamUrl}${route ? ` (${route.provider})` : ""}`);
@@ -609,6 +616,15 @@ async function forward(
         headers[k] = Array.isArray(v) ? v.join(", ") : v;
     }
     headers["host"] = new URL(route ? route.upstream : opts.upstream).host;
+    // Inject a synthesized session-affinity header for clients that send none
+    // (pi). opencode already sends x-session-affinity (passed through above);
+    // codex carries identity in body.session_id (passes through in the body).
+    // pi sends nothing, so upstream sticky-routing/cache pools would fall back
+    // to content fingerprinting — give them a stable key instead. Only inject
+    // when the client sent NO session header at all (don't shadow opencode's).
+    if (affinity && !clientConversationHeader(req.headers)) {
+        headers["x-session-id"] = affinity;
+    }
     const init: RequestInit = {
         method: req.method ?? "GET",
         headers,
