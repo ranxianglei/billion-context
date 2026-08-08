@@ -66,6 +66,34 @@ bili
 
 就这样 —— 真实 API key 照常填在客户端配置里(proxy 原样透传)。context 窗口(gpt-5.1-codex=400K、glm-5.2=1M、claude-opus-4=200K ……)自动从 models.dev 查询。
 
+#### 各客户端示例
+
+**OpenCode** —— 编辑 `~/.config/opencode/opencode.json`,改 provider 的 `baseURL`:
+```jsonc
+// 之前:
+"baseURL": "https://open.bigmodel.cn/api/coding/paas/v4"
+// 之后(前面加上代理地址 + /p/):
+"baseURL": "http://localhost:8787/p/https://open.bigmodel.cn/api/coding/paas/v4"
+```
+
+**Codex** —— 编辑 `~/.codex/config.toml`,改 provider 的 `base_url`:
+```toml
+# 之前:
+base_url = "https://api.openai.com/v1"
+# 之后:
+base_url = "http://localhost:8787/p/https://api.openai.com/v1"
+```
+
+**Pi** —— 编辑 `~/.pi/agent/models.json`,改 provider 的 `baseUrl`:
+```jsonc
+// 之前:
+"baseUrl": "https://api.anthropic.com"
+// 之后:
+"baseUrl": "http://localhost:8787/p/https://api.anthropic.com"
+```
+
+**其他客户端(Cursor / Aider / Continue ……)** —— 只要配置了上游 URL,前面加 `http://localhost:8787/p/` 就行,其他都不用改。
+
 ### 方式 B —— 命名 provider(配置文件)
 
 ### 第 1 步 —— 启动代理

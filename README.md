@@ -76,6 +76,35 @@ passes it through untouched). Context windows (gpt-5.1-codex=400K,
 glm-5.2=1M, claude-opus-4=200K, …) are looked up from models.dev
 automatically.
 
+#### Examples by client
+
+**OpenCode** — edit `~/.config/opencode/opencode.json`, change the provider's `baseURL`:
+```jsonc
+// before:
+"baseURL": "https://open.bigmodel.cn/api/coding/paas/v4"
+// after (just prepend the proxy origin + /p/):
+"baseURL": "http://localhost:8787/p/https://open.bigmodel.cn/api/coding/paas/v4"
+```
+
+**Codex** — edit `~/.codex/config.toml`, change the provider's `base_url`:
+```toml
+# before:
+base_url = "https://api.openai.com/v1"
+# after:
+base_url = "http://localhost:8787/p/https://api.openai.com/v1"
+```
+
+**Pi** — edit `~/.pi/agent/models.json`, change the provider's `baseUrl`:
+```jsonc
+// before:
+"baseUrl": "https://api.anthropic.com"
+// after:
+"baseUrl": "http://localhost:8787/p/https://api.anthropic.com"
+```
+
+**Other clients (Cursor / Aider / Continue …)** — wherever the upstream URL is
+configured, prepend `http://localhost:8787/p/` to it. Nothing else changes.
+
 ### Option B — Named providers (config file)
 
 ### Step 1 — Start the proxy
