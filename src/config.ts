@@ -4,7 +4,11 @@ import { configFile } from "./paths.js";
 
 function safeReadJson(path: string): unknown {
     try {
-        return JSON.parse(readFileSync(path, "utf8"));
+        // Strip a leading UTF-8 BOM: Windows Notepad saves UTF-8 "with BOM",
+        // and JSON.parse("\uFEFF...") throws SyntaxError, silently dropping
+        // the whole config file.
+        const raw = readFileSync(path, "utf8").replace(/^\uFEFF/, "");
+        return JSON.parse(raw);
     } catch (e) {
         // Surface config parse failures instead of silently swallowing them;
         // a malformed providers file would otherwise run the proxy with
