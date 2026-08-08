@@ -78,15 +78,25 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
     if (!opts.autoUpdate && !force) return;
     if (inFlight) return;
     inFlight = true;
+    // First call in this process always runs a real check (ignores the
+    // cross-process throttle file). Rationale: a freshly started proxy should
+    // tell the user promptly if an update is waiting, not inherit a stale
+    // throttle from the previous run that could delay the first check by up
+    // to the full interval. Subsequent calls honor the shared throttle.
+    const firstInProcess = !notified.has("__first_check_done__");
     try {
         const now = Date.now();
         const lastCheck = await readLastCheck();
-        if (!force && now - lastCheck < CHECK_INTERVAL_MS) {
-            loggerLog("info", `[update] check skipped (throttled, ${(CHECK_INTERVAL_MS - (now - lastCheck)) / 1000 | 0}s until next)`);
+        const sinceLastSec = lastCheck ? ((now - lastCheck) / 1000 | 0) : -1;
+        if (!force && !firstInProcess && now - lastCheck < CHECK_INTERVAL_MS) {
+            // Be explicit about BOTH directions so the count can't look wrong:
+            // "last checked Ns ago" (monotonic) + "retry in Ms" (countdown).
+            const retryIn = ((CHECK_INTERVAL_MS - (now - lastCheck)) / 1000 | 0);
+            loggerLog("info", `[update] throttled — last checked ${sinceLastSec}s ago, retry in ${retryIn}s`);
             return;
         }
         await writeLastCheck(now);
-        loggerLog("info", `[update] checking npm registry for ${opts.packageName}…`);
+        loggerLog("info", `[update] checking npm registry for ${opts.packageName}${firstInProcess ? " (startup check)" : sinceLastSec < 0 ? "" : ` (last check ${sinceLastSec}s ago)`}…`);
 
         const url = `${REGISTRY_BASE}/${opts.packageName}/latest`;
         const res = await fetch(url, {
@@ -125,6 +135,9 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         loggerLog("warn", `[update] check failed: ${String(e)}`);
     } finally {
         inFlight = false;
+        // Mark that the startup check has run so subsequent calls honor the
+        // shared cross-process throttle.
+        notified.add("__first_check_done__");
     }
 }
 
