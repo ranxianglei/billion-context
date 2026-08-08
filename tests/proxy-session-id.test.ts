@@ -16,6 +16,12 @@ test("deriveSessionId: same conversation + same key + same protocol + same upstr
     assert.equal(a, b);
 });
 
+test("deriveSessionId: stable for same (key, protocol, upstream, conversation)", () => {
+    const a = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "hello world");
+    const b = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "hello world");
+    assert.equal(a, b);
+});
+
 test("deriveSessionId: different API key → different session (no cross-account bleed)", () => {
     const a = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "hello world");
     const b = deriveSessionId(hdrs("Bearer keyB"), "anthropic", "https://bailian.example", "hello world");
@@ -34,52 +40,51 @@ test("deriveSessionId: different protocol → different session (no cross-format
     assert.notEqual(a, b);
 });
 
-test("deriveSessionId: different conversation (different first-user) → different session", () => {
+test("deriveSessionId: different conversation → different session", () => {
     const a = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "hello");
     const b = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "goodbye");
     assert.notEqual(a, b);
 });
 
-test("deriveSessionId: client conversation signal overrides content fingerprint", () => {
-    // Same first-user content but different client conversation headers → different sessions
-    const a = deriveSessionId(hdrs("Bearer keyA", "ses_111"), "anthropic", "https://up", "hello", {
-        clientConversation: "ses_111",
-    });
-    const b = deriveSessionId(hdrs("Bearer keyA", "ses_222"), "anthropic", "https://up", "hello", {
-        clientConversation: "ses_222",
-    });
+test("deriveSessionId: conversation signal is the only conversation dimension", () => {
+    // The conversation dimension is whatever the caller passes — typically the
+    // output of conversationSignal*, which already prefers a client header
+    // and falls back to a content hash. Here we just confirm the passed value
+    // is what matters (same key/proto/upstream, different convo → different).
+    const a = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://up", "ses_111");
+    const b = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://up", "ses_222");
     assert.notEqual(a, b);
-    // And two requests with the SAME client signal hit the same session even if
-    // the first-user content fingerprint input differs (the signal wins).
-    const c = deriveSessionId(hdrs("Bearer keyA", "ses_111"), "anthropic", "https://up", "different text", {
-        clientConversation: "ses_111",
-    });
-    assert.equal(a, c);
+    // Same convo signal → same session, regardless of anything else.
+    assert.equal(a, deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://up", "ses_111"));
 });
 
 test("deriveSessionId: no Authorization header → still works (uses placeholder key)", () => {
-    const id = deriveSessionId({}, "anthropic", "https://up", "hello");
+    const id = deriveSessionId({}, "anthropic", "https://up", "convo-1");
     assert.ok(id.length > 0);
     // Two keyless requests with same content → same session.
-    assert.equal(id, deriveSessionId({}, "anthropic", "https://up", "hello"));
+    assert.equal(id, deriveSessionId({}, "anthropic", "https://up", "convo-1"));
+});
+
+test("deriveSessionId: empty conversation dimension THROWS (no silent collapse)", () => {
+    // A caller that forgets to pass the conversation signal must fail loudly,
+    // not silently collapse every anonymous session onto one id.
+    assert.throws(() => deriveSessionId({}, "anthropic", "https://up", ""), /conversation dimension is required/);
 });
 
 test("affinityToken: uses client signal when present (passthrough, preserves ses_ format)", () => {
-    const t = affinityToken(hdrs("Bearer k", "ses_opencode_xyz"), "hello");
+    const t = affinityToken(hdrs("Bearer k", "ses_opencode_xyz"), "convo-1");
     assert.equal(t, "ses_opencode_xyz");
 });
 
-test("affinityToken: falls back to ses_<hash(convo)> when no client signal (no key, no upstream)", () => {
-    const t = affinityToken(hdrs("Bearer k"), "hello world");
-    assert.match(t, /^ses_[0-9a-f]+$/);
-    // Stable for same input.
-    assert.equal(t, affinityToken(hdrs("Bearer k"), "hello world"));
-    // Different content → different token.
-    assert.notEqual(t, affinityToken(hdrs("Bearer k"), "goodbye"));
+test("affinityToken: falls back to ses_<convo> when no client signal", () => {
+    const t = affinityToken(hdrs("Bearer k"), "convo-hash-xyz");
+    assert.equal(t, "ses_convo-hash-xyz");
+    // Different conversation → different token.
+    assert.notEqual(t, affinityToken(hdrs("Bearer k"), "other-convo"));
 });
 
-test("affinityToken: protocolConversation (Responses previous_response_id) wins over content fingerprint", () => {
-    const t = affinityToken(hdrs("Bearer k"), "some content", "resp_resp_abc123");
+test("affinityToken: protocolConversation (Responses previous_response_id) is just the conversation arg", () => {
+    const t = affinityToken(hdrs("Bearer k"), "resp_resp_abc123");
     assert.equal(t, "ses_resp_resp_abc123");
 });
 

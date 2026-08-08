@@ -46,23 +46,23 @@ function clientConversationHeader(headers: Record<string, string | string[] | un
 }
 
 /**
- * Derive the proxy-internal session id. `firstUserContent` is a short prefix
- * of the first user message in the request, used as the conversation
- * fingerprint fallback when the client sends no session signal.
+ * Derive the proxy-internal session id. The conversation dimension MUST be
+ * supplied by the caller via `extra.conversation` (typically the output of
+ * the per-protocol conversationSignal* helper, which already falls back to a
+ * hash of the first user message). There is intentionally NO content-
+ * fingerprint fallback inside this function — a silent "" default would
+ * collapse every anonymous session onto one id. If `conversation` is missing
+ * the caller has a bug and we throw rather than silently mis-isolating.
  */
 export function deriveSessionId(
     headers: Record<string, string | string[] | undefined>,
     protocol: "anthropic" | "openai" | "responses",
     upstream: string,
-    firstUserContent: string,
-    extra?: { clientConversation?: string; protocolConversation?: string },
+    conversation: string,
 ): string {
+    if (!conversation) throw new Error("deriveSessionId: conversation dimension is required (pass the conversationSignal* output)");
     const key = extractKey(headers);
-    const convo =
-        extra?.clientConversation ??
-        extra?.protocolConversation ??
-        hashId(firstUserContent);
-    return hashId(`${protocol}|${upstream}|${key}|${convo}`);
+    return hashId(`${protocol}|${upstream}|${key}|${conversation}`);
 }
 
 /**
@@ -74,13 +74,11 @@ export function deriveSessionId(
  */
 export function affinityToken(
     headers: Record<string, string | string[] | undefined>,
-    firstUserContent: string,
-    protocolConversation?: string,
+    conversation: string,
 ): string {
     const client = clientConversationHeader(headers);
     if (client) return client;
-    const convo = protocolConversation ?? hashId(firstUserContent);
-    return `ses_${convo}`;
+    return `ses_${conversation}`;
 }
 
 export { clientConversationHeader };
