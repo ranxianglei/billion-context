@@ -7,9 +7,6 @@ import {
     type Config,
     type CoreMessage,
 } from "acp-kernel";
-import { writeFileSync, mkdirSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { tmpdir } from "node:os";
 import type { Session } from "./session.js";
 import { parseCompressInput, PROXY_TOOL_NAMES } from "./compress-tool.js";
 import { applyRanges } from "./stream.js";
