@@ -132,7 +132,7 @@ then set it as default in `settings.json`:
   "providers": {
     "bili": {
       "baseUrl": "http://localhost:8787/zhipu/api/coding/paas/v4",
-      "api": "openai-completions",                       // or "anthropic-messages"
+      "api": "openai-completions",
       "apiKey": "<your key>",
       "models": [{ "id": "glm-5.2", "contextWindow": 1000000, "maxTokens": 131072 }]
     }
@@ -143,6 +143,14 @@ then set it as default in `settings.json`:
 // ~/.pi/agent/settings.json
 { "defaultProvider": "bili", "defaultModel": "glm-5.2" }
 ```
+
+The `api` field selects Pi's wire protocol and must match the endpoint you
+point `baseUrl` at — they're not interchangeable:
+
+| `api` value | points at | example `baseUrl`
+|---|---|---|
+| `openai-completions` | an OpenAI-compatible endpoint (GLM/DeepSeek/OpenAI) | `…/zhipu/api/coding/paas/v4` |
+| `anthropic-messages` | an Anthropic-compatible endpoint | `…/anthropic` (your named route) |
 
 > If you use the `billion-context-pi` extension, run Pi in an isolated agent
 dir (`PI_CODING_AGENT_DIR=…`) so the client-side extension doesn't double-

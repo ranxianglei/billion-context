@@ -123,7 +123,7 @@ acp-proxy listening on http://127.0.0.1:8787 — routes: anthropic=https://api.a
   "providers": {
     "bili": {
       "baseUrl": "http://localhost:8787/zhipu/api/coding/paas/v4",
-      "api": "openai-completions",                       // 或 "anthropic-messages"
+      "api": "openai-completions",
       "apiKey": "<your key>",
       "models": [{ "id": "glm-5.2", "contextWindow": 1000000, "maxTokens": 131072 }]
     }
@@ -134,6 +134,13 @@ acp-proxy listening on http://127.0.0.1:8787 — routes: anthropic=https://api.a
 // ~/.pi/agent/settings.json
 { "defaultProvider": "bili", "defaultModel": "glm-5.2" }
 ```
+
+`api` 字段选择 Pi 的线路协议,必须和 `baseUrl` 指向的端点匹配 —— 两者不能互换:
+
+| `api` 值 | 指向 | `baseUrl` 示例 |
+|---|---|---|
+| `openai-completions` | OpenAI 兼容端点(GLM/DeepSeek/OpenAI) | `…/zhipu/api/coding/paas/v4` |
+| `anthropic-messages` | Anthropic 兼容端点 | `…/anthropic`(你声明的路由) |
 
 > 如果你装了 `billion-context-pi` 扩展,用隔离的 agent 目录跑 Pi
 > (`PI_CODING_AGENT_DIR=…`),免得客户端扩展和 proxy 双重压缩。
