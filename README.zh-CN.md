@@ -58,8 +58,7 @@ bili
 
 ### 第 2 步 —— 编辑配置文件
 
-复制以下内容
-
+在网页上添加你的 provider,复制以下内容到配置:
 <img width="2931" height="1519" alt="image" src="https://github.com/user-attachments/assets/c02278be-bc7a-4f14-8f58-0f2d83784d54" />
 
 > 不想用网页?也可以直接手编 JSON 文件,见下文[手动配置文件](#手动配置文件)。
