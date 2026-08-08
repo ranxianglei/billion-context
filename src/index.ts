@@ -1,9 +1,6 @@
 #!/usr/bin/env node
-import { loadOptions } from "./config.js";
-import { startServer } from "./server.js";
-
-const opts = loadOptions();
-startServer(opts).catch((err) => {
-    console.error("failed to start:", err);
-    process.exit(1);
-});
+// Entry point: runs the CLI dispatcher (src/cli.ts).
+// Both `bili` and `bili-proxy` bin aliases point here, and `node dist/index.js`
+// still works.
+import { main } from "./cli.js";
+main();

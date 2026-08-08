@@ -112,7 +112,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             `acp-proxy listening on http://${opts.host}:${opts.port}` +
                 (Object.keys(opts.routes).length
                     ? ` — routes: ${Object.entries(opts.routes)
-                          .map(([n, u]) => `${n}=${u}`)
+                          .map(([n, u]) => `${n}=${typeof u === "string" ? u : u.url}`)
                           .join(", ")}`
                     : ` → ${opts.upstream}`),
         );
