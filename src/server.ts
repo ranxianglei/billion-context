@@ -45,6 +45,10 @@ const UPSTREAM_HOP_HEADERS = new Set([
     "connection",
     "keep-alive",
     "transfer-encoding",
+    // Node's fetch transparently decodes compressed responses. Do not
+    // forward the upstream encoding marker when the body is rewritten or
+    // streamed from fetch, otherwise clients try to decompress plain bytes.
+    "content-encoding",
 ]);
 
 export function resolveUpstream(opts: ProxyOptions, reqUrl: string): { upstream: string; rewrittenUrl: string; provider: string } | undefined {
