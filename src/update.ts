@@ -1,34 +1,44 @@
 /**
  * Auto-update: periodically checks the npm registry for a newer version of
- * billion-context and installs it globally when one is found.
+ * billion-context and installs it by downloading the tarball and extracting
+ * it over the current installation.
  *
- * Design notes (differs from the billion-context-pi extension updater):
- *  - The proxy is a long-running server, so we check on startup and then every
- *    few hours (not per-LLM-call like the extension).
- *  - The package is installed globally (`npm install -g`), not into a host
- *    extension dir.
- *  - There is no TUI to show a notification in, so results are logged to the
- *    console (the terminal where `bili` runs, or /tmp/bili-proxy.log for
- *    background test runs). After a successful install the *running* process
- *    is still old code; we log a clear "restart to finish" message.
+ * Why tarball (not `npm install -g`):
+ *  - Users may not have installed via npm (homebrew, manual, etc.).
+ *  - `npm install -g` needs global write permissions and may fail silently.
+ *  - Tarball extraction works for any install location, as long as the
+ *    install directory is writable.
+ *
+ * Concurrency safety:
+ *  - An exclusive lock file prevents multiple bili processes from updating
+ *    simultaneously.
+ *  - Extraction goes to a temp staging directory first, then copies over
+ *    the install dir only after extraction + verification succeed.
+ *
+ * Version detection reads package.json from disk on every check (not a startup
+ * constant), so after a successful in-place update the next check sees the new
+ * version and stops trying. No notified Set — failed installs retry next
+ * cycle automatically.
  */
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import { readFile, writeFile, mkdir, access, constants, rm } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { cacheDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 
 const REGISTRY_BASE = "https://registry.npmjs.org";
 const CHECK_INTERVAL_MS = 3 * 60 * 1000;
 const THROTTLE_FILE = path.join(cacheDir(), ".update-check");
+const LOCK_FILE = path.join(cacheDir(), ".update-lock");
 const SEMVER_RE = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z-.]+)?$/;
+/** Lock staleness threshold: if a lock file is older than this, it's considered
+ *  abandoned (crashed process) and can be stolen. */
+const LOCK_STALE_MS = 2 * 60 * 1000;
 
 let timer: ReturnType<typeof setInterval> | undefined;
 let inFlight = false;
-/** Versions we've already installed + notified about this process. Prevents
- *  repeated reinstall/notify loops every check cycle until the user restarts
- *  (the running process keeps the old currentVersion until restart). */
-const notified = new Set<string>();
+let firstCheckDone = false;
 
 function parseVersion(v: string): number[] {
     return v.replace(/^v/, "").split(".").map((n) => parseInt(n, 10) || 0);
@@ -64,10 +74,117 @@ async function writeLastCheck(ts: number): Promise<void> {
     }
 }
 
+/**
+ * Walk up from this module's location until we find the directory whose
+ * package.json `name` matches `packageName`. This is the install directory.
+ */
+async function findInstallDir(packageName: string): Promise<string | undefined> {
+    let dir = path.dirname(fileURLToPath(import.meta.url));
+    for (;;) {
+        try {
+            const pkg = JSON.parse(await readFile(path.join(dir, "package.json"), "utf-8"));
+            if (pkg.name === packageName) return dir;
+        } catch {
+            // not a package.json or doesn't match — keep walking
+        }
+        const parent = path.dirname(dir);
+        if (parent === dir) return undefined;
+        dir = parent;
+    }
+}
+
+/** Read the version from the on-disk package.json (not the startup constant). */
+async function readDiskVersion(installDir: string): Promise<string | undefined> {
+    try {
+        const pkg = JSON.parse(await readFile(path.join(installDir, "package.json"), "utf-8"));
+        return pkg.version;
+    } catch {
+        return undefined;
+    }
+}
+
+/**
+ * Try to acquire an exclusive cross-process lock for updating.
+ * Uses a lock file containing { pid, ts }. If the lock file exists and
+ * the holder is alive and recent, returns null (another process is updating).
+ * If the lock is stale (holder crashed or it's too old), we steal it.
+ *
+ * Returns a release function if the lock was acquired, or null otherwise.
+ */
+async function tryAcquireLock(): Promise<{ release: () => Promise<void> } | null> {
+    const pid = process.pid;
+    const now = Date.now();
+
+    async function readLock(): Promise<{ pid: number; ts: number } | null> {
+        try {
+            const raw = await readFile(LOCK_FILE, "utf-8");
+            const data = JSON.parse(raw);
+            if (typeof data.pid === "number" && typeof data.ts === "number") {
+                return data;
+            }
+        } catch {
+            // no lock or corrupt
+        }
+        return null;
+    }
+
+    /** Check if a process is alive. */
+    function isAlive(checkPid: number): boolean {
+        try {
+            process.kill(checkPid, 0);
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    const existing = await readLock();
+    if (existing) {
+        const age = now - existing.ts;
+        const holderAlive = isAlive(existing.pid);
+        if (holderAlive && age < LOCK_STALE_MS) {
+            // Another process is actively updating — back off.
+            return null;
+        }
+        // Lock is stale (holder dead or timeout) — steal it.
+        loggerLog("info", `[update] stealing stale lock (pid=${existing.pid}, age=${Math.round(age / 1000)}s, alive=${holderAlive})`);
+    }
+
+    // Write our lock. Use flag "wx" to fail if file already exists.
+    try {
+        await writeFile(LOCK_FILE, JSON.stringify({ pid, ts: now }), { flag: "wx" });
+    } catch {
+        // Lost the race — another process created the lock file first.
+        const winner = await readLock();
+        if (winner && winner.pid !== pid) {
+            loggerLog("info", `[update] lost lock race to pid=${winner.pid}, skipping update`);
+            return null;
+        }
+    }
+
+    // Re-read to confirm we are the holder (handles edge cases).
+    const confirmed = await readLock();
+    if (!confirmed || confirmed.pid !== pid) {
+        loggerLog("info", `[update] lock held by pid=${confirmed?.pid}, skipping update`);
+        return null;
+    }
+
+    return {
+        release: async () => {
+            const current = await readLock();
+            if (current?.pid === pid) {
+                await rm(LOCK_FILE, { force: true }).catch(() => {});
+            }
+        },
+    };
+}
+
 export type UpdateOptions = {
     /** Package name, e.g. "billion-context". */
     packageName: string;
-    /** Currently running version. */
+    /** Fallback version (read at startup). The actual version is re-read from
+     *  disk on each check so that an in-place tarball update is immediately
+     *  reflected without restart. */
     currentVersion: string;
     /** Enable auto-install when a newer version is found. */
     autoUpdate: boolean;
@@ -78,25 +195,18 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
     if (!opts.autoUpdate && !force) return;
     if (inFlight) return;
     inFlight = true;
-    // First call in this process always runs a real check (ignores the
-    // cross-process throttle file). Rationale: a freshly started proxy should
-    // tell the user promptly if an update is waiting, not inherit a stale
-    // throttle from the previous run that could delay the first check by up
-    // to the full interval. Subsequent calls honor the shared throttle.
-    const firstInProcess = !notified.has("__first_check_done__");
     try {
         const now = Date.now();
         const lastCheck = await readLastCheck();
         const sinceLastSec = lastCheck ? ((now - lastCheck) / 1000 | 0) : -1;
-        if (!force && !firstInProcess && now - lastCheck < CHECK_INTERVAL_MS) {
-            // Be explicit about BOTH directions so the count can't look wrong:
-            // "last checked Ns ago" (monotonic) + "retry in Ms" (countdown).
+        if (!force && firstCheckDone && now - lastCheck < CHECK_INTERVAL_MS) {
             const retryIn = ((CHECK_INTERVAL_MS - (now - lastCheck)) / 1000 | 0);
-            loggerLog("info", `[update] throttled — last checked ${sinceLastSec}s ago, retry in ${retryIn}s`);
+            loggerLog("info", `[update] throttled \u2014 last checked ${sinceLastSec}s ago, retry in ${retryIn}s`);
             return;
         }
         await writeLastCheck(now);
-        loggerLog("info", `[update] checking npm registry for ${opts.packageName}${firstInProcess ? " (startup check)" : sinceLastSec < 0 ? "" : ` (last check ${sinceLastSec}s ago)`}…`);
+        firstCheckDone = true;
+        loggerLog("info", `[update] checking npm registry for ${opts.packageName}${sinceLastSec < 0 ? " (startup check)" : sinceLastSec === 0 ? "" : ` (last check ${sinceLastSec}s ago)`}\u2026`);
 
         const url = `${REGISTRY_BASE}/${opts.packageName}/latest`;
         const res = await fetch(url, {
@@ -107,56 +217,168 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
             loggerLog("warn", `[update] registry returned ${res.status} ${res.statusText}, skipping`);
             return;
         }
-        const data = (await res.json()) as { version?: string };
+        const data = (await res.json()) as {
+            version?: string;
+            dist?: { tarball?: string };
+        };
         const latest = data.version;
         if (!latest) {
             loggerLog("warn", `[update] registry response had no version, skipping`);
             return;
         }
-        if (!isNewer(latest, opts.currentVersion)) {
-            loggerLog("info", `[update] current=${opts.currentVersion} latest=${latest} (up to date)`);
-            return;
-        }
-        // Already installed and notified about this version — don't loop.
-        if (notified.has(latest)) {
-            loggerLog("info", `[update] latest=${latest} already installed this run, awaiting restart`);
-            return;
-        }
-        loggerLog("info", `[update] new version found: ${opts.currentVersion} → ${latest}, installing…`);
 
-        const installed = await installLatest(opts.packageName, latest);
-        if (installed) {
-            notified.add(latest);
-            loggerLog("info", `[update] installed ${opts.packageName} ${opts.currentVersion} → ${latest}. Restart to finish.`);
-        } else {
-            loggerLog("warn", `[update] install failed; will retry next cycle. Or: npm install -g ${opts.packageName}@${latest}`);
+        // Read current version from disk (not from startup constant) so that
+        // a successful in-place update is detected without a restart.
+        const installDir = await findInstallDir(opts.packageName);
+        const diskVersion = installDir ? await readDiskVersion(installDir) : undefined;
+        const currentVersion = diskVersion ?? opts.currentVersion;
+
+        if (!isNewer(latest, currentVersion)) {
+            loggerLog("info", `[update] current=${currentVersion} latest=${latest} (up to date)`);
+            return;
+        }
+
+        const tarballUrl = data.dist?.tarball;
+        if (!tarballUrl) {
+            loggerLog("warn", `[update] registry response for ${latest} had no tarball URL`);
+            return;
+        }
+
+        loggerLog("info", `[update] new version found: ${currentVersion} \u2192 ${latest}, downloading\u2026`);
+
+        // Acquire lock to prevent concurrent updates across processes.
+        const lock = await tryAcquireLock();
+        if (!lock) {
+            loggerLog("info", `[update] another process is updating, will check next cycle`);
+            return;
+        }
+        try {
+            const result = await installViaTarball(latest, tarballUrl, installDir);
+            if (result.ok) {
+                loggerLog("info", `[update] installed ${currentVersion} \u2192 ${latest}. Restart to finish.`);
+            } else {
+                loggerLog("warn", `[update] install failed: ${result.error}. Will retry next cycle.`);
+            }
+        } finally {
+            await lock.release();
         }
     } catch (e) {
         loggerLog("warn", `[update] check failed: ${String(e)}`);
     } finally {
         inFlight = false;
-        // Mark that the startup check has run so subsequent calls honor the
-        // shared cross-process throttle.
-        notified.add("__first_check_done__");
     }
 }
 
-async function installLatest(packageName: string, latest: string): Promise<boolean> {
-    // Reject anything that isn't a strict semver before handing it to npm.
-    if (!SEMVER_RE.test(latest)) return false;
+/**
+ * Download the npm tarball, extract to a temp staging dir, verify, then copy
+ * over the install directory.
+ */
+async function installViaTarball(
+    version: string,
+    tarballUrl: string,
+    installDir: string | undefined,
+): Promise<{ ok: boolean; error?: string }> {
+    if (!installDir) {
+        return { ok: false, error: "cannot determine install directory (package.json not found walking up from running binary)" };
+    }
+
+    // Pre-flight: can we write to the install dir?
     try {
-        const code = await new Promise<number>((resolve) => {
+        await access(installDir, constants.W_OK);
+    } catch {
+        return { ok: false, error: `install dir not writable: ${installDir}` };
+    }
+
+    // Download tarball
+    let tgzBuffer: Buffer;
+    try {
+        const tgzRes = await fetch(tarballUrl, { signal: AbortSignal.timeout(60_000) });
+        if (!tgzRes.ok) {
+            return { ok: false, error: `tarball download failed: HTTP ${tgzRes.status} ${tgzRes.statusText}` };
+        }
+        tgzBuffer = Buffer.from(await tgzRes.arrayBuffer());
+    } catch (e) {
+        return { ok: false, error: `tarball download failed: ${String(e)}` };
+    }
+
+    // Write to temp file
+    const tmpFile = path.join(cacheDir(), `.update-${version}.tgz`);
+    try {
+        await mkdir(cacheDir(), { recursive: true });
+        await writeFile(tmpFile, tgzBuffer);
+    } catch (e) {
+        return { ok: false, error: `failed to write temp file ${tmpFile}: ${String(e)}` };
+    }
+
+    // Extract to a temp staging dir (NOT directly over install dir).
+    const stagingDir = path.join(cacheDir(), `.update-staging-${version}`);
+    try {
+        // Clean any leftover staging dir from a previous failed attempt.
+        await rm(stagingDir, { recursive: true, force: true });
+        await mkdir(stagingDir, { recursive: true });
+
+        const { code, stderr } = await new Promise<{ code: number; stderr: string }>((resolve) => {
             execFile(
-                "npm",
-                ["install", "-g", `${packageName}@${latest}`, "--silent", "--no-audit", "--no-fund"],
-                { timeout: 120_000, shell: process.platform === "win32" },
-                (err) => resolve(err ? 1 : 0),
+                "tar",
+                ["xzf", tmpFile, "-C", stagingDir, "--strip-components=1"],
+                { timeout: 30_000 },
+                (err, _stdout, stderr) => {
+                    if (err) {
+                        resolve({ code: 1, stderr: stderr || err.message });
+                    } else {
+                        resolve({ code: 0, stderr: stderr || "" });
+                    }
+                },
             );
         });
-        return code === 0;
-    } catch {
-        return false;
+        if (code !== 0) {
+            return { ok: false, error: `extraction failed (tar exit ${code})${stderr.trim() ? `: ${stderr.trim()}` : ""}` };
+        }
+
+        // Verify the staging dir has a valid package.json with the right version.
+        const stagingVersion = await readDiskVersion(stagingDir);
+        if (stagingVersion !== version) {
+            return { ok: false, error: `staging verification failed: version is ${stagingVersion ?? "missing"}, expected ${version}` };
+        }
+    } catch (e) {
+        return { ok: false, error: `extraction failed: ${String(e)}` };
+    } finally {
+        await rm(tmpFile, { force: true });
     }
+
+    // Copy staging over install dir.
+    // `cp -r staging/. installDir/` merges without creating a nested dir.
+    try {
+        const { code, stderr } = await new Promise<{ code: number; stderr: string }>((resolve) => {
+            execFile(
+                "cp",
+                ["-r", stagingDir + "/.", installDir + "/"],
+                { timeout: 30_000 },
+                (err, _stdout, stderr) => {
+                    if (err) {
+                        resolve({ code: 1, stderr: stderr || err.message });
+                    } else {
+                        resolve({ code: 0, stderr: stderr || "" });
+                    }
+                },
+            );
+        });
+        if (code !== 0) {
+            return { ok: false, error: `failed to copy to install dir (cp exit ${code})${stderr.trim() ? `: ${stderr.trim()}` : ""}` };
+        }
+    } catch (e) {
+        return { ok: false, error: `failed to copy to install dir: ${String(e)}` };
+    } finally {
+        await rm(stagingDir, { recursive: true, force: true });
+    }
+
+    // Final verification
+    const newVersion = await readDiskVersion(installDir);
+    if (newVersion !== version) {
+        return { ok: false, error: `post-install verification failed: package.json version is ${newVersion ?? "missing"}, expected ${version}` };
+    }
+
+    return { ok: true };
 }
 
 export function startAutoUpdate(opts: UpdateOptions): void {
