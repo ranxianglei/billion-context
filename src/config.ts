@@ -4,7 +4,13 @@ import { readFileSync } from "node:fs";
 function safeReadJson(path: string): unknown {
     try {
         return JSON.parse(readFileSync(path, "utf8"));
-    } catch {
+    } catch (e) {
+        // Surface config parse failures instead of silently swallowing them;
+        // a malformed providers file would otherwise run the proxy with
+        // defaults and the user would not know why routing is wrong.
+        if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
+            console.error(`[acp-config] failed to parse ${path}: ${String(e)}`);
+        }
         return undefined;
     }
 }

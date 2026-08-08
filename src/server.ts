@@ -1,8 +1,9 @@
 import http from "node:http";
 import fs from "node:fs";
-import { createCore, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, estimateTokensFast, renderNudgeText } from "acp-kernel";
+import { createCore, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, estimateTokensFast, renderNudgeText, deactivateBlock } from "acp-kernel";
 import type { ProxyOptions } from "./config.js";
 import { lookupContextLimit } from "./config.js";
+import { fetchWithTimeout, MAX_REQUEST_BYTES } from "./fetch-util.js";
 import {
     anthropicToCore,
     coreToAnthropic,
@@ -21,11 +22,22 @@ import {
     type OpenAIRequestBody,
     type OpenAITool,
 } from "./openai.js";
+import {
+    type ResponsesRequestBody,
+    type ResponseInputItem,
+    responsesToCore,
+    coreToResponses,
+    injectResponsesInstructions,
+    deriveSessionIdResponses,
+} from "./responses.js";
 import { getSession, listSessions, type Session } from "./session.js";
-import { COMPRESS_TOOL, ACP_TOOLS_OPENAI, COMPRESS_TOOL_NAME, buildCompressSystemPrompt } from "./compress-tool.js";
+import { COMPRESS_TOOL, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressTextSystemPrompt } from "./compress-tool.js";
 import { rewriteSseStream, rewriteJsonResponse, type RewriteCtx } from "./stream.js";
+import { reapOrphanBlocks } from "./orphan-gc.js";
 import { compressLoopStream } from "./compress-loop.js";
+import { compressLoopResponsesStream } from "./compress-loop-responses.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
+import { rewriteResponsesSseStream, rewriteResponsesJsonResponse } from "./stream-responses.js";
 
 const UPSTREAM_HOP_HEADERS = new Set([
     "host",
@@ -33,6 +45,10 @@ const UPSTREAM_HOP_HEADERS = new Set([
     "connection",
     "keep-alive",
     "transfer-encoding",
+    // Node's fetch transparently decodes compressed responses. Do not
+    // forward the upstream encoding marker when the body is rewritten or
+    // streamed from fetch, otherwise clients try to decompress plain bytes.
+    "content-encoding",
 ]);
 
 export function resolveUpstream(opts: ProxyOptions, reqUrl: string): { upstream: string; rewrittenUrl: string; provider: string } | undefined {
@@ -71,10 +87,12 @@ export function startServer(opts: ProxyOptions): http.Server {
         try {
             await handle(req, res, opts, core, config, log);
         } catch (err) {
-            log("error", String(err));
+            const msg = String(err);
+            log("error", msg);
             if (!res.headersSent) {
-                res.writeHead(502, { "content-type": "application/json" });
-                res.end(JSON.stringify({ error: "acp-proxy failure", detail: String(err) }));
+                const status = msg.includes("exceeds") ? 413 : 502;
+                res.writeHead(status, { "content-type": "application/json" });
+                res.end(JSON.stringify({ error: "acp-proxy failure", detail: msg }));
             } else {
                 res.end();
             }
@@ -98,7 +116,7 @@ type Prepared = {
     body: string;
     session: Session;
     processedMessages: CoreMessage[];
-    protocol: "anthropic" | "openai";
+    protocol: "anthropic" | "openai" | "responses";
     stream: boolean;
     compressInjected: boolean;
 };
@@ -144,13 +162,18 @@ async function handle(
     }
     const bodyBuffer = await readBody(req);
     const url = req.url ?? "";
-    const protocol: "anthropic" | "openai" | null =
+    // Strip query string before matching path suffixes: a request like
+    // `/v1/responses?foo=1` must still be detected as the responses protocol.
+    const urlPath = url.split("?", 2)[0];
+    const protocol: "anthropic" | "openai" | "responses" | null =
         req.method === "POST" && bodyBuffer.length > 0
-            ? url.endsWith("/chat/completions")
+            ? urlPath.endsWith("/chat/completions")
                 ? "openai"
-                : url.endsWith("/v1/messages") || url.endsWith("/messages")
+                : urlPath.endsWith("/v1/messages") || urlPath.endsWith("/messages")
                   ? "anthropic"
-                  : null
+                  : urlPath.endsWith("/responses")
+                    ? "responses"
+                    : null
             : null;
     // Per-request context limit: look up body.model in the built-in table.
     // Lets the proxy run with the right window per model without asking the
@@ -171,7 +194,9 @@ async function handle(
             ? prepareAnthropic(bodyBuffer, req, opts, core, reqConfig, log)
             : protocol === "openai"
               ? prepareOpenai(bodyBuffer, req, opts, core, reqConfig, log)
-              : null;
+              : protocol === "responses"
+                ? prepareResponses(bodyBuffer, req, opts, core, reqConfig, log)
+                : null;
     const outBody: Buffer | string = prepared ? prepared.body : bodyBuffer;
     await forward(req, res, opts, outBody, prepared, core, reqConfig, log);
 }
@@ -216,6 +241,7 @@ function prepareAnthropic(
         session.state = turn.state;
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         processedMessages = applyCondense(turn.messages, opts, session);
+        reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = coreToAnthropic(processedMessages);
 
         systemOut = injectSystem(parsed, opts);
@@ -271,6 +297,7 @@ function prepareOpenai(
         session.state = turn.state;
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         processedMessages = applyCondense(turn.messages, opts, session);
+        reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = coreToOpenai(processedMessages);
 
         // ONLY the static compress prompt goes into the system message — the
@@ -302,6 +329,96 @@ function prepareOpenai(
 
     const rebuilt: OpenAIRequestBody = { ...parsed, messages: rebuiltMessages, tools: toolsOut as OpenAITool[] | undefined };
     return { body: JSON.stringify(rebuilt), session, processedMessages, protocol: "openai", stream, compressInjected: shouldInject };
+}
+
+function prepareResponses(
+    bodyBuffer: Buffer,
+    req: http.IncomingMessage,
+    opts: ProxyOptions,
+    core: CompressionCore,
+    config: Config,
+    log: (level: string, msg: string) => void,
+): Prepared {
+    const parsed = JSON.parse(bodyBuffer.toString("utf8")) as ResponsesRequestBody;
+    const stream = parsed.stream === true;
+    const sessionId = deriveSessionIdResponses(parsed, headerValue(req, opts.sessionHeader));
+    const session = getSession(sessionId);
+    session.requests++;
+
+    let processedMessages: CoreMessage[] = [];
+    let rebuiltInput: ResponseInputItem[] | string = parsed.input;
+    let toolsOut = parsed.tools;
+
+    const shouldInject = opts.compress.injectTool;
+
+    try {
+        const { msgs, systemParts, preamble, customToolCallIds } = responsesToCore(parsed);
+        if (process.env.ACP_DEBUG) {
+            log("info", `[${sessionId}] input items: ${Array.isArray(parsed.input) ? parsed.input.map((i: ResponseInputItem) => i.type).join(",") : "(string)"}`);
+        }
+        const tokenCount = estimateTokensFast(msgs.map((m) => m.text ?? "").join("\n"));
+        const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" });
+        session.state = turn.state;
+        log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
+        processedMessages = applyCondense(turn.messages, opts, session);
+        reapOrphanBlocks(session, msgs, deactivateBlock);
+        // Rebuild input preserving the responses_lite contract:
+        //   input[0]   = additional_tools (host directive, verbatim)
+        //   input[1]   = developer message (base instructions + compress prompt)
+        //   input[2..] = conversation history (compressed)
+        //   top-level `instructions` is NEVER touched — it must stay empty for
+        //   responses_lite. Setting it non-empty breaks code_mode tool exposure.
+        const conversationItems = coreToResponses(processedMessages, customToolCallIds);
+        if (preamble.length > 0) {
+            log("info", `[${sessionId}] preserved ${preamble.length} opaque preamble item(s): ${preamble.map((p) => p.type).join(",")}`);
+        }
+
+        const inputItems: ResponseInputItem[] = [...preamble];
+        if (shouldInject && !process.env.ACP_NO_COMPRESS_PROMPT) {
+            const sysParts = [...systemParts, buildCompressSystemPrompt()];
+            inputItems.push({ type: "message", role: "developer", content: sysParts.join("\n\n---\n\n") });
+            if (!process.env.ACP_NO_INJECT_TOOL) {
+                toolsOut = injectResponsesTool(parsed.tools);
+            }
+        } else if (systemParts.length > 0) {
+            // No compress injection, but still restore the base instructions
+            // that responsesToCore lifted out of the input.
+            inputItems.push({ type: "message", role: "developer", content: systemParts.join("\n\n---\n\n") });
+        }
+        inputItems.push(...conversationItems);
+        if (process.env.ACP_DEBUG) {
+            const ctcs = conversationItems.filter((i) => i.type === "custom_tool_call").length;
+            const ctcos = conversationItems.filter((i) => i.type === "custom_tool_call_output").length;
+            log("info", `[${sessionId}] rebuilt: msgs=${msgs.length} -> conv=${conversationItems.length} (custom_tool_call=${ctcs} custom_tool_call_output=${ctcos})`);
+        }
+        if (turn.nudge?.shouldInject && shouldInject) {
+            try {
+                const rendered = renderNudgeText(turn.nudge);
+                if (rendered.text) {
+                    inputItems.push({ type: "message", role: "user", content: rendered.text });
+                }
+            } catch {
+            }
+        }
+        rebuiltInput = inputItems;
+    } catch (err) {
+        log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
+        processedMessages = [];
+    }
+
+    const rebuilt: ResponsesRequestBody = { ...parsed, input: rebuiltInput, tools: toolsOut };
+    // Log the final tools we forward upstream so we can confirm ACP tools are
+    // present. Distinguishes "compress" (top-level function) from Codex
+    // namespace items (type:namespace/custom).
+    if (process.env.ACP_DEBUG) {
+        const fwdTools = (Array.isArray(toolsOut) ? toolsOut : []).map((t) => {
+            const r = t as Record<string, unknown>;
+            const sub = Array.isArray(r.tools) ? `(${r.tools.length} sub)` : "";
+            return `${r.type as string}:${(r.name as string) ?? "?"}${sub}`;
+        });
+        log("info", `[${sessionId}] responses forward tools=[${fwdTools.join(",")}] injectTool=${shouldInject} NO_INJECT_TOOL=${!!process.env.ACP_NO_INJECT_TOOL} NO_COMPRESS_PROMPT=${!!process.env.ACP_NO_COMPRESS_PROMPT}`);
+    }
+    return { body: JSON.stringify(rebuilt), session, processedMessages, protocol: "responses", stream, compressInjected: shouldInject };
 }
 
 function injectSystem(
@@ -337,6 +454,26 @@ function injectOpenaiTool(tools: OpenAITool[] | undefined): OpenAITool[] {
     return [...tools, ...(additions as OpenAITool[])];
 }
 
+/** When true, the Responses path teaches compression via a text trigger
+ *  instead of a function tool. Used for hosts (OpenAI Codex code_mode) whose
+ *  server-side tools are disabled the moment any `tools` entry is declared.
+ *  In text mode we keep `tools` untouched (undefined) so code_mode stays
+ *  active, and detect the trigger in the output_text stream instead. */
+const TEXT_PROTOCOL = process.env.ACP_COMPRESS_PROTOCOL === "text";
+/** Inject all ACP tools (compress/decompress/search_context/acp_status) in
+ *  Responses API flat format, matching the PROXY_TOOL_NAMES set the compress
+ *  loop dispatches on. Idempotent. */
+function injectResponsesTool(tools: unknown[] | undefined): unknown[] {
+    if (!Array.isArray(tools)) return [...ACP_TOOLS_RESPONSES];
+    const present = new Set(
+        tools
+            .map((t) => (t as { name?: string })?.name)
+            .filter((n): n is string => typeof n === "string"),
+    );
+    const additions = ACP_TOOLS_RESPONSES.filter((t) => !present.has(t.name));
+    return [...tools, ...additions];
+}
+
 async function forward(
     req: http.IncomingMessage,
     res: http.ServerResponse,
@@ -355,12 +492,15 @@ async function forward(
             const parsed = JSON.parse(body);
             const toolNames = (parsed.tools ?? []).map((t: Record<string, unknown>) => {
                 const fn = t.function as { name?: string } | undefined;
-                return fn?.name ?? "?";
+                // chat completions nests under `function`; Responses API is flat.
+                return fn?.name ?? (t.name as string | undefined) ?? "?";
             });
             log("info", `[debug] tools=[${toolNames.join(",")}] msgs=${parsed.messages?.length ?? 0} stream=${parsed.stream ?? false} system_len=${JSON.stringify(parsed.messages?.find((m: Record<string, string>) => m.role === "system")?.content ?? "").length}`);
-            const out = `/tmp/acp-proxy-debug-req-${Date.now()}.json`;
-            fs.writeFileSync(out, body.slice(0, 50000));
-            log("info", `[debug] forwarded body written to ${out}`);
+            if (process.env.ACP_DUMP_REQ === "1") {
+                const out = `/tmp/acp-proxy-debug-req-${Date.now()}.json`;
+                fs.writeFileSync(out, body.slice(0, 50000));
+                log("info", `[debug] forwarded body written to ${out}`);
+            }
         } catch { /* best-effort */ }
     }
     const headers: Record<string, string> = {};
@@ -374,7 +514,7 @@ async function forward(
         headers,
         body: req.method === "GET" || req.method === "HEAD" ? undefined : body,
     };
-    const upstream = await fetch(upstreamUrl, init);
+    const { response: upstream, clearTimer: clearUpstreamTimer } = await fetchWithTimeout(upstreamUrl, init);
     const respHeaders: Record<string, string> = {};
     upstream.headers.forEach((v, k) => {
         if (UPSTREAM_HOP_HEADERS.has(k.toLowerCase())) return;
@@ -383,6 +523,7 @@ async function forward(
     res.writeHead(upstream.status, respHeaders);
     if (!upstream.body) {
         res.end();
+        clearUpstreamTimer();
         return;
     }
     // We only rewrite when THIS request actually had the compress tool
@@ -397,6 +538,7 @@ async function forward(
         prepared.processedMessages.length > 0;
     if (!useRewriter || prepared === null) {
         await pipeThrough(upstream.body, res);
+        clearUpstreamTimer();
         return;
     }
     const ctx: RewriteCtx = {
@@ -438,6 +580,29 @@ async function forward(
                 }
                 if (!res.write(chunk)) await new Promise<void>((r) => res.once("drain", () => r()));
             }
+        } else if (prepared.protocol === "responses") {
+            const parsedReq = JSON.parse(typeof body === "string" ? body : body.toString("utf8"));
+            const reqHeaders: Record<string, string> = {};
+            for (const [k, v] of Object.entries(headers)) {
+                if (k.toLowerCase() === "content-length" || k.toLowerCase() === "host") continue;
+                reqHeaders[k] = v;
+            }
+            reqHeaders["content-type"] = "application/json";
+            const loop = compressLoopResponsesStream(
+                streamToRead,
+                { core, config, messages: prepared.processedMessages, session: prepared.session, log: ctx.log },
+                parsedReq,
+                { url: upstreamUrl, headers: reqHeaders },
+            );
+            for await (const chunk of loop) {
+                {
+                    const s = chunk.toString("utf8");
+                    if (s.includes("\x3cacp ") || s.includes("\x3c/acp")) {
+                        log("warn", `[${prepared.session.id}] tag echo: responses response stream contains <acp tag`);
+                    }
+                }
+                if (!res.write(chunk)) await new Promise<void>((r) => res.once("drain", () => r()));
+            }
         } else {
             const rewriter = rewriteSseStream(streamToRead, ctx);
             for await (const chunk of rewriter) {
@@ -451,6 +616,7 @@ async function forward(
             }
         }
         res.end();
+        clearUpstreamTimer();
         if (dumpRaw) await dumpRaw;
     } else {
         const buf = await upstream.arrayBuffer();
@@ -459,6 +625,8 @@ async function forward(
             const json = JSON.parse(text);
             if (prepared.protocol === "openai") {
                 rewriteOpenaiJsonResponse(json, ctx);
+            } else if (prepared.protocol === "responses") {
+                rewriteResponsesJsonResponse(json, ctx);
             } else {
                 rewriteJsonResponse(json, ctx);
             }
@@ -466,6 +634,7 @@ async function forward(
         } catch {
             res.end(text);
         }
+        clearUpstreamTimer();
     }
 }
 
@@ -530,9 +699,21 @@ function headerValue(req: http.IncomingMessage, name: string): string | undefine
 function readBody(req: http.IncomingMessage): Promise<Buffer> {
     return new Promise((resolve, reject) => {
         const chunks: Buffer[] = [];
-        req.on("data", (c: Buffer) => chunks.push(c));
-        req.on("end", () => resolve(Buffer.concat(chunks)));
-        req.on("error", reject);
+        let size = 0;
+        let aborted = false;
+        req.on("data", (c: Buffer) => {
+            if (aborted) return;
+            size += c.length;
+            if (size > MAX_REQUEST_BYTES) {
+                aborted = true;
+                reject(new Error(`request body exceeds ${MAX_REQUEST_BYTES} bytes`));
+                req.destroy();
+                return;
+            }
+            chunks.push(c);
+        });
+        req.on("end", () => { if (!aborted) resolve(Buffer.concat(chunks)); });
+        req.on("error", (e) => { if (!aborted) reject(e); });
     });
 }
 

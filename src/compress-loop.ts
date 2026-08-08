@@ -13,6 +13,9 @@ import { tmpdir } from "node:os";
 import type { Session } from "./session.js";
 import { parseCompressInput, PROXY_TOOL_NAMES } from "./compress-tool.js";
 import { applyRanges } from "./stream.js";
+import { resolveDecompress } from "./decompress-shared.js";
+import { fetchWithTimeout } from "./fetch-util.js";
+import { normalizeSseLineEndings } from "./sse-util.js";
 
 interface CompressLoopCtx {
     core: CompressionCore;
@@ -43,34 +46,7 @@ function executeProxyTool(
         return applyRanges(parseCompressInput(args), ctx);
     }
     if (toolName === "decompress") {
-        const rawBlockId = args.blockId;
-        if (typeof rawBlockId !== "string" || rawBlockId.length === 0) {
-            return "[decompress FAILED: blockId is required]";
-        }
-        const blockId = rawBlockId.trim();
-        const block = ctx.core.decompress(blockId, ctx.session.state);
-        if (!block) return `[Block ${blockId} not found]`;
-        const full = args.full === true;
-        const collected = collectBlockContent(ctx.session.state, block, ctx.messages, { full });
-        ctx.session.state = deactivateBlock(ctx.session.state, [blockId]);
-        const header = `[Restored block ${blockId} — ${collected.count} item(s)${full ? ", full" : ""}]`;
-        const body = collected.text || block.summary;
-        // Security: never honor args.toFile in proxy mode — it is an
-        // untrusted path from the model/client and enables path traversal
-        // (e.g. overwriting ~/.bashrc or project source). Always write to a
-        // temp dir when the body is large.
-        const safeBlockId = blockId.replace(/[^a-zA-Z0-9_-]/g, "-");
-        const outPath = body.length > 10000 ? join(tmpdir(), `acp-decompress-${safeBlockId}-${Date.now()}.txt`) : null;
-        if (outPath) {
-            try {
-                mkdirSync(dirname(outPath), { recursive: true });
-                writeFileSync(outPath, body, "utf8");
-                return `${header}\nContent (${body.length} chars) written to: ${outPath}\nUse the read tool to access it.`;
-            } catch (e) {
-                return `${header}\n[Failed to write to ${outPath}: ${String(e)}]\n${body.slice(0, 4000)}...`;
-            }
-        }
-        return `${header}\n${body}`;
+        return resolveDecompress(args, ctx);
     }
     if (toolName === "search_context") {
         const query = typeof args.query === "string" ? args.query : "";
@@ -197,7 +173,7 @@ function buildContentSse(
     })}\n\n`;
 }
 
-function buildVisibilityMarker(toolName: string, result: string): string {
+export function buildVisibilityMarker(toolName: string, result: string): string {
     const lines = result.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
     const failed = lines.some((l) =>
         l.includes("FAILED")
@@ -229,6 +205,7 @@ export async function* compressLoopStream(
     requestOptions: RequestOptions,
 ): AsyncGenerator<Buffer> {
     let upstream = initialUpstream;
+    let activeClearTimer: (() => void) | null = null;
     const model = (requestBody.model as string) ?? "unknown";
     let responseId = `chatcmpl-proxy-${Date.now()}`;
     const makeBase = () => ({
@@ -262,6 +239,7 @@ export async function* compressLoopStream(
                 const { done, value } = await reader.read();
                 if (done) break;
                 sseBuffer += decoder.decode(value, { stream: true });
+                sseBuffer = normalizeSseLineEndings(sseBuffer);
                 let sep: number;
                 while ((sep = sseBuffer.indexOf("\n\n")) >= 0) {
                     const eventStr = sseBuffer.slice(0, sep);
@@ -307,6 +285,38 @@ export async function* compressLoopStream(
                 }
             }
             sseBuffer += decoder.decode();
+            sseBuffer = normalizeSseLineEndings(sseBuffer);
+            // Drain any events still in the residual buffer (a well-formed
+            // stream ends with \n\n, but some upstreams omit the final
+            // blank line; processing the tail avoids losing the last event).
+            let resSep: number;
+            while ((resSep = sseBuffer.indexOf("\n\n")) >= 0) {
+                const eventStr = sseBuffer.slice(0, resSep);
+                sseBuffer = sseBuffer.slice(resSep + 2);
+                if (!eventStr.trim()) continue;
+                const d = classifySseEvent(eventStr);
+                if (d.done) continue;
+                if (isFirstRound) {
+                    if (d.yieldChunk) yield d.yieldChunk;
+                } else {
+                    if (d.contentDelta) yield Buffer.from(buildContentSse(responseId, model, d.contentDelta), "utf8");
+                }
+                if (d.contentDelta) contentText += d.contentDelta;
+                if (d.finishReason) finishReason = d.finishReason;
+                if (d.usage !== undefined) usage = d.usage;
+                if (d.toolCalls) {
+                    for (const tc of d.toolCalls) {
+                        const existing = toolCallByIndex.get(tc.index);
+                        if (existing) {
+                            if (tc.name) existing.name = tc.name;
+                            if (tc.id) existing.id = tc.id;
+                            existing.arguments += tc.arguments;
+                        } else {
+                            toolCallByIndex.set(tc.index, tc);
+                        }
+                    }
+                }
+            }
         } finally {
             reader.releaseLock();
         }
@@ -372,7 +382,7 @@ export async function* compressLoopStream(
 
         requestBody.messages = messages;
 
-        const resp = await fetch(requestOptions.url, {
+        const { response: resp, clearTimer } = await fetchWithTimeout(requestOptions.url, {
             method: "POST",
             headers: requestOptions.headers,
             body: JSON.stringify(requestBody),
@@ -398,5 +408,6 @@ export async function* compressLoopStream(
         }
 
         upstream = resp.body as ReadableStream<Uint8Array>;
+        activeClearTimer = clearTimer;
     }
 }

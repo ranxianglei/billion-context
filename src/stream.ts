@@ -1,6 +1,7 @@
-import type { CompressionCore, Config, CoreMessage, CompressionState } from "acp-kernel";
+import { collectBlockContent, type CompressionCore, type Config, type CoreMessage, type CompressionState } from "acp-kernel";
 import type { Session } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput } from "./compress-tool.js";
+import { normalizeSseLineEndings } from "./sse-util.js";
 
 export type RewriteCtx = {
     core: CompressionCore;
@@ -38,6 +39,7 @@ export async function* rewriteSseStream(
             const { done, value } = await reader.read();
             if (done) break;
             buf += decoder.decode(value, { stream: true });
+            buf = normalizeSseLineEndings(buf);
             let idx: number;
             while ((idx = buf.indexOf("\n\n")) !== -1) {
                 const rawEvent = buf.slice(0, idx);
@@ -162,7 +164,25 @@ export function applyRanges(ranges: ReturnType<typeof parseCompressInput>, ctx: 
             state: ctx.session.state,
             config: ctx.config,
         });
+        const beforeIds = new Set(ctx.session.state.blocks.map((b) => b.blockId));
         ctx.session.state = res.state;
+        // Cache original content for newly-created blocks. At compress time the
+        // source messages are still in ctx.messages (this round's view, before
+        // the next processTurn folds them). Storing the text here lets decompress
+        // work in later rounds where ctx.messages no longer carries the originals.
+        // Two views are cached so decompress can honor the `full` flag: `one`
+        // (direct messages + nested child summaries) and `full` (all originals).
+        for (const b of res.state.blocks) {
+            if (beforeIds.has(b.blockId)) continue;
+            const full = collectBlockContent(res.state, b, ctx.messages, { full: true });
+            const one = collectBlockContent(res.state, b, ctx.messages, { full: false });
+            if (full.count > 0 || one.count > 0) {
+                ctx.session.blockContents.set(b.blockId, {
+                    one: { text: one.text, count: one.count },
+                    full: { text: full.text, count: full.count },
+                });
+            }
+        }
         const r = res.result;
         const detail = ranges.map((rg) => `${rg.startRef}–${rg.endRef}`).join(", ");
 
