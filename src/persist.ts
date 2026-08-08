@@ -42,7 +42,8 @@ import type { Session, BlockContent } from "./session.js";
  *  - All writes within a process are serialized per-session by Node's single
  *    event loop; there is no per-session *request* serialization (two
  *    concurrent HTTP requests for the same session can interleave processTurn
- *    and corrupt in-memory state). See AGENTS.md.
+ *    and corrupt in-memory state). This is a known limitation; a per-session
+ *    lock should be added before promoting multi-agent concurrency as safe.
  */
 
 const PERSIST_VERSION = 1;

@@ -91,7 +91,7 @@ test("conversationSignalAnthropic is stable for same first message, differs othe
     const a = conversationSignalAnthropic(body);
     const b = conversationSignalAnthropic(body);
     assert.equal(a, b);
-    const other = { ...body, messages: [{ role: "user", content: "different" }] };
+    const other = { ...body, messages: [{ role: "user" as const, content: "different" }] };
     assert.notEqual(a, conversationSignalAnthropic(other));
 });
 
@@ -312,9 +312,9 @@ test("processTurn adds ACP tags but tool-call args can be restored", async () =>
     const state = createInitialState();
     const args = '{"command":"echo hello"}';
     const msgs = [
-        { id: "raw-0", role: "user", contentType: "text" as const, text: "run echo" },
-        { id: "raw-1", role: "assistant", contentType: "tool-call" as const, text: args, toolName: "bash", toolCallId: "tc1" },
-        { id: "raw-2", role: "tool", contentType: "tool-result" as const, text: "hello", toolName: "bash", toolCallId: "tc1" },
+        { id: "raw-0", role: "user" as const, contentType: "text" as const, text: "run echo" },
+        { id: "raw-1", role: "assistant" as const, contentType: "tool-call" as const, text: args, toolName: "bash", toolCallId: "tc1" },
+        { id: "raw-2", role: "tool" as const, contentType: "tool-result" as const, text: "hello", toolName: "bash", toolCallId: "tc1" },
     ];
     const turn = core.processTurn({ messages: msgs, state, config, tokenCount: 100 });
     const tc = turn.messages.find(m => m.contentType === "tool-call")!;
