@@ -99,65 +99,88 @@ windows, optional fields — is in [Configuration](#configuration).)
 
 ### Step 3 — Point your client at the proxy
 
-Set the client's base URL to `http://localhost:8787/<provider>/...`. The provider
-name is the first path segment; the rest is forwarded as-is. Start the client
-with your **real** API key.
+Edit the client's own config file so it sends requests to
+`http://localhost:8787/<provider>/...` (the provider name from Step 2 as the
+first path segment). Put your **real** API key in the client's config too —
+the proxy passes it through untouched.
 
-#### Pi (with the billion-context-pi extension)
+#### Pi (billion-context-pi)
 
-Pi is an **Anthropic** client. Point it at the `anthropic` route you declared in
-Step 2:
+`~/.pi/agent/models.json` — declare a provider pointing at your proxy route,
+then set it as default in `settings.json`:
 
-```bash
-export ANTHROPIC_BASE_URL=http://localhost:8787/anthropic
-export ANTHROPIC_API_KEY=sk-ant-...   # your real key
-pi-stable   # or: pi
+```jsonc
+// ~/.pi/agent/models.json
+{
+  "providers": {
+    "bili": {
+      "baseUrl": "http://localhost:8787/zhipu/api/coding/paas/v4",
+      "api": "openai-completions",                       // or "anthropic-messages"
+      "apiKey": "<your key>",
+      "models": [{ "id": "glm-5.2", "contextWindow": 1000000, "maxTokens": 131072 }]
+    }
+  }
+}
 ```
+```jsonc
+// ~/.pi/agent/settings.json
+{ "defaultProvider": "bili", "defaultModel": "glm-5.2" }
+```
+
+> If you use the `billion-context-pi` extension, run Pi in an isolated agent
+dir (`PI_CODING_AGENT_DIR=…`) so the client-side extension doesn't double-
+compress alongside the proxy. The `bili-test-pi` helper does this for you.
 
 #### OpenCode
 
-OpenCode is also an **Anthropic** client by default (it speaks the Messages
-API). Point it at `anthropic`:
+`~/.config/opencode/opencode.json` — add a provider under `provider`, then
+reference it in `model`:
 
-```bash
-export ANTHROPIC_BASE_URL=http://localhost:8787/anthropic
-export ANTHROPIC_API_KEY=sk-ant-...
-opencode
+```jsonc
+{
+  "provider": {
+    "bili": {
+      "options": {
+        "apiKey": "<your key>",
+        "baseURL": "http://localhost:8787/zhipu/api/coding/paas/v4"
+      },
+      "models": {
+        "glm-5.2": { "limit": { "context": 1000000, "output": 131072 } }
+      }
+    }
+  },
+  "model": "bili/glm-5.2"
+}
 ```
 
-If your OpenCode provider is OpenAI-compatible (e.g. GLM), set that provider's
-`baseURL` to `http://localhost:8787/zhipu/api/coding/paas/v4` in `opencode.json`
-instead — same routing rule, different config location.
+For an Anthropic provider instead, set `baseURL` to
+`http://localhost:8787/anthropic`.
 
 #### Codex
 
-Codex is an **OpenAI** client (Responses API). Point it at an OpenAI-compatible
-route. For GLM via the `zhipu` route:
+`~/.codex/config.toml` — declare a `model_provider` block pointing at your
+proxy route, then select it:
 
-```bash
-export OPENAI_BASE_URL=http://localhost:8787/zhipu/api/coding/paas/v4
-export OPENAI_API_KEY=<your real GLM key>
-codex
+```toml
+model_provider = "bili"
+model = "glm-5.2"
+
+[model_providers.bili]
+name = "bili"
+base_url = "http://localhost:8787/zhipu/api/coding/paas/v4"
+wire_api = "responses"
+env_key = "OPENAI_API_KEY"   # Codex reads the key from this env var
 ```
 
 > Codex's Responses API needs an upstream that speaks the Responses protocol.
 > Most regional OpenAI-compatible endpoints only speak `/chat/completions`; if
-> yours 404s on `/responses`, use a relay like `comfly` that speaks Responses,
-> or the official OpenAI API.
-
-#### Claude Code (Anthropic)
-
-```bash
-export ANTHROPIC_BASE_URL=http://localhost:8787/anthropic
-export ANTHROPIC_API_KEY=sk-ant-...
-claude
-```
+> yours 404s on `/responses`, use a relay that speaks Responses, or the
+> official OpenAI API.
 
 #### Other clients (Cursor / Aider / Continue …)
 
-Any client that lets you set a base URL works. Set it to
-`http://localhost:8787/<provider>` — `anthropic`, `zhipu`, `deepseek`, whatever
-you named in Step 2.
+Any client that lets you set a base URL works. Point it at
+`http://localhost:8787/<provider>` — the provider name you declared in Step 2.
 
 ### Verify
 

@@ -93,60 +93,86 @@ acp-proxy listening on http://127.0.0.1:8787 — routes: anthropic=https://api.a
 
 ### 第 3 步 —— 把客户端指向代理
 
-把客户端的 base URL 设为 `http://localhost:8787/<provider>/...`。provider 名是路径第一段,剩余路径原样转发。用你的**真实** API key 启动客户端。
+编辑客户端自己的配置文件,让它把请求发到
+`http://localhost:8787/<provider>/...`(第 2 步声明的 provider 名作为路径
+第一段)。把你的**真实** API key 也填进客户端配置 —— 代理原样透传。
 
-#### Pi(带 billion-context-pi 扩展)
+#### Pi(billion-context-pi)
 
-Pi 是 **Anthropic** 客户端。指向你在第 2 步声明的 `anthropic` 路由:
+`~/.pi/agent/models.json` —— 声明一个指向你 proxy 路由的 provider,然后在
+`settings.json` 里设为默认:
 
-```bash
-export ANTHROPIC_BASE_URL=http://localhost:8787/anthropic
-export ANTHROPIC_API_KEY=sk-ant-...   # 你的真实 key
-pi-stable   # 或: pi
+```jsonc
+// ~/.pi/agent/models.json
+{
+  "providers": {
+    "bili": {
+      "baseUrl": "http://localhost:8787/zhipu/api/coding/paas/v4",
+      "api": "openai-completions",                       // 或 "anthropic-messages"
+      "apiKey": "<your key>",
+      "models": [{ "id": "glm-5.2", "contextWindow": 1000000, "maxTokens": 131072 }]
+    }
+  }
+}
 ```
+```jsonc
+// ~/.pi/agent/settings.json
+{ "defaultProvider": "bili", "defaultModel": "glm-5.2" }
+```
+
+> 如果你装了 `billion-context-pi` 扩展,用隔离的 agent 目录跑 Pi
+> (`PI_CODING_AGENT_DIR=…`),免得客户端扩展和 proxy 双重压缩。
+> `bili-test-pi` 脚本帮你做好了这层隔离。
 
 #### OpenCode
 
-OpenCode 默认也是 **Anthropic** 客户端(它说 Messages API)。指向 `anthropic`:
+`~/.config/opencode/opencode.json` —— 在 `provider` 下加一个,然后在 `model`
+里引用:
 
-```bash
-export ANTHROPIC_BASE_URL=http://localhost:8787/anthropic
-export ANTHROPIC_API_KEY=sk-ant-...
-opencode
+```jsonc
+{
+  "provider": {
+    "bili": {
+      "options": {
+        "apiKey": "<your key>",
+        "baseURL": "http://localhost:8787/zhipu/api/coding/paas/v4"
+      },
+      "models": {
+        "glm-5.2": { "limit": { "context": 1000000, "output": 131072 } }
+      }
+    }
+  },
+  "model": "bili/glm-5.2"
+}
 ```
 
-如果你的 OpenCode provider 是 OpenAI 兼容的(例如智谱 GLM),改为在
-`opencode.json` 里把该 provider 的 `baseURL` 设为
-`http://localhost:8787/zhipu/api/coding/paas/v4` —— 同样的路由规则,只是配置位置不同。
+如果要走 Anthropic provider,把 `baseURL` 设为
+`http://localhost:8787/anthropic`。
 
 #### Codex
 
-Codex 是 **OpenAI** 客户端(Responses API)。指向一个 OpenAI 兼容路由。
-走 `zhipu` 路由用智谱 GLM:
+`~/.codex/config.toml` —— 声明一个指向你 proxy 路由的 `model_provider`,
+然后选中它:
 
-```bash
-export OPENAI_BASE_URL=http://localhost:8787/zhipu/api/coding/paas/v4
-export OPENAI_API_KEY=<你的真实智谱 key>
-codex
+```toml
+model_provider = "bili"
+model = "glm-5.2"
+
+[model_providers.bili]
+name = "bili"
+base_url = "http://localhost:8787/zhipu/api/coding/paas/v4"
+wire_api = "responses"
+env_key = "OPENAI_API_KEY"   # Codex 从这个环境变量读 key
 ```
 
 > Codex 的 Responses API 需要上游说 Responses 协议。多数区域性 OpenAI
 > 兼容端点只说 `/chat/completions`;如果你的端点在 `/responses` 上 404,
-> 用一个说 Responses 的中转(如 `comfly`),或用官方 OpenAI API。
-
-#### Claude Code(Anthropic)
-
-```bash
-export ANTHROPIC_BASE_URL=http://localhost:8787/anthropic
-export ANTHROPIC_API_KEY=sk-ant-...
-claude
-```
+> 用一个说 Responses 的中转,或用官方 OpenAI API。
 
 #### 其他客户端(Cursor / Aider / Continue …)
 
-任何允许设置 base URL 的客户端都能用。设为
-`http://localhost:8787/<provider>` —— `anthropic`、`zhipu`、`deepseek`,
-你在第 2 步起了什么名就用什么。
+任何允许设置 base URL 的客户端都能用。指向
+`http://localhost:8787/<provider>` —— 第 2 步声明的 provider 名。
 
 ### 验证
 
