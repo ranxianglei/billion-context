@@ -1,5 +1,6 @@
 import { defaultConfig, type Config } from "acp-kernel";
 import { readFileSync } from "node:fs";
+import { configFile } from "./paths.js";
 
 function safeReadJson(path: string): unknown {
     try {
@@ -111,30 +112,39 @@ export type ProxyOptions = {
 };
 
 export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions {
-    const port = parseInt(env.ACP_PORT ?? env.PORT ?? "8787", 10);
-    const host = env.ACP_HOST ?? "127.0.0.1";
-    const upstream = (env.ACP_UPSTREAM ?? "https://api.anthropic.com").replace(/\/$/, "");
+    // --- Source 1: JSON config file (~/.config/billion-context/billion-context.json) ---
+    // The canonical, user-editable config. Loaded first so env vars below can
+    // override it (env wins for environment-specific overrides).
+    const fileConfig = loadConfigFile();
+
+    // --- Source 2: env vars (highest priority) ---
+    const port = parseInt(env.ACP_PORT ?? env.PORT ?? `${fileConfig.port ?? 8787}`, 10);
+    const host = env.ACP_HOST ?? fileConfig.host ?? "127.0.0.1";
+    const upstream = (env.ACP_UPSTREAM ?? fileConfig.upstream ?? "https://api.anthropic.com").replace(/\/$/, "");
     let routes: ProviderRoutes = {};
-    const routesPath = env.ACP_PROVIDERS ?? "";
+    // Routes: explicit env path > config file providers > none.
+    const routesPath = env.ACP_PROVIDERS ?? fileConfig.providersPath ?? "";
     if (routesPath) {
         const parsed = safeReadJson(routesPath);
         if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-            // Accept both legacy { name: "url" } and new { name: { url, models } }.
             for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
-                if (typeof v === "string" && v.length > 0) {
-                    routes[k] = { url: v.replace(/\/$/, "") };
-                } else if (v && typeof v === "object" && !Array.isArray(v) && typeof (v as { url?: unknown }).url === "string" && (v as { url: string }).url.length > 0) {
-                    const obj = v as { url: string; models?: Record<string, { context?: number; output?: number }> };
-                    routes[k] = { url: obj.url.replace(/\/$/, ""), models: obj.models };
-                }
+                const route = parseRouteEntry(v);
+                if (route) routes[k] = route;
             }
         }
     }
-    const modelContextLimit = parseInt(env.ACP_MODEL_CONTEXT_LIMIT ?? "200000", 10);
-    const enabled = (env.ACP_CONDENSE_ENABLED ?? "1") !== "0";
-    const keepRecentToolResults = parseInt(env.ACP_KEEP_RECENT_TOOL_RESULTS ?? "6", 10);
-    const minCharsToCondense = parseInt(env.ACP_MIN_CHARS_TO_CONDENSE ?? "1500", 10);
-    const maxKeptChars = parseInt(env.ACP_MAX_KEPT_CHARS ?? "400", 10);
+    // Also accept providers inline in the config file.
+    if (fileConfig.providers) {
+        for (const [k, v] of Object.entries(fileConfig.providers)) {
+            const route = parseRouteEntry(v);
+            if (route && !routes[k]) routes[k] = route;
+        }
+    }
+    const modelContextLimit = parseInt(env.ACP_MODEL_CONTEXT_LIMIT ?? `${fileConfig.modelContextLimit ?? 200000}`, 10);
+    const enabled = (env.ACP_CONDENSE_ENABLED ?? (fileConfig.condense?.enabled === false ? "0" : "1")) !== "0";
+    const keepRecentToolResults = parseInt(env.ACP_KEEP_RECENT_TOOL_RESULTS ?? `${fileConfig.condense?.keepRecentToolResults ?? 6}`, 10);
+    const minCharsToCondense = parseInt(env.ACP_MIN_CHARS_TO_CONDENSE ?? `${fileConfig.condense?.minCharsToCondense ?? 1500}`, 10);
+    const maxKeptChars = parseInt(env.ACP_MAX_KEPT_CHARS ?? `${fileConfig.condense?.maxKeptChars ?? 400}`, 10);
     return {
         port: Number.isFinite(port) ? port : 8787,
         host,
@@ -144,13 +154,52 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         kernelConfig: defaultConfig(modelContextLimit),
         condense: { enabled, keepRecentToolResults, minCharsToCondense, maxKeptChars },
         compress: {
-            injectTool: (env.ACP_COMPRESS_TOOL ?? "1") !== "0",
-            injectNudge: (env.ACP_COMPRESS_NUDGE ?? "1") !== "0",
+            injectTool: (env.ACP_COMPRESS_TOOL ?? (fileConfig.compress?.injectTool === false ? "0" : "1")) !== "0",
+            injectNudge: (env.ACP_COMPRESS_NUDGE ?? (fileConfig.compress?.injectNudge === false ? "0" : "1")) !== "0",
         },
-        sessionHeader: env.ACP_SESSION_HEADER ?? "x-acp-session",
-        log: env.ACP_LOG !== "0",
-        debug: (env.ACP_DEBUG ?? "0") === "1",
-        dumpSse: env.ACP_DUMP_SSE || undefined,
-        passthrough: (env.ACP_PASSTHROUGH ?? "0") === "1",
+        sessionHeader: env.ACP_SESSION_HEADER ?? fileConfig.sessionHeader ?? "x-acp-session",
+        log: env.ACP_LOG !== "0" && fileConfig.log !== false,
+        debug: (env.ACP_DEBUG ?? (fileConfig.debug ? "1" : "0")) === "1",
+        dumpSse: env.ACP_DUMP_SSE || fileConfig.dumpSse || undefined,
+        passthrough: (env.ACP_PASSTHROUGH ?? (fileConfig.passthrough ? "1" : "0")) === "1",
     };
+}
+
+/** Shape of the optional JSON config file. All fields optional — the file is a
+ *  pure override layer; anything unset falls through to defaults. */
+type FileConfig = {
+    port?: number;
+    host?: string;
+    upstream?: string;
+    /** Path to a legacy providers.json (backward compat). */
+    providersPath?: string;
+    /** Inline providers, same shape as providers.json. */
+    providers?: Record<string, unknown>;
+    modelContextLimit?: number;
+    sessionHeader?: string;
+    log?: boolean;
+    debug?: boolean;
+    dumpSse?: string;
+    passthrough?: boolean;
+    condense?: { enabled?: boolean; keepRecentToolResults?: number; minCharsToCondense?: number; maxKeptChars?: number };
+    compress?: { injectTool?: boolean; injectNudge?: boolean };
+};
+
+function loadConfigFile(): FileConfig {
+    const parsed = safeReadJson(configFile());
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as FileConfig;
+    }
+    return {};
+}
+
+function parseRouteEntry(v: unknown): ProviderRoute | undefined {
+    if (typeof v === "string" && v.length > 0) {
+        return { url: v.replace(/\/$/, "") };
+    }
+    if (v && typeof v === "object" && !Array.isArray(v) && typeof (v as { url?: unknown }).url === "string" && (v as { url: string }).url.length > 0) {
+        const obj = v as { url: string; models?: Record<string, { context?: number; output?: number }> };
+        return { url: obj.url.replace(/\/$/, ""), models: obj.models };
+    }
+    return undefined;
 }

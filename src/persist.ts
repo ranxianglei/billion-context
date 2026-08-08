@@ -2,7 +2,7 @@ import { promises as fs } from "node:fs";
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import * as path from "node:path";
-import * as os from "node:os";
+import { sessionsDir } from "./paths.js";
 import { createInitialState, type CompressionState } from "acp-kernel";
 import type { Session, BlockContent } from "./session.js";
 
@@ -382,9 +382,7 @@ function msg(e: unknown): string {
 }
 
 function defaultDir(): string {
-    const env = process.env.BILI_SESSIONS_DIR;
-    if (env) return env;
-    return path.join(os.homedir(), ".bili", "sessions");
+    return sessionsDir();
 }
 
 function defaultDebounce(): number {
