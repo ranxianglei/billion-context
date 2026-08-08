@@ -62,6 +62,19 @@ so you don't have to invent the schema from scratch:
 [acp-config] created empty config at ~/.config/billion-context/billion-context.json — add your providers (see README Quickstart), then restart
 ```
 
+**Or configure via the web UI** (easier): open `http://localhost:8787/__acp/` in
+a browser while the proxy is running — edit providers in a form, and get
+copy-ready config snippets for Pi / OpenCode / Codex. The startup banner prints
+this URL too:
+
+```
+acp-proxy listening on http://localhost:8787 — web UI: http://localhost:8787/__acp/
+```
+
+This is the recommended path for first-time setup. (Prefer editing the JSON
+file directly — e.g. for git-managed or scripted deployments? See
+[Manual config file](#manual-config-file) below.)
+
 ### How routing works
 
 The proxy routes by a **provider name in the URL path** — the first path
@@ -86,40 +99,20 @@ to send each request. In the config below, `zhipu` corresponds to:
       }
 ```
 
-### Step 2 — Edit the config file
+### Step 2 — Configure your providers
 
-Open the file from Step 1 (`~/.config/billion-context/billion-context.json`)
-and edit the `providers` block to match what you pay for. Each entry is a
-**name → URL** mapping; the name is what you'll put in the client's base URL in
-Step 3.
-
-```json
-{
-  "providers": {
-    "zhipu": {
-      "url": "https://open.bigmodel.cn",
-      "models": {
-        "glm-5.2": { "context": 1000000, "output": 131072 }
-      }
-    },
-    "anthropic": "https://api.anthropic.com"
-  }
-}
-```
-
-- Delete providers you don't use.
-- Add others (e.g. `"deepseek": "https://api.deepseek.com"`).
-- The API key is **not** here — it lives in the client; the proxy passes it
-  through untouched.
-
-After saving, **restart `bili`**. The startup banner lists your routes:
+Open the **web UI** at `http://localhost:8787/__acp/` and add your providers
+there (add provider → fill name + URL + per-model context → Save). This writes
+to `~/.config/billion-context/billion-context.json` directly. Then **restart
+`bili`** — the startup banner lists your routes:
 
 ```
-acp-proxy listening on http://127.0.0.1:8787 — routes: anthropic=https://api.anthropic.com, zhipu=https://open.bigmodel.cn
+acp-proxy listening on http://localhost:8787 — routes: anthropic=https://api.anthropic.com, zhipu=https://open.bigmodel.cn
 ```
 
-That confirms the proxy picked up your config. (Full schema — per-model context
-windows, optional fields — is in [Configuration](#configuration).)
+That confirms the proxy picked up your config. (Prefer editing the JSON file by
+hand? See [Manual config file](#manual-config-file). Full schema — per-model
+context windows, optional fields — is in [Configuration](#configuration).)
 
 ### Step 3 — Point your client at the proxy
 
@@ -186,6 +179,48 @@ Everything else (`name`, `wire_api`, `env_key`) stays unchanged.
 Not yet supported. The proxy currently speaks the Anthropic, OpenAI
 chat-completions, and OpenAI Responses protocols — if your client uses a
 different protocol or a non-standard auth header, it won't work yet.
+
+### Web UI
+
+Open `http://localhost:8787/__acp/` in a browser while the proxy is running. You can:
+
+- **Edit providers** in a form (add/remove providers and per-model context windows) and save — this writes to `billion-context.json` directly.
+- **Generate client URLs** — pick a provider, get ready-to-copy config snippets for Pi / OpenCode / Codex (the `baseUrl`/`baseURL`/`base_url` line with the proxy origin + provider name filled in).
+- **View sessions** — live table of active sessions (requests, tokens saved, last seen), auto-refreshing.
+
+Changes to providers require a **restart** to take effect (the UI tells you this).
+
+### Manual config file
+
+Prefer editing JSON by hand — for git-managed configs, scripted deployments, or
+if you just don't want to use the browser? The web UI writes to the same file,
+so you can edit it directly with identical results.
+
+Open `~/.config/billion-context/billion-context.json` and edit the `providers`
+block. Each entry is a **name → URL** mapping; the name is what you put in the
+client's base URL in Step 3.
+
+```json
+{
+  "providers": {
+    "zhipu": {
+      "url": "https://open.bigmodel.cn",
+      "models": {
+        "glm-5.2": { "context": 1000000, "output": 131072 }
+      }
+    },
+    "anthropic": "https://api.anthropic.com"
+  }
+}
+```
+
+- Delete providers you don't use.
+- Add others (e.g. `"deepseek": "https://api.deepseek.com"`).
+- The API key is **not** here — it lives in the client; the proxy passes it
+  through untouched.
+
+After saving, **restart `bili`**. (Full schema — per-model context windows,
+optional fields — is in [Configuration](#configuration).)
 
 ### Verify
 

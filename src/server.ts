@@ -32,6 +32,7 @@ import {
 import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, withSessionLock } from "./session.js";
 import { COMPRESS_TOOL, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressTextSystemPrompt } from "./compress-tool.js";
 import { rewriteSseStream, rewriteJsonResponse, type RewriteCtx } from "./stream.js";
+import { renderUI, handleConfigGet, handleConfigPut } from "./web.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { getStore } from "./persist.js";
 import { compressLoopStream } from "./compress-loop.js";
@@ -114,14 +115,16 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         }
     });
     server.listen(opts.port, opts.host, () => {
+        const displayHost = opts.host === "0.0.0.0" ? "localhost" : opts.host;
         log(
             "info",
-            `acp-proxy listening on http://${opts.host}:${opts.port}` +
+            `acp-proxy listening on http://${displayHost}:${opts.port}` +
                 (Object.keys(opts.routes).length
                     ? ` — routes: ${Object.entries(opts.routes)
                           .map(([n, u]) => `${n}=${typeof u === "string" ? u : u.url}`)
                           .join(", ")}`
-                    : ` → ${opts.upstream}`),
+                    : ` → ${opts.upstream}`) +
+                ` — web UI: http://${displayHost}:${opts.port}/__acp/`,
         );
     });
     // Listen errors (EADDRINUSE port taken, EACCES privileged port, EAFNOSUPPORT
@@ -216,6 +219,15 @@ async function handle(
         res.end(JSON.stringify({ ok: true, upstream: opts.upstream }));
         return;
     }
+    // Web config UI (served as HTML, separate from the JSON health check above).
+    if (req.method === "GET" && req.url === "/__acp/") {
+        const origin = `http://${opts.host === "0.0.0.0" ? "localhost" : opts.host}:${opts.port}`;
+        res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+        res.end(renderUI(origin));
+        return;
+    }
+    if (req.method === "GET" && req.url === "/__acp/config") return handleConfigGet(res);
+    if (req.method === "PUT" && req.url === "/__acp/config") return handleConfigPut(req, res);
     let bodyBuffer: Buffer;
     try {
         bodyBuffer = await readBody(req);
@@ -286,13 +298,18 @@ async function handle(
                   ? conversationSignalOpenai(parsed as OpenAIRequestBody, sessionHeader)
                   : conversationSignalResponses(parsed as ResponsesRequestBody, sessionHeader);
         const sessionId = deriveProxySessionId(req.headers, protocol, upstreamOrigin, conversation);
-        const session = getSession(sessionId, { protocol, upstreamOrigin });
-        // Affinity token to forward upstream: prefer the client's own session
-        // header (opencode x-session-affinity, codex body.session_id); if the
-        // client sent none (pi), synthesize ses_<conversation> so upstream
-        // sticky-routing / cache pools still get a stable key. See README
-        // "Session identity".
+        // Two separate uses of the conversation signal:
+        //  - `affinity`: header value forwarded upstream for sticky-routing /
+        //    cache pools. Synthesized as ses_<conversation> when the client
+        //    sent none (pi), so upstream still gets a stable key.
+        //  - `label`: human-readable display in the web UI / stats. We store
+        //    ONLY the client's own value (opencode x-session-affinity, codex
+        //    body.session_id) — never the synthetic one — so a user can tell
+        //    at a glance which client owns a session. pi sends nothing, so its
+        //    label stays empty (shown as "—" in the UI).
         const affinity = affinityToken(req.headers, conversation);
+        const clientLabel = clientConversationHeader(req.headers);
+        const session = getSession(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? undefined });
         // Serialize per-session: prepare (processTurn mutates state) + forward
         // (stream rewriter mutates state via compress/decompress) must not
         // interleave across concurrent requests on the same session.
@@ -358,7 +375,7 @@ function prepareAnthropic(
 ): Prepared {
     const sessionId = session.id;
     const stream = parsed.stream === true;
-    session.requests++;
+    ++session.stats.requests;
 
     let processedMessages: CoreMessage[] = [];
     let rebuiltMessages = parsed.messages;
@@ -370,6 +387,11 @@ function prepareAnthropic(
         const tokenCount = estimateTokensFast(msgs.map((m) => m.text ?? "").join("\n"));
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
+        session.stats.contextTokens = tokenCount;
+        if (!session.meta.title) {
+            const t = deriveTitle(msgs);
+            if (t) session.meta.title = t;
+        }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit));
         processedMessages = turn.messages;
@@ -412,7 +434,7 @@ function prepareOpenai(
 ): Prepared {
     const sessionId = session.id;
     const stream = parsed.stream === true;
-    session.requests++;
+    ++session.stats.requests;
 
     let processedMessages: CoreMessage[] = [];
     let rebuiltMessages = parsed.messages;
@@ -433,6 +455,11 @@ function prepareOpenai(
         const tokenCount = estimateTokensFast(msgs.map((m) => m.text ?? "").join("\n"));
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
+        session.stats.contextTokens = tokenCount;
+        if (!session.meta.title) {
+            const t = deriveTitle(msgs);
+            if (t) session.meta.title = t;
+        }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit));
         processedMessages = turn.messages;
@@ -482,7 +509,7 @@ function prepareResponses(
 ): Prepared {
     const sessionId = session.id;
     const stream = parsed.stream === true;
-    session.requests++;
+    ++session.stats.requests;
 
     let processedMessages: CoreMessage[] = [];
     let rebuiltInput: ResponseInputItem[] | string = parsed.input;
@@ -498,6 +525,11 @@ function prepareResponses(
         const tokenCount = estimateTokensFast(msgs.map((m) => m.text ?? "").join("\n"));
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" });
         session.state = turn.state;
+        session.stats.contextTokens = tokenCount;
+        if (!session.meta.title) {
+            const t = deriveTitle(msgs);
+            if (t) session.meta.title = t;
+        }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit));
         processedMessages = turn.messages;
@@ -868,11 +900,31 @@ async function dumpStreamToFile(stream: ReadableStream<Uint8Array>, dir: string,
     }
 }
 
+/** Derive a short human-readable title from the first user text message.
+ *  Used so the web UI can show "Fix auth bug" instead of an opaque hash. */
+function deriveTitle(messages: CoreMessage[]): string | undefined {
+    for (const m of messages) {
+        if (m.role !== "user" || m.contentType !== "text") continue;
+        const clean = (m.text ?? "").replace(/\s+/g, " ").trim();
+        if (clean) return clean.length > 60 ? clean.slice(0, 57) + "\u2026" : clean;
+    }
+    return undefined;
+}
+
 function sendStats(res: http.ServerResponse): void {
     const sessions = listSessions().map((s) => ({
         id: s.id,
-        requests: s.requests,
-        tokensSaved: s.tokensSaved,
+        protocol: s.meta.protocol,
+        upstream: s.meta.upstreamOrigin,
+        label: s.meta.label,
+        title: s.meta.title,
+        requests: s.stats.requests,
+        contextTokens: s.stats.contextTokens,
+        inputTokens: s.stats.inputTokens,
+        cachedTokens: s.stats.cachedTokens,
+        outputTokens: s.stats.outputTokens,
+        cacheSamples: s.stats.cacheSamples,
+        cacheHitPct: s.stats.cacheSamples > 0 ? Math.round(s.stats.cachedTokens / s.stats.inputTokens * 100) : null,
         lastSeen: new Date(s.lastSeen).toISOString(),
     }));
     res.writeHead(200, { "content-type": "application/json" });

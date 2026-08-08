@@ -23,11 +23,12 @@ function jsonFilesUnder(dir: string): string[] {
 function makeSession(id: string): Session {
     return {
         id,
+        meta: {},
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, contextTokens: 0 },
+        metadata: {},
         state: createInitialState(),
         createdAt: Date.now(),
         lastSeen: Date.now(),
-        requests: 0,
-        tokensSaved: 0,
         blockContents: new Map(),
         inFlight: 0,
         persisted: false,
@@ -53,8 +54,8 @@ async function settle(ms = 30): Promise<void> {
 
 await withTempStore("writeNow round-trips state + blockContents", async (store, dir) => {
     const s = makeSession("sess-1");
-    s.requests = 42;
-    s.tokensSaved = 1234;
+    s.stats.requests = 42;
+    s.stats.tokensSaved = 1234;
     s.state.nextBlockId = 7;
     const content: BlockContent = { one: { text: "one-text", count: 3 }, full: { text: "full-text", count: 9 } };
     s.blockContents.set("b1", content);
@@ -65,22 +66,23 @@ await withTempStore("writeNow round-trips state + blockContents", async (store, 
     assert.ok(files.length > 0, "a session json file was written");
     const raw = JSON.parse(readFileSync(files[0], "utf8"));
     assert.equal(raw.id, "sess-1");
-    assert.equal(raw.requests, 42);
-    assert.equal(raw.tokensSaved, 1234);
+    assert.equal(raw.requests, undefined);
+    assert.equal(raw.stats.requests, 42);
+    assert.equal(raw.stats.tokensSaved, 1234);
     assert.equal(raw.state.nextBlockId, 7);
     assert.deepEqual(raw.blockContents.b1, { one: { text: "one-text", count: 3 }, full: { text: "full-text", count: 9 } });
 });
 
 await withTempStore("loadSync restores a persisted session", async (store) => {
     const s = makeSession("sess-2");
-    s.tokensSaved = 999;
+    s.stats.tokensSaved = 999;
     s.state.nextBlockId = 3;
     await store.writeNow(s);
 
     const loaded = store.loadSync("sess-2");
     assert.ok(loaded, "loaded from disk");
     assert.equal(loaded!.id, "sess-2");
-    assert.equal(loaded!.tokensSaved, 999);
+    assert.equal(loaded!.stats.tokensSaved, 999);
     assert.equal(loaded!.state.nextBlockId, 3);
     assert.ok(loaded!.blockContents instanceof Map, "blockContents restored as a Map");
 });
@@ -91,16 +93,16 @@ await withTempStore("loadSync returns null for unknown id", async (store) => {
 
 await withTempStore("scheduleSave debounces and eventually writes", async (store, dir) => {
     const s = makeSession("debounce-1");
-    s.requests = 1;
+    s.stats.requests = 1;
     store.scheduleSave(s);
-    s.requests = 2; // mutate again before timer fires → should coalesce
+    s.stats.requests = 2; // mutate again before timer fires → should coalesce
     store.scheduleSave(s);
-    s.requests = 3;
+    s.stats.requests = 3;
     store.scheduleSave(s);
     await settle();
     assert.equal(readdirSync(dir).length, 1, "exactly one top-level entry (the _unknown subdir) happened");
     const loaded = store.loadSync("debounce-1");
-    assert.equal(loaded!.requests, 3, "latest value persisted");
+    assert.equal(loaded!.stats.requests, 3, "latest value persisted");
 });
 
 await withTempStore("loadAll bulk-loads every session from disk", async (store) => {
@@ -114,10 +116,10 @@ await withTempStore("loadAll bulk-loads every session from disk", async (store) 
 
 await withTempStore("flushSync writes immediately (for eviction)", async (store, dir) => {
     const s = makeSession("evict-1");
-    s.tokensSaved = 555;
+    s.stats.tokensSaved = 555;
     store.flushSync(s);
     assert.equal(readdirSync(dir).length, 1);
-    assert.equal(store.loadSync("evict-1")!.tokensSaved, 555);
+    assert.equal(store.loadSync("evict-1")!.stats.tokensSaved, 555);
 });
 
 await withTempStore("flushAll flushes all pending debounce writes", async (store) => {
@@ -223,18 +225,18 @@ await withTempStore("sessions are namespaced by protocol + provider on disk", as
     //   openai/zhipu_<hash>.json
     //   responses/comfly_<hash>.json
     const anth = makeSession("sess-anth");
-    anth.protocol = "anthropic";
-    anth.upstreamOrigin = "https://coding.dashscope.aliyuncs.com";
+    anth.meta.protocol = "anthropic";
+    anth.meta.upstreamOrigin = "https://coding.dashscope.aliyuncs.com";
     await store.writeNow(anth);
 
     const oai = makeSession("sess-oai");
-    oai.protocol = "openai";
-    oai.upstreamOrigin = "https://open.bigmodel.cn";
+    oai.meta.protocol = "openai";
+    oai.meta.upstreamOrigin = "https://open.bigmodel.cn";
     await store.writeNow(oai);
 
     const resp = makeSession("sess-resp");
-    resp.protocol = "responses";
-    resp.upstreamOrigin = "https://ai.comfly.org";
+    resp.meta.protocol = "responses";
+    resp.meta.upstreamOrigin = "https://ai.comfly.org";
     await store.writeNow(resp);
 
     const all = jsonFilesUnder(dir);
@@ -262,8 +264,8 @@ await withTempStore("loadSync uses protocol meta to locate namespaced file", asy
     // After an LRU eviction, loadSync must find the file by protocol/host,
     // not by scanning. Passing the meta must hit the right path.
     const s = makeSession("meta-1");
-    s.protocol = "openai";
-    s.upstreamOrigin = "https://open.bigmodel.cn";
+    s.meta.protocol = "openai";
+    s.meta.upstreamOrigin = "https://open.bigmodel.cn";
     await store.writeNow(s);
     // With correct meta → found.
     assert.ok(store.loadSync("meta-1", { protocol: "openai", upstreamOrigin: "https://open.bigmodel.cn" }));

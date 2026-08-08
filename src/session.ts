@@ -8,17 +8,52 @@ export type BlockContent = {
 
 export type Session = {
     id: string;
-    /** Protocol + upstream origin this session belongs to. Captured at first
-     *  request and persisted, so the on-disk filename can be namespaced by
-     *  protocol/provider (e.g. sessions/anthropic/bailian_<hash>.json) and a
-     *  human can tell sessions apart at a glance. */
-    protocol?: "anthropic" | "openai" | "responses";
-    upstreamOrigin?: string;
+    /** Identity / descriptive metadata. Populated on first request. */
+    meta: {
+        /** Client wire protocol. Absent until the first request resolves it.
+         *  Captured at first request and persisted, so the on-disk filename can
+         *  be namespaced by protocol/provider (e.g.
+         *  sessions/anthropic/bailian_<hash>.json) and a human can tell
+         *  sessions apart at a glance. */
+        protocol?: "anthropic" | "openai" | "responses";
+        /** Upstream origin URL this session routes to. */
+        upstreamOrigin?: string;
+        /** Human-readable conversation label (the affinity token), e.g.
+         *  "ses_abc123" from opencode's x-session-affinity, or a client-provided
+         *  id from codex's body.session_id. Pure conversation dimension — no
+         *  key or upstream — so it is safe to display. Empty/undefined if the
+         *  client sent none. */
+        label?: string;
+        /** Short human-readable title derived from the first user message
+         *  (truncated). Lets the web UI show "Fix auth bug" instead of a hash.
+         *  Set once on the first request that has a user message. */
+        title?: string;
+    };
+    /** Cumulative usage stats, summed across all requests. Each sample =
+     *  one upstream usage report. Persisted; survives restart. */
+    stats: {
+        requests: number;
+        /** Approximate tokens saved by compression (legacy/rough — kept for
+         *  backward compat with old session files, not shown in UI). */
+        tokensSaved: number;
+        /** Cumulative input (prompt) tokens billed by upstream. */
+        inputTokens: number;
+        /** Cumulative prompt-cache-hit tokens. */
+        cachedTokens: number;
+        /** Cumulative output (completion) tokens. */
+        outputTokens: number;
+        /** Number of upstream usage samples recorded. */
+        cacheSamples: number;
+        /** Current in-context (uncompressed) token count at last processTurn. */
+        contextTokens: number;
+    };
+    /** Free-form escape hatch for future fields not yet promoted to typed
+     *  members. Persisted as-is (must be JSON-serializable). Use sparingly —
+     *  prefer promoting a stable field into `meta` or `stats` once it's clear. */
+    metadata: Record<string, unknown>;
     state: CompressionState;
     createdAt: number;
     lastSeen: number;
-    requests: number;
-    tokensSaved: number;
     /** Original content of compressed blocks, captured at compress time when
      *  the source messages are still present in the request. decompress reads
      *  from here instead of scanning ctx.messages (which only holds the
@@ -73,14 +108,15 @@ export async function initSessions(): Promise<void> {
     }
 }
 
-export function getSession(id: string, meta?: { protocol?: Session["protocol"]; upstreamOrigin?: string }): Session {
+export function getSession(id: string, meta?: { protocol?: Session["meta"]["protocol"]; upstreamOrigin?: string; label?: string }): Session {
     const existing = sessions.get(id);
     if (existing) {
         existing.lastSeen = Date.now();
-        // Fill in protocol/upstream meta on an existing session if the caller
+        // Fill in protocol/upstream/label meta on an existing session if the caller
         // now knows it (e.g. a session was created by loadAll without meta).
-        if (meta?.protocol && !existing.protocol) existing.protocol = meta.protocol;
-        if (meta?.upstreamOrigin && !existing.upstreamOrigin) existing.upstreamOrigin = meta.upstreamOrigin;
+        if (meta?.protocol && !existing.meta.protocol) existing.meta.protocol = meta.protocol;
+        if (meta?.upstreamOrigin && !existing.meta.upstreamOrigin) existing.meta.upstreamOrigin = meta.upstreamOrigin;
+        if (meta?.label && !existing.meta.label) existing.meta.label = meta.label;
         return existing;
     }
     // Memory miss: try reload from disk (e.g. after LRU eviction).
@@ -95,13 +131,12 @@ export function getSession(id: string, meta?: { protocol?: Session["protocol"]; 
     if (sessions.size >= MAX_SESSIONS) evictOldest();
     const session: Session = {
         id,
-        protocol: meta?.protocol,
-        upstreamOrigin: meta?.upstreamOrigin,
+        meta: { protocol: meta?.protocol, upstreamOrigin: meta?.upstreamOrigin, label: meta?.label },
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, contextTokens: 0 },
+        metadata: {},
         state: createInitialState(),
         createdAt: Date.now(),
         lastSeen: Date.now(),
-        requests: 0,
-        tokensSaved: 0,
         blockContents: new Map(),
         inFlight: 0,
         persisted: false,

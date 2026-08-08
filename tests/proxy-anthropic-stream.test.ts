@@ -8,7 +8,7 @@ function makeCtx() {
     const core = createCore();
     const config = defaultConfig(200000);
     const state = createInitialState();
-    return { ctx: { core, config, messages: [], session: { id: "t", state }, log: () => {} } as never };
+    return { ctx: { core, config, messages: [], session: { id: "t", meta: {}, stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, contextTokens: 0 }, metadata: {}, state }, log: () => {} } as never };
 }
 
 function evt(type: string, data: object): string {
