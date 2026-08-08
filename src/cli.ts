@@ -161,7 +161,7 @@ export async function main(): Promise<void> {
         return;
     }
     if (command === "update") {
-        // Manual one-shot update — bypasses the 6h throttle.
+        // Manual one-shot update — bypasses the throttle.
         await checkForUpdate({ packageName: PACKAGE_NAME, currentVersion: VERSION, autoUpdate: true }, true);
         return;
     }
