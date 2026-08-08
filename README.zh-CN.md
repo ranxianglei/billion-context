@@ -53,7 +53,7 @@ bili
 
 它监听 `http://127.0.0.1:8787`。保持这个终端开着(或后台运行,见[运行代理](#运行代理))。
 
-添加你的模型
+点击[http://localhost:8787/__acp/](http://localhost:8787/__acp/) 添加你的模型
 <img width="2908" height="1787" alt="image" src="https://github.com/user-attachments/assets/cacf4b64-e5c6-41f2-b270-fd2be02eab0c" />
 
 ### 第 2 步 —— 编辑配置文件
