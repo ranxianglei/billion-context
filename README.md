@@ -1,3 +1,5 @@
+[English](./README.md) | [中文](./README.zh-CN.md)
+
 # billion-context
 
 Universal context-compression proxy for AI coding agents.
@@ -132,10 +134,44 @@ Disable permanently via config (`"autoUpdate": false`) or env
 
 ## Configuration
 
-Configuration is read from a JSON file with env-var overrides. Priority:
-**env var > config file > built-in default**.
+The proxy is configured via **environment variables** (the recommended way
+for most setups) **or** a JSON config file. Both are fully supported; pick one.
+Priority (highest wins): **CLI flag > env var > config file > built-in default**.
 
-### Config file
+- **Env vars** — quickest, great for a single provider, easy to script
+  (`.env`, systemd unit, docker `--env`). Just `export ACP_…` and run `bili`.
+- **JSON file** — better when you have many providers with per-model context
+  windows (the only place to declare those). A handful of keys (notably
+  `providers.*.models` context windows) have no env equivalent.
+
+Both can coexist: env vars override individual file keys.
+
+### Environment variables (recommended)
+
+Every config key has an env override. Set to override the file value (or to run
+with no file at all).
+
+| Env | Default | Description |
+|-----|---------|-------------|
+| `ACP_PORT` / `PORT` | `8787` | Listen port |
+| `ACP_HOST` | `127.0.0.1` | Listen host |
+| `ACP_UPSTREAM` | `https://api.anthropic.com` | Default upstream |
+| `ACP_PROVIDERS` | *(none)* | Path to a legacy providers JSON file (overrides `providers` in config) |
+| `ACP_MODEL_CONTEXT_LIMIT` | `200000` | Global fallback context window (only used when no provider/model match) |
+| `ACP_SESSION_HEADER` | `x-acp-session` | Conversation-id header name |
+| `ACP_COMPRESS_TOOL` | `1` | Set `0` to disable injecting the compress tool |
+| `ACP_COMPRESS_NUDGE` | `1` | Set `0` to disable compression nudges |
+| `ACP_DEBUG` | `0` | Set `1` for verbose logging |
+| `ACP_PASSTHROUGH` | `0` | Set `1` to forward without compression |
+| `ACP_AUTO_UPDATE` | `1` | Set `0` to disable background self-update |
+| `ACP_LOG_FILE` | *XDG state path* | Log file path (`off` disables the file, keeps stderr) |
+| `ACP_DUMP_SSE` | *(none)* | Directory to dump SSE for debugging |
+| `BILI_PERSIST` | `1` | Set `0` to disable session persistence (in-memory only, lost on restart) |
+| `BILI_PERSIST_DEBOUNCE_MS` | `500` | Debounce window for writes to disk (ms) |
+| `BILI_MAX_SESSIONS` | `256` | Max sessions held in memory (LRU eviction; disk is source of truth) |
+| `BILI_SESSIONS_DIR` | *(XDG data dir)* | Directory for persisted session state |
+
+### Config file (optional)
 
 Location (XDG Base Directory):
 
@@ -245,32 +281,6 @@ codex
 The `/zhipu/...` prefix tells the proxy to route to the `zhipu` provider; the
 remaining `/api/coding/paas/v4/...` path is preserved.
 
-### Environment variables (override the config file)
-
-Every config key has an env-var override. Set to override the file value.
-
-| Env | Default | Description |
-|-----|---------|-------------|
-| `ACP_PORT` / `PORT` | `8787` | Listen port |
-| `ACP_HOST` | `127.0.0.1` | Listen host |
-| `ACP_UPSTREAM` | `https://api.anthropic.com` | Default upstream |
-| `ACP_PROVIDERS` | *(none)* | Path to a legacy providers JSON file (overrides `providers` in config) |
-| `ACP_MODEL_CONTEXT_LIMIT` | `200000` | Global fallback context window (only used when no provider/model match) |
-| `ACP_SESSION_HEADER` | `x-acp-session` | Conversation-id header name |
-| `ACP_COMPRESS_TOOL` | `1` | Set `0` to disable injecting the compress tool |
-| `ACP_COMPRESS_NUDGE` | `1` | Set `0` to disable compression nudges |
-| `ACP_CONDENSE_ENABLED` | `1` | Set `0` to disable tool-result condensing |
-| `ACP_KEEP_RECENT_TOOL_RESULTS` | `6` | Tool results kept verbatim before condensing |
-| `ACP_MIN_CHARS_TO_CONDENSE` | `1500` | Condense tool results longer than this |
-| `ACP_MAX_KEPT_CHARS` | `400` | Max chars kept when condensing a tool result |
-| `ACP_DEBUG` | `0` | Set `1` for verbose logging |
-| `ACP_PASSTHROUGH` | `0` | Set `1` to forward without compression |
-| `ACP_DUMP_SSE` | *(none)* | Directory to dump SSE for debugging |
-| `BILI_PERSIST` | `1` | Set `0` to disable session persistence (in-memory only, lost on restart) |
-| `BILI_PERSIST_DEBOUNCE_MS` | `500` | Debounce window for writes to disk (ms) |
-| `BILI_MAX_SESSIONS` | `256` | Max sessions held in memory (LRU eviction; disk is source of truth) |
-| `BILI_SESSIONS_DIR` | *(XDG data dir)* | Directory for persisted session state |
-
 ### Notes on provider names
 
 - Must start with a letter, contain only letters/digits/`-`/`_`.
@@ -278,7 +288,7 @@ Every config key has an env-var override. Set to override the file value.
   are rejected to avoid colliding with real API path segments.
 - The provider name can appear anywhere in the path; the longest match wins.
 
-### Session identity
+## How sessions work
 
 The proxy needs a stable per-conversation identifier to isolate compression
 state across concurrent users/accounts. It derives one from four dimensions
