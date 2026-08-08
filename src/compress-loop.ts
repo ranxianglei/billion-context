@@ -53,10 +53,27 @@ function executeProxyTool(
         const block = ctx.core.decompress(blockId, ctx.session.state);
         if (!block) return `[Block ${blockId} not found]`;
         const full = args.full === true;
-        const collected = collectBlockContent(ctx.session.state, block, ctx.messages, { full });
-        ctx.session.state = deactivateBlock(ctx.session.state, [blockId]);
-        const header = `[Restored block ${blockId} — ${collected.count} item(s)${full ? ", full" : ""}]`;
-        const body = collected.text || block.summary;
+        // Prefer the content cached at compress time (cross-round safe).
+        // collectBlockContent only sees the post-fold ctx.messages, where
+        // originals are already replaced by summaries — so it returns 0 items
+        // for any block created in an earlier round.
+        const cached = ctx.session.blockContents.get(blockId);
+        let body: string;
+        let count: number;
+        if (cached) {
+            body = cached.text;
+            count = cached.count;
+        } else {
+            const collected = collectBlockContent(ctx.session.state, block, ctx.messages, { full });
+            body = collected.text || block.summary;
+            count = collected.count;
+        }
+        // Only deactivate when we actually recovered content. Deactivating on a
+        // 0-count result would discard the block and make later retries harder.
+        if (count > 0 || cached) {
+            ctx.session.state = deactivateBlock(ctx.session.state, [blockId]);
+        }
+        const header = `[Restored block ${blockId} — ${count} item(s)${full ? ", full" : ""}]`;
         // Security: never honor args.toFile in proxy mode — it is an
         // untrusted path from the model/client and enables path traversal
         // (e.g. overwriting ~/.bashrc or project source). Always write to a

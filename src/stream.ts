@@ -1,4 +1,4 @@
-import type { CompressionCore, Config, CoreMessage, CompressionState } from "acp-kernel";
+import { collectBlockContent, type CompressionCore, type Config, type CoreMessage, type CompressionState } from "acp-kernel";
 import type { Session } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput } from "./compress-tool.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
@@ -164,7 +164,17 @@ export function applyRanges(ranges: ReturnType<typeof parseCompressInput>, ctx: 
             state: ctx.session.state,
             config: ctx.config,
         });
+        const beforeIds = new Set(ctx.session.state.blocks.map((b) => b.blockId));
         ctx.session.state = res.state;
+        // Cache original content for newly-created blocks. At compress time the
+        // source messages are still in ctx.messages (this round's view, before
+        // the next processTurn folds them). Storing the text here lets decompress
+        // work in later rounds where ctx.messages no longer carries the originals.
+        for (const b of res.state.blocks) {
+            if (beforeIds.has(b.blockId)) continue;
+            const collected = collectBlockContent(res.state, b, ctx.messages, { full: true });
+            if (collected.count > 0) ctx.session.blockContents.set(b.blockId, { text: collected.text, count: collected.count });
+        }
         const r = res.result;
         const detail = ranges.map((rg) => `${rg.startRef}–${rg.endRef}`).join(", ");
 

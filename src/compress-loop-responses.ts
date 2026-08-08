@@ -96,10 +96,21 @@ function executeProxyTool(
         const block = ctx.core.decompress(blockId, ctx.session.state);
         if (!block) return `[Block ${blockId} not found]`;
         const full = args.full === true;
-        const collected = collectBlockContent(ctx.session.state, block, ctx.messages, { full });
-        ctx.session.state = deactivateBlock(ctx.session.state, [blockId]);
-        const header = `[Restored block ${blockId} — ${collected.count} item(s)${full ? ", full" : ""}]`;
-        const body = collected.text || block.summary;
+        const cached = ctx.session.blockContents.get(blockId);
+        let body: string;
+        let count: number;
+        if (cached) {
+            body = cached.text;
+            count = cached.count;
+        } else {
+            const collected = collectBlockContent(ctx.session.state, block, ctx.messages, { full });
+            body = collected.text || block.summary;
+            count = collected.count;
+        }
+        if (count > 0 || cached) {
+            ctx.session.state = deactivateBlock(ctx.session.state, [blockId]);
+        }
+        const header = `[Restored block ${blockId} — ${count} item(s)${full ? ", full" : ""}]`;
         const safeBlockId = blockId.replace(/[^a-zA-Z0-9_-]/g, "-");
         const outPath = body.length > 10000 ? join(tmpdir(), `acp-decompress-${safeBlockId}-${Date.now()}.txt`) : null;
         if (outPath) {

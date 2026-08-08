@@ -8,6 +8,11 @@ export type Session = {
     requests: number;
     condensedToolResults: number;
     tokensSaved: number;
+    /** Original content of compressed blocks, captured at compress time when
+     *  the source messages are still present in the request. decompress reads
+     *  from here instead of scanning ctx.messages (which only holds the
+     *  post-compression / folded view and loses originals across rounds). */
+    blockContents: Map<string, { text: string; count: number }>;
 };
 
 // KNOWN LIMITATION: sessions live in process memory. A proxy restart (deploy /
@@ -39,6 +44,7 @@ export function getSession(id: string): Session {
         requests: 0,
         condensedToolResults: 0,
         tokensSaved: 0,
+        blockContents: new Map(),
     };
     sessions.set(id, session);
     return session;
