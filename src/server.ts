@@ -36,6 +36,8 @@ import { rewriteSseStream, rewriteJsonResponse, type RewriteCtx } from "./stream
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { getStore } from "./persist.js";
 import { compressLoopStream } from "./compress-loop.js";
+import { log as loggerLog, configureLogger, getLogPath, closeLogger } from "./logger.js";
+import { defaultLogFile } from "./paths.js";
 import { compressLoopResponsesStream } from "./compress-loop-responses.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesSseStream, rewriteResponsesJsonResponse } from "./stream-responses.js";
@@ -83,6 +85,9 @@ export function resolveUpstream(opts: ProxyOptions, reqUrl: string): { upstream:
 }
 
 export async function startServer(opts: ProxyOptions): Promise<http.Server> {
+    // Configure the tee logger (file + stderr) BEFORE any logging so the very
+    // first line (persist status) lands in the file too.
+    const filePath = configureLogger(opts.logFile ?? defaultLogFile());
     const core = createCore();
     const config: Config = opts.kernelConfig;
     const log = (level: string, msg: string) => logMsg(opts, level, msg);
@@ -91,6 +96,9 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // re-send oversized raw history and hang).
     await initSessions();
     log("info", `[persist] ${getStore().enabled ? "enabled" : "disabled"}`);
+    if (filePath) {
+        log("info", `[log] writing to ${filePath}`);
+    }
     const server = http.createServer(async (req, res) => {
         try {
             await handle(req, res, opts, core, config, log);
@@ -129,6 +137,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         // could mutate state after its snapshot is taken and be lost.
         server.close();
         void flushAllSessions().finally(() => {
+            closeLogger();
             process.exit(0);
         });
     };
@@ -886,6 +895,5 @@ export function readBody(req: http.IncomingMessage): Promise<Buffer> {
 
 function logMsg(opts: ProxyOptions, level: string, msg: string): void {
     if (!opts.log) return;
-    const ts = new Date().toISOString();
-    console.error(`${ts} [${level}] ${msg}`);
+    loggerLog(level, msg);
 }

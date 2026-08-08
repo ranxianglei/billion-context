@@ -13,6 +13,7 @@ import { applyRanges } from "./stream.js";
 import { resolveDecompress } from "./decompress-shared.js";
 import { fetchWithTimeout } from "./fetch-util.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
+import { log as loggerLog } from "./logger.js";
 
 interface CompressLoopCtx {
     core: CompressionCore;
@@ -331,6 +332,19 @@ export async function* compressLoopStream(
         const realCalls = toolCalls.filter((tc) => !PROXY_TOOL_NAMES.has(tc.name));
 
         const hasOnlyProxy = proxyCalls.length > 0 && realCalls.length === 0;
+
+        // Log cache-hit stats from the upstream usage object so we can measure
+        // prefix-cache health on the OpenAI chat-completions path (GLM/zhipu).
+        if (usage) {
+            const prompt = (usage.prompt_tokens ?? usage.input_tokens) as number | undefined;
+            const det = (usage.prompt_tokens_details ?? usage.prompt_cache_hit_tokens) as Record<string, unknown> | undefined;
+            const cached = det?.cached_tokens ?? usage.prompt_cache_hit_tokens;
+            const out = usage.completion_tokens ?? usage.output_tokens;
+            if (typeof prompt === "number") {
+                const ch = typeof cached === "number" ? cached : 0;
+                loggerLog("info", `[acp-usage] round ${loopCount} input=${prompt} cached=${typeof cached === "number" ? cached : "?"} output=${out ?? "?"}${ch > 0 ? ` (cache hit ${Math.round(ch / prompt * 100)}%)` : ""}`);
+            }
+        }
 
         if (!hasOnlyProxy) {
             for (const tc of realCalls) {
