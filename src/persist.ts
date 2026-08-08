@@ -1,5 +1,5 @@
 import { promises as fs } from "node:fs";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import * as path from "node:path";
 import * as os from "node:os";
@@ -293,7 +293,7 @@ export class SessionStore {
             this.log("error", `[persist] flushSync FAILED for ${session.id}: ${msg(e)} — session NOT evicted to prevent loss`);
             // Best-effort: remove the orphan temp so it doesn't accumulate.
             try {
-                require("node:fs").unlinkSync(tmp);
+                unlinkSync(tmp);
             } catch {
                 /* ignore */
             }

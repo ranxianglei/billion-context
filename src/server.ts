@@ -228,6 +228,9 @@ async function handle(
               : protocol === "responses"
                 ? prepareResponses(bodyBuffer, req, opts, core, reqConfig, log, protocol, upstreamOrigin)
                 : null;
+    if (protocol === null && !opts.passthrough) {
+        log("warn", `unrecognized path ${url} — not a known protocol (/chat/completions, /v1/messages, /responses); forwarding unchanged`);
+    }
     const outBody: Buffer | string = prepared ? prepared.body : bodyBuffer;
     if (prepared) acquireInFlight(prepared.session);
     try {
@@ -264,7 +267,7 @@ function prepareAnthropic(
     const parsed = JSON.parse(bodyBuffer.toString("utf8")) as AnthropicRequestBody;
     const stream = parsed.stream === true;
     const sessionHeader = headerValue(req, opts.sessionHeader);
-    const sessionId = deriveProxySessionId(req.headers, protocol, upstreamOrigin, "", { clientConversation: conversationSignalAnthropic(parsed, sessionHeader) });
+    const sessionId = deriveProxySessionId(req.headers, protocol, upstreamOrigin, conversationSignalAnthropic(parsed, sessionHeader));
     const session = getSession(sessionId, { protocol, upstreamOrigin });
     session.requests++;
 
@@ -321,7 +324,7 @@ function prepareOpenai(
     const parsed = JSON.parse(bodyBuffer.toString("utf8")) as OpenAIRequestBody;
     const stream = parsed.stream === true;
     const sessionHeader = headerValue(req, opts.sessionHeader);
-    const sessionId = deriveProxySessionId(req.headers, protocol, upstreamOrigin, "", { clientConversation: conversationSignalOpenai(parsed, sessionHeader) });
+    const sessionId = deriveProxySessionId(req.headers, protocol, upstreamOrigin, conversationSignalOpenai(parsed, sessionHeader));
     const session = getSession(sessionId, { protocol, upstreamOrigin });
     session.requests++;
 
@@ -388,7 +391,7 @@ function prepareResponses(
     const parsed = JSON.parse(bodyBuffer.toString("utf8")) as ResponsesRequestBody;
     const stream = parsed.stream === true;
     const sessionHeader = headerValue(req, opts.sessionHeader);
-    const sessionId = deriveProxySessionId(req.headers, protocol, upstreamOrigin, "", { clientConversation: conversationSignalResponses(parsed, sessionHeader) });
+    const sessionId = deriveProxySessionId(req.headers, protocol, upstreamOrigin, conversationSignalResponses(parsed, sessionHeader));
     const session = getSession(sessionId, { protocol, upstreamOrigin });
     session.requests++;
 
@@ -584,6 +587,19 @@ async function forward(
         if (UPSTREAM_HOP_HEADERS.has(k.toLowerCase())) return;
         respHeaders[k] = v;
     });
+    // P1.2: if the upstream returned a non-2xx (auth, rate-limit, context too
+    // long, ...), do NOT route the error body through the SSE rewriter — it has
+    // no SSE events and would be silently swallowed, leaving the client with
+    // an empty stream and no idea why. Pass status + body through verbatim.
+    // (writeHead is done HERE, only in the error branch, so we never double-
+    // write headers when a later branch would also call writeHead.)
+    if (!upstream.ok) {
+        res.writeHead(upstream.status, respHeaders);
+        if (upstream.body) await pipeThrough(upstream.body, res);
+        clearUpstreamTimer();
+        return;
+    }
+    // 2xx path: now safe to commit the status + headers, then stream the body.
     res.writeHead(upstream.status, respHeaders);
     if (!upstream.body) {
         res.end();
@@ -601,16 +617,6 @@ async function forward(
         prepared.compressInjected &&
         prepared.processedMessages.length > 0;
     if (!useRewriter || prepared === null) {
-        await pipeThrough(upstream.body, res);
-        clearUpstreamTimer();
-        return;
-    }
-    // P1.2: if the upstream returned a non-2xx (auth, rate-limit, context too
-    // long, ...), do NOT route the error body through the SSE rewriter — it has
-    // no SSE events and would be silently swallowed, leaving the client with
-    // an empty stream and no idea why. Pass status + body through verbatim.
-    if (!upstream.ok) {
-        res.writeHead(upstream.status, respHeaders);
         await pipeThrough(upstream.body, res);
         clearUpstreamTimer();
         return;
