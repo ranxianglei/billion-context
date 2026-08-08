@@ -275,6 +275,7 @@ var savedProviders = null;
 // ── helpers ──
 function el(id) { return document.getElementById(id); }
 function esc(s) { return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+function fmtTok(n) { if (n >= 1000000) return (n/1000000).toFixed(1)+"M"; if (n >= 1000) return (n/1000).toFixed(1)+"K"; return String(n); }
 function toast(msg, isErr) {
   var t = el("toast"); t.textContent = msg; t.className = "toast show" + (isErr ? " err" : "");
   setTimeout(function(){ t.className = "toast" + (isErr ? " err" : ""); }, 2500);
@@ -424,8 +425,15 @@ async function refreshSessions() {
     el("sess-total").textContent = ss.length + " session" + (ss.length !== 1 ? "s" : "");
     if (ss.length === 0) { el("sessions-table").innerHTML = '<div class="empty">No sessions yet. Send a request through the proxy.</div>'; return; }
     var h = '<table><tr><th>ID</th><th>Requests</th><th>Tokens saved</th><th>Last seen</th></tr>';
+    var h = '<table><tr><th>Protocol</th><th>Label</th><th>Requests</th><th>Context</th><th>Cache hit</th><th>Input</th><th>Output</th><th>Last seen</th></tr>';
     ss.forEach(function(s) {
-      h += "<tr><td class=\\"mono\\">"+esc(s.id)+"</td><td>"+s.requests+"</td><td>"+(s.tokensSaved||0)+"</td><td>"+esc(s.lastSeen)+"</td></tr>";
+      var proto = s.protocol ? esc(s.protocol) : "<span class='dim'>?</span>";
+      var label = s.label ? "<span class=\\"mono\\">"+esc(s.label.slice(0,24))+"</span>" : "<span class='dim'>—</span>";
+      var ctx = s.contextTokens ? fmtTok(s.contextTokens) : "0";
+      var ch = (s.cacheHitPct !== null && s.cacheHitPct !== undefined) ? s.cacheHitPct + "%" : "<span class='dim'>—</span>";
+      var inp = s.inputTokens ? fmtTok(s.inputTokens) : "0";
+      var out = s.outputTokens ? fmtTok(s.outputTokens) : "0";
+      h += "<tr><td>"+proto+"</td><td>"+label+"</td><td>"+s.requests+"</td><td>"+ctx+"</td><td>"+ch+"</td><td>"+inp+"</td><td>"+out+"</td><td>"+esc(s.lastSeen)+"</td></tr>";
     });
     h += "</table>";
     el("sessions-table").innerHTML = h;

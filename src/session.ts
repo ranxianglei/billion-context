@@ -14,11 +14,33 @@ export type Session = {
      *  human can tell sessions apart at a glance. */
     protocol?: "anthropic" | "openai" | "responses";
     upstreamOrigin?: string;
+    /** Human-readable conversation label (the affinity token), e.g.
+     *  "ses_abc123" from opencode's x-session-affinity, or a client-provided
+     *  id from codex's body.session_id. Pure conversation dimension — no key
+     *  or upstream — so it is safe to display. The internal `id` above is the
+     *  opaque hash that embeds everything; `label` is the friendly view. */
+    label?: string;
     state: CompressionState;
     createdAt: number;
     lastSeen: number;
     requests: number;
     tokensSaved: number;
+    /** Cumulative input (prompt) tokens billed by the upstream, summed across
+     *  all requests. "Input" = what the provider charges for the prompt. */
+    inputTokens: number;
+    /** Cumulative prompt-cache-hit tokens (the portion of input that was a
+     *  cache hit, i.e. not billed / billed at the discount rate). */
+    cachedTokens: number;
+    /** Cumulative output (completion) tokens billed by the upstream. */
+    outputTokens: number;
+    /** Number of upstream usage samples recorded (one per request that
+     *  reported usage). inputTokens/cachedTokens/outputTokens are sums over
+     *  this many samples. */
+    cacheSamples: number;
+    /** Size of the current in-context (uncompressed) portion of the
+     *  conversation, in tokens, as estimated at the last processTurn. This is
+     *  the "how full is the context window" number. */
+    contextTokens: number;
     /** Original content of compressed blocks, captured at compress time when
      *  the source messages are still present in the request. decompress reads
      *  from here instead of scanning ctx.messages (which only holds the
@@ -73,14 +95,15 @@ export async function initSessions(): Promise<void> {
     }
 }
 
-export function getSession(id: string, meta?: { protocol?: Session["protocol"]; upstreamOrigin?: string }): Session {
+export function getSession(id: string, meta?: { protocol?: Session["protocol"]; upstreamOrigin?: string; label?: string }): Session {
     const existing = sessions.get(id);
     if (existing) {
         existing.lastSeen = Date.now();
-        // Fill in protocol/upstream meta on an existing session if the caller
+        // Fill in protocol/upstream/label meta on an existing session if the caller
         // now knows it (e.g. a session was created by loadAll without meta).
         if (meta?.protocol && !existing.protocol) existing.protocol = meta.protocol;
         if (meta?.upstreamOrigin && !existing.upstreamOrigin) existing.upstreamOrigin = meta.upstreamOrigin;
+        if (meta?.label && !existing.label) existing.label = meta.label;
         return existing;
     }
     // Memory miss: try reload from disk (e.g. after LRU eviction).
@@ -97,11 +120,17 @@ export function getSession(id: string, meta?: { protocol?: Session["protocol"]; 
         id,
         protocol: meta?.protocol,
         upstreamOrigin: meta?.upstreamOrigin,
+        label: meta?.label,
         state: createInitialState(),
         createdAt: Date.now(),
         lastSeen: Date.now(),
         requests: 0,
         tokensSaved: 0,
+        inputTokens: 0,
+        cachedTokens: 0,
+        outputTokens: 0,
+        cacheSamples: 0,
+        contextTokens: 0,
         blockContents: new Map(),
         inFlight: 0,
         persisted: false,

@@ -296,13 +296,13 @@ async function handle(
                   ? conversationSignalOpenai(parsed as OpenAIRequestBody, sessionHeader)
                   : conversationSignalResponses(parsed as ResponsesRequestBody, sessionHeader);
         const sessionId = deriveProxySessionId(req.headers, protocol, upstreamOrigin, conversation);
-        const session = getSession(sessionId, { protocol, upstreamOrigin });
         // Affinity token to forward upstream: prefer the client's own session
         // header (opencode x-session-affinity, codex body.session_id); if the
         // client sent none (pi), synthesize ses_<conversation> so upstream
-        // sticky-routing / cache pools still get a stable key. See README
-        // "Session identity".
+        // sticky-routing / cache pools still get a stable key. Also stored on
+        // the session as a human-readable label for the web UI / stats.
         const affinity = affinityToken(req.headers, conversation);
+        const session = getSession(sessionId, { protocol, upstreamOrigin, label: affinity });
         // Serialize per-session: prepare (processTurn mutates state) + forward
         // (stream rewriter mutates state via compress/decompress) must not
         // interleave across concurrent requests on the same session.
@@ -380,6 +380,7 @@ function prepareAnthropic(
         const tokenCount = estimateTokensFast(msgs.map((m) => m.text ?? "").join("\n"));
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
+        session.contextTokens = tokenCount;
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit));
         processedMessages = turn.messages;
@@ -443,6 +444,7 @@ function prepareOpenai(
         const tokenCount = estimateTokensFast(msgs.map((m) => m.text ?? "").join("\n"));
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
+        session.contextTokens = tokenCount;
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit));
         processedMessages = turn.messages;
@@ -508,6 +510,7 @@ function prepareResponses(
         const tokenCount = estimateTokensFast(msgs.map((m) => m.text ?? "").join("\n"));
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" });
         session.state = turn.state;
+        session.contextTokens = tokenCount;
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit));
         processedMessages = turn.messages;
@@ -881,8 +884,16 @@ async function dumpStreamToFile(stream: ReadableStream<Uint8Array>, dir: string,
 function sendStats(res: http.ServerResponse): void {
     const sessions = listSessions().map((s) => ({
         id: s.id,
+        protocol: s.protocol,
+        upstream: s.upstreamOrigin,
+        label: s.label,
         requests: s.requests,
-        tokensSaved: s.tokensSaved,
+        contextTokens: s.contextTokens,
+        inputTokens: s.inputTokens,
+        cachedTokens: s.cachedTokens,
+        outputTokens: s.outputTokens,
+        cacheSamples: s.cacheSamples,
+        cacheHitPct: s.cacheSamples > 0 ? Math.round(s.cachedTokens / s.inputTokens * 100) : null,
         lastSeen: new Date(s.lastSeen).toISOString(),
     }));
     res.writeHead(200, { "content-type": "application/json" });

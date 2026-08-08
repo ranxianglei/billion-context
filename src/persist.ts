@@ -58,9 +58,17 @@ interface PersistedSession {
      *  field existed; treated as unknown on load (file lives under _unknown/). */
     protocol?: "anthropic" | "openai" | "responses";
     upstreamOrigin?: string;
+    /** Human-readable conversation label (affinity token). Absent on files
+     *  written before this field existed. */
+    label?: string;
     createdAt: number;
     requests: number;
     tokensSaved: number;
+    inputTokens?: number;
+    cachedTokens?: number;
+    outputTokens?: number;
+    cacheSamples?: number;
+    contextTokens?: number;
     state: CompressionState;
     /** blockContents serialized as a plain record (Maps do not survive JSON). */
     blockContents: Record<string, BlockContent>;
@@ -356,9 +364,15 @@ function buildRecord(session: Session): PersistedSession {
         id: session.id,
         protocol: session.protocol,
         upstreamOrigin: session.upstreamOrigin,
+        label: session.label,
         createdAt: session.createdAt,
         requests: session.requests,
         tokensSaved: session.tokensSaved,
+        inputTokens: session.inputTokens,
+        cachedTokens: session.cachedTokens,
+        outputTokens: session.outputTokens,
+        cacheSamples: session.cacheSamples,
+        contextTokens: session.contextTokens,
         state: session.state,
         blockContents: Object.fromEntries(session.blockContents),
     };
@@ -378,6 +392,11 @@ function buildSession(parsed: PersistedSession): Session {
         lastSeen: Date.now(),
         requests: parsed.requests ?? 0,
         tokensSaved: parsed.tokensSaved ?? 0,
+        inputTokens: parsed.inputTokens ?? 0,
+        cachedTokens: parsed.cachedTokens ?? 0,
+        outputTokens: parsed.outputTokens ?? 0,
+        cacheSamples: parsed.cacheSamples ?? 0,
+        contextTokens: parsed.contextTokens ?? 0,
         blockContents,
         inFlight: 0,
         persisted: true,

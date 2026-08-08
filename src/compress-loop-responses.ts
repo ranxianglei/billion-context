@@ -387,6 +387,13 @@ export async function* compressLoopResponsesStream(
                             const cached = inDet?.cached_tokens ?? prDet?.cached_tokens ?? "?";
                             const out = usage.output_tokens ?? "?";
                             loggerLog("info", `[acp-usage] round ${loopCount} input=${prompt} cached=${cached} output=${out}${cached !== "?" && cached !== 0 && prompt !== "?" ? ` (cache hit ${Math.round(Number(cached) / Number(prompt) * 100)}%)` : ""}`);
+                            // Record into the session for the web UI / stats.
+                            if (typeof prompt === "number") {
+                                ctx.session.inputTokens += prompt;
+                                if (typeof cached === "number") ctx.session.cachedTokens += cached;
+                                if (typeof out === "number") ctx.session.outputTokens += out;
+                                ctx.session.cacheSamples += 1;
+                            }
                         }
                     }
                 }

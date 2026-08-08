@@ -343,6 +343,12 @@ export async function* compressLoopStream(
             if (typeof prompt === "number") {
                 const ch = typeof cached === "number" ? cached : 0;
                 loggerLog("info", `[acp-usage] round ${loopCount} input=${prompt} cached=${typeof cached === "number" ? cached : "?"} output=${out ?? "?"}${ch > 0 ? ` (cache hit ${Math.round(ch / prompt * 100)}%)` : ""}`);
+                // Record into the session for the web UI / stats: cumulative
+                // tokens + cache-hit ratio across all rounds seen so far.
+                ctx.session.inputTokens += prompt;
+                if (typeof cached === "number") ctx.session.cachedTokens += cached;
+                if (typeof out === "number") ctx.session.outputTokens += out;
+                ctx.session.cacheSamples += 1;
             }
         }
 
