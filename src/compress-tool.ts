@@ -1,4 +1,5 @@
 import { COMPRESS_PHILOSOPHY, HOW_TO_COMPRESS_RULES } from "acp-kernel";
+import { log as loggerLog } from "./logger.js";
 
 export const COMPRESS_TOOL_NAME = "compress";
 
@@ -44,7 +45,7 @@ export type ParsedRange = {
 
 export function parseCompressInput(input: unknown): ParsedRange[] {
     if (!input || typeof input !== "object") {
-        console.error(`[acp-compress-input] rejected: not object (${typeof input})`);
+        loggerLog("warn", `[acp-compress-input] rejected: not object (${typeof input})`);
         return [];
     }
     const obj = input as Record<string, unknown>;
@@ -52,11 +53,11 @@ export function parseCompressInput(input: unknown): ParsedRange[] {
         const out = obj.content
             .map((r) => toRange(r as Record<string, unknown>))
             .filter((r): r is ParsedRange => r !== null);
-        if (out.length === 0) console.error(`[acp-compress-input] content array but 0 valid ranges. keys per item: ${obj.content.map((c) => Object.keys(c ?? {}).join(",")).join(" | ")}`);
+        if (out.length === 0) loggerLog("warn", `[acp-compress-input] content array but 0 valid ranges. keys per item: ${obj.content.map((c) => Object.keys(c ?? {}).join(",")).join(" | ")}`);
         return out;
     }
     const single = toRange(obj);
-    if (!single) console.error(`[acp-compress-input] no content array, single-parse failed. top keys: ${Object.keys(obj).join(",")}`);
+    if (!single) loggerLog("warn", `[acp-compress-input] no content array, single-parse failed. top keys: ${Object.keys(obj).join(",")}`);
     return single ? [single] : [];
 }
 
