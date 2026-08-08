@@ -1,6 +1,6 @@
 import http from "node:http";
 import fs from "node:fs";
-import { createCore, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, estimateTokensFast, renderNudgeText } from "acp-kernel";
+import { createCore, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, estimateTokensFast, renderNudgeText, deactivateBlock } from "acp-kernel";
 import type { ProxyOptions } from "./config.js";
 import { lookupContextLimit } from "./config.js";
 import { fetchWithTimeout, MAX_REQUEST_BYTES } from "./fetch-util.js";
@@ -33,6 +33,7 @@ import {
 import { getSession, listSessions, type Session } from "./session.js";
 import { COMPRESS_TOOL, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressTextSystemPrompt } from "./compress-tool.js";
 import { rewriteSseStream, rewriteJsonResponse, type RewriteCtx } from "./stream.js";
+import { reapOrphanBlocks } from "./orphan-gc.js";
 import { compressLoopStream } from "./compress-loop.js";
 import { compressLoopResponsesStream } from "./compress-loop-responses.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
@@ -236,6 +237,7 @@ function prepareAnthropic(
         session.state = turn.state;
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         processedMessages = applyCondense(turn.messages, opts, session);
+        reapOrphanBlocks(session, turn.messages, deactivateBlock);
         rebuiltMessages = coreToAnthropic(processedMessages);
 
         systemOut = injectSystem(parsed, opts);
@@ -291,6 +293,7 @@ function prepareOpenai(
         session.state = turn.state;
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         processedMessages = applyCondense(turn.messages, opts, session);
+        reapOrphanBlocks(session, turn.messages, deactivateBlock);
         rebuiltMessages = coreToOpenai(processedMessages);
 
         // ONLY the static compress prompt goes into the system message — the
@@ -354,6 +357,7 @@ function prepareResponses(
         session.state = turn.state;
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         processedMessages = applyCondense(turn.messages, opts, session);
+        reapOrphanBlocks(session, turn.messages, deactivateBlock);
         // Rebuild input preserving the responses_lite contract:
         //   input[0]   = additional_tools (host directive, verbatim)
         //   input[1]   = developer message (base instructions + compress prompt)

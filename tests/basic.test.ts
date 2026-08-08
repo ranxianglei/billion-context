@@ -101,10 +101,10 @@ test("deriveSessionId prefers explicit header", () => {
     assert.equal(fromHeader, "my-session-id");
 });
 
-test("anthropicToCore assigns raw ids that never collide with kernel mNNNNN refs", () => {
+test("anthropicToCore assigns h_* ids that never collide with kernel mNNNNN refs", () => {
     const { msgs } = anthropicToCore(bigToolResult("hello"));
     for (const m of msgs) {
-        assert.ok(m.id.startsWith("raw-"), `id "${m.id}" should be raw-* (not m-prefixed)`);
+        assert.ok(m.id.startsWith("h_"), `id "${m.id}" should be h_* (not m-prefixed)`);
         assert.ok(!/^m\d{5}$/.test(m.id), `id "${m.id}" must not look like a kernel ref`);
     }
 });
@@ -165,11 +165,11 @@ function openaiBody(): OpenAIRequestBody {
     };
 }
 
-test("openaiToCore assigns raw-* ids distinct from mNNNNN refs", () => {
+test("openaiToCore assigns h_* ids distinct from mNNNNN refs", () => {
     const { msgs } = openaiToCore(openaiBody());
     assert.ok(msgs.length >= 5);
     for (const m of msgs) {
-        assert.ok(m.id.startsWith("raw-"), `id "${m.id}" must be raw-*`);
+        assert.ok(m.id.startsWith("h_"), `id "${m.id}" must be h_*`);
     }
     const toolResult = msgs.find((m) => m.contentType === "tool-result");
     assert.ok(toolResult, "should have a tool-result node");

@@ -1,6 +1,7 @@
 import type { CoreMessage } from "acp-kernel";
 import { condenseOldToolResults, type CondenseOptions, type CondenseResult } from "./anthropic.js";
 import { hashId } from "./util.js";
+import { ClusterCounter, deriveMessageId } from "./message-id.js";
 
 /**
  * OpenAI Responses API protocol shapes.
@@ -113,9 +114,11 @@ export function responsesToCore(body: ResponsesRequestBody): Flat {
         systemParts.push(body.instructions);
     }
     let idx = 0;
+    const clusters = new ClusterCounter();
     const items = Array.isArray(body.input) ? body.input : [];
     if (typeof body.input === "string") {
-        msgs.push({ id: `raw-${idx}`, role: "user", contentType: "text", text: body.input });
+        const base = deriveMessageId("user", "text", body.input);
+        msgs.push({ id: clusters.next(base), role: "user", contentType: "text", text: body.input });
         idx++;
         return { msgs, systemParts, preamble, customToolCallIds };
     }
@@ -134,11 +137,13 @@ export function responsesToCore(body: ResponsesRequestBody): Flat {
                 if (m.role === "system" || m.role === "developer") {
                     systemParts.push(text);
                 } else if (m.role === "user") {
-                    msgs.push({ id: `raw-${idx}`, role: "user", contentType: "text", text });
+                    const base = deriveMessageId("user", "text", text);
+                    msgs.push({ id: clusters.next(base), role: "user", contentType: "text", text });
                     idx++;
                 } else if (m.role === "assistant") {
                     if (text) {
-                        msgs.push({ id: `raw-${idx}`, role: "assistant", contentType: "text", text });
+                        const base = deriveMessageId("assistant", "text", text);
+                        msgs.push({ id: clusters.next(base), role: "assistant", contentType: "text", text });
                         idx++;
                     }
                 }
@@ -146,8 +151,12 @@ export function responsesToCore(body: ResponsesRequestBody): Flat {
             }
             case "function_call": {
                 const fc = it as ResponseFunctionCall;
+                const base = deriveMessageId("assistant", "tool-call", fc.arguments ?? "", {
+                    toolCallId: fc.call_id,
+                    toolName: fc.name,
+                });
                 msgs.push({
-                    id: `raw-${idx}`,
+                    id: clusters.next(base),
                     role: "assistant",
                     contentType: "tool-call",
                     toolName: fc.name,
@@ -159,12 +168,14 @@ export function responsesToCore(body: ResponsesRequestBody): Flat {
             }
             case "function_call_output": {
                 const fco = it as ResponseFunctionCallOutput;
+                const outText = typeof fco.output === "string" ? fco.output : JSON.stringify(fco.output);
+                const base = deriveMessageId("tool", "tool-result", outText, { toolCallId: fco.call_id });
                 msgs.push({
-                    id: `raw-${idx}`,
+                    id: clusters.next(base),
                     role: "tool",
                     contentType: "tool-result",
                     toolCallId: fco.call_id,
-                    text: typeof fco.output === "string" ? fco.output : JSON.stringify(fco.output),
+                    text: outText,
                 });
                 idx++;
                 break;
@@ -173,13 +184,18 @@ export function responsesToCore(body: ResponsesRequestBody): Flat {
                 const ctc = it as { call_id?: string; name?: string; input?: string; arguments?: string };
                 const callId = ctc.call_id ?? `call_${idx}`;
                 customToolCallIds.add(callId);
+                const argText = ctc.input ?? ctc.arguments ?? "";
+                const base = deriveMessageId("assistant", "tool-call", argText, {
+                    toolCallId: callId,
+                    toolName: ctc.name ?? "custom",
+                });
                 msgs.push({
-                    id: `raw-${idx}`,
+                    id: clusters.next(base),
                     role: "assistant",
                     contentType: "tool-call",
                     toolName: ctc.name ?? "custom",
                     toolCallId: callId,
-                    text: ctc.input ?? ctc.arguments ?? "",
+                    text: argText,
                 });
                 idx++;
                 break;
@@ -188,12 +204,14 @@ export function responsesToCore(body: ResponsesRequestBody): Flat {
                 const ctco = it as { call_id?: string; output?: string };
                 const callId = ctco.call_id ?? `call_${idx}`;
                 customToolCallIds.add(callId);
+                const outText = typeof ctco.output === "string" ? ctco.output : JSON.stringify(ctco.output ?? "");
+                const base = deriveMessageId("tool", "tool-result", outText, { toolCallId: callId });
                 msgs.push({
-                    id: `raw-${idx}`,
+                    id: clusters.next(base),
                     role: "tool",
                     contentType: "tool-result",
                     toolCallId: callId,
-                    text: typeof ctco.output === "string" ? ctco.output : JSON.stringify(ctco.output ?? ""),
+                    text: outText,
                 });
                 idx++;
                 break;

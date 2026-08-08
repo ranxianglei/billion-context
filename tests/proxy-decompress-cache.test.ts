@@ -20,7 +20,7 @@ function compressARange() {
     const msgs: CoreMessage[] = [];
     for (let i = 0; i < 12; i++) {
         msgs.push({
-            id: `raw-${i}`,
+            id: `h_${i}`,
             role: i % 2 === 0 ? "user" : "assistant",
             contentType: "text",
             text: `\x3cacp tokens="2K" type="text"\x3em${String(i + 1).padStart(5, "0")}\x3c/acp\x3e\nHistorical detail ${i}. ${"x".repeat(2000)}`,

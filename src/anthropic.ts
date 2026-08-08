@@ -1,5 +1,6 @@
 import type { CoreMessage } from "acp-kernel";
 import { hashId } from "./util.js";
+import { ClusterCounter, deriveMessageId } from "./message-id.js";
 
 export type AnthropicTextBlock = { type: "text"; text: string; cache_control?: unknown };
 export type AnthropicToolUse = {
@@ -61,19 +62,23 @@ type Flat = { msgs: CoreMessage[] };
 
 export function anthropicToCore(body: AnthropicRequestBody): Flat {
     const msgs: CoreMessage[] = [];
-    let idx = 0;
+    const clusters = new ClusterCounter();
     for (const m of body.messages) {
         const blocks = typeof m.content === "string" ? [{ type: "text" as const, text: m.content }] : m.content;
         for (const b of blocks) {
-            const id = `raw-${idx}`;
-            idx++;
             switch (b.type) {
-                case "text":
-                    msgs.push({ id, role: m.role, contentType: "text", text: b.text });
+                case "text": {
+                    const base = deriveMessageId(m.role, "text", b.text);
+                    msgs.push({ id: clusters.next(base), role: m.role, contentType: "text", text: b.text });
                     break;
-                case "tool_use":
+                }
+                case "tool_use": {
+                    const base = deriveMessageId("assistant", "tool-call", safeStringify(b.input), {
+                        toolCallId: b.id,
+                        toolName: b.name,
+                    });
                     msgs.push({
-                        id,
+                        id: clusters.next(base),
                         role: "assistant",
                         contentType: "tool-call",
                         toolName: b.name,
@@ -81,10 +86,12 @@ export function anthropicToCore(body: AnthropicRequestBody): Flat {
                         text: safeStringify(b.input),
                     });
                     break;
+                }
                 case "tool_result": {
                     const text = typeof b.content === "string" ? b.content : b.content.map((c) => c.text).join("\n");
+                    const base = deriveMessageId("tool", "tool-result", text, { toolCallId: b.tool_use_id });
                     msgs.push({
-                        id,
+                        id: clusters.next(base),
                         role: "tool",
                         contentType: "tool-result",
                         toolCallId: b.tool_use_id,
@@ -92,12 +99,16 @@ export function anthropicToCore(body: AnthropicRequestBody): Flat {
                     });
                     break;
                 }
-                case "thinking":
-                    msgs.push({ id, role: "assistant", contentType: "reasoning", text: b.thinking });
+                case "thinking": {
+                    const base = deriveMessageId("assistant", "reasoning", b.thinking);
+                    msgs.push({ id: clusters.next(base), role: "assistant", contentType: "reasoning", text: b.thinking });
                     break;
-                case "image":
-                    msgs.push({ id, role: m.role, contentType: "text", text: "[image]" });
+                }
+                case "image": {
+                    const base = deriveMessageId(m.role, "text", "[image]");
+                    msgs.push({ id: clusters.next(base), role: m.role, contentType: "text", text: "[image]" });
                     break;
+                }
             }
         }
     }

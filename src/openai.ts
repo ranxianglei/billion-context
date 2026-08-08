@@ -1,6 +1,7 @@
 import type { CoreMessage } from "acp-kernel";
 import { condenseOldToolResults, type CondenseOptions, type CondenseResult } from "./anthropic.js";
 import { hashId } from "./util.js";
+import { ClusterCounter, deriveMessageId } from "./message-id.js";
 
 export type OpenAIContentPart =
     | { type: "text"; text: string }
@@ -38,50 +39,55 @@ type Flat = { msgs: CoreMessage[] };
 
 export function openaiToCore(body: OpenAIRequestBody): Flat {
     const msgs: CoreMessage[] = [];
-    let idx = 0;
+    const clusters = new ClusterCounter();
     for (const m of body.messages) {
         switch (m.role) {
             case "system":
             case "developer": {
-                msgs.push({ id: `raw-${idx}`, role: "system", contentType: "text", text: stringContent(m.content) });
-                idx++;
+                const base = deriveMessageId(m.role, "text", stringContent(m.content));
+                msgs.push({ id: clusters.next(base), role: "system", contentType: "text", text: stringContent(m.content) });
                 break;
             }
             case "user": {
-                msgs.push({ id: `raw-${idx}`, role: "user", contentType: "text", text: stringContent(m.content) });
-                idx++;
+                const base = deriveMessageId("user", "text", stringContent(m.content));
+                msgs.push({ id: clusters.next(base), role: "user", contentType: "text", text: stringContent(m.content) });
                 break;
             }
             case "assistant": {
                 const text = stringContent(m.content);
                 if (text) {
-                    msgs.push({ id: `raw-${idx}`, role: "assistant", contentType: "text", text });
-                    idx++;
+                    const base = deriveMessageId("assistant", "text", text);
+                    msgs.push({ id: clusters.next(base), role: "assistant", contentType: "text", text });
                 }
                 if (Array.isArray(m.tool_calls)) {
                     for (const tc of m.tool_calls) {
+                        const base = deriveMessageId("assistant", "tool-call", tc.function.arguments ?? "", {
+                            toolCallId: tc.id,
+                            toolName: tc.function.name,
+                        });
                         msgs.push({
-                            id: `raw-${idx}`,
+                            id: clusters.next(base),
                             role: "assistant",
                             contentType: "tool-call",
                             toolName: tc.function.name,
                             toolCallId: tc.id,
                             text: tc.function.arguments ?? "",
                         });
-                        idx++;
                     }
                 }
                 break;
             }
             case "tool": {
+                const base = deriveMessageId("tool", "tool-result", stringContent(m.content), {
+                    toolCallId: m.tool_call_id ?? "",
+                });
                 msgs.push({
-                    id: `raw-${idx}`,
+                    id: clusters.next(base),
                     role: "tool",
                     contentType: "tool-result",
                     toolCallId: m.tool_call_id ?? "",
                     text: stringContent(m.content),
                 });
-                idx++;
                 break;
             }
         }
