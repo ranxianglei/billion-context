@@ -1,5 +1,6 @@
 import { defaultConfig, type Config } from "acp-kernel";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { configFile } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 
@@ -190,6 +191,40 @@ function loadConfigFile(): FileConfig {
         return parsed as FileConfig;
     }
     return {};
+}
+
+/** Template written on first run so the user has something concrete to edit
+ *  instead of having to invent the schema. Demonstrates both provider forms:
+ *  a bare string (simplest) and an object with per-model context windows.
+ *  The API key is intentionally NOT here — it lives in the client, and the
+ *  proxy passes it through untouched. */
+const TEMPLATE_CONFIG = `{
+  "providers": {
+    "anthropic": "https://api.anthropic.com",
+    "zhipu": {
+      "url": "https://open.bigmodel.cn",
+      "models": {
+        "glm-5.2": { "context": 1000000, "output": 131072 }
+      }
+    }
+  }
+}`;
+
+/** On first run, seed a template config file next to where loadOptions reads.
+ *  Idempotent: never overwrites an existing file. Returns true if it created
+ *  one. Non-fatal: if the dir isn't writable, we fall through to defaults and
+ *  the proxy still runs. */
+export function ensureConfigTemplate(): boolean {
+    const p = configFile();
+    if (existsSync(p)) return false;
+    try {
+        mkdirSync(dirname(p), { recursive: true });
+        writeFileSync(p, TEMPLATE_CONFIG + "\n", "utf8");
+        loggerLog("info", `[acp-config] created config template at ${p} — edit it with your providers, then restart`);
+        return true;
+    } catch {
+        return false;
+    }
 }
 
 function parseRouteEntry(v: unknown): ProviderRoute | undefined {

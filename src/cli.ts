@@ -17,7 +17,7 @@
  * for the full config-file schema (which also supports `debug`, `port`, etc.
  * — flags are just convenient overrides).
  */
-import { loadOptions } from "./config.js";
+import { loadOptions, ensureConfigTemplate } from "./config.js";
 import { startServer } from "./server.js";
 import { configFile as defaultConfigFile } from "./paths.js";
 import { checkForUpdate, startAutoUpdate } from "./update.js";
@@ -171,6 +171,9 @@ export async function main(): Promise<void> {
     for (const [k, v] of Object.entries(overrides)) {
         if (v !== undefined) process.env[k] = v;
     }
+    // First run: seed a template config so the user has a file to edit rather
+    // than a bare error. No-op if it already exists.
+    ensureConfigTemplate();
     const opts = loadOptions();
     await startServer(opts);
 

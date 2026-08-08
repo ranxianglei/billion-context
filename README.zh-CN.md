@@ -40,53 +40,146 @@ npm install -g billion-context
 
 这会安装 `bili` 命令(`bili-proxy` 保留为别名)。
 
-## 用法
+## 快速上手
 
-### 启动代理
+三步:**启动代理 → 编辑配置文件 → 把客户端指向它**。
+压缩是自动注入的 —— 你只需配置路由,无需配置压缩本身。
+
+### 第 1 步 —— 启动代理
 
 ```bash
 bili
 ```
 
-就这么简单。代理从 `~/.config/billion-context/billion-context.json`(XDG)读取配置,监听 `127.0.0.1:8787`。如果配置文件还不存在,会用合理默认值,并打印期望的文件位置。
+它监听 `http://127.0.0.1:8787`。保持这个终端开着(或后台运行,见[运行代理](#运行代理))。
 
-### 快速覆盖(命令行参数)
+首次运行 `bili` 会**自动创建一份配置模板**,并告诉你路径,这样你不用凭空搛 schema:
 
-```bash
-bili --port 9000              # 改监听端口
-bili --host 0.0.0.0           # 监听所有网卡
-bili --debug                 # 详细日志(也可在配置里设 "debug": true)
-bili --passthrough           # 不压缩直接转发(冒烟测试模式)
-bili --config ~/my-bili.json # 用别的配置文件
+```
+[acp-config] created config template at ~/.config/billion-context/billion-context.json — edit it with your providers, then restart
 ```
 
-参数优先级高于配置文件和环境变量。`bili --help` 列出全部。
+### 第 2 步 —— 编辑配置文件
 
-### 把你的助手指向代理
+打开第 1 步创建的文件(`~/.config/billion-context/billion-context.json`),
+编辑 `providers` 块,填入你付费使用的 provider。每个条目是一个
+**名字 → URL** 映射;这个名字就是你在第 3 步里写进客户端 base URL 的东西。
 
-代理按 **URL 路径里的 provider 名**路由。把助手的 base URL 设为 `http://localhost:8787/<provider>/...`,代理就转发到该 provider(如何在配置里声明 provider 见[配置](#配置))。
+```json
+{
+  "providers": {
+    "anthropic": "https://api.anthropic.com",
+    "zhipu": {
+      "url": "https://open.bigmodel.cn",
+      "models": {
+        "glm-5.2": { "context": 1000000, "output": 131072 }
+      }
+    }
+  }
+}
+```
+
+- 删掉你不用的 provider。
+- 添加其他的(例如 `"deepseek": "https://api.deepseek.com"`)。
+- API key **不**写在这里 —— key 在客户端那边,代理原样透传。
+
+保存后**重启 `bili`**。启动行列出你的路由:
+
+```
+acp-proxy listening on http://127.0.0.1:8787 — routes: anthropic=https://api.anthropic.com, zhipu=https://open.bigmodel.cn
+```
+
+这证明代理读到了你的配置。(完整 schema —— 按模型的 context 窗口、可选字段 —— 见[配置](#配置)。)
+
+### 第 3 步 —— 把客户端指向代理
+
+把客户端的 base URL 设为 `http://localhost:8787/<provider>/...`。provider 名是路径第一段,剩余路径原样转发。用你的**真实** API key 启动客户端。
+
+#### Pi(带 billion-context-pi 扩展)
+
+Pi 是 **Anthropic** 客户端。指向你在第 2 步声明的 `anthropic` 路由:
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:8787/anthropic
+export ANTHROPIC_API_KEY=sk-ant-...   # 你的真实 key
+pi-stable   # 或: pi
+```
+
+#### OpenCode
+
+OpenCode 默认也是 **Anthropic** 客户端(它说 Messages API)。指向 `anthropic`:
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:8787/anthropic
+export ANTHROPIC_API_KEY=sk-ant-...
+opencode
+```
+
+如果你的 OpenCode provider 是 OpenAI 兼容的(例如智谱 GLM),改为在
+`opencode.json` 里把该 provider 的 `baseURL` 设为
+`http://localhost:8787/zhipu/api/coding/paas/v4` —— 同样的路由规则,只是配置位置不同。
+
+#### Codex
+
+Codex 是 **OpenAI** 客户端(Responses API)。指向一个 OpenAI 兼容路由。
+走 `zhipu` 路由用智谱 GLM:
+
+```bash
+export OPENAI_BASE_URL=http://localhost:8787/zhipu/api/coding/paas/v4
+export OPENAI_API_KEY=<你的真实智谱 key>
+codex
+```
+
+> Codex 的 Responses API 需要上游说 Responses 协议。多数区域性 OpenAI
+> 兼容端点只说 `/chat/completions`;如果你的端点在 `/responses` 上 404,
+> 用一个说 Responses 的中转(如 `comfly`),或用官方 OpenAI API。
 
 #### Claude Code(Anthropic)
 
 ```bash
 export ANTHROPIC_BASE_URL=http://localhost:8787/anthropic
-export ANTHROPIC_API_KEY=sk-ant-...   # 真实 key —— 原样透传
+export ANTHROPIC_API_KEY=sk-ant-...
 claude
 ```
 
-#### Codex / 任意 OpenAI 兼容助手(智谱 / openai / deepseek)
+#### 其他客户端(Cursor / Aider / Continue …)
+
+任何允许设置 base URL 的客户端都能用。设为
+`http://localhost:8787/<provider>` —— `anthropic`、`zhipu`、`deepseek`,
+你在第 2 步起了什么名就用什么。
+
+### 验证
+
+代理跑着、配置保存了之后,确认它能应答,并且第一个真实请求在日志里显示压缩活动:
 
 ```bash
-export OPENAI_BASE_URL=http://localhost:8787/zhipu/api/coding/paas/v4
-export OPENAI_API_KEY=<你的真实智谱 key>   # 原样透传
-codex
+# 健康检查(代理是否在跑 + 转发到哪)
+curl -s http://localhost:8787/__acp/health
+# → {"ok":true,"upstream":"https://api.anthropic.com"}
+
+# 实时会话统计(发过真实请求后)
+curl -s http://localhost:8787/__acp/stats
 ```
 
-`/zhipu/...` 前缀告诉代理路由到 `zhipu` provider;剩余路径保留不变。
+然后从助手发一条消息,观察日志(`~/.local/state/billion-context/bili.log`,
+同时也打到 stderr)。每个请求应该看到一行 `processTurn`,等对话变长后
+会出现 `[acp-usage] round N input=X cached=Y (cache hit Z%)` + `compress` 事件。
 
-#### Cursor / Aider / 其他
+## 运行代理
 
-在助手设置里把 base URL 设为 `http://localhost:8787/<provider>`。
+### 命令行参数
+
+```bash
+bili --port 9000              # 改监听端口
+bili --host 0.0.0.0           # 监听所有网卡(见下面的 host 说明)
+bili --debug                 # 详细日志(也可在配置里设 "debug": true)
+bili --passthrough           # 不压缩直接转发(冒烟测试模式)
+bili --config ~/my-bili.json # 用别的配置文件
+bili update                  # 立即检查并安装新版本(跳过节流)
+bili --no-auto-update        # 本次启动禁用自动更新
+```
+
+参数优先级高于环境变量和配置文件。`bili --help` 列出全部。
 
 ### 调试
 
@@ -100,11 +193,10 @@ codex
 
 ### 日志文件
 
-所有日志**默认同时写入文件**:`~/.local/state/billion-context/bili.log`(XDG state 目录)。同时仍打印到 stderr,所以前台运行 `bili start` 时终端也能看到。
+所有日志**默认同时写入文件**:`~/.local/state/billion-context/bili.log`
+(XDG state 目录)。同时仍打印到 stderr,所以前台运行 `bili start` 时终端也能看到。
 
 ```bash
-bili start                # 日志 → ~/.local/state/billion-context/bili.log + 终端
-bili update               # (见下文)
 # 配置: "logFile": "/custom/path.log"
 # 环境变量: ACP_LOG_FILE=/custom/path.log   (或 ACP_LOG_FILE=off 关闭文件,只保留 stderr)
 ```
@@ -114,11 +206,6 @@ bili update               # (见下文)
 ### 自动更新
 
 代理启动时和每 3 分钟检查 npm 是否有新版本。发现新版本就全局安装(`npm install -g`)并打印通知 —— **重启 `bili` 才能生效**。
-
-```bash
-bili update          # 立即检查并安装(手动,跳过 3 分钟节流)
-bili --no-auto-update   # 本次启动禁用自动更新
-```
 
 永久禁用:配置(`"autoUpdate": false`)或环境变量(`ACP_AUTO_UPDATE=0`)。
 
@@ -234,7 +321,7 @@ bili --no-auto-update   # 本次启动禁用自动更新
 
 ### 路由
 
-用 provider 名作为路径段把任意助手指向代理。代理剥离该名字并转发到该 provider 的根 URL。
+用 provider 名作为路径段把任意助手指向代理。代理剥离该名字并转发到该 provider 的根 URL。完整的助手配置示例见[快速上手,第 2 步](#第-2-步--把助手指向代理);请求 URL 如何重写的机制:
 
 ```
 助手 baseURL:   http://localhost:8787/zhipu/api/coding/paas/v4
@@ -243,23 +330,9 @@ bili --no-auto-update   # 本次启动禁用自动更新
                      + provider 名        (原样转发)
 ```
 
-#### Claude Code(Anthropic)
-
-```bash
-export ANTHROPIC_BASE_URL=http://localhost:8787/anthropic
-export ANTHROPIC_API_KEY=sk-ant-...   # 真实 key —— 原样透传
-claude
-```
-
-#### Codex / 任意 OpenAI 兼容助手(智谱 / openai / deepseek)
-
-```bash
-export OPENAI_BASE_URL=http://localhost:8787/zhipu/api/coding/paas/v4
-export OPENAI_API_KEY=<你的真实智谱 key>   # 原样透传
-codex
-```
-
-`/zhipu/...` 前缀告诉代理路由到 `zhipu` provider;剩余 `/api/coding/paas/v4/...` 路径保留不变。
+**未配置任何 providers**(比如你清空了 `providers` 块)时,provider 名这步被跳过
+—— 每个请求按完整原始路径转发到默认 `upstream`。这是个边缘场景;
+正常流程是声明 providers 并按名字路由,见快速上手。
 
 ### Provider 名注意事项
 
