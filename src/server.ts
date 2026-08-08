@@ -317,7 +317,7 @@ function prepareAnthropic(
     let toolsOut = parsed.tools;
 
     try {
-        const { msgs } = anthropicToCore(parsed);
+        const { msgs, cacheControls } = anthropicToCore(parsed);
         const tokenCount = estimateTokensFast(msgs.map((m) => m.text ?? "").join("\n"));
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
@@ -325,7 +325,7 @@ function prepareAnthropic(
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit));
         processedMessages = turn.messages;
         reapOrphanBlocks(session, msgs, deactivateBlock);
-        rebuiltMessages = coreToAnthropic(processedMessages);
+        rebuiltMessages = coreToAnthropic(processedMessages, cacheControls);
 
         systemOut = injectSystem(parsed, opts);
         if (opts.compress.injectTool) {

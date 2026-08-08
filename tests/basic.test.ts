@@ -52,6 +52,38 @@ test("anthropicToCore + coreToAnthropic round-trips tool_use and tool_result", (
     assert.equal(tr.tool_use_id, "t1");
 });
 
+test("cache_control survives the anthropicToCore → coreToAnthropic round-trip", () => {
+    const body: AnthropicRequestBody = {
+        messages: [
+            { role: "user" as const, content: [{ type: "text", text: "hello", cache_control: { type: "ephemeral" } }] },
+            { role: "assistant" as const, content: [{ type: "tool_use", id: "t1", name: "Bash", input: { cmd: "ls" }, cache_control: { type: "ephemeral" } }] },
+            { role: "user" as const, content: [{ type: "tool_result", tool_use_id: "t1", content: "ok", cache_control: { type: "ephemeral" } }] },
+        ],
+    };
+    const { msgs, cacheControls } = anthropicToCore(body);
+    assert.equal(cacheControls.size, 3);
+    for (const m of msgs) {
+        assert.ok(cacheControls.has(m.id), `message ${m.id} should have cache_control`);
+    }
+    const rebuilt = coreToAnthropic(msgs, cacheControls);
+    const textBlock = (rebuilt[0]!.content as unknown[])[0] as { cache_control?: unknown };
+    assert.deepEqual(textBlock.cache_control, { type: "ephemeral" });
+    const tuBlock = (rebuilt[1]!.content as unknown[])[0] as { cache_control?: unknown };
+    assert.deepEqual(tuBlock.cache_control, { type: "ephemeral" });
+    const trBlock = (rebuilt[2]!.content as unknown[])[0] as { cache_control?: unknown };
+    assert.deepEqual(trBlock.cache_control, { type: "ephemeral" });
+});
+
+test("coreToAnthropic without cacheControls produces no cache_control", () => {
+    const body: AnthropicRequestBody = {
+        messages: [{ role: "user" as const, content: [{ type: "text", text: "hi" }] }],
+    };
+    const { msgs } = anthropicToCore(body);
+    const rebuilt = coreToAnthropic(msgs);
+    const block = (rebuilt[0]!.content as unknown[])[0] as { cache_control?: unknown };
+    assert.equal(block.cache_control, undefined);
+});
+
 test("conversationSignalAnthropic is stable for same first message, differs otherwise", () => {
     const body = bigToolResult("hello");
     const a = conversationSignalAnthropic(body);

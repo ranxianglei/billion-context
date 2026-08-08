@@ -51,16 +51,17 @@ export function extractSystem(system: AnthropicRequestBody["system"]): string {
 
 export function buildSystem(text: string, original: AnthropicRequestBody["system"]): string | AnthropicTextBlock[] {
     if (Array.isArray(original) && original.length > 0) {
-        const cc = original[0]?.cache_control;
-        return [{ type: "text", text, ...(cc ? { cache_control: cc } : {}) }];
+        const ccBlock = original.find((b) => b.cache_control);
+        return [{ type: "text", text, ...(ccBlock ? { cache_control: ccBlock.cache_control } : {}) }];
     }
     return text;
 }
 
-type Flat = { msgs: CoreMessage[] };
+type Flat = { msgs: CoreMessage[]; cacheControls: Map<string, unknown> };
 
 export function anthropicToCore(body: AnthropicRequestBody): Flat {
     const msgs: CoreMessage[] = [];
+    const cacheControls = new Map<string, unknown>();
     const clusters = new ClusterCounter();
     for (const m of body.messages) {
         const blocks = typeof m.content === "string" ? [{ type: "text" as const, text: m.content }] : m.content;
@@ -68,7 +69,9 @@ export function anthropicToCore(body: AnthropicRequestBody): Flat {
             switch (b.type) {
                 case "text": {
                     const base = deriveMessageId(m.role, "text", b.text);
-                    msgs.push({ id: clusters.next(base), role: m.role, contentType: "text", text: b.text });
+                    const id = clusters.next(base);
+                    msgs.push({ id, role: m.role, contentType: "text", text: b.text });
+                    if (b.cache_control) cacheControls.set(id, b.cache_control);
                     break;
                 }
                 case "tool_use": {
@@ -76,26 +79,30 @@ export function anthropicToCore(body: AnthropicRequestBody): Flat {
                         toolCallId: b.id,
                         toolName: b.name,
                     });
+                    const id = clusters.next(base);
                     msgs.push({
-                        id: clusters.next(base),
+                        id,
                         role: "assistant",
                         contentType: "tool-call",
                         toolName: b.name,
                         toolCallId: b.id,
                         text: safeStringify(b.input),
                     });
+                    if (b.cache_control) cacheControls.set(id, b.cache_control);
                     break;
                 }
                 case "tool_result": {
                     const text = typeof b.content === "string" ? b.content : b.content.map((c) => c.text).join("\n");
                     const base = deriveMessageId("tool", "tool-result", text, { toolCallId: b.tool_use_id });
+                    const id = clusters.next(base);
                     msgs.push({
-                        id: clusters.next(base),
+                        id,
                         role: "tool",
                         contentType: "tool-result",
                         toolCallId: b.tool_use_id,
                         text,
                     });
+                    if (b.cache_control) cacheControls.set(id, b.cache_control);
                     break;
                 }
                 case "thinking": {
@@ -111,10 +118,10 @@ export function anthropicToCore(body: AnthropicRequestBody): Flat {
             }
         }
     }
-    return { msgs };
+    return { msgs, cacheControls };
 }
 
-export function coreToAnthropic(messages: CoreMessage[]): AnthropicMessage[] {
+export function coreToAnthropic(messages: CoreMessage[], cacheControls?: Map<string, unknown>): AnthropicMessage[] {
     const out: AnthropicMessage[] = [];
     let current: { role: "user" | "assistant"; blocks: AnthropicBlock[] } | null = null;
     const flush = () => {
@@ -122,6 +129,10 @@ export function coreToAnthropic(messages: CoreMessage[]): AnthropicMessage[] {
             out.push({ role: current.role, content: current.blocks });
         }
         current = null;
+    };
+    const cc = (id: string): { cache_control?: unknown } => {
+        const v = cacheControls?.get(id);
+        return v ? { cache_control: v } : {};
     };
     for (const m of messages) {
         const target: "user" | "assistant" =
@@ -132,7 +143,7 @@ export function coreToAnthropic(messages: CoreMessage[]): AnthropicMessage[] {
         }
         switch (m.contentType) {
             case "text":
-                current.blocks.push({ type: "text", text: m.text ?? "" });
+                current.blocks.push({ type: "text", text: m.text ?? "", ...cc(m.id) });
                 break;
             case "tool-call":
                 current.blocks.push({
@@ -140,6 +151,7 @@ export function coreToAnthropic(messages: CoreMessage[]): AnthropicMessage[] {
                     id: m.toolCallId ?? `call_${m.id}`,
                     name: m.toolName ?? "unknown",
                     input: safeParse(m.text),
+                    ...cc(m.id),
                 });
                 break;
             case "tool-result":
@@ -147,6 +159,7 @@ export function coreToAnthropic(messages: CoreMessage[]): AnthropicMessage[] {
                     type: "tool_result",
                     tool_use_id: m.toolCallId ?? "",
                     content: m.text ?? "",
+                    ...cc(m.id),
                 });
                 break;
             case "reasoning":
