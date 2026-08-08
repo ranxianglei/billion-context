@@ -84,10 +84,15 @@ npm test               # node --import tsx --test tests/*.test.ts
 
 ```bash
 npm run build
-# Install from registry (NOT npm install -g . which creates a symlink)
-npm install -g billion-context@latest
+npm install -g billion-context@latest   # install from registry
 bili start --port 8787
 ```
+
+`npm install -g .` also works (installs from the local directory) and does NOT
+create a symlink here — npm copies the package into the global `node_modules`
+because `package.json` has proper `bin` + `files` fields. Either approach is
+fine; the registry install is preferred for testing the real published
+artifact.
 
 ### Code Quality
 
@@ -100,9 +105,9 @@ bili start --port 8787
 
 | Rule | Enforcement |
 |------|-------------|
-| **NEVER force-push to `master`** | Under no circumstances |
+| **NEVER force-push to `master`** | Under no circumstances. (GitHub branch protection also blocks this.) |
 | **NEVER merge PRs** | PR merges are human-only. The Agent MUST NEVER merge. |
-| **NEVER run `npm publish`** | npm publish is human-only. The Agent MUST NEVER publish, including with `NPM_ALLOW_DANGEROUS=1`. |
+| **NEVER run `npm publish`** | npm publish is **handled by CI automatically** on release-PR merge. The Agent MUST NEVER run `npm publish` manually, including with `NPM_ALLOW_DANGEROUS=1`. (See §5.) |
 | **Branch naming** | `YYYY-MM-DD_short-title` |
 | **NEVER modify `version` on non-release branches** | Version bumps only on release branches |
 
@@ -114,42 +119,47 @@ PR merges are a **human-only operation**. The Agent MUST NEVER merge any PR unde
 
 ### npm Publish — Absolute Prohibition
 
-`npm publish` is a **human-only operation**. The Agent MUST NEVER run `npm publish` under ANY circumstances. This includes:
+`npm publish` is **handled by CI automatically** (see §5). The Agent MUST
+NEVER run `npm publish` manually under ANY circumstances. This includes:
 
 - **NEVER** use `NPM_ALLOW_DANGEROUS=1 npm publish` to bypass the guard
 - **NEVER** use `npm pack` + manual install as a workaround
 - **NEVER** bypass or attempt to bypass any npm guard or safety mechanism
 
-If a human instructs publish, reply:
+If a human instructs manual publish, reply:
 
-> I can't publish to npm — AGENTS.md forbids Agents from publishing. Please run it yourself: `npm publish`.
+> I can't publish to npm — AGENTS.md forbids manual publishing. Releases are
+> published automatically by CI when a release PR is merged. See §5. If you
+> need a manual fallback, please run `npm publish` yourself.
 
-### Local Install — No Symlink
+### Local Install
 
-When testing locally, **NEVER** use `npm install -g .` — it creates a symlink to the project directory, causing `bili --version` to follow the current git branch instead of reflecting the installed package version. Always install from a tarball or registry:
+When testing locally, install from the **registry** to test the real
+published artifact:
 
 ```bash
-# CORRECT: install from registry
 npm install -g billion-context@latest
-
-# CORRECT: install from tarball
-npm pack && npm install -g billion-context-{VERSION}.tgz
-
-# WRONG: creates symlink, version follows git branch
-npm install -g .
 ```
+
+`npm install -g .` is also acceptable (it copies the local package into the
+global `node_modules` — it does NOT create a symlink here, because
+`package.json` has proper `bin` + `files` fields). Just be aware the
+installed version reflects whatever is in the project directory at install
+time, not the registry.
 
 ## 5. Release Workflow
 
-Same baseline as acp-kernel (branch naming, PR-merge-is-human-only, pre-flight checks, release-commit convention). See [acp-kernel AGENTS.md §5](https://github.com/ranxianglei/acp-kernel/blob/master/AGENTS.md).
+Releases are **fully automated via CI** (`.github/workflows/release.yml`).
+The Agent prepares a release PR; merging it triggers CI which builds, tests,
+publishes to npm, creates a git tag, and creates a GitHub Release.
 
 ### Branch Naming
 
-Release branches: `YYYY-MM-DD_release-v{VERSION}` (e.g., `2026-08-08_release-v0.1.14`)
+Release branches: `YYYY-MM-DD_release-v{VERSION}` (e.g., `2026-08-08_release-v0.1.17`)
 
 ### Process (exact steps)
 
-The Agent does steps 1–5, the human does 6–7.
+The Agent does steps 1–5, the human does step 6 (merge).
 
 1. **Sync master**:
    ```bash
@@ -161,8 +171,8 @@ The Agent does steps 1–5, the human does 6–7.
    ```
 3. **Bump version** — edit ONLY the `"version"` field in `package.json`:
    ```diff
-   -    "version": "0.1.13",
-   +    "version": "0.1.14",
+   -    "version": "0.1.16",
+   +    "version": "0.1.17",
    ```
 4. **Local pre-flight** — run the same checks CI runs:
    ```bash
@@ -172,42 +182,58 @@ The Agent does steps 1–5, the human does 6–7.
    ```
 5. **Commit, push, open PR** — release-commit convention:
    - Message: `release v{VERSION}`
-   - The commit changes ONLY `package.json` + `package-lock.json`. Never bundle other changes into a release commit.
+   - The commit changes ONLY `package.json` (+ `package-lock.json` if it
+     drifts). Never bundle other changes into a release commit.
    - PR title: `release v{VERSION}`; body lists changes since last tag.
 6. **Human merges the PR** (Agent MUST NOT merge).
-7. **Human publishes to npm** (Agent MUST NOT publish):
-   ```bash
-   npm run build
-   npm publish
-   ```
+7. **CI publishes automatically** — no manual `npm publish`:
+   - On merge, `release.yml` detects the `*_release-v*` branch name +
+     `release v{VERSION}` commit message.
+   - It runs `npm ci` + `typecheck` + `test` + `build`, then
+     `npm publish --tag latest` (using the `NPM_TOKEN` repo secret),
+     creates git tag `v{VERSION}`, and creates a GitHub Release.
 8. **Verify** the published version is live:
    ```bash
-   npm view billion-context dist-tags --json
+   npm view billion-context version
    ```
+
+### CI publish mechanism (what release.yml does)
+
+- **Trigger**: push to `master` where the merge commit or branch name matches
+  `*_release-v*`.
+- **Prerelease handling**: if the version contains `-` (e.g. `0.1.17-beta.1`),
+  publishes with `--tag dev` instead of `--tag latest`.
+- **No publish step for the Agent**: the Agent never runs `npm publish`. The
+  only manual fallback (if CI is down) is a human running `npm publish`.
 
 ### Cross-repo dependency: acp-kernel MUST ship first
 
-`acp-kernel` is pinned in **devDependencies** (exact version, no `^`) and **bundled inline** at build time, so `dist/index.js` is self-contained.
+`acp-kernel` is pinned in **devDependencies** (exact version, no `^`) and
+**bundled inline** at build time, so `dist/index.js` is self-contained.
 
-⚠️ **Publishing order is strict:**
-1. Release `acp-kernel` first (open + merge its release PR, wait for CI publish).
+⚠️ **When bumping the acp-kernel dependency version:**
+1. Release `acp-kernel` first (merge its release PR, wait for CI publish).
 2. **Verify it is live on npm:** `npm view acp-kernel version` returns the new version.
-3. THEN release billion-context.
+3. THEN bump `acp-kernel` in this repo's `package.json` and release billion-context.
+
+Rationale: billion-context CI runs `npm ci`, which installs the exact
+`acp-kernel` version pinned in `package.json`. A release branch that bumps
+`acp-kernel` to a not-yet-published version fails CI at install time.
 
 ### Auto-update testing
 
 To test that a running older version auto-updates to a newer registry version:
 
 ```bash
-# 1. Install older version from registry (NOT symlink)
-npm install -g billion-context@0.1.14
+# 1. Install older version from registry
+npm install -g billion-context@0.1.16
 
-# 2. Publish newer version (HUMAN ONLY)
-npm publish
+# 2. Merge the newer release PR (HUMAN merges) — CI publishes 0.1.17 to npm.
 
-# 3. Wait for registry propagation, then start the older version
+# 3. Start the older version
 bili start --port 19195
-# It will auto-detect and install the newer version within ~10 seconds.
+# Within ~10s (startup check) it detects 0.1.17 and installs it, logging:
+#   ✔ billion-context auto-updated 0.1.16 → 0.1.17. Restart bili to finish.
 ```
 
 ## 6. Contributing
