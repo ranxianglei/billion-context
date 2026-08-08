@@ -30,7 +30,7 @@ import {
     injectResponsesInstructions,
     conversationSignalResponses,
 } from "./responses.js";
-import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight } from "./session.js";
+import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, withSessionLock } from "./session.js";
 import { COMPRESS_TOOL, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressTextSystemPrompt } from "./compress-tool.js";
 import { rewriteSseStream, rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
@@ -210,34 +210,61 @@ async function handle(
     // declaration in providers.json first (same model can have different
     // windows behind different relays), then the built-in table. Falls back to
     // the global env default if neither matches.
-    let reqConfig = config;
+    // Parse body once and reuse everywhere (fixes duplicate JSON.parse).
+    let parsed: unknown = null;
     if (protocol && bodyBuffer.length > 0) {
-        const m = bodyBuffer.toString("utf8").match(/"model"\s*:\s*"([^"]+)"/);
-        if (m) {
-            const limit = resolveContextLimit(opts.routes, route?.provider, m[1]);
+        try {
+            parsed = JSON.parse(bodyBuffer.toString("utf8"));
+        } catch {
+            parsed = null;
+        }
+    }
+    // Per-request context limit: look up body.model against the per-route
+    // model declaration first, then the built-in table.
+    let reqConfig = config;
+    if (parsed && typeof parsed === "object") {
+        const model = (parsed as { model?: string }).model;
+        if (model) {
+            const limit = resolveContextLimit(opts.routes, route?.provider, model);
             if (limit && limit !== config.modelContextLimit) {
                 reqConfig = { ...config, modelContextLimit: limit };
             }
         }
     }
-    const prepared = opts.passthrough
-        ? null
-        : protocol === "anthropic"
-            ? prepareAnthropic(bodyBuffer, req, opts, core, reqConfig, log, protocol, upstreamOrigin)
-            : protocol === "openai"
-              ? prepareOpenai(bodyBuffer, req, opts, core, reqConfig, log, protocol, upstreamOrigin)
-              : protocol === "responses"
-                ? prepareResponses(bodyBuffer, req, opts, core, reqConfig, log, protocol, upstreamOrigin)
-                : null;
-    if (protocol === null && !opts.passthrough) {
-        log("warn", `unrecognized path ${url} — not a known protocol (/chat/completions, /v1/messages, /responses); forwarding unchanged`);
+    let prepared: Prepared | null = null;
+    if (!opts.passthrough && protocol && parsed && typeof parsed === "object") {
+        const sessionHeader = headerValue(req, opts.sessionHeader);
+        const conversation =
+            protocol === "anthropic"
+                ? conversationSignalAnthropic(parsed as AnthropicRequestBody, sessionHeader)
+                : protocol === "openai"
+                  ? conversationSignalOpenai(parsed as OpenAIRequestBody, sessionHeader)
+                  : conversationSignalResponses(parsed as ResponsesRequestBody, sessionHeader);
+        const sessionId = deriveProxySessionId(req.headers, protocol, upstreamOrigin, conversation);
+        const session = getSession(sessionId, { protocol, upstreamOrigin });
+        // Serialize per-session: prepare (processTurn mutates state) + forward
+        // (stream rewriter mutates state via compress/decompress) must not
+        // interleave across concurrent requests on the same session.
+        await withSessionLock(session, async () => {
+            prepared =
+                protocol === "anthropic"
+                    ? prepareAnthropic(parsed as AnthropicRequestBody, req, opts, core, reqConfig, log, session)
+                    : protocol === "openai"
+                      ? prepareOpenai(parsed as OpenAIRequestBody, req, opts, core, reqConfig, log, session)
+                      : prepareResponses(parsed as ResponsesRequestBody, req, opts, core, reqConfig, log, session);
+            acquireInFlight(session);
+            try {
+                await forward(req, res, opts, prepared!.body, prepared!, core, reqConfig, log, route);
+            } finally {
+                releaseInFlight(session);
+            }
+        });
     }
-    const outBody: Buffer | string = prepared ? prepared.body : bodyBuffer;
-    if (prepared) acquireInFlight(prepared.session);
-    try {
-        await forward(req, res, opts, outBody, prepared, core, reqConfig, log, route);
-    } finally {
-        if (prepared) releaseInFlight(prepared.session);
+    if (!prepared) {
+        if (protocol === null && !opts.passthrough) {
+            log("warn", `unrecognized path ${url} — not a known protocol (/chat/completions, /v1/messages, /responses); forwarding unchanged`);
+        }
+        await forward(req, res, opts, bodyBuffer, null, core, reqConfig, log, route);
     }
 }
 
@@ -270,20 +297,16 @@ function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; cont
 }
 
 function prepareAnthropic(
-    bodyBuffer: Buffer,
+    parsed: AnthropicRequestBody,
     req: http.IncomingMessage,
     opts: ProxyOptions,
     core: CompressionCore,
     config: Config,
     log: (level: string, msg: string) => void,
-    protocol: "anthropic" | "openai" | "responses",
-    upstreamOrigin: string,
+    session: Session,
 ): Prepared {
-    const parsed = JSON.parse(bodyBuffer.toString("utf8")) as AnthropicRequestBody;
+    const sessionId = session.id;
     const stream = parsed.stream === true;
-    const sessionHeader = headerValue(req, opts.sessionHeader);
-    const sessionId = deriveProxySessionId(req.headers, protocol, upstreamOrigin, conversationSignalAnthropic(parsed, sessionHeader));
-    const session = getSession(sessionId, { protocol, upstreamOrigin });
     session.requests++;
 
     let processedMessages: CoreMessage[] = [];
@@ -328,20 +351,16 @@ function prepareAnthropic(
 }
 
 function prepareOpenai(
-    bodyBuffer: Buffer,
+    parsed: OpenAIRequestBody,
     req: http.IncomingMessage,
     opts: ProxyOptions,
     core: CompressionCore,
     config: Config,
     log: (level: string, msg: string) => void,
-    protocol: "anthropic" | "openai" | "responses",
-    upstreamOrigin: string,
+    session: Session,
 ): Prepared {
-    const parsed = JSON.parse(bodyBuffer.toString("utf8")) as OpenAIRequestBody;
+    const sessionId = session.id;
     const stream = parsed.stream === true;
-    const sessionHeader = headerValue(req, opts.sessionHeader);
-    const sessionId = deriveProxySessionId(req.headers, protocol, upstreamOrigin, conversationSignalOpenai(parsed, sessionHeader));
-    const session = getSession(sessionId, { protocol, upstreamOrigin });
     session.requests++;
 
     let processedMessages: CoreMessage[] = [];
@@ -396,20 +415,16 @@ function prepareOpenai(
 }
 
 function prepareResponses(
-    bodyBuffer: Buffer,
+    parsed: ResponsesRequestBody,
     req: http.IncomingMessage,
     opts: ProxyOptions,
     core: CompressionCore,
     config: Config,
     log: (level: string, msg: string) => void,
-    protocol: "anthropic" | "openai" | "responses",
-    upstreamOrigin: string,
+    session: Session,
 ): Prepared {
-    const parsed = JSON.parse(bodyBuffer.toString("utf8")) as ResponsesRequestBody;
+    const sessionId = session.id;
     const stream = parsed.stream === true;
-    const sessionHeader = headerValue(req, opts.sessionHeader);
-    const sessionId = deriveProxySessionId(req.headers, protocol, upstreamOrigin, conversationSignalResponses(parsed, sessionHeader));
-    const session = getSession(sessionId, { protocol, upstreamOrigin });
     session.requests++;
 
     let processedMessages: CoreMessage[] = [];

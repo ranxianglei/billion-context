@@ -41,6 +41,11 @@ export type Session = {
      *  drop a never-persisted session on flush failure (that would be a
      *  permanent loss). */
     persisted: boolean;
+    /** Promise chain for per-session serialization. Two concurrent requests
+     *  sharing a session id would interleave processTurn / stream-rewriter
+     *  mutations on session.state, corrupting it. withSessionLock chains each
+     *  critical section onto the previous one so they run strictly in order. */
+    lockChain?: Promise<unknown>;
 };
 
 const sessions = new Map<string, Session>();
@@ -116,6 +121,26 @@ export function acquireInFlight(session: Session): void {
 /** Release an in-use marker. Decrements; the session becomes evictable again. */
 export function releaseInFlight(session: Session): void {
     if (session.inFlight > 0) session.inFlight--;
+}
+
+/** Serialize a critical section per session. Each call chains onto the
+ *  previous lockChain, so concurrent requests for the same session execute
+ *  strictly one-at-a-time. This prevents two processTurn / stream-rewriter
+ *  invocations from interleaving mutations on session.state.
+ *
+ *  For single-agent workflows (the common case) there is no contention and
+ *  the chain resolves immediately. The cost is one Promise allocation. */
+export async function withSessionLock<T>(session: Session, fn: () => Promise<T>): Promise<T> {
+    const prev = session.lockChain ?? Promise.resolve();
+    let release!: () => void;
+    const done = new Promise<void>((resolve) => { release = resolve; });
+    session.lockChain = prev.then(() => done);
+    await prev;
+    try {
+        return await fn();
+    } finally {
+        release();
+    }
 }
 
 export function listSessions(): Session[] {
