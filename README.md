@@ -42,9 +42,70 @@ This installs the `bili` command (`bili-proxy` is kept as an alias).
 
 ## Quickstart
 
-Three steps: **start the proxy → edit the config file → point your client at it**.
+Two ways to use it — pick one:
+
+- **Zero-config (simplest):** prefix your client's baseURL with the proxy
+  origin + `/p/`. No config file needed — context windows are auto-detected
+  from the [models.dev](https://models.dev) registry.
+- **Named providers:** declare providers in a config file, then use shorter
+  `http://localhost:8787/<name>/...` URLs. Better when you manage several
+  endpoints or want explicit per-model context overrides.
+
 Compression is injected automatically — you only configure routing, never
 compression itself.
+
+### Option A — Zero-config (`/p/` prefix)
+
+Start the proxy:
+
+```bash
+bili
+```
+
+Then just prefix your client's existing baseURL with `http://localhost:8787/p/`.
+The full upstream URL is embedded in the path, so the proxy knows where to
+forward without any config:
+
+```
+client baseURL before:  https://api.openai.com/v1
+client baseURL after:   http://localhost:8787/p/https://api.openai.com/v1
+```
+
+That's it — put your real API key in the client config as usual (the proxy
+passes it through untouched). Context windows (gpt-5.1-codex=400K,
+glm-5.2=1M, claude-opus-4=200K, …) are looked up from models.dev
+automatically.
+
+#### Examples by client
+
+**OpenCode** — edit `~/.config/opencode/opencode.json`, change the provider's `baseURL`:
+```jsonc
+// before:
+"baseURL": "https://open.bigmodel.cn/api/coding/paas/v4"
+// after (just prepend the proxy origin + /p/):
+"baseURL": "http://localhost:8787/p/https://open.bigmodel.cn/api/coding/paas/v4"
+```
+
+**Codex** — edit `~/.codex/config.toml`, change the provider's `base_url`:
+```toml
+# before:
+base_url = "https://api.openai.com/v1"
+# after:
+base_url = "http://localhost:8787/p/https://api.openai.com/v1"
+```
+
+**Pi** — edit `~/.pi/agent/models.json`, change the provider's `baseUrl`:
+```jsonc
+// before:
+"baseUrl": "https://api.anthropic.com"
+// after:
+"baseUrl": "http://localhost:8787/p/https://api.anthropic.com"
+```
+
+**Other clients (Cursor / Aider / Continue …)** — wherever the upstream URL is
+configured, prepend `http://localhost:8787/p/` to it. Nothing else changes.
+
+### Option B — Named providers (config file)
 
 ### Step 1 — Start the proxy
 

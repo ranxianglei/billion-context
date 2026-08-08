@@ -42,8 +42,59 @@ npm install -g billion-context
 
 ## 快速上手
 
-三步:**启动代理 → 编辑配置文件 → 把客户端指向它**。
+两种方式 —— 任选其一:
+
+- **零配置(最简单):** 在客户端 baseURL 前面加上代理地址 + `/p/`。无需配置文件 —— context 窗口自动从 [models.dev](https://models.dev) registry 查询。
+- **命名 provider:** 在配置文件里声明 provider,然后用更短的 `http://localhost:8787/<name>/...` URL。适合管理多个端点或需要显式指定按模型 context 的场景。
+
 压缩是自动注入的 —— 你只需配置路由,无需配置压缩本身。
+
+### 方式 A —— 零配置(`/p/` 前缀)
+
+启动代理:
+
+```bash
+bili
+```
+
+然后把客户端现有的 baseURL 前面加上 `http://localhost:8787/p/` 就行。完整上游 URL 嵌在路径里,proxy 无需任何配置就知道转发到哪:
+
+```
+客户端 baseURL 之前:  https://api.openai.com/v1
+客户端 baseURL 之后:  http://localhost:8787/p/https://api.openai.com/v1
+```
+
+就这样 —— 真实 API key 照常填在客户端配置里(proxy 原样透传)。context 窗口(gpt-5.1-codex=400K、glm-5.2=1M、claude-opus-4=200K ……)自动从 models.dev 查询。
+
+#### 各客户端示例
+
+**OpenCode** —— 编辑 `~/.config/opencode/opencode.json`,改 provider 的 `baseURL`:
+```jsonc
+// 之前:
+"baseURL": "https://open.bigmodel.cn/api/coding/paas/v4"
+// 之后(前面加上代理地址 + /p/):
+"baseURL": "http://localhost:8787/p/https://open.bigmodel.cn/api/coding/paas/v4"
+```
+
+**Codex** —— 编辑 `~/.codex/config.toml`,改 provider 的 `base_url`:
+```toml
+# 之前:
+base_url = "https://api.openai.com/v1"
+# 之后:
+base_url = "http://localhost:8787/p/https://api.openai.com/v1"
+```
+
+**Pi** —— 编辑 `~/.pi/agent/models.json`,改 provider 的 `baseUrl`:
+```jsonc
+// 之前:
+"baseUrl": "https://api.anthropic.com"
+// 之后:
+"baseUrl": "http://localhost:8787/p/https://api.anthropic.com"
+```
+
+**其他客户端(Cursor / Aider / Continue ……)** —— 只要配置了上游 URL,前面加 `http://localhost:8787/p/` 就行,其他都不用改。
+
+### 方式 B —— 命名 provider(配置文件)
 
 ### 第 1 步 —— 启动代理
 

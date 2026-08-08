@@ -5,6 +5,7 @@ import { createCore, type CompressionCore, type Config, type CoreMessage, type N
 import type { ProxyOptions } from "./config.js";
 import { loadRoutes } from "./config.js";
 import { resolveContextLimit } from "./config.js";
+import { contextFromRegistry, loadRegistry } from "./registry.js";
 import { fetchWithTimeout, MAX_REQUEST_BYTES } from "./fetch-util.js";
 import {
     anthropicToCore,
@@ -58,6 +59,21 @@ const UPSTREAM_HOP_HEADERS = new Set([
 ]);
 
 export function resolveUpstream(opts: ProxyOptions, reqUrl: string): { upstream: string; rewrittenUrl: string; provider: string } | undefined {
+    // Zero-config mode: a request like `/p/https://open.bigmodel.cn/api/anthropic`
+    // embeds the full upstream URL after the `/p/` prefix. Strip the prefix,
+    // take the rest verbatim as the upstream. This lets users route without any
+    // config file at all — they just prefix their client's baseURL with the
+    // proxy origin + `/p/`. The provider name returned is "p" so stats/labels
+    // can tell zero-config requests apart from named-config ones.
+    if (reqUrl.startsWith("/p/http://") || reqUrl.startsWith("/p/https://")) {
+        const full = reqUrl.slice(3); // drop "/p/"
+        try {
+            const u = new URL(full);
+            return { upstream: `${u.protocol}//${u.host}`, rewrittenUrl: full, provider: "p" };
+        } catch {
+            // malformed embedded URL — fall through to named matching, which will miss
+        }
+    }
     const names = Object.keys(opts.routes);
     if (names.length === 0) return undefined;
     // Provider names that coincide with common API path segments are rejected
@@ -100,6 +116,10 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     if (filePath) {
         log("info", `[log] writing to ${filePath}`);
     }
+    // Pre-fetch the models.dev registry in the background (non-blocking). Used
+    // as the context-window source for zero-config `/p/` routes that have no
+    // per-model config. A miss falls back to the prefix table + default.
+    void loadRegistry();
     const server = http.createServer(async (req, res) => {
         try {
             await handle(req, res, opts, core, config, log);
@@ -125,7 +145,8 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                           .map(([n, u]) => `${n}=${typeof u === "string" ? u : u.url}`)
                           .join(", ")}`
                     : ` → ${opts.upstream}`) +
-                ` — web UI: http://${displayHost}:${opts.port}/__acp/`,
+                ` — web UI: http://${displayHost}:${opts.port}/__acp/` +
+                ` — zero-config: prefix any baseURL with http://${displayHost}:${opts.port}/p/`,
         );
     });
     // Listen errors (EADDRINUSE port taken, EACCES privileged port, EAFNOSUPPORT
@@ -284,7 +305,13 @@ async function handle(
     if (parsed && typeof parsed === "object") {
         const model = (parsed as { model?: string }).model;
         if (model) {
-            const limit = resolveContextLimit(opts.routes, route?.provider, model);
+            let limit = resolveContextLimit(opts.routes, route?.provider, model);
+            // Zero-config routes (provider "p") have no per-model config; try the
+            // models.dev registry as a middle layer before the prefix table / default.
+            if (!limit && route?.provider === "p" && route.upstream) {
+                const host = (() => { try { return new URL(route.upstream).host; } catch { return undefined; } })();
+                limit = await contextFromRegistry(model, host) ?? undefined;
+            }
             if (limit && limit !== config.modelContextLimit) {
                 reqConfig = { ...config, modelContextLimit: limit };
             }
@@ -662,7 +689,10 @@ async function forward(
     affinity?: string,
 ): Promise<void> {
     const upstreamUrl = route ? route.rewrittenUrl : opts.upstream + (req.url ?? "");
-    log("info", `forward ${req.method} ${req.url ?? ""} → ${upstreamUrl}${route ? ` (${route.provider})` : ""}`);
+    // Show the final proxied URL (where the request actually lands) as the
+    // primary signal. The provider label is appended only for named routes —
+    // zero-config (/p/) requests have no meaningful name, so we omit it.
+    log("info", `forward ${req.method} → ${upstreamUrl}${route && route.provider !== "p" ? `  [${route.provider}]` : ""}`);
     if (process.env.ACP_DEBUG && prepared) {
         const sid = prepared.session.id;
         const hdrKeys = Object.keys(req.headers);
