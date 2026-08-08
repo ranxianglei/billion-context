@@ -62,6 +62,15 @@ so you don't have to invent the schema from scratch:
 [acp-config] created empty config at ~/.config/billion-context/billion-context.json — add your providers (see README Quickstart), then restart
 ```
 
+**Or configure via the web UI** (easier): open `http://localhost:8787/__acp/` in
+a browser while the proxy is running — edit providers in a form, and get
+copy-ready config snippets for Pi / OpenCode / Codex. The startup banner prints
+this URL too:
+
+```
+acp-proxy listening on http://localhost:8787 — web UI: http://localhost:8787/__acp/
+```
+
 ### How routing works
 
 The proxy routes by a **provider name in the URL path** — the first path

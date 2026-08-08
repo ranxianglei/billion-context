@@ -59,6 +59,14 @@ bili
 [acp-config] created empty config at ~/.config/billion-context/billion-context.json — add your providers (see README Quickstart), then restart
 ```
 
+**或者用网页配置**(更简单):代理跑着的时候,在浏览器打开
+`http://localhost:8787/__acp/` —— 用表单编辑 providers,还能直接复制 Pi / OpenCode /
+Codex 的配置片段。启动行也会打印这个 URL:
+
+```
+acp-proxy listening on http://localhost:8787 — web UI: http://localhost:8787/__acp/
+```
+
 ### 路由怎么工作
 
 代理按 **URL 路径里的 provider 名**路由 —— host 后面的第一段路径。它会

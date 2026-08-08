@@ -115,14 +115,16 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         }
     });
     server.listen(opts.port, opts.host, () => {
+        const displayHost = opts.host === "0.0.0.0" ? "localhost" : opts.host;
         log(
             "info",
-            `acp-proxy listening on http://${opts.host}:${opts.port}` +
+            `acp-proxy listening on http://${displayHost}:${opts.port}` +
                 (Object.keys(opts.routes).length
                     ? ` — routes: ${Object.entries(opts.routes)
                           .map(([n, u]) => `${n}=${typeof u === "string" ? u : u.url}`)
                           .join(", ")}`
-                    : ` → ${opts.upstream}`),
+                    : ` → ${opts.upstream}`) +
+                ` — web UI: http://${displayHost}:${opts.port}/__acp/`,
         );
     });
     // Listen errors (EADDRINUSE port taken, EACCES privileged port, EAFNOSUPPORT
