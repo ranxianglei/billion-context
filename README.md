@@ -55,11 +55,11 @@ bili
 It listens on `http://127.0.0.1:8787`. Keep this terminal open (or run in the
 background; see [Running the proxy](#running-the-proxy)).
 
-On first run `bili` **auto-creates a template config file** and tells you where,
+On first run `bili` **auto-creates an empty config file** and tells you where:
 so you don't have to invent the schema from scratch:
 
 ```
-[acp-config] created config template at ~/.config/billion-context/billion-context.json — edit it with your providers, then restart
+[acp-config] created empty config at ~/.config/billion-context/billion-context.json — add your providers (see README Quickstart), then restart
 ```
 
 ### How routing works

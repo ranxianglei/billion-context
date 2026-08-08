@@ -53,10 +53,10 @@ bili
 
 它监听 `http://127.0.0.1:8787`。保持这个终端开着(或后台运行,见[运行代理](#运行代理))。
 
-首次运行 `bili` 会**自动创建一份配置模板**,并告诉你路径,这样你不用凭空搛 schema:
+首次运行 `bili` 会**自动创建一份空的配置文件**,并告诉你路径:
 
 ```
-[acp-config] created config template at ~/.config/billion-context/billion-context.json — edit it with your providers, then restart
+[acp-config] created empty config at ~/.config/billion-context/billion-context.json — add your providers (see README Quickstart), then restart
 ```
 
 ### 路由怎么工作

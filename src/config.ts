@@ -193,20 +193,12 @@ function loadConfigFile(): FileConfig {
     return {};
 }
 
-/** Template written on first run so the user has something concrete to edit
- *  instead of having to invent the schema. Demonstrates both provider forms:
- *  a bare string (simplest) and an object with per-model context windows.
- *  The API key is intentionally NOT here — it lives in the client, and the
- *  proxy passes it through untouched. */
+/** Template written on first run so the user has a file to edit instead
+ *  of having to invent the path/schema. Left empty on purpose: the proxy
+ *  can't guess your provider, so we don't put a fake one. Fill it in per
+ *  the README Quickstart, then restart `bili`. */
 const TEMPLATE_CONFIG = `{
   "providers": {
-    "anthropic": "https://api.anthropic.com",
-    "zhipu": {
-      "url": "https://open.bigmodel.cn",
-      "models": {
-        "glm-5.2": { "context": 1000000, "output": 131072 }
-      }
-    }
   }
 }`;
 
@@ -220,7 +212,7 @@ export function ensureConfigTemplate(): boolean {
     try {
         mkdirSync(dirname(p), { recursive: true });
         writeFileSync(p, TEMPLATE_CONFIG + "\n", "utf8");
-        loggerLog("info", `[acp-config] created config template at ${p} — edit it with your providers, then restart`);
+        loggerLog("info", `[acp-config] created empty config at ${p} — add your providers (see README Quickstart), then restart`);
         return true;
     } catch {
         return false;
