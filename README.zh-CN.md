@@ -178,6 +178,16 @@ base_url = "http://localhost:8787/zhipu/api/coding/paas/v4"
 暂不支持。代理目前说 Anthropic、OpenAI chat-completions、OpenAI Responses
 三种协议 —— 如果你的客户端用别的协议或非标准 auth header,还用不了。
 
+### 网页配置
+
+代理跑着的时候,在浏览器打开 `http://localhost:8787/__acp/`。你可以:
+
+- **编辑 providers** —— 用表单增删 provider 和按模型的 context 窗口,点 Save 直接写入 `billion-context.json`。
+- **生成客户端 URL** —— 选一个 provider,得到可直接复制的配置片段(Pi / OpenCode / Codex 的 `baseUrl`/`baseURL`/`base_url` 一行,已填好代理地址 + provider 名)。
+- **查看会话** —— 实时会话表(请求数、省的 token、最后活跃时间),自动刷新。
+
+改完 providers 需要**重启 bili** 才生效(UI 会提醒你)。
+
 ### 验证
 
 代理跑着、配置保存了之后,确认它能应答,并且第一个真实请求在日志里显示压缩活动:

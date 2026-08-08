@@ -187,6 +187,16 @@ Not yet supported. The proxy currently speaks the Anthropic, OpenAI
 chat-completions, and OpenAI Responses protocols — if your client uses a
 different protocol or a non-standard auth header, it won't work yet.
 
+### Web UI
+
+Open `http://localhost:8787/__acp/` in a browser while the proxy is running. You can:
+
+- **Edit providers** in a form (add/remove providers and per-model context windows) and save — this writes to `billion-context.json` directly.
+- **Generate client URLs** — pick a provider, get ready-to-copy config snippets for Pi / OpenCode / Codex (the `baseUrl`/`baseURL`/`base_url` line with the proxy origin + provider name filled in).
+- **View sessions** — live table of active sessions (requests, tokens saved, last seen), auto-refreshing.
+
+Changes to providers require a **restart** to take effect (the UI tells you this).
+
 ### Verify
 
 With the proxy running and your config saved, check it answers and that your

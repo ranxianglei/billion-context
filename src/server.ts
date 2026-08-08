@@ -32,6 +32,7 @@ import {
 import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, withSessionLock } from "./session.js";
 import { COMPRESS_TOOL, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressTextSystemPrompt } from "./compress-tool.js";
 import { rewriteSseStream, rewriteJsonResponse, type RewriteCtx } from "./stream.js";
+import { renderUI, handleConfigGet, handleConfigPut } from "./web.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { getStore } from "./persist.js";
 import { compressLoopStream } from "./compress-loop.js";
@@ -216,6 +217,15 @@ async function handle(
         res.end(JSON.stringify({ ok: true, upstream: opts.upstream }));
         return;
     }
+    // Web config UI (served as HTML, separate from the JSON health check above).
+    if (req.method === "GET" && req.url === "/__acp/") {
+        const origin = `http://${opts.host === "0.0.0.0" ? "localhost" : opts.host}:${opts.port}`;
+        res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+        res.end(renderUI(origin));
+        return;
+    }
+    if (req.method === "GET" && req.url === "/__acp/config") return handleConfigGet(res);
+    if (req.method === "PUT" && req.url === "/__acp/config") return handleConfigPut(req, res);
     let bodyBuffer: Buffer;
     try {
         bodyBuffer = await readBody(req);

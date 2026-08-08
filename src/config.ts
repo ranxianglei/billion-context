@@ -4,7 +4,7 @@ import { dirname } from "node:path";
 import { configFile } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 
-function safeReadJson(path: string): unknown {
+export function safeReadJson(path: string): unknown {
     try {
         // Strip a leading UTF-8 BOM: Windows Notepad saves UTF-8 "with BOM",
         // and JSON.parse("\uFEFF...") throws SyntaxError, silently dropping
@@ -219,7 +219,7 @@ export function ensureConfigTemplate(): boolean {
     }
 }
 
-function parseRouteEntry(v: unknown): ProviderRoute | undefined {
+export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
     if (typeof v === "string" && v.length > 0) {
         return { url: v.replace(/\/$/, "") };
     }
