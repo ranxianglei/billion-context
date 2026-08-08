@@ -11,8 +11,14 @@ export type Session = {
     /** Original content of compressed blocks, captured at compress time when
      *  the source messages are still present in the request. decompress reads
      *  from here instead of scanning ctx.messages (which only holds the
-     *  post-compression / folded view and loses originals across rounds). */
-    blockContents: Map<string, { text: string; count: number }>;
+     *  post-compression / folded view and loses originals across rounds).
+     *  Two views are cached: `one` (one-level: direct messages + nested
+     *  child summaries) and `full` (all original messages), matching the
+     *  collectBlockContent full flag semantics. */
+    blockContents: Map<string, {
+        one: { text: string; count: number };
+        full: { text: string; count: number };
+    }>;
 };
 
 // KNOWN LIMITATION: sessions live in process memory. A proxy restart (deploy /

@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import type { Session } from "./session.js";
 import { parseCompressInput, PROXY_TOOL_NAMES, COMPRESS_TOOL_NAME, ACP_TEXT_OPEN, ACP_TEXT_CLOSE } from "./compress-tool.js";
 import { applyRanges } from "./stream.js";
+import { resolveDecompress } from "./decompress-shared.js";
 import { buildVisibilityMarker } from "./compress-loop.js";
 import { fetchWithTimeout } from "./fetch-util.js";
 
@@ -88,41 +89,7 @@ function executeProxyTool(
         return applyRanges(parseCompressInput(args), ctx);
     }
     if (toolName === "decompress") {
-        const rawBlockId = args.blockId;
-        if (typeof rawBlockId !== "string" || rawBlockId.length === 0) {
-            return "[decompress FAILED: blockId is required]";
-        }
-        const blockId = rawBlockId.trim();
-        const block = ctx.core.decompress(blockId, ctx.session.state);
-        if (!block) return `[Block ${blockId} not found]`;
-        const full = args.full === true;
-        const cached = ctx.session.blockContents.get(blockId);
-        let body: string;
-        let count: number;
-        if (cached) {
-            body = cached.text;
-            count = cached.count;
-        } else {
-            const collected = collectBlockContent(ctx.session.state, block, ctx.messages, { full });
-            body = collected.text || block.summary;
-            count = collected.count;
-        }
-        if (count > 0 || cached) {
-            ctx.session.state = deactivateBlock(ctx.session.state, [blockId]);
-        }
-        const header = `[Restored block ${blockId} — ${count} item(s)${full ? ", full" : ""}]`;
-        const safeBlockId = blockId.replace(/[^a-zA-Z0-9_-]/g, "-");
-        const outPath = body.length > 10000 ? join(tmpdir(), `acp-decompress-${safeBlockId}-${Date.now()}.txt`) : null;
-        if (outPath) {
-            try {
-                mkdirSync(dirname(outPath), { recursive: true });
-                writeFileSync(outPath, body, "utf8");
-                return `${header}\nContent (${body.length} chars) written to: ${outPath}\nUse the read tool to access it.`;
-            } catch (e) {
-                return `${header}\n[Failed to write to ${outPath}: ${String(e)}]\n${body.slice(0, 4000)}...`;
-            }
-        }
-        return `${header}\n${body}`;
+        return resolveDecompress(args, ctx);
     }
     if (toolName === "search_context") {
         const query = typeof args.query === "string" ? args.query : "";

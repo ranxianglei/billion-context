@@ -170,10 +170,18 @@ export function applyRanges(ranges: ReturnType<typeof parseCompressInput>, ctx: 
         // source messages are still in ctx.messages (this round's view, before
         // the next processTurn folds them). Storing the text here lets decompress
         // work in later rounds where ctx.messages no longer carries the originals.
+        // Two views are cached so decompress can honor the `full` flag: `one`
+        // (direct messages + nested child summaries) and `full` (all originals).
         for (const b of res.state.blocks) {
             if (beforeIds.has(b.blockId)) continue;
-            const collected = collectBlockContent(res.state, b, ctx.messages, { full: true });
-            if (collected.count > 0) ctx.session.blockContents.set(b.blockId, { text: collected.text, count: collected.count });
+            const full = collectBlockContent(res.state, b, ctx.messages, { full: true });
+            const one = collectBlockContent(res.state, b, ctx.messages, { full: false });
+            if (full.count > 0 || one.count > 0) {
+                ctx.session.blockContents.set(b.blockId, {
+                    one: { text: one.text, count: one.count },
+                    full: { text: full.text, count: full.count },
+                });
+            }
         }
         const r = res.result;
         const detail = ranges.map((rg) => `${rg.startRef}–${rg.endRef}`).join(", ");
