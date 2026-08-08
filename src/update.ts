@@ -20,8 +20,9 @@
  * version and stops trying. No notified Set — failed installs retry next
  * cycle automatically.
  */
-import { readFile, writeFile, mkdir, access, constants, rm } from "node:fs/promises";
+import { readFile, writeFile, mkdir, access, constants, rm, cp } from "node:fs/promises";
 import { execFile } from "node:child_process";
+import * as tar from "tar";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { cacheDir } from "./paths.js";
@@ -311,29 +312,21 @@ async function installViaTarball(
     }
 
     // Extract to a temp staging dir (NOT directly over install dir).
+    // Uses the `tar` npm package (pure JS, cross-platform) instead of
+    // shelling out to the `tar` binary, which is absent or inconsistent on
+    // Windows. `--strip-components=1` maps to `strip: 1` (npm tarballs wrap
+    // files in a `package/` dir).
     const stagingDir = path.join(cacheDir(), `.update-staging-${version}`);
     try {
         // Clean any leftover staging dir from a previous failed attempt.
         await rm(stagingDir, { recursive: true, force: true });
         await mkdir(stagingDir, { recursive: true });
 
-        const { code, stderr } = await new Promise<{ code: number; stderr: string }>((resolve) => {
-            execFile(
-                "tar",
-                ["xzf", tmpFile, "-C", stagingDir, "--strip-components=1"],
-                { timeout: 30_000 },
-                (err, _stdout, stderr) => {
-                    if (err) {
-                        resolve({ code: 1, stderr: stderr || err.message });
-                    } else {
-                        resolve({ code: 0, stderr: stderr || "" });
-                    }
-                },
-            );
+        await tar.x({
+            file: tmpFile,
+            cwd: stagingDir,
+            strip: 1,
         });
-        if (code !== 0) {
-            return { ok: false, error: `extraction failed (tar exit ${code})${stderr.trim() ? `: ${stderr.trim()}` : ""}` };
-        }
 
         // Verify the staging dir has a valid package.json with the right version.
         const stagingVersion = await readDiskVersion(stagingDir);
@@ -346,26 +339,12 @@ async function installViaTarball(
         await rm(tmpFile, { force: true });
     }
 
-    // Copy staging over install dir.
-    // `cp -r staging/. installDir/` merges without creating a nested dir.
+    // Copy staging over install dir using Node's built-in fs.cp (Node 16.7+).
+    // Cross-platform — no dependency on the `cp` binary (absent on Windows).
+    // `recursive: true` + the trailing `/.` semantics: fs.cp copies the
+    // *contents* of stagingDir into installDir, merging without nesting.
     try {
-        const { code, stderr } = await new Promise<{ code: number; stderr: string }>((resolve) => {
-            execFile(
-                "cp",
-                ["-r", stagingDir + "/.", installDir + "/"],
-                { timeout: 30_000 },
-                (err, _stdout, stderr) => {
-                    if (err) {
-                        resolve({ code: 1, stderr: stderr || err.message });
-                    } else {
-                        resolve({ code: 0, stderr: stderr || "" });
-                    }
-                },
-            );
-        });
-        if (code !== 0) {
-            return { ok: false, error: `failed to copy to install dir (cp exit ${code})${stderr.trim() ? `: ${stderr.trim()}` : ""}` };
-        }
+        await cp(stagingDir, installDir, { recursive: true, force: true });
     } catch (e) {
         return { ok: false, error: `failed to copy to install dir: ${String(e)}` };
     } finally {
