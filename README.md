@@ -77,7 +77,14 @@ client baseURL:  http://localhost:8787/zhipu/api/coding/paas/v4
 
 This is why Step 2 has you declare named providers, and Step 3 has you put that
 same name at the start of the client's base URL — it's how the proxy knows where
-to send each request.
+to send each request. In the config below, `zhipu` corresponds to:
+```json
+    "zhipu": {
+      "url": "https://open.bigmodel.cn",
+      "models": {
+        "glm-5.2": { "context": 1000000, "output": 131072 }
+      }
+```
 
 ### Step 2 — Edit the config file
 
@@ -89,13 +96,13 @@ Step 3.
 ```json
 {
   "providers": {
-    "anthropic": "https://api.anthropic.com",
     "zhipu": {
       "url": "https://open.bigmodel.cn",
       "models": {
         "glm-5.2": { "context": 1000000, "output": 131072 }
       }
-    }
+    },
+    "anthropic": "https://api.anthropic.com"
   }
 }
 ```
@@ -104,20 +111,6 @@ Step 3.
 - Add others (e.g. `"deepseek": "https://api.deepseek.com"`).
 - The API key is **not** here — it lives in the client; the proxy passes it
   through untouched.
-
-Each **name on the left** is the key the proxy looks for in the URL path.
-The name you choose is arbitrary — it's just a label — but it must match the
-path you use in Step 3:
-
-| config name (Step 2) | becomes the path segment in Step 3 |
-|---|---|
-| `"zhipu": ...` | `http://localhost:8787/zhipu/...` |
-| `"anthropic": ...` | `http://localhost:8787/anthropic` |
-| `"deepseek": ...` | `http://localhost:8787/deepseek` |
-
-So `http://localhost:8787/zhipu/api/coding/paas/v4` means: *route to the
-provider named `zhipu` (→ `https://open.bigmodel.cn`), and forward the rest of
-the path (`/api/coding/paas/v4`) as-is.*
 
 After saving, **restart `bili`**. The startup banner lists your routes:
 
@@ -137,34 +130,21 @@ the proxy passes it through untouched.
 
 #### Pi (billion-context-pi)
 
-`~/.pi/agent/models.json` — declare a provider pointing at your proxy route,
-then set it as default in `settings.json`:
+Open `~/.pi/agent/models.json` and change your existing provider's **`baseUrl` line** to point at the proxy — leave every other field alone:
 
 ```jsonc
-// ~/.pi/agent/models.json
-{
-  "providers": {
-    "bili": {
-      "baseUrl": "http://localhost:8787/zhipu/api/coding/paas/v4",
-      "api": "openai-completions",
-      "apiKey": "<your key>",
-      "models": [{ "id": "glm-5.2", "contextWindow": 1000000, "maxTokens": 131072 }]
-    }
-  }
-}
-```
-```jsonc
-// ~/.pi/agent/settings.json
-{ "defaultProvider": "bili", "defaultModel": "glm-5.2" }
+// before:
+"baseUrl": "https://open.bigmodel.cn/api/coding/paas/v4",
+// after (swap the host for the proxy + the provider name you picked):
+"baseUrl": "http://localhost:8787/zhipu/api/coding/paas/v4",
 ```
 
-The `api` field selects Pi's wire protocol and must match the endpoint you
-point `baseUrl` at — they're not interchangeable:
+`http://localhost:8787` is the proxy, `zhipu` is the name from Step 2, and the remaining path `/api/coding/paas/v4` is forwarded as-is to Zhipu. `apiKey`, `api`, and `models` stay unchanged.
 
-| `api` value | points at | example `baseUrl`
-|---|---|---|
-| `openai-completions` | an OpenAI-compatible endpoint (GLM/DeepSeek/OpenAI) | `…/zhipu/api/coding/paas/v4` |
-| `anthropic-messages` | an Anthropic-compatible endpoint | `…/anthropic` (your named route) |
+| `api` value | `baseUrl` should point at |
+|---|---|
+| `openai-completions` | an OpenAI-compatible endpoint (GLM/DeepSeek/OpenAI) → `…/zhipu/...` |
+| `anthropic-messages` | an Anthropic-compatible endpoint → `…/anthropic` |
 
 > If you use the `billion-context-pi` extension, run Pi in an isolated agent
 dir (`PI_CODING_AGENT_DIR=…`) so the client-side extension doesn't double-
@@ -172,44 +152,29 @@ compress alongside the proxy. The `bili-test-pi` helper does this for you.
 
 #### OpenCode
 
-`~/.config/opencode/opencode.json` — add a provider under `provider`, then
-reference it in `model`:
+Open `~/.config/opencode/opencode.json` and change your existing provider's **`baseURL` line** to point at the proxy:
 
 ```jsonc
-{
-  "provider": {
-    "bili": {
-      "options": {
-        "apiKey": "<your key>",
-        "baseURL": "http://localhost:8787/zhipu/api/coding/paas/v4"
-      },
-      "models": {
-        "glm-5.2": { "limit": { "context": 1000000, "output": 131072 } }
-      }
-    }
-  },
-  "model": "bili/glm-5.2"
-}
+// before:
+"baseURL": "https://open.bigmodel.cn/api/coding/paas/v4"
+// after:
+"baseURL": "http://localhost:8787/zhipu/api/coding/paas/v4"
 ```
 
-For an Anthropic provider instead, set `baseURL` to
-`http://localhost:8787/anthropic`.
+Everything else (`apiKey`, `models`) stays unchanged. For an Anthropic provider, change `baseURL` to `http://localhost:8787/anthropic`.
 
 #### Codex
 
-`~/.codex/config.toml` — declare a `model_provider` block pointing at your
-proxy route, then select it:
+Open `~/.codex/config.toml` and change your existing provider's **`base_url` line** to point at the proxy:
 
 ```toml
-model_provider = "bili"
-model = "glm-5.2"
-
-[model_providers.bili]
-name = "bili"
+# before:
+base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
+# after:
 base_url = "http://localhost:8787/zhipu/api/coding/paas/v4"
-wire_api = "responses"
-env_key = "OPENAI_API_KEY"   # Codex reads the key from this env var
 ```
+
+Everything else (`name`, `wire_api`, `env_key`) stays unchanged.
 
 > Codex's Responses API needs an upstream that speaks the Responses protocol.
 > Most regional OpenAI-compatible endpoints only speak `/chat/completions`; if

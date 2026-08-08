@@ -73,7 +73,7 @@ bili
 
 这就是为什么第 2 步让你声明带名字的 provider、第 3 步又让你把同样的名字
 放在客户端 base URL 的开头 —— 代理凭这个知道每条请求发到哪。
-稍后配置中`zhipu`被代表为 
+稍后在配置文件中,`zhipu` 对应的是:
 ```json
     "zhipu": {
       "url": "https://open.bigmodel.cn",
@@ -97,7 +97,7 @@ bili
       "models": {
         "glm-5.2": { "context": 1000000, "output": 131072 }
       }
-    }，
+    },
     "anthropic": "https://api.anthropic.com",
   }
 }
@@ -123,35 +123,21 @@ acp-proxy listening on http://127.0.0.1:8787 — routes: anthropic=https://api.a
 
 #### Pi(billion-context-pi)
 
-！！！！这里写由什么改成什么 ，我理解只改1行 ！！！！！！！！
-
-`~/.pi/agent/models.json` —— 声明一个指向你 proxy 路由的 provider,然后在
-`settings.json` 里设为默认:
+打开 `~/.pi/agent/models.json`,把你现有 provider 的 **`baseUrl` 这一行**改成指向代理,其他字段都不用动:
 
 ```jsonc
-// ~/.pi/agent/models.json
-{
-  "providers": {
-    "bili": {
-      "baseUrl": "http://localhost:8787/zhipu/api/coding/paas/v4",
-      "api": "openai-completions",
-      "apiKey": "<your key>",
-      "models": [{ "id": "glm-5.2", "contextWindow": 1000000, "maxTokens": 131072 }]
-    }
-  }
-}
-```
-```jsonc
-// ~/.pi/agent/settings.json
-{ "defaultProvider": "bili", "defaultModel": "glm-5.2" }
+// 改之前:
+"baseUrl": "https://open.bigmodel.cn/api/coding/paas/v4",
+// 改之后(把 host 换成代理 + 你起的 provider 名):
+"baseUrl": "http://localhost:8787/zhipu/api/coding/paas/v4",
 ```
 
-`api` 字段选择 Pi 的线路协议,必须和 `baseUrl` 指向的端点匹配 —— 两者不能互换:
+`http://localhost:8787` 是代理,`zhipu` 是第 2 步起的名字,剩余路径 `/api/coding/paas/v4` 原样转发到智谱。`apiKey`、`api`、`models` 都不用改。
 
-| `api` 值 | 指向 | `baseUrl` 示例 |
-|---|---|---|
-| `openai-completions` | OpenAI 兼容端点(GLM/DeepSeek/OpenAI) | `…/zhipu/api/coding/paas/v4` |
-| `anthropic-messages` | Anthropic 兼容端点 | `…/anthropic`(你声明的路由) |
+| `api` 值 | `baseUrl` 应指向 |
+|---|---|
+| `openai-completions` | OpenAI 兼容端点(GLM/DeepSeek/OpenAI)→ `…/zhipu/...` |
+| `anthropic-messages` | Anthropic 兼容端点 → `…/anthropic` |
 
 > 如果你装了 `billion-context-pi` 扩展,用隔离的 agent 目录跑 Pi
 > (`PI_CODING_AGENT_DIR=…`),免得客户端扩展和 proxy 双重压缩。
@@ -159,44 +145,29 @@ acp-proxy listening on http://127.0.0.1:8787 — routes: anthropic=https://api.a
 
 #### OpenCode
 
-`~/.config/opencode/opencode.json` —— 在 `provider` 下加一个,然后在 `model`
-里引用:
+打开 `~/.config/opencode/opencode.json`,把你现有 provider 的 **`baseURL` 这一行**改成指向代理:
 
 ```jsonc
-{
-  "provider": {
-    "bili": {
-      "options": {
-        "apiKey": "<your key>",
-        "baseURL": "http://localhost:8787/zhipu/api/coding/paas/v4"
-      },
-      "models": {
-        "glm-5.2": { "limit": { "context": 1000000, "output": 131072 } }
-      }
-    }
-  },
-  "model": "bili/glm-5.2"
-}
+// 改之前:
+"baseURL": "https://open.bigmodel.cn/api/coding/paas/v4"
+// 改之后:
+"baseURL": "http://localhost:8787/zhipu/api/coding/paas/v4"
 ```
 
-如果要走 Anthropic provider,把 `baseURL` 设为
-`http://localhost:8787/anthropic`。
+其他字段(`apiKey`、`models`)都不用改。如果要走 Anthropic provider,把 `baseURL` 改为 `http://localhost:8787/anthropic`。
 
 #### Codex
 
-`~/.codex/config.toml` —— 声明一个指向你 proxy 路由的 `model_provider`,
-然后选中它:
+打开 `~/.codex/config.toml`,把现有 provider 的 **`base_url` 这一行**改成指向代理:
 
 ```toml
-model_provider = "bili"
-model = "glm-5.2"
-
-[model_providers.bili]
-name = "bili"
+# 改之前:
+base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
+# 改之后:
 base_url = "http://localhost:8787/zhipu/api/coding/paas/v4"
-wire_api = "responses"
-env_key = "OPENAI_API_KEY"   # Codex 从这个环境变量读 key
 ```
+
+其他字段(`name`、`wire_api`、`env_key`)都不用改。
 
 > Codex 的 Responses API 需要上游说 Responses 协议。多数区域性 OpenAI
 > 兼容端点只说 `/chat/completions`;如果你的端点在 `/responses` 上 404,
