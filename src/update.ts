@@ -81,12 +81,16 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
     try {
         const now = Date.now();
         const lastCheck = await readLastCheck();
+        const sinceLastSec = lastCheck ? ((now - lastCheck) / 1000 | 0) : -1;
         if (!force && now - lastCheck < CHECK_INTERVAL_MS) {
-            loggerLog("info", `[update] check skipped (throttled, ${(CHECK_INTERVAL_MS - (now - lastCheck)) / 1000 | 0}s until next)`);
+            // Be explicit about BOTH directions so the count can't look wrong:
+            // "last checked Ns ago" (monotonic) + "retry in Ms" (countdown).
+            const retryIn = ((CHECK_INTERVAL_MS - (now - lastCheck)) / 1000 | 0);
+            loggerLog("info", `[update] throttled — last checked ${sinceLastSec}s ago, retry in ${retryIn}s`);
             return;
         }
         await writeLastCheck(now);
-        loggerLog("info", `[update] checking npm registry for ${opts.packageName}…`);
+        loggerLog("info", `[update] checking npm registry for ${opts.packageName} (last check ${sinceLastSec < 0 ? "never" : sinceLastSec + "s ago"})…`);
 
         const url = `${REGISTRY_BASE}/${opts.packageName}/latest`;
         const res = await fetch(url, {
