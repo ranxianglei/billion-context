@@ -32,7 +32,7 @@ import {
     conversationSignalResponses,
 } from "./responses.js";
 import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, withSessionLock } from "./session.js";
-import { COMPRESS_TOOL, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressTextSystemPrompt } from "./compress-tool.js";
+import { COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressTextSystemPrompt } from "./compress-tool.js";
 import { rewriteSseStream, rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { renderUI, handleConfigGet, handleConfigPut } from "./web.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
@@ -645,9 +645,10 @@ function injectSystem(
 }
 
 function injectTool(tools: unknown[] | undefined): unknown[] {
-    if (!Array.isArray(tools)) return [COMPRESS_TOOL];
-    if (tools.some((t) => (t as { name?: string })?.name === COMPRESS_TOOL_NAME)) return tools;
-    return [...tools, COMPRESS_TOOL];
+    if (!Array.isArray(tools)) return [...ACP_TOOLS_ANTHROPIC];
+    const names = new Set(tools.map((t) => (t as { name?: string })?.name));
+    const missing = ACP_TOOLS_ANTHROPIC.filter((t) => !names.has(t.name));
+    return missing.length === 0 ? tools : [...tools, ...missing];
 }
 
 function injectOpenaiTool(tools: OpenAITool[] | undefined): OpenAITool[] {
