@@ -151,7 +151,7 @@ non-model traffic.
 
 2. In the client's **Settings → Network / Proxy** set:
    - **HTTP Proxy**: `http://127.0.0.1:8787`
-   - **Proxy CA certificate path**: `/home/<you>/.local/share/billion-context/ca/root-ca.pem`
+   - **Proxy CA certificate path**: `~/.local/share/billion-context/ca/root-ca.pem`
    - (optional) **No-proxy list**: `localhost,127.0.0.1`
    - (For ZCode specifically: **Settings → Network**. For Codex/Claude Code:
      set the `HTTPS_PROXY` env var and `NODE_EXTRA_CA_CERTS` to the CA path.)

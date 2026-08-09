@@ -128,7 +128,7 @@ MITM 默认开启,且只对一份 **白名单**中的模型域名(`open.bigmodel
 
 2. 在客户端的 **设置 → 网络/代理** 里填:
    - **HTTP 代理**:`http://127.0.0.1:8787`
-   - **代理 CA 证书路径**:`/home/<你>/.local/share/billion-context/ca/root-ca.pem`
+   - **代理 CA 证书路径**:`~/.local/share/billion-context/ca/root-ca.pem`
    - (可选)**不走代理列表**:`localhost,127.0.0.1`
    - (ZCode 具体位置:**设置 → 网络**。Codex/Claude Code:设 `HTTPS_PROXY`
      环境变量 + `NODE_EXTRA_CA_CERTS` 指向 CA 路径。)
