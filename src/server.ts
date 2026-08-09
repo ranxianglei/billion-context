@@ -210,7 +210,21 @@ async function handle(
     log: (level: string, msg: string) => void,
 ): Promise<void> {
     if (req.method === "GET" && req.url === "/__bili/stats") return sendStats(res);
-    if (req.method === "GET" && (req.url === "/" || req.url === "/__bili/health")) {
+    if (req.method === "GET" && req.url === "/") {
+        // Browser visits root → redirect to the web UI. curl / health probes
+        // (Accept: */* or no Accept) still get the JSON health check so
+        // existing scripts and Docker-style health probes keep working.
+        const accept = req.headers.accept ?? "";
+        if (accept.includes("text/html")) {
+            res.writeHead(302, { location: "/__bili/" });
+            res.end();
+            return;
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, upstream: opts.upstream }));
+        return;
+    }
+    if (req.method === "GET" && req.url === "/__bili/health") {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: true, upstream: opts.upstream }));
         return;
