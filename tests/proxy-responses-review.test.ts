@@ -5,12 +5,14 @@ import { compressLoopResponsesStream } from "../src/compress-loop-responses.ts";
 import type { Config, CoreMessage } from "acp-kernel";
 import { createCore, createInitialState } from "acp-kernel";
 import type { Session } from "../src/session.ts";
+import { getSession } from "../src/session.ts";
 
 function makeCtx(log: (m: string) => void): { core: ReturnType<typeof createCore>; config: Config; messages: CoreMessage[]; session: Session; log: (m: string) => void } {
     return {
         core: createCore(),
         config: { modelContextLimit: 200000 } as Config,
         messages: [] as CoreMessage[],
+        session: getSession("test-session"),
         log,
     };
 }

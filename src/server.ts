@@ -58,46 +58,22 @@ const UPSTREAM_HOP_HEADERS = new Set([
     "content-encoding",
 ]);
 
-export function resolveUpstream(opts: ProxyOptions, reqUrl: string): { upstream: string; rewrittenUrl: string; provider: string } | undefined {
+export function resolveUpstream(_opts: ProxyOptions, reqUrl: string): { upstream: string; rewrittenUrl: string } | undefined {
     // Zero-config mode: a request like `/bili/https://open.bigmodel.cn/api/anthropic`
     // embeds the full upstream URL after the `/bili/` prefix. Strip the prefix,
-    // take the rest verbatim as the upstream. This lets users route without any
-    // config file at all — they just prefix their client's baseURL with the
-    // proxy origin + `/bili/`. The `/bili/` prefix doubles as a signal: client-side
-    // billion-context extensions (billion-context-pi / opencode-acp) can detect it
-    // in their own baseUrl and self-disable, avoiding double compression.
+    // take the rest verbatim as the upstream. This is the ONLY routing mode —
+    // there are no named providers. The `/bili/` prefix doubles as a signal:
+    // client-side billion-context extensions (billion-context-pi / opencode-acp)
+    // can detect it in their own baseUrl and self-disable, avoiding double
+    // compression.
     if (reqUrl.startsWith("/bili/http://") || reqUrl.startsWith("/bili/https://")) {
         const full = reqUrl.slice(6); // drop "/bili/"
         try {
             const u = new URL(full);
-            return { upstream: `${u.protocol}//${u.host}`, rewrittenUrl: full, provider: "bili" };
+            return { upstream: `${u.protocol}//${u.host}`, rewrittenUrl: full };
         } catch {
-            // malformed embedded URL — fall through to named matching, which will miss
+            // malformed embedded URL
         }
-    }
-    const names = Object.keys(opts.routes);
-    if (names.length === 0) return undefined;
-    // Provider names that coincide with common API path segments are rejected
-    // so they can't swallow real segments. If a user really names a route
-    // "chat" or "v1" they'd collide with every request, so we treat those as
-    // configuration errors and skip them.
-    const RESERVED = new Set(["v1", "v2", "v4", "chat", "completions", "messages", "models", "api"]);
-    // Match a provider name as a standalone path segment anywhere in the URL.
-    // Examples: /v1/glm/chat/completions → glm; /anthropic/v1/messages → anthropic.
-    // Names are sorted longest-first so a name like "openai" can't be shadowed
-    // by a shorter segment it contains.
-    const sorted = [...names].sort((a, b) => b.length - a.length);
-    const segments = reqUrl.split("/");
-    for (const name of sorted) {
-        if (!/^[A-Za-z][A-Za-z0-9_-]*$/.test(name)) continue;
-        if (RESERVED.has(name.toLowerCase())) continue;
-        const idx = segments.indexOf(name);
-        if (idx < 0) continue;
-        const base = opts.routes[name].url.replace(/\/$/, "");
-        // Drop the single provider-name segment, keep the rest.
-        const rest = [...segments.slice(0, idx), ...segments.slice(idx + 1)].join("/");
-        const rewrittenUrl = base + rest;
-        return { upstream: base, rewrittenUrl, provider: name };
     }
     return undefined;
 }
@@ -138,16 +114,13 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     });
     server.listen(opts.port, opts.host, () => {
         const displayHost = opts.host === "0.0.0.0" ? "localhost" : opts.host;
+        const nOverrides = Object.keys(opts.routes).length;
         log(
             "info",
             `acp-proxy listening on http://${displayHost}:${opts.port}` +
-                (Object.keys(opts.routes).length
-                    ? ` — routes: ${Object.entries(opts.routes)
-                          .map(([n, u]) => `${n}=${typeof u === "string" ? u : u.url}`)
-                          .join(", ")}`
-                    : ` → ${opts.upstream}`) +
-                ` — web UI: http://${displayHost}:${opts.port}/__acp/` +
-                ` — zero-config: prefix any baseURL with http://${displayHost}:${opts.port}/bili/`,
+                ` — web UI: http://${displayHost}:${opts.port}/__bili/` +
+                ` — zero-config: prefix any baseURL with http://${displayHost}:${opts.port}/bili/` +
+                (nOverrides ? ` — context overrides for ${nOverrides} upstream URL(s)` : ""),
         );
     });
     // Listen errors (EADDRINUSE port taken, EACCES privileged port, EAFNOSUPPORT
@@ -236,22 +209,36 @@ async function handle(
     config: Config,
     log: (level: string, msg: string) => void,
 ): Promise<void> {
-    if (req.method === "GET" && req.url === "/__acp/stats") return sendStats(res);
-    if (req.method === "GET" && (req.url === "/" || req.url === "/__acp/health")) {
+    if (req.method === "GET" && req.url === "/__bili/stats") return sendStats(res);
+    if (req.method === "GET" && req.url === "/") {
+        // Browser visits root → redirect to the web UI. curl / health probes
+        // (Accept: */* or no Accept) still get the JSON health check so
+        // existing scripts and Docker-style health probes keep working.
+        const accept = req.headers.accept ?? "";
+        if (accept.includes("text/html")) {
+            res.writeHead(302, { location: "/__bili/" });
+            res.end();
+            return;
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, upstream: opts.upstream }));
+        return;
+    }
+    if (req.method === "GET" && req.url === "/__bili/health") {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: true, upstream: opts.upstream }));
         return;
     }
     // Web config UI (served as HTML, separate from the JSON health check above).
-    if (req.method === "GET" && req.url === "/__acp/") {
+    if (req.method === "GET" && req.url === "/__bili/") {
         const origin = `http://${opts.host === "0.0.0.0" ? "localhost" : opts.host}:${opts.port}`;
         res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
         res.end(renderUI(origin));
         return;
     }
-    if (req.method === "GET" && req.url === "/__acp/config") return handleConfigGet(res);
-    if (req.method === "PUT" && req.url === "/__acp/config") return handleConfigPut(req, res);
-    if (req.method === "POST" && req.url === "/__acp/config/reload") return handleConfigReload(opts, res, log);
+    if (req.method === "GET" && req.url === "/__bili/config") return handleConfigGet(res);
+    if (req.method === "PUT" && req.url === "/__bili/config") return handleConfigPut(req, res);
+    if (req.method === "POST" && req.url === "/__bili/config/reload") return handleConfigReload(opts, res, log);
     let bodyBuffer: Buffer;
     try {
         bodyBuffer = await readBody(req);
@@ -306,12 +293,13 @@ async function handle(
     if (parsed && typeof parsed === "object") {
         const model = (parsed as { model?: string }).model;
         if (model) {
-            let limit = resolveContextLimit(opts.routes, route?.provider, model);
-            // Zero-config routes (provider "bili") have no per-model config; try the
-            // models.dev registry as a middle layer before the prefix table / default.
-            if (!limit && route?.provider === "bili" && route.upstream) {
-                const host = (() => { try { return new URL(route.upstream).host; } catch { return undefined; } })();
-                limit = await contextFromRegistry(model, host) ?? undefined;
+            // Match config by the embedded upstream URL (the /bili/<this> string).
+            // The registry is a middle layer when config doesn't cover this URL/model.
+            const embeddedUrl = route?.rewrittenUrl;
+            let limit = resolveContextLimit(opts.routes, embeddedUrl, model);
+            if (!limit && embeddedUrl) {
+                const host = (() => { try { return new URL(embeddedUrl).host; } catch { return undefined; } })();
+                limit = await contextFromRegistry(model, host);
             }
             if (limit && limit !== config.modelContextLimit) {
                 reqConfig = { ...config, modelContextLimit: limit };
@@ -692,8 +680,9 @@ async function forward(
     const upstreamUrl = route ? route.rewrittenUrl : opts.upstream + (req.url ?? "");
     // Show the final proxied URL (where the request actually lands) as the
     // primary signal. The provider label is appended only for named routes —
-    // zero-config (/p/) requests have no meaningful name, so we omit it.
-    log("info", `forward ${req.method} → ${upstreamUrl}${route && route.provider !== "bili" ? `  [${route.provider}]` : ""}`);
+    // zero-config requests have a single routing mode now, so the final
+    // proxied URL is the only useful signal in the log.
+    log("info", `forward ${req.method} → ${upstreamUrl}`);
     if (process.env.ACP_DEBUG && prepared) {
         const sid = prepared.session.id;
         const hdrKeys = Object.keys(req.headers);
