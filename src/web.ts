@@ -283,6 +283,7 @@ var savedProviders = null;
 // ── helpers ──
 function el(id) { return document.getElementById(id); }
 function esc(s) { return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+function autosize(t) { t.style.height="auto"; t.style.height=t.scrollHeight+"px"; }
 function fmtTok(n) { if (n >= 1000000) return (n/1000000).toFixed(1)+"M"; if (n >= 1000) return (n/1000).toFixed(1)+"K"; return String(n); }
 function toast(msg, isErr) {
   var t = el("toast"); t.textContent = msg; t.className = "toast show" + (isErr ? " err" : "");
@@ -330,7 +331,7 @@ function renderProviders() {
   if (providers.length === 0) html = '<div class="empty">No providers yet. Click "Add provider" below.</div>';
     providers.forEach(function(p, i) {
     html += '<div class="card">';
-    html += '<div class="card-head"><div class="name"><input class="mono" value="'+esc(p.url)+'" onchange="providers['+i+'].url=this.value" placeholder="https://upstream/api/path" style="background:transparent;border:none;padding:0;width:100%"></div>';
+    html += '<div class="card-head" style="align-items:flex-start"><div class="name" style="flex:1;min-width:0;width:100%"><textarea class="mono url-edit" onchange="providers['+i+'].url=this.value" oninput="autosize(this)" placeholder="https://upstream/api/path" style="background:transparent;border:1px dashed var(--border);border-radius:4px;padding:6px 8px;width:100%;resize:none;overflow:hidden;font-weight:600;color:var(--accent);font-family:inherit;font-size:13px;line-height:1.4">'+esc(p.url)+'</textarea></div>';
     html += '<button class="btn danger small" onclick="removeProvider('+i+')">Remove</button></div>';
     html += '<div class="client-setup">';
     html += '<div class="client-head">Client base URL — copy this into Pi / OpenCode / Codex / Claude Code config:</div>';
@@ -348,6 +349,7 @@ function renderProviders() {
     html += '</div>';
   });
   el("providers-list").innerHTML = html;
+  document.querySelectorAll(".url-edit").forEach(autosize);
   checkDirty();
 }
 function addProvider() {
