@@ -107,8 +107,8 @@ base_url = "http://localhost:8787/bili/https://api.openai.com/v1"
 | 客户端 | 登录方式 | 硬编码端点 | 状态 |
 |---|---|---|---|
 | **ZCode** | 智谱 coding plan(OAuth) | `open.bigmodel.cn`(内置 provider) | ✅ 已测试 |
-| **Codex** | ChatGPT 账号(OAuth) | `chatgpt.com/backend-api` | ⚠️ 未测试 |
-| **Claude Code** | Claude 订阅(OAuth) | `api.anthropic.com` | ⚠️ 未测试 |
+| **Codex** | ChatGPT 账号(OAuth) | `chatgpt.com/backend-api` | ❓ 未测试(可能不支持,需验证) |
+| **Claude Code** | Claude 订阅(OAuth) | `api.anthropic.com` | ❓ 未测试(可能不支持,需验证) |
 
 MITM 模式原理:这类客户端只提供 **HTTP 代理**设置,所以它发送
 `CONNECT <域名>:443`;billion-context 在本地用自生成的根 CA 终止 TLS,在明文里注入压缩,再重新加密转发。OAuth token 随客户端的

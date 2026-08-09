@@ -126,8 +126,8 @@ Supported login clients:
 | Client | Login | Endpoint hardcoded | Status |
 |---|---|---|---|
 | **ZCode** | bigmodel coding plan (OAuth) | `open.bigmodel.cn` (builtin provider) | ✅ tested |
-| **Codex** | ChatGPT account (OAuth) | `chatgpt.com/backend-api` | ⚠️ untested |
-| **Claude Code** | Claude subscription (OAuth) | `api.anthropic.com` | ⚠️ untested |
+| **Codex** | ChatGPT account (OAuth) | `chatgpt.com/backend-api` | ❓ untested (may not work — needs verification) |
+| **Claude Code** | Claude subscription (OAuth) | `api.anthropic.com` | ❓ untested (may not work — needs verification) |
 
 How MITM mode works: the client only offers an **HTTP proxy** setting, so it
 sends `CONNECT <host>:443`; billion-context terminates the TLS locally (with a
