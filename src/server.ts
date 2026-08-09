@@ -214,6 +214,11 @@ type Prepared = {
     body: string;
     session: Session;
     processedMessages: CoreMessage[];
+    /** Original CoreMessages from the protocol conversion, BEFORE processTurn
+     *  folded/replaced anything. compress/decompress/acp_status need the raw
+     *  text (collectBlockContent reads message text by id); processedMessages
+     *  has compressed messages replaced with placeholders → empty content. */
+    originalMessages: CoreMessage[];
     protocol: "anthropic" | "openai" | "responses";
     stream: boolean;
     compressInjected: boolean;
@@ -423,12 +428,14 @@ function prepareAnthropic(
     ++session.stats.requests;
 
     let processedMessages: CoreMessage[] = [];
+    let originalMessages: CoreMessage[] = [];
     let rebuiltMessages = parsed.messages;
     let systemOut = parsed.system;
     let toolsOut = parsed.tools;
 
     try {
         const { msgs, cacheControls } = anthropicToCore(parsed);
+        originalMessages = msgs;
         // tokenCount drives the nudge decision ("should we compress?"). It MUST
         // be the real context size, never an estimate — estimates undercount
         // CJK text 3-4x and never trigger compression for Chinese sessions.
@@ -474,7 +481,7 @@ function prepareAnthropic(
 
     const rebuilt: AnthropicRequestBody = { ...parsed, messages: rebuiltMessages, system: systemOut, tools: toolsOut };
     markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, processedMessages, protocol: "anthropic", stream, compressInjected: opts.compress.injectTool } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "anthropic", stream, compressInjected: opts.compress.injectTool } as Prepared;
 }
 
 function prepareOpenai(
@@ -491,6 +498,7 @@ function prepareOpenai(
     ++session.stats.requests;
 
     let processedMessages: CoreMessage[] = [];
+    let originalMessages: CoreMessage[] = [];
     let rebuiltMessages = parsed.messages;
     let toolsOut = parsed.tools;
 
@@ -506,6 +514,7 @@ function prepareOpenai(
 
     try {
         const { msgs } = openaiToCore(parsed);
+        originalMessages = msgs;
         // tokenCount = upstream's real input_tokens from the previous turn
         // (see anthropic branch comment). Never an estimate.
         const tokenCount = session.stats.lastInputTokens;
@@ -560,7 +569,7 @@ function prepareOpenai(
         (rebuilt as Record<string, unknown>).stream_options = { include_usage: true };
     }
     markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, processedMessages, protocol: "openai", stream, compressInjected: shouldInject } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: shouldInject } as Prepared;
 }
 
 function prepareResponses(
@@ -577,6 +586,7 @@ function prepareResponses(
     ++session.stats.requests;
 
     let processedMessages: CoreMessage[] = [];
+    let originalMessages: CoreMessage[] = [];
     let rebuiltInput: ResponseInputItem[] | string = parsed.input;
     let toolsOut = parsed.tools;
 
@@ -584,6 +594,7 @@ function prepareResponses(
 
     try {
         const { msgs, systemParts, preamble, customToolCallIds } = responsesToCore(parsed);
+        originalMessages = msgs;
         if (process.env.ACP_DEBUG) {
             log("info", `[${sessionId}] input items: ${Array.isArray(parsed.input) ? parsed.input.map((i: ResponseInputItem) => i.type).join(",") : "(string)"}`);
         }
@@ -660,7 +671,7 @@ function prepareResponses(
         log("info", `[${sessionId}] responses forward tools=[${fwdTools.join(",")}] injectTool=${shouldInject} NO_INJECT_TOOL=${!!process.env.ACP_NO_INJECT_TOOL} NO_COMPRESS_PROMPT=${!!process.env.ACP_NO_COMPRESS_PROMPT}`);
     }
     markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, processedMessages, protocol: "responses", stream, compressInjected: shouldInject } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "responses", stream, compressInjected: shouldInject } as Prepared;
 }
 
 function injectSystem(
@@ -830,7 +841,7 @@ async function forward(
     const ctx: RewriteCtx = {
         core,
         config,
-        messages: prepared.processedMessages,
+        messages: prepared.originalMessages,
         session: prepared.session,
         log: (msg: string) => log("info", `[${prepared.session.id}] ${msg}`),
         debug: opts.debug,
@@ -858,7 +869,7 @@ async function forward(
             reqHeaders["content-type"] = "application/json";
             const loop = compressLoopStream(
                 streamToRead,
-                { core, config, messages: prepared.processedMessages, session: prepared.session, log: ctx.log },
+                { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log },
                 parsedReq,
                 { url: upstreamUrl, headers: reqHeaders },
             );
@@ -881,7 +892,7 @@ async function forward(
             reqHeaders["content-type"] = "application/json";
             const loop = compressLoopResponsesStream(
                 streamToRead,
-                { core, config, messages: prepared.processedMessages, session: prepared.session, log: ctx.log },
+                { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log },
                 parsedReq,
                 { url: upstreamUrl, headers: reqHeaders },
             );
@@ -904,7 +915,7 @@ async function forward(
             reqHeaders["content-type"] = "application/json";
             const loop = compressLoopAnthropicStream(
                 streamToRead,
-                { core, config, messages: prepared.processedMessages, session: prepared.session, log: ctx.log },
+                { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log },
                 parsedReq,
                 { url: upstreamUrl, headers: reqHeaders },
             );
