@@ -8,7 +8,7 @@
  * it from growing without bound: when the existing file exceeds MAX_BYTES it
  * is renamed to <file>.old and a fresh file is started.
  */
-import { createWriteStream, mkdirSync, statSync, renameSync, type WriteStream } from "node:fs";
+import { createWriteStream, mkdirSync, statSync, existsSync, renameSync, type WriteStream } from "node:fs";
 import path from "node:path";
 
 const MAX_BYTES = 10 * 1024 * 1024; // 10 MB → rotate
@@ -69,6 +69,16 @@ export const log: Logger = (level, msg) => {
     process.stderr.write(line);
     // file — durable record.
     if (stream && logPath) {
+        // The underlying file can vanish under us without the stream noticing:
+        // another process deletes it (rebuild, logrotate, `rm`, a restart that
+        // clobbers it). Once the inode is unlinked, writes still "succeed" but
+        // go to a now-private inode that no path points to — the log vanishes
+        // into a black hole while the proxy keeps running. Reopen if the path
+        // no longer resolves to an existing file.
+        if (!existsSync(logPath)) {
+            stream.end();
+            stream = open(logPath);
+        }
         // Runtime rotation: if we've crossed the threshold since last check,
         // reopen the file (rotates the old one out). This keeps a long-running
         // proxy's log bounded without needing a restart.
