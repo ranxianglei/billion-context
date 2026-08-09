@@ -371,3 +371,29 @@ test("responses: call item and reasoning keep distinct ids in the same turn", ()
     assert.equal(ids.length, 2);
     assert.notEqual(ids[0], ids[1], "same raw id does not collide across kinds");
 });
+
+// 17. ACP_REASONING_KEEP=none drops chain-of-thought but MUST preserve call
+// items: call items reuse the "reasoning" contentType only as a compression
+// bucket, not because they are reasoning. Dropping a computer_call would
+// corrupt the Responses conversation replay.
+test("responses: ACP_REASONING_KEEP=none drops reasoning but keeps call items", () => {
+    const prev = process.env.ACP_REASONING_KEEP;
+    process.env.ACP_REASONING_KEEP = "none";
+    try {
+        const body: ResponsesRequestBody = {
+            input: [
+                { type: "reasoning", id: "rs_1", encrypted_content: "E" },
+                { type: "computer_call", id: "cc_1", action: { type: "screenshot" } } as ResponseInputItem,
+                { type: "mcp_call", id: "mc_1", name: "n", arguments: "{}" } as ResponseInputItem,
+            ],
+        };
+        const { msgs } = responsesToCore(body);
+        const reasoning = msgs.filter((m) => (m.rawResponsesItem as { type?: string }).type === "reasoning");
+        const calls = msgs.filter((m) => (m.rawResponsesItem as { type?: string }).type !== "reasoning" && m.contentType === "reasoning");
+        assert.equal(reasoning.length, 0, "chain-of-thought is dropped under ACP_REASONING_KEEP=none");
+        assert.equal(calls.length, 2, "computer_call + mcp_call survive (replay-critical)");
+    } finally {
+        if (prev === undefined) delete process.env.ACP_REASONING_KEEP;
+        else process.env.ACP_REASONING_KEEP = prev;
+    }
+});

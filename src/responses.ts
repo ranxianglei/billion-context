@@ -193,6 +193,10 @@ export function responsesToCore(body: ResponsesRequestBody): Flat {
         }
         switch (it.type) {
             case "reasoning": {
+                // shouldDropAllReasoning() is checked ONLY here, not in the
+                // call-item cases below: dropping chain-of-thought is safe, but
+                // a computer_call/mcp_call is replay-critical. Call items reuse
+                // "reasoning" only as a compression-safe contentType bucket.
                 if (shouldDropAllReasoning()) {
                     droppedReasoning++;
                     break;
