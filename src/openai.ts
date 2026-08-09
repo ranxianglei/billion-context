@@ -1,6 +1,7 @@
 import type { CoreMessage } from "acp-kernel";
 import { hashId } from "./util.js";
 import { ClusterCounter, deriveMessageId } from "./message-id.js";
+import { parseDataUrl, type BiliMessage } from "./bili-message.js";
 
 export type OpenAIContentPart =
     | { type: "text"; text: string }
@@ -34,22 +35,30 @@ export type OpenAIRequestBody = {
     [key: string]: unknown;
 };
 
-type Flat = { msgs: CoreMessage[] };
+type Flat = { msgs: BiliMessage[] };
 
 export function openaiToCore(body: OpenAIRequestBody): Flat {
-    const msgs: CoreMessage[] = [];
+    const msgs: BiliMessage[] = [];
     const clusters = new ClusterCounter();
     for (const m of body.messages) {
         switch (m.role) {
             case "system":
             case "developer": {
                 const base = deriveMessageId(m.role, "text", stringContent(m.content));
-                msgs.push({ id: clusters.next(base), role: "system", contentType: "text", text: stringContent(m.content) });
+                msgs.push({ id: clusters.next(base), role: "system", contentType: "text", text: stringContent(m.content), originalRole: m.role });
                 break;
             }
             case "user": {
-                const base = deriveMessageId("user", "text", stringContent(m.content));
-                msgs.push({ id: clusters.next(base), role: "user", contentType: "text", text: stringContent(m.content) });
+                const text = stringContent(m.content);
+                const img = firstImagePart(m.content);
+                const base = deriveMessageId("user", "text", text);
+                msgs.push({
+                    id: clusters.next(base),
+                    role: "user",
+                    contentType: "text",
+                    text,
+                    ...(img ? { rawOpenaiContent: img.part, imageMediaType: img.mediaType, imageBase64: img.base64 } : {}),
+                });
                 break;
             }
             case "assistant": {
@@ -94,7 +103,7 @@ export function openaiToCore(body: OpenAIRequestBody): Flat {
     return { msgs };
 }
 
-export function coreToOpenai(messages: CoreMessage[]): OpenAIMessage[] {
+export function coreToOpenai(messages: BiliMessage[]): OpenAIMessage[] {
     const out: OpenAIMessage[] = [];
     let pending: { text: string | null; toolCalls: OpenAIToolCall[] } | null = null;
     const flush = () => {
@@ -125,9 +134,20 @@ export function coreToOpenai(messages: CoreMessage[]): OpenAIMessage[] {
         } else {
             flush();
             if (m.role === "system") {
-                out.push({ role: "system", content: m.text ?? "" });
+                out.push({ role: m.originalRole === "developer" ? "developer" : "system", content: m.text ?? "" });
             } else if (m.role === "user") {
-                out.push({ role: "user", content: m.text ?? "" });
+                if (m.rawOpenaiContent || m.imageBase64) {
+                    const parts: OpenAIContentPart[] = [];
+                    if (m.text) parts.push({ type: "text", text: m.text });
+                    if (m.rawOpenaiContent) {
+                        parts.push(m.rawOpenaiContent as OpenAIContentPart);
+                    } else if (m.imageBase64 && m.imageMediaType) {
+                        parts.push({ type: "image_url", image_url: { url: `data:${m.imageMediaType};base64,${m.imageBase64}` } });
+                    }
+                    out.push({ role: "user", content: parts });
+                } else {
+                    out.push({ role: "user", content: m.text ?? "" });
+                }
             } else if (m.role === "tool") {
                 out.push({ role: "tool", tool_call_id: m.toolCallId ?? "", content: m.text ?? "" });
             }
@@ -168,4 +188,19 @@ function stringContent(content: OpenAIMessage["content"]): string {
             .join("\n");
     }
     return "";
+}
+
+function firstImagePart(content: OpenAIMessage["content"]): { part: OpenAIContentPart; mediaType: string; base64: string } | undefined {
+    if (!Array.isArray(content)) return undefined;
+    for (const p of content) {
+        if (p && typeof p === "object" && p.type === "image_url") {
+            const iu = (p as { image_url?: { url?: string } }).image_url;
+            const url = iu?.url;
+            if (typeof url === "string") {
+                const parsed = parseDataUrl(url);
+                if (parsed) return { part: p, mediaType: parsed.mediaType, base64: parsed.base64 };
+            }
+        }
+    }
+    return undefined;
 }

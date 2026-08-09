@@ -48,6 +48,7 @@ import { rewriteResponsesSseStream, rewriteResponsesJsonResponse } from "./strea
 import { emitStreamError } from "./stream-error.js";
 import { deriveSessionId as deriveProxySessionId, affinityToken, clientConversationHeader } from "./session-id.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
+import type { BiliMessage } from "./bili-message.js";
 
 const UPSTREAM_HOP_HEADERS = new Set([
     "host",
@@ -224,6 +225,13 @@ type Prepared = {
     compressInjected: boolean;
 };
 
+/** True if `addr` is a loopback (IPv4 127.x or IPv6 ::1 / ::ffff:127.0.0.1).
+ *  Used to gate the management endpoints to local connections only. */
+function isLoopback(addr: string | undefined): boolean {
+    if (!addr) return false;
+    return addr === "::1" || addr === "127.0.0.1" || addr.startsWith("127.") || addr.startsWith("::ffff:127.");
+}
+
 async function handle(
     req: http.IncomingMessage,
     res: http.ServerResponse,
@@ -232,6 +240,19 @@ async function handle(
     config: Config,
     log: (level: string, msg: string) => void,
 ): Promise<void> {
+    // SECURITY: the /__bili/ management endpoints (config read/write, reload,
+    // session stats) are privileged — a remote caller who can reach them can
+    // rewrite upstream routing to exfiltrate API keys (MITM). Restrict them
+    // to loopback connections. The proxy default host is 127.0.0.1 (loopback
+    // only), but a user can set --host 0.0.0.0 to share the proxy on a LAN —
+    // in that case we still must NOT expose management to the LAN. Only the
+    // proxy /bili/ and CONNECT (model traffic) endpoints remain open to all.
+    const isAdminPath = req.url === "/__bili/" || req.url?.startsWith("/__bili/") || req.url === "/__acp/" || req.url?.startsWith("/__acp/");
+    if (isAdminPath && !isLoopback(req.socket.remoteAddress)) {
+        res.writeHead(403, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "management endpoints are loopback-only; access denied for " + (req.socket.remoteAddress ?? "unknown") }));
+        return;
+    }
     if (req.method === "GET" && req.url === "/__bili/stats") return sendStats(res);
     if (req.method === "GET" && req.url === "/") {
         // Browser visits root → redirect to the web UI. curl / health probes
@@ -457,7 +478,7 @@ function prepareAnthropic(
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit));
         processedMessages = turn.messages;
         reapOrphanBlocks(session, msgs, deactivateBlock);
-        rebuiltMessages = coreToAnthropic(processedMessages, cacheControls);
+        rebuiltMessages = coreToAnthropic(processedMessages as BiliMessage[], cacheControls);
 
         systemOut = injectSystem(parsed, opts);
         if (opts.compress.injectTool) {
@@ -529,7 +550,7 @@ function prepareOpenai(
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit));
         processedMessages = turn.messages;
         reapOrphanBlocks(session, msgs, deactivateBlock);
-        rebuiltMessages = coreToOpenai(processedMessages);
+        rebuiltMessages = coreToOpenai(processedMessages as BiliMessage[]);
 
         // ONLY the static compress prompt goes into the system message — the
         // system prompt is the prefix-cache anchor and must be byte-stable
@@ -620,7 +641,7 @@ function prepareResponses(
         //   input[2..] = conversation history (compressed)
         //   top-level `instructions` is NEVER touched — it must stay empty for
         //   responses_lite. Setting it non-empty breaks code_mode tool exposure.
-        const conversationItems = coreToResponses(processedMessages, customToolCallIds);
+        const conversationItems = coreToResponses(processedMessages as BiliMessage[], customToolCallIds);
         if (preamble.length > 0) {
             log("info", `[${sessionId}] preserved ${preamble.length} opaque preamble item(s): ${preamble.map((p) => p.type).join(",")}`);
         }

@@ -10,6 +10,12 @@ export default defineConfig({
     sourcemap: true,
     splitting: false,
     shims: false,
+    // acp-kernel is a BUILD-TIME dependency: tsup inlines it into dist so the
+    // published artifact is self-contained (zero runtime deps). Without
+    // noExternal, esbuild keeps `import ... from "acp-kernel"` in dist, and
+    // npm then installs acp-kernel as a runtime dep — breaking the
+    // "dist/index.js is self-contained" contract (AGENTS.md §2.1).
+    noExternal: ["acp-kernel", "node-forge"],
     banner: {
         // node-forge is a CommonJS dependency that calls require("crypto") etc.
         // inlined into our ESM output, esbuild's __require shim throws in an

@@ -20,7 +20,7 @@
  * version and stops trying. No notified Set — failed installs retry next
  * cycle automatically.
  */
-import { readFile, writeFile, mkdir, access, constants, rm, cp } from "node:fs/promises";
+import { readFile, writeFile, mkdir, access, constants, rm, cp, unlink } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import * as tar from "tar";
 import path from "node:path";
@@ -147,8 +147,24 @@ async function tryAcquireLock(): Promise<{ release: () => Promise<void> } | null
             // Another process is actively updating — back off.
             return null;
         }
-        // Lock is stale (holder dead or timeout) — steal it.
+        // Lock is stale (holder dead or timeout) — steal it. MUST delete the
+        // stale lock file first: writeFile({flag:"wx"}) below requires the path
+        // to NOT exist, and the stale file is still there. Without this unlink
+        // the wx write always fails → update returns null forever → a single
+        // crash during update permanently blocks all future auto-updates.
         loggerLog("info", `[update] stealing stale lock (pid=${existing.pid}, age=${Math.round(age / 1000)}s, alive=${holderAlive})`);
+        try {
+            await unlink(LOCK_FILE);
+        } catch (e) {
+            const code = (e as NodeJS.ErrnoException).code;
+            // ENOENT is fine (someone else already cleaned it). Anything else
+            // (EACCES, EBUSY on Windows) means we can't steal — bail out
+            // rather than hammering wx writes that will all fail.
+            if (code !== "ENOENT") {
+                loggerLog("warn", `[update] could not remove stale lock: ${(e as Error).message}`);
+                return null;
+            }
+        }
     }
 
     // Write our lock. Use flag "wx" to fail if file already exists.

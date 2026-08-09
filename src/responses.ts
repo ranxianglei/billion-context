@@ -1,6 +1,7 @@
 import type { CoreMessage } from "acp-kernel";
 import { hashId } from "./util.js";
 import { ClusterCounter, deriveMessageId } from "./message-id.js";
+import { parseDataUrl, type BiliMessage } from "./bili-message.js";
 
 /**
  * OpenAI Responses API protocol shapes.
@@ -61,7 +62,7 @@ export type ResponsesRequestBody = {
 };
 
 type Flat = {
-    msgs: CoreMessage[];
+    msgs: BiliMessage[];
     systemParts: string[];
     preamble: ResponseInputItem[];
     /** call_ids that arrived as custom_tool_call / custom_tool_call_output.
@@ -108,8 +109,23 @@ function messageContent(c: string | ResponseContentPart[]): string {
     return "";
 }
 
+function findInputImage(c: string | ResponseContentPart[]): { mediaType?: string; base64?: string } | undefined {
+    if (!Array.isArray(c)) return undefined;
+    for (const p of c) {
+        if (p && typeof p === "object" && p.type === "input_image") {
+            const url = (p as { image_url?: string }).image_url;
+            if (typeof url === "string") {
+                const parsed = parseDataUrl(url);
+                if (parsed) return { mediaType: parsed.mediaType, base64: parsed.base64 };
+            }
+            return {};
+        }
+    }
+    return undefined;
+}
+
 export function responsesToCore(body: ResponsesRequestBody): Flat {
-    const msgs: CoreMessage[] = [];
+    const msgs: BiliMessage[] = [];
     const systemParts: string[] = [];
     const preamble: ResponseInputItem[] = [];
     const customToolCallIds = new Set<string>();
@@ -140,8 +156,22 @@ export function responsesToCore(body: ResponsesRequestBody): Flat {
                 if (m.role === "system" || m.role === "developer") {
                     systemParts.push(text);
                 } else if (m.role === "user") {
+                    const img = findInputImage(m.content);
                     const base = deriveMessageId("user", "text", text);
-                    msgs.push({ id: clusters.next(base), role: "user", contentType: "text", text });
+                    msgs.push({
+                        id: clusters.next(base),
+                        role: "user",
+                        contentType: "text",
+                        text,
+                        ...(img
+                            ? {
+                                  rawResponsesItem: it,
+                                  ...(img.mediaType && img.base64
+                                      ? { imageMediaType: img.mediaType, imageBase64: img.base64 }
+                                      : {}),
+                              }
+                            : {}),
+                    });
                     idx++;
                 } else if (m.role === "assistant") {
                     if (text) {
@@ -231,7 +261,7 @@ export function responsesToCore(body: ResponsesRequestBody): Flat {
 }
 
 export function coreToResponses(
-    messages: CoreMessage[],
+    messages: BiliMessage[],
     customToolCallIds: Set<string> = new Set(),
 ): ResponseInputItem[] {
     const out: ResponseInputItem[] = [];
@@ -239,7 +269,11 @@ export function coreToResponses(
         if (m.role === "system") {
             out.push({ type: "message", role: "developer", content: m.text ?? "" });
         } else if (m.role === "user") {
-            out.push({ type: "message", role: "user", content: m.text ?? "" });
+            if (m.rawResponsesItem) {
+                out.push(m.rawResponsesItem as ResponseInputItem);
+            } else {
+                out.push({ type: "message", role: "user", content: m.text ?? "" });
+            }
         } else if (m.role === "assistant") {
             if (m.contentType === "text") {
                 out.push({ type: "message", role: "assistant", content: m.text ?? "" });

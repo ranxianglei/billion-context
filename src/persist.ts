@@ -157,6 +157,12 @@ export class SessionStore {
     /** Monotonic counter for unique temp filenames within a process. */
     private tmpSeq = 0;
     private readonly log: Logger;
+    /** Per-session write serialization chain. Each writeNow/flushSync chains
+     *  onto the previous write for the SAME session, so two concurrent writes
+     *  to the same session never race on fs.rename (Windows: EPERM/EBUSY when
+     *  two renames target the same file). The promise resolves when this
+     *  session's write queue is fully drained. */
+    private readonly writeChains = new Map<string, Promise<void>>();
 
     constructor(opts?: { dir?: string; debounceMs?: number; enabled?: boolean; log?: Logger }) {
         this.dir = opts?.dir ?? defaultDir();
@@ -279,8 +285,25 @@ export class SessionStore {
     }
 
     /** Asynchronously persist a session right now (skips the debounce). Throws
-     *  on write failure so callers can react (e.g. avoid evicting). */
+     *  on write failure so callers can react (e.g. avoid evicting). Serialized
+     *  per-session via writeChains so concurrent writes don't race on rename. */
     async writeNow(session: Session): Promise<void> {
+        if (!this.enabled) return;
+        const id = session.id;
+        // Chain this write after any in-flight write for the same session.
+        // The previous promise may reject (disk full, EPERM) — catch so our
+        // chain doesn't break, then run our own write.
+        const prev = this.writeChains.get(id) ?? Promise.resolve();
+        const next = prev.catch(() => {}).then(() => this.writeNowInner(session));
+        this.writeChains.set(id, next);
+        // Clean up the chain entry once settled so the Map doesn't grow.
+        next.finally(() => {
+            if (this.writeChains.get(id) === next) this.writeChains.delete(id);
+        });
+        return next;
+    }
+
+    private async writeNowInner(session: Session): Promise<void> {
         if (!this.enabled) return;
         const record = buildRecord(session);
         const file = this.filePath(session.id, session.meta.protocol, session.meta.upstreamOrigin);
@@ -298,7 +321,7 @@ export class SessionStore {
         // leaving an orphan that the next write can collide with.
         try {
             await fs.writeFile(tmp, data, "utf8");
-            await fs.rename(tmp, file);
+            await renameWithRetry(tmp, file);
         } catch (e) {
             try {
                 await fs.unlink(tmp).catch(() => {});
@@ -324,6 +347,7 @@ export class SessionStore {
         }
         const record = buildRecord(session);
         const file = this.filePath(session.id, session.meta.protocol, session.meta.upstreamOrigin);
+        const data = JSON.stringify(record);
         try {
             mkdirSync(path.dirname(file), { recursive: true });
         } catch (e) {
@@ -331,8 +355,25 @@ export class SessionStore {
         }
         const tmp = this.tempPath(session.id);
         try {
-            writeFileSync(tmp, JSON.stringify(record), "utf8");
-            renameSync(tmp, file);
+            writeFileSync(tmp, data, "utf8");
+            // Sync path: renameSync can throw EPERM on Windows if the dest is
+            // briefly held (AV/indexer/SMB). Retry a couple of times before
+            // giving up — transient locks usually release within ms.
+            let lastErr: unknown;
+            for (let attempt = 0; attempt < 3; attempt++) {
+                try {
+                    renameSync(tmp, file);
+                    lastErr = undefined;
+                    break;
+                } catch (e) {
+                    lastErr = e;
+                    const code = (e as NodeJS.ErrnoException).code;
+                    if (code !== "EPERM" && code !== "EBUSY" && code !== "EACCES") break;
+                    // brief sync backoff (Atomics.wait is the sync sleep)
+                    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20 * (attempt + 1));
+                }
+            }
+            if (lastErr) throw lastErr;
             return true;
         } catch (e) {
             this.log("error", `[persist] flushSync FAILED for ${session.id}: ${msg(e)} — session NOT evicted to prevent loss`);
@@ -436,6 +477,27 @@ function isValidRecord(parsed: unknown): parsed is PersistedSession {
 
 function msg(e: unknown): string {
     return e instanceof Error ? e.message : String(e);
+}
+
+/** fs.rename with brief retries on Windows transient locks. EPERM/EBUSY/EACCES
+ *  happen when the destination is momentarily held open (AV scan, search
+ *  indexer, SMB). A short delay + retry almost always succeeds. Async (used by
+ *  writeNow). */
+async function renameWithRetry(src: string, dest: string): Promise<void> {
+    let lastErr: unknown;
+    for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+            await fs.rename(src, dest);
+            return;
+        } catch (e) {
+            lastErr = e;
+            const code = (e as NodeJS.ErrnoException).code;
+            if (code !== "EPERM" && code !== "EBUSY" && code !== "EACCES") throw e;
+            // brief backoff before retry (transient lock usually releases)
+            await new Promise((r) => setTimeout(r, 20 * (attempt + 1)));
+        }
+    }
+    throw lastErr;
 }
 
 function defaultDir(): string {
