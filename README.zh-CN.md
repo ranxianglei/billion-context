@@ -264,7 +264,7 @@ bili --no-auto-update        # 本次启动禁用自动更新
 
 ### Providers(按 URL 的 context 覆盖)
 
-路由始终是 `/bili/` 前缀(见[路由怎么工作](#路由怎么工作))。
+路由始终是 `/bili/` 前缀(见[方式 A](#方式-a-零配置bili-前缀))。
 `providers` 块只声明**按 URL 的 context 窗口覆盖**,以上游 URL 为 key。
 key 就是客户端写在 `/bili/` 后面的那个字符串:
 
