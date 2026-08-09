@@ -332,6 +332,10 @@ function renderProviders() {
     html += '<div class="card">';
     html += '<div class="card-head"><div class="name"><input class="mono" value="'+esc(p.url)+'" onchange="providers['+i+'].url=this.value" placeholder="https://upstream/api/path" style="background:transparent;border:none;padding:0;width:100%"></div>';
     html += '<button class="btn danger small" onclick="removeProvider('+i+')">Remove</button></div>';
+    html += '<div class="client-setup">';
+    html += '<div class="client-head">Client base URL — copy this into Pi / OpenCode / Codex / Claude Code config:</div>';
+    html += snippet("", ORIGIN + "/bili/" + p.url);
+    html += '</div>';
     p.models.forEach(function(m, j) {
       html += '<div class="sub-card">';
       html += '<div class="model-head"><span class="mname mono">'+esc(m.name)+'</span>';
@@ -413,7 +417,8 @@ async function saveProviders() {
 // ── snippets (used inline in each provider card) ──
 function snippet(label, code) {
   var c = code.replace(/"/g, "&quot;");
-  return '<div class="snippet"><div class="label"><b>' + label + '</b></div><code>' + esc(code) + '</code><button class="btn small copy" onclick="copyText(this,\\''+c+'\\')">Copy</button></div>';
+  var labelHtml = label ? '<div class="label"><b>' + label + '</b></div>' : '';
+  return '<div class="snippet">' + labelHtml + '<code>' + esc(code) + '</code><button class="btn small copy" onclick="copyText(this,\\''+c+'\\')">Copy</button></div>';
 }
 function copyText(btn, text) {
   var t = text.replace(/&quot;/g, '"');
