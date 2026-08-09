@@ -2,6 +2,7 @@ import type { CoreMessage } from "acp-kernel";
 import { randomUUID } from "node:crypto";
 import { ClusterCounter, deriveMessageId } from "./message-id.js";
 import type { ConversationIdentity } from "./session-id.js";
+import { hashId } from "./util.js";
 import { parseDataUrl, type BiliMessage } from "./bili-message.js";
 
 export type ResponseContentPart =
@@ -64,11 +65,14 @@ export type ResponsesProjection = {
     customToolCallIds: Set<string>;
     layout: ResponseLayoutSlot[];
     stringInput?: { original: string; coreId: string };
+    /** Reasoning items dropped because ACP_REASONING_KEEP=none. 0 by default —
+     *  reasoning is normally routed through the compression pipeline so it is
+     *  hidden automatically once its turn is summarized. */
+    droppedReasoning: number;
 };
 
 const OPAQUE_ITEM_TYPES = new Set([
     "additional_tools",
-    "reasoning",
     "computer_call",
     "computer_call_output",
     "file_search_call",
@@ -83,6 +87,10 @@ const OPAQUE_ITEM_TYPES = new Set([
 
 function isOpaqueItem(item: ResponseInputItem): boolean {
     return OPAQUE_ITEM_TYPES.has(item.type);
+}
+
+function shouldDropAllReasoning(): boolean {
+    return (process.env.ACP_REASONING_KEEP ?? "").trim().toLowerCase() === "none";
 }
 
 function partText(part: ResponseContentPart): string {
@@ -102,17 +110,37 @@ export function responsesToCore(body: ResponsesRequestBody): ResponsesProjection
     const preamble: ResponseInputItem[] = [];
     const customToolCallIds = new Set<string>();
     const layout: ResponseLayoutSlot[] = [];
+    let droppedReasoning = 0;
     const clusters = new ClusterCounter();
     if (typeof body.instructions === "string" && body.instructions.trim()) systemParts.push(body.instructions);
     if (typeof body.input === "string") {
         const id = clusters.next(deriveMessageId("user", "text", body.input));
         msgs.push({ id, role: "user", contentType: "text", text: body.input });
-        return { msgs, systemParts, preamble, customToolCallIds, layout, stringInput: { original: body.input, coreId: id } };
+        return { msgs, systemParts, preamble, customToolCallIds, layout, droppedReasoning, stringInput: { original: body.input, coreId: id } };
     }
     for (const item of body.input) {
         let coreId: string | undefined;
         if (isOpaqueItem(item)) preamble.push(item);
         switch (item.type) {
+            case "reasoning": {
+                if (shouldDropAllReasoning()) {
+                    droppedReasoning++;
+                    continue;
+                }
+                const rid =
+                    typeof (item as { id?: unknown }).id === "string"
+                        ? String((item as { id?: string }).id)
+                        : hashId(JSON.stringify(item));
+                coreId = clusters.next(deriveMessageId("assistant", "reasoning", rid));
+                msgs.push({
+                    id: coreId,
+                    role: "assistant",
+                    contentType: "reasoning",
+                    text: rid,
+                    rawResponsesItem: item,
+                });
+                break;
+            }
             case "message": {
                 const message = item as ResponseInputMessage;
                 const text = messageContent(message.content);
@@ -171,7 +199,7 @@ export function responsesToCore(body: ResponsesRequestBody): ResponsesProjection
         }
         layout.push({ original: item, coreId });
     }
-    return { msgs, systemParts, preamble, customToolCallIds, layout };
+    return { msgs, systemParts, preamble, customToolCallIds, layout, droppedReasoning };
 }
 
 function patchTextParts(parts: ResponseContentPart[], text: string): ResponseContentPart[] {
@@ -280,6 +308,8 @@ export function coreToResponses(messages: CoreMessage[]): ResponseInputItem[] {
                     name: message.toolName ?? "unknown",
                     arguments: message.text ?? "",
                 });
+            } else if (message.contentType === "reasoning") {
+                if (raw) out.push(raw);
             }
         } else if (message.role === "tool") {
             out.push({ type: "function_call_output", call_id: message.toolCallId ?? "", output: message.text ?? "" });

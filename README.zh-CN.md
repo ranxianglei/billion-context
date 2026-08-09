@@ -273,6 +273,7 @@ bili --no-auto-update        # 本次启动禁用自动更新
 | `ACP_SESSION_HEADER` | `x-acp-session` | 会话标识 header 名 |
 | `ACP_COMPRESS_TOOL` | `1` | 设 `0` 禁止注入 compress 工具 |
 | `ACP_COMPRESS_NUDGE` | `1` | 设 `0` 禁止压缩 nudge |
+| `ACP_REASONING_KEEP` | *(默认)* | 仅 Responses API：设 `none` 丢弃全部 reasoning。默认走压缩管线，turn 被压缩时自动隐藏（防止 reasoning 无限累积撑爆 Codex 的 prompt-cache 前缀）。 |
 | `ACP_DEBUG` | `0` | 设 `1` 打开详细日志 |
 | `ACP_PASSTHROUGH` | `0` | 设 `1` 不压缩直接转发 |
 | `ACP_AUTO_UPDATE` | `1` | 设 `0` 禁用后台自动更新 |

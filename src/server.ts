@@ -436,6 +436,7 @@ async function handle(
     // `/v1/responses?foo=1` must still be detected as the responses protocol.
     const urlPath = url.split("?", 2)[0];
     const responsesCompact = urlPath.endsWith("/responses/compact");
+    const countTokens = isCountTokensRequest(req.method ?? "GET", urlPath, bodyBuffer.length > 0);
     const protocol: "anthropic" | "openai" | "responses" | null =
         req.method === "POST" && bodyBuffer.length > 0
             ? urlPath.endsWith("/chat/completions")
@@ -531,13 +532,15 @@ async function handle(
         // interleave across concurrent requests on the same session.
         await withSessionLock(session, async () => {
             prepared =
-                protocol === "anthropic"
-                    ? prepareAnthropic(parsed as AnthropicRequestBody, req, opts, core, reqConfig, log, session)
-                    : protocol === "openai"
-                      ? prepareOpenai(parsed as OpenAIRequestBody, req, opts, core, reqConfig, log, session)
-                      : responsesCompact
-                        ? prepareResponsesCompact(bodyBuffer, parsed as ResponsesRequestBody, session)
-                        : prepareResponses(parsed as ResponsesRequestBody, req, opts, core, reqConfig, log, session, responsesIdentity!);
+                countTokens
+                    ? prepareCountTokens(parsed as AnthropicRequestBody, core, reqConfig, log, session)
+                    : protocol === "anthropic"
+                      ? prepareAnthropic(parsed as AnthropicRequestBody, req, opts, core, reqConfig, log, session)
+                      : protocol === "openai"
+                        ? prepareOpenai(parsed as OpenAIRequestBody, req, opts, core, reqConfig, log, session)
+                        : responsesCompact
+                          ? prepareResponsesCompact(bodyBuffer, parsed as ResponsesRequestBody, session)
+                          : prepareResponses(parsed as ResponsesRequestBody, req, opts, core, reqConfig, log, session, responsesIdentity!);
             acquireInFlight(session);
             try {
                 await forward(req, res, opts, prepared!.body, prepared!, core, reqConfig, log, route, affinity);
@@ -840,6 +843,51 @@ function prepareResponses(
         compressInjected: shouldInject,
         responsesTextProtocol,
     };
+}
+
+export function isCountTokensRequest(method: string, urlPath: string, hasBody: boolean): boolean {
+    return (
+        method === "POST" &&
+        hasBody &&
+        process.env.ACP_COUNT_TOKENS_PASSTHROUGH !== "1" &&
+        urlPath.endsWith("/messages/count_tokens")
+    );
+}
+
+export function prepareCountTokens(
+    parsed: AnthropicRequestBody,
+    core: CompressionCore,
+    config: Config,
+    log: (level: string, msg: string) => void,
+    session: Session,
+): Prepared {
+    const sessionId = session.id;
+    try {
+        const { msgs, cacheControls } = anthropicToCore(parsed);
+        const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount: session.stats.lastInputTokens, renderTags: "text-only" });
+        const rebuiltMessages = coreToAnthropic(turn.messages as BiliMessage[], cacheControls);
+        log("info", `[${sessionId}] count_tokens pruned: ${msgs.length} → ${turn.messages.length} msgs`);
+        return {
+            body: JSON.stringify({ ...parsed, messages: rebuiltMessages }),
+            session,
+            processedMessages: [],
+            originalMessages: msgs,
+            protocol: "anthropic",
+            stream: false,
+            compressInjected: false,
+        };
+    } catch (err) {
+        log("warn", `[${sessionId}] count_tokens prune failed, forwarding unchanged: ${String(err)}`);
+        return {
+            body: JSON.stringify(parsed),
+            session,
+            processedMessages: [],
+            originalMessages: [],
+            protocol: "anthropic",
+            stream: false,
+            compressInjected: false,
+        };
+    }
 }
 
 function prepareResponsesCompact(body: Buffer, parsed: ResponsesRequestBody, session: Session): Prepared {
