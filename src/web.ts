@@ -64,7 +64,7 @@ export async function handleConfigPut(req: IncomingMessage, res: ServerResponse)
         const route = parseRouteEntry(val);
         if (!route) {
             res.writeHead(400, { "content-type": "application/json" });
-            res.end(JSON.stringify({ error: `invalid provider "${name}": expected "url" or { url, models }` }));
+            res.end(JSON.stringify({ error: `invalid provider "${name}": expected { "models": { ... } } or null (the key is the upstream URL)` }));
             return;
         }
         routes[name] = route;
@@ -80,7 +80,7 @@ export async function handleConfigPut(req: IncomingMessage, res: ServerResponse)
         res.end(JSON.stringify({ error: `failed to write: ${String(e)}` }));
         return;
     }
-    log("info", `[acp-web] providers updated via web UI (${Object.keys(routes).length} providers) — restart to apply`);
+    log("info", `[acp-web] providers updated via web UI (${Object.keys(routes).length} upstream URL(s)) — restart to apply`);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true, count: Object.keys(routes).length, note: "restart bili to apply" }));
 }
@@ -317,12 +317,11 @@ async function load() {
 }
 function entries(obj) {
   if (!obj || typeof obj !== "object") return [];
-  return Object.keys(obj).map(function(name){
-    var v = obj[name];
-    var url, models = [];
-    if (typeof v === "string") { url = v; }
-    else { url = v.url || ""; models = entries_models(v.models); }
-    return { name: name, url: url, models: models };
+  return Object.keys(obj).map(function(url){
+    var v = obj[url];
+    var models = [];
+    if (v && typeof v === "object" && !Array.isArray(v)) models = entries_models(v.models);
+    return { url: url, models: models };
   });
 }
 function entries_models(obj) {
@@ -336,11 +335,10 @@ function entries_models(obj) {
 function renderProviders() {
   var html = "";
   if (providers.length === 0) html = '<div class="empty">No providers yet. Click "Add provider" below.</div>';
-  providers.forEach(function(p, i) {
+    providers.forEach(function(p, i) {
     html += '<div class="card">';
-    html += '<div class="card-head"><div class="name"><input value="'+esc(p.name)+'" onchange="providers['+i+'].name=this.value" style="background:transparent;border:none;padding:0;width:auto"></div>';
+    html += '<div class="card-head"><div class="name"><input class="mono" value="'+esc(p.url)+'" onchange="providers['+i+'].url=this.value" placeholder="https://upstream/api/path" style="background:transparent;border:none;padding:0;width:100%"></div>';
     html += '<button class="btn danger small" onclick="removeProvider('+i+')">Remove</button></div>';
-    html += '<div class="row"><label>URL</label><input class="mono" value="'+esc(p.url)+'" onchange="providers['+i+'].url=this.value"></div>';
     p.models.forEach(function(m, j) {
       html += '<div class="sub-card">';
       html += '<div class="model-head"><span class="mname mono">'+esc(m.name)+'</span>';
@@ -356,7 +354,7 @@ function renderProviders() {
   checkDirty();
 }
 function addProvider() {
-  providers.push({ name: "new-provider", url: "https://", models: [] });
+  providers.push({ url: "https://api.example.com", models: [] });
   renderProviders();
 }
 function removeProvider(i) {
@@ -397,36 +395,39 @@ async function applyProviders() {
 async function saveProviders() {
   var obj = {};
   providers.forEach(function(p) {
-    if (!p.name) return;
-    if (p.models.length === 0) { obj[p.name] = p.url; }
+    if (!p.url) return;
+    var key = p.url.replace(/\/+$/, ""); // drop trailing slashes (keys must be prefix-matchable)
+    if (!key) return;
+    if (p.models.length === 0) { obj[key] = {}; }
     else {
       var models = {};
       p.models.forEach(function(m){ if(m.name) models[m.name] = { context: m.context }; });
-      obj[p.name] = { url: p.url, models: models };
+      obj[key] = { models: models };
     }
   });
   try {
     var r = await fetch("/__acp/config", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ providers: obj }) });
     var d = await r.json();
-    if (r.ok) { savedProviders = JSON.stringify(providers); checkDirty(); toast("Saved " + d.count + " providers — click Apply to activate"); }
+    if (r.ok) { savedProviders = JSON.stringify(providers); checkDirty(); toast("Saved " + d.count + " provider(s) — click Apply to activate"); }
     else { toast("Error: " + (d.error || "unknown"), true); }
   } catch(e) { toast("Save failed: " + e, true); }
 }
 
 // ── client setup ──
 function renderSetup() {
+  // Rebuild the dropdown each time so URL edits/adds/removes are reflected.
   var sel = el("setup-provider");
-  if (sel.options.length === 0 && providers.length > 0) {
-    providers.forEach(function(p){ sel.options.add(new Option(p.name, p.name)); });
-  }
-  var name = sel.value || (providers[0] && providers[0].name) || "";
-  var p = providers.find(function(x){ return x.name === name; });
+  var prev = sel.value;
+  sel.innerHTML = "";
+  providers.forEach(function(p){ if (p.url) sel.options.add(new Option(p.url, p.url)); });
+  if (prev && providers.some(function(p){ return p.url === prev; })) sel.value = prev;
+  var url = sel.value || (providers[0] && providers[0].url) || "";
+  var p = providers.find(function(x){ return x.url === url; });
   var box = el("setup-snippets");
-  if (!p) { box.innerHTML = '<div class="empty">Add a provider first (Providers tab).</div>'; return; }
-  var base = ORIGIN + "/" + p.name;
-  // Pi: the original upstream URL minus host → keep the tail
-  var tail = p.url.replace(/^https?:\\/\\/[^/]+/, "");
-  var full = tail ? base + tail : base;
+  if (!p) { box.innerHTML = '<div class="empty">Add a provider URL first (Providers tab).</div>'; return; }
+  // The client points at the proxy with /bili/<full-upstream-url>. This is the
+  // single routing mode — the upstream URL is embedded in the baseURL itself.
+  var full = ORIGIN + "/bili/" + p.url;
   var h = "";
   h += snippet("Pi  (~/.pi/agent/models.json)", '"baseUrl": "' + full + '"');
   h += snippet("OpenCode  (opencode.json)", '"baseURL": "' + full + '"');

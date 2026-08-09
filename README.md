@@ -50,9 +50,10 @@ Two ways to use it — pick one:
   doubles as a self-detection signal: billion-context client extensions
   (billion-context-pi / opencode-acp) can recognize it in their own baseUrl
   and self-disable, so you never get double compression.
-- **Named providers:** declare providers in a config file, then use shorter
-  `http://localhost:8787/<name>/...` URLs. Better when you manage several
-  endpoints or want explicit per-model context overrides.
+- **Explicit context overrides:** declare per-URL context windows in a config
+  file (or the web UI) for endpoints the registry doesn't know about, or when
+  you want to pin an exact value. Routing is the same `/bili/` prefix either
+  way — the config only changes which context window the proxy uses.
 
 Compression is injected automatically — you only configure routing, never
 compression itself.
@@ -108,9 +109,14 @@ base_url = "http://localhost:8787/bili/https://api.openai.com/v1"
 **Other clients (Cursor / Aider / Continue …)** — wherever the upstream URL is
 configured, prepend `http://localhost:8787/bili/` to it. Nothing else changes.
 
-### Option B — Named providers (config file)
+### Option B — Explicit context windows (config file)
 
-Three steps: **start the proxy → configure your providers → point your client at it**.
+Zero-config (Option A) already auto-detects context windows from
+[models.dev](https://models.dev). You only need a config file when you want to
+**override** that — e.g. a private relay behind a fixed limit, or a model that
+isn't in the registry yet.
+
+Three steps: **start the proxy → declare context overrides → point your client at it**.
 
 ### Step 1 — Start the proxy
 
@@ -134,70 +140,76 @@ acp-proxy listening on http://localhost:8787 — web UI: http://localhost:8787/_
 
 ### How routing works
 
-The proxy routes by a **provider name in the URL path** — the first path
-segment after the host. It strips the name and forwards the rest to that
-provider. Everything after the name is passed through untouched:
+There is **one** routing mode: the `/bili/` prefix. The client embeds the
+full upstream URL right there, and the proxy forwards to it verbatim:
 
 ```
-client baseURL:  http://localhost:8787/zhipu/api/coding/paas/v4
-                  └──────────┬──────────┘└────────┬────────┘
-                      proxy host           remaining path
-                      + provider name      (forwarded as-is)
+client baseURL:  http://localhost:8787/bili/https://open.bigmodel.cn/api/coding/paas/v4
+                  └──────────┬──────────┘└────┬────┘└────────────────┬───────────────────────┘
+                      proxy host       /bili/        upstream URL (forwarded as-is)
 ```
 
-This is why Step 2 has you declare named providers, and Step 3 has you put that
-same name at the start of the client's base URL — it's how the proxy knows where
-to send each request. In the config below, `zhipu` corresponds to:
-```json
-    "zhipu": {
-      "url": "https://open.bigmodel.cn",
-      "models": {
-        "glm-5.2": { "context": 1000000 }
-      }
+The config file does **not** change routing. It only tells the proxy the
+context window for a given upstream URL + model, so it knows when to compress.
+The key is the same upstream URL string the client puts after `/bili/`:
+
+```jsonc
+{
+  "providers": {
+    "https://open.bigmodel.cn/api/coding/paas/v4": {
+      "models": { "glm-5.2": { "context": 1000000 } }
+    }
+  }
+}
 ```
 
-### Step 2 — Configure your providers
+A request matches a key when the client's embedded URL **equals the key or
+starts with it** (longest key wins). A shallow key like
+`https://open.bigmodel.cn` overrides every path on that host; a deep key like
+`https://open.bigmodel.cn/api/anthropic` overrides only that endpoint. Models
+not listed in any matching key fall back to models.dev, then the built-in
+prefix table.
 
-Copy the content below:
+### Step 2 — Declare context overrides
+
+The web UI's **Providers** tab lets you add an upstream URL and its per-model
+context windows in a form, then **Save** (writes the config file) and **Apply**
+(hot-reload into the running proxy, no restart).
 <img width="2931" height="1519" alt="image" src="https://github.com/user-attachments/assets/c02278be-bc7a-4f14-8f58-0f2d83784d54" />
 
-> Prefer not to use the web UI? You can also edit the JSON file directly — see
-> [Manual config file](#manual-config-file) below.
+> Prefer editing the JSON directly? See [Manual config file](#manual-config-file).
+Full schema is in [Configuration](#configuration).
 
-Then **restart `bili`** — the startup banner lists your routes:
+After Save + Apply the startup banner reflects it:
 
 ```
-acp-proxy listening on http://localhost:8787 — routes: anthropic=https://api.anthropic.com, zhipu=https://open.bigmodel.cn
+acp-proxy listening on http://localhost:8787 — web UI: http://localhost:8787/__acp/ — context overrides for 2 upstream URL(s)
 ```
-
-That confirms the proxy picked up your config. (Prefer editing the JSON file by
-hand? See [Manual config file](#manual-config-file). Full schema — per-model
-context windows, optional fields — is in [Configuration](#configuration).)
 
 ### Step 3 — Point your client at the proxy
 
 Edit the client's own config file so it sends requests to
-`http://localhost:8787/<provider>/...` (the provider name from Step 2 as the
-first path segment). Put your **real** API key in the client's config too —
-the proxy passes it through untouched.
+`http://localhost:8787/bili/<full-upstream-url>`. Put your **real** API key in
+the client's config too — the proxy passes it through untouched.
 
 #### Pi (billion-context-pi)
 
-Open `~/.pi/agent/models.json` and change your existing provider's **`baseUrl` line** to point at the proxy — leave every other field alone:
+Open `~/.pi/agent/models.json` and change your existing provider's **`baseUrl` line** — just prepend the proxy origin + `/bili/` to the real URL, leave every other field alone:
 
 ```jsonc
 // before:
 "baseUrl": "https://open.bigmodel.cn/api/coding/paas/v4",
-// after (swap the host for the proxy + the provider name you picked):
-"baseUrl": "http://localhost:8787/zhipu/api/coding/paas/v4",
+// after:
+"baseUrl": "http://localhost:8787/bili/https://open.bigmodel.cn/api/coding/paas/v4",
 ```
 
-`http://localhost:8787` is the proxy, `zhipu` is the name from Step 2, and the remaining path `/api/coding/paas/v4` is forwarded as-is to Zhipu. `apiKey`, `api`, and `models` stay unchanged.
+`http://localhost:8787/bili/` is the proxy; everything after it is the real
+upstream URL, forwarded as-is. `apiKey`, `api`, and `models` stay unchanged.
 
-| `api` value | `baseUrl` should point at |
+| `api` value | upstream |
 |---|---|
-| `openai-completions` | an OpenAI-compatible endpoint (GLM/DeepSeek/OpenAI) → `…/zhipu/...` |
-| `anthropic-messages` | an Anthropic-compatible endpoint → `…/anthropic` |
+| `openai-completions` | an OpenAI-compatible endpoint (GLM/DeepSeek/OpenAI) |
+| `anthropic-messages` | an Anthropic-compatible endpoint |
 
 > If you use the `billion-context-pi` extension, run Pi in an isolated agent
 dir (`PI_CODING_AGENT_DIR=…`) so the client-side extension doesn't double-
@@ -205,26 +217,26 @@ compress alongside the proxy. The `bili-test-pi` helper does this for you.
 
 #### OpenCode
 
-Open `~/.config/opencode/opencode.json` and change your existing provider's **`baseURL` line** to point at the proxy:
+Open `~/.config/opencode/opencode.json` and change your existing provider's **`baseURL` line** — prepend the proxy origin + `/bili/`:
 
 ```jsonc
 // before:
 "baseURL": "https://open.bigmodel.cn/api/coding/paas/v4"
 // after:
-"baseURL": "http://localhost:8787/zhipu/api/coding/paas/v4"
+"baseURL": "http://localhost:8787/bili/https://open.bigmodel.cn/api/coding/paas/v4"
 ```
 
-Everything else (`apiKey`, `models`) stays unchanged. For an Anthropic provider, change `baseURL` to `http://localhost:8787/anthropic`.
+Everything else (`apiKey`, `models`) stays unchanged.
 
 #### Codex
 
-Open `~/.codex/config.toml` and change your existing provider's **`base_url` line** to point at the proxy:
+Open `~/.codex/config.toml` and change your existing provider's **`base_url` line** — prepend the proxy origin + `/bili/`:
 
 ```toml
 # before:
 base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
 # after:
-base_url = "http://localhost:8787/zhipu/api/coding/paas/v4"
+base_url = "http://localhost:8787/bili/https://open.bigmodel.cn/api/coding/paas/v4"
 ```
 
 Everything else (`name`, `wire_api`, `env_key`) stays unchanged.
@@ -236,18 +248,17 @@ Everything else (`name`, `wire_api`, `env_key`) stays unchanged.
 
 #### Other clients (Cursor / Aider / Continue …)
 
-If the client lets you set a base URL, point it at the proxy exactly like the
-examples above (zero-config `/bili/` prefix or named `/<provider>/` prefix).
-The proxy speaks the Anthropic, OpenAI chat-completions, and OpenAI Responses
-protocols — any client using one of those works. A client using a different
-protocol or a non-standard auth header won't work yet.
+If the client lets you set a base URL, prepend `http://localhost:8787/bili/`
+to it. The proxy speaks the Anthropic, OpenAI chat-completions, and OpenAI
+Responses protocols — any client using one of those works. A client using a
+different protocol or a non-standard auth header won't work yet.
 
 ### Web UI
 
 Open `http://localhost:8787/__acp/` in a browser while the proxy is running. You can:
 
 - **Edit providers** in a form (add/remove providers and per-model context windows) and save — this writes to `billion-context.json` directly.
-- **Generate client URLs** — pick a provider, get ready-to-copy config snippets for Pi / OpenCode / Codex (the `baseUrl`/`baseURL`/`base_url` line with the proxy origin + provider name filled in).
+- **Generate client URLs** — pick an upstream URL, get ready-to-copy config snippets for Pi / OpenCode / Codex (the `baseUrl`/`baseURL`/`base_url` line with the proxy origin + `/bili/` + the URL filled in).
 - **View sessions** — live table of active sessions (requests, tokens saved, last seen), auto-refreshing.
 
 Use the **Apply** button to hot-reload provider routes into the running
@@ -261,30 +272,31 @@ if you just don't want to use the browser? The web UI writes to the same file,
 so you can edit it directly with identical results.
 
 Open `~/.config/billion-context/billion-context.json` and edit the `providers`
-block. Each entry is a **name → URL** mapping; the name is what you put in the
-client's base URL in Step 3.
+block. **The key is the upstream URL** — the same string the client puts after
+`/bili/`. The value declares per-model context windows for that URL:
 
 ```json
 {
   "providers": {
-    "zhipu": {
-      "url": "https://open.bigmodel.cn",
-      "models": {
-        "glm-5.2": { "context": 1000000 }
-      }
+    "https://open.bigmodel.cn/api/coding/paas/v4": {
+      "models": { "glm-5.2": { "context": 1000000 } }
     },
-    "anthropic": "https://api.anthropic.com"
+    "https://api.anthropic.com": {}
   }
 }
 ```
 
-- Delete providers you don't use.
-- Add others (e.g. `"deepseek": "https://api.deepseek.com"`).
+- A key matches when the client's embedded URL equals it or starts with it
+  (longest key wins). A bare host key covers every path on that host.
+- An empty value `{}` means "this URL exists, no overrides" (context windows
+  come from models.dev / the prefix table).
+- Delete entries you don't use; add others as needed.
 - The API key is **not** here — it lives in the client; the proxy passes it
   through untouched.
 
-After saving, **restart `bili`**. (Full schema — per-model context windows,
-optional fields — is in [Configuration](#configuration).)
+After saving, click **Apply** in the web UI (or **restart `bili`**). (Full
+schema — per-model context windows, optional fields — is in
+[Configuration](#configuration).)
 
 ### Verify
 
@@ -410,15 +422,13 @@ The config file is a single JSON object. Example:
   "port": 8787,
   "host": "127.0.0.1",
   "providers": {
-    "zhipu": {
-      "url": "https://open.bigmodel.cn",
+    "https://open.bigmodel.cn/api/coding/paas/v4": {
       "models": {
         "glm-5.2": { "context": 1000000 },
         "glm-5.1": { "context": 200000 }
       }
     },
-    "anthropic": "https://api.anthropic.com",
-    "deepseek": "https://api.deepseek.com"
+    "https://api.deepseek.com": {}
   }
 }
 ```
@@ -429,12 +439,11 @@ The config file is a single JSON object. Example:
 |------|---------|-------------|
 | `port` | `8787` | Proxy listen port |
 | `host` | `127.0.0.1` | Proxy listen host |
-| `upstream` | `https://api.anthropic.com` | Default upstream when no route matches |
 | `sessionHeader` | `x-acp-session` | Header name clients may send to identify a conversation |
 | `log` | `true` | Enable request logging |
 | `debug` | `false` | Verbose logging (same as `ACP_DEBUG=1`) |
 | `passthrough` | `false` | Forward without compression (same as `ACP_PASSTHROUGH=1`) |
-| `providers` | *(none)* | Provider routes — see below |
+| `providers` | *(none)* | Per-URL context overrides — see below |
 | `compress` | *(see defaults)* | `{ injectTool, injectNudge }` |
 
 > **Choosing a `host`** (IPv6 / containers): the default `127.0.0.1` is
@@ -446,57 +455,52 @@ The config file is a single JSON object. Example:
 > `--host 0.0.0.0` there. ⚠️ `0.0.0.0` / `::` expose the proxy on **all**
 > interfaces; ensure you're on a trusted network or behind a firewall.
 
-### Providers (URL routing + per-model context)
+### Providers (per-URL context overrides)
 
-`providers` maps a route name to either a bare URL string (simple) or an
-object with `url` + optional per-model context window (recommended).
+Routing is always the `/bili/` prefix (see [How routing works](#how-routing-works)).
+The `providers` block only declares **context-window overrides** keyed by
+upstream URL. The key is the same string the client puts after `/bili/`:
 
-**Simple form** — provider name → URL:
-```json
-{ "deepseek": "https://api.deepseek.com" }
-```
-
-**Full form** — provider name → `{ url, models }`:
 ```json
 {
-  "zhipu": {
-    "url": "https://open.bigmodel.cn",
-    "models": {
-      "glm-5.2": { "context": 1000000 },
-      "glm-5.1": { "context": 200000 }
-    }
+  "providers": {
+    "https://open.bigmodel.cn/api/coding/paas/v4": {
+      "models": {
+        "glm-5.2": { "context": 1000000 },
+        "glm-5.1": { "context": 200000 }
+      }
+    },
+    "https://api.deepseek.com": {}
   }
 }
 ```
 
-The same model can have a different context window behind different providers
-(e.g. relay wraps a model with a larger window). `context` is the **input
-context limit** (used by the compressor to decide when to nudge); `output` is
-the max output tokens. Both are optional; missing values fall back to the
-built-in model table, then to `modelContextLimit`. **`output` is no longer
-needed** — the proxy forwards whatever `max_tokens` the client sends, and
-omits it otherwise so the upstream uses its own default (Anthropic clients
-always send it, so Anthropic routes are covered automatically). An `output`
-field is still accepted for backward compatibility but has no effect.
+The same model can have a different context window behind different upstreams
+(e.g. a relay wraps a model with a larger window). `context` is the **input
+context limit** (used by the compressor to decide when to nudge). It is
+optional; missing values fall back to the [models.dev](https://models.dev)
+registry, then the built-in prefix table.
 
 > **Why declare context at all?** The LLM `/models` API does **not** return
 > context windows (verified across OpenAI, Anthropic, 智谱, comfly). They are
 > document-level information. A wrong value (e.g. GLM-5.2 guessed as 128K
 > instead of 1M) causes spurious frequent compression. Declaring it per
-> provider + model makes the proxy match the registry the client itself uses.
+> URL + model makes the proxy match the registry the client itself uses.
+
+### URL key matching rules
+
+- A request matches a key when the client's embedded URL **equals the key or
+  starts with it** (longest key wins).
+- A shallow key like `https://open.bigmodel.cn` overrides every path on that
+  host; a deep key like `https://open.bigmodel.cn/api/anthropic` overrides
+  only that endpoint.
+- Keys never cross hosts (the boundary check requires a `/` or end-of-string
+  after the key), so `https://x.com` does not match `https://x.com.evil`.
+- Models not covered by any matching key fall back to models.dev, then the
+  prefix table, then `modelContextLimit`.
 
 **API keys are never stored in the proxy** — whatever key the agent sends is
 passed through untouched to the upstream.
-
-### Provider name rules
-
-- Must start with a letter, contain only letters/digits/`-`/`_`.
-- Reserved words (`v1`, `chat`, `completions`, `messages`, `models`, `api`)
-  are rejected to avoid colliding with real API path segments.
-- The provider name can appear anywhere in the path; the longest match wins.
-- With **no providers** declared (e.g. you emptied the `providers` block),
-  every request is forwarded to the default `upstream` with its full path —
-  an edge case, not the normal flow.
 
 ## How sessions work
 

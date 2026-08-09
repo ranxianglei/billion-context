@@ -37,10 +37,9 @@ export function safeReadJson(path: string): unknown {
  *
  *  Backward compatible: a bare string is accepted and treated as { url }. */
 export type ProviderRoute = {
-    url: string;
     models?: Record<string, { context?: number; output?: number }>;
 };
-export type ProviderRoutes = Record<string, ProviderRoute>;
+export type ProviderRoutes = Record<string, ProviderRoute>; // key = upstream URL prefix (the /bili/<this> string)
 
 /** Built-in context window for common model families, keyed by a lowercase
  *  prefix. This is a FALLBACK used when the per-route model declaration in
@@ -74,21 +73,34 @@ export function lookupContextLimit(model: string | undefined): number | undefine
 }
 
 /** Resolve the context-window limit for a request. Priority:
- *  1. Per-route per-model declaration in providers.json (user-controlled, most accurate)
+ *  1. Per-URL per-model declaration in config (user-controlled, most accurate).
+ *     The upstreamUrl is matched against config keys by **longest-prefix wins**
+ *     (the key is a string the user wrote, identical to what follows /bili/ in
+ *     the zero-config baseURL). A shallow key like "https://open.bigmodel.cn"
+ *     matches all paths on that host; a deep key like
+ *     "https://open.bigmodel.cn/api/anthropic" matches only that endpoint.
  *  2. Built-in CONTEXT_LIMIT_TABLE (by model name prefix)
  *  Returns undefined if neither matches — caller falls back to the env default. */
 export function resolveContextLimit(
     routes: ProviderRoutes,
-    provider: string | undefined,
+    upstreamUrl: string | undefined,
     model: string | undefined,
 ): number | undefined {
-    if (!model) return undefined;
-    if (provider) {
-        const route = routes[provider];
-        if (route?.models) {
-            const m = route.models[model];
-            if (m?.context && m.context > 0) return m.context;
+    if (!model || !upstreamUrl) return lookupContextLimit(model);
+    // Longest-prefix match: collect all keys that are a prefix of upstreamUrl,
+    // pick the longest (most specific). A key matches if upstreamUrl === key
+    // OR upstreamUrl starts with key + ("/" or key being the full origin). This
+    // avoids "https://x.com" matching "https://x.com.evil" — the boundary check
+    // requires the next char after the key to be "/" or end-of-string.
+    let bestKey = "";
+    for (const key of Object.keys(routes)) {
+        if (upstreamUrl === key || upstreamUrl.startsWith(key + "/")) {
+            if (key.length > bestKey.length) bestKey = key;
         }
+    }
+    if (bestKey) {
+        const m = routes[bestKey].models?.[model];
+        if (m?.context && m.context > 0) return m.context;
     }
     return lookupContextLimit(model);
 }
@@ -129,14 +141,14 @@ export function loadRoutes(env: NodeJS.ProcessEnv = process.env): ProviderRoutes
         if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
             for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
                 const route = parseRouteEntry(v);
-                if (route) routes[k] = route;
+                if (route) routes[normalizeUrlKey(k)] = route;
             }
         }
     }
     if (fileConfig.providers) {
         for (const [k, v] of Object.entries(fileConfig.providers)) {
             const route = parseRouteEntry(v);
-            if (route && !routes[k]) routes[k] = route;
+            if (route && !routes[normalizeUrlKey(k)]) routes[normalizeUrlKey(k)] = route;
         }
     }
     return routes;
@@ -160,7 +172,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
             for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
                 const route = parseRouteEntry(v);
-                if (route) routes[k] = route;
+                if (route) routes[normalizeUrlKey(k)] = route;
             }
         }
     }
@@ -168,7 +180,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
     if (fileConfig.providers) {
         for (const [k, v] of Object.entries(fileConfig.providers)) {
             const route = parseRouteEntry(v);
-            if (route && !routes[k]) routes[k] = route;
+            if (route && !routes[normalizeUrlKey(k)]) routes[normalizeUrlKey(k)] = route;
         }
     }
     const modelContextLimit = parseInt(env.ACP_MODEL_CONTEXT_LIMIT ?? `${fileConfig.modelContextLimit ?? 200000}`, 10);
@@ -248,13 +260,23 @@ export function ensureConfigTemplate(): boolean {
     }
 }
 
+export function normalizeUrlKey(key: string): string {
+    // Keys are upstream URLs matched by longest-prefix against the request's
+    // embedded URL. A trailing slash breaks that match (the embedded URL never
+    // has one), so strip trailing slashes. Manual edits and web-UI saves both
+    // flow through here so the behavior is consistent.
+    return key.replace(/\/+$/, "");
+}
+
 export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
-    if (typeof v === "string" && v.length > 0) {
-        return { url: v.replace(/\/$/, "") };
+    // The value describes per-model context overrides. The upstream URL itself
+    // is the KEY in the providers map (identical to the /bili/<url> string),
+    // so it is NOT repeated inside the value.
+    if (v && typeof v === "object" && !Array.isArray(v)) {
+        const obj = v as { models?: Record<string, { context?: number; output?: number }> };
+        return { models: obj.models };
     }
-    if (v && typeof v === "object" && !Array.isArray(v) && typeof (v as { url?: unknown }).url === "string" && (v as { url: string }).url.length > 0) {
-        const obj = v as { url: string; models?: Record<string, { context?: number; output?: number }> };
-        return { url: obj.url.replace(/\/$/, ""), models: obj.models };
-    }
+    // A bare value (e.g. null) means "this upstream exists, no overrides".
+    if (v === null) return {};
     return undefined;
 }

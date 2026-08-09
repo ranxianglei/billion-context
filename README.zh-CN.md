@@ -45,7 +45,7 @@ npm install -g billion-context
 两种方式 —— 任选其一:
 
 - **零配置(最简单):** 在客户端 baseURL 前面加上代理地址 + `/bili/`。无需配置文件 —— context 窗口自动从 [models.dev](https://models.dev) registry 查询。`/bili/` 前缀还是个自检测信号:billion-context 的客户端扩展(billion-context-pi / opencode-acp)能在自己的 baseUrl 里认出它并自禁用,避免双层压缩。
-- **命名 provider:** 在配置文件里声明 provider,然后用更短的 `http://localhost:8787/<name>/...` URL。适合管理多个端点或需要显式指定按模型 context 的场景。
+- **显式 context 窗口覆盖:** 在配置文件(或网页)里按 URL 声明 context 窗口,用于 registry 不认识的端点,或想钉死一个精确值的场景。两种方式路由都是同一个 `/bili/` 前缀 —— 配置只改变代理用哪个 context 窗口。
 
 压缩是自动注入的 —— 你只需配置路由,无需配置压缩本身。
 
@@ -94,9 +94,11 @@ base_url = "http://localhost:8787/bili/https://api.openai.com/v1"
 
 **其他客户端(Cursor / Aider / Continue ……)** —— 只要配置了上游 URL,前面加 `http://localhost:8787/bili/` 就行,其他都不用改。
 
-### 方式 B —— 命名 provider(配置文件)
+### 方式 B —— 显式 context 窗口(配置文件)
 
-三步:**启动代理 → 配置 provider → 把客户端指向它**。
+零配置(方式 A)已经从 [models.dev](https://models.dev) 自动探测 context 窗口了。只有当你想**覆盖**它时才需要配置文件 —— 例如某个私有中转挂了个固定上限,或某个模型还没进 registry。
+
+三步:**启动代理 → 声明 context 覆盖 → 把客户端指向它**。
 
 ### 第 1 步 —— 启动代理
 
@@ -106,39 +108,74 @@ bili
 
 它监听 `http://127.0.0.1:8787`。保持这个终端开着(或后台运行,见[运行代理](#运行代理))。
 
-点击[http://localhost:8787/__acp/](http://localhost:8787/__acp/) 添加你的模型
+点击 [http://localhost:8787/__acp/](http://localhost:8787/__acp/) 添加你的模型:
 <img width="2908" height="1787" alt="image" src="https://github.com/user-attachments/assets/cacf4b64-e5c6-41f2-b270-fd2be02eab0c" />
 
-### 第 2 步 —— 编辑配置文件
+首次运行时 `bili` 会**自动创建一个空配置文件**并告诉你路径,你不必凭空编 schema。启动横幅也会打印网页地址:
 
-在网页上添加你的 provider,复制以下内容到配置:
+```
+acp-proxy listening on http://localhost:8787 — web UI: http://localhost:8787/__acp/
+```
+
+### 路由怎么工作
+
+只有**一种**路由模式:`/bili/` 前缀。客户端把完整上游 URL 直接嵌在那里,代理原样转发:
+
+```
+客户端 baseURL:  http://localhost:8787/bili/https://open.bigmodel.cn/api/coding/paas/v4
+                  └──────────┬──────────┘└────┬────┘└────────────────┬───────────────────────┘
+                      代理地址         /bili/          上游 URL(原样转发)
+```
+
+配置文件**不改变**路由。它只告诉代理某个上游 URL + 模型的 context 窗口,以便判断何时压缩。key 就是客户端写在 `/bili/` 后面的那个上游 URL 字符串:
+
+```jsonc
+{
+  "providers": {
+    "https://open.bigmodel.cn/api/coding/paas/v4": {
+      "models": { "glm-5.2": { "context": 1000000 } }
+    }
+  }
+}
+```
+
+一个请求在客户端嵌入的 URL **等于 key 或以 key 开头**时匹配(最长 key 优先)。浅 key 如 `https://open.bigmodel.cn` 会覆盖该 host 上的每条路径;深 key 如 `https://open.bigmodel.cn/api/anthropic` 只覆盖那一个端点。未在任何匹配 key 里列出的模型回退到 models.dev,再回退到内置前缀表。
+
+### 第 2 步 —— 声明 context 覆盖
+
+网页的 **Providers** 标签页可以用表单添加上游 URL 及其按模型的 context 窗口,然后点 **Save**(写入配置文件)和 **Apply**(热加载进运行中的代理,无需重启)。
 <img width="2931" height="1519" alt="image" src="https://github.com/user-attachments/assets/c02278be-bc7a-4f14-8f58-0f2d83784d54" />
 
-> 不想用网页?也可以直接手编 JSON 文件,见下文[手动配置文件](#手动配置文件)。
+> 更想直接手编 JSON?见下文[手动配置文件](#手动配置文件)。完整 schema 见[配置](#配置)。
+
+Save + Apply 之后,启动横幅会反映出来:
+
+```
+acp-proxy listening on http://localhost:8787 — web UI: http://localhost:8787/__acp/ — context overrides for 2 upstream URL(s)
+```
 
 ### 第 3 步 —— 把客户端指向代理
 
 编辑客户端自己的配置文件,让它把请求发到
-`http://localhost:8787/<provider>/...`(第 2 步声明的 provider 名作为路径
-第一段)。把你的**真实** API key 也填进客户端配置 —— 代理原样透传。
+`http://localhost:8787/bili/<完整上游 URL>`。把你的**真实** API key 也填进客户端配置 —— 代理原样透传。
 
 #### Pi(billion-context-pi)
 
-打开 `~/.pi/agent/models.json`,把你现有 provider 的 **`baseUrl` 这一行**改成指向代理,其他字段都不用动:
+打开 `~/.pi/agent/models.json`,把你现有 provider 的 **`baseUrl` 这一行**改成指向代理 —— 真实 URL 前面加代理地址 + `/bili/`,其他字段都不用动:
 
 ```jsonc
 // 改之前:
 "baseUrl": "https://open.bigmodel.cn/api/coding/paas/v4",
-// 改之后(把 host 换成代理 + 你起的 provider 名):
-"baseUrl": "http://localhost:8787/zhipu/api/coding/paas/v4",
+// 改之后:
+"baseUrl": "http://localhost:8787/bili/https://open.bigmodel.cn/api/coding/paas/v4",
 ```
 
-`http://localhost:8787` 是代理,`zhipu` 是第 2 步起的名字,剩余路径 `/api/coding/paas/v4` 原样转发到智谱。`apiKey`、`api`、`models` 都不用改。
+`http://localhost:8787/bili/` 是代理,后面整段就是真实上游 URL,原样转发。`apiKey`、`api`、`models` 都不用改。
 
-| `api` 值 | `baseUrl` 应指向 |
+| `api` 值 | 上游 |
 |---|---|
-| `openai-completions` | OpenAI 兼容端点(GLM/DeepSeek/OpenAI)→ `…/zhipu/...` |
-| `anthropic-messages` | Anthropic 兼容端点 → `…/anthropic` |
+| `openai-completions` | OpenAI 兼容端点(GLM/DeepSeek/OpenAI) |
+| `anthropic-messages` | Anthropic 兼容端点 |
 
 > 如果你装了 `billion-context-pi` 扩展,用隔离的 agent 目录跑 Pi
 > (`PI_CODING_AGENT_DIR=…`),免得客户端扩展和 proxy 双重压缩。
@@ -146,26 +183,26 @@ bili
 
 #### OpenCode
 
-打开 `~/.config/opencode/opencode.json`,把你现有 provider 的 **`baseURL` 这一行**改成指向代理:
+打开 `~/.config/opencode/opencode.json`,把你现有 provider 的 **`baseURL` 这一行**改成指向代理 —— 真实 URL 前面加代理地址 + `/bili/`:
 
 ```jsonc
 // 改之前:
 "baseURL": "https://open.bigmodel.cn/api/coding/paas/v4"
 // 改之后:
-"baseURL": "http://localhost:8787/zhipu/api/coding/paas/v4"
+"baseURL": "http://localhost:8787/bili/https://open.bigmodel.cn/api/coding/paas/v4"
 ```
 
-其他字段(`apiKey`、`models`)都不用改。如果要走 Anthropic provider,把 `baseURL` 改为 `http://localhost:8787/anthropic`。
+其他字段(`apiKey`、`models`)都不用改。
 
 #### Codex
 
-打开 `~/.codex/config.toml`,把现有 provider 的 **`base_url` 这一行**改成指向代理:
+打开 `~/.codex/config.toml`,把现有 provider 的 **`base_url` 这一行**改成指向代理 —— 真实 URL 前面加代理地址 + `/bili/`:
 
 ```toml
 # 改之前:
 base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
 # 改之后:
-base_url = "http://localhost:8787/zhipu/api/coding/paas/v4"
+base_url = "http://localhost:8787/bili/https://open.bigmodel.cn/api/coding/paas/v4"
 ```
 
 其他字段(`name`、`wire_api`、`env_key`)都不用改。
@@ -176,52 +213,43 @@ base_url = "http://localhost:8787/zhipu/api/coding/paas/v4"
 
 #### 其他客户端(Cursor / Aider / Continue …)
 
-只要客户端能设 base URL,就像上面的例子一样指向代理(零配置 `/bili/` 前缀或命名 `/<provider>/` 前缀)。代理说 Anthropic、OpenAI chat-completions、OpenAI Responses 三种协议 —— 用其中任一种的客户端都能工作。用别的协议或非标准 auth header 的客户端暂时还不行。
-
-### 手动配置文件
-
-上面用网页配置。如果你不想用网页、想把配置纳入 git 管理、或者用脚本
-自动化部署,也可以直接手编 JSON 文件,效果完全一样。
-
-打开 `~/.config/billion-context/billion-context.json`,编辑 `providers` 块。
-每个条目是一个**名字 → URL** 映射;这个名字就是你在第 3 步里写进客户端
-base URL 的东西。
-
-```json
-{
-  "providers": {
-    "zhipu": {
-      "url": "https://open.bigmodel.cn",
-      "models": {
-        "glm-5.2": { "context": 1000000 }
-      }
-    },
-    "anthropic": "https://api.anthropic.com"
-  }
-}
-```
-
-- 删掉你不用的 provider。
-- 添加其他的(例如 `"deepseek": "https://api.deepseek.com"`)。
-- API key **不**写在这里 —— key 在客户端那边,代理原样透传。
-
-保存后**重启 `bili`**。启动行列出你的路由:
-
-```
-acp-proxy listening on http://127.0.0.1:8787 — routes: anthropic=https://api.anthropic.com, zhipu=https://open.bigmodel.cn
-```
-
-这证明代理读到了你的配置。(完整 schema —— 按模型的 context 窗口、可选字段 —— 见[配置](#配置)。)
+只要客户端能设 base URL,前面加 `http://localhost:8787/bili/` 就行。代理说 Anthropic、OpenAI chat-completions、OpenAI Responses 三种协议 —— 用其中任一种的客户端都能工作。用别的协议或非标准 auth header 的客户端暂时还不行。
 
 ### 网页配置
 
 代理跑着的时候,在浏览器打开 `http://localhost:8787/__acp/`。你可以:
 
 - **编辑 providers** —— 用表单增删 provider 和按模型的 context 窗口,点 Save 直接写入 `billion-context.json`。
-- **生成客户端 URL** —— 选一个 provider,得到可直接复制的配置片段(Pi / OpenCode / Codex 的 `baseUrl`/`baseURL`/`base_url` 一行,已填好代理地址 + provider 名)。
+- **生成客户端 URL** —— 选一个上游 URL,得到可直接复制的配置片段(Pi / OpenCode / Codex 的 `baseUrl`/`baseURL`/`base_url` 一行,已填好代理地址 + `/bili/` + URL)。
 - **查看会话** —— 实时会话表(请求数、省的 token、最后活跃时间),自动刷新。
 
 用 **Apply** 按钮可以热加载 provider 路由到运行中的进程,无需重启(只有 `port`/`host` 需要重启,因为监听 socket 已经绑了)。
+
+### 手动配置文件
+
+不想用网页 —— 想纳入 git 管理、用脚本自动化部署、或者就是不爱用浏览器?网页写的也是这同一个文件,直接手编效果完全一样。
+
+打开 `~/.config/billion-context/billion-context.json`,编辑 `providers` 块。
+**key 就是上游 URL** —— 客户端写在 `/bili/` 后面的那个字符串。value 为该
+URL 声明按模型的 context 窗口:
+
+```json
+{
+  "providers": {
+    "https://open.bigmodel.cn/api/coding/paas/v4": {
+      "models": { "glm-5.2": { "context": 1000000 } }
+    },
+    "https://api.anthropic.com": {}
+  }
+}
+```
+
+- 一个 key 在客户端嵌入的 URL 等于它或以它开头时匹配(最长 key 优先)。纯 host key 覆盖该 host 上的所有路径。
+- 空 value `{}` 表示"这个 URL 存在,无覆盖"(context 窗口来自 models.dev / 前缀表)。
+- 删掉你不用的条目;添加其他的(按需)。
+- API key **不**写在这里 —— key 在客户端那边,代理原样透传。
+
+保存后点网页里的 **Apply**(或**重启 `bili`**)。(完整 schema —— 按模型的 context 窗口、可选字段 —— 见[配置](#配置)。)
 
 ### 验证
 
@@ -331,15 +359,13 @@ bili --no-auto-update        # 本次启动禁用自动更新
   "port": 8787,
   "host": "127.0.0.1",
   "providers": {
-    "zhipu": {
-      "url": "https://open.bigmodel.cn",
+    "https://open.bigmodel.cn/api/coding/paas/v4": {
       "models": {
         "glm-5.2": { "context": 1000000 },
         "glm-5.1": { "context": 200000 }
       }
     },
-    "anthropic": "https://api.anthropic.com",
-    "deepseek": "https://api.deepseek.com"
+    "https://api.deepseek.com": {}
   }
 }
 ```
@@ -350,12 +376,11 @@ bili --no-auto-update        # 本次启动禁用自动更新
 |------|---------|-------------|
 | `port` | `8787` | 代理监听端口 |
 | `host` | `127.0.0.1` | 代理监听地址 |
-| `upstream` | `https://api.anthropic.com` | 无路由匹配时的默认上游 |
 | `sessionHeader` | `x-acp-session` | 客户端可发来标识会话的 header 名 |
 | `log` | `true` | 启用请求日志 |
 | `debug` | `false` | 详细日志(等同 `ACP_DEBUG=1`) |
 | `passthrough` | `false` | 不压缩直接转发(等同 `ACP_PASSTHROUGH=1`) |
-| `providers` | *(无)* | Provider 路由 —— 见下文 |
+| `providers` | *(无)* | 按 URL 的 context 覆盖 —— 见下文 |
 | `compress` | *(见默认值)* | `{ injectTool, injectNudge }` |
 
 > **选择 `host`**(IPv6 / 容器):默认 `127.0.0.1` 只听 IPv4 且仅
@@ -366,41 +391,38 @@ bili --no-auto-update        # 本次启动禁用自动更新
 > `--host 0.0.0.0`。⚠️ `0.0.0.0` / `::` 会把代理暴露到**所有**网卡;
 > 确保你在可信网络或防火墙后面。
 
-### Providers(URL 路由 + 按模型 context)
+### Providers(按 URL 的 context 覆盖)
 
-`providers` 把路由名映射到一个纯 URL 字符串(简单)或一个带 `url` + 可选按模型 context 窗口的对象(推荐)。
+路由始终是 `/bili/` 前缀(见[路由怎么工作](#路由怎么工作))。
+`providers` 块只声明**按 URL 的 context 窗口覆盖**,以上游 URL 为 key。
+key 就是客户端写在 `/bili/` 后面的那个字符串:
 
-**简单形式** —— provider 名 → URL:
-```json
-{ "deepseek": "https://api.deepseek.com" }
-```
-
-**完整形式** —— provider 名 → `{ url, models }`:
 ```json
 {
-  "zhipu": {
-    "url": "https://open.bigmodel.cn",
-    "models": {
-      "glm-5.2": { "context": 1000000 },
-      "glm-5.1": { "context": 200000 }
-    }
+  "providers": {
+    "https://open.bigmodel.cn/api/coding/paas/v4": {
+      "models": {
+        "glm-5.2": { "context": 1000000 },
+        "glm-5.1": { "context": 200000 }
+      }
+    },
+    "https://api.deepseek.com": {}
   }
 }
 ```
 
-同一个模型在不同 provider 后面可以有不同 context 窗口(例如 relay 把模型包成更大窗口)。`context` 是**输入 context 上限**(压缩器用它判断何时 nudge)。可选;缺失值回退到内置模型表,再回退到 `modelContextLimit`。**`output`(最大输出 token)已不再需要** —— proxy 原样透传客户端发的 `max_tokens`,客户端不发就让上游用默认值(Anthropic 客户端总会发,所以 Anthropic 路由自动覆盖)。config 里的 `output` 字段仍兼容接受,但已无效果。
+同一个模型在不同上游后面可以有不同 context 窗口(例如 relay 把模型包成更大窗口)。`context` 是**输入 context 上限**(压缩器用它判断何时 nudge)。可选;缺失值回退到 [models.dev](https://models.dev) registry,再回退到内置前缀表。
 
-> **为什么要声明 context?** LLM 的 `/models` API **不返回** context 窗口(已跨 OpenAI、Anthropic、智谱、comfly 验证)。它们是文档级信息。值错了(例如把 GLM-5.2 猜成 128K 而非 1M)会导致频繁误触发压缩。按 provider + 模型声明能让代理匹配客户端自己用的注册表。
+> **为什么要声明 context?** LLM 的 `/models` API **不返回** context 窗口(已跨 OpenAI、Anthropic、智谱、comfly 验证)。它们是文档级信息。值错了(例如把 GLM-5.2 猜成 128K 而非 1M)会导致频繁误触发压缩。按 URL + 模型声明能让代理匹配客户端自己用的注册表。
+
+### URL key 匹配规则
+
+- 一个请求在客户端嵌入的 URL **等于 key 或以 key 开头**时匹配(最长 key 优先)。
+- 浅 key 如 `https://open.bigmodel.cn` 覆盖该 host 上的每条路径;深 key 如 `https://open.bigmodel.cn/api/anthropic` 只覆盖那一个端点。
+- key 永不跨 host(边界检查要求 key 后面是 `/` 或字符串结尾),所以 `https://x.com` 不会匹配 `https://x.com.evil`。
+- 未被任何匹配 key 覆盖的模型回退到 models.dev,再回退到前缀表,最后回退到 `modelContextLimit`。
 
 **API key 永远不存进代理** —— 助手发什么 key,原样透传给上游。
-
-### Provider 名规则
-
-- 必须以字母开头,只含字母/数字/`-`/`_`。
-- 保留字(`v1`、`chat`、`completions`、`messages`、`models`、`api`)被拒绝,以免与真实 API 路径段冲突。
-- provider 名可出现在路径任意位置;最长匹配优先。
-- **未声明任何 providers**(比如你清空了 `providers` 块)时,每个请求按完整
-  原始路径转发到默认 `upstream` —— 边缘场景,非正常流程。
 
 ## 会话机制
 
