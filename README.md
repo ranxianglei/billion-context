@@ -80,7 +80,11 @@ passes it through untouched). Context windows (gpt-5.1-codex=400K,
 glm-5.2=1M, claude-opus-4=200K, …) are looked up from models.dev
 automatically.
 
-#### Examples by client
+#### A. API-key clients (`/bili/` prefix)
+
+Clients you configure with an **API key** (not a login) let you change the
+upstream URL. Just prepend `http://localhost:8787/bili/` to it — that's the
+only change.
 
 **OpenCode** — edit `~/.config/opencode/opencode.json`, change the provider's `baseURL`:
 ```jsonc
@@ -90,7 +94,7 @@ automatically.
 "baseURL": "http://localhost:8787/bili/https://open.bigmodel.cn/api/coding/paas/v4"
 ```
 
-**Codex** — edit `~/.codex/config.toml`, change the provider's `base_url`:
+**Codex (API key)** — edit `~/.codex/config.toml`, change the provider's `base_url`:
 ```toml
 # before:
 base_url = "https://api.openai.com/v1"
@@ -106,23 +110,29 @@ base_url = "http://localhost:8787/bili/https://api.openai.com/v1"
 "baseUrl": "http://localhost:8787/bili/https://api.anthropic.com"
 ```
 
-**Other clients (Cursor / Aider / Continue …)** — wherever the upstream URL
-is configured, prepend `http://localhost:8787/bili/` to it. Nothing else
-changes.
+**Other API-key clients (Cursor / Aider / Continue …)** — wherever the
+upstream URL is configured, prepend `http://localhost:8787/bili/` to it.
+Nothing else changes.
 
-#### ZCode (special: MITM mode)
+#### B. Login/subscription clients (MITM transparent proxy)
 
-ZCode is different from the clients above: its OAuth-logged-in provider
-(`builtin:bigmodel-coding-plan`) **hardcodes the endpoint and does not let you
-change the baseURL**. The `/bili/` prefix trick does not work because ZCode
-never lets you type the upstream URL.
+Clients you sign **into an account** (ChatGPT Plus/Pro, Claude, ZCode coding
+plan, …) authenticate via **OAuth and hardcode the endpoint** — you can't
+change the baseURL, so the `/bili/` prefix trick doesn't work. These need
+**MITM transparent-proxy mode** instead.
 
-For ZCode (and any client that only offers an **HTTP proxy** setting rather
-than a baseURL), enable **MITM transparent-proxy mode**. In this mode
-billion-context acts as an HTTP forward proxy: ZCode sends a
-`CONNECT open.bigmodel.cn:443`, billion-context terminates the TLS locally
-(with a locally-generated root CA), injects compression into the cleartext,
-then re-encrypts and forwards. The OAuth token travels in ZCode's
+Supported login clients:
+
+| Client | Login | Endpoint hardcoded |
+|---|---|---|
+| **ZCode** | bigmodel coding plan (OAuth) | `open.bigmodel.cn` (builtin provider) |
+| **Codex** | ChatGPT account (OAuth) | `chatgpt.com/backend-api` |
+| **Claude Code** | Claude subscription (OAuth) | `api.anthropic.com` |
+
+How MITM mode works: the client only offers an **HTTP proxy** setting, so it
+sends `CONNECT <host>:443`; billion-context terminates the TLS locally (with a
+locally-generated root CA), injects compression into the cleartext, then
+re-encrypts and forwards. The OAuth token travels in the client's
 `Authorization` header, which is forwarded untouched — so the subscription
 discount is preserved.
 
@@ -131,7 +141,7 @@ MITM is on by default and is scoped to a **whitelist** of model hosts
 All other HTTPS hosts are blind-tunnelled — billion-context never decrypts
 non-model traffic.
 
-**One-time setup (trust the root CA in ZCode):**
+**One-time setup (trust the root CA in the client):**
 
 1. Start the proxy once to generate the root CA:
    ```bash
@@ -139,20 +149,23 @@ non-model traffic.
    ls ~/.local/share/billion-context/ca/root-ca.pem   # exists now
    ```
 
-2. In ZCode → **Settings → Network** set:
+2. In the client's **Settings → Network / Proxy** set:
    - **HTTP Proxy**: `http://127.0.0.1:8787`
    - **Proxy CA certificate path**: `/home/<you>/.local/share/billion-context/ca/root-ca.pem`
    - (optional) **No-proxy list**: `localhost,127.0.0.1`
+   - (For ZCode specifically: **Settings → Network**. For Codex/Claude Code:
+     set the `HTTPS_PROXY` env var and `NODE_EXTRA_CA_CERTS` to the CA path.)
 
-3. Restart ZCode. Its model traffic now flows through billion-context with
-   compression injected. Send a message and check the proxy log
+3. Restart the client. Its model traffic now flows through billion-context
+   with compression injected. Send a message and check the proxy log
    (`~/.local/state/billion-context/bili.log`) for
-   `mitm open.bigmodel.cn:443 tunnel established`.
+   `mitm <host>:443 tunnel established`.
 
 > The root CA is generated locally and lives only on this machine; it is
-> **not** a system-wide install. Only ZCode (via the CA-path setting, which
-> it feeds to Node as `NODE_EXTRA_CA_CERTS`) trusts it, so no other app is
-> affected. Deleting the CA files and restarting the proxy regenerates them.
+> **not** a system-wide install. Only the client you configure (via the
+> CA-path setting, which it feeds to Node as `NODE_EXTRA_CA_CERTS`) trusts it,
+> so no other app is affected. Deleting the CA files and restarting the proxy
+> regenerates them.
 
 ### Option B — Manual config file & context windows
 
