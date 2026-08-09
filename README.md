@@ -167,6 +167,12 @@ non-model traffic.
 > so no other app is affected. Deleting the CA files and restarting the proxy
 > regenerates them.
 
+**Routing a login client through its own proxy (firewall/GFW).** A login
+client (ZCode) and an API-key client can both hit the same host
+(`open.bigmodel.cn`). To give the login client its OWN upstream proxy without
+affecting API-key clients, use the `mitm://` scheme key — see
+[Upstream proxy (MITM vs `/bili/`)](#upstream-proxy-firewall--gfw).
+
 ### Option B — Manual config file & context windows
 
 Open `~/.config/billion-context/billion-context.json` and edit the `providers`
@@ -344,6 +350,7 @@ The config file is a single JSON object. Example:
 | `passthrough` | `false` | Forward without compression (same as `ACP_PASSTHROUGH=1`) |
 | `providers` | *(none)* | Per-URL context overrides — see below |
 | `compress` | *(see defaults)* | `{ injectTool, injectNudge }` |
+| `proxy` | *(none)* | Upstream HTTP proxy for the proxy's OWN outbound connections to model providers (`http://host:port`). Per-URL `proxy` overrides this. See [Upstream proxy](#upstream-proxy-firewall--gfw). |
 
 > **Choosing a `host`** (IPv6 / containers): the default `127.0.0.1` is
 > IPv4-only and loopback-only. Use `--host ::` (or `"host": "::"`) to listen
@@ -400,6 +407,65 @@ registry, then the built-in prefix table.
 
 **API keys are never stored in the proxy** — whatever key the agent sends is
 passed through untouched to the upstream.
+
+### Upstream proxy (firewall / GFW)
+
+If the proxy's own outbound connections to a model provider are blocked
+(e.g. `api.openai.com` from inside the GFW), configure an **upstream proxy**
+(the local v2rayA / clash HTTP port) so the proxy reaches the provider:
+
+```jsonc
+{
+  // Global default: ALL providers route through this proxy
+  "proxy": "http://127.0.0.1:20172",
+  "providers": {
+    "https://api.openai.com/v1": {
+      // Per-URL overrides global (use a different proxy for this host)
+      "proxy": "http://127.0.0.1:20173",
+      "models": { "gpt-5": { "context": 400000 } }
+    },
+    "https://open.bigmodel.cn/api/anthropic": {
+      // Empty string = explicitly DIRECT, overriding the global proxy
+      "proxy": "",
+      "models": { "glm-5.2": { "context": 1000000 } }
+    }
+  }
+}
+```
+
+Rules:
+- **Global `proxy`** (top level) applies to every provider's outbound.
+- **Per-URL `proxy`** overrides the global for that host.
+- Empty string `""` means **explicitly direct** (override-and-disable).
+- Neither set = direct connect.
+- Only HTTP proxies (`http://host:port`). SOCKS5 is not supported yet.
+- Both outbound paths are covered: `/bili/` path-mode (fetch) AND MITM CONNECT
+  tunnels (the proxy's connection to the real upstream goes through the HTTP
+  CONNECT proxy).
+
+Env override: `BILI_UPSTREAM_PROXY=http://127.0.0.1:20172` (same as global
+`proxy`; config file wins over env if both set).
+
+**MITM vs `/bili/` — distinguishing the key scheme.** A login client
+(ZCode via MITM) and an API-key client can both hit the same host
+(`open.bigmodel.cn`). To let their config differ, MITM traffic uses a
+`mitm://` scheme in the lookup key while `/bili/` traffic uses the real
+`https://`:
+
+| Client | Lookup key example |
+|---|---|
+| ZCode (MITM, login) | `mitm://open.bigmodel.cn` |
+| API-key client (`/bili/`) | `https://open.bigmodel.cn/api/anthropic` |
+
+So you can give ZCode its own proxy without affecting API-key clients:
+```jsonc
+{
+  "providers": {
+    "mitm://open.bigmodel.cn":            { "proxy": "http://127.0.0.1:20173" },
+    "https://open.bigmodel.cn/api/anthropic": { "proxy": "http://127.0.0.1:20172" }
+  }
+}
+```
 
 ## How sessions work
 

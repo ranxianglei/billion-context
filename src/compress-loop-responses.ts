@@ -14,6 +14,7 @@ import { applyRanges } from "./stream.js";
 import { resolveDecompress } from "./decompress-shared.js";
 import { buildVisibilityMarker } from "./compress-loop.js";
 import { fetchWithTimeout } from "./fetch-util.js";
+import { proxyDispatcher } from "./upstream-proxy.js";
 
 /** Text-protocol mode: the host (OpenAI Codex code_mode) cannot coexist with
  *  a declared `tools` array, so compression is triggered by a text marker the
@@ -64,6 +65,8 @@ interface CompressLoopResponsesCtx {
     messages: CoreMessage[];
     session: Session;
     log: (msg: string) => void;
+    /** Resolved upstream proxy URL (http://host:port) or undefined for direct. */
+    proxyUrl?: string;
 }
 
 interface RequestOptions {
@@ -506,6 +509,7 @@ export async function* compressLoopResponsesStream(
             method: "POST",
             headers: requestOptions.headers,
             body: JSON.stringify(requestBody),
+            ...(ctx.proxyUrl ? { dispatcher: proxyDispatcher(ctx.proxyUrl) } : {}),
         });
 
         if (!resp.ok || !resp.body) {

@@ -38,6 +38,10 @@ export function safeReadJson(path: string): unknown {
  *  Backward compatible: a bare string is accepted and treated as { url }. */
 export type ProviderRoute = {
     models?: Record<string, { context?: number; output?: number }>;
+    /** Per-URL upstream HTTP proxy. Overrides the global `proxy`. Empty string
+     *  means "explicitly direct" (override global with no proxy). Format:
+     *  `http://host:port`. SOCKS5 is not supported yet. */
+    proxy?: string;
 };
 export type ProviderRoutes = Record<string, ProviderRoute>; // key = upstream URL prefix (the /bili/<this> string)
 
@@ -110,6 +114,9 @@ export type ProxyOptions = {
     host: string;
     upstream: string;
     routes: ProviderRoutes;
+    /** Global default upstream HTTP proxy. Per-URL `proxy` overrides this.
+     *  Empty string disables. `http://host:port` format. */
+    proxy?: string;
     modelContextLimit: number;
     kernelConfig: Config;
     compress: {
@@ -195,6 +202,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         host,
         upstream,
         routes,
+        proxy: env.BILI_UPSTREAM_PROXY ?? fileConfig.proxy,
         modelContextLimit,
         kernelConfig: defaultConfig(modelContextLimit),
         compress: {
@@ -225,6 +233,9 @@ type FileConfig = {
     providersPath?: string;
     /** Inline providers, same shape as providers.json. */
     providers?: Record<string, unknown>;
+    /** Global default upstream HTTP proxy (applied to all providers unless a
+     *  per-URL `proxy` overrides it). `http://host:port`. */
+    proxy?: string;
     modelContextLimit?: number;
     sessionHeader?: string;
     log?: boolean;
@@ -284,8 +295,10 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
     // is the KEY in the providers map (identical to the /bili/<url> string),
     // so it is NOT repeated inside the value.
     if (v && typeof v === "object" && !Array.isArray(v)) {
-        const obj = v as { models?: Record<string, { context?: number; output?: number }> };
-        return { models: obj.models };
+        const obj = v as { models?: Record<string, { context?: number; output?: number }>; proxy?: string };
+        const route: ProviderRoute = { models: obj.models };
+        if (typeof obj.proxy === "string") route.proxy = obj.proxy;
+        return route;
     }
     // A bare value (e.g. null) means "this upstream exists, no overrides".
     if (v === null) return {};

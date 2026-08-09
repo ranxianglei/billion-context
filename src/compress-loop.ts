@@ -12,6 +12,7 @@ import { parseCompressInput, PROXY_TOOL_NAMES } from "./compress-tool.js";
 import { applyRanges } from "./stream.js";
 import { resolveDecompress } from "./decompress-shared.js";
 import { fetchWithTimeout } from "./fetch-util.js";
+import { proxyDispatcher } from "./upstream-proxy.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
 import { log as loggerLog } from "./logger.js";
 
@@ -21,6 +22,9 @@ interface CompressLoopCtx {
     messages: CoreMessage[];
     session: Session;
     log: (msg: string) => void;
+    /** Resolved upstream proxy URL (http://host:port) or undefined for direct.
+     *  Pre-resolved by the caller (server.ts) via resolveProxy(). */
+    proxyUrl?: string;
 }
 
 interface RequestOptions {
@@ -406,6 +410,7 @@ export async function* compressLoopStream(
             method: "POST",
             headers: requestOptions.headers,
             body: JSON.stringify(requestBody),
+            ...(ctx.proxyUrl ? { dispatcher: proxyDispatcher(ctx.proxyUrl) } : {}),
         });
 
         if (!resp.ok || !resp.body) {
