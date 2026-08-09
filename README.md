@@ -45,8 +45,11 @@ This installs the `bili` command (`bili-proxy` is kept as an alias).
 Two ways to use it — pick one:
 
 - **Zero-config (simplest):** prefix your client's baseURL with the proxy
-  origin + `/p/`. No config file needed — context windows are auto-detected
-  from the [models.dev](https://models.dev) registry.
+  origin + `/bili/`. No config file needed — context windows are auto-detected
+  from the [models.dev](https://models.dev) registry. The `/bili/` prefix also
+  doubles as a self-detection signal: billion-context client extensions
+  (billion-context-pi / opencode-acp) can recognize it in their own baseUrl
+  and self-disable, so you never get double compression.
 - **Named providers:** declare providers in a config file, then use shorter
   `http://localhost:8787/<name>/...` URLs. Better when you manage several
   endpoints or want explicit per-model context overrides.
@@ -54,7 +57,7 @@ Two ways to use it — pick one:
 Compression is injected automatically — you only configure routing, never
 compression itself.
 
-### Option A — Zero-config (`/p/` prefix)
+### Option A — Zero-config (`/bili/` prefix)
 
 Start the proxy:
 
@@ -62,13 +65,13 @@ Start the proxy:
 bili
 ```
 
-Then just prefix your client's existing baseURL with `http://localhost:8787/p/`.
+Then just prefix your client's existing baseURL with `http://localhost:8787/bili/`.
 The full upstream URL is embedded in the path, so the proxy knows where to
 forward without any config:
 
 ```
 client baseURL before:  https://api.openai.com/v1
-client baseURL after:   http://localhost:8787/p/https://api.openai.com/v1
+client baseURL after:   http://localhost:8787/bili/https://api.openai.com/v1
 ```
 
 That's it — put your real API key in the client config as usual (the proxy
@@ -82,8 +85,8 @@ automatically.
 ```jsonc
 // before:
 "baseURL": "https://open.bigmodel.cn/api/coding/paas/v4"
-// after (just prepend the proxy origin + /p/):
-"baseURL": "http://localhost:8787/p/https://open.bigmodel.cn/api/coding/paas/v4"
+// after (just prepend the proxy origin + /bili/):
+"baseURL": "http://localhost:8787/bili/https://open.bigmodel.cn/api/coding/paas/v4"
 ```
 
 **Codex** — edit `~/.codex/config.toml`, change the provider's `base_url`:
@@ -91,7 +94,7 @@ automatically.
 # before:
 base_url = "https://api.openai.com/v1"
 # after:
-base_url = "http://localhost:8787/p/https://api.openai.com/v1"
+base_url = "http://localhost:8787/bili/https://api.openai.com/v1"
 ```
 
 **Pi** — edit `~/.pi/agent/models.json`, change the provider's `baseUrl`:
@@ -99,13 +102,15 @@ base_url = "http://localhost:8787/p/https://api.openai.com/v1"
 // before:
 "baseUrl": "https://api.anthropic.com"
 // after:
-"baseUrl": "http://localhost:8787/p/https://api.anthropic.com"
+"baseUrl": "http://localhost:8787/bili/https://api.anthropic.com"
 ```
 
 **Other clients (Cursor / Aider / Continue …)** — wherever the upstream URL is
-configured, prepend `http://localhost:8787/p/` to it. Nothing else changes.
+configured, prepend `http://localhost:8787/bili/` to it. Nothing else changes.
 
 ### Option B — Named providers (config file)
+
+Three steps: **start the proxy → configure your providers → point your client at it**.
 
 ### Step 1 — Start the proxy
 
@@ -231,9 +236,11 @@ Everything else (`name`, `wire_api`, `env_key`) stays unchanged.
 
 #### Other clients (Cursor / Aider / Continue …)
 
-Not yet supported. The proxy currently speaks the Anthropic, OpenAI
-chat-completions, and OpenAI Responses protocols — if your client uses a
-different protocol or a non-standard auth header, it won't work yet.
+If the client lets you set a base URL, point it at the proxy exactly like the
+examples above (zero-config `/bili/` prefix or named `/<provider>/` prefix).
+The proxy speaks the Anthropic, OpenAI chat-completions, and OpenAI Responses
+protocols — any client using one of those works. A client using a different
+protocol or a non-standard auth header won't work yet.
 
 ### Web UI
 
@@ -243,7 +250,9 @@ Open `http://localhost:8787/__acp/` in a browser while the proxy is running. You
 - **Generate client URLs** — pick a provider, get ready-to-copy config snippets for Pi / OpenCode / Codex (the `baseUrl`/`baseURL`/`base_url` line with the proxy origin + provider name filled in).
 - **View sessions** — live table of active sessions (requests, tokens saved, last seen), auto-refreshing.
 
-Changes to providers require a **restart** to take effect (the UI tells you this).
+Use the **Apply** button to hot-reload provider routes into the running
+process without restarting (only `port`/`host` require a restart, since the
+listen socket is already bound).
 
 ### Manual config file
 
@@ -525,7 +534,7 @@ pass an explicit `x-acp-session` header per conversation to avoid collisions.
 
 ## Status
 
-Early. Protocol handling and compression work against mock tests (141 passing). Real-model integration testing is the next milestone. Expect rough edges.
+Early. Protocol handling and compression work against mock tests (146 passing). Real-model integration testing is the next milestone. Expect rough edges.
 
 See [billion-context-pi](https://github.com/ranxianglei/billion-context-pi) for the pi-extension mode (in-process, tighter integration, the reference implementation).
 
