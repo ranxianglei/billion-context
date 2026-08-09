@@ -2,6 +2,7 @@ import http from "node:http";
 import net from "node:net";
 import tls from "node:tls";
 import { ensureRootCA, getSecureContext } from "./ca.js";
+import { connectThroughProxy } from "./upstream-proxy.js";
 
 /** Domains we transparently MITM: the model-inference endpoints of the
  *  providers billion-context targets. Everything else (banking, mail, …) is
@@ -49,6 +50,7 @@ export function setupMitm(
     server: http.Server,
     extraDomains: string[] = [],
     log: Logger = () => {},
+    resolveProxyUrl?: (host: string) => string | undefined,
 ): void {
     ensureRootCA();
     server.on("connect", (req: http.IncomingMessage, clientSocket: net.Socket, head: Buffer) => {
@@ -60,7 +62,8 @@ export function setupMitm(
         }
         const targetPort = port || 443;
         if (!isMitmHost(hostname, extraDomains)) {
-            tunnelThrough(clientSocket, hostname, targetPort, head, log);
+            const proxyUrl = resolveProxyUrl?.(hostname);
+            tunnelThrough(clientSocket, hostname, targetPort, head, log, proxyUrl);
             return;
         }
         doMitm(server, clientSocket, hostname, targetPort, head, log);
@@ -78,46 +81,55 @@ function parseHostPort(s: string): { hostname: string; port: number } {
 }
 
 /** Pure TCP tunnel for non-whitelisted hosts. We establish a connection to the
- *  real upstream and pipe bytes both ways without ever inspecting them. */
+ *  real upstream and pipe bytes both ways without ever inspecting them.
+ *  `proxyUrl` (optional) routes the outbound through an HTTP CONNECT proxy. */
 function tunnelThrough(
     clientSocket: net.Socket,
     host: string,
     port: number,
     head: Buffer,
     log: Logger,
+    proxyUrl?: string,
 ): void {
-    const upstream = net.connect(port, host);
+    // Outbound connect: direct, or via HTTP CONNECT proxy if configured. The
+    // proxy case is async (handshake) so we bridge with a promise.
+    let upstream: net.Socket | undefined;
     let established = false;
-    // Fail fast if the real upstream is unreachable: without a timeout the
-    // tunnel would hang forever, pinning the client's connection. 10s is
-    // generous for a TCP connect to a known model endpoint.
     const connectTimer = setTimeout(() => {
         if (!established) {
             log(`tunnel ${host}:${port} connect timeout`);
             clientSocket.write("HTTP/1.1 504 Gateway Timeout\r\n\r\n");
-            upstream.destroy();
+            if (upstream) upstream.destroy();
             clientSocket.destroy();
         }
-    }, 10000);
-    upstream.on("connect", () => {
+    }, 15000);
+    connectThroughProxy(host, port, proxyUrl).then((sock) => {
+        upstream = sock;
+        upstream.on("connect", () => {
+            clearTimeout(connectTimer);
+            established = true;
+            clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+            if (head.length > 0) upstream!.write(head);
+            upstream!.pipe(clientSocket);
+            clientSocket.pipe(upstream!);
+        });
+        const cleanup = (where: string, err: Error) => {
+            clearTimeout(connectTimer);
+            if (!established) {
+                log(`tunnel ${host}:${port} ${where} failed: ${err.message}`);
+                clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+            }
+            clientSocket.destroy();
+            upstream?.destroy();
+        };
+        upstream.on("error", (e) => cleanup("upstream", e));
+        clientSocket.on("error", (e) => cleanup("client", e));
+    }).catch((err: Error) => {
         clearTimeout(connectTimer);
-        established = true;
-        clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
-        if (head.length > 0) upstream.write(head);
-        upstream.pipe(clientSocket);
-        clientSocket.pipe(upstream);
-    });
-    const cleanup = (where: string, err: Error) => {
-        clearTimeout(connectTimer);
-        if (!established) {
-            log(`tunnel ${host}:${port} ${where} failed: ${err.message}`);
-            clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
-        }
+        log(`tunnel ${host}:${port} connect failed: ${err.message}`);
+        clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
         clientSocket.destroy();
-        upstream.destroy();
-    };
-    upstream.on("error", (e) => cleanup("upstream", e));
-    clientSocket.on("error", (e) => cleanup("client", e));
+    });
 }
 
 /** MITM the connection: terminate TLS with our signed cert, then inject the

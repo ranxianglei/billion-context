@@ -7,6 +7,7 @@ import { loadRoutes } from "./config.js";
 import { resolveContextLimit } from "./config.js";
 import { contextFromRegistry, loadRegistry } from "./registry.js";
 import { fetchWithTimeout, MAX_REQUEST_BYTES } from "./fetch-util.js";
+import { resolveProxy, proxyDispatcher } from "./upstream-proxy.js";
 import {
     anthropicToCore,
     coreToAnthropic,
@@ -128,7 +129,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         }
     });
     if (opts.mitm.enabled) {
-        setupMitm(server, opts.mitm.domains, (msg) => log("info", msg));
+        setupMitm(server, opts.mitm.domains, (msg) => log("info", msg), (host) => resolveProxy(opts.routes, opts.proxy, `https://${host}`));
     }
     server.listen(opts.port, opts.host, () => {
         const displayHost = opts.host === "0.0.0.0" ? "localhost" : opts.host;
@@ -814,11 +815,13 @@ async function forward(
     if (affinity && !clientConversationHeader(req.headers)) {
         headers["x-session-id"] = affinity;
     }
-    const init: RequestInit = {
+    const dispatcher = proxyDispatcher(resolveProxy(opts.routes, opts.proxy, route?.rewrittenUrl));
+    const init: Omit<RequestInit, "dispatcher"> & { dispatcher?: object } = {
         method: req.method ?? "GET",
         headers,
         body: req.method === "GET" || req.method === "HEAD" ? undefined : body,
     };
+    if (dispatcher) init.dispatcher = dispatcher;
     const { response: upstream, clearTimer: clearUpstreamTimer } = await fetchWithTimeout(upstreamUrl, init);
     const respHeaders: Record<string, string> = {};
     upstream.headers.forEach((v, k) => {
@@ -890,7 +893,7 @@ async function forward(
             reqHeaders["content-type"] = "application/json";
             const loop = compressLoopStream(
                 streamToRead,
-                { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log },
+                { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl: resolveProxy(opts.routes, opts.proxy, route?.rewrittenUrl) },
                 parsedReq,
                 { url: upstreamUrl, headers: reqHeaders },
             );
@@ -913,7 +916,7 @@ async function forward(
             reqHeaders["content-type"] = "application/json";
             const loop = compressLoopResponsesStream(
                 streamToRead,
-                { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log },
+                { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl: resolveProxy(opts.routes, opts.proxy, route?.rewrittenUrl) },
                 parsedReq,
                 { url: upstreamUrl, headers: reqHeaders },
             );
@@ -936,7 +939,7 @@ async function forward(
             reqHeaders["content-type"] = "application/json";
             const loop = compressLoopAnthropicStream(
                 streamToRead,
-                { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log },
+                { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl: resolveProxy(opts.routes, opts.proxy, route?.rewrittenUrl) },
                 parsedReq,
                 { url: upstreamUrl, headers: reqHeaders },
             );
