@@ -298,6 +298,7 @@ bili --no-auto-update        # 本次启动禁用自动更新
 | `passthrough` | `false` | 不压缩直接转发(等同 `ACP_PASSTHROUGH=1`) |
 | `providers` | *(无)* | 按 URL 的 context 覆盖 —— 见下文 |
 | `compress` | *(见默认值)* | `{ injectTool, injectNudge }` |
+| `proxy` | *(无)* | 代理自身访问模型提供商时走的上游 HTTP 代理(`http://host:port`)。按 URL 的 `proxy` 会覆盖它。见[上游代理](#上游代理防火墙gfw)。 |
 
 > **选择 `host`**(IPv6 / 容器):默认 `127.0.0.1` 只听 IPv4 且仅
 > loopback。用 `--host ::`(或 `"host": "::"`)可同时听 IPv4 和 IPv6
@@ -339,6 +340,39 @@ key 就是客户端写在 `/bili/` 后面的那个字符串:
 - 未被任何匹配 key 覆盖的模型回退到 models.dev,再回退到前缀表,最后回退到 `modelContextLimit`。
 
 **API key 永远不存进代理** —— 助手发什么 key,原样透传给上游。
+
+### 上游代理(防火墙 / GFW)
+
+如果代理自身访问模型提供商的连接被墙(比如 GFW 内访问 `api.openai.com`),配置一个**上游代理**(本地 v2rayA / clash 的 HTTP 端口),让代理能连到提供商:
+
+```jsonc
+{
+  // 全局默认:所有提供商的出站都走这个代理
+  "proxy": "http://127.0.0.1:20172",
+  "providers": {
+    "https://api.openai.com/v1": {
+      // 按 URL 覆盖全局(给这个域名用另一个代理)
+      "proxy": "http://127.0.0.1:20173",
+      "models": { "gpt-5": { "context": 400000 } }
+    },
+    "https://open.bigmodel.cn/api/anthropic": {
+      // 空字符串 = 明确直连,覆盖全局代理
+      "proxy": "",
+      "models": { "glm-5.2": { "context": 1000000 } }
+    }
+  }
+}
+```
+
+规则:
+- **全局 `proxy`**(顶层)对所有提供商的出站生效。
+- **按 URL 的 `proxy`** 覆盖该域名的全局设置。
+- 空字符串 `""` 表示**明确直连**(覆盖并禁用)。
+- 都不配 = 直连。
+- 只支持 HTTP 代理(`http://host:port`)。SOCKS5 暂不支持。
+- 两条出站路径都覆盖:`/bili/` 路径模式(fetch)和 MITM CONNECT 隧道(代理连接真实上游的链路走 HTTP CONNECT 代理)。
+
+环境变量覆盖:`BILI_UPSTREAM_PROXY=http://127.0.0.1:20172`(等同全局 `proxy`;两者都设时配置文件优先)。
 
 ## 会话机制
 
