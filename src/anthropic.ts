@@ -1,4 +1,5 @@
 import type { CoreMessage } from "acp-kernel";
+import type { BiliMessage } from "./bili-message.js";
 import { hashId } from "./util.js";
 import { ClusterCounter, deriveMessageId } from "./message-id.js";
 
@@ -57,10 +58,10 @@ export function buildSystem(text: string, original: AnthropicRequestBody["system
     return text;
 }
 
-type Flat = { msgs: CoreMessage[]; cacheControls: Map<string, unknown> };
+type Flat = { msgs: BiliMessage[]; cacheControls: Map<string, unknown> };
 
 export function anthropicToCore(body: AnthropicRequestBody): Flat {
-    const msgs: CoreMessage[] = [];
+    const msgs: BiliMessage[] = [];
     const cacheControls = new Map<string, unknown>();
     const clusters = new ClusterCounter();
     for (const m of body.messages) {
@@ -101,18 +102,31 @@ export function anthropicToCore(body: AnthropicRequestBody): Flat {
                         contentType: "tool-result",
                         toolCallId: b.tool_use_id,
                         text,
+                        ...(b.is_error === true ? { toolIsError: true } : {}),
                     });
                     if (b.cache_control) cacheControls.set(id, b.cache_control);
                     break;
                 }
                 case "thinking": {
                     const base = deriveMessageId("assistant", "reasoning", b.thinking);
-                    msgs.push({ id: clusters.next(base), role: "assistant", contentType: "reasoning", text: b.thinking });
+                    msgs.push({
+                        id: clusters.next(base),
+                        role: "assistant",
+                        contentType: "reasoning",
+                        text: b.thinking,
+                        ...(b.signature ? { thinkingSignature: b.signature } : {}),
+                    });
                     break;
                 }
                 case "image": {
                     const base = deriveMessageId(m.role, "text", "[image]");
-                    msgs.push({ id: clusters.next(base), role: m.role, contentType: "text", text: "[image]" });
+                    msgs.push({
+                        id: clusters.next(base),
+                        role: m.role,
+                        contentType: "text",
+                        text: "[image]",
+                        rawAnthropicBlock: b,
+                    });
                     break;
                 }
             }
@@ -121,7 +135,7 @@ export function anthropicToCore(body: AnthropicRequestBody): Flat {
     return { msgs, cacheControls };
 }
 
-export function coreToAnthropic(messages: CoreMessage[], cacheControls?: Map<string, unknown>): AnthropicMessage[] {
+export function coreToAnthropic(messages: BiliMessage[], cacheControls?: Map<string, unknown>): AnthropicMessage[] {
     const out: AnthropicMessage[] = [];
     let current: { role: "user" | "assistant"; blocks: AnthropicBlock[] } | null = null;
     const flush = () => {
@@ -142,9 +156,14 @@ export function coreToAnthropic(messages: CoreMessage[], cacheControls?: Map<str
             current = { role: target, blocks: [] };
         }
         switch (m.contentType) {
-            case "text":
+            case "text": {
+                if (m.rawAnthropicBlock) {
+                    current.blocks.push(m.rawAnthropicBlock as AnthropicBlock);
+                    break;
+                }
                 current.blocks.push({ type: "text", text: m.text ?? "", ...cc(m.id) });
                 break;
+            }
             case "tool-call":
                 current.blocks.push({
                     type: "tool_use",
@@ -159,11 +178,16 @@ export function coreToAnthropic(messages: CoreMessage[], cacheControls?: Map<str
                     type: "tool_result",
                     tool_use_id: m.toolCallId ?? "",
                     content: m.text ?? "",
+                    ...(m.toolIsError ? { is_error: true } : {}),
                     ...cc(m.id),
                 });
                 break;
             case "reasoning":
-                current.blocks.push({ type: "thinking", thinking: m.text ?? "" });
+                current.blocks.push({
+                    type: "thinking",
+                    thinking: m.text ?? "",
+                    ...(m.thinkingSignature ? { signature: m.thinkingSignature } : {}),
+                });
                 break;
         }
     }

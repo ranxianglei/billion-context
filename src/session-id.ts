@@ -26,12 +26,19 @@ import { hashId } from "./util.js";
  * understand that convention work without bespoke support.
  */
 
-/** Extract the account credential from common auth headers, normalized. */
+/** Extract the account credential from common auth headers, verbatim.
+ *  The value is fed into a hash — it is NEVER stored, logged, or compared.
+ *  Normalization is intentionally minimal: trim whitespace only. We do NOT
+ *  lowercase: while that reduces hash collisions in theory (two keys that
+ *  differ only in case would hash the same), in practice API keys are
+ *  case-sensitive and a lowercase normalization would collapse two distinct
+ *  valid keys into one hash bucket — a silent isolation violation. Keep the
+ *  raw value so each distinct key hashes distinctly. */
 function extractKey(headers: Record<string, string | string[] | undefined>): string {
     const auth = headers["authorization"];
-    if (typeof auth === "string" && auth.length > 0) return auth.trim().toLowerCase();
+    if (typeof auth === "string" && auth.length > 0) return auth.trim();
     const apiKey = headers["x-api-key"];
-    if (typeof apiKey === "string" && apiKey.length > 0) return `key:${apiKey.trim().toLowerCase()}`;
+    if (typeof apiKey === "string" && apiKey.length > 0) return `key:${apiKey.trim()}`;
     return "(no-key)";
 }
 
