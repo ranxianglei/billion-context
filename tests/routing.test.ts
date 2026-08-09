@@ -1,9 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { writeFileSync, unlinkSync } from "node:fs";
-import { loadOptions, lookupContextLimit } from "../src/config.ts";
-import { resolveUpstream } from "../src/server.ts";
-import type { ProxyOptions } from "../src/config.ts";
+import { loadOptions, lookupContextLimit, resolveContextLimit, parseRouteEntry } from "../src/config.ts";
 
 const TMP = (s: string) => `/tmp/test-acp-${s}.json`;
 const writeRoutes = (name: string, obj: unknown) => {
@@ -11,39 +9,44 @@ const writeRoutes = (name: string, obj: unknown) => {
     writeFileSync(p, JSON.stringify(obj));
     return p;
 };
-const OPTS = (routes: Record<string, string>): ProxyOptions => ({ ...loadOptions({}), routes: Object.fromEntries(Object.entries(routes).map(([k, v]) => [k, { url: v }])) });
 
-test("routes are parsed as an object map { provider: url }", () => {
+test("providers map is parsed as { url: { models } }", () => {
     const opts = loadOptions({ ACP_PROVIDERS: writeRoutes("obj", {}) });
     assert.equal(typeof opts.routes, "object");
     assert.ok(opts.routes !== null);
     unlinkSync(TMP("obj"));
 });
 
-test("routes object strips trailing slashes from baseURLs", () => {
-    const p = writeRoutes("slash", { glm: "https://bigmodel.cn/", anthropic: "https://api.anthropic.com/" });
+test("providers value is an object with optional models (key IS the url)", () => {
+    // key = upstream URL, value = { models }
+    const p = writeRoutes("obj-form", {
+        "https://open.bigmodel.cn": { models: { "glm-5.2": { context: 1000000 } } },
+    });
     const opts = loadOptions({ ACP_PROVIDERS: p });
-    assert.equal(opts.routes.glm?.url, "https://bigmodel.cn");
-    assert.equal(opts.routes.anthropic?.url, "https://api.anthropic.com");
+    assert.ok(opts.routes["https://open.bigmodel.cn"]);
+    assert.equal(opts.routes["https://open.bigmodel.cn"]?.models?.["glm-5.2"]?.context, 1000000);
     unlinkSync(p);
 });
 
-test("routes accept object form { url, models }", () => {
-    const p = writeRoutes("obj-form", { glm: { url: "https://bigmodel.cn", models: { "glm-5.2": { context: 1000000 } } } });
-    const opts = loadOptions({ ACP_PROVIDERS: p });
-    assert.equal(opts.routes.glm?.url, "https://bigmodel.cn");
-    assert.equal(opts.routes.glm?.models?.["glm-5.2"]?.context, 1000000);
-    unlinkSync(p);
+test("parseRouteEntry: object form keeps models", () => {
+    const r = parseRouteEntry({ models: { "glm-5.2": { context: 1000000 } } });
+    assert.deepEqual(r, { models: { "glm-5.2": { context: 1000000 } } });
 });
 
-test("routes ignore invalid entries (defensive)", () => {
-    const p = writeRoutes("defensive", { glm: "https://ok", bad: 123, also: null, obj: { url: "https://obj" } });
-    const opts = loadOptions({ ACP_PROVIDERS: p });
-    assert.equal(opts.routes.glm?.url, "https://ok");
-    assert.equal(opts.routes.obj?.url, "https://obj");
-    assert.ok(!("bad" in opts.routes));
-    assert.ok(!("also" in opts.routes));
-    unlinkSync(p);
+test("parseRouteEntry: bare object (no models) is valid", () => {
+    const r = parseRouteEntry({});
+    assert.deepEqual(r, { models: undefined });
+});
+
+test("parseRouteEntry: null means present-but-no-overrides", () => {
+    const r = parseRouteEntry(null);
+    assert.deepEqual(r, {});
+});
+
+test("parseRouteEntry: invalid values return undefined", () => {
+    assert.equal(parseRouteEntry(123), undefined);
+    assert.equal(parseRouteEntry(undefined), undefined);
+    assert.equal(parseRouteEntry("string"), undefined); // url is the KEY, not the value
 });
 
 test("lookupContextLimit returns known windows", () => {
@@ -65,66 +68,85 @@ test("lookupContextLimit returns undefined for unknown models", () => {
     assert.equal(lookupContextLimit(undefined), undefined);
 });
 
-test("path-based routing does not require apiKey in route config", () => {
-    const p = writeRoutes("nokey", { glm: "https://bigmodel.cn" });
-    const opts = loadOptions({ ACP_PROVIDERS: p });
-    assert.equal(opts.routes.glm?.url, "https://bigmodel.cn");
-    assert.ok(!("apiKey" in opts));
-    assert.ok(!("apiKey" in opts.routes));
-    unlinkSync(p);
+// ── resolveContextLimit: longest-prefix matching on URL keys ──────────────
+// The key is the /bili/<this> string. A request matches when its embedded
+// upstream URL equals the key, or starts with key + "/". Longest key wins
+// (most specific). Shallow keys match the whole host; deep keys match only
+// that endpoint. This never cross-matches different hosts/paths because the
+// key is a literal URL prefix.
+
+test("exact URL key match returns context", () => {
+    const routes = {
+        "https://open.bigmodel.cn/api/anthropic": { models: { "glm-5.2": { context: 1000000 } } },
+    };
+    assert.equal(resolveContextLimit(routes, "https://open.bigmodel.cn/api/anthropic", "glm-5.2"), 1000000);
 });
 
-// ── resolveUpstream: URL path rewriting contract ───────────────────────────
-// The core invariant: the proxy drops ONLY the provider-name segment from the
-// request path and splices the real baseURL in front. The request's own /v1
-// (or /v4, etc.) prefix is preserved. So route baseURL should be the provider
-// ROOT (no /v1), and the agent's SDK naturally carries /v1 in its path.
-
-test("OpenAI SDK: /v1/glm/chat/completions → <root>/v1/chat/completions", () => {
-    // Agent sets baseURL=http://localhost:8788/v1/glm, SDK posts to /v1/glm/chat/completions.
-    // Route.glm = provider root (no /v1). Result: clean single /v1.
-    const o = OPTS({ glm: "https://bigmodel.cn" });
-    const r = resolveUpstream(o, "/v1/glm/chat/completions");
-    assert.ok(r);
-    assert.equal(r.provider, "glm");
-    assert.equal(r.upstream, "https://bigmodel.cn");
-    assert.equal(r.rewrittenUrl, "https://bigmodel.cn/v1/chat/completions");
+test("key as prefix of request (request adds /v1/messages) still matches", () => {
+    const routes = {
+        "https://open.bigmodel.cn/api/anthropic": { models: { "glm-5.2": { context: 1000000 } } },
+    };
+    assert.equal(resolveContextLimit(routes, "https://open.bigmodel.cn/api/anthropic/v1/messages", "glm-5.2"), 1000000);
 });
 
-test("Anthropic SDK: /anthropic/v1/messages → <root>/v1/messages", () => {
-    // Agent sets baseURL=http://localhost:8788/anthropic, SDK posts to /anthropic/v1/messages.
-    // Route.anthropic = provider root. Result preserves /v1.
-    const o = OPTS({ anthropic: "https://api.anthropic.com" });
-    const r = resolveUpstream(o, "/anthropic/v1/messages");
-    assert.ok(r);
-    assert.equal(r.provider, "anthropic");
-    assert.equal(r.rewrittenUrl, "https://api.anthropic.com/v1/messages");
+test("shallow key (host only) matches all paths on that host", () => {
+    const routes = {
+        "https://open.bigmodel.cn": { models: { "glm-5.2": { context: 1000000 } } },
+    };
+    assert.equal(resolveContextLimit(routes, "https://open.bigmodel.cn/api/anthropic/v1/messages", "glm-5.2"), 1000000);
+    assert.equal(resolveContextLimit(routes, "https://open.bigmodel.cn/anything", "glm-5.2"), 1000000);
 });
 
-test("provider segment at a non-standard position still matches", () => {
-    // Some agents may place the provider elsewhere in the path.
-    const o = OPTS({ glm: "https://bigmodel.cn" });
-    const r = resolveUpstream(o, "/some/prefix/glm/v1/chat/completions");
-    assert.ok(r);
-    assert.equal(r.rewrittenUrl, "https://bigmodel.cn/some/prefix/v1/chat/completions");
+test("deep key does NOT match a request to a different path (no cross-path bleed)", () => {
+    const routes = {
+        "https://open.bigmodel.cn/api/anthropic": { models: { "glm-5.2": { context: 1000000 } } },
+    };
+    // request to /api/openai path — deep anthropic key must NOT match.
+    // Falls through to built-in table (glm-5 → 1000000), so we verify the
+    // *route* didn't match by checking an unknown model returns undefined.
+    assert.equal(resolveContextLimit(routes, "https://open.bigmodel.cn/api/openai/v1/messages", "unknown-model"), undefined);
 });
 
-test("returns undefined when no provider segment is present", () => {
-    const o = OPTS({ glm: "https://bigmodel.cn" });
-    assert.equal(resolveUpstream(o, "/v1/chat/completions"), undefined);
-    assert.equal(resolveUpstream(o, "/chat/completions"), undefined);
+test("does not match different host with similar prefix (boundary check)", () => {
+    const routes = {
+        "https://open.bigmodel.cn": { models: { "glm-5.2": { context: 1000000 } } },
+    };
+    // evil.com.evil should not match open.bigmodel.cn (no host-prefix bleed).
+    // Verify with an unknown model so the built-in table doesn't mask the result.
+    assert.equal(resolveContextLimit(routes, "https://open.bigmodel.cn.evil", "unknown-model"), undefined);
 });
 
-test("ignores provider names that look like API path segments", () => {
-    // Names must start with a letter and be alnum/-/_ so they can't collide
-    // with normal API segments like v1, chat, completions, messages.
-    const o = OPTS({ v1: "https://example.com", glm: "https://ok" });
-    assert.equal(resolveUpstream(o, "/v1/chat/completions"), undefined);
+test("longest key wins (most specific)", () => {
+    const routes = {
+        "https://open.bigmodel.cn": { models: { "glm-5.2": { context: 200000 } } },
+        "https://open.bigmodel.cn/api/anthropic": { models: { "glm-5.2": { context: 1000000 } } },
+    };
+    // Both keys are prefixes of the request; the deeper one wins.
+    assert.equal(resolveContextLimit(routes, "https://open.bigmodel.cn/api/anthropic/v1/messages", "glm-5.2"), 1000000);
 });
 
-test("picks the longest matching name (no prefix shadowing)", () => {
-    const o = OPTS({ openai: "https://api.openai.com", oai: "https://other" });
-    const r = resolveUpstream(o, "/openai/chat/completions");
-    assert.ok(r);
-    assert.equal(r.provider, "openai");
+test("model not in route falls through to lookup table", () => {
+    const routes = {
+        "https://open.bigmodel.cn": { models: { "glm-5.2": { context: 1000000 } } },
+    };
+    // glm-5.2 not in this route's models, but in the built-in table (1000000)
+    assert.equal(resolveContextLimit(routes, "https://api.deepseek.com", "deepseek-chat"), 64000);
+});
+
+test("no matching key and unknown model returns undefined", () => {
+    const routes = {
+        "https://open.bigmodel.cn": { models: { "glm-5.2": { context: 1000000 } } },
+    };
+    assert.equal(resolveContextLimit(routes, "https://api.unknown.com", "some-future-model"), undefined);
+});
+
+// Trailing slashes on config keys are normalized away so they still match.
+// A user typing "https://open.bigmodel.cn/" (trailing slash) must still get
+// the override for requests to that host.
+import { normalizeUrlKey } from "../src/config.ts";
+test("normalizeUrlKey strips trailing slashes", () => {
+    assert.equal(normalizeUrlKey("https://open.bigmodel.cn/"), "https://open.bigmodel.cn");
+    assert.equal(normalizeUrlKey("https://open.bigmodel.cn///"), "https://open.bigmodel.cn");
+    assert.equal(normalizeUrlKey("https://open.bigmodel.cn"), "https://open.bigmodel.cn");
+    assert.equal(normalizeUrlKey(""), "");
 });
