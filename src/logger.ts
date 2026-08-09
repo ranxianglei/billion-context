@@ -65,30 +65,42 @@ export function configureLogger(file?: string): string | undefined {
 export const log: Logger = (level, msg) => {
     const ts = new Date().toISOString();
     const line = `${ts} [${level}] ${msg}\n`;
-    // stderr (foreground terminal / shell redirect) — never throws.
-    process.stderr.write(line);
+    // stderr (foreground terminal / shell redirect). MUST NOT throw — if the
+    // reader has gone (terminal closed, piped process exited, broken pipe)
+    // write() throws EPIPE and, as an uncaughtException in a hot path, kills
+    // the whole proxy. Swallow so logging can never crash the server.
+    try {
+        process.stderr.write(line);
+    } catch {
+        // best-effort: stderr is gone (EPIPE), nothing we can do
+    }
     // file — durable record.
     if (stream && logPath) {
-        // The underlying file can vanish under us without the stream noticing:
-        // another process deletes it (rebuild, logrotate, `rm`, a restart that
-        // clobbers it). Once the inode is unlinked, writes still "succeed" but
-        // go to a now-private inode that no path points to — the log vanishes
-        // into a black hole while the proxy keeps running. Reopen if the path
-        // no longer resolves to an existing file.
-        if (!existsSync(logPath)) {
-            stream.end();
-            stream = open(logPath);
+        try {
+            // The underlying file can vanish under us without the stream
+            // noticing: another process deletes it (rebuild, logrotate, `rm`,
+            // a restart that clobbers it). Once the inode is unlinked, writes
+            // still "succeed" but go to a now-private inode that no path
+            // points to — the log vanishes into a black hole while the proxy
+            // keeps running. Reopen if the path no longer resolves to an
+            // existing file.
+            if (!existsSync(logPath)) {
+                stream.end();
+                stream = open(logPath);
+            }
+            // Runtime rotation: if we've crossed the threshold since last
+            // check, reopen the file (rotates the old one out). This keeps a
+            // long-running proxy's log bounded without needing a restart.
+            if (bytesWritten >= MAX_BYTES) {
+                stream.end();
+                rotate(logPath);
+                stream = open(logPath);
+            }
+            stream.write(line);
+            bytesWritten += Buffer.byteLength(line);
+        } catch {
+            // file logging must never crash the proxy either (disk full, perms)
         }
-        // Runtime rotation: if we've crossed the threshold since last check,
-        // reopen the file (rotates the old one out). This keeps a long-running
-        // proxy's log bounded without needing a restart.
-        if (bytesWritten >= MAX_BYTES) {
-            stream.end();
-            rotate(logPath);
-            stream = open(logPath);
-        }
-        stream.write(line);
-        bytesWritten += Buffer.byteLength(line);
     }
 };
 
