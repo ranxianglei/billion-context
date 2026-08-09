@@ -110,6 +110,50 @@ base_url = "http://localhost:8787/bili/https://api.openai.com/v1"
 is configured, prepend `http://localhost:8787/bili/` to it. Nothing else
 changes.
 
+#### ZCode (special: MITM mode)
+
+ZCode is different from the clients above: its OAuth-logged-in provider
+(`builtin:bigmodel-coding-plan`) **hardcodes the endpoint and does not let you
+change the baseURL**. The `/bili/` prefix trick does not work because ZCode
+never lets you type the upstream URL.
+
+For ZCode (and any client that only offers an **HTTP proxy** setting rather
+than a baseURL), enable **MITM transparent-proxy mode**. In this mode
+billion-context acts as an HTTP forward proxy: ZCode sends a
+`CONNECT open.bigmodel.cn:443`, billion-context terminates the TLS locally
+(with a locally-generated root CA), injects compression into the cleartext,
+then re-encrypts and forwards. The OAuth token travels in ZCode's
+`Authorization` header, which is forwarded untouched — so the subscription
+discount is preserved.
+
+MITM is on by default and is scoped to a **whitelist** of model hosts
+(`open.bigmodel.cn`, `api.anthropic.com`, `api.openai.com`, `chatgpt.com`).
+All other HTTPS hosts are blind-tunnelled — billion-context never decrypts
+non-model traffic.
+
+**One-time setup (trust the root CA in ZCode):**
+
+1. Start the proxy once to generate the root CA:
+   ```bash
+   bili start
+   ls ~/.local/share/billion-context/ca/root-ca.pem   # exists now
+   ```
+
+2. In ZCode → **Settings → Network** set:
+   - **HTTP Proxy**: `http://127.0.0.1:8787`
+   - **Proxy CA certificate path**: `/home/<you>/.local/share/billion-context/ca/root-ca.pem`
+   - (optional) **No-proxy list**: `localhost,127.0.0.1`
+
+3. Restart ZCode. Its model traffic now flows through billion-context with
+   compression injected. Send a message and check the proxy log
+   (`~/.local/state/billion-context/bili.log`) for
+   `mitm open.bigmodel.cn:443 tunnel established`.
+
+> The root CA is generated locally and lives only on this machine; it is
+> **not** a system-wide install. Only ZCode (via the CA-path setting, which
+> it feeds to Node as `NODE_EXTRA_CA_CERTS`) trusts it, so no other app is
+> affected. Deleting the CA files and restarting the proxy regenerates them.
+
 ### Option B — Manual config file & context windows
 
 Open `~/.config/billion-context/billion-context.json` and edit the `providers`

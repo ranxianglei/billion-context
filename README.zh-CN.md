@@ -94,6 +94,37 @@ base_url = "http://localhost:8787/bili/https://api.openai.com/v1"
 
 **其他客户端(Cursor / Aider / Continue ……)** —— 只要配置了上游 URL,前面加 `http://localhost:8787/bili/` 就行,其他都不用改。
 
+#### ZCode(特殊:MITM 模式)
+
+ZCode 与上面这些客户端不同:登录后的 provider(`builtin:bigmodel-coding-plan`)**硬编码了端点,不允许你改 baseURL**。`/bili/` 前缀方式对它无效,因为 ZCode 根本不让你填上游 URL。
+
+对 ZCode(以及任何只提供 **HTTP 代理**设置、不能改 baseURL 的客户端),启用 **MITM 透明代理模式**。在这个模式下 billion-context 充当标准 HTTP 正向代理:ZCode 发送
+`CONNECT open.bigmodel.cn:443`,billion-context 在本地用自生成的根 CA 终止 TLS,在明文里注入压缩,再重新加密转发。OAuth token 随 ZCode 的
+`Authorization` 头原样转发(我们不动它)——订阅折扣保留。
+
+MITM 默认开启,且只对一份 **白名单**中的模型域名(`open.bigmodel.cn`、
+`api.anthropic.com`、`api.openai.com`、`chatgpt.com`)生效。所有其他 HTTPS
+域名都是盲隧道(billion-context 从不解密非模型流量)。
+
+**一次性设置(在 ZCode 里信任根 CA):**
+
+1. 启动一次 proxy 以生成根 CA:
+   ```bash
+   bili start
+   ls ~/.local/share/billion-context/ca/root-ca.pem   # 现在存在了
+   ```
+
+2. 在 ZCode → **设置 → 网络** 里填:
+   - **HTTP 代理**:`http://127.0.0.1:8787`
+   - **代理 CA 证书路径**:`/home/<你>/.local/share/billion-context/ca/root-ca.pem`
+   - (可选)**不走代理列表**:`localhost,127.0.0.1`
+
+3. 重启 ZCode。它的模型流量现在会经过 billion-context 并注入压缩。发一条消息,看 proxy 日志(`~/.local/state/billion-context/bili.log`)应出现
+   `mitm open.bigmodel.cn:443 tunnel established`。
+
+> 根 CA 是本地生成的、只存在本机,**不是**系统级安装。只有 ZCode(通过 CA
+> 路径设置,它会把该路径作为 `NODE_EXTRA_CA_CERTS` 喂给 Node)信任它,其他
+> 应用不受影响。删除 CA 文件并重启 proxy 会重新生成。
 
 ### 方式 B 手动配置文件&设置上下文大小
 
