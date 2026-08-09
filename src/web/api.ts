@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { configFile } from "../paths.js";
 import {
+    loadRoutes,
     normalizeUrlKey,
     parseRouteEntry,
     parseUpstreamProxyMode,
@@ -28,12 +29,7 @@ function readConfig(): ConfigShape {
 }
 
 export function readProviders(): ProviderRoutes {
-    const routes: ProviderRoutes = {};
-    for (const [key, value] of Object.entries(readConfig().providers ?? {})) {
-        const route = parseRouteEntry(value);
-        if (route) routes[key] = route;
-    }
-    return routes;
+    return loadRoutes();
 }
 
 export function readUpstreamSettings(): { mode: UpstreamProxyMode; proxy?: string } {
