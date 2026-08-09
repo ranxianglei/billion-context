@@ -123,6 +123,12 @@ export type ProxyOptions = {
     passthrough: boolean;
     autoUpdate: boolean;
     logFile?: string;
+    /** MITM transparent-proxy mode. When enabled, an HTTP CONNECT handler is
+     *  attached so clients that only know how to set HTTP_PROXY (ZCode with a
+     *  locked-in endpoint) can route through the proxy. Whitelisted model
+     *  hosts are TLS-terminated locally and fed back into the same request
+     *  pipeline; all other hosts are blind-tunnelled. */
+    mitm: { enabled: boolean; domains: string[] };
 };
 
 /** Re-read ONLY the routes from the current config sources, returning a fresh
@@ -202,6 +208,10 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         passthrough: (env.ACP_PASSTHROUGH ?? (fileConfig.passthrough ? "1" : "0")) === "1",
         autoUpdate: (env.ACP_AUTO_UPDATE ?? (fileConfig.autoUpdate === false ? "0" : "1")) !== "0",
         logFile: env.ACP_LOG_FILE !== undefined ? (env.ACP_LOG_FILE || undefined) : fileConfig.logFile,
+        mitm: {
+            enabled: (env.BILI_MITM ?? (fileConfig.mitm?.enabled === false ? "0" : "1")) !== "0",
+            domains: fileConfig.mitm?.domains ?? [],
+        },
     };
 }
 
@@ -224,6 +234,7 @@ type FileConfig = {
     autoUpdate?: boolean;
     logFile?: string;
     compress?: { injectTool?: boolean; injectNudge?: boolean };
+    mitm?: { enabled?: boolean; domains?: string[] };
 };
 
 function loadConfigFile(): FileConfig {

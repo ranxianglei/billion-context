@@ -45,6 +45,7 @@ import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesSseStream, rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { emitStreamError } from "./stream-error.js";
 import { deriveSessionId as deriveProxySessionId, affinityToken, clientConversationHeader } from "./session-id.js";
+import { setupMitm, readMitmUpstream } from "./mitm.js";
 
 const UPSTREAM_HOP_HEADERS = new Set([
     "host",
@@ -58,7 +59,18 @@ const UPSTREAM_HOP_HEADERS = new Set([
     "content-encoding",
 ]);
 
-export function resolveUpstream(_opts: ProxyOptions, reqUrl: string): { upstream: string; rewrittenUrl: string } | undefined {
+export function resolveUpstream(_opts: ProxyOptions, reqUrl: string, req?: http.IncomingMessage): { upstream: string; rewrittenUrl: string } | undefined {
+    // MITM mode: the request arrived over a CONNECT tunnel we terminated
+    // locally (client set HTTP_PROXY and issued CONNECT host:443). The socket
+    // carries the real upstream origin; the request path has no /bili/ prefix
+    // — it's a bare /api/anthropic/v1/messages. Reconstruct the full upstream
+    // URL so handle()/forward() route to the host the CONNECT targeted. The
+    // client's Authorization header (OAuth token for the subscription) is
+    // forwarded verbatim → subscription auth preserved, no MITM of creds.
+    const mitmUpstream = readMitmUpstream(req?.socket);
+    if (mitmUpstream) {
+        return { upstream: mitmUpstream, rewrittenUrl: mitmUpstream + (reqUrl ?? "") };
+    }
     // Zero-config mode: a request like `/bili/https://open.bigmodel.cn/api/anthropic`
     // embeds the full upstream URL after the `/bili/` prefix. Strip the prefix,
     // take the rest verbatim as the upstream. This is the ONLY routing mode —
@@ -112,6 +124,9 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             }
         }
     });
+    if (opts.mitm.enabled) {
+        setupMitm(server, opts.mitm.domains, (msg) => log("info", msg));
+    }
     server.listen(opts.port, opts.host, () => {
         const displayHost = opts.host === "0.0.0.0" ? "localhost" : opts.host;
         const nOverrides = Object.keys(opts.routes).length;
@@ -120,7 +135,8 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             `acp-proxy listening on http://${displayHost}:${opts.port}` +
                 ` — web UI: http://${displayHost}:${opts.port}/__bili/` +
                 ` — zero-config: prefix any baseURL with http://${displayHost}:${opts.port}/bili/` +
-                (nOverrides ? ` — context overrides for ${nOverrides} upstream URL(s)` : ""),
+                (nOverrides ? ` — context overrides for ${nOverrides} upstream URL(s)` : "")
+                + (opts.mitm.enabled ? ` — MITM proxy on (whitelist)${opts.mitm.domains.length ? ` +${opts.mitm.domains.join(",")}` : ""}` : ""),
         );
     });
     // Listen errors (EADDRINUSE port taken, EACCES privileged port, EAFNOSUPPORT
@@ -272,7 +288,7 @@ async function handle(
     // upstream ORIGIN for cross-provider isolation) and forward() (needs the
     // full rewritten URL) use the same decision. Computed before prepare() so
     // the session can embed the provider origin.
-    const route = resolveUpstream(opts, req.url ?? "");
+    const route = resolveUpstream(opts, req.url ?? "", req);
     const upstreamOrigin = route ? route.upstream : opts.upstream;
     // Per-request context limit: look up body.model against the per-route model
     // declaration in providers.json first (same model can have different
