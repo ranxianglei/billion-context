@@ -94,140 +94,8 @@ base_url = "http://localhost:8787/bili/https://api.openai.com/v1"
 
 **其他客户端(Cursor / Aider / Continue ……)** —— 只要配置了上游 URL,前面加 `http://localhost:8787/bili/` 就行,其他都不用改。
 
-### 方式 B —— 显式 context 窗口(配置文件)
 
-零配置(方式 A)已经从 [models.dev](https://models.dev) 自动探测 context 窗口了。只有当你想**覆盖**它时才需要配置文件 —— 例如某个私有中转挂了个固定上限,或某个模型还没进 registry。
-
-三步:**启动代理 → 声明 context 覆盖 → 把客户端指向它**。
-
-### 第 1 步 —— 启动代理
-
-```bash
-bili
-```
-
-它监听 `http://127.0.0.1:8787`。保持这个终端开着(或后台运行,见[运行代理](#运行代理))。
-
-点击 [http://localhost:8787/__bili/](http://localhost:8787/__bili/) 添加你的模型:
-<img width="2908" height="1787" alt="image" src="https://github.com/user-attachments/assets/cacf4b64-e5c6-41f2-b270-fd2be02eab0c" />
-
-首次运行时 `bili` 会**自动创建一个空配置文件**并告诉你路径,你不必凭空编 schema。启动横幅也会打印网页地址:
-
-```
-acp-proxy listening on http://localhost:8787 — web UI: http://localhost:8787/__bili/
-```
-
-### 路由怎么工作
-
-只有**一种**路由模式:`/bili/` 前缀。客户端把完整上游 URL 直接嵌在那里,代理原样转发:
-
-```
-客户端 baseURL:  http://localhost:8787/bili/https://open.bigmodel.cn/api/coding/paas/v4
-                  └──────────┬──────────┘└────┬────┘└────────────────┬───────────────────────┘
-                      代理地址         /bili/          上游 URL(原样转发)
-```
-
-配置文件**不改变**路由。它只告诉代理某个上游 URL + 模型的 context 窗口,以便判断何时压缩。key 就是客户端写在 `/bili/` 后面的那个上游 URL 字符串:
-
-```jsonc
-{
-  "providers": {
-    "https://open.bigmodel.cn/api/coding/paas/v4": {
-      "models": { "glm-5.2": { "context": 1000000 } }
-    }
-  }
-}
-```
-
-一个请求在客户端嵌入的 URL **等于 key 或以 key 开头**时匹配(最长 key 优先)。浅 key 如 `https://open.bigmodel.cn` 会覆盖该 host 上的每条路径;深 key 如 `https://open.bigmodel.cn/api/anthropic` 只覆盖那一个端点。未在任何匹配 key 里列出的模型回退到 models.dev,再回退到内置前缀表。
-
-### 第 2 步 —— 声明 context 覆盖
-
-网页的 **Providers** 标签页可以用表单添加上游 URL 及其按模型的 context 窗口,然后点 **Save**(写入配置文件)和 **Apply**(热加载进运行中的代理,无需重启)。
-<img width="2931" height="1519" alt="image" src="https://github.com/user-attachments/assets/c02278be-bc7a-4f14-8f58-0f2d83784d54" />
-
-> 更想直接手编 JSON?见下文[手动配置文件](#手动配置文件)。完整 schema 见[配置](#配置)。
-
-Save + Apply 之后,启动横幅会反映出来:
-
-```
-acp-proxy listening on http://localhost:8787 — web UI: http://localhost:8787/__bili/ — context overrides for 2 upstream URL(s)
-```
-
-### 第 3 步 —— 把客户端指向代理
-
-编辑客户端自己的配置文件,让它把请求发到
-`http://localhost:8787/bili/<完整上游 URL>`。把你的**真实** API key 也填进客户端配置 —— 代理原样透传。
-
-#### Pi(billion-context-pi)
-
-打开 `~/.pi/agent/models.json`,把你现有 provider 的 **`baseUrl` 这一行**改成指向代理 —— 真实 URL 前面加代理地址 + `/bili/`,其他字段都不用动:
-
-```jsonc
-// 改之前:
-"baseUrl": "https://open.bigmodel.cn/api/coding/paas/v4",
-// 改之后:
-"baseUrl": "http://localhost:8787/bili/https://open.bigmodel.cn/api/coding/paas/v4",
-```
-
-`http://localhost:8787/bili/` 是代理,后面整段就是真实上游 URL,原样转发。`apiKey`、`api`、`models` 都不用改。
-
-| `api` 值 | 上游 |
-|---|---|
-| `openai-completions` | OpenAI 兼容端点(GLM/DeepSeek/OpenAI) |
-| `anthropic-messages` | Anthropic 兼容端点 |
-
-> 如果你装了 `billion-context-pi` 扩展,用隔离的 agent 目录跑 Pi
-> (`PI_CODING_AGENT_DIR=…`),免得客户端扩展和 proxy 双重压缩。
-> `bili-test-pi` 脚本帮你做好了这层隔离。
-
-#### OpenCode
-
-打开 `~/.config/opencode/opencode.json`,把你现有 provider 的 **`baseURL` 这一行**改成指向代理 —— 真实 URL 前面加代理地址 + `/bili/`:
-
-```jsonc
-// 改之前:
-"baseURL": "https://open.bigmodel.cn/api/coding/paas/v4"
-// 改之后:
-"baseURL": "http://localhost:8787/bili/https://open.bigmodel.cn/api/coding/paas/v4"
-```
-
-其他字段(`apiKey`、`models`)都不用改。
-
-#### Codex
-
-打开 `~/.codex/config.toml`,把现有 provider 的 **`base_url` 这一行**改成指向代理 —— 真实 URL 前面加代理地址 + `/bili/`:
-
-```toml
-# 改之前:
-base_url = "https://open.bigmodel.cn/api/coding/paas/v4"
-# 改之后:
-base_url = "http://localhost:8787/bili/https://open.bigmodel.cn/api/coding/paas/v4"
-```
-
-其他字段(`name`、`wire_api`、`env_key`)都不用改。
-
-> Codex 的 Responses API 需要上游说 Responses 协议。多数区域性 OpenAI
-> 兼容端点只说 `/chat/completions`;如果你的端点在 `/responses` 上 404,
-> 用一个说 Responses 的中转,或用官方 OpenAI API。
-
-#### 其他客户端(Cursor / Aider / Continue …)
-
-只要客户端能设 base URL,前面加 `http://localhost:8787/bili/` 就行。代理说 Anthropic、OpenAI chat-completions、OpenAI Responses 三种协议 —— 用其中任一种的客户端都能工作。用别的协议或非标准 auth header 的客户端暂时还不行。
-
-### 网页配置
-
-代理跑着的时候,在浏览器打开 `http://localhost:8787/__bili/`。你可以:
-
-- **编辑 providers** —— 用表单增删 provider 和按模型的 context 窗口,点 Save 直接写入 `billion-context.json`。
-- **生成客户端 URL** —— 选一个上游 URL,得到可直接复制的配置片段(Pi / OpenCode / Codex 的 `baseUrl`/`baseURL`/`base_url` 一行,已填好代理地址 + `/bili/` + URL)。
-- **查看会话** —— 实时会话表(请求数、省的 token、最后活跃时间),自动刷新。
-
-用 **Apply** 按钮可以热加载 provider 路由到运行中的进程,无需重启(只有 `port`/`host` 需要重启,因为监听 socket 已经绑了)。
-
-### 手动配置文件
-
-不想用网页 —— 想纳入 git 管理、用脚本自动化部署、或者就是不爱用浏览器?网页写的也是这同一个文件,直接手编效果完全一样。
+### 方式 B 手动配置文件&设置上下文大小
 
 打开 `~/.config/billion-context/billion-context.json`,编辑 `providers` 块。
 **key 就是上游 URL** —— 客户端写在 `/bili/` 后面的那个字符串。value 为该
@@ -249,7 +117,10 @@ URL 声明按模型的 context 窗口:
 - 删掉你不用的条目;添加其他的(按需)。
 - API key **不**写在这里 —— key 在客户端那边,代理原样透传。
 
-保存后点网页里的 **Apply**(或**重启 `bili`**)。(完整 schema —— 按模型的 context 窗口、可选字段 —— 见[配置](#配置)。)
+
+### 方式C 网页配置&设置上下文大小
+
+打开 [http://localhost:8787/__bili/](http://localhost:8787/__bili/) 进行配置。
 
 ### 验证
 
