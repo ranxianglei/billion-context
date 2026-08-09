@@ -550,6 +550,15 @@ function prepareOpenai(
     }
 
     const rebuilt: OpenAIRequestBody = { ...parsed, messages: rebuiltMessages, tools: toolsOut as OpenAITool[] | undefined };
+    // OpenAI Chat Completions only emits a usage object in the final stream
+    // chunk when the client sets stream_options.include_usage=true. Without
+    // it, streaming sessions never learn their real input_tokens →
+    // lastInputTokens stays 0 → compression never fires. Force it on for any
+    // streaming request that doesn't already opt in. (Anthropic/Responses
+    // emit usage unconditionally, so this is OpenAI-specific.)
+    if (stream && (rebuilt as Record<string, unknown>).stream_options === undefined) {
+        (rebuilt as Record<string, unknown>).stream_options = { include_usage: true };
+    }
     markDirty(session);
     return { body: JSON.stringify(rebuilt), session, processedMessages, protocol: "openai", stream, compressInjected: shouldInject } as Prepared;
 }
@@ -927,6 +936,28 @@ async function forward(
             const text = Buffer.from(buf).toString("utf8");
             try {
                 const json = JSON.parse(text);
+                // Capture upstream usage so tokenCount (which drives nudge +
+                // emergency-truncate) reflects reality for non-streaming
+                // sessions too. The streaming loops do this in their SSE
+                // event handlers; without it here, lastInputTokens stays 0 for
+                // any non-streaming session → compression never fires. Field
+                // names differ per protocol:
+                //   Anthropic: input_tokens / cache_read_input_tokens / output_tokens
+                //   OpenAI: prompt_tokens / prompt_tokens_details.cached_tokens / completion_tokens
+                //   Responses: input_tokens / input_tokens_details.cached_tokens / output_tokens
+                const u = (json?.usage ?? {}) as Record<string, any>;
+                const prompt = u.prompt_tokens ?? u.input_tokens;
+                if (typeof prompt === "number") {
+                    prepared.session.stats.inputTokens += prompt;
+                    prepared.session.stats.lastInputTokens = prompt;
+                    const cached = u.prompt_tokens_details?.cached_tokens ?? u.input_tokens_details?.cached_tokens ?? u.cache_read_input_tokens;
+                    if (typeof cached === "number") {
+                        prepared.session.stats.cachedTokens += cached;
+                        prepared.session.stats.cacheSamples += 1;
+                    }
+                    const out = u.completion_tokens ?? u.output_tokens;
+                    if (typeof out === "number") prepared.session.stats.outputTokens += out;
+                }
                 if (prepared.protocol === "openai") {
                     rewriteOpenaiJsonResponse(json, ctx);
                 } else if (prepared.protocol === "responses") {
