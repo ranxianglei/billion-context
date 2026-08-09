@@ -429,12 +429,16 @@ function prepareAnthropic(
 
     try {
         const { msgs, cacheControls } = anthropicToCore(parsed);
-        // contextTokens must include the system prompt: ZCode (and other IDE
-        // clients) put huge workspace-reminder blocks in body.system, not in
-        // messages. Without counting it, tokenCount grossly underestimates real
-        // context size → nudge never fires → never compresses even at 1.7M tokens.
-        const sysText = extractSystem(parsed.system);
-        const tokenCount = estimateTokensFast(msgs.map((m) => m.text ?? "").join("\n") + "\n" + sysText);
+        // tokenCount drives the nudge decision ("should we compress?"). It MUST
+        // be the real context size, never an estimate — estimates undercount
+        // CJK text 3-4x and never trigger compression for Chinese sessions.
+        // Use the upstream's own input_tokens from the PREVIOUS turn (known by
+        // now — the response came back). First turn has no history → 0 (never
+        // triggers anyway). extractSystem is still called so sysText flows into
+        // the fallback path below if we ever need it, but we no longer feed
+        // estimates to the kernel.
+        extractSystem(parsed.system);
+        const tokenCount = session.stats.lastInputTokens;
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
         session.stats.contextTokens = tokenCount;
@@ -502,11 +506,9 @@ function prepareOpenai(
 
     try {
         const { msgs } = openaiToCore(parsed);
-        // openaiToCore already includes system/developer messages in `msgs`
-        // (they are mapped to CoreMessage with role:"system"), so tokenCount
-        // already covers the system prompt. No separate system-text accounting
-        // needed here.
-        const tokenCount = estimateTokensFast(msgs.map((m) => m.text ?? "").join("\n"));
+        // tokenCount = upstream's real input_tokens from the previous turn
+        // (see anthropic branch comment). Never an estimate.
+        const tokenCount = session.stats.lastInputTokens;
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
         session.stats.contextTokens = tokenCount;
@@ -576,13 +578,11 @@ function prepareResponses(
         if (process.env.ACP_DEBUG) {
             log("info", `[${sessionId}] input items: ${Array.isArray(parsed.input) ? parsed.input.map((i: ResponseInputItem) => i.type).join(",") : "(string)"}`);
         }
-        // contextTokens must include the system prompt: Codex puts a large
-        // `instructions` field (system-level prompt) in the request, and other
-        // system/developer items are collected into systemParts by
-        // responsesToCore but NOT included in `msgs`. Count them separately so
-        // tokenCount reflects the real context size and nudge can fire.
-        const sysText = systemParts.join("\n\n");
-        const tokenCount = estimateTokensFast(msgs.map((m) => m.text ?? "").join("\n") + "\n" + sysText);
+        // tokenCount = upstream's real input_tokens from the previous turn
+        // (see anthropic branch comment). Never an estimate. systemParts is
+        // still extracted (used by injectResponsesInstructions later).
+        systemParts.join("\n\n");
+        const tokenCount = session.stats.lastInputTokens;
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" });
         session.state = turn.state;
         session.stats.contextTokens = tokenCount;

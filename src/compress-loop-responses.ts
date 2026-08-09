@@ -390,6 +390,7 @@ export async function* compressLoopResponsesStream(
                             // Record into the session for the web UI / stats.
                             if (typeof prompt === "number") {
                                 ctx.session.stats.inputTokens += prompt;
+                                ctx.session.stats.lastInputTokens = prompt;
                                 if (typeof cached === "number") ctx.session.stats.cachedTokens += cached;
                                 if (typeof out === "number") ctx.session.stats.outputTokens += out;
                                 ctx.session.stats.cacheSamples += 1;

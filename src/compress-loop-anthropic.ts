@@ -209,6 +209,7 @@ export async function* compressLoopAnthropicStream(
                 onCacheUsage: (input, cached) => {
                     if (typeof input === "number") {
                         ctx.session.stats.inputTokens += input;
+                        ctx.session.stats.lastInputTokens = input;
                         totalInputTokens += input;
                     }
                     if (typeof cached === "number") {

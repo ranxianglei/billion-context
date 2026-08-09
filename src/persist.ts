@@ -70,6 +70,7 @@ interface PersistedSession {
         cachedTokens?: number;
         outputTokens?: number;
         cacheSamples?: number;
+        lastInputTokens?: number;
         contextTokens?: number;
     };
     /** Free-form escape hatch (v2+). */
@@ -86,6 +87,7 @@ interface PersistedSession {
     cachedTokens?: number;
     outputTokens?: number;
     cacheSamples?: number;
+    lastInputTokens?: number;
     contextTokens?: number;
     state: CompressionState;
     /** blockContents serialized as a plain record (Maps do not survive JSON). */
@@ -413,6 +415,7 @@ function buildSession(parsed: PersistedSession): Session {
             cachedTokens: stats.cachedTokens ?? parsed.cachedTokens ?? 0,
             outputTokens: stats.outputTokens ?? parsed.outputTokens ?? 0,
             cacheSamples: stats.cacheSamples ?? parsed.cacheSamples ?? 0,
+            lastInputTokens: stats.lastInputTokens ?? parsed.lastInputTokens ?? 0,
             contextTokens: stats.contextTokens ?? parsed.contextTokens ?? 0,
         },
         metadata: parsed.metadata ?? {},

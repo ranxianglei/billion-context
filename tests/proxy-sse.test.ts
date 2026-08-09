@@ -8,7 +8,7 @@ function makeCtx() {
     const core = createCore();
     const config = defaultConfig(200000);
     const state = createInitialState();
-    return { core, config, state, ctx: { core, config, messages: [], session: { id: "t", meta: {}, stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, contextTokens: 0 }, metadata: {}, state }, log: () => {} } as never };
+    return { core, config, state, ctx: { core, config, messages: [], session: { id: "t", meta: {}, stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 }, metadata: {}, state }, log: () => {} } as never };
 }
 
 function parseToolCalls(sse: string) {

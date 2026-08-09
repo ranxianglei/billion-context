@@ -44,6 +44,10 @@ export type Session = {
         outputTokens: number;
         /** Number of upstream usage samples recorded. */
         cacheSamples: number;
+        /** Last upstream-reported input_tokens for THIS session (single-turn,
+         *  overwritten each turn). Source of truth for tokenCount — never an
+         *  estimate. See onCacheUsage in compress-loop-*.ts. */
+        lastInputTokens: number;
         /** Current in-context (uncompressed) token count at last processTurn. */
         contextTokens: number;
     };
@@ -132,7 +136,7 @@ export function getSession(id: string, meta?: { protocol?: Session["meta"]["prot
     const session: Session = {
         id,
         meta: { protocol: meta?.protocol, upstreamOrigin: meta?.upstreamOrigin, label: meta?.label },
-        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, contextTokens: 0 },
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 },
         metadata: {},
         state: createInitialState(),
         createdAt: Date.now(),
