@@ -374,6 +374,14 @@ function routeAnthropicEvent(
         const u = (data.usage ?? {}) as Record<string, unknown>;
         const out = u.output_tokens as number | undefined;
         if (typeof out === "number") cb.onOutputTokens(out);
+        // GLM (unlike Anthropic's spec) puts the REAL input_tokens in
+        // message_delta.usage, with message_start.usage.input_tokens=0. Always
+        // capture input + cache_read here so stats reflect the actual billable
+        // tokens regardless of which event the provider chose for it.
+        cb.onCacheUsage(
+            u.input_tokens as number | undefined,
+            u.cache_read_input_tokens as number | undefined,
+        );
         const d = (data.delta ?? {}) as Record<string, unknown>;
         if (typeof d.stop_reason === "string") cb.onStopReason(d.stop_reason);
         // ALWAYS suppress — we emit our own terminal SSE at the end with

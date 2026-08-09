@@ -902,22 +902,30 @@ async function forward(
             if (dumpRaw) await dumpRaw;
         }
     } else {
-        const buf = await upstream.arrayBuffer();
-        const text = Buffer.from(buf).toString("utf8");
+        // Wrap the whole non-streaming branch in try/finally so the upstream
+        // timer is always cleared and the session is always persisted — even
+        // when arrayBuffer() throws (10-min abort, connection reset). Without
+        // this, a thrown arrayBuffer() leaks the timeout and skips markDirty(),
+        // losing the persistence of any block this turn's compress created.
         try {
-            const json = JSON.parse(text);
-            if (prepared.protocol === "openai") {
-                rewriteOpenaiJsonResponse(json, ctx);
-            } else if (prepared.protocol === "responses") {
-                rewriteResponsesJsonResponse(json, ctx);
-            } else {
-                rewriteJsonResponse(json, ctx);
+            const buf = await upstream.arrayBuffer();
+            const text = Buffer.from(buf).toString("utf8");
+            try {
+                const json = JSON.parse(text);
+                if (prepared.protocol === "openai") {
+                    rewriteOpenaiJsonResponse(json, ctx);
+                } else if (prepared.protocol === "responses") {
+                    rewriteResponsesJsonResponse(json, ctx);
+                } else {
+                    rewriteJsonResponse(json, ctx);
+                }
+                res.end(JSON.stringify(json));
+            } catch {
+                res.end(text);
             }
-            res.end(JSON.stringify(json));
-        } catch {
-            res.end(text);
+        } finally {
+            clearUpstreamTimer();
         }
-        clearUpstreamTimer();
     }
     // State may have mutated during response streaming (compress created a
     // block, decompress deactivated one) — persist the final snapshot.
@@ -1002,7 +1010,7 @@ function sendStats(res: http.ServerResponse): void {
         cachedTokens: s.stats.cachedTokens,
         outputTokens: s.stats.outputTokens,
         cacheSamples: s.stats.cacheSamples,
-        cacheHitPct: s.stats.cacheSamples > 0 ? Math.round(s.stats.cachedTokens / s.stats.inputTokens * 100) : null,
+        cacheHitPct: s.stats.cacheSamples > 0 && s.stats.inputTokens > 0 ? Math.round(s.stats.cachedTokens / s.stats.inputTokens * 100) : null,
         lastSeen: new Date(s.lastSeen).toISOString(),
     }));
     res.writeHead(200, { "content-type": "application/json" });

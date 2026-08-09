@@ -155,6 +155,15 @@ function doMitm(
     // sees the decrypted request as a plain POST /api/anthropic/v1/messages —
     // with this marker it routes to https://<host> instead of the default.
     (tlsSocket as unknown as Record<string, unknown>)[MITM_UPSTREAM_KEY] = `https://${host}`;
+    // A TLS handshake error (client rejects our cert, abrupt disconnect,
+    // reset) emits "error" on the TLSSocket. Without a listener Node treats
+    // it as an uncaught exception and crashes the whole proxy. Destroy the
+    // underlying socket and log — mirrors tunnelThrough()'s error handling.
+    tlsSocket.on("error", (err: Error) => {
+        log(`mitm ${host}:${port} TLS error: ${err.message}`);
+        tlsSocket.destroy();
+        clientSocket.destroy();
+    });
     // Hand the decrypted TLS socket to the http server's connection listener.
     // The server treats it as a new TCP connection and runs its HTTP parser on
     // the cleartext bytes — exactly the same path as a direct (non-proxy)
