@@ -106,25 +106,38 @@ function routeOpenaiEvent(rawEvent: string, state: StreamState): string | null {
     }
     const delta = choice.delta as { content?: string; tool_calls?: Array<Record<string, unknown>> } | undefined;
     if (delta && Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) {
-        const entry = delta.tool_calls[0] as {
-            index?: number;
-            function?: { name?: string; arguments?: string };
-        };
-        const tidx = entry.index ?? 0;
-        const name = entry.function?.name;
-        if (typeof name === "string") {
-            if (name === COMPRESS_TOOL_NAME) {
-                state.compressIndices.add(tidx);
-                state.converted = true;
+        // Process EVERY tool call in the delta, not just tool_calls[0]. A
+        // single SSE chunk can carry multiple tool calls (different indices);
+        // reading only [0] dropped the args of the 2nd+ and failed to mark
+        // them as real/compress.
+        let allCompress = true;
+        for (const raw of delta.tool_calls) {
+            const entry = raw as {
+                index?: number;
+                function?: { name?: string; arguments?: string };
+            };
+            const tidx = entry.index ?? 0;
+            const name = entry.function?.name;
+            if (typeof name === "string") {
+                if (name === COMPRESS_TOOL_NAME) {
+                    state.compressIndices.add(tidx);
+                    state.converted = true;
+                } else {
+                    state.sawReal = true;
+                }
+            }
+            if (state.compressIndices.has(tidx)) {
+                const frag = entry.function?.arguments;
+                if (typeof frag === "string") state.args[tidx] = (state.args[tidx] ?? "") + frag;
             } else {
-                state.sawReal = true;
+                allCompress = false;
             }
         }
-        if (state.compressIndices.has(tidx)) {
-            const frag = entry.function?.arguments;
-            if (typeof frag === "string") state.args[tidx] = (state.args[tidx] ?? "") + frag;
-            return null;
-        }
+        // Suppress the whole event only if every tool call in this chunk is a
+        // compress call. If a real tool call shares the chunk, pass it through
+        // verbatim (multi-tool-per-chunk is rare; rewriting a partial delta
+        // is fragile, so we accept the edge case rather than risk corruption).
+        if (allCompress) return null;
         return rawEvent + "\n\n";
     }
     return rawEvent + "\n\n";

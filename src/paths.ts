@@ -61,3 +61,10 @@ export function stateDir(): string {
 export function defaultLogFile(): string {
     return path.join(stateDir(), "bili.log");
 }
+
+/** CA dir: root CA + dynamically-signed host certificates for MITM mode.
+ *  Lives under the data dir (the private key is sensitive but regenerable).
+ *  Created lazily by ca.ts on first MITM use. */
+export function caDir(): string {
+    return path.join(dataDir(), "ca");
+}

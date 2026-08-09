@@ -13,7 +13,7 @@ function makeCtx(log: (m: string) => void): { core: ReturnType<typeof createCore
         session: {
             id: "test",
             meta: {},
-            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, contextTokens: 0 },
+            stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 },
             metadata: {},
             state: createInitialState(),
             createdAt: Date.now(),

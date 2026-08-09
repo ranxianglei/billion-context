@@ -16,6 +16,7 @@ const BASE_OPTS: ProxyOptions = {
     debug: false,
     passthrough: false,
     autoUpdate: false,
+    mitm: { enabled: false, domains: [] },
 };
 
 test("zero-config /bili/ route: strips prefix, uses embedded URL verbatim", () => {

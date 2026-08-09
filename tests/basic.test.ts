@@ -236,7 +236,7 @@ test("OpenAI SSE rewriter passes through real tool calls when no compress detect
     const core = createCore();
     const state = createInitialState();
     const config = defaultConfig(200000);
-    const ctx = { core, config, messages: [], session: { id: "s1", meta: {}, stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, contextTokens: 0 }, metadata: {}, state }, log: () => {} };
+    const ctx = { core, config, messages: [], session: { id: "s1", meta: {}, stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 }, metadata: {}, state }, log: () => {} };
 
     // Simulate a provider that sends the LAST tool_call arguments fragment
     // in the SAME chunk as finish_reason (common in GLM/OpenAI-compatible APIs).
@@ -272,7 +272,7 @@ test("OpenAI SSE rewriter suppresses compress tool call and injects note", async
     const core = createCore();
     const config = defaultConfig(200000);
     const state = createInitialState();
-    const ctx = { core, config, messages: [], session: { id: "s1", meta: {}, stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, contextTokens: 0 }, metadata: {}, state }, log: () => {} };
+    const ctx = { core, config, messages: [], session: { id: "s1", meta: {}, stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 }, metadata: {}, state }, log: () => {} };
 
     const sse = [
         `data: ${JSON.stringify({ object: "chat.completion.chunk", choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "compress", arguments: '{"content":[{"startId":"m00001","endId":"m00001","summary":"test"}]}' } }] }, finish_reason: null }] })}\n\n`,

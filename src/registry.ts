@@ -117,7 +117,12 @@ export function providerFromHost(host: string): string | undefined {
     const lower = host.toLowerCase();
     if (HOST_TO_PROVIDER[lower]) return HOST_TO_PROVIDER[lower];
     for (const [h, p] of Object.entries(HOST_TO_PROVIDER)) {
-        if (lower.endsWith(h) || h.endsWith(lower)) return p;
+        // Boundary-safe suffix match: "api.openai.com" must NOT match a key
+        // like "penai.com". Require an exact host match or a "."-delimited
+        // subdomain (h === lower || lower.endsWith("." + h)). The reverse
+        // direction (h.endsWith(lower)) is dropped — it matched arbitrary
+        // substrings of the host and mis-classified providers.
+        if (lower === h || lower.endsWith("." + h)) return p;
     }
     return undefined;
 }

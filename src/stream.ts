@@ -1,6 +1,7 @@
-import { collectBlockContent, type CompressionCore, type Config, type CoreMessage, type CompressionState } from "acp-kernel";
+import { buildStatusReport, collectBlockContent, estimateTokensFast, type CompressionCore, type Config, type CoreMessage, type CompressionState } from "acp-kernel";
 import { type Session, cacheBlockContent } from "./session.js";
-import { COMPRESS_TOOL_NAME, parseCompressInput } from "./compress-tool.js";
+import { COMPRESS_TOOL_NAME, parseCompressInput, PROXY_TOOL_NAMES } from "./compress-tool.js";
+import { resolveDecompress } from "./decompress-shared.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
 
 export type RewriteCtx = {
@@ -12,7 +13,7 @@ export type RewriteCtx = {
     debug?: boolean;
 };
 
-type BlockState = { isCompress: boolean; json: string; hadRealToolUse: boolean };
+type BlockState = { toolName: string | null; json: string; hadRealToolUse: boolean };
 
 const NOOP = Symbol("noop");
 
@@ -26,6 +27,7 @@ export async function* rewriteSseStream(
     const blocks = new Map<number, BlockState>();
     let convertedAny = false;
     let sawRealToolUse = false;
+    let capturedUsage: Record<string, unknown> | undefined;
     let output = "";
 
     const flush = (): Buffer => {
@@ -46,14 +48,14 @@ export async function* rewriteSseStream(
                 buf = buf.slice(idx + 2);
                 const ev = parseSseEvent(rawEvent);
                 if (!ev) continue;
-                const routed = routeEvent(ev, blocks, ctx, (c) => (convertedAny = c || convertedAny), () => (sawRealToolUse = true), () => convertedAny);
+                const routed = routeEvent(ev, blocks, ctx, (c) => (convertedAny = c || convertedAny), () => (sawRealToolUse = true), () => convertedAny, (u) => (capturedUsage = u));
                 if (routed === NOOP) continue;
                 output += routed;
                 if (output.length >= 8192) yield flush();
             }
         }
         if (convertedAny) {
-            const finalDelta = buildStopReasonRewrite(sawRealToolUse);
+            const finalDelta = buildStopReasonRewrite(sawRealToolUse, capturedUsage);
             if (finalDelta) output += finalDelta;
         }
         if (buf) {
@@ -73,6 +75,7 @@ function routeEvent(
     markConverted: (v: boolean) => void,
     markRealToolUse: () => void,
     getConverted: () => boolean,
+    setUsage: (u: Record<string, unknown>) => void,
 ): string | typeof NOOP {
     const d = ev.data;
     if (!d || typeof d !== "object") return emitEvent(ev);
@@ -80,8 +83,8 @@ function routeEvent(
     if (t === "content_block_start") {
         const index = (d as { index?: number }).index ?? 0;
         const cb = (d as { content_block?: { type?: string; name?: string } }).content_block;
-        if (cb?.type === "tool_use" && cb.name === COMPRESS_TOOL_NAME) {
-            blocks.set(index, { isCompress: true, json: "", hadRealToolUse: false });
+        if (cb?.type === "tool_use" && typeof cb.name === "string" && PROXY_TOOL_NAMES.has(cb.name)) {
+            blocks.set(index, { toolName: cb.name, json: "", hadRealToolUse: false });
             markConverted(true);
             return NOOP;
         }
@@ -91,7 +94,7 @@ function routeEvent(
     if (t === "content_block_delta") {
         const index = (d as { index?: number }).index ?? 0;
         const st = blocks.get(index);
-        if (st && st.isCompress) {
+        if (st && st.toolName) {
             const partial = (d as { delta?: { partial_json?: string } }).delta?.partial_json;
             if (typeof partial === "string") st.json += partial;
             return NOOP;
@@ -105,9 +108,9 @@ function routeEvent(
     if (t === "content_block_stop") {
         const index = (d as { index?: number }).index ?? 0;
         const st = blocks.get(index);
-        if (st && st.isCompress) {
+        if (st && st.toolName) {
             blocks.delete(index);
-            return emitReplacementText(st.json, ctx, index);
+            return emitToolReplacement(st.toolName, st.json, ctx, index);
         }
         return emitEvent(ev);
     }
@@ -119,9 +122,15 @@ function routeEvent(
     // — but ONLY on the non-converted path (when we replaced the response with
     // a compress note, the upstream usage is not the real completion).
     if (t === "message_delta") {
-        if (!getConverted()) {
-            const u = (d as { usage?: Record<string, unknown> }).usage;
-            if (u) {
+        // Capture upstream usage on BOTH paths: when not converted we need it
+        // for stats; when converted (tool_use replaced by text) the upstream
+        // message_delta is suppressed (NOOP below) but we still need its usage
+        // to emit a well-formed synthetic message_delta — ZCode's Zod schema
+        // requires usage.output_tokens:number, so hardcoding {} fails.
+        const u = (d as { usage?: Record<string, unknown> }).usage;
+        if (u) {
+            setUsage(u);
+            if (!getConverted()) {
                 const out = u.output_tokens;
                 if (typeof out === "number") ctx.session.stats.outputTokens += out;
             }
@@ -152,15 +161,15 @@ function routeEvent(
     return emitEvent(ev);
 }
 
-function emitReplacementText(jsonInput: string, ctx: RewriteCtx, index: number): string {
+function emitToolReplacement(toolName: string, jsonInput: string, ctx: RewriteCtx, index: number): string {
     let parsed: unknown = {};
     try {
         parsed = jsonInput ? JSON.parse(jsonInput) : {}
     } catch {
         parsed = {};
     }
-    const ranges = parseCompressInput(parsed);
-    const note = applyRanges(ranges, ctx);
+    const args = (parsed && typeof parsed === "object" ? parsed : {}) as Record<string, unknown>;
+    const text = executeAnthropicProxyTool(toolName, args, ctx);
     // Reuse the suppressed tool_use block's own index instead of hardcoding 0.
     // Hardcoding 0 re-opens an already-closed text block (index 0 is usually a
     // preceding text block), producing malformed SSE.
@@ -168,10 +177,40 @@ function emitReplacementText(jsonInput: string, ctx: RewriteCtx, index: number):
         `event: content_block_start\n` +
         `data: ${JSON.stringify({ type: "content_block_start", index, content_block: { type: "text", text: "" } })}\n\n` +
         `event: content_block_delta\n` +
-        `data: ${JSON.stringify({ type: "content_block_delta", index, delta: { type: "text_delta", text: note } })}\n\n` +
+        `data: ${JSON.stringify({ type: "content_block_delta", index, delta: { type: "text_delta", text } })}\n\n` +
         `event: content_block_stop\n` +
         `data: ${JSON.stringify({ type: "content_block_stop", index })}\n\n`
     );
+}
+
+// Dispatch all four ACP proxy tools to the same logic the OpenAI/Responses
+// path uses (compress-loop.ts executeProxyTool). compress mutates context
+// (handled by applyRanges); the other three are read-only queries whose result
+// is emitted as a text delta replacing the intercepted tool_use block.
+function executeAnthropicProxyTool(toolName: string, args: Record<string, unknown>, ctx: RewriteCtx): string {
+    if (toolName === COMPRESS_TOOL_NAME) {
+        return applyRanges(parseCompressInput(args), ctx);
+    }
+    if (toolName === "decompress") {
+        return resolveDecompress(args, ctx);
+    }
+    if (toolName === "search_context") {
+        const query = typeof args.query === "string" ? args.query : "";
+        if (query.length === 0) return "[search_context FAILED: query is required]";
+        const limit = typeof args.limit === "number" && args.limit > 0 ? Math.floor(args.limit) : 5;
+        const blocks = ctx.core.search(query, ctx.session.state).slice(0, limit);
+        if (blocks.length === 0) return `[No blocks matched "${query}"]`;
+        const lines = blocks.map((b) => {
+            const topic = b.topic ?? "(no topic)";
+            const preview = b.summary.length > 200 ? b.summary.slice(0, 200) + "..." : b.summary;
+            return `${b.blockId} (T${b.tier}) "${topic}"\n  ${preview}`;
+        });
+        return `Found ${blocks.length} block(s) for "${query}":\n\n${lines.join("\n\n")}`;
+    }
+    if (toolName === "acp_status") {
+        return buildStatusReport(ctx.session.state, ctx.messages, estimateTokensFast);
+    }
+    return `[Unknown proxy tool: ${toolName}]`;
 }
 
 export function applyRanges(ranges: ReturnType<typeof parseCompressInput>, ctx: RewriteCtx): string {
@@ -230,11 +269,15 @@ export function applyRanges(ranges: ReturnType<typeof parseCompressInput>, ctx: 
     }
 }
 
-function buildStopReasonRewrite(sawRealToolUse: boolean): string {
+function buildStopReasonRewrite(sawRealToolUse: boolean, usage?: Record<string, unknown>): string {
     const stop_reason = sawRealToolUse ? "tool_use" : "end_turn";
+    // Preserve upstream usage (output_tokens etc.). Default output_tokens:0 so
+    // strict clients (ZCode Zod) that require output_tokens:number still pass
+    // even if the upstream omitted it.
+    const u = { output_tokens: 0, ...(usage ?? {}) };
     return (
         `event: message_delta\n` +
-        `data: ${JSON.stringify({ type: "message_delta", delta: { stop_reason }, usage: {} })}\n\n` +
+        `data: ${JSON.stringify({ type: "message_delta", delta: { stop_reason }, usage: u })}\n\n` +
         `event: message_stop\n` +
         `data: ${JSON.stringify({ type: "message_stop" })}\n\n`
     );
@@ -271,10 +314,10 @@ export function rewriteJsonResponse(body: unknown, ctx: RewriteCtx): unknown {
     const newContent: unknown[] = [];
     for (const block of b.content) {
         const blk = block as { type?: string; name?: string; input?: unknown };
-        if (blk.type === "tool_use" && blk.name === COMPRESS_TOOL_NAME) {
+        if (blk.type === "tool_use" && typeof blk.name === "string" && PROXY_TOOL_NAMES.has(blk.name)) {
             converted = true;
-            const ranges = parseCompressInput(blk.input);
-            newContent.push({ type: "text", text: applyRanges(ranges, ctx) });
+            const args = (blk.input && typeof blk.input === "object" ? blk.input : {}) as Record<string, unknown>;
+            newContent.push({ type: "text", text: executeAnthropicProxyTool(blk.name, args, ctx) });
         } else {
             if (blk.type === "tool_use") sawRealToolUse = true;
             newContent.push(block);

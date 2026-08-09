@@ -223,11 +223,37 @@ export const ACP_TOOLS_OPENAI = [
     ACP_STATUS_TOOL_OPENAI,
 ] as const;
 
-/**
- * Responses API tool format: flat shape {type:"function", name, parameters},
- * NOT the chat completions nested {function:{name,...}} form.
- * Only the compress tool is injected for now (matches the Anthropic path).
- */
+/** Anthropic-format tools (name + description + input_schema). The Anthropic
+ *  request path (ZCode, Claude Code) injects all four so the model can actually
+ *  call compress/decompress/search_context/acp_status — previously only
+ *  COMPRESS_TOOL was injected while the system prompt described all four,
+ *  leaving the model able to see the tool docs but unable to call them. */
+export const DECOMPRESS_TOOL = {
+    name: DECOMPRESS_TOOL_NAME,
+    description: DECOMPRESS_TOOL_OPENAI.function.description,
+    input_schema: DECOMPRESS_TOOL_OPENAI.function.parameters,
+};
+
+export const SEARCH_CONTEXT_TOOL = {
+    name: SEARCH_CONTEXT_TOOL_NAME,
+    description: SEARCH_CONTEXT_TOOL_OPENAI.function.description,
+    input_schema: SEARCH_CONTEXT_TOOL_OPENAI.function.parameters,
+};
+
+export const ACP_STATUS_TOOL = {
+    name: ACP_STATUS_TOOL_NAME,
+    description: ACP_STATUS_TOOL_OPENAI.function.description,
+    input_schema: ACP_STATUS_TOOL_OPENAI.function.parameters,
+};
+
+export const ACP_TOOLS_ANTHROPIC = [
+    COMPRESS_TOOL,
+    DECOMPRESS_TOOL,
+    SEARCH_CONTEXT_TOOL,
+    ACP_STATUS_TOOL,
+] as const;
+
+// Anthropic format tool constants (defined below, after DECOMPRESS_TOOL_OPENAI etc.)
 export const COMPRESS_TOOL_RESPONSES = {
     type: "function" as const,
     name: COMPRESS_TOOL_NAME,

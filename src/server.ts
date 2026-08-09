@@ -32,12 +32,14 @@ import {
     conversationSignalResponses,
 } from "./responses.js";
 import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, withSessionLock } from "./session.js";
-import { COMPRESS_TOOL, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressTextSystemPrompt } from "./compress-tool.js";
+import { COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressTextSystemPrompt } from "./compress-tool.js";
 import { rewriteSseStream, rewriteJsonResponse, type RewriteCtx } from "./stream.js";
+import { applyRanges } from "./stream.js";
 import { renderUI, handleConfigGet, handleConfigPut } from "./web.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { getStore } from "./persist.js";
 import { compressLoopStream } from "./compress-loop.js";
+import { compressLoopAnthropicStream } from "./compress-loop-anthropic.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger } from "./logger.js";
 import { defaultLogFile } from "./paths.js";
 import { compressLoopResponsesStream } from "./compress-loop-responses.js";
@@ -45,6 +47,7 @@ import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesSseStream, rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { emitStreamError } from "./stream-error.js";
 import { deriveSessionId as deriveProxySessionId, affinityToken, clientConversationHeader } from "./session-id.js";
+import { setupMitm, readMitmUpstream } from "./mitm.js";
 
 const UPSTREAM_HOP_HEADERS = new Set([
     "host",
@@ -58,7 +61,18 @@ const UPSTREAM_HOP_HEADERS = new Set([
     "content-encoding",
 ]);
 
-export function resolveUpstream(_opts: ProxyOptions, reqUrl: string): { upstream: string; rewrittenUrl: string } | undefined {
+export function resolveUpstream(_opts: ProxyOptions, reqUrl: string, req?: http.IncomingMessage): { upstream: string; rewrittenUrl: string } | undefined {
+    // MITM mode: the request arrived over a CONNECT tunnel we terminated
+    // locally (client set HTTP_PROXY and issued CONNECT host:443). The socket
+    // carries the real upstream origin; the request path has no /bili/ prefix
+    // — it's a bare /api/anthropic/v1/messages. Reconstruct the full upstream
+    // URL so handle()/forward() route to the host the CONNECT targeted. The
+    // client's Authorization header (OAuth token for the subscription) is
+    // forwarded verbatim → subscription auth preserved, no MITM of creds.
+    const mitmUpstream = readMitmUpstream(req?.socket);
+    if (mitmUpstream) {
+        return { upstream: mitmUpstream, rewrittenUrl: mitmUpstream + (reqUrl ?? "") };
+    }
     // Zero-config mode: a request like `/bili/https://open.bigmodel.cn/api/anthropic`
     // embeds the full upstream URL after the `/bili/` prefix. Strip the prefix,
     // take the rest verbatim as the upstream. This is the ONLY routing mode —
@@ -112,6 +126,9 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             }
         }
     });
+    if (opts.mitm.enabled) {
+        setupMitm(server, opts.mitm.domains, (msg) => log("info", msg));
+    }
     server.listen(opts.port, opts.host, () => {
         const displayHost = opts.host === "0.0.0.0" ? "localhost" : opts.host;
         const nOverrides = Object.keys(opts.routes).length;
@@ -120,7 +137,8 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             `acp-proxy listening on http://${displayHost}:${opts.port}` +
                 ` — web UI: http://${displayHost}:${opts.port}/__bili/` +
                 ` — zero-config: prefix any baseURL with http://${displayHost}:${opts.port}/bili/` +
-                (nOverrides ? ` — context overrides for ${nOverrides} upstream URL(s)` : ""),
+                (nOverrides ? ` — context overrides for ${nOverrides} upstream URL(s)` : "")
+                + (opts.mitm.enabled ? ` — MITM proxy on (whitelist)${opts.mitm.domains.length ? ` +${opts.mitm.domains.join(",")}` : ""}` : ""),
         );
     });
     // Listen errors (EADDRINUSE port taken, EACCES privileged port, EAFNOSUPPORT
@@ -196,6 +214,11 @@ type Prepared = {
     body: string;
     session: Session;
     processedMessages: CoreMessage[];
+    /** Original CoreMessages from the protocol conversion, BEFORE processTurn
+     *  folded/replaced anything. compress/decompress/acp_status need the raw
+     *  text (collectBlockContent reads message text by id); processedMessages
+     *  has compressed messages replaced with placeholders → empty content. */
+    originalMessages: CoreMessage[];
     protocol: "anthropic" | "openai" | "responses";
     stream: boolean;
     compressInjected: boolean;
@@ -272,7 +295,7 @@ async function handle(
     // upstream ORIGIN for cross-provider isolation) and forward() (needs the
     // full rewritten URL) use the same decision. Computed before prepare() so
     // the session can embed the provider origin.
-    const route = resolveUpstream(opts, req.url ?? "");
+    const route = resolveUpstream(opts, req.url ?? "", req);
     const upstreamOrigin = route ? route.upstream : opts.upstream;
     // Per-request context limit: look up body.model against the per-route model
     // declaration in providers.json first (same model can have different
@@ -309,12 +332,21 @@ async function handle(
     let prepared: Prepared | null = null;
     if (!opts.passthrough && protocol && parsed && typeof parsed === "object") {
         const sessionHeader = headerValue(req, opts.sessionHeader);
+        // The client's own conversation header (x-session-id / x-session-affinity
+        // / x-opencode-session / x-acp-session) is the STRONGEST signal that two
+        // requests belong to the same conversation — much stronger than the
+        // content-fingerprint fallback. Prefer it over opts.sessionHeader and
+        // over content hashing, so IDE clients (ZCode/Cursor) that inject a
+        // fixed system-reminder into every new conversation don't collide on a
+        // shared 200-char prefix and leak compression state across sessions.
+        const clientConv = clientConversationHeader(req.headers);
+        const convHeader = clientConv ?? sessionHeader;
         const conversation =
             protocol === "anthropic"
-                ? conversationSignalAnthropic(parsed as AnthropicRequestBody, sessionHeader)
+                ? conversationSignalAnthropic(parsed as AnthropicRequestBody, convHeader)
                 : protocol === "openai"
-                  ? conversationSignalOpenai(parsed as OpenAIRequestBody, sessionHeader)
-                  : conversationSignalResponses(parsed as ResponsesRequestBody, sessionHeader);
+                  ? conversationSignalOpenai(parsed as OpenAIRequestBody, convHeader)
+                  : conversationSignalResponses(parsed as ResponsesRequestBody, convHeader);
         const sessionId = deriveProxySessionId(req.headers, protocol, upstreamOrigin, conversation);
         // Two separate uses of the conversation signal:
         //  - `affinity`: header value forwarded upstream for sticky-routing /
@@ -396,13 +428,24 @@ function prepareAnthropic(
     ++session.stats.requests;
 
     let processedMessages: CoreMessage[] = [];
+    let originalMessages: CoreMessage[] = [];
     let rebuiltMessages = parsed.messages;
     let systemOut = parsed.system;
     let toolsOut = parsed.tools;
 
     try {
         const { msgs, cacheControls } = anthropicToCore(parsed);
-        const tokenCount = estimateTokensFast(msgs.map((m) => m.text ?? "").join("\n"));
+        originalMessages = msgs;
+        // tokenCount drives the nudge decision ("should we compress?"). It MUST
+        // be the real context size, never an estimate — estimates undercount
+        // CJK text 3-4x and never trigger compression for Chinese sessions.
+        // Use the upstream's own input_tokens from the PREVIOUS turn (known by
+        // now — the response came back). First turn has no history → 0 (never
+        // triggers anyway). extractSystem is still called so sysText flows into
+        // the fallback path below if we ever need it, but we no longer feed
+        // estimates to the kernel.
+        extractSystem(parsed.system);
+        const tokenCount = session.stats.lastInputTokens;
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
         session.stats.contextTokens = tokenCount;
@@ -438,7 +481,7 @@ function prepareAnthropic(
 
     const rebuilt: AnthropicRequestBody = { ...parsed, messages: rebuiltMessages, system: systemOut, tools: toolsOut };
     markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, processedMessages, protocol: "anthropic", stream, compressInjected: opts.compress.injectTool } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "anthropic", stream, compressInjected: opts.compress.injectTool } as Prepared;
 }
 
 function prepareOpenai(
@@ -455,6 +498,7 @@ function prepareOpenai(
     ++session.stats.requests;
 
     let processedMessages: CoreMessage[] = [];
+    let originalMessages: CoreMessage[] = [];
     let rebuiltMessages = parsed.messages;
     let toolsOut = parsed.tools;
 
@@ -470,7 +514,10 @@ function prepareOpenai(
 
     try {
         const { msgs } = openaiToCore(parsed);
-        const tokenCount = estimateTokensFast(msgs.map((m) => m.text ?? "").join("\n"));
+        originalMessages = msgs;
+        // tokenCount = upstream's real input_tokens from the previous turn
+        // (see anthropic branch comment). Never an estimate.
+        const tokenCount = session.stats.lastInputTokens;
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
         session.stats.contextTokens = tokenCount;
@@ -512,8 +559,17 @@ function prepareOpenai(
     }
 
     const rebuilt: OpenAIRequestBody = { ...parsed, messages: rebuiltMessages, tools: toolsOut as OpenAITool[] | undefined };
+    // OpenAI Chat Completions only emits a usage object in the final stream
+    // chunk when the client sets stream_options.include_usage=true. Without
+    // it, streaming sessions never learn their real input_tokens →
+    // lastInputTokens stays 0 → compression never fires. Force it on for any
+    // streaming request that doesn't already opt in. (Anthropic/Responses
+    // emit usage unconditionally, so this is OpenAI-specific.)
+    if (stream && (rebuilt as Record<string, unknown>).stream_options === undefined) {
+        (rebuilt as Record<string, unknown>).stream_options = { include_usage: true };
+    }
     markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, processedMessages, protocol: "openai", stream, compressInjected: shouldInject } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: shouldInject } as Prepared;
 }
 
 function prepareResponses(
@@ -530,6 +586,7 @@ function prepareResponses(
     ++session.stats.requests;
 
     let processedMessages: CoreMessage[] = [];
+    let originalMessages: CoreMessage[] = [];
     let rebuiltInput: ResponseInputItem[] | string = parsed.input;
     let toolsOut = parsed.tools;
 
@@ -537,10 +594,15 @@ function prepareResponses(
 
     try {
         const { msgs, systemParts, preamble, customToolCallIds } = responsesToCore(parsed);
+        originalMessages = msgs;
         if (process.env.ACP_DEBUG) {
             log("info", `[${sessionId}] input items: ${Array.isArray(parsed.input) ? parsed.input.map((i: ResponseInputItem) => i.type).join(",") : "(string)"}`);
         }
-        const tokenCount = estimateTokensFast(msgs.map((m) => m.text ?? "").join("\n"));
+        // tokenCount = upstream's real input_tokens from the previous turn
+        // (see anthropic branch comment). Never an estimate. systemParts is
+        // still extracted (used by injectResponsesInstructions later).
+        systemParts.join("\n\n");
+        const tokenCount = session.stats.lastInputTokens;
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" });
         session.state = turn.state;
         session.stats.contextTokens = tokenCount;
@@ -609,7 +671,7 @@ function prepareResponses(
         log("info", `[${sessionId}] responses forward tools=[${fwdTools.join(",")}] injectTool=${shouldInject} NO_INJECT_TOOL=${!!process.env.ACP_NO_INJECT_TOOL} NO_COMPRESS_PROMPT=${!!process.env.ACP_NO_COMPRESS_PROMPT}`);
     }
     markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, processedMessages, protocol: "responses", stream, compressInjected: shouldInject } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "responses", stream, compressInjected: shouldInject } as Prepared;
 }
 
 function injectSystem(
@@ -629,9 +691,10 @@ function injectSystem(
 }
 
 function injectTool(tools: unknown[] | undefined): unknown[] {
-    if (!Array.isArray(tools)) return [COMPRESS_TOOL];
-    if (tools.some((t) => (t as { name?: string })?.name === COMPRESS_TOOL_NAME)) return tools;
-    return [...tools, COMPRESS_TOOL];
+    if (!Array.isArray(tools)) return [...ACP_TOOLS_ANTHROPIC];
+    const names = new Set(tools.map((t) => (t as { name?: string })?.name));
+    const missing = ACP_TOOLS_ANTHROPIC.filter((t) => !names.has(t.name));
+    return missing.length === 0 ? tools : [...tools, ...missing];
 }
 
 function injectOpenaiTool(tools: OpenAITool[] | undefined): OpenAITool[] {
@@ -778,7 +841,7 @@ async function forward(
     const ctx: RewriteCtx = {
         core,
         config,
-        messages: prepared.processedMessages,
+        messages: prepared.originalMessages,
         session: prepared.session,
         log: (msg: string) => log("info", `[${prepared.session.id}] ${msg}`),
         debug: opts.debug,
@@ -806,7 +869,7 @@ async function forward(
             reqHeaders["content-type"] = "application/json";
             const loop = compressLoopStream(
                 streamToRead,
-                { core, config, messages: prepared.processedMessages, session: prepared.session, log: ctx.log },
+                { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log },
                 parsedReq,
                 { url: upstreamUrl, headers: reqHeaders },
             );
@@ -829,7 +892,7 @@ async function forward(
             reqHeaders["content-type"] = "application/json";
             const loop = compressLoopResponsesStream(
                 streamToRead,
-                { core, config, messages: prepared.processedMessages, session: prepared.session, log: ctx.log },
+                { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log },
                 parsedReq,
                 { url: upstreamUrl, headers: reqHeaders },
             );
@@ -843,8 +906,20 @@ async function forward(
                 if (!res.write(chunk)) await new Promise<void>((r) => res.once("drain", () => r()));
             }
         } else {
-            const rewriter = rewriteSseStream(streamToRead, ctx);
-            for await (const chunk of rewriter) {
+            const parsedReq = JSON.parse(typeof body === "string" ? body : body.toString("utf8"));
+            const reqHeaders: Record<string, string> = {};
+            for (const [k, v] of Object.entries(headers)) {
+                if (k.toLowerCase() === "content-length" || k.toLowerCase() === "host") continue;
+                reqHeaders[k] = v;
+            }
+            reqHeaders["content-type"] = "application/json";
+            const loop = compressLoopAnthropicStream(
+                streamToRead,
+                { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log },
+                parsedReq,
+                { url: upstreamUrl, headers: reqHeaders },
+            );
+            for await (const chunk of loop) {
                 {
                     const s = chunk.toString("utf8");
                     if (s.includes("\x3cacp ") || s.includes("\x3c/acp")) {
@@ -862,22 +937,53 @@ async function forward(
             if (dumpRaw) await dumpRaw;
         }
     } else {
-        const buf = await upstream.arrayBuffer();
-        const text = Buffer.from(buf).toString("utf8");
+        // Wrap the whole non-streaming branch in try/finally so the upstream
+        // timer is always cleared and the session is always persisted — even
+        // when arrayBuffer() throws (10-min abort, connection reset). Without
+        // this, a thrown arrayBuffer() leaks the timeout and skips markDirty(),
+        // losing the persistence of any block this turn's compress created.
         try {
-            const json = JSON.parse(text);
-            if (prepared.protocol === "openai") {
-                rewriteOpenaiJsonResponse(json, ctx);
-            } else if (prepared.protocol === "responses") {
-                rewriteResponsesJsonResponse(json, ctx);
-            } else {
-                rewriteJsonResponse(json, ctx);
+            const buf = await upstream.arrayBuffer();
+            const text = Buffer.from(buf).toString("utf8");
+            try {
+                const json = JSON.parse(text);
+                // Capture upstream usage so tokenCount (which drives nudge +
+                // emergency-truncate) reflects reality for non-streaming
+                // sessions too. The streaming loops do this in their SSE
+                // event handlers; without it here, lastInputTokens stays 0 for
+                // any non-streaming session → compression never fires. Field
+                // names differ per protocol:
+                //   Anthropic: input_tokens / cache_read_input_tokens / output_tokens
+                //   OpenAI: prompt_tokens / prompt_tokens_details.cached_tokens / completion_tokens
+                //   Responses: input_tokens / input_tokens_details.cached_tokens / output_tokens
+                const u = (json?.usage ?? {}) as Record<string, any>;
+                const prompt = u.prompt_tokens ?? u.input_tokens;
+                if (typeof prompt === "number") {
+                    prepared.session.stats.inputTokens += prompt;
+                    const cached = u.prompt_tokens_details?.cached_tokens ?? u.input_tokens_details?.cached_tokens ?? u.cache_read_input_tokens;
+                    // tokenCount = TOTAL context (new + cached); see anthropic branch.
+                    prepared.session.stats.lastInputTokens = prompt + (typeof cached === "number" ? cached : 0);
+                    if (typeof cached === "number") {
+                        prepared.session.stats.cachedTokens += cached;
+                        prepared.session.stats.cacheSamples += 1;
+                    }
+                    const out = u.completion_tokens ?? u.output_tokens;
+                    if (typeof out === "number") prepared.session.stats.outputTokens += out;
+                }
+                if (prepared.protocol === "openai") {
+                    rewriteOpenaiJsonResponse(json, ctx);
+                } else if (prepared.protocol === "responses") {
+                    rewriteResponsesJsonResponse(json, ctx);
+                } else {
+                    rewriteJsonResponse(json, ctx);
+                }
+                res.end(JSON.stringify(json));
+            } catch {
+                res.end(text);
             }
-            res.end(JSON.stringify(json));
-        } catch {
-            res.end(text);
+        } finally {
+            clearUpstreamTimer();
         }
-        clearUpstreamTimer();
     }
     // State may have mutated during response streaming (compress created a
     // block, decompress deactivated one) — persist the final snapshot.
@@ -962,7 +1068,7 @@ function sendStats(res: http.ServerResponse): void {
         cachedTokens: s.stats.cachedTokens,
         outputTokens: s.stats.outputTokens,
         cacheSamples: s.stats.cacheSamples,
-        cacheHitPct: s.stats.cacheSamples > 0 ? Math.round(s.stats.cachedTokens / s.stats.inputTokens * 100) : null,
+        cacheHitPct: s.stats.cacheSamples > 0 && s.stats.inputTokens > 0 ? Math.round(s.stats.cachedTokens / s.stats.inputTokens * 100) : null,
         lastSeen: new Date(s.lastSeen).toISOString(),
     }));
     res.writeHead(200, { "content-type": "application/json" });
