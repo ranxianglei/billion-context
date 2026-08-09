@@ -623,10 +623,13 @@ function prepareResponses(
     const shouldInject = opts.compress.injectTool;
 
     try {
-        const { msgs, systemParts, preamble, customToolCallIds } = responsesToCore(parsed);
+        const { msgs, systemParts, preamble, customToolCallIds, droppedReasoning } = responsesToCore(parsed);
         originalMessages = msgs;
         if (process.env.ACP_DEBUG) {
             log("info", `[${sessionId}] input items: ${Array.isArray(parsed.input) ? parsed.input.map((i: ResponseInputItem) => i.type).join(",") : "(string)"}`);
+            if (droppedReasoning > 0) {
+                log("info", `[${sessionId}] dropped ${droppedReasoning} old reasoning item(s) (ACP_REASONING_KEEP=${process.env.ACP_REASONING_KEEP ?? "recent"})`);
+            }
         }
         // tokenCount = upstream's real input_tokens from the previous turn
         // (see anthropic branch comment). Never an estimate. systemParts is

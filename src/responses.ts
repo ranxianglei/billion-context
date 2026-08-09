@@ -70,6 +70,7 @@ type Flat = {
      *  out — a standard `function_call` must NOT be rewritten as
      *  `custom_tool_call` (different Responses API semantics). */
     customToolCallIds: Set<string>;
+    droppedReasoning: number;
 };
 
 /** Item types that are opaque host directives (tool definitions, reasoning,
@@ -93,6 +94,30 @@ const OPAQUE_ITEM_TYPES = new Set([
 
 function isOpaqueItem(it: ResponseInputItem): boolean {
     return OPAQUE_ITEM_TYPES.has(it.type);
+}
+
+/** External-input items (user messages, tool outputs) mark turn boundaries.
+ *  Reasoning at or before the LAST one belongs to an old, completed model
+ *  response and is dropped (see getReasoningKeepMode). `computer_call_output`
+ *  is intentionally excluded: it is itself an opaque item the host
+ *  re-injects, not a fresh external input. */
+function isExternalInputItem(it: ResponseInputItem): boolean {
+    const t = it.type;
+    if (t === "message") {
+        return (it as ResponseInputMessage).role === "user";
+    }
+    return t === "function_call_output" || t === "custom_tool_call_output";
+}
+
+/** Controls how `reasoning` items from previous model responses are handled.
+ *  - "recent" (default): keep only the most recent response's reasoning (after
+ *    the last external input), drop all older reasoning.
+ *  - "all": legacy behaviour — preserve every reasoning item verbatim.
+ *  - "none": drop all reasoning items (maximum context savings). */
+type ReasoningKeepMode = "recent" | "all" | "none";
+function getReasoningKeepMode(): ReasoningKeepMode {
+    const v = (process.env.ACP_REASONING_KEEP ?? "recent").trim().toLowerCase();
+    return v === "all" || v === "none" ? v : "recent";
 }
 
 function partText(p: ResponseContentPart): string {
@@ -129,23 +154,42 @@ export function responsesToCore(body: ResponsesRequestBody): Flat {
     const systemParts: string[] = [];
     const preamble: ResponseInputItem[] = [];
     const customToolCallIds = new Set<string>();
+    let droppedReasoning = 0;
     if (typeof body.instructions === "string" && body.instructions.trim()) {
         systemParts.push(body.instructions);
     }
     let idx = 0;
     const clusters = new ClusterCounter();
     const items = Array.isArray(body.input) ? body.input : [];
+    const reasoningKeep = getReasoningKeepMode();
+    // Index of the last external input (user message or tool output). Reasoning
+    // items at or before this index belong to old, completed model responses
+    // and are dropped (except in "all" mode) to stop unbounded accumulation.
+    let lastExternalInputIdx = -1;
+    if (reasoningKeep === "recent") {
+        for (let i = 0; i < items.length; i++) {
+            if (isExternalInputItem(items[i])) lastExternalInputIdx = i;
+        }
+    }
     if (typeof body.input === "string") {
         const base = deriveMessageId("user", "text", body.input);
         msgs.push({ id: clusters.next(base), role: "user", contentType: "text", text: body.input });
         idx++;
-        return { msgs, systemParts, preamble, customToolCallIds };
+        return { msgs, systemParts, preamble, customToolCallIds, droppedReasoning };
     }
-    for (const it of items) {
+    for (let i = 0; i < items.length; i++) {
+        const it = items[i];
         // Preserve opaque host-directive items verbatim. They are never
         // conversation history: capture them so the caller re-prepends them
-        // unchanged (additional_tools MUST stay at input[0]).
+        // unchanged (additional_tools MUST stay at input[0]). The one exception
+        // is `reasoning`: legacy behaviour re-sent every historical reasoning
+        // item every turn, which balloons context and breaks the upstream
+        // prompt-cache prefix. Trim to the most recent response's reasoning.
         if (isOpaqueItem(it)) {
+            if (it.type === "reasoning") {
+                if (reasoningKeep === "none") { droppedReasoning++; continue; }
+                if (reasoningKeep === "recent" && i <= lastExternalInputIdx) { droppedReasoning++; continue; }
+            }
             preamble.push(it);
             continue;
         }
@@ -257,7 +301,7 @@ export function responsesToCore(body: ResponsesRequestBody): Flat {
                 break;
         }
     }
-    return { msgs, systemParts, preamble, customToolCallIds };
+    return { msgs, systemParts, preamble, customToolCallIds, droppedReasoning };
 }
 
 export function coreToResponses(

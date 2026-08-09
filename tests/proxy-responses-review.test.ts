@@ -73,6 +73,68 @@ test("responses: unknown item type is preserved in preamble", () => {
     assert.equal(msgs.length, 1, "only the real message enters compression");
 });
 
+function runWithReasoningKeep(mode: string | undefined, body: unknown) {
+    const prev = process.env.ACP_REASONING_KEEP;
+    if (mode === undefined) delete process.env.ACP_REASONING_KEEP;
+    else process.env.ACP_REASONING_KEEP = mode;
+    try {
+        return responsesToCore(body as never);
+    } finally {
+        if (prev === undefined) delete process.env.ACP_REASONING_KEEP;
+        else process.env.ACP_REASONING_KEEP = prev;
+    }
+}
+
+// Agentic loop across three responses: reasoning from the two oldest responses
+// sits before the last tool output (old, completed); reasoning after the last
+// tool output belongs to the most recent response.
+const reasoningLoopBody = {
+    model: "o4-mini",
+    input: [
+        { type: "additional_tools", tools: [{ name: "shell" }] },
+        { type: "message", role: "user", content: "go" },
+        { type: "reasoning", id: "rs_old_1" },
+        { type: "reasoning", id: "rs_old_2" },
+        { type: "function_call", call_id: "c1", name: "f", arguments: "{}" },
+        { type: "function_call_output", call_id: "c1", output: "out" },
+        { type: "reasoning", id: "rs_new_1" },
+        { type: "reasoning", id: "rs_new_2" },
+    ],
+};
+const reasoningOf = (preamble: { type: string }[]) => preamble.filter((i) => i.type === "reasoning");
+
+test("responses: default (recent) trims old reasoning, keeps most recent response", () => {
+    const { preamble } = runWithReasoningKeep(undefined, reasoningLoopBody);
+    const reasoning = reasoningOf(preamble);
+    assert.equal(preamble.find((i) => i.type === "additional_tools")?.type, "additional_tools", "additional_tools always preserved");
+    assert.deepEqual(reasoning.map((r) => (r as { id: string }).id), ["rs_new_1", "rs_new_2"], "only reasoning after last external input survives");
+});
+
+test("responses: ACP_REASONING_KEEP=all preserves every reasoning item (legacy)", () => {
+    const { preamble } = runWithReasoningKeep("all", reasoningLoopBody);
+    const reasoning = reasoningOf(preamble);
+    assert.equal(reasoning.length, 4, "all four reasoning items preserved");
+});
+
+test("responses: ACP_REASONING_KEEP=none drops all reasoning items", () => {
+    const { preamble } = runWithReasoningKeep("none", reasoningLoopBody);
+    assert.equal(reasoningOf(preamble).length, 0, "no reasoning survives");
+    assert.ok(preamble.find((i) => i.type === "additional_tools"), "additional_tools still preserved in none mode");
+});
+
+test("responses: recent mode keeps reasoning when it is the only (most recent) response", () => {
+    const body = {
+        model: "o4-mini",
+        input: [
+            { type: "message", role: "user", content: "u" },
+            { type: "reasoning", id: "rs_only_1" },
+            { type: "reasoning", id: "rs_only_2" },
+        ],
+    };
+    const { preamble } = runWithReasoningKeep(undefined, body);
+    assert.equal(reasoningOf(preamble).length, 2, "reasoning after the only user message is the most recent response and is kept");
+});
+
 // Review #2: response.failed terminal is replayed verbatim and NOT followed by
 // a fabricated response.completed (which would contradict the failure).
 test("compressLoopResponsesStream: response.failed is replayed without a contradictory completed", async () => {
