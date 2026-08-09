@@ -949,8 +949,9 @@ async function forward(
                 const prompt = u.prompt_tokens ?? u.input_tokens;
                 if (typeof prompt === "number") {
                     prepared.session.stats.inputTokens += prompt;
-                    prepared.session.stats.lastInputTokens = prompt;
                     const cached = u.prompt_tokens_details?.cached_tokens ?? u.input_tokens_details?.cached_tokens ?? u.cache_read_input_tokens;
+                    // tokenCount = TOTAL context (new + cached); see anthropic branch.
+                    prepared.session.stats.lastInputTokens = prompt + (typeof cached === "number" ? cached : 0);
                     if (typeof cached === "number") {
                         prepared.session.stats.cachedTokens += cached;
                         prepared.session.stats.cacheSamples += 1;

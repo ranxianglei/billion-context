@@ -209,7 +209,14 @@ export async function* compressLoopAnthropicStream(
                 onCacheUsage: (input, cached) => {
                     if (typeof input === "number") {
                         ctx.session.stats.inputTokens += input;
-                        ctx.session.stats.lastInputTokens = input;
+                        // tokenCount drives the nudge decision: it must be the
+                        // TOTAL context size (new + cached), not just the new
+                        // billable input_tokens. Providers split the prompt into
+                        // input_tokens (new) + cache_read_input_tokens (cached);
+                        // only the SUM reflects how full the context window is.
+                        // Using only input_tokens makes a cached session look
+                        // tiny (e.g. 601 of a 40k context) and never compress.
+                        ctx.session.stats.lastInputTokens = input + (typeof cached === "number" ? cached : 0);
                         totalInputTokens += input;
                     }
                     if (typeof cached === "number") {

@@ -346,7 +346,8 @@ export async function* compressLoopStream(
                 // Record into the session for the web UI / stats: cumulative
                 // tokens + cache-hit ratio across all rounds seen so far.
                 ctx.session.stats.inputTokens += prompt;
-                ctx.session.stats.lastInputTokens = prompt;
+                // tokenCount = TOTAL context (new + cached); see anthropic branch.
+                ctx.session.stats.lastInputTokens = prompt + (typeof cached === "number" ? cached : 0);
                 if (typeof cached === "number") ctx.session.stats.cachedTokens += cached;
                 if (typeof out === "number") ctx.session.stats.outputTokens += out;
                 ctx.session.stats.cacheSamples += 1;
