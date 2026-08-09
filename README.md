@@ -167,6 +167,12 @@ non-model traffic.
 > so no other app is affected. Deleting the CA files and restarting the proxy
 > regenerates them.
 
+**Routing a login client through its own proxy (firewall/GFW).** A login
+client (ZCode) and an API-key client can both hit the same host
+(`open.bigmodel.cn`). To give the login client its OWN upstream proxy without
+affecting API-key clients, use the `mitm://` scheme key — see
+[Upstream proxy (MITM vs `/bili/`)](#upstream-proxy-firewall--gfw).
+
 ### Option B — Manual config file & context windows
 
 Open `~/.config/billion-context/billion-context.json` and edit the `providers`

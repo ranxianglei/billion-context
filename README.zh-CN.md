@@ -140,6 +140,8 @@ MITM 默认开启,且只对一份 **白名单**中的模型域名(`open.bigmodel
 > 客户端(通过 CA 路径设置,它会把该路径作为 `NODE_EXTRA_CA_CERTS` 喂给
 > Node)信任它,其他应用不受影响。删除 CA 文件并重启 proxy 会重新生成。
 
+**给登录客户端单独配代理(防火墙/GFW)。** 登录客户端(ZCode)和 API-key 客户端可能连同一个域名(`open.bigmodel.cn`)。要给登录客户端配**专属上游代理**而不影响 API-key 客户端,用 `mitm://` scheme 键 —— 见[上游代理(MITM 与 `/bili/`)](#上游代理防火墙gfw)。
+
 ### 方式 B 手动配置文件&设置上下文大小
 
 打开 `~/.config/billion-context/billion-context.json`,编辑 `providers` 块。
