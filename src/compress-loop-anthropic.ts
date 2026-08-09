@@ -113,10 +113,23 @@ function buildTextBlockSse(index: number, text: string): string {
 function buildTerminalSse(
     stopReason: string,
     outputTokens: number,
+    inputTokens: number,
+    cachedTokens: number,
     messageId: string | undefined,
     model: string | undefined,
 ): string {
-    const usage = { output_tokens: outputTokens };
+    // The synthetic message_delta must carry the FULL usage the upstream sent
+    // in ITS message_delta — not just output_tokens. Standard clients (ZCode,
+    // any Anthropic SDK) read input_tokens + cache_read_input_tokens from
+    // message_delta (GLM puts the real values there; message_start's are 0).
+    // If we emit only output_tokens, clients see input=0 and report a tiny
+    // context size. Forward the accumulated totals so the client's context
+    // meter reflects reality.
+    const usage = {
+        input_tokens: inputTokens,
+        output_tokens: outputTokens,
+        cache_read_input_tokens: cachedTokens,
+    };
     const extra: Record<string, unknown> = {};
     if (messageId) extra.id = messageId;
     if (model) extra.model = model;
@@ -169,11 +182,13 @@ export async function* compressLoopAnthropicStream(
         let messageId: string | undefined;
         let clientIndex = 0;
         let totalOutputTokens = 0;
+        let totalInputTokens = 0;
+        let totalCachedTokens = 0;
 
         for (let loopCount = 1; ; loopCount++) {
             if (loopCount > 10) {
                 ctx.log("[acp-proxy: anthropic compress loop limit (10) reached, finishing]");
-                yield Buffer.from(buildTerminalSse("end_turn", totalOutputTokens, messageId, model), "utf8");
+                yield Buffer.from(buildTerminalSse("end_turn", totalOutputTokens, totalInputTokens, totalCachedTokens, messageId, model), "utf8");
                 return;
             }
             const isFirstRound = loopCount === 1;
@@ -192,10 +207,14 @@ export async function* compressLoopAnthropicStream(
                 onMessageId: (id) => { if (!messageId) messageId = id; },
                 onStopReason: (r) => { roundStopReason = r; },
                 onCacheUsage: (input, cached) => {
-                    if (typeof input === "number") ctx.session.stats.inputTokens += input;
+                    if (typeof input === "number") {
+                        ctx.session.stats.inputTokens += input;
+                        totalInputTokens += input;
+                    }
                     if (typeof cached === "number") {
                         ctx.session.stats.cachedTokens += cached;
                         ctx.session.stats.cacheSamples += 1;
+                        totalCachedTokens += cached;
                     }
                 },
             };
@@ -238,7 +257,7 @@ export async function* compressLoopAnthropicStream(
 
             if (!hasOnlyProxy) {
                 const stop = hasRealToolUse ? "tool_use" : (roundStopReason ?? "end_turn");
-                yield Buffer.from(buildTerminalSse(stop, totalOutputTokens, messageId, model), "utf8");
+                yield Buffer.from(buildTerminalSse(stop, totalOutputTokens, totalInputTokens, totalCachedTokens, messageId, model), "utf8");
                 return;
             }
 
@@ -280,7 +299,7 @@ export async function* compressLoopAnthropicStream(
                 const errText = await resp.text().catch(() => "upstream error");
                 ctx.log(`[acp-proxy: anthropic compress loop upstream error ${resp.status}: ${errText.slice(0, 200)}]`);
                 yield Buffer.from(buildTextBlockSse(clientIndex, `\n[acp-proxy: upstream error ${resp.status}: ${errText.slice(0, 200)}]\n`), "utf8");
-                yield Buffer.from(buildTerminalSse("end_turn", totalOutputTokens, messageId, model), "utf8");
+                yield Buffer.from(buildTerminalSse("end_turn", totalOutputTokens, totalInputTokens, totalCachedTokens, messageId, model), "utf8");
                 return;
             }
 
