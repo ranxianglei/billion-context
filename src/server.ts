@@ -59,17 +59,18 @@ const UPSTREAM_HOP_HEADERS = new Set([
 ]);
 
 export function resolveUpstream(opts: ProxyOptions, reqUrl: string): { upstream: string; rewrittenUrl: string; provider: string } | undefined {
-    // Zero-config mode: a request like `/p/https://open.bigmodel.cn/api/anthropic`
-    // embeds the full upstream URL after the `/p/` prefix. Strip the prefix,
+    // Zero-config mode: a request like `/bili/https://open.bigmodel.cn/api/anthropic`
+    // embeds the full upstream URL after the `/bili/` prefix. Strip the prefix,
     // take the rest verbatim as the upstream. This lets users route without any
     // config file at all — they just prefix their client's baseURL with the
-    // proxy origin + `/p/`. The provider name returned is "p" so stats/labels
-    // can tell zero-config requests apart from named-config ones.
-    if (reqUrl.startsWith("/p/http://") || reqUrl.startsWith("/p/https://")) {
-        const full = reqUrl.slice(3); // drop "/p/"
+    // proxy origin + `/bili/`. The `/bili/` prefix doubles as a signal: client-side
+    // billion-context extensions (billion-context-pi / opencode-acp) can detect it
+    // in their own baseUrl and self-disable, avoiding double compression.
+    if (reqUrl.startsWith("/bili/http://") || reqUrl.startsWith("/bili/https://")) {
+        const full = reqUrl.slice(6); // drop "/bili/"
         try {
             const u = new URL(full);
-            return { upstream: `${u.protocol}//${u.host}`, rewrittenUrl: full, provider: "p" };
+            return { upstream: `${u.protocol}//${u.host}`, rewrittenUrl: full, provider: "bili" };
         } catch {
             // malformed embedded URL — fall through to named matching, which will miss
         }
@@ -146,7 +147,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                           .join(", ")}`
                     : ` → ${opts.upstream}`) +
                 ` — web UI: http://${displayHost}:${opts.port}/__acp/` +
-                ` — zero-config: prefix any baseURL with http://${displayHost}:${opts.port}/p/`,
+                ` — zero-config: prefix any baseURL with http://${displayHost}:${opts.port}/bili/`,
         );
     });
     // Listen errors (EADDRINUSE port taken, EACCES privileged port, EAFNOSUPPORT
@@ -306,9 +307,9 @@ async function handle(
         const model = (parsed as { model?: string }).model;
         if (model) {
             let limit = resolveContextLimit(opts.routes, route?.provider, model);
-            // Zero-config routes (provider "p") have no per-model config; try the
+            // Zero-config routes (provider "bili") have no per-model config; try the
             // models.dev registry as a middle layer before the prefix table / default.
-            if (!limit && route?.provider === "p" && route.upstream) {
+            if (!limit && route?.provider === "bili" && route.upstream) {
                 const host = (() => { try { return new URL(route.upstream).host; } catch { return undefined; } })();
                 limit = await contextFromRegistry(model, host) ?? undefined;
             }
@@ -692,7 +693,7 @@ async function forward(
     // Show the final proxied URL (where the request actually lands) as the
     // primary signal. The provider label is appended only for named routes —
     // zero-config (/p/) requests have no meaningful name, so we omit it.
-    log("info", `forward ${req.method} → ${upstreamUrl}${route && route.provider !== "p" ? `  [${route.provider}]` : ""}`);
+    log("info", `forward ${req.method} → ${upstreamUrl}${route && route.provider !== "bili" ? `  [${route.provider}]` : ""}`);
     if (process.env.ACP_DEBUG && prepared) {
         const sid = prepared.session.id;
         const hdrKeys = Object.keys(req.headers);

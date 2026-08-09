@@ -45,7 +45,7 @@ This installs the `bili` command (`bili-proxy` is kept as an alias).
 Two ways to use it — pick one:
 
 - **Zero-config (simplest):** prefix your client's baseURL with the proxy
-  origin + `/p/`. No config file needed — context windows are auto-detected
+  origin + `/bili/`. No config file needed — context windows are auto-detected
   from the [models.dev](https://models.dev) registry.
 - **Named providers:** declare providers in a config file, then use shorter
   `http://localhost:8787/<name>/...` URLs. Better when you manage several
@@ -54,7 +54,7 @@ Two ways to use it — pick one:
 Compression is injected automatically — you only configure routing, never
 compression itself.
 
-### Option A — Zero-config (`/p/` prefix)
+### Option A — Zero-config (`/bili/` prefix)
 
 Start the proxy:
 
@@ -62,13 +62,13 @@ Start the proxy:
 bili
 ```
 
-Then just prefix your client's existing baseURL with `http://localhost:8787/p/`.
+Then just prefix your client's existing baseURL with `http://localhost:8787/bili/`.
 The full upstream URL is embedded in the path, so the proxy knows where to
 forward without any config:
 
 ```
 client baseURL before:  https://api.openai.com/v1
-client baseURL after:   http://localhost:8787/p/https://api.openai.com/v1
+client baseURL after:   http://localhost:8787/bili/https://api.openai.com/v1
 ```
 
 That's it — put your real API key in the client config as usual (the proxy
@@ -82,8 +82,8 @@ automatically.
 ```jsonc
 // before:
 "baseURL": "https://open.bigmodel.cn/api/coding/paas/v4"
-// after (just prepend the proxy origin + /p/):
-"baseURL": "http://localhost:8787/p/https://open.bigmodel.cn/api/coding/paas/v4"
+// after (just prepend the proxy origin + /bili/):
+"baseURL": "http://localhost:8787/bili/https://open.bigmodel.cn/api/coding/paas/v4"
 ```
 
 **Codex** — edit `~/.codex/config.toml`, change the provider's `base_url`:
@@ -91,7 +91,7 @@ automatically.
 # before:
 base_url = "https://api.openai.com/v1"
 # after:
-base_url = "http://localhost:8787/p/https://api.openai.com/v1"
+base_url = "http://localhost:8787/bili/https://api.openai.com/v1"
 ```
 
 **Pi** — edit `~/.pi/agent/models.json`, change the provider's `baseUrl`:
@@ -99,11 +99,11 @@ base_url = "http://localhost:8787/p/https://api.openai.com/v1"
 // before:
 "baseUrl": "https://api.anthropic.com"
 // after:
-"baseUrl": "http://localhost:8787/p/https://api.anthropic.com"
+"baseUrl": "http://localhost:8787/bili/https://api.anthropic.com"
 ```
 
 **Other clients (Cursor / Aider / Continue …)** — wherever the upstream URL is
-configured, prepend `http://localhost:8787/p/` to it. Nothing else changes.
+configured, prepend `http://localhost:8787/bili/` to it. Nothing else changes.
 
 ### Option B — Named providers (config file)
 

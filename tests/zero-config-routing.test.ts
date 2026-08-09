@@ -18,32 +18,32 @@ const BASE_OPTS: ProxyOptions = {
     autoUpdate: false,
 };
 
-test("zero-config /p/ route: strips prefix, uses embedded URL verbatim", () => {
-    const r = resolveUpstream(BASE_OPTS, "/p/https://open.bigmodel.cn/api/anthropic/v1/messages");
+test("zero-config /bili/ route: strips prefix, uses embedded URL verbatim", () => {
+    const r = resolveUpstream(BASE_OPTS, "/bili/https://open.bigmodel.cn/api/anthropic/v1/messages");
     assert.ok(r, "should resolve");
-    assert.equal(r!.provider, "p");
+    assert.equal(r!.provider, "bili");
     assert.equal(r!.rewrittenUrl, "https://open.bigmodel.cn/api/anthropic/v1/messages");
     assert.equal(r!.upstream, "https://open.bigmodel.cn");
 });
 
-test("zero-config /p/ route: works with trailing path segments", () => {
-    const r = resolveUpstream(BASE_OPTS, "/p/https://api.openai.com/v1/chat/completions");
+test("zero-config /bili/ route: works with trailing path segments", () => {
+    const r = resolveUpstream(BASE_OPTS, "/bili/https://api.openai.com/v1/chat/completions");
     assert.ok(r);
     assert.equal(r!.rewrittenUrl, "https://api.openai.com/v1/chat/completions");
     assert.equal(r!.upstream, "https://api.openai.com");
 });
 
-test("zero-config /p/ takes precedence over named route (no name shadowing)", () => {
-    // A provider literally named 'p' must not shadow the zero-config prefix.
-    const opts: ProxyOptions = { ...BASE_OPTS, routes: { p: { url: "https://example.com" } } };
-    const r = resolveUpstream(opts, "/p/https://api.openai.com/v1/responses");
+test("zero-config /bili/ takes precedence over named route (no name shadowing)", () => {
+    // A provider literally named 'bili' must not shadow the zero-config prefix.
+    const opts: ProxyOptions = { ...BASE_OPTS, routes: { bili: { url: "https://example.com" } } };
+    const r = resolveUpstream(opts, "/bili/https://api.openai.com/v1/responses");
     assert.ok(r);
-    assert.equal(r!.provider, "p");
+    assert.equal(r!.provider, "bili");
     assert.equal(r!.rewrittenUrl, "https://api.openai.com/v1/responses");
 });
 
-test("zero-config /p/ ignores malformed embedded URL, falls through", () => {
-    const r = resolveUpstream(BASE_OPTS, "/p/not-a-url");
+test("zero-config /bili/ ignores malformed embedded URL, falls through", () => {
+    const r = resolveUpstream(BASE_OPTS, "/bili/not-a-url");
     // falls through to named matching, which misses → undefined
     assert.equal(r, undefined);
 });
