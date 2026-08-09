@@ -311,6 +311,18 @@ async function handle(
     // Strip query string before matching path suffixes: a request like
     // `/v1/responses?foo=1` must still be detected as the responses protocol.
     const urlPath = url.split("?", 2)[0];
+    // count_tokens (Anthropic /v1/messages/count_tokens) is routed through the
+    // anthropic session path so the proxy can apply the SAME compression it
+    // would forward on the next /v1/messages turn — the relay then returns the
+    // compressed-context token count. CC sizes its own autocompact window off
+    // this count, so reporting the post-compression count keeps CC from ever
+    // tripping autocompact (zero task drift). ACP_COUNT_TOKENS_PASSTHROUGH=1
+    // restores the old "forward unchanged" behavior.
+    const countTokens =
+        req.method === "POST" &&
+        bodyBuffer.length > 0 &&
+        process.env.ACP_COUNT_TOKENS_PASSTHROUGH !== "1" &&
+        (urlPath.endsWith("/v1/messages/count_tokens") || urlPath.endsWith("/messages/count_tokens"));
     const protocol: "anthropic" | "openai" | "responses" | null =
         req.method === "POST" && bodyBuffer.length > 0
             ? urlPath.endsWith("/chat/completions")
@@ -319,7 +331,9 @@ async function handle(
                   ? "anthropic"
                   : urlPath.endsWith("/responses")
                     ? "responses"
-                    : null
+                    : countTokens
+                      ? "anthropic"
+                      : null
             : null;
     // Resolve the upstream route once here so both the session id (needs the
     // upstream ORIGIN for cross-provider isolation) and forward() (needs the
@@ -394,12 +408,13 @@ async function handle(
         // (stream rewriter mutates state via compress/decompress) must not
         // interleave across concurrent requests on the same session.
         await withSessionLock(session, async () => {
-            prepared =
-                protocol === "anthropic"
-                    ? prepareAnthropic(parsed as AnthropicRequestBody, req, opts, core, reqConfig, log, session)
-                    : protocol === "openai"
-                      ? prepareOpenai(parsed as OpenAIRequestBody, req, opts, core, reqConfig, log, session)
-                      : prepareResponses(parsed as ResponsesRequestBody, req, opts, core, reqConfig, log, session);
+            prepared = countTokens
+                ? prepareCountTokens(parsed as AnthropicRequestBody, core, reqConfig, log, session)
+                : protocol === "anthropic"
+                  ? prepareAnthropic(parsed as AnthropicRequestBody, req, opts, core, reqConfig, log, session)
+                  : protocol === "openai"
+                    ? prepareOpenai(parsed as OpenAIRequestBody, req, opts, core, reqConfig, log, session)
+                    : prepareResponses(parsed as ResponsesRequestBody, req, opts, core, reqConfig, log, session);
             acquireInFlight(session);
             try {
                 await forward(req, res, opts, prepared!.body, prepared!, core, reqConfig, log, route, affinity);
@@ -442,6 +457,47 @@ function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; cont
     const ref = b["growthReference"] ?? 0;
     const inject = n.shouldInject ? `INJECT T${n.tier ?? "?"}` : "idle";
     return `[${sessionId}] nudge ${inject}: usage=${pct} (${tokenCount}/${limit}), growth=${growth}/${floor} (ref=${ref}, interval=${interval}), pendingT1=${pendingT1}/${interval}, reason="${n.reason.slice(0, 120)}"`;
+}
+
+export function prepareCountTokens(
+    parsed: AnthropicRequestBody,
+    core: CompressionCore,
+    config: Config,
+    log: (level: string, msg: string) => void,
+    session: Session,
+): Prepared {
+    const sessionId = session.id;
+    try {
+        const { msgs, cacheControls } = anthropicToCore(parsed);
+        // READ-ONLY: run the same processTurn as prepareAnthropic to mirror
+        // exactly what the next /v1/messages forwards (covered messages pruned,
+        // summaries injected, refs tagged), but DISCARD the returned state —
+        // count_tokens is a query and must not mutate session state or nudge.
+        // Verified: processTurn does not mutate the input state object.
+        const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount: session.stats.lastInputTokens, renderTags: "text-only" });
+        const rebuiltMessages = coreToAnthropic(turn.messages as BiliMessage[], cacheControls);
+        log("info", `[${sessionId}] count_tokens pruned: ${msgs.length} → ${turn.messages.length} msgs`);
+        return {
+            body: JSON.stringify({ ...parsed, messages: rebuiltMessages }),
+            session,
+            processedMessages: [],
+            originalMessages: msgs,
+            protocol: "anthropic",
+            stream: false,
+            compressInjected: false,
+        } as Prepared;
+    } catch (err) {
+        log("warn", `[${sessionId}] count_tokens prune failed, forwarding unchanged: ${String(err)}`);
+        return {
+            body: JSON.stringify(parsed),
+            session,
+            processedMessages: [],
+            originalMessages: [],
+            protocol: "anthropic",
+            stream: false,
+            compressInjected: false,
+        } as Prepared;
+    }
 }
 
 function prepareAnthropic(
