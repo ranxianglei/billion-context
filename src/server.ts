@@ -429,7 +429,12 @@ function prepareAnthropic(
 
     try {
         const { msgs, cacheControls } = anthropicToCore(parsed);
-        const tokenCount = estimateTokensFast(msgs.map((m) => m.text ?? "").join("\n"));
+        // contextTokens must include the system prompt: ZCode (and other IDE
+        // clients) put huge workspace-reminder blocks in body.system, not in
+        // messages. Without counting it, tokenCount grossly underestimates real
+        // context size → nudge never fires → never compresses even at 1.7M tokens.
+        const sysText = extractSystem(parsed.system);
+        const tokenCount = estimateTokensFast(msgs.map((m) => m.text ?? "").join("\n") + "\n" + sysText);
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
         session.stats.contextTokens = tokenCount;
@@ -497,6 +502,10 @@ function prepareOpenai(
 
     try {
         const { msgs } = openaiToCore(parsed);
+        // openaiToCore already includes system/developer messages in `msgs`
+        // (they are mapped to CoreMessage with role:"system"), so tokenCount
+        // already covers the system prompt. No separate system-text accounting
+        // needed here.
         const tokenCount = estimateTokensFast(msgs.map((m) => m.text ?? "").join("\n"));
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
@@ -567,7 +576,13 @@ function prepareResponses(
         if (process.env.ACP_DEBUG) {
             log("info", `[${sessionId}] input items: ${Array.isArray(parsed.input) ? parsed.input.map((i: ResponseInputItem) => i.type).join(",") : "(string)"}`);
         }
-        const tokenCount = estimateTokensFast(msgs.map((m) => m.text ?? "").join("\n"));
+        // contextTokens must include the system prompt: Codex puts a large
+        // `instructions` field (system-level prompt) in the request, and other
+        // system/developer items are collected into systemParts by
+        // responsesToCore but NOT included in `msgs`. Count them separately so
+        // tokenCount reflects the real context size and nudge can fire.
+        const sysText = systemParts.join("\n\n");
+        const tokenCount = estimateTokensFast(msgs.map((m) => m.text ?? "").join("\n") + "\n" + sysText);
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" });
         session.state = turn.state;
         session.stats.contextTokens = tokenCount;
