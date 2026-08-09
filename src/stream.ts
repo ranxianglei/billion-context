@@ -27,6 +27,7 @@ export async function* rewriteSseStream(
     const blocks = new Map<number, BlockState>();
     let convertedAny = false;
     let sawRealToolUse = false;
+    let capturedUsage: Record<string, unknown> | undefined;
     let output = "";
 
     const flush = (): Buffer => {
@@ -47,14 +48,14 @@ export async function* rewriteSseStream(
                 buf = buf.slice(idx + 2);
                 const ev = parseSseEvent(rawEvent);
                 if (!ev) continue;
-                const routed = routeEvent(ev, blocks, ctx, (c) => (convertedAny = c || convertedAny), () => (sawRealToolUse = true), () => convertedAny);
+                const routed = routeEvent(ev, blocks, ctx, (c) => (convertedAny = c || convertedAny), () => (sawRealToolUse = true), () => convertedAny, (u) => (capturedUsage = u));
                 if (routed === NOOP) continue;
                 output += routed;
                 if (output.length >= 8192) yield flush();
             }
         }
         if (convertedAny) {
-            const finalDelta = buildStopReasonRewrite(sawRealToolUse);
+            const finalDelta = buildStopReasonRewrite(sawRealToolUse, capturedUsage);
             if (finalDelta) output += finalDelta;
         }
         if (buf) {
@@ -74,6 +75,7 @@ function routeEvent(
     markConverted: (v: boolean) => void,
     markRealToolUse: () => void,
     getConverted: () => boolean,
+    setUsage: (u: Record<string, unknown>) => void,
 ): string | typeof NOOP {
     const d = ev.data;
     if (!d || typeof d !== "object") return emitEvent(ev);
@@ -120,9 +122,15 @@ function routeEvent(
     // — but ONLY on the non-converted path (when we replaced the response with
     // a compress note, the upstream usage is not the real completion).
     if (t === "message_delta") {
-        if (!getConverted()) {
-            const u = (d as { usage?: Record<string, unknown> }).usage;
-            if (u) {
+        // Capture upstream usage on BOTH paths: when not converted we need it
+        // for stats; when converted (tool_use replaced by text) the upstream
+        // message_delta is suppressed (NOOP below) but we still need its usage
+        // to emit a well-formed synthetic message_delta — ZCode's Zod schema
+        // requires usage.output_tokens:number, so hardcoding {} fails.
+        const u = (d as { usage?: Record<string, unknown> }).usage;
+        if (u) {
+            setUsage(u);
+            if (!getConverted()) {
                 const out = u.output_tokens;
                 if (typeof out === "number") ctx.session.stats.outputTokens += out;
             }
@@ -261,11 +269,15 @@ export function applyRanges(ranges: ReturnType<typeof parseCompressInput>, ctx: 
     }
 }
 
-function buildStopReasonRewrite(sawRealToolUse: boolean): string {
+function buildStopReasonRewrite(sawRealToolUse: boolean, usage?: Record<string, unknown>): string {
     const stop_reason = sawRealToolUse ? "tool_use" : "end_turn";
+    // Preserve upstream usage (output_tokens etc.). Default output_tokens:0 so
+    // strict clients (ZCode Zod) that require output_tokens:number still pass
+    // even if the upstream omitted it.
+    const u = { output_tokens: 0, ...(usage ?? {}) };
     return (
         `event: message_delta\n` +
-        `data: ${JSON.stringify({ type: "message_delta", delta: { stop_reason }, usage: {} })}\n\n` +
+        `data: ${JSON.stringify({ type: "message_delta", delta: { stop_reason }, usage: u })}\n\n` +
         `event: message_stop\n` +
         `data: ${JSON.stringify({ type: "message_stop" })}\n\n`
     );
