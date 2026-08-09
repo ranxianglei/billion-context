@@ -76,27 +76,22 @@ type Flat = {
     droppedReasoning: number;
 };
 
-/** Item types that are opaque host directives (tool definitions, computer
- *  calls, ...) and must be preserved verbatim — they are NOT conversation
- *  history and must never be compressed or rewritten. `additional_tools` in
- *  particular carries the Codex code_mode exec/wait tool definitions and MUST
- *  stay at input[0] (see openai/codex client.rs splice(0..0, prefix)).
+/** Item types that are host DIRECTIVES (tool/definition listings), not
+ *  conversation history: preserved verbatim and re-prepended at input[0..].
+ *  `additional_tools` carries the Codex code_mode exec/wait tool definitions
+ *  and MUST stay at input[0] (see openai/codex client.rs splice(0..0, prefix)).
+ *  `mcp_list_tools` is a stable per-session tool listing.
  *
- *  `reasoning` is intentionally NOT opaque: it IS conversation history (a
- *  prior response's chain-of-thought) and is converted to a tracked
- *  BiliMessage so the compression pipeline hides it once its turn is
- *  summarized — preventing the unbounded accumulation that broke Codex's
- *  prompt-cache prefix. See the `reasoning` case in responsesToCore. */
+ *  Only definitions belong here. Output/action items from a prior response
+ *  (reasoning, computer_call, function_call, mcp_call, ...) ARE conversation
+ *  history and are routed as tracked BiliMessages via pushVerbatimItem /
+ *  the message/function cases, so the compression pipeline hides them once
+ *  their turn is summarized — preserving them verbatim in the preamble instead
+ *  made them accumulate unbounded every turn and broke Codex's prompt-cache
+ *  prefix. */
 const OPAQUE_ITEM_TYPES = new Set([
     "additional_tools",
-    "computer_call",
-    "computer_call_output",
-    "file_search_call",
-    "web_search_call",
-    "image_generation_call",
-    "code_interpreter_call",
     "mcp_list_tools",
-    "mcp_call",
 ]);
 
 function isOpaqueItem(it: ResponseInputItem): boolean {
@@ -109,6 +104,36 @@ function isOpaqueItem(it: ResponseInputItem): boolean {
  *  continuity for the responses that are still live. */
 function shouldDropAllReasoning(): boolean {
     return (process.env.ACP_REASONING_KEEP ?? "").trim().toLowerCase() === "none";
+}
+
+/** Route an opaque Responses output item — reasoning, or a tool-call-shaped
+ *  action item (computer_call / file_search_call / mcp_call / ...) — through
+ *  the compression pipeline so it is hidden once its turn is summarized. The
+ *  item's own structure is opaque to us, so we carry it verbatim in
+ *  rawResponsesItem and re-emit it unchanged via coreToResponses while the turn
+ *  is still live. `kind` only namespaces the derived id (so reasoning and call
+ *  items never collide). contentType "reasoning" is the only safe bucket: the
+ *  kernel filters/pairs tool-call & tool-result by toolCallId and injects ACP
+ *  tags into text, while reasoning items pass through untouched (no tag, no
+ *  filtering) and are still covered by compression blocks. */
+function pushVerbatimItem(
+    msgs: BiliMessage[],
+    clusters: ClusterCounter,
+    it: ResponseInputItem,
+    kind: string,
+): void {
+    const rawId =
+        typeof (it as { id?: unknown }).id === "string"
+            ? String((it as { id?: string }).id)
+            : hashId(JSON.stringify(it));
+    const base = deriveMessageId("assistant", kind, rawId);
+    msgs.push({
+        id: clusters.next(base),
+        role: "assistant",
+        contentType: "reasoning",
+        text: rawId,
+        rawResponsesItem: it,
+    });
 }
 
 function partText(p: ResponseContentPart): string {
@@ -168,30 +193,27 @@ export function responsesToCore(body: ResponsesRequestBody): Flat {
         }
         switch (it.type) {
             case "reasoning": {
-                // Route reasoning through the compression pipeline (like
-                // Anthropic thinking) so it is hidden once its turn is
-                // summarized — NOT preserved verbatim in the preamble, which
-                // caused unbounded accumulation and broke the prompt-cache
-                // prefix. encrypted_content is opaque to us, so we carry the
-                // raw item in rawResponsesItem and re-emit it verbatim while
-                // the turn is still live. The `text` is only a stable identity
-                // for ref-id derivation (the reasoning item's own id).
                 if (shouldDropAllReasoning()) {
                     droppedReasoning++;
                     break;
                 }
-                const rid =
-                    typeof (it as { id?: unknown }).id === "string"
-                        ? String((it as { id?: string }).id)
-                        : hashId(JSON.stringify(it));
-                const base = deriveMessageId("assistant", "reasoning", rid);
-                msgs.push({
-                    id: clusters.next(base),
-                    role: "assistant",
-                    contentType: "reasoning",
-                    text: rid,
-                    rawResponsesItem: it,
-                });
+                pushVerbatimItem(msgs, clusters, it, "reasoning");
+                idx++;
+                break;
+            }
+            // Prior-response action items whose structure is opaque to us.
+            // Routed through compression (same mechanism as reasoning) instead
+            // of being pinned in the preamble, which made them pile up every
+            // turn and break the prompt-cache prefix. Re-emitted verbatim via
+            // rawResponsesItem while their turn is live.
+            case "computer_call":
+            case "computer_call_output":
+            case "file_search_call":
+            case "web_search_call":
+            case "image_generation_call":
+            case "code_interpreter_call":
+            case "mcp_call": {
+                pushVerbatimItem(msgs, clusters, it, "responses-call");
                 idx++;
                 break;
             }
@@ -345,10 +367,11 @@ export function coreToResponses(
                     });
                 }
             } else if (m.contentType === "reasoning") {
-                // Re-emit the carried raw reasoning item verbatim (with its
-                // encrypted_content). Only reached for reasoning whose turn has
-                // NOT been compressed — compressed reasoning is hidden by the
-                // kernel and never gets here.
+                // Re-emit the carried raw item verbatim (reasoning's
+                // encrypted_content, or an opaque call item like
+                // computer_call / mcp_call). Only reached for items whose turn
+                // has NOT been compressed — compressed items are hidden by the
+                // kernel and never get here.
                 if (m.rawResponsesItem) {
                     out.push(m.rawResponsesItem as ResponseInputItem);
                 }
