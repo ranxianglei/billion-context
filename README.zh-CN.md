@@ -108,13 +108,13 @@ bili
 
 它监听 `http://127.0.0.1:8787`。保持这个终端开着(或后台运行,见[运行代理](#运行代理))。
 
-点击 [http://localhost:8787/__acp/](http://localhost:8787/__acp/) 添加你的模型:
+点击 [http://localhost:8787/__bili/](http://localhost:8787/__bili/) 添加你的模型:
 <img width="2908" height="1787" alt="image" src="https://github.com/user-attachments/assets/cacf4b64-e5c6-41f2-b270-fd2be02eab0c" />
 
 首次运行时 `bili` 会**自动创建一个空配置文件**并告诉你路径,你不必凭空编 schema。启动横幅也会打印网页地址:
 
 ```
-acp-proxy listening on http://localhost:8787 — web UI: http://localhost:8787/__acp/
+acp-proxy listening on http://localhost:8787 — web UI: http://localhost:8787/__bili/
 ```
 
 ### 路由怎么工作
@@ -151,7 +151,7 @@ acp-proxy listening on http://localhost:8787 — web UI: http://localhost:8787/_
 Save + Apply 之后,启动横幅会反映出来:
 
 ```
-acp-proxy listening on http://localhost:8787 — web UI: http://localhost:8787/__acp/ — context overrides for 2 upstream URL(s)
+acp-proxy listening on http://localhost:8787 — web UI: http://localhost:8787/__bili/ — context overrides for 2 upstream URL(s)
 ```
 
 ### 第 3 步 —— 把客户端指向代理
@@ -217,7 +217,7 @@ base_url = "http://localhost:8787/bili/https://open.bigmodel.cn/api/coding/paas/
 
 ### 网页配置
 
-代理跑着的时候,在浏览器打开 `http://localhost:8787/__acp/`。你可以:
+代理跑着的时候,在浏览器打开 `http://localhost:8787/__bili/`。你可以:
 
 - **编辑 providers** —— 用表单增删 provider 和按模型的 context 窗口,点 Save 直接写入 `billion-context.json`。
 - **生成客户端 URL** —— 选一个上游 URL,得到可直接复制的配置片段(Pi / OpenCode / Codex 的 `baseUrl`/`baseURL`/`base_url` 一行,已填好代理地址 + `/bili/` + URL)。
@@ -257,11 +257,11 @@ URL 声明按模型的 context 窗口:
 
 ```bash
 # 健康检查(代理是否在跑 + 转发到哪)
-curl -s http://localhost:8787/__acp/health
+curl -s http://localhost:8787/__bili/health
 # → {"ok":true,"upstream":"https://api.anthropic.com"}
 
 # 实时会话统计(发过真实请求后)
-curl -s http://localhost:8787/__acp/stats
+curl -s http://localhost:8787/__bili/stats
 ```
 
 然后从助手发一条消息,观察日志(`~/.local/state/billion-context/bili.log`,

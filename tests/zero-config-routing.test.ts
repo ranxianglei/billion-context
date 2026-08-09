@@ -38,7 +38,7 @@ test("zero-config /bili/ ignores malformed embedded URL", () => {
 
 test("non-/bili/ requests return undefined (no named routing anymore)", () => {
     // The old /<name>/... named-routing is gone. Anything without /bili/ is
-    // either a control endpoint (__acp) handled elsewhere, or unrouteable.
+    // either a control endpoint (__bili) handled elsewhere, or unrouteable.
     assert.equal(resolveUpstream(BASE_OPTS, "/zhipu/api/coding/paas/v4/chat/completions"), undefined);
     assert.equal(resolveUpstream(BASE_OPTS, "/v1/chat/completions"), undefined);
     assert.equal(resolveUpstream(BASE_OPTS, "/anthropic/v1/messages"), undefined);

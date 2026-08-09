@@ -127,7 +127,7 @@ bili
 It listens on `http://127.0.0.1:8787`. Keep this terminal open (or run in the
 background; see [Running the proxy](#running-the-proxy)).
 
-Click [http://localhost:8787/__acp/](http://localhost:8787/__acp/) to add your models:
+Click [http://localhost:8787/__bili/](http://localhost:8787/__bili/) to add your models:
 <img width="2908" height="1787" alt="image" src="https://github.com/user-attachments/assets/cacf4b64-e5c6-41f2-b270-fd2be02eab0c" />
 
 On first run `bili` **auto-creates an empty config file** and tells you where,
@@ -135,7 +135,7 @@ so you don't have to invent the schema from scratch. The startup banner prints
 the web UI URL too:
 
 ```
-acp-proxy listening on http://localhost:8787 — web UI: http://localhost:8787/__acp/
+acp-proxy listening on http://localhost:8787 — web UI: http://localhost:8787/__bili/
 ```
 
 ### How routing works
@@ -183,7 +183,7 @@ Full schema is in [Configuration](#configuration).
 After Save + Apply the startup banner reflects it:
 
 ```
-acp-proxy listening on http://localhost:8787 — web UI: http://localhost:8787/__acp/ — context overrides for 2 upstream URL(s)
+acp-proxy listening on http://localhost:8787 — web UI: http://localhost:8787/__bili/ — context overrides for 2 upstream URL(s)
 ```
 
 ### Step 3 — Point your client at the proxy
@@ -255,7 +255,7 @@ different protocol or a non-standard auth header won't work yet.
 
 ### Web UI
 
-Open `http://localhost:8787/__acp/` in a browser while the proxy is running. You can:
+Open `http://localhost:8787/__bili/` in a browser while the proxy is running. You can:
 
 - **Edit providers** in a form (add/remove providers and per-model context windows) and save — this writes to `billion-context.json` directly.
 - **Generate client URLs** — pick an upstream URL, get ready-to-copy config snippets for Pi / OpenCode / Codex (the `baseUrl`/`baseURL`/`base_url` line with the proxy origin + `/bili/` + the URL filled in).
@@ -305,11 +305,11 @@ first real request shows compression activity in the log:
 
 ```bash
 # Health check (proxy up + where it forwards)
-curl -s http://localhost:8787/__acp/health
+curl -s http://localhost:8787/__bili/health
 # → {"ok":true,"upstream":"https://api.anthropic.com"}
 
 # Live session stats (after a real request)
-curl -s http://localhost:8787/__acp/stats
+curl -s http://localhost:8787/__bili/stats
 ```
 
 Then send one message from your client and watch the log

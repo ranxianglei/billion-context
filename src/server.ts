@@ -118,7 +118,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         log(
             "info",
             `acp-proxy listening on http://${displayHost}:${opts.port}` +
-                ` — web UI: http://${displayHost}:${opts.port}/__acp/` +
+                ` — web UI: http://${displayHost}:${opts.port}/__bili/` +
                 ` — zero-config: prefix any baseURL with http://${displayHost}:${opts.port}/bili/` +
                 (nOverrides ? ` — context overrides for ${nOverrides} upstream URL(s)` : ""),
         );
@@ -209,22 +209,22 @@ async function handle(
     config: Config,
     log: (level: string, msg: string) => void,
 ): Promise<void> {
-    if (req.method === "GET" && req.url === "/__acp/stats") return sendStats(res);
-    if (req.method === "GET" && (req.url === "/" || req.url === "/__acp/health")) {
+    if (req.method === "GET" && req.url === "/__bili/stats") return sendStats(res);
+    if (req.method === "GET" && (req.url === "/" || req.url === "/__bili/health")) {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: true, upstream: opts.upstream }));
         return;
     }
     // Web config UI (served as HTML, separate from the JSON health check above).
-    if (req.method === "GET" && req.url === "/__acp/") {
+    if (req.method === "GET" && req.url === "/__bili/") {
         const origin = `http://${opts.host === "0.0.0.0" ? "localhost" : opts.host}:${opts.port}`;
         res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
         res.end(renderUI(origin));
         return;
     }
-    if (req.method === "GET" && req.url === "/__acp/config") return handleConfigGet(res);
-    if (req.method === "PUT" && req.url === "/__acp/config") return handleConfigPut(req, res);
-    if (req.method === "POST" && req.url === "/__acp/config/reload") return handleConfigReload(opts, res, log);
+    if (req.method === "GET" && req.url === "/__bili/config") return handleConfigGet(res);
+    if (req.method === "PUT" && req.url === "/__bili/config") return handleConfigPut(req, res);
+    if (req.method === "POST" && req.url === "/__bili/config/reload") return handleConfigReload(opts, res, log);
     let bodyBuffer: Buffer;
     try {
         bodyBuffer = await readBody(req);

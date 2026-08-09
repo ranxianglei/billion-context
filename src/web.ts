@@ -299,7 +299,7 @@ function showTab(name) {
 // ── load ──
 async function load() {
   try {
-    var r = await fetch("/__acp/config");
+    var r = await fetch("/__bili/config");
     var d = await r.json();
     providers = entries(d.providers);
     savedProviders = JSON.stringify(providers);
@@ -381,7 +381,7 @@ async function applyProviders() {
     return;
   }
   try {
-    var r = await fetch("/__acp/config/reload", { method: "POST" });
+    var r = await fetch("/__bili/config/reload", { method: "POST" });
     var d = await r.json();
     if (r.ok) { toast("Applied — " + d.count + " providers active (no restart needed)"); }
     else { toast("Apply failed: " + (d.error || "unknown"), true); }
@@ -407,7 +407,7 @@ async function saveProviders() {
     }
   });
   try {
-    var r = await fetch("/__acp/config", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ providers: obj }) });
+    var r = await fetch("/__bili/config", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ providers: obj }) });
     var d = await r.json();
     if (r.ok) { savedProviders = JSON.stringify(providers); checkDirty(); toast("Saved " + d.count + " provider(s) — click Apply to activate"); }
     else { toast("Error: " + (d.error || "unknown"), true); }
@@ -428,7 +428,7 @@ function copyText(btn, text) {
 // ── sessions ──
 async function refreshSessions() {
   try {
-    var r = await fetch("/__acp/stats");
+    var r = await fetch("/__bili/stats");
     var d = await r.json();
     var ss = d.sessions || [];
     el("sess-total").textContent = ss.length + " session" + (ss.length !== 1 ? "s" : "");
