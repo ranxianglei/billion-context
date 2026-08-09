@@ -70,17 +70,25 @@ type Flat = {
      *  out — a standard `function_call` must NOT be rewritten as
      *  `custom_tool_call` (different Responses API semantics). */
     customToolCallIds: Set<string>;
+    /** Reasoning items dropped because ACP_REASONING_KEEP=none. 0 by default —
+     *  reasoning is normally routed through the compression pipeline so it is
+     *  hidden automatically once its turn is summarized. */
+    droppedReasoning: number;
 };
 
-/** Item types that are opaque host directives (tool definitions, reasoning,
- *  computer calls, ...) and must be preserved verbatim — they are NOT
- *  conversation history and must never be compressed or rewritten.
- *  `additional_tools` in particular carries the Codex code_mode exec/wait
- *  tool definitions and MUST stay at input[0] (see openai/codex client.rs
- *  splice(0..0, prefix)). */
+/** Item types that are opaque host directives (tool definitions, computer
+ *  calls, ...) and must be preserved verbatim — they are NOT conversation
+ *  history and must never be compressed or rewritten. `additional_tools` in
+ *  particular carries the Codex code_mode exec/wait tool definitions and MUST
+ *  stay at input[0] (see openai/codex client.rs splice(0..0, prefix)).
+ *
+ *  `reasoning` is intentionally NOT opaque: it IS conversation history (a
+ *  prior response's chain-of-thought) and is converted to a tracked
+ *  BiliMessage so the compression pipeline hides it once its turn is
+ *  summarized — preventing the unbounded accumulation that broke Codex's
+ *  prompt-cache prefix. See the `reasoning` case in responsesToCore. */
 const OPAQUE_ITEM_TYPES = new Set([
     "additional_tools",
-    "reasoning",
     "computer_call",
     "computer_call_output",
     "file_search_call",
@@ -93,6 +101,14 @@ const OPAQUE_ITEM_TYPES = new Set([
 
 function isOpaqueItem(it: ResponseInputItem): boolean {
     return OPAQUE_ITEM_TYPES.has(it.type);
+}
+
+/** Escape hatch: when ACP_REASONING_KEEP=none, drop reasoning items entirely
+ *  instead of routing them through compression. Default (any other value)
+ *  keeps reasoning until its turn is summarized, preserving chain-of-thought
+ *  continuity for the responses that are still live. */
+function shouldDropAllReasoning(): boolean {
+    return (process.env.ACP_REASONING_KEEP ?? "").trim().toLowerCase() === "none";
 }
 
 function partText(p: ResponseContentPart): string {
@@ -129,6 +145,7 @@ export function responsesToCore(body: ResponsesRequestBody): Flat {
     const systemParts: string[] = [];
     const preamble: ResponseInputItem[] = [];
     const customToolCallIds = new Set<string>();
+    let droppedReasoning = 0;
     if (typeof body.instructions === "string" && body.instructions.trim()) {
         systemParts.push(body.instructions);
     }
@@ -139,7 +156,7 @@ export function responsesToCore(body: ResponsesRequestBody): Flat {
         const base = deriveMessageId("user", "text", body.input);
         msgs.push({ id: clusters.next(base), role: "user", contentType: "text", text: body.input });
         idx++;
-        return { msgs, systemParts, preamble, customToolCallIds };
+        return { msgs, systemParts, preamble, customToolCallIds, droppedReasoning };
     }
     for (const it of items) {
         // Preserve opaque host-directive items verbatim. They are never
@@ -150,6 +167,34 @@ export function responsesToCore(body: ResponsesRequestBody): Flat {
             continue;
         }
         switch (it.type) {
+            case "reasoning": {
+                // Route reasoning through the compression pipeline (like
+                // Anthropic thinking) so it is hidden once its turn is
+                // summarized — NOT preserved verbatim in the preamble, which
+                // caused unbounded accumulation and broke the prompt-cache
+                // prefix. encrypted_content is opaque to us, so we carry the
+                // raw item in rawResponsesItem and re-emit it verbatim while
+                // the turn is still live. The `text` is only a stable identity
+                // for ref-id derivation (the reasoning item's own id).
+                if (shouldDropAllReasoning()) {
+                    droppedReasoning++;
+                    break;
+                }
+                const rid =
+                    typeof (it as { id?: unknown }).id === "string"
+                        ? String((it as { id?: string }).id)
+                        : hashId(JSON.stringify(it));
+                const base = deriveMessageId("assistant", "reasoning", rid);
+                msgs.push({
+                    id: clusters.next(base),
+                    role: "assistant",
+                    contentType: "reasoning",
+                    text: rid,
+                    rawResponsesItem: it,
+                });
+                idx++;
+                break;
+            }
             case "message": {
                 const m = it as ResponseInputMessage;
                 const text = messageContent(m.content);
@@ -257,7 +302,7 @@ export function responsesToCore(body: ResponsesRequestBody): Flat {
                 break;
         }
     }
-    return { msgs, systemParts, preamble, customToolCallIds };
+    return { msgs, systemParts, preamble, customToolCallIds, droppedReasoning };
 }
 
 export function coreToResponses(
@@ -298,6 +343,14 @@ export function coreToResponses(
                         name: m.toolName ?? "unknown",
                         arguments: m.text ?? "",
                     });
+                }
+            } else if (m.contentType === "reasoning") {
+                // Re-emit the carried raw reasoning item verbatim (with its
+                // encrypted_content). Only reached for reasoning whose turn has
+                // NOT been compressed — compressed reasoning is hidden by the
+                // kernel and never gets here.
+                if (m.rawResponsesItem) {
+                    out.push(m.rawResponsesItem as ResponseInputItem);
                 }
             }
         } else if (m.role === "tool") {

@@ -303,6 +303,7 @@ with no file at all).
 | `ACP_SESSION_HEADER` | `x-acp-session` | Conversation-id header name |
 | `ACP_COMPRESS_TOOL` | `1` | Set `0` to disable injecting the compress tool |
 | `ACP_COMPRESS_NUDGE` | `1` | Set `0` to disable compression nudges |
+| `ACP_REASONING_KEEP` | *(default)* | Responses API only: set `none` to drop all reasoning items. Default routes reasoning through the compression pipeline so it is hidden automatically once its turn is summarized (prevents the unbounded accumulation that broke Codex's prompt-cache prefix). |
 | `ACP_DEBUG` | `0` | Set `1` for verbose logging |
 | `ACP_PASSTHROUGH` | `0` | Set `1` to forward without compression |
 | `ACP_AUTO_UPDATE` | `1` | Set `0` to disable background self-update |

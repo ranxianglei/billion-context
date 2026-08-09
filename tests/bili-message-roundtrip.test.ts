@@ -171,3 +171,63 @@ test("responses: user input_image is restored via rawResponsesItem", () => {
     assert.ok(img, "input_image reconstructed");
     assert.equal(img?.image_url, DATA_URL, "image url restored");
 });
+
+// 7. Responses reasoning is routed into the compression pipeline (NOT the
+// opaque preamble) so the kernel hides it once its turn is summarized. The raw
+// item — including encrypted_content — round-trips verbatim via
+// rawResponsesItem while the turn is still live.
+test("responses: reasoning enters msgs[] as a tracked reasoning message (not preamble)", () => {
+    const body: ResponsesRequestBody = {
+        input: [
+            { type: "reasoning", id: "rs_abc", summary: [{ type: "summary_text", text: "thinking" }], encrypted_content: "ENC_BLOB" },
+            { type: "message", role: "user", content: "hi" },
+        ],
+    };
+    const { msgs, preamble } = responsesToCore(body);
+    assert.equal(preamble.length, 0, "reasoning is NOT in the opaque preamble");
+    const r = msgs.find((m) => m.contentType === "reasoning");
+    assert.ok(r, "reasoning entered msgs[] as contentType reasoning");
+    assert.ok(r?.rawResponsesItem, "raw reasoning item carried in rawResponsesItem");
+    const rebuilt = coreToResponses(msgs);
+    const out = rebuilt.find((i) => (i as { id?: string }).id === "rs_abc") as { type: string; encrypted_content?: string };
+    assert.ok(out, "reasoning item rebuilt");
+    assert.equal(out.type, "reasoning");
+    assert.equal(out.encrypted_content, "ENC_BLOB", "encrypted_content preserved verbatim");
+});
+
+// 8. additional_tools (and other opaque host directives) still go to the
+// preamble verbatim — only reasoning was promoted into compression.
+test("responses: additional_tools stays in the opaque preamble", () => {
+    const body: ResponsesRequestBody = {
+        input: [
+            { type: "additional_tools", tools: [{ name: "exec" }] },
+            { type: "reasoning", id: "rs_1" },
+            { type: "message", role: "user", content: "hi" },
+        ],
+    };
+    const { msgs, preamble } = responsesToCore(body);
+    assert.equal(preamble.length, 1, "only additional_tools is opaque");
+    assert.equal(preamble[0]?.type, "additional_tools");
+    assert.ok(msgs.find((m) => m.contentType === "reasoning"), "reasoning went to msgs[], not preamble");
+});
+
+// 9. ACP_REASONING_KEEP=none drops reasoning entirely (escape hatch).
+test("responses: ACP_REASONING_KEEP=none drops all reasoning", () => {
+    const prev = process.env.ACP_REASONING_KEEP;
+    process.env.ACP_REASONING_KEEP = "none";
+    try {
+        const body: ResponsesRequestBody = {
+            input: [
+                { type: "reasoning", id: "rs_abc", encrypted_content: "ENC" },
+                { type: "message", role: "user", content: "hi" },
+            ],
+        };
+        const { msgs, preamble, droppedReasoning } = responsesToCore(body);
+        assert.equal(preamble.length, 0);
+        assert.ok(!msgs.find((m) => m.contentType === "reasoning"), "no reasoning in msgs[]");
+        assert.equal(droppedReasoning, 1, "droppedReasoning counted");
+    } finally {
+        if (prev === undefined) delete process.env.ACP_REASONING_KEEP;
+        else process.env.ACP_REASONING_KEEP = prev;
+    }
+});
