@@ -171,3 +171,139 @@ test("responses: user input_image is restored via rawResponsesItem", () => {
     assert.ok(img, "input_image reconstructed");
     assert.equal(img?.image_url, DATA_URL, "image url restored");
 });
+
+// 7. Responses reasoning is routed into the compression pipeline (NOT the
+// opaque preamble) so the kernel hides it once its turn is summarized. The raw
+// item — including encrypted_content — round-trips verbatim via
+// rawResponsesItem while the turn is still live.
+test("responses: reasoning enters msgs[] as a tracked reasoning message (not preamble)", () => {
+    const body: ResponsesRequestBody = {
+        input: [
+            { type: "reasoning", id: "rs_abc", summary: [{ type: "summary_text", text: "thinking" }], encrypted_content: "ENC_BLOB" },
+            { type: "message", role: "user", content: "hi" },
+        ],
+    };
+    const { msgs, preamble } = responsesToCore(body);
+    assert.equal(preamble.length, 0, "reasoning is NOT in the opaque preamble");
+    const r = msgs.find((m) => m.contentType === "reasoning");
+    assert.ok(r, "reasoning entered msgs[] as contentType reasoning");
+    assert.ok(r?.rawResponsesItem, "raw reasoning item carried in rawResponsesItem");
+    const rebuilt = coreToResponses(msgs);
+    const out = rebuilt.find((i) => (i as { id?: string }).id === "rs_abc") as { type: string; encrypted_content?: string };
+    assert.ok(out, "reasoning item rebuilt");
+    assert.equal(out.type, "reasoning");
+    assert.equal(out.encrypted_content, "ENC_BLOB", "encrypted_content preserved verbatim");
+});
+
+// 8. additional_tools (and other opaque host directives) still go to the
+// preamble verbatim — only reasoning was promoted into compression.
+test("responses: additional_tools stays in the opaque preamble", () => {
+    const body: ResponsesRequestBody = {
+        input: [
+            { type: "additional_tools", tools: [{ name: "exec" }] },
+            { type: "reasoning", id: "rs_1" },
+            { type: "message", role: "user", content: "hi" },
+        ],
+    };
+    const { msgs, preamble } = responsesToCore(body);
+    assert.equal(preamble.length, 1, "only additional_tools is opaque");
+    assert.equal(preamble[0]?.type, "additional_tools");
+    assert.ok(msgs.find((m) => m.contentType === "reasoning"), "reasoning went to msgs[], not preamble");
+});
+
+// 9. ACP_REASONING_KEEP=none drops reasoning entirely (escape hatch).
+test("responses: ACP_REASONING_KEEP=none drops all reasoning", () => {
+    const prev = process.env.ACP_REASONING_KEEP;
+    process.env.ACP_REASONING_KEEP = "none";
+    try {
+        const body: ResponsesRequestBody = {
+            input: [
+                { type: "reasoning", id: "rs_abc", encrypted_content: "ENC" },
+                { type: "message", role: "user", content: "hi" },
+            ],
+        };
+        const { msgs, preamble, droppedReasoning } = responsesToCore(body);
+        assert.equal(preamble.length, 0);
+        assert.ok(!msgs.find((m) => m.contentType === "reasoning"), "no reasoning in msgs[]");
+        assert.equal(droppedReasoning, 1, "droppedReasoning counted");
+    } finally {
+        if (prev === undefined) delete process.env.ACP_REASONING_KEEP;
+        else process.env.ACP_REASONING_KEEP = prev;
+    }
+});
+
+// 10. Reasoning VANISHES from the rebuilt input once its turn is covered by a
+// compression block — the central guarantee of the fix (issue #15). The kernel
+// drops covered message ids before coreToResponses runs; simulating that prune
+// here, the reasoning item must disappear while ordinary messages survive.
+test("responses: reasoning is dropped from output after its turn is compressed", () => {
+    const body: ResponsesRequestBody = {
+        input: [
+            { type: "reasoning", id: "rs_abc", encrypted_content: "ENC" },
+            { type: "message", role: "user", content: "hi" },
+            { type: "message", role: "assistant", content: "hello" },
+        ],
+    };
+    const { msgs } = responsesToCore(body);
+    const reasoningId = msgs.find((m) => m.contentType === "reasoning")!.id;
+    const pruned = msgs.filter((m) => m.id !== reasoningId);
+    const rebuilt = coreToResponses(pruned);
+    const gone = rebuilt.find((i) => (i as { type?: string }).type === "reasoning");
+    assert.equal(gone, undefined, "reasoning item disappears once its turn is compressed");
+    assert.equal(rebuilt.length, 2, "user + assistant messages survive");
+});
+
+// 11. Reasoning id is stable across turns — Codex re-sends the same reasoning
+// items every turn, so the same input item must yield the same BiliMessage id
+// or the kernel would accumulate phantom duplicates.
+test("responses: reasoning id is stable across turns (same item → same id)", () => {
+    const body = (): ResponsesRequestBody => ({
+        input: [
+            { type: "reasoning", id: "rs_abc", summary: [{ type: "summary_text", text: "t" }] },
+            { type: "message", role: "user", content: "hi" },
+        ],
+    });
+    const a = responsesToCore(body()).msgs.find((m) => m.contentType === "reasoning")!.id;
+    const b = responsesToCore(body()).msgs.find((m) => m.contentType === "reasoning")!.id;
+    assert.equal(a, b, "same reasoning item yields the same message id across turns");
+});
+
+// 12. Multiple reasoning items in one turn each get distinct ids and survive
+// round-trip in order.
+test("responses: multiple reasoning items keep distinct ids and order", () => {
+    const body: ResponsesRequestBody = {
+        input: [
+            { type: "reasoning", id: "rs_1", encrypted_content: "A" },
+            { type: "reasoning", id: "rs_2", encrypted_content: "B" },
+            { type: "message", role: "user", content: "hi" },
+        ],
+    };
+    const { msgs } = responsesToCore(body);
+    const rs = msgs.filter((m) => m.contentType === "reasoning");
+    assert.equal(rs.length, 2);
+    assert.notEqual(rs[0]!.id, rs[1]!.id, "distinct ids");
+    const rebuilt = coreToResponses(msgs);
+    const ids = rebuilt
+        .filter((i) => (i as { type?: string }).type === "reasoning")
+        .map((i) => (i as { id?: string }).id);
+    assert.deepEqual(ids, ["rs_1", "rs_2"], "order + ids preserved on rebuild");
+});
+
+// 13. Reasoning without encrypted_content (older API shape) still round-trips
+// via rawResponsesItem.
+test("responses: reasoning without encrypted_content round-trips", () => {
+    const body: ResponsesRequestBody = {
+        input: [
+            { type: "reasoning", id: "rs_x", summary: [{ type: "summary_text", text: "t" }] },
+            { type: "message", role: "user", content: "hi" },
+        ],
+    };
+    const { msgs } = responsesToCore(body);
+    const rebuilt = coreToResponses(msgs);
+    const out = rebuilt.find((i) => (i as { id?: string }).id === "rs_x") as
+        | { type: string; encrypted_content?: string }
+        | undefined;
+    assert.ok(out, "reasoning without encrypted_content still rebuilt");
+    assert.equal(out!.type, "reasoning");
+    assert.equal(out!.encrypted_content, undefined);
+});
