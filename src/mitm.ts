@@ -91,39 +91,34 @@ function tunnelThrough(
     log: Logger,
     proxyUrl?: string,
 ): void {
-    // Outbound connect: direct, or via HTTP CONNECT proxy if configured. The
-    // proxy case is async (handshake) so we bridge with a promise.
-    let upstream: net.Socket | undefined;
+    // connectThroughProxy resolves a socket that is ALREADY connected: direct
+    // mode resolves on net.connect's 'connect' event; proxied mode resolves
+    // after the CONNECT handshake returns 200. Either way we must NOT wait
+    // for another 'connect' event here — Node does not replay it, so attaching
+    // a listener in this .then() callback (the old code) never fires, and the
+    // client would time out. Just start piping immediately.
     let established = false;
     const connectTimer = setTimeout(() => {
         if (!established) {
             log(`tunnel ${host}:${port} connect timeout`);
             clientSocket.write("HTTP/1.1 504 Gateway Timeout\r\n\r\n");
-            if (upstream) upstream.destroy();
             clientSocket.destroy();
         }
     }, 15000);
-    connectThroughProxy(host, port, proxyUrl).then((sock) => {
-        upstream = sock;
-        upstream.on("connect", () => {
-            clearTimeout(connectTimer);
-            established = true;
-            clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
-            if (head.length > 0) upstream!.write(head);
-            upstream!.pipe(clientSocket);
-            clientSocket.pipe(upstream!);
-        });
+    connectThroughProxy(host, port, proxyUrl).then((upstream) => {
+        established = true;
+        clearTimeout(connectTimer);
+        clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+        if (head.length > 0) upstream.write(head);
+        upstream.pipe(clientSocket);
+        clientSocket.pipe(upstream);
         const cleanup = (where: string, err: Error) => {
-            clearTimeout(connectTimer);
-            if (!established) {
-                log(`tunnel ${host}:${port} ${where} failed: ${err.message}`);
-                clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
-            }
+            log(`tunnel ${host}:${port} ${where} closed: ${err.message}`);
+            upstream.destroy();
             clientSocket.destroy();
-            upstream?.destroy();
         };
-        upstream.on("error", (e) => cleanup("upstream", e));
-        clientSocket.on("error", (e) => cleanup("client", e));
+        upstream.once("error", (e) => cleanup("upstream", e));
+        clientSocket.once("error", (e) => cleanup("client", e));
     }).catch((err: Error) => {
         clearTimeout(connectTimer);
         log(`tunnel ${host}:${port} connect failed: ${err.message}`);

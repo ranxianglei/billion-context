@@ -73,7 +73,9 @@ export function resolveProxy(
 
 /** Get (or create) a cached undici ProxyAgent for `proxyUrl`. Returns undefined
  *  for direct connect. Used by the fetch (`/bili/`) path. Returned as a plain
- *  object so callers don't need to import the undici Dispatcher type. */
+ *  object so callers don't need to import the undici Dispatcher type.
+ *  Call `resetProxyCache()` on config hot-reload to release ProxyAgents whose
+ *  URL was removed/changed (otherwise they'd leak for the process lifetime). */
 export function proxyDispatcher(proxyUrl: string | undefined): object | undefined {
     if (!proxyUrl) return undefined;
     let agent = dispatcherCache.get(proxyUrl);
@@ -82,6 +84,16 @@ export function proxyDispatcher(proxyUrl: string | undefined): object | undefine
         dispatcherCache.set(proxyUrl, agent);
     }
     return agent;
+}
+
+/** Release all cached ProxyAgents. Called on config hot-reload so agents for
+ *  proxy URLs that were removed/changed don't leak. Safe to call anytime;
+ *  the next proxyDispatcher() call re-creates the needed agent lazily. */
+export function resetProxyCache(): void {
+    for (const agent of dispatcherCache.values()) {
+        try { agent.close(); } catch { /* best-effort */ }
+    }
+    dispatcherCache.clear();
 }
 
 /** Establish a TCP connection to `host:port`, through an HTTP proxy if one is
@@ -118,7 +130,18 @@ export function connectThroughProxy(
     return new Promise((resolve, reject) => {
         const sock = net.connect(proxy.port, proxy.host);
         let established = false;
+        // Internal timeout for the CONNECT handshake (proxy → upstream). If the
+        // proxy is slow/unresponsive the outer 15s tunnel timer would still
+        // fire, but a dedicated handshake timeout fails faster and surfaces a
+        // clearer error ("CONNECT handshake timeout") in the log.
+        const handshakeTimer = setTimeout(() => {
+            if (!established) {
+                sock.destroy();
+                reject(new Error(`upstream proxy CONNECT ${host}:${port} handshake timeout`));
+            }
+        }, 10000);
         const cleanup = (err: Error) => {
+            clearTimeout(handshakeTimer);
             if (!established) sock.destroy();
             reject(err);
         };
@@ -148,6 +171,7 @@ export function connectThroughProxy(
                     return;
                 }
                 established = true;
+                clearTimeout(handshakeTimer);
                 // If the proxy pipelined any early bytes after the 200, push
                 // them back so the TLS handshake sees them.
                 if (rest.length > 0) sock.unshift(rest);

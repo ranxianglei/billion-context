@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { createCore, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, estimateTokensFast, renderNudgeText, deactivateBlock } from "acp-kernel";
 import type { ProxyOptions } from "./config.js";
 import { loadRoutes } from "./config.js";
+import { resetProxyCache } from "./upstream-proxy.js";
 import { resolveContextLimit } from "./config.js";
 import { contextFromRegistry, loadRegistry } from "./registry.js";
 import { fetchWithTimeout, MAX_REQUEST_BYTES } from "./fetch-util.js";
@@ -1084,6 +1085,10 @@ function handleConfigReload(opts: ProxyOptions, res: http.ServerResponse, log: (
     // (which read opts.routes) pick up the new entries without needing reassignment.
     for (const k of Object.keys(opts.routes)) delete opts.routes[k];
     Object.assign(opts.routes, fresh);
+    // Release cached ProxyAgents so agents for proxy URLs that were
+    // removed/changed don't leak for the process lifetime. The next request
+    // re-creates the needed agent lazily via proxyDispatcher().
+    resetProxyCache();
     const names = Object.keys(fresh);
     log("info", `[acp-web] routes hot-reloaded (${names.length} providers): ${names.join(", ") || "(none)"}`);
     res.writeHead(200, { "content-type": "application/json" });
