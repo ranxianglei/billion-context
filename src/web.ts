@@ -215,6 +215,8 @@ input:focus, select:focus { outline: none; border-color: var(--accent); }
 .snippet .label b { color: var(--fg); }
 .snippet code { display: block; font-size: 13px; color: var(--ok); white-space: pre-wrap; word-break: break-all; }
 .snippet .copy { position: absolute; top: 8px; right: 8px; }
+.client-setup { margin-top: 14px; padding-top: 12px; border-top: 1px dashed var(--border); }
+.client-head { font-size: 12px; color: var(--dim); margin-bottom: 8px; }
 
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th { text-align: left; padding: 8px 12px; color: var(--dim); font-weight: 500; border-bottom: 1px solid var(--border); }
@@ -246,11 +248,10 @@ select { cursor: pointer; }
 </header>
 <nav>
   <button class="active" onclick="showTab('providers')">Providers</button>
-  <button onclick="showTab('setup')">Client Setup</button>
   <button onclick="showTab('sessions')">Sessions</button>
 </nav>
 <main>
-  <!-- Providers tab -->
+  <!-- Providers tab (URL + models + client config, all in one) -->
   <div id="tab-providers" class="tab active">
     <div id="restart-notice" class="notice" style="display:none"></div>
     <div id="providers-list"></div>
@@ -261,15 +262,6 @@ select { cursor: pointer; }
       <button class="btn" onclick="applyProviders()">Apply</button>
       <button class="btn primary" onclick="saveProviders()">Save</button>
     </div>
-  </div>
-
-  <!-- Client Setup tab -->
-  <div id="tab-setup" class="tab">
-    <div class="row" style="margin-bottom:16px">
-      <label>Provider</label>
-      <select id="setup-provider" onchange="renderSetup()"></select>
-    </div>
-    <div id="setup-snippets"></div>
   </div>
 
   <!-- Sessions tab -->
@@ -302,7 +294,6 @@ function showTab(name) {
   el("tab-"+name).classList.add("active");
   event.target.classList.add("active");
   if (name === "sessions") refreshSessions();
-  if (name === "setup") renderSetup();
 }
 
 // ── load ──
@@ -311,7 +302,6 @@ async function load() {
     var r = await fetch("/__acp/config");
     var d = await r.json();
     providers = entries(d.providers);
-    el("setup-provider").innerHTML = "";
     savedProviders = JSON.stringify(providers);
     renderProviders();
   } catch(e) {
@@ -420,28 +410,7 @@ async function saveProviders() {
   } catch(e) { toast("Save failed: " + e, true); }
 }
 
-// ── client setup ──
-function renderSetup() {
-  // Rebuild the dropdown each time so URL edits/adds/removes are reflected.
-  var sel = el("setup-provider");
-  var prev = sel.value;
-  sel.innerHTML = "";
-  providers.forEach(function(p){ if (p.url) sel.options.add(new Option(p.url, p.url)); });
-  if (prev && providers.some(function(p){ return p.url === prev; })) sel.value = prev;
-  var url = sel.value || (providers[0] && providers[0].url) || "";
-  var p = providers.find(function(x){ return x.url === url; });
-  var box = el("setup-snippets");
-  if (!p) { box.innerHTML = '<div class="empty">Add a provider URL first (Providers tab).</div>'; return; }
-  // The client points at the proxy with /bili/<full-upstream-url>. This is the
-  // single routing mode — the upstream URL is embedded in the baseURL itself.
-  var full = ORIGIN + "/bili/" + p.url;
-  var h = "";
-  h += snippet("Pi  (~/.pi/agent/models.json)", '"baseUrl": "' + full + '"');
-  h += snippet("OpenCode  (opencode.json)", '"baseURL": "' + full + '"');
-  h += snippet("Codex  (config.toml)", 'base_url = "' + full + '"');
-  h += snippet("Full path (any client)", full);
-  box.innerHTML = h;
-}
+// ── snippets (used inline in each provider card) ──
 function snippet(label, code) {
   var c = code.replace(/"/g, "&quot;");
   return '<div class="snippet"><div class="label"><b>' + label + '</b></div><code>' + esc(code) + '</code><button class="btn small copy" onclick="copyText(this,\\''+c+'\\')">Copy</button></div>';
