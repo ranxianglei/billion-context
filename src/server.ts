@@ -327,12 +327,21 @@ async function handle(
     let prepared: Prepared | null = null;
     if (!opts.passthrough && protocol && parsed && typeof parsed === "object") {
         const sessionHeader = headerValue(req, opts.sessionHeader);
+        // The client's own conversation header (x-session-id / x-session-affinity
+        // / x-opencode-session / x-acp-session) is the STRONGEST signal that two
+        // requests belong to the same conversation — much stronger than the
+        // content-fingerprint fallback. Prefer it over opts.sessionHeader and
+        // over content hashing, so IDE clients (ZCode/Cursor) that inject a
+        // fixed system-reminder into every new conversation don't collide on a
+        // shared 200-char prefix and leak compression state across sessions.
+        const clientConv = clientConversationHeader(req.headers);
+        const convHeader = clientConv ?? sessionHeader;
         const conversation =
             protocol === "anthropic"
-                ? conversationSignalAnthropic(parsed as AnthropicRequestBody, sessionHeader)
+                ? conversationSignalAnthropic(parsed as AnthropicRequestBody, convHeader)
                 : protocol === "openai"
-                  ? conversationSignalOpenai(parsed as OpenAIRequestBody, sessionHeader)
-                  : conversationSignalResponses(parsed as ResponsesRequestBody, sessionHeader);
+                  ? conversationSignalOpenai(parsed as OpenAIRequestBody, convHeader)
+                  : conversationSignalResponses(parsed as ResponsesRequestBody, convHeader);
         const sessionId = deriveProxySessionId(req.headers, protocol, upstreamOrigin, conversation);
         // Two separate uses of the conversation signal:
         //  - `affinity`: header value forwarded upstream for sticky-routing /
