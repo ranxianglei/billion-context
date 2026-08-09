@@ -67,6 +67,7 @@ interface CompressLoopResponsesCtx {
     log: (msg: string) => void;
     /** Resolved upstream proxy URL (http://host:port) or undefined for direct. */
     proxyUrl?: string;
+    textProtocol?: boolean;
 }
 
 interface RequestOptions {
@@ -296,12 +297,104 @@ function buildCompleted(responseObj: Record<string, unknown> | null): string {
     })}\n\n`;
 }
 
+function responsesJsonOutput(response: Record<string, unknown>): {
+    text: string;
+    textParts: Array<Record<string, unknown>>;
+    calls: FunctionCallAccumulator[];
+} {
+    const textParts: Array<Record<string, unknown>> = [];
+    const calls: FunctionCallAccumulator[] = [];
+    for (const item of Array.isArray(response.output) ? response.output : []) {
+        if (!item || typeof item !== "object") continue;
+        const value = item as Record<string, unknown>;
+        if (value.type === "message") {
+            for (const part of Array.isArray(value.content) ? value.content : []) {
+                if (part && typeof part === "object" && (part as Record<string, unknown>).type === "output_text") {
+                    textParts.push(part as Record<string, unknown>);
+                }
+            }
+        } else if (value.type === "function_call") {
+            calls.push({
+                itemId: typeof value.id === "string" ? value.id : "",
+                callId: typeof value.call_id === "string" ? value.call_id : "",
+                name: typeof value.name === "string" ? value.name : "",
+                arguments: typeof value.arguments === "string" ? value.arguments : "",
+            });
+        }
+    }
+    return {
+        text: textParts.map((part) => typeof part.text === "string" ? part.text : "").join(""),
+        textParts,
+        calls,
+    };
+}
+
+function replaceResponsesJsonText(parts: Array<Record<string, unknown>>, text: string): void {
+    parts.forEach((part, index) => {
+        part.text = index === 0 ? text : "";
+    });
+}
+
+export async function compressLoopResponsesJson(
+    initialResponse: Record<string, unknown>,
+    ctx: CompressLoopResponsesCtx,
+    requestBody: Record<string, unknown>,
+    requestOptions: RequestOptions,
+): Promise<Record<string, unknown>> {
+    let current = initialResponse;
+    for (let loopCount = 1; loopCount <= 5; loopCount++) {
+        const output = responsesJsonOutput(current);
+        const extracted = extractTextTriggers(output.text);
+        const allCalls = [...output.calls, ...extracted.calls].filter((call) => call.name.length > 0);
+        const proxyCalls = allCalls.filter((call) => PROXY_TOOL_NAMES.has(call.name));
+        const realCalls = allCalls.filter((call) => !PROXY_TOOL_NAMES.has(call.name));
+        if (proxyCalls.length === 0 || realCalls.length > 0) {
+            if (proxyCalls.length > 0) replaceResponsesJsonText(output.textParts, extracted.clean);
+            return current;
+        }
+        const inputItems = Array.isArray(requestBody.input) ? [...(requestBody.input as unknown[])] : [];
+        if (extracted.clean.trim()) {
+            inputItems.push({ type: "message", role: "assistant", content: [{ type: "output_text", text: extracted.clean }] });
+        }
+        for (const call of proxyCalls) {
+            let args: Record<string, unknown> = {};
+            try {
+                args = JSON.parse(call.arguments) as Record<string, unknown>;
+            } catch (error) {
+                loggerLog("warn", `[acp-compress-args] ${call.name} JSON.parse failed: ${String(error)}`);
+            }
+            const result = executeProxyTool(call.name, args, ctx);
+            ctx.log(`[acp-proxy: responses JSON ${call.name} → ${result.slice(0, 120).replace(/\n/g, " ")}]`);
+            inputItems.push({ type: "message", role: "user", content: buildVisibilityMarker(call.name, result) });
+        }
+        requestBody.input = inputItems;
+        const { response, clearTimer } = await fetchWithTimeout(requestOptions.url, {
+            method: "POST",
+            headers: requestOptions.headers,
+            body: JSON.stringify(requestBody),
+            ...(ctx.proxyUrl ? { dispatcher: proxyDispatcher(ctx.proxyUrl) } : {}),
+        });
+        try {
+            if (!response.ok) {
+                const detail = await response.text().catch(() => "upstream error");
+                throw new Error(`responses compress loop upstream error ${response.status}: ${detail.slice(0, 200)}`);
+            }
+            current = await response.json() as Record<string, unknown>;
+        } finally {
+            clearTimer();
+        }
+    }
+    ctx.log("[acp-proxy: responses JSON compress loop limit (5) reached]");
+    return current;
+}
+
 export async function* compressLoopResponsesStream(
     initialUpstream: ReadableStream<Uint8Array>,
     ctx: CompressLoopResponsesCtx,
     requestBody: Record<string, unknown>,
     requestOptions: RequestOptions,
 ): AsyncGenerator<Buffer> {
+    const textProtocol = ctx.textProtocol ?? TEXT_PROTOCOL;
     let upstream = initialUpstream;
     let loopCount = 0;
     let responseObj: Record<string, unknown> | null = null;
@@ -352,7 +445,7 @@ export async function* compressLoopResponsesStream(
                     // strip the <acp_compress> trigger before the client sees it;
                     // we re-emit a clean message item at round end. Meta-start
                     // events still open the stream in round 1.
-                    if (d.yieldChunk && (isFirstRound || !d.isMeta) && !(TEXT_PROTOCOL && !d.isMeta)) {
+                    if (d.yieldChunk && (isFirstRound || !d.isMeta) && !(textProtocol && !d.isMeta)) {
                         yield d.yieldChunk;
                     }
                     if (d.contentDelta) contentText += d.contentDelta;
@@ -416,7 +509,7 @@ export async function* compressLoopResponsesStream(
         // text and treat them as proxy compress calls so the loop executes
         // them and continues. The cleaned text replaces contentText so the
         // client never sees the raw trigger.
-        if (TEXT_PROTOCOL) {
+        if (textProtocol) {
             const extracted = extractTextTriggers(contentText);
             contentText = extracted.clean;
             for (const c of extracted.calls) {
@@ -467,14 +560,16 @@ export async function* compressLoopResponsesStream(
                 content: [{ type: "output_text", text: contentText }],
             });
         }
-        for (const fc of proxyCalls) {
-            inputItems.push({
-                type: "function_call",
-                id: fc.itemId || `fc_${Date.now()}`,
-                call_id: fc.callId || `call_${Date.now()}`,
-                name: fc.name,
-                arguments: fc.arguments,
-            });
+        if (!textProtocol) {
+            for (const fc of proxyCalls) {
+                inputItems.push({
+                    type: "function_call",
+                    id: fc.itemId || `fc_${Date.now()}`,
+                    call_id: fc.callId || `call_${Date.now()}`,
+                    name: fc.name,
+                    arguments: fc.arguments,
+                });
+            }
         }
         for (const fc of proxyCalls) {
             let args: Record<string, unknown> = {};
@@ -495,11 +590,9 @@ export async function* compressLoopResponsesStream(
                 buildMessageItemSequence(markerItemId, nextOutputIndex++, buildVisibilityMarker(fc.name, result)),
                 "utf8",
             );
-            inputItems.push({
-                type: "function_call_output",
-                call_id: fc.callId || `call_${Date.now()}`,
-                output: result,
-            });
+            inputItems.push(textProtocol
+                ? { type: "message", role: "user", content: buildVisibilityMarker(fc.name, result) }
+                : { type: "function_call_output", call_id: fc.callId || `call_${Date.now()}`, output: result });
         }
 
         requestBody.input = inputItems;

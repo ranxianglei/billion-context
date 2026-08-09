@@ -3,6 +3,7 @@ import { readFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { configFile } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
+import { validateHttpProxy, type ProxyFallbackOptions } from "./upstream-proxy.js";
 
 export function safeReadJson(path: string): unknown {
     try {
@@ -22,20 +23,12 @@ export function safeReadJson(path: string): unknown {
     }
 }
 
-/** Provider route: a short name (e.g. "glm") mapped to an upstream URL.
- *  Agents point their base URL at the proxy using the name as a path segment:
- *    http://localhost:8788/v1/glm          → routes.glm
- *    http://localhost:8788/anthropic        → routes.anthropic
- *  The API key is NOT stored here — the proxy passes the agent's key through
- *  untouched, so secrets only live in the agent's config.
- *
- *  Each route may declare per-model context/output limits, mirroring the
+/** Each upstream URL may declare per-model context/output limits, mirroring the
  *  structure agents like opencode carry in their own model registry. This is
  *  the source of truth for the proxy: the LLM `/models` endpoint does NOT
  *  return context windows (verified across OpenAI/Anthropic/zhipu/comfly),
  *  so the proxy cannot discover them at runtime — the user must declare them.
- *
- *  Backward compatible: a bare string is accepted and treated as { url }. */
+ */
 export type ProviderRoute = {
     models?: Record<string, { context?: number; output?: number }>;
     /** Per-URL upstream HTTP proxy. Overrides the global `proxy`. Empty string
@@ -44,6 +37,8 @@ export type ProviderRoute = {
     proxy?: string;
 };
 export type ProviderRoutes = Record<string, ProviderRoute>; // key = upstream URL prefix (the /bili/<this> string)
+export type PromptCacheRouting = "auto" | "enabled" | "disabled";
+export type UpstreamProxyMode = "auto" | "manual" | "direct";
 
 /** Built-in context window for common model families, keyed by a lowercase
  *  prefix. This is a FALLBACK used when the per-route model declaration in
@@ -90,7 +85,15 @@ export function resolveContextLimit(
     upstreamUrl: string | undefined,
     model: string | undefined,
 ): number | undefined {
-    if (!model || !upstreamUrl) return lookupContextLimit(model);
+    return resolveConfiguredContextLimit(routes, upstreamUrl, model) ?? lookupContextLimit(model);
+}
+
+export function resolveConfiguredContextLimit(
+    routes: ProviderRoutes,
+    upstreamUrl: string | undefined,
+    model: string | undefined,
+): number | undefined {
+    if (!model || !upstreamUrl) return undefined;
     // Longest-prefix match: collect all keys that are a prefix of upstreamUrl,
     // pick the longest (most specific). A key matches if upstreamUrl === key
     // OR upstreamUrl starts with key + ("/" or key being the full origin). This
@@ -106,7 +109,7 @@ export function resolveContextLimit(
         const m = routes[bestKey].models?.[model];
         if (m?.context && m.context > 0) return m.context;
     }
-    return lookupContextLimit(model);
+    return undefined;
 }
 
 export type ProxyOptions = {
@@ -115,14 +118,18 @@ export type ProxyOptions = {
     upstream: string;
     routes: ProviderRoutes;
     /** Global default upstream HTTP proxy. Per-URL `proxy` overrides this.
-     *  Empty string disables. `http://host:port` format. */
+     *  Empty string explicitly disables environment/system proxy fallback. */
     proxy?: string;
+    proxyMode?: UpstreamProxyMode;
+    proxySource?: "bili-env" | "web-manual" | "config" | "auto" | "direct";
+    proxyFallback?: ProxyFallbackOptions;
     modelContextLimit: number;
     kernelConfig: Config;
     compress: {
         injectTool: boolean;
         injectNudge: boolean;
     };
+    promptCache: { routing: PromptCacheRouting };
     sessionHeader: string;
     log: boolean;
     debug: boolean;
@@ -153,6 +160,7 @@ export function loadRoutes(env: NodeJS.ProcessEnv = process.env): ProviderRoutes
         const parsed = safeReadJson(routesPath);
         if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
             for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+                rejectLegacyRoute(k, v);
                 const route = parseRouteEntry(v);
                 if (route) routes[normalizeUrlKey(k)] = route;
             }
@@ -160,6 +168,7 @@ export function loadRoutes(env: NodeJS.ProcessEnv = process.env): ProviderRoutes
     }
     if (fileConfig.providers) {
         for (const [k, v] of Object.entries(fileConfig.providers)) {
+            rejectLegacyRoute(k, v);
             const route = parseRouteEntry(v);
             if (route && !routes[normalizeUrlKey(k)]) routes[normalizeUrlKey(k)] = route;
         }
@@ -184,6 +193,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         const parsed = safeReadJson(routesPath);
         if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
             for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+                rejectLegacyRoute(k, v);
                 const route = parseRouteEntry(v);
                 if (route) routes[normalizeUrlKey(k)] = route;
             }
@@ -192,22 +202,65 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
     // Also accept providers inline in the config file.
     if (fileConfig.providers) {
         for (const [k, v] of Object.entries(fileConfig.providers)) {
+            rejectLegacyRoute(k, v);
             const route = parseRouteEntry(v);
             if (route && !routes[normalizeUrlKey(k)]) routes[normalizeUrlKey(k)] = route;
         }
     }
     const modelContextLimit = parseInt(env.ACP_MODEL_CONTEXT_LIMIT ?? `${fileConfig.modelContextLimit ?? 200000}`, 10);
+    const biliProxy = nonEmpty(env.BILI_UPSTREAM_PROXY);
+    const webProxy = nonEmpty(fileConfig.upstreamProxy);
+    const configProxy = nonEmpty(fileConfig.proxy);
+    const proxyMode = parseUpstreamProxyMode(
+        env.BILI_UPSTREAM_PROXY_MODE ?? fileConfig.upstreamProxyMode ?? (webProxy ? "manual" : undefined),
+    );
+    const proxy = biliProxy ?? (proxyMode === "direct" ? "" : proxyMode === "manual" ? webProxy ?? configProxy : configProxy);
+    const proxySource: ProxyOptions["proxySource"] = biliProxy
+        ? "bili-env"
+        : proxyMode === "direct"
+          ? "direct"
+          : proxyMode === "manual" && webProxy
+            ? "web-manual"
+            : configProxy
+              ? "config"
+              : "auto";
+    const httpProxy = nonEmpty(env.HTTP_PROXY ?? env.http_proxy);
+    const httpsProxy = nonEmpty(env.HTTPS_PROXY ?? env.https_proxy);
+    const allProxy = nonEmpty(env.ALL_PROXY ?? env.all_proxy);
+    const noProxy = nonEmpty(env.NO_PROXY ?? env.no_proxy);
+    const proxyFallback: ProxyFallbackOptions = {
+        ...(httpProxy ? { httpProxy } : {}),
+        ...(httpsProxy ? { httpsProxy } : {}),
+        ...(allProxy ? { allProxy } : {}),
+        ...(noProxy ? { noProxy } : {}),
+        biliPort: Number.isFinite(port) ? port : 8787,
+        globalSource: proxySource,
+    };
+    validateHttpProxy(proxy, proxyFallback.biliPort);
+    for (const [url, route] of Object.entries(routes)) {
+        try {
+            validateHttpProxy(route.proxy, proxyFallback.biliPort);
+        } catch (error) {
+            throw new Error(`[acp-config] invalid upstream proxy for ${url}: ${String(error)}`);
+        }
+    }
     return {
         port: Number.isFinite(port) ? port : 8787,
         host,
         upstream,
         routes,
-        proxy: env.BILI_UPSTREAM_PROXY ?? fileConfig.proxy,
+        proxy,
+        proxyMode,
+        proxySource,
+        proxyFallback,
         modelContextLimit,
         kernelConfig: defaultConfig(modelContextLimit),
         compress: {
             injectTool: (env.ACP_COMPRESS_TOOL ?? (fileConfig.compress?.injectTool === false ? "0" : "1")) !== "0",
             injectNudge: (env.ACP_COMPRESS_NUDGE ?? (fileConfig.compress?.injectNudge === false ? "0" : "1")) !== "0",
+        },
+        promptCache: {
+            routing: parsePromptCacheRouting(env.ACP_PROMPT_CACHE_ROUTING ?? fileConfig.promptCache?.routing),
         },
         sessionHeader: env.ACP_SESSION_HEADER ?? fileConfig.sessionHeader ?? "x-acp-session",
         log: env.ACP_LOG !== "0" && fileConfig.log !== false,
@@ -243,10 +296,18 @@ type FileConfig = {
     dumpSse?: string;
     passthrough?: boolean;
     autoUpdate?: boolean;
+    upstreamProxy?: string;
+    upstreamProxyMode?: string;
     logFile?: string;
     compress?: { injectTool?: boolean; injectNudge?: boolean };
+    promptCache?: { routing?: string };
     mitm?: { enabled?: boolean; domains?: string[] };
 };
+
+function nonEmpty(value: string | undefined): string | undefined {
+    const trimmed = value?.trim();
+    return trimmed ? trimmed : undefined;
+}
 
 function loadConfigFile(): FileConfig {
     const parsed = safeReadJson(configFile());
@@ -303,4 +364,20 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
     // A bare value (e.g. null) means "this upstream exists, no overrides".
     if (v === null) return {};
     return undefined;
+}
+
+export function parsePromptCacheRouting(value: string | undefined): PromptCacheRouting {
+    return value === "enabled" || value === "disabled" ? value : "auto";
+}
+
+export function parseUpstreamProxyMode(value: string | undefined): UpstreamProxyMode {
+    return value === "manual" || value === "direct" ? value : "auto";
+}
+
+function rejectLegacyRoute(key: string, value: unknown): void {
+    if (typeof value !== "string") return;
+    throw new Error(
+        `[acp-config] legacy provider route \"${key}\": \"${value}\" is no longer valid; ` +
+        `use the upstream URL as the key, for example { \"${value.replace(/\/+$/, "")}\": {} }`,
+    );
 }

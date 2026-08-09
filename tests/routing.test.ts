@@ -1,9 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { writeFileSync, unlinkSync } from "node:fs";
-import { loadOptions, lookupContextLimit, resolveContextLimit, parseRouteEntry } from "../src/config.ts";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { loadOptions, lookupContextLimit, resolveContextLimit, resolveConfiguredContextLimit, parseRouteEntry, parsePromptCacheRouting } from "../src/config.ts";
 
-const TMP = (s: string) => `/tmp/test-acp-${s}.json`;
+const TMP = (s: string) => join(tmpdir(), `test-acp-${process.pid}-${s}.json`);
 const writeRoutes = (name: string, obj: unknown) => {
     const p = TMP(name);
     writeFileSync(p, JSON.stringify(obj));
@@ -47,6 +49,22 @@ test("parseRouteEntry: invalid values return undefined", () => {
     assert.equal(parseRouteEntry(123), undefined);
     assert.equal(parseRouteEntry(undefined), undefined);
     assert.equal(parseRouteEntry("string"), undefined); // url is the KEY, not the value
+});
+
+test("legacy named-route config fails with an actionable migration error", () => {
+    const p = writeRoutes("legacy-string", { openai: "https://api.openai.com/v1" });
+    try {
+        assert.throws(() => loadOptions({ ACP_PROVIDERS: p }), /legacy provider route.*use the upstream URL as the key/);
+    } finally {
+        unlinkSync(p);
+    }
+});
+
+test("prompt-cache routing accepts the tri-state and defaults invalid values to auto", () => {
+    assert.equal(parsePromptCacheRouting("enabled"), "enabled");
+    assert.equal(parsePromptCacheRouting("disabled"), "disabled");
+    assert.equal(parsePromptCacheRouting("auto"), "auto");
+    assert.equal(parsePromptCacheRouting("unknown"), "auto");
 });
 
 test("lookupContextLimit returns known windows", () => {
@@ -131,6 +149,12 @@ test("model not in route falls through to lookup table", () => {
     };
     // glm-5.2 not in this route's models, but in the built-in table (1000000)
     assert.equal(resolveContextLimit(routes, "https://api.deepseek.com", "deepseek-chat"), 64000);
+});
+
+test("configured context lookup stays separate from registry/built-in fallbacks", () => {
+    const routes = { "https://api.openai.com": { models: {} } };
+    assert.equal(resolveConfiguredContextLimit(routes, "https://api.openai.com/v1/responses", "gpt-5"), undefined);
+    assert.equal(resolveContextLimit(routes, "https://api.openai.com/v1/responses", "gpt-5"), 400_000);
 });
 
 test("no matching key and unknown model returns undefined", () => {

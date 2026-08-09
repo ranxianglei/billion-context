@@ -195,6 +195,38 @@ export function cacheBlockContent(session: Session, blockId: string, content: Bl
     session.blockContents.set(blockId, content);
 }
 
+export function resetSessionCompression(session: Session): void {
+    session.state = createInitialState();
+    session.blockContents.clear();
+    session.stats.lastInputTokens = 0;
+    session.stats.contextTokens = 0;
+    session.metadata.nativeCompactionAt = Date.now();
+    markDirty(session);
+}
+
+export function markNativeCompactionBoundary(session: Session): void {
+    session.metadata.nativeCompactionBoundary = {
+        at: Date.now(),
+        pendingRebase: true,
+    };
+    markDirty(session);
+}
+
+export function reconcileNativeCompactionBoundary(session: Session): boolean {
+    const boundary = session.metadata.nativeCompactionBoundary;
+    if (!boundary || typeof boundary !== "object" || !(boundary as Record<string, unknown>).pendingRebase) {
+        return false;
+    }
+    resetSessionCompression(session);
+    session.metadata.nativeCompactionBoundary = {
+        ...(boundary as Record<string, unknown>),
+        pendingRebase: false,
+        rebasedAt: Date.now(),
+    };
+    markDirty(session);
+    return true;
+}
+
 /** Flush a session to disk and drop it from memory (LRU eviction). Refuses to
  *  evict sessions that are in-flight or whose flush failed (would lose a
  *  never-persisted session permanently). */

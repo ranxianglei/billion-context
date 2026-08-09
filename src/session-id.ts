@@ -1,5 +1,11 @@
 import { hashId } from "./util.js";
 
+export type ConversationIdentity = {
+    value: string;
+    source: "header" | "body-session" | "metadata-session" | "generated";
+    clientProvided: boolean;
+};
+
 /**
  * Session identity for the proxy's OWN compression state.
  *
@@ -19,11 +25,8 @@ import { hashId } from "./util.js";
  * compression-state store). It is NEVER sent upstream — it embeds the key and
  * upstream origin, which the upstream either already knows or must not see.
  *
- * If a separate per-conversation signal is needed for upstream routing (e.g.
- * to keep a multi-account load-balancer's prefix cache warm), use
- * `affinityToken()` below — it is the conversation dimension alone, formatted
- * to mirror OpenCode's `x-session-affinity` header so upstreams/LBs that
- * understand that convention work without bespoke support.
+ * If a client-provided per-conversation signal is needed for upstream routing,
+ * use `affinityToken()` below. Generated proxy identities are never forwarded.
  */
 
 /** Extract the account credential from common auth headers, verbatim.
@@ -44,7 +47,7 @@ function extractKey(headers: Record<string, string | string[] | undefined>): str
 
 /** Pull a client-provided conversation signal from headers, if any. */
 export function clientConversationHeader(headers: Record<string, string | string[] | undefined>): string | undefined {
-    const names = ["x-session-affinity", "x-acp-session", "x-session-id", "x-opencode-session"];
+    const names = ["x-session-affinity", "x-acp-session", "x-session-id", "x-opencode-session", "session-id", "session_id"];
     for (const name of names) {
         const v = headers[name];
         if (typeof v === "string" && v.trim().length > 0) return v.trim();
@@ -73,17 +76,9 @@ export function deriveSessionId(
 }
 
 /**
- * The conversation dimension alone, formatted as OpenCode's
- * `x-session-affinity: ses_<hash>` value. Suitable for forwarding to an
- * upstream that understands that convention (e.g. a multi-account
- * load-balancer doing sticky routing). Contains NO key or upstream, so it is
- * safe to send upstream and stable across account rotations.
+ * Return only an identity the client already supplied. Generated identities
+ * remain proxy-internal so billion-context does not invent upstream headers.
  */
-export function affinityToken(
-    headers: Record<string, string | string[] | undefined>,
-    conversation: string,
-): string {
-    const client = clientConversationHeader(headers);
-    if (client) return client;
-    return `ses_${conversation}`;
+export function affinityToken(identity: ConversationIdentity): string | undefined {
+    return identity.clientProvided ? identity.value : undefined;
 }

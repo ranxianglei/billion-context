@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { deriveSessionId, affinityToken, clientConversationHeader } from "../src/session-id.ts";
-import { conversationSignalResponses } from "../src/responses.ts";
+import { conversationIdentityResponses, conversationSignalResponses } from "../src/responses.ts";
 
 /** Helper: build a minimal headers object. */
 function hdrs(auth?: string, sessionAffinity?: string): Record<string, string> {
@@ -27,6 +27,12 @@ test("deriveSessionId: different API key → different session (no cross-account
     const a = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "hello world");
     const b = deriveSessionId(hdrs("Bearer keyB"), "anthropic", "https://bailian.example", "hello world");
     assert.notEqual(a, b);
+});
+
+test("deriveSessionId: credentials remain case-sensitive opaque values", () => {
+    const upper = deriveSessionId(hdrs("Bearer AbCd"), "responses", "https://chatgpt.com", "session");
+    const lower = deriveSessionId(hdrs("Bearer abcd"), "responses", "https://chatgpt.com", "session");
+    assert.notEqual(upper, lower);
 });
 
 test("deriveSessionId: different upstream origin → different session (no cross-provider bleed)", () => {
@@ -73,20 +79,12 @@ test("deriveSessionId: empty conversation dimension THROWS (no silent collapse)"
 });
 
 test("affinityToken: uses client signal when present (passthrough, preserves ses_ format)", () => {
-    const t = affinityToken(hdrs("Bearer k", "ses_opencode_xyz"), "convo-1");
+    const t = affinityToken({ value: "ses_opencode_xyz", source: "header", clientProvided: true });
     assert.equal(t, "ses_opencode_xyz");
 });
 
-test("affinityToken: falls back to ses_<convo> when no client signal", () => {
-    const t = affinityToken(hdrs("Bearer k"), "convo-hash-xyz");
-    assert.equal(t, "ses_convo-hash-xyz");
-    // Different conversation → different token.
-    assert.notEqual(t, affinityToken(hdrs("Bearer k"), "other-convo"));
-});
-
-test("affinityToken: protocolConversation (Responses previous_response_id) is just the conversation arg", () => {
-    const t = affinityToken(hdrs("Bearer k"), "resp_resp_abc123");
-    assert.equal(t, "ses_resp_resp_abc123");
+test("affinityToken: generated identities are never forwarded upstream", () => {
+    assert.equal(affinityToken({ value: "generated-random", source: "generated", clientProvided: false }), undefined);
 });
 
 test("clientConversationHeader: reads known session header names in priority order", () => {
@@ -94,15 +92,14 @@ test("clientConversationHeader: reads known session header names in priority ord
     assert.equal(clientConversationHeader({ "x-acp-session": "B" }), "B");
     assert.equal(clientConversationHeader({ "x-session-id": "C" }), "C");
     assert.equal(clientConversationHeader({ "x-opencode-session": "D" }), "D");
+    assert.equal(clientConversationHeader({ "session-id": "E" }), "E");
+    assert.equal(clientConversationHeader({ session_id: "F" }), "F");
     assert.equal(clientConversationHeader({}), undefined);
 });
 
 test("affinityToken is safe to send upstream: does NOT embed the API key", () => {
-    // The affinity token must be derivable from the conversation alone — an
-    // upstream that receives it should not be able to learn the key.
-    const withKeyA = affinityToken(hdrs("Bearer keyA"), "hello");
-    const withKeyB = affinityToken(hdrs("Bearer keyB"), "hello");
-    assert.equal(withKeyA, withKeyB, "affinity token identical regardless of key");
+    const token = affinityToken({ value: "client-session", source: "body-session", clientProvided: true });
+    assert.equal(token, "client-session");
 });
 
 test("conversationSignalResponses: prefers codex body.session_id (UUID) over previous_response_id and content hash", () => {
@@ -114,7 +111,10 @@ test("conversationSignalResponses: prefers codex body.session_id (UUID) over pre
         previous_response_id: "resp_abc",
     } as unknown as Parameters<typeof conversationSignalResponses>[0];
     const sig = conversationSignalResponses(body, undefined);
-    assert.equal(sig, "codex-019fdc81-a420-7a00-bbd1-0a64e3eb772c");
+    assert.equal(sig, "019fdc81-a420-7a00-bbd1-0a64e3eb772c");
+    const identity = conversationIdentityResponses(body, undefined);
+    assert.equal(identity.source, "body-session");
+    assert.equal(identity.clientProvided, true);
 });
 
 test("conversationSignalResponses: header (opencode x-session-affinity) still wins over body.session_id", () => {
@@ -128,19 +128,20 @@ test("conversationSignalResponses: header (opencode x-session-affinity) still wi
     assert.equal(sig, "ses_opencode-123");
 });
 
-test("conversationSignalResponses: falls back to previous_response_id when no session_id and no header", () => {
+test("conversationIdentityResponses: previous_response_id is not treated as a stable session", () => {
     const body = {
         input: "hello",
         previous_response_id: "resp_xyz",
     } as unknown as Parameters<typeof conversationSignalResponses>[0];
-    assert.equal(conversationSignalResponses(body, undefined), "resp-resp_xyz");
+    const identity = conversationIdentityResponses(body, undefined);
+    assert.equal(identity.source, "generated");
+    assert.equal(identity.clientProvided, false);
 });
 
-test("conversationSignalResponses: falls back to content hash when nothing else (pi path)", () => {
+test("conversationIdentityResponses: identical anonymous openers stay isolated", () => {
     const body = { input: "hello world" } as unknown as Parameters<typeof conversationSignalResponses>[0];
-    // No header, no session_id, no previous_response_id → deterministic hash.
     const a = conversationSignalResponses(body, undefined);
     const b = conversationSignalResponses({ input: "hello world" } as never, undefined);
-    assert.equal(a, b);
-    assert.ok(/^[0-9a-f]{16}$/.test(a), `expected content-hash id, got ${a}`);
+    assert.notEqual(a, b);
+    assert.match(a, /^generated-[0-9a-f-]{36}$/);
 });

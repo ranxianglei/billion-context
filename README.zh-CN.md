@@ -96,7 +96,27 @@ base_url = "http://localhost:8787/bili/https://api.openai.com/v1"
 
 **其他 API-key 客户端(Cursor / Aider / Continue ……)** —— 只要配置了上游 URL,前面加 `http://localhost:8787/bili/` 就行,其他都不用改。
 
-#### B. 登录/订阅客户端(MITM 透明代理)
+#### B. Codex 路由(API key 或 ChatGPT 订阅)
+
+Codex 不需要改 `model_provider`,也不需要信任 MITM 证书。启动 bili,打开
+[http://localhost:8787/__bili/](http://localhost:8787/__bili/),在“路由”页启用
+**Codex 路由**。脚本化启动时,先启用路由,再启动拥有它的服务:
+
+```bash
+bili codex enable --port 8787
+bili start --port 8787
+```
+
+billion-context 只解析当前激活的 Codex provider,记录它的真实 `base_url`,
+并临时只把这个字段替换成 `http://127.0.0.1:8787/codex`。provider id 始终
+不变,所以现有 Codex 历史仍在同一个分桶。关闭路由或正常停止拥有该路由的
+bili 进程时会恢复原字段;路由期间用户自己做的新修改会被保留。异常退出留下
+的接管状态会在下次启动 bili 时安全恢复。
+
+“路由”页还提供旧版 bili 测试 provider 会话的手动修复:先预览、先备份、再
+修复。正常路由绝不会自动迁移 Codex 历史。
+
+#### C. 其他登录/订阅客户端(MITM 透明代理)
 
 需要 **登录账号**的客户端(ChatGPT Plus/Pro、Claude、ZCode coding plan
 ……)通过 **OAuth 认证,且硬编码了端点**——你改不了 baseURL,所以 `/bili/`
@@ -107,7 +127,7 @@ base_url = "http://localhost:8787/bili/https://api.openai.com/v1"
 | 客户端 | 登录方式 | 硬编码端点 | 状态 |
 |---|---|---|---|
 | **ZCode** | 智谱 coding plan(OAuth) | `open.bigmodel.cn`(内置 provider) | ✅ 已测试 |
-| **Codex** | ChatGPT 账号(OAuth) | `chatgpt.com/backend-api` | ❓ 未测试(可能不支持,需验证) |
+| **Codex** | ChatGPT 账号(OAuth) | `chatgpt.com/backend-api` | ✅ 优先使用上面的 Codex 路由;MITM 仅作 fallback |
 | **Claude Code** | Claude 订阅(OAuth) | `api.anthropic.com` | ❓ 未测试(可能不支持,需验证) |
 
 MITM 模式原理:这类客户端只提供 **HTTP 代理**设置,所以它发送
@@ -130,8 +150,8 @@ MITM 默认开启,且只对一份 **白名单**中的模型域名(`open.bigmodel
    - **HTTP 代理**:`http://127.0.0.1:8787`
    - **代理 CA 证书路径**:`~/.local/share/billion-context/ca/root-ca.pem`
    - (可选)**不走代理列表**:`localhost,127.0.0.1`
-   - (ZCode 具体位置:**设置 → 网络**。Codex/Claude Code:设 `HTTPS_PROXY`
-     环境变量 + `NODE_EXTRA_CA_CERTS` 指向 CA 路径。)
+   - (ZCode 具体位置:**设置 → 网络**。Claude Code:设 `HTTPS_PROXY` 环境变量
+     + `NODE_EXTRA_CA_CERTS` 指向 CA 路径。)
 
 3. 重启客户端。它的模型流量现在会经过 billion-context 并注入压缩。发一条消息,看 proxy 日志(`~/.local/state/billion-context/bili.log`)应出现
    `mitm <域名>:443 tunnel established`。
@@ -367,14 +387,18 @@ key 就是客户端写在 `/bili/` 后面的那个字符串:
 ```
 
 规则:
-- **全局 `proxy`**(顶层)对所有提供商的出站生效。
-- **按 URL 的 `proxy`** 覆盖该域名的全局设置。
+- **按 URL 的 `proxy`** 对匹配的 provider URL 优先级最高。
+- 其余优先级为:`BILI_UPSTREAM_PROXY` → Web UI 手动代理 → 顶层 `proxy` →
+  `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` → Windows 系统代理 → 直连。
 - 空字符串 `""` 表示**明确直连**(覆盖并禁用)。
-- 都不配 = 直连。
-- 只支持 HTTP 代理(`http://host:port`)。SOCKS5 暂不支持。
+- 自动模式会让环境/系统 fallback 遵守 `NO_PROXY` 与 Windows 绕过列表。
+  指回 bili 自己本地端口的代理会被跳过或拒绝,防止自环。
+- 支持 HTTP 和 HTTPS 代理 origin。SOCKS5 暂不支持。
 - 两条出站路径都覆盖:`/bili/` 路径模式(fetch)和 MITM CONNECT 隧道(代理连接真实上游的链路走 HTTP CONNECT 代理)。
 
-环境变量覆盖:`BILI_UPSTREAM_PROXY=http://127.0.0.1:20172`(等同全局 `proxy`;两者都设时配置文件优先)。
+环境变量覆盖:`BILI_UPSTREAM_PROXY=http://127.0.0.1:20172`(优先于配置文件)。
+Windows 下会自动发现常见 Clash/Mihomo 静态系统代理;Web UI 会显示实际来源,
+以及 Internet Settings 中检测到的 PAC URL。
 
 **MITM 与 `/bili/` —— 用 scheme 区分。** 登录客户端(ZCode 走 MITM)和 API-key 客户端可能连同一个域名(`open.bigmodel.cn`)。为了让它们的配置能区分,MITM 流量在查找键里用 `mitm://` scheme,`/bili/` 流量用真实的 `https://`:
 
