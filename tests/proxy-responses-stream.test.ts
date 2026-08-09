@@ -155,3 +155,27 @@ test("compressLoopResponsesStream: Codex text protocol never sends synthetic fun
         globalThis.fetch = originalFetch;
     }
 });
+
+test("compressLoopResponsesStream: Codex code_mode custom_tool_call passes through in text-protocol (regression for 无法使用工具)", async () => {
+    const events = [
+        sse("response.created", { response: { id: "resp_ctc", status: "in_progress" } }),
+        sse("response.output_item.added", { item: { type: "message", id: "msg_ctc", role: "assistant", content: [] }, output_index: 0 }),
+        sse("response.output_text.delta", { item_id: "msg_ctc", output_index: 0, delta: "Running ls." }),
+        sse("response.output_item.done", { item: { type: "message", id: "msg_ctc" }, output_index: 0 }),
+        sse("response.output_item.added", { item: { type: "custom_tool_call", id: "ctc_1", call_id: "call_ctc_1", name: "shell", input: "" }, output_index: 1 }),
+        sse("response.custom_tool_call.input_text.delta", { item_id: "ctc_1", delta: '{"cmd":"ls"}' }),
+        sse("response.output_item.done", { item: { type: "custom_tool_call", id: "ctc_1", call_id: "call_ctc_1", name: "shell", input: '{"cmd":"ls"}' }, output_index: 1 }),
+        sse("response.completed", { response: { id: "resp_ctc", status: "completed", output: [] } }),
+    ].join("");
+    const ctx = { ...makeCtx(() => {}), textProtocol: true };
+    const out = await drain(
+        new Response(events).body!,
+        ctx,
+        { model: "gpt-5", input: [{ type: "message", role: "user", content: "list files" }], stream: true },
+        { url: "http://unused", headers: {} },
+    );
+    assert.ok(out.includes("custom_tool_call"), "custom_tool_call item reaches the client in text-protocol");
+    assert.ok(out.includes('"shell"'), "code_mode tool name preserved");
+    assert.ok(out.includes("Running ls."), "assistant text still emitted");
+    assert.ok(out.includes("response.completed"), "completion emitted");
+});

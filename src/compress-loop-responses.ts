@@ -150,6 +150,14 @@ interface ResponsesEventDisposition {
     terminalRaw?: string;
     responseObj?: Record<string, unknown> | null;
     isMeta?: boolean;
+    /** Bypass the text-protocol realtime buffer for host tool calls (Codex
+     *  code_mode `custom_tool_call`). They never carry an ACP compress trigger,
+     *  so buffering only drops them — the end-of-turn rebuild re-emits output_text
+     *  only. Required for Codex tools to work in text-protocol mode. */
+    noBuffer?: boolean;
+    /** A `custom_tool_call` output_item finalized this round (for [acp-diag];
+     *  the function_call-only allCalls would otherwise hide code_mode usage). */
+    customToolCallDone?: boolean;
 }
 
 function classifyResponsesSseEvent(eventStr: string): ResponsesEventDisposition {
@@ -183,6 +191,7 @@ function classifyResponsesSseEvent(eventStr: string): ResponsesEventDisposition 
                 };
                 return out;
             }
+            if (item?.type === "custom_tool_call") out.noBuffer = true;
             out.yieldChunk = Buffer.from(eventStr + "\n\n", "utf8");
             return out;
         }
@@ -210,6 +219,10 @@ function classifyResponsesSseEvent(eventStr: string): ResponsesEventDisposition 
             if (item?.type === "function_call") {
                 out.fcDone = { itemId: typeof item.id === "string" ? item.id : "" };
                 return out;
+            }
+            if (item?.type === "custom_tool_call") {
+                out.noBuffer = true;
+                out.customToolCallDone = true;
             }
             out.yieldChunk = Buffer.from(eventStr + "\n\n", "utf8");
             return out;
@@ -239,6 +252,7 @@ function classifyResponsesSseEvent(eventStr: string): ResponsesEventDisposition 
             out.terminalRaw = eventStr;
             return out;
         default:
+            if (type.startsWith("response.custom_tool_call.")) out.noBuffer = true;
             out.yieldChunk = Buffer.from(eventStr + "\n\n", "utf8");
             return out;
     }
@@ -413,6 +427,7 @@ export async function* compressLoopResponsesStream(
 
         const fcByItemId = new Map<string, FunctionCallAccumulator>();
         let contentText = "";
+        let customToolCalls = 0;
         let completed = false;
         let terminalKind: "completed" | "incomplete" | "failed" | "error" | null = null;
         let terminalRaw: string | null = null;
@@ -445,7 +460,7 @@ export async function* compressLoopResponsesStream(
                     // strip the <acp_compress> trigger before the client sees it;
                     // we re-emit a clean message item at round end. Meta-start
                     // events still open the stream in round 1.
-                    if (d.yieldChunk && (isFirstRound || !d.isMeta) && !(textProtocol && !d.isMeta)) {
+                    if (d.yieldChunk && (isFirstRound || !d.isMeta) && !(textProtocol && !d.isMeta && !d.noBuffer)) {
                         yield d.yieldChunk;
                     }
                     if (d.contentDelta) contentText += d.contentDelta;
@@ -469,6 +484,7 @@ export async function* compressLoopResponsesStream(
                             existing.arguments = args;
                         }
                     }
+                    if (d.customToolCallDone) customToolCalls++;
                     if (d.terminal) {
                         completed = true;
                         terminalKind = d.terminalKind ?? null;
@@ -525,7 +541,7 @@ export async function* compressLoopResponsesStream(
         const proxyCalls = allCalls.filter((c) => PROXY_TOOL_NAMES.has(c.name));
         const realCalls = allCalls.filter((c) => !PROXY_TOOL_NAMES.has(c.name));
         // DIAG: log what tools the upstream returned this round.
-        loggerLog("debug", `[acp-diag] round ${loopCount} allCalls=[${allCalls.map((c) => c.name).join(",")}] realCalls=[${realCalls.map((c) => c.name).join(",")}] text=${JSON.stringify(contentText.slice(0, 120))}`);
+        loggerLog("debug", `[acp-diag] round ${loopCount} allCalls=[${allCalls.map((c) => c.name).join(",")}] realCalls=[${realCalls.map((c) => c.name).join(",")}] customToolCalls=${customToolCalls} text=${JSON.stringify(contentText.slice(0, 120))}`);
         const hasOnlyProxy = proxyCalls.length > 0 && realCalls.length === 0;
 
         if (!hasOnlyProxy) {
