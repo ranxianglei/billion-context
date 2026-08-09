@@ -34,10 +34,12 @@ import {
 import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, withSessionLock } from "./session.js";
 import { COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressTextSystemPrompt } from "./compress-tool.js";
 import { rewriteSseStream, rewriteJsonResponse, type RewriteCtx } from "./stream.js";
+import { applyRanges } from "./stream.js";
 import { renderUI, handleConfigGet, handleConfigPut } from "./web.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { getStore } from "./persist.js";
 import { compressLoopStream } from "./compress-loop.js";
+import { compressLoopAnthropicStream } from "./compress-loop-anthropic.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger } from "./logger.js";
 import { defaultLogFile } from "./paths.js";
 import { compressLoopResponsesStream } from "./compress-loop-responses.js";
@@ -860,8 +862,20 @@ async function forward(
                 if (!res.write(chunk)) await new Promise<void>((r) => res.once("drain", () => r()));
             }
         } else {
-            const rewriter = rewriteSseStream(streamToRead, ctx);
-            for await (const chunk of rewriter) {
+            const parsedReq = JSON.parse(typeof body === "string" ? body : body.toString("utf8"));
+            const reqHeaders: Record<string, string> = {};
+            for (const [k, v] of Object.entries(headers)) {
+                if (k.toLowerCase() === "content-length" || k.toLowerCase() === "host") continue;
+                reqHeaders[k] = v;
+            }
+            reqHeaders["content-type"] = "application/json";
+            const loop = compressLoopAnthropicStream(
+                streamToRead,
+                { core, config, messages: prepared.processedMessages, session: prepared.session, log: ctx.log },
+                parsedReq,
+                { url: upstreamUrl, headers: reqHeaders },
+            );
+            for await (const chunk of loop) {
                 {
                     const s = chunk.toString("utf8");
                     if (s.includes("\x3cacp ") || s.includes("\x3c/acp")) {
