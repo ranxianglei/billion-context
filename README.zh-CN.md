@@ -44,7 +44,7 @@ npm install -g billion-context
 
 两种方式 —— 任选其一:
 
-- **零配置(最简单):** 在客户端 baseURL 前面加上代理地址 + `/bili/`。无需配置文件 —— context 窗口自动从 [models.dev](https://models.dev) registry 查询。
+- **零配置(最简单):** 在客户端 baseURL 前面加上代理地址 + `/bili/`。无需配置文件 —— context 窗口自动从 [models.dev](https://models.dev) registry 查询。`/bili/` 前缀还是个自检测信号:billion-context 的客户端扩展(billion-context-pi / opencode-acp)能在自己的 baseUrl 里认出它并自禁用,避免双层压缩。
 - **命名 provider:** 在配置文件里声明 provider,然后用更短的 `http://localhost:8787/<name>/...` URL。适合管理多个端点或需要显式指定按模型 context 的场景。
 
 压缩是自动注入的 —— 你只需配置路由,无需配置压缩本身。
@@ -95,6 +95,8 @@ base_url = "http://localhost:8787/bili/https://api.openai.com/v1"
 **其他客户端(Cursor / Aider / Continue ……)** —— 只要配置了上游 URL,前面加 `http://localhost:8787/bili/` 就行,其他都不用改。
 
 ### 方式 B —— 命名 provider(配置文件)
+
+三步:**启动代理 → 配置 provider → 把客户端指向它**。
 
 ### 第 1 步 —— 启动代理
 
@@ -174,8 +176,7 @@ base_url = "http://localhost:8787/zhipu/api/coding/paas/v4"
 
 #### 其他客户端(Cursor / Aider / Continue …)
 
-暂不支持。代理目前说 Anthropic、OpenAI chat-completions、OpenAI Responses
-三种协议 —— 如果你的客户端用别的协议或非标准 auth header,还用不了。
+只要客户端能设 base URL,就像上面的例子一样指向代理(零配置 `/bili/` 前缀或命名 `/<provider>/` 前缀)。代理说 Anthropic、OpenAI chat-completions、OpenAI Responses 三种协议 —— 用其中任一种的客户端都能工作。用别的协议或非标准 auth header 的客户端暂时还不行。
 
 ### 手动配置文件
 
@@ -220,7 +221,7 @@ acp-proxy listening on http://127.0.0.1:8787 — routes: anthropic=https://api.a
 - **生成客户端 URL** —— 选一个 provider,得到可直接复制的配置片段(Pi / OpenCode / Codex 的 `baseUrl`/`baseURL`/`base_url` 一行,已填好代理地址 + provider 名)。
 - **查看会话** —— 实时会话表(请求数、省的 token、最后活跃时间),自动刷新。
 
-改完 providers 需要**重启 bili** 才生效(UI 会提醒你)。
+用 **Apply** 按钮可以热加载 provider 路由到运行中的进程,无需重启(只有 `port`/`host` 需要重启,因为监听 socket 已经绑了)。
 
 ### 验证
 
@@ -421,7 +422,7 @@ bili --no-auto-update        # 本次启动禁用自动更新
 
 ## 状态
 
-早期。协议处理和压缩已通过 mock 测试(141 项通过)。真实模型集成测试是下一里程碑。预期会有粗糙的地方。
+早期。协议处理和压缩已通过 mock 测试(146 项通过)。真实模型集成测试是下一里程碑。预期会有粗糙的地方。
 
 pi 扩展模式(进程内、更紧密集成、参考实现)见 [billion-context-pi](https://github.com/ranxianglei/billion-context-pi)。
 
