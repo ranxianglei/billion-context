@@ -374,6 +374,23 @@ key 就是客户端写在 `/bili/` 后面的那个字符串:
 
 环境变量覆盖:`BILI_UPSTREAM_PROXY=http://127.0.0.1:20172`(等同全局 `proxy`;两者都设时配置文件优先)。
 
+**MITM 与 `/bili/` —— 用 scheme 区分。** 登录客户端(ZCode 走 MITM)和 API-key 客户端可能连同一个域名(`open.bigmodel.cn`)。为了让它们的配置能区分,MITM 流量在查找键里用 `mitm://` scheme,`/bili/` 流量用真实的 `https://`:
+
+| 客户端 | 查找键示例 |
+|---|---|
+| ZCode(MITM,登录态)| `mitm://open.bigmodel.cn` |
+| API-key 客户端(`/bili/`)| `https://open.bigmodel.cn/api/anthropic` |
+
+所以你可以给 ZCode 单独配代理,不影响 API-key 客户端:
+```jsonc
+{
+  "providers": {
+    "mitm://open.bigmodel.cn":            { "proxy": "http://127.0.0.1:20173" },
+    "https://open.bigmodel.cn/api/anthropic": { "proxy": "http://127.0.0.1:20172" }
+  }
+}
+```
+
 ## 会话机制
 
 代理需要一个稳定的、按会话标识的 ID,以便在多个用户/账号并发时隔离压缩状态。它从四个维度推导一个(见 `src/session-id.ts`):**协议 × 上游 origin × API key × 会话**。前三个防止跨账号 / 跨 provider 串数据;会话维度来自客户端发送的内容。

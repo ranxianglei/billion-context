@@ -440,6 +440,27 @@ Rules:
 Env override: `BILI_UPSTREAM_PROXY=http://127.0.0.1:20172` (same as global
 `proxy`; config file wins over env if both set).
 
+**MITM vs `/bili/` — distinguishing the key scheme.** A login client
+(ZCode via MITM) and an API-key client can both hit the same host
+(`open.bigmodel.cn`). To let their config differ, MITM traffic uses a
+`mitm://` scheme in the lookup key while `/bili/` traffic uses the real
+`https://`:
+
+| Client | Lookup key example |
+|---|---|
+| ZCode (MITM, login) | `mitm://open.bigmodel.cn` |
+| API-key client (`/bili/`) | `https://open.bigmodel.cn/api/anthropic` |
+
+So you can give ZCode its own proxy without affecting API-key clients:
+```jsonc
+{
+  "providers": {
+    "mitm://open.bigmodel.cn":            { "proxy": "http://127.0.0.1:20173" },
+    "https://open.bigmodel.cn/api/anthropic": { "proxy": "http://127.0.0.1:20172" }
+  }
+}
+```
+
 ## How sessions work
 
 The proxy needs a stable per-conversation identifier to isolate compression

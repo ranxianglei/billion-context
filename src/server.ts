@@ -73,7 +73,14 @@ export function resolveUpstream(_opts: ProxyOptions, reqUrl: string, req?: http.
     // forwarded verbatim → subscription auth preserved, no MITM of creds.
     const mitmUpstream = readMitmUpstream(req?.socket);
     if (mitmUpstream) {
-        return { upstream: mitmUpstream, rewrittenUrl: mitmUpstream + (reqUrl ?? "") };
+        // Use a `mitm://` scheme in rewrittenUrl so per-URL config (proxy,
+        // context overrides) can DISTINGUISH MITM traffic from /bili/ path
+        // traffic to the SAME host. The real upstream stays https:// (in
+        // `upstream`) for the actual fetch; forward() strips the mitm:// scheme
+        // back to https:// before calling fetch (fetch would reject mitm://).
+        // Mapping is bijective: mitm://<host><path> ⟺ https://<host><path>.
+        const mitmKey = mitmUpstream.replace(/^https:\/\//, "mitm://");
+        return { upstream: mitmUpstream, rewrittenUrl: mitmKey + (reqUrl ?? "") };
     }
     // Zero-config mode: a request like `/bili/https://open.bigmodel.cn/api/anthropic`
     // embeds the full upstream URL after the `/bili/` prefix. Strip the prefix,
@@ -762,7 +769,11 @@ async function forward(
     route: ReturnType<typeof resolveUpstream>,
     affinity?: string,
 ): Promise<void> {
-    const upstreamUrl = route ? route.rewrittenUrl : opts.upstream + (req.url ?? "");
+    // rewrittenUrl may use a `mitm://` scheme (for config-lookup distinction
+    // — see resolveUpstream). fetch needs the real https:// scheme, so strip
+    // mitm:// back to https:// for the actual upstream request.
+    const rewritten = route ? route.rewrittenUrl : opts.upstream + (req.url ?? "");
+    const upstreamUrl = rewritten.replace(/^mitm:\/\//, "https://");
     // Show the final proxied URL (where the request actually lands) as the
     // primary signal. The provider label is appended only for named routes —
     // zero-config requests have a single routing mode now, so the final
