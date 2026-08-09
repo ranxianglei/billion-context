@@ -308,7 +308,7 @@ with no file at all).
 | `ACP_AUTO_UPDATE` | `1` | Set `0` to disable background self-update |
 | `ACP_LOG_FILE` | *XDG state path* | Log file path (`off` disables the file, keeps stderr) |
 | `ACP_DUMP_SSE` | *(none)* | Directory to dump SSE for debugging |
-| `ACP_REASONING_KEEP` | `recent` | Responses-API only: how `reasoning` items from previous responses are carried. `recent` keeps only the most recent response's reasoning (drops old chain-of-thought that accumulates every turn and breaks the prompt-cache prefix); `all` re-sends every historical reasoning item (legacy); `none` drops all reasoning. |
+| `ACP_REASONING_KEEP` | `recent` | Responses-API only: how `reasoning` items from previous responses are carried. `recent` keeps only the most recent response's reasoning (drops old chain-of-thought that accumulates every turn — a major context-size reduction); `all` re-sends every historical reasoning item (legacy); `none` drops all reasoning. |
 | `BILI_PERSIST` | `1` | Set `0` to disable session persistence (in-memory only, lost on restart) |
 | `BILI_PERSIST_DEBOUNCE_MS` | `500` | Debounce window for writes to disk (ms) |
 | `BILI_MAX_SESSIONS` | `256` | Max sessions held in memory (LRU eviction; disk is source of truth) |

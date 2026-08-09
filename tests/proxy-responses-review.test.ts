@@ -135,6 +135,22 @@ test("responses: recent mode keeps reasoning when it is the only (most recent) r
     assert.equal(reasoningOf(preamble).length, 2, "reasoning after the only user message is the most recent response and is kept");
 });
 
+test("responses: computer_call_output is a turn boundary (CUA loop)", () => {
+    const body = {
+        model: "computer-use-preview",
+        input: [
+            { type: "message", role: "user", content: "click the button" },
+            { type: "reasoning", id: "rs_cua_old" },
+            { type: "computer_call", call_id: "cc1", action: {}, status: "completed" },
+            { type: "computer_call_output", call_id: "cc1", output: {} },
+            { type: "reasoning", id: "rs_cua_new" },
+        ],
+    };
+    const { preamble } = runWithReasoningKeep(undefined, body);
+    const ids = reasoningOf(preamble).map((r) => (r as { id: string }).id);
+    assert.deepEqual(ids, ["rs_cua_new"], "only reasoning after the last computer_call_output survives");
+});
+
 // Review #2: response.failed terminal is replayed verbatim and NOT followed by
 // a fabricated response.completed (which would contradict the failure).
 test("compressLoopResponsesStream: response.failed is replayed without a contradictory completed", async () => {

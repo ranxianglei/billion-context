@@ -96,17 +96,18 @@ function isOpaqueItem(it: ResponseInputItem): boolean {
     return OPAQUE_ITEM_TYPES.has(it.type);
 }
 
-/** External-input items (user messages, tool outputs) mark turn boundaries.
- *  Reasoning at or before the LAST one belongs to an old, completed model
- *  response and is dropped (see getReasoningKeepMode). `computer_call_output`
- *  is intentionally excluded: it is itself an opaque item the host
- *  re-injects, not a fresh external input. */
+/** External-input items (user messages and tool outputs) mark turn boundaries
+ *  between model responses. Reasoning at or before the LAST one belongs to an
+ *  old, completed model response and is dropped (see getReasoningKeepMode).
+ *  This mirrors OpenAI's stateless contract: each `reasoning` + `*_call` is a
+ *  discrete response, and only the immediately preceding response's reasoning
+ *  is needed to continue the chain. */
 function isExternalInputItem(it: ResponseInputItem): boolean {
     const t = it.type;
     if (t === "message") {
         return (it as ResponseInputMessage).role === "user";
     }
-    return t === "function_call_output" || t === "custom_tool_call_output";
+    return t === "function_call_output" || t === "custom_tool_call_output" || t === "computer_call_output";
 }
 
 /** Controls how `reasoning` items from previous model responses are handled.

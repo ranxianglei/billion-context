@@ -258,7 +258,7 @@ bili --no-auto-update        # 本次启动禁用自动更新
 | `ACP_AUTO_UPDATE` | `1` | 设 `0` 禁用后台自动更新 |
 | `ACP_LOG_FILE` | *XDG state 路径* | 日志文件路径(`off` 关闭文件,只保留 stderr) |
 | `ACP_DUMP_SSE` | *(无)* | 转储 SSE 用于调试的目录 |
-| `ACP_REASONING_KEEP` | `recent` | 仅 Responses API:控制如何携带历史 `reasoning` 项。`recent` 只保留最近一轮响应的 reasoning(丢弃每轮累积、会破坏 prompt-cache 前缀的旧思维链);`all` 每轮全量重发所有历史 reasoning(旧行为);`none` 丢弃全部 reasoning。 |
+| `ACP_REASONING_KEEP` | `recent` | 仅 Responses API:控制如何携带历史 `reasoning` 项。`recent` 只保留最近一轮响应的 reasoning(丢弃每轮累积的旧思维链,大幅减少上下文体量);`all` 每轮全量重发所有历史 reasoning(旧行为);`none` 丢弃全部 reasoning。 |
 | `BILI_PERSIST` | `1` | 设 `0` 禁用会话持久化(纯内存,重启丢失) |
 | `BILI_PERSIST_DEBOUNCE_MS` | `500` | 写磁盘的防抖窗口(毫秒) |
 | `BILI_MAX_SESSIONS` | `256` | 内存中保留的最大会话数(LRU 淘汰;磁盘是真相源) |
