@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createCore, createInitialState, defaultConfig, coveredMessageIds } from "acp-kernel";
 import type { Session } from "../src/session.ts";
-import { prepareCountTokens } from "../src/server.ts";
+import { prepareCountTokens, isCountTokensRequest } from "../src/server.ts";
 import { anthropicToCore, type AnthropicRequestBody } from "../src/anthropic.js";
 
 function makeSession(): Session {
@@ -68,24 +68,15 @@ test("prepareCountTokens prunes covered messages when a compression block is act
     assert.ok(logs.some((l) => /count_tokens pruned:/.test(l)), "should log the prune delta");
 });
 
-test("prepareCountTokens is READ-ONLY: session.state is unchanged", () => {
+test("prepareCountTokens is READ-ONLY: session.state + stats unchanged", () => {
     const { session, core, body } = buildSessionWithCoverage();
     const config = defaultConfig(200000);
-    const before = JSON.stringify({
-        blocks: session.state.blocks,
-        messageRefs: session.state.messageRefs,
-        nextBlockId: session.state.nextBlockId,
-        stats: session.state.stats,
-    });
+    const stateBefore = JSON.stringify(session.state);
+    const statsBefore = JSON.stringify(session.stats);
     const blockCountBefore = session.state.blocks.length;
     prepareCountTokens(body, core, config, () => {}, session);
-    const after = JSON.stringify({
-        blocks: session.state.blocks,
-        messageRefs: session.state.messageRefs,
-        nextBlockId: session.state.nextBlockId,
-        stats: session.state.stats,
-    });
-    assert.equal(after, before, "session.state must be byte-identical after prepareCountTokens");
+    assert.equal(JSON.stringify(session.state), stateBefore, "session.state byte-identical (incl. survivedCount/generation/nudge baselines)");
+    assert.equal(JSON.stringify(session.stats), statsBefore, "session.stats unchanged (requests/lastInputTokens)");
     assert.equal(session.state.blocks.length, blockCountBefore, "no new blocks created");
     assert.equal(coveredMessageIds(session.state).size, 15, "coverage unchanged");
 });
@@ -122,4 +113,30 @@ test("prepareCountTokens forwards unchanged body on prune failure", () => {
     const logs: string[] = [];
     prepareCountTokens(parsed, core, config, (_l, m) => logs.push(m), bogus);
     assert.ok(logs.some((l) => /count_tokens prune failed/i.test(l)), "should log the fallback warning");
+});
+
+test("isCountTokensRequest detects count_tokens URLs across path variants", () => {
+    assert.ok(isCountTokensRequest("POST", "/v1/messages/count_tokens", true));
+    assert.ok(isCountTokensRequest("POST", "/messages/count_tokens", true));
+    assert.ok(isCountTokensRequest("POST", "/some/prefix/messages/count_tokens", true));
+});
+
+test("isCountTokensRequest rejects non-count_tokens requests", () => {
+    assert.ok(!isCountTokensRequest("POST", "/v1/messages", true), "/v1/messages is a real turn, not count_tokens");
+    assert.ok(!isCountTokensRequest("GET", "/v1/messages/count_tokens", true), "GET is not a count body");
+    assert.ok(!isCountTokensRequest("POST", "/v1/messages/count_tokens", false), "empty body is not a count body");
+    assert.ok(!isCountTokensRequest("POST", "/v1/chat/completions", true), "openai endpoint");
+    assert.ok(!isCountTokensRequest("POST", "/v1/responses", true), "responses endpoint");
+});
+
+test("isCountTokensRequest honors ACP_COUNT_TOKENS_PASSTHROUGH=1 escape hatch", () => {
+    const prev = process.env.ACP_COUNT_TOKENS_PASSTHROUGH;
+    process.env.ACP_COUNT_TOKENS_PASSTHROUGH = "1";
+    try {
+        assert.ok(!isCountTokensRequest("POST", "/v1/messages/count_tokens", true), "passthrough=1 must skip compression");
+    } finally {
+        if (prev === undefined) delete process.env.ACP_COUNT_TOKENS_PASSTHROUGH;
+        else process.env.ACP_COUNT_TOKENS_PASSTHROUGH = prev;
+    }
+    assert.ok(isCountTokensRequest("POST", "/v1/messages/count_tokens", true), "restored env re-enables compression");
 });

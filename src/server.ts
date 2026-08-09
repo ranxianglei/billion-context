@@ -318,11 +318,7 @@ async function handle(
     // this count, so reporting the post-compression count keeps CC from ever
     // tripping autocompact (zero task drift). ACP_COUNT_TOKENS_PASSTHROUGH=1
     // restores the old "forward unchanged" behavior.
-    const countTokens =
-        req.method === "POST" &&
-        bodyBuffer.length > 0 &&
-        process.env.ACP_COUNT_TOKENS_PASSTHROUGH !== "1" &&
-        (urlPath.endsWith("/v1/messages/count_tokens") || urlPath.endsWith("/messages/count_tokens"));
+    const countTokens = isCountTokensRequest(req.method ?? "GET", urlPath, bodyBuffer.length > 0);
     const protocol: "anthropic" | "openai" | "responses" | null =
         req.method === "POST" && bodyBuffer.length > 0
             ? urlPath.endsWith("/chat/completions")
@@ -459,6 +455,15 @@ function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; cont
     return `[${sessionId}] nudge ${inject}: usage=${pct} (${tokenCount}/${limit}), growth=${growth}/${floor} (ref=${ref}, interval=${interval}), pendingT1=${pendingT1}/${interval}, reason="${n.reason.slice(0, 120)}"`;
 }
 
+export function isCountTokensRequest(method: string, urlPath: string, hasBody: boolean): boolean {
+    return (
+        method === "POST" &&
+        hasBody &&
+        process.env.ACP_COUNT_TOKENS_PASSTHROUGH !== "1" &&
+        urlPath.endsWith("/messages/count_tokens")
+    );
+}
+
 export function prepareCountTokens(
     parsed: AnthropicRequestBody,
     core: CompressionCore,
@@ -469,11 +474,13 @@ export function prepareCountTokens(
     const sessionId = session.id;
     try {
         const { msgs, cacheControls } = anthropicToCore(parsed);
-        // READ-ONLY: run the same processTurn as prepareAnthropic to mirror
-        // exactly what the next /v1/messages forwards (covered messages pruned,
-        // summaries injected, refs tagged), but DISCARD the returned state —
-        // count_tokens is a query and must not mutate session state or nudge.
-        // Verified: processTurn does not mutate the input state object.
+        // READ-ONLY mirror of the next /v1/messages turn (same processTurn:
+        // prune covered msgs, inject summaries, tag refs) so the relay counts
+        // the COMPRESSED context. Safety depends on acp-kernel syncBlocks
+        // deep-cloning input state (it bumps block.survivedCount in place);
+        // turn.state is discarded so nothing is stamped/created. If a future
+        // acp-kernel change reverts that clone this would silently corrupt
+        // session.state — the READ-ONLY test guards it.
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount: session.stats.lastInputTokens, renderTags: "text-only" });
         const rebuiltMessages = coreToAnthropic(turn.messages as BiliMessage[], cacheControls);
         log("info", `[${sessionId}] count_tokens pruned: ${msgs.length} → ${turn.messages.length} msgs`);
@@ -484,8 +491,12 @@ export function prepareCountTokens(
             originalMessages: msgs,
             protocol: "anthropic",
             stream: false,
+            // MUST stay false + empty processedMessages: keeps forward() on
+            // plain-pipeThrough so usage-capture/markDirty stays unreachable
+            // (else it poisons lastInputTokens with the compressed count and
+            // suppresses the proxy's own nudges).
             compressInjected: false,
-        } as Prepared;
+        };
     } catch (err) {
         log("warn", `[${sessionId}] count_tokens prune failed, forwarding unchanged: ${String(err)}`);
         return {
@@ -496,7 +507,7 @@ export function prepareCountTokens(
             protocol: "anthropic",
             stream: false,
             compressInjected: false,
-        } as Prepared;
+        };
     }
 }
 
