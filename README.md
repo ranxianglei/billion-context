@@ -123,11 +123,11 @@ change the baseURL, so the `/bili/` prefix trick doesn't work. These need
 
 Supported login clients:
 
-| Client | Login | Endpoint hardcoded |
-|---|---|---|
-| **ZCode** | bigmodel coding plan (OAuth) | `open.bigmodel.cn` (builtin provider) |
-| **Codex** | ChatGPT account (OAuth) | `chatgpt.com/backend-api` |
-| **Claude Code** | Claude subscription (OAuth) | `api.anthropic.com` |
+| Client | Login | Endpoint hardcoded | Status |
+|---|---|---|---|
+| **ZCode** | bigmodel coding plan (OAuth) | `open.bigmodel.cn` (builtin provider) | ✅ tested |
+| **Codex** | ChatGPT account (OAuth) | `chatgpt.com/backend-api` | ⚠️ untested |
+| **Claude Code** | Claude subscription (OAuth) | `api.anthropic.com` | ⚠️ untested |
 
 How MITM mode works: the client only offers an **HTTP proxy** setting, so it
 sends `CONNECT <host>:443`; billion-context terminates the TLS locally (with a
