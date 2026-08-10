@@ -121,6 +121,7 @@ test("/codex integration preserves query, subscription, account and thread heade
         debug: false,
         passthrough: true,
         autoUpdate: false,
+        updateMode: "auto",
         mitm: { enabled: false, domains: [] },
     };
     const bili = await startServer(opts);

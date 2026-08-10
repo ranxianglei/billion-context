@@ -16,11 +16,14 @@ import {
 import { log } from "../logger.js";
 import { validateHttpProxy } from "../upstream-proxy.js";
 import { previewLegacyCodexHistory, repairLegacyCodexHistory } from "../codex-history.js";
+import { getUpdateStatus, runScheduledUpdate, installUpdate, type UpdateOptions } from "../update.js";
 
 type ConfigShape = Record<string, unknown> & {
     providers?: Record<string, unknown>;
     upstreamProxy?: string;
     upstreamProxyMode?: string;
+    update?: { mode?: string };
+    compress?: { nudgeGrowthTokens?: number };
 };
 
 function readConfig(): ConfigShape {
@@ -64,12 +67,15 @@ function atomicWriteConfig(config: ConfigShape): void {
 
 export async function handleConfigGet(res: ServerResponse): Promise<void> {
     const upstream = readUpstreamSettings();
+    const config = readConfig();
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
         path: configFile(),
         providers: readProviders(),
         upstreamProxy: upstream.proxy ?? null,
         upstreamProxyMode: upstream.mode,
+        updateMode: config.update?.mode ?? null,
+        nudgeGrowthTokens: config.compress?.nudgeGrowthTokens ?? null,
     }, null, 2));
 }
 
@@ -85,7 +91,11 @@ export async function handleConfigPut(
     const hasProviders = Object.prototype.hasOwnProperty.call(body, "providers");
     const hasProxy = Object.prototype.hasOwnProperty.call(body, "upstreamProxy");
     const hasMode = Object.prototype.hasOwnProperty.call(body, "upstreamProxyMode");
-    if (!hasProviders && !hasProxy && !hasMode) return sendError(res, 400, "expected providers or upstream proxy settings");
+    const hasUpdateMode = Object.prototype.hasOwnProperty.call(body, "updateMode");
+    const hasNudgeGrowthTokens = Object.prototype.hasOwnProperty.call(body, "nudgeGrowthTokens");
+    if (!hasProviders && !hasProxy && !hasMode && !hasUpdateMode && !hasNudgeGrowthTokens) {
+        return sendError(res, 400, "expected providers, upstream proxy settings, updateMode, or nudgeGrowthTokens");
+    }
 
     const routes: Record<string, ProviderRoute> = {};
     if (hasProviders) {
@@ -123,6 +133,25 @@ export async function handleConfigPut(
         return sendError(res, 400, "manual mode requires an upstream proxy URL");
     }
 
+    let updateMode: string | undefined;
+    if (hasUpdateMode) {
+        if (body.updateMode !== null && (typeof body.updateMode !== "string" || !["auto", "check", "manual"].includes(body.updateMode))) {
+            return sendError(res, 400, "updateMode must be auto, check, manual, or null");
+        }
+        updateMode = typeof body.updateMode === "string" ? body.updateMode : undefined;
+    }
+    let nudgeGrowthTokens: number | undefined;
+    if (hasNudgeGrowthTokens) {
+        if (body.nudgeGrowthTokens !== null && body.nudgeGrowthTokens !== undefined) {
+            const value = body.nudgeGrowthTokens;
+            const num = typeof value === "number" ? value : Number(String(value).trim());
+            if (!Number.isFinite(num) || num <= 0 || !Number.isInteger(num)) {
+                return sendError(res, 400, "nudgeGrowthTokens must be a finite positive integer (> 0) or null");
+            }
+            nudgeGrowthTokens = num;
+        }
+    }
+
     const config = readConfig();
     if (hasProviders) config.providers = routes;
     if (hasProxy) {
@@ -130,6 +159,14 @@ export async function handleConfigPut(
         else delete config.upstreamProxy;
     }
     if (hasMode && mode) config.upstreamProxyMode = mode;
+    if (hasUpdateMode) {
+        if (updateMode) config.update = { ...(config.update ?? {}), mode: updateMode };
+        else if (config.update) delete config.update.mode;
+    }
+    if (hasNudgeGrowthTokens) {
+        if (nudgeGrowthTokens) config.compress = { ...(config.compress ?? {}), nudgeGrowthTokens };
+        else if (config.compress) delete config.compress.nudgeGrowthTokens;
+    }
     try {
         atomicWriteConfig(config);
         onChanged?.();
@@ -159,6 +196,28 @@ export async function handleCodexHistoryRepair(res: ServerResponse): Promise<voi
     } catch (error) {
         sendError(res, 409, String(error));
     }
+}
+
+/** GET /__bili/update/status — current update state (mode, versions, last
+ *  check/install outcome). Never touches the network. */
+export function handleUpdateStatus(res: ServerResponse): void {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(getUpdateStatus()));
+}
+
+/** POST /__bili/update/check — run one explicit check now (bypasses throttle).
+ *  Respects the mode: auto/check report; only auto installs. */
+export async function handleUpdateCheck(res: ServerResponse, opts: UpdateOptions): Promise<void> {
+    await runScheduledUpdate(opts, true);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(getUpdateStatus()));
+}
+
+/** POST /__bili/update/install — check + install the latest version now. */
+export async function handleUpdateInstall(res: ServerResponse, opts: UpdateOptions): Promise<void> {
+    const result = await installUpdate(opts);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: result.ok, error: result.error ?? null, installedTo: result.installedTo ?? null, ...getUpdateStatus() }));
 }
 
 function sendError(res: ServerResponse, status: number, message: string): void {

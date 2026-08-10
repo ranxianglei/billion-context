@@ -8,6 +8,9 @@ export {
     handleCodexHistoryRepair,
     handleConfigGet,
     handleConfigPut,
+    handleUpdateStatus,
+    handleUpdateCheck,
+    handleUpdateInstall,
     readProviders,
     readUpstreamSettings,
 } from "./api.js";

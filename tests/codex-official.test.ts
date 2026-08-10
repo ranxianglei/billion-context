@@ -58,6 +58,7 @@ test("Codex official transport preserves OAuth headers, decodes bodies, and reba
         debug: false,
         passthrough: false,
         autoUpdate: false,
+        updateMode: "auto",
         mitm: { enabled: false, domains: [] },
     };
     const proxy = await startServer(opts);

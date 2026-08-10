@@ -1,13 +1,18 @@
 /**
- * Auto-update: periodically checks the npm registry for a newer version of
- * billion-context and installs it by downloading the tarball and extracting
- * it over the current installation.
+ * Self-update: checks the npm registry for a newer version of billion-context
+ * and optionally installs it by downloading the tarball and extracting it over
+ * the current installation.
  *
- * Why tarball (not `npm install -g`):
- *  - Users may not have installed via npm (homebrew, manual, etc.).
- *  - `npm install -g` needs global write permissions and may fail silently.
- *  - Tarball extraction works for any install location, as long as the
- *    install directory is writable.
+ * 3-state update mode (see `UpdateMode` in config.ts):
+ *  - auto:   startup + periodic check, newer version auto-installed.
+ *  - check:  startup + periodic check, only reports (never installs).
+ *  - manual: no background checks at all; only the explicit Web UI /
+ *    `bili update` action ever contacts the registry.
+ *
+ * The registry metadata request and the tarball download reuse the project's
+ * upstream-proxy network egress (undici ProxyAgent via `proxyDispatcher`) when
+ * a proxy is configured, so users behind a system/HTTP proxy never hit a
+ * direct-fetch timeout.
  *
  * Concurrency safety:
  *  - An exclusive lock file prevents multiple bili processes from updating
@@ -21,25 +26,90 @@
  * cycle automatically.
  */
 import { readFile, writeFile, mkdir, access, constants, rm, cp, unlink } from "node:fs/promises";
-import { execFile } from "node:child_process";
 import * as tar from "tar";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { cacheDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
+import { proxyDispatcher } from "./upstream-proxy.js";
+import type { UpdateMode } from "./config.js";
 
 const REGISTRY_BASE = "https://registry.npmjs.org";
 const CHECK_INTERVAL_MS = 3 * 60 * 1000;
-const THROTTLE_FILE = path.join(cacheDir(), ".update-check");
-const LOCK_FILE = path.join(cacheDir(), ".update-lock");
-const SEMVER_RE = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z-.]+)?$/;
 /** Lock staleness threshold: if a lock file is older than this, it's considered
  *  abandoned (crashed process) and can be stolen. */
 const LOCK_STALE_MS = 2 * 60 * 1000;
 
+// Evaluated per call (not at module load) so tests / containers that relocate
+// XDG_CACHE_HOME after import still isolate the throttle + lock files.
+function throttleFile(): string {
+    return path.join(cacheDir(), ".update-check");
+}
+function lockFile(): string {
+    return path.join(cacheDir(), ".update-lock");
+}
+
 let timer: ReturnType<typeof setInterval> | undefined;
 let inFlight = false;
 let firstCheckDone = false;
+
+export type UpdateOptions = {
+    /** Package name, e.g. "billion-context". */
+    packageName: string;
+    /** Fallback version (read at startup). The actual version is re-read from
+     *  disk on each check so that an in-place tarball update is immediately
+     *  reflected without restart. */
+    currentVersion: string;
+    /** 3-state update mode. `manual` never runs background checks. */
+    mode: UpdateMode;
+    /** Optional upstream proxy URL. Registry metadata + tarball downloads are
+     *  routed through this proxy's ProxyAgent so system-proxy users don't time
+     *  out on direct fetches. Omit for direct egress. */
+    proxyUrl?: string;
+};
+
+/** Latest registry check result — the "report" half of the update mechanism.
+ *  Stored in `lastStatus` and surfaced by the Web UI status endpoint. */
+export type LatestCheck = {
+    latestVersion: string;
+    tarballUrl: string | undefined;
+    currentVersion: string;
+    hasUpdate: boolean;
+};
+
+let lastStatus: {
+    mode?: UpdateMode;
+    currentVersion?: string;
+    latest?: LatestCheck;
+    checkedAt?: number;
+    checkError?: string;
+    installError?: string;
+    installing?: boolean;
+} = {};
+
+/** Current observable update status (Web UI / API). mode and currentVersion are
+ *  filled in by the last startAutoUpdate/checkLatestVersion call. */
+export function getUpdateStatus(): {
+    mode: UpdateMode;
+    currentVersion: string;
+    latestVersion?: string;
+    hasUpdate?: boolean;
+    checkedAt?: number;
+    checkError?: string;
+    installError?: string;
+    installing?: boolean;
+} {
+    return {
+        mode: lastStatus.mode ?? "manual",
+        currentVersion: lastStatus.currentVersion ?? "dev",
+        latestVersion: lastStatus.latest?.latestVersion,
+        hasUpdate: lastStatus.latest?.hasUpdate,
+        checkedAt: lastStatus.checkedAt,
+        checkError: lastStatus.checkError,
+        installError: lastStatus.installError,
+        installing: lastStatus.installing,
+    };
+}
 
 function parseVersion(v: string): number[] {
     return v.replace(/^v/, "").split(".").map((n) => parseInt(n, 10) || 0);
@@ -59,7 +129,7 @@ function isNewer(latest: string, current: string): boolean {
 
 async function readLastCheck(): Promise<number> {
     try {
-        const data = await readFile(THROTTLE_FILE, "utf-8");
+        const data = await readFile(throttleFile(), "utf-8");
         return parseInt(data.trim(), 10) || 0;
     } catch {
         return 0;
@@ -68,8 +138,8 @@ async function readLastCheck(): Promise<number> {
 
 async function writeLastCheck(ts: number): Promise<void> {
     try {
-        await mkdir(path.dirname(THROTTLE_FILE), { recursive: true });
-        await writeFile(THROTTLE_FILE, String(ts), "utf-8");
+        await mkdir(path.dirname(throttleFile()), { recursive: true });
+        await writeFile(throttleFile(), String(ts), "utf-8");
     } catch {
         // best-effort
     }
@@ -118,7 +188,7 @@ async function tryAcquireLock(): Promise<{ release: () => Promise<void> } | null
 
     async function readLock(): Promise<{ pid: number; ts: number } | null> {
         try {
-            const raw = await readFile(LOCK_FILE, "utf-8");
+            const raw = await readFile(lockFile(), "utf-8");
             const data = JSON.parse(raw);
             if (typeof data.pid === "number" && typeof data.ts === "number") {
                 return data;
@@ -154,7 +224,7 @@ async function tryAcquireLock(): Promise<{ release: () => Promise<void> } | null
         // crash during update permanently blocks all future auto-updates.
         loggerLog("info", `[update] stealing stale lock (pid=${existing.pid}, age=${Math.round(age / 1000)}s, alive=${holderAlive})`);
         try {
-            await unlink(LOCK_FILE);
+            await unlink(lockFile());
         } catch (e) {
             const code = (e as NodeJS.ErrnoException).code;
             // ENOENT is fine (someone else already cleaned it). Anything else
@@ -169,7 +239,7 @@ async function tryAcquireLock(): Promise<{ release: () => Promise<void> } | null
 
     // Write our lock. Use flag "wx" to fail if file already exists.
     try {
-        await writeFile(LOCK_FILE, JSON.stringify({ pid, ts: now }), { flag: "wx" });
+        await writeFile(lockFile(), JSON.stringify({ pid, ts: now }), { flag: "wx" });
     } catch {
         // Lost the race — another process created the lock file first.
         const winner = await readLock();
@@ -190,49 +260,35 @@ async function tryAcquireLock(): Promise<{ release: () => Promise<void> } | null
         release: async () => {
             const current = await readLock();
             if (current?.pid === pid) {
-                await rm(LOCK_FILE, { force: true }).catch(() => {});
+                await rm(lockFile(), { force: true }).catch(() => {});
             }
         },
     };
 }
 
-export type UpdateOptions = {
-    /** Package name, e.g. "billion-context". */
-    packageName: string;
-    /** Fallback version (read at startup). The actual version is re-read from
-     *  disk on each check so that an in-place tarball update is immediately
-     *  reflected without restart. */
-    currentVersion: string;
-    /** Enable auto-install when a newer version is found. */
-    autoUpdate: boolean;
-};
+/** Build fetch init with the upstream proxy's ProxyAgent (if configured). */
+function proxiedFetchInit(opts: UpdateOptions, extra: RequestInit = {}): RequestInit {
+    const init: Omit<RequestInit, "dispatcher"> & { dispatcher?: object } = { ...extra };
+    const dispatcher = opts.proxyUrl ? proxyDispatcher(opts.proxyUrl) : undefined;
+    if (dispatcher) init.dispatcher = dispatcher;
+    return init as RequestInit;
+}
 
-/** Run a single check (throttled unless `force`). Safe to call frequently. */
-export async function checkForUpdate(opts: UpdateOptions, force = false): Promise<void> {
-    if (!opts.autoUpdate && !force) return;
-    if (inFlight) return;
-    inFlight = true;
+/** The "check" half: query the npm registry for the latest version. Never
+ *  installs anything. Returns the check result, or null if the registry is
+ *  unreachable / the response is malformed. */
+export async function checkLatestVersion(opts: UpdateOptions): Promise<LatestCheck | null> {
+    const url = `${REGISTRY_BASE}/${opts.packageName}/latest`;
     try {
-        const now = Date.now();
-        const lastCheck = await readLastCheck();
-        const sinceLastSec = lastCheck ? ((now - lastCheck) / 1000 | 0) : -1;
-        if (!force && firstCheckDone && now - lastCheck < CHECK_INTERVAL_MS) {
-            const retryIn = ((CHECK_INTERVAL_MS - (now - lastCheck)) / 1000 | 0);
-            loggerLog("info", `[update] throttled \u2014 last checked ${sinceLastSec}s ago, retry in ${retryIn}s`);
-            return;
-        }
-        await writeLastCheck(now);
-        firstCheckDone = true;
-        loggerLog("info", `[update] checking npm registry for ${opts.packageName}${sinceLastSec < 0 ? " (startup check)" : sinceLastSec === 0 ? "" : ` (last check ${sinceLastSec}s ago)`}\u2026`);
-
-        const url = `${REGISTRY_BASE}/${opts.packageName}/latest`;
-        const res = await fetch(url, {
+        const res = await fetch(url, proxiedFetchInit(opts, {
             signal: AbortSignal.timeout(5000),
             headers: { Accept: "application/json" },
-        });
+        }));
         if (!res.ok) {
-            loggerLog("warn", `[update] registry returned ${res.status} ${res.statusText}, skipping`);
-            return;
+            const error = `registry returned ${res.status} ${res.statusText}`;
+            loggerLog("warn", `[update] ${error}, skipping`);
+            lastStatus = { ...lastStatus, checkError: error, checkedAt: Date.now() };
+            return null;
         }
         const data = (await res.json()) as {
             version?: string;
@@ -240,49 +296,91 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         };
         const latest = data.version;
         if (!latest) {
-            loggerLog("warn", `[update] registry response had no version, skipping`);
-            return;
+            const error = "registry response had no version";
+            loggerLog("warn", `[update] ${error}, skipping`);
+            lastStatus = { ...lastStatus, checkError: error, checkedAt: Date.now() };
+            return null;
         }
-
         // Read current version from disk (not from startup constant) so that
         // a successful in-place update is detected without a restart.
         const installDir = await findInstallDir(opts.packageName);
         const diskVersion = installDir ? await readDiskVersion(installDir) : undefined;
         const currentVersion = diskVersion ?? opts.currentVersion;
-
-        if (!isNewer(latest, currentVersion)) {
+        const result: LatestCheck = {
+            latestVersion: latest,
+            tarballUrl: data.dist?.tarball,
+            currentVersion,
+            hasUpdate: isNewer(latest, currentVersion),
+        };
+        lastStatus = { ...lastStatus, latest: result, currentVersion, checkedAt: Date.now(), checkError: undefined };
+        if (!result.hasUpdate) {
             loggerLog("info", `[update] current=${currentVersion} latest=${latest} (up to date)`);
-            return;
+        } else {
+            loggerLog("info", `[update] new version found: ${currentVersion} \u2192 ${latest}`);
         }
+        return result;
+    } catch (e) {
+        lastStatus = { ...lastStatus, checkError: String(e), checkedAt: Date.now() };
+        loggerLog("warn", `[update] check failed: ${String(e)}`);
+        return null;
+    }
+}
 
-        const tarballUrl = data.dist?.tarball;
-        if (!tarballUrl) {
-            loggerLog("warn", `[update] registry response for ${latest} had no tarball URL`);
-            return;
+/** The "install" half: install the given version (or the latest known).
+ *  Downloads the tarball, extracts to staging, verifies, then copies over the
+ *  install dir. Never performs the check itself when `version` is provided;
+ *  in that case `tarballUrl` should also be passed (the caller already checked
+ *  and holds the dist URL). */
+export async function installUpdate(
+    opts: UpdateOptions,
+    version?: string,
+    tarballUrl?: string,
+): Promise<{ ok: boolean; error?: string; installedTo?: string }> {
+    if (inFlight) {
+        return { ok: false, error: "another update is already in progress" };
+    }
+    inFlight = true;
+    lastStatus = { ...lastStatus, installing: true, installError: undefined };
+    try {
+        let targetVersion = version;
+        let currentVersion = opts.currentVersion;
+        if (!targetVersion) {
+            const check = await checkLatestVersion(opts);
+            if (!check) return { ok: false, error: lastStatus.checkError ?? "check failed" };
+            currentVersion = check.currentVersion;
+            if (!check.hasUpdate) {
+                loggerLog("info", `[update] already up to date (${currentVersion})`);
+                return { ok: true, installedTo: currentVersion };
+            }
+            targetVersion = check.latestVersion;
+            tarballUrl = check.tarballUrl;
         }
-
-        loggerLog("info", `[update] new version found: ${currentVersion} \u2192 ${latest}, downloading\u2026`);
-
-        // Acquire lock to prevent concurrent updates across processes.
+        const installDir = await findInstallDir(opts.packageName);
         const lock = await tryAcquireLock();
         if (!lock) {
-            loggerLog("info", `[update] another process is updating, will check next cycle`);
-            return;
+            const error = "another process is updating, will check next cycle";
+            loggerLog("info", `[update] ${error}`);
+            return { ok: false, error };
         }
         try {
-            const result = await installViaTarball(latest, tarballUrl, installDir);
+            const result = await installViaTarball(targetVersion, tarballUrl, installDir, opts);
             if (result.ok) {
-                loggerLog("info", `[update] installed ${currentVersion} \u2192 ${latest}. Restart to finish.`);
-            } else {
-                loggerLog("warn", `[update] install failed: ${result.error}. Will retry next cycle.`);
+                loggerLog("info", `[update] installed ${currentVersion} \u2192 ${targetVersion}. Restart to finish.`);
+                return { ok: true, installedTo: targetVersion };
             }
+            lastStatus = { ...lastStatus, installError: result.error };
+            loggerLog("warn", `[update] install failed: ${result.error}. Will retry next cycle.`);
+            return { ok: false, error: result.error };
         } finally {
             await lock.release();
         }
     } catch (e) {
-        loggerLog("warn", `[update] check failed: ${String(e)}`);
+        lastStatus = { ...lastStatus, installError: String(e) };
+        loggerLog("warn", `[update] install failed: ${String(e)}`);
+        return { ok: false, error: String(e) };
     } finally {
         inFlight = false;
+        lastStatus = { ...lastStatus, installing: false };
     }
 }
 
@@ -292,11 +390,15 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
  */
 async function installViaTarball(
     version: string,
-    tarballUrl: string,
+    tarballUrl: string | undefined,
     installDir: string | undefined,
+    opts: UpdateOptions,
 ): Promise<{ ok: boolean; error?: string }> {
     if (!installDir) {
         return { ok: false, error: "cannot determine install directory (package.json not found walking up from running binary)" };
+    }
+    if (!tarballUrl) {
+        return { ok: false, error: `registry response for ${version} had no tarball URL` };
     }
 
     // Pre-flight: can we write to the install dir?
@@ -306,10 +408,10 @@ async function installViaTarball(
         return { ok: false, error: `install dir not writable: ${installDir}` };
     }
 
-    // Download tarball
+    // Download tarball (through the configured upstream proxy when present).
     let tgzBuffer: Buffer;
     try {
-        const tgzRes = await fetch(tarballUrl, { signal: AbortSignal.timeout(60_000) });
+        const tgzRes = await fetch(tarballUrl, proxiedFetchInit(opts, { signal: AbortSignal.timeout(60_000) }));
         if (!tgzRes.ok) {
             return { ok: false, error: `tarball download failed: HTTP ${tgzRes.status} ${tgzRes.statusText}` };
         }
@@ -376,15 +478,64 @@ async function installViaTarball(
     return { ok: true };
 }
 
+/** Run a single scheduled pass. Behavior depends on `opts.mode`:
+ *  - auto:   check + auto-install when newer (throttled unless force).
+ *  - check:  check only (never installs).
+ *  - manual: no-op — background checks never run.
+ *  `force` bypasses the throttle (explicit user action, e.g. Web UI button). */
+export async function runScheduledUpdate(opts: UpdateOptions, force = false): Promise<void> {
+    if (opts.mode === "manual" && !force) return;
+    if (inFlight) return;
+    inFlight = true;
+    let check: LatestCheck | null = null;
+    try {
+        const now = Date.now();
+        const lastCheck = await readLastCheck();
+        const sinceLastSec = lastCheck ? ((now - lastCheck) / 1000 | 0) : -1;
+        if (!force && firstCheckDone && now - lastCheck < CHECK_INTERVAL_MS) {
+            const retryIn = ((CHECK_INTERVAL_MS - (now - lastCheck)) / 1000 | 0);
+            loggerLog("info", `[update] throttled \u2014 last checked ${sinceLastSec}s ago, retry in ${retryIn}s`);
+            return;
+        }
+        await writeLastCheck(now);
+        firstCheckDone = true;
+        loggerLog("info", `[update] checking npm registry for ${opts.packageName}${sinceLastSec < 0 ? " (startup check)" : sinceLastSec === 0 ? "" : ` (last check ${sinceLastSec}s ago)`}\u2026`);
+
+        check = await checkLatestVersion(opts);
+        if (!check || !check.hasUpdate) return;
+        if (opts.mode !== "auto") {
+            // check mode: report only — never install.
+            loggerLog("info", `[update] mode=${opts.mode}: update available (${check.currentVersion} \u2192 ${check.latestVersion}), not installing`);
+            return;
+        }
+    } catch (e) {
+        loggerLog("warn", `[update] check failed: ${String(e)}`);
+        return;
+    } finally {
+        inFlight = false;
+    }
+    // Install outside the check's in-flight hold: installUpdate manages its own
+    // exclusive guard, so overlapping scheduled passes can't double-install.
+    if (!check) return;
+    await installUpdate(opts, check.latestVersion, check.tarballUrl);
+}
+
+/** Start the background schedule. `manual` mode logs once and returns without
+ *  scheduling anything (no startup check, no periodic check). */
 export function startAutoUpdate(opts: UpdateOptions): void {
+    lastStatus = { ...lastStatus, mode: opts.mode, currentVersion: opts.currentVersion };
+    if (opts.mode === "manual") {
+        loggerLog("info", "[update] manual mode — background update checks disabled");
+        return;
+    }
+    loggerLog("info", `[update] ${opts.mode} mode enabled (checking every ${CHECK_INTERVAL_MS / 1000 | 0}s)`);
     // First check after a short delay (don't block startup / don't race the
     // listening socket).
-    loggerLog("info", `[update] auto-update enabled (checking every ${CHECK_INTERVAL_MS / 1000 | 0}s)`);
     setTimeout(() => {
-        void checkForUpdate(opts);
+        void runScheduledUpdate(opts);
     }, 10_000);
     timer = setInterval(() => {
-        void checkForUpdate(opts);
+        void runScheduledUpdate(opts);
     }, CHECK_INTERVAL_MS);
     timer.unref?.();
 }
@@ -395,4 +546,12 @@ export function stopAutoUpdate(): void {
         clearInterval(timer);
         timer = undefined;
     }
+}
+
+/** Reset module state (for tests). */
+export function _resetUpdateForTest(): void {
+    stopAutoUpdate();
+    inFlight = false;
+    firstCheckDone = false;
+    lastStatus = {};
 }

@@ -71,6 +71,7 @@ test("Web UI exposes route, upstream and history controls without inline handler
         debug: false,
         passthrough: false,
         autoUpdate: false,
+        updateMode: "auto",
         mitm: { enabled: false, domains: [] },
     };
     const proxy = await startServer(opts);
@@ -164,6 +165,7 @@ test("PUT /__bili/config with providers takes effect without a separate reload c
         debug: false,
         passthrough: false,
         autoUpdate: false,
+        updateMode: "auto",
         mitm: { enabled: false, domains: [] },
     };
     const proxy = await startServer(opts);
