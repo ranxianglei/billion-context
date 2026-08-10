@@ -20,17 +20,24 @@ async function* iterSseChunks(stream: ReadableStream<Uint8Array>): AsyncGenerato
     let buf = "";
     try {
         while (true) {
-            const { done, value } = await reader.read();
+            let done: boolean;
+            let value: Uint8Array | undefined;
+            try {
+                ({ done, value } = await reader.read());
+            } catch {
+                break;
+            }
             if (done) break;
             buf += new TextDecoder().decode(value, { stream: true });
+            buf = buf.replace(/\r\n|\r/g, "\n");
             let idx: number;
             while ((idx = buf.indexOf("\n\n")) >= 0) {
                 const raw = buf.slice(0, idx);
                 buf = buf.slice(idx + 2);
-                if (raw.trim().length > 0) yield raw.replace(/\r\n/g, "\n");
+                if (raw.trim().length > 0) yield raw;
             }
         }
-        if (buf.trim().length > 0) yield buf.replace(/\r\n/g, "\n");
+        if (buf.trim().length > 0) yield buf;
     } finally {
         reader.releaseLock();
     }

@@ -19,17 +19,24 @@ async function* iterSseEvents(stream: ReadableStream<Uint8Array>): AsyncGenerato
     let buf = "";
     try {
         while (true) {
-            const { done, value } = await reader.read();
+            let done: boolean;
+            let value: Uint8Array | undefined;
+            try {
+                ({ done, value } = await reader.read());
+            } catch {
+                break;
+            }
             if (done) break;
             buf += new TextDecoder().decode(value, { stream: true });
+            buf = buf.replace(/\r\n|\r/g, "\n");
             let idx: number;
             while ((idx = buf.indexOf("\n\n")) >= 0) {
                 const raw = buf.slice(0, idx);
                 buf = buf.slice(idx + 2);
-                if (raw.trim().length > 0) yield raw.replace(/\r\n/g, "\n");
+                if (raw.trim().length > 0) yield raw;
             }
         }
-        if (buf.trim().length > 0) yield buf.replace(/\r\n/g, "\n");
+        if (buf.trim().length > 0) yield buf;
     } finally {
         reader.releaseLock();
     }
@@ -51,6 +58,29 @@ function parseAnthropicSse(eventStr: string): { type: string; data: Record<strin
     } catch {
         return { type, data: {} };
     }
+}
+
+function remapIndexInEvent(eventStr: string, newIndex: number): Buffer {
+    const lines = eventStr.split("\n");
+    const rebuilt: string[] = [];
+    let touched = false;
+    for (const l of lines) {
+        if (!touched && l.startsWith("data:")) {
+            const jsonStr = l.slice(5).replace(/^ /, "");
+            try {
+                const obj = JSON.parse(jsonStr) as Record<string, unknown>;
+                if (typeof obj === "object" && obj !== null && typeof obj.index === "number") {
+                    obj.index = newIndex;
+                    rebuilt.push(`data: ${JSON.stringify(obj)}`);
+                    touched = true;
+                    continue;
+                }
+            } catch {
+            }
+        }
+        rebuilt.push(l);
+    }
+    return Buffer.from(rebuilt.join("\n") + "\n\n", "utf8");
 }
 
 export function createAnthropicAdapter(requestBody: Record<string, unknown>): CompressLoopAdapter {
@@ -116,6 +146,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>): Co
             let roundOutput: number | undefined;
             let stopReason: string | undefined;
             let usageYielded = false;
+            const indexMap = new Map<number, number>();
 
             for await (const eventStr of iterSseEvents(upstream)) {
                 const parsed = parseAnthropicSse(eventStr);
@@ -141,9 +172,13 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>): Co
                         const name = typeof block.name === "string" ? block.name : "";
                         const id = typeof block.id === "string" ? block.id : `toolu_${upstreamIndex}`;
                         pending.set(upstreamIndex, { id, name, json: "" });
+                        if (round === 1) {
+                            indexMap.set(upstreamIndex, clientIndex++);
+                        }
                     } else if (round === 1) {
-                        clientIndex += 1;
-                        yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
+                        const ci = clientIndex++;
+                        indexMap.set(upstreamIndex, ci);
+                        yield { kind: "meta", chunk: remapIndexInEvent(eventStr, ci), firstRoundOnly: true } as ParsedStreamEvent;
                     }
                 } else if (type === "content_block_delta") {
                     const upstreamIndex = (data.index as number) ?? 0;
@@ -154,12 +189,14 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>): Co
                         }
                     } else if (delta.type === "text_delta" && typeof delta.text === "string") {
                         if (round === 1) {
-                            yield { kind: "text", delta: delta.text, raw: rawBuf } as ParsedStreamEvent;
+                            const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
+                            yield { kind: "text", delta: delta.text, raw: remapIndexInEvent(eventStr, ci) } as ParsedStreamEvent;
                         } else {
                             yield { kind: "text", delta: delta.text } as ParsedStreamEvent;
                         }
                     } else if (round === 1) {
-                        yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
+                        const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
+                        yield { kind: "meta", chunk: remapIndexInEvent(eventStr, ci), firstRoundOnly: true } as ParsedStreamEvent;
                     }
                 } else if (type === "content_block_stop") {
                     const upstreamIndex = (data.index as number) ?? 0;
@@ -173,7 +210,8 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>): Co
                             arguments: tb.json,
                         } as ParsedStreamEvent;
                     } else if (round === 1) {
-                        yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
+                        const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
+                        yield { kind: "meta", chunk: remapIndexInEvent(eventStr, ci), firstRoundOnly: true } as ParsedStreamEvent;
                     }
                 } else if (type === "message_delta") {
                     const u = (data.usage ?? {}) as Record<string, unknown>;

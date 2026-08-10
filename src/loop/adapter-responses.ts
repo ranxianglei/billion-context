@@ -23,17 +23,24 @@ async function* iterSseEvents(stream: ReadableStream<Uint8Array>): AsyncGenerato
     let buf = "";
     try {
         while (true) {
-            const { done, value } = await reader.read();
+            let done: boolean;
+            let value: Uint8Array | undefined;
+            try {
+                ({ done, value } = await reader.read());
+            } catch {
+                break;
+            }
             if (done) break;
             buf += new TextDecoder().decode(value, { stream: true });
+            buf = buf.replace(/\r\n|\r/g, "\n");
             let idx: number;
             while ((idx = buf.indexOf("\n\n")) >= 0) {
                 const raw = buf.slice(0, idx);
                 buf = buf.slice(idx + 2);
-                if (raw.trim().length > 0) yield raw.replace(/\r\n/g, "\n");
+                if (raw.trim().length > 0) yield raw;
             }
         }
-        if (buf.trim().length > 0) yield buf.replace(/\r\n/g, "\n");
+        if (buf.trim().length > 0) yield buf;
     } finally {
         reader.releaseLock();
     }
@@ -171,6 +178,8 @@ export function createResponsesAdapter(textProtocol?: boolean): CompressLoopAdap
                             name: typeof item.name === "string" ? item.name : "",
                             arguments: "",
                         });
+                    } else if (item?.type === "custom_tool_call") {
+                        yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
                     } else {
                         yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
                     }
@@ -212,6 +221,8 @@ export function createResponsesAdapter(textProtocol?: boolean): CompressLoopAdap
                                 arguments: fc.arguments,
                             } as ParsedStreamEvent;
                         }
+                    } else if (item?.type === "custom_tool_call") {
+                        yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
                     } else {
                         yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
                     }
@@ -242,6 +253,9 @@ export function createResponsesAdapter(textProtocol?: boolean): CompressLoopAdap
                     yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
                 }
             }
+            if (!terminalKind) {
+                yield { kind: "done", finishReason: "failed" } as ParsedStreamEvent;
+            }
         },
 
         emitText(delta) {
@@ -265,6 +279,17 @@ export function createResponsesAdapter(textProtocol?: boolean): CompressLoopAdap
         emitCompletion(opts?: EmitCompletionOpts) {
             if (terminalRaw && (terminalKind === "failed" || terminalKind === "incomplete")) {
                 return terminalRaw;
+            }
+            if (!responseObj && opts?.finishReason === "failed") {
+                const failed = {
+                    id: `resp-error-${Date.now()}`,
+                    status: "failed",
+                    error: { code: "server_error", message: "upstream returned no response" },
+                };
+                return Buffer.from(
+                    `event: response.failed\ndata: ${JSON.stringify({ type: "response.failed", response: failed })}\n\n`,
+                    "utf8",
+                );
             }
             let resp = responseObj
                 ? ({ ...responseObj } as Record<string, unknown>)
