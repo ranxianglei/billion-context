@@ -197,3 +197,70 @@ test("compressLoopResponsesJson: Codex text trigger is intercepted and re-reques
         globalThis.fetch = previousFetch;
     }
 });
+
+test("compressLoopResponsesJson: read-only acp_status executes once, surfaces marker, NO upstream re-request (炸锅 regression, JSON path)", async () => {
+    let fetchCalls = 0;
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+        fetchCalls++;
+        return new Response(JSON.stringify({ id: "resp_never", status: "completed", output: [] }), {
+            status: 200, headers: { "content-type": "application/json" },
+        });
+    }) as typeof fetch;
+    try {
+        const initial = {
+            id: "resp_st_json",
+            status: "completed",
+            output: [{
+                type: "function_call",
+                id: "fc_st",
+                call_id: "call_st",
+                name: "acp_status",
+                arguments: "{}",
+            }],
+        };
+        const out = await compressLoopResponsesJson(initial, makeCtx(() => {}), {
+            model: "gpt-4o",
+            input: [{ type: "message", role: "user", content: "status?" }],
+        }, { url: "https://unused.example/responses", headers: { "content-type": "application/json" } });
+        assert.equal(fetchCalls, 0, "read-only acp_status must NOT trigger an upstream re-request (JSON path)");
+        const outputs = out.output as Array<Record<string, unknown>>;
+        const joined = JSON.stringify(outputs);
+        assert.ok(joined.includes("📊"), "acp_status marker (📊) appended to JSON output");
+        assert.ok(joined.includes("[ACP]"), "[ACP] visibility tag present in marker");
+    } finally {
+        globalThis.fetch = previousFetch;
+    }
+});
+
+test("compressLoopResponsesJson: real tool + read-only acp_status surfaces marker AND preserves real call (Q2 stream/JSON parity)", async () => {
+    let fetchCalls = 0;
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+        fetchCalls++;
+        return new Response(JSON.stringify({ id: "resp_never", status: "completed", output: [] }), {
+            status: 200, headers: { "content-type": "application/json" },
+        });
+    }) as typeof fetch;
+    try {
+        const initial = {
+            id: "resp_rmx_json",
+            status: "completed",
+            output: [
+                { type: "function_call", id: "fc_shell", call_id: "call_shell", name: "shell", arguments: '{"cmd":"ls"}' },
+                { type: "function_call", id: "fc_st", call_id: "call_st", name: "acp_status", arguments: "{}" },
+            ],
+        };
+        const out = await compressLoopResponsesJson(initial, makeCtx(() => {}), {
+            model: "gpt-4o",
+            input: [{ type: "message", role: "user", content: "run + status" }],
+        }, { url: "https://unused.example/responses", headers: { "content-type": "application/json" } });
+        assert.equal(fetchCalls, 0, "no MUTATING tool present → must NOT re-request");
+        const outputs = out.output as Array<Record<string, unknown>>;
+        const joined = JSON.stringify(outputs);
+        assert.ok(joined.includes("📊"), "acp_status marker surfaced even when a real tool accompanies it (regression: JSON used to drop it)");
+        assert.ok(joined.includes('"shell"'), "the real tool call is preserved in output so the client can execute it");
+    } finally {
+        globalThis.fetch = previousFetch;
+    }
+});

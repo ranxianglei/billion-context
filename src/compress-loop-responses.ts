@@ -372,13 +372,19 @@ function surfaceReadonlyJson(
         } catch {
             args = {};
         }
-        const result = executeProxyTool(call.name, args, ctx);
-        ctx.log(`[acp-proxy: responses JSON ${call.name} (read-only) → ${result.slice(0, 120).replace(/\n/g, " ")}]`);
+        let result: string;
+        try {
+            result = executeProxyTool(call.name, args, ctx);
+            ctx.log(`[acp-proxy: responses JSON ${call.name} (read-only) → ${result.slice(0, 120).replace(/\n/g, " ")}]`);
+        } catch (e) {
+            result = `\u274c [ACP] ${call.name} FAILED: ${String(e)}`;
+            ctx.log(`[acp-proxy: responses JSON ${call.name} (read-only) FAILED: ${String(e)}]`);
+        }
         markers.push(buildVisibilityMarker(call.name, result));
     }
     if (markers.length === 0) return current;
     const out = Array.isArray(current.output) ? [...(current.output as unknown[])] : [];
-    out.push({ type: "message", id: `msg_acp_ro_${Date.now()}`, role: "assistant", content: [{ type: "output_text", text: markers.join("\n") }] });
+    out.push({ type: "message", id: `msg_acp_ro_${Date.now()}_${markers.length}`, role: "assistant", content: [{ type: "output_text", text: markers.join("\n") }] });
     return { ...current, output: out };
 }
 
@@ -399,7 +405,7 @@ export async function compressLoopResponsesJson(
         if (mutatingProxy.length === 0 || realCalls.length > 0) {
             if (proxyCalls.length > 0) {
                 replaceResponsesJsonText(output.textParts, extracted.clean);
-                if (realCalls.length === 0) current = surfaceReadonlyJson(current, proxyCalls, ctx);
+                current = surfaceReadonlyJson(current, proxyCalls, ctx);
             }
             return current;
         }
@@ -591,9 +597,15 @@ export async function* compressLoopResponsesStream(
                     loggerLog("warn", `[acp-compress-args] ${fc.name} JSON.parse failed: ${String(e)}`);
                     args = {};
                 }
-                const result = executeProxyTool(fc.name, args, ctx);
-                const preview = result.length > 120 ? result.slice(0, 120) + "..." : result;
-                ctx.log(`[acp-proxy: responses ${fc.name} (read-only) (${fc.callId}) → ${preview.replace(/\n/g, " ")}]`);
+                let result: string;
+                try {
+                    result = executeProxyTool(fc.name, args, ctx);
+                    const preview = result.length > 120 ? result.slice(0, 120) + "..." : result;
+                    ctx.log(`[acp-proxy: responses ${fc.name} (read-only) (${fc.callId}) → ${preview.replace(/\n/g, " ")}]`);
+                } catch (e) {
+                    result = `\u274c [ACP] ${fc.name} FAILED: ${String(e)}`;
+                    ctx.log(`[acp-proxy: responses ${fc.name} (read-only) (${fc.callId}) FAILED: ${String(e)}]`);
+                }
                 const markerItemId = `msg_acp_ro_${Date.now()}_${nextOutputIndex}`;
                 yield Buffer.from(buildMessageItemSequence(markerItemId, nextOutputIndex++, buildVisibilityMarker(fc.name, result)), "utf8");
             }

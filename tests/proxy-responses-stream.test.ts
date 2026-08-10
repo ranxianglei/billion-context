@@ -279,9 +279,134 @@ test("compressLoopResponsesStream: mixed mutating + read-only round still re-req
             { url: "http://mock", headers: {} },
         );
         assert.equal(fetchCalls, 1, "a round containing a MUTATING tool (compress) must re-request exactly once");
-        assert.ok(out.includes("[ACP]"), "visibility markers emitted");
+        // Count [ACP] tags, not icons: the empty session makes both tools return
+        // "not found", flipping their icons to ❌. ≥2 markers proves both ran.
+        const markerCount = (out.match(/\[ACP\]/g) || []).length;
+        assert.ok(markerCount >= 2, `both compress + acp_status must produce markers (got ${markerCount})`);
         assert.ok(out.includes("Done."), "round 2 real content emitted");
         assert.ok(out.includes("response.completed"), "final completion emitted");
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+test("compressLoopResponsesStream: read-only search_context executes once and completes WITHOUT upstream re-request", async () => {
+    const round1 = [
+        sse("response.created", { response: { id: "resp_sc_1", status: "in_progress" } }),
+        sse("response.output_item.added", {
+            item: { type: "function_call", id: "fc_sc", call_id: "call_sc", name: "search_context" },
+            output_index: 0,
+        }),
+        sse("response.function_call_arguments.delta", { item_id: "fc_sc", delta: JSON.stringify({ query: "kv cache" }) }),
+        sse("response.output_item.done", {
+            item: { type: "function_call", id: "fc_sc", call_id: "call_sc", name: "search_context", arguments: JSON.stringify({ query: "kv cache" }) },
+            output_index: 0,
+        }),
+        sse("response.completed", { response: { id: "resp_sc_1", status: "completed", output: [] } }),
+    ].join("");
+    let fetchCalls = 0;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+        fetchCalls++;
+        return new Response(round1, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(round1, { status: 200, headers: { "content-type": "text/event-stream" } }).body!,
+            makeCtx(() => {}),
+            { model: "gpt-4o", input: [{ type: "message", role: "user", content: "search" }], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.equal(fetchCalls, 0, "read-only search_context must NOT trigger an upstream re-request");
+        assert.ok(out.includes("[ACP]"), "search_context visibility marker emitted to client");
+        assert.ok(out.includes("response.completed"), "turn completes instead of looping or being discarded");
+        assert.ok(!out.includes("compress loop limit"), "loop limit must not be hit for a read-only tool");
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+test("compressLoopResponsesStream: MUTATING decompress-only round STILL drives the re-request loop (locks no-behavior-change)", async () => {
+    const round1 = [
+        sse("response.created", { response: { id: "resp_dc_1", status: "in_progress" } }),
+        sse("response.output_item.added", {
+            item: { type: "function_call", id: "fc_dc", call_id: "call_dc", name: "decompress" },
+            output_index: 0,
+        }),
+        sse("response.function_call_arguments.delta", { item_id: "fc_dc", delta: JSON.stringify({ blockId: "b0" }) }),
+        sse("response.output_item.done", {
+            item: { type: "function_call", id: "fc_dc", call_id: "call_dc", name: "decompress", arguments: JSON.stringify({ blockId: "b0" }) },
+            output_index: 0,
+        }),
+        sse("response.completed", { response: { id: "resp_dc_1", status: "completed", output: [] } }),
+    ].join("");
+    const round2 = [
+        sse("response.created", { response: { id: "resp_dc_2", status: "in_progress" } }),
+        sse("response.output_text.delta", { item_id: "msg_dc", output_index: 0, delta: "Restored." }),
+        sse("response.completed", { response: { id: "resp_dc_2", status: "completed", output: [] } }),
+    ].join("");
+    let fetchCalls = 0;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+        fetchCalls++;
+        return new Response(fetchCalls === 1 ? round2 : round1, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(round1, { status: 200, headers: { "content-type": "text/event-stream" } }).body!,
+            makeCtx(() => {}),
+            { model: "gpt-4o", input: [{ type: "message", role: "user", content: "restore" }], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.equal(fetchCalls, 1, "decompress (MUTATING) must re-request exactly once — behavior unchanged from pre-fix");
+        assert.ok(out.includes("[ACP]"), "decompress visibility marker emitted");
+        assert.ok(out.includes("Restored."), "round 2 real content emitted");
+        assert.ok(out.includes("response.completed"), "final completion emitted");
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+test("compressLoopResponsesStream: real tool + read-only acp_status surfaces marker, forwards real call, NO re-request", async () => {
+    const round1 = [
+        sse("response.created", { response: { id: "resp_rmx_1", status: "in_progress" } }),
+        sse("response.output_item.added", {
+            item: { type: "function_call", id: "fc_shell", call_id: "call_shell", name: "shell" },
+            output_index: 0,
+        }),
+        sse("response.function_call_arguments.delta", { item_id: "fc_shell", delta: '{"cmd":"ls"}' }),
+        sse("response.output_item.done", {
+            item: { type: "function_call", id: "fc_shell", call_id: "call_shell", name: "shell", arguments: '{"cmd":"ls"}' },
+            output_index: 0,
+        }),
+        sse("response.output_item.added", {
+            item: { type: "function_call", id: "fc_st", call_id: "call_st", name: "acp_status" },
+            output_index: 1,
+        }),
+        sse("response.function_call_arguments.delta", { item_id: "fc_st", delta: "{}" }),
+        sse("response.output_item.done", {
+            item: { type: "function_call", id: "fc_st", call_id: "call_st", name: "acp_status", arguments: "{}" },
+            output_index: 1,
+        }),
+        sse("response.completed", { response: { id: "resp_rmx_1", status: "completed", output: [] } }),
+    ].join("");
+    let fetchCalls = 0;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+        fetchCalls++;
+        return new Response(round1, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(round1, { status: 200, headers: { "content-type": "text/event-stream" } }).body!,
+            makeCtx(() => {}),
+            { model: "gpt-4o", input: [{ type: "message", role: "user", content: "run + status" }], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.equal(fetchCalls, 0, "a (real tool + read-only) round must NOT re-request — no MUTATING tool present");
+        assert.ok(out.includes("📊"), "acp_status marker emitted even though a real tool accompanies it");
+        assert.ok(out.includes('"shell"'), "the real tool call is forwarded to the client");
+        assert.ok(out.includes("response.completed"), "turn completes");
     } finally {
         globalThis.fetch = originalFetch;
     }
