@@ -136,7 +136,11 @@ function stateDbPaths(configPath: string): string[] {
 }
 
 async function sqliteModule(): Promise<SqliteModule> {
-    return await import("node:sqlite");
+    // Indirect specifier so the bundler cannot rewrite this into a
+    // __require("sqlite") shim (which strips the node: prefix and fails to
+    // resolve). Left as a native dynamic import(), resolved by Node 22.5+.
+    const specifier = "node:sqlite";
+    return (await import(specifier)) as SqliteModule;
 }
 
 function hasProviderColumn(database: SqliteDatabase): boolean {
