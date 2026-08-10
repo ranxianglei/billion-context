@@ -64,7 +64,7 @@ test("Codex route patches the active provider in place and restores byte-for-byt
     }
 });
 
-test("built-in openai takeover keeps model_provider absent and removes its temporary section", () => {
+test("built-in openai provider uses top-level openai_base_url instead of creating [model_providers.openai]", () => {
     const files = fixture();
     const original = 'model = "gpt-5.4"\n[mcp_servers.keep]\ncommand = "keep"';
     writeFileSync(files.configPath, original, "utf8");
@@ -72,9 +72,8 @@ test("built-in openai takeover keeps model_provider absent and removes its tempo
         const enabled = enableCodexTakeover(9123, files);
         assert.equal(enabled.providerId, "openai");
         const active = readFileSync(files.configPath, "utf8");
-        assert.doesNotMatch(active, /^\s*model_provider\s*=/m);
-        assert.match(active, /\[model_providers\.openai\]/);
-        assert.match(active, /base_url = "http:\/\/127\.0\.0\.1:9123\/codex"/);
+        assert.doesNotMatch(active, /\[model_providers\.openai\]/);
+        assert.match(active, /^openai_base_url = "http:\/\/127\.0\.0\.1:9123\/codex"$/m);
         disableCodexTakeover(files);
         assert.equal(readFileSync(files.configPath, "utf8"), original);
     } finally {
@@ -152,20 +151,18 @@ test("a running bili owner cannot be displaced by another process", () => {
     }
 });
 
-test("comments added to a temporary built-in provider section survive restore", () => {
+test("disable restores original openai_base_url when built-in provider had a pre-existing value", () => {
     const files = fixture();
-    writeFileSync(files.configPath, 'model = "gpt-5.4"\n', "utf8");
+    const original = 'openai_base_url = "https://user-existing.example/v1"\nmodel = "gpt-5.4"\n';
+    writeFileSync(files.configPath, original, "utf8");
     try {
         enableCodexTakeover(8787, files);
-        const active = readFileSync(files.configPath, "utf8").replace(
-            "[model_providers.openai]\n",
-            "[model_providers.openai]\n# user note added while routed\n",
-        );
-        writeFileSync(files.configPath, active, "utf8");
+        const active = readFileSync(files.configPath, "utf8");
+        assert.match(active, /^openai_base_url = "http:\/\/127\.0\.0\.1:8787\/codex"$/m);
+        assert.doesNotMatch(active, /\[model_providers\.openai\]/);
         disableCodexTakeover(files);
         const restored = readFileSync(files.configPath, "utf8");
-        assert.match(restored, /\[model_providers\.openai\]\n# user note added while routed/);
-        assert.doesNotMatch(restored, /base_url|supports_websockets/);
+        assert.match(restored, /^openai_base_url = "https:\/\/user-existing\.example\/v1"$/m);
     } finally {
         rmSync(files.root, { recursive: true, force: true });
     }
@@ -247,6 +244,49 @@ test("non-numeric sectionPrefixLength in state is rejected without wiping config
         assert.doesNotThrow(() => getCodexTakeoverStatus(files));
         assert.equal(getCodexTakeoverStatus(files).state, "disabled", "invalid sectionPrefixLength rejects state");
         assert.equal(readFileSync(files.configPath, "utf8"), configContent, "config.toml not wiped");
+    } finally {
+        rmSync(files.root, { recursive: true, force: true });
+    }
+});
+
+test("migration: old-format v1 state with openai sectionAdded is cleaned up on disable", () => {
+    const files = fixture();
+    const routedConfig = [
+        "[model_providers.openai]",
+        'name = "OpenAI"',
+        'base_url = "http://127.0.0.1:8787/codex"',
+        'wire_api = "responses"',
+        "requires_openai_auth = true",
+        "supports_websockets = false",
+        "",
+    ].join("\n");
+    writeFileSync(files.configPath, routedConfig, "utf8");
+    mkdirSync(path.dirname(files.statePath), { recursive: true });
+    writeFileSync(files.statePath, JSON.stringify({
+        version: 1,
+        active: true,
+        providerId: "openai",
+        configPath: files.configPath,
+        sectionAdded: true,
+        sectionPrefixLength: 0,
+        insertedFields: ["name", "base_url", "wire_api", "requires_openai_auth", "supports_websockets"],
+        originalFields: {
+            base_url: { present: false },
+            supports_websockets: { present: false },
+        },
+        original: { baseUrl: "https://chatgpt.com/backend-api/codex", supportsWebsockets: true },
+        installed: { baseUrl: "http://127.0.0.1:8787/codex", supportsWebsockets: false },
+        configHashBefore: "abc",
+        startedAt: new Date().toISOString(),
+    }), "utf8");
+    try {
+        const status = getCodexTakeoverStatus(files);
+        assert.equal(status.state, "enabled", "migrated v1 state is recognized as enabled");
+        disableCodexTakeover(files);
+        const restored = readFileSync(files.configPath, "utf8");
+        assert.doesNotMatch(restored, /\[model_providers\.openai\]/);
+        assert.doesNotMatch(restored, /base_url|supports_websockets|requires_openai_auth/);
+        assert.equal(existsSync(files.statePath), false);
     } finally {
         rmSync(files.root, { recursive: true, force: true });
     }

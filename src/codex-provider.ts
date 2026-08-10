@@ -283,6 +283,50 @@ export function removeCodexProviderField(text: string, providerId: string, key: 
     return existing ? text.slice(0, existing.lineStart) + text.slice(existing.lineEnd) : text;
 }
 
+export function getTopLevelField(text: string, key: string): ProviderFieldValue | undefined {
+    return rootAssignment(text, key)?.value;
+}
+
+export function getTopLevelFieldSnapshot(text: string, key: string): ProviderFieldSnapshot | undefined {
+    const assignment = rootAssignment(text, key);
+    return assignment ? { value: assignment.value, encoded: assignment.encoded } : undefined;
+}
+
+export function setTopLevelField(
+    text: string,
+    key: string,
+    value: ProviderFieldValue,
+): { text: string; added: boolean } {
+    const existing = rootAssignment(text, key);
+    if (existing) {
+        return {
+            text: text.slice(0, existing.start) + encodeValue(value) + text.slice(existing.end),
+            added: false,
+        };
+    }
+    const eol = preferredEol(text);
+    const firstSection = linesOf(text).find((line) => /^\s*\[/.test(line.content));
+    const insertAt = firstSection?.start ?? text.length;
+    const prefix = insertAt > 0 && !/(?:\r\n|\r|\n)$/.test(text.slice(0, insertAt)) ? eol : "";
+    const line = `${key} = ${encodeValue(value)}${eol}`;
+    return { text: text.slice(0, insertAt) + prefix + line + text.slice(insertAt), added: true };
+}
+
+export function restoreTopLevelField(
+    text: string,
+    key: string,
+    snapshot: ProviderFieldSnapshot,
+): string {
+    const existing = rootAssignment(text, key);
+    if (!existing) throw new Error(`Top-level field "${key}" is missing`);
+    return text.slice(0, existing.start) + snapshot.encoded + text.slice(existing.end);
+}
+
+export function removeTopLevelField(text: string, key: string): string {
+    const existing = rootAssignment(text, key);
+    return existing ? text.slice(0, existing.lineStart) + text.slice(existing.lineEnd) : text;
+}
+
 export function appendCodexProviderSection(
     text: string,
     providerId: string,

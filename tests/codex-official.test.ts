@@ -187,3 +187,50 @@ test("Codex official profile uses text protocol and prompt-cache auto stays nati
     assert.equal(isCodexResponsesLite({}, { input: [{ type: "additional_tools", tools: [] }] }), true);
     assert.equal(isCodexResponsesLite({}, { input: [] }), false);
 });
+
+test("WebSocket upgrade to /codex/responses returns 426 so Codex falls back to HTTP POST", async () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    const opts: ProxyOptions = {
+        port: 0,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1",
+        routes: {},
+        modelContextLimit: 400_000,
+        kernelConfig: defaultConfig(400_000),
+        compress: { injectTool: true, injectNudge: true },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        mitm: { enabled: false, domains: [] },
+    };
+    const proxy = await startServer(opts);
+    await listen(proxy);
+    const proxyPort = (proxy.address() as { port: number }).port;
+    try {
+        const response = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+            const req = http.request(
+                {
+                    hostname: "127.0.0.1",
+                    port: proxyPort,
+                    path: "/codex/responses",
+                    method: "GET",
+                    headers: { upgrade: "websocket", connection: "Upgrade" },
+                },
+                (res) => {
+                    const chunks: Buffer[] = [];
+                    res.on("data", (chunk: Buffer) => chunks.push(chunk));
+                    res.on("end", () => resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf8") }));
+                },
+            );
+            req.on("error", reject);
+            req.end();
+        });
+        assert.equal(response.status, 426);
+    } finally {
+        await close(proxy);
+    }
+});

@@ -410,7 +410,13 @@ async function handle(
     }
     if (req.method === "GET" && req.url === "/__bili/codex-history") return handleCodexHistoryGet(res);
     if (req.method === "POST" && req.url === "/__bili/codex-history/repair") return handleCodexHistoryRepair(res);
-    if ((req.url === "/codex" || req.url?.startsWith("/codex/") || req.url?.startsWith("/codex?")) && !getCodexRouteState()) {
+    const isCodexPath = req.url === "/codex" || req.url?.startsWith("/codex/") || req.url?.startsWith("/codex?");
+    if (isCodexPath && req.headers.upgrade === "websocket") {
+        res.writeHead(426, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "WebSocket upgrade is not supported; use HTTP POST" }));
+        return;
+    }
+    if (isCodexPath && !getCodexRouteState()) {
         res.writeHead(503, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: "Codex local route is not enabled; run bili codex enable" }));
         return;

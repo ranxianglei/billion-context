@@ -14,21 +14,25 @@ import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import { dataDir } from "./paths.js";
 import {
-    appendCodexProviderSection,
     codexConfigFile,
     getCodexProviderField,
     getCodexProviderFieldSnapshot,
+    getTopLevelField,
+    getTopLevelFieldSnapshot,
     readCodexConfig,
     removeCodexProviderField,
     removeCodexProviderSectionWithPrefixIfEmpty,
+    removeTopLevelField,
     restoreCodexProviderField,
+    restoreTopLevelField,
     resolveActiveCodexProvider,
     setCodexProviderField,
+    setTopLevelField,
     type ActiveCodexProvider,
     type ProviderFieldValue,
 } from "./codex-provider.js";
 
-export const CODEX_ROUTE_STATE_VERSION = 1;
+export const CODEX_ROUTE_STATE_VERSION = 2;
 
 const INSTALLED_BASE_FIELDS: Record<string, ProviderFieldValue> = {
     name: "OpenAI",
@@ -43,7 +47,7 @@ type StoredField = {
 };
 
 export type CodexRouteState = {
-    version: typeof CODEX_ROUTE_STATE_VERSION;
+    version: number;
     active: true;
     pid?: number;
     providerId: string;
@@ -60,6 +64,8 @@ export type CodexRouteState = {
         baseUrl: string;
         supportsWebsockets: false;
     };
+    baseUrlMode: "top-level" | "provider-section";
+    originalTopLevelBaseUrl?: StoredField;
     configHashBefore: string;
     startedAt: string;
     lastRequestAt?: string;
@@ -125,9 +131,9 @@ function atomicWrite(filePath: string, text: string): void {
 function parseState(statePath: string): CodexRouteState | undefined {
     if (!existsSync(statePath)) return undefined;
     try {
-        const value = JSON.parse(readFileSync(statePath, "utf8")) as Partial<CodexRouteState>;
+        const value = JSON.parse(readFileSync(statePath, "utf8")) as Partial<CodexRouteState> & { version?: number };
         if (
-            value.version === CODEX_ROUTE_STATE_VERSION &&
+            (value.version === 1 || value.version === 2) &&
             value.active === true &&
             typeof value.providerId === "string" &&
             typeof value.configPath === "string" &&
@@ -137,7 +143,11 @@ function parseState(statePath: string): CodexRouteState | undefined {
             value.originalFields && typeof value.originalFields === "object" &&
             Array.isArray(value.insertedFields) &&
             typeof value.sectionPrefixLength === "number" && value.sectionPrefixLength >= 0
-        ) return value as CodexRouteState;
+        ) {
+            const migrated = value as unknown as CodexRouteState;
+            if (!migrated.baseUrlMode) migrated.baseUrlMode = "provider-section";
+            return migrated;
+        }
     } catch {
     }
     return undefined;
@@ -172,6 +182,11 @@ function isInstalledBaseUrl(value: string): boolean {
 
 function storedField(text: string, providerId: string, key: string): StoredField {
     const snapshot = getCodexProviderFieldSnapshot(text, providerId, key);
+    return snapshot === undefined ? { present: false } : { present: true, ...snapshot };
+}
+
+function storedTopLevelField(text: string, key: string): StoredField {
+    const snapshot = getTopLevelFieldSnapshot(text, key);
     return snapshot === undefined ? { present: false } : { present: true, ...snapshot };
 }
 
@@ -219,9 +234,14 @@ export function getCodexTakeoverStatus(options: CodexTakeoverPaths = {}): CodexT
         };
     }
     const text = readCodexConfig(paths.configPath);
-    const currentBase = getCodexProviderField(text, state.providerId, "base_url");
-    const currentWebsockets = getCodexProviderField(text, state.providerId, "supports_websockets");
-    const matches = currentBase === state.installed.baseUrl && currentWebsockets === false;
+    const isTopLevel = state.baseUrlMode === "top-level";
+    const currentBase = isTopLevel
+        ? getTopLevelField(text, "openai_base_url")
+        : getCodexProviderField(text, state.providerId, "base_url");
+    const currentWebsockets = isTopLevel
+        ? undefined
+        : getCodexProviderField(text, state.providerId, "supports_websockets");
+    const matches = currentBase === state.installed.baseUrl && (isTopLevel || currentWebsockets === false);
     const port = Number.parseInt(new URL(state.installed.baseUrl).port, 10);
     return {
         state: matches ? "enabled" : "conflict",
@@ -271,19 +291,20 @@ export function enableCodexTakeover(port: number, options: CodexTakeoverPaths = 
     const managedKeys = ["base_url", "supports_websockets"];
     const originalFields: Record<string, StoredField> = {};
     for (const key of managedKeys) originalFields[key] = storedField(before, provider.id, key);
+    const originalTopLevelBaseUrl = !provider.sectionExists
+        ? storedTopLevelField(before, "openai_base_url")
+        : undefined;
     let after = before;
     const insertedFields: string[] = [];
     let sectionAdded = false;
+    let baseUrlMode: "top-level" | "provider-section";
     if (!provider.sectionExists) {
-        sectionAdded = true;
-        const fields = {
-            ...INSTALLED_BASE_FIELDS,
-            base_url: installedUrl,
-            supports_websockets: false,
-        };
-        after = appendCodexProviderSection(after, provider.id, fields);
-        insertedFields.push(...Object.keys(fields));
+        baseUrlMode = "top-level";
+        const result = setTopLevelField(after, "openai_base_url", installedUrl);
+        after = result.text;
+        if (result.added) insertedFields.push("openai_base_url");
     } else {
+        baseUrlMode = "provider-section";
         const baseResult = setCodexProviderField(after, provider.id, "base_url", installedUrl);
         after = baseResult.text;
         if (baseResult.added) insertedFields.push("base_url");
@@ -309,6 +330,8 @@ export function enableCodexTakeover(port: number, options: CodexTakeoverPaths = 
         originalFields,
         original: { baseUrl: provider.baseUrl, supportsWebsockets: provider.supportsWebsockets },
         installed: { baseUrl: installedUrl, supportsWebsockets: false },
+        baseUrlMode,
+        ...(originalTopLevelBaseUrl ? { originalTopLevelBaseUrl } : {}),
         configHashBefore: sha256(before),
         startedAt: new Date().toISOString(),
     };
@@ -328,6 +351,29 @@ export function disableCodexTakeover(options: CodexTakeoverPaths = {}): CodexTak
     if (!state) return getCodexTakeoverStatus(paths);
     let text = readCodexConfig(state.configPath);
     const preserved: string[] = [];
+    if (state.baseUrlMode === "top-level") {
+        const current = getTopLevelField(text, "openai_base_url");
+        if (current === state.installed.baseUrl) {
+            const original = state.originalTopLevelBaseUrl;
+            if (original?.present && original.value !== undefined) {
+                text = typeof original.encoded === "string"
+                    ? restoreTopLevelField(text, "openai_base_url", {
+                        value: original.value,
+                        encoded: original.encoded,
+                    })
+                    : setTopLevelField(text, "openai_base_url", original.value).text;
+            } else {
+                text = removeTopLevelField(text, "openai_base_url");
+            }
+        } else if (current !== undefined) {
+            preserved.push("openai_base_url");
+        }
+        atomicWrite(state.configPath, text);
+        removeState(paths.statePath);
+        const status = getCodexTakeoverStatus({ ...paths, configPath: state.configPath });
+        if (preserved.length > 0) status.detail = `检测到用户修改，已保留：${preserved.join(", ")}`;
+        return status;
+    }
     const installedValues: Record<string, ProviderFieldValue> = {
         ...INSTALLED_BASE_FIELDS,
         base_url: state.installed.baseUrl,
