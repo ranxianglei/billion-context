@@ -3,9 +3,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import net from "node:net";
 import { once } from "node:events";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
+import { once } from "node:events";
 import { defaultConfig } from "acp-kernel";
 import { loadOptions, type ProxyOptions } from "../src/config.ts";
 import { resolveUpstream, startServer } from "../src/server.ts";
@@ -31,46 +29,20 @@ function close(server: http.Server): Promise<void> {
     return new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
 }
 
-function codexFixture(): { root: string; codexHome: string; configPath: string } {
-    const root = path.join(tmpdir(), `bili-route-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`);
-    const codexHome = path.join(root, "codex");
-    mkdirSync(codexHome, { recursive: true });
-    const configPath = path.join(codexHome, "config.toml");
-    return { root, codexHome, configPath };
-}
-
-test("/codex resolves every future subpath against the active provider from config.toml", () => {
-    const files = codexFixture();
-    writeFileSync(files.configPath, [
-        'model_provider = "relay"',
-        "[model_providers.relay]",
-        'name = "Relay"',
-        'base_url = "https://relay.example/openai/v1"',
-        'wire_api = "responses"',
-        "requires_openai_auth = true",
-        "supports_websockets = false",
-    ].join("\n"), "utf8");
-    const oldHome = process.env.CODEX_HOME;
-    process.env.CODEX_HOME = files.codexHome;
-    try {
-        const opts = loadOptions({ ACP_PORT: "8787" });
-        assert.deepEqual(resolveUpstream(opts, "/codex/responses?foo=a%2Fb"), {
-            upstream: "https://relay.example/openai/v1",
-            rewrittenUrl: "https://relay.example/openai/v1/responses?foo=a%2Fb",
-        });
-        assert.deepEqual(resolveUpstream(opts, "/codex/future/unknown?x=1"), {
-            upstream: "https://relay.example/openai/v1",
-            rewrittenUrl: "https://relay.example/openai/v1/future/unknown?x=1",
-        });
-        assert.equal(resolveUpstream(opts, "/codex-not-owned/responses"), undefined);
-    } finally {
-        if (oldHome === undefined) delete process.env.CODEX_HOME;
-        else process.env.CODEX_HOME = oldHome;
-        rmSync(files.root, { recursive: true, force: true });
-    }
+test("/bili/ resolves upstream host and full path from embedded URL", () => {
+    const opts = loadOptions({ ACP_PORT: "8787" });
+    assert.deepEqual(resolveUpstream(opts, "/bili/https://relay.example/openai/v1/responses?foo=a%2Fb"), {
+        upstream: "https://relay.example",
+        rewrittenUrl: "https://relay.example/openai/v1/responses?foo=a%2Fb",
+    });
+    assert.deepEqual(resolveUpstream(opts, "/bili/https://relay.example/openai/v1/future/unknown?x=1"), {
+        upstream: "https://relay.example",
+        rewrittenUrl: "https://relay.example/openai/v1/future/unknown?x=1",
+    });
+    assert.equal(resolveUpstream(opts, "/bili-not-owned/responses"), undefined);
 });
 
-test("/codex integration preserves query, subscription, account and thread headers", async () => {
+test("/bili/ integration preserves query, subscription, account and thread headers", async () => {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     let captured: { url: string; headers: http.IncomingHttpHeaders; body: string } | undefined;
@@ -85,18 +57,6 @@ test("/codex integration preserves query, subscription, account and thread heade
     });
     await listen(upstream);
     const upstreamPort = (upstream.address() as { port: number }).port;
-    const files = codexFixture();
-    writeFileSync(files.configPath, [
-        'model_provider = "relay"',
-        "[model_providers.relay]",
-        'name = "Relay"',
-        `base_url = "http://127.0.0.1:${upstreamPort}/backend-api/codex"`,
-        'wire_api = "responses"',
-        "requires_openai_auth = true",
-        "supports_websockets = false",
-    ].join("\n"), "utf8");
-    const oldHome = process.env.CODEX_HOME;
-    process.env.CODEX_HOME = files.codexHome;
     const probe = http.createServer();
     await listen(probe);
     const biliPort = (probe.address() as { port: number }).port;
@@ -121,7 +81,7 @@ test("/codex integration preserves query, subscription, account and thread heade
     const bili = await startServer(opts);
     if (!bili.listening) await once(bili, "listening");
     try {
-        const response = await fetch(`http://127.0.0.1:${biliPort}/codex/future/unknown?x=1&encoded=a%2Fb`, {
+        const response = await fetch(`http://127.0.0.1:${biliPort}/bili/http://127.0.0.1:${upstreamPort}/backend-api/codex/future/unknown?x=1&encoded=a%2Fb`, {
             method: "POST",
             headers: {
                 authorization: "Bearer OfficialSubscription",
@@ -143,9 +103,6 @@ test("/codex integration preserves query, subscription, account and thread heade
     } finally {
         await close(bili);
         await close(upstream);
-        if (oldHome === undefined) delete process.env.CODEX_HOME;
-        else process.env.CODEX_HOME = oldHome;
-        rmSync(files.root, { recursive: true, force: true });
     }
 });
 
