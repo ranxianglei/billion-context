@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { writeFileSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadOptions, lookupContextLimit, resolveContextLimit, resolveConfiguredContextLimit, parseRouteEntry, parsePromptCacheRouting } from "../src/config.ts";
+import { loadOptions, lookupContextLimit, resolveContextLimit, resolveConfiguredContextLimit, resolveConfiguredProtocol, parseRouteEntry, parsePromptCacheRouting } from "../src/config.ts";
 
 const TMP = (s: string) => join(tmpdir(), `test-acp-${process.pid}-${s}.json`);
 const writeRoutes = (name: string, obj: unknown) => {
@@ -173,4 +173,32 @@ test("normalizeUrlKey strips trailing slashes", () => {
     assert.equal(normalizeUrlKey("https://open.bigmodel.cn///"), "https://open.bigmodel.cn");
     assert.equal(normalizeUrlKey("https://open.bigmodel.cn"), "https://open.bigmodel.cn");
     assert.equal(normalizeUrlKey(""), "");
+});
+
+// ── resolveConfiguredProtocol: explicit protocol override ─────────────────
+
+test("resolveConfiguredProtocol returns explicit protocol for matching URL", () => {
+    const routes = {
+        "https://custom-relay.example.com/api": { protocol: "responses" },
+    };
+    assert.equal(resolveConfiguredProtocol(routes, "https://custom-relay.example.com/api/chat"), "responses");
+    assert.equal(resolveConfiguredProtocol(routes, "https://custom-relay.example.com/api"), "responses");
+});
+
+test("resolveConfiguredProtocol longest-prefix wins", () => {
+    const routes = {
+        "https://host.com": { protocol: "openai" },
+        "https://host.com/v1": { protocol: "anthropic" },
+    };
+    assert.equal(resolveConfiguredProtocol(routes, "https://host.com/v1/messages"), "anthropic");
+    assert.equal(resolveConfiguredProtocol(routes, "https://host.com/other"), "openai");
+});
+
+test("resolveConfiguredProtocol returns undefined when no protocol configured", () => {
+    const routes = {
+        "https://host.com": { models: { "gpt-5": { context: 128000 } } },
+    };
+    assert.equal(resolveConfiguredProtocol(routes, "https://host.com/v1/chat"), undefined);
+    assert.equal(resolveConfiguredProtocol(routes, "https://unrelated.com"), undefined);
+    assert.equal(resolveConfiguredProtocol(routes, undefined), undefined);
 });

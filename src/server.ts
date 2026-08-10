@@ -5,7 +5,7 @@ import { createCore, type CompressionCore, type Config, type CoreMessage, type N
 import type { ProxyOptions } from "./config.js";
 import { loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
-import { resolveContextLimit } from "./config.js";
+import { resolveContextLimit, resolveConfiguredProtocol } from "./config.js";
 import { contextFromRegistry, loadRegistry } from "./registry.js";
 import { fetchWithTimeout, MAX_REQUEST_BYTES } from "./fetch-util.js";
 import { formatUpstreamError, getUpstreamConnectionStatus, recordUpstreamConnection, resolveProxy, resolveProxyDecision, proxyDispatcher } from "./upstream-proxy.js";
@@ -400,8 +400,12 @@ async function handle(
     const urlPath = url.split("?", 2)[0];
     const responsesCompact = urlPath.endsWith("/responses/compact");
     const countTokens = isCountTokensRequest(req.method ?? "GET", urlPath, bodyBuffer.length > 0);
+    const route = resolveUpstream(opts, req.url ?? "", req);
+    const upstreamOrigin = route ? route.upstream : opts.upstream;
+    const explicitProtocol = resolveConfiguredProtocol(opts.routes, route?.rewrittenUrl);
     const protocol: "anthropic" | "openai" | "responses" | null =
-        req.method === "POST" && bodyBuffer.length > 0
+        explicitProtocol
+        ?? (req.method === "POST" && bodyBuffer.length > 0
             ? urlPath.endsWith("/chat/completions")
                 ? "openai"
                 : urlPath.endsWith("/v1/messages") || urlPath.endsWith("/messages")
@@ -409,13 +413,7 @@ async function handle(
                   : urlPath.endsWith("/responses") || responsesCompact
                     ? "responses"
                     : null
-            : null;
-    // Resolve the upstream route once here so both the session id (needs the
-    // upstream ORIGIN for cross-provider isolation) and forward() (needs the
-    // full rewritten URL) use the same decision. Computed before prepare() so
-    // the session can embed the provider origin.
-    const route = resolveUpstream(opts, req.url ?? "", req);
-    const upstreamOrigin = route ? route.upstream : opts.upstream;
+            : null);
     // Per-request context limit: look up body.model against the per-route model
     // declaration in providers.json first (same model can have different
     // windows behind different relays), then the built-in table. Falls back to
