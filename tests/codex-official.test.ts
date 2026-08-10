@@ -104,16 +104,17 @@ test("Codex official transport preserves OAuth headers, decodes bodies, and reba
         const forwarded = JSON.parse(captured[0].body.toString("utf8")) as {
             input: Array<Record<string, unknown>>;
             prompt_cache_key?: string;
-            instructions: string;
+            instructions?: string;
             additional_tools: unknown[];
             tools: unknown[];
         };
         assert.deepEqual(forwarded.input.map((item) => item.type), ["additional_tools", "message", "reasoning", "message"]);
         assert.match(String(forwarded.input[1].content), /acp_compress/);
+        assert.match(String(forwarded.input[1].content), /keep native Codex instructions/);
         assert.equal(forwarded.input[2].encrypted_content, "ciphertext");
         assert.equal((forwarded.input[3].content as Array<Record<string, unknown>>)[1].type, "input_image");
         assert.equal(forwarded.prompt_cache_key, undefined);
-        assert.equal(forwarded.instructions, requestBody.instructions);
+        assert.equal(forwarded.instructions, undefined);
         assert.deepEqual(forwarded.additional_tools, requestBody.additional_tools);
         assert.deepEqual(forwarded.tools, requestBody.tools);
 

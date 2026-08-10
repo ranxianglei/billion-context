@@ -792,8 +792,11 @@ function prepareResponses(
         rebuiltInput = patchResponsesInput(projection, processedMessages);
         if (shouldInject && !process.env.ACP_NO_COMPRESS_PROMPT) {
             const prompt = responsesTextProtocol ? buildCompressTextSystemPrompt() : buildCompressSystemPrompt();
-            rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, prompt);
+            const devContent = [...projection.systemParts, prompt].join("\n\n---\n\n");
+            rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent);
             if (!responsesTextProtocol && !process.env.ACP_NO_INJECT_TOOL) toolsOut = injectResponsesTool(parsed.tools);
+        } else if (projection.systemParts.length > 0) {
+            rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, projection.systemParts.join("\n\n---\n\n"));
         }
         if (turn.nudge?.shouldInject && shouldInject) {
             try {
@@ -821,6 +824,16 @@ function prepareResponses(
         session.meta.upstreamOrigin,
     );
     if (promptCacheKey && !rebuilt.prompt_cache_key) rebuilt.prompt_cache_key = promptCacheKey;
+    // This adapter is stateless: we replay the FULL conversation in `input`.
+    // Strip Responses' native chaining fields so the upstream does not resolve
+    // stored server-side state on top of the input we already sent. Forwarding
+    // previous_response_id would make the prefix shift every turn (as the id
+    // advances) and duplicate history — breaking prompt-cache. `instructions`
+    // was already lifted into the developer message at input[1], so forwarding
+    // it again here double-sends it and violates the responses_lite contract
+    // (top-level instructions must stay empty for code_mode tool exposure).
+    delete rebuilt.previous_response_id;
+    delete rebuilt.instructions;
     // Log the final tools we forward upstream so we can confirm ACP tools are
     // present. Distinguishes "compress" (top-level function) from Codex
     // namespace items (type:namespace/custom).

@@ -71,18 +71,20 @@ export type ResponsesProjection = {
     droppedReasoning: number;
 };
 
+/** Item types that are host DIRECTIVES (tool/definition listings), not
+ *  conversation history: preserved verbatim and re-prepended at input[0..].
+ *  `additional_tools` carries the Codex code_mode exec/wait tool definitions
+ *  and MUST stay at input[0]. `mcp_list_tools` is a stable per-session listing.
+ *
+ *  Only definitions belong here. Output/action items from a prior response
+ *  (reasoning, computer_call, function_call, mcp_call, ...) ARE conversation
+ *  history and are routed as tracked BiliMessages, so the compression pipeline
+ *  hides them once their turn is summarized — preserving them verbatim in the
+ *  preamble instead made them accumulate unbounded every turn and broke Codex's
+ *  prompt-cache prefix. */
 const OPAQUE_ITEM_TYPES = new Set([
     "additional_tools",
-    "computer_call",
-    "computer_call_output",
-    "file_search_call",
-    "web_search_call",
-    "image_generation_call",
-    "code_interpreter_call",
     "mcp_list_tools",
-    "mcp_call",
-    "custom_tool_call",
-    "custom_tool_call_output",
 ]);
 
 function isOpaqueItem(item: ResponseInputItem): boolean {
@@ -112,6 +114,7 @@ export function responsesToCore(body: ResponsesRequestBody): ResponsesProjection
     const layout: ResponseLayoutSlot[] = [];
     let droppedReasoning = 0;
     const clusters = new ClusterCounter();
+    let idx = 0;
     if (typeof body.instructions === "string" && body.instructions.trim()) systemParts.push(body.instructions);
     if (typeof body.input === "string") {
         const id = clusters.next(deriveMessageId("user", "text", body.input));
@@ -146,6 +149,8 @@ export function responsesToCore(body: ResponsesRequestBody): ResponsesProjection
                 const text = messageContent(message.content);
                 if (message.role === "system" || message.role === "developer") {
                     systemParts.push(text);
+                    idx++;
+                    continue;
                 } else if (message.role === "user" || (message.role === "assistant" && text)) {
                     const role = message.role;
                     coreId = clusters.next(deriveMessageId(role, "text", text));
@@ -188,9 +193,37 @@ export function responsesToCore(body: ResponsesRequestBody): ResponsesProjection
                 msgs.push({ id: coreId, role: "tool", contentType: "tool-result", toolCallId: output.call_id, text, rawResponsesItem: item });
                 break;
             }
-            case "custom_tool_call":
+            case "computer_call":
+            case "computer_call_output":
+            case "file_search_call":
+            case "web_search_call":
+            case "image_generation_call":
+            case "code_interpreter_call":
+            case "mcp_call": {
+                const rid =
+                    typeof (item as { id?: unknown }).id === "string"
+                        ? String((item as { id?: string }).id)
+                        : hashId(JSON.stringify(item));
+                coreId = clusters.next(deriveMessageId("assistant", "responses-call", rid));
+                msgs.push({ id: coreId, role: "assistant", contentType: "reasoning", text: rid, rawResponsesItem: item });
+                break;
+            }
+            case "custom_tool_call": {
+                const ctc = item as { call_id?: string; name?: string; input?: string; arguments?: string };
+                const callId = ctc.call_id ?? `call_${idx}`;
+                customToolCallIds.add(callId);
+                const argText = ctc.input ?? ctc.arguments ?? "";
+                coreId = clusters.next(deriveMessageId("assistant", "tool-call", argText, { toolCallId: callId, toolName: ctc.name ?? "custom" }));
+                msgs.push({ id: coreId, role: "assistant", contentType: "tool-call", toolName: ctc.name ?? "custom", toolCallId: callId, text: argText, rawResponsesItem: item });
+                break;
+            }
             case "custom_tool_call_output": {
-                if (typeof item.call_id === "string") customToolCallIds.add(item.call_id);
+                const ctco = item as { call_id?: string; output?: string };
+                const callId = ctco.call_id ?? `call_${idx}`;
+                customToolCallIds.add(callId);
+                const outText = typeof ctco.output === "string" ? ctco.output : JSON.stringify(ctco.output ?? "");
+                coreId = clusters.next(deriveMessageId("tool", "tool-result", outText, { toolCallId: callId }));
+                msgs.push({ id: coreId, role: "tool", contentType: "tool-result", toolCallId: callId, text: outText, rawResponsesItem: item });
                 break;
             }
             default:
@@ -198,6 +231,7 @@ export function responsesToCore(body: ResponsesRequestBody): ResponsesProjection
                 break;
         }
         layout.push({ original: item, coreId });
+        idx++;
     }
     return { msgs, systemParts, preamble, customToolCallIds, layout, droppedReasoning };
 }
@@ -250,7 +284,7 @@ export function patchResponsesInput(projection: ResponsesProjection, messages: C
         if (original && next && messages.length === 1 && next.role === "user" && next.contentType === "text") {
             return next.text === original.text ? projection.stringInput.original : next.text ?? "";
         }
-        return coreToResponses(messages);
+        return coreToResponses(messages, projection.customToolCallIds);
     }
     const sourceById = new Map(projection.msgs.map((message) => [message.id, message]));
     const nextById = new Map(messages.map((message) => [message.id, message]));
@@ -270,7 +304,7 @@ export function patchResponsesInput(projection: ResponsesProjection, messages: C
                 break;
             }
         }
-        const generated = coreToResponses([message]);
+        const generated = coreToResponses([message], projection.customToolCallIds);
         if (generated.length > 0) insertions.set(target, [...(insertions.get(target) ?? []), ...generated]);
     }
     const out: ResponseInputItem[] = [];
@@ -288,7 +322,10 @@ export function patchResponsesInput(projection: ResponsesProjection, messages: C
     return out;
 }
 
-export function coreToResponses(messages: CoreMessage[]): ResponseInputItem[] {
+export function coreToResponses(
+    messages: CoreMessage[],
+    customToolCallIds: Set<string> = new Set(),
+): ResponseInputItem[] {
     const out: ResponseInputItem[] = [];
     for (const message of messages) {
         const biliMessage = message as BiliMessage;
@@ -302,17 +339,22 @@ export function coreToResponses(messages: CoreMessage[]): ResponseInputItem[] {
             if (message.contentType === "text") {
                 out.push({ type: "message", role: "assistant", content: message.text ?? "" });
             } else if (message.contentType === "tool-call") {
-                out.push({
-                    type: "function_call",
-                    call_id: message.toolCallId ?? `call_${message.id}`,
-                    name: message.toolName ?? "unknown",
-                    arguments: message.text ?? "",
-                });
+                const callId = message.toolCallId ?? `call_${message.id}`;
+                if (customToolCallIds.has(callId)) {
+                    out.push({ type: "custom_tool_call", call_id: callId, name: message.toolName ?? "unknown", input: message.text ?? "", status: "completed" } as ResponseInputItem);
+                } else {
+                    out.push({ type: "function_call", call_id: callId, name: message.toolName ?? "unknown", arguments: message.text ?? "" });
+                }
             } else if (message.contentType === "reasoning") {
                 if (raw) out.push(raw);
             }
         } else if (message.role === "tool") {
-            out.push({ type: "function_call_output", call_id: message.toolCallId ?? "", output: message.text ?? "" });
+            const callId = message.toolCallId ?? "";
+            if (customToolCallIds.has(callId)) {
+                out.push({ type: "custom_tool_call_output", call_id: callId, output: message.text ?? "" } as ResponseInputItem);
+            } else {
+                out.push({ type: "function_call_output", call_id: callId, output: message.text ?? "" });
+            }
         }
     }
     return out;

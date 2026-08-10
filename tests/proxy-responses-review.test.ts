@@ -52,7 +52,7 @@ test("responses: preserves standard and custom tool-call item types", () => {
     assert.equal(getWeather?.type, "function_call", "standard function tool stays function_call");
     const getWeatherOut = rebuilt.find((i) => i.type === "function_call_output");
     assert.ok(getWeatherOut, "standard function tool output is function_call_output");
-    assert.equal(rebuilt.some((i) => i.type === "custom_tool_call"), false, "custom calls are not projected into mutable CoreMessages");
+    assert.equal(rebuilt.some((i) => i.type === "custom_tool_call"), true, "custom calls ARE projected into tracked CoreMessages (PR#75)");
     assert.deepEqual(patchResponsesInput(responsesToCore(body as never), msgs), body.input);
 });
 
