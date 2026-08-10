@@ -19,8 +19,10 @@ import type { CompressLoopAdapter } from "./core.js";
 export function pickAdapter(
     protocol: "responses" | "openai" | "anthropic",
     requestBody: Record<string, unknown>,
+    textProtocol?: boolean,
 ): CompressLoopAdapter {
-    if (protocol === "responses") return createResponsesAdapter();
+    if (protocol === "responses") return createResponsesAdapter(textProtocol);
     if (protocol === "openai") return createOpenaiAdapter(requestBody);
-    return createAnthropicAdapter(requestBody);
+    if (protocol === "anthropic") return createAnthropicAdapter(requestBody);
+    throw new Error(`[acp-loop] unknown protocol: ${protocol}`);
 }

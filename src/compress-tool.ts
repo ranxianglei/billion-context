@@ -41,24 +41,28 @@ export type ParsedRange = {
     endRef: string;
     summary: string;
     topic?: string;
+    compressCallId?: string;
 };
 
-export function parseCompressInput(input: unknown): ParsedRange[] {
+export function parseCompressInput(input: unknown, callId?: string): ParsedRange[] {
     if (!input || typeof input !== "object") {
         loggerLog("warn", `[acp-compress-input] rejected: not object (${typeof input})`);
         return [];
     }
     const obj = input as Record<string, unknown>;
-    if (Array.isArray(obj.content)) {
-        const out = obj.content
-            .map((r) => toRange(r as Record<string, unknown>))
-            .filter((r): r is ParsedRange => r !== null);
-        if (out.length === 0) loggerLog("warn", `[acp-compress-input] content array but 0 valid ranges. keys per item: ${obj.content.map((c) => Object.keys(c ?? {}).join(",")).join(" | ")}`);
-        return out;
-    }
     const single = toRange(obj);
-    if (!single) loggerLog("warn", `[acp-compress-input] no content array, single-parse failed. top keys: ${Object.keys(obj).join(",")}`);
-    return single ? [single] : [];
+    const ranges = Array.isArray(obj.content)
+        ? obj.content
+              .map((r) => toRange(r as Record<string, unknown>))
+              .filter((r): r is ParsedRange => r !== null)
+        : single
+          ? [single]
+          : [];
+    if (ranges.length === 0) {
+        loggerLog("warn", `[acp-compress-input] parsed 0 valid ranges. top keys: ${Object.keys(obj).join(",")}`);
+    }
+    if (callId) for (const r of ranges) r.compressCallId = callId;
+    return ranges;
 }
 
 function toRange(r: Record<string, unknown>): ParsedRange | null {

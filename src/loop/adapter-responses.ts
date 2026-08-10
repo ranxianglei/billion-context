@@ -116,7 +116,8 @@ function buildCompleted(responseObj: Record<string, unknown> | null): Buffer {
     );
 }
 
-export function createResponsesAdapter(): CompressLoopAdapter {
+export function createResponsesAdapter(textProtocol?: boolean): CompressLoopAdapter {
+    const suppressTextLifecycle = !!textProtocol;
     let outputIndex = 0;
     let responseObj: Record<string, unknown> | null = null;
     let terminalRaw: Buffer | null = null;
@@ -178,7 +179,9 @@ export function createResponsesAdapter(): CompressLoopAdapter {
                     type === "response.content_part.done" ||
                     type === "response.output_text.done"
                 ) {
-                    yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
+                    if (!suppressTextLifecycle) {
+                        yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
+                    }
                 } else if (type === "response.output_text.delta") {
                     const delta = typeof obj.delta === "string" ? obj.delta : "";
                     if (delta.length > 0) {
@@ -216,6 +219,16 @@ export function createResponsesAdapter(): CompressLoopAdapter {
                     responseObj = (obj.response as Record<string, unknown>) ?? null;
                     terminalKind = "completed";
                     terminalRaw = null;
+                    const respUsage = (responseObj as Record<string, unknown> | null)?.usage as
+                        | Record<string, unknown>
+                        | undefined;
+                    const pd = respUsage?.input_tokens_details as Record<string, unknown> | undefined;
+                    yield {
+                        kind: "usage",
+                        inputTokens: typeof respUsage?.input_tokens === "number" ? respUsage.input_tokens : undefined,
+                        outputTokens: typeof respUsage?.output_tokens === "number" ? respUsage.output_tokens : undefined,
+                        cachedTokens: typeof pd?.cached_tokens === "number" ? pd.cached_tokens : undefined,
+                    } as ParsedStreamEvent;
                     yield { kind: "done", finishReason: "completed" } as ParsedStreamEvent;
                 } else if (type === "response.incomplete") {
                     terminalKind = "incomplete";

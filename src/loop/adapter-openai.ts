@@ -184,7 +184,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>): Compr
 
                 if (typeof delta.content === "string" && delta.content.length > 0) {
                     yield { kind: "text", delta: delta.content, raw: rawBuf } as ParsedStreamEvent;
-                } else if (delta.role || Object.keys(delta).length === 0) {
+                } else if (delta.role || (Object.keys(delta).length === 0 && !finishReason)) {
                     yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
                 }
             }

@@ -14,6 +14,7 @@ import {
 } from "../compress-tool.js";
 import { applyRanges } from "../stream.js";
 import { resolveDecompress } from "../decompress-shared.js";
+import { buildVisibilityMarker } from "../compress-loop.js";
 import { fetchWithTimeout } from "../fetch-util.js";
 import { proxyDispatcher } from "../upstream-proxy.js";
 import { log as loggerLog } from "../logger.js";
@@ -78,9 +79,10 @@ export function executeProxyTool(
     toolName: string,
     args: Record<string, unknown>,
     ctx: LoopCtx,
+    callId?: string,
 ): string {
     if (toolName === "compress") {
-        return applyRanges(parseCompressInput(args), ctx);
+        return applyRanges(parseCompressInput(args, callId), ctx);
     }
     if (toolName === "decompress") {
         return resolveDecompress(args, ctx);
@@ -194,7 +196,7 @@ export async function* runCompressLoop(
             let sawMutating = false;
             let realCalls = 0;
             const realToolCalls: ToolCallEmit[] = [];
-            const proxyResults: { name: string; callId: string; result: string }[] = [];
+            const proxyResults: { name: string; callId: string; result: string; arguments: string }[] = [];
 
             for (const call of allCalls) {
                 if (PROXY_TOOL_NAMES.has(call.name)) {
@@ -204,8 +206,8 @@ export async function* runCompressLoop(
                     } catch {
                         parsedArgs = {};
                     }
-                    const result = executeProxyTool(call.name, parsedArgs, ctx);
-                    proxyResults.push({ name: call.name, callId: call.callId, result });
+                    const result = executeProxyTool(call.name, parsedArgs, ctx, call.callId);
+                    proxyResults.push({ name: call.name, callId: call.callId, result, arguments: call.arguments });
                     yield adapter.emitMarker(call.name, result);
                     if (MUTATING_PROXY_TOOLS.has(call.name)) sawMutating = true;
                 } else {
@@ -228,26 +230,38 @@ export async function* runCompressLoop(
                     });
                 }
                 for (const pr of proxyResults) {
-                    coreMessages.push({
-                        id: `acp_loop_r${round}_asst_tc_${pr.callId}`,
-                        role: "assistant",
-                        contentType: "tool-call",
-                        toolName: pr.name,
-                        toolCallId: pr.callId,
-                    });
-                    coreMessages.push({
-                        id: `acp_loop_r${round}_tool_${pr.callId}`,
-                        role: "tool",
-                        contentType: "tool-result",
-                        toolCallId: pr.callId,
-                        text: pr.result,
-                    });
+                    if (ctx.textProtocol) {
+                        coreMessages.push({
+                            id: `acp_loop_r${round}_marker_${pr.callId}`,
+                            role: "user",
+                            contentType: "text",
+                            text: buildVisibilityMarker(pr.name, pr.result),
+                        });
+                    } else {
+                        coreMessages.push({
+                            id: `acp_loop_r${round}_asst_tc_${pr.callId}`,
+                            role: "assistant",
+                            contentType: "tool-call",
+                            toolName: pr.name,
+                            toolCallId: pr.callId,
+                            text: pr.arguments,
+                        });
+                        coreMessages.push({
+                            id: `acp_loop_r${round}_tool_${pr.callId}`,
+                            role: "tool",
+                            contentType: "tool-result",
+                            toolCallId: pr.callId,
+                            text: pr.result,
+                        });
+                    }
                 }
-                const hidden = hideConsumedCompressCalls(ctx.session.state, coreMessages);
-                if (hidden.hidden > 0) {
-                    ctx.log(`[acp-loop] round ${round} hideConsumed hid ${hidden.hidden} compress record(s)`);
-                    coreMessages.length = 0;
-                    coreMessages.push(...hidden.messages);
+                if (!ctx.textProtocol) {
+                    const hidden = hideConsumedCompressCalls(ctx.session.state, coreMessages);
+                    if (hidden.hidden > 0) {
+                        ctx.log(`[acp-loop] round ${round} hideConsumed hid ${hidden.hidden} compress record(s)`);
+                        coreMessages.length = 0;
+                        coreMessages.push(...hidden.messages);
+                    }
                 }
             }
 
@@ -281,6 +295,7 @@ export async function* runCompressLoop(
             });
 
             if (!resp.ok || !resp.body) {
+                clearTimer();
                 const errText = await resp.text().catch(() => "upstream error");
                 ctx.log(`[acp-proxy: compress loop upstream error ${resp.status}: ${errText.slice(0, 200)}]`);
                 loggerLog("error", `[acp-loop] upstream error ${resp.status}: ${errText.slice(0, 200)}`);

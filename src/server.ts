@@ -1139,7 +1139,7 @@ async function forward(
             reqHeaders["content-type"] = "application/json";
             const textProtocol = prepared.protocol === "responses" && !!prepared.responsesTextProtocol;
             const systemPrompt = textProtocol ? buildCompressTextSystemPrompt() : buildCompressSystemPrompt();
-            const adapter = pickAdapter(prepared.protocol, parsedReq);
+            const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol);
             const loop = runCompressLoop(
                 streamToRead,
                 { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, textProtocol, debug: opts.debug },
