@@ -4,6 +4,7 @@ import { compressLoopResponsesStream } from "../src/compress-loop-responses.ts";
 import type { Config, CoreMessage } from "acp-kernel";
 import { createCore, createInitialState } from "acp-kernel";
 import type { Session } from "../src/session.ts";
+import { ACP_TEXT_CLOSE, ACP_TEXT_OPEN } from "../src/compress-tool.ts";
 
 function makeCtx(log: (m: string) => void): { core: ReturnType<typeof createCore>; config: Config; messages: CoreMessage[]; session: Session; log: (m: string) => void } {
     return {
@@ -116,4 +117,65 @@ test("compressLoopResponsesStream: compress-only round executes tool and re-requ
     } finally {
         globalThis.fetch = originalFetch;
     }
+});
+
+test("compressLoopResponsesStream: Codex text protocol never sends synthetic function items", async () => {
+    const trigger = `${ACP_TEXT_OPEN}${JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "sum" }] })}${ACP_TEXT_CLOSE}`;
+    const round1 = [
+        sse("response.created", { response: { id: "resp_text_1", status: "in_progress" } }),
+        sse("response.output_text.delta", { item_id: "msg_text_1", output_index: 0, delta: trigger }),
+        sse("response.completed", { response: { id: "resp_text_1", status: "completed", output: [] } }),
+    ].join("");
+    const round2 = [
+        sse("response.created", { response: { id: "resp_text_2", status: "in_progress" } }),
+        sse("response.output_text.delta", { item_id: "msg_text_2", output_index: 0, delta: "Done." }),
+        sse("response.completed", { response: { id: "resp_text_2", status: "completed", output: [] } }),
+    ].join("");
+    const originalFetch = globalThis.fetch;
+    let forwarded: Record<string, unknown> | undefined;
+    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+        forwarded = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        return new Response(round2, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }) as typeof fetch;
+    try {
+        const ctx = { ...makeCtx(() => {}), textProtocol: true };
+        const out = await drain(
+            new Response(round1, { status: 200, headers: { "content-type": "text/event-stream" } }).body!,
+            ctx,
+            { model: "gpt-5", input: [{ type: "message", role: "user", content: "hi" }], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        const types = (forwarded?.input as Array<{ type: string }>).map((item) => item.type);
+        assert.ok(!types.includes("function_call"));
+        assert.ok(!types.includes("function_call_output"));
+        assert.ok(types.every((type) => type === "message"));
+        assert.ok(out.includes("Done."));
+        assert.ok(!out.includes(ACP_TEXT_OPEN));
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+test("compressLoopResponsesStream: Codex code_mode custom_tool_call passes through in text-protocol (regression for 无法使用工具)", async () => {
+    const events = [
+        sse("response.created", { response: { id: "resp_ctc", status: "in_progress" } }),
+        sse("response.output_item.added", { item: { type: "message", id: "msg_ctc", role: "assistant", content: [] }, output_index: 0 }),
+        sse("response.output_text.delta", { item_id: "msg_ctc", output_index: 0, delta: "Running ls." }),
+        sse("response.output_item.done", { item: { type: "message", id: "msg_ctc" }, output_index: 0 }),
+        sse("response.output_item.added", { item: { type: "custom_tool_call", id: "ctc_1", call_id: "call_ctc_1", name: "shell", input: "" }, output_index: 1 }),
+        sse("response.custom_tool_call.input_text.delta", { item_id: "ctc_1", delta: '{"cmd":"ls"}' }),
+        sse("response.output_item.done", { item: { type: "custom_tool_call", id: "ctc_1", call_id: "call_ctc_1", name: "shell", input: '{"cmd":"ls"}' }, output_index: 1 }),
+        sse("response.completed", { response: { id: "resp_ctc", status: "completed", output: [] } }),
+    ].join("");
+    const ctx = { ...makeCtx(() => {}), textProtocol: true };
+    const out = await drain(
+        new Response(events).body!,
+        ctx,
+        { model: "gpt-5", input: [{ type: "message", role: "user", content: "list files" }], stream: true },
+        { url: "http://unused", headers: {} },
+    );
+    assert.ok(out.includes("custom_tool_call"), "custom_tool_call item reaches the client in text-protocol");
+    assert.ok(out.includes('"shell"'), "code_mode tool name preserved");
+    assert.ok(out.includes("Running ls."), "assistant text still emitted");
+    assert.ok(out.includes("response.completed"), "completion emitted");
 });

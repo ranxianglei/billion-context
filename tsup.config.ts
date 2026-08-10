@@ -15,7 +15,7 @@ export default defineConfig({
     // noExternal, esbuild keeps `import ... from "acp-kernel"` in dist, and
     // npm then installs acp-kernel as a runtime dep — breaking the
     // "dist/index.js is self-contained" contract (AGENTS.md §2.1).
-    noExternal: ["acp-kernel", "node-forge", "undici"],
+    noExternal: ["acp-kernel", "fzstd", "node-forge", "tar", "undici"],
     banner: {
         // node-forge is a CommonJS dependency that calls require("crypto") etc.
         // inlined into our ESM output, esbuild's __require shim throws in an

@@ -11,6 +11,7 @@ const BASE_OPTS: ProxyOptions = {
     modelContextLimit: 200000,
     kernelConfig: { blocks: [], messageRefs: [], nudge: {}, stats: {}, nextBlockId: 0, nextRunId: 0 } as never,
     compress: { injectTool: true, injectNudge: true },
+    promptCache: { routing: "auto" },
     sessionHeader: "",
     log: false,
     debug: false,

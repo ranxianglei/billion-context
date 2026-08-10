@@ -114,7 +114,31 @@ base_url = "http://localhost:8787/bili/https://api.openai.com/v1"
 upstream URL is configured, prepend `http://localhost:8787/bili/` to it.
 Nothing else changes.
 
-#### B. Login/subscription clients (MITM transparent proxy)
+#### B. Codex Route (API key or ChatGPT subscription)
+
+Codex can be connected without changing its active `model_provider` and
+without trusting a MITM certificate. Start bili, open
+[http://localhost:8787/__bili/](http://localhost:8787/__bili/), then enable
+**Codex Route** on the Routing page. For scripted startup, enable it before
+starting the owning server:
+
+```bash
+bili codex enable --port 8787
+bili start --port 8787
+```
+
+billion-context resolves only the active Codex provider, records its real
+`base_url`, and temporarily replaces that one field with
+`http://127.0.0.1:8787/codex`. The provider id never changes, so existing Codex
+history stays in the same bucket. Disabling the route or gracefully stopping
+the owning bili process restores the original field; edits made by the user
+while routing was active are preserved. A stale takeover is safely recovered
+the next time bili starts.
+
+The Routing page also offers a manual, backup-first repair for sessions created
+by older bili test provider ids. Normal routing never migrates Codex history.
+
+#### C. Other login/subscription clients (MITM transparent proxy)
 
 Clients you sign **into an account** (ChatGPT Plus/Pro, Claude, ZCode coding
 plan, …) authenticate via **OAuth and hardcode the endpoint** — you can't
@@ -126,7 +150,7 @@ Supported login clients:
 | Client | Login | Endpoint hardcoded | Status |
 |---|---|---|---|
 | **ZCode** | bigmodel coding plan (OAuth) | `open.bigmodel.cn` (builtin provider) | ✅ tested |
-| **Codex** | ChatGPT account (OAuth) | `chatgpt.com/backend-api` | ❓ untested (may not work — needs verification) |
+| **Codex** | ChatGPT account (OAuth) | `chatgpt.com/backend-api` | ✅ use Codex Route above; MITM is fallback only |
 | **Claude Code** | Claude subscription (OAuth) | `api.anthropic.com` | ❓ untested (may not work — needs verification) |
 
 How MITM mode works: the client only offers an **HTTP proxy** setting, so it
@@ -153,8 +177,8 @@ non-model traffic.
    - **HTTP Proxy**: `http://127.0.0.1:8787`
    - **Proxy CA certificate path**: `~/.local/share/billion-context/ca/root-ca.pem`
    - (optional) **No-proxy list**: `localhost,127.0.0.1`
-   - (For ZCode specifically: **Settings → Network**. For Codex/Claude Code:
-     set the `HTTPS_PROXY` env var and `NODE_EXTRA_CA_CERTS` to the CA path.)
+   - (For ZCode specifically: **Settings → Network**. For Claude Code, set the
+     `HTTPS_PROXY` env var and `NODE_EXTRA_CA_CERTS` to the CA path.)
 
 3. Restart the client. Its model traffic now flows through billion-context
    with compression injected. Send a message and check the proxy log
@@ -435,17 +459,23 @@ If the proxy's own outbound connections to a model provider are blocked
 ```
 
 Rules:
-- **Global `proxy`** (top level) applies to every provider's outbound.
-- **Per-URL `proxy`** overrides the global for that host.
+- **Per-URL `proxy`** has the highest priority for its matching provider URL.
+- Remaining priority is `BILI_UPSTREAM_PROXY` → Web UI manual proxy → top-level
+  `proxy` → `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` → Windows system proxy
+  → direct.
 - Empty string `""` means **explicitly direct** (override-and-disable).
-- Neither set = direct connect.
-- Only HTTP proxies (`http://host:port`). SOCKS5 is not supported yet.
+- Auto mode honors `NO_PROXY` and the Windows proxy bypass list for
+  environment/system fallbacks. A proxy pointing back to bili's own local port
+  is ignored or rejected to prevent a loop.
+- HTTP and HTTPS proxy origins are supported. SOCKS5 is not supported yet.
 - Both outbound paths are covered: `/bili/` path-mode (fetch) AND MITM CONNECT
   tunnels (the proxy's connection to the real upstream goes through the HTTP
   CONNECT proxy).
 
-Env override: `BILI_UPSTREAM_PROXY=http://127.0.0.1:20172` (same as global
-`proxy`; config file wins over env if both set).
+Env override: `BILI_UPSTREAM_PROXY=http://127.0.0.1:20172` (higher priority than
+the config file). On Windows, common Clash/Mihomo static system proxies are
+discovered automatically; the Web UI shows the effective source and any PAC
+URL detected in Internet Settings.
 
 **MITM vs `/bili/` — distinguishing the key scheme.** A login client
 (ZCode via MITM) and an API-key client can both hit the same host

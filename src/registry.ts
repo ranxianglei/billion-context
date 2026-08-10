@@ -144,3 +144,8 @@ export function _resetForTest(): void {
     cache = null;
     loading = null;
 }
+
+export function _setForTest(data: RegistryShape): void {
+    cache = data;
+    loading = null;
+}

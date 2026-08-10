@@ -1,81 +1,278 @@
-/**
- * Upstream proxy support.
- *
- * Allows billion-context to route its OWN outbound connections (to the model
- * providers) through an HTTP proxy. Typical use case: a Codex user behind the
- * GFW already runs v2rayA; configuring billion-context's upstream proxy lets
- * `api.openai.com` traffic reach the model instead of timing out.
- *
- * TWO outbound paths must support this:
- *   1. `/bili/` path-mode requests — forwarded via `fetch()`. We inject an
- *      undici `ProxyAgent` as the fetch `dispatcher`.
- *   2. MITM mode — `CONNECT <host>:443` tunnels. We establish the outbound
- *      connection by talking CONNECT to the proxy, then run TLS over the
- *      resulting tunnel.
- *
- * Only HTTP proxies are supported (`http://host:port`). SOCKS5 is intentionally
- * out of scope for now.
- */
+import { execFileSync } from "node:child_process";
 import net from "node:net";
 import tls from "node:tls";
 import { ProxyAgent } from "undici";
 import type { ProviderRoutes } from "./config.js";
 
-/** Per-URL proxy cache so we don't construct a new ProxyAgent per request. */
-const dispatcherCache = new Map<string, ProxyAgent>();
+export type ParsedHttpProxy = {
+    url: string;
+    host: string;
+    port: number;
+    protocol: "http:" | "https:";
+    authorization?: string;
+};
 
-/** Parse a proxy URL. Returns undefined if `proxy` is empty or not an http(s)
- *  URL (we only support HTTP forward proxies, not SOCKS, for now). */
-export function parseHttpProxy(proxy?: string): { url: string; host: string; port: number } | undefined {
-    if (!proxy || typeof proxy !== "string") return undefined;
+export type ProxyFallbackOptions = {
+    httpProxy?: string;
+    httpsProxy?: string;
+    allProxy?: string;
+    noProxy?: string;
+    biliPort?: number;
+    systemProxy?: WindowsSystemProxy;
+    globalSource?: "bili-env" | "web-manual" | "config" | "auto" | "direct";
+};
+
+export type UpstreamProxyDecision = {
+    proxy?: string;
+    source: string;
+    autoConfigUrl?: string;
+};
+
+export type WindowsSystemProxy = {
+    enabled: boolean;
+    http?: string;
+    https?: string;
+    bypass?: string;
+    autoConfigUrl?: string;
+};
+
+export type UpstreamConnectionStatus = {
+    url?: string;
+    proxy?: string;
+    connected?: boolean;
+    error?: string;
+    checkedAt?: string;
+};
+
+const dispatcherCache = new Map<string, ProxyAgent>();
+let lastConnection: UpstreamConnectionStatus = {};
+let windowsProxyCache: { at: number; value: WindowsSystemProxy } | undefined;
+
+function defaultPort(protocol: string): number {
+    return protocol === "https:" ? 443 : 80;
+}
+
+function hostIsLoopback(host: string): boolean {
+    const normalized = host.replace(/^\[|\]$/g, "").toLowerCase();
+    return normalized === "localhost" ||
+        normalized === "0.0.0.0" ||
+        normalized === "::" ||
+        normalized === "::1" ||
+        normalized === "0:0:0:0:0:0:0:1" ||
+        normalized.startsWith("127.") ||
+        normalized.startsWith("::ffff:127.") ||
+        /^::ffff:7f[0-9a-f]{2}:/.test(normalized);
+}
+
+function proxyAuthorization(url: URL): string | undefined {
+    if (!url.username && !url.password) return undefined;
+    const username = decodeURIComponent(url.username);
+    const password = decodeURIComponent(url.password);
+    return `Basic ${Buffer.from(`${username}:${password}`).toString("base64")}`;
+}
+
+export function redactProxyUrl(value: string | undefined): string | undefined {
+    if (!value) return undefined;
     try {
-        const u = new URL(proxy);
-        // We accept http:// (standard HTTP forward proxy). https:// would mean
-        // TLS to the proxy itself — uncommon for local proxies; reject to keep
-        // the MITM path simple. socks5:// is not supported yet.
-        if (u.protocol !== "http:") return undefined;
-        const port = u.port ? parseInt(u.port, 10) : 80;
-        if (!Number.isFinite(port)) return undefined;
-        return { url: `${u.protocol}//${u.hostname}:${port}`, host: u.hostname, port };
+        const url = new URL(value);
+        if (url.username || url.password) {
+            url.username = "***";
+            url.password = "***";
+        }
+        return url.href;
+    } catch {
+        return "(invalid proxy URL)";
+    }
+}
+
+export function parseHttpProxy(proxy?: string, biliPort?: number): ParsedHttpProxy | undefined {
+    if (!proxy || typeof proxy !== "string" || !proxy.trim()) return undefined;
+    const candidate = /^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(proxy.trim()) ? proxy.trim() : `http://${proxy.trim()}`;
+    let url: URL;
+    try {
+        url = new URL(candidate);
+    } catch {
+        return undefined;
+    }
+    if (url.protocol !== "http:" && url.protocol !== "https:") return undefined;
+    if ((url.pathname && url.pathname !== "/") || url.search || url.hash) return undefined;
+    const port = url.port ? Number.parseInt(url.port, 10) : defaultPort(url.protocol);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return undefined;
+    if (biliPort && hostIsLoopback(url.hostname) && port === biliPort) {
+        throw new Error(`upstream proxy would loop back into bili: ${redactProxyUrl(url.href)}`);
+    }
+    return {
+        url: url.href,
+        host: url.hostname,
+        port,
+        protocol: url.protocol,
+        ...(proxyAuthorization(url) ? { authorization: proxyAuthorization(url) } : {}),
+    };
+}
+
+export function validateHttpProxy(proxy: string | undefined, biliPort?: number): void {
+    if (!proxy?.trim()) return;
+    if (!parseHttpProxy(proxy, biliPort)) {
+        throw new Error(`upstream proxy must be an HTTP/HTTPS proxy origin: ${redactProxyUrl(proxy)}`);
+    }
+}
+
+function targetUrl(upstreamUrl: string | undefined): URL | undefined {
+    if (!upstreamUrl) return undefined;
+    try {
+        return new URL(upstreamUrl.replace(/^mitm:\/\//, "https://"));
     } catch {
         return undefined;
     }
 }
 
-/**
- * Resolve the effective proxy for a given upstream URL.
- *
- * Rule: per-URL `route.proxy` overrides the global `globalProxy`. Neither set
- * → undefined (direct connect). Uses the same longest-prefix match as
- * resolveContextLimit so `https://api.openai.com/v1` and a MITM virtual URL
- * `https://api.openai.com` both match a key like `https://api.openai.com`.
- */
+function parseFallbackProxy(proxy: string | undefined, biliPort?: number): ParsedHttpProxy | undefined {
+    try {
+        return parseHttpProxy(proxy, biliPort);
+    } catch {
+        return undefined;
+    }
+}
+
+export function matchesNoProxy(target: URL, noProxy: string | undefined): boolean {
+    if (!noProxy) return false;
+    const host = target.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    const port = target.port ? Number.parseInt(target.port, 10) : defaultPort(target.protocol);
+    for (const raw of noProxy.split(/[;,]/)) {
+        let token = raw.trim().toLowerCase();
+        if (!token) continue;
+        if (token === "*") return true;
+        if (token === "<local>" && !host.includes(".")) return true;
+        let tokenPort: number | undefined;
+        if (token.startsWith("[")) {
+            const bracket = token.indexOf("]");
+            if (bracket > 0 && token[bracket + 1] === ":") {
+                tokenPort = Number.parseInt(token.slice(bracket + 2), 10);
+                token = token.slice(1, bracket);
+            } else token = token.replace(/^\[|\]$/g, "");
+        } else {
+            const colon = token.lastIndexOf(":");
+            if (colon > 0 && token.indexOf(":") === colon && /^\d+$/.test(token.slice(colon + 1))) {
+                tokenPort = Number.parseInt(token.slice(colon + 1), 10);
+                token = token.slice(0, colon);
+            }
+        }
+        if (tokenPort !== undefined && tokenPort !== port) continue;
+        const suffix = token.startsWith("*.") ? token.slice(1) : token.startsWith(".") ? token : undefined;
+        if (suffix ? host.endsWith(suffix) || host === suffix.slice(1) : host === token) return true;
+    }
+    return false;
+}
+
+function parseWindowsProxyServer(value: string): Pick<WindowsSystemProxy, "http" | "https"> {
+    const trimmed = value.trim();
+    if (!trimmed) return {};
+    if (!trimmed.includes("=")) {
+        const normalized = parseHttpProxy(trimmed)?.url;
+        return normalized ? { http: normalized, https: normalized } : {};
+    }
+    const result: Pick<WindowsSystemProxy, "http" | "https"> = {};
+    for (const item of trimmed.split(";")) {
+        const [scheme, address] = item.split("=", 2).map((part) => part?.trim());
+        const normalizedScheme = scheme?.toLowerCase();
+        if ((normalizedScheme === "http" || normalizedScheme === "https") && address) {
+            const normalized = parseHttpProxy(address)?.url;
+            if (normalized) result[normalizedScheme] = normalized;
+        }
+    }
+    return result;
+}
+
+function registryValue(output: string, name: string): string | undefined {
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return output.match(new RegExp(`^\\s*${escaped}\\s+REG_\\w+\\s+(.+)$`, "mi"))?.[1]?.trim();
+}
+
+export function readWindowsSystemProxy(): WindowsSystemProxy {
+    if (process.platform !== "win32") return { enabled: false };
+    const now = Date.now();
+    if (windowsProxyCache && now - windowsProxyCache.at < 5000) return windowsProxyCache.value;
+    let value: WindowsSystemProxy = { enabled: false };
+    try {
+        const output = execFileSync("reg", [
+            "query",
+            "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings",
+        ], { encoding: "utf8", windowsHide: true, timeout: 3000 });
+        const enabledRaw = registryValue(output, "ProxyEnable");
+        const enabled = enabledRaw === "0x1" || enabledRaw === "1";
+        const staticProxy = enabled ? parseWindowsProxyServer(registryValue(output, "ProxyServer") ?? "") : {};
+        value = {
+            enabled,
+            ...staticProxy,
+            ...(registryValue(output, "ProxyOverride") ? { bypass: registryValue(output, "ProxyOverride") } : {}),
+            ...(registryValue(output, "AutoConfigURL") ? { autoConfigUrl: registryValue(output, "AutoConfigURL") } : {}),
+        };
+    } catch {
+    }
+    windowsProxyCache = { at: now, value };
+    return value;
+}
+
+export function resolveProxyDecision(
+    routes: ProviderRoutes,
+    globalProxy: string | undefined,
+    upstreamUrl: string | undefined,
+    fallback: ProxyFallbackOptions = {},
+): UpstreamProxyDecision {
+    const target = targetUrl(upstreamUrl);
+    let bestKey = "";
+    if (upstreamUrl) {
+        for (const key of Object.keys(routes)) {
+            if (upstreamUrl === key || upstreamUrl.startsWith(key + "/")) {
+                if (key.length > bestKey.length) bestKey = key;
+            }
+        }
+    }
+    if (bestKey) {
+        const routeProxy = routes[bestKey].proxy;
+        if (routeProxy !== undefined) {
+            if (!routeProxy.trim()) return { source: "provider-direct" };
+            const parsed = parseHttpProxy(routeProxy, fallback.biliPort);
+            if (!parsed) throw new Error(`invalid per-URL upstream proxy for ${bestKey}: ${redactProxyUrl(routeProxy)}`);
+            return { proxy: parsed.url, source: "provider" };
+        }
+    }
+    if (globalProxy === "") return { source: "direct" };
+    const explicit = parseHttpProxy(globalProxy, fallback.biliPort)?.url;
+    if (explicit) return { proxy: explicit, source: fallback.globalSource ?? "global" };
+    if (target && matchesNoProxy(target, fallback.noProxy)) return { source: "no-proxy" };
+    const environmentCandidates: Array<[string, string | undefined]> = target?.protocol === "http:"
+        ? [["HTTP_PROXY", fallback.httpProxy], ["ALL_PROXY", fallback.allProxy]]
+        : [["HTTPS_PROXY", fallback.httpsProxy], ["HTTP_PROXY", fallback.httpProxy], ["ALL_PROXY", fallback.allProxy]];
+    for (const [source, value] of environmentCandidates) {
+        const parsed = parseFallbackProxy(value, fallback.biliPort);
+        if (parsed) return { proxy: parsed.url, source };
+    }
+    const system = fallback.systemProxy ?? readWindowsSystemProxy();
+    if (target && matchesNoProxy(target, system.bypass)) {
+        return { source: "windows-bypass", ...(system.autoConfigUrl ? { autoConfigUrl: system.autoConfigUrl } : {}) };
+    }
+    const systemValue = target?.protocol === "http:" ? system.http : system.https ?? system.http;
+    const systemProxy = parseFallbackProxy(systemValue, fallback.biliPort)?.url;
+    if (systemProxy) {
+        return {
+            proxy: systemProxy,
+            source: "windows-system",
+            ...(system.autoConfigUrl ? { autoConfigUrl: system.autoConfigUrl } : {}),
+        };
+    }
+    return { source: "direct", ...(system.autoConfigUrl ? { autoConfigUrl: system.autoConfigUrl } : {}) };
+}
+
 export function resolveProxy(
     routes: ProviderRoutes,
     globalProxy: string | undefined,
     upstreamUrl: string | undefined,
+    fallback: ProxyFallbackOptions = {},
 ): string | undefined {
-    if (!upstreamUrl) return parseHttpProxy(globalProxy)?.url;
-    let bestKey = "";
-    for (const key of Object.keys(routes)) {
-        if (upstreamUrl === key || upstreamUrl.startsWith(key + "/")) {
-            if (key.length > bestKey.length) bestKey = key;
-        }
-    }
-    // Child overrides parent. Empty string on the route means "explicitly
-    // direct" (override the global). Otherwise fall back to global.
-    if (bestKey) {
-        const routeProxy = routes[bestKey].proxy;
-        if (routeProxy !== undefined) return parseHttpProxy(routeProxy)?.url;
-    }
-    return parseHttpProxy(globalProxy)?.url;
+    return resolveProxyDecision(routes, globalProxy, upstreamUrl, fallback).proxy;
 }
 
-/** Get (or create) a cached undici ProxyAgent for `proxyUrl`. Returns undefined
- *  for direct connect. Used by the fetch (`/bili/`) path. Returned as a plain
- *  object so callers don't need to import the undici Dispatcher type.
- *  Call `resetProxyCache()` on config hot-reload to release ProxyAgents whose
- *  URL was removed/changed (otherwise they'd leak for the process lifetime). */
 export function proxyDispatcher(proxyUrl: string | undefined): object | undefined {
     if (!proxyUrl) return undefined;
     let agent = dispatcherCache.get(proxyUrl);
@@ -86,120 +283,144 @@ export function proxyDispatcher(proxyUrl: string | undefined): object | undefine
     return agent;
 }
 
-/** Release all cached ProxyAgents. Called on config hot-reload so agents for
- *  proxy URLs that were removed/changed don't leak. Safe to call anytime;
- *  the next proxyDispatcher() call re-creates the needed agent lazily. */
 export function resetProxyCache(): void {
     for (const agent of dispatcherCache.values()) {
-        try { agent.close(); } catch { /* best-effort */ }
+        try { void agent.close().catch(() => undefined); } catch { }
     }
     dispatcherCache.clear();
+    lastConnection = {};
 }
 
-/** Establish a TCP connection to `host:port`, through an HTTP proxy if one is
- *  configured. `proxyUrl` is the resolved proxy (from resolveProxy) or
- *  undefined for direct connect.
- *
- *  For direct connect: `net.connect(port, host)`.
- *  For proxied connect: connect to the proxy, send
- *    `CONNECT host:port HTTP/1.1\r\nHost: host:port\r\n\r\n`, wait for
- *    `HTTP/1.1 200`, then return the socket (the tunnel is now transparent).
- *  Throws on any failure (proxy refused, non-200, connection reset). */
-export function connectThroughProxy(
-    host: string,
-    port: number,
-    proxyUrl: string | undefined,
-): Promise<net.Socket> {
+function openProxySocket(proxy: ParsedHttpProxy): net.Socket {
+    if (proxy.protocol === "https:") {
+        return tls.connect({ host: proxy.host, port: proxy.port, servername: net.isIP(proxy.host) ? undefined : proxy.host });
+    }
+    return net.connect(proxy.port, proxy.host);
+}
+
+export function connectThroughProxy(host: string, port: number, proxyUrl: string | undefined): Promise<net.Socket> {
     if (!proxyUrl) {
-        // Direct connect — the common, fast path.
         return new Promise((resolve, reject) => {
-            const sock = net.connect(port, host);
-            sock.once("connect", () => resolve(sock));
-            sock.once("error", reject);
+            const socket = net.connect(port, host);
+            socket.once("connect", () => resolve(socket));
+            socket.once("error", reject);
         });
     }
     const proxy = parseHttpProxy(proxyUrl);
-    if (!proxy) {
-        // Malformed proxy URL — fall back to direct rather than crash.
-        return new Promise((resolve, reject) => {
-            const sock = net.connect(port, host);
-            sock.once("connect", () => resolve(sock));
-            sock.once("error", reject);
-        });
-    }
+    if (!proxy) return Promise.reject(new Error(`invalid upstream proxy: ${redactProxyUrl(proxyUrl)}`));
     return new Promise((resolve, reject) => {
-        const sock = net.connect(proxy.port, proxy.host);
-        let established = false;
-        // Internal timeout for the CONNECT handshake (proxy → upstream). If the
-        // proxy is slow/unresponsive the outer 15s tunnel timer would still
-        // fire, but a dedicated handshake timeout fails faster and surfaces a
-        // clearer error ("CONNECT handshake timeout") in the log.
-        const handshakeTimer = setTimeout(() => {
-            if (!established) {
-                sock.destroy();
-                reject(new Error(`upstream proxy CONNECT ${host}:${port} handshake timeout`));
-            }
-        }, 10000);
-        const cleanup = (err: Error) => {
-            clearTimeout(handshakeTimer);
-            if (!established) sock.destroy();
-            reject(err);
+        const socket = openProxySocket(proxy);
+        let settled = false;
+        const finishError = (error: Error) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            socket.destroy();
+            reject(error);
         };
-        sock.once("error", cleanup);
-        sock.once("connect", () => {
-            // Send CONNECT to the proxy to open a tunnel to host:port.
-            const connectReq =
-                `CONNECT ${host}:${port} HTTP/1.1\r\n` +
-                `Host: ${host}:${port}\r\n` +
-                `Proxy-Connection: Keep-Alive\r\n\r\n`;
-            sock.write(connectReq);
-            // Read the proxy's HTTP response. We only need the status line +
-            // the blank-line terminator; body (if any) is not expected for a
-            // successful CONNECT.
-            let buf = "";
-            const onLine = (data: Buffer) => {
-                buf += data.toString("utf8");
-                const end = buf.indexOf("\r\n\r\n");
-                if (end === -1) return;
-                sock.removeListener("data", onLine);
-                const head = buf.slice(0, end);
-                const rest = Buffer.from(buf.slice(end + 4), "utf8");
-                // Status line: "HTTP/1.1 200 Connection Established\r\n..."
-                const statusLine = head.split("\r\n")[0] ?? "";
-                if (!/^HTTP\/1\.[01]\s+2\d\d/.test(statusLine)) {
-                    cleanup(new Error(`upstream proxy CONNECT ${host}:${port} failed: ${statusLine}`));
+        const timer = setTimeout(() => finishError(new Error(`upstream proxy CONNECT ${host}:${port} handshake timeout`)), 10_000);
+        socket.once("error", finishError);
+        const connectedEvent = proxy.protocol === "https:" ? "secureConnect" : "connect";
+        socket.once(connectedEvent, () => {
+            const headers = [
+                `CONNECT ${host}:${port} HTTP/1.1`,
+                `Host: ${host}:${port}`,
+                "Proxy-Connection: Keep-Alive",
+                ...(proxy.authorization ? [`Proxy-Authorization: ${proxy.authorization}`] : []),
+                "",
+                "",
+            ];
+            socket.write(headers.join("\r\n"));
+            let buffer = Buffer.alloc(0);
+            const onData = (chunk: Buffer) => {
+                buffer = Buffer.concat([buffer, chunk]);
+                const end = buffer.indexOf("\r\n\r\n");
+                if (end < 0) {
+                    if (buffer.length > 64 * 1024) finishError(new Error("upstream proxy CONNECT response header is too large"));
                     return;
                 }
-                established = true;
-                clearTimeout(handshakeTimer);
-                // If the proxy pipelined any early bytes after the 200, push
-                // them back so the TLS handshake sees them.
-                if (rest.length > 0) sock.unshift(rest);
-                resolve(sock);
+                socket.removeListener("data", onData);
+                const head = buffer.subarray(0, end).toString("latin1");
+                const statusLine = head.split("\r\n", 1)[0] ?? "";
+                if (!/^HTTP\/1\.[01]\s+2\d\d(?:\s|$)/.test(statusLine)) {
+                    finishError(new Error(`upstream proxy CONNECT ${host}:${port} failed: ${statusLine}`));
+                    return;
+                }
+                settled = true;
+                clearTimeout(timer);
+                socket.removeListener("error", finishError);
+                const rest = buffer.subarray(end + 4);
+                if (rest.length > 0) socket.unshift(rest);
+                resolve(socket);
             };
-            sock.on("data", onLine);
-            sock.once("error", cleanup);
+            socket.on("data", onData);
         });
     });
 }
 
-/** Connect to `host:port` over TLS, through a proxy if configured. Used by the
- *  MITM path: after terminating the client's TLS, we re-establish a TLS
- *  connection to the REAL upstream. If a proxy is configured, the TLS runs
- *  over a CONNECT tunnel to that proxy. */
 export async function connectTlsThroughProxy(
     host: string,
     port: number,
     proxyUrl: string | undefined,
     servername?: string,
 ): Promise<tls.TLSSocket> {
-    const sock = await connectThroughProxy(host, port, proxyUrl);
-    return tls.connect({
-        socket: sock,
-        servername: servername ?? host,
-        // Let Node pick ALPN; we must accept h2 here because the real upstream
-        // (api.openai.com etc.) may negotiate it and we forward raw bytes in
-        // the blind-tunnel path. The MITM-decrypt path forces http/1.1 on the
-        // CLIENT side but the UPSTREAM side can be anything.
-    });
+    const socket = await connectThroughProxy(host, port, proxyUrl);
+    return tls.connect({ socket, servername: servername ?? host });
+}
+
+function errorChain(error: unknown): Array<Record<string, unknown>> {
+    const chain: Array<Record<string, unknown>> = [];
+    const seen = new Set<unknown>();
+    let current: unknown = error;
+    while (current && !seen.has(current)) {
+        seen.add(current);
+        if (current instanceof Error) {
+            const record: Record<string, unknown> = { message: current.message };
+            for (const key of ["code", "errno", "syscall", "address", "port"]) {
+                const value = (current as unknown as Record<string, unknown>)[key];
+                if (value !== undefined) record[key] = value;
+            }
+            chain.push(record);
+            current = current.cause;
+        } else {
+            chain.push({ message: String(current) });
+            break;
+        }
+    }
+    return chain;
+}
+
+export function formatUpstreamError(error: unknown, url: string, proxyUrl?: string): string {
+    const chain = errorChain(error);
+    const fields = ["code", "errno", "syscall", "address", "port"];
+    const parts: string[] = [];
+    for (const field of fields) {
+        const value = chain.find((entry) => entry[field] !== undefined)?.[field];
+        if (value !== undefined) parts.push(`${field}=${String(value)}`);
+    }
+    const messages = chain.map((entry) => String(entry.message ?? "")).filter(Boolean);
+    if (messages.length > 0) parts.push(`message=${messages.join(" <- ")}`);
+    parts.push(`url=${url}`);
+    parts.push(`proxy=${redactProxyUrl(proxyUrl) ?? "direct"}`);
+    return parts.join(" ");
+}
+
+export function recordUpstreamConnection(url: string, proxyUrl: string | undefined, error?: unknown): void {
+    lastConnection = {
+        url,
+        proxy: redactProxyUrl(proxyUrl),
+        connected: error === undefined,
+        ...(error === undefined ? {} : { error: formatUpstreamError(error, url, proxyUrl) }),
+        checkedAt: new Date().toISOString(),
+    };
+}
+
+export function getUpstreamConnectionStatus(): UpstreamConnectionStatus {
+    return { ...lastConnection };
+}
+
+export function _resetUpstreamProxyForTest(): void {
+    resetProxyCache();
+    lastConnection = {};
+    windowsProxyCache = undefined;
 }

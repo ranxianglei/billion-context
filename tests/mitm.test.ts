@@ -74,8 +74,10 @@ await test("ensureRootCA: generates a PEM cert + key on first call", async () =>
         const keyPem = fs.readFileSync(keyPath, "utf8");
         assert.ok(keyPem.includes("BEGIN PRIVATE KEY") || keyPem.includes("BEGIN RSA PRIVATE KEY"));
         // Key must NOT be world-readable.
-        const mode = (fs.statSync(keyPath).mode & 0o777);
-        assert.equal(mode & 0o077, 0, `key file mode ${mode.toString(8)} leaks group/other bits`);
+        if (process.platform !== "win32") {
+            const mode = (fs.statSync(keyPath).mode & 0o777);
+            assert.equal(mode & 0o077, 0, `key file mode ${mode.toString(8)} leaks group/other bits`);
+        }
     });
 });
 

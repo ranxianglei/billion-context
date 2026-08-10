@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative, sep } from "node:path";
 import { SessionStore } from "../src/persist.ts";
 import { createInitialState } from "acp-kernel";
 import type { Session, BlockContent } from "../src/session.ts";
@@ -241,7 +241,7 @@ await withTempStore("sessions are namespaced by protocol + provider on disk", as
 
     const all = jsonFilesUnder(dir);
     assert.equal(all.length, 3, "three sessions written");
-    const rel = all.map((f) => f.slice(dir.length + 1));
+    const rel = all.map((f) => relative(dir, f).split(sep).join("/"));
     assert.ok(rel.some((p) => p.startsWith("anthropic/") && /dashscope/.test(p)), `anthropic/dashscope path: ${rel.join(", ")}`);
     assert.ok(rel.some((p) => p.startsWith("openai/") && /bigmodel/.test(p)), `openai/bigmodel path: ${rel.join(", ")}`);
     assert.ok(rel.some((p) => p.startsWith("responses/") && /comfly/.test(p)), `responses/comfly path: ${rel.join(", ")}`);
