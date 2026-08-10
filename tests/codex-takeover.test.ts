@@ -208,3 +208,46 @@ test("custom provider without optional auth/websocket fields resolves with safe 
         rmSync(files.root, { recursive: true, force: true });
     }
 });
+
+test("corrupted state file degrades gracefully instead of throwing", () => {
+    const files = fixture();
+    const configContent = '[model_providers.openai]\nname = "OpenAI"\nbase_url = "https://api.openai.com/v1"\n';
+    writeFileSync(files.configPath, configContent, "utf8");
+    mkdirSync(path.dirname(files.statePath), { recursive: true });
+    writeFileSync(files.statePath, "{garbage not valid json", "utf8");
+    try {
+        assert.doesNotThrow(() => getCodexTakeoverStatus(files), "corrupt state must not throw");
+        assert.equal(getCodexTakeoverStatus(files).state, "disabled");
+        assert.equal(readFileSync(files.configPath, "utf8"), configContent, "config.toml left intact");
+    } finally {
+        rmSync(files.root, { recursive: true, force: true });
+    }
+});
+
+test("non-numeric sectionPrefixLength in state is rejected without wiping config.toml", () => {
+    const files = fixture();
+    const configContent = '[model_providers.openai]\nname = "OpenAI"\nbase_url = "https://api.openai.com/v1"\n';
+    writeFileSync(files.configPath, configContent, "utf8");
+    mkdirSync(path.dirname(files.statePath), { recursive: true });
+    writeFileSync(files.statePath, JSON.stringify({
+        version: 1,
+        active: true,
+        providerId: "openai",
+        configPath: files.configPath,
+        sectionAdded: false,
+        sectionPrefixLength: "not-a-number",
+        insertedFields: ["base_url"],
+        originalFields: { base_url: "https://api.openai.com/v1" },
+        original: { baseUrl: "https://api.openai.com/v1", supportsWebsockets: false },
+        installed: { baseUrl: "http://127.0.0.1:8787", supportsWebsockets: false },
+        configHashBefore: "abc",
+        startedAt: new Date().toISOString(),
+    }), "utf8");
+    try {
+        assert.doesNotThrow(() => getCodexTakeoverStatus(files));
+        assert.equal(getCodexTakeoverStatus(files).state, "disabled", "invalid sectionPrefixLength rejects state");
+        assert.equal(readFileSync(files.configPath, "utf8"), configContent, "config.toml not wiped");
+    } finally {
+        rmSync(files.root, { recursive: true, force: true });
+    }
+});

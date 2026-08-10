@@ -97,7 +97,10 @@ test("clientConversationHeader: reads known session header names in priority ord
     assert.equal(clientConversationHeader({}), undefined);
 });
 
-test("affinityToken is safe to send upstream: does NOT embed the API key", () => {
+test("affinityToken: client-provided identity passes through verbatim (credentials never in scope)", () => {
+    // After the refactor, affinityToken receives only the resolved identity
+    // object ({ value, source, clientProvided }) — never raw headers or the
+    // API key — so credential leakage is impossible by construction.
     const token = affinityToken({ value: "client-session", source: "body-session", clientProvided: true });
     assert.equal(token, "client-session");
 });

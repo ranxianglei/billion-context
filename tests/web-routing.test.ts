@@ -136,3 +136,52 @@ test("Web UI exposes route, upstream and history controls without inline handler
         assert.equal(restoredOnClose, originalCodex);
     }
 });
+
+test("PUT /__bili/config with providers takes effect without a separate reload call", async () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    const root = path.join(tmpdir(), `bili-put-providers-${process.pid}-${Date.now()}`);
+    mkdirSync(root, { recursive: true });
+    const biliConfig = path.join(root, "billion-context.json");
+    writeFileSync(biliConfig, '{"providers":{}}\n', "utf8");
+    const prevConfig = process.env.BILI_CONFIG_FILE;
+    process.env.BILI_CONFIG_FILE = biliConfig;
+    const port = await freePort();
+    const opts: ProxyOptions = {
+        port,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1:1",
+        routes: {},
+        proxy: "",
+        proxyMode: "direct",
+        proxySource: "direct",
+        modelContextLimit: 400_000,
+        kernelConfig: defaultConfig(400_000),
+        compress: { injectTool: true, injectNudge: true },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        mitm: { enabled: false, domains: [] },
+    };
+    const proxy = await startServer(opts);
+    if (!proxy.listening) await once(proxy, "listening");
+    const base = `http://127.0.0.1:${port}`;
+    try {
+        const providers = { "https://api.example.com/v1": { models: { "gpt-test": { context: 123456 } } } };
+        const put = await fetch(`${base}/__bili/config`, {
+            method: "PUT",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ providers }),
+        });
+        assert.equal(put.status, 200);
+        const after = await (await fetch(`${base}/__bili/config`)).json() as { providers: Record<string, unknown> };
+        assert.deepEqual(after.providers, providers, "providers saved and visible after PUT without /reload");
+    } finally {
+        await close(proxy);
+        if (prevConfig === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = prevConfig;
+        rmSync(root, { recursive: true, force: true });
+    }
+});
