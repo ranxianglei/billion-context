@@ -138,6 +138,22 @@ test("anthropic adapter: acp_status-only round → marker + graceful completion,
     }
 });
 
+test("openai adapter (S1): a single finish_reason chunk is forwarded exactly once (not double-emitted)", async () => {
+    const round1 = [
+        `data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", created: 1, model: "gpt", choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] })}\n\n`,
+        `data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", created: 1, model: "gpt", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`,
+        `data: [DONE]\n\n`,
+    ].join("");
+    const out = await drain(
+        new Response(round1, { status: 200 }).body!,
+        makeCtx("openai-single-finish"),
+        createOpenaiAdapter({ model: "gpt" }),
+        { model: "gpt", messages: [], stream: true },
+    );
+    const finishCount = (out.match(/"finish_reason":"stop"/g) || []).length;
+    assert.equal(finishCount, 1, "finish_reason:\"stop\" emitted exactly once (S1: original finish chunk not passthrough'd + emitCompletion)");
+});
+
 test("ACP_LOOP_V2 smoke: import + runCompressLoop round-trips (responses) without crashing", async () => {
     const mod = await import("../src/loop/index.ts");
     assert.equal(typeof mod.runCompressLoop, "function", "runCompressLoop exported");
