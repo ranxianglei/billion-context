@@ -379,9 +379,9 @@ async function handle(
     }
     if (req.method === "GET" && req.url === "/__bili/codex-history") return handleCodexHistoryGet(res);
     if (req.method === "POST" && req.url === "/__bili/codex-history/repair") return handleCodexHistoryRepair(res);
-    // Codex's built-in fast-fallback: reject WebSocket upgrades to /codex/responses
-    // with 426 so it immediately retries over HTTP POST instead of stalling.
-    if (req.headers.upgrade === "websocket" && (req.url === "/codex/responses" || req.url?.startsWith("/codex/responses?"))) {
+    // Bili does not support WebSocket — reject any upgrade with 426 so clients
+    // with built-in fast-fallback (e.g. Codex supports_websockets=true) retry over HTTP POST.
+    if (req.headers.upgrade === "websocket") {
         res.writeHead(426, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: "WebSocket upgrades are not supported; use HTTP POST" }));
         return;
