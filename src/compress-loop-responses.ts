@@ -311,6 +311,15 @@ function buildCompleted(responseObj: Record<string, unknown> | null): string {
     })}\n\n`;
 }
 
+function buildFailed(responseObj: Record<string, unknown> | null): string {
+    const id = responseObj?.id ?? `resp-failed-${Date.now()}`;
+    const resp = { ...(responseObj ?? {}), id, status: "failed", error: { code: "server_error", message: "upstream returned empty response" } };
+    return `event: response.failed\ndata: ${JSON.stringify({
+        type: "response.failed",
+        response: resp,
+    })}\n\n`;
+}
+
 function responsesJsonOutput(response: Record<string, unknown>): {
     text: string;
     textParts: Array<Record<string, unknown>>;
@@ -558,7 +567,15 @@ export async function* compressLoopResponsesStream(
                 yield Buffer.from(terminalRaw + "\n\n", "utf8");
                 return;
             }
-            if (!completed && contentText.length === 0 && realCalls.length === 0) {
+            // Empty upstream response (no text/tool_call/usage): inject
+            // response.failed so the client retries instead of hanging.
+            const hasUsage = !!(responseObj as Record<string, unknown> | undefined)?.usage;
+            if (contentText.length === 0 && realCalls.length === 0 && customToolCalls === 0 && !hasUsage) {
+                ctx.log("[acp-proxy: empty upstream response (no content/usage) — injecting response.failed for client retry]");
+                yield Buffer.from(buildFailed(responseObj), "utf8");
+                return;
+            }
+            if (!completed) {
                 ctx.log("[acp-proxy: responses stream ended without completion]");
             }
             yield Buffer.from(buildCompleted(responseObj), "utf8");
