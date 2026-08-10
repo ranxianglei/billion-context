@@ -52,7 +52,7 @@ import { emitStreamError } from "./stream-error.js";
 import { deriveSessionId as deriveProxySessionId, affinityToken, clientConversationHeader, type ConversationIdentity } from "./session-id.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "./bili-message.js";
-import { resolveActiveCodexProvider } from "./codex-provider.js";
+
 import { decodeRequestBody } from "./content-encoding.js";
 
 const UPSTREAM_HOP_HEADERS = new Set([
@@ -85,16 +85,6 @@ export function resolveUpstream(_opts: ProxyOptions, reqUrl: string, req?: http.
         // Mapping is bijective: mitm://<host><path> ⟺ https://<host><path>.
         const mitmKey = mitmUpstream.replace(/^https:\/\//, "mitm://");
         return { upstream: mitmUpstream, rewrittenUrl: mitmKey + (reqUrl ?? "") };
-    }
-    if (reqUrl === "/codex" || reqUrl.startsWith("/codex/") || reqUrl.startsWith("/codex?")) {
-        try {
-            const provider = resolveActiveCodexProvider();
-            const suffix = reqUrl.slice("/codex".length);
-            const baseUrl = provider.baseUrl.replace(/\/+$/, "");
-            return { upstream: baseUrl, rewrittenUrl: baseUrl + suffix };
-        } catch {
-            return undefined;
-        }
     }
     // Zero-config mode: a request like `/bili/https://open.bigmodel.cn/api/anthropic`
     // embeds the full upstream URL after the `/bili/` prefix. Strip the prefix,
