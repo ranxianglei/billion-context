@@ -194,7 +194,7 @@ export function resolveActiveCodexProvider(configPath: string = codexConfigFile(
         }
         return typeof assignment?.value === "string" ? assignment.value : fallback;
     };
-    const boolField = (key: string, fallback?: boolean): boolean | undefined => {
+    const boolField = (key: string, fallback: boolean): boolean => {
         const assignment = fieldFor(text, id, key);
         if (assignment && typeof assignment.value !== "boolean") {
             throw new Error(`Codex provider \"${id}\" has a non-boolean ${key}`);
@@ -203,10 +203,10 @@ export function resolveActiveCodexProvider(configPath: string = codexConfigFile(
     };
     const baseUrl = stringField("base_url", builtin?.baseUrl)?.replace(/\/+$/, "");
     const wireApi = stringField("wire_api", builtin?.wireApi);
-    const requiresOpenaiAuth = boolField("requires_openai_auth", builtin?.requiresOpenaiAuth);
-    const supportsWebsockets = boolField("supports_websockets", builtin?.supportsWebsockets);
-    if (!baseUrl || !wireApi || requiresOpenaiAuth === undefined || supportsWebsockets === undefined) {
-        throw new Error(`cannot safely resolve active Codex provider \"${id}\": base_url/wire_api/auth/websocket fields are incomplete`);
+    const requiresOpenaiAuth = boolField("requires_openai_auth", builtin?.requiresOpenaiAuth ?? false);
+    const supportsWebsockets = boolField("supports_websockets", builtin?.supportsWebsockets ?? false);
+    if (!baseUrl || !wireApi) {
+        throw new Error(`cannot safely resolve active Codex provider \"${id}\": base_url/wire_api fields are incomplete`);
     }
     let parsed: URL;
     try {

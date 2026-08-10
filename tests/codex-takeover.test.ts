@@ -187,3 +187,24 @@ test("takeover rejects a provider base URL with query or fragment routing ambigu
         rmSync(files.root, { recursive: true, force: true });
     }
 });
+
+test("custom provider without optional auth/websocket fields resolves with safe defaults", () => {
+    const files = fixture();
+    writeFileSync(files.configPath, [
+        'model_provider = "my-relay"',
+        "[model_providers.my-relay]",
+        'name = "my-relay"',
+        'base_url = "http://127.0.0.1:8787/bili/https://relay.example/v1"',
+        'wire_api = "responses"',
+        'env_key = "OPENAI_API_KEY"',
+    ].join("\n"), "utf8");
+    try {
+        const provider = resolveActiveCodexProvider(files.configPath);
+        assert.equal(provider.id, "my-relay");
+        assert.equal(provider.requiresOpenaiAuth, false, "defaults to false when unspecified");
+        assert.equal(provider.supportsWebsockets, false, "defaults to false when unspecified");
+        assert.equal(provider.baseUrl, "http://127.0.0.1:8787/bili/https://relay.example/v1");
+    } finally {
+        rmSync(files.root, { recursive: true, force: true });
+    }
+});
