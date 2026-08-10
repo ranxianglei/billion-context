@@ -35,11 +35,6 @@ export type ProviderRoute = {
      *  means "explicitly direct" (override global with no proxy). Format:
      *  `http://host:port`. SOCKS5 is not supported yet. */
     proxy?: string;
-    /** Explicit protocol override. When set, this value is used instead of
-     *  path-suffix detection (`endsWith("/responses")` etc.). Use this when
-     *  the upstream API uses a non-standard path that bili cannot auto-detect.
-     *  Example: `{ "protocol": "responses" }` for a custom relay endpoint. */
-    protocol?: "openai" | "anthropic" | "responses";
 };
 export type ProviderRoutes = Record<string, ProviderRoute>; // key = upstream URL prefix (the /bili/<this> string)
 export type PromptCacheRouting = "auto" | "enabled" | "disabled";
@@ -115,20 +110,6 @@ export function resolveConfiguredContextLimit(
         if (m?.context && m.context > 0) return m.context;
     }
     return undefined;
-}
-
-export function resolveConfiguredProtocol(
-    routes: ProviderRoutes,
-    upstreamUrl: string | undefined,
-): "openai" | "anthropic" | "responses" | undefined {
-    if (!upstreamUrl) return undefined;
-    let bestKey = "";
-    for (const key of Object.keys(routes)) {
-        if (upstreamUrl === key || upstreamUrl.startsWith(key + "/")) {
-            if (key.length > bestKey.length) bestKey = key;
-        }
-    }
-    return bestKey ? routes[bestKey].protocol : undefined;
 }
 
 export type ProxyOptions = {

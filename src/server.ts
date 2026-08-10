@@ -5,7 +5,7 @@ import { createCore, type CompressionCore, type Config, type CoreMessage, type N
 import type { ProxyOptions } from "./config.js";
 import { loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
-import { resolveContextLimit, resolveConfiguredProtocol } from "./config.js";
+import { resolveContextLimit } from "./config.js";
 import { contextFromRegistry, loadRegistry } from "./registry.js";
 import { fetchWithTimeout, MAX_REQUEST_BYTES } from "./fetch-util.js";
 import { formatUpstreamError, getUpstreamConnectionStatus, recordUpstreamConnection, resolveProxy, resolveProxyDecision, proxyDispatcher } from "./upstream-proxy.js";
@@ -67,7 +67,7 @@ const UPSTREAM_HOP_HEADERS = new Set([
     "content-encoding",
 ]);
 
-export function resolveUpstream(_opts: ProxyOptions, reqUrl: string, req?: http.IncomingMessage): { upstream: string; rewrittenUrl: string } | undefined {
+export function resolveUpstream(_opts: ProxyOptions, reqUrl: string, req?: http.IncomingMessage): { upstream: string; rewrittenUrl: string; explicitProtocol?: "openai" | "anthropic" | "responses" } | undefined {
     // MITM mode: the request arrived over a CONNECT tunnel we terminated
     // locally (client set HTTP_PROXY and issued CONNECT host:443). The socket
     // carries the real upstream origin; the request path has no /bili/ prefix
@@ -93,13 +93,25 @@ export function resolveUpstream(_opts: ProxyOptions, reqUrl: string, req?: http.
     // client-side billion-context extensions (billion-context-pi / opencode-acp)
     // can detect it in their own baseUrl and self-disable, avoiding double
     // compression.
-    if (reqUrl.startsWith("/bili/http://") || reqUrl.startsWith("/bili/https://")) {
-        const full = reqUrl.slice(6); // drop "/bili/"
-        try {
-            const u = new URL(full);
-            return { upstream: `${u.protocol}//${u.host}`, rewrittenUrl: full };
-        } catch {
-            // malformed embedded URL
+    const KNOWN_PROTOCOLS = ["responses", "anthropic", "openai"] as const;
+    if (reqUrl.startsWith("/bili/")) {
+        let rest = reqUrl.slice(6);
+        let explicitProtocol: "openai" | "anthropic" | "responses" | undefined;
+        for (const p of KNOWN_PROTOCOLS) {
+            const prefix = `${p}/`;
+            if (rest.startsWith(prefix + "http://") || rest.startsWith(prefix + "https://")) {
+                explicitProtocol = p;
+                rest = rest.slice(prefix.length);
+                break;
+            }
+        }
+        if (rest.startsWith("http://") || rest.startsWith("https://")) {
+            try {
+                const u = new URL(rest);
+                return { upstream: `${u.protocol}//${u.host}`, rewrittenUrl: rest, explicitProtocol };
+            } catch {
+                // malformed embedded URL
+            }
         }
     }
     return undefined;
@@ -402,9 +414,8 @@ async function handle(
     const countTokens = isCountTokensRequest(req.method ?? "GET", urlPath, bodyBuffer.length > 0);
     const route = resolveUpstream(opts, req.url ?? "", req);
     const upstreamOrigin = route ? route.upstream : opts.upstream;
-    const explicitProtocol = resolveConfiguredProtocol(opts.routes, route?.rewrittenUrl);
     const protocol: "anthropic" | "openai" | "responses" | null =
-        explicitProtocol
+        route?.explicitProtocol
         ?? (req.method === "POST" && bodyBuffer.length > 0
             ? urlPath.endsWith("/chat/completions")
                 ? "openai"
