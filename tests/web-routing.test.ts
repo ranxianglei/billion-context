@@ -29,23 +29,17 @@ async function freePort(): Promise<number> {
     return port;
 }
 
-test("Web UI exposes upstream and history controls without inline handlers", async () => {
+test("Web UI exposes upstream controls without inline handlers", async () => {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const root = path.join(tmpdir(), `bili-web-routing-${process.pid}-${Date.now()}`);
-    const codexHome = path.join(root, "codex");
-    const codexConfig = path.join(codexHome, "config.toml");
     const biliConfig = path.join(root, "billion-context.json");
-    mkdirSync(codexHome, { recursive: true });
-    const originalCodex = 'model = "gpt-5.4"\n[mcp_servers.keep]\ncommand = "keep"\n';
-    writeFileSync(codexConfig, originalCodex, "utf8");
+    mkdirSync(root, { recursive: true });
     writeFileSync(biliConfig, '{"providers":{}}\n', "utf8");
 
     const previous = {
-        codexHome: process.env.CODEX_HOME,
         config: process.env.BILI_CONFIG_FILE,
     };
-    process.env.CODEX_HOME = codexHome;
     process.env.BILI_CONFIG_FILE = biliConfig;
     const port = await freePort();
     const opts: ProxyOptions = {
@@ -72,9 +66,9 @@ test("Web UI exposes upstream and history controls without inline handlers", asy
     const base = `http://127.0.0.1:${port}`;
     try {
         const ui = await (await fetch(`${base}/__bili/`)).text();
-        assert.match(ui, /Codex（ChatGPT 订阅）/);
+        assert.match(ui, /Codex（ChatGPT 登录）/);
         assert.match(ui, /上游网络/);
-        assert.match(ui, /修复旧版路由会话/);
+        assert.match(ui, /Fork me on GitHub/);
         assert.match(ui, /addEventListener/);
         assert.doesNotMatch(ui, /\sonclick=/i);
         assert.match(ui, /escapeHtml/);
@@ -94,7 +88,6 @@ test("Web UI exposes upstream and history controls without inline handlers", asy
 
     } finally {
         await close(proxy);
-        if (previous.codexHome === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = previous.codexHome;
         if (previous.config === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = previous.config;
         rmSync(root, { recursive: true, force: true });
     }

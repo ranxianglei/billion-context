@@ -3,7 +3,6 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import net from "node:net";
 import { once } from "node:events";
-import { once } from "node:events";
 import { defaultConfig } from "acp-kernel";
 import { loadOptions, type ProxyOptions } from "../src/config.ts";
 import { resolveUpstream, startServer } from "../src/server.ts";
