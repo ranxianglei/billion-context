@@ -172,9 +172,6 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>): Co
                         const name = typeof block.name === "string" ? block.name : "";
                         const id = typeof block.id === "string" ? block.id : `toolu_${upstreamIndex}`;
                         pending.set(upstreamIndex, { id, name, json: "" });
-                        if (round === 1) {
-                            indexMap.set(upstreamIndex, clientIndex++);
-                        }
                     } else if (round === 1) {
                         const ci = clientIndex++;
                         indexMap.set(upstreamIndex, ci);

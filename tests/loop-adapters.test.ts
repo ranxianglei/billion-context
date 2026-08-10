@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import type { Config, CoreMessage } from "acp-kernel";
 import { createCore, createInitialState } from "acp-kernel";
 import type { Session } from "../src/session.ts";
-import { runCompressLoop, createOpenaiAdapter, createAnthropicAdapter } from "../src/loop/index.ts";
+import { runCompressLoop, createOpenaiAdapter, createAnthropicAdapter, createResponsesAdapter } from "../src/loop/index.ts";
+import type { ParsedStreamEvent } from "../src/loop/index.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
 
 function makeCtx(id: string, messages: CoreMessage[] = []): {
@@ -164,4 +165,244 @@ test("ACP_LOOP_V2 smoke: import + runCompressLoop round-trips (responses) withou
     assert.equal(typeof openaiA.emitCompletion, "function", "openai adapter has emitCompletion");
     const anthA = mod.pickAdapter("anthropic", { model: "claude" });
     assert.equal(typeof anthA.emitText, "function", "anthropic adapter has emitText");
+});
+
+function mockStream(...chunks: string[]): ReadableStream<Uint8Array> {
+    return new ReadableStream<Uint8Array>({
+        start(controller) {
+            const enc = new TextEncoder();
+            for (const c of chunks) controller.enqueue(enc.encode(c));
+            controller.close();
+        },
+    });
+}
+
+function erroringStream(firstChunk: string): ReadableStream<Uint8Array> {
+    let calls = 0;
+    return new ReadableStream<Uint8Array>({
+        async pull(controller) {
+            calls++;
+            if (calls === 1) {
+                controller.enqueue(new TextEncoder().encode(firstChunk));
+                return;
+            }
+            throw new Error("simulated network drop on second read");
+        },
+    });
+}
+
+function sseLf(type: string, data: unknown): string {
+    return `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+function sseCrlf(type: string, data: unknown): string {
+    return `event: ${type}\r\ndata: ${JSON.stringify(data)}\r\n\r\n`;
+}
+
+async function collectParseEvents(
+    adapter: ReturnType<typeof createResponsesAdapter> | ReturnType<typeof createOpenaiAdapter> | ReturnType<typeof createAnthropicAdapter>,
+    stream: ReadableStream<Uint8Array>,
+    round: number,
+): Promise<ParsedStreamEvent[]> {
+    const events: ParsedStreamEvent[] = [];
+    for await (const ev of adapter.parseStream(stream, round)) events.push(ev);
+    return events;
+}
+
+test("F1 (CRLF): responses adapter yields text delta from \\r\\n-separated SSE (not silently swallowed)", async () => {
+    const crlf = sseCrlf("response.output_text.delta", {
+        type: "response.output_text.delta",
+        item_id: "m1",
+        output_index: 0,
+        delta: "HiCRLF",
+    });
+    const events = await collectParseEvents(createResponsesAdapter(), mockStream(crlf), 1);
+    const textEv = events.find((e) => e.kind === "text");
+    assert.ok(textEv, "text delta yielded — CRLF (0D0A0D0A) normalized so indexOf(\\n\\n) matches");
+    if (textEv && textEv.kind === "text") {
+        assert.equal(textEv.delta, "HiCRLF", "delta content intact");
+    }
+});
+
+test("F1 (CRLF): openai adapter yields text delta from \\r\\n-separated SSE (not silently swallowed)", async () => {
+    const crlf = `data: ${JSON.stringify({
+        id: "c1",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "gpt",
+        choices: [{ index: 0, delta: { content: "HiCRLF" }, finish_reason: null }],
+    })}\r\n\r\n`;
+    const events = await collectParseEvents(createOpenaiAdapter({ model: "gpt" }), mockStream(crlf), 1);
+    const textEv = events.find((e) => e.kind === "text");
+    assert.ok(textEv, "text delta yielded — CRLF (0D0A0D0A) normalized so indexOf(\\n\\n) matches");
+    if (textEv && textEv.kind === "text") {
+        assert.equal(textEv.delta, "HiCRLF", "delta content intact");
+    }
+});
+
+test("F1 (CRLF): anthropic adapter yields text delta from \\r\\n-separated SSE (not silently swallowed)", async () => {
+    const crlf = sseCrlf("content_block_delta", {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text: "HiCRLF" },
+    });
+    const events = await collectParseEvents(createAnthropicAdapter({ model: "claude" }), mockStream(crlf), 1);
+    const textEv = events.find((e) => e.kind === "text");
+    assert.ok(textEv, "text delta yielded — CRLF (0D0A0D0A) normalized so indexOf(\\n\\n) matches");
+    if (textEv && textEv.kind === "text") {
+        assert.equal(textEv.delta, "HiCRLF", "delta content intact");
+    }
+});
+
+test("F2: responses custom_tool_call meta events have firstRoundOnly=false (passthrough survives round 2+)", async () => {
+    const stream = mockStream(
+        sseLf("response.output_item.added", {
+            type: "response.output_item.added",
+            output_index: 0,
+            item: { type: "custom_tool_call", id: "ctc_1", call_id: "call_x", name: "code_mode_tool", arguments: "" },
+        }),
+        sseLf("response.output_item.done", {
+            type: "response.output_item.done",
+            output_index: 0,
+            item: { type: "custom_tool_call", id: "ctc_1", call_id: "call_x", name: "code_mode_tool", arguments: "{}" },
+        }),
+    );
+    const events = await collectParseEvents(createResponsesAdapter(), stream, 2);
+    const metas = events.filter((e) => e.kind === "meta");
+    assert.ok(metas.length >= 2, "both custom_tool_call events (added+done) yielded in round 2");
+    for (const m of metas) {
+        if (m.kind === "meta") {
+            assert.equal(
+                m.firstRoundOnly,
+                false,
+                "custom_tool_call passthrough has firstRoundOnly=false (not the generic else branch firstRoundOnly:true)",
+            );
+        }
+    }
+});
+
+test("F3: anthropic remaps forwarded block indices to be strictly sequential when tool_use is suppressed", async () => {
+    const stream = mockStream(
+        sseLf("message_start", { type: "message_start", message: { id: "msg_1", usage: { input_tokens: 3 } } }),
+        sseLf("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
+        sseLf("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Hello" } }),
+        sseLf("content_block_stop", { type: "content_block_stop", index: 0 }),
+        sseLf("content_block_start", {
+            type: "content_block_start",
+            index: 1,
+            content_block: { type: "tool_use", id: "toolu_1", name: "get_weather", input: {} },
+        }),
+        sseLf("content_block_delta", {
+            type: "content_block_delta",
+            index: 1,
+            delta: { type: "input_json_delta", partial_json: '{"city":"SF"}' },
+        }),
+        sseLf("content_block_stop", { type: "content_block_stop", index: 1 }),
+        sseLf("content_block_start", { type: "content_block_start", index: 2, content_block: { type: "text", text: "" } }),
+        sseLf("content_block_delta", { type: "content_block_delta", index: 2, delta: { type: "text_delta", text: "World" } }),
+        sseLf("content_block_stop", { type: "content_block_stop", index: 2 }),
+        sseLf("message_delta", { type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 5 } }),
+        sseLf("message_stop", { type: "message_stop" }),
+    );
+    const adapter = createAnthropicAdapter({ model: "claude" });
+    const forwardedBlockIndices: number[] = [];
+    const toolCallEvents: ParsedStreamEvent[] = [];
+    for await (const ev of adapter.parseStream(stream, 1)) {
+        if (ev.kind === "tool_call") {
+            toolCallEvents.push(ev);
+            continue;
+        }
+        const buf = ev.kind === "text" ? ev.raw : ev.kind === "meta" ? ev.chunk : undefined;
+        if (!buf) continue;
+        for (const line of buf.toString("utf8").split("\n")) {
+            if (!line.startsWith("data:")) continue;
+            try {
+                const obj = JSON.parse(line.slice(5).trim()) as Record<string, unknown>;
+                if (
+                    typeof obj.index === "number" &&
+                    typeof obj.type === "string" &&
+                    obj.type.startsWith("content_block_")
+                ) {
+                    forwardedBlockIndices.push(obj.index);
+                }
+            } catch {
+            }
+        }
+    }
+
+    assert.equal(toolCallEvents.length, 1, "suppressed tool_use@1 emitted as a tool_call event");
+    const tc = toolCallEvents[0];
+    if (tc && tc.kind === "tool_call") {
+        assert.equal(tc.name, "get_weather", "tool_call name from content_block_start");
+        assert.equal(tc.callId, "toolu_1", "tool_call id from content_block_start");
+        assert.ok(
+            tc.arguments.includes('"city":"SF"'),
+            "tool_call arguments accumulated from input_json_delta",
+        );
+    }
+
+    const distinct = [...new Set(forwardedBlockIndices)].sort((a, b) => a - b);
+    const expected = Array.from({ length: distinct.length }, (_, i) => i);
+    assert.deepEqual(
+        distinct,
+        expected,
+        `forwarded content_block indices STRICTLY SEQUENTIAL (0,1,...) with no gaps/dupes; got ${JSON.stringify(distinct)}`,
+    );
+    assert.ok(
+        distinct.includes(1),
+        "text@2 (upstream) remapped to client index 1 because tool_use@1 was suppressed (fills the gap)",
+    );
+});
+
+test("F4 (network drop): responses parseStream completes normally when upstream read() throws", async () => {
+    const firstChunk = sseLf("response.output_text.delta", {
+        type: "response.output_text.delta",
+        item_id: "m1",
+        output_index: 0,
+        delta: "before-drop",
+    });
+    const events = await collectParseEvents(createResponsesAdapter(), erroringStream(firstChunk), 1);
+    const textEv = events.find((e) => e.kind === "text");
+    assert.ok(textEv, "pre-drop text yielded; iterator completed normally without rethrowing the read() error");
+});
+
+test("F4 (network drop): openai parseStream completes normally when upstream read() throws", async () => {
+    const firstChunk = `data: ${JSON.stringify({
+        id: "c1",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "gpt",
+        choices: [{ index: 0, delta: { content: "before-drop" }, finish_reason: null }],
+    })}\n\n`;
+    const events = await collectParseEvents(createOpenaiAdapter({ model: "gpt" }), erroringStream(firstChunk), 1);
+    const textEv = events.find((e) => e.kind === "text");
+    assert.ok(textEv, "pre-drop text yielded; iterator completed normally without rethrowing the read() error");
+});
+
+test("F4 (network drop): anthropic parseStream completes normally when upstream read() throws", async () => {
+    const firstChunk = sseLf("content_block_delta", {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text: "before-drop" },
+    });
+    const events = await collectParseEvents(createAnthropicAdapter({ model: "claude" }), erroringStream(firstChunk), 1);
+    const textEv = events.find((e) => e.kind === "text");
+    assert.ok(textEv, "pre-drop text yielded; iterator completed normally without rethrowing the read() error");
+});
+
+test("F5: responses empty upstream → emitCompletion produces response.failed (not fabricated completed)", async () => {
+    const adapter = createResponsesAdapter();
+    let doneFinishReason: string | undefined;
+    for await (const ev of adapter.parseStream(mockStream(), 1)) {
+        if (ev.kind === "done") doneFinishReason = ev.finishReason;
+    }
+    assert.equal(doneFinishReason, "failed", "empty upstream yields done.finishReason=failed (not undefined)");
+
+    const out = adapter.emitCompletion({ finishReason: doneFinishReason }).toString("utf8");
+    assert.ok(out.includes("event: response.failed"), "emitCompletion emits response.failed event");
+    assert.ok(out.includes('"status":"failed"'), "response object carries status:failed");
+    assert.ok(
+        !out.includes("event: response.completed"),
+        "emitCompletion does NOT fabricate response.completed on empty upstream",
+    );
 });
