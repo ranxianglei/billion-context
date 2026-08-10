@@ -135,11 +135,12 @@ function parseState(statePath: string): CodexRouteState | undefined {
             typeof value.installed?.baseUrl === "string" &&
             value.installed.supportsWebsockets === false &&
             value.originalFields && typeof value.originalFields === "object" &&
-            Array.isArray(value.insertedFields)
+            Array.isArray(value.insertedFields) &&
+            typeof value.sectionPrefixLength === "number" && value.sectionPrefixLength >= 0
         ) return value as CodexRouteState;
     } catch {
     }
-    throw new Error(`invalid Codex route ownership state: ${statePath}`);
+    return undefined;
 }
 
 function writeState(statePath: string, state: CodexRouteState): void {

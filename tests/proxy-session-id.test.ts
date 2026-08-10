@@ -128,20 +128,21 @@ test("conversationSignalResponses: header (opencode x-session-affinity) still wi
     assert.equal(sig, "ses_opencode-123");
 });
 
-test("conversationIdentityResponses: previous_response_id is not treated as a stable session", () => {
+test("conversationIdentityResponses: previous_response_id provides a stable conversation link", () => {
     const body = {
         input: "hello",
         previous_response_id: "resp_xyz",
     } as unknown as Parameters<typeof conversationSignalResponses>[0];
     const identity = conversationIdentityResponses(body, undefined);
-    assert.equal(identity.source, "generated");
+    assert.equal(identity.source, "previous-response");
+    assert.equal(identity.value, "resp_xyz");
     assert.equal(identity.clientProvided, false);
 });
 
-test("conversationIdentityResponses: identical anonymous openers stay isolated", () => {
+test("conversationIdentityResponses: identical anonymous openers share a content fingerprint (enables compression)", () => {
     const body = { input: "hello world" } as unknown as Parameters<typeof conversationSignalResponses>[0];
     const a = conversationSignalResponses(body, undefined);
     const b = conversationSignalResponses({ input: "hello world" } as never, undefined);
-    assert.notEqual(a, b);
-    assert.match(a, /^generated-[0-9a-f-]{36}$/);
+    assert.equal(a, b);
+    assert.match(a, /^[0-9a-f]{16}$/);
 });

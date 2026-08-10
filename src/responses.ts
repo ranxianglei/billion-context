@@ -1,5 +1,4 @@
 import type { CoreMessage } from "acp-kernel";
-import { randomUUID } from "node:crypto";
 import { ClusterCounter, deriveMessageId } from "./message-id.js";
 import type { ConversationIdentity } from "./session-id.js";
 import { hashId } from "./util.js";
@@ -385,7 +384,10 @@ export function conversationIdentityResponses(
     if (typeof metadataSession === "string" && metadataSession.trim()) {
         return { value: metadataSession.trim(), source: "metadata-session", clientProvided: true };
     }
-    return { value: `generated-${randomUUID()}`, source: "generated", clientProvided: false };
+    if (typeof body.previous_response_id === "string" && body.previous_response_id.trim()) {
+        return { value: body.previous_response_id.trim(), source: "previous-response", clientProvided: false };
+    }
+    return { value: hashId(JSON.stringify(body.input ?? [])), source: "content-fingerprint", clientProvided: false };
 }
 
 export function conversationSignalResponses(body: ResponsesRequestBody, headerValue?: string): string {

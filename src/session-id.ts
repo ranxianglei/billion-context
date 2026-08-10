@@ -2,7 +2,7 @@ import { hashId } from "./util.js";
 
 export type ConversationIdentity = {
     value: string;
-    source: "header" | "body-session" | "metadata-session" | "generated";
+    source: "header" | "body-session" | "metadata-session" | "previous-response" | "content-fingerprint" | "generated";
     clientProvided: boolean;
 };
 

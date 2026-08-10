@@ -340,6 +340,8 @@ async function handle(
             opts.proxySource = fresh.proxySource;
             opts.proxyFallback = fresh.proxyFallback;
             resetProxyCache();
+            for (const k of Object.keys(opts.routes)) delete opts.routes[k];
+            Object.assign(opts.routes, loadRoutes());
         }, opts.port);
     }
     if (req.method === "POST" && req.url === "/__bili/config/reload") return handleConfigReload(opts, res, log);
