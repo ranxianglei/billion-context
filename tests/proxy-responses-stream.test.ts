@@ -196,3 +196,93 @@ test("compressLoopResponsesStream: empty upstream response (no content/usage) yi
     assert.ok(!out.includes("response.completed"), "no fake completion for empty response");
     assert.ok(out.includes("empty response"), "error message included");
 });
+
+test("compressLoopResponsesStream: read-only acp_status executes once and completes WITHOUT upstream re-request (regression for 炸锅 loop)", async () => {
+    const round1 = [
+        sse("response.created", { response: { id: "resp_st_1", status: "in_progress" } }),
+        sse("response.output_item.added", {
+            item: { type: "function_call", id: "fc_st", call_id: "call_st", name: "acp_status" },
+            output_index: 0,
+        }),
+        sse("response.function_call_arguments.delta", { item_id: "fc_st", delta: "{}" }),
+        sse("response.output_item.done", {
+            item: { type: "function_call", id: "fc_st", call_id: "call_st", name: "acp_status", arguments: "{}" },
+            output_index: 0,
+        }),
+        sse("response.completed", { response: { id: "resp_st_1", status: "completed", output: [] } }),
+    ].join("");
+    let fetchCalls = 0;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+        fetchCalls++;
+        return new Response(round1, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }) as typeof fetch;
+    const logs: string[] = [];
+    try {
+        const out = await drain(
+            new Response(round1, { status: 200, headers: { "content-type": "text/event-stream" } }).body!,
+            makeCtx((m) => logs.push(m)),
+            { model: "gpt-4o", input: [{ type: "message", role: "user", content: "status?" }], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.equal(fetchCalls, 0, "read-only acp_status must NOT trigger an upstream re-request");
+        assert.ok(out.includes("[ACP]"), "acp_status visibility marker emitted to client");
+        assert.ok(out.includes("response.completed"), "turn completes instead of looping or being discarded");
+        assert.ok(!out.includes("compress loop limit"), "loop limit must not be hit for a read-only tool");
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+test("compressLoopResponsesStream: mixed mutating + read-only round still re-requests (only MUTATING tools drive the loop)", async () => {
+    const round1 = [
+        sse("response.created", { response: { id: "resp_mx_1", status: "in_progress" } }),
+        sse("response.output_item.added", {
+            item: { type: "function_call", id: "fc_c", call_id: "call_c", name: "compress" },
+            output_index: 0,
+        }),
+        sse("response.function_call_arguments.delta", {
+            item_id: "fc_c",
+            delta: JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "sum" }] }),
+        }),
+        sse("response.output_item.done", {
+            item: { type: "function_call", id: "fc_c", call_id: "call_c", name: "compress", arguments: JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "sum" }] }) },
+            output_index: 0,
+        }),
+        sse("response.output_item.added", {
+            item: { type: "function_call", id: "fc_s", call_id: "call_s", name: "acp_status" },
+            output_index: 1,
+        }),
+        sse("response.function_call_arguments.delta", { item_id: "fc_s", delta: "{}" }),
+        sse("response.output_item.done", {
+            item: { type: "function_call", id: "fc_s", call_id: "call_s", name: "acp_status", arguments: "{}" },
+            output_index: 1,
+        }),
+        sse("response.completed", { response: { id: "resp_mx_1", status: "completed", output: [] } }),
+    ].join("");
+    const round2 = [
+        sse("response.created", { response: { id: "resp_mx_2", status: "in_progress" } }),
+        sse("response.output_text.delta", { item_id: "msg_mx", output_index: 0, delta: "Done." }),
+        sse("response.completed", { response: { id: "resp_mx_2", status: "completed", output: [] } }),
+    ].join("");
+    let fetchCalls = 0;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+        fetchCalls++;
+        return new Response(fetchCalls === 1 ? round2 : round1, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(round1, { status: 200, headers: { "content-type": "text/event-stream" } }).body!,
+            makeCtx(() => {}),
+            { model: "gpt-4o", input: [{ type: "message", role: "user", content: "go" }], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.equal(fetchCalls, 1, "a round containing a MUTATING tool (compress) must re-request exactly once");
+        assert.ok(out.includes("[ACP]"), "visibility markers emitted");
+        assert.ok(out.includes("Done."), "round 2 real content emitted");
+        assert.ok(out.includes("response.completed"), "final completion emitted");
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});

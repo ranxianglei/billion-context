@@ -8,7 +8,7 @@ import {
     type CoreMessage,
 } from "acp-kernel";
 import type { Session } from "./session.js";
-import { parseCompressInput, PROXY_TOOL_NAMES, COMPRESS_TOOL_NAME, ACP_TEXT_OPEN, ACP_TEXT_CLOSE } from "./compress-tool.js";
+import { parseCompressInput, PROXY_TOOL_NAMES, MUTATING_PROXY_TOOLS, READONLY_PROXY_TOOLS, COMPRESS_TOOL_NAME, ACP_TEXT_OPEN, ACP_TEXT_CLOSE } from "./compress-tool.js";
 import { log as loggerLog } from "./logger.js";
 import { applyRanges } from "./stream.js";
 import { resolveDecompress } from "./decompress-shared.js";
@@ -358,6 +358,30 @@ function replaceResponsesJsonText(parts: Array<Record<string, unknown>>, text: s
     });
 }
 
+function surfaceReadonlyJson(
+    current: Record<string, unknown>,
+    proxyCalls: FunctionCallAccumulator[],
+    ctx: CompressLoopResponsesCtx,
+): Record<string, unknown> {
+    const markers: string[] = [];
+    for (const call of proxyCalls) {
+        if (MUTATING_PROXY_TOOLS.has(call.name)) continue;
+        let args: Record<string, unknown> = {};
+        try {
+            args = JSON.parse(call.arguments) as Record<string, unknown>;
+        } catch {
+            args = {};
+        }
+        const result = executeProxyTool(call.name, args, ctx);
+        ctx.log(`[acp-proxy: responses JSON ${call.name} (read-only) → ${result.slice(0, 120).replace(/\n/g, " ")}]`);
+        markers.push(buildVisibilityMarker(call.name, result));
+    }
+    if (markers.length === 0) return current;
+    const out = Array.isArray(current.output) ? [...(current.output as unknown[])] : [];
+    out.push({ type: "message", id: `msg_acp_ro_${Date.now()}`, role: "assistant", content: [{ type: "output_text", text: markers.join("\n") }] });
+    return { ...current, output: out };
+}
+
 export async function compressLoopResponsesJson(
     initialResponse: Record<string, unknown>,
     ctx: CompressLoopResponsesCtx,
@@ -371,8 +395,12 @@ export async function compressLoopResponsesJson(
         const allCalls = [...output.calls, ...extracted.calls].filter((call) => call.name.length > 0);
         const proxyCalls = allCalls.filter((call) => PROXY_TOOL_NAMES.has(call.name));
         const realCalls = allCalls.filter((call) => !PROXY_TOOL_NAMES.has(call.name));
-        if (proxyCalls.length === 0 || realCalls.length > 0) {
-            if (proxyCalls.length > 0) replaceResponsesJsonText(output.textParts, extracted.clean);
+        const mutatingProxy = proxyCalls.filter((call) => MUTATING_PROXY_TOOLS.has(call.name));
+        if (mutatingProxy.length === 0 || realCalls.length > 0) {
+            if (proxyCalls.length > 0) {
+                replaceResponsesJsonText(output.textParts, extracted.clean);
+                if (realCalls.length === 0) current = surfaceReadonlyJson(current, proxyCalls, ctx);
+            }
             return current;
         }
         const inputItems = Array.isArray(requestBody.input) ? [...(requestBody.input as unknown[])] : [];
@@ -549,11 +577,26 @@ export async function* compressLoopResponsesStream(
         const allCalls = [...fcByItemId.values()].filter((c) => c.name.length > 0);
         const proxyCalls = allCalls.filter((c) => PROXY_TOOL_NAMES.has(c.name));
         const realCalls = allCalls.filter((c) => !PROXY_TOOL_NAMES.has(c.name));
+        const readonlyProxy = proxyCalls.filter((c) => READONLY_PROXY_TOOLS.has(c.name));
         // DIAG: log what tools the upstream returned this round.
         loggerLog("debug", `[acp-diag] round ${loopCount} allCalls=[${allCalls.map((c) => c.name).join(",")}] realCalls=[${realCalls.map((c) => c.name).join(",")}] customToolCalls=${customToolCalls} text=${JSON.stringify(contentText.slice(0, 120))}`);
-        const hasOnlyProxy = proxyCalls.length > 0 && realCalls.length === 0;
+        const hasMutatingOnly = proxyCalls.some((c) => MUTATING_PROXY_TOOLS.has(c.name)) && realCalls.length === 0;
 
-        if (!hasOnlyProxy) {
+        if (!hasMutatingOnly) {
+            for (const fc of readonlyProxy) {
+                let args: Record<string, unknown> = {};
+                try {
+                    args = JSON.parse(fc.arguments) as Record<string, unknown>;
+                } catch (e) {
+                    loggerLog("warn", `[acp-compress-args] ${fc.name} JSON.parse failed: ${String(e)}`);
+                    args = {};
+                }
+                const result = executeProxyTool(fc.name, args, ctx);
+                const preview = result.length > 120 ? result.slice(0, 120) + "..." : result;
+                ctx.log(`[acp-proxy: responses ${fc.name} (read-only) (${fc.callId}) → ${preview.replace(/\n/g, " ")}]`);
+                const markerItemId = `msg_acp_ro_${Date.now()}_${nextOutputIndex}`;
+                yield Buffer.from(buildMessageItemSequence(markerItemId, nextOutputIndex++, buildVisibilityMarker(fc.name, result)), "utf8");
+            }
             let oi = nextOutputIndex;
             for (const fc of realCalls) {
                 yield Buffer.from(buildFunctionCallEvents(fc, oi), "utf8");
@@ -570,7 +613,8 @@ export async function* compressLoopResponsesStream(
             // Empty upstream response (no text/tool_call/usage): inject
             // response.failed so the client retries instead of hanging.
             const hasUsage = !!(responseObj as Record<string, unknown> | undefined)?.usage;
-            if (contentText.length === 0 && realCalls.length === 0 && customToolCalls === 0 && !hasUsage) {
+            const emittedReadonly = readonlyProxy.length > 0;
+            if (contentText.length === 0 && realCalls.length === 0 && customToolCalls === 0 && !emittedReadonly && !hasUsage) {
                 ctx.log("[acp-proxy: empty upstream response (no content/usage) — injecting response.failed for client retry]");
                 yield Buffer.from(buildFailed(responseObj), "utf8");
                 return;

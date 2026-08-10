@@ -296,3 +296,17 @@ export const PROXY_TOOL_NAMES: ReadonlySet<string> = new Set([
     SEARCH_CONTEXT_TOOL_NAME,
     ACP_STATUS_TOOL_NAME,
 ]);
+
+/** compress/decompress: mutate history → must drive the compress loop (their
+ *  result is folded into the request before the model continues). */
+export const MUTATING_PROXY_TOOLS: ReadonlySet<string> = new Set([
+    COMPRESS_TOOL_NAME,
+    DECOMPRESS_TOOL_NAME,
+]);
+
+/** acp_status/search_context: read-only → must NOT loop. Looping them made the
+ *  model re-call until the 5× limit and discarded the whole turn. */
+export const READONLY_PROXY_TOOLS: ReadonlySet<string> = new Set([
+    SEARCH_CONTEXT_TOOL_NAME,
+    ACP_STATUS_TOOL_NAME,
+]);
