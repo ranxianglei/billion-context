@@ -46,6 +46,7 @@ import { compressLoopAnthropicStream } from "./compress-loop-anthropic.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger } from "./logger.js";
 import { defaultLogFile } from "./paths.js";
 import { compressLoopResponsesJson, compressLoopResponsesStream } from "./compress-loop-responses.js";
+import { runCompressLoop, pickAdapter } from "./loop/index.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesSseStream, rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { emitStreamError } from "./stream-error.js";
@@ -1128,7 +1129,37 @@ async function forward(
         // emitStreamError sends a protocol-appropriate error + finish so the
         // client ends cleanly instead of seeing a bare truncated stream.
         try {
-        if (prepared.protocol === "openai") {
+        if (process.env.ACP_LOOP_V2 === "1") {
+            const parsedReq = JSON.parse(typeof body === "string" ? body : body.toString("utf8"));
+            const reqHeaders: Record<string, string> = {};
+            for (const [k, v] of Object.entries(headers)) {
+                if (k.toLowerCase() === "content-length" || k.toLowerCase() === "host") continue;
+                reqHeaders[k] = v;
+            }
+            reqHeaders["content-type"] = "application/json";
+            const textProtocol = prepared.protocol === "responses" && !!prepared.responsesTextProtocol;
+            const systemPrompt = textProtocol ? buildCompressTextSystemPrompt() : buildCompressSystemPrompt();
+            const adapter = pickAdapter(prepared.protocol, parsedReq);
+            const loop = runCompressLoop(
+                streamToRead,
+                { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, textProtocol, debug: opts.debug },
+                parsedReq,
+                { url: upstreamUrl, headers: reqHeaders },
+                adapter,
+                systemPrompt,
+            );
+            for await (const chunk of loop) {
+                {
+                    const s = chunk.toString("utf8");
+                    if (s.includes("\x3cacp ") || s.includes("\x3c/acp")) {
+                        log("warn", `[${prepared.session.id}] tag echo: ${prepared.protocol} response stream contains \x3cacp tag`);
+                    }
+                }
+                res.write(chunk);
+                if (res.writableNeedDrain) await new Promise<void>((r) => res.once("drain", () => r()));
+            }
+            res.end();
+        } else if (prepared.protocol === "openai") {
             const parsedReq = JSON.parse(typeof body === "string" ? body : body.toString("utf8"));
             const reqHeaders: Record<string, string> = {};
             for (const [k, v] of Object.entries(headers)) {
