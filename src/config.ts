@@ -39,6 +39,12 @@ export type ProviderRoute = {
 export type ProviderRoutes = Record<string, ProviderRoute>; // key = upstream URL prefix (the /bili/<this> string)
 export type PromptCacheRouting = "auto" | "enabled" | "disabled";
 export type UpstreamProxyMode = "auto" | "manual" | "direct";
+/** Software self-update mode.
+ *  - `auto`: startup + periodic check, newer version auto-installed.
+ *  - `check`: startup + periodic check, only reports (never installs).
+ *  - `manual`: no background checks at all; only the explicit Web UI /
+ *    `bili update` action ever contacts the registry. */
+export type UpdateMode = "auto" | "check" | "manual";
 
 /** Built-in context window for common model families, keyed by a lowercase
  *  prefix. This is a FALLBACK used when the per-route model declaration in
@@ -125,6 +131,15 @@ export type ProxyOptions = {
     proxyFallback?: ProxyFallbackOptions;
     modelContextLimit: number;
     kernelConfig: Config;
+    /** Explicit fixed "proactive nudge interval" (tokens). When set, acp-kernel's
+     *  adaptive `nudgeGrowthTokens` is clamped to exactly this value (by setting
+     *  nudge.growthFloor = nudge.growthCap = value). When unset, acp-kernel's
+     *  adaptive default (≈5% of modelContextLimit, clamped to [20k, 50k]) is used.
+     *  Used by Web UI / config to expose a stable "compress every X tokens" knob. */
+    nudgeGrowthTokens?: number;
+    /** Origin of nudgeGrowthTokens for startup diag log: "env" | "config" | undefined
+     *  (undefined = adaptive default, no user override). */
+    nudgeGrowthTokensSource?: "env" | "config";
     compress: {
         injectTool: boolean;
         injectNudge: boolean;
@@ -135,7 +150,12 @@ export type ProxyOptions = {
     debug: boolean;
     dumpSse?: string;
     passthrough: boolean;
+    /** @deprecated replaced by `updateMode` (3-state). Kept for legacy migration
+     *  only — `true` → "auto", `false` → "manual". New code should read updateMode. */
     autoUpdate: boolean;
+    /** Software self-update mode (3-state). Resolved from env `BILI_UPDATE_MODE` >
+     *  config `update.mode` > legacy `autoUpdate` (true→auto, false→manual) > "auto". */
+    updateMode: UpdateMode;
     logFile?: string;
     /** MITM transparent-proxy mode. When enabled, an HTTP CONNECT handler is
      *  attached so clients that only know how to set HTTP_PROXY (ZCode with a
@@ -208,6 +228,31 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         }
     }
     const modelContextLimit = parseInt(env.ACP_MODEL_CONTEXT_LIMIT ?? `${fileConfig.modelContextLimit ?? 200000}`, 10);
+    // nudgeGrowthTokens: explicit fixed "proactive nudge interval".
+    // Priority: env ACP_NUDGE_GROWTH_TOKENS > config compress.nudgeGrowthTokens >
+    // acp-kernel adaptive default. Invalid values (0, negative, NaN, non-integer)
+    // are a hard config error — never a silent fallback.
+    const nudgeEnvRaw = env.ACP_NUDGE_GROWTH_TOKENS;
+    const nudgeConfigRaw = fileConfig.compress?.nudgeGrowthTokens;
+    const nudgeGrowthTokens = parseNudgeGrowthTokens(
+        nudgeEnvRaw !== undefined ? nudgeEnvRaw : nudgeConfigRaw,
+        nudgeEnvRaw !== undefined ? "env" : nudgeConfigRaw !== undefined ? "config" : undefined,
+    );
+    // acp-kernel's defaultConfig overrides take a full Config, so we build the
+    // base default first, then override ONLY growthFloor/growthCap on the nudge
+    // block. emergencyThresholdPct and every other nudge default survive.
+    // Setting floor=cap=value makes the runtime-derived nudgeGrowthTokens constant.
+    const baseKernelConfig = defaultConfig(modelContextLimit);
+    const kernelConfig = nudgeGrowthTokens !== undefined
+        ? {
+              ...baseKernelConfig,
+              nudge: {
+                  ...baseKernelConfig.nudge,
+                  growthFloor: nudgeGrowthTokens,
+                  growthCap: nudgeGrowthTokens,
+              },
+          }
+        : baseKernelConfig;
     const biliProxy = nonEmpty(env.BILI_UPSTREAM_PROXY);
     const webProxy = nonEmpty(fileConfig.upstreamProxy);
     const configProxy = nonEmpty(fileConfig.proxy);
@@ -244,6 +289,15 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
             throw new Error(`[acp-config] invalid upstream proxy for ${url}: ${String(error)}`);
         }
     }
+    // Update mode: 3-state. Priority: env BILI_UPDATE_MODE > config update.mode >
+    // legacy autoUpdate (true→auto, false→manual) > "auto". The legacy
+    // ACP_AUTO_UPDATE env var still maps (0→manual) for backward compat.
+    const legacyAutoUpdate = (env.ACP_AUTO_UPDATE ?? (fileConfig.autoUpdate === false ? "0" : "1")) !== "0";
+    const updateMode = parseUpdateMode(
+        env.BILI_UPDATE_MODE
+            ?? fileConfig.update?.mode
+            ?? (legacyAutoUpdate ? "auto" : "manual"),
+    );
     return {
         port: Number.isFinite(port) ? port : 8787,
         host,
@@ -254,7 +308,9 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         proxySource,
         proxyFallback,
         modelContextLimit,
-        kernelConfig: defaultConfig(modelContextLimit),
+        kernelConfig,
+        nudgeGrowthTokens,
+        nudgeGrowthTokensSource: nudgeEnvRaw !== undefined ? "env" : nudgeConfigRaw !== undefined ? "config" : undefined,
         compress: {
             injectTool: (env.ACP_COMPRESS_TOOL ?? (fileConfig.compress?.injectTool === false ? "0" : "1")) !== "0",
             injectNudge: (env.ACP_COMPRESS_NUDGE ?? (fileConfig.compress?.injectNudge === false ? "0" : "1")) !== "0",
@@ -267,7 +323,8 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         debug: (env.ACP_DEBUG ?? (fileConfig.debug ? "1" : "0")) === "1",
         dumpSse: env.ACP_DUMP_SSE || fileConfig.dumpSse || undefined,
         passthrough: (env.ACP_PASSTHROUGH ?? (fileConfig.passthrough ? "1" : "0")) === "1",
-        autoUpdate: (env.ACP_AUTO_UPDATE ?? (fileConfig.autoUpdate === false ? "0" : "1")) !== "0",
+        autoUpdate: legacyAutoUpdate,
+        updateMode,
         logFile: env.ACP_LOG_FILE !== undefined ? (env.ACP_LOG_FILE || undefined) : fileConfig.logFile,
         mitm: {
             enabled: (env.BILI_MITM ?? (fileConfig.mitm?.enabled === false ? "0" : "1")) !== "0",
@@ -295,11 +352,13 @@ type FileConfig = {
     debug?: boolean;
     dumpSse?: string;
     passthrough?: boolean;
+    /** @deprecated replaced by `update.mode` (3-state). true→"auto", false→"manual". */
     autoUpdate?: boolean;
+    update?: { mode?: UpdateMode };
     upstreamProxy?: string;
     upstreamProxyMode?: string;
     logFile?: string;
-    compress?: { injectTool?: boolean; injectNudge?: boolean };
+    compress?: { injectTool?: boolean; injectNudge?: boolean; nudgeGrowthTokens?: number };
     promptCache?: { routing?: string };
     mitm?: { enabled?: boolean; domains?: string[] };
 };
@@ -307,6 +366,31 @@ type FileConfig = {
 function nonEmpty(value: string | undefined): string | undefined {
     const trimmed = value?.trim();
     return trimmed ? trimmed : undefined;
+}
+
+/** Strict parser for nudgeGrowthTokens. Accepts only a finite positive integer
+ *  (0, negative, NaN, Infinity, fractional, or arbitrary strings are hard
+ *  config errors — never a silent fallback). Returns undefined when unset. */
+export function parseNudgeGrowthTokens(
+    value: unknown,
+    source: "env" | "config" | undefined,
+): number | undefined {
+    if (value === undefined || value === null || value === "") return undefined;
+    const raw = typeof value === "string" ? value.trim() : value;
+    if (raw === "") return undefined;
+    const num = typeof raw === "number" ? raw : Number(raw);
+    if (!Number.isFinite(num) || num <= 0 || !Number.isInteger(num)) {
+        const where = source === "env" ? "env ACP_NUDGE_GROWTH_TOKENS" : source === "config" ? "compress.nudgeGrowthTokens" : "nudgeGrowthTokens";
+        throw new Error(`[acp-config] invalid ${where}: ${JSON.stringify(value)} — must be a finite positive integer (> 0)`);
+    }
+    return num;
+}
+
+/** Parse the 3-state update mode. Invalid values are a hard config error. */
+export function parseUpdateMode(value: string | undefined): UpdateMode {
+    if (value === "auto" || value === "check" || value === "manual") return value;
+    if (value === undefined) return "auto";
+    throw new Error(`[acp-config] invalid update mode: ${JSON.stringify(value)} — must be "auto", "check", or "manual"`);
 }
 
 function loadConfigFile(): FileConfig {

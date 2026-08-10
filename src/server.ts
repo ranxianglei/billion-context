@@ -1,5 +1,7 @@
 import http from "node:http";
 import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { createCore, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, estimateTokensFast, renderNudgeText, deactivateBlock } from "acp-kernel";
 import type { ProxyOptions } from "./config.js";
@@ -9,6 +11,7 @@ import { resolveContextLimit } from "./config.js";
 import { contextFromRegistry, loadRegistry } from "./registry.js";
 import { fetchWithTimeout, MAX_REQUEST_BYTES } from "./fetch-util.js";
 import { formatUpstreamError, getUpstreamConnectionStatus, recordUpstreamConnection, resolveProxy, resolveProxyDecision, proxyDispatcher } from "./upstream-proxy.js";
+import { type UpdateOptions } from "./update.js";
 import {
     anthropicToCore,
     coreToAnthropic,
@@ -38,7 +41,7 @@ import { getSession, listSessions, type Session, initSessions, markDirty, flushA
 import { COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressTextSystemPrompt } from "./compress-tool.js";
 import { rewriteSseStream, rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
-import { renderUI, handleCodexHistoryGet, handleCodexHistoryRepair, handleConfigGet, handleConfigPut } from "./web/index.js";
+import { renderUI, handleCodexHistoryGet, handleCodexHistoryRepair, handleConfigGet, handleConfigPut, handleUpdateStatus, handleUpdateCheck, handleUpdateInstall } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { getStore } from "./persist.js";
 import { compressLoopStream } from "./compress-loop.js";
@@ -73,6 +76,35 @@ const UPSTREAM_HOP_HEADERS = new Set([
     // streamed from fetch, otherwise clients try to decompress plain bytes.
     "content-encoding",
 ]);
+
+/** Package metadata read from package.json next to the bundle (same trick as
+ *  cli.ts — works in dev via tsx and in the bundled dist). */
+function packageMeta(): { name: string; version: string } {
+    try {
+        const here = fileURLToPath(import.meta.url);
+        const pkg = path.join(path.dirname(here), "..", "package.json");
+        const data = JSON.parse(fs.readFileSync(pkg, "utf8")) as { name?: string; version?: string };
+        return { name: data.name ?? "billion-context", version: data.version ?? "dev" };
+    } catch {
+        return { name: "billion-context", version: "dev" };
+    }
+}
+
+/** Build the update options for this process: the update mode comes from the
+ *  live opts (env > config > legacy), and the registry/tarball egress reuses
+ *  the project's upstream-proxy decision so system-proxy users don't time out. */
+function buildUpdateOptions(opts: ProxyOptions): UpdateOptions {
+    const { name, version } = packageMeta();
+    // Route registry + tarball downloads through the same proxy resolution the
+    // upstream traffic uses (global proxy > per-URL > system/HTTP_PROXY).
+    const proxyUrl = resolveProxy(opts.routes, opts.proxy, "https://registry.npmjs.org", opts.proxyFallback);
+    return {
+        packageName: name,
+        currentVersion: version,
+        mode: opts.updateMode,
+        ...(proxyUrl ? { proxyUrl } : {}),
+    };
+}
 
 export function resolveUpstream(_opts: ProxyOptions, reqUrl: string, req?: http.IncomingMessage): { upstream: string; rewrittenUrl: string } | undefined {
     // MITM mode: the request arrived over a CONNECT tunnel we terminated
@@ -131,6 +163,10 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // re-send oversized raw history and hang).
     await initSessions();
     log("info", `[persist] ${getStore().enabled ? "enabled" : "disabled"}`);
+    // Startup diag: resolved proactive nudge interval and its source.
+    const nudgeVal = opts.nudgeGrowthTokens;
+    const nudgeSrc = opts.nudgeGrowthTokensSource === "env" ? "env" : opts.nudgeGrowthTokensSource === "config" ? "config" : "adaptive";
+    log("info", `[acp-config] nudgeGrowthTokens=${nudgeVal ?? "adaptive"} source=${nudgeSrc}`);
     if (filePath) {
         log("info", `[log] writing to ${filePath}`);
     }
@@ -342,9 +378,27 @@ async function handle(
             resetProxyCache();
             for (const k of Object.keys(opts.routes)) delete opts.routes[k];
             Object.assign(opts.routes, loadRoutes());
+            // Hot-reload compression-related runtime config so a Web UI save
+            // (e.g. nudgeGrowthTokens 20000 → 200000) takes effect on the next
+            // request without restarting bili or Codex. In-flight requests keep
+            // their captured config; new requests read the fresh one.
+            opts.modelContextLimit = fresh.modelContextLimit;
+            opts.kernelConfig = fresh.kernelConfig;
+            opts.nudgeGrowthTokens = fresh.nudgeGrowthTokens;
+            opts.nudgeGrowthTokensSource = fresh.nudgeGrowthTokensSource;
+            opts.compress = fresh.compress;
+            opts.updateMode = fresh.updateMode;
+            opts.autoUpdate = fresh.autoUpdate;
         }, opts.port);
     }
     if (req.method === "POST" && req.url === "/__bili/config/reload") return handleConfigReload(opts, res, log);
+    if (req.method === "GET" && req.url === "/__bili/update/status") return handleUpdateStatus(res);
+    if (req.method === "POST" && req.url === "/__bili/update/check") {
+        return handleUpdateCheck(res, buildUpdateOptions(opts));
+    }
+    if (req.method === "POST" && req.url === "/__bili/update/install") {
+        return handleUpdateInstall(res, buildUpdateOptions(opts));
+    }
     if (req.method === "GET" && req.url === "/__bili/codex") {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify(getCodexTakeoverStatus()));
@@ -573,18 +627,19 @@ function diagTagSummary(messages: CoreMessage[], sessionId: string, strategy: st
     return `[${sessionId}] processTurn: ${messages.length} msgs, renderTags=${strategy}, ${textTagged} text tagged, ${toolTagged} tool tagged (should be 0 with text-only)`;
 }
 
-function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; contextUsage: number; tier: number | null; breakdown?: Record<string, number> } | null }, sessionId: string, tokenCount: number, limit: number): string {
+export function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; contextUsage: number; tier: number | null; breakdown?: Record<string, number> } | null }, sessionId: string, tokenCount: number, limit: number): string {
     const n = turn.nudge;
     if (!n) return `[${sessionId}] nudge: unavailable`;
     const b = n.breakdown ?? {};
     const pct = limit > 0 ? `${Math.round((tokenCount / limit) * 100)}%` : "?";
     const growth = b["growth"] ?? 0;
-    const floor = b["growthFloor"] ?? 0;
     const interval = b["nudgeGrowthTokens"] ?? 0;
     const pendingT1 = b["pendingT1"] ?? 0;
     const ref = b["growthReference"] ?? 0;
     const inject = n.shouldInject ? `INJECT T${n.tier ?? "?"}` : "idle";
-    return `[${sessionId}] nudge ${inject}: usage=${pct} (${tokenCount}/${limit}), growth=${growth}/${floor} (ref=${ref}, interval=${interval}), pendingT1=${pendingT1}/${interval}, reason="${n.reason.slice(0, 120)}"`;
+    // Denominator is acp-kernel's resolved nudgeGrowthTokens (the actual nudge
+    // threshold), never growthFloor — the two diverge under adaptive growth.
+    return `[${sessionId}] nudge ${inject}: usage=${pct} (${tokenCount}/${limit}), growth=${growth}/${interval} (ref=${ref}, interval=${interval}), pendingT1=${pendingT1}/${interval}, reason="${n.reason.slice(0, 120)}"`;
 }
 
 function prepareAnthropic(
@@ -1373,6 +1428,16 @@ function handleConfigReload(opts: ProxyOptions, res: http.ServerResponse, log: (
     // removed/changed don't leak for the process lifetime. The next request
     // re-creates the needed agent lazily via proxyDispatcher().
     resetProxyCache();
+    // Hot-reload compression config too: kernelConfig (nudgeGrowthTokens etc.)
+    // is read per-request from `config` (captured at request start), so new
+    // requests see the fresh value immediately without a restart.
+    const freshFull = loadOptions();
+    opts.modelContextLimit = freshFull.modelContextLimit;
+    opts.kernelConfig = freshFull.kernelConfig;
+    opts.nudgeGrowthTokens = freshFull.nudgeGrowthTokens;
+    opts.nudgeGrowthTokensSource = freshFull.nudgeGrowthTokensSource;
+    opts.compress = freshFull.compress;
+    opts.updateMode = freshFull.updateMode;
     const names = Object.keys(fresh);
     log("info", `[acp-web] routes hot-reloaded (${names.length} providers): ${names.join(", ") || "(none)"}`);
     res.writeHead(200, { "content-type": "application/json" });

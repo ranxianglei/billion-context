@@ -20,7 +20,8 @@
 import { loadOptions, ensureConfigTemplate } from "./config.js";
 import { startServer } from "./server.js";
 import { configFile as defaultConfigFile } from "./paths.js";
-import { checkForUpdate, startAutoUpdate } from "./update.js";
+import { startAutoUpdate, installUpdate } from "./update.js";
+import { resolveProxy } from "./upstream-proxy.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -107,7 +108,8 @@ function parseArgs(argv: string[]): Parsed {
                 overrides.ACP_DEBUG = "1";
                 break;
             case "--no-auto-update":
-                overrides.ACP_AUTO_UPDATE = "0";
+                // Override the current run to manual only — never persist.
+                overrides.BILI_UPDATE_MODE = "manual";
                 break;
             case "--passthrough":
                 overrides.ACP_PASSTHROUGH = "1";
@@ -189,8 +191,23 @@ export async function main(): Promise<void> {
         return;
     }
     if (command === "update") {
-        // Manual one-shot update — bypasses the throttle.
-        await checkForUpdate({ packageName: PACKAGE_NAME, currentVersion: VERSION, autoUpdate: true }, true);
+        // Manual one-shot update — check + install now, bypasses the throttle.
+        const opts = loadOptions();
+        const proxyUrl = resolveProxy(opts.routes, opts.proxy, "https://registry.npmjs.org", opts.proxyFallback);
+        const result = await installUpdate({
+            packageName: PACKAGE_NAME,
+            currentVersion: VERSION,
+            mode: opts.updateMode,
+            ...(proxyUrl ? { proxyUrl } : {}),
+        });
+        if (result.ok) {
+            process.stdout.write(result.installedTo === VERSION
+                ? `billion-context is up to date (v${VERSION})\n`
+                : `✔ billion-context updated ${VERSION} → ${result.installedTo}. Restart bili to finish.\n`);
+        } else {
+            process.stderr.write(`✖ update failed: ${result.error}\n`);
+            process.exitCode = 1;
+        }
         return;
     }
 
@@ -226,9 +243,15 @@ export async function main(): Promise<void> {
     claimCodexTakeover(process.pid);
     await startServer(opts);
 
-    // Start background auto-update after the server is listening so a slow
-    // registry check never delays startup or races the listen socket.
-    if (opts.autoUpdate) {
-        startAutoUpdate({ packageName: PACKAGE_NAME, currentVersion: VERSION, autoUpdate: true });
-    }
+    // Start the background update scheduler after the server is listening so a
+    // slow registry check never delays startup or races the listen socket.
+    // startAutoUpdate branches internally: auto/check schedule periodic checks
+    // (auto also installs), manual schedules nothing.
+    const proxyUrl = resolveProxy(opts.routes, opts.proxy, "https://registry.npmjs.org", opts.proxyFallback);
+    startAutoUpdate({
+        packageName: PACKAGE_NAME,
+        currentVersion: VERSION,
+        mode: opts.updateMode,
+        ...(proxyUrl ? { proxyUrl } : {}),
+    });
 }

@@ -17,6 +17,7 @@ const BASE_OPTS: ProxyOptions = {
     debug: false,
     passthrough: false,
     autoUpdate: false,
+    updateMode: "auto",
     mitm: { enabled: false, domains: [] },
 };
 
