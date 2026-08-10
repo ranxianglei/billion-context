@@ -38,7 +38,7 @@ import { getSession, listSessions, type Session, initSessions, markDirty, flushA
 import { COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressTextSystemPrompt } from "./compress-tool.js";
 import { rewriteSseStream, rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
-import { renderUI, handleCodexHistoryGet, handleCodexHistoryRepair, handleConfigGet, handleConfigPut } from "./web/index.js";
+import { renderUI, handleConfigGet, handleConfigPut } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { getStore } from "./persist.js";
 import { compressLoopStream } from "./compress-loop.js";
@@ -379,8 +379,7 @@ async function handle(
         }
         return;
     }
-    if (req.method === "GET" && req.url === "/__bili/codex-history") return handleCodexHistoryGet(res);
-    if (req.method === "POST" && req.url === "/__bili/codex-history/repair") return handleCodexHistoryRepair(res);
+
     // Bili does not support WebSocket — reject any upgrade with 426 so clients
     // with built-in fast-fallback (e.g. Codex supports_websockets=true) retry over HTTP POST.
     if (req.headers.upgrade === "websocket") {

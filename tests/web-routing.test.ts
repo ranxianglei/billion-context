@@ -92,9 +92,6 @@ test("Web UI exposes upstream and history controls without inline handlers", asy
         assert.equal(upstream.proxy, "http://127.0.0.1:9999/");
         assert.equal(upstream.source, "web-manual");
 
-        const history = await (await fetch(`${base}/__bili/codex-history`)).json() as { targetProviderId: string; sessions: number };
-        assert.equal(history.targetProviderId, "openai");
-        assert.equal(history.sessions, 0);
     } finally {
         await close(proxy);
         if (previous.codexHome === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = previous.codexHome;

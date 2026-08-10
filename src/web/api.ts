@@ -15,7 +15,6 @@ import {
 } from "../config.js";
 import { log } from "../logger.js";
 import { validateHttpProxy } from "../upstream-proxy.js";
-import { previewLegacyCodexHistory, repairLegacyCodexHistory } from "../codex-history.js";
 
 type ConfigShape = Record<string, unknown> & {
     providers?: Record<string, unknown>;
@@ -139,26 +138,6 @@ export async function handleConfigPut(
     log("info", `[acp-web] configuration updated (${hasProviders ? `${Object.keys(routes).length} routes` : "network only"})`);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true, providers: hasProviders ? Object.keys(routes).length : undefined }));
-}
-
-export async function handleCodexHistoryGet(res: ServerResponse): Promise<void> {
-    try {
-        const preview = await previewLegacyCodexHistory();
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify(preview));
-    } catch (error) {
-        sendError(res, 409, String(error));
-    }
-}
-
-export async function handleCodexHistoryRepair(res: ServerResponse): Promise<void> {
-    try {
-        const result = await repairLegacyCodexHistory();
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify(result));
-    } catch (error) {
-        sendError(res, 409, String(error));
-    }
 }
 
 function sendError(res: ServerResponse, status: number, message: string): void {
