@@ -371,7 +371,7 @@ export function parsePromptCacheRouting(value: string | undefined): PromptCacheR
 }
 
 export function parseUpstreamProxyMode(value: string | undefined): UpstreamProxyMode {
-    return value === "manual" || value === "direct" ? value : "auto";
+    return value === "manual" || value === "auto" ? value : "direct";
 }
 
 function rejectLegacyRoute(key: string, value: unknown): void {
