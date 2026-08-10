@@ -179,3 +179,20 @@ test("compressLoopResponsesStream: Codex code_mode custom_tool_call passes throu
     assert.ok(out.includes("Running ls."), "assistant text still emitted");
     assert.ok(out.includes("response.completed"), "completion emitted");
 });
+
+test("compressLoopResponsesStream: empty upstream response (no content/usage) yields response.failed for client retry", async () => {
+    const events = [
+        sse("response.created", { response: { id: "resp_empty", status: "in_progress" } }),
+        sse("response.completed", { response: { id: "resp_empty", status: "completed", output: [] } }),
+    ].join("");
+    const ctx = { ...makeCtx(() => {}), textProtocol: true };
+    const out = await drain(
+        new Response(events).body!,
+        ctx,
+        { model: "gpt-5", input: [{ type: "message", role: "user", content: "hi" }], stream: true },
+        { url: "http://unused", headers: {} },
+    );
+    assert.ok(out.includes("response.failed"), "empty upstream response yields response.failed");
+    assert.ok(!out.includes("response.completed"), "no fake completion for empty response");
+    assert.ok(out.includes("empty response"), "error message included");
+});
