@@ -9,7 +9,6 @@ import path from "node:path";
 import { defaultConfig } from "acp-kernel";
 import { loadOptions, type ProxyOptions } from "../src/config.ts";
 import { resolveUpstream, startServer } from "../src/server.ts";
-import { enableCodexTakeover, disableCodexTakeover } from "../src/codex-takeover.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { fetchWithTimeout } from "../src/fetch-util.ts";
@@ -32,17 +31,16 @@ function close(server: http.Server): Promise<void> {
     return new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
 }
 
-function routeFixture(): { root: string; configPath: string; statePath: string } {
+function codexFixture(): { root: string; codexHome: string; configPath: string } {
     const root = path.join(tmpdir(), `bili-route-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`);
-    const codex = path.join(root, "codex");
-    mkdirSync(codex, { recursive: true });
-    const configPath = path.join(codex, "config.toml");
-    const statePath = path.join(root, "codex-route-state.json");
-    return { root, configPath, statePath };
+    const codexHome = path.join(root, "codex");
+    mkdirSync(codexHome, { recursive: true });
+    const configPath = path.join(codexHome, "config.toml");
+    return { root, codexHome, configPath };
 }
 
-test("/codex resolves every future subpath against the captured active provider", () => {
-    const files = routeFixture();
+test("/codex resolves every future subpath against the active provider from config.toml", () => {
+    const files = codexFixture();
     writeFileSync(files.configPath, [
         'model_provider = "relay"',
         "[model_providers.relay]",
@@ -52,10 +50,9 @@ test("/codex resolves every future subpath against the captured active provider"
         "requires_openai_auth = true",
         "supports_websockets = false",
     ].join("\n"), "utf8");
-    const oldState = process.env.BILI_CODEX_ROUTE_STATE;
-    process.env.BILI_CODEX_ROUTE_STATE = files.statePath;
+    const oldHome = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = files.codexHome;
     try {
-        enableCodexTakeover(8787, files);
         const opts = loadOptions({ ACP_PORT: "8787" });
         assert.deepEqual(resolveUpstream(opts, "/codex/responses?foo=a%2Fb"), {
             upstream: "https://relay.example/openai/v1",
@@ -67,9 +64,8 @@ test("/codex resolves every future subpath against the captured active provider"
         });
         assert.equal(resolveUpstream(opts, "/codex-not-owned/responses"), undefined);
     } finally {
-        try { disableCodexTakeover(files); } catch { }
-        if (oldState === undefined) delete process.env.BILI_CODEX_ROUTE_STATE;
-        else process.env.BILI_CODEX_ROUTE_STATE = oldState;
+        if (oldHome === undefined) delete process.env.CODEX_HOME;
+        else process.env.CODEX_HOME = oldHome;
         rmSync(files.root, { recursive: true, force: true });
     }
 });
@@ -89,7 +85,7 @@ test("/codex integration preserves query, subscription, account and thread heade
     });
     await listen(upstream);
     const upstreamPort = (upstream.address() as { port: number }).port;
-    const files = routeFixture();
+    const files = codexFixture();
     writeFileSync(files.configPath, [
         'model_provider = "relay"',
         "[model_providers.relay]",
@@ -99,13 +95,12 @@ test("/codex integration preserves query, subscription, account and thread heade
         "requires_openai_auth = true",
         "supports_websockets = false",
     ].join("\n"), "utf8");
-    const oldState = process.env.BILI_CODEX_ROUTE_STATE;
-    process.env.BILI_CODEX_ROUTE_STATE = files.statePath;
+    const oldHome = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = files.codexHome;
     const probe = http.createServer();
     await listen(probe);
     const biliPort = (probe.address() as { port: number }).port;
     await close(probe);
-    enableCodexTakeover(biliPort, files);
     const opts: ProxyOptions = {
         port: biliPort,
         host: "127.0.0.1",
@@ -148,9 +143,8 @@ test("/codex integration preserves query, subscription, account and thread heade
     } finally {
         await close(bili);
         await close(upstream);
-        try { disableCodexTakeover(files); } catch { }
-        if (oldState === undefined) delete process.env.BILI_CODEX_ROUTE_STATE;
-        else process.env.BILI_CODEX_ROUTE_STATE = oldState;
+        if (oldHome === undefined) delete process.env.CODEX_HOME;
+        else process.env.CODEX_HOME = oldHome;
         rmSync(files.root, { recursive: true, force: true });
     }
 });

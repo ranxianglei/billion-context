@@ -52,14 +52,7 @@ import { emitStreamError } from "./stream-error.js";
 import { deriveSessionId as deriveProxySessionId, affinityToken, clientConversationHeader, type ConversationIdentity } from "./session-id.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "./bili-message.js";
-import {
-    disableCodexTakeover,
-    enableCodexTakeover,
-    getCodexRouteState,
-    getCodexTakeoverStatus,
-    recordCodexRouteRequest,
-    restoreCodexTakeoverOwnedBy,
-} from "./codex-takeover.js";
+import { resolveActiveCodexProvider } from "./codex-provider.js";
 import { decodeRequestBody } from "./content-encoding.js";
 
 const UPSTREAM_HOP_HEADERS = new Set([
@@ -94,11 +87,14 @@ export function resolveUpstream(_opts: ProxyOptions, reqUrl: string, req?: http.
         return { upstream: mitmUpstream, rewrittenUrl: mitmKey + (reqUrl ?? "") };
     }
     if (reqUrl === "/codex" || reqUrl.startsWith("/codex/") || reqUrl.startsWith("/codex?")) {
-        const state = getCodexRouteState();
-        if (!state) return undefined;
-        const suffix = reqUrl.slice("/codex".length);
-        const baseUrl = state.original.baseUrl.replace(/\/+$/, "");
-        return { upstream: baseUrl, rewrittenUrl: baseUrl + suffix };
+        try {
+            const provider = resolveActiveCodexProvider();
+            const suffix = reqUrl.slice("/codex".length);
+            const baseUrl = provider.baseUrl.replace(/\/+$/, "");
+            return { upstream: baseUrl, rewrittenUrl: baseUrl + suffix };
+        } catch {
+            return undefined;
+        }
     }
     // Zero-config mode: a request like `/bili/https://open.bigmodel.cn/api/anthropic`
     // embeds the full upstream URL after the `/bili/` prefix. Strip the prefix,
@@ -234,13 +230,6 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     if (process.platform === "win32") {
         process.on("SIGBREAK", () => shutdown("SIGBREAK"));
     }
-    server.once("close", () => {
-        try {
-            restoreCodexTakeoverOwnedBy(process.pid);
-        } catch (error) {
-            log("warn", `[codex-route] restore on server close failed: ${String(error)}`);
-        }
-    });
     return server;
 }
 
@@ -345,27 +334,8 @@ async function handle(
         }, opts.port);
     }
     if (req.method === "POST" && req.url === "/__bili/config/reload") return handleConfigReload(opts, res, log);
-    if (req.method === "GET" && req.url === "/__bili/codex") {
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify(getCodexTakeoverStatus()));
-        return;
-    }
-    if (req.method === "POST" && (req.url === "/__bili/codex/enable" || req.url === "/__bili/codex/disable")) {
-        try {
-            const status = req.url.endsWith("/enable")
-                ? enableCodexTakeover(opts.port, { ownerPid: process.pid })
-                : disableCodexTakeover();
-            res.writeHead(200, { "content-type": "application/json" });
-            res.end(JSON.stringify(status));
-        } catch (error) {
-            res.writeHead(409, { "content-type": "application/json" });
-            res.end(JSON.stringify({ error: String(error) }));
-        }
-        return;
-    }
     if (req.method === "GET" && req.url === "/__bili/upstream") {
-        const routeState = getCodexRouteState();
-        const target = routeState?.original.baseUrl ?? opts.upstream;
+        const target = opts.upstream;
         const decision = resolveProxyDecision(opts.routes, opts.proxy, target, opts.proxyFallback);
         const connection = getUpstreamConnectionStatus();
         const connectionMatchesTarget = (() => {
@@ -388,8 +358,7 @@ async function handle(
         return;
     }
     if (req.method === "POST" && req.url === "/__bili/upstream/test") {
-        const routeState = getCodexRouteState();
-        const target = routeState?.original.baseUrl ?? opts.upstream;
+        const target = opts.upstream;
         const targetUrl = new URL(target).origin;
         const proxyUrl = resolveProxyDecision(opts.routes, opts.proxy, target, opts.proxyFallback).proxy;
         try {
@@ -410,9 +379,11 @@ async function handle(
     }
     if (req.method === "GET" && req.url === "/__bili/codex-history") return handleCodexHistoryGet(res);
     if (req.method === "POST" && req.url === "/__bili/codex-history/repair") return handleCodexHistoryRepair(res);
-    if ((req.url === "/codex" || req.url?.startsWith("/codex/") || req.url?.startsWith("/codex?")) && !getCodexRouteState()) {
-        res.writeHead(503, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: "Codex local route is not enabled; run bili codex enable" }));
+    // Codex's built-in fast-fallback: reject WebSocket upgrades to /codex/responses
+    // with 426 so it immediately retries over HTTP POST instead of stalling.
+    if (req.headers.upgrade === "websocket" && (req.url === "/codex/responses" || req.url?.startsWith("/codex/responses?"))) {
+        res.writeHead(426, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "WebSocket upgrades are not supported; use HTTP POST" }));
         return;
     }
     let bodyBuffer: Buffer;
@@ -454,9 +425,6 @@ async function handle(
     // full rewritten URL) use the same decision. Computed before prepare() so
     // the session can embed the provider origin.
     const route = resolveUpstream(opts, req.url ?? "", req);
-    if (route && (req.url === "/codex" || req.url?.startsWith("/codex/") || req.url?.startsWith("/codex?"))) {
-        recordCodexRouteRequest(req.url ?? "/codex");
-    }
     const upstreamOrigin = route ? route.upstream : opts.upstream;
     // Per-request context limit: look up body.model against the per-route model
     // declaration in providers.json first (same model can have different
