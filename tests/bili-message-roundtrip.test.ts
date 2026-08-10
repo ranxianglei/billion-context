@@ -307,3 +307,93 @@ test("responses: reasoning without encrypted_content round-trips", () => {
     assert.equal(out!.type, "reasoning");
     assert.equal(out!.encrypted_content, undefined);
 });
+
+// 14. Prior-response ACTION items (computer_call, mcp_call, ...) are routed
+// through the compression pipeline (NOT the opaque preamble) so they don't
+// accumulate unbounded every turn and break the prompt-cache prefix. They
+// round-trip verbatim via rawResponsesItem while their turn is live.
+test("responses: call items (computer_call/mcp_call) enter msgs[] not preamble", () => {
+    const body: ResponsesRequestBody = {
+        input: [
+            { type: "additional_tools", tools: [] } as ResponseInputItem,
+            { type: "mcp_list_tools", server_label: "s" } as ResponseInputItem,
+            { type: "computer_call", id: "cc_1", action: { type: "screenshot" } } as ResponseInputItem,
+            { type: "mcp_call", id: "mc_1", name: "search", arguments: "{}" } as ResponseInputItem,
+            { type: "message", role: "user", content: "go" },
+        ],
+    };
+    const { msgs, preamble } = responsesToCore(body);
+    assert.deepEqual(
+        preamble.map((p) => p.type),
+        ["additional_tools", "mcp_list_tools"],
+        "only definitions stay in the preamble",
+    );
+    const calls = msgs.filter((m) => m.contentType === "reasoning" && m.rawResponsesItem);
+    assert.equal(calls.length, 2, "both call items routed into msgs[]");
+    const rebuilt = coreToResponses(msgs);
+    const types = rebuilt.map((i) => i.type);
+    assert.ok(types.includes("computer_call"), "computer_call round-trips verbatim");
+    assert.ok(types.includes("mcp_call"), "mcp_call round-trips verbatim");
+});
+
+// 15. Call items are hidden once their turn is compressed (same prune
+// semantics as reasoning).
+test("responses: call items drop from output after their turn is compressed", () => {
+    const body: ResponsesRequestBody = {
+        input: [
+            { type: "computer_call", id: "cc_1", action: { type: "screenshot" } } as ResponseInputItem,
+            { type: "message", role: "user", content: "hi" },
+        ],
+    };
+    const { msgs } = responsesToCore(body);
+    const callMsg = msgs.find((m) => m.contentType === "reasoning" && (m.rawResponsesItem as { type?: string }).type === "computer_call");
+    assert.ok(callMsg, "computer_call entered msgs[]");
+    const pruned = msgs.filter((m) => m.id !== callMsg!.id);
+    const rebuilt = coreToResponses(pruned);
+    assert.equal(
+        rebuilt.find((i) => i.type === "computer_call"),
+        undefined,
+        "computer_call disappears once its turn is compressed",
+    );
+});
+
+// 16. A call item is given a distinct id namespace from reasoning, so the two
+// never collide even when present in the same turn.
+test("responses: call item and reasoning keep distinct ids in the same turn", () => {
+    const body: ResponsesRequestBody = {
+        input: [
+            { type: "reasoning", id: "shared", encrypted_content: "E" },
+            { type: "mcp_call", id: "shared", name: "n", arguments: "{}" } as ResponseInputItem,
+        ],
+    };
+    const { msgs } = responsesToCore(body);
+    const ids = msgs.filter((m) => m.contentType === "reasoning").map((m) => m.id);
+    assert.equal(ids.length, 2);
+    assert.notEqual(ids[0], ids[1], "same raw id does not collide across kinds");
+});
+
+// 17. ACP_REASONING_KEEP=none drops chain-of-thought but MUST preserve call
+// items: call items reuse the "reasoning" contentType only as a compression
+// bucket, not because they are reasoning. Dropping a computer_call would
+// corrupt the Responses conversation replay.
+test("responses: ACP_REASONING_KEEP=none drops reasoning but keeps call items", () => {
+    const prev = process.env.ACP_REASONING_KEEP;
+    process.env.ACP_REASONING_KEEP = "none";
+    try {
+        const body: ResponsesRequestBody = {
+            input: [
+                { type: "reasoning", id: "rs_1", encrypted_content: "E" },
+                { type: "computer_call", id: "cc_1", action: { type: "screenshot" } } as ResponseInputItem,
+                { type: "mcp_call", id: "mc_1", name: "n", arguments: "{}" } as ResponseInputItem,
+            ],
+        };
+        const { msgs } = responsesToCore(body);
+        const reasoning = msgs.filter((m) => (m.rawResponsesItem as { type?: string }).type === "reasoning");
+        const calls = msgs.filter((m) => (m.rawResponsesItem as { type?: string }).type !== "reasoning" && m.contentType === "reasoning");
+        assert.equal(reasoning.length, 0, "chain-of-thought is dropped under ACP_REASONING_KEEP=none");
+        assert.equal(calls.length, 2, "computer_call + mcp_call survive (replay-critical)");
+    } finally {
+        if (prev === undefined) delete process.env.ACP_REASONING_KEEP;
+        else process.env.ACP_REASONING_KEEP = prev;
+    }
+});
