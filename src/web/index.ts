@@ -4,8 +4,6 @@ import { fileURLToPath } from "node:url";
 import { renderPage } from "./page.js";
 
 export {
-    handleCodexHistoryGet,
-    handleCodexHistoryRepair,
     handleConfigGet,
     handleConfigPut,
     readProviders,

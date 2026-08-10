@@ -86,6 +86,14 @@ base_url = "https://api.openai.com/v1"
 base_url = "http://localhost:8787/bili/https://api.openai.com/v1"
 ```
 
+**Codex(ChatGPT 登录)** —— 设顶层 `openai_base_url` 字段(保持 `model_provider = "openai"` 和 OAuth 登录不变):
+```toml
+# ~/.codex/config.toml（顶层字段,不是 section）
+model_provider = "openai"
+openai_base_url = "http://localhost:8787/bili/https://chatgpt.com/backend-api/codex"
+```
+照常运行 `codex login`;OAuth token 随 `Authorization` 头传输,bili 原样转发给上游。
+
 **Pi** —— 编辑 `~/.pi/agent/models.json`,改 provider 的 `baseUrl`:
 ```jsonc
 // 之前:
@@ -96,38 +104,20 @@ base_url = "http://localhost:8787/bili/https://api.openai.com/v1"
 
 **其他 API-key 客户端(Cursor / Aider / Continue ……)** —— 只要配置了上游 URL,前面加 `http://localhost:8787/bili/` 就行,其他都不用改。
 
-#### B. Codex 路由(API key 或 ChatGPT 订阅)
-
-Codex 不需要改 `model_provider`,也不需要信任 MITM 证书。启动 bili,打开
-[http://localhost:8787/__bili/](http://localhost:8787/__bili/),在“路由”页启用
-**Codex 路由**。脚本化启动时,先启用路由,再启动拥有它的服务:
-
-```bash
-bili codex enable --port 8787
-bili start --port 8787
-```
-
-billion-context 只解析当前激活的 Codex provider,记录它的真实 `base_url`,
-并临时只把这个字段替换成 `http://127.0.0.1:8787/codex`。provider id 始终
-不变,所以现有 Codex 历史仍在同一个分桶。关闭路由或正常停止拥有该路由的
-bili 进程时会恢复原字段;路由期间用户自己做的新修改会被保留。异常退出留下
-的接管状态会在下次启动 bili 时安全恢复。
-
-“路由”页还提供旧版 bili 测试 provider 会话的手动修复:先预览、先备份、再
-修复。正常路由绝不会自动迁移 Codex 历史。
-
-#### C. 其他登录/订阅客户端(MITM 透明代理)
+#### B. 登录/订阅客户端(硬编码端点,MITM 透明代理)
 
 需要 **登录账号**的客户端(ChatGPT Plus/Pro、Claude、ZCode coding plan
-……)通过 **OAuth 认证,且硬编码了端点**——你改不了 baseURL,所以 `/bili/`
-前缀方式对它们无效。这类客户端要用 **MITM 透明代理模式**。
+……)通过 **OAuth 认证**。多数这类客户端还 **硬编码了端点**——如果你改不了
+baseURL,`/bili/` 前缀方式就无效。这类客户端要用 **MITM 透明代理模式**。
 
-支持的登录客户端:
+> **Codex 例外:** Codex 暴露了顶层 `openai_base_url` 配置字段,所以
+> ChatGPT 登录版 CAN 用 `/bili/` 前缀(见上方)。Codex 不需要 MITM。
+
+支持的 MITM 客户端:
 
 | 客户端 | 登录方式 | 硬编码端点 | 状态 |
 |---|---|---|---|
 | **ZCode** | 智谱 coding plan(OAuth) | `open.bigmodel.cn`(内置 provider) | ✅ 已测试 |
-| **Codex** | ChatGPT 账号(OAuth) | `chatgpt.com/backend-api` | ✅ 优先使用上面的 Codex 路由;MITM 仅作 fallback |
 | **Claude Code** | Claude 订阅(OAuth) | `api.anthropic.com` | ❓ 未测试(可能不支持,需验证) |
 
 MITM 模式原理:这类客户端只提供 **HTTP 代理**设置,所以它发送

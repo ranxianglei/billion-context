@@ -24,13 +24,6 @@ import { checkForUpdate, startAutoUpdate } from "./update.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import {
-    claimCodexTakeover,
-    disableCodexTakeover,
-    enableCodexTakeover,
-    getCodexTakeoverStatus,
-    recoverStaleCodexTakeover,
-} from "./codex-takeover.js";
 
 const VERSION = (() => {
     try {
@@ -58,9 +51,6 @@ const HELP = `bili ${VERSION} — billion-context proxy
 
 Usage:
   bili [start] [options]        start the proxy (default: reads ${defaultConfigFile()})
-  bili codex enable [--port N]  route Codex Desktop through the local proxy
-  bili codex disable            restore the active Codex provider endpoint
-  bili codex status             show Codex Desktop local-route status
   bili update                   check for & install a newer version now
   bili --version                print version
   bili --help                   show this help
@@ -82,8 +72,7 @@ Docs: https://github.com/ranxianglei/billion-context
 `;
 
 type Parsed = {
-    command: "start" | "update" | "codex" | "help" | "version";
-    codexAction?: "enable" | "disable" | "status";
+    command: "start" | "update" | "help" | "version";
     overrides: Record<string, string | undefined>;
 };
 
@@ -144,7 +133,7 @@ function parseArgs(argv: string[]): Parsed {
         }
     }
 
-    // First positional (if any) is the command. "start" | "update" | "codex" are recognized;
+    // First positional (if any) is the command. "start" | "update" are recognized;
     // an unknown command is an error.
     if (positional.length > 0) {
         const cmd = positional[0]!;
@@ -152,34 +141,17 @@ function parseArgs(argv: string[]): Parsed {
             command = command === "help" || command === "version" ? command : "start";
         } else if (cmd === "update") {
             command = "update";
-        } else if (cmd === "codex") {
-            command = "codex";
         } else {
             console.error(`bili: unknown command "${cmd}" (try "bili --help")`);
             process.exit(2);
         }
     }
 
-    let codexAction: Parsed["codexAction"];
-    if (positional[0] === "codex") {
-        command = "codex";
-        const action = positional[1];
-        if (action !== "enable" && action !== "disable" && action !== "status") {
-            console.error('bili: "codex" requires enable, disable, or status');
-            process.exit(2);
-        }
-        if (positional.length > 2) {
-            console.error(`bili: unexpected argument "${positional[2]}"`);
-            process.exit(2);
-        }
-        codexAction = action;
-    }
-
-    return { command, codexAction, overrides };
+    return { command, overrides };
 }
 
 export async function main(): Promise<void> {
-    const { command, codexAction, overrides } = parseArgs(process.argv.slice(2));
+    const { command, overrides } = parseArgs(process.argv.slice(2));
     if (command === "help") {
         process.stdout.write(HELP);
         return;
@@ -197,33 +169,13 @@ export async function main(): Promise<void> {
     for (const [k, v] of Object.entries(overrides)) {
         if (v !== undefined) process.env[k] = v;
     }
-    if (command === "codex") {
-        if (codexAction === "enable") recoverStaleCodexTakeover();
-        const status = codexAction === "enable"
-            ? enableCodexTakeover(loadOptions().port)
-            : codexAction === "disable"
-              ? disableCodexTakeover()
-              : getCodexTakeoverStatus();
-        if (status.state === "enabled") {
-            process.stdout.write(`Codex route enabled for ${status.providerId}: ${status.baseUrl} → ${status.originalBaseUrl}\n`);
-        } else if (status.state === "disabled") {
-            const provider = status.provider ? ` (provider ${status.provider.id})` : "";
-            process.stdout.write(`Codex route disabled${provider}: ${status.configPath}${status.detail ? `\n${status.detail}` : ""}\n`);
-        } else {
-            process.stdout.write(`Codex Desktop local route conflict: ${status.detail ?? status.configPath}\n`);
-            process.exitCode = 1;
-        }
-        return;
-    }
 
     // CLI flags override env (which overrides the config file inside
     // loadOptions). Merge into process.env so loadOptions picks them up.
     // First run: seed a template config so the user has a file to edit rather
     // than a bare error. No-op if it already exists.
-    recoverStaleCodexTakeover();
     ensureConfigTemplate();
     const opts = loadOptions();
-    claimCodexTakeover(process.pid);
     await startServer(opts);
 
     // Start background auto-update after the server is listening so a slow

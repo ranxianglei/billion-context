@@ -38,7 +38,7 @@ import { getSession, listSessions, type Session, initSessions, markDirty, flushA
 import { COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressTextSystemPrompt } from "./compress-tool.js";
 import { rewriteSseStream, rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
-import { renderUI, handleCodexHistoryGet, handleCodexHistoryRepair, handleConfigGet, handleConfigPut } from "./web/index.js";
+import { renderUI, handleConfigGet, handleConfigPut } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { getStore } from "./persist.js";
 import { compressLoopStream } from "./compress-loop.js";
@@ -52,14 +52,7 @@ import { emitStreamError } from "./stream-error.js";
 import { deriveSessionId as deriveProxySessionId, affinityToken, clientConversationHeader, type ConversationIdentity } from "./session-id.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "./bili-message.js";
-import {
-    disableCodexTakeover,
-    enableCodexTakeover,
-    getCodexRouteState,
-    getCodexTakeoverStatus,
-    recordCodexRouteRequest,
-    restoreCodexTakeoverOwnedBy,
-} from "./codex-takeover.js";
+
 import { decodeRequestBody } from "./content-encoding.js";
 
 const UPSTREAM_HOP_HEADERS = new Set([
@@ -74,7 +67,7 @@ const UPSTREAM_HOP_HEADERS = new Set([
     "content-encoding",
 ]);
 
-export function resolveUpstream(_opts: ProxyOptions, reqUrl: string, req?: http.IncomingMessage): { upstream: string; rewrittenUrl: string } | undefined {
+export function resolveUpstream(_opts: ProxyOptions, reqUrl: string, req?: http.IncomingMessage): { upstream: string; rewrittenUrl: string; explicitProtocol?: "openai" | "anthropic" | "responses" } | undefined {
     // MITM mode: the request arrived over a CONNECT tunnel we terminated
     // locally (client set HTTP_PROXY and issued CONNECT host:443). The socket
     // carries the real upstream origin; the request path has no /bili/ prefix
@@ -93,13 +86,6 @@ export function resolveUpstream(_opts: ProxyOptions, reqUrl: string, req?: http.
         const mitmKey = mitmUpstream.replace(/^https:\/\//, "mitm://");
         return { upstream: mitmUpstream, rewrittenUrl: mitmKey + (reqUrl ?? "") };
     }
-    if (reqUrl === "/codex" || reqUrl.startsWith("/codex/") || reqUrl.startsWith("/codex?")) {
-        const state = getCodexRouteState();
-        if (!state) return undefined;
-        const suffix = reqUrl.slice("/codex".length);
-        const baseUrl = state.original.baseUrl.replace(/\/+$/, "");
-        return { upstream: baseUrl, rewrittenUrl: baseUrl + suffix };
-    }
     // Zero-config mode: a request like `/bili/https://open.bigmodel.cn/api/anthropic`
     // embeds the full upstream URL after the `/bili/` prefix. Strip the prefix,
     // take the rest verbatim as the upstream. This is the ONLY routing mode —
@@ -107,13 +93,25 @@ export function resolveUpstream(_opts: ProxyOptions, reqUrl: string, req?: http.
     // client-side billion-context extensions (billion-context-pi / opencode-acp)
     // can detect it in their own baseUrl and self-disable, avoiding double
     // compression.
-    if (reqUrl.startsWith("/bili/http://") || reqUrl.startsWith("/bili/https://")) {
-        const full = reqUrl.slice(6); // drop "/bili/"
-        try {
-            const u = new URL(full);
-            return { upstream: `${u.protocol}//${u.host}`, rewrittenUrl: full };
-        } catch {
-            // malformed embedded URL
+    const KNOWN_PROTOCOLS = ["responses", "anthropic", "openai"] as const;
+    if (reqUrl.startsWith("/bili/")) {
+        let rest = reqUrl.slice(6);
+        let explicitProtocol: "openai" | "anthropic" | "responses" | undefined;
+        for (const p of KNOWN_PROTOCOLS) {
+            const prefix = `${p}/`;
+            if (rest.startsWith(prefix + "http://") || rest.startsWith(prefix + "https://")) {
+                explicitProtocol = p;
+                rest = rest.slice(prefix.length);
+                break;
+            }
+        }
+        if (rest.startsWith("http://") || rest.startsWith("https://")) {
+            try {
+                const u = new URL(rest);
+                return { upstream: `${u.protocol}//${u.host}`, rewrittenUrl: rest, explicitProtocol };
+            } catch {
+                // malformed embedded URL
+            }
         }
     }
     return undefined;
@@ -234,13 +232,6 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     if (process.platform === "win32") {
         process.on("SIGBREAK", () => shutdown("SIGBREAK"));
     }
-    server.once("close", () => {
-        try {
-            restoreCodexTakeoverOwnedBy(process.pid);
-        } catch (error) {
-            log("warn", `[codex-route] restore on server close failed: ${String(error)}`);
-        }
-    });
     return server;
 }
 
@@ -345,27 +336,8 @@ async function handle(
         }, opts.port);
     }
     if (req.method === "POST" && req.url === "/__bili/config/reload") return handleConfigReload(opts, res, log);
-    if (req.method === "GET" && req.url === "/__bili/codex") {
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify(getCodexTakeoverStatus()));
-        return;
-    }
-    if (req.method === "POST" && (req.url === "/__bili/codex/enable" || req.url === "/__bili/codex/disable")) {
-        try {
-            const status = req.url.endsWith("/enable")
-                ? enableCodexTakeover(opts.port, { ownerPid: process.pid })
-                : disableCodexTakeover();
-            res.writeHead(200, { "content-type": "application/json" });
-            res.end(JSON.stringify(status));
-        } catch (error) {
-            res.writeHead(409, { "content-type": "application/json" });
-            res.end(JSON.stringify({ error: String(error) }));
-        }
-        return;
-    }
     if (req.method === "GET" && req.url === "/__bili/upstream") {
-        const routeState = getCodexRouteState();
-        const target = routeState?.original.baseUrl ?? opts.upstream;
+        const target = opts.upstream;
         const decision = resolveProxyDecision(opts.routes, opts.proxy, target, opts.proxyFallback);
         const connection = getUpstreamConnectionStatus();
         const connectionMatchesTarget = (() => {
@@ -388,8 +360,7 @@ async function handle(
         return;
     }
     if (req.method === "POST" && req.url === "/__bili/upstream/test") {
-        const routeState = getCodexRouteState();
-        const target = routeState?.original.baseUrl ?? opts.upstream;
+        const target = opts.upstream;
         const targetUrl = new URL(target).origin;
         const proxyUrl = resolveProxyDecision(opts.routes, opts.proxy, target, opts.proxyFallback).proxy;
         try {
@@ -408,11 +379,12 @@ async function handle(
         }
         return;
     }
-    if (req.method === "GET" && req.url === "/__bili/codex-history") return handleCodexHistoryGet(res);
-    if (req.method === "POST" && req.url === "/__bili/codex-history/repair") return handleCodexHistoryRepair(res);
-    if ((req.url === "/codex" || req.url?.startsWith("/codex/") || req.url?.startsWith("/codex?")) && !getCodexRouteState()) {
-        res.writeHead(503, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: "Codex local route is not enabled; run bili codex enable" }));
+
+    // Bili does not support WebSocket — reject any upgrade with 426 so clients
+    // with built-in fast-fallback (e.g. Codex supports_websockets=true) retry over HTTP POST.
+    if (req.headers.upgrade === "websocket") {
+        res.writeHead(426, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "WebSocket upgrades are not supported; use HTTP POST" }));
         return;
     }
     let bodyBuffer: Buffer;
@@ -439,8 +411,11 @@ async function handle(
     const urlPath = url.split("?", 2)[0];
     const responsesCompact = urlPath.endsWith("/responses/compact");
     const countTokens = isCountTokensRequest(req.method ?? "GET", urlPath, bodyBuffer.length > 0);
+    const route = resolveUpstream(opts, req.url ?? "", req);
+    const upstreamOrigin = route ? route.upstream : opts.upstream;
     const protocol: "anthropic" | "openai" | "responses" | null =
-        req.method === "POST" && bodyBuffer.length > 0
+        route?.explicitProtocol
+        ?? (req.method === "POST" && bodyBuffer.length > 0
             ? urlPath.endsWith("/chat/completions")
                 ? "openai"
                 : urlPath.endsWith("/v1/messages") || urlPath.endsWith("/messages")
@@ -448,16 +423,7 @@ async function handle(
                   : urlPath.endsWith("/responses") || responsesCompact
                     ? "responses"
                     : null
-            : null;
-    // Resolve the upstream route once here so both the session id (needs the
-    // upstream ORIGIN for cross-provider isolation) and forward() (needs the
-    // full rewritten URL) use the same decision. Computed before prepare() so
-    // the session can embed the provider origin.
-    const route = resolveUpstream(opts, req.url ?? "", req);
-    if (route && (req.url === "/codex" || req.url?.startsWith("/codex/") || req.url?.startsWith("/codex?"))) {
-        recordCodexRouteRequest(req.url ?? "/codex");
-    }
-    const upstreamOrigin = route ? route.upstream : opts.upstream;
+            : null);
     // Per-request context limit: look up body.model against the per-route model
     // declaration in providers.json first (same model can have different
     // windows behind different relays), then the built-in table. Falls back to

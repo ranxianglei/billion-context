@@ -3,13 +3,9 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import net from "node:net";
 import { once } from "node:events";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
 import { defaultConfig } from "acp-kernel";
 import { loadOptions, type ProxyOptions } from "../src/config.ts";
 import { resolveUpstream, startServer } from "../src/server.ts";
-import { enableCodexTakeover, disableCodexTakeover } from "../src/codex-takeover.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { fetchWithTimeout } from "../src/fetch-util.ts";
@@ -32,49 +28,32 @@ function close(server: http.Server): Promise<void> {
     return new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
 }
 
-function routeFixture(): { root: string; configPath: string; statePath: string } {
-    const root = path.join(tmpdir(), `bili-route-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`);
-    const codex = path.join(root, "codex");
-    mkdirSync(codex, { recursive: true });
-    const configPath = path.join(codex, "config.toml");
-    const statePath = path.join(root, "codex-route-state.json");
-    return { root, configPath, statePath };
-}
-
-test("/codex resolves every future subpath against the captured active provider", () => {
-    const files = routeFixture();
-    writeFileSync(files.configPath, [
-        'model_provider = "relay"',
-        "[model_providers.relay]",
-        'name = "Relay"',
-        'base_url = "https://relay.example/openai/v1"',
-        'wire_api = "responses"',
-        "requires_openai_auth = true",
-        "supports_websockets = false",
-    ].join("\n"), "utf8");
-    const oldState = process.env.BILI_CODEX_ROUTE_STATE;
-    process.env.BILI_CODEX_ROUTE_STATE = files.statePath;
-    try {
-        enableCodexTakeover(8787, files);
-        const opts = loadOptions({ ACP_PORT: "8787" });
-        assert.deepEqual(resolveUpstream(opts, "/codex/responses?foo=a%2Fb"), {
-            upstream: "https://relay.example/openai/v1",
-            rewrittenUrl: "https://relay.example/openai/v1/responses?foo=a%2Fb",
-        });
-        assert.deepEqual(resolveUpstream(opts, "/codex/future/unknown?x=1"), {
-            upstream: "https://relay.example/openai/v1",
-            rewrittenUrl: "https://relay.example/openai/v1/future/unknown?x=1",
-        });
-        assert.equal(resolveUpstream(opts, "/codex-not-owned/responses"), undefined);
-    } finally {
-        try { disableCodexTakeover(files); } catch { }
-        if (oldState === undefined) delete process.env.BILI_CODEX_ROUTE_STATE;
-        else process.env.BILI_CODEX_ROUTE_STATE = oldState;
-        rmSync(files.root, { recursive: true, force: true });
-    }
+test("/bili/ resolves upstream host and full path from embedded URL", () => {
+    const opts = loadOptions({ ACP_PORT: "8787" });
+    assert.deepEqual(resolveUpstream(opts, "/bili/https://relay.example/openai/v1/responses?foo=a%2Fb"), {
+        upstream: "https://relay.example",
+        rewrittenUrl: "https://relay.example/openai/v1/responses?foo=a%2Fb",
+        explicitProtocol: undefined,
+    });
+    assert.deepEqual(resolveUpstream(opts, "/bili/https://relay.example/openai/v1/future/unknown?x=1"), {
+        upstream: "https://relay.example",
+        rewrittenUrl: "https://relay.example/openai/v1/future/unknown?x=1",
+        explicitProtocol: undefined,
+    });
+    assert.deepEqual(resolveUpstream(opts, "/bili/responses/https://relay.example/custom-path"), {
+        upstream: "https://relay.example",
+        rewrittenUrl: "https://relay.example/custom-path",
+        explicitProtocol: "responses",
+    });
+    assert.deepEqual(resolveUpstream(opts, "/bili/anthropic/https://relay.example/api/generate"), {
+        upstream: "https://relay.example",
+        rewrittenUrl: "https://relay.example/api/generate",
+        explicitProtocol: "anthropic",
+    });
+    assert.equal(resolveUpstream(opts, "/bili-not-owned/responses"), undefined);
 });
 
-test("/codex integration preserves query, subscription, account and thread headers", async () => {
+test("/bili/ integration preserves query, subscription, account and thread headers", async () => {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     let captured: { url: string; headers: http.IncomingHttpHeaders; body: string } | undefined;
@@ -89,23 +68,10 @@ test("/codex integration preserves query, subscription, account and thread heade
     });
     await listen(upstream);
     const upstreamPort = (upstream.address() as { port: number }).port;
-    const files = routeFixture();
-    writeFileSync(files.configPath, [
-        'model_provider = "relay"',
-        "[model_providers.relay]",
-        'name = "Relay"',
-        `base_url = "http://127.0.0.1:${upstreamPort}/backend-api/codex"`,
-        'wire_api = "responses"',
-        "requires_openai_auth = true",
-        "supports_websockets = false",
-    ].join("\n"), "utf8");
-    const oldState = process.env.BILI_CODEX_ROUTE_STATE;
-    process.env.BILI_CODEX_ROUTE_STATE = files.statePath;
     const probe = http.createServer();
     await listen(probe);
     const biliPort = (probe.address() as { port: number }).port;
     await close(probe);
-    enableCodexTakeover(biliPort, files);
     const opts: ProxyOptions = {
         port: biliPort,
         host: "127.0.0.1",
@@ -126,7 +92,7 @@ test("/codex integration preserves query, subscription, account and thread heade
     const bili = await startServer(opts);
     if (!bili.listening) await once(bili, "listening");
     try {
-        const response = await fetch(`http://127.0.0.1:${biliPort}/codex/future/unknown?x=1&encoded=a%2Fb`, {
+        const response = await fetch(`http://127.0.0.1:${biliPort}/bili/http://127.0.0.1:${upstreamPort}/backend-api/codex/future/unknown?x=1&encoded=a%2Fb`, {
             method: "POST",
             headers: {
                 authorization: "Bearer OfficialSubscription",
@@ -148,10 +114,6 @@ test("/codex integration preserves query, subscription, account and thread heade
     } finally {
         await close(bili);
         await close(upstream);
-        try { disableCodexTakeover(files); } catch { }
-        if (oldState === undefined) delete process.env.BILI_CODEX_ROUTE_STATE;
-        else process.env.BILI_CODEX_ROUTE_STATE = oldState;
-        rmSync(files.root, { recursive: true, force: true });
     }
 });
 

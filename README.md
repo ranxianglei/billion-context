@@ -102,6 +102,16 @@ base_url = "https://api.openai.com/v1"
 base_url = "http://localhost:8787/bili/https://api.openai.com/v1"
 ```
 
+**Codex (ChatGPT login)** — set the top-level `openai_base_url` field (keeps
+`model_provider = "openai"` and OAuth login intact):
+```toml
+# ~/.codex/config.toml (top-level field, not a section)
+model_provider = "openai"
+openai_base_url = "http://localhost:8787/bili/https://chatgpt.com/backend-api/codex"
+```
+Run `codex login` as usual; the OAuth token travels in the `Authorization`
+header, which bili forwards untouched to the upstream.
+
 **Pi** — edit `~/.pi/agent/models.json`, change the provider's `baseUrl`:
 ```jsonc
 // before:
@@ -114,43 +124,22 @@ base_url = "http://localhost:8787/bili/https://api.openai.com/v1"
 upstream URL is configured, prepend `http://localhost:8787/bili/` to it.
 Nothing else changes.
 
-#### B. Codex Route (API key or ChatGPT subscription)
-
-Codex can be connected without changing its active `model_provider` and
-without trusting a MITM certificate. Start bili, open
-[http://localhost:8787/__bili/](http://localhost:8787/__bili/), then enable
-**Codex Route** on the Routing page. For scripted startup, enable it before
-starting the owning server:
-
-```bash
-bili codex enable --port 8787
-bili start --port 8787
-```
-
-billion-context resolves only the active Codex provider, records its real
-`base_url`, and temporarily replaces that one field with
-`http://127.0.0.1:8787/codex`. The provider id never changes, so existing Codex
-history stays in the same bucket. Disabling the route or gracefully stopping
-the owning bili process restores the original field; edits made by the user
-while routing was active are preserved. A stale takeover is safely recovered
-the next time bili starts.
-
-The Routing page also offers a manual, backup-first repair for sessions created
-by older bili test provider ids. Normal routing never migrates Codex history.
-
-#### C. Other login/subscription clients (MITM transparent proxy)
+#### B. Login/subscription clients with hardcoded endpoints (MITM transparent proxy)
 
 Clients you sign **into an account** (ChatGPT Plus/Pro, Claude, ZCode coding
-plan, …) authenticate via **OAuth and hardcode the endpoint** — you can't
-change the baseURL, so the `/bili/` prefix trick doesn't work. These need
-**MITM transparent-proxy mode** instead.
+plan, …) authenticate via **OAuth**. Most such clients also **hardcode the
+endpoint** — if you can't change the baseURL, the `/bili/` prefix trick
+doesn't work. These need **MITM transparent-proxy mode** instead.
 
-Supported login clients:
+> **Codex exception:** Codex exposes a top-level `openai_base_url` config
+> field, so the ChatGPT login version CAN use the `/bili/` prefix (see above).
+> MITM is not needed for Codex.
+
+Supported MITM clients:
 
 | Client | Login | Endpoint hardcoded | Status |
 |---|---|---|---|
 | **ZCode** | bigmodel coding plan (OAuth) | `open.bigmodel.cn` (builtin provider) | ✅ tested |
-| **Codex** | ChatGPT account (OAuth) | `chatgpt.com/backend-api` | ✅ use Codex Route above; MITM is fallback only |
 | **Claude Code** | Claude subscription (OAuth) | `api.anthropic.com` | ❓ untested (may not work — needs verification) |
 
 How MITM mode works: the client only offers an **HTTP proxy** setting, so it
