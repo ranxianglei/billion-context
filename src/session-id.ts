@@ -47,7 +47,11 @@ function extractKey(headers: Record<string, string | string[] | undefined>): str
 
 /** Pull a client-provided conversation signal from headers, if any. */
 export function clientConversationHeader(headers: Record<string, string | string[] | undefined>): string | undefined {
-    const names = ["x-session-affinity", "x-acp-session", "x-session-id", "x-opencode-session", "session-id", "session_id"];
+    // x-claude-code-session-id first: the CLI's true per-session UUID — the
+    // strongest signal. The name is client-specific, so no other agent
+    // (opencode/codex/zcode/curl) ever hits it; their own headers are
+    // unchanged below.
+    const names = ["x-claude-code-session-id", "x-session-affinity", "x-acp-session", "x-session-id", "x-opencode-session", "session-id", "session_id"];
     for (const name of names) {
         const v = headers[name];
         if (typeof v === "string" && v.trim().length > 0) return v.trim();
