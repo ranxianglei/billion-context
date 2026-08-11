@@ -196,9 +196,8 @@ export function buildVisibilityMarker(toolName: string, result: string): string 
     };
     const icon = failed ? "❌" : (icons[toolName] ?? "📦");
 
-    if (toolName === "acp_status" && lines.length >= 2) {
-        const dataLine = lines.slice(0, 3).join(" | ").replace(/\s+/g, " ");
-        return `\n${icon} [ACP] ${dataLine}\n`;
+    if (toolName === "acp_status") {
+        return `\n${icon} [ACP] acp_status result:\n${result.trim()}\n`;
     }
 
     const inner = (lines[0] ?? "").replace(/^\[/, "").replace(/\]$/, "").trim();
