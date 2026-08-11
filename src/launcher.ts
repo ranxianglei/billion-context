@@ -29,7 +29,7 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, type StdioOptions } from "node:child_process";
 import { DEFAULT_MITM_DOMAINS } from "./mitm.js";
 
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
@@ -63,7 +63,7 @@ export interface SpawnChild {
 export type SpawnFn = (
     command: string,
     args: readonly string[],
-    options: { detached?: boolean; stdio?: "ignore" | "inherit"; env?: NodeJS.ProcessEnv },
+    options: { detached?: boolean; stdio?: StdioOptions; env?: NodeJS.ProcessEnv },
 ) => SpawnChild;
 
 export interface LaunchOptions {
@@ -79,6 +79,7 @@ export interface ProxyHandle {
     port: number;
     reused: boolean;
     child: SpawnChild | null;
+    logPath?: string;
 }
 
 export interface LauncherDeps {
@@ -407,16 +408,25 @@ export async function ensureProxyRunning(
 
     const script = process.argv[1];
     if (!script) throw new Error("bili: cannot resolve launcher script path");
-    const child = spawnImpl(process.execPath, [script, ...proxyStartArgs({ ...opts, port })], {
-        detached: true,
-        stdio: "ignore",
-        env: {
-            ...process.env,
-            ...(opts.mitmDomains && opts.mitmDomains.length
-                ? { BILI_MITM_DOMAINS: opts.mitmDomains.join(",") }
-                : {}),
+    const logPath = path.join(os.tmpdir(), `bili-proxy-${port}.log`);
+    const logFd = fs.openSync(logPath, "a");
+    const child = spawnImpl(
+        process.execPath,
+        [script, ...proxyStartArgs({ ...opts, port, debug: true })],
+        {
+            detached: true,
+            stdio: ["ignore", logFd, logFd],
+            env: {
+                ...process.env,
+                ...(opts.mitmDomains && opts.mitmDomains.length
+                    ? { BILI_MITM_DOMAINS: opts.mitmDomains.join(",") }
+                    : {}),
+            },
         },
-    });
+    );
+    try {
+        fs.closeSync(logFd);
+    } catch {}
     try {
         child.unref?.();
     } catch {}
@@ -425,7 +435,7 @@ export async function ensureProxyRunning(
     while (now() < deadline) {
         await sleepImpl(HEALTH_POLL_INTERVAL_MS);
         if (await probeHealth(spawnedOrigin, fetchImpl)) {
-            return { origin: spawnedOrigin, port, reused: false, child };
+            return { origin: spawnedOrigin, port, reused: false, child, logPath };
         }
     }
     throw new Error(`bili: proxy did not become healthy at ${spawnedOrigin} within ${SPAWN_WAIT_MS}ms`);
@@ -630,6 +640,9 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
             (routes.httpRewrites.length > 0 ? ` (HTTP /bili/ rewrites: ${routes.httpRewrites.length})` : "") +
             (params.client === "pi-test" ? " (no extensions)" : ""),
     );
+    if (handle.logPath) {
+        console.error(`bili: proxy log: ${handle.logPath}`);
+    }
 
     const ca = resolveCaCertPath(process.env);
     let env: NodeJS.ProcessEnv;
@@ -687,6 +700,9 @@ export async function runTestPi(params: RunTestPiParams, deps: LauncherDeps = {}
     console.error(
         `bili: ${handle.reused ? "reusing existing" : "started"} proxy at ${handle.origin} (MITM domains: ${domains.length ? domains.join(", ") : "defaults"})`,
     );
+    if (handle.logPath) {
+        console.error(`bili: proxy log: ${handle.logPath}`);
+    }
 
     const ca = resolveCaCertPath(process.env);
     const env = buildPiEnv(handle.origin, ca, process.env);
