@@ -418,23 +418,27 @@ export async function ensureProxyRunning(
     if (!script) throw new Error("bili: cannot resolve launcher script path");
     const logPath = path.join(os.tmpdir(), `bili-proxy-${port}.log`);
     const logFd = fs.openSync(logPath, "a");
-    const child = spawnImpl(
-        process.execPath,
-        [script, ...proxyStartArgs({ ...opts, port, debug: true })],
-        {
-            detached: true,
-            stdio: ["ignore", logFd, logFd],
-            env: {
-                ...stripInheritedProxy(process.env),
-                ...(opts.mitmDomains && opts.mitmDomains.length
-                    ? { BILI_MITM_DOMAINS: opts.mitmDomains.join(",") }
-                    : {}),
-            },
-        },
-    );
+    let child: SpawnChild;
     try {
-        fs.closeSync(logFd);
-    } catch {}
+        child = spawnImpl(
+            process.execPath,
+            [script, ...proxyStartArgs({ ...opts, port, debug: true })],
+            {
+                detached: true,
+                stdio: ["ignore", logFd, logFd],
+                env: {
+                    ...stripInheritedProxy(process.env),
+                    ...(opts.mitmDomains && opts.mitmDomains.length
+                        ? { BILI_MITM_DOMAINS: opts.mitmDomains.join(",") }
+                        : {}),
+                },
+            },
+        );
+    } finally {
+        try {
+            fs.closeSync(logFd);
+        } catch {}
+    }
     try {
         child.unref?.();
     } catch {}
@@ -452,7 +456,7 @@ export async function ensureProxyRunning(
 export function stopProxy(handle: ProxyHandle): void {
     const child = handle.child;
     if (!child || child.pid === undefined) return;
-    if (child.pid > 0) {
+    if (process.platform !== "win32" && child.pid > 0) {
         try {
             process.kill(-child.pid);
         } catch {
