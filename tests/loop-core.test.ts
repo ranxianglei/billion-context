@@ -63,15 +63,16 @@ function fcEvents(outputIndex: number, callId: string, name: string, args: strin
 
 const COMPLETED = sse("response.completed", { response: { id: "resp_done", status: "completed", output: [] } });
 
-test("loop #1: acp_status-only round → marker surfaced, NO re-request, graceful completion", async () => {
+test("loop #1: acp_status-only round → marker surfaced + re-request (avoids tool_calls-no-body hang)", async () => {
     const round1 = [
         sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
         fcEvents(0, "call_status", "acp_status", "{}"),
         COMPLETED,
     ].join("");
+    const round2 = COMPLETED;
     let fetchCalls = 0;
     const orig = globalThis.fetch;
-    globalThis.fetch = (async () => { fetchCalls++; return new Response(round1, { status: 200 }); }) as typeof fetch;
+    globalThis.fetch = (async () => { fetchCalls++; return new Response(round2, { status: 200 }); }) as typeof fetch;
     try {
         const out = await drain(
             new Response(round1, { status: 200 }).body!,
@@ -81,21 +82,22 @@ test("loop #1: acp_status-only round → marker surfaced, NO re-request, gracefu
         );
         assert.ok(out.includes("[ACP]"), "acp_status visibility marker surfaced to client");
         assert.ok(/response\.completed/.test(out), "graceful completion present (no 炸锅)");
-        assert.equal(fetchCalls, 0, "NO re-request: acp_status is read-only, turn ends");
+        assert.equal(fetchCalls, 1, "re-request after acp_status so model can continue (not finish_reason=tool_calls with no body)");
     } finally {
         globalThis.fetch = orig;
     }
 });
 
-test("loop #2: search_context-only round → marker surfaced, NO re-request, graceful completion", async () => {
+test("loop #2: search_context-only round → marker surfaced + re-request", async () => {
     const round1 = [
         sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
         fcEvents(0, "call_search", "search_context", JSON.stringify({ query: "auth", limit: 3 })),
         COMPLETED,
     ].join("");
+    const round2 = COMPLETED;
     let fetchCalls = 0;
     const orig = globalThis.fetch;
-    globalThis.fetch = (async () => { fetchCalls++; return new Response(round1, { status: 200 }); }) as typeof fetch;
+    globalThis.fetch = (async () => { fetchCalls++; return new Response(round2, { status: 200 }); }) as typeof fetch;
     try {
         const out = await drain(
             new Response(round1, { status: 200 }).body!,
@@ -105,7 +107,7 @@ test("loop #2: search_context-only round → marker surfaced, NO re-request, gra
         );
         assert.ok(out.includes("[ACP]"), "search_context marker surfaced");
         assert.ok(/response\.completed/.test(out), "graceful completion present");
-        assert.equal(fetchCalls, 0, "NO re-request: search_context is read-only");
+        assert.equal(fetchCalls, 1, "re-request after search_context so model can use results");
     } finally {
         globalThis.fetch = orig;
     }

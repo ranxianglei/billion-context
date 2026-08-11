@@ -67,16 +67,20 @@ test("openai adapter: plain text round-trips live + [DONE] termination", async (
     assert.ok(/finish_reason/.test(out), "finish chunk present");
 });
 
-test("openai adapter: acp_status-only round → marker + graceful completion, no re-request, no crash", async () => {
+test("openai adapter: acp_status-only round → marker + re-request, no crash", async () => {
     const round1 = [
         `data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", created: 1, model: "gpt", choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] })}\n\n`,
         `data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", created: 1, model: "gpt", choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call_s", type: "function", function: { name: "acp_status", arguments: "{}" } }] }, finish_reason: null }] })}\n\n`,
         `data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", created: 1, model: "gpt", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] })}\n\n`,
         `data: [DONE]\n\n`,
     ].join("");
+    const round2 = [
+        `data: ${JSON.stringify({ id: "c2", object: "chat.completion.chunk", created: 2, model: "gpt", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`,
+        `data: [DONE]\n\n`,
+    ].join("");
     let fetchCalls = 0;
     const orig = globalThis.fetch;
-    globalThis.fetch = (async () => { fetchCalls++; return new Response(round1, { status: 200 }); }) as typeof fetch;
+    globalThis.fetch = (async () => { fetchCalls++; return new Response(round2, { status: 200 }); }) as typeof fetch;
     try {
         const out = await drain(
             new Response(round1, { status: 200 }).body!,
@@ -86,7 +90,7 @@ test("openai adapter: acp_status-only round → marker + graceful completion, no
         );
         assert.ok(out.includes("[ACP]"), "acp_status marker surfaced");
         assert.ok(out.includes("[DONE]"), "graceful completion ([DONE])");
-        assert.equal(fetchCalls, 0, "no re-request for read-only acp_status");
+        assert.equal(fetchCalls, 1, "re-request after acp_status (avoids tool_calls-no-body hang)");
     } finally {
         globalThis.fetch = orig;
     }
@@ -112,7 +116,7 @@ test("anthropic adapter: plain text round-trips live + message_delta/message_sto
     assert.ok(out.includes("message_stop"), "message_stop terminal present");
 });
 
-test("anthropic adapter: acp_status-only round → marker + graceful completion, no re-request, no crash", async () => {
+test("anthropic adapter: acp_status-only round → marker + re-request, no crash", async () => {
     const round1 = [
         `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_1", usage: { input_tokens: 3 } } })}\n\n`,
         `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_s", name: "acp_status", input: {} } })}\n\n`,
@@ -121,9 +125,14 @@ test("anthropic adapter: acp_status-only round → marker + graceful completion,
         `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 1 } })}\n\n`,
         `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
     ].join("");
+    const round2 = [
+        `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_2", usage: { input_tokens: 3 } } })}\n\n`,
+        `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } })}\n\n`,
+        `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+    ].join("");
     let fetchCalls = 0;
     const orig = globalThis.fetch;
-    globalThis.fetch = (async () => { fetchCalls++; return new Response(round1, { status: 200 }); }) as typeof fetch;
+    globalThis.fetch = (async () => { fetchCalls++; return new Response(round2, { status: 200 }); }) as typeof fetch;
     try {
         const out = await drain(
             new Response(round1, { status: 200 }).body!,
@@ -133,7 +142,7 @@ test("anthropic adapter: acp_status-only round → marker + graceful completion,
         );
         assert.ok(out.includes("[ACP]"), "acp_status marker surfaced");
         assert.ok(out.includes("message_stop"), "graceful completion (message_stop)");
-        assert.equal(fetchCalls, 0, "no re-request for read-only acp_status");
+        assert.equal(fetchCalls, 1, "re-request after acp_status (avoids tool_use-no-body hang)");
     } finally {
         globalThis.fetch = orig;
     }

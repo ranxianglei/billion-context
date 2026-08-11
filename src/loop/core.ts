@@ -8,7 +8,6 @@ import {
 } from "acp-kernel";
 import type { Session } from "../session.js";
 import {
-    MUTATING_PROXY_TOOLS,
     parseCompressInput,
     PROXY_TOOL_NAMES,
 } from "../compress-tool.js";
@@ -193,7 +192,6 @@ export async function* runCompressLoop(
                 yield adapter.emitText(resolvedText);
             }
 
-            let sawMutating = false;
             let realCalls = 0;
             const realToolCalls: ToolCallEmit[] = [];
             const proxyResults: { name: string; callId: string; result: string; arguments: string }[] = [];
@@ -209,7 +207,6 @@ export async function* runCompressLoop(
                     const result = executeProxyTool(call.name, parsedArgs, ctx, call.callId);
                     proxyResults.push({ name: call.name, callId: call.callId, result, arguments: call.arguments });
                     yield adapter.emitMarker(call.name, result);
-                    if (MUTATING_PROXY_TOOLS.has(call.name)) sawMutating = true;
                 } else {
                     realToolCalls.push(call);
                     realCalls += 1;
@@ -269,7 +266,7 @@ export async function* runCompressLoop(
                 yield adapter.emitToolCall(tc);
             }
 
-            const reRequest = sawMutating && realCalls === 0;
+            const reRequest = proxyResults.length > 0 && realCalls === 0;
             if (!reRequest) {
                 yield adapter.emitCompletion({ finishReason, usage });
                 return;
