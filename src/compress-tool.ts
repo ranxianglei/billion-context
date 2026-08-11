@@ -94,7 +94,7 @@ export const COMPRESS_TOOL_OPENAI = {
                 topic: { type: "string", description: "Optional short title for the compressed range" },
                 content: {
                     type: "array",
-                    description: "One or more ranges to compress into separate summary blocks",
+                    description: "One or more ranges to compress into separate summary blocks. REQUIRED — compress without content is invalid.",
                     items: {
                         type: "object",
                         properties: {
@@ -107,6 +107,7 @@ export const COMPRESS_TOOL_OPENAI = {
                     },
                 },
             },
+            required: ["content"],
         },
     },
 };

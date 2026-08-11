@@ -213,6 +213,19 @@ export async function* runCompressLoop(
                 }
             }
 
+            if (ctx.debug) {
+                const callSummary = allCalls.map(c => {
+                    const argSnippet = c.arguments.length > 200 ? c.arguments.slice(0, 200) + "..." : c.arguments;
+                    return `${c.name}(${argSnippet})`;
+                }).join(" | ");
+                ctx.log(`[acp-loop] round ${round}: ${allCalls.length} call(s): ${callSummary || "(none)"}`);
+                for (const pr of proxyResults) {
+                    const resSnippet = pr.result.length > 300 ? pr.result.slice(0, 300) + "..." : pr.result;
+                    ctx.log(`[acp-loop]   → ${pr.name} result: ${resSnippet}`);
+                }
+                if (realCalls > 0) ctx.log(`[acp-loop] round ${round}: ${realCalls} real tool call(s) forwarded to client`);
+            }
+
             // Per-round hygiene (fixes the injection-persistence 炸锅): the
             // philosophy systemPrompt is transient (passed fresh to buildRequest,
             // never in coreMessages), and hideConsumedCompressCalls runs each
