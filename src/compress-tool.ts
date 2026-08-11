@@ -167,9 +167,9 @@ You manage context by emitting a special trigger in your text output. When you d
 ${ACP_TEXT_OPEN}{"content":[{"startId":"m00150","endId":"m00220","summary":"...","topic":"optional"}]}${ACP_TEXT_CLOSE}
 
 Rules for the trigger:
-- Output the marker on its own, with NO surrounding prose. Just the raw marker.
+- Append the marker at the END of your response, AFTER completing your task. Complete your work first, then compress.
 - JSON shape matches the compress tool: {"content":[{startId,endId,summary,topic?}]}. Batch multiple ranges in one trigger.
-- After emitting the marker, STOP your turn. Do not continue with other text — the proxy will execute the compression and return the result, then you continue fresh.
+- The proxy applies the compression silently — your response is delivered as-is. You do not need to wait for a result.
 - Do NOT wrap the marker in code fences, quotes, or commentary.
 - NEVER compress on short conversations or when context is small (well below the window limit). Only compress when context is genuinely large.
 
@@ -190,9 +190,9 @@ Since host tools cannot coexist with a declared tools field, ALL ACP tools use t
    Optional: {"blockId":"b5","toFile":"/tmp/b5.txt"} to write to file instead.
    Optional: {"blockId":"b5","full":true} to restore all the way to original messages.
 
-Rules for ALL triggers:
+Rules for acp_status, search_context, decompress triggers:
 - Output on its own, NO surrounding prose. Just the raw marker.
-- After emitting, STOP your turn. The proxy executes and returns the result.
+- After emitting, STOP your turn. The proxy executes and returns the result in a new round.
 - Do NOT wrap in code fences, quotes, or commentary.`;
 }
 
