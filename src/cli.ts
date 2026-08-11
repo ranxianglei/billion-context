@@ -55,6 +55,7 @@ const HELP = `bili ${VERSION} — billion-context proxy
 Usage:
   bili [start] [options]           start the proxy (default: reads ${defaultConfigFile()})
   bili pi [opts --] [args]         start a proxy + launch pi against it (cert-MITM)
+  bili pi-test [opts --] [args]    like bili pi but injects --no-extensions (clean test)
   bili codex [opts --] [args]      start a proxy + launch codex against it (cert-MITM)
   bili claude [opts --] [args]     start a proxy + launch claude against it (cert-MITM)
   bili test pi                     non-polluting pi smoke test through the proxy
@@ -71,6 +72,7 @@ Launcher (bili pi / bili codex / bili claude):
   via NODE_EXTRA_CA_CERTS, codex via SSL_CERT_FILE. Proxy killed on client exit.
     bili pi                               # launch pi through the proxy
     bili pi -- print "hi"                 # args after the client are passed through
+    bili pi-test                          # pi through the proxy with extensions off (proxy owns compression)
     bili codex                            # launch codex through the proxy
     bili claude                           # launch claude through the proxy
     bili test pi                          # quick end-to-end check of the pi path

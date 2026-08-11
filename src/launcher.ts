@@ -34,8 +34,9 @@ import { DEFAULT_MITM_DOMAINS } from "./mitm.js";
 
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
 export const LAUNCHER_DEFAULT_PORT = 8787;
-export const LAUNCH_CLIENTS = ["pi", "codex", "claude"] as const;
+export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "pi-test"] as const;
 export type ClientName = (typeof LAUNCH_CLIENTS)[number];
+export type BaseClientName = "claude" | "codex" | "pi";
 
 const HEALTH_PATH = "/__bili/health";
 const HEALTH_POLL_INTERVAL_MS = 200;
@@ -89,6 +90,15 @@ export interface LauncherDeps {
 
 export function isLaunchClient(value: string): value is ClientName {
     return (LAUNCH_CLIENTS as readonly string[]).includes(value);
+}
+
+export function baseClientName(client: ClientName): BaseClientName {
+    return client === "pi-test" ? "pi" : client;
+}
+
+/** `pi-test` injects `--no-extensions` so the billion-context-pi client extension doesn't double-compress alongside the proxy. */
+export function piTestArgs(client: ClientName, clientArgs: string[]): string[] {
+    return client === "pi-test" ? ["--no-extensions", ...clientArgs] : clientArgs;
 }
 
 export function proxyOrigin(host: string, port: number): string {
@@ -611,33 +621,36 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     const debug = params.overrides.ACP_DEBUG === "1";
 
     const config = loadClientConfig(process.env, process.cwd());
-    const routes = discoverRoutes(params.client, config);
+    const base = baseClientName(params.client);
+    const routes = discoverRoutes(base, config);
     const domains = dedupeInOrder([...routes.httpsDomains, ...(params.mitmDomains ?? [])]);
     const handle = await ensureProxyRunning({ host, port, passthrough, debug, mitmDomains: domains }, deps);
     console.error(
         `bili: ${handle.reused ? "reusing existing" : "started"} proxy at ${handle.origin} (MITM domains: ${domains.length ? domains.join(", ") : "defaults"})` +
-            (routes.httpRewrites.length > 0 ? ` (HTTP /bili/ rewrites: ${routes.httpRewrites.length})` : ""),
+            (routes.httpRewrites.length > 0 ? ` (HTTP /bili/ rewrites: ${routes.httpRewrites.length})` : "") +
+            (params.client === "pi-test" ? " (no extensions)" : ""),
     );
 
     const ca = resolveCaCertPath(process.env);
     let env: NodeJS.ProcessEnv;
     let clientArgs = params.clientArgs;
     let piTmpHome: string | undefined;
-    if (params.client === "pi") {
+    if (base === "pi") {
         env = buildPiEnv(handle.origin, ca, process.env);
         piTmpHome = preparePiHttpRewrite(resolvePiHome(process.env), handle.origin, routes.httpRewrites);
         if (piTmpHome) env.PI_CODING_AGENT_DIR = piTmpHome;
-    } else if (params.client === "codex") {
+    } else if (base === "codex") {
         env = buildCodexEnv(handle.origin, ca, process.env);
         clientArgs = buildCodexArgs(handle.origin, routes.httpRewrites, params.clientArgs);
     } else {
         env = buildClaudeEnv(handle.origin, ca, routes.httpRewrites, process.env);
     }
 
-    const { command, prefixArgs } = resolveClientCommand(params.client, process.env);
+    const { command, prefixArgs } = resolveClientCommand(base, process.env);
+    const effectiveClientArgs = piTestArgs(params.client, clientArgs);
     let code = 0;
     try {
-        code = await runClient(command, [...prefixArgs, ...clientArgs], env, {
+        code = await runClient(command, [...prefixArgs, ...effectiveClientArgs], env, {
             spawnImpl: deps.spawnImpl,
         });
     } catch (err) {

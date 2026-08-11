@@ -7,6 +7,8 @@ import path from "node:path";
 import {
     LAUNCHER_DEFAULT_HOST,
     isLaunchClient,
+    baseClientName,
+    piTestArgs,
     proxyOrigin,
     healthUrl,
     wrapUpstream,
@@ -33,13 +35,29 @@ import {
     type HttpRewrite,
 } from "../src/launcher.ts";
 
-test("isLaunchClient: pi/claude/codex true, others false", () => {
+test("isLaunchClient: pi/claude/codex/pi-test true, others false", () => {
     assert.equal(isLaunchClient("pi"), true);
     assert.equal(isLaunchClient("claude"), true);
     assert.equal(isLaunchClient("codex"), true);
+    assert.equal(isLaunchClient("pi-test"), true);
     assert.equal(isLaunchClient("opencode"), false);
     assert.equal(isLaunchClient("start"), false);
     assert.equal(isLaunchClient(""), false);
+});
+
+test("baseClientName: pi-test → pi, others unchanged", () => {
+    assert.equal(baseClientName("pi-test"), "pi");
+    assert.equal(baseClientName("pi"), "pi");
+    assert.equal(baseClientName("claude"), "claude");
+    assert.equal(baseClientName("codex"), "codex");
+});
+
+test("piTestArgs: prepends --no-extensions for pi-test, leaves other clients unchanged", () => {
+    assert.deepEqual(piTestArgs("pi-test", ["print hi"]), ["--no-extensions", "print hi"]);
+    assert.deepEqual(piTestArgs("pi-test", []), ["--no-extensions"]);
+    assert.deepEqual(piTestArgs("pi", ["--foo", "bar"]), ["--foo", "bar"]);
+    assert.deepEqual(piTestArgs("codex", ["--foo"]), ["--foo"]);
+    assert.deepEqual(piTestArgs("claude", ["--foo"]), ["--foo"]);
 });
 
 test("proxyOrigin / healthUrl", () => {

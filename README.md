@@ -76,6 +76,7 @@ blind-tunnel everything else.
 ```bash
 bili pi                               # launch pi through the proxy
 bili pi -- print "hi"                 # args after the client are passed through
+bili pi-test                          # clean pi (extensions off) — proxy owns compression, no double-compress
 bili codex                            # launch codex through the proxy
 bili claude                           # launch claude through the proxy
 bili test pi                          # quick end-to-end smoke test of the pi path
