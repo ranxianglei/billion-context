@@ -1,6 +1,5 @@
 import http from "node:http";
 import fs from "node:fs";
-import { tmpdir } from "node:os";
 import { createCore, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, estimateTokensFast, renderNudgeText, deactivateBlock } from "acp-kernel";
 import type { ProxyOptions } from "./config.js";
 import { loadOptions, loadRoutes } from "./config.js";
@@ -44,7 +43,7 @@ import { getStore } from "./persist.js";
 import { compressLoopStream } from "./compress-loop.js";
 import { compressLoopAnthropicStream } from "./compress-loop-anthropic.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger } from "./logger.js";
-import { defaultLogFile } from "./paths.js";
+import { defaultLogFile, stateDir } from "./paths.js";
 import { compressLoopResponsesJson, compressLoopResponsesStream } from "./compress-loop-responses.js";
 import { runCompressLoop, pickAdapter } from "./loop/index.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
@@ -1026,9 +1025,17 @@ async function forward(
                 return fn?.name ?? (t.name as string | undefined) ?? "?";
             });
             log("info", `[debug] tools=[${toolNames.join(",")}] msgs=${parsed.messages?.length ?? 0} stream=${parsed.stream ?? false} system_len=${JSON.stringify(parsed.messages?.find((m: Record<string, string>) => m.role === "system")?.content ?? "").length}`);
-            if (process.env.ACP_DUMP_REQ === "1") {
-                const out = `${tmpdir()}/acp-proxy-debug-req-${Date.now()}.json`;
-                fs.writeFileSync(out, body.slice(0, 50000));
+            if (process.env.ACP_DUMP_REQ !== "0") {
+                const dumpDir = process.env.ACP_DUMP_DIR || `${stateDir()}/dumps`;
+                try { fs.mkdirSync(dumpDir, { recursive: true }); } catch { /* best-effort */ }
+                const sid = prepared?.session.id ?? "unknown";
+                const out = `${dumpDir}/req-${Date.now()}-${sid}.json`;
+                try {
+                    const pretty = JSON.stringify(JSON.parse(body), null, 2);
+                    fs.writeFileSync(out, pretty);
+                } catch {
+                    fs.writeFileSync(out, body);
+                }
                 log("info", `[debug] forwarded body written to ${out}`);
             }
         } catch { /* best-effort */ }
