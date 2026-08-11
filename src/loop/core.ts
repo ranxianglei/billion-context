@@ -169,6 +169,7 @@ export async function* runCompressLoop(
     let activeClearTimer: (() => void) | null = null;
     let currentUpstream = upstream;
     const coreMessages: CoreMessage[] = [...ctx.messages];
+    let mutatedThisTurn = false;
 
     try {
         for (let round = 1; round <= MAX_LOOP_ROUNDS; round++) {
@@ -234,7 +235,15 @@ export async function* runCompressLoop(
                     } catch {
                         parsedArgs = {};
                     }
-                    const result = executeProxyTool(call.name, parsedArgs, ctx, call.callId);
+                    const isMutating = call.name === "compress" || call.name === "decompress";
+                    let result: string;
+                    if (isMutating && mutatedThisTurn) {
+                        result = `Already ${call.name}ed once this turn. Do not ${call.name} again; generate your normal response now.`;
+                        ctx.log(`[acp-loop] round ${round}: ${call.name} skipped (state already mutated this turn) — no-op result`);
+                    } else {
+                        result = executeProxyTool(call.name, parsedArgs, ctx, call.callId);
+                        if (isMutating) mutatedThisTurn = true;
+                    }
                     proxyResults.push({ name: call.name, callId: call.callId, result, arguments: call.arguments });
                     yield adapter.emitMarker(call.name, result);
                 } else {
@@ -309,18 +318,16 @@ export async function* runCompressLoop(
                 yield adapter.emitToolCall(tc);
             }
 
-            // Fix A (align Pi): one compress per request. After a state-changing
-            // proxy tool (compress/decompress), complete immediately and do NOT
-            // re-request. Multi-round re-requests used a divergent request prefix
-            // (re-request body != original forward) → a cache miss every compress
-            // round, and the stale coreMessages view caused 0-char compress
-            // failures. The compress system prompt encourages batching multiple
-            // ranges in one trigger, so round 1 captures all compress calls; we
-            // fold them into state, then complete.
-            const stateChanged = proxyResults.some(pr => pr.name === "compress" || pr.name === "decompress");
-            const reRequest = proxyResults.length > 0 && realCalls === 0 && !stateChanged;
+            // Re-request so the model receives the proxy-tool result and can
+            // continue (standard function-calling continuation: the proxy acts as
+            // the client, executes compress/decompress/acp_status/search, then
+            // feeds the result back). The mutatedThisTurn guard above ensures at
+            // most ONE compress/decompress per request — a second mutating call
+            // returns a no-op, which prevents the 0-char spiral (model re-targeting
+            // a just-compressed range on a stale view) without cutting off the
+            // model's continuation (which a hard stop did — it hung the session).
+            const reRequest = proxyResults.length > 0 && realCalls === 0;
             if (!reRequest) {
-                if (stateChanged) ctx.log(`[acp-loop] round ${round}: state changed (compress/decompress); completing (one per request)`);
                 yield adapter.emitCompletion({ finishReason, usage });
                 return;
             }
@@ -334,7 +341,7 @@ export async function* runCompressLoop(
                 return;
             }
 
-            ctx.log(`[acp-loop] round ${round}: non-mutating proxy tool (acp_status/search); re-requesting so the model sees the result`);
+            ctx.log(`[acp-loop] round ${round}: proxy tool executed (state ${mutatedThisTurn ? "mutated" : "read-only"}); re-requesting so the model sees the result`);
 
             const newBody = adapter.buildRequest(coreMessages, systemPrompt, requestBody);
             if (process.env.ACP_DUMP_REQ !== "0" && ctx.debug) {
