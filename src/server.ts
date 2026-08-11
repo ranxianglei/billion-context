@@ -1052,6 +1052,13 @@ async function forward(
         headers["x-session-id"] = affinity;
     }
     const proxyUrl = resolveProxy(opts.routes, opts.proxy, route?.rewrittenUrl ?? upstreamUrl, opts.proxyFallback);
+    if (opts.debug) {
+        const hdrLog: Record<string, string> = {};
+        for (const [hk, hv] of Object.entries(headers)) {
+            if (typeof hv === "string") hdrLog[hk] = hv.length > 200 ? hv.slice(0, 200) + "..." : hv;
+        }
+        log("info", `[${prepared?.session.id ?? "unknown"}] → upstream headers: ${JSON.stringify(hdrLog)}`);
+    }
     const dispatcher = proxyDispatcher(proxyUrl);
     const init: Omit<RequestInit, "dispatcher"> & { dispatcher?: object } = {
         method: req.method ?? "GET",
@@ -1073,6 +1080,14 @@ async function forward(
         if (UPSTREAM_HOP_HEADERS.has(k.toLowerCase())) return;
         respHeaders[k] = v;
     });
+    if (opts.debug) {
+        const respLog: Record<string, string> = {};
+        upstream.headers.forEach((v, k) => {
+            if (UPSTREAM_HOP_HEADERS.has(k.toLowerCase())) return;
+            respLog[k] = v.length > 300 ? v.slice(0, 300) + "..." : v;
+        });
+        log("info", `[${prepared?.session.id ?? "unknown"}] ← upstream response headers: ${JSON.stringify(respLog)}`);
+    }
     // P1.2: if the upstream returned a non-2xx (auth, rate-limit, context too
     // long, ...), do NOT route the error body through the SSE rewriter — it has
     // no SSE events and would be silently swallowed, leaving the client with

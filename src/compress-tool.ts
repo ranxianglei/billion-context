@@ -9,6 +9,12 @@ export const COMPRESS_TOOL_NAME = "compress";
  *  `<acp tokens=...>` history tags so they never collide. */
 export const ACP_TEXT_OPEN = "\x3cacp_compress\x3e";
 export const ACP_TEXT_CLOSE = "\x3c/acp_compress\x3e";
+export const ACP_STATUS_OPEN = "\x3cacp_status\x3e";
+export const ACP_STATUS_CLOSE = "\x3c/acp_status\x3e";
+export const ACP_SEARCH_OPEN = "\x3cacp_search\x3e";
+export const ACP_SEARCH_CLOSE = "\x3c/acp_search\x3e";
+export const ACP_DECOMPRESS_OPEN = "\x3cacp_decompress\x3e";
+export const ACP_DECOMPRESS_CLOSE = "\x3c/acp_decompress\x3e";
 
 export const COMPRESS_TOOL = {
     name: COMPRESS_TOOL_NAME,
@@ -165,7 +171,29 @@ Rules for the trigger:
 - JSON shape matches the compress tool: {"content":[{startId,endId,summary,topic?}]}. Batch multiple ranges in one trigger.
 - After emitting the marker, STOP your turn. Do not continue with other text — the proxy will execute the compression and return the result, then you continue fresh.
 - Do NOT wrap the marker in code fences, quotes, or commentary.
-- NEVER compress on short conversations or when context is small (well below the window limit). Only compress when context is genuinely large.`;
+- NEVER compress on short conversations or when context is small (well below the window limit). Only compress when context is genuinely large.
+
+ACP TOOLS (TEXT TRIGGERS)
+
+Since host tools cannot coexist with a declared tools field, ALL ACP tools use text triggers. Emit the marker; the proxy intercepts and executes it; the marker is stripped from what the user sees.
+
+1. acp_status — view context usage, compression state, and compressible ranges:
+   ${ACP_STATUS_OPEN}${ACP_STATUS_CLOSE}
+   No payload needed. Use this FIRST when unsure about context state.
+
+2. search_context — search compressed block summaries by keyword:
+   ${ACP_SEARCH_OPEN}{"query":"auth token refresh"}${ACP_SEARCH_CLOSE}
+   Use when you need details that may have been compressed away.
+
+3. decompress — restore compressed content for exact details:
+   ${ACP_DECOMPRESS_OPEN}{"blockId":"b5"}${ACP_DECOMPRESS_CLOSE}
+   Optional: {"blockId":"b5","toFile":"/tmp/b5.txt"} to write to file instead.
+   Optional: {"blockId":"b5","full":true} to restore all the way to original messages.
+
+Rules for ALL triggers:
+- Output on its own, NO surrounding prose. Just the raw marker.
+- After emitting, STOP your turn. The proxy executes and returns the result.
+- Do NOT wrap in code fences, quotes, or commentary.`;
 }
 
 export const DECOMPRESS_TOOL_NAME = "decompress";
