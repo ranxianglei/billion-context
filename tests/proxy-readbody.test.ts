@@ -12,22 +12,17 @@ test("readBody: returns buffer for a normal request", async () => {
     assert.equal(out.toString("utf8"), "hello");
 });
 
-test("readBody: rejects with BodyTooLargeError when body exceeds MAX_REQUEST_BYTES (no req.destroy)", async () => {
-    // Two chunks that together exceed MAX_REQUEST_BYTES. We emit the first
-    // (over-limit) chunk and expect a rejection of the right kind BEFORE any
-    // destroy would have run. The fix removed req.destroy() so the client
-    // connection stays open for handle() to write a 413.
+test("readBody: rejects with BodyTooLargeError AND destroys socket when body exceeds MAX_REQUEST_BYTES", async () => {
     const req = new EventEmitter();
     let destroyed = false;
     Object.defineProperty(req, "destroy", { value: () => { destroyed = true; }, configurable: true });
     const p = readBody(req as never);
-    // Emit a chunk large enough to trip the limit.
     (req as EventEmitter).emit("data", Buffer.alloc(MAX_REQUEST_BYTES + 1));
     await assert.rejects(p, (e: unknown) => {
         assert.ok(e instanceof BodyTooLargeError, `expected BodyTooLargeError, got ${(e as Error)?.constructor?.name}`);
         return true;
     });
-    assert.equal(destroyed, false, "req.destroy() must NOT be called (it cuts off the 413 response)");
+    assert.equal(destroyed, true, "req.destroy() must be called on over-limit (Bug C)");
 });
 
 test("readBody: BodyTooLargeError carries the limit", async () => {

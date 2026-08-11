@@ -145,9 +145,11 @@ function recordUsage(
     if (typeof prompt === "number") ctx.session.stats.inputTokens += prompt;
     ctx.session.stats.lastInputTokens =
         (typeof prompt === "number" ? prompt : 0) + (typeof cached === "number" ? cached : 0);
-    if (typeof cached === "number") ctx.session.stats.cachedTokens += cached;
+    if (typeof cached === "number") {
+        ctx.session.stats.cachedTokens += cached;
+        ctx.session.stats.cacheSamples += 1;
+    }
     if (typeof out === "number") ctx.session.stats.outputTokens += out;
-    ctx.session.stats.cacheSamples += 1;
     const hitPct =
         typeof prompt === "number" && typeof cached === "number" && prompt + cached > 0
             ? Math.round((cached / (prompt + cached)) * 100)
@@ -164,6 +166,7 @@ export async function* runCompressLoop(
     requestOptions: RequestOptions,
     adapter: CompressLoopAdapter,
     systemPrompt: string,
+    signal?: AbortSignal,
 ): AsyncGenerator<Buffer> {
     let activeClearTimer: (() => void) | null = null;
     let currentUpstream = upstream;
@@ -171,12 +174,14 @@ export async function* runCompressLoop(
 
     try {
         for (let round = 1; round <= MAX_LOOP_ROUNDS; round++) {
+            if (signal?.aborted) break;
             let assistantText = "";
             const calls: ToolCallEmit[] = [];
             let usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number } = {};
             let finishReason: string | undefined;
 
             for await (const ev of adapter.parseStream(currentUpstream, round)) {
+                if (signal?.aborted) break;
                 if (ev.kind === "text") {
                     assistantText += ev.delta;
                     if (!ctx.textProtocol && round === 1 && ev.raw) {
@@ -325,6 +330,8 @@ export async function* runCompressLoop(
 
             ctx.log(`[acp-loop] round ${round} saw mutating proxy tool; re-requesting`);
 
+            if (signal?.aborted) break;
+
             const newBody = adapter.buildRequest(coreMessages, systemPrompt, requestBody);
             if (process.env.ACP_DUMP_REQ !== "0" && ctx.debug) {
                 try {
@@ -335,12 +342,17 @@ export async function* runCompressLoop(
                     fs.writeFileSync(`${dumpDir}/req-${Date.now()}-${sid}-REREQUEST.json`, JSON.stringify(newBody, null, 2));
                 } catch { /* best-effort */ }
             }
-            const { response: resp, clearTimer } = await fetchWithTimeout(requestOptions.url, {
-                method: "POST",
-                headers: requestOptions.headers,
-                body: JSON.stringify(newBody),
-                ...(ctx.proxyUrl ? { dispatcher: proxyDispatcher(ctx.proxyUrl) } : {}),
-            });
+            const { response: resp, clearTimer } = await fetchWithTimeout(
+                requestOptions.url,
+                {
+                    method: "POST",
+                    headers: requestOptions.headers,
+                    body: JSON.stringify(newBody),
+                    ...(ctx.proxyUrl ? { dispatcher: proxyDispatcher(ctx.proxyUrl) } : {}),
+                },
+                undefined,
+                signal,
+            );
 
             if (!resp.ok || !resp.body) {
                 clearTimer();
