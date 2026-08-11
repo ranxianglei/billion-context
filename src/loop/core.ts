@@ -26,6 +26,7 @@ export interface LoopCtx {
     core: CompressionCore;
     config: Config;
     messages: CoreMessage[];
+    originalMessages: CoreMessage[];
     session: Session;
     log: (msg: string) => void;
     proxyUrl?: string;
@@ -168,6 +169,7 @@ export async function* runCompressLoop(
     let activeClearTimer: (() => void) | null = null;
     let currentUpstream = upstream;
     const coreMessages: CoreMessage[] = [...ctx.messages];
+    let originalCount = coreMessages.length;
 
     try {
         for (let round = 1; round <= MAX_LOOP_ROUNDS; round++) {
@@ -324,6 +326,36 @@ export async function* runCompressLoop(
             }
 
             ctx.log(`[acp-loop] round ${round} saw mutating proxy tool; re-requesting`);
+
+            // Re-prune between loop rounds (fix B for the multi-round stale-view
+            // bug): after a compress/decompress mutates state, re-run processTurn
+            // on the ORIGINAL (untagged) messages so newly-covered ranges are
+            // folded out and the nudge/compressible-ranges reflect the new state.
+            // Without this, round N+1 reuses round-1's coreMessages (the just-
+            // compressed range still raw + still listed) and the model re-targets
+            // it → applyCompression sees it covered → 0-char compress failures.
+            const stateChanged = proxyResults.some(pr => pr.name === "compress" || pr.name === "decompress");
+            if (stateChanged) {
+                try {
+                    const reTurn = ctx.core.processTurn({
+                        messages: ctx.originalMessages,
+                        state: ctx.session.state,
+                        config: ctx.config,
+                        tokenCount: ctx.session.stats.lastInputTokens,
+                        renderTags: "text-only",
+                    });
+                    ctx.session.state = reTurn.state;
+                    ctx.nudge = reTurn.nudge;
+                    const appended = coreMessages.slice(originalCount);
+                    const rePruned = reTurn.messages.filter(m => !(m.id ?? "").startsWith("acp_summary_"));
+                    coreMessages.length = 0;
+                    coreMessages.push(...rePruned, ...appended);
+                    originalCount = rePruned.length;
+                    ctx.log(`[acp-loop] round ${round} re-pruned ctx: ${rePruned.length} original + ${appended.length} round msgs`);
+                } catch (err) {
+                    ctx.log(`[acp-loop] round ${round} re-prune failed (stale view): ${String(err)}`);
+                }
+            }
 
             const newBody = adapter.buildRequest(coreMessages, systemPrompt, requestBody);
             if (process.env.ACP_DUMP_REQ !== "0" && ctx.debug) {
