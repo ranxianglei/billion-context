@@ -1,5 +1,5 @@
 import type { CoreMessage } from "acp-kernel";
-import { coreToResponses, injectResponsesDeveloperMessage } from "../responses.js";
+import { coreToResponses, injectResponsesDeveloperMessage, patchResponsesInput, type ResponseInputItem, type ResponsesProjection } from "../responses.js";
 import { buildVisibilityMarker } from "../compress-loop.js";
 import { ACP_TEXT_OPEN, ACP_TEXT_CLOSE, COMPRESS_TOOL_NAME } from "../compress-tool.js";
 import type { BiliMessage } from "../bili-message.js";
@@ -123,7 +123,7 @@ function buildCompleted(responseObj: Record<string, unknown> | null): Buffer {
     );
 }
 
-export function createResponsesAdapter(textProtocol?: boolean): CompressLoopAdapter {
+export function createResponsesAdapter(textProtocol?: boolean, projection?: ResponsesProjection): CompressLoopAdapter {
     const suppressTextLifecycle = !!textProtocol;
     let outputIndex = 0;
     let responseObj: Record<string, unknown> | null = null;
@@ -141,8 +141,19 @@ export function createResponsesAdapter(textProtocol?: boolean): CompressLoopAdap
                     if (id) customToolCallIds.add(id);
                 }
             }
-            const inputItems = coreToResponses(coreMessages, customToolCallIds);
-            const withDev = injectResponsesDeveloperMessage(inputItems, systemPrompt);
+            let inputItems: ResponseInputItem[];
+            if (projection) {
+                const rebuiltInput = patchResponsesInput(projection, coreMessages);
+                inputItems = typeof rebuiltInput === "string"
+                    ? [{ type: "message", role: "user", content: rebuiltInput }]
+                    : rebuiltInput;
+            } else {
+                inputItems = coreToResponses(coreMessages, customToolCallIds);
+            }
+            const devParts = projection && projection.systemParts.length > 0
+                ? [...projection.systemParts, systemPrompt]
+                : [systemPrompt];
+            const withDev = injectResponsesDeveloperMessage(inputItems, devParts.join("\n\n---\n\n"));
             const rebuilt: Record<string, unknown> = { ...requestBody, input: withDev };
             delete rebuilt.previous_response_id;
             delete rebuilt.instructions;

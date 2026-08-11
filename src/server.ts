@@ -27,6 +27,7 @@ import {
 import {
     type ResponsesRequestBody,
     type ResponseInputItem,
+    type ResponsesProjection,
     responsesToCore,
     patchResponsesInput,
     injectResponsesDeveloperMessage,
@@ -249,6 +250,8 @@ type Prepared = {
     compressInjected: boolean;
     responsesTextProtocol?: boolean;
     resetAfterSuccess?: boolean;
+    responsesProjection?: ResponsesProjection;
+    anthropicSystem?: AnthropicRequestBody["system"];
 };
 
 /** True if `addr` is a loopback (IPv4 127.x or IPv6 ::1 / ::ffff:127.0.0.1).
@@ -620,7 +623,7 @@ function prepareAnthropic(
 
     const rebuilt: AnthropicRequestBody = { ...parsed, messages: rebuiltMessages, system: systemOut, tools: toolsOut };
     markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "anthropic", stream, compressInjected: opts.compress.injectTool } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: opts.compress.injectTool } as Prepared;
 }
 
 function prepareOpenai(
@@ -730,6 +733,7 @@ function prepareResponses(
 
     let processedMessages: CoreMessage[] = [];
     let originalMessages: CoreMessage[] = [];
+    let responsesProjection: ResponsesProjection | undefined;
     let rebuiltInput: ResponseInputItem[] | string = parsed.input;
     let toolsOut = parsed.tools;
 
@@ -740,6 +744,7 @@ function prepareResponses(
 
     try {
         const projection = responsesToCore(parsed);
+        responsesProjection = projection;
         const { msgs } = projection;
         originalMessages = msgs;
         if (process.env.ACP_DEBUG) {
@@ -819,6 +824,7 @@ function prepareResponses(
         session,
         processedMessages,
         originalMessages,
+        responsesProjection,
         protocol: "responses",
         stream,
         compressInjected: shouldInject,
@@ -1146,7 +1152,7 @@ async function forward(
             reqHeaders["content-type"] = "application/json";
             const textProtocol = prepared.protocol === "responses" && !!prepared.responsesTextProtocol;
             const systemPrompt = textProtocol ? buildCompressTextSystemPrompt() : buildCompressSystemPrompt();
-            const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol);
+            const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem);
             const loop = runCompressLoop(
                 streamToRead,
                 { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, textProtocol, debug: opts.debug },
