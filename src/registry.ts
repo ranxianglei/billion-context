@@ -1,5 +1,5 @@
 import { readFile, writeFile, mkdir } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import path from "node:path";
 import { cacheDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
@@ -47,7 +47,7 @@ async function writeDiskCache(data: RegistryShape): Promise<void> {
 function diskCacheFresh(): boolean {
     if (!existsSync(CACHE_FILE)) return false;
     try {
-        const { mtimeMs } = require("node:fs").statSync(CACHE_FILE);
+        const { mtimeMs } = statSync(CACHE_FILE);
         return Date.now() - mtimeMs < TTL_MS;
     } catch {
         return false;

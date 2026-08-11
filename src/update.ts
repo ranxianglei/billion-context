@@ -306,14 +306,35 @@ async function installViaTarball(
         return { ok: false, error: `install dir not writable: ${installDir}` };
     }
 
-    // Download tarball
+    // Download tarball. Stream into memory with a hard size cap so a corrupt
+    // or malicious tarball cannot exhaust memory.
+    const MAX_TARBALL_BYTES = 100 * 1024 * 1024;
     let tgzBuffer: Buffer;
     try {
         const tgzRes = await fetch(tarballUrl, { signal: AbortSignal.timeout(60_000) });
         if (!tgzRes.ok) {
             return { ok: false, error: `tarball download failed: HTTP ${tgzRes.status} ${tgzRes.statusText}` };
         }
-        tgzBuffer = Buffer.from(await tgzRes.arrayBuffer());
+        if (!tgzRes.body) {
+            return { ok: false, error: "tarball download failed: empty response body" };
+        }
+        const reader = tgzRes.body.getReader();
+        const chunks: Uint8Array[] = [];
+        let total = 0;
+        try {
+            for (;;) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                total += value.byteLength;
+                if (total > MAX_TARBALL_BYTES) {
+                    return { ok: false, error: `tarball exceeds ${MAX_TARBALL_BYTES} byte cap` };
+                }
+                chunks.push(value);
+            }
+        } finally {
+            reader.releaseLock();
+        }
+        tgzBuffer = Buffer.concat(chunks);
     } catch (e) {
         return { ok: false, error: `tarball download failed: ${String(e)}` };
     }
