@@ -279,7 +279,12 @@ export async function* runCompressLoop(
                 yield adapter.emitToolCall(tc);
             }
 
-            const reRequest = proxyResults.length > 0 && realCalls === 0;
+            const compressOnly = proxyResults.length > 0 && proxyResults.every((p) => p.name === "compress");
+            const silentCompress = ctx.textProtocol && compressOnly && resolvedText.length > 0;
+            if (silentCompress) {
+                ctx.log(`[acp-loop] round ${round}: textProtocol compress applied silently (no re-request)`);
+            }
+            const reRequest = proxyResults.length > 0 && realCalls === 0 && !silentCompress;
             if (!reRequest) {
                 yield adapter.emitCompletion({ finishReason, usage });
                 return;

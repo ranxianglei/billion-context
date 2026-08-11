@@ -344,3 +344,38 @@ test("loop #10 (S3): upstream 500 mid-loop terminates cleanly (timer cleared, no
         globalThis.fetch = orig;
     }
 });
+
+test("loop #11: textProtocol compress WITH text → no re-request (silent compress, prevents task interruption)", async () => {
+    const ctx = makeCtx([
+        textMsg("m00001", "user", "hello"),
+        textMsg("m00002", "assistant", "hi"),
+    ]);
+    ctx.textProtocol = true;
+    const compressArgs = JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "s" }] });
+    const trigger = `\x3cacp_compress\x3e${compressArgs}\x3c/acp_compress\x3e`;
+    const round1 = [
+        sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+        sse("response.output_text.delta", { item_id: "msg_1", output_index: 0, delta: "Here is your result." }),
+        sse("response.output_text.delta", { item_id: "msg_1", output_index: 0, delta: trigger }),
+        COMPLETED,
+    ].join("");
+    let fetchCalls = 0;
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async () => {
+        fetchCalls++;
+        return new Response(COMPLETED, { status: 200 });
+    }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(round1, { status: 200 }).body!,
+            ctx,
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+            createResponsesAdapter(true),
+        );
+        assert.equal(fetchCalls, 0, "NO upstream re-request for textProtocol compress-with-text");
+        assert.ok(out.includes("Here is your result."), "model text delivered to client (trigger stripped)");
+    } finally {
+        globalThis.fetch = orig;
+    }
+});
