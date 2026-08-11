@@ -8,7 +8,12 @@ import {
     type CoreMessage,
 } from "acp-kernel";
 import type { Session } from "./session.js";
-import { parseCompressInput, PROXY_TOOL_NAMES } from "./compress-tool.js";
+import {
+    MUTATING_PROXY_TOOLS,
+    parseCompressInput,
+    PROXY_TOOL_NAMES,
+    READONLY_PROXY_TOOLS,
+} from "./compress-tool.js";
 import { applyRanges } from "./stream.js";
 import { resolveDecompress } from "./decompress-shared.js";
 import { fetchWithTimeout } from "./fetch-util.js";
@@ -334,8 +339,9 @@ export async function* compressLoopStream(
 
         const proxyCalls = toolCalls.filter((tc) => PROXY_TOOL_NAMES.has(tc.name));
         const realCalls = toolCalls.filter((tc) => !PROXY_TOOL_NAMES.has(tc.name));
-
-        const hasOnlyProxy = proxyCalls.length > 0 && realCalls.length === 0;
+        const mutatingProxy = proxyCalls.filter((tc) => MUTATING_PROXY_TOOLS.has(tc.name));
+        const readonlyProxy = proxyCalls.filter((tc) => READONLY_PROXY_TOOLS.has(tc.name));
+        const hasMutatingOnly = mutatingProxy.length > 0 && realCalls.length === 0;
 
         // Log cache-hit stats from the upstream usage object so we can measure
         // prefix-cache health on the OpenAI chat-completions path (GLM/zhipu).
@@ -358,7 +364,27 @@ export async function* compressLoopStream(
             }
         }
 
-        if (!hasOnlyProxy) {
+        if (!hasMutatingOnly) {
+            for (const tc of readonlyProxy) {
+                let args: Record<string, unknown> = {};
+                try {
+                    args = JSON.parse(tc.arguments) as Record<string, unknown>;
+                } catch {
+                    args = {};
+                }
+                let result: string;
+                try {
+                    result = executeProxyTool(tc.name, args, ctx);
+                } catch (e) {
+                    result = `[${tc.name} FAILED: ${e instanceof Error ? e.message : String(e)}]`;
+                }
+                const preview = result.length > 120 ? result.slice(0, 120) + "..." : result;
+                ctx.log(`[acp-proxy: ${tc.name} (${tc.id}) → ${preview.replace(/\n/g, " ")}]`);
+                yield Buffer.from(
+                    buildContentSse(responseId, model, buildVisibilityMarker(tc.name, result)),
+                    "utf8",
+                );
+            }
             for (const tc of realCalls) {
                 yield Buffer.from(buildToolCallSse(makeBase(), tc), "utf8");
             }

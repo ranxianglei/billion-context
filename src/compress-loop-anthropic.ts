@@ -6,7 +6,12 @@ import {
     type CoreMessage,
 } from "acp-kernel";
 import type { Session } from "./session.js";
-import { parseCompressInput, PROXY_TOOL_NAMES } from "./compress-tool.js";
+import {
+    MUTATING_PROXY_TOOLS,
+    parseCompressInput,
+    PROXY_TOOL_NAMES,
+    READONLY_PROXY_TOOLS,
+} from "./compress-tool.js";
 import { applyRanges } from "./stream.js";
 import { resolveDecompress } from "./decompress-shared.js";
 import { buildVisibilityMarker } from "./compress-loop.js";
@@ -264,9 +269,24 @@ export async function* compressLoopAnthropicStream(
             clientIndex = state.clientIndex;
 
             const proxyCalls = [...state.toolBlocks.values()].filter((b) => PROXY_TOOL_NAMES.has(b.name));
-            const hasOnlyProxy = proxyCalls.length > 0 && !hasRealToolUse;
+            const mutatingProxy = proxyCalls.filter((b) => MUTATING_PROXY_TOOLS.has(b.name));
+            const readonlyProxy = proxyCalls.filter((b) => READONLY_PROXY_TOOLS.has(b.name));
+            const hasMutatingOnly = mutatingProxy.length > 0 && !hasRealToolUse;
 
-            if (!hasOnlyProxy) {
+            if (!hasMutatingOnly) {
+                for (const tc of readonlyProxy) {
+                    const args = safeParse(tc.json);
+                    let result: string;
+                    try {
+                        result = executeProxyTool(tc.name, args, ctx);
+                    } catch (e) {
+                        result = `[${tc.name} FAILED: ${e instanceof Error ? e.message : String(e)}]`;
+                    }
+                    const preview = result.length > 120 ? result.slice(0, 120) + "..." : result;
+                    ctx.log(`[acp-proxy: ${tc.name} (${tc.id}) → ${preview.replace(/\n/g, " ")}]`);
+                    yield Buffer.from(buildTextBlockSse(clientIndex, buildVisibilityMarker(tc.name, result)), "utf8");
+                    clientIndex++;
+                }
                 const stop = hasRealToolUse ? "tool_use" : (roundStopReason ?? "end_turn");
                 yield Buffer.from(buildTerminalSse(stop, totalOutputTokens, totalInputTokens, totalCachedTokens, messageId, model), "utf8");
                 return;
