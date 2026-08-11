@@ -186,27 +186,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
     const port = parseInt(env.ACP_PORT ?? env.PORT ?? `${fileConfig.port ?? 8787}`, 10);
     const host = env.ACP_HOST ?? fileConfig.host ?? "127.0.0.1";
     const upstream = (env.ACP_UPSTREAM ?? fileConfig.upstream ?? "https://api.anthropic.com").replace(/\/$/, "");
-    let routes: ProviderRoutes = {};
-    // Routes: explicit env path > config file providers > none.
-    const routesPath = env.ACP_PROVIDERS ?? fileConfig.providersPath ?? "";
-    if (routesPath) {
-        const parsed = safeReadJson(routesPath);
-        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-            for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
-                rejectLegacyRoute(k, v);
-                const route = parseRouteEntry(v);
-                if (route) routes[normalizeUrlKey(k)] = route;
-            }
-        }
-    }
-    // Also accept providers inline in the config file.
-    if (fileConfig.providers) {
-        for (const [k, v] of Object.entries(fileConfig.providers)) {
-            rejectLegacyRoute(k, v);
-            const route = parseRouteEntry(v);
-            if (route && !routes[normalizeUrlKey(k)]) routes[normalizeUrlKey(k)] = route;
-        }
-    }
+    const routes = loadRoutes(env);
     const modelContextLimit = parseInt(env.ACP_MODEL_CONTEXT_LIMIT ?? `${fileConfig.modelContextLimit ?? 200000}`, 10);
     const biliProxy = nonEmpty(env.BILI_UPSTREAM_PROXY);
     const webProxy = nonEmpty(fileConfig.upstreamProxy);
