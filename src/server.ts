@@ -1136,7 +1136,7 @@ async function forward(
         // emitStreamError sends a protocol-appropriate error + finish so the
         // client ends cleanly instead of seeing a bare truncated stream.
         try {
-        if (process.env.ACP_LOOP_V2 === "1") {
+        if (process.env.ACP_LOOP_V2 !== "0") {
             const parsedReq = JSON.parse(typeof body === "string" ? body : body.toString("utf8"));
             const reqHeaders: Record<string, string> = {};
             for (const [k, v] of Object.entries(headers)) {
