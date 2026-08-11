@@ -27,6 +27,7 @@ import {
 import {
     type ResponsesRequestBody,
     type ResponseInputItem,
+    type ResponsesProjection,
     responsesToCore,
     patchResponsesInput,
     injectResponsesDeveloperMessage,
@@ -249,6 +250,7 @@ type Prepared = {
     compressInjected: boolean;
     responsesTextProtocol?: boolean;
     resetAfterSuccess?: boolean;
+    responsesProjection?: ResponsesProjection;
 };
 
 /** True if `addr` is a loopback (IPv4 127.x or IPv6 ::1 / ::ffff:127.0.0.1).
@@ -730,6 +732,7 @@ function prepareResponses(
 
     let processedMessages: CoreMessage[] = [];
     let originalMessages: CoreMessage[] = [];
+    let responsesProjection: ResponsesProjection | undefined;
     let rebuiltInput: ResponseInputItem[] | string = parsed.input;
     let toolsOut = parsed.tools;
 
@@ -740,6 +743,7 @@ function prepareResponses(
 
     try {
         const projection = responsesToCore(parsed);
+        responsesProjection = projection;
         const { msgs } = projection;
         originalMessages = msgs;
         if (process.env.ACP_DEBUG) {
@@ -819,6 +823,7 @@ function prepareResponses(
         session,
         processedMessages,
         originalMessages,
+        responsesProjection,
         protocol: "responses",
         stream,
         compressInjected: shouldInject,
@@ -1146,7 +1151,7 @@ async function forward(
             reqHeaders["content-type"] = "application/json";
             const textProtocol = prepared.protocol === "responses" && !!prepared.responsesTextProtocol;
             const systemPrompt = textProtocol ? buildCompressTextSystemPrompt() : buildCompressSystemPrompt();
-            const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol);
+            const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection);
             const loop = runCompressLoop(
                 streamToRead,
                 { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, textProtocol, debug: opts.debug },

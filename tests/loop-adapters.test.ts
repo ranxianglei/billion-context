@@ -6,6 +6,8 @@ import type { Session } from "../src/session.ts";
 import { runCompressLoop, createOpenaiAdapter, createAnthropicAdapter, createResponsesAdapter } from "../src/loop/index.ts";
 import type { ParsedStreamEvent } from "../src/loop/index.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
+import { responsesToCore } from "../src/responses.ts";
+import type { ResponsesRequestBody } from "../src/responses.ts";
 
 function makeCtx(id: string, messages: CoreMessage[] = []): {
     core: ReturnType<typeof createCore>;
@@ -431,4 +433,32 @@ test("F5: responses empty upstream → emitCompletion produces response.failed (
         !out.includes("event: response.completed"),
         "emitCompletion does NOT fabricate response.completed on empty upstream",
     );
+});
+
+test("F6: responses buildRequest preserves instructions + additional_tools prefix (codex prefix-cache fix)", () => {
+    const body = {
+        instructions: "AGENTS_MD_RULES",
+        input: [
+            { type: "additional_tools", name: "shell", tools: [{ type: "function", name: "shell", parameters: {} }] },
+            { type: "message", role: "user", content: "hello codex" },
+        ],
+        stream: true,
+    } as unknown as ResponsesRequestBody;
+    const projection = responsesToCore(body);
+    assert.ok(projection.systemParts.includes("AGENTS_MD_RULES"), "instructions lifted into systemParts");
+    assert.ok(projection.preamble.some((i) => i.type === "additional_tools"), "additional_tools captured as preamble");
+
+    const systemPrompt = buildCompressSystemPrompt();
+    const adapter = createResponsesAdapter(false, projection);
+    const rebuilt = adapter.buildRequest(projection.msgs, systemPrompt, body) as Record<string, unknown>;
+    const input = rebuilt.input as Array<Record<string, unknown>>;
+
+    assert.equal(!("instructions" in rebuilt), true, "top-level instructions stripped (responses_lite contract)");
+    assert.equal(!("previous_response_id" in rebuilt), true, "previous_response_id stripped");
+
+    assert.equal(input[0]?.type, "additional_tools", "additional_tools stays at input[0] (preamble preserved)");
+    const dev = input.find((i) => i.role === "developer");
+    assert.ok(dev, "developer message present");
+    assert.ok(typeof dev?.content === "string" && dev.content.includes("AGENTS_MD_RULES"), "developer includes original instructions (systemParts) — matches round-1 prefix");
+    assert.ok(typeof dev?.content === "string" && dev.content.includes(systemPrompt), "developer includes compress prompt");
 });
