@@ -26,7 +26,6 @@ export interface LoopCtx {
     core: CompressionCore;
     config: Config;
     messages: CoreMessage[];
-    originalMessages: CoreMessage[];
     session: Session;
     log: (msg: string) => void;
     proxyUrl?: string;
