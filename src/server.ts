@@ -393,9 +393,6 @@ async function handle(
     let bodyBuffer: Buffer;
     try {
         bodyBuffer = await readBody(req);
-        const decoded = await decodeRequestBody(headerValue(req, "content-encoding"), bodyBuffer, MAX_REQUEST_BYTES);
-        bodyBuffer = decoded.body;
-        if (decoded.decoded) delete req.headers["content-encoding"];
     } catch (err) {
         if (err instanceof BodyTooLargeError) {
             log("warn", `413: request body exceeds ${err.limit} bytes`);
@@ -403,7 +400,7 @@ async function handle(
             res.end(JSON.stringify({ error: { type: "request_too_large", message: err.message } }));
             return;
         }
-        log("warn", `read/decode body failed: ${String(err)}`);
+        log("warn", `read body failed: ${String(err)}`);
         res.writeHead(400, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: { type: "invalid_request", message: String(err) } }));
         return;
@@ -413,7 +410,6 @@ async function handle(
     // `/v1/responses?foo=1` must still be detected as the responses protocol.
     const urlPath = url.split("?", 2)[0];
     const responsesCompact = urlPath.endsWith("/responses/compact");
-    const countTokens = isCountTokensRequest(req.method ?? "GET", urlPath, bodyBuffer.length > 0);
     const route = resolveUpstream(opts, req.url ?? "", req);
     const upstreamOrigin = route ? route.upstream : opts.upstream;
     const protocol: "anthropic" | "openai" | "responses" | null =
@@ -427,6 +423,27 @@ async function handle(
                     ? "responses"
                     : null
             : null);
+    // Issue #99: decode body only for known protocols — passthrough requests
+    // (e.g. GET /models) must forward raw bytes without content-encoding decode.
+    if (protocol !== null && bodyBuffer.length > 0) {
+        try {
+            const decoded = await decodeRequestBody(headerValue(req, "content-encoding"), bodyBuffer, MAX_REQUEST_BYTES);
+            bodyBuffer = decoded.body;
+            if (decoded.decoded) delete req.headers["content-encoding"];
+        } catch (err) {
+            if (err instanceof BodyTooLargeError) {
+                log("warn", `413: decoded body exceeds ${err.limit} bytes`);
+                res.writeHead(413, { "content-type": "application/json" });
+                res.end(JSON.stringify({ error: { type: "request_too_large", message: err.message } }));
+                return;
+            }
+            log("warn", `decode body failed: ${String(err)}`);
+            res.writeHead(400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: { type: "invalid_request", message: String(err) } }));
+            return;
+        }
+    }
+    const countTokens = isCountTokensRequest(req.method ?? "GET", urlPath, bodyBuffer.length > 0);
     // Per-request context limit: look up body.model against the per-route model
     // declaration in providers.json first (same model can have different
     // windows behind different relays), then the built-in table. Falls back to
