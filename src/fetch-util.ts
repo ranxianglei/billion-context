@@ -26,14 +26,28 @@ export type FetchOptions = Omit<RequestInit, "dispatcher"> & { dispatcher?: obje
  *  otherwise the timer correctly fires and aborts a stuck stream.
  *
  *  `opts.dispatcher` (optional) routes the fetch through an upstream proxy
- *  (an `undici.ProxyAgent`). When omitted, fetch uses its default agent. */
+ *  (an `undici.ProxyAgent`). When omitted, fetch uses its default agent.
+ *
+ *  `externalSignal` (optional) lets the caller abort the in-flight request
+ *  independently of the timeout — e.g. when the downstream client disconnects.
+ *  When it fires, the internal controller aborts as well, which (a) cancels
+ *  any pending fetch and (b) frees the body stream promptly. */
 export async function fetchWithTimeout(
     url: string,
     opts: FetchOptions,
     timeoutMs: number = UPSTREAM_TIMEOUT_MS,
+    externalSignal?: AbortSignal,
 ): Promise<{ response: Response; clearTimer: () => void }> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
+    let onExternalAbort: (() => void) | null = null;
+    if (externalSignal) {
+        if (externalSignal.aborted) controller.abort();
+        else {
+            onExternalAbort = () => controller.abort();
+            externalSignal.addEventListener("abort", onExternalAbort, { once: true });
+        }
+    }
     try {
         const finalOpts: Omit<RequestInit, "dispatcher"> & { dispatcher?: object } = { ...opts, signal: controller.signal };
         // `fetch` is undici's global; it accepts `dispatcher` at runtime. @types/node
@@ -42,9 +56,16 @@ export async function fetchWithTimeout(
         // Dispatcher — but at runtime they're the same thing. Assert to the
         // concrete RequestInit type (no `as any`) to satisfy the call site.
         const response = await fetch(url, finalOpts as RequestInit);
-        return { response: response as Response, clearTimer: () => clearTimeout(timer) };
+        return {
+            response: response as Response,
+            clearTimer: () => {
+                clearTimeout(timer);
+                if (onExternalAbort && externalSignal) externalSignal.removeEventListener("abort", onExternalAbort);
+            },
+        };
     } catch (e) {
         clearTimeout(timer);
+        if (onExternalAbort && externalSignal) externalSignal.removeEventListener("abort", onExternalAbort);
         throw e;
     }
 }
