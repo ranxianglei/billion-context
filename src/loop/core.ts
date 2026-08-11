@@ -274,7 +274,7 @@ export async function* runCompressLoop(
                     if (ctx.textProtocol) {
                         coreMessages.push({
                             id: `acp_loop_r${round}_marker_${pr.callId}`,
-                            role: "user",
+                            role: "system",
                             contentType: "text",
                             text: buildVisibilityMarker(pr.name, pr.result),
                         });
