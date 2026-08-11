@@ -46,10 +46,10 @@ Three ways to use it — pick one:
 
 - **Launcher (no config-file edits):** run `bili pi`, `bili codex`, or
   `bili claude` and billion-context brings up a proxy on an independent port,
-  then launches the client pointed at it via `HTTPS_PROXY` + the proxy's MITM
-  CA. Your existing client config is untouched — HTTPS upstreams are discovered
-  and auto-whitelisted for TLS interception; HTTP/localhost providers go direct.
-  See **Option 0** below.
+  then launches the client pointed at it. Both schemes are auto-proxied with no
+  config edits: HTTPS upstreams via `HTTPS_PROXY` + the proxy's MITM CA
+  (whitelisted for TLS interception), HTTP upstreams via a `/bili/` baseURL
+  rewrite (cert MITM can't intercept plaintext). See **Option 0** below.
 - **Zero-config (simplest):** prefix your client's baseURL with the proxy
   origin + `/bili/`. No config file needed — context windows are auto-detected
   from the [models.dev](https://models.dev) registry. The `/bili/` prefix also
@@ -100,12 +100,20 @@ the client's own config, so whatever you already have set up keeps working:
 | Claude Code | hardcoded `api.anthropic.com` (no per-config upstream) |
 
 Only **HTTPS** hosts are MITM'd (a self-signed CA can't intercept plaintext
-anyway). HTTP / `localhost` / `127.0.0.1` providers go direct — the proxy
-tunnels them untouched. The MITM CA cert is the proxy's own root
-(`~/.local/share/billion-context/ca/root-ca.pem`, generated lazily), so the
-client must trust it; pi/claude honor `NODE_EXTRA_CA_CERTS`, codex honors
-`SSL_CERT_FILE`. Compression is injected on the intercepted TLS stream via the
-existing MITM pipeline.
+anyway); HTTP / `localhost` / `127.0.0.1` providers used to go direct, but are
+now auto-proxied too. Both schemes are covered with no config edits:
+
+- **HTTPS upstreams → cert MITM.** The MITM CA cert is the proxy's own root
+  (`~/.local/share/billion-context/ca/root-ca.pem`, generated lazily); the
+  client must trust it — pi/claude honor `NODE_EXTRA_CA_CERTS`, codex honors
+  `SSL_CERT_FILE`. Compression is injected on the intercepted TLS stream.
+- **HTTP upstreams → `/bili/` baseURL rewrite** (since plaintext can't be
+  MITM'd). The launcher rewrites the client's base URL through the client's own
+  mechanism, leaving its config files untouched: codex via `-c key=value` flags,
+  claude via the `ANTHROPIC_BASE_URL` env var, pi via an isolated
+  `PI_CODING_AGENT_DIR` pointing at a temp copy of the pi home with a rewritten
+  `models.json` (`auth.json` and the rest are symlinked through unchanged; the
+  temp dir is removed when the client exits).
 
 `--mitm-domain <domain>` (repeatable) adds extra domains to the whitelist
 beyond what auto-discovery finds — useful for hosts the client fetches at

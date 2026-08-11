@@ -14,8 +14,12 @@ import {
     buildPiEnv,
     buildCodexEnv,
     buildClaudeEnv,
+    buildCodexArgs,
+    preparePiHttpRewrite,
+    resolvePiHome,
     extractDomains,
     discoverDomains,
+    discoverRoutes,
     resolveCaCertPath,
     resolveClientCommand,
     isOnPath,
@@ -26,6 +30,7 @@ import {
     type SpawnChild,
     type SpawnFn,
     type ClientConfig,
+    type HttpRewrite,
 } from "../src/launcher.ts";
 
 test("isLaunchClient: pi/claude/codex true, others false", () => {
@@ -87,7 +92,7 @@ test("buildCodexEnv: sets HTTPS_PROXY + SSL_CERT_FILE, preserves baseEnv", () =>
 });
 
 test("buildClaudeEnv: sets HTTPS_PROXY + NODE_EXTRA_CA_CERTS, preserves baseEnv", () => {
-    const env = buildClaudeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", { PATH: "/usr/bin", ANTHROPIC_API_KEY: "sk-x" });
+    const env = buildClaudeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", [], { PATH: "/usr/bin", ANTHROPIC_API_KEY: "sk-x" });
     assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
     assert.equal(env.NODE_EXTRA_CA_CERTS, "/tmp/ca.pem");
     assert.equal(env.PATH, "/usr/bin");
@@ -358,4 +363,170 @@ test("resolveClientCommand: pi falls back to node + cli.js when not on PATH and 
     assert.equal(r.command, process.execPath);
     assert.equal(r.prefixArgs.length, 1);
     assert.ok(r.prefixArgs[0].endsWith("pi-coding-agent/dist/cli.js"));
+});
+
+test("resolvePiHome: PI_CODING_AGENT_DIR > PI_HOME > default ~/.pi/agent", () => {
+    const h = os.homedir();
+    assert.equal(resolvePiHome({ PI_CODING_AGENT_DIR: "/custom/dir" }), "/custom/dir");
+    assert.equal(resolvePiHome({ PI_HOME: "/pi/home" }), "/pi/home");
+    assert.equal(resolvePiHome({ PI_CODING_AGENT_DIR: "/a", PI_HOME: "/b" }), "/a");
+    assert.equal(resolvePiHome({}), path.join(h, ".pi", "agent"));
+    assert.equal(resolvePiHome({ PI_CODING_AGENT_DIR: "  ", PI_HOME: "/b" }), "/b");
+});
+
+test("discoverRoutes: codex mixed http+https → splits httpsDomains + httpRewrites", () => {
+    const config: ClientConfig = {
+        codex: {
+            openaiBaseUrl: "https://chatgpt.com/backend-api/codex",
+            providers: {
+                openai: { baseUrl: "https://api.openai.com/v1" },
+                relay: { baseUrl: "http://relay.local/v1" },
+            },
+        },
+    };
+    const routes = discoverRoutes("codex", config);
+    assert.deepEqual(routes.httpsDomains, ["api.openai.com", "chatgpt.com"]);
+    assert.deepEqual(routes.httpRewrites, [
+        { key: "model_providers.relay.base_url", realUpstream: "http://relay.local/v1" },
+    ]);
+});
+
+test("discoverRoutes: codex wrapped /bili/ http provider → unwrapped realUpstream", () => {
+    const config: ClientConfig = {
+        codex: {
+            providers: {
+                relay: { baseUrl: "http://127.0.0.1:8787/bili/http://relay.local/v1" },
+            },
+        },
+    };
+    const routes = discoverRoutes("codex", config);
+    assert.deepEqual(routes.httpsDomains, []);
+    assert.deepEqual(routes.httpRewrites, [
+        { key: "model_providers.relay.base_url", realUpstream: "http://relay.local/v1" },
+    ]);
+});
+
+test("discoverRoutes: claude with http ANTHROPIC_BASE_URL → httpRewrites entry, no https domains", () => {
+    const config: ClientConfig = {
+        claude: { anthropicBaseUrl: "http://relay.local/anthropic" },
+    };
+    const routes = discoverRoutes("claude", config);
+    assert.deepEqual(routes.httpsDomains, []);
+    assert.deepEqual(routes.httpRewrites, [
+        { key: "ANTHROPIC_BASE_URL", realUpstream: "http://relay.local/anthropic" },
+    ]);
+});
+
+test("discoverRoutes: claude default → api.anthropic.com in httpsDomains, no rewrites", () => {
+    const routes = discoverRoutes("claude", {});
+    assert.deepEqual(routes.httpsDomains, ["api.anthropic.com"]);
+    assert.deepEqual(routes.httpRewrites, []);
+});
+
+test("discoverRoutes: pi with one http provider → rewrite keyed by provider name", () => {
+    const config: ClientConfig = {
+        pi: {
+            providers: {
+                zhipu: { baseUrl: "https://open.bigmodel.cn/api/coding/paas/v4" },
+                local: { baseUrl: "http://127.0.0.1:18081" },
+            },
+        },
+    };
+    const routes = discoverRoutes("pi", config);
+    assert.deepEqual(routes.httpsDomains, ["open.bigmodel.cn"]);
+    assert.deepEqual(routes.httpRewrites, [
+        { key: "local", realUpstream: "http://127.0.0.1:18081" },
+    ]);
+});
+
+test("discoverRoutes: empty config → {httpsDomains:[], httpRewrites:[]}", () => {
+    assert.deepEqual(discoverRoutes("pi", {}), { httpsDomains: [], httpRewrites: [] });
+    assert.deepEqual(discoverRoutes("codex", {}), { httpsDomains: [], httpRewrites: [] });
+});
+
+test("buildCodexArgs: emits -c pairs for each http rewrite, then extra args", () => {
+    const rewrites: HttpRewrite[] = [
+        { key: "k1", realUpstream: "u1" },
+        { key: "k2", realUpstream: "u2" },
+    ];
+    assert.deepEqual(buildCodexArgs("http://h:p", rewrites, ["--extra"]), [
+        "-c", "k1=http://h:p/bili/u1",
+        "-c", "k2=http://h:p/bili/u2",
+        "--extra",
+    ]);
+});
+
+test("buildCodexArgs: no rewrites → just extra args", () => {
+    assert.deepEqual(buildCodexArgs("http://h:p", [], ["--foo"]), ["--foo"]);
+});
+
+test("buildClaudeEnv: ANTHROPIC_BASE_URL rewrite sets env + keeps HTTPS_PROXY/CA", () => {
+    const rewrites: HttpRewrite[] = [
+        { key: "ANTHROPIC_BASE_URL", realUpstream: "http://relay.local/anthropic" },
+    ];
+    const env = buildClaudeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", rewrites, { PATH: "/usr/bin" });
+    assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
+    assert.equal(env.NODE_EXTRA_CA_CERTS, "/tmp/ca.pem");
+    assert.equal(env.ANTHROPIC_BASE_URL, "http://127.0.0.1:8787/bili/http://relay.local/anthropic");
+});
+
+test("buildClaudeEnv: no ANTHROPIC_BASE_URL rewrite → env.ANTHROPIC_BASE_URL unset", () => {
+    const env = buildClaudeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", [], { PATH: "/usr/bin" });
+    assert.equal(env.ANTHROPIC_BASE_URL, undefined);
+    assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
+});
+
+test("preparePiHttpRewrite: rewrites matching provider, leaves others, symlinks siblings", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-pihome-"));
+    fs.writeFileSync(
+        path.join(home, "models.json"),
+        JSON.stringify({
+            providers: {
+                a: { baseUrl: "http://example.com/v1" },
+                b: { baseUrl: "https://secure.example.com" },
+            },
+        }),
+    );
+    fs.writeFileSync(path.join(home, "auth.json"), '{"key":"x"}');
+    const tmp = preparePiHttpRewrite(home, "http://127.0.0.1:8787", [
+        { key: "a", realUpstream: "http://example.com/v1" },
+    ]);
+    try {
+        assert.ok(typeof tmp === "string" && tmp.length > 0);
+        const out = JSON.parse(fs.readFileSync(path.join(tmp!, "models.json"), "utf8"));
+        assert.equal(out.providers.a.baseUrl, "http://127.0.0.1:8787/bili/http://example.com/v1");
+        assert.equal(out.providers.b.baseUrl, "https://secure.example.com");
+        assert.equal(fs.lstatSync(path.join(tmp!, "auth.json")).isSymbolicLink(), true);
+        assert.equal(fs.realpathSync(path.join(tmp!, "auth.json")), path.join(home, "auth.json"));
+    } finally {
+        if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("preparePiHttpRewrite: returns undefined when no rewrites", () => {
+    assert.equal(preparePiHttpRewrite("/whatever", "http://127.0.0.1:8787", []), undefined);
+});
+
+test("preparePiHttpRewrite: returns undefined when models.json missing or unparseable", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-pihome-"));
+    const rw: HttpRewrite[] = [{ key: "a", realUpstream: "http://x/v1" }];
+    try {
+        assert.equal(preparePiHttpRewrite(home, "http://127.0.0.1:8787", rw), undefined);
+        fs.writeFileSync(path.join(home, "models.json"), "not-json{");
+        assert.equal(preparePiHttpRewrite(home, "http://127.0.0.1:8787", rw), undefined);
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("preparePiHttpRewrite: returns undefined when models.json is not an object", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-pihome-"));
+    const rw: HttpRewrite[] = [{ key: "a", realUpstream: "http://x/v1" }];
+    try {
+        fs.writeFileSync(path.join(home, "models.json"), JSON.stringify([1, 2, 3]));
+        assert.equal(preparePiHttpRewrite(home, "http://127.0.0.1:8787", rw), undefined);
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+    }
 });
