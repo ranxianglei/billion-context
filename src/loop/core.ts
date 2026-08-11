@@ -1,10 +1,12 @@
 import {
     buildStatusReport,
     estimateTokensFast,
+    formatRanges,
     hideConsumedCompressCalls,
     type CompressionCore,
     type Config,
     type CoreMessage,
+    type NudgeDecision,
 } from "acp-kernel";
 import type { Session } from "../session.js";
 import {
@@ -29,6 +31,7 @@ export interface LoopCtx {
     proxyUrl?: string;
     textProtocol?: boolean;
     debug?: boolean;
+    nudge?: NudgeDecision;
 }
 
 export interface RequestOptions {
@@ -100,9 +103,35 @@ export function executeProxyTool(
         return `Found ${blocks.length} block(s) for "${query}":\n\n${lines.join("\n\n")}`;
     }
     if (toolName === "acp_status") {
-        return buildStatusReport(ctx.session.state, ctx.messages, estimateTokensFast);
+        return handleAcpStatus(args, ctx);
     }
     return `[Unknown proxy tool: ${toolName}]`;
+}
+
+// Aligns with billion-context-pi's handleStatus: appends compressible ranges
+// to the default overview so the model picks valid refs (else it guesses
+// covered/protected refs → 0-char compress failures).
+function handleAcpStatus(args: Record<string, unknown>, ctx: LoopCtx): string {
+    const scope = typeof args.scope === "string" ? (args.scope as "compressed" | "uncompressed") : undefined;
+    const view = typeof args.view === "string" ? (args.view as "ranges" | "messages") : undefined;
+    const tool = typeof args.tool === "string" ? args.tool : undefined;
+    const sort = typeof args.sort === "string" ? (args.sort as "size" | "time" | "tool" | "age") : undefined;
+    const limit = typeof args.limit === "number" ? args.limit : undefined;
+    const base = buildStatusReport(ctx.session.state, ctx.messages, estimateTokensFast, { scope, view, tool, sort, limit });
+    if (scope) return base;
+    const nudge = ctx.nudge;
+    const ranges = nudge?.compressibleRanges ?? [];
+    const protectedRanges = nudge?.protectedRanges ?? [];
+    const extra: string[] = [];
+    if (nudge) {
+        extra.push("");
+        extra.push(nudge.shouldInject ? `Nudge: ACTIVE — ${nudge.reason}` : `Nudge: idle — ${nudge.reason}`);
+    }
+    if (ranges.length > 0 || protectedRanges.length > 0) {
+        extra.push("");
+        extra.push(formatRanges(ranges, protectedRanges));
+    }
+    return extra.length > 0 ? `${base}\n${extra.join("\n")}` : base;
 }
 
 function recordUsage(
