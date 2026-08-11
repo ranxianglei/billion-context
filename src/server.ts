@@ -514,27 +514,30 @@ async function handle(
             ? responsesIdentity.value
             : clientConversationHeader(req.headers);
         const session = getSession(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? undefined });
-        // Serialize per-session: prepare (processTurn mutates state) + forward
-        // (stream rewriter mutates state via compress/decompress) must not
-        // interleave across concurrent requests on the same session.
-        await withSessionLock(session, async () => {
-            prepared =
-                countTokens
-                    ? prepareCountTokens(parsed as AnthropicRequestBody, core, reqConfig, log, session)
-                    : protocol === "anthropic"
-                      ? prepareAnthropic(parsed as AnthropicRequestBody, req, opts, core, reqConfig, log, session)
-                      : protocol === "openai"
-                        ? prepareOpenai(parsed as OpenAIRequestBody, req, opts, core, reqConfig, log, session)
-                        : responsesCompact
-                          ? prepareResponsesCompact(bodyBuffer, parsed as ResponsesRequestBody, session)
-                          : prepareResponses(parsed as ResponsesRequestBody, req, opts, core, reqConfig, log, session, responsesIdentity!);
-            acquireInFlight(session);
-            try {
+        // acquireInFlight must precede the lock so evictOldest() cannot flush
+        // this session between getSession and lock acquisition (inFlight===0
+        // window). Released in the outer finally after forward completes.
+        acquireInFlight(session);
+        try {
+            // Serialize per-session: prepare (processTurn mutates state) + forward
+            // (stream rewriter mutates state via compress/decompress) must not
+            // interleave across concurrent requests on the same session.
+            await withSessionLock(session, async () => {
+                prepared =
+                    countTokens
+                        ? prepareCountTokens(parsed as AnthropicRequestBody, core, reqConfig, log, session)
+                        : protocol === "anthropic"
+                          ? prepareAnthropic(parsed as AnthropicRequestBody, req, opts, core, reqConfig, log, session)
+                          : protocol === "openai"
+                            ? prepareOpenai(parsed as OpenAIRequestBody, req, opts, core, reqConfig, log, session)
+                            : responsesCompact
+                              ? prepareResponsesCompact(bodyBuffer, parsed as ResponsesRequestBody, session)
+                              : prepareResponses(parsed as ResponsesRequestBody, req, opts, core, reqConfig, log, session, responsesIdentity!);
                 await forward(req, res, opts, prepared!.body, prepared!, core, reqConfig, log, route, affinity);
-            } finally {
-                releaseInFlight(session);
-            }
-        });
+            });
+        } finally {
+            releaseInFlight(session);
+        }
     }
     if (!prepared) {
         if (protocol === null && !opts.passthrough) {
@@ -1194,6 +1197,10 @@ async function forward(
             const textProtocol = prepared.protocol === "responses" && !!prepared.responsesTextProtocol;
             const systemPrompt = textProtocol ? buildCompressTextSystemPrompt() : buildCompressSystemPrompt();
             const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem);
+            const abortCtrl = new AbortController();
+            req.on("close", () => {
+                if (!res.writableEnded) abortCtrl.abort();
+            });
             const loop = runCompressLoop(
                 streamToRead,
                 { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, textProtocol, debug: opts.debug, nudge: prepared.nudge },
@@ -1201,6 +1208,7 @@ async function forward(
                 { url: upstreamUrl, headers: reqHeaders },
                 adapter,
                 systemPrompt,
+                abortCtrl.signal,
             );
             for await (const chunk of loop) {
                 {
@@ -1210,7 +1218,13 @@ async function forward(
                     }
                 }
                 res.write(chunk);
-                if (res.writableNeedDrain) await new Promise<void>((r) => res.once("drain", () => r()));
+                if (res.writableNeedDrain) {
+                    await Promise.race([
+                        new Promise<void>((r) => res.once("drain", () => r())),
+                        new Promise<void>((r) => res.once("close", () => r())),
+                    ]);
+                }
+                if (res.destroyed || res.writableEnded) break;
             }
             res.end();
         } catch (e) {
@@ -1382,9 +1396,10 @@ function headerValue(req: http.IncomingMessage, name: string): string | undefine
     return undefined;
 }
 
-/** A thrown BodyTooLargeError lets handle() respond 413 cleanly before
- *  destroying the request. Avoids a bare req.destroy() that would reject
- *  readBody but leave the client connection with no HTTP response. */
+/** Thrown by readBody when the request body exceeds MAX_REQUEST_BYTES.
+ *  handle() catches this and attempts a 413 response; readBody also destroys
+ *  the request socket so a client that keeps streaming a pathological body
+ *  cannot hold the connection open. */
 export class BodyTooLargeError extends Error {
     constructor(public readonly limit: number) {
         super(`request body exceeds ${limit} bytes`);
@@ -1402,9 +1417,7 @@ export function readBody(req: http.IncomingMessage): Promise<Buffer> {
             size += c.length;
             if (size > MAX_REQUEST_BYTES) {
                 aborted = true;
-                // Reject FIRST so handle() can write a 413 and return.
-                // Then drain remaining data so the socket can close
-                // cleanly instead of lingering mid-request.
+                req.destroy();
                 reject(new BodyTooLargeError(MAX_REQUEST_BYTES));
                 return;
             }
