@@ -391,8 +391,36 @@ async function handle(
         return;
     }
     let bodyBuffer: Buffer;
+    let urlPath: string;
+    let responsesCompact: boolean;
+    let route: ReturnType<typeof resolveUpstream>;
+    let upstreamOrigin: string;
+    let protocol: "anthropic" | "openai" | "responses" | null;
     try {
         bodyBuffer = await readBody(req);
+        const url = req.url ?? "";
+        urlPath = url.split("?", 2)[0];
+        responsesCompact = urlPath.endsWith("/responses/compact");
+        route = resolveUpstream(opts, req.url ?? "", req);
+        upstreamOrigin = route ? route.upstream : opts.upstream;
+        protocol =
+            route?.explicitProtocol
+            ?? (req.method === "POST" && bodyBuffer.length > 0
+                ? urlPath.endsWith("/chat/completions")
+                    ? "openai"
+                    : urlPath.endsWith("/v1/messages") || urlPath.endsWith("/messages")
+                      ? "anthropic"
+                      : urlPath.endsWith("/responses") || responsesCompact
+                        ? "responses"
+                        : null
+                : null);
+        // Issue #99: decode body only for known protocols — passthrough requests
+        // (e.g. GET /models) must forward raw bytes without content-encoding decode.
+        if (protocol !== null && bodyBuffer.length > 0) {
+            const decoded = await decodeRequestBody(headerValue(req, "content-encoding"), bodyBuffer, MAX_REQUEST_BYTES);
+            bodyBuffer = decoded.body;
+            if (decoded.decoded) delete req.headers["content-encoding"];
+        }
     } catch (err) {
         if (err instanceof BodyTooLargeError) {
             log("warn", `413: request body exceeds ${err.limit} bytes`);
@@ -400,48 +428,10 @@ async function handle(
             res.end(JSON.stringify({ error: { type: "request_too_large", message: err.message } }));
             return;
         }
-        log("warn", `read body failed: ${String(err)}`);
+        log("warn", `read/decode body failed: ${String(err)}`);
         res.writeHead(400, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: { type: "invalid_request", message: String(err) } }));
         return;
-    }
-    const url = req.url ?? "";
-    // Strip query string before matching path suffixes: a request like
-    // `/v1/responses?foo=1` must still be detected as the responses protocol.
-    const urlPath = url.split("?", 2)[0];
-    const responsesCompact = urlPath.endsWith("/responses/compact");
-    const route = resolveUpstream(opts, req.url ?? "", req);
-    const upstreamOrigin = route ? route.upstream : opts.upstream;
-    const protocol: "anthropic" | "openai" | "responses" | null =
-        route?.explicitProtocol
-        ?? (req.method === "POST" && bodyBuffer.length > 0
-            ? urlPath.endsWith("/chat/completions")
-                ? "openai"
-                : urlPath.endsWith("/v1/messages") || urlPath.endsWith("/messages")
-                  ? "anthropic"
-                  : urlPath.endsWith("/responses") || responsesCompact
-                    ? "responses"
-                    : null
-            : null);
-    // Issue #99: decode body only for known protocols — passthrough requests
-    // (e.g. GET /models) must forward raw bytes without content-encoding decode.
-    if (protocol !== null && bodyBuffer.length > 0) {
-        try {
-            const decoded = await decodeRequestBody(headerValue(req, "content-encoding"), bodyBuffer, MAX_REQUEST_BYTES);
-            bodyBuffer = decoded.body;
-            if (decoded.decoded) delete req.headers["content-encoding"];
-        } catch (err) {
-            if (err instanceof BodyTooLargeError) {
-                log("warn", `413: decoded body exceeds ${err.limit} bytes`);
-                res.writeHead(413, { "content-type": "application/json" });
-                res.end(JSON.stringify({ error: { type: "request_too_large", message: err.message } }));
-                return;
-            }
-            log("warn", `decode body failed: ${String(err)}`);
-            res.writeHead(400, { "content-type": "application/json" });
-            res.end(JSON.stringify({ error: { type: "invalid_request", message: String(err) } }));
-            return;
-        }
     }
     const countTokens = isCountTokensRequest(req.method ?? "GET", urlPath, bodyBuffer.length > 0);
     // Per-request context limit: look up body.model against the per-route model
@@ -539,7 +529,7 @@ async function handle(
     }
     if (!prepared) {
         if (protocol === null && !opts.passthrough) {
-            log("warn", `unrecognized path ${url} — not a known protocol (/chat/completions, /v1/messages, /responses, /responses/compact); forwarding unchanged`);
+            log("warn", `unrecognized path ${req.url ?? ""} — not a known protocol (/chat/completions, /v1/messages, /responses, /responses/compact); forwarding unchanged`);
         }
         await forward(req, res, opts, bodyBuffer, null, core, reqConfig, log, route, undefined);
     }
