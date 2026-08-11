@@ -184,6 +184,9 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
 
     // --- Source 2: env vars (highest priority) ---
     const port = parseInt(env.ACP_PORT ?? env.PORT ?? `${fileConfig.port ?? 8787}`, 10);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+        throw new Error(`Invalid port ${Number.isNaN(port) ? "(not a number)" : port}; must be 1-65535`);
+    }
     const host = env.ACP_HOST ?? fileConfig.host ?? "127.0.0.1";
     const upstream = (env.ACP_UPSTREAM ?? fileConfig.upstream ?? "https://api.anthropic.com").replace(/\/$/, "");
     const routes = loadRoutes(env);
@@ -191,9 +194,9 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
     const biliProxy = nonEmpty(env.BILI_UPSTREAM_PROXY);
     const webProxy = nonEmpty(fileConfig.upstreamProxy);
     const configProxy = nonEmpty(fileConfig.proxy);
-    const proxyMode = parseUpstreamProxyMode(
-        env.BILI_UPSTREAM_PROXY_MODE ?? fileConfig.upstreamProxyMode ?? (webProxy ? "manual" : undefined),
-    );
+    const rawProxyMode = env.BILI_UPSTREAM_PROXY_MODE ?? fileConfig.upstreamProxyMode ?? (webProxy ? "manual" : undefined);
+    const proxyMode = parseUpstreamProxyMode(rawProxyMode);
+    const explicitDirect = proxyMode === "direct" && rawProxyMode === "direct";
     const proxy = biliProxy ?? (proxyMode === "direct" ? "" : proxyMode === "manual" ? webProxy ?? configProxy : configProxy);
     const proxySource: ProxyOptions["proxySource"] = biliProxy
         ? "bili-env"
@@ -213,8 +216,9 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         ...(httpsProxy ? { httpsProxy } : {}),
         ...(allProxy ? { allProxy } : {}),
         ...(noProxy ? { noProxy } : {}),
-        biliPort: Number.isFinite(port) ? port : 8787,
+        biliPort: port,
         globalSource: proxySource,
+        explicitDirect,
     };
     validateHttpProxy(proxy, proxyFallback.biliPort);
     for (const [url, route] of Object.entries(routes)) {
@@ -225,7 +229,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         }
     }
     return {
-        port: Number.isFinite(port) ? port : 8787,
+        port,
         host,
         upstream,
         routes,

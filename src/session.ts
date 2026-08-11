@@ -88,7 +88,8 @@ export type Session = {
 
 const sessions = new Map<string, Session>();
 
-const MAX_SESSIONS = Number.parseInt(process.env.BILI_MAX_SESSIONS ?? "256", 10) || 256;
+// `|| 256` only catches falsy (0/NaN); Math.max(1, ...) also rejects negatives.
+let MAX_SESSIONS = Math.max(1, Number.parseInt(process.env.BILI_MAX_SESSIONS ?? "256", 10) || 256);
 
 let initialized = false;
 
@@ -132,7 +133,12 @@ export function getSession(id: string, meta?: { protocol?: Session["meta"]["prot
         sessions.set(id, reloaded);
         return reloaded;
     }
-    if (sessions.size >= MAX_SESSIONS) evictOldest();
+    if (sessions.size >= MAX_SESSIONS) {
+        const evicted = evictOldest();
+        if (!evicted) {
+            throw new Error(`session pool exhausted (MAX_SESSIONS=${MAX_SESSIONS}; all in-flight)`);
+        }
+    }
     const session: Session = {
         id,
         meta: { protocol: meta?.protocol, upstreamOrigin: meta?.upstreamOrigin, label: meta?.label },
@@ -229,8 +235,8 @@ export function reconcileNativeCompactionBoundary(session: Session): boolean {
 
 /** Flush a session to disk and drop it from memory (LRU eviction). Refuses to
  *  evict sessions that are in-flight or whose flush failed (would lose a
- *  never-persisted session permanently). */
-function evictOldest(): void {
+ *  never-persisted session permanently). Returns true if a slot was freed. */
+function evictOldest(): boolean {
     let oldestId: string | undefined;
     let oldestSeen = Infinity;
     for (const [id, s] of sessions) {
@@ -243,18 +249,31 @@ function evictOldest(): void {
             oldestId = id;
         }
     }
-    if (!oldestId) return;
+    if (!oldestId) return false;
     const s = sessions.get(oldestId)!;
     const ok = getStore().flushSync(s);
     if (!ok && !s.persisted) {
         // Flush failed AND this session was never written to disk — evicting
         // would permanently lose it. Keep it in memory instead.
-        return;
+        return false;
     }
     sessions.delete(oldestId);
+    return true;
 }
 
 /** Graceful shutdown: flush all sessions with pending writes. */
 export async function flushAllSessions(): Promise<void> {
     await getStore().flushAll(sessions.values());
+}
+
+export function _resetSessionsForTest(max?: number): void {
+    if (max !== undefined) MAX_SESSIONS = Math.max(1, Math.floor(max));
+    for (const s of sessions.values()) {
+        if (s.inFlight > 0) s.inFlight = 0;
+    }
+    sessions.clear();
+}
+
+export function _sessionsSizeForTest(): number {
+    return sessions.size;
 }
