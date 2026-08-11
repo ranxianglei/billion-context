@@ -549,23 +549,6 @@ function diagTagSummary(messages: CoreMessage[], sessionId: string, strategy: st
     return `[${sessionId}] processTurn: ${messages.length} msgs, renderTags=${strategy}, ${textTagged} text tagged, ${toolTagged} tool tagged (should be 0 with text-only)`;
 }
 
-const NUDGE_MIN_USAGE_PCT = parseFloat(process.env.ACP_NUDGE_MIN_USAGE ?? "0.50");
-
-function gateNudge(
-    turn: { nudge?: { shouldInject: boolean; tier: number | null } | null },
-    tokenCount: number,
-    limit: number,
-    sessionId: string,
-    log: (level: string, msg: string) => void,
-): void {
-    if (!turn.nudge?.shouldInject) return;
-    const usage = limit > 0 ? tokenCount / limit : 1;
-    if (usage < NUDGE_MIN_USAGE_PCT) {
-        log("info", `[${sessionId}] nudge SUPPRESSED: usage ${Math.round(usage * 100)}% < ${Math.round(NUDGE_MIN_USAGE_PCT * 100)}% (kernel wanted T${turn.nudge.tier ?? "?"})`);
-        turn.nudge.shouldInject = false;
-    }
-}
-
 function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; contextUsage: number; tier: number | null; breakdown?: Record<string, number> } | null }, sessionId: string, tokenCount: number, limit: number): string {
     const n = turn.nudge;
     if (!n) return `[${sessionId}] nudge: unavailable`;
@@ -614,7 +597,6 @@ function prepareAnthropic(
         const tokenCount = session.stats.lastInputTokens;
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
-        gateNudge(turn, tokenCount, config.modelContextLimit, sessionId, log);
         session.stats.contextTokens = tokenCount;
         if (!session.meta.title) {
             const t = deriveTitle(msgs);
@@ -687,7 +669,6 @@ function prepareOpenai(
         const tokenCount = session.stats.lastInputTokens;
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
-        gateNudge(turn, tokenCount, config.modelContextLimit, sessionId, log);
         session.stats.contextTokens = tokenCount;
         if (!session.meta.title) {
             const t = deriveTitle(msgs);
@@ -779,7 +760,6 @@ function prepareResponses(
         const tokenCount = session.stats.lastInputTokens;
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" });
         session.state = turn.state;
-        gateNudge(turn, tokenCount, config.modelContextLimit, sessionId, log);
         session.stats.contextTokens = tokenCount;
         if (!session.meta.title) {
             const t = deriveTitle(msgs);
