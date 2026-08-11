@@ -13,7 +13,7 @@ export const ACP_TEXT_CLOSE = "\x3c/acp_compress\x3e";
 export const COMPRESS_TOOL = {
     name: COMPRESS_TOOL_NAME,
     description:
-        "Replace a contiguous range of older conversation with a detailed summary you write. Use when content is genuinely consumed. Batch form: content=[{startId,endId,summary,topic?}].",
+        "Replace a contiguous range of older conversation with a detailed summary you write. Use when content is genuinely consumed. Batch form: content=[{startId,endId,summary,topic?}]. REQUIRED — compress without content is invalid.",
     input_schema: {
         type: "object",
         properties: {
@@ -33,6 +33,7 @@ export const COMPRESS_TOOL = {
                 },
             },
         },
+        required: ["content"],
     },
 };
 
