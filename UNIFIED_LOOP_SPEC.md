@@ -78,11 +78,11 @@ Round logic (per bili-pi hygiene):
 1. `for round in 1..MAX_ROUNDS` (MAX_ROUNDS = 10):
    - Parse `upstream` stream via `adapter.parseStream`.
    - Accumulate assistant text; for each tool_call:
-     - If PROXY tool (compress/decompress/search_context/acp_status): execute via shared `executeProxyTool`, `yield adapter.emitMarker(...)`, append `{assistant,tool-call}` + `{tool,tool-result}` to a LOCAL coreMessages copy.
-       - Track `sawMutating` if name ∈ {compress, decompress}.
-     - Else (real tool): `yield adapter.emitToolCall(...)`, increment `realCalls`.
-   - After stream done: run `hideConsumedCompressCalls(ctx.session.state, coreMessages)` (per-round hygiene).
-   - Decision: if `sawMutating && realCalls === 0` → re-request: rebuild body via `adapter.buildRequest(coreMessages, systemPrompt, requestBody)`, fetch new upstream, loop. Else → `yield adapter.emitCompletion(...)`, return.
+      - If PROXY tool (compress/decompress/search_context/acp_status): execute via shared `executeProxyTool`, `yield adapter.emitMarker(...)`, append `{assistant,tool-call}` + `{tool,tool-result}` to a LOCAL coreMessages copy.
+      - Else (real tool): `yield adapter.emitToolCall(...)`, increment `realCalls`.
+    - After stream done: run `hideConsumedCompressCalls(ctx.session.state, coreMessages)` (per-round hygiene, skipped for textProtocol).
+    - Decision: if `proxyResults.length > 0 && realCalls === 0` → re-request: rebuild body via `adapter.buildRequest(coreMessages, systemPrompt, requestBody)`, fetch new upstream, loop. Else → `yield adapter.emitCompletion(...)`, return.
+      - Note: ALL proxy tools (including read-only acp_status/search_context) drive re-request. This differs from baseline (`hasMutatingOnly`) which only re-requested for compress/decompress. V2 re-requests for read-only tools to feed the result back to the model (fixes the tool_calls-no-body hang, commit d8a1e0d). Safety net: MAX_LOOP_ROUNDS=10 graceful completion (never the degenerate empty completion that caused 炸锅).
 2. Limit reached: `yield adapter.emitCompletion(...)` **gracefully** (NOT a degenerate empty completion). Log it. This is the key fix — never discard the turn.
 
 ### Shared executeProxyTool (de-dup ×3 → ×1)
@@ -147,16 +147,19 @@ The transient `systemPrompt` = `buildCompressSystemPrompt()` (or `buildCompressT
 - TypeScript strict, ESM (.js extensions in imports).
 
 ## Test plan (Phase 3)
-Existing tests: `npm test` → 212 baseline (before PR#90) / 219 (with PR#90). New tests in `tests/loop-*.test.ts`:
-1. **acp_status-only round**: model calls only acp_status → assert (a) marker surfaced to client, (b) NO re-request (readonly), (c) graceful completion present, (d) `realCalls` passthrough. **No 炸锅.**
-2. **search_context-only round**: same shape as #1.
+247 tests total (219 baseline + 28 new in `tests/loop-*.test.ts`). Updated to match d8a1e0d (read-only tools now drive re-request):
+1. **acp_status-only round**: model calls only acp_status → assert (a) marker surfaced to client, (b) re-request happens (result fed back to model), (c) graceful completion at limit, (d) no hang. **No 炸锅.** *(Changed from "NO re-request" after d8a1e0d fixed the tool_calls-no-body hang.)*
+2. **search_context-only round**: same shape as #1 (re-request + graceful completion).
 3. **compress round**: model calls compress → assert re-request happens (mutating), result fed back, hideConsumed ran (consumed compress records hidden in round 2 input).
 4. **decompress round**: re-request happens.
-5. **limit-hit graceful**: force 10 mutating rounds → assert graceful completion (NOT degenerate empty), no crash.
+5. **limit-hit graceful**: force 10 rounds → assert graceful completion (NOT degenerate empty), no crash.
 6. **philosophy transient**: assert philosophy appears exactly ONCE per round in upstream body (not accumulated) — spy on fetch.
 7. **hideConsumed per round**: after a compress in round 1, round 2's upstream body must NOT contain the consumed compress tool-call/result (verify hideConsumedCompressCalls ran).
 8. **real-tool passthrough**: model calls a real tool (e.g. `bash`) → emitted to client, loop ends (no re-request).
-9. **mixed**: compress + real tool in same round → forwarded (no re-request), compress executed, marker shown.
+9. **mixed**: compress + real tool in same round → forwarded (no re-request), compress executed, marker shown. *(V2 executes compress in mixed rounds; baseline does NOT — documented difference.)*
+
+### recordUsage semantics (reviewer P1 clarification)
+`session.stats.inputTokens` ACCUMULATES across loop rounds (`+=` per round) = total tokens consumed (billing/usage). `session.stats.lastInputTokens` OVERWRITES each round = current context size (used by nudge/compression trigger). Both behaviors are intentional and correct for their respective purposes.
 Run via `node --import tsx --test tests/loop-*.test.ts` (node/npm at /home/dog/.local/bin; npx NOT available, use `npm test`).
 
 ## Verification gate (must pass before declaring done)
