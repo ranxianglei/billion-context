@@ -252,6 +252,7 @@ type Prepared = {
     resetAfterSuccess?: boolean;
     responsesProjection?: ResponsesProjection;
     anthropicSystem?: AnthropicRequestBody["system"];
+    nudge?: NudgeDecision;
 };
 
 /** True if `addr` is a loopback (IPv4 127.x or IPv6 ::1 / ::ffff:127.0.0.1).
@@ -578,6 +579,7 @@ function prepareAnthropic(
 
     let processedMessages: CoreMessage[] = [];
     let originalMessages: CoreMessage[] = [];
+    let nudge: NudgeDecision | undefined;
     let rebuiltMessages = parsed.messages;
     let systemOut = parsed.system;
     let toolsOut = parsed.tools;
@@ -597,6 +599,7 @@ function prepareAnthropic(
         const tokenCount = session.stats.lastInputTokens;
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
+        nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         if (!session.meta.title) {
             const t = deriveTitle(msgs);
@@ -630,7 +633,7 @@ function prepareAnthropic(
 
     const rebuilt: AnthropicRequestBody = { ...parsed, messages: rebuiltMessages, system: systemOut, tools: toolsOut };
     markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: opts.compress.injectTool } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: opts.compress.injectTool, nudge } as Prepared;
 }
 
 function prepareOpenai(
@@ -648,6 +651,7 @@ function prepareOpenai(
 
     let processedMessages: CoreMessage[] = [];
     let originalMessages: CoreMessage[] = [];
+    let nudge: NudgeDecision | undefined;
     let rebuiltMessages = parsed.messages;
     let toolsOut = parsed.tools;
 
@@ -669,6 +673,7 @@ function prepareOpenai(
         const tokenCount = session.stats.lastInputTokens;
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
+        nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         if (!session.meta.title) {
             const t = deriveTitle(msgs);
@@ -718,7 +723,7 @@ function prepareOpenai(
         (rebuilt as Record<string, unknown>).stream_options = { include_usage: true };
     }
     markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: shouldInject } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: shouldInject, nudge } as Prepared;
 }
 
 function prepareResponses(
@@ -740,6 +745,7 @@ function prepareResponses(
 
     let processedMessages: CoreMessage[] = [];
     let originalMessages: CoreMessage[] = [];
+    let nudge: NudgeDecision | undefined;
     let responsesProjection: ResponsesProjection | undefined;
     let rebuiltInput: ResponseInputItem[] | string = parsed.input;
     let toolsOut = parsed.tools;
@@ -760,6 +766,7 @@ function prepareResponses(
         const tokenCount = session.stats.lastInputTokens;
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" });
         session.state = turn.state;
+        nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         if (!session.meta.title) {
             const t = deriveTitle(msgs);
@@ -836,6 +843,7 @@ function prepareResponses(
         stream,
         compressInjected: shouldInject,
         responsesTextProtocol,
+        nudge,
     };
 }
 
@@ -1177,7 +1185,7 @@ async function forward(
             const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem);
             const loop = runCompressLoop(
                 streamToRead,
-                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, textProtocol, debug: opts.debug },
+                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, textProtocol, debug: opts.debug, nudge: prepared.nudge },
                 parsedReq,
                 { url: upstreamUrl, headers: reqHeaders },
                 adapter,
