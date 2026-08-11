@@ -462,3 +462,19 @@ test("F6: responses buildRequest preserves instructions + additional_tools prefi
     assert.ok(typeof dev?.content === "string" && dev.content.includes("AGENTS_MD_RULES"), "developer includes original instructions (systemParts) — matches round-1 prefix");
     assert.ok(typeof dev?.content === "string" && dev.content.includes(systemPrompt), "developer includes compress prompt");
 });
+
+test("F7: anthropic buildRequest preserves client system + cache_control + merges compress prompt (prefix-cache fix)", () => {
+    const clientSystem = [{ type: "text", text: "YOU_ARE_CLAUDE", cache_control: { type: "ephemeral" } }];
+    const systemPrompt = buildCompressSystemPrompt();
+    const adapter = createAnthropicAdapter({ model: "claude" }, clientSystem);
+    const rebuilt = adapter.buildRequest([], systemPrompt, { model: "claude", messages: [] }) as Record<string, unknown>;
+    const system = rebuilt.system;
+    assert.ok(Array.isArray(system), "system preserved as structured array (buildSystem keeps array form when original was array)");
+    const text = Array.isArray(system)
+        ? (system as Array<Record<string, unknown>>).map((b) => b.text as string).join("\n\n")
+        : (system as string);
+    assert.ok(text.includes("YOU_ARE_CLAUDE"), "client system text preserved (not lost in round-2) — matches round-1 prefix");
+    assert.ok(text.includes(systemPrompt), "compress prompt merged into system");
+    const hasCc = Array.isArray(system) && (system as Array<Record<string, unknown>>).some((b) => b.cache_control);
+    assert.ok(hasCc, "cache_control marker preserved on system block (Anthropic prefix-cache anchor)");
+});
