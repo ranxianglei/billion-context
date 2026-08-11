@@ -422,7 +422,7 @@ export async function compressLoopResponsesJson(
             }
             const result = executeProxyTool(call.name, args, ctx);
             ctx.log(`[acp-proxy: responses JSON ${call.name} → ${result.slice(0, 120).replace(/\n/g, " ")}]`);
-            inputItems.push({ type: "message", role: "user", content: buildVisibilityMarker(call.name, result) });
+            inputItems.push({ type: "message", role: "developer", content: buildVisibilityMarker(call.name, result) });
         }
         requestBody.input = inputItems;
         const { response, clearTimer } = await fetchWithTimeout(requestOptions.url, {
@@ -680,7 +680,7 @@ export async function* compressLoopResponsesStream(
                 "utf8",
             );
             inputItems.push(textProtocol
-                ? { type: "message", role: "user", content: buildVisibilityMarker(fc.name, result) }
+                ? { type: "message", role: "developer", content: buildVisibilityMarker(fc.name, result) }
                 : { type: "function_call_output", call_id: fc.callId || `call_${Date.now()}`, output: result });
         }
 
