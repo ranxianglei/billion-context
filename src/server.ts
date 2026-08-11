@@ -41,11 +41,9 @@ import { applyRanges } from "./stream.js";
 import { renderUI, handleConfigGet, handleConfigPut } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { getStore } from "./persist.js";
-import { compressLoopStream } from "./compress-loop.js";
-import { compressLoopAnthropicStream } from "./compress-loop-anthropic.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger } from "./logger.js";
 import { defaultLogFile, stateDir } from "./paths.js";
-import { compressLoopResponsesJson, compressLoopResponsesStream } from "./compress-loop-responses.js";
+import { compressLoopResponsesJson } from "./compress-loop-responses.js";
 import { runCompressLoop, pickAdapter } from "./loop/index.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesSseStream, rewriteResponsesJsonResponse } from "./stream-responses.js";
@@ -67,6 +65,16 @@ const UPSTREAM_HOP_HEADERS = new Set([
     // streamed from fetch, otherwise clients try to decompress plain bytes.
     "content-encoding",
 ]);
+
+function buildForwardHeaders(headers: Record<string, string>): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(headers)) {
+        if (k.toLowerCase() === "content-length" || k.toLowerCase() === "host") continue;
+        out[k] = v;
+    }
+    out["content-type"] = "application/json";
+    return out;
+}
 
 export function resolveUpstream(_opts: ProxyOptions, reqUrl: string, req?: http.IncomingMessage): { upstream: string; rewrittenUrl: string; explicitProtocol?: "openai" | "anthropic" | "responses" } | undefined {
     // MITM mode: the request arrived over a CONNECT tunnel we terminated
@@ -1172,14 +1180,8 @@ async function forward(
         // emitStreamError sends a protocol-appropriate error + finish so the
         // client ends cleanly instead of seeing a bare truncated stream.
         try {
-        if (process.env.ACP_LOOP_V2 !== "0") {
             const parsedReq = JSON.parse(typeof body === "string" ? body : body.toString("utf8"));
-            const reqHeaders: Record<string, string> = {};
-            for (const [k, v] of Object.entries(headers)) {
-                if (k.toLowerCase() === "content-length" || k.toLowerCase() === "host") continue;
-                reqHeaders[k] = v;
-            }
-            reqHeaders["content-type"] = "application/json";
+            const reqHeaders = buildForwardHeaders(headers);
             const textProtocol = prepared.protocol === "responses" && !!prepared.responsesTextProtocol;
             const systemPrompt = textProtocol ? buildCompressTextSystemPrompt() : buildCompressSystemPrompt();
             const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem);
@@ -1202,77 +1204,6 @@ async function forward(
                 if (res.writableNeedDrain) await new Promise<void>((r) => res.once("drain", () => r()));
             }
             res.end();
-        } else if (prepared.protocol === "openai") {
-            const parsedReq = JSON.parse(typeof body === "string" ? body : body.toString("utf8"));
-            const reqHeaders: Record<string, string> = {};
-            for (const [k, v] of Object.entries(headers)) {
-                if (k.toLowerCase() === "content-length" || k.toLowerCase() === "host") continue;
-                reqHeaders[k] = v;
-            }
-            reqHeaders["content-type"] = "application/json";
-            const loop = compressLoopStream(
-                streamToRead,
-                { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl },
-                parsedReq,
-                { url: upstreamUrl, headers: reqHeaders },
-            );
-            for await (const chunk of loop) {
-                {
-                    const s = chunk.toString("utf8");
-                    if (s.includes("\x3cacp ") || s.includes("\x3c/acp")) {
-                        log("warn", `[${prepared.session.id}] tag echo: openai response stream contains <acp tag`);
-                    }
-                }
-                if (!res.write(chunk)) await new Promise<void>((r) => res.once("drain", () => r()));
-            }
-        } else if (prepared.protocol === "responses") {
-            const parsedReq = JSON.parse(typeof body === "string" ? body : body.toString("utf8"));
-            const reqHeaders: Record<string, string> = {};
-            for (const [k, v] of Object.entries(headers)) {
-                if (k.toLowerCase() === "content-length" || k.toLowerCase() === "host") continue;
-                reqHeaders[k] = v;
-            }
-            reqHeaders["content-type"] = "application/json";
-            const loop = compressLoopResponsesStream(
-                streamToRead,
-                { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, textProtocol: prepared.responsesTextProtocol },
-                parsedReq,
-                { url: upstreamUrl, headers: reqHeaders },
-            );
-            for await (const chunk of loop) {
-                {
-                    const s = chunk.toString("utf8");
-                    if (s.includes("\x3cacp ") || s.includes("\x3c/acp")) {
-                        log("warn", `[${prepared.session.id}] tag echo: responses response stream contains <acp tag`);
-                    }
-                }
-                if (!res.write(chunk)) await new Promise<void>((r) => res.once("drain", () => r()));
-            }
-        } else {
-            const parsedReq = JSON.parse(typeof body === "string" ? body : body.toString("utf8"));
-            const reqHeaders: Record<string, string> = {};
-            for (const [k, v] of Object.entries(headers)) {
-                if (k.toLowerCase() === "content-length" || k.toLowerCase() === "host") continue;
-                reqHeaders[k] = v;
-            }
-            reqHeaders["content-type"] = "application/json";
-            const loop = compressLoopAnthropicStream(
-                streamToRead,
-                { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl },
-                parsedReq,
-                { url: upstreamUrl, headers: reqHeaders },
-            );
-            for await (const chunk of loop) {
-                {
-                    const s = chunk.toString("utf8");
-                    if (s.includes("\x3cacp ") || s.includes("\x3c/acp")) {
-                        log("warn", `[${prepared.session.id}] tag echo: anthropic response stream contains <acp tag`);
-                    }
-                }
-                if (!res.write(chunk)) await new Promise<void>((r) => res.once("drain", () => r()));
-            }
-        }
-        res.end();
         } catch (e) {
             emitStreamError(res, prepared.protocol, (e as Error)?.message ?? String(e), (m) => log("error", `[${prepared.session.id}] ${m}`));
         } finally {
@@ -1292,12 +1223,7 @@ async function forward(
                 let json = JSON.parse(text) as Record<string, unknown>;
                 if (prepared.protocol === "responses" && prepared.responsesTextProtocol) {
                     const requestBody = JSON.parse(typeof body === "string" ? body : body.toString("utf8")) as Record<string, unknown>;
-                    const requestHeaders: Record<string, string> = {};
-                    for (const [key, value] of Object.entries(headers)) {
-                        if (key.toLowerCase() === "content-length" || key.toLowerCase() === "host") continue;
-                        requestHeaders[key] = value;
-                    }
-                    requestHeaders["content-type"] = "application/json";
+                    const requestHeaders = buildForwardHeaders(headers);
                     json = await compressLoopResponsesJson(
                         json,
                         { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, textProtocol: true },
