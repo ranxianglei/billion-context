@@ -11,6 +11,7 @@ import { log as loggerLog } from "./logger.js";
 import { applyRanges } from "./stream.js";
 import { resolveDecompress } from "./decompress-shared.js";
 import { buildVisibilityMarker } from "./compress-loop.js";
+import { MAX_LOOP_ROUNDS } from "./loop/index.js";
 import { fetchWithTimeout } from "./fetch-util.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 
@@ -180,7 +181,7 @@ export async function compressLoopResponsesJson(
     requestOptions: RequestOptions,
 ): Promise<Record<string, unknown>> {
     let current = initialResponse;
-    for (let loopCount = 1; loopCount <= 5; loopCount++) {
+    for (let loopCount = 1; loopCount <= MAX_LOOP_ROUNDS; loopCount++) {
         const output = responsesJsonOutput(current);
         const extracted = extractTextTriggers(output.text);
         const allCalls = [...output.calls, ...extracted.calls].filter((call) => call.name.length > 0);
@@ -198,6 +199,7 @@ export async function compressLoopResponsesJson(
         if (extracted.clean.trim()) {
             inputItems.push({ type: "message", role: "assistant", content: [{ type: "output_text", text: extracted.clean }] });
         }
+        let mutatedThisTurn = false;
         for (const call of proxyCalls) {
             let args: Record<string, unknown> = {};
             try {
@@ -205,8 +207,15 @@ export async function compressLoopResponsesJson(
             } catch (error) {
                 loggerLog("warn", `[acp-compress-args] ${call.name} JSON.parse failed: ${String(error)}`);
             }
-            const result = executeProxyTool(call.name, args, ctx);
-            ctx.log(`[acp-proxy: responses JSON ${call.name} → ${result.slice(0, 120).replace(/\n/g, " ")}]`);
+            let result: string;
+            if (MUTATING_PROXY_TOOLS.has(call.name) && mutatedThisTurn) {
+                result = `Already ${call.name}ed once this turn. Do not ${call.name} again; generate your normal response now.`;
+                ctx.log(`[acp-proxy: responses JSON ${call.name} skipped (state already mutated this turn)]`);
+            } else {
+                result = executeProxyTool(call.name, args, ctx);
+                if (MUTATING_PROXY_TOOLS.has(call.name)) mutatedThisTurn = true;
+                ctx.log(`[acp-proxy: responses JSON ${call.name} → ${result.slice(0, 120).replace(/\n/g, " ")}]`);
+            }
             inputItems.push({ type: "message", role: "developer", content: buildVisibilityMarker(call.name, result) });
         }
         requestBody.input = inputItems;
@@ -226,6 +235,6 @@ export async function compressLoopResponsesJson(
             clearTimer();
         }
     }
-    ctx.log("[acp-proxy: responses JSON compress loop limit (5) reached]");
+    ctx.log(`[acp-proxy: responses JSON compress loop limit (${MAX_LOOP_ROUNDS}) reached]`);
     return current;
 }
