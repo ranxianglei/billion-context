@@ -20,6 +20,10 @@ export type ProxyFallbackOptions = {
     biliPort?: number;
     systemProxy?: WindowsSystemProxy;
     globalSource?: "bili-env" | "web-manual" | "config" | "auto" | "direct";
+    /** True only when the user EXPLICITLY set proxy mode "direct". The default
+     *  unset mode also parses as "direct" but means "no preference" — in that
+     *  case an empty globalProxy must fall through to env proxy discovery. */
+    explicitDirect?: boolean;
 };
 
 export type UpstreamProxyDecision = {
@@ -237,7 +241,7 @@ export function resolveProxyDecision(
             return { proxy: parsed.url, source: "provider" };
         }
     }
-    if (globalProxy === "") return { source: "direct" };
+    if (globalProxy === "" && fallback.explicitDirect) return { source: "direct" };
     const explicit = parseHttpProxy(globalProxy, fallback.biliPort)?.url;
     if (explicit) return { proxy: explicit, source: fallback.globalSource ?? "global" };
     if (target && matchesNoProxy(target, fallback.noProxy)) return { source: "no-proxy" };
