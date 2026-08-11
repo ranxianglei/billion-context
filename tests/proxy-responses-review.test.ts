@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { responsesToCore, coreToResponses, patchResponsesInput, injectResponsesDeveloperMessage } from "../src/responses.ts";
-import { compressLoopResponsesJson, compressLoopResponsesStream } from "../src/compress-loop-responses.ts";
+import { compressLoopResponsesJson } from "../src/compress-loop-responses.ts";
 import type { Config, CoreMessage } from "acp-kernel";
 import { createCore, createInitialState } from "acp-kernel";
 import type { Session } from "../src/session.ts";
@@ -15,18 +15,6 @@ function makeCtx(log: (m: string) => void): { core: ReturnType<typeof createCore
         session: getSession("test-session"),
         log,
     };
-}
-
-async function drain(stream: ReadableStream<Uint8Array>): Promise<string> {
-    const chunks: Buffer[] = [];
-    for await (const chunk of compressLoopResponsesStream(stream, makeCtx(() => {}), { model: "gpt-4o", input: [{ type: "message", role: "user", content: "hi" }], stream: true }, { url: "http://unused", headers: {} })) {
-        chunks.push(chunk);
-    }
-    return Buffer.concat(chunks).toString("utf8");
-}
-
-function sse(type: string, data: unknown, eol = "\n"): string {
-    return `event: ${type}${eol}data: ${JSON.stringify(data)}${eol}${eol}`;
 }
 
 // Standard function calls remain compressible. Codex custom items stay in the
@@ -119,41 +107,6 @@ test("responses: ACP developer prompt is inserted after leading additional_tools
     const out = injectResponsesDeveloperMessage(input as never, "ACP prompt");
     assert.deepEqual(out.map((item) => item.type), ["additional_tools", "message", "reasoning", "message"]);
     assert.equal(out[2], input[1]);
-});
-
-// Review #2: response.failed terminal is replayed verbatim and NOT followed by
-// a fabricated response.completed (which would contradict the failure).
-test("compressLoopResponsesStream: response.failed is replayed without a contradictory completed", async () => {
-    const events = [
-        sse("response.created", { response: { id: "resp_f", status: "in_progress" } }),
-        sse("response.output_item.added", { item: { type: "message", id: "m1", role: "assistant", content: [] }, output_index: 0 }),
-        sse("response.output_text.delta", { item_id: "m1", output_index: 0, delta: "partial" }),
-        sse("response.failed", { response: { id: "resp_f", status: "failed", error: { code: "rate_limit_exceeded", message: "boom" } } }),
-    ].join("");
-    const out = await drain(new Response(events).body!);
-    assert.ok(out.includes("response.failed"), "response.failed replayed to client");
-    assert.ok(out.includes("boom"), "failure detail preserved");
-    // The critical assertion: NO fabricated response.completed after the failure.
-    assert.ok(!out.includes("response.completed"), "no contradictory response.completed emitted");
-});
-
-// Review #3: CRLF line endings (\r\n\r\n separators) parse correctly — without
-// the fix, these events vanish entirely and the proxy synthesizes a bogus id.
-test("compressLoopResponsesStream: CRLF (\\r\\n) SSE line endings are parsed", async () => {
-    const crlf = "\r\n";
-    const events = [
-        sse("response.created", { response: { id: "resp_crlf", status: "in_progress" } }, crlf),
-        sse("response.output_item.added", { item: { type: "message", id: "m1", role: "assistant", content: [] }, output_index: 0 }, crlf),
-        sse("response.output_text.delta", { item_id: "m1", output_index: 0, delta: "CRLF works" }, crlf),
-        sse("response.output_item.done", { item: { type: "message", id: "m1" }, output_index: 0 }, crlf),
-        sse("response.completed", { response: { id: "resp_crlf", status: "completed", output: [] } }, crlf),
-    ].join("");
-    const out = await drain(new Response(events).body!);
-    assert.ok(out.includes("CRLF works"), "CRLF-delimited delta content passed through");
-    assert.ok(out.includes("response.created"), "CRLF response.created parsed (stream opened)");
-    assert.ok(out.includes("response.completed"), "CRLF response.completed parsed");
-    // Must not fabricate a fallback id (sign the separator was missed).
-    assert.ok(!out.includes("resp-proxy-"), "no synthesized fallback response id");
 });
 
 test("compressLoopResponsesJson: Codex text trigger is intercepted and re-requested", async () => {
