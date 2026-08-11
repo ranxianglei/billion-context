@@ -18,6 +18,7 @@ import {
     buildClaudeEnv,
     buildCodexArgs,
     preparePiHttpRewrite,
+    stripInheritedProxy,
     resolvePiHome,
     extractDomains,
     discoverDomains,
@@ -547,4 +548,27 @@ test("preparePiHttpRewrite: returns undefined when models.json is not an object"
     } finally {
         fs.rmSync(home, { recursive: true, force: true });
     }
+});
+
+test("stripInheritedProxy: removes generic proxy redirector vars, keeps the rest", () => {
+    const cleaned = stripInheritedProxy({
+        http_proxy: "http://corp:20172",
+        https_proxy: "http://corp:20172",
+        all_proxy: "http://corp:20172",
+        HTTP_PROXY: "http://corp:20172",
+        HTTPS_PROXY: "http://corp:20172",
+        ALL_PROXY: "http://corp:20172",
+        no_proxy: "127.0.0.1",
+        NO_PROXY: "127.0.0.1",
+        BILI_UPSTREAM_PROXY: "http://relay:9999",
+        PATH: "/usr/bin",
+        HOME: "/home/dog",
+    });
+    for (const k of ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"]) {
+        assert.equal(cleaned[k], undefined, `${k} should be stripped`);
+    }
+    assert.equal(cleaned.no_proxy, "127.0.0.1", "no_proxy kept");
+    assert.equal(cleaned.BILI_UPSTREAM_PROXY, "http://relay:9999", "BILI_UPSTREAM_PROXY kept (explicit chaining)");
+    assert.equal(cleaned.PATH, "/usr/bin", "PATH kept");
+    assert.equal(cleaned.HOME, "/home/dog", "HOME kept");
 });

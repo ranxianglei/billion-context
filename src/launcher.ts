@@ -382,6 +382,14 @@ export function findFreePort(preferred: number, host = LAUNCHER_DEFAULT_HOST): P
     });
 }
 
+const INHERITED_PROXY_VARS = ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"];
+
+export function stripInheritedProxy(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    const cleaned: NodeJS.ProcessEnv = { ...env };
+    for (const key of INHERITED_PROXY_VARS) delete cleaned[key];
+    return cleaned;
+}
+
 function proxyStartArgs(opts: LaunchOptions): string[] {
     const args = ["start", "--host", opts.host, "--port", String(opts.port)];
     if (opts.passthrough) args.push("--passthrough");
@@ -417,7 +425,7 @@ export async function ensureProxyRunning(
             detached: true,
             stdio: ["ignore", logFd, logFd],
             env: {
-                ...process.env,
+                ...stripInheritedProxy(process.env),
                 ...(opts.mitmDomains && opts.mitmDomains.length
                     ? { BILI_MITM_DOMAINS: opts.mitmDomains.join(",") }
                     : {}),
