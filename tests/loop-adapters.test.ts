@@ -67,6 +67,23 @@ test("openai adapter: plain text round-trips live + [DONE] termination", async (
     assert.ok(/finish_reason/.test(out), "finish chunk present");
 });
 
+test("openai adapter: separated usage chunk (choices:[] + usage) captured → lastInputTokens set", async () => {
+    const round1 = [
+        `data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", created: 1, model: "gpt", choices: [{ index: 0, delta: { content: "Hi" }, finish_reason: null }] })}\n\n`,
+        `data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", created: 1, model: "gpt", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`,
+        `data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", created: 1, model: "gpt", choices: [], usage: { prompt_tokens: 42, completion_tokens: 7, prompt_tokens_details: { cached_tokens: 30 } } })}\n\n`,
+        `data: [DONE]\n\n`,
+    ].join("");
+    const ctx = makeCtx("openai-usage-sep");
+    await drain(
+        new Response(round1, { status: 200 }).body!,
+        ctx,
+        createOpenaiAdapter({ model: "gpt" }),
+        { model: "gpt", messages: [], stream: true },
+    );
+    assert.ok((ctx.session.stats.lastInputTokens ?? 0) > 0, "usage from choices:[] chunk captured (lastInputTokens > 0)");
+});
+
 test("openai adapter: acp_status-only round → marker + re-request, no crash", async () => {
     const round1 = [
         `data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", created: 1, model: "gpt", choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }] })}\n\n`,

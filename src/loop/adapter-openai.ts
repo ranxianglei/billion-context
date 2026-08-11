@@ -136,7 +136,19 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>): Compr
                 const rawBuf = Buffer.from(eventStr + "\n\n", "utf8");
                 const choices = parsed.choices as Array<Record<string, unknown>> | undefined;
                 const choice = choices?.[0];
-                if (!choice) continue;
+                if (!choice) {
+                    if (parsed.usage) {
+                        const u = parsed.usage as Record<string, unknown>;
+                        const pd = u.prompt_tokens_details as Record<string, unknown> | undefined;
+                        yield {
+                            kind: "usage",
+                            inputTokens: typeof u.prompt_tokens === "number" ? u.prompt_tokens : undefined,
+                            outputTokens: typeof u.completion_tokens === "number" ? u.completion_tokens : undefined,
+                            cachedTokens: typeof pd?.cached_tokens === "number" ? pd.cached_tokens : undefined,
+                        } as ParsedStreamEvent;
+                    }
+                    continue;
+                }
                 const delta = choice.delta as Record<string, unknown> | undefined;
                 const finishReason = typeof choice.finish_reason === "string" ? choice.finish_reason : undefined;
 
