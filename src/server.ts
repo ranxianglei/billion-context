@@ -1184,7 +1184,7 @@ async function forward(
                     }
                 }
                 res.write(chunk);
-                if (res.writableNeedDrain) await new Promise<void>((r) => res.once("drain", () => r()));
+                if (res.writableNeedDrain) await awaitDrain(res);
             }
             res.end();
         } else if (prepared.protocol === "openai") {
@@ -1208,7 +1208,7 @@ async function forward(
                         log("warn", `[${prepared.session.id}] tag echo: openai response stream contains <acp tag`);
                     }
                 }
-                if (!res.write(chunk)) await new Promise<void>((r) => res.once("drain", () => r()));
+                if (!res.write(chunk)) await awaitDrain(res);
             }
         } else if (prepared.protocol === "responses") {
             const parsedReq = JSON.parse(typeof body === "string" ? body : body.toString("utf8"));
@@ -1231,7 +1231,7 @@ async function forward(
                         log("warn", `[${prepared.session.id}] tag echo: responses response stream contains <acp tag`);
                     }
                 }
-                if (!res.write(chunk)) await new Promise<void>((r) => res.once("drain", () => r()));
+                if (!res.write(chunk)) await awaitDrain(res);
             }
         } else {
             const parsedReq = JSON.parse(typeof body === "string" ? body : body.toString("utf8"));
@@ -1254,7 +1254,7 @@ async function forward(
                         log("warn", `[${prepared.session.id}] tag echo: anthropic response stream contains <acp tag`);
                     }
                 }
-                if (!res.write(chunk)) await new Promise<void>((r) => res.once("drain", () => r()));
+                if (!res.write(chunk)) await awaitDrain(res);
             }
         }
         res.end();
@@ -1335,6 +1335,18 @@ async function forward(
     markDirty(prepared.session);
 }
 
+/** Wait for backpressure drain, but also resolve when the client connection
+ *  closes or errors. Without this, a client that stops reading mid-stream
+ *  leaves the request hanging forever on 'drain' — and with it the session
+ *  lock chain, freezing every later request on that session. */
+export function awaitDrain(res: http.ServerResponse): Promise<void> {
+    return new Promise((resolve) => {
+        res.once("drain", resolve);
+        res.once("close", resolve);
+        res.once("error", resolve);
+    });
+}
+
 async function pipeThrough(stream: ReadableStream<Uint8Array>, res: http.ServerResponse): Promise<void> {
     const reader = stream.getReader();
     try {
@@ -1342,7 +1354,7 @@ async function pipeThrough(stream: ReadableStream<Uint8Array>, res: http.ServerR
             const { done, value } = await reader.read();
             if (done) break;
             if (!res.write(Buffer.from(value))) {
-                await new Promise<void>((r) => res.once("drain", () => r()));
+                await awaitDrain(res);
             }
         }
     } finally {
