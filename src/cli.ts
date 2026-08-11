@@ -10,6 +10,8 @@
  *   bili start --debug            verbose logging
  *   bili start --config FILE      path to config file (default: XDG)
  *   bili start --passthrough      forward without compression
+ *   bili pi/codex/claude [args]   start a proxy + launch a client via cert-MITM
+ *   bili test pi                  non-polluting pi smoke test
  *   bili --version
  *   bili --help
  *
@@ -21,6 +23,7 @@ import { loadOptions, ensureConfigTemplate } from "./config.js";
 import { startServer } from "./server.js";
 import { configFile as defaultConfigFile } from "./paths.js";
 import { checkForUpdate, startAutoUpdate } from "./update.js";
+import { runLaunch, runTestPi, isLaunchClient, type ClientName } from "./launcher.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -50,19 +53,38 @@ const PACKAGE_NAME = (() => {
 const HELP = `bili ${VERSION} — billion-context proxy
 
 Usage:
-  bili [start] [options]        start the proxy (default: reads ${defaultConfigFile()})
-  bili update                   check for & install a newer version now
-  bili --version                print version
-  bili --help                   show this help
+  bili [start] [options]           start the proxy (default: reads ${defaultConfigFile()})
+  bili pi [opts --] [args]         start a proxy + launch pi against it (cert-MITM)
+  bili codex [opts --] [args]      start a proxy + launch codex against it (cert-MITM)
+  bili claude [opts --] [args]     start a proxy + launch claude against it (cert-MITM)
+  bili test pi                     non-polluting pi smoke test through the proxy
+  bili update                      check for & install a newer version now
+  bili --version                   print version
+  bili --help                      show this help
+
+Launcher (bili pi / bili codex / bili claude):
+  Brings up a proxy on an independent port (reusing one already running on
+  that port), then runs the client pointed at it via HTTPS_PROXY + the proxy's
+  MITM CA — no config-file edits. Discovered HTTPS upstream domains are
+  auto-whitelisted for MITM so the proxy TLS-terminates exactly the hosts the
+  client uses; HTTP / localhost providers go direct. pi/claude trust the CA
+  via NODE_EXTRA_CA_CERTS, codex via SSL_CERT_FILE. Proxy killed on client exit.
+    bili pi                               # launch pi through the proxy
+    bili pi -- print "hi"                 # args after the client are passed through
+    bili codex                            # launch codex through the proxy
+    bili claude                           # launch claude through the proxy
+    bili test pi                          # quick end-to-end check of the pi path
+    bili pi --mitm-domain api.foo.com     # add a domain to the MITM whitelist
 
 Options (override config file / env):
-  --port <N>                    listen port (default 8787)
-  --host <ADDR>                 listen host (default 127.0.0.1)
-  --config <FILE>               path to config JSON (default: XDG location)
-  --debug                       verbose logging
-  --passthrough                 forward without compression
-  --no-passthrough              force compression on (overrides config)
-  --no-auto-update              disable background self-update this run
+  --port <N>                       listen port (default 8787)
+  --host <ADDR>                    listen host (default 127.0.0.1)
+  --mitm-domain <domain>           extra MITM domain (repeatable; launcher only)
+  --config <FILE>                  path to config JSON (default: XDG location)
+  --debug                          verbose logging
+  --passthrough                    forward without compression
+  --no-passthrough                 force compression on (overrides config)
+  --no-auto-update                 disable background self-update this run
 
 Config: ${defaultConfigFile()}
   Set port/host/debug/providers/compress/autoUpdate there. See README §Configuration.
@@ -72,7 +94,10 @@ Docs: https://github.com/ranxianglei/billion-context
 `;
 
 type Parsed = {
-    command: "start" | "update" | "help" | "version";
+    command: "start" | "update" | "help" | "version" | "launch" | "test";
+    client?: ClientName;
+    clientArgs: string[];
+    mitmDomains: string[];
     overrides: Record<string, string | undefined>;
 };
 
@@ -80,9 +105,17 @@ function parseArgs(argv: string[]): Parsed {
     const overrides: Record<string, string | undefined> = {};
     let command: Parsed["command"] = "start";
     const positional: string[] = [];
+    let client: ClientName | undefined;
+    let clientArgs: string[] = [];
+    const mitmDomains: string[] = [];
 
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i]!;
+        if (!client && positional.length === 0 && isLaunchClient(a)) {
+            client = a;
+            clientArgs = argv.slice(i + 1);
+            break;
+        }
         switch (a) {
             case "--help":
             case "-h":
@@ -104,6 +137,15 @@ function parseArgs(argv: string[]): Parsed {
             case "--no-passthrough":
                 overrides.ACP_PASSTHROUGH = "0";
                 break;
+            case "--mitm-domain": {
+                const val = argv[++i];
+                if (val === undefined) {
+                    console.error(`bili: ${a} requires a value`);
+                    process.exit(2);
+                }
+                mitmDomains.push(val);
+                break;
+            }
             case "--port":
             case "--host":
             case "--config": {
@@ -133,25 +175,36 @@ function parseArgs(argv: string[]): Parsed {
         }
     }
 
-    // First positional (if any) is the command. "start" | "update" are recognized;
-    // an unknown command is an error.
-    if (positional.length > 0) {
+    // First positional (if any) is the command. "start" | "update" | "test"
+    // are recognized; an unknown command is an error.
+    if (client) {
+        command = "launch";
+    } else if (positional.length > 0) {
         const cmd = positional[0]!;
         if (cmd === "start") {
             command = command === "help" || command === "version" ? command : "start";
         } else if (cmd === "update") {
             command = "update";
+        } else if (cmd === "test") {
+            const target = positional[1];
+            if (target && isLaunchClient(target)) {
+                command = "test";
+                client = target;
+            } else {
+                console.error(`bili test: unknown client "${target ?? ""}" (try "bili test pi")`);
+                process.exit(2);
+            }
         } else {
             console.error(`bili: unknown command "${cmd}" (try "bili --help")`);
             process.exit(2);
         }
     }
 
-    return { command, overrides };
+    return { command, client, clientArgs, mitmDomains, overrides };
 }
 
 export async function main(): Promise<void> {
-    const { command, overrides } = parseArgs(process.argv.slice(2));
+    const { command, client, clientArgs, mitmDomains, overrides } = parseArgs(process.argv.slice(2));
     if (command === "help") {
         process.stdout.write(HELP);
         return;
@@ -163,6 +216,18 @@ export async function main(): Promise<void> {
     if (command === "update") {
         // Manual one-shot update — bypasses the throttle.
         await checkForUpdate({ packageName: PACKAGE_NAME, currentVersion: VERSION, autoUpdate: true }, true);
+        return;
+    }
+    if (command === "test") {
+        if (client === "pi") {
+            await runTestPi({ overrides, mitmDomains });
+            return;
+        }
+        console.error("bili test: only 'pi' supported for now");
+        process.exit(2);
+    }
+    if (command === "launch") {
+        await runLaunch({ client: client!, clientArgs, mitmDomains, overrides });
         return;
     }
 

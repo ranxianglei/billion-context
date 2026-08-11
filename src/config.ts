@@ -271,7 +271,10 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         logFile: env.ACP_LOG_FILE !== undefined ? (env.ACP_LOG_FILE || undefined) : fileConfig.logFile,
         mitm: {
             enabled: (env.BILI_MITM ?? (fileConfig.mitm?.enabled === false ? "0" : "1")) !== "0",
-            domains: fileConfig.mitm?.domains ?? [],
+            domains: dedupeDomains([
+                ...(fileConfig.mitm?.domains ?? []),
+                ...splitCsv(env.BILI_MITM_DOMAINS),
+            ]),
         },
     };
 }
@@ -307,6 +310,26 @@ type FileConfig = {
 function nonEmpty(value: string | undefined): string | undefined {
     const trimmed = value?.trim();
     return trimmed ? trimmed : undefined;
+}
+
+function splitCsv(value: string | undefined): string[] {
+    if (!value) return [];
+    return value
+        .split(",")
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0);
+}
+
+function dedupeDomains(list: string[]): string[] {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const d of list) {
+        if (!seen.has(d)) {
+            seen.add(d);
+            out.push(d);
+        }
+    }
+    return out;
 }
 
 function loadConfigFile(): FileConfig {
