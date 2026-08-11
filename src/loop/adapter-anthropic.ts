@@ -1,5 +1,5 @@
 import type { CoreMessage } from "acp-kernel";
-import { coreToAnthropic } from "../anthropic.js";
+import { coreToAnthropic, extractSystem, buildSystem, type AnthropicRequestBody } from "../anthropic.js";
 import { buildVisibilityMarker } from "../compress-loop.js";
 import type {
     CompressLoopAdapter,
@@ -83,7 +83,7 @@ function remapIndexInEvent(eventStr: string, newIndex: number): Buffer {
     return Buffer.from(rebuilt.join("\n") + "\n\n", "utf8");
 }
 
-export function createAnthropicAdapter(requestBody: Record<string, unknown>): CompressLoopAdapter {
+export function createAnthropicAdapter(requestBody: Record<string, unknown>, originalSystem?: AnthropicRequestBody["system"]): CompressLoopAdapter {
     const model = (requestBody.model as string) ?? undefined;
     let messageId: string | undefined;
     let clientIndex = 0;
@@ -136,7 +136,10 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>): Co
     return {
         buildRequest(coreMessages, systemPrompt, body) {
             const messages = coreToAnthropic(coreMessages);
-            return { ...body, system: systemPrompt, messages };
+            const baseText = originalSystem !== undefined ? extractSystem(originalSystem) : "";
+            const full = baseText ? `${baseText}\n\n---\n\n${systemPrompt}` : systemPrompt;
+            const system = originalSystem !== undefined ? buildSystem(full, originalSystem) : full;
+            return { ...body, system, messages };
         },
 
         async *parseStream(upstream, round) {
