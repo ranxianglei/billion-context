@@ -13,7 +13,7 @@ export const ACP_TEXT_CLOSE = "\x3c/acp_compress\x3e";
 export const COMPRESS_TOOL = {
     name: COMPRESS_TOOL_NAME,
     description:
-        "Replace a contiguous range of older conversation with a detailed summary you write. Use when content is genuinely consumed. Batch form: content=[{startId,endId,summary,topic?}].",
+        "Replace a contiguous range of older conversation with a detailed summary you write. Use when content is genuinely consumed. Batch form: content=[{startId,endId,summary,topic?}]. REQUIRED — compress without content is invalid.",
     input_schema: {
         type: "object",
         properties: {
@@ -33,6 +33,7 @@ export const COMPRESS_TOOL = {
                 },
             },
         },
+        required: ["content"],
     },
 };
 
@@ -41,24 +42,28 @@ export type ParsedRange = {
     endRef: string;
     summary: string;
     topic?: string;
+    compressCallId?: string;
 };
 
-export function parseCompressInput(input: unknown): ParsedRange[] {
+export function parseCompressInput(input: unknown, callId?: string): ParsedRange[] {
     if (!input || typeof input !== "object") {
         loggerLog("warn", `[acp-compress-input] rejected: not object (${typeof input})`);
         return [];
     }
     const obj = input as Record<string, unknown>;
-    if (Array.isArray(obj.content)) {
-        const out = obj.content
-            .map((r) => toRange(r as Record<string, unknown>))
-            .filter((r): r is ParsedRange => r !== null);
-        if (out.length === 0) loggerLog("warn", `[acp-compress-input] content array but 0 valid ranges. keys per item: ${obj.content.map((c) => Object.keys(c ?? {}).join(",")).join(" | ")}`);
-        return out;
-    }
     const single = toRange(obj);
-    if (!single) loggerLog("warn", `[acp-compress-input] no content array, single-parse failed. top keys: ${Object.keys(obj).join(",")}`);
-    return single ? [single] : [];
+    const ranges = Array.isArray(obj.content)
+        ? obj.content
+              .map((r) => toRange(r as Record<string, unknown>))
+              .filter((r): r is ParsedRange => r !== null)
+        : single
+          ? [single]
+          : [];
+    if (ranges.length === 0) {
+        loggerLog("warn", `[acp-compress-input] parsed 0 valid ranges. top keys: ${Object.keys(obj).join(",")}`);
+    }
+    if (callId) for (const r of ranges) r.compressCallId = callId;
+    return ranges;
 }
 
 function toRange(r: Record<string, unknown>): ParsedRange | null {
@@ -90,7 +95,7 @@ export const COMPRESS_TOOL_OPENAI = {
                 topic: { type: "string", description: "Optional short title for the compressed range" },
                 content: {
                     type: "array",
-                    description: "One or more ranges to compress into separate summary blocks",
+                    description: "One or more ranges to compress into separate summary blocks. REQUIRED — compress without content is invalid.",
                     items: {
                         type: "object",
                         properties: {
@@ -103,6 +108,7 @@ export const COMPRESS_TOOL_OPENAI = {
                     },
                 },
             },
+            required: ["content"],
         },
     },
 };
@@ -293,6 +299,20 @@ export const ACP_TOOLS_RESPONSES = [
 export const PROXY_TOOL_NAMES: ReadonlySet<string> = new Set([
     COMPRESS_TOOL_NAME,
     DECOMPRESS_TOOL_NAME,
+    SEARCH_CONTEXT_TOOL_NAME,
+    ACP_STATUS_TOOL_NAME,
+]);
+
+/** compress/decompress: mutate history → must drive the compress loop (their
+ *  result is folded into the request before the model continues). */
+export const MUTATING_PROXY_TOOLS: ReadonlySet<string> = new Set([
+    COMPRESS_TOOL_NAME,
+    DECOMPRESS_TOOL_NAME,
+]);
+
+/** acp_status/search_context: read-only → must NOT loop. Looping them made the
+ *  model re-call until the 5× limit and discarded the whole turn. */
+export const READONLY_PROXY_TOOLS: ReadonlySet<string> = new Set([
     SEARCH_CONTEXT_TOOL_NAME,
     ACP_STATUS_TOOL_NAME,
 ]);
