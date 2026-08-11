@@ -284,6 +284,15 @@ export async function* runCompressLoop(
             ctx.log(`[acp-loop] round ${round} saw mutating proxy tool; re-requesting`);
 
             const newBody = adapter.buildRequest(coreMessages, systemPrompt, requestBody);
+            if (process.env.ACP_DUMP_REQ !== "0" && ctx.debug) {
+                try {
+                    const fs = await import("node:fs");
+                    const dumpDir = process.env.ACP_DUMP_DIR || `${process.env.HOME}/.local/state/billion-context/dumps`;
+                    fs.mkdirSync(dumpDir, { recursive: true });
+                    const sid = ctx.session.id ?? "unknown";
+                    fs.writeFileSync(`${dumpDir}/req-${Date.now()}-${sid}-REREQUEST.json`, JSON.stringify(newBody, null, 2));
+                } catch { /* best-effort */ }
+            }
             const { response: resp, clearTimer } = await fetchWithTimeout(requestOptions.url, {
                 method: "POST",
                 headers: requestOptions.headers,

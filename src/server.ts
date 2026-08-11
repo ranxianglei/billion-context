@@ -1149,7 +1149,7 @@ async function forward(
             const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol);
             const loop = runCompressLoop(
                 streamToRead,
-                { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, textProtocol, debug: opts.debug },
+                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, textProtocol, debug: opts.debug },
                 parsedReq,
                 { url: upstreamUrl, headers: reqHeaders },
                 adapter,
