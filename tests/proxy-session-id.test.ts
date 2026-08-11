@@ -88,6 +88,10 @@ test("affinityToken: generated identities are never forwarded upstream", () => {
 });
 
 test("clientConversationHeader: reads known session header names in priority order", () => {
+    // Claude Code's true per-session UUID is the strongest signal and wins
+    // over any other session header (only claude-code-family clients send it).
+    assert.equal(clientConversationHeader({ "x-claude-code-session-id": "S", "x-session-affinity": "A" }), "S");
+    assert.equal(clientConversationHeader({ "x-claude-code-session-id": "S" }), "S");
     assert.equal(clientConversationHeader({ "x-session-affinity": "A", "x-acp-session": "B" }), "A");
     assert.equal(clientConversationHeader({ "x-acp-session": "B" }), "B");
     assert.equal(clientConversationHeader({ "x-session-id": "C" }), "C");
