@@ -537,6 +537,14 @@ async function handle(
 
 const ACP_TAG_MARK = "\x3cacp ";
 
+// acp-kernel injects an in-place `acp_summary_*` at the compressed range as a
+// generic-library fallback; this host strips it because the compress tool-call
+// already carries the summary (hideConsumedCompressCalls keeps active-block calls),
+// and a mid-stream insertion would shift the upstream prefix-cache breakpoint.
+function stripKernelSummaries(messages: BiliMessage[]): BiliMessage[] {
+    return messages.filter((m) => !(m.id ?? "").startsWith("acp_summary_"));
+}
+
 function diagTagSummary(messages: CoreMessage[], sessionId: string, strategy: string): string {
     let textTagged = 0;
     let toolTagged = 0;
@@ -604,7 +612,7 @@ function prepareAnthropic(
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit));
-        processedMessages = turn.messages;
+        processedMessages = stripKernelSummaries(turn.messages);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = coreToAnthropic(processedMessages as BiliMessage[], cacheControls);
 
@@ -676,7 +684,7 @@ function prepareOpenai(
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit));
-        processedMessages = turn.messages;
+        processedMessages = stripKernelSummaries(turn.messages);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = coreToOpenai(processedMessages as BiliMessage[]);
 
@@ -767,7 +775,7 @@ function prepareResponses(
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit));
-        processedMessages = turn.messages;
+        processedMessages = stripKernelSummaries(turn.messages);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltInput = patchResponsesInput(projection, processedMessages);
         if (shouldInject && !process.env.ACP_NO_COMPRESS_PROMPT) {
@@ -859,8 +867,9 @@ export function prepareCountTokens(
     try {
         const { msgs, cacheControls } = anthropicToCore(parsed);
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount: session.stats.lastInputTokens, renderTags: "text-only" });
-        const rebuiltMessages = coreToAnthropic(turn.messages as BiliMessage[], cacheControls);
-        log("info", `[${sessionId}] count_tokens pruned: ${msgs.length} → ${turn.messages.length} msgs`);
+        const stripped = stripKernelSummaries(turn.messages as BiliMessage[]);
+        const rebuiltMessages = coreToAnthropic(stripped, cacheControls);
+        log("info", `[${sessionId}] count_tokens pruned: ${msgs.length} → ${stripped.length} msgs`);
         return {
             body: JSON.stringify({ ...parsed, messages: rebuiltMessages }),
             session,
