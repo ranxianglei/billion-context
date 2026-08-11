@@ -20,6 +20,12 @@ import { log as loggerLog } from "../logger.js";
 
 export const MAX_LOOP_ROUNDS = 10;
 
+const ACP_TAG_RE = /\x3cacp\b[^>]*\x3e[\s\S]*?\x3c\/acp\x3e/gi;
+
+function stripAcpTags(text: string): string {
+    return text.replace(ACP_TAG_RE, "").replace(/\x3cacp\b[^>]*\/\x3e/gi, "").trimEnd();
+}
+
 export interface LoopCtx {
     core: CompressionCore;
     config: Config;
@@ -146,12 +152,18 @@ export async function* runCompressLoop(
             const calls: ToolCallEmit[] = [];
             let usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number } = {};
             let finishReason: string | undefined;
+            let streamingTagEcho = false;
 
             for await (const ev of adapter.parseStream(currentUpstream, round)) {
                 if (ev.kind === "text") {
                     assistantText += ev.delta;
                     if (!ctx.textProtocol && round === 1 && ev.raw) {
-                        yield ev.raw;
+                        if (!streamingTagEcho && /\x3cacp\b/i.test(ev.delta)) {
+                            streamingTagEcho = true;
+                        }
+                        if (!streamingTagEcho) {
+                            yield ev.raw;
+                        }
                     }
                 } else if (ev.kind === "tool_call") {
                     calls.push({ name: ev.name, callId: ev.callId, arguments: ev.arguments });
@@ -185,6 +197,8 @@ export async function* runCompressLoop(
                 resolvedText = extracted.clean;
                 allCalls = [...calls, ...extracted.calls];
             }
+
+            resolvedText = stripAcpTags(resolvedText);
 
             if (ctx.textProtocol && resolvedText.length > 0) {
                 yield adapter.emitText(resolvedText);
