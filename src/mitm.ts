@@ -8,7 +8,7 @@ import { connectThroughProxy } from "./upstream-proxy.js";
  *  providers billion-context targets. Everything else (banking, mail, …) is
  *  pure tunnelled — we never decrypt it. This whitelist is the security
  *  boundary: expanding it expands the set of hosts whose TLS we terminate. */
-const DEFAULT_MITM_DOMAINS = [
+export const DEFAULT_MITM_DOMAINS = [
     "open.bigmodel.cn",
     "api.anthropic.com",
     "api.openai.com",

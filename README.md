@@ -42,8 +42,14 @@ This installs the `bili` command (`bili-proxy` is kept as an alias).
 
 ## Quickstart
 
-Two ways to use it — pick one:
+Three ways to use it — pick one:
 
+- **Launcher (no config-file edits):** run `bili pi`, `bili codex`, or
+  `bili claude` and billion-context brings up a proxy on an independent port,
+  then launches the client pointed at it. Both schemes are auto-proxied with no
+  config edits: HTTPS upstreams via `HTTPS_PROXY` + the proxy's MITM CA
+  (whitelisted for TLS interception), HTTP upstreams via a `/bili/` baseURL
+  rewrite (cert MITM can't intercept plaintext). See **Option 0** below.
 - **Zero-config (simplest):** prefix your client's baseURL with the proxy
   origin + `/bili/`. No config file needed — context windows are auto-detected
   from the [models.dev](https://models.dev) registry. The `/bili/` prefix also
@@ -57,6 +63,68 @@ Two ways to use it — pick one:
 
 Compression is injected automatically — you only configure routing, never
 compression itself.
+
+### Option 0 — Launcher (`bili pi` / `bili codex` / `bili claude`)
+
+The launcher wraps a client in one command: it starts a proxy on an
+independent port (reusing one already running there), then points the client
+at it via **certificate-based MITM** — no config files are edited. The client's
+own config is READ to discover which HTTPS upstream hosts it talks to; those
+hosts are whitelisted for MITM so the proxy can TLS-terminate exactly them and
+blind-tunnel everything else.
+
+```bash
+bili pi                               # launch pi through the proxy
+bili pi -- print "hi"                 # args after the client are passed through
+bili pi-test                          # clean pi (extensions off) — proxy owns compression, no double-compress
+bili codex                            # launch codex through the proxy
+bili claude                           # launch claude through the proxy
+bili test pi                          # quick end-to-end smoke test of the pi path
+bili pi --mitm-domain api.foo.com     # add a domain to the MITM whitelist
+```
+
+How the client is pointed at the proxy (set automatically in the child env):
+
+| Client      | Proxy redirect      | CA trust env var        |
+|-------------|---------------------|-------------------------|
+| pi          | `HTTPS_PROXY`       | `NODE_EXTRA_CA_CERTS`   |
+| claude      | `HTTPS_PROXY`       | `NODE_EXTRA_CA_CERTS`   |
+| codex       | `HTTPS_PROXY`       | `SSL_CERT_FILE`         |
+
+The real upstream HTTPS hosts are **discovered by reading** (never editing)
+the client's own config, so whatever you already have set up keeps working:
+
+| Client      | Read from                                    |
+|-------------|----------------------------------------------|
+| Pi          | `~/.pi/agent/models.json` — each provider's `baseUrl` |
+| Codex       | `~/.codex/config.toml` — each `[model_providers.<name>]` `base_url` (+ top-level `openai_base_url`) |
+| Claude Code | hardcoded `api.anthropic.com` (no per-config upstream) |
+
+Only **HTTPS** hosts are MITM'd (a self-signed CA can't intercept plaintext
+anyway); HTTP / `localhost` / `127.0.0.1` providers used to go direct, but are
+now auto-proxied too. Both schemes are covered with no config edits:
+
+- **HTTPS upstreams → cert MITM.** The MITM CA cert is the proxy's own root
+  (`~/.local/share/billion-context/ca/root-ca.pem`, generated lazily); the
+  client must trust it — pi/claude honor `NODE_EXTRA_CA_CERTS`, codex honors
+  `SSL_CERT_FILE`. Compression is injected on the intercepted TLS stream.
+- **HTTP upstreams → `/bili/` baseURL rewrite** (since plaintext can't be
+  MITM'd). The launcher rewrites the client's base URL through the client's own
+  mechanism, leaving its config files untouched: codex via `-c key=value` flags,
+  claude via the `ANTHROPIC_BASE_URL` env var, pi via an isolated
+  `PI_CODING_AGENT_DIR` pointing at a temp copy of the pi home with a rewritten
+  `models.json` (`auth.json` and the rest are symlinked through unchanged; the
+  temp dir is removed when the client exits).
+
+`--mitm-domain <domain>` (repeatable) adds extra domains to the whitelist
+beyond what auto-discovery finds — useful for hosts the client fetches at
+runtime rather than from its config file. The proxy port defaults to `8787`;
+if it's taken, a free port is chosen automatically. Use `--passthrough` /
+`--debug` / `--no-auto-update` just like plain `bili`.
+
+> **Note:** the launcher ties the proxy's lifetime to the client — when the
+> client exits, a proxy it started is stopped. If it reuses a proxy you already
+> started with plain `bili`, that one is left running.
 
 ### Option A — Zero-config (`/bili/` prefix)
 

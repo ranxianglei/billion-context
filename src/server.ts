@@ -174,6 +174,9 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 (nOverrides ? ` — context overrides for ${nOverrides} upstream URL(s)` : "")
                 + (opts.mitm.enabled ? ` — MITM proxy on (whitelist)${opts.mitm.domains.length ? ` +${opts.mitm.domains.join(",")}` : ""}` : ""),
         );
+        if (opts.debug) {
+            log("info", `[debug] build features: raw-HTTP-capture(on) | remote_compaction_v2-strip(on) | cert-MITM-launcher(on) | strip-acp-summary(on) — seeing this line confirms the launcher build (not registry 0.1.34)`);
+        }
     });
     // Listen errors (EADDRINUSE port taken, EACCES privileged port, EAFNOSUPPORT
     // bad host) surface as an 'error' event on the server. Without a listener
@@ -456,6 +459,22 @@ async function handle(
             parsed = null;
         }
     }
+    // Capture the CLIENT's raw incoming request (before bili rebuilds) to
+    // resolve whether codex sends previous_response_id + full input vs delta.
+    if (opts.debug && parsed && typeof parsed === "object") {
+        try {
+            const p = parsed as Record<string, unknown>;
+            const hasPrev = p.previous_response_id !== undefined;
+            const inLen = Array.isArray(p.input) ? p.input.length : 0;
+            log("info", `[debug] INCOMING previous_response_id=${hasPrev ? String(p.previous_response_id).slice(0, 16) : "absent"} input_items=${inLen} instructions=${p.instructions !== undefined ? "present" : "absent"}`);
+            const rawDir = `${stateDir()}/raw`;
+            try { fs.mkdirSync(rawDir, { recursive: true }); } catch { /* best-effort */ }
+            const hdrs = Object.entries(req.headers)
+                .filter(([k]) => !/authorization|x-api-key|cookie/i.test(k))
+                .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(",") : v}`).join("\n");
+            fs.writeFileSync(`${rawDir}/${Date.now()}-INCOMING.txt`, `${req.method} ${req.url}\n${hdrs}\n\n${bodyBuffer.toString("utf8")}`);
+        } catch { /* best-effort dump */ }
+    }
     // Per-request context limit: look up body.model against the per-route
     // model declaration first, then the built-in table.
     let reqConfig = config;
@@ -549,6 +568,14 @@ async function handle(
 
 const ACP_TAG_MARK = "\x3cacp ";
 
+// acp-kernel injects an in-place `acp_summary_*` at the compressed range as a
+// generic-library fallback; this host strips it because the compress tool-call
+// already carries the summary (hideConsumedCompressCalls keeps active-block calls),
+// and a mid-stream insertion would shift the upstream prefix-cache breakpoint.
+function stripKernelSummaries(messages: BiliMessage[]): BiliMessage[] {
+    return messages.filter((m) => !(m.id ?? "").startsWith("acp_summary_"));
+}
+
 function diagTagSummary(messages: CoreMessage[], sessionId: string, strategy: string): string {
     let textTagged = 0;
     let toolTagged = 0;
@@ -618,7 +645,7 @@ function prepareAnthropic(
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit));
-        processedMessages = turn.messages;
+        processedMessages = stripKernelSummaries(turn.messages);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = coreToAnthropic(processedMessages as BiliMessage[], cacheControls);
 
@@ -692,7 +719,7 @@ function prepareOpenai(
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit));
-        processedMessages = turn.messages;
+        processedMessages = stripKernelSummaries(turn.messages);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = coreToOpenai(processedMessages as BiliMessage[]);
 
@@ -785,7 +812,7 @@ function prepareResponses(
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit));
-        processedMessages = turn.messages;
+        processedMessages = stripKernelSummaries(turn.messages);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltInput = patchResponsesInput(projection, processedMessages);
         if (shouldInject && !process.env.ACP_NO_COMPRESS_PROMPT) {
@@ -823,14 +850,16 @@ function prepareResponses(
     );
     if (promptCacheKey && !rebuilt.prompt_cache_key) rebuilt.prompt_cache_key = promptCacheKey;
     // This adapter is stateless: we replay the FULL conversation in `input`.
-    // Strip Responses' native chaining fields so the upstream does not resolve
-    // stored server-side state on top of the input we already sent. Forwarding
-    // previous_response_id would make the prefix shift every turn (as the id
-    // advances) and duplicate history — breaking prompt-cache. `instructions`
-    // was already lifted into the developer message at input[1], so forwarding
-    // it again here double-sends it and violates the responses_lite contract
+    // Strip Responses' native chaining field so the upstream does not resolve
+    // stored server-side state ON TOP of the input we already sent (which would
+    // duplicate history for clients that use store:true + chaining). Empirically
+    // codex sends store:false and never sets previous_response_id, so this is a
+    // no-op for codex — kept defensively for any client that does chain. Set
+    // ACP_KEEP_RESPONSE_ID=1 to preserve it (diagnostic only). `instructions`
+    // was already lifted into the developer message at input[1]; forwarding it
+    // again here double-sends it and violates the responses_lite contract
     // (top-level instructions must stay empty for code_mode tool exposure).
-    delete rebuilt.previous_response_id;
+    if (process.env.ACP_KEEP_RESPONSE_ID !== "1") delete rebuilt.previous_response_id;
     delete rebuilt.instructions;
     // Log the final tools we forward upstream so we can confirm ACP tools are
     // present. Distinguishes "compress" (top-level function) from Codex
@@ -878,8 +907,9 @@ export function prepareCountTokens(
     try {
         const { msgs, cacheControls } = anthropicToCore(parsed);
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount: session.stats.lastInputTokens, renderTags: "text-only" });
-        const rebuiltMessages = coreToAnthropic(turn.messages as BiliMessage[], cacheControls);
-        log("info", `[${sessionId}] count_tokens pruned: ${msgs.length} → ${turn.messages.length} msgs`);
+        const stripped = stripKernelSummaries(turn.messages as BiliMessage[]);
+        const rebuiltMessages = coreToAnthropic(stripped, cacheControls);
+        log("info", `[${sessionId}] count_tokens pruned: ${msgs.length} → ${stripped.length} msgs`);
         return {
             body: JSON.stringify({ ...parsed, messages: rebuiltMessages }),
             session,
@@ -1078,6 +1108,20 @@ async function forward(
         headers[k] = Array.isArray(v) ? v.join(", ") : v;
     }
     headers["host"] = new URL(route ? route.upstream : opts.upstream).host;
+    // codex advertises its own server-side context compaction via this beta
+    // feature. It conflicts with bili's client-side compress (bili IS the
+    // compression layer) and third-party aggregators reject it with
+    // "invalid range / ref not found". Strip it so bili's compress is the
+    // sole mechanism.
+    const betaKey = Object.keys(headers).find((h) => h.toLowerCase() === "x-codex-beta-features");
+    if (betaKey) {
+        const kept = headers[betaKey]
+            .split(",")
+            .map((s) => s.trim())
+            .filter((f) => f && f !== "remote_compaction_v2");
+        if (kept.length > 0) headers[betaKey] = kept.join(",");
+        else delete headers[betaKey];
+    }
     // Forward a client-provided Responses session identity only when it was
     // carried in the body rather than an existing request header.
     if (affinity && !clientConversationHeader(req.headers)) {
@@ -1090,6 +1134,41 @@ async function forward(
             if (typeof hv === "string") hdrLog[hk] = hv.length > 200 ? hv.slice(0, 200) + "..." : hv;
         }
         log("info", `[${prepared?.session.id ?? "unknown"}] → upstream headers: ${JSON.stringify(hdrLog)}`);
+    }
+    // Raw HTTP capture: dump the COMPLETE exchange (request method/URL/all
+    // headers/exact body bytes; response status+headers) so two consecutive
+    // requests can be byte-diffed to locate a cache-breaker that the JSON body
+    // dump (which re-formats and omits headers) may hide. Enabled with --debug
+    // (headers written verbatim minus credential values).
+    const rawBase =
+        opts.debug
+            ? (() => {
+                  try {
+                      const rawDir = process.env.ACP_RAW_DUMP_DIR || `${stateDir()}/raw`;
+                      fs.mkdirSync(rawDir, { recursive: true });
+                      return `${rawDir}/${Date.now()}-${prepared?.session.id ?? "unknown"}`;
+                  } catch {
+                      return "";
+                  }
+              })()
+            : "";
+    if (rawBase) {
+        try {
+            const maskHdr = (k: string, v: string) =>
+                /key|auth|token/i.test(k) ? `<masked ${v.length} chars>` : v;
+            const hdrText = Object.entries(headers)
+                .map(([k, v]) => `${k}: ${maskHdr(k, String(v))}`)
+                .join("\n");
+            const bodyText =
+                req.method === "GET" || req.method === "HEAD"
+                    ? ""
+                    : typeof body === "string"
+                      ? body
+                      : Buffer.from(body).toString("utf8");
+            const reqPath = `${rawBase}-REQ.txt`;
+            fs.writeFileSync(reqPath, `${req.method ?? "POST"} ${upstreamUrl}\n${hdrText}\n\n${bodyText}`);
+            log("info", `[debug] RAW request dump: ${reqPath}`);
+        } catch { /* best-effort */ }
     }
     const dispatcher = proxyDispatcher(proxyUrl);
     const init: Omit<RequestInit, "dispatcher"> & { dispatcher?: object } = {
@@ -1119,6 +1198,18 @@ async function forward(
             respLog[k] = v.length > 300 ? v.slice(0, 300) + "..." : v;
         });
         log("info", `[${prepared?.session.id ?? "unknown"}] ← upstream response headers: ${JSON.stringify(respLog)}`);
+    }
+    if (rawBase) {
+        try {
+            const maskHdr = (k: string, v: string) =>
+                /key|auth|token/i.test(k) ? `<masked ${v.length} chars>` : v;
+            const hdrText = Object.entries(respHeaders)
+                .map(([k, v]) => `${k}: ${maskHdr(k, v)}`)
+                .join("\n");
+            const resPath = `${rawBase}-RES.txt`;
+            fs.writeFileSync(resPath, `${upstream.status}\n${hdrText}\n`);
+            log("info", `[debug] RAW response dump: ${resPath}`);
+        } catch { /* best-effort */ }
     }
     // P1.2: if the upstream returned a non-2xx (auth, rate-limit, context too
     // long, ...), do NOT route the error body through the SSE rewriter — it has
