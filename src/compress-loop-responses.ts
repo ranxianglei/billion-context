@@ -199,7 +199,6 @@ export async function compressLoopResponsesJson(
         if (extracted.clean.trim()) {
             inputItems.push({ type: "message", role: "assistant", content: [{ type: "output_text", text: extracted.clean }] });
         }
-        let mutatedThisTurn = false;
         for (const call of proxyCalls) {
             let args: Record<string, unknown> = {};
             try {
@@ -207,15 +206,8 @@ export async function compressLoopResponsesJson(
             } catch (error) {
                 loggerLog("warn", `[acp-compress-args] ${call.name} JSON.parse failed: ${String(error)}`);
             }
-            let result: string;
-            if (MUTATING_PROXY_TOOLS.has(call.name) && mutatedThisTurn) {
-                result = `Already ${call.name}ed once this turn. Do not ${call.name} again; generate your normal response now.`;
-                ctx.log(`[acp-proxy: responses JSON ${call.name} skipped (state already mutated this turn)]`);
-            } else {
-                result = executeProxyTool(call.name, args, ctx);
-                if (MUTATING_PROXY_TOOLS.has(call.name)) mutatedThisTurn = true;
-                ctx.log(`[acp-proxy: responses JSON ${call.name} → ${result.slice(0, 120).replace(/\n/g, " ")}]`);
-            }
+            const result = executeProxyTool(call.name, args, ctx);
+            ctx.log(`[acp-proxy: responses JSON ${call.name} → ${result.slice(0, 120).replace(/\n/g, " ")}]`);
             inputItems.push({ type: "message", role: "developer", content: buildVisibilityMarker(call.name, result) });
         }
         requestBody.input = inputItems;

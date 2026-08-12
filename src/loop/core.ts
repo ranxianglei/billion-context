@@ -171,7 +171,6 @@ export async function* runCompressLoop(
     let activeClearTimer: (() => void) | null = null;
     let currentUpstream = upstream;
     const coreMessages: CoreMessage[] = [...ctx.messages];
-    let mutatedThisTurn = false;
 
     try {
         for (let round = 1; round <= MAX_LOOP_ROUNDS; round++) {
@@ -220,6 +219,7 @@ export async function* runCompressLoop(
                 resolvedText = extracted.clean;
                 allCalls = [...calls, ...extracted.calls];
             }
+            const functionCallIds = new Set(calls.map(c => c.callId));
 
             if (ctx.textProtocol && resolvedText.length > 0) {
                 yield adapter.emitText(resolvedText);
@@ -239,15 +239,7 @@ export async function* runCompressLoop(
                     } catch {
                         parsedArgs = {};
                     }
-                    const isMutating = call.name === "compress" || call.name === "decompress";
-                    let result: string;
-                    if (isMutating && mutatedThisTurn) {
-                        result = `Already ${call.name}ed once this turn. Do not ${call.name} again; generate your normal response now.`;
-                        ctx.log(`[acp-loop] round ${round}: ${call.name} skipped (state already mutated this turn) — no-op result`);
-                    } else {
-                        result = executeProxyTool(call.name, parsedArgs, ctx, call.callId);
-                        if (isMutating) mutatedThisTurn = true;
-                    }
+                    const result = executeProxyTool(call.name, parsedArgs, ctx, call.callId);
                     proxyResults.push({ name: call.name, callId: call.callId, result, arguments: call.arguments });
                     yield adapter.emitMarker(call.name, result);
                 } else {
@@ -274,23 +266,16 @@ export async function* runCompressLoop(
             // never in coreMessages), and hideConsumedCompressCalls runs each
             // round so consumed compress records cannot re-prime the model.
             if (proxyResults.length > 0) {
-                if (resolvedText.length > 0) {
+                if (assistantText.length > 0) {
                     coreMessages.push({
                         id: `acp_loop_r${round}_asst`,
                         role: "assistant",
                         contentType: "text",
-                        text: resolvedText,
+                        text: assistantText,
                     });
                 }
                 for (const pr of proxyResults) {
-                    if (ctx.textProtocol) {
-                        coreMessages.push({
-                            id: `acp_loop_r${round}_marker_${pr.callId}`,
-                            role: "system",
-                            contentType: "text",
-                            text: buildVisibilityMarker(pr.name, pr.result),
-                        });
-                    } else {
+                    if (functionCallIds.has(pr.callId)) {
                         coreMessages.push({
                             id: `acp_loop_r${round}_asst_tc_${pr.callId}`,
                             role: "assistant",
@@ -306,9 +291,19 @@ export async function* runCompressLoop(
                             toolCallId: pr.callId,
                             text: pr.result,
                         });
+                    } else {
+                        coreMessages.push({
+                            id: `acp_loop_r${round}_marker_${pr.callId}`,
+                            role: "system",
+                            contentType: "text",
+                            text: buildVisibilityMarker(pr.name, pr.result),
+                        });
                     }
                 }
-                if (!ctx.textProtocol) {
+                const anyCompressFailed = proxyResults.some(
+                    (pr) => (pr.name === "compress" || pr.name === "decompress") && pr.result.includes("FAILED"),
+                );
+                if (!ctx.textProtocol && !anyCompressFailed) {
                     const hidden = hideConsumedCompressCalls(ctx.session.state, coreMessages);
                     if (hidden.hidden > 0) {
                         ctx.log(`[acp-loop] round ${round} hideConsumed hid ${hidden.hidden} compress record(s)`);
@@ -325,11 +320,11 @@ export async function* runCompressLoop(
             // Re-request so the model receives the proxy-tool result and can
             // continue (standard function-calling continuation: the proxy acts as
             // the client, executes compress/decompress/acp_status/search, then
-            // feeds the result back). The mutatedThisTurn guard above ensures at
-            // most ONE compress/decompress per request — a second mutating call
-            // returns a no-op, which prevents the 0-char spiral (model re-targeting
-            // a just-compressed range on a stale view) without cutting off the
-            // model's continuation (which a hard stop did — it hung the session).
+            // feeds the result back as a normal tool output via functionCallIds
+            // above — success OR failure alike). The model sees the result and
+            // decides its next action (retry a different range, or stop). A failed
+            // compress returns its failure as the tool output, so the model is not
+            // blind to why it failed. MAX_LOOP_ROUNDS bounds runaway loops.
             const reRequest = proxyResults.length > 0 && realCalls === 0;
             if (!reRequest) {
                 yield adapter.emitCompletion({ finishReason, usage });
@@ -345,7 +340,7 @@ export async function* runCompressLoop(
                 return;
             }
 
-            ctx.log(`[acp-loop] round ${round}: proxy tool executed (state ${mutatedThisTurn ? "mutated" : "read-only"}); re-requesting so the model sees the result`);
+            ctx.log(`[acp-loop] round ${round}: proxy tool executed; re-requesting so the model sees the result`);
 
             if (signal?.aborted) break;
 

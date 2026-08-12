@@ -12,7 +12,10 @@ import { createCore } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 import { getSession } from "../src/session.ts";
 
-test("compressLoopResponsesJson: mutatedThisTurn guard — second mutating call in a turn is a no-op", async () => {
+test("compressLoopResponsesJson: no guard — both compress calls in a turn execute (model may compress multiple ranges)", async () => {
+    // Design (post guard-removal): there is NO one-compress guard. Both compress
+    // calls execute and their results are fed back as developer markers so the
+    // model can decide its next action. Guards against re-introducing the no-op.
     let applyCalls = 0;
     const baseCore = createCore();
     const applyCompression = (input: ApplyCompressionInput): ApplyCompressionResult => {
@@ -76,8 +79,8 @@ test("compressLoopResponsesJson: mutatedThisTurn guard — second mutating call 
 
         assert.equal(
             applyCalls,
-            1,
-            "applyCompression must run exactly once — second compress is a no-op (mutatedThisTurn guard)",
+            2,
+            "both compress calls execute (no guard short-circuit)",
         );
 
         assert.ok(forwarded, "upstream was re-requested with both compress markers folded in");
@@ -86,16 +89,13 @@ test("compressLoopResponsesJson: mutatedThisTurn guard — second mutating call 
         assert.equal(devMessages.length, 2, "two developer markers (one per compress call)");
 
         const NO_OP = /Already compressed once this turn\. Do not compress again; generate your normal response now\./;
-        assert.match(
-            JSON.stringify(devMessages[1]),
-            NO_OP,
-            "second compress returns the no-op 'Already compressed...' message",
-        );
-        assert.doesNotMatch(
-            JSON.stringify(devMessages[0]),
-            NO_OP,
-            "first compress executed for real, not the no-op",
-        );
+        for (const dm of devMessages) {
+            assert.doesNotMatch(
+                JSON.stringify(dm),
+                NO_OP,
+                "no no-op 'Already compressed...' message (guard removed — both calls executed)",
+            );
+        }
 
         const finalMsg = (out.output as Array<Record<string, unknown>>)[0]!;
         const part = (finalMsg.content as Array<Record<string, unknown>>)[0]!;

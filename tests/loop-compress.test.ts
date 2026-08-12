@@ -232,10 +232,13 @@ test("loop #8 (B3): textProtocol compress round → marker shown, re-request fir
     }
 });
 
-test("loop #11 (guard): a SECOND compress in the same request is a no-op (prevents 0-char spiral), then model continues", async () => {
-    // Round 1: compress (mutates state). Round 2 (re-request mock): model emits
-    // compress AGAIN — the one-compress guard must short-circuit it to a no-op
-    // result instead of re-executing (which would hit the stale-view 0-char path).
+test("loop #11 (no-guard): a SECOND compress in the same request EXECUTES (no short-circuit) — the model may legitimately compress multiple ranges", async () => {
+    // Design (post guard-removal): there is NO one-compress guard. A second
+    // compress call executes normally; its result (success or failure, e.g.
+    // "range already covered") is fed back to the model as a normal tool output
+    // so the model can decide its next action. This test guards against
+    // re-introducing the no-op guard that incorrectly blocked legitimate
+    // multi-compress.
     const ctx = withRefs(makeCtx([
         textMsg("raw_1", "user", bigText(5000)),
         textMsg("raw_2", "assistant", bigText(5000)),
@@ -273,9 +276,93 @@ test("loop #11 (guard): a SECOND compress in the same request is a no-op (preven
             { model: "gpt-4o", input: [], stream: true },
             { url: "http://mock", headers: {} },
         );
-        assert.ok(logs.some(l => l.includes("skipped (state already mutated this turn)")), "second compress was short-circuited to a no-op by the guard");
+        assert.ok(!logs.some(l => l.includes("skipped")), "no guard short-circuit — second compress executed (result fed back as a normal tool output)");
         assert.ok(out.includes("[ACP]"), "markers shown");
         assert.ok(/event: response\.completed/.test(out), "graceful completion");
+    } finally {
+        globalThis.fetch = orig;
+    }
+});
+
+test("loop #12 (no-guard): a SECOND acp_status in the same request EXECUTES (no short-circuit) — the model may re-query; result fed back", async () => {
+    // Design (post guard-removal): there is NO readOnlyCalled cap. A second
+    // acp_status executes normally and its result is fed back as a tool output.
+    // MAX_LOOP_ROUNDS bounds runaway; the model is trusted to stop once it has
+    // the status it asked for.
+    const ctx = makeCtx([
+        textMsg("m00001", "user", "hello"),
+        textMsg("m00002", "assistant", "hi"),
+    ]);
+    const round1 = [
+        sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+        fcEvents(0, "call_c1", "acp_status", "{}"),
+        COMPLETED,
+    ].join("");
+    const round2 = [
+        sse("response.created", { response: { id: "resp_2", status: "in_progress" } }),
+        fcEvents(0, "call_c2", "acp_status", "{}"),
+        COMPLETED,
+    ].join("");
+    let call = 0;
+    const orig = globalThis.fetch;
+    const logs: string[] = [];
+    ctx.log = (m: string) => logs.push(m);
+    globalThis.fetch = (async () => {
+        call++;
+        const body = call === 1 ? round2 : REFETCH_DONE;
+        return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(round1, { status: 200 }).body!,
+            ctx,
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.ok(!logs.some(l => l.includes("skipped")), "no guard short-circuit — second acp_status executed (result fed back)");
+        assert.ok(out.includes("[ACP]"), "markers shown");
+        assert.ok(/event: response\.completed/.test(out), "graceful completion");
+    } finally {
+        globalThis.fetch = orig;
+    }
+});
+
+test("loop #13 (feedback fix): textProtocol + native function_call → round-2 re-request carries a proper function_call_output (not a bare developer message)", async () => {
+    // Before the fix, textProtocol mode fed ALL proxy-tool results back as
+    // role:system developer messages (buildVisibilityMarker), never as a proper
+    // function_call_output. The Responses API expects function_call →
+    // function_call_output pairing; a bare system message gets ignored, so the
+    // model re-calls the same tool (#119 run-on). The fix tracks which calls were
+    // native function_calls and feeds those back as a proper function_call +
+    // function_call_output pair even under textProtocol.
+    const ctx = makeCtx([
+        textMsg("m00001", "user", "hello"),
+        textMsg("m00002", "assistant", "hi"),
+    ]);
+    ctx.textProtocol = true;
+    const round1 = [
+        sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+        fcEvents(0, "call_s", "acp_status", "{}"),
+        COMPLETED,
+    ].join("");
+    const bodies: string[] = [];
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async (_u: unknown, init?: RequestInit) => {
+        if (init?.body) bodies.push(String(init.body));
+        return new Response(REFETCH_DONE, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }) as typeof fetch;
+    try {
+        await drain(
+            new Response(round1, { status: 200 }).body!,
+            ctx,
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+            createResponsesAdapter(true),
+        );
+        assert.ok(bodies.length >= 1, "re-request fires after acp_status");
+        const body = bodies[0];
+        assert.ok(body.includes('"function_call"'), "round-2 body includes the assistant function_call item");
+        assert.ok(body.includes('"function_call_output"'), "round-2 body includes a proper function_call_output (the fix); previously only a developer system message was sent");
     } finally {
         globalThis.fetch = orig;
     }

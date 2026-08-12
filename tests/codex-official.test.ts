@@ -109,14 +109,18 @@ test("Codex official transport preserves OAuth headers, decodes bodies, and reba
             tools: unknown[];
         };
         assert.deepEqual(forwarded.input.map((item) => item.type), ["additional_tools", "message", "reasoning", "message"]);
-        assert.match(String(forwarded.input[1].content), /acp_compress/);
+        assert.match(String(forwarded.input[1].content), /Compression Philosophy/);
+        assert.match(String(forwarded.input[1].content), /five context-management tools/);
         assert.match(String(forwarded.input[1].content), /keep native Codex instructions/);
         assert.equal(forwarded.input[2].encrypted_content, "ciphertext");
         assert.equal((forwarded.input[3].content as Array<Record<string, unknown>>)[1].type, "input_image");
         assert.equal(forwarded.prompt_cache_key, undefined);
         assert.equal(forwarded.instructions, undefined);
         assert.deepEqual(forwarded.additional_tools, requestBody.additional_tools);
-        assert.deepEqual(forwarded.tools, requestBody.tools);
+        assert.deepEqual(
+            forwarded.tools.map((t: { name: string }) => t.name),
+            ["shell", "compress", "decompress", "search_context", "acp_status"],
+        );
 
         const session = listSessions().find((candidate) => candidate.meta.label === sessionId);
         assert.ok(session);
@@ -183,7 +187,8 @@ test("Codex official profile uses text protocol and prompt-cache auto stays nati
     assert.equal(resolvePromptCacheKey(undefined, identity, "auto", "https://api.openai.com"), "real-session");
     assert.equal(resolvePromptCacheKey(undefined, { ...identity, clientProvided: false }, "enabled", "https://api.openai.com"), undefined);
     assert.equal(isCodexResponsesLite({ "x-openai-internal-codex-responses-lite": "1" }, { input: [] }), true);
-    assert.equal(isCodexResponsesLite({}, { input: [], additional_tools: [] }), true);
-    assert.equal(isCodexResponsesLite({}, { input: [{ type: "additional_tools", tools: [] }] }), true);
+    // additional_tools is NOT a lite signal (codex always sends it; coexists with tools)
+    assert.equal(isCodexResponsesLite({}, { input: [], additional_tools: [] }), false);
+    assert.equal(isCodexResponsesLite({}, { input: [{ type: "additional_tools", tools: [] }] }), false);
     assert.equal(isCodexResponsesLite({}, { input: [] }), false);
 });

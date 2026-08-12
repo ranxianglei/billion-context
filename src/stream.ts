@@ -256,7 +256,7 @@ export function applyRanges(ranges: ReturnType<typeof parseCompressInput>, ctx: 
         if (r.blocksCreated === 0) {
             const errs = r.errors.join("; ") || "no blocks created";
             ctx.log(`[acp-proxy: compress FAILED ${detail} → 0 blocks. ${errs}]`);
-            return `[Compression FAILED: ${errs} Do not retry the same range.]`;
+            return `[Compression FAILED: ${errs}]`;
         }
 
         const warn = r.warnings.length > 0 ? ` ${r.warnings.join("; ")}` : "";
@@ -265,7 +265,7 @@ export function applyRanges(ranges: ReturnType<typeof parseCompressInput>, ctx: 
         return msg;
     } catch (err) {
         ctx.log(`[acp-proxy: compress failed: ${String(err)}]`);
-        return `[Compression FAILED: ${String(err)} Do not retry the same range.]`;
+        return `[Compression FAILED: ${String(err)}]`;
     }
 }
 
