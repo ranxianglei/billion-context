@@ -790,8 +790,7 @@ function prepareResponses(
 
     const shouldInject = opts.compress.injectTool;
     const responsesTextProtocol = FORCE_TEXT_PROTOCOL ||
-        isChatGptCodexUpstream(session.meta.upstreamOrigin) ||
-        isCodexResponsesLite(req.headers, parsed);
+        isChatGptCodexUpstream(session.meta.upstreamOrigin);
 
     try {
         const projection = responsesToCore(parsed);
@@ -960,10 +959,11 @@ export function isChatGptCodexUpstream(upstream: string | undefined): boolean {
     }
 }
 
-export function isCodexResponsesLite(headers: http.IncomingHttpHeaders, body: ResponsesRequestBody): boolean {
+export function isCodexResponsesLite(headers: http.IncomingHttpHeaders, _body: ResponsesRequestBody): boolean {
+    // additional_tools is NOT a lite signal: codex always sends it and it coexists
+    // with injected `tools` (verified end-to-end). Only the explicit header counts.
     if (headers["x-openai-internal-codex-responses-lite"] !== undefined) return true;
-    if (Object.prototype.hasOwnProperty.call(body, "additional_tools")) return true;
-    return Array.isArray(body.input) && body.input.some((item) => item.type === "additional_tools");
+    return false;
 }
 
 export function shouldInjectPromptCacheKey(
