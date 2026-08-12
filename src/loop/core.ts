@@ -172,6 +172,7 @@ export async function* runCompressLoop(
     let currentUpstream = upstream;
     const coreMessages: CoreMessage[] = [...ctx.messages];
     let mutatedThisTurn = false;
+    const readOnlyCalled = new Set<string>();
 
     try {
         for (let round = 1; round <= MAX_LOOP_ROUNDS; round++) {
@@ -240,13 +241,18 @@ export async function* runCompressLoop(
                         parsedArgs = {};
                     }
                     const isMutating = call.name === "compress" || call.name === "decompress";
+                    const isIdempotentReadOnly = call.name === "acp_status";
                     let result: string;
                     if (isMutating && mutatedThisTurn) {
                         result = `Already ${call.name}ed once this turn. Do not ${call.name} again; generate your normal response now.`;
                         ctx.log(`[acp-loop] round ${round}: ${call.name} skipped (state already mutated this turn) — no-op result`);
+                    } else if (isIdempotentReadOnly && readOnlyCalled.has(call.name)) {
+                        result = `Already called ${call.name} this turn; the context status has not changed since. Generate your final response now.`;
+                        ctx.log(`[acp-loop] round ${round}: ${call.name} skipped (read-only already called this turn) — no-op result`);
                     } else {
                         result = executeProxyTool(call.name, parsedArgs, ctx, call.callId);
                         if (isMutating) mutatedThisTurn = true;
+                        if (isIdempotentReadOnly) readOnlyCalled.add(call.name);
                     }
                     proxyResults.push({ name: call.name, callId: call.callId, result, arguments: call.arguments });
                     yield adapter.emitMarker(call.name, result);
@@ -330,6 +336,11 @@ export async function* runCompressLoop(
             // returns a no-op, which prevents the 0-char spiral (model re-targeting
             // a just-compressed range on a stale view) without cutting off the
             // model's continuation (which a hard stop did — it hung the session).
+            // The readOnlyCalled guard likewise caps acp_status at ONE call per
+            // request: it is idempotent (no args), and without the cap some models
+            // (e.g. gpt-5.6-sol) re-invoke it every round until MAX_LOOP_ROUNDS,
+            // burning upstream calls. search_context is intentionally NOT capped —
+            // it takes a query arg and may legitimately be called several times.
             const reRequest = proxyResults.length > 0 && realCalls === 0;
             if (!reRequest) {
                 yield adapter.emitCompletion({ finishReason, usage });

@@ -281,6 +281,48 @@ test("loop #11 (guard): a SECOND compress in the same request is a no-op (preven
     }
 });
 
+test("loop #12 (guard): a SECOND acp_status in the same request is a no-op (prevents read-only run-on), then model continues", async () => {
+    // Round 1: acp_status (read-only). Round 2 (re-request mock): model calls
+    // acp_status AGAIN — the readOnlyCalled guard must short-circuit it to a
+    // no-op so the model emits a final answer instead of looping to MAX_LOOP_ROUNDS.
+    const ctx = makeCtx([
+        textMsg("m00001", "user", "hello"),
+        textMsg("m00002", "assistant", "hi"),
+    ]);
+    const round1 = [
+        sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+        fcEvents(0, "call_c1", "acp_status", "{}"),
+        COMPLETED,
+    ].join("");
+    const round2 = [
+        sse("response.created", { response: { id: "resp_2", status: "in_progress" } }),
+        fcEvents(0, "call_c2", "acp_status", "{}"),
+        COMPLETED,
+    ].join("");
+    let call = 0;
+    const orig = globalThis.fetch;
+    const logs: string[] = [];
+    ctx.log = (m: string) => logs.push(m);
+    globalThis.fetch = (async () => {
+        call++;
+        const body = call === 1 ? round2 : REFETCH_DONE;
+        return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(round1, { status: 200 }).body!,
+            ctx,
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.ok(logs.some(l => l.includes("skipped (read-only already called this turn)")), "second acp_status was short-circuited to a no-op by the readOnlyCalled guard");
+        assert.ok(out.includes("[ACP]"), "markers shown");
+        assert.ok(/event: response\.completed/.test(out), "graceful completion");
+    } finally {
+        globalThis.fetch = orig;
+    }
+});
+
 test("loop #9 (S2): responses round yields usage → session.stats populated (nudge/stat tracking)", async () => {
     const ctx = makeCtx([
         textMsg("m00001", "user", "hello"),
