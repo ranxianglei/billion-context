@@ -459,6 +459,22 @@ async function handle(
             parsed = null;
         }
     }
+    // Capture the CLIENT's raw incoming request (before bili rebuilds) to
+    // resolve whether codex sends previous_response_id + full input vs delta.
+    if (opts.debug && parsed && typeof parsed === "object") {
+        try {
+            const p = parsed as Record<string, unknown>;
+            const hasPrev = p.previous_response_id !== undefined;
+            const inLen = Array.isArray(p.input) ? p.input.length : 0;
+            log("info", `[debug] INCOMING previous_response_id=${hasPrev ? String(p.previous_response_id).slice(0, 16) : "absent"} input_items=${inLen} instructions=${p.instructions !== undefined ? "present" : "absent"}`);
+            const rawDir = `${stateDir()}/raw`;
+            try { fs.mkdirSync(rawDir, { recursive: true }); } catch { /* best-effort */ }
+            const hdrs = Object.entries(req.headers)
+                .filter(([k]) => !/authorization|x-api-key|cookie/i.test(k))
+                .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(",") : v}`).join("\n");
+            fs.writeFileSync(`${rawDir}/${Date.now()}-INCOMING.txt`, `${req.method} ${req.url}\n${hdrs}\n\n${bodyBuffer.toString("utf8")}`);
+        } catch { /* best-effort dump */ }
+    }
     // Per-request context limit: look up body.model against the per-route
     // model declaration first, then the built-in table.
     let reqConfig = config;
@@ -834,14 +850,16 @@ function prepareResponses(
     );
     if (promptCacheKey && !rebuilt.prompt_cache_key) rebuilt.prompt_cache_key = promptCacheKey;
     // This adapter is stateless: we replay the FULL conversation in `input`.
-    // Strip Responses' native chaining fields so the upstream does not resolve
-    // stored server-side state on top of the input we already sent. Forwarding
-    // previous_response_id would make the prefix shift every turn (as the id
-    // advances) and duplicate history — breaking prompt-cache. `instructions`
-    // was already lifted into the developer message at input[1], so forwarding
-    // it again here double-sends it and violates the responses_lite contract
+    // Strip Responses' native chaining field so the upstream does not resolve
+    // stored server-side state ON TOP of the input we already sent (which would
+    // duplicate history for clients that use store:true + chaining). Empirically
+    // codex sends store:false and never sets previous_response_id, so this is a
+    // no-op for codex — kept defensively for any client that does chain. Set
+    // ACP_KEEP_RESPONSE_ID=1 to preserve it (diagnostic only). `instructions`
+    // was already lifted into the developer message at input[1]; forwarding it
+    // again here double-sends it and violates the responses_lite contract
     // (top-level instructions must stay empty for code_mode tool exposure).
-    delete rebuilt.previous_response_id;
+    if (process.env.ACP_KEEP_RESPONSE_ID !== "1") delete rebuilt.previous_response_id;
     delete rebuilt.instructions;
     // Log the final tools we forward upstream so we can confirm ACP tools are
     // present. Distinguishes "compress" (top-level function) from Codex
