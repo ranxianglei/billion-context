@@ -414,7 +414,7 @@ async function handle(
         urlPath = url.split("?", 2)[0];
         responsesCompact = urlPath.endsWith("/responses/compact");
         route = resolveUpstream(opts, req.url ?? "", req);
-        upstreamOrigin = route ? route.upstream : opts.upstream;
+        upstreamOrigin = route ? route.upstream : /^https?:\/\//i.test(url) ? new URL(url).origin : opts.upstream;
         protocol =
             route?.explicitProtocol
             ?? (req.method === "POST" && bodyBuffer.length > 0
@@ -1059,7 +1059,9 @@ async function forward(
     // rewrittenUrl may use a `mitm://` scheme (for config-lookup distinction
     // — see resolveUpstream). fetch needs the real https:// scheme, so strip
     // mitm:// back to https:// for the actual upstream request.
-    const rewritten = route ? route.rewrittenUrl : opts.upstream + (req.url ?? "");
+    const reqUrl = req.url ?? "";
+    const isAbsoluteUrl = /^https?:\/\//i.test(reqUrl);
+    const rewritten = route ? route.rewrittenUrl : isAbsoluteUrl ? reqUrl : opts.upstream + reqUrl;
     const upstreamUrl = rewritten.replace(/^mitm:\/\//, "https://");
     // Show the final proxied URL (where the request actually lands) as the
     // primary signal. The provider label is appended only for named routes —
@@ -1111,7 +1113,7 @@ async function forward(
         if (UPSTREAM_HOP_HEADERS.has(k.toLowerCase()) || v === undefined) continue;
         headers[k] = Array.isArray(v) ? v.join(", ") : v;
     }
-    headers["host"] = new URL(route ? route.upstream : opts.upstream).host;
+    headers["host"] = new URL(upstreamUrl).host;
     // codex advertises its own server-side context compaction via this beta
     // feature. It conflicts with bili's client-side compress (bili IS the
     // compression layer) and third-party aggregators reject it with
