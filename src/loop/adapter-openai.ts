@@ -165,8 +165,10 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>): Compr
                 const finishReason = typeof choice.finish_reason === "string" ? choice.finish_reason : undefined;
 
                 if (finishReason) {
+                    let yieldedToolCall = false;
                     for (const [, tc] of pending) {
                         if (tc.name.length > 0 || tc.id.length > 0) {
+                            yieldedToolCall = true;
                             yield {
                                 kind: "tool_call",
                                 name: tc.name,
@@ -184,7 +186,10 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>): Compr
                         outputTokens: typeof u?.completion_tokens === "number" ? u.completion_tokens : undefined,
                         cachedTokens: typeof pd?.cached_tokens === "number" ? pd.cached_tokens : undefined,
                     } as ParsedStreamEvent;
-                    yield { kind: "done", finishReason } as ParsedStreamEvent;
+                    yield {
+                        kind: "done",
+                        finishReason: yieldedToolCall && finishReason === "stop" ? "tool_calls" : finishReason,
+                    } as ParsedStreamEvent;
                 }
 
                 if (!delta) continue;
