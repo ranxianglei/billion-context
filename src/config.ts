@@ -35,6 +35,10 @@ export type ProviderRoute = {
      *  means "explicitly direct" (override global with no proxy). Format:
      *  `http://host:port`. SOCKS5 is not supported yet. */
     proxy?: string;
+    /** Per-URL Responses compress protocol. "marker" = text-trigger protocol
+     *  (for upstreams that cannot coexist with a declared tools field).
+     *  Default / "tools" = native function tools. */
+    compressProtocol?: "tools" | "marker";
 };
 export type ProviderRoutes = Record<string, ProviderRoute>; // key = upstream URL prefix (the /bili/<this> string)
 export type PromptCacheRouting = "auto" | "enabled" | "disabled";
@@ -110,6 +114,17 @@ export function resolveConfiguredContextLimit(
         if (m?.context && m.context > 0) return m.context;
     }
     return undefined;
+}
+
+export function resolveCompressProtocol(routes: ProviderRoutes, upstreamUrl: string | undefined): "tools" | "marker" | undefined {
+    if (!upstreamUrl) return undefined;
+    let bestKey = "";
+    for (const key of Object.keys(routes)) {
+        if (upstreamUrl === key || upstreamUrl.startsWith(key + "/")) {
+            if (key.length > bestKey.length) bestKey = key;
+        }
+    }
+    return bestKey ? routes[bestKey].compressProtocol : undefined;
 }
 
 export type ProxyOptions = {
@@ -363,9 +378,10 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
     // is the KEY in the providers map (identical to the /bili/<url> string),
     // so it is NOT repeated inside the value.
     if (v && typeof v === "object" && !Array.isArray(v)) {
-        const obj = v as { models?: Record<string, { context?: number; output?: number }>; proxy?: string };
+        const obj = v as { models?: Record<string, { context?: number; output?: number }>; proxy?: string; compressProtocol?: string };
         const route: ProviderRoute = { models: obj.models };
         if (typeof obj.proxy === "string") route.proxy = obj.proxy;
+        if (obj.compressProtocol === "marker" || obj.compressProtocol === "tools") route.compressProtocol = obj.compressProtocol;
         return route;
     }
     // A bare value (e.g. null) means "this upstream exists, no overrides".

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { writeFileSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadOptions, lookupContextLimit, resolveContextLimit, resolveConfiguredContextLimit, parseRouteEntry, parsePromptCacheRouting } from "../src/config.ts";
+import { loadOptions, lookupContextLimit, resolveContextLimit, resolveConfiguredContextLimit, resolveCompressProtocol, parseRouteEntry, parsePromptCacheRouting } from "../src/config.ts";
 
 const TMP = (s: string) => join(tmpdir(), `test-acp-${process.pid}-${s}.json`);
 const writeRoutes = (name: string, obj: unknown) => {
@@ -173,4 +173,15 @@ test("normalizeUrlKey strips trailing slashes", () => {
     assert.equal(normalizeUrlKey("https://open.bigmodel.cn///"), "https://open.bigmodel.cn");
     assert.equal(normalizeUrlKey("https://open.bigmodel.cn"), "https://open.bigmodel.cn");
     assert.equal(normalizeUrlKey(""), "");
+});
+
+test("resolveCompressProtocol: longest-prefix URL match, undefined = default tools", () => {
+    const routes = {
+        "https://chatgpt.com": { compressProtocol: "marker" },
+        "https://ai.comfly.org": { models: { "gpt-5.6-sol": { context: 400000 } } },
+    };
+    assert.equal(resolveCompressProtocol(routes, "https://chatgpt.com/backend-api/codex"), "marker");
+    assert.equal(resolveCompressProtocol(routes, "https://ai.comfly.org/v1/responses"), undefined);
+    assert.equal(resolveCompressProtocol(routes, "https://api.openai.com/v1"), undefined);
+    assert.equal(resolveCompressProtocol(routes, undefined), undefined);
 });

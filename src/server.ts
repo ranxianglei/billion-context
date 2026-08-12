@@ -4,7 +4,7 @@ import { createCore, type CompressionCore, type Config, type CoreMessage, type N
 import type { ProxyOptions } from "./config.js";
 import { loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
-import { resolveContextLimit } from "./config.js";
+import { resolveContextLimit, resolveCompressProtocol } from "./config.js";
 import { contextFromRegistry, loadRegistry } from "./registry.js";
 import { fetchWithTimeout, MAX_REQUEST_BYTES } from "./fetch-util.js";
 import { formatUpstreamError, getUpstreamConnectionStatus, recordUpstreamConnection, resolveProxy, resolveProxyDecision, proxyDispatcher } from "./upstream-proxy.js";
@@ -790,7 +790,7 @@ function prepareResponses(
 
     const shouldInject = opts.compress.injectTool;
     const responsesTextProtocol = FORCE_TEXT_PROTOCOL ||
-        isChatGptCodexUpstream(session.meta.upstreamOrigin);
+        resolveCompressProtocol(opts.routes, session.meta.upstreamOrigin) === "marker";
 
     try {
         const projection = responsesToCore(parsed);
