@@ -232,10 +232,13 @@ test("loop #8 (B3): textProtocol compress round → marker shown, re-request fir
     }
 });
 
-test("loop #11 (guard): a SECOND compress in the same request is a no-op (prevents 0-char spiral), then model continues", async () => {
-    // Round 1: compress (mutates state). Round 2 (re-request mock): model emits
-    // compress AGAIN — the one-compress guard must short-circuit it to a no-op
-    // result instead of re-executing (which would hit the stale-view 0-char path).
+test("loop #11 (no-guard): a SECOND compress in the same request EXECUTES (no short-circuit) — the model may legitimately compress multiple ranges", async () => {
+    // Design (post guard-removal): there is NO one-compress guard. A second
+    // compress call executes normally; its result (success or failure, e.g.
+    // "range already covered") is fed back to the model as a normal tool output
+    // so the model can decide its next action. This test guards against
+    // re-introducing the no-op guard that incorrectly blocked legitimate
+    // multi-compress.
     const ctx = withRefs(makeCtx([
         textMsg("raw_1", "user", bigText(5000)),
         textMsg("raw_2", "assistant", bigText(5000)),
@@ -273,7 +276,7 @@ test("loop #11 (guard): a SECOND compress in the same request is a no-op (preven
             { model: "gpt-4o", input: [], stream: true },
             { url: "http://mock", headers: {} },
         );
-        assert.ok(logs.some(l => l.includes("skipped (state already mutated this turn)")), "second compress was short-circuited to a no-op by the guard");
+        assert.ok(!logs.some(l => l.includes("skipped")), "no guard short-circuit — second compress executed (result fed back as a normal tool output)");
         assert.ok(out.includes("[ACP]"), "markers shown");
         assert.ok(/event: response\.completed/.test(out), "graceful completion");
     } finally {
@@ -281,10 +284,11 @@ test("loop #11 (guard): a SECOND compress in the same request is a no-op (preven
     }
 });
 
-test("loop #12 (guard): a SECOND acp_status in the same request is a no-op (prevents read-only run-on), then model continues", async () => {
-    // Round 1: acp_status (read-only). Round 2 (re-request mock): model calls
-    // acp_status AGAIN — the readOnlyCalled guard must short-circuit it to a
-    // no-op so the model emits a final answer instead of looping to MAX_LOOP_ROUNDS.
+test("loop #12 (no-guard): a SECOND acp_status in the same request EXECUTES (no short-circuit) — the model may re-query; result fed back", async () => {
+    // Design (post guard-removal): there is NO readOnlyCalled cap. A second
+    // acp_status executes normally and its result is fed back as a tool output.
+    // MAX_LOOP_ROUNDS bounds runaway; the model is trusted to stop once it has
+    // the status it asked for.
     const ctx = makeCtx([
         textMsg("m00001", "user", "hello"),
         textMsg("m00002", "assistant", "hi"),
@@ -315,7 +319,7 @@ test("loop #12 (guard): a SECOND acp_status in the same request is a no-op (prev
             { model: "gpt-4o", input: [], stream: true },
             { url: "http://mock", headers: {} },
         );
-        assert.ok(logs.some(l => l.includes("skipped (read-only already called this turn)")), "second acp_status was short-circuited to a no-op by the readOnlyCalled guard");
+        assert.ok(!logs.some(l => l.includes("skipped")), "no guard short-circuit — second acp_status executed (result fed back)");
         assert.ok(out.includes("[ACP]"), "markers shown");
         assert.ok(/event: response\.completed/.test(out), "graceful completion");
     } finally {

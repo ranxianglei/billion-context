@@ -171,8 +171,6 @@ export async function* runCompressLoop(
     let activeClearTimer: (() => void) | null = null;
     let currentUpstream = upstream;
     const coreMessages: CoreMessage[] = [...ctx.messages];
-    let mutatedThisTurn = false;
-    const readOnlyCalled = new Set<string>();
 
     try {
         for (let round = 1; round <= MAX_LOOP_ROUNDS; round++) {
@@ -241,20 +239,7 @@ export async function* runCompressLoop(
                     } catch {
                         parsedArgs = {};
                     }
-                    const isMutating = call.name === "compress" || call.name === "decompress";
-                    const isIdempotentReadOnly = call.name === "acp_status";
-                    let result: string;
-                    if (isMutating && mutatedThisTurn) {
-                        result = `Already ${call.name}ed once this turn. Do not ${call.name} again; generate your normal response now.`;
-                        ctx.log(`[acp-loop] round ${round}: ${call.name} skipped (state already mutated this turn) — no-op result`);
-                    } else if (isIdempotentReadOnly && readOnlyCalled.has(call.name)) {
-                        result = `Already called ${call.name} this turn; the context status has not changed since. Generate your final response now.`;
-                        ctx.log(`[acp-loop] round ${round}: ${call.name} skipped (read-only already called this turn) — no-op result`);
-                    } else {
-                        result = executeProxyTool(call.name, parsedArgs, ctx, call.callId);
-                        if (isMutating) mutatedThisTurn = true;
-                        if (isIdempotentReadOnly) readOnlyCalled.add(call.name);
-                    }
+                    const result = executeProxyTool(call.name, parsedArgs, ctx, call.callId);
                     proxyResults.push({ name: call.name, callId: call.callId, result, arguments: call.arguments });
                     yield adapter.emitMarker(call.name, result);
                 } else {
@@ -332,16 +317,11 @@ export async function* runCompressLoop(
             // Re-request so the model receives the proxy-tool result and can
             // continue (standard function-calling continuation: the proxy acts as
             // the client, executes compress/decompress/acp_status/search, then
-            // feeds the result back). The mutatedThisTurn guard above ensures at
-            // most ONE compress/decompress per request — a second mutating call
-            // returns a no-op, which prevents the 0-char spiral (model re-targeting
-            // a just-compressed range on a stale view) without cutting off the
-            // model's continuation (which a hard stop did — it hung the session).
-            // The readOnlyCalled guard likewise caps acp_status at ONE call per
-            // request: it is idempotent (no args), and without the cap some models
-            // (e.g. gpt-5.6-sol) re-invoke it every round until MAX_LOOP_ROUNDS,
-            // burning upstream calls. search_context is intentionally NOT capped —
-            // it takes a query arg and may legitimately be called several times.
+            // feeds the result back as a normal tool output via functionCallIds
+            // above — success OR failure alike). The model sees the result and
+            // decides its next action (retry a different range, or stop). A failed
+            // compress returns its failure as the tool output, so the model is not
+            // blind to why it failed. MAX_LOOP_ROUNDS bounds runaway loops.
             const reRequest = proxyResults.length > 0 && realCalls === 0;
             if (!reRequest) {
                 yield adapter.emitCompletion({ finishReason, usage });
@@ -357,7 +337,7 @@ export async function* runCompressLoop(
                 return;
             }
 
-            ctx.log(`[acp-loop] round ${round}: proxy tool executed (state ${mutatedThisTurn ? "mutated" : "read-only"}); re-requesting so the model sees the result`);
+            ctx.log(`[acp-loop] round ${round}: proxy tool executed; re-requesting so the model sees the result`);
 
             if (signal?.aborted) break;
 
