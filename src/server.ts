@@ -1403,6 +1403,7 @@ async function dumpStreamToFile(stream: ReadableStream<Uint8Array>, dir: string,
     try {
         mkdirSync(dir, { recursive: true });
         const ws = createWriteStream(join(dir, name));
+        ws.on("error", (e) => { loggerLog("debug", `[dump] write stream error: ${(e as Error).message ?? e}`); });
         const reader = stream.getReader();
         try {
             for (;;) {
