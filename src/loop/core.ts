@@ -300,7 +300,10 @@ export async function* runCompressLoop(
                         });
                     }
                 }
-                if (!ctx.textProtocol) {
+                const anyCompressFailed = proxyResults.some(
+                    (pr) => (pr.name === "compress" || pr.name === "decompress") && pr.result.includes("FAILED"),
+                );
+                if (!ctx.textProtocol && !anyCompressFailed) {
                     const hidden = hideConsumedCompressCalls(ctx.session.state, coreMessages);
                     if (hidden.hidden > 0) {
                         ctx.log(`[acp-loop] round ${round} hideConsumed hid ${hidden.hidden} compress record(s)`);
