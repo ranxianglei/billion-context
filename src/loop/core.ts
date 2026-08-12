@@ -171,7 +171,7 @@ export async function* runCompressLoop(
     let activeClearTimer: (() => void) | null = null;
     let currentUpstream = upstream;
     const coreMessages: CoreMessage[] = [...ctx.messages];
-    let mutatedThisTurn = false;
+    let compressOutcome: "none" | "succeeded" | "failed" = "none";
 
     try {
         for (let round = 1; round <= MAX_LOOP_ROUNDS; round++) {
@@ -241,12 +241,14 @@ export async function* runCompressLoop(
                     }
                     const isMutating = call.name === "compress" || call.name === "decompress";
                     let result: string;
-                    if (isMutating && mutatedThisTurn) {
-                        result = `Already ${call.name}ed once this turn. Do not ${call.name} again; generate your normal response now.`;
-                        ctx.log(`[acp-loop] round ${round}: ${call.name} skipped (state already mutated this turn) — no-op result`);
+                    if (isMutating && compressOutcome !== "none") {
+                        result = compressOutcome === "succeeded"
+                            ? `Already ${call.name}ed once this turn. Do not ${call.name} again; generate your normal response now.`
+                            : `${call.name} already failed once this turn (not enough compressible content). Do not retry; respond to the user instead.`;
+                        ctx.log(`[acp-loop] round ${round}: ${call.name} skipped (compressOutcome=${compressOutcome}) — no-op result`);
                     } else {
                         result = executeProxyTool(call.name, parsedArgs, ctx, call.callId);
-                        if (isMutating) mutatedThisTurn = true;
+                        if (isMutating) compressOutcome = result.includes("FAILED") ? "failed" : "succeeded";
                     }
                     proxyResults.push({ name: call.name, callId: call.callId, result, arguments: call.arguments });
                     yield adapter.emitMarker(call.name, result);
@@ -325,11 +327,12 @@ export async function* runCompressLoop(
             // Re-request so the model receives the proxy-tool result and can
             // continue (standard function-calling continuation: the proxy acts as
             // the client, executes compress/decompress/acp_status/search, then
-            // feeds the result back). The mutatedThisTurn guard above ensures at
+            // feeds the result back). The compressOutcome guard above ensures at
             // most ONE compress/decompress per request — a second mutating call
-            // returns a no-op, which prevents the 0-char spiral (model re-targeting
-            // a just-compressed range on a stale view) without cutting off the
-            // model's continuation (which a hard stop did — it hung the session).
+            // returns a no-op whose wording reflects whether the first attempt
+            // succeeded or failed, which prevents both the 0-char spiral (model
+            // re-targeting a just-compressed range) and the failure-retry spiral
+            // (model re-trying a too-small range) without hanging the session.
             const reRequest = proxyResults.length > 0 && realCalls === 0;
             if (!reRequest) {
                 yield adapter.emitCompletion({ finishReason, usage });
@@ -345,7 +348,7 @@ export async function* runCompressLoop(
                 return;
             }
 
-            ctx.log(`[acp-loop] round ${round}: proxy tool executed (state ${mutatedThisTurn ? "mutated" : "read-only"}); re-requesting so the model sees the result`);
+            ctx.log(`[acp-loop] round ${round}: proxy tool executed (state ${compressOutcome !== "none" ? compressOutcome : "read-only"}); re-requesting so the model sees the result`);
 
             if (signal?.aborted) break;
 

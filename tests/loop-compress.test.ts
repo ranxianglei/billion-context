@@ -273,9 +273,48 @@ test("loop #11 (guard): a SECOND compress in the same request is a no-op (preven
             { model: "gpt-4o", input: [], stream: true },
             { url: "http://mock", headers: {} },
         );
-        assert.ok(logs.some(l => l.includes("skipped (state already mutated this turn)")), "second compress was short-circuited to a no-op by the guard");
+        assert.ok(logs.some(l => l.includes("skipped (compressOutcome=succeeded)")), "second compress was short-circuited to a no-op by the guard");
         assert.ok(out.includes("[ACP]"), "markers shown");
         assert.ok(/event: response\.completed/.test(out), "graceful completion");
+    } finally {
+        globalThis.fetch = orig;
+    }
+});
+
+test("loop #14 (guard-failure): a FAILED compress (too small) sets outcome=failed → second compress is a no-op (v10.txt loop)", async () => {
+    // v10.txt regression: failed compress must cap retry (outcome=failed no-op), not spiral on an inaccurate "Already compressed".
+    const ctx = withRefs(makeCtx([
+        textMsg("raw_1", "user", "short"),
+        textMsg("raw_2", "assistant", "short"),
+    ]));
+    const compressArgs = JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "s" }] });
+    const round1 = [
+        sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+        fcEvents(0, "call_c1", "compress", compressArgs),
+        COMPLETED,
+    ].join("");
+    const round2 = [
+        sse("response.created", { response: { id: "resp_2", status: "in_progress" } }),
+        fcEvents(0, "call_c2", "compress", compressArgs),
+        COMPLETED,
+    ].join("");
+    let call = 0;
+    const orig = globalThis.fetch;
+    const logs: string[] = [];
+    ctx.log = (m: string) => logs.push(m);
+    globalThis.fetch = (async () => {
+        call++;
+        const body = call === 1 ? round2 : REFETCH_DONE;
+        return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }) as typeof fetch;
+    try {
+        await drain(
+            new Response(round1, { status: 200 }).body!,
+            ctx,
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.ok(logs.some(l => l.includes("skipped (compressOutcome=failed)")), "second compress no-op'd by failed-outcome guard");
     } finally {
         globalThis.fetch = orig;
     }
