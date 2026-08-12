@@ -186,6 +186,8 @@ export async function* runCompressLoop(
                     assistantText += ev.delta;
                     if (!ctx.textProtocol && round === 1 && ev.raw) {
                         yield ev.raw;
+                    } else if (!ctx.textProtocol && round > 1 && ev.delta.length > 0) {
+                        yield adapter.emitText(ev.delta);
                     }
                 } else if (ev.kind === "tool_call") {
                     calls.push({ name: ev.name, callId: ev.callId, arguments: ev.arguments });
@@ -222,8 +224,6 @@ export async function* runCompressLoop(
             const functionCallIds = new Set(calls.map(c => c.callId));
 
             if (ctx.textProtocol && resolvedText.length > 0) {
-                yield adapter.emitText(resolvedText);
-            } else if (!ctx.textProtocol && round > 1 && resolvedText.length > 0) {
                 yield adapter.emitText(resolvedText);
             }
 
