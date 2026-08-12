@@ -3,6 +3,16 @@
 All notable changes to **billion-context** are documented here.
 Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag.
 
+## [0.1.36] — 2026-08-12
+
+### Fixes
+
+- **Round-2+ streaming after a tool call** (#122): `runCompressLoop` forwarded round-1 text to the client in real-time but **buffered** round-2+ text (the re-request round, emitted after the model calls `compress`/`acp_status`/…) and flushed it all at once when the stream completed — so the first token after a compress tool call appeared to hang. Round-2+ non-text-protocol text now streams per-delta (`yield adapter.emitText(ev.delta)`). The text-protocol path still buffers (marker extraction needs the whole text).
+
+### Tests
+
+- **L2 end-to-end proxy smoke test** (#122): `tests/e2e-proxy-smoke.test.ts` spins up the real `startServer` + a stub upstream. Round 1 returns a `compress` tool_call (bili intercepts → re-request); round 2 returns text deltas 40 ms apart. Asserts the upstream saw ≥2 requests (re-request happened), the client received the full text, and round-2 chunks span ≥50 ms (real-time streaming, not buffered). Model-free, deterministic, CI-friendly — would have caught the round-2 buffering bug.
+
 ## [0.1.35] — 2026-08-12
 
 ### Features
