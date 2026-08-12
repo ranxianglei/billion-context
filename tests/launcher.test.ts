@@ -111,7 +111,7 @@ test("buildCodexEnv: sets HTTPS_PROXY + SSL_CERT_FILE, preserves baseEnv", () =>
 });
 
 test("buildClaudeEnv: sets HTTPS_PROXY + NODE_EXTRA_CA_CERTS, preserves baseEnv", () => {
-    const env = buildClaudeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", [], { PATH: "/usr/bin", ANTHROPIC_API_KEY: "sk-x" });
+    const env = buildClaudeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", [], [], { PATH: "/usr/bin", ANTHROPIC_API_KEY: "sk-x" });
     assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
     assert.equal(env.NODE_EXTRA_CA_CERTS, "/tmp/ca.pem");
     assert.equal(env.PATH, "/usr/bin");
@@ -459,8 +459,8 @@ test("discoverRoutes: pi with one http provider → rewrite keyed by provider na
 });
 
 test("discoverRoutes: empty config → {httpsDomains:[], httpRewrites:[]}", () => {
-    assert.deepEqual(discoverRoutes("pi", {}), { httpsDomains: [], httpRewrites: [] });
-    assert.deepEqual(discoverRoutes("codex", {}), { httpsDomains: [], httpRewrites: [] });
+    assert.deepEqual(discoverRoutes("pi", {}), { httpsDomains: [], httpRewrites: [], httpsRewrites: [] });
+    assert.deepEqual(discoverRoutes("codex", {}), { httpsDomains: [], httpRewrites: [], httpsRewrites: [] });
 });
 
 test("buildCodexArgs: emits -c pairs for each http rewrite, then extra args", () => {
@@ -468,7 +468,7 @@ test("buildCodexArgs: emits -c pairs for each http rewrite, then extra args", ()
         { key: "k1", realUpstream: "u1" },
         { key: "k2", realUpstream: "u2" },
     ];
-    assert.deepEqual(buildCodexArgs("http://h:p", rewrites, ["--extra"]), [
+    assert.deepEqual(buildCodexArgs("http://h:p", rewrites, [], ["--extra"]), [
         "-c", "k1=http://h:p/bili/u1",
         "-c", "k2=http://h:p/bili/u2",
         "--extra",
@@ -476,21 +476,21 @@ test("buildCodexArgs: emits -c pairs for each http rewrite, then extra args", ()
 });
 
 test("buildCodexArgs: no rewrites → just extra args", () => {
-    assert.deepEqual(buildCodexArgs("http://h:p", [], ["--foo"]), ["--foo"]);
+    assert.deepEqual(buildCodexArgs("http://h:p", [], [], ["--foo"]), ["--foo"]);
 });
 
 test("buildClaudeEnv: ANTHROPIC_BASE_URL rewrite sets env + keeps HTTPS_PROXY/CA", () => {
     const rewrites: HttpRewrite[] = [
         { key: "ANTHROPIC_BASE_URL", realUpstream: "http://relay.local/anthropic" },
     ];
-    const env = buildClaudeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", rewrites, { PATH: "/usr/bin" });
+    const env = buildClaudeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", rewrites, [], { PATH: "/usr/bin" });
     assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
     assert.equal(env.NODE_EXTRA_CA_CERTS, "/tmp/ca.pem");
     assert.equal(env.ANTHROPIC_BASE_URL, "http://127.0.0.1:8787/bili/http://relay.local/anthropic");
 });
 
 test("buildClaudeEnv: no ANTHROPIC_BASE_URL rewrite → env.ANTHROPIC_BASE_URL unset", () => {
-    const env = buildClaudeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", [], { PATH: "/usr/bin" });
+    const env = buildClaudeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", [], [], { PATH: "/usr/bin" });
     assert.equal(env.ANTHROPIC_BASE_URL, undefined);
     assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
 });
@@ -509,7 +509,7 @@ test("preparePiHttpRewrite: rewrites matching provider, leaves others, symlinks 
     fs.writeFileSync(path.join(home, "auth.json"), '{"key":"x"}');
     const tmp = preparePiHttpRewrite(home, "http://127.0.0.1:8787", [
         { key: "a", realUpstream: "http://example.com/v1" },
-    ]);
+    ], []);
     try {
         assert.ok(typeof tmp === "string" && tmp.length > 0);
         const out = JSON.parse(fs.readFileSync(path.join(tmp!, "models.json"), "utf8"));
@@ -524,16 +524,16 @@ test("preparePiHttpRewrite: rewrites matching provider, leaves others, symlinks 
 });
 
 test("preparePiHttpRewrite: returns undefined when no rewrites", () => {
-    assert.equal(preparePiHttpRewrite("/whatever", "http://127.0.0.1:8787", []), undefined);
+    assert.equal(preparePiHttpRewrite("/whatever", "http://127.0.0.1:8787", [], []), undefined);
 });
 
 test("preparePiHttpRewrite: returns undefined when models.json missing or unparseable", () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-pihome-"));
     const rw: HttpRewrite[] = [{ key: "a", realUpstream: "http://x/v1" }];
     try {
-        assert.equal(preparePiHttpRewrite(home, "http://127.0.0.1:8787", rw), undefined);
+        assert.equal(preparePiHttpRewrite(home, "http://127.0.0.1:8787", rw, []), undefined);
         fs.writeFileSync(path.join(home, "models.json"), "not-json{");
-        assert.equal(preparePiHttpRewrite(home, "http://127.0.0.1:8787", rw), undefined);
+        assert.equal(preparePiHttpRewrite(home, "http://127.0.0.1:8787", rw, []), undefined);
     } finally {
         fs.rmSync(home, { recursive: true, force: true });
     }
@@ -544,7 +544,7 @@ test("preparePiHttpRewrite: returns undefined when models.json is not an object"
     const rw: HttpRewrite[] = [{ key: "a", realUpstream: "http://x/v1" }];
     try {
         fs.writeFileSync(path.join(home, "models.json"), JSON.stringify([1, 2, 3]));
-        assert.equal(preparePiHttpRewrite(home, "http://127.0.0.1:8787", rw), undefined);
+        assert.equal(preparePiHttpRewrite(home, "http://127.0.0.1:8787", rw, []), undefined);
     } finally {
         fs.rmSync(home, { recursive: true, force: true });
     }

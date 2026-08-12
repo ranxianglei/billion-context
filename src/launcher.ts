@@ -159,6 +159,7 @@ export interface HttpRewrite {
 export interface DiscoveredRoutes {
     httpsDomains: string[];
     httpRewrites: HttpRewrite[];
+    httpsRewrites: HttpRewrite[];
 }
 
 function nonEmpty(s: unknown): s is string {
@@ -200,8 +201,10 @@ export function extractDomains(upstreams: string[]): string[] {
 export function discoverRoutes(client: ClientName, config: ClientConfig): DiscoveredRoutes {
     const httpsDomains: string[] = [];
     const httpRewrites: HttpRewrite[] = [];
+    const httpsRewrites: HttpRewrite[] = [];
     const httpsSeen = new Set<string>();
     const rewriteKeys = new Set<string>();
+    const httpsRewriteKeys = new Set<string>();
     const classify = (raw: string | undefined, key: string): void => {
         if (!nonEmpty(raw)) return;
         let url: URL;
@@ -215,6 +218,12 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
             if (host && !httpsSeen.has(host.toLowerCase())) {
                 httpsSeen.add(host.toLowerCase());
                 httpsDomains.push(host);
+            }
+            // Wrapped HTTPS (/bili/<https>): rewrite client base_url to the RAW
+            // https upstream so HTTPS_PROXY routes it through the cert MITM.
+            if (raw !== unwrapUpstream(raw) && !httpsRewriteKeys.has(key)) {
+                httpsRewriteKeys.add(key);
+                httpsRewrites.push({ key, realUpstream: unwrapUpstream(raw) });
             }
         } else if (url.protocol === "http:") {
             if (!rewriteKeys.has(key)) {
@@ -239,7 +248,7 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
         classify(config.codex?.openaiBaseUrl, "openai_base_url");
     }
 
-    return { httpsDomains, httpRewrites };
+    return { httpsDomains, httpRewrites, httpsRewrites };
 }
 
 export function discoverDomains(client: ClientName, config: ClientConfig): string[] {
@@ -254,10 +263,18 @@ export function buildCodexEnv(origin: string, caPath: string, baseEnv: NodeJS.Pr
     return { ...baseEnv, HTTPS_PROXY: origin, SSL_CERT_FILE: caPath };
 }
 
-export function buildCodexArgs(origin: string, httpRewrites: HttpRewrite[], extra: string[]): string[] {
+export function buildCodexArgs(
+    origin: string,
+    httpRewrites: HttpRewrite[],
+    httpsRewrites: HttpRewrite[],
+    extra: string[],
+): string[] {
     const args: string[] = [];
     for (const r of httpRewrites) {
         args.push("-c", `${r.key}=${wrapUpstream(origin, r.realUpstream)}`);
+    }
+    for (const r of httpsRewrites) {
+        args.push("-c", `${r.key}=${r.realUpstream}`);
     }
     args.push(...extra);
     return args;
@@ -267,11 +284,14 @@ export function buildClaudeEnv(
     origin: string,
     caPath: string,
     httpRewrites: HttpRewrite[],
+    httpsRewrites: HttpRewrite[],
     baseEnv: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
     const env: NodeJS.ProcessEnv = { ...baseEnv, HTTPS_PROXY: origin, NODE_EXTRA_CA_CERTS: caPath };
     const r = httpRewrites.find((rw) => rw.key === "ANTHROPIC_BASE_URL");
     if (r) env.ANTHROPIC_BASE_URL = wrapUpstream(origin, r.realUpstream);
+    const hr = httpsRewrites.find((rw) => rw.key === "ANTHROPIC_BASE_URL");
+    if (hr) env.ANTHROPIC_BASE_URL = hr.realUpstream;
     return env;
 }
 
@@ -279,8 +299,9 @@ export function preparePiHttpRewrite(
     piHome: string,
     origin: string,
     httpRewrites: HttpRewrite[],
+    httpsRewrites: HttpRewrite[],
 ): string | undefined {
-    if (httpRewrites.length === 0) return undefined;
+    if (httpRewrites.length === 0 && httpsRewrites.length === 0) return undefined;
     const modelsPath = path.join(piHome, "models.json");
     let txt: string;
     try {
@@ -305,6 +326,13 @@ export function preparePiHttpRewrite(
                 const p = prov as { baseUrl?: unknown };
                 const existing = typeof p.baseUrl === "string" ? p.baseUrl : r.realUpstream;
                 p.baseUrl = wrapUpstream(origin, unwrapUpstream(existing));
+            }
+        }
+        for (const r of httpsRewrites) {
+            const prov = providers[r.key];
+            if (prov && typeof prov === "object" && !Array.isArray(prov)) {
+                const p = prov as { baseUrl?: unknown };
+                p.baseUrl = r.realUpstream;
             }
         }
     }
@@ -650,6 +678,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     console.error(
         `bili: ${handle.reused ? "reusing existing" : "started"} proxy at ${handle.origin} (MITM domains: ${domains.length ? domains.join(", ") : "defaults"})` +
             (routes.httpRewrites.length > 0 ? ` (HTTP /bili/ rewrites: ${routes.httpRewrites.length})` : "") +
+            (routes.httpsRewrites.length > 0 ? ` (HTTPS cert rewrites: ${routes.httpsRewrites.length})` : "") +
             (params.client === "pi-test" ? " (no extensions)" : ""),
     );
     if (handle.logPath) {
@@ -662,13 +691,13 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     let piTmpHome: string | undefined;
     if (base === "pi") {
         env = buildPiEnv(handle.origin, ca, process.env);
-        piTmpHome = preparePiHttpRewrite(resolvePiHome(process.env), handle.origin, routes.httpRewrites);
+        piTmpHome = preparePiHttpRewrite(resolvePiHome(process.env), handle.origin, routes.httpRewrites, routes.httpsRewrites);
         if (piTmpHome) env.PI_CODING_AGENT_DIR = piTmpHome;
     } else if (base === "codex") {
         env = buildCodexEnv(handle.origin, ca, process.env);
-        clientArgs = buildCodexArgs(handle.origin, routes.httpRewrites, params.clientArgs);
+        clientArgs = buildCodexArgs(handle.origin, routes.httpRewrites, routes.httpsRewrites, params.clientArgs);
     } else {
-        env = buildClaudeEnv(handle.origin, ca, routes.httpRewrites, process.env);
+        env = buildClaudeEnv(handle.origin, ca, routes.httpRewrites, routes.httpsRewrites, process.env);
     }
 
     const { command, prefixArgs } = resolveClientCommand(base, process.env);
