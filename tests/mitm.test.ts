@@ -6,6 +6,36 @@ import path from "node:path";
 import tls from "node:tls";
 import { isMitmHost, readMitmUpstream, MITM_UPSTREAM_KEY } from "../src/mitm.js";
 import { ensureRootCA, rootCaPath, getSecureContext, _resetForTest } from "../src/ca.js";
+import { _resetDiscoveryCacheForTest } from "../src/discover.js";
+
+// isMitmHost now calls discoverMitmDomains(), which reads real client config
+// files. Isolate discovery to an empty temp HOME so the isMitmHost assertions
+// are deterministic (only DEFAULT_MITM_DOMAINS apply, no discovered hosts).
+const _discoverySavedEnv: Record<string, string | undefined> = {};
+let _discoveryTmpHome: string | undefined;
+
+test.before(() => {
+    _discoveryTmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-mitm-disc-"));
+    for (const k of ["HOME", "CODEX_HOME", "ZCODE_DATA_BASE_DIR", "PI_CODING_AGENT_DIR", "PI_HOME"]) {
+        _discoverySavedEnv[k] = process.env[k];
+    }
+    process.env.HOME = _discoveryTmpHome;
+    process.env.CODEX_HOME = path.join(_discoveryTmpHome, ".codex");
+    process.env.ZCODE_DATA_BASE_DIR = path.join(_discoveryTmpHome, ".zcode");
+    process.env.PI_CODING_AGENT_DIR = path.join(_discoveryTmpHome, ".pi");
+    _resetDiscoveryCacheForTest();
+});
+
+test.after(() => {
+    for (const [k, v] of Object.entries(_discoverySavedEnv)) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+    }
+    _resetDiscoveryCacheForTest();
+    if (_discoveryTmpHome) {
+        try { fs.rmSync(_discoveryTmpHome, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+});
 
 // Isolate the CA directory to a per-test tmp dir so we never touch the real
 // ~/.local/share/billion-context/ca. caDir() = dataDir()/ca =
@@ -25,7 +55,7 @@ function withTmpCa<T>(fn: () => Promise<T> | T): Promise<T> | T {
 }
 
 test("isMitmHost: matches the built-in whitelist exactly", () => {
-    assert.equal(isMitmHost("open.bigmodel.cn"), true);
+    assert.equal(isMitmHost("open.bigmodel.cn"), false);
     assert.equal(isMitmHost("api.anthropic.com"), true);
     assert.equal(isMitmHost("api.openai.com"), true);
     assert.equal(isMitmHost("chatgpt.com"), true);
@@ -57,7 +87,7 @@ test("isMitmHost: honors extra domains from config", () => {
 });
 
 test("isMitmHost: is case-insensitive on the host", () => {
-    assert.equal(isMitmHost("OPEN.BIGMODEL.CN"), true);
+    assert.equal(isMitmHost("CHATGPT.COM"), true);
     assert.equal(isMitmHost("Api.Anthropic.Com"), true);
 });
 

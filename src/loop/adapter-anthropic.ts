@@ -175,10 +175,10 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                         const name = typeof block.name === "string" ? block.name : "";
                         const id = typeof block.id === "string" ? block.id : `toolu_${upstreamIndex}`;
                         pending.set(upstreamIndex, { id, name, json: "" });
-                    } else if (round === 1) {
+                    } else {
                         const ci = clientIndex++;
                         indexMap.set(upstreamIndex, ci);
-                        yield { kind: "meta", chunk: remapIndexInEvent(eventStr, ci), firstRoundOnly: true } as ParsedStreamEvent;
+                        yield { kind: "meta", chunk: remapIndexInEvent(eventStr, ci), firstRoundOnly: round === 1 } as ParsedStreamEvent;
                     }
                 } else if (type === "content_block_delta") {
                     const upstreamIndex = (data.index as number) ?? 0;
@@ -188,12 +188,8 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                             pending.get(upstreamIndex)!.json += delta.partial_json;
                         }
                     } else if (delta.type === "text_delta" && typeof delta.text === "string") {
-                        if (round === 1) {
-                            const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
-                            yield { kind: "text", delta: delta.text, raw: remapIndexInEvent(eventStr, ci) } as ParsedStreamEvent;
-                        } else {
-                            yield { kind: "text", delta: delta.text } as ParsedStreamEvent;
-                        }
+                        const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
+                        yield { kind: "text", delta: delta.text, raw: remapIndexInEvent(eventStr, ci) } as ParsedStreamEvent;
                     } else if (round === 1) {
                         const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
                         yield { kind: "meta", chunk: remapIndexInEvent(eventStr, ci), firstRoundOnly: true } as ParsedStreamEvent;
@@ -209,9 +205,9 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                             callId: tb.id,
                             arguments: tb.json,
                         } as ParsedStreamEvent;
-                    } else if (round === 1) {
+                    } else {
                         const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
-                        yield { kind: "meta", chunk: remapIndexInEvent(eventStr, ci), firstRoundOnly: true } as ParsedStreamEvent;
+                        yield { kind: "meta", chunk: remapIndexInEvent(eventStr, ci), firstRoundOnly: round === 1 } as ParsedStreamEvent;
                     }
                 } else if (type === "message_delta") {
                     const u = (data.usage ?? {}) as Record<string, unknown>;
