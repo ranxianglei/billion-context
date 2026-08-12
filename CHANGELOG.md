@@ -3,6 +3,23 @@
 All notable changes to **billion-context** are documented here.
 Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag.
 
+## [0.1.38] — 2026-08-13
+
+### Fixes
+
+- **OpenAI `reasoning_content` round-trip for thinking-mode models** (#129): OpenAI-compatible reasoning models (DeepSeek-R1, GLM-4.6 thinking, Qwen-QwQ) emit `reasoning_content` (chain-of-thought) and require it be echoed back on subsequent requests — without it the upstream returns HTTP 400 `The reasoning_content in the thinking mode must be passed back to the API.` bili's OpenAI adapter dropped it (Anthropic `thinking` and Responses paths already handled it). Now `openaiToCore`/`coreToOpenai` round-trip `reasoning_content` through a `contentType:"reasoning"` core message; the streaming adapter captures `delta.reasoning_content`; re-request reconstruction re-emits it so the model never sees a missing-CoT 400. Also fixed double-forwarding when a single chunk carried both `reasoning_content` and `content`.
+
+## [0.1.37] — 2026-08-13
+
+### Features
+
+- **MITM domain auto-discovery** (#125): bili now reads client configs (`~/.zcode/v2/config.json`, `~/.codex/config.toml`, `~/.pi/agent/models.json`, `~/.claude/settings.json`) and auto-builds the MITM whitelist from all discovered HTTPS provider hostnames (mtime-cached, re-scanned on change). No more hardcoded domain assumptions — `open.bigmodel.cn`, `zcode.z.ai`, `api.z.ai` are now discovered, not baked in. Defaults reduced to the three binary-hardcoded endpoints (api.anthropic.com / api.openai.com / chatgpt.com) that have no config file to discover from.
+
+### Fixes
+
+- **Anthropic round-2 streaming framing (vertical-text bug)** (#126): after a proxy tool/compress re-request, round-2 streamed text rendered as vertical text (each ~2-char chunk on its own line). `runCompressLoop` round-2 text now carries the Anthropic `content_block_start/delta/stop` framing with the correct client index. Regression test added.
+- **HTTP-proxy-mode absolute URLs** (#127): bili concatenated its default anthropic upstream with the full absolute request URL in HTTP-proxy mode (`https://api.anthropic.comhttp://127.0.0.1:18081/…`). Absolute URLs (e.g. a local model server) are now forwarded to the host in the URL instead of mangled.
+
 ## [0.1.36] — 2026-08-12
 
 ### Fixes
