@@ -221,6 +221,7 @@ export async function* runCompressLoop(
                 resolvedText = extracted.clean;
                 allCalls = [...calls, ...extracted.calls];
             }
+            const functionCallIds = new Set(calls.map(c => c.callId));
 
             if (ctx.textProtocol && resolvedText.length > 0) {
                 yield adapter.emitText(resolvedText);
@@ -280,23 +281,16 @@ export async function* runCompressLoop(
             // never in coreMessages), and hideConsumedCompressCalls runs each
             // round so consumed compress records cannot re-prime the model.
             if (proxyResults.length > 0) {
-                if (resolvedText.length > 0) {
+                if (assistantText.length > 0) {
                     coreMessages.push({
                         id: `acp_loop_r${round}_asst`,
                         role: "assistant",
                         contentType: "text",
-                        text: resolvedText,
+                        text: assistantText,
                     });
                 }
                 for (const pr of proxyResults) {
-                    if (ctx.textProtocol) {
-                        coreMessages.push({
-                            id: `acp_loop_r${round}_marker_${pr.callId}`,
-                            role: "system",
-                            contentType: "text",
-                            text: buildVisibilityMarker(pr.name, pr.result),
-                        });
-                    } else {
+                    if (functionCallIds.has(pr.callId)) {
                         coreMessages.push({
                             id: `acp_loop_r${round}_asst_tc_${pr.callId}`,
                             role: "assistant",
@@ -311,6 +305,13 @@ export async function* runCompressLoop(
                             contentType: "tool-result",
                             toolCallId: pr.callId,
                             text: pr.result,
+                        });
+                    } else {
+                        coreMessages.push({
+                            id: `acp_loop_r${round}_marker_${pr.callId}`,
+                            role: "system",
+                            contentType: "text",
+                            text: buildVisibilityMarker(pr.name, pr.result),
                         });
                     }
                 }

@@ -323,6 +323,47 @@ test("loop #12 (guard): a SECOND acp_status in the same request is a no-op (prev
     }
 });
 
+test("loop #13 (feedback fix): textProtocol + native function_call → round-2 re-request carries a proper function_call_output (not a bare developer message)", async () => {
+    // Before the fix, textProtocol mode fed ALL proxy-tool results back as
+    // role:system developer messages (buildVisibilityMarker), never as a proper
+    // function_call_output. The Responses API expects function_call →
+    // function_call_output pairing; a bare system message gets ignored, so the
+    // model re-calls the same tool (#119 run-on). The fix tracks which calls were
+    // native function_calls and feeds those back as a proper function_call +
+    // function_call_output pair even under textProtocol.
+    const ctx = makeCtx([
+        textMsg("m00001", "user", "hello"),
+        textMsg("m00002", "assistant", "hi"),
+    ]);
+    ctx.textProtocol = true;
+    const round1 = [
+        sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+        fcEvents(0, "call_s", "acp_status", "{}"),
+        COMPLETED,
+    ].join("");
+    const bodies: string[] = [];
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async (_u: unknown, init?: RequestInit) => {
+        if (init?.body) bodies.push(String(init.body));
+        return new Response(REFETCH_DONE, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }) as typeof fetch;
+    try {
+        await drain(
+            new Response(round1, { status: 200 }).body!,
+            ctx,
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+            createResponsesAdapter(true),
+        );
+        assert.ok(bodies.length >= 1, "re-request fires after acp_status");
+        const body = bodies[0];
+        assert.ok(body.includes('"function_call"'), "round-2 body includes the assistant function_call item");
+        assert.ok(body.includes('"function_call_output"'), "round-2 body includes a proper function_call_output (the fix); previously only a developer system message was sent");
+    } finally {
+        globalThis.fetch = orig;
+    }
+});
+
 test("loop #9 (S2): responses round yields usage → session.stats populated (nudge/stat tracking)", async () => {
     const ctx = makeCtx([
         textMsg("m00001", "user", "hello"),
