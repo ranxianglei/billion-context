@@ -5,10 +5,43 @@ import {
     type Config,
     type CoreMessage,
 } from "acp-kernel";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import type { Session } from "./session.js";
+
+/** Bounded retention for large-decompress temp files. Each decompress with
+ *  body > 10000 writes one file under tmpdir(); the reaper unlinks oldest past
+ *  BILI_DECOMPRESS_TMP_CAP (default 50) and beforeExit cleans all. */
+type TrackedTempFile = { path: string; mtimeMs: number };
+const trackedTempFiles: TrackedTempFile[] = [];
+
+function getDecompressTmpCap(): number {
+    const raw = process.env.BILI_DECOMPRESS_TMP_CAP;
+    const parsed = raw ? Number.parseInt(raw, 10) : NaN;
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 50;
+}
+
+function reapTempFiles(): void {
+    const cap = getDecompressTmpCap();
+    while (trackedTempFiles.length > cap) {
+        trackedTempFiles.sort((a, b) => a.mtimeMs - b.mtimeMs);
+        const oldest = trackedTempFiles.shift();
+        if (!oldest) break;
+        try {
+            unlinkSync(oldest.path);
+        } catch {}
+    }
+}
+
+process.on("beforeExit", () => {
+    for (const f of trackedTempFiles) {
+        try {
+            unlinkSync(f.path);
+        } catch {}
+    }
+    trackedTempFiles.length = 0;
+});
 
 /** Shared ctx shape used by both the chat and responses compress loops. */
 export type ProxyToolCtx = {
@@ -73,6 +106,8 @@ export function resolveDecompress(
         try {
             mkdirSync(dirname(outPath), { recursive: true });
             writeFileSync(outPath, body, "utf8");
+            trackedTempFiles.push({ path: outPath, mtimeMs: Date.now() });
+            reapTempFiles();
             return `${header}\nContent (${body.length} chars) written to: ${outPath}\nUse the read tool to access it.`;
         } catch (e) {
             return `${header}\n[Failed to write to ${outPath}: ${String(e)}]\n${body.slice(0, 4000)}...`;

@@ -41,11 +41,9 @@ import { applyRanges } from "./stream.js";
 import { renderUI, handleConfigGet, handleConfigPut } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { getStore } from "./persist.js";
-import { compressLoopStream } from "./compress-loop.js";
-import { compressLoopAnthropicStream } from "./compress-loop-anthropic.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger } from "./logger.js";
 import { defaultLogFile, stateDir } from "./paths.js";
-import { compressLoopResponsesJson, compressLoopResponsesStream } from "./compress-loop-responses.js";
+import { compressLoopResponsesJson } from "./compress-loop-responses.js";
 import { runCompressLoop, pickAdapter } from "./loop/index.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesSseStream, rewriteResponsesJsonResponse } from "./stream-responses.js";
@@ -67,6 +65,16 @@ const UPSTREAM_HOP_HEADERS = new Set([
     // streamed from fetch, otherwise clients try to decompress plain bytes.
     "content-encoding",
 ]);
+
+function buildForwardHeaders(headers: Record<string, string>): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(headers)) {
+        if (k.toLowerCase() === "content-length" || k.toLowerCase() === "host") continue;
+        out[k] = v;
+    }
+    out["content-type"] = "application/json";
+    return out;
+}
 
 export function resolveUpstream(_opts: ProxyOptions, reqUrl: string, req?: http.IncomingMessage): { upstream: string; rewrittenUrl: string; explicitProtocol?: "openai" | "anthropic" | "responses" } | undefined {
     // MITM mode: the request arrived over a CONNECT tunnel we terminated
@@ -166,6 +174,9 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 (nOverrides ? ` — context overrides for ${nOverrides} upstream URL(s)` : "")
                 + (opts.mitm.enabled ? ` — MITM proxy on (whitelist)${opts.mitm.domains.length ? ` +${opts.mitm.domains.join(",")}` : ""}` : ""),
         );
+        if (opts.debug) {
+            log("info", `[debug] build features: raw-HTTP-capture(on) | remote_compaction_v2-strip(on) | cert-MITM-launcher(on) | strip-acp-summary(on) — seeing this line confirms the launcher build (not registry 0.1.34)`);
+        }
     });
     // Listen errors (EADDRINUSE port taken, EACCES privileged port, EAFNOSUPPORT
     // bad host) surface as an 'error' event on the server. Without a listener
@@ -252,6 +263,7 @@ type Prepared = {
     resetAfterSuccess?: boolean;
     responsesProjection?: ResponsesProjection;
     anthropicSystem?: AnthropicRequestBody["system"];
+    nudge?: NudgeDecision;
 };
 
 /** True if `addr` is a loopback (IPv4 127.x or IPv6 ::1 / ::ffff:127.0.0.1).
@@ -447,6 +459,22 @@ async function handle(
             parsed = null;
         }
     }
+    // Capture the CLIENT's raw incoming request (before bili rebuilds) to
+    // resolve whether codex sends previous_response_id + full input vs delta.
+    if (opts.debug && parsed && typeof parsed === "object") {
+        try {
+            const p = parsed as Record<string, unknown>;
+            const hasPrev = p.previous_response_id !== undefined;
+            const inLen = Array.isArray(p.input) ? p.input.length : 0;
+            log("info", `[debug] INCOMING previous_response_id=${hasPrev ? String(p.previous_response_id).slice(0, 16) : "absent"} input_items=${inLen} instructions=${p.instructions !== undefined ? "present" : "absent"}`);
+            const rawDir = `${stateDir()}/raw`;
+            try { fs.mkdirSync(rawDir, { recursive: true }); } catch { /* best-effort */ }
+            const hdrs = Object.entries(req.headers)
+                .filter(([k]) => !/authorization|x-api-key|cookie/i.test(k))
+                .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(",") : v}`).join("\n");
+            fs.writeFileSync(`${rawDir}/${Date.now()}-INCOMING.txt`, `${req.method} ${req.url}\n${hdrs}\n\n${bodyBuffer.toString("utf8")}`);
+        } catch { /* best-effort dump */ }
+    }
     // Per-request context limit: look up body.model against the per-route
     // model declaration first, then the built-in table.
     let reqConfig = config;
@@ -505,27 +533,30 @@ async function handle(
             ? responsesIdentity.value
             : clientConversationHeader(req.headers);
         const session = getSession(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? undefined });
-        // Serialize per-session: prepare (processTurn mutates state) + forward
-        // (stream rewriter mutates state via compress/decompress) must not
-        // interleave across concurrent requests on the same session.
-        await withSessionLock(session, async () => {
-            prepared =
-                countTokens
-                    ? prepareCountTokens(parsed as AnthropicRequestBody, core, reqConfig, log, session)
-                    : protocol === "anthropic"
-                      ? prepareAnthropic(parsed as AnthropicRequestBody, req, opts, core, reqConfig, log, session)
-                      : protocol === "openai"
-                        ? prepareOpenai(parsed as OpenAIRequestBody, req, opts, core, reqConfig, log, session)
-                        : responsesCompact
-                          ? prepareResponsesCompact(bodyBuffer, parsed as ResponsesRequestBody, session)
-                          : prepareResponses(parsed as ResponsesRequestBody, req, opts, core, reqConfig, log, session, responsesIdentity!);
-            acquireInFlight(session);
-            try {
+        // acquireInFlight must precede the lock so evictOldest() cannot flush
+        // this session between getSession and lock acquisition (inFlight===0
+        // window). Released in the outer finally after forward completes.
+        acquireInFlight(session);
+        try {
+            // Serialize per-session: prepare (processTurn mutates state) + forward
+            // (stream rewriter mutates state via compress/decompress) must not
+            // interleave across concurrent requests on the same session.
+            await withSessionLock(session, async () => {
+                prepared =
+                    countTokens
+                        ? prepareCountTokens(parsed as AnthropicRequestBody, core, reqConfig, log, session)
+                        : protocol === "anthropic"
+                          ? prepareAnthropic(parsed as AnthropicRequestBody, req, opts, core, reqConfig, log, session)
+                          : protocol === "openai"
+                            ? prepareOpenai(parsed as OpenAIRequestBody, req, opts, core, reqConfig, log, session)
+                            : responsesCompact
+                              ? prepareResponsesCompact(bodyBuffer, parsed as ResponsesRequestBody, session)
+                              : prepareResponses(parsed as ResponsesRequestBody, req, opts, core, reqConfig, log, session, responsesIdentity!);
                 await forward(req, res, opts, prepared!.body, prepared!, core, reqConfig, log, route, affinity);
-            } finally {
-                releaseInFlight(session);
-            }
-        });
+            });
+        } finally {
+            releaseInFlight(session);
+        }
     }
     if (!prepared) {
         if (protocol === null && !opts.passthrough) {
@@ -586,6 +617,7 @@ function prepareAnthropic(
 
     let processedMessages: CoreMessage[] = [];
     let originalMessages: CoreMessage[] = [];
+    let nudge: NudgeDecision | undefined;
     let rebuiltMessages = parsed.messages;
     let systemOut = parsed.system;
     let toolsOut = parsed.tools;
@@ -605,6 +637,7 @@ function prepareAnthropic(
         const tokenCount = session.stats.lastInputTokens;
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
+        nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         if (!session.meta.title) {
             const t = deriveTitle(msgs);
@@ -638,7 +671,7 @@ function prepareAnthropic(
 
     const rebuilt: AnthropicRequestBody = { ...parsed, messages: rebuiltMessages, system: systemOut, tools: toolsOut };
     markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: opts.compress.injectTool } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: opts.compress.injectTool, nudge } as Prepared;
 }
 
 function prepareOpenai(
@@ -656,6 +689,7 @@ function prepareOpenai(
 
     let processedMessages: CoreMessage[] = [];
     let originalMessages: CoreMessage[] = [];
+    let nudge: NudgeDecision | undefined;
     let rebuiltMessages = parsed.messages;
     let toolsOut = parsed.tools;
 
@@ -677,6 +711,7 @@ function prepareOpenai(
         const tokenCount = session.stats.lastInputTokens;
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
+        nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         if (!session.meta.title) {
             const t = deriveTitle(msgs);
@@ -726,7 +761,7 @@ function prepareOpenai(
         (rebuilt as Record<string, unknown>).stream_options = { include_usage: true };
     }
     markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: shouldInject } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: shouldInject, nudge } as Prepared;
 }
 
 function prepareResponses(
@@ -748,6 +783,7 @@ function prepareResponses(
 
     let processedMessages: CoreMessage[] = [];
     let originalMessages: CoreMessage[] = [];
+    let nudge: NudgeDecision | undefined;
     let responsesProjection: ResponsesProjection | undefined;
     let rebuiltInput: ResponseInputItem[] | string = parsed.input;
     let toolsOut = parsed.tools;
@@ -768,6 +804,7 @@ function prepareResponses(
         const tokenCount = session.stats.lastInputTokens;
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" });
         session.state = turn.state;
+        nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         if (!session.meta.title) {
             const t = deriveTitle(msgs);
@@ -813,14 +850,16 @@ function prepareResponses(
     );
     if (promptCacheKey && !rebuilt.prompt_cache_key) rebuilt.prompt_cache_key = promptCacheKey;
     // This adapter is stateless: we replay the FULL conversation in `input`.
-    // Strip Responses' native chaining fields so the upstream does not resolve
-    // stored server-side state on top of the input we already sent. Forwarding
-    // previous_response_id would make the prefix shift every turn (as the id
-    // advances) and duplicate history — breaking prompt-cache. `instructions`
-    // was already lifted into the developer message at input[1], so forwarding
-    // it again here double-sends it and violates the responses_lite contract
+    // Strip Responses' native chaining field so the upstream does not resolve
+    // stored server-side state ON TOP of the input we already sent (which would
+    // duplicate history for clients that use store:true + chaining). Empirically
+    // codex sends store:false and never sets previous_response_id, so this is a
+    // no-op for codex — kept defensively for any client that does chain. Set
+    // ACP_KEEP_RESPONSE_ID=1 to preserve it (diagnostic only). `instructions`
+    // was already lifted into the developer message at input[1]; forwarding it
+    // again here double-sends it and violates the responses_lite contract
     // (top-level instructions must stay empty for code_mode tool exposure).
-    delete rebuilt.previous_response_id;
+    if (process.env.ACP_KEEP_RESPONSE_ID !== "1") delete rebuilt.previous_response_id;
     delete rebuilt.instructions;
     // Log the final tools we forward upstream so we can confirm ACP tools are
     // present. Distinguishes "compress" (top-level function) from Codex
@@ -844,6 +883,7 @@ function prepareResponses(
         stream,
         compressInjected: shouldInject,
         responsesTextProtocol,
+        nudge,
     };
 }
 
@@ -1068,6 +1108,20 @@ async function forward(
         headers[k] = Array.isArray(v) ? v.join(", ") : v;
     }
     headers["host"] = new URL(route ? route.upstream : opts.upstream).host;
+    // codex advertises its own server-side context compaction via this beta
+    // feature. It conflicts with bili's client-side compress (bili IS the
+    // compression layer) and third-party aggregators reject it with
+    // "invalid range / ref not found". Strip it so bili's compress is the
+    // sole mechanism.
+    const betaKey = Object.keys(headers).find((h) => h.toLowerCase() === "x-codex-beta-features");
+    if (betaKey) {
+        const kept = headers[betaKey]
+            .split(",")
+            .map((s) => s.trim())
+            .filter((f) => f && f !== "remote_compaction_v2");
+        if (kept.length > 0) headers[betaKey] = kept.join(",");
+        else delete headers[betaKey];
+    }
     // Forward a client-provided Responses session identity only when it was
     // carried in the body rather than an existing request header.
     if (affinity && !clientConversationHeader(req.headers)) {
@@ -1080,6 +1134,41 @@ async function forward(
             if (typeof hv === "string") hdrLog[hk] = hv.length > 200 ? hv.slice(0, 200) + "..." : hv;
         }
         log("info", `[${prepared?.session.id ?? "unknown"}] → upstream headers: ${JSON.stringify(hdrLog)}`);
+    }
+    // Raw HTTP capture: dump the COMPLETE exchange (request method/URL/all
+    // headers/exact body bytes; response status+headers) so two consecutive
+    // requests can be byte-diffed to locate a cache-breaker that the JSON body
+    // dump (which re-formats and omits headers) may hide. Enabled with --debug
+    // (headers written verbatim minus credential values).
+    const rawBase =
+        opts.debug
+            ? (() => {
+                  try {
+                      const rawDir = process.env.ACP_RAW_DUMP_DIR || `${stateDir()}/raw`;
+                      fs.mkdirSync(rawDir, { recursive: true });
+                      return `${rawDir}/${Date.now()}-${prepared?.session.id ?? "unknown"}`;
+                  } catch {
+                      return "";
+                  }
+              })()
+            : "";
+    if (rawBase) {
+        try {
+            const maskHdr = (k: string, v: string) =>
+                /key|auth|token/i.test(k) ? `<masked ${v.length} chars>` : v;
+            const hdrText = Object.entries(headers)
+                .map(([k, v]) => `${k}: ${maskHdr(k, String(v))}`)
+                .join("\n");
+            const bodyText =
+                req.method === "GET" || req.method === "HEAD"
+                    ? ""
+                    : typeof body === "string"
+                      ? body
+                      : Buffer.from(body).toString("utf8");
+            const reqPath = `${rawBase}-REQ.txt`;
+            fs.writeFileSync(reqPath, `${req.method ?? "POST"} ${upstreamUrl}\n${hdrText}\n\n${bodyText}`);
+            log("info", `[debug] RAW request dump: ${reqPath}`);
+        } catch { /* best-effort */ }
     }
     const dispatcher = proxyDispatcher(proxyUrl);
     const init: Omit<RequestInit, "dispatcher"> & { dispatcher?: object } = {
@@ -1109,6 +1198,18 @@ async function forward(
             respLog[k] = v.length > 300 ? v.slice(0, 300) + "..." : v;
         });
         log("info", `[${prepared?.session.id ?? "unknown"}] ← upstream response headers: ${JSON.stringify(respLog)}`);
+    }
+    if (rawBase) {
+        try {
+            const maskHdr = (k: string, v: string) =>
+                /key|auth|token/i.test(k) ? `<masked ${v.length} chars>` : v;
+            const hdrText = Object.entries(respHeaders)
+                .map(([k, v]) => `${k}: ${maskHdr(k, v)}`)
+                .join("\n");
+            const resPath = `${rawBase}-RES.txt`;
+            fs.writeFileSync(resPath, `${upstream.status}\n${hdrText}\n`);
+            log("info", `[debug] RAW response dump: ${resPath}`);
+        } catch { /* best-effort */ }
     }
     // P1.2: if the upstream returned a non-2xx (auth, rate-limit, context too
     // long, ...), do NOT route the error body through the SSE rewriter — it has
@@ -1173,24 +1274,23 @@ async function forward(
         // emitStreamError sends a protocol-appropriate error + finish so the
         // client ends cleanly instead of seeing a bare truncated stream.
         try {
-        if (process.env.ACP_LOOP_V2 !== "0") {
             const parsedReq = JSON.parse(typeof body === "string" ? body : body.toString("utf8"));
-            const reqHeaders: Record<string, string> = {};
-            for (const [k, v] of Object.entries(headers)) {
-                if (k.toLowerCase() === "content-length" || k.toLowerCase() === "host") continue;
-                reqHeaders[k] = v;
-            }
-            reqHeaders["content-type"] = "application/json";
+            const reqHeaders = buildForwardHeaders(headers);
             const textProtocol = prepared.protocol === "responses" && !!prepared.responsesTextProtocol;
             const systemPrompt = textProtocol ? buildCompressTextSystemPrompt() : buildCompressSystemPrompt();
             const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem);
+            const abortCtrl = new AbortController();
+            req.on("close", () => {
+                if (!res.writableEnded) abortCtrl.abort();
+            });
             const loop = runCompressLoop(
                 streamToRead,
-                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, textProtocol, debug: opts.debug },
+                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, textProtocol, debug: opts.debug, nudge: prepared.nudge },
                 parsedReq,
                 { url: upstreamUrl, headers: reqHeaders },
                 adapter,
                 systemPrompt,
+                abortCtrl.signal,
             );
             for await (const chunk of loop) {
                 {
@@ -1200,80 +1300,15 @@ async function forward(
                     }
                 }
                 res.write(chunk);
-                if (res.writableNeedDrain) await new Promise<void>((r) => res.once("drain", () => r()));
+                if (res.writableNeedDrain) {
+                    await Promise.race([
+                        new Promise<void>((r) => res.once("drain", () => r())),
+                        new Promise<void>((r) => res.once("close", () => r())),
+                    ]);
+                }
+                if (res.destroyed || res.writableEnded) break;
             }
             res.end();
-        } else if (prepared.protocol === "openai") {
-            const parsedReq = JSON.parse(typeof body === "string" ? body : body.toString("utf8"));
-            const reqHeaders: Record<string, string> = {};
-            for (const [k, v] of Object.entries(headers)) {
-                if (k.toLowerCase() === "content-length" || k.toLowerCase() === "host") continue;
-                reqHeaders[k] = v;
-            }
-            reqHeaders["content-type"] = "application/json";
-            const loop = compressLoopStream(
-                streamToRead,
-                { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl },
-                parsedReq,
-                { url: upstreamUrl, headers: reqHeaders },
-            );
-            for await (const chunk of loop) {
-                {
-                    const s = chunk.toString("utf8");
-                    if (s.includes("\x3cacp ") || s.includes("\x3c/acp")) {
-                        log("warn", `[${prepared.session.id}] tag echo: openai response stream contains <acp tag`);
-                    }
-                }
-                if (!res.write(chunk)) await new Promise<void>((r) => res.once("drain", () => r()));
-            }
-        } else if (prepared.protocol === "responses") {
-            const parsedReq = JSON.parse(typeof body === "string" ? body : body.toString("utf8"));
-            const reqHeaders: Record<string, string> = {};
-            for (const [k, v] of Object.entries(headers)) {
-                if (k.toLowerCase() === "content-length" || k.toLowerCase() === "host") continue;
-                reqHeaders[k] = v;
-            }
-            reqHeaders["content-type"] = "application/json";
-            const loop = compressLoopResponsesStream(
-                streamToRead,
-                { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, textProtocol: prepared.responsesTextProtocol },
-                parsedReq,
-                { url: upstreamUrl, headers: reqHeaders },
-            );
-            for await (const chunk of loop) {
-                {
-                    const s = chunk.toString("utf8");
-                    if (s.includes("\x3cacp ") || s.includes("\x3c/acp")) {
-                        log("warn", `[${prepared.session.id}] tag echo: responses response stream contains <acp tag`);
-                    }
-                }
-                if (!res.write(chunk)) await new Promise<void>((r) => res.once("drain", () => r()));
-            }
-        } else {
-            const parsedReq = JSON.parse(typeof body === "string" ? body : body.toString("utf8"));
-            const reqHeaders: Record<string, string> = {};
-            for (const [k, v] of Object.entries(headers)) {
-                if (k.toLowerCase() === "content-length" || k.toLowerCase() === "host") continue;
-                reqHeaders[k] = v;
-            }
-            reqHeaders["content-type"] = "application/json";
-            const loop = compressLoopAnthropicStream(
-                streamToRead,
-                { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl },
-                parsedReq,
-                { url: upstreamUrl, headers: reqHeaders },
-            );
-            for await (const chunk of loop) {
-                {
-                    const s = chunk.toString("utf8");
-                    if (s.includes("\x3cacp ") || s.includes("\x3c/acp")) {
-                        log("warn", `[${prepared.session.id}] tag echo: anthropic response stream contains <acp tag`);
-                    }
-                }
-                if (!res.write(chunk)) await new Promise<void>((r) => res.once("drain", () => r()));
-            }
-        }
-        res.end();
         } catch (e) {
             emitStreamError(res, prepared.protocol, (e as Error)?.message ?? String(e), (m) => log("error", `[${prepared.session.id}] ${m}`));
         } finally {
@@ -1293,12 +1328,7 @@ async function forward(
                 let json = JSON.parse(text) as Record<string, unknown>;
                 if (prepared.protocol === "responses" && prepared.responsesTextProtocol) {
                     const requestBody = JSON.parse(typeof body === "string" ? body : body.toString("utf8")) as Record<string, unknown>;
-                    const requestHeaders: Record<string, string> = {};
-                    for (const [key, value] of Object.entries(headers)) {
-                        if (key.toLowerCase() === "content-length" || key.toLowerCase() === "host") continue;
-                        requestHeaders[key] = value;
-                    }
-                    requestHeaders["content-type"] = "application/json";
+                    const requestHeaders = buildForwardHeaders(headers);
                     json = await compressLoopResponsesJson(
                         json,
                         { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, textProtocol: true },
@@ -1448,9 +1478,10 @@ function headerValue(req: http.IncomingMessage, name: string): string | undefine
     return undefined;
 }
 
-/** A thrown BodyTooLargeError lets handle() respond 413 cleanly before
- *  destroying the request. Avoids a bare req.destroy() that would reject
- *  readBody but leave the client connection with no HTTP response. */
+/** Thrown by readBody when the request body exceeds MAX_REQUEST_BYTES.
+ *  handle() catches this and attempts a 413 response; readBody also destroys
+ *  the request socket so a client that keeps streaming a pathological body
+ *  cannot hold the connection open. */
 export class BodyTooLargeError extends Error {
     constructor(public readonly limit: number) {
         super(`request body exceeds ${limit} bytes`);
@@ -1468,9 +1499,7 @@ export function readBody(req: http.IncomingMessage): Promise<Buffer> {
             size += c.length;
             if (size > MAX_REQUEST_BYTES) {
                 aborted = true;
-                // Reject FIRST so handle() can write a 413 and return.
-                // Then drain remaining data so the socket can close
-                // cleanly instead of lingering mid-request.
+                req.destroy();
                 reject(new BodyTooLargeError(MAX_REQUEST_BYTES));
                 return;
             }

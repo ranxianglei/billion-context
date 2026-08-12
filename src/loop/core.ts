@@ -1,10 +1,12 @@
 import {
     buildStatusReport,
     estimateTokensFast,
+    formatRanges,
     hideConsumedCompressCalls,
     type CompressionCore,
     type Config,
     type CoreMessage,
+    type NudgeDecision,
 } from "acp-kernel";
 import type { Session } from "../session.js";
 import {
@@ -29,6 +31,7 @@ export interface LoopCtx {
     proxyUrl?: string;
     textProtocol?: boolean;
     debug?: boolean;
+    nudge?: NudgeDecision;
 }
 
 export interface RequestOptions {
@@ -100,9 +103,35 @@ export function executeProxyTool(
         return `Found ${blocks.length} block(s) for "${query}":\n\n${lines.join("\n\n")}`;
     }
     if (toolName === "acp_status") {
-        return buildStatusReport(ctx.session.state, ctx.messages, estimateTokensFast);
+        return handleAcpStatus(args, ctx);
     }
     return `[Unknown proxy tool: ${toolName}]`;
+}
+
+// Aligns with billion-context-pi's handleStatus: appends compressible ranges
+// to the default overview so the model picks valid refs (else it guesses
+// covered/protected refs → 0-char compress failures).
+function handleAcpStatus(args: Record<string, unknown>, ctx: LoopCtx): string {
+    const scope = typeof args.scope === "string" ? (args.scope as "compressed" | "uncompressed") : undefined;
+    const view = typeof args.view === "string" ? (args.view as "ranges" | "messages") : undefined;
+    const tool = typeof args.tool === "string" ? args.tool : undefined;
+    const sort = typeof args.sort === "string" ? (args.sort as "size" | "time" | "tool" | "age") : undefined;
+    const limit = typeof args.limit === "number" ? args.limit : undefined;
+    const base = buildStatusReport(ctx.session.state, ctx.messages, estimateTokensFast, { scope, view, tool, sort, limit });
+    if (scope) return base;
+    const nudge = ctx.nudge;
+    const ranges = nudge?.compressibleRanges ?? [];
+    const protectedRanges = nudge?.protectedRanges ?? [];
+    const extra: string[] = [];
+    if (nudge) {
+        extra.push("");
+        extra.push(nudge.shouldInject ? `Nudge: ACTIVE — ${nudge.reason}` : `Nudge: idle — ${nudge.reason}`);
+    }
+    if (ranges.length > 0 || protectedRanges.length > 0) {
+        extra.push("");
+        extra.push(formatRanges(ranges, protectedRanges));
+    }
+    return extra.length > 0 ? `${base}\n${extra.join("\n")}` : base;
 }
 
 function recordUsage(
@@ -116,9 +145,11 @@ function recordUsage(
     if (typeof prompt === "number") ctx.session.stats.inputTokens += prompt;
     ctx.session.stats.lastInputTokens =
         (typeof prompt === "number" ? prompt : 0) + (typeof cached === "number" ? cached : 0);
-    if (typeof cached === "number") ctx.session.stats.cachedTokens += cached;
+    if (typeof cached === "number") {
+        ctx.session.stats.cachedTokens += cached;
+        ctx.session.stats.cacheSamples += 1;
+    }
     if (typeof out === "number") ctx.session.stats.outputTokens += out;
-    ctx.session.stats.cacheSamples += 1;
     const hitPct =
         typeof prompt === "number" && typeof cached === "number" && prompt + cached > 0
             ? Math.round((cached / (prompt + cached)) * 100)
@@ -135,19 +166,23 @@ export async function* runCompressLoop(
     requestOptions: RequestOptions,
     adapter: CompressLoopAdapter,
     systemPrompt: string,
+    signal?: AbortSignal,
 ): AsyncGenerator<Buffer> {
     let activeClearTimer: (() => void) | null = null;
     let currentUpstream = upstream;
     const coreMessages: CoreMessage[] = [...ctx.messages];
+    let mutatedThisTurn = false;
 
     try {
         for (let round = 1; round <= MAX_LOOP_ROUNDS; round++) {
+            if (signal?.aborted) break;
             let assistantText = "";
             const calls: ToolCallEmit[] = [];
             let usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number } = {};
             let finishReason: string | undefined;
 
             for await (const ev of adapter.parseStream(currentUpstream, round)) {
+                if (signal?.aborted) break;
                 if (ev.kind === "text") {
                     assistantText += ev.delta;
                     if (!ctx.textProtocol && round === 1 && ev.raw) {
@@ -204,7 +239,15 @@ export async function* runCompressLoop(
                     } catch {
                         parsedArgs = {};
                     }
-                    const result = executeProxyTool(call.name, parsedArgs, ctx, call.callId);
+                    const isMutating = call.name === "compress" || call.name === "decompress";
+                    let result: string;
+                    if (isMutating && mutatedThisTurn) {
+                        result = `Already ${call.name}ed once this turn. Do not ${call.name} again; generate your normal response now.`;
+                        ctx.log(`[acp-loop] round ${round}: ${call.name} skipped (state already mutated this turn) — no-op result`);
+                    } else {
+                        result = executeProxyTool(call.name, parsedArgs, ctx, call.callId);
+                        if (isMutating) mutatedThisTurn = true;
+                    }
                     proxyResults.push({ name: call.name, callId: call.callId, result, arguments: call.arguments });
                     yield adapter.emitMarker(call.name, result);
                 } else {
@@ -243,7 +286,7 @@ export async function* runCompressLoop(
                     if (ctx.textProtocol) {
                         coreMessages.push({
                             id: `acp_loop_r${round}_marker_${pr.callId}`,
-                            role: "user",
+                            role: "system",
                             contentType: "text",
                             text: buildVisibilityMarker(pr.name, pr.result),
                         });
@@ -279,6 +322,14 @@ export async function* runCompressLoop(
                 yield adapter.emitToolCall(tc);
             }
 
+            // Re-request so the model receives the proxy-tool result and can
+            // continue (standard function-calling continuation: the proxy acts as
+            // the client, executes compress/decompress/acp_status/search, then
+            // feeds the result back). The mutatedThisTurn guard above ensures at
+            // most ONE compress/decompress per request — a second mutating call
+            // returns a no-op, which prevents the 0-char spiral (model re-targeting
+            // a just-compressed range on a stale view) without cutting off the
+            // model's continuation (which a hard stop did — it hung the session).
             const reRequest = proxyResults.length > 0 && realCalls === 0;
             if (!reRequest) {
                 yield adapter.emitCompletion({ finishReason, usage });
@@ -294,7 +345,9 @@ export async function* runCompressLoop(
                 return;
             }
 
-            ctx.log(`[acp-loop] round ${round} saw mutating proxy tool; re-requesting`);
+            ctx.log(`[acp-loop] round ${round}: proxy tool executed (state ${mutatedThisTurn ? "mutated" : "read-only"}); re-requesting so the model sees the result`);
+
+            if (signal?.aborted) break;
 
             const newBody = adapter.buildRequest(coreMessages, systemPrompt, requestBody);
             if (process.env.ACP_DUMP_REQ !== "0" && ctx.debug) {
@@ -306,12 +359,17 @@ export async function* runCompressLoop(
                     fs.writeFileSync(`${dumpDir}/req-${Date.now()}-${sid}-REREQUEST.json`, JSON.stringify(newBody, null, 2));
                 } catch { /* best-effort */ }
             }
-            const { response: resp, clearTimer } = await fetchWithTimeout(requestOptions.url, {
-                method: "POST",
-                headers: requestOptions.headers,
-                body: JSON.stringify(newBody),
-                ...(ctx.proxyUrl ? { dispatcher: proxyDispatcher(ctx.proxyUrl) } : {}),
-            });
+            const { response: resp, clearTimer } = await fetchWithTimeout(
+                requestOptions.url,
+                {
+                    method: "POST",
+                    headers: requestOptions.headers,
+                    body: JSON.stringify(newBody),
+                    ...(ctx.proxyUrl ? { dispatcher: proxyDispatcher(ctx.proxyUrl) } : {}),
+                },
+                undefined,
+                signal,
+            );
 
             if (!resp.ok || !resp.body) {
                 clearTimer();

@@ -155,7 +155,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                 : [systemPrompt];
             const withDev = injectResponsesDeveloperMessage(inputItems, devParts.join("\n\n---\n\n"));
             const rebuilt: Record<string, unknown> = { ...requestBody, input: withDev };
-            delete rebuilt.previous_response_id;
+            if (process.env.ACP_KEEP_RESPONSE_ID !== "1") delete rebuilt.previous_response_id;
             delete rebuilt.instructions;
             return rebuilt;
         },

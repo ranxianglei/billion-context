@@ -184,36 +184,19 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
 
     // --- Source 2: env vars (highest priority) ---
     const port = parseInt(env.ACP_PORT ?? env.PORT ?? `${fileConfig.port ?? 8787}`, 10);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+        throw new Error(`Invalid port ${Number.isNaN(port) ? "(not a number)" : port}; must be 1-65535`);
+    }
     const host = env.ACP_HOST ?? fileConfig.host ?? "127.0.0.1";
     const upstream = (env.ACP_UPSTREAM ?? fileConfig.upstream ?? "https://api.anthropic.com").replace(/\/$/, "");
-    let routes: ProviderRoutes = {};
-    // Routes: explicit env path > config file providers > none.
-    const routesPath = env.ACP_PROVIDERS ?? fileConfig.providersPath ?? "";
-    if (routesPath) {
-        const parsed = safeReadJson(routesPath);
-        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-            for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
-                rejectLegacyRoute(k, v);
-                const route = parseRouteEntry(v);
-                if (route) routes[normalizeUrlKey(k)] = route;
-            }
-        }
-    }
-    // Also accept providers inline in the config file.
-    if (fileConfig.providers) {
-        for (const [k, v] of Object.entries(fileConfig.providers)) {
-            rejectLegacyRoute(k, v);
-            const route = parseRouteEntry(v);
-            if (route && !routes[normalizeUrlKey(k)]) routes[normalizeUrlKey(k)] = route;
-        }
-    }
+    const routes = loadRoutes(env);
     const modelContextLimit = parseInt(env.ACP_MODEL_CONTEXT_LIMIT ?? `${fileConfig.modelContextLimit ?? 200000}`, 10);
     const biliProxy = nonEmpty(env.BILI_UPSTREAM_PROXY);
     const webProxy = nonEmpty(fileConfig.upstreamProxy);
     const configProxy = nonEmpty(fileConfig.proxy);
-    const proxyMode = parseUpstreamProxyMode(
-        env.BILI_UPSTREAM_PROXY_MODE ?? fileConfig.upstreamProxyMode ?? (webProxy ? "manual" : undefined),
-    );
+    const rawProxyMode = env.BILI_UPSTREAM_PROXY_MODE ?? fileConfig.upstreamProxyMode ?? (webProxy ? "manual" : undefined);
+    const proxyMode = parseUpstreamProxyMode(rawProxyMode);
+    const explicitDirect = proxyMode === "direct" && rawProxyMode === "direct";
     const proxy = biliProxy ?? (proxyMode === "direct" ? "" : proxyMode === "manual" ? webProxy ?? configProxy : configProxy);
     const proxySource: ProxyOptions["proxySource"] = biliProxy
         ? "bili-env"
@@ -233,8 +216,9 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         ...(httpsProxy ? { httpsProxy } : {}),
         ...(allProxy ? { allProxy } : {}),
         ...(noProxy ? { noProxy } : {}),
-        biliPort: Number.isFinite(port) ? port : 8787,
+        biliPort: port,
         globalSource: proxySource,
+        explicitDirect,
     };
     validateHttpProxy(proxy, proxyFallback.biliPort);
     for (const [url, route] of Object.entries(routes)) {
@@ -245,7 +229,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         }
     }
     return {
-        port: Number.isFinite(port) ? port : 8787,
+        port,
         host,
         upstream,
         routes,
@@ -271,7 +255,10 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         logFile: env.ACP_LOG_FILE !== undefined ? (env.ACP_LOG_FILE || undefined) : fileConfig.logFile,
         mitm: {
             enabled: (env.BILI_MITM ?? (fileConfig.mitm?.enabled === false ? "0" : "1")) !== "0",
-            domains: fileConfig.mitm?.domains ?? [],
+            domains: dedupeDomains([
+                ...(fileConfig.mitm?.domains ?? []),
+                ...splitCsv(env.BILI_MITM_DOMAINS),
+            ]),
         },
     };
 }
@@ -307,6 +294,26 @@ type FileConfig = {
 function nonEmpty(value: string | undefined): string | undefined {
     const trimmed = value?.trim();
     return trimmed ? trimmed : undefined;
+}
+
+function splitCsv(value: string | undefined): string[] {
+    if (!value) return [];
+    return value
+        .split(",")
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0);
+}
+
+function dedupeDomains(list: string[]): string[] {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const d of list) {
+        if (!seen.has(d)) {
+            seen.add(d);
+            out.push(d);
+        }
+    }
+    return out;
 }
 
 function loadConfigFile(): FileConfig {
