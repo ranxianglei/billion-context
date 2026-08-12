@@ -1100,6 +1100,41 @@ async function forward(
         }
         log("info", `[${prepared?.session.id ?? "unknown"}] → upstream headers: ${JSON.stringify(hdrLog)}`);
     }
+    // ACP_RAW_DUMP: capture the COMPLETE raw HTTP exchange (request method/URL/
+    // all headers/exact body bytes; later the response status+headers) so two
+    // consecutive requests can be byte-diffed to locate a cache-breaker that
+    // the JSON body dump (which re-formats and omits headers) may hide. Opt-in
+    // via env (writes headers verbatim minus credential values).
+    const rawBase =
+        opts.debug && process.env.ACP_RAW_DUMP
+            ? (() => {
+                  try {
+                      const rawDir = process.env.ACP_RAW_DUMP_DIR || `${stateDir()}/raw`;
+                      fs.mkdirSync(rawDir, { recursive: true });
+                      return `${rawDir}/${Date.now()}-${prepared?.session.id ?? "unknown"}`;
+                  } catch {
+                      return "";
+                  }
+              })()
+            : "";
+    if (rawBase) {
+        try {
+            const maskHdr = (k: string, v: string) =>
+                /key|auth|token/i.test(k) ? `<masked ${v.length} chars>` : v;
+            const hdrText = Object.entries(headers)
+                .map(([k, v]) => `${k}: ${maskHdr(k, String(v))}`)
+                .join("\n");
+            const bodyText =
+                req.method === "GET" || req.method === "HEAD"
+                    ? ""
+                    : typeof body === "string"
+                      ? body
+                      : Buffer.from(body).toString("utf8");
+            const reqPath = `${rawBase}-REQ.txt`;
+            fs.writeFileSync(reqPath, `${req.method ?? "POST"} ${upstreamUrl}\n${hdrText}\n\n${bodyText}`);
+            log("info", `[debug] RAW request dump: ${reqPath}`);
+        } catch { /* best-effort */ }
+    }
     const dispatcher = proxyDispatcher(proxyUrl);
     const init: Omit<RequestInit, "dispatcher"> & { dispatcher?: object } = {
         method: req.method ?? "GET",
@@ -1128,6 +1163,18 @@ async function forward(
             respLog[k] = v.length > 300 ? v.slice(0, 300) + "..." : v;
         });
         log("info", `[${prepared?.session.id ?? "unknown"}] ← upstream response headers: ${JSON.stringify(respLog)}`);
+    }
+    if (rawBase) {
+        try {
+            const maskHdr = (k: string, v: string) =>
+                /key|auth|token/i.test(k) ? `<masked ${v.length} chars>` : v;
+            const hdrText = Object.entries(respHeaders)
+                .map(([k, v]) => `${k}: ${maskHdr(k, v)}`)
+                .join("\n");
+            const resPath = `${rawBase}-RES.txt`;
+            fs.writeFileSync(resPath, `${upstream.status}\n${hdrText}\n`);
+            log("info", `[debug] RAW response dump: ${resPath}`);
+        } catch { /* best-effort */ }
     }
     // P1.2: if the upstream returned a non-2xx (auth, rate-limit, context too
     // long, ...), do NOT route the error body through the SSE rewriter — it has
