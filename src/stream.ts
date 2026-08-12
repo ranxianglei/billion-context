@@ -254,7 +254,7 @@ export function applyRanges(ranges: ReturnType<typeof parseCompressInput>, ctx: 
         const detail = ranges.map((rg) => `${rg.startRef}–${rg.endRef}`).join(", ");
 
         if (r.blocksCreated === 0) {
-            const errs = (r.errors.join("; ") || "no blocks created").replace(/\s*Combine more messages[^.]*\./g, "").trim();
+            const errs = r.errors.join("; ") || "no blocks created";
             ctx.log(`[acp-proxy: compress FAILED ${detail} → 0 blocks. ${errs}]`);
             return `[Compression FAILED: ${errs}]`;
         }
