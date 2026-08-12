@@ -1087,6 +1087,20 @@ async function forward(
         headers[k] = Array.isArray(v) ? v.join(", ") : v;
     }
     headers["host"] = new URL(route ? route.upstream : opts.upstream).host;
+    // codex advertises its own server-side context compaction via this beta
+    // feature. It conflicts with bili's client-side compress (bili IS the
+    // compression layer) and third-party aggregators reject it with
+    // "invalid range / ref not found". Strip it so bili's compress is the
+    // sole mechanism.
+    const betaKey = Object.keys(headers).find((h) => h.toLowerCase() === "x-codex-beta-features");
+    if (betaKey) {
+        const kept = headers[betaKey]
+            .split(",")
+            .map((s) => s.trim())
+            .filter((f) => f && f !== "remote_compaction_v2");
+        if (kept.length > 0) headers[betaKey] = kept.join(",");
+        else delete headers[betaKey];
+    }
     // Forward a client-provided Responses session identity only when it was
     // carried in the body rather than an existing request header.
     if (affinity && !clientConversationHeader(req.headers)) {
