@@ -3,13 +3,15 @@ import net from "node:net";
 import tls from "node:tls";
 import { ensureRootCA, getSecureContext } from "./ca.js";
 import { connectThroughProxy } from "./upstream-proxy.js";
+import { discoverMitmDomains } from "./discover.js";
 
-/** Domains we transparently MITM: the model-inference endpoints of the
- *  providers billion-context targets. Everything else (banking, mail, …) is
- *  pure tunnelled — we never decrypt it. This whitelist is the security
- *  boundary: expanding it expands the set of hosts whose TLS we terminate. */
+// Domains we transparently MITM. These are ONLY the model-inference endpoints
+// hardcoded in client BINARIES with no config file to discover from
+// (Claude=api.anthropic.com, codex-login=api.openai.com/chatgpt.com).
+// Everything else is auto-discovered at runtime from each client's config
+// (see discoverMitmDomains). Expanding this list expands the set of hosts
+// whose TLS we terminate — the security boundary.
 export const DEFAULT_MITM_DOMAINS = [
-    "open.bigmodel.cn",
     "api.anthropic.com",
     "api.openai.com",
     "chatgpt.com",
@@ -23,10 +25,12 @@ export const MITM_UPSTREAM_KEY = "__biliMitmUpstream";
 
 /** True if `host` should be MITM-decrypted. Matches by exact hostname or a
  *  domain suffix (so `api.openai.com` and `chatgpt.com` both work, and
- *  subdomains like `edge.chatgpt.com` are covered). */
-export function isMitmHost(host: string, extra: string[] = []): boolean {
+ *  subdomains like `edge.chatgpt.com` are covered). The candidate set is the
+ *  binary-hardcoded DEFAULT_MITM_DOMAINS + caller-supplied extras + domains
+ *  auto-discovered from client config files (see discoverMitmDomains). */
+export function isMitmHost(host: string, extraDomains: string[] = []): boolean {
     const h = host.toLowerCase();
-    const all = [...DEFAULT_MITM_DOMAINS, ...extra].map((d) => d.toLowerCase());
+    const all = [...DEFAULT_MITM_DOMAINS, ...extraDomains, ...discoverMitmDomains()].map((d) => d.toLowerCase());
     return all.some((d) => h === d || h.endsWith("." + d));
 }
 
