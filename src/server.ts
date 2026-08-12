@@ -174,6 +174,9 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 (nOverrides ? ` — context overrides for ${nOverrides} upstream URL(s)` : "")
                 + (opts.mitm.enabled ? ` — MITM proxy on (whitelist)${opts.mitm.domains.length ? ` +${opts.mitm.domains.join(",")}` : ""}` : ""),
         );
+        if (opts.debug) {
+            log("info", `[debug] build features: raw-HTTP-capture(on) | remote_compaction_v2-strip(on) | cert-MITM-launcher(on) | strip-acp-summary(on) — seeing this line confirms the launcher build (not registry 0.1.34)`);
+        }
     });
     // Listen errors (EADDRINUSE port taken, EACCES privileged port, EAFNOSUPPORT
     // bad host) surface as an 'error' event on the server. Without a listener
@@ -1114,13 +1117,13 @@ async function forward(
         }
         log("info", `[${prepared?.session.id ?? "unknown"}] → upstream headers: ${JSON.stringify(hdrLog)}`);
     }
-    // ACP_RAW_DUMP: capture the COMPLETE raw HTTP exchange (request method/URL/
-    // all headers/exact body bytes; later the response status+headers) so two
-    // consecutive requests can be byte-diffed to locate a cache-breaker that
-    // the JSON body dump (which re-formats and omits headers) may hide. Opt-in
-    // via env (writes headers verbatim minus credential values).
+    // Raw HTTP capture: dump the COMPLETE exchange (request method/URL/all
+    // headers/exact body bytes; response status+headers) so two consecutive
+    // requests can be byte-diffed to locate a cache-breaker that the JSON body
+    // dump (which re-formats and omits headers) may hide. Enabled with --debug
+    // (headers written verbatim minus credential values).
     const rawBase =
-        opts.debug && process.env.ACP_RAW_DUMP
+        opts.debug
             ? (() => {
                   try {
                       const rawDir = process.env.ACP_RAW_DUMP_DIR || `${stateDir()}/raw`;
