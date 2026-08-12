@@ -463,6 +463,41 @@ test("discoverRoutes: empty config → {httpsDomains:[], httpRewrites:[]}", () =
     assert.deepEqual(discoverRoutes("codex", {}), { httpsDomains: [], httpRewrites: [], httpsRewrites: [] });
 });
 
+test("discoverRoutes: codex /bili/-wrapped HTTPS provider → httpsRewrites to raw upstream", () => {
+    const config: ClientConfig = {
+        codex: {
+            providers: {
+                "bili-comfly": { baseUrl: "http://127.0.0.1:8787/bili/https://ai.comfly.org/v1" },
+            },
+        },
+    };
+    const routes = discoverRoutes("codex", config);
+    assert.deepEqual(routes.httpsDomains, ["ai.comfly.org"]);
+    assert.deepEqual(routes.httpsRewrites, [
+        { key: "model_providers.bili-comfly.base_url", realUpstream: "https://ai.comfly.org/v1" },
+    ]);
+    assert.deepEqual(routes.httpRewrites, []);
+});
+
+test("discoverRoutes: codex clean (unwrapped) HTTPS → httpsDomains only, httpsRewrites empty", () => {
+    const config: ClientConfig = {
+        codex: { providers: { openai: { baseUrl: "https://api.openai.com/v1" } } },
+    };
+    const routes = discoverRoutes("codex", config);
+    assert.deepEqual(routes.httpsDomains, ["api.openai.com"]);
+    assert.deepEqual(routes.httpsRewrites, []);
+    assert.deepEqual(routes.httpRewrites, []);
+});
+
+test("buildCodexArgs: httpsRewrites emit -c key=raw upstream (unwrapped, for cert MITM)", () => {
+    const httpsRewrites: HttpRewrite[] = [
+        { key: "model_providers.x.base_url", realUpstream: "https://ai.comfly.org/v1" },
+    ];
+    assert.deepEqual(buildCodexArgs("http://127.0.0.1:41355", [], httpsRewrites, []), [
+        "-c", "model_providers.x.base_url=https://ai.comfly.org/v1",
+    ]);
+});
+
 test("buildCodexArgs: emits -c pairs for each http rewrite, then extra args", () => {
     const rewrites: HttpRewrite[] = [
         { key: "k1", realUpstream: "u1" },
