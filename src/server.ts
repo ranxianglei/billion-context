@@ -35,7 +35,7 @@ import {
     conversationSignalResponses,
 } from "./responses.js";
 import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary } from "./session.js";
-import { COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressTextSystemPrompt } from "./compress-tool.js";
+import { COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressHybridSystemPrompt } from "./compress-tool.js";
 import { rewriteSseStream, rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
 import { renderUI, handleConfigGet, handleConfigPut } from "./web/index.js";
@@ -816,10 +816,14 @@ function prepareResponses(
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltInput = patchResponsesInput(projection, processedMessages);
         if (shouldInject && !process.env.ACP_NO_COMPRESS_PROMPT) {
-            const prompt = responsesTextProtocol ? buildCompressTextSystemPrompt() : buildCompressSystemPrompt();
+            const prompt = responsesTextProtocol ? buildCompressHybridSystemPrompt() : buildCompressSystemPrompt();
             const devContent = [...projection.systemParts, prompt].join("\n\n---\n\n");
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent);
-            if (!responsesTextProtocol && !process.env.ACP_NO_INJECT_TOOL) toolsOut = injectResponsesTool(parsed.tools);
+            if (!process.env.ACP_NO_INJECT_TOOL) {
+                toolsOut = responsesTextProtocol
+                    ? injectResponsesTool(parsed.tools, ACP_READONLY_TOOLS_RESPONSES)
+                    : injectResponsesTool(parsed.tools);
+            }
         } else if (projection.systemParts.length > 0) {
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, projection.systemParts.join("\n\n---\n\n"));
         }
@@ -1029,14 +1033,14 @@ const FORCE_TEXT_PROTOCOL = process.env.ACP_COMPRESS_PROTOCOL === "text";
 /** Inject all ACP tools (compress/decompress/search_context/acp_status) in
  *  Responses API flat format, matching the PROXY_TOOL_NAMES set the compress
  *  loop dispatches on. Idempotent. */
-function injectResponsesTool(tools: unknown[] | undefined): unknown[] {
-    if (!Array.isArray(tools)) return [...ACP_TOOLS_RESPONSES];
+function injectResponsesTool(tools: unknown[] | undefined, toolsToAdd: readonly { name: string }[] = ACP_TOOLS_RESPONSES): unknown[] {
+    if (!Array.isArray(tools)) return [...toolsToAdd];
     const present = new Set(
         tools
             .map((t) => (t as { name?: string })?.name)
             .filter((n): n is string => typeof n === "string"),
     );
-    const additions = ACP_TOOLS_RESPONSES.filter((t) => !present.has(t.name));
+    const additions = toolsToAdd.filter((t) => !present.has(t.name));
     return [...tools, ...additions];
 }
 
@@ -1277,7 +1281,7 @@ async function forward(
             const parsedReq = JSON.parse(typeof body === "string" ? body : body.toString("utf8"));
             const reqHeaders = buildForwardHeaders(headers);
             const textProtocol = prepared.protocol === "responses" && !!prepared.responsesTextProtocol;
-            const systemPrompt = textProtocol ? buildCompressTextSystemPrompt() : buildCompressSystemPrompt();
+            const systemPrompt = textProtocol ? buildCompressHybridSystemPrompt() : buildCompressSystemPrompt();
             const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem);
             const abortCtrl = new AbortController();
             req.on("close", () => {
