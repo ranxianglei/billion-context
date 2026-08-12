@@ -3,6 +3,12 @@
 All notable changes to **billion-context** are documented here.
 Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag.
 
+## [0.1.39] — 2026-08-13
+
+### Fixes
+
+- **OpenAI non-compliant `finish_reason="stop"` for tool-call responses** (#131): some OpenAI-compatible upstreams (e.g. the model behind openclaw) return `finish_reason="stop"` for a text + tool_calls response, violating the OpenAI Chat Completions spec (which requires `"tool_calls"`). bili faithfully re-emitted `"stop"`, and the downstream parser (openclaw `openai-transport-stream`) dropped **all** `tool_call` chunks because `hasVisibleText=true` kept `stopReason=stop` — so tool calls were silently lost and the model "replied once and stopped". bili now rewrites the non-compliant `"stop"` to `"tool_calls"` when the streamed response emitted tool calls; compliant `"tool_calls"`, text-only `"stop"`, and `"length"` are unchanged.
+
 ## [0.1.38] — 2026-08-13
 
 ### Fixes
