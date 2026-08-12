@@ -431,7 +431,7 @@ The config file is a single JSON object. Example:
 | `debug` | `false` | Verbose logging (same as `ACP_DEBUG=1`) |
 | `passthrough` | `false` | Forward without compression (same as `ACP_PASSTHROUGH=1`) |
 | `providers` | *(none)* | Per-URL context overrides — see below |
-| `compress` | *(see defaults)* | `{ injectTool, injectNudge }` |
+| `compress` | *(see defaults)* | Global compression block: `{ injectTool, injectNudge }` injection toggles **plus** engine tuning (`nudgeGrowthTokens`, `modelContextLimit`, …) — see [Compression tuning](#compression-tuning-the-compress-block) |
 | `proxy` | *(none)* | Upstream HTTP proxy for the proxy's OWN outbound connections to model providers (`http://host:port`). Per-URL `proxy` overrides this. See [Upstream proxy](#upstream-proxy-firewall--gfw). |
 
 > **Choosing a `host`** (IPv6 / containers): the default `127.0.0.1` is
@@ -474,6 +474,61 @@ registry, then the built-in prefix table.
 > document-level information. A wrong value (e.g. GLM-5.2 guessed as 128K
 > instead of 1M) causes spurious frequent compression. Declaring it per
 > URL + model makes the proxy match the registry the client itself uses.
+
+### Compression tuning (the `compress` block)
+
+The `compress` object tunes the compression engine itself — when to nudge, how much
+to compress per step, how many recent messages to protect. It is configurable
+at **three levels** that merge **per field, deepest wins** (child covers
+parent; an unset field at a deeper level never clears a value set higher up):
+
+1. **Global** — top-level `"compress": { … }` (applies to every request). This is
+   also where the `injectTool` / `injectNudge` toggles live (honored globally).
+2. **Per-provider** — `"compress": { … }` inside a `providers[url]` entry.
+3. **Per-model** — `"compress": { … }` inside a `providers[url].models[model]` entry.
+
+```jsonc
+{
+  // Level 1: global default for all providers/models
+  "compress": { "nudgeGrowthTokens": 50000, "maxContextLimit": "70%" },
+  "providers": {
+    "https://api.anthropic.com": {
+      // Level 2: override for this provider only
+      "compress": { "nudgeGrowthTokens": 30000, "preserveRecentMessages": 6 },
+      "models": {
+        "claude-opus-4": {
+          // Level 3: override for this one model (wins per-field)
+          "compress": { "nudgeGrowthTokens": 20000, "tiers": false }
+        }
+      }
+    }
+  }
+}
+```
+
+Fields (all optional; unset fields inherit the kernel default):
+
+| Field | Description |
+|-------|-------------|
+| `modelContextLimit` | The model's context **window size** — the denominator the kernel uses for its usage ratio (`usage = tokens / contextLimit`). **Not** a truncation cap. Accepts an absolute number (`200000`) or a percentage of the native window (`"70%"` → 140000 on a 200K model). When unset, defaults to the native window (built-in table / models.dev registry). ⚠️ Shrinking it pulls *every* ratio threshold (`emergencyThresholdPercent`, truncate) down with it — to leave headroom, set `emergencyThresholdPercent` instead. Highest-priority source for the model limit — overrides the built-in table, the models.dev registry, the legacy `modelContextLimit`, and per-model `context`. |
+| `maxContextLimit` | Usage ratio `0`–`1` at which compression is **forced** (nudge injected regardless of growth). Defaults to `0.75` (75% of the context window). Accepts a number (`0.75`) or percentage string (`"75%"`). Lower = compress earlier / more aggressively. |
+| `nudgeGrowthTokens` | Nudge growth step in tokens. A compression nudge fires roughly every time this many tokens become compressible. Flattens the adaptive band to a fixed step (default 50000 at 1M context). |
+| `emergencyThresholdPercent` | Usage ratio `0`–`1` at which compression becomes an **emergency** and tool outputs are hard-truncated to keep the session alive (default `0.95`). Accepts a number (`0.95`) or percentage string (`"95%"`). Must be ≥ `maxContextLimit`. |
+| `preserveRecentMessages` | Number of trailing messages never offered for compression. |
+| `preserveRecentTokens` | Token budget reserved for recent messages. |
+| `minCompressRange` | Minimum compressible range size in tokens; smaller ranges are skipped. |
+| `tiers` | Enable multi-tier (T2/T3) distillation (`true`/`false`). Promotion across tiers is driven by `nudgeGrowthTokens` (token accumulation), not a separate block-count knob. |
+
+The most common knobs are **`nudgeGrowthTokens`** (raise it to compress less often /
+delay compression) and **`modelContextLimit`** (pin an exact window the registry
+doesn't know). Everything else is for advanced tuning.
+
+**Injection toggles** (`injectTool`, `injectNudge` — global only, not per-level):
+
+| Toggle | Default | Effect |
+|--------|---------|--------|
+| `injectTool` | `true` | Injects the compress/decompress/search **tools** + the compress system prompt, so the model can trigger compression via a tool call. Disable to make compression fully automatic (no manual tool). Env `ACP_COMPRESS_TOOL=0`. |
+| `injectNudge` | `true` | Injects automatic **nudge** messages that prompt the model to compress when the context grows. Disable for tool-only / silent operation. Env `ACP_COMPRESS_NUDGE=0`. |
 
 ### URL key matching rules
 

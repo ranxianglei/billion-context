@@ -5,6 +5,7 @@ import type { ProxyOptions } from "./config.js";
 import { loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
 import { resolveContextLimit, resolveCompressProtocol } from "./config.js";
+import { resolveCompress, applyCompressSettings, hasCompressSettings, resolveContextLimitValue } from "./compress-settings.js";
 import { contextFromRegistry, loadRegistry } from "./registry.js";
 import { fetchWithTimeout, MAX_REQUEST_BYTES } from "./fetch-util.js";
 import { formatUpstreamError, getUpstreamConnectionStatus, recordUpstreamConnection, resolveProxy, resolveProxyDecision, proxyDispatcher } from "./upstream-proxy.js";
@@ -475,22 +476,27 @@ async function handle(
             fs.writeFileSync(`${rawDir}/${Date.now()}-INCOMING.txt`, `${req.method} ${req.url}\n${hdrs}\n\n${bodyBuffer.toString("utf8")}`);
         } catch { /* best-effort dump */ }
     }
-    // Per-request context limit: look up body.model against the per-route
-    // model declaration first, then the built-in table.
+    // Per-request context limit + compression tuning: look up body.model against
+    // the per-route model declaration first, then the built-in table / registry.
+    // Compress settings (global → provider → model) merge deepest-field-wins and
+    // are applied on top of the resolved limit. `compress.contextLimit` (an
+    // absolute number, a "70%" string of the native window, or unset → native)
+    // overrides the table.
     let reqConfig = config;
     if (parsed && typeof parsed === "object") {
         const model = (parsed as { model?: string }).model;
         if (model) {
-            // Match config by the embedded upstream URL (the /bili/<this> string).
-            // The registry is a middle layer when config doesn't cover this URL/model.
             const embeddedUrl = route?.rewrittenUrl;
-            let limit = resolveContextLimit(opts.routes, embeddedUrl, model);
-            if (!limit && embeddedUrl) {
+            const compress = resolveCompress(opts.routes, embeddedUrl, model, opts.compress);
+            let native = resolveContextLimit(opts.routes, embeddedUrl, model);
+            if (!native && embeddedUrl) {
                 const host = (() => { try { return new URL(embeddedUrl).host; } catch { return undefined; } })();
-                limit = await contextFromRegistry(model, host);
+                native = await contextFromRegistry(model, host);
             }
-            if (limit && limit !== config.modelContextLimit) {
-                reqConfig = { ...config, modelContextLimit: limit };
+            const limit = resolveContextLimitValue(compress.modelContextLimit, native ?? config.modelContextLimit);
+            const tuned = hasCompressSettings(compress);
+            if (tuned || limit !== config.modelContextLimit) {
+                reqConfig = applyCompressSettings(config, limit, compress);
             }
         }
     }
@@ -655,7 +661,7 @@ function prepareAnthropic(
         }
         // Nudge as a separate trailing user message (cache-friendly): the
         // system block stays byte-stable so the prefix cache survives.
-        if (turn.nudge?.shouldInject) {
+        if (opts.compress.injectNudge && turn.nudge?.shouldInject) {
             try {
                 const rendered = renderNudgeText(turn.nudge);
                 if (rendered.text) {
@@ -736,7 +742,7 @@ function prepareOpenai(
             toolsOut = injectOpenaiTool(parsed.tools);
         }
         // Nudge as a separate trailing user message (cache-friendly).
-        if (turn.nudge?.shouldInject && shouldInject) {
+        if (opts.compress.injectNudge && turn.nudge?.shouldInject && shouldInject) {
             try {
                 const rendered = renderNudgeText(turn.nudge);
                 if (rendered.text) {
@@ -826,7 +832,7 @@ function prepareResponses(
         } else if (projection.systemParts.length > 0) {
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, projection.systemParts.join("\n\n---\n\n"));
         }
-        if (turn.nudge?.shouldInject && shouldInject) {
+        if (opts.compress.injectNudge && turn.nudge?.shouldInject && shouldInject) {
             try {
                 const rendered = renderNudgeText(turn.nudge);
                 if (rendered.text) {
