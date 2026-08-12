@@ -31,6 +31,26 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, type StdioOptions } from "node:child_process";
 import { DEFAULT_MITM_DOMAINS } from "./mitm.js";
+import { nonEmpty, resolvePiHome, loadClientConfig, type ClientConfig } from "./client-config.js";
+
+export {
+    type ClaudeSettings,
+    type CodexProvider,
+    type CodexConfig,
+    type PiProvider,
+    type PiConfig,
+    type ClientConfig,
+    type ZcodeProvider,
+    type ZcodeConfig,
+    readClaudeSettings,
+    parseCodexToml,
+    readCodexConfig,
+    readPiConfig,
+    loadClientConfig,
+    parseZcodeConfig,
+    readZcodeConfig,
+    resolvePiHome,
+} from "./client-config.js";
 
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
 export const LAUNCHER_DEFAULT_PORT = 8787;
@@ -123,34 +143,6 @@ export function unwrapUpstream(url: string): string {
     return idx >= 0 ? url.slice(idx + "/bili/".length) : url;
 }
 
-export interface ClaudeSettings {
-    anthropicBaseUrl?: string;
-}
-
-export interface CodexProvider {
-    baseUrl?: string;
-}
-
-export interface CodexConfig {
-    modelProvider?: string;
-    openaiBaseUrl?: string;
-    providers: Record<string, CodexProvider>;
-}
-
-export interface PiProvider {
-    baseUrl?: string;
-}
-
-export interface PiConfig {
-    providers: Record<string, PiProvider>;
-}
-
-export interface ClientConfig {
-    claude?: ClaudeSettings;
-    codex?: CodexConfig;
-    pi?: PiConfig;
-}
-
 export interface HttpRewrite {
     key: string;
     realUpstream: string;
@@ -162,20 +154,9 @@ export interface DiscoveredRoutes {
     httpsRewrites: HttpRewrite[];
 }
 
-function nonEmpty(s: unknown): s is string {
-    return typeof s === "string" && s.trim().length > 0;
-}
-
 export function resolveCaCertPath(env: NodeJS.ProcessEnv): string {
     const base = env.XDG_DATA_HOME || path.join(os.homedir(), ".local/share");
     return path.join(base, "billion-context", "ca", "root-ca.pem");
-}
-
-export function resolvePiHome(env: NodeJS.ProcessEnv): string {
-    const h = os.homedir();
-    return nonEmpty(env.PI_CODING_AGENT_DIR) ? env.PI_CODING_AGENT_DIR!
-        : nonEmpty(env.PI_HOME) ? env.PI_HOME!
-        : path.join(h, ".pi", "agent");
 }
 
 export function extractDomains(upstreams: string[]): string[] {
@@ -543,109 +524,6 @@ export function resolveClientCommand(
         return { command: process.execPath, prefixArgs: [cli] };
     }
     return { command: client, prefixArgs: [] };
-}
-
-function readJsonObject(filePath: string): Record<string, unknown> | null {
-    try {
-        const txt = fs.readFileSync(filePath, "utf8");
-        const parsed: unknown = JSON.parse(txt);
-        return parsed && typeof parsed === "object" && !Array.isArray(parsed)
-            ? (parsed as Record<string, unknown>)
-            : null;
-    } catch {
-        return null;
-    }
-}
-
-export function readClaudeSettings(homeDir: string, cwd: string): ClaudeSettings {
-    const files = [
-        path.join(homeDir, ".claude", "settings.json"),
-        path.join(cwd, ".claude", "settings.json"),
-    ];
-    let anthropicBaseUrl: string | undefined;
-    for (const f of files) {
-        const obj = readJsonObject(f);
-        const env = obj?.env;
-        if (env && typeof env === "object" && !Array.isArray(env)) {
-            const v = (env as Record<string, unknown>).ANTHROPIC_BASE_URL;
-            if (nonEmpty(v)) anthropicBaseUrl = v;
-        }
-    }
-    return anthropicBaseUrl ? { anthropicBaseUrl } : {};
-}
-
-/**
- * Targeted TOML reader for ~/.codex/config.toml: top-level `model_provider` /
- * `openai_base_url` and each `[model_providers.<name>]` `base_url`. String
- * values only; NOT a general TOML parser — intentionally dependency-free.
- */
-export function parseCodexToml(text: string): CodexConfig {
-    const result: CodexConfig = { providers: {} };
-    let table = "";
-    let curProvider: string | null = null;
-    for (const rawLine of text.split(/\r?\n/)) {
-        const line = rawLine.trim();
-        if (!line || line.startsWith("#")) continue;
-        const tableMatch = /^\[([^\]]+)\]$/.exec(line);
-        if (tableMatch) {
-            table = tableMatch[1].trim();
-            curProvider = table.startsWith("model_providers.")
-                ? table.slice("model_providers.".length).trim()
-                : null;
-            if (curProvider && !result.providers[curProvider]) {
-                result.providers[curProvider] = {};
-            }
-            continue;
-        }
-        const m = /^([A-Za-z0-9_.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/.exec(line);
-        if (!m) continue;
-        const key = m[1];
-        const val = m[2] !== undefined ? m[2] : m[3];
-        if (table === "") {
-            if (key === "model_provider") result.modelProvider = val;
-            else if (key === "openai_base_url") result.openaiBaseUrl = val;
-        } else if (curProvider && key === "base_url") {
-            result.providers[curProvider].baseUrl = val;
-        }
-    }
-    return result;
-}
-
-export function readCodexConfig(codexHome: string): CodexConfig {
-    const cfgPath = path.join(codexHome, "config.toml");
-    let text: string;
-    try {
-        text = fs.readFileSync(cfgPath, "utf8");
-    } catch {
-        return { providers: {} };
-    }
-    return parseCodexToml(text);
-}
-
-export function readPiConfig(piHome: string): PiConfig {
-    const cfgPath = path.join(piHome, "models.json");
-    const obj = readJsonObject(cfgPath);
-    const providers: Record<string, PiProvider> = {};
-    const rawProviders = obj?.providers;
-    if (rawProviders && typeof rawProviders === "object" && !Array.isArray(rawProviders)) {
-        for (const [name, val] of Object.entries(rawProviders as Record<string, unknown>)) {
-            if (val && typeof val === "object" && !Array.isArray(val)) {
-                const baseUrl = (val as { baseUrl?: unknown }).baseUrl;
-                providers[name] = typeof baseUrl === "string" ? { baseUrl } : {};
-            }
-        }
-    }
-    return { providers };
-}
-
-export function loadClientConfig(env: NodeJS.ProcessEnv, cwd: string): ClientConfig {
-    const home = os.homedir();
-    const config: ClientConfig = {};
-    config.claude = readClaudeSettings(home, cwd);
-    const codexHome = nonEmpty(env.CODEX_HOME) ? env.CODEX_HOME : path.join(home, ".codex");
-    config.codex = readCodexConfig(codexHome);
-    config.pi = readPiConfig(resolvePiHome(env));
-    return config;
 }
 
 export interface RunLaunchParams {
