@@ -37,6 +37,11 @@ export interface BiliMessage extends CoreMessage {
      *  pairs; without it the request is rejected. Stored alongside the
      *  reasoning text so coreToAnthropic can reattach it. */
     thinkingSignature?: string;
+    /** OpenAI reasoning_content (chain-of-thought from DeepSeek-R1, GLM-4.6
+     *  thinking, Qwen-QwQ). These models require reasoning_content be echoed
+     *  back on subsequent requests or the API returns HTTP 400; stored so
+     *  coreToOpenai can reattach it. */
+    reasoningContent?: string;
     /** Anthropic tool_result.is_error. Marks the tool result as an error so
      *  the model knows the tool failed (not just returned an error string). */
     toolIsError?: boolean;

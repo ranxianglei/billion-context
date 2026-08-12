@@ -9,6 +9,7 @@ import {
     type NudgeDecision,
 } from "acp-kernel";
 import type { Session } from "../session.js";
+import type { BiliMessage } from "../bili-message.js";
 import {
     parseCompressInput,
     PROXY_TOOL_NAMES,
@@ -41,6 +42,7 @@ export interface RequestOptions {
 
 export type ParsedStreamEvent =
     | { kind: "text"; delta: string; raw?: Buffer }
+    | { kind: "reasoning"; delta: string; raw?: Buffer }
     | { kind: "tool_call"; name: string; callId: string; arguments: string }
     | { kind: "usage"; inputTokens?: number; outputTokens?: number; cachedTokens?: number }
     | { kind: "done"; finishReason?: string }
@@ -70,6 +72,7 @@ export interface CompressLoopAdapter {
     ): Record<string, unknown>;
     parseStream(upstream: ReadableStream<Uint8Array>, round: number): AsyncGenerator<ParsedStreamEvent>;
     emitText(delta: string): Buffer;
+    emitReasoning?(delta: string): Buffer;
     emitToolCall(call: ToolCallEmit): Buffer;
     emitMarker(toolName: string, result: string): Buffer;
     emitCompletion(opts?: EmitCompletionOpts): Buffer;
@@ -176,6 +179,7 @@ export async function* runCompressLoop(
         for (let round = 1; round <= MAX_LOOP_ROUNDS; round++) {
             if (signal?.aborted) break;
             let assistantText = "";
+            let assistantReasoning = "";
             const calls: ToolCallEmit[] = [];
             let usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number } = {};
             let finishReason: string | undefined;
@@ -188,6 +192,15 @@ export async function* runCompressLoop(
                             yield ev.raw;
                         } else if (!ctx.textProtocol && round > 1 && ev.delta.length > 0) {
                             yield adapter.emitText(ev.delta);
+                        }
+                    } else if (ev.kind === "reasoning") {
+                        assistantReasoning += ev.delta;
+                        if (!ctx.textProtocol) {
+                            if (ev.raw) {
+                                yield ev.raw;
+                            } else if (round > 1 && ev.delta.length > 0 && adapter.emitReasoning) {
+                                yield adapter.emitReasoning(ev.delta);
+                            }
                         }
                     } else if (ev.kind === "tool_call") {
                     calls.push({ name: ev.name, callId: ev.callId, arguments: ev.arguments });
@@ -266,6 +279,16 @@ export async function* runCompressLoop(
             // never in coreMessages), and hideConsumedCompressCalls runs each
             // round so consumed compress records cannot re-prime the model.
             if (proxyResults.length > 0) {
+                if (assistantReasoning.length > 0) {
+                    const reasoningMsg: BiliMessage = {
+                        id: `acp_loop_r${round}_reasoning`,
+                        role: "assistant",
+                        contentType: "reasoning",
+                        text: assistantReasoning,
+                        reasoningContent: assistantReasoning,
+                    };
+                    coreMessages.push(reasoningMsg);
+                }
                 if (assistantText.length > 0) {
                     coreMessages.push({
                         id: `acp_loop_r${round}_asst`,

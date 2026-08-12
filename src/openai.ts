@@ -17,6 +17,7 @@ export type OpenAIToolCall = {
 export type OpenAIMessage = {
     role: "system" | "developer" | "user" | "assistant" | "tool";
     content?: string | null | OpenAIContentPart[];
+    reasoning_content?: string | null;
     tool_calls?: OpenAIToolCall[];
     tool_call_id?: string;
     name?: string;
@@ -62,6 +63,17 @@ export function openaiToCore(body: OpenAIRequestBody): Flat {
                 break;
             }
             case "assistant": {
+                const reasoning = typeof m.reasoning_content === "string" ? m.reasoning_content : "";
+                if (reasoning) {
+                    const base = deriveMessageId("assistant", "reasoning", reasoning);
+                    msgs.push({
+                        id: clusters.next(base),
+                        role: "assistant",
+                        contentType: "reasoning",
+                        text: reasoning,
+                        reasoningContent: reasoning,
+                    });
+                }
                 const text = stringContent(m.content);
                 if (text) {
                     const base = deriveMessageId("assistant", "text", text);
@@ -105,24 +117,30 @@ export function openaiToCore(body: OpenAIRequestBody): Flat {
 
 export function coreToOpenai(messages: BiliMessage[]): OpenAIMessage[] {
     const out: OpenAIMessage[] = [];
-    let pending: { text: string | null; toolCalls: OpenAIToolCall[] } | null = null;
+    let pending: { text: string | null; toolCalls: OpenAIToolCall[]; reasoning: string | null } | null = null;
     const flush = () => {
         if (!pending) return;
+        const reasoning = pending.reasoning !== null && pending.reasoning.length > 0 ? pending.reasoning : undefined;
         if (pending.toolCalls.length > 0) {
             out.push({
                 role: "assistant",
                 content: pending.text ?? null,
                 tool_calls: pending.toolCalls,
+                ...(reasoning ? { reasoning_content: reasoning } : {}),
             });
         } else if (pending.text !== null) {
-            out.push({ role: "assistant", content: pending.text });
+            out.push({ role: "assistant", content: pending.text, ...(reasoning ? { reasoning_content: reasoning } : {}) });
+        } else if (reasoning) {
+            out.push({ role: "assistant", content: null, reasoning_content: reasoning });
         }
         pending = null;
     };
     for (const m of messages) {
         if (m.role === "assistant") {
-            if (!pending) pending = { text: null, toolCalls: [] };
-            if (m.contentType === "text") {
+            if (!pending) pending = { text: null, toolCalls: [], reasoning: null };
+            if (m.contentType === "reasoning") {
+                pending.reasoning = (pending.reasoning ?? "") + (m.reasoningContent ?? m.text ?? "");
+            } else if (m.contentType === "text") {
                 pending.text = (pending.text ?? "") + (m.text ?? "");
             } else if (m.contentType === "tool-call") {
                 pending.toolCalls.push({
