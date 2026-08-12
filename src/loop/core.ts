@@ -182,14 +182,14 @@ export async function* runCompressLoop(
 
             for await (const ev of adapter.parseStream(currentUpstream, round)) {
                 if (signal?.aborted) break;
-                if (ev.kind === "text") {
-                    assistantText += ev.delta;
-                    if (!ctx.textProtocol && round === 1 && ev.raw) {
-                        yield ev.raw;
-                    } else if (!ctx.textProtocol && round > 1 && ev.delta.length > 0) {
-                        yield adapter.emitText(ev.delta);
-                    }
-                } else if (ev.kind === "tool_call") {
+                    if (ev.kind === "text") {
+                        assistantText += ev.delta;
+                        if (!ctx.textProtocol && ev.raw) {
+                            yield ev.raw;
+                        } else if (!ctx.textProtocol && round > 1 && ev.delta.length > 0) {
+                            yield adapter.emitText(ev.delta);
+                        }
+                    } else if (ev.kind === "tool_call") {
                     calls.push({ name: ev.name, callId: ev.callId, arguments: ev.arguments });
                 } else if (ev.kind === "usage") {
                     usage = {
