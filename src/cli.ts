@@ -23,7 +23,7 @@ import { loadOptions, ensureConfigTemplate } from "./config.js";
 import { startServer } from "./server.js";
 import { configFile as defaultConfigFile } from "./paths.js";
 import { checkForUpdate, startAutoUpdate } from "./update.js";
-import { runLaunch, runTestPi, isLaunchClient, type ClientName } from "./launcher.js";
+import { runLaunch, runTestPi, isLaunchClient, stopLauncherProxy, type ClientName } from "./launcher.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -60,6 +60,7 @@ Usage:
   bili claude [opts --] [args]     start a proxy + launch claude against it (cert-MITM)
   bili test pi                     non-polluting pi smoke test through the proxy
   bili update                      check for & install a newer version now
+  bili stop                        stop proxy process(es) left running by "bili <client>"
   bili --version                   print version
   bili --help                      show this help
 
@@ -96,7 +97,7 @@ Docs: https://github.com/ranxianglei/billion-context
 `;
 
 type Parsed = {
-    command: "start" | "update" | "help" | "version" | "launch" | "test";
+    command: "start" | "update" | "help" | "version" | "launch" | "test" | "stop";
     client?: ClientName;
     clientArgs: string[];
     mitmDomains: string[];
@@ -196,6 +197,8 @@ function parseArgs(argv: string[]): Parsed {
                 console.error(`bili test: unknown client "${target ?? ""}" (try "bili test pi")`);
                 process.exit(2);
             }
+        } else if (cmd === "stop") {
+            command = "stop";
         } else {
             console.error(`bili: unknown command "${cmd}" (try "bili --help")`);
             process.exit(2);
@@ -230,6 +233,13 @@ export async function main(): Promise<void> {
     }
     if (command === "launch") {
         await runLaunch({ client: client!, clientArgs, mitmDomains, overrides });
+        return;
+    }
+    if (command === "stop") {
+        const { stopped, errors } = stopLauncherProxy(process.env);
+        if (stopped > 0) console.error(`bili: stopped ${stopped} launcher proxy process(es).`);
+        else console.error("bili: no launcher proxy found (nothing to stop).");
+        for (const e of errors) console.error(`bili: ${e}`);
         return;
     }
 

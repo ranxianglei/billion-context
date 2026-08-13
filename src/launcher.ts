@@ -100,6 +100,44 @@ export interface ProxyHandle {
     reused: boolean;
     child: SpawnChild | null;
     logPath?: string;
+    pidPath?: string;
+}
+
+export function launcherPidFile(port: number, env: NodeJS.ProcessEnv = process.env): string {
+    const base = env.XDG_DATA_HOME || path.join(os.homedir(), ".local/share");
+    return path.join(base, "billion-context", `launcher-proxy-${port}.pid`);
+}
+
+export function stopLauncherProxy(env: NodeJS.ProcessEnv = process.env): { stopped: number; errors: string[] } {
+    const base = env.XDG_DATA_HOME || path.join(os.homedir(), ".local/share");
+    const dir = path.join(base, "billion-context");
+    const errors: string[] = [];
+    let stopped = 0;
+    let entries: string[] = [];
+    try {
+        entries = fs.readdirSync(dir);
+    } catch {
+        return { stopped: 0, errors };
+    }
+    for (const entry of entries) {
+        if (!/^launcher-proxy-\d+\.pid$/.test(entry)) continue;
+        const pidPath = path.join(dir, entry);
+        let pid: number | undefined;
+        try {
+            pid = parseInt(fs.readFileSync(pidPath, "utf8").trim(), 10);
+        } catch {
+            try { fs.unlinkSync(pidPath); } catch {}
+            continue;
+        }
+        try {
+            if (pid > 0) process.kill(pid);
+            stopped++;
+        } catch (e) {
+            errors.push(`${entry}: ${e instanceof Error ? e.message : String(e)}`);
+        }
+        try { fs.unlinkSync(pidPath); } catch {}
+    }
+    return { stopped, errors };
 }
 
 export interface LauncherDeps {
@@ -456,7 +494,12 @@ export async function ensureProxyRunning(
     while (now() < deadline) {
         await sleepImpl(HEALTH_POLL_INTERVAL_MS);
         if (await probeHealth(spawnedOrigin, fetchImpl)) {
-            return { origin: spawnedOrigin, port, reused: false, child, logPath };
+            const pidPath = launcherPidFile(port, process.env);
+            try {
+                fs.mkdirSync(path.dirname(pidPath), { recursive: true });
+                if (child.pid !== undefined) fs.writeFileSync(pidPath, String(child.pid), "utf8");
+            } catch {}
+            return { origin: spawnedOrigin, port, reused: false, child, logPath, pidPath };
         }
     }
     throw new Error(`bili: proxy did not become healthy at ${spawnedOrigin} within ${SPAWN_WAIT_MS}ms`);
@@ -589,7 +632,11 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         console.error(`bili: failed to launch ${params.client}: ${err instanceof Error ? err.message : String(err)}`);
         code = 1;
     } finally {
-        if (!handle.reused) stopProxy(handle);
+        if (!handle.reused && handle.pidPath) {
+            console.error(
+                `bili: proxy left running at ${handle.origin} for reuse by other clients (run "bili stop" to terminate).`,
+            );
+        }
         if (piTmpHome) {
             try {
                 fs.rmSync(piTmpHome, { recursive: true, force: true });
