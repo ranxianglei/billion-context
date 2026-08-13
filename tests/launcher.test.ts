@@ -362,13 +362,13 @@ test("resolveClientCommand: pi prefers PI_BIN env", () => {
     });
 });
 
-test("resolveClientCommand: pi on PATH resolves to 'pi'", () => {
+test("resolveClientCommand: pi on PATH resolves to full path", () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-path-"));
     const piFile = path.join(tmp, "pi");
     fs.writeFileSync(piFile, "#!/bin/sh\necho pi\n", { mode: 0o755 });
     try {
         assert.deepEqual(resolveClientCommand("pi", { PATH: tmp }), {
-            command: "pi",
+            command: piFile,
             prefixArgs: [],
         });
     } finally {
