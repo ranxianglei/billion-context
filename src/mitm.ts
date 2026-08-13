@@ -63,6 +63,12 @@ export function setupMitm(
 ): void {
     ensureRootCA();
     server.on("connect", (req: http.IncomingMessage, clientSocket: net.Socket, head: Buffer) => {
+        if (!isLoopback(clientSocket.remoteAddress)) {
+            log(`CONNECT ${req.url} rejected: non-loopback client ${clientSocket.remoteAddress}`);
+            clientSocket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+            clientSocket.destroy();
+            return;
+        }
         const { hostname, port } = parseHostPort(req.url ?? "");
         if (!hostname) {
             clientSocket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
@@ -77,6 +83,10 @@ export function setupMitm(
         }
         doMitm(server, clientSocket, hostname, targetPort, head, log);
     });
+}
+
+function isLoopback(addr: string | undefined): boolean {
+    return !!addr && (addr === "127.0.0.1" || addr === "::1" || addr === "::ffff:127.0.0.1" || addr.startsWith("127."));
 }
 
 function parseHostPort(s: string): { hostname: string; port: number } {
@@ -107,14 +117,20 @@ function tunnelThrough(
     // a listener in this .then() callback (the old code) never fires, and the
     // client would time out. Just start piping immediately.
     let established = false;
+    let aborted = false;
     const connectTimer = setTimeout(() => {
         if (!established) {
+            aborted = true;
             log(`tunnel ${host}:${port} connect timeout`);
             clientSocket.write("HTTP/1.1 504 Gateway Timeout\r\n\r\n");
             clientSocket.destroy();
         }
     }, 15000);
     connectThroughProxy(host, port, proxyUrl).then((upstream) => {
+        if (aborted) {
+            upstream.destroy();
+            return;
+        }
         established = true;
         clearTimeout(connectTimer);
         clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
@@ -129,6 +145,7 @@ function tunnelThrough(
         upstream.once("error", (e) => cleanup("upstream", e));
         clientSocket.once("error", (e) => cleanup("client", e));
     }).catch((err: Error) => {
+        if (aborted) return;
         clearTimeout(connectTimer);
         log(`tunnel ${host}:${port} connect failed: ${err.message}`);
         clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");

@@ -65,7 +65,30 @@ const UPSTREAM_HOP_HEADERS = new Set([
     // forward the upstream encoding marker when the body is rewritten or
     // streamed from fetch, otherwise clients try to decompress plain bytes.
     "content-encoding",
+    // RFC 7230 §6.1 hop-by-hop headers. proxy-authorization in particular
+    // carries client→proxy credentials that must never reach the model
+    // endpoint. (#80)
+    "proxy-authenticate",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "upgrade",
 ]);
+
+// RFC 7230 §6.1: the Connection header names additional hop-by-hop headers
+// that must be stripped per-message. Returns their lowercased names.
+function connectionNamedHeaders(conn: string | string[] | undefined): Set<string> {
+    const out = new Set<string>();
+    if (!conn) return out;
+    for (const part of Array.isArray(conn) ? conn : [conn]) {
+        for (const name of part.split(",")) {
+            const t = name.trim().toLowerCase();
+            if (t) out.add(t);
+        }
+    }
+    return out;
+}
 
 function buildForwardHeaders(headers: Record<string, string>): Record<string, string> {
     const out: Record<string, string> = {};
@@ -1136,8 +1159,10 @@ async function forward(
         } catch { /* best-effort */ }
     }
     const headers: Record<string, string> = {};
+    const reqConnNamed = connectionNamedHeaders(req.headers["connection"]);
     for (const [k, v] of Object.entries(req.headers)) {
-        if (UPSTREAM_HOP_HEADERS.has(k.toLowerCase()) || v === undefined) continue;
+        const lower = k.toLowerCase();
+        if (UPSTREAM_HOP_HEADERS.has(lower) || reqConnNamed.has(lower) || v === undefined) continue;
         headers[k] = Array.isArray(v) ? v.join(", ") : v;
     }
     headers["host"] = new URL(upstreamUrl).host;
@@ -1220,14 +1245,17 @@ async function forward(
     }
     const { response: upstream, clearTimer: clearUpstreamTimer } = upstreamResult;
     const respHeaders: Record<string, string> = {};
+    const respConnNamed = connectionNamedHeaders(upstream.headers.get("connection") ?? undefined);
     upstream.headers.forEach((v, k) => {
-        if (UPSTREAM_HOP_HEADERS.has(k.toLowerCase())) return;
+        const lower = k.toLowerCase();
+        if (UPSTREAM_HOP_HEADERS.has(lower) || respConnNamed.has(lower)) return;
         respHeaders[k] = v;
     });
     if (opts.debug) {
         const respLog: Record<string, string> = {};
         upstream.headers.forEach((v, k) => {
-            if (UPSTREAM_HOP_HEADERS.has(k.toLowerCase())) return;
+            const lower = k.toLowerCase();
+            if (UPSTREAM_HOP_HEADERS.has(lower) || respConnNamed.has(lower)) return;
             respLog[k] = v.length > 300 ? v.slice(0, 300) + "..." : v;
         });
         log("info", `[${prepared?.session.id ?? "unknown"}] ← upstream response headers: ${JSON.stringify(respLog)}`);

@@ -34,9 +34,6 @@ const CHECK_INTERVAL_MS = 3 * 60 * 1000;
 const THROTTLE_FILE = path.join(cacheDir(), ".update-check");
 const LOCK_FILE = path.join(cacheDir(), ".update-lock");
 const SEMVER_RE = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z-.]+)?$/;
-/** Lock staleness threshold: if a lock file is older than this, it's considered
- *  abandoned (crashed process) and can be stolen. */
-const LOCK_STALE_MS = 2 * 60 * 1000;
 
 let timer: ReturnType<typeof setInterval> | undefined;
 let inFlight = false;
@@ -142,18 +139,20 @@ async function tryAcquireLock(): Promise<{ release: () => Promise<void> } | null
 
     const existing = await readLock();
     if (existing) {
-        const age = now - existing.ts;
         const holderAlive = isAlive(existing.pid);
-        if (holderAlive && age < LOCK_STALE_MS) {
-            // Another process is actively updating — back off.
+        if (holderAlive) {
+            // Never steal from a live holder: a slow install can run long, and
+            // stealing its lock would let two processes write the install dir
+            // concurrently → corruption. Only steal from a dead holder. (#117)
+            loggerLog("info", `[update] lock held by live pid=${existing.pid} (age=${Math.round((now - existing.ts) / 1000)}s), skipping update`);
             return null;
         }
-        // Lock is stale (holder dead or timeout) — steal it. MUST delete the
-        // stale lock file first: writeFile({flag:"wx"}) below requires the path
-        // to NOT exist, and the stale file is still there. Without this unlink
-        // the wx write always fails → update returns null forever → a single
-        // crash during update permanently blocks all future auto-updates.
-        loggerLog("info", `[update] stealing stale lock (pid=${existing.pid}, age=${Math.round(age / 1000)}s, alive=${holderAlive})`);
+        // Holder is dead (crashed) — steal the lock. MUST delete the stale lock
+        // file first: writeFile({flag:"wx"}) below requires the path to NOT
+        // exist, and the stale file is still there. Without this unlink the wx
+        // write always fails → update returns null forever → a single crash
+        // during update permanently blocks all future auto-updates.
+        loggerLog("info", `[update] stealing lock from dead pid=${existing.pid} (age=${Math.round((now - existing.ts) / 1000)}s)`);
         try {
             await unlink(LOCK_FILE);
         } catch (e) {
