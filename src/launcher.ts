@@ -83,7 +83,7 @@ export interface SpawnChild {
 export type SpawnFn = (
     command: string,
     args: readonly string[],
-    options: { detached?: boolean; stdio?: StdioOptions; env?: NodeJS.ProcessEnv },
+    options: { detached?: boolean; stdio?: StdioOptions; env?: NodeJS.ProcessEnv; shell?: boolean },
 ) => SpawnChild;
 
 export interface LaunchOptions {
@@ -485,7 +485,7 @@ export function runClient(
 ): Promise<number> {
     const spawnImpl = deps?.spawnImpl ?? (spawn as SpawnFn);
     return new Promise((resolve, reject) => {
-        const child = spawnImpl(cmd, args, { stdio: "inherit", env });
+        const child = spawnImpl(cmd, args, { stdio: "inherit", env, shell: process.platform === "win32" });
         child.on?.("error", (...rest: unknown[]) => reject(rest[0]));
         child.on?.("exit", (...rest: unknown[]) => {
             const code = rest[0];
@@ -495,18 +495,25 @@ export function runClient(
     });
 }
 
-export function isOnPath(name: string, env: NodeJS.ProcessEnv): boolean {
+const PATH_EXTS = process.platform === "win32" ? [".cmd", ".bat", ".exe", ""] : [""];
+
+export function resolveOnPath(name: string, env: NodeJS.ProcessEnv): string | undefined {
     const p = env.PATH;
-    if (!p) return false;
-    return p.split(":").some((dir) => {
-        if (!dir) return false;
-        try {
-            const f = path.join(dir, name);
-            return fs.existsSync(f) && fs.statSync(f).isFile();
-        } catch {
-            return false;
+    if (!p) return undefined;
+    for (const dir of p.split(path.delimiter)) {
+        if (!dir) continue;
+        for (const ext of PATH_EXTS) {
+            const f = path.join(dir, name + ext);
+            try {
+                if (fs.existsSync(f) && fs.statSync(f).isFile()) return f;
+            } catch {}
         }
-    });
+    }
+    return undefined;
+}
+
+export function isOnPath(name: string, env: NodeJS.ProcessEnv): boolean {
+    return resolveOnPath(name, env) !== undefined;
 }
 
 export function resolveClientCommand(
@@ -516,14 +523,16 @@ export function resolveClientCommand(
     if (client === "pi") {
         const piBin = env.PI_BIN?.trim();
         if (piBin) return { command: piBin, prefixArgs: [] };
-        if (isOnPath("pi", env)) return { command: "pi", prefixArgs: [] };
+        const piResolved = resolveOnPath("pi", env);
+        if (piResolved) return { command: piResolved, prefixArgs: [] };
         const cli = path.join(
             os.homedir(),
             ".pi/agent/npm/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
         );
         return { command: process.execPath, prefixArgs: [cli] };
     }
-    return { command: client, prefixArgs: [] };
+    const resolved = resolveOnPath(client, env);
+    return { command: resolved ?? client, prefixArgs: [] };
 }
 
 export interface RunLaunchParams {
