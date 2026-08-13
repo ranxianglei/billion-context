@@ -3,6 +3,18 @@
 All notable changes to **billion-context** are documented here.
 Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag.
 
+## [0.1.40] — 2026-08-13
+
+### Features
+
+- **Three-level compression tuning** (#124): the `compress` block now merges **per field, deepest wins** at three levels — global → per-provider → per-model. An unset field at a deeper level never clears a value set higher up, so you can pin a global `nudgeGrowthTokens` and still override `modelContextLimit` for one model on one provider without re-declaring the rest. Lets you tune when/where compression fires without forking the whole config per model.
+
+### Fixes
+
+- **Windows `bili codex` ENOENT** (#134): npm globals install as `.cmd`/`.bat` shims on Windows, and Node `spawn` can't resolve a bare name to them (CVE-2024-27980). `resolveClientCommand` now resolves the full `.cmd`/`.bat`/`.exe` path via `resolveOnPath` (using `path.delimiter`, was hardcoded `:`) and spawns with `shell:true` on win32. Fixes `spawn codex ENOENT` for all `bili <client>` launchers on Windows.
+- **DeepSeek thinking 400 after compression** (#133): the root cause is in acp-kernel — an assistant turn's `reasoning_content` (emitted as a separate `contentType:"reasoning"` message) could be split from its companion text/tool-call by a compress range, leaving an orphaned half that DeepSeek-thinking rejects with HTTP 400 `"reasoning_content in the thinking mode must be passed back to the API."`. Bumps **acp-kernel to 0.0.23**, which mirrors the existing tool-pair mechanism: `adjustBoundariesForReasoningPairs` expands the compress range so the pair always compresses together, `stripOrphanedReasoning` is a rebuild safety net, and `applyPairBoundaryAdjustments` composes both to a fixpoint. The same latent class is fixed on the Anthropic and Responses paths too.
+- **textProtocol suppresses only message items, preserves reasoning/image lifecycle** (#94): the text-protocol stream filter was dropping `reasoning` and `image` content along with the message items it meant to suppress, breaking their lifecycle. Now only `message` items are suppressed; reasoning and image blocks pass through unchanged.
+
 ## [0.1.39] — 2026-08-13
 
 ### Fixes
