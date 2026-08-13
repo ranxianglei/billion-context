@@ -203,7 +203,7 @@ export function coreToAnthropic(messages: BiliMessage[], cacheControls?: Map<str
 export function conversationSignalAnthropic(body: AnthropicRequestBody, headerValue?: string): string {
     if (headerValue && headerValue.trim()) return headerValue.trim();
     const firstUser = body.messages.find((m) => m.role === "user");
-    const seed = firstUser ? JSON.stringify(firstUser.content).slice(0, 200) : "default";
+    const seed = firstUser ? JSON.stringify(firstUser.content) : "default";
     return hashId(seed);
 }
 
