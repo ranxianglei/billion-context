@@ -93,7 +93,7 @@ export const log: Logger = (level, msg) => {
         // best-effort: stderr is gone (EPIPE), nothing we can do
     }
     // file — durable record.
-    const s = getStream();
+    let s = getStream();
     if (s) {
         // Runtime rotation: if we've crossed the threshold since last check,
         // reopen the file (rotates the old one out). This keeps a long-running
@@ -103,6 +103,7 @@ export const log: Logger = (level, msg) => {
                 s.end();
             } catch { /* best-effort */ }
             stream = openStream(logPath!);
+            s = stream;
         }
         try {
             s.write(line);

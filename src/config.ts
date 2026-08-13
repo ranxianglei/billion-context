@@ -30,13 +30,73 @@ export function safeReadJson(path: string): unknown {
  *  so the proxy cannot discover them at runtime — the user must declare them.
  */
 export type ProviderRoute = {
-    models?: Record<string, { context?: number; output?: number }>;
+    models?: Record<string, ModelEntry>;
     /** Per-URL upstream HTTP proxy. Overrides the global `proxy`. Empty string
      *  means "explicitly direct" (override global with no proxy). Format:
      *  `http://host:port`. SOCKS5 is not supported yet. */
     proxy?: string;
+    /** Per-URL Responses compress protocol. "marker" = text-trigger protocol
+     *  (for upstreams that cannot coexist with a declared tools field).
+     *  Default / "tools" = native function tools. */
+    compressProtocol?: "tools" | "marker";
+    /** Per-provider compression overrides (level 2 of 3). See CompressSettings. */
+    compress?: CompressSettings;
 };
 export type ProviderRoutes = Record<string, ProviderRoute>; // key = upstream URL prefix (the /bili/<this> string)
+
+/** Per-model declaration under a provider route. `context` / `output` are the
+ *  legacy fields; `compress` is the level-3 override (deepest, highest priority). */
+export type ModelEntry = {
+    context?: number;
+    output?: number;
+    /** Per-model compression overrides (level 3 of 3, wins over provider
+     *  and global). See CompressSettings. */
+    compress?: CompressSettings;
+};
+
+/** User-facing compression tuning. Configurable at three levels — global
+ *  (config root `compress`), per-provider (`providers[url].compress`), per-model
+ *  (`providers[url].models[model].compress`) — merged deepest-field-wins by
+ *  {@link mergeCompress} (child covers parent, per field, not whole-object). Every
+ *  field is optional; unset fields fall through to the kernel default. */
+export type CompressSettings = {
+    /** Effective context window used by the compression engine — this is the
+     *  model's context size. It is the **denominator** the kernel uses for its
+     *  usage ratio (`usage = tokens / modelContextLimit`); it is NOT a
+     *  truncation cap. Accepts two forms:
+     *  - **absolute** (`number`): exact token budget, e.g. `200000`.
+     *  - **percentage** (`string` like `"70%"`): a fraction of the model's
+     *    native window (from the built-in table / models.dev registry).
+     *  When unset at every level, the default is the model's **native window**.
+     *  Highest-priority source for the model limit; overrides the built-in
+     *  table / registry and the legacy `modelContextLimit` / per-model
+     *  `context`. See {@link resolveContextLimitValue}. */
+    modelContextLimit?: number | string;
+    /** Context usage percentage that triggers forced compression nudges
+     *  (bypasses growth-gate + cadence). Accepts a ratio (0.75) or percent
+     *  string ("75%"). Maps to kernel `nudge.maxContextLimitPct`. */
+    maxContextLimit?: number | string;
+    /** Context usage percentage that triggers emergency truncation of large
+     *  tool outputs. Accepts a ratio (0.95) or percent string ("95%"). Must
+     *  be >= maxContextLimit. Maps to kernel `nudge.emergencyThresholdPct` +
+     *  `truncate.threshold`. */
+    emergencyThresholdPercent?: number | string;
+    /** Nudge growth magnitude in tokens — a compression nudge fires roughly
+     *  every time this many tokens become compressible. Flattens the kernel's
+     *  adaptive band to a fixed step (sets both `nudge.growthFloor` and
+     *  `nudge.growthCap`). */
+    nudgeGrowthTokens?: number;
+    /** Trailing messages never offered for compression
+     *  (kernel `preserveRecentMessages`). */
+    preserveRecentMessages?: number;
+    /** Token budget reserved for recent messages (kernel `preserveRecentTokens`). */
+    preserveRecentTokens?: number;
+    /** Minimum compressible range size in tokens; smaller ranges are skipped
+     *  (kernel `compress.minCompressRange`). */
+    minCompressRange?: number;
+    /** Enable multi-tier (T2/T3) distillation (kernel `tiers.enabled`). */
+    tiers?: boolean;
+};
 export type PromptCacheRouting = "auto" | "enabled" | "disabled";
 export type UpstreamProxyMode = "auto" | "manual" | "direct";
 
@@ -88,28 +148,36 @@ export function resolveContextLimit(
     return resolveConfiguredContextLimit(routes, upstreamUrl, model) ?? lookupContextLimit(model);
 }
 
-export function resolveConfiguredContextLimit(
-    routes: ProviderRoutes,
-    upstreamUrl: string | undefined,
-    model: string | undefined,
-): number | undefined {
-    if (!model || !upstreamUrl) return undefined;
-    // Longest-prefix match: collect all keys that are a prefix of upstreamUrl,
-    // pick the longest (most specific). A key matches if upstreamUrl === key
-    // OR upstreamUrl starts with key + ("/" or key being the full origin). This
-    // avoids "https://x.com" matching "https://x.com.evil" — the boundary check
-    // requires the next char after the key to be "/" or end-of-string.
+/** Longest-URL-prefix match over the providers map. Returns the most specific
+ *  ProviderRoute whose key is a prefix of `upstreamUrl`, or undefined. Shared
+ *  by context-limit / compress-protocol / compress-settings resolution. */
+export function findRoute(routes: ProviderRoutes, upstreamUrl: string | undefined): ProviderRoute | undefined {
+    if (!upstreamUrl) return undefined;
+    // A key matches if upstreamUrl === key OR upstreamUrl starts with key + "/".
+    // The boundary check ("/" or end-of-string) avoids "https://x.com" matching
+    // "https://x.com.evil". Longest (most specific) key wins.
     let bestKey = "";
     for (const key of Object.keys(routes)) {
         if (upstreamUrl === key || upstreamUrl.startsWith(key + "/")) {
             if (key.length > bestKey.length) bestKey = key;
         }
     }
-    if (bestKey) {
-        const m = routes[bestKey].models?.[model];
-        if (m?.context && m.context > 0) return m.context;
-    }
+    return bestKey ? routes[bestKey] : undefined;
+}
+
+export function resolveConfiguredContextLimit(
+    routes: ProviderRoutes,
+    upstreamUrl: string | undefined,
+    model: string | undefined,
+): number | undefined {
+    if (!model || !upstreamUrl) return undefined;
+    const m = findRoute(routes, upstreamUrl)?.models?.[model];
+    if (m?.context && m.context > 0) return m.context;
     return undefined;
+}
+
+export function resolveCompressProtocol(routes: ProviderRoutes, upstreamUrl: string | undefined): "tools" | "marker" | undefined {
+    return findRoute(routes, upstreamUrl)?.compressProtocol;
 }
 
 export type ProxyOptions = {
@@ -125,7 +193,11 @@ export type ProxyOptions = {
     proxyFallback?: ProxyFallbackOptions;
     modelContextLimit: number;
     kernelConfig: Config;
-    compress: {
+    /** Global-level compression settings (level 1) — the tuning fields from the
+     *  user-facing `compress` block, passed through for per-request resolution
+     *  (provider = level 2, model = level 3). `injectTool` / `injectNudge` are
+     *  the env-resolved booleans (honored globally only). */
+    compress: CompressSettings & {
         injectTool: boolean;
         injectNudge: boolean;
     };
@@ -184,36 +256,19 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
 
     // --- Source 2: env vars (highest priority) ---
     const port = parseInt(env.ACP_PORT ?? env.PORT ?? `${fileConfig.port ?? 8787}`, 10);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+        throw new Error(`Invalid port ${Number.isNaN(port) ? "(not a number)" : port}; must be 1-65535`);
+    }
     const host = env.ACP_HOST ?? fileConfig.host ?? "127.0.0.1";
     const upstream = (env.ACP_UPSTREAM ?? fileConfig.upstream ?? "https://api.anthropic.com").replace(/\/$/, "");
-    let routes: ProviderRoutes = {};
-    // Routes: explicit env path > config file providers > none.
-    const routesPath = env.ACP_PROVIDERS ?? fileConfig.providersPath ?? "";
-    if (routesPath) {
-        const parsed = safeReadJson(routesPath);
-        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-            for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
-                rejectLegacyRoute(k, v);
-                const route = parseRouteEntry(v);
-                if (route) routes[normalizeUrlKey(k)] = route;
-            }
-        }
-    }
-    // Also accept providers inline in the config file.
-    if (fileConfig.providers) {
-        for (const [k, v] of Object.entries(fileConfig.providers)) {
-            rejectLegacyRoute(k, v);
-            const route = parseRouteEntry(v);
-            if (route && !routes[normalizeUrlKey(k)]) routes[normalizeUrlKey(k)] = route;
-        }
-    }
+    const routes = loadRoutes(env);
     const modelContextLimit = parseInt(env.ACP_MODEL_CONTEXT_LIMIT ?? `${fileConfig.modelContextLimit ?? 200000}`, 10);
     const biliProxy = nonEmpty(env.BILI_UPSTREAM_PROXY);
     const webProxy = nonEmpty(fileConfig.upstreamProxy);
     const configProxy = nonEmpty(fileConfig.proxy);
-    const proxyMode = parseUpstreamProxyMode(
-        env.BILI_UPSTREAM_PROXY_MODE ?? fileConfig.upstreamProxyMode ?? (webProxy ? "manual" : undefined),
-    );
+    const rawProxyMode = env.BILI_UPSTREAM_PROXY_MODE ?? fileConfig.upstreamProxyMode ?? (webProxy ? "manual" : undefined);
+    const proxyMode = parseUpstreamProxyMode(rawProxyMode);
+    const explicitDirect = proxyMode === "direct" && rawProxyMode === "direct";
     const proxy = biliProxy ?? (proxyMode === "direct" ? "" : proxyMode === "manual" ? webProxy ?? configProxy : configProxy);
     const proxySource: ProxyOptions["proxySource"] = biliProxy
         ? "bili-env"
@@ -233,8 +288,9 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         ...(httpsProxy ? { httpsProxy } : {}),
         ...(allProxy ? { allProxy } : {}),
         ...(noProxy ? { noProxy } : {}),
-        biliPort: Number.isFinite(port) ? port : 8787,
+        biliPort: port,
         globalSource: proxySource,
+        explicitDirect,
     };
     validateHttpProxy(proxy, proxyFallback.biliPort);
     for (const [url, route] of Object.entries(routes)) {
@@ -245,7 +301,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         }
     }
     return {
-        port: Number.isFinite(port) ? port : 8787,
+        port,
         host,
         upstream,
         routes,
@@ -256,6 +312,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         modelContextLimit,
         kernelConfig: defaultConfig(modelContextLimit),
         compress: {
+            ...(fileConfig.compress ?? {}),
             injectTool: (env.ACP_COMPRESS_TOOL ?? (fileConfig.compress?.injectTool === false ? "0" : "1")) !== "0",
             injectNudge: (env.ACP_COMPRESS_NUDGE ?? (fileConfig.compress?.injectNudge === false ? "0" : "1")) !== "0",
         },
@@ -271,7 +328,10 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         logFile: env.ACP_LOG_FILE !== undefined ? (env.ACP_LOG_FILE || undefined) : fileConfig.logFile,
         mitm: {
             enabled: (env.BILI_MITM ?? (fileConfig.mitm?.enabled === false ? "0" : "1")) !== "0",
-            domains: fileConfig.mitm?.domains ?? [],
+            domains: dedupeDomains([
+                ...(fileConfig.mitm?.domains ?? []),
+                ...splitCsv(env.BILI_MITM_DOMAINS),
+            ]),
         },
     };
 }
@@ -299,7 +359,11 @@ type FileConfig = {
     upstreamProxy?: string;
     upstreamProxyMode?: string;
     logFile?: string;
-    compress?: { injectTool?: boolean; injectNudge?: boolean };
+    /** Global compression block (level 1 of 3). Holds the injection toggles
+     *  (`injectTool` / `injectNudge`, honored globally) plus the tuning fields
+     *  (see CompressSettings), overridden per-field by provider- and model-level
+     *  `compress`. */
+    compress?: CompressSettings & { injectTool?: boolean; injectNudge?: boolean };
     promptCache?: { routing?: string };
     mitm?: { enabled?: boolean; domains?: string[] };
 };
@@ -307,6 +371,26 @@ type FileConfig = {
 function nonEmpty(value: string | undefined): string | undefined {
     const trimmed = value?.trim();
     return trimmed ? trimmed : undefined;
+}
+
+function splitCsv(value: string | undefined): string[] {
+    if (!value) return [];
+    return value
+        .split(",")
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0);
+}
+
+function dedupeDomains(list: string[]): string[] {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const d of list) {
+        if (!seen.has(d)) {
+            seen.add(d);
+            out.push(d);
+        }
+    }
+    return out;
 }
 
 function loadConfigFile(): FileConfig {
@@ -356,9 +440,11 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
     // is the KEY in the providers map (identical to the /bili/<url> string),
     // so it is NOT repeated inside the value.
     if (v && typeof v === "object" && !Array.isArray(v)) {
-        const obj = v as { models?: Record<string, { context?: number; output?: number }>; proxy?: string };
+        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; compress?: CompressSettings };
         const route: ProviderRoute = { models: obj.models };
         if (typeof obj.proxy === "string") route.proxy = obj.proxy;
+        if (obj.compressProtocol === "marker" || obj.compressProtocol === "tools") route.compressProtocol = obj.compressProtocol;
+        if (obj.compress) route.compress = obj.compress;
         return route;
     }
     // A bare value (e.g. null) means "this upstream exists, no overrides".

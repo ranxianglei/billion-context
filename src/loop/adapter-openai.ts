@@ -67,6 +67,18 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>): Compr
             "utf8",
         );
 
+    const buildReasoning = (content: string): Buffer =>
+        Buffer.from(
+            `data: ${JSON.stringify({
+                id: responseId,
+                object: "chat.completion.chunk",
+                created: Date.now(),
+                model,
+                choices: [{ index: 0, delta: { reasoning_content: content }, finish_reason: null }],
+            })}\n\n`,
+            "utf8",
+        );
+
     const buildToolCall = (call: ToolCallEmit): Buffer => {
         const idx = toolIndex++;
         return Buffer.from(
@@ -153,8 +165,10 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>): Compr
                 const finishReason = typeof choice.finish_reason === "string" ? choice.finish_reason : undefined;
 
                 if (finishReason) {
+                    let yieldedToolCall = false;
                     for (const [, tc] of pending) {
                         if (tc.name.length > 0 || tc.id.length > 0) {
+                            yieldedToolCall = true;
                             yield {
                                 kind: "tool_call",
                                 name: tc.name,
@@ -172,10 +186,17 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>): Compr
                         outputTokens: typeof u?.completion_tokens === "number" ? u.completion_tokens : undefined,
                         cachedTokens: typeof pd?.cached_tokens === "number" ? pd.cached_tokens : undefined,
                     } as ParsedStreamEvent;
-                    yield { kind: "done", finishReason } as ParsedStreamEvent;
+                    yield {
+                        kind: "done",
+                        finishReason: yieldedToolCall && finishReason === "stop" ? "tool_calls" : finishReason,
+                    } as ParsedStreamEvent;
                 }
 
                 if (!delta) continue;
+
+                if (typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0) {
+                    yield { kind: "reasoning", delta: delta.reasoning_content, raw: rawBuf } as ParsedStreamEvent;
+                }
 
                 if (delta.tool_calls) {
                     const tcs = delta.tool_calls as Array<Record<string, unknown>>;
@@ -201,9 +222,10 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>): Compr
                     continue;
                 }
 
+                const hasReasoning = typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0;
                 if (typeof delta.content === "string" && delta.content.length > 0) {
-                    yield { kind: "text", delta: delta.content, raw: rawBuf } as ParsedStreamEvent;
-                } else if (delta.role || (Object.keys(delta).length === 0 && !finishReason)) {
+                    yield { kind: "text", delta: delta.content, ...(hasReasoning ? {} : { raw: rawBuf }) } as ParsedStreamEvent;
+                } else if (!hasReasoning && (delta.role || (Object.keys(delta).length === 0 && !finishReason))) {
                     yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
                 }
             }
@@ -211,6 +233,10 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>): Compr
 
         emitText(delta) {
             return buildContent(delta);
+        },
+
+        emitReasoning(delta) {
+            return buildReasoning(delta);
         },
 
         emitToolCall(call) {

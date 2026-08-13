@@ -60,11 +60,11 @@ test("prepareCountTokens prunes covered messages when a compression block is act
     const prepared = prepareCountTokens(body, core, config, log, session);
     const out = JSON.parse(prepared.body);
     assert.ok(out.messages.length < inputCount, `pruned output (${out.messages.length}) must be < input (${inputCount})`);
-    const hasSummary = out.messages.some((m: { content: unknown }) => {
+    const hasInPlaceSummary = out.messages.some((m: { content: unknown }) => {
         const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
         return /early history summary/i.test(text);
     });
-    assert.ok(hasSummary, "a summary block should be injected");
+    assert.ok(!hasInPlaceSummary, "in-place acp_summary stripped (host relies on the compress tool-call to carry the summary)");
     assert.ok(logs.some((l) => /count_tokens pruned:/.test(l)), "should log the prune delta");
 });
 

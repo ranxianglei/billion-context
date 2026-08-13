@@ -162,6 +162,7 @@ test("loadOptions keeps BILI_UPSTREAM_PROXY above config/environment fallback", 
         noProxy: "localhost,127.0.0.1",
         biliPort: 9100,
         globalSource: "bili-env",
+        explicitDirect: false,
     });
 });
 

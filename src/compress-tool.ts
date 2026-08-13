@@ -9,6 +9,12 @@ export const COMPRESS_TOOL_NAME = "compress";
  *  `<acp tokens=...>` history tags so they never collide. */
 export const ACP_TEXT_OPEN = "\x3cacp_compress\x3e";
 export const ACP_TEXT_CLOSE = "\x3c/acp_compress\x3e";
+export const ACP_STATUS_OPEN = "\x3cacp_status\x3e";
+export const ACP_STATUS_CLOSE = "\x3c/acp_status\x3e";
+export const ACP_SEARCH_OPEN = "\x3cacp_search\x3e";
+export const ACP_SEARCH_CLOSE = "\x3c/acp_search\x3e";
+export const ACP_DECOMPRESS_OPEN = "\x3cacp_decompress\x3e";
+export const ACP_DECOMPRESS_CLOSE = "\x3c/acp_decompress\x3e";
 
 export const COMPRESS_TOOL = {
     name: COMPRESS_TOOL_NAME,
@@ -165,7 +171,67 @@ Rules for the trigger:
 - JSON shape matches the compress tool: {"content":[{startId,endId,summary,topic?}]}. Batch multiple ranges in one trigger.
 - After emitting the marker, STOP your turn. Do not continue with other text — the proxy will execute the compression and return the result, then you continue fresh.
 - Do NOT wrap the marker in code fences, quotes, or commentary.
-- NEVER compress on short conversations or when context is small (well below the window limit). Only compress when context is genuinely large.`;
+- NEVER compress on short conversations or when context is small (well below the window limit). Only compress when context is genuinely large.
+
+ACP TOOLS (TEXT TRIGGERS)
+
+Since host tools cannot coexist with a declared tools field, ALL ACP tools use text triggers. Emit the marker; the proxy intercepts and executes it; the marker is stripped from what the user sees.
+
+1. acp_status — view context usage, compression state, and compressible ranges:
+   ${ACP_STATUS_OPEN}${ACP_STATUS_CLOSE}
+   No payload needed. Use this FIRST when unsure about context state.
+
+2. search_context — search compressed block summaries by keyword:
+   ${ACP_SEARCH_OPEN}{"query":"auth token refresh"}${ACP_SEARCH_CLOSE}
+   Use when you need details that may have been compressed away.
+
+3. decompress — restore compressed content for exact details:
+   ${ACP_DECOMPRESS_OPEN}{"blockId":"b5"}${ACP_DECOMPRESS_CLOSE}
+   Optional: {"blockId":"b5","toFile":"/tmp/b5.txt"} to write to file instead.
+   Optional: {"blockId":"b5","full":true} to restore all the way to original messages.
+
+Rules for ALL triggers:
+- Output on its own, NO surrounding prose. Just the raw marker.
+- After emitting, STOP your turn. The proxy executes and returns the result.
+- Do NOT wrap in code fences, quotes, or commentary.`;
+}
+
+/** Hybrid protocol prompt (codex): compress stays a text marker (batch + STOP
+ *  is a poor fit for a single function call), while decompress/search_context/
+ *  acp_status are real function tools the model calls directly. The compress
+ *  loop already merges text triggers and function tool_calls, so both paths
+ *  coexist in one turn. */
+export function buildCompressHybridSystemPrompt(): string {
+    return `${COMPRESS_PHILOSOPHY}
+
+${HOW_TO_COMPRESS_RULES}
+
+ACP TAGS
+
+Each message in the conversation is annotated with a <acp> tag showing its reference ID, approximate token size, and content type. These tags are system metadata. NEVER echo these history tags. Use only the ref ID (e.g. m00005), never the XML wrapper.
+
+COMPRESSION PROTOCOL (TEXT)
+
+You manage context by emitting a special trigger in your text output. When you decide a range of conversation is genuinely consumed and should be compressed into a summary, output EXACTLY this marker (the proxy intercepts and executes it; the marker is stripped from what the user sees):
+
+${ACP_TEXT_OPEN}{"content":[{"startId":"m00150","endId":"m00220","summary":"...","topic":"optional"}]}${ACP_TEXT_CLOSE}
+
+Rules for the trigger:
+- Output the marker on its own, with NO surrounding prose. Just the raw marker.
+- JSON shape: {"content":[{startId,endId,summary,topic?}]}. Batch multiple ranges in one trigger.
+- After emitting the marker, STOP your turn. Do not continue with other text — the proxy will execute the compression and return the result, then you continue fresh.
+- Do NOT wrap the marker in code fences, quotes, or commentary.
+- NEVER compress on short conversations or when context is small (well below the window limit). Only compress when context is genuinely large.
+
+ACP TOOLS (FUNCTION CALLS)
+
+The proxy also provides these as real function tools you can call directly (they appear in your tool list). Call them like any other function; the proxy executes them and returns the result, then you continue.
+
+- acp_status — view context usage, compression state, and compressible ranges. No arguments. Use this FIRST when unsure about context state.
+- search_context — search compressed block summaries by keyword. Arguments: {"query":"...","limit":5}.
+- decompress — restore compressed content for exact details. Arguments: {"blockId":"b5"} (optional "toFile":"/tmp/x.txt", "full":true).
+
+Note: compress is ONLY available via the text marker above (it needs batch ranges + an immediate stop), NOT as a function tool.`;
 }
 
 export const DECOMPRESS_TOOL_NAME = "decompress";
@@ -291,6 +357,18 @@ export const ACP_STATUS_TOOL_RESPONSES = {
 /** All ACP tools in Responses API flat format, matching PROXY_TOOL_NAMES. */
 export const ACP_TOOLS_RESPONSES = [
     COMPRESS_TOOL_RESPONSES,
+    DECOMPRESS_TOOL_RESPONSES,
+    SEARCH_CONTEXT_TOOL_RESPONSES,
+    ACP_STATUS_TOOL_RESPONSES,
+] as const;
+
+/** Read-only ACP tools (no compress) in Responses flat format. Used for the
+ *  hybrid protocol (codex): compress stays a text marker (batch + STOP), while
+ *  decompress/search_context/acp_status are injected as real function tools so
+ *  the model can call them directly instead of emitting text triggers.
+ *  Empirically (direct comfly A/B) declaring these tools does NOT disable
+ *  codex code_mode — the earlier "tools can't coexist" assumption was wrong. */
+export const ACP_READONLY_TOOLS_RESPONSES = [
     DECOMPRESS_TOOL_RESPONSES,
     SEARCH_CONTEXT_TOOL_RESPONSES,
     ACP_STATUS_TOOL_RESPONSES,

@@ -1,7 +1,7 @@
 import type { CoreMessage } from "acp-kernel";
-import { coreToResponses, injectResponsesDeveloperMessage } from "../responses.js";
+import { coreToResponses, injectResponsesDeveloperMessage, patchResponsesInput, type ResponseInputItem, type ResponsesProjection } from "../responses.js";
 import { buildVisibilityMarker } from "../compress-loop.js";
-import { ACP_TEXT_OPEN, ACP_TEXT_CLOSE, COMPRESS_TOOL_NAME } from "../compress-tool.js";
+import { ACP_TEXT_OPEN, ACP_TEXT_CLOSE, ACP_STATUS_OPEN, ACP_STATUS_CLOSE, ACP_SEARCH_OPEN, ACP_SEARCH_CLOSE, ACP_DECOMPRESS_OPEN, ACP_DECOMPRESS_CLOSE, COMPRESS_TOOL_NAME } from "../compress-tool.js";
 import type { BiliMessage } from "../bili-message.js";
 import type {
     CompressLoopAdapter,
@@ -123,7 +123,7 @@ function buildCompleted(responseObj: Record<string, unknown> | null): Buffer {
     );
 }
 
-export function createResponsesAdapter(textProtocol?: boolean): CompressLoopAdapter {
+export function createResponsesAdapter(textProtocol?: boolean, projection?: ResponsesProjection): CompressLoopAdapter {
     const suppressTextLifecycle = !!textProtocol;
     let outputIndex = 0;
     let responseObj: Record<string, unknown> | null = null;
@@ -141,10 +141,21 @@ export function createResponsesAdapter(textProtocol?: boolean): CompressLoopAdap
                     if (id) customToolCallIds.add(id);
                 }
             }
-            const inputItems = coreToResponses(coreMessages, customToolCallIds);
-            const withDev = injectResponsesDeveloperMessage(inputItems, systemPrompt);
+            let inputItems: ResponseInputItem[];
+            if (projection) {
+                const rebuiltInput = patchResponsesInput(projection, coreMessages);
+                inputItems = typeof rebuiltInput === "string"
+                    ? [{ type: "message", role: "user", content: rebuiltInput }]
+                    : rebuiltInput;
+            } else {
+                inputItems = coreToResponses(coreMessages, customToolCallIds);
+            }
+            const devParts = projection && projection.systemParts.length > 0
+                ? [...projection.systemParts, systemPrompt]
+                : [systemPrompt];
+            const withDev = injectResponsesDeveloperMessage(inputItems, devParts.join("\n\n---\n\n"));
             const rebuilt: Record<string, unknown> = { ...requestBody, input: withDev };
-            delete rebuilt.previous_response_id;
+            if (process.env.ACP_KEEP_RESPONSE_ID !== "1") delete rebuilt.previous_response_id;
             delete rebuilt.instructions;
             return rebuilt;
         },
@@ -329,22 +340,30 @@ export function createResponsesAdapter(textProtocol?: boolean): CompressLoopAdap
             const calls: ToolCallEmit[] = [];
             let clean = text;
             let hadTrigger = false;
-            let start = clean.indexOf(ACP_TEXT_OPEN);
-            while (start >= 0) {
-                const end = clean.indexOf(ACP_TEXT_CLOSE, start + ACP_TEXT_OPEN.length);
-                if (end < 0) break;
-                hadTrigger = true;
-                const payload = clean.slice(start + ACP_TEXT_OPEN.length, end).trim();
-                if (payload.length > 0) {
-                    const stamp = `${Date.now()}-${calls.length}`;
-                    calls.push({
-                        name: COMPRESS_TOOL_NAME,
-                        callId: `call_text_${stamp}`,
-                        arguments: payload,
-                    });
+            const triggers = [
+                { name: "compress", open: ACP_TEXT_OPEN, close: ACP_TEXT_CLOSE, requirePayload: true },
+                { name: "acp_status", open: ACP_STATUS_OPEN, close: ACP_STATUS_CLOSE, requirePayload: false },
+                { name: "search_context", open: ACP_SEARCH_OPEN, close: ACP_SEARCH_CLOSE, requirePayload: true },
+                { name: "decompress", open: ACP_DECOMPRESS_OPEN, close: ACP_DECOMPRESS_CLOSE, requirePayload: true },
+            ];
+            for (const t of triggers) {
+                let start = clean.indexOf(t.open);
+                while (start >= 0) {
+                    const end = clean.indexOf(t.close, start + t.open.length);
+                    if (end < 0) break;
+                    hadTrigger = true;
+                    const payload = clean.slice(start + t.open.length, end).trim();
+                    if (payload.length > 0 || !t.requirePayload) {
+                        const stamp = `${Date.now()}-${calls.length}`;
+                        calls.push({
+                            name: t.name,
+                            callId: `call_text_${stamp}`,
+                            arguments: payload.length > 0 ? payload : "{}",
+                        });
+                    }
+                    clean = clean.slice(0, start) + clean.slice(end + t.close.length);
+                    start = clean.indexOf(t.open);
                 }
-                clean = clean.slice(0, start) + clean.slice(end + ACP_TEXT_CLOSE.length);
-                start = clean.indexOf(ACP_TEXT_OPEN);
             }
             return { clean: hadTrigger ? clean : text, calls } as ExtractedTextTriggers;
         },

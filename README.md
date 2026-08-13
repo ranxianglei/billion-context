@@ -42,8 +42,14 @@ This installs the `bili` command (`bili-proxy` is kept as an alias).
 
 ## Quickstart
 
-Two ways to use it — pick one:
+Three ways to use it — pick one:
 
+- **Launcher (no config-file edits):** run `bili pi`, `bili codex`, or
+  `bili claude` and billion-context brings up a proxy on an independent port,
+  then launches the client pointed at it. Both schemes are auto-proxied with no
+  config edits: HTTPS upstreams via `HTTPS_PROXY` + the proxy's MITM CA
+  (whitelisted for TLS interception), HTTP upstreams via a `/bili/` baseURL
+  rewrite (cert MITM can't intercept plaintext). See **Option 0** below.
 - **Zero-config (simplest):** prefix your client's baseURL with the proxy
   origin + `/bili/`. No config file needed — context windows are auto-detected
   from the [models.dev](https://models.dev) registry. The `/bili/` prefix also
@@ -57,6 +63,68 @@ Two ways to use it — pick one:
 
 Compression is injected automatically — you only configure routing, never
 compression itself.
+
+### Option 0 — Launcher (`bili pi` / `bili codex` / `bili claude`)
+
+The launcher wraps a client in one command: it starts a proxy on an
+independent port (reusing one already running there), then points the client
+at it via **certificate-based MITM** — no config files are edited. The client's
+own config is READ to discover which HTTPS upstream hosts it talks to; those
+hosts are whitelisted for MITM so the proxy can TLS-terminate exactly them and
+blind-tunnel everything else.
+
+```bash
+bili pi                               # launch pi through the proxy
+bili pi -- print "hi"                 # args after the client are passed through
+bili pi-test                          # clean pi (extensions off) — proxy owns compression, no double-compress
+bili codex                            # launch codex through the proxy
+bili claude                           # launch claude through the proxy
+bili test pi                          # quick end-to-end smoke test of the pi path
+bili pi --mitm-domain api.foo.com     # add a domain to the MITM whitelist
+```
+
+How the client is pointed at the proxy (set automatically in the child env):
+
+| Client      | Proxy redirect      | CA trust env var        |
+|-------------|---------------------|-------------------------|
+| pi          | `HTTPS_PROXY`       | `NODE_EXTRA_CA_CERTS`   |
+| claude      | `HTTPS_PROXY`       | `NODE_EXTRA_CA_CERTS`   |
+| codex       | `HTTPS_PROXY`       | `SSL_CERT_FILE`         |
+
+The real upstream HTTPS hosts are **discovered by reading** (never editing)
+the client's own config, so whatever you already have set up keeps working:
+
+| Client      | Read from                                    |
+|-------------|----------------------------------------------|
+| Pi          | `~/.pi/agent/models.json` — each provider's `baseUrl` |
+| Codex       | `~/.codex/config.toml` — each `[model_providers.<name>]` `base_url` (+ top-level `openai_base_url`) |
+| Claude Code | hardcoded `api.anthropic.com` (no per-config upstream) |
+
+Only **HTTPS** hosts are MITM'd (a self-signed CA can't intercept plaintext
+anyway); HTTP / `localhost` / `127.0.0.1` providers used to go direct, but are
+now auto-proxied too. Both schemes are covered with no config edits:
+
+- **HTTPS upstreams → cert MITM.** The MITM CA cert is the proxy's own root
+  (`~/.local/share/billion-context/ca/root-ca.pem`, generated lazily); the
+  client must trust it — pi/claude honor `NODE_EXTRA_CA_CERTS`, codex honors
+  `SSL_CERT_FILE`. Compression is injected on the intercepted TLS stream.
+- **HTTP upstreams → `/bili/` baseURL rewrite** (since plaintext can't be
+  MITM'd). The launcher rewrites the client's base URL through the client's own
+  mechanism, leaving its config files untouched: codex via `-c key=value` flags,
+  claude via the `ANTHROPIC_BASE_URL` env var, pi via an isolated
+  `PI_CODING_AGENT_DIR` pointing at a temp copy of the pi home with a rewritten
+  `models.json` (`auth.json` and the rest are symlinked through unchanged; the
+  temp dir is removed when the client exits).
+
+`--mitm-domain <domain>` (repeatable) adds extra domains to the whitelist
+beyond what auto-discovery finds — useful for hosts the client fetches at
+runtime rather than from its config file. The proxy port defaults to `8787`;
+if it's taken, a free port is chosen automatically. Use `--passthrough` /
+`--debug` / `--no-auto-update` just like plain `bili`.
+
+> **Note:** the launcher ties the proxy's lifetime to the client — when the
+> client exits, a proxy it started is stopped. If it reuses a proxy you already
+> started with plain `bili`, that one is left running.
 
 ### Option A — Zero-config (`/bili/` prefix)
 
@@ -363,7 +431,7 @@ The config file is a single JSON object. Example:
 | `debug` | `false` | Verbose logging (same as `ACP_DEBUG=1`) |
 | `passthrough` | `false` | Forward without compression (same as `ACP_PASSTHROUGH=1`) |
 | `providers` | *(none)* | Per-URL context overrides — see below |
-| `compress` | *(see defaults)* | `{ injectTool, injectNudge }` |
+| `compress` | *(see defaults)* | Global compression block: `{ injectTool, injectNudge }` injection toggles **plus** engine tuning (`nudgeGrowthTokens`, `modelContextLimit`, …) — see [Compression tuning](#compression-tuning-the-compress-block) |
 | `proxy` | *(none)* | Upstream HTTP proxy for the proxy's OWN outbound connections to model providers (`http://host:port`). Per-URL `proxy` overrides this. See [Upstream proxy](#upstream-proxy-firewall--gfw). |
 
 > **Choosing a `host`** (IPv6 / containers): the default `127.0.0.1` is
@@ -406,6 +474,61 @@ registry, then the built-in prefix table.
 > document-level information. A wrong value (e.g. GLM-5.2 guessed as 128K
 > instead of 1M) causes spurious frequent compression. Declaring it per
 > URL + model makes the proxy match the registry the client itself uses.
+
+### Compression tuning (the `compress` block)
+
+The `compress` object tunes the compression engine itself — when to nudge, how much
+to compress per step, how many recent messages to protect. It is configurable
+at **three levels** that merge **per field, deepest wins** (child covers
+parent; an unset field at a deeper level never clears a value set higher up):
+
+1. **Global** — top-level `"compress": { … }` (applies to every request). This is
+   also where the `injectTool` / `injectNudge` toggles live (honored globally).
+2. **Per-provider** — `"compress": { … }` inside a `providers[url]` entry.
+3. **Per-model** — `"compress": { … }` inside a `providers[url].models[model]` entry.
+
+```jsonc
+{
+  // Level 1: global default for all providers/models
+  "compress": { "nudgeGrowthTokens": 50000, "maxContextLimit": "70%" },
+  "providers": {
+    "https://api.anthropic.com": {
+      // Level 2: override for this provider only
+      "compress": { "nudgeGrowthTokens": 30000, "preserveRecentMessages": 6 },
+      "models": {
+        "claude-opus-4": {
+          // Level 3: override for this one model (wins per-field)
+          "compress": { "nudgeGrowthTokens": 20000, "tiers": false }
+        }
+      }
+    }
+  }
+}
+```
+
+Fields (all optional; unset fields inherit the kernel default):
+
+| Field | Description |
+|-------|-------------|
+| `modelContextLimit` | The model's context **window size** — the denominator the kernel uses for its usage ratio (`usage = tokens / contextLimit`). **Not** a truncation cap. Accepts an absolute number (`200000`) or a percentage of the native window (`"70%"` → 140000 on a 200K model). When unset, defaults to the native window (built-in table / models.dev registry). ⚠️ Shrinking it pulls *every* ratio threshold (`emergencyThresholdPercent`, truncate) down with it — to leave headroom, set `emergencyThresholdPercent` instead. Highest-priority source for the model limit — overrides the built-in table, the models.dev registry, the legacy `modelContextLimit`, and per-model `context`. |
+| `maxContextLimit` | Usage ratio `0`–`1` at which compression is **forced** (nudge injected regardless of growth). Defaults to `0.75` (75% of the context window). Accepts a number (`0.75`) or percentage string (`"75%"`). Lower = compress earlier / more aggressively. |
+| `nudgeGrowthTokens` | Nudge growth step in tokens. A compression nudge fires roughly every time this many tokens become compressible. Flattens the adaptive band to a fixed step (default 50000 at 1M context). |
+| `emergencyThresholdPercent` | Usage ratio `0`–`1` at which compression becomes an **emergency** and tool outputs are hard-truncated to keep the session alive (default `0.95`). Accepts a number (`0.95`) or percentage string (`"95%"`). Must be ≥ `maxContextLimit`. |
+| `preserveRecentMessages` | Number of trailing messages never offered for compression. |
+| `preserveRecentTokens` | Token budget reserved for recent messages. |
+| `minCompressRange` | Minimum compressible range size in tokens; smaller ranges are skipped. |
+| `tiers` | Enable multi-tier (T2/T3) distillation (`true`/`false`). Promotion across tiers is driven by `nudgeGrowthTokens` (token accumulation), not a separate block-count knob. |
+
+The most common knobs are **`nudgeGrowthTokens`** (raise it to compress less often /
+delay compression) and **`modelContextLimit`** (pin an exact window the registry
+doesn't know). Everything else is for advanced tuning.
+
+**Injection toggles** (`injectTool`, `injectNudge` — global only, not per-level):
+
+| Toggle | Default | Effect |
+|--------|---------|--------|
+| `injectTool` | `true` | Injects the compress/decompress/search **tools** + the compress system prompt, so the model can trigger compression via a tool call. Disable to make compression fully automatic (no manual tool). Env `ACP_COMPRESS_TOOL=0`. |
+| `injectNudge` | `true` | Injects automatic **nudge** messages that prompt the model to compress when the context grows. Disable for tool-only / silent operation. Env `ACP_COMPRESS_NUDGE=0`. |
 
 ### URL key matching rules
 

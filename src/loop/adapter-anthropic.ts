@@ -1,5 +1,5 @@
 import type { CoreMessage } from "acp-kernel";
-import { coreToAnthropic } from "../anthropic.js";
+import { coreToAnthropic, extractSystem, buildSystem, type AnthropicRequestBody } from "../anthropic.js";
 import { buildVisibilityMarker } from "../compress-loop.js";
 import type {
     CompressLoopAdapter,
@@ -83,7 +83,7 @@ function remapIndexInEvent(eventStr: string, newIndex: number): Buffer {
     return Buffer.from(rebuilt.join("\n") + "\n\n", "utf8");
 }
 
-export function createAnthropicAdapter(requestBody: Record<string, unknown>): CompressLoopAdapter {
+export function createAnthropicAdapter(requestBody: Record<string, unknown>, originalSystem?: AnthropicRequestBody["system"]): CompressLoopAdapter {
     const model = (requestBody.model as string) ?? undefined;
     let messageId: string | undefined;
     let clientIndex = 0;
@@ -136,7 +136,10 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>): Co
     return {
         buildRequest(coreMessages, systemPrompt, body) {
             const messages = coreToAnthropic(coreMessages);
-            return { ...body, system: systemPrompt, messages };
+            const baseText = originalSystem !== undefined ? extractSystem(originalSystem) : "";
+            const full = baseText ? `${baseText}\n\n---\n\n${systemPrompt}` : systemPrompt;
+            const system = originalSystem !== undefined ? buildSystem(full, originalSystem) : full;
+            return { ...body, system, messages };
         },
 
         async *parseStream(upstream, round) {
@@ -172,10 +175,10 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>): Co
                         const name = typeof block.name === "string" ? block.name : "";
                         const id = typeof block.id === "string" ? block.id : `toolu_${upstreamIndex}`;
                         pending.set(upstreamIndex, { id, name, json: "" });
-                    } else if (round === 1) {
+                    } else {
                         const ci = clientIndex++;
                         indexMap.set(upstreamIndex, ci);
-                        yield { kind: "meta", chunk: remapIndexInEvent(eventStr, ci), firstRoundOnly: true } as ParsedStreamEvent;
+                        yield { kind: "meta", chunk: remapIndexInEvent(eventStr, ci), firstRoundOnly: round === 1 } as ParsedStreamEvent;
                     }
                 } else if (type === "content_block_delta") {
                     const upstreamIndex = (data.index as number) ?? 0;
@@ -185,12 +188,8 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>): Co
                             pending.get(upstreamIndex)!.json += delta.partial_json;
                         }
                     } else if (delta.type === "text_delta" && typeof delta.text === "string") {
-                        if (round === 1) {
-                            const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
-                            yield { kind: "text", delta: delta.text, raw: remapIndexInEvent(eventStr, ci) } as ParsedStreamEvent;
-                        } else {
-                            yield { kind: "text", delta: delta.text } as ParsedStreamEvent;
-                        }
+                        const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
+                        yield { kind: "text", delta: delta.text, raw: remapIndexInEvent(eventStr, ci) } as ParsedStreamEvent;
                     } else if (round === 1) {
                         const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
                         yield { kind: "meta", chunk: remapIndexInEvent(eventStr, ci), firstRoundOnly: true } as ParsedStreamEvent;
@@ -206,9 +205,9 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>): Co
                             callId: tb.id,
                             arguments: tb.json,
                         } as ParsedStreamEvent;
-                    } else if (round === 1) {
+                    } else {
                         const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
-                        yield { kind: "meta", chunk: remapIndexInEvent(eventStr, ci), firstRoundOnly: true } as ParsedStreamEvent;
+                        yield { kind: "meta", chunk: remapIndexInEvent(eventStr, ci), firstRoundOnly: round === 1 } as ParsedStreamEvent;
                     }
                 } else if (type === "message_delta") {
                     const u = (data.usage ?? {}) as Record<string, unknown>;
