@@ -23,6 +23,11 @@ export const DEFAULT_MITM_DOMAINS = [
  *  host the CONNECT tunnel targeted. */
 export const MITM_UPSTREAM_KEY = "__biliMitmUpstream";
 
+/** Max ms to wait for a MITM client to finish the TLS handshake after we
+ *  return CONNECT 200. Bounds slowloris-style resource hold (a client that
+ *  opens the tunnel but never sends/trickle-feeds its ClientHello). */
+const MITM_HANDSHAKE_TIMEOUT_MS = 10_000;
+
 /** True if `host` should be MITM-decrypted. Matches by exact hostname or a
  *  domain suffix (so `api.openai.com` and `chatgpt.com` both work, and
  *  subdomains like `edge.chatgpt.com` are covered). The candidate set is the
@@ -175,6 +180,18 @@ function doMitm(
         tlsSocket.destroy();
         clientSocket.destroy();
     });
+    // Slowloris guard: a client that issues CONNECT, gets the 200, then never
+    // completes (or trickle-feeds) the TLS ClientHello would hold the socket
+    // and our signed-cert context open indefinitely. Arm a handshake timeout;
+    // clear it once the handshake completes ('secure'), or on error/close.
+    const handshakeTimer = setTimeout(() => {
+        log(`mitm ${host}:${port} TLS handshake timeout`);
+        tlsSocket.destroy();
+        clientSocket.destroy();
+    }, MITM_HANDSHAKE_TIMEOUT_MS);
+    tlsSocket.once("secure", () => clearTimeout(handshakeTimer));
+    tlsSocket.once("close", () => clearTimeout(handshakeTimer));
+    tlsSocket.once("error", () => clearTimeout(handshakeTimer));
     // Hand the decrypted TLS socket to the http server's connection listener.
     // The server treats it as a new TCP connection and runs its HTTP parser on
     // the cleartext bytes — exactly the same path as a direct (non-proxy)

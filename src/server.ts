@@ -274,15 +274,36 @@ function isLoopback(addr: string | undefined): boolean {
     return addr === "::1" || addr === "127.0.0.1" || addr.startsWith("127.") || addr.startsWith("::ffff:127.");
 }
 
-function isTrustedAdminOrigin(origin: string | undefined, host: string | undefined): boolean {
+function isTrustedAdminOrigin(origin: string | undefined, host: string | undefined, trustedHosts: Set<string>): boolean {
     if (!origin) return true;
     if (!host) return false;
+    const lcHost = host.toLowerCase();
+    if (!trustedHosts.has(lcHost)) return false;
     try {
         const parsed = new URL(origin);
-        return (parsed.protocol === "http:" || parsed.protocol === "https:") && parsed.host === host;
+        if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+        return trustedHosts.has(parsed.host.toLowerCase());
     } catch {
         return false;
     }
+}
+
+/** The set of Host header values we accept on management endpoints. DNS
+ *  rebinding (attacker resolves evil.com → 127.0.0.1) can make a browser
+ *  request carry Origin == Host == evil.com:port and still reach loopback;
+ *  only pinning Host to our own listen address defeats it. */
+function adminTrustedHosts(bindHost: string, port: number): Set<string> {
+    const p = String(port);
+    const names = ["localhost", "127.0.0.1", "[::1]"];
+    if (bindHost && bindHost !== "0.0.0.0" && bindHost !== "::" && !names.includes(bindHost)) {
+        names.push(bindHost);
+    }
+    const set = new Set<string>();
+    for (const n of names) {
+        set.add(`${n}:${p}`.toLowerCase());
+        if (p === "80") set.add(n.toLowerCase());
+    }
+    return set;
 }
 
 async function handle(
@@ -306,7 +327,7 @@ async function handle(
         res.end(JSON.stringify({ error: "management endpoints are loopback-only; access denied for " + (req.socket.remoteAddress ?? "unknown") }));
         return;
     }
-    if (isAdminPath && !isTrustedAdminOrigin(req.headers.origin, req.headers.host)) {
+    if (isAdminPath && !isTrustedAdminOrigin(req.headers.origin, req.headers.host, adminTrustedHosts(opts.host, opts.port))) {
         res.writeHead(403, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: "management request origin does not match the local bili UI" }));
         return;
