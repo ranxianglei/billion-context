@@ -141,3 +141,46 @@ test("PUT /__bili/config with providers takes effect without a separate reload c
         rmSync(root, { recursive: true, force: true });
     }
 });
+
+test("admin endpoints reject non-loopback Host and cross-site Sec-Fetch-Site (DNS rebinding defense)", async () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    const port = await freePort();
+    const opts: ProxyOptions = {
+        port,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1:1",
+        routes: {},
+        proxy: "",
+        proxyMode: "direct",
+        proxySource: "direct",
+        modelContextLimit: 400_000,
+        kernelConfig: defaultConfig(400_000),
+        compress: { injectTool: true, injectNudge: true },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        mitm: { enabled: false, domains: [] },
+    };
+    const proxy = await startServer(opts);
+    if (!proxy.listening) await once(proxy, "listening");
+    try {
+        const evilHostStatus = await new Promise<number>((resolve, reject) => {
+            const req = http.request(`http://127.0.0.1:${port}/__bili/stats`, { headers: { host: "evil.example" } }, (res) => {
+                res.resume();
+                resolve(res.statusCode ?? 0);
+            });
+            req.on("error", reject);
+            req.end();
+        });
+        assert.equal(evilHostStatus, 403, "non-loopback Host header must be rejected");
+
+        const crossSiteStatus = (await fetch(`http://127.0.0.1:${port}/__bili/stats`, { headers: { "sec-fetch-site": "cross-site" } })).status;
+        assert.equal(crossSiteStatus, 403, "cross-site Sec-Fetch-Site must be rejected");
+    } finally {
+        await close(proxy);
+    }
+});

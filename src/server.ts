@@ -274,7 +274,16 @@ function isLoopback(addr: string | undefined): boolean {
     return addr === "::1" || addr === "127.0.0.1" || addr.startsWith("127.") || addr.startsWith("::ffff:127.");
 }
 
-function isTrustedAdminOrigin(origin: string | undefined, host: string | undefined): boolean {
+function isTrustedAdminOrigin(origin: string | undefined, host: string | undefined, secFetchSite: string | undefined): boolean {
+    // DNS-rebinding defense: the Host header must point at loopback. Without
+    // this, a rebinding domain (evil.com -> 127.0.0.1) passes the Origin===Host
+    // check below because both carry the attacker domain.
+    if (host) {
+        const hostname = host.replace(/^\[|\]$/g, "").split(":")[0].toLowerCase();
+        if (hostname !== "127.0.0.1" && hostname !== "localhost" && hostname !== "::1") return false;
+    }
+    // Sec-Fetch-Site is a fetch metadata header that browser JS cannot forge.
+    if (secFetchSite !== undefined && secFetchSite !== "same-origin") return false;
     if (!origin) return true;
     if (!host) return false;
     try {
@@ -306,7 +315,7 @@ async function handle(
         res.end(JSON.stringify({ error: "management endpoints are loopback-only; access denied for " + (req.socket.remoteAddress ?? "unknown") }));
         return;
     }
-    if (isAdminPath && !isTrustedAdminOrigin(req.headers.origin, req.headers.host)) {
+    if (isAdminPath && !isTrustedAdminOrigin(req.headers.origin, req.headers.host, req.headers["sec-fetch-site"] as string | undefined)) {
         res.writeHead(403, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: "management request origin does not match the local bili UI" }));
         return;
