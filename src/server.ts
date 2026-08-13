@@ -47,7 +47,7 @@ import { defaultLogFile, stateDir } from "./paths.js";
 import { compressLoopResponsesJson } from "./compress-loop-responses.js";
 import { runCompressLoop, pickAdapter } from "./loop/index.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
-import { rewriteResponsesSseStream, rewriteResponsesJsonResponse } from "./stream-responses.js";
+import { rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { emitStreamError } from "./stream-error.js";
 import { deriveSessionId as deriveProxySessionId, affinityToken, clientConversationHeader, type ConversationIdentity } from "./session-id.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
