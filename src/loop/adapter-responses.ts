@@ -191,7 +191,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                         });
                     } else if (item?.type === "custom_tool_call") {
                         yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
-                    } else if (!suppressTextLifecycle) {
+                    } else if (item?.type !== "message" || !suppressTextLifecycle) {
                         yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
                     }
                 } else if (
@@ -234,7 +234,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                         }
                     } else if (item?.type === "custom_tool_call") {
                         yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
-                    } else if (!suppressTextLifecycle) {
+                    } else if (item?.type !== "message" || !suppressTextLifecycle) {
                         yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
                     }
                 } else if (type === "response.completed") {
