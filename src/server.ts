@@ -390,6 +390,7 @@ async function handle(
             opts.proxyMode = fresh.proxyMode;
             opts.proxySource = fresh.proxySource;
             opts.proxyFallback = fresh.proxyFallback;
+            opts.compress = fresh.compress;
             resetProxyCache();
             for (const k of Object.keys(opts.routes)) delete opts.routes[k];
             Object.assign(opts.routes, loadRoutes());
@@ -1489,14 +1490,16 @@ function deriveTitle(messages: CoreMessage[]): string | undefined {
 
 function handleConfigReload(opts: ProxyOptions, res: http.ServerResponse, log: (level: string, msg: string) => void): void {
     // Hot-reload routes from the config file into the running process — no
-    // restart needed. Only routes are re-read; port/host/upstream stay as-is
-    // (the listen socket is already bound). Mutates opts.routes in place so all
-    // in-flight handle() closures that captured `opts` see the new routes.
+    // restart needed. Routes and the global compress block are re-read;
+    // port/host/upstream stay as-is (the listen socket is already bound).
+    // Mutates opts.routes in place so all in-flight handle() closures that
+    // captured `opts` see the new routes.
     const fresh = loadRoutes();
     // Clear and refill the SAME object reference so resolveUpstream/resolveContextLimit
     // (which read opts.routes) pick up the new entries without needing reassignment.
     for (const k of Object.keys(opts.routes)) delete opts.routes[k];
     Object.assign(opts.routes, fresh);
+    opts.compress = loadOptions().compress;
     // Release cached ProxyAgents so agents for proxy URLs that were
     // removed/changed don't leak for the process lifetime. The next request
     // re-creates the needed agent lazily via proxyDispatcher().

@@ -460,6 +460,35 @@ export function parseUpstreamProxyMode(value: string | undefined): UpstreamProxy
     return value === "manual" || value === "auto" ? value : "direct";
 }
 
+export function parseCompressSettings(v: unknown): CompressSettings | undefined {
+    if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
+    const obj = v as Record<string, unknown>;
+    const out: CompressSettings = {};
+    const numberOrPercent = (value: unknown): value is number | string =>
+        typeof value === "number" && Number.isFinite(value)
+        || (typeof value === "string" && /^\d+(\.\d+)?%$/.test(value.trim()));
+    let ok = true;
+    const takeNumber = (key: keyof CompressSettings): void => {
+        if (!(key in obj)) return;
+        if (typeof obj[key] !== "number" || !Number.isFinite(obj[key] as number)) ok = false;
+        else (out as Record<string, unknown>)[key] = obj[key];
+    };
+    for (const key of ["modelContextLimit", "maxContextLimit", "emergencyThresholdPercent"] as const) {
+        if (!(key in obj)) continue;
+        if (!numberOrPercent(obj[key])) { ok = false; continue; }
+        (out as Record<string, unknown>)[key] = typeof obj[key] === "string" ? (obj[key] as string).trim() : obj[key];
+    }
+    for (const key of ["nudgeGrowthTokens", "preserveRecentMessages", "preserveRecentTokens", "minCompressRange"] as const) {
+        takeNumber(key);
+    }
+    if ("tiers" in obj) {
+        if (typeof obj.tiers !== "boolean") ok = false;
+        else out.tiers = obj.tiers;
+    }
+    if (!ok) return undefined;
+    return out;
+}
+
 function rejectLegacyRoute(key: string, value: unknown): void {
     if (typeof value !== "string") return;
     throw new Error(

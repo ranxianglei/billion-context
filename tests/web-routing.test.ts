@@ -11,6 +11,7 @@ import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { WEB_CLIENT } from "../src/web/client.ts";
+import { parseCompressSettings } from "../src/config.ts";
 
 function close(server: http.Server): Promise<void> {
     return new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
@@ -135,6 +136,107 @@ test("PUT /__bili/config with providers takes effect without a separate reload c
         assert.equal(put.status, 200);
         const after = await (await fetch(`${base}/__bili/config`)).json() as { providers: Record<string, unknown> };
         assert.deepEqual(after.providers, providers, "providers saved and visible after PUT without /reload");
+    } finally {
+        await close(proxy);
+        if (prevConfig === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = prevConfig;
+        rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test("parseCompressSettings accepts tuned fields and rejects malformed ones", () => {
+    assert.deepEqual(parseCompressSettings({
+        modelContextLimit: "70%",
+        maxContextLimit: 0.8,
+        emergencyThresholdPercent: "95%",
+        nudgeGrowthTokens: 4000,
+        preserveRecentMessages: 6,
+        preserveRecentTokens: 2000,
+        minCompressRange: 1000,
+        tiers: true,
+    }), {
+        modelContextLimit: "70%",
+        maxContextLimit: 0.8,
+        emergencyThresholdPercent: "95%",
+        nudgeGrowthTokens: 4000,
+        preserveRecentMessages: 6,
+        preserveRecentTokens: 2000,
+        minCompressRange: 1000,
+        tiers: true,
+    });
+    assert.equal(parseCompressSettings(null), undefined);
+    assert.equal(parseCompressSettings("x"), undefined);
+    assert.equal(parseCompressSettings({ nudgeGrowthTokens: "lots" }), undefined);
+    assert.equal(parseCompressSettings({ tiers: "yes" }), undefined);
+    assert.equal(parseCompressSettings({ modelContextLimit: "seventy percent" }), undefined);
+    assert.deepEqual(parseCompressSettings({}), {});
+});
+
+test("#154: PUT /__bili/config with compress hot-applies the global compress block", async () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    const root = path.join(tmpdir(), `bili-put-compress-${process.pid}-${Date.now()}`);
+    mkdirSync(root, { recursive: true });
+    const biliConfig = path.join(root, "billion-context.json");
+    writeFileSync(biliConfig, '{"providers":{}}\n', "utf8");
+    const prevConfig = process.env.BILI_CONFIG_FILE;
+    process.env.BILI_CONFIG_FILE = biliConfig;
+    const port = await freePort();
+    const opts: ProxyOptions = {
+        port,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1:1",
+        routes: {},
+        proxy: "",
+        proxyMode: "direct",
+        proxySource: "direct",
+        modelContextLimit: 400_000,
+        kernelConfig: defaultConfig(400_000),
+        compress: { injectTool: true, injectNudge: true },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        mitm: { enabled: false, domains: [] },
+    };
+    const proxy = await startServer(opts);
+    if (!proxy.listening) await once(proxy, "listening");
+    const base = `http://127.0.0.1:${port}`;
+    try {
+        const ui = await (await fetch(`${base}/__bili/`)).text();
+        assert.match(ui, /compress-json/);
+        assert.match(ui, /save-compress/);
+
+        const before = await (await fetch(`${base}/__bili/config`)).json() as { compress: unknown };
+        assert.equal(before.compress, null);
+
+        const bad = await fetch(`${base}/__bili/config`, {
+            method: "PUT",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ compress: { nudgeGrowthTokens: "fast" } }),
+        });
+        assert.equal(bad.status, 400);
+
+        const tuned = { modelContextLimit: 200_000, maxContextLimit: "75%", preserveRecentMessages: 4 };
+        const put = await fetch(`${base}/__bili/config`, {
+            method: "PUT",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ compress: tuned }),
+        });
+        assert.equal(put.status, 200);
+
+        const after = await (await fetch(`${base}/__bili/config`)).json() as { compress: typeof tuned };
+        assert.deepEqual(after.compress, tuned);
+
+        const cleared = await fetch(`${base}/__bili/config`, {
+            method: "PUT",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ compress: null }),
+        });
+        assert.equal(cleared.status, 200);
+        const final = await (await fetch(`${base}/__bili/config`)).json() as { compress: unknown };
+        assert.equal(final.compress, null);
     } finally {
         await close(proxy);
         if (prevConfig === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = prevConfig;
