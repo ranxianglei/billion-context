@@ -193,7 +193,7 @@ export function injectOpenaiSystem(messages: OpenAIMessage[], parts: string[]): 
 export function conversationSignalOpenai(body: OpenAIRequestBody, headerValue?: string): string {
     if (headerValue && headerValue.trim()) return headerValue.trim();
     const firstUser = body.messages.find((m) => m.role === "user");
-    const seed = firstUser ? stringContent(firstUser.content).slice(0, 200) : "default";
+    const seed = firstUser ? stringContent(firstUser.content) : "default";
     return hashId(seed);
 }
 

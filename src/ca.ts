@@ -14,6 +14,9 @@ let rootCert: forge.pki.Certificate | undefined;
 let rootKey: forge.pki.PrivateKey | undefined;
 
 const secureContextCache = new Map<string, tls.SecureContext>();
+// Cap guards memory if the discovered-domain set swells; keygen is also gated
+// to MITM-whitelisted hosts, so this stays small in practice. LRU via Map order.
+const SECURE_CONTEXT_CACHE_MAX = 64;
 
 /** Path to the PEM-encoded root CA certificate. Clients that support a proxy
  *  CA override (ZCode httpProxyCaCertPath → NODE_EXTRA_CA_CERTS) point at this
@@ -82,7 +85,11 @@ export function getSecureContext(host: string): tls.SecureContext {
         throw new Error("CA not initialized — call ensureRootCA() first");
     }
     const cached = secureContextCache.get(host);
-    if (cached) return cached;
+    if (cached) {
+        secureContextCache.delete(host);
+        secureContextCache.set(host, cached);
+        return cached;
+    }
 
     const keys = forge.pki.rsa.generateKeyPair({ bits: 2048 });
     const cert = forge.pki.createCertificate();
@@ -107,6 +114,10 @@ export function getSecureContext(host: string): tls.SecureContext {
         ca: rootCertPem,
     });
     secureContextCache.set(host, ctx);
+    if (secureContextCache.size > SECURE_CONTEXT_CACHE_MAX) {
+        const oldest = secureContextCache.keys().next().value;
+        if (oldest !== undefined) secureContextCache.delete(oldest);
+    }
     return ctx;
 }
 
