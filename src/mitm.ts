@@ -4,6 +4,7 @@ import tls from "node:tls";
 import { ensureRootCA, getSecureContext } from "./ca.js";
 import { connectThroughProxy } from "./upstream-proxy.js";
 import { discoverMitmDomains } from "./discover.js";
+import { isLoopbackAddress } from "./util.js";
 
 // Domains we transparently MITM. These are ONLY the model-inference endpoints
 // hardcoded in client BINARIES with no config file to discover from
@@ -17,16 +18,19 @@ export const DEFAULT_MITM_DOMAINS = [
     "chatgpt.com",
 ];
 
-/** Socket property that carry the real upstream origin to handle().
- *  handle()'s resolveUpstream reads this so a MITM request (path like
- *  `/api/anthropic/v1/messages`, no `/bili/` prefix) still resolves to the
+/** Socket marker: when we MITM a CONNECT tunnel, we stash the original
  *  host the CONNECT tunnel targeted. */
 export const MITM_UPSTREAM_KEY = "__biliMitmUpstream";
 
 /** Max ms to wait for a MITM client to finish the TLS handshake after we
  *  return CONNECT 200. Bounds slowloris-style resource hold (a client that
- *  opens the tunnel but never sends/trickle-feeds its ClientHello). */
-const MITM_HANDSHAKE_TIMEOUT_MS = 10_000;
+ *  opens the tunnel but never sends/trickle-feeds its ClientHello).
+ *  Env-overridable so tests can exercise the timeout path quickly. */
+const MITM_HANDSHAKE_TIMEOUT_MS_DEFAULT = 10_000;
+function mitmHandshakeTimeoutMs(): number {
+    const v = Number.parseInt(process.env.BILI_MITM_HANDSHAKE_TIMEOUT_MS ?? "", 10);
+    return Number.isFinite(v) && v > 0 ? v : MITM_HANDSHAKE_TIMEOUT_MS_DEFAULT;
+}
 
 /** True if `host` should be MITM-decrypted. Matches by exact hostname or a
  *  domain suffix (so `api.openai.com` and `chatgpt.com` both work, and
@@ -63,18 +67,13 @@ export function setupMitm(
 ): void {
     ensureRootCA();
     server.on("connect", (req: http.IncomingMessage, clientSocket: net.Socket, head: Buffer) => {
-        if (!isLoopback(clientSocket.remoteAddress)) {
+        if (!isLoopbackAddress(clientSocket.remoteAddress)) {
             log(`CONNECT ${req.url} rejected: non-loopback client ${clientSocket.remoteAddress}`);
-            clientSocket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
-            clientSocket.destroy();
+            // end() (not write+destroy) so the 403 bytes are flushed before close.
+            clientSocket.end("HTTP/1.1 403 Forbidden\r\n\r\n");
             return;
         }
         const { hostname, port } = parseHostPort(req.url ?? "");
-        if (!hostname) {
-            clientSocket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
-            clientSocket.end();
-            return;
-        }
         const targetPort = port || 443;
         if (!isMitmHost(hostname, extraDomains)) {
             const proxyUrl = resolveProxyUrl?.(hostname);
@@ -85,9 +84,6 @@ export function setupMitm(
     });
 }
 
-function isLoopback(addr: string | undefined): boolean {
-    return !!addr && (addr === "127.0.0.1" || addr === "::1" || addr === "::ffff:127.0.0.1" || addr.startsWith("127."));
-}
 
 function parseHostPort(s: string): { hostname: string; port: number } {
     // req.url in a CONNECT is "host:port".
@@ -205,7 +201,7 @@ function doMitm(
         log(`mitm ${host}:${port} TLS handshake timeout`);
         tlsSocket.destroy();
         clientSocket.destroy();
-    }, MITM_HANDSHAKE_TIMEOUT_MS);
+    }, mitmHandshakeTimeoutMs());
     tlsSocket.once("secure", () => clearTimeout(handshakeTimer));
     tlsSocket.once("close", () => clearTimeout(handshakeTimer));
     tlsSocket.once("error", () => clearTimeout(handshakeTimer));

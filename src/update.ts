@@ -35,6 +35,18 @@ const THROTTLE_FILE = path.join(cacheDir(), ".update-check");
 const LOCK_FILE = path.join(cacheDir(), ".update-lock");
 const SEMVER_RE = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z-.]+)?$/;
 
+/** Age after which a lock is stealable even if kill(pid,0) says the holder is
+ *  "alive": a real install never takes this long, and a crashed holder whose
+ *  pid was reused by an unrelated process looks alive forever. Without this
+ *  cap, one such residue permanently blocks all future auto-updates. (#117) */
+const LOCK_MAX_AGE_MS = 30 * 60 * 1000;
+
+/** Pure steal decision for the update lock — exported for tests.
+ *  Dead holders are always stealable; live holders only past LOCK_MAX_AGE_MS. */
+export function shouldStealLock(holderAlive: boolean, ageMs: number): boolean {
+    return !holderAlive || ageMs >= LOCK_MAX_AGE_MS;
+}
+
 let timer: ReturnType<typeof setInterval> | undefined;
 let inFlight = false;
 let firstCheckDone = false;
@@ -140,19 +152,21 @@ async function tryAcquireLock(): Promise<{ release: () => Promise<void> } | null
     const existing = await readLock();
     if (existing) {
         const holderAlive = isAlive(existing.pid);
-        if (holderAlive) {
-            // Never steal from a live holder: a slow install can run long, and
-            // stealing its lock would let two processes write the install dir
-            // concurrently → corruption. Only steal from a dead holder. (#117)
+        if (!shouldStealLock(holderAlive, now - existing.ts)) {
+            // Never steal from a live, recent holder: a slow install can run
+            // long, and stealing its lock would let two processes write the
+            // install dir concurrently → corruption. (#117)
             loggerLog("info", `[update] lock held by live pid=${existing.pid} (age=${Math.round((now - existing.ts) / 1000)}s), skipping update`);
             return null;
         }
-        // Holder is dead (crashed) — steal the lock. MUST delete the stale lock
-        // file first: writeFile({flag:"wx"}) below requires the path to NOT
-        // exist, and the stale file is still there. Without this unlink the wx
-        // write always fails → update returns null forever → a single crash
-        // during update permanently blocks all future auto-updates.
-        loggerLog("info", `[update] stealing lock from dead pid=${existing.pid} (age=${Math.round((now - existing.ts) / 1000)}s)`);
+        // Holder is dead, or alive-but-fossilized (crashed and its pid got
+        // reused by an unrelated process — kill(pid,0) can't tell the
+        // difference — or wedged for hours) — steal the lock. MUST delete the
+        // stale lock file first: writeFile({flag:"wx"}) below requires the path
+        // to NOT exist, and the stale file is still there. Without this unlink
+        // the wx write always fails → update returns null forever → a single
+        // crash during update permanently blocks all future auto-updates.
+        loggerLog("info", `[update] stealing lock from pid=${existing.pid} (alive=${holderAlive}, age=${Math.round((now - existing.ts) / 1000)}s)`);
         try {
             await unlink(LOCK_FILE);
         } catch (e) {
@@ -288,21 +302,23 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
     }
 }
 
-/**
- * Download the npm tarball, extract to a temp staging dir, verify, then copy
- * over the install directory.
- */
 /** Verify a downloaded tarball against the npm registry's integrity field
  *  (sha512-<base64>) or legacy shasum (hex sha1). Refuses to install if the
  *  registry provided neither — npm always returns both, so their absence
- *  signals a tampered or non-standard response. */
-function verifyTarballIntegrity(buf: Buffer, integrity?: string, shasum?: string): { ok: boolean; error?: string } {
+ *  signals a tampered or non-standard response. Unknown hash algorithms fail
+ *  closed rather than throwing. Exported for tests. */
+export function verifyTarballIntegrity(buf: Buffer, integrity?: string, shasum?: string): { ok: boolean; error?: string } {
     if (integrity) {
         const dash = integrity.indexOf("-");
-        if (dash <= 0) return { ok: false, error: `malformed integrity field` };
+        if (dash <= 0) return { ok: false, error: "malformed integrity field" };
         const alg = integrity.slice(0, dash);
         const expected = integrity.slice(dash + 1);
-        const actual = crypto.createHash(alg).update(buf).digest("base64");
+        let actual: string;
+        try {
+            actual = crypto.createHash(alg).update(buf).digest("base64");
+        } catch {
+            return { ok: false, error: `unsupported integrity algorithm: ${alg}` };
+        }
         if (actual !== expected) return { ok: false, error: `${alg} mismatch` };
         return { ok: true };
     }
@@ -313,6 +329,9 @@ function verifyTarballIntegrity(buf: Buffer, integrity?: string, shasum?: string
     }
     return { ok: false, error: "no integrity or shasum from registry" };
 }
+
+/** Download the npm tarball, extract to a temp staging dir, verify, then copy
+ *  over the install directory. */
 
 async function installViaTarball(
     version: string,
