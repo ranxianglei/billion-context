@@ -381,7 +381,10 @@ test("resolveClientCommand: pi falls back to node + cli.js when not on PATH and 
     const r = resolveClientCommand("pi", { PATH: "/nonexistent-dir-zzz" });
     assert.equal(r.command, process.execPath);
     assert.equal(r.prefixArgs.length, 1);
-    assert.ok(r.prefixArgs[0].endsWith("pi-coding-agent/dist/cli.js"));
+    assert.ok(
+        r.prefixArgs[0].split(path.sep).join("/").endsWith("pi-coding-agent/dist/cli.js"),
+        `prefixArgs[0]=${r.prefixArgs[0]}`,
+    );
 });
 
 test("resolvePiHome: PI_CODING_AGENT_DIR > PI_HOME > default ~/.pi/agent", () => {

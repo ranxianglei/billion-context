@@ -176,13 +176,15 @@ test("discoverMitmDomains: two calls within TTL return the same array (cache hit
 
 test("discoverMitmDomains: mtime change + TTL expiry triggers re-scan", async () => {
     await withTempHome(async (home, env) => {
+        const cfgPath = path.join(home, ".zcode", "v2", "config.json");
         writeZcodeConfig(home, ["https://v1.example.com"]);
+        const baseMtime = Math.floor(fs.statSync(cfgPath).mtimeMs / 1000);
         _resetDiscoveryCacheForTest();
         const first = discoverMitmDomains(env);
         assert.ok(first.includes("v1.example.com"));
 
         writeZcodeConfig(home, ["https://v2.example.com"]);
-
+        fs.utimesSync(cfgPath, baseMtime + 60, baseMtime + 60);
         const withinTtl = discoverMitmDomains(env);
         assert.strictEqual(withinTtl, first, "within TTL: still cached");
 
