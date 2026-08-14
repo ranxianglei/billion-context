@@ -37,13 +37,45 @@ test("emitStreamError: anthropic emits content_block_delta + message_stop", asyn
     assert.match(out, /message_stop/);
 });
 
-test("emitStreamError: responses emits output_text.delta + response.completed", async () => {
+test("emitStreamError: responses emits a full item lifecycle (added → delta → done → completed)", async () => {
     const { res, chunks } = makeCollector();
     emitStreamError(res, "responses", "kaboom");
     const out = Buffer.concat(chunks).toString("utf8");
-    assert.match(out, /response\.output_text\.delta/);
+    // Ordered: every delta must be preceded by output_item.added and followed
+    // by the done events — a bare delta crashes strict clients (#62).
+    const order = [
+        "response.output_item.added",
+        "response.content_part.added",
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.content_part.done",
+        "response.output_item.done",
+        "response.completed",
+    ];
+    let cursor = -1;
+    for (const ev of order) {
+        const at = out.indexOf(ev);
+        assert.notEqual(at, -1, `missing event ${ev}`);
+        assert.ok(at > cursor, `${ev} out of order`);
+        cursor = at;
+    }
     assert.match(out, /kaboom/);
-    assert.match(out, /response\.completed/);
+    // Every item-scoped event carries the same item_id and output_index, so
+    // strict clients can associate the delta with the added item.
+    const itemId = "msg_acp_error";
+    const itemEvents = out.split("\n\n").filter((block) => block.includes("item_id"));
+    assert.ok(itemEvents.length >= 4, "expected item-scoped events");
+    for (const block of itemEvents) {
+        assert.match(block, new RegExp(`"item_id":"${itemId}"`));
+        assert.match(block, /"output_index":0/);
+    }
+    // The completed response contains the error item in its output array.
+    const completed = out.split("\n\n").find((b) => b.includes("response.completed"));
+    assert.ok(completed);
+    const data = JSON.parse((completed?.split("data: ")[1] ?? "").trim());
+    assert.equal(data.response.output.length, 1);
+    assert.equal(data.response.output[0].id, itemId);
+    assert.ok(data.response.output[0].content[0].text.includes("kaboom"));
 });
 
 test("emitStreamError: never throws even if write throws (client gone)", () => {

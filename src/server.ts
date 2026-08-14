@@ -52,6 +52,7 @@ import { emitStreamError } from "./stream-error.js";
 import { deriveSessionId as deriveProxySessionId, affinityToken, clientConversationHeader, type ConversationIdentity } from "./session-id.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "./bili-message.js";
+import { isLoopbackAddress } from "./util.js";
 
 import { decodeRequestBody } from "./content-encoding.js";
 
@@ -290,18 +291,14 @@ type Prepared = {
     nudge?: NudgeDecision;
 };
 
-/** True if `addr` is a loopback (IPv4 127.x or IPv6 ::1 / ::ffff:127.0.0.1).
- *  Used to gate the management endpoints to local connections only. */
-function isLoopback(addr: string | undefined): boolean {
-    if (!addr) return false;
-    return addr === "::1" || addr === "127.0.0.1" || addr.startsWith("127.") || addr.startsWith("::ffff:127.");
-}
 
 function isTrustedAdminOrigin(origin: string | undefined, host: string | undefined, trustedHosts: Set<string>): boolean {
-    if (!origin) return true;
-    if (!host) return false;
-    const lcHost = host.toLowerCase();
-    if (!trustedHosts.has(lcHost)) return false;
+    // Host must be one of OUR listen identities regardless of whether an
+    // Origin header is present. A same-origin browser GET/fetch (the DNS
+    // rebinding read path: evil.com → 127.0.0.1) often carries NO Origin
+    // header, so gating on Origin alone would leave config reads exposed.
+    if (!host || !trustedHosts.has(host.toLowerCase())) return false;
+    if (!origin) return true; // non-browser client (curl, CLI UI) on a trusted Host
     try {
         const parsed = new URL(origin);
         if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
@@ -345,12 +342,15 @@ async function handle(
     // in that case we still must NOT expose management to the LAN. Only the
     // proxy /bili/ and CONNECT (model traffic) endpoints remain open to all.
     const isAdminPath = req.url === "/__bili/" || req.url?.startsWith("/__bili/") || req.url === "/__acp/" || req.url?.startsWith("/__acp/");
-    if (isAdminPath && !isLoopback(req.socket.remoteAddress)) {
+    if (isAdminPath && !isLoopbackAddress(req.socket.remoteAddress)) {
         res.writeHead(403, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: "management endpoints are loopback-only; access denied for " + (req.socket.remoteAddress ?? "unknown") }));
         return;
     }
-    if (isAdminPath && !isTrustedAdminOrigin(req.headers.origin, req.headers.host, adminTrustedHosts(opts.host, opts.port))) {
+    // localPort, not opts.port: when listening on port 0 (dynamic assignment,
+    // programmatic embedding, tests) the real port differs from opts.port and
+    // pinning to the configured value would 403 every admin request.
+    if (isAdminPath && !isTrustedAdminOrigin(req.headers.origin, req.headers.host, adminTrustedHosts(opts.host, req.socket.localPort ?? opts.port))) {
         res.writeHead(403, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: "management request origin does not match the local bili UI" }));
         return;

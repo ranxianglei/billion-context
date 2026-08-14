@@ -30,3 +30,12 @@ export function safeJsonParse(s: string): unknown {
         return {};
     }
 }
+
+/** True if a socket remote address is loopback. Covers the IPv4 127.0.0.0/8
+ *  block and IPv6 ::1, including the IPv4-mapped ::ffff:127.x.x.x form Node
+ *  reports for dual-stack sockets. Shared by the admin-endpoint gate
+ *  (server.ts) and the MITM CONNECT gate (mitm.ts) — keep one definition so
+ *  the two security checks cannot drift apart. */
+export function isLoopbackAddress(addr: string | undefined): boolean {
+    return !!addr && (addr.startsWith("127.") || addr === "::1" || addr.startsWith("::ffff:127."));
+}
