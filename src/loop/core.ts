@@ -43,7 +43,7 @@ export interface RequestOptions {
 export type ParsedStreamEvent =
     | { kind: "text"; delta: string; raw?: Buffer }
     | { kind: "reasoning"; delta: string; raw?: Buffer }
-    | { kind: "tool_call"; name: string; callId: string; arguments: string }
+    | { kind: "tool_call"; name: string; callId: string; arguments: string; passthrough?: boolean }
     | { kind: "usage"; inputTokens?: number; outputTokens?: number; cachedTokens?: number }
     | { kind: "done"; finishReason?: string }
     | { kind: "meta"; chunk: Buffer; firstRoundOnly?: boolean };
@@ -57,6 +57,7 @@ export interface ToolCallEmit {
     name: string;
     callId: string;
     arguments: string;
+    passthrough?: boolean;
 }
 
 export interface ExtractedTextTriggers {
@@ -203,7 +204,7 @@ export async function* runCompressLoop(
                             }
                         }
                     } else if (ev.kind === "tool_call") {
-                    calls.push({ name: ev.name, callId: ev.callId, arguments: ev.arguments });
+                    calls.push({ name: ev.name, callId: ev.callId, arguments: ev.arguments, passthrough: ev.passthrough });
                 } else if (ev.kind === "usage") {
                     usage = {
                         inputTokens: ev.inputTokens,
@@ -337,6 +338,7 @@ export async function* runCompressLoop(
             }
 
             for (const tc of realToolCalls) {
+                if (tc.passthrough) continue;
                 yield adapter.emitToolCall(tc);
             }
 

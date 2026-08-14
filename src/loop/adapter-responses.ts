@@ -1,7 +1,7 @@
 import type { CoreMessage } from "acp-kernel";
 import { coreToResponses, injectResponsesDeveloperMessage, patchResponsesInput, type ResponseInputItem, type ResponsesProjection } from "../responses.js";
 import { buildVisibilityMarker } from "../compress-loop.js";
-import { ACP_TEXT_OPEN, ACP_TEXT_CLOSE, ACP_STATUS_OPEN, ACP_STATUS_CLOSE, ACP_SEARCH_OPEN, ACP_SEARCH_CLOSE, ACP_DECOMPRESS_OPEN, ACP_DECOMPRESS_CLOSE, COMPRESS_TOOL_NAME } from "../compress-tool.js";
+import { ACP_TEXT_OPEN, ACP_TEXT_CLOSE, ACP_STATUS_OPEN, ACP_STATUS_CLOSE, ACP_SEARCH_OPEN, ACP_SEARCH_CLOSE, ACP_DECOMPRESS_OPEN, ACP_DECOMPRESS_CLOSE, COMPRESS_TOOL_NAME, PROXY_TOOL_NAMES } from "../compress-tool.js";
 import type { BiliMessage } from "../bili-message.js";
 import type {
     CompressLoopAdapter,
@@ -182,13 +182,18 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                 } else if (type === "response.output_item.added") {
                     const item = obj.item as Record<string, unknown> | undefined;
                     if (item?.type === "function_call") {
-                        const itemId = typeof item.id === "string" ? item.id : "";
-                        pending.set(itemId, {
-                            itemId,
-                            callId: typeof item.call_id === "string" ? item.call_id : "",
-                            name: typeof item.name === "string" ? item.name : "",
-                            arguments: "",
-                        });
+                        const fcName = typeof item.name === "string" ? item.name : "";
+                        if (PROXY_TOOL_NAMES.has(fcName)) {
+                            const itemId = typeof item.id === "string" ? item.id : "";
+                            pending.set(itemId, {
+                                itemId,
+                                callId: typeof item.call_id === "string" ? item.call_id : "",
+                                name: fcName,
+                                arguments: "",
+                            });
+                        } else {
+                            yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
+                        }
                     } else if (item?.type === "custom_tool_call") {
                         yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
                     } else if (item?.type !== "message" || !suppressTextLifecycle) {
@@ -212,11 +217,13 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                     const delta = typeof obj.delta === "string" ? obj.delta : "";
                     const fc = pending.get(itemId);
                     if (fc) fc.arguments += delta;
+                    else yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
                 } else if (type === "response.function_call_arguments.done") {
                     const itemId = typeof obj.item_id === "string" ? obj.item_id : "";
                     const args = typeof obj.arguments === "string" ? obj.arguments : "";
                     const fc = pending.get(itemId);
                     if (fc && args) fc.arguments = args;
+                    else yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
                 } else if (type === "response.output_item.done") {
                     const item = obj.item as Record<string, unknown> | undefined;
                     if (item?.type === "function_call") {
@@ -230,6 +237,15 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                                 name: fc.name,
                                 callId: fc.callId,
                                 arguments: fc.arguments,
+                            } as ParsedStreamEvent;
+                        } else {
+                            yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
+                            yield {
+                                kind: "tool_call",
+                                name: typeof item.name === "string" ? item.name : "",
+                                callId: typeof item.call_id === "string" ? item.call_id : "",
+                                arguments: typeof item.arguments === "string" ? item.arguments : "",
+                                passthrough: true,
                             } as ParsedStreamEvent;
                         }
                     } else if (item?.type === "custom_tool_call") {
