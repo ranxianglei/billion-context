@@ -22,6 +22,7 @@
  */
 import { readFile, writeFile, mkdir, access, constants, rm, cp, unlink } from "node:fs/promises";
 import { execFile } from "node:child_process";
+import crypto from "node:crypto";
 import * as tar from "tar";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -33,9 +34,6 @@ const CHECK_INTERVAL_MS = 3 * 60 * 1000;
 const THROTTLE_FILE = path.join(cacheDir(), ".update-check");
 const LOCK_FILE = path.join(cacheDir(), ".update-lock");
 const SEMVER_RE = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z-.]+)?$/;
-/** Lock staleness threshold: if a lock file is older than this, it's considered
- *  abandoned (crashed process) and can be stolen. */
-const LOCK_STALE_MS = 2 * 60 * 1000;
 
 let timer: ReturnType<typeof setInterval> | undefined;
 let inFlight = false;
@@ -141,18 +139,20 @@ async function tryAcquireLock(): Promise<{ release: () => Promise<void> } | null
 
     const existing = await readLock();
     if (existing) {
-        const age = now - existing.ts;
         const holderAlive = isAlive(existing.pid);
-        if (holderAlive && age < LOCK_STALE_MS) {
-            // Another process is actively updating — back off.
+        if (holderAlive) {
+            // Never steal from a live holder: a slow install can run long, and
+            // stealing its lock would let two processes write the install dir
+            // concurrently → corruption. Only steal from a dead holder. (#117)
+            loggerLog("info", `[update] lock held by live pid=${existing.pid} (age=${Math.round((now - existing.ts) / 1000)}s), skipping update`);
             return null;
         }
-        // Lock is stale (holder dead or timeout) — steal it. MUST delete the
-        // stale lock file first: writeFile({flag:"wx"}) below requires the path
-        // to NOT exist, and the stale file is still there. Without this unlink
-        // the wx write always fails → update returns null forever → a single
-        // crash during update permanently blocks all future auto-updates.
-        loggerLog("info", `[update] stealing stale lock (pid=${existing.pid}, age=${Math.round(age / 1000)}s, alive=${holderAlive})`);
+        // Holder is dead (crashed) — steal the lock. MUST delete the stale lock
+        // file first: writeFile({flag:"wx"}) below requires the path to NOT
+        // exist, and the stale file is still there. Without this unlink the wx
+        // write always fails → update returns null forever → a single crash
+        // during update permanently blocks all future auto-updates.
+        loggerLog("info", `[update] stealing lock from dead pid=${existing.pid} (age=${Math.round((now - existing.ts) / 1000)}s)`);
         try {
             await unlink(LOCK_FILE);
         } catch (e) {
@@ -236,7 +236,7 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         }
         const data = (await res.json()) as {
             version?: string;
-            dist?: { tarball?: string };
+            dist?: { tarball?: string; integrity?: string; shasum?: string };
         };
         const latest = data.version;
         if (!latest) {
@@ -256,6 +256,8 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         }
 
         const tarballUrl = data.dist?.tarball;
+        const integrity = data.dist?.integrity;
+        const shasum = data.dist?.shasum;
         if (!tarballUrl) {
             loggerLog("warn", `[update] registry response for ${latest} had no tarball URL`);
             return;
@@ -270,7 +272,7 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
             return;
         }
         try {
-            const result = await installViaTarball(latest, tarballUrl, installDir);
+            const result = await installViaTarball(latest, tarballUrl, installDir, integrity, shasum);
             if (result.ok) {
                 loggerLog("info", `[update] installed ${currentVersion} \u2192 ${latest}. Restart to finish.`);
             } else {
@@ -290,10 +292,34 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
  * Download the npm tarball, extract to a temp staging dir, verify, then copy
  * over the install directory.
  */
+/** Verify a downloaded tarball against the npm registry's integrity field
+ *  (sha512-<base64>) or legacy shasum (hex sha1). Refuses to install if the
+ *  registry provided neither — npm always returns both, so their absence
+ *  signals a tampered or non-standard response. */
+function verifyTarballIntegrity(buf: Buffer, integrity?: string, shasum?: string): { ok: boolean; error?: string } {
+    if (integrity) {
+        const dash = integrity.indexOf("-");
+        if (dash <= 0) return { ok: false, error: `malformed integrity field` };
+        const alg = integrity.slice(0, dash);
+        const expected = integrity.slice(dash + 1);
+        const actual = crypto.createHash(alg).update(buf).digest("base64");
+        if (actual !== expected) return { ok: false, error: `${alg} mismatch` };
+        return { ok: true };
+    }
+    if (shasum) {
+        const actual = crypto.createHash("sha1").update(buf).digest("hex");
+        if (actual !== shasum) return { ok: false, error: "sha1 shasum mismatch" };
+        return { ok: true };
+    }
+    return { ok: false, error: "no integrity or shasum from registry" };
+}
+
 async function installViaTarball(
     version: string,
     tarballUrl: string,
     installDir: string | undefined,
+    integrity?: string,
+    shasum?: string,
 ): Promise<{ ok: boolean; error?: string }> {
     if (!installDir) {
         return { ok: false, error: "cannot determine install directory (package.json not found walking up from running binary)" };
@@ -337,6 +363,11 @@ async function installViaTarball(
         tgzBuffer = Buffer.concat(chunks);
     } catch (e) {
         return { ok: false, error: `tarball download failed: ${String(e)}` };
+    }
+
+    const v = verifyTarballIntegrity(tgzBuffer, integrity, shasum);
+    if (!v.ok) {
+        return { ok: false, error: `tarball integrity verification failed: ${v.error}` };
     }
 
     // Write to temp file

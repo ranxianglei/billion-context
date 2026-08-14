@@ -94,7 +94,7 @@ let MAX_SESSIONS = Math.max(1, Number.parseInt(process.env.BILI_MAX_SESSIONS ?? 
 let initialized = false;
 
 /** Bulk-load persisted sessions from disk into the in-memory map. Called once
- *  at server startup before listening. Caps at MAX_SESSIONS by savedAt
+ *  at server startup before listening. Caps at MAX_SESSIONS by createdAt
  *  (keeps the most recent) so a huge backlog cannot OOM on boot. Idempotent. */
 export async function initSessions(): Promise<void> {
     if (initialized) return;
