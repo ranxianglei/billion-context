@@ -6,7 +6,21 @@ import { caDir } from "./paths.js";
 
 const ROOT_CERT_FILE = "root-ca.pem";
 const ROOT_KEY_FILE = "root-ca-key.pem";
+const COMBINED_CA_FILE = "combined-ca.pem";
 const ROOT_CN = "billion-context MITM Root CA";
+
+/** First readable candidate wins per platform; Node's Mozilla root set is
+ *  always merged in so the combined bundle also works on Windows. */
+const PLATFORM_CA_CANDIDATES: readonly string[] =
+    process.platform === "darwin"
+        ? ["/etc/ssl/cert.pem", "/private/etc/ssl/cert.pem"]
+        : [
+              "/etc/ssl/certs/ca-certificates.crt",
+              "/etc/pki/tls/certs/ca-bundle.crt",
+              "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+              "/etc/ssl/ca-bundle.pem",
+              "/etc/ssl/cert.pem",
+          ];
 
 let rootCertPem: string | undefined;
 let rootKeyPem: string | undefined;
@@ -23,6 +37,46 @@ const SECURE_CONTEXT_CACHE_MAX = 64;
  *  file so they trust the dynamically-signed host certs. */
 export function rootCaPath(): string {
     return path.join(caDir(), ROOT_CERT_FILE);
+}
+
+/** Path to the combined CA bundle: system/public roots + the MITM root CA.
+ *  Integrations that REPLACE the default CA bundle via env vars
+ *  (SSL_CERT_FILE / REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE / GIT_SSL_CAINFO —
+ *  replace semantics, unlike the appending NODE_EXTRA_CA_CERTS) must point at
+ *  THIS file, not root-ca.pem: non-MITM hosts are blind-tunnelled and present
+ *  their real certificate chains, which only validate against public roots. */
+export function combinedCaPath(): string {
+    return path.join(caDir(), COMBINED_CA_FILE);
+}
+
+export function collectSystemCaPems(env: NodeJS.ProcessEnv = process.env): string[] {
+    const pems: string[] = [];
+    const seen = new Set<string>();
+    const pushFile = (file: string): boolean => {
+        try {
+            const text = fs.readFileSync(file, "utf8");
+            if (!text.includes("BEGIN CERTIFICATE") || seen.has(text)) return false;
+            seen.add(text);
+            pems.push(text);
+            return true;
+        } catch { }
+        return false;
+    };
+    const userBundle = env.SSL_CERT_FILE?.trim();
+    if (userBundle && pushFile(userBundle)) return pems;
+    for (const candidate of PLATFORM_CA_CANDIDATES) {
+        if (pushFile(candidate)) break;
+    }
+    return pems;
+}
+
+function writeCombinedBundle(): void {
+    const certs = new Set<string>();
+    for (const pem of collectSystemCaPems()) certs.add(pem.trim());
+    for (const pem of tls.rootCertificates) certs.add(pem.trim());
+    certs.add(rootCertPem!.trim());
+    const body = [...certs].map((pem) => (pem.endsWith("\n") ? pem : pem + "\n")).join("");
+    fs.writeFileSync(path.join(caDir(), COMBINED_CA_FILE), body, { mode: 0o644 });
 }
 
 function generateRootCA(): { cert: string; key: string } {
@@ -55,7 +109,10 @@ function generateRootCA(): { cert: string; key: string } {
  *  Idempotent: once written, subsequent processes reuse the same CA so already
  *  installed trust keeps working across restarts. */
 export function ensureRootCA(): void {
-    if (rootCertPem && rootKeyPem) return;
+    if (rootCertPem && rootKeyPem) {
+        writeCombinedBundle();
+        return;
+    }
     const dir = caDir();
     fs.mkdirSync(dir, { recursive: true });
     const certPath = path.join(dir, ROOT_CERT_FILE);
@@ -65,6 +122,7 @@ export function ensureRootCA(): void {
         rootKeyPem = fs.readFileSync(keyPath, "utf8");
         rootCert = forge.pki.certificateFromPem(rootCertPem);
         rootKey = forge.pki.privateKeyFromPem(rootKeyPem);
+        writeCombinedBundle();
         return;
     }
     const { cert, key } = generateRootCA();
@@ -74,6 +132,7 @@ export function ensureRootCA(): void {
     rootKeyPem = key;
     rootCert = forge.pki.certificateFromPem(cert);
     rootKey = forge.pki.privateKeyFromPem(key);
+    writeCombinedBundle();
 }
 
 /** Return a tls.SecureContext that presents a certificate for `host`, signed
