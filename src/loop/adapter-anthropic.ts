@@ -190,6 +190,21 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                     } else if (delta.type === "text_delta" && typeof delta.text === "string") {
                         const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
                         yield { kind: "text", delta: delta.text, raw: remapIndexInEvent(eventStr, ci) } as ParsedStreamEvent;
+                    } else if (delta.type === "thinking_delta" && typeof delta.thinking === "string" && delta.thinking.length > 0) {
+                        const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
+                        yield {
+                            kind: "reasoning",
+                            delta: delta.thinking,
+                            ...(round === 1 ? { raw: remapIndexInEvent(eventStr, ci) } : {}),
+                        } as ParsedStreamEvent;
+                    } else if (delta.type === "signature_delta" && typeof delta.signature === "string") {
+                        const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
+                        yield {
+                            kind: "reasoning",
+                            delta: "",
+                            signature: delta.signature,
+                            ...(round === 1 ? { raw: remapIndexInEvent(eventStr, ci) } : {}),
+                        } as ParsedStreamEvent;
                     } else if (round === 1) {
                         const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
                         yield { kind: "meta", chunk: remapIndexInEvent(eventStr, ci), firstRoundOnly: true } as ParsedStreamEvent;
