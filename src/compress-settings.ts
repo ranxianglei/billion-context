@@ -115,3 +115,26 @@ function parsePercent(v: number | string): number {
     if (s.endsWith("%")) return Number(s.slice(0, -1)) / 100;
     return Number(s);
 }
+
+/** Resolve the per-request kernel Config for one proxied request: the pure
+ *  (non-async) half of the server.ts:485-502 pipeline. Given the route graph,
+ *  the matched upstream URL, the request model, and the already-resolved native
+ *  context window (the caller handles the async registry lookup), this merges
+ *  global → provider → model compress settings and applies them onto `base`,
+ *  returning the tuned Config (or `base` unchanged when nothing is configured
+ *  and the limit is unchanged). This is the exact function the proxy calls for
+ *  every request, extracted so the three-level cascade is testable end-to-end
+ *  without spinning up the HTTP server. */
+export function resolveRequestConfig(
+    base: Config,
+    routes: ProviderRoutes,
+    embeddedUrl: string | undefined,
+    model: string,
+    native: number | undefined,
+    globalCompress?: CompressSettings,
+): Config {
+    const compress = resolveCompress(routes, embeddedUrl, model, globalCompress);
+    const limit = resolveContextLimitValue(compress.modelContextLimit, native ?? base.modelContextLimit);
+    if (!hasCompressSettings(compress) && limit === base.modelContextLimit) return base;
+    return applyCompressSettings(base, limit, compress);
+}
