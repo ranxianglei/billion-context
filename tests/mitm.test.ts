@@ -4,7 +4,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import tls from "node:tls";
-import { isMitmHost, readMitmUpstream, MITM_UPSTREAM_KEY } from "../src/mitm.js";
+import net from "node:net";
+import { once } from "node:events";
+import http from "node:http";
+import { isMitmHost, readMitmUpstream, MITM_UPSTREAM_KEY, setupMitm } from "../src/mitm.js";
 import { ensureRootCA, rootCaPath, getSecureContext, _resetForTest } from "../src/ca.js";
 import { _resetDiscoveryCacheForTest } from "../src/discover.js";
 
@@ -40,15 +43,19 @@ test.after(() => {
 // Isolate the CA directory to a per-test tmp dir so we never touch the real
 // ~/.local/share/billion-context/ca. caDir() = dataDir()/ca =
 // XDG_DATA_HOME/billion-context/ca.
-function withTmpCa<T>(fn: () => Promise<T> | T): Promise<T> | T {
+async function withTmpCa<T>(fn: () => Promise<T> | T): Promise<T> {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-mitm-"));
     const prev = process.env.XDG_DATA_HOME;
     process.env.XDG_DATA_HOME = tmp;
     _resetForTest();
     try {
-        return fn();
+        // MUST await: a bare `return fn()` lets the finally below run as soon
+        // as an async fn suspends — restoring XDG_DATA_HOME and wiping the CA
+        // state while the test body is still running.
+        return await fn();
     } finally {
-        process.env.XDG_DATA_HOME = prev;
+        if (prev === undefined) delete process.env.XDG_DATA_HOME;
+        else process.env.XDG_DATA_HOME = prev;
         _resetForTest();
         try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* best-effort */ }
     }
@@ -152,4 +159,113 @@ test("readMitmUpstream: returns undefined when no marker (direct /bili/ request)
     const fakeSocket = {} as unknown as import("node:net").Socket;
     assert.equal(readMitmUpstream(fakeSocket), undefined);
     assert.equal(readMitmUpstream(undefined), undefined);
+});
+
+// ---------------------------------------------------------------------------
+// e2e CONNECT tests (#77 gate, #118 handshake timeout, happy path)
+// ---------------------------------------------------------------------------
+
+/** Send a raw CONNECT and resolve once the status line is received. */
+function rawConnect(port: number, host: string, connectTo: string): Promise<{ statusLine: string; socket: net.Socket }> {
+    const { promise, resolve, reject } = Promise.withResolvers<{ statusLine: string; socket: net.Socket }>();
+    const socket = net.connect(port, host, () => {
+        socket.write(`CONNECT ${connectTo} HTTP/1.1\r\nHost: ${connectTo}\r\n\r\n`);
+    });
+    let buf = "";
+    const onData = (chunk: Buffer): void => {
+        buf += chunk.toString("utf8");
+        if (buf.includes("\r\n\r\n")) {
+            socket.off("data", onData);
+            resolve({ statusLine: buf.slice(0, buf.indexOf("\r\n")), socket });
+        }
+    };
+    socket.on("data", onData);
+    socket.once("error", reject);
+    return promise;
+}
+
+await test("setupMitm e2e: CONNECT → TLS handshake → decrypted request reaches http server", async () => {
+    await withTmpCa(async () => {
+        let sawMarker: string | undefined;
+        const server = http.createServer((req, res) => {
+            sawMarker = readMitmUpstream(req.socket as unknown as tls.TLSSocket);
+            res.writeHead(200, { "content-type": "text/plain" });
+            res.end("mitm-ok");
+        });
+        setupMitm(server, [], (msg) => { /* silent */ });
+        server.listen(0, "127.0.0.1");
+        await once(server, "listening");
+        const port = (server.address() as { port: number }).port;
+        try {
+            const { statusLine, socket } = await rawConnect(port, "127.0.0.1", "api.anthropic.com:443");
+            assert.match(statusLine, /^HTTP\/1\.1 200/);
+            const tlsSock = tls.connect({ socket, rejectUnauthorized: false, servername: "api.anthropic.com" });
+            const { promise: bodyPromise, resolve: resolveBody, reject: rejectBody } = Promise.withResolvers<string>();
+            let out = "";
+            tlsSock.on("secureConnect", () => {
+                tlsSock.write("GET /probe HTTP/1.1\r\nHost: api.anthropic.com\r\nConnection: close\r\n\r\n");
+            });
+            tlsSock.on("data", (c: Buffer) => { out += c.toString("utf8"); });
+            tlsSock.on("close", () => resolveBody(out));
+            tlsSock.once("error", rejectBody);
+            const body = await bodyPromise;
+            assert.match(body, /mitm-ok/);
+            assert.equal(sawMarker, "https://api.anthropic.com", "decrypted request must carry the MITM upstream marker");
+        } finally {
+            server.close();
+            server.closeAllConnections?.();
+        }
+    });
+});
+
+await test("setupMitm e2e: idle tunnel after CONNECT is killed by the handshake timeout (#118)", async () => {
+    await withTmpCa(async () => {
+        const server = http.createServer((_req, res) => { res.writeHead(500); res.end(); });
+        setupMitm(server, [], () => { /* silent */ });
+        server.listen(0, "127.0.0.1");
+        await once(server, "listening");
+        const port = (server.address() as { port: number }).port;
+        process.env.BILI_MITM_HANDSHAKE_TIMEOUT_MS = "200";
+        try {
+            const { statusLine, socket } = await rawConnect(port, "127.0.0.1", "api.anthropic.com:443");
+            assert.match(statusLine, /^HTTP\/1\.1 200/);
+            // Never send the TLS ClientHello — the slowloris pattern. This test
+            // deliberately exercises a REAL timer (the server-side handshake
+            // timeout): deterministic clock control cannot cross the process
+            // boundary, so we await the close event with a generous bound.
+            const closed = Promise.withResolvers<void>();
+            socket.once("close", () => closed.resolve());
+            const bail = setTimeout(() => closed.resolve(), 3000);
+            await closed.promise;
+            clearTimeout(bail);
+            assert.equal(socket.destroyed, true, "socket must be destroyed by the handshake timeout");
+        } finally {
+            delete process.env.BILI_MITM_HANDSHAKE_TIMEOUT_MS;
+            server.close();
+            server.closeAllConnections?.();
+        }
+    });
+});
+
+await test("setupMitm e2e: non-loopback CONNECT client gets 403 (#77)", async (t) => {
+    // The test client's remoteAddress is only non-loopback if we connect via a
+    // real LAN address of this host. Skip when the box has none (some CI).
+    const lanAddr = Object.values(os.networkInterfaces())
+        .flat()
+        .find((i) => i && i.family === "IPv4" && !i.internal);
+    if (!lanAddr) return t.skip("no non-loopback IPv4 address available");
+    await withTmpCa(async () => {
+        const server = http.createServer((_req, res) => { res.writeHead(500); res.end(); });
+        setupMitm(server, [], () => { /* silent */ });
+        server.listen(0, lanAddr.address);
+        await once(server, "listening");
+        const port = (server.address() as { port: number }).port;
+        try {
+            const { statusLine } = await rawConnect(port, lanAddr.address, "api.anthropic.com:443");
+            assert.match(statusLine, /^HTTP\/1\.1 403/);
+        } finally {
+            server.close();
+            server.closeAllConnections?.();
+        }
+    });
 });

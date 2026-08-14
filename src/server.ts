@@ -5,7 +5,7 @@ import type { ProxyOptions } from "./config.js";
 import { loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
 import { resolveContextLimit, resolveCompressProtocol } from "./config.js";
-import { resolveCompress, applyCompressSettings, hasCompressSettings, resolveContextLimitValue } from "./compress-settings.js";
+import { resolveRequestConfig } from "./compress-settings.js";
 import { contextFromRegistry, loadRegistry } from "./registry.js";
 import { fetchWithTimeout, MAX_REQUEST_BYTES } from "./fetch-util.js";
 import { formatUpstreamError, getUpstreamConnectionStatus, recordUpstreamConnection, resolveProxy, resolveProxyDecision, proxyDispatcher } from "./upstream-proxy.js";
@@ -47,11 +47,12 @@ import { defaultLogFile, stateDir } from "./paths.js";
 import { compressLoopResponsesJson } from "./compress-loop-responses.js";
 import { runCompressLoop, pickAdapter } from "./loop/index.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
-import { rewriteResponsesSseStream, rewriteResponsesJsonResponse } from "./stream-responses.js";
+import { rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { emitStreamError } from "./stream-error.js";
 import { deriveSessionId as deriveProxySessionId, affinityToken, clientConversationHeader, type ConversationIdentity } from "./session-id.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "./bili-message.js";
+import { isLoopbackAddress } from "./util.js";
 
 import { decodeRequestBody } from "./content-encoding.js";
 
@@ -65,7 +66,30 @@ const UPSTREAM_HOP_HEADERS = new Set([
     // forward the upstream encoding marker when the body is rewritten or
     // streamed from fetch, otherwise clients try to decompress plain bytes.
     "content-encoding",
+    // RFC 7230 §6.1 hop-by-hop headers. proxy-authorization in particular
+    // carries client→proxy credentials that must never reach the model
+    // endpoint. (#80)
+    "proxy-authenticate",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "upgrade",
 ]);
+
+// RFC 7230 §6.1: the Connection header names additional hop-by-hop headers
+// that must be stripped per-message. Returns their lowercased names.
+function connectionNamedHeaders(conn: string | string[] | undefined): Set<string> {
+    const out = new Set<string>();
+    if (!conn) return out;
+    for (const part of Array.isArray(conn) ? conn : [conn]) {
+        for (const name of part.split(",")) {
+            const t = name.trim().toLowerCase();
+            if (t) out.add(t);
+        }
+    }
+    return out;
+}
 
 function buildForwardHeaders(headers: Record<string, string>): Record<string, string> {
     const out: Record<string, string> = {};
@@ -267,22 +291,39 @@ type Prepared = {
     nudge?: NudgeDecision;
 };
 
-/** True if `addr` is a loopback (IPv4 127.x or IPv6 ::1 / ::ffff:127.0.0.1).
- *  Used to gate the management endpoints to local connections only. */
-function isLoopback(addr: string | undefined): boolean {
-    if (!addr) return false;
-    return addr === "::1" || addr === "127.0.0.1" || addr.startsWith("127.") || addr.startsWith("::ffff:127.");
-}
 
-function isTrustedAdminOrigin(origin: string | undefined, host: string | undefined): boolean {
-    if (!origin) return true;
-    if (!host) return false;
+function isTrustedAdminOrigin(origin: string | undefined, host: string | undefined, trustedHosts: Set<string>): boolean {
+    // Host must be one of OUR listen identities regardless of whether an
+    // Origin header is present. A same-origin browser GET/fetch (the DNS
+    // rebinding read path: evil.com → 127.0.0.1) often carries NO Origin
+    // header, so gating on Origin alone would leave config reads exposed.
+    if (!host || !trustedHosts.has(host.toLowerCase())) return false;
+    if (!origin) return true; // non-browser client (curl, CLI UI) on a trusted Host
     try {
         const parsed = new URL(origin);
-        return (parsed.protocol === "http:" || parsed.protocol === "https:") && parsed.host === host;
+        if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+        return trustedHosts.has(parsed.host.toLowerCase());
     } catch {
         return false;
     }
+}
+
+/** The set of Host header values we accept on management endpoints. DNS
+ *  rebinding (attacker resolves evil.com → 127.0.0.1) can make a browser
+ *  request carry Origin == Host == evil.com:port and still reach loopback;
+ *  only pinning Host to our own listen address defeats it. */
+function adminTrustedHosts(bindHost: string, port: number): Set<string> {
+    const p = String(port);
+    const names = ["localhost", "127.0.0.1", "[::1]"];
+    if (bindHost && bindHost !== "0.0.0.0" && bindHost !== "::" && !names.includes(bindHost)) {
+        names.push(bindHost);
+    }
+    const set = new Set<string>();
+    for (const n of names) {
+        set.add(`${n}:${p}`.toLowerCase());
+        if (p === "80") set.add(n.toLowerCase());
+    }
+    return set;
 }
 
 async function handle(
@@ -301,12 +342,15 @@ async function handle(
     // in that case we still must NOT expose management to the LAN. Only the
     // proxy /bili/ and CONNECT (model traffic) endpoints remain open to all.
     const isAdminPath = req.url === "/__bili/" || req.url?.startsWith("/__bili/") || req.url === "/__acp/" || req.url?.startsWith("/__acp/");
-    if (isAdminPath && !isLoopback(req.socket.remoteAddress)) {
+    if (isAdminPath && !isLoopbackAddress(req.socket.remoteAddress)) {
         res.writeHead(403, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: "management endpoints are loopback-only; access denied for " + (req.socket.remoteAddress ?? "unknown") }));
         return;
     }
-    if (isAdminPath && !isTrustedAdminOrigin(req.headers.origin, req.headers.host)) {
+    // localPort, not opts.port: when listening on port 0 (dynamic assignment,
+    // programmatic embedding, tests) the real port differs from opts.port and
+    // pinning to the configured value would 403 every admin request.
+    if (isAdminPath && !isTrustedAdminOrigin(req.headers.origin, req.headers.host, adminTrustedHosts(opts.host, req.socket.localPort ?? opts.port))) {
         res.writeHead(403, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: "management request origin does not match the local bili UI" }));
         return;
@@ -487,17 +531,12 @@ async function handle(
         const model = (parsed as { model?: string }).model;
         if (model) {
             const embeddedUrl = route?.rewrittenUrl;
-            const compress = resolveCompress(opts.routes, embeddedUrl, model, opts.compress);
             let native = resolveContextLimit(opts.routes, embeddedUrl, model);
             if (!native && embeddedUrl) {
                 const host = (() => { try { return new URL(embeddedUrl).host; } catch { return undefined; } })();
                 native = await contextFromRegistry(model, host);
             }
-            const limit = resolveContextLimitValue(compress.modelContextLimit, native ?? config.modelContextLimit);
-            const tuned = hasCompressSettings(compress);
-            if (tuned || limit !== config.modelContextLimit) {
-                reqConfig = applyCompressSettings(config, limit, compress);
-            }
+            reqConfig = resolveRequestConfig(config, opts.routes, embeddedUrl, model, native, opts.compress);
         }
     }
     let prepared: Prepared | null = null;
@@ -1115,8 +1154,10 @@ async function forward(
         } catch { /* best-effort */ }
     }
     const headers: Record<string, string> = {};
+    const reqConnNamed = connectionNamedHeaders(req.headers["connection"]);
     for (const [k, v] of Object.entries(req.headers)) {
-        if (UPSTREAM_HOP_HEADERS.has(k.toLowerCase()) || v === undefined) continue;
+        const lower = k.toLowerCase();
+        if (UPSTREAM_HOP_HEADERS.has(lower) || reqConnNamed.has(lower) || v === undefined) continue;
         headers[k] = Array.isArray(v) ? v.join(", ") : v;
     }
     headers["host"] = new URL(upstreamUrl).host;
@@ -1199,14 +1240,17 @@ async function forward(
     }
     const { response: upstream, clearTimer: clearUpstreamTimer } = upstreamResult;
     const respHeaders: Record<string, string> = {};
+    const respConnNamed = connectionNamedHeaders(upstream.headers.get("connection") ?? undefined);
     upstream.headers.forEach((v, k) => {
-        if (UPSTREAM_HOP_HEADERS.has(k.toLowerCase())) return;
+        const lower = k.toLowerCase();
+        if (UPSTREAM_HOP_HEADERS.has(lower) || respConnNamed.has(lower)) return;
         respHeaders[k] = v;
     });
     if (opts.debug) {
         const respLog: Record<string, string> = {};
         upstream.headers.forEach((v, k) => {
-            if (UPSTREAM_HOP_HEADERS.has(k.toLowerCase())) return;
+            const lower = k.toLowerCase();
+            if (UPSTREAM_HOP_HEADERS.has(lower) || respConnNamed.has(lower)) return;
             respLog[k] = v.length > 300 ? v.slice(0, 300) + "..." : v;
         });
         log("info", `[${prepared?.session.id ?? "unknown"}] ← upstream response headers: ${JSON.stringify(respLog)}`);

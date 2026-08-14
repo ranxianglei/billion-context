@@ -4,6 +4,7 @@ import tls from "node:tls";
 import { ensureRootCA, getSecureContext } from "./ca.js";
 import { connectThroughProxy } from "./upstream-proxy.js";
 import { discoverMitmDomains } from "./discover.js";
+import { isLoopbackAddress } from "./util.js";
 
 // Domains we transparently MITM. These are ONLY the model-inference endpoints
 // hardcoded in client BINARIES with no config file to discover from
@@ -17,11 +18,19 @@ export const DEFAULT_MITM_DOMAINS = [
     "chatgpt.com",
 ];
 
-/** Socket property that carry the real upstream origin to handle().
- *  handle()'s resolveUpstream reads this so a MITM request (path like
- *  `/api/anthropic/v1/messages`, no `/bili/` prefix) still resolves to the
+/** Socket marker: when we MITM a CONNECT tunnel, we stash the original
  *  host the CONNECT tunnel targeted. */
 export const MITM_UPSTREAM_KEY = "__biliMitmUpstream";
+
+/** Max ms to wait for a MITM client to finish the TLS handshake after we
+ *  return CONNECT 200. Bounds slowloris-style resource hold (a client that
+ *  opens the tunnel but never sends/trickle-feeds its ClientHello).
+ *  Env-overridable so tests can exercise the timeout path quickly. */
+const MITM_HANDSHAKE_TIMEOUT_MS_DEFAULT = 10_000;
+function mitmHandshakeTimeoutMs(): number {
+    const v = Number.parseInt(process.env.BILI_MITM_HANDSHAKE_TIMEOUT_MS ?? "", 10);
+    return Number.isFinite(v) && v > 0 ? v : MITM_HANDSHAKE_TIMEOUT_MS_DEFAULT;
+}
 
 /** True if `host` should be MITM-decrypted. Matches by exact hostname or a
  *  domain suffix (so `api.openai.com` and `chatgpt.com` both work, and
@@ -58,12 +67,13 @@ export function setupMitm(
 ): void {
     ensureRootCA();
     server.on("connect", (req: http.IncomingMessage, clientSocket: net.Socket, head: Buffer) => {
-        const { hostname, port } = parseHostPort(req.url ?? "");
-        if (!hostname) {
-            clientSocket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
-            clientSocket.end();
+        if (!isLoopbackAddress(clientSocket.remoteAddress)) {
+            log(`CONNECT ${req.url} rejected: non-loopback client ${clientSocket.remoteAddress}`);
+            // end() (not write+destroy) so the 403 bytes are flushed before close.
+            clientSocket.end("HTTP/1.1 403 Forbidden\r\n\r\n");
             return;
         }
+        const { hostname, port } = parseHostPort(req.url ?? "");
         const targetPort = port || 443;
         if (!isMitmHost(hostname, extraDomains)) {
             const proxyUrl = resolveProxyUrl?.(hostname);
@@ -73,6 +83,7 @@ export function setupMitm(
         doMitm(server, clientSocket, hostname, targetPort, head, log);
     });
 }
+
 
 function parseHostPort(s: string): { hostname: string; port: number } {
     // req.url in a CONNECT is "host:port".
@@ -102,14 +113,20 @@ function tunnelThrough(
     // a listener in this .then() callback (the old code) never fires, and the
     // client would time out. Just start piping immediately.
     let established = false;
+    let aborted = false;
     const connectTimer = setTimeout(() => {
         if (!established) {
+            aborted = true;
             log(`tunnel ${host}:${port} connect timeout`);
             clientSocket.write("HTTP/1.1 504 Gateway Timeout\r\n\r\n");
             clientSocket.destroy();
         }
     }, 15000);
     connectThroughProxy(host, port, proxyUrl).then((upstream) => {
+        if (aborted) {
+            upstream.destroy();
+            return;
+        }
         established = true;
         clearTimeout(connectTimer);
         clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
@@ -124,6 +141,7 @@ function tunnelThrough(
         upstream.once("error", (e) => cleanup("upstream", e));
         clientSocket.once("error", (e) => cleanup("client", e));
     }).catch((err: Error) => {
+        if (aborted) return;
         clearTimeout(connectTimer);
         log(`tunnel ${host}:${port} connect failed: ${err.message}`);
         clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
@@ -175,6 +193,18 @@ function doMitm(
         tlsSocket.destroy();
         clientSocket.destroy();
     });
+    // Slowloris guard: a client that issues CONNECT, gets the 200, then never
+    // completes (or trickle-feeds) the TLS ClientHello would hold the socket
+    // and our signed-cert context open indefinitely. Arm a handshake timeout;
+    // clear it once the handshake completes ('secure'), or on error/close.
+    const handshakeTimer = setTimeout(() => {
+        log(`mitm ${host}:${port} TLS handshake timeout`);
+        tlsSocket.destroy();
+        clientSocket.destroy();
+    }, mitmHandshakeTimeoutMs());
+    tlsSocket.once("secure", () => clearTimeout(handshakeTimer));
+    tlsSocket.once("close", () => clearTimeout(handshakeTimer));
+    tlsSocket.once("error", () => clearTimeout(handshakeTimer));
     // Hand the decrypted TLS socket to the http server's connection listener.
     // The server treats it as a new TCP connection and runs its HTTP parser on
     // the cleartext bytes — exactly the same path as a direct (non-proxy)
