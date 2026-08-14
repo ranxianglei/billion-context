@@ -42,7 +42,7 @@ export interface RequestOptions {
 
 export type ParsedStreamEvent =
     | { kind: "text"; delta: string; raw?: Buffer }
-    | { kind: "reasoning"; delta: string; raw?: Buffer }
+    | { kind: "reasoning"; delta: string; raw?: Buffer; signature?: string }
     | { kind: "tool_call"; name: string; callId: string; arguments: string; passthrough?: boolean }
     | { kind: "usage"; inputTokens?: number; outputTokens?: number; cachedTokens?: number }
     | { kind: "done"; finishReason?: string }
@@ -181,6 +181,7 @@ export async function* runCompressLoop(
             if (signal?.aborted) break;
             let assistantText = "";
             let assistantReasoning = "";
+            let assistantReasoningSignature: string | undefined;
             const calls: ToolCallEmit[] = [];
             let usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number } = {};
             let finishReason: string | undefined;
@@ -196,6 +197,7 @@ export async function* runCompressLoop(
                         }
                     } else if (ev.kind === "reasoning") {
                         assistantReasoning += ev.delta;
+                        if (ev.signature) assistantReasoningSignature = ev.signature;
                         if (!ctx.textProtocol) {
                             if (ev.raw) {
                                 yield ev.raw;
@@ -287,6 +289,7 @@ export async function* runCompressLoop(
                         contentType: "reasoning",
                         text: assistantReasoning,
                         reasoningContent: assistantReasoning,
+                        ...(assistantReasoningSignature ? { thinkingSignature: assistantReasoningSignature } : {}),
                     };
                     coreMessages.push(reasoningMsg);
                 }
