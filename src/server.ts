@@ -5,7 +5,7 @@ import type { ProxyOptions } from "./config.js";
 import { loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
 import { resolveContextLimit, resolveCompressProtocol } from "./config.js";
-import { resolveCompress, applyCompressSettings, hasCompressSettings, resolveContextLimitValue } from "./compress-settings.js";
+import { resolveRequestConfig } from "./compress-settings.js";
 import { contextFromRegistry, loadRegistry } from "./registry.js";
 import { fetchWithTimeout, MAX_REQUEST_BYTES } from "./fetch-util.js";
 import { formatUpstreamError, getUpstreamConnectionStatus, recordUpstreamConnection, resolveProxy, resolveProxyDecision, proxyDispatcher } from "./upstream-proxy.js";
@@ -487,17 +487,12 @@ async function handle(
         const model = (parsed as { model?: string }).model;
         if (model) {
             const embeddedUrl = route?.rewrittenUrl;
-            const compress = resolveCompress(opts.routes, embeddedUrl, model, opts.compress);
             let native = resolveContextLimit(opts.routes, embeddedUrl, model);
             if (!native && embeddedUrl) {
                 const host = (() => { try { return new URL(embeddedUrl).host; } catch { return undefined; } })();
                 native = await contextFromRegistry(model, host);
             }
-            const limit = resolveContextLimitValue(compress.modelContextLimit, native ?? config.modelContextLimit);
-            const tuned = hasCompressSettings(compress);
-            if (tuned || limit !== config.modelContextLimit) {
-                reqConfig = applyCompressSettings(config, limit, compress);
-            }
+            reqConfig = resolveRequestConfig(config, opts.routes, embeddedUrl, model, native, opts.compress);
         }
     }
     let prepared: Prepared | null = null;
