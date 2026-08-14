@@ -652,6 +652,7 @@ recommended** for many concurrent conversations because of the collision
 risk — until pi grows its own session-id signal. For pi multi-agent use,
 pass an explicit `x-acp-session` header per conversation to avoid collisions.
 
+### Sessions depend on the proxy (#151)
 
 Compression state (blocks, summaries, original message cache) lives **in the
 proxy**, not in the client. The client's own local history is the full
