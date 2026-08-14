@@ -98,3 +98,53 @@ test("admin endpoints: DNS-rebinding Host is rejected with and without Origin (#
         try { rmSync(root, { recursive: true, force: true }); } catch { /* best-effort */ }
     }
 });
+
+test("admin endpoints work with port: 0 (dynamic port assignment)", async () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    const root = path.join(tmpdir(), `bili-admin-port0-${process.pid}-${Date.now()}`);
+    mkdirSync(root, { recursive: true });
+    const biliConfig = path.join(root, "billion-context.json");
+    writeFileSync(biliConfig, '{"providers":{}}\n', "utf8");
+    const prevConfig = process.env.BILI_CONFIG_FILE;
+    process.env.BILI_CONFIG_FILE = biliConfig;
+
+    // port: 0 → the OS assigns the real port; trusted-host pinning must use
+    // the socket's localPort, not the configured 0 (regression: every admin
+    // request 403'd because the trusted set contained "localhost:0").
+    const opts: ProxyOptions = {
+        port: 0,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1:1",
+        routes: {},
+        proxy: "",
+        proxyMode: "direct",
+        proxySource: "direct",
+        modelContextLimit: 400_000,
+        kernelConfig: defaultConfig(400_000),
+        compress: { injectTool: true, injectNudge: true },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        mitm: { enabled: false, domains: [] },
+    };
+    const proxy = await startServer(opts);
+    if (!proxy.listening) await once(proxy, "listening");
+    const actualPort = (proxy.address() as { port: number }).port;
+    try {
+        const curlLike = await request(actualPort, { host: `127.0.0.1:${actualPort}` });
+        assert.equal(curlLike.status, 200, "admin endpoints must accept trusted Host on the dynamically assigned port");
+        const uiLike = await request(actualPort, { host: `localhost:${actualPort}`, origin: `http://localhost:${actualPort}` });
+        assert.equal(uiLike.status, 200);
+        const spoofed = await request(actualPort, { host: `evil.com:${actualPort}` });
+        assert.equal(spoofed.status, 403, "rebinding Host still rejected on dynamic port");
+    } finally {
+        process.env.BILI_CONFIG_FILE = prevConfig;
+        proxy.closeAllConnections?.();
+        await close(proxy);
+        try { rmSync(root, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+});
