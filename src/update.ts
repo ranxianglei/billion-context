@@ -40,6 +40,9 @@ const LOCK_STALE_MS = 2 * 60 * 1000;
 let timer: ReturnType<typeof setInterval> | undefined;
 let inFlight = false;
 let firstCheckDone = false;
+let lastRestartNag = 0;
+/** Nag cadence for restart-pending: the check cycle is 3 min, warning every cycle would spam. */
+const RESTART_NAG_MS = 30 * 60 * 1000;
 
 function parseVersion(v: string): number[] {
     return v.replace(/^v/, "").split(".").map((n) => parseInt(n, 10) || 0);
@@ -249,6 +252,11 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         const installDir = await findInstallDir(opts.packageName);
         const diskVersion = installDir ? await readDiskVersion(installDir) : undefined;
         const currentVersion = diskVersion ?? opts.currentVersion;
+
+        if (diskVersion && isNewer(diskVersion, opts.currentVersion) && now - lastRestartNag >= RESTART_NAG_MS) {
+            lastRestartNag = now;
+            loggerLog("warn", `[update] restart pending: this proxy is running ${opts.currentVersion} but ${diskVersion} is installed \u2014 RESTART the proxy to activate it`);
+        }
 
         if (!isNewer(latest, currentVersion)) {
             loggerLog("info", `[update] current=${currentVersion} latest=${latest} (up to date)`);

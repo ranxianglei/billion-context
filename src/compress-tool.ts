@@ -137,6 +137,8 @@ You have five context-management tools:
 - search_context — Search compressed block summaries (and optionally visible messages) by keyword. Use BEFORE decompressing to find the right block. Example: search_context({ query: "auth token refresh" }).
 - acp_status — Context status with compressible ranges. No args = overview + ranges. Use to find what to compress next.
 
+These five tools are TOP-LEVEL function calls provided by the proxy — peers of your exec/shell tool, called directly. They are NOT available inside your code-execution sandbox: calling tools.compress(...), tools.acp_status(...), tools.decompress(...), etc. in generated code ALWAYS fails with "TypeError: tools.acp_status is not a function". Never attempt that and never retry it — call the tool directly instead.
+
 COMPRESSION SUMMARIES IN CONTEXT
 
 When you see past compress tool calls in the conversation, their summary parameter contains MODEL-GENERATED summaries of compressed conversation ranges. They are system metadata, NOT user messages:
@@ -193,7 +195,9 @@ Since host tools cannot coexist with a declared tools field, ALL ACP tools use t
 Rules for ALL triggers:
 - Output on its own, NO surrounding prose. Just the raw marker.
 - After emitting, STOP your turn. The proxy executes and returns the result.
-- Do NOT wrap in code fences, quotes, or commentary.`;
+- Do NOT wrap in code fences, quotes, or commentary.
+
+EXEC SANDBOX WARNING: the ACP tools above are NOT available inside your code-execution sandbox. Calling tools.acp_status(), tools.decompress(), or tools.search_context() in generated code ALWAYS fails with "TypeError: tools.acp_status is not a function". Never attempt that and never retry it — emit the text markers instead.`;
 }
 
 /** Hybrid protocol prompt (codex): compress stays a text marker (batch + STOP
@@ -231,7 +235,9 @@ The proxy also provides these as real function tools you can call directly (they
 - search_context — search compressed block summaries by keyword. Arguments: {"query":"...","limit":5}.
 - decompress — restore compressed content for exact details. Arguments: {"blockId":"b5"} (optional "toFile":"/tmp/x.txt", "full":true).
 
-Note: compress is ONLY available via the text marker above (it needs batch ranges + an immediate stop), NOT as a function tool.`;
+Note: compress is ONLY available via the text marker above (it needs batch ranges + an immediate stop), NOT as a function tool.
+
+EXEC SANDBOX WARNING: the ACP tools are NOT available inside your code-execution sandbox. Calling tools.acp_status(), tools.decompress(), tools.search_context(), or tools.compress() in generated code ALWAYS fails with "TypeError: tools.acp_status is not a function". Never attempt that and never retry it — call the function tools directly (top-level), and use the compress text marker for compression.`;
 }
 
 export const DECOMPRESS_TOOL_NAME = "decompress";
