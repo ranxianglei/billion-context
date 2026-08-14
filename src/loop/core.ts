@@ -42,7 +42,7 @@ export interface RequestOptions {
 
 export type ParsedStreamEvent =
     | { kind: "text"; delta: string; raw?: Buffer }
-    | { kind: "reasoning"; delta: string; raw?: Buffer; signature?: string }
+    | { kind: "reasoning"; delta: string; raw?: Buffer; signature?: string; blockEnd?: boolean }
     | { kind: "tool_call"; name: string; callId: string; arguments: string }
     | { kind: "usage"; inputTokens?: number; outputTokens?: number; cachedTokens?: number }
     | { kind: "done"; finishReason?: string }
@@ -180,7 +180,8 @@ export async function* runCompressLoop(
             if (signal?.aborted) break;
             let assistantText = "";
             let assistantReasoning = "";
-            let assistantReasoningSignature: string | undefined;
+            const reasoningSegments: { text: string; signature: string }[] = [];
+            let reasoningSealed = true;
             const calls: ToolCallEmit[] = [];
             let usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number } = {};
             let finishReason: string | undefined;
@@ -196,7 +197,15 @@ export async function* runCompressLoop(
                         }
                     } else if (ev.kind === "reasoning") {
                         assistantReasoning += ev.delta;
-                        if (ev.signature) assistantReasoningSignature = ev.signature;
+                        let seg = reasoningSegments[reasoningSegments.length - 1];
+                        if (reasoningSealed || !seg) {
+                            seg = { text: "", signature: "" };
+                            reasoningSegments.push(seg);
+                            reasoningSealed = false;
+                        }
+                        seg.text += ev.delta;
+                        if (ev.signature) seg.signature += ev.signature;
+                        if (ev.blockEnd) reasoningSealed = true;
                         if (!ctx.textProtocol) {
                             if (ev.raw) {
                                 yield ev.raw;
@@ -281,16 +290,20 @@ export async function* runCompressLoop(
             // never in coreMessages), and hideConsumedCompressCalls runs each
             // round so consumed compress records cannot re-prime the model.
             if (proxyResults.length > 0) {
-                if (assistantReasoning.length > 0) {
-                    const reasoningMsg: BiliMessage = {
-                        id: `acp_loop_r${round}_reasoning`,
-                        role: "assistant",
-                        contentType: "reasoning",
-                        text: assistantReasoning,
-                        reasoningContent: assistantReasoning,
-                        ...(assistantReasoningSignature ? { thinkingSignature: assistantReasoningSignature } : {}),
-                    };
-                    coreMessages.push(reasoningMsg);
+                if (reasoningSegments.length > 0) {
+                    for (let i = 0; i < reasoningSegments.length; i++) {
+                        const seg = reasoningSegments[i];
+                        if (seg.text.length === 0 && seg.signature.length === 0) continue;
+                        const reasoningMsg: BiliMessage = {
+                            id: i === 0 ? `acp_loop_r${round}_reasoning` : `acp_loop_r${round}_reasoning_${i + 1}`,
+                            role: "assistant",
+                            contentType: "reasoning",
+                            text: seg.text,
+                            reasoningContent: seg.text,
+                            ...(seg.signature.length > 0 ? { thinkingSignature: seg.signature } : {}),
+                        };
+                        coreMessages.push(reasoningMsg);
+                    }
                 }
                 if (assistantText.length > 0) {
                     coreMessages.push({
