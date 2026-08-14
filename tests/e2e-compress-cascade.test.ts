@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { defaultConfig } from "acp-kernel";
+import { createCore, createInitialState, defaultConfig, type CoreMessage } from "acp-kernel";
 import { resolveRequestConfig } from "../src/compress-settings.ts";
 import type { CompressSettings, ProviderRoutes } from "../src/config.ts";
 
@@ -77,4 +77,48 @@ test("e2e compress cascade: a single resolver call resolves differently per mode
     const large = resolveRequestConfig(BASE, r, UPSTREAM, "gpt-large", 200_000, GLOBAL);
     const plain = resolveRequestConfig(BASE, r, UPSTREAM, "gpt-plain", 100_000, GLOBAL);
     assert.notEqual(large.nudge.maxContextLimitPct, plain.nudge.maxContextLimitPct, "gpt-large 70% != gpt-plain 80%");
+});
+
+// Behavioral: feed the resolved Config into the real kernel core.processTurn
+// (the same primitive server.ts drives per request) and assert shouldInject
+// flips with the limit. The nudge needs recommendedRanges > 0, not just a high
+// usage ratio — hence the bulk text.
+function compressibleMessages(): CoreMessage[] {
+    const msgs: CoreMessage[] = [];
+    for (let i = 0; i < 12; i++) {
+        msgs.push({
+            id: `h_${i}`,
+            role: i % 2 === 0 ? "user" : "assistant",
+            contentType: "text",
+            text: `historical detail ${i}. ${"x".repeat(2000)}`,
+        });
+    }
+    return msgs;
+}
+
+test("e2e compress cascade: a 2w limit fires the compress nudge at 2w tokens; a 100w limit does not", () => {
+    const core = createCore();
+    const tokenCount = 20_000;
+
+    const small = resolveRequestConfig(BASE, routes(), UPSTREAM, "gpt-large", 20_000, GLOBAL);
+    assert.equal(small.modelContextLimit, 20_000, "native 2w window becomes the kernel context limit");
+    const smallTurn = core.processTurn({
+        messages: compressibleMessages(),
+        state: createInitialState(),
+        config: small,
+        tokenCount,
+        renderTags: "text-only",
+    });
+    assert.ok(smallTurn.nudge?.shouldInject, "2w tokens at a 2w limit crosses the 70% threshold → compress nudge fires");
+
+    const large = resolveRequestConfig(BASE, routes(), UPSTREAM, "gpt-large", 1_000_000, GLOBAL);
+    assert.equal(large.modelContextLimit, 1_000_000, "native 100w window becomes the kernel context limit");
+    const largeTurn = core.processTurn({
+        messages: compressibleMessages(),
+        state: createInitialState(),
+        config: large,
+        tokenCount,
+        renderTags: "text-only",
+    });
+    assert.ok(!largeTurn.nudge?.shouldInject, "2w tokens at a 100w limit stays under threshold → no compression");
 });
