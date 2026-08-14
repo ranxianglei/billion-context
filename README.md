@@ -652,6 +652,23 @@ recommended** for many concurrent conversations because of the collision
 risk — until pi grows its own session-id signal. For pi multi-agent use,
 pass an explicit `x-acp-session` header per conversation to avoid collisions.
 
+### Codex subagents get their own compression namespace (#150)
+
+Codex subagents (e.g. the `guardian_subagent` approval reviewer) reuse the
+main conversation's `session_id`, so on the wire they look like the same
+session. Without care their requests inherit the main conversation's
+compression state — a subagent turn can get its context folded (losing the
+verbatim user authorization it must read back) and the two roles' usage
+estimates pollute each other.
+
+billion-context detects this via the `instructions` field: subagent requests
+carry their own role prompt. The **first** instructions seen for a
+conversation anchor the main namespace (stable even if the main prompt
+drifts); any other instructions value maps to a separate `|sub:` namespace
+with its own empty compression state. Subagent requests are self-contained
+replays, so the fresh namespace is lossless — and the web UI's session list
+shows the two namespaces as separate sessions sharing the same client label.
+
 ### Sessions depend on the proxy (#151)
 
 Compression state (blocks, summaries, original message cache) lives **in the

@@ -393,3 +393,27 @@ export function conversationIdentityResponses(
 export function conversationSignalResponses(body: ResponsesRequestBody, headerValue?: string): string {
     return conversationIdentityResponses(body, headerValue).value;
 }
+
+// Codex subagents (guardian approval reviewer, etc.) reuse the main
+// conversation's body.session_id, so identity alone collapses their requests
+// onto the main session's compression state — a compressed subagent request
+// loses the verbatim user authorization it must read back (#150). Subagent
+// requests carry their own `instructions` (the agent's role prompt), so the
+// FIRST instructions seen for an identity anchor the main namespace (it never
+// changes for the conversation, even if the main prompt drifts), and any other
+// instructions value maps to a separate `|sub:` namespace with its own empty
+// compression state. Subagent requests are self-contained replays, so the
+// fresh namespace is lossless. Unbounded growth is fine: one ~100-byte entry
+// per conversation identity.
+const instructionAnchors = new Map<string, string>();
+
+export function subagentNamespace(identityValue: string, instructions: unknown): string {
+    if (typeof instructions !== "string" || instructions.trim().length === 0) return identityValue;
+    const fp = hashId(instructions);
+    const anchor = instructionAnchors.get(identityValue);
+    if (anchor === undefined) {
+        instructionAnchors.set(identityValue, fp);
+        return identityValue;
+    }
+    return anchor === fp ? identityValue : `${identityValue}|sub:${fp}`;
+}
