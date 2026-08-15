@@ -61,7 +61,7 @@ export function renderHandoff(s: Session, full: boolean): string {
     lines.push("");
     const active = s.state.blocks.filter((b) => b.active);
     if (active.length === 0) {
-        lines.push("No active compression blocks — the session history below is the original conversation.");
+        lines.push("No active compression blocks. Original messages are only persisted when they are compressed into a block, so this session's conversation content is not available for export.");
         lines.push("");
     }
     for (const b of active) {
@@ -79,10 +79,12 @@ export function renderHandoff(s: Session, full: boolean): string {
             lines.push("");
         }
     }
-    lines.push("---");
-    lines.push("");
-    lines.push("Paste the block summaries above into a new session to continue without the proxy.");
-    lines.push("");
+    if (active.length > 0) {
+        lines.push("---");
+        lines.push("");
+        lines.push("Paste the block summaries above into a new session to continue without the proxy.");
+        lines.push("");
+    }
     return lines.join("\n");
 }
 
@@ -99,7 +101,7 @@ export async function exportSession(selector: string | undefined, opts: ExportOp
     const store = new SessionStore({ dir: opts.dir, enabled: true });
     const all = [...(await store.loadAll()).values()];
     if (all.length === 0) {
-        return "No persisted sessions found. Sessions are written under the sessions directory after the proxy compresses a conversation.";
+        return "No persisted sessions found. Sessions are written under the sessions directory once the proxy has served a request (compression state and compressed originals only — uncompressed conversation text is not persisted).";
     }
     if (!selector) {
         const list = await listSessions(opts);
