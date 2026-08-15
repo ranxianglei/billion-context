@@ -75,7 +75,7 @@ test("e2e export: real proxy compresses via real tool call, block persists, bili
 
             if (!compressSent && toolNames.includes("compress") && refs.length >= 4) {
                 compressSent = true;
-                const [startId, endId] = refs;
+                const [startId, endId] = [refs[2]!, refs[3]!];
                 json({
                     id: "r1",
                     object: "chat.completion",
@@ -141,9 +141,9 @@ test("e2e export: real proxy compresses via real tool call, block persists, bili
         const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/chat/completions`;
         const big = (label: string, n: number) => `${label}: ${"detail ".repeat(n)}`.slice(0, 4800);
         const history = [
-            { role: "user", content: `${big("hello proxy, please track this greeting", 400)} DEEPMARKER778899 ${big("", 300)}` },
+            { role: "user", content: `${big("hello proxy, please track this greeting", 400)} ${big("", 300)}` },
             { role: "assistant", content: big("greeting tracked", 700) },
-            { role: "user", content: big("work item B", 800) },
+            { role: "user", content: `${big("work item B", 800)} DEEPMARKER778899 ${big("", 300)}` },
             { role: "assistant", content: big("work B done", 800) },
             { role: "user", content: big("work item C", 800) },
             { role: "assistant", content: big("work C done", 800) },
@@ -176,11 +176,12 @@ test("e2e export: real proxy compresses via real tool call, block persists, bili
 
         const md = await exportSession(sessions[0]!.id, { dir });
         assert.match(md, /# billion-context session handoff/);
-        assert.match(md, new RegExp(SUMMARY_MARKER), "model-written summary missing from handoff doc");
-        assert.match(md, /greeting round/, "block topic missing from handoff doc");
-        assert.doesNotMatch(md, /DEEPMARKER778899/, "default handoff view should omit compressed originals (deep body text leaked)");
+        assert.match(md, new RegExp(SUMMARY_MARKER), "model-written summary missing from folded handoff doc");
+        assert.match(md, /final question/, "uncompressed tail missing from handoff doc");
+        assert.doesNotMatch(md, /DEEPMARKER778899/, "folded handoff view should omit compressed originals (deep body text leaked)");
         const full = await exportSession(sessions[0]!.id, { dir, full: true });
         assert.match(full, /hello proxy, please track this greeting/, "--full handoff view lost the original messages");
+        assert.match(full, /DEEPMARKER778899/, "--full handoff view lost deep compressed-original text");
     } finally {
         await close(proxy);
         await close(upstream);

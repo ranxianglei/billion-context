@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import * as path from "node:path";
 import { sessionsDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
-import { createInitialState, type CompressionState } from "acp-kernel";
+import { createInitialState, type CompressionState, type CoreMessage } from "acp-kernel";
 import type { Session, BlockContent } from "./session.js";
 
 /**
@@ -47,7 +47,7 @@ import type { Session, BlockContent } from "./session.js";
  *    lock should be added before promoting multi-agent concurrency as safe.
  */
 
-const PERSIST_VERSION = 2;
+const PERSIST_VERSION = 3;
 
 interface PersistedSession {
     version: number;
@@ -92,6 +92,10 @@ interface PersistedSession {
     state: CompressionState;
     /** blockContents serialized as a plain record (Maps do not survive JSON). */
     blockContents: Record<string, BlockContent>;
+    /** Latest full-conversation snapshot (v3+): the client's raw messages
+     *  from its most recent request, overwritten every turn. Absent on v2
+     *  files — export falls back to block-only rendering. */
+    messages?: CoreMessage[];
 }
 
 type Logger = (level: "info" | "warn" | "error", msg: string) => void;
@@ -428,6 +432,7 @@ function buildRecord(session: Session): PersistedSession {
         id: session.id,
         meta: { ...session.meta },
         stats: { ...session.stats },
+        messages: session.lastMessages,
         metadata: { ...session.metadata },
         state: session.state,
         blockContents: Object.fromEntries(session.blockContents),
@@ -466,6 +471,7 @@ function buildSession(parsed: PersistedSession): Session {
         createdAt: parsed.createdAt ?? Date.now(),
         lastSeen: Date.now(),
         blockContents,
+        lastMessages: parsed.messages,
         inFlight: 0,
         persisted: true,
     };

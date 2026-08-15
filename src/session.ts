@@ -1,4 +1,4 @@
-import { createInitialState, type CompressionState } from "acp-kernel";
+import { createInitialState, type CompressionState, type CoreMessage } from "acp-kernel";
 import { getStore } from "./persist.js";
 
 export type BlockContent = {
@@ -70,6 +70,12 @@ export type Session = {
      *  truth; the MAX_SESSIONS cap bounds the number of concurrent sessions
      *  in memory. See persist.ts. */
     blockContents: Map<string, BlockContent>;
+    /** Latest full conversation snapshot, taken from the client's raw request
+     *  each turn (originalMessages). The client is the source of truth and
+     *  sends its complete history every request, so overwriting this per
+     *  request keeps a bounded, up-to-date copy — that is what makes offline
+     *  export complete. Bounded by MAX_SESSIONS, same as blockContents. */
+    lastMessages?: CoreMessage[];
     /** Number of in-flight requests using this session. A session with
      *  inFlight > 0 must NOT be LRU-evicted: evicting it mid-stream flushes a
      *  half-mutated snapshot and then a miss reloads a SECOND Session object,
@@ -188,6 +194,14 @@ export async function withSessionLock<T>(session: Session, fn: () => Promise<T>)
 
 export function listSessions(): Session[] {
     return [...sessions.values()].sort((a, b) => b.lastSeen - a.lastSeen);
+}
+
+/** Overwrite the session's full-conversation snapshot with the latest client
+ *  raw request messages (originalMessages from prepare*). One array per
+ *  session, replaced every request — bounded, always the newest state. Empty
+ *  arrays (parse failures) never clobber a good snapshot. */
+export function snapshotMessages(session: Session, messages: CoreMessage[]): void {
+    if (messages.length > 0) session.lastMessages = messages;
 }
 
 /** Mark a session's state as changed so it is persisted on the next debounce.

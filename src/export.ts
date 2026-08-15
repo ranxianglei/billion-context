@@ -1,5 +1,6 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { prune, type CoreMessage } from "acp-kernel";
 import type { Session } from "./session.js";
 import { SessionStore } from "./persist.js";
 
@@ -59,9 +60,33 @@ export function renderHandoff(s: Session, full: boolean): string {
     if (s.stats.contextTokens) lines.push(`- last context tokens: ~${s.stats.contextTokens}`);
     lines.push(`- compression blocks: ${s.state.blocks.length} (active ${s.state.blocks.filter((b) => b.active).length})`);
     lines.push("");
+
+    const messages = s.lastMessages;
+    if (messages && messages.length > 0) {
+        // Full-conversation snapshot (v3 files): render exactly what the model
+        // saw. Default = folded view via the kernel's own renderer (summaries
+        // in place of compressed ranges); --full = every original message.
+        lines.push(full ? `## Full conversation (${messages.length} messages)` : `## Conversation (folded view as the model saw it, ${messages.length} client messages)`);
+        lines.push("");
+        let lastRole = "";
+        const view = full ? messages : prune(messages, s.state);
+        for (const m of view) {
+            if (m.role !== lastRole) {
+                lines.push(`### ${m.role}`);
+                lines.push("");
+                lastRole = m.role;
+            }
+            lines.push(renderMessage(m));
+        }
+        lines.push("");
+        return lines.join("\n");
+    }
+
+    // v2 fallback: no snapshot persisted. Block summaries (+ originals with
+    // --full from the blockContents cache) are all that is recoverable offline.
     const active = s.state.blocks.filter((b) => b.active);
     if (active.length === 0) {
-        lines.push("No active compression blocks. Original messages are only persisted when they are compressed into a block, so this session's conversation content is not available for export.");
+        lines.push("No active compression blocks and no persisted conversation snapshot (v2 session file). Original messages are only persisted when they are compressed into a block, so this session's conversation content is not available for export.");
         lines.push("");
     }
     for (const b of active) {
@@ -86,6 +111,28 @@ export function renderHandoff(s: Session, full: boolean): string {
         lines.push("");
     }
     return lines.join("\n");
+}
+
+/** Render one CoreMessage as markdown. tool-call / tool-result / reasoning
+ *  carry their structured fields; text carries the body. */
+function renderMessage(m: CoreMessage): string {
+    const parts: string[] = [];
+    switch (m.contentType) {
+        case "text":
+            parts.push(m.text ?? "");
+            break;
+        case "tool-call":
+            parts.push(`\`${m.toolName ?? "?"}(${m.toolCallId ?? ""})\` args: ${m.text ?? ""}`);
+            break;
+        case "tool-result":
+            parts.push(`\`${m.toolName ?? "?"}(${m.toolCallId ?? ""})\` → ${m.text ?? ""}`);
+            break;
+        case "reasoning":
+            parts.push(`_reasoning_: ${m.text ?? ""}`);
+            break;
+    }
+    const body = parts.join("\n").trim();
+    return body === "" ? "_(empty)_" : body + "\n";
 }
 
 function matchSession(sessions: Session[], selector: string): Session[] {
