@@ -56,6 +56,11 @@ ACP 工具(`compress` / `decompress` / `search_context` / `acp_status`)
 代理统一下发(`GET /__bili/plugin/manifest`),插件与代理永远不会版本
 漂移。协议规范见 [PLUGIN.md](PLUGIN.md)。带插件的会话通过请求头自动
 识别 —— 该会话的 wire 层工具注入自动关闭(不会双重压缩,工具体验原生)。
+两种代理模式都支持:`/bili/` 前缀 baseURL **和 MITM 透明模式** ——
+launcher(`bili pi` / `bili codex` / `bili claude`)会导出
+`BILLION_CONTEXT_PROXY` 供插件检测;插件还可以上报 agent 自己的模型
+上下文窗口(`x-bili-plugin-context-window`),并通过
+`GET /__bili/plugin/status` 读取实时上下文水位。
 
 压缩是自动注入的 —— 你只需配置路由,无需配置压缩本身。
 
