@@ -1,12 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { defaultConfig } from "acp-kernel";
+import { defaultConfig, defaultPrompts } from "acp-kernel";
 import {
     mergeCompress,
     resolveCompress,
     applyCompressSettings,
     hasCompressSettings,
     resolveContextLimitValue,
+    resolveCompressPrompts,
 } from "../src/compress-settings.ts";
 import { parseRouteEntry, type ProviderRoutes } from "../src/config.ts";
 
@@ -188,4 +189,50 @@ test("parseRouteEntry: preserves provider-level and model-level compress", () =>
 test("parseRouteEntry: no compress leaves the field absent", () => {
     const route = parseRouteEntry({ models: { "m": { context: 128000 } } });
     assert.equal(route?.compress, undefined);
+});
+
+test("resolveCompressPrompts: no prompts configured returns kernel defaults", () => {
+    const p = resolveCompressPrompts({ nudgeGrowthTokens: 50000 });
+    assert.equal(p, defaultPrompts);
+});
+
+test("resolveCompressPrompts: prompts ignored without acknowledgePromptsRisk", () => {
+    const p = resolveCompressPrompts({ prompts: { compressPhilosophy: "CUSTOM" } });
+    assert.equal(p, defaultPrompts);
+    assert.notEqual(p.compressPhilosophy, "CUSTOM");
+});
+
+test("resolveCompressPrompts: acknowledgePromptsRisk applies string overrides", () => {
+    const p = resolveCompressPrompts({
+        prompts: { compressPhilosophy: "CUSTOM PHILOSOPHY", howToCompressRules: 42 as unknown as string },
+        acknowledgePromptsRisk: true,
+    });
+    assert.equal(p.compressPhilosophy, "CUSTOM PHILOSOPHY");
+    // Non-string override silently dropped (kernel resolvePrompts), never clobbers a default.
+    assert.equal(p.howToCompressRules, defaultPrompts.howToCompressRules);
+    assert.equal(p.tier2DistillRules, defaultPrompts.tier2DistillRules);
+});
+
+test("mergeCompress: prompts + acknowledgePromptsRisk deepest-wins per field", () => {
+    const merged = mergeCompress(
+        { prompts: { compressPhilosophy: "GLOBAL" }, acknowledgePromptsRisk: true },
+        { prompts: { howToCompressRules: "PROVIDER" } },
+        { prompts: { compressPhilosophy: "MODEL" } },
+    );
+    assert.deepEqual(merged.prompts, { compressPhilosophy: "MODEL", howToCompressRules: "PROVIDER" });
+    // Risk flag from the global level survives when deeper levels don't set it.
+    assert.equal(merged.acknowledgePromptsRisk, true);
+});
+
+test("resolveCompress: prompts cascade end-to-end via provider routes", () => {
+    const routes: ProviderRoutes = {
+        "https://api.example.com": parseRouteEntry({
+            compress: { prompts: { compressPhilosophy: "PROVIDER" } },
+            models: { "m": { context: 128000, compress: { prompts: { howToCompressRules: "MODEL RULES" }, acknowledgePromptsRisk: true } } },
+        })!,
+    };
+    const merged = resolveCompress(routes, "https://api.example.com", "m");
+    const p = resolveCompressPrompts(merged);
+    assert.equal(p.compressPhilosophy, "PROVIDER");
+    assert.equal(p.howToCompressRules, "MODEL RULES");
 });

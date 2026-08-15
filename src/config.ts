@@ -1,4 +1,4 @@
-import { defaultConfig, type Config } from "acp-kernel";
+import { defaultConfig, type Config, type Prompts } from "acp-kernel";
 import { readFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { configFile } from "./paths.js";
@@ -96,6 +96,18 @@ export type CompressSettings = {
     minCompressRange?: number;
     /** Enable multi-tier (T2/T3) distillation (kernel `tiers.enabled`). */
     tiers?: boolean;
+    /** Override the kernel's compression prompt text (compressPhilosophy /
+     *  howToCompressRules / tier2DistillRules / tier3CondenseRules). All four
+     *  fields are LOAD-BEARING: the kernel rules were tuned in production and
+     *  overriding them can degrade summary quality (lost paths / signatures /
+     *  decisions → broken retrieval). Ignored unless `acknowledgePromptsRisk`
+     *  is also true at the winning level. Same three-level merge as the other
+     *  fields, but the object is merged via kernel `resolvePrompts` (non-string
+     *  fields silently dropped), not a raw pass-through. */
+    prompts?: Partial<Prompts>;
+    /** Must be true for `prompts` overrides to take effect. Acknowledges the
+     *  summary-quality risk documented on `prompts`. */
+    acknowledgePromptsRisk?: boolean;
 };
 export type PromptCacheRouting = "auto" | "enabled" | "disabled";
 export type UpstreamProxyMode = "auto" | "manual" | "direct";

@@ -1,4 +1,4 @@
-import { COMPRESS_PHILOSOPHY, HOW_TO_COMPRESS_RULES } from "acp-kernel";
+import { defaultPrompts, type Prompts } from "acp-kernel";
 import { log as loggerLog } from "./logger.js";
 
 export const COMPRESS_TOOL_NAME = "compress";
@@ -119,10 +119,10 @@ export const COMPRESS_TOOL_OPENAI = {
     },
 };
 
-export function buildCompressSystemPrompt(): string {
-    return `${COMPRESS_PHILOSOPHY}
+export function buildCompressSystemPrompt(prompts: Prompts = defaultPrompts): string {
+    return `${prompts.compressPhilosophy}
 
-${HOW_TO_COMPRESS_RULES}
+${prompts.howToCompressRules}
 
 ACP TAGS
 
@@ -151,10 +151,10 @@ When you see past compress tool calls in the conversation, their summary paramet
  *  the trigger tags in its text output instead of calling a function tool.
  *  Only compress is available via this protocol (decompress/search/status
  *  require real tools). */
-export function buildCompressTextSystemPrompt(): string {
-    return `${COMPRESS_PHILOSOPHY}
+export function buildCompressTextSystemPrompt(prompts: Prompts = defaultPrompts): string {
+    return `${prompts.compressPhilosophy}
 
-${HOW_TO_COMPRESS_RULES}
+${prompts.howToCompressRules}
 
 ACP TAGS
 
@@ -201,10 +201,10 @@ Rules for ALL triggers:
  *  acp_status are real function tools the model calls directly. The compress
  *  loop already merges text triggers and function tool_calls, so both paths
  *  coexist in one turn. */
-export function buildCompressHybridSystemPrompt(): string {
-    return `${COMPRESS_PHILOSOPHY}
+export function buildCompressHybridSystemPrompt(prompts: Prompts = defaultPrompts): string {
+    return `${prompts.compressPhilosophy}
 
-${HOW_TO_COMPRESS_RULES}
+${prompts.howToCompressRules}
 
 ACP TAGS
 
