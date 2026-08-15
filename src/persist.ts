@@ -301,9 +301,17 @@ export class SessionStore {
         const next = prev.catch(() => {}).then(() => this.writeNowInner(session));
         this.writeChains.set(id, next);
         // Clean up the chain entry once settled so the Map doesn't grow.
-        next.finally(() => {
-            if (this.writeChains.get(id) === next) this.writeChains.delete(id);
-        });
+        // Clean up the chain entry once settled so the Map doesn't grow. The
+        // .catch() is load-bearing: .finally() returns a derived promise that
+        // nobody else holds — when the chain rejects (disk full, ENOENT after
+        // the dir vanished) it would surface as an unhandledRejection, which
+        // crashes the proxy on default Node settings. The real rejection is
+        // still delivered to the caller of writeNow.
+        next
+            .finally(() => {
+                if (this.writeChains.get(id) === next) this.writeChains.delete(id);
+            })
+            .catch(() => {});
         return next;
     }
 
