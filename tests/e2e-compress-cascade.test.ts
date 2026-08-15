@@ -90,7 +90,7 @@ function compressibleMessages(): CoreMessage[] {
             id: `h_${i}`,
             role: i % 2 === 0 ? "user" : "assistant",
             contentType: "text",
-            text: `historical detail ${i}. ${"x".repeat(2000)}`,
+            text: `historical detail ${i}. ${"x".repeat(6000)}`,
         });
     }
     return msgs;
@@ -109,7 +109,7 @@ test("e2e compress cascade: a 2w limit fires the compress nudge at 2w tokens; a 
         tokenCount,
         renderTags: "text-only",
     });
-    assert.ok(smallTurn.nudge?.shouldInject, "2w tokens at a 2w limit crosses the 70% threshold → compress nudge fires");
+    assert.ok(smallTurn.nudge?.shouldInject, "2w tokens at a 2w limit crosses the threshold and the merged compressible range exceeds minCompressRange → nudge fires (kernel ≥0.0.24 gates pressure nudges on effective pending)");
 
     const large = resolveRequestConfig(BASE, routes(), UPSTREAM, "gpt-large", 1_000_000, GLOBAL);
     assert.equal(large.modelContextLimit, 1_000_000, "native 100w window becomes the kernel context limit");

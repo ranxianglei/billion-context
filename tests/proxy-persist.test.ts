@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { mkdtempSync, rmSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative, sep } from "node:path";
 import { SessionStore } from "../src/persist.ts";
@@ -217,6 +217,35 @@ await withTempStore("hasPending reflects the debounce timer", async (store) => {
     assert.equal(store.hasPending(s.id), true);
     await settle();
     assert.equal(store.hasPending(s.id), false);
+});
+
+// Regression (2026-08-15, windows-latest CI flake on PR #158): the writeNow
+// per-session chain cleaned itself up via `next.finally(...)` — a derived
+// promise nobody held. When the chain rejected (the test's tmpdir was
+// removed before the async write hit the disk → ENOENT), that orphan
+// surfaced as a process-level unhandledRejection and failed the whole test
+// file. In production the same leak means a transient persist failure
+// (disk full, EPERM) crashes the proxy. The caller of writeNow still gets
+// the real rejection; only the cleanup side-effect must swallow.
+await withTempStore("writeNow rejection does not leak an unhandled rejection", async (store) => {
+    // Deterministic failure: point the store at a path whose parent is a
+    // regular FILE, so mkdir(recursive) cannot recreate the directory and
+    // the tmp-file write fails with ENOENT.
+    const blocker = join(tmpdir(), `bili-persist-blocker-${Date.now()}-${process.pid}`);
+    writeFileSync(blocker, "x");
+    const dead = new SessionStore({ dir: join(blocker, "sessions"), debounceMs: 5, enabled: true });
+    const unhandled: unknown[] = [];
+    const onUnhandled = (e: unknown) => unhandled.push(e);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+        const s = makeSession("orphan-check");
+        await assert.rejects(dead.writeNow(s), /ENOENT|ENOTDIR/);
+        await settle(50); // give any orphan a chance to surface
+    } finally {
+        process.off("unhandledRejection", onUnhandled);
+        rmSync(blocker, { force: true });
+    }
+    assert.equal(unhandled.length, 0, `orphan rejection leaked: ${unhandled.map(String).join("; ")}`);
 });
 
 await withTempStore("sessions are namespaced by protocol + provider on disk", async (store, dir) => {
