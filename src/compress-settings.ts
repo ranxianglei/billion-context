@@ -1,5 +1,6 @@
-import type { Config } from "acp-kernel";
+import { defaultPrompts, resolvePrompts, type Config, type Prompts } from "acp-kernel";
 import { findRoute, type CompressSettings, type ProviderRoutes } from "./config.js";
+import { log as loggerLog } from "./logger.js";
 
 /** Resolve a raw `contextLimit` value to an absolute token count.
  *  - `number` → used as-is (absolute window).
@@ -34,6 +35,12 @@ export function mergeCompress(
 ): CompressSettings {
     const pick = <K extends keyof CompressSettings>(k: K): CompressSettings[K] =>
         model?.[k] ?? provider?.[k] ?? global?.[k];
+    // `prompts` is the one nested-object field: merge SUB-field-wise across
+    // levels (global → provider → model) instead of whole-object replace, so a
+    // model-level override of howToCompressRules does not discard a
+    // provider-level compressPhilosophy. The kernel's resolvePrompts then
+    // fills any still-missing sub-fields from defaultPrompts.
+    const promptLevels = [global?.prompts, provider?.prompts, model?.prompts].filter(Boolean) as Partial<Prompts>[];
     return {
         modelContextLimit: pick("modelContextLimit"),
         maxContextLimit: pick("maxContextLimit"),
@@ -43,6 +50,8 @@ export function mergeCompress(
         preserveRecentTokens: pick("preserveRecentTokens"),
         minCompressRange: pick("minCompressRange"),
         tiers: pick("tiers"),
+        prompts: promptLevels.length > 0 ? Object.assign({}, ...promptLevels) : undefined,
+        acknowledgePromptsRisk: pick("acknowledgePromptsRisk"),
     };
 }
 
@@ -58,6 +67,30 @@ export function resolveCompress(
 ): CompressSettings {
     const route = findRoute(routes, upstreamUrl);
     return mergeCompress(global, route?.compress, model ? route?.models?.[model]?.compress : undefined);
+}
+
+let warnedPromptsRisk = false;
+
+/** Resolve the effective compression prompts from merged settings. `prompts`
+ *  overrides only take effect with `acknowledgePromptsRisk: true` at the
+ *  winning level (the kernel rules are load-bearing; see Prompts docs). When
+ *  ignored, a one-time warning is logged so the misconfiguration is visible.
+ *  Non-string fields inside `prompts` are silently dropped by the kernel's
+ *  resolvePrompts (a malformed partial never clobbers a good default). */
+export function resolveCompressPrompts(s: CompressSettings): Prompts {
+    if (!s.prompts) return defaultPrompts;
+    if (s.acknowledgePromptsRisk !== true) {
+        if (!warnedPromptsRisk) {
+            warnedPromptsRisk = true;
+            loggerLog("warn", "[compress] prompts override IGNORED: acknowledgePromptsRisk !== true. Set it to true to acknowledge the summary-quality risk.");
+        }
+        return defaultPrompts;
+    }
+    try {
+        return resolvePrompts(s.prompts, { acknowledgeRisk: true });
+    } catch {
+        return defaultPrompts;
+    }
 }
 
 /** True when a CompressSettings carries at least one configured field (i.e. it

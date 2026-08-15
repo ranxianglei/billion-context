@@ -1,11 +1,11 @@
 import http from "node:http";
 import fs from "node:fs";
-import { createCore, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, estimateTokensFast, renderNudgeText, deactivateBlock } from "acp-kernel";
+import { createCore, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, type Prompts, defaultPrompts, estimateTokensFast, renderNudgeText, deactivateBlock } from "acp-kernel";
+import { resolveCompress, resolveCompressPrompts, resolveRequestConfig } from "./compress-settings.js";
 import type { ProxyOptions } from "./config.js";
 import { loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
 import { resolveContextLimit, resolveCompressProtocol } from "./config.js";
-import { resolveRequestConfig } from "./compress-settings.js";
 import { contextFromRegistry, loadRegistry } from "./registry.js";
 import { fetchWithTimeout, MAX_REQUEST_BYTES } from "./fetch-util.js";
 import { formatUpstreamError, getUpstreamConnectionStatus, recordUpstreamConnection, resolveProxy, resolveProxyDecision, proxyDispatcher } from "./upstream-proxy.js";
@@ -289,6 +289,11 @@ type Prepared = {
     responsesProjection?: ResponsesProjection;
     anthropicSystem?: AnthropicRequestBody["system"];
     nudge?: NudgeDecision;
+    /** Effective compression prompts for this request (three-level cascade,
+     *  defaults to the kernel's defaultPrompts). Carried so the compress loop
+     *  in forward() rebuilds the SAME system prompt the request was prepared
+     *  with. */
+    prompts?: Prompts;
 };
 
 
@@ -527,6 +532,12 @@ async function handle(
     // absolute number, a "70%" string of the native window, or unset → native)
     // overrides the table.
     let reqConfig = config;
+    // Effective compression prompts for this request: resolved from the same
+    // three-level cascade (global → provider → model) as the limit above, then
+    // threaded into every prepare* path so the system prompt, the nudge text,
+    // and the compress-loop system prompt all use one consistent Prompts set
+    // (kernel contract: renderNudgeText and the adapter prompt must match).
+    let reqPrompts: Prompts = defaultPrompts;
     if (parsed && typeof parsed === "object") {
         const model = (parsed as { model?: string }).model;
         if (model) {
@@ -537,6 +548,7 @@ async function handle(
                 native = await contextFromRegistry(model, host);
             }
             reqConfig = resolveRequestConfig(config, opts.routes, embeddedUrl, model, native, opts.compress);
+            reqPrompts = resolveCompressPrompts(resolveCompress(opts.routes, embeddedUrl, model, opts.compress));
         }
     }
     let prepared: Prepared | null = null;
@@ -591,12 +603,12 @@ async function handle(
                     countTokens
                         ? prepareCountTokens(parsed as AnthropicRequestBody, core, reqConfig, log, session)
                         : protocol === "anthropic"
-                          ? prepareAnthropic(parsed as AnthropicRequestBody, req, opts, core, reqConfig, log, session)
+                          ? prepareAnthropic(parsed as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, log, session)
                           : protocol === "openai"
-                            ? prepareOpenai(parsed as OpenAIRequestBody, req, opts, core, reqConfig, log, session)
+                            ? prepareOpenai(parsed as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, log, session)
                             : responsesCompact
                               ? prepareResponsesCompact(bodyBuffer, parsed as ResponsesRequestBody, session)
-                              : prepareResponses(parsed as ResponsesRequestBody, req, opts, core, reqConfig, log, session, responsesIdentity!);
+                              : prepareResponses(parsed as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, responsesIdentity!);
                 await forward(req, res, opts, prepared!.body, prepared!, core, reqConfig, log, route, affinity);
             });
         } finally {
@@ -653,6 +665,7 @@ function prepareAnthropic(
     opts: ProxyOptions,
     core: CompressionCore,
     config: Config,
+    prompts: Prompts,
     log: (level: string, msg: string) => void,
     session: Session,
 ): Prepared {
@@ -694,7 +707,7 @@ function prepareAnthropic(
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = coreToAnthropic(processedMessages as BiliMessage[], cacheControls);
 
-        systemOut = injectSystem(parsed, opts);
+        systemOut = injectSystem(parsed, opts, prompts);
         if (opts.compress.injectTool) {
             toolsOut = injectTool(parsed.tools);
         }
@@ -702,7 +715,7 @@ function prepareAnthropic(
         // system block stays byte-stable so the prefix cache survives.
         if (opts.compress.injectNudge && turn.nudge?.shouldInject) {
             try {
-                const rendered = renderNudgeText(turn.nudge);
+                const rendered = renderNudgeText(turn.nudge, prompts);
                 if (rendered.text) {
                     rebuiltMessages = [...rebuiltMessages, { role: "user", content: rendered.text }];
                 }
@@ -713,10 +726,10 @@ function prepareAnthropic(
         log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
         processedMessages = [];
     }
+    markDirty(session);
 
     const rebuilt: AnthropicRequestBody = { ...parsed, messages: rebuiltMessages, system: systemOut, tools: toolsOut };
-    markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: opts.compress.injectTool, nudge } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: opts.compress.injectTool, nudge, prompts } as Prepared;
 }
 
 function prepareOpenai(
@@ -725,6 +738,7 @@ function prepareOpenai(
     opts: ProxyOptions,
     core: CompressionCore,
     config: Config,
+    prompts: Prompts,
     log: (level: string, msg: string) => void,
     session: Session,
 ): Prepared {
@@ -775,7 +789,7 @@ function prepareOpenai(
         // instead, mirroring pai-acp's design. Putting the nudge in system
         // would invalidate the cache every turn.
         const sysParts: string[] = [];
-        if (shouldInject) sysParts.push(buildCompressSystemPrompt());
+        if (shouldInject) sysParts.push(buildCompressSystemPrompt(prompts));
         rebuiltMessages = injectOpenaiSystem(rebuiltMessages, sysParts);
         if (shouldInject) {
             toolsOut = injectOpenaiTool(parsed.tools);
@@ -783,7 +797,7 @@ function prepareOpenai(
         // Nudge as a separate trailing user message (cache-friendly).
         if (opts.compress.injectNudge && turn.nudge?.shouldInject && shouldInject) {
             try {
-                const rendered = renderNudgeText(turn.nudge);
+                const rendered = renderNudgeText(turn.nudge, prompts);
                 if (rendered.text) {
                     rebuiltMessages = [...rebuiltMessages, { role: "user", content: rendered.text }];
                 }
@@ -806,7 +820,7 @@ function prepareOpenai(
         (rebuilt as Record<string, unknown>).stream_options = { include_usage: true };
     }
     markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: shouldInject, nudge } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: shouldInject, nudge, prompts } as Prepared;
 }
 
 function prepareResponses(
@@ -815,6 +829,7 @@ function prepareResponses(
     opts: ProxyOptions,
     core: CompressionCore,
     config: Config,
+    prompts: Prompts,
     log: (level: string, msg: string) => void,
     session: Session,
     identity: ConversationIdentity,
@@ -860,7 +875,7 @@ function prepareResponses(
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltInput = patchResponsesInput(projection, processedMessages);
         if (shouldInject && !process.env.ACP_NO_COMPRESS_PROMPT) {
-            const prompt = responsesTextProtocol ? buildCompressHybridSystemPrompt() : buildCompressSystemPrompt();
+            const prompt = responsesTextProtocol ? buildCompressHybridSystemPrompt(prompts) : buildCompressSystemPrompt(prompts);
             const devContent = [...projection.systemParts, prompt].join("\n\n---\n\n");
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent);
             if (!process.env.ACP_NO_INJECT_TOOL) {
@@ -873,7 +888,7 @@ function prepareResponses(
         }
         if (opts.compress.injectNudge && turn.nudge?.shouldInject && shouldInject) {
             try {
-                const rendered = renderNudgeText(turn.nudge);
+                const rendered = renderNudgeText(turn.nudge, prompts);
                 if (rendered.text) {
                     const inputItems: ResponseInputItem[] = typeof rebuiltInput === "string"
                         ? [{ type: "message", role: "user", content: rebuiltInput }]
@@ -932,6 +947,7 @@ function prepareResponses(
         compressInjected: shouldInject,
         responsesTextProtocol,
         nudge,
+        prompts,
     };
 }
 
@@ -1038,6 +1054,7 @@ export function resolvePromptCacheKey(
 function injectSystem(
     parsed: AnthropicRequestBody,
     opts: ProxyOptions,
+    prompts: Prompts = defaultPrompts,
 ): string | AnthropicRequestBody["system"] {
     // ONLY the static compress prompt goes into the system block — it is the
     // prefix-cache anchor and must stay byte-stable across turns. The nudge
@@ -1045,7 +1062,7 @@ function injectSystem(
     // the caller (prepareAnthropic), never merged into system.
     const baseText = extractSystem(parsed.system);
     const parts: string[] = [];
-    if (opts.compress.injectTool) parts.push(buildCompressSystemPrompt());
+    if (opts.compress.injectTool) parts.push(buildCompressSystemPrompt(prompts));
     if (parts.length === 0) return parsed.system;
     const full = baseText ? `${baseText}\n\n---\n\n${parts.join("\n\n")}` : parts.join("\n\n");
     return buildSystem(full, parsed.system);
@@ -1333,7 +1350,7 @@ async function forward(
             const parsedReq = JSON.parse(typeof body === "string" ? body : body.toString("utf8"));
             const reqHeaders = buildForwardHeaders(headers);
             const textProtocol = prepared.protocol === "responses" && !!prepared.responsesTextProtocol;
-            const systemPrompt = textProtocol ? buildCompressHybridSystemPrompt() : buildCompressSystemPrompt();
+            const systemPrompt = textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts);
             const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem);
             const abortCtrl = new AbortController();
             req.on("close", () => {

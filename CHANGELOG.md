@@ -3,6 +3,12 @@
 All notable changes to **billion-context** are documented here.
 Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag.
 
+## [Unreleased]
+
+### Features
+
+- **Customizable compression prompts** (#156): the `compress` block now accepts `prompts` — an override object for the compression prompt text (`compressPhilosophy`, `howToCompressRules`, `tier2DistillRules`, `tier3CondenseRules`) — merged sub-field-wise across the three config levels (global → provider → model) and applied consistently to the system prompt, the nudge text, and the compress loop. Because the kernel's default rules are load-bearing (tuned over months of production use), overrides are **inert until `acknowledgePromptsRisk: true`** is set at the winning level; without it they are ignored and a one-time warning is logged. Non-string fields are silently dropped. Mainly useful for non-English or small-model prompt tuning.
+
 ## [0.1.40] — 2026-08-13
 
 ### Features
