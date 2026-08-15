@@ -150,6 +150,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             let stopReason: string | undefined;
             let usageYielded = false;
             const indexMap = new Map<number, number>();
+            const thinkingIndexes = new Set<number>();
 
             for await (const eventStr of iterSseEvents(upstream)) {
                 const parsed = parseAnthropicSse(eventStr);
@@ -176,6 +177,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                         const id = typeof block.id === "string" ? block.id : `toolu_${upstreamIndex}`;
                         pending.set(upstreamIndex, { id, name, json: "" });
                     } else {
+                        if (block.type === "thinking" || block.type === "redacted_thinking") thinkingIndexes.add(upstreamIndex);
                         const ci = clientIndex++;
                         indexMap.set(upstreamIndex, ci);
                         yield { kind: "meta", chunk: remapIndexInEvent(eventStr, ci), firstRoundOnly: round === 1 } as ParsedStreamEvent;
@@ -190,6 +192,21 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                     } else if (delta.type === "text_delta" && typeof delta.text === "string") {
                         const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
                         yield { kind: "text", delta: delta.text, raw: remapIndexInEvent(eventStr, ci) } as ParsedStreamEvent;
+                    } else if (delta.type === "thinking_delta" && typeof delta.thinking === "string" && delta.thinking.length > 0) {
+                        const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
+                        yield {
+                            kind: "reasoning",
+                            delta: delta.thinking,
+                            ...(round === 1 ? { raw: remapIndexInEvent(eventStr, ci) } : {}),
+                        } as ParsedStreamEvent;
+                    } else if (delta.type === "signature_delta" && typeof delta.signature === "string") {
+                        const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
+                        yield {
+                            kind: "reasoning",
+                            delta: "",
+                            signature: delta.signature,
+                            ...(round === 1 ? { raw: remapIndexInEvent(eventStr, ci) } : {}),
+                        } as ParsedStreamEvent;
                     } else if (round === 1) {
                         const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
                         yield { kind: "meta", chunk: remapIndexInEvent(eventStr, ci), firstRoundOnly: true } as ParsedStreamEvent;
@@ -205,6 +222,14 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                             callId: tb.id,
                             arguments: tb.json,
                         } as ParsedStreamEvent;
+                    } else if (thinkingIndexes.delete(upstreamIndex)) {
+                        // Seal the current thinking segment so interleaved thinking
+                        // blocks each keep their own signature on rebuild.
+                        if (round === 1) {
+                            const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
+                            yield { kind: "meta", chunk: remapIndexInEvent(eventStr, ci), firstRoundOnly: true } as ParsedStreamEvent;
+                        }
+                        yield { kind: "reasoning", delta: "", blockEnd: true } as ParsedStreamEvent;
                     } else {
                         const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
                         yield { kind: "meta", chunk: remapIndexInEvent(eventStr, ci), firstRoundOnly: round === 1 } as ParsedStreamEvent;
@@ -246,6 +271,19 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
         emitText(delta) {
             return buildTextBlock(clientIndex++, delta);
         },
+        emitReasoning(delta) {
+            const index = clientIndex++;
+            return Buffer.from(
+                `event: content_block_start\n` +
+                `data: ${JSON.stringify({ type: "content_block_start", index, content_block: { type: "thinking", thinking: "" } })}\n\n` +
+                `event: content_block_delta\n` +
+                `data: ${JSON.stringify({ type: "content_block_delta", index, delta: { type: "thinking_delta", thinking: delta } })}\n\n` +
+                `event: content_block_stop\n` +
+                `data: ${JSON.stringify({ type: "content_block_stop", index })}\n\n`,
+                "utf8",
+            );
+        },
+
 
         emitToolCall(call) {
             return buildToolUseBlock(clientIndex++, call);
