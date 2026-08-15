@@ -31,7 +31,7 @@
 
 ## 4. Notes / Follow-ups
 
+- Follow-up commit (issue #1 comment: MITM + deeper cooperation): `BILLION_CONTEXT_PROXY` exported by `bili pi`/`codex`/`claude` launcher env builders (MITM detection signal for plugins); `x-bili-plugin-context-window` header — plugin-reported window replaces the `native` source in `resolveRequestConfig` (operator `compress.modelContextLimit` still outranks); `GET /__bili/plugin/status?conversationId=` endpoint (contextTokens/contextLimit/blocks/requests for plugin UIs); usage now applied BEFORE `res.end()` in `pipeThroughWithUsage` (client's next request must see it). Tests: 426/426.
 - Kernel `search()` is token-based, not substring: "lorem" does not match "lorem-ipsum" in a summary (test uses "plugin").
 - The kernel keeps the first user message of a compressed range anchored (turn-1 question survives, turn-1 answer folds) — consistent across wire and plugin modes; asserted only on the folded answer.
 - Follow-up (separate repos): billion-context-pi adopts the protocol as the reference plugin; per-agent plugins (opencode etc.) follow.
-- Not exposed in v1: `/__bili/stats` does not surface `lastInputTokens` (plugin UIs should use the `acp_status` tool for now).

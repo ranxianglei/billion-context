@@ -52,7 +52,7 @@ import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { emitStreamError } from "./stream-error.js";
 import { deriveSessionId as deriveProxySessionId, affinityToken, clientConversationHeader, type ConversationIdentity } from "./session-id.js";
-import { handlePluginManifest, handlePluginTool, pipePluginJson, pipeThroughWithUsage, pluginAgentHeader, pluginConversationHeader, recordPluginSession, rememberPluginMessages } from "./plugin.js";
+import { handlePluginManifest, handlePluginStatus, handlePluginTool, pipePluginJson, pipeThroughWithUsage, pluginAgentHeader, pluginContextWindowHeader, pluginConversationHeader, recordPluginSession, rememberPluginMessages } from "./plugin.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import { isLoopbackAddress } from "./util.js";
@@ -459,6 +459,16 @@ async function handle(
     // search_context/acp_status against the session the plugin drives. Both
     // live under the /__bili/ loopback + trusted-origin gate above.
     if (req.method === "GET" && req.url === "/__bili/plugin/manifest") return handlePluginManifest(res);
+    if (req.method === "GET" && req.url?.startsWith("/__bili/plugin/status")) {
+        const query = req.url.slice(req.url.indexOf("?") + 1);
+        const conversationId = new URLSearchParams(query).get("conversationId")?.trim() ?? "";
+        if (!conversationId) {
+            res.writeHead(400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: "conversationId query parameter is required" }));
+            return;
+        }
+        return handlePluginStatus(conversationId, res);
+    }
     if (req.method === "POST" && req.url === "/__bili/plugin/tool") {
         try {
             const body = await readBody(req);
@@ -567,7 +577,13 @@ async function handle(
         const model = (parsed as { model?: string }).model;
         if (model) {
             const embeddedUrl = route?.rewrittenUrl;
-            let native = resolveContextLimit(opts.routes, embeddedUrl, model);
+            // A cooperative plugin's reported window (the agent's own config)
+            // is the authoritative native window — it outranks the table and
+            // the models.dev registry (most valuable in MITM mode where the
+            // model may be a private relay), but operator tuning via
+            // compress.modelContextLimit still outranks it inside
+            // resolveRequestConfig.
+            let native = pluginContextWindowHeader(req.headers) ?? resolveContextLimit(opts.routes, embeddedUrl, model);
             if (!native && embeddedUrl) {
                 const host = (() => { try { return new URL(embeddedUrl).host; } catch { return undefined; } })();
                 native = await contextFromRegistry(model, host);
@@ -625,6 +641,7 @@ async function handle(
         const session = getSession(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? undefined });
         if (pluginMode) {
             if (session.metadata.pluginAgent !== pluginAgent) session.metadata.pluginAgent = pluginAgent;
+            session.metadata.effectiveContextLimit = reqConfig.modelContextLimit;
             recordPluginSession(pluginConversationHeader(req.headers) ?? conversation, session.id);
         }
         // acquireInFlight must precede the lock so evictOldest() cannot flush

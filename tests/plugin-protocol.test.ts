@@ -154,7 +154,7 @@ async function callPluginAnthropic(
     h: Harness,
     conversationId: string,
     messages: AnthropicMessage[],
-    opts: { tools?: unknown[]; stream?: boolean } = {},
+    opts: { tools?: unknown[]; stream?: boolean; contextWindow?: number } = {},
 ): Promise<{ raw: string; events: SseEvent[]; json: Record<string, unknown> | undefined }> {
     const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1/messages`, {
         method: "POST",
@@ -162,6 +162,7 @@ async function callPluginAnthropic(
             "content-type": "application/json",
             "x-bili-plugin": "pi-plugin/0.0.1",
             "x-bili-plugin-conversation": conversationId,
+            ...(opts.contextWindow !== undefined ? { "x-bili-plugin-context-window": String(opts.contextWindow) } : {}),
         },
         body: JSON.stringify({
             model: "claude-test",
@@ -387,6 +388,48 @@ test("plugin mode: non-streaming JSON response passes through and usage is sniff
         const mine = (stats.sessions ?? []).find((s) => s.label === conv);
         assert.ok(mine, "session for plugin conversation not found");
         assert.equal(mine!.inputTokens, 55);
+    } finally {
+        await h.close();
+    }
+});
+
+test("plugin-reported context window becomes the nudge denominator and is visible via status", async () => {
+    const h = await startHarness([textScript()]);
+    try {
+        const conv = "plug-conv-window";
+        // claude-test is configured at 400000 in the harness routes; the
+        // plugin reports the agent's own 50000 window → must win over the
+        // route value (authoritative native source).
+        await callPluginAnthropic(h, conv, [{ role: "user", content: "hello" }], { contextWindow: 50000 });
+
+        const missing = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/status`);
+        assert.equal(missing.status, 400);
+
+        const unknown = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/status?conversationId=never-seen`);
+        assert.equal(unknown.status, 404);
+
+        const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/status?conversationId=${conv}`);
+        assert.equal(resp.status, 200);
+        const status = (await resp.json()) as {
+            ok: boolean;
+            contextLimit: number | null;
+            contextTokens: number;
+            requests: number;
+            pluginAgent: string | null;
+        };
+        assert.equal(status.ok, true);
+        assert.equal(status.contextLimit, 50000, "plugin-reported window must override the route-configured 400000");
+        assert.equal(status.contextTokens, 66, "context level = input 55 + cached 11 (total prompt size the nudge sees)");
+        assert.equal(status.requests, 1);
+        assert.match(status.pluginAgent ?? "", /pi-plugin/);
+
+        // Without the header the route-configured window (400000) applies.
+        const conv2 = "plug-conv-window-default";
+        await callPluginAnthropic(h, conv2, [{ role: "user", content: "hello" }]);
+        const status2 = (await (await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/status?conversationId=${conv2}`)).json()) as {
+            contextLimit: number | null;
+        };
+        assert.equal(status2.contextLimit, 400000);
     } finally {
         await h.close();
     }

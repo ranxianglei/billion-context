@@ -25,6 +25,7 @@ import { normalizeSseLineEndings } from "./sse-util.js";
 
 export const PLUGIN_AGENT_HEADER = "x-bili-plugin";
 export const PLUGIN_CONVERSATION_HEADER = "x-bili-plugin-conversation";
+export const PLUGIN_CONTEXT_WINDOW_HEADER = "x-bili-plugin-context-window";
 
 export const PLUGIN_PROTOCOL_VERSION = 1;
 
@@ -51,6 +52,17 @@ export function pluginAgentHeader(headers: Record<string, string | string[] | un
 
 export function pluginConversationHeader(headers: Record<string, string | string[] | undefined>): string | undefined {
     return headerValue(headers, PLUGIN_CONVERSATION_HEADER);
+}
+
+/** The plugin reports its agent's own model context window (what the agent
+ *  configured, e.g. a pinned/overridden contextWindow). It replaces the
+ *  native-window source (built-in table / models.dev registry) in the config
+ *  cascade — operator tuning (compress.modelContextLimit) still outranks it. */
+export function pluginContextWindowHeader(headers: Record<string, string | string[] | undefined>): number | undefined {
+    const raw = headerValue(headers, PLUGIN_CONTEXT_WINDOW_HEADER);
+    if (raw === undefined) return undefined;
+    const n = Number.parseInt(raw, 10);
+    return Number.isFinite(n) && n > 0 ? n : undefined;
 }
 
 type ConversationEntry = { sessionId: string; lastSeen: number };
@@ -98,8 +110,9 @@ export function handlePluginManifest(res: import("node:http").ServerResponse): v
             openai: ACP_TOOLS_OPENAI,
             responses: ACP_TOOLS_RESPONSES,
         },
-        headers: { agent: PLUGIN_AGENT_HEADER, conversation: PLUGIN_CONVERSATION_HEADER },
+        headers: { agent: PLUGIN_AGENT_HEADER, conversation: PLUGIN_CONVERSATION_HEADER, contextWindow: PLUGIN_CONTEXT_WINDOW_HEADER },
         toolEndpoint: "/__bili/plugin/tool",
+        statusEndpoint: "/__bili/plugin/status",
     }));
 }
 
@@ -108,6 +121,36 @@ export type PluginToolDeps = {
     config: Config;
     log: (level: string, msg: string) => void;
 };
+
+/** Context-level visibility for plugin UIs (status bars / slash commands):
+ *  the same usage the nudge decision sees, keyed by conversation id. */
+export function handlePluginStatus(conversationId: string, res: import("node:http").ServerResponse): void {
+    const entry = conversations.get(conversationId);
+    const session = entry ? peekSession(entry.sessionId) : undefined;
+    if (!entry || !session) {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "unknown plugin conversation" }));
+        return;
+    }
+    entry.lastSeen = Date.now();
+    const limit = session.metadata.effectiveContextLimit;
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+        ok: true,
+        conversationId,
+        sessionId: session.id,
+        label: session.meta.label ?? null,
+        pluginAgent: session.metadata.pluginAgent ?? null,
+        contextLimit: typeof limit === "number" ? limit : null,
+        contextTokens: session.stats.lastInputTokens,
+        inputTokens: session.stats.inputTokens,
+        outputTokens: session.stats.outputTokens,
+        cachedTokens: session.stats.cachedTokens,
+        requests: session.stats.requests,
+        blocks: session.state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active })),
+        lastSeen: session.lastSeen,
+    }));
+}
 
 export async function handlePluginTool(
     payload: string,
@@ -275,13 +318,17 @@ export async function pipeThroughWithUsage(
             }
             if (res.destroyed || res.writableEnded) break;
         }
+        // Apply BEFORE res.end() in the finally below: the client can issue
+        // its next request (e.g. /__bili/plugin/status, or the follow-up turn
+        // that reads lastInputTokens for the nudge decision) the moment the
+        // stream completes, and those must already see this usage.
+        if (acc.inputTokens !== undefined || acc.outputTokens !== undefined || acc.cachedTokens !== undefined) {
+            applyUsageSample(session, acc);
+            markDirty(session);
+        }
     } finally {
         reader.releaseLock();
         res.end();
-    }
-    if (acc.inputTokens !== undefined || acc.outputTokens !== undefined || acc.cachedTokens !== undefined) {
-        applyUsageSample(session, acc);
-        markDirty(session);
     }
 }
 

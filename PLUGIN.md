@@ -41,9 +41,11 @@ Fetch once at plugin startup.
   },
   "headers": {
     "agent": "x-bili-plugin",
-    "conversation": "x-bili-plugin-conversation"
+    "conversation": "x-bili-plugin-conversation",
+    "contextWindow": "x-bili-plugin-context-window"
   },
-  "toolEndpoint": "/__bili/plugin/tool"
+  "toolEndpoint": "/__bili/plugin/tool",
+  "statusEndpoint": "/__bili/plugin/status"
 }
 ```
 
@@ -55,6 +57,7 @@ On **every model request** the plugin sends:
 
 - `x-bili-plugin: <agent-name>` — announces plugin mode for this session.
 - `x-bili-plugin-conversation: <conversation-id>` — the agent's real conversation/session id, stable for the whole conversation.
+- `x-bili-plugin-context-window: <tokens>` (optional but recommended) — the model's context window as configured inside the agent (e.g. a pinned/overridden `contextWindow`). This becomes the authoritative "native" window for nudge decisions — it outranks the proxy's built-in table and the models.dev registry (most valuable for private relays and MITM mode), while operator tuning (`compress.modelContextLimit`) still outranks it.
 
 Effects on the proxy for that session:
 
@@ -89,7 +92,34 @@ Notes:
 - `compress` mutates state; `decompress` / `search_context` / `acp_status` are read-only.
 - Errors: `400` invalid JSON / missing `conversationId` / unknown tool, `404` unknown conversation (no model request has arrived with that conversation id yet), `500` execution failure.
 
-### 4. Lifecycle of one compression (what the plugin does)
+### 4. `GET /__bili/plugin/status?conversationId=<id>`
+
+Context-level visibility for plugin UIs (status bars / slash commands):
+
+```json
+{
+  "ok": true,
+  "conversationId": "...",
+  "sessionId": "...",
+  "pluginAgent": "pi",
+  "contextLimit": 200000,
+  "contextTokens": 138211,
+  "inputTokens": 251000,
+  "outputTokens": 40021,
+  "cachedTokens": 180000,
+  "requests": 42,
+  "blocks": [{ "id": "b3", "tier": 1, "active": true }],
+  "lastSeen": 1755300000000
+}
+```
+
+`contextTokens` is the last reported context size (input + cache-read) — the same value the nudge decision reads. Errors: `400` missing `conversationId`, `404` unknown conversation.
+
+### 5. MITM transparent-proxy mode
+
+The `/bili/` prefix is absent in MITM mode, so URL-based detection cannot work. Instead the proxy's own launcher (`bili pi` / `bili codex` / `bili claude`) exports `BILLION_CONTEXT_PROXY=http://127.0.0.1:<port>` in the child env, next to the `HTTPS_PROXY` + CA vars it already sets. A plugin detects cooperative mode by reading that env var (the proxy origin for all `/__bili/plugin/*` calls); everything else (headers, tool forwarding, status) is identical — the `x-bili-plugin*` headers pass through the MITM tunnel into the same pipeline. This is also where `x-bili-plugin-context-window` matters most: MITM upstreams are often private relays the models.dev registry doesn't know.
+
+### 6. Lifecycle of one compression (what the plugin does)
 
 1. Model replies with a native `compress` tool call (args contain `startId`/`endId` refs it read from the tag-annotated context).
 2. The agent ends the assistant turn; the plugin's tool handler fires.
