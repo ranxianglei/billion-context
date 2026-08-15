@@ -27,13 +27,13 @@ type ChatMessage = {
     tool_call_id?: string;
 };
 
-export type GlmBridgeOptions = {
+export type ChatRelayOptions = {
     upstream: string;
     host?: string;
     port?: number;
 };
 
-export type GlmBridge = {
+export type ChatRelay = {
     server: http.Server;
     port: number;
     close(): Promise<void>;
@@ -183,7 +183,7 @@ async function pipeStream(chatBody: Record<string, unknown>, upstream: string, r
     });
     if (!upstreamResp.ok || !upstreamResp.body) {
         res.writeHead(502, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: { message: `glm bridge upstream ${upstreamResp.status}` } }));
+        res.end(JSON.stringify({ error: { message: `chat relay upstream ${upstreamResp.status}` } }));
         return;
     }
     res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
@@ -226,7 +226,7 @@ async function pipeStream(chatBody: Record<string, unknown>, upstream: string, r
                 }
                 handleChatChunk(obj, state, res, responseId, (text) => {
                     messageText += text;
-                });
+                }, messageText);
             }
         }
     }
@@ -247,6 +247,7 @@ function handleChatChunk(
     res: http.ServerResponse,
     responseId: string,
     onText: (text: string) => void,
+    messageText: string,
 ): void {
     const usage = obj.usage as { prompt_tokens?: number; completion_tokens?: number } | undefined;
     if (usage) {
@@ -302,7 +303,7 @@ function handleChatChunk(
             state.toolCalls.set(index, tc);
             ensureCreated(state, res, responseId);
             closeReasoning(state, res);
-            closeMessage(state, res, "");
+            closeMessage(state, res, messageText);
             res.write(
                 sseBlock("response.output_item.added", {
                     output_index: 0,
@@ -352,7 +353,7 @@ async function pipeJson(chatBody: Record<string, unknown>, upstream: string, res
     );
 }
 
-export async function startGlmBridge(options: GlmBridgeOptions): Promise<GlmBridge> {
+export async function startChatRelay(options: ChatRelayOptions): Promise<ChatRelay> {
     const server = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
         req.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -360,7 +361,7 @@ export async function startGlmBridge(options: GlmBridgeOptions): Promise<GlmBrid
             const url = req.url ?? "";
             if (req.method !== "POST" || !url.endsWith("/responses")) {
                 res.writeHead(404, { "content-type": "application/json" });
-                res.end(JSON.stringify({ error: { message: `glm bridge: unsupported ${req.method} ${url}` } }));
+                res.end(JSON.stringify({ error: { message: `chat relay: unsupported ${req.method} ${url}` } }));
                 return;
             }
             let body: Record<string, unknown>;
@@ -368,7 +369,7 @@ export async function startGlmBridge(options: GlmBridgeOptions): Promise<GlmBrid
                 body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>;
             } catch {
                 res.writeHead(400, { "content-type": "application/json" });
-                res.end(JSON.stringify({ error: { message: "glm bridge: invalid JSON" } }));
+                res.end(JSON.stringify({ error: { message: "chat relay: invalid JSON" } }));
                 return;
             }
             const chatBody = responsesToChat(body);
@@ -381,7 +382,7 @@ export async function startGlmBridge(options: GlmBridgeOptions): Promise<GlmBrid
                 }
             } catch (error) {
                 res.writeHead(502, { "content-type": "application/json" });
-                res.end(JSON.stringify({ error: { message: `glm bridge: ${(error as Error).message}` } }));
+                res.end(JSON.stringify({ error: { message: `chat relay: ${(error as Error).message}` } }));
             }
         });
     });

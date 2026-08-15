@@ -7,11 +7,11 @@ import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { startGlmBridge } from "./e2e/glm-bridge.ts";
+import { startChatRelay } from "./e2e/chat-relay.ts";
 
 type Captured = { url: string; body: string };
 
-type GlmScript = (requestIndex: number) => string[];
+type ChatRelayScript = (requestIndex: number) => string[];
 
 function listen(server: http.Server): Promise<void> {
     if (server.listening) return Promise.resolve();
@@ -28,7 +28,7 @@ function sseLine(obj: unknown): string {
 
 const DELAY_MS = 40;
 
-function startMockGlm(script: GlmScript, captured: Captured[]): http.Server {
+function startMockChatRelay(script: ChatRelayScript, captured: Captured[]): http.Server {
     const server = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
         req.on("data", (chunk: Buffer) => chunks.push(chunk));
@@ -146,14 +146,14 @@ type Harness = {
     cleanup(): Promise<void>;
 };
 
-async function startHarness(script: GlmScript, marker: boolean): Promise<Harness> {
+async function startHarness(script: ChatRelayScript, marker: boolean): Promise<Harness> {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const captured: Captured[] = [];
-    const glm = startMockGlm(script, captured);
-    await listen(glm);
-    const glmPort = (glm.address() as { port: number }).port;
-    const bridge = await startGlmBridge({ upstream: `http://127.0.0.1:${glmPort}/v1/chat/completions` });
+    const relay = startMockChatRelay(script, captured);
+    await listen(relay);
+    const relayPort = (relay.address() as { port: number }).port;
+    const bridge = await startChatRelay({ upstream: `http://127.0.0.1:${relayPort}/v1/chat/completions` });
     const route: Record<string, unknown> = { models: { "gpt-test": { context: 400_000 } } };
     if (marker) route.compressProtocol = "marker";
     const opts: ProxyOptions = {
@@ -182,7 +182,7 @@ async function startHarness(script: GlmScript, marker: boolean): Promise<Harness
         cleanup: async () => {
             await close(proxy);
             await bridge.close();
-            await close(glm);
+            await close(relay);
         },
     };
 }
@@ -237,7 +237,7 @@ async function callResponses(h: Harness, input: unknown[], tools?: unknown[]): P
 
 const USER_INPUT = [{ type: "message", role: "user", content: [{ type: "input_text", text: "hello" }] }];
 
-test("e2e glm bridge: responses text streams through bili with incremental deltas (native protocol)", async () => {
+test("e2e chat relay: responses text streams through bili with incremental deltas (native protocol)", async () => {
     const h = await startHarness((i) => (i === 0 ? textScript() : roundTwoTextScript()), false);
     try {
         const { events, arrivals } = await callResponses(h, USER_INPUT);
@@ -249,20 +249,20 @@ test("e2e glm bridge: responses text streams through bili with incremental delta
         const contentChunks = arrivals.filter((a) => a.text.includes("output_text.delta"));
         const span = contentChunks[contentChunks.length - 1]!.t - contentChunks[0]!.t;
         assert.ok(span >= 50, `deltas buffered, not streamed (span=${span}ms)`);
-        const glmReq = JSON.parse(h.captured[0]!.body) as { messages: Array<{ role: string; content?: string }>; tools?: Array<{ type: string; function: { name: string } }> };
-        const systemMsg = glmReq.messages.find((m) => m.role === "system");
-        assert.ok(systemMsg, `instructions not lifted to system/developer message: ${JSON.stringify(glmReq.messages.map((m) => m.role))}`);
+        const chatRelayReq = JSON.parse(h.captured[0]!.body) as { messages: Array<{ role: string; content?: string }>; tools?: Array<{ type: string; function: { name: string } }> };
+        const systemMsg = chatRelayReq.messages.find((m) => m.role === "system");
+        assert.ok(systemMsg, `instructions not lifted to system/developer message: ${JSON.stringify(chatRelayReq.messages.map((m) => m.role))}`);
         assert.match(systemMsg?.content ?? "", /test assistant/);
         assert.ok(
-            (glmReq.tools ?? []).some((t) => t.type === "function" && t.function.name === "compress"),
-            `bili-injected compress tool not converted to nested chat format: ${JSON.stringify(glmReq.tools)}`,
+            (chatRelayReq.tools ?? []).some((t) => t.type === "function" && t.function.name === "compress"),
+            `bili-injected compress tool not converted to nested chat format: ${JSON.stringify(chatRelayReq.tools)}`,
         );
     } finally {
         await h.cleanup();
     }
 });
 
-test("e2e glm bridge: marker protocol coalesces text into one delta and rebuilds message lifecycle (by design)", async () => {
+test("e2e chat relay: marker protocol coalesces text into one delta and rebuilds message lifecycle (by design)", async () => {
     const h = await startHarness((i) => (i === 0 ? textScript() : roundTwoTextScript()), true);
     try {
         const { events } = await callResponses(h, USER_INPUT);
@@ -283,7 +283,7 @@ test("e2e glm bridge: marker protocol coalesces text into one delta and rebuilds
     }
 });
 
-test("e2e glm bridge: namespaced function_call passes through raw with stable item id (issue #143 regression, marker protocol)", async () => {
+test("e2e chat relay: namespaced function_call passes through raw with stable item id (issue #143 regression, marker protocol)", async () => {
     const h = await startHarness((i) => (i === 0 ? namespacedToolScript() : textScript()), true);
     try {
         const { events } = await callResponses(h, USER_INPUT, [
@@ -310,7 +310,7 @@ test("e2e glm bridge: namespaced function_call passes through raw with stable it
     }
 });
 
-test("e2e glm bridge: reasoning item lifecycle preserved end-to-end (issue #94 regression, marker protocol)", async () => {
+test("e2e chat relay: reasoning item lifecycle preserved end-to-end (issue #94 regression, marker protocol)", async () => {
     const h = await startHarness((i) => (i === 0 ? reasoningScript() : textScript()), true);
     try {
         const { events } = await callResponses(h, USER_INPUT);
@@ -325,7 +325,7 @@ test("e2e glm bridge: reasoning item lifecycle preserved end-to-end (issue #94 r
     }
 });
 
-test("e2e glm bridge: compress tool-call round-trip on responses path (marker protocol)", async () => {
+test("e2e chat relay: compress tool-call round-trip on responses path (marker protocol)", async () => {
     const h = await startHarness((i) => (i === 0 ? compressScript() : roundTwoTextScript()), true);
     const big = "y".repeat(2000);
     try {
@@ -350,7 +350,7 @@ test("e2e glm bridge: compress tool-call round-trip on responses path (marker pr
     }
 });
 
-test("e2e glm bridge: namespaced function_call passthrough also works in native responses protocol", async () => {
+test("e2e chat relay: namespaced function_call passthrough also works in native responses protocol", async () => {
     const h = await startHarness((i) => (i === 0 ? namespacedToolScript() : textScript()), false);
     try {
         const { events } = await callResponses(h, USER_INPUT, [
@@ -360,6 +360,58 @@ test("e2e glm bridge: namespaced function_call passthrough also works in native 
         assert.ok(added, "output_item.added for function_call missing (native protocol)");
         assert.equal((added!.data!.item as Record<string, unknown>).name, "agents.spawn_agent");
         assert.ok(!events.some((e) => JSON.stringify(e).includes("fc-proxy-")), "fc-proxy- id leaked (native protocol)");
+    } finally {
+        await h.cleanup();
+    }
+});
+
+test("e2e chat relay: text before tool_call keeps full text in message lifecycle (regression: closeMessage lost accumulated text)", async () => {
+    const mixedScript: string[] = [
+        sseLine({ id: "g1", object: "chat.completion.chunk", choices: [{ index: 0, delta: { role: "assistant", content: "Thinking out " } }] }),
+        sseLine({ id: "g1", object: "chat.completion.chunk", choices: [{ index: 0, delta: { content: "loud, now calling." } }] }),
+        sseLine({
+            id: "g1",
+            object: "chat.completion.chunk",
+            choices: [
+                {
+                    index: 0,
+                    delta: {
+                        content: null,
+                        tool_calls: [
+                            {
+                                index: 0,
+                                id: "call_mixed_1",
+                                type: "function",
+                                function: { name: "agents.spawn_agent", arguments: JSON.stringify({ task: "demo" }) },
+                            },
+                        ],
+                    },
+                },
+            ],
+        }),
+        sseLine({ id: "g1", object: "chat.completion.chunk", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }], usage: { prompt_tokens: 10, completion_tokens: 5 } }),
+    ];
+    const h = await startHarness((i) => (i === 0 ? mixedScript : textScript()), true);
+    try {
+        const { events } = await callResponses(h, USER_INPUT, [
+            { type: "function", name: "agents.spawn_agent", description: "spawn", parameters: { type: "object", properties: {} } },
+        ]);
+        const deltas = events.filter((e) => e.event === "response.output_text.delta");
+        assert.ok(deltas.length >= 1, "text deltas missing before tool_call");
+        assert.equal(deltas.map((d) => String(d.data?.delta ?? "")).join(""), "Thinking out loud, now calling.");
+        const textDone = events.find((e) => e.event === "response.output_text.done");
+        assert.ok(textDone, "output_text.done missing for text-before-tool_call message");
+        assert.equal(String(textDone!.data?.text ?? ""), "Thinking out loud, now calling.");
+        const msgDone = events.find((e) => e.event === "response.output_item.done" && String((e.data?.item as Record<string, unknown> | undefined)?.type) === "message");
+        assert.ok(msgDone, "message output_item.done missing before function_call");
+        const completed = events.find((e) => e.event === "response.completed");
+        const output = (completed?.data?.response as Record<string, unknown> | undefined)?.output as Array<Record<string, unknown>> | undefined;
+        assert.ok(Array.isArray(output), "completed.output missing");
+        const msgItem = output?.find((item) => item.type === "message");
+        assert.ok(msgItem, "completed.output missing message item");
+        const text = (msgItem?.content as Array<{ type: string; text?: string }> | undefined)?.find((c) => c.type === "output_text")?.text;
+        assert.equal(text, "Thinking out loud, now calling.");
+        assert.ok(output?.some((item) => item.type === "function_call" && item.name === "agents.spawn_agent"), "completed.output missing function_call item");
     } finally {
         await h.cleanup();
     }
