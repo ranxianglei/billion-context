@@ -471,7 +471,7 @@ function buildSession(parsed: PersistedSession): Session {
         createdAt: parsed.createdAt ?? Date.now(),
         lastSeen: Date.now(),
         blockContents,
-        lastMessages: parsed.messages,
+        lastMessages: Array.isArray(parsed.messages) ? parsed.messages : undefined,
         inFlight: 0,
         persisted: true,
     };

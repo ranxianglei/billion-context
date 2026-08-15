@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { defaultConfig } from "acp-kernel";
@@ -205,6 +205,12 @@ test("parseCompressSettings accepts tuned fields and rejects malformed ones", ()
     assert.equal(parseCompressSettings({ tiers: "yes" }), undefined);
     assert.equal(parseCompressSettings({ modelContextLimit: "seventy percent" }), undefined);
     assert.deepEqual(parseCompressSettings({}), {});
+    // Injection toggles are file-level fields shown in the web UI — they must
+    // round-trip, and malformed ones are rejected like every other field.
+    assert.deepEqual(parseCompressSettings({ injectTool: false, injectNudge: true }), { injectTool: false, injectNudge: true });
+    assert.deepEqual(parseCompressSettings({ injectTool: false, nudgeGrowthTokens: 4000 }), { injectTool: false, nudgeGrowthTokens: 4000 });
+    assert.equal(parseCompressSettings({ injectTool: "no" }), undefined);
+    assert.equal(parseCompressSettings({ injectNudge: 1 }), undefined);
 });
 
 test("#154: PUT /__bili/config with compress hot-applies the global compress block", async () => {
@@ -273,6 +279,67 @@ test("#154: PUT /__bili/config with compress hot-applies the global compress blo
         assert.equal(cleared.status, 200);
         const final = await (await fetch(`${base}/__bili/config`)).json() as { compress: unknown };
         assert.equal(final.compress, null);
+    } finally {
+        await close(proxy);
+        if (prevConfig === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = prevConfig;
+        rmSync(root, { recursive: true, force: true });
+    }
+});
+
+// Regression: the file's compress block may carry the global injection
+// toggles (injectTool / injectNudge — FileConfig.compress, honored by
+// loadOptions via `=== false`). GET returns the raw file block, so the web
+// UI's compress textarea shows them, and an unchanged save must round-trip
+// them: dropping them silently flips injectTool:false back to the enabled
+// default on the next loadOptions().
+test("compress round-trip preserves injectTool/injectNudge injection toggles", async () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    const root = path.join(tmpdir(), `bili-put-toggles-${process.pid}-${Date.now()}`);
+    mkdirSync(root, { recursive: true });
+    const biliConfig = path.join(root, "billion-context.json");
+    const toggles = { injectTool: false, nudgeGrowthTokens: 4000 };
+    writeFileSync(biliConfig, JSON.stringify({ providers: {}, compress: toggles }) + "\n", "utf8");
+    const prevConfig = process.env.BILI_CONFIG_FILE;
+    process.env.BILI_CONFIG_FILE = biliConfig;
+    const port = await freePort();
+    const opts: ProxyOptions = {
+        port,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1:1",
+        routes: {},
+        proxy: "",
+        proxyMode: "direct",
+        proxySource: "direct",
+        modelContextLimit: 400_000,
+        kernelConfig: defaultConfig(400_000),
+        compress: { injectTool: false, injectNudge: true },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        mitm: { enabled: false, domains: [] },
+    };
+    const proxy = await startServer(opts);
+    if (!proxy.listening) await once(proxy, "listening");
+    const base = `http://127.0.0.1:${port}`;
+    try {
+        // UI flow: GET shows the file block (incl. the toggles); "save" sends
+        // the textarea content back unchanged.
+        const before = await (await fetch(`${base}/__bili/config`)).json() as { compress: Record<string, unknown> };
+        assert.deepEqual(before.compress, toggles);
+        const put = await fetch(`${base}/__bili/config`, {
+            method: "PUT",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ compress: before.compress }),
+        });
+        assert.equal(put.status, 200);
+        const fileAfter = JSON.parse(readFileSync(biliConfig, "utf8")) as { compress: unknown };
+        assert.deepEqual(fileAfter.compress, toggles, "unchanged web save must not strip injectTool from the file");
+        const after = await (await fetch(`${base}/__bili/config`)).json() as { compress: unknown };
+        assert.deepEqual(after.compress, toggles);
     } finally {
         await close(proxy);
         if (prevConfig === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = prevConfig;

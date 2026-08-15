@@ -472,7 +472,7 @@ export function parseUpstreamProxyMode(value: string | undefined): UpstreamProxy
     return value === "manual" || value === "auto" ? value : "direct";
 }
 
-export function parseCompressSettings(v: unknown): CompressSettings | undefined {
+export function parseCompressSettings(v: unknown): (CompressSettings & { injectTool?: boolean; injectNudge?: boolean }) | undefined {
     if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
     const obj = v as Record<string, unknown>;
     const out: CompressSettings = {};
@@ -496,6 +496,16 @@ export function parseCompressSettings(v: unknown): CompressSettings | undefined 
     if ("tiers" in obj) {
         if (typeof obj.tiers !== "boolean") ok = false;
         else out.tiers = obj.tiers;
+    }
+    // Injection toggles are file-level fields (FileConfig.compress) honored by
+    // loadOptions via `=== false`; the web UI shows them from the raw file
+    // block, so they must round-trip here. Dropping them would silently
+    // re-enable injectTool/injectNudge on an unchanged save.
+    for (const key of ["injectTool", "injectNudge"] as const) {
+        if (key in obj) {
+            if (typeof obj[key] !== "boolean") ok = false;
+            else (out as Record<string, unknown>)[key] = obj[key];
+        }
     }
     if ("acknowledgePromptsRisk" in obj) {
         if (typeof obj.acknowledgePromptsRisk !== "boolean") ok = false;

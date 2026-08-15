@@ -149,7 +149,11 @@ export async function handleConfigPut(
     } catch (error) {
         return sendError(res, 500, `failed to apply config: ${String(error)}`);
     }
-    log("info", `[acp-web] configuration updated (${hasProviders ? `${Object.keys(routes).length} routes` : "network only"})`);
+    const changed: string[] = [];
+    if (hasProviders) changed.push(`${Object.keys(routes).length} routes`);
+    if (hasProxy || hasMode) changed.push("network");
+    if (hasCompress) changed.push("compress");
+    log("info", `[acp-web] configuration updated (${changed.join(", ") || "none"})`);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true, providers: hasProviders ? Object.keys(routes).length : undefined }));
 }
