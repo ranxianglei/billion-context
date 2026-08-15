@@ -241,6 +241,20 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Status:** ACTIVE
 - **Description:** Enable multi-tier compression — tier-2 distillation of old summaries and tier-3 condensation. Set `false` to run in tier-1-only mode (every summary is a flat tier-1 summary). Maps to the kernel field `tiers.enabled`.
 
+#### `prompts`
+
+- **Type:** `object` (`{ compressPhilosophy?, howToCompressRules?, tier2DistillRules?, tier3CondenseRules? }`, all strings)
+- **Default:** *(kernel defaults — see `acp-kernel` `defaultPrompts`)*
+- **Status:** ACTIVE
+- **Description:** Override the compression prompt text injected into the system prompt and nudge messages. Every field is **load-bearing**: the kernel rules were tuned over months of production use, and overriding them can degrade summary quality (lost paths / signatures / decisions → broken retrieval). Overrides only take effect when `acknowledgePromptsRisk: true` is set at the same (winning) level; otherwise they are ignored and a one-time warning is logged. Non-string fields are silently dropped (a malformed partial never clobbers a good default). Useful mainly for non-English or small-model tuning — see issue #156.
+
+#### `acknowledgePromptsRisk`
+
+- **Type:** `boolean`
+- **Default:** `false`
+- **Status:** ACTIVE
+- **Description:** Must be `true` for `prompts` overrides to take effect. Setting it acknowledges the summary-quality risk documented above.
+
 ### Injection toggles (global only)
 
 These two toggles are honoured only at the **global** level. Setting them inside a per-provider or per-model `compress` block has no effect.
