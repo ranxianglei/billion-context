@@ -1,5 +1,5 @@
 import type { CoreMessage } from "acp-kernel";
-import { coreToOpenai, injectOpenaiSystem } from "../openai.js";
+import { coreToOpenai, injectOpenaiSystem } from "acp-kernel/wire";
 import { buildVisibilityMarker } from "../compress-loop.js";
 import type {
     CompressLoopAdapter,

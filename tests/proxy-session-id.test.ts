@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { deriveSessionId, affinityToken, clientConversationHeader } from "../src/session-id.ts";
-import { conversationIdentityResponses, conversationSignalResponses } from "../src/responses.ts";
+import { conversationIdentityResponses, conversationSignalResponses } from "acp-kernel/wire";
 
 /** Helper: build a minimal headers object. */
 function hdrs(auth?: string, sessionAffinity?: string): Record<string, string> {

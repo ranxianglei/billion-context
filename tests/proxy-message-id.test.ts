@@ -1,11 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { anthropicToCore } from "../src/anthropic.ts";
-import { openaiToCore } from "../src/openai.ts";
-import { responsesToCore } from "../src/responses.ts";
-import type { AnthropicMessage, AnthropicRequestBody } from "../src/anthropic.ts";
-import type { OpenAIRequestBody } from "../src/openai.ts";
-import type { ResponsesRequestBody } from "../src/responses.ts";
+import { anthropicToCore } from "acp-kernel/wire";
+import { openaiToCore } from "acp-kernel/wire";
+import { responsesToCore } from "acp-kernel/wire";
+import type { AnthropicMessage, AnthropicRequestBody } from "acp-kernel/wire";
+import type { OpenAIRequestBody } from "acp-kernel/wire";
+import type { ResponsesRequestBody } from "acp-kernel/wire";
 
 // --- Anthropic ---
 

@@ -6,7 +6,7 @@ import type { Session } from "../src/session.ts";
 import { runCompressLoop, createResponsesAdapter } from "../src/loop/index.ts";
 import type { ParsedStreamEvent } from "../src/loop/core.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
-import { responsesToCore, patchResponsesInput, injectResponsesDeveloperMessage, type ResponseInputItem } from "../src/responses.ts";
+import { responsesToCore, patchResponsesInput, injectResponsesDeveloperMessage, type ResponseInputItem } from "acp-kernel/wire";
 
 function makeCtx(messages: CoreMessage[] = []): {
     core: ReturnType<typeof createCore>;

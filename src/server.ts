@@ -9,6 +9,8 @@ import { resolveContextLimit, resolveCompressProtocol } from "./config.js";
 import { contextFromRegistry, loadRegistry } from "./registry.js";
 import { fetchWithTimeout, MAX_REQUEST_BYTES } from "./fetch-util.js";
 import { formatUpstreamError, getUpstreamConnectionStatus, recordUpstreamConnection, resolveProxy, resolveProxyDecision, proxyDispatcher } from "./upstream-proxy.js";
+// Protocol codecs live in the kernel now (single source of truth shared with
+// the omp/pi adapters): import from "acp-kernel/wire".
 import {
     anthropicToCore,
     coreToAnthropic,
@@ -16,7 +18,7 @@ import {
     extractSystem,
     buildSystem,
     type AnthropicRequestBody,
-} from "./anthropic.js";
+} from "acp-kernel/wire";
 import {
     openaiToCore,
     coreToOpenai,
@@ -24,7 +26,7 @@ import {
     conversationSignalOpenai,
     type OpenAIRequestBody,
     type OpenAITool,
-} from "./openai.js";
+} from "acp-kernel/wire";
 import {
     type ResponsesRequestBody,
     type ResponseInputItem,
@@ -34,7 +36,7 @@ import {
     injectResponsesDeveloperMessage,
     conversationIdentityResponses,
     conversationSignalResponses,
-} from "./responses.js";
+} from "acp-kernel/wire";
 import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary } from "./session.js";
 import { COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressHybridSystemPrompt } from "./compress-tool.js";
 import { rewriteSseStream, rewriteJsonResponse, type RewriteCtx } from "./stream.js";
@@ -51,7 +53,7 @@ import { rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { emitStreamError } from "./stream-error.js";
 import { deriveSessionId as deriveProxySessionId, affinityToken, clientConversationHeader, type ConversationIdentity } from "./session-id.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
-import type { BiliMessage } from "./bili-message.js";
+import type { BiliMessage } from "acp-kernel/wire";
 import { isLoopbackAddress } from "./util.js";
 
 import { decodeRequestBody } from "./content-encoding.js";
