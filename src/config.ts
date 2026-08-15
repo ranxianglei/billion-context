@@ -497,6 +497,28 @@ export function parseCompressSettings(v: unknown): CompressSettings | undefined 
         if (typeof obj.tiers !== "boolean") ok = false;
         else out.tiers = obj.tiers;
     }
+    if ("acknowledgePromptsRisk" in obj) {
+        if (typeof obj.acknowledgePromptsRisk !== "boolean") ok = false;
+        else out.acknowledgePromptsRisk = obj.acknowledgePromptsRisk;
+    }
+    if ("prompts" in obj && obj.prompts !== undefined) {
+        const prompts = obj.prompts;
+        if (!prompts || typeof prompts !== "object" || Array.isArray(prompts)) {
+            ok = false;
+        } else {
+            const cleaned: Partial<Prompts> = {};
+            for (const [key, value] of Object.entries(prompts as Record<string, unknown>)) {
+                if (typeof value !== "string" || value.trim().length === 0) { ok = false; continue; }
+                if (key !== "compressPhilosophy" && key !== "howToCompressRules"
+                    && key !== "tier2DistillRules" && key !== "tier3CondenseRules") {
+                    ok = false;
+                    continue;
+                }
+                (cleaned as Record<string, string>)[key] = value;
+            }
+            if (ok) out.prompts = cleaned;
+        }
+    }
     if (!ok) return undefined;
     return out;
 }

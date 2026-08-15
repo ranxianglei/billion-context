@@ -143,6 +143,42 @@ test("PUT /__bili/config with providers takes effect without a separate reload c
     }
 });
 
+test("parseCompressSettings round-trips prompts overrides (#155 + #157 interplay)", () => {
+    const withPrompts = {
+        nudgeGrowthTokens: 4000,
+        acknowledgePromptsRisk: true,
+        prompts: {
+            compressPhilosophy: "custom philosophy",
+            howToCompressRules: "custom rules",
+        },
+    };
+    assert.deepEqual(parseCompressSettings(withPrompts), withPrompts);
+    // Full four-field prompts object passes through.
+    const full = {
+        prompts: {
+            compressPhilosophy: "p",
+            howToCompressRules: "r",
+            tier2DistillRules: "t2",
+            tier3CondenseRules: "t3",
+        },
+    };
+    assert.deepEqual(parseCompressSettings(full), full);
+    // Prompts without the risk acknowledgement are still stored (the gate is
+    // enforced at resolve time, not by the parser).
+    assert.deepEqual(parseCompressSettings({ prompts: { compressPhilosophy: "x" } }), { prompts: { compressPhilosophy: "x" } });
+    // Malformed prompts are rejected, not silently dropped.
+    assert.equal(parseCompressSettings({ prompts: { compressPhilosophy: 42 } }), undefined);
+    assert.equal(parseCompressSettings({ prompts: { unknownKey: "x" } }), undefined);
+    assert.equal(parseCompressSettings({ prompts: { compressPhilosophy: "   " } }), undefined);
+    assert.equal(parseCompressSettings({ prompts: "not an object" }), undefined);
+    assert.equal(parseCompressSettings({ acknowledgePromptsRisk: "yes" }), undefined);
+    // Regression: saving unrelated compress fields from the web UI must not
+    // strip prompts that live in the config file (PUT validates the whole
+    // block, so prompts must be accepted here, not dropped).
+    const mixed = { tiers: true, prompts: { tier2DistillRules: "t2" }, acknowledgePromptsRisk: true };
+    assert.deepEqual(parseCompressSettings(mixed), mixed);
+});
+
 test("parseCompressSettings accepts tuned fields and rejects malformed ones", () => {
     assert.deepEqual(parseCompressSettings({
         modelContextLimit: "70%",
