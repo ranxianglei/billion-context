@@ -241,6 +241,20 @@
 - **状态：** ACTIVE
 - **说明：** 启用多层压缩 —— 对旧摘要进行 tier-2 蒸馏，以及 tier-3 凝缩。设为 `false` 可运行在仅 tier-1 模式（每个摘要都是扁平的 tier-1 摘要）。映射到内核字段 `tiers.enabled`。
 
+#### `prompts`
+
+- **类型：** `object`（`{ compressPhilosophy?, howToCompressRules?, tier2DistillRules?, tier3CondenseRules? }`，均为字符串）
+- **默认值：** *（内核默认值 —— 见 `acp-kernel` 的 `defaultPrompts`）*
+- **状态：** ACTIVE
+- **说明：** 覆盖注入到系统提示词与 nudge 消息中的压缩提示词文本。每个字段都是**承重的（load-bearing）**：内核规则经过数月生产调优，覆盖它们可能降低摘要质量（丢失路径 / 签名 / 决策 → 检索失效）。只有当同一（胜出的）层级同时设置了 `acknowledgePromptsRisk: true` 时覆盖才生效；否则会被忽略并记录一次警告。非字符串字段会被静默丢弃（畸形的局部配置不会破坏正常默认值）。主要用于非英文或小模型调优 —— 见 issue #156。
+
+#### `acknowledgePromptsRisk`
+
+- **类型：** `boolean`
+- **默认值：** `false`
+- **状态：** ACTIVE
+- **说明：** 必须为 `true`，`prompts` 覆盖才会生效。设置它即表示知悉上文所述的摘要质量风险。
+
 ### 注入开关（仅全局生效）
 
 这两个开关只在**全局**层级生效。在按 provider 或按模型的 `compress` 块中设置它们无效。
