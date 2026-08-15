@@ -121,7 +121,7 @@ export const COMPRESS_TOOL_OPENAI = {
 
 export function buildCompressSystemPrompt(prompts: Prompts = defaultPrompts): string {
     return `${prompts.compressPhilosophy}
- 
+
 ${prompts.howToCompressRules}
 
 ACP TAGS
@@ -153,7 +153,7 @@ When you see past compress tool calls in the conversation, their summary paramet
  *  require real tools). */
 export function buildCompressTextSystemPrompt(prompts: Prompts = defaultPrompts): string {
     return `${prompts.compressPhilosophy}
- 
+
 ${prompts.howToCompressRules}
 
 ACP TAGS
@@ -203,7 +203,7 @@ Rules for ALL triggers:
  *  coexist in one turn. */
 export function buildCompressHybridSystemPrompt(prompts: Prompts = defaultPrompts): string {
     return `${prompts.compressPhilosophy}
- 
+
 ${prompts.howToCompressRules}
 
 ACP TAGS
