@@ -11,6 +11,7 @@
  *   bili start --config FILE      path to config file (default: XDG)
  *   bili start --passthrough      forward without compression
  *   bili pi/codex/claude [args]   start a proxy + launch a client via cert-MITM
+ *   bili export [id] [--full]     export a persisted session as a handoff doc
  *   bili test pi                  non-polluting pi smoke test
  *   bili --version
  *   bili --help
@@ -24,6 +25,7 @@ import { startServer } from "./server.js";
 import { configFile as defaultConfigFile } from "./paths.js";
 import { checkForUpdate, startAutoUpdate } from "./update.js";
 import { runLaunch, runTestPi, isLaunchClient, type ClientName } from "./launcher.js";
+import { exportSession } from "./export.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -59,6 +61,8 @@ Usage:
   bili codex [opts --] [args]      start a proxy + launch codex against it (cert-MITM)
   bili claude [opts --] [args]     start a proxy + launch claude against it (cert-MITM)
   bili test pi                     non-polluting pi smoke test through the proxy
+  bili export [session] [--full]   list sessions / export one as a Markdown handoff
+                                    (--full includes original messages; --output FILE)
   bili update                      check for & install a newer version now
   bili --version                   print version
   bili --help                      show this help
@@ -96,20 +100,26 @@ Docs: https://github.com/ranxianglei/billion-context
 `;
 
 type Parsed = {
-    command: "start" | "update" | "help" | "version" | "launch" | "test";
+    command: "start" | "update" | "help" | "version" | "launch" | "test" | "export";
     client?: ClientName;
     clientArgs: string[];
     mitmDomains: string[];
     overrides: Record<string, string | undefined>;
+    exportSelector?: string;
+    exportOutput?: string;
+    exportFull?: boolean;
 };
 
-function parseArgs(argv: string[]): Parsed {
+export function parseArgs(argv: string[]): Parsed {
     const overrides: Record<string, string | undefined> = {};
     let command: Parsed["command"] = "start";
     const positional: string[] = [];
     let client: ClientName | undefined;
     let clientArgs: string[] = [];
     const mitmDomains: string[] = [];
+    let exportSelector: string | undefined;
+    let exportOutput: string | undefined;
+    let exportFull = false;
 
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i]!;
@@ -146,6 +156,18 @@ function parseArgs(argv: string[]): Parsed {
                     process.exit(2);
                 }
                 mitmDomains.push(val);
+                break;
+            }
+            case "--full":
+                exportFull = true;
+                break;
+            case "--output": {
+                const val = argv[++i];
+                if (val === undefined) {
+                    console.error(`bili: ${a} requires a value`);
+                    process.exit(2);
+                }
+                exportOutput = val;
                 break;
             }
             case "--port":
@@ -187,6 +209,9 @@ function parseArgs(argv: string[]): Parsed {
             command = command === "help" || command === "version" ? command : "start";
         } else if (cmd === "update") {
             command = "update";
+        } else if (cmd === "export") {
+            command = "export";
+            exportSelector = positional[1];
         } else if (cmd === "test") {
             const target = positional[1];
             if (target && isLaunchClient(target)) {
@@ -202,17 +227,27 @@ function parseArgs(argv: string[]): Parsed {
         }
     }
 
-    return { command, client, clientArgs, mitmDomains, overrides };
+    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull };
 }
 
 export async function main(): Promise<void> {
-    const { command, client, clientArgs, mitmDomains, overrides } = parseArgs(process.argv.slice(2));
+    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull } = parseArgs(process.argv.slice(2));
     if (command === "help") {
         process.stdout.write(HELP);
         return;
     }
     if (command === "version") {
         process.stdout.write(VERSION + "\n");
+        return;
+    }
+    if (command === "export") {
+        try {
+            const text = await exportSession(exportSelector, { output: exportOutput, full: exportFull });
+            process.stdout.write(text + "\n");
+        } catch (error) {
+            console.error(`bili export: ${error instanceof Error ? error.message : String(error)}`);
+            process.exit(1);
+        }
         return;
     }
     if (command === "update") {

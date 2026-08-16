@@ -159,6 +159,11 @@ export function resolveCaCertPath(env: NodeJS.ProcessEnv): string {
     return path.join(base, "billion-context", "ca", "root-ca.pem");
 }
 
+export function resolveCombinedCaPath(env: NodeJS.ProcessEnv): string {
+    const base = env.XDG_DATA_HOME || path.join(os.homedir(), ".local/share");
+    return path.join(base, "billion-context", "ca", "combined-ca.pem");
+}
+
 export function extractDomains(upstreams: string[]): string[] {
     const seen = new Set<string>();
     const out: string[] = [];
@@ -581,7 +586,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         piTmpHome = preparePiHttpRewrite(resolvePiHome(process.env), handle.origin, routes.httpRewrites, routes.httpsRewrites);
         if (piTmpHome) env.PI_CODING_AGENT_DIR = piTmpHome;
     } else if (base === "codex") {
-        env = buildCodexEnv(handle.origin, ca, process.env);
+        env = buildCodexEnv(handle.origin, resolveCombinedCaPath(process.env), process.env);
         clientArgs = buildCodexArgs(handle.origin, routes.httpRewrites, routes.httpsRewrites, params.clientArgs);
     } else {
         env = buildClaudeEnv(handle.origin, ca, routes.httpRewrites, routes.httpsRewrites, process.env);
