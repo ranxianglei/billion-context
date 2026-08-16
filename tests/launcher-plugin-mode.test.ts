@@ -186,8 +186,9 @@ test("launcher identity binding does not leak onto other sessions", async () => 
 });
 
 test("launcher injection builders: direct-URL env, MCP config JSON, codex -c args", () => {
-    assert.equal(launcherDirectUrl({}), true, "direct URL is the default");
-    assert.equal(launcherDirectUrl({ BILI_LAUNCHER_MITM: "1" }), false, "MITM opt-out honored");
+    assert.equal(launcherDirectUrl({}), false, "transparent-MITM route is the default (existing launcher compatibility)");
+    assert.equal(launcherDirectUrl({ BILI_LAUNCHER_DIRECT: "1" }), true, "direct URL is opt-in");
+    assert.equal(launcherDirectUrl({ BILI_LAUNCHER_DIRECT: "0" }), false, "explicit opt-out honored");
 
     const env = buildClaudePluginEnv("http://127.0.0.1:8787", true, { HOME: "/h" });
     assert.equal(env.ANTHROPIC_BASE_URL, "http://127.0.0.1:8787/bili/https://api.anthropic.com");

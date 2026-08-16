@@ -104,16 +104,21 @@ bili pi --mitm-domain api.foo.com     # add a domain to the MITM whitelist
 **Plugin-in-launcher mode (#162)** — for `claude` and `codex` the launcher
 additionally injects a single `bili` MCP server (`--mcp-config` for claude,
 `-c mcp_servers.bili.*` for codex — both ephemeral, nothing written to host
-config) and routes via **direct URL** (claude's `ANTHROPIC_BASE_URL` /
-codex's provider `base_url` pointing at the `/bili/` prefix — no MITM, no CA
-trust). The result is the native-plugin experience of [PLUGIN.md](PLUGIN.md)
+config). The traffic route is **unchanged by default** — the transparent-
+MITM proxy as before — so existing setups keep working exactly as they did
+(OAuth-subscription traffic, custom relay endpoints). Opt in to **direct URL
+routing** (`BILI_LAUNCHER_DIRECT=1`) to drop MITM/CA trust entirely (claude's
+`ANTHROPIC_BASE_URL` / codex's provider `base_url` pointing at the `/bili/`
+prefix); the launcher prints a warning when direct mode changes your traffic
+route. The result is the native-plugin experience of [PLUGIN.md](PLUGIN.md)
 with zero setup: the four ACP tools appear as native MCP tools, executed on
 the proxy under the session lock, while the proxy keeps state, folding,
 philosophy prompt and nudges. Session binding is automatic — claude passes
 its session id to MCP children and on every request; codex spawns bind on
 first sight. Opt-outs: `BILI_LAUNCHER_PLUGIN=0` (plain launcher, wire-injected
-tools), `BILI_LAUNCHER_MITM=1` (old transparent-MITM route, needed for OAuth
-subscription traffic). Mode matrix:
+tools). `BILI_LAUNCHER_DIRECT=1` is an opt-in, not an opt-out.
+
+Mode matrix:
 
 | Mode | Tools surface | Setup | When |
 |------|--------------|-------|------|

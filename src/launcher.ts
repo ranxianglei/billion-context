@@ -285,10 +285,14 @@ export function buildClaudeEnv(
 // spawn-time flags, never touching host config files on disk. ---
 
 /** Direct-URL mode: the host talks to the proxy via the /bili/ prefix (no
- *  MITM/CA). Default ON for claude/codex; set BILI_LAUNCHER_MITM=1 to keep
- *  the old transparent-proxy route (needed for OAuth-subscription traffic). */
+ *  MITM/CA). OPT-IN via BILI_LAUNCHER_DIRECT=1 — the default keeps the
+ *  transparent-proxy (MITM) route so existing `bili claude` / `bili codex`
+ *  setups behave exactly as before: OAuth-subscription traffic and custom
+ *  relay endpoints (ANTHROPIC_BASE_URL / codex provider config) keep working.
+ *  Direct mode changes what the host points at, so it must be a deliberate
+ *  choice, not a silent upgrade. */
 export function launcherDirectUrl(env: NodeJS.ProcessEnv): boolean {
-    return env.BILI_LAUNCHER_MITM !== "1";
+    return env.BILI_LAUNCHER_DIRECT === "1";
 }
 
 /** Ephemeral MCP config for --mcp-config / -c mcp_servers.bili.*: a single
@@ -633,6 +637,17 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     let piTmpHome: string | undefined;
     const tmpFiles: string[] = [];
     const directUrl = launcherDirectUrl(process.env);
+    if (directUrl) {
+        if (base === "codex") {
+            console.error(
+                "bili: direct-URL mode — codex's LLM traffic does NOT go through the proxy, so compression is not applied (only the bili MCP tool calls do). For full compression use the default MITM mode (unset BILI_LAUNCHER_DIRECT).",
+            );
+        } else if (base === "claude") {
+            console.error(
+                "bili: direct-URL mode — claude's ANTHROPIC_BASE_URL is overridden to the proxy; a pre-configured relay is bypassed unless BILI_CLAUDE_UPSTREAM=<relay> is set. OAuth-subscription traffic requires the default MITM mode.",
+            );
+        }
+    }
     const injectMcp = base !== "pi" && process.env.BILI_LAUNCHER_PLUGIN !== "0";
     const origin = handle.origin;
     if (base === "pi") {
