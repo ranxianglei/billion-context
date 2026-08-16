@@ -7,8 +7,7 @@ import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { subagentNamespace } from "../src/responses.ts";
-import { deriveMessageId } from "../src/message-id.ts";
+import { subagentNamespace, deriveMessageId } from "acp-kernel/wire";
 
 function listen(server: http.Server): Promise<void> {
     if (server.listening) return Promise.resolve();
