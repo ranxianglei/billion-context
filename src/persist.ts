@@ -111,6 +111,7 @@ function mergeState(parsed: CompressionState): CompressionState {
         stats: { ...fresh.stats, ...(parsed.stats ?? {}) },
         nextBlockId: parsed.nextBlockId ?? fresh.nextBlockId,
         nextRunId: parsed.nextRunId ?? fresh.nextRunId,
+        tokenSnapshot: parsed.tokenSnapshot ?? fresh.tokenSnapshot,
     };
 }
 
