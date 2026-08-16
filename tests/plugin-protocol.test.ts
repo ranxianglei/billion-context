@@ -9,7 +9,8 @@ import { defaultConfig } from "acp-kernel";
 import { startServer, type ProxyOptions } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { _resetPluginStateForTest } from "../src/plugin.ts";
+import { _resetPluginStateForTest, pluginReportedContextWindow } from "../src/plugin.ts";
+import { clientConversationHeader } from "../src/session-id.ts";
 
 interface Harness {
     proxyPort: number;
@@ -391,6 +392,45 @@ test("plugin mode: non-streaming JSON response passes through and usage is sniff
     } finally {
         await h.close();
     }
+});
+
+test("plugin-protocol headers are honored only from requests announcing x-bili-plugin", () => {
+    // x-bili-plugin-context-window: a plain client must not be able to
+    // rewrite the nudge denominator by sending a plugin-protocol header.
+    assert.equal(
+        pluginReportedContextWindow({ "x-bili-plugin-context-window": "50000" }),
+        undefined,
+        "context-window header without the plugin marker is ignored",
+    );
+    assert.equal(
+        pluginReportedContextWindow({ "x-bili-plugin": "pi-plugin/0.0.1", "x-bili-plugin-context-window": "50000" }),
+        50000,
+        "plugin marker + reported window is honored",
+    );
+    assert.equal(
+        pluginReportedContextWindow({ "x-bili-plugin": "pi-plugin/0.0.1", "x-bili-plugin-context-window": "junk" }),
+        undefined,
+        "non-numeric reported window falls back to the cascade",
+    );
+
+    // x-bili-plugin-conversation: likewise gated on the marker, while the
+    // legacy client headers keep working without any marker.
+    assert.equal(
+        clientConversationHeader({ "x-bili-plugin-conversation": "steal-me" }),
+        undefined,
+        "plugin conversation header without the marker is ignored",
+    );
+    assert.equal(
+        clientConversationHeader({ "x-bili-plugin": "pi-plugin/0.0.1", "x-bili-plugin-conversation": "steal-me" }),
+        "steal-me",
+        "plugin conversation header honored with the marker",
+    );
+    assert.equal(
+        clientConversationHeader({ "x-bili-plugin-conversation": "steal-me", "x-claude-code-session-id": "legacy-1" }),
+        "legacy-1",
+        "falls through to the legacy client header",
+    );
+    assert.equal(clientConversationHeader({ "x-session-id": "zcode-1" }), "zcode-1");
 });
 
 test("plugin-reported context window becomes the nudge denominator and is visible via status", async () => {

@@ -53,7 +53,7 @@ import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { emitStreamError } from "./stream-error.js";
 import { deriveSessionId as deriveProxySessionId, affinityToken, clientConversationHeader, type ConversationIdentity } from "./session-id.js";
-import { handlePluginManifest, handlePluginStatus, handlePluginTool, pipePluginJson, pipeThroughWithUsage, pluginAgentHeader, pluginContextWindowHeader, pluginConversationHeader, recordPluginSession, rememberPluginMessages } from "./plugin.js";
+import { handlePluginManifest, handlePluginStatus, handlePluginTool, pipePluginJson, pipeThroughWithUsage, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages } from "./plugin.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import { isLoopbackAddress } from "./util.js";
@@ -584,8 +584,10 @@ async function handle(
             // the models.dev registry (most valuable in MITM mode where the
             // model may be a private relay), but operator tuning via
             // compress.modelContextLimit still outranks it inside
-            // resolveRequestConfig.
-            let native = pluginContextWindowHeader(req.headers) ?? resolveContextLimit(opts.routes, embeddedUrl, model);
+            // resolveRequestConfig. Gated on the x-bili-plugin marker: the
+            // header is protocol-internal, and a plain client must not be
+            // able to rewrite the nudge denominator by name.
+            let native = pluginReportedContextWindow(req.headers) ?? resolveContextLimit(opts.routes, embeddedUrl, model);
             if (!native && embeddedUrl) {
                 const host = (() => { try { return new URL(embeddedUrl).host; } catch { return undefined; } })();
                 native = await contextFromRegistry(model, host);

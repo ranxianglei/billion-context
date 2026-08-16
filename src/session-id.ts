@@ -51,13 +51,18 @@ export function clientConversationHeader(headers: Record<string, string | string
     // statement of which conversation it is driving (see src/plugin.ts).
     // It outranks every other signal — the plugin owns the session identity
     // in plugin mode (this is what fixes pi's content-fingerprint collision
-    // risk for plugin-equipped agents).
+    // risk for plugin-equipped agents). Honored ONLY when the plugin marker
+    // header x-bili-plugin is present: the protocol always sends both
+    // together, and trusting a plugin-protocol header from any client would
+    // let an unauthenticated LAN client steer the proxy's session identity.
     // x-claude-code-session-id next: the CLI's true per-session UUID — the
     // strongest legacy signal. The name is client-specific, so no other agent
     // (opencode/codex/zcode/curl) ever hits it; their own headers are
     // unchanged below.
+    const pluginMarker = typeof headers["x-bili-plugin"] === "string";
     const names = ["x-bili-plugin-conversation", "x-claude-code-session-id", "x-session-affinity", "x-acp-session", "x-session-id", "x-opencode-session", "session-id", "session_id"];
     for (const name of names) {
+        if (name === "x-bili-plugin-conversation" && !pluginMarker) continue;
         const v = headers[name];
         if (typeof v === "string" && v.trim().length > 0) return v.trim();
     }

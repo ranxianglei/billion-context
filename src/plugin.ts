@@ -65,6 +65,15 @@ export function pluginContextWindowHeader(headers: Record<string, string | strin
     return Number.isFinite(n) && n > 0 ? n : undefined;
 }
 
+/** The reported window is honored ONLY from a request that also announces
+ *  itself as a plugin (x-bili-plugin). This header is protocol-internal:
+ *  honoring it from a plain (non-plugin) client would let anyone who can
+ *  reach the endpoint rewrite the nudge denominator. A real plugin sends
+ *  both headers together (see the manifest's `headers` block). */
+export function pluginReportedContextWindow(headers: Record<string, string | string[] | undefined>): number | undefined {
+    return pluginAgentHeader(headers) !== undefined ? pluginContextWindowHeader(headers) : undefined;
+}
+
 type ConversationEntry = { sessionId: string; lastSeen: number };
 type RememberedMessages = { processed: CoreMessage[]; original: CoreMessage[]; nudge?: NudgeDecision };
 
