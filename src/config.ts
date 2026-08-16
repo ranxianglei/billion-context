@@ -472,6 +472,67 @@ export function parseUpstreamProxyMode(value: string | undefined): UpstreamProxy
     return value === "manual" || value === "auto" ? value : "direct";
 }
 
+export function parseCompressSettings(v: unknown): (CompressSettings & { injectTool?: boolean; injectNudge?: boolean }) | undefined {
+    if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
+    const obj = v as Record<string, unknown>;
+    const out: CompressSettings = {};
+    const numberOrPercent = (value: unknown): value is number | string =>
+        typeof value === "number" && Number.isFinite(value)
+        || (typeof value === "string" && /^\d+(\.\d+)?%$/.test(value.trim()));
+    let ok = true;
+    const takeNumber = (key: keyof CompressSettings): void => {
+        if (!(key in obj)) return;
+        if (typeof obj[key] !== "number" || !Number.isFinite(obj[key] as number)) ok = false;
+        else (out as Record<string, unknown>)[key] = obj[key];
+    };
+    for (const key of ["modelContextLimit", "maxContextLimit", "emergencyThresholdPercent"] as const) {
+        if (!(key in obj)) continue;
+        if (!numberOrPercent(obj[key])) { ok = false; continue; }
+        (out as Record<string, unknown>)[key] = typeof obj[key] === "string" ? (obj[key] as string).trim() : obj[key];
+    }
+    for (const key of ["nudgeGrowthTokens", "preserveRecentMessages", "preserveRecentTokens", "minCompressRange"] as const) {
+        takeNumber(key);
+    }
+    if ("tiers" in obj) {
+        if (typeof obj.tiers !== "boolean") ok = false;
+        else out.tiers = obj.tiers;
+    }
+    // Injection toggles are file-level fields (FileConfig.compress) honored by
+    // loadOptions via `=== false`; the web UI shows them from the raw file
+    // block, so they must round-trip here. Dropping them would silently
+    // re-enable injectTool/injectNudge on an unchanged save.
+    for (const key of ["injectTool", "injectNudge"] as const) {
+        if (key in obj) {
+            if (typeof obj[key] !== "boolean") ok = false;
+            else (out as Record<string, unknown>)[key] = obj[key];
+        }
+    }
+    if ("acknowledgePromptsRisk" in obj) {
+        if (typeof obj.acknowledgePromptsRisk !== "boolean") ok = false;
+        else out.acknowledgePromptsRisk = obj.acknowledgePromptsRisk;
+    }
+    if ("prompts" in obj && obj.prompts !== undefined) {
+        const prompts = obj.prompts;
+        if (!prompts || typeof prompts !== "object" || Array.isArray(prompts)) {
+            ok = false;
+        } else {
+            const cleaned: Partial<Prompts> = {};
+            for (const [key, value] of Object.entries(prompts as Record<string, unknown>)) {
+                if (typeof value !== "string" || value.trim().length === 0) { ok = false; continue; }
+                if (key !== "compressPhilosophy" && key !== "howToCompressRules"
+                    && key !== "tier2DistillRules" && key !== "tier3CondenseRules") {
+                    ok = false;
+                    continue;
+                }
+                (cleaned as Record<string, string>)[key] = value;
+            }
+            if (ok) out.prompts = cleaned;
+        }
+    }
+    if (!ok) return undefined;
+    return out;
+}
+
 function rejectLegacyRoute(key: string, value: unknown): void {
     if (typeof value !== "string") return;
     throw new Error(

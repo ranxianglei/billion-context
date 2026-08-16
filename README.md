@@ -109,6 +109,13 @@ How the client is pointed at the proxy (set automatically in the child env):
 | claude      | `HTTPS_PROXY`       | `NODE_EXTRA_CA_CERTS`   |
 | codex       | `HTTPS_PROXY`       | `SSL_CERT_FILE`         |
 
+`NODE_EXTRA_CA_CERTS` *appends* to the built-in trust store, so it points at
+the MITM root alone (`root-ca.pem`). `SSL_CERT_FILE` *replaces* the default
+CA bundle, so for codex it points at `combined-ca.pem` — a bundle containing
+the MITM root **plus** the system/Node public roots — keeping pip/git/curl
+style TLS (blind-tunnelled, real certificates) working inside the child env
+(#152).
+
 The real upstream HTTPS hosts are **discovered by reading** (never editing)
 the client's own config, so whatever you already have set up keeps working:
 
@@ -125,7 +132,8 @@ now auto-proxied too. Both schemes are covered with no config edits:
 - **HTTPS upstreams → cert MITM.** The MITM CA cert is the proxy's own root
   (`~/.local/share/billion-context/ca/root-ca.pem`, generated lazily); the
   client must trust it — pi/claude honor `NODE_EXTRA_CA_CERTS`, codex honors
-  `SSL_CERT_FILE`. Compression is injected on the intercepted TLS stream.
+  `SSL_CERT_FILE` (which points at `combined-ca.pem`, see above). Compression
+  is injected on the intercepted TLS stream.
 - **HTTP upstreams → `/bili/` baseURL rewrite** (since plaintext can't be
   MITM'd). The launcher rewrites the client's base URL through the client's own
   mechanism, leaving its config files untouched: codex via `-c key=value` flags,
@@ -661,6 +669,49 @@ conversations through the proxy. pi is fine for a single agent, but is **not
 recommended** for many concurrent conversations because of the collision
 risk — until pi grows its own session-id signal. For pi multi-agent use,
 pass an explicit `x-acp-session` header per conversation to avoid collisions.
+
+### Codex subagents get their own compression namespace (#150)
+
+Codex subagents (e.g. the `guardian_subagent` approval reviewer) reuse the
+main conversation's `session_id`, so on the wire they look like the same
+session. Without care their requests inherit the main conversation's
+compression state — a subagent turn can get its context folded (losing the
+verbatim user authorization it must read back) and the two roles' usage
+estimates pollute each other.
+
+billion-context detects this via the `instructions` field: subagent requests
+carry their own role prompt. The **first** instructions seen for a
+conversation anchor the main namespace (stable even if the main prompt
+drifts); any other instructions value maps to a separate `|sub:` namespace
+with its own empty compression state. Subagent requests are self-contained
+replays, so the fresh namespace is lossless — and the web UI's session list
+shows the two namespaces as separate sessions sharing the same client label.
+
+### Sessions depend on the proxy (#151)
+
+Compression state (blocks, summaries, original message cache) lives **in the
+proxy**, not in the client. The client's own local history is the full
+uncompressed view. Two consequences:
+
+- If you point the client back at the real upstream (or stop the proxy), the
+  client replays its **full local history** every turn. After a long
+  compressed session this can exceed the model's context window
+  (`context_window_exceeded`).
+- There is no way to "unpack" a compression block into the client's local
+  history — the client never saw the compressed form.
+
+**Migrating off the proxy:** export the session and paste it into a fresh
+conversation as a handoff:
+
+```bash
+bili export                      # list persisted sessions (id, label, blocks)
+bili export <id|label>           # print a Markdown handoff (block summaries)
+bili export <id> --full          # include the original messages per block
+bili export <id> --full --output handoff.md
+```
+
+Then start a new conversation in the client (direct to upstream) and paste
+the handoff doc as the opening context.
 
 ## Status
 
