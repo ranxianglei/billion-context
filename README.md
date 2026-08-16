@@ -101,6 +101,27 @@ bili test pi                          # quick end-to-end smoke test of the pi pa
 bili pi --mitm-domain api.foo.com     # add a domain to the MITM whitelist
 ```
 
+**Plugin-in-launcher mode (#162)** — for `claude` and `codex` the launcher
+additionally injects a single `bili` MCP server (`--mcp-config` for claude,
+`-c mcp_servers.bili.*` for codex — both ephemeral, nothing written to host
+config) and routes via **direct URL** (claude's `ANTHROPIC_BASE_URL` /
+codex's provider `base_url` pointing at the `/bili/` prefix — no MITM, no CA
+trust). The result is the native-plugin experience of [PLUGIN.md](PLUGIN.md)
+with zero setup: the four ACP tools appear as native MCP tools, executed on
+the proxy under the session lock, while the proxy keeps state, folding,
+philosophy prompt and nudges. Session binding is automatic — claude passes
+its session id to MCP children and on every request; codex spawns bind on
+first sight. Opt-outs: `BILI_LAUNCHER_PLUGIN=0` (plain launcher, wire-injected
+tools), `BILI_LAUNCHER_MITM=1` (old transparent-MITM route, needed for OAuth
+subscription traffic). Mode matrix:
+
+| Mode | Tools surface | Setup | When |
+|------|--------------|-------|------|
+| Launcher + MCP (default for claude/codex) | native MCP tools | none — just `bili claude` / `bili codex` | best UX |
+| Launcher wire mode (`BILI_LAUNCHER_PLUGIN=0`) | proxy-injected wire tools | none | fallback |
+| Manual plugin (pi etc.) | agent-side plugin | install plugin | hosts with plugin APIs |
+| Manual baseURL | proxy-injected wire tools | edit client config | exotic hosts |
+
 How the client is pointed at the proxy (set automatically in the child env):
 
 | Client      | Proxy redirect      | CA trust env var        |

@@ -281,6 +281,56 @@ export function buildClaudeEnv(
     return env;
 }
 
+// --- Launcher plugin mode (#162): inject the MCP shell + session hooks as
+// spawn-time flags, never touching host config files on disk. ---
+
+/** Direct-URL mode: the host talks to the proxy via the /bili/ prefix (no
+ *  MITM/CA). Default ON for claude/codex; set BILI_LAUNCHER_MITM=1 to keep
+ *  the old transparent-proxy route (needed for OAuth-subscription traffic). */
+export function launcherDirectUrl(env: NodeJS.ProcessEnv): boolean {
+    return env.BILI_LAUNCHER_MITM !== "1";
+}
+
+/** Ephemeral MCP config for --mcp-config / -c mcp_servers.bili.*: a single
+ *  "bili" stdio server running dist/mcp.js. Args are kept flat so codex's
+ *  TOML value parser stays happy. */
+export function buildMcpConfig(origin: string): { mcpServers: { bili: { command: string; args: string[]; env: Record<string, string> } } } {
+    const script = process.argv[1] ? path.resolve(path.dirname(process.argv[1]), "mcp.js") : "bili-mcp";
+    return {
+        mcpServers: {
+            bili: {
+                command: process.execPath,
+                args: [script],
+                env: { BILI_MCP_PROXY: origin },
+            },
+        },
+    };
+}
+
+/** Ephemeral Claude Code settings for --settings: direct-URL mode only needs
+ *  the base URL, which we pass via spawn env (ANTHROPIC_BASE_URL) — no
+ *  settings file, no hooks. Session registration happens inside the MCP
+ *  shell (CLAUDE_CODE_SESSION_ID is passed to MCP children by claude
+ *  itself, verified 2.1.227). */
+export function buildClaudePluginEnv(origin: string, directUrl: boolean, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    if (!directUrl) return baseEnv;
+    const upstream = baseEnv.BILI_CLAUDE_UPSTREAM?.trim() || "https://api.anthropic.com";
+    return { ...baseEnv, ANTHROPIC_BASE_URL: wrapUpstream(origin, upstream) };
+}
+
+/** Codex: -c inline overrides for the bili MCP server only. */
+export function buildCodexMcpArgs(origin: string): string[] {
+    const script = process.argv[1] ? path.resolve(path.dirname(process.argv[1]), "mcp.js") : "bili-mcp";
+    return [
+        "-c",
+        `mcp_servers.bili.command=${JSON.stringify(process.execPath)}`,
+        "-c",
+        `mcp_servers.bili.args=${JSON.stringify(JSON.stringify([script]))}`,
+        "-c",
+        `mcp_servers.bili.env.BILI_MCP_PROXY=${JSON.stringify(origin)}`,
+    ];
+}
+
 export function preparePiHttpRewrite(
     piHome: string,
     origin: string,
@@ -581,15 +631,34 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     let env: NodeJS.ProcessEnv;
     let clientArgs = params.clientArgs;
     let piTmpHome: string | undefined;
+    const tmpFiles: string[] = [];
+    const directUrl = launcherDirectUrl(process.env);
+    const injectMcp = base !== "pi" && process.env.BILI_LAUNCHER_PLUGIN !== "0";
+    const origin = handle.origin;
     if (base === "pi") {
-        env = buildPiEnv(handle.origin, ca, process.env);
-        piTmpHome = preparePiHttpRewrite(resolvePiHome(process.env), handle.origin, routes.httpRewrites, routes.httpsRewrites);
+        env = buildPiEnv(origin, ca, process.env);
+        piTmpHome = preparePiHttpRewrite(resolvePiHome(process.env), origin, routes.httpRewrites, routes.httpsRewrites);
         if (piTmpHome) env.PI_CODING_AGENT_DIR = piTmpHome;
     } else if (base === "codex") {
-        env = buildCodexEnv(handle.origin, resolveCombinedCaPath(process.env), process.env);
-        clientArgs = buildCodexArgs(handle.origin, routes.httpRewrites, routes.httpsRewrites, params.clientArgs);
+        if (directUrl) {
+            env = { ...process.env, BILLION_CONTEXT_PROXY: origin };
+            clientArgs = [...buildCodexMcpArgs(origin), ...clientArgs];
+        } else {
+            env = buildCodexEnv(origin, resolveCombinedCaPath(process.env), process.env);
+            clientArgs = buildCodexArgs(origin, routes.httpRewrites, routes.httpsRewrites, clientArgs);
+            if (injectMcp) clientArgs = [...buildCodexMcpArgs(origin), ...clientArgs];
+        }
     } else {
-        env = buildClaudeEnv(handle.origin, ca, routes.httpRewrites, routes.httpsRewrites, process.env);
+        env = directUrl
+            ? buildClaudePluginEnv(origin, true, process.env)
+            : buildClaudeEnv(origin, ca, routes.httpRewrites, routes.httpsRewrites, process.env);
+        if (directUrl) env.BILLION_CONTEXT_PROXY = origin;
+        if (injectMcp) {
+            const mcpFile = path.join(os.tmpdir(), `bili-mcp-${Date.now()}.json`);
+            fs.writeFileSync(mcpFile, JSON.stringify(buildMcpConfig(origin)));
+            tmpFiles.push(mcpFile);
+            clientArgs = ["--mcp-config", mcpFile, ...clientArgs];
+        }
     }
 
     const { command, prefixArgs } = resolveClientCommand(base, process.env);
@@ -607,6 +676,11 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         if (piTmpHome) {
             try {
                 fs.rmSync(piTmpHome, { recursive: true, force: true });
+            } catch {}
+        }
+        for (const f of tmpFiles) {
+            try {
+                fs.rmSync(f, { force: true });
             } catch {}
         }
     }

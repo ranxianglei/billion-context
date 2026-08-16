@@ -24,6 +24,7 @@ import { loadOptions, ensureConfigTemplate } from "./config.js";
 import { startServer } from "./server.js";
 import { configFile as defaultConfigFile } from "./paths.js";
 import { checkForUpdate, startAutoUpdate } from "./update.js";
+import { runMcpStdio } from "./mcp.js";
 import { runLaunch, runTestPi, isLaunchClient, type ClientName } from "./launcher.js";
 import { exportSession } from "./export.js";
 import { readFileSync } from "node:fs";
@@ -100,7 +101,7 @@ Docs: https://github.com/ranxianglei/billion-context
 `;
 
 type Parsed = {
-    command: "start" | "update" | "help" | "version" | "launch" | "test" | "export";
+    command: "start" | "update" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp";
     client?: ClientName;
     clientArgs: string[];
     mitmDomains: string[];
@@ -212,6 +213,11 @@ export function parseArgs(argv: string[]): Parsed {
         } else if (cmd === "export") {
             command = "export";
             exportSelector = positional[1];
+        } else if (cmd === "plugin-register") {
+            command = "plugin-register";
+            exportSelector = positional[1]; // conversation id
+        } else if (cmd === "mcp") {
+            command = "mcp";
         } else if (cmd === "test") {
             const target = positional[1];
             if (target && isLaunchClient(target)) {
@@ -238,6 +244,31 @@ export async function main(): Promise<void> {
     }
     if (command === "version") {
         process.stdout.write(VERSION + "\n");
+        return;
+    }
+    if (command === "plugin-register") {
+        const conversationId = exportSelector?.trim();
+        if (!conversationId) {
+            console.error('bili plugin-register: conversation id is required (e.g. bili plugin-register "$CLAUDE_SESSION_ID" --origin http://127.0.0.1:8787)');
+            process.exit(2);
+        }
+        const origin = (overrides.BILI_MCP_PROXY ?? process.env.BILI_MCP_PROXY ?? "http://127.0.0.1:8787").replace(/\/$/, "");
+        try {
+            const res = await fetch(`${origin}/__bili/plugin/register`, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ conversationId, agent: "claude" }),
+            });
+            const data = (await res.json()) as { ok?: boolean; error?: string };
+            if (!res.ok || !data.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+        } catch (error) {
+            console.error(`bili plugin-register: ${error instanceof Error ? error.message : String(error)}`);
+            process.exit(1);
+        }
+        return;
+    }
+    if (command === "mcp") {
+        runMcpStdio();
         return;
     }
     if (command === "export") {
