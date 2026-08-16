@@ -15,8 +15,8 @@ import { createResponsesAdapter } from "./adapter-responses.js";
 import { createOpenaiAdapter } from "./adapter-openai.js";
 import { createAnthropicAdapter } from "./adapter-anthropic.js";
 import type { CompressLoopAdapter } from "./core.js";
-import type { ResponsesProjection } from "../responses.js";
-import type { AnthropicRequestBody } from "../anthropic.js";
+import type { ResponsesProjection } from "acp-kernel/wire";
+import type { AnthropicRequestBody } from "acp-kernel/wire";
 
 export function pickAdapter(
     protocol: "responses" | "openai" | "anthropic",

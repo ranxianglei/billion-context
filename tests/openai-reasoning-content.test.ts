@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { openaiToCore, coreToOpenai } from "../src/openai.ts";
-import type { OpenAIRequestBody } from "../src/openai.ts";
+import { openaiToCore, coreToOpenai } from "acp-kernel/wire";
+import type { OpenAIRequestBody } from "acp-kernel/wire";
 import { createOpenaiAdapter } from "../src/loop/index.ts";
 import type { ParsedStreamEvent } from "../src/loop/index.ts";
 

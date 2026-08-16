@@ -9,7 +9,7 @@ import {
     type NudgeDecision,
 } from "acp-kernel";
 import type { Session } from "../session.js";
-import type { BiliMessage } from "../bili-message.js";
+import type { BiliMessage } from "acp-kernel/wire";
 import {
     parseCompressInput,
     PROXY_TOOL_NAMES,

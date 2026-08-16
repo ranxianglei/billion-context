@@ -5,7 +5,7 @@ import {
     coreToAnthropic,
     conversationSignalAnthropic,
     type AnthropicRequestBody,
-} from "../src/anthropic.js";
+} from "acp-kernel/wire";
 import {
     COMPRESS_TOOL,
     COMPRESS_TOOL_NAME,
@@ -19,7 +19,7 @@ import {
     injectOpenaiSystem,
     conversationSignalOpenai,
     type OpenAIRequestBody,
-} from "../src/openai.js";
+} from "acp-kernel/wire";
 
 function bigToolResult(text: string): AnthropicRequestBody {
     return {

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { responsesToCore, coreToResponses, patchResponsesInput, injectResponsesDeveloperMessage } from "../src/responses.ts";
+import { responsesToCore, coreToResponses, patchResponsesInput, injectResponsesDeveloperMessage } from "acp-kernel/wire";
 import { compressLoopResponsesJson } from "../src/compress-loop-responses.ts";
 import type { Config, CoreMessage } from "acp-kernel";
 import { createCore, createInitialState } from "acp-kernel";

@@ -4,7 +4,7 @@ import type { Session } from "./session.js";
 /**
  * Orphan block garbage collection.
  *
- * WHY: With content-fingerprint message ids (see src/message-id.ts), a block's
+ * WHY: With content-fingerprint message ids (see acp-kernel/wire message-id), a block's
  * `effectiveMessageIds` reference specific message identities. If a client
  * (or another plugin) deletes the original messages that a block compressed,
  * those ids no longer appear in the current visible context. The kernel's

@@ -1,11 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { anthropicToCore, coreToAnthropic } from "../src/anthropic.ts";
-import { openaiToCore, coreToOpenai } from "../src/openai.ts";
-import { responsesToCore, coreToResponses } from "../src/responses.ts";
-import type { AnthropicBlock, AnthropicRequestBody } from "../src/anthropic.ts";
-import type { OpenAIRequestBody } from "../src/openai.ts";
-import type { ResponsesRequestBody } from "../src/responses.ts";
+import { anthropicToCore, coreToAnthropic } from "acp-kernel/wire";
+import { openaiToCore, coreToOpenai } from "acp-kernel/wire";
+import { responsesToCore, coreToResponses } from "acp-kernel/wire";
+import type { AnthropicBlock, AnthropicRequestBody } from "acp-kernel/wire";
+import type { OpenAIRequestBody } from "acp-kernel/wire";
+import type { ResponsesRequestBody } from "acp-kernel/wire";
 
 const IMG_DATA = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
 const DATA_URL = `data:image/png;base64,${IMG_DATA}`;

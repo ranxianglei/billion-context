@@ -1,5 +1,5 @@
 import type { CoreMessage } from "acp-kernel";
-import { coreToAnthropic, extractSystem, buildSystem, type AnthropicRequestBody } from "../anthropic.js";
+import { coreToAnthropic, extractSystem, buildSystem, type AnthropicRequestBody } from "acp-kernel/wire";
 import { buildVisibilityMarker } from "../compress-loop.js";
 import type {
     CompressLoopAdapter,
