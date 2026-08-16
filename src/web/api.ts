@@ -6,6 +6,7 @@ import { configFile } from "../paths.js";
 import {
     loadRoutes,
     normalizeUrlKey,
+    parseCompressSettings,
     parseRouteEntry,
     parseUpstreamProxyMode,
     safeReadJson,
@@ -63,12 +64,14 @@ function atomicWriteConfig(config: ConfigShape): void {
 
 export async function handleConfigGet(res: ServerResponse): Promise<void> {
     const upstream = readUpstreamSettings();
+    const config = readConfig();
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
         path: configFile(),
         providers: readProviders(),
         upstreamProxy: upstream.proxy ?? null,
         upstreamProxyMode: upstream.mode,
+        compress: config.compress ?? null,
     }, null, 2));
 }
 
@@ -84,7 +87,8 @@ export async function handleConfigPut(
     const hasProviders = Object.prototype.hasOwnProperty.call(body, "providers");
     const hasProxy = Object.prototype.hasOwnProperty.call(body, "upstreamProxy");
     const hasMode = Object.prototype.hasOwnProperty.call(body, "upstreamProxyMode");
-    if (!hasProviders && !hasProxy && !hasMode) return sendError(res, 400, "expected providers or upstream proxy settings");
+    const hasCompress = Object.prototype.hasOwnProperty.call(body, "compress");
+    if (!hasProviders && !hasProxy && !hasMode && !hasCompress) return sendError(res, 400, "expected providers, upstream proxy, or compress settings");
 
     const routes: Record<string, ProviderRoute> = {};
     if (hasProviders) {
@@ -122,6 +126,12 @@ export async function handleConfigPut(
         return sendError(res, 400, "manual mode requires an upstream proxy URL");
     }
 
+    let compress: ReturnType<typeof parseCompressSettings>;
+    if (hasCompress) {
+        compress = body.compress === null ? {} : parseCompressSettings(body.compress);
+        if (compress === undefined) return sendError(res, 400, "invalid compress settings");
+    }
+
     const config = readConfig();
     if (hasProviders) config.providers = routes;
     if (hasProxy) {
@@ -129,13 +139,21 @@ export async function handleConfigPut(
         else delete config.upstreamProxy;
     }
     if (hasMode && mode) config.upstreamProxyMode = mode;
+    if (hasCompress) {
+        if (compress && Object.keys(compress).length > 0) config.compress = compress;
+        else delete config.compress;
+    }
     try {
         atomicWriteConfig(config);
         onChanged?.();
     } catch (error) {
         return sendError(res, 500, `failed to apply config: ${String(error)}`);
     }
-    log("info", `[acp-web] configuration updated (${hasProviders ? `${Object.keys(routes).length} routes` : "network only"})`);
+    const changed: string[] = [];
+    if (hasProviders) changed.push(`${Object.keys(routes).length} routes`);
+    if (hasProxy || hasMode) changed.push("network");
+    if (hasCompress) changed.push("compress");
+    log("info", `[acp-web] configuration updated (${changed.join(", ") || "none"})`);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true, providers: hasProviders ? Object.keys(routes).length : undefined }));
 }

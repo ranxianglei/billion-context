@@ -36,8 +36,9 @@ import {
     injectResponsesDeveloperMessage,
     conversationIdentityResponses,
     conversationSignalResponses,
+    subagentNamespace,
 } from "acp-kernel/wire";
-import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary } from "./session.js";
+import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages } from "./session.js";
 import { COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressHybridSystemPrompt } from "./compress-tool.js";
 import { rewriteSseStream, rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
@@ -397,6 +398,7 @@ async function handle(
             opts.proxyMode = fresh.proxyMode;
             opts.proxySource = fresh.proxySource;
             opts.proxyFallback = fresh.proxyFallback;
+            opts.compress = fresh.compress;
             resetProxyCache();
             for (const k of Object.keys(opts.routes)) delete opts.routes[k];
             Object.assign(opts.routes, loadRoutes());
@@ -572,7 +574,10 @@ async function handle(
             ? conversationSignalAnthropic(parsed as AnthropicRequestBody, convHeader)
             : protocol === "openai"
               ? conversationSignalOpenai(parsed as OpenAIRequestBody, convHeader)
-              : responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader);
+              : subagentNamespace(
+                  responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
+                  (parsed as ResponsesRequestBody).instructions,
+              );
         const sessionId = deriveProxySessionId(req.headers, protocol, upstreamOrigin, conversation);
         // Two separate uses of the conversation signal:
         //  - `affinity`: header value forwarded upstream for sticky-routing /
@@ -728,6 +733,7 @@ function prepareAnthropic(
         log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
         processedMessages = [];
     }
+    snapshotMessages(session, originalMessages);
     markDirty(session);
 
     const rebuilt: AnthropicRequestBody = { ...parsed, messages: rebuiltMessages, system: systemOut, tools: toolsOut };
@@ -821,6 +827,7 @@ function prepareOpenai(
     if (stream && (rebuilt as Record<string, unknown>).stream_options === undefined) {
         (rebuilt as Record<string, unknown>).stream_options = { include_usage: true };
     }
+    snapshotMessages(session, originalMessages);
     markDirty(session);
     return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: shouldInject, nudge, prompts } as Prepared;
 }
@@ -937,6 +944,7 @@ function prepareResponses(
         });
         log("info", `[${sessionId}] responses forward tools=[${fwdTools.join(",")}] injectTool=${shouldInject} NO_INJECT_TOOL=${!!process.env.ACP_NO_INJECT_TOOL} NO_COMPRESS_PROMPT=${!!process.env.ACP_NO_COMPRESS_PROMPT}`);
     }
+    snapshotMessages(session, originalMessages);
     markDirty(session);
     return {
         body: JSON.stringify(rebuilt),
@@ -1508,14 +1516,16 @@ function deriveTitle(messages: CoreMessage[]): string | undefined {
 
 function handleConfigReload(opts: ProxyOptions, res: http.ServerResponse, log: (level: string, msg: string) => void): void {
     // Hot-reload routes from the config file into the running process — no
-    // restart needed. Only routes are re-read; port/host/upstream stay as-is
-    // (the listen socket is already bound). Mutates opts.routes in place so all
-    // in-flight handle() closures that captured `opts` see the new routes.
+    // restart needed. Routes and the global compress block are re-read;
+    // port/host/upstream stay as-is (the listen socket is already bound).
+    // Mutates opts.routes in place so all in-flight handle() closures that
+    // captured `opts` see the new routes.
     const fresh = loadRoutes();
     // Clear and refill the SAME object reference so resolveUpstream/resolveContextLimit
     // (which read opts.routes) pick up the new entries without needing reassignment.
     for (const k of Object.keys(opts.routes)) delete opts.routes[k];
     Object.assign(opts.routes, fresh);
+    opts.compress = loadOptions().compress;
     // Release cached ProxyAgents so agents for proxy URLs that were
     // removed/changed don't leak for the process lifetime. The next request
     // re-creates the needed agent lazily via proxyDispatcher().
