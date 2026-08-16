@@ -25,6 +25,7 @@
  * (not owned). Otherwise a detached proxy child is spawned on that port (or a
  * free one) and OWNED — it is killed when the client exits.
  */
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
@@ -322,8 +323,17 @@ export function buildClaudePluginEnv(origin: string, directUrl: boolean, baseEnv
     return { ...baseEnv, ANTHROPIC_BASE_URL: wrapUpstream(origin, upstream) };
 }
 
-/** Codex: -c inline overrides for the bili MCP server only. */
-export function buildCodexMcpArgs(origin: string): string[] {
+/** Codex: -c inline overrides for the bili MCP server only.
+ *
+ *  `conversationId` is a per-spawn UUID injected as BILI_CONVERSATION_ID:
+ *  codex passes no session id to MCP children (verified codex-cli 0.147.0),
+ *  so the MCP shell uses this to self-register headlessly; the first model
+ *  request that creates a NEW session consumes the registration and binds
+ *  the conversation (MITM route — in direct-URL mode the model traffic does
+ *  not reach the proxy and the binding cannot happen, see the direct-mode
+ *  warning). Without it every native tool call fails with "no conversation
+ *  id". */
+export function buildCodexMcpArgs(origin: string, conversationId: string): string[] {
     const script = process.argv[1] ? path.resolve(path.dirname(process.argv[1]), "mcp.js") : "bili-mcp";
     return [
         "-c",
@@ -332,6 +342,8 @@ export function buildCodexMcpArgs(origin: string): string[] {
         `mcp_servers.bili.args=${JSON.stringify([script])}`,
         "-c",
         `mcp_servers.bili.env.BILI_MCP_PROXY=${JSON.stringify(origin)}`,
+        "-c",
+        `mcp_servers.bili.env.BILI_CONVERSATION_ID=${JSON.stringify(conversationId)}`,
     ];
 }
 
@@ -655,13 +667,16 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         piTmpHome = preparePiHttpRewrite(resolvePiHome(process.env), origin, routes.httpRewrites, routes.httpsRewrites);
         if (piTmpHome) env.PI_CODING_AGENT_DIR = piTmpHome;
     } else if (base === "codex") {
+        // Per-spawn conversation id for the MCP shell's headless
+        // self-registration (codex provides no session id of its own).
+        const codexConversationId = injectMcp ? randomUUID() : undefined;
         if (directUrl) {
             env = { ...process.env, BILLION_CONTEXT_PROXY: origin };
-            clientArgs = [...buildCodexMcpArgs(origin), ...clientArgs];
+            if (codexConversationId) clientArgs = [...buildCodexMcpArgs(origin, codexConversationId), ...clientArgs];
         } else {
             env = buildCodexEnv(origin, resolveCombinedCaPath(process.env), process.env);
             clientArgs = buildCodexArgs(origin, routes.httpRewrites, routes.httpsRewrites, clientArgs);
-            if (injectMcp) clientArgs = [...buildCodexMcpArgs(origin), ...clientArgs];
+            if (injectMcp && codexConversationId) clientArgs = [...buildCodexMcpArgs(origin, codexConversationId), ...clientArgs];
         }
     } else {
         env = directUrl

@@ -200,7 +200,8 @@ test("launcher injection builders: direct-URL env, MCP config JSON, codex -c arg
     assert.match(mcp.mcpServers.bili.args[0]!, /mcp\.js$/);
     assert.equal(mcp.mcpServers.bili.env.BILI_MCP_PROXY, "http://127.0.0.1:8787");
 
-    const args = buildCodexMcpArgs("http://127.0.0.1:8787");
+    const codexConvId = "11111111-2222-4333-8444-555555555555";
+    const args = buildCodexMcpArgs("http://127.0.0.1:8787", codexConvId);
     assert.deepEqual(args[0], "-c");
     assert.match(args[1]!, /^mcp_servers\.bili\.command=/);
     assert.match(args[3]!, /^mcp_servers\.bili\.args=/);
@@ -213,6 +214,10 @@ test("launcher injection builders: direct-URL env, MCP config JSON, codex -c arg
     const parsedArgs = JSON.parse(argsValue) as unknown[];
     assert.ok(Array.isArray(parsedArgs) && parsedArgs.length === 1, "exactly one argument");
     assert.ok(String(parsedArgs[0]).endsWith("mcp.js"), "argument is the mcp script path");
+    // codex passes no session id to MCP children, so the launcher injects a
+    // per-spawn conversation id for the shell's headless self-registration.
+    assert.match(args[7]!, /^mcp_servers\.bili\.env\.BILI_CONVERSATION_ID=/);
+    assert.equal(args[7]!.slice("mcp_servers.bili.env.BILI_CONVERSATION_ID=".length), JSON.stringify(codexConvId));
 });
 
 test("mcp stdio shell: manifest → tools/list → tools/call forwards to the plugin tool endpoint", async () => {
@@ -268,4 +273,74 @@ test("mcp stdio shell: manifest → tools/list → tools/call forwards to the pl
     const call = byId(3) as { result?: { content?: { text?: string }[]; isError?: boolean } };
     assert.equal(call.result?.isError, false);
     assert.match(call.result?.content?.[0]?.text ?? "", /CONTEXT BREAKDOWN/, "acp_status result forwarded verbatim");
+});
+
+test("mcp stdio shell (codex style): BILI_CONVERSATION_ID self-register → headless binding → tools/call", async () => {
+    // The exact flow `bili codex` now produces (default MITM route): the
+    // launcher passes BILI_CONVERSATION_ID, the shell self-registers
+    // headlessly on initialize (no manual register, no identity header), the
+    // first NEW-session model request consumes the pending registration, and
+    // tool calls through the shell resolve.
+    const rig = await startRig();
+    const conv = "codex-e2e-conv-1";
+    let status: { ok: boolean; pluginAgent?: string } = { ok: false };
+
+    const shell = spawn(process.execPath, ["--import", "tsx", "src/mcp.ts"], {
+        env: {
+            ...process.env,
+            BILI_MCP_PROXY: rig.proxyUrl(""),
+            BILI_CONVERSATION_ID: conv,
+            // deliberately NO CLAUDE_CODE_SESSION_ID — codex passes none.
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+    });
+    const { promise: settled, resolve: settledOk, reject: settledErr } = Promise.withResolvers<void>();
+    const lines: string[] = [];
+    shell.stdout.on("data", (d: Buffer) => {
+        let chunk = d.toString("utf8");
+        let nl: number;
+        while ((nl = chunk.indexOf("\n")) >= 0) {
+            const line = chunk.slice(0, nl).trim();
+            chunk = chunk.slice(nl + 1);
+            if (line.startsWith("{")) {
+                lines.push(line);
+                if (lines.length === 1) {
+                    // initialize answered → the headless register has landed
+                    // (the shell awaits it before responding). Consume it via
+                    // a fresh model session, then ask for tools.
+                    void postModel(rig).then(() => {
+                        send({ jsonrpc: "2.0", id: 2, method: "tools/list" });
+                        send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "acp_status", arguments: {} } });
+                    });
+                } else if (lines.length === 3) {
+                    settledOk();
+                }
+            }
+        }
+    });
+    shell.stderr.on("data", () => {});
+    shell.on("error", settledErr);
+    const send = (msg: unknown) => shell.stdin.write(JSON.stringify(msg) + "\n");
+
+    send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "0" } } });
+    send({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+    try {
+        await settled;
+        // The headless registration was consumed by the model session — the
+        // conversation is bound in the proxy. (Must run before closeAll.)
+        status = await (await fetch(rig.proxyUrl(`/__bili/plugin/status?conversationId=${conv}`))).json() as { ok: boolean; pluginAgent?: string };
+    } finally {
+        shell.kill();
+        await rig.closeAll();
+    }
+
+    const byId = (n: number): Record<string, unknown> => JSON.parse(lines.find((l) => (JSON.parse(l) as { id?: number }).id === n) ?? "{}");
+    const tools = byId(2) as { result?: { tools?: { name: string }[] } };
+    assert.deepEqual(tools.result?.tools?.map((t) => t.name).sort(), ["acp_status", "compress", "decompress", "search_context"], "tools listed");
+    const call = byId(3) as { result?: { content?: { text?: string }[]; isError?: boolean } };
+    assert.equal(call.result?.isError, false, `tools/call succeeded (self-registered conversation bound)${call.result?.isError ? ": " + (call.result?.content?.[0]?.text ?? "") : ""}`);
+    assert.match(call.result?.content?.[0]?.text ?? "", /CONTEXT BREAKDOWN/);
+    assert.equal(status.ok, true, "conversation bound after the model request");
+    assert.equal(status.pluginAgent, "mcp");
 });
