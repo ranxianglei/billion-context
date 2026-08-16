@@ -204,6 +204,14 @@ test("launcher injection builders: direct-URL env, MCP config JSON, codex -c arg
     assert.match(args[1]!, /^mcp_servers\.bili\.command=/);
     assert.match(args[3]!, /^mcp_servers\.bili\.args=/);
     assert.match(args[5]!, /^mcp_servers\.bili\.env\.BILI_MCP_PROXY=/);
+    // codex-cli parses these -c values as TOML: args MUST be a TOML array,
+    // not a JSON-encoded string — a double-encoded value makes codex refuse
+    // to start ("invalid type: string ..., expected a sequence").
+    const argsValue = args[3]!.slice("mcp_servers.bili.args=".length);
+    assert.match(argsValue, /^\[.*\]$/, "args is a TOML array, not a stringified array");
+    const parsedArgs = JSON.parse(argsValue) as unknown[];
+    assert.ok(Array.isArray(parsedArgs) && parsedArgs.length === 1, "exactly one argument");
+    assert.ok(String(parsedArgs[0]).endsWith("mcp.js"), "argument is the mcp script path");
 });
 
 test("mcp stdio shell: manifest → tools/list → tools/call forwards to the plugin tool endpoint", async () => {

@@ -257,7 +257,7 @@ export async function main(): Promise<void> {
             const res = await fetch(`${origin}/__bili/plugin/register`, {
                 method: "POST",
                 headers: { "content-type": "application/json" },
-                body: JSON.stringify({ conversationId, agent: "claude" }),
+                body: JSON.stringify({ conversationId, agent: "claude", identity: true }),
             });
             const data = (await res.json()) as { ok?: boolean; error?: string };
             if (!res.ok || !data.ok) throw new Error(data.error ?? `HTTP ${res.status}`);

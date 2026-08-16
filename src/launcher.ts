@@ -325,7 +325,7 @@ export function buildCodexMcpArgs(origin: string): string[] {
         "-c",
         `mcp_servers.bili.command=${JSON.stringify(process.execPath)}`,
         "-c",
-        `mcp_servers.bili.args=${JSON.stringify(JSON.stringify([script]))}`,
+        `mcp_servers.bili.args=${JSON.stringify([script])}`,
         "-c",
         `mcp_servers.bili.env.BILI_MCP_PROXY=${JSON.stringify(origin)}`,
     ];
