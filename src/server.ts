@@ -53,7 +53,7 @@ import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { emitStreamError } from "./stream-error.js";
 import { deriveSessionId as deriveProxySessionId, affinityToken, clientConversationHeader, type ConversationIdentity } from "./session-id.js";
-import { consumePluginRegisterFor, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, pipePluginJson, pipeThroughWithUsage, pluginAgentHeader, pluginContextWindowHeader, pluginConversationHeader, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
+import { consumePluginRegisterFor, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, pipePluginJson, pipeThroughWithUsage, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import { isLoopbackAddress } from "./util.js";
@@ -595,8 +595,10 @@ async function handle(
             // the models.dev registry (most valuable in MITM mode where the
             // model may be a private relay), but operator tuning via
             // compress.modelContextLimit still outranks it inside
-            // resolveRequestConfig.
-            let native = pluginContextWindowHeader(req.headers) ?? resolveContextLimit(opts.routes, embeddedUrl, model);
+            // resolveRequestConfig. Gated on the x-bili-plugin marker: the
+            // header is protocol-internal, and a plain client must not be
+            // able to rewrite the nudge denominator by name.
+            let native = pluginReportedContextWindow(req.headers) ?? resolveContextLimit(opts.routes, embeddedUrl, model);
             if (!native && embeddedUrl) {
                 const host = (() => { try { return new URL(embeddedUrl).host; } catch { return undefined; } })();
                 native = await contextFromRegistry(model, host);
@@ -749,7 +751,7 @@ function diagTagSummary(messages: CoreMessage[], sessionId: string, strategy: st
     return `[${sessionId}] processTurn: ${messages.length} msgs, renderTags=${strategy}, ${textTagged} text tagged, ${toolTagged} tool tagged (should be 0 with text-only)`;
 }
 
-function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; contextUsage: number; tier: number | null; breakdown?: Record<string, number> } | null }, sessionId: string, tokenCount: number, limit: number): string {
+function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; contextUsage: number; tier: number | null; breakdown?: Record<string, number> } | null }, sessionId: string, tokenCount: number, limit: number, model?: string): string {
     const n = turn.nudge;
     if (!n) return `[${sessionId}] nudge: unavailable`;
     const b = n.breakdown ?? {};
@@ -760,7 +762,8 @@ function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; cont
     const pendingT1 = b["pendingT1"] ?? 0;
     const ref = b["growthReference"] ?? 0;
     const inject = n.shouldInject ? `INJECT T${n.tier ?? "?"}` : "idle";
-    return `[${sessionId}] nudge ${inject}: usage=${pct} (${tokenCount}/${limit}), growth=${growth}/${floor} (ref=${ref}, interval=${interval}), pendingT1=${pendingT1}/${interval}, reason="${n.reason.slice(0, 120)}"`;
+    const modelTag = model ? ` model=${model}` : "";
+    return `[${sessionId}] nudge ${inject}: usage=${pct} (${tokenCount}/${limit}), growth=${growth}/${floor} (ref=${ref}, interval=${interval}), pendingT1=${pendingT1}/${interval}${modelTag}, reason="${n.reason.slice(0, 120)}"`;
 }
 
 function prepareAnthropic(
@@ -808,7 +811,7 @@ function prepareAnthropic(
             if (t) session.meta.title = t;
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
-        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit));
+        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model));
         processedMessages = stripKernelSummaries(turn.messages);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = coreToAnthropic(processedMessages as BiliMessage[], cacheControls);
@@ -886,7 +889,7 @@ function prepareOpenai(
             if (t) session.meta.title = t;
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
-        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit));
+        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model));
         processedMessages = stripKernelSummaries(turn.messages);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = coreToOpenai(processedMessages as BiliMessage[]);
@@ -982,7 +985,7 @@ function prepareResponses(
             if (t) session.meta.title = t;
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
-        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit));
+        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model));
         processedMessages = stripKernelSummaries(turn.messages);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltInput = patchResponsesInput(projection, processedMessages);
