@@ -25,6 +25,7 @@
  * (not owned). Otherwise a detached proxy child is spawned on that port (or a
  * free one) and OWNED — it is killed when the client exits.
  */
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
@@ -279,6 +280,81 @@ export function buildClaudeEnv(
     const hr = httpsRewrites.find((rw) => rw.key === "ANTHROPIC_BASE_URL");
     if (hr) env.ANTHROPIC_BASE_URL = hr.realUpstream;
     return env;
+}
+
+// --- Launcher plugin mode (#162): inject the MCP shell + session hooks as
+// spawn-time flags, never touching host config files on disk. ---
+
+/** Direct-URL mode: the host talks to the proxy via the /bili/ prefix (no
+ *  MITM/CA). OPT-IN via BILI_LAUNCHER_DIRECT=1 — the default keeps the
+ *  transparent-proxy (MITM) route so existing `bili claude` / `bili codex`
+ *  setups behave exactly as before: OAuth-subscription traffic and custom
+ *  relay endpoints (ANTHROPIC_BASE_URL / codex provider config) keep working.
+ *  Direct mode changes what the host points at, so it must be a deliberate
+ *  choice, not a silent upgrade. */
+export function launcherDirectUrl(env: NodeJS.ProcessEnv): boolean {
+    return env.BILI_LAUNCHER_DIRECT === "1";
+}
+
+/** Plugin-in-launcher MCP injection is OPT-IN (`BILI_LAUNCHER_PLUGIN=1`):
+ *  enabling it changes the spawn args of claude/codex, and hosts older than
+ *  the verified builds (claude 2.1.227, codex 0.147.0) have not been tested
+ *  against `--mcp-config` / `-c mcp_servers.*`. Flip the default to on (with
+ *  `!== "0"` semantics) once the flags have soaked; pi is always excluded —
+ *  it has its own native extension (billion-context-pi #154). */
+export function launcherInjectMcp(env: NodeJS.ProcessEnv, base: string): boolean {
+    return base !== "pi" && env.BILI_LAUNCHER_PLUGIN === "1";
+}
+
+/** Ephemeral MCP config for --mcp-config / -c mcp_servers.bili.*: a single
+ *  "bili" stdio server running dist/mcp.js. Args are kept flat so codex's
+ *  TOML value parser stays happy. */
+export function buildMcpConfig(origin: string): { mcpServers: { bili: { command: string; args: string[]; env: Record<string, string> } } } {
+    const script = process.argv[1] ? path.resolve(path.dirname(process.argv[1]), "mcp.js") : "bili-mcp";
+    return {
+        mcpServers: {
+            bili: {
+                command: process.execPath,
+                args: [script],
+                env: { BILI_MCP_PROXY: origin },
+            },
+        },
+    };
+}
+
+/** Ephemeral Claude Code settings for --settings: direct-URL mode only needs
+ *  the base URL, which we pass via spawn env (ANTHROPIC_BASE_URL) — no
+ *  settings file, no hooks. Session registration happens inside the MCP
+ *  shell (CLAUDE_CODE_SESSION_ID is passed to MCP children by claude
+ *  itself, verified 2.1.227). */
+export function buildClaudePluginEnv(origin: string, directUrl: boolean, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    if (!directUrl) return baseEnv;
+    const upstream = baseEnv.BILI_CLAUDE_UPSTREAM?.trim() || "https://api.anthropic.com";
+    return { ...baseEnv, ANTHROPIC_BASE_URL: wrapUpstream(origin, upstream) };
+}
+
+/** Codex: -c inline overrides for the bili MCP server only.
+ *
+ *  `conversationId` is a per-spawn UUID injected as BILI_CONVERSATION_ID:
+ *  codex passes no session id to MCP children (verified codex-cli 0.147.0),
+ *  so the MCP shell uses this to self-register headlessly; the first model
+ *  request that creates a NEW session consumes the registration and binds
+ *  the conversation (MITM route — in direct-URL mode the model traffic does
+ *  not reach the proxy and the binding cannot happen, see the direct-mode
+ *  warning). Without it every native tool call fails with "no conversation
+ *  id". */
+export function buildCodexMcpArgs(origin: string, conversationId: string): string[] {
+    const script = process.argv[1] ? path.resolve(path.dirname(process.argv[1]), "mcp.js") : "bili-mcp";
+    return [
+        "-c",
+        `mcp_servers.bili.command=${JSON.stringify(process.execPath)}`,
+        "-c",
+        `mcp_servers.bili.args=${JSON.stringify([script])}`,
+        "-c",
+        `mcp_servers.bili.env.BILI_MCP_PROXY=${JSON.stringify(origin)}`,
+        "-c",
+        `mcp_servers.bili.env.BILI_CONVERSATION_ID=${JSON.stringify(conversationId)}`,
+    ];
 }
 
 export function preparePiHttpRewrite(
@@ -581,15 +657,51 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     let env: NodeJS.ProcessEnv;
     let clientArgs = params.clientArgs;
     let piTmpHome: string | undefined;
+    const tmpFiles: string[] = [];
+    const directUrl = launcherDirectUrl(process.env);
+    if (directUrl) {
+        if (base === "codex") {
+            console.error(
+                "bili: direct-URL mode — codex's LLM traffic does NOT go through the proxy, so compression is not applied (only the bili MCP tool calls do). For full compression use the default MITM mode (unset BILI_LAUNCHER_DIRECT).",
+            );
+        } else if (base === "claude") {
+            console.error(
+                "bili: direct-URL mode — claude's ANTHROPIC_BASE_URL is overridden to the proxy; a pre-configured relay is bypassed unless BILI_CLAUDE_UPSTREAM=<relay> is set. OAuth-subscription traffic requires the default MITM mode.",
+            );
+        }
+    }
+    const injectMcp = launcherInjectMcp(process.env, base);
+    if (!injectMcp && (base === "claude" || base === "codex")) {
+        console.error("bili: plugin mode off — set BILI_LAUNCHER_PLUGIN=1 to enable native MCP tools (experimental; verified with claude 2.1.227 / codex 0.147.0).");
+    }
+    const origin = handle.origin;
     if (base === "pi") {
-        env = buildPiEnv(handle.origin, ca, process.env);
-        piTmpHome = preparePiHttpRewrite(resolvePiHome(process.env), handle.origin, routes.httpRewrites, routes.httpsRewrites);
+        env = buildPiEnv(origin, ca, process.env);
+        piTmpHome = preparePiHttpRewrite(resolvePiHome(process.env), origin, routes.httpRewrites, routes.httpsRewrites);
         if (piTmpHome) env.PI_CODING_AGENT_DIR = piTmpHome;
     } else if (base === "codex") {
-        env = buildCodexEnv(handle.origin, resolveCombinedCaPath(process.env), process.env);
-        clientArgs = buildCodexArgs(handle.origin, routes.httpRewrites, routes.httpsRewrites, params.clientArgs);
+        // Per-spawn conversation id for the MCP shell's headless
+        // self-registration (codex provides no session id of its own).
+        const codexConversationId = injectMcp ? randomUUID() : undefined;
+        if (directUrl) {
+            env = { ...process.env, BILLION_CONTEXT_PROXY: origin };
+            if (codexConversationId) clientArgs = [...buildCodexMcpArgs(origin, codexConversationId), ...clientArgs];
+        } else {
+            env = buildCodexEnv(origin, resolveCombinedCaPath(process.env), process.env);
+            clientArgs = buildCodexArgs(origin, routes.httpRewrites, routes.httpsRewrites, clientArgs);
+            if (injectMcp && codexConversationId) clientArgs = [...buildCodexMcpArgs(origin, codexConversationId), ...clientArgs];
+        }
     } else {
-        env = buildClaudeEnv(handle.origin, ca, routes.httpRewrites, routes.httpsRewrites, process.env);
+        env = directUrl
+            ? buildClaudePluginEnv(origin, true, process.env)
+            : buildClaudeEnv(origin, ca, routes.httpRewrites, routes.httpsRewrites, process.env);
+        if (directUrl) env.BILLION_CONTEXT_PROXY = origin;
+        if (injectMcp) {
+            const mcpFile = path.join(os.tmpdir(), `bili-mcp-${Date.now()}.json`);
+            fs.writeFileSync(mcpFile, JSON.stringify(buildMcpConfig(origin)));
+            tmpFiles.push(mcpFile);
+            clientArgs = ["--mcp-config", mcpFile, ...clientArgs];
+        }
     }
 
     const { command, prefixArgs } = resolveClientCommand(base, process.env);
@@ -607,6 +719,11 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         if (piTmpHome) {
             try {
                 fs.rmSync(piTmpHome, { recursive: true, force: true });
+            } catch {}
+        }
+        for (const f of tmpFiles) {
+            try {
+                fs.rmSync(f, { force: true });
             } catch {}
         }
     }

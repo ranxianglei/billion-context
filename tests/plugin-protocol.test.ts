@@ -9,7 +9,7 @@ import { defaultConfig } from "acp-kernel";
 import { startServer, type ProxyOptions } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { _resetPluginStateForTest, pluginReportedContextWindow } from "../src/plugin.ts";
+import { _resetPluginStateForTest, pluginReportedContextWindow, queuePluginRegister, takePendingPluginRegister } from "../src/plugin.ts";
 import { clientConversationHeader } from "../src/session-id.ts";
 
 interface Harness {
@@ -472,5 +472,22 @@ test("plugin-reported context window becomes the nudge denominator and is visibl
         assert.equal(status2.contextLimit, 400000);
     } finally {
         await h.close();
+    }
+});
+
+test("headless launcher registrations expire after the TTL (no stale poisoning)", () => {
+    _resetPluginStateForTest();
+    const t0 = Date.now();
+    const realNow = Date.now;
+    try {
+        Date.now = () => t0;
+        queuePluginRegister("ttl-stale", "codex", false);
+        Date.now = () => t0 + 11 * 60 * 1000;
+        queuePluginRegister("ttl-fresh", "codex", false);
+        assert.equal(takePendingPluginRegister()?.conversationId, "ttl-fresh", "expired registration dropped, fresh one bound");
+        assert.equal(takePendingPluginRegister(), undefined, "queue drained");
+    } finally {
+        Date.now = realNow;
+        _resetPluginStateForTest();
     }
 });

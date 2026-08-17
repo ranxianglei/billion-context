@@ -53,7 +53,7 @@ import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { emitStreamError } from "./stream-error.js";
 import { deriveSessionId as deriveProxySessionId, affinityToken, clientConversationHeader, type ConversationIdentity } from "./session-id.js";
-import { handlePluginManifest, handlePluginStatus, handlePluginTool, pipePluginJson, pipeThroughWithUsage, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages } from "./plugin.js";
+import { consumePluginRegisterFor, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, pipePluginJson, pipeThroughWithUsage, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import { isLoopbackAddress } from "./util.js";
@@ -481,6 +481,17 @@ async function handle(
             return;
         }
     }
+    if (req.method === "POST" && req.url === "/__bili/plugin/register") {
+        try {
+            const body = await readBody(req);
+            handlePluginRegister(body.toString("utf8"), res);
+            return;
+        } catch (err) {
+            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: String(err) }));
+            return;
+        }
+    }
 
     // Bili does not support WebSocket — reject any upgrade with 426 so clients
     // with built-in fast-fallback (e.g. Codex supports_websockets=true) retry over HTTP POST.
@@ -605,8 +616,17 @@ async function handle(
         // manifest) — wire tool injection is suppressed and the compress loop
         // never intercepts proxy-named tool calls. Philosophy prompt + nudge
         // keep flowing from here; state + folding stay proxy-owned.
-        const pluginAgent = pluginAgentHeader(req.headers);
-        const pluginMode = pluginAgent !== undefined;
+        //
+        // Launcher mode (#162) is the header-less variant: hosts that cannot
+        // attach per-request headers (claude/codex spawned by `bili claude`
+        // / `bili codex`) POST /__bili/plugin/register first (Claude Code
+        // SessionStart hook / codex spawn). The FIRST request that creates a
+        // NEW session consumes the pending register — that session is plugin
+        // mode from then on, keyed by the registered conversation id, and the
+        // binding sticks via session.metadata.pluginAgent. stats.requests
+        // increments inside prepare() below, so === 0 here means first sight.
+        let pluginAgent = pluginAgentHeader(req.headers);
+        let pluginConversation = pluginConversationHeader(req.headers);
         // The client's own conversation header (x-session-id / x-session-affinity
         // / x-opencode-session / x-acp-session) is the STRONGEST signal that two
         // requests belong to the same conversation — much stronger than the
@@ -646,11 +666,33 @@ async function handle(
             ? responsesIdentity.value
             : clientConversationHeader(req.headers);
         const session = getSession(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? undefined });
-        if (pluginMode) {
+        // Launcher-mode binding (#162): prefer identity — claude code sends
+        // x-claude-code-session-id on every request, equal to the
+        // CLAUDE_CODE_SESSION_ID the MCP shell registered, so binding is
+        // race-free. Fall back to the headless pending queue (codex spawn)
+        // for the first request that creates a new session.
+        if (!pluginAgent) {
+            const identityAgent = consumePluginRegisterFor(clientConv ?? conversation);
+            if (identityAgent) {
+                pluginAgent = identityAgent;
+                pluginConversation = clientConv ?? conversation;
+            }
+        }
+        if (!pluginAgent && session.stats.requests === 0) {
+            const pending = takePendingPluginRegister();
+            if (pending) {
+                pluginAgent = pending.agent;
+                pluginConversation = pending.conversationId;
+            }
+        }
+        if (!pluginAgent && typeof session.metadata.pluginAgent === "string") pluginAgent = session.metadata.pluginAgent;
+        if (pluginAgent && !pluginConversation) pluginConversation = conversation;
+        if (pluginAgent) {
             if (session.metadata.pluginAgent !== pluginAgent) session.metadata.pluginAgent = pluginAgent;
             session.metadata.effectiveContextLimit = reqConfig.modelContextLimit;
-            recordPluginSession(pluginConversationHeader(req.headers) ?? conversation, session.id);
+            recordPluginSession(pluginConversation ?? conversation, session.id);
         }
+        const pluginMode = pluginAgent !== undefined;
         // acquireInFlight must precede the lock so evictOldest() cannot flush
         // this session between getSession and lock acquisition (inFlight===0
         // window). Released in the outer finally after forward completes.

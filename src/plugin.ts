@@ -106,6 +106,96 @@ export function rememberPluginMessages(sessionId: string, processed: CoreMessage
     remembered.set(sessionId, { processed, original, nudge });
 }
 
+// Launcher mode (#162): hosts that cannot attach per-request headers
+// (claude/codex spawned by `bili claude` / `bili codex`) pre-register their
+// conversation via POST /__bili/plugin/register — typically from a Claude
+// Code SessionStart hook or at codex spawn time. A pending register is
+// consumed by the FIRST model request that creates a NEW session afterwards
+// (server.ts binding step): that session becomes plugin-mode (native tools,
+// wire injection suppressed) and the conversation id becomes its tool-API key
+// — no x-bili-plugin headers required.
+export type PendingPluginRegister = { conversationId: string; agent: string; ts: number };
+
+const MAX_PENDING_REGISTERS = 64;
+
+const pendingRegisters: PendingPluginRegister[] = [];
+
+/** Queue a launcher-mode registration. `identity: true` means the host puts
+ *  the SAME id on every model request (claude code: x-claude-code-session-id
+ *  === CLAUDE_CODE_SESSION_ID) — bind by identity match only. `identity:
+ *  false` (headless codex spawn) means requests carry no matching id — bind
+ *  the next NEW session instead. Splitting the two keeps a foreign session
+ *  from eating an identity registration it can never claim. */
+export function queuePluginRegister(conversationId: string, agent: string, identity: boolean): void {
+    if (!identity) {
+        for (let i = 0; i < pendingRegisters.length; i++) {
+            if (pendingRegisters[i]!.conversationId === conversationId) {
+                pendingRegisters.splice(i, 1);
+                break;
+            }
+        }
+        pendingRegisters.push({ conversationId, agent, ts: Date.now() });
+        while (pendingRegisters.length > MAX_PENDING_REGISTERS) pendingRegisters.shift();
+    } else {
+        registeredIds.set(conversationId, agent);
+        while (registeredIds.size > MAX_PENDING_REGISTERS) {
+            const oldest = registeredIds.keys().next().value;
+            if (oldest !== undefined) registeredIds.delete(oldest);
+        }
+    }
+}
+
+/** Headless registrations expire: a registration that no new session has
+ *  claimed within this window was orphaned (the spawn never happened, or the
+ *  session was created by some other path). Binding a stale one to an
+ *  unrelated later session would turn that session into plugin mode with a
+ *  foreign conversation id. */
+const PENDING_REGISTER_TTL_MS = 10 * 60 * 1000;
+
+/** Take (and remove) the oldest pending registration — called by the server
+ *  when a model request resolves a NEW session, to bind that session into
+ *  plugin mode. Expired (orphaned) registrations are dropped, never bound.
+ *  Entries are appended in time order, so pruning from the front suffices. */
+export function takePendingPluginRegister(): PendingPluginRegister | undefined {
+    const now = Date.now();
+    while (pendingRegisters.length > 0 && now - pendingRegisters[0]!.ts > PENDING_REGISTER_TTL_MS) {
+        pendingRegisters.shift();
+    }
+    return pendingRegisters.shift();
+}
+const registeredIds = new Map<string, string>();
+
+/** Identity-driven binding (#162): hosts whose model requests carry the SAME
+ *  id the MCP shell registered (claude code: every request has
+ *  x-claude-code-session-id === CLAUDE_CODE_SESSION_ID === the registered
+ *  conversation id) bind the moment any of their requests shows up — no
+ *  ordering race with the shell's initialize. */
+export function consumePluginRegisterFor(conversationId: string): string | undefined {
+    const agent = registeredIds.get(conversationId);
+    if (agent !== undefined) registeredIds.delete(conversationId);
+    return agent;
+}
+
+export function handlePluginRegister(payload: string, res: import("node:http").ServerResponse): void {
+    let parsed: { conversationId?: unknown; agent?: unknown; identity?: unknown };
+    try {
+        parsed = JSON.parse(payload) as { conversationId?: unknown; agent?: unknown; identity?: unknown };
+    } catch {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "invalid JSON body" }));
+        return;
+    }
+    const conversationId = typeof parsed.conversationId === "string" ? parsed.conversationId.trim() : "";
+    if (!conversationId) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "conversationId is required" }));
+        return;
+    }
+    const agent = typeof parsed.agent === "string" && parsed.agent.trim() ? parsed.agent.trim() : "launcher";
+    queuePluginRegister(conversationId, agent, parsed.identity === true);
+    res.end(JSON.stringify({ ok: true, conversationId, agent }));
+}
+
 export function handlePluginManifest(res: import("node:http").ServerResponse): void {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
@@ -381,4 +471,6 @@ export async function pipePluginJson(
 export function _resetPluginStateForTest(): void {
     conversations.clear();
     remembered.clear();
+    pendingRegisters.length = 0;
+    registeredIds.clear();
 }
