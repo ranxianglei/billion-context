@@ -296,6 +296,16 @@ export function launcherDirectUrl(env: NodeJS.ProcessEnv): boolean {
     return env.BILI_LAUNCHER_DIRECT === "1";
 }
 
+/** Plugin-in-launcher MCP injection is OPT-IN (`BILI_LAUNCHER_PLUGIN=1`):
+ *  enabling it changes the spawn args of claude/codex, and hosts older than
+ *  the verified builds (claude 2.1.227, codex 0.147.0) have not been tested
+ *  against `--mcp-config` / `-c mcp_servers.*`. Flip the default to on (with
+ *  `!== "0"` semantics) once the flags have soaked; pi is always excluded —
+ *  it has its own native extension (billion-context-pi #154). */
+export function launcherInjectMcp(env: NodeJS.ProcessEnv, base: string): boolean {
+    return base !== "pi" && env.BILI_LAUNCHER_PLUGIN === "1";
+}
+
 /** Ephemeral MCP config for --mcp-config / -c mcp_servers.bili.*: a single
  *  "bili" stdio server running dist/mcp.js. Args are kept flat so codex's
  *  TOML value parser stays happy. */
@@ -660,7 +670,10 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
             );
         }
     }
-    const injectMcp = base !== "pi" && process.env.BILI_LAUNCHER_PLUGIN !== "0";
+    const injectMcp = launcherInjectMcp(process.env, base);
+    if (!injectMcp && (base === "claude" || base === "codex")) {
+        console.error("bili: plugin mode off — set BILI_LAUNCHER_PLUGIN=1 to enable native MCP tools (experimental; verified with claude 2.1.227 / codex 0.147.0).");
+    }
     const origin = handle.origin;
     if (base === "pi") {
         env = buildPiEnv(origin, ca, process.env);

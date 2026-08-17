@@ -115,15 +115,18 @@ with zero setup: the four ACP tools appear as native MCP tools, executed on
 the proxy under the session lock, while the proxy keeps state, folding,
 philosophy prompt and nudges. Session binding is automatic — claude passes
 its session id to MCP children and on every request; codex spawns bind on
-first sight. Opt-outs: `BILI_LAUNCHER_PLUGIN=0` (plain launcher, wire-injected
-tools). `BILI_LAUNCHER_DIRECT=1` is an opt-in, not an opt-out.
+first sight. Plugin mode is opt-in while host-flag compatibility soaks: set
+`BILI_LAUNCHER_PLUGIN=1` to enable the native MCP tools (verified with
+claude 2.1.227 / codex 0.147.0; `BILI_LAUNCHER_PLUGIN=0` forces the plain
+wire-injected launcher once the default flips on).
+`BILI_LAUNCHER_DIRECT=1` is an opt-in, not an opt-out.
 
 Mode matrix:
 
 | Mode | Tools surface | Setup | When |
 |------|--------------|-------|------|
-| Launcher + MCP (default for claude/codex) | native MCP tools | none — just `bili claude` / `bili codex` | best UX |
-| Launcher wire mode (`BILI_LAUNCHER_PLUGIN=0`) | proxy-injected wire tools | none | fallback |
+| Launcher + MCP (`BILI_LAUNCHER_PLUGIN=1`) | native MCP tools | one env var | best UX; opt-in while soaking |
+| Launcher wire mode (default for claude/codex) | proxy-injected wire tools | none — just `bili claude` / `bili codex` | default until plugin mode soaks |
 | Manual plugin (pi etc.) | agent-side plugin | install plugin | hosts with plugin APIs |
 | Manual baseURL | proxy-injected wire tools | edit client config | exotic hosts |
 

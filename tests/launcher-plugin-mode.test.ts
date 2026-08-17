@@ -11,7 +11,7 @@ import { startServer, type ProxyOptions } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
-import { buildClaudePluginEnv, buildCodexMcpArgs, buildMcpConfig, launcherDirectUrl } from "../src/launcher.ts";
+import { buildClaudePluginEnv, buildCodexMcpArgs, buildMcpConfig, launcherDirectUrl, launcherInjectMcp } from "../src/launcher.ts";
 
 // Launcher mode (#162): hosts that cannot attach per-request headers
 // (claude/codex spawned by `bili claude` / `bili codex`) bind into plugin mode
@@ -189,6 +189,17 @@ test("launcher injection builders: direct-URL env, MCP config JSON, codex -c arg
     assert.equal(launcherDirectUrl({}), false, "transparent-MITM route is the default (existing launcher compatibility)");
     assert.equal(launcherDirectUrl({ BILI_LAUNCHER_DIRECT: "1" }), true, "direct URL is opt-in");
     assert.equal(launcherDirectUrl({ BILI_LAUNCHER_DIRECT: "0" }), false, "explicit opt-out honored");
+
+    // MCP injection is OPT-IN (#163): spawn args change when enabled and
+    // hosts older than the verified builds (claude 2.1.227, codex 0.147.0)
+    // are untested against the injection flags — default-off keeps existing
+    // `bili claude` / `bili codex` spawns byte-identical.
+    assert.equal(launcherInjectMcp({}, "claude"), false, "plugin injection off by default (claude)");
+    assert.equal(launcherInjectMcp({}, "codex"), false, "plugin injection off by default (codex)");
+    assert.equal(launcherInjectMcp({ BILI_LAUNCHER_PLUGIN: "0" }, "claude"), false, "explicit opt-out honored");
+    assert.equal(launcherInjectMcp({ BILI_LAUNCHER_PLUGIN: "1" }, "claude"), true, "opt-in enables injection");
+    assert.equal(launcherInjectMcp({ BILI_LAUNCHER_PLUGIN: "1" }, "codex"), true, "opt-in enables injection (codex)");
+    assert.equal(launcherInjectMcp({ BILI_LAUNCHER_PLUGIN: "1" }, "pi"), false, "pi always excluded (native extension #154)");
 
     const env = buildClaudePluginEnv("http://127.0.0.1:8787", true, { HOME: "/h" });
     assert.equal(env.ANTHROPIC_BASE_URL, "http://127.0.0.1:8787/bili/https://api.anthropic.com");
