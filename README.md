@@ -61,6 +61,24 @@ Three ways to use it — pick one:
   or when you want to pin an exact value. Routing is the same `/bili/` prefix
   either way — the config only changes which context window the proxy uses.
 
+### Agent plugin mode (内外呼应)
+
+For a native-plugin experience, an agent can run a small cooperative plugin
+alongside the proxy: the plugin registers the four ACP tools
+(`compress` / `decompress` / `search_context` / `acp_status`) natively with
+the agent and drives the agent's own tool loop, while the proxy stays the
+compression authority (state, history folding, philosophy prompt, nudges).
+Tool schemas are served by the proxy itself (`GET /__bili/plugin/manifest`),
+so plugin and proxy can never drift. See [PLUGIN.md](PLUGIN.md) for the
+protocol spec. Plugin-equipped sessions are detected automatically via
+request headers — wire-level tool injection is then suppressed for them
+(no double compression, native tool UX). Works in both proxy modes: the
+`/bili/` prefix baseURL **and MITM transparent mode** — the launcher
+(`bili pi` / `bili codex` / `bili claude`) exports `BILLION_CONTEXT_PROXY`
+for plugins to detect; the plugin can also report the agent's own model
+context window (`x-bili-plugin-context-window`) and read live context
+usage via `GET /__bili/plugin/status`.
+
 Compression is injected automatically — you only configure routing, never
 compression itself.
 
@@ -82,6 +100,35 @@ bili claude                           # launch claude through the proxy
 bili test pi                          # quick end-to-end smoke test of the pi path
 bili pi --mitm-domain api.foo.com     # add a domain to the MITM whitelist
 ```
+
+**Plugin-in-launcher mode (#162)** — for `claude` and `codex` the launcher
+additionally injects a single `bili` MCP server (`--mcp-config` for claude,
+`-c mcp_servers.bili.*` for codex — both ephemeral, nothing written to host
+config). The traffic route is **unchanged by default** — the transparent-
+MITM proxy as before — so existing setups keep working exactly as they did
+(OAuth-subscription traffic, custom relay endpoints). Opt in to **direct URL
+routing** (`BILI_LAUNCHER_DIRECT=1`) to drop MITM/CA trust entirely (claude's
+`ANTHROPIC_BASE_URL` / codex's provider `base_url` pointing at the `/bili/`
+prefix); the launcher prints a warning when direct mode changes your traffic
+route. The result is the native-plugin experience of [PLUGIN.md](PLUGIN.md)
+with zero setup: the four ACP tools appear as native MCP tools, executed on
+the proxy under the session lock, while the proxy keeps state, folding,
+philosophy prompt and nudges. Session binding is automatic — claude passes
+its session id to MCP children and on every request; codex spawns bind on
+first sight. Plugin mode is opt-in while host-flag compatibility soaks: set
+`BILI_LAUNCHER_PLUGIN=1` to enable the native MCP tools (verified with
+claude 2.1.227 / codex 0.147.0; `BILI_LAUNCHER_PLUGIN=0` forces the plain
+wire-injected launcher once the default flips on).
+`BILI_LAUNCHER_DIRECT=1` is an opt-in, not an opt-out.
+
+Mode matrix:
+
+| Mode | Tools surface | Setup | When |
+|------|--------------|-------|------|
+| Launcher + MCP (`BILI_LAUNCHER_PLUGIN=1`) | native MCP tools | one env var | best UX; opt-in while soaking |
+| Launcher wire mode (default for claude/codex) | proxy-injected wire tools | none — just `bili claude` / `bili codex` | default until plugin mode soaks |
+| Manual plugin (pi etc.) | agent-side plugin | install plugin | hosts with plugin APIs |
+| Manual baseURL | proxy-injected wire tools | edit client config | exotic hosts |
 
 How the client is pointed at the proxy (set automatically in the child env):
 

@@ -196,6 +196,13 @@ export function listSessions(): Session[] {
     return [...sessions.values()].sort((a, b) => b.lastSeen - a.lastSeen);
 }
 
+/** Read-only in-memory lookup. Unlike getSession, never creates or reloads a
+ *  session — used by the plugin tool API, which must not conjure state for a
+ *  conversation it has never seen. */
+export function peekSession(id: string): Session | undefined {
+    return sessions.get(id);
+}
+
 /** Overwrite the session's full-conversation snapshot with the latest client
  *  raw request messages (originalMessages from prepare*). One array per
  *  session, replaced every request — bounded, always the newest state. Empty

@@ -53,6 +53,7 @@ import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { emitStreamError } from "./stream-error.js";
 import { deriveSessionId as deriveProxySessionId, affinityToken, clientConversationHeader, type ConversationIdentity } from "./session-id.js";
+import { consumePluginRegisterFor, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, pipePluginJson, pipeThroughWithUsage, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import { isLoopbackAddress } from "./util.js";
@@ -287,6 +288,11 @@ type Prepared = {
     protocol: "anthropic" | "openai" | "responses";
     stream: boolean;
     compressInjected: boolean;
+    /** True when the session is driven by a cooperative agent-side plugin
+     *  (x-bili-plugin header, see src/plugin.ts): tools are native, the
+     *  response must pass through verbatim, and usage is sniffed instead of
+     *  captured by the compress loop. */
+    pluginMode?: boolean;
     responsesTextProtocol?: boolean;
     resetAfterSuccess?: boolean;
     responsesProjection?: ResponsesProjection;
@@ -449,6 +455,44 @@ async function handle(
         return;
     }
 
+    // Cooperative plugin protocol (see src/plugin.ts + PLUGIN.md): the
+    // manifest serves the exact tool schemas the wire injector uses, and the
+    // tool endpoint lets an agent-side plugin execute compress/decompress/
+    // search_context/acp_status against the session the plugin drives. Both
+    // live under the /__bili/ loopback + trusted-origin gate above.
+    if (req.method === "GET" && req.url === "/__bili/plugin/manifest") return handlePluginManifest(res);
+    if (req.method === "GET" && req.url?.startsWith("/__bili/plugin/status")) {
+        const query = req.url.slice(req.url.indexOf("?") + 1);
+        const conversationId = new URLSearchParams(query).get("conversationId")?.trim() ?? "";
+        if (!conversationId) {
+            res.writeHead(400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: "conversationId query parameter is required" }));
+            return;
+        }
+        return handlePluginStatus(conversationId, res);
+    }
+    if (req.method === "POST" && req.url === "/__bili/plugin/tool") {
+        try {
+            const body = await readBody(req);
+            return await handlePluginTool(body.toString("utf8"), res, { core, config, log });
+        } catch (err) {
+            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: String(err) }));
+            return;
+        }
+    }
+    if (req.method === "POST" && req.url === "/__bili/plugin/register") {
+        try {
+            const body = await readBody(req);
+            handlePluginRegister(body.toString("utf8"), res);
+            return;
+        } catch (err) {
+            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: String(err) }));
+            return;
+        }
+    }
+
     // Bili does not support WebSocket — reject any upgrade with 426 so clients
     // with built-in fast-fallback (e.g. Codex supports_websockets=true) retry over HTTP POST.
     if (req.headers.upgrade === "websocket") {
@@ -546,7 +590,15 @@ async function handle(
         const model = (parsed as { model?: string }).model;
         if (model) {
             const embeddedUrl = route?.rewrittenUrl;
-            let native = resolveContextLimit(opts.routes, embeddedUrl, model);
+            // A cooperative plugin's reported window (the agent's own config)
+            // is the authoritative native window — it outranks the table and
+            // the models.dev registry (most valuable in MITM mode where the
+            // model may be a private relay), but operator tuning via
+            // compress.modelContextLimit still outranks it inside
+            // resolveRequestConfig. Gated on the x-bili-plugin marker: the
+            // header is protocol-internal, and a plain client must not be
+            // able to rewrite the nudge denominator by name.
+            let native = pluginReportedContextWindow(req.headers) ?? resolveContextLimit(opts.routes, embeddedUrl, model);
             if (!native && embeddedUrl) {
                 const host = (() => { try { return new URL(embeddedUrl).host; } catch { return undefined; } })();
                 native = await contextFromRegistry(model, host);
@@ -558,6 +610,23 @@ async function handle(
     let prepared: Prepared | null = null;
     if (!opts.passthrough && protocol && parsed && typeof parsed === "object") {
         const sessionHeader = headerValue(req, opts.sessionHeader);
+        // Plugin mode (issue #1, "内外呼应"): a cooperative agent-side plugin
+        // announces itself with x-bili-plugin. The proxy then treats the
+        // session's tool surface as NATIVE (plugin-registered from the
+        // manifest) — wire tool injection is suppressed and the compress loop
+        // never intercepts proxy-named tool calls. Philosophy prompt + nudge
+        // keep flowing from here; state + folding stay proxy-owned.
+        //
+        // Launcher mode (#162) is the header-less variant: hosts that cannot
+        // attach per-request headers (claude/codex spawned by `bili claude`
+        // / `bili codex`) POST /__bili/plugin/register first (Claude Code
+        // SessionStart hook / codex spawn). The FIRST request that creates a
+        // NEW session consumes the pending register — that session is plugin
+        // mode from then on, keyed by the registered conversation id, and the
+        // binding sticks via session.metadata.pluginAgent. stats.requests
+        // increments inside prepare() below, so === 0 here means first sight.
+        let pluginAgent = pluginAgentHeader(req.headers);
+        let pluginConversation = pluginConversationHeader(req.headers);
         // The client's own conversation header (x-session-id / x-session-affinity
         // / x-opencode-session / x-acp-session) is the STRONGEST signal that two
         // requests belong to the same conversation — much stronger than the
@@ -597,6 +666,33 @@ async function handle(
             ? responsesIdentity.value
             : clientConversationHeader(req.headers);
         const session = getSession(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? undefined });
+        // Launcher-mode binding (#162): prefer identity — claude code sends
+        // x-claude-code-session-id on every request, equal to the
+        // CLAUDE_CODE_SESSION_ID the MCP shell registered, so binding is
+        // race-free. Fall back to the headless pending queue (codex spawn)
+        // for the first request that creates a new session.
+        if (!pluginAgent) {
+            const identityAgent = consumePluginRegisterFor(clientConv ?? conversation);
+            if (identityAgent) {
+                pluginAgent = identityAgent;
+                pluginConversation = clientConv ?? conversation;
+            }
+        }
+        if (!pluginAgent && session.stats.requests === 0) {
+            const pending = takePendingPluginRegister();
+            if (pending) {
+                pluginAgent = pending.agent;
+                pluginConversation = pending.conversationId;
+            }
+        }
+        if (!pluginAgent && typeof session.metadata.pluginAgent === "string") pluginAgent = session.metadata.pluginAgent;
+        if (pluginAgent && !pluginConversation) pluginConversation = conversation;
+        if (pluginAgent) {
+            if (session.metadata.pluginAgent !== pluginAgent) session.metadata.pluginAgent = pluginAgent;
+            session.metadata.effectiveContextLimit = reqConfig.modelContextLimit;
+            recordPluginSession(pluginConversation ?? conversation, session.id);
+        }
+        const pluginMode = pluginAgent !== undefined;
         // acquireInFlight must precede the lock so evictOldest() cannot flush
         // this session between getSession and lock acquisition (inFlight===0
         // window). Released in the outer finally after forward completes.
@@ -610,13 +706,16 @@ async function handle(
                     countTokens
                         ? prepareCountTokens(parsed as AnthropicRequestBody, core, reqConfig, log, session)
                         : protocol === "anthropic"
-                          ? prepareAnthropic(parsed as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, log, session)
+                          ? prepareAnthropic(parsed as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, pluginMode)
                           : protocol === "openai"
-                            ? prepareOpenai(parsed as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, log, session)
+                            ? prepareOpenai(parsed as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, pluginMode)
                             : responsesCompact
                               ? prepareResponsesCompact(bodyBuffer, parsed as ResponsesRequestBody, session)
-                              : prepareResponses(parsed as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, responsesIdentity!);
+                              : prepareResponses(parsed as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, responsesIdentity!, pluginMode);
                 await forward(req, res, opts, prepared!.body, prepared!, core, reqConfig, log, route, affinity);
+                if (pluginMode && prepared) {
+                    rememberPluginMessages(sessionId, prepared.processedMessages, prepared.originalMessages, prepared.nudge);
+                }
             });
         } finally {
             releaseInFlight(session);
@@ -676,10 +775,12 @@ function prepareAnthropic(
     prompts: Prompts,
     log: (level: string, msg: string) => void,
     session: Session,
+    pluginMode: boolean,
 ): Prepared {
     const sessionId = session.id;
     const stream = parsed.stream === true;
     ++session.stats.requests;
+    const injectTools = opts.compress.injectTool && !pluginMode;
 
     let processedMessages: CoreMessage[] = [];
     let originalMessages: CoreMessage[] = [];
@@ -716,7 +817,7 @@ function prepareAnthropic(
         rebuiltMessages = coreToAnthropic(processedMessages as BiliMessage[], cacheControls);
 
         systemOut = injectSystem(parsed, opts, prompts);
-        if (opts.compress.injectTool) {
+        if (injectTools) {
             toolsOut = injectTool(parsed.tools);
         }
         // Nudge as a separate trailing user message (cache-friendly): the
@@ -738,7 +839,7 @@ function prepareAnthropic(
     markDirty(session);
 
     const rebuilt: AnthropicRequestBody = { ...parsed, messages: rebuiltMessages, system: systemOut, tools: toolsOut };
-    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: opts.compress.injectTool, nudge, prompts } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts } as Prepared;
 }
 
 function prepareOpenai(
@@ -750,6 +851,7 @@ function prepareOpenai(
     prompts: Prompts,
     log: (level: string, msg: string) => void,
     session: Session,
+    pluginMode: boolean,
 ): Prepared {
     const sessionId = session.id;
     const stream = parsed.stream === true;
@@ -770,6 +872,7 @@ function prepareOpenai(
     // provider prefix cache for every subsequent turn.
     const isTitleGen = maxTokens <= 200;
     const shouldInject = opts.compress.injectTool && !isTitleGen;
+    const injectTools = shouldInject && !pluginMode;
 
     try {
         const { msgs } = openaiToCore(parsed);
@@ -800,7 +903,7 @@ function prepareOpenai(
         const sysParts: string[] = [];
         if (shouldInject) sysParts.push(buildCompressSystemPrompt(prompts));
         rebuiltMessages = injectOpenaiSystem(rebuiltMessages, sysParts);
-        if (shouldInject) {
+        if (injectTools) {
             toolsOut = injectOpenaiTool(parsed.tools);
         }
         // Nudge as a separate trailing user message (cache-friendly).
@@ -830,7 +933,7 @@ function prepareOpenai(
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: shouldInject, nudge, prompts } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: injectTools, pluginMode, nudge, prompts } as Prepared;
 }
 
 function prepareResponses(
@@ -843,6 +946,7 @@ function prepareResponses(
     log: (level: string, msg: string) => void,
     session: Session,
     identity: ConversationIdentity,
+    pluginMode: boolean,
 ): Prepared {
     const sessionId = session.id;
     const stream = parsed.stream === true;
@@ -859,6 +963,7 @@ function prepareResponses(
     let toolsOut = parsed.tools;
 
     const shouldInject = opts.compress.injectTool;
+    const injectTools = shouldInject && !pluginMode;
     const responsesTextProtocol = FORCE_TEXT_PROTOCOL ||
         resolveCompressProtocol(opts.routes, session.meta.upstreamOrigin) === "marker";
 
@@ -888,7 +993,7 @@ function prepareResponses(
             const prompt = responsesTextProtocol ? buildCompressHybridSystemPrompt(prompts) : buildCompressSystemPrompt(prompts);
             const devContent = [...projection.systemParts, prompt].join("\n\n---\n\n");
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent);
-            if (!process.env.ACP_NO_INJECT_TOOL) {
+            if (!process.env.ACP_NO_INJECT_TOOL && injectTools) {
                 toolsOut = responsesTextProtocol
                     ? injectResponsesTool(parsed.tools, ACP_READONLY_TOOLS_RESPONSES)
                     : injectResponsesTool(parsed.tools);
@@ -955,7 +1060,8 @@ function prepareResponses(
         responsesProjection,
         protocol: "responses",
         stream,
-        compressInjected: shouldInject,
+        compressInjected: injectTools,
+        pluginMode,
         responsesTextProtocol,
         nudge,
         prompts,
@@ -1316,6 +1422,19 @@ async function forward(
             markNativeCompactionBoundary(prepared.session);
             log("info", `[${prepared.session.id}] native Responses compact completed; rebase scheduled for next Responses turn`);
         }
+        return;
+    }
+    // Plugin mode: the agent's native loop owns the tool surface — pass the
+    // response through VERBATIM (a model-emitted compress call must reach the
+    // plugin untouched) while sniffing usage so lastInputTokens (the input to
+    // the next nudge decision) keeps tracking reality.
+    if (prepared?.pluginMode) {
+        if (prepared.stream) {
+            await pipeThroughWithUsage(upstream.body as ReadableStream<Uint8Array>, res, prepared.session);
+        } else {
+            await pipePluginJson(upstream.body as ReadableStream<Uint8Array>, res, prepared.session);
+        }
+        clearUpstreamTimer();
         return;
     }
     // We only rewrite when THIS request actually had the compress tool

@@ -47,6 +47,21 @@ npm install -g billion-context
 - **零配置(最简单):** 在客户端 baseURL 前面加上代理地址 + `/bili/`。无需配置文件 —— context 窗口自动从 [models.dev](https://models.dev) registry 查询。`/bili/` 前缀还是个自检测信号:billion-context 的客户端扩展(billion-context-pi / opencode-acp)能在自己的 baseUrl 里认出它并自禁用,避免双层压缩。
 - **显式 context 窗口覆盖:** 在配置文件(或网页)里按 URL 声明 context 窗口,用于 registry 不认识的端点,或想钉死一个精确值的场景。两种方式路由都是同一个 `/bili/` 前缀 —— 配置只改变代理用哪个 context 窗口。
 
+### Agent 插件模式(内外呼应)
+
+想要原生插件体验,可以在 agent 内部装一个配合代理的插件:插件把四个
+ACP 工具(`compress` / `decompress` / `search_context` / `acp_status`)
+原生注册进 agent、由 agent 自己的工具循环驱动,而代理仍然是压缩引擎
+(状态、历史折叠、压缩哲学 prompt、nudge 全归代理)。工具 schema 由
+代理统一下发(`GET /__bili/plugin/manifest`),插件与代理永远不会版本
+漂移。协议规范见 [PLUGIN.md](PLUGIN.md)。带插件的会话通过请求头自动
+识别 —— 该会话的 wire 层工具注入自动关闭(不会双重压缩,工具体验原生)。
+两种代理模式都支持:`/bili/` 前缀 baseURL **和 MITM 透明模式** ——
+launcher(`bili pi` / `bili codex` / `bili claude`)会导出
+`BILLION_CONTEXT_PROXY` 供插件检测;插件还可以上报 agent 自己的模型
+上下文窗口(`x-bili-plugin-context-window`),并通过
+`GET /__bili/plugin/status` 读取实时上下文水位。
+
 压缩是自动注入的 —— 你只需配置路由,无需配置压缩本身。
 
 ### 方式 A —— 零配置(`/bili/` 前缀)

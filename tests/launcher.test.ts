@@ -97,6 +97,7 @@ test("buildPiEnv: sets HTTPS_PROXY + NODE_EXTRA_CA_CERTS, preserves baseEnv", ()
     const env = buildPiEnv("http://127.0.0.1:8787", "/tmp/ca.pem", { PATH: "/usr/bin", ANTHROPIC_API_KEY: "sk-x" });
     assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
     assert.equal(env.NODE_EXTRA_CA_CERTS, "/tmp/ca.pem");
+    assert.equal(env.BILLION_CONTEXT_PROXY, "http://127.0.0.1:8787");
     assert.equal(env.PATH, "/usr/bin");
     assert.equal(env.ANTHROPIC_API_KEY, "sk-x");
 });
@@ -105,6 +106,7 @@ test("buildCodexEnv: sets HTTPS_PROXY + SSL_CERT_FILE, preserves baseEnv", () =>
     const env = buildCodexEnv("http://127.0.0.1:8787", "/tmp/ca.pem", { PATH: "/usr/bin", OPENAI_API_KEY: "sk-x" });
     assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
     assert.equal(env.SSL_CERT_FILE, "/tmp/ca.pem");
+    assert.equal(env.BILLION_CONTEXT_PROXY, "http://127.0.0.1:8787");
     assert.equal(env.PATH, "/usr/bin");
     assert.equal(env.OPENAI_API_KEY, "sk-x");
     assert.equal(env.NODE_EXTRA_CA_CERTS, undefined);
@@ -114,6 +116,7 @@ test("buildClaudeEnv: sets HTTPS_PROXY + NODE_EXTRA_CA_CERTS, preserves baseEnv"
     const env = buildClaudeEnv("http://127.0.0.1:8787", "/tmp/ca.pem", [], [], { PATH: "/usr/bin", ANTHROPIC_API_KEY: "sk-x" });
     assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
     assert.equal(env.NODE_EXTRA_CA_CERTS, "/tmp/ca.pem");
+    assert.equal(env.BILLION_CONTEXT_PROXY, "http://127.0.0.1:8787");
     assert.equal(env.PATH, "/usr/bin");
     assert.equal(env.ANTHROPIC_API_KEY, "sk-x");
     assert.equal(env.SSL_CERT_FILE, undefined);
