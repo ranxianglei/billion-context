@@ -242,11 +242,11 @@ export function discoverDomains(client: ClientName, config: ClientConfig): strin
 }
 
 export function buildPiEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-    return { ...baseEnv, HTTPS_PROXY: origin, NODE_EXTRA_CA_CERTS: caPath };
+    return { ...baseEnv, HTTPS_PROXY: origin, NODE_EXTRA_CA_CERTS: caPath, BILLION_CONTEXT_PROXY: origin };
 }
 
 export function buildCodexEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-    return { ...baseEnv, HTTPS_PROXY: origin, SSL_CERT_FILE: caPath };
+    return { ...baseEnv, HTTPS_PROXY: origin, SSL_CERT_FILE: caPath, BILLION_CONTEXT_PROXY: origin };
 }
 
 export function buildCodexArgs(
@@ -273,7 +273,7 @@ export function buildClaudeEnv(
     httpsRewrites: HttpRewrite[],
     baseEnv: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
-    const env: NodeJS.ProcessEnv = { ...baseEnv, HTTPS_PROXY: origin, NODE_EXTRA_CA_CERTS: caPath };
+    const env: NodeJS.ProcessEnv = { ...baseEnv, HTTPS_PROXY: origin, NODE_EXTRA_CA_CERTS: caPath, BILLION_CONTEXT_PROXY: origin };
     const r = httpRewrites.find((rw) => rw.key === "ANTHROPIC_BASE_URL");
     if (r) env.ANTHROPIC_BASE_URL = wrapUpstream(origin, r.realUpstream);
     const hr = httpsRewrites.find((rw) => rw.key === "ANTHROPIC_BASE_URL");

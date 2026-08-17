@@ -61,6 +61,24 @@ Three ways to use it — pick one:
   or when you want to pin an exact value. Routing is the same `/bili/` prefix
   either way — the config only changes which context window the proxy uses.
 
+### Agent plugin mode (内外呼应)
+
+For a native-plugin experience, an agent can run a small cooperative plugin
+alongside the proxy: the plugin registers the four ACP tools
+(`compress` / `decompress` / `search_context` / `acp_status`) natively with
+the agent and drives the agent's own tool loop, while the proxy stays the
+compression authority (state, history folding, philosophy prompt, nudges).
+Tool schemas are served by the proxy itself (`GET /__bili/plugin/manifest`),
+so plugin and proxy can never drift. See [PLUGIN.md](PLUGIN.md) for the
+protocol spec. Plugin-equipped sessions are detected automatically via
+request headers — wire-level tool injection is then suppressed for them
+(no double compression, native tool UX). Works in both proxy modes: the
+`/bili/` prefix baseURL **and MITM transparent mode** — the launcher
+(`bili pi` / `bili codex` / `bili claude`) exports `BILLION_CONTEXT_PROXY`
+for plugins to detect; the plugin can also report the agent's own model
+context window (`x-bili-plugin-context-window`) and read live context
+usage via `GET /__bili/plugin/status`.
+
 Compression is injected automatically — you only configure routing, never
 compression itself.
 
