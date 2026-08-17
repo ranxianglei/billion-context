@@ -302,13 +302,47 @@ function openProxySocket(proxy: ParsedHttpProxy): net.Socket {
     return net.connect(proxy.port, proxy.host);
 }
 
+const CONNECT_TIMEOUT_MS = 10_000;
+
+// Test seam: lets tests substitute a connect factory that never completes,
+// so the direct-path timeout can be asserted in milliseconds instead of
+// simulating a black-holed port (ESM namespaces are immutable — the repo's
+// established _...ForTest pattern instead of module mocking).
+let connectFactory: (port: number, host: string) => net.Socket = (port, host) => net.connect(port, host);
+
+export function _setConnectFactoryForTest(factory: ((port: number, host: string) => net.Socket) | undefined): void {
+    connectFactory = factory ?? ((port, host) => net.connect(port, host));
+}
+
+/** Plain (non-proxied) outbound TCP connect with a bounded handshake:
+ *  a black-holed upstream (firewall drop, routing hole) must fail in seconds,
+ *  not after the OS default ~127s (tcp_syn_retries). Mirrors the proxied
+ *  branch's 10s handshake timeout (see #78). */
+export function connectDirect(host: string, port: number, timeoutMs: number = CONNECT_TIMEOUT_MS): Promise<net.Socket> {
+    return new Promise((resolve, reject) => {
+        const socket = connectFactory(port, host);
+        let settled = false;
+        const finishError = (error: Error) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            socket.destroy();
+            reject(error);
+        };
+        const timer = setTimeout(() => finishError(new Error(`upstream connect ${host}:${port} timed out after ${timeoutMs}ms`)), timeoutMs);
+        socket.once("error", finishError);
+        socket.once("connect", () => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            resolve(socket);
+        });
+    });
+}
+
 export function connectThroughProxy(host: string, port: number, proxyUrl: string | undefined): Promise<net.Socket> {
     if (!proxyUrl) {
-        return new Promise((resolve, reject) => {
-            const socket = net.connect(port, host);
-            socket.once("connect", () => resolve(socket));
-            socket.once("error", reject);
-        });
+        return connectDirect(host, port);
     }
     const proxy = parseHttpProxy(proxyUrl);
     if (!proxy) return Promise.reject(new Error(`invalid upstream proxy: ${redactProxyUrl(proxyUrl)}`));
@@ -322,7 +356,7 @@ export function connectThroughProxy(host: string, port: number, proxyUrl: string
             socket.destroy();
             reject(error);
         };
-        const timer = setTimeout(() => finishError(new Error(`upstream proxy CONNECT ${host}:${port} handshake timeout`)), 10_000);
+        const timer = setTimeout(() => finishError(new Error(`upstream proxy CONNECT ${host}:${port} handshake timeout`)), CONNECT_TIMEOUT_MS);
         socket.once("error", finishError);
         const connectedEvent = proxy.protocol === "https:" ? "secureConnect" : "connect";
         socket.once(connectedEvent, () => {
