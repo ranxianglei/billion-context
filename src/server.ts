@@ -46,7 +46,7 @@ import { renderUI, handleConfigGet, handleConfigPut } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { getStore } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger } from "./logger.js";
-import { defaultLogFile, stateDir } from "./paths.js";
+import { defaultLogFile, stateDir, proxyOriginFile } from "./paths.js";
 import { compressLoopResponsesJson } from "./compress-loop-responses.js";
 import { runCompressLoop, pickAdapter } from "./loop/index.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
@@ -194,6 +194,12 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     }
     server.listen(opts.port, opts.host, () => {
         const displayHost = opts.host === "0.0.0.0" ? "localhost" : opts.host;
+        try {
+            fs.mkdirSync(stateDir(), { recursive: true });
+            fs.writeFileSync(proxyOriginFile(), `http://127.0.0.1:${server.address() === null ? opts.port : (server.address() as { port: number }).port}\n`);
+        } catch {
+            // best-effort discovery hint for host-spawned MCP shells
+        }
         const nOverrides = Object.keys(opts.routes).length;
         log(
             "info",

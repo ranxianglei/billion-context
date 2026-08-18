@@ -17,6 +17,7 @@ import os from "node:os";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { resolvePiHome } from "./client-config.js";
+import { resolveProxyOrigin } from "./mcp.js";
 
 export const PLUGIN_AGENTS = ["pi", "omp", "claude", "codex", "opencode"] as const;
 export type PluginAgent = (typeof PLUGIN_AGENTS)[number];
@@ -116,11 +117,9 @@ function piStatus(): string {
 // — omp ———————————————————————————————————————————————————————————————
 
 function ompConfigFile(): string {
-    const raw = process.env.OMP_CONFIG?.trim();
-    if (raw && raw.length > 0) return raw;
-    const xdg = process.env.XDG_CONFIG_HOME?.trim();
-    if (xdg && xdg.length > 0) return path.join(xdg, "omp/agent/config.yml");
-    return homeFile(".config/omp/agent/config.yml");
+    const raw = process.env.PI_CODING_AGENT_DIR?.trim();
+    if (raw && raw.length > 0) return path.join(raw, "config.yml");
+    return path.join(os.homedir(), ".omp", "agent", "config.yml");
 }
 
 function ompExtensionPath(): string {
@@ -207,7 +206,7 @@ function claudeInstall(): string {
     const mcpJs = path.join(root, "dist", "mcp.js");
     requireDistFile(mcpJs);
     try {
-        execFileSync("claude", ["mcp", "add", "bili", "--scope", "user", "--", process.execPath, mcpJs], { stdio: ["ignore", "pipe", "pipe"], timeout: CLAUDE_EXEC_TIMEOUT_MS });
+        execFileSync("claude", ["mcp", "add", "bili", "--scope", "user", "-e", `BILI_MCP_PROXY=${resolveProxyOrigin()}`, "--", process.execPath, mcpJs], { stdio: ["ignore", "pipe", "pipe"], timeout: CLAUDE_EXEC_TIMEOUT_MS });
         return `claude: installed via \`claude mcp add\` (user scope) -> ${claudeMcpJson()}`;
     } catch (err) {
         const stderr = err instanceof Error && "stderr" in err ? String((err as { stderr?: Buffer | string }).stderr ?? "") : "";
@@ -232,17 +231,27 @@ function claudeStatus(): string {
 // — codex ——————————————————————————————————————————————————————————————
 
 function codexToml(): string {
-    return homeFile(".codex/config.toml", "CODEX_HOME");
+    const raw = process.env.CODEX_HOME?.trim();
+    if (raw && raw.length > 0) return path.join(raw, "config.toml");
+    return homeFile(".codex/config.toml");
 }
 
 function codexBlock(): string {
-    return `\n[mcp_servers.bili]\ncommand = ${JSON.stringify(process.execPath)}\nargs = [${JSON.stringify(path.join(selfPackageRoot(), "dist", "mcp.js"))}]\n`;
+    return `\n[mcp_servers.bili]\ncommand = ${JSON.stringify(process.execPath)}\nargs = [${JSON.stringify(path.join(selfPackageRoot(), "dist", "mcp.js"))}]\nenv = { BILI_MCP_PROXY = ${JSON.stringify(resolveProxyOrigin())} }\n`;
 }
 
 function codexInstall(): string {
     const file = codexToml();
     const text = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
-    if (/^\[mcp_servers\.bili\]\s*$/m.test(text)) return `codex: already installed (${file})`;
+    const existing = /^[ \t]*\[mcp_servers\.bili\][ \t]*$/m.exec(text);
+    if (existing !== null) {
+        const block = text.slice(existing.index, text.indexOf("\n[", existing.index + 1) === -1 ? undefined : text.indexOf("\n[", existing.index + 1));
+        if (block.includes(`BILI_MCP_PROXY = ${JSON.stringify(resolveProxyOrigin())}`)) return `codex: already installed (${file})`;
+        const refreshed = text.slice(0, existing.index) + codexBlock().replace(/^\n/, "") + text.slice(existing.index + block.length);
+        backupOnce(file);
+        fs.writeFileSync(file, refreshed);
+        return `codex: refreshed proxy origin -> ${file} [mcp_servers.bili]`;
+    }
     fs.mkdirSync(path.dirname(file), { recursive: true });
     backupOnce(file);
     fs.writeFileSync(file, text + (text.endsWith("\n") || text.length === 0 ? "" : "\n") + codexBlock());
@@ -290,7 +299,7 @@ function opencodeInstall(): string {
     const data = readJson(file);
     const mcp = (data.mcp as Record<string, unknown> | undefined) ?? {};
     if ("bili" in mcp) return `opencode: already installed (${file})`;
-    mcp.bili = { type: "local", command: [process.execPath, mcpJs], enabled: true };
+    mcp.bili = { type: "local", command: [process.execPath, mcpJs], environment: { BILI_MCP_PROXY: resolveProxyOrigin() }, enabled: true };
     data.mcp = mcp;
     writeJson(file, data);
     return `opencode: installed -> ${file} mcp.bili`;

@@ -12,6 +12,7 @@ import { proxyBaseFromUrl, proxyBaseFromEnv, detectProxyBase, fetchManifest, for
 import biliPlugin, { createBiliPlugin } from "../src/agent/pi.ts";
 import ompPlugin from "../src/agent/omp.ts";
 import { pluginInstall, pluginRemove, pluginStatusAll, PLUGIN_AGENTS, selfPackageRoot } from "../src/plugin-install.ts";
+import { resolveProxyOrigin } from "../src/mcp.ts";
 
 function withEnv(vars: Record<string, string | undefined>, fn: () => void | Promise<void>): Promise<void> {
     const saved = new Map<string, string | undefined>();
@@ -252,10 +253,10 @@ test("omp entry reports x-bili-plugin: omp without env vars", async () => {
 function hintEnv(home: string, piAgentDir: string): Record<string, string> {
     return {
         PI_CODING_AGENT_DIR: piAgentDir,
-        OMP_CONFIG: path.join(home, ".omp/agent/config.yml"),
         CODEX_HOME: home,
         OPENCODE_CONFIG: path.join(home, ".config/opencode/opencode.json"),
         CLAUDE_CONFIG_DIR: home,
+        BILI_MCP_PROXY: "http://127.0.0.1:8787",
     };
 }
 
@@ -274,6 +275,7 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
         assert.match(pluginRemove("pi"), /not installed/);
 
         fs.mkdirSync(path.join(home, ".omp/agent"), { recursive: true });
+        await withEnv({ PI_CODING_AGENT_DIR: path.join(home, ".omp/agent") }, async () => {
         fs.writeFileSync(path.join(home, ".omp/agent/config.yml"), "extensions:\n  - /some/other/ext.js\nfirstRunComplete: true\n");
         assert.match(pluginInstall("omp"), /installed/);
         const ompText = fs.readFileSync(path.join(home, ".omp/agent/config.yml"), "utf8");
@@ -309,20 +311,26 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
         assert.match(pluginInstall("omp"), /already installed/);
         assert.match(pluginRemove("omp"), /removed/);
         assert.equal(fs.readFileSync(path.join(home, ".omp/agent/config.yml"), "utf8"), "extensions:\n");
+        });
 
         assert.match(pluginInstall("codex"), /installed/);
-        const toml = fs.readFileSync(path.join(home, ".codex/config.toml"), "utf8");
+        const toml = fs.readFileSync(path.join(home, "config.toml"), "utf8");
         assert.match(toml, /\[mcp_servers\.bili\]\ncommand = /);
-        fs.writeFileSync(path.join(home, ".codex/config.toml"), toml + "\n[mcp_servers.other]\ncommand = \"x\"\n");
+        assert.match(toml, /BILI_MCP_PROXY = "http:\/\/127\.0\.0\.1:8787"/);
+        fs.writeFileSync(path.join(home, "config.toml"), toml + "\n[mcp_servers.other]\ncommand = \"x\"\n");
         assert.match(pluginInstall("codex"), /already installed/);
+        fs.writeFileSync(path.join(home, "config.toml"), fs.readFileSync(path.join(home, "config.toml"), "utf8").replace("8787", "9999"));
+        assert.match(pluginInstall("codex"), /refreshed/);
+        assert.match(fs.readFileSync(path.join(home, "config.toml"), "utf8"), /BILI_MCP_PROXY = "http:\/\/127\.0\.0\.1:8787"/);
         assert.match(pluginRemove("codex"), /removed/);
-        const tomlAfter = fs.readFileSync(path.join(home, ".codex/config.toml"), "utf8");
+        const tomlAfter = fs.readFileSync(path.join(home, "config.toml"), "utf8");
         assert.doesNotMatch(tomlAfter, /mcp_servers\.bili/);
         assert.match(tomlAfter, /\[mcp_servers\.other\]\ncommand = "x"\n/);
 
         assert.match(pluginInstall("opencode"), /installed/);
-        const oc = JSON.parse(fs.readFileSync(path.join(home, ".config/opencode/opencode.json"), "utf8")) as { mcp: Record<string, { command: string[] }> };
+        const oc = JSON.parse(fs.readFileSync(path.join(home, ".config/opencode/opencode.json"), "utf8")) as { mcp: Record<string, { command: string[]; environment?: Record<string, string> }> };
         assert.equal(oc.mcp.bili.command[1]!.endsWith("dist/mcp.js"), true);
+        assert.equal(oc.mcp.bili.environment?.BILI_MCP_PROXY, "http://127.0.0.1:8787");
         assert.match(pluginRemove("opencode"), /removed/);
         assert.equal((JSON.parse(fs.readFileSync(path.join(home, ".config/opencode/opencode.json"), "utf8")) as { mcp?: unknown }).mcp, undefined);
 
@@ -333,6 +341,22 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
         assert.deepEqual(PLUGIN_AGENTS, ["pi", "omp", "claude", "codex", "opencode"]);
     });
     fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("resolveProxyOrigin discovers the running proxy via the state file", async () => {
+    const state = fs.mkdtempSync(path.join(os.tmpdir(), "bili-state-"));
+    await withEnv({ XDG_STATE_HOME: state, BILI_MCP_PROXY: undefined }, () => {
+        assert.equal(resolveProxyOrigin(), "http://127.0.0.1:8787");
+        fs.mkdirSync(path.join(state, "billion-context"), { recursive: true });
+        fs.writeFileSync(path.join(state, "billion-context", "proxy-origin"), "http://127.0.0.1:8792\n");
+        assert.equal(resolveProxyOrigin(), "http://127.0.0.1:8792");
+        fs.writeFileSync(path.join(state, "billion-context", "proxy-origin"), "ftp://bad\ngarbage");
+        assert.equal(resolveProxyOrigin(), "http://127.0.0.1:8787");
+    });
+    await withEnv({ XDG_STATE_HOME: state, BILI_MCP_PROXY: "http://10.0.0.5:9000" }, () => {
+        assert.equal(resolveProxyOrigin(), "http://10.0.0.5:9000");
+    });
+    fs.rmSync(state, { recursive: true, force: true });
 });
 
 test("plugin install refuses to touch broken or non-object configs", async () => {
