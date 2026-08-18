@@ -25,6 +25,7 @@ import { startServer } from "./server.js";
 import { configFile as defaultConfigFile } from "./paths.js";
 import { checkForUpdate, startAutoUpdate } from "./update.js";
 import { runMcpStdio } from "./mcp.js";
+import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, type PluginAgent } from "./plugin-install.js";
 import { runLaunch, runTestPi, isLaunchClient, type ClientName } from "./launcher.js";
 import { exportSession } from "./export.js";
 import { readFileSync } from "node:fs";
@@ -101,7 +102,7 @@ Docs: https://github.com/ranxianglei/billion-context
 `;
 
 type Parsed = {
-    command: "start" | "update" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp";
+    command: "start" | "update" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp" | "plugin";
     client?: ClientName;
     clientArgs: string[];
     mitmDomains: string[];
@@ -109,6 +110,8 @@ type Parsed = {
     exportSelector?: string;
     exportOutput?: string;
     exportFull?: boolean;
+    pluginAction?: "install" | "remove" | "list";
+    pluginAgent?: PluginAgent;
 };
 
 export function parseArgs(argv: string[]): Parsed {
@@ -121,6 +124,8 @@ export function parseArgs(argv: string[]): Parsed {
     let exportSelector: string | undefined;
     let exportOutput: string | undefined;
     let exportFull = false;
+    let pluginAction: Parsed["pluginAction"];
+    let pluginAgent: Parsed["pluginAgent"];
 
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i]!;
@@ -218,6 +223,27 @@ export function parseArgs(argv: string[]): Parsed {
             exportSelector = positional[1]; // conversation id
         } else if (cmd === "mcp") {
             command = "mcp";
+        } else if (cmd === "plugin") {
+            command = "plugin";
+            const action = positional[1];
+            if (action === "install" || action === "remove" || action === "list") {
+                pluginAction = action;
+            } else {
+                console.error(`bili plugin: unknown action "${action ?? ""}" (try "bili plugin install|remove|list <agent>")`);
+                process.exit(2);
+            }
+            const agent = positional[2];
+            if (agent !== undefined) {
+                if (!isPluginAgent(agent)) {
+                    console.error(`bili plugin: unknown agent "${agent}" (try one of: ${PLUGIN_AGENTS.join(", ")})`);
+                    process.exit(2);
+                }
+                pluginAgent = agent;
+            }
+            if (pluginAction !== "list" && pluginAgent === undefined) {
+                console.error(`bili plugin ${pluginAction}: agent is required (try one of: ${PLUGIN_AGENTS.join(", ")})`);
+                process.exit(2);
+            }
         } else if (cmd === "test") {
             const target = positional[1];
             if (target && isLaunchClient(target)) {
@@ -233,11 +259,11 @@ export function parseArgs(argv: string[]): Parsed {
         }
     }
 
-    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull };
+    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, pluginAction, pluginAgent };
 }
 
 export async function main(): Promise<void> {
-    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull } = parseArgs(process.argv.slice(2));
+    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, pluginAction, pluginAgent } = parseArgs(process.argv.slice(2));
     if (command === "help") {
         process.stdout.write(HELP);
         return;
@@ -270,6 +296,22 @@ export async function main(): Promise<void> {
     if (command === "mcp") {
         runMcpStdio();
         return;
+    }
+    if (command === "plugin") {
+        if (pluginAction === "list") {
+            for (const row of pluginStatusAll()) {
+                console.log(`${row.agent.padEnd(10)} ${row.status}`);
+            }
+            return;
+        }
+        if (pluginAction === "install") {
+            console.log(pluginInstall(pluginAgent!));
+            return;
+        }
+        if (pluginAction === "remove") {
+            console.log(pluginRemove(pluginAgent!));
+            return;
+        }
     }
     if (command === "export") {
         try {
