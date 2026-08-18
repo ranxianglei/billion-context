@@ -88,4 +88,66 @@ export function usageTotals(
         total: num(usage["input_tokens"]),
         cached: num((usage["input_tokens_details"] as Record<string, unknown> | undefined)?.["cached_tokens"]),
     };
+/** Result of inspecting an upstream response for a "context too long" error. */
+export interface ContextOverflowInfo {
+    /** True if the response looks like an upstream context-overflow error. */
+    isOverflow: boolean;
+    /** The real context window (tokens) learned from the error body, if any
+     *  confident number is present. */
+    window?: number;
+    /** Truncated error-body text, for logging. */
+    message: string;
+}
+
+// Upstream "context too long" markers across providers. Deliberately specific:
+// NO bare "too many tokens" — that is Bedrock's *throttle* phrase (a 429 the
+// client should back off on), not a context overflow.
+const CONTEXT_OVERFLOW_PATTERNS: RegExp[] = [
+    /context_length_exceeded/i,
+    /context length exceeded/i,
+    /maximum context length/i,
+    /max context length/i,
+    /exceeds the context window/i,
+    /exceeded model token limit/i,
+    /prompt is too long/i,
+    /prompt_too_long/i,
+    /prompt_is_too_long/i,
+    /request_too_large/i,
+    /token limit exceeded/i,
+];
+
+function toTokenNumber(s: string): number | undefined {
+    const n = parseInt(s.replace(/,/g, ""), 10);
+    // A plausible window is at least a few thousand tokens; smaller numbers in
+    // the message (e.g. "5 inputs", a request id) are not the window.
+    return Number.isFinite(n) && n >= 1000 ? n : undefined;
+}
+
+/** Best-effort extraction of the real context window from an overflow error
+ *  body. Returns undefined when no confident window number is present — a wrong
+ *  guess (e.g. the prompt size, not the limit) is worse than no guess. */
+function parseOverflowWindow(text: string): number | undefined {
+    // "130000 tokens > 128000 maximum" (Anthropic) → the maximum, not the total.
+    let m = text.match(/>\s*(\d[\d,]*)\s*maximum/i);
+    if (m) return toTokenNumber(m[1]);
+    m =
+        text.match(/maximum context length is (\d[\d,]*)/i) ??
+        text.match(/maximum context length of (\d[\d,]*)/i) ??
+        text.match(/(?:maximum|max)\s+(?:context\s+)?length\s+(?:is\s+)?(\d[\d,]*)/i) ??
+        text.match(/limit of (\d[\d,]*)\s*token/i) ??
+        text.match(/(\d[\d,]*)\s*maximum\b/i);
+    if (m) return toTokenNumber(m[1]);
+    return undefined;
+}
+
+/** Inspect an upstream response for a context-overflow error. `status` is the
+ *  HTTP status; `bodyText` is the (usually small) error body. Only 400/413 with
+ *  a recognized context-too-long marker counts. */
+export function inspectContextOverflow(status: number, bodyText: string): ContextOverflowInfo {
+    const message = (bodyText ?? "").slice(0, 300);
+    if (status !== 400 && status !== 413) return { isOverflow: false, message };
+    if (!bodyText) return { isOverflow: false, message };
+    const isOverflow = CONTEXT_OVERFLOW_PATTERNS.some((p) => p.test(bodyText));
+    if (!isOverflow) return { isOverflow: false, message };
+    return { isOverflow: true, window: parseOverflowWindow(bodyText), message };
 }
