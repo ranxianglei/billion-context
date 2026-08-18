@@ -22,8 +22,24 @@ test("OpenAI: 'maximum context length is N tokens' → overflow + window", () =>
     assert.equal(info.window, 128000);
 });
 
-test("Anthropic: 'prompt is too long: X tokens > Y maximum' → window is Y", () => {
+test("OpenAI Responses: 'exceeds the model's maximum context size of N' → overflow + window", () => {
+    // The newer Responses-API phrasing (the chat-completions one above says
+    // "maximum context LENGTH is") — must be detected too, or self-heal never
+    // fires for /responses relays.
     const body = JSON.stringify({
+        error: {
+            message:
+                "This request's total token count is 130000, which exceeds the model's maximum context size of 128000 tokens.",
+            type: "invalid_request_error",
+            code: "context_length_exceeded",
+        },
+    });
+    const info = inspectContextOverflow(400, body);
+    assert.equal(info.isOverflow, true);
+    assert.equal(info.window, 128000);
+});
+
+test("Anthropic: 'prompt is too long: X tokens > Y maximum' → window is Y", () => {    const body = JSON.stringify({
         type: "error",
         error: { type: "invalid_request_error", message: "prompt is too long: 130000 tokens > 128000 maximum" },
     });

@@ -16,9 +16,12 @@ import { listSessions } from "../src/session.ts";
 // model on a relay). The upstream truthfully reports its real window (128000)
 // via a context-overflow 400. The proxy must:
 //   1. detect the overflow and pass the 400 + body through verbatim;
-//   2. learn the real window (128000) into session.metadata.learnedContextLimit;
+//   2. learn the real window (128000) into session.metadata.learnedContextLimits,
+//      keyed by the model that overflowed;
 //   3. arm an emergency shrink (lastInputTokens >= window);
-//   4. let the NEXT request recover (self-healed window, upstream 200).
+//   4. let the NEXT request recover (self-healed window, upstream 200);
+//   5. NOT apply the learned limit to a different model in the same session
+//      (the user can switch models mid-conversation).
 
 const OVERFLOW_BODY = JSON.stringify({
     type: "error",
@@ -64,7 +67,7 @@ test("e2e: upstream context overflow → learn window + arm shrink + pass throug
         port: 0,
         host: "127.0.0.1",
         upstream: "http://127.0.0.1",
-        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-test": { context: 400_000 } } } },
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-test": { context: 400_000 }, "claude-big": { context: 400_000 } } } },
         modelContextLimit: 400_000,
         kernelConfig: defaultConfig(400_000),
         compress: { injectTool: true, injectNudge: true },
@@ -94,9 +97,10 @@ test("e2e: upstream context overflow → learn window + arm shrink + pass throug
         const r1text = await r1.text();
         assert.ok(r1text.includes("prompt is too long"), "error body must pass through");
 
-        // The session learned the real window and armed the emergency shrink.
-        const s = listSessions().find((x) => x.metadata.learnedContextLimit === 128000);
-        assert.ok(s, "a session learned the real window from the overflow");
+        // The session learned the real window (per model) and armed the emergency shrink.
+        const s = listSessions().find((x) => (x.metadata.learnedContextLimits as Record<string, number> | undefined)?.["claude-test"] === 128000);
+        assert.ok(s, "a session learned the real window from the overflow (keyed by model)");
+        assert.equal(s!.metadata.learnedContextLimit, undefined, "no legacy scalar when the model is known");
         assert.ok(s!.stats.lastInputTokens >= 128000, "emergency shrink armed (lastInputTokens >= window)");
 
         // --- Request 2: recovers (self-healed window; upstream is fine now) ---
@@ -111,6 +115,22 @@ test("e2e: upstream context overflow → learn window + arm shrink + pass throug
         // The real usage report from the successful turn overwrote the armed value.
         const s2 = listSessions().find((x) => x.id === s!.id);
         assert.equal(s2?.stats.lastInputTokens, 5000);
+
+        // --- Request 3: DIFFERENT model in the same session (user switched
+        // models) — the learned limit from claude-test must NOT apply. The map
+        // gains no entry for claude-big and the session keeps its 400k window.
+        const body3 = JSON.stringify({ model: "claude-big", max_tokens: 1024, stream: true, messages: [{ role: "user", content: "hi" }] });
+        const r3 = await fetch(url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "overflow-sess" },
+            body: body3,
+        });
+        assert.equal(r3.status, 200);
+        await r3.text(); // drain
+        const s3 = listSessions().find((x) => x.id === s!.id);
+        const limits = s3?.metadata.learnedContextLimits as Record<string, number> | undefined;
+        assert.equal(limits?.["claude-big"], undefined, "no learned limit for the other model");
+        assert.deepEqual(Object.keys(limits ?? {}), ["claude-test"], "only the overflowing model is scoped");
     } finally {
         proxy.close();
         await once(proxy, "close");

@@ -107,6 +107,7 @@ const CONTEXT_OVERFLOW_PATTERNS: RegExp[] = [
     /context length exceeded/i,
     /maximum context length/i,
     /max context length/i,
+    /maximum context size/i,
     /exceeds the context window/i,
     /exceeded model token limit/i,
     /prompt is too long/i,
@@ -133,6 +134,7 @@ function parseOverflowWindow(text: string): number | undefined {
     m =
         text.match(/maximum context length is (\d[\d,]*)/i) ??
         text.match(/maximum context length of (\d[\d,]*)/i) ??
+        text.match(/maximum context size (?:is|of) (\d[\d,]*)/i) ??
         text.match(/(?:maximum|max)\s+(?:context\s+)?length\s+(?:is\s+)?(\d[\d,]*)/i) ??
         text.match(/limit of (\d[\d,]*)\s*token/i) ??
         text.match(/(\d[\d,]*)\s*maximum\b/i);

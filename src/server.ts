@@ -693,14 +693,21 @@ async function handle(
             recordPluginSession(pluginConversation ?? conversation, session.id);
         }
         const pluginMode = pluginAgent !== undefined;
-        // Self-heal the context window: a prior upstream overflow may have taught
-        // us the real window (forward()'s overflow detection persists it to
+        // Self-heal the context window: a prior upstream overflow may have
+        // taught us the real window (forward()'s overflow detection persists it
+        // to metadata.learnedContextLimits, keyed by model, or the legacy scalar
         // metadata.learnedContextLimit). If it is smaller than what we resolved this
         // turn (e.g. the 200k fallback for an unknown model on a relay), re-center
         // the kernel on it so the nudge/truncate bands sit below the real limit
-        // instead of above it. Spread into a new object — never mutate the shared
-        // global config.
-        const learnedLimit = session.metadata.learnedContextLimit as number | undefined;
+        // instead of above it. A limit learned for a DIFFERENT model does not
+        // apply — the user can switch models mid-conversation (same session),
+        // and a stale smaller window would cap the bigger model prematurely.
+        // Spread into a new object — never mutate the shared global config.
+        const reqModel = (parsed as { model?: string }).model;
+        const learnedMap = session.metadata.learnedContextLimits as Record<string, number> | undefined;
+        const learnedLimit =
+            (reqModel && learnedMap ? learnedMap[reqModel] : undefined) ??
+            (session.metadata.learnedContextLimit as number | undefined);
         if (learnedLimit && learnedLimit > 0 && learnedLimit < reqConfig.modelContextLimit) {
             const resolved = reqConfig.modelContextLimit;
             reqConfig = { ...reqConfig, modelContextLimit: learnedLimit };
@@ -1455,13 +1462,26 @@ async function forward(
             const s = prepared.session;
             const info = inspectContextOverflow(upstream.status, errBody.toString("utf8"));
             if (info.isOverflow) {
+                // The request's model — the learned window only applies to the
+                // model that produced the overflow (per-model scoping: a stale
+                // limit from another model must not cap this one).
+                let reqModel: string | undefined;
+                try {
+                    const rawBody = typeof prepared.body === "string" ? prepared.body : prepared.body.toString("utf8");
+                    reqModel = (JSON.parse(rawBody) as { model?: string }).model;
+                } catch {
+                    reqModel = undefined; // non-JSON body — fall back to the legacy scalar
+                }
+                const learnedMap = (s.metadata.learnedContextLimits as Record<string, number> | undefined) ?? {};
                 if (info.window) {
-                    const prev = s.metadata.learnedContextLimit as number | undefined;
-                    // Persist the real window to a STABLE field: effectiveContextLimit
-                    // is re-resolved every turn (plugin mode) and would be overwritten;
-                    // handle() reads learnedContextLimit to re-center the kernel next turn.
-                    s.metadata.learnedContextLimit = info.window;
-                    log("warn", `[${s.id}] upstream context overflow — learned real window ${info.window} (was ${prev ?? "unset"}); arming emergency shrink`);
+                    const prev = (reqModel ? learnedMap[reqModel] : undefined) ?? (s.metadata.learnedContextLimit as number | undefined);
+                    // Persist the real window to a STABLE field (effectiveContextLimit
+                    // is re-resolved every turn in plugin mode and would be overwritten);
+                    // handle() reads it (per model) to re-center the kernel next turn.
+                    if (reqModel) learnedMap[reqModel] = info.window;
+                    else s.metadata.learnedContextLimit = info.window;
+                    s.metadata.learnedContextLimits = learnedMap;
+                    log("warn", `[${s.id}] upstream context overflow — learned real window ${info.window} for ${reqModel ?? "(unknown model)"} (was ${prev ?? "unset"}); arming emergency shrink`);
                 } else {
                     log("warn", `[${s.id}] upstream context overflow (window not parseable): ${info.message}`);
                 }
@@ -1472,6 +1492,7 @@ async function forward(
                 // next successful turn overwrites it.
                 const floor =
                     info.window ??
+                    (reqModel ? learnedMap[reqModel] : undefined) ??
                     (s.metadata.learnedContextLimit as number | undefined) ??
                     (s.metadata.effectiveContextLimit as number | undefined) ??
                     0;
@@ -1662,15 +1683,26 @@ async function forward(
 
 /** Read a (small) fetch Response body stream fully into a Buffer. Used for the
  *  non-2xx error path, where we inspect the body for a context-overflow before
- *  passing it through. Error bodies are small JSON, so full buffering is safe. */
-async function readStreamToBuffer(stream: ReadableStream<Uint8Array>): Promise<Buffer> {
+ *  passing it through. Error bodies are small JSON, so full buffering is safe —
+ *  but the read is still CAPPED (maxBytes, default 1 MiB): a misbehaving upstream
+ *  that streams a huge error body must not spike memory. The stream is drained
+ *  either way (no backpressure deadlock, no discarded keep-alive connection); only
+ *  the retained bytes are capped. Overflow markers live in the first few hundred
+ *  bytes, so a cap never loses the signal. */
+async function readStreamToBuffer(stream: ReadableStream<Uint8Array>, maxBytes = 1 << 20): Promise<Buffer> {
     const reader = stream.getReader();
     const chunks: Buffer[] = [];
+    let kept = 0;
     try {
         for (;;) {
             const { done, value } = await reader.read();
             if (done) break;
-            if (value) chunks.push(Buffer.from(value));
+            if (value && kept < maxBytes) {
+                // Trim the final chunk so retained bytes never exceed maxBytes.
+                const take = Math.min(value.length, maxBytes - kept);
+                chunks.push(Buffer.from(value.subarray(0, take)));
+                kept += take;
+            }
         }
     } finally {
         reader.releaseLock();
