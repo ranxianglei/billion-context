@@ -52,9 +52,11 @@ function manifestToTool(proxyBase: string, tool: ManifestTool): ToolDefinition {
     };
 }
 
-async function registerTools(pi: ExtensionAPI, ctx: Ctx): Promise<void> {
+async function registerTools(pi: ExtensionAPI, ctx: Ctx, registeredFor: { sid: string | undefined }): Promise<void> {
     const proxyBase = proxyBaseForCtx(ctx);
     if (proxyBase === undefined) return;
+    const sid = ctx.sessionManager.getSessionId();
+    if (sid === registeredFor.sid) return;
     let tools: ManifestTool[];
     try {
         tools = await fetchManifest(proxyBase);
@@ -62,10 +64,17 @@ async function registerTools(pi: ExtensionAPI, ctx: Ctx): Promise<void> {
         console.error(`bili-plugin(${agentName()}): manifest fetch failed: ${err instanceof Error ? err.message : String(err)} — tools unavailable this session`);
         return;
     }
-    for (const t of tools) pi.registerTool(manifestToTool(proxyBase, t));
+    try {
+        for (const t of tools) pi.registerTool(manifestToTool(proxyBase, t));
+        registeredFor.sid = sid;
+    } catch (err) {
+        registeredFor.sid = undefined;
+        console.error(`bili-plugin(${agentName()}): tool registration deferred (${err instanceof Error ? err.message : String(err)})`);
+    }
 }
 
 export default function biliPlugin(pi: ExtensionAPI): void {
+    const registeredFor: { sid: string | undefined } = { sid: undefined };
     pi.on("before_provider_headers", (event, ctx) => {
         if (proxyBaseForCtx(ctx) === undefined) return;
         const headers = (event as unknown as { headers: Record<string, string> }).headers;
@@ -75,9 +84,11 @@ export default function biliPlugin(pi: ExtensionAPI): void {
         if (typeof window === "number" && Number.isFinite(window) && window > 0) {
             headers["x-bili-plugin-context-window"] = String(Math.floor(window));
         }
+        void registerTools(pi, ctx, registeredFor);
     });
     pi.on("session_start", (event, ctx) => {
-        void registerTools(pi, ctx);
+        registeredFor.sid = undefined;
+        void registerTools(pi, ctx, registeredFor);
     });
 }
 
