@@ -129,7 +129,9 @@ function makeFakePi(): FakePi {
         tools,
         on: (event, handler) => events.set(event, handler as (event: never, ctx: never) => unknown),
         registerTool: (tool) => {
-            tools.push(tool);
+            const i = tools.findIndex((t) => t.name === tool.name);
+            if (i >= 0) tools[i] = tool;
+            else tools.push(tool);
         },
     };
 }
