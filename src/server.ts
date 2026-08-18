@@ -56,7 +56,7 @@ import { deriveSessionId as deriveProxySessionId, affinityToken, clientConversat
 import { consumePluginRegisterFor, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, pipePluginJson, pipeThroughWithUsage, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
-import { isLoopbackAddress } from "./util.js";
+import { isLoopbackAddress, usageTotals } from "./util.js";
 
 import { decodeRequestBody } from "./content-encoding.js";
 
@@ -1430,9 +1430,9 @@ async function forward(
     // the next nudge decision) keeps tracking reality.
     if (prepared?.pluginMode) {
         if (prepared.stream) {
-            await pipeThroughWithUsage(upstream.body as ReadableStream<Uint8Array>, res, prepared.session);
+            await pipeThroughWithUsage(upstream.body as ReadableStream<Uint8Array>, res, prepared.session, prepared.protocol);
         } else {
-            await pipePluginJson(upstream.body as ReadableStream<Uint8Array>, res, prepared.session);
+            await pipePluginJson(upstream.body as ReadableStream<Uint8Array>, res, prepared.session, prepared.protocol);
         }
         clearUpstreamTimer();
         return;
@@ -1548,15 +1548,14 @@ async function forward(
                 //   Anthropic: input_tokens / cache_read_input_tokens / output_tokens
                 //   OpenAI: prompt_tokens / prompt_tokens_details.cached_tokens / completion_tokens
                 //   Responses: input_tokens / input_tokens_details.cached_tokens / output_tokens
+                // usageTotals() normalizes the per-protocol semantics so
+                // `total` is always the true context size (see util.ts).
                 const u = (json.usage ?? {}) as Record<string, unknown>;
-                const prompt = u.prompt_tokens ?? u.input_tokens;
-                if (typeof prompt === "number") {
-                    prepared.session.stats.inputTokens += prompt;
-                    const promptDetails = u.prompt_tokens_details as Record<string, unknown> | undefined;
-                    const inputDetails = u.input_tokens_details as Record<string, unknown> | undefined;
-                    const cached = promptDetails?.cached_tokens ?? inputDetails?.cached_tokens ?? u.cache_read_input_tokens;
-                    // tokenCount = TOTAL context (new + cached); see anthropic branch.
-                    prepared.session.stats.lastInputTokens = prompt + (typeof cached === "number" ? cached : 0);
+                const { total, cached } = usageTotals(prepared.protocol, u);
+                if (typeof total === "number") {
+                    prepared.session.stats.inputTokens += total;
+                    // lastInputTokens = true TOTAL context (protocol-correct).
+                    prepared.session.stats.lastInputTokens = total;
                     if (typeof cached === "number") {
                         prepared.session.stats.cachedTokens += cached;
                         prepared.session.stats.cacheSamples += 1;

@@ -370,7 +370,9 @@ test("plugin mode: streamed response forwards verbatim while usage is sniffed in
         const mine = (stats.sessions ?? []).find((s) => s.label === conv);
         assert.ok(mine, `session for plugin conversation not found: ${JSON.stringify(stats.sessions?.map((s) => s.label))}`);
         assert.equal(mine!.requests, 1);
-        assert.equal(mine!.inputTokens, 55, "message_start usage must be sniffed in plugin mode");
+        // inputTokens is the true TOTAL context (input_tokens + cache_read),
+        // so cacheHitPct = cachedTokens/inputTokens is a meaningful ratio.
+        assert.equal(mine!.inputTokens, 66, "message_start usage sniffed: total = input_tokens(55) + cache_read(11)");
     } finally {
         await h.close();
     }
