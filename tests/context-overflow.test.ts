@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { inspectContextOverflow } from "../src/util.ts";
+import { inspectContextOverflow, reserveOutputHeadroom } from "../src/util.ts";
 
 // A context-overflow error is the only reliable signal that the configured
 // window is wrong (e.g. the 200k fallback for an unknown model on a relay).
@@ -80,4 +80,35 @@ test("5xx is NOT an overflow (server error, not context)", () => {
 
 test("empty body is NOT an overflow", () => {
     assert.equal(inspectContextOverflow(400, "").isOverflow, false);
+});
+
+// reserveOutputHeadroom: the effective window handed to the kernel after
+// reserving the model's per-request output budget. The kernel's nudge/truncate
+// bands are a fraction of this window, so reserving maxOutput keeps the context
+// below (window - maxOutput) — a context+output overflow can't happen.
+test("reserveOutputHeadroom: reserves maxOutput when it leaves a usable window", () => {
+    // 100k window, 8k requested output → effective 92k.
+    assert.equal(reserveOutputHeadroom(100_000, 8_000), 92_000);
+    // 100k window, 40k requested output → effective 60k.
+    assert.equal(reserveOutputHeadroom(100_000, 40_000), 60_000);
+});
+
+test("reserveOutputHeadroom: no-op for non-positive / non-finite maxOutput", () => {
+    assert.equal(reserveOutputHeadroom(100_000, 0), 100_000);
+    assert.equal(reserveOutputHeadroom(100_000, -5), 100_000);
+    assert.equal(reserveOutputHeadroom(100_000, Number.NaN), 100_000);
+    assert.equal(reserveOutputHeadroom(100_000, Infinity), 100_000);
+});
+
+test("reserveOutputHeadroom: no-op when maxOutput >= window (degenerate request)", () => {
+    // Output budget equal to the window → nothing left for context; don't
+    // reserve (a <=0 window is invalid for the kernel) — self-heal handles it.
+    assert.equal(reserveOutputHeadroom(100_000, 100_000), 100_000);
+    assert.equal(reserveOutputHeadroom(100_000, 150_000), 100_000);
+});
+
+test("reserveOutputHeadroom: no-op for a non-positive / non-finite window", () => {
+    assert.equal(reserveOutputHeadroom(0, 8_000), 0);
+    assert.equal(reserveOutputHeadroom(-1, 8_000), -1);
+    assert.equal(reserveOutputHeadroom(Number.NaN, 8_000), Number.NaN);
 });

@@ -151,3 +151,19 @@ export function inspectContextOverflow(status: number, bodyText: string): Contex
     if (!isOverflow) return { isOverflow: false, message };
     return { isOverflow: true, window: parseOverflowWindow(bodyText), message };
 }
+
+/**
+ * Reserve the model's OUTPUT budget from the context window so the kernel's
+ * nudge/truncate bands (a fraction of the window) sit below (window - maxOutput)
+ * and a context+output overflow can't happen on a small window (e.g. 100k with a
+ * large max_tokens). Returns the effective window to hand to the kernel. No-op
+ * unless maxOutput is a positive finite number that leaves a usable window
+ * (maxOutput < window) — a request whose output budget is >= the whole window is
+ * degenerate and the self-heal handles the resulting overflow instead.
+ */
+export function reserveOutputHeadroom(window: number, maxOutput: number): number {
+    if (Number.isFinite(window) && window > 0 && Number.isFinite(maxOutput) && maxOutput > 0 && maxOutput < window) {
+        return window - maxOutput;
+    }
+    return window;
+}

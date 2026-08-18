@@ -56,7 +56,7 @@ import { deriveSessionId as deriveProxySessionId, affinityToken, clientConversat
 import { consumePluginRegisterFor, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, pipePluginJson, pipeThroughWithUsage, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
-import { isLoopbackAddress, inspectContextOverflow, usageTotals } from "./util.js";
+import { isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, usageTotals } from "./util.js";
 
 import { decodeRequestBody } from "./content-encoding.js";
 
@@ -705,6 +705,23 @@ async function handle(
             const resolved = reqConfig.modelContextLimit;
             reqConfig = { ...reqConfig, modelContextLimit: learnedLimit };
             log("info", `[${session.id}] self-healed context window: ${resolved} → ${learnedLimit} (learned from an upstream overflow)`);
+        }
+        // Reserve the model's OUTPUT budget for this turn from the window so the
+        // kernel's nudge/truncate bands sit below (window - maxOutput) and a
+        // context+output overflow can't happen on a small window (e.g. 100k with a
+        // large max_tokens — the most common "context blew up" cause; none of the
+        // three layers reserved room for the output before this). max_tokens is the
+        // exact output budget requested for THIS turn, so the reservation is precise
+        // and per-request. Only reserve when it leaves a usable window (maxOutput <
+        // window); otherwise the request is degenerate (output >= whole window) and
+        // the self-heal above handles the resulting overflow. Feeds reqConfig (→
+        // processTurn `config`), so diagNudge shows the reserved window (no extra log).
+        {
+            const p = parsed as Record<string, unknown>;
+            const rawMax = p.max_tokens ?? p.max_completion_tokens ?? p.max_output_tokens;
+            const maxOutput = typeof rawMax === "number" ? rawMax : 0;
+            const reserved = reserveOutputHeadroom(reqConfig.modelContextLimit, maxOutput);
+            if (reserved !== reqConfig.modelContextLimit) reqConfig = { ...reqConfig, modelContextLimit: reserved };
         }
         // acquireInFlight must precede the lock so evictOldest() cannot flush
         // this session between getSession and lock acquisition (inFlight===0
