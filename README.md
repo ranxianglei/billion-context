@@ -82,6 +82,28 @@ usage via `GET /__bili/plugin/status`.
 Compression is injected automatically — you only configure routing, never
 compression itself.
 
+For pi and omp, the plugin ships **inside billion-context itself** — no
+separate package to install:
+
+```bash
+bili plugin install pi      # adds this billion-context install to pi's settings.json (packages)
+bili plugin install omp     # same for omp (config.yml extensions)
+bili plugin install claude  # registers the bili MCP server (claude mcp add, user scope)
+bili plugin install codex   # appends [mcp_servers.bili] to ~/.codex/config.toml
+bili plugin install opencode  # adds mcp.bili to ~/.config/opencode/opencode.json
+bili plugin list            # install status for every supported host
+bili plugin remove pi       # undo (original files backed up to *.bili-bak once)
+```
+
+The installed plugin is a **thin** one (~5 KB, zero runtime deps): it just
+detects the proxy (from the `/bili/` baseURL or `BILLION_CONTEXT_PROXY`),
+fetches tool schemas from the proxy, registers native tools, and forwards
+executions — the proxy remains the single compression authority, so plugin
+and proxy always match versions. Killing it entirely: `BILLION_CONTEXT_PLUGIN=0`.
+
+Hosts without a plugin API (claude, codex, opencode) install the MCP
+bridge instead (`dist/mcp.js`), same protocol underneath.
+
 ### Option 0 — Launcher (`bili pi` / `bili codex` / `bili claude`)
 
 The launcher wraps a client in one command: it starts a proxy on an
