@@ -15,16 +15,20 @@ const MANIFEST_TIMEOUT_MS = 5000;
 const TOOL_TIMEOUT_MS = 60000;
 const STATUS_TIMEOUT_MS = 5000;
 
-export const PLUGIN_AGENT_NAMES = ["pi", "omp", "opencode"] as const;
-
 /** Detect the proxy from a provider baseUrl's `/bili/` zero-config prefix.
+ *  The real prefix embeds the full upstream URL (`/bili/https://…`), so the
+ *  check requires `bili` as the first path segment followed by an http(s)
+ *  URL — a plain `/foo/bili/` path segment is NOT a bili proxy.
  *  Returns the proxy origin (scheme//host) the request will actually hit. */
 export function proxyBaseFromUrl(baseUrl: string | undefined): string | undefined {
     if (!baseUrl) return undefined;
     try {
         const url = new URL(baseUrl);
+        if (url.protocol !== "http:" && url.protocol !== "https:") return undefined;
         const segments = url.pathname.split("/").filter((s) => s.length > 0);
-        if (!segments.includes("bili")) return undefined;
+        if (segments[0] !== "bili") return undefined;
+        const rest = url.pathname.slice(url.pathname.indexOf("bili") + "bili".length);
+        if (!/^\/https?:\/\//.test(rest)) return undefined;
         return `${url.protocol}//${url.host}`;
     } catch {
         return undefined;
@@ -49,11 +53,19 @@ export function detectProxyBase(baseUrl: string | undefined): string | undefined
     return proxyBaseFromUrl(baseUrl) ?? proxyBaseFromEnv();
 }
 
-async function fetchJson(url: string, init: RequestInit | undefined, timeoutMs: number): Promise<{ ok: boolean; status: number; json: unknown }> {
+async function fetchJson(url: string, init: RequestInit | undefined, timeoutMs: number, externalSignal?: AbortSignal): Promise<{ ok: boolean; status: number; json: unknown }> {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), timeoutMs);
+    const onExternalAbort = () => ac.abort();
+    externalSignal?.addEventListener("abort", onExternalAbort, { once: true });
     try {
-        const res = await fetch(url, { ...init, signal: ac.signal });
+        let res: Response;
+        try {
+            res = await fetch(url, { ...init, signal: ac.signal });
+        } catch (err) {
+            if (ac.signal.aborted && !externalSignal?.aborted) throw new Error(`timeout after ${timeoutMs}ms: ${url}`);
+            throw err;
+        }
         const text = await res.text();
         let json: unknown = undefined;
         try {
@@ -64,6 +76,7 @@ async function fetchJson(url: string, init: RequestInit | undefined, timeoutMs: 
         return { ok: res.ok, status: res.status, json };
     } finally {
         clearTimeout(timer);
+        externalSignal?.removeEventListener("abort", onExternalAbort);
     }
 }
 
@@ -76,12 +89,12 @@ export async function fetchManifest(proxyBase: string): Promise<ManifestTool[]> 
     return tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.input_schema ?? { type: "object", properties: {} } }));
 }
 
-export async function forwardTool(proxyBase: string, conversationId: string, tool: string, args: unknown): Promise<string> {
+export async function forwardTool(proxyBase: string, conversationId: string, tool: string, args: unknown, signal?: AbortSignal): Promise<string> {
     const { ok, status, json } = await fetchJson(`${proxyBase}/__bili/plugin/tool`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ conversationId, tool, args }),
-    }, TOOL_TIMEOUT_MS);
+        body: JSON.stringify({ conversationId, tool, args: args ?? {} }),
+    }, TOOL_TIMEOUT_MS, signal);
     const data = json as { ok?: boolean; result?: string; error?: string } | undefined;
     if (!ok || !data?.ok) {
         throw new Error(`bili proxy tool ${tool} failed (${status}): ${data?.error ?? "unknown error"}`);
@@ -89,6 +102,8 @@ export async function forwardTool(proxyBase: string, conversationId: string, too
     return data.result ?? "";
 }
 
+/** Soft-fail by design: the status read is best-effort UI data; undefined
+ *  means "no data" whether the proxy is down or the session is unknown. */
 export async function fetchStatus(proxyBase: string, conversationId: string): Promise<Record<string, unknown> | undefined> {
     const { ok, json } = await fetchJson(`${proxyBase}/__bili/plugin/status?conversationId=${encodeURIComponent(conversationId)}`, undefined, STATUS_TIMEOUT_MS);
     if (!ok || !json || typeof json !== "object") return undefined;

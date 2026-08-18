@@ -9,7 +9,8 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 
 import { proxyBaseFromUrl, proxyBaseFromEnv, detectProxyBase, fetchManifest, forwardTool, fetchStatus } from "../src/agent/shared.ts";
-import biliPlugin from "../src/agent/pi.ts";
+import biliPlugin, { createBiliPlugin } from "../src/agent/pi.ts";
+import ompPlugin from "../src/agent/omp.ts";
 import { pluginInstall, pluginRemove, pluginStatusAll, PLUGIN_AGENTS, selfPackageRoot } from "../src/plugin-install.ts";
 
 function withEnv(vars: Record<string, string | undefined>, fn: () => void | Promise<void>): Promise<void> {
@@ -33,6 +34,8 @@ test("proxyBaseFromUrl detects /bili/ prefix and returns origin", () => {
     assert.equal(proxyBaseFromUrl("https://api.example.com/v1"), undefined);
     assert.equal(proxyBaseFromUrl(undefined), undefined);
     assert.equal(proxyBaseFromUrl("not a url"), undefined);
+    assert.equal(proxyBaseFromUrl("http://x/api/bili/v1"), undefined);
+    assert.equal(proxyBaseFromUrl("http://x/bili/ftp://y"), undefined);
 });
 
 test("proxyBaseFromEnv accepts BILLION_CONTEXT_PROXY, detectProxyBase honors kill switch", async () => {
@@ -112,7 +115,8 @@ test("shared manifest/tool/status against a fake proxy", async () => {
     }
 });
 
-type RecordedTool = { name: string; parameters: unknown; execute: (id: string, params: Record<string, unknown>, signal: undefined, onUpdate: undefined, ctx: Record<string, unknown>) => Promise<{ output: string }> };
+type TextBlock = { type: "text"; text: string };
+type RecordedTool = { name: string; parameters: unknown; execute: (id: string, params: Record<string, unknown>, signal: undefined, onUpdate: undefined, ctx: Record<string, unknown>) => Promise<{ content: TextBlock[]; isError?: boolean }> };
 
 type FakePi = {
     events: Map<string, (event: unknown, ctx: unknown) => unknown>;
@@ -144,6 +148,10 @@ function fakeCtx(proxy: FakeProxy | undefined, sessionId = "sess-42"): Record<st
     };
 }
 
+async function flush(): Promise<void> {
+    await new Promise((r) => setTimeout(r, 20));
+}
+
 test("pi extension registers manifest tools and stamps headers when proxied", async () => {
     const proxy = await startFakeProxy();
     try {
@@ -155,15 +163,52 @@ test("pi extension registers manifest tools and stamps headers when proxied", as
         assert.equal(headers["x-bili-plugin-conversation"], "sess-42");
         assert.equal(headers["x-bili-plugin-context-window"], "1000000");
         await pi.events.get("session_start")!({}, fakeCtx(proxy));
-        await new Promise((r) => setTimeout(r, 20));
+        await flush();
         assert.equal(pi.tools.length, 2);
         assert.equal(pi.tools[0]!.name, "compress");
         assert.deepEqual(pi.tools[0]!.parameters, { type: "object", properties: { content: { type: "array" } }, required: ["content"] });
         const out = await pi.tools[0]!.execute("call-1", { content: [] }, undefined, undefined, fakeCtx(proxy));
-        assert.equal(out.output, "[Compressed m00001-m00002 -> b1]");
+        assert.equal(out.content[0]!.text, "[Compressed m00001-m00002 -> b1]");
+        assert.equal(out.isError, undefined);
         assert.deepEqual(proxy.toolCalls, [{ conversationId: "sess-42", tool: "compress", args: { content: [] } }]);
         const errOut = await pi.tools[1]!.execute("call-2", {}, undefined, undefined, fakeCtx(proxy));
-        assert.match(errOut.output, /bili tool error:.*boom/);
+        assert.match(errOut.content[0]!.text, /bili tool error:.*boom/);
+        assert.equal(errOut.isError, true);
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("pi extension survives hostile host shapes without throwing", async () => {
+    const proxy = await startFakeProxy();
+    try {
+        const pi = makeFakePi();
+        biliPlugin(pi as never);
+        pi.events.get("before_provider_headers")!({}, {});
+        pi.events.get("before_provider_headers")!({ headers: null }, fakeCtx(proxy));
+        pi.events.get("before_provider_headers")!({ headers: [] }, { sessionManager: {}, model: { baseUrl: `${proxy.origin}/bili/https://api.example.com/v1` } });
+        await pi.events.get("session_start")!({}, {});
+        await flush();
+        // proxied baseUrl above intentionally triggers header-fallback registration
+        assert.equal(pi.tools.length, 2);
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("registration retries are throttled and deduped", async () => {
+    const proxy = await startFakeProxy();
+    try {
+        const pi = makeFakePi();
+        biliPlugin(pi as never);
+        await pi.events.get("session_start")!({}, fakeCtx(proxy));
+        await flush();
+        assert.equal(pi.tools.length, 2);
+        const calls = proxy.toolCalls.length;
+        for (let i = 0; i < 5; i++) pi.events.get("before_provider_headers")!({ headers: {} }, fakeCtx(proxy));
+        await flush();
+        assert.equal(pi.tools.length, 2);
+        assert.equal(proxy.toolCalls.length, calls);
     } finally {
         await proxy.close();
     }
@@ -176,11 +221,18 @@ test("pi extension is inert without a proxy", async () => {
     pi.events.get("before_provider_headers")!({ headers }, fakeCtx(undefined));
     assert.deepEqual(headers, {});
     await pi.events.get("session_start")!({}, fakeCtx(undefined));
-    await new Promise((r) => setTimeout(r, 20));
+    await flush();
     assert.equal(pi.tools.length, 0);
 });
 
-test("omp agent name env stamps x-bili-plugin: omp", async () => {
+test("omp entry reports x-bili-plugin: omp without env vars", async () => {
+    await withEnv({ BILLION_CONTEXT_PLUGIN_AGENT: undefined, BILLION_CONTEXT_PROXY: "http://127.0.0.1:8799" }, () => {
+        const pi = makeFakePi();
+        ompPlugin(pi as never);
+        const headers: Record<string, string> = {};
+        pi.events.get("before_provider_headers")!({ headers }, fakeCtx(undefined));
+        assert.equal(headers["x-bili-plugin"], "omp");
+    });
     await withEnv({ BILLION_CONTEXT_PLUGIN_AGENT: "omp", BILLION_CONTEXT_PROXY: "http://127.0.0.1:8799" }, () => {
         const pi = makeFakePi();
         biliPlugin(pi as never);
@@ -188,19 +240,29 @@ test("omp agent name env stamps x-bili-plugin: omp", async () => {
         pi.events.get("before_provider_headers")!({ headers }, fakeCtx(undefined));
         assert.equal(headers["x-bili-plugin"], "omp");
     });
+    await withEnv({ BILLION_CONTEXT_PLUGIN_AGENT: undefined }, () => {
+        const pi = makeFakePi();
+        createBiliPlugin("dsh")(pi as never);
+        const headers: Record<string, string> = {};
+        pi.events.get("before_provider_headers")!({ headers }, { sessionManager: { getSessionId: () => "s" }, model: { baseUrl: "http://127.0.0.1:8799/bili/https://x" } });
+        assert.equal(headers["x-bili-plugin"], "dsh");
+    });
 });
+
+function hintEnv(home: string, piAgentDir: string): Record<string, string> {
+    return {
+        PI_CODING_AGENT_DIR: piAgentDir,
+        OMP_CONFIG: path.join(home, ".omp/agent/config.yml"),
+        CODEX_HOME: home,
+        OPENCODE_CONFIG: path.join(home, ".config/opencode/opencode.json"),
+        CLAUDE_CONFIG_DIR: home,
+    };
+}
 
 test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HOME", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-plugin-home-"));
     const piAgentDir = path.join(home, ".pi/agent");
-    const hints: Record<string, string> = {
-        PI_CODING_AGENT_DIR: piAgentDir,
-        OMP_CONFIG_HINT: home,
-        CODEX_HOME_HINT: home,
-        OPENCODE_CONFIG_HINT: home,
-        CLAUDE_CONFIG_DIR_HINT: home,
-    };
-    await withEnv({ ...hints }, async () => {
+    await withEnv(hintEnv(home, piAgentDir), async () => {
         const root = selfPackageRoot();
 
         assert.match(pluginInstall("pi"), /installed/);
@@ -232,6 +294,22 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
         assert.match(fs.readFileSync(path.join(home, ".omp/agent/config.yml"), "utf8"), /extensions:\n  - .*omp\.js\n/);
         pluginRemove("omp");
 
+        const colZeroYml = "extensions:\n- /a.js\n- /b.js\nother: 1\n";
+        fs.writeFileSync(path.join(home, ".omp/agent/config.yml"), colZeroYml);
+        pluginInstall("omp");
+        assert.match(fs.readFileSync(path.join(home, ".omp/agent/config.yml"), "utf8"), /^extensions:\n- \/a\.js\n- \/b\.js\n- .*omp\.js\nother: 1\n$/);
+        pluginRemove("omp");
+        assert.equal(fs.readFileSync(path.join(home, ".omp/agent/config.yml"), "utf8"), colZeroYml);
+
+        const flowYml = "extensions: [/a.js]\n";
+        fs.writeFileSync(path.join(home, ".omp/agent/config.yml"), flowYml);
+        assert.throws(() => pluginInstall("omp"), /flow style|inline value/);
+        const quotedYml = `extensions:\n  - "${path.join(root, "dist/agent/omp.js")}" # my ext\n`;
+        fs.writeFileSync(path.join(home, ".omp/agent/config.yml"), quotedYml);
+        assert.match(pluginInstall("omp"), /already installed/);
+        assert.match(pluginRemove("omp"), /removed/);
+        assert.equal(fs.readFileSync(path.join(home, ".omp/agent/config.yml"), "utf8"), "extensions:\n");
+
         assert.match(pluginInstall("codex"), /installed/);
         const toml = fs.readFileSync(path.join(home, ".codex/config.toml"), "utf8");
         assert.match(toml, /\[mcp_servers\.bili\]\ncommand = /);
@@ -248,11 +326,34 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
         assert.match(pluginRemove("opencode"), /removed/);
         assert.equal((JSON.parse(fs.readFileSync(path.join(home, ".config/opencode/opencode.json"), "utf8")) as { mcp?: unknown }).mcp, undefined);
 
-        assert.match(pluginInstall("claude"), /FAILED/);
+        assert.throws(() => pluginInstall("claude"), /claude: install failed/);
 
         const rows = pluginStatusAll();
         assert.equal(rows.length, 5);
         assert.deepEqual(PLUGIN_AGENTS, ["pi", "omp", "claude", "codex", "opencode"]);
+    });
+    fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("plugin install refuses to touch broken or non-object configs", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-plugin-home-"));
+    const piAgentDir = path.join(home, ".pi/agent");
+    await withEnv(hintEnv(home, piAgentDir), async () => {
+        fs.mkdirSync(piAgentDir, { recursive: true });
+        fs.writeFileSync(path.join(piAgentDir, "settings.json"), "{ not json");
+        assert.throws(() => pluginInstall("pi"), /not valid JSON/);
+        assert.equal(fs.existsSync(path.join(piAgentDir, "settings.json.bili-bak")), false);
+        fs.writeFileSync(path.join(piAgentDir, "settings.json"), "[1,2]");
+        assert.throws(() => pluginInstall("pi"), /expected a JSON object/);
+        fs.writeFileSync(path.join(piAgentDir, "settings.json"), JSON.stringify({ packages: [`/opt/old/node_modules/billion-context`] }));
+        assert.match(pluginInstall("pi"), /installed/);
+        const after = JSON.parse(fs.readFileSync(path.join(piAgentDir, "settings.json"), "utf8")) as { packages: string[] };
+        assert.equal(after.packages.length, 1);
+        assert.ok(after.packages[0]!.endsWith(selfPackageRoot().slice(-10)) || after.packages[0] === selfPackageRoot());
+        const ocDir = path.join(home, ".config/opencode");
+        fs.mkdirSync(ocDir, { recursive: true });
+        fs.writeFileSync(path.join(ocDir, "opencode.json"), "nope{");
+        assert.throws(() => pluginInstall("opencode"), /not valid JSON/);
     });
     fs.rmSync(home, { recursive: true, force: true });
 });

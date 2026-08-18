@@ -1,3 +1,3 @@
-import biliPlugin from "./pi.js";
+import { createBiliPlugin } from "./pi.js";
 
-export default biliPlugin;
+export default createBiliPlugin("omp");

@@ -8,12 +8,13 @@
 import { detectProxyBase, fetchManifest, forwardTool, fetchStatus, type ManifestTool } from "./shared.js";
 
 type Ctx = {
-    sessionManager: { getSessionId(): string };
+    sessionManager?: { getSessionId?: () => string } | undefined;
     model?: { contextWindow?: number; baseUrl?: string } | undefined;
     cwd?: string;
 };
 
-type ToolResult = { output: string };
+type TextBlock = { type: "text"; text: string };
+type ToolResult = { content: TextBlock[]; isError?: boolean };
 
 type ToolDefinition = {
     name: string;
@@ -27,7 +28,8 @@ type ExtensionAPI = {
     registerTool: (tool: ToolDefinition) => void;
 };
 
-function agentName(): string {
+function agentName(override: string | undefined): string {
+    if (override) return override;
     return process.env.BILLION_CONTEXT_PLUGIN_AGENT === "omp" ? "omp" : "pi";
 }
 
@@ -35,61 +37,97 @@ function proxyBaseForCtx(ctx: Ctx): string | undefined {
     return detectProxyBase(ctx.model?.baseUrl);
 }
 
-function manifestToTool(proxyBase: string, tool: ManifestTool): ToolDefinition {
+function sessionIdOf(ctx: Ctx): string | undefined {
+    try {
+        const sid = ctx.sessionManager?.getSessionId?.();
+        return typeof sid === "string" ? sid : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+function manifestToTool(proxyBase: string, tool: ManifestTool, agent: string): ToolDefinition {
     return {
         name: tool.name,
         description: tool.description,
         parameters: tool.inputSchema,
-        execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
-            const conversationId = ctx.sessionManager.getSessionId();
+        execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
+            const conversationId = sessionIdOf(ctx) ?? "unknown";
             try {
-                const output = await forwardTool(proxyBase, conversationId, tool.name, params);
-                return { output };
+                const output = await forwardTool(proxyBase, conversationId, tool.name, params, signal);
+                return { content: [{ type: "text", text: output }] };
             } catch (err) {
-                return { output: `bili tool error: ${err instanceof Error ? err.message : String(err)}` };
+                return { content: [{ type: "text", text: `bili tool error: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
             }
         },
     };
 }
 
-async function registerTools(pi: ExtensionAPI, ctx: Ctx, registeredFor: { sid: string | undefined }): Promise<void> {
+const RETRY_INTERVAL_MS = 10000;
+
+type RegisterState = { sid?: string; pending?: Promise<void>; retryAt?: number; retryTimer?: ReturnType<typeof setTimeout> };
+
+async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, agent: string): Promise<void> {
     const proxyBase = proxyBaseForCtx(ctx);
     if (proxyBase === undefined) return;
-    const sid = ctx.sessionManager.getSessionId();
-    if (sid === registeredFor.sid) return;
-    let tools: ManifestTool[];
+    const sid = sessionIdOf(ctx);
+    if (sid !== undefined && sid === state.sid) return;
+    if (state.pending !== undefined) return state.pending;
+    if (state.retryAt !== undefined && Date.now() < state.retryAt) return;
+    state.pending = (async () => {
+        let tools: ManifestTool[];
+        try {
+            tools = await fetchManifest(proxyBase);
+        } catch (err) {
+            state.retryAt = Date.now() + RETRY_INTERVAL_MS;
+            console.error(`bili-plugin(${agent}): manifest fetch failed: ${err instanceof Error ? err.message : String(err)} — retrying in ${RETRY_INTERVAL_MS / 1000}s`);
+            return;
+        }
+        try {
+            for (const t of tools) pi.registerTool(manifestToTool(proxyBase, t, agent));
+            state.sid = sid;
+            state.retryAt = undefined;
+        } catch (err) {
+            state.sid = undefined;
+            state.retryAt = Date.now() + RETRY_INTERVAL_MS;
+            console.error(`bili-plugin(${agent}): tool registration deferred (${err instanceof Error ? err.message : String(err)}) — retrying in ${RETRY_INTERVAL_MS / 1000}s`);
+        }
+    })();
     try {
-        tools = await fetchManifest(proxyBase);
-    } catch (err) {
-        console.error(`bili-plugin(${agentName()}): manifest fetch failed: ${err instanceof Error ? err.message : String(err)} — tools unavailable this session`);
-        return;
-    }
-    try {
-        for (const t of tools) pi.registerTool(manifestToTool(proxyBase, t));
-        registeredFor.sid = sid;
-    } catch (err) {
-        registeredFor.sid = undefined;
-        console.error(`bili-plugin(${agentName()}): tool registration deferred (${err instanceof Error ? err.message : String(err)})`);
+        await state.pending;
+    } finally {
+        state.pending = undefined;
     }
 }
 
-export default function biliPlugin(pi: ExtensionAPI): void {
-    const registeredFor: { sid: string | undefined } = { sid: undefined };
-    pi.on("before_provider_headers", (event, ctx) => {
-        if (proxyBaseForCtx(ctx) === undefined) return;
-        const headers = (event as unknown as { headers: Record<string, string> }).headers;
-        headers["x-bili-plugin"] = agentName();
-        headers["x-bili-plugin-conversation"] = ctx.sessionManager.getSessionId();
-        const window = ctx.model?.contextWindow;
-        if (typeof window === "number" && Number.isFinite(window) && window > 0) {
-            headers["x-bili-plugin-context-window"] = String(Math.floor(window));
-        }
-        void registerTools(pi, ctx, registeredFor);
-    });
-    pi.on("session_start", (event, ctx) => {
-        registeredFor.sid = undefined;
-        void registerTools(pi, ctx, registeredFor);
-    });
+export function createBiliPlugin(agentOverride?: string): (pi: ExtensionAPI) => void {
+    return function biliPlugin(pi: ExtensionAPI): void {
+        const agent = agentName(agentOverride);
+        const state: RegisterState = {};
+        pi.on("before_provider_headers", (event, ctx) => {
+            try {
+                if (proxyBaseForCtx(ctx) === undefined) return;
+                const headers = (event as unknown as { headers?: Record<string, string> }).headers;
+                if (headers === undefined || typeof headers !== "object" || Array.isArray(headers)) return;
+                const sid = sessionIdOf(ctx);
+                if (sid !== undefined) headers["x-bili-plugin-conversation"] = sid;
+                headers["x-bili-plugin"] = agent;
+                const window = ctx.model?.contextWindow;
+                if (typeof window === "number" && Number.isFinite(window) && window > 0) {
+                    headers["x-bili-plugin-context-window"] = String(Math.floor(window));
+                }
+            } catch (err) {
+                console.error(`bili-plugin(${agent}): header stamp skipped (${err instanceof Error ? err.message : String(err)})`);
+            }
+            void registerTools(pi, ctx, state, agent).catch((err: unknown) => console.error(`bili-plugin(${agent}): ${err instanceof Error ? err.message : String(err)}`));
+        });
+        pi.on("session_start", (_event, ctx) => {
+            state.sid = undefined;
+            void registerTools(pi, ctx, state, agent).catch((err: unknown) => console.error(`bili-plugin(${agent}): ${err instanceof Error ? err.message : String(err)}`));
+        });
+    };
 }
+
+export default createBiliPlugin();
 
 export { fetchStatus };

@@ -8,12 +8,15 @@
 //   claude   `claude mcp add` (user scope; writes ~/.claude.json)
 //   codex    ~/.codex/config.toml        [mcp_servers.bili]
 //   opencode ~/.config/opencode/opencode.json  mcp.bili
+// Installers throw on failure (bad/locked config, missing host CLI); the CLI
+// layer catches, prints `bili plugin: <msg>` and exits 1.
 
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { resolvePiHome } from "./client-config.js";
 
 export const PLUGIN_AGENTS = ["pi", "omp", "claude", "codex", "opencode"] as const;
 export type PluginAgent = (typeof PLUGIN_AGENTS)[number];
@@ -25,7 +28,8 @@ export function selfPackageRoot(): string {
 }
 
 function homeFile(rel: string, envOverride?: string): string {
-    const base = (envOverride && process.env[envOverride]) || os.homedir();
+    const raw = (envOverride !== undefined ? process.env[envOverride] : undefined)?.trim();
+    const base = raw && raw.length > 0 ? raw : os.homedir();
     return path.join(base, rel);
 }
 
@@ -36,11 +40,23 @@ function backupOnce(file: string): void {
 }
 
 function readJson(file: string): Record<string, unknown> {
+    let text: string;
     try {
-        return JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
-    } catch {
-        return {};
+        text = fs.readFileSync(file, "utf8");
+    } catch (err) {
+        if ((err as { code?: string }).code === "ENOENT") return {};
+        throw err;
     }
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(text);
+    } catch (err) {
+        throw new Error(`${file}: not valid JSON (${err instanceof Error ? err.message : String(err)}) — fix it or restore ${path.basename(file)}.bili-bak first; refusing to overwrite`);
+    }
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+        throw new Error(`${file}: expected a JSON object at top level, refusing to overwrite`);
+    }
+    return parsed as Record<string, unknown>;
 }
 
 function writeJson(file: string, data: unknown): void {
@@ -49,16 +65,20 @@ function writeJson(file: string, data: unknown): void {
     fs.writeFileSync(file, JSON.stringify(data, null, 2) + "\n");
 }
 
+function requireDistFile(file: string): void {
+    if (!fs.existsSync(file)) {
+        console.error(`bili plugin: warning: ${file} does not exist yet (run \`npm run build\` in ${selfPackageRoot()}) — the entry will be dead until built`);
+    }
+}
+
 // — pi ————————————————————————————————————————————————————————————————
 
 function piSettingsFile(): string {
-    const agentDir = process.env.PI_CODING_AGENT_DIR?.trim();
-    if (agentDir) return path.join(agentDir, "settings.json");
-    return homeFile(".pi/agent/settings.json");
+    return path.join(resolvePiHome(process.env), "settings.json");
 }
 
 function isPiEntry(entry: string, root: string): boolean {
-    return entry === root || entry === `npm:billion-context` || /^npm:billion-context@/.test(entry);
+    return entry === root || entry === `npm:billion-context` || /^npm:billion-context@/.test(entry) || /(^|\/)node_modules\/billion-context(\/|$)/.test(entry);
 }
 
 function piInstall(): string {
@@ -66,9 +86,10 @@ function piInstall(): string {
     const file = piSettingsFile();
     const settings = readJson(file);
     const packages = Array.isArray(settings.packages) ? (settings.packages as unknown[]).map(String) : [];
-    if (packages.some((p) => isPiEntry(p, root))) return `pi: already installed (${file})`;
-    packages.push(root);
-    settings.packages = packages;
+    if (packages.some((p) => p === root)) return `pi: already installed (${file})`;
+    const kept = packages.filter((p) => !isPiEntry(p, root));
+    kept.push(root);
+    settings.packages = kept;
     writeJson(file, settings);
     return `pi: installed -> ${file} packages += ${root}`;
 }
@@ -95,42 +116,19 @@ function piStatus(): string {
 // — omp ———————————————————————————————————————————————————————————————
 
 function ompConfigFile(): string {
-    return homeFile(".omp/agent/config.yml", "OMP_CONFIG_HINT");
+    const raw = process.env.OMP_CONFIG?.trim();
+    if (raw && raw.length > 0) return raw;
+    const xdg = process.env.XDG_CONFIG_HOME?.trim();
+    if (xdg && xdg.length > 0) return path.join(xdg, "omp/agent/config.yml");
+    return homeFile(".config/omp/agent/config.yml");
 }
 
 function ompExtensionPath(): string {
     return path.join(selfPackageRoot(), "dist", "agent", "omp.js");
 }
 
-function ompInstall(): string {
-    const file = ompConfigFile();
-    const entry = ompExtensionPath();
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    const text = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
-    if (text.includes(entry)) return `omp: already installed (${file})`;
-    let out: string;
-    const extIdx = text.search(/^extensions:\s*$/m);
-    if (extIdx >= 0) {
-        const afterKey = text.indexOf("\n", extIdx);
-        const rest = afterKey < 0 ? "" : text.slice(afterKey + 1);
-        const firstNonList = rest.search(/^(?!\s*-\s)\S/m);
-        let head: string;
-        let tail: string;
-        if (firstNonList >= 0) {
-            head = text.slice(0, afterKey + 1 + firstNonList);
-            tail = text.slice(afterKey + 1 + firstNonList);
-        } else {
-            head = text.length === 0 || text.endsWith("\n") ? text : text + "\n";
-            tail = "";
-        }
-        out = `${head}  - ${entry}\n${tail}`;
-    } else {
-        out = text.endsWith("\n") || text.length === 0 ? text : text + "\n";
-        out += `extensions:\n  - ${entry}\n`;
-    }
-    backupOnce(file);
-    fs.writeFileSync(file, out);
-    return `omp: installed -> ${file} extensions += ${entry}`;
+function ompEntryValue(line: string): string {
+    return line.replace(/#.*$/, "").trim().replace(/^-\s*/, "").replace(/^["']|["']$/g, "").trim();
 }
 
 function ompRemove(): string {
@@ -140,7 +138,7 @@ function ompRemove(): string {
     const text = fs.readFileSync(file, "utf8");
     const cleaned = text
         .split("\n")
-        .filter((line) => line.trim() !== `- ${entry}`)
+        .filter((line) => ompEntryValue(line) !== entry)
         .join("\n");
     if (cleaned === text) return `omp: not installed (${file})`;
     backupOnce(file);
@@ -148,34 +146,81 @@ function ompRemove(): string {
     return `omp: removed from ${file}`;
 }
 
+function ompInstall(): string {
+    const file = ompConfigFile();
+    const entry = ompExtensionPath();
+    requireDistFile(entry);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const text = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
+    if (text.split("\n").some((line) => ompEntryValue(line) === entry)) return `omp: already installed (${file})`;
+    const keyCount = (text.match(/^extensions:/gm) ?? []).length;
+    if (keyCount > 1) throw new Error(`${file}: multiple \`extensions:\` keys — fix the file first, refusing to edit`);
+    if (/^extensions:\s*\S/m.test(text) && !/^extensions:\s*$/m.test(text)) {
+        throw new Error(`${file}: \`extensions:\` uses flow style or an inline value; convert it to a block list first, refusing to edit`);
+    }
+    let out: string;
+    const extMatch = /^extensions:\s*$/m.exec(text);
+    if (extMatch !== null) {
+        const afterKey = text.indexOf("\n", extMatch.index);
+        const rest = afterKey < 0 ? "" : text.slice(afterKey + 1);
+        const firstNonList = rest.search(/^(?!\s*-\s)\S/m);
+        const existingIndent = /^(\s*)-\s\S/m.exec(rest)?.[1] ?? "  ";
+        let head: string;
+        let tail: string;
+        if (firstNonList >= 0) {
+            head = text.slice(0, afterKey + 1 + firstNonList);
+            tail = text.slice(afterKey + 1 + firstNonList);
+        } else {
+            head = text.length === 0 || text.endsWith("\n") ? text : text + "\n";
+            tail = "";
+        }
+        out = `${head}${existingIndent}- ${entry}\n${tail}`;
+    } else {
+        out = text.endsWith("\n") || text.length === 0 ? text : text + "\n";
+        out += `extensions:\n  - ${entry}\n`;
+    }
+    const occurrences = out.split("\n").filter((line) => ompEntryValue(line) === entry).length;
+    if (occurrences !== 1) {
+        throw new Error(`${file}: edit would leave ${occurrences} copies of the entry — aborting without writing`);
+    }
+    backupOnce(file);
+    fs.writeFileSync(file, out);
+    return `omp: installed -> ${file} extensions += ${entry}`;
+}
+
 function ompStatus(): string {
-    const text = fs.existsSync(ompConfigFile()) ? fs.readFileSync(ompConfigFile(), "utf8") : "";
-    return text.includes(ompExtensionPath()) ? "installed" : "not installed";
+    const file = ompConfigFile();
+    const text = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
+    return text.split("\n").some((line) => ompEntryValue(line) === ompExtensionPath()) ? "installed" : "not installed";
 }
 
 // — claude —————————————————————————————————————————————————————————————
 
+const CLAUDE_EXEC_TIMEOUT_MS = 15000;
+
 function claudeMcpJson(): string {
-    return homeFile(".claude.json", "CLAUDE_CONFIG_DIR_HINT");
+    return homeFile(".claude.json", "CLAUDE_CONFIG_DIR");
 }
 
 function claudeInstall(): string {
     const root = selfPackageRoot();
+    const mcpJs = path.join(root, "dist", "mcp.js");
+    requireDistFile(mcpJs);
     try {
-        execFileSync("claude", ["mcp", "add", "bili", "--scope", "user", "--", process.execPath, path.join(root, "dist", "mcp.js")], { stdio: ["ignore", "pipe", "pipe"] });
+        execFileSync("claude", ["mcp", "add", "bili", "--scope", "user", "--", process.execPath, mcpJs], { stdio: ["ignore", "pipe", "pipe"], timeout: CLAUDE_EXEC_TIMEOUT_MS });
         return `claude: installed via \`claude mcp add\` (user scope) -> ${claudeMcpJson()}`;
     } catch (err) {
         const stderr = err instanceof Error && "stderr" in err ? String((err as { stderr?: Buffer | string }).stderr ?? "") : "";
-        return `claude: FAILED (${stderr.trim() || (err instanceof Error ? err.message : String(err))}) — is the claude CLI on PATH?`;
+        throw new Error(`claude: install failed (${stderr.trim() || (err instanceof Error ? err.message : String(err))}) — is the claude CLI on PATH?`);
     }
 }
 
 function claudeRemove(): string {
     try {
-        execFileSync("claude", ["mcp", "remove", "bili", "--scope", "user"], { stdio: ["ignore", "pipe", "pipe"] });
+        execFileSync("claude", ["mcp", "remove", "bili", "--scope", "user"], { stdio: ["ignore", "pipe", "pipe"], timeout: CLAUDE_EXEC_TIMEOUT_MS });
         return "claude: removed";
     } catch (err) {
-        return `claude: FAILED (${err instanceof Error ? err.message : String(err)})`;
+        throw new Error(`claude: remove failed (${err instanceof Error ? err.message : String(err)})`);
     }
 }
 
@@ -187,7 +232,7 @@ function claudeStatus(): string {
 // — codex ——————————————————————————————————————————————————————————————
 
 function codexToml(): string {
-    return homeFile(".codex/config.toml", "CODEX_HOME_HINT");
+    return homeFile(".codex/config.toml", "CODEX_HOME");
 }
 
 function codexBlock(): string {
@@ -197,7 +242,7 @@ function codexBlock(): string {
 function codexInstall(): string {
     const file = codexToml();
     const text = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
-    if (text.includes("[mcp_servers.bili]")) return `codex: already installed (${file})`;
+    if (/^\[mcp_servers\.bili\]\s*$/m.test(text)) return `codex: already installed (${file})`;
     fs.mkdirSync(path.dirname(file), { recursive: true });
     backupOnce(file);
     fs.writeFileSync(file, text + (text.endsWith("\n") || text.length === 0 ? "" : "\n") + codexBlock());
@@ -208,12 +253,16 @@ function codexRemove(): string {
     const file = codexToml();
     if (!fs.existsSync(file)) return `codex: not installed (${file})`;
     const text = fs.readFileSync(file, "utf8");
-    const idx = text.indexOf("\n[mcp_servers.bili]\n");
-    if (idx < 0) return `codex: not installed (${file})`;
-    const after = text.slice(idx + 1);
-    const nextTable = after.slice(1).search(/^\[/m);
-    const end = nextTable >= 0 ? idx + 1 + 1 + nextTable : text.length;
-    const cleaned = text.slice(0, idx) + text.slice(end);
+    const start = (() => {
+        const m = /^[ \t]*\[mcp_servers\.bili\][ \t]*$/m.exec(text);
+        return m === null ? -1 : m.index;
+    })();
+    if (start < 0) return `codex: not installed (${file})`;
+    const lineStart = text.lastIndexOf("\n", start - 1) + 1;
+    const after = text.slice(start);
+    const nextTable = after.slice(after.indexOf("\n") + 1).search(/^[ \t]*\[/m);
+    const end = nextTable >= 0 ? start + after.indexOf("\n") + 1 + nextTable : text.length;
+    const cleaned = (text.slice(0, lineStart).replace(/\n+$/, "\n") + text.slice(end)).replace(/^\n+/, "");
     backupOnce(file);
     fs.writeFileSync(file, cleaned);
     return `codex: removed from ${file}`;
@@ -221,21 +270,27 @@ function codexRemove(): string {
 
 function codexStatus(): string {
     const text = fs.existsSync(codexToml()) ? fs.readFileSync(codexToml(), "utf8") : "";
-    return text.includes("[mcp_servers.bili]") ? "installed" : "not installed";
+    return /^\[mcp_servers\.bili\]\s*$/m.test(text) ? "installed" : "not installed";
 }
 
 // — opencode ————————————————————————————————————————————————————————————
 
 function opencodeJson(): string {
-    return homeFile(".config/opencode/opencode.json", "OPENCODE_CONFIG_HINT");
+    const raw = process.env.OPENCODE_CONFIG?.trim();
+    if (raw && raw.length > 0) return raw;
+    const xdg = process.env.XDG_CONFIG_HOME?.trim();
+    if (xdg && xdg.length > 0) return path.join(xdg, "opencode/opencode.json");
+    return path.join(os.homedir(), ".config", "opencode", "opencode.json");
 }
 
 function opencodeInstall(): string {
     const file = opencodeJson();
+    const mcpJs = path.join(selfPackageRoot(), "dist", "mcp.js");
+    requireDistFile(mcpJs);
     const data = readJson(file);
     const mcp = (data.mcp as Record<string, unknown> | undefined) ?? {};
     if ("bili" in mcp) return `opencode: already installed (${file})`;
-    mcp.bili = { type: "local", command: [process.execPath, path.join(selfPackageRoot(), "dist", "mcp.js")], enabled: true };
+    mcp.bili = { type: "local", command: [process.execPath, mcpJs], enabled: true };
     data.mcp = mcp;
     writeJson(file, data);
     return `opencode: installed -> ${file} mcp.bili`;
