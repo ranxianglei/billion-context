@@ -279,7 +279,7 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
         fs.writeFileSync(path.join(home, ".omp/agent/config.yml"), "extensions:\n  - /some/other/ext.js\nfirstRunComplete: true\n");
         assert.match(pluginInstall("omp"), /installed/);
         const ompText = fs.readFileSync(path.join(home, ".omp/agent/config.yml"), "utf8");
-        assert.match(ompText, /extensions:\n  - \/some\/other\/ext\.js\n  - .*dist\/agent\/omp\.js\nfirstRunComplete: true\n/);
+        assert.match(ompText, /extensions:\n  - \/some\/other\/ext\.js\n  - .*dist[\\/]agent[\\/]omp\.js\nfirstRunComplete: true\n/);
         assert.match(pluginInstall("omp"), /already installed/);
         assert.match(pluginRemove("omp"), /removed/);
         assert.equal(fs.readFileSync(path.join(home, ".omp/agent/config.yml"), "utf8"), "extensions:\n  - /some/other/ext.js\nfirstRunComplete: true\n");
