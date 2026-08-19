@@ -12,7 +12,7 @@ import { proxyBaseFromUrl, proxyBaseFromEnv, detectProxyBase, fetchManifest, for
 import biliPlugin, { createBiliPlugin } from "../src/agent/pi.ts";
 import ompPlugin from "../src/agent/omp.ts";
 import { pluginInstall, pluginRemove, pluginStatusAll, PLUGIN_AGENTS, selfPackageRoot } from "../src/plugin-install.ts";
-import { resolveProxyOrigin } from "../src/mcp.ts";
+import { resolveProxyOrigin, forwardTool as mcpForwardTool } from "../src/mcp.ts";
 
 function withEnv(vars: Record<string, string | undefined>, fn: () => void | Promise<void>): Promise<void> {
     const saved = new Map<string, string | undefined>();
@@ -380,4 +380,30 @@ test("plugin install refuses to touch broken or non-object configs", async () =>
         assert.throws(() => pluginInstall("opencode"), /not valid JSON/);
     });
     fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("plugin list survives a broken host config (per-row error, no crash)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-plugin-home-"));
+    const piAgentDir = path.join(home, ".pi/agent");
+    await withEnv(hintEnv(home, piAgentDir), async () => {
+        fs.writeFileSync(path.join(home, ".claude.json"), "{ broken json");
+        const rows = pluginStatusAll();
+        assert.equal(rows.length, 5);
+        const claude = rows.find((r) => r.agent === "claude")!;
+        assert.match(claude.status, /error: .*not valid JSON/);
+        const pi = rows.find((r) => r.agent === "pi")!;
+        assert.equal(pi.status, "not installed");
+    });
+    fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("mcp forwardTool times out against a hanging proxy", async () => {
+    const server = http.createServer(() => {});
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    await withEnv({ BILI_MCP_PROXY: origin }, async () => {
+        await assert.rejects(() => mcpForwardTool("compress", {}, 200), /timed out after 200ms/);
+    });
+    await new Promise<void>((resolve) => server.close(() => resolve()));
 });

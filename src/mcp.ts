@@ -45,7 +45,7 @@ export function resolveProxyOrigin(): string {
     return DEFAULT_PROXY_ORIGIN;
 }
 
-const PROXY_ORIGIN = resolveProxyOrigin();
+const TOOL_TIMEOUT_MS = 60_000;
 const CONVERSATION_FROM_ENV = process.env.CLAUDE_CODE_SESSION_ID?.trim() || process.env.BILI_CONVERSATION_ID?.trim() || undefined;
 const IDENTITY_BINDING = Boolean(process.env.CLAUDE_CODE_SESSION_ID?.trim());
 let manifestTools: McpToolDef[] = [];
@@ -67,7 +67,7 @@ function sendError(id: JsonRpcId, code: number, message: string): void {
 }
 
 async function fetchManifest(): Promise<void> {
-    const res = await fetch(`${PROXY_ORIGIN}/__bili/plugin/manifest`, { signal: AbortSignal.timeout(5000) });
+    const res = await fetch(`${resolveProxyOrigin()}/__bili/plugin/manifest`, { signal: AbortSignal.timeout(5000) });
     if (!res.ok) throw new Error(`manifest fetch failed: ${res.status}`);
     const data = (await res.json()) as { tools?: Record<string, { name: string; description?: string; input_schema?: unknown }[]> };
     // Anthropic wire shape is the canonical MCP-compatible schema source.
@@ -85,12 +85,19 @@ function ensureManifest(): Promise<void> {
     return manifestPromise;
 }
 
-async function forwardTool(tool: string, args: unknown): Promise<string> {
-    const res = await fetch(`${PROXY_ORIGIN}/__bili/plugin/tool`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ conversationId, tool, args }),
-    });
+export async function forwardTool(tool: string, args: unknown, timeoutMs: number = TOOL_TIMEOUT_MS): Promise<string> {
+    let res: Response;
+    try {
+        res = await fetch(`${resolveProxyOrigin()}/__bili/plugin/tool`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ conversationId, tool, args }),
+            signal: AbortSignal.timeout(timeoutMs),
+        });
+    } catch (err) {
+        if (err instanceof Error && err.name === "TimeoutError") throw new Error(`tool forward timed out after ${timeoutMs}ms: ${tool}`);
+        throw err;
+    }
     const data = (await res.json()) as { ok?: boolean; result?: string; error?: string };
     if (!res.ok || !data.ok) throw new Error(data.error ?? `tool forward failed: ${res.status}`);
     return data.result ?? "";
@@ -121,10 +128,11 @@ async function handleMessage(msg: {
             if (fromMeta) conversationId ??= fromMeta;
             initialized = true;
             if (conversationId && !registered) {
-                const registerFetch = fetch(`${PROXY_ORIGIN}/__bili/plugin/register`, {
+                const registerFetch = fetch(`${resolveProxyOrigin()}/__bili/plugin/register`, {
                     method: "POST",
                     headers: { "content-type": "application/json" },
                     body: JSON.stringify({ conversationId, agent: "mcp", identity: IDENTITY_BINDING }),
+                    signal: AbortSignal.timeout(5000),
                 });
                 if (IDENTITY_BINDING) {
                     // Identity-mode binding survives any arrival order —
@@ -156,7 +164,7 @@ async function handleMessage(msg: {
                 await ensureManifest();
                 sendResult(id, { tools: manifestTools });
             } catch (err) {
-                sendError(id, -32003, `bili proxy unreachable at ${PROXY_ORIGIN} (${err instanceof Error ? err.message : String(err)}) — start bili or set BILI_MCP_PROXY`);
+                sendError(id, -32003, `bili proxy unreachable at ${resolveProxyOrigin()} (${err instanceof Error ? err.message : String(err)}) — start bili or set BILI_MCP_PROXY`);
             }
             return;
         }

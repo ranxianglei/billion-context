@@ -68,7 +68,7 @@ function writeJson(file: string, data: unknown): void {
 
 function requireDistFile(file: string): void {
     if (!fs.existsSync(file)) {
-        console.error(`bili plugin: warning: ${file} does not exist yet (run \`npm run build\` in ${selfPackageRoot()}) — the entry will be dead until built`);
+        process.stderr.write(`bili plugin: warning: ${file} does not exist yet (run \`npm run build\` in ${selfPackageRoot()}) — the entry will be dead until built\n`);
     }
 }
 
@@ -336,11 +336,18 @@ export function pluginRemove(agent: PluginAgent): string {
 }
 
 export function pluginStatusAll(): Array<{ agent: string; status: string }> {
-    return [
-        { agent: "pi", status: piStatus() },
-        { agent: "omp", status: ompStatus() },
-        { agent: "claude", status: claudeStatus() },
-        { agent: "codex", status: codexStatus() },
-        { agent: "opencode", status: opencodeStatus() },
+    const checks: Array<[string, () => string]> = [
+        ["pi", piStatus],
+        ["omp", ompStatus],
+        ["claude", claudeStatus],
+        ["codex", codexStatus],
+        ["opencode", opencodeStatus],
     ];
+    return checks.map(([agent, check]) => {
+        try {
+            return { agent, status: check() };
+        } catch (err) {
+            return { agent, status: `error: ${err instanceof Error ? err.message : String(err)}` };
+        }
+    });
 }

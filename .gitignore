@@ -3,4 +3,4 @@ dist/
 *.log
 .env
 *.tgz
-.bili-thin-build-stamp
+.bili-coop-build-stamp
