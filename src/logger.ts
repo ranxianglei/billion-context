@@ -79,8 +79,21 @@ export function configureLogger(file?: string): string | undefined {
     return file;
 }
 
+let capture: ((level: string, msg: string) => void) | null = null;
+
+export function setLogCapture(fn: ((level: string, msg: string) => void) | null): void {
+    capture = fn;
+}
+
 /** Log a line to file + stderr. */
 export const log: Logger = (level, msg) => {
+    if (capture) {
+        try {
+            capture(level, msg);
+        } catch {
+            // best-effort: a broken test/probe sink must never crash logging
+        }
+    }
     const ts = new Date().toISOString();
     const line = `${ts} [${level}] ${msg}\n`;
     // stderr (foreground terminal / shell redirect). MUST NOT throw — if the
