@@ -20,6 +20,7 @@ import { buildVisibilityMarker } from "../compress-loop.js";
 import { fetchWithTimeout } from "../fetch-util.js";
 import { proxyDispatcher } from "../upstream-proxy.js";
 import { log as loggerLog } from "../logger.js";
+import type { WireProtocol } from "../util.js";
 
 export const MAX_LOOP_ROUNDS = 10;
 
@@ -33,6 +34,10 @@ export interface LoopCtx {
     textProtocol?: boolean;
     debug?: boolean;
     nudge?: NudgeDecision;
+    // Which wire protocol produced the usage the loop records. Needed to
+    // compute the true context total correctly (Anthropic reports
+    // input_tokens as NEW-only; OpenAI/Responses report the TOTAL).
+    protocol?: WireProtocol;
 }
 
 export interface RequestOptions {
@@ -146,20 +151,27 @@ function recordUsage(
     const prompt = usage.inputTokens;
     const cached = usage.cachedTokens;
     const out = usage.outputTokens;
-    if (typeof prompt === "number") ctx.session.stats.inputTokens += prompt;
-    ctx.session.stats.lastInputTokens =
-        (typeof prompt === "number" ? prompt : 0) + (typeof cached === "number" ? cached : 0);
+    // Adapters emit `inputTokens` in protocol-native units: Anthropic's
+    // `input_tokens` is the NEW (uncached) portion only (cached reported
+    // separately), while OpenAI/Responses report the TOTAL (cached already
+    // included). Add `cached` back in ONLY when it is not already part of
+    // `prompt` — otherwise the cached portion is double-counted, inflating the
+    // context size (→ premature compression) and deflating the hit rate.
+    const includesCached = ctx.protocol === "openai" || ctx.protocol === "responses";
+    const total =
+        (typeof prompt === "number" ? prompt : 0) +
+        (!includesCached && typeof cached === "number" ? cached : 0);
+    if (total > 0) ctx.session.stats.inputTokens += total;
+    ctx.session.stats.lastInputTokens = total;
     if (typeof cached === "number") {
         ctx.session.stats.cachedTokens += cached;
         ctx.session.stats.cacheSamples += 1;
     }
     if (typeof out === "number") ctx.session.stats.outputTokens += out;
     const hitPct =
-        typeof prompt === "number" && typeof cached === "number" && prompt + cached > 0
-            ? Math.round((cached / (prompt + cached)) * 100)
-            : 0;
+        typeof cached === "number" && total > 0 ? Math.round((cached / total) * 100) : 0;
     ctx.log(
-        `[acp-usage] round ${round} input=${ctx.session.stats.lastInputTokens} cached=${cached ?? 0} (cache hit ${hitPct}%)`,
+        `[acp-usage] round ${round} input=${total} cached=${cached ?? 0} (cache hit ${hitPct}%)`,
     );
 }
 

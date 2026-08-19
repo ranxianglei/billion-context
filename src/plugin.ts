@@ -6,6 +6,7 @@ import { acquireInFlight, markDirty, peekSession, releaseInFlight, withSessionLo
 import { ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, PROXY_TOOL_NAMES } from "./compress-tool.js";
 import { executeProxyTool } from "./loop/core.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
+import type { WireProtocol } from "./util.js";
 
 // Cooperative plugin protocol ("内外呼应", issue #1): an agent-side plugin
 // registers the ACP tools NATIVELY with its agent and runs the agent's own
@@ -333,7 +334,13 @@ function usageFromSseEvent(obj: Record<string, unknown>): UsageSample | undefine
     if (type === "message_delta") {
         const usage = obj["usage"] as Record<string, unknown> | undefined;
         if (!usage) return undefined;
-        return { inputTokens: num(usage["input_tokens"]), outputTokens: num(usage["output_tokens"]) };
+        // Some relays echo `input_tokens: 0` in message_delta (the field is
+        // normally absent — message_start is authoritative for the input size,
+        // which is fixed within a turn). A 0 here is never a legitimate new
+        // value; merging it would zero acc.inputTokens (set by message_start)
+        // and collapse lastInputTokens to the cached portion only.
+        const input = num(usage["input_tokens"]);
+        return { inputTokens: input && input > 0 ? input : undefined, outputTokens: num(usage["output_tokens"]) };
     }
     if (type === "response.completed") {
         const usage = (obj["response"] as Record<string, unknown> | undefined)?.["usage"] as Record<string, unknown> | undefined;
@@ -355,14 +362,21 @@ function usageFromSseEvent(obj: Record<string, unknown>): UsageSample | undefine
     return undefined;
 }
 
-function applyUsageSample(session: Session, sample: UsageSample): void {
-    if (sample.inputTokens !== undefined) session.stats.inputTokens += sample.inputTokens;
+function applyUsageSample(session: Session, sample: UsageSample, protocol?: WireProtocol): void {
+    // inputTokens is protocol-native: Anthropic reports it NEW-only (cached
+    // separate); OpenAI/Responses report the TOTAL (cached already included).
+    // Add cached back in only when it is not already part of inputTokens.
+    const includesCached = protocol === "openai" || protocol === "responses";
     if (sample.cachedTokens !== undefined) {
         session.stats.cachedTokens += sample.cachedTokens;
         session.stats.cacheSamples += 1;
     }
     if (sample.inputTokens !== undefined) {
-        session.stats.lastInputTokens = sample.inputTokens + (sample.cachedTokens ?? 0);
+        const total =
+            sample.inputTokens +
+            (!includesCached && sample.cachedTokens !== undefined ? sample.cachedTokens : 0);
+        session.stats.inputTokens += total;
+        session.stats.lastInputTokens = total;
     }
     if (sample.outputTokens !== undefined) session.stats.outputTokens += sample.outputTokens;
 }
@@ -386,6 +400,7 @@ export async function pipeThroughWithUsage(
     stream: ReadableStream<Uint8Array>,
     res: import("node:http").ServerResponse,
     session: Session,
+    protocol?: WireProtocol,
 ): Promise<void> {
     const reader = stream.getReader();
     const decoder = new TextDecoder("utf-8");
@@ -422,7 +437,7 @@ export async function pipeThroughWithUsage(
         // that reads lastInputTokens for the nudge decision) the moment the
         // stream completes, and those must already see this usage.
         if (acc.inputTokens !== undefined || acc.outputTokens !== undefined || acc.cachedTokens !== undefined) {
-            applyUsageSample(session, acc);
+            applyUsageSample(session, acc, protocol);
             markDirty(session);
         }
     } finally {
@@ -437,6 +452,7 @@ export async function pipePluginJson(
     stream: ReadableStream<Uint8Array>,
     res: import("node:http").ServerResponse,
     session: Session,
+    protocol?: WireProtocol,
 ): Promise<void> {
     const reader = stream.getReader();
     const chunks: Buffer[] = [];
@@ -460,7 +476,7 @@ export async function pipePluginJson(
                         num((usage["prompt_tokens_details"] as Record<string, unknown> | undefined)?.["cached_tokens"]) ??
                         num((usage["input_tokens_details"] as Record<string, unknown> | undefined)?.["cached_tokens"]) ??
                         num(usage["cache_read_input_tokens"]),
-                });
+                }, protocol);
                 markDirty(session);
             }
         }
