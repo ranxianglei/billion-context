@@ -135,6 +135,32 @@ test("anthropic adapter: plain text round-trips live + message_delta/message_sto
     assert.ok(out.includes("message_stop"), "message_stop terminal present");
 });
 
+test("anthropic adapter: relay-echoed message_delta with input_tokens: 0 must NOT overwrite message_start usage", async () => {
+    // Some relays echo a schema-shaped `usage` in message_delta where
+    // `input_tokens` is present but 0 (the spec field is normally absent).
+    // The input context is fixed within a turn — message_start is
+    // authoritative — so a 0 in message_delta must be ignored, not merged
+    // (it used to zero roundInput → lastInputTokens = cached-only → the nudge
+    // denominator collapsed and compression never fired on cached sessions).
+    const round1 = [
+        `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_1", usage: { input_tokens: 55, cache_read_input_tokens: 11 } } })}\n\n`,
+        `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}\n\n`,
+        `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } })}\n\n`,
+        `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`,
+        `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 7 } })}\n\n`,
+        `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+    ].join("");
+    const ctx = { ...makeCtx("anthropic-delta-zero"), protocol: "anthropic" };
+    await drain(
+        new Response(round1, { status: 200 }).body!,
+        ctx,
+        createAnthropicAdapter({ model: "claude" }),
+        { model: "claude", messages: [], stream: true, max_tokens: 10 },
+    );
+    assert.equal(ctx.session.stats.lastInputTokens, 66, "total = input_tokens(55) + cache_read(11); the 0 in message_delta is ignored");
+    assert.equal(ctx.session.stats.cachedTokens, 11, "cached portion from message_start preserved");
+});
+
 test("anthropic adapter: acp_status-only round → marker + re-request, no crash", async () => {
     const round1 = [
         `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_1", usage: { input_tokens: 3 } } })}\n\n`,

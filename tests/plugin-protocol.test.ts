@@ -378,6 +378,38 @@ test("plugin mode: streamed response forwards verbatim while usage is sniffed in
     }
 });
 
+test("plugin mode: relay-echoed message_delta input_tokens:0 must not zero the sniffed input", async () => {
+    // Some relays echo a schema-shaped usage in message_delta with
+    // input_tokens: 0 (the spec field is normally absent — message_start is
+    // authoritative and the input is fixed within a turn). Merging the 0 used
+    // to collapse lastInputTokens to the cached portion only (11 instead of
+    // 66) — the nudge denominator then under-reported by ~6x.
+    const zeroEchoScript = [
+        ...textScript().slice(0, 4), // message_start + content block events
+        anthropicSse("message_delta", {
+            type: "message_delta",
+            delta: { stop_reason: "end_turn", stop_sequence: null },
+            usage: { input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 7 },
+        }),
+        anthropicSse("message_stop", { type: "message_stop" }),
+    ];
+    const h = await startHarness([zeroEchoScript]);
+    try {
+        const conv = "plug-conv-delta-zero";
+        await callPluginAnthropic(h, conv, [{ role: "user", content: "hello" }]);
+
+        const stats = (await (await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/stats`)).json()) as {
+            sessions?: Array<{ label?: string; inputTokens?: number; cachedTokens?: number }>;
+        };
+        const mine = (stats.sessions ?? []).find((s) => s.label === conv);
+        assert.ok(mine, "session for plugin conversation not found");
+        assert.equal(mine!.inputTokens, 66, "message_start total preserved despite the 0 echoed in message_delta");
+        assert.equal(mine!.cachedTokens, 11, "cached portion preserved");
+    } finally {
+        await h.close();
+    }
+});
+
 test("plugin mode: non-streaming JSON response passes through and usage is sniffed", async () => {
     const h = await startHarness([textScript()]);
     try {

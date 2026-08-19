@@ -237,8 +237,15 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                 } else if (type === "message_delta") {
                     const u = (data.usage ?? {}) as Record<string, unknown>;
                     if (typeof u.output_tokens === "number") roundOutput = u.output_tokens;
-                    if (typeof u.input_tokens === "number") roundInput = u.input_tokens;
-                    if (typeof u.cache_read_input_tokens === "number") roundCached = u.cache_read_input_tokens;
+                    // The input context is FIXED within a turn, so message_start is
+                    // authoritative for input/cache tokens. Some relays echo a
+                    // schema-shaped `usage` in message_delta with `input_tokens: 0`
+                    // (the field is normally absent); adopting a 0 would overwrite
+                    // message_start's real value and under-report the context size
+                    // (→ nudge/compression never fires, cache hit rate collapses).
+                    // A 0 can never be a legitimate update, so adopt only > 0.
+                    if (typeof u.input_tokens === "number" && u.input_tokens > 0) roundInput = u.input_tokens;
+                    if (typeof u.cache_read_input_tokens === "number" && u.cache_read_input_tokens > 0) roundCached = u.cache_read_input_tokens;
                     const d = (data.delta ?? {}) as Record<string, unknown>;
                     if (typeof d.stop_reason === "string") stopReason = d.stop_reason;
                     if (!usageYielded) {

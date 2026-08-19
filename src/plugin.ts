@@ -334,7 +334,13 @@ function usageFromSseEvent(obj: Record<string, unknown>): UsageSample | undefine
     if (type === "message_delta") {
         const usage = obj["usage"] as Record<string, unknown> | undefined;
         if (!usage) return undefined;
-        return { inputTokens: num(usage["input_tokens"]), outputTokens: num(usage["output_tokens"]) };
+        // Some relays echo `input_tokens: 0` in message_delta (the field is
+        // normally absent — message_start is authoritative for the input size,
+        // which is fixed within a turn). A 0 here is never a legitimate new
+        // value; merging it would zero acc.inputTokens (set by message_start)
+        // and collapse lastInputTokens to the cached portion only.
+        const input = num(usage["input_tokens"]);
+        return { inputTokens: input && input > 0 ? input : undefined, outputTokens: num(usage["output_tokens"]) };
     }
     if (type === "response.completed") {
         const usage = (obj["response"] as Record<string, unknown> | undefined)?.["usage"] as Record<string, unknown> | undefined;
