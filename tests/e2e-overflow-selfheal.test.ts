@@ -9,7 +9,7 @@ import { defaultConfig } from "acp-kernel";
 import { startServer, type ProxyOptions } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { listSessions } from "../src/session.ts";
+import { listSessions, type Session } from "../src/session.ts";
 
 // The configured window here is deliberately LARGE (400k) so it plays the role
 // of a wrong/mis-detected window (the 200k-fallback footgun for an unknown
@@ -61,7 +61,18 @@ test("e2e: upstream context overflow → learn window + arm shrink + pass throug
     await once(upstream, "listening");
     const upstreamPort = upstream.address().port;
 
-    _setStoreForTest(new SessionStore({ enabled: false }));
+    // Spy on scheduleSave: the overflow error path returns before
+    // forward()'s trailing markDirty, so it must schedule its own save —
+    // otherwise the learned window (metadata) and the armed emergency
+    // (lastInputTokens) live only in memory and are lost on restart.
+    // (An on-disk assertion can't prove this: the prepare phase's own
+    // markDirty schedules a debounced save that serializes the live session
+    // AFTER forward() has mutated it.)
+    const store = new SessionStore({ enabled: false });
+    const scheduleCalls: string[] = [];
+    const origSchedule = store.scheduleSave.bind(store);
+    store.scheduleSave = ((s: Session) => { scheduleCalls.push(s.id); return origSchedule(s); }) as typeof store.scheduleSave;
+    _setStoreForTest(store);
     setRegistryForTest({});
     const proxy = await startServer({
         port: 0,
@@ -102,6 +113,12 @@ test("e2e: upstream context overflow → learn window + arm shrink + pass throug
         assert.ok(s, "a session learned the real window from the overflow (keyed by model)");
         assert.equal(s!.metadata.learnedContextLimit, undefined, "no legacy scalar when the model is known");
         assert.ok(s!.stats.lastInputTokens >= 128000, "emergency shrink armed (lastInputTokens >= window)");
+
+        // The prepare phase marks the session dirty once per request; the
+        // overflow error path must add its OWN save for the learned window +
+        // armed value (it returns before forward()'s trailing markDirty).
+        const saves = scheduleCalls.filter((id) => id === s!.id).length;
+        assert.ok(saves >= 2, `overflow error path scheduled its own save (scheduleSave x${saves} for the session)`);
 
         // --- Request 2: recovers (self-healed window; upstream is fine now) ---
         const r2 = await fetch(url, {

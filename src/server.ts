@@ -56,7 +56,7 @@ import { deriveSessionId as deriveProxySessionId, affinityToken, clientConversat
 import { consumePluginRegisterFor, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, pipePluginJson, pipeThroughWithUsage, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
-import { isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, usageTotals } from "./util.js";
+import { isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, shouldReserveOutputHeadroom, usageTotals } from "./util.js";
 
 import { decodeRequestBody } from "./content-encoding.js";
 
@@ -717,13 +717,17 @@ async function handle(
         // kernel's nudge/truncate bands sit below (window - maxOutput) and a
         // context+output overflow can't happen on a small window (e.g. 100k with a
         // large max_tokens — the most common "context blew up" cause; none of the
-        // three layers reserved room for the output before this). max_tokens is the
-        // exact output budget requested for THIS turn, so the reservation is precise
-        // and per-request. Only reserve when it leaves a usable window (maxOutput <
-        // window); otherwise the request is degenerate (output >= whole window) and
-        // the self-heal above handles the resulting overflow. Feeds reqConfig (→
+        // three layers reserved room for the output before this). Anthropic is
+        // exempt: its input limit is enforced independently of max_tokens
+        // (separate output budget), so reserving would shift every band down by
+        // maxOutput on every session for no safety gain — see
+        // shouldReserveOutputHeadroom. max_tokens is the exact output budget
+        // requested for THIS turn, so the reservation is precise and per-request.
+        // Only reserve when it leaves a usable window (maxOutput < window);
+        // otherwise the request is degenerate (output >= whole window) and the
+        // self-heal above handles the resulting overflow. Feeds reqConfig (→
         // processTurn `config`), so diagNudge shows the reserved window (no extra log).
-        {
+        if (shouldReserveOutputHeadroom(protocol)) {
             const p = parsed as Record<string, unknown>;
             const rawMax = p.max_tokens ?? p.max_completion_tokens ?? p.max_output_tokens;
             const maxOutput = typeof rawMax === "number" ? rawMax : 0;
@@ -1497,15 +1501,22 @@ async function forward(
                     (s.metadata.effectiveContextLimit as number | undefined) ??
                     0;
                 if (floor > 0) s.stats.lastInputTokens = Math.max(s.stats.lastInputTokens, floor);
+                // The learned window (metadata) and the armed emergency
+                // (lastInputTokens) live in memory only until scheduled —
+                // the error path returns before forward()'s trailing
+                // markDirty, so schedule the save HERE or the self-heal is
+                // lost on restart and the next overflow must be re-learned.
+                markDirty(s);
             }
         }
         const errHeaders: Record<string, string> = { ...respHeaders };
-        if (errBody) {
-            // Writing a complete body — drop framing headers that would conflict
-            // with a fixed-length write.
-            delete errHeaders["content-length"];
-            delete errHeaders["transfer-encoding"];
-        }
+        // Drop the upstream framing headers unconditionally: when errBody is
+        // present a fixed-length write replaces them, and when errBody is
+        // null (broken body stream) the response ends with no body — a
+        // content-length/transfer-encoding claiming bytes that never arrive
+        // would leave the client on a broken response.
+        delete errHeaders["content-length"];
+        delete errHeaders["transfer-encoding"];
         res.writeHead(upstream.status, errHeaders);
         res.end(errBody ?? undefined);
         clearUpstreamTimer();

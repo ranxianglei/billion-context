@@ -88,6 +88,8 @@ export function usageTotals(
         total: num(usage["input_tokens"]),
         cached: num((usage["input_tokens_details"] as Record<string, unknown> | undefined)?.["cached_tokens"]),
     };
+}
+
 /** Result of inspecting an upstream response for a "context too long" error. */
 export interface ContextOverflowInfo {
     /** True if the response looks like an upstream context-overflow error. */
@@ -168,4 +170,18 @@ export function reserveOutputHeadroom(window: number, maxOutput: number): number
         return window - maxOutput;
     }
     return window;
+}
+
+/**
+ * Whether the OUTPUT budget should be reserved from the context window at all.
+ * Anthropic's Messages API enforces the input limit INDEPENDENTLY of
+ * max_tokens (the output budget is separate — input up to the window works
+ * with any max_tokens), so reserving it would shift the nudge/truncate bands
+ * down by maxOutput on every session with no safety gain. The OpenAI-family
+ * APIs count output against the window, so the reservation is only needed
+ * there. Unknown/other protocols reserve (conservative — a missed reservation
+ * at worst overflows once and the self-heal corrects it).
+ */
+export function shouldReserveOutputHeadroom(protocol: string | undefined): boolean {
+    return protocol !== "anthropic";
 }

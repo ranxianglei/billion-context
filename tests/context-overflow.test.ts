@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { inspectContextOverflow, reserveOutputHeadroom } from "../src/util.ts";
+import { inspectContextOverflow, reserveOutputHeadroom, shouldReserveOutputHeadroom } from "../src/util.ts";
 
 // A context-overflow error is the only reliable signal that the configured
 // window is wrong (e.g. the 200k fallback for an unknown model on a relay).
@@ -127,4 +127,15 @@ test("reserveOutputHeadroom: no-op for a non-positive / non-finite window", () =
     assert.equal(reserveOutputHeadroom(0, 8_000), 0);
     assert.equal(reserveOutputHeadroom(-1, 8_000), -1);
     assert.equal(reserveOutputHeadroom(Number.NaN, 8_000), Number.NaN);
+});
+
+// Protocol gate: Anthropic's Messages API enforces the input limit
+// independently of max_tokens (separate output budget), so reserving there
+// would shift every nudge/truncate band down by maxOutput for no safety gain.
+// OpenAI-family APIs count output against the window — reserve there.
+test("shouldReserveOutputHeadroom: anthropic exempt, other protocols reserve", () => {
+    assert.equal(shouldReserveOutputHeadroom("anthropic"), false, "Anthropic: output budget is separate from the context window");
+    assert.equal(shouldReserveOutputHeadroom("openai"), true);
+    assert.equal(shouldReserveOutputHeadroom("responses"), true);
+    assert.equal(shouldReserveOutputHeadroom(undefined), true, "unknown protocol → conservative (reserve)");
 });
