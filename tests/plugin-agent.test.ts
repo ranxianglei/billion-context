@@ -329,7 +329,7 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
 
         assert.match(pluginInstall("opencode"), /installed/);
         const oc = JSON.parse(fs.readFileSync(path.join(home, ".config/opencode/opencode.json"), "utf8")) as { mcp: Record<string, { command: string[]; environment?: Record<string, string> }> };
-        assert.equal(oc.mcp.bili.command[1]!.endsWith("dist/mcp.js"), true);
+        assert.equal(oc.mcp.bili.command[1]!.endsWith(path.join("dist", "mcp.js")), true);
         assert.equal(oc.mcp.bili.environment?.BILI_MCP_PROXY, "http://127.0.0.1:8787");
         assert.match(pluginRemove("opencode"), /removed/);
         assert.equal((JSON.parse(fs.readFileSync(path.join(home, ".config/opencode/opencode.json"), "utf8")) as { mcp?: unknown }).mcp, undefined);
