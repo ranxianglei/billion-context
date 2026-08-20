@@ -89,3 +89,99 @@ export function usageTotals(
         cached: num((usage["input_tokens_details"] as Record<string, unknown> | undefined)?.["cached_tokens"]),
     };
 }
+
+/** Result of inspecting an upstream response for a "context too long" error. */
+export interface ContextOverflowInfo {
+    /** True if the response looks like an upstream context-overflow error. */
+    isOverflow: boolean;
+    /** The real context window (tokens) learned from the error body, if any
+     *  confident number is present. */
+    window?: number;
+    /** Truncated error-body text, for logging. */
+    message: string;
+}
+
+// Upstream "context too long" markers across providers. Deliberately specific:
+// NO bare "too many tokens" — that is Bedrock's *throttle* phrase (a 429 the
+// client should back off on), not a context overflow.
+const CONTEXT_OVERFLOW_PATTERNS: RegExp[] = [
+    /context_length_exceeded/i,
+    /context length exceeded/i,
+    /maximum context length/i,
+    /max context length/i,
+    /maximum context size/i,
+    /exceeds the context window/i,
+    /exceeded model token limit/i,
+    /prompt is too long/i,
+    /prompt_too_long/i,
+    /prompt_is_too_long/i,
+    /request_too_large/i,
+    /token limit exceeded/i,
+];
+
+function toTokenNumber(s: string): number | undefined {
+    const n = parseInt(s.replace(/,/g, ""), 10);
+    // A plausible window is at least a few thousand tokens; smaller numbers in
+    // the message (e.g. "5 inputs", a request id) are not the window.
+    return Number.isFinite(n) && n >= 1000 ? n : undefined;
+}
+
+/** Best-effort extraction of the real context window from an overflow error
+ *  body. Returns undefined when no confident window number is present — a wrong
+ *  guess (e.g. the prompt size, not the limit) is worse than no guess. */
+function parseOverflowWindow(text: string): number | undefined {
+    // "130000 tokens > 128000 maximum" (Anthropic) → the maximum, not the total.
+    let m = text.match(/>\s*(\d[\d,]*)\s*maximum/i);
+    if (m) return toTokenNumber(m[1]);
+    m =
+        text.match(/maximum context length is (\d[\d,]*)/i) ??
+        text.match(/maximum context length of (\d[\d,]*)/i) ??
+        text.match(/maximum context size (?:is|of) (\d[\d,]*)/i) ??
+        text.match(/(?:maximum|max)\s+(?:context\s+)?length\s+(?:is\s+)?(\d[\d,]*)/i) ??
+        text.match(/limit of (\d[\d,]*)\s*token/i) ??
+        text.match(/(\d[\d,]*)\s*maximum\b/i);
+    if (m) return toTokenNumber(m[1]);
+    return undefined;
+}
+
+/** Inspect an upstream response for a context-overflow error. `status` is the
+ *  HTTP status; `bodyText` is the (usually small) error body. Only 400/413 with
+ *  a recognized context-too-long marker counts. */
+export function inspectContextOverflow(status: number, bodyText: string): ContextOverflowInfo {
+    const message = (bodyText ?? "").slice(0, 300);
+    if (status !== 400 && status !== 413) return { isOverflow: false, message };
+    if (!bodyText) return { isOverflow: false, message };
+    const isOverflow = CONTEXT_OVERFLOW_PATTERNS.some((p) => p.test(bodyText));
+    if (!isOverflow) return { isOverflow: false, message };
+    return { isOverflow: true, window: parseOverflowWindow(bodyText), message };
+}
+
+/**
+ * Reserve the model's OUTPUT budget from the context window so the kernel's
+ * nudge/truncate bands (a fraction of the window) sit below (window - maxOutput)
+ * and a context+output overflow can't happen on a small window (e.g. 100k with a
+ * large max_tokens). Returns the effective window to hand to the kernel. No-op
+ * unless maxOutput is a positive finite number that leaves a usable window
+ * (maxOutput < window) — a request whose output budget is >= the whole window is
+ * degenerate and the self-heal handles the resulting overflow instead.
+ */
+export function reserveOutputHeadroom(window: number, maxOutput: number): number {
+    if (Number.isFinite(window) && window > 0 && Number.isFinite(maxOutput) && maxOutput > 0 && maxOutput < window) {
+        return window - maxOutput;
+    }
+    return window;
+}
+
+/**
+ * Whether the OUTPUT budget should be reserved from the context window at all.
+ * Anthropic's Messages API enforces the input limit INDEPENDENTLY of
+ * max_tokens (the output budget is separate — input up to the window works
+ * with any max_tokens), so reserving it would shift the nudge/truncate bands
+ * down by maxOutput on every session with no safety gain. The OpenAI-family
+ * APIs count output against the window, so the reservation is only needed
+ * there. Unknown/other protocols reserve (conservative — a missed reservation
+ * at worst overflows once and the self-heal corrects it).
+ */
+export function shouldReserveOutputHeadroom(protocol: string | undefined): boolean {
+    return protocol !== "anthropic";
+}
