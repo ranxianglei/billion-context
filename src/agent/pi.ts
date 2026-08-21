@@ -65,13 +65,16 @@ function manifestToTool(proxyBase: string, tool: ManifestTool, agent: string): T
 
 const RETRY_INTERVAL_MS = 10000;
 
-type RegisterState = { sid?: string; pending?: Promise<void>; retryAt?: number; retryTimer?: ReturnType<typeof setTimeout> };
+type RegisterState = { sid?: string; pending?: Promise<void>; retryAt?: number };
 
 async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, agent: string): Promise<void> {
     const proxyBase = proxyBaseForCtx(ctx);
     if (proxyBase === undefined) return;
-    const sid = sessionIdOf(ctx);
-    if (sid !== undefined && sid === state.sid) return;
+    // Cache on the session id; "" (host has no sessionManager) still caches,
+    // so a successful registration is not re-fetched on every provider
+    // request — the manifest is session-independent anyway.
+    const sid = sessionIdOf(ctx) ?? "";
+    if (sid === state.sid) return;
     if (state.pending !== undefined) return state.pending;
     if (state.retryAt !== undefined && Date.now() < state.retryAt) return;
     state.pending = (async () => {

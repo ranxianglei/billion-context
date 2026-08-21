@@ -196,7 +196,12 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         const displayHost = opts.host === "0.0.0.0" ? "localhost" : opts.host;
         try {
             fs.mkdirSync(stateDir(), { recursive: true });
-            fs.writeFileSync(proxyOriginFile(), `http://127.0.0.1:${server.address() === null ? opts.port : (server.address() as { port: number }).port}\n`);
+            // Discovery origin local MCP shells dial: collapse wildcard
+            // binds to loopback (localhost may resolve to ::1, where an
+            // IPv4-only listener is absent) and bracket bare IPv6 literals
+            // so the file always holds a valid URL.
+            const originHost = opts.host === "0.0.0.0" || opts.host === "::" || opts.host === "localhost" ? "127.0.0.1" : opts.host.includes(":") && !opts.host.startsWith("[") ? `[${opts.host}]` : opts.host;
+            fs.writeFileSync(proxyOriginFile(), `http://${originHost}:${server.address() === null ? opts.port : (server.address() as { port: number }).port}\n`);
         } catch {
             // best-effort discovery hint for host-spawned MCP shells
         }

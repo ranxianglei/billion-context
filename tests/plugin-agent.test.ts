@@ -116,6 +116,17 @@ test("shared manifest/tool/status against a fake proxy", async () => {
     }
 });
 
+test("forwardTool rejects immediately when the caller's signal is already aborted", async () => {
+    const proxy = await startFakeProxy();
+    try {
+        const ac = new AbortController();
+        ac.abort();
+        await assert.rejects(forwardTool(proxy.origin, "conv-1", "compress", { content: [] }, ac.signal), /abort/i);
+    } finally {
+        await proxy.close();
+    }
+});
+
 type TextBlock = { type: "text"; text: string };
 type RecordedTool = { name: string; parameters: unknown; execute: (id: string, params: Record<string, unknown>, signal: undefined, onUpdate: undefined, ctx: Record<string, unknown>) => Promise<{ content: TextBlock[]; isError?: boolean }> };
 
@@ -256,6 +267,7 @@ function hintEnv(home: string, piAgentDir: string): Record<string, string> {
         CODEX_HOME: home,
         OPENCODE_CONFIG: path.join(home, ".config/opencode/opencode.json"),
         CLAUDE_CONFIG_DIR: home,
+        CLAUDE: "/nonexistent/bili-claude-stub",
         BILI_MCP_PROXY: "http://127.0.0.1:8787",
     };
 }
@@ -335,6 +347,10 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
         assert.equal((JSON.parse(fs.readFileSync(path.join(home, ".config/opencode/opencode.json"), "utf8")) as { mcp?: unknown }).mcp, undefined);
 
         assert.throws(() => pluginInstall("claude"), /claude: install failed/);
+        // The CLAUDE stub above keeps that assertion deterministic even on
+        // machines WITH the real claude CLI; remove is a no-op when the
+        // config has no bili entry (and must not exec the CLI at all).
+        assert.match(pluginRemove("claude"), /not installed/);
 
         const rows = pluginStatusAll();
         assert.equal(rows.length, 5);

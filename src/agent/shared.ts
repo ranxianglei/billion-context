@@ -55,6 +55,10 @@ export function detectProxyBase(baseUrl: string | undefined): string | undefined
 
 async function fetchJson(url: string, init: RequestInit | undefined, timeoutMs: number, externalSignal?: AbortSignal): Promise<{ ok: boolean; status: number; json: unknown }> {
     const ac = new AbortController();
+    // An already-aborted external signal never fires its "abort" event, so
+    // forward the state directly — otherwise only the timeout could stop
+    // the request, turning an instant cancel into a timeout wait.
+    if (externalSignal?.aborted) ac.abort();
     const timer = setTimeout(() => ac.abort(), timeoutMs);
     const onExternalAbort = () => ac.abort();
     externalSignal?.addEventListener("abort", onExternalAbort, { once: true });

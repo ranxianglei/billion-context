@@ -201,12 +201,16 @@ function claudeMcpJson(): string {
     return homeFile(".claude.json", "CLAUDE_CONFIG_DIR");
 }
 
+// CLAUDE overrides the claude binary path (absolute path for sandboxed
+// setups; a guaranteed-missing file in tests so the failure path stays
+// deterministic even on machines that have the real CLI).
 function claudeInstall(): string {
     const root = selfPackageRoot();
     const mcpJs = path.join(root, "dist", "mcp.js");
     requireDistFile(mcpJs);
+    const claude = process.env.CLAUDE?.trim() || "claude";
     try {
-        execFileSync("claude", ["mcp", "add", "bili", "--scope", "user", "-e", `BILI_MCP_PROXY=${resolveProxyOrigin()}`, "--", process.execPath, mcpJs], { stdio: ["ignore", "pipe", "pipe"], timeout: CLAUDE_EXEC_TIMEOUT_MS });
+        execFileSync(claude, ["mcp", "add", "bili", "--scope", "user", "-e", `BILI_MCP_PROXY=${resolveProxyOrigin()}`, "--", process.execPath, mcpJs], { stdio: ["ignore", "pipe", "pipe"], timeout: CLAUDE_EXEC_TIMEOUT_MS });
         return `claude: installed via \`claude mcp add\` (user scope) -> ${claudeMcpJson()}`;
     } catch (err) {
         const stderr = err instanceof Error && "stderr" in err ? String((err as { stderr?: Buffer | string }).stderr ?? "") : "";
@@ -215,8 +219,10 @@ function claudeInstall(): string {
 }
 
 function claudeRemove(): string {
+    if (claudeStatus() === "not installed") return `claude: not installed (${claudeMcpJson()})`;
+    const claude = process.env.CLAUDE?.trim() || "claude";
     try {
-        execFileSync("claude", ["mcp", "remove", "bili", "--scope", "user"], { stdio: ["ignore", "pipe", "pipe"], timeout: CLAUDE_EXEC_TIMEOUT_MS });
+        execFileSync(claude, ["mcp", "remove", "bili", "--scope", "user"], { stdio: ["ignore", "pipe", "pipe"], timeout: CLAUDE_EXEC_TIMEOUT_MS });
         return "claude: removed";
     } catch (err) {
         throw new Error(`claude: remove failed (${err instanceof Error ? err.message : String(err)})`);
