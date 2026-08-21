@@ -189,6 +189,24 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             }
         }
     });
+    // Bili does not support WebSocket. An explicit 'upgrade' listener is
+    // required: without one Node's behavior is version-dependent (some
+    // versions destroy the socket with no response), delaying clients with
+    // built-in fast-fallback (e.g. Codex) that need a clean 426 to switch to
+    // HTTP POST immediately.
+    server.on("upgrade", (req, socket) => {
+        log("info", `[ws] rejected ${req.method} ${req.url ?? ""} host=${req.headers.host ?? "?"} with 426`);
+        socket.on("error", () => {}); // client may vanish mid-write; don't let ECONNRESET crash the process
+        const body = JSON.stringify({ error: "WebSocket upgrades are not supported; use HTTP POST" });
+        socket.end(
+            "HTTP/1.1 426 Upgrade Required\r\n" +
+                "Connection: close\r\n" +
+                "Content-Type: application/json\r\n" +
+                `Content-Length: ${Buffer.byteLength(body)}\r\n` +
+                "\r\n" +
+                body,
+        );
+    });
     if (opts.mitm.enabled) {
         setupMitm(server, opts.mitm.domains, (msg) => log("info", msg), (host) => resolveProxy(opts.routes, opts.proxy, `https://${host}`, opts.proxyFallback));
     }
@@ -493,13 +511,9 @@ async function handle(
         }
     }
 
-    // Bili does not support WebSocket — reject any upgrade with 426 so clients
-    // with built-in fast-fallback (e.g. Codex supports_websockets=true) retry over HTTP POST.
-    if (req.headers.upgrade === "websocket") {
-        res.writeHead(426, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: "WebSocket upgrades are not supported; use HTTP POST" }));
-        return;
-    }
+    // NOTE: WebSocket upgrades are answered by the dedicated 'upgrade' listener
+    // in startServer() (above), which is the only reliable path — Node routes
+    // upgrade requests there and never to this request handler.
     let bodyBuffer: Buffer;
     let urlPath: string;
     let responsesCompact: boolean;
