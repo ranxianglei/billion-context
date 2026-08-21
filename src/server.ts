@@ -1531,6 +1531,17 @@ async function forward(
                 markDirty(s);
             }
         }
+        // #174: always log a non-2xx upstream response (status + request-id +
+        // body snippet) — a 4xx/5xx with zero log trace is a diagnostic
+        // black hole (issue #2).
+        const errSid = prepared?.session.id ?? "unknown";
+        const reqId = upstream.headers.get("x-request-id") ?? upstream.headers.get("request-id");
+        const reqIdText = reqId ? ` request-id=${reqId}` : "";
+        const bodyText = errBody ? new TextDecoder().decode(errBody) : "";
+        let snippet = bodyText.slice(0, 600).replace(/\s+/g, " ").trim();
+        if (bodyText.length > 600) snippet += " …";
+        if (!snippet) snippet = "(no body)";
+        loggerLog("warn", `[${errSid}] ← upstream ${upstream.status}${reqIdText}: ${snippet}`);
         const errHeaders: Record<string, string> = { ...respHeaders };
         // Drop the upstream framing headers unconditionally: when errBody is
         // present a fixed-length write replaces them, and when errBody is
