@@ -9,6 +9,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { proxyOriginFile } from "./paths.js";
 
 const VERSION = (() => {
     try {
@@ -31,7 +32,20 @@ type McpToolDef = {
 // every model request (x-claude-code-session-id), so binding is by identity.
 // BILI_CONVERSATION_ID (launcher-spawned hosts like codex) has no matching
 // request id — binding is headless (next NEW session).
-const PROXY_ORIGIN = process.env.BILI_MCP_PROXY ?? "http://127.0.0.1:8787";
+const DEFAULT_PROXY_ORIGIN = "http://127.0.0.1:8787";
+
+export function resolveProxyOrigin(): string {
+    const fromEnv = process.env.BILI_MCP_PROXY?.trim();
+    if (fromEnv && fromEnv.length > 0) return fromEnv;
+    try {
+        const discovered = fs.readFileSync(proxyOriginFile(), "utf8").trim();
+        if (/^https?:\/\/\S+$/.test(discovered)) return discovered;
+    } catch {
+    }
+    return DEFAULT_PROXY_ORIGIN;
+}
+
+const TOOL_TIMEOUT_MS = 60_000;
 const CONVERSATION_FROM_ENV = process.env.CLAUDE_CODE_SESSION_ID?.trim() || process.env.BILI_CONVERSATION_ID?.trim() || undefined;
 const IDENTITY_BINDING = Boolean(process.env.CLAUDE_CODE_SESSION_ID?.trim());
 let manifestTools: McpToolDef[] = [];
@@ -53,7 +67,7 @@ function sendError(id: JsonRpcId, code: number, message: string): void {
 }
 
 async function fetchManifest(): Promise<void> {
-    const res = await fetch(`${PROXY_ORIGIN}/__bili/plugin/manifest`);
+    const res = await fetch(`${resolveProxyOrigin()}/__bili/plugin/manifest`, { signal: AbortSignal.timeout(5000) });
     if (!res.ok) throw new Error(`manifest fetch failed: ${res.status}`);
     const data = (await res.json()) as { tools?: Record<string, { name: string; description?: string; input_schema?: unknown }[]> };
     // Anthropic wire shape is the canonical MCP-compatible schema source.
@@ -62,12 +76,28 @@ async function fetchManifest(): Promise<void> {
     if (manifestTools.length === 0) throw new Error("manifest served no anthropic tools");
 }
 
-async function forwardTool(tool: string, args: unknown): Promise<string> {
-    const res = await fetch(`${PROXY_ORIGIN}/__bili/plugin/tool`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ conversationId, tool, args }),
+let manifestPromise: Promise<void> | null = null;
+function ensureManifest(): Promise<void> {
+    manifestPromise ??= fetchManifest().catch((err) => {
+        manifestPromise = null;
+        throw err;
     });
+    return manifestPromise;
+}
+
+export async function forwardTool(tool: string, args: unknown, timeoutMs: number = TOOL_TIMEOUT_MS): Promise<string> {
+    let res: Response;
+    try {
+        res = await fetch(`${resolveProxyOrigin()}/__bili/plugin/tool`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ conversationId, tool, args }),
+            signal: AbortSignal.timeout(timeoutMs),
+        });
+    } catch (err) {
+        if (err instanceof Error && err.name === "TimeoutError") throw new Error(`tool forward timed out after ${timeoutMs}ms: ${tool}`);
+        throw err;
+    }
     const data = (await res.json()) as { ok?: boolean; result?: string; error?: string };
     if (!res.ok || !data.ok) throw new Error(data.error ?? `tool forward failed: ${res.status}`);
     return data.result ?? "";
@@ -98,10 +128,11 @@ async function handleMessage(msg: {
             if (fromMeta) conversationId ??= fromMeta;
             initialized = true;
             if (conversationId && !registered) {
-                const registerFetch = fetch(`${PROXY_ORIGIN}/__bili/plugin/register`, {
+                const registerFetch = fetch(`${resolveProxyOrigin()}/__bili/plugin/register`, {
                     method: "POST",
                     headers: { "content-type": "application/json" },
                     body: JSON.stringify({ conversationId, agent: "mcp", identity: IDENTITY_BINDING }),
+                    signal: AbortSignal.timeout(5000),
                 });
                 registered = true; // issue-once: a repeated initialize must not re-register
                 if (IDENTITY_BINDING) {
@@ -130,7 +161,12 @@ async function handleMessage(msg: {
                 sendError(id, -32002, "server not initialized");
                 return;
             }
-            sendResult(id, { tools: manifestTools });
+            try {
+                await ensureManifest();
+                sendResult(id, { tools: manifestTools });
+            } catch (err) {
+                sendError(id, -32003, `bili proxy unreachable at ${resolveProxyOrigin()} (${err instanceof Error ? err.message : String(err)}) — start bili or set BILI_MCP_PROXY`);
+            }
             return;
         }
         case "tools/call": {
@@ -163,12 +199,6 @@ async function handleMessage(msg: {
     }
 }
 async function mcpMain(): Promise<void> {
-    try {
-        await fetchManifest();
-    } catch (err) {
-        console.error(`bili-mcp: ${err instanceof Error ? err.message : String(err)} (proxy at ${PROXY_ORIGIN})`);
-        process.exit(1);
-    }
     let buf = "";
     process.stdin.setEncoding("utf8");
     process.stdin.on("data", (chunk: string) => {

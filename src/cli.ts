@@ -25,6 +25,7 @@ import { startServer } from "./server.js";
 import { configFile as defaultConfigFile } from "./paths.js";
 import { checkForUpdate, startAutoUpdate } from "./update.js";
 import { runMcpStdio } from "./mcp.js";
+import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, type PluginAgent } from "./plugin-install.js";
 import { runLaunch, runTestPi, isLaunchClient, type ClientName } from "./launcher.js";
 import { exportSession } from "./export.js";
 import { readFileSync } from "node:fs";
@@ -65,6 +66,13 @@ Usage:
   bili export [session] [--full]   list sessions / export one as a Markdown handoff
                                     (--full includes original messages; --output FILE)
   bili update                      check for & install a newer version now
+  bili plugin install <agent>      install the thin plugin into a host (pi/omp/
+                                    claude/codex/opencode; original backed up once)
+  bili plugin remove <agent>       remove it again
+  bili plugin list                 show install status for every host
+  bili mcp                         run the bili MCP server standalone (stdio)
+  bili plugin-register <id>        pre-bind a conversation to the plugin mode
+                                    (--origin URL, --agent name)
   bili --version                   print version
   bili --help                      show this help
 
@@ -101,7 +109,7 @@ Docs: https://github.com/ranxianglei/billion-context
 `;
 
 type Parsed = {
-    command: "start" | "update" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp";
+    command: "start" | "update" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp" | "plugin";
     client?: ClientName;
     clientArgs: string[];
     mitmDomains: string[];
@@ -109,6 +117,9 @@ type Parsed = {
     exportSelector?: string;
     exportOutput?: string;
     exportFull?: boolean;
+    registerConversationId?: string;
+    pluginAction?: "install" | "remove" | "list";
+    pluginAgent?: PluginAgent;
 };
 
 export function parseArgs(argv: string[]): Parsed {
@@ -119,8 +130,11 @@ export function parseArgs(argv: string[]): Parsed {
     let clientArgs: string[] = [];
     const mitmDomains: string[] = [];
     let exportSelector: string | undefined;
+    let registerConversationId: string | undefined;
     let exportOutput: string | undefined;
     let exportFull = false;
+    let pluginAction: Parsed["pluginAction"];
+    let pluginAgent: Parsed["pluginAgent"];
 
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i]!;
@@ -173,15 +187,19 @@ export function parseArgs(argv: string[]): Parsed {
             }
             case "--port":
             case "--host":
-            case "--config": {
+            case "--config":
+            case "--origin":
+            case "--agent": {
                 const val = argv[++i];
-                if (val === undefined) {
-                    console.error(`bili: ${a} requires a value`);
+                if (val === undefined || val.length === 0) {
+                    console.error(`bili: ${a} requires a non-empty value`);
                     process.exit(2);
                 }
                 if (a === "--port") overrides.ACP_PORT = val;
                 else if (a === "--host") overrides.ACP_HOST = val;
-                else overrides.BILI_CONFIG_FILE = val;
+                else if (a === "--config") overrides.BILI_CONFIG_FILE = val;
+                else if (a === "--origin") overrides.BILI_MCP_PROXY = val;
+                else overrides.BILI_PLUGIN_AGENT = val;
                 break;
             }
             default:
@@ -215,9 +233,30 @@ export function parseArgs(argv: string[]): Parsed {
             exportSelector = positional[1];
         } else if (cmd === "plugin-register") {
             command = "plugin-register";
-            exportSelector = positional[1]; // conversation id
+            registerConversationId = positional[1];
         } else if (cmd === "mcp") {
             command = "mcp";
+        } else if (cmd === "plugin") {
+            command = "plugin";
+            const action = positional[1];
+            if (action === "install" || action === "remove" || action === "list") {
+                pluginAction = action;
+            } else {
+                console.error(`bili plugin: unknown action "${action ?? ""}" (try "bili plugin install|remove|list <agent>")`);
+                process.exit(2);
+            }
+            const agent = positional[2];
+            if (agent !== undefined) {
+                if (!isPluginAgent(agent)) {
+                    console.error(`bili plugin: unknown agent "${agent}" (try one of: ${PLUGIN_AGENTS.join(", ")})`);
+                    process.exit(2);
+                }
+                pluginAgent = agent;
+            }
+            if (pluginAction !== "list" && pluginAgent === undefined) {
+                console.error(`bili plugin ${pluginAction}: agent is required (try one of: ${PLUGIN_AGENTS.join(", ")})`);
+                process.exit(2);
+            }
         } else if (cmd === "test") {
             const target = positional[1];
             if (target && isLaunchClient(target)) {
@@ -233,11 +272,11 @@ export function parseArgs(argv: string[]): Parsed {
         }
     }
 
-    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull };
+    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, registerConversationId, pluginAction, pluginAgent };
 }
 
 export async function main(): Promise<void> {
-    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull } = parseArgs(process.argv.slice(2));
+    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, registerConversationId, pluginAction, pluginAgent } = parseArgs(process.argv.slice(2));
     if (command === "help") {
         process.stdout.write(HELP);
         return;
@@ -247,17 +286,19 @@ export async function main(): Promise<void> {
         return;
     }
     if (command === "plugin-register") {
-        const conversationId = exportSelector?.trim();
+        const conversationId = registerConversationId?.trim();
         if (!conversationId) {
-            console.error('bili plugin-register: conversation id is required (e.g. bili plugin-register "$CLAUDE_SESSION_ID" --origin http://127.0.0.1:8787)');
+            console.error('bili plugin-register: conversation id is required (e.g. bili plugin-register "$CLAUDE_SESSION_ID" --origin http://127.0.0.1:8787 --agent claude)');
             process.exit(2);
         }
+        const agent = (overrides.BILI_PLUGIN_AGENT ?? process.env.BILI_PLUGIN_AGENT ?? "claude").trim() || "claude";
         const origin = (overrides.BILI_MCP_PROXY ?? process.env.BILI_MCP_PROXY ?? "http://127.0.0.1:8787").replace(/\/$/, "");
         try {
             const res = await fetch(`${origin}/__bili/plugin/register`, {
                 method: "POST",
                 headers: { "content-type": "application/json" },
-                body: JSON.stringify({ conversationId, agent: "claude", identity: true }),
+                body: JSON.stringify({ conversationId, agent, identity: true }),
+                signal: AbortSignal.timeout(5000),
             });
             const data = (await res.json()) as { ok?: boolean; error?: string };
             if (!res.ok || !data.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
@@ -270,6 +311,38 @@ export async function main(): Promise<void> {
     if (command === "mcp") {
         runMcpStdio();
         return;
+    }
+    if (command === "plugin") {
+        // Installers read resolveProxyOrigin() (env first) at dispatch time.
+        // Apply --origin BEFORE handling the subcommand: the generic env
+        // merge further down runs only on the server path, which this
+        // branch returns ahead of — without this, a stale ~/.bili/
+        // proxy-origin discovery file would silently win over the flag.
+        if (overrides.BILI_MCP_PROXY !== undefined) process.env.BILI_MCP_PROXY = overrides.BILI_MCP_PROXY;
+        if (pluginAction === "list") {
+            for (const row of pluginStatusAll()) {
+                console.log(`${row.agent.padEnd(10)} ${row.status}`);
+            }
+            return;
+        }
+        if (pluginAction === "install") {
+            try {
+                console.log(pluginInstall(pluginAgent!));
+            } catch (error) {
+                console.error(`bili plugin: ${error instanceof Error ? error.message : String(error)}`);
+                process.exit(1);
+            }
+            return;
+        }
+        if (pluginAction === "remove") {
+            try {
+                console.log(pluginRemove(pluginAgent!));
+            } catch (error) {
+                console.error(`bili plugin: ${error instanceof Error ? error.message : String(error)}`);
+                process.exit(1);
+            }
+            return;
+        }
     }
     if (command === "export") {
         try {

@@ -62,6 +62,12 @@ export function defaultLogFile(): string {
     return path.join(stateDir(), "bili.log");
 }
 
+/** Origin of the most recently started proxy (best-effort discovery file for
+ *  host-spawned MCP shells that have no env passthrough: opencode/claude/codex). */
+export function proxyOriginFile(): string {
+    return path.join(stateDir(), "proxy-origin");
+}
+
 /** CA dir: root CA + dynamically-signed host certificates for MITM mode.
  *  Lives under the data dir (the private key is sensitive but regenerable).
  *  Created lazily by ca.ts on first MITM use. */

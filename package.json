@@ -58,6 +58,11 @@
     "README.md",
     "LICENSE"
   ],
+  "pi": {
+    "extensions": [
+      "./dist/agent/pi.js"
+    ]
+  },
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org"
