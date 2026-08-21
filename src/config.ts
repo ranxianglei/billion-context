@@ -271,7 +271,8 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
     if (!Number.isInteger(port) || port < 1 || port > 65535) {
         throw new Error(`Invalid port ${Number.isNaN(port) ? "(not a number)" : port}; must be 1-65535`);
     }
-    const host = env.ACP_HOST ?? fileConfig.host ?? "127.0.0.1";
+    const rawHost = env.ACP_HOST ?? fileConfig.host ?? "127.0.0.1";
+    const host = rawHost === "localhost" ? "127.0.0.1" : rawHost;
     const upstream = (env.ACP_UPSTREAM ?? fileConfig.upstream ?? "https://api.anthropic.com").replace(/\/$/, "");
     const routes = loadRoutes(env);
     const modelContextLimit = parseInt(env.ACP_MODEL_CONTEXT_LIMIT ?? `${fileConfig.modelContextLimit ?? 200000}`, 10);
