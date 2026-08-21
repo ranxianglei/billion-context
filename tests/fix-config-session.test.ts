@@ -102,6 +102,12 @@ test("loadOptions: PORT env also validated (ACP_PORT absent)", () => {
     assert.throws(() => loadOptions({ PORT: "99999" }), /Invalid port/);
 });
 
+test("loadOptions: ACP_HOST=localhost is normalized to 127.0.0.1; explicit hosts pass through", () => {
+    assert.equal(loadOptions({ ACP_HOST: "localhost" }).host, "127.0.0.1");
+    assert.equal(loadOptions({ ACP_HOST: "0.0.0.0" }).host, "0.0.0.0");
+    assert.equal(loadOptions({ ACP_HOST: "::1" }).host, "::1");
+});
+
 // --- Bug 3: getSession must not exceed MAX_SESSIONS when eviction can't free
 //     an in-flight slot; pool-exhausted throws instead of growing the Map. ---
 

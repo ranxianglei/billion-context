@@ -5,8 +5,9 @@ import { createCore, createInitialState } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 import { runCompressLoop, createResponsesAdapter } from "../src/loop/index.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
+import type { WireProtocol } from "../src/util.ts";
 
-function makeCtx(messages: CoreMessage[] = []): {
+function makeCtx(messages: CoreMessage[] = [], protocol?: WireProtocol): {
     core: ReturnType<typeof createCore>;
     config: Config;
     messages: CoreMessage[];
@@ -14,6 +15,7 @@ function makeCtx(messages: CoreMessage[] = []): {
     log: (m: string) => void;
     proxyUrl?: string;
     textProtocol?: boolean;
+    protocol?: WireProtocol;
 } {
     return {
         core: createCore(),
@@ -32,6 +34,7 @@ function makeCtx(messages: CoreMessage[] = []): {
             persisted: false,
         },
         log: () => {},
+        protocol,
     };
 }
 
@@ -189,4 +192,49 @@ test("loop #5: limit-hit graceful — 10 mutating rounds never degenerate empty,
     } finally {
         globalThis.fetch = orig;
     }
+});
+
+// Regression guard: the server's runCompressLoop caller used to build LoopCtx
+// WITHOUT `protocol`, so recordUsage treated every protocol as Anthropic-style
+// (prompt + cached) and double-counted cached tokens for OpenAI/Responses
+// streams. The responses adapter reports input_tokens as the TOTAL (cached
+// already included) — assert both the fixed path (protocol set) and the
+// documented default (protocol unset → legacy additive behavior).
+const USAGE_COMPLETED = sse("response.completed", {
+    response: {
+        id: "resp_usage",
+        status: "completed",
+        output: [],
+        usage: {
+            input_tokens: 1000,
+            output_tokens: 10,
+            input_tokens_details: { cached_tokens: 900 },
+        },
+    },
+});
+
+test("loop usage: protocol='responses' → cached NOT double-counted (input_tokens is the total)", async () => {
+    const ctx = makeCtx([], "responses");
+    await drain(
+        new Response(USAGE_COMPLETED, { status: 200 }).body!,
+        ctx,
+        { model: "gpt-4o", input: [], stream: true },
+        { url: "http://mock", headers: {} },
+    );
+    assert.equal(ctx.session.stats.inputTokens, 1000, "total = input_tokens (1000), NOT 1900");
+    assert.equal(ctx.session.stats.lastInputTokens, 1000);
+    assert.equal(ctx.session.stats.cachedTokens, 900);
+    assert.equal(ctx.session.stats.cacheSamples, 1);
+});
+
+test("loop usage: protocol unset → legacy additive behavior (prompt + cached)", async () => {
+    const ctx = makeCtx();
+    await drain(
+        new Response(USAGE_COMPLETED, { status: 200 }).body!,
+        ctx,
+        { model: "gpt-4o", input: [], stream: true },
+        { url: "http://mock", headers: {} },
+    );
+    assert.equal(ctx.session.stats.inputTokens, 1900, "no protocol → prompt + cached (1000 + 900)");
+    assert.equal(ctx.session.stats.cachedTokens, 900);
 });

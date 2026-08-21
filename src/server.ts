@@ -56,7 +56,7 @@ import { deriveSessionId as deriveProxySessionId, affinityToken, clientConversat
 import { consumePluginRegisterFor, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, pipePluginJson, pipeThroughWithUsage, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
-import { isLoopbackAddress } from "./util.js";
+import { isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, shouldReserveOutputHeadroom, usageTotals } from "./util.js";
 
 import { decodeRequestBody } from "./content-encoding.js";
 
@@ -188,6 +188,24 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 res.end();
             }
         }
+    });
+    // Bili does not support WebSocket. An explicit 'upgrade' listener is
+    // required: without one Node's behavior is version-dependent (some
+    // versions destroy the socket with no response), delaying clients with
+    // built-in fast-fallback (e.g. Codex) that need a clean 426 to switch to
+    // HTTP POST immediately.
+    server.on("upgrade", (req, socket) => {
+        log("info", `[ws] rejected ${req.method} ${req.url ?? ""} host=${req.headers.host ?? "?"} with 426`);
+        socket.on("error", () => {}); // client may vanish mid-write; don't let ECONNRESET crash the process
+        const body = JSON.stringify({ error: "WebSocket upgrades are not supported; use HTTP POST" });
+        socket.end(
+            "HTTP/1.1 426 Upgrade Required\r\n" +
+                "Connection: close\r\n" +
+                "Content-Type: application/json\r\n" +
+                `Content-Length: ${Buffer.byteLength(body)}\r\n` +
+                "\r\n" +
+                body,
+        );
     });
     if (opts.mitm.enabled) {
         setupMitm(server, opts.mitm.domains, (msg) => log("info", msg), (host) => resolveProxy(opts.routes, opts.proxy, `https://${host}`, opts.proxyFallback));
@@ -504,13 +522,9 @@ async function handle(
         }
     }
 
-    // Bili does not support WebSocket — reject any upgrade with 426 so clients
-    // with built-in fast-fallback (e.g. Codex supports_websockets=true) retry over HTTP POST.
-    if (req.headers.upgrade === "websocket") {
-        res.writeHead(426, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: "WebSocket upgrades are not supported; use HTTP POST" }));
-        return;
-    }
+    // NOTE: WebSocket upgrades are answered by the dedicated 'upgrade' listener
+    // in startServer() (above), which is the only reliable path — Node routes
+    // upgrade requests there and never to this request handler.
     let bodyBuffer: Buffer;
     let urlPath: string;
     let responsesCompact: boolean;
@@ -704,6 +718,47 @@ async function handle(
             recordPluginSession(pluginConversation ?? conversation, session.id);
         }
         const pluginMode = pluginAgent !== undefined;
+        // Self-heal the context window: a prior upstream overflow may have
+        // taught us the real window (forward()'s overflow detection persists it
+        // to metadata.learnedContextLimits, keyed by model, or the legacy scalar
+        // metadata.learnedContextLimit). If it is smaller than what we resolved this
+        // turn (e.g. the 200k fallback for an unknown model on a relay), re-center
+        // the kernel on it so the nudge/truncate bands sit below the real limit
+        // instead of above it. A limit learned for a DIFFERENT model does not
+        // apply — the user can switch models mid-conversation (same session),
+        // and a stale smaller window would cap the bigger model prematurely.
+        // Spread into a new object — never mutate the shared global config.
+        const reqModel = (parsed as { model?: string }).model;
+        const learnedMap = session.metadata.learnedContextLimits as Record<string, number> | undefined;
+        const learnedLimit =
+            (reqModel && learnedMap ? learnedMap[reqModel] : undefined) ??
+            (session.metadata.learnedContextLimit as number | undefined);
+        if (learnedLimit && learnedLimit > 0 && learnedLimit < reqConfig.modelContextLimit) {
+            const resolved = reqConfig.modelContextLimit;
+            reqConfig = { ...reqConfig, modelContextLimit: learnedLimit };
+            log("info", `[${session.id}] self-healed context window: ${resolved} → ${learnedLimit} (learned from an upstream overflow)`);
+        }
+        // Reserve the model's OUTPUT budget for this turn from the window so the
+        // kernel's nudge/truncate bands sit below (window - maxOutput) and a
+        // context+output overflow can't happen on a small window (e.g. 100k with a
+        // large max_tokens — the most common "context blew up" cause; none of the
+        // three layers reserved room for the output before this). Anthropic is
+        // exempt: its input limit is enforced independently of max_tokens
+        // (separate output budget), so reserving would shift every band down by
+        // maxOutput on every session for no safety gain — see
+        // shouldReserveOutputHeadroom. max_tokens is the exact output budget
+        // requested for THIS turn, so the reservation is precise and per-request.
+        // Only reserve when it leaves a usable window (maxOutput < window);
+        // otherwise the request is degenerate (output >= whole window) and the
+        // self-heal above handles the resulting overflow. Feeds reqConfig (→
+        // processTurn `config`), so diagNudge shows the reserved window (no extra log).
+        if (shouldReserveOutputHeadroom(protocol)) {
+            const p = parsed as Record<string, unknown>;
+            const rawMax = p.max_tokens ?? p.max_completion_tokens ?? p.max_output_tokens;
+            const maxOutput = typeof rawMax === "number" ? rawMax : 0;
+            const reserved = reserveOutputHeadroom(reqConfig.modelContextLimit, maxOutput);
+            if (reserved !== reqConfig.modelContextLimit) reqConfig = { ...reqConfig, modelContextLimit: reserved };
+        }
         // acquireInFlight must precede the lock so evictOldest() cannot flush
         // this session between getSession and lock acquisition (inFlight===0
         // window). Released in the outer finally after forward completes.
@@ -1375,9 +1430,17 @@ async function forward(
         body: req.method === "GET" || req.method === "HEAD" ? undefined : body,
     };
     if (dispatcher) init.dispatcher = dispatcher;
+    // Must be created before fetchWithTimeout: the signal aborts the upstream
+    // request when the client disconnects (IDE cancel), otherwise the proxy
+    // keeps reading upstream and holds the per-session lock. Also passed to
+    // the rewriter loop below so fetch and loop stop together.
+    const clientAbort = new AbortController();
+    res.on("close", () => {
+        if (!res.writableEnded) clientAbort.abort();
+    });
     let upstreamResult: Awaited<ReturnType<typeof fetchWithTimeout>>;
     try {
-        upstreamResult = await fetchWithTimeout(upstreamUrl, init);
+        upstreamResult = await fetchWithTimeout(upstreamUrl, init, undefined, clientAbort.signal);
         recordUpstreamConnection(upstreamUrl, proxyUrl);
     } catch (error) {
         recordUpstreamConnection(upstreamUrl, proxyUrl, error);
@@ -1419,8 +1482,87 @@ async function forward(
     // (writeHead is done HERE, only in the error branch, so we never double-
     // write headers when a later branch would also call writeHead.)
     if (!upstream.ok) {
-        res.writeHead(upstream.status, respHeaders);
-        if (upstream.body) await pipeThrough(upstream.body, res);
+        // Buffer the (small) error body so a context overflow can be detected:
+        // when the configured window is wrong (e.g. the 200k fallback for an
+        // unknown model on a relay) an upstream 400 is the only reliable signal
+        // that the real window is smaller. Learn the window, arm an emergency
+        // shrink for the next turn, then pass the error through verbatim.
+        let errBody: Buffer | null = null;
+        if (upstream.body) {
+            try {
+                errBody = await readStreamToBuffer(upstream.body);
+            } catch {
+                errBody = null; // body consumed/broken — respond with status only
+            }
+        }
+        if (prepared?.session && errBody) {
+            const s = prepared.session;
+            const info = inspectContextOverflow(upstream.status, errBody.toString("utf8"));
+            if (info.isOverflow) {
+                // The request's model — the learned window only applies to the
+                // model that produced the overflow (per-model scoping: a stale
+                // limit from another model must not cap this one).
+                let reqModel: string | undefined;
+                try {
+                    const rawBody = typeof prepared.body === "string" ? prepared.body : prepared.body.toString("utf8");
+                    reqModel = (JSON.parse(rawBody) as { model?: string }).model;
+                } catch {
+                    reqModel = undefined; // non-JSON body — fall back to the legacy scalar
+                }
+                const learnedMap = (s.metadata.learnedContextLimits as Record<string, number> | undefined) ?? {};
+                if (info.window) {
+                    const prev = (reqModel ? learnedMap[reqModel] : undefined) ?? (s.metadata.learnedContextLimit as number | undefined);
+                    // Persist the real window to a STABLE field (effectiveContextLimit
+                    // is re-resolved every turn in plugin mode and would be overwritten);
+                    // handle() reads it (per model) to re-center the kernel next turn.
+                    if (reqModel) learnedMap[reqModel] = info.window;
+                    else s.metadata.learnedContextLimit = info.window;
+                    s.metadata.learnedContextLimits = learnedMap;
+                    log("warn", `[${s.id}] upstream context overflow — learned real window ${info.window} for ${reqModel ?? "(unknown model)"} (was ${prev ?? "unset"}); arming emergency shrink`);
+                } else {
+                    log("warn", `[${s.id}] upstream context overflow (window not parseable): ${info.message}`);
+                }
+                // Arm the emergency shrink: force the next turn's usage to >=100%
+                // so the kernel's emergency nudge + tool-result truncate fire.
+                // lastInputTokens is a lower bound here (the context overflowed,
+                // so it is at least the window); a real usage report from the
+                // next successful turn overwrites it.
+                const floor =
+                    info.window ??
+                    (reqModel ? learnedMap[reqModel] : undefined) ??
+                    (s.metadata.learnedContextLimit as number | undefined) ??
+                    (s.metadata.effectiveContextLimit as number | undefined) ??
+                    0;
+                if (floor > 0) s.stats.lastInputTokens = Math.max(s.stats.lastInputTokens, floor);
+                // The learned window (metadata) and the armed emergency
+                // (lastInputTokens) live in memory only until scheduled —
+                // the error path returns before forward()'s trailing
+                // markDirty, so schedule the save HERE or the self-heal is
+                // lost on restart and the next overflow must be re-learned.
+                markDirty(s);
+            }
+        }
+        // #174: always log a non-2xx upstream response (status + request-id +
+        // body snippet) — a 4xx/5xx with zero log trace is a diagnostic
+        // black hole (issue #2).
+        const errSid = prepared?.session.id ?? "unknown";
+        const reqId = upstream.headers.get("x-request-id") ?? upstream.headers.get("request-id");
+        const reqIdText = reqId ? ` request-id=${reqId}` : "";
+        const bodyText = errBody ? new TextDecoder().decode(errBody) : "";
+        let snippet = bodyText.slice(0, 600).replace(/\s+/g, " ").trim();
+        if (bodyText.length > 600) snippet += " …";
+        if (!snippet) snippet = "(no body)";
+        loggerLog("warn", `[${errSid}] ← upstream ${upstream.status}${reqIdText}: ${snippet}`);
+        const errHeaders: Record<string, string> = { ...respHeaders };
+        // Drop the upstream framing headers unconditionally: when errBody is
+        // present a fixed-length write replaces them, and when errBody is
+        // null (broken body stream) the response ends with no body — a
+        // content-length/transfer-encoding claiming bytes that never arrive
+        // would leave the client on a broken response.
+        delete errHeaders["content-length"];
+        delete errHeaders["transfer-encoding"];
+        res.writeHead(upstream.status, errHeaders);
+        res.end(errBody ?? undefined);
         clearUpstreamTimer();
         return;
     }
@@ -1441,9 +1583,9 @@ async function forward(
     // the next nudge decision) keeps tracking reality.
     if (prepared?.pluginMode) {
         if (prepared.stream) {
-            await pipeThroughWithUsage(upstream.body as ReadableStream<Uint8Array>, res, prepared.session);
+            await pipeThroughWithUsage(upstream.body as ReadableStream<Uint8Array>, res, prepared.session, prepared.protocol);
         } else {
-            await pipePluginJson(upstream.body as ReadableStream<Uint8Array>, res, prepared.session);
+            await pipePluginJson(upstream.body as ReadableStream<Uint8Array>, res, prepared.session, prepared.protocol);
         }
         clearUpstreamTimer();
         return;
@@ -1493,20 +1635,17 @@ async function forward(
             const textProtocol = prepared.protocol === "responses" && !!prepared.responsesTextProtocol;
             const systemPrompt = textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts);
             const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem);
-            const abortCtrl = new AbortController();
-            req.on("close", () => {
-                if (!res.writableEnded) abortCtrl.abort();
-            });
             const loop = runCompressLoop(
                 streamToRead,
-                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, textProtocol, debug: opts.debug, nudge: prepared.nudge },
+                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, protocol: prepared.protocol, textProtocol, debug: opts.debug, nudge: prepared.nudge },
                 parsedReq,
                 { url: upstreamUrl, headers: reqHeaders },
                 adapter,
                 systemPrompt,
-                abortCtrl.signal,
+                clientAbort.signal,
             );
             for await (const chunk of loop) {
+                if (res.destroyed || res.writableEnded) break;
                 {
                     const s = chunk.toString("utf8");
                     if (s.includes("\x3cacp ") || s.includes("\x3c/acp")) {
@@ -1559,15 +1698,14 @@ async function forward(
                 //   Anthropic: input_tokens / cache_read_input_tokens / output_tokens
                 //   OpenAI: prompt_tokens / prompt_tokens_details.cached_tokens / completion_tokens
                 //   Responses: input_tokens / input_tokens_details.cached_tokens / output_tokens
+                // usageTotals() normalizes the per-protocol semantics so
+                // `total` is always the true context size (see util.ts).
                 const u = (json.usage ?? {}) as Record<string, unknown>;
-                const prompt = u.prompt_tokens ?? u.input_tokens;
-                if (typeof prompt === "number") {
-                    prepared.session.stats.inputTokens += prompt;
-                    const promptDetails = u.prompt_tokens_details as Record<string, unknown> | undefined;
-                    const inputDetails = u.input_tokens_details as Record<string, unknown> | undefined;
-                    const cached = promptDetails?.cached_tokens ?? inputDetails?.cached_tokens ?? u.cache_read_input_tokens;
-                    // tokenCount = TOTAL context (new + cached); see anthropic branch.
-                    prepared.session.stats.lastInputTokens = prompt + (typeof cached === "number" ? cached : 0);
+                const { total, cached } = usageTotals(prepared.protocol, u);
+                if (typeof total === "number") {
+                    prepared.session.stats.inputTokens += total;
+                    // lastInputTokens = true TOTAL context (protocol-correct).
+                    prepared.session.stats.lastInputTokens = total;
                     if (typeof cached === "number") {
                         prepared.session.stats.cachedTokens += cached;
                         prepared.session.stats.cacheSamples += 1;
@@ -1593,6 +1731,35 @@ async function forward(
     // State may have mutated during response streaming (compress created a
     // block, decompress deactivated one) — persist the final snapshot.
     markDirty(prepared.session);
+}
+
+/** Read a (small) fetch Response body stream fully into a Buffer. Used for the
+ *  non-2xx error path, where we inspect the body for a context-overflow before
+ *  passing it through. Error bodies are small JSON, so full buffering is safe —
+ *  but the read is still CAPPED (maxBytes, default 1 MiB): a misbehaving upstream
+ *  that streams a huge error body must not spike memory. The stream is drained
+ *  either way (no backpressure deadlock, no discarded keep-alive connection); only
+ *  the retained bytes are capped. Overflow markers live in the first few hundred
+ *  bytes, so a cap never loses the signal. */
+async function readStreamToBuffer(stream: ReadableStream<Uint8Array>, maxBytes = 1 << 20): Promise<Buffer> {
+    const reader = stream.getReader();
+    const chunks: Buffer[] = [];
+    let kept = 0;
+    try {
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (value && kept < maxBytes) {
+                // Trim the final chunk so retained bytes never exceed maxBytes.
+                const take = Math.min(value.length, maxBytes - kept);
+                chunks.push(Buffer.from(value.subarray(0, take)));
+                kept += take;
+            }
+        }
+    } finally {
+        reader.releaseLock();
+    }
+    return Buffer.concat(chunks);
 }
 
 async function pipeThrough(stream: ReadableStream<Uint8Array>, res: http.ServerResponse): Promise<void> {

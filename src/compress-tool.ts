@@ -57,9 +57,19 @@ export function parseCompressInput(input: unknown, callId?: string): ParsedRange
         return [];
     }
     const obj = input as Record<string, unknown>;
+    // Accept JSON-string content (non-strict-tool providers stringify array args, e.g. vLLM openai-completions).
+    let content: unknown = obj.content;
+    if (typeof content === "string") {
+        try {
+            content = JSON.parse(content);
+        } catch {
+            loggerLog("warn", `[acp-compress-input] content is a string but not valid JSON; parsed 0 valid ranges`);
+            return [];
+        }
+    }
     const single = toRange(obj);
-    const ranges = Array.isArray(obj.content)
-        ? obj.content
+    const ranges = Array.isArray(content)
+        ? content
               .map((r) => toRange(r as Record<string, unknown>))
               .filter((r): r is ParsedRange => r !== null)
         : single

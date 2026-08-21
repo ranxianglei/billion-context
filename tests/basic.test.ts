@@ -143,6 +143,23 @@ test("parseCompressInput returns empty for malformed input", () => {
     assert.deepEqual(parseCompressInput({ content: [{ startId: "m1" }] }), []);
 });
 
+test("parseCompressInput accepts JSON-string content (non-strict providers stringify arrays)", () => {
+    const parsed = parseCompressInput({
+        content: JSON.stringify([
+            { startId: "m00001", endId: "m00010", summary: "first", topic: "intro" },
+            { startId: "m00020", endId: "m00030", summary: "second" },
+        ]),
+    });
+    assert.equal(parsed.length, 2);
+    assert.equal(parsed[0]?.startRef, "m00001");
+    assert.equal(parsed[0]?.endRef, "m00010");
+    assert.equal(parsed[0]?.summary, "first");
+    assert.equal(parsed[0]?.topic, "intro");
+    assert.equal(parsed[1]?.startRef, "m00020");
+    assert.equal(parsed[1]?.endRef, "m00030");
+    assert.deepEqual(parseCompressInput({ content: "not-json" }), []);
+});
+
 test("buildCompressSystemPrompt includes compression philosophy", () => {
     const prompt = buildCompressSystemPrompt();
     assert.ok(prompt.length > 100, "prompt should be substantial");

@@ -253,6 +253,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>): Compr
                 ? {
                       prompt_tokens: opts.usage.inputTokens,
                       completion_tokens: opts.usage.outputTokens,
+                      total_tokens: (opts.usage.inputTokens ?? 0) + (opts.usage.outputTokens ?? 0),
                       ...(typeof opts.usage.cachedTokens === "number"
                           ? { prompt_tokens_details: { cached_tokens: opts.usage.cachedTokens } }
                           : {}),
