@@ -1405,9 +1405,17 @@ async function forward(
         body: req.method === "GET" || req.method === "HEAD" ? undefined : body,
     };
     if (dispatcher) init.dispatcher = dispatcher;
+    // Must be created before fetchWithTimeout: the signal aborts the upstream
+    // request when the client disconnects (IDE cancel), otherwise the proxy
+    // keeps reading upstream and holds the per-session lock. Also passed to
+    // the rewriter loop below so fetch and loop stop together.
+    const clientAbort = new AbortController();
+    res.on("close", () => {
+        if (!res.writableEnded) clientAbort.abort();
+    });
     let upstreamResult: Awaited<ReturnType<typeof fetchWithTimeout>>;
     try {
-        upstreamResult = await fetchWithTimeout(upstreamUrl, init);
+        upstreamResult = await fetchWithTimeout(upstreamUrl, init, undefined, clientAbort.signal);
         recordUpstreamConnection(upstreamUrl, proxyUrl);
     } catch (error) {
         recordUpstreamConnection(upstreamUrl, proxyUrl, error);
@@ -1591,10 +1599,6 @@ async function forward(
             const textProtocol = prepared.protocol === "responses" && !!prepared.responsesTextProtocol;
             const systemPrompt = textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts);
             const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem);
-            const abortCtrl = new AbortController();
-            req.on("close", () => {
-                if (!res.writableEnded) abortCtrl.abort();
-            });
             const loop = runCompressLoop(
                 streamToRead,
                 { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, protocol: prepared.protocol, textProtocol, debug: opts.debug, nudge: prepared.nudge },
@@ -1602,9 +1606,10 @@ async function forward(
                 { url: upstreamUrl, headers: reqHeaders },
                 adapter,
                 systemPrompt,
-                abortCtrl.signal,
+                clientAbort.signal,
             );
             for await (const chunk of loop) {
+                if (res.destroyed || res.writableEnded) break;
                 {
                     const s = chunk.toString("utf8");
                     if (s.includes("\x3cacp ") || s.includes("\x3c/acp")) {
