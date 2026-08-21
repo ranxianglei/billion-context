@@ -103,6 +103,7 @@ async function handleMessage(msg: {
                     headers: { "content-type": "application/json" },
                     body: JSON.stringify({ conversationId, agent: "mcp", identity: IDENTITY_BINDING }),
                 });
+                registered = true; // issue-once: a repeated initialize must not re-register
                 if (IDENTITY_BINDING) {
                     // Identity-mode binding survives any arrival order —
                     // respond immediately so pipelined hosts are not stuck

@@ -89,7 +89,11 @@ const remembered = new Map<string, RememberedMessages>();
 export function recordPluginSession(conversationId: string, sessionId: string): void {
     conversations.delete(conversationId);
     conversations.set(conversationId, { sessionId, lastSeen: Date.now() });
-    remembered.delete(sessionId);
+    // remembered[sessionId] is intentionally left alone here: this runs OUTSIDE
+    // the session lock. rememberPluginMessages() rewrites it under the lock
+    // after forward(), and the tool API reads it under the lock — so no
+    // out-of-lock mutation that could leave a concurrent tool call on a stale
+    // (empty) snapshot.
     if (conversations.size > MAX_PLUGIN_CONVERSATIONS) {
         const oldest = conversations.keys().next().value;
         if (oldest !== undefined) conversations.delete(oldest);
@@ -286,22 +290,26 @@ export async function handlePluginTool(
     }
     entry.lastSeen = Date.now();
     const args = parsed.args && typeof parsed.args === "object" ? (parsed.args as Record<string, unknown>) : {};
-    const mem = remembered.get(session.id);
-    const messages = mem ? (mem.processed.length > 0 ? mem.processed : mem.original) : [];
     const callId = `plugin_${Date.now().toString(36)}`;
     acquireInFlight(session);
     let result: string;
     try {
-        result = await withSessionLock(session, async () =>
-            executeProxyTool(tool, args, {
+        result = await withSessionLock(session, async () => {
+            // Read the remembered snapshot UNDER the session lock: the model
+            // request rewrites remembered atomically under this same lock
+            // (rememberPluginMessages), so a racing tool call sees a consistent
+            // state instead of a stale/empty window.
+            const mem = remembered.get(session.id);
+            const messages = mem ? (mem.processed.length > 0 ? mem.processed : mem.original) : [];
+            return executeProxyTool(tool, args, {
                 core: deps.core,
                 config: deps.config,
                 messages,
                 session,
                 log: (m) => deps.log("info", `[${session.id}] [plugin] ${m}`),
                 nudge: mem?.nudge,
-            }, callId),
-        );
+            }, callId);
+        });
     } catch (err) {
         releaseInFlight(session);
         deps.log("warn", `[${session.id}] [plugin] tool ${tool} threw: ${String(err)}`);
