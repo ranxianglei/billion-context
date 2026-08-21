@@ -24,6 +24,31 @@ import type { WireProtocol } from "../util.js";
 
 export const MAX_LOOP_ROUNDS = 10;
 
+/** #156: identity of a round's failed compress call(s): the requested refs
+ * plus the failure text with volatile numbers collapsed, so "Summary too
+ * short (28 chars…)" and "(31 chars…)" count as the same failure. Two
+ * consecutive rounds with the same signature mean the model re-sent the
+ * same bad request and cannot self-correct — re-requesting again just
+ * burns upstream calls (field logs showed all 10 rounds wasted). */
+function compressFailureSignature(proxyResults: { name: string; result: string; arguments: string }[]): string | null {
+    const parts: string[] = [];
+    for (const pr of proxyResults) {
+        if (pr.name !== "compress" || !pr.result.includes("FAILED")) continue;
+        let args: unknown;
+        try {
+            args = pr.arguments.length > 0 ? JSON.parse(pr.arguments) : {};
+        } catch {
+            args = {};
+        }
+        const ranges = parseCompressInput(args);
+        const rangeKey = ranges.length > 0
+            ? ranges.map((r) => `${r.startRef}..${r.endRef}`).join("+")
+            : pr.arguments.replace(/\s+/g, "");
+        parts.push(`${rangeKey} :: ${pr.result.replace(/\d+/g, "#").replace(/\s+/g, " ")}`);
+    }
+    return parts.length > 0 ? parts.sort().join(" | ") : null;
+}
+
 export interface LoopCtx {
     core: CompressionCore;
     config: Config;
@@ -187,6 +212,9 @@ export async function* runCompressLoop(
     let activeClearTimer: (() => void) | null = null;
     let currentUpstream = upstream;
     const coreMessages: CoreMessage[] = [...ctx.messages];
+    // #156: signature of the previous round's failed compress call(s), used
+    // to short-circuit loops where the model repeats the identical failure.
+    let prevCompressFailureSig: string | null = null;
 
     try {
         for (let round = 1; round <= MAX_LOOP_ROUNDS; round++) {
@@ -369,6 +397,20 @@ export async function* runCompressLoop(
                 if (tc.passthrough) continue;
                 yield adapter.emitToolCall(tc);
             }
+
+            // #156: identical compress failures in consecutive rounds mean
+            // the model cannot self-correct (small models were observed
+            // burning all MAX_LOOP_ROUNDS on the same range + same
+            // validation error). Complete gracefully after the second
+            // identical failure instead of re-requesting a third time.
+            const failureSig = compressFailureSignature(proxyResults);
+            if (failureSig !== null && failureSig === prevCompressFailureSig) {
+                ctx.log(`[acp-loop] round ${round}: identical compress failure twice; completing instead of re-requesting`);
+                loggerLog("warn", `[acp-loop] compress loop short-circuited (identical failure twice): ${failureSig}`);
+                yield adapter.emitCompletion({ finishReason: "length", usage });
+                return;
+            }
+            prevCompressFailureSig = failureSig;
 
             // Re-request so the model receives the proxy-tool result and can
             // continue (standard function-calling continuation: the proxy acts as

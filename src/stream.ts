@@ -216,7 +216,7 @@ function executeAnthropicProxyTool(toolName: string, args: Record<string, unknow
 export function applyRanges(ranges: ReturnType<typeof parseCompressInput>, ctx: RewriteCtx): string {
     if (ranges.length === 0) {
         ctx.log("[acp-proxy: compress call had no valid ranges; nothing compressed.]");
-        return "[Compression FAILED: no valid ranges parsed from the tool call. Check your startId/endId parameters.]";
+        return "[Compression FAILED: no valid ranges parsed from the tool call. Each range must be an object with string startId/endId refs (e.g. m00001) and a non-empty summary; run acp_status to list currently valid refs.]";
     }
     ctx.log(`[acp-proxy: compress requested ${ranges.length} range(s): ${ranges.map((r) => `${r.startRef}–${r.endRef}`).join(", ")}]`);
     ctx.log(`[acp-proxy: ctx has ${ctx.messages.length} message(s), state has ${ctx.session.state.messageRefs?.byRef?.size ?? "?"} ref(s) mapped]`);

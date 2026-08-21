@@ -49,10 +49,14 @@ function fcEvents(outputIndex: number, callId: string, name: string, args: strin
 
 const COMPLETED = sse("response.completed", { response: { id: "resp_done", status: "completed", output: [] } });
 
-function mutatingRound(): string {
+/** A round whose compress call deterministically FAILS (no ref map in
+ * makeCtx()). `round` varies the requested refs so consecutive rounds have
+ * distinct failure signatures — the #156 identical-failure short-circuit
+ * must not fire in these tests. */
+function mutatingRound(round = 1): string {
     return [
         sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
-        fcEvents(0, "call_c", "compress", JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "s" }] })),
+        fcEvents(0, "call_c", "compress", JSON.stringify({ content: [{ startId: `m${String(round).padStart(5, "0")}`, endId: `m${String(round + 1).padStart(5, "0")}`, summary: "s" }] })),
         COMPLETED,
     ].join("");
 }
@@ -110,9 +114,12 @@ test("client-abort: signal aborted during a re-request stops further re-requests
 });
 
 test("client-abort control: without a signal, mutating rounds keep re-requesting up to the loop limit", async () => {
+    // #156 note: the fetch mock varies the failing range each round so the
+    // identical-failure short-circuit stays out of the picture — what stops
+    // this loop must be the round limit, not a signal and not short-circuit.
     let fetchCalls = 0;
     const orig = globalThis.fetch;
-    globalThis.fetch = (() => { fetchCalls++; return new Response(mutatingRound(), { status: 200 }); }) as typeof fetch;
+    globalThis.fetch = (() => { fetchCalls++; return new Response(mutatingRound(fetchCalls + 1), { status: 200 }); }) as typeof fetch;
     try {
         await drainSig(new Response(mutatingRound(), { status: 200 }).body!, makeCtx(), undefined);
         assert.ok(fetchCalls > 1, `control path re-requested multiple times (fetchCalls=${fetchCalls}); abort is what stops it`);
