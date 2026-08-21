@@ -114,6 +114,95 @@ async function readDiskVersion(installDir: string): Promise<string | undefined> 
     }
 }
 
+/** Declared loadable entries of a package.json: `main` plus every `bin`
+ *  value (string or map form), deduped. Exported for tests. */
+export function declaredEntryRelPaths(pkg: { main?: unknown; bin?: unknown }): string[] {
+    const entries = new Set<string>();
+    if (typeof pkg.main === "string") entries.add(pkg.main);
+    const bin = pkg.bin;
+    if (typeof bin === "string") entries.add(bin);
+    else if (bin && typeof bin === "object") {
+        for (const v of Object.values(bin)) {
+            if (typeof v === "string") entries.add(v);
+        }
+    }
+    return [...entries];
+}
+
+/** Run `node --check` on a file in a child process. Never throws. */
+function runNodeCheck(file: string): Promise<{ code: number; stderr: string }> {
+    return new Promise((resolve) => {
+        execFile(
+            process.execPath,
+            ["--check", file],
+            { timeout: 15_000, maxBuffer: 4 * 1024 * 1024 },
+            (err, _stdout, stderr) => {
+                resolve({ code: err ? 1 : 0, stderr: String(stderr) });
+            },
+        );
+    });
+}
+
+/**
+ * Syntax-check an ESM entry with `node --check`. The entry is copied to a
+ * `.mjs` temp first: extension-based module-goal detection is the only signal
+ * `--check` honors consistently across Node versions, and the entry must not
+ * be *executed* (running it would start the CLI/server).
+ * Returns null on success or a short reason on failure.
+ */
+async function syntaxCheckEntry(entryAbs: string): Promise<string | null> {
+    let source: string;
+    try {
+        source = await readFile(entryAbs, "utf-8");
+    } catch (e) {
+        return `entry unreadable: ${String(e)}`;
+    }
+    const tmpCheck = path.join(cacheDir(), ".update-syntax-check.mjs");
+    try {
+        await mkdir(cacheDir(), { recursive: true });
+        await writeFile(tmpCheck, source);
+        const r = await runNodeCheck(tmpCheck);
+        if (r.code !== 0) {
+            return `entry does not parse (${path.basename(entryAbs)}): ${r.stderr.split("\n").filter(Boolean).slice(0, 3).join(" | ").slice(0, 300)}`;
+        }
+        return null;
+    } finally {
+        try {
+            await rm(tmpCheck, { force: true });
+        } catch {
+            // best-effort cleanup
+        }
+    }
+}
+
+/**
+ * Verify that every entry a broken publish could forget (main, bins) exists
+ * and parses. Used against the staging dir before the install dir is touched
+ * and against the install dir after the copy. Returns null or the reason.
+ */
+async function verifyEntries(dir: string, label: string): Promise<string | null> {
+    let pkg: { main?: unknown; bin?: unknown };
+    try {
+        pkg = JSON.parse(await readFile(path.join(dir, "package.json"), "utf-8"));
+    } catch (e) {
+        return `${label}: package.json unreadable: ${String(e)}`;
+    }
+    const entries = declaredEntryRelPaths(pkg);
+    if (entries.length === 0) {
+        return `${label}: no declared entry (main/bin)`;
+    }
+    for (const rel of entries) {
+        try {
+            await access(path.join(dir, rel));
+        } catch {
+            return `${label}: entry missing: ${rel}`;
+        }
+        const reason = await syntaxCheckEntry(path.join(dir, rel));
+        if (reason) return `${label}: ${reason}`;
+    }
+    return null;
+}
+
 /**
  * Try to acquire an exclusive cross-process lock for updating.
  * Uses a lock file containing { pid, ts }. If the lock file exists and
@@ -333,7 +422,7 @@ export function verifyTarballIntegrity(buf: Buffer, integrity?: string, shasum?:
 /** Download the npm tarball, extract to a temp staging dir, verify, then copy
  *  over the install directory. */
 
-async function installViaTarball(
+export async function installViaTarball(
     version: string,
     tarballUrl: string,
     installDir: string | undefined,
@@ -420,29 +509,81 @@ async function installViaTarball(
         if (stagingVersion !== version) {
             return { ok: false, error: `staging verification failed: version is ${stagingVersion ?? "missing"}, expected ${version}` };
         }
+
+        // Broken-publish guard: a tarball can carry the right version but a
+        // missing or corrupt entry file (broken publish, partial upload).
+        // Catch it in staging — the install dir must never be touched by a
+        // package that cannot load, because a dead install can never update
+        // itself healthy again.
+        const stagingEntryErr = await verifyEntries(stagingDir, "staging verification failed");
+        if (stagingEntryErr) {
+            return { ok: false, error: stagingEntryErr };
+        }
     } catch (e) {
         return { ok: false, error: `extraction failed: ${String(e)}` };
     } finally {
         await rm(tmpFile, { force: true });
     }
 
+    // Back up the current install before overwriting. If anything fails after
+    // the copy (partial copy, version drift, corrupted entry), the backup is
+    // restored so the previously working version keeps running.
+    const backupDir = path.join(cacheDir(), `.update-backup-${version}`);
+    try {
+        await rm(backupDir, { recursive: true, force: true });
+        await cp(installDir, backupDir, { recursive: true, force: true });
+    } catch (e) {
+        // Fail closed: without a backup we refuse to overwrite the running
+        // install — the current version keeps working.
+        return { ok: false, error: `backup of current install failed (install left untouched): ${String(e)}` };
+    }
+
+    const restoreFromBackup = async (): Promise<string | null> => {
+        try {
+            await rm(installDir, { recursive: true, force: true });
+            await cp(backupDir, installDir, { recursive: true, force: true });
+            return null;
+        } catch (e) {
+            // Keep the backup dir — it is the only healthy copy left.
+            return `ROLLBACK FAILED — restore ${backupDir} to ${installDir} manually: ${String(e)}`;
+        }
+    };
+
     // Copy staging over install dir using Node's built-in fs.cp (Node 16.7+).
     // Cross-platform — no dependency on the `cp` binary (absent on Windows).
     // `recursive: true` + the trailing `/.` semantics: fs.cp copies the
     // *contents* of stagingDir into installDir, merging without nesting.
+    let copyError: string | null = null;
     try {
         await cp(stagingDir, installDir, { recursive: true, force: true });
     } catch (e) {
-        return { ok: false, error: `failed to copy to install dir: ${String(e)}` };
+        copyError = `failed to copy to install dir: ${String(e)}`;
     } finally {
         await rm(stagingDir, { recursive: true, force: true });
     }
+    if (copyError !== null) {
+        const rb = await restoreFromBackup();
+        return { ok: false, error: rb ?? copyError };
+    }
 
-    // Final verification
+    // Final verification: version must match and every declared entry must
+    // still parse on disk.
     const newVersion = await readDiskVersion(installDir);
     if (newVersion !== version) {
-        return { ok: false, error: `post-install verification failed: package.json version is ${newVersion ?? "missing"}, expected ${version}` };
+        const rb = await restoreFromBackup();
+        return {
+            ok: false,
+            error: rb ?? `post-install verification failed: package.json version is ${newVersion ?? "missing"}, expected ${version}`,
+        };
     }
+    const postEntryErr = await verifyEntries(installDir, "post-install verification failed");
+    if (postEntryErr) {
+        const rb = await restoreFromBackup();
+        return { ok: false, error: rb ?? postEntryErr };
+    }
+
+    // Success: the backup is no longer needed.
+    await rm(backupDir, { recursive: true, force: true });
 
     return { ok: true };
 }
