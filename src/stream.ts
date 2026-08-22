@@ -8,6 +8,10 @@ export type RewriteCtx = {
     core: CompressionCore;
     config: Config;
     messages: CoreMessage[];
+    /** View handed to applyCompression. Defaults to `messages`; hosts whose
+     *  `messages` view has pruned/hidden content (so block anchors can't
+     *  resolve) pass the unpruned log here (billion-context-pi#195). */
+    compressMessages?: CoreMessage[];
     session: Session;
     log: (msg: string) => void;
     debug?: boolean;
@@ -227,7 +231,7 @@ export function applyRanges(ranges: ReturnType<typeof parseCompressInput>, ctx: 
     try {
         const res = ctx.core.applyCompression({
             ranges,
-            messages: ctx.messages,
+            messages: ctx.compressMessages ?? ctx.messages,
             state: ctx.session.state,
             config: ctx.config,
         });
