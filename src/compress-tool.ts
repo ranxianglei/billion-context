@@ -1,4 +1,4 @@
-import { defaultPrompts, type Prompts } from "acp-kernel";
+import { defaultPrompts, salvageParseRanges, type Prompts } from "acp-kernel";
 import { log as loggerLog } from "./logger.js";
 
 export const COMPRESS_TOOL_NAME = "compress";
@@ -52,6 +52,12 @@ export type ParsedRange = {
 };
 
 export function parseCompressInput(input: unknown, callId?: string): ParsedRange[] {
+    if (typeof input === "string") {
+        // Raw arguments string (text-protocol triggers and stream tails hand
+        // us the unparsed arguments). Route through the kernel's lenient
+        // parser instead of strict JSON.parse — see omp#121.
+        return parseCompressInputString(input, callId);
+    }
     if (!input || typeof input !== "object") {
         loggerLog("warn", `[acp-compress-input] rejected: not object (${typeof input})`);
         return [];
@@ -63,8 +69,9 @@ export function parseCompressInput(input: unknown, callId?: string): ParsedRange
         try {
             content = JSON.parse(content);
         } catch {
-            loggerLog("warn", `[acp-compress-input] content is a string but not valid JSON; parsed 0 valid ranges`);
-            return [];
+            // Not valid JSON — try the kernel salvage ladder before giving up
+            // (truncation/repairs may still recover complete entries).
+            return parseCompressInputString(JSON.stringify(input), callId);
         }
     }
     const single = toRange(obj);
@@ -80,6 +87,30 @@ export function parseCompressInput(input: unknown, callId?: string): ParsedRange
     }
     if (callId) for (const r of ranges) r.compressCallId = callId;
     return ranges;
+}
+
+/** Lenient string path: kernel salvageParseRanges (5-layer ladder) with
+ *  evidence logging — the old code discarded raw args on parse failure, which
+ *  made the ~50% weak-model arg failure class undiagnosable (omp#121). */
+export function parseCompressInputString(raw: string, callId?: string): ParsedRange[] {
+    const res = salvageParseRanges(raw);
+    if (res.layer !== "json") {
+        loggerLog(
+            "warn",
+            `[acp-compress-input] lenient parse layer=${res.layer}: ${res.note}. ranges=${res.ranges.length}` +
+                (res.ranges.length === 0
+                    ? ` raw[:800]=${raw.slice(0, 800).replace(/\n/g, "\\n")} (len=${raw.length})`
+                    : ""),
+        );
+    }
+    const out: ParsedRange[] = res.ranges.map((r: { startRef: string; endRef: string; summary: string; topic?: string }) => ({
+        startRef: r.startRef,
+        endRef: r.endRef,
+        summary: r.summary,
+        ...(r.topic ? { topic: r.topic } : {}),
+    }));
+    if (callId) for (const r of out) r.compressCallId = callId;
+    return out;
 }
 
 function toRange(r: Record<string, unknown>): ParsedRange | null {

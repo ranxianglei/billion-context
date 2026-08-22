@@ -143,6 +143,46 @@ test("parseCompressInput returns empty for malformed input", () => {
     assert.deepEqual(parseCompressInput({ content: [{ startId: "m1" }] }), []);
 });
 
+test("parseCompressInput salvages raw truncated JSON args string (omp#121)", () => {
+    // Weak/local model emitted a truncated content array — strict parse fails,
+    // array-prefix salvage must recover the 2 complete entries.
+    const raw =
+        '{"content":[{"startId":"m00010","endId":"m00020","summary":"first"},{"startId":"m00030","endId":"m00040","summary":"secon';
+    const parsed = parseCompressInput(raw, "call-1");
+    assert.equal(parsed.length, 1);
+    assert.equal(parsed[0]?.startRef, "m00010");
+    assert.equal(parsed[0]?.endRef, "m00020");
+    assert.equal(parsed[0]?.summary, "first");
+    assert.equal(parsed[0]?.compressCallId, "call-1");
+});
+
+test("parseCompressInput repairs trailing commas and raw newlines", () => {
+    const raw = '{\n  "content": [\n    {"startId":"m00001","endId":"m00002","summary":"line1\\nline2"},\n  ],\n}';
+    const parsed = parseCompressInput(raw);
+    assert.equal(parsed.length, 1);
+    assert.equal(parsed[0]?.summary, "line1\nline2");
+});
+
+test("parseCompressInput extracts fields from prose-shaped args", () => {
+    // kernel gates field-regex summaries at >=50 chars (anti-garbage); use a realistic one
+    const long =
+        "Discussed the auth refactor: token refresh moved out of the request path into a background worker, plus rotation on privilege change.";
+    const raw = `compress from m00150 to m00220 with summary "${long}"`;
+    const parsed = parseCompressInput(raw);
+    assert.equal(parsed.length, 1);
+    assert.equal(parsed[0]?.startRef, "m00150");
+    assert.equal(parsed[0]?.endRef, "m00220");
+});
+
+test("parseCompressInputString salvages JSON-string content that is itself broken", () => {
+    // content was double-encoded then truncated mid-way
+    const input = { content: '[{"startId":"m00005","endId":"m00006","summary":"ok"},{"startId":"m0' };
+    const parsed = parseCompressInput(input);
+    assert.equal(parsed.length, 1);
+    assert.equal(parsed[0]?.startRef, "m00005");
+    assert.equal(parsed[0]?.summary, "ok");
+});
+
 test("parseCompressInput accepts JSON-string content (non-strict providers stringify arrays)", () => {
     const parsed = parseCompressInput({
         content: JSON.stringify([
