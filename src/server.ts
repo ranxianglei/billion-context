@@ -326,6 +326,10 @@ type Prepared = {
     resetAfterSuccess?: boolean;
     responsesProjection?: ResponsesProjection;
     anthropicSystem?: AnthropicRequestBody["system"];
+    /** Original leading system/developer prefix text captured by the kernel's
+     *  openai hoist (0.0.37). The fold space no longer carries it, so every
+     *  rebuilt payload and compress-loop round must re-inject it. */
+    openaiSystemText?: string;
     nudge?: NudgeDecision;
     /** Effective compression prompts for this request (three-level cascade,
      *  defaults to the kernel's defaultPrompts). Carried so the compress loop
@@ -926,7 +930,7 @@ function prepareOpenai(
     const sessionId = session.id;
     const stream = parsed.stream === true;
     ++session.stats.requests;
-
+    let openaiSystemText = "";
     let processedMessages: CoreMessage[] = [];
     let originalMessages: CoreMessage[] = [];
     let nudge: NudgeDecision | undefined;
@@ -945,7 +949,12 @@ function prepareOpenai(
     const injectTools = shouldInject && !pluginMode;
 
     try {
-        const { msgs } = openaiToCore(parsed);
+        // Kernel 0.0.37 hoists the contiguous leading system/developer prefix
+        // OUT of the fold space: system content is host runtime state and
+        // must not feed ids/fingerprints. Capture it and re-inject below —
+        // otherwise the proxy would forward payloads without any system.
+        const { msgs, systemText } = openaiToCore(parsed);
+        openaiSystemText = systemText;
         originalMessages = msgs;
         // tokenCount = upstream's real input_tokens from the previous turn
         // (see anthropic branch comment). Never an estimate.
@@ -975,6 +984,7 @@ function prepareOpenai(
         // instead, mirroring pai-acp's design. Putting the nudge in system
         // would invalidate the cache every turn.
         const sysParts: string[] = [];
+        if (systemText) sysParts.push(systemText);
         if (shouldInject) sysParts.push(buildCompressSystemPrompt(prompts));
         rebuiltMessages = injectOpenaiSystem(rebuiltMessages, sysParts);
         if (injectTools) {
@@ -1007,7 +1017,7 @@ function prepareOpenai(
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: injectTools, pluginMode, nudge, prompts } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: injectTools, pluginMode, nudge, prompts, openaiSystemText } as Prepared;
 }
 
 function prepareResponses(
@@ -1646,7 +1656,7 @@ async function forward(
             const reqHeaders = buildForwardHeaders(headers);
             const textProtocol = prepared.protocol === "responses" && !!prepared.responsesTextProtocol;
             const systemPrompt = textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts);
-            const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem);
+            const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText);
             const loop = runCompressLoop(
                 streamToRead,
                 { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, protocol: prepared.protocol, textProtocol, debug: opts.debug, nudge: prepared.nudge },
