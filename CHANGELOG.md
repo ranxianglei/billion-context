@@ -9,6 +9,10 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 - **Customizable compression prompts** (#156): the `compress` block now accepts `prompts` — an override object for the compression prompt text (`compressPhilosophy`, `howToCompressRules`, `tier2DistillRules`, `tier3CondenseRules`) — merged sub-field-wise across the three config levels (global → provider → model) and applied consistently to the system prompt, the nudge text, and the compress loop. Because the kernel's default rules are load-bearing (tuned over months of production use), overrides are **inert until `acknowledgePromptsRisk: true`** is set at the winning level; without it they are ignored and a one-time warning is logged. Non-string fields are silently dropped. Mainly useful for non-English or small-model prompt tuning.
 
+### Fixes
+
+- **acp-loop replay auto-retry on upstream risk-control rejections** (#189): after a `compress`, the acp-loop replay request can be rejected by provider risk-control — GLM Coding Plan returns `400 {"code":3007,"msg":"captcha verify failed"}` ~1s after the big context rewrite — and the error was passed straight into the agent session as `[acp-proxy: compress loop upstream error 400: ...]`. The replay request (both the streaming loop and the Responses-API JSON loop) now retries transient upstream failures with exponential backoff: up to 3 attempts total, base delay 1500ms doubling per attempt, overridable via `BILI_REPLAY_RETRY_BASE_MS` (ms; `0` disables the delay). Transient = HTTP 429/5xx, or any other 4xx whose body matches risk-control markers (`captcha`, `verify failed`, `risk control`, `风控`, `rate limit`, `too many requests`, `try again`); plain 4xx (bad model, bad params) still fail fast with no retry. Each retry logs a clear line (`upstream rejected replay (HTTP 400 ...); likely provider risk-control — retrying in 1500ms (attempt 1/3)`), and if all attempts fail the surfaced error now says `after 3 attempt(s)` so users can tell it was retried.
+
 ## [0.1.40] — 2026-08-13
 
 ### Features
