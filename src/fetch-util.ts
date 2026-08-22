@@ -111,6 +111,14 @@ export function isTransientUpstreamError(status: number, body: string): boolean 
 /** Total requests per replay attempt (initial + retries). */
 export const REPLAY_MAX_ATTEMPTS = 3;
 
+/** Total requests per replay attempt; overridable via BILI_REPLAY_RETRY_MAX
+ *  (1 = legacy fail-fast behavior, no retry). Read on each call so tests can
+ *  tune it live. */
+export function replayMaxAttempts(): number {
+    const raw = Number(process.env.BILI_REPLAY_RETRY_MAX);
+    return Number.isInteger(raw) && raw >= 1 ? raw : REPLAY_MAX_ATTEMPTS;
+}
+
 /** Base backoff delay in ms; overridable via BILI_REPLAY_RETRY_BASE_MS
  *  (0 disables the delay). Read on each call so tests can tune it live. */
 export function replayBaseDelayMs(): number {
@@ -144,6 +152,7 @@ export interface ReplayRetryInfo {
     status: number;
     detail: string;
     delayMs: number;
+    maxAttempts: number;
 }
 
 /** fetchWithTimeout with bounded retry on transient upstream HTTP failures.
@@ -158,15 +167,16 @@ export async function fetchWithRetry(
     externalSignal: AbortSignal | undefined,
     onRetry?: (info: ReplayRetryInfo) => void,
 ): Promise<{ response: Response; clearTimer: () => void }> {
+    const maxAttempts = replayMaxAttempts();
     for (let attempt = 1; ; attempt++) {
         const result = await fetchWithTimeout(url, opts, timeoutMs, externalSignal);
         if (result.response.ok) return result;
         const errText = await result.response.text().catch(() => "upstream error");
         result.clearTimer();
-        const lastAttempt = attempt >= REPLAY_MAX_ATTEMPTS;
+        const lastAttempt = attempt >= maxAttempts;
         if (!lastAttempt && isTransientUpstreamError(result.response.status, errText)) {
             const delayMs = replayBackoffMs(attempt);
-            onRetry?.({ attempt, status: result.response.status, detail: errText, delayMs });
+            onRetry?.({ attempt, status: result.response.status, detail: errText, delayMs, maxAttempts });
             await sleep(delayMs, externalSignal);
             continue;
         }

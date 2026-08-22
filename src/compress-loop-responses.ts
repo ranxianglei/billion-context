@@ -12,7 +12,7 @@ import { applyRanges } from "./stream.js";
 import { resolveDecompress } from "./decompress-shared.js";
 import { buildVisibilityMarker } from "./compress-loop.js";
 import { MAX_LOOP_ROUNDS } from "./loop/index.js";
-import { fetchWithRetry, UpstreamHttpError, REPLAY_MAX_ATTEMPTS } from "./fetch-util.js";
+import { fetchWithRetry, UpstreamHttpError } from "./fetch-util.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 
 /** Extract  triggers from assistant text.
@@ -217,8 +217,8 @@ export async function compressLoopResponsesJson(
             body: JSON.stringify(requestBody),
             ...(ctx.proxyUrl ? { dispatcher: proxyDispatcher(ctx.proxyUrl) } : {}),
         }, undefined, undefined, (info) => {
-            ctx.log(`[acp-proxy: responses upstream rejected replay (HTTP ${info.status}: ${info.detail.slice(0, 120)}); likely provider risk-control — retrying in ${info.delayMs}ms (attempt ${info.attempt}/${REPLAY_MAX_ATTEMPTS})]`);
-            loggerLog("warn", `[acp-compress-responses] upstream rejected replay (HTTP ${info.status}); retrying in ${info.delayMs}ms (attempt ${info.attempt}/${REPLAY_MAX_ATTEMPTS})`);
+            ctx.log(`[acp-proxy: responses upstream rejected replay (HTTP ${info.status}: ${info.detail.slice(0, 120)}); likely provider risk-control — retrying in ${info.delayMs}ms (attempt ${info.attempt}/${info.maxAttempts})]`);
+            loggerLog("warn", `[acp-compress-responses] upstream rejected replay (HTTP ${info.status}); retrying in ${info.delayMs}ms (attempt ${info.attempt}/${info.maxAttempts})`);
         }).catch((e) => {
             if (e instanceof UpstreamHttpError) {
                 const suffix = e.attempts > 1 ? ` after ${e.attempts} attempt(s)` : "";

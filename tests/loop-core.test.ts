@@ -6,7 +6,7 @@ import type { Session } from "../src/session.ts";
 import { runCompressLoop, createResponsesAdapter } from "../src/loop/index.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
 import type { WireProtocol } from "../src/util.ts";
-import { isTransientUpstreamError, REPLAY_MAX_ATTEMPTS, replayBackoffMs } from "../src/fetch-util.ts";
+import { isTransientUpstreamError, REPLAY_MAX_ATTEMPTS, replayBackoffMs, replayMaxAttempts } from "../src/fetch-util.ts";
 
 function makeCtx(messages: CoreMessage[] = [], protocol?: WireProtocol): {
     core: ReturnType<typeof createCore>;
@@ -371,4 +371,41 @@ test("replayBackoffMs: exponential from env-tunable base", () => {
         delete process.env.BILI_REPLAY_RETRY_BASE_MS;
     }
     assert.equal(replayBackoffMs(1), 1500, "default base is 1500ms");
+});
+
+test("replayMaxAttempts: env-tunable total attempts (1 = legacy no-retry)", () => {
+    for (const [value, expected] of [["1", 1], ["5", 5], ["0", REPLAY_MAX_ATTEMPTS], ["abc", REPLAY_MAX_ATTEMPTS], ["-2", REPLAY_MAX_ATTEMPTS]] as const) {
+        if (value === "abc") delete process.env.BILI_REPLAY_RETRY_MAX;
+        else process.env.BILI_REPLAY_RETRY_MAX = value;
+        try {
+            assert.equal(replayMaxAttempts(), expected, `BILI_REPLAY_RETRY_MAX=${value}`);
+        } finally {
+            delete process.env.BILI_REPLAY_RETRY_MAX;
+        }
+    }
+    assert.equal(replayMaxAttempts(), REPLAY_MAX_ATTEMPTS, "default is 3");
+});
+
+test("replay retry: BILI_REPLAY_RETRY_MAX=1 → legacy fail-fast (no retry)", async () => {
+    process.env.BILI_REPLAY_RETRY_MAX = "1";
+    let fetchCalls = 0;
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async () => {
+        fetchCalls++;
+        return new Response(CAPTCHA_400_BODY, { status: 400 });
+    }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(compressRound(), { status: 200 }).body!,
+            makeCtx(),
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.equal(fetchCalls, 1, "MAX=1 disables retries (legacy behavior)");
+        assert.ok(out.includes("upstream error 400"), "error surfaced to client");
+        assert.ok(!out.includes("attempt(s)"), "no attempt-count suffix on single attempt");
+    } finally {
+        delete process.env.BILI_REPLAY_RETRY_MAX;
+        globalThis.fetch = orig;
+    }
 });
