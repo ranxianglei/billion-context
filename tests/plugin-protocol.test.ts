@@ -304,7 +304,11 @@ test("plugin tool API executes compress under the session lock; next request fol
         assert.equal(h.captured.length, 2);
         const foldedRaw = JSON.parse(h.captured[1]!.body) as { messages: Array<{ role: string; content: unknown }> };
         const folded = JSON.stringify(foldedRaw);
-        assert.ok(!folded.includes("toolu_c_1"), `consumed compress tool_use must be hidden from upstream: ${folded.slice(0, 400)}`);
+        // acp-kernel 0.0.32 (reverts #18): KEEP_LAST_ORPHANED=2 keeps the newest
+        // two orphaned compress call+result pairs visible for failure observability.
+        // The plugin-side block carries a plugin_<ts> callId (not the model's
+        // tool_use id), so toolu_c_1 is orphaned and stays visible — not hidden.
+        assert.ok(folded.includes("toolu_c_1"), `newest orphaned compress tool_use stays visible (KEEP_LAST_ORPHANED=2): ${folded.slice(0, 400)}`);
         assert.ok(foldedRaw.messages.length < 12, `history must shrink after folding: got ${foldedRaw.messages.length}`);
         assert.ok(!folded.includes("turn-1-marker answer"), "compressed range content must be folded away");
 
