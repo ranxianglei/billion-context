@@ -43,7 +43,7 @@ async function* iterSseChunks(stream: ReadableStream<Uint8Array>): AsyncGenerato
     }
 }
 
-export function createOpenaiAdapter(requestBody: Record<string, unknown>): CompressLoopAdapter {
+export function createOpenaiAdapter(requestBody: Record<string, unknown>, clientSystem?: string): CompressLoopAdapter {
     const model = (requestBody.model as string) ?? "unknown";
     let responseId = `chatcmpl-proxy-${Date.now()}`;
     let toolIndex = 0;
@@ -113,8 +113,13 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>): Compr
 
     return {
         buildRequest(coreMessages, systemPrompt, body) {
+            // Kernel 0.0.37 hoists the leading system/developer prefix out of
+            // the openai fold space (fingerprints must not depend on host
+            // runtime state), so coreMessages no longer carries it — re-inject
+            // the CLIENT's original system ahead of the compress prompt,
+            // mirroring the anthropic adapter's anthropicSystem path.
             const messages = coreToOpenai(coreMessages);
-            const withSys = injectOpenaiSystem(messages, [systemPrompt]);
+            const withSys = injectOpenaiSystem(messages, [clientSystem, systemPrompt].filter((p): p is string => typeof p === "string" && p.length > 0));
             return { ...body, messages: withSys };
         },
 
