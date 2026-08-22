@@ -339,6 +339,16 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
         assert.doesNotMatch(tomlAfter, /mcp_servers\.bili/);
         assert.match(tomlAfter, /\[mcp_servers\.other\]\ncommand = "x"\n/);
 
+        // Regression: a header-only [mcp_servers.bili] block as the final
+        // line with no trailing newline must be fully removed (previously
+        // the header line survived because the next-table search matched
+        // the header itself when after.indexOf("\n") was -1).
+        fs.writeFileSync(path.join(home, "config.toml"), "[mcp_servers.other]\ncommand = \"x\"\n[mcp_servers.bili]");
+        assert.match(pluginRemove("codex"), /removed/);
+        const tomlEdge = fs.readFileSync(path.join(home, "config.toml"), "utf8");
+        assert.doesNotMatch(tomlEdge, /mcp_servers\.bili/);
+        assert.match(tomlEdge, /\[mcp_servers\.other\]\ncommand = "x"\n/);
+
         assert.match(pluginInstall("opencode"), /installed/);
         const oc = JSON.parse(fs.readFileSync(path.join(home, ".config/opencode/opencode.json"), "utf8")) as { mcp: Record<string, { command: string[]; environment?: Record<string, string> }> };
         assert.equal(oc.mcp.bili.command[1]!.endsWith(path.join("dist", "mcp.js")), true);

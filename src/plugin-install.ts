@@ -275,8 +275,9 @@ function codexRemove(): string {
     if (start < 0) return `codex: not installed (${file})`;
     const lineStart = text.lastIndexOf("\n", start - 1) + 1;
     const after = text.slice(start);
-    const nextTable = after.slice(after.indexOf("\n") + 1).search(/^[ \t]*\[/m);
-    const end = nextTable >= 0 ? start + after.indexOf("\n") + 1 + nextTable : text.length;
+    const firstNewline = after.indexOf("\n");
+    const nextTable = firstNewline < 0 ? -1 : after.slice(firstNewline + 1).search(/^[ \t]*\[/m);
+    const end = nextTable >= 0 ? start + firstNewline + 1 + nextTable : text.length;
     const cleaned = (text.slice(0, lineStart).replace(/\n+$/, "\n") + text.slice(end)).replace(/^\n+/, "");
     backupOnce(file);
     fs.writeFileSync(file, cleaned);
