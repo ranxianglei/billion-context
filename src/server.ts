@@ -1,6 +1,6 @@
 import http from "node:http";
 import fs from "node:fs";
-import { createCore, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, type Prompts, defaultPrompts, estimateTokensFast, renderNudgeText, deactivateBlock } from "acp-kernel";
+import { createCore, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, type Prompts, defaultPrompts, estimateTokensFast, renderNudgeText, deactivateBlock, viableRanges } from "acp-kernel";
 import { resolveCompress, resolveCompressPrompts, resolveRequestConfig } from "./compress-settings.js";
 import type { ProxyOptions } from "./config.js";
 import { loadOptions, loadRoutes } from "./config.js";
@@ -870,6 +870,10 @@ function prepareAnthropic(
         const tokenCount = session.stats.lastInputTokens;
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
+        // Drop sub-viability fragments before any consumer sees them: a tiny
+        // range in the list makes batched compress attempts fail atomically
+        // (kernel validates the whole batch). Mirrors billion-context-pi.
+        if (turn.nudge) turn.nudge.compressibleRanges = viableRanges(turn.nudge.compressibleRanges);
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         if (!session.meta.title) {
@@ -948,6 +952,10 @@ function prepareOpenai(
         const tokenCount = session.stats.lastInputTokens;
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
+        // Drop sub-viability fragments before any consumer sees them: a tiny
+        // range in the list makes batched compress attempts fail atomically
+        // (kernel validates the whole batch). Mirrors billion-context-pi.
+        if (turn.nudge) turn.nudge.compressibleRanges = viableRanges(turn.nudge.compressibleRanges);
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         if (!session.meta.title) {
@@ -1044,6 +1052,10 @@ function prepareResponses(
         const tokenCount = session.stats.lastInputTokens;
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" });
         session.state = turn.state;
+        // Drop sub-viability fragments before any consumer sees them: a tiny
+        // range in the list makes batched compress attempts fail atomically
+        // (kernel validates the whole batch). Mirrors billion-context-pi.
+        if (turn.nudge) turn.nudge.compressibleRanges = viableRanges(turn.nudge.compressibleRanges);
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         if (!session.meta.title) {
