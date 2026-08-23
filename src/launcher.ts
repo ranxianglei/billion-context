@@ -32,7 +32,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, type StdioOptions } from "node:child_process";
 import { DEFAULT_MITM_DOMAINS } from "./mitm.js";
-import { nonEmpty, resolvePiHome, loadClientConfig, type ClientConfig } from "./client-config.js";
+import { nonEmpty, resolvePiHome, resolveOmpHome, loadClientConfig, type ClientConfig } from "./client-config.js";
 
 export {
     type ClaudeSettings,
@@ -51,13 +51,18 @@ export {
     parseZcodeConfig,
     readZcodeConfig,
     resolvePiHome,
+    type OmpProvider,
+    type OmpConfig,
+    readOmpConfig,
+    parseOmpYaml,
+    resolveOmpHome,
 } from "./client-config.js";
 
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
 export const LAUNCHER_DEFAULT_PORT = 8787;
-export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "pi-test"] as const;
+export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "pi-test"] as const;
 export type ClientName = (typeof LAUNCH_CLIENTS)[number];
-export type BaseClientName = "claude" | "codex" | "pi";
+export type BaseClientName = "claude" | "codex" | "pi" | "omp";
 
 const HEALTH_PATH = "/__bili/health";
 const HEALTH_POLL_INTERVAL_MS = 200;
@@ -228,6 +233,10 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
         for (const [name, prov] of Object.entries(config.pi?.providers ?? {})) {
             classify(prov.baseUrl, name);
         }
+    } else if (client === "omp") {
+        for (const [name, prov] of Object.entries(config.omp?.providers ?? {})) {
+            classify(prov.baseUrl, name);
+        }
     } else {
         for (const [name, prov] of Object.entries(config.codex?.providers ?? {})) {
             classify(prov.baseUrl, `model_providers.${name}.base_url`);
@@ -303,7 +312,7 @@ export function launcherDirectUrl(env: NodeJS.ProcessEnv): boolean {
  *  `!== "0"` semantics) once the flags have soaked; pi is always excluded —
  *  it has its own native extension (billion-context-pi #154). */
 export function launcherInjectMcp(env: NodeJS.ProcessEnv, base: string): boolean {
-    return base !== "pi" && env.BILI_LAUNCHER_PLUGIN === "1";
+    return base !== "pi" && base !== "omp" && env.BILI_LAUNCHER_PLUGIN === "1";
 }
 
 /** Ephemeral MCP config for --mcp-config / -c mcp_servers.bili.*: a single
@@ -408,6 +417,74 @@ export function preparePiHttpRewrite(
         }
     } catch {}
     fs.writeFileSync(path.join(tmp, "models.json"), JSON.stringify(root));
+    return tmp;
+}
+
+/**
+ * omp counterpart of preparePiHttpRewrite: build an isolated PI_CODING_AGENT_DIR
+ * that symlinks every entry of the real omp home EXCEPT models.yml, and write a
+ * models.yml whose target providers' baseUrl is rewritten (HTTP → /bili/ wrap,
+ * wrapped-HTTPS → raw https for cert MITM). The real models.yml is never
+ * touched. The rewrite is line-based (indentation-tracked) so all other bytes —
+ * comments, ordering, formatting — are preserved verbatim.
+ */
+export function prepareOmpHttpRewrite(
+    ompHome: string,
+    origin: string,
+    httpRewrites: HttpRewrite[],
+    httpsRewrites: HttpRewrite[],
+): string | undefined {
+    if (httpRewrites.length === 0 && httpsRewrites.length === 0) return undefined;
+    const modelsPath = path.join(ompHome, "models.yml");
+    let txt: string;
+    try {
+        txt = fs.readFileSync(modelsPath, "utf8");
+    } catch {
+        return undefined;
+    }
+    const httpMap = new Map(httpRewrites.map((r) => [r.key, wrapUpstream(origin, r.realUpstream)]));
+    const httpsMap = new Map(httpsRewrites.map((r) => [r.key, r.realUpstream]));
+    const lines = txt.split(/\r?\n/);
+    let providersIndent = -1;
+    let providerIndent = -1;
+    let currentProvider: string | null = null;
+    for (let i = 0; i < lines.length; i++) {
+        const rawLine = lines[i];
+        const trimmed = rawLine.trim();
+        if (!trimmed || trimmed.startsWith("#")) continue;
+        const indent = rawLine.length - rawLine.trimStart().length;
+        if (providersIndent === -1) {
+            if (/^providers:\s*(#.*)?$/.test(trimmed)) providersIndent = indent;
+            continue;
+        }
+        if (indent <= providersIndent) break;
+        if (providerIndent === -1) providerIndent = indent;
+        if (indent === providerIndent) {
+            const m = /^([A-Za-z0-9_.-]+):/.exec(trimmed);
+            currentProvider = m ? m[1] : null;
+        } else if (indent > providerIndent && currentProvider) {
+            const baseMatch = /^(baseUrl:\s*)(\S+)/.exec(trimmed);
+            if (baseMatch) {
+                const target = httpMap.get(currentProvider) ?? httpsMap.get(currentProvider);
+                if (target) {
+                    const leading = rawLine.slice(0, rawLine.length - rawLine.trimStart().length);
+                    const commentMatch = /\s+#.*$/.exec(rawLine);
+                    const comment = commentMatch ? commentMatch[0] : "";
+                    lines[i] = `${leading}baseUrl: ${target}${comment}`;
+                }
+            }
+        }
+    }
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-omp-"));
+    try {
+        for (const entry of fs.readdirSync(ompHome)) {
+            if (entry === "models.yml") continue;
+            try {
+                fs.symlinkSync(path.join(ompHome, entry), path.join(tmp, entry));
+            } catch {}
+        }
+    } catch {}
+    fs.writeFileSync(path.join(tmp, "models.yml"), lines.join("\n"));
     return tmp;
 }
 
@@ -657,6 +734,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     let env: NodeJS.ProcessEnv;
     let clientArgs = params.clientArgs;
     let piTmpHome: string | undefined;
+    let ompTmpHome: string | undefined;
     const tmpFiles: string[] = [];
     const directUrl = launcherDirectUrl(process.env);
     if (directUrl) {
@@ -679,6 +757,12 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         env = buildPiEnv(origin, ca, process.env);
         piTmpHome = preparePiHttpRewrite(resolvePiHome(process.env), origin, routes.httpRewrites, routes.httpsRewrites);
         if (piTmpHome) env.PI_CODING_AGENT_DIR = piTmpHome;
+    } else if (base === "omp") {
+        // omp is pi-based: same env as pi (HTTPS_PROXY + CA + BILLION_CONTEXT_PROXY);
+        // the /bili/ rewrite rides an isolated PI_CODING_AGENT_DIR (real models.yml untouched).
+        env = buildPiEnv(origin, ca, process.env);
+        ompTmpHome = prepareOmpHttpRewrite(resolveOmpHome(process.env), origin, routes.httpRewrites, routes.httpsRewrites);
+        if (ompTmpHome) env.PI_CODING_AGENT_DIR = ompTmpHome;
     } else if (base === "codex") {
         // Per-spawn conversation id for the MCP shell's headless
         // self-registration (codex provides no session id of its own).
@@ -719,6 +803,11 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         if (piTmpHome) {
             try {
                 fs.rmSync(piTmpHome, { recursive: true, force: true });
+            } catch {}
+        }
+        if (ompTmpHome) {
+            try {
+                fs.rmSync(ompTmpHome, { recursive: true, force: true });
             } catch {}
         }
         for (const f of tmpFiles) {

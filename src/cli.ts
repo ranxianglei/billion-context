@@ -10,7 +10,7 @@
  *   bili start --debug            verbose logging
  *   bili start --config FILE      path to config file (default: XDG)
  *   bili start --passthrough      forward without compression
- *   bili pi/codex/claude [args]   start a proxy + launch a client via cert-MITM
+ *   bili pi/codex/claude/omp [args]   start a proxy + launch a client via cert-MITM
  *   bili export [id] [--full]     export a persisted session as a handoff doc
  *   bili test pi                  non-polluting pi smoke test
  *   bili --version
@@ -62,6 +62,7 @@ Usage:
   bili pi-test [opts --] [args]    like bili pi but injects --no-extensions (clean test)
   bili codex [opts --] [args]      start a proxy + launch codex against it (cert-MITM)
   bili claude [opts --] [args]     start a proxy + launch claude against it (cert-MITM)
+  bili omp [opts --] [args]        start a proxy + launch omp against it (cert-MITM)
   bili test pi                     non-polluting pi smoke test through the proxy
   bili export [session] [--full]   list sessions / export one as a Markdown handoff
                                     (--full includes original messages; --output FILE)
@@ -76,7 +77,7 @@ Usage:
   bili --version                   print version
   bili --help                      show this help
 
-Launcher (bili pi / bili codex / bili claude):
+Launcher (bili pi / bili codex / bili claude / bili omp):
   Brings up a proxy on an independent port (reusing one already running on
   that port), then runs the client pointed at it via HTTPS_PROXY + the proxy's
   MITM CA — no config-file edits. Discovered HTTPS upstream domains are
@@ -88,6 +89,7 @@ Launcher (bili pi / bili codex / bili claude):
     bili pi-test                          # pi through the proxy with extensions off (proxy owns compression)
     bili codex                            # launch codex through the proxy
     bili claude                           # launch claude through the proxy
+    bili omp                              # launch omp through the proxy (pi-based; /bili/ rewrite)
     bili test pi                          # quick end-to-end check of the pi path
     bili pi --mitm-domain api.foo.com     # add a domain to the MITM whitelist
 
