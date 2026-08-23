@@ -2,7 +2,6 @@ import type { CompressionCore, Config, CoreMessage } from "acp-kernel";
 import type { Session } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput } from "./compress-tool.js";
 import { applyRanges, type RewriteCtx } from "./stream.js";
-import { safeJsonParse } from "./util.js";
 
 /**
  * Responses API (non-streaming) JSON rewriter: strips compress function_call
@@ -25,7 +24,7 @@ export function rewriteResponsesJsonResponse(body: unknown, ctx: RewriteCtx): un
     for (const item of b.output) {
         if (item.type === "function_call" && item.name === COMPRESS_TOOL_NAME) {
             converted = true;
-            noteParts.push(applyRanges(parseCompressInput(safeJsonParse(String(item.arguments ?? ""))), ctx));
+            noteParts.push(applyRanges(parseCompressInput(String(item.arguments ?? "")), ctx));
         } else {
             if (item.type === "function_call") sawReal = true;
             keep.push(item);

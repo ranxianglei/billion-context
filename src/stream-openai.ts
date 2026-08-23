@@ -3,7 +3,6 @@ import type { Session } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput } from "./compress-tool.js";
 import { applyRanges, type RewriteCtx } from "./stream.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
-import { safeJsonParse } from "./util.js";
 
 type StreamState = {
     compressIndices: Set<number>;
@@ -198,7 +197,7 @@ export function rewriteOpenaiJsonResponse(body: unknown, ctx: RewriteCtx): unkno
         for (const tc of toolCalls) {
             if (tc.function?.name === COMPRESS_TOOL_NAME) {
                 converted = true;
-                noteParts.push(applyRanges(parseCompressInput(safeJsonParse(tc.function?.arguments ?? "")), ctx));
+                noteParts.push(applyRanges(parseCompressInput(tc.function?.arguments ?? ""), ctx));
             } else {
                 sawReal = true;
                 keepToolCalls.push(tc);
