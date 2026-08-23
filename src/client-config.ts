@@ -44,12 +44,21 @@ export interface OmpConfig {
     providers: Record<string, OmpProvider>;
 }
 
+export interface OpencodeProvider {
+    baseURL?: string;
+}
+
+export interface OpencodeConfig {
+    providers: Record<string, OpencodeProvider>;
+}
+
 export interface ClientConfig {
     claude?: ClaudeSettings;
     codex?: CodexConfig;
     pi?: PiConfig;
     zcode?: ZcodeConfig;
     omp?: OmpConfig;
+    opencode?: OpencodeConfig;
 }
 
 export function nonEmpty(s: unknown): s is string {
@@ -83,7 +92,7 @@ export function resolveOmpHome(env: NodeJS.ProcessEnv): string {
         : path.join(h, ".omp", "agent");
 }
 
-export function readClaudeSettings(homeDir: string, cwd: string): ClaudeSettings {
+export function readClaudeSettings(homeDir: string, cwd: string, env: NodeJS.ProcessEnv = process.env): ClaudeSettings {
     const files = [
         path.join(homeDir, ".claude", "settings.json"),
         path.join(cwd, ".claude", "settings.json"),
@@ -91,12 +100,15 @@ export function readClaudeSettings(homeDir: string, cwd: string): ClaudeSettings
     let anthropicBaseUrl: string | undefined;
     for (const f of files) {
         const obj = readJsonObject(f);
-        const env = obj?.env;
-        if (env && typeof env === "object" && !Array.isArray(env)) {
-            const v = (env as Record<string, unknown>).ANTHROPIC_BASE_URL;
+        const settingsEnv = obj?.env;
+        if (settingsEnv && typeof settingsEnv === "object" && !Array.isArray(settingsEnv)) {
+            const v = (settingsEnv as Record<string, unknown>).ANTHROPIC_BASE_URL;
             if (nonEmpty(v)) anthropicBaseUrl = v;
         }
     }
+    // Honor a shell-exported ANTHROPIC_BASE_URL (claude's native override) so
+    // the launcher wraps the relay the user actually uses, not the default.
+    if (!anthropicBaseUrl && nonEmpty(env.ANTHROPIC_BASE_URL)) anthropicBaseUrl = env.ANTHROPIC_BASE_URL;
     return anthropicBaseUrl ? { anthropicBaseUrl } : {};
 }
 
@@ -212,6 +224,43 @@ export function readOmpConfig(ompHome: string): OmpConfig {
     return parseOmpYaml(text);
 }
 
+export function resolveOpencodeConfigFile(env: NodeJS.ProcessEnv): string {
+    if (nonEmpty(env.OPENCODE_CONFIG)) return env.OPENCODE_CONFIG;
+    const xdg = nonEmpty(env.XDG_CONFIG_HOME) ? env.XDG_CONFIG_HOME : path.join(os.homedir(), ".config");
+    return path.join(xdg, "opencode", "opencode.json");
+}
+
+export function readOpencodeConfig(file: string): OpencodeConfig {
+    let text: string;
+    try {
+        text = fs.readFileSync(file, "utf8");
+    } catch {
+        return { providers: {} };
+    }
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(text);
+    } catch {
+        return { providers: {} };
+    }
+    const providers: Record<string, OpencodeProvider> = {};
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        const root = parsed as Record<string, unknown>;
+        const provRoot = root.provider;
+        if (provRoot && typeof provRoot === "object" && !Array.isArray(provRoot)) {
+            for (const [name, value] of Object.entries(provRoot)) {
+                if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+                const opts = (value as Record<string, unknown>).options;
+                if (opts && typeof opts === "object" && !Array.isArray(opts)) {
+                    const baseURL = (opts as Record<string, unknown>).baseURL;
+                    if (typeof baseURL === "string") providers[name] = { baseURL };
+                }
+            }
+        }
+    }
+    return { providers };
+}
+
 export function parseZcodeConfig(obj: unknown): ZcodeConfig {
     const result: ZcodeConfig = { providers: {} };
     if (!obj || typeof obj !== "object" || Array.isArray(obj)) return result;
@@ -249,12 +298,13 @@ export function readZcodeConfig(zcodeHome: string): ZcodeConfig {
 export function loadClientConfig(env: NodeJS.ProcessEnv, cwd: string): ClientConfig {
     const home = os.homedir();
     const config: ClientConfig = {};
-    config.claude = readClaudeSettings(home, cwd);
+    config.claude = readClaudeSettings(home, cwd, env);
     const codexHome = nonEmpty(env.CODEX_HOME) ? env.CODEX_HOME : path.join(home, ".codex");
     config.codex = readCodexConfig(codexHome);
     config.pi = readPiConfig(resolvePiHome(env));
     const zcodeHome = nonEmpty(env.ZCODE_DATA_BASE_DIR) ? env.ZCODE_DATA_BASE_DIR : path.join(home, ".zcode");
     config.zcode = readZcodeConfig(zcodeHome);
     config.omp = readOmpConfig(resolveOmpHome(env));
+    config.opencode = readOpencodeConfig(resolveOpencodeConfigFile(env));
     return config;
 }

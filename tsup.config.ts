@@ -1,7 +1,7 @@
 import { defineConfig } from "tsup";
 
 export default defineConfig({
-    entry: ["src/index.ts", "src/mcp.ts", "src/agent/pi.ts", "src/agent/omp.ts"],
+    entry: ["src/index.ts", "src/mcp.ts", "src/agent/pi.ts", "src/agent/omp.ts", "src/agent/opencode.ts"],
     format: ["esm"],
     target: "node20",
     platform: "node",
