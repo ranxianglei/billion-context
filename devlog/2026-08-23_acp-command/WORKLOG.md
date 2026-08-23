@@ -181,16 +181,19 @@ start). Both are in this branch's uncommitted changes on top of the `/acp` commi
   which is why pi worked.
 - **Key discovery**: omp sends its own session id in the request **body** as
   `prompt_cache_key` (a Responses-API field), and that value is exactly the session
-  id the plugin uses for `/acp` (`ctx.sessionManager.getSessionId()`). The kernel's
-  `conversationIdentityResponses` (acp-kernel/wire) already extracts it as the
-  conversation identity — so the session was ALWAYS keyed by omp's session id; only
-  the map lookup was missing.
-- **Fix** (`src/server.ts`, one block): for responses requests with a
-  client-provided conversation identity, call
-  `recordPluginSession(responsesIdentity.value, session.id)` unconditionally (not
-  just when `pluginAgent` is set). No-op duplicate for pi (same key); the ONLY path
-  for omp.
+  id the plugin uses for `/acp` (`ctx.sessionManager.getSessionId()`).
+  **Pitfall**: the kernel's `conversationIdentityResponses` (acp-kernel/wire) does
+  NOT read `prompt_cache_key` — it only checks a header, `body.session_id`,
+  `body.metadata.session_id`, `body.previous_response_id` (clientProvided:false),
+  then falls back to a content fingerprint (clientProvided:false). So
+  `responsesIdentity.clientProvided` is **false** for omp's first request, and a
+  fix keyed on it never fires. The field must be read directly.
+- **Fix** (`src/server.ts`, one block): for responses requests, read
+  `parsed.prompt_cache_key` directly and, if present, call
+  `recordPluginSession(pck.trim(), session.id)` unconditionally (not just when
+  `pluginAgent` is set). This is the ONLY path for omp; pi still records via the
+  header path above.
 - **Verification**: `bili omp -p "<unique prompt>"` → the conversations file gains
-  an entry keyed by the omp session id; `GET /__bili/plugin/status?conversationId=<that id>`
-  returns `ok:true` with the rendered `buildStatusPanel` (Context 19% (24k/128k),
-  Nudge idle, Blocks none).
+  an entry whose key EQUALS the request's `prompt_cache_key`; then
+  `GET /__bili/plugin/status?conversationId=<that id>` (what `/acp` does) returns
+  `ok:true` with the rendered `buildStatusPanel`.

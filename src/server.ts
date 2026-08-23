@@ -725,14 +725,17 @@ async function handle(
             session.metadata.effectiveContextLimit = reqConfig.modelContextLimit;
             recordPluginSession(pluginConversation ?? conversation, session.id);
         }
-        // Responses clients that carry a client-provided conversation identity
-        // (omp sends its own session id as `prompt_cache_key` in the body) get
-        // that conversation recorded even WITHOUT the x-bili-plugin header, so
-        // the /acp command — which looks the session up by the client's session
-        // id — can find it. pi already records via the header path above; this
-        // is a no-op duplicate for pi (same key) and the ONLY path for omp.
-        if (protocol === "responses" && responsesIdentity?.clientProvided) {
-            recordPluginSession(responsesIdentity.value, session.id);
+        // Responses clients that send their own session id as `prompt_cache_key`
+        // (omp) get that conversation recorded even WITHOUT the x-bili-plugin
+        // header, so the /acp command — which looks the session up by the
+        // client's session id — can find it. NOTE: conversationIdentityResponses
+        // does NOT read prompt_cache_key (it falls back to a content fingerprint
+        // with clientProvided:false), so we read the field directly here.
+        if (protocol === "responses") {
+            const pck = (parsed as ResponsesRequestBody).prompt_cache_key;
+            if (typeof pck === "string" && pck.trim().length > 0) {
+                recordPluginSession(pck.trim(), session.id);
+            }
         }
         const pluginMode = pluginAgent !== undefined;
         // Self-heal the context window: a prior upstream overflow may have
