@@ -60,9 +60,9 @@ export {
 
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
 export const LAUNCHER_DEFAULT_PORT = 8787;
-export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "pi-test"] as const;
+export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "pi-test"] as const;
 export type ClientName = (typeof LAUNCH_CLIENTS)[number];
-export type BaseClientName = "claude" | "codex" | "pi" | "omp";
+export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode";
 
 const HEALTH_PATH = "/__bili/health";
 const HEALTH_POLL_INTERVAL_MS = 200;
@@ -312,7 +312,7 @@ export function launcherDirectUrl(env: NodeJS.ProcessEnv): boolean {
  *  `!== "0"` semantics) once the flags have soaked; pi is always excluded —
  *  it has its own native extension (billion-context-pi #154). */
 export function launcherInjectMcp(env: NodeJS.ProcessEnv, base: string): boolean {
-    return base !== "pi" && base !== "omp" && env.BILI_LAUNCHER_PLUGIN === "1";
+    return base !== "pi" && base !== "omp" && base !== "opencode" && env.BILI_LAUNCHER_PLUGIN === "1";
 }
 
 /** Ephemeral MCP config for --mcp-config / -c mcp_servers.bili.*: a single
@@ -678,6 +678,11 @@ export function resolveClientCommand(
     client: ClientName,
     env: NodeJS.ProcessEnv,
 ): { command: string; prefixArgs: string[] } {
+    const binOverride = env.BILI_CLIENT_BIN?.trim();
+    if (binOverride) {
+        const resolved = resolveOnPath(binOverride, env);
+        return { command: resolved ?? binOverride, prefixArgs: [] };
+    }
     if (client === "pi") {
         const piBin = env.PI_BIN?.trim();
         if (piBin) return { command: piBin, prefixArgs: [] };
@@ -763,6 +768,10 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         env = buildPiEnv(origin, ca, process.env);
         ompTmpHome = prepareOmpHttpRewrite(resolveOmpHome(process.env), origin, routes.httpRewrites, routes.httpsRewrites);
         if (ompTmpHome) env.PI_CODING_AGENT_DIR = ompTmpHome;
+    } else if (base === "opencode") {
+        // opencode uses MITM (HTTPS_PROXY + CA); BILLION_CONTEXT_PROXY makes
+        // opencode-acp self-disable so the proxy's MCP tools take priority.
+        env = { ...process.env, HTTPS_PROXY: origin, NODE_EXTRA_CA_CERTS: ca, BILLION_CONTEXT_PROXY: origin };
     } else if (base === "codex") {
         // Per-spawn conversation id for the MCP shell's headless
         // self-registration (codex provides no session id of its own).

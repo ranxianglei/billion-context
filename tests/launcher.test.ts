@@ -40,13 +40,13 @@ import {
     type HttpRewrite,
 } from "../src/launcher.ts";
 
-test("isLaunchClient: pi/claude/codex/omp/pi-test true, others false", () => {
+test("isLaunchClient: pi/claude/codex/omp/opencode/pi-test true, others false", () => {
     assert.equal(isLaunchClient("pi"), true);
     assert.equal(isLaunchClient("claude"), true);
     assert.equal(isLaunchClient("codex"), true);
     assert.equal(isLaunchClient("omp"), true);
+    assert.equal(isLaunchClient("opencode"), true);
     assert.equal(isLaunchClient("pi-test"), true);
-    assert.equal(isLaunchClient("opencode"), false);
     assert.equal(isLaunchClient("start"), false);
     assert.equal(isLaunchClient(""), false);
 });

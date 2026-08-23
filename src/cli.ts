@@ -63,6 +63,7 @@ Usage:
   bili codex [opts --] [args]      start a proxy + launch codex against it (cert-MITM)
   bili claude [opts --] [args]     start a proxy + launch claude against it (cert-MITM)
   bili omp [opts --] [args]        start a proxy + launch omp against it (cert-MITM)
+  bili opencode [opts --] [args]   start a proxy + launch opencode against it (cert-MITM)
   bili test pi                     non-polluting pi smoke test through the proxy
   bili export [session] [--full]   list sessions / export one as a Markdown handoff
                                     (--full includes original messages; --output FILE)
@@ -77,7 +78,7 @@ Usage:
   bili --version                   print version
   bili --help                      show this help
 
-Launcher (bili pi / bili codex / bili claude / bili omp):
+Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode):
   Brings up a proxy on an independent port (reusing one already running on
   that port), then runs the client pointed at it via HTTPS_PROXY + the proxy's
   MITM CA — no config-file edits. Discovered HTTPS upstream domains are
@@ -191,7 +192,8 @@ export function parseArgs(argv: string[]): Parsed {
             case "--host":
             case "--config":
             case "--origin":
-            case "--agent": {
+            case "--agent":
+            case "--bin": {
                 const val = argv[++i];
                 if (val === undefined || val.length === 0) {
                     console.error(`bili: ${a} requires a non-empty value`);
@@ -201,6 +203,7 @@ export function parseArgs(argv: string[]): Parsed {
                 else if (a === "--host") overrides.ACP_HOST = val;
                 else if (a === "--config") overrides.BILI_CONFIG_FILE = val;
                 else if (a === "--origin") overrides.BILI_MCP_PROXY = val;
+                else if (a === "--bin") process.env.BILI_CLIENT_BIN = val;
                 else overrides.BILI_PLUGIN_AGENT = val;
                 break;
             }
