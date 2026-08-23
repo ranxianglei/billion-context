@@ -105,7 +105,7 @@ function compressRound1Script(): string[] {
         anthropicSse("content_block_start", {
             type: "content_block_start",
             index: 0,
-            content_block: { type: "tool_use", id: "toolu_c_1", name: "compress", input: {} },
+            content_block: { type: "tool_use", id: "toolu_c_1", name: "bili_compress", input: {} },
         }),
         anthropicSse("content_block_delta", {
             type: "content_block_delta",
@@ -256,7 +256,7 @@ test("e2e anthropic: text streams through with incremental deltas, injected tool
             system?: string | Array<{ type: string; text?: string }>;
         };
         const upstreamToolNames = upstreamReq.tools?.map((t) => t.name) ?? [];
-        for (const expected of ["get_weather", "compress", "decompress", "search_context", "acp_status"]) {
+        for (const expected of ["get_weather", "bili_compress", "bili_decompress", "bili_search_context", "bili_status"]) {
             assert.ok(upstreamToolNames.includes(expected), `upstream tools missing ${expected}: ${JSON.stringify(upstreamToolNames)}`);
         }
         const sysText = typeof upstreamReq.system === "string" ? upstreamReq.system : (upstreamReq.system ?? []).map((b) => b.text ?? "").join("\n");
@@ -314,7 +314,7 @@ test("e2e anthropic: compress tool_use round-trip — 2nd upstream request carri
         const clientToolUses = events.filter(
             (e) => e.event === "content_block_start" && (e.data.content_block as { type?: string; name?: string })?.type === "tool_use",
         );
-        assert.equal(clientToolUses.filter((e) => (e.data.content_block as { name?: string }).name === "compress").length, 0, "compress tool_use leaked to client");
+        assert.equal(clientToolUses.filter((e) => (e.data.content_block as { name?: string }).name === "bili_compress").length, 0, "compress tool_use leaked to client");
 
         assert.equal(events.filter((e) => e.event === "message_stop").length, 1, "expected exactly one terminal message_stop across both rounds");
     } finally {

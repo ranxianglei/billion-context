@@ -1,7 +1,7 @@
 import type { CoreMessage } from "acp-kernel";
 import { coreToResponses, injectResponsesDeveloperMessage, patchResponsesInput, type ResponseInputItem, type ResponsesProjection } from "acp-kernel/wire";
 import { buildVisibilityMarker } from "../compress-loop.js";
-import { ACP_TEXT_OPEN, ACP_TEXT_CLOSE, ACP_STATUS_OPEN, ACP_STATUS_CLOSE, ACP_SEARCH_OPEN, ACP_SEARCH_CLOSE, ACP_DECOMPRESS_OPEN, ACP_DECOMPRESS_CLOSE, COMPRESS_TOOL_NAME, PROXY_TOOL_NAMES } from "../compress-tool.js";
+import { ACP_TEXT_OPEN, ACP_TEXT_CLOSE, ACP_STATUS_OPEN, ACP_STATUS_CLOSE, ACP_SEARCH_OPEN, ACP_SEARCH_CLOSE, ACP_DECOMPRESS_OPEN, ACP_DECOMPRESS_CLOSE, COMPRESS_TOOL_NAME, BILI_PROXY_TOOL_NAMES } from "../compress-tool.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import type {
     CompressLoopAdapter,
@@ -183,7 +183,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                     const item = obj.item as Record<string, unknown> | undefined;
                     if (item?.type === "function_call") {
                         const fcName = typeof item.name === "string" ? item.name : "";
-                        if (PROXY_TOOL_NAMES.has(fcName)) {
+                        if (BILI_PROXY_TOOL_NAMES.has(fcName)) {
                             const itemId = typeof item.id === "string" ? item.id : "";
                             pending.set(itemId, {
                                 itemId,
