@@ -18,8 +18,10 @@ import {
     buildClaudeEnv,
     buildCodexArgs,
     preparePiHttpRewrite,
+    prepareOmpHttpRewrite,
     stripInheritedProxy,
     resolvePiHome,
+    resolveOmpHome,
     extractDomains,
     discoverDomains,
     discoverRoutes,
@@ -27,6 +29,8 @@ import {
     resolveClientCommand,
     isOnPath,
     parseCodexToml,
+    parseOmpYaml,
+    readOmpConfig,
     findFreePort,
     ensureProxyRunning,
     stopProxy,
@@ -36,10 +40,11 @@ import {
     type HttpRewrite,
 } from "../src/launcher.ts";
 
-test("isLaunchClient: pi/claude/codex/pi-test true, others false", () => {
+test("isLaunchClient: pi/claude/codex/omp/pi-test true, others false", () => {
     assert.equal(isLaunchClient("pi"), true);
     assert.equal(isLaunchClient("claude"), true);
     assert.equal(isLaunchClient("codex"), true);
+    assert.equal(isLaunchClient("omp"), true);
     assert.equal(isLaunchClient("pi-test"), true);
     assert.equal(isLaunchClient("opencode"), false);
     assert.equal(isLaunchClient("start"), false);
@@ -612,4 +617,115 @@ test("stripInheritedProxy: removes generic proxy redirector vars, keeps the rest
     assert.equal(cleaned.BILI_UPSTREAM_PROXY, "http://relay:9999", "BILI_UPSTREAM_PROXY kept (explicit chaining)");
     assert.equal(cleaned.PATH, "/usr/bin", "PATH kept");
     assert.equal(cleaned.HOME, "/home/dog", "HOME kept");
+});
+
+test("parseOmpYaml: reads providers.<name>.baseUrl (skips non-matching)", () => {
+    const yml = [
+        "providers:",
+        "  sglang-responses:",
+        "    baseUrl: http://127.0.0.1:8199/v1",
+        "    models:",
+        "      - name: qwen3.8-27b",
+        "  zhipuai:",
+        "    baseUrl: https://open.bigmodel.cn/api/coding/paas/v4",
+        "    api: openai",
+        "  ollama-chat:",
+        "    baseUrl: http://127.0.0.1:11435/v1",
+        "modelRoles:",
+        "  default: sglang-responses/qwen3.8-27b:high",
+    ].join("\n");
+    const cfg = parseOmpYaml(yml);
+    assert.equal(cfg.providers["sglang-responses"].baseUrl, "http://127.0.0.1:8199/v1");
+    assert.equal(cfg.providers["zhipuai"].baseUrl, "https://open.bigmodel.cn/api/coding/paas/v4");
+    assert.equal(cfg.providers["ollama-chat"].baseUrl, "http://127.0.0.1:11435/v1");
+    assert.equal(Object.keys(cfg.providers).length, 3);
+});
+
+test("parseOmpYaml: no providers key → {}", () => {
+    assert.deepEqual(parseOmpYaml("modelRoles:\n  default: x\n"), { providers: {} });
+    assert.deepEqual(parseOmpYaml(""), { providers: {} });
+});
+
+test("readOmpConfig: reads models.yml from omp home", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-"));
+    try {
+        fs.writeFileSync(path.join(home, "models.yml"), "providers:\n  a:\n    baseUrl: http://x:1/v1\n");
+        const cfg = readOmpConfig(home);
+        assert.equal(cfg.providers.a.baseUrl, "http://x:1/v1");
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("readOmpConfig: missing models.yml → {}", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-"));
+    try {
+        assert.deepEqual(readOmpConfig(home), { providers: {} });
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("resolveOmpHome: PI_CODING_AGENT_DIR > default ~/.omp/agent", () => {
+    assert.equal(resolveOmpHome({ PI_CODING_AGENT_DIR: "/custom/omp" }), "/custom/omp");
+    assert.equal(resolveOmpHome({}), path.join(os.homedir(), ".omp", "agent"));
+});
+
+test("discoverRoutes: omp http + https providers → splits httpsDomains + httpRewrites", () => {
+    const config: ClientConfig = {
+        omp: {
+            providers: {
+                zhipuai: { baseUrl: "https://open.bigmodel.cn/api/coding/paas/v4" },
+                sglang: { baseUrl: "http://127.0.0.1:8199/v1" },
+            },
+        },
+    };
+    const routes = discoverRoutes("omp", config);
+    assert.deepEqual(routes.httpsDomains, ["open.bigmodel.cn"]);
+    assert.deepEqual(routes.httpRewrites, [
+        { key: "sglang", realUpstream: "http://127.0.0.1:8199/v1" },
+    ]);
+});
+
+test("prepareOmpHttpRewrite: rewrites matching provider, leaves others, symlinks siblings", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-"));
+    fs.writeFileSync(
+        path.join(home, "models.yml"),
+        [
+            "providers:",
+            "  a:",
+            "    baseUrl: http://example.com/v1",
+            "  b:",
+            "    baseUrl: https://secure.example.com",
+        ].join("\n"),
+    );
+    fs.writeFileSync(path.join(home, "config.yml"), "extensions:\n  - /x/omp.js\n");
+    const tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", [
+        { key: "a", realUpstream: "http://example.com/v1" },
+    ], []);
+    try {
+        assert.ok(typeof tmp === "string" && tmp.length > 0);
+        const out = fs.readFileSync(path.join(tmp!, "models.yml"), "utf8");
+        assert.ok(out.includes("baseUrl: http://127.0.0.1:8787/bili/http://example.com/v1"), "a rewritten");
+        assert.ok(out.includes("baseUrl: https://secure.example.com"), "b unchanged");
+        assert.equal(fs.lstatSync(path.join(tmp!, "config.yml")).isSymbolicLink(), true);
+        assert.equal(fs.realpathSync(path.join(tmp!, "config.yml")), path.join(home, "config.yml"));
+    } finally {
+        if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("prepareOmpHttpRewrite: returns undefined when no rewrites", () => {
+    assert.equal(prepareOmpHttpRewrite("/whatever", "http://127.0.0.1:8787", [], []), undefined);
+});
+
+test("prepareOmpHttpRewrite: returns undefined when models.yml missing", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-"));
+    try {
+        const rw = [{ key: "a", realUpstream: "http://example.com/v1" }];
+        assert.equal(prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []), undefined);
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+    }
 });

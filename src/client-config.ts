@@ -36,11 +36,20 @@ export interface ZcodeConfig {
     providers: Record<string, ZcodeProvider>;
 }
 
+export interface OmpProvider {
+    baseUrl?: string;
+}
+
+export interface OmpConfig {
+    providers: Record<string, OmpProvider>;
+}
+
 export interface ClientConfig {
     claude?: ClaudeSettings;
     codex?: CodexConfig;
     pi?: PiConfig;
     zcode?: ZcodeConfig;
+    omp?: OmpConfig;
 }
 
 export function nonEmpty(s: unknown): s is string {
@@ -64,6 +73,14 @@ export function resolvePiHome(env: NodeJS.ProcessEnv): string {
     return nonEmpty(env.PI_CODING_AGENT_DIR) ? env.PI_CODING_AGENT_DIR!
         : nonEmpty(env.PI_HOME) ? env.PI_HOME!
         : path.join(h, ".pi", "agent");
+}
+
+/** omp (oh-my-pi) is pi-based: it honors PI_CODING_AGENT_DIR and defaults to
+ *  ~/.omp/agent. */
+export function resolveOmpHome(env: NodeJS.ProcessEnv): string {
+    const h = os.homedir();
+    return nonEmpty(env.PI_CODING_AGENT_DIR) ? env.PI_CODING_AGENT_DIR!
+        : path.join(h, ".omp", "agent");
 }
 
 export function readClaudeSettings(homeDir: string, cwd: string): ClaudeSettings {
@@ -147,6 +164,54 @@ export function readPiConfig(piHome: string): PiConfig {
     return { providers };
 }
 
+/**
+ * Targeted YAML reader for omp's ~/.omp/agent/models.yml: each
+ * `providers.<name>.baseUrl`. String values only; NOT a general YAML parser —
+ * intentionally dependency-free (mirrors parseCodexToml). Indentation-relative
+ * so it tolerates the file's base indent.
+ */
+export function parseOmpYaml(text: string): OmpConfig {
+    const result: OmpConfig = { providers: {} };
+    let providersIndent = -1;
+    let providerIndent = -1;
+    let currentProvider: string | null = null;
+    for (const rawLine of text.split(/\r?\n/)) {
+        const trimmed = rawLine.trim();
+        if (!trimmed || trimmed.startsWith("#")) continue;
+        const indent = rawLine.length - rawLine.trimStart().length;
+        if (providersIndent === -1) {
+            if (/^providers:\s*(#.*)?$/.test(trimmed)) providersIndent = indent;
+            continue;
+        }
+        if (indent <= providersIndent) break;
+        if (providerIndent === -1) providerIndent = indent;
+        if (indent === providerIndent) {
+            const m = /^([A-Za-z0-9_.-]+):/.exec(trimmed);
+            if (m) {
+                currentProvider = m[1];
+                if (!result.providers[currentProvider]) result.providers[currentProvider] = {};
+            } else {
+                currentProvider = null;
+            }
+        } else if (indent > providerIndent && currentProvider) {
+            const m = /^baseUrl:\s*(\S+)/.exec(trimmed);
+            if (m) result.providers[currentProvider].baseUrl = m[1];
+        }
+    }
+    return result;
+}
+
+export function readOmpConfig(ompHome: string): OmpConfig {
+    const cfgPath = path.join(ompHome, "models.yml");
+    let text: string;
+    try {
+        text = fs.readFileSync(cfgPath, "utf8");
+    } catch {
+        return { providers: {} };
+    }
+    return parseOmpYaml(text);
+}
+
 export function parseZcodeConfig(obj: unknown): ZcodeConfig {
     const result: ZcodeConfig = { providers: {} };
     if (!obj || typeof obj !== "object" || Array.isArray(obj)) return result;
@@ -190,5 +255,6 @@ export function loadClientConfig(env: NodeJS.ProcessEnv, cwd: string): ClientCon
     config.pi = readPiConfig(resolvePiHome(env));
     const zcodeHome = nonEmpty(env.ZCODE_DATA_BASE_DIR) ? env.ZCODE_DATA_BASE_DIR : path.join(home, ".zcode");
     config.zcode = readZcodeConfig(zcodeHome);
+    config.omp = readOmpConfig(resolveOmpHome(env));
     return config;
 }
