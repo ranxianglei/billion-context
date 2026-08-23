@@ -8,7 +8,7 @@
  *    kernel's ACP_* names ("proxy" is a misnomer once shared);
  *  - parseCompressInput wires the kernel's onWarn hook into the proxy logger.
  */
-import { parseCompressInput as kernelParseCompressInput, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, ACP_TOOL_NAMES } from "acp-kernel";
+import { parseCompressArgs, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, ACP_TOOL_NAMES } from "acp-kernel";
 import { log as loggerLog } from "./logger.js";
 
 export {
@@ -97,5 +97,9 @@ export const BILI_PROXY_TOOL_NAMES: ReadonlySet<string> = new Set([
 ]);
 
 export function parseCompressInput(input: unknown, callId?: string) {
-    return kernelParseCompressInput(input, callId, (message) => loggerLog("warn", message));
+    const { ranges, diagnostics } = parseCompressArgs(input, { callId });
+    if (!diagnostics.ok && diagnostics.kind !== "ok") {
+        loggerLog("warn", `[acp-compress-input] rejected: kind=${diagnostics.kind} invalidItems=${diagnostics.invalidItems}${diagnostics.keys ? ` keys=[${diagnostics.keys.join(",")}]` : ""}${diagnostics.length !== undefined ? ` len=${diagnostics.length}` : ""}`);
+    }
+    return ranges;
 }
