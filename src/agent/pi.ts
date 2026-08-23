@@ -23,9 +23,16 @@ type ToolDefinition = {
     execute: (toolCallId: string, params: Record<string, unknown>, signal: AbortSignal | undefined, onUpdate: ((u: unknown) => void) | undefined, ctx: Ctx) => Promise<ToolResult>;
 };
 
+type CommandCtx = {
+    sessionManager?: { getSessionId?: () => string } | undefined;
+    model?: { contextWindow?: number; baseUrl?: string } | undefined;
+    ui?: { notify?: (message: string, type?: string) => void } | undefined;
+};
+
 type ExtensionAPI = {
     on: (event: string, handler: (event: never, ctx: Ctx) => unknown) => void;
     registerTool: (tool: ToolDefinition) => void;
+    registerCommand?: (name: string, options: { description?: string; handler: (args: string, ctx: CommandCtx) => void | Promise<void> }) => void;
 };
 
 function agentName(override: string | undefined): string {
@@ -44,6 +51,35 @@ function sessionIdOf(ctx: Ctx): string | undefined {
     } catch {
         return undefined;
     }
+}
+
+function fmtTok(n: number): string {
+    if (n < 1000) return String(n);
+    if (n < 1_000_000) return `${(n / 1000).toFixed(1)}K`;
+    return `${(n / 1_000_000).toFixed(2)}M`;
+}
+
+function renderAcpStatus(s: Record<string, unknown>): string {
+    const num = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) ? v : null);
+    const contextTokens = num(s.contextTokens);
+    const contextLimit = num(s.contextLimit);
+    const inputTokens = num(s.inputTokens);
+    const outputTokens = num(s.outputTokens);
+    const cachedTokens = num(s.cachedTokens);
+    const requests = num(s.requests);
+    const blocks = Array.isArray(s.blocks) ? (s.blocks as Array<{ tier?: number; active?: boolean }>) : [];
+    const activeBlocks = blocks.filter((b) => b.active === true).length;
+    const lines: string[] = ["📊 ACP status"];
+    if (contextTokens !== null) {
+        const pct = contextLimit !== null && contextLimit > 0 ? ` (${((contextTokens / contextLimit) * 100).toFixed(1)}%)` : "";
+        lines.push(`  context: ${fmtTok(contextTokens)}${contextLimit !== null ? ` / ${fmtTok(contextLimit)}` : ""}${pct}`);
+    }
+    if (inputTokens !== null || outputTokens !== null || cachedTokens !== null) {
+        lines.push(`  in/out/cached: ${fmtTok(inputTokens ?? 0)} / ${fmtTok(outputTokens ?? 0)} / ${fmtTok(cachedTokens ?? 0)}`);
+    }
+    if (requests !== null) lines.push(`  requests: ${requests}`);
+    if (blocks.length > 0) lines.push(`  blocks: ${blocks.length} (${activeBlocks} active)`);
+    return lines.join("\n");
 }
 
 function manifestToTool(proxyBase: string, tool: ManifestTool, agent: string): ToolDefinition {
@@ -107,6 +143,38 @@ export function createBiliPlugin(agentOverride?: string): (pi: ExtensionAPI) => 
     return function biliPlugin(pi: ExtensionAPI): void {
         const agent = agentName(agentOverride);
         const state: RegisterState = {};
+        if (typeof pi.registerCommand === "function") {
+            pi.registerCommand("acp", {
+                description: "Show ACP context-compression status for this session",
+                handler: async (_args, ctx) => {
+                    const notify = (message: string, type?: string): void => {
+                        try {
+                            ctx.ui?.notify?.(message, type);
+                        } catch {
+                            // host UI unavailable — the command is best-effort
+                        }
+                    };
+                    const proxyBase = detectProxyBase(ctx.model?.baseUrl);
+                    if (proxyBase === undefined) {
+                        notify("bili: no proxy detected (run via `bili <client>` or set a /bili/ baseURL)", "warning");
+                        return;
+                    }
+                    const conversationId = sessionIdOf(ctx) ?? "unknown";
+                    let status: Record<string, unknown> | undefined;
+                    try {
+                        status = await fetchStatus(proxyBase, conversationId);
+                    } catch (err) {
+                        notify(`bili: status fetch failed: ${err instanceof Error ? err.message : String(err)}`, "error");
+                        return;
+                    }
+                    if (status === undefined) {
+                        notify("bili: no ACP session yet (send a model request first, then run /acp)", "warning");
+                        return;
+                    }
+                    notify(renderAcpStatus(status), "info");
+                },
+            });
+        }
         pi.on("before_provider_headers", (event, ctx) => {
             try {
                 if (proxyBaseForCtx(ctx) === undefined) return;

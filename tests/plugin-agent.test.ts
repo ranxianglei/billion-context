@@ -130,24 +130,33 @@ test("forwardTool rejects immediately when the caller's signal is already aborte
 type TextBlock = { type: "text"; text: string };
 type RecordedTool = { name: string; parameters: unknown; execute: (id: string, params: Record<string, unknown>, signal: undefined, onUpdate: undefined, ctx: Record<string, unknown>) => Promise<{ content: TextBlock[]; isError?: boolean }> };
 
+type RecordedCommand = { name: string; description?: string; handler: (args: string, ctx: unknown) => void | Promise<void> };
+
 type FakePi = {
     events: Map<string, (event: unknown, ctx: unknown) => unknown>;
     tools: RecordedTool[];
+    commands: Map<string, RecordedCommand>;
     on: (event: string, handler: (event: never, ctx: never) => unknown) => void;
     registerTool: (tool: RecordedTool) => void;
+    registerCommand: (name: string, options: RecordedCommand) => void;
 };
 
 function makeFakePi(): FakePi {
     const events = new Map<string, (event: unknown, ctx: unknown) => unknown>();
     const tools: RecordedTool[] = [];
+    const commands = new Map<string, RecordedCommand>();
     return {
         events,
         tools,
+        commands,
         on: (event, handler) => events.set(event, handler as (event: never, ctx: never) => unknown),
         registerTool: (tool) => {
             const i = tools.findIndex((t) => t.name === tool.name);
             if (i >= 0) tools[i] = tool;
             else tools.push(tool);
+        },
+        registerCommand: (name, options) => {
+            commands.set(name, options);
         },
     };
 }
@@ -245,6 +254,103 @@ test("pi extension is inert without a proxy", async () => {
     await pi.events.get("session_start")!({}, fakeCtx(undefined));
     await flush();
     assert.equal(pi.tools.length, 0);
+});
+
+test("/acp command is registered and renders proxy status", async () => {
+    const server = http.createServer((req, res) => {
+        if (req.url?.startsWith("/__bili/plugin/status")) {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({
+                ok: true,
+                contextLimit: 200000,
+                contextTokens: 12345,
+                inputTokens: 10000,
+                outputTokens: 1234,
+                cachedTokens: 8000,
+                requests: 7,
+                blocks: [{ id: "b1", tier: 1, active: true }, { id: "b2", tier: 2, active: false }],
+            }));
+            return;
+        }
+        res.writeHead(404);
+        res.end("{}");
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    try {
+        const pi = makeFakePi();
+        biliPlugin(pi as never);
+        const cmd = pi.commands.get("acp");
+        assert.ok(cmd, "acp command should be registered");
+        assert.match(cmd!.description ?? "", /ACP/);
+        const notes: Array<{ msg: string; type?: string }> = [];
+        const ctx = {
+            sessionManager: { getSessionId: () => "sess-acp" },
+            model: { baseUrl: `${origin}/bili/https://api.example.com/v1` },
+            ui: { notify: (msg: string, type?: string) => notes.push({ msg, type }) },
+        };
+        await cmd!.handler("", ctx);
+        assert.equal(notes.length, 1);
+        assert.equal(notes[0]!.type, "info");
+        assert.match(notes[0]!.msg, /📊 ACP status/);
+        assert.match(notes[0]!.msg, /context: 12\.3K \/ 200\.0K \(6\.2%\)/);
+        assert.match(notes[0]!.msg, /in\/out\/cached: 10\.0K \/ 1\.2K \/ 8\.0K/);
+        assert.match(notes[0]!.msg, /requests: 7/);
+        assert.match(notes[0]!.msg, /blocks: 2 \(1 active\)/);
+    } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+});
+
+test("/acp command warns when no proxy is detected", async () => {
+    await withEnv({ BILLION_CONTEXT_PROXY: undefined }, async () => {
+        const pi = makeFakePi();
+        biliPlugin(pi as never);
+        const cmd = pi.commands.get("acp")!;
+        const notes: Array<{ msg: string; type?: string }> = [];
+        const ctx = {
+            sessionManager: { getSessionId: () => "sess" },
+            model: { baseUrl: "https://api.example.com/v1" },
+            ui: { notify: (msg: string, type?: string) => notes.push({ msg, type }) },
+        };
+        await cmd.handler("", ctx);
+        assert.equal(notes.length, 1);
+        assert.equal(notes[0]!.type, "warning");
+        assert.match(notes[0]!.msg, /no proxy detected/);
+    });
+});
+
+test("/acp command warns when the session is unknown", async () => {
+    const server = http.createServer((req, res) => {
+        if (req.url?.startsWith("/__bili/plugin/status")) {
+            res.writeHead(404, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: "unknown plugin conversation" }));
+            return;
+        }
+        res.writeHead(404);
+        res.end("{}");
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    try {
+        const pi = makeFakePi();
+        biliPlugin(pi as never);
+        const cmd = pi.commands.get("acp")!;
+        const notes: Array<{ msg: string; type?: string }> = [];
+        const ctx = {
+            sessionManager: { getSessionId: () => "sess-unknown" },
+            model: { baseUrl: `${origin}/bili/https://api.example.com/v1` },
+            ui: { notify: (msg: string, type?: string) => notes.push({ msg, type }) },
+        };
+        await cmd.handler("", ctx);
+        assert.equal(notes.length, 1);
+        assert.equal(notes[0]!.type, "warning");
+        assert.match(notes[0]!.msg, /no ACP session yet/);
+    } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
 });
 
 test("omp entry reports x-bili-plugin: omp without env vars", async () => {
