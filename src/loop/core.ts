@@ -16,6 +16,7 @@ import {
 } from "../compress-tool.js";
 import { applyRanges } from "../stream.js";
 import { resolveDecompress } from "../decompress-shared.js";
+import { ABSORB_TOOL_NAME, executeAbsorb } from "../absorb.js";
 import { buildVisibilityMarker } from "../compress-loop.js";
 import { fetchWithTimeout } from "../fetch-util.js";
 import { proxyDispatcher } from "../upstream-proxy.js";
@@ -113,6 +114,9 @@ export function executeProxyTool(
     }
     if (toolName === "acp_status") {
         return handleAcpStatus(args, ctx);
+    }
+    if (toolName === ABSORB_TOOL_NAME) {
+        return executeAbsorb(args, ctx, callId);
     }
     return `[Unknown proxy tool: ${toolName}]`;
 }

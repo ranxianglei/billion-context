@@ -377,25 +377,31 @@ export const ACP_TOOLS_RESPONSES = [
  *  decompress/search_context/acp_status are injected as real function tools so
  *  the model can call them directly instead of emitting text triggers.
  *  Empirically (direct comfly A/B) declaring these tools does NOT disable
- *  codex code_mode — the earlier "tools can't coexist" assumption was wrong. */
+ *  codex code_mode — the earlier "tools can't coexist" assumption was wrong.
+ *  absorb is NOT here: it is opt-in (compress.absorb) and injected in addition
+ *  to these when enabled — see prepareResponses. */
 export const ACP_READONLY_TOOLS_RESPONSES = [
     DECOMPRESS_TOOL_RESPONSES,
     SEARCH_CONTEXT_TOOL_RESPONSES,
     ACP_STATUS_TOOL_RESPONSES,
 ] as const;
 
+import { ABSORB_TOOL_NAME } from "./absorb.js";
+
 export const PROXY_TOOL_NAMES: ReadonlySet<string> = new Set([
     COMPRESS_TOOL_NAME,
     DECOMPRESS_TOOL_NAME,
     SEARCH_CONTEXT_TOOL_NAME,
     ACP_STATUS_TOOL_NAME,
+    ABSORB_TOOL_NAME,
 ]);
 
-/** compress/decompress: mutate history → must drive the compress loop (their
- *  result is folded into the request before the model continues). */
+/** compress/decompress/absorb: mutate history → must drive the compress loop
+ *  (their result is folded into the request before the model continues). */
 export const MUTATING_PROXY_TOOLS: ReadonlySet<string> = new Set([
     COMPRESS_TOOL_NAME,
     DECOMPRESS_TOOL_NAME,
+    ABSORB_TOOL_NAME,
 ]);
 
 /** acp_status/search_context: read-only → must NOT loop. Looping them made the

@@ -10,6 +10,7 @@ import { parseCompressInput, PROXY_TOOL_NAMES, MUTATING_PROXY_TOOLS, COMPRESS_TO
 import { log as loggerLog } from "./logger.js";
 import { applyRanges } from "./stream.js";
 import { resolveDecompress } from "./decompress-shared.js";
+import { ABSORB_TOOL_NAME, executeAbsorb } from "./absorb.js";
 import { buildVisibilityMarker } from "./compress-loop.js";
 import { MAX_LOOP_ROUNDS } from "./loop/index.js";
 import { fetchWithTimeout } from "./fetch-util.js";
@@ -102,6 +103,9 @@ function executeProxyTool(
     }
     if (toolName === "acp_status") {
         return buildStatusReport(ctx.session.state, ctx.messages, estimateTokensFast);
+    }
+    if (toolName === ABSORB_TOOL_NAME) {
+        return executeAbsorb(args, ctx);
     }
     return `[Unknown proxy tool: ${toolName}]`;
 }

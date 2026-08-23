@@ -1,12 +1,14 @@
 import type { CompressionCore, Config, CoreMessage } from "acp-kernel";
 import type { Session } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput } from "./compress-tool.js";
+import { ABSORB_TOOL_NAME, executeAbsorb } from "./absorb.js";
 import { applyRanges, type RewriteCtx } from "./stream.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
 import { safeJsonParse } from "./util.js";
 
 type StreamState = {
     compressIndices: Set<number>;
+    absorbIndices: Set<number>;
     args: Record<number, string>;
     converted: boolean;
     sawReal: boolean;
@@ -18,6 +20,7 @@ type StreamState = {
 function newState(): StreamState {
     return {
         compressIndices: new Set(),
+        absorbIndices: new Set(),
         args: {},
         converted: false,
         sawReal: false,
@@ -122,11 +125,14 @@ function routeOpenaiEvent(rawEvent: string, state: StreamState): string | null {
                 if (name === COMPRESS_TOOL_NAME) {
                     state.compressIndices.add(tidx);
                     state.converted = true;
+                } else if (name === ABSORB_TOOL_NAME) {
+                    state.absorbIndices.add(tidx);
+                    state.converted = true;
                 } else {
                     state.sawReal = true;
                 }
             }
-            if (state.compressIndices.has(tidx)) {
+            if (state.compressIndices.has(tidx) || state.absorbIndices.has(tidx)) {
                 const frag = entry.function?.arguments;
                 if (typeof frag === "string") state.args[tidx] = (state.args[tidx] ?? "") + frag;
             } else {
@@ -147,7 +153,7 @@ function buildOpenaiTail(state: StreamState, ctx: RewriteCtx): string {
     if (!state.converted) return "";
     const base = (state.finishObj ?? { object: "chat.completion.chunk" }) as Record<string, unknown>;
     let out = "";
-    const sortedIndices = [...state.compressIndices].sort((a, b) => a - b);
+    const sortedIndices = [...state.compressIndices, ...state.absorbIndices].sort((a, b) => a - b);
     for (const tidx of sortedIndices) {
         const raw = state.args[tidx] ?? "";
         let parsed: unknown = {};
@@ -156,7 +162,10 @@ function buildOpenaiTail(state: StreamState, ctx: RewriteCtx): string {
         } catch {
             parsed = {};
         }
-        const note = applyRanges(parseCompressInput(parsed), ctx);
+        const args = (parsed && typeof parsed === "object" ? parsed : {}) as Record<string, unknown>;
+        const note = state.absorbIndices.has(tidx)
+            ? executeAbsorb(args, ctx)
+            : applyRanges(parseCompressInput(parsed), ctx);
         out += `data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: { content: note + "\n" }, finish_reason: null }] })}\n\n`;
     }
     let finalReason: string;
@@ -196,9 +205,14 @@ export function rewriteOpenaiJsonResponse(body: unknown, ctx: RewriteCtx): unkno
     const toolCalls = msg.tool_calls as Array<{ function?: { name?: string; arguments?: string } }> | undefined;
     if (Array.isArray(toolCalls)) {
         for (const tc of toolCalls) {
-            if (tc.function?.name === COMPRESS_TOOL_NAME) {
+            const name = tc.function?.name;
+            if (name === COMPRESS_TOOL_NAME) {
                 converted = true;
                 noteParts.push(applyRanges(parseCompressInput(safeJsonParse(tc.function?.arguments ?? "")), ctx));
+            } else if (name === ABSORB_TOOL_NAME) {
+                converted = true;
+                const args = safeJsonParse(tc.function?.arguments ?? "");
+                noteParts.push(executeAbsorb(args && typeof args === "object" ? args as Record<string, unknown> : {}, ctx));
             } else {
                 sawReal = true;
                 keepToolCalls.push(tc);

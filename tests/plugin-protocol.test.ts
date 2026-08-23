@@ -203,11 +203,11 @@ test("plugin manifest serves the exact wire tool schemas, headers and version", 
         assert.equal(manifest.ok, true);
         assert.equal(manifest.protocolVersion, 1);
         assert.ok(/^\d+\.\d+\.\d+/.test(manifest.version), `version looks wrong: ${manifest.version}`);
-        assert.deepEqual([...manifest.toolNames].sort(), ["acp_status", "compress", "decompress", "search_context"]);
+        assert.deepEqual([...manifest.toolNames].sort(), ["absorb", "acp_status", "compress", "decompress", "search_context"]);
         const names = manifest.tools.anthropic!.map((t) => t.name).sort();
-        assert.deepEqual(names, ["acp_status", "compress", "decompress", "search_context"]);
-        assert.equal(manifest.tools.openai!.length, 4);
-        assert.equal(manifest.tools.responses!.length, 4);
+        assert.deepEqual(names, ["absorb", "acp_status", "compress", "decompress", "search_context"]);
+        assert.equal(manifest.tools.openai!.length, 5);
+        assert.equal(manifest.tools.responses!.length, 5);
         assert.equal(manifest.headers.agent, "x-bili-plugin");
         assert.equal(manifest.headers.conversation, "x-bili-plugin-conversation");
         assert.equal(manifest.toolEndpoint, "/__bili/plugin/tool");

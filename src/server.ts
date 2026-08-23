@@ -39,7 +39,8 @@ import {
     subagentNamespace,
 } from "acp-kernel/wire";
 import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages } from "./session.js";
-import { COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressHybridSystemPrompt } from "./compress-tool.js";
+import { COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, parseCompressInput } from "./compress-tool.js";
+import { ABSORB_TOOL, ABSORB_TOOL_OPENAI, ABSORB_TOOL_NAME, ABSORB_TOOL_RESPONSES, buildAbsorbSystemPrompt } from "./absorb.js";
 import { rewriteSseStream, rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
 import { renderUI, handleConfigGet, handleConfigPut } from "./web/index.js";
@@ -868,7 +869,7 @@ function prepareAnthropic(
         // estimates to the kernel.
         extractSystem(parsed.system);
         const tokenCount = session.stats.lastInputTokens;
-        const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
+        const turn = core.processTurn({ messages: pluginMode ? hidePluginEchoCompressCalls(msgs, session.state) : msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
@@ -882,9 +883,9 @@ function prepareAnthropic(
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = coreToAnthropic(processedMessages as BiliMessage[], cacheControls);
 
-        systemOut = injectSystem(parsed, opts, prompts);
+        systemOut = injectSystem(parsed, opts, prompts, config.absorb?.enabled === true);
         if (injectTools) {
-            toolsOut = injectTool(parsed.tools);
+            toolsOut = injectTool(parsed.tools, config.absorb?.enabled === true);
         }
         // Nudge as a separate trailing user message (cache-friendly): the
         // system block stays byte-stable so the prefix cache survives.
@@ -906,6 +907,41 @@ function prepareAnthropic(
 
     const rebuilt: AnthropicRequestBody = { ...parsed, messages: rebuiltMessages, system: systemOut, tools: toolsOut };
     return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts } as Prepared;
+}
+
+// Plugin mode: the host executes compress natively (tool API) and echoes the
+// tool_use/tool_result pair on the next request. The block records the
+// plugin-side `plugin_*` call id, never the wire id, so the kernel sees an
+// orphan and keeps the pair visible (KEEP_LAST_ORPHANED=2, kernel 0.0.45).
+// The tail pair is a consumed echo — drop it; older echoes keep the kernel's
+// bounded-orphan treatment.
+function hidePluginEchoCompressCalls(
+    msgs: CoreMessage[],
+    state: { blocks?: Array<{ startRef?: string; endRef?: string }> },
+): CoreMessage[] {
+    const blocks = state.blocks ?? [];
+    if (blocks.length === 0) return msgs;
+    const executed = new Set<string>();
+    for (const b of blocks) {
+        if (b.startRef && b.endRef) executed.add(`${b.startRef}:${b.endRef}`);
+    }
+    if (executed.size === 0) return msgs;
+    const windowStart = Math.max(0, msgs.length - 4);
+    const hidden = new Set<string>();
+    for (let i = windowStart; i < msgs.length; i++) {
+        const m = msgs[i];
+        if (m.toolName !== COMPRESS_TOOL_NAME || m.contentType !== "tool-call" || !m.toolCallId) continue;
+        let args: unknown;
+        try {
+            args = JSON.parse(m.text ?? "{}");
+        } catch {
+            continue;
+        }
+        const ranges = parseCompressInput(args, m.toolCallId);
+        if (ranges.some((r) => executed.has(`${r.startRef}:${r.endRef}`))) hidden.add(m.toolCallId);
+    }
+    if (hidden.size === 0) return msgs;
+    return msgs.filter((m) => !(m.toolCallId && hidden.has(m.toolCallId)));
 }
 
 function prepareOpenai(
@@ -941,7 +977,7 @@ function prepareOpenai(
     const injectTools = shouldInject && !pluginMode;
 
     try {
-        const { msgs } = openaiToCore(parsed);
+        const { msgs, systemText } = openaiToCore(parsed);
         originalMessages = msgs;
         // tokenCount = upstream's real input_tokens from the previous turn
         // (see anthropic branch comment). Never an estimate.
@@ -967,10 +1003,17 @@ function prepareOpenai(
         // instead, mirroring pai-acp's design. Putting the nudge in system
         // would invalidate the cache every turn.
         const sysParts: string[] = [];
+        // Kernel >= 0.0.45 hoists the leading system/developer prefix out of
+        // the fold space; without re-injection the host system prompt is lost.
+        if (systemText) sysParts.push(systemText);
         if (shouldInject) sysParts.push(buildCompressSystemPrompt(prompts));
+        if (shouldInject && config.absorb?.enabled) sysParts.push(buildAbsorbSystemPrompt(ABSORB_TOOL_NAME));
         rebuiltMessages = injectOpenaiSystem(rebuiltMessages, sysParts);
+        if (systemText && parsed.messages[0]?.role === "developer" && rebuiltMessages[0]?.role === "system") {
+            rebuiltMessages = [{ ...rebuiltMessages[0], role: "developer" }, ...rebuiltMessages.slice(1)];
+        }
         if (injectTools) {
-            toolsOut = injectOpenaiTool(parsed.tools);
+            toolsOut = injectOpenaiTool(parsed.tools, config.absorb?.enabled === true);
         }
         // Nudge as a separate trailing user message (cache-friendly).
         if (opts.compress.injectNudge && turn.nudge?.shouldInject && shouldInject) {
@@ -1056,13 +1099,14 @@ function prepareResponses(
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltInput = patchResponsesInput(projection, processedMessages);
         if (shouldInject && !process.env.ACP_NO_COMPRESS_PROMPT) {
-            const prompt = responsesTextProtocol ? buildCompressHybridSystemPrompt(prompts) : buildCompressSystemPrompt(prompts);
+            let prompt = responsesTextProtocol ? buildCompressHybridSystemPrompt(prompts) : buildCompressSystemPrompt(prompts);
+            if (config.absorb?.enabled) prompt += `\n\n${buildAbsorbSystemPrompt(ABSORB_TOOL_NAME)}`;
             const devContent = [...projection.systemParts, prompt].join("\n\n---\n\n");
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent);
             if (!process.env.ACP_NO_INJECT_TOOL && injectTools) {
                 toolsOut = responsesTextProtocol
-                    ? injectResponsesTool(parsed.tools, ACP_READONLY_TOOLS_RESPONSES)
-                    : injectResponsesTool(parsed.tools);
+                    ? injectResponsesTool(parsed.tools, config.absorb?.enabled ? [...ACP_READONLY_TOOLS_RESPONSES, ABSORB_TOOL_RESPONSES] : ACP_READONLY_TOOLS_RESPONSES)
+                    : injectResponsesTool(parsed.tools, config.absorb?.enabled ? [...ACP_TOOLS_RESPONSES, ABSORB_TOOL_RESPONSES] : ACP_TOOLS_RESPONSES);
             }
         } else if (projection.systemParts.length > 0) {
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, projection.systemParts.join("\n\n---\n\n"));
@@ -1238,6 +1282,7 @@ function injectSystem(
     parsed: AnthropicRequestBody,
     opts: ProxyOptions,
     prompts: Prompts = defaultPrompts,
+    absorbOn = false,
 ): string | AnthropicRequestBody["system"] {
     // ONLY the static compress prompt goes into the system block — it is the
     // prefix-cache anchor and must stay byte-stable across turns. The nudge
@@ -1246,26 +1291,29 @@ function injectSystem(
     const baseText = extractSystem(parsed.system);
     const parts: string[] = [];
     if (opts.compress.injectTool) parts.push(buildCompressSystemPrompt(prompts));
+    if (absorbOn) parts.push(buildAbsorbSystemPrompt(ABSORB_TOOL_NAME));
     if (parts.length === 0) return parsed.system;
     const full = baseText ? `${baseText}\n\n---\n\n${parts.join("\n\n")}` : parts.join("\n\n");
     return buildSystem(full, parsed.system);
 }
 
-function injectTool(tools: unknown[] | undefined): unknown[] {
-    if (!Array.isArray(tools)) return [...ACP_TOOLS_ANTHROPIC];
+function injectTool(tools: unknown[] | undefined, absorbOn = false): unknown[] {
+    const all = absorbOn ? [...ACP_TOOLS_ANTHROPIC, ABSORB_TOOL] : [...ACP_TOOLS_ANTHROPIC];
+    if (!Array.isArray(tools)) return all;
     const names = new Set(tools.map((t) => (t as { name?: string })?.name));
-    const missing = ACP_TOOLS_ANTHROPIC.filter((t) => !names.has(t.name));
+    const missing = all.filter((t) => !names.has(t.name));
     return missing.length === 0 ? tools : [...tools, ...missing];
 }
 
-function injectOpenaiTool(tools: OpenAITool[] | undefined): OpenAITool[] {
-    if (!Array.isArray(tools)) return [...ACP_TOOLS_OPENAI] as OpenAITool[];
+function injectOpenaiTool(tools: OpenAITool[] | undefined, absorbOn = false): OpenAITool[] {
+    const all = absorbOn ? [...ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI] : [...ACP_TOOLS_OPENAI];
+    if (!Array.isArray(tools)) return all as OpenAITool[];
     const present = new Set(
         tools
             .map((t) => t?.function?.name)
             .filter((n): n is string => typeof n === "string"),
     );
-    const additions = ACP_TOOLS_OPENAI.filter((t) => !present.has(t.function.name));
+    const additions = all.filter((t) => !present.has(t.function.name));
     return [...tools, ...(additions as OpenAITool[])];
 }
 
@@ -1278,8 +1326,7 @@ const FORCE_TEXT_PROTOCOL = process.env.ACP_COMPRESS_PROTOCOL === "text";
 /** Inject all ACP tools (compress/decompress/search_context/acp_status) in
  *  Responses API flat format, matching the PROXY_TOOL_NAMES set the compress
  *  loop dispatches on. Idempotent. */
-function injectResponsesTool(tools: unknown[] | undefined, toolsToAdd: readonly { name: string }[] = ACP_TOOLS_RESPONSES): unknown[] {
-    if (!Array.isArray(tools)) return [...toolsToAdd];
+function injectResponsesTool(tools: unknown[] | undefined, toolsToAdd: readonly { name: string }[] = ACP_TOOLS_RESPONSES): unknown[] {    if (!Array.isArray(tools)) return [...toolsToAdd];
     const present = new Set(
         tools
             .map((t) => (t as { name?: string })?.name)
@@ -1633,7 +1680,8 @@ async function forward(
             const parsedReq = JSON.parse(typeof body === "string" ? body : body.toString("utf8"));
             const reqHeaders = buildForwardHeaders(headers);
             const textProtocol = prepared.protocol === "responses" && !!prepared.responsesTextProtocol;
-            const systemPrompt = textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts);
+            let systemPrompt = textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts);
+            if (config.absorb?.enabled) systemPrompt += `\n\n${buildAbsorbSystemPrompt(ABSORB_TOOL_NAME)}`;
             const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem);
             const loop = runCompressLoop(
                 streamToRead,

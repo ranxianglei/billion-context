@@ -280,7 +280,7 @@ test("mcp stdio shell: manifest → tools/list → tools/call forwards to the pl
     const init = byId(1) as { result?: { serverInfo?: { name?: string } } };
     assert.equal(init.result?.serverInfo?.name, "bili");
     const tools = byId(2) as { result?: { tools?: { name: string }[] } };
-    assert.deepEqual(tools.result?.tools?.map((t) => t.name).sort(), ["acp_status", "compress", "decompress", "search_context"]);
+    assert.deepEqual(tools.result?.tools?.map((t) => t.name).sort(), ["absorb", "acp_status", "compress", "decompress", "search_context"]);
     const call = byId(3) as { result?: { content?: { text?: string }[]; isError?: boolean } };
     assert.equal(call.result?.isError, false);
     assert.match(call.result?.content?.[0]?.text ?? "", /CONTEXT BREAKDOWN/, "acp_status result forwarded verbatim");
@@ -348,7 +348,7 @@ test("mcp stdio shell (codex style): BILI_CONVERSATION_ID self-register → head
 
     const byId = (n: number): Record<string, unknown> => JSON.parse(lines.find((l) => (JSON.parse(l) as { id?: number }).id === n) ?? "{}");
     const tools = byId(2) as { result?: { tools?: { name: string }[] } };
-    assert.deepEqual(tools.result?.tools?.map((t) => t.name).sort(), ["acp_status", "compress", "decompress", "search_context"], "tools listed");
+    assert.deepEqual(tools.result?.tools?.map((t) => t.name).sort(), ["absorb", "acp_status", "compress", "decompress", "search_context"], "tools listed");
     const call = byId(3) as { result?: { content?: { text?: string }[]; isError?: boolean } };
     assert.equal(call.result?.isError, false, `tools/call succeeded (self-registered conversation bound)${call.result?.isError ? ": " + (call.result?.content?.[0]?.text ?? "") : ""}`);
     assert.match(call.result?.content?.[0]?.text ?? "", /CONTEXT BREAKDOWN/);

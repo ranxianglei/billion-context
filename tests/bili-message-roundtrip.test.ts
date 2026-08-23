@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { anthropicToCore, coreToAnthropic } from "acp-kernel/wire";
-import { openaiToCore, coreToOpenai } from "acp-kernel/wire";
+import { openaiToCore, coreToOpenai, injectOpenaiSystem } from "acp-kernel/wire";
 import { responsesToCore, coreToResponses } from "acp-kernel/wire";
 import type { AnthropicBlock, AnthropicRequestBody } from "acp-kernel/wire";
 import type { OpenAIRequestBody } from "acp-kernel/wire";
@@ -92,24 +92,31 @@ test("anthropic: tool_result without is_error stays clean", () => {
     assert.equal(tr.is_error, undefined, "no spurious is_error");
 });
 
-// 4. OpenAI developer role round-trips (was collapsed to system).
-test("openai: developer role is restored", () => {
+// 4. OpenAI developer role round-trips (was collapsed to system). Since the
+// kernel's system-hoist (0.0.45) the LEADING system/developer prefix is lifted
+// out of the fold space into systemText; the proxy re-injects it via
+// injectOpenaiSystem and restores the original head role (developer).
+test("openai: leading developer head is hoisted and re-injected", () => {
     const body: OpenAIRequestBody = { messages: [{ role: "developer", content: "you are a dev" }] };
-    const { msgs } = openaiToCore(body);
-    assert.equal(msgs[0]?.role, "system", "kernel sees system");
-    assert.equal(msgs[0]?.originalRole, "developer", "originalRole sidecar stored");
+    const { msgs, systemText } = openaiToCore(body);
+    assert.equal(msgs.length, 0, "leading system/developer is hoisted out of msgs");
+    assert.equal(systemText, "you are a dev");
     const rebuilt = coreToOpenai(msgs);
-    assert.equal(rebuilt[0]?.role, "developer", "developer role reconstructed");
-    assert.equal(rebuilt[0]?.content, "you are a dev");
+    assert.equal(rebuilt.length, 0);
+    const withSystem = injectOpenaiSystem(rebuilt, [systemText]);
+    assert.equal(withSystem[0]?.role, "system");
+    assert.equal(withSystem[0]?.content, "you are a dev");
 });
 
-// 4b. Sanity: a plain system role is NOT promoted to developer.
-test("openai: system role stays system", () => {
+// 4b. Sanity: a plain system head hoists the same way.
+test("openai: leading system head is hoisted and re-injected", () => {
     const body: OpenAIRequestBody = { messages: [{ role: "system", content: "sys" }] };
-    const { msgs } = openaiToCore(body);
-    assert.equal(msgs[0]?.originalRole, "system");
-    const rebuilt = coreToOpenai(msgs);
-    assert.equal(rebuilt[0]?.role, "system");
+    const { msgs, systemText } = openaiToCore(body);
+    assert.equal(msgs.length, 0);
+    assert.equal(systemText, "sys");
+    const withSystem = injectOpenaiSystem(coreToOpenai(msgs), [systemText]);
+    assert.equal(withSystem[0]?.role, "system");
+    assert.equal(withSystem[0]?.content, "sys");
 });
 
 // 5. OpenAI image_url round-trips (image was previously dropped entirely).

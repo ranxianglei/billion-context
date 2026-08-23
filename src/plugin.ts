@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { acquireInFlight, markDirty, peekSession, releaseInFlight, withSessionLock, type Session } from "./session.js";
 import { ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, PROXY_TOOL_NAMES } from "./compress-tool.js";
+import { ABSORB_TOOL, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES } from "./absorb.js";
 import { executeProxyTool } from "./loop/core.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
 import type { WireProtocol } from "./util.js";
@@ -210,9 +211,9 @@ export function handlePluginManifest(res: import("node:http").ServerResponse): v
         version: VERSION,
         toolNames: [...PROXY_TOOL_NAMES],
         tools: {
-            anthropic: ACP_TOOLS_ANTHROPIC,
-            openai: ACP_TOOLS_OPENAI,
-            responses: ACP_TOOLS_RESPONSES,
+            anthropic: [...ACP_TOOLS_ANTHROPIC, ABSORB_TOOL],
+            openai: [...ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI],
+            responses: [...ACP_TOOLS_RESPONSES, ABSORB_TOOL_RESPONSES],
         },
         headers: { agent: PLUGIN_AGENT_HEADER, conversation: PLUGIN_CONVERSATION_HEADER, contextWindow: PLUGIN_CONTEXT_WINDOW_HEADER },
         toolEndpoint: "/__bili/plugin/tool",

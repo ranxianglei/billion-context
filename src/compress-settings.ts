@@ -1,5 +1,6 @@
 import { defaultPrompts, resolvePrompts, type Config, type Prompts } from "acp-kernel";
 import { findRoute, type CompressSettings, type ProviderRoutes } from "./config.js";
+import { applyAbsorbConfig } from "./absorb.js";
 import { log as loggerLog } from "./logger.js";
 
 /** Resolve a raw `contextLimit` value to an absolute token count.
@@ -52,6 +53,7 @@ export function mergeCompress(
         tiers: pick("tiers"),
         prompts: promptLevels.length > 0 ? Object.assign({}, ...promptLevels) : undefined,
         acknowledgePromptsRisk: pick("acknowledgePromptsRisk"),
+        absorb: pick("absorb"),
     };
 }
 
@@ -113,8 +115,9 @@ export function hasCompressSettings(s: CompressSettings): boolean {
  *  - `minCompressRange` → `compress.minCompressRange`.
  *  - `tiers` → `tiers.enabled`. */
 export function applyCompressSettings(base: Config, limit: number, s: CompressSettings): Config {
-    const nudge = { ...base.nudge };
-    const truncate = { ...base.truncate };
+    const withAbsorb = applyAbsorbConfig(base, s);
+    const nudge = { ...withAbsorb.nudge };
+    const truncate = { ...withAbsorb.truncate };
     if (s.maxContextLimit !== undefined) nudge.maxContextLimitPct = parsePercent(s.maxContextLimit);
     if (s.emergencyThresholdPercent !== undefined) {
         const pct = parsePercent(s.emergencyThresholdPercent);
@@ -125,19 +128,19 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
         nudge.growthFloor = s.nudgeGrowthTokens;
         nudge.growthCap = s.nudgeGrowthTokens;
     }
-    const tiers = { ...base.tiers };
+    const tiers = { ...withAbsorb.tiers };
     if (s.tiers !== undefined) tiers.enabled = s.tiers;
     return {
-        ...base,
+        ...withAbsorb,
         modelContextLimit: limit,
         nudge,
         truncate,
         tiers,
-        preserveRecentMessages: s.preserveRecentMessages ?? base.preserveRecentMessages,
-        preserveRecentTokens: s.preserveRecentTokens ?? base.preserveRecentTokens,
+        preserveRecentMessages: s.preserveRecentMessages ?? withAbsorb.preserveRecentMessages,
+        preserveRecentTokens: s.preserveRecentTokens ?? withAbsorb.preserveRecentTokens,
         compress: {
-            ...base.compress,
-            minCompressRange: s.minCompressRange ?? base.compress.minCompressRange,
+            ...withAbsorb.compress,
+            minCompressRange: s.minCompressRange ?? withAbsorb.compress.minCompressRange,
         },
     };
 }

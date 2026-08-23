@@ -54,6 +54,21 @@ export type ModelEntry = {
     compress?: CompressSettings;
 };
 
+export type AbsorbSettings = {
+    /** Explicit on/off when using the object form (default true). */
+    enabled?: boolean;
+    /** Minimum estimated tokens of a tool result before it gets the forced
+     *  absorb prompt (kernel `absorb.minToolTokens`, default 1000). */
+    minToolTokens?: number;
+    /** Only prompt for absorb once context usage passes this fraction of the
+     *  window. Accepts a ratio (0.3) or percent string ("30%"). 0 = size alone
+     *  decides (kernel `absorb.contextThresholdPct`, default 0). */
+    contextThresholdPct?: number | string;
+    /** Tool names whose results are never absorb-prompted
+     *  (kernel `absorb.excludeTools`). */
+    excludeTools?: string[];
+};
+
 /** User-facing compression tuning. Configurable at three levels — global
  *  (config root `compress`), per-provider (`providers[url].compress`), per-model
  *  (`providers[url].models[model].compress`) — merged deepest-field-wins by
@@ -108,6 +123,14 @@ export type CompressSettings = {
     /** Must be true for `prompts` overrides to take effect. Acknowledges the
      *  summary-quality risk documented on `prompts`. */
     acknowledgePromptsRisk?: boolean;
+    /** Instant tool-result absorption for small contexts: large tool results
+     *  get a forced prompt telling the model to immediately distill them via
+     *  the injected `absorb` tool; the original pair is hidden from later
+     *  turns and the model's summary (carried in the absorb result text) is
+     *  the durable record. `true` = defaults; object form tunes the knobs
+     *  (see AbsorbSettings). Absorbed results stay compressible like any
+     *  other content. Default: off. */
+    absorb?: boolean | AbsorbSettings;
 };
 export type PromptCacheRouting = "auto" | "enabled" | "disabled";
 export type UpstreamProxyMode = "auto" | "manual" | "direct";
