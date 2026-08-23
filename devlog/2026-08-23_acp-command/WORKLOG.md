@@ -197,3 +197,16 @@ start). Both are in this branch's uncommitted changes on top of the `/acp` commi
   an entry whose key EQUALS the request's `prompt_cache_key`; then
   `GET /__bili/plugin/status?conversationId=<that id>` (what `/acp` does) returns
   `ok:true` with the rendered `buildStatusPanel`.
+
+### 8.3 Show the proxy version in the /acp panel
+
+- **Request**: user asked to add a version number to the /acp panel, aligned with
+  billion-context-pi's format.
+- **Reference**: billion-context-pi passes `version: billion-context-pi@${CURRENT_VERSION}`
+  (a build-time injected constant) to `buildStatusPanel` (src/commands.ts:128-130).
+- **Fix** (`src/plugin.ts`): added a `PROXY_VERSION` constant (reads `package.json`
+  at runtime, same pattern as `src/cli.ts`'s `VERSION`) and passed
+  `version: billion-context@${PROXY_VERSION}` to `buildStatusPanel`. The panel now
+  shows `billion-context@0.1.46` under the header, aligned with pi's format.
+- **Verification**: e2e test → panel renders `billion-context@0.1.46`; typecheck
+  PASS, 526 tests pass, build PASS.

@@ -10,6 +10,19 @@ import { normalizeSseLineEndings } from "./sse-util.js";
 import type { WireProtocol } from "./util.js";
 import { stateDir } from "./paths.js";
 
+// The proxy's own version, read from package.json at runtime (works in both dev
+// via tsx and bundled via tsup). Shown in the /acp panel header, aligned with
+// billion-context-pi's `billion-context-pi@<version>` format.
+const PROXY_VERSION = (() => {
+    try {
+        const here = fileURLToPath(import.meta.url);
+        const pkg = path.join(path.dirname(here), "..", "package.json");
+        return (JSON.parse(fs.readFileSync(pkg, "utf8")).version as string) ?? "dev";
+    } catch {
+        return "dev";
+    }
+})();
+
 // Cooperative plugin protocol ("内外呼应", issue #1): an agent-side plugin
 // registers the ACP tools NATIVELY with its agent and runs the agent's own
 // tool loop, while the proxy stays the single compression authority (state,
@@ -297,6 +310,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     let panel: string | undefined;
     try {
         panel = buildStatusPanel({
+            version: `billion-context@${PROXY_VERSION}`,
             tokenCount: session.stats.lastInputTokens,
             systemPromptTokens: 0,
             state: session.state,
