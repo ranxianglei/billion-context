@@ -32,6 +32,15 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, type StdioOptions } from "node:child_process";
 import { DEFAULT_MITM_DOMAINS } from "./mitm.js";
+import { selfPackageRoot } from "./plugin-install.js";
+
+/** Absolute path of a file inside our dist/, resolved via the package root
+ * (import.meta.url-based) so it survives global-installed symlink bins
+ * (~/.local/bin/bili → .../node_modules/billion-context) — process.argv[1]
+ * stays at the symlink and would break path.resolve(dirname(argv[1]), ...). */
+function selfDistFile(name: string): string {
+    return path.join(selfPackageRoot(), "dist", name);
+}
 import { nonEmpty, resolvePiHome, resolveOmpHome, loadClientConfig, type ClientConfig, resolveOpencodeConfigFile, type OpencodeConfig, type OpencodeProvider } from "./client-config.js";
 
 export {
@@ -327,7 +336,7 @@ export function launcherInjectMcp(env: NodeJS.ProcessEnv, base: string): boolean
  *  "bili" stdio server running dist/mcp.js. Args are kept flat so codex's
  *  TOML value parser stays happy. */
 export function buildMcpConfig(origin: string): { mcpServers: { bili: { command: string; args: string[]; env: Record<string, string> } } } {
-    const script = process.argv[1] ? path.resolve(path.dirname(process.argv[1]), "mcp.js") : "bili-mcp";
+    const script = selfDistFile("mcp.js");
     return {
         mcpServers: {
             bili: {
@@ -361,7 +370,7 @@ export function buildClaudePluginEnv(origin: string, directUrl: boolean, baseEnv
  *  warning). Without it every native tool call fails with "no conversation
  *  id". */
 export function buildCodexMcpArgs(origin: string, conversationId: string): string[] {
-    const script = process.argv[1] ? path.resolve(path.dirname(process.argv[1]), "mcp.js") : "bili-mcp";
+    const script = selfDistFile("mcp.js");
     return [
         "-c",
         `mcp_servers.bili.command=${JSON.stringify(process.execPath)}`,
@@ -836,7 +845,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // OPENCODE_CONFIG (real config untouched). BILLION_CONTEXT_PROXY makes
         // opencode-acp self-disable so the proxy owns the ACP tools.
         env = { ...process.env, HTTPS_PROXY: origin, NODE_EXTRA_CA_CERTS: ca, BILLION_CONTEXT_PROXY: origin };
-        const opencodePlugin = process.argv[1] ? path.resolve(path.dirname(process.argv[1]), "agent", "opencode.js") : undefined;
+        const opencodePlugin = selfDistFile("agent/opencode.js");
         const opencodePluginPath = opencodePlugin && fs.existsSync(opencodePlugin) ? opencodePlugin : undefined;
         opencodeTmpFile = prepareOpencodeHttpRewrite(resolveOpencodeConfigFile(process.env), origin, routes.httpRewrites, routes.httpsRewrites, opencodePluginPath);
         if (opencodeTmpFile) env.OPENCODE_CONFIG = opencodeTmpFile;

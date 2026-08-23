@@ -60,6 +60,22 @@
   param → 404. PASS.
 - Real `~/.config/opencode/opencode.json` byte-identical; temp dirs cleaned.
 
+## Follow-up fix — symlink-safe dist path resolution
+Symptom: user's `bili opencode` TUI (22:44) loaded the temp config and
+opencode-acp/awork/omo but NOT `dist/agent/opencode.js`, while `node
+dist/index.js opencode` (same dist) injected it fine.
+Root cause: the launcher resolved the plugin as
+`path.resolve(path.dirname(process.argv[1]), "agent/opencode.js")` — via the
+global bin symlink `~/.local/.../bin/bili` that dirname is the bin dir, so
+`existsSync` failed and the plugin was silently skipped. Same latent bug in
+`buildMcpConfig` / `buildCodexMcpArgs` (dist/mcp.js).
+Fix: added `selfDistFile(name)` = `path.join(selfPackageRoot(), "dist", name)`
+(selfPackageRoot is import.meta.url-based, so Node's realpath resolution
+makes it symlink-safe); used it at all three sites.
+Verified: `bili opencode run "reply with exactly: pong"` through the global
+symlink now prints `[bili-opencode] plugin active` and the session log shows
+`dist/agent/opencode.js loading plugin`. 530 tests pass, typecheck/build OK.
+
 ## Rollback
 Revert this commit. No data-format or protocol changes; the fallback param is
 additive and ignored by older callers.
