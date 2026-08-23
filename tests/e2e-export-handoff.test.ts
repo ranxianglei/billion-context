@@ -73,7 +73,7 @@ test("e2e export: real proxy compresses via real tool call, block persists, bili
                 res.end(JSON.stringify(payload));
             };
 
-            if (!compressSent && toolNames.includes("compress") && refs.length >= 4) {
+            if (!compressSent && toolNames.includes("bili_compress") && refs.length >= 4) {
                 compressSent = true;
                 const [startId, endId] = [refs[2]!, refs[3]!];
                 json({
@@ -89,7 +89,7 @@ test("e2e export: real proxy compresses via real tool call, block persists, bili
                                 id: "call_compress_1",
                                 type: "function",
                                 function: {
-                                    name: "compress",
+                                    name: "bili_compress",
                                     arguments: JSON.stringify({
                                         content: [{
                                             startId,

@@ -256,7 +256,7 @@ test("pi extension is inert without a proxy", async () => {
     assert.equal(pi.tools.length, 0);
 });
 
-test("/acp command is registered and renders proxy status", async () => {
+test("/bili command is registered and renders proxy status", async () => {
     const server = http.createServer((req, res) => {
         if (req.url?.startsWith("/__bili/plugin/status")) {
             res.writeHead(200, { "content-type": "application/json" });
@@ -281,7 +281,7 @@ test("/acp command is registered and renders proxy status", async () => {
     try {
         const pi = makeFakePi();
         biliPlugin(pi as never);
-        const cmd = pi.commands.get("acp");
+        const cmd = pi.commands.get("bili");
         assert.ok(cmd, "acp command should be registered");
         assert.match(cmd!.description ?? "", /ACP/);
         const notes: Array<{ msg: string; type?: string }> = [];
@@ -303,11 +303,11 @@ test("/acp command is registered and renders proxy status", async () => {
     }
 });
 
-test("/acp command warns when no proxy is detected", async () => {
+test("/bili command warns when no proxy is detected", async () => {
     await withEnv({ BILLION_CONTEXT_PROXY: undefined }, async () => {
         const pi = makeFakePi();
         biliPlugin(pi as never);
-        const cmd = pi.commands.get("acp")!;
+        const cmd = pi.commands.get("bili")!;
         const notes: Array<{ msg: string; type?: string }> = [];
         const ctx = {
             sessionManager: { getSessionId: () => "sess" },
@@ -321,7 +321,7 @@ test("/acp command warns when no proxy is detected", async () => {
     });
 });
 
-test("/acp command warns when the session is unknown", async () => {
+test("/bili command warns when the session is unknown", async () => {
     const server = http.createServer((req, res) => {
         if (req.url?.startsWith("/__bili/plugin/status")) {
             res.writeHead(404, { "content-type": "application/json" });
@@ -337,7 +337,7 @@ test("/acp command warns when the session is unknown", async () => {
     try {
         const pi = makeFakePi();
         biliPlugin(pi as never);
-        const cmd = pi.commands.get("acp")!;
+        const cmd = pi.commands.get("bili")!;
         const notes: Array<{ msg: string; type?: string }> = [];
         const ctx = {
             sessionManager: { getSessionId: () => "sess-unknown" },

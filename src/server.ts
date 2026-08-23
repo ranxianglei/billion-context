@@ -39,7 +39,7 @@ import {
     subagentNamespace,
 } from "acp-kernel/wire";
 import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages } from "./session.js";
-import { COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressHybridSystemPrompt } from "./compress-tool.js";
+import { COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES, biliToolName } from "./compress-tool.js";
 import { rewriteSseStream, rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
 import { renderUI, handleConfigGet, handleConfigPut } from "./web/index.js";
@@ -1290,20 +1290,20 @@ function injectSystem(
 }
 
 function injectTool(tools: unknown[] | undefined): unknown[] {
-    if (!Array.isArray(tools)) return [...ACP_TOOLS_ANTHROPIC];
+    if (!Array.isArray(tools)) return [...BILI_ACP_TOOLS_ANTHROPIC];
     const names = new Set(tools.map((t) => (t as { name?: string })?.name));
-    const missing = ACP_TOOLS_ANTHROPIC.filter((t) => !names.has(t.name));
+    const missing = BILI_ACP_TOOLS_ANTHROPIC.filter((t) => !names.has(t.name));
     return missing.length === 0 ? tools : [...tools, ...missing];
 }
 
 function injectOpenaiTool(tools: OpenAITool[] | undefined): OpenAITool[] {
-    if (!Array.isArray(tools)) return [...ACP_TOOLS_OPENAI] as OpenAITool[];
+    if (!Array.isArray(tools)) return [...BILI_ACP_TOOLS_OPENAI] as OpenAITool[];
     const present = new Set(
         tools
             .map((t) => t?.function?.name)
             .filter((n): n is string => typeof n === "string"),
     );
-    const additions = ACP_TOOLS_OPENAI.filter((t) => !present.has(t.function.name));
+    const additions = BILI_ACP_TOOLS_OPENAI.filter((t) => !present.has(t.function.name));
     return [...tools, ...(additions as OpenAITool[])];
 }
 
@@ -1316,7 +1316,7 @@ const FORCE_TEXT_PROTOCOL = process.env.ACP_COMPRESS_PROTOCOL === "text";
 /** Inject all ACP tools (compress/decompress/search_context/acp_status) in
  *  Responses API flat format, matching the PROXY_TOOL_NAMES set the compress
  *  loop dispatches on. Idempotent. */
-function injectResponsesTool(tools: unknown[] | undefined, toolsToAdd: readonly { name: string }[] = ACP_TOOLS_RESPONSES): unknown[] {
+function injectResponsesTool(tools: unknown[] | undefined, toolsToAdd: readonly { name: string }[] = BILI_ACP_TOOLS_RESPONSES): unknown[] {
     if (!Array.isArray(tools)) return [...toolsToAdd];
     const present = new Set(
         tools

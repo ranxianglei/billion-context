@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import path from "node:path";
 import { acquireInFlight, markDirty, peekSession, releaseInFlight, withSessionLock, type Session } from "./session.js";
-import { ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, PROXY_TOOL_NAMES } from "./compress-tool.js";
+import { ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, PROXY_TOOL_NAMES, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES, BILI_PROXY_TOOL_NAMES, BILI_TOOL_NAMES, biliToolName } from "./compress-tool.js";
 import { executeProxyTool } from "./loop/core.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
 import type { WireProtocol } from "./util.js";
@@ -275,11 +275,11 @@ export function handlePluginManifest(res: import("node:http").ServerResponse): v
         protocolVersion: PLUGIN_PROTOCOL_VERSION,
         proxy: "billion-context",
         version: VERSION,
-        toolNames: [...PROXY_TOOL_NAMES],
+        toolNames: Object.values(BILI_TOOL_NAMES),
         tools: {
-            anthropic: ACP_TOOLS_ANTHROPIC,
-            openai: ACP_TOOLS_OPENAI,
-            responses: ACP_TOOLS_RESPONSES,
+            anthropic: BILI_ACP_TOOLS_ANTHROPIC,
+            openai: BILI_ACP_TOOLS_OPENAI,
+            responses: BILI_ACP_TOOLS_RESPONSES,
         },
         headers: { agent: PLUGIN_AGENT_HEADER, conversation: PLUGIN_CONVERSATION_HEADER, contextWindow: PLUGIN_CONTEXT_WINDOW_HEADER },
         toolEndpoint: "/__bili/plugin/tool",
@@ -362,9 +362,9 @@ export async function handlePluginTool(
         res.end(JSON.stringify({ ok: false, error: `conversationId is required (send the same value as the ${PLUGIN_CONVERSATION_HEADER} header)` }));
         return;
     }
-    if (!PROXY_TOOL_NAMES.has(tool)) {
+    if (!BILI_PROXY_TOOL_NAMES.has(tool)) {
         res.writeHead(400, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: false, error: `unknown tool "${tool}" (expected one of: ${[...PROXY_TOOL_NAMES].join(", ")})` }));
+        res.end(JSON.stringify({ ok: false, error: `unknown tool "${tool}" (expected one of: ${[...BILI_PROXY_TOOL_NAMES].join(", ")})` }));
         return;
     }
     const entry = conversations.get(conversationId);
