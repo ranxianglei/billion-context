@@ -28,6 +28,8 @@ export interface LoopCtx {
     core: CompressionCore;
     config: Config;
     messages: CoreMessage[];
+    /** View handed to applyCompression (see RewriteCtx.compressMessages). */
+    compressMessages?: CoreMessage[];
     session: Session;
     log: (msg: string) => void;
     proxyUrl?: string;

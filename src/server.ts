@@ -1,6 +1,6 @@
 import http from "node:http";
 import fs from "node:fs";
-import { createCore, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, type Prompts, defaultPrompts, estimateTokensFast, renderNudgeText, deactivateBlock } from "acp-kernel";
+import { createCore, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, type Prompts, defaultPrompts, estimateTokensFast, renderNudgeText, deactivateBlock, viableRanges } from "acp-kernel";
 import { resolveCompress, resolveCompressPrompts, resolveRequestConfig } from "./compress-settings.js";
 import type { ProxyOptions } from "./config.js";
 import { loadOptions, loadRoutes } from "./config.js";
@@ -53,7 +53,7 @@ import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { emitStreamError } from "./stream-error.js";
 import { deriveSessionId as deriveProxySessionId, affinityToken, clientConversationHeader, type ConversationIdentity } from "./session-id.js";
-import { consumePluginRegisterFor, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, pipePluginJson, pipeThroughWithUsage, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
+import { consumePluginRegisterFor, flushConversations, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, loadConversations, pipePluginJson, pipeThroughWithUsage, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import { isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, shouldReserveOutputHeadroom, usageTotals } from "./util.js";
@@ -166,6 +166,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // that survived a restart keep their folded view (otherwise long sessions
     // re-send oversized raw history and hang).
     await initSessions();
+    loadConversations();
     log("info", `[persist] ${getStore().enabled ? "enabled" : "disabled"}`);
     if (filePath) {
         log("info", `[log] writing to ${filePath}`);
@@ -251,6 +252,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         log("error", `listen failed: ${err.code ?? ""} ${err.message}${hint}`);
         shuttingDown = true;
         server.close();
+        flushConversations();
         void flushAllSessions().finally(() => {
             closeLogger();
             process.exit(1);
@@ -279,6 +281,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         // before invoking cb, so in-flight SSE streams get a chance to finish
         // rather than being yanked mid-chunk.
         server.close(() => {
+            flushConversations();
             void flushAllSessions().finally(() => {
                 closeLogger();
                 process.exit(0);
@@ -288,6 +291,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         // block shutdown forever — force-exit after a grace window.
         setTimeout(() => {
             log("warn", "shutdown grace window elapsed; forcing exit");
+            flushConversations();
             void flushAllSessions().finally(() => {
                 closeLogger();
                 process.exit(0);
@@ -326,6 +330,10 @@ type Prepared = {
     resetAfterSuccess?: boolean;
     responsesProjection?: ResponsesProjection;
     anthropicSystem?: AnthropicRequestBody["system"];
+    /** Original leading system/developer prefix text captured by the kernel's
+     *  openai hoist (0.0.37). The fold space no longer carries it, so every
+     *  rebuilt payload and compress-loop round must re-inject it. */
+    openaiSystemText?: string;
     nudge?: NudgeDecision;
     /** Effective compression prompts for this request (three-level cascade,
      *  defaults to the kernel's defaultPrompts). Carried so the compress loop
@@ -492,13 +500,14 @@ async function handle(
     if (req.method === "GET" && req.url === "/__bili/plugin/manifest") return handlePluginManifest(res);
     if (req.method === "GET" && req.url?.startsWith("/__bili/plugin/status")) {
         const query = req.url.slice(req.url.indexOf("?") + 1);
-        const conversationId = new URLSearchParams(query).get("conversationId")?.trim() ?? "";
+        const params = new URLSearchParams(query);
+        const conversationId = params.get("conversationId")?.trim() ?? "";
         if (!conversationId) {
             res.writeHead(400, { "content-type": "application/json" });
             res.end(JSON.stringify({ ok: false, error: "conversationId query parameter is required" }));
             return;
         }
-        return handlePluginStatus(conversationId, res);
+        return handlePluginStatus(conversationId, res, params.get("fallback") === "latest");
     }
     if (req.method === "POST" && req.url === "/__bili/plugin/tool") {
         try {
@@ -717,6 +726,18 @@ async function handle(
             session.metadata.effectiveContextLimit = reqConfig.modelContextLimit;
             recordPluginSession(pluginConversation ?? conversation, session.id);
         }
+        // Responses clients that send their own session id as `prompt_cache_key`
+        // (omp) get that conversation recorded even WITHOUT the x-bili-plugin
+        // header, so the /acp command — which looks the session up by the
+        // client's session id — can find it. NOTE: conversationIdentityResponses
+        // does NOT read prompt_cache_key (it falls back to a content fingerprint
+        // with clientProvided:false), so we read the field directly here.
+        if (protocol === "responses") {
+            const pck = (parsed as ResponsesRequestBody).prompt_cache_key;
+            if (typeof pck === "string" && pck.trim().length > 0) {
+                recordPluginSession(pck.trim(), session.id);
+            }
+        }
         const pluginMode = pluginAgent !== undefined;
         // Self-heal the context window: a prior upstream overflow may have
         // taught us the real window (forward()'s overflow detection persists it
@@ -870,6 +891,10 @@ function prepareAnthropic(
         const tokenCount = session.stats.lastInputTokens;
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
+        // Drop sub-viability fragments before any consumer sees them: a tiny
+        // range in the list makes batched compress attempts fail atomically
+        // (kernel validates the whole batch). Mirrors billion-context-pi.
+        if (turn.nudge) turn.nudge.compressibleRanges = viableRanges(turn.nudge.compressibleRanges);
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         if (!session.meta.title) {
@@ -922,7 +947,7 @@ function prepareOpenai(
     const sessionId = session.id;
     const stream = parsed.stream === true;
     ++session.stats.requests;
-
+    let openaiSystemText = "";
     let processedMessages: CoreMessage[] = [];
     let originalMessages: CoreMessage[] = [];
     let nudge: NudgeDecision | undefined;
@@ -941,13 +966,22 @@ function prepareOpenai(
     const injectTools = shouldInject && !pluginMode;
 
     try {
-        const { msgs } = openaiToCore(parsed);
+        // Kernel 0.0.37 hoists the contiguous leading system/developer prefix
+        // OUT of the fold space: system content is host runtime state and
+        // must not feed ids/fingerprints. Capture it and re-inject below —
+        // otherwise the proxy would forward payloads without any system.
+        const { msgs, systemText } = openaiToCore(parsed);
+        openaiSystemText = systemText;
         originalMessages = msgs;
         // tokenCount = upstream's real input_tokens from the previous turn
         // (see anthropic branch comment). Never an estimate.
         const tokenCount = session.stats.lastInputTokens;
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
+        // Drop sub-viability fragments before any consumer sees them: a tiny
+        // range in the list makes batched compress attempts fail atomically
+        // (kernel validates the whole batch). Mirrors billion-context-pi.
+        if (turn.nudge) turn.nudge.compressibleRanges = viableRanges(turn.nudge.compressibleRanges);
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         if (!session.meta.title) {
@@ -967,6 +1001,7 @@ function prepareOpenai(
         // instead, mirroring pai-acp's design. Putting the nudge in system
         // would invalidate the cache every turn.
         const sysParts: string[] = [];
+        if (systemText) sysParts.push(systemText);
         if (shouldInject) sysParts.push(buildCompressSystemPrompt(prompts));
         rebuiltMessages = injectOpenaiSystem(rebuiltMessages, sysParts);
         if (injectTools) {
@@ -999,7 +1034,7 @@ function prepareOpenai(
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: injectTools, pluginMode, nudge, prompts } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: injectTools, pluginMode, nudge, prompts, openaiSystemText } as Prepared;
 }
 
 function prepareResponses(
@@ -1044,6 +1079,10 @@ function prepareResponses(
         const tokenCount = session.stats.lastInputTokens;
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" });
         session.state = turn.state;
+        // Drop sub-viability fragments before any consumer sees them: a tiny
+        // range in the list makes batched compress attempts fail atomically
+        // (kernel validates the whole batch). Mirrors billion-context-pi.
+        if (turn.nudge) turn.nudge.compressibleRanges = viableRanges(turn.nudge.compressibleRanges);
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         if (!session.meta.title) {
@@ -1634,10 +1673,10 @@ async function forward(
             const reqHeaders = buildForwardHeaders(headers);
             const textProtocol = prepared.protocol === "responses" && !!prepared.responsesTextProtocol;
             const systemPrompt = textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts);
-            const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem);
+            const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText);
             const loop = runCompressLoop(
                 streamToRead,
-                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, protocol: prepared.protocol, textProtocol, debug: opts.debug, nudge: prepared.nudge },
+                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, protocol: prepared.protocol, textProtocol, debug: opts.debug, nudge: prepared.nudge },
                 parsedReq,
                 { url: upstreamUrl, headers: reqHeaders },
                 adapter,

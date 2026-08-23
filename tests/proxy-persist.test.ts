@@ -1,12 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
-import { join, relative, sep } from "node:path";
+import { mkdirSync, mkdtempSync, rmSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { SessionStore } from "../src/persist.ts";
-import { createInitialState } from "acp-kernel";
+import { dirname, join, relative, sep } from "node:path";
 import type { Session, BlockContent } from "../src/session.ts";
-
+import { createInitialState } from "acp-kernel";
 /** Recursively collect *.json files under dir (sessions are namespaced into
  *  protocol/ subdirs). */
 function jsonFilesUnder(dir: string): string[] {
@@ -64,8 +64,12 @@ await withTempStore("writeNow round-trips state + blockContents", async (store, 
 
     const files = jsonFilesUnder(dir);
     assert.ok(files.length > 0, "a session json file was written");
-    const raw = JSON.parse(readFileSync(files[0], "utf8"));
-    assert.equal(raw.id, "sess-1");
+    // Files are envelope-wrapped {version, savedAt, id, payload}; the record
+    // itself moved under `payload` (acp-kernel StateStore mechanism).
+    const envelope = JSON.parse(readFileSync(files[0], "utf8"));
+    assert.equal(envelope.version, 3);
+    assert.equal(envelope.id, "sess-1");
+    const raw = envelope.payload;
     assert.equal(raw.requests, undefined);
     assert.equal(raw.stats.requests, 42);
     assert.equal(raw.stats.tokensSaved, 1234);
@@ -289,7 +293,7 @@ await withTempStore("protocol-less session lands under _unknown/ (legacy compat)
     assert.ok(loaded && loaded.id === "legacy-1", "legacy session loads back");
 });
 
-await withTempStore("loadSync uses protocol meta to locate namespaced file", async (store) => {
+await withTempStore("loadSync uses protocol meta to locate namespaced file", async (store, dir) => {
     // After an LRU eviction, loadSync must find the file by protocol/host,
     // not by scanning. Passing the meta must hit the right path.
     const s = makeSession("meta-1");
@@ -298,7 +302,42 @@ await withTempStore("loadSync uses protocol meta to locate namespaced file", asy
     await store.writeNow(s);
     // With correct meta → found.
     assert.ok(store.loadSync("meta-1", { protocol: "openai", upstreamOrigin: "https://open.bigmodel.cn" }));
-    // With wrong meta → not found at the namespaced path (and no _unknown fallback
-    // because protocol is given, so it does not scan the legacy location).
-    assert.equal(store.loadSync("meta-1", { protocol: "anthropic", upstreamOrigin: "https://other.example" }), null);
+    // A fresh store with WRONG meta → not found at the namespaced path (and
+    // no scan: the flat fallback name differs from the namespaced file). In
+    // the SAME store a wrong-meta probe still resolves via the kernel's
+    // discovered-file cache — the id is authoritative, the meta is only a
+    // path hint — which is why the isolation probe uses a second store.
+    const cold = new SessionStore({ dir });
+    assert.equal(cold.loadSync("meta-1", { protocol: "anthropic", upstreamOrigin: "https://other.example" }), null);
+});
+
+await withTempStore("pre-envelope flat file is adopted and re-persisted as envelope", async (store, dir) => {
+    // Files written before the acp-kernel StateStore extraction are FLAT
+    // records (no {version,savedAt,id,payload} wrapper). They must keep
+    // loading via the kernel's legacy adoption hook, and the next dirty
+    // write migrates them to the envelope format.
+    const flat = {
+        version: 3,
+        savedAt: Date.now(),
+        id: "flat-1",
+        meta: { protocol: "openai", upstreamOrigin: "https://open.bigmodel.cn" },
+        stats: { requests: 5, tokensSaved: 111 },
+        createdAt: Date.now() - 1000,
+        state: createInitialState(),
+        blockContents: {},
+    };
+    const hash = createHash("sha256").update("flat-1", "utf8").digest("hex").slice(0, 24);
+    const file = join(dir, "openai", `open.bigmodel.cn_${hash}.json`);
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, JSON.stringify(flat));
+
+    const loaded = store.loadSync("flat-1", { protocol: "openai", upstreamOrigin: "https://open.bigmodel.cn" });
+    assert.ok(loaded && loaded.id === "flat-1", "flat file adopted on load");
+    assert.equal(loaded!.stats.requests, 5, "stats survive adoption");
+    loaded!.stats.requests = 6;
+    await store.writeNow(loaded!);
+
+    const envelope = JSON.parse(readFileSync(file, "utf8"));
+    assert.ok("payload" in envelope, "re-persisted as envelope");
+    assert.equal(envelope.payload.stats.requests, 6, "payload carries the update");
 });

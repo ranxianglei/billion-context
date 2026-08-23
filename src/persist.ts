@@ -1,7 +1,6 @@
-import { promises as fs } from "node:fs";
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import * as path from "node:path";
+import { StateStore, type PersistedEnvelope } from "acp-kernel/persist";
 import { sessionsDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { createInitialState, type CompressionState, type CoreMessage } from "acp-kernel";
@@ -28,11 +27,21 @@ import type { Session, BlockContent } from "./session.js";
  *    left behind and discarded on next load by the corrupt-file fallback).
  *    Does NOT survive power loss (no fsync of the directory entry); the
  *    debounced writes keep the on-disk state within ~debounce of in-memory.
- *  - Debounced async writes (default 500ms): the hot path never blocks on fs.
- *    Multiple mutations within the window coalesce into one write.
- *  - Forward-compat: `mergeInitialState` fills any fields missing on a file
- *    written by an older version, so a schema change never breaks old files.
+ *  - Forward-compat: `mergeState` fills any fields missing on a file written
+ *    by an older version, so a schema change never breaks old files.
  *  - Disable with BILI_PERSIST=0 for ephemeral/test runs.
+ *
+ * MECHANISM lives in `acp-kernel/persist` (StateStore: atomic write, rename
+ * retries, debounce, per-id serialization, corrupt-tolerant load, recursive
+ * discovery). This module is POLICY: the record schema (PersistedSession),
+ * the namespaced layout (relPathFor), validity (isValidRecord), and legacy
+ * adoption for files written by the pre-envelope store.
+ *
+ * ON-DISK FORMAT (v3+): an envelope `{version, savedAt, id, payload}` where
+ * payload is the flat PersistedSession record. Files written by earlier
+ * proxy versions (flat record, no envelope) are adopted on load via the
+ * kernel's `legacy` hook and re-persisted in envelope form on the next dirty
+ * write — old files keep loading, files migrate organically.
  *
  * KNOWN LIMITATIONS:
  *  - No fsync of temp file or directory entry — a power loss can lose the
@@ -40,11 +49,12 @@ import type { Session, BlockContent } from "./session.js";
  *    the last successful write.
  *  - No cross-process lock — two proxy processes sharing BILI_SESSIONS_DIR
  *    will clobber each other's writes. Single-instance only.
- *  - All writes within a process are serialized per-session by Node's single
- *    event loop; there is no per-session *request* serialization (two
- *    concurrent HTTP requests for the same session can interleave processTurn
- *    and corrupt in-memory state). This is a known limitation; a per-session
- *    lock should be added before promoting multi-agent concurrency as safe.
+ *  - All writes within a process are serialized per-session by the kernel
+ *    store's write chains; there is no per-session *request* serialization
+ *    (two concurrent HTTP requests for the same session can interleave
+ *    processTurn and corrupt in-memory state). This is a known limitation; a
+ *    per-session lock should be added before promoting multi-agent
+ *    concurrency as safe.
  */
 
 const PERSIST_VERSION = 3;
@@ -101,7 +111,7 @@ interface PersistedSession {
 type Logger = (level: "info" | "warn" | "error", msg: string) => void;
 
 /** Forward-compat: merge a parsed state with a fresh one so missing fields
- *  (added in later versions) get sane defaults instead of `undefined`. */
+ * (added in later versions) get sane defaults instead of `undefined`. */
 function mergeState(parsed: CompressionState): CompressionState {
     const fresh = createInitialState();
     return {
@@ -148,43 +158,29 @@ function relPathFor(id: string, protocol?: string, upstreamOrigin?: string): str
     return path.join(proto, `${host}${createHash("sha256").update(id, "utf8").digest("hex").slice(0, 24)}.json`);
 }
 
-/** Legacy flat filename (pre-namespace). Kept only for loadAll to recognize
- *  and migrate old files. */
-function legacyFileNameFor(id: string): string {
-    return createHash("sha256").update(id, "utf8").digest("hex").slice(0, 24) + ".json";
-}
-
+/** Session persistence policy over the kernel StateStore mechanism. The
+ *  public API predates the extraction and is kept stable for session.ts /
+ *  server.ts / export.ts. */
 export class SessionStore {
-    private readonly dir: string;
-    private readonly debounceMs: number;
     readonly enabled: boolean;
-    private readonly timers = new Map<string, NodeJS.Timeout>();
-    /** Monotonic counter for unique temp filenames within a process. */
-    private tmpSeq = 0;
-    private readonly log: Logger;
-    /** Per-session write serialization chain. Each writeNow/flushSync chains
-     *  onto the previous write for the SAME session, so two concurrent writes
-     *  to the same session never race on fs.rename (Windows: EPERM/EBUSY when
-     *  two renames target the same file). The promise resolves when this
-     *  session's write queue is fully drained. */
-    private readonly writeChains = new Map<string, Promise<void>>();
+    private readonly store: StateStore<PersistedSession>;
 
     constructor(opts?: { dir?: string; debounceMs?: number; enabled?: boolean; log?: Logger }) {
-        this.dir = opts?.dir ?? defaultDir();
-        this.debounceMs = opts?.debounceMs ?? defaultDebounce();
-        this.enabled = (opts?.enabled ?? true) && this.debounceMs >= 0;
-        this.log = opts?.log ?? defaultLogger;
-    }
-
-    private filePath(id: string, protocol?: string, upstreamOrigin?: string): string {
-        return path.join(this.dir, relPathFor(id, protocol, upstreamOrigin));
-    }
-
-    /** A unique temp path per write (per process). Two overlapping writes for
-     *  the same session must not share a temp file, or one rename invalidates
-     *  the other. */
-    private tempPath(id: string): string {
-        return path.join(this.dir, `.tmp-${legacyFileNameFor(id)}-${process.pid}-${this.tmpSeq++}`);
+        const debounceMs = opts?.debounceMs ?? defaultDebounce();
+        this.enabled = (opts?.enabled ?? true) && debounceMs >= 0;
+        this.store = new StateStore<PersistedSession>({
+            dir: opts?.dir ?? defaultDir(),
+            version: PERSIST_VERSION,
+            debounceMs: Math.max(0, debounceMs),
+            enabled: this.enabled,
+            log: opts?.log ?? defaultLogger,
+            relPath: (id, payload) =>
+                relPathFor(id, payload.meta?.protocol ?? payload.protocol, payload.meta?.upstreamOrigin ?? payload.upstreamOrigin),
+            // Adopt the pre-envelope flat format this store itself wrote
+            // before the kernel extraction (and every v1/v2 file before it).
+            legacy: (parsed) => (isValidRecord(parsed) ? { id: parsed.id, payload: parsed, version: parsed.version, savedAt: parsed.savedAt } : null),
+            validate: (envelope) => isValidRecord(envelope.payload),
+        });
     }
 
     /** Bulk-load every persisted session from disk into a map keyed by the
@@ -194,56 +190,8 @@ export class SessionStore {
     async loadAll(): Promise<Map<string, Session>> {
         const out = new Map<string, Session>();
         if (!this.enabled) return out;
-        try {
-            await fs.mkdir(this.dir, { recursive: true });
-        } catch {
-            return out;
-        }
-        // Recursively walk the sessions dir to pick up the namespaced layout
-        // (sessions/<protocol>/<host>_<hash>.json) as well as legacy flat files
-        // (sessions/<hash>.json) written by older versions.
-        const files: string[] = [];
-        const walk = async (dir: string): Promise<void> => {
-            let entries: import("node:fs").Dirent[];
-            try {
-                entries = await fs.readdir(dir, { withFileTypes: true });
-            } catch {
-                return;
-            }
-            for (const e of entries) {
-                if (e.name.startsWith(".tmp-")) continue;
-                const full = path.join(dir, e.name);
-                if (e.isDirectory()) {
-                    await walk(full);
-                } else if (e.isFile() && e.name.endsWith(".json")) {
-                    files.push(full);
-                }
-            }
-        };
-        await walk(this.dir);
-        for (const full of files) {
-            const name = path.basename(full);
-            try {
-                const parsed = JSON.parse(await fs.readFile(full, "utf8")) as PersistedSession;
-                if (!isValidRecord(parsed)) continue;
-                // Accept the file if EITHER the namespaced name or the legacy
-                // flat name matches the body id. The namespaced form is the
-                // current convention; the legacy form is tolerated so old
-                // files still load (and will be re-persisted under the new
-                // namespace on next dirty write).
-                const pm = parsed.meta ?? {};
-                const proto = pm.protocol ?? parsed.protocol;
-                const origin = pm.upstreamOrigin ?? parsed.upstreamOrigin;
-                const expectedNamespaced = path.basename(relPathFor(parsed.id, proto, origin));
-                const expectedLegacy = legacyFileNameFor(parsed.id);
-                if (name !== expectedNamespaced && name !== expectedLegacy) {
-                    this.log("warn", `[persist] skipping ${full}: filename does not match body id (expected ${expectedNamespaced})`);
-                    continue;
-                }
-                out.set(parsed.id, buildSession(parsed));
-            } catch (e) {
-                this.log("warn", `[persist] skipping corrupt session file ${full}: ${msg(e)}`);
-            }
+        for (const [id, envelope] of await this.store.loadAll()) {
+            out.set(id, buildSession(envelope.payload));
         }
         return out;
     }
@@ -254,96 +202,32 @@ export class SessionStore {
      *  body id does not match what we asked for. */
     loadSync(id: string, meta?: { protocol?: string; upstreamOrigin?: string }): Session | null {
         if (!this.enabled) return null;
-        // Try the namespaced path first (current convention), then fall back to
-        // the _unknown/ legacy location for sessions persisted before protocol
-        // meta was captured.
-        const candidates = [this.filePath(id, meta?.protocol, meta?.upstreamOrigin)];
-        if (meta?.protocol) candidates.push(this.filePath(id)); // _unknown/ fallback
-        for (const file of candidates) {
-            if (!existsSync(file)) continue;
-            try {
-                const parsed = JSON.parse(readFileSync(file, "utf8")) as PersistedSession;
-                if (!isValidRecord(parsed) || parsed.id !== id) continue;
-                return buildSession(parsed);
-            } catch (e) {
-                this.log("warn", `[persist] failed to load session ${id}: ${msg(e)}`);
-            }
+        // Namespaced path first (current convention), then the _unknown/
+        // location for sessions persisted before protocol meta was captured.
+        // The kernel store also probes the flat legacy name on each call.
+        const envelopes = [
+            this.store.loadSync(id, relPathFor(id, meta?.protocol, meta?.upstreamOrigin)),
+            meta?.protocol ? this.store.loadSync(id, relPathFor(id)) : null,
+        ];
+        for (const envelope of envelopes) {
+            if (envelope) return buildSession(envelope.payload);
         }
         return null;
     }
 
     /** Schedule a debounced write for a session. Multiple calls within the
-     *  window coalesce. Safe to call on the hot path. No-op if disabled. */
+     *  window coalesce; the record is built at WRITE time, so the freshest
+     *  session state is persisted. Safe to call on the hot path. No-op if
+     *  disabled. */
     scheduleSave(session: Session): void {
-        if (!this.enabled) return;
-        const existing = this.timers.get(session.id);
-        if (existing) clearTimeout(existing);
-        const timer = setTimeout(() => {
-            this.timers.delete(session.id);
-            void this.writeNow(session).catch((e) => {
-                this.log("error", `[persist] debounced write failed for ${session.id}: ${msg(e)}`);
-            });
-        }, this.debounceMs);
-        // Don't keep the event loop alive solely for a pending write.
-        timer.unref?.();
-        this.timers.set(session.id, timer);
+        this.store.scheduleSave(session.id, () => buildRecord(session));
     }
 
     /** Asynchronously persist a session right now (skips the debounce). Throws
      *  on write failure so callers can react (e.g. avoid evicting). Serialized
-     *  per-session via writeChains so concurrent writes don't race on rename. */
+     *  per-session by the kernel store's write chains. */
     async writeNow(session: Session): Promise<void> {
-        if (!this.enabled) return;
-        const id = session.id;
-        // Chain this write after any in-flight write for the same session.
-        // The previous promise may reject (disk full, EPERM) — catch so our
-        // chain doesn't break, then run our own write.
-        const prev = this.writeChains.get(id) ?? Promise.resolve();
-        const next = prev.catch(() => {}).then(() => this.writeNowInner(session));
-        this.writeChains.set(id, next);
-        // Clean up the chain entry once settled so the Map doesn't grow.
-        // Clean up the chain entry once settled so the Map doesn't grow. The
-        // .catch() is load-bearing: .finally() returns a derived promise that
-        // nobody else holds — when the chain rejects (disk full, ENOENT after
-        // the dir vanished) it would surface as an unhandledRejection, which
-        // crashes the proxy on default Node settings. The real rejection is
-        // still delivered to the caller of writeNow.
-        next
-            .finally(() => {
-                if (this.writeChains.get(id) === next) this.writeChains.delete(id);
-            })
-            .catch(() => {});
-        return next;
-    }
-
-    private async writeNowInner(session: Session): Promise<void> {
-        if (!this.enabled) return;
-        const record = buildRecord(session);
-        const file = this.filePath(session.id, session.meta.protocol, session.meta.upstreamOrigin);
-        try {
-            await fs.mkdir(path.dirname(file), { recursive: true });
-        } catch (e) {
-            this.log("warn", `[persist] could not create session dir ${this.dir}: ${msg(e)}`);
-        }
-        const tmp = this.tempPath(session.id);
-        const data = JSON.stringify(record);
-        // Windows: fs.rename (MoveFileEx with MOVEFILE_REPLACE_EXISTING) can
-        // throw EPERM/EBUSY if the destination is held open (AV scan, search
-        // indexer, a concurrent flushSync, SMB share). Wrap so a failure cleans
-        // up the .tmp file and is reported, rather than propagating and
-        // leaving an orphan that the next write can collide with.
-        try {
-            await fs.writeFile(tmp, data, "utf8");
-            await renameWithRetry(tmp, file);
-        } catch (e) {
-            try {
-                await fs.unlink(tmp).catch(() => {});
-            } catch {
-                // best-effort cleanup
-            }
-            this.log("error", `[persist] write failed for ${session.id}: ${msg(e)}`);
-            throw e;
-        }
+        await this.store.writeNow(session.id, () => buildRecord(session));
     }
 
     /** Synchronous flush for a single session. Used on memory eviction so a
@@ -352,85 +236,25 @@ export class SessionStore {
      *  Returns true on success, false on failure (caller must NOT evict on
      *  failure for a never-persisted session or it is lost permanently). */
     flushSync(session: Session): boolean {
-        if (!this.enabled) return true;
-        const existing = this.timers.get(session.id);
-        if (existing) {
-            clearTimeout(existing);
-            this.timers.delete(session.id);
-        }
-        const record = buildRecord(session);
-        const file = this.filePath(session.id, session.meta.protocol, session.meta.upstreamOrigin);
-        const data = JSON.stringify(record);
-        try {
-            mkdirSync(path.dirname(file), { recursive: true });
-        } catch (e) {
-            this.log("warn", `[persist] could not create session dir ${this.dir}: ${msg(e)}`);
-        }
-        const tmp = this.tempPath(session.id);
-        try {
-            writeFileSync(tmp, data, "utf8");
-            // Sync path: renameSync can throw EPERM on Windows if the dest is
-            // briefly held (AV/indexer/SMB). Retry a couple of times before
-            // giving up — transient locks usually release within ms.
-            let lastErr: unknown;
-            for (let attempt = 0; attempt < 3; attempt++) {
-                try {
-                    renameSync(tmp, file);
-                    lastErr = undefined;
-                    break;
-                } catch (e) {
-                    lastErr = e;
-                    const code = (e as NodeJS.ErrnoException).code;
-                    if (code !== "EPERM" && code !== "EBUSY" && code !== "EACCES") break;
-                    // brief sync backoff (Atomics.wait is the sync sleep)
-                    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20 * (attempt + 1));
-                }
-            }
-            if (lastErr) throw lastErr;
-            return true;
-        } catch (e) {
-            this.log("error", `[persist] flushSync FAILED for ${session.id}: ${msg(e)} — session NOT evicted to prevent loss`);
-            // Best-effort: remove the orphan temp so it doesn't accumulate.
-            try {
-                unlinkSync(tmp);
-            } catch {
-                /* ignore */
-            }
-            return false;
-        }
+        return this.store.flushSync(session.id, () => buildRecord(session));
     }
 
     /** Flush all dirty sessions with a pending debounce timer. Called on
-     *  SIGTERM/SIGINT for graceful shutdown. Clears timers first, then writes
-     *  every session that had a pending write. */
-    async flushAll(sessions: Iterable<Session>): Promise<void> {
-        if (!this.enabled) return;
-        const dirty = new Set(this.timers.keys());
-        for (const timer of this.timers.values()) clearTimeout(timer);
-        this.timers.clear();
-        const pending: Promise<void>[] = [];
-        for (const s of sessions) {
-            if (!dirty.has(s.id)) continue; // only flush sessions with pending writes
-            pending.push(
-                this.writeNow(s).catch((e) => {
-                    this.log("error", `[persist] shutdown flush failed for ${s.id}: ${msg(e)}`);
-                }),
-            );
-        }
-        await Promise.all(pending);
-        // Drain writes whose timer fired (absent from `dirty`) but are still mid-flight.
-        await Promise.allSettled([...this.writeChains.values()]);
+     *  SIGTERM/SIGINT for graceful shutdown. The kernel store flushes its own
+     *  pending set (builders read the live Session objects at write time, so
+     *  no session list is needed) and drains in-flight write chains. */
+    async flushAll(_sessions: Iterable<Session>): Promise<void> {
+        await this.store.flushAll();
     }
 
     /** Whether a write is currently pending (debounce timer armed) for a id. */
     hasPending(id: string): boolean {
-        return this.timers.has(id);
+        return this.store.hasPending(id);
     }
 
     /** Cancel all pending writes without flushing (e.g. for tests). */
     cancelAll(): void {
-        for (const timer of this.timers.values()) clearTimeout(timer);
-        this.timers.clear();
+        this.store.cancelAll();
     }
 }
 
@@ -490,31 +314,6 @@ function isValidRecord(parsed: unknown): parsed is PersistedSession {
     if (!parsed || typeof parsed !== "object") return false;
     const r = parsed as Partial<PersistedSession>;
     return typeof r.id === "string" && typeof r.state === "object" && r.state !== null && Array.isArray(r.state.blocks);
-}
-
-function msg(e: unknown): string {
-    return e instanceof Error ? e.message : String(e);
-}
-
-/** fs.rename with brief retries on Windows transient locks. EPERM/EBUSY/EACCES
- *  happen when the destination is momentarily held open (AV scan, search
- *  indexer, SMB). A short delay + retry almost always succeeds. Async (used by
- *  writeNow). */
-async function renameWithRetry(src: string, dest: string): Promise<void> {
-    let lastErr: unknown;
-    for (let attempt = 0; attempt < 3; attempt++) {
-        try {
-            await fs.rename(src, dest);
-            return;
-        } catch (e) {
-            lastErr = e;
-            const code = (e as NodeJS.ErrnoException).code;
-            if (code !== "EPERM" && code !== "EBUSY" && code !== "EACCES") throw e;
-            // brief backoff before retry (transient lock usually releases)
-            await new Promise((r) => setTimeout(r, 20 * (attempt + 1)));
-        }
-    }
-    throw lastErr;
 }
 
 function defaultDir(): string {

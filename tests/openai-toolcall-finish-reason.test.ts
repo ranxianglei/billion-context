@@ -31,8 +31,9 @@ const collect = async (stream: ReadableStream<Uint8Array>) => {
     return events;
 };
 
-// 1. Non-compliant upstream: tool_calls + finish_reason="stop" → bili rewrites to "tool_calls".
-test("openai adapter: tool_calls with finish_reason=stop rewritten to tool_calls", async () => {
+// 1. Non-compliant upstream: tool_calls + finish_reason="stop" → passthrough
+//    (real tool_call chunks are forwarded verbatim as meta; finish_reason kept as-is).
+test("openai adapter: real tool_calls passed through verbatim (meta)", async () => {
     const stream = mockStream(
         sseChunk({ role: "assistant" }),
         sseChunk({
@@ -43,11 +44,11 @@ test("openai adapter: tool_calls with finish_reason=stop rewritten to tool_calls
         sseChunk({}, "stop"),
     );
     const events = await collect(stream);
+    const metas = events.filter((e) => e.kind === "meta");
+    assert.ok(metas.length >= 2, "tool_call + finish_reason chunks passed through as meta");
     const done = events.find((e) => e.kind === "done");
     assert.ok(done && done.kind === "done", "done event present");
-    assert.equal(done!.finishReason, "tool_calls", "finish_reason corrected to tool_calls");
-    const toolCall = events.find((e) => e.kind === "tool_call");
-    assert.ok(toolCall, "tool_call event still emitted");
+    assert.equal(done!.finishReason, "stop", "finish_reason preserved as-is from upstream");
 });
 
 // 2. Compliant upstream: tool_calls + finish_reason="tool_calls" → unchanged.

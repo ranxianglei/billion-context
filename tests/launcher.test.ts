@@ -18,8 +18,11 @@ import {
     buildClaudeEnv,
     buildCodexArgs,
     preparePiHttpRewrite,
+    prepareOmpHttpRewrite,
+    prepareOpencodeHttpRewrite,
     stripInheritedProxy,
     resolvePiHome,
+    resolveOmpHome,
     extractDomains,
     discoverDomains,
     discoverRoutes,
@@ -27,6 +30,10 @@ import {
     resolveClientCommand,
     isOnPath,
     parseCodexToml,
+    parseOmpYaml,
+    readOmpConfig,
+    readOpencodeConfig,
+    resolveOpencodeConfigFile,
     findFreePort,
     ensureProxyRunning,
     stopProxy,
@@ -36,12 +43,13 @@ import {
     type HttpRewrite,
 } from "../src/launcher.ts";
 
-test("isLaunchClient: pi/claude/codex/pi-test true, others false", () => {
+test("isLaunchClient: pi/claude/codex/omp/opencode/pi-test true, others false", () => {
     assert.equal(isLaunchClient("pi"), true);
     assert.equal(isLaunchClient("claude"), true);
     assert.equal(isLaunchClient("codex"), true);
+    assert.equal(isLaunchClient("omp"), true);
+    assert.equal(isLaunchClient("opencode"), true);
     assert.equal(isLaunchClient("pi-test"), true);
-    assert.equal(isLaunchClient("opencode"), false);
     assert.equal(isLaunchClient("start"), false);
     assert.equal(isLaunchClient(""), false);
 });
@@ -142,8 +150,8 @@ test("extractDomains: empty / all-invalid input → []", () => {
     assert.deepEqual(extractDomains(["", "ftp://x.example", "http://only.http/v1"]), []);
 });
 
-test("discoverDomains: claude → api.anthropic.com", () => {
-    assert.deepEqual(discoverDomains("claude", {}), ["api.anthropic.com"]);
+test("discoverDomains: claude → [] (claude rides /bili/ rewrites, not cert MITM)", () => {
+    assert.deepEqual(discoverDomains("claude", {}), []);
 });
 
 test("discoverDomains: pi → https hostnames from providers (http dropped, /bili/ unwrapped)", () => {
@@ -442,10 +450,24 @@ test("discoverRoutes: claude with http ANTHROPIC_BASE_URL → httpRewrites entry
     ]);
 });
 
-test("discoverRoutes: claude default → api.anthropic.com in httpsDomains, no rewrites", () => {
+test("discoverRoutes: claude default → ANTHROPIC_BASE_URL /bili/ rewrite (no cert MITM; undici ignores HTTPS_PROXY)", () => {
     const routes = discoverRoutes("claude", {});
-    assert.deepEqual(routes.httpsDomains, ["api.anthropic.com"]);
-    assert.deepEqual(routes.httpRewrites, []);
+    assert.deepEqual(routes.httpsDomains, []);
+    assert.deepEqual(routes.httpsRewrites, []);
+    assert.deepEqual(routes.httpRewrites, [
+        { key: "ANTHROPIC_BASE_URL", realUpstream: "https://api.anthropic.com" },
+    ]);
+});
+
+test("discoverRoutes: claude /bili/-wrapped base_url unwraps to real upstream for re-wrap", () => {
+    const config: ClientConfig = {
+        claude: { anthropicBaseUrl: "http://127.0.0.1:8787/bili/https://api.anthropic.com" },
+    };
+    const routes = discoverRoutes("claude", config);
+    assert.deepEqual(routes.httpsDomains, []);
+    assert.deepEqual(routes.httpRewrites, [
+        { key: "ANTHROPIC_BASE_URL", realUpstream: "https://api.anthropic.com" },
+    ]);
 });
 
 test("discoverRoutes: pi with one http provider → rewrite keyed by provider name", () => {
@@ -612,4 +634,195 @@ test("stripInheritedProxy: removes generic proxy redirector vars, keeps the rest
     assert.equal(cleaned.BILI_UPSTREAM_PROXY, "http://relay:9999", "BILI_UPSTREAM_PROXY kept (explicit chaining)");
     assert.equal(cleaned.PATH, "/usr/bin", "PATH kept");
     assert.equal(cleaned.HOME, "/home/dog", "HOME kept");
+});
+
+test("parseOmpYaml: reads providers.<name>.baseUrl (skips non-matching)", () => {
+    const yml = [
+        "providers:",
+        "  sglang-responses:",
+        "    baseUrl: http://127.0.0.1:8199/v1",
+        "    models:",
+        "      - name: qwen3.8-27b",
+        "  zhipuai:",
+        "    baseUrl: https://open.bigmodel.cn/api/coding/paas/v4",
+        "    api: openai",
+        "  ollama-chat:",
+        "    baseUrl: http://127.0.0.1:11435/v1",
+        "modelRoles:",
+        "  default: sglang-responses/qwen3.8-27b:high",
+    ].join("\n");
+    const cfg = parseOmpYaml(yml);
+    assert.equal(cfg.providers["sglang-responses"].baseUrl, "http://127.0.0.1:8199/v1");
+    assert.equal(cfg.providers["zhipuai"].baseUrl, "https://open.bigmodel.cn/api/coding/paas/v4");
+    assert.equal(cfg.providers["ollama-chat"].baseUrl, "http://127.0.0.1:11435/v1");
+    assert.equal(Object.keys(cfg.providers).length, 3);
+});
+
+test("parseOmpYaml: no providers key → {}", () => {
+    assert.deepEqual(parseOmpYaml("modelRoles:\n  default: x\n"), { providers: {} });
+    assert.deepEqual(parseOmpYaml(""), { providers: {} });
+});
+
+test("readOmpConfig: reads models.yml from omp home", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-"));
+    try {
+        fs.writeFileSync(path.join(home, "models.yml"), "providers:\n  a:\n    baseUrl: http://x:1/v1\n");
+        const cfg = readOmpConfig(home);
+        assert.equal(cfg.providers.a.baseUrl, "http://x:1/v1");
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("readOmpConfig: missing models.yml → {}", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-"));
+    try {
+        assert.deepEqual(readOmpConfig(home), { providers: {} });
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("resolveOmpHome: PI_CODING_AGENT_DIR > default ~/.omp/agent", () => {
+    assert.equal(resolveOmpHome({ PI_CODING_AGENT_DIR: "/custom/omp" }), "/custom/omp");
+    assert.equal(resolveOmpHome({}), path.join(os.homedir(), ".omp", "agent"));
+});
+
+test("discoverRoutes: omp http + https providers → splits httpsDomains + httpRewrites", () => {
+    const config: ClientConfig = {
+        omp: {
+            providers: {
+                zhipuai: { baseUrl: "https://open.bigmodel.cn/api/coding/paas/v4" },
+                sglang: { baseUrl: "http://127.0.0.1:8199/v1" },
+            },
+        },
+    };
+    const routes = discoverRoutes("omp", config);
+    assert.deepEqual(routes.httpsDomains, ["open.bigmodel.cn"]);
+    assert.deepEqual(routes.httpRewrites, [
+        { key: "sglang", realUpstream: "http://127.0.0.1:8199/v1" },
+    ]);
+});
+
+test("prepareOmpHttpRewrite: rewrites matching provider, leaves others, symlinks siblings", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-"));
+    fs.writeFileSync(
+        path.join(home, "models.yml"),
+        [
+            "providers:",
+            "  a:",
+            "    baseUrl: http://example.com/v1",
+            "  b:",
+            "    baseUrl: https://secure.example.com",
+        ].join("\n"),
+    );
+    fs.writeFileSync(path.join(home, "config.yml"), "extensions:\n  - /x/omp.js\n");
+    const tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", [
+        { key: "a", realUpstream: "http://example.com/v1" },
+    ], []);
+    try {
+        assert.ok(typeof tmp === "string" && tmp.length > 0);
+        const out = fs.readFileSync(path.join(tmp!, "models.yml"), "utf8");
+        assert.ok(out.includes("baseUrl: http://127.0.0.1:8787/bili/http://example.com/v1"), "a rewritten");
+        assert.ok(out.includes("baseUrl: https://secure.example.com"), "b unchanged");
+        assert.equal(fs.lstatSync(path.join(tmp!, "config.yml")).isSymbolicLink(), true);
+        assert.equal(fs.realpathSync(path.join(tmp!, "config.yml")), path.join(home, "config.yml"));
+    } finally {
+        if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("prepareOmpHttpRewrite: returns undefined when no rewrites", () => {
+    assert.equal(prepareOmpHttpRewrite("/whatever", "http://127.0.0.1:8787", [], []), undefined);
+});
+
+test("prepareOmpHttpRewrite: returns undefined when models.yml missing", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-"));
+    try {
+        const rw = [{ key: "a", realUpstream: "http://example.com/v1" }];
+        assert.equal(prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []), undefined);
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("readOpencodeConfig: reads provider baseURLs from opencode.json", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "oc-cfg-"));
+    try {
+        const cfgFile = path.join(dir, "opencode.json");
+        fs.writeFileSync(
+            cfgFile,
+            JSON.stringify({
+                provider: {
+                    local: { options: { baseURL: "http://127.0.0.1:18081/v1" } },
+                    remote: { options: { baseURL: "https://api.example.com/v1" } },
+                    noUrl: { options: {} },
+                },
+            }),
+        );
+        const cfg = readOpencodeConfig(cfgFile);
+        assert.deepEqual(cfg.providers["local"], { baseURL: "http://127.0.0.1:18081/v1" });
+        assert.deepEqual(cfg.providers["remote"], { baseURL: "https://api.example.com/v1" });
+        assert.equal(cfg.providers["noUrl"], undefined);
+        assert.equal(readOpencodeConfig(path.join(dir, "missing.json")).providers["local"], undefined);
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("discoverRoutes(opencode): HTTP baseURL → /bili/ rewrite, HTTPS → MITM domain", () => {
+    const config = {
+        opencode: {
+            providers: {
+                "zhipuai-lb": { baseURL: "http://127.0.0.1:18081/v1" },
+                zhipuai: { baseURL: "https://open.bigmodel.cn/api/coding/paas/v4" },
+            },
+        },
+    } as unknown as import("../src/client-config.js").ClientConfig;
+    const routes = discoverRoutes("opencode", config);
+    assert.equal(routes.httpRewrites.length, 1);
+    assert.equal(routes.httpRewrites[0].key, "zhipuai-lb");
+    assert.equal(routes.httpRewrites[0].realUpstream, "http://127.0.0.1:18081/v1");
+    assert.deepEqual(routes.httpsDomains, ["open.bigmodel.cn"]);
+});
+
+test("prepareOpencodeHttpRewrite: writes rewritten copy, original untouched", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "oc-rw-"));
+    try {
+        const cfgFile = path.join(dir, "opencode.json");
+        const original = JSON.stringify({
+            plugin: ["opencode-acp@latest"],
+            provider: { "zhipuai-lb": { options: { baseURL: "http://127.0.0.1:18081/v1" } } },
+        });
+        fs.writeFileSync(cfgFile, original);
+        const rw = [{ key: "zhipuai-lb", realUpstream: "http://127.0.0.1:18081/v1" }];
+        const tmpFile = prepareOpencodeHttpRewrite(cfgFile, "http://127.0.0.1:8787", rw, []);
+        assert.ok(tmpFile);
+        const rewritten = JSON.parse(fs.readFileSync(tmpFile, "utf8"));
+        assert.equal(rewritten.provider["zhipuai-lb"].options.baseURL, "http://127.0.0.1:8787/bili/http://127.0.0.1:18081/v1");
+        assert.deepEqual(rewritten.plugin, ["opencode-acp@latest"]);
+        assert.equal(fs.readFileSync(cfgFile, "utf8"), original);
+        fs.rmSync(path.dirname(tmpFile), { recursive: true, force: true });
+        assert.equal(prepareOpencodeHttpRewrite(cfgFile, "http://127.0.0.1:8787", [], []), undefined);
+        const withPlugin = prepareOpencodeHttpRewrite(cfgFile, "http://127.0.0.1:8787", [], [], "/opt/bili/dist/agent/opencode.js");
+        assert.ok(withPlugin);
+        const injected = JSON.parse(fs.readFileSync(withPlugin, "utf8"));
+        assert.deepEqual(injected.plugin, ["opencode-acp@latest", "/opt/bili/dist/agent/opencode.js"]);
+        assert.equal(injected.provider["zhipuai-lb"].options.baseURL, "http://127.0.0.1:18081/v1");
+        fs.rmSync(path.dirname(withPlugin), { recursive: true, force: true });
+        const missingCfg = prepareOpencodeHttpRewrite(path.join(dir, "nope.json"), "http://127.0.0.1:8787", [], [], "/opt/bili/dist/agent/opencode.js");
+        assert.ok(missingCfg);
+        const fromEmpty = JSON.parse(fs.readFileSync(missingCfg, "utf8"));
+        assert.deepEqual(fromEmpty.plugin, ["/opt/bili/dist/agent/opencode.js"]);
+        fs.rmSync(path.dirname(missingCfg), { recursive: true, force: true });
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("resolveOpencodeConfigFile: OPENCODE_CONFIG wins, XDG fallback", () => {
+    assert.equal(resolveOpencodeConfigFile({ OPENCODE_CONFIG: "/tmp/x.json" }), "/tmp/x.json");
+    const p = resolveOpencodeConfigFile({ XDG_CONFIG_HOME: "/tmp/xdg" });
+    assert.ok(p.endsWith(path.join("opencode", "opencode.json")));
 });

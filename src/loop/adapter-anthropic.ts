@@ -197,7 +197,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                         yield {
                             kind: "reasoning",
                             delta: delta.thinking,
-                            ...(round === 1 ? { raw: remapIndexInEvent(eventStr, ci) } : {}),
+                            raw: remapIndexInEvent(eventStr, ci),
                         } as ParsedStreamEvent;
                     } else if (delta.type === "signature_delta" && typeof delta.signature === "string") {
                         const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
@@ -205,7 +205,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                             kind: "reasoning",
                             delta: "",
                             signature: delta.signature,
-                            ...(round === 1 ? { raw: remapIndexInEvent(eventStr, ci) } : {}),
+                            raw: remapIndexInEvent(eventStr, ci),
                         } as ParsedStreamEvent;
                     } else if (round === 1) {
                         const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
@@ -225,10 +225,8 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                     } else if (thinkingIndexes.delete(upstreamIndex)) {
                         // Seal the current thinking segment so interleaved thinking
                         // blocks each keep their own signature on rebuild.
-                        if (round === 1) {
-                            const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
-                            yield { kind: "meta", chunk: remapIndexInEvent(eventStr, ci), firstRoundOnly: true } as ParsedStreamEvent;
-                        }
+                        const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
+                        yield { kind: "meta", chunk: remapIndexInEvent(eventStr, ci), firstRoundOnly: false } as ParsedStreamEvent;
                         yield { kind: "reasoning", delta: "", blockEnd: true } as ParsedStreamEvent;
                     } else {
                         const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;

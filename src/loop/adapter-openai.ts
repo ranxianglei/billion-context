@@ -1,6 +1,11 @@
 import type { CoreMessage } from "acp-kernel";
 import { coreToOpenai, injectOpenaiSystem } from "acp-kernel/wire";
 import { buildVisibilityMarker } from "../compress-loop.js";
+
+const PROXY_TOOL_SET = new Set([
+    "compress", "decompress", "search_context", "acp_status",
+    "bili_compress", "bili_decompress", "bili_search_context", "bili_status",
+]);
 import type {
     CompressLoopAdapter,
     EmitCompletionOpts,
@@ -43,7 +48,7 @@ async function* iterSseChunks(stream: ReadableStream<Uint8Array>): AsyncGenerato
     }
 }
 
-export function createOpenaiAdapter(requestBody: Record<string, unknown>): CompressLoopAdapter {
+export function createOpenaiAdapter(requestBody: Record<string, unknown>, clientSystem?: string): CompressLoopAdapter {
     const model = (requestBody.model as string) ?? "unknown";
     let responseId = `chatcmpl-proxy-${Date.now()}`;
     let toolIndex = 0;
@@ -113,18 +118,28 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>): Compr
 
     return {
         buildRequest(coreMessages, systemPrompt, body) {
+            // Kernel 0.0.37 hoists the leading system/developer prefix out of
+            // the openai fold space (fingerprints must not depend on host
+            // runtime state), so coreMessages no longer carries it — re-inject
+            // the CLIENT's original system ahead of the compress prompt,
+            // mirroring the anthropic adapter's anthropicSystem path.
             const messages = coreToOpenai(coreMessages);
-            const withSys = injectOpenaiSystem(messages, [systemPrompt]);
+            const withSys = injectOpenaiSystem(messages, [clientSystem, systemPrompt].filter((p): p is string => typeof p === "string" && p.length > 0));
             return { ...body, messages: withSys };
         },
 
         async *parseStream(upstream, _round) {
             const pending = new Map<number, ToolCallBuffer>();
+            let sawRealToolCall = false;
             for await (const eventStr of iterSseChunks(upstream)) {
                 const dataLine = eventStr.split("\n").find((l) => l.startsWith("data:"));
                 if (!dataLine) continue;
                 const jsonStr = dataLine.slice(5).trim();
                 if (jsonStr === "[DONE]") {
+                    if (sawRealToolCall) {
+                        yield { kind: "meta", chunk: Buffer.from(eventStr + "\n\n", "utf8") } as ParsedStreamEvent;
+                        continue;
+                    }
                     for (const [, tc] of pending) {
                         if (tc.name.length > 0 || tc.id.length > 0) {
                             yield {
@@ -165,6 +180,19 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>): Compr
                 const finishReason = typeof choice.finish_reason === "string" ? choice.finish_reason : undefined;
 
                 if (finishReason) {
+                    if (sawRealToolCall) {
+                        const u2 = parsed.usage as Record<string, unknown> | undefined;
+                        const pd2 = u2?.prompt_tokens_details as Record<string, unknown> | undefined;
+                        yield {
+                            kind: "usage",
+                            inputTokens: typeof u2?.prompt_tokens === "number" ? u2.prompt_tokens : undefined,
+                            outputTokens: typeof u2?.completion_tokens === "number" ? u2.completion_tokens : undefined,
+                            cachedTokens: typeof pd2?.cached_tokens === "number" ? pd2.cached_tokens : undefined,
+                        } as ParsedStreamEvent;
+                        yield { kind: "meta", chunk: rawBuf } as ParsedStreamEvent;
+                        yield { kind: "done", finishReason } as ParsedStreamEvent;
+                        continue;
+                    }
                     let yieldedToolCall = false;
                     for (const [, tc] of pending) {
                         if (tc.name.length > 0 || tc.id.length > 0) {
@@ -200,6 +228,22 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>): Compr
 
                 if (delta.tool_calls) {
                     const tcs = delta.tool_calls as Array<Record<string, unknown>>;
+                    let allProxy = true;
+                    for (const tc of tcs) {
+                        const fn = tc.function as Record<string, unknown> | undefined;
+                        const name = typeof fn?.name === "string" ? fn.name : "";
+                        if (!PROXY_TOOL_SET.has(name)) {
+                            allProxy = false;
+                        }
+                    }
+                    if (!allProxy) {
+                        sawRealToolCall = true;
+                        yield { kind: "meta", chunk: rawBuf } as ParsedStreamEvent;
+                        if (typeof delta.content === "string" && delta.content.length > 0) {
+                            yield { kind: "text", delta: delta.content } as ParsedStreamEvent;
+                        }
+                        continue;
+                    }
                     for (const tc of tcs) {
                         const idx = typeof tc.index === "number" ? tc.index : 0;
                         const fn = tc.function as Record<string, unknown> | undefined;
