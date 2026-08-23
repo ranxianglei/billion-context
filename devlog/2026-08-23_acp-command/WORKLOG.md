@@ -3,7 +3,7 @@
 - Task ID: `2026-08-23_acp-command`
 - Home Repo: `billion-context`
 - Status: Done
-- Updated: 2026-08-23 08:25
+- Updated: 2026-08-23 17:30
 
 ## 1. Summary
 
@@ -91,7 +91,7 @@ npm run build          # tsup
 ### Test Coverage
 
 - New/modified test files: `tests/plugin-agent.test.ts`
-- Test count: 517 total, 517 pass, 0 fail (was 514 before; +3 new)
+- Test count: 526 total, 526 pass, 0 fail
 - Key scenarios verified:
   - `/acp` is registered with a description matching /ACP/.
   - `/acp` renders `context: 12.3K / 200.0K (6.2%)`, `in/out/cached: 10.0K / 1.2K /
@@ -148,3 +148,49 @@ npm run build          # tsup
 - [ ] Consider `/acp compress` (manual compression trigger) — needs a new proxy
       endpoint that runs a compress round on demand.
 - [ ] Consider surfacing the same status in the `/__bili/` web UI (issue #53).
+
+## 8. omp `/acp` fixes (post-merge debugging)
+
+Two fixes were needed for `/acp` to work in **omp** (it worked in pi from the
+start). Both are in this branch's uncommitted changes on top of the `/acp` commit.
+
+### 8.1 Persist the plugin-conversation map across proxy restarts
+
+- **Symptom**: after restarting `bili omp` (or resuming with `-r`), `/acp` said
+  "no ACP session yet" even though a model request had been sent in the prior run.
+- **Root cause**: the `conversations` map (`conversationId → sessionId`) in
+  `src/plugin.ts` was in-memory only. Every `bili omp` starts a fresh proxy with an
+  empty map, and the map is only repopulated by a NEW model request. A resumed
+  session that hasn't sent a new prompt yet had no entry.
+- **Fix** (`src/plugin.ts` + `src/server.ts`): persist the map to
+  `<stateDir()>/plugin-conversations.json` (debounced 300ms write on
+  `recordPluginSession`, `flushConversations()` on the 3 shutdown paths,
+  `loadConversations()` right after `initSessions()` at startup). `stateDir()` is
+  `$XDG_STATE_HOME/billion-context` (default `~/.local/state/billion-context`).
+
+### 8.2 Record omp's session id from the request body (`prompt_cache_key`)
+
+- **Symptom**: even after 8.1, a FRESH omp session's `/acp` still said "no ACP
+  session yet".
+- **Root cause**: the map is populated by `recordPluginSession`, which was called
+  ONLY inside `if (pluginAgent)`. `pluginAgent` is set from the `x-bili-plugin`
+  header — which the plugin stamps in the `before_provider_headers` event. **omp
+  has no `before_provider_headers` event** (its dist only emits
+  `before_provider_request`, which exposes the body, not headers), so the header
+  was never stamped and `pluginAgent` stayed undefined for omp. pi HAS the event,
+  which is why pi worked.
+- **Key discovery**: omp sends its own session id in the request **body** as
+  `prompt_cache_key` (a Responses-API field), and that value is exactly the session
+  id the plugin uses for `/acp` (`ctx.sessionManager.getSessionId()`). The kernel's
+  `conversationIdentityResponses` (acp-kernel/wire) already extracts it as the
+  conversation identity — so the session was ALWAYS keyed by omp's session id; only
+  the map lookup was missing.
+- **Fix** (`src/server.ts`, one block): for responses requests with a
+  client-provided conversation identity, call
+  `recordPluginSession(responsesIdentity.value, session.id)` unconditionally (not
+  just when `pluginAgent` is set). No-op duplicate for pi (same key); the ONLY path
+  for omp.
+- **Verification**: `bili omp -p "<unique prompt>"` → the conversations file gains
+  an entry keyed by the omp session id; `GET /__bili/plugin/status?conversationId=<that id>`
+  returns `ok:true` with the rendered `buildStatusPanel` (Context 19% (24k/128k),
+  Nudge idle, Blocks none).

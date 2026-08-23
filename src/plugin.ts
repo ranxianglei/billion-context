@@ -8,6 +8,7 @@ import { ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, PROXY_TOOL_
 import { executeProxyTool } from "./loop/core.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
 import type { WireProtocol } from "./util.js";
+import { stateDir } from "./paths.js";
 
 // Cooperative plugin protocol ("内外呼应", issue #1): an agent-side plugin
 // registers the ACP tools NATIVELY with its agent and runs the agent's own
@@ -84,6 +85,57 @@ const MAX_PLUGIN_CONVERSATIONS = 1024;
 const conversations = new Map<string, ConversationEntry>();
 const remembered = new Map<string, RememberedMessages>();
 
+// The conversationId → session mapping is in-memory. Persist it so a resumed
+// or restarted proxy can still resolve /acp + tool calls to the (persisted)
+// session without waiting for a fresh model request. Best-effort: a crash
+// before the debounced write just means the next model request repopulates it.
+const conversationsFile = () => path.join(stateDir(), "plugin-conversations.json");
+let conversationsSaveTimer: NodeJS.Timeout | undefined;
+
+function writeConversationsFile(): void {
+    try {
+        const obj: Record<string, ConversationEntry> = {};
+        for (const [k, v] of conversations) obj[k] = v;
+        fs.mkdirSync(stateDir(), { recursive: true });
+        fs.writeFileSync(conversationsFile(), JSON.stringify(obj));
+    } catch {
+        // best-effort persistence; ignore write failures
+    }
+}
+
+function scheduleSaveConversations(): void {
+    if (conversationsSaveTimer) clearTimeout(conversationsSaveTimer);
+    conversationsSaveTimer = setTimeout(() => {
+        conversationsSaveTimer = undefined;
+        writeConversationsFile();
+    }, 300);
+}
+
+/** Flush the conversation map to disk immediately (called on shutdown). */
+export function flushConversations(): void {
+    if (conversationsSaveTimer) {
+        clearTimeout(conversationsSaveTimer);
+        conversationsSaveTimer = undefined;
+    }
+    writeConversationsFile();
+}
+
+/** Restore the persisted conversationId → session map. Called at startup,
+ *  AFTER initSessions so the referenced sessions are already loaded. */
+export function loadConversations(): void {
+    try {
+        const raw = fs.readFileSync(conversationsFile(), "utf8");
+        const obj = JSON.parse(raw) as Record<string, ConversationEntry>;
+        for (const [k, v] of Object.entries(obj)) {
+            if (v && typeof v.sessionId === "string" && v.sessionId.length > 0) {
+                conversations.set(k, { sessionId: v.sessionId, lastSeen: typeof v.lastSeen === "number" ? v.lastSeen : Date.now() });
+            }
+        }
+    } catch {
+        // no file or corrupt — start empty
+    }
+}
+
 /** Index a plugin session by its conversation id (the key the plugin uses on
  *  the tool API). Re-inserting moves the entry to the end so plain Map
  *  insertion order doubles as an LRU clock. */
@@ -99,6 +151,7 @@ export function recordPluginSession(conversationId: string, sessionId: string): 
         const oldest = conversations.keys().next().value;
         if (oldest !== undefined) conversations.delete(oldest);
     }
+    scheduleSaveConversations();
 }
 
 /** Keep the last prepare()'s view for a plugin session so tool-API execution
