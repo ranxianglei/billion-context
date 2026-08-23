@@ -89,3 +89,22 @@ additive and ignored by older callers.
   local self-disable patches must hit the cached copy.
 - The ignored-message render path (`noReply` + `parts[].ignored`) is the
   opencode-sanctioned way to print UI text from a plugin.
+
+## Follow-up 3: /acp 无反应 — this 绑定丢失 (2026-08-23 23:06)
+
+**症状**: `bili opencode` 下选 /acp 发送无任何反应（无报错、无输出）。
+
+**排查** (tmux + console.error 打点 dist):
+- 第一次 Enter 只是选中 slash 弹出菜单，第二次 Enter 才真正提交 —— TUI 正常行为，非 bug。
+- 提交后 hook 正常触发、status HTTP 200、panel 422 字节到手，但 `prompt() THREW: undefined is not an object (evaluating 'this._client')`，且旧代码 `catch {}` 把错误吞了 → 完全静默。
+
+**根因**: `showText` 把 SDK 方法解构出来调用：
+```ts
+const prompt = ctx.client?.session?.prompt;
+await prompt({...});        // this === undefined → this._client 抛错
+```
+上游 opencode-acp 是 `client.session.prompt(...)` 直接方法调用（this = session）。
+
+**修复** (src/agent/opencode.ts): 先守卫 `const session = ctx.client?.session; if (!session || typeof session.prompt !== "function") ...`，再 `await session.prompt({...})` 方法调用；catch 改为 console.error 输出真实错误，不再静默吞。
+
+**验证**: tmux 内 `/acp` ×2 Enter → 面板渲染成功（billion-context@0.1.46 / Context 0% (0/200k) / Blocks none / Tag visibility）；stderr 无 THREW。typecheck/530 tests/build 全绿。

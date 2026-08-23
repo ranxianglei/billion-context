@@ -65,14 +65,20 @@ interface OpencodeHooks {
 const proxyBase = process.env.BILLION_CONTEXT_PROXY ?? "";
 
 async function showText(ctx: OpencodePluginContext, sid: string, text: string): Promise<void> {
-        const prompt = ctx.client?.session?.prompt;
-        if (typeof prompt !== "function") return;
+        // Direct method call — `const p = ctx.client.session.prompt; p(...)` loses `this` (this._client) and throws.
+        const session = ctx.client?.session;
+        if (!session || typeof session.prompt !== "function") {
+            console.error("[bili-opencode] /acp render failed: session.prompt unavailable");
+            return;
+        }
         try {
-            await prompt({
+            await session.prompt({
                 path: { id: sid },
                 body: { noReply: true, parts: [{ type: "text", text, ignored: true }] },
             });
-        } catch {}
+        } catch (err) {
+            console.error(`[bili-opencode] /acp render failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
 }
 
 const server = async (ctx: OpencodePluginContext): Promise<OpencodeHooks> => {
