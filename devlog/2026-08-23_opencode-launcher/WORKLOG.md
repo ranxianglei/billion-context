@@ -108,3 +108,46 @@ await prompt({...});        // this === undefined → this._client 抛错
 **修复** (src/agent/opencode.ts): 先守卫 `const session = ctx.client?.session; if (!session || typeof session.prompt !== "function") ...`，再 `await session.prompt({...})` 方法调用；catch 改为 console.error 输出真实错误，不再静默吞。
 
 **验证**: tmux 内 `/acp` ×2 Enter → 面板渲染成功（billion-context@0.1.46 / Context 0% (0/200k) / Blocks none / Tag visibility）；stderr 无 THREW。typecheck/530 tests/build 全绿。
+
+## Follow-up 4: codex/claude launcher verification + claude /bili/ switch (2026-08-23 23:30)
+
+**Context**: verify `bili codex` / `bili claude` end-to-end. No real API keys on the
+box, so plumbing was proven with a fake local upstream (401 from it = full path OK)
+plus real-upstream runs (401/403 from comfly/anthropic = upstream reachable).
+
+**Fix 1 — cli.ts `--` passthrough**: `bili codex -- exec ...` forwarded the literal
+`--` to the client; clap treats everything after it as positionals →
+`error: unexpected argument`. Now cli.ts consumes a leading `--` after the client
+name (documented form `bili <client> [opts --] [args]`). bili's own options must
+still precede the client name (`bili --port N codex -- ...`).
+
+**Fix 2 — claude drops cert-MITM, rides /bili/ for everything**: claude 2.1.227
+(undici fetch) ignores HTTPS_PROXY, so the MITM path could never intercept it
+(region-block 403 arrived with zero proxy forward logs). discoverRoutes now routes
+every claude upstream — raw HTTP, raw HTTPS, or pre-wrapped at an old proxy
+origin — into httpRewrites; buildClaudeEnv wraps it via ANTHROPIC_BASE_URL (claude
+honors that env natively). MITM whitelist stays empty for claude.
+
+**Fix 3 — readClaudeSettings honors shell env**: settings.json-only reading
+ignored a user-exported ANTHROPIC_BASE_URL (their real relay); the launcher would
+then wrap api.anthropic.com and override the relay entirely. Now env is a fallback
+(settings.json still wins). Loop-local variable renamed settingsEnv to avoid
+shadowing.
+
+**Verification** (fake upstream 127.0.0.1:9955 + real runs):
+- codex `/bili/`: `OPENAI_API_KEY=dummy bili codex -- exec --skip-git-repo-check
+  -c model_providers.bili-comfly.base_url=http://127.0.0.1:8901/bili/http://127.0.0.1:9955/v1 ...`
+  → upstream saw `POST /v1/responses ua=codex_exec/0.147.0` with
+  `tools=[compress,decompress,search_context,acp_status]` injected. codex exec
+  needs `--skip-git-repo-check` + `</dev/null` (else blocks reading stdin).
+- codex MITM (comfly, real): session file `ai.comfly.org_*.json` created through
+  the CONNECT tunnel; real upstream 401 surfaced in codex output.
+- claude `/bili/` (raw env relay): 16 upstream hits
+  `POST /v1/messages?beta=true ua=claude-cli/2.1.227`, ACP tools appended to the
+  full 30-tool Claude set (plus alternating 4-tool probe rounds — expected).
+- claude default (no base_url): proxy log `forward POST →
+  https://api.anthropic.com/v1/messages?beta=true` + real 403 round-trip.
+
+**Tests**: updated discoverDomains/discoverRoutes claude expectations (no MITM
+domains; ANTHROPIC_BASE_URL rewrite), added wrapped-URL unwrap→rewrap test.
+531 pass / 0 fail; typecheck + build clean.

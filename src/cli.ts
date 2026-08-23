@@ -143,7 +143,11 @@ export function parseArgs(argv: string[]): Parsed {
         const a = argv[i]!;
         if (!client && positional.length === 0 && isLaunchClient(a)) {
             client = a;
-            clientArgs = argv.slice(i + 1);
+            const rest = argv.slice(i + 1);
+            // Consume a leading "--" separator (documented form: `bili <client> [opts --] [args]`)
+            // so it is never forwarded to the client (clap-style parsers treat everything
+            // after "--" as positionals).
+            clientArgs = rest[0] === "--" ? rest.slice(1) : rest;
             break;
         }
         switch (a) {

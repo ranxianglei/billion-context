@@ -150,8 +150,8 @@ test("extractDomains: empty / all-invalid input → []", () => {
     assert.deepEqual(extractDomains(["", "ftp://x.example", "http://only.http/v1"]), []);
 });
 
-test("discoverDomains: claude → api.anthropic.com", () => {
-    assert.deepEqual(discoverDomains("claude", {}), ["api.anthropic.com"]);
+test("discoverDomains: claude → [] (claude rides /bili/ rewrites, not cert MITM)", () => {
+    assert.deepEqual(discoverDomains("claude", {}), []);
 });
 
 test("discoverDomains: pi → https hostnames from providers (http dropped, /bili/ unwrapped)", () => {
@@ -450,10 +450,24 @@ test("discoverRoutes: claude with http ANTHROPIC_BASE_URL → httpRewrites entry
     ]);
 });
 
-test("discoverRoutes: claude default → api.anthropic.com in httpsDomains, no rewrites", () => {
+test("discoverRoutes: claude default → ANTHROPIC_BASE_URL /bili/ rewrite (no cert MITM; undici ignores HTTPS_PROXY)", () => {
     const routes = discoverRoutes("claude", {});
-    assert.deepEqual(routes.httpsDomains, ["api.anthropic.com"]);
-    assert.deepEqual(routes.httpRewrites, []);
+    assert.deepEqual(routes.httpsDomains, []);
+    assert.deepEqual(routes.httpsRewrites, []);
+    assert.deepEqual(routes.httpRewrites, [
+        { key: "ANTHROPIC_BASE_URL", realUpstream: "https://api.anthropic.com" },
+    ]);
+});
+
+test("discoverRoutes: claude /bili/-wrapped base_url unwraps to real upstream for re-wrap", () => {
+    const config: ClientConfig = {
+        claude: { anthropicBaseUrl: "http://127.0.0.1:8787/bili/https://api.anthropic.com" },
+    };
+    const routes = discoverRoutes("claude", config);
+    assert.deepEqual(routes.httpsDomains, []);
+    assert.deepEqual(routes.httpRewrites, [
+        { key: "ANTHROPIC_BASE_URL", realUpstream: "https://api.anthropic.com" },
+    ]);
 });
 
 test("discoverRoutes: pi with one http provider → rewrite keyed by provider name", () => {

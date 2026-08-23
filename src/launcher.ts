@@ -239,9 +239,22 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
     };
 
     if (client === "claude") {
-        const u = config.claude?.anthropicBaseUrl;
-        if (nonEmpty(u)) classify(u, "ANTHROPIC_BASE_URL");
-        else classify("https://api.anthropic.com", "ANTHROPIC_BASE_URL");
+        // Claude Code's undici fetch ignores HTTPS_PROXY, so cert MITM cannot
+        // intercept it. Route every upstream — raw HTTP, raw HTTPS, or already
+        // wrapped at a previous proxy origin — through the /bili/ URL form via
+        // ANTHROPIC_BASE_URL instead (claude honors that env var natively).
+        const raw = nonEmpty(config.claude?.anthropicBaseUrl) ? config.claude!.anthropicBaseUrl! : "https://api.anthropic.com";
+        const real = unwrapUpstream(raw);
+        try {
+            const url = new URL(real);
+            if ((url.protocol === "https:" || url.protocol === "http:") && !rewriteKeys.has("ANTHROPIC_BASE_URL")) {
+                rewriteKeys.add("ANTHROPIC_BASE_URL");
+                httpRewrites.push({ key: "ANTHROPIC_BASE_URL", realUpstream: real });
+            }
+        } catch {
+            // Unparseable base URL: leave routes empty (proxy still runs; claude
+            // falls back to its own default endpoint).
+        }
     } else if (client === "pi") {
         for (const [name, prov] of Object.entries(config.pi?.providers ?? {})) {
             classify(prov.baseUrl, name);

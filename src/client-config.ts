@@ -92,7 +92,7 @@ export function resolveOmpHome(env: NodeJS.ProcessEnv): string {
         : path.join(h, ".omp", "agent");
 }
 
-export function readClaudeSettings(homeDir: string, cwd: string): ClaudeSettings {
+export function readClaudeSettings(homeDir: string, cwd: string, env: NodeJS.ProcessEnv = process.env): ClaudeSettings {
     const files = [
         path.join(homeDir, ".claude", "settings.json"),
         path.join(cwd, ".claude", "settings.json"),
@@ -100,12 +100,15 @@ export function readClaudeSettings(homeDir: string, cwd: string): ClaudeSettings
     let anthropicBaseUrl: string | undefined;
     for (const f of files) {
         const obj = readJsonObject(f);
-        const env = obj?.env;
-        if (env && typeof env === "object" && !Array.isArray(env)) {
-            const v = (env as Record<string, unknown>).ANTHROPIC_BASE_URL;
+        const settingsEnv = obj?.env;
+        if (settingsEnv && typeof settingsEnv === "object" && !Array.isArray(settingsEnv)) {
+            const v = (settingsEnv as Record<string, unknown>).ANTHROPIC_BASE_URL;
             if (nonEmpty(v)) anthropicBaseUrl = v;
         }
     }
+    // Honor a shell-exported ANTHROPIC_BASE_URL (claude's native override) so
+    // the launcher wraps the relay the user actually uses, not the default.
+    if (!anthropicBaseUrl && nonEmpty(env.ANTHROPIC_BASE_URL)) anthropicBaseUrl = env.ANTHROPIC_BASE_URL;
     return anthropicBaseUrl ? { anthropicBaseUrl } : {};
 }
 
@@ -295,7 +298,7 @@ export function readZcodeConfig(zcodeHome: string): ZcodeConfig {
 export function loadClientConfig(env: NodeJS.ProcessEnv, cwd: string): ClientConfig {
     const home = os.homedir();
     const config: ClientConfig = {};
-    config.claude = readClaudeSettings(home, cwd);
+    config.claude = readClaudeSettings(home, cwd, env);
     const codexHome = nonEmpty(env.CODEX_HOME) ? env.CODEX_HOME : path.join(home, ".codex");
     config.codex = readCodexConfig(codexHome);
     config.pi = readPiConfig(resolvePiHome(env));
