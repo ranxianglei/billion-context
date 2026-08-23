@@ -220,6 +220,8 @@ export type ProxyOptions = {
     dumpSse?: string;
     passthrough: boolean;
     autoUpdate: boolean;
+    /** Dist-tag channel the auto-updater follows (default "latest"). */
+    updateTag: string;
     logFile?: string;
     /** MITM transparent-proxy mode. When enabled, an HTTP CONNECT handler is
      *  attached so clients that only know how to set HTTP_PROXY (ZCode with a
@@ -338,6 +340,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         dumpSse: env.ACP_DUMP_SSE || fileConfig.dumpSse || undefined,
         passthrough: (env.ACP_PASSTHROUGH ?? (fileConfig.passthrough ? "1" : "0")) === "1",
         autoUpdate: (env.ACP_AUTO_UPDATE ?? (fileConfig.autoUpdate === false ? "0" : "1")) !== "0",
+        updateTag: (env.ACP_UPDATE_TAG ?? fileConfig.updateTag ?? "latest").trim() || "latest",
         logFile: env.ACP_LOG_FILE !== undefined ? (env.ACP_LOG_FILE || undefined) : fileConfig.logFile,
         mitm: {
             enabled: (env.BILI_MITM ?? (fileConfig.mitm?.enabled === false ? "0" : "1")) !== "0",
@@ -369,6 +372,8 @@ type FileConfig = {
     dumpSse?: string;
     passthrough?: boolean;
     autoUpdate?: boolean;
+    /** Dist-tag channel the auto-updater follows (default "latest"). */
+    updateTag?: string;
     upstreamProxy?: string;
     upstreamProxyMode?: string;
     logFile?: string;

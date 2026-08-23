@@ -51,20 +51,50 @@ let timer: ReturnType<typeof setInterval> | undefined;
 let inFlight = false;
 let firstCheckDone = false;
 
-function parseVersion(v: string): number[] {
-    return v.replace(/^v/, "").split(".").map((n) => parseInt(n, 10) || 0);
+// --- Version comparison (ported from opencode-acp lib/update.ts) ---
+// Proper semver including prerelease ordering: a prerelease is OLDER than its
+// release (0.1.46-pr.202.1 < 0.1.46), and prerelease parts compare
+// numeric-then-lexicographic. The old 3-part numeric compare mis-ordered
+// prereleases and multi-digit segments.
+export function isVersionNewer(latest: string, current: string): boolean {
+    const next = parseSemVer(latest);
+    const prev = parseSemVer(current);
+    if (!next || !prev) return false;
+
+    for (let i = 0; i < 3; i++) {
+        const a = next.parts[i] ?? 0;
+        const b = prev.parts[i] ?? 0;
+        if (a !== b) return a > b;
+    }
+
+    if (!next.pre.length && prev.pre.length) return true;
+    if (next.pre.length && !prev.pre.length) return false;
+
+    for (let i = 0; i < Math.max(next.pre.length, prev.pre.length); i++) {
+        const a = next.pre[i];
+        const b = prev.pre[i];
+        if (a === undefined) return false;
+        if (b === undefined) return true;
+        if (a === b) continue;
+
+        const aNumber = /^\d+$/.test(a) ? Number(a) : undefined;
+        const bNumber = /^\d+$/.test(b) ? Number(b) : undefined;
+        if (aNumber !== undefined && bNumber !== undefined) return aNumber > bNumber;
+        if (aNumber !== undefined) return false;
+        if (bNumber !== undefined) return true;
+        return a > b;
+    }
+
+    return false;
 }
 
-function isNewer(latest: string, current: string): boolean {
-    const l = parseVersion(latest);
-    const c = parseVersion(current);
-    for (let i = 0; i < 3; i++) {
-        const lv = l[i] ?? 0;
-        const cv = c[i] ?? 0;
-        if (lv > cv) return true;
-        if (lv < cv) return false;
-    }
-    return false;
+function parseSemVer(version: string): { parts: number[]; pre: string[] } | undefined {
+    const match = version.match(/^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+.+)?$/);
+    if (!match) return undefined;
+    return {
+        parts: [Number(match[1]), Number(match[2]), Number(match[3])],
+        pre: match[4]?.split(".") ?? [],
+    };
 }
 
 async function readLastCheck(): Promise<number> {
@@ -308,6 +338,9 @@ export type UpdateOptions = {
     currentVersion: string;
     /** Enable auto-install when a newer version is found. */
     autoUpdate: boolean;
+    /** Dist-tag channel to follow (default "latest"), e.g. "dev", "stable".
+     *  Publishing a PR (pr-N tag) never pulls a user on another channel. */
+    updateTag?: string;
 };
 
 /** Run a single check (throttled unless `force`). Safe to call frequently. */
@@ -328,7 +361,12 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         firstCheckDone = true;
         loggerLog("info", `[update] checking npm registry for ${opts.packageName}${sinceLastSec < 0 ? " (startup check)" : sinceLastSec === 0 ? "" : ` (last check ${sinceLastSec}s ago)`}\u2026`);
 
-        const url = `${REGISTRY_BASE}/${opts.packageName}/latest`;
+        // Follow the configured dist-tag channel (default "latest"): an
+        // `updateTag: "dev"` install tracks `dev`, "stable" tracks "stable",
+        // etc. PR previews (pr-N tags) are only followed if explicitly
+        // configured, so publishing a PR never pulls a stable user forward.
+        const tag = (opts.updateTag ?? "latest").trim() || "latest";
+        const url = `${REGISTRY_BASE}/${opts.packageName}/${encodeURIComponent(tag)}`;
         const res = await fetch(url, {
             signal: AbortSignal.timeout(5000),
             headers: { Accept: "application/json" },
@@ -353,8 +391,8 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         const diskVersion = installDir ? await readDiskVersion(installDir) : undefined;
         const currentVersion = diskVersion ?? opts.currentVersion;
 
-        if (!isNewer(latest, currentVersion)) {
-            loggerLog("info", `[update] current=${currentVersion} latest=${latest} (up to date)`);
+        if (!isVersionNewer(latest, currentVersion)) {
+            loggerLog("info", `[update] current=${currentVersion} latest=${latest} tag=${tag} (up to date)`);
             return;
         }
 

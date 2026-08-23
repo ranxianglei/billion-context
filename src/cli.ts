@@ -355,8 +355,12 @@ export async function main(): Promise<void> {
         return;
     }
     if (command === "update") {
-        // Manual one-shot update — bypasses the throttle.
-        await checkForUpdate({ packageName: PACKAGE_NAME, currentVersion: VERSION, autoUpdate: true }, true);
+        // Manual one-shot update — bypasses the throttle. Respect the
+        // configured channel (updateTag) so `bili update` follows the same
+        // dist-tag as the background auto-updater.
+        ensureConfigTemplate();
+        const updateOpts = loadOptions();
+        await checkForUpdate({ packageName: PACKAGE_NAME, currentVersion: VERSION, autoUpdate: true, updateTag: updateOpts.updateTag }, true);
         return;
     }
     if (command === "test") {
@@ -387,6 +391,6 @@ export async function main(): Promise<void> {
     // Start background auto-update after the server is listening so a slow
     // registry check never delays startup or races the listen socket.
     if (opts.autoUpdate) {
-        startAutoUpdate({ packageName: PACKAGE_NAME, currentVersion: VERSION, autoUpdate: true });
+        startAutoUpdate({ packageName: PACKAGE_NAME, currentVersion: VERSION, autoUpdate: true, updateTag: opts.updateTag });
     }
 }
