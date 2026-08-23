@@ -500,13 +500,14 @@ async function handle(
     if (req.method === "GET" && req.url === "/__bili/plugin/manifest") return handlePluginManifest(res);
     if (req.method === "GET" && req.url?.startsWith("/__bili/plugin/status")) {
         const query = req.url.slice(req.url.indexOf("?") + 1);
-        const conversationId = new URLSearchParams(query).get("conversationId")?.trim() ?? "";
+        const params = new URLSearchParams(query);
+        const conversationId = params.get("conversationId")?.trim() ?? "";
         if (!conversationId) {
             res.writeHead(400, { "content-type": "application/json" });
             res.end(JSON.stringify({ ok: false, error: "conversationId query parameter is required" }));
             return;
         }
-        return handlePluginStatus(conversationId, res);
+        return handlePluginStatus(conversationId, res, params.get("fallback") === "latest");
     }
     if (req.method === "POST" && req.url === "/__bili/plugin/tool") {
         try {

@@ -791,6 +791,17 @@ test("prepareOpencodeHttpRewrite: writes rewritten copy, original untouched", ()
         assert.equal(fs.readFileSync(cfgFile, "utf8"), original);
         fs.rmSync(path.dirname(tmpFile), { recursive: true, force: true });
         assert.equal(prepareOpencodeHttpRewrite(cfgFile, "http://127.0.0.1:8787", [], []), undefined);
+        const withPlugin = prepareOpencodeHttpRewrite(cfgFile, "http://127.0.0.1:8787", [], [], "/opt/bili/dist/agent/opencode.js");
+        assert.ok(withPlugin);
+        const injected = JSON.parse(fs.readFileSync(withPlugin, "utf8"));
+        assert.deepEqual(injected.plugin, ["opencode-acp@latest", "/opt/bili/dist/agent/opencode.js"]);
+        assert.equal(injected.provider["zhipuai-lb"].options.baseURL, "http://127.0.0.1:18081/v1");
+        fs.rmSync(path.dirname(withPlugin), { recursive: true, force: true });
+        const missingCfg = prepareOpencodeHttpRewrite(path.join(dir, "nope.json"), "http://127.0.0.1:8787", [], [], "/opt/bili/dist/agent/opencode.js");
+        assert.ok(missingCfg);
+        const fromEmpty = JSON.parse(fs.readFileSync(missingCfg, "utf8"));
+        assert.deepEqual(fromEmpty.plugin, ["/opt/bili/dist/agent/opencode.js"]);
+        fs.rmSync(path.dirname(missingCfg), { recursive: true, force: true });
     } finally {
         fs.rmSync(dir, { recursive: true, force: true });
     }

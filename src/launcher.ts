@@ -509,22 +509,19 @@ export function prepareOpencodeHttpRewrite(
     origin: string,
     httpRewrites: HttpRewrite[],
     httpsRewrites: HttpRewrite[],
+    pluginPath?: string,
 ): string | undefined {
-    if (httpRewrites.length === 0 && httpsRewrites.length === 0) return undefined;
-    let txt: string;
+    if (httpRewrites.length === 0 && httpsRewrites.length === 0 && !pluginPath) return undefined;
+    let root: Record<string, unknown> = {};
     try {
-        txt = fs.readFileSync(configFile, "utf8");
+        const txt = fs.readFileSync(configFile, "utf8");
+        const parsed = JSON.parse(txt);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            root = { ...(parsed as Record<string, unknown>) };
+        }
     } catch {
-        return undefined;
+        // missing or invalid config — still emit a temp config so the plugin rides along
     }
-    let parsed: unknown;
-    try {
-        parsed = JSON.parse(txt);
-    } catch {
-        return undefined;
-    }
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
-    const root = parsed as Record<string, unknown>;
     const provRoot = root.provider;
     if (provRoot && typeof provRoot === "object" && !Array.isArray(provRoot)) {
         const providers = provRoot as Record<string, unknown>;
@@ -540,6 +537,11 @@ export function prepareOpencodeHttpRewrite(
         };
         rewrite(httpRewrites, true);
         rewrite(httpsRewrites, false);
+    }
+    if (pluginPath) {
+        const plugins = Array.isArray(root.plugin) ? root.plugin.filter((p): p is string => typeof p === "string") : [];
+        if (!plugins.includes(pluginPath)) plugins.push(pluginPath);
+        root.plugin = plugins;
     }
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-opencode-"));
     const tmpFile = path.join(tmp, "opencode.json");
@@ -834,7 +836,9 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // OPENCODE_CONFIG (real config untouched). BILLION_CONTEXT_PROXY makes
         // opencode-acp self-disable so the proxy owns the ACP tools.
         env = { ...process.env, HTTPS_PROXY: origin, NODE_EXTRA_CA_CERTS: ca, BILLION_CONTEXT_PROXY: origin };
-        opencodeTmpFile = prepareOpencodeHttpRewrite(resolveOpencodeConfigFile(process.env), origin, routes.httpRewrites, routes.httpsRewrites);
+        const opencodePlugin = process.argv[1] ? path.resolve(path.dirname(process.argv[1]), "agent", "opencode.js") : undefined;
+        const opencodePluginPath = opencodePlugin && fs.existsSync(opencodePlugin) ? opencodePlugin : undefined;
+        opencodeTmpFile = prepareOpencodeHttpRewrite(resolveOpencodeConfigFile(process.env), origin, routes.httpRewrites, routes.httpsRewrites, opencodePluginPath);
         if (opencodeTmpFile) env.OPENCODE_CONFIG = opencodeTmpFile;
     } else if (base === "codex") {
         // Per-spawn conversation id for the MCP shell's headless

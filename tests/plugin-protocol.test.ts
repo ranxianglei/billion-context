@@ -486,6 +486,16 @@ test("plugin-reported context window becomes the nudge denominator and is visibl
         const unknown = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/status?conversationId=never-seen`);
         assert.equal(unknown.status, 404);
 
+        // fallback=latest: an unknown conversation resolves to the most
+        // recently active session (opencode's thin plugin can't stamp headers,
+        // so /acp rides the latest-session fallback).
+        const fb = (await (await fetch(
+            `http://127.0.0.1:${h.proxyPort}/__bili/plugin/status?conversationId=never-seen&fallback=latest`,
+        )).json()) as { ok: boolean; fallback?: boolean; requests: number };
+        assert.equal(fb.ok, true);
+        assert.equal(fb.fallback, true);
+        assert.ok(fb.requests >= 1);
+
         const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/status?conversationId=${conv}`);
         assert.equal(resp.status, 200);
         const status = (await resp.json()) as {

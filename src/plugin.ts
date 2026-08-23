@@ -3,7 +3,7 @@ import { buildStatusPanel } from "acp-kernel/panel";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import path from "node:path";
-import { acquireInFlight, markDirty, peekSession, releaseInFlight, withSessionLock, type Session } from "./session.js";
+import { acquireInFlight, listSessions, markDirty, peekSession, releaseInFlight, withSessionLock, type Session } from "./session.js";
 import { ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, PROXY_TOOL_NAMES } from "./compress-tool.js";
 import { executeProxyTool } from "./loop/core.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
@@ -295,15 +295,25 @@ export type PluginToolDeps = {
 
 /** Context-level visibility for plugin UIs (status bars / slash commands):
  *  the same usage the nudge decision sees, keyed by conversation id. */
-export function handlePluginStatus(conversationId: string, res: import("node:http").ServerResponse): void {
-    const entry = conversations.get(conversationId);
-    const session = entry ? peekSession(entry.sessionId) : undefined;
-    if (!entry || !session) {
+export function handlePluginStatus(conversationId: string, res: import("node:http").ServerResponse, fallbackLatest = false): void {
+    let entry = conversations.get(conversationId);
+    let session = entry ? peekSession(entry.sessionId) : undefined;
+    let viaFallback = false;
+    if ((!entry || !session) && fallbackLatest) {
+        const latest = listSessions()
+            .filter((s) => typeof s.lastSeen === "number")
+            .sort((a, b) => (b.lastSeen ?? 0) - (a.lastSeen ?? 0))[0];
+        if (latest) {
+            session = latest;
+            viaFallback = true;
+        }
+    }
+    if (!session) {
         res.writeHead(404, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: false, error: "unknown plugin conversation" }));
         return;
     }
-    entry.lastSeen = Date.now();
+    if (entry) entry.lastSeen = Date.now();
     const limit = session.metadata.effectiveContextLimit;
     const mem = remembered.get(session.id);
     const modelContextLimit = typeof limit === "number" && limit > 0 ? limit : 200000;
@@ -327,7 +337,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     res.end(JSON.stringify({
         ok: true,
         conversationId,
-        sessionId: session.id,
+        fallback: viaFallback || undefined,
         label: session.meta.label ?? null,
         pluginAgent: session.metadata.pluginAgent ?? null,
         contextLimit: typeof limit === "number" ? limit : null,
