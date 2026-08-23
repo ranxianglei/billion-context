@@ -92,24 +92,41 @@ test("anthropic: tool_result without is_error stays clean", () => {
     assert.equal(tr.is_error, undefined, "no spurious is_error");
 });
 
-// 4. OpenAI developer role round-trips (was collapsed to system).
-test("openai: developer role is restored", () => {
-    const body: OpenAIRequestBody = { messages: [{ role: "developer", content: "you are a dev" }] };
-    const { msgs } = openaiToCore(body);
-    assert.equal(msgs[0]?.role, "system", "kernel sees system");
-    assert.equal(msgs[0]?.originalRole, "developer", "originalRole sidecar stored");
+// 4. OpenAI developer role: leading prefixes are HOISTED out of the fold
+// space (kernel 0.0.37 — system content is host runtime state and must not
+// feed ids/fingerprints); a MID-conversation developer message still
+// round-trips via the originalRole sidecar.
+test("openai: leading developer prefix is hoisted, mid-conversation developer role is restored", () => {
+    const body: OpenAIRequestBody = {
+        messages: [
+            { role: "developer", content: "you are a dev" },
+            { role: "user", content: "hi" },
+            { role: "developer", content: "mid-turn nudge" },
+        ],
+    };
+    const { msgs, systemText } = openaiToCore(body);
+    assert.equal(systemText, "you are a dev", "leading developer prefix is returned alongside the core stream");
+    const mid = msgs.find((m) => m.role === "system");
+    assert.equal(mid?.originalRole, "developer", "originalRole sidecar stored for the mid-conversation piece");
     const rebuilt = coreToOpenai(msgs);
-    assert.equal(rebuilt[0]?.role, "developer", "developer role reconstructed");
-    assert.equal(rebuilt[0]?.content, "you are a dev");
+    assert.equal(rebuilt.find((m) => m.role === "developer")?.content, "mid-turn nudge", "developer role reconstructed");
 });
 
-// 4b. Sanity: a plain system role is NOT promoted to developer.
+// 4b. A plain (mid-conversation) system role is NOT promoted to developer.
 test("openai: system role stays system", () => {
-    const body: OpenAIRequestBody = { messages: [{ role: "system", content: "sys" }] };
-    const { msgs } = openaiToCore(body);
-    assert.equal(msgs[0]?.originalRole, "system");
+    const body: OpenAIRequestBody = {
+        messages: [
+            { role: "system", content: "head sys" },
+            { role: "user", content: "hi" },
+            { role: "system", content: "mid sys" },
+        ],
+    };
+    const { msgs, systemText } = openaiToCore(body);
+    assert.equal(systemText, "head sys", "leading system hoisted");
+    const mid = msgs.find((m) => m.role === "system");
+    assert.equal(mid?.originalRole, "system");
     const rebuilt = coreToOpenai(msgs);
-    assert.equal(rebuilt[0]?.role, "system");
+    assert.ok(rebuilt.some((m) => m.role === "system" && m.content === "mid sys"), "mid-conversation system reconstructed as system");
 });
 
 // 5. OpenAI image_url round-trips (image was previously dropped entirely).
