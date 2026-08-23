@@ -171,7 +171,8 @@ export function createBiliPlugin(agentOverride?: string): (pi: ExtensionAPI) => 
                         notify("bili: no ACP session yet (send a model request first, then run /acp)", "warning");
                         return;
                     }
-                    notify(renderAcpStatus(status), "info");
+                    const panel = typeof status.panel === "string" ? status.panel : undefined;
+                    notify(panel ?? renderAcpStatus(status), "info");
                 },
             });
         }

@@ -1,4 +1,5 @@
-import { type CompressionCore, type Config, type CoreMessage, type NudgeDecision } from "acp-kernel";
+import { type CompressionCore, type Config, type CoreMessage, type NudgeDecision, defaultCountTokens } from "acp-kernel";
+import { buildStatusPanel } from "acp-kernel/panel";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import path from "node:path";
@@ -238,6 +239,23 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     }
     entry.lastSeen = Date.now();
     const limit = session.metadata.effectiveContextLimit;
+    const mem = remembered.get(session.id);
+    const modelContextLimit = typeof limit === "number" && limit > 0 ? limit : 200000;
+    let panel: string | undefined;
+    try {
+        panel = buildStatusPanel({
+            tokenCount: session.stats.lastInputTokens,
+            systemPromptTokens: 0,
+            state: session.state,
+            nudge: mem?.nudge,
+            modelContextLimit,
+            unprunedTokens: mem && mem.original.length > 0
+                ? mem.original.reduce((sum, m) => sum + defaultCountTokens(m.text ?? ""), 0)
+                : undefined,
+        });
+    } catch {
+        panel = undefined;
+    }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
         ok: true,
@@ -252,6 +270,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         cachedTokens: session.stats.cachedTokens,
         requests: session.stats.requests,
         blocks: session.state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active })),
+        panel,
         lastSeen: session.lastSeen,
     }));
 }

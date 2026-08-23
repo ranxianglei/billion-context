@@ -10,8 +10,12 @@
 - **What was done** (1–3 sentences): Added a single `/acp` slash command to the
   agent plugin (pi/omp) that shows the current session's ACP context-compression
   status. The command is registered via `pi.registerCommand()` in
-  `createBiliPlugin` (shared by pi and omp) and reads the proxy's existing
-  `/__bili/plugin/status` endpoint — no proxy changes.
+  `createBiliPlugin` (shared by pi and omp) and reads the proxy's
+  `/__bili/plugin/status` endpoint. The proxy now renders the status with the
+  kernel's `buildStatusPanel` (from `acp-kernel/panel`) and returns it as a `panel`
+  field; the plugin displays that rendered panel (falling back to a compact
+  `renderAcpStatus` if absent) — so the `/acp` output matches billion-context-pi's
+  `/acp` exactly (same kernel function).
 - **Why** (1–3 sentences): The four ACP tools are model-facing; there was no
   user-facing way to view status without prompting the model. pi/omp expose
   `registerCommand`, so a slash command is a first-class, low-risk addition
@@ -35,9 +39,19 @@
   `fmtTok` + `renderAcpStatus` helpers; the `/acp` registration in
   `createBiliPlugin` (guarded by `typeof pi.registerCommand === "function"`). The
   handler detects the proxy (`detectProxyBase`), reads the session id
-  (`sessionIdOf`), calls `fetchStatus`, and renders the result via
-  `ctx.ui.notify(..., "info")`. Warns (not throws) when the proxy is undetected or
-  the session is unknown.
+  (`sessionIdOf`), calls `fetchStatus`, and displays `status.panel` (the
+  proxy-rendered `buildStatusPanel` text) when present, else falls back to
+  `renderAcpStatus`. Warns (not throws) when the proxy is undetected or the
+  session is unknown.
+- `src/plugin.ts` — `handlePluginStatus` now renders the status with
+  `buildStatusPanel` (imported from `acp-kernel/panel`) and adds a `panel` field to
+  the response. Inputs: `tokenCount` = `session.stats.lastInputTokens`,
+  `systemPromptTokens` = 0 (the proxy keeps the system prompt out of the CoreMessages,
+  so it isn't measured per session), `state` = `session.state`, `nudge` = the
+  remembered per-session nudge, `modelContextLimit` = `session.metadata.effectiveContextLimit`
+  (fallback 200000), `unprunedTokens` = `defaultCountTokens` over the remembered
+  original messages. Wrapped in try/catch — a render failure yields `panel: undefined`
+  (the plugin falls back to `renderAcpStatus`).
 - `tests/plugin-agent.test.ts` — extended `FakePi` with `registerCommand`/`commands`;
   3 new tests (renders proxy status; warns when no proxy; warns when session unknown).
 
@@ -50,11 +64,19 @@
   reads `GET /__bili/plugin/status?conversationId=<session id>`.
 - **Key logic explanation**: the proxy status endpoint returns
   `{ contextLimit, contextTokens, inputTokens, outputTokens, cachedTokens, requests,
-  blocks: [{id, tier, active}] }`. `renderAcpStatus` formats tokens as
-  `12.3K`/`200.0K`/`1.2M` and shows `context: <used> / <limit> (<pct>)`,
-  `in/out/cached`, `requests`, and `blocks: <total> (<active> active)`. The command
-  is registered unconditionally at plugin load (cheap); the proxy is detected at
+  blocks: [{id, tier, active}], panel }`. `panel` is the kernel's `buildStatusPanel`
+  output (the same function billion-context-pi's `/acp` uses) — a bordered
+  "ACP Context Analysis" with the context bar, sent-view token breakdown, nudge
+  state, compressible ranges, and the block list with topics. The plugin displays
+  `panel` verbatim when present; `renderAcpStatus` (the compact `12.3K / 200.0K`
+  format) is only a fallback for proxies that don't return `panel`. The command is
+  registered unconditionally at plugin load (cheap); the proxy is detected at
   invocation time so a proxy that comes up later still works.
+- **Note on "Sent to LLM"**: the panel derives the sent view from
+  `nudge.contextBreakdown` + `systemPromptTokens`. For a short/no-compression turn
+  the breakdown is all-zero, so "Sent to LLM" shows 0 — this is kernel behavior
+  (billion-context-pi shows the same); it populates correctly once compression is
+  active.
 
 ## 4. Testing & Verification
 
@@ -81,14 +103,17 @@ npm run build          # tsup
 ### Results
 
 - **PASS/FAIL**: PASS
-- **Key logs/data** (optional): built-artifact harness (loaded
-  `dist/agent/pi.js` with a fake pi + fake proxy) produced:
+- **Key logs/data** (optional): end-to-end (real proxy + SGLang backend, model
+  request with `x-bili-plugin` headers, then `GET /__bili/plugin/status`) returned a
+  rendered `panel`:
   ```
-  [info] 📊 ACP status
-    context: 12.3K / 200.0K (6.2%)
-    in/out/cached: 10.0K / 1.2K / 8.0K
-    requests: 7
-    blocks: 2 (1 active)
+  ╭─────────────────────────────────────────────╮
+  │           ACP Context Analysis              │
+  ╰─────────────────────────────────────────────╯
+  Context (session accounting, host footer scale): 1% (1.8k / 262k) — never shrinks; includes compressed originals
+  Sent to LLM (after compression, est.): 0 (0% of limit)
+  Nudge: idle — max compressible 0 < threshold 50000; growth 0 < floor 22500
+  Blocks: none (nothing compressed yet)
   ```
   Both `dist/agent/pi.js` and `dist/agent/omp.js` contain the `registerCommand` call
   (omp reuses the factory). Full TUI verification (typing `/acp` in a live omp/pi)
