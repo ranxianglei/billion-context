@@ -53,7 +53,7 @@ import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { emitStreamError } from "./stream-error.js";
 import { deriveSessionId as deriveProxySessionId, affinityToken, clientConversationHeader, type ConversationIdentity } from "./session-id.js";
-import { consumePluginRegisterFor, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, pipePluginJson, pipeThroughWithUsage, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
+import { consumePluginRegisterFor, flushConversations, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, loadConversations, pipePluginJson, pipeThroughWithUsage, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import { isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, shouldReserveOutputHeadroom, usageTotals } from "./util.js";
@@ -166,6 +166,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // that survived a restart keep their folded view (otherwise long sessions
     // re-send oversized raw history and hang).
     await initSessions();
+    loadConversations();
     log("info", `[persist] ${getStore().enabled ? "enabled" : "disabled"}`);
     if (filePath) {
         log("info", `[log] writing to ${filePath}`);
@@ -251,6 +252,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         log("error", `listen failed: ${err.code ?? ""} ${err.message}${hint}`);
         shuttingDown = true;
         server.close();
+        flushConversations();
         void flushAllSessions().finally(() => {
             closeLogger();
             process.exit(1);
@@ -279,6 +281,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         // before invoking cb, so in-flight SSE streams get a chance to finish
         // rather than being yanked mid-chunk.
         server.close(() => {
+            flushConversations();
             void flushAllSessions().finally(() => {
                 closeLogger();
                 process.exit(0);
@@ -288,6 +291,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         // block shutdown forever — force-exit after a grace window.
         setTimeout(() => {
             log("warn", "shutdown grace window elapsed; forcing exit");
+            flushConversations();
             void flushAllSessions().finally(() => {
                 closeLogger();
                 process.exit(0);
@@ -720,6 +724,18 @@ async function handle(
             if (session.metadata.pluginAgent !== pluginAgent) session.metadata.pluginAgent = pluginAgent;
             session.metadata.effectiveContextLimit = reqConfig.modelContextLimit;
             recordPluginSession(pluginConversation ?? conversation, session.id);
+        }
+        // Responses clients that send their own session id as `prompt_cache_key`
+        // (omp) get that conversation recorded even WITHOUT the x-bili-plugin
+        // header, so the /acp command — which looks the session up by the
+        // client's session id — can find it. NOTE: conversationIdentityResponses
+        // does NOT read prompt_cache_key (it falls back to a content fingerprint
+        // with clientProvided:false), so we read the field directly here.
+        if (protocol === "responses") {
+            const pck = (parsed as ResponsesRequestBody).prompt_cache_key;
+            if (typeof pck === "string" && pck.trim().length > 0) {
+                recordPluginSession(pck.trim(), session.id);
+            }
         }
         const pluginMode = pluginAgent !== undefined;
         // Self-heal the context window: a prior upstream overflow may have
