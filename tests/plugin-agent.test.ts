@@ -164,6 +164,16 @@ async function flush(): Promise<void> {
     await new Promise((r) => setTimeout(r, 20));
 }
 
+// Windows CI runners can take seconds on a cold loopback connect, so a fixed
+// 20ms flush races the manifest fetch. Poll for registration instead.
+async function waitForTools(pi: FakePi, count: number, timeoutMs = 15000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (pi.tools.length < count) {
+        if (Date.now() > deadline) throw new Error(`timed out waiting for ${count} registered tools; got ${pi.tools.length}`);
+        await new Promise((r) => setTimeout(r, 25));
+    }
+}
+
 test("pi extension registers manifest tools and stamps headers when proxied", async () => {
     const proxy = await startFakeProxy();
     try {
@@ -175,7 +185,7 @@ test("pi extension registers manifest tools and stamps headers when proxied", as
         assert.equal(headers["x-bili-plugin-conversation"], "sess-42");
         assert.equal(headers["x-bili-plugin-context-window"], "1000000");
         await pi.events.get("session_start")!({}, fakeCtx(proxy));
-        await flush();
+        await waitForTools(pi, 2);
         assert.equal(pi.tools.length, 2);
         assert.equal(pi.tools[0]!.name, "compress");
         assert.deepEqual(pi.tools[0]!.parameters, { type: "object", properties: { content: { type: "array" } }, required: ["content"] });
@@ -200,7 +210,7 @@ test("pi extension survives hostile host shapes without throwing", async () => {
         pi.events.get("before_provider_headers")!({ headers: null }, fakeCtx(proxy));
         pi.events.get("before_provider_headers")!({ headers: [] }, { sessionManager: {}, model: { baseUrl: `${proxy.origin}/bili/https://api.example.com/v1` } });
         await pi.events.get("session_start")!({}, {});
-        await flush();
+        await waitForTools(pi, 2);
         // proxied baseUrl above intentionally triggers header-fallback registration
         assert.equal(pi.tools.length, 2);
     } finally {
@@ -214,7 +224,7 @@ test("registration retries are throttled and deduped", async () => {
         const pi = makeFakePi();
         biliPlugin(pi as never);
         await pi.events.get("session_start")!({}, fakeCtx(proxy));
-        await flush();
+        await waitForTools(pi, 2);
         assert.equal(pi.tools.length, 2);
         const calls = proxy.toolCalls.length;
         for (let i = 0; i < 5; i++) pi.events.get("before_provider_headers")!({ headers: {} }, fakeCtx(proxy));
