@@ -18,6 +18,20 @@ interface FunctionCallBuffer {
     arguments: string;
 }
 
+interface MappedItem {
+    id: string;
+    index: number;
+}
+
+function rewriteItemEvent(type: string, obj: Record<string, unknown>, mapped: MappedItem): Buffer {
+    const item = { ...((obj.item as Record<string, unknown>) ?? {}), id: mapped.id };
+    return Buffer.from(`event: ${type}\ndata: ${JSON.stringify({ ...obj, output_index: mapped.index, item })}\n\n`, "utf8");
+}
+
+function rewriteRefEvent(type: string, obj: Record<string, unknown>, mapped: MappedItem): Buffer {
+    return Buffer.from(`event: ${type}\ndata: ${JSON.stringify({ ...obj, item_id: mapped.id, output_index: mapped.index })}\n\n`, "utf8");
+}
+
 async function* iterSseEvents(stream: ReadableStream<Uint8Array>): AsyncGenerator<string> {
     const reader = stream.getReader();
     let buf = "";
@@ -162,6 +176,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
 
         async *parseStream(upstream, round) {
             const pending = new Map<string, FunctionCallBuffer>();
+            const remapped = new Map<string, MappedItem>();
             for await (const eventStr of iterSseEvents(upstream)) {
                 const type = extractEventType(eventStr);
                 const dataLine = extractDataLine(eventStr);
@@ -196,6 +211,11 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                         }
                     } else if (item?.type === "custom_tool_call") {
                         yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
+                    } else if (item?.type === "message" && round > 1 && !suppressTextLifecycle) {
+                        const origId = typeof item.id === "string" ? item.id : "";
+                        const mapped = { id: `msg-proxy-${round}-${origId || outputIndex}`, index: outputIndex++ };
+                        if (origId) remapped.set(origId, mapped);
+                        yield { kind: "meta", chunk: rewriteItemEvent(type, obj, mapped), firstRoundOnly: false } as ParsedStreamEvent;
                     } else if (item?.type !== "message" || !suppressTextLifecycle) {
                         yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
                     }
@@ -204,13 +224,23 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                     type === "response.content_part.done" ||
                     type === "response.output_text.done"
                 ) {
-                    if (!suppressTextLifecycle) {
+                    const mapped = remapped.get(typeof obj.item_id === "string" ? obj.item_id : "");
+                    if (mapped) {
+                        yield { kind: "meta", chunk: rewriteRefEvent(type, obj, mapped), firstRoundOnly: false } as ParsedStreamEvent;
+                    } else if (!suppressTextLifecycle) {
                         yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
                     }
                 } else if (type === "response.output_text.delta") {
                     const delta = typeof obj.delta === "string" ? obj.delta : "";
                     if (delta.length > 0) {
-                        yield { kind: "text", delta, raw: rawBuf } as ParsedStreamEvent;
+                        const mapped = remapped.get(typeof obj.item_id === "string" ? obj.item_id : "");
+                        if (mapped) {
+                            yield { kind: "text", delta, raw: rewriteRefEvent(type, obj, mapped) } as ParsedStreamEvent;
+                        } else if (round === 1) {
+                            yield { kind: "text", delta, raw: rawBuf } as ParsedStreamEvent;
+                        } else {
+                            yield { kind: "text", delta } as ParsedStreamEvent;
+                        }
                     }
                 } else if (type === "response.function_call_arguments.delta") {
                     const itemId = typeof obj.item_id === "string" ? obj.item_id : "";
@@ -250,6 +280,15 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                         }
                     } else if (item?.type === "custom_tool_call") {
                         yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
+                    } else if (item?.type === "message") {
+                        const origId = typeof item.id === "string" ? item.id : "";
+                        const mapped = remapped.get(origId);
+                        if (mapped) {
+                            remapped.delete(origId);
+                            yield { kind: "meta", chunk: rewriteItemEvent(type, obj, mapped), firstRoundOnly: false } as ParsedStreamEvent;
+                        } else if (!suppressTextLifecycle) {
+                            yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
+                        }
                     } else if (item?.type !== "message" || !suppressTextLifecycle) {
                         yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
                     }
