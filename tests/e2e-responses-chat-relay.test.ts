@@ -116,7 +116,7 @@ function compressScript(): string[] {
                                 id: "call_compress",
                                 type: "function",
                                 function: {
-                                    name: "bili_compress",
+                                    name: "compress",
                                     arguments: JSON.stringify({
                                         content: [{ startId: "m00001", endId: "m00002", topic: "e2e", summary: "e2e summary" }],
                                     }),
@@ -254,7 +254,7 @@ test("e2e chat relay: responses text streams through bili with incremental delta
         assert.ok(systemMsg, `instructions not lifted to system/developer message: ${JSON.stringify(chatRelayReq.messages.map((m) => m.role))}`);
         assert.match(systemMsg?.content ?? "", /test assistant/);
         assert.ok(
-            (chatRelayReq.tools ?? []).some((t) => t.type === "function" && t.function.name === "bili_compress"),
+            (chatRelayReq.tools ?? []).some((t) => t.type === "function" && t.function.name === "compress"),
             `bili-injected compress tool not converted to nested chat format: ${JSON.stringify(chatRelayReq.tools)}`,
         );
     } finally {

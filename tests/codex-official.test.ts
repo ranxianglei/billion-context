@@ -119,7 +119,7 @@ test("Codex official transport preserves OAuth headers, decodes bodies, and reba
         assert.deepEqual(forwarded.additional_tools, requestBody.additional_tools);
         assert.deepEqual(
             forwarded.tools.map((t: { name: string }) => t.name),
-            ["shell", "bili_compress", "bili_decompress", "bili_search_context", "bili_status"],
+            ["shell", "compress", "decompress", "search_context", "acp_status"],
         );
 
         const session = listSessions().find((candidate) => candidate.meta.label === sessionId);

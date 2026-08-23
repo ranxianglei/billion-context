@@ -13,8 +13,6 @@ import type { BiliMessage } from "acp-kernel/wire";
 import {
     parseCompressInput,
     PROXY_TOOL_NAMES,
-    BILI_PROXY_TOOL_NAMES,
-    biliToolName,
 } from "../compress-tool.js";
 import { applyRanges } from "../stream.js";
 import { resolveDecompress } from "../decompress-shared.js";
@@ -96,7 +94,6 @@ export function executeProxyTool(
     ctx: LoopCtx,
     callId?: string,
 ): string {
-    toolName = biliToolName(toolName);
     if (toolName === "compress") {
         return applyRanges(parseCompressInput(args, callId), ctx);
     }
@@ -274,7 +271,7 @@ export async function* runCompressLoop(
             const proxyResults: { name: string; callId: string; result: string; arguments: string }[] = [];
 
             for (const call of allCalls) {
-                if (BILI_PROXY_TOOL_NAMES.has(call.name)) {
+                if (PROXY_TOOL_NAMES.has(call.name)) {
                     let parsedArgs: Record<string, unknown>;
                     try {
                         parsedArgs = call.arguments.length > 0 ? JSON.parse(call.arguments) : {};

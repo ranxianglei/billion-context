@@ -1,6 +1,6 @@
 import type { CompressionCore, Config, CoreMessage } from "acp-kernel";
 import type { Session } from "./session.js";
-import { COMPRESS_TOOL_NAME, BILI_TOOL_NAMES, parseCompressInput } from "./compress-tool.js";
+import { COMPRESS_TOOL_NAME, parseCompressInput } from "./compress-tool.js";
 import { applyRanges, type RewriteCtx } from "./stream.js";
 import { safeJsonParse } from "./util.js";
 
@@ -23,7 +23,7 @@ export function rewriteResponsesJsonResponse(body: unknown, ctx: RewriteCtx): un
     const noteParts: string[] = [];
     const keep: Record<string, unknown>[] = [];
     for (const item of b.output) {
-        if (item.type === "function_call" && (item.name === COMPRESS_TOOL_NAME || item.name === BILI_TOOL_NAMES.compress)) {
+        if (item.type === "function_call" && item.name === COMPRESS_TOOL_NAME) {
             converted = true;
             noteParts.push(applyRanges(parseCompressInput(safeJsonParse(String(item.arguments ?? ""))), ctx));
         } else {

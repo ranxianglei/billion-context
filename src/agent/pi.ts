@@ -144,7 +144,7 @@ export function createBiliPlugin(agentOverride?: string): (pi: ExtensionAPI) => 
         const agent = agentName(agentOverride);
         const state: RegisterState = {};
         if (typeof pi.registerCommand === "function") {
-            pi.registerCommand("bili", {
+            pi.registerCommand("acp", {
                 description: "Show ACP context-compression status for this session",
                 handler: async (_args, ctx) => {
                     const notify = (message: string, type?: string): void => {

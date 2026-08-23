@@ -1,6 +1,6 @@
 import type { CompressionCore, Config, CoreMessage } from "acp-kernel";
 import type { Session } from "./session.js";
-import { COMPRESS_TOOL_NAME, BILI_TOOL_NAMES, parseCompressInput } from "./compress-tool.js";
+import { COMPRESS_TOOL_NAME, parseCompressInput } from "./compress-tool.js";
 import { applyRanges, type RewriteCtx } from "./stream.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
 import { safeJsonParse } from "./util.js";
@@ -119,7 +119,7 @@ function routeOpenaiEvent(rawEvent: string, state: StreamState): string | null {
             const tidx = entry.index ?? 0;
             const name = entry.function?.name;
             if (typeof name === "string") {
-                if (name === COMPRESS_TOOL_NAME || name === BILI_TOOL_NAMES.compress) {
+                if (name === COMPRESS_TOOL_NAME) {
                     state.compressIndices.add(tidx);
                     state.converted = true;
                 } else {
@@ -196,7 +196,7 @@ export function rewriteOpenaiJsonResponse(body: unknown, ctx: RewriteCtx): unkno
     const toolCalls = msg.tool_calls as Array<{ function?: { name?: string; arguments?: string } }> | undefined;
     if (Array.isArray(toolCalls)) {
         for (const tc of toolCalls) {
-            if (tc.function?.name === COMPRESS_TOOL_NAME || tc.function?.name === BILI_TOOL_NAMES.compress) {
+            if (tc.function?.name === COMPRESS_TOOL_NAME) {
                 converted = true;
                 noteParts.push(applyRanges(parseCompressInput(safeJsonParse(tc.function?.arguments ?? "")), ctx));
             } else {

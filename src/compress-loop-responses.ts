@@ -6,7 +6,7 @@ import {
     type CoreMessage,
 } from "acp-kernel";
 import type { Session } from "./session.js";
-import { parseCompressInput, BILI_PROXY_TOOL_NAMES, MUTATING_PROXY_TOOLS, COMPRESS_TOOL_NAME, BILI_TOOL_NAMES, ACP_TEXT_OPEN, ACP_TEXT_CLOSE } from "./compress-tool.js";
+import { parseCompressInput, PROXY_TOOL_NAMES, MUTATING_PROXY_TOOLS, COMPRESS_TOOL_NAME, ACP_TEXT_OPEN, ACP_TEXT_CLOSE } from "./compress-tool.js";
 import { log as loggerLog } from "./logger.js";
 import { applyRanges } from "./stream.js";
 import { resolveDecompress } from "./decompress-shared.js";
@@ -185,8 +185,8 @@ export async function compressLoopResponsesJson(
         const output = responsesJsonOutput(current);
         const extracted = extractTextTriggers(output.text);
         const allCalls = [...output.calls, ...extracted.calls].filter((call) => call.name.length > 0);
-        const proxyCalls = allCalls.filter((call) => BILI_PROXY_TOOL_NAMES.has(call.name));
-        const realCalls = allCalls.filter((call) => !BILI_PROXY_TOOL_NAMES.has(call.name));
+        const proxyCalls = allCalls.filter((call) => PROXY_TOOL_NAMES.has(call.name));
+        const realCalls = allCalls.filter((call) => !PROXY_TOOL_NAMES.has(call.name));
         const mutatingProxy = proxyCalls.filter((call) => MUTATING_PROXY_TOOLS.has(call.name));
         if (mutatingProxy.length === 0 || realCalls.length > 0) {
             if (proxyCalls.length > 0) {
