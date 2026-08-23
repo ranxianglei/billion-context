@@ -44,12 +44,21 @@ export interface OmpConfig {
     providers: Record<string, OmpProvider>;
 }
 
+export interface OpencodeProvider {
+    baseURL?: string;
+}
+
+export interface OpencodeConfig {
+    providers: Record<string, OpencodeProvider>;
+}
+
 export interface ClientConfig {
     claude?: ClaudeSettings;
     codex?: CodexConfig;
     pi?: PiConfig;
     zcode?: ZcodeConfig;
     omp?: OmpConfig;
+    opencode?: OpencodeConfig;
 }
 
 export function nonEmpty(s: unknown): s is string {
@@ -212,6 +221,43 @@ export function readOmpConfig(ompHome: string): OmpConfig {
     return parseOmpYaml(text);
 }
 
+export function resolveOpencodeConfigFile(env: NodeJS.ProcessEnv): string {
+    if (nonEmpty(env.OPENCODE_CONFIG)) return env.OPENCODE_CONFIG;
+    const xdg = nonEmpty(env.XDG_CONFIG_HOME) ? env.XDG_CONFIG_HOME : path.join(os.homedir(), ".config");
+    return path.join(xdg, "opencode", "opencode.json");
+}
+
+export function readOpencodeConfig(file: string): OpencodeConfig {
+    let text: string;
+    try {
+        text = fs.readFileSync(file, "utf8");
+    } catch {
+        return { providers: {} };
+    }
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(text);
+    } catch {
+        return { providers: {} };
+    }
+    const providers: Record<string, OpencodeProvider> = {};
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        const root = parsed as Record<string, unknown>;
+        const provRoot = root.provider;
+        if (provRoot && typeof provRoot === "object" && !Array.isArray(provRoot)) {
+            for (const [name, value] of Object.entries(provRoot)) {
+                if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+                const opts = (value as Record<string, unknown>).options;
+                if (opts && typeof opts === "object" && !Array.isArray(opts)) {
+                    const baseURL = (opts as Record<string, unknown>).baseURL;
+                    if (typeof baseURL === "string") providers[name] = { baseURL };
+                }
+            }
+        }
+    }
+    return { providers };
+}
+
 export function parseZcodeConfig(obj: unknown): ZcodeConfig {
     const result: ZcodeConfig = { providers: {} };
     if (!obj || typeof obj !== "object" || Array.isArray(obj)) return result;
@@ -256,5 +302,6 @@ export function loadClientConfig(env: NodeJS.ProcessEnv, cwd: string): ClientCon
     const zcodeHome = nonEmpty(env.ZCODE_DATA_BASE_DIR) ? env.ZCODE_DATA_BASE_DIR : path.join(home, ".zcode");
     config.zcode = readZcodeConfig(zcodeHome);
     config.omp = readOmpConfig(resolveOmpHome(env));
+    config.opencode = readOpencodeConfig(resolveOpencodeConfigFile(env));
     return config;
 }

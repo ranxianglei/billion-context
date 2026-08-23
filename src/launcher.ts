@@ -32,7 +32,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, type StdioOptions } from "node:child_process";
 import { DEFAULT_MITM_DOMAINS } from "./mitm.js";
-import { nonEmpty, resolvePiHome, resolveOmpHome, loadClientConfig, type ClientConfig } from "./client-config.js";
+import { nonEmpty, resolvePiHome, resolveOmpHome, loadClientConfig, type ClientConfig, resolveOpencodeConfigFile, type OpencodeConfig, type OpencodeProvider } from "./client-config.js";
 
 export {
     type ClaudeSettings,
@@ -56,6 +56,10 @@ export {
     readOmpConfig,
     parseOmpYaml,
     resolveOmpHome,
+    resolveOpencodeConfigFile,
+    readOpencodeConfig,
+    type OpencodeConfig,
+    type OpencodeProvider,
 } from "./client-config.js";
 
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
@@ -236,6 +240,10 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
     } else if (client === "omp") {
         for (const [name, prov] of Object.entries(config.omp?.providers ?? {})) {
             classify(prov.baseUrl, name);
+        }
+    } else if (client === "opencode") {
+        for (const [name, prov] of Object.entries(config.opencode?.providers ?? {})) {
+            classify(prov.baseURL, name);
         }
     } else {
         for (const [name, prov] of Object.entries(config.codex?.providers ?? {})) {
@@ -486,6 +494,57 @@ export function prepareOmpHttpRewrite(
     } catch {}
     fs.writeFileSync(path.join(tmp, "models.yml"), lines.join("\n"));
     return tmp;
+}
+
+/**
+ * opencode counterpart of preparePiHttpRewrite: write a full copy of the user's
+ * opencode.json with the discovered providers' baseURL rewritten (HTTP →
+ * /bili/ wrap, wrapped-HTTPS → raw https for cert MITM) into a temp dir, and
+ * point OPENCODE_CONFIG at it. The real opencode.json is never touched.
+ * Returns the temp config FILE path (undefined when there is nothing to do or
+ * the config can't be parsed).
+ */
+export function prepareOpencodeHttpRewrite(
+    configFile: string,
+    origin: string,
+    httpRewrites: HttpRewrite[],
+    httpsRewrites: HttpRewrite[],
+): string | undefined {
+    if (httpRewrites.length === 0 && httpsRewrites.length === 0) return undefined;
+    let txt: string;
+    try {
+        txt = fs.readFileSync(configFile, "utf8");
+    } catch {
+        return undefined;
+    }
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(txt);
+    } catch {
+        return undefined;
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    const root = parsed as Record<string, unknown>;
+    const provRoot = root.provider;
+    if (provRoot && typeof provRoot === "object" && !Array.isArray(provRoot)) {
+        const providers = provRoot as Record<string, unknown>;
+        const rewrite = (rewrites: HttpRewrite[], wrap: boolean): void => {
+            for (const r of rewrites) {
+                const prov = providers[r.key];
+                if (!prov || typeof prov !== "object" || Array.isArray(prov)) continue;
+                const p = prov as { options?: { baseURL?: unknown } };
+                if (!p.options || typeof p.options !== "object") continue;
+                const existing = typeof p.options.baseURL === "string" ? p.options.baseURL : r.realUpstream;
+                p.options.baseURL = wrap ? wrapUpstream(origin, unwrapUpstream(existing)) : r.realUpstream;
+            }
+        };
+        rewrite(httpRewrites, true);
+        rewrite(httpsRewrites, false);
+    }
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-opencode-"));
+    const tmpFile = path.join(tmp, "opencode.json");
+    fs.writeFileSync(tmpFile, JSON.stringify(root));
+    return tmpFile;
 }
 
 function dedupeInOrder(list: string[]): string[] {
@@ -740,6 +799,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     let clientArgs = params.clientArgs;
     let piTmpHome: string | undefined;
     let ompTmpHome: string | undefined;
+    let opencodeTmpFile: string | undefined;
     const tmpFiles: string[] = [];
     const directUrl = launcherDirectUrl(process.env);
     if (directUrl) {
@@ -769,9 +829,13 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         ompTmpHome = prepareOmpHttpRewrite(resolveOmpHome(process.env), origin, routes.httpRewrites, routes.httpsRewrites);
         if (ompTmpHome) env.PI_CODING_AGENT_DIR = ompTmpHome;
     } else if (base === "opencode") {
-        // opencode uses MITM (HTTPS_PROXY + CA); BILLION_CONTEXT_PROXY makes
-        // opencode-acp self-disable so the proxy's MCP tools take priority.
+        // opencode: HTTPS upstreams ride cert-MITM (HTTPS_PROXY + CA); plaintext
+        // HTTP upstreams get a /bili/-rewritten copy of opencode.json via
+        // OPENCODE_CONFIG (real config untouched). BILLION_CONTEXT_PROXY makes
+        // opencode-acp self-disable so the proxy owns the ACP tools.
         env = { ...process.env, HTTPS_PROXY: origin, NODE_EXTRA_CA_CERTS: ca, BILLION_CONTEXT_PROXY: origin };
+        opencodeTmpFile = prepareOpencodeHttpRewrite(resolveOpencodeConfigFile(process.env), origin, routes.httpRewrites, routes.httpsRewrites);
+        if (opencodeTmpFile) env.OPENCODE_CONFIG = opencodeTmpFile;
     } else if (base === "codex") {
         // Per-spawn conversation id for the MCP shell's headless
         // self-registration (codex provides no session id of its own).
@@ -817,6 +881,11 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         if (ompTmpHome) {
             try {
                 fs.rmSync(ompTmpHome, { recursive: true, force: true });
+            } catch {}
+        }
+        if (opencodeTmpFile) {
+            try {
+                fs.rmSync(path.dirname(opencodeTmpFile), { recursive: true, force: true });
             } catch {}
         }
         for (const f of tmpFiles) {
