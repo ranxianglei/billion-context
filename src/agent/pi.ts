@@ -101,7 +101,7 @@ function manifestToTool(proxyBase: string, tool: ManifestTool, agent: string): T
 
 const RETRY_INTERVAL_MS = 10000;
 
-type RegisterState = { sid?: string; pending?: Promise<void>; retryAt?: number };
+type RegisterState = { sid?: string; toolsReady?: boolean; pending?: Promise<void>; retryAt?: number };
 
 async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, agent: string): Promise<void> {
     const proxyBase = proxyBaseForCtx(ctx);
@@ -125,6 +125,7 @@ async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, a
         try {
             for (const t of tools) pi.registerTool(manifestToTool(proxyBase, t, agent));
             state.sid = sid;
+            state.toolsReady = true;
             state.retryAt = undefined;
         } catch (err) {
             state.sid = undefined;
@@ -181,12 +182,22 @@ export function createBiliPlugin(agentOverride?: string): (pi: ExtensionAPI) => 
                 if (proxyBaseForCtx(ctx) === undefined) return;
                 const headers = (event as unknown as { headers?: Record<string, string> }).headers;
                 if (headers === undefined || typeof headers !== "object" || Array.isArray(headers)) return;
-                const sid = sessionIdOf(ctx);
-                if (sid !== undefined) headers["x-bili-plugin-conversation"] = sid;
-                headers["x-bili-plugin"] = agent;
-                const window = ctx.model?.contextWindow;
-                if (typeof window === "number" && Number.isFinite(window) && window > 0) {
-                    headers["x-bili-plugin-context-window"] = String(Math.floor(window));
+                // The x-bili-plugin marker tells the proxy "the client owns the
+                // ACP tools natively — skip wire-level injection". Stamping it
+                // before registerTools() finishes would send round 1 out with
+                // NO ACP tools (the first provider request races the manifest
+                // fetch). Claim ownership only once tools are registered;
+                // until then the request rides the proxy's wire mode. A
+                // permanently failing manifest fetch keeps us in wire mode —
+                // a graceful fallback rather than a tool-less session.
+                if (state.toolsReady === true) {
+                    const sid = sessionIdOf(ctx);
+                    if (sid !== undefined) headers["x-bili-plugin-conversation"] = sid;
+                    headers["x-bili-plugin"] = agent;
+                    const window = ctx.model?.contextWindow;
+                    if (typeof window === "number" && Number.isFinite(window) && window > 0) {
+                        headers["x-bili-plugin-context-window"] = String(Math.floor(window));
+                    }
                 }
             } catch (err) {
                 console.error(`bili-plugin(${agent}): header stamp skipped (${err instanceof Error ? err.message : String(err)})`);
