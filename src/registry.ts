@@ -3,6 +3,8 @@ import { existsSync, statSync } from "node:fs";
 import path from "node:path";
 import { cacheDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
+import { proxyDispatcher } from "./upstream-proxy.js";
+import { fetchWithTimeout } from "./fetch-util.js";
 
 const REGISTRY_URL = "https://models.dev/models.json";
 const CACHE_FILE = path.join(cacheDir(), "models-dev.json");
@@ -54,20 +56,38 @@ function diskCacheFresh(): boolean {
     }
 }
 
+/** Fetch the registry. Node's global fetch IGNORES http(s)_proxy env vars,
+ *  so on networks where models.dev is unreachable directly (observed:
+ *  direct connections time out while the shell proxy works) the registry
+ *  was permanently dead and the stale built-in table became the only data
+ *  source. Route through the configured upstream proxy when one exists
+ *  (proxyDispatcher caches the ProxyAgent); fall back to a direct fetch
+ *  when no proxy is configured or the proxied attempt fails. */
 async function fetchFresh(): Promise<RegistryShape | null> {
-    try {
-        const res = await fetch(REGISTRY_URL, {
-            signal: AbortSignal.timeout(15_000),
-            headers: { Accept: "application/json" },
-        });
-        if (!res.ok) return null;
-        const text = await res.text();
-        const parsed = parse(text);
-        if (parsed) await writeDiskCache(parsed);
-        return parsed;
-    } catch {
-        return null;
+    const dispatcher = proxyDispatcher(process.env.https_proxy || process.env.HTTPS_PROXY || process.env.http_proxy || process.env.HTTP_PROXY);
+    const attempts: Array<{ opts: Parameters<typeof fetchWithTimeout>[1]; label: string }> = dispatcher
+        ? [{ opts: { dispatcher }, label: "via proxy" }, { opts: {}, label: "direct" }]
+        : [{ opts: {}, label: "direct" }];
+    for (const { opts, label } of attempts) {
+        try {
+            const { response, clearTimer } = await fetchWithTimeout(REGISTRY_URL, {
+                ...opts,
+                headers: { Accept: "application/json" },
+            }, 15_000);
+            const text = await response.text();
+            clearTimer();
+            if (!response.ok) continue;
+            const parsed = parse(text);
+            if (parsed) {
+                await writeDiskCache(parsed);
+                loggerLog("info", `[acp-registry] loaded models.dev (${Object.keys(parsed).length} models, ${label})`);
+                return parsed;
+            }
+        } catch {
+            // try the next transport
+        }
     }
+    return null;
 }
 
 export async function loadRegistry(): Promise<RegistryShape | null> {

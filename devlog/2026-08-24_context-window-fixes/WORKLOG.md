@@ -44,3 +44,31 @@
 
 - A static fallback table that OUTRANKS a live registry inverts the freshness hierarchy: the fallback becomes the authority and staleness becomes permanent. Fallbacks must lose to fresher sources whenever both are available cheaply (hence peek-only, no fetch on the hot path).
 - "Read-modify-write" on a config file needs a parse-state guard: merging into `{}` when the read failed is the classic silent-data-loss path — refuse the write instead.
+
+## Follow-up: registry fetch was dead behind direct-only connections
+
+User insight (verified correct): the registry never worked on this machine —
+every log line was `could not load models.dev registry (offline + no cache)`
+and the disk cache never existed. Root cause chain:
+
+- models.dev is unreachable directly here (curl --noproxy: 000 timeout)
+- the user shell has a working proxy (https_proxy=127.0.0.1:20172)
+- but `fetchFresh()` used bare global `fetch`, and Node's fetch IGNORES
+  http(s)_proxy env vars → permanent death → the stale built-in table was
+  the ONLY live data source (which is why the stale limits mattered so much)
+
+Fix (`src/registry.ts`): `fetchFresh()` now routes through the configured
+upstream proxy when one exists — `proxyDispatcher(env https_proxy|HTTPS_PROXY
+|http_proxy|HTTP_PROXY)` (cached undici ProxyAgent, same infrastructure the
+model traffic uses) — and falls back to a direct attempt when no proxy is
+configured or the proxied attempt fails. Reuses `fetchWithTimeout` (15s).
+Self-loop safety: a proxy URL pointing at bili itself results in a CONNECT
+blind-tunnel that fails once, then the direct fallback runs — no recursion.
+
+Verification (real machine):
+- node one-liner via ProxyAgent(20172): status 200, 355 models
+- rebuilt dist → `start --port 8961` → one deepseek chat request →
+  `[acp-registry] loaded models.dev (355 models, via proxy)`
+- `~/.cache/billion-context/models-dev.json` written (288KB);
+  deepseek-chat → 1,000,000; MiniMax-M2.1 → 204,800
+- typecheck ✅ · 542/542 ✅
