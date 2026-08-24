@@ -149,38 +149,6 @@ bili --no-auto-update        # 本次启动禁用自动更新
 
 ## 配置
 
-代理通过**环境变量**(大多数场景的推荐方式)**或** JSON 配置文件配置。两者都完全支持,任选其一。优先级(高优先级覆盖低优先级):**命令行参数 > 环境变量 > 配置文件 > 内置默认**。
-
-- **环境变量** —— 最快,适合单 provider,易于脚本化(`.env`、systemd unit、docker `--env`)。`export ACP_…` 然后运行 `bili` 即可。
-- **JSON 文件** —— 当你有多个 provider 且需要按模型声明 context 窗口时更合适(这是唯一能声明它们的地方)。少数键(尤其是 `providers.*.models` 的 context 窗口)没有对应的环境变量。
-
-两者可共存:环境变量覆盖文件里的个别键。
-
-### 环境变量(推荐)
-
-每个配置键都有环境变量覆盖。设置后覆盖文件值(或不配文件直接跑)。
-
-| 环境变量 | 默认值 | 说明 |
-|-----|---------|-------------|
-| `ACP_PORT` / `PORT` | `8787` | 监听端口 |
-| `ACP_HOST` | `127.0.0.1` | 监听地址 |
-| `ACP_UPSTREAM` | `https://api.anthropic.com` | 默认上游 |
-| `ACP_PROVIDERS` | *(无)* | 旧版 providers JSON 文件路径(覆盖配置里的 `providers`) |
-| `ACP_MODEL_CONTEXT_LIMIT` | `200000` | 全局兜底 context 窗口(仅当 provider/model 都不匹配时用) |
-| `ACP_SESSION_HEADER` | `x-acp-session` | 会话标识 header 名 |
-| `ACP_COMPRESS_TOOL` | `1` | 设 `0` 禁止注入 compress 工具 |
-| `ACP_COMPRESS_NUDGE` | `1` | 设 `0` 禁止压缩 nudge |
-| `ACP_REASONING_KEEP` | *(默认)* | 仅 Responses API：设 `none` 丢弃全部 reasoning。默认走压缩管线，turn 被压缩时自动隐藏（防止 reasoning 无限累积撑爆 Codex 的 prompt-cache 前缀）。 |
-| `ACP_DEBUG` | `0` | 设 `1` 打开详细日志 |
-| `ACP_PASSTHROUGH` | `0` | 设 `1` 不压缩直接转发 |
-| `ACP_AUTO_UPDATE` | `1` | 设 `0` 禁用后台自动更新 |
-| `ACP_LOG_FILE` | *XDG state 路径* | 日志文件路径(`off` 关闭文件,只保留 stderr) |
-| `ACP_DUMP_SSE` | *(无)* | 转储 SSE 用于调试的目录 |
-| `BILI_PERSIST` | `1` | 设 `0` 禁用会话持久化(纯内存,重启丢失) |
-| `BILI_PERSIST_DEBOUNCE_MS` | `500` | 写磁盘的防抖窗口(毫秒) |
-| `BILI_MAX_SESSIONS` | `256` | 内存中保留的最大会话数(LRU 淘汰;磁盘是真相源) |
-| `BILI_SESSIONS_DIR` | *(XDG data 目录)* | 持久化会话状态的目录 |
-
 ### 配置文件(可选)
 
 位置(XDG 基础目录):
