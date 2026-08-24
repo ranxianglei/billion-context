@@ -232,6 +232,31 @@ test("before_provider_headers does not claim plugin mode until tools are registe
     }
 });
 
+test("before_provider_headers stays silent when the manifest fetch keeps failing", async () => {
+    // Graceful degradation: a dead manifest endpoint means the plugin never
+    // claims ownership, so the session rides the proxy's wire mode forever.
+    const server = http.createServer((req, res) => {
+        res.writeHead(404);
+        res.end("{}");
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+        const pi = makeFakePi();
+        biliPlugin(pi as never);
+        await pi.events.get("session_start")!({}, fakeCtx(origin));
+        await flush();
+        await flush();
+        assert.equal(pi.tools.length, 0);
+        const headers: Record<string, string> = {};
+        pi.events.get("before_provider_headers")!({ headers }, fakeCtx(origin));
+        assert.deepEqual(headers, {});
+    } finally {
+        server.close();
+    }
+});
+
 test("pi extension survives hostile host shapes without throwing", async () => {
     const proxy = await startFakeProxy();
     try {
