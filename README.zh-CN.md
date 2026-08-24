@@ -42,8 +42,9 @@ npm install -g billion-context
 
 ## 快速上手
 
-两种方式 —— 任选其一:
+三种方式 —— 任选其一:
 
+- **启动器(最省事):** `bili <client>` 一条命令拉起代理 + 客户端,不碰任何真实配置文件(见下方「方式 0」)。
 - **零配置(最简单):** 在客户端 baseURL 前面加上代理地址 + `/bili/`。无需配置文件 —— context 窗口自动从 [models.dev](https://models.dev) registry 查询。`/bili/` 前缀还是个自检测信号:billion-context 的客户端扩展(billion-context-pi / opencode-acp)能在自己的 baseUrl 里认出它并自禁用,避免双层压缩。
 - **显式 context 窗口覆盖:** 在配置文件(或网页)里按 URL 声明 context 窗口,用于 registry 不认识的端点,或想钉死一个精确值的场景。两种方式路由都是同一个 `/bili/` 前缀 —— 配置只改变代理用哪个 context 窗口。
 
@@ -63,6 +64,53 @@ launcher(`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode`
 `GET /__bili/plugin/status` 读取实时上下文水位。
 
 压缩是自动注入的 —— 你只需配置路由,无需配置压缩本身。
+
+### 方式 0 —— 启动器(`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode` / `bili hermes`)
+
+启动器把客户端包进一条命令:在独立端口拉起一个代理(总是全新实例,绝不复用端口),再按客户端支持的机制把它指向代理 —— 能吃代理/CA 环境变量的走**证书 MITM**,不吃的走隔离的**`/bili/` 配置重写**。真实配置文件从不被修改;客户端自己的配置只被**读取**,用来发现它实际连接的 HTTPS 上游主机,把这些主机加入 MITM 白名单 —— 代理只 TLS 终结它们,其余流量盲透传。
+
+```bash
+bili pi                               # 拉起 pi,走代理
+bili pi -- print "hi"                 # -- 之后的参数透传给客户端
+bili pi-test                          # 干净 pi(关扩展)—— 压缩全归代理,不会双层压缩
+bili codex                            # 拉起 codex
+bili claude                           # 拉起 claude
+bili omp                              # pi 同款 MITM 环境变量 + 隔离临时 models.yml
+bili opencode                         # HTTPS 走 MITM + 临时 opencode.json(HTTP 走 /bili/)+ 轻量 /acp 插件
+bili hermes                           # 无法 MITM(certifi CA)—— 隔离 HERMES_HOME,全部流量 /bili/
+bili test pi                          # pi 路径的端到端快速自检
+bili pi --mitm-domain api.foo.com     # 向 MITM 白名单追加域名
+```
+
+客户端如何被指向代理(自动注入子进程环境变量):
+
+| 客户端      | 重定向方式      | CA 信任环境变量        |
+|-------------|---------------------|-------------------------|
+| pi          | `HTTPS_PROXY`       | `NODE_EXTRA_CA_CERTS`   |
+| claude      | `HTTPS_PROXY`(undici 忽略它 → 改设 `ANTHROPIC_BASE_URL` 走 `/bili/`) | `NODE_EXTRA_CA_CERTS` |
+| codex       | `HTTPS_PROXY`       | `SSL_CERT_FILE`         |
+| omp         | `HTTPS_PROXY`       | `NODE_EXTRA_CA_CERTS`   |
+| opencode    | `HTTPS_PROXY`       | `NODE_EXTRA_CA_CERTS`   |
+| hermes      | `HERMES_HOME`(临时 `config.yaml`,所有上游 `/bili/`) | —(无 MITM:httpx 自建 CA bundle) |
+
+真实上游 HTTPS 主机(只读)发现来源:
+
+| 客户端      | 读取路径                                    |
+|-------------|----------------------------------------------|
+| Pi          | `~/.pi/agent/models.json` —— 各 provider 的 `baseUrl` |
+| Codex       | `~/.codex/config.toml` —— 各 `[model_providers.<name>]` 的 `base_url`(+顶层 `openai_base_url`) |
+| Claude Code | 硬编码 `api.anthropic.com`(无按配置的上游) |
+| omp         | `~/.omp/agent/models.yml` —— 各 provider 的 `baseUrl` |
+| opencode    | `~/.config/opencode/opencode.json` —— 各 provider 的 `options.baseURL` |
+| hermes      | `~/.hermes/config.yaml` —— 各 provider 的 `api:`/`base_url:` 端点 |
+
+环境变量搞不定的客户端,启动器会写一份**隔离的临时配置副本**(发现的上游重写后指向代理),再把客户端指过去 —— 真实配置从不被碰,客户端退出后临时目录自动清理:
+
+- **pi / omp** —— 隔离的 `PI_CODING_AGENT_DIR`,`models.json` / `models.yml` 里 HTTP 上游重写为 `/bili/` 形式(HTTPS 上游照走证书 MITM;真实 home 里的其余文件全部符号链接透传)。
+- **opencode** —— `OPENCODE_CONFIG` 指向一份完整 `opencode.json` 副本:HTTP 上游重写为 `/bili/`,并追加轻量 `bili` `/acp` 状态插件(`BILLION_CONTEXT_PROXY` 让宿主侧 opencode-acp 插件自禁用,压缩归代理)。
+- **hermes** —— 证书 MITM 不可能(httpx 用 certifi 自建 CA bundle,忽略 `SSL_CERT_FILE`),所以**所有**上游都重写为 `/bili/` 形式,放进隔离的 `HERMES_HOME`(`config.yaml` 副本;skills/memories/sessions 通过符号链接保持共享)。
+
+> **注:** 启动器的生命周期与客户端绑定 —— 客户端退出时,它拉起的代理随之停止。每次 `bili <client>` 都会拉起自己的全新代理实例,绝不复用同端口上已有的代理。
 
 ### 方式 A —— 零配置(`/bili/` 前缀)
 
