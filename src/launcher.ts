@@ -83,14 +83,6 @@ const SPAWN_WAIT_MS = 20000;
 const PROBE_TIMEOUT_MS = 1500;
 
 const DEFAULT_MITM_DOMAIN_SET = new Set(DEFAULT_MITM_DOMAINS.map((d) => d.toLowerCase()));
-function coveredByDefaultMitm(host: string): boolean {
-    const h = host.toLowerCase();
-    return DEFAULT_MITM_DOMAINS.some((d) => h === d || h.endsWith("." + d));
-}
-function domainsNeedFreshProxy(domains: string[] | undefined): boolean {
-    if (!domains || domains.length === 0) return false;
-    return domains.some((d) => !coveredByDefaultMitm(d));
-}
 
 export interface SpawnChild {
     pid: number;
@@ -116,8 +108,7 @@ export interface LaunchOptions {
 export interface ProxyHandle {
     origin: string;
     port: number;
-    reused: boolean;
-    child: SpawnChild | null;
+    child: SpawnChild;
     logPath?: string;
 }
 
@@ -656,11 +647,6 @@ export async function ensureProxyRunning(
     const now = deps.now ?? Date.now;
     const sleepImpl = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
 
-    const preferredOrigin = proxyOrigin(opts.host, opts.port);
-    if (!domainsNeedFreshProxy(opts.mitmDomains) && (await probeHealth(preferredOrigin, fetchImpl))) {
-        return { origin: preferredOrigin, port: opts.port, reused: true, child: null };
-    }
-
     const port = await findFreePort(opts.port, opts.host);
     const spawnedOrigin = proxyOrigin(opts.host, port);
 
@@ -697,7 +683,7 @@ export async function ensureProxyRunning(
     while (now() < deadline) {
         await sleepImpl(HEALTH_POLL_INTERVAL_MS);
         if (await probeHealth(spawnedOrigin, fetchImpl)) {
-            return { origin: spawnedOrigin, port, reused: false, child, logPath };
+            return { origin: spawnedOrigin, port, child, logPath };
         }
     }
     throw new Error(`bili: proxy did not become healthy at ${spawnedOrigin} within ${SPAWN_WAIT_MS}ms`);
@@ -809,7 +795,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     const domains = dedupeInOrder([...routes.httpsDomains, ...(params.mitmDomains ?? [])]);
     const handle = await ensureProxyRunning({ host, port, passthrough, debug, mitmDomains: domains }, deps);
     console.error(
-        `bili: ${handle.reused ? "reusing existing" : "started"} proxy at ${handle.origin} (MITM domains: ${domains.length ? domains.join(", ") : "defaults"})` +
+        `bili: started proxy at ${handle.origin} (MITM domains: ${domains.length ? domains.join(", ") : "defaults"})` +
             (routes.httpRewrites.length > 0 ? ` (HTTP /bili/ rewrites: ${routes.httpRewrites.length})` : "") +
             (routes.httpsRewrites.length > 0 ? ` (HTTPS cert rewrites: ${routes.httpsRewrites.length})` : "") +
             (params.client === "pi-test" ? " (no extensions)" : ""),
@@ -898,7 +884,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         console.error(`bili: failed to launch ${params.client}: ${err instanceof Error ? err.message : String(err)}`);
         code = 1;
     } finally {
-        if (!handle.reused) stopProxy(handle);
+        stopProxy(handle);
         if (piTmpHome) {
             try {
                 fs.rmSync(piTmpHome, { recursive: true, force: true });
@@ -941,7 +927,7 @@ export async function runTestPi(params: RunTestPiParams, deps: LauncherDeps = {}
     ]);
     const handle = await ensureProxyRunning({ host, port, passthrough, debug, mitmDomains: domains }, deps);
     console.error(
-        `bili: ${handle.reused ? "reusing existing" : "started"} proxy at ${handle.origin} (MITM domains: ${domains.length ? domains.join(", ") : "defaults"})`,
+        `bili: started proxy at ${handle.origin} (MITM domains: ${domains.length ? domains.join(", ") : "defaults"})`,
     );
     if (handle.logPath) {
         console.error(`bili: proxy log: ${handle.logPath}`);
@@ -972,7 +958,7 @@ export async function runTestPi(params: RunTestPiParams, deps: LauncherDeps = {}
         console.error(`bili: pi test failed: ${err instanceof Error ? err.message : String(err)}`);
         code = 1;
     } finally {
-        if (!handle.reused) stopProxy(handle);
+        stopProxy(handle);
     }
     process.exit(code ?? 0);
 }
