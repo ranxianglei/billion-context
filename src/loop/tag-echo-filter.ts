@@ -3,20 +3,20 @@
 // imitate them in visible output ("tag echo"), the client replays the echoed
 // tags on later turns, and the imitation amplifies into unbounded repetition.
 // Stripping render tags from outgoing text breaks the loop at the source.
-// ONLY the render form (`<acp attrs…>` / exact `</acp>`) is stripped — the
-// underscore-namespaced text-protocol triggers (`<acp_compress>` etc.) and
+// ONLY the render form (`\x3cacp attrs…>` / exact `\x3c/acp>`) is stripped — the
+// underscore-namespaced text-protocol triggers (`\x3cacp_compress>` etc.) and
 // ordinary prose containing `<` pass through untouched.
 
-const PAIRED = /<acp\s[^<>]*>([^<>]{0,64})<\/acp>/;
+const PAIRED = /\x3cacp\s[^<>]*>([^<>]{0,64})<\/acp>/;
 const LONE = /<\/?acp(?=[\s>])[^<>]*>/;
 // A suffix of the buffer that could still grow into a render tag: either an
-// unterminated `<acp …` opening (attrs so far, no `>` yet) or a short
+// unterminated `\x3cacp …` opening (attrs so far, no `>` yet) or a short
 // ambiguous prefix like `<`, `<a`, `</ac`, …
-const PARTIAL_TAIL = /(<acp\s[^<>]*|<\/?a?c?p?)$/;
+const PARTIAL_TAIL = /(\x3cacp\s[^<>]*|<\/?a?c?p?)$/;
 // An unterminated render-tag opening that already shows a quoted tokens=
 // attribute — always an imitation truncated mid-tag, never prose.
-const TRUNCATED_TAG = /<acp\s[^<>]*tokens\s*=\s*"[^<>"]*"[^<>]*$/;
-const CLOSE_TAG = "</acp";
+const TRUNCATED_TAG = /\x3cacp\s[^<>]*tokens\s*=\s*"[^<>"]*"[^<>]*$/;
+const CLOSE_TAG = "\x3c/acp";
 const HOLD_LIMIT = 128;
 const SWALLOW_CAP = 80;
 
@@ -31,6 +31,14 @@ export function stripAcpTags(text: string): string {
         .replace(new RegExp(PAIRED.source, "g"), "")
         .replace(new RegExp(LONE.source, "g"), "")
         .replace(new RegExp(TRUNCATED_TAG.source), "");
+}
+
+// Cheap pre-check on a raw wire string (SSE event or JSON body): does it
+// contain anything that looks like a render tag (literal or JSON-escaped
+// `\u003c` form)? Callers use this to skip re-serializing chunks that need
+// no stripping, preserving byte-identical passthrough.
+export function containsRenderTagText(s: string): boolean {
+    return /\x3c\/?acp(?=[\s>])/.test(s) || /\\u003c\/?acp(?=[\s>\\])/.test(s);
 }
 
 export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEchoFilter {
@@ -88,8 +96,11 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
             drop(m[0]);
             out += buf.slice(0, m.index);
             buf = buf.slice(m.index + m[0].length);
-            const wasPaired = m === p && m[0].endsWith(CLOSE_TAG);
-            if (!wasPaired && /^<acp\s/.test(m[0])) {
+            // A PAIRED match is by definition a complete open+content+close
+            // span — only a LONE opening tag leaves the stream mid-tag and
+            // needs to swallow until its close arrives.
+            const wasPaired = m === p;
+            if (!wasPaired && /^\x3cacp\s/.test(m[0])) {
                 swallowUntilClose = true;
                 swallowed = "";
             }

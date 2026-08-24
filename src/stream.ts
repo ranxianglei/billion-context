@@ -3,7 +3,7 @@ import { type Session, cacheBlockContent } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput, PROXY_TOOL_NAMES } from "./compress-tool.js";
 import { resolveDecompress } from "./decompress-shared.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
-import { stripAcpTags } from "./loop/tag-echo-filter.js";
+import { containsRenderTagText, stripAcpTags } from "./loop/tag-echo-filter.js";
 
 export type RewriteCtx = {
     core: CompressionCore;
@@ -105,7 +105,7 @@ function routeEvent(
             return NOOP;
         }
         const dt = (d as { delta?: { text?: string } }).delta;
-        if (dt?.text && (dt.text.includes("\x3cacp ") || dt.text.includes("\x3c/acp"))) {
+        if (dt?.text && containsRenderTagText(dt.text)) {
             ctx.log(`[warn: tag echo] model emitted <acp tag in text delta: ${dt.text.slice(0, 120).replace(/\n/g, " ")}`);
         }
         return emitEvent(ev);
@@ -332,7 +332,7 @@ export function rewriteJsonResponse(body: unknown, ctx: RewriteCtx): unknown {
     if (converted && !sawRealToolUse) b.stop_reason = "end_turn";
     for (const blk of newContent) {
         const t = (blk as { type?: string; text?: string }).text;
-        if (typeof t === "string" && (t.includes("\x3cacp ") || t.includes("\x3c/acp"))) {
+        if (typeof t === "string" && containsRenderTagText(t)) {
             ctx.log(`[warn: tag echo] non-stream model output contains <acp tag: ${t.slice(0, 120).replace(/\n/g, " ")}`);
             (blk as { text?: string }).text = stripAcpTags(t);
         }

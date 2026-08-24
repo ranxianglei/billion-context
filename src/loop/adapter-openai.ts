@@ -91,7 +91,7 @@ function rewriteContentChunk(parsed: Record<string, unknown>, content: string): 
         const delta = { ...(choice.delta as Record<string, unknown>) };
         delta.content = content;
         choice.delta = delta;
-        clone.choices = [choice];
+        clone.choices = [choice, ...clone.choices.slice(1)];
     }
     return Buffer.from(`data: ${JSON.stringify(clone)}\n\n`, "utf8");
 }
@@ -357,10 +357,11 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
 
                 const hasReasoning = typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0;
                 if (typeof delta.content === "string" && delta.content.length > 0) {
-                    const clean = tagFilter.push(delta.content);
-                    if (clean.length > 0) {
-                        yield { kind: "text", delta: clean, ...(hasReasoning ? {} : { raw: rewriteContentChunk(parsed, clean) }) } as ParsedStreamEvent;
-                    }
+                        const clean = tagFilter.push(delta.content);
+                        if (clean.length > 0) {
+                            const raw = clean === delta.content ? rawBuf : rewriteContentChunk(parsed, clean);
+                            yield { kind: "text", delta: clean, ...(hasReasoning ? {} : { raw }) } as ParsedStreamEvent;
+                        }
                 } else if (!hasReasoning && (delta.role || (Object.keys(delta).length === 0 && !finishReason))) {
                     yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
                 }

@@ -1,7 +1,7 @@
 import type { CoreMessage } from "acp-kernel";
 import { coreToResponses, injectResponsesDeveloperMessage, patchResponsesInput, type ResponseInputItem, type ResponsesProjection } from "acp-kernel/wire";
 import { buildVisibilityMarker } from "../compress-loop.js";
-import { createTagEchoFilter, stripResponsesText } from "./tag-echo-filter.js";
+import { createTagEchoFilter, stripResponsesText, containsRenderTagText } from "./tag-echo-filter.js";
 import { log as loggerLog } from "../logger.js";
 import { ACP_TEXT_OPEN, ACP_TEXT_CLOSE, ACP_STATUS_OPEN, ACP_STATUS_CLOSE, ACP_SEARCH_OPEN, ACP_SEARCH_CLOSE, ACP_DECOMPRESS_OPEN, ACP_DECOMPRESS_CLOSE, COMPRESS_TOOL_NAME, PROXY_TOOL_NAMES } from "../compress-tool.js";
 import type { BiliMessage } from "acp-kernel/wire";
@@ -250,7 +250,8 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                     if (mapped) {
                         yield { kind: "meta", chunk: rewriteRefEvent(type, stripResponsesText(obj), mapped), firstRoundOnly: false } as ParsedStreamEvent;
                     } else if (!suppressTextLifecycle) {
-                        yield { kind: "meta", chunk: rebuildResponsesEvent(type, stripResponsesText(obj)), firstRoundOnly: true } as ParsedStreamEvent;
+                        const chunk = containsRenderTagText(eventStr) ? rebuildResponsesEvent(type, stripResponsesText(obj)) : rawBuf;
+                        yield { kind: "meta", chunk, firstRoundOnly: true } as ParsedStreamEvent;
                     }
                 } else if (type === "response.output_text.delta") {
                     const delta = typeof obj.delta === "string" ? obj.delta : "";
@@ -264,7 +265,8 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                             if (mapped) {
                                 yield { kind: "text", delta: clean, raw: rewriteRefEvent(type, { ...obj, delta: clean }, mapped) } as ParsedStreamEvent;
                             } else if (round === 1) {
-                                yield { kind: "text", delta: clean, raw: rebuildResponsesEvent(type, { ...obj, delta: clean }) } as ParsedStreamEvent;
+                                const raw = clean === delta ? rawBuf : rebuildResponsesEvent(type, { ...obj, delta: clean });
+                                yield { kind: "text", delta: clean, raw } as ParsedStreamEvent;
                             } else {
                                 yield { kind: "text", delta: clean } as ParsedStreamEvent;
                             }
@@ -315,7 +317,8 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                             remapped.delete(origId);
                             yield { kind: "meta", chunk: rewriteItemEvent(type, stripResponsesText(obj), mapped), firstRoundOnly: false } as ParsedStreamEvent;
                         } else if (!suppressTextLifecycle) {
-                            yield { kind: "meta", chunk: rebuildResponsesEvent(type, stripResponsesText(obj)), firstRoundOnly: true } as ParsedStreamEvent;
+                            const chunk = containsRenderTagText(eventStr) ? rebuildResponsesEvent(type, stripResponsesText(obj)) : rawBuf;
+                            yield { kind: "meta", chunk, firstRoundOnly: true } as ParsedStreamEvent;
                         }
                     } else if (item?.type !== "message" || !suppressTextLifecycle) {
                         yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;

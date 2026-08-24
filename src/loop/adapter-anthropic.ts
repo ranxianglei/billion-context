@@ -235,7 +235,8 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                         lastTextIndex = ci;
                         const clean = tagFilter.push(delta.text);
                         if (clean.length > 0) {
-                            yield { kind: "text", delta: clean, raw: rewriteTextDeltaEvent(eventStr, ci, clean) } as ParsedStreamEvent;
+                            const raw = clean === delta.text ? remapIndexInEvent(eventStr, ci) : rewriteTextDeltaEvent(eventStr, ci, clean);
+                            yield { kind: "text", delta: clean, raw } as ParsedStreamEvent;
                         }
                     } else if (delta.type === "thinking_delta" && typeof delta.thinking === "string" && delta.thinking.length > 0) {
                         const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
