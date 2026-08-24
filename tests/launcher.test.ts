@@ -267,7 +267,7 @@ function makeFakeChild(pid: number): SpawnChild {
     };
 }
 
-test("ensureProxyRunning: reuses an already-healthy proxy without spawning", async () => {
+test("ensureProxyRunning: always spawns a fresh proxy, never reuses a listener", async () => {
     let spawnCalls = 0;
     const spawnImpl: SpawnFn = () => {
         spawnCalls++;
@@ -278,10 +278,10 @@ test("ensureProxyRunning: reuses an already-healthy proxy without spawning", asy
         { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
         { fetchImpl, spawnImpl },
     );
-    assert.equal(handle.reused, true);
-    assert.equal(handle.child, null);
-    assert.equal(handle.origin, "http://127.0.0.1:8787");
-    assert.equal(spawnCalls, 0);
+    assert.equal(spawnCalls, 1);
+    assert.ok(handle.child);
+    assert.equal(handle.origin, `http://127.0.0.1:${handle.port}`);
+    assert.notEqual(handle.child, null);
 });
 
 test("ensureProxyRunning: spawns when not healthy, polls until healthy", async () => {
@@ -299,7 +299,6 @@ test("ensureProxyRunning: spawns when not healthy, polls until healthy", async (
         { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
         { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
     );
-    assert.equal(handle.reused, false);
     assert.equal(handle.child?.pid, 42421);
     assert.ok(spawnedArgs !== null);
     assert.ok(spawnedArgs.includes("start"));
@@ -328,9 +327,9 @@ test("ensureProxyRunning: throws when never healthy within deadline", async () =
     );
 });
 
-test("stopProxy: no-op when reused (child null)", () => {
+test("stopProxy: no-op when child missing pid", () => {
     assert.doesNotThrow(() =>
-        stopProxy({ origin: "http://127.0.0.1:8787", port: 8787, reused: true, child: null }),
+        stopProxy({ origin: "http://127.0.0.1:8787", port: 8787, child: { pid: 0 } }),
     );
 });
 

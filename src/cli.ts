@@ -79,8 +79,7 @@ Usage:
   bili --help                      show this help
 
 Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode):
-  Brings up a proxy on an independent port (reusing one already running on
-  that port), then runs the client pointed at it via HTTPS_PROXY + the proxy's
+  Brings up a proxy on an independent port (a fresh instance every launch), then runs the client pointed at it via HTTPS_PROXY + the proxy's
   MITM CA — no config-file edits. Discovered HTTPS upstream domains are
   auto-whitelisted for MITM so the proxy TLS-terminates exactly the hosts the
   client uses; HTTP / localhost providers go direct. pi/claude trust the CA
