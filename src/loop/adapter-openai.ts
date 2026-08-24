@@ -2,16 +2,50 @@ import type { CoreMessage } from "acp-kernel";
 import { coreToOpenai, injectOpenaiSystem } from "acp-kernel/wire";
 import { buildVisibilityMarker } from "../compress-loop.js";
 
-const PROXY_TOOL_SET = new Set([
-    "compress", "decompress", "search_context", "acp_status",
-    "bili_compress", "bili_decompress", "bili_search_context", "bili_status",
-]);
 import type {
     CompressLoopAdapter,
     EmitCompletionOpts,
     ParsedStreamEvent,
     ToolCallEmit,
 } from "./core.js";
+
+const PROXY_TOOL_SET = new Set([
+    "compress", "decompress", "search_context", "acp_status",
+    "bili_compress", "bili_decompress", "bili_search_context", "bili_status",
+]);
+
+// Given a raw SSE chunk that carries tool_call fragments, decide how to
+// replay it for a real-tool round: "keep" = every fragment belongs to a real
+// call (forward verbatim), null = nothing real in it (drop), or a rewritten
+// copy keeping only the real fragments (mixed chunk).
+function filterRealToolFragments(
+    parsed: Record<string, unknown>,
+    realIndexes: Set<number>,
+): "keep" | null | Record<string, unknown> {
+    const choices = parsed.choices as Array<Record<string, unknown>> | undefined;
+    const choice = choices?.[0];
+    const delta = choice?.delta as Record<string, unknown> | undefined;
+    const tcs = delta?.tool_calls as Array<Record<string, unknown>> | undefined;
+    if (!tcs || tcs.length === 0) return "keep";
+    let anyReal = false;
+    let anyProxy = false;
+    for (const tc of tcs) {
+        const idx = typeof tc.index === "number" ? tc.index : 0;
+        if (realIndexes.has(idx)) anyReal = true;
+        else anyProxy = true;
+    }
+    if (!anyProxy) return "keep";
+    if (!anyReal) return null;
+    const filtered: Record<string, unknown> = { ...parsed };
+    const filteredChoices: Array<Record<string, unknown>> = [...(choices as Array<Record<string, unknown>>)];
+    const filteredChoice: Record<string, unknown> = { ...(choice as Record<string, unknown>) };
+    const filteredDelta: Record<string, unknown> = { ...(delta as Record<string, unknown>) };
+    filteredDelta.tool_calls = tcs.filter((tc) => realIndexes.has(typeof tc.index === "number" ? tc.index : 0));
+    filteredChoice.delta = filteredDelta;
+    filteredChoices[0] = filteredChoice;
+    filtered.choices = filteredChoices;
+    return filtered;
+}
 
 interface ToolCallBuffer {
     index: number;
@@ -130,7 +164,73 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
 
         async *parseStream(upstream, _round) {
             const pending = new Map<number, ToolCallBuffer>();
+            // Raw tool_call chunks in arrival order. Backends (SGLang/vLLM)
+            // stream a tool name across MULTIPLE deltas — the first fragment
+            // carries the name, continuation fragments carry empty names.
+            // Deciding "proxy vs real" per-chunk loses the name entirely (the
+            // name chunk gets buffered while an empty-name continuation flips
+            // the stream into passthrough mode, and the flush is then skipped).
+            // So: buffer EVERYTHING, decide once at finish.
+            const rawToolChunks: { json: string; parsed: Record<string, unknown> }[] = [];
             let sawRealToolCall = false;
+            const flushPendingAsStructured = function* (): Generator<ParsedStreamEvent> {
+                for (const [, tc] of pending) {
+                    if (tc.name.length > 0 || tc.id.length > 0) {
+                        yield {
+                            kind: "tool_call",
+                            name: tc.name,
+                            callId: tc.id,
+                            arguments: tc.arguments,
+                        } as ParsedStreamEvent;
+                    }
+                }
+                pending.clear();
+            };
+            // Decide proxy-vs-real from the ACCUMULATED names and emit events:
+            // real calls → raw replay (verbatim chunks, original ids/order) +
+            // passthrough-flagged structured events so the loop counts them;
+            // proxy calls → structured events (server-side execution).
+            const settleToolCalls = function* (): Generator<ParsedStreamEvent> {
+                const realIndexes = new Set<number>();
+                for (const [idx, tc] of pending) {
+                    if (tc.name.length > 0 && !PROXY_TOOL_SET.has(tc.name)) realIndexes.add(idx);
+                }
+                sawRealToolCall = realIndexes.size > 0;
+                if (!sawRealToolCall) {
+                    yield* flushPendingAsStructured();
+                    return;
+                }
+                for (const [idx, tc] of pending) {
+                    if (realIndexes.has(idx) && (tc.name.length > 0 || tc.id.length > 0)) {
+                        yield {
+                            kind: "tool_call",
+                            name: tc.name,
+                            callId: tc.id,
+                            arguments: tc.arguments,
+                            passthrough: true,
+                        } as ParsedStreamEvent;
+                    }
+                }
+                for (const { json, parsed } of rawToolChunks) {
+                    const filtered = filterRealToolFragments(parsed, realIndexes);
+                    if (filtered === "keep") {
+                        yield { kind: "meta", chunk: Buffer.from("data: " + json + "\n\n", "utf8") } as ParsedStreamEvent;
+                    } else if (filtered !== null) {
+                        yield { kind: "meta", chunk: Buffer.from("data: " + JSON.stringify(filtered) + "\n\n", "utf8") } as ParsedStreamEvent;
+                    }
+                }
+                for (const [idx, tc] of pending) {
+                    if (!realIndexes.has(idx) && tc.name.length > 0) {
+                        yield {
+                            kind: "tool_call",
+                            name: tc.name,
+                            callId: tc.id,
+                            arguments: tc.arguments,
+                        } as ParsedStreamEvent;
+                    }
+                }
+                pending.clear();
+            };
             for await (const eventStr of iterSseChunks(upstream)) {
                 const dataLine = eventStr.split("\n").find((l) => l.startsWith("data:"));
                 if (!dataLine) continue;
@@ -140,18 +240,11 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                         yield { kind: "meta", chunk: Buffer.from(eventStr + "\n\n", "utf8") } as ParsedStreamEvent;
                         continue;
                     }
-                    for (const [, tc] of pending) {
-                        if (tc.name.length > 0 || tc.id.length > 0) {
-                            yield {
-                                kind: "tool_call",
-                                name: tc.name,
-                                callId: tc.id,
-                                arguments: tc.arguments,
-                            } as ParsedStreamEvent;
-                        }
+                    yield* settleToolCalls();
+                    if (sawRealToolCall) {
+                        yield { kind: "meta", chunk: Buffer.from(eventStr + "\n\n", "utf8") } as ParsedStreamEvent;
                     }
-                    pending.clear();
-                    yield { kind: "done", finishReason: "stop" } as ParsedStreamEvent;
+                    yield { kind: "done", finishReason: "stop", ...(sawRealToolCall ? { suppressCompletion: true } : {}) } as ParsedStreamEvent;
                     continue;
                 }
                 let parsed: Record<string, unknown>;
@@ -180,32 +273,8 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                 const finishReason = typeof choice.finish_reason === "string" ? choice.finish_reason : undefined;
 
                 if (finishReason) {
-                    if (sawRealToolCall) {
-                        const u2 = parsed.usage as Record<string, unknown> | undefined;
-                        const pd2 = u2?.prompt_tokens_details as Record<string, unknown> | undefined;
-                        yield {
-                            kind: "usage",
-                            inputTokens: typeof u2?.prompt_tokens === "number" ? u2.prompt_tokens : undefined,
-                            outputTokens: typeof u2?.completion_tokens === "number" ? u2.completion_tokens : undefined,
-                            cachedTokens: typeof pd2?.cached_tokens === "number" ? pd2.cached_tokens : undefined,
-                        } as ParsedStreamEvent;
-                        yield { kind: "meta", chunk: rawBuf } as ParsedStreamEvent;
-                        yield { kind: "done", finishReason } as ParsedStreamEvent;
-                        continue;
-                    }
-                    let yieldedToolCall = false;
-                    for (const [, tc] of pending) {
-                        if (tc.name.length > 0 || tc.id.length > 0) {
-                            yieldedToolCall = true;
-                            yield {
-                                kind: "tool_call",
-                                name: tc.name,
-                                callId: tc.id,
-                                arguments: tc.arguments,
-                            } as ParsedStreamEvent;
-                        }
-                    }
-                    pending.clear();
+                    const hadToolCalls = [...pending.values()].some((tc) => tc.name.length > 0 || tc.id.length > 0);
+                    yield* settleToolCalls();
                     const u = parsed.usage as Record<string, unknown> | undefined;
                     const pd = u?.prompt_tokens_details as Record<string, unknown> | undefined;
                     yield {
@@ -214,10 +283,15 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                         outputTokens: typeof u?.completion_tokens === "number" ? u.completion_tokens : undefined,
                         cachedTokens: typeof pd?.cached_tokens === "number" ? pd.cached_tokens : undefined,
                     } as ParsedStreamEvent;
-                    yield {
-                        kind: "done",
-                        finishReason: yieldedToolCall && finishReason === "stop" ? "tool_calls" : finishReason,
-                    } as ParsedStreamEvent;
+                    if (sawRealToolCall) {
+                        yield { kind: "meta", chunk: rawBuf } as ParsedStreamEvent;
+                        yield { kind: "done", finishReason, suppressCompletion: true } as ParsedStreamEvent;
+                    } else {
+                        yield {
+                            kind: "done",
+                            finishReason: hadToolCalls && finishReason === "stop" ? "tool_calls" : finishReason,
+                        } as ParsedStreamEvent;
+                    }
                 }
 
                 if (!delta) continue;
@@ -228,22 +302,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
 
                 if (delta.tool_calls) {
                     const tcs = delta.tool_calls as Array<Record<string, unknown>>;
-                    let allProxy = true;
-                    for (const tc of tcs) {
-                        const fn = tc.function as Record<string, unknown> | undefined;
-                        const name = typeof fn?.name === "string" ? fn.name : "";
-                        if (!PROXY_TOOL_SET.has(name)) {
-                            allProxy = false;
-                        }
-                    }
-                    if (!allProxy) {
-                        sawRealToolCall = true;
-                        yield { kind: "meta", chunk: rawBuf } as ParsedStreamEvent;
-                        if (typeof delta.content === "string" && delta.content.length > 0) {
-                            yield { kind: "text", delta: delta.content } as ParsedStreamEvent;
-                        }
-                        continue;
-                    }
+                    rawToolChunks.push({ json: jsonStr, parsed });
                     for (const tc of tcs) {
                         const idx = typeof tc.index === "number" ? tc.index : 0;
                         const fn = tc.function as Record<string, unknown> | undefined;
@@ -256,7 +315,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                             pending.set(idx, buf);
                         } else {
                             if (id) buf.id = id;
-                            if (name) buf.name = name;
+                            buf.name += name;
                             buf.arguments += args;
                         }
                     }

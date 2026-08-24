@@ -60,7 +60,7 @@ export type ParsedStreamEvent =
     | { kind: "reasoning"; delta: string; raw?: Buffer; signature?: string; blockEnd?: boolean }
     | { kind: "tool_call"; name: string; callId: string; arguments: string; passthrough?: boolean }
     | { kind: "usage"; inputTokens?: number; outputTokens?: number; cachedTokens?: number }
-    | { kind: "done"; finishReason?: string }
+    | { kind: "done"; finishReason?: string; suppressCompletion?: boolean }
     | { kind: "meta"; chunk: Buffer; firstRoundOnly?: boolean };
 
 export interface EmitCompletionOpts {
@@ -209,6 +209,7 @@ export async function* runCompressLoop(
             const calls: ToolCallEmit[] = [];
             let usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number } = {};
             let finishReason: string | undefined;
+            let suppressCompletion = false;
 
             for await (const ev of adapter.parseStream(currentUpstream, round)) {
                 if (signal?.aborted) break;
@@ -247,6 +248,7 @@ export async function* runCompressLoop(
                     };
                 } else if (ev.kind === "done") {
                     finishReason = ev.finishReason;
+                    suppressCompletion = ev.suppressCompletion === true;
                 } else if (ev.kind === "meta") {
                     if (round === 1 || !ev.firstRoundOnly) {
                         yield ev.chunk;
@@ -391,7 +393,12 @@ export async function* runCompressLoop(
             // blind to why it failed. MAX_LOOP_ROUNDS bounds runaway loops.
             const reRequest = proxyResults.length > 0 && realCalls === 0;
             if (!reRequest) {
-                yield adapter.emitCompletion({ finishReason, usage });
+                // A passthrough round already streamed the upstream's own finish
+                // chunk + [DONE] verbatim (original id + order); re-emitting a
+                // regenerated completion would duplicate them.
+                if (!suppressCompletion) {
+                    yield adapter.emitCompletion({ finishReason, usage });
+                }
                 return;
             }
 
