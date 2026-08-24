@@ -346,3 +346,74 @@ test("compress round-trip preserves injectTool/injectNudge injection toggles", a
         rmSync(root, { recursive: true, force: true });
     }
 });
+
+test("PUT /__bili/config refuses to overwrite a config file that does not parse", async () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    const root = path.join(tmpdir(), `bili-put-broken-${process.pid}-${Date.now()}`);
+    mkdirSync(root, { recursive: true });
+    const biliConfig = path.join(root, "billion-context.json");
+    // Hand-edited file with a trailing comma — JSON.parse fails, the loader
+    // sees {}. A PUT must NOT rebuild from {} (that would silently drop the
+    // user's modelContextLimit etc.); it must 409 until the syntax is fixed.
+    writeFileSync(biliConfig, '{"providers":{},"modelContextLimit":333000,}\n', "utf8");
+    const prevConfig = process.env.BILI_CONFIG_FILE;
+    process.env.BILI_CONFIG_FILE = biliConfig;
+    const port = await freePort();
+    const opts: ProxyOptions = {
+        port,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1:1",
+        routes: {},
+        proxy: "",
+        proxyMode: "direct",
+        proxySource: "direct",
+        modelContextLimit: 400_000,
+        kernelConfig: defaultConfig(400_000),
+        compress: { injectTool: true, injectNudge: true },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        mitm: { enabled: false, domains: [] },
+    };
+    const proxy = await startServer(opts);
+    if (!proxy.listening) await once(proxy, "listening");
+    const base = `http://127.0.0.1:${port}`;
+    try {
+        const get1 = await (await fetch(`${base}/__bili/config`)).json() as { parseError?: string };
+        assert.ok(get1.parseError, "GET surfaces parseError for a broken file");
+        assert.match(get1.parseError, /not valid JSON/);
+
+        const put = await fetch(`${base}/__bili/config`, {
+            method: "PUT",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ providers: {} }),
+        });
+        assert.equal(put.status, 409);
+        const err = await put.json() as { error: string };
+        assert.match(err.error, /not valid JSON/);
+        // File untouched on disk.
+        assert.match(readFileSync(biliConfig, "utf8"), /modelContextLimit/);
+
+        // User fixes the syntax by hand → PUT works again and preserves fields.
+        writeFileSync(biliConfig, '{"providers":{},"modelContextLimit":333000}\n', "utf8");
+        const put2 = await fetch(`${base}/__bili/config`, {
+            method: "PUT",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ providers: { "https://api.example.com": {} } }),
+        });
+        assert.equal(put2.status, 200);
+        const after = readFileSync(biliConfig, "utf8");
+        assert.match(after, /modelContextLimit/, "pre-existing fields survive the PUT");
+        const get2 = await (await fetch(`${base}/__bili/config`)).json() as { parseError?: string; providers: Record<string, unknown> };
+        assert.equal(get2.parseError, undefined);
+        assert.ok(get2.providers["https://api.example.com"]);
+    } finally {
+        await close(proxy);
+        if (prevConfig === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = prevConfig;
+        rmSync(root, { recursive: true, force: true });
+    }
+});

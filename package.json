@@ -10,6 +10,7 @@
   },
   "scripts": {
     "build": "tsup",
+    "registry:snapshot": "node scripts/update-registry-snapshot.mjs",
     "typecheck": "tsc --noEmit --project tsconfig.build.json",
     "test": "node --import tsx --test tests/*.test.ts",
     "start": "node dist/index.js"
