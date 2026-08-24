@@ -66,3 +66,21 @@ Revert the single commit; no data migrations, no config-format changes.
 - Upstream forbids wheel/sdist builds (setup.py guard); the supported local
   install is a clone + `uv venv` + editable install (see ~/system/README.md
   "Hermes Agent").
+
+## Follow-up 4: review findings (second tmux review round)
+
+A reviewer session running under `bili hermes` itself flagged two gaps:
+
+1. **Silent bypass when prepare fails**: the launcher only warned when
+   discovery found zero providers. If `httpRewrites` was non-empty but
+   `prepareHermesHome` returned `undefined` (unreadable config.yaml, no
+   matching lines), traffic silently bypassed the proxy. The else branch now
+   warns in both cases with distinct messages.
+2. **CRLF → LF regression**: `lines.join("\n")` destroyed CRLF files
+   (Windows-edited configs). The rewriter now detects the dominant EOL from
+   the source text and preserves it; the split regex already tolerated both.
+
+Tests: CRLF preservation (incl. no-doubled-newlines + rewritten line keeps
+`\r`) and unreadable-config-with-pending-rewrites → undefined.
+
+559/559 pass, typecheck clean.

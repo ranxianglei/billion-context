@@ -932,3 +932,33 @@ test("prepareHermesHome: rewrites api lines, shares siblings, never touches the 
         fs.rmSync(dir, { recursive: true, force: true });
     }
 });
+
+test("prepareHermesHome: preserves CRLF line endings when rewriting", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-home-"));
+    try {
+        fs.writeFileSync(
+            path.join(dir, "config.yaml"),
+            ["model:", "  default: qwen3.8-27b", "providers:", "  bili:", "    api: http://127.0.0.1:8199/v1"].join("\r\n") + "\r\n",
+        );
+        const rewrites: HttpRewrite[] = [{ key: "bili", realUpstream: "http://127.0.0.1:8199/v1" }];
+        const tmp = prepareHermesHome(dir, "http://127.0.0.1:8787", rewrites);
+        assert.ok(tmp);
+        const txt = fs.readFileSync(path.join(tmp, "config.yaml"), "utf8");
+        assert.ok(txt.includes("\r\n"), "CRLF preserved");
+        assert.ok(!/\r\n\r\n/.test(txt), "no doubled newlines");
+        assert.ok(txt.includes("api: http://127.0.0.1:8787/bili/http://127.0.0.1:8199/v1\r"));
+        fs.rmSync(tmp, { recursive: true, force: true });
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("prepareHermesHome: returns undefined for unreadable config even with rewrites pending", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-home-"));
+    try {
+        const rewrites: HttpRewrite[] = [{ key: "bili", realUpstream: "http://127.0.0.1:8199/v1" }];
+        assert.equal(prepareHermesHome(dir, "http://127.0.0.1:8787", rewrites), undefined);
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});

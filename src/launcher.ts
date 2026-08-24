@@ -554,6 +554,7 @@ export function prepareHermesHome(
         return undefined;
     }
     const wrapSet = new Set(rewrites.map((r) => r.realUpstream));
+    const eol = txt.includes("\r\n") ? "\r\n" : "\n";
     const lines = txt.split(/\r?\n/);
     let changed = false;
     for (let i = 0; i < lines.length; i++) {
@@ -577,7 +578,7 @@ export function prepareHermesHome(
             } catch {}
         }
     } catch {}
-    fs.writeFileSync(path.join(tmp, "config.yaml"), lines.join("\n"));
+    fs.writeFileSync(path.join(tmp, "config.yaml"), lines.join(eol));
     return tmp;
 }
 
@@ -930,8 +931,12 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         hermesTmpHome = prepareHermesHome(resolveHermesHome(process.env), origin, routes.httpRewrites);
         if (hermesTmpHome) {
             env.HERMES_HOME = hermesTmpHome;
-        } else if (routes.httpRewrites.length === 0) {
-            console.error("bili: no hermes providers found in ~/.hermes/config.yaml — traffic will NOT go through the proxy (configure a provider first)." );
+        } else {
+            console.error(
+                routes.httpRewrites.length === 0
+                    ? "bili: no hermes providers found in ~/.hermes/config.yaml — traffic will NOT go through the proxy (configure a provider first)."
+                    : "bili: hermes config.yaml could not be rewritten (unreadable or no matching provider endpoints) — traffic will NOT go through the proxy.",
+            );
         }
     } else if (base === "codex") {
         // Per-spawn conversation id for the MCP shell's headless
