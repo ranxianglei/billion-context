@@ -17,7 +17,7 @@ import {
 import { applyRanges } from "../stream.js";
 import { resolveDecompress } from "../decompress-shared.js";
 import { buildVisibilityMarker } from "../compress-loop.js";
-import { fetchWithTimeout } from "../fetch-util.js";
+import { fetchWithRetry, UpstreamHttpError } from "../fetch-util.js";
 import { proxyDispatcher } from "../upstream-proxy.js";
 import { log as loggerLog } from "../logger.js";
 import type { WireProtocol } from "../util.js";
@@ -409,30 +409,41 @@ export async function* runCompressLoop(
                     fs.writeFileSync(`${dumpDir}/req-${Date.now()}-${sid}-REREQUEST.json`, JSON.stringify(newBody, null, 2));
                 } catch { /* best-effort */ }
             }
-            const { response: resp, clearTimer } = await fetchWithTimeout(
-                requestOptions.url,
-                {
-                    method: "POST",
-                    headers: requestOptions.headers,
-                    body: JSON.stringify(newBody),
-                    ...(ctx.proxyUrl ? { dispatcher: proxyDispatcher(ctx.proxyUrl) } : {}),
-                },
-                undefined,
-                signal,
-            );
-
-            if (!resp.ok || !resp.body) {
-                clearTimer();
-                const errText = await resp.text().catch(() => "upstream error");
-                ctx.log(`[acp-proxy: compress loop upstream error ${resp.status}: ${errText.slice(0, 200)}]`);
-                loggerLog("error", `[acp-loop] upstream error ${resp.status}: ${errText.slice(0, 200)}`);
-                yield adapter.emitError(`upstream error ${resp.status}: ${errText.slice(0, 200)}`);
+            let respResult: { response: Response; clearTimer: () => void };
+            try {
+                respResult = await fetchWithRetry(
+                    requestOptions.url,
+                    {
+                        method: "POST",
+                        headers: requestOptions.headers,
+                        body: JSON.stringify(newBody),
+                        ...(ctx.proxyUrl ? { dispatcher: proxyDispatcher(ctx.proxyUrl) } : {}),
+                    },
+                    undefined,
+                    signal,
+                    (info) => {
+                        ctx.log(`[acp-proxy: upstream rejected replay (HTTP ${info.status}: ${info.detail.slice(0, 120)}); likely provider risk-control — retrying in ${info.delayMs}ms (attempt ${info.attempt}/${info.maxAttempts})]`);
+                        loggerLog("warn", `[acp-loop] upstream rejected replay (HTTP ${info.status}); retrying in ${info.delayMs}ms (attempt ${info.attempt}/${info.maxAttempts})`);
+                    },
+                );
+            } catch (e) {
+                if (!(e instanceof UpstreamHttpError)) throw e;
+                const suffix = e.attempts > 1 ? ` after ${e.attempts} attempt(s)` : "";
+                ctx.log(`[acp-proxy: compress loop upstream error ${e.status}${suffix}: ${e.body.slice(0, 200)}]`);
+                loggerLog("error", `[acp-loop] upstream error ${e.status}${suffix}: ${e.body.slice(0, 200)}`);
+                yield adapter.emitError(`upstream error ${e.status}${suffix}: ${e.body.slice(0, 200)}`);
                 return;
             }
 
-            currentUpstream = resp.body as ReadableStream<Uint8Array>;
+            if (!respResult.response.body) {
+                respResult.clearTimer();
+                yield adapter.emitError(`upstream error ${respResult.response.status}: empty response body`);
+                return;
+            }
+
+            currentUpstream = respResult.response.body as ReadableStream<Uint8Array>;
             if (activeClearTimer) activeClearTimer();
-            activeClearTimer = clearTimer;
+            activeClearTimer = respResult.clearTimer;
         }
     } finally {
         if (activeClearTimer) {
