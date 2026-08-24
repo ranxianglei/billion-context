@@ -65,6 +65,31 @@ launcher(`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode`
 
 压缩是自动注入的 —— 你只需配置路由,无需配置压缩本身。
 
+安装插件是**可选的** —— 不装的话,所有客户端(包括 hermes)照样拿到代理
+wire 注入的四个工具,压缩照常工作;装了只是把工具体验升级为原生工具。
+插件**内置于 billion-context 自身**,无需单独安装包:pi、omp 是原生
+agent 插件(`dist/agent/*.js`),claude、codex、opencode 是 MCP 桥
+(`dist/mcp.js`,底层协议相同)。hermes 没有插件 API,始终走 wire 注入工具。
+
+```bash
+bili plugin install pi      # 把本 billion-context 安装加进 pi 的 settings.json(packages)
+bili plugin install omp     # 同理 omp(config.yml extensions)
+bili plugin install claude  # 注册 bili MCP 服务器(claude mcp add,user 作用域)
+bili plugin install codex   # 向 ~/.codex/config.toml 追加 [mcp_servers.bili]
+bili plugin install opencode  # 向 ~/.config/opencode/opencode.json 加 mcp.bili
+bili plugin list            # 查看所有支持宿主的安装状态
+bili plugin remove pi       # 卸载(原文件备份为 *.bili-bak,仅一次)
+```
+
+装上的插件非常**薄**(~5 KB,零运行时依赖):只负责探测代理(通过 `/bili/`
+baseURL 或 `BILLION_CONTEXT_PROXY`)、从代理拉取工具 schema、注册原生工具
+并转发执行 —— 代理始终是唯一压缩引擎,插件与代理版本永远匹配。彻底
+关闭:`BILLION_CONTEXT_PLUGIN=0`。
+
+走 launcher 时完全不需要 `plugin install`:`bili opencode` 自动注入插件
+(临时 `OPENCODE_CONFIG`),claude/codex 用 `BILI_LAUNCHER_PLUGIN=1` 拿到
+MCP 壳,pi/omp/hermes 走 wire 注入工具。
+
 ### 方式 0 —— 启动器(`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode` / `bili hermes`)
 
 启动器把客户端包进一条命令:在独立端口拉起一个代理(总是全新实例,绝不复用端口),再按客户端支持的机制把它指向代理 —— 能吃代理/CA 环境变量的走**证书 MITM**,不吃的走隔离的**`/bili/` 配置重写**。真实配置文件从不被修改;客户端自己的配置只被**读取**,用来发现它实际连接的 HTTPS 上游主机,把这些主机加入 MITM 白名单 —— 代理只 TLS 终结它们,其余流量盲透传。

@@ -82,8 +82,13 @@ usage via `GET /__bili/plugin/status`.
 Compression is injected automatically — you only configure routing, never
 compression itself.
 
-For pi and omp, the plugin ships **inside billion-context itself** — no
-separate package to install:
+Installing a plugin is **optional** — without one, every client (hermes
+included) still gets the four tools wire-injected by the proxy; installing
+only upgrades them to native agent tools. The plugins ship **inside
+billion-context itself** — no separate package: pi and omp get native agent
+plugins (`dist/agent/*.js`), claude, codex and opencode get the MCP bridge
+(`dist/mcp.js`, same protocol underneath). hermes has no plugin API — it
+always rides the wire-injected tools.
 
 ```bash
 bili plugin install pi      # adds this billion-context install to pi's settings.json (packages)
@@ -101,8 +106,10 @@ fetches tool schemas from the proxy, registers native tools, and forwards
 executions — the proxy remains the single compression authority, so plugin
 and proxy always match versions. Killing it entirely: `BILLION_CONTEXT_PLUGIN=0`.
 
-Hosts without a plugin API (claude, codex, opencode) install the MCP
-bridge instead (`dist/mcp.js`), same protocol underneath.
+Via the launcher you never need `plugin install`: `bili opencode` injects
+its plugin automatically (temp `OPENCODE_CONFIG`), claude/codex get the
+MCP shell with `BILI_LAUNCHER_PLUGIN=1`, and pi/omp/hermes ride the
+wire-injected tools.
 
 ### Option 0 — Launcher (`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode` / `bili hermes`)
 

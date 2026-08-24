@@ -43,6 +43,15 @@
   full 「方式 0 —— 启动器」 chapter (six clients, redirect/CA + discovery
   tables, isolated-temp-config pattern) and a quickstart bullet
   (两种方式 → 三种方式).
+- Third commit: plugin-install parity — README.md lead rewritten (install is
+  optional; pi/omp = native plugins, claude/codex/opencode = MCP bridge,
+  hermes = none; launcher needs no install), README.zh-CN.md gained the
+  entire missing install block (commands, thin-plugin note, kill switch,
+  launcher note). Facts verified: PLUGIN_AGENTS=[pi,omp,claude,codex,opencode]
+  (src/plugin-install.ts:22), plugin install|remove|list actions (src/cli.ts),
+  *.bili-bak once-backup (src/plugin-install.ts:38), launcherInjectMcp gates
+  MCP injection to claude/codex via BILI_LAUNCHER_PLUGIN=1; opencode launcher
+  auto-injects via OPENCODE_CONFIG (src/launcher.ts:357).
 - CHANGELOG.md: [Unreleased] += #222 (thinking-replay degraded retry),
   #223 (hermes launcher, under Features), #224 (SSE name-split,
   buffer-to-finish). Backfilled [0.1.41]–[0.1.49] sections with PR numbers
