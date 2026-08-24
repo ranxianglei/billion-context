@@ -78,8 +78,17 @@ function piSettingsFile(): string {
     return path.join(resolvePiHome(process.env), "settings.json");
 }
 
+// A packages entry is "ours" if it points at THIS install's package root,
+// any other billion-context install (npm: form, node_modules path, or a
+// dev checkout dir — separators in either style for Windows), or the legacy
+// billion-context-pi package (0.1.x shipped as a separate package before the
+// plugin moved into billion-context itself). install() replaces every match
+// so exactly one bili plugin is live after `bili plugin install pi`.
 function isPiEntry(entry: string, root: string): boolean {
-    return entry === root || entry === `npm:billion-context` || /^npm:billion-context@/.test(entry) || /(^|\/)node_modules\/billion-context(\/|$)/.test(entry);
+    return entry === root
+        || /^npm:billion-context(-pi)?(@|$)/.test(entry)
+        || /(^|[/\\])node_modules[/\\]billion-context(-pi)?([\/\\]|$)/.test(entry)
+        || /(^|[/\\])billion-context(-pi)?$/.test(entry);
 }
 
 function piInstall(): string {
@@ -111,7 +120,7 @@ function piStatus(): string {
     const root = selfPackageRoot();
     const packages = readJson(piSettingsFile()).packages;
     const list = Array.isArray(packages) ? (packages as unknown[]).map(String) : [];
-    return list.some((p) => isPiEntry(p, root)) ? "installed" : "not installed";
+    return list.some((p) => p === root) ? "installed" : "not installed";
 }
 
 // — omp ———————————————————————————————————————————————————————————————
