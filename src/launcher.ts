@@ -41,7 +41,7 @@ import { selfPackageRoot } from "./plugin-install.js";
 function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
-import { nonEmpty, resolvePiHome, resolveOmpHome, loadClientConfig, type ClientConfig, resolveOpencodeConfigFile, type OpencodeConfig, type OpencodeProvider } from "./client-config.js";
+import { nonEmpty, resolvePiHome, resolveOmpHome, resolveHermesHome, loadClientConfig, type ClientConfig, resolveOpencodeConfigFile, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider } from "./client-config.js";
 
 export {
     type ClaudeSettings,
@@ -65,6 +65,9 @@ export {
     readOmpConfig,
     parseOmpYaml,
     resolveOmpHome,
+    readHermesConfig,
+    parseHermesYaml,
+    resolveHermesHome,
     resolveOpencodeConfigFile,
     readOpencodeConfig,
     type OpencodeConfig,
@@ -73,9 +76,9 @@ export {
 
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
 export const LAUNCHER_DEFAULT_PORT = 8787;
-export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "pi-test"] as const;
+export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "pi-test"] as const;
 export type ClientName = (typeof LAUNCH_CLIENTS)[number];
-export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode";
+export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes";
 
 const HEALTH_PATH = "/__bili/health";
 const HEALTH_POLL_INTERVAL_MS = 200;
@@ -258,6 +261,25 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
         for (const [name, prov] of Object.entries(config.opencode?.providers ?? {})) {
             classify(prov.baseURL, name);
         }
+    } else if (client === "hermes") {
+        // hermes rides /bili/ for EVERY upstream (http AND https): its httpx
+        // client builds its own CA bundle from certifi, so cert-MITM would
+        // need extra trust config. Wrapping the URL form needs no cert at all.
+        const hermesSeen = new Set<string>();
+        for (const [name, prov] of Object.entries(config.hermes?.providers ?? {})) {
+            if (!nonEmpty(prov.api)) continue;
+            const real = unwrapUpstream(prov.api!);
+            try {
+                const url = new URL(real);
+                if (url.protocol !== "http:" && url.protocol !== "https:") continue;
+                if (hermesSeen.has(name)) continue;
+                hermesSeen.add(name);
+                rewriteKeys.add(name);
+                httpRewrites.push({ key: name, realUpstream: real });
+            } catch {
+                // Unparseable endpoint: skip.
+            }
+        }
     } else {
         for (const [name, prov] of Object.entries(config.codex?.providers ?? {})) {
             classify(prov.baseUrl, `model_providers.${name}.base_url`);
@@ -333,7 +355,7 @@ export function launcherDirectUrl(env: NodeJS.ProcessEnv): boolean {
  *  `!== "0"` semantics) once the flags have soaked; pi is always excluded —
  *  it has its own native extension (billion-context-pi #154). */
 export function launcherInjectMcp(env: NodeJS.ProcessEnv, base: string): boolean {
-    return base !== "pi" && base !== "omp" && base !== "opencode" && env.BILI_LAUNCHER_PLUGIN === "1";
+    return base !== "pi" && base !== "omp" && base !== "opencode" && base !== "hermes" && env.BILI_LAUNCHER_PLUGIN === "1";
 }
 
 /** Ephemeral MCP config for --mcp-config / -c mcp_servers.bili.*: a single
@@ -506,6 +528,57 @@ export function prepareOmpHttpRewrite(
         }
     } catch {}
     fs.writeFileSync(path.join(tmp, "models.yml"), lines.join("\n"));
+    return tmp;
+}
+
+/**
+ * hermes counterpart of prepareOmpHttpRewrite: an isolated HERMES_HOME (temp
+ * dir, every ~/.hermes sibling symlinked so skills/memories/sessions stay
+ * shared) holding a rewritten copy of config.yaml. Every provider endpoint
+ * line (api: / base_url: / url:) is rewrapped as origin + "/bili/" + raw
+ * upstream — http AND https alike, since hermes's httpx stack can't consume
+ * the MITM CA without extra trust config. The real ~/.hermes is never
+ * touched. Returns the temp dir (undefined when nothing is rewritable).
+ */
+export function prepareHermesHome(
+    hermesHome: string,
+    origin: string,
+    rewrites: HttpRewrite[],
+): string | undefined {
+    if (rewrites.length === 0) return undefined;
+    const cfgPath = path.join(hermesHome, "config.yaml");
+    let txt: string;
+    try {
+        txt = fs.readFileSync(cfgPath, "utf8");
+    } catch {
+        return undefined;
+    }
+    const wrapSet = new Set(rewrites.map((r) => r.realUpstream));
+    const eol = txt.includes("\r\n") ? "\r\n" : "\n";
+    const lines = txt.split(/\r?\n/);
+    let changed = false;
+    for (let i = 0; i < lines.length; i++) {
+        const rawLine = lines[i];
+        const m = /^(\s*(?:api|base_url|url):\s*)(\S+)(\s+#.*)?$/.exec(rawLine);
+        if (!m) continue;
+        const rawUrl = m[2];
+        if (!/^https?:\/\//i.test(rawUrl)) continue;
+        const real = unwrapUpstream(rawUrl);
+        if (!wrapSet.has(real)) continue;
+        lines[i] = `${m[1]}${wrapUpstream(origin, real)}${m[3] ?? ""}`;
+        changed = true;
+    }
+    if (!changed) return undefined;
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-hermes-"));
+    try {
+        for (const entry of fs.readdirSync(hermesHome)) {
+            if (entry === "config.yaml") continue;
+            try {
+                fs.symlinkSync(path.join(hermesHome, entry), path.join(tmp, entry));
+            } catch {}
+        }
+    } catch {}
+    fs.writeFileSync(path.join(tmp, "config.yaml"), lines.join(eol));
     return tmp;
 }
 
@@ -810,6 +883,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     let piTmpHome: string | undefined;
     let ompTmpHome: string | undefined;
     let opencodeTmpFile: string | undefined;
+    let hermesTmpHome: string | undefined;
     const tmpFiles: string[] = [];
     const directUrl = launcherDirectUrl(process.env);
     if (directUrl) {
@@ -848,6 +922,22 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         const opencodePluginPath = opencodePlugin && fs.existsSync(opencodePlugin) ? opencodePlugin : undefined;
         opencodeTmpFile = prepareOpencodeHttpRewrite(resolveOpencodeConfigFile(process.env), origin, routes.httpRewrites, routes.httpsRewrites, opencodePluginPath);
         if (opencodeTmpFile) env.OPENCODE_CONFIG = opencodeTmpFile;
+    } else if (base === "hermes") {
+        // hermes: no plugin, no MITM cert trust (httpx builds its own CA
+        // bundle) — every upstream rides the /bili/ URL form via an isolated
+        // HERMES_HOME whose config.yaml is rewritten. skills/memories/sessions
+        // stay shared through symlinks; the real ~/.hermes is never touched.
+        env = { ...process.env };
+        hermesTmpHome = prepareHermesHome(resolveHermesHome(process.env), origin, routes.httpRewrites);
+        if (hermesTmpHome) {
+            env.HERMES_HOME = hermesTmpHome;
+        } else {
+            console.error(
+                routes.httpRewrites.length === 0
+                    ? "bili: no hermes providers found in ~/.hermes/config.yaml — traffic will NOT go through the proxy (configure a provider first)."
+                    : "bili: hermes config.yaml could not be rewritten (unreadable or no matching provider endpoints) — traffic will NOT go through the proxy.",
+            );
+        }
     } else if (base === "codex") {
         // Per-spawn conversation id for the MCP shell's headless
         // self-registration (codex provides no session id of its own).
@@ -893,6 +983,11 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         if (ompTmpHome) {
             try {
                 fs.rmSync(ompTmpHome, { recursive: true, force: true });
+            } catch {}
+        }
+        if (hermesTmpHome) {
+            try {
+                fs.rmSync(hermesTmpHome, { recursive: true, force: true });
             } catch {}
         }
         if (opencodeTmpFile) {

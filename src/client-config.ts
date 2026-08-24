@@ -52,6 +52,14 @@ export interface OpencodeConfig {
     providers: Record<string, OpencodeProvider>;
 }
 
+export interface HermesProvider {
+    api?: string;
+}
+
+export interface HermesConfig {
+    providers: Record<string, HermesProvider>;
+}
+
 export interface ClientConfig {
     claude?: ClaudeSettings;
     codex?: CodexConfig;
@@ -59,6 +67,7 @@ export interface ClientConfig {
     zcode?: ZcodeConfig;
     omp?: OmpConfig;
     opencode?: OpencodeConfig;
+    hermes?: HermesConfig;
 }
 
 export function nonEmpty(s: unknown): s is string {
@@ -90,6 +99,14 @@ export function resolveOmpHome(env: NodeJS.ProcessEnv): string {
     const h = os.homedir();
     return nonEmpty(env.PI_CODING_AGENT_DIR) ? env.PI_CODING_AGENT_DIR!
         : path.join(h, ".omp", "agent");
+}
+
+/** hermes-agent (Nous Research) keeps everything under HERMES_HOME
+ *  (default ~/.hermes): config.yaml, .env, skills, memories, sessions. */
+export function resolveHermesHome(env: NodeJS.ProcessEnv): string {
+    const h = os.homedir();
+    return nonEmpty(env.HERMES_HOME) ? env.HERMES_HOME!
+        : path.join(h, ".hermes");
 }
 
 export function readClaudeSettings(homeDir: string, cwd: string, env: NodeJS.ProcessEnv = process.env): ClaudeSettings {
@@ -224,6 +241,92 @@ export function readOmpConfig(ompHome: string): OmpConfig {
     return parseOmpYaml(text);
 }
 
+/** Minimal line-based YAML reader for hermes config.yaml: collects provider
+ *  entries from the v12 `providers:` dict (provider key -> `api:` url) and the
+ *  legacy `custom_providers:` list (- name: ... / base_url: ...). Anything
+ *  else in the file is ignored — only name -> endpoint URL pairs matter for
+ *  launcher route discovery. */
+export function parseHermesYaml(text: string): HermesConfig {
+    const result: HermesConfig = { providers: {} };
+    type Mode = "none" | "dict" | "list";
+    let mode: Mode = "none";
+    let sectionIndent = -1;
+    let entryIndent = -1;
+    let current: string | null = null;
+    let anonCount = 0;
+    for (const rawLine of text.split(/\r?\n/)) {
+        const trimmed = rawLine.trim();
+        if (!trimmed || trimmed.startsWith("#")) continue;
+        const indent = rawLine.length - rawLine.trimStart().length;
+        if (mode === "none") {
+            if (/^providers:\s*(#.*)?$/.test(trimmed)) {
+                mode = "dict";
+                sectionIndent = indent;
+                entryIndent = -1;
+                current = null;
+            } else if (/^custom_providers:\s*(#.*)?$/.test(trimmed)) {
+                mode = "list";
+                sectionIndent = indent;
+                entryIndent = -1;
+                current = null;
+            }
+            continue;
+        }
+        if (indent <= sectionIndent) {
+            // Left the section — re-evaluate this line for a new section start.
+            mode = "none";
+            sectionIndent = -1;
+            entryIndent = -1;
+            current = null;
+            if (/^providers:\s*(#.*)?$/.test(trimmed)) {
+                mode = "dict";
+                sectionIndent = indent;
+            } else if (/^custom_providers:\s*(#.*)?$/.test(trimmed)) {
+                mode = "list";
+                sectionIndent = indent;
+            }
+            continue;
+        }
+        if (mode === "dict") {
+            if (entryIndent === -1) entryIndent = indent;
+            if (indent === entryIndent) {
+                const m = /^([A-Za-z0-9_.-]+):/.exec(trimmed);
+                current = m ? m[1] : null;
+                if (current && !result.providers[current]) result.providers[current] = {};
+            } else if (indent > entryIndent && current) {
+                const apiMatch = /^api:\s*(\S+)/.exec(trimmed);
+                if (apiMatch) result.providers[current].api = apiMatch[1];
+            }
+        } else {
+            // Legacy list: "- name: x" opens an entry; nested base_url/api/url lines.
+            const dashMatch = /^-\s+(.*)$/.exec(trimmed);
+            if (dashMatch) {
+                entryIndent = indent;
+                const nameMatch = /name:\s*([A-Za-z0-9_.-]+)/.exec(dashMatch[1]);
+                current = nameMatch ? nameMatch[1] : `custom-${++anonCount}`;
+                if (!result.providers[current]) result.providers[current] = {};
+                const inlineUrl = /^(?:base_url|api|url):\s*(\S+)/.exec(dashMatch[1]);
+                if (inlineUrl) result.providers[current].api = inlineUrl[1];
+            } else if (current) {
+                const urlMatch = /^(?:base_url|api|url):\s*(\S+)/.exec(trimmed);
+                if (urlMatch) result.providers[current].api = urlMatch[1];
+            }
+        }
+    }
+    return result;
+}
+
+export function readHermesConfig(hermesHome: string): HermesConfig {
+    const cfgPath = path.join(hermesHome, "config.yaml");
+    let text: string;
+    try {
+        text = fs.readFileSync(cfgPath, "utf8");
+    } catch {
+        return { providers: {} };
+    }
+    return parseHermesYaml(text);
+}
+
 export function resolveOpencodeConfigFile(env: NodeJS.ProcessEnv): string {
     if (nonEmpty(env.OPENCODE_CONFIG)) return env.OPENCODE_CONFIG;
     const xdg = nonEmpty(env.XDG_CONFIG_HOME) ? env.XDG_CONFIG_HOME : path.join(os.homedir(), ".config");
@@ -306,5 +409,6 @@ export function loadClientConfig(env: NodeJS.ProcessEnv, cwd: string): ClientCon
     config.zcode = readZcodeConfig(zcodeHome);
     config.omp = readOmpConfig(resolveOmpHome(env));
     config.opencode = readOpencodeConfig(resolveOpencodeConfigFile(env));
+    config.hermes = readHermesConfig(resolveHermesHome(env));
     return config;
 }
