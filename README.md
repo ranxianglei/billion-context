@@ -98,18 +98,15 @@ the client UI just never lists the tools; ask the model to run `acp_status`
 if you want the status panel rendered in chat.
 
 ```bash
-bili plugin install pi      # needed: pi's native tools + /acp come ONLY from install (the launcher never injects MCP for pi/omp)
-bili plugin install omp     # same for omp
-bili plugin install claude  # optional: persistent MCP registration (or BILI_LAUNCHER_PLUGIN=1 with the launcher — either works)
-bili plugin install codex   # optional: same as claude
+bili plugin install pi      # needed: pi's native tools + /acp come ONLY from install (the launcher never injects MCP for pi)
 bili plugin list            # install status for every supported host
 bili plugin remove pi       # undo (original files backed up to *.bili-bak once)
 ```
 
-opencode does **not** need install — `bili opencode` injects the plugin
-automatically; `bili plugin install opencode` only matters for the manual
-URL-prefix setup if you want the native panel. hermes has no plugin
-API at all.
+Every other host skips install: omp ships with the plugin built in, opencode
+is injected automatically by `bili opencode`, claude/codex can set
+`BILI_LAUNCHER_PLUGIN=1` with the launcher (or `plugin install` for a
+persistent MCP registration), and hermes has no plugin API at all.
 
 The installed plugin is a **thin** one (~5 KB, zero runtime deps): it just
 detects the proxy (from the `/bili/` baseURL or `BILLION_CONTEXT_PROXY`),
