@@ -42,11 +42,10 @@ npm install -g billion-context
 
 ## 快速上手
 
-3种方式 —— 任选其一:
+2种方式 —— 任选其一:
 
 - **启动器(最省事):** `bili <client>` 一条命令拉起代理 + 客户端,不碰任何真实配置文件.
 - **改url(持久化):** 在客户端 baseURL 前面加上代理地址 + `/bili/`。
-- **手动配置文件:** 方式 2 的路由不变,只是在配置文件里显式声明 context 窗口(registry 不认识的端点,或想钉死精确值)。
 
 
 
@@ -84,7 +83,7 @@ bili
 客户端 baseURL 之后:  http://localhost:8787/bili/https://api.openai.com/v1
 ```
 
-就这样 —— 真实 API key 照常填在客户端配置里(proxy 原样透传)。context 窗口(gpt-5.1-codex=400K、glm-5.2=1M、claude-opus-4=200K ……)自动从 models.dev 查询。
+更多客户端配置参考网页配制: [http://localhost:8787](http://localhost:8787) .
 
 #### A. API-key 客户端(`/bili/` 前缀)
 
@@ -171,28 +170,6 @@ MITM 默认开启,且只对一份 **白名单**中的模型域名(`open.bigmodel
 > Node)信任它,其他应用不受影响。删除 CA 文件并重启 proxy 会重新生成。
 
 **给登录客户端单独配代理(防火墙/GFW)。** 登录客户端(ZCode)和 API-key 客户端可能连同一个域名(`open.bigmodel.cn`)。要给登录客户端配**专属上游代理**而不影响 API-key 客户端,用 `mitm://` scheme 键 —— 见[上游代理(MITM 与 `/bili/`)](#上游代理防火墙gfw)。
-
-### 方式 3 手动配置文件&设置上下文大小
-
-打开 `~/.config/billion-context/billion-context.json`,编辑 `providers` 块。
-**key 就是上游 URL** —— 客户端写在 `/bili/` 后面的那个字符串。value 为该
-URL 声明按模型的 context 窗口:
-
-```json
-{
-  "providers": {
-    "https://open.bigmodel.cn/api/coding/paas/v4": {
-      "models": { "glm-5.2": { "context": 1000000 } }
-    },
-    "https://api.anthropic.com": {}
-  }
-}
-```
-
-- 一个 key 在客户端嵌入的 URL 等于它或以它开头时匹配(最长 key 优先)。纯 host key 覆盖该 host 上的所有路径。
-- 空 value `{}` 表示"这个 URL 存在,无覆盖"(context 窗口来自 models.dev / 前缀表)。
-- 删掉你不用的条目;添加其他的(按需)。
-- API key **不**写在这里 —— key 在客户端那边,代理原样透传。
 
 
 
