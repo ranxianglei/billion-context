@@ -826,8 +826,34 @@ const ACP_TAG_MARK = "\x3cacp ";
 // generic-library fallback; this host strips it because the compress tool-call
 // already carries the summary (hideConsumedCompressCalls keeps active-block calls),
 // and a mid-stream insertion would shift the upstream prefix-cache breakpoint.
-function stripKernelSummaries(messages: BiliMessage[]): BiliMessage[] {
-    return messages.filter((m) => !(m.id ?? "").startsWith("acp_summary_"));
+//
+// Kernel >=0.0.32 also keeps the newest two ORPHANED compress pairs visible
+// (KEEP_LAST_ORPHANED=2 — failure observability, billion-context-pi#9). The
+// proxy wants consumed calls OFF the wire: drop orphaned pairs whose result is
+// not a failure. Active-block-linked calls stay (their args carry the live
+// summary); rejected calls stay (the model must see its own failures).
+function stripKernelSummaries(messages: BiliMessage[], state: { blocks: Array<{ active: boolean; compressCallId?: string }> }): BiliMessage[] {
+    const activeCallIds = new Set<string>();
+    for (const b of state.blocks) {
+        if (b.active && b.compressCallId) activeCallIds.add(b.compressCallId);
+    }
+    const compressCallIds = new Set<string>();
+    for (const m of messages) {
+        if (m.contentType === "tool-call" && m.toolName === "compress" && m.toolCallId) compressCallIds.add(m.toolCallId);
+    }
+    const consumedCallIds = new Set<string>();
+    for (const m of messages) {
+        if (m.contentType !== "tool-result" || !m.toolCallId) continue;
+        if (!compressCallIds.has(m.toolCallId)) continue;
+        if (activeCallIds.has(m.toolCallId)) continue;
+        if ((m.text ?? "").includes("FAILED")) continue;
+        consumedCallIds.add(m.toolCallId);
+    }
+    return messages.filter((m) => {
+        if ((m.id ?? "").startsWith("acp_summary_")) return false;
+        if (m.contentType !== "tool-call" && m.contentType !== "tool-result") return true;
+        return !(m.toolCallId && consumedCallIds.has(m.toolCallId));
+    });
 }
 
 function diagTagSummary(messages: CoreMessage[], sessionId: string, strategy: string): string {
@@ -907,7 +933,7 @@ function prepareAnthropic(
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model));
-        processedMessages = stripKernelSummaries(turn.messages);
+        processedMessages = stripKernelSummaries(turn.messages, session.state);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = coreToAnthropic(processedMessages as BiliMessage[], cacheControls);
 
@@ -994,7 +1020,7 @@ function prepareOpenai(
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model));
-        processedMessages = stripKernelSummaries(turn.messages);
+        processedMessages = stripKernelSummaries(turn.messages, session.state);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = coreToOpenai(processedMessages as BiliMessage[]);
 
@@ -1095,7 +1121,7 @@ function prepareResponses(
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model));
-        processedMessages = stripKernelSummaries(turn.messages);
+        processedMessages = stripKernelSummaries(turn.messages, session.state);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltInput = patchResponsesInput(projection, processedMessages);
         if (shouldInject && !process.env.ACP_NO_COMPRESS_PROMPT) {
@@ -1197,7 +1223,7 @@ export function prepareCountTokens(
     try {
         const { msgs, cacheControls } = anthropicToCore(parsed);
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount: session.stats.lastInputTokens, renderTags: "text-only" });
-        const stripped = stripKernelSummaries(turn.messages as BiliMessage[]);
+        const stripped = stripKernelSummaries(turn.messages as BiliMessage[], session.state);
         const rebuiltMessages = coreToAnthropic(stripped, cacheControls);
         log("info", `[${sessionId}] count_tokens pruned: ${msgs.length} → ${stripped.length} msgs`);
         return {
