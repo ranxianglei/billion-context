@@ -32,6 +32,10 @@ import {
     parseCodexToml,
     parseOmpYaml,
     readOmpConfig,
+    parseHermesYaml,
+    readHermesConfig,
+    resolveHermesHome,
+    prepareHermesHome,
     readOpencodeConfig,
     resolveOpencodeConfigFile,
     findFreePort,
@@ -49,6 +53,7 @@ test("isLaunchClient: pi/claude/codex/omp/opencode/pi-test true, others false", 
     assert.equal(isLaunchClient("codex"), true);
     assert.equal(isLaunchClient("omp"), true);
     assert.equal(isLaunchClient("opencode"), true);
+    assert.equal(isLaunchClient("hermes"), true);
     assert.equal(isLaunchClient("pi-test"), true);
     assert.equal(isLaunchClient("start"), false);
     assert.equal(isLaunchClient(""), false);
@@ -824,4 +829,106 @@ test("resolveOpencodeConfigFile: OPENCODE_CONFIG wins, XDG fallback", () => {
     assert.equal(resolveOpencodeConfigFile({ OPENCODE_CONFIG: "/tmp/x.json" }), "/tmp/x.json");
     const p = resolveOpencodeConfigFile({ XDG_CONFIG_HOME: "/tmp/xdg" });
     assert.ok(p.endsWith(path.join("opencode", "opencode.json")));
+});
+
+test("parseHermesYaml: v12 providers dict + legacy custom_providers list", () => {
+    const v12 = parseHermesYaml([
+        "model:",
+        "  default: qwen3.8-27b",
+        "  provider: bili",
+        "providers:",
+        "  bili:",
+        "    name: bili",
+        "    api: http://127.0.0.1:8199/v1",
+        "    transport: openai_chat",
+        "  glm:",
+        "    api: https://open.bigmodel.cn/api/paas/v4",
+    ].join("\n"));
+    assert.equal(v12.providers.bili?.api, "http://127.0.0.1:8199/v1");
+    assert.equal(v12.providers.glm?.api, "https://open.bigmodel.cn/api/paas/v4");
+    assert.deepEqual(v12.providers.bili ?? {}, { api: "http://127.0.0.1:8199/v1" });
+
+    const legacy = parseHermesYaml([
+        "custom_providers:",
+        "  - name: sglang",
+        "    base_url: http://127.0.0.1:8199/v1",
+        "    api_key: sk-x",
+        "  - base_url: http://other:1/v1",
+    ].join("\n"));
+    assert.equal(legacy.providers.sglang?.api, "http://127.0.0.1:8199/v1");
+    assert.equal(legacy.providers["custom-1"]?.api, "http://other:1/v1");
+});
+
+test("readHermesConfig + resolveHermesHome", () => {
+    assert.equal(resolveHermesHome({ HERMES_HOME: "/tmp/hh" }), "/tmp/hh");
+    assert.ok(resolveHermesHome({}).endsWith(path.join(".hermes")));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-cfg-"));
+    try {
+        assert.deepEqual(readHermesConfig(path.join(dir, "nope")).providers, {});
+        fs.writeFileSync(path.join(dir, "config.yaml"), "providers:\n  x:\n    api: http://1.2.3.4:9/v1\n");
+        const cfg = readHermesConfig(dir);
+        assert.equal(cfg.providers.x?.api, "http://1.2.3.4:9/v1");
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("discoverRoutes: hermes wraps http AND https via /bili/ (no MITM domains)", () => {
+    const config: ClientConfig = {};
+    (config as Record<string, unknown>).hermes = {
+        providers: {
+            sglang: { api: "http://127.0.0.1:8199/v1" },
+            glm: { api: "https://open.bigmodel.cn/api/paas/v4" },
+            wrapped: { api: "http://127.0.0.1:8787/bili/https://api.foo.io/v1" },
+            broken: { api: "::::" },
+        },
+    };
+    const routes = discoverRoutes("hermes", config);
+    assert.deepEqual(routes.httpsDomains, []);
+    assert.deepEqual(routes.httpRewrites.map((r) => r.key).sort(), ["glm", "sglang", "wrapped"]);
+    const glm = routes.httpRewrites.find((r) => r.key === "glm");
+    assert.equal(glm?.realUpstream, "https://open.bigmodel.cn/api/paas/v4");
+    const wrapped = routes.httpRewrites.find((r) => r.key === "wrapped");
+    assert.equal(wrapped?.realUpstream, "https://api.foo.io/v1");
+});
+
+test("prepareHermesHome: rewrites api lines, shares siblings, never touches the real home", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-home-"));
+    try {
+        fs.writeFileSync(path.join(dir, "config.yaml"), [
+            "model:",
+            "  default: qwen3.8-27b",
+            "providers:",
+            "  bili:",
+            "    api: http://127.0.0.1:8199/v1  # local sglang",
+            "  glm:",
+            "    api: https://open.bigmodel.cn/api/paas/v4",
+            "custom_providers:",
+            "  - name: legacy",
+            "    base_url: http://10.0.0.5:1234/v1",
+        ].join("\n"));
+        fs.writeFileSync(path.join(dir, "SOUL.md"), "soul");
+        fs.mkdirSync(path.join(dir, "skills"));
+        const original = fs.readFileSync(path.join(dir, "config.yaml"), "utf8");
+
+        const rewrites: HttpRewrite[] = [
+            { key: "bili", realUpstream: "http://127.0.0.1:8199/v1" },
+            { key: "glm", realUpstream: "https://open.bigmodel.cn/api/paas/v4" },
+            { key: "legacy", realUpstream: "http://10.0.0.5:1234/v1" },
+        ];
+        const tmp = prepareHermesHome(dir, "http://127.0.0.1:8787", rewrites);
+        assert.ok(tmp);
+        const txt = fs.readFileSync(path.join(tmp, "config.yaml"), "utf8");
+        assert.ok(txt.includes("api: http://127.0.0.1:8787/bili/http://127.0.0.1:8199/v1  # local sglang"));
+        assert.ok(txt.includes("api: http://127.0.0.1:8787/bili/https://open.bigmodel.cn/api/paas/v4"));
+        assert.ok(txt.includes("base_url: http://127.0.0.1:8787/bili/http://10.0.0.5:1234/v1"));
+        assert.equal(fs.readFileSync(path.join(dir, "config.yaml"), "utf8"), original);
+        assert.equal(fs.readFileSync(path.join(tmp, "SOUL.md"), "utf8"), "soul");
+        assert.ok(fs.lstatSync(path.join(tmp, "skills")).isSymbolicLink());
+        fs.rmSync(tmp, { recursive: true, force: true });
+
+        assert.equal(prepareHermesHome(dir, "http://127.0.0.1:8787", []), undefined);
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
 });
