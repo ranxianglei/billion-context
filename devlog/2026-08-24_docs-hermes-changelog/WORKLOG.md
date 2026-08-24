@@ -39,7 +39,10 @@
   (+omp/+opencode/+hermes rows, claude ride-along note); discovery table
   (+3 rows); new "isolated temp config" subsection; port-reuse note fixed
   per #216 ("always spawns a fresh instance").
-- README.zh-CN.md: launcher client list line.
+- README.zh-CN.md: launcher client list one-liner; follow-up commit added a
+  full 「方式 0 —— 启动器」 chapter (six clients, redirect/CA + discovery
+  tables, isolated-temp-config pattern) and a quickstart bullet
+  (两种方式 → 三种方式).
 - CHANGELOG.md: [Unreleased] += #222 (thinking-replay degraded retry),
   #223 (hermes launcher, under Features), #224 (SSE name-split,
   buffer-to-finish). Backfilled [0.1.41]–[0.1.49] sections with PR numbers
@@ -58,7 +61,7 @@
 
 ## 5. Follow-ups
 
-- README.zh-CN.md has no dedicated launcher section (only the one-liner);
-  a fuller zh translation of the launcher chapter can come later.
+- README.zh-CN.md launcher chapter added in the follow-up commit — done, no
+  longer pending.
 - When PR #225 (v0.1.50) merges, move the [Unreleased] block into
   `[0.1.50] — <merge date>` in the next docs pass.
