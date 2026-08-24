@@ -66,12 +66,8 @@ bili pi --mitm-domain api.foo.com     # 向 MITM 白名单追加域名
 注意,以下客户端需要执行`bili plugin install`以获得原生体验
 ```bash
 bili plugin install pi      # 必需: launcher 对 pi/omp 不注入 MCP,install 是原生工具 + /acp 的唯一途径
-bili plugin install omp     # 必需: 同 pi
-bili plugin install claude  # 可选: 持久 MCP 注册,或 launcher 加 BILI_LAUNCHER_PLUGIN=1 二选一
-bili plugin install codex   # 可选: 同 claude
 ```
 
-opencode 不需要 —— `bili opencode` 启动器自动注入插件;hermes 没有插件 API,装不了。
 
 ### 方式 2 —— 改url(`/bili/` 前缀)
 
