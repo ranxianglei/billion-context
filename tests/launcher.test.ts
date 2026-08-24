@@ -725,12 +725,69 @@ test("prepareOmpHttpRewrite: rewrites matching provider, leaves others, symlinks
         { key: "a", realUpstream: "http://example.com/v1" },
     ], []);
     try {
-        assert.ok(typeof tmp === "string" && tmp.length > 0);
+        assert.equal(tmp, `${home}-bili`);
         const out = fs.readFileSync(path.join(tmp!, "models.yml"), "utf8");
         assert.ok(out.includes("baseUrl: http://127.0.0.1:8787/bili/http://example.com/v1"), "a rewritten");
         assert.ok(out.includes("baseUrl: https://secure.example.com"), "b unchanged");
         assert.equal(fs.lstatSync(path.join(tmp!, "config.yml")).isSymbolicLink(), true);
         assert.equal(fs.realpathSync(path.join(tmp!, "config.yml")), path.join(home, "config.yml"));
+    } finally {
+        if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("prepareOmpHttpRewrite: overlay is stable, refreshes symlinks, keeps bili-created entries", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-"));
+    const modelsYml = ["providers:", "  a:", "    baseUrl: http://example.com/v1"].join("\n");
+    fs.writeFileSync(path.join(home, "models.yml"), modelsYml);
+    fs.mkdirSync(path.join(home, "sessions"));
+    const rw = [{ key: "a", realUpstream: "http://example.com/v1" }];
+    let tmp: string | undefined;
+    try {
+        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
+        assert.equal(tmp, `${home}-bili`);
+        assert.equal(fs.lstatSync(path.join(tmp!, "sessions")).isSymbolicLink(), true);
+        fs.writeFileSync(path.join(tmp!, "agent.db"), "state-created-inside-overlay");
+        const tmp2 = prepareOmpHttpRewrite(home, "http://127.0.0.1:9999", rw, []);
+        assert.equal(tmp2, tmp);
+        assert.equal(fs.readFileSync(path.join(tmp!, "agent.db"), "utf8"), "state-created-inside-overlay");
+        const rewritten = fs.readFileSync(path.join(tmp!, "models.yml"), "utf8");
+        assert.ok(rewritten.includes("baseUrl: http://127.0.0.1:9999/bili/http://example.com/v1"), "port updated");
+        fs.mkdirSync(path.join(home, "memories"));
+        const tmp3 = prepareOmpHttpRewrite(home, "http://127.0.0.1:9999", rw, []);
+        assert.equal(tmp3, tmp);
+        assert.equal(fs.lstatSync(path.join(tmp!, "memories")).isSymbolicLink(), true);
+        const leftovers = fs.readdirSync(tmp!).filter((f) => /^\.models\.yml\.\d+\.tmp$/.test(f));
+        assert.deepEqual(leftovers, [], "no leftover models.yml tmp files");
+    } finally {
+        if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("prepareOmpHttpRewrite: drops dead symlinks and merges shadowed dirs into real home", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-"));
+    const modelsYml = ["providers:", "  a:", "    baseUrl: http://example.com/v1"].join("\n");
+    fs.writeFileSync(path.join(home, "models.yml"), modelsYml);
+    fs.mkdirSync(path.join(home, "sessions"));
+    const rw = [{ key: "a", realUpstream: "http://example.com/v1" }];
+    const overlay = `${home}-bili`;
+    let tmp: string | undefined;
+    try {
+        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
+        fs.symlinkSync(path.join(home, "gone-entry"), path.join(overlay, "gone-entry"));
+        fs.rmSync(path.join(overlay, "sessions"));
+        fs.mkdirSync(path.join(overlay, "sessions"));
+        fs.writeFileSync(path.join(overlay, "sessions", "orphaned.jsonl"), "session-created-under-bili");
+        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
+        assert.equal(fs.existsSync(path.join(overlay, "gone-entry")), false, "dead symlink dropped");
+        assert.equal(fs.lstatSync(path.join(overlay, "sessions")).isSymbolicLink(), true, "shadow dir re-linked");
+        assert.equal(
+            fs.readFileSync(path.join(home, "sessions", "orphaned.jsonl"), "utf8"),
+            "session-created-under-bili",
+            "shadow dir merged into real home",
+        );
     } finally {
         if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
         fs.rmSync(home, { recursive: true, force: true });

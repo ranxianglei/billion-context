@@ -132,9 +132,9 @@ bili pi -- print "hi"                 # args after the client are passed through
 bili pi-test                          # clean pi (extensions off) — proxy owns compression, no double-compress
 bili codex                            # launch codex through the proxy
 bili claude                           # launch claude through the proxy
-bili omp                              # pi-style: MITM env + isolated temp models.yml
+bili omp                              # pi-style: MITM env + persistent overlay home (~/.omp/agent-bili, real config untouched)
 bili opencode                         # MITM for HTTPS + temp opencode.json (/bili/ for HTTP) + thin /acp plugin
-bili hermes                           # no MITM possible (certifi CA) — isolated HERMES_HOME, all traffic /bili/
+bili hermes                           # no MITM possible (certifi CA) — persistent overlay home (~/.hermes-bili), all traffic /bili/
 bili test pi                          # quick end-to-end smoke test of the pi path
 bili pi --mitm-domain api.foo.com     # add a domain to the MITM whitelist
 ```
@@ -177,7 +177,7 @@ How the client is pointed at the proxy (set automatically in the child env):
 | codex       | `HTTPS_PROXY`       | `SSL_CERT_FILE`         |
 | omp         | `HTTPS_PROXY`       | `NODE_EXTRA_CA_CERTS`   |
 | opencode    | `HTTPS_PROXY`       | `NODE_EXTRA_CA_CERTS`   |
-| hermes      | `HERMES_HOME` (temp `config.yaml`, every upstream `/bili/`) | — (no MITM: httpx builds its own CA bundle) |
+| hermes      | `HERMES_HOME` (persistent overlay `~/.hermes-bili`, every upstream `/bili/`) | — (no MITM: httpx builds its own CA bundle) |
 
 `NODE_EXTRA_CA_CERTS` *appends* to the built-in trust store, so it points at
 the MITM root alone (`root-ca.pem`). `SSL_CERT_FILE` *replaces* the default
