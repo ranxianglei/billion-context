@@ -42,10 +42,11 @@ npm install -g billion-context
 
 ## 快速上手
 
-2种方式 —— 任选其一:
+3种方式 —— 任选其一:
 
 - **启动器(最省事):** `bili <client>` 一条命令拉起代理 + 客户端,不碰任何真实配置文件.
 - **改url(持久化):** 在客户端 baseURL 前面加上代理地址 + `/bili/`。
+- **手动配置文件:** 方式 2 的路由不变,只是在配置文件里显式声明 context 窗口(registry 不认识的端点,或想钉死精确值)。
 
 
 
@@ -74,6 +75,15 @@ bili plugin list            # 查看所有支持宿主的安装状态
 bili plugin remove pi       # 卸载(原文件备份为 *.bili-bak,仅一次)
 ```
 
+**什么时候才需要 install?** 压缩功能永远不需要 —— 不装插件,代理也会把四个工具
+(`compress`/`decompress`/`search_context`/`acp_status`)直接注入给模型,压缩照常工作。
+Install 买的是**原生体验**:
+
+- 走**方式 1 启动器**:完全不需要 install。`bili opencode` 自动注入插件;
+  claude/codex 加 `BILI_LAUNCHER_PLUGIN=1` 可得原生 MCP 工具;pi/omp/hermes 走 wire 注入。
+- 走**方式 2 改url**:想要原生工具面板时才 install。pi/omp/opencode 装后还多一个
+  `/acp` 状态命令;claude/codex 是原生 MCP 工具但没有 `/acp`(MCP 协议无斜杠命令);
+  hermes 没有插件 API,只能走 wire。不装的话想看状态,让模型调一次 `acp_status` 即可。
 
 ### 方式 2 —— 改url(`/bili/` 前缀)
 
@@ -346,7 +356,7 @@ bili --no-auto-update        # 本次启动禁用自动更新
 
 ### Providers(按 URL 的 context 覆盖)
 
-路由始终是 `/bili/` 前缀(见[方式 A](#方式-a-零配置bili-前缀))。
+路由始终是 `/bili/` 前缀(见上方「方式 2 —— 改url」)。
 `providers` 块只声明**按 URL 的 context 窗口覆盖**,以上游 URL 为 key。
 key 就是客户端写在 `/bili/` 后面的那个字符串:
 
