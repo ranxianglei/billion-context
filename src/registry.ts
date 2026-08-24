@@ -17,26 +17,29 @@ type RegistryShape = Record<string, ModelEntry>;
 let cache: RegistryShape | null = null;
 let loading: Promise<RegistryShape | null> | null = null;
 
-/** Slim models.dev snapshot committed at src/registry-snapshot.json (refresh
- *  with `npm run registry:snapshot`) and inlined into dist at build time.
- *  Covers the cold-start-forever-offline case: a fresh install with no disk
- *  cache, an unreachable models.dev, and no upstream proxy still resolves
- *  exact per-model windows from the very first request, and the sync
+/** Full models.dev snapshot committed at src/registry-snapshot.json
+ *  (refresh with `npm run registry:snapshot`) and inlined into dist at build
+ *  time — the ENTIRE registry (all fields models.dev ships: name,
+ *  description, reasoning, tool_call, modalities, limits, benchmarks, …),
+ *  not a projection. Today only limit.context is consumed; the rest rides
+ *  along so future features get the offline floor for free. Covers the
+ *  cold-start-forever-offline case: a fresh install with no disk cache, an
+ *  unreachable models.dev, and no upstream proxy still resolves exact
+ *  per-model windows from the very first request, and the sync
  *  peekRegistryContext path is pre-warmed before any async fetch runs. */
-type SnapshotShape = { fetchedAt?: unknown; models?: Record<string, unknown> };
+type SnapshotShape = { fetchedAt?: unknown; models?: Record<string, ModelEntry> };
 let snapshotReg: RegistryShape | null = null;
 let snapshotMs = 0;
 function bundledSnapshotRegistry(): RegistryShape | null {
     if (snapshotReg) return snapshotReg;
     const snap = bundledSnapshot as SnapshotShape;
     if (!snap || typeof snap !== "object" || !snap.models || typeof snap.models !== "object") return null;
-    const reg: RegistryShape = {};
-    for (const [k, v] of Object.entries(snap.models)) {
-        if (typeof v === "number" && v > 0) reg[k] = { limit: { context: v } };
-    }
+    // Full entries are structurally valid ModelEntry (extra fields beyond
+    // the declared shape ride along harmlessly — registryLookup only reads
+    // limit.context and validates it at lookup time).
+    snapshotReg = snap.models;
     const ts = typeof snap.fetchedAt === "string" ? Date.parse(snap.fetchedAt) : NaN;
     snapshotMs = Number.isFinite(ts) ? ts : 0;
-    snapshotReg = reg;
     return snapshotReg;
 }
 // Pre-warm the sync peek path with the bundled snapshot. loadRegistry still
@@ -234,6 +237,12 @@ export async function contextFromRegistry(model: string, host?: string): Promise
  *  warms the cache for subsequent requests. */
 export function peekRegistryContext(model: string, host?: string): number | undefined {
     return registryLookup(cache, model, host);
+}
+
+/** Test-only escape hatch: raw access to the bundled snapshot registry
+ *  (for asserting the snapshot ships full entries, not projections). */
+export function bundledRegistryForTestsOnly(): RegistryShape | null {
+    return bundledSnapshotRegistry();
 }
 
 /** Lookup against the bundled build-time snapshot ONLY — never the runtime

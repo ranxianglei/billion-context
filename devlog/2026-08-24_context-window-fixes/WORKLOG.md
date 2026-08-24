@@ -102,3 +102,31 @@ Offline verification (no proxy env, disk cache deleted, fresh process):
   peek MiniMax-M2.1@api.minimax.chat  → 204,800
   unknown model                        → undefined (no guessing)
 typecheck ✅ · 544/544 ✅ · build ✅ (dist 2.27 MB)
+
+## Follow-up 3: full models.dev registry bundled (2026-08-24)
+
+User asked whether the snapshot covers ALL of models.dev — it covered only
+`limit.context` (12KB / 351 models). Directive: cache the ENTIRE models.dev
+content, hard-coded into the package.
+
+- `scripts/update-registry-snapshot.mjs` now writes the full registry:
+  `{fetchedAt, count, models: <entire models.dev object>}` — 282KB / 355
+  models with every field (name, description, family, attachment,
+  reasoning, tool_call, temperature, knowledge, release_date,
+  last_updated, modalities, open_weights, limit.context/output/input,
+  weights, benchmarks, ...).
+- `src/registry.ts`: `bundledSnapshotRegistry()` uses `snap.models` directly —
+  full entries are structurally valid ModelEntry, extra fields ride along
+  harmlessly (registryLookup still only reads `limit.context`, validated at
+  lookup time). Added `bundledRegistryForTestsOnly()` escape hatch.
+- New test: "bundled snapshot carries the FULL models.dev entry" — guards
+  >=350 entries with >=300 having family / limit.output / reasoning+tool_call
+  booleans, so a future slimming regression fails CI.
+- dist grew 2.27MB -> 2.55MB (esbuild inlines the JSON as an object literal;
+  verified `MiniMax-M2.1` + tool_call/benchmarks present).
+- Offline re-verified (no proxy, no disk cache, fresh process):
+  deepseek-chat -> 1,000,000 · MiniMax-M2.1 -> 204,800 · unknown -> undefined.
+- Future features (pricing, modality checks, reasoning/tool_call flags) get
+  the offline floor for free — today only limit.context is consumed.
+
+typecheck ✅ · 545/545 ✅ · build ✅ (dist 2.55 MB)

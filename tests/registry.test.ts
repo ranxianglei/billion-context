@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { contextFromRegistry, peekRegistryContext, providerFromHost, newerFallback, bundledSnapshotLookup, _resetForTest, _setForTest } from "../src/registry.ts";
+import { contextFromRegistry, peekRegistryContext, providerFromHost, newerFallback, bundledSnapshotLookup, bundledRegistryForTestsOnly, _resetForTest, _setForTest } from "../src/registry.ts";
 
 test("providerFromHost maps minimax domains", () => {
     assert.equal(providerFromHost("api.minimax.chat"), "minimax");
@@ -65,6 +65,27 @@ test("bundled snapshot ships real data and resolves known models", () => {
     assert.ok(typeof minimax === "number" && minimax >= 200_000, `MiniMax-M2.1 expected >=200k, got ${minimax}`);
     // Unknown model must miss (no bogus 200k-style guessing).
     assert.equal(bundledSnapshotLookup("totally-custom-model-x", "api.deepseek.com"), undefined);
+});
+
+test("bundled snapshot carries the FULL models.dev entry, not just context", () => {
+    // The snapshot is the entire registry: future features (pricing,
+    // modality checks, reasoning/tool_call flags) get the offline floor for
+    // free. Guard against accidentally slimming it back down to numbers.
+    const snap = (bundledRegistryForTestsOnly() ?? {}) as Record<string, { family?: unknown; reasoning?: unknown; tool_call?: unknown; limit?: { context?: unknown; output?: unknown } }>;
+    const keys = Object.keys(snap);
+    assert.ok(keys.length >= 350, `expected the full registry (>=350), got ${keys.length}`);
+    let withFamily = 0;
+    let withOutput = 0;
+    let withBoolFlags = 0;
+    for (const k of keys) {
+        const e = snap[k];
+        if (typeof e.family === "string") withFamily++;
+        if (typeof e.limit?.output === "number") withOutput++;
+        if (typeof e.reasoning === "boolean" && typeof e.tool_call === "boolean") withBoolFlags++;
+    }
+    assert.ok(withFamily >= 300, `family field missing on most entries (${withFamily}/${keys.length}) — snapshot slimmed?`);
+    assert.ok(withOutput >= 300, `limit.output missing on most entries (${withOutput}/${keys.length}) — snapshot slimmed?`);
+    assert.ok(withBoolFlags >= 300, `reasoning/tool_call booleans missing on most entries (${withBoolFlags}/${keys.length}) — snapshot slimmed?`);
 });
 
 test("newerFallback picks the newer source, tolerating missing sides", () => {

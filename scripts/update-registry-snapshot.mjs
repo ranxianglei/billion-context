@@ -1,11 +1,14 @@
 #!/usr/bin/env node
 /** Refresh src/registry-snapshot.json from models.dev.
 
-The slim snapshot is committed to the repo and bundled into dist at build
-time, so a fresh install on a network where models.dev is unreachable (and
-no upstream proxy is configured) still resolves exact model context windows
-on the very first request — the hand-written CONTEXT_LIMIT_TABLE regex
-fallback only has to cover custom/renamed models.
+The FULL registry is committed to the repo and bundled into dist at build
+-time (hard-coded into the code), so a fresh install on a network where
+models.dev is unreachable (and no upstream proxy is configured) still has
+the entire dataset — every field models.dev ships (name, description,
+family, reasoning, tool_call, modalities, limits, benchmarks, …), not just
+context windows. Today only limit.context is consumed; future features
+(pricing, provider metadata, modality checks) get the offline floor for
+free.
 
 Run manually or before a release:
     npm run registry:snapshot
@@ -57,12 +60,7 @@ try {
     process.exit(1);
 }
 
-const models = {};
-for (const [key, entry] of Object.entries(full)) {
-    const ctx = entry?.limit?.context;
-    if (typeof ctx === "number" && ctx > 0) models[key] = ctx;
-}
-const slim = { fetchedAt: new Date().toISOString(), count: Object.keys(models).length, models };
+const slim = { fetchedAt: new Date().toISOString(), count: Object.keys(full).length, models: full };
 const body = JSON.stringify(slim) + "\n";
 await writeFile(OUT_FILE, body, "utf8");
-console.log(`wrote ${OUT_FILE} (${slim.count} models, ${(body.length / 1024).toFixed(1)} KB)`);
+console.log(`wrote ${OUT_FILE} (${slim.count} models, FULL registry, ${(body.length / 1024).toFixed(1)} KB)`);
