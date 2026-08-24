@@ -63,7 +63,6 @@ bili opencode                         # HTTPS 走 MITM + 临时 opencode.json(HT
 bili hermes                           # 无法 MITM(certifi CA)—— 隔离 HERMES_HOME,全部流量 /bili/
 bili pi --mitm-domain api.foo.com     # 向 MITM 白名单追加域名
 ```
-todo 补充什么情况下需要bili plugin install才能获得原生体验
 
 ```bash
 bili plugin install pi      # 把本 billion-context 安装加进 pi 的 settings.json(packages)
