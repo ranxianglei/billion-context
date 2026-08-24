@@ -84,7 +84,7 @@ function piSettingsFile(): string {
 // billion-context-pi package (0.1.x shipped as a separate package before the
 // plugin moved into billion-context itself). install() replaces every match
 // so exactly one bili plugin is live after `bili plugin install pi`.
-function isPiEntry(entry: string, root: string): boolean {
+export function isPiEntry(entry: string, root: string): boolean {
     return entry === root
         || /^npm:billion-context(-pi)?(@|$)/.test(entry)
         || /(^|[/\\])node_modules[/\\]billion-context(-pi)?([\/\\]|$)/.test(entry)

@@ -32,7 +32,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, type StdioOptions } from "node:child_process";
 import { DEFAULT_MITM_DOMAINS } from "./mitm.js";
-import { selfPackageRoot } from "./plugin-install.js";
+import { selfPackageRoot, isPiEntry } from "./plugin-install.js";
 
 /** Absolute path of a file inside our dist/, resolved via the package root
  * (import.meta.url-based) so it survives global-installed symlink bins
@@ -407,6 +407,21 @@ export function buildCodexMcpArgs(origin: string, conversationId: string): strin
         "-c",
         `mcp_servers.bili.env.BILI_CONVERSATION_ID=${JSON.stringify(conversationId)}`,
     ];
+}
+
+/** True when the real pi settings.json already loads a bili plugin entry —
+ *  in that case the launcher must NOT add `-e dist/agent/pi.js` on top (pi
+ *  keeps both loaded and same-name tools/commands clash). */
+function piPluginInstalled(piHome: string): boolean {
+    const root = selfPackageRoot();
+    if (!root) return false;
+    try {
+        const parsed = JSON.parse(fs.readFileSync(path.join(piHome, "settings.json"), "utf8")) as { packages?: unknown };
+        const list = Array.isArray(parsed.packages) ? parsed.packages.map(String) : [];
+        return list.some((p) => isPiEntry(p, root));
+    } catch {
+        return false;
+    }
 }
 
 export function preparePiHttpRewrite(
@@ -906,6 +921,15 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         env = buildPiEnv(origin, ca, process.env);
         piTmpHome = preparePiHttpRewrite(resolvePiHome(process.env), origin, routes.httpRewrites, routes.httpsRewrites);
         if (piTmpHome) env.PI_CODING_AGENT_DIR = piTmpHome;
+        // Native tooling out of the box: when the user has NOT installed the
+        // plugin, ride pi's `-e <file>` (loads for this run only, writes
+        // nothing) instead of leaving them on wire-mode fallback. When they
+        // HAVE installed it, settings.json (symlinked into the tmp home)
+        // already loads it — adding `-e` too would double-register.
+        const piExt = selfDistFile("agent/pi.js");
+        if (piExt && fs.existsSync(piExt) && !piPluginInstalled(resolvePiHome(process.env))) {
+            clientArgs = ["-e", piExt, ...clientArgs];
+        }
     } else if (base === "omp") {
         // omp is pi-based: same env as pi (HTTPS_PROXY + CA + BILLION_CONTEXT_PROXY);
         // the /bili/ rewrite rides an isolated PI_CODING_AGENT_DIR (real models.yml untouched).

@@ -39,6 +39,23 @@
   - round 1 wire 注入（设计内：toolsReady 竞态守卫），真实工具调用后的第二个请求
     盖上 `x-bili-plugin: pi` + conversation id + context-window=1000000 → 插件原生接管 ✓
 
+## Follow-up 2: `bili pi` 原生体验开箱即用（-e 注入，无需先 install）
+
+用户确认目标：其他客户端 `bili omp`/`bili opencode` 都开箱即原生，pi 是唯一要手动
+install 的缺口。补齐：
+
+- `src/launcher.ts` pi 分支：未 install 时给 clientArgs 前置 `pi -e <selfDistFile("agent/pi.js")>`
+  （pi 官方开关，仅本次运行加载扩展，不写 settings.json）；已 install 则不加
+  （互斥——pi 按解析后路径做扩展身份，install 条目（包根）与 -e（文件）路径不同，
+  同时加载会双份注册同名工具/命令，必须二选一）。新增 `piPluginInstalled()` helper，
+  复用与 install 相同的 `isPiEntry` 判定。
+- `src/plugin-install.ts`：`isPiEntry` 改 export。
+- `tests/launcher.test.ts` 新增 "runLaunch pi: native -e plugin injected only when not
+  installed"（未装→args 前两项 `[-e, dist/agent/pi.js]`；已装→无 `-e`）。踩坑：
+  makeFakeChild 不触发 exit 事件，runClient 的 promise 永不 resolve→测试挂起；
+  需包一层 on，注册 exit listener 后 setTimeout 异步触发；代理子进程保持原样。
+- 全量 516/516 ✅，typecheck ✅，build ✅（dist/index.js 2.45MB）。
+
 ## Windows 验证（win10-vm，Node 22.23.2 / npm 10.9.8 / pi 0.84.1 / GLM）
 
 | 步骤 | 结果 |
