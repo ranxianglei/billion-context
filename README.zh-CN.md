@@ -44,38 +44,25 @@ npm install -g billion-context
 
 三种方式 —— 任选其一:
 
-- **启动器(最省事):** `bili <client>` 一条命令拉起代理 + 客户端,不碰任何真实配置文件(见下方「方式 0」)。
-- **零配置(最简单):** 在客户端 baseURL 前面加上代理地址 + `/bili/`。无需配置文件 —— context 窗口自动从 [models.dev](https://models.dev) registry 查询。`/bili/` 前缀还是个自检测信号:billion-context 的客户端扩展(billion-context-pi / opencode-acp)能在自己的 baseUrl 里认出它并自禁用,避免双层压缩。
-- **显式 context 窗口覆盖:** 在配置文件(或网页)里按 URL 声明 context 窗口,用于 registry 不认识的端点,或想钉死一个精确值的场景。两种方式路由都是同一个 `/bili/` 前缀 —— 配置只改变代理用哪个 context 窗口。
+- **启动器(最省事):** `bili <client>` 一条命令拉起代理 + 客户端,不碰任何真实配置文件.
+- **改url(持久化):** 在客户端 baseURL 前面加上代理地址 + `/bili/`。
 
-### Agent 插件模式(内外呼应)
 
-想要原生插件体验,可以在 agent 内部装一个配合代理的插件:插件把四个
-ACP 工具(`compress` / `decompress` / `search_context` / `acp_status`)
-原生注册进 agent、由 agent 自己的工具循环驱动,而代理仍然是压缩引擎
-(状态、历史折叠、压缩哲学 prompt、nudge 全归代理)。工具 schema 由
-代理统一下发(`GET /__bili/plugin/manifest`),插件与代理永远不会版本
-漂移。协议规范见 [PLUGIN.md](PLUGIN.md)。带插件的会话通过请求头自动
-识别 —— 该会话的 wire 层工具注入自动关闭(不会双重压缩,工具体验原生)。
-两种代理模式都支持:`/bili/` 前缀 baseURL **和 MITM 透明模式** ——
-launcher(`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode` / `bili hermes`)会导出
-`BILLION_CONTEXT_PROXY` 供插件检测;插件还可以上报 agent 自己的模型
-上下文窗口(`x-bili-plugin-context-window`),并通过
-`GET /__bili/plugin/status` 读取实时上下文水位。
 
-压缩是自动注入的 —— 你只需配置路由,无需配置压缩本身。
+### 方式 1 —— 启动器(`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode` / `bili hermes`)
 
-安装插件是**可选的** —— 不装的话,所有客户端(包括 hermes)照样拿到代理
-wire 注入的四个工具,压缩照常工作;装了只是把工具体验升级为原生工具。
-插件**内置于 billion-context 自身**,无需单独安装包:pi、omp 是原生
-agent 插件(`dist/agent/*.js`),claude、codex、opencode 是 MCP 桥
-(`dist/mcp.js`,底层协议相同)。hermes 没有插件 API,始终走 wire 注入工具。
+启动器把客户端包进一条命令:在独立端口拉起一个代理(总是全新实例,绝不复用端口),再按客户端支持的机制把它指向代理 —— 能吃代理/CA 环境变量的走**证书 MITM**,不吃的走隔离的**`/bili/` 配置重写**。真实配置文件从不被修改;客户端自己的配置只被**读取**,用来发现它实际连接的 HTTPS 上游主机,把这些主机加入 MITM 白名单 —— 代理只 TLS 终结它们,其余流量盲透传。
 
-各宿主从插件得到什么:**pi / omp / opencode** 会把四个工具原生注册,**并**
-新增 `/acp` 状态命令;**claude / codex**(MCP 桥)拿到的是原生 MCP 工具,但
-**没有 `/acp` 斜杠命令**(MCP 协议没有这个概念)。不装插件压缩效果完全
-相同 —— 只是客户端 UI 不会列出这些工具;想看状态面板,可以让模型调一次
-`acp_status` 贴在对话里。
+```bash
+bili pi                               # 拉起 pi,走代理
+bili codex                            # 拉起 codex
+bili claude                           # 拉起 claude
+bili omp                              # pi 同款 MITM 环境变量 + 隔离临时 models.yml
+bili opencode                         # HTTPS 走 MITM + 临时 opencode.json(HTTP 走 /bili/)+ 轻量 /acp 插件
+bili hermes                           # 无法 MITM(certifi CA)—— 隔离 HERMES_HOME,全部流量 /bili/
+bili pi --mitm-domain api.foo.com     # 向 MITM 白名单追加域名
+```
+todo 补充什么情况下需要bili plugin install才能获得原生体验
 
 ```bash
 bili plugin install pi      # 把本 billion-context 安装加进 pi 的 settings.json(packages)
@@ -87,63 +74,8 @@ bili plugin list            # 查看所有支持宿主的安装状态
 bili plugin remove pi       # 卸载(原文件备份为 *.bili-bak,仅一次)
 ```
 
-装上的插件非常**薄**(~5 KB,零运行时依赖):只负责探测代理(通过 `/bili/`
-baseURL 或 `BILLION_CONTEXT_PROXY`)、从代理拉取工具 schema、注册原生工具
-并转发执行 —— 代理始终是唯一压缩引擎,插件与代理版本永远匹配。彻底
-关闭:`BILLION_CONTEXT_PLUGIN=0`。
 
-走 launcher 时完全不需要 `plugin install`:`bili opencode` 自动注入插件
-(临时 `OPENCODE_CONFIG`),claude/codex 用 `BILI_LAUNCHER_PLUGIN=1` 拿到
-MCP 壳,pi/omp/hermes 走 wire 注入工具。
-
-### 方式 0 —— 启动器(`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode` / `bili hermes`)
-
-启动器把客户端包进一条命令:在独立端口拉起一个代理(总是全新实例,绝不复用端口),再按客户端支持的机制把它指向代理 —— 能吃代理/CA 环境变量的走**证书 MITM**,不吃的走隔离的**`/bili/` 配置重写**。真实配置文件从不被修改;客户端自己的配置只被**读取**,用来发现它实际连接的 HTTPS 上游主机,把这些主机加入 MITM 白名单 —— 代理只 TLS 终结它们,其余流量盲透传。
-
-```bash
-bili pi                               # 拉起 pi,走代理
-bili pi -- print "hi"                 # -- 之后的参数透传给客户端
-bili pi-test                          # 干净 pi(关扩展)—— 压缩全归代理,不会双层压缩
-bili codex                            # 拉起 codex
-bili claude                           # 拉起 claude
-bili omp                              # pi 同款 MITM 环境变量 + 隔离临时 models.yml
-bili opencode                         # HTTPS 走 MITM + 临时 opencode.json(HTTP 走 /bili/)+ 轻量 /acp 插件
-bili hermes                           # 无法 MITM(certifi CA)—— 隔离 HERMES_HOME,全部流量 /bili/
-bili test pi                          # pi 路径的端到端快速自检
-bili pi --mitm-domain api.foo.com     # 向 MITM 白名单追加域名
-```
-
-客户端如何被指向代理(自动注入子进程环境变量):
-
-| 客户端      | 重定向方式      | CA 信任环境变量        |
-|-------------|---------------------|-------------------------|
-| pi          | `HTTPS_PROXY`       | `NODE_EXTRA_CA_CERTS`   |
-| claude      | `HTTPS_PROXY`(undici 忽略它 → 改设 `ANTHROPIC_BASE_URL` 走 `/bili/`) | `NODE_EXTRA_CA_CERTS` |
-| codex       | `HTTPS_PROXY`       | `SSL_CERT_FILE`         |
-| omp         | `HTTPS_PROXY`       | `NODE_EXTRA_CA_CERTS`   |
-| opencode    | `HTTPS_PROXY`       | `NODE_EXTRA_CA_CERTS`   |
-| hermes      | `HERMES_HOME`(临时 `config.yaml`,所有上游 `/bili/`) | —(无 MITM:httpx 自建 CA bundle) |
-
-真实上游 HTTPS 主机(只读)发现来源:
-
-| 客户端      | 读取路径                                    |
-|-------------|----------------------------------------------|
-| Pi          | `~/.pi/agent/models.json` —— 各 provider 的 `baseUrl` |
-| Codex       | `~/.codex/config.toml` —— 各 `[model_providers.<name>]` 的 `base_url`(+顶层 `openai_base_url`) |
-| Claude Code | 硬编码 `api.anthropic.com`(无按配置的上游) |
-| omp         | `~/.omp/agent/models.yml` —— 各 provider 的 `baseUrl` |
-| opencode    | `~/.config/opencode/opencode.json` —— 各 provider 的 `options.baseURL` |
-| hermes      | `~/.hermes/config.yaml` —— 各 provider 的 `api:`/`base_url:` 端点 |
-
-环境变量搞不定的客户端,启动器会写一份**隔离的临时配置副本**(发现的上游重写后指向代理),再把客户端指过去 —— 真实配置从不被碰,客户端退出后临时目录自动清理:
-
-- **pi / omp** —— 隔离的 `PI_CODING_AGENT_DIR`,`models.json` / `models.yml` 里 HTTP 上游重写为 `/bili/` 形式(HTTPS 上游照走证书 MITM;真实 home 里的其余文件全部符号链接透传)。
-- **opencode** —— `OPENCODE_CONFIG` 指向一份完整 `opencode.json` 副本:HTTP 上游重写为 `/bili/`,并追加轻量 `bili` `/acp` 状态插件(`BILLION_CONTEXT_PROXY` 让宿主侧 opencode-acp 插件自禁用,压缩归代理)。
-- **hermes** —— 证书 MITM 不可能(httpx 用 certifi 自建 CA bundle,忽略 `SSL_CERT_FILE`),所以**所有**上游都重写为 `/bili/` 形式,放进隔离的 `HERMES_HOME`(`config.yaml` 副本;skills/memories/sessions 通过符号链接保持共享)。
-
-> **注:** 启动器的生命周期与客户端绑定 —— 客户端退出时,它拉起的代理随之停止。每次 `bili <client>` 都会拉起自己的全新代理实例,绝不复用同端口上已有的代理。
-
-### 方式 A —— 零配置(`/bili/` 前缀)
+### 方式 2 —— 改url(`/bili/` 前缀)
 
 启动代理:
 
@@ -246,7 +178,7 @@ MITM 默认开启,且只对一份 **白名单**中的模型域名(`open.bigmodel
 
 **给登录客户端单独配代理(防火墙/GFW)。** 登录客户端(ZCode)和 API-key 客户端可能连同一个域名(`open.bigmodel.cn`)。要给登录客户端配**专属上游代理**而不影响 API-key 客户端,用 `mitm://` scheme 键 —— 见[上游代理(MITM 与 `/bili/`)](#上游代理防火墙gfw)。
 
-### 方式 B 手动配置文件&设置上下文大小
+### 方式 3 手动配置文件&设置上下文大小
 
 打开 `~/.config/billion-context/billion-context.json`,编辑 `providers` 块。
 **key 就是上游 URL** —— 客户端写在 `/bili/` 后面的那个字符串。value 为该
@@ -269,9 +201,6 @@ URL 声明按模型的 context 窗口:
 - API key **不**写在这里 —— key 在客户端那边,代理原样透传。
 
 
-### 方式C 网页配置&设置上下文大小
-
-打开 [http://localhost:8787/__bili/](http://localhost:8787/__bili/) 进行配置。
 
 ### 验证
 
