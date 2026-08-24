@@ -32,32 +32,44 @@
 billion-context/
 ├── src/
 │   ├── index.ts                  # Entry: runs cli.ts main()
-│   ├── cli.ts                    # CLI dispatcher: start/update/version/help
+│   ├── cli.ts                    # CLI dispatcher: start/update/export/test/plugin + client launchers
 │   ├── server.ts                 # HTTP proxy server, request pipeline
 │   ├── config.ts                 # Config loading (file + env + CLI flags)
 │   ├── logger.ts                 # Tee logger: file (~/.local/state/) + stderr
 │   ├── paths.ts                  # XDG paths (config/cache/state dirs)
 │   ├── session.ts                # Session model + in-memory store
 │   ├── session-id.ts             # Session ID generation
-│   ├── message-id.ts             # Message ref ID generation
-│   ├── persist.ts                # On-disk session persistence
+│   ├── persist.ts                # On-disk session persistence (kernel StateStore)
 │   ├── update.ts                 # Auto-update: checks npm, auto-installs latest
+│   ├── launcher.ts               # `bili <client>` launchers (pi/codex/claude/omp/opencode/hermes)
+│   ├── client-config.ts          # READ-only discovery of each client's upstream config
+│   ├── mitm.ts / ca.ts           # Cert-MITM proxying + lazily generated root CA
+│   ├── mcp.ts                    # Plugin-in-launcher MCP shell (spawn-time injection)
+│   ├── plugin.ts / plugin-install.ts # Cooperative plugin protocol + `bili plugin install`
+│   ├── registry.ts               # models.dev context-window registry (snapshot-first)
+│   ├── registry-snapshot.json    # Bundled full models.dev snapshot (offline floor)
+│   ├── upstream-proxy.ts         # undici ProxyAgent routing (https_proxy for registry fetch)
 │   ├── stream.ts                 # SSE stream utilities + tag patching
 │   ├── stream-openai.ts          # OpenAI-format stream processing
 │   ├── stream-responses.ts       # Responses-API stream processing
 │   ├── stream-error.ts           # Stream error handling
 │   ├── sse-util.ts               # SSE parsing helpers
+│   ├── loop/                     # Unified compress loop (wire-agnostic core)
+│   │   ├── core.ts               #   protocol-neutral event model + tool adjudication
+│   │   ├── adapter-anthropic.ts  #   Anthropic wire adapter (buffer-to-finish tool calls)
+│   │   ├── adapter-openai.ts     #   OpenAI chat adapter (buffer-to-finish, raw passthrough)
+│   │   └── adapter-responses.ts  #   Responses API adapter
 │   ├── compress-loop.ts          # Compress loop (OpenAI chat format)
 │   ├── compress-loop-responses.ts # Compress loop (Responses API format)
-│   ├── compress-tool.ts          # compress tool parsing
+│   ├── compress-settings.ts      # Three-level compress config merge
+│   ├── compress-tool.ts          # compress tool parsing (kernel parseCompressArgs)
 │   ├── decompress-shared.ts      # Shared decompress logic
 │   ├── orphan-gc.ts              # Orphaned block cleanup
-│   ├── anthropic.ts              # Anthropic adapter helpers
-│   ├── openai.ts                 # OpenAI adapter helpers
-│   ├── responses.ts              # Responses API helpers
+│   ├── agent/                    # Thin agent-side plugins (pi/omp/opencode)
+│   ├── web/                      # Web UI (config + context windows)
 │   ├── fetch-util.ts             # HTTP fetch with timeout
 │   └── util.ts                   # Misc utilities
-├── tests/                        # 16 test files, 141 tests
+├── tests/                        # 66 test files
 ├── tsup.config.ts
 └── package.json
 ```
