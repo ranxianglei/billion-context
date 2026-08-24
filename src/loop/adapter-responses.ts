@@ -1,6 +1,8 @@
 import type { CoreMessage } from "acp-kernel";
 import { coreToResponses, injectResponsesDeveloperMessage, patchResponsesInput, type ResponseInputItem, type ResponsesProjection } from "acp-kernel/wire";
 import { buildVisibilityMarker } from "../compress-loop.js";
+import { createTagEchoFilter, stripResponsesText } from "./tag-echo-filter.js";
+import { log as loggerLog } from "../logger.js";
 import { ACP_TEXT_OPEN, ACP_TEXT_CLOSE, ACP_STATUS_OPEN, ACP_STATUS_CLOSE, ACP_SEARCH_OPEN, ACP_SEARCH_CLOSE, ACP_DECOMPRESS_OPEN, ACP_DECOMPRESS_CLOSE, COMPRESS_TOOL_NAME, PROXY_TOOL_NAMES } from "../compress-tool.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import type {
@@ -30,6 +32,10 @@ function rewriteItemEvent(type: string, obj: Record<string, unknown>, mapped: Ma
 
 function rewriteRefEvent(type: string, obj: Record<string, unknown>, mapped: MappedItem): Buffer {
     return Buffer.from(`event: ${type}\ndata: ${JSON.stringify({ ...obj, item_id: mapped.id, output_index: mapped.index })}\n\n`, "utf8");
+}
+
+function rebuildResponsesEvent(type: string, obj: Record<string, unknown>): Buffer {
+    return Buffer.from(`event: ${type}\ndata: ${JSON.stringify(obj)}\n\n`, "utf8");
 }
 
 async function* iterSseEvents(stream: ReadableStream<Uint8Array>): AsyncGenerator<string> {
@@ -177,6 +183,22 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
         async *parseStream(upstream, round) {
             const pending = new Map<string, FunctionCallBuffer>();
             const remapped = new Map<string, MappedItem>();
+            // #206: render-tag echo filter — deltas stream through the filter;
+            // full-text events (.done / output_item.done / completed response)
+            // are stripped wholesale via stripResponsesText.
+            const tagFilter = createTagEchoFilter((snippet) => {
+                loggerLog("warn", `[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+            });
+            let lastTextRef: { itemId: string; outputIndex: number } | null = null;
+            const flushFilter = function* (): Generator<ParsedStreamEvent> {
+                const tail = tagFilter.flush();
+                if (tail.length > 0) {
+                    const raw = lastTextRef
+                        ? rebuildResponsesEvent("response.output_text.delta", { type: "response.output_text.delta", item_id: lastTextRef.itemId, output_index: lastTextRef.outputIndex, delta: tail })
+                        : undefined;
+                    yield { kind: "text", delta: tail, ...(raw ? { raw } : {}) } as ParsedStreamEvent;
+                }
+            };
             for await (const eventStr of iterSseEvents(upstream)) {
                 const type = extractEventType(eventStr);
                 const dataLine = extractDataLine(eventStr);
@@ -226,20 +248,26 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                 ) {
                     const mapped = remapped.get(typeof obj.item_id === "string" ? obj.item_id : "");
                     if (mapped) {
-                        yield { kind: "meta", chunk: rewriteRefEvent(type, obj, mapped), firstRoundOnly: false } as ParsedStreamEvent;
+                        yield { kind: "meta", chunk: rewriteRefEvent(type, stripResponsesText(obj), mapped), firstRoundOnly: false } as ParsedStreamEvent;
                     } else if (!suppressTextLifecycle) {
-                        yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
+                        yield { kind: "meta", chunk: rebuildResponsesEvent(type, stripResponsesText(obj)), firstRoundOnly: true } as ParsedStreamEvent;
                     }
                 } else if (type === "response.output_text.delta") {
                     const delta = typeof obj.delta === "string" ? obj.delta : "";
                     if (delta.length > 0) {
-                        const mapped = remapped.get(typeof obj.item_id === "string" ? obj.item_id : "");
-                        if (mapped) {
-                            yield { kind: "text", delta, raw: rewriteRefEvent(type, obj, mapped) } as ParsedStreamEvent;
-                        } else if (round === 1) {
-                            yield { kind: "text", delta, raw: rawBuf } as ParsedStreamEvent;
-                        } else {
-                            yield { kind: "text", delta } as ParsedStreamEvent;
+                        const itemId = typeof obj.item_id === "string" ? obj.item_id : "";
+                        const outputIndex = typeof obj.output_index === "number" ? obj.output_index : 0;
+                        const mapped = remapped.get(itemId);
+                        lastTextRef = { itemId: mapped ? mapped.id : itemId, outputIndex: mapped ? mapped.index : outputIndex };
+                        const clean = tagFilter.push(delta);
+                        if (clean.length > 0) {
+                            if (mapped) {
+                                yield { kind: "text", delta: clean, raw: rewriteRefEvent(type, { ...obj, delta: clean }, mapped) } as ParsedStreamEvent;
+                            } else if (round === 1) {
+                                yield { kind: "text", delta: clean, raw: rebuildResponsesEvent(type, { ...obj, delta: clean }) } as ParsedStreamEvent;
+                            } else {
+                                yield { kind: "text", delta: clean } as ParsedStreamEvent;
+                            }
                         }
                     }
                 } else if (type === "response.function_call_arguments.delta") {
@@ -285,15 +313,16 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                         const mapped = remapped.get(origId);
                         if (mapped) {
                             remapped.delete(origId);
-                            yield { kind: "meta", chunk: rewriteItemEvent(type, obj, mapped), firstRoundOnly: false } as ParsedStreamEvent;
+                            yield { kind: "meta", chunk: rewriteItemEvent(type, stripResponsesText(obj), mapped), firstRoundOnly: false } as ParsedStreamEvent;
                         } else if (!suppressTextLifecycle) {
-                            yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
+                            yield { kind: "meta", chunk: rebuildResponsesEvent(type, stripResponsesText(obj)), firstRoundOnly: true } as ParsedStreamEvent;
                         }
                     } else if (item?.type !== "message" || !suppressTextLifecycle) {
                         yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
                     }
                 } else if (type === "response.completed") {
-                    responseObj = (obj.response as Record<string, unknown>) ?? null;
+                    yield* flushFilter();
+                    responseObj = stripResponsesText((obj.response as Record<string, unknown>) ?? null);
                     terminalKind = "completed";
                     terminalRaw = null;
                     const respUsage = (responseObj as Record<string, unknown> | null)?.usage as
@@ -308,10 +337,12 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                     } as ParsedStreamEvent;
                     yield { kind: "done", finishReason: "completed" } as ParsedStreamEvent;
                 } else if (type === "response.incomplete") {
+                    yield* flushFilter();
                     terminalKind = "incomplete";
                     terminalRaw = rawBuf;
                     yield { kind: "done", finishReason: "incomplete" } as ParsedStreamEvent;
                 } else if (type === "response.failed" || type === "response.error") {
+                    yield* flushFilter();
                     terminalKind = "failed";
                     terminalRaw = rawBuf;
                     yield { kind: "done", finishReason: "failed" } as ParsedStreamEvent;

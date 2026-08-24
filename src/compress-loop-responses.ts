@@ -12,6 +12,7 @@ import { applyRanges } from "./stream.js";
 import { resolveDecompress } from "./decompress-shared.js";
 import { buildVisibilityMarker } from "./compress-loop.js";
 import { MAX_LOOP_ROUNDS } from "./loop/index.js";
+import { stripResponsesText } from "./loop/tag-echo-filter.js";
 import { fetchWithRetry, UpstreamHttpError } from "./fetch-util.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 
@@ -182,6 +183,7 @@ export async function compressLoopResponsesJson(
 ): Promise<Record<string, unknown>> {
     let current = initialResponse;
     for (let loopCount = 1; loopCount <= MAX_LOOP_ROUNDS; loopCount++) {
+        current = stripResponsesText(current);
         const output = responsesJsonOutput(current);
         const extracted = extractTextTriggers(output.text);
         const allCalls = [...output.calls, ...extracted.calls].filter((call) => call.name.length > 0);

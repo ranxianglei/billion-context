@@ -3,6 +3,7 @@ import { type Session, cacheBlockContent } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput, PROXY_TOOL_NAMES } from "./compress-tool.js";
 import { resolveDecompress } from "./decompress-shared.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
+import { stripAcpTags } from "./loop/tag-echo-filter.js";
 
 export type RewriteCtx = {
     core: CompressionCore;
@@ -333,6 +334,7 @@ export function rewriteJsonResponse(body: unknown, ctx: RewriteCtx): unknown {
         const t = (blk as { type?: string; text?: string }).text;
         if (typeof t === "string" && (t.includes("\x3cacp ") || t.includes("\x3c/acp"))) {
             ctx.log(`[warn: tag echo] non-stream model output contains <acp tag: ${t.slice(0, 120).replace(/\n/g, " ")}`);
+            (blk as { text?: string }).text = stripAcpTags(t);
         }
     }
     return body;

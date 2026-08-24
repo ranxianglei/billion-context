@@ -1,6 +1,8 @@
 import type { CoreMessage } from "acp-kernel";
 import { coreToAnthropic, extractSystem, buildSystem, type AnthropicRequestBody } from "acp-kernel/wire";
 import { buildVisibilityMarker } from "../compress-loop.js";
+import { createTagEchoFilter } from "./tag-echo-filter.js";
+import { log as loggerLog } from "../logger.js";
 import type {
     CompressLoopAdapter,
     EmitCompletionOpts,
@@ -83,6 +85,37 @@ function remapIndexInEvent(eventStr: string, newIndex: number): Buffer {
     return Buffer.from(rebuilt.join("\n") + "\n\n", "utf8");
 }
 
+function rewriteTextDeltaEvent(eventStr: string, newIndex: number, newText: string): Buffer {
+    const lines = eventStr.split("\n");
+    const rebuilt: string[] = [];
+    for (const l of lines) {
+        if (l.startsWith("data:")) {
+            const jsonStr = l.slice(5).replace(/^ /, "");
+            try {
+                const obj = JSON.parse(jsonStr) as Record<string, unknown>;
+                if (typeof obj === "object" && obj !== null && typeof obj.index === "number") {
+                    obj.index = newIndex;
+                    const d = obj.delta as Record<string, unknown> | undefined;
+                    if (d && typeof d.text === "string") d.text = newText;
+                    rebuilt.push(`data: ${JSON.stringify(obj)}`);
+                    continue;
+                }
+            } catch {
+            }
+        }
+        rebuilt.push(l);
+    }
+    return Buffer.from(rebuilt.join("\n") + "\n\n", "utf8");
+}
+
+function buildTextDeltaEvent(index: number, text: string): Buffer {
+    return Buffer.from(
+        `event: content_block_delta\n` +
+        `data: ${JSON.stringify({ type: "content_block_delta", index, delta: { type: "text_delta", text } })}\n\n`,
+        "utf8",
+    );
+}
+
 export function createAnthropicAdapter(requestBody: Record<string, unknown>, originalSystem?: AnthropicRequestBody["system"]): CompressLoopAdapter {
     const model = (requestBody.model as string) ?? undefined;
     let messageId: string | undefined;
@@ -151,6 +184,14 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             let usageYielded = false;
             const indexMap = new Map<number, number>();
             const thinkingIndexes = new Set<number>();
+            // #206: strip model-imitated render tags from text deltas before
+            // they reach the client (and before coreText accumulates them for
+            // re-request rounds). Flush at the owning block's stop so held-back
+            // fragments still emit while the block is open.
+            const tagFilter = createTagEchoFilter((snippet) => {
+                loggerLog("warn", `[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+            });
+            let lastTextIndex: number | null = null;
 
             for await (const eventStr of iterSseEvents(upstream)) {
                 const parsed = parseAnthropicSse(eventStr);
@@ -191,7 +232,11 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                         }
                     } else if (delta.type === "text_delta" && typeof delta.text === "string") {
                         const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
-                        yield { kind: "text", delta: delta.text, raw: remapIndexInEvent(eventStr, ci) } as ParsedStreamEvent;
+                        lastTextIndex = ci;
+                        const clean = tagFilter.push(delta.text);
+                        if (clean.length > 0) {
+                            yield { kind: "text", delta: clean, raw: rewriteTextDeltaEvent(eventStr, ci, clean) } as ParsedStreamEvent;
+                        }
                     } else if (delta.type === "thinking_delta" && typeof delta.thinking === "string" && delta.thinking.length > 0) {
                         const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
                         yield {
@@ -230,6 +275,13 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                         yield { kind: "reasoning", delta: "", blockEnd: true } as ParsedStreamEvent;
                     } else {
                         const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
+                        if (lastTextIndex !== null) {
+                            const tail = tagFilter.flush();
+                            if (tail.length > 0) {
+                                yield { kind: "text", delta: tail, raw: buildTextDeltaEvent(lastTextIndex, tail) } as ParsedStreamEvent;
+                            }
+                            lastTextIndex = null;
+                        }
                         yield { kind: "meta", chunk: remapIndexInEvent(eventStr, ci), firstRoundOnly: round === 1 } as ParsedStreamEvent;
                     }
                 } else if (type === "message_delta") {
@@ -257,6 +309,13 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                     }
                     yield { kind: "done", finishReason: stopReason } as ParsedStreamEvent;
                 } else if (type === "message_stop") {
+                    if (lastTextIndex !== null) {
+                        const tail = tagFilter.flush();
+                        if (tail.length > 0) {
+                            yield { kind: "text", delta: tail, raw: buildTextDeltaEvent(lastTextIndex, tail) } as ParsedStreamEvent;
+                        }
+                        lastTextIndex = null;
+                    }
                     if (!usageYielded) {
                         usageYielded = true;
                         yield {
