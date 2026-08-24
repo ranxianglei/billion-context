@@ -1332,6 +1332,33 @@ function injectResponsesTool(tools: unknown[] | undefined, toolsToAdd: readonly 
     return [...tools, ...additions];
 }
 
+// #11: a failed request (relay 5xx, socket reset, timeout) never reports
+// usage, so lastInputTokens stays frozen and each retry re-sends the same
+// oversized payload — the relay fails it again (deadlock). Arm the emergency
+// shrink with a local estimate of the body just sent. Deliberate exception
+// to "tokenCount must be real usage" above: it only RAISES the value (a
+// lower bound can only compress earlier, never later), the kernel no-ops
+// below truncate.threshold, and the next successful usage report overwrites
+// it. markDirty is needed because error paths return before forward()'s
+// trailing save.
+function armFailureShrink(
+    prepared: Prepared | null,
+    body: Buffer | string | undefined,
+    log: (level: string, msg: string) => void,
+    reason: string,
+): void {
+    const s = prepared?.session;
+    if (!s || body === undefined) return;
+    try {
+        const est = estimateTokensFast(typeof body === "string" ? body : body.toString("utf8"));
+        if (est > s.stats.lastInputTokens) {
+            s.stats.lastInputTokens = est;
+            markDirty(s);
+            log("warn", `[${s.id}] ${reason} with no usage report — armed emergency shrink with local estimate ${est} tokens`);
+        }
+    } catch { /* non-text body — nothing to estimate */ }
+}
+
 async function forward(
     req: http.IncomingMessage,
     res: http.ServerResponse,
@@ -1487,6 +1514,9 @@ async function forward(
         recordUpstreamConnection(upstreamUrl, proxyUrl);
     } catch (error) {
         recordUpstreamConnection(upstreamUrl, proxyUrl, error);
+        // #11: a network-level failure also never reports usage — arm the
+        // emergency shrink the same way as the 5xx branch below.
+        if (req.method !== "GET" && req.method !== "HEAD") armFailureShrink(prepared, body, log, "network failure");
         throw new Error(`upstream request failed: ${formatUpstreamError(error, upstreamUrl, proxyUrl)}`, { cause: error });
     }
     const { response: upstream, clearTimer: clearUpstreamTimer } = upstreamResult;
@@ -1583,6 +1613,13 @@ async function forward(
                 // markDirty, so schedule the save HERE or the self-heal is
                 // lost on restart and the next overflow must be re-learned.
                 markDirty(s);
+            } else if (upstream.status >= 500) {
+                // #11: relay/gateway 5xx — no usage report will arrive, so
+                // arm the emergency shrink with a local estimate of what we
+                // just sent (see armFailureShrink for the deadlock this
+                // breaks). Generic relay errors (new_api_error etc.) are not
+                // overflow signatures, so this is the only self-heal path.
+                armFailureShrink(prepared, prepared.body, log, `upstream ${upstream.status}`);
             }
         }
         // #174: always log a non-2xx upstream response (status + request-id +
