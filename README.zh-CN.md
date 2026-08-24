@@ -63,26 +63,11 @@ bili opencode                         # HTTPS 走 MITM + 临时 opencode.json(HT
 bili hermes                           # 无法 MITM(certifi CA)—— 隔离 HERMES_HOME,全部流量 /bili/
 bili pi --mitm-domain api.foo.com     # 向 MITM 白名单追加域名
 ```
-
+注意,以下客户端需要执行`bili plugin install`以获得原生体验
 ```bash
-bili plugin install pi      # 把本 billion-context 安装加进 pi 的 settings.json(packages)
-bili plugin install omp     # 同理 omp(config.yml extensions)
-bili plugin install claude  # 注册 bili MCP 服务器(claude mcp add,user 作用域)
-bili plugin install codex   # 向 ~/.codex/config.toml 追加 [mcp_servers.bili]
-bili plugin install opencode  # 向 ~/.config/opencode/opencode.json 加 mcp.bili
-bili plugin list            # 查看所有支持宿主的安装状态
-bili plugin remove pi       # 卸载(原文件备份为 *.bili-bak,仅一次)
+bili plugin install pi     
 ```
 
-**什么时候才需要 install?** 压缩功能永远不需要 —— 不装插件,代理也会把四个工具
-(`compress`/`decompress`/`search_context`/`acp_status`)直接注入给模型,压缩照常工作。
-Install 买的是**原生体验**:
-
-- 走**方式 1 启动器**:完全不需要 install。`bili opencode` 自动注入插件;
-  claude/codex 加 `BILI_LAUNCHER_PLUGIN=1` 可得原生 MCP 工具;pi/omp/hermes 走 wire 注入。
-- 走**方式 2 改url**:想要原生工具面板时才 install。pi/omp/opencode 装后还多一个
-  `/acp` 状态命令;claude/codex 是原生 MCP 工具但没有 `/acp`(MCP 协议无斜杠命令);
-  hermes 没有插件 API,只能走 wire。不装的话想看状态,让模型调一次 `acp_status` 即可。
 
 ### 方式 2 —— 改url(`/bili/` 前缀)
 
