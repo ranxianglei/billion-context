@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { contextFromRegistry, peekRegistryContext, providerFromHost, _resetForTest, _setForTest } from "../src/registry.ts";
+import { contextFromRegistry, peekRegistryContext, providerFromHost, newerFallback, bundledSnapshotLookup, _resetForTest, _setForTest } from "../src/registry.ts";
 
 test("providerFromHost maps minimax domains", () => {
     assert.equal(providerFromHost("api.minimax.chat"), "minimax");
@@ -55,4 +55,24 @@ test("_resetForTest clears the warm cache", () => {
     assert.equal(peekRegistryContext("gpt-y"), 1);
     _resetForTest();
     assert.equal(peekRegistryContext("gpt-y"), undefined);
+});
+
+test("bundled snapshot ships real data and resolves known models", () => {
+    // The committed snapshot must not be empty — it is the offline floor.
+    const deepseek = bundledSnapshotLookup("deepseek-chat", "api.deepseek.com");
+    assert.ok(typeof deepseek === "number" && deepseek >= 128_000, `deepseek-chat expected >=128k, got ${deepseek}`);
+    const minimax = bundledSnapshotLookup("MiniMax-M2.1", "api.minimax.chat");
+    assert.ok(typeof minimax === "number" && minimax >= 200_000, `MiniMax-M2.1 expected >=200k, got ${minimax}`);
+    // Unknown model must miss (no bogus 200k-style guessing).
+    assert.equal(bundledSnapshotLookup("totally-custom-model-x", "api.deepseek.com"), undefined);
+});
+
+test("newerFallback picks the newer source, tolerating missing sides", () => {
+    const now = Date.now();
+    assert.equal(newerFallback(now, now - 1000), "disk");
+    assert.equal(newerFallback(now - 1000, now), "snapshot");
+    assert.equal(newerFallback(now, now), "disk"); // tie → disk (already resident)
+    assert.equal(newerFallback(undefined, now), "snapshot");
+    assert.equal(newerFallback(now, 0), "disk");
+    assert.equal(newerFallback(undefined, 0), "none");
 });

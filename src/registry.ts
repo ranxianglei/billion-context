@@ -5,6 +5,7 @@ import { cacheDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import { fetchWithTimeout } from "./fetch-util.js";
+import bundledSnapshot from "./registry-snapshot.json" with { type: "json" };
 
 const REGISTRY_URL = "https://models.dev/models.json";
 const CACHE_FILE = path.join(cacheDir(), "models-dev.json");
@@ -15,6 +16,37 @@ type RegistryShape = Record<string, ModelEntry>;
 
 let cache: RegistryShape | null = null;
 let loading: Promise<RegistryShape | null> | null = null;
+
+/** Slim models.dev snapshot committed at src/registry-snapshot.json (refresh
+ *  with `npm run registry:snapshot`) and inlined into dist at build time.
+ *  Covers the cold-start-forever-offline case: a fresh install with no disk
+ *  cache, an unreachable models.dev, and no upstream proxy still resolves
+ *  exact per-model windows from the very first request, and the sync
+ *  peekRegistryContext path is pre-warmed before any async fetch runs. */
+type SnapshotShape = { fetchedAt?: unknown; models?: Record<string, unknown> };
+let snapshotReg: RegistryShape | null = null;
+let snapshotMs = 0;
+function bundledSnapshotRegistry(): RegistryShape | null {
+    if (snapshotReg) return snapshotReg;
+    const snap = bundledSnapshot as SnapshotShape;
+    if (!snap || typeof snap !== "object" || !snap.models || typeof snap.models !== "object") return null;
+    const reg: RegistryShape = {};
+    for (const [k, v] of Object.entries(snap.models)) {
+        if (typeof v === "number" && v > 0) reg[k] = { limit: { context: v } };
+    }
+    const ts = typeof snap.fetchedAt === "string" ? Date.parse(snap.fetchedAt) : NaN;
+    snapshotMs = Number.isFinite(ts) ? ts : 0;
+    snapshotReg = reg;
+    return snapshotReg;
+}
+// Pre-warm the sync peek path with the bundled snapshot. loadRegistry still
+// upgrades `cache` past it (fresh disk cache / live fetch both outrank the
+// build-time data); the identity check `cache !== snapshotReg` marks "still
+// the seed, keep upgrading".
+{
+    const seed = bundledSnapshotRegistry();
+    if (seed && !cache) cache = seed;
+}
 
 function parse(raw: string): RegistryShape | null {
     try {
@@ -91,7 +123,7 @@ async function fetchFresh(): Promise<RegistryShape | null> {
 }
 
 export async function loadRegistry(): Promise<RegistryShape | null> {
-    if (cache) return cache;
+    if (cache && cache !== snapshotReg) return cache;
     if (diskCacheFresh()) {
         const disk = await readDiskCache();
         if (disk) {
@@ -107,18 +139,55 @@ export async function loadRegistry(): Promise<RegistryShape | null> {
             loggerLog("info", `[acp-registry] loaded models.dev (${Object.keys(fresh).length} models)`);
             return fresh;
         }
-        const disk = await readDiskCache();
-        if (disk) {
-            cache = disk;
-            loggerLog("info", `[acp-registry] using stale disk cache (${Object.keys(disk).length} models, fetch failed)`);
-            return disk;
+        // Fetch failed. Last resort: stale disk cache vs the bundled snapshot —
+        // whichever is newer wins (a release's snapshot can postdate a disk
+        // cache that has been offline for months, and vice versa).
+        const fallback = await pickFallback();
+        if (fallback) {
+            cache = fallback.reg;
+            loggerLog("info", `[acp-registry] ${fallback.label}; fetch failed`);
+            return fallback.reg;
         }
-        loggerLog("warn", `[acp-registry] could not load models.dev registry (offline + no cache)`);
+        loggerLog("warn", `[acp-registry] could not load models.dev registry (offline + no cache + no snapshot)`);
         return null;
     })();
     const result = await loading;
     loading = null;
     return result;
+}
+
+/** Pick between the stale on-disk cache and the build-time bundled snapshot
+ *  by timestamp (newer wins). Exported for tests. */
+export function newerFallback(diskMs: number | undefined, snapMs: number): "disk" | "snapshot" | "none" {
+    const d = diskMs ?? 0;
+    if (d > 0 && snapMs > 0) return d >= snapMs ? "disk" : "snapshot";
+    if (d > 0) return "disk";
+    if (snapMs > 0) return "snapshot";
+    return "none";
+}
+
+async function pickFallback(): Promise<{ reg: RegistryShape; label: string } | null> {
+    const snap = bundledSnapshotRegistry();
+    let disk: RegistryShape | null = null;
+    let diskMs = 0;
+    if (existsSync(CACHE_FILE)) {
+        disk = await readDiskCache();
+        if (disk) {
+            try {
+                diskMs = statSync(CACHE_FILE).mtimeMs;
+            } catch {
+                diskMs = 0;
+            }
+        }
+    }
+    const choice = newerFallback(disk ? diskMs : undefined, snapshotMs);
+    if (choice === "disk" && disk) {
+        return { reg: disk, label: `using stale disk cache (${Object.keys(disk).length} models, ${new Date(diskMs).toISOString()})` };
+    }
+    if (choice === "snapshot" && snap) {
+        return { reg: snap, label: `using bundled snapshot (${Object.keys(snap).length} models, ${new Date(snapshotMs).toISOString()})` };
+    }
+    return null;
 }
 
 const HOST_TO_PROVIDER: Record<string, string> = {
@@ -165,6 +234,13 @@ export async function contextFromRegistry(model: string, host?: string): Promise
  *  warms the cache for subsequent requests. */
 export function peekRegistryContext(model: string, host?: string): number | undefined {
     return registryLookup(cache, model, host);
+}
+
+/** Lookup against the bundled build-time snapshot ONLY — never the runtime
+ *  caches, never a fetch. Exposed for tests and diagnostics (verifying what
+ *  the offline floor actually ships). */
+export function bundledSnapshotLookup(model: string, host?: string): number | undefined {
+    return registryLookup(bundledSnapshotRegistry(), model, host);
 }
 
 function registryLookup(reg: RegistryShape | null, model: string, host?: string): number | undefined {

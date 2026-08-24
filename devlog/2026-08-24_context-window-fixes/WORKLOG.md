@@ -72,3 +72,33 @@ Verification (real machine):
 - `~/.cache/billion-context/models-dev.json` written (288KB);
   deepseek-chat → 1,000,000; MiniMax-M2.1 → 204,800
 - typecheck ✅ · 542/542 ✅
+
+## Follow-up 2: bundled models.dev snapshot as the offline floor
+
+User asked whether the downloaded registry is cached in-code for the
+unreachable case. It was not — only the 17-entry regex table ships in the
+package; the 355-model data lived solely in the runtime disk cache, which a
+fresh install behind a dead network never obtains.
+
+Layered fix:
+- `scripts/update-registry-snapshot.mjs` (`npm run registry:snapshot`,
+  proxy-aware like the runtime fetch, keeps the old file when offline) →
+  slim `src/registry-snapshot.json` (351 models, 12 KB) committed to the
+  repo and inlined into dist by tsup (verified: `MiniMax-M2.1` present in
+  dist/index.js).
+- `src/registry.ts`: the snapshot pre-warms the sync `peekRegistryContext`
+  path at module load (identity check `cache !== snapshotReg` lets
+  loadRegistry still upgrade past it — fresh disk cache and live fetch both
+  outrank the build-time data). When a fetch fails, the newer of
+  (stale disk cache by mtime, bundled snapshot by fetchedAt) wins
+  (`newerFallback`, exported + unit-tested). `bundledSnapshotLookup()`
+  exposed for tests/diagnostics.
+- Fallback chain now: memory cache → fresh disk cache (24h) → live fetch
+  (proxy first, direct fallback) → newer(stale disk, bundled snapshot) →
+  built-in 17-entry regex table → 200k default.
+
+Offline verification (no proxy env, disk cache deleted, fresh process):
+  peek deepseek-chat@api.deepseek.com → 1,000,000   (was: undefined → 64k table)
+  peek MiniMax-M2.1@api.minimax.chat  → 204,800
+  unknown model                        → undefined (no guessing)
+typecheck ✅ · 544/544 ✅ · build ✅ (dist 2.27 MB)
