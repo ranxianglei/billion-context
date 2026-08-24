@@ -71,6 +71,12 @@ wire 注入的四个工具,压缩照常工作;装了只是把工具体验升级�
 agent 插件(`dist/agent/*.js`),claude、codex、opencode 是 MCP 桥
 (`dist/mcp.js`,底层协议相同)。hermes 没有插件 API,始终走 wire 注入工具。
 
+各宿主从插件得到什么:**pi / omp / opencode** 会把四个工具原生注册,**并**
+新增 `/acp` 状态命令;**claude / codex**(MCP 桥)拿到的是原生 MCP 工具,但
+**没有 `/acp` 斜杠命令**(MCP 协议没有这个概念)。不装插件压缩效果完全
+相同 —— 只是客户端 UI 不会列出这些工具;想看状态面板,可以让模型调一次
+`acp_status` 贴在对话里。
+
 ```bash
 bili plugin install pi      # 把本 billion-context 安装加进 pi 的 settings.json(packages)
 bili plugin install omp     # 同理 omp(config.yml extensions)

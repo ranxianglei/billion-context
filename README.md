@@ -90,6 +90,13 @@ plugins (`dist/agent/*.js`), claude, codex and opencode get the MCP bridge
 (`dist/mcp.js`, same protocol underneath). hermes has no plugin API — it
 always rides the wire-injected tools.
 
+What each host gets from a plugin: **pi / omp / opencode** register the four
+tools natively **and** add an `/acp` status command; **claude / codex** (MCP
+bridge) get the four tools as native MCP tools but no `/acp` slash command
+(the MCP protocol has none). Without a plugin the compression is identical —
+the client UI just never lists the tools; ask the model to run `acp_status`
+if you want the status panel rendered in chat.
+
 ```bash
 bili plugin install pi      # adds this billion-context install to pi's settings.json (packages)
 bili plugin install omp     # same for omp (config.yml extensions)
