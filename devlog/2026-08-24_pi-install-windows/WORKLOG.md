@@ -55,6 +55,19 @@ install 的缺口。补齐：
   makeFakeChild 不触发 exit 事件，runClient 的 promise 永不 resolve→测试挂起；
   需包一层 on，注册 exit listener 后 setTimeout 异步触发；代理子进程保持原样。
 - 全量 516/516 ✅，typecheck ✅，build ✅（dist/index.js 2.45MB）。
+- 真实 e2e（本机未安装状态）：`bili plugin remove pi` 后 `bili pi -- -p "read ..."`
+  → 第一个真实工具请求即带 `"x-bili-plugin":"pi"` + conversation +
+  context-window=1000000（/tmp/bili-proxy-34117.log 验证），退出后重 install 恢复。
+
+## Follow-up 3: Windows VM 验证 -e 注入（全通）
+
+- npm pack 当前分支 → bili-fix2.tgz scp → `npm install -g`（VM 现为 0.1.50+双修复）。
+- `bili plugin remove pi`（未安装态）→ `bili pi -- -p "read C:\\Users\\dog\\note-e2e.txt ..."`
+  → EXITCODE=0，逐字复述正确，上游请求头 `"x-bili-plugin":"pi"` + context-window=1000000
+  （Temp\\bili-proxy-8787.log 验证）→ Windows 上 -e 注入原生接管 ✓。
+- 结束后 `bili plugin install pi` 恢复安装态（install 路径在 Windows 再次验证 ✓），
+  临时文件已清理。
+- 坑：写 .bat 必须 CRLF（LF 行尾会让 cmd 错拆 %VAR% 报 `'PDATAPATH"' 不是内部或外部命令`）。
 
 ## Windows 验证（win10-vm，Node 22.23.2 / npm 10.9.8 / pi 0.84.1 / GLM）
 
