@@ -28,6 +28,17 @@ function readConfig(): ConfigShape {
     return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as ConfigShape : {};
 }
 
+/** The config file exists on disk but does not parse as JSON (hand-edited
+ *  comment, trailing comma, …). Distinct from "missing": a broken file must
+ *  never be silently rebuilt from {} by a PUT — that would wipe every field
+ *  the loader could not read. */
+function configParseError(): string | null {
+    if (!existsSync(configFile())) return null;
+    const parsed = safeReadJson(configFile());
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return null;
+    return `config file is not valid JSON: ${configFile()}`;
+}
+
 export function readProviders(): ProviderRoutes {
     return loadRoutes();
 }
@@ -65,6 +76,8 @@ function atomicWriteConfig(config: ConfigShape): void {
 export async function handleConfigGet(res: ServerResponse): Promise<void> {
     const upstream = readUpstreamSettings();
     const config = readConfig();
+    const parseError = configParseError();
+    if (parseError) log("warn", `[acp-web] ${parseError} — showing empty view; PUT is blocked until fixed`);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
         path: configFile(),
@@ -72,6 +85,7 @@ export async function handleConfigGet(res: ServerResponse): Promise<void> {
         upstreamProxy: upstream.proxy ?? null,
         upstreamProxyMode: upstream.mode,
         compress: config.compress ?? null,
+        ...(parseError ? { parseError } : {}),
     }, null, 2));
 }
 
@@ -83,6 +97,13 @@ export async function handleConfigPut(
 ): Promise<void> {
     const raw = await readJsonBody(req);
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) return sendError(res, 400, "expected JSON object");
+    // Guard the unreadable-config footgun: if the on-disk file exists but
+    // does not parse, merging into an empty {} and saving would silently
+    // drop every field the JSON loader could not read. Refuse instead —
+    // the user fixes the syntax error by hand (the GET view surfaces
+    // parseError with the path) and PUT works again.
+    const parseError = configParseError();
+    if (parseError) return sendError(res, 409, `${parseError} — fix the syntax error by hand, then retry; refusing to overwrite`);
     const body = raw as Record<string, unknown>;
     const hasProviders = Object.prototype.hasOwnProperty.call(body, "providers");
     const hasProxy = Object.prototype.hasOwnProperty.call(body, "upstreamProxy");

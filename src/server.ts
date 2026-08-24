@@ -6,7 +6,7 @@ import type { ProxyOptions } from "./config.js";
 import { loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
 import { resolveContextLimit, resolveCompressProtocol } from "./config.js";
-import { contextFromRegistry, loadRegistry } from "./registry.js";
+import { contextFromRegistry, loadRegistry, peekRegistryContext } from "./registry.js";
 import { fetchWithTimeout, MAX_REQUEST_BYTES } from "./fetch-util.js";
 import { formatUpstreamError, getUpstreamConnectionStatus, recordUpstreamConnection, resolveProxy, resolveProxyDecision, proxyDispatcher } from "./upstream-proxy.js";
 // Protocol codecs live in the kernel now (single source of truth shared with
@@ -624,17 +624,21 @@ async function handle(
         const model = (parsed as { model?: string }).model;
         if (model) {
             const embeddedUrl = route?.rewrittenUrl;
-            // A cooperative plugin's reported window (the agent's own config)
-            // is the authoritative native window — it outranks the table and
-            // the models.dev registry (most valuable in MITM mode where the
-            // model may be a private relay), but operator tuning via
-            // compress.modelContextLimit still outranks it inside
-            // resolveRequestConfig. Gated on the x-bili-plugin marker: the
-            // header is protocol-internal, and a plain client must not be
-            // able to rewrite the nudge denominator by name.
-            let native = pluginReportedContextWindow(req.headers) ?? resolveContextLimit(opts.routes, embeddedUrl, model);
-            if (!native && embeddedUrl) {
-                const host = (() => { try { return new URL(embeddedUrl).host; } catch { return undefined; } })();
+            // Native-window resolution order: (1) a cooperative plugin's
+            // report (the agent's own config — most authoritative, gated on
+            // the x-bili-plugin marker so a plain client cannot rewrite the
+            // nudge denominator by name); (2) a WARM models.dev registry
+            // cache (daily refresh — outranks the static table whenever
+            // already resident; peek never fetches, cold start skips to (3)
+            // without blocking); (3) resolveContextLimit = user's per-route
+            // per-model declaration, then the built-in CONTEXT_LIMIT_TABLE
+            // fallback. Operator tuning via compress.modelContextLimit still
+            // outranks everything inside resolveRequestConfig.
+            const host = (() => { try { return embeddedUrl ? new URL(embeddedUrl).host : undefined; } catch { return undefined; } })();
+            let native = pluginReportedContextWindow(req.headers)
+                ?? (host ? peekRegistryContext(model, host) : undefined)
+                ?? resolveContextLimit(opts.routes, embeddedUrl, model);
+            if (!native && host) {
                 native = await contextFromRegistry(model, host);
             }
             reqConfig = resolveRequestConfig(config, opts.routes, embeddedUrl, model, native, opts.compress);

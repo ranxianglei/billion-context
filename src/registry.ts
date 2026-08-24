@@ -111,6 +111,9 @@ const HOST_TO_PROVIDER: Record<string, string> = {
     "api.moonshot.cn": "moonshot",
     "generativelanguage.googleapis.com": "google",
     "ai.comfly.org": "comfly",
+    "api.minimax.chat": "minimax",
+    "api.minimaxi.com": "minimax",
+    "api.minimax.io": "minimax",
 };
 
 export function providerFromHost(host: string): string | undefined {
@@ -129,6 +132,22 @@ export function providerFromHost(host: string): string | undefined {
 
 export async function contextFromRegistry(model: string, host?: string): Promise<number | undefined> {
     const reg = await loadRegistry();
+    return registryLookup(reg, model, host);
+}
+
+/** Synchronous cache-only lookup: returns the window when the models.dev
+ *  registry is ALREADY resident in memory, undefined otherwise (never
+ *  triggers a fetch). Used to let a warm registry outrank the built-in
+ *  CONTEXT_LIMIT_TABLE — the table is a static fallback that goes stale
+ *  (DeepSeek was pinned at 64K long after the real window grew to 128K+),
+ *  while the cached registry refreshes every 24h. Cold start still falls
+ *  back to the table instantly; the async contextFromRegistry path later
+ *  warms the cache for subsequent requests. */
+export function peekRegistryContext(model: string, host?: string): number | undefined {
+    return registryLookup(cache, model, host);
+}
+
+function registryLookup(reg: RegistryShape | null, model: string, host?: string): number | undefined {
     if (!reg || !model) return undefined;
     const provider = host ? providerFromHost(host) : undefined;
     const candidates = provider ? [`${provider}/${model}`, model] : [model];

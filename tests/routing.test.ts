@@ -75,7 +75,10 @@ test("lookupContextLimit returns known windows", () => {
     assert.equal(lookupContextLimit("gemini-2.5-pro"), 1_000_000);
     assert.equal(lookupContextLimit("glm-4.6"), 128_000);
     assert.equal(lookupContextLimit("glm-4.5-air"), 128_000);
-    assert.equal(lookupContextLimit("deepseek-chat"), 64_000);
+    assert.equal(lookupContextLimit("deepseek-chat"), 128_000);
+    assert.equal(lookupContextLimit("deepseek-reasoner"), 128_000);
+    assert.equal(lookupContextLimit("MiniMax-M2.1"), 204_800);
+    assert.equal(lookupContextLimit("minimax-m2"), 204_800);
     assert.equal(lookupContextLimit("qwen-max"), 128_000);
     assert.equal(lookupContextLimit("kimi-k2"), 128_000);
 });
@@ -148,7 +151,7 @@ test("model not in route falls through to lookup table", () => {
         "https://open.bigmodel.cn": { models: { "glm-5.2": { context: 1000000 } } },
     };
     // glm-5.2 not in this route's models, but in the built-in table (1000000)
-    assert.equal(resolveContextLimit(routes, "https://api.deepseek.com", "deepseek-chat"), 64000);
+    assert.equal(resolveContextLimit(routes, "https://api.deepseek.com", "deepseek-chat"), 128000);
 });
 
 test("configured context lookup stays separate from registry/built-in fallbacks", () => {
