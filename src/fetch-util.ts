@@ -69,3 +69,117 @@ export async function fetchWithTimeout(
         throw e;
     }
 }
+
+/** Upstream HTTP failure after all retry attempts are exhausted (or a
+ *  non-transient error that fails fast). `attempts` is the number of requests
+ *  actually made; `body` is the upstream error body (already read). */
+export class UpstreamHttpError extends Error {
+    readonly status: number;
+    readonly body: string;
+    readonly attempts: number;
+    constructor(status: number, body: string, attempts: number) {
+        super(`upstream error ${status}`);
+        this.name = "UpstreamHttpError";
+        this.status = status;
+        this.body = body;
+        this.attempts = attempts;
+    }
+}
+
+/** Body markers indicating an upstream 4xx is a transient risk-control /
+ *  rate-limit rejection rather than a genuine client error. GLM Coding Plan
+ *  returns 400 {"code":3007,"msg":"captcha verify failed"} ~1s after large
+ *  context rewrites (issue #189); every observed case recovered on retry,
+ *  so such bodies are retried while plain 4xx (bad model, bad params) fail fast. */
+const TRANSIENT_BODY_MARKERS = [
+    "captcha",
+    "verify failed",
+    "risk control",
+    "风控",
+    "rate limit",
+    "too many requests",
+    "try again",
+];
+
+export function isTransientUpstreamError(status: number, body: string): boolean {
+    if (status === 429 || status >= 500) return true;
+    if (status < 400) return false;
+    const lower = body.toLowerCase();
+    return TRANSIENT_BODY_MARKERS.some((marker) => lower.includes(marker));
+}
+
+/** Total requests per replay attempt (initial + retries). */
+export const REPLAY_MAX_ATTEMPTS = 3;
+
+/** Total requests per replay attempt; overridable via BILI_REPLAY_RETRY_MAX
+ *  (1 = legacy fail-fast behavior, no retry). Read on each call so tests can
+ *  tune it live. */
+export function replayMaxAttempts(): number {
+    const raw = Number(process.env.BILI_REPLAY_RETRY_MAX);
+    return Number.isInteger(raw) && raw >= 1 ? raw : REPLAY_MAX_ATTEMPTS;
+}
+
+/** Base backoff delay in ms; overridable via BILI_REPLAY_RETRY_BASE_MS
+ *  (0 disables the delay). Read on each call so tests can tune it live. */
+export function replayBaseDelayMs(): number {
+    const raw = Number(process.env.BILI_REPLAY_RETRY_BASE_MS);
+    return Number.isFinite(raw) && raw >= 0 ? raw : 1500;
+}
+
+/** Exponential backoff for the given 1-based attempt: base * 2^(attempt-1). */
+export function replayBackoffMs(attempt: number): number {
+    return replayBaseDelayMs() * 2 ** (attempt - 1);
+}
+
+/** Abortable sleep: resolves early if `signal` fires (downstream disconnect).
+ *  ms <= 0 resolves immediately. */
+export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+    if (ms <= 0 || signal?.aborted) return Promise.resolve();
+    return new Promise((resolve) => {
+        let timer: ReturnType<typeof setTimeout> | null = null;
+        const finish = () => {
+            if (timer) clearTimeout(timer);
+            if (signal) signal.removeEventListener("abort", finish);
+            resolve();
+        };
+        timer = setTimeout(finish, ms);
+        if (signal) signal.addEventListener("abort", finish, { once: true });
+    });
+}
+
+export interface ReplayRetryInfo {
+    attempt: number;
+    status: number;
+    detail: string;
+    delayMs: number;
+    maxAttempts: number;
+}
+
+/** fetchWithTimeout with bounded retry on transient upstream HTTP failures.
+ *  For acp-loop replay requests, where provider risk-control may briefly
+ *  reject a request whose context was just rewritten (#189). Network-level
+ *  failures (timeout, connection reset) propagate unchanged — NOT retried
+ *  here, to avoid stacking the 10-min timeout across attempts. */
+export async function fetchWithRetry(
+    url: string,
+    opts: FetchOptions,
+    timeoutMs: number | undefined,
+    externalSignal: AbortSignal | undefined,
+    onRetry?: (info: ReplayRetryInfo) => void,
+): Promise<{ response: Response; clearTimer: () => void }> {
+    const maxAttempts = replayMaxAttempts();
+    for (let attempt = 1; ; attempt++) {
+        const result = await fetchWithTimeout(url, opts, timeoutMs, externalSignal);
+        if (result.response.ok) return result;
+        const errText = await result.response.text().catch(() => "upstream error");
+        result.clearTimer();
+        const lastAttempt = attempt >= maxAttempts;
+        if (!lastAttempt && isTransientUpstreamError(result.response.status, errText)) {
+            const delayMs = replayBackoffMs(attempt);
+            onRetry?.({ attempt, status: result.response.status, detail: errText, delayMs, maxAttempts });
+            await sleep(delayMs, externalSignal);
+            continue;
+        }
+        throw new UpstreamHttpError(result.response.status, errText, attempt);
+    }
+}

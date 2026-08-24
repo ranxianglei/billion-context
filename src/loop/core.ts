@@ -17,7 +17,7 @@ import {
 import { applyRanges } from "../stream.js";
 import { resolveDecompress } from "../decompress-shared.js";
 import { buildVisibilityMarker } from "../compress-loop.js";
-import { fetchWithTimeout } from "../fetch-util.js";
+import { fetchWithRetry, UpstreamHttpError } from "../fetch-util.js";
 import { proxyDispatcher } from "../upstream-proxy.js";
 import { log as loggerLog } from "../logger.js";
 import type { WireProtocol } from "../util.js";
@@ -409,7 +409,7 @@ export async function* runCompressLoop(
             if (signal?.aborted) break;
 
             const fetchUpstream = (body: Record<string, unknown>) =>
-                fetchWithTimeout(
+                fetchWithRetry(
                     requestOptions.url,
                     {
                         method: "POST",
@@ -419,6 +419,10 @@ export async function* runCompressLoop(
                     },
                     undefined,
                     signal,
+                    (info) => {
+                        ctx.log(`[acp-proxy: upstream rejected replay (HTTP ${info.status}: ${info.detail.slice(0, 120)}); likely provider risk-control — retrying in ${info.delayMs}ms (attempt ${info.attempt}/${info.maxAttempts})]`);
+                        loggerLog("warn", `[acp-loop] upstream rejected replay (HTTP ${info.status}); retrying in ${info.delayMs}ms (attempt ${info.attempt}/${info.maxAttempts})`);
+                    },
                 );
 
             let newBody = adapter.buildRequest(coreMessages, systemPrompt, requestBody);
@@ -431,40 +435,47 @@ export async function* runCompressLoop(
                     fs.writeFileSync(`${dumpDir}/req-${Date.now()}-${sid}-REREQUEST.json`, JSON.stringify(newBody, null, 2));
                 } catch { /* best-effort */ }
             }
-            let fetched = await fetchUpstream(newBody);
-
-            if (
-                !fetched.response.ok &&
-                fetched.response.status >= 400 &&
-                fetched.response.status < 500 &&
-                !degradedRetried &&
-                coreMessages.some(isLoopThinking)
-            ) {
-                const errText = await fetched.response.text().catch(() => "upstream error");
-                fetched.clearTimer();
-                degradedRetried = true;
-                const stripped = stripLoopThinking(coreMessages);
-                coreMessages.length = 0;
-                coreMessages.push(...stripped);
-                ctx.log(`[acp-loop] round ${round}: re-request rejected (${fetched.response.status}: ${errText.slice(0, 200)}); retrying without replayed thinking blocks`);
-                loggerLog("warn", `[acp-loop] re-request rejected (${fetched.response.status}); retrying without thinking replay: ${errText.slice(0, 200)}`);
-                newBody = adapter.buildRequest(coreMessages, systemPrompt, requestBody);
-                fetched = await fetchUpstream(newBody);
-            }
-
-            const resp = fetched.response;
-            if (!resp.ok || !resp.body) {
-                fetched.clearTimer();
-                const errText = await resp.text().catch(() => "upstream error");
-                ctx.log(`[acp-proxy: compress loop upstream error ${resp.status}: ${errText.slice(0, 200)}]`);
-                loggerLog("error", `[acp-loop] upstream error ${resp.status}: ${errText.slice(0, 200)}`);
-                yield adapter.emitError(`upstream error ${resp.status}: ${errText.slice(0, 200)}`);
+            let respResult: { response: Response; clearTimer: () => void };
+            try {
+                try {
+                    respResult = await fetchUpstream(newBody);
+                } catch (e) {
+                    if (
+                        !(e instanceof UpstreamHttpError) ||
+                        e.status < 400 ||
+                        e.status >= 500 ||
+                        degradedRetried ||
+                        !coreMessages.some(isLoopThinking)
+                    ) {
+                        throw e;
+                    }
+                    degradedRetried = true;
+                    const stripped = stripLoopThinking(coreMessages);
+                    coreMessages.length = 0;
+                    coreMessages.push(...stripped);
+                    ctx.log(`[acp-loop] round ${round}: re-request rejected (${e.status}: ${e.body.slice(0, 200)}); retrying without replayed thinking blocks`);
+                    loggerLog("warn", `[acp-loop] re-request rejected (${e.status}); retrying without thinking replay: ${e.body.slice(0, 200)}`);
+                    newBody = adapter.buildRequest(coreMessages, systemPrompt, requestBody);
+                    respResult = await fetchUpstream(newBody);
+                }
+            } catch (e) {
+                if (!(e instanceof UpstreamHttpError)) throw e;
+                const suffix = e.attempts > 1 ? ` after ${e.attempts} attempt(s)` : "";
+                ctx.log(`[acp-proxy: compress loop upstream error ${e.status}${suffix}: ${e.body.slice(0, 200)}]`);
+                loggerLog("error", `[acp-loop] upstream error ${e.status}${suffix}: ${e.body.slice(0, 200)}`);
+                yield adapter.emitError(`upstream error ${e.status}${suffix}: ${e.body.slice(0, 200)}`);
                 return;
             }
 
-            currentUpstream = resp.body as ReadableStream<Uint8Array>;
+            if (!respResult.response.body) {
+                respResult.clearTimer();
+                yield adapter.emitError(`upstream error ${respResult.response.status}: empty response body`);
+                return;
+            }
+
+            currentUpstream = respResult.response.body as ReadableStream<Uint8Array>;
             if (activeClearTimer) activeClearTimer();
-            activeClearTimer = fetched.clearTimer;
+            activeClearTimer = respResult.clearTimer;
         }
     } finally {
         if (activeClearTimer) {

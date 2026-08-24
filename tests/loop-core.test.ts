@@ -6,6 +6,7 @@ import type { Session } from "../src/session.ts";
 import { runCompressLoop, createResponsesAdapter } from "../src/loop/index.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
 import type { WireProtocol } from "../src/util.ts";
+import { isTransientUpstreamError, REPLAY_MAX_ATTEMPTS, replayBackoffMs, replayMaxAttempts } from "../src/fetch-util.ts";
 
 function makeCtx(messages: CoreMessage[] = [], protocol?: WireProtocol): {
     core: ReturnType<typeof createCore>;
@@ -237,4 +238,174 @@ test("loop usage: protocol unset → legacy additive behavior (prompt + cached)"
     );
     assert.equal(ctx.session.stats.inputTokens, 1900, "no protocol → prompt + cached (1000 + 900)");
     assert.equal(ctx.session.stats.cachedTokens, 900);
+});
+
+// Regression guard for #189: after a compress, the acp-loop replay request can
+// be rejected by provider risk-control (GLM Coding Plan returns 400
+// {"code":3007,"msg":"captcha verify failed"} ~1s after a big context rewrite).
+// The replay must auto-retry with backoff instead of surfacing the error into
+// the agent session.
+const CAPTCHA_400_BODY = '{"code":3007,"msg":"captcha verify failed"}';
+
+function compressRound(): string {
+    return [
+        sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+        fcEvents(0, "call_c", "compress", JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "s" }] })),
+        COMPLETED,
+    ].join("");
+}
+
+test("replay retry: transient 400 (captcha) then success → retried, no error surfaced", async () => {
+    process.env.BILI_REPLAY_RETRY_BASE_MS = "1";
+    let fetchCalls = 0;
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async () => {
+        fetchCalls++;
+        if (fetchCalls === 1) return new Response(CAPTCHA_400_BODY, { status: 400 });
+        return new Response(COMPLETED, { status: 200 });
+    }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(compressRound(), { status: 200 }).body!,
+            makeCtx(),
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.equal(fetchCalls, 2, "replay retried once after transient 400");
+        assert.ok(!out.includes("upstream error"), "no upstream error surfaced to client");
+        assert.ok(/response\.completed/.test(out), "graceful completion after retry");
+    } finally {
+        delete process.env.BILI_REPLAY_RETRY_BASE_MS;
+        globalThis.fetch = orig;
+    }
+});
+
+test("replay retry: persistent captcha 400 → bounded retries, error names attempt count", async () => {
+    process.env.BILI_REPLAY_RETRY_BASE_MS = "1";
+    let fetchCalls = 0;
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async () => {
+        fetchCalls++;
+        return new Response(CAPTCHA_400_BODY, { status: 400 });
+    }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(compressRound(), { status: 200 }).body!,
+            makeCtx(),
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.equal(fetchCalls, REPLAY_MAX_ATTEMPTS, "retries are bounded");
+        assert.ok(out.includes("upstream error 400"), "error surfaced to client");
+        assert.ok(out.includes(`after ${REPLAY_MAX_ATTEMPTS} attempt(s)`), "attempt count in error message");
+    } finally {
+        delete process.env.BILI_REPLAY_RETRY_BASE_MS;
+        globalThis.fetch = orig;
+    }
+});
+
+test("replay retry: fatal 400 (invalid model) → NO retry, fail fast", async () => {
+    let fetchCalls = 0;
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async () => {
+        fetchCalls++;
+        return new Response('{"error":{"message":"Invalid model"}}', { status: 400 });
+    }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(compressRound(), { status: 200 }).body!,
+            makeCtx(),
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.equal(fetchCalls, 1, "non-transient 4xx is not retried");
+        assert.ok(out.includes("upstream error 400"), "error surfaced to client");
+        assert.ok(!out.includes("attempt(s)"), "no attempt-count suffix on single-attempt failure");
+    } finally {
+        globalThis.fetch = orig;
+    }
+});
+
+test("replay retry: 429 then success → retried", async () => {
+    process.env.BILI_REPLAY_RETRY_BASE_MS = "1";
+    let fetchCalls = 0;
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async () => {
+        fetchCalls++;
+        if (fetchCalls === 1) return new Response('{"error":"rate limited"}', { status: 429 });
+        return new Response(COMPLETED, { status: 200 });
+    }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(compressRound(), { status: 200 }).body!,
+            makeCtx(),
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.equal(fetchCalls, 2, "429 retried");
+        assert.ok(!out.includes("upstream error"), "no upstream error surfaced to client");
+    } finally {
+        delete process.env.BILI_REPLAY_RETRY_BASE_MS;
+        globalThis.fetch = orig;
+    }
+});
+
+test("isTransientUpstreamError: classifier matrix", () => {
+    assert.equal(isTransientUpstreamError(400, CAPTCHA_400_BODY), true, "captcha 400 is transient");
+    assert.equal(isTransientUpstreamError(400, '{"error":{"message":"Invalid model"}}'), false, "plain 400 is not");
+    assert.equal(isTransientUpstreamError(401, ""), false, "401 never retried");
+    assert.equal(isTransientUpstreamError(429, ""), true, "429 always retried");
+    assert.equal(isTransientUpstreamError(500, ""), true, "5xx always retried");
+    assert.equal(isTransientUpstreamError(503, "service unavailable"), true);
+    assert.equal(isTransientUpstreamError(200, "captcha"), false, "2xx never classified");
+    assert.equal(REPLAY_MAX_ATTEMPTS, 3);
+});
+
+test("replayBackoffMs: exponential from env-tunable base", () => {
+    process.env.BILI_REPLAY_RETRY_BASE_MS = "100";
+    try {
+        assert.equal(replayBackoffMs(1), 100);
+        assert.equal(replayBackoffMs(2), 200);
+        assert.equal(replayBackoffMs(3), 400);
+    } finally {
+        delete process.env.BILI_REPLAY_RETRY_BASE_MS;
+    }
+    assert.equal(replayBackoffMs(1), 1500, "default base is 1500ms");
+});
+
+test("replayMaxAttempts: env-tunable total attempts (1 = legacy no-retry)", () => {
+    for (const [value, expected] of [["1", 1], ["5", 5], ["0", REPLAY_MAX_ATTEMPTS], ["abc", REPLAY_MAX_ATTEMPTS], ["-2", REPLAY_MAX_ATTEMPTS]] as const) {
+        if (value === "abc") delete process.env.BILI_REPLAY_RETRY_MAX;
+        else process.env.BILI_REPLAY_RETRY_MAX = value;
+        try {
+            assert.equal(replayMaxAttempts(), expected, `BILI_REPLAY_RETRY_MAX=${value}`);
+        } finally {
+            delete process.env.BILI_REPLAY_RETRY_MAX;
+        }
+    }
+    assert.equal(replayMaxAttempts(), REPLAY_MAX_ATTEMPTS, "default is 3");
+});
+
+test("replay retry: BILI_REPLAY_RETRY_MAX=1 → legacy fail-fast (no retry)", async () => {
+    process.env.BILI_REPLAY_RETRY_MAX = "1";
+    let fetchCalls = 0;
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async () => {
+        fetchCalls++;
+        return new Response(CAPTCHA_400_BODY, { status: 400 });
+    }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(compressRound(), { status: 200 }).body!,
+            makeCtx(),
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.equal(fetchCalls, 1, "MAX=1 disables retries (legacy behavior)");
+        assert.ok(out.includes("upstream error 400"), "error surfaced to client");
+        assert.ok(!out.includes("attempt(s)"), "no attempt-count suffix on single attempt");
+    } finally {
+        delete process.env.BILI_REPLAY_RETRY_MAX;
+        globalThis.fetch = orig;
+    }
 });

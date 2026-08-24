@@ -5,6 +5,7 @@ import { createCore, createInitialState, assignRefs, emptyRefMap, defaultConfig 
 import type { Session } from "../src/session.ts";
 import { runCompressLoop, createResponsesAdapter } from "../src/loop/index.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
+import { REPLAY_MAX_ATTEMPTS } from "../src/fetch-util.ts";
 
 function makeCtx(messages: CoreMessage[] = []): {
     core: ReturnType<typeof createCore>;
@@ -394,6 +395,7 @@ test("loop #9 (S2): responses round yields usage → session.stats populated (nu
 });
 
 test("loop #10 (S3): upstream 500 mid-loop terminates cleanly (timer cleared, no hang)", async () => {
+    process.env.BILI_REPLAY_RETRY_BASE_MS = "1";
     const ctx = makeCtx([
         textMsg("m00001", "user", "hello"),
         textMsg("m00002", "assistant", "hi"),
@@ -404,8 +406,12 @@ test("loop #10 (S3): upstream 500 mid-loop terminates cleanly (timer cleared, no
         fcEvents(0, "call_c", "compress", compressArgs),
         COMPLETED,
     ].join("");
+    let fetchCalls = 0;
     const orig = globalThis.fetch;
-    globalThis.fetch = (async () => new Response("upstream error", { status: 500 })) as typeof fetch;
+    globalThis.fetch = (async () => {
+        fetchCalls++;
+        return new Response("upstream error", { status: 500 });
+    }) as typeof fetch;
     try {
         const out = await Promise.race([
             drain(
@@ -417,7 +423,9 @@ test("loop #10 (S3): upstream 500 mid-loop terminates cleanly (timer cleared, no
             new Promise<string>((_, reject) => setTimeout(() => reject(new Error("loop hung (timer not cleared)")), 3000)),
         ]);
         assert.ok(typeof out === "string", "loop terminated cleanly on upstream 500 (S3: timer cleared)");
+        assert.equal(fetchCalls, REPLAY_MAX_ATTEMPTS, "5xx retried with bounded attempts (#189)");
     } finally {
+        delete process.env.BILI_REPLAY_RETRY_BASE_MS;
         globalThis.fetch = orig;
     }
 });
