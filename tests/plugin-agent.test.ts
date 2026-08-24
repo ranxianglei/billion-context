@@ -188,13 +188,16 @@ test("pi extension registers manifest tools and stamps headers when proxied", as
     try {
         const pi = makeFakePi();
         biliPlugin(pi as never);
+        // The header is only stamped once tools are registered, so register
+        // first (a real session does this via session_start before the first
+        // provider request; a one-shot -p run races it and rides wire mode).
+        await pi.events.get("session_start")!({}, fakeCtx(proxy));
+        await waitForTools(pi, 2);
         const headers: Record<string, string> = {};
         pi.events.get("before_provider_headers")!({ headers }, fakeCtx(proxy));
         assert.equal(headers["x-bili-plugin"], "pi");
         assert.equal(headers["x-bili-plugin-conversation"], "sess-42");
         assert.equal(headers["x-bili-plugin-context-window"], "1000000");
-        await pi.events.get("session_start")!({}, fakeCtx(proxy));
-        await waitForTools(pi, 2);
         assert.equal(pi.tools.length, 2);
         assert.equal(pi.tools[0]!.name, "compress");
         assert.deepEqual(pi.tools[0]!.parameters, { type: "object", properties: { content: { type: "array" } }, required: ["content"] });
@@ -207,6 +210,50 @@ test("pi extension registers manifest tools and stamps headers when proxied", as
         assert.equal(errOut.isError, true);
     } finally {
         await proxy.close();
+    }
+});
+
+test("before_provider_headers does not claim plugin mode until tools are registered", async () => {
+    const proxy = await startFakeProxy();
+    try {
+        const pi = makeFakePi();
+        biliPlugin(pi as never);
+        const early: Record<string, string> = {};
+        pi.events.get("before_provider_headers")!({ headers: early }, fakeCtx(proxy));
+        assert.deepEqual(early, {});
+        await pi.events.get("session_start")!({}, fakeCtx(proxy));
+        await waitForTools(pi, 2);
+        const late: Record<string, string> = {};
+        pi.events.get("before_provider_headers")!({ headers: late }, fakeCtx(proxy));
+        assert.equal(late["x-bili-plugin"], "pi");
+        assert.equal(late["x-bili-plugin-conversation"], "sess-42");
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("before_provider_headers stays silent when the manifest fetch keeps failing", async () => {
+    // Graceful degradation: a dead manifest endpoint means the plugin never
+    // claims ownership, so the session rides the proxy's wire mode forever.
+    const server = http.createServer((req, res) => {
+        res.writeHead(404);
+        res.end("{}");
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+        const pi = makeFakePi();
+        biliPlugin(pi as never);
+        await pi.events.get("session_start")!({}, fakeCtx(origin));
+        await flush();
+        await flush();
+        assert.equal(pi.tools.length, 0);
+        const headers: Record<string, string> = {};
+        pi.events.get("before_provider_headers")!({ headers }, fakeCtx(origin));
+        assert.deepEqual(headers, {});
+    } finally {
+        server.close();
     }
 });
 
@@ -354,27 +401,39 @@ test("/acp command warns when the session is unknown", async () => {
 });
 
 test("omp entry reports x-bili-plugin: omp without env vars", async () => {
-    await withEnv({ BILLION_CONTEXT_PLUGIN_AGENT: undefined, BILLION_CONTEXT_PROXY: "http://127.0.0.1:8799" }, () => {
-        const pi = makeFakePi();
-        ompPlugin(pi as never);
-        const headers: Record<string, string> = {};
-        pi.events.get("before_provider_headers")!({ headers }, fakeCtx(undefined));
-        assert.equal(headers["x-bili-plugin"], "omp");
-    });
-    await withEnv({ BILLION_CONTEXT_PLUGIN_AGENT: "omp", BILLION_CONTEXT_PROXY: "http://127.0.0.1:8799" }, () => {
-        const pi = makeFakePi();
-        biliPlugin(pi as never);
-        const headers: Record<string, string> = {};
-        pi.events.get("before_provider_headers")!({ headers }, fakeCtx(undefined));
-        assert.equal(headers["x-bili-plugin"], "omp");
-    });
-    await withEnv({ BILLION_CONTEXT_PLUGIN_AGENT: undefined }, () => {
-        const pi = makeFakePi();
-        createBiliPlugin("dsh")(pi as never);
-        const headers: Record<string, string> = {};
-        pi.events.get("before_provider_headers")!({ headers }, { sessionManager: { getSessionId: () => "s" }, model: { baseUrl: "http://127.0.0.1:8799/bili/https://x" } });
-        assert.equal(headers["x-bili-plugin"], "dsh");
-    });
+    const proxy = await startFakeProxy();
+    try {
+        await withEnv({ BILLION_CONTEXT_PLUGIN_AGENT: undefined, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+            const pi = makeFakePi();
+            ompPlugin(pi as never);
+            await pi.events.get("session_start")!({}, fakeCtx(undefined));
+            await waitForTools(pi, 2);
+            const headers: Record<string, string> = {};
+            pi.events.get("before_provider_headers")!({ headers }, fakeCtx(undefined));
+            assert.equal(headers["x-bili-plugin"], "omp");
+        });
+        await withEnv({ BILLION_CONTEXT_PLUGIN_AGENT: "omp", BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
+            const pi = makeFakePi();
+            biliPlugin(pi as never);
+            await pi.events.get("session_start")!({}, fakeCtx(undefined));
+            await waitForTools(pi, 2);
+            const headers: Record<string, string> = {};
+            pi.events.get("before_provider_headers")!({ headers }, fakeCtx(undefined));
+            assert.equal(headers["x-bili-plugin"], "omp");
+        });
+        await withEnv({ BILLION_CONTEXT_PLUGIN_AGENT: undefined }, async () => {
+            const pi = makeFakePi();
+            createBiliPlugin("dsh")(pi as never);
+            const ctx = { sessionManager: { getSessionId: () => "s" }, model: { baseUrl: `${proxy.origin}/bili/https://x` } };
+            await pi.events.get("session_start")!({}, ctx);
+            await waitForTools(pi, 2);
+            const headers: Record<string, string> = {};
+            pi.events.get("before_provider_headers")!({ headers }, ctx);
+            assert.equal(headers["x-bili-plugin"], "dsh");
+        });
+    } finally {
+        await proxy.close();
+    }
 });
 
 function hintEnv(home: string, piAgentDir: string): Record<string, string> {
