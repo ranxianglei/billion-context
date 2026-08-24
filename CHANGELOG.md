@@ -8,10 +8,112 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 ### Features
 
 - **Customizable compression prompts** (#156): the `compress` block now accepts `prompts` — an override object for the compression prompt text (`compressPhilosophy`, `howToCompressRules`, `tier2DistillRules`, `tier3CondenseRules`) — merged sub-field-wise across the three config levels (global → provider → model) and applied consistently to the system prompt, the nudge text, and the compress loop. Because the kernel's default rules are load-bearing (tuned over months of production use), overrides are **inert until `acknowledgePromptsRisk: true`** is set at the winning level; without it they are ignored and a one-time warning is logged. Non-string fields are silently dropped. Mainly useful for non-English or small-model prompt tuning.
+- **hermes launcher (#223)**: `bili hermes` wraps the hermes-agent (Nous Research) — cert MITM is impossible (httpx builds its own CA bundle from certifi and ignores `SSL_CERT_FILE`), so every upstream is rewritten to the `/bili/` form in an isolated `HERMES_HOME` whose `config.yaml` is a rewritten temp copy (skills/memories/sessions stay shared via symlinks; the real `~/.hermes` is never touched; CRLF endings preserved). Warns clearly when no provider endpoints are found or the config can't be rewritten — traffic then bypasses the proxy visibly instead of silently.
 
 ### Fixes
 
 - **acp-loop replay auto-retry on upstream risk-control rejections** (#189): after a `compress`, the acp-loop replay request can be rejected by provider risk-control — GLM Coding Plan returns `400 {"code":3007,"msg":"captcha verify failed"}` ~1s after the big context rewrite — and the error was passed straight into the agent session as `[acp-proxy: compress loop upstream error 400: ...]`. The replay request (both the streaming loop and the Responses-API JSON loop) now retries transient upstream failures with exponential backoff: up to 3 attempts total, base delay 1500ms doubling per attempt, overridable via `BILI_REPLAY_RETRY_BASE_MS` (ms; `0` disables the delay). Transient = HTTP 429/5xx, or any other 4xx whose body matches risk-control markers (`captcha`, `verify failed`, `risk control`, `风控`, `rate limit`, `too many requests`, `try again`); plain 4xx (bad model, bad params) still fail fast with no retry. Each retry logs a clear line (`upstream rejected replay (HTTP 400 ...); likely provider risk-control — retrying in 1500ms (attempt 1/3)`), and if all attempts fail the surfaced error now says `after 3 attempt(s)` so users can tell it was retried. Set `BILI_REPLAY_RETRY_MAX=1` to restore the previous fail-fast behavior.
+- **Upstream rejection of replayed thinking blocks (#222, issue #221)**: some upstreams (GLM 4.6 thinking) reject the compress-loop re-request when it carries replayed `thinking` blocks with a 400 (`Invalid parameter: thinking_content …`). The compress loop now strips loop-injected thinking and retries the re-request degraded-first: replay with thinking stripped → on failure retry with reasoning dropped entirely → on failure replay raw; each degradation logs a clear line. Only affects the internal re-request — the client stream keeps the original reasoning blocks.
+- **OpenAI SSE tool-call name-split regression (#224)**: some OpenAI-compatible upstreams (SGLang) split the streamed `tool_calls.delta.name` across multiple chunks; the per-chunk proxy-vs-real adjudication dropped split names, so the client received an empty tool name and the agent errored with `Unknown tool ''`. Tool calls are now settled once at `finish_reason` from the fully-buffered deltas: pure-proxy rounds re-emit structured events, real rounds replay the raw chunks verbatim (with `suppressCompletion`), mixed rounds strip only the proxy fragments. Buffer-to-finish also fixes chunk-reordering regressions.
+
+## [0.1.49] — 2026-08-24
+
+### Fixes
+
+- **Context-window registry overhaul (#219, fixes #212)**: stale builtin context limits corrected (DeepSeek 64k→128k, MiniMax host mapping + 204800), resolution is now registry-first (snapshot > builtin table), and the models.dev registry fetch routes through the upstream proxy via undici `ProxyAgent` (Node fetch ignores `https_proxy` — registry lookups work behind GFW/firewalls). Ships a slim offline snapshot (351 models, 12KB) **plus the full models.dev registry bundled in-dist** (282KB, 355 models, all fields) so fresh installs resolve context windows with no network. Web-UI config PUT gains a parse-error guard.
+
+## [0.1.48] — 2026-08-24
+
+### Fixes
+
+- **Responses round-2 lifecycle (#215)**: remapped the round-2 message lifecycle so codex stops dropping text deltas after a proxy tool call.
+- **Launcher never reuses a proxy port (#216)**: always spawns a fresh instance — consecutive launcher runs can no longer attach to a stale proxy holding different config.
+- **Plugin header gating (#217)**: `x-bili-plugin` is stamped only after the plugin tools are registered; a manifest failure falls back to permanent wire mode — a session never claims plugin mode without the tools to back it.
+
+## [0.1.47] — 2026-08-24
+
+### Features
+
+- **opencode launcher (#211)**: `bili opencode` — HTTP upstreams get a `/bili/`-rewritten temp copy of `opencode.json` via `OPENCODE_CONFIG` (with the thin `bili` `/acp` status plugin appended; `BILLION_CONTEXT_PROXY` makes a host opencode-acp plugin self-disable); HTTPS upstreams ride cert-MITM. Also adds `--bin` for non-standard binary names, symlink-safe dist resolution, and `--` arg passthrough.
+- **claude rides `/bili/` (#211)**: Claude Code's undici fetch ignores `HTTPS_PROXY`, so cert-MITM can't reach it — the launcher sets `ANTHROPIC_BASE_URL` to the `/bili/` form directly.
+- **omp launcher (#207)**: `bili omp` — pi-style MITM env plus an isolated `PI_CODING_AGENT_DIR` temp copy of `models.yml` (the real `~/.omp/agent` is never touched).
+- **`/acp` command (#205)**: thin agent plugin adds an `/acp` status command rendering the kernel's `buildStatusPanel` — live compression state with a version footer; omp sessions bind via `prompt_cache_key`.
+
+### Fixes
+
+- **OpenAI SSE passthrough of real tool calls** (with #205): real (non-proxy) tool-call events are re-emitted verbatim instead of re-synthesized, preserving upstream chunk boundaries.
+- **Anthropic round-2 thinking fragmentation (#200)**: round-2 thinking deltas carry the raw delta — stops per-delta content-block fragmentation.
+- **de-JSON compress args (#208)**: `parseCompressInput` delegates to the kernel's `parseCompressArgs` — lenient with JSON-string content.
+
+### Chores
+
+- acp-kernel 0.0.42 (#203, ACP tool surface re-exported from the kernel); persist mechanism delegated to `acp-kernel/persist` StateStore (#198); per-PR npm preview builds in CI (#202).
+
+## [0.1.46] — 2026-08-23
+
+### Fixes
+
+- **applyCompression over the unpruned view (#197)**: compression runs over the full conversation view — compressed-but-unpruned ranges no longer produce wrong boundaries (billion-context-pi#195).
+- **OpenAI system re-injection (#193)**: the client's OpenAI system prompt is re-injected around the kernel hoist (acp-kernel 0.0.37) instead of being dropped.
+- **codexRemove header-only block (#187)**: drops the header-only bili block even without a trailing newline.
+- acp-kernel 0.0.34 → 0.0.36 (#191, #192): sub-viability nudge ranges filtered via kernel `viableRanges`.
+
+## [0.1.45] — 2026-08-22
+
+### Features
+
+- **Builtin thin agent plugins (#173)**: `bili plugin install pi|omp|claude|codex|opencode` — thin agent-side plugins ship inside billion-context itself, registering the four ACP tools natively while the proxy stays the compression engine.
+- acp-kernel 0.0.31 → 0.0.32 (#181, #184).
+
+## [0.1.44] — 2026-08-21
+
+### Features
+
+- **Cooperative plugin protocol (#161)**: agent-side native tools + proxy-owned engine — the protocol behind [PLUGIN.md](PLUGIN.md) (manifest via `GET /__bili/plugin/manifest`, `x-bili-plugin` session header, `x-bili-plugin-context-window` reporting).
+- **Plugin-in-launcher (#163)**: native MCP tools via spawn-time injection (`--mcp-config` for claude, `-c mcp_servers.bili.*` for codex — ephemeral, nothing written to host config).
+
+### Fixes
+
+- **WebSocket upgrades answer a clean 426 (#169)** so codex falls back to HTTP immediately.
+- **Direct-connect 10s handshake timeout (#168)** (#78).
+- **Cache-hit accounting per protocol (#170)** — no double-count.
+- **Context-window self-heal (#172)**: self-heals on upstream overflow and reserves output headroom.
+- **Upstream non-2xx logging (#174)** — status + request-id + body snippet.
+- **Localhost bind normalization (#175)**; codex web card simplified to url-only.
+- **JSON-string compress content (#176)**: `parseCompressInput` accepts JSON-string content.
+- **VSCode Copilot BYOK (#178)**: `total_tokens` in the final chunk + cancel propagation (#177).
+- **Auto-update anti-brick (#179)**: verifies entry files and never overwrites a working install with a broken one.
+
+## [0.1.43] — 2026-08-17
+
+### Refactors
+
+- **acp-kernel/wire adoption (#160)**: codecs move to the kernel (acp-kernel 0.0.26 → 0.0.28, #165); `subagentNamespace` released, unblocking codex subagent compression namespaces (#150).
+
+### Fixes
+
+- **Issues #150 #151 #152 #154 batch (#155)**.
+- **Model identity on the nudge diagnostic line (#164)**.
+
+## [0.1.42] — 2026-08-15
+
+### Features
+
+- **Configurable compression prompts (#157)**: three-level (global → provider → model) prompt overrides, risk-gated — the ancestor of today's `prompts` + `acknowledgePromptsRisk` tuning.
+
+### Fixes
+
+- **Security hardening batch (#141, follow-ups #153)**: network/security fixes for #115 #116 #117 #118 #80 #77 #76 #79 #63 #61 #62 (admin Host gate bypass, port-0 regression, …).
+- **DeepSeek thinking signature (#147)**: the thinking `signature` is kept on compressed re-requests for the DeepSeek Anthropic endpoint (was HTTP 400).
+- **e2e GLM chat-completions bridge (#149, #142)**: e2e covers chat-completions ↔ responses bridging; fixed lost text when a tool_call follows text.
+- **Persist cleanup (#158)**: chain-cleanup rejection swallowed (no more unhandled rejections). acp-kernel 0.0.24.
+
+## [0.1.41] — 2026-08-14
+
+### Fixes
+
+- **Responses non-proxy function_call passthrough (#144)**: non-proxy `function_call` items pass through raw — Codex `agents.*` unsupported-call workflows work.
+- **Windows + cross-platform CI (#140)**: windows-latest added to the CI matrix (path-separator + coarse-mtime test fixes); devlog structure introduced.
 
 ## [0.1.40] — 2026-08-13
 

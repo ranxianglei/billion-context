@@ -104,14 +104,16 @@ and proxy always match versions. Killing it entirely: `BILLION_CONTEXT_PLUGIN=0`
 Hosts without a plugin API (claude, codex, opencode) install the MCP
 bridge instead (`dist/mcp.js`), same protocol underneath.
 
-### Option 0 — Launcher (`bili pi` / `bili codex` / `bili claude`)
+### Option 0 — Launcher (`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode` / `bili hermes`)
 
 The launcher wraps a client in one command: it starts a proxy on an
-independent port (reusing one already running there), then points the client
-at it via **certificate-based MITM** — no config files are edited. The client's
-own config is READ to discover which HTTPS upstream hosts it talks to; those
-hosts are whitelisted for MITM so the proxy can TLS-terminate exactly them and
-blind-tunnel everything else.
+independent port (a fresh instance is always spawned — a port is never
+reused), then points the client at it — **certificate-based MITM** where the
+client honors proxy/CA env vars, or an isolated **`/bili/` config rewrite**
+where it doesn't. No real config file is ever edited; the client's own
+config is READ to discover which HTTPS upstream hosts it talks to, and those
+hosts are whitelisted for MITM so the proxy can TLS-terminate exactly them
+and blind-tunnel everything else.
 
 ```bash
 bili pi                               # launch pi through the proxy
@@ -119,6 +121,9 @@ bili pi -- print "hi"                 # args after the client are passed through
 bili pi-test                          # clean pi (extensions off) — proxy owns compression, no double-compress
 bili codex                            # launch codex through the proxy
 bili claude                           # launch claude through the proxy
+bili omp                              # pi-style: MITM env + isolated temp models.yml
+bili opencode                         # MITM for HTTPS + temp opencode.json (/bili/ for HTTP) + thin /acp plugin
+bili hermes                           # no MITM possible (certifi CA) — isolated HERMES_HOME, all traffic /bili/
 bili test pi                          # quick end-to-end smoke test of the pi path
 bili pi --mitm-domain api.foo.com     # add a domain to the MITM whitelist
 ```
@@ -157,8 +162,11 @@ How the client is pointed at the proxy (set automatically in the child env):
 | Client      | Proxy redirect      | CA trust env var        |
 |-------------|---------------------|-------------------------|
 | pi          | `HTTPS_PROXY`       | `NODE_EXTRA_CA_CERTS`   |
-| claude      | `HTTPS_PROXY`       | `NODE_EXTRA_CA_CERTS`   |
+| claude      | `HTTPS_PROXY` (undici ignores it → `ANTHROPIC_BASE_URL` `/bili/` ride-along) | `NODE_EXTRA_CA_CERTS` |
 | codex       | `HTTPS_PROXY`       | `SSL_CERT_FILE`         |
+| omp         | `HTTPS_PROXY`       | `NODE_EXTRA_CA_CERTS`   |
+| opencode    | `HTTPS_PROXY`       | `NODE_EXTRA_CA_CERTS`   |
+| hermes      | `HERMES_HOME` (temp `config.yaml`, every upstream `/bili/`) | — (no MITM: httpx builds its own CA bundle) |
 
 `NODE_EXTRA_CA_CERTS` *appends* to the built-in trust store, so it points at
 the MITM root alone (`root-ca.pem`). `SSL_CERT_FILE` *replaces* the default
@@ -175,6 +183,9 @@ the client's own config, so whatever you already have set up keeps working:
 | Pi          | `~/.pi/agent/models.json` — each provider's `baseUrl` |
 | Codex       | `~/.codex/config.toml` — each `[model_providers.<name>]` `base_url` (+ top-level `openai_base_url`) |
 | Claude Code | hardcoded `api.anthropic.com` (no per-config upstream) |
+| omp         | `~/.omp/agent/models.yml` — each provider's `baseUrl` |
+| opencode    | `~/.config/opencode/opencode.json` — each provider's `options.baseURL` |
+| hermes      | `~/.hermes/config.yaml` — each provider's `api:`/`base_url:` endpoint |
 
 Only **HTTPS** hosts are MITM'd (a self-signed CA can't intercept plaintext
 anyway); HTTP / `localhost` / `127.0.0.1` providers used to go direct, but are
@@ -199,9 +210,28 @@ runtime rather than from its config file. The proxy port defaults to `8787`;
 if it's taken, a free port is chosen automatically. Use `--passthrough` /
 `--debug` / `--no-auto-update` just like plain `bili`.
 
+For clients whose config can't be pointed at the proxy through env vars, the
+launcher writes an **isolated temp copy** of the client config with the
+discovered upstreams rewritten and points the client at it — the real config
+is never touched, and the temp dir is removed when the client exits:
+
+- **pi / omp** — an isolated `PI_CODING_AGENT_DIR` whose `models.json` /
+  `models.yml` rewrites HTTP upstreams to the `/bili/` form (HTTPS upstreams
+  ride cert-MITM; everything else in the real home is symlinked through).
+- **opencode** — `OPENCODE_CONFIG` pointing at a full copy of `opencode.json`
+  with HTTP upstreams `/bili/`-rewritten **and** the thin `bili` `/acp`
+  status plugin appended to `plugin` (`BILLION_CONTEXT_PROXY` makes a host
+  opencode-acp plugin self-disable so the proxy owns the ACP tools).
+- **hermes** — cert MITM is impossible (httpx builds its own CA bundle from
+  certifi and ignores `SSL_CERT_FILE`), so **every** upstream is rewritten to
+  the `/bili/` form in an isolated `HERMES_HOME` (`config.yaml` copy;
+  skills/memories/sessions stay shared via symlinks). No plugin — hermes has
+  no plugin API; wire-injected tools ride the proxied stream.
+
 > **Note:** the launcher ties the proxy's lifetime to the client — when the
-> client exits, a proxy it started is stopped. If it reuses a proxy you already
-> started with plain `bili`, that one is left running.
+> client exits, the proxy it started is stopped. Each `bili <client>` spawns
+> its own fresh proxy instance; an independently started `bili` on the same
+> port is never reused.
 
 ### Option A — Zero-config (`/bili/` prefix)
 
