@@ -74,3 +74,13 @@
   longer pending.
 - When PR #225 (v0.1.50) merges, move the [Unreleased] block into
   `[0.1.50] — <merge date>` in the next docs pass.
+
+## Follow-up 5: 用户重构 README.zh-CN.md 后的 review 修复
+
+用户在 GitHub 网页直接精简了中文 README(-87 行: 方式0/A/B/C → 方式1/2/3, 删除 plugin-mode/表格/Web UI 章节, install 命令块挪进启动器章节)。review 发现 3 缺陷并修复(e6e481d + 9a52eca):
+
+1. 开头 "2种方式" 与实际三节不一致 → 改 "3种方式" + 补第三 bullet(手动配置文件)
+2. :349 死锚点 `#方式-a-零配置bili-前缀`(标题已改) → 改为纯文字引用「方式 2 —— 改url」
+3. 遗留 TODO 行 → 落成正文「什么时候才需要 install?」段: 压缩永远不需要(wire 注入兜底); 启动器完全不需要; 改url+想要原生面板才 install(pi/omp/opencode 装后多 /acp; claude/codex MCP 工具但无 /acp; hermes 只能 wire); 不装可让模型调 acp_status
+
+尊重用户精简取舍, 未恢复被删内容(Web UI 章节删除是用户决定, 产品功能仍在)。
