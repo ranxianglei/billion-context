@@ -820,7 +820,10 @@ async function handle(
                               ? prepareResponsesCompact(bodyBuffer, parsed as ResponsesRequestBody, session)
                               : prepareResponses(parsed as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, responsesIdentity!, pluginMode);
                 await forward(req, res, opts, prepared!.body, prepared!, core, reqConfig, log, route, affinity);
-                if (pluginMode && prepared) {
+                // Remember for ALL modes (not just plugin): wire clients (dsh,
+                // hermes, unplug'd pi) read the same panel via /__bili/plugin/status
+                // and need the nudge/breakdown sections too.
+                if (prepared) {
                     rememberPluginMessages(sessionId, prepared.processedMessages, prepared.originalMessages, prepared.nudge);
                 }
             });
