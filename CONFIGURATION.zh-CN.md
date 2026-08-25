@@ -620,4 +620,4 @@ bili export <id> --full --output handoff.md
 
 ### Codex 子代理有独立压缩会话
 
-新版 Codex 请求会用 `thread-id` 标识每个 agent，并在 `x-codex-turn-metadata` 中记录同一 ID。billion-context 优先采用这个经过相互印证的 agent 身份，而不是根任务的 `session-id`，因此即使 `instructions` 随轮次变化，主 agent、派生 agent 和审批 reviewer 也不会覆盖彼此的压缩状态。没有这组显式元数据的旧版 Responses 客户端为兼容性继续使用原有的 `instructions` 命名空间 fallback；原生压缩请求末尾的 trigger 则始终留在基础会话中。
+新版 Codex 请求会用 `thread-id` 标识每个 agent，并在 `x-codex-turn-metadata` 中记录同一 ID。billion-context 优先采用这个经过相互印证的 agent 身份，而不是根任务的 `session-id`，因此主 agent、派生 agent 和审批 reviewer 不会覆盖彼此的压缩状态。没有这组 Codex 元数据的请求沿用普通会话身份；`instructions` 属于请求内容并可能随轮次变化，因此不再用作身份判断。
