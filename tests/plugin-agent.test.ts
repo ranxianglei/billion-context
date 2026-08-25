@@ -400,6 +400,44 @@ test("/acp command warns when the session is unknown", async () => {
     }
 });
 
+test("/acp shows armed info when the proxy is live but the session is unknown", async () => {
+    const server = http.createServer((req, res) => {
+        if (req.url?.startsWith("/__bili/plugin/status")) {
+            res.writeHead(404, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: "unknown plugin conversation" }));
+            return;
+        }
+        if (req.url?.startsWith("/__bili/plugin/manifest")) {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true, version: "9.9.9", toolNames: [] }));
+            return;
+        }
+        res.writeHead(404);
+        res.end("{}");
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    try {
+        const pi = makeFakePi();
+        biliPlugin(pi as never);
+        const cmd = pi.commands.get("acp")!;
+        const notes: Array<{ msg: string; type?: string }> = [];
+        const ctx = {
+            sessionManager: { getSessionId: () => "sess-fresh" },
+            model: { baseUrl: `${origin}/bili/https://api.example.com/v1` },
+            ui: { notify: (msg: string, type?: string) => notes.push({ msg, type }) },
+        };
+        await cmd.handler("", ctx);
+        assert.equal(notes.length, 1);
+        assert.equal(notes[0]!.type, "info");
+        assert.match(notes[0]!.msg, /billion-context@9\.9\.9/);
+        assert.match(notes[0]!.msg, /compression armed/);
+    } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+});
+
 test("omp entry reports x-bili-plugin: omp without env vars", async () => {
     const proxy = await startFakeProxy();
     try {

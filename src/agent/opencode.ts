@@ -8,6 +8,8 @@
 //     pending-register queue (POST /__bili/plugin/register on session.created)
 //   - renders the proxy's buildStatusPanel via an ignored chat message
 
+import { fetchProxyVersion } from "./shared.js";
+
 interface OpencodeCommandConfig {
     template: string;
     description?: string;
@@ -102,7 +104,16 @@ const server = async (ctx: OpencodePluginContext): Promise<OpencodeHooks> => {
                 if (typeof status.panel === "string" && status.panel.length > 0) {
                     text = status.panel;
                 } else if (status.ok === false) {
-                    text = "bili: no ACP session yet (send a model request first, then run /acp)";
+                    // zero sessions on the proxy (fresh launch) — friendly idle notice
+                    let version: string | undefined;
+                    try {
+                        version = await fetchProxyVersion(proxyBase);
+                    } catch {
+                        version = undefined;
+                    }
+                    text = version !== undefined
+                        ? `billion-context@${version} — proxy connected, no ACP session yet. Send a model request, then run /acp again.`
+                        : "bili: no ACP session yet (send a model request first, then run /acp)";
                 } else {
                     text = "bili: proxy returned no status panel";
                 }

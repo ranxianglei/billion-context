@@ -5,7 +5,7 @@
 // minimal structural declarations — the bundled artifact imports NOTHING
 // from the host at runtime (the host duck-types us in).
 
-import { detectProxyBase, fetchManifest, forwardTool, fetchStatus, type ManifestTool } from "./shared.js";
+import { detectProxyBase, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, type ManifestTool } from "./shared.js";
 
 type Ctx = {
     sessionManager?: { getSessionId?: () => string } | undefined;
@@ -169,7 +169,24 @@ export function createBiliPlugin(agentOverride?: string): (pi: ExtensionAPI) => 
                         return;
                     }
                     if (status === undefined) {
-                        notify("bili: no ACP session yet (send a model request first, then run /acp)", "warning");
+                        // 404 from a live proxy = this conversation has sent no
+                        // model request yet (e.g. /acp right after startup).
+                        // Probe the manifest to confirm liveness + version and
+                        // show an armed/idle notice instead of a scary warning.
+                        let version: string | undefined;
+                        try {
+                            version = await fetchProxyVersion(proxyBase);
+                        } catch {
+                            version = undefined;
+                        }
+                        if (version !== undefined) {
+                            notify(
+                                `billion-context@${version} — proxy connected, compression armed. No model request in this conversation yet; send one, then run /acp again.`,
+                                "info",
+                            );
+                        } else {
+                            notify("bili: no ACP session yet (send a model request first, then run /acp)", "warning");
+                        }
                         return;
                     }
                     const panel = typeof status.panel === "string" ? status.panel : undefined;
