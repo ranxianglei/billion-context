@@ -344,3 +344,277 @@ Environment variables take precedence over the config file. They are useful for 
 | `ACP_PROVIDERS` | Path to an external `providers.json` (legacy / shared file). |
 | `BILI_REPLAY_RETRY_BASE_MS` | Base backoff delay (ms) for acp-loop replay retries after a transient upstream rejection (default `1500`; set `0` to disable the delay). See #189. |
 | `BILI_REPLAY_RETRY_MAX` | Total attempts for acp-loop replay retries (default `3`; set `1` to disable retries entirely — legacy fail-fast behavior). See #189. |
+| `ACP_SESSION_HEADER` | Conversation-id header name (default `x-acp-session`). |
+| `ACP_REASONING_KEEP` | Responses API only: set `none` to drop all reasoning items. Default routes reasoning through the compression pipeline so it is hidden automatically once its turn is summarized (prevents the unbounded accumulation that broke Codex's prompt-cache prefix). |
+| `ACP_LOG_FILE` | Log file path (default XDG state path; `off` disables the file, keeps stderr). Auto-rotates at 10 MB. |
+| `ACP_DUMP_SSE` | Directory to dump raw SSE frames for debugging. |
+| `BILI_UPSTREAM_PROXY` | Upstream proxy for the proxy's own outbound connections — highest priority, above per-URL/per-provider config. See the README *Upstream proxy* section. |
+| `BILI_PERSIST` | Set `0` to disable session persistence (in-memory only, lost on restart). |
+| `BILI_PERSIST_DEBOUNCE_MS` | Debounce window for persistence writes to disk, in ms (default `500`). |
+| `BILI_MAX_SESSIONS` | Max sessions held in memory (default `256`; LRU eviction — disk is the source of truth). |
+| `BILI_SESSIONS_DIR` | Directory for persisted session state (default XDG data dir). |
+| `BILLION_CONTEXT_PROXY` | Exported by the launcher; client-side bili plugins/extensions detect it and self-disable their own compression (no double compression). |
+| `BILLION_CONTEXT_PLUGIN` | Set `0` to disable plugin mode entirely (wire-level tool injection resumes). |
+| `BILI_LAUNCHER_PLUGIN` | Set `1` to have the launcher inject the bili MCP server for claude/codex (native tools). See [Launcher Reference](#launcher-reference). |
+| `BILI_LAUNCHER_DIRECT` | Set `1` for direct-URL routing in the launcher (drop MITM/CA trust). See [Launcher Reference](#launcher-reference). |
+| `BILI_CLAUDE_UPSTREAM` | claude direct mode: your relay endpoint, when `ANTHROPIC_BASE_URL` already points at a relay the launcher would otherwise bypass. |
+
+---
+
+## CLI Reference
+
+Full command surface (`bili --help` prints an abridged version). Precedence everywhere: **CLI flag > env var > config file > built-in default**.
+
+| Command | What it does |
+|---|---|
+| `bili [start] [options]` | Start the proxy (reads the XDG config file by default) |
+| `bili pi [opts --] [args]` | Start a proxy + launch **pi** against it |
+| `bili pi-test [opts --] [args]` | Like `bili pi`, but adds `--no-extensions` (clean-room test — the proxy owns compression) |
+| `bili codex [opts --] [args]` | Proxy + **codex** |
+| `bili claude [opts --] [args]` | Proxy + **claude** (Claude Code CLI) |
+| `bili omp [opts --] [args]` | Proxy + **omp** (pi-based) |
+| `bili opencode [opts --] [args]` | Proxy + **opencode** |
+| `bili hermes [opts --] [args]` | Proxy + **hermes-agent** (`/bili/` rewrite) |
+| `bili test pi` | Non-polluting end-to-end smoke test of the pi path |
+| `bili export [session] [--full] [--output FILE]` | List persisted sessions / export one as a Markdown handoff — see [Sessions & Migration](#sessions--migration) |
+| `bili update` | Check for & install a newer version now (bypasses the 3-minute throttle) |
+| `bili plugin install <agent>` | Install the native-tool plugin / MCP bridge into a host — see [Plugin Mode](#plugin-mode-native-tools) |
+| `bili plugin remove <agent>` | Remove it again |
+| `bili plugin list` | Show install status for every host |
+| `bili mcp` | Run the bili MCP server standalone on stdio |
+| `bili plugin-register <id> [--origin URL] [--agent name]` | Pre-bind a conversation id to plugin mode (advanced) |
+| `bili --version` / `bili --help` | Print version / help |
+
+Anything after `--` in a launcher command is passed through to the client verbatim (`bili pi -- print "hi"`).
+
+### Options
+
+| Flag | Effect |
+|---|---|
+| `--port <N>` | Listen port (default `8787`) |
+| `--host <ADDR>` | Listen host (default `127.0.0.1`) |
+| `--config <FILE>` | Path to config JSON (default: XDG location) |
+| `--debug` | Verbose logging |
+| `--passthrough` | Forward without compression |
+| `--no-passthrough` | Force compression on (overrides config) |
+| `--no-auto-update` | Disable background self-update for this run |
+| `--mitm-domain <domain>` | Extra MITM whitelist entry (repeatable; launcher only) |
+
+---
+
+## Client Integration
+
+Two ways to point a client at the proxy without the launcher: the **`/bili/` prefix** (API-key clients) and **MITM transparent mode** (login clients with hardcoded endpoints).
+
+### `/bili/` prefix (API-key clients)
+
+Clients you configure with an **API key** (not a login) let you change the upstream URL. Prepend the proxy origin + `/bili/` to it — that's the only change. The API key stays in the client config and is passed through untouched.
+
+**OpenCode** — edit `~/.config/opencode/opencode.json`, change the provider's `baseURL`:
+
+```jsonc
+// before:
+"baseURL": "https://open.bigmodel.cn/api/coding/paas/v4"
+// after (prepend the proxy origin + /bili/):
+"baseURL": "http://localhost:8787/bili/https://open.bigmodel.cn/api/coding/paas/v4"
+```
+
+**Codex (API key)** — edit `~/.codex/config.toml`, change the provider's `base_url`:
+
+```toml
+# before:
+base_url = "https://api.openai.com/v1"
+# after:
+base_url = "http://localhost:8787/bili/https://api.openai.com/v1"
+```
+
+**Codex (ChatGPT login)** — set the top-level `openai_base_url` field (keeps `model_provider = "openai"` and OAuth login intact):
+
+```toml
+# ~/.codex/config.toml (top-level field, not a section)
+model_provider = "openai"
+openai_base_url = "http://localhost:8787/bili/https://chatgpt.com/backend-api/codex"
+```
+
+Run `codex login` as usual; the OAuth token travels in the `Authorization` header, which the proxy forwards untouched.
+
+**Pi** — edit `~/.pi/agent/models.json`, change the provider's `baseUrl`:
+
+```jsonc
+// before:
+"baseUrl": "https://api.anthropic.com"
+// after:
+"baseUrl": "http://localhost:8787/bili/https://api.anthropic.com"
+```
+
+**Other API-key clients** (Cursor / Aider / Continue …) — wherever the upstream URL is configured, prepend `http://localhost:8787/bili/`. Nothing else changes.
+
+The `/bili/` prefix doubles as a **self-detection signal**: billion-context client extensions (billion-context-pi / opencode-acp) recognize it in their own baseUrl and self-disable, so you never get double compression.
+
+### MITM transparent proxy (login clients)
+
+Clients you sign **into an account** (ChatGPT Plus/Pro, Claude, ZCode coding plan, …) authenticate via OAuth and often **hardcode the endpoint** — if you can't change the baseURL, the prefix trick doesn't work. These use MITM mode instead.
+
+How it works: the client only offers an **HTTP proxy** setting, so it sends `CONNECT <host>:443`; billion-context terminates the TLS locally (with a locally-generated root CA), injects compression into the cleartext, re-encrypts and forwards. The OAuth token travels in the client's `Authorization` header, which is forwarded untouched — so the subscription discount is preserved.
+
+Supported MITM clients:
+
+| Client | Login | Endpoint hardcoded | Status |
+|---|---|---|---|
+| **ZCode** | bigmodel coding plan (OAuth) | `open.bigmodel.cn` (builtin provider) | ✅ tested |
+| **Claude Code** | Claude subscription (OAuth) | `api.anthropic.com` | ❓ untested (may not work — needs verification) |
+
+> **Codex exception:** Codex exposes a top-level `openai_base_url` config field, so the ChatGPT login version CAN use the `/bili/` prefix (see above). MITM is not needed for Codex.
+
+MITM is scoped to a **whitelist** of model hosts (`open.bigmodel.cn`, `api.anthropic.com`, `api.openai.com`, `chatgpt.com`). All other HTTPS hosts are blind-tunnelled — billion-context never decrypts non-model traffic.
+
+One-time setup (trust the root CA in the client):
+
+1. Start the proxy once to generate the root CA:
+
+   ```bash
+   bili start
+   ls ~/.local/share/billion-context/ca/root-ca.pem   # exists now
+   ```
+
+2. In the client's **Settings → Network / Proxy** set:
+   - **HTTP Proxy**: `http://127.0.0.1:8787`
+   - **Proxy CA certificate path**: `~/.local/share/billion-context/ca/root-ca.pem`
+   - (optional) **No-proxy list**: `localhost,127.0.0.1`
+   - (For ZCode specifically: **Settings → Network**. For Claude Code, set the `HTTPS_PROXY` env var and `NODE_EXTRA_CA_CERTS` to the CA path.)
+
+3. Restart the client. Its model traffic now flows through billion-context with compression injected. Send a message and check the proxy log (`~/.local/state/billion-context/bili.log`) for `mitm <host>:443 tunnel established`.
+
+> The root CA is generated locally and lives only on this machine; it is **not** a system-wide install. Only the client you configure (via its CA-path setting) trusts it, so no other app is affected. Deleting the CA files and restarting the proxy regenerates them.
+
+To give a MITM login client its **own upstream proxy** (firewall/GFW) without affecting API-key clients on the same host, use the `mitm://` scheme key — see the README's *Upstream proxy* section.
+
+---
+
+## Launcher Reference
+
+`bili <client>` brings up a proxy on an independent port (a **fresh instance every launch** — an already-running `bili start` is never reused, #216), then runs the client pointed at it. **No config-file edits**: the client's own config is **read** (never edited) to discover which upstream hosts it talks to; those hosts are auto-whitelisted for MITM so the proxy TLS-terminates exactly the hosts the client uses. When the client exits, a proxy the launcher started is stopped.
+
+Both upstream schemes are covered automatically, with no config edits:
+
+- **HTTPS upstreams → cert MITM.** The client is pointed at the proxy via `HTTPS_PROXY` and trusts the proxy's MITM root CA (`~/.local/share/billion-context/ca/root-ca.pem`, generated lazily). Compression is injected on the intercepted TLS stream.
+- **HTTP / localhost upstreams → `/bili/` baseURL rewrite** (plaintext can't be MITM'd). The launcher rewrites the client's base URL through the client's own mechanism, via an isolated temp copy of its config — the real config files are never touched (details below).
+
+How each client is pointed at the proxy (set automatically in the child env):
+
+| Client | Redirect | CA trust |
+|---|---|---|
+| pi | `HTTPS_PROXY` + isolated `PI_CODING_AGENT_DIR` | `NODE_EXTRA_CA_CERTS` |
+| omp | `HTTPS_PROXY` + isolated `PI_CODING_AGENT_DIR` | `NODE_EXTRA_CA_CERTS` |
+| codex | `HTTPS_PROXY` + `-c key=value` overrides | `SSL_CERT_FILE` → `combined-ca.pem` |
+| claude | `ANTHROPIC_BASE_URL` = `/bili/` URL | none needed |
+| opencode | `HTTPS_PROXY` + isolated `OPENCODE_CONFIG` | `NODE_EXTRA_CA_CERTS` |
+| hermes | isolated `HERMES_HOME`; **all** upstreams `/bili/` | none (certifi ignores `SSL_CERT_FILE`) |
+
+`NODE_EXTRA_CA_CERTS` *appends* to the built-in trust store, so it points at the MITM root alone (`root-ca.pem`). `SSL_CERT_FILE` *replaces* the default CA bundle, so for codex it points at `combined-ca.pem` — a bundle containing the MITM root **plus** the system/Node public roots — keeping pip/git/curl style TLS (blind-tunnelled, real certificates) working inside the child env (#152).
+
+Claude Code's undici fetch ignores `HTTPS_PROXY`, so cert MITM cannot intercept it. Every claude upstream — including a pre-configured `ANTHROPIC_BASE_URL` relay — is routed through the `/bili/` URL form via `ANTHROPIC_BASE_URL` instead; no CA trust is required.
+
+Where upstreams are discovered from (read-only):
+
+| Client | Read from |
+|---|---|
+| Pi | `~/.pi/agent/models.json` — each provider's `baseUrl` |
+| omp | `~/.omp/agent/models.yml` — each provider's `baseUrl` |
+| Codex | `~/.codex/config.toml` — each `[model_providers.<name>]` `base_url` (+ top-level `openai_base_url`) |
+| Claude Code | `ANTHROPIC_BASE_URL` env var, else hardcoded `api.anthropic.com` |
+| OpenCode | `~/.config/opencode/opencode.json` — each provider's `baseURL` |
+| hermes | `~/.hermes/config.yaml` — each provider's endpoint lines |
+
+### Isolated temp config (what gets written)
+
+The `/bili/` rewrite modes write a **temp copy** — the real config is never edited — and the temp dir is removed when the client exits:
+
+- **pi / omp** — an isolated `PI_CODING_AGENT_DIR` (under `/tmp`) containing only a rewritten `models.json` / `models.yml` with the `/bili/`-wrapped plaintext baseUrls. Everything else (`settings.json`, `sessions/`, `auth.json`, extensions…) is **symlinked** to the real pi/omp home, so sessions and logins are shared: a conversation started under the launcher continues seamlessly in a bare client, and vice versa.
+- **opencode** — a temp `opencode.json` pointed at by `OPENCODE_CONFIG`, with `/bili/`-rewritten baseURLs **plus the thin `/acp` plugin appended** (native tools out of the box; the standalone `opencode-acp` plugin self-disables via `BILLION_CONTEXT_PROXY`).
+- **hermes** — an isolated `HERMES_HOME` with a rewritten `config.yaml` routing **every** upstream (HTTP and HTTPS) through `/bili/` (httpx builds its own CA bundle and ignores `SSL_CERT_FILE`, so cert MITM is impossible). `skills/`, `memories/`, `sessions/` are symlinked through. If no providers are configured — or `config.yaml` can't be rewritten — the launcher prints a warning and hermes runs **unproxied** (compression off).
+
+### Native tools in the launcher
+
+- **pi** — if the plugin is NOT installed, the launcher rides pi's `-e <file>` flag to load `dist/agent/pi.js` for that run only (nothing is written): native tools + the `/acp` command out of the box. If it IS installed, the symlinked `settings.json` already loads it — no `-e` is added.
+- **omp** — ships with the plugin built in; nothing to do.
+- **opencode** — the temp config appends the thin plugin automatically.
+- **claude / codex** — opt-in via `BILI_LAUNCHER_PLUGIN=1`: the launcher additionally injects a single `bili` MCP server (`--mcp-config` for claude, `-c mcp_servers.bili.*` for codex — both ephemeral, nothing written to host config). The default stays wire mode while host-flag compatibility soaks (verified with claude 2.1.227 / codex 0.147.0). `BILI_LAUNCHER_PLUGIN=0` forces plain wire mode.
+- **hermes** — no plugin API; always wire mode.
+
+Launcher-mode matrix:
+
+| Mode | Tools surface | Setup |
+|---|---|---|
+| Launcher + MCP (`BILI_LAUNCHER_PLUGIN=1`, claude/codex) | native MCP tools | one env var |
+| Launcher wire mode (default for claude/codex) | proxy-injected wire tools | none — just `bili claude` / `bili codex` |
+| Launcher `-e` / auto-plugin (pi, opencode; omp built-in) | native plugin tools | none |
+| Manual plugin (`bili plugin install`) | agent-side plugin | run install |
+| Manual baseURL (`/bili/` prefix) | proxy-injected wire tools | edit client config |
+
+### Direct-URL mode (opt-in)
+
+`BILI_LAUNCHER_DIRECT=1` drops MITM/CA trust entirely — claude's `ANTHROPIC_BASE_URL` / codex's provider `base_url` point at the `/bili/` prefix directly. Warnings:
+
+- **codex direct mode**: the LLM traffic does **not** go through the proxy, so compression is not applied — only the bili MCP tool calls do. For full compression use the default MITM mode (unset `BILI_LAUNCHER_DIRECT`).
+- **claude direct mode**: `ANTHROPIC_BASE_URL` is overridden to the proxy; a pre-configured relay is bypassed unless `BILI_CLAUDE_UPSTREAM=<relay>` is set. OAuth-subscription traffic requires the default MITM mode.
+
+`--mitm-domain <domain>` (repeatable) adds extra domains to the MITM whitelist beyond what auto-discovery finds — useful for hosts the client fetches at runtime rather than from its config file. The launcher picks a free port automatically if the default is taken; `--passthrough` / `--debug` / `--no-auto-update` work like plain `bili`.
+
+---
+
+## Plugin Mode (native tools)
+
+For a native-plugin experience, an agent can run a small cooperative plugin alongside the proxy: the plugin registers the four ACP tools (`compress` / `decompress` / `search_context` / `acp_status`) natively with the agent and drives the agent's own tool loop, while the proxy stays the compression authority (state, history folding, philosophy prompt, nudges). Tool schemas are served by the proxy itself (`GET /__bili/plugin/manifest`), so plugin and proxy can never drift. Protocol spec: [PLUGIN.md](PLUGIN.md).
+
+Plugin-equipped sessions are detected automatically via request headers — wire-level tool injection is then suppressed for them (no double compression, native tool UX). Works in both proxy modes: the `/bili/` prefix baseURL **and** MITM transparent mode. The plugin can also report the agent's own model context window (`x-bili-plugin-context-window`) and read live context usage via `GET /__bili/plugin/status`.
+
+### install / remove / list
+
+```bash
+bili plugin install pi      # add this billion-context install to pi's settings.json (packages)
+bili plugin install omp     # same for omp (config.yml extensions)
+bili plugin install claude  # register the bili MCP server (claude mcp add, user scope)
+bili plugin install codex   # append [mcp_servers.bili] to ~/.codex/config.toml
+bili plugin install opencode  # add mcp.bili to ~/.config/opencode/opencode.json
+bili plugin list            # install status for every supported host
+bili plugin remove pi       # undo (original files backed up to *.bili-bak once)
+```
+
+`install pi` also replaces any **legacy** billion-context entries (old `npm:billion-context-pi` references, stale `npm:billion-context@x.y.z`, leftover dev-checkout paths) so exactly one bili plugin stays live.
+
+The installed plugin is a **thin** one (~5 KB, zero runtime deps): it detects the proxy (from the `/bili/` baseURL or `BILLION_CONTEXT_PROXY`), fetches tool schemas from the proxy, registers native tools, and forwards executions — the proxy remains the single compression authority, so plugin and proxy always match versions. Hosts without a plugin API (claude, codex, opencode) install the MCP bridge (`dist/mcp.js`) instead — same protocol underneath, though MCP has no slash-commands (no `/acp` panel command).
+
+Kill switch: `BILLION_CONTEXT_PLUGIN=0` disables plugin mode entirely (wire-level injection resumes).
+
+**When do you need `plugin install` at all?** Launcher users mostly don't (see [Launcher Reference](#launcher-reference) — pi gets `-e`, opencode auto-injects, omp ships with it, claude/codex opt in via `BILI_LAUNCHER_PLUGIN=1`, hermes is wire-only). It's for a manually-configured client (`/bili/` prefix or MITM) where you want the native panel: pi/omp/opencode get native tools + `/acp`; claude/codex get native MCP tools (no `/acp`); hermes can't (wire only). Without any plugin everything still works — compression runs via wire-injected tools, and the model can be asked to call `acp_status` to check live usage.
+
+---
+
+## Sessions & Migration
+
+### Compression state lives in the proxy (#151)
+
+Compression state (blocks, summaries, original message cache) lives **in the proxy**, not in the client. The client's own local history is the full uncompressed view. Two consequences:
+
+- If you point the client back at the real upstream (or stop the proxy), the client replays its **full local history** every turn. After a long compressed session this can exceed the model's context window (`context_window_exceeded`).
+- There is no way to "unpack" a compression block into the client's local history — the client never saw the compressed form.
+
+### Migrating off the proxy
+
+Export the session and paste it into a fresh conversation as a handoff:
+
+```bash
+bili export                      # list persisted sessions (id, label, blocks)
+bili export <id|label>           # print a Markdown handoff (block summaries)
+bili export <id> --full          # include the original messages per block
+bili export <id> --full --output handoff.md
+```
+
+Then start a new conversation in the client (direct to upstream) and paste the handoff doc as the opening context.
+
+### Codex subagents get their own compression namespace (#150)
+
+Codex subagents (e.g. the `guardian_subagent` approval reviewer) reuse the main conversation's `session_id`, so on the wire they look like the same session. Without care their requests inherit the main conversation's compression state — a subagent turn can get its context folded (losing the verbatim user authorization it must read back) and the two roles' usage estimates pollute each other.
+
+billion-context detects this via the `instructions` field: subagent requests carry their own role prompt. The **first** instructions seen for a conversation anchor the main namespace (stable even if the main prompt drifts); any other instructions value maps to a separate `|sub:` namespace with its own empty compression state. Subagent requests are self-contained replays, so the fresh namespace is lossless — and the web UI's session list shows the two namespaces as separate sessions sharing the same client label.
