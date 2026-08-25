@@ -77,7 +77,7 @@ Top-level keys that control how the proxy listens and behaves globally.
 - **Type:** `string`
 - **Default:** `127.0.0.1`
 - **Status:** ACTIVE
-- **Description:** Network interface the proxy binds to. `127.0.0.1` (default) listens only on localhost — safe for a local sidecar. Use `::` for IPv4 + IPv6 dual-stack. Use `0.0.0.0` inside a container to expose the proxy on all interfaces (ensure the surrounding network is trusted). Overridden by `ACP_HOST` / `--host`.
+- **Description:** Network interface the proxy binds to. `127.0.0.1` (default) listens only on localhost — safe for a local sidecar. Use `::` for IPv4 + IPv6 dual-stack. Use `0.0.0.0` (or a LAN IP) to expose the proxy to other machines — typically inside a container or on a trusted LAN: remote agents then point their model `baseURL` at `http://<this-host>:<port>/bili/…`, and MITM-mode `CONNECT` accepts remote clients for whitelisted model hosts only (blind tunnels stay loopback-only, and `/__bili/` management endpoints remain loopback-only). There is no authentication — ensure the surrounding network is trusted. Overridden by `ACP_HOST` / `--host`.
 
 ### `sessionHeader`
 
