@@ -57,6 +57,12 @@ type Logger = (msg: string) => void;
  *    3. If host is NOT on the whitelist → blind TCP tunnel (CONNECT 200 +
  *       bidirectional pipe). We never see the cleartext.
  *
+ *  Remote-client policy (#240): loopback clients get the full behavior above.
+ *  When the server is explicitly bound to a non-loopback host
+ *  (`--host 0.0.0.0` / LAN IP), `allowRemoteClients` lets remote clients use
+ *  CONNECT — but ONLY for MITM-whitelisted hosts. Blind tunnels stay
+ *  loopback-only so the proxy can never serve as an open TCP relay.
+ *
  *  This means MITM mode reuses 100% of the existing request pipeline — no
  *  second code path for compression/forwarding. */
 export function setupMitm(
@@ -64,11 +70,13 @@ export function setupMitm(
     extraDomains: string[] = [],
     log: Logger = () => {},
     resolveProxyUrl?: (host: string) => string | undefined,
+    allowRemoteClients = false,
 ): void {
     ensureRootCA();
     server.on("connect", (req: http.IncomingMessage, clientSocket: net.Socket, head: Buffer) => {
-        if (!isLoopbackAddress(clientSocket.remoteAddress)) {
-            log(`CONNECT ${req.url} rejected: non-loopback client ${clientSocket.remoteAddress}`);
+        const remote = !isLoopbackAddress(clientSocket.remoteAddress);
+        if (remote && !allowRemoteClients) {
+            log(`CONNECT ${req.url} rejected: non-loopback client ${clientSocket.remoteAddress} (bind a non-loopback --host to allow remote clients)`);
             // end() (not write+destroy) so the 403 bytes are flushed before close.
             clientSocket.end("HTTP/1.1 403 Forbidden\r\n\r\n");
             return;
@@ -76,6 +84,15 @@ export function setupMitm(
         const { hostname, port } = parseHostPort(req.url ?? "");
         const targetPort = port || 443;
         if (!isMitmHost(hostname, extraDomains)) {
+            if (remote) {
+                // Blind tunnels are a loopback-only convenience: a remote
+                // client must not use this proxy as an open TCP relay to
+                // arbitrary hosts. Remote CONNECT is for MITM-whitelisted
+                // model endpoints only.
+                log(`CONNECT ${req.url} rejected: remote client ${clientSocket.remoteAddress} tunneling non-whitelisted host`);
+                clientSocket.end("HTTP/1.1 403 Forbidden\r\n\r\n");
+                return;
+            }
             const proxyUrl = resolveProxyUrl?.(hostname);
             tunnelThrough(clientSocket, hostname, targetPort, head, log, proxyUrl);
             return;

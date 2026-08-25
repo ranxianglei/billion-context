@@ -209,10 +209,19 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         );
     });
     if (opts.mitm.enabled) {
-        setupMitm(server, opts.mitm.domains, (msg) => log("info", msg), (host) => resolveProxy(opts.routes, opts.proxy, `https://${host}`, opts.proxyFallback));
+        // Non-loopback bind (--host 0.0.0.0 / LAN IP) opts into serving
+        // remote clients: CONNECT is then allowed for non-loopback clients
+        // (whitelisted model hosts only — see setupMitm). Loopback binds
+        // keep the strict loopback-only CONNECT gate (#240).
+        const allowRemoteConnect = opts.host === "0.0.0.0" || opts.host === "::" || !isLoopbackAddress(opts.host);
+        setupMitm(server, opts.mitm.domains, (msg) => log("info", msg), (host) => resolveProxy(opts.routes, opts.proxy, `https://${host}`, opts.proxyFallback), allowRemoteConnect);
     }
     server.listen(opts.port, opts.host, () => {
-        const displayHost = opts.host === "0.0.0.0" ? "localhost" : opts.host;
+        const nonLoopbackBind = opts.host === "0.0.0.0" || opts.host === "::" || !isLoopbackAddress(opts.host);
+        // Honest bind display: a wildcard bind shows as 0.0.0.0 (the user
+        // chose to expose the proxy — hiding it behind "localhost" made
+        // remote setups look broken in the log, see #240).
+        const displayHost = nonLoopbackBind ? opts.host : opts.host === "0.0.0.0" ? "localhost" : opts.host;
         try {
             fs.mkdirSync(stateDir(), { recursive: true });
             // Discovery origin local MCP shells dial: collapse wildcard
@@ -233,6 +242,12 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 (nOverrides ? ` — context overrides for ${nOverrides} upstream URL(s)` : "")
                 + (opts.mitm.enabled ? ` — MITM proxy on (whitelist)${opts.mitm.domains.length ? ` +${opts.mitm.domains.join(",")}` : ""}` : ""),
         );
+        if (nonLoopbackBind) {
+            log(
+                "warn",
+                `[security] bound to ${opts.host} — proxy endpoints (/bili/, CONNECT for whitelisted model hosts) are reachable from the network with NO authentication; /__bili/ management endpoints stay loopback-only. Restrict access with a firewall on untrusted networks. Remote agents: point baseURL at http://<this-host>:${opts.port}/bili/`,
+            );
+        }
         if (opts.debug) {
             log("info", `[debug] build features: raw-HTTP-capture(on) | remote_compaction_v2-strip(on) | cert-MITM-launcher(on) | strip-acp-summary(on) — seeing this line confirms the launcher build (not registry 0.1.34)`);
         }
