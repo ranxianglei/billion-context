@@ -113,3 +113,13 @@ export async function fetchStatus(proxyBase: string, conversationId: string): Pr
     if (!ok || !json || typeof json !== "object") return undefined;
     return json as Record<string, unknown>;
 }
+
+/** Liveness + version probe for status UIs: same loopback origin as the
+ *  status endpoint, so a 404 status + a live manifest means "proxy up,
+ *  conversation not seen yet" — an armed-but-idle state, not an error. */
+export async function fetchProxyVersion(proxyBase: string): Promise<string | undefined> {
+    const { ok, json } = await fetchJson(`${proxyBase}/__bili/plugin/manifest`, undefined, STATUS_TIMEOUT_MS);
+    if (!ok || !json || typeof json !== "object") return undefined;
+    const version = (json as { version?: unknown }).version;
+    return typeof version === "string" && version.length > 0 ? version : undefined;
+}
