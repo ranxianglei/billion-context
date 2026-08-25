@@ -342,3 +342,279 @@
 | `ACP_LOG` | 设为 `0` 关闭请求日志。 |
 | `ACP_AUTO_UPDATE` | 设为 `0` 禁用自动更新检查。 |
 | `ACP_PROVIDERS` | 指向外部 `providers.json` 的路径（旧版 / 共享文件）。 |
+| `BILI_REPLAY_RETRY_BASE_MS` | acp-loop 回放重试的基础退避延迟（毫秒）：上游瞬时拒绝后重试（默认 `1500`；设 `0` 关闭延迟）。见 #189。 |
+| `BILI_REPLAY_RETRY_MAX` | acp-loop 回放重试的总次数（默认 `3`；设 `1` 彻底关闭重试 —— 旧版 fail-fast 行为）。见 #189。 |
+| `ACP_SESSION_HEADER` | 会话 id 请求头名称（默认 `x-acp-session`）。 |
+| `ACP_REASONING_KEEP` | 仅 Responses API：设 `none` 丢弃全部 reasoning 项。默认让 reasoning 走压缩管道，其轮次被摘要后自动隐藏（避免无限累积破坏 Codex 的 prompt-cache 前缀）。 |
+| `ACP_LOG_FILE` | 日志文件路径（默认 XDG state 路径；`off` 关闭文件只保留 stderr）。10 MB 自动轮转。 |
+| `ACP_DUMP_SSE` | 调试用：转储原始 SSE 帧的目录。 |
+| `BILI_UPSTREAM_PROXY` | 代理自身出站连接的上游代理 —— 优先级最高，高于 per-URL/per-provider 配置。见 README「上游代理」一节。 |
+| `BILI_PERSIST` | 设 `0` 关闭会话持久化（仅内存，重启即丢）。 |
+| `BILI_PERSIST_DEBOUNCE_MS` | 持久化写盘的防抖窗口（毫秒，默认 `500`）。 |
+| `BILI_MAX_SESSIONS` | 内存中最多保留的会话数（默认 `256`；LRU 淘汰 —— 磁盘是事实源）。 |
+| `BILI_SESSIONS_DIR` | 会话持久化目录（默认 XDG data 目录）。 |
+| `BILLION_CONTEXT_PROXY` | launcher 会导出它；客户端侧 bili 插件/扩展检测到后自禁用自身压缩（避免双重压缩）。 |
+| `BILLION_CONTEXT_PLUGIN` | 设 `0` 彻底关闭插件模式（恢复 wire 层工具注入）。 |
+| `BILI_LAUNCHER_PLUGIN` | 设 `1` 让 launcher 为 claude/codex 注入 bili MCP 服务器（原生工具）。见[启动器参考](#启动器参考)。 |
+| `BILI_LAUNCHER_DIRECT` | 设 `1` 启用 launcher 直连 URL 路由（放弃 MITM/CA 信任）。见[启动器参考](#启动器参考)。 |
+| `BILI_CLAUDE_UPSTREAM` | claude 直连模式：当 `ANTHROPIC_BASE_URL` 已指向某个 relay 时，用它指定你的 relay 端点（否则会被旁路）。 |
+
+---
+
+## CLI 参考
+
+完整命令面（`bili --help` 打印的是精简版）。优先级处处一致：**CLI 参数 > 环境变量 > 配置文件 > 内置默认值**。
+
+| 命令 | 作用 |
+|---|---|
+| `bili [start] [options]` | 启动代理（默认读取 XDG 配置文件） |
+| `bili pi [opts --] [args]` | 启动代理 + 拉起 **pi** 接入它 |
+| `bili pi-test [opts --] [args]` | 类似 `bili pi`，但追加 `--no-extensions`（干净测试 —— 压缩完全由代理负责） |
+| `bili codex [opts --] [args]` | 代理 + **codex** |
+| `bili claude [opts --] [args]` | 代理 + **claude**（Claude Code CLI） |
+| `bili omp [opts --] [args]` | 代理 + **omp**（pi 内核） |
+| `bili opencode [opts --] [args]` | 代理 + **opencode** |
+| `bili hermes [opts --] [args]` | 代理 + **hermes-agent**（`/bili/` 重写） |
+| `bili test pi` | 无污染的 pi 链路端到端冒烟测试 |
+| `bili export [session] [--full] [--output FILE]` | 列出持久化会话 / 把一个会话导出为 Markdown 交接文档 —— 见[会话与迁移](#会话与迁移) |
+| `bili update` | 立即检查并安装新版本（绕过 3 分钟节流） |
+| `bili plugin install <agent>` | 把原生工具插件 / MCP 桥装进宿主 —— 见[插件模式（原生工具）](#插件模式原生工具) |
+| `bili plugin remove <agent>` | 卸载 |
+| `bili plugin list` | 显示每个宿主的安装状态 |
+| `bili mcp` | 独立运行 bili MCP 服务器（stdio） |
+| `bili plugin-register <id> [--origin URL] [--agent name]` | 预绑定会话 id 到插件模式（高级用法） |
+| `bili --version` / `bili --help` | 打印版本 / 帮助 |
+
+launcher 命令里 `--` 之后的参数原样透传给客户端（`bili pi -- print "hi"`）。
+
+### 参数
+
+| 参数 | 作用 |
+|---|---|
+| `--port <N>` | 监听端口（默认 `8787`） |
+| `--host <ADDR>` | 监听主机（默认 `127.0.0.1`） |
+| `--config <FILE>` | 配置 JSON 路径（默认： XDG 位置） |
+| `--debug` | 详细日志 |
+| `--passthrough` | 不经压缩直接转发 |
+| `--no-passthrough` | 强制开启压缩（覆盖配置文件） |
+| `--no-auto-update` | 本次运行禁用后台自动更新 |
+| `--mitm-domain <domain>` | 追加 MITM 白名单域名（可重复；仅 launcher） |
+
+---
+
+## 客户端接入
+
+不用 launcher 时，把客户端指向代理有两种方式：**`/bili/` 前缀**（API-key 客户端）和 **MITM 透明代理**（端点硬编码的登录客户端）。
+
+### `/bili/` 前缀（API-key 客户端）
+
+用 **API key** 配置（不是登录账号）的客户端允许你改上游 URL。只需在前面加上代理地址 + `/bili/`，其他都不用改。API key 仍留在客户端配置里，代理原样透传。
+
+**OpenCode** —— 编辑 `~/.config/opencode/opencode.json`，改 provider 的 `baseURL`：
+
+```jsonc
+// 之前：
+"baseURL": "https://open.bigmodel.cn/api/coding/paas/v4"
+// 之后（前面加上代理地址 + /bili/）：
+"baseURL": "http://localhost:8787/bili/https://open.bigmodel.cn/api/coding/paas/v4"
+```
+
+**Codex（API key 模式）** —— 编辑 `~/.codex/config.toml`，改 provider 的 `base_url`：
+
+```toml
+# 之前：
+base_url = "https://api.openai.com/v1"
+# 之后：
+base_url = "http://localhost:8787/bili/https://api.openai.com/v1"
+```
+
+**Codex（ChatGPT 登录）** —— 设顶层 `openai_base_url` 字段（保持 `model_provider = "openai"` 和 OAuth 登录不变）：
+
+```toml
+# ~/.codex/config.toml（顶层字段，不是 section）
+model_provider = "openai"
+openai_base_url = "http://localhost:8787/bili/https://chatgpt.com/backend-api/codex"
+```
+
+照常运行 `codex login`；OAuth token 随 `Authorization` 头传输，代理原样转发给上游。
+
+**Pi** —— 编辑 `~/.pi/agent/models.json`，改 provider 的 `baseUrl`：
+
+```jsonc
+// 之前：
+"baseUrl": "https://api.anthropic.com"
+// 之后：
+"baseUrl": "http://localhost:8787/bili/https://api.anthropic.com"
+```
+
+**其他 API-key 客户端（Cursor / Aider / Continue ……）** —— 只要配置了上游 URL，前面加 `http://localhost:8787/bili/` 就行，其他都不用改。
+
+`/bili/` 前缀还是个**自检测信号**：billion-context 的客户端扩展（billion-context-pi / opencode-acp）能在自己的 baseUrl 里认出它并自禁用，避免双层压缩。
+
+### MITM 透明代理（登录/订阅客户端）
+
+用**账号登录**的客户端（ChatGPT Plus/Pro、Claude、ZCode coding plan ……）走 OAuth 认证，且通常**硬编码端点** —— 改不了 baseURL 就没法用前缀方式，这类客户端要用 MITM 模式。
+
+原理：这类客户端只提供 **HTTP 代理**设置，所以它发送 `CONNECT <host>:443`；billion-context 在本地终结 TLS（用本地生成的根 CA），把压缩注入明文，再重新加密转发。OAuth token 随客户端的 `Authorization` 头传输、原样转发 —— 订阅折扣得以保留。
+
+支持的 MITM 客户端：
+
+| 客户端 | 登录方式 | 硬编码端点 | 状态 |
+|---|---|---|---|
+| **ZCode** | bigmodel coding plan（OAuth） | `open.bigmodel.cn`（内置 provider） | ✅ 已测试 |
+| **Claude Code** | Claude 订阅（OAuth） | `api.anthropic.com` | ❓ 未测试（可能不可用 —— 待验证） |
+
+> **Codex 例外：** Codex 暴露顶层 `openai_base_url` 配置字段，所以 ChatGPT 登录版**可以**用 `/bili/` 前缀（见上文）。Codex 不需要 MITM。
+
+MITM 只对一份**白名单**中的模型域名生效（`open.bigmodel.cn`、`api.anthropic.com`、`api.openai.com`、`chatgpt.com`）。其余 HTTPS 主机全部盲转发 —— billion-context 绝不解密非模型流量。
+
+一次性设置（在客户端里信任根 CA）：
+
+1. 启动一次代理以生成根 CA：
+
+   ```bash
+   bili start
+   ls ~/.local/share/billion-context/ca/root-ca.pem   # 现在存在了
+   ```
+
+2. 在客户端的 **设置 → 网络 / 代理** 里设：
+   - **HTTP 代理**： `http://127.0.0.1:8787`
+   - **代理 CA 证书路径**： `~/.local/share/billion-context/ca/root-ca.pem`
+   - （可选）**No-proxy 列表**： `localhost,127.0.0.1`
+   - （ZCode 具体位置：**Settings → Network**。Claude Code 则设 `HTTPS_PROXY` 环境变量、`NODE_EXTRA_CA_CERTS` 指向 CA 路径。）
+
+3. 重启客户端。它的模型流量从此流经 billion-context 并注入压缩。发一条消息，在代理日志（`~/.local/state/billion-context/bili.log`）里找 `mitm <host>:443 tunnel established`。
+
+> 根 CA 在本地生成、只存在于本机 —— **不是**系统级安装。只有你配置的那个客户端（通过它的 CA 路径设置）信任它，其他应用不受影响。删掉 CA 文件并重启代理会重新生成。
+
+要给 MITM 登录客户端配**专属上游代理**（防火墙/GFW）而不影响同一域名上的 API-key 客户端，用 `mitm://` scheme 键 —— 见 README「上游代理」一节。
+
+---
+
+## 启动器参考
+
+`bili <client>` 在一个独立端口拉起代理（**每次启动都是全新实例** —— 不会复用已在运行的 `bili start`，#216），然后把客户端指向它。**不改动任何配置文件**：启动器只**读取**（绝不编辑）客户端自己的配置来发现它访问哪些上游主机；这些主机自动加入 MITM 白名单。客户端退出时，启动器拉起的代理随之停止。
+
+两种上游方案全自动覆盖，无需配置：
+
+- **HTTPS 上游 → 证书 MITM。** 通过 `HTTPS_PROXY` 把客户端指向代理，并让它信任代理的 MITM 根 CA（`~/.local/share/billion-context/ca/root-ca.pem`，惰性生成）。压缩注入在被拦截的 TLS 流上。
+- **HTTP / localhost 上游 → `/bili/` baseURL 重写**（明文没法 MITM）。启动器通过客户端自己的机制重写 base URL，走的是配置的隔离临时副本 —— 真实配置文件一个字节都不碰（见下文）。
+
+各客户端如何被指向代理（自动设置在子进程环境里）：
+
+| 客户端 | 重定向方式 | CA 信任 |
+|---|---|---|
+| pi | `HTTPS_PROXY` + 隔离 `PI_CODING_AGENT_DIR` | `NODE_EXTRA_CA_CERTS` |
+| omp | `HTTPS_PROXY` + 隔离 `PI_CODING_AGENT_DIR` | `NODE_EXTRA_CA_CERTS` |
+| codex | `HTTPS_PROXY` + `-c key=value` 覆盖 | `SSL_CERT_FILE` → `combined-ca.pem` |
+| claude | `ANTHROPIC_BASE_URL` = `/bili/` URL | 无需 |
+| opencode | `HTTPS_PROXY` + 隔离 `OPENCODE_CONFIG` | `NODE_EXTRA_CA_CERTS` |
+| hermes | 隔离 `HERMES_HOME`；**全部**上游走 `/bili/` | 无（certifi 忽略 `SSL_CERT_FILE`） |
+
+`NODE_EXTRA_CA_CERTS` 是**追加**到内置信任库，所以只指向 MITM 根证书（`root-ca.pem`）即可。`SSL_CERT_FILE` 会**替换**默认 CA bundle，所以 codex 指向 `combined-ca.pem` —— 包含 MITM 根证书**加上**系统/Node 公共根 —— 保证子进程环境里 pip/git/curl 类 TLS（盲转发、真证书）不受影响（#152）。
+
+Claude Code 的 undici fetch 忽略 `HTTPS_PROXY`，所以证书 MITM 拦不到它。claude 的所有上游 —— 包括预先配置的 `ANTHROPIC_BASE_URL` relay —— 一律改走 `/bili/` URL 形式的 `ANTHROPIC_BASE_URL`；无需任何 CA 信任。
+
+上游从哪里发现（只读）：
+
+| 客户端 | 读取位置 |
+|---|---|
+| Pi | `~/.pi/agent/models.json` —— 各 provider 的 `baseUrl` |
+| omp | `~/.omp/agent/models.yml` —— 各 provider 的 `baseUrl` |
+| Codex | `~/.codex/config.toml` —— 各 `[model_providers.<name>]` 的 `base_url`（+ 顶层 `openai_base_url`） |
+| Claude Code | `ANTHROPIC_BASE_URL` 环境变量，否则硬编码 `api.anthropic.com` |
+| OpenCode | `~/.config/opencode/opencode.json` —— 各 provider 的 `baseURL` |
+| hermes | `~/.hermes/config.yaml` —— 各 provider 的端点行 |
+
+### 隔离临时配置（写了什么）
+
+`/bili/` 重写模式写的是**临时副本** —— 真实配置绝不编辑 —— 客户端退出时临时目录一并删除：
+
+- **pi / omp** —— 隔离的 `PI_CODING_AGENT_DIR`（在 `/tmp` 下），里面只有一份重写后的 `models.json` / `models.yml`（明文 baseUrl 包上 `/bili/`）。其余一切（`settings.json`、`sessions/`、`auth.json`、扩展……）都**符号链接**到真实 pi/omp 主目录，所以会话与登录互通：launcher 里开的会话在裸客户端里无缝继续，反之亦然。
+- **opencode** —— 临时 `opencode.json`（由 `OPENCODE_CONFIG` 指向），`baseURL` 重写为 `/bili/` 形式，**并追加了薄 `/acp` 插件**（开箱即原生工具；独立的 `opencode-acp` 插件检测到 `BILLION_CONTEXT_PROXY` 后自禁用）。
+- **hermes** —— 隔离的 `HERMES_HOME`，重写后的 `config.yaml` 让**所有**上游（HTTP 和 HTTPS）都走 `/bili/`（httpx 自建 CA bundle 且忽略 `SSL_CERT_FILE`，证书 MITM 不可行）。`skills/`、`memories/`、`sessions/` 符号链接共享。若没配置任何 provider —— 或 `config.yaml` 无法重写 —— 启动器打印警告，hermes 将**不经代理**运行（无压缩）。
+
+### 启动器里的原生工具
+
+- **pi** —— 未安装插件时，启动器借用 pi 的 `-e <file>` 参数为本次运行加载 `dist/agent/pi.js`（不写任何东西）：开箱即原生工具 + `/acp` 命令。已安装则符号链接的 `settings.json` 已加载它 —— 不再加 `-e`。
+- **omp** —— 发行版自带插件；无需任何操作。
+- **opencode** —— 临时配置自动追加薄插件。
+- **claude / codex** —— 通过 `BILI_LAUNCHER_PLUGIN=1` 选择启用：启动器额外注入单个 `bili` MCP 服务器（claude 用 `--mcp-config`，codex 用 `-c mcp_servers.bili.*` —— 都是临时生效，不写宿主配置）。默认仍是 wire 模式，待宿主参数兼容性充分验证后翻转（已在 claude 2.1.227 / codex 0.147.0 验证）。`BILI_LAUNCHER_PLUGIN=0` 强制 wire 模式。
+- **hermes** —— 无插件 API；永远 wire 模式。
+
+启动器模式矩阵：
+
+| 模式 | 工具形态 | 设置 |
+|---|---|---|
+| 启动器 + MCP（`BILI_LAUNCHER_PLUGIN=1`，claude/codex） | 原生 MCP 工具 | 一个环境变量 |
+| 启动器 wire 模式（claude/codex 默认） | 代理注入的 wire 工具 | 无 —— `bili claude` / `bili codex` 即可 |
+| 启动器 `-e` / 自动插件（pi、opencode；omp 自带） | 原生插件工具 | 无 |
+| 手动插件（`bili plugin install`） | 客户端侧插件 | 执行 install |
+| 手动 baseURL（`/bili/` 前缀） | 代理注入的 wire 工具 | 改客户端配置 |
+
+### 直连 URL 模式（可选）
+
+`BILI_LAUNCHER_DIRECT=1` 彻底放弃 MITM/CA 信任 —— claude 的 `ANTHROPIC_BASE_URL` / codex 的 provider `base_url` 直接指向 `/bili/` 前缀。警告：
+
+- **codex 直连模式**：LLM 流量**不**经过代理，压缩不生效 —— 只有 bili MCP 工具调用经过。要完整压缩请用默认 MITM 模式（不设 `BILI_LAUNCHER_DIRECT`）。
+- **claude 直连模式**：`ANTHROPIC_BASE_URL` 被覆盖指向代理；预先配置的 relay 被旁路，除非设 `BILI_CLAUDE_UPSTREAM=<relay>`。OAuth 订阅流量需要默认 MITM 模式。
+
+`--mitm-domain <domain>`（可重复）在自动发现之外追加 MITM 白名单域名 —— 适用于客户端在运行时才获取、不写进配置文件的主机。默认端口被占用时启动器自动换空闲端口；`--passthrough` / `--debug` / `--no-auto-update` 与普通 `bili` 用法相同。
+
+---
+
+## 插件模式（原生工具）
+
+想要原生插件体验，可以在客户端里装一个配合代理的插件：插件把四个 ACP 工具（`compress` / `decompress` / `search_context` / `acp_status`）原生注册进客户端、由客户端自己的工具循环驱动，而代理仍然是压缩引擎（状态、历史折叠、压缩哲学 prompt、nudge 全归代理）。工具 schema 由代理统一下发（`GET /__bili/plugin/manifest`），插件与代理永远不会版本漂移。协议规范见 [PLUGIN.md](PLUGIN.md)。
+
+带插件的会话通过请求头自动识别 —— 该会话的 wire 层工具注入自动关闭（不会双重压缩，工具体验原生）。两种代理模式都支持：`/bili/` 前缀 baseURL **和** MITM 透明模式。插件还可以上报客户端自己的模型上下文窗口（`x-bili-plugin-context-window`），并通过 `GET /__bili/plugin/status` 读取实时上下文水位。
+
+### install / remove / list
+
+```bash
+bili plugin install pi      # 把本 billion-context 安装加入 pi 的 settings.json（packages）
+bili plugin install omp     # omp 同理（config.yml extensions）
+bili plugin install claude  # 注册 bili MCP 服务器（claude mcp add，user 作用域）
+bili plugin install codex   # 向 ~/.codex/config.toml 追加 [mcp_servers.bili]
+bili plugin install opencode  # 向 ~/.config/opencode/opencode.json 加 mcp.bili
+bili plugin list            # 所有受支持宿主的安装状态
+bili plugin remove pi       # 撤销（原文件一次性备份为 *.bili-bak）
+```
+
+`install pi` 还会替换**遗留的** billion-context 条目（旧的 `npm:billion-context-pi` 引用、过期的 `npm:billion-context@x.y.z`、残留的 dev 目录路径），确保只有恰好一个 bili 插件在生效。
+
+安装的插件是**薄**插件（约 5 KB，零运行时依赖）：它检测代理（从 `/bili/` baseURL 或 `BILLION_CONTEXT_PROXY`）、从代理拉取工具 schema、注册原生工具、转发执行 —— 代理始终是唯一的压缩引擎，所以插件与代理永远版本一致。没有插件 API 的宿主（claude、codex、opencode）改装 MCP 桥（`dist/mcp.js`）—— 底层协议相同，但 MCP 没有斜杠命令（没有 `/acp`）。
+
+总开关：`BILLION_CONTEXT_PLUGIN=0` 彻底关闭插件模式（恢复 wire 层注入）。
+
+**到底什么时候需要 `plugin install`？** 用启动器的基本都不需要（见[启动器参考](#启动器参考) —— pi 自动 `-e`、opencode 自动注入、omp 自带、claude/codex 用 `BILI_LAUNCHER_PLUGIN=1`、hermes 只能 wire）。它适用于手动配置客户端（`/bili/` 前缀或 MITM）又想要原生面板的场景：pi/omp/opencode 装后获得原生工具 + `/acp`；claude/codex 获得原生 MCP 工具（无 `/acp`）；hermes 装不了（只能 wire）。不装任何插件一切照常工作 —— 压缩走 wire 注入的工具，让模型调 `acp_status` 即可查看实时用量。
+
+---
+
+## 会话与迁移
+
+### 压缩状态存在代理里（#151）
+
+压缩状态（块、摘要、原始消息缓存）存在**代理**里，不在客户端。客户端自己的本地历史是完整的未压缩视图。两个后果：
+
+- 把客户端指回真实上游（或停掉代理）后，客户端每轮重放**完整本地历史**。长压缩会话之后这很容易超出模型上下文窗口（`context_window_exceeded`）。
+- 没有办法把压缩块「解包」回客户端本地历史 —— 客户端从未见过压缩形态。
+
+### 从代理迁移出去
+
+导出会话，粘贴到新会话里作为交接：
+
+```bash
+bili export                      # 列出持久化会话（id、标签、块数）
+bili export <id|label>           # 打印 Markdown 交接文档（块摘要）
+bili export <id> --full          # 附上每个块的原始消息
+bili export <id> --full --output handoff.md
+```
+
+然后在客户端里开一个新会话（直连上游），把交接文档粘贴为开场上下文。
+
+### Codex 子代理有独立压缩命名空间（#150）
+
+Codex 子代理（如 `guardian_subagent` 审批 reviewer）复用主会话的 `session_id`，在线路上看起来是同一个会话。若不处理，子代理请求会继承主会话的压缩状态 —— 子代理轮次的上下文可能被折叠（丢失它必须逐字读取的用户授权），两个角色的用量估算也会互相污染。
+
+billion-context 通过 `instructions` 字段识别：子代理请求带自己的角色 prompt。会话**首次**看到的 instructions 锚定主命名空间（即使主 prompt 后来漂移也稳定）；任何其他 instructions 值映射到独立的 `|sub:` 命名空间，拥有自己的空白压缩状态。子代理请求是自包含重放，所以新命名空间无损 —— Web UI 的会话列表会把两个命名空间显示为共享同一客户端标签的独立会话。
