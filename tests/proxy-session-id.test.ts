@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { deriveSessionId, affinityToken, clientConversationHeader, preferPromptCacheKeyIdentity } from "../src/session-id.ts";
+import { deriveSessionId, affinityToken, clientConversationHeader, codexThreadHeader, preferPromptCacheKeyIdentity } from "../src/session-id.ts";
 import { conversationIdentityResponses, conversationSignalResponses } from "acp-kernel/wire";
 
 /** Helper: build a minimal headers object. */
@@ -97,6 +97,24 @@ test("deriveSessionId: credentials remain case-sensitive opaque values", () => {
     assert.notEqual(upper, lower);
 });
 
+test("deriveSessionId: ChatGPT account id survives OAuth bearer rotation", () => {
+    const a = deriveSessionId({ authorization: "Bearer old", "chatgpt-account-id": "acct-1" }, "responses", "https://chatgpt.com", "session");
+    const b = deriveSessionId({ authorization: "Bearer new", "chatgpt-account-id": "acct-1" }, "responses", "https://chatgpt.com", "session");
+    assert.equal(a, b);
+});
+
+test("deriveSessionId: ChatGPT account id still isolates accounts", () => {
+    const a = deriveSessionId({ authorization: "Bearer shared", "chatgpt-account-id": "acct-1" }, "responses", "https://chatgpt.com", "session");
+    const b = deriveSessionId({ authorization: "Bearer shared", "chatgpt-account-id": "acct-2" }, "responses", "https://chatgpt.com", "session");
+    assert.notEqual(a, b);
+});
+
+test("deriveSessionId: ChatGPT account header does not override credentials on other upstreams", () => {
+    const a = deriveSessionId({ authorization: "Bearer old", "chatgpt-account-id": "acct-1" }, "responses", "https://api.openai.com", "session");
+    const b = deriveSessionId({ authorization: "Bearer new", "chatgpt-account-id": "acct-1" }, "responses", "https://api.openai.com", "session");
+    assert.notEqual(a, b);
+});
+
 test("deriveSessionId: different upstream origin → different session (no cross-provider bleed)", () => {
     const a = deriveSessionId(hdrs("Bearer keyA"), "openai", "https://zhipu.example", "hello");
     const b = deriveSessionId(hdrs("Bearer keyA"), "openai", "https://bailian.example", "hello");
@@ -161,6 +179,19 @@ test("clientConversationHeader: reads known session header names in priority ord
     assert.equal(clientConversationHeader({ "session-id": "E" }), "E");
     assert.equal(clientConversationHeader({ session_id: "F" }), "F");
     assert.equal(clientConversationHeader({}), undefined);
+});
+
+test("codexThreadHeader: accepts only a thread-id confirmed by Codex turn metadata", () => {
+    const metadata = JSON.stringify({
+        session_id: "root-session",
+        thread_id: "subagent-thread",
+        agent_name: "/root/subagent_probe",
+        thread_source: "subagent",
+    });
+    assert.equal(codexThreadHeader({ "x-codex-turn-metadata": metadata, "thread-id": "subagent-thread", "session-id": "root-session" }), "subagent-thread");
+    assert.equal(codexThreadHeader({ "x-codex-turn-metadata": metadata, "thread-id": "different" }), undefined);
+    assert.equal(codexThreadHeader({ "x-codex-turn-metadata": "not json", "thread-id": "subagent-thread" }), undefined);
+    assert.equal(codexThreadHeader({ "thread-id": "generic-client-thread" }), undefined);
 });
 
 test("affinityToken: client-provided identity passes through verbatim (credentials never in scope)", () => {
