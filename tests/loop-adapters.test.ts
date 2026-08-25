@@ -504,3 +504,19 @@ test("F7: anthropic buildRequest preserves client system + cache_control + merge
     const hasCc = Array.isArray(system) && (system as Array<Record<string, unknown>>).some((b) => b.cache_control);
     assert.ok(hasCc, "cache_control marker preserved on system block (Anthropic prefix-cache anchor)");
 });
+
+test("openai emitCompletion: usage with absent token counts still serializes complete numeric fields (#dsh)", () => {
+    const adapter = createOpenaiAdapter({ model: "deepseek-v4-flash" });
+    const out = adapter.emitCompletion({ finishReason: "stop", usage: { inputTokens: undefined, outputTokens: undefined } }).toString("utf8");
+    const finishLine = out.split("\n").find((l) => l.startsWith("data: ") && l.includes("finish_reason"));
+    assert.ok(finishLine, "finish chunk present");
+    const parsed = JSON.parse(finishLine.slice("data: ".length)) as { usage?: Record<string, unknown> };
+    assert.ok(parsed.usage, "usage object present");
+    assert.equal(parsed.usage!.prompt_tokens, 0, "prompt_tokens defaults to 0 (never dropped)");
+    assert.equal(parsed.usage!.completion_tokens, 0, "completion_tokens defaults to 0 (never dropped)");
+    assert.equal(parsed.usage!.total_tokens, 0);
+    const real = adapter.emitCompletion({ finishReason: "stop", usage: { inputTokens: 7, outputTokens: 3 } }).toString("utf8");
+    const realLine = real.split("\n").find((l) => l.startsWith("data: ") && l.includes("finish_reason"));
+    const realParsed = JSON.parse(realLine!.slice("data: ".length)) as { usage?: Record<string, unknown> };
+    assert.deepEqual({ p: realParsed.usage!.prompt_tokens, c: realParsed.usage!.completion_tokens, t: realParsed.usage!.total_tokens }, { p: 7, c: 3, t: 10 });
+});

@@ -67,7 +67,7 @@ npm install -g billion-context
 
 
 
-### 方式 1 —— 启动器(`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode` / `bili hermes`)
+### 方式 1 —— 启动器(`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode` / `bili hermes` / `bili dsh`)
 
 启动器把客户端包进一条命令:在独立端口拉起一个代理(总是全新实例,绝不复用端口),再按客户端支持的机制把它指向代理 —— 能吃代理/CA 环境变量的走**证书 MITM**,不吃的走隔离的**`/bili/` 配置重写**。真实配置文件从不被修改;客户端自己的配置只被**读取**,用来发现它实际连接的 HTTPS 上游主机,把这些主机加入 MITM 白名单 —— 代理只 TLS 终结它们,其余流量盲透传。
 
@@ -78,6 +78,7 @@ bili claude                           # 拉起 claude
 bili omp                              # pi 同款 MITM 环境变量 + 隔离临时 models.yml
 bili opencode                         # HTTPS 走 MITM + 临时 opencode.json(HTTP 走 /bili/)+ 轻量 /acp 插件
 bili hermes                           # 无法 MITM(certifi CA)—— 隔离 HERMES_HOME,全部流量 /bili/
+bili dsh                              # deepseek-harness:内置 deepseek 路由走 DEEPSEEK_BASE_URL + 隔离 DSH_HOME(~/.dsh-bili),全部流量 /bili/
 bili pi --mitm-domain api.foo.com     # 向 MITM 白名单追加域名
 ```
 

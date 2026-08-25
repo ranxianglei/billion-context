@@ -41,7 +41,7 @@ import { selfPackageRoot, isBiliPiEntry } from "./plugin-install.js";
 function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
-import { nonEmpty, resolvePiHome, resolveOmpHome, resolveHermesHome, loadClientConfig, type ClientConfig, resolveOpencodeConfigFile, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider } from "./client-config.js";
+import { nonEmpty, resolvePiHome, resolveOmpHome, resolveHermesHome, resolveDshHome, loadClientConfig, type ClientConfig, resolveOpencodeConfigFile, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider } from "./client-config.js";
 
 export {
     type ClaudeSettings,
@@ -68,6 +68,9 @@ export {
     readHermesConfig,
     parseHermesYaml,
     resolveHermesHome,
+    readDshConfig,
+    parseDshSettingsYaml,
+    resolveDshHome,
     resolveOpencodeConfigFile,
     readOpencodeConfig,
     type OpencodeConfig,
@@ -76,9 +79,9 @@ export {
 
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
 export const LAUNCHER_DEFAULT_PORT = 8787;
-export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "pi-test"] as const;
+export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "pi-test"] as const;
 export type ClientName = (typeof LAUNCH_CLIENTS)[number];
-export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes";
+export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh";
 
 const HEALTH_PATH = "/__bili/health";
 const HEALTH_POLL_INTERVAL_MS = 200;
@@ -280,6 +283,27 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
                 // Unparseable endpoint: skip.
             }
         }
+    } else if (client === "dsh") {
+        // dsh (deepseek-harness) has no proxy/CA knobs in its fetch stack:
+        // every configured upstream rides the /bili/ URL form. The built-in
+        // deepseek-official route is captured via $DEEPSEEK_BASE_URL in
+        // runLaunch; user-configured settings.yaml endpoints here.
+        const dshSeen = new Set<string>();
+        let anon = 0;
+        for (const raw of config.dsh?.baseUrls ?? []) {
+            const real = unwrapUpstream(raw);
+            try {
+                const url = new URL(real);
+                if (url.protocol !== "http:" && url.protocol !== "https:") continue;
+                if (dshSeen.has(real)) continue;
+                dshSeen.add(real);
+                anon += 1;
+                rewriteKeys.add(`dsh-${anon}`);
+                httpRewrites.push({ key: `dsh-${anon}`, realUpstream: real });
+            } catch {
+                // Unparseable endpoint: skip.
+            }
+        }
     } else {
         for (const [name, prov] of Object.entries(config.codex?.providers ?? {})) {
             classify(prov.baseUrl, `model_providers.${name}.base_url`);
@@ -355,7 +379,7 @@ export function launcherDirectUrl(env: NodeJS.ProcessEnv): boolean {
  *  `!== "0"` semantics) once the flags have soaked; pi is always excluded —
  *  it has its own native extension (billion-context-pi #154). */
 export function launcherInjectMcp(env: NodeJS.ProcessEnv, base: string): boolean {
-    return base !== "pi" && base !== "omp" && base !== "opencode" && base !== "hermes" && env.BILI_LAUNCHER_PLUGIN === "1";
+    return base !== "pi" && base !== "omp" && base !== "opencode" && base !== "hermes" && base !== "dsh" && env.BILI_LAUNCHER_PLUGIN === "1";
 }
 
 /** Ephemeral MCP config for --mcp-config / -c mcp_servers.bili.*: a single
@@ -779,6 +803,46 @@ export function prepareHermesHome(
     return overlay;
 }
 
+/** dsh counterpart of prepareHermesHome: a persistent `<dshHome>-bili` overlay
+ *  (every ~/.dsh sibling symlinked so credentials/profiles/sessions stay
+ *  shared) holding a rewritten copy of settings.yaml. Every baseURL/baseUrl/
+ *  base_url value is rewrapped as origin + "/bili/" + raw upstream — http AND
+ *  https alike, since dsh's fetch stack exposes no proxy/CA trust knobs. The
+ *  real ~/.dsh is never touched. Returns the overlay dir (undefined when the
+ *  settings file is unreadable or nothing is rewritable). */
+export function prepareDshHome(
+    dshHome: string,
+    origin: string,
+    rewrites: HttpRewrite[],
+): string | undefined {
+    const cfgPath = path.join(dshHome, "settings.yaml");
+    let txt: string;
+    try {
+        txt = fs.readFileSync(cfgPath, "utf8");
+    } catch {
+        return undefined;
+    }
+    const wrapSet = new Set(rewrites.map((r) => r.realUpstream));
+    const eol = txt.includes("\r\n") ? "\r\n" : "\n";
+    const lines = txt.split(/\r?\n/);
+    let changed = false;
+    for (let i = 0; i < lines.length; i++) {
+        const m = /^(\s*(?:baseURL|baseUrl|base_url):\s*)(\S+)(\s+#.*)?$/.exec(lines[i]);
+        if (!m) continue;
+        const rawUrl = m[2].replace(/^["']|["']$/g, "");
+        if (!/^https?:\/\//i.test(rawUrl)) continue;
+        const real = unwrapUpstream(rawUrl);
+        if (!wrapSet.has(real)) continue;
+        lines[i] = `${m[1]}${wrapUpstream(origin, real)}${m[3] ?? ""}`;
+        changed = true;
+    }
+    if (!changed) return undefined;
+    const overlay = `${dshHome}-bili`;
+    if (!refreshOverlayHome(dshHome, overlay, "settings.yaml")) return undefined;
+    writeOverlayFileAtomic(overlay, "settings.yaml", lines.join(eol));
+    return overlay;
+}
+
 /**
  * opencode counterpart of preparePiHttpRewrite: write a full copy of the user's
  * opencode.json with the discovered providers' baseURL rewritten (HTTP →
@@ -1081,6 +1145,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     let ompOverlayHome: string | undefined;
     let opencodeTmpFile: string | undefined;
     let hermesOverlayHome: string | undefined;
+    let dshOverlayHome: string | undefined;
     const tmpFiles: string[] = [];
     const directUrl = launcherDirectUrl(process.env);
     if (directUrl) {
@@ -1144,6 +1209,29 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
                 routes.httpRewrites.length === 0
                     ? "bili: no hermes providers found in ~/.hermes/config.yaml — traffic will NOT go through the proxy (configure a provider first)."
                     : "bili: hermes config.yaml could not be rewritten (unreadable or no matching provider endpoints) — traffic will NOT go through the proxy.",
+            );
+        }
+    } else if (base === "dsh") {
+        // dsh (deepseek-harness): no plugin surface, no MITM cert trust (plain
+        // fetch) — the built-in deepseek-official route is captured through
+        // $DEEPSEEK_BASE_URL (its resolution order is settings baseURL ?? env
+        // ?? https://api.deepseek.com, so a rewritten user setting wins and
+        // this env is the no-settings fallback). Custom providers in
+        // ~/.dsh/settings.yaml ride a persistent overlay DSH_HOME
+        // (~/.dsh-bili); credentials/profiles/sessions stay shared through
+        // symlinks and the real ~/.dsh is never touched.
+        env = { ...process.env, BILLION_CONTEXT_PROXY: origin };
+        env.DEEPSEEK_BASE_URL = wrapUpstream(origin, "https://api.deepseek.com");
+        dshOverlayHome = prepareDshHome(resolveDshHome(process.env), origin, routes.httpRewrites);
+        if (dshOverlayHome) {
+            env.DSH_HOME = dshOverlayHome;
+        } else if (routes.httpRewrites.length > 0) {
+            console.error(
+                "bili: dsh settings.yaml could not be rewritten (unreadable or no matching endpoints) — custom providers will NOT go through the proxy; the built-in deepseek route still does.",
+            );
+        } else {
+            console.error(
+                "bili: no custom providers found in ~/.dsh/settings.yaml — proxying the built-in deepseek route via DEEPSEEK_BASE_URL only.",
             );
         }
     } else if (base === "codex") {

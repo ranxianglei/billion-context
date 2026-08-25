@@ -65,6 +65,7 @@ Usage:
   bili omp [opts --] [args]        start a proxy + launch omp against it (cert-MITM)
   bili opencode [opts --] [args]   start a proxy + launch opencode against it (cert-MITM)
   bili hermes [opts --] [args]     start a proxy + launch hermes-agent against it (/bili/ rewrite)
+  bili dsh [opts --] [args]        start a proxy + launch deepseek-harness against it (/bili/ rewrite)
   bili test pi                     non-polluting pi smoke test through the proxy
   bili export [session] [--full]   list sessions / export one as a Markdown handoff
                                     (--full includes original messages; --output FILE)
@@ -79,7 +80,7 @@ Usage:
   bili --version                   print version
   bili --help                      show this help
 
-Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili hermes):
+Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili hermes / bili dsh):
   Brings up a proxy on an independent port (a fresh instance every launch), then runs the client pointed at it via HTTPS_PROXY + the proxy's
   MITM CA — no config-file edits. Discovered HTTPS upstream domains are
   auto-whitelisted for MITM so the proxy TLS-terminates exactly the hosts the
@@ -92,6 +93,7 @@ Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili h
     bili claude                           # launch claude through the proxy
     bili omp                              # launch omp through the proxy (pi-based; /bili/ rewrite)
     bili hermes                           # launch hermes-agent through the proxy (/bili/ rewrite of ~/.hermes/config.yaml)
+    bili dsh --profile web "task"         # launch deepseek-harness through the proxy (/bili/ rewrite of ~/.dsh/settings.yaml)
     bili test pi                          # quick end-to-end check of the pi path
     bili pi --mitm-domain api.foo.com     # add a domain to the MITM whitelist
 
