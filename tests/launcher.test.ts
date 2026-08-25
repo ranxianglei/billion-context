@@ -40,6 +40,8 @@ import {
     readDshConfig,
     resolveDshHome,
     prepareDshHome,
+    writeDshAcpPatch,
+    dshArgsWithPatch,
     readOpencodeConfig,
     resolveOpencodeConfigFile,
     findFreePort,
@@ -1338,6 +1340,30 @@ test("prepareDshHome: preserves CRLF line endings when rewriting", () => {
     }
 });
 
+test("writeDshAcpPatch: writes insert overlay with file:// plugin URL into <home>-bili", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-patch-"));
+    try {
+        const file = writeDshAcpPatch(dir);
+        assert.ok(file);
+        assert.equal(file, path.join(`${dir}-bili`, ".bili-acp.patch.yml"));
+        const txt = fs.readFileSync(file, "utf8");
+        assert.ok(txt.startsWith("- insert:\n"));
+        assert.match(txt, /^ {4}- name: file:\/\/.+dsh-acp\.js\n$/m);
+        fs.rmSync(`${dir}-bili`, { recursive: true, force: true });
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("dshArgsWithPatch: splices --patch by dsh argv shape", () => {
+    const patch = "/tmp/x/.bili-acp.patch.yml";
+    assert.deepEqual(dshArgsWithPatch(["--profile", "headless", "task"], patch), ["--patch", patch, "--profile", "headless", "task"]);
+    assert.deepEqual(dshArgsWithPatch([], patch), ["--patch", patch]);
+    assert.deepEqual(dshArgsWithPatch(["web", "--port", "3080"], patch), ["web", "--patch", patch, "--port", "3080"]);
+    assert.deepEqual(dshArgsWithPatch(["plugin", "--profile", "web", "add", "pkg"], patch), ["plugin", "--profile", "web", "add", "pkg"]);
+    assert.deepEqual(dshArgsWithPatch(["--dump-default-config"], patch), ["--dump-default-config"]);
+});
+
 test("prepareDshHome: returns undefined for unreadable settings even with rewrites pending", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-home-"));
     try {
@@ -1371,9 +1397,11 @@ test("runLaunch dsh: DSH_HOME overlay + DEEPSEEK_BASE_URL env, real home untouch
     process.env.DSH_HOME = dshHome;
 
     const envSeen: NodeJS.ProcessEnv[] = [];
-    const spawnImpl: SpawnFn = (cmd, _args, options) => {
+    const argsSeen: string[][] = [];
+    const spawnImpl: SpawnFn = (cmd, args, options) => {
         if (cmd === fakeDsh) {
             if (options?.env) envSeen.push(options.env);
+            argsSeen.push([...args]);
             const child = makeFakeChild(0);
             const orig = child.on.bind(child);
             (child as { on: SpawnChild["on"] }).on = (event, listener) => {
@@ -1411,6 +1439,14 @@ test("runLaunch dsh: DSH_HOME overlay + DEEPSEEK_BASE_URL env, real home untouch
         const overlayTxt = fs.readFileSync(path.join(overlay, "settings.yaml"), "utf8");
         assert.ok(overlayTxt.includes(`baseURL: ${origin}/bili/https://api.anthropic.com`));
         assert.ok(fs.lstatSync(path.join(overlay, "profiles")).isSymbolicLink());
+        // /acp command injection: --patch flag spliced before user args, and
+        // the patch overlay file exists pointing at our bundled cordis plugin.
+        const patchFile = path.join(overlay, ".bili-acp.patch.yml");
+        assert.ok(fs.existsSync(patchFile));
+        const patchTxt = fs.readFileSync(patchFile, "utf8");
+        assert.ok(patchTxt.startsWith("- insert:\n"));
+        assert.ok(/- name: file:\/\/\/.*dsh-acp\.js\n/.test(patchTxt));
+        assert.deepEqual(argsSeen[0], ["--patch", patchFile, "--profile", "headless", "task"]);
         fs.rmSync(overlay, { recursive: true, force: true });
     } finally {
         process.exit = prevExit;

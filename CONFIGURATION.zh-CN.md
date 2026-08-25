@@ -545,7 +545,7 @@ Claude Code 的 undici fetch 忽略 `HTTPS_PROXY`，所以证书 MITM 拦不到�
 - **opencode** —— 临时配置自动追加薄插件。
 - **claude / codex** —— 通过 `BILI_LAUNCHER_PLUGIN=1` 选择启用：启动器额外注入单个 `bili` MCP 服务器（claude 用 `--mcp-config`，codex 用 `-c mcp_servers.bili.*` —— 都是临时生效，不写宿主配置）。默认仍是 wire 模式，待宿主参数兼容性充分验证后翻转（已在 claude 2.1.227 / codex 0.147.0 验证）。`BILI_LAUNCHER_PLUGIN=0` 强制 wire 模式。
 - **hermes** —— 无插件 API；永远 wire 模式。
-- **dsh** —— 无插件 API；永远 wire 模式。
+- **dsh** —— 启动器始终在 dsh 的 argv 里拼接 `--patch <file>`（写入 `~/.dsh-bili/.bili-acp.patch.yml`），把 `dist/agent/dsh-acp.js` 插进 profile 的加载树：原生 `/acp` 命令，与 dsh 自带 `/compact` 同一形态。在任何组合了 commands 服务的 profile（web/tui 交互表面）都可用；`headless` 一次性驱动器把任务直接发给模型、不解析命令（原生 `/compact` 在那里同样不可用）。子命令形态已处理：`dsh web` 的 flag 插在 `web` 之后，`dsh plugin`/`--dump-default-config` 不注入。
 
 启动器模式矩阵：
 
@@ -592,7 +592,7 @@ bili plugin remove pi       # 撤销（原文件一次性备份为 *.bili-bak）
 
 总开关：`BILLION_CONTEXT_PLUGIN=0` 彻底关闭插件模式（恢复 wire 层注入）。
 
-**到底什么时候需要 `plugin install`？** 用启动器的基本都不需要（见[启动器参考](#启动器参考) —— pi 自动 `-e`、opencode 自动注入、omp 自带、claude/codex 用 `BILI_LAUNCHER_PLUGIN=1`、hermes/dsh 只能 wire）。它适用于手动配置客户端（`/bili/` 前缀或 MITM）又想要原生面板的场景：pi/omp/opencode 装后获得原生工具 + `/acp`；claude/codex 获得原生 MCP 工具（无 `/acp`）；hermes/dsh 装不了（只能 wire）。不装任何插件一切照常工作 —— 压缩走 wire 注入的工具，让模型调 `acp_status` 即可查看实时用量。
+**到底什么时候需要 `plugin install`？** 用启动器的基本都不需要（见[启动器参考](#启动器参考) —— pi 自动 `-e`、opencode 自动注入、omp 自带、claude/codex 用 `BILI_LAUNCHER_PLUGIN=1`、dsh 经 `--patch` 自动获得原生 `/acp` 命令、hermes 只能 wire）。它适用于手动配置客户端（`/bili/` 前缀或 MITM）又想要原生面板的场景：pi/omp/opencode 装后获得原生工具 + `/acp`；claude/codex 获得原生 MCP 工具（无 `/acp`）；dsh 的 `/acp` 由启动器 `--patch` 注入（手动配置的 dsh 可自行添加同一 patch）；hermes 装不了（只能 wire）。不装任何插件一切照常工作 —— 压缩走 wire 注入的工具，让模型调 `acp_status` 即可查看实时用量。
 
 ---
 

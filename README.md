@@ -85,7 +85,7 @@ bili claude                           # launch claude through the proxy
 bili omp                              # pi-style: MITM env + persistent overlay home (~/.omp/agent-bili, real config untouched)
 bili opencode                         # MITM for HTTPS + temp opencode.json (/bili/ for HTTP) + thin /acp plugin
 bili hermes                           # no MITM possible (certifi CA) — persistent overlay home (~/.hermes-bili), all traffic /bili/
-bili dsh                              # deepseek-harness: built-in deepseek route via DEEPSEEK_BASE_URL + overlay DSH_HOME (~/.dsh-bili), all traffic /bili/
+bili dsh                              # deepseek-harness: built-in deepseek route via DEEPSEEK_BASE_URL + overlay DSH_HOME (~/.dsh-bili), all traffic /bili/, native /acp command injected via --patch
 bili pi --mitm-domain api.foo.com     # add a domain to the MITM whitelist
 ```
 

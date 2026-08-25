@@ -30,6 +30,7 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { spawn, type StdioOptions } from "node:child_process";
 import { DEFAULT_MITM_DOMAINS } from "./mitm.js";
 import { selfPackageRoot, isBiliPiEntry } from "./plugin-install.js";
@@ -843,6 +844,40 @@ export function prepareDshHome(
     return overlay;
 }
 
+/** Write the `--patch` overlay file that inserts the bili /acp command
+ *  plugin into whatever profile dsh boots. Lives in the persistent
+ *  `<dshHome>-bili` dir, INDEPENDENT of the settings.yaml rewrite — the
+ *  /acp command is injected even when the user has no custom providers
+ *  (pure built-in deepseek route). Returns the patch file path (undefined
+ *  when it could not be written — dsh then just boots without /acp). */
+export function writeDshAcpPatch(dshHome: string): string | undefined {
+    const pluginUrl = pathToFileURL(selfDistFile("agent/dsh-acp.js")).href;
+    const dir = `${dshHome}-bili`;
+    try {
+        fs.mkdirSync(dir, { recursive: true });
+    } catch {
+        return undefined;
+    }
+    writeOverlayFileAtomic(dir, ".bili-acp.patch.yml", `- insert:\n    - name: ${pluginUrl}\n`);
+    const file = path.join(dir, ".bili-acp.patch.yml");
+    try {
+        return fs.existsSync(file) ? file : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+/** Splice a `--patch <file>` flag into dsh's own flag namespace. dsh parses
+ *  parent flags only before the first positional; the `web`/`plugin`
+ *  subcommands reject parent flags, but `web` accepts its own --patch, and
+ *  `plugin` (pnpm forwarding) plus `--dump-default-config` take none at all. */
+export function dshArgsWithPatch(args: readonly string[], patchFile: string): string[] {
+    if (args[0] === "plugin") return [...args];
+    if (args[0] === "web") return ["web", "--patch", patchFile, ...args.slice(1)];
+    if (args.includes("--dump-default-config")) return [...args];
+    return ["--patch", patchFile, ...args];
+}
+
 /**
  * opencode counterpart of preparePiHttpRewrite: write a full copy of the user's
  * opencode.json with the discovered providers' baseURL rewritten (HTTP →
@@ -1222,7 +1257,8 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // symlinks and the real ~/.dsh is never touched.
         env = { ...process.env, BILLION_CONTEXT_PROXY: origin };
         env.DEEPSEEK_BASE_URL = wrapUpstream(origin, "https://api.deepseek.com");
-        dshOverlayHome = prepareDshHome(resolveDshHome(process.env), origin, routes.httpRewrites);
+        const dshHomeDir = resolveDshHome(process.env);
+        dshOverlayHome = prepareDshHome(dshHomeDir, origin, routes.httpRewrites);
         if (dshOverlayHome) {
             env.DSH_HOME = dshOverlayHome;
         } else if (routes.httpRewrites.length > 0) {
@@ -1234,6 +1270,10 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
                 "bili: no custom providers found in ~/.dsh/settings.yaml — proxying the built-in deepseek route via DEEPSEEK_BASE_URL only.",
             );
         }
+        // Native /acp command rides a --patch overlay (independent of the
+        // settings rewrite above), so it exists on every profile dsh boots.
+        const dshAcpPatch = writeDshAcpPatch(dshHomeDir);
+        if (dshAcpPatch) clientArgs = dshArgsWithPatch(clientArgs, dshAcpPatch);
     } else if (base === "codex") {
         // Per-spawn conversation id for the MCP shell's headless
         // self-registration (codex provides no session id of its own).

@@ -114,6 +114,18 @@ export async function fetchStatus(proxyBase: string, conversationId: string): Pr
     return json as Record<string, unknown>;
 }
 
+/** Wire-mode status read (dsh): those clients carry no per-conversation id
+ *  the proxy could bind, so ask for the most recently active session instead
+ *  (fallback=latest). Same soft-fail contract as fetchStatus. */
+export async function fetchStatusLatest(proxyBase: string): Promise<Record<string, unknown> | undefined> {
+    // conversationId must be non-empty (server rejects the empty string), but
+    // any unknown id is fine: fallback=latest then resolves the most recently
+    // active session.
+    const { ok, json } = await fetchJson(`${proxyBase}/__bili/plugin/status?conversationId=dsh&fallback=latest`, undefined, STATUS_TIMEOUT_MS);
+    if (!ok || !json || typeof json !== "object") return undefined;
+    return json as Record<string, unknown>;
+}
+
 /** Liveness + version probe for status UIs: same loopback origin as the
  *  status endpoint, so a 404 status + a live manifest means "proxy up,
  *  conversation not seen yet" — an armed-but-idle state, not an error. */

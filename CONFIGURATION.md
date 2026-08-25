@@ -545,7 +545,7 @@ The `/bili/` rewrite modes write a **temp copy** — the real config is never ed
 - **opencode** — the temp config appends the thin plugin automatically.
 - **claude / codex** — opt-in via `BILI_LAUNCHER_PLUGIN=1`: the launcher additionally injects a single `bili` MCP server (`--mcp-config` for claude, `-c mcp_servers.bili.*` for codex — both ephemeral, nothing written to host config). The default stays wire mode while host-flag compatibility soaks (verified with claude 2.1.227 / codex 0.147.0). `BILI_LAUNCHER_PLUGIN=0` forces plain wire mode.
 - **hermes** — no plugin API; always wire mode.
-- **dsh** — no plugin API; always wire mode.
+- **dsh** — the launcher always splices a `--patch <file>` flag into dsh's argv (written to `~/.dsh-bili/.bili-acp.patch.yml`), inserting `dist/agent/dsh-acp.js` into the profile's loader tree: the native `/acp` command, same shape as dsh's own `/compact`. Works on every profile that composes the commands service (web/tui interactive surfaces; the `headless` one-shot driver sends its task straight to the model and parses no commands — `/compact` behaves the same there). Subcommand forms are handled: `dsh web` gets the flag after `web`, `dsh plugin`/`--dump-default-config` take none.
 
 Launcher-mode matrix:
 
@@ -592,7 +592,7 @@ The installed plugin is a **thin** one (~5 KB, zero runtime deps): it detects th
 
 Kill switch: `BILLION_CONTEXT_PLUGIN=0` disables plugin mode entirely (wire-level injection resumes).
 
-**When do you need `plugin install` at all?** Launcher users mostly don't (see [Launcher Reference](#launcher-reference) — pi gets `-e`, opencode auto-injects, omp ships with it, claude/codex opt in via `BILI_LAUNCHER_PLUGIN=1`, hermes/dsh are wire-only). It's for a manually-configured client (`/bili/` prefix or MITM) where you want the native panel: pi/omp/opencode get native tools + `/acp`; claude/codex get native MCP tools (no `/acp`); hermes/dsh can't (wire only). Without any plugin everything still works — compression runs via wire-injected tools, and the model can be asked to call `acp_status` to check live usage.
+**When do you need `plugin install` at all?** Launcher users mostly don't (see [Launcher Reference](#launcher-reference) — pi gets `-e`, opencode auto-injects, omp ships with it, claude/codex opt in via `BILI_LAUNCHER_PLUGIN=1`, dsh gets the native `/acp` command via `--patch`, hermes is wire-only). It's for a manually-configured client (`/bili/` prefix or MITM) where you want the native panel: pi/omp/opencode get native tools + `/acp`; claude/codex get native MCP tools (no `/acp`); dsh gets `/acp` through the launcher's `--patch` (a manually-configured dsh can add the same patch itself); hermes can't (wire only). Without any plugin everything still works — compression runs via wire-injected tools, and the model can be asked to call `acp_status` to check live usage.
 
 ---
 
