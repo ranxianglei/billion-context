@@ -209,6 +209,7 @@ export async function* runCompressLoop(
             const calls: ToolCallEmit[] = [];
             let usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number } = {};
             let finishReason: string | undefined;
+            let sawDone = false;
             let suppressCompletion = false;
 
             for await (const ev of adapter.parseStream(currentUpstream, round)) {
@@ -247,6 +248,7 @@ export async function* runCompressLoop(
                         cachedTokens: ev.cachedTokens,
                     };
                 } else if (ev.kind === "done") {
+                    sawDone = true;
                     finishReason = ev.finishReason;
                     suppressCompletion = ev.suppressCompletion === true;
                 } else if (ev.kind === "meta") {
@@ -393,6 +395,15 @@ export async function* runCompressLoop(
             // blind to why it failed. MAX_LOOP_ROUNDS bounds runaway loops.
             const reRequest = proxyResults.length > 0 && realCalls === 0;
             if (!reRequest) {
+                if (!sawDone) {
+                    const partialText = assistantText.length;
+                    const partialReasoning = assistantReasoning.length;
+                    const msg = `upstream stream truncated (no completion event; round ${round}, ${partialText} text chars + ${partialReasoning} reasoning chars received)`;
+                    ctx.log(`[acp-loop] round ${round}: ${msg}`);
+                    loggerLog("error", `[acp-loop] ${msg}`);
+                    yield adapter.emitError(msg);
+                    return;
+                }
                 // A passthrough round already streamed the upstream's own finish
                 // chunk + [DONE] verbatim (original id + order); re-emitting a
                 // regenerated completion would duplicate them.
