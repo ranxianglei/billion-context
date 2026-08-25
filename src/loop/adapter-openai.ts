@@ -1,6 +1,8 @@
 import type { CoreMessage } from "acp-kernel";
 import { coreToOpenai, injectOpenaiSystem } from "acp-kernel/wire";
 import { buildVisibilityMarker } from "../compress-loop.js";
+import { createTagEchoFilter } from "./tag-echo-filter.js";
+import { log as loggerLog } from "../logger.js";
 
 import type {
     CompressLoopAdapter,
@@ -80,6 +82,18 @@ async function* iterSseChunks(stream: ReadableStream<Uint8Array>): AsyncGenerato
     } finally {
         reader.releaseLock();
     }
+}
+
+function rewriteContentChunk(parsed: Record<string, unknown>, content: string): Buffer {
+    const clone = { ...parsed } as { choices?: Array<Record<string, unknown>> };
+    if (clone.choices && clone.choices.length > 0) {
+        const choice = { ...(clone.choices[0] as Record<string, unknown>) };
+        const delta = { ...(choice.delta as Record<string, unknown>) };
+        delta.content = content;
+        choice.delta = delta;
+        clone.choices = [choice, ...clone.choices.slice(1)];
+    }
+    return Buffer.from(`data: ${JSON.stringify(clone)}\n\n`, "utf8");
 }
 
 export function createOpenaiAdapter(requestBody: Record<string, unknown>, clientSystem?: string): CompressLoopAdapter {
@@ -164,6 +178,17 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
 
         async *parseStream(upstream, _round) {
             const pending = new Map<number, ToolCallBuffer>();
+            // #206: strip model-imitated render tags from content deltas; the
+            // filter may hold back a short tail, flushed at finish/[DONE].
+            const tagFilter = createTagEchoFilter((snippet) => {
+                loggerLog("warn", `[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+            });
+            const flushFilter = function* (): Generator<ParsedStreamEvent> {
+                const tail = tagFilter.flush();
+                if (tail.length > 0) {
+                    yield { kind: "text", delta: tail, raw: buildContent(tail) } as ParsedStreamEvent;
+                }
+            };
             // Raw tool_call chunks in arrival order. Backends (SGLang/vLLM)
             // stream a tool name across MULTIPLE deltas — the first fragment
             // carries the name, continuation fragments carry empty names.
@@ -236,6 +261,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                 if (!dataLine) continue;
                 const jsonStr = dataLine.slice(5).trim();
                 if (jsonStr === "[DONE]") {
+                    yield* flushFilter();
                     if (sawRealToolCall) {
                         yield { kind: "meta", chunk: Buffer.from(eventStr + "\n\n", "utf8") } as ParsedStreamEvent;
                         continue;
@@ -273,6 +299,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                 const finishReason = typeof choice.finish_reason === "string" ? choice.finish_reason : undefined;
 
                 if (finishReason) {
+                    yield* flushFilter();
                     const hadToolCalls = [...pending.values()].some((tc) => tc.name.length > 0 || tc.id.length > 0);
                     yield* settleToolCalls();
                     const u = parsed.usage as Record<string, unknown> | undefined;
@@ -320,14 +347,21 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                         }
                     }
                     if (typeof delta.content === "string" && delta.content.length > 0) {
-                        yield { kind: "text", delta: delta.content } as ParsedStreamEvent;
+                        const clean = tagFilter.push(delta.content);
+                        if (clean.length > 0) {
+                            yield { kind: "text", delta: clean } as ParsedStreamEvent;
+                        }
                     }
                     continue;
                 }
 
                 const hasReasoning = typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0;
                 if (typeof delta.content === "string" && delta.content.length > 0) {
-                    yield { kind: "text", delta: delta.content, ...(hasReasoning ? {} : { raw: rawBuf }) } as ParsedStreamEvent;
+                        const clean = tagFilter.push(delta.content);
+                        if (clean.length > 0) {
+                            const raw = clean === delta.content ? rawBuf : rewriteContentChunk(parsed, clean);
+                            yield { kind: "text", delta: clean, ...(hasReasoning ? {} : { raw }) } as ParsedStreamEvent;
+                        }
                 } else if (!hasReasoning && (delta.role || (Object.keys(delta).length === 0 && !finishReason))) {
                     yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
                 }

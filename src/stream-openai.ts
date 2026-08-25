@@ -3,6 +3,7 @@ import type { Session } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput } from "./compress-tool.js";
 import { applyRanges, type RewriteCtx } from "./stream.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
+import { containsRenderTagText, stripAcpTags } from "./loop/tag-echo-filter.js";
 
 type StreamState = {
     compressIndices: Set<number>;
@@ -191,7 +192,7 @@ export function rewriteOpenaiJsonResponse(body: unknown, ctx: RewriteCtx): unkno
     let sawReal = false;
     const noteParts: string[] = [];
     const keepToolCalls: unknown[] = [];
-    const existingText = typeof msg.content === "string" ? msg.content : "";
+    let existingText = typeof msg.content === "string" ? msg.content : "";
     const toolCalls = msg.tool_calls as Array<{ function?: { name?: string; arguments?: string } }> | undefined;
     if (Array.isArray(toolCalls)) {
         for (const tc of toolCalls) {
@@ -204,8 +205,10 @@ export function rewriteOpenaiJsonResponse(body: unknown, ctx: RewriteCtx): unkno
             }
         }
     }
-    if (existingText && (existingText.includes("\x3cacp ") || existingText.includes("\x3c/acp"))) {
+    if (existingText && containsRenderTagText(existingText)) {
         ctx.log(`[warn: tag echo] non-stream openai output contains <acp tag: ${existingText.slice(0, 120).replace(/\n/g, " ")}`);
+        existingText = stripAcpTags(existingText);
+        msg.content = existingText;
     }
     if (!converted) return body;
     const note = noteParts.join("\n");

@@ -461,6 +461,27 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
         assert.ok(!(JSON.parse(fs.readFileSync(path.join(piAgentDir, "settings.json"), "utf8")) as { packages: string[] }).packages.includes(root));
         assert.match(pluginRemove("pi"), /not installed/);
 
+        // Legacy entries (old billion-context-pi npm package, a dev checkout
+        // path, backslash Windows paths) must be REPLACED by install so only
+        // one bili plugin stays live.
+        fs.writeFileSync(path.join(piAgentDir, "settings.json"), JSON.stringify({
+            packages: [
+                "npm:billion-context-pi",
+                "npm:billion-context-pi@0.1.48",
+                "npm:billion-context@0.1.40",
+                "/home/x/projects/billion-context",
+                "C:\\Users\\x\\AppData\\Roaming\\npm\\node_modules\\billion-context-pi",
+                "/home/x/other-package",
+            ],
+            theme: "dark",
+        }, null, 2));
+        assert.match(pluginInstall("pi"), /installed/);
+        const replaced = JSON.parse(fs.readFileSync(path.join(piAgentDir, "settings.json"), "utf8")) as { packages: string[]; theme: string };
+        assert.deepEqual(replaced.packages, ["/home/x/other-package", root]);
+        assert.equal(replaced.theme, "dark");
+        assert.match(pluginRemove("pi"), /removed/);
+        assert.deepEqual((JSON.parse(fs.readFileSync(path.join(piAgentDir, "settings.json"), "utf8")) as { packages: string[] }).packages, ["/home/x/other-package"]);
+
         fs.mkdirSync(path.join(home, ".omp/agent"), { recursive: true });
         await withEnv({ PI_CODING_AGENT_DIR: path.join(home, ".omp/agent") }, async () => {
         fs.writeFileSync(path.join(home, ".omp/agent/config.yml"), "extensions:\n  - /some/other/ext.js\nfirstRunComplete: true\n");

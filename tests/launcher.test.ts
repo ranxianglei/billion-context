@@ -43,6 +43,7 @@ import {
     stopProxy,
     type SpawnChild,
     type SpawnFn,
+    runLaunch,
     type ClientConfig,
     type HttpRewrite,
 } from "../src/launcher.ts";
@@ -253,6 +254,89 @@ test("findFreePort: returns another port when preferred is occupied", async () =
         assert.ok(got > 0);
     } finally {
         blocker.close();
+    }
+});
+
+import { selfPackageRoot } from "../src/plugin-install.js";
+
+test("runLaunch pi: native -e plugin injected only when not installed", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-pie-"));
+    const prevHome = process.env.HOME;
+    const prevPiBin = process.env.PI_BIN;
+    const prevPiDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.HOME = home;
+    delete process.env.PI_CODING_AGENT_DIR;
+    const fakePi = path.join(home, "fake-pi");
+    fs.writeFileSync(fakePi, "");
+    process.env.PI_BIN = fakePi;
+    const piHome = path.join(home, ".pi/agent");
+    fs.mkdirSync(piHome, { recursive: true });
+    fs.writeFileSync(path.join(piHome, "models.json"), JSON.stringify({ providers: {} }));
+
+    // runLaunch only injects -e when dist/agent/pi.js exists; create a stub
+    // when running tests from a checkout without a prior build.
+    const root = selfPackageRoot();
+    const distAgent = path.join(root, "dist", "agent", "pi.js");
+    const stubbed = !fs.existsSync(distAgent);
+    if (stubbed) {
+        fs.mkdirSync(path.dirname(distAgent), { recursive: true });
+        fs.writeFileSync(distAgent, "");
+    }
+
+    const clientArgsSeen: string[][] = [];
+    const spawnImpl: SpawnFn = (cmd, args) => {
+        if (cmd === fakePi) {
+            clientArgsSeen.push([...args]);
+            // runClient resolves on "exit" — fire it on next tick.
+            const child = makeFakeChild(0);
+            const orig = child.on.bind(child);
+            (child as { on: SpawnChild["on"] }).on = (event, listener) => {
+                orig(event, listener);
+                if (event === "exit") setTimeout(() => listener(0, null), 0);
+                return child;
+            };
+            return child;
+        }
+        return makeFakeChild(42422);
+    };
+    const fetchImpl = async () => ({ ok: true });
+
+    // runLaunch ends with process.exit() — stub it or it kills the test
+    // runner and every test registered after this one silently never runs.
+    const prevExit = process.exit;
+    const exitCalls: number[] = [];
+    process.exit = ((code?: number) => {
+        exitCalls.push(code ?? 0);
+        return undefined as never;
+    }) as typeof process.exit;
+
+    try {
+        await runLaunch(
+            { client: "pi", clientArgs: [], overrides: {} },
+            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(clientArgsSeen.length, 1);
+        assert.deepEqual(clientArgsSeen[0].slice(0, 2), ["-e", distAgent]);
+
+        // installed (settings.json packages already points at this install) → no -e
+        fs.writeFileSync(path.join(piHome, "settings.json"), JSON.stringify({ packages: [root] }));
+        clientArgsSeen.length = 0;
+        await runLaunch(
+            { client: "pi", clientArgs: [], overrides: {} },
+            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(clientArgsSeen.length, 1);
+        assert.ok(!clientArgsSeen[0].includes("-e"));
+        assert.deepEqual(exitCalls, [0, 0]);
+    } finally {
+        process.exit = prevExit;
+        process.env.HOME = prevHome;
+        if (prevPiBin === undefined) delete process.env.PI_BIN;
+        else process.env.PI_BIN = prevPiBin;
+        if (prevPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+        else process.env.PI_CODING_AGENT_DIR = prevPiDir;
+        if (stubbed) fs.rmSync(distAgent, { force: true });
+        fs.rmSync(home, { recursive: true, force: true });
     }
 });
 
