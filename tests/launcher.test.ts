@@ -333,6 +333,28 @@ test("runLaunch pi: native -e plugin injected only when not installed", async ()
         assert.equal(clientArgsSeen.length, 1);
         assert.ok(!clientArgsSeen[0].includes("-e"));
         assert.deepEqual(exitCalls, [0, 0]);
+
+        // legacy billion-context-pi entry is a DIFFERENT (usually absent) package
+        // that self-disables under BILLION_CONTEXT_PROXY — it must NOT suppress -e
+        fs.writeFileSync(path.join(piHome, "settings.json"), JSON.stringify({ packages: ["npm:billion-context-pi"] }));
+        clientArgsSeen.length = 0;
+        await runLaunch(
+            { client: "pi", clientArgs: [], overrides: {} },
+            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(clientArgsSeen.length, 1);
+        assert.deepEqual(clientArgsSeen[0].slice(0, 2), ["-e", distAgent]);
+
+        // a registry npm:billion-context entry DOES load this package's plugin → no -e
+        fs.writeFileSync(path.join(piHome, "settings.json"), JSON.stringify({ packages: ["npm:billion-context"] }));
+        clientArgsSeen.length = 0;
+        await runLaunch(
+            { client: "pi", clientArgs: [], overrides: {} },
+            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(clientArgsSeen.length, 1);
+        assert.ok(!clientArgsSeen[0].includes("-e"));
+        assert.deepEqual(exitCalls, [0, 0, 0, 0]);
     } finally {
         process.exit = prevExit;
         process.env.HOME = prevHome;

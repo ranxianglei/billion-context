@@ -91,6 +91,18 @@ export function isPiEntry(entry: string, root: string): boolean {
         || /(^|[/\\])billion-context(-pi)?$/.test(entry);
 }
 
+// Entries that load THIS package's pi plugin (billion-context proper).
+// Legacy `billion-context-pi` entries are deliberately excluded: that is a
+// separate older package — usually not installed, and it self-disables under
+// BILLION_CONTEXT_PROXY — so treating it as "installed" wrongly suppressed
+// the launcher's `-e` fallback and left pi with no plugin at all.
+export function isBiliPiEntry(entry: string, root: string): boolean {
+    return entry === root
+        || /^npm:billion-context(@|$)/.test(entry)
+        || /(^|[/\\])node_modules[/\\]billion-context([\/\\]|$)/.test(entry)
+        || /(^|[/\\])billion-context$/.test(entry);
+}
+
 function piInstall(): string {
     const root = selfPackageRoot();
     const file = piSettingsFile();
