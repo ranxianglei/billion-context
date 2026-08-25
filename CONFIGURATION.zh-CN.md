@@ -537,7 +537,7 @@ Claude Code 的 undici fetch 忽略 `HTTPS_PROXY`，所以证书 MITM 拦不到�
 ### 启动器里的原生工具
 
 - **pi** —— 未安装插件时，启动器借用 pi 的 `-e <file>` 参数为本次运行加载 `dist/agent/pi.js`（不写任何东西）：开箱即原生工具 + `/acp` 命令。已安装则符号链接的 `settings.json` 已加载它 —— 不再加 `-e`。
-- **omp** —— 发行版自带插件；无需任何操作。
+- **omp** —— 发行版不自带插件；启动器在配置里没有可加载的 bili 条目时自动注入 `-e dist/agent/omp.js`（与 pi 相同的零配置搭车）。omp 不把扩展工具放进模型工具面、也不发 `before_provider_headers`，因此模型继续用 wire 注入的工具；注入插件的增益是原生 `/acp` 命令。
 - **opencode** —— 临时配置自动追加薄插件。
 - **claude / codex** —— 通过 `BILI_LAUNCHER_PLUGIN=1` 选择启用：启动器额外注入单个 `bili` MCP 服务器（claude 用 `--mcp-config`，codex 用 `-c mcp_servers.bili.*` —— 都是临时生效，不写宿主配置）。默认仍是 wire 模式，待宿主参数兼容性充分验证后翻转（已在 claude 2.1.227 / codex 0.147.0 验证）。`BILI_LAUNCHER_PLUGIN=0` 强制 wire 模式。
 - **hermes** —— 无插件 API；永远 wire 模式。
@@ -548,7 +548,7 @@ Claude Code 的 undici fetch 忽略 `HTTPS_PROXY`，所以证书 MITM 拦不到�
 |---|---|---|
 | 启动器 + MCP（`BILI_LAUNCHER_PLUGIN=1`，claude/codex） | 原生 MCP 工具 | 一个环境变量 |
 | 启动器 wire 模式（claude/codex 默认） | 代理注入的 wire 工具 | 无 —— `bili claude` / `bili codex` 即可 |
-| 启动器 `-e` / 自动插件（pi、opencode；omp 自带） | 原生插件工具 | 无 |
+| 启动器 `-e` / 自动插件（pi、omp、opencode） | 原生插件工具 | 无 |
 | 手动插件（`bili plugin install`） | 客户端侧插件 | 执行 install |
 | 手动 baseURL（`/bili/` 前缀） | 代理注入的 wire 工具 | 改客户端配置 |
 
@@ -587,7 +587,7 @@ bili plugin remove pi       # 撤销（原文件一次性备份为 *.bili-bak）
 
 总开关：`BILLION_CONTEXT_PLUGIN=0` 彻底关闭插件模式（恢复 wire 层注入）。
 
-**到底什么时候需要 `plugin install`？** 用启动器的基本都不需要（见[启动器参考](#启动器参考) —— pi 自动 `-e`、opencode 自动注入、omp 自带、claude/codex 用 `BILI_LAUNCHER_PLUGIN=1`、hermes 只能 wire）。它适用于手动配置客户端（`/bili/` 前缀或 MITM）又想要原生面板的场景：pi/omp/opencode 装后获得原生工具 + `/acp`；claude/codex 获得原生 MCP 工具（无 `/acp`）；hermes 装不了（只能 wire）。不装任何插件一切照常工作 —— 压缩走 wire 注入的工具，让模型调 `acp_status` 即可查看实时用量。
+**到底什么时候需要 `plugin install`？** 用启动器的基本都不需要（见[启动器参考](#启动器参考) —— pi/omp 自动 `-e`、opencode 自动注入、claude/codex 用 `BILI_LAUNCHER_PLUGIN=1`、hermes 只能 wire）。它适用于手动配置客户端（`/bili/` 前缀或 MITM）又想要原生面板的场景：pi/omp/opencode 装后获得原生工具 + `/acp`；claude/codex 获得原生 MCP 工具（无 `/acp`）；hermes 装不了（只能 wire）。不装任何插件一切照常工作 —— 压缩走 wire 注入的工具，让模型调 `acp_status` 即可查看实时用量。
 
 ---
 

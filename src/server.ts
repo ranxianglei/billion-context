@@ -1183,7 +1183,7 @@ function prepareResponses(
             const sub = Array.isArray(r.tools) ? `(${r.tools.length} sub)` : "";
             return `${r.type as string}:${(r.name as string) ?? "?"}${sub}`;
         });
-        log("info", `[${sessionId}] responses forward tools=[${fwdTools.join(",")}] injectTool=${shouldInject} NO_INJECT_TOOL=${!!process.env.ACP_NO_INJECT_TOOL} NO_COMPRESS_PROMPT=${!!process.env.ACP_NO_COMPRESS_PROMPT}`);
+        log("info", `[${sessionId}] responses forward tools=[${fwdTools.join(",")}] injectTool=${injectTools}${pluginMode ? " (plugin mode: wire injection suppressed)" : ""} NO_INJECT_TOOL=${!!process.env.ACP_NO_INJECT_TOOL} NO_COMPRESS_PROMPT=${!!process.env.ACP_NO_COMPRESS_PROMPT}`);
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);

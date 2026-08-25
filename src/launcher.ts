@@ -32,7 +32,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, type StdioOptions } from "node:child_process";
 import { DEFAULT_MITM_DOMAINS } from "./mitm.js";
-import { selfPackageRoot, isBiliPiEntry } from "./plugin-install.js";
+import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom } from "./plugin-install.js";
 
 /** Absolute path of a file inside our dist/, resolved via the package root
  * (import.meta.url-based) so it survives global-installed symlink bins
@@ -1119,6 +1119,16 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         env = buildPiEnv(origin, ca, process.env);
         ompOverlayHome = prepareOmpHttpRewrite(resolveOmpHome(process.env), origin, routes.httpRewrites, routes.httpsRewrites);
         if (ompOverlayHome) env.PI_CODING_AGENT_DIR = ompOverlayHome;
+        // Native tooling out of the box (same rationale as pi): omp does NOT
+        // ship the bili plugin — when the config carries no loadable entry,
+        // ride omp's `-e <file>` (loads for this run only, writes nothing)
+        // instead of dropping to wire-mode fallback. A loadable entry (the
+        // overlay symlinks config.yml from the real home) already provides
+        // the plugin; adding `-e` too would double-register tools/commands.
+        const ompExt = selfDistFile("agent/omp.js");
+        if (ompExt && fs.existsSync(ompExt) && !ompPluginLoadedFrom(resolveOmpHome(process.env))) {
+            clientArgs = ["-e", ompExt, ...clientArgs];
+        }
     } else if (base === "opencode") {
         // opencode: HTTPS upstreams ride cert-MITM (HTTPS_PROXY + CA); plaintext
         // HTTP upstreams get a /bili/-rewritten copy of opencode.json via
