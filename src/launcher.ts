@@ -426,15 +426,48 @@ export function buildCodexMcpArgs(origin: string, conversationId: string): strin
  *
  * Refresh semantics on every launch: stale `.file.pid.tmp` drafts are dropped;
  * dead or mis-targeted symlinks are re-pointed; real files/dirs that shadow a
- * real-home entry are merged into the real home before being replaced by a
- * symlink (no data loss); entries the real home lacks are kept as-is.
+ * real-home entry are merged into the real home (recursively; mtime-newer-wins
+ * for files, losers preserved as `<name>.bili-conflict`) and only removed from
+ * the overlay when the merge fully succeeded; entries the real home lacks are
+ * kept as-is. A `.bili-launch.pid` marker warns when two launches share the
+ * overlay (each launch rewrites the generated file with its own proxy origin).
  */
+function overlayLockPath(overlay: string): string {
+    return path.join(overlay, ".bili-launch.pid");
+}
+
+function livePidHoldsOverlay(overlay: string): number | undefined {
+    let raw: string | undefined;
+    try {
+        raw = fs.readFileSync(overlayLockPath(overlay), "utf8");
+    } catch {
+        return undefined;
+    }
+    const pid = Number.parseInt(raw.trim(), 10);
+    if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) return undefined;
+    try {
+        process.kill(pid, 0);
+    } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ESRCH") return undefined;
+    }
+    return pid;
+}
+
 function refreshOverlayHome(realHome: string, overlay: string, generatedFile: string): boolean {
     try {
         fs.mkdirSync(overlay, { recursive: true });
     } catch {
         return false;
     }
+    const holder = livePidHoldsOverlay(overlay);
+    if (holder !== undefined) {
+        console.error(
+            `bili: another bili launch (pid ${holder}) is using ${overlay} — concurrent launches share this overlay and the last one's proxy port wins in the generated config.`,
+        );
+    }
+    try {
+        fs.writeFileSync(overlayLockPath(overlay), `${process.pid}\n`);
+    } catch {}
     const realEntries = new Set<string>();
     try {
         for (const entry of fs.readdirSync(realHome)) realEntries.add(entry);
@@ -467,10 +500,13 @@ function refreshOverlayHome(realHome: string, overlay: string, generatedFile: st
                     } catch {}
                 }
             } else if (realEntries.has(entry)) {
-                if (st.isDirectory()) mergeOverlayDir(overlayPath, path.join(realHome, entry));
-                try {
-                    fs.rmSync(overlayPath, { recursive: true, force: true });
-                } catch {}
+                if (mergeOverlayEntry(overlayPath, path.join(realHome, entry))) {
+                    try {
+                        fs.rmSync(overlayPath, { recursive: true, force: true });
+                    } catch {}
+                } else {
+                    console.error(`bili: could not merge ${overlayPath} into ${realHome} — kept in place, resolve manually.`);
+                }
             }
         }
         for (const entry of realEntries) {
@@ -483,17 +519,86 @@ function refreshOverlayHome(realHome: string, overlay: string, generatedFile: st
     return true;
 }
 
-function mergeOverlayDir(fromDir: string, toDir: string): void {
+function mergeOverlayEntry(src: string, dst: string): boolean {
+    let st: fs.Stats;
     try {
-        fs.mkdirSync(toDir, { recursive: true });
-        for (const child of fs.readdirSync(fromDir)) {
-            const dst = path.join(toDir, child);
-            if (fs.existsSync(dst)) continue;
-            try {
-                fs.renameSync(path.join(fromDir, child), dst);
-            } catch {}
-        }
+        st = fs.lstatSync(src);
+    } catch {
+        return true;
+    }
+    let dstStat: fs.Stats | undefined;
+    try {
+        dstStat = fs.lstatSync(dst);
     } catch {}
+    if (st.isDirectory()) {
+        if (dstStat && !dstStat.isDirectory()) {
+            try {
+                fs.renameSync(dst, `${dst}.bili-conflict`);
+                dstStat = undefined;
+            } catch {
+                return false;
+            }
+        }
+        try {
+            fs.mkdirSync(dst, { recursive: true });
+        } catch {
+            return false;
+        }
+        let entries: string[];
+        try {
+            entries = fs.readdirSync(src);
+        } catch {
+            return false;
+        }
+        let ok = true;
+        for (const entry of entries) {
+            if (!mergeOverlayEntry(path.join(src, entry), path.join(dst, entry))) ok = false;
+        }
+        return ok;
+    }
+    if (dstStat && dstStat.isDirectory()) {
+        try {
+            fs.renameSync(src, `${dst}.bili-conflict`);
+            return true;
+        } catch {
+            return false;
+        }
+    }
+    if (st.isSymbolicLink()) {
+        if (dstStat) {
+            try {
+                fs.unlinkSync(src);
+            } catch {}
+            return true;
+        }
+        try {
+            fs.renameSync(src, dst);
+        } catch {
+            return false;
+        }
+        return true;
+    }
+    if (dstStat && dstStat.mtimeMs >= st.mtimeMs) {
+        try {
+            fs.renameSync(src, `${dst}.bili-conflict`);
+            return true;
+        } catch {
+            return false;
+        }
+    }
+    if (dstStat) {
+        try {
+            fs.renameSync(dst, `${dst}.bili-conflict`);
+        } catch {
+            return false;
+        }
+    }
+    try {
+        fs.renameSync(src, dst);
+        return true;
+    } catch {
+        return false;
+    }
 }
 
 function writeOverlayFileAtomic(overlay: string, fileName: string, contents: string): void {

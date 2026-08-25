@@ -794,6 +794,86 @@ test("prepareOmpHttpRewrite: drops dead symlinks and merges shadowed dirs into r
     }
 });
 
+test("prepareOmpHttpRewrite: shadow FILE merged newer-wins, loser kept as .bili-conflict", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-"));
+    const modelsYml = ["providers:", "  a:", "    baseUrl: http://example.com/v1"].join("\n");
+    fs.writeFileSync(path.join(home, "models.yml"), modelsYml);
+    fs.writeFileSync(path.join(home, "settings.json"), "stale-from-real-home");
+    fs.writeFileSync(path.join(home, "older.json"), "real-newer");
+    const rw = [{ key: "a", realUpstream: "http://example.com/v1" }];
+    const overlay = `${home}-bili`;
+    let tmp: string | undefined;
+    try {
+        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
+        assert.equal(fs.readFileSync(path.join(overlay, ".bili-launch.pid"), "utf8").trim(), `${process.pid}`, "launch pid marker written");
+        fs.rmSync(path.join(overlay, "settings.json"));
+        fs.writeFileSync(path.join(overlay, "settings.json"), "client-newer-write");
+        const now = Date.now();
+        fs.utimesSync(path.join(home, "settings.json"), new Date(now - 4000), new Date(now - 4000));
+        fs.rmSync(path.join(overlay, "older.json"));
+        fs.writeFileSync(path.join(overlay, "older.json"), "overlay-stale");
+        fs.utimesSync(path.join(overlay, "older.json"), new Date(now - 4000), new Date(now - 4000));
+        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
+        assert.equal(fs.readFileSync(path.join(home, "settings.json"), "utf8"), "client-newer-write", "newer overlay file wins");
+        assert.equal(fs.readFileSync(path.join(home, "settings.json.bili-conflict"), "utf8"), "stale-from-real-home", "loser preserved as conflict copy");
+        assert.equal(fs.lstatSync(path.join(overlay, "settings.json")).isSymbolicLink(), true, "shadow file re-linked");
+        assert.equal(fs.readFileSync(path.join(home, "older.json"), "utf8"), "real-newer", "newer real-home file wins");
+        assert.equal(fs.readFileSync(path.join(home, "older.json.bili-conflict"), "utf8"), "overlay-stale", "stale overlay copy preserved as conflict");
+        assert.equal(fs.lstatSync(path.join(overlay, "older.json")).isSymbolicLink(), true, "re-linked after merge");
+    } finally {
+        if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("prepareOmpHttpRewrite: recursive dir merge keeps deep new files when both sides share a subdir", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-"));
+    const modelsYml = ["providers:", "  a:", "    baseUrl: http://example.com/v1"].join("\n");
+    fs.writeFileSync(path.join(home, "models.yml"), modelsYml);
+    fs.mkdirSync(path.join(home, "sessions", "sub"), { recursive: true });
+    fs.writeFileSync(path.join(home, "sessions", "sub", "old.jsonl"), "old");
+    const rw = [{ key: "a", realUpstream: "http://example.com/v1" }];
+    const overlay = `${home}-bili`;
+    let tmp: string | undefined;
+    try {
+        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
+        fs.rmSync(path.join(overlay, "sessions"));
+        fs.mkdirSync(path.join(overlay, "sessions", "sub"), { recursive: true });
+        fs.writeFileSync(path.join(overlay, "sessions", "sub", "new.jsonl"), "deep-new-session");
+        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
+        assert.equal(fs.readFileSync(path.join(home, "sessions", "sub", "old.jsonl"), "utf8"), "old", "existing deep file untouched");
+        assert.equal(fs.readFileSync(path.join(home, "sessions", "sub", "new.jsonl"), "utf8"), "deep-new-session", "deep new file merged, not destroyed");
+        assert.equal(fs.lstatSync(path.join(overlay, "sessions")).isSymbolicLink(), true, "shadow dir re-linked");
+    } finally {
+        if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("prepareOmpHttpRewrite: file-vs-dir type clash preserves both sides", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-"));
+    const modelsYml = ["providers:", "  a:", "    baseUrl: http://example.com/v1"].join("\n");
+    fs.writeFileSync(path.join(home, "models.yml"), modelsYml);
+    fs.writeFileSync(path.join(home, "state.bin"), "v1-file");
+    const rw = [{ key: "a", realUpstream: "http://example.com/v1" }];
+    const overlay = `${home}-bili`;
+    let tmp: string | undefined;
+    try {
+        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
+        fs.rmSync(path.join(overlay, "state.bin"));
+        fs.mkdirSync(path.join(overlay, "state.bin", "x"), { recursive: true });
+        fs.writeFileSync(path.join(overlay, "state.bin", "x", "precious.txt"), "precious");
+        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
+        assert.equal(fs.statSync(path.join(home, "state.bin")).isDirectory(), true, "merged dir took the canonical name");
+        assert.equal(fs.readFileSync(path.join(home, "state.bin", "x", "precious.txt"), "utf8"), "precious", "overlay subtree preserved, not destroyed");
+        assert.equal(fs.readFileSync(path.join(home, "state.bin.bili-conflict"), "utf8"), "v1-file", "displaced real-home file preserved as conflict copy");
+        assert.equal(fs.lstatSync(path.join(overlay, "state.bin")).isSymbolicLink(), true, "re-linked after merge");
+    } finally {
+        if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
 test("prepareOmpHttpRewrite: returns undefined when no rewrites", () => {
     assert.equal(prepareOmpHttpRewrite("/whatever", "http://127.0.0.1:8787", [], []), undefined);
 });
