@@ -247,7 +247,7 @@ await test("setupMitm e2e: idle tunnel after CONNECT is killed by the handshake 
     });
 });
 
-await test("setupMitm e2e: non-loopback CONNECT client gets 403 (#77)", async (t) => {
+await test("setupMitm e2e: remote CONNECT policy (#77, #240)", async (t) => {
     // The test client's remoteAddress is only non-loopback if we connect via a
     // real LAN address of this host. Skip when the box has none (some CI).
     const lanAddr = Object.values(os.networkInterfaces())
@@ -255,17 +255,37 @@ await test("setupMitm e2e: non-loopback CONNECT client gets 403 (#77)", async (t
         .find((i) => i && i.family === "IPv4" && !i.internal);
     if (!lanAddr) return t.skip("no non-loopback IPv4 address available");
     await withTmpCa(async () => {
-        const server = http.createServer((_req, res) => { res.writeHead(500); res.end(); });
-        setupMitm(server, [], () => { /* silent */ });
-        server.listen(0, lanAddr.address);
-        await once(server, "listening");
-        const port = (server.address() as { port: number }).port;
+        // Gate stays closed when allowRemoteClients is not opted in (default:
+        // loopback-only proxy) — the #77 regression.
+        const strictServer = http.createServer((_req, res) => { res.writeHead(500); res.end(); });
+        setupMitm(strictServer, [], () => { /* silent */ });
+        strictServer.listen(0, lanAddr.address);
+        await once(strictServer, "listening");
+        const strictPort = (strictServer.address() as { port: number }).port;
         try {
-            const { statusLine } = await rawConnect(port, lanAddr.address, "api.anthropic.com:443");
+            const { statusLine } = await rawConnect(strictPort, lanAddr.address, "api.anthropic.com:443");
             assert.match(statusLine, /^HTTP\/1\.1 403/);
         } finally {
-            server.close();
-            server.closeAllConnections?.();
+            strictServer.close();
+            strictServer.closeAllConnections?.();
+        }
+
+        // Non-loopback --host opts in (#240): whitelisted model hosts accept
+        // remote CONNECT, everything else stays 403 (no open TCP relay).
+        const openServer = http.createServer((_req, res) => { res.writeHead(500); res.end(); });
+        setupMitm(openServer, [], () => { /* silent */ }, undefined, true);
+        openServer.listen(0, lanAddr.address);
+        await once(openServer, "listening");
+        const openPort = (openServer.address() as { port: number }).port;
+        try {
+            const whitelisted = await rawConnect(openPort, lanAddr.address, "api.anthropic.com:443");
+            assert.match(whitelisted.statusLine, /^HTTP\/1\.1 200/, "remote client + whitelisted host must be MITM'd");
+            whitelisted.socket.destroy();
+            const other = await rawConnect(openPort, lanAddr.address, "example.com:443");
+            assert.match(other.statusLine, /^HTTP\/1\.1 403/, "remote client + non-whitelisted host must be refused");
+        } finally {
+            openServer.close();
+            openServer.closeAllConnections?.();
         }
     });
 });

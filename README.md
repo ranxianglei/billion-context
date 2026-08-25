@@ -148,6 +148,23 @@ bili --no-auto-update        # disable self-update for this run
 
 Flags override env vars and the config file. `bili --help` lists them all.
 
+### Remote agents (`--host`)
+
+By default the proxy binds `127.0.0.1` and only accepts loopback
+connections. To serve agents on other machines, bind a non-loopback host:
+
+```bash
+bili --host 0.0.0.0           # all interfaces (or use your LAN IP)
+```
+
+- Remote agents point their model `baseURL` at `http://<this-host>:<port>/bili/…`.
+- MITM-mode `CONNECT` then also accepts remote clients — for **whitelisted
+  model hosts only**. Blind tunnels to arbitrary hosts stay loopback-only, so
+  the proxy can never be used as an open relay.
+- There is **no authentication**: only do this on a trusted LAN or behind a
+  firewall. The `/__bili/` management endpoints remain loopback-only.
+- A startup `[security]` warning reminds you of the above.
+
 ### Debugging
 
 Three ways to enable verbose logging (priority: flag > env > config):
