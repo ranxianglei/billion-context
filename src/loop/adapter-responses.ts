@@ -21,6 +21,25 @@ interface FunctionCallBuffer {
     arguments: string;
 }
 
+// Upstream rejects Responses input item ids longer than 64 chars. All
+// proxy-synthesized ids stay well below this cap (#242).
+const RESPONSES_ITEM_ID_MAX = 64;
+
+/**
+ * Heal client rollouts already poisoned with over-long ids (they 400 every
+ * request otherwise). Rewrites in place, deterministically, so repeated
+ * requests keep referencing the same replacement id (#242).
+ */
+export function sanitizeResponsesInputIds(input: unknown): void {
+    if (!Array.isArray(input)) return;
+    for (const item of input) {
+        const rec = item as Record<string, unknown>;
+        if (typeof rec?.id === "string" && rec.id.length > RESPONSES_ITEM_ID_MAX) {
+            rec.id = `msg-fix-${hashId(rec.id)}`;
+        }
+    }
+}
+
 interface MappedItem {
     id: string;
     index: number;

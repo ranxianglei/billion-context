@@ -4,6 +4,7 @@ import type { Config, CoreMessage } from "acp-kernel";
 import { createCore, createInitialState } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 import { runCompressLoop, createResponsesAdapter } from "../src/loop/index.ts";
+import { sanitizeResponsesInputIds } from "../src/loop/adapter-responses.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
 
 function sse(event: string, obj: Record<string, unknown>): string {
@@ -128,4 +129,28 @@ test("responses wire round-2: lifecycle references stay valid and remapped ids f
         events.some((e) => e.event === "response.output_item.done" && (e.data.item as Record<string, unknown>)?.id === round2Id),
         "round-2 message item closed with output_item.done",
     );
+});
+
+test("sanitizeResponsesInputIds rewrites over-long ids deterministically and heals poisoned rollouts (#242)", () => {
+    const poisoned = `msg-proxy-2-${"x".repeat(60)}`;
+    const input = [
+        { type: "message", id: poisoned, role: "user", content: [] },
+        { type: "message", id: "msg_short_ok", role: "assistant", content: [] },
+        { type: "function_call", id: "fc_1", call_id: `call_${"y".repeat(70)}`, name: "acp_status", arguments: "{}" },
+    ];
+    sanitizeResponsesInputIds(input);
+    const [healed, untouched, callItem] = input as Array<{ id: string; call_id?: string }>;
+    assert.ok(healed.id.length <= 64, `healed id must fit the 64-char limit; got ${healed.id.length}`);
+    assert.ok(healed.id.startsWith("msg-fix-"), "healed id uses the msg-fix prefix");
+    assert.notEqual(healed.id, poisoned, "over-long id is actually rewritten");
+    assert.equal(untouched.id, "msg_short_ok", "ids within the limit pass through untouched");
+    assert.ok((callItem.call_id ?? "").length > 64, "call_id values are not rewritten (upstream allows long call ids)");
+
+    const again = [{ type: "message", id: poisoned, role: "user", content: [] }];
+    sanitizeResponsesInputIds(again);
+    assert.equal((again[0] as { id: string }).id, healed.id, "rewrite is deterministic: same source id maps to the same replacement");
+
+    sanitizeResponsesInputIds(undefined as unknown as unknown[]);
+    sanitizeResponsesInputIds("not-an-array" as unknown as unknown[]);
+    assert.ok(true, "non-array input tolerated");
 });
