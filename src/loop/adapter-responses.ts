@@ -1,6 +1,7 @@
 import type { CoreMessage } from "acp-kernel";
 import { coreToResponses, injectResponsesDeveloperMessage, patchResponsesInput, type ResponseInputItem, type ResponsesProjection } from "acp-kernel/wire";
 import { buildVisibilityMarker } from "../compress-loop.js";
+import { hashId } from "../util.js";
 import { createTagEchoFilter, stripResponsesText, containsRenderTagText } from "./tag-echo-filter.js";
 import { log as loggerLog } from "../logger.js";
 import { ACP_TEXT_OPEN, ACP_TEXT_CLOSE, ACP_STATUS_OPEN, ACP_STATUS_CLOSE, ACP_SEARCH_OPEN, ACP_SEARCH_CLOSE, ACP_DECOMPRESS_OPEN, ACP_DECOMPRESS_CLOSE, COMPRESS_TOOL_NAME, PROXY_TOOL_NAMES } from "../compress-tool.js";
@@ -18,6 +19,25 @@ interface FunctionCallBuffer {
     callId: string;
     name: string;
     arguments: string;
+}
+
+// Upstream rejects Responses input item ids longer than 64 chars. All
+// proxy-synthesized ids stay well below this cap (#242).
+const RESPONSES_ITEM_ID_MAX = 64;
+
+/**
+ * Heal client rollouts already poisoned with over-long ids (they 400 every
+ * request otherwise). Rewrites in place, deterministically, so repeated
+ * requests keep referencing the same replacement id (#242).
+ */
+export function sanitizeResponsesInputIds(input: unknown): void {
+    if (!Array.isArray(input)) return;
+    for (const item of input) {
+        const rec = item as Record<string, unknown>;
+        if (typeof rec?.id === "string" && rec.id.length > RESPONSES_ITEM_ID_MAX) {
+            rec.id = `msg-fix-${hashId(rec.id)}`;
+        }
+    }
 }
 
 interface MappedItem {
@@ -235,7 +255,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                         yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
                     } else if (item?.type === "message" && round > 1 && !suppressTextLifecycle) {
                         const origId = typeof item.id === "string" ? item.id : "";
-                        const mapped = { id: `msg-proxy-${round}-${origId || outputIndex}`, index: outputIndex++ };
+                        const mapped = { id: `msg-proxy-${round}-${hashId(origId || String(outputIndex))}`, index: outputIndex++ };
                         if (origId) remapped.set(origId, mapped);
                         yield { kind: "meta", chunk: rewriteItemEvent(type, obj, mapped), firstRoundOnly: false } as ParsedStreamEvent;
                     } else if (item?.type !== "message" || !suppressTextLifecycle) {

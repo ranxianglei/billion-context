@@ -4,6 +4,7 @@ import type { Config, CoreMessage } from "acp-kernel";
 import { createCore, createInitialState } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 import { runCompressLoop, createResponsesAdapter } from "../src/loop/index.ts";
+import { sanitizeResponsesInputIds } from "../src/loop/adapter-responses.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
 
 function sse(event: string, obj: Record<string, unknown>): string {
@@ -51,7 +52,9 @@ function parseOut(out: string): OutEvent[] {
     return events;
 }
 
-test("responses wire round-2: every output_text.delta must reference an item the client saw added (codex #212)", async () => {
+test("responses wire round-2: lifecycle references stay valid and remapped ids fit the API limit (codex #212, #242)", async () => {
+    const upstreamRound2Id = "msg_083f5e89ab47276e016a8d80c2a5c4819780d41a8c32999fc8";
+    assert.equal(upstreamRound2Id.length, 54, "fixture matches the length of a real Codex message id");
     const round1 = [
         sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
         sse("response.output_item.added", { output_index: 0, item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "acp_status", arguments: "" } }),
@@ -63,13 +66,13 @@ test("responses wire round-2: every output_text.delta must reference an item the
 
     const round2 = [
         sse("response.created", { response: { id: "resp_2", status: "in_progress" } }),
-        sse("response.output_item.added", { output_index: 0, item: { type: "message", id: "msg_2", role: "assistant", content: [] } }),
-        sse("response.content_part.added", { item_id: "msg_2", output_index: 0, part: { type: "output_text", text: "" } }),
-        sse("response.output_text.delta", { item_id: "msg_2", output_index: 0, delta: "after " }),
-        sse("response.output_text.delta", { item_id: "msg_2", output_index: 0, delta: "compress" }),
-        sse("response.output_text.done", { item_id: "msg_2", output_index: 0, text: "after compress" }),
-        sse("response.content_part.done", { item_id: "msg_2", output_index: 0, part: { type: "output_text", text: "after compress" } }),
-        sse("response.output_item.done", { output_index: 0, item: { type: "message", id: "msg_2", role: "assistant", content: [{ type: "output_text", text: "after compress" }] } }),
+        sse("response.output_item.added", { output_index: 0, item: { type: "message", id: upstreamRound2Id, role: "assistant", content: [] } }),
+        sse("response.content_part.added", { item_id: upstreamRound2Id, output_index: 0, part: { type: "output_text", text: "" } }),
+        sse("response.output_text.delta", { item_id: upstreamRound2Id, output_index: 0, delta: "after " }),
+        sse("response.output_text.delta", { item_id: upstreamRound2Id, output_index: 0, delta: "compress" }),
+        sse("response.output_text.done", { item_id: upstreamRound2Id, output_index: 0, text: "after compress" }),
+        sse("response.content_part.done", { item_id: upstreamRound2Id, output_index: 0, part: { type: "output_text", text: "after compress" } }),
+        sse("response.output_item.done", { output_index: 0, item: { type: "message", id: upstreamRound2Id, role: "assistant", content: [{ type: "output_text", text: "after compress" }] } }),
         sse("response.completed", { response: { id: "resp_2", status: "completed", output: [] } }),
     ].join("");
 
@@ -119,10 +122,35 @@ test("responses wire round-2: every output_text.delta must reference an item the
     );
     assert.ok(round2Item, "round-2 message item forwarded with remapped id (native streaming, not buffered)");
     const round2Id = String((round2Item.data.item as Record<string, unknown>).id);
+    assert.ok(round2Id.length <= 64, `remapped message id must fit the Responses API's 64-character limit; got ${round2Id.length}`);
     const round2Deltas = deltas.filter((e) => e.data.item_id === round2Id);
     assert.equal(round2Deltas.map((e) => e.data.delta).join(""), "after compress", "round-2 text content streamed in order");
     assert.ok(
         events.some((e) => e.event === "response.output_item.done" && (e.data.item as Record<string, unknown>)?.id === round2Id),
         "round-2 message item closed with output_item.done",
     );
+});
+
+test("sanitizeResponsesInputIds rewrites over-long ids deterministically and heals poisoned rollouts (#242)", () => {
+    const poisoned = `msg-proxy-2-${"x".repeat(60)}`;
+    const input = [
+        { type: "message", id: poisoned, role: "user", content: [] },
+        { type: "message", id: "msg_short_ok", role: "assistant", content: [] },
+        { type: "function_call", id: "fc_1", call_id: `call_${"y".repeat(70)}`, name: "acp_status", arguments: "{}" },
+    ];
+    sanitizeResponsesInputIds(input);
+    const [healed, untouched, callItem] = input as Array<{ id: string; call_id?: string }>;
+    assert.ok(healed.id.length <= 64, `healed id must fit the 64-char limit; got ${healed.id.length}`);
+    assert.ok(healed.id.startsWith("msg-fix-"), "healed id uses the msg-fix prefix");
+    assert.notEqual(healed.id, poisoned, "over-long id is actually rewritten");
+    assert.equal(untouched.id, "msg_short_ok", "ids within the limit pass through untouched");
+    assert.ok((callItem.call_id ?? "").length > 64, "call_id values are not rewritten (upstream allows long call ids)");
+
+    const again = [{ type: "message", id: poisoned, role: "user", content: [] }];
+    sanitizeResponsesInputIds(again);
+    assert.equal((again[0] as { id: string }).id, healed.id, "rewrite is deterministic: same source id maps to the same replacement");
+
+    sanitizeResponsesInputIds(undefined as unknown as unknown[]);
+    sanitizeResponsesInputIds("not-an-array" as unknown as unknown[]);
+    assert.ok(true, "non-array input tolerated");
 });
