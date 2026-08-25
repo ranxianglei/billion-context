@@ -264,6 +264,30 @@ test("Codex official transport preserves OAuth headers, decodes bodies, and reba
         assert.ok(subagentSession, "subagent session is labelled with its per-agent thread-id");
         assert.notEqual(subagentSession.id, session.id);
         assert.equal(subagentSession.stats.requests, 2, "changing subagent instructions does not split its explicit thread identity");
+
+        const legacySessionId = "legacy-responses-session";
+        for (const instructions of ["legacy dynamic instructions A", "legacy dynamic instructions B"]) {
+            const legacy = await fetch(`${base}/responses`, {
+                method: "POST",
+                headers: {
+                    authorization: "Bearer AbCdEf",
+                    "chatgpt-account-id": "account-123",
+                    "session-id": legacySessionId,
+                    "content-type": "application/json",
+                },
+                body: JSON.stringify({
+                    model: "gpt-5",
+                    stream: false,
+                    instructions,
+                    input: [{ type: "message", role: "user", content: "legacy client turn" }],
+                }),
+            });
+            assert.equal(legacy.status, 200);
+            await legacy.arrayBuffer();
+        }
+        const legacySessions = listSessions().filter((candidate) => candidate.meta.label === legacySessionId);
+        assert.equal(legacySessions.length, 1, "changing instructions does not split a legacy Responses session");
+        assert.equal(legacySessions[0].stats.requests, 2);
     } finally {
         await close(proxy);
         await close(upstream);
