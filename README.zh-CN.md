@@ -1,10 +1,28 @@
-[English](./README.md) | [中文](./README.zh-CN.md)
-
 # billion-context
 
-AI 编程助手的通用上下文压缩代理。
+[English](./README.md) | [中文](./README.zh-CN.md)
 
-`billion-context` 架在**任意**编程助手与其模型 API 之间,用 [acp-kernel](https://github.com/ranxianglei/acp-kernel) 压缩重写 Anthropic/OpenAI 流。任何能设置 base URL 的助手开箱即用 —— **无需为每个助手写适配代码**。
+<p align="center">
+AI 编程助手的<strong>通用上下文压缩代理</strong>
+<br />
+任何能设置 base URL 的助手 —— <em>无需为每个助手写适配代码</em>。
+</p>
+
+---
+
+<p align="center">
+<a href="https://www.npmjs.com/package/billion-context"><img src="https://img.shields.io/npm/v/billion-context.svg?style=flat-square" alt="npm"></a>
+<a href="https://github.com/ranxianglei/billion-context/blob/master/LICENSE"><img src="https://img.shields.io/npm/l/billion-context.svg?style=flat-square" alt="license"></a>
+<a href="https://github.com/ranxianglei/billion-context"><img src="https://img.shields.io/badge/GitHub-ranxianglei%2Fbillion--context-181717?style=flat-square&logo=github" alt="GitHub"></a>
+</p>
+
+<p align="center">
+<code>npm install -g billion-context</code>
+</p>
+
+---
+
+`billion-context` 架在**任意**编程助手与其模型 API 之间,用 [acp-kernel](https://github.com/ranxianglei/acp-kernel) 压缩重写 Anthropic/OpenAI 流。何时压缩、压缩什么 —— <strong>由模型决定</strong>,而非硬截断。
 
 ## 为什么
 

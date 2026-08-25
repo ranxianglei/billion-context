@@ -1,10 +1,28 @@
-[English](./README.md) | [中文](./README.zh-CN.md)
-
 # billion-context
 
-Universal context-compression proxy for AI coding agents.
+[English](./README.md) | [中文](./README.zh-CN.md)
 
-`billion-context` sits between **any** agent and its model API, rewriting Anthropic/OpenAI streams with [acp-kernel](https://github.com/ranxianglei/acp-kernel) compression. Any agent that can set a base URL works out of the box — **zero per-agent adapter code**.
+<p align="center">
+<strong>Universal context-compression proxy</strong> for AI coding agents
+<br />
+Any agent that can set a base URL — <em>zero per-agent adapter code</em>.
+</p>
+
+---
+
+<p align="center">
+<a href="https://www.npmjs.com/package/billion-context"><img src="https://img.shields.io/npm/v/billion-context.svg?style=flat-square" alt="npm"></a>
+<a href="https://github.com/ranxianglei/billion-context/blob/master/LICENSE"><img src="https://img.shields.io/npm/l/billion-context.svg?style=flat-square" alt="license"></a>
+<a href="https://github.com/ranxianglei/billion-context"><img src="https://img.shields.io/badge/GitHub-ranxianglei%2Fbillion--context-181717?style=flat-square&logo=github" alt="GitHub"></a>
+</p>
+
+<p align="center">
+<code>npm install -g billion-context</code>
+</p>
+
+---
+
+`billion-context` sits between **any** agent and its model API, rewriting Anthropic/OpenAI streams with [acp-kernel](https://github.com/ranxianglei/acp-kernel) compression. The model decides **when** and **what** to compress into high-fidelity summaries — not a hard truncation limit.
 
 ## Why
 
