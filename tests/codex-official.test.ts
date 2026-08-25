@@ -4,7 +4,7 @@ import http from "node:http";
 import { once } from "node:events";
 import { gzipSync } from "node:zlib";
 import { createInitialState, defaultConfig } from "acp-kernel";
-import { startServer, isChatGptCodexUpstream, isCodexResponsesLite, shouldInjectPromptCacheKey, resolvePromptCacheKey } from "../src/server.ts";
+import { startServer, hasTerminalResponsesCompactionTrigger, isChatGptCodexUpstream, isCodexResponsesLite, shouldInjectPromptCacheKey, resolvePromptCacheKey } from "../src/server.ts";
 import { listSessions } from "../src/session.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import type { ProxyOptions } from "../src/config.ts";
@@ -161,6 +161,41 @@ test("Codex official transport preserves OAuth headers, decodes bodies, and reba
         assert.equal(session.blockContents.size, 0);
         assert.equal((session.metadata.nativeCompactionBoundary as Record<string, unknown>).pendingRebase, false);
 
+        session.stats.lastInputTokens = 390_000;
+        const triggerBody = {
+            ...requestBody,
+            instructions: "You are a temporary compaction helper.",
+            input: [
+                ...Array.from({ length: 12 }, (_, index) => ({
+                    type: "message",
+                    id: index === 0 ? `msg-proxy-2-${"x".repeat(60)}` : `msg_${index}`,
+                    role: index % 2 === 0 ? "user" : "assistant",
+                    content: `${index}:${"x".repeat(40_000)}`,
+                })),
+                { type: "compaction_trigger" },
+            ],
+        };
+        const trigger = await fetch(`${base}/responses`, {
+            method: "POST",
+            headers: {
+                authorization: "Bearer AbCdEf",
+                "chatgpt-account-id": "account-123",
+                "session-id": sessionId,
+                "content-type": "application/json",
+            },
+            body: JSON.stringify(triggerBody),
+        });
+        assert.equal(trigger.status, 200);
+        await trigger.arrayBuffer();
+        const forwardedTrigger = JSON.parse(captured[3].body.toString("utf8")) as typeof triggerBody;
+        assert.deepEqual({ ...forwardedTrigger, input: [] }, { ...triggerBody, input: [] });
+        assert.match(forwardedTrigger.input[0].id, /^msg-fix-/);
+        assert.ok(forwardedTrigger.input[0].id.length <= 64);
+        assert.deepEqual(forwardedTrigger.input.slice(1), triggerBody.input.slice(1));
+        assert.equal(forwardedTrigger.input.at(-1)?.type, "compaction_trigger");
+        assert.equal(listSessions().filter((candidate) => candidate.meta.label === sessionId).length, 1);
+        assert.equal((session.metadata.nativeCompactionBoundary as Record<string, unknown>).pendingRebase, true);
+
         session.state.nextBlockId = 8;
         const failedCompact = await fetch(`${base}/responses/compact?fail=1`, {
             method: "POST",
@@ -170,6 +205,65 @@ test("Codex official transport preserves OAuth headers, decodes bodies, and reba
         assert.equal(failedCompact.status, 500);
         await failedCompact.arrayBuffer();
         assert.equal(session.state.nextBlockId, 8);
+
+        const resumed = await fetch(`${base}/responses`, {
+            method: "POST",
+            headers: {
+                authorization: "Bearer AbCdEf",
+                "chatgpt-account-id": "account-123",
+                "session-id": sessionId,
+                "thread-id": sessionId,
+                "x-codex-turn-metadata": JSON.stringify({
+                    session_id: sessionId,
+                    thread_id: sessionId,
+                    agent_name: "/root",
+                    thread_source: "root",
+                }),
+                "content-type": "application/json",
+            },
+            body: JSON.stringify({ ...requestBody, instructions: "changed root instructions after native compaction" }),
+        });
+        assert.equal(resumed.status, 200);
+        await resumed.arrayBuffer();
+        assert.equal(session.state.nextBlockId, createInitialState().nextBlockId);
+        assert.equal((session.metadata.nativeCompactionBoundary as Record<string, unknown>).pendingRebase, false);
+        assert.equal(listSessions().filter((candidate) => candidate.meta.label === sessionId).length, 1);
+
+        const subagentThreadId = "01a03980-5342-70b2-86f5-8e50be38b494";
+        const subagentHeaders = {
+            authorization: "Bearer AbCdEf",
+            "chatgpt-account-id": "account-123",
+            "session-id": sessionId,
+            "thread-id": subagentThreadId,
+            "x-codex-turn-metadata": JSON.stringify({
+                session_id: sessionId,
+                thread_id: subagentThreadId,
+                agent_name: "/root/subagent_probe",
+                thread_source: "subagent",
+                parent_thread_id: sessionId,
+            }),
+            "content-type": "application/json",
+        };
+        for (const instructions of ["dynamic subagent prompt A", "dynamic subagent prompt B"]) {
+            const subagent = await fetch(`${base}/responses`, {
+                method: "POST",
+                headers: subagentHeaders,
+                body: JSON.stringify({
+                    model: "gpt-5",
+                    stream: false,
+                    instructions,
+                    input: [{ type: "message", role: "user", content: "SUBAGENT_PROBE_OK" }],
+                }),
+            });
+            assert.equal(subagent.status, 200);
+            await subagent.arrayBuffer();
+        }
+        const sessionsAfterSubagent = listSessions();
+        assert.equal(sessionsAfterSubagent.length, 2, "root and Codex subagent receive separate compression sessions");
+        const subagentSession = sessionsAfterSubagent.find((candidate) => candidate.meta.label === subagentThreadId);
+        assert.ok(subagentSession, "subagent session is labelled with its per-agent thread-id");
+        assert.notEqual(subagentSession.id, session.id);
+        assert.equal(subagentSession.stats.requests, 2, "changing subagent instructions does not split its explicit thread identity");
     } finally {
         await close(proxy);
         await close(upstream);
@@ -191,4 +285,12 @@ test("Codex official profile uses text protocol and prompt-cache auto stays nati
     assert.equal(isCodexResponsesLite({}, { input: [], additional_tools: [] }), false);
     assert.equal(isCodexResponsesLite({}, { input: [{ type: "additional_tools", tools: [] }] }), false);
     assert.equal(isCodexResponsesLite({}, { input: [] }), false);
+});
+
+test("Codex native compaction is recognized only when the trigger is terminal", () => {
+    const message = { type: "message", role: "user", content: "hello" } as never;
+    const trigger = { type: "compaction_trigger" } as never;
+    assert.equal(hasTerminalResponsesCompactionTrigger([message, trigger]), true);
+    assert.equal(hasTerminalResponsesCompactionTrigger([trigger, message]), false);
+    assert.equal(hasTerminalResponsesCompactionTrigger([]), false);
 });

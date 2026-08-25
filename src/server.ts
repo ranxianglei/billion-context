@@ -53,7 +53,7 @@ import { sanitizeResponsesInputIds } from "./loop/adapter-responses.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { emitStreamError } from "./stream-error.js";
-import { deriveSessionId as deriveProxySessionId, affinityToken, clientConversationHeader, type ConversationIdentity } from "./session-id.js";
+import { deriveSessionId as deriveProxySessionId, affinityToken, clientConversationHeader, codexThreadHeader, type ConversationIdentity } from "./session-id.js";
 import { consumePluginRegisterFor, flushConversations, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, loadConversations, pipePluginJson, pipeThroughWithUsage, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
@@ -688,19 +688,28 @@ async function handle(
         // over content hashing, so IDE clients (ZCode/Cursor) that inject a
         // fixed system-reminder into every new conversation don't collide on a
         // shared 200-char prefix and leak compression state across sessions.
-        const clientConv = clientConversationHeader(req.headers);
+        // Codex keeps `session-id` fixed for the whole root task, including
+        // spawned agents, while `thread-id` identifies the actual agent thread.
+        // Prefer that cross-checked per-thread identity so a subagent cannot mutate
+        // the root agent's compression state. Other clients retain the legacy
+        // header priority below.
+        const codexThread = protocol === "responses" ? codexThreadHeader(req.headers) : undefined;
+        const clientConv = codexThread ?? clientConversationHeader(req.headers);
         const convHeader = clientConv ?? sessionHeader;
-        const responsesIdentity = protocol === "responses"
-            ? conversationIdentityResponses(parsed as ResponsesRequestBody, convHeader)
+        const responsesBody = protocol === "responses" ? parsed as ResponsesRequestBody : undefined;
+        const responsesIdentity = responsesBody
+            ? conversationIdentityResponses(responsesBody, convHeader)
+            : undefined;
+        const responsesConversation = responsesBody
+            ? responsesIdentity?.value ?? conversationSignalResponses(responsesBody, convHeader)
             : undefined;
         const conversation = protocol === "anthropic"
             ? conversationSignalAnthropic(parsed as AnthropicRequestBody, convHeader)
             : protocol === "openai"
               ? conversationSignalOpenai(parsed as OpenAIRequestBody, convHeader)
-              : subagentNamespace(
-                  responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
-                  (parsed as ResponsesRequestBody).instructions,
-              );
+              : codexThread || hasTerminalResponsesCompactionTrigger(responsesBody!.input)
+                ? responsesConversation!
+                : subagentNamespace(responsesConversation!, responsesBody!.instructions);
         const sessionId = deriveProxySessionId(req.headers, protocol, upstreamOrigin, conversation);
         // Two separate uses of the conversation signal:
         //  - `affinity`: header value forwarded upstream for sticky-routing /
@@ -1072,6 +1081,24 @@ function prepareResponses(
     const sessionId = session.id;
     const stream = parsed.stream === true;
     ++session.stats.requests;
+    const nativeCompactionTrigger = hasTerminalResponsesCompactionTrigger(parsed.input);
+    // #242: over-long input item ids (poisoned rollouts) 400 upstream on every
+    // request; rewrite them before either the native-compact fast path or ACP
+    // processing reads and replays the input.
+    sanitizeResponsesInputIds(parsed.input);
+    if (nativeCompactionTrigger) {
+        log("info", `[${sessionId}] terminal compaction_trigger detected; forwarding without ACP injection`);
+        return {
+            body: JSON.stringify(parsed),
+            session,
+            processedMessages: [],
+            originalMessages: [],
+            protocol: "responses",
+            stream,
+            compressInjected: false,
+            resetAfterSuccess: true,
+        };
+    }
     if (reconcileNativeCompactionBoundary(session)) {
         log("info", `[${sessionId}] reconciled ACP state after native Responses compact boundary`);
     }
@@ -1082,11 +1109,6 @@ function prepareResponses(
     let responsesProjection: ResponsesProjection | undefined;
     let rebuiltInput: ResponseInputItem[] | string = parsed.input;
     let toolsOut = parsed.tools;
-
-    // #242: over-long input item ids (poisoned rollouts) 400 upstream on every
-    // request; rewrite them to short deterministic ids before anything reads
-    // or replays the input.
-    sanitizeResponsesInputIds(parsed.input);
 
     const shouldInject = opts.compress.injectTool;
     const injectTools = shouldInject && !pluginMode;
@@ -1196,6 +1218,11 @@ function prepareResponses(
         nudge,
         prompts,
     };
+}
+
+export function hasTerminalResponsesCompactionTrigger(input: ResponsesRequestBody["input"]): boolean {
+    if (!Array.isArray(input) || input.length === 0) return false;
+    return input[input.length - 1]?.type === "compaction_trigger";
 }
 
 export function isCountTokensRequest(method: string, urlPath: string, hasBody: boolean): boolean {

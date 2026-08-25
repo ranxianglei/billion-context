@@ -613,8 +613,6 @@ bili export <id> --full --output handoff.md
 
 Then start a new conversation in the client (direct to upstream) and paste the handoff doc as the opening context.
 
-### Codex subagents get their own compression namespace (#150)
+### Codex subagents get their own compression session
 
-Codex subagents (e.g. the `guardian_subagent` approval reviewer) reuse the main conversation's `session_id`, so on the wire they look like the same session. Without care their requests inherit the main conversation's compression state — a subagent turn can get its context folded (losing the verbatim user authorization it must read back) and the two roles' usage estimates pollute each other.
-
-billion-context detects this via the `instructions` field: subagent requests carry their own role prompt. The **first** instructions seen for a conversation anchor the main namespace (stable even if the main prompt drifts); any other instructions value maps to a separate `|sub:` namespace with its own empty compression state. Subagent requests are self-contained replays, so the fresh namespace is lossless — and the web UI's session list shows the two namespaces as separate sessions sharing the same client label.
+Modern Codex requests identify each agent with a `thread-id` also recorded in `x-codex-turn-metadata`. billion-context prefers this cross-checked per-agent identity over the root `session-id`, so the main agent, spawned agents, and the approval reviewer cannot overwrite one another's compression state even when `instructions` change between turns. Older Responses clients without this explicit metadata retain the legacy `instructions`-based namespace fallback for compatibility; a terminal native-compaction trigger always stays in the base conversation.

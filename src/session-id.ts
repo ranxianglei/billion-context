@@ -14,9 +14,8 @@ export type ConversationIdentity = {
  *                  formats must never share compression state)
  *   2. upstream  — the resolved upstream origin, e.g. "https://open.bigmodel.cn"
  *                  (same key hitting two providers must not share state)
- *   3. apiKey    — the account credential from Authorization / x-api-key
- *                  (different accounts must never share state, even if they
- *                  happen to send the same conversation content)
+ *   3. account   — a stable account id when the upstream provides one, else
+ *                  the credential from Authorization / x-api-key
  *   4. conversation — the client's own notion of "which conversation this is",
  *                  taken from a client-provided signal when available, falling
  *                  back to a content fingerprint.
@@ -29,20 +28,49 @@ export type ConversationIdentity = {
  * use `affinityToken()` below. Generated proxy identities are never forwarded.
  */
 
-/** Extract the account credential from common auth headers, verbatim.
- *  The value is fed into a hash — it is NEVER stored, logged, or compared.
- *  Normalization is intentionally minimal: trim whitespace only. We do NOT
- *  lowercase: while that reduces hash collisions in theory (two keys that
- *  differ only in case would hash the same), in practice API keys are
- *  case-sensitive and a lowercase normalization would collapse two distinct
- *  valid keys into one hash bucket — a silent isolation violation. Keep the
- *  raw value so each distinct key hashes distinctly. */
-function extractKey(headers: Record<string, string | string[] | undefined>): string {
+/** Resolve the account scope used only inside the proxy's session hash.
+ *  ChatGPT's account id is stable across OAuth bearer rotation; other
+ *  upstreams retain credential-based isolation. No raw value is stored or
+ *  logged, and case-sensitive credentials are never normalized. */
+function extractKey(headers: Record<string, string | string[] | undefined>, upstream: string): string {
+    let hostname = "";
+    try {
+        hostname = new URL(upstream).hostname.toLowerCase();
+    } catch {
+    }
+    if (hostname === "chatgpt.com" || hostname.endsWith(".chatgpt.com")) {
+        const accountId = headers["chatgpt-account-id"];
+        if (typeof accountId === "string" && accountId.trim().length > 0) return `account:${accountId.trim()}`;
+    }
     const auth = headers["authorization"];
     if (typeof auth === "string" && auth.length > 0) return auth.trim();
     const apiKey = headers["x-api-key"];
     if (typeof apiKey === "string" && apiKey.length > 0) return `key:${apiKey.trim()}`;
     return "(no-key)";
+}
+
+/**
+ * Return Codex's per-agent thread identity when the explicit header agrees
+ * with the structured turn metadata. A spawned Codex agent keeps the root
+ * `session-id`, but receives its own `thread-id`; compression state must follow
+ * the latter or a short subagent turn can overwrite the root agent's usage and
+ * folding state.
+ *
+ * Requiring both Codex-specific metadata and a matching `thread-id` avoids
+ * changing the meaning of a generic `thread-id` header for other clients.
+ */
+export function codexThreadHeader(headers: Record<string, string | string[] | undefined>): string | undefined {
+    const metadata = headers["x-codex-turn-metadata"];
+    const threadHeader = headers["thread-id"];
+    if (typeof metadata !== "string" || typeof threadHeader !== "string") return undefined;
+    const threadId = threadHeader.trim();
+    if (!threadId) return undefined;
+    try {
+        const parsed = JSON.parse(metadata) as { thread_id?: unknown };
+        return typeof parsed.thread_id === "string" && parsed.thread_id.trim() === threadId ? threadId : undefined;
+    } catch {
+        return undefined;
+    }
 }
 
 /** Pull a client-provided conversation signal from headers, if any. */
@@ -85,7 +113,7 @@ export function deriveSessionId(
     conversation: string,
 ): string {
     if (!conversation) throw new Error("deriveSessionId: conversation dimension is required (pass the conversationSignal* output)");
-    const key = extractKey(headers);
+    const key = extractKey(headers, upstream);
     return hashId(`${protocol}|${upstream}|${key}|${conversation}`);
 }
 
