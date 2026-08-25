@@ -1,6 +1,7 @@
 import type { CoreMessage } from "acp-kernel";
 import { coreToResponses, injectResponsesDeveloperMessage, patchResponsesInput, type ResponseInputItem, type ResponsesProjection } from "acp-kernel/wire";
 import { buildVisibilityMarker } from "../compress-loop.js";
+import { hashId } from "../util.js";
 import { createTagEchoFilter, stripResponsesText, containsRenderTagText } from "./tag-echo-filter.js";
 import { log as loggerLog } from "../logger.js";
 import { ACP_TEXT_OPEN, ACP_TEXT_CLOSE, ACP_STATUS_OPEN, ACP_STATUS_CLOSE, ACP_SEARCH_OPEN, ACP_SEARCH_CLOSE, ACP_DECOMPRESS_OPEN, ACP_DECOMPRESS_CLOSE, COMPRESS_TOOL_NAME, PROXY_TOOL_NAMES } from "../compress-tool.js";
@@ -235,7 +236,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                         yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
                     } else if (item?.type === "message" && round > 1 && !suppressTextLifecycle) {
                         const origId = typeof item.id === "string" ? item.id : "";
-                        const mapped = { id: `msg-proxy-${round}-${origId || outputIndex}`, index: outputIndex++ };
+                        const mapped = { id: `msg-proxy-${round}-${hashId(origId || String(outputIndex))}`, index: outputIndex++ };
                         if (origId) remapped.set(origId, mapped);
                         yield { kind: "meta", chunk: rewriteItemEvent(type, obj, mapped), firstRoundOnly: false } as ParsedStreamEvent;
                     } else if (item?.type !== "message" || !suppressTextLifecycle) {
