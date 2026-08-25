@@ -32,7 +32,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawn, type StdioOptions } from "node:child_process";
 import { DEFAULT_MITM_DOMAINS } from "./mitm.js";
-import { selfPackageRoot, isPiEntry } from "./plugin-install.js";
+import { selfPackageRoot, isBiliPiEntry } from "./plugin-install.js";
 
 /** Absolute path of a file inside our dist/, resolved via the package root
  * (import.meta.url-based) so it survives global-installed symlink bins
@@ -610,7 +610,7 @@ function piPluginInstalled(piHome: string): boolean {
     try {
         const parsed = JSON.parse(fs.readFileSync(path.join(piHome, "settings.json"), "utf8")) as { packages?: unknown };
         const list = Array.isArray(parsed.packages) ? parsed.packages.map(String) : [];
-        return list.some((p) => isPiEntry(p, root));
+        return list.some((p) => isBiliPiEntry(p, root));
     } catch {
         return false;
     }
