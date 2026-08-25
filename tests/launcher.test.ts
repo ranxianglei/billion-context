@@ -262,9 +262,14 @@ import { selfPackageRoot } from "../src/plugin-install.js";
 test("runLaunch pi: native -e plugin injected only when not installed", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-pie-"));
     const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
     const prevPiBin = process.env.PI_BIN;
     const prevPiDir = process.env.PI_CODING_AGENT_DIR;
     process.env.HOME = home;
+    // resolvePiHome falls back to os.homedir(), which on Windows reads
+    // USERPROFILE, not HOME — set both or the test reads the runner's real
+    // home and the second assertion fails.
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
     delete process.env.PI_CODING_AGENT_DIR;
     const fakePi = path.join(home, "fake-pi");
     fs.writeFileSync(fakePi, "");
@@ -331,6 +336,8 @@ test("runLaunch pi: native -e plugin injected only when not installed", async ()
     } finally {
         process.exit = prevExit;
         process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
         if (prevPiBin === undefined) delete process.env.PI_BIN;
         else process.env.PI_BIN = prevPiBin;
         if (prevPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
