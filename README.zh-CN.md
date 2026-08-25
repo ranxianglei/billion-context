@@ -62,10 +62,6 @@ bili opencode                         # HTTPS 走 MITM + 临时 opencode.json(HT
 bili hermes                           # 无法 MITM(certifi CA)—— 隔离 HERMES_HOME,全部流量 /bili/
 bili pi --mitm-domain api.foo.com     # 向 MITM 白名单追加域名
 ```
-注意,以下客户端需要执行`bili plugin install`以获得原生体验
-```bash
-bili plugin install pi      # 必需: launcher 对 pi/omp 不注入 MCP,install 是原生工具 + /acp 的唯一途径
-```
 
 
 ### 方式 2 —— 改url(`/bili/` 前缀)
@@ -226,7 +222,7 @@ Windows 下会自动发现常见 Clash/Mihomo 静态系统代理;Web UI 会显�
 
 ## 状态
 
-早期。协议处理和压缩已通过 mock 测试(146 项通过)。真实模型集成测试是下一里程碑。预期会有粗糙的地方。
+早期。协议处理和压缩已通过 mock 测试(500+ 项通过)。真实模型集成测试是下一里程碑。预期会有粗糙的地方。
 
 pi 扩展模式(进程内、更紧密集成、参考实现)见 [billion-context-pi](https://github.com/ranxianglei/billion-context-pi)。
 
