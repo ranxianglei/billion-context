@@ -1222,6 +1222,15 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // symlinks and the real ~/.dsh is never touched.
         env = { ...process.env, BILLION_CONTEXT_PROXY: origin };
         env.DEEPSEEK_BASE_URL = wrapUpstream(origin, "https://api.deepseek.com");
+        // dsh has no default profile — a bare `dsh` errors out with
+        // "--profile <name> is required". Match the other launchers'
+        // just-works behavior by defaulting to the shipped interactive
+        // template (web, same as the `dsh web` alias) when the user gave no
+        // arguments at all; anything explicit passes through untouched.
+        if (clientArgs.length === 0) {
+            clientArgs = ["--profile", "web"];
+            console.error("bili: no dsh profile given — booting the shipped web profile (same as: bili dsh web).");
+        }
         dshOverlayHome = prepareDshHome(resolveDshHome(process.env), origin, routes.httpRewrites);
         if (dshOverlayHome) {
             env.DSH_HOME = dshOverlayHome;
