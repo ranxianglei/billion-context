@@ -20,6 +20,36 @@ interface FunctionCallBuffer {
     arguments: string;
 }
 
+// Deterministic short digest: FNV-1a 32-bit in base36 (≤7 chars) (#242).
+export function shortItemHash(input: string): string {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < input.length; i++) {
+        h ^= input.charCodeAt(i);
+        h = Math.imul(h, 0x01000193);
+    }
+    return (h >>> 0).toString(36);
+}
+
+// Upstream rejects Responses input item ids longer than 64 chars. Round-2+
+// remapped ids used to embed the full upstream id and could exceed that
+// (#242). All proxy-synthesized ids stay ≤ this cap.
+const RESPONSES_ITEM_ID_MAX = 64;
+
+/**
+ * Heal client rollouts already poisoned with over-long ids (they 400 every
+ * request otherwise). Rewrites in place, deterministically, so repeated
+ * requests keep referencing the same replacement id (#242).
+ */
+export function sanitizeResponsesInputIds(input: unknown): void {
+    if (!Array.isArray(input)) return;
+    for (const item of input) {
+        const rec = item as Record<string, unknown>;
+        if (typeof rec?.id === "string" && rec.id.length > RESPONSES_ITEM_ID_MAX) {
+            rec.id = `msg-fix-${shortItemHash(rec.id)}`;
+        }
+    }
+}
+
 interface MappedItem {
     id: string;
     index: number;
@@ -235,7 +265,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                         yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
                     } else if (item?.type === "message" && round > 1 && !suppressTextLifecycle) {
                         const origId = typeof item.id === "string" ? item.id : "";
-                        const mapped = { id: `msg-proxy-${round}-${origId || outputIndex}`, index: outputIndex++ };
+                        const mapped = { id: `msg-proxy-${round}-${shortItemHash(origId || String(outputIndex))}`, index: outputIndex++ };
                         if (origId) remapped.set(origId, mapped);
                         yield { kind: "meta", chunk: rewriteItemEvent(type, obj, mapped), firstRoundOnly: false } as ParsedStreamEvent;
                     } else if (item?.type !== "message" || !suppressTextLifecycle) {

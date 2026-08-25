@@ -126,3 +126,100 @@ test("responses wire round-2: every output_text.delta must reference an item the
         "round-2 message item closed with output_item.done",
     );
 });
+
+test("responses wire round-2: remapped message id stays <= 64 chars with a real 54-char upstream id (#242)", async () => {
+    // Exactly the shape from the bug report: 54-char upstream message id that
+    // used to be embedded verbatim into `msg-proxy-2-<origId>` (66 chars) and
+    // then 400'd upstream ("input[N].id: string too long") on every replay.
+    const longId = "msg_083f5e89ab47276e016a8d80c2a5c4819780d41a8c32999fc8";
+    assert.equal(longId.length, 54);
+
+    const round1 = [
+        sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+        sse("response.output_item.added", { output_index: 0, item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "acp_status", arguments: "" } }),
+        sse("response.function_call_arguments.delta", { item_id: "fc_1", output_index: 0, delta: "{}" }),
+        sse("response.function_call_arguments.done", { item_id: "fc_1", output_index: 0, arguments: "{}" }),
+        sse("response.output_item.done", { output_index: 0, item: { type: "function_call", id: "fc_1", call_id: "call_1", name: "acp_status", arguments: "{}" } }),
+        sse("response.completed", { response: { id: "resp_1", status: "completed", output: [] } }),
+    ].join("");
+
+    const round2 = [
+        sse("response.created", { response: { id: "resp_2", status: "in_progress" } }),
+        sse("response.output_item.added", { output_index: 0, item: { type: "message", id: longId, role: "assistant", content: [] } }),
+        sse("response.content_part.added", { item_id: longId, output_index: 0, part: { type: "output_text", text: "" } }),
+        sse("response.output_text.delta", { item_id: longId, output_index: 0, delta: "healed" }),
+        sse("response.output_text.done", { item_id: longId, output_index: 0, text: "healed" }),
+        sse("response.content_part.done", { item_id: longId, output_index: 0, part: { type: "output_text", text: "healed" } }),
+        sse("response.output_item.done", { output_index: 0, item: { type: "message", id: longId, role: "assistant", content: [{ type: "output_text", text: "healed" }] } }),
+        sse("response.completed", { response: { id: "resp_2", status: "completed", output: [] } }),
+    ].join("");
+
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async () => new Response(round2, { status: 200 })) as typeof fetch;
+
+    const chunks: Buffer[] = [];
+    try {
+        const ctx = makeCtx("resp-round2-idlen");
+        for await (const chunk of runCompressLoop(
+            new Response(round1, { status: 200 }).body!,
+            ctx,
+            { model: "gpt-5", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+            createResponsesAdapter(),
+            buildCompressSystemPrompt(),
+        )) {
+            chunks.push(chunk);
+        }
+    } finally {
+        globalThis.fetch = orig;
+    }
+    const events = parseOut(Buffer.concat(chunks).toString("utf8"));
+
+    const added = events.find(
+        (e) => e.event === "response.output_item.added" && String((e.data.item as Record<string, unknown>)?.id ?? "").startsWith("msg-proxy-2-"),
+    );
+    assert.ok(added, "round-2 message item forwarded with remapped id");
+    const mappedId = String((added.data.item as Record<string, unknown>).id);
+    assert.ok(mappedId.length <= 64, `remapped id must stay <= 64 chars, got ${mappedId.length}: ${mappedId}`);
+    assert.notEqual(mappedId, `msg-proxy-2-${longId}`, "full upstream id must not be embedded");
+    for (const e of events) {
+        const id = e.event === "response.output_item.added" || e.event === "response.output_item.done"
+            ? (e.data.item as Record<string, unknown> | undefined)?.id
+            : e.data.item_id;
+        if (typeof id === "string" && id.startsWith("msg-proxy-2-")) {
+            assert.ok(id.length <= 64, `event ${e.event} references over-long id ${id}`);
+        }
+    }
+    assert.ok(
+        events.some((e) => e.event === "response.output_text.delta" && e.data.item_id === mappedId && e.data.delta === "healed"),
+        "deltas reference the same remapped id",
+    );
+    assert.ok(
+        events.some((e) => e.event === "response.output_item.done" && (e.data.item as Record<string, unknown>)?.id === mappedId),
+        "item closed with the same remapped id",
+    );
+});
+
+test("sanitizeResponsesInputIds: over-long rollout ids are shortened deterministically (#242)", async () => {
+    const { sanitizeResponsesInputIds } = await import("../src/loop/adapter-responses.ts");
+    const longId = `msg-proxy-2-msg_083f5e89ab47276e016a8d80c2a5c4819780d41a8c32999fc8`;
+    assert.equal(longId.length, 66);
+    const input = [
+        { type: "message", id: "msg_short", role: "user", content: [] },
+        { type: "message", id: longId, role: "assistant", content: [] },
+        { type: "function_call", id: longId, call_id: "call_1", name: "shell", arguments: "{}" },
+    ];
+    sanitizeResponsesInputIds(input);
+    assert.equal(input[0].id, "msg_short", "short ids untouched");
+    assert.ok(input[1].id!.length <= 64, `shortened id <= 64 chars, got ${input[1].id!.length}`);
+    assert.ok(input[1].id!.startsWith("msg-fix-"), `healed id uses msg-fix- prefix, got ${input[1].id}`);
+    assert.equal(input[1].id, input[2].id, "deterministic: same source id maps to same replacement");
+    assert.equal(input[2].call_id, "call_1", "call_id untouched");
+    // idempotent across requests
+    sanitizeResponsesInputIds(input);
+    assert.equal(input[1].id!.startsWith("msg-fix-"), true);
+    assert.ok(input[1].id!.length <= 64);
+    // non-array / string input tolerated
+    sanitizeResponsesInputIds(undefined);
+    sanitizeResponsesInputIds("plain string input");
+});
