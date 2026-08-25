@@ -409,6 +409,198 @@ export function buildCodexMcpArgs(origin: string, conversationId: string): strin
     ];
 }
 
+/**
+ * Shared persistent-overlay machinery for home-dir-based launchers (pi / omp /
+ * hermes). The overlay (`<realHome>-bili`) symlinks every real-home entry
+ * except the launcher-generated file (models.json / models.yml / config.yaml),
+ * which is rewritten in place atomically.
+ *
+ * The overlay is PERSISTENT and never deleted: these agents record absolute
+ * paths derived from their home override into shared state (resume pointers
+ * like omp's `terminal-sessions/<tty>`, fork metadata, session references in
+ * history dbs), so an ephemeral temp home removed on exit leaves dangling
+ * pointers — the agent's history becomes invisible — and any state the agent
+ * created inside the temp home (entries the real home lacks) is destroyed.
+ * A stable overlay keeps every recorded path resolvable forever and lets
+ * overlay-created state survive across runs.
+ *
+ * Refresh semantics on every launch: stale `.file.pid.tmp` drafts are dropped;
+ * dead or mis-targeted symlinks are re-pointed; real files/dirs that shadow a
+ * real-home entry are merged into the real home (recursively; mtime-newer-wins
+ * for files, losers preserved as `<name>.bili-conflict`) and only removed from
+ * the overlay when the merge fully succeeded; entries the real home lacks are
+ * kept as-is. A `.bili-launch.pid` marker warns when two launches share the
+ * overlay (each launch rewrites the generated file with its own proxy origin).
+ */
+function overlayLockPath(overlay: string): string {
+    return path.join(overlay, ".bili-launch.pid");
+}
+
+function livePidHoldsOverlay(overlay: string): number | undefined {
+    let raw: string | undefined;
+    try {
+        raw = fs.readFileSync(overlayLockPath(overlay), "utf8");
+    } catch {
+        return undefined;
+    }
+    const pid = Number.parseInt(raw.trim(), 10);
+    if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) return undefined;
+    try {
+        process.kill(pid, 0);
+    } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ESRCH") return undefined;
+    }
+    return pid;
+}
+
+function refreshOverlayHome(realHome: string, overlay: string, generatedFile: string): boolean {
+    try {
+        fs.mkdirSync(overlay, { recursive: true });
+    } catch {
+        return false;
+    }
+    const holder = livePidHoldsOverlay(overlay);
+    if (holder !== undefined) {
+        console.error(
+            `bili: another bili launch (pid ${holder}) is using ${overlay} — concurrent launches share this overlay and the last one's proxy port wins in the generated config.`,
+        );
+    }
+    try {
+        fs.writeFileSync(overlayLockPath(overlay), `${process.pid}\n`);
+    } catch {}
+    const realEntries = new Set<string>();
+    try {
+        for (const entry of fs.readdirSync(realHome)) realEntries.add(entry);
+    } catch {}
+    try {
+        for (const entry of fs.readdirSync(overlay)) {
+            if (entry === generatedFile) continue;
+            const overlayPath = path.join(overlay, entry);
+            if (entry.startsWith(`.${generatedFile}.`) && entry.endsWith(".tmp")) {
+                try {
+                    fs.unlinkSync(overlayPath);
+                } catch {}
+                continue;
+            }
+            let st: fs.Stats;
+            try {
+                st = fs.lstatSync(overlayPath);
+            } catch {
+                continue;
+            }
+            if (st.isSymbolicLink()) {
+                let target: string | undefined;
+                try {
+                    target = fs.readlinkSync(overlayPath);
+                } catch {}
+                const wanted = realEntries.has(entry) ? path.join(realHome, entry) : undefined;
+                if (!wanted || target !== wanted) {
+                    try {
+                        fs.unlinkSync(overlayPath);
+                    } catch {}
+                }
+            } else if (realEntries.has(entry)) {
+                if (mergeOverlayEntry(overlayPath, path.join(realHome, entry))) {
+                    try {
+                        fs.rmSync(overlayPath, { recursive: true, force: true });
+                    } catch {}
+                } else {
+                    console.error(`bili: could not merge ${overlayPath} into ${realHome} — kept in place, resolve manually.`);
+                }
+            }
+        }
+        for (const entry of realEntries) {
+            if (entry === generatedFile) continue;
+            try {
+                fs.symlinkSync(path.join(realHome, entry), path.join(overlay, entry));
+            } catch {}
+        }
+    } catch {}
+    return true;
+}
+
+function mergeOverlayEntry(src: string, dst: string): boolean {
+    let st: fs.Stats;
+    try {
+        st = fs.lstatSync(src);
+    } catch {
+        return true;
+    }
+    let dstStat: fs.Stats | undefined;
+    try {
+        dstStat = fs.lstatSync(dst);
+    } catch {}
+    if (st.isDirectory()) {
+        if (dstStat && !dstStat.isDirectory()) {
+            try {
+                fs.renameSync(dst, `${dst}.bili-conflict`);
+                dstStat = undefined;
+            } catch {
+                return false;
+            }
+        }
+        try {
+            fs.mkdirSync(dst, { recursive: true });
+        } catch {
+            return false;
+        }
+        let entries: string[];
+        try {
+            entries = fs.readdirSync(src);
+        } catch {
+            return false;
+        }
+        let ok = true;
+        for (const entry of entries) {
+            if (!mergeOverlayEntry(path.join(src, entry), path.join(dst, entry))) ok = false;
+        }
+        return ok;
+    }
+    if (dstStat && dstStat.isDirectory()) {
+        try {
+            fs.renameSync(src, `${dst}.bili-conflict`);
+            return true;
+        } catch {
+            return false;
+        }
+    }
+    if (st.isSymbolicLink()) {
+        if (dstStat) {
+            try {
+                fs.unlinkSync(src);
+            } catch {}
+            return true;
+        }
+        try {
+            fs.renameSync(src, dst);
+        } catch {
+            return false;
+        }
+        return true;
+    }
+    if (dstStat && dstStat.mtimeMs >= st.mtimeMs) {
+        try {
+            fs.renameSync(src, `${dst}.bili-conflict`);
+            return true;
+        } catch {
+            return false;
+        }
+    }
+    if (dstStat) {
+        try {
+            fs.renameSync(dst, `${dst}.bili-conflict`);
+        } catch {
+            return false;
+        }
+    }
+    try {
+        fs.renameSync(src, dst);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
 /** True when the real pi settings.json already loads a bili plugin entry —
  *  in that case the launcher must NOT add `-e dist/agent/pi.js` on top (pi
  *  keeps both loaded and same-name tools/commands clash). */
@@ -421,6 +613,18 @@ function piPluginInstalled(piHome: string): boolean {
         return list.some((p) => isPiEntry(p, root));
     } catch {
         return false;
+    }
+}
+
+function writeOverlayFileAtomic(overlay: string, fileName: string, contents: string): void {
+    const draft = path.join(overlay, `.${fileName}.${process.pid}.tmp`);
+    try {
+        fs.writeFileSync(draft, contents);
+        fs.renameSync(draft, path.join(overlay, fileName));
+    } catch {
+        try {
+            fs.rmSync(draft, { force: true });
+        } catch {}
     }
 }
 
@@ -465,26 +669,18 @@ export function preparePiHttpRewrite(
             }
         }
     }
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-pi-"));
-    try {
-        for (const entry of fs.readdirSync(piHome)) {
-            if (entry === "models.json") continue;
-            try {
-                fs.symlinkSync(path.join(piHome, entry), path.join(tmp, entry));
-            } catch {}
-        }
-    } catch {}
-    fs.writeFileSync(path.join(tmp, "models.json"), JSON.stringify(root));
-    return tmp;
+    const overlay = `${piHome}-bili`;
+    if (!refreshOverlayHome(piHome, overlay, "models.json")) return undefined;
+    writeOverlayFileAtomic(overlay, "models.json", JSON.stringify(root));
+    return overlay;
 }
 
 /**
- * omp counterpart of preparePiHttpRewrite: build an isolated PI_CODING_AGENT_DIR
- * that symlinks every entry of the real omp home EXCEPT models.yml, and write a
- * models.yml whose target providers' baseUrl is rewritten (HTTP → /bili/ wrap,
- * wrapped-HTTPS → raw https for cert MITM). The real models.yml is never
- * touched. The rewrite is line-based (indentation-tracked) so all other bytes —
- * comments, ordering, formatting — are preserved verbatim.
+ * omp counterpart of preparePiHttpRewrite: line-based (indentation-tracked)
+ * models.yml rewrite (HTTP → /bili/ wrap, wrapped-HTTPS → raw https for cert
+ * MITM) riding the persistent `<ompHome>-bili` overlay from
+ * refreshOverlayHome — comments, ordering and formatting are preserved
+ * verbatim, and the real models.yml is never touched.
  */
 export function prepareOmpHttpRewrite(
     ompHome: string,
@@ -533,27 +729,20 @@ export function prepareOmpHttpRewrite(
             }
         }
     }
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-omp-"));
-    try {
-        for (const entry of fs.readdirSync(ompHome)) {
-            if (entry === "models.yml") continue;
-            try {
-                fs.symlinkSync(path.join(ompHome, entry), path.join(tmp, entry));
-            } catch {}
-        }
-    } catch {}
-    fs.writeFileSync(path.join(tmp, "models.yml"), lines.join("\n"));
-    return tmp;
+    const overlay = `${ompHome}-bili`;
+    if (!refreshOverlayHome(ompHome, overlay, "models.yml")) return undefined;
+    writeOverlayFileAtomic(overlay, "models.yml", lines.join("\n"));
+    return overlay;
 }
 
 /**
- * hermes counterpart of prepareOmpHttpRewrite: an isolated HERMES_HOME (temp
- * dir, every ~/.hermes sibling symlinked so skills/memories/sessions stay
+ * hermes counterpart of prepareOmpHttpRewrite: a persistent `<hermesHome>-bili`
+ * overlay (every ~/.hermes sibling symlinked so skills/memories/sessions stay
  * shared) holding a rewritten copy of config.yaml. Every provider endpoint
  * line (api: / base_url: / url:) is rewrapped as origin + "/bili/" + raw
  * upstream — http AND https alike, since hermes's httpx stack can't consume
  * the MITM CA without extra trust config. The real ~/.hermes is never
- * touched. Returns the temp dir (undefined when nothing is rewritable).
+ * touched. Returns the overlay dir (undefined when nothing is rewritable).
  */
 export function prepareHermesHome(
     hermesHome: string,
@@ -584,17 +773,10 @@ export function prepareHermesHome(
         changed = true;
     }
     if (!changed) return undefined;
-    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-hermes-"));
-    try {
-        for (const entry of fs.readdirSync(hermesHome)) {
-            if (entry === "config.yaml") continue;
-            try {
-                fs.symlinkSync(path.join(hermesHome, entry), path.join(tmp, entry));
-            } catch {}
-        }
-    } catch {}
-    fs.writeFileSync(path.join(tmp, "config.yaml"), lines.join(eol));
-    return tmp;
+    const overlay = `${hermesHome}-bili`;
+    if (!refreshOverlayHome(hermesHome, overlay, "config.yaml")) return undefined;
+    writeOverlayFileAtomic(overlay, "config.yaml", lines.join(eol));
+    return overlay;
 }
 
 /**
@@ -895,10 +1077,10 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     const ca = resolveCaCertPath(process.env);
     let env: NodeJS.ProcessEnv;
     let clientArgs = params.clientArgs;
-    let piTmpHome: string | undefined;
-    let ompTmpHome: string | undefined;
+    let piOverlayHome: string | undefined;
+    let ompOverlayHome: string | undefined;
     let opencodeTmpFile: string | undefined;
-    let hermesTmpHome: string | undefined;
+    let hermesOverlayHome: string | undefined;
     const tmpFiles: string[] = [];
     const directUrl = launcherDirectUrl(process.env);
     if (directUrl) {
@@ -919,12 +1101,12 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     const origin = handle.origin;
     if (base === "pi") {
         env = buildPiEnv(origin, ca, process.env);
-        piTmpHome = preparePiHttpRewrite(resolvePiHome(process.env), origin, routes.httpRewrites, routes.httpsRewrites);
-        if (piTmpHome) env.PI_CODING_AGENT_DIR = piTmpHome;
+        piOverlayHome = preparePiHttpRewrite(resolvePiHome(process.env), origin, routes.httpRewrites, routes.httpsRewrites);
+        if (piOverlayHome) env.PI_CODING_AGENT_DIR = piOverlayHome;
         // Native tooling out of the box: when the user has NOT installed the
         // plugin, ride pi's `-e <file>` (loads for this run only, writes
         // nothing) instead of leaving them on wire-mode fallback. When they
-        // HAVE installed it, settings.json (symlinked into the tmp home)
+        // HAVE installed it, settings.json (symlinked into the overlay home)
         // already loads it — adding `-e` too would double-register.
         const piExt = selfDistFile("agent/pi.js");
         if (piExt && fs.existsSync(piExt) && !piPluginInstalled(resolvePiHome(process.env))) {
@@ -932,10 +1114,11 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         }
     } else if (base === "omp") {
         // omp is pi-based: same env as pi (HTTPS_PROXY + CA + BILLION_CONTEXT_PROXY);
-        // the /bili/ rewrite rides an isolated PI_CODING_AGENT_DIR (real models.yml untouched).
+        // the /bili/ rewrite rides a persistent overlay PI_CODING_AGENT_DIR
+        // (~/.omp/agent-bili; real models.yml untouched, session paths stay resolvable).
         env = buildPiEnv(origin, ca, process.env);
-        ompTmpHome = prepareOmpHttpRewrite(resolveOmpHome(process.env), origin, routes.httpRewrites, routes.httpsRewrites);
-        if (ompTmpHome) env.PI_CODING_AGENT_DIR = ompTmpHome;
+        ompOverlayHome = prepareOmpHttpRewrite(resolveOmpHome(process.env), origin, routes.httpRewrites, routes.httpsRewrites);
+        if (ompOverlayHome) env.PI_CODING_AGENT_DIR = ompOverlayHome;
     } else if (base === "opencode") {
         // opencode: HTTPS upstreams ride cert-MITM (HTTPS_PROXY + CA); plaintext
         // HTTP upstreams get a /bili/-rewritten copy of opencode.json via
@@ -948,13 +1131,14 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         if (opencodeTmpFile) env.OPENCODE_CONFIG = opencodeTmpFile;
     } else if (base === "hermes") {
         // hermes: no plugin, no MITM cert trust (httpx builds its own CA
-        // bundle) — every upstream rides the /bili/ URL form via an isolated
-        // HERMES_HOME whose config.yaml is rewritten. skills/memories/sessions
-        // stay shared through symlinks; the real ~/.hermes is never touched.
+        // bundle) — every upstream rides the /bili/ URL form via a persistent
+        // overlay HERMES_HOME (~/.hermes-bili) whose config.yaml is rewritten.
+        // skills/memories/sessions stay shared through symlinks; the real
+        // ~/.hermes is never touched.
         env = { ...process.env };
-        hermesTmpHome = prepareHermesHome(resolveHermesHome(process.env), origin, routes.httpRewrites);
-        if (hermesTmpHome) {
-            env.HERMES_HOME = hermesTmpHome;
+        hermesOverlayHome = prepareHermesHome(resolveHermesHome(process.env), origin, routes.httpRewrites);
+        if (hermesOverlayHome) {
+            env.HERMES_HOME = hermesOverlayHome;
         } else {
             console.error(
                 routes.httpRewrites.length === 0
@@ -999,21 +1183,6 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         code = 1;
     } finally {
         stopProxy(handle);
-        if (piTmpHome) {
-            try {
-                fs.rmSync(piTmpHome, { recursive: true, force: true });
-            } catch {}
-        }
-        if (ompTmpHome) {
-            try {
-                fs.rmSync(ompTmpHome, { recursive: true, force: true });
-            } catch {}
-        }
-        if (hermesTmpHome) {
-            try {
-                fs.rmSync(hermesTmpHome, { recursive: true, force: true });
-            } catch {}
-        }
         if (opencodeTmpFile) {
             try {
                 fs.rmSync(path.dirname(opencodeTmpFile), { recursive: true, force: true });

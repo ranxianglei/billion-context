@@ -64,9 +64,9 @@ and blind-tunnel everything else.
 bili pi                               # launch pi through the proxy
 bili codex                            # launch codex through the proxy
 bili claude                           # launch claude through the proxy
-bili omp                              # pi-style: MITM env + isolated temp models.yml
+bili omp                              # pi-style: MITM env + persistent overlay home (~/.omp/agent-bili, real config untouched)
 bili opencode                         # MITM for HTTPS + temp opencode.json (/bili/ for HTTP) + thin /acp plugin
-bili hermes                           # no MITM possible (certifi CA) — isolated HERMES_HOME, all traffic /bili/
+bili hermes                           # no MITM possible (certifi CA) — persistent overlay home (~/.hermes-bili), all traffic /bili/
 bili pi --mitm-domain api.foo.com     # add a domain to the MITM whitelist
 ```
 
