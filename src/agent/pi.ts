@@ -107,7 +107,7 @@ function manifestToTool(proxyBase: string, tool: ManifestTool, agent: string): T
 
 const RETRY_INTERVAL_MS = 10000;
 
-type RegisterState = { sid?: string; toolsReady?: boolean; pending?: Promise<void>; retryAt?: number; identityAt?: string };
+type RegisterState = { sid?: string; toolsFor?: string; toolsReady?: boolean; pending?: Promise<void>; retryAt?: number; identityAt?: string; retryIntervalMs: number };
 
 // omp never emits before_provider_headers, so the x-bili-plugin marker cannot
 // be stamped per request. Register the conversation id once (after tools are
@@ -133,18 +133,24 @@ async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, a
     if (sid === state.sid) return;
     if (state.pending !== undefined) return state.pending;
     if (state.retryAt !== undefined && Date.now() < state.retryAt) return;
+    const wait = state.retryIntervalMs;
     state.pending = (async () => {
         let tools: ManifestTool[];
         try {
             tools = await fetchManifest(proxyBase);
         } catch (err) {
-            state.retryAt = Date.now() + RETRY_INTERVAL_MS;
-            console.error(`bili-plugin(${agent}): manifest fetch failed: ${err instanceof Error ? err.message : String(err)} — retrying in ${RETRY_INTERVAL_MS / 1000}s`);
+            state.retryAt = Date.now() + wait;
+            console.error(`bili-plugin(${agent}): manifest fetch failed: ${err instanceof Error ? err.message : String(err)} — retrying in ${wait / 1000}s`);
             return;
         }
         try {
-            for (const t of tools) pi.registerTool(manifestToTool(proxyBase, t, agent));
-            state.sid = sid;
+            // toolsFor (not sid) guards the register loop: a retry after a
+            // failed identity register re-fetches the manifest but must NOT
+            // re-register the tools (the host may not dedupe by name).
+            if (state.toolsFor !== sid) {
+                for (const t of tools) pi.registerTool(manifestToTool(proxyBase, t, agent));
+                state.toolsFor = sid;
+            }
             state.toolsReady = true;
             state.retryAt = undefined;
             if (agent === "omp" && sid !== "" && state.identityAt !== sid) {
@@ -152,14 +158,22 @@ async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, a
                     await postIdentityRegister(proxyBase, sid, agent);
                     state.identityAt = sid;
                 } catch (err) {
-                    state.retryAt = Date.now() + RETRY_INTERVAL_MS;
-                    console.error(`bili-plugin(${agent}): identity register failed (${err instanceof Error ? err.message : String(err)}) — retrying in ${RETRY_INTERVAL_MS / 1000}s`);
+                    // Leave state.sid UNSET so the next per-request event
+                    // re-enters (throttled by retryAt) and retries ONLY the
+                    // register — setting sid here would wedge the session in
+                    // wire mode forever (the early return above blocks every
+                    // retry).
+                    state.retryAt = Date.now() + wait;
+                    console.error(`bili-plugin(${agent}): identity register failed (${err instanceof Error ? err.message : String(err)}) — retrying in ${wait / 1000}s`);
+                    return;
                 }
             }
+            state.sid = sid;
         } catch (err) {
             state.sid = undefined;
-            state.retryAt = Date.now() + RETRY_INTERVAL_MS;
-            console.error(`bili-plugin(${agent}): tool registration deferred (${err instanceof Error ? err.message : String(err)}) — retrying in ${RETRY_INTERVAL_MS / 1000}s`);
+            state.toolsFor = undefined;
+            state.retryAt = Date.now() + wait;
+            console.error(`bili-plugin(${agent}): tool registration deferred (${err instanceof Error ? err.message : String(err)}) — retrying in ${wait / 1000}s`);
         }
     })();
     try {
@@ -169,10 +183,10 @@ async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, a
     }
 }
 
-export function createBiliPlugin(agentOverride?: string): (pi: ExtensionAPI) => void {
+export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalMs?: number }): (pi: ExtensionAPI) => void {
     return function biliPlugin(pi: ExtensionAPI): void {
         const agent = agentName(agentOverride);
-        const state: RegisterState = {};
+        const state: RegisterState = { retryIntervalMs: opts?.retryIntervalMs ?? RETRY_INTERVAL_MS };
         if (typeof pi.registerCommand === "function") {
             pi.registerCommand("acp", {
                 description: "Show ACP context-compression status for this session",
