@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { NudgeDecision } from "acp-kernel";
 
 /**
  * Cryptographic hash of a string, truncated to a 64-bit id (16 hex chars).
@@ -88,6 +89,40 @@ export function usageTotals(
         total: num(usage["input_tokens"]),
         cached: num((usage["input_tokens_details"] as Record<string, unknown> | undefined)?.["cached_tokens"]),
     };
+}
+
+/**
+ * The kernel's own lower-bound estimate of the current context size, from the
+ * nudge decision's tier breakdown: pending T1 (uncompressed messages) plus the
+ * current size of the active T2/T3 block summaries. The context also carries
+ * the system prompt, tool schemas and protected messages, so this is a floor,
+ * never an overcount of the truth — except that the fast tokenizer
+ * undercounts CJK (see server.ts tokenCount comment), which makes the floor
+ * even more conservative.
+ */
+export function pendingEstimateTokens(nudge: NudgeDecision | null | undefined): number {
+    const b = nudge?.breakdown;
+    if (!b) return 0;
+    return (b.pendingT1 ?? 0) + (b.pendingT2 ?? 0) + (b.pendingT3 ?? 0);
+}
+
+/**
+ * Floor a relay-reported context size against the kernel's estimate. Some
+ * relays report `input_tokens` far below the real context (aihub/MiniMax-M3
+ * reported 5720 while the kernel counted 29238 pending T1 alone — issue #256);
+ * a nudge keyed on that number never fires, so compression never happens
+ * proactively. The floor engages only when the report is materially below the
+ * estimate (>10% AND >=2048 tokens) — small discrepancies are tokenizer
+ * noise, and the estimate is a lower bound, so flooring can only ever make
+ * the nudge slightly more eager, never less. A 0 report is never legitimate
+ * for a non-empty prompt; it is replaced by the estimate when that is
+ * significant.
+ */
+export function applyUsageFloor(reported: number, floor: number): number {
+    if (floor <= 0) return reported;
+    if (reported <= 0) return floor > 2048 ? floor : reported;
+    if (floor - reported <= Math.max(2048, Math.round(reported * 0.1))) return reported;
+    return floor;
 }
 
 /** Result of inspecting an upstream response for a "context too long" error. */

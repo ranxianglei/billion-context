@@ -57,7 +57,7 @@ import { deriveSessionId as deriveProxySessionId, affinityToken, clientConversat
 import { consumePluginRegisterFor, flushConversations, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, loadConversations, pipePluginJson, pipeThroughWithUsage, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
-import { isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, shouldReserveOutputHeadroom, usageTotals } from "./util.js";
+import { applyUsageFloor, isLoopbackAddress, inspectContextOverflow, pendingEstimateTokens, reserveOutputHeadroom, shouldReserveOutputHeadroom, usageTotals } from "./util.js";
 
 import { decodeRequestBody } from "./content-encoding.js";
 
@@ -1697,9 +1697,9 @@ async function forward(
     // the next nudge decision) keeps tracking reality.
     if (prepared?.pluginMode) {
         if (prepared.stream) {
-            await pipeThroughWithUsage(upstream.body as ReadableStream<Uint8Array>, res, prepared.session, prepared.protocol);
+            await pipeThroughWithUsage(upstream.body as ReadableStream<Uint8Array>, res, prepared.session, prepared.protocol, prepared.nudge);
         } else {
-            await pipePluginJson(upstream.body as ReadableStream<Uint8Array>, res, prepared.session, prepared.protocol);
+            await pipePluginJson(upstream.body as ReadableStream<Uint8Array>, res, prepared.session, prepared.protocol, prepared.nudge);
         }
         clearUpstreamTimer();
         return;
@@ -1818,12 +1818,18 @@ async function forward(
                 const { total, cached } = usageTotals(prepared.protocol, u);
                 if (typeof total === "number") {
                     prepared.session.stats.inputTokens += total;
+                    // Floor the relay-reported size against the kernel's own
+                    // estimate (issue #256) — see recordUsage in loop/core.ts.
+                    const effective = applyUsageFloor(total, pendingEstimateTokens(prepared.nudge));
+                    if (effective !== total) {
+                        log("info", `[${prepared.session.id}] [acp-usage] upstream under-reported usage: reported=${total} < kernel-estimate=${effective} — flooring (relay usage unreliable)`);
+                    }
                     // lastInputTokens = true TOTAL context (protocol-correct),
                     // net of this turn's compress savings (see stream.ts
                     // applyRanges — the fold lands on the NEXT request).
                     prepared.session.stats.lastInputTokens = Math.max(
                         0,
-                        total - (prepared.session.stats.compressCreditTokens ?? 0),
+                        effective - (prepared.session.stats.compressCreditTokens ?? 0),
                     );
                     if (typeof cached === "number") {
                         prepared.session.stats.cachedTokens += cached;

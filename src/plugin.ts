@@ -7,7 +7,8 @@ import { acquireInFlight, listSessions, markDirty, peekSession, releaseInFlight,
 import { ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, PROXY_TOOL_NAMES } from "./compress-tool.js";
 import { executeProxyTool } from "./loop/core.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
-import type { WireProtocol } from "./util.js";
+import { applyUsageFloor, pendingEstimateTokens, type WireProtocol } from "./util.js";
+import { log as loggerLog } from "./logger.js";
 import { stateDir } from "./paths.js";
 
 // The proxy's own version, read from package.json at runtime (works in both dev
@@ -466,7 +467,7 @@ function usageFromSseEvent(obj: Record<string, unknown>): UsageSample | undefine
     return undefined;
 }
 
-function applyUsageSample(session: Session, sample: UsageSample, protocol?: WireProtocol): void {
+function applyUsageSample(session: Session, sample: UsageSample, protocol?: WireProtocol, floor = 0): void {
     // inputTokens is protocol-native: Anthropic reports it NEW-only (cached
     // separate); OpenAI/Responses report the TOTAL (cached already included).
     // Add cached back in only when it is not already part of inputTokens.
@@ -480,9 +481,15 @@ function applyUsageSample(session: Session, sample: UsageSample, protocol?: Wire
             sample.inputTokens +
             (!includesCached && sample.cachedTokens !== undefined ? sample.cachedTokens : 0);
         session.stats.inputTokens += total;
+        // Floor the relay-reported size against the kernel's own estimate
+        // (issue #256) — see applyUsageFloor in util.ts.
+        const effective = applyUsageFloor(total, floor);
+        if (effective !== total) {
+            loggerLog("info", `[${session.id}] [acp-usage] upstream under-reported usage: reported=${total} < kernel-estimate=${effective} — flooring (relay usage unreliable)`);
+        }
         // Net out pending compress savings (see stream.ts applyRanges): plugin
         // compress tool results shrink the next request, not this report.
-        session.stats.lastInputTokens = Math.max(0, total - (session.stats.compressCreditTokens ?? 0));
+        session.stats.lastInputTokens = Math.max(0, effective - (session.stats.compressCreditTokens ?? 0));
     }
     if (sample.outputTokens !== undefined) session.stats.outputTokens += sample.outputTokens;
 }
@@ -507,6 +514,7 @@ export async function pipeThroughWithUsage(
     res: import("node:http").ServerResponse,
     session: Session,
     protocol?: WireProtocol,
+    nudge?: NudgeDecision,
 ): Promise<void> {
     const reader = stream.getReader();
     const decoder = new TextDecoder("utf-8");
@@ -543,7 +551,7 @@ export async function pipeThroughWithUsage(
         // that reads lastInputTokens for the nudge decision) the moment the
         // stream completes, and those must already see this usage.
         if (acc.inputTokens !== undefined || acc.outputTokens !== undefined || acc.cachedTokens !== undefined) {
-            applyUsageSample(session, acc, protocol);
+            applyUsageSample(session, acc, protocol, pendingEstimateTokens(nudge));
             markDirty(session);
         }
     } finally {
@@ -559,6 +567,7 @@ export async function pipePluginJson(
     res: import("node:http").ServerResponse,
     session: Session,
     protocol?: WireProtocol,
+    nudge?: NudgeDecision,
 ): Promise<void> {
     const reader = stream.getReader();
     const chunks: Buffer[] = [];
@@ -582,7 +591,7 @@ export async function pipePluginJson(
                         num((usage["prompt_tokens_details"] as Record<string, unknown> | undefined)?.["cached_tokens"]) ??
                         num((usage["input_tokens_details"] as Record<string, unknown> | undefined)?.["cached_tokens"]) ??
                         num(usage["cache_read_input_tokens"]),
-                }, protocol);
+                }, protocol, pendingEstimateTokens(nudge));
                 markDirty(session);
             }
         }

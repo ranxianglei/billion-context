@@ -20,7 +20,7 @@ import { buildVisibilityMarker } from "../compress-loop.js";
 import { fetchWithRetry, UpstreamHttpError } from "../fetch-util.js";
 import { proxyDispatcher } from "../upstream-proxy.js";
 import { log as loggerLog } from "../logger.js";
-import type { WireProtocol } from "../util.js";
+import { applyUsageFloor, pendingEstimateTokens, type WireProtocol } from "../util.js";
 
 export const MAX_LOOP_ROUNDS = 10;
 
@@ -172,10 +172,18 @@ function recordUsage(
         (typeof prompt === "number" ? prompt : 0) +
         (!includesCached && typeof cached === "number" ? cached : 0);
     if (total > 0) ctx.session.stats.inputTokens += total;
+    // Floor the relay-reported size against the kernel's own estimate: some
+    // relays under-report input_tokens (issue #256), which would keep the
+    // nudge — keyed on lastInputTokens — permanently idle. Billing above
+    // stays raw; only the nudge input is floored.
+    const effective = applyUsageFloor(total, pendingEstimateTokens(ctx.nudge));
+    if (effective !== total) {
+        ctx.log(`[acp-usage] round ${round} upstream under-reported usage: reported=${total} < kernel-estimate=${effective} — flooring (relay usage unreliable)`);
+    }
     // Net out this turn's compress credit: the post-compress re-request
     // re-sends the unfolded history, so its usage report over-reports the
     // context the NEXT request will actually carry (see stream.ts applyRanges).
-    ctx.session.stats.lastInputTokens = Math.max(0, total - (ctx.session.stats.compressCreditTokens ?? 0));
+    ctx.session.stats.lastInputTokens = Math.max(0, effective - (ctx.session.stats.compressCreditTokens ?? 0));
     if (typeof cached === "number") {
         ctx.session.stats.cachedTokens += cached;
         ctx.session.stats.cacheSamples += 1;
