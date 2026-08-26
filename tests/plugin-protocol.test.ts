@@ -9,7 +9,7 @@ import { defaultConfig } from "acp-kernel";
 import { startServer, type ProxyOptions } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { _resetPluginStateForTest, pluginReportedContextWindow, queuePluginRegister, takePendingPluginRegister } from "../src/plugin.ts";
+import { _resetPluginStateForTest, consumePluginRegisterFor, consumeSoleHeaderlessRegister, pluginReportedContextWindow, queuePluginRegister, takePendingPluginRegister } from "../src/plugin.ts";
 import { clientConversationHeader } from "../src/session-id.ts";
 
 interface Harness {
@@ -534,6 +534,31 @@ test("headless launcher registrations expire after the TTL (no stale poisoning)"
         queuePluginRegister("ttl-fresh", "codex", false);
         assert.equal(takePendingPluginRegister()?.conversationId, "ttl-fresh", "expired registration dropped, fresh one bound");
         assert.equal(takePendingPluginRegister(), undefined, "queue drained");
+    } finally {
+        Date.now = realNow;
+        _resetPluginStateForTest();
+    }
+});
+
+test("headerless identity registrations: sole + fresh binds, stale drops, non-headerless untouched (#268)", () => {
+    _resetPluginStateForTest();
+    const t0 = Date.now();
+    const realNow = Date.now;
+    try {
+        Date.now = () => t0;
+        queuePluginRegister("hl-stale", "omp", true, true);
+        Date.now = () => t0 + 11 * 60 * 1000;
+        assert.equal(consumeSoleHeaderlessRegister(), undefined, "stale registration dropped, not bound");
+        queuePluginRegister("hl-fresh", "omp", true, true);
+        assert.deepEqual(consumeSoleHeaderlessRegister(), { conversationId: "hl-fresh", agent: "omp" }, "fresh sole registration bound");
+        assert.equal(consumeSoleHeaderlessRegister(), undefined, "queue drained");
+        queuePluginRegister("claude-x", "mcp", true);
+        assert.equal(consumeSoleHeaderlessRegister(), undefined, "non-headerless entry not consumed by the heuristic");
+        assert.equal(consumePluginRegisterFor("claude-x"), "mcp", "still consumable by exact match");
+        queuePluginRegister("omp-y", "omp", true, true);
+        queuePluginRegister("omp-z", "omp", true, true);
+        assert.equal(consumeSoleHeaderlessRegister(), undefined, "multiple entries — ambiguous, nothing consumed");
+        assert.equal(consumePluginRegisterFor("omp-y"), "omp", "entries survive for a later exact match");
     } finally {
         Date.now = realNow;
         _resetPluginStateForTest();

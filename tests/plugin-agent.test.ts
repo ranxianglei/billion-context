@@ -56,7 +56,7 @@ test("proxyBaseFromEnv accepts BILLION_CONTEXT_PROXY, detectProxyBase honors kil
 type FakeProxy = {
     origin: string;
     toolCalls: Array<{ conversationId: string; tool: string; args: unknown }>;
-    registers: Array<{ conversationId: string; agent: string; identity: boolean }>;
+    registers: Array<{ conversationId: string; agent: string; identity: boolean; headerless: boolean }>;
     close(): Promise<void>;
 };
 
@@ -92,8 +92,8 @@ async function startFakeProxy(opts: { failRegister?: number } = {}): Promise<Fak
             let body = "";
             req.on("data", (c) => (body += c));
             req.on("end", () => {
-                const data = JSON.parse(body) as { conversationId?: string; agent?: string; identity?: boolean };
-                registers.push({ conversationId: data.conversationId ?? "", agent: data.agent ?? "", identity: data.identity === true });
+                const data = JSON.parse(body) as { conversationId?: string; agent?: string; identity?: boolean; headerless?: boolean };
+                registers.push({ conversationId: data.conversationId ?? "", agent: data.agent ?? "", identity: data.identity === true, headerless: data.headerless === true });
                 if (opts.failRegister !== undefined) {
                     res.writeHead(opts.failRegister);
                     res.end("{}");
@@ -720,7 +720,7 @@ test("omp plugin identity-registers the conversation once tools are ready", asyn
         while (proxy.registers.length === 0 && Date.now() < deadline) {
             await new Promise((r) => setTimeout(r, 25));
         }
-        assert.deepEqual(proxy.registers, [{ conversationId: "omp-sess-7", agent: "omp", identity: true }]);
+        assert.deepEqual(proxy.registers, [{ conversationId: "omp-sess-7", agent: "omp", identity: true, headerless: true }]);
         // Re-driving per-request events must not re-POST (identityAt caches by sid).
         await pi.events.get("before_provider_request")!({}, fakeCtx(proxy, "omp-sess-7"));
         await flush();
@@ -731,7 +731,7 @@ test("omp plugin identity-registers the conversation once tools are ready", asyn
         while (proxy.registers.length < 2 && Date.now() < deadline2) {
             await new Promise((r) => setTimeout(r, 25));
         }
-        assert.deepEqual(proxy.registers[1], { conversationId: "omp-sess-8", agent: "omp", identity: true });
+        assert.deepEqual(proxy.registers[1], { conversationId: "omp-sess-8", agent: "omp", identity: true, headerless: true });
     } finally {
         await proxy.close();
     }

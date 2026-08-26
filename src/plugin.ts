@@ -199,8 +199,12 @@ const pendingRegisters: PendingPluginRegister[] = [];
  *  === CLAUDE_CODE_SESSION_ID) — bind by identity match only. `identity:
  *  false` (headless codex spawn) means requests carry no matching id — bind
  *  the next NEW session instead. Splitting the two keeps a foreign session
- *  from eating an identity registration it can never claim. */
-export function queuePluginRegister(conversationId: string, agent: string, identity: boolean): void {
+ *  from eating an identity registration it can never claim. `headerless`
+ *  (#268) marks identity registrations whose host CANNOT stamp the id on
+ *  requests (omp has no before_provider_headers event) — the exact-match
+ *  path can never fire for those, so they are additionally eligible for
+ *  single-client attribution (consumeSoleHeaderlessRegister). */
+export function queuePluginRegister(conversationId: string, agent: string, identity: boolean, headerless = false): void {
     if (!identity) {
         for (let i = 0; i < pendingRegisters.length; i++) {
             if (pendingRegisters[i]!.conversationId === conversationId) {
@@ -211,7 +215,7 @@ export function queuePluginRegister(conversationId: string, agent: string, ident
         pendingRegisters.push({ conversationId, agent, ts: Date.now() });
         while (pendingRegisters.length > MAX_PENDING_REGISTERS) pendingRegisters.shift();
     } else {
-        registeredIds.set(conversationId, agent);
+        registeredIds.set(conversationId, { agent, headerless, ts: Date.now() });
         while (registeredIds.size > MAX_PENDING_REGISTERS) {
             const oldest = registeredIds.keys().next().value;
             if (oldest !== undefined) registeredIds.delete(oldest);
@@ -237,7 +241,9 @@ export function takePendingPluginRegister(): PendingPluginRegister | undefined {
     }
     return pendingRegisters.shift();
 }
-const registeredIds = new Map<string, string>();
+type RegisteredIdentity = { agent: string; headerless: boolean; ts: number };
+
+const registeredIds = new Map<string, RegisteredIdentity>();
 
 /** Identity-driven binding (#162): hosts whose model requests carry the SAME
  *  id the MCP shell registered (claude code: every request has
@@ -245,15 +251,39 @@ const registeredIds = new Map<string, string>();
  *  conversation id) bind the moment any of their requests shows up — no
  *  ordering race with the shell's initialize. */
 export function consumePluginRegisterFor(conversationId: string): string | undefined {
-    const agent = registeredIds.get(conversationId);
-    if (agent !== undefined) registeredIds.delete(conversationId);
-    return agent;
+    const entry = registeredIds.get(conversationId);
+    if (entry !== undefined) registeredIds.delete(conversationId);
+    return entry?.agent;
+}
+
+/** Headerless identity binding (#268): omp registers its conversation id but
+ *  cannot stamp it on requests (no before_provider_headers event), so the
+ *  exact-match above can never fire for it. When the incoming request
+ *  carries NO client-provided conversation identity and EXACTLY ONE fresh
+ *  headerless registration is pending, attribute it to this request — the
+ *  single-client case `bili omp` runs in. Two pending registrations are
+ *  ambiguous (left for a later exact match); a stale one is dropped so an
+ *  abandoned session cannot hijack an unrelated request after the TTL.
+ *  Non-headerless entries are left untouched (claude code still binds by
+ *  exact match). */
+export function consumeSoleHeaderlessRegister(): { conversationId: string; agent: string } | undefined {
+    if (registeredIds.size !== 1) return undefined;
+    const first = registeredIds.entries().next().value;
+    if (first === undefined) return undefined;
+    const [conversationId, entry] = first;
+    if (!entry.headerless) return undefined;
+    if (Date.now() - entry.ts > PENDING_REGISTER_TTL_MS) {
+        registeredIds.delete(conversationId);
+        return undefined;
+    }
+    registeredIds.delete(conversationId);
+    return { conversationId, agent: entry.agent };
 }
 
 export function handlePluginRegister(payload: string, res: import("node:http").ServerResponse): void {
-    let parsed: { conversationId?: unknown; agent?: unknown; identity?: unknown };
+    let parsed: { conversationId?: unknown; agent?: unknown; identity?: unknown; headerless?: unknown };
     try {
-        parsed = JSON.parse(payload) as { conversationId?: unknown; agent?: unknown; identity?: unknown };
+        parsed = JSON.parse(payload) as { conversationId?: unknown; agent?: unknown; identity?: unknown; headerless?: unknown };
     } catch {
         res.writeHead(400, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: false, error: "invalid JSON body" }));
@@ -266,7 +296,7 @@ export function handlePluginRegister(payload: string, res: import("node:http").S
         return;
     }
     const agent = typeof parsed.agent === "string" && parsed.agent.trim() ? parsed.agent.trim() : "launcher";
-    queuePluginRegister(conversationId, agent, parsed.identity === true);
+    queuePluginRegister(conversationId, agent, parsed.identity === true, parsed.headerless === true);
     res.end(JSON.stringify({ ok: true, conversationId, agent }));
 }
 

@@ -54,7 +54,7 @@ import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { emitStreamError } from "./stream-error.js";
 import { deriveSessionId as deriveProxySessionId, affinityToken, clientConversationHeader, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
-import { consumePluginRegisterFor, flushConversations, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, loadConversations, pipePluginJson, pipePluginResponsesWithStrip, pipeThroughWithUsage, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
+import { consumePluginRegisterFor, consumeSoleHeaderlessRegister, flushConversations, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, loadConversations, pipePluginJson, pipePluginResponsesWithStrip, pipeThroughWithUsage, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import { isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, shouldReserveOutputHeadroom, usageTotals } from "./util.js";
@@ -766,6 +766,20 @@ async function handle(
             if (identityAgent) {
                 pluginAgent = identityAgent;
                 pluginConversation = clientConv ?? conversation;
+            }
+        }
+        // Headerless identity binding (#268): omp registers its conversation
+        // id but cannot stamp it on requests (no before_provider_headers
+        // event), so the exact-match above can never fire for it. When this
+        // request carries NO client-provided conversation identity and
+        // exactly one fresh headerless registration is pending, attribute it
+        // — the single-client case `bili omp` runs in. No requests===0 gate
+        // on purpose: `bili omp --resume` reuses a pre-existing session.
+        if (!pluginAgent && convHeader === undefined && !responsesIdentity?.clientProvided) {
+            const sole = consumeSoleHeaderlessRegister();
+            if (sole) {
+                pluginAgent = sole.agent;
+                pluginConversation = sole.conversationId;
             }
         }
         if (!pluginAgent && session.stats.requests === 0) {

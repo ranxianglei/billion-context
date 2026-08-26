@@ -111,13 +111,14 @@ type RegisterState = { sid?: string; toolsFor?: string; toolsReady?: boolean; pe
 
 // omp never emits before_provider_headers, so the x-bili-plugin marker cannot
 // be stamped per request. Register the conversation id once (after tools are
-// ready): the proxy binds any request carrying that id into plugin mode —
-// same launcher path claude/codex use (#162).
+// ready) with headerless:true — omp's requests carry NO conversation identity
+// header, so the proxy's exact-match identity path can never fire for it; the
+// flag marks the registration for single-client attribution instead (#268).
 async function postIdentityRegister(proxyBase: string, conversationId: string, agent: string): Promise<void> {
     const res = await fetch(`${proxyBase}/__bili/plugin/register`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ conversationId, agent, identity: true }),
+        body: JSON.stringify({ conversationId, agent, identity: true, headerless: true }),
         signal: AbortSignal.timeout(5000),
     });
     if (!res.ok) throw new Error(`register HTTP ${res.status}`);

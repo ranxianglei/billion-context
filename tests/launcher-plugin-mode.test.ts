@@ -115,11 +115,11 @@ function postModel(rig: Rig, sessionHeader?: string): Promise<Response> {
     });
 }
 
-async function register(rig: Rig, conversationId: string, opts?: { agent?: string; identity?: boolean }): Promise<void> {
+async function register(rig: Rig, conversationId: string, opts?: { agent?: string; identity?: boolean; headerless?: boolean }): Promise<void> {
     const res = await fetch(rig.proxyUrl("/__bili/plugin/register"), {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ conversationId, agent: opts?.agent, identity: opts?.identity ?? false }),
+        body: JSON.stringify({ conversationId, agent: opts?.agent, identity: opts?.identity ?? false, headerless: opts?.headerless ?? false }),
     });
     assert.equal(res.status, 200, "register accepted");
 }
@@ -180,6 +180,88 @@ test("launcher identity binding does not leak onto other sessions", async () => 
         assert.ok(rig.upstreamBodies[0]!.includes("compress"), "unregistered conversation stays wire mode");
         const status = await (await fetch(rig.proxyUrl("/__bili/plugin/status?conversationId=sess-mine"))).json() as { ok: boolean };
         assert.ok(!status.ok, "registration not consumed by a foreign session");
+    } finally {
+        await rig.closeAll();
+    }
+});
+
+test("omp headerless identity binding: register before the first request binds the headerless session (#268)", async () => {
+    const rig = await startRig();
+    try {
+        // omp cannot stamp its conversation id on requests (no
+        // before_provider_headers event) — the registration is flagged
+        // headerless and the proxy attributes the identity-less request to
+        // the sole pending headerless registration.
+        await register(rig, "omp-conv-1", { agent: "omp", identity: true, headerless: true });
+        await postModel(rig); // no session header at all — omp's real shape
+        assert.ok(!rig.upstreamBodies[0]!.includes("\"compress\""), "wire tool injection suppressed from the very first request");
+        const status = await (await fetch(rig.proxyUrl("/__bili/plugin/status?conversationId=omp-conv-1"))).json() as { ok: boolean; pluginAgent?: string };
+        assert.ok(status.ok, "conversation bound under the registered client id");
+        assert.equal(status.pluginAgent, "omp");
+    } finally {
+        await rig.closeAll();
+    }
+});
+
+test("omp headerless identity binding: register arriving AFTER the first request still binds (tool-ready race)", async () => {
+    const rig = await startRig();
+    try {
+        // The omp plugin registers only after the manifest fetch completes —
+        // the first request may already be in flight.
+        await postModel(rig);
+        assert.ok(rig.upstreamBodies[0]!.includes("compress"), "wire tools injected before the register lands");
+        await register(rig, "omp-conv-2", { agent: "omp", identity: true, headerless: true });
+        await postModel(rig);
+        assert.ok(!rig.upstreamBodies[1]!.includes("\"compress\""), "wire tool injection suppressed after the sole-headerless binding");
+        const status = await (await fetch(rig.proxyUrl("/__bili/plugin/status?conversationId=omp-conv-2"))).json() as { ok: boolean; pluginAgent?: string };
+        assert.ok(status.ok, "conversation registered");
+        assert.equal(status.pluginAgent, "omp");
+    } finally {
+        await rig.closeAll();
+    }
+});
+
+test("headerless binding does not leak onto sessions carrying a client identity", async () => {
+    const rig = await startRig();
+    try {
+        await register(rig, "omp-conv-3", { agent: "omp", identity: true, headerless: true });
+        await postModel(rig, "sess-other"); // carries x-claude-code-session-id
+        assert.ok(rig.upstreamBodies[0]!.includes("compress"), "identified session stays wire mode");
+        await postModel(rig); // the real headerless omp request
+        assert.ok(!rig.upstreamBodies[1]!.includes("\"compress\""), "registration consumed by the headerless request");
+        const status = await (await fetch(rig.proxyUrl("/__bili/plugin/status?conversationId=omp-conv-3"))).json() as { ok: boolean; pluginAgent?: string };
+        assert.ok(status.ok, "bound under the registered client id");
+        assert.equal(status.pluginAgent, "omp");
+    } finally {
+        await rig.closeAll();
+    }
+});
+
+test("non-headerless (claude-style) identity registration is not consumed by a headerless request", async () => {
+    const rig = await startRig();
+    try {
+        await register(rig, "claude-conv-1", { agent: "mcp", identity: true });
+        await postModel(rig); // headerless request — must NOT eat the claude registration
+        assert.ok(rig.upstreamBodies[0]!.includes("compress"), "headerless request stays wire mode");
+        await postModel(rig, "claude-conv-1"); // the real claude request
+        assert.ok(!rig.upstreamBodies[1]!.includes("\"compress\""), "exact-match identity binding still works");
+        const status = await (await fetch(rig.proxyUrl("/__bili/plugin/status?conversationId=claude-conv-1"))).json() as { ok: boolean };
+        assert.ok(status.ok, "claude conversation bound by exact match");
+    } finally {
+        await rig.closeAll();
+    }
+});
+
+test("two pending headerless registrations are ambiguous — no binding", async () => {
+    const rig = await startRig();
+    try {
+        await register(rig, "omp-a", { agent: "omp", identity: true, headerless: true });
+        await register(rig, "omp-b", { agent: "omp", identity: true, headerless: true });
+        await postModel(rig);
+        assert.ok(rig.upstreamBodies[0]!.includes("compress"), "ambiguous — stays wire mode");
+        const a = await (await fetch(rig.proxyUrl("/__bili/plugin/status?conversationId=omp-a"))).json() as { ok: boolean };
+        const b = await (await fetch(rig.proxyUrl("/__bili/plugin/status?conversationId=omp-b"))).json() as { ok: boolean };
+        assert.ok(!a.ok && !b.ok, "neither conversation bound");
     } finally {
         await rig.closeAll();
     }
