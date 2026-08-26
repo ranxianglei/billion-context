@@ -588,13 +588,13 @@ export async function pipePluginResponsesWithStrip(
         }
     };
     let lastDeltaMeta: { item_id?: unknown; output_index?: unknown } | null = null;
-    const flushTail = (before: string) => {
+    const flushTail = (after: string) => {
         const tail = tagFilter.flush();
         if (tail.length > 0) {
             const meta = lastDeltaMeta ?? {};
-            before += `data: ${JSON.stringify({ type: "response.output_text.delta", ...meta, delta: tail })}\n\n`;
+            return `data: ${JSON.stringify({ type: "response.output_text.delta", ...meta, delta: tail })}\n\n` + after;
         }
-        return before;
+        return after;
     };
     try {
         for (;;) {
@@ -632,7 +632,7 @@ export async function pipePluginResponsesWithStrip(
                         type === "response.incomplete"
                     ) {
                         // done-family events also carry full text payloads — strip those too.
-                        const out = containsRenderTagText(jsonStr) ? rebuildEvent(rawEvent, stripResponsesText(ev)) : rawEvent;
+                        const out = containsRenderTagText(jsonStr) ? rebuildEvent(rawEvent, stripResponsesText(ev)) : rawEvent + "\n\n";
                         await write(flushTail(out));
                         continue;
                     }

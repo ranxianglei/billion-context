@@ -85,8 +85,11 @@ test("plugin passthrough strips tags split across deltas and flushes tail before
     assert.ok(!text.includes("m00042"), "split tag fully swallowed");
     assert.ok(text.includes("ok "), "first delta prose passes");
     assert.ok(text.includes("tail"), "post-tag tail flushed before completed");
-    const flushDelta = text.split("\n\n").find((l) => l.includes("tail"));
-    assert.ok(flushDelta?.includes("msg_1"), "flushed tail delta carries item_id");
+    const blocks = text.split("\n\n").filter((b) => b.trim().length > 0);
+    const flushIdx = blocks.findIndex((b) => b.includes("tail"));
+    const completedIdx = blocks.findIndex((b) => b.includes("response.completed"));
+    assert.ok(flushIdx !== -1 && completedIdx !== -1 && flushIdx < completedIdx, "flushed tail delta must precede the done-family event that triggered it");
+    assert.ok((blocks[flushIdx] ?? "").includes("msg_1"), "flushed tail delta carries item_id");
 });
 
 test("plugin passthrough keeps function_call and non-tag events byte-identical", async () => {
@@ -115,4 +118,30 @@ test("plugin passthrough strips tags from done-family full-text payloads", async
     const text = out.join("");
     assert.ok(!text.includes("m00001"), "done payload stripped");
     assert.ok(text.includes("clean "), "done payload prose survives");
+});
+
+test("plugin passthrough preserves SSE framing for tag-free done-family events (no data lines fused)", async () => {
+    const out: string[] = [];
+    const res = makeRes(out);
+    const session = makeSession();
+    const done = sse({ type: "response.output_text.done", item_id: "msg_1", output_index: 0, text: "done text no tags" });
+    const events = [
+        sse({ type: "response.output_text.delta", item_id: "msg_1", output_index: 0, delta: "hello" }),
+        done,
+        sse({ type: "response.output_item.added", output_index: 2, item: { type: "function_call", name: "read", call_id: "c2", arguments: "{}" } }),
+        sse({ type: "response.completed", response: { usage: { input_tokens: 9 } } }),
+    ];
+    await pipePluginResponsesWithStrip(streamOf(events), res, session);
+    const text = out.join("");
+    const dataLines = text.split("\n").filter((l) => l.startsWith("data:"));
+    assert.equal(dataLines.length, 4, "event count preserved");
+    for (const l of dataLines) {
+        let parsed: unknown;
+        assert.doesNotThrow(() => {
+            parsed = JSON.parse(l.slice(5).trim());
+        }, `every data line must stay valid JSON: ${l.slice(0, 120)}`);
+        assert.ok(parsed);
+    }
+    assert.ok(text.includes(done.trim()), "tag-free done event byte-identical");
+    assert.ok(text.endsWith("\n\n"), "stream keeps event framing to the end");
 });
