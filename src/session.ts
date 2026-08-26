@@ -48,6 +48,13 @@ export type Session = {
          *  overwritten each turn). Source of truth for tokenCount — never an
          *  estimate. See onCacheUsage in compress-loop-*.ts. */
         lastInputTokens: number;
+        /** Tokens compressed THIS turn whose fold has not yet materialized in
+         *  an upstream usage report (the post-compress re-request re-sends the
+         *  UNFOLDED history for prefix-cache reasons, so its usage report
+         *  over-reports). Usage recorders net this credit out of
+         *  lastInputTokens; the next prepare() — where the fold actually
+         *  happens — clears it. In-memory only. */
+        compressCreditTokens: number;
         /** Current in-context (uncompressed) token count at last processTurn. */
         contextTokens: number;
     };
@@ -148,7 +155,7 @@ export function getSession(id: string, meta?: { protocol?: Session["meta"]["prot
     const session: Session = {
         id,
         meta: { protocol: meta?.protocol, upstreamOrigin: meta?.upstreamOrigin, label: meta?.label },
-        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, contextTokens: 0 },
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0 },
         metadata: {},
         state: createInitialState(),
         createdAt: Date.now(),

@@ -297,6 +297,8 @@ function buildSession(parsed: PersistedSession): Session {
             outputTokens: stats.outputTokens ?? parsed.outputTokens ?? 0,
             cacheSamples: stats.cacheSamples ?? parsed.cacheSamples ?? 0,
             lastInputTokens: stats.lastInputTokens ?? parsed.lastInputTokens ?? 0,
+            // In-memory only — a fresh process has no pending compress fold.
+            compressCreditTokens: 0,
             contextTokens: stats.contextTokens ?? parsed.contextTokens ?? 0,
         },
         metadata: parsed.metadata ?? {},

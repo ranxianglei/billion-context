@@ -10,6 +10,17 @@ export interface ClaudeSettings {
     anthropicBaseUrl?: string;
 }
 
+export interface ModelWindow {
+    id: string;
+    contextWindow: number;
+}
+
+function toModelWindow(id: unknown, contextWindow: unknown): ModelWindow | null {
+    return typeof id === "string" && id.length > 0 && typeof contextWindow === "number" && Number.isFinite(contextWindow) && contextWindow > 0
+        ? { id, contextWindow: Math.floor(contextWindow) }
+        : null;
+}
+
 export interface CodexProvider {
     baseUrl?: string;
 }
@@ -17,11 +28,14 @@ export interface CodexProvider {
 export interface CodexConfig {
     modelProvider?: string;
     openaiBaseUrl?: string;
+    /** Top-level `model` + `model_context_window` override pair (if set). */
+    modelWindows?: ModelWindow[];
     providers: Record<string, CodexProvider>;
 }
 
 export interface PiProvider {
     baseUrl?: string;
+    models?: ModelWindow[];
 }
 
 export interface PiConfig {
@@ -38,6 +52,7 @@ export interface ZcodeConfig {
 
 export interface OmpProvider {
     baseUrl?: string;
+    models?: ModelWindow[];
 }
 
 export interface OmpConfig {
@@ -46,6 +61,8 @@ export interface OmpConfig {
 
 export interface OpencodeProvider {
     baseURL?: string;
+    /** opencode's per-model context limit (`models.<id>.limit`). */
+    models?: ModelWindow[];
 }
 
 export interface OpencodeConfig {
@@ -179,6 +196,8 @@ export function parseCodexToml(text: string): CodexConfig {
     const result: CodexConfig = { providers: {} };
     let table = "";
     let curProvider: string | null = null;
+    let codexModel: string | undefined;
+    let codexContextWindow: number | undefined;
     for (const rawLine of text.split(/\r?\n/)) {
         const line = rawLine.trim();
         if (!line || line.startsWith("#")) continue;
@@ -193,17 +212,24 @@ export function parseCodexToml(text: string): CodexConfig {
             }
             continue;
         }
-        const m = /^([A-Za-z0-9_.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/.exec(line);
-        if (!m) continue;
-        const key = m[1];
-        const val = m[2] !== undefined ? m[2] : m[3];
-        if (table === "") {
-            if (key === "model_provider") result.modelProvider = val;
-            else if (key === "openai_base_url") result.openaiBaseUrl = val;
-        } else if (curProvider && key === "base_url") {
-            result.providers[curProvider].baseUrl = val;
+        const strMatch = /^([A-Za-z0-9_.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/.exec(line);
+        const numMatch = /^([A-Za-z0-9_.-]+)\s*=\s*([0-9]+)\b/.exec(line);
+        if (strMatch) {
+            const key = strMatch[1];
+            const val = strMatch[2] !== undefined ? strMatch[2] : strMatch[3];
+            if (table === "") {
+                if (key === "model_provider") result.modelProvider = val;
+                else if (key === "openai_base_url") result.openaiBaseUrl = val;
+                else if (key === "model") codexModel = val;
+            } else if (curProvider && key === "base_url") {
+                result.providers[curProvider].baseUrl = val;
+            }
+        } else if (numMatch && table === "" && numMatch[1] === "model_context_window") {
+            codexContextWindow = Number(numMatch[2]);
         }
     }
+    const win = toModelWindow(codexModel, codexContextWindow);
+    if (win) result.modelWindows = [win];
     return result;
 }
 
@@ -227,7 +253,19 @@ export function readPiConfig(piHome: string): PiConfig {
         for (const [name, val] of Object.entries(rawProviders as Record<string, unknown>)) {
             if (val && typeof val === "object" && !Array.isArray(val)) {
                 const baseUrl = (val as { baseUrl?: unknown }).baseUrl;
-                providers[name] = typeof baseUrl === "string" ? { baseUrl } : {};
+                const models = (val as { models?: unknown }).models;
+                const windows: ModelWindow[] = [];
+                if (Array.isArray(models)) {
+                    for (const m of models) {
+                        if (!m || typeof m !== "object") continue;
+                        const win = toModelWindow((m as { id?: unknown }).id, (m as { contextWindow?: unknown }).contextWindow);
+                        if (win) windows.push(win);
+                    }
+                }
+                providers[name] = {
+                    ...(typeof baseUrl === "string" ? { baseUrl } : {}),
+                    ...(windows.length > 0 ? { models: windows } : {}),
+                };
             }
         }
     }
@@ -245,6 +283,11 @@ export function parseOmpYaml(text: string): OmpConfig {
     let providersIndent = -1;
     let providerIndent = -1;
     let currentProvider: string | null = null;
+    // `models:` subsection: `- id: <x>` (any deeper indent) starts a model
+    // entry, a deeper `contextWindow: <n>` completes it.
+    let modelsIndent = -1;
+    let dashIndent = -1;
+    let currentModelId: string | undefined;
     for (const rawLine of text.split(/\r?\n/)) {
         const trimmed = rawLine.trim();
         if (!trimmed || trimmed.startsWith("#")) continue;
@@ -256,6 +299,9 @@ export function parseOmpYaml(text: string): OmpConfig {
         if (indent <= providersIndent) break;
         if (providerIndent === -1) providerIndent = indent;
         if (indent === providerIndent) {
+            modelsIndent = -1;
+            dashIndent = -1;
+            currentModelId = undefined;
             const m = /^([A-Za-z0-9_.-]+):/.exec(trimmed);
             if (m) {
                 currentProvider = m[1];
@@ -264,8 +310,26 @@ export function parseOmpYaml(text: string): OmpConfig {
                 currentProvider = null;
             }
         } else if (indent > providerIndent && currentProvider) {
-            const m = /^baseUrl:\s*(\S+)/.exec(trimmed);
-            if (m) result.providers[currentProvider].baseUrl = m[1];
+            const idMatch = /^-\s+id:\s*(\S+)/.exec(trimmed);
+            if (modelsIndent >= 0 && indent > modelsIndent && idMatch) {
+                currentModelId = idMatch[1];
+                dashIndent = indent;
+            } else if (modelsIndent >= 0 && dashIndent >= 0 && indent > dashIndent && /^contextWindow:\s*([0-9]+)/.test(trimmed)) {
+                const n = Number(/^contextWindow:\s*([0-9]+)/.exec(trimmed)![1]);
+                const win = toModelWindow(currentModelId, n);
+                if (win) {
+                    const prov = result.providers[currentProvider];
+                    prov.models = [...(prov.models ?? []), win];
+                }
+                currentModelId = undefined;
+            } else if (/^models:\s*(#.*)?$/.test(trimmed)) {
+                modelsIndent = indent;
+                dashIndent = -1;
+                currentModelId = undefined;
+            } else if (modelsIndent < 0 || indent <= modelsIndent) {
+                const m = /^baseUrl:\s*(\S+)/.exec(trimmed);
+                if (m) result.providers[currentProvider].baseUrl = m[1];
+            }
         }
     }
     return result;
@@ -399,6 +463,19 @@ export function readOpencodeConfig(file: string): OpencodeConfig {
                     const baseURL = (opts as Record<string, unknown>).baseURL;
                     if (typeof baseURL === "string") providers[name] = { baseURL };
                 }
+                const modelsRoot = (value as Record<string, unknown>).models;
+                if (modelsRoot && typeof modelsRoot === "object" && !Array.isArray(modelsRoot) && providers[name]) {
+                    const windows: ModelWindow[] = [];
+                    for (const [modelId, mv] of Object.entries(modelsRoot as Record<string, unknown>)) {
+                        if (!mv || typeof mv !== "object") continue;
+                        const limit = (mv as Record<string, unknown>).limit;
+                        if (typeof limit === "number") {
+                            const win = toModelWindow(modelId, limit);
+                            if (win) windows.push(win);
+                        }
+                    }
+                    if (windows.length > 0) providers[name].models = windows;
+                }
             }
         }
     }
@@ -453,4 +530,22 @@ export function loadClientConfig(env: NodeJS.ProcessEnv, cwd: string): ClientCon
     config.hermes = readHermesConfig(resolveHermesHome(env));
     config.dsh = readDshConfig(resolveDshHome(env));
     return config;
+}
+
+/** Collect per-model context windows from every client config the launcher
+ *  can read (pi models.json, omp models.yml, opencode opencode.json, codex
+ *  config.toml). Same model id under multiple providers → the LARGEST window
+ *  wins (the client will route by id; the proxy only needs the denominator). */
+export function collectModelWindows(config: ClientConfig): Record<string, number> {
+    const out: Record<string, number> = {};
+    const add = (wins: ModelWindow[] | undefined): void => {
+        for (const w of wins ?? []) {
+            if (!out[w.id] || w.contextWindow > out[w.id]) out[w.id] = w.contextWindow;
+        }
+    };
+    for (const p of Object.values(config.pi?.providers ?? {})) add(p.models);
+    for (const p of Object.values(config.omp?.providers ?? {})) add(p.models);
+    for (const p of Object.values(config.opencode?.providers ?? {})) add(p.models);
+    add(config.codex?.modelWindows);
+    return out;
 }

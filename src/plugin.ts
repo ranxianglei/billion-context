@@ -480,7 +480,9 @@ function applyUsageSample(session: Session, sample: UsageSample, protocol?: Wire
             sample.inputTokens +
             (!includesCached && sample.cachedTokens !== undefined ? sample.cachedTokens : 0);
         session.stats.inputTokens += total;
-        session.stats.lastInputTokens = total;
+        // Net out pending compress savings (see stream.ts applyRanges): plugin
+        // compress tool results shrink the next request, not this report.
+        session.stats.lastInputTokens = Math.max(0, total - (session.stats.compressCreditTokens ?? 0));
     }
     if (sample.outputTokens !== undefined) session.stats.outputTokens += sample.outputTokens;
 }
