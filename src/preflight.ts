@@ -1,5 +1,5 @@
 import {
-    estimateTokensFast,
+    defaultCountTokens,
     viableRanges,
     type CompressionCore,
     type Config,
@@ -66,9 +66,12 @@ function refNum(ref: string): number {
     return Number(ref.replace(/\D/g, "")) || 0;
 }
 
+// CJK-aware: the fast chars/4 estimator undercounts CJK ~4× (CJK is ~1
+// token/char), which made the fit check believe an oversized CJK payload
+// already fit and skip compression. defaultCountTokens counts CJK per-char.
 export function estimateCoreMessages(messages: CoreMessage[]): number {
     let tokens = 0;
-    for (const m of messages) tokens += estimateTokensFast(m.text ?? "");
+    for (const m of messages) tokens += defaultCountTokens(m.text ?? "");
     return tokens;
 }
 
@@ -106,7 +109,7 @@ function splitChunks(messages: CoreMessage[], startIdx: number, endIdx: number, 
         let tokens = 0;
         let last = cur;
         for (let i = cur; i <= endIdx; i++) {
-            const t = estimateTokensFast(messages[i].text ?? "");
+            const t = defaultCountTokens(messages[i].text ?? "");
             if (tokens + t > budgetTokens && i > cur) break;
             tokens += t;
             last = i;
@@ -221,7 +224,10 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             renderTags: "text-only",
         });
         deps.session.state = turn.state;
-        currentTokens = estimateCoreMessages(turn.messages);
+        // Floor on the session's measured input baseline: the upstream's
+        // input_tokens also covers the system prompt + tool definitions, which
+        // are not in turn.messages, so the direct estimate can undershoot.
+        currentTokens = Math.max(deps.session.stats.lastInputTokens, estimateCoreMessages(turn.messages));
         if (startTokens < 0) startTokens = currentTokens;
         if (currentTokens < limit) break;
         const ranges = viableRanges(turn.nudge?.compressibleRanges ?? []);
@@ -270,8 +276,8 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             // The summary itself re-enters the payload; net its cost against
             // both the folded size and the session's input baseline.
             const compressed = deps.session.stats.compressCreditTokens - creditBefore;
-            currentTokens = Math.max(0, currentTokens - compressed + estimateTokensFast(summary));
-            deps.session.stats.lastInputTokens += estimateTokensFast(summary);
+            currentTokens = Math.max(0, currentTokens - compressed + defaultCountTokens(summary));
+            deps.session.stats.lastInputTokens += defaultCountTokens(summary);
             appliedThisRound += 1;
             result.compressedRanges += 1;
         }
