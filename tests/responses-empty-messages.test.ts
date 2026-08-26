@@ -73,3 +73,13 @@ test("non-array input tolerated; message with non-text parts kept", () => {
     assert.equal(dropWhitespaceResponsesMessages(input), 0);
     assert.equal(input.length, 1);
 });
+
+test("dropWhitespaceResponsesMessages preserves items with malformed non-object content parts", () => {
+    const input = [
+        { role: "assistant", content: [{ type: "output_text", text: "\n\n" }, 42] },
+        { role: "assistant", content: [{ type: "output_text", text: "real" }] },
+    ];
+    const dropped = dropWhitespaceResponsesMessages(input);
+    assert.equal(dropped, 0, "malformed part makes emptiness unknowable — item preserved");
+    assert.equal(input.length, 2, "nothing removed");
+});

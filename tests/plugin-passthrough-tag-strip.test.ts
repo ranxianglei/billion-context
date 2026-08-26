@@ -25,7 +25,9 @@ function makeRes(chunks: string[]) {
             chunks.push(typeof b === "string" ? b : b.toString("utf8"));
             return true;
         },
-        end() {},
+        end(b?: Buffer | string) {
+            if (b !== undefined) chunks.push(typeof b === "string" ? b : b.toString("utf8"));
+        },
         once() {},
         destroyed: false,
         writableEnded: false,
@@ -144,4 +146,72 @@ test("plugin passthrough preserves SSE framing for tag-free done-family events (
     }
     assert.ok(text.includes(done.trim()), "tag-free done event byte-identical");
     assert.ok(text.endsWith("\n\n"), "stream keeps event framing to the end");
+});
+
+test("plugin passthrough flushes held tail when stream ends without a done-family event", async () => {
+    const out: string[] = [];
+    const res = makeRes(out);
+    const session = makeSession();
+    const events = [
+        sse({ type: "response.output_text.delta", item_id: "msg_9", output_index: 0, delta: `prose ${TAG_OPEN}m0` }),
+    ];
+    await pipePluginResponsesWithStrip(streamOf(events), res, session);
+    const text = out.join("");
+    assert.ok(text.includes("prose "), "clean prefix passes");
+    assert.ok(text.includes("m0"), "held unterminated fragment is flushed at stream end, not lost");
+});
+
+test("plugin passthrough rebuildEvent collapses multi-line data payloads into one line", async () => {
+    const out: string[] = [];
+    const res = makeRes(out);
+    const session = makeSession();
+    const escOpen = TAG_OPEN.replace(/"/g, '\\"');
+    const payload = `{ "type": "response.output_text.done",\n"item_id": "msg_1", "text": "done ${escOpen}m00001${TAG_CLOSE}" }`;
+    const raw = `event: response.output_text.done\ndata: ${payload.split("\n")[0]}\ndata: ${payload.split("\n")[1]}\n\n`;
+    const events = [
+        sse({ type: "response.output_text.delta", item_id: "msg_1", output_index: 0, delta: "x" }),
+        raw,
+    ];
+    await pipePluginResponsesWithStrip(streamOf(events), res, session);
+    const text = out.join("");
+    const dataLines = text.split("\n").filter((l) => l.startsWith("data:"));
+    for (const l of dataLines) {
+        assert.doesNotThrow(() => JSON.parse(l.slice(5).trim()), `single-line data stays parseable: ${l.slice(0, 100)}`);
+    }
+    assert.ok(!text.includes("m00001"), "multi-line done payload still stripped");
+});
+
+test("plugin JSON passthrough strips render tags for responses protocol", async () => {
+    const { pipePluginJson } = await import("../src/plugin.ts");
+    const out: string[] = [];
+    const res = makeRes(out);
+    const session = makeSession();
+    const body = JSON.stringify({ output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: `hi ${TAG_OPEN}m00003${TAG_CLOSE}` }] }], usage: { input_tokens: 4 } });
+    const stream = streamOf([body]);
+    await pipePluginJson(stream, res as unknown as import("node:http").ServerResponse, session, "responses");
+    const text = out.join("");
+    const parsed = JSON.parse(text) as { output: Array<{ content: Array<{ text: string }> }> };
+    assert.ok(!text.includes("m00003"), "tag stripped from non-streaming responses body");
+    assert.equal(parsed.output[0]?.content[0]?.text, "hi ", "prose survives");
+    assert.equal((session.stats as Record<string, unknown>)["lastInputTokens"], 4, "usage still sampled");
+});
+
+test("plugin JSON passthrough stays verbatim for openai protocol and tag-free bodies", async () => {
+    const { pipePluginJson } = await import("../src/plugin.ts");
+    {
+        const out: string[] = [];
+        const res = makeRes(out);
+        const session = makeSession();
+        const body = JSON.stringify({ choices: [{ message: { content: `x ${TAG_OPEN}m00005${TAG_CLOSE}` } }], usage: { prompt_tokens: 2 } });
+        await pipePluginJson(streamOf([body]), res as unknown as import("node:http").ServerResponse, session, "openai");
+        assert.equal(out.join(""), body, "openai protocol body byte-identical");
+    }
+    {
+        const out: string[] = [];
+        const res = makeRes(out);
+        const session = makeSession();
+        const body = JSON.stringify({ output: [{ type: "message", content: [{ type: "output_text", text: "clean" }] }] });
+        await pipePluginJson(streamOf([body]), res as unknown as import("node:http").ServerResponse, session, "responses");
+        assert.equal(out.join(""), body, "tag-free responses body byte-identical");
+    }
 });
