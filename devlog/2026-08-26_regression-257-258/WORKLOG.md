@@ -47,3 +47,40 @@
 - 补两个 merge（零冲突）：`a05cba5`（merge #257 head）+ `cffc5d5`（merge #258 head）
 - 重跑预检：typecheck ✓ / **636/636** / build ✓（dist/index.js 2.48 MB，dist/agent/omp.js 11.79 KB）
 - e2e 结论对新树仍成立：2a1bd22 只改 register **失败**路径（e2e 走的是首请求即绑定成功的 happy path，终态一致）；21fa531 纯 docs
+
+## Follow-up: plugin-mode passthrough tag-echo strip (same day)
+
+User reported a NEW omp session (post-#257 testing) filling with fake render tags
+(`<acp tokens="247" type="text">m00042</acp>`, same ref, tokens counting down) and the
+model never quoting the requested text. First diagnosis blamed an old Aug-24 proxy
+process — WRONG (user challenged it; the session was on the fresh bili-omp proxy).
+Real root cause: `server.ts` plugin-mode branch pipes the upstream Responses stream
+VERBATIM (`pipeThroughWithUsage`), and the tag-echo stripper (#206) only exists in the
+compress-loop stream path — bringing omp into plugin mode (#257) bypassed the output-side
+strip, so fake tags flowed back verbatim, omp flattened them into session items, replay
+amplified them, and #258's ingress drop could not save mixed (tag+prose) messages.
+
+Fix (on this regression branch):
+- `src/loop/tag-echo-filter.ts`: `TagEchoFilter` gains `pending(): boolean`.
+- `src/plugin.ts`: new `pipePluginResponsesWithStrip(stream, res, session, log?)` —
+  event-level passthrough that filters `output_text.delta` through the same
+  `createTagEchoFilter` state machine (fast path when no tag and nothing pending),
+  flushes held tail as a delta before done-family events, strips full-text fields of
+  done events, keeps every other event byte-identical; samples usage from
+  `ev.response.usage`.
+- `src/server.ts`: plugin-mode branch uses the new pipe for protocol "responses".
+
+Verification: tests/plugin-passthrough-tag-strip.test.ts 4/4 (single-event strip,
+split-across-deltas strip + tail flush with item_id, byte-identical passthrough for
+clean events, done-payload strip); full suite 640/640; typecheck; build. Real omp e2e
+(isolate PI_CODING_AGENT_DIR + full lifecycle mock): proxy log shows
+`injectTool=false (plugin mode)` + `[tag-echo] stripped ... (plugin passthrough)` and
+omp receives `Here:  ECHO-DONE` — tag gone, prose intact. (First e2e attempt failed
+with "stream closed before terminal event" — mock lacked output_item.added/
+content_part events; pi-ai Responses parser needs the full lifecycle chain.)
+
+Also fixed a duplicated `### Fixes` header in [Unreleased] (merge artifact from #258's
+CHANGELOG edit) while adding the entry.
+
+User recovery: kill the pre-fix proxy; next `bili omp` spawns a fresh one with the strip.
+Poisoned session (01a03dcb) is unrecoverable — start a new session.
