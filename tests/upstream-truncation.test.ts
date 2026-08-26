@@ -96,6 +96,60 @@ async function drain(
     return Buffer.concat(chunks).toString("utf8");
 }
 
+// A stream that is cut right after message_start: NO content block, NO text,
+// NO reasoning, NO completion event. This is the relay-timeout shape from
+// issue #221 (a long-running request cut before any token is emitted).
+const TRUNCATED_EMPTY = [
+    sse("message_start", { type: "message_start", message: { id: "msg_1", usage: { input_tokens: 10 } } }),
+].join("");
+
+const COMPLETE_RETRY = [
+    sse("message_start", { type: "message_start", message: { id: "msg_2", usage: { input_tokens: 10 } } }),
+    sse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
+    sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "重试后完整输出" } }),
+    sse("content_block_stop", { type: "content_block_stop", index: 0 }),
+    sse("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 5 } }),
+    sse("message_stop", { type: "message_stop" }),
+].join("");
+
+function withTruncationRetries(max: string, fn: () => Promise<void>): Promise<void> {
+    const prev = process.env.BILI_TRUNCATION_RETRY_MAX;
+    process.env.BILI_TRUNCATION_RETRY_MAX = max;
+    return Promise.resolve()
+        .then(fn)
+        .finally(() => {
+            if (prev === undefined) delete process.env.BILI_TRUNCATION_RETRY_MAX;
+            else process.env.BILI_TRUNCATION_RETRY_MAX = prev;
+        });
+}
+
+test("issue #221: no-content truncation auto-retries and delivers the full response", async () => {
+    await withTruncationRetries("2", async () => {
+        const out = await drain(streamOf(TRUNCATED_EMPTY), [COMPLETE_RETRY], makeCtx());
+        assert.ok(out.includes("重试后完整输出"), "retry content should reach the client");
+        assert.ok(!out.includes("upstream stream truncated"), "no error marker when the retry succeeds");
+        assert.match(out, /stop_reason.*end_turn/, "client stream should terminate cleanly");
+        const starts = (out.match(/event: message_start/g) ?? []).length;
+        assert.equal(starts, 1, "retry must not duplicate message_start");
+    });
+});
+
+test("issue #221: no-content truncation that keeps truncating surfaces the error after retries are exhausted", async () => {
+    await withTruncationRetries("1", async () => {
+        const out = await drain(streamOf(TRUNCATED_EMPTY), [TRUNCATED_EMPTY, TRUNCATED_EMPTY], makeCtx());
+        assert.ok(out.includes("upstream stream truncated"), "error must surface once retries are exhausted");
+        assert.ok(!out.includes("重试后完整输出"), "no content should have been delivered");
+    });
+});
+
+test("issue #221: partial-content truncation is NOT auto-retried (would duplicate the streamed prefix)", async () => {
+    await withTruncationRetries("2", async () => {
+        const out = await drain(streamOf(TRUNCATED_CONCLUSION), [COMPLETE_RETRY], makeCtx());
+        assert.ok(out.includes("upstream stream truncated"), "partial truncation must still surface the error");
+        assert.ok(!out.includes("重试后完整输出"), "must not re-request and duplicate the partial prefix");
+    });
+});
+
 test("issue #221 follow-up: truncated final round surfaces a visible error instead of silent end_turn", async () => {
     const out = await drain(streamOf(TRUNCATED_CONCLUSION), [], makeCtx());
     assert.ok(out.includes("本周总结"), "partial conclusion text should still reach the client");

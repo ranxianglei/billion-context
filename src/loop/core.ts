@@ -24,6 +24,15 @@ import type { WireProtocol } from "../util.js";
 
 export const MAX_LOOP_ROUNDS = 10;
 
+/** Max auto-retries after a no-content upstream truncation (a relay cutting a
+ *  long-running request before any token is emitted, issue #221). Overridable
+ *  via BILI_TRUNCATION_RETRY_MAX (0 disables the auto-retry). Read on each call
+ *  so tests can tune it live. */
+export function maxTruncationRetries(): number {
+    const raw = Number(process.env.BILI_TRUNCATION_RETRY_MAX);
+    return Number.isInteger(raw) && raw >= 0 ? raw : 2;
+}
+
 function isLoopThinking(m: CoreMessage): boolean {
     return m.contentType === "reasoning" && typeof m.id === "string" && m.id.startsWith("acp_loop_");
 }
@@ -201,6 +210,7 @@ export async function* runCompressLoop(
     let currentUpstream = upstream;
     const coreMessages: CoreMessage[] = [...ctx.messages];
     let degradedRetried = false;
+    let truncationRetries = 0;
 
     try {
         for (let round = 1; round <= MAX_LOOP_ROUNDS; round++) {
@@ -397,7 +407,18 @@ export async function* runCompressLoop(
             // compress returns its failure as the tool output, so the model is not
             // blind to why it failed. MAX_LOOP_ROUNDS bounds runaway loops.
             const reRequest = proxyResults.length > 0 && realCalls === 0;
-            if (!reRequest) {
+            // A truncated stream that produced NO content (no text, no reasoning)
+            // is a clean re-send: nothing meaningful reached the client, so
+            // re-requesting the same body cannot duplicate anything. This recovers
+            // the relay-timeout case where a long-running request (e.g. a model
+            // thinking server-side for minutes) is cut before any token is emitted
+            // (issue #221). A partial-content truncation is NOT retried here — the
+            // model would regenerate from scratch and duplicate the already-streamed
+            // prefix, so that case still surfaces the visible error below.
+            const zeroContent = assistantText.length === 0 && assistantReasoning.length === 0;
+            const canRetryTruncation =
+                !sawDone && zeroContent && truncationRetries < maxTruncationRetries();
+            if (!reRequest && !canRetryTruncation) {
                 if (!sawDone) {
                     const partialText = assistantText.length;
                     const partialReasoning = assistantReasoning.length;
@@ -425,7 +446,14 @@ export async function* runCompressLoop(
                 return;
             }
 
-            ctx.log(`[acp-loop] round ${round}: proxy tool executed; re-requesting so the model sees the result`);
+            if (canRetryTruncation) {
+                truncationRetries += 1;
+                const max = maxTruncationRetries();
+                ctx.log(`[acp-loop] round ${round}: upstream truncated with no content; auto-retrying (attempt ${truncationRetries}/${max})`);
+                loggerLog("warn", `[acp-loop] upstream stream truncated with no content (round ${round}); auto-retrying (attempt ${truncationRetries}/${max})`);
+            } else {
+                ctx.log(`[acp-loop] round ${round}: proxy tool executed; re-requesting so the model sees the result`);
+            }
 
             if (signal?.aborted) break;
 
