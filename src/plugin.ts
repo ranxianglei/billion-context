@@ -246,7 +246,16 @@ const registeredIds = new Map<string, string>();
  *  ordering race with the shell's initialize. */
 export function consumePluginRegisterFor(conversationId: string): string | undefined {
     const agent = registeredIds.get(conversationId);
-    if (agent !== undefined) registeredIds.delete(conversationId);
+    if (agent !== undefined) {
+        // The registration describes the CONVERSATION, not a one-shot token:
+        // switching models/upstreams mid-conversation resolves to a NEW
+        // session (session key = protocol|upstream|apiKey|conversation) that
+        // must still bind — omp TUI flows that switch models would otherwise
+        // drop back to wire mode on every switch. Keep the entry and refresh
+        // LRU order so the size cap evicts least-recently-active conversations.
+        registeredIds.delete(conversationId);
+        registeredIds.set(conversationId, agent);
+    }
     return agent;
 }
 
