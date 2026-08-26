@@ -154,6 +154,7 @@ type FakePi = {
     events: Map<string, (event: unknown, ctx: unknown) => unknown>;
     tools: RecordedTool[];
     commands: Map<string, RecordedCommand>;
+    readonly registerCalls: number;
     on: (event: string, handler: (event: never, ctx: never) => unknown) => void;
     registerTool: (tool: RecordedTool) => void;
     registerCommand: (name: string, options: RecordedCommand) => void;
@@ -163,12 +164,15 @@ function makeFakePi(): FakePi {
     const events = new Map<string, (event: unknown, ctx: unknown) => unknown>();
     const tools: RecordedTool[] = [];
     const commands = new Map<string, RecordedCommand>();
+    let registerCallCount = 0;
     return {
         events,
         tools,
         commands,
+        get registerCalls() { return registerCallCount; },
         on: (event, handler) => events.set(event, handler as (event: never, ctx: never) => unknown),
         registerTool: (tool) => {
+            registerCallCount++;
             const i = tools.findIndex((t) => t.name === tool.name);
             if (i >= 0) tools[i] = tool;
             else tools.push(tool);
@@ -752,7 +756,7 @@ test("omp identity register failure throttles and retries later", async () => {
     const proxy = await startFakeProxy({ failRegister: 500 });
     try {
         const pi = makeFakePi();
-        ompPlugin(pi as never);
+        createBiliPlugin("omp", { retryIntervalMs: 500 })(pi as never);
         await pi.events.get("session_start")!({}, fakeCtx(proxy, "omp-sess-9"));
         await waitForTools(pi, 2);
         const deadline = Date.now() + 15000;
@@ -760,13 +764,24 @@ test("omp identity register failure throttles and retries later", async () => {
             await new Promise((r) => setTimeout(r, 25));
         }
         assert.equal(proxy.registers.length, 1);
-        // The retry is throttled by retryAt (10s) — a burst of per-request
-        // events right after the failure must not hammer the endpoint.
+        // Throttled: a burst of per-request events right after the failure must
+        // not hammer the endpoint (retryAt gates re-entry).
         for (let i = 0; i < 5; i++) {
             await pi.events.get("before_provider_request")!({}, fakeCtx(proxy, "omp-sess-9"));
             await flush();
         }
-        assert.equal(proxy.registers.length, 1);
+        assert.equal(proxy.registers.length, 1, "throttled — no immediate retry");
+        // After the throttle window, a per-request event retries ONLY the
+        // register (re-fetches manifest, re-POSTs register; tools are NOT
+        // re-registered).
+        await new Promise((r) => setTimeout(r, 700));
+        await pi.events.get("before_provider_request")!({}, fakeCtx(proxy, "omp-sess-9"));
+        const deadline2 = Date.now() + 5000;
+        while (proxy.registers.length < 2 && Date.now() < deadline2) {
+            await new Promise((r) => setTimeout(r, 25));
+        }
+        assert.equal(proxy.registers.length, 2, "retried after the throttle window");
+        assert.equal(pi.registerCalls, 2, "tools registered once, not re-registered on retry");
     } finally {
         await proxy.close();
     }
