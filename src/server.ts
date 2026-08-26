@@ -1,6 +1,6 @@
 import http from "node:http";
 import fs from "node:fs";
-import { createCore, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, type Prompts, defaultPrompts, estimateTokensFast, renderNudgeText, deactivateBlock, viableRanges } from "acp-kernel";
+import { createCore, type CompressionCore, type CompressionState, type Config, type CoreMessage, type NudgeDecision, type Prompts, defaultPrompts, estimateTokensFast, renderNudgeText, deactivateBlock, viableRanges } from "acp-kernel";
 import { resolveCompress, resolveCompressPrompts, resolveRequestConfig } from "./compress-settings.js";
 import type { ProxyOptions } from "./config.js";
 import { loadOptions, loadRoutes } from "./config.js";
@@ -42,6 +42,7 @@ import { getSession, listSessions, type Session, initSessions, markDirty, flushA
 import { COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressHybridSystemPrompt } from "./compress-tool.js";
 import { rewriteSseStream, rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
+import { preflightCompress, estimateCoreMessages } from "./preflight.js";
 import { renderUI, handleConfigGet, handleConfigPut } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { getStore } from "./persist.js";
@@ -847,7 +848,7 @@ async function handle(
             // (stream rewriter mutates state via compress/decompress) must not
             // interleave across concurrent requests on the same session.
             await withSessionLock(session, async () => {
-                prepared =
+                const runPrepare = (): Prepared =>
                     countTokens
                         ? prepareCountTokens(parsed as AnthropicRequestBody, core, reqConfig, log, session)
                         : protocol === "anthropic"
@@ -857,6 +858,22 @@ async function handle(
                             : responsesCompact
                               ? prepareResponsesCompact(bodyBuffer, parsed as ResponsesRequestBody, session)
                               : prepareResponses(parsed as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, responsesIdentity!, pluginMode);
+                prepared = runPrepare();
+                if (!countTokens && !responsesCompact) {
+                    prepared = await preflightCompressIfNeeded(
+                        prepared,
+                        runPrepare,
+                        req,
+                        res,
+                        opts,
+                        core,
+                        reqConfig,
+                        (parsed as { model?: string }).model,
+                        route,
+                        affinity,
+                        log,
+                    );
+                }
                 await forward(req, res, opts, prepared!.body, prepared!, core, reqConfig, log, route, affinity);
                 // Remember for ALL modes (not just plugin): wire clients (dsh,
                 // hermes, unplug'd pi) read the same panel via /__bili/plugin/status
@@ -880,11 +897,21 @@ async function handle(
 const ACP_TAG_MARK = "\x3cacp ";
 
 // acp-kernel injects an in-place `acp_summary_*` at the compressed range as a
-// generic-library fallback; this host strips it because the compress tool-call
-// already carries the summary (hideConsumedCompressCalls keeps active-block calls),
-// and a mid-stream insertion would shift the upstream prefix-cache breakpoint.
-function stripKernelSummaries(messages: BiliMessage[]): BiliMessage[] {
-    return messages.filter((m) => !(m.id ?? "").startsWith("acp_summary_"));
+// generic-library fallback. This host strips it ONLY when it is redundant: the
+// block's compress tool-call also carries the summary (hideConsumedCompressCalls
+// keeps active-block calls), and a mid-stream insertion would shift the upstream
+// prefix-cache breakpoint. Blocks created without a tool call (preflight
+// compression, src/preflight.ts — #247) have NO other carrier: their anchor is
+// the only place the summary reaches the model, so it must survive.
+function stripKernelSummaries(messages: BiliMessage[], state: CompressionState): BiliMessage[] {
+    const carried = new Set<string>();
+    for (const b of state.blocks) {
+        if (!b.active || !b.compressCallId) continue;
+        if (messages.some((m) => m.contentType === "tool-call" && m.toolCallId === b.compressCallId)) {
+            carried.add(`acp_summary_${b.blockId}`);
+        }
+    }
+    return messages.filter((m) => !(m.id ?? "").startsWith("acp_summary_") || !carried.has(m.id));
 }
 
 function diagTagSummary(messages: CoreMessage[], sessionId: string, strategy: string): string {
@@ -967,7 +994,7 @@ function prepareAnthropic(
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model));
-        processedMessages = stripKernelSummaries(turn.messages);
+        processedMessages = stripKernelSummaries(turn.messages, turn.state);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = coreToAnthropic(processedMessages as BiliMessage[], cacheControls);
 
@@ -1057,7 +1084,7 @@ function prepareOpenai(
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model));
-        processedMessages = stripKernelSummaries(turn.messages);
+        processedMessages = stripKernelSummaries(turn.messages, turn.state);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = coreToOpenai(processedMessages as BiliMessage[]);
 
@@ -1170,7 +1197,7 @@ function prepareResponses(
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model));
-        processedMessages = stripKernelSummaries(turn.messages);
+        processedMessages = stripKernelSummaries(turn.messages, turn.state);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltInput = patchResponsesInput(projection, processedMessages);
         if (shouldInject && !process.env.ACP_NO_COMPRESS_PROMPT) {
@@ -1272,7 +1299,7 @@ export function prepareCountTokens(
     try {
         const { msgs, cacheControls } = anthropicToCore(parsed);
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount: session.stats.lastInputTokens, renderTags: "text-only" });
-        const stripped = stripKernelSummaries(turn.messages as BiliMessage[]);
+        const stripped = stripKernelSummaries(turn.messages as BiliMessage[], turn.state);
         const rebuiltMessages = coreToAnthropic(stripped, cacheControls);
         log("info", `[${sessionId}] count_tokens pruned: ${msgs.length} → ${stripped.length} msgs`);
         return {
@@ -1407,6 +1434,118 @@ function injectResponsesTool(tools: unknown[] | undefined, toolsToAdd: readonly 
     return [...tools, ...additions];
 }
 
+type ForwardTarget = {
+    upstreamUrl: string;
+    headers: Record<string, string>;
+    proxyUrl: string | undefined;
+};
+
+function buildForwardTarget(
+    req: http.IncomingMessage,
+    opts: ProxyOptions,
+    route: ReturnType<typeof resolveUpstream>,
+    affinity?: string,
+): ForwardTarget {
+    // rewrittenUrl may use a `mitm://` scheme (for config-lookup distinction
+    // — see resolveUpstream). fetch needs the real https:// scheme, so strip
+    // mitm:// back to https:// for the actual upstream request.
+    const reqUrl = req.url ?? "";
+    const isAbsoluteUrl = /^https?:\/\//i.test(reqUrl);
+    const rewritten = route ? route.rewrittenUrl : isAbsoluteUrl ? reqUrl : opts.upstream + reqUrl;
+    const upstreamUrl = rewritten.replace(/^mitm:\/\//, "https://");
+    const headers: Record<string, string> = {};
+    const reqConnNamed = connectionNamedHeaders(req.headers["connection"]);
+    for (const [k, v] of Object.entries(req.headers)) {
+        const lower = k.toLowerCase();
+        if (UPSTREAM_HOP_HEADERS.has(lower) || reqConnNamed.has(lower) || v === undefined) continue;
+        headers[k] = Array.isArray(v) ? v.join(", ") : v;
+    }
+    headers["host"] = new URL(upstreamUrl).host;
+    // codex advertises its own server-side context compaction via this beta
+    // feature. It conflicts with bili's client-side compress (bili IS the
+    // compression layer) and third-party aggregators reject it with
+    // "invalid range / ref not found". Strip it so bili's compress is the
+    // sole mechanism.
+    const betaKey = Object.keys(headers).find((h) => h.toLowerCase() === "x-codex-beta-features");
+    if (betaKey) {
+        const kept = headers[betaKey]
+            .split(",")
+            .map((s) => s.trim())
+            .filter((f) => f && f !== "remote_compaction_v2");
+        if (kept.length > 0) headers[betaKey] = kept.join(",");
+        else delete headers[betaKey];
+    }
+    // Forward a client-provided Responses session identity only when it was
+    // carried in the body rather than an existing request header.
+    if (affinity && !clientConversationHeader(req.headers)) {
+        headers["x-session-id"] = affinity;
+    }
+    const proxyUrl = resolveProxy(opts.routes, opts.proxy, route?.rewrittenUrl ?? upstreamUrl, opts.proxyFallback);
+    return { upstreamUrl, headers, proxyUrl };
+}
+
+// #247: context exceeds the (new) model's window — usually right after a
+// mid-session model switch. The payload would overflow at forward time and
+// the reactive nudge could never fire (the request itself is rejected before
+// the model sees it), so the session would be stuck. Compress oldest
+// compressible ranges first (summarization calls sized to fit the smaller
+// window), then rebuild the payload.
+async function preflightCompressIfNeeded(
+    prepared: Prepared,
+    runPrepare: () => Prepared,
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    opts: ProxyOptions,
+    core: CompressionCore,
+    config: Config,
+    model: string | undefined,
+    route: ReturnType<typeof resolveUpstream>,
+    affinity: string | undefined,
+    log: (level: string, msg: string) => void,
+): Promise<Prepared> {
+    const session = prepared.session;
+    const limit = config.modelContextLimit;
+    // A fresh session (id rotated, e.g. after a model switch) has
+    // lastInputTokens = 0 while still carrying a full raw history; size the
+    // trigger on the real post-fold payload too.
+    const tokenCount = Math.max(session.stats.lastInputTokens, estimateCoreMessages(prepared.processedMessages));
+    if (limit <= 0 || !model || tokenCount < limit) return prepared;
+    if ((prepared.nudge?.compressibleRanges ?? []).length === 0) return prepared;
+    log("warn", `[${session.id}] context ${tokenCount} tokens exceeds model window ${limit} (model=${model}); preflight compressing before forward`);
+    const { upstreamUrl, headers, proxyUrl } = buildForwardTarget(req, opts, route, affinity);
+    const clientAbort = new AbortController();
+    res.on("close", () => {
+        if (!res.writableEnded) clientAbort.abort();
+    });
+    const started = Date.now();
+    const result = await preflightCompress(
+        {
+            core,
+            session,
+            config,
+            prompts: prepared.prompts ?? defaultPrompts,
+            protocol: prepared.protocol,
+            url: upstreamUrl,
+            headers,
+            model,
+            proxyUrl,
+            signal: clientAbort.signal,
+            log,
+        },
+        prepared.originalMessages,
+    );
+    if (result.compressedRanges > 0) {
+        log("info", `[${session.id}] preflight compressed ${result.compressedRanges} range(s), ~${result.savedTokens} tokens saved (${tokenCount} → ${session.stats.lastInputTokens}) in ${Date.now() - started}ms; rebuilding payload`);
+        const rebuilt = runPrepare();
+        // runPrepare re-incremented stats.requests; the rebuild is internal
+        // to this single client request.
+        session.stats.requests -= 1;
+        return rebuilt;
+    }
+    log("warn", `[${session.id}] preflight could not compress enough (~${result.savedTokens} tokens saved); forwarding as-is`);
+    return prepared;
+}
+
 async function forward(
     req: http.IncomingMessage,
     res: http.ServerResponse,
@@ -1419,13 +1558,7 @@ async function forward(
     route: ReturnType<typeof resolveUpstream>,
     affinity?: string,
 ): Promise<void> {
-    // rewrittenUrl may use a `mitm://` scheme (for config-lookup distinction
-    // — see resolveUpstream). fetch needs the real https:// scheme, so strip
-    // mitm:// back to https:// for the actual upstream request.
-    const reqUrl = req.url ?? "";
-    const isAbsoluteUrl = /^https?:\/\//i.test(reqUrl);
-    const rewritten = route ? route.rewrittenUrl : isAbsoluteUrl ? reqUrl : opts.upstream + reqUrl;
-    const upstreamUrl = rewritten.replace(/^mitm:\/\//, "https://");
+    const { upstreamUrl, headers, proxyUrl } = buildForwardTarget(req, opts, route, affinity);
     // Show the final proxied URL (where the request actually lands) as the
     // primary signal. The provider label is appended only for named routes —
     // zero-config requests have a single routing mode now, so the final
@@ -1471,34 +1604,6 @@ async function forward(
             }
         } catch { /* best-effort */ }
     }
-    const headers: Record<string, string> = {};
-    const reqConnNamed = connectionNamedHeaders(req.headers["connection"]);
-    for (const [k, v] of Object.entries(req.headers)) {
-        const lower = k.toLowerCase();
-        if (UPSTREAM_HOP_HEADERS.has(lower) || reqConnNamed.has(lower) || v === undefined) continue;
-        headers[k] = Array.isArray(v) ? v.join(", ") : v;
-    }
-    headers["host"] = new URL(upstreamUrl).host;
-    // codex advertises its own server-side context compaction via this beta
-    // feature. It conflicts with bili's client-side compress (bili IS the
-    // compression layer) and third-party aggregators reject it with
-    // "invalid range / ref not found". Strip it so bili's compress is the
-    // sole mechanism.
-    const betaKey = Object.keys(headers).find((h) => h.toLowerCase() === "x-codex-beta-features");
-    if (betaKey) {
-        const kept = headers[betaKey]
-            .split(",")
-            .map((s) => s.trim())
-            .filter((f) => f && f !== "remote_compaction_v2");
-        if (kept.length > 0) headers[betaKey] = kept.join(",");
-        else delete headers[betaKey];
-    }
-    // Forward a client-provided Responses session identity only when it was
-    // carried in the body rather than an existing request header.
-    if (affinity && !clientConversationHeader(req.headers)) {
-        headers["x-session-id"] = affinity;
-    }
-    const proxyUrl = resolveProxy(opts.routes, opts.proxy, route?.rewrittenUrl ?? upstreamUrl, opts.proxyFallback);
     if (opts.debug) {
         const hdrLog: Record<string, string> = {};
         for (const [hk, hv] of Object.entries(headers)) {
