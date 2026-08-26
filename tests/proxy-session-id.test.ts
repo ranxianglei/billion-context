@@ -60,6 +60,25 @@ test("preferPromptCacheKeyIdentity: no/blank/non-string prompt_cache_key keeps f
     assert.equal(preferPromptCacheKeyIdentity(undefined, { prompt_cache_key: "x" }), undefined);
 });
 
+test("preferPromptCacheKeyIdentity: malformed or oversized prompt_cache_key is not promoted (header-safety gate)", () => {
+    const bad = [
+        "a\nb",           // control char — undici ERR_INVALID_CHAR upstream
+        "a\rb",
+        "a b",            // space
+        "a\tb",
+        "x".repeat(129),  // unbounded blob
+        "\u4e2d\u6587",    // non-ASCII
+    ];
+    for (const pck of bad) {
+        const body = { input: [], prompt_cache_key: pck };
+        const id = preferPromptCacheKeyIdentity(conversationIdentityResponses(body, undefined), body);
+        assert.equal(id!.source, "content-fingerprint", `expected no promotion for ${JSON.stringify(pck)}`);
+    }
+    // Boundary: 128 printable chars still promotes.
+    const ok = { input: [], prompt_cache_key: "k".repeat(128) };
+    assert.equal(preferPromptCacheKeyIdentity(conversationIdentityResponses(ok, undefined), ok)!.source, "prompt-cache-key");
+});
+
 test("preferPromptCacheKeyIdentity: derived session id stable across growing turns + affinity forwards it", () => {
     const body1 = { input: [{ type: "message", role: "user", content: "hi" }], prompt_cache_key: "pck-omp-1" };
     const body2 = { input: [...body1.input, { type: "message", role: "user", content: "turn 2" }], prompt_cache_key: "pck-omp-1" };

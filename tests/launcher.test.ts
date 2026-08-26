@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
+import os from "node:os";
 import path from "node:path";
 import {
     LAUNCHER_DEFAULT_HOST,
@@ -480,6 +481,19 @@ test("ompPluginLoadedFrom: only entries whose file exists count as loaded", () =
         assert.equal(ompPluginLoadedFrom(ompHome), false); // stale target
         fs.writeFileSync(path.join(ompHome, "config.yml"), "extensions:\n  - /some/other/plugin.js\n");
         assert.equal(ompPluginLoadedFrom(ompHome), false); // foreign plugin
+        // Path-shaped value OUTSIDE the extensions block must not gate -e.
+        fs.writeFileSync(path.join(ompHome, "config.yml"), `modelRoles:\n  default: ${live}\n`);
+        assert.equal(ompPluginLoadedFrom(ompHome), false);
+        // `~`-prefixed loadable entry counts as loaded (omp expands it too).
+        fs.writeFileSync(path.join(ompHome, "config.yml"), `extensions:\n  - ~/live/dist/agent/omp.js\n`);
+        const realHome = live.slice(0, live.indexOf("/live/"));
+        const savedHome = os.homedir();
+        try {
+            Object.defineProperty(os, "homedir", { value: () => realHome, configurable: true });
+            assert.equal(ompPluginLoadedFrom(ompHome), true);
+        } finally {
+            Object.defineProperty(os, "homedir", { value: () => savedHome, configurable: true });
+        }
     } finally {
         fs.rmSync(home, { recursive: true, force: true });
     }

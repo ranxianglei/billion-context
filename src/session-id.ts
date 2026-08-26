@@ -119,6 +119,21 @@ export function preferPromptCacheKeyIdentity<T extends ConversationIdentity>(
 ): T | undefined {
     if (!identity || identity.source !== "content-fingerprint") return identity;
     const pck = typeof body.prompt_cache_key === "string" ? body.prompt_cache_key.trim() : "";
-    if (pck.length === 0) return identity;
+    if (!isPromotableCacheKey(pck)) return identity;
     return { ...identity, value: pck, source: "prompt-cache-key", clientProvided: true };
+}
+
+/** Shape gate for promoting `prompt_cache_key` to the conversation identity.
+ *  The promoted value ends up in TWO header-ish places: the upstream
+ *  `x-session-id` affinity header (undici rejects control chars with
+ *  ERR_INVALID_CHAR — one malformed key would fail EVERY request) and the
+ *  persisted session label. Limit to printable ASCII without spaces, at most
+ *  128 chars. This also blunts the constant-pck foot-gun: a client that pins
+ *  ONE fixed key across different conversations still merges them (that is
+ *  the field's documented cache-affinity semantics), but at least cannot
+ *  smuggle control bytes or unbounded blobs through it. */
+const PROMOTABLE_CACHE_KEY_MAX = 128;
+
+function isPromotableCacheKey(value: string): boolean {
+    return value.length > 0 && value.length <= PROMOTABLE_CACHE_KEY_MAX && /^[\x21-\x7e]+$/.test(value);
 }

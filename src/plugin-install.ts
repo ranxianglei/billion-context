@@ -224,10 +224,28 @@ function ompStatus(): string {
 export function ompPluginLoadedFrom(ompHome: string): boolean {
     try {
         const text = fs.readFileSync(path.join(ompHome, "config.yml"), "utf8");
-        return text.split("\n").some((line) => {
+        // Only entries under the `extensions:` block count. A path-shaped
+        // value anywhere else in the YAML (another key, a comment-heavy
+        // section) must not gate the -e injection — a missed injection loses
+        // /acp entirely, which is the very bug this guard exists to prevent.
+        let inExtensions = false;
+        for (const raw of text.split("\n")) {
+            const line = raw.trimEnd();
+            if (/^extensions:\s*(#.*)?$/.test(line)) {
+                inExtensions = true;
+                continue;
+            }
+            // A new top-level key ends the block.
+            if (inExtensions && /^\S/.test(line)) inExtensions = false;
+            if (!inExtensions) continue;
             const v = ompEntryValue(line);
-            return /[\\/]dist[\\/]agent[\\/]omp\.js$/.test(v) && fs.existsSync(v);
-        });
+            // omp (pi-family) expands `~` in extension paths; match that so a
+            // loadable entry is never mis-classified as stale (which would
+            // double-load the plugin via -e).
+            const expanded = v.startsWith("~") ? path.join(os.homedir(), v.slice(1)) : v;
+            if (/[\\/]dist[\\/]agent[\\/]omp\.js$/.test(expanded) && fs.existsSync(expanded)) return true;
+        }
+        return false;
     } catch {
         return false;
     }
