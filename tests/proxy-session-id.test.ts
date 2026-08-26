@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { deriveSessionId, affinityToken, clientConversationHeader } from "../src/session-id.ts";
+import { deriveSessionId, affinityToken, clientConversationHeader, preferPromptCacheKeyIdentity } from "../src/session-id.ts";
 import { conversationIdentityResponses, conversationSignalResponses } from "acp-kernel/wire";
 
 /** Helper: build a minimal headers object. */
@@ -10,6 +10,68 @@ function hdrs(auth?: string, sessionAffinity?: string): Record<string, string> {
     if (sessionAffinity) h["x-session-affinity"] = sessionAffinity;
     return h;
 }
+
+test("preferPromptCacheKeyIdentity: fingerprint + prompt_cache_key → stable client-provided identity (omp stateless replay)", () => {
+    // omp replays full history with no headers/session_id/previous_response_id:
+    // kernel mints a per-request fingerprint. Two turns (different tails) must
+    // both resolve to the SAME prompt_cache_key identity.
+    const body1 = { input: [{ type: "message", role: "user", content: "hi" }], prompt_cache_key: "01a03971-c498-7000-a904-1c6bb148cccf" };
+    const body2 = { input: [...body1.input, { type: "message", role: "user", content: "and more" }], prompt_cache_key: "01a03971-c498-7000-a904-1c6bb148cccf" };
+    const id1 = preferPromptCacheKeyIdentity(conversationIdentityResponses(body1, undefined), body1);
+    const id2 = preferPromptCacheKeyIdentity(conversationIdentityResponses(body2, undefined), body2);
+    assert.ok(id1 && id2);
+    assert.equal(id1.source, "prompt-cache-key");
+    assert.equal(id1.value, "01a03971-c498-7000-a904-1c6bb148cccf");
+    assert.equal(id1.value, id2.value);
+    assert.equal(id1.clientProvided, true);
+    // without the key the two turns would have diverged (per-request sessions)
+    assert.notEqual(
+        conversationIdentityResponses(body1, undefined).value,
+        conversationIdentityResponses(body2, undefined).value,
+    );
+});
+
+test("preferPromptCacheKeyIdentity: stronger signals win over prompt_cache_key", () => {
+    const pckBody = { input: [], prompt_cache_key: "cache-key-x" };
+    const header = preferPromptCacheKeyIdentity(
+        conversationIdentityResponses(pckBody, "hdr-conv-1"),
+        pckBody,
+    );
+    assert.equal(header!.source, "header");
+    assert.equal(header!.value, "hdr-conv-1");
+    const bodySession = preferPromptCacheKeyIdentity(
+        conversationIdentityResponses({ input: [], session_id: "sess-1", prompt_cache_key: "cache-key-x" }, undefined),
+        { prompt_cache_key: "cache-key-x" },
+    );
+    assert.equal(bodySession!.source, "body-session");
+    const prevResp = preferPromptCacheKeyIdentity(
+        conversationIdentityResponses({ input: [], previous_response_id: "resp_1" }, undefined),
+        { prompt_cache_key: "cache-key-x" },
+    );
+    assert.equal(prevResp!.source, "previous-response");
+});
+
+test("preferPromptCacheKeyIdentity: no/blank/non-string prompt_cache_key keeps fingerprint", () => {
+    for (const body of [{ input: [] }, { input: [], prompt_cache_key: "   " }, { input: [], prompt_cache_key: 42 }]) {
+        const id = preferPromptCacheKeyIdentity(conversationIdentityResponses(body, undefined), body);
+        assert.equal(id!.source, "content-fingerprint");
+        assert.equal(id!.clientProvided, false);
+    }
+    assert.equal(preferPromptCacheKeyIdentity(undefined, { prompt_cache_key: "x" }), undefined);
+});
+
+test("preferPromptCacheKeyIdentity: derived session id stable across growing turns + affinity forwards it", () => {
+    const body1 = { input: [{ type: "message", role: "user", content: "hi" }], prompt_cache_key: "pck-omp-1" };
+    const body2 = { input: [...body1.input, { type: "message", role: "user", content: "turn 2" }], prompt_cache_key: "pck-omp-1" };
+    const h = hdrs("Bearer keyOmp");
+    const id1 = preferPromptCacheKeyIdentity(conversationIdentityResponses(body1, undefined), body1)!;
+    const id2 = preferPromptCacheKeyIdentity(conversationIdentityResponses(body2, undefined), body2)!;
+    assert.equal(
+        deriveSessionId(h, "responses", "http://127.0.0.1:8199", id1.value),
+        deriveSessionId(h, "responses", "http://127.0.0.1:8199", id2.value),
+    );
+    assert.equal(affinityToken(id1), "pck-omp-1");
+});
 
 test("deriveSessionId: same conversation + same key + same protocol + same upstream → stable", () => {
     const a = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "hello world");

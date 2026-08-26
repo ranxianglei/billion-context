@@ -214,6 +214,25 @@ function ompStatus(): string {
     return text.split("\n").some((line) => ompEntryValue(line) === ompExtensionPath()) ? "installed" : "not installed";
 }
 
+/** True when the given omp home's config.yml carries a bili plugin entry
+ *  whose target file still exists on disk. The launcher uses this to decide
+ *  whether `-e dist/agent/omp.js` is needed (omp does NOT ship the plugin):
+ *  a loadable entry means omp already loads it — adding `-e` too would
+ *  double-register the same tools/commands. Entries pointing at stale
+ *  install paths (file gone) don't count: omp fails to load those, so the
+ *  launcher must supply the working plugin itself. */
+export function ompPluginLoadedFrom(ompHome: string): boolean {
+    try {
+        const text = fs.readFileSync(path.join(ompHome, "config.yml"), "utf8");
+        return text.split("\n").some((line) => {
+            const v = ompEntryValue(line);
+            return /[\\/]dist[\\/]agent[\\/]omp\.js$/.test(v) && fs.existsSync(v);
+        });
+    } catch {
+        return false;
+    }
+}
+
 // — claude —————————————————————————————————————————————————————————————
 
 const CLAUDE_EXEC_TIMEOUT_MS = 15000;

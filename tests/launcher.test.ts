@@ -264,7 +264,7 @@ test("findFreePort: returns another port when preferred is occupied", async () =
     }
 });
 
-import { selfPackageRoot } from "../src/plugin-install.js";
+import { selfPackageRoot, ompPluginLoadedFrom } from "../src/plugin-install.js";
 
 test("runLaunch pi: native -e plugin injected only when not installed", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-pie-"));
@@ -372,6 +372,122 @@ test("runLaunch pi: native -e plugin injected only when not installed", async ()
         if (prevPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
         else process.env.PI_CODING_AGENT_DIR = prevPiDir;
         if (stubbed) fs.rmSync(distAgent, { force: true });
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("runLaunch omp: native -e plugin injected only when no loadable config entry", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-ompe-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevClientBin = process.env.BILI_CLIENT_BIN;
+    const prevOmpDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    delete process.env.PI_CODING_AGENT_DIR;
+    const fakeOmp = path.join(home, "fake-omp");
+    fs.writeFileSync(fakeOmp, "");
+    process.env.BILI_CLIENT_BIN = fakeOmp;
+    const ompHome = path.join(home, ".omp", "agent");
+    fs.mkdirSync(ompHome, { recursive: true });
+    fs.writeFileSync(path.join(ompHome, "models.yml"), "providers: {}\n");
+
+    // runLaunch only injects -e when dist/agent/omp.js exists; stub it when
+    // running tests from a checkout without a prior build.
+    const root = selfPackageRoot();
+    const distAgent = path.join(root, "dist", "agent", "omp.js");
+    const stubbed = !fs.existsSync(distAgent);
+    if (stubbed) {
+        fs.mkdirSync(path.dirname(distAgent), { recursive: true });
+        fs.writeFileSync(distAgent, "");
+    }
+
+    const clientArgsSeen: string[][] = [];
+    const spawnImpl: SpawnFn = (cmd, args) => {
+        if (cmd === fakeOmp) {
+            clientArgsSeen.push([...args]);
+            const child = makeFakeChild(0);
+            const orig = child.on.bind(child);
+            (child as { on: SpawnChild["on"] }).on = (event, listener) => {
+                orig(event, listener);
+                if (event === "exit") setTimeout(() => listener(0, null), 0);
+                return child;
+            };
+            return child;
+        }
+        return makeFakeChild(42422);
+    };
+    const fetchImpl = async () => ({ ok: true });
+
+    const prevExit = process.exit;
+    const exitCalls: number[] = [];
+    process.exit = ((code?: number) => {
+        exitCalls.push(code ?? 0);
+        return undefined as never;
+    }) as typeof process.exit;
+
+    try {
+        // no config.yml at all → -e injected
+        await runLaunch(
+            { client: "omp", clientArgs: [], overrides: {} },
+            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(clientArgsSeen.length, 1);
+        assert.deepEqual(clientArgsSeen[0].slice(0, 2), ["-e", distAgent]);
+
+        // loadable entry (existing file) → omp loads it from config; no -e
+        const otherInstall = path.join(home, "other-install", "dist", "agent", "omp.js");
+        fs.mkdirSync(path.dirname(otherInstall), { recursive: true });
+        fs.writeFileSync(otherInstall, "");
+        fs.writeFileSync(path.join(ompHome, "config.yml"), `extensions:\n  - ${otherInstall}\n`);
+        clientArgsSeen.length = 0;
+        await runLaunch(
+            { client: "omp", clientArgs: [], overrides: {} },
+            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(clientArgsSeen.length, 1);
+        assert.ok(!clientArgsSeen[0].includes("-e"));
+
+        // stale entry (file gone) → omp would fail to load it; -e injected again
+        fs.rmSync(path.dirname(otherInstall), { recursive: true, force: true });
+        clientArgsSeen.length = 0;
+        await runLaunch(
+            { client: "omp", clientArgs: [], overrides: {} },
+            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(clientArgsSeen.length, 1);
+        assert.deepEqual(clientArgsSeen[0].slice(0, 2), ["-e", distAgent]);
+        assert.deepEqual(exitCalls, [0, 0, 0]);
+    } finally {
+        process.exit = prevExit;
+        process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        if (prevClientBin === undefined) delete process.env.BILI_CLIENT_BIN;
+        else process.env.BILI_CLIENT_BIN = prevClientBin;
+        if (prevOmpDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+        else process.env.PI_CODING_AGENT_DIR = prevOmpDir;
+        if (stubbed) fs.rmSync(distAgent, { force: true });
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("ompPluginLoadedFrom: only entries whose file exists count as loaded", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-ompl-"));
+    try {
+        const ompHome = path.join(home, ".omp", "agent");
+        fs.mkdirSync(ompHome, { recursive: true });
+        assert.equal(ompPluginLoadedFrom(ompHome), false); // no config.yml
+        const live = path.join(home, "live", "dist", "agent", "omp.js");
+        fs.mkdirSync(path.dirname(live), { recursive: true });
+        fs.writeFileSync(live, "");
+        fs.writeFileSync(path.join(ompHome, "config.yml"), `# omp config\nextensions:\n  - ${live} # bili\nmodelRoles:\n  default: x\n`);
+        assert.equal(ompPluginLoadedFrom(ompHome), true); // comments/inline tolerated
+        fs.writeFileSync(path.join(ompHome, "config.yml"), "extensions:\n  - /gone/dist/agent/omp.js\n");
+        assert.equal(ompPluginLoadedFrom(ompHome), false); // stale target
+        fs.writeFileSync(path.join(ompHome, "config.yml"), "extensions:\n  - /some/other/plugin.js\n");
+        assert.equal(ompPluginLoadedFrom(ompHome), false); // foreign plugin
+    } finally {
         fs.rmSync(home, { recursive: true, force: true });
     }
 });
