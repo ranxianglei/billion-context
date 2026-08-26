@@ -69,7 +69,12 @@ export function dropWhitespaceResponsesMessages(input: unknown): number {
             let joined = "";
             for (const part of content) {
                 const p = part as Record<string, unknown>;
-                if (p === null || typeof p !== "object") continue;
+                // Malformed parts (non-objects) make emptiness unknowable —
+                // treat as mixed and preserve the item.
+                if (p === null || typeof p !== "object") {
+                    mixed = true;
+                    break;
+                }
                 const pt = p.type;
                 if (pt !== undefined && pt !== "input_text" && pt !== "output_text" && pt !== "text") {
                     mixed = true;

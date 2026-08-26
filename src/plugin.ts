@@ -661,6 +661,12 @@ export async function pipePluginResponsesWithStrip(
             }
             if (res.destroyed || res.writableEnded) break;
         }
+        // Stream cut without a done-family event: flush whatever the tag
+        // filter still holds so prose is never silently lost.
+        if (!res.destroyed && !res.writableEnded) {
+            const rest = flushTail("");
+            if (rest.length > 0) await write(rest);
+        }
         if (acc.inputTokens !== undefined || acc.outputTokens !== undefined || acc.cachedTokens !== undefined) {
             applyUsageSample(session, acc, "responses");
             markDirty(session);
@@ -674,13 +680,19 @@ export async function pipePluginResponsesWithStrip(
 function rebuildEvent(rawEvent: string, ev: Record<string, unknown>): string {
     const lines = rawEvent.split("\n");
     let replaced = false;
-    const out = lines.map((l) => {
-        if (!replaced && l.startsWith("data:")) {
+    const out: string[] = [];
+    for (const l of lines) {
+        if (l.startsWith("data:")) {
+            // Multi-line data payloads (never emitted by real upstreams, but
+            // tolerated by the parser) collapse into the single rebuilt line —
+            // leaving the extra data lines would fuse two JSON payloads.
+            if (replaced) continue;
             replaced = true;
-            return `data: ${JSON.stringify(ev)}`;
+            out.push(`data: ${JSON.stringify(ev)}`);
+            continue;
         }
-        return l;
-    });
+        out.push(l);
+    }
     return replaced ? out.join("\n") + "\n\n" : `data: ${JSON.stringify(ev)}\n\n`;
 }
 
@@ -717,6 +729,18 @@ export async function pipePluginJson(
             }
         }
     } catch { /* non-JSON body — forward verbatim */ }
+    if (protocol === "responses") {
+        // #206 parity for the non-streaming plugin path: the compress loop's
+        // JSON branch strips render tags from every round (compressLoopResponsesJson);
+        // a verbatim plugin JSON response would re-feed the model's tag echoes.
+        try {
+            const json = JSON.parse(text) as Record<string, unknown>;
+            if (containsRenderTagText(text)) {
+                res.end(Buffer.from(JSON.stringify(stripResponsesText(json)), "utf8"));
+                return;
+            }
+        } catch { /* fall through to verbatim */ }
+    }
     res.end(text);
 }
 
