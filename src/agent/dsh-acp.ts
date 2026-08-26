@@ -29,12 +29,12 @@ async function statusOutcome(): Promise<CommandOutcome> {
             text: "bili: no proxy detected — launch dsh through `bili dsh` so /acp can read context status.",
         };
     }
-    const status = await fetchStatusLatest(base);
+    const status = await fetchStatusLatest(base).catch(() => undefined);
     const panel = status?.panel;
     if (status && typeof panel === "string" && panel.length > 0) {
         return { kind: "success", text: panel };
     }
-    const version = await fetchProxyVersion(base);
+    const version = await fetchProxyVersion(base).catch(() => undefined);
     if (version) {
         return {
             kind: "success",

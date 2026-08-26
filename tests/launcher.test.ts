@@ -1448,6 +1448,26 @@ test("runLaunch dsh: DSH_HOME overlay + DEEPSEEK_BASE_URL env, real home untouch
         assert.ok(/- name: file:\/\/\/.*dsh-acp\.js\n/.test(patchTxt));
         assert.deepEqual(argsSeen[0], ["--patch", patchFile, "--profile", "headless", "task"]);
         fs.rmSync(overlay, { recursive: true, force: true });
+
+        // Second launch with a shell-exported DEEPSEEK_BASE_URL: the user's
+        // relay is wrapped, NOT silently redirected to api.deepseek.com.
+        process.env.DEEPSEEK_BASE_URL = "https://my-relay.example/v1";
+        envSeen.length = 0;
+        await runLaunch(
+            { client: "dsh", clientArgs: [], overrides: {} },
+            { fetchImpl: async () => ({ ok: true }), spawnImpl, sleep: () => Promise.resolve() },
+        );
+        const origin2 = envSeen[0].BILLION_CONTEXT_PROXY;
+        assert.equal(envSeen[0].DEEPSEEK_BASE_URL, `${origin2}/bili/https://my-relay.example/v1`);
+        // Already-wrapped values stay idempotent (no double wrap).
+        process.env.DEEPSEEK_BASE_URL = `${origin2}/bili/https://my-relay.example/v1`;
+        envSeen.length = 0;
+        await runLaunch(
+            { client: "dsh", clientArgs: [], overrides: {} },
+            { fetchImpl: async () => ({ ok: true }), spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(envSeen[0].DEEPSEEK_BASE_URL, `${envSeen[0].BILLION_CONTEXT_PROXY}/bili/https://my-relay.example/v1`);
+        delete process.env.DEEPSEEK_BASE_URL;
     } finally {
         process.exit = prevExit;
         if (prevBin === undefined) delete process.env.BILI_CLIENT_BIN;

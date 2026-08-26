@@ -501,7 +501,12 @@ function refreshOverlayHome(realHome: string, overlay: string, generatedFile: st
         for (const entry of fs.readdirSync(overlay)) {
             if (entry === generatedFile) continue;
             const overlayPath = path.join(overlay, entry);
-            if (entry.startsWith(`.${generatedFile}.`) && entry.endsWith(".tmp")) {
+            // Stale atomic-write drafts (`.file.pid.tmp`) are dropped. Beyond
+            // this refresh's own generatedFile that includes the dsh /acp
+            // patch (written next to it in the same overlay dir).
+            const staleDraft =
+                (entry.startsWith(`.${generatedFile}.`) || entry.startsWith("..bili-acp.patch.yml.")) && entry.endsWith(".tmp");
+            if (staleDraft) {
                 try {
                     fs.unlinkSync(overlayPath);
                 } catch {}
@@ -641,15 +646,17 @@ function piPluginInstalled(piHome: string): boolean {
     }
 }
 
-function writeOverlayFileAtomic(overlay: string, fileName: string, contents: string): void {
+function writeOverlayFileAtomic(overlay: string, fileName: string, contents: string): boolean {
     const draft = path.join(overlay, `.${fileName}.${process.pid}.tmp`);
     try {
         fs.writeFileSync(draft, contents);
         fs.renameSync(draft, path.join(overlay, fileName));
+        return true;
     } catch {
         try {
             fs.rmSync(draft, { force: true });
         } catch {}
+        return false;
     }
 }
 
@@ -851,14 +858,23 @@ export function prepareDshHome(
  *  (pure built-in deepseek route). Returns the patch file path (undefined
  *  when it could not be written — dsh then just boots without /acp). */
 export function writeDshAcpPatch(dshHome: string): string | undefined {
-    const pluginUrl = pathToFileURL(selfDistFile("agent/dsh-acp.js")).href;
+    const pluginFile = selfDistFile("agent/dsh-acp.js");
+    // Mirror the pi branch's guard: writing a patch that points at a missing
+    // file makes dsh's loader fail at boot (worse than no /acp at all).
+    try {
+        if (!fs.existsSync(pluginFile)) return undefined;
+    } catch {
+        return undefined;
+    }
+    const pluginUrl = pathToFileURL(pluginFile).href;
     const dir = `${dshHome}-bili`;
     try {
         fs.mkdirSync(dir, { recursive: true });
     } catch {
         return undefined;
     }
-    writeOverlayFileAtomic(dir, ".bili-acp.patch.yml", `- insert:\n    - name: ${pluginUrl}\n`);
+    const wrote = writeOverlayFileAtomic(dir, ".bili-acp.patch.yml", `- insert:\n    - name: ${pluginUrl}\n`);
+    if (!wrote) return undefined;
     const file = path.join(dir, ".bili-acp.patch.yml");
     try {
         return fs.existsSync(file) ? file : undefined;
@@ -1256,7 +1272,18 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // (~/.dsh-bili); credentials/profiles/sessions stay shared through
         // symlinks and the real ~/.dsh is never touched.
         env = { ...process.env, BILLION_CONTEXT_PROXY: origin };
-        env.DEEPSEEK_BASE_URL = wrapUpstream(origin, "https://api.deepseek.com");
+        // A shell-exported DEEPSEEK_BASE_URL is the user's real upstream (a
+        // relay, a mirror) — wrap THAT, not a silent redirect to
+        // api.deepseek.com (which would break the relay's auth). Same policy
+        // as the claude launcher honoring ANTHROPIC_BASE_URL. unwrapUpstream
+        // keeps a re-launch idempotent (no /bili/ double-wrap); dsh's chain
+        // is settings baseURL ?? env ?? default, so a rewritten user setting
+        // above still wins when present.
+        const userDeepseekBase =
+            typeof process.env.DEEPSEEK_BASE_URL === "string" && process.env.DEEPSEEK_BASE_URL.trim().length > 0
+                ? unwrapUpstream(process.env.DEEPSEEK_BASE_URL.trim())
+                : "https://api.deepseek.com";
+        env.DEEPSEEK_BASE_URL = wrapUpstream(origin, userDeepseekBase);
         const dshHomeDir = resolveDshHome(process.env);
         dshOverlayHome = prepareDshHome(dshHomeDir, origin, routes.httpRewrites);
         if (dshOverlayHome) {
@@ -1273,7 +1300,11 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // Native /acp command rides a --patch overlay (independent of the
         // settings rewrite above), so it exists on every profile dsh boots.
         const dshAcpPatch = writeDshAcpPatch(dshHomeDir);
-        if (dshAcpPatch) clientArgs = dshArgsWithPatch(clientArgs, dshAcpPatch);
+        if (dshAcpPatch) {
+            clientArgs = dshArgsWithPatch(clientArgs, dshAcpPatch);
+        } else {
+            console.error("bili: could not write the dsh /acp patch — dsh will start without the /acp command.");
+        }
     } else if (base === "codex") {
         // Per-spawn conversation id for the MCP shell's headless
         // self-registration (codex provides no session id of its own).

@@ -71,13 +71,47 @@ test("dsh-acp /acp: 404 status + live manifest → armed-but-idle info", async (
     assert.match(out.text, /billion-context@9\.9\.9 — proxy connected, compression armed/);
 });
 
-test("dsh-acp /acp: unreachable proxy → error outcome", async () => {
+test("dsh-acp /acp: unreachable proxy (HTTP-level) → error outcome", async () => {
     const out = await runHandler(
         { BILLION_CONTEXT_PROXY: "http://127.0.0.1:8787", BILLION_CONTEXT_PLUGIN: undefined },
         {},
     );
     assert.equal(out.kind, "error");
     assert.match(out.text, /proxy not reachable at http:\/\/127\.0\.0\.1:8787/);
+});
+
+test("dsh-acp /acp: network-level fetch failure (ECONNREFUSED) → error outcome, no unhandled rejection", async () => {
+    const prev = { ...process.env } as Record<string, string | undefined>;
+    const prevFetch = globalThis.fetch;
+    process.env.BILLION_CONTEXT_PROXY = "http://127.0.0.1:8787";
+    delete process.env.BILLION_CONTEXT_PLUGIN;
+    let handler: (() => Promise<Outcome>) | undefined;
+    const ctx = {
+        commands: {
+            register: (cmd: { name: string; handler: () => Promise<Outcome> }) => {
+                handler = cmd.handler;
+            },
+        },
+    };
+    apply(ctx as never);
+    assert.ok(handler, "handler registered");
+    // fetchJson RETHROWS network errors (only HTTP-level failures soft-fail
+    // to undefined) — the handler must absorb them (review M2).
+    globalThis.fetch = (async () => {
+        throw new TypeError("fetch failed");
+    }) as typeof fetch;
+    try {
+        const out = await handler();
+        assert.equal(out.kind, "error");
+        assert.match(out.text, /proxy not reachable/);
+    } finally {
+        globalThis.fetch = prevFetch;
+        for (const k of Object.keys(prev)) {
+            const v = prev[k];
+            if (v === undefined) delete process.env[k];
+            else process.env[k] = v;
+        }
+    }
 });
 
 test("dsh-acp /acp: no BILLION_CONTEXT_PROXY env → launch hint", async () => {
