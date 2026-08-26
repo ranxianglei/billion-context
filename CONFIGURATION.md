@@ -375,6 +375,7 @@ Full command surface (`bili --help` prints an abridged version). Precedence ever
 | `bili omp [opts --] [args]` | Proxy + **omp** (pi-based) |
 | `bili opencode [opts --] [args]` | Proxy + **opencode** |
 | `bili hermes [opts --] [args]` | Proxy + **hermes-agent** (`/bili/` rewrite) |
+| `bili dsh [opts --] [args]` | Proxy + **deepseek-harness** (`/bili/` rewrite; args like `--profile web "task"` pass through) |
 | `bili test pi` | Non-polluting end-to-end smoke test of the pi path |
 | `bili export [session] [--full] [--output FILE]` | List persisted sessions / export one as a Markdown handoff — see [Sessions & Migration](#sessions--migration) |
 | `bili update` | Check for & install a newer version now (bypasses the 3-minute throttle) |
@@ -510,6 +511,7 @@ How each client is pointed at the proxy (set automatically in the child env):
 | claude | `ANTHROPIC_BASE_URL` = `/bili/` URL | none needed |
 | opencode | `HTTPS_PROXY` + isolated `OPENCODE_CONFIG` | `NODE_EXTRA_CA_CERTS` |
 | hermes | isolated `HERMES_HOME`; **all** upstreams `/bili/` | none (certifi ignores `SSL_CERT_FILE`) |
+| dsh | isolated `DSH_HOME` + `DEEPSEEK_BASE_URL`; **all** upstreams `/bili/` | none (plain fetch, no proxy/CA knobs) |
 
 `NODE_EXTRA_CA_CERTS` *appends* to the built-in trust store, so it points at the MITM root alone (`root-ca.pem`). `SSL_CERT_FILE` *replaces* the default CA bundle, so for codex it points at `combined-ca.pem` — a bundle containing the MITM root **plus** the system/Node public roots — keeping pip/git/curl style TLS (blind-tunnelled, real certificates) working inside the child env (#152).
 
@@ -525,6 +527,7 @@ Where upstreams are discovered from (read-only):
 | Claude Code | `ANTHROPIC_BASE_URL` env var, else hardcoded `api.anthropic.com` |
 | OpenCode | `~/.config/opencode/opencode.json` — each provider's `baseURL` |
 | hermes | `~/.hermes/config.yaml` — each provider's endpoint lines |
+| dsh | `~/.dsh/settings.yaml` — every `baseURL`/`baseUrl`/`base_url` value; plus the built-in `deepseek-official` route via `$DEEPSEEK_BASE_URL` |
 
 ### Isolated temp config (what gets written)
 
@@ -533,14 +536,16 @@ The `/bili/` rewrite modes write a **temp copy** — the real config is never ed
 - **pi / omp** — an isolated `PI_CODING_AGENT_DIR` (under `/tmp`) containing only a rewritten `models.json` / `models.yml` with the `/bili/`-wrapped plaintext baseUrls. Everything else (`settings.json`, `sessions/`, `auth.json`, extensions…) is **symlinked** to the real pi/omp home, so sessions and logins are shared: a conversation started under the launcher continues seamlessly in a bare client, and vice versa.
 - **opencode** — a temp `opencode.json` pointed at by `OPENCODE_CONFIG`, with `/bili/`-rewritten baseURLs **plus the thin `/acp` plugin appended** (native tools out of the box; the standalone `opencode-acp` plugin self-disables via `BILLION_CONTEXT_PROXY`).
 - **hermes** — an isolated `HERMES_HOME` with a rewritten `config.yaml` routing **every** upstream (HTTP and HTTPS) through `/bili/` (httpx builds its own CA bundle and ignores `SSL_CERT_FILE`, so cert MITM is impossible). `skills/`, `memories/`, `sessions/` are symlinked through. If no providers are configured — or `config.yaml` can't be rewritten — the launcher prints a warning and hermes runs **unproxied** (compression off).
+- **dsh** — an isolated `DSH_HOME` (persistent overlay `~/.dsh-bili`) with a rewritten `settings.yaml` routing every configured upstream through `/bili/` (plain `fetch`, no proxy/CA knobs, so cert MITM is impossible). `profiles/`, credentials and sessions are symlinked through. The built-in `deepseek-official` route is captured separately via `$DEEPSEEK_BASE_URL` (dsh resolves `settings llm-deepseek.baseURL` ?? env ?? default, so a rewritten user setting wins and the env is the zero-config fallback) — with no custom providers the deepseek route is still proxied out of the box.
 
 ### Native tools in the launcher
 
 - **pi** — if the plugin is NOT installed, the launcher rides pi's `-e <file>` flag to load `dist/agent/pi.js` for that run only (nothing is written): native tools + the `/acp` command out of the box. If it IS installed, the symlinked `settings.json` already loads it — no `-e` is added.
-- **omp** — ships with the plugin built in; nothing to do.
+- **omp** — does NOT ship the plugin; the launcher auto-injects `-e dist/agent/omp.js` when the config carries no loadable bili entry (same zero-config ride as pi). omp excludes extension tools from its model-facing surface and sends no `before_provider_headers`, so the model keeps wire-injected tools; the injected plugin's value is the native `/acp` command.
 - **opencode** — the temp config appends the thin plugin automatically.
 - **claude / codex** — opt-in via `BILI_LAUNCHER_PLUGIN=1`: the launcher additionally injects a single `bili` MCP server (`--mcp-config` for claude, `-c mcp_servers.bili.*` for codex — both ephemeral, nothing written to host config). The default stays wire mode while host-flag compatibility soaks (verified with claude 2.1.227 / codex 0.147.0). `BILI_LAUNCHER_PLUGIN=0` forces plain wire mode.
 - **hermes** — no plugin API; always wire mode.
+- **dsh** — the launcher always splices a `--patch <file>` flag into dsh's argv (written to `~/.dsh-bili/.bili-acp.patch.yml`), inserting `dist/agent/dsh-acp.js` into the profile's loader tree: the native `/acp` command, same shape as dsh's own `/compact`. Works on every profile that composes the commands service (web/tui interactive surfaces; the `headless` one-shot driver sends its task straight to the model and parses no commands — `/compact` behaves the same there). Subcommand forms are handled: `dsh web` gets the flag after `web`, `dsh plugin`/`--dump-default-config` take none.
 
 Launcher-mode matrix:
 
@@ -587,7 +592,7 @@ The installed plugin is a **thin** one (~5 KB, zero runtime deps): it detects th
 
 Kill switch: `BILLION_CONTEXT_PLUGIN=0` disables plugin mode entirely (wire-level injection resumes).
 
-**When do you need `plugin install` at all?** Launcher users mostly don't (see [Launcher Reference](#launcher-reference) — pi gets `-e`, opencode auto-injects, omp ships with it, claude/codex opt in via `BILI_LAUNCHER_PLUGIN=1`, hermes is wire-only). It's for a manually-configured client (`/bili/` prefix or MITM) where you want the native panel: pi/omp/opencode get native tools + `/acp`; claude/codex get native MCP tools (no `/acp`); hermes can't (wire only). Without any plugin everything still works — compression runs via wire-injected tools, and the model can be asked to call `acp_status` to check live usage.
+**When do you need `plugin install` at all?** Launcher users mostly don't (see [Launcher Reference](#launcher-reference) — pi/omp get `-e` auto-injected, opencode auto-injects, claude/codex opt in via `BILI_LAUNCHER_PLUGIN=1`, dsh gets the native `/acp` command via `--patch`, hermes is wire-only). It's for a manually-configured client (`/bili/` prefix or MITM) where you want the native panel: pi/omp/opencode get native tools + `/acp` (on omp the fork hides extension tools from the model — the plugin's value there is the `/acp` command); claude/codex get native MCP tools (no `/acp`); dsh gets `/acp` through the launcher's `--patch` (a manually-configured dsh can add the same patch itself); hermes can't (wire only). Without any plugin everything still works — compression runs via wire-injected tools, and the model can be asked to call `acp_status` to check live usage.
 
 ---
 

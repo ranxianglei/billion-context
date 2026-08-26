@@ -36,6 +36,12 @@ import {
     readHermesConfig,
     resolveHermesHome,
     prepareHermesHome,
+    parseDshSettingsYaml,
+    readDshConfig,
+    resolveDshHome,
+    prepareDshHome,
+    writeDshAcpPatch,
+    dshArgsWithPatch,
     readOpencodeConfig,
     resolveOpencodeConfigFile,
     findFreePort,
@@ -55,6 +61,7 @@ test("isLaunchClient: pi/claude/codex/omp/opencode/pi-test true, others false", 
     assert.equal(isLaunchClient("omp"), true);
     assert.equal(isLaunchClient("opencode"), true);
     assert.equal(isLaunchClient("hermes"), true);
+    assert.equal(isLaunchClient("dsh"), true);
     assert.equal(isLaunchClient("pi-test"), true);
     assert.equal(isLaunchClient("start"), false);
     assert.equal(isLaunchClient(""), false);
@@ -257,7 +264,7 @@ test("findFreePort: returns another port when preferred is occupied", async () =
     }
 });
 
-import { selfPackageRoot } from "../src/plugin-install.js";
+import { selfPackageRoot, ompPluginLoadedFrom } from "../src/plugin-install.js";
 
 test("runLaunch pi: native -e plugin injected only when not installed", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-pie-"));
@@ -365,6 +372,122 @@ test("runLaunch pi: native -e plugin injected only when not installed", async ()
         if (prevPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
         else process.env.PI_CODING_AGENT_DIR = prevPiDir;
         if (stubbed) fs.rmSync(distAgent, { force: true });
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("runLaunch omp: native -e plugin injected only when no loadable config entry", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-ompe-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevClientBin = process.env.BILI_CLIENT_BIN;
+    const prevOmpDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    delete process.env.PI_CODING_AGENT_DIR;
+    const fakeOmp = path.join(home, "fake-omp");
+    fs.writeFileSync(fakeOmp, "");
+    process.env.BILI_CLIENT_BIN = fakeOmp;
+    const ompHome = path.join(home, ".omp", "agent");
+    fs.mkdirSync(ompHome, { recursive: true });
+    fs.writeFileSync(path.join(ompHome, "models.yml"), "providers: {}\n");
+
+    // runLaunch only injects -e when dist/agent/omp.js exists; stub it when
+    // running tests from a checkout without a prior build.
+    const root = selfPackageRoot();
+    const distAgent = path.join(root, "dist", "agent", "omp.js");
+    const stubbed = !fs.existsSync(distAgent);
+    if (stubbed) {
+        fs.mkdirSync(path.dirname(distAgent), { recursive: true });
+        fs.writeFileSync(distAgent, "");
+    }
+
+    const clientArgsSeen: string[][] = [];
+    const spawnImpl: SpawnFn = (cmd, args) => {
+        if (cmd === fakeOmp) {
+            clientArgsSeen.push([...args]);
+            const child = makeFakeChild(0);
+            const orig = child.on.bind(child);
+            (child as { on: SpawnChild["on"] }).on = (event, listener) => {
+                orig(event, listener);
+                if (event === "exit") setTimeout(() => listener(0, null), 0);
+                return child;
+            };
+            return child;
+        }
+        return makeFakeChild(42422);
+    };
+    const fetchImpl = async () => ({ ok: true });
+
+    const prevExit = process.exit;
+    const exitCalls: number[] = [];
+    process.exit = ((code?: number) => {
+        exitCalls.push(code ?? 0);
+        return undefined as never;
+    }) as typeof process.exit;
+
+    try {
+        // no config.yml at all → -e injected
+        await runLaunch(
+            { client: "omp", clientArgs: [], overrides: {} },
+            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(clientArgsSeen.length, 1);
+        assert.deepEqual(clientArgsSeen[0].slice(0, 2), ["-e", distAgent]);
+
+        // loadable entry (existing file) → omp loads it from config; no -e
+        const otherInstall = path.join(home, "other-install", "dist", "agent", "omp.js");
+        fs.mkdirSync(path.dirname(otherInstall), { recursive: true });
+        fs.writeFileSync(otherInstall, "");
+        fs.writeFileSync(path.join(ompHome, "config.yml"), `extensions:\n  - ${otherInstall}\n`);
+        clientArgsSeen.length = 0;
+        await runLaunch(
+            { client: "omp", clientArgs: [], overrides: {} },
+            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(clientArgsSeen.length, 1);
+        assert.ok(!clientArgsSeen[0].includes("-e"));
+
+        // stale entry (file gone) → omp would fail to load it; -e injected again
+        fs.rmSync(path.dirname(otherInstall), { recursive: true, force: true });
+        clientArgsSeen.length = 0;
+        await runLaunch(
+            { client: "omp", clientArgs: [], overrides: {} },
+            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(clientArgsSeen.length, 1);
+        assert.deepEqual(clientArgsSeen[0].slice(0, 2), ["-e", distAgent]);
+        assert.deepEqual(exitCalls, [0, 0, 0]);
+    } finally {
+        process.exit = prevExit;
+        process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        if (prevClientBin === undefined) delete process.env.BILI_CLIENT_BIN;
+        else process.env.BILI_CLIENT_BIN = prevClientBin;
+        if (prevOmpDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+        else process.env.PI_CODING_AGENT_DIR = prevOmpDir;
+        if (stubbed) fs.rmSync(distAgent, { force: true });
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("ompPluginLoadedFrom: only entries whose file exists count as loaded", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-ompl-"));
+    try {
+        const ompHome = path.join(home, ".omp", "agent");
+        fs.mkdirSync(ompHome, { recursive: true });
+        assert.equal(ompPluginLoadedFrom(ompHome), false); // no config.yml
+        const live = path.join(home, "live", "dist", "agent", "omp.js");
+        fs.mkdirSync(path.dirname(live), { recursive: true });
+        fs.writeFileSync(live, "");
+        fs.writeFileSync(path.join(ompHome, "config.yml"), `# omp config\nextensions:\n  - ${live} # bili\nmodelRoles:\n  default: x\n`);
+        assert.equal(ompPluginLoadedFrom(ompHome), true); // comments/inline tolerated
+        fs.writeFileSync(path.join(ompHome, "config.yml"), "extensions:\n  - /gone/dist/agent/omp.js\n");
+        assert.equal(ompPluginLoadedFrom(ompHome), false); // stale target
+        fs.writeFileSync(path.join(ompHome, "config.yml"), "extensions:\n  - /some/other/plugin.js\n");
+        assert.equal(ompPluginLoadedFrom(ompHome), false); // foreign plugin
+    } finally {
         fs.rmSync(home, { recursive: true, force: true });
     }
 });
@@ -1210,5 +1333,243 @@ test("prepareHermesHome: returns undefined for unreadable config even with rewri
         assert.equal(prepareHermesHome(dir, "http://127.0.0.1:8787", rewrites), undefined);
     } finally {
         fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("readDshConfig + resolveDshHome + parseDshSettingsYaml", () => {
+    assert.equal(resolveDshHome({ DSH_HOME: "/tmp/dd" }), "/tmp/dd");
+    assert.ok(resolveDshHome({}).endsWith(path.join(".dsh")));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-cfg-"));
+    try {
+        assert.deepEqual(readDshConfig(path.join(dir, "nope")).baseUrls, []);
+        fs.writeFileSync(
+            path.join(dir, "settings.yaml"),
+            [
+                "llm-pi-ai:",
+                "  providers:",
+                "    anthropic:",
+                "      baseURL: https://api.anthropic.com",
+                "    sglang:",
+                "      baseURL: http://127.0.0.1:8199/v1",
+                "llm-deepseek:",
+                "  baseURL: https://relay.example.com",
+                "other:",
+                "  base_url: http://10.0.0.5:1234/v1",
+                "  noturl: notaurl",
+            ].join("\n"),
+        );
+        const cfg = readDshConfig(dir);
+        assert.deepEqual(cfg.baseUrls, [
+            "https://api.anthropic.com",
+            "http://127.0.0.1:8199/v1",
+            "https://relay.example.com",
+            "http://10.0.0.5:1234/v1",
+        ]);
+        assert.deepEqual(parseDshSettingsYaml('x:\n  baseURL: \'"notaurl\"\'\n'), []);
+        assert.deepEqual(parseDshSettingsYaml('x:\n  baseURL: "https://api.quoted.io/v1"\n'), ["https://api.quoted.io/v1"]);
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("discoverRoutes: dsh wraps every settings.yaml endpoint via /bili/", () => {
+    const config: ClientConfig = {};
+    (config as Record<string, unknown>).dsh = {
+        baseUrls: [
+            "http://127.0.0.1:8199/v1",
+            "https://open.bigmodel.cn/api/paas/v4",
+            "http://127.0.0.1:8787/bili/https://api.foo.io/v1",
+            "http://127.0.0.1:8199/v1",
+            "::::",
+        ],
+    };
+    const routes = discoverRoutes("dsh", config);
+    assert.deepEqual(routes.httpsDomains, []);
+    assert.deepEqual(routes.httpRewrites.map((r) => r.realUpstream).sort(), [
+        "http://127.0.0.1:8199/v1",
+        "https://api.foo.io/v1",
+        "https://open.bigmodel.cn/api/paas/v4",
+    ]);
+});
+
+test("prepareDshHome: rewrites baseURL lines, shares siblings, never touches the real home", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-home-"));
+    try {
+        fs.writeFileSync(
+            path.join(dir, "settings.yaml"),
+            [
+                "llm-pi-ai:",
+                "  providers:",
+                "    anthropic:",
+                "      baseURL: https://api.anthropic.com  # official",
+                "    sglang:",
+                "      baseURL: http://127.0.0.1:8199/v1",
+                "llm-deepseek:",
+                "  baseURL: https://relay.example.com",
+                "unrelated: true",
+            ].join("\n"),
+        );
+        fs.writeFileSync(path.join(dir, ".credentials.yaml"), "DEEPSEEK_API_KEY: sk-x");
+        fs.mkdirSync(path.join(dir, "profiles"));
+        const original = fs.readFileSync(path.join(dir, "settings.yaml"), "utf8");
+
+        const rewrites: HttpRewrite[] = [
+            { key: "dsh-1", realUpstream: "https://api.anthropic.com" },
+            { key: "dsh-2", realUpstream: "http://127.0.0.1:8199/v1" },
+            { key: "dsh-3", realUpstream: "https://relay.example.com" },
+        ];
+        const overlay = prepareDshHome(dir, "http://127.0.0.1:8787", rewrites);
+        assert.ok(overlay);
+        const txt = fs.readFileSync(path.join(overlay, "settings.yaml"), "utf8");
+        assert.ok(txt.includes("baseURL: http://127.0.0.1:8787/bili/https://api.anthropic.com  # official"));
+        assert.ok(txt.includes("baseURL: http://127.0.0.1:8787/bili/http://127.0.0.1:8199/v1"));
+        assert.ok(txt.includes("baseURL: http://127.0.0.1:8787/bili/https://relay.example.com"));
+        assert.ok(txt.includes("unrelated: true"));
+        assert.equal(fs.readFileSync(path.join(dir, "settings.yaml"), "utf8"), original);
+        assert.equal(fs.readFileSync(path.join(overlay, ".credentials.yaml"), "utf8"), "DEEPSEEK_API_KEY: sk-x");
+        assert.ok(fs.lstatSync(path.join(overlay, "profiles")).isSymbolicLink());
+        fs.rmSync(overlay, { recursive: true, force: true });
+
+        assert.equal(prepareDshHome(dir, "http://127.0.0.1:8787", []), undefined);
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("prepareDshHome: preserves CRLF line endings when rewriting", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-home-"));
+    try {
+        fs.writeFileSync(
+            path.join(dir, "settings.yaml"),
+            ["llm-pi-ai:", "  providers:", "    x:", "      baseURL: http://127.0.0.1:8199/v1"].join("\r\n") + "\r\n",
+        );
+        const rewrites: HttpRewrite[] = [{ key: "dsh-1", realUpstream: "http://127.0.0.1:8199/v1" }];
+        const overlay = prepareDshHome(dir, "http://127.0.0.1:8787", rewrites);
+        assert.ok(overlay);
+        const txt = fs.readFileSync(path.join(overlay, "settings.yaml"), "utf8");
+        assert.ok(txt.includes("\r\n"), "CRLF preserved");
+        assert.ok(!/\r\n\r\n/.test(txt), "no doubled newlines");
+        assert.ok(txt.includes("baseURL: http://127.0.0.1:8787/bili/http://127.0.0.1:8199/v1\r"));
+        fs.rmSync(overlay, { recursive: true, force: true });
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("writeDshAcpPatch: writes insert overlay with file:// plugin URL into <home>-bili", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-patch-"));
+    try {
+        const file = writeDshAcpPatch(dir);
+        assert.ok(file);
+        assert.equal(file, path.join(`${dir}-bili`, ".bili-acp.patch.yml"));
+        const txt = fs.readFileSync(file, "utf8");
+        assert.ok(txt.startsWith("- insert:\n"));
+        assert.match(txt, /^ {4}- name: file:\/\/.+dsh-acp\.js\n$/m);
+        fs.rmSync(`${dir}-bili`, { recursive: true, force: true });
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("dshArgsWithPatch: splices --patch by dsh argv shape", () => {
+    const patch = "/tmp/x/.bili-acp.patch.yml";
+    assert.deepEqual(dshArgsWithPatch(["--profile", "headless", "task"], patch), ["--patch", patch, "--profile", "headless", "task"]);
+    assert.deepEqual(dshArgsWithPatch([], patch), ["--patch", patch]);
+    assert.deepEqual(dshArgsWithPatch(["web", "--port", "3080"], patch), ["web", "--patch", patch, "--port", "3080"]);
+    assert.deepEqual(dshArgsWithPatch(["plugin", "--profile", "web", "add", "pkg"], patch), ["plugin", "--profile", "web", "add", "pkg"]);
+    assert.deepEqual(dshArgsWithPatch(["--dump-default-config"], patch), ["--dump-default-config"]);
+});
+
+test("prepareDshHome: returns undefined for unreadable settings even with rewrites pending", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-home-"));
+    try {
+        const rewrites: HttpRewrite[] = [{ key: "dsh-1", realUpstream: "http://127.0.0.1:8199/v1" }];
+        assert.equal(prepareDshHome(dir, "http://127.0.0.1:8787", rewrites), undefined);
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("runLaunch dsh: DSH_HOME overlay + DEEPSEEK_BASE_URL env, real home untouched", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-launch-"));
+    const prevBin = process.env.BILI_CLIENT_BIN;
+    const prevDshHome = process.env.DSH_HOME;
+    const dshHome = path.join(home, ".dsh");
+    fs.mkdirSync(dshHome);
+    fs.writeFileSync(
+        path.join(dshHome, "settings.yaml"),
+        [
+            "llm-pi-ai:",
+            "  providers:",
+            "    anthropic:",
+            "      baseURL: https://api.anthropic.com",
+        ].join("\n"),
+    );
+    fs.mkdirSync(path.join(dshHome, "profiles"));
+    const original = fs.readFileSync(path.join(dshHome, "settings.yaml"), "utf8");
+    const fakeDsh = path.join(home, "fake-dsh");
+    fs.writeFileSync(fakeDsh, "");
+    process.env.BILI_CLIENT_BIN = fakeDsh;
+    process.env.DSH_HOME = dshHome;
+
+    const envSeen: NodeJS.ProcessEnv[] = [];
+    const argsSeen: string[][] = [];
+    const spawnImpl: SpawnFn = (cmd, args, options) => {
+        if (cmd === fakeDsh) {
+            if (options?.env) envSeen.push(options.env);
+            argsSeen.push([...args]);
+            const child = makeFakeChild(0);
+            const orig = child.on.bind(child);
+            (child as { on: SpawnChild["on"] }).on = (event, listener) => {
+                orig(event, listener);
+                if (event === "exit") setTimeout(() => listener(0, null), 0);
+                return child;
+            };
+            return child;
+        }
+        return makeFakeChild(42423);
+    };
+
+    const prevExit = process.exit;
+    const exitCalls: number[] = [];
+    process.exit = ((code?: number) => {
+        exitCalls.push(code ?? 0);
+        return undefined as never;
+    }) as typeof process.exit;
+
+    try {
+        await runLaunch(
+            { client: "dsh", clientArgs: ["--profile", "headless", "task"], overrides: {} },
+            { fetchImpl: async () => ({ ok: true }), spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(envSeen.length, 1);
+        const seenEnv = envSeen[0];
+        const origin = seenEnv.BILLION_CONTEXT_PROXY;
+        assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(String(origin)));
+        assert.equal(seenEnv.DEEPSEEK_BASE_URL, `${origin}/bili/https://api.deepseek.com`);
+        assert.equal(seenEnv.DSH_HOME, `${dshHome}-bili`);
+        assert.deepEqual(exitCalls, [0]);
+        assert.equal(fs.readFileSync(path.join(dshHome, "settings.yaml"), "utf8"), original);
+        const overlay = `${dshHome}-bili`;
+        assert.ok(fs.existsSync(path.join(overlay, "settings.yaml")));
+        const overlayTxt = fs.readFileSync(path.join(overlay, "settings.yaml"), "utf8");
+        assert.ok(overlayTxt.includes(`baseURL: ${origin}/bili/https://api.anthropic.com`));
+        assert.ok(fs.lstatSync(path.join(overlay, "profiles")).isSymbolicLink());
+        // /acp command injection: --patch flag spliced before user args, and
+        // the patch overlay file exists pointing at our bundled cordis plugin.
+        const patchFile = path.join(overlay, ".bili-acp.patch.yml");
+        assert.ok(fs.existsSync(patchFile));
+        const patchTxt = fs.readFileSync(patchFile, "utf8");
+        assert.ok(patchTxt.startsWith("- insert:\n"));
+        assert.ok(/- name: file:\/\/\/.*dsh-acp\.js\n/.test(patchTxt));
+        assert.deepEqual(argsSeen[0], ["--patch", patchFile, "--profile", "headless", "task"]);
+        fs.rmSync(overlay, { recursive: true, force: true });
+    } finally {
+        process.exit = prevExit;
+        if (prevBin === undefined) delete process.env.BILI_CLIENT_BIN;
+        else process.env.BILI_CLIENT_BIN = prevBin;
+        if (prevDshHome === undefined) delete process.env.DSH_HOME;
+        else process.env.DSH_HOME = prevDshHome;
+        fs.rmSync(home, { recursive: true, force: true });
     }
 });

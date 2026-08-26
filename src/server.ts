@@ -53,7 +53,7 @@ import { sanitizeResponsesInputIds } from "./loop/adapter-responses.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { emitStreamError } from "./stream-error.js";
-import { deriveSessionId as deriveProxySessionId, affinityToken, clientConversationHeader, type ConversationIdentity } from "./session-id.js";
+import { deriveSessionId as deriveProxySessionId, affinityToken, clientConversationHeader, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
 import { consumePluginRegisterFor, flushConversations, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, loadConversations, pipePluginJson, pipeThroughWithUsage, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
@@ -691,7 +691,10 @@ async function handle(
         const clientConv = clientConversationHeader(req.headers);
         const convHeader = clientConv ?? sessionHeader;
         const responsesIdentity = protocol === "responses"
-            ? conversationIdentityResponses(parsed as ResponsesRequestBody, convHeader)
+            ? preferPromptCacheKeyIdentity(
+                  conversationIdentityResponses(parsed as ResponsesRequestBody, convHeader),
+                  parsed as ResponsesRequestBody,
+              )
             : undefined;
         const conversation = protocol === "anthropic"
             ? conversationSignalAnthropic(parsed as AnthropicRequestBody, convHeader)
@@ -749,9 +752,11 @@ async function handle(
         // Responses clients that send their own session id as `prompt_cache_key`
         // (omp) get that conversation recorded even WITHOUT the x-bili-plugin
         // header, so the /acp command — which looks the session up by the
-        // client's session id — can find it. NOTE: conversationIdentityResponses
-        // does NOT read prompt_cache_key (it falls back to a content fingerprint
-        // with clientProvided:false), so we read the field directly here.
+        // client's session id — can find it. The session id itself now ALSO
+        // derives from prompt_cache_key (preferPromptCacheKeyIdentity above,
+        // which only kicks in when the kernel would have fallen to a
+        // per-request content fingerprint) — this lookup binding remains for
+        // clients that send a real conversation header or session_id.
         if (protocol === "responses") {
             const pck = (parsed as ResponsesRequestBody).prompt_cache_key;
             if (typeof pck === "string" && pck.trim().length > 0) {
@@ -820,7 +825,10 @@ async function handle(
                               ? prepareResponsesCompact(bodyBuffer, parsed as ResponsesRequestBody, session)
                               : prepareResponses(parsed as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, responsesIdentity!, pluginMode);
                 await forward(req, res, opts, prepared!.body, prepared!, core, reqConfig, log, route, affinity);
-                if (pluginMode && prepared) {
+                // Remember for ALL modes (not just plugin): wire clients (dsh,
+                // hermes, unplug'd pi) read the same panel via /__bili/plugin/status
+                // and need the nudge/breakdown sections too.
+                if (prepared) {
                     rememberPluginMessages(sessionId, prepared.processedMessages, prepared.originalMessages, prepared.nudge);
                 }
             });
@@ -1178,7 +1186,7 @@ function prepareResponses(
             const sub = Array.isArray(r.tools) ? `(${r.tools.length} sub)` : "";
             return `${r.type as string}:${(r.name as string) ?? "?"}${sub}`;
         });
-        log("info", `[${sessionId}] responses forward tools=[${fwdTools.join(",")}] injectTool=${shouldInject} NO_INJECT_TOOL=${!!process.env.ACP_NO_INJECT_TOOL} NO_COMPRESS_PROMPT=${!!process.env.ACP_NO_COMPRESS_PROMPT}`);
+        log("info", `[${sessionId}] responses forward tools=[${fwdTools.join(",")}] injectTool=${injectTools}${pluginMode ? " (plugin mode: wire injection suppressed)" : ""} NO_INJECT_TOOL=${!!process.env.ACP_NO_INJECT_TOOL} NO_COMPRESS_PROMPT=${!!process.env.ACP_NO_COMPRESS_PROMPT}`);
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);
