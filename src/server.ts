@@ -49,12 +49,12 @@ import { log as loggerLog, configureLogger, getLogPath, closeLogger } from "./lo
 import { defaultLogFile, stateDir, proxyOriginFile } from "./paths.js";
 import { compressLoopResponsesJson } from "./compress-loop-responses.js";
 import { runCompressLoop, pickAdapter } from "./loop/index.js";
-import { sanitizeResponsesInputIds } from "./loop/adapter-responses.js";
+import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages } from "./loop/adapter-responses.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { emitStreamError } from "./stream-error.js";
 import { deriveSessionId as deriveProxySessionId, affinityToken, clientConversationHeader, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
-import { consumePluginRegisterFor, flushConversations, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, loadConversations, pipePluginJson, pipeThroughWithUsage, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
+import { consumePluginRegisterFor, flushConversations, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, loadConversations, pipePluginJson, pipePluginResponsesWithStrip, pipeThroughWithUsage, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import { isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, shouldReserveOutputHeadroom, usageTotals } from "./util.js";
@@ -1134,6 +1134,10 @@ function prepareResponses(
     // request; rewrite them to short deterministic ids before anything reads
     // or replays the input.
     sanitizeResponsesInputIds(parsed.input);
+    const droppedEmpty = dropWhitespaceResponsesMessages(parsed.input);
+    if (droppedEmpty > 0) {
+        log("info", `[${sessionId}] dropped ${droppedEmpty} whitespace-only message item(s) before projection (flattened-turn artifact)`);
+    }
 
     const shouldInject = opts.compress.injectTool;
     const injectTools = shouldInject && !pluginMode;
@@ -1697,7 +1701,11 @@ async function forward(
     // the next nudge decision) keeps tracking reality.
     if (prepared?.pluginMode) {
         if (prepared.stream) {
-            await pipeThroughWithUsage(upstream.body as ReadableStream<Uint8Array>, res, prepared.session, prepared.protocol);
+            if (prepared.protocol === "responses") {
+                await pipePluginResponsesWithStrip(upstream.body as ReadableStream<Uint8Array>, res, prepared.session, (msg) => log("info", `[${prepared.session.id}] ${msg}`));
+            } else {
+                await pipeThroughWithUsage(upstream.body as ReadableStream<Uint8Array>, res, prepared.session, prepared.protocol);
+            }
         } else {
             await pipePluginJson(upstream.body as ReadableStream<Uint8Array>, res, prepared.session, prepared.protocol);
         }
