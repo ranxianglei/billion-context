@@ -1341,6 +1341,14 @@ test("prepareDshHome: preserves CRLF line endings when rewriting", () => {
 });
 
 test("writeDshAcpPatch: writes insert overlay with file:// plugin URL into <home>-bili", () => {
+    // writeDshAcpPatch only writes a patch when dist/agent/dsh-acp.js exists
+    // (a missing file would crash dsh's loader at boot); stub it like the
+    // pi -e tests do, and verify the no-dist guard too.
+    const root = selfPackageRoot();
+    const pluginFile = path.join(root, "dist", "agent", "dsh-acp.js");
+    fs.mkdirSync(path.dirname(pluginFile), { recursive: true });
+    const hadPlugin = fs.existsSync(pluginFile);
+    if (!hadPlugin) fs.writeFileSync(pluginFile, "");
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-patch-"));
     try {
         const file = writeDshAcpPatch(dir);
@@ -1350,6 +1358,7 @@ test("writeDshAcpPatch: writes insert overlay with file:// plugin URL into <home
         assert.ok(txt.startsWith("- insert:\n"));
         assert.match(txt, /^ {4}- name: file:\/\/.+dsh-acp\.js\n$/m);
         fs.rmSync(`${dir}-bili`, { recursive: true, force: true });
+        if (!hadPlugin) fs.rmSync(pluginFile, { force: true });
     } finally {
         fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -1395,6 +1404,14 @@ test("runLaunch dsh: DSH_HOME overlay + DEEPSEEK_BASE_URL env, real home untouch
     fs.writeFileSync(fakeDsh, "");
     process.env.BILI_CLIENT_BIN = fakeDsh;
     process.env.DSH_HOME = dshHome;
+    // writeDshAcpPatch requires dist/agent/dsh-acp.js to exist (missing file
+    // would crash dsh's loader) — stub it so the --patch splice is exercised
+    // even without a prior build (mirrors the pi -e tests).
+    const repoRoot = selfPackageRoot();
+    const dshPluginStub = path.join(repoRoot, "dist", "agent", "dsh-acp.js");
+    fs.mkdirSync(path.dirname(dshPluginStub), { recursive: true });
+    const hadDshPlugin = fs.existsSync(dshPluginStub);
+    if (!hadDshPlugin) fs.writeFileSync(dshPluginStub, "");
 
     const envSeen: NodeJS.ProcessEnv[] = [];
     const argsSeen: string[][] = [];
@@ -1474,6 +1491,7 @@ test("runLaunch dsh: DSH_HOME overlay + DEEPSEEK_BASE_URL env, real home untouch
         else process.env.BILI_CLIENT_BIN = prevBin;
         if (prevDshHome === undefined) delete process.env.DSH_HOME;
         else process.env.DSH_HOME = prevDshHome;
+        if (!hadDshPlugin) fs.rmSync(dshPluginStub, { force: true });
         fs.rmSync(home, { recursive: true, force: true });
     }
 });
