@@ -386,10 +386,13 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
 
         emitCompletion(opts?: EmitCompletionOpts) {
             const finishReason = opts?.finishReason ?? "stop";
+            // Numeric fields must never serialize to absent/undefined: strict
+            // clients (dsh's mapUsage) compute over prompt_tokens/completion_tokens
+            // and a usage object missing them yields NaN (non-JSON-serializable).
             const usage = opts?.usage
                 ? {
-                      prompt_tokens: opts.usage.inputTokens,
-                      completion_tokens: opts.usage.outputTokens,
+                      prompt_tokens: opts.usage.inputTokens ?? 0,
+                      completion_tokens: opts.usage.outputTokens ?? 0,
                       total_tokens: (opts.usage.inputTokens ?? 0) + (opts.usage.outputTokens ?? 0),
                       ...(typeof opts.usage.cachedTokens === "number"
                           ? { prompt_tokens_details: { cached_tokens: opts.usage.cachedTokens } }

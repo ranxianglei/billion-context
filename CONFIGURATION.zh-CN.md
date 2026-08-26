@@ -375,6 +375,7 @@
 | `bili omp [opts --] [args]` | 代理 + **omp**（pi 内核） |
 | `bili opencode [opts --] [args]` | 代理 + **opencode** |
 | `bili hermes [opts --] [args]` | 代理 + **hermes-agent**（`/bili/` 重写） |
+| `bili dsh [opts --] [args]` | 代理 + **deepseek-harness**（`/bili/` 重写；`--profile web "task"` 等参数原样透传） |
 | `bili test pi` | 无污染的 pi 链路端到端冒烟测试 |
 | `bili export [session] [--full] [--output FILE]` | 列出持久化会话 / 把一个会话导出为 Markdown 交接文档 —— 见[会话与迁移](#会话与迁移) |
 | `bili update` | 立即检查并安装新版本（绕过 3 分钟节流） |
@@ -510,6 +511,7 @@ MITM 只对一份**白名单**中的模型域名生效（`open.bigmodel.cn`、`a
 | claude | `ANTHROPIC_BASE_URL` = `/bili/` URL | 无需 |
 | opencode | `HTTPS_PROXY` + 隔离 `OPENCODE_CONFIG` | `NODE_EXTRA_CA_CERTS` |
 | hermes | 隔离 `HERMES_HOME`；**全部**上游走 `/bili/` | 无（certifi 忽略 `SSL_CERT_FILE`） |
+| dsh | 隔离 `DSH_HOME` + `DEEPSEEK_BASE_URL`；**全部**上游走 `/bili/` | 无（纯 fetch，无代理/CA 接口） |
 
 `NODE_EXTRA_CA_CERTS` 是**追加**到内置信任库，所以只指向 MITM 根证书（`root-ca.pem`）即可。`SSL_CERT_FILE` 会**替换**默认 CA bundle，所以 codex 指向 `combined-ca.pem` —— 包含 MITM 根证书**加上**系统/Node 公共根 —— 保证子进程环境里 pip/git/curl 类 TLS（盲转发、真证书）不受影响（#152）。
 
@@ -525,6 +527,7 @@ Claude Code 的 undici fetch 忽略 `HTTPS_PROXY`，所以证书 MITM 拦不到�
 | Claude Code | `ANTHROPIC_BASE_URL` 环境变量，否则硬编码 `api.anthropic.com` |
 | OpenCode | `~/.config/opencode/opencode.json` —— 各 provider 的 `baseURL` |
 | hermes | `~/.hermes/config.yaml` —— 各 provider 的端点行 |
+| dsh | `~/.dsh/settings.yaml` —— 每个 `baseURL`/`baseUrl`/`base_url` 值；内置 `deepseek-official` 路由另经 `$DEEPSEEK_BASE_URL` 接管 |
 
 ### 隔离临时配置（写了什么）
 
@@ -533,6 +536,7 @@ Claude Code 的 undici fetch 忽略 `HTTPS_PROXY`，所以证书 MITM 拦不到�
 - **pi / omp** —— 隔离的 `PI_CODING_AGENT_DIR`（在 `/tmp` 下），里面只有一份重写后的 `models.json` / `models.yml`（明文 baseUrl 包上 `/bili/`）。其余一切（`settings.json`、`sessions/`、`auth.json`、扩展……）都**符号链接**到真实 pi/omp 主目录，所以会话与登录互通：launcher 里开的会话在裸客户端里无缝继续，反之亦然。
 - **opencode** —— 临时 `opencode.json`（由 `OPENCODE_CONFIG` 指向），`baseURL` 重写为 `/bili/` 形式，**并追加了薄 `/acp` 插件**（开箱即原生工具；独立的 `opencode-acp` 插件检测到 `BILLION_CONTEXT_PROXY` 后自禁用）。
 - **hermes** —— 隔离的 `HERMES_HOME`，重写后的 `config.yaml` 让**所有**上游（HTTP 和 HTTPS）都走 `/bili/`（httpx 自建 CA bundle 且忽略 `SSL_CERT_FILE`，证书 MITM 不可行）。`skills/`、`memories/`、`sessions/` 符号链接共享。若没配置任何 provider —— 或 `config.yaml` 无法重写 —— 启动器打印警告，hermes 将**不经代理**运行（无压缩）。
+- **dsh** —— 隔离的 `DSH_HOME`（持久 overlay `~/.dsh-bili`），重写后的 `settings.yaml` 让所有已配置上游都走 `/bili/`（纯 `fetch`，无代理/CA 接口，证书 MITM 不可行）。`profiles/`、凭据、会话符号链接共享。内置 `deepseek-official` 路由另行经 `$DEEPSEEK_BASE_URL` 接管（dsh 解析顺序为 settings `llm-deepseek.baseURL` ?? 环境变量 ?? 默认值，重写过的用户配置优先，环境变量作零配置兜底）—— 即便没有任何自定义 provider，内置 deepseek 路由也照样走代理。
 
 ### 启动器里的原生工具
 
@@ -541,6 +545,7 @@ Claude Code 的 undici fetch 忽略 `HTTPS_PROXY`，所以证书 MITM 拦不到�
 - **opencode** —— 临时配置自动追加薄插件。
 - **claude / codex** —— 通过 `BILI_LAUNCHER_PLUGIN=1` 选择启用：启动器额外注入单个 `bili` MCP 服务器（claude 用 `--mcp-config`，codex 用 `-c mcp_servers.bili.*` —— 都是临时生效，不写宿主配置）。默认仍是 wire 模式，待宿主参数兼容性充分验证后翻转（已在 claude 2.1.227 / codex 0.147.0 验证）。`BILI_LAUNCHER_PLUGIN=0` 强制 wire 模式。
 - **hermes** —— 无插件 API；永远 wire 模式。
+- **dsh** —— 启动器始终在 dsh 的 argv 里拼接 `--patch <file>`（写入 `~/.dsh-bili/.bili-acp.patch.yml`），把 `dist/agent/dsh-acp.js` 插进 profile 的加载树：原生 `/acp` 命令，与 dsh 自带 `/compact` 同一形态。在任何组合了 commands 服务的 profile（web/tui 交互表面）都可用；`headless` 一次性驱动器把任务直接发给模型、不解析命令（原生 `/compact` 在那里同样不可用）。子命令形态已处理：`dsh web` 的 flag 插在 `web` 之后，`dsh plugin`/`--dump-default-config` 不注入。
 
 启动器模式矩阵：
 
@@ -587,7 +592,7 @@ bili plugin remove pi       # 撤销（原文件一次性备份为 *.bili-bak）
 
 总开关：`BILLION_CONTEXT_PLUGIN=0` 彻底关闭插件模式（恢复 wire 层注入）。
 
-**到底什么时候需要 `plugin install`？** 用启动器的基本都不需要（见[启动器参考](#启动器参考) —— pi 自动 `-e`、opencode 自动注入、omp 自带、claude/codex 用 `BILI_LAUNCHER_PLUGIN=1`、hermes 只能 wire）。它适用于手动配置客户端（`/bili/` 前缀或 MITM）又想要原生面板的场景：pi/omp/opencode 装后获得原生工具 + `/acp`；claude/codex 获得原生 MCP 工具（无 `/acp`）；hermes 装不了（只能 wire）。不装任何插件一切照常工作 —— 压缩走 wire 注入的工具，让模型调 `acp_status` 即可查看实时用量。
+**到底什么时候需要 `plugin install`？** 用启动器的基本都不需要（见[启动器参考](#启动器参考) —— pi 自动 `-e`、opencode 自动注入、omp 自带、claude/codex 用 `BILI_LAUNCHER_PLUGIN=1`、dsh 经 `--patch` 自动获得原生 `/acp` 命令、hermes 只能 wire）。它适用于手动配置客户端（`/bili/` 前缀或 MITM）又想要原生面板的场景：pi/omp/opencode 装后获得原生工具 + `/acp`；claude/codex 获得原生 MCP 工具（无 `/acp`）；dsh 的 `/acp` 由启动器 `--patch` 注入（手动配置的 dsh 可自行添加同一 patch）；hermes 装不了（只能 wire）。不装任何插件一切照常工作 —— 压缩走 wire 注入的工具，让模型调 `acp_status` 即可查看实时用量。
 
 ---
 
