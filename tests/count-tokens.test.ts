@@ -60,12 +60,65 @@ test("prepareCountTokens prunes covered messages when a compression block is act
     const prepared = prepareCountTokens(body, core, config, log, session);
     const out = JSON.parse(prepared.body);
     assert.ok(out.messages.length < inputCount, `pruned output (${out.messages.length}) must be < input (${inputCount})`);
+    // The block was created without a compress tool-call (no tool_use in the
+    // payload), so the in-place anchor is the sole summary carrier and must
+    // survive — stripping it would make the summary unreachable (#247).
     const hasInPlaceSummary = out.messages.some((m: { content: unknown }) => {
         const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
-        return /early history summary/i.test(text);
+        return /\[Compressed conversation section\]/.test(text);
     });
-    assert.ok(!hasInPlaceSummary, "in-place acp_summary stripped (host relies on the compress tool-call to carry the summary)");
+    assert.ok(hasInPlaceSummary, "in-place acp_summary kept (sole carrier: no compress tool-call in payload)");
     assert.ok(logs.some((l) => /count_tokens pruned:/.test(l)), "should log the prune delta");
+});
+
+test("prepareCountTokens strips the redundant in-place anchor when the compress tool-call is in the payload", () => {
+    const session = makeSession();
+    const core = createCore();
+    const config = defaultConfig(200000);
+    const body: AnthropicRequestBody = {
+        model: "claude-test",
+        messages: [],
+    };
+    for (let i = 0; i < 40; i++) {
+        body.messages.push({ role: i % 2 === 0 ? "user" : "assistant", content: `message ${i} ${"y".repeat(2000)}` });
+    }
+    const summary = "early history summary long enough to pass min length check".repeat(3);
+    body.messages.push({
+        role: "assistant",
+        content: [
+            { type: "tool_use", id: "call_pf_1", name: "compress", input: { content: [{ startId: "m00001", endId: "m00015", summary }] } },
+        ],
+    });
+    body.messages.push({
+        role: "user",
+        content: [
+            { type: "tool_result", tool_use_id: "call_pf_1", content: "[Compressed m00001-m00015]" },
+        ],
+    });
+    const { msgs } = anthropicToCore(body);
+    const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount: 9999, renderTags: "text-only" });
+    session.state = turn.state;
+    const res = core.applyCompression({
+        ranges: [{ startRef: "m00001", endRef: "m00015", summary, compressCallId: "call_pf_1" }],
+        state: session.state,
+        config,
+        messages: turn.messages,
+    });
+    session.state = res.state;
+    assert.equal(res.result.blocksCreated, 1, "compression block should be created");
+
+    const prepared = prepareCountTokens(body, core, config, () => {}, session);
+    const out = JSON.parse(prepared.body);
+    const hasAnchor = out.messages.some((m: { content: unknown }) => {
+        const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+        return /\[Compressed conversation section\]/.test(text);
+    });
+    assert.ok(!hasAnchor, "redundant in-place anchor stripped (the compress tool-call carries the summary)");
+    const hasToolCall = out.messages.some((m: { content: unknown }) => {
+        const text = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
+        return text.includes("call_pf_1");
+    });
+    assert.ok(hasToolCall, "compress tool-call survives (host relies on it to carry the summary)");
 });
 
 test("prepareCountTokens is READ-ONLY: session.state + stats unchanged", () => {
