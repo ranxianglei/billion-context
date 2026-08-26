@@ -3,7 +3,7 @@ import test from "node:test";
 
 process.env.NODE_ENV = "test";
 
-import { dropWhitespaceResponsesMessages } from "../src/loop/adapter-responses.ts";
+import { dropWhitespaceResponsesMessages, normalizeResponsesMessageItems } from "../src/loop/adapter-responses.ts";
 
 function msg(role: string, text: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
     return { type: "message", role, content: [{ type: "output_text", text }], ...extra };
@@ -82,4 +82,27 @@ test("dropWhitespaceResponsesMessages preserves items with malformed non-object 
     const dropped = dropWhitespaceResponsesMessages(input);
     assert.equal(dropped, 0, "malformed part makes emptiness unknowable — item preserved");
     assert.equal(input.length, 2, "nothing removed");
+});
+
+// #247 test companion: omp sends user items without the spec-required "type"
+// field; the kernel projection switches on item.type and silently drops them.
+test("normalizeResponsesMessageItems stamps type:message on type-less role items", () => {
+    const input: any[] = [
+        { role: "user", content: [{ type: "input_text", text: "hello" }] },
+        { type: "message", role: "user", content: [{ type: "input_text", text: "typed" }] },
+        { role: "assistant", content: [{ type: "output_text", text: "reply" }] },
+        { role: "system", content: "no content field" },
+        { type: "function_call", call_id: "c1", name: "f", arguments: "{}" },
+        "plain string",
+    ];
+    const typed = normalizeResponsesMessageItems(input);
+    assert.equal(typed, 2);
+    assert.equal(input[0].type, "message");
+    assert.equal(input[1].type, "message");
+    assert.equal(input[2].type, "message");
+    assert.equal(input[3].type, undefined);
+    assert.equal(input[4].type, "function_call");
+    assert.equal(typeof input[5], "string");
+    // non-array tolerated
+    assert.equal(normalizeResponsesMessageItems(null), 0);
 });

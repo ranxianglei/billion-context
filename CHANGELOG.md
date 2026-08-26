@@ -8,6 +8,7 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 ### Fixes
 
 - **Identity plugin binding survives model switches (one conversation, many sessions)**: an identity registration (`POST /__bili/plugin/register` with `identity: true` — the omp/claude-code path) was consumed one-shot: the first request that carried the conversation id ate the registration and bound ITS session into plugin mode. Switching models or upstreams mid-conversation resolves a NEW session (session key = protocol|upstream|apiKey|conversation) — the registration was already gone, so the omp TUI flow "chat model → responses model" silently dropped back to wire injection (native tools gone, model roleplaying `acp_status` output). Identity registrations are now sticky for the conversation: every request carrying the id binds, LRU-refreshed and bounded by the same 64-entry cap. Wild-caught as "原生模式消失了" after a GLM-chat → qwen-responses model switch.
+- **Responses: stamp `type:"message"` on type-less input items at ingress.** omp (pi-ai) sends user items without the spec-required `type` field; the kernel wire projection switches on `item.type` and silently dropped them, so user prompts never entered the compression state (no refs, never tagged, never compressible, invisible to nudge/preflight — #247 testing caught this).
 
 ### Features
 

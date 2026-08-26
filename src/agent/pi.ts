@@ -58,6 +58,30 @@ function sessionIdOf(ctx: Ctx): string | undefined {
     }
 }
 
+// omp's chat-completions payloads carry NO conversation signal (no
+// prompt_cache_key / session / user, and no session header — verified by dump),
+// so the proxy's openai identity falls to a content fingerprint that never
+// matches the session id this plugin registered (the identity register is keyed
+// by the omp session uuid). The before_provider_request return value REPLACES
+// the whole outgoing payload (omp onPayload chain, verified in the omp 17.3.8
+// dist), so stamp prompt_cache_key with the omp session id: the proxy binds
+// pluginMode by that identity and /acp finds the session by it. Chat shape only
+// (messages array, no responses `input`, no anthropic `max_tokens`, no native
+// prompt_cache_key); pi is untouched (it stamps x-bili-plugin-conversation in
+// before_provider_headers, which outranks the body field).
+function stampPromptCacheKey(event: unknown, ctx: Ctx, agent: string): Record<string, unknown> | undefined {
+    if (agent !== "omp") return undefined;
+    const payload = (event as { payload?: unknown } | undefined)?.payload;
+    if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return undefined;
+    const p = payload as Record<string, unknown>;
+    if (!Array.isArray(p.messages)) return undefined;
+    if (p.input !== undefined || p.max_tokens !== undefined) return undefined;
+    if (typeof p.prompt_cache_key === "string" && p.prompt_cache_key.trim().length > 0) return undefined;
+    const sid = sessionIdOf(ctx);
+    if (sid === undefined || sid.length === 0) return undefined;
+    return { ...p, prompt_cache_key: sid };
+}
+
 function fmtTok(n: number): string {
     if (n < 1000) return String(n);
     if (n < 1_000_000) return `${(n / 1000).toFixed(1)}K`;
@@ -264,11 +288,12 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             }
             void registerTools(pi, ctx, state, agent).catch((err: unknown) => console.error(`bili-plugin(${agent}): ${err instanceof Error ? err.message : String(err)}`));
         });
-        pi.on("before_provider_request", (_event, ctx) => {
+        pi.on("before_provider_request", (event, ctx) => {
             // omp emits this per model request (but never before_provider_headers);
             // it doubles as the retry driver when the session_start manifest
             // fetch raced the proxy startup. Cached by sid, throttled by retryAt.
             void registerTools(pi, ctx, state, agent).catch((err: unknown) => console.error(`bili-plugin(${agent}): ${err instanceof Error ? err.message : String(err)}`));
+            return stampPromptCacheKey(event, ctx, agent);
         });
         pi.on("session_start", (_event, ctx) => {
             state.sid = undefined;
