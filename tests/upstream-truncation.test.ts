@@ -150,6 +150,37 @@ test("issue #221: partial-content truncation is NOT auto-retried (would duplicat
     });
 });
 
+// A stream cut after a COMPLETELY CLOSED real tool_use block (no text, no
+// reasoning, no completion event): the tool call is already flushed to the
+// client, which will execute it and follow up with the tool result.
+const TRUNCATED_TOOLCALL = [
+    sse("message_start", { type: "message_start", message: { id: "msg_1", usage: { input_tokens: 10 } } }),
+    sse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_9", name: "bash", input: {} } }),
+    sse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: JSON.stringify({ command: "ls" }) } }),
+    sse("content_block_stop", { type: "content_block_stop", index: 0 }),
+].join("");
+
+test("issue #221: truncation that already flushed a real tool call is NOT auto-retried", async () => {
+    await withTruncationRetries("2", async () => {
+        const out = await drain(streamOf(TRUNCATED_TOOLCALL), [COMPLETE_RETRY], makeCtx());
+        assert.ok(out.includes("toolu_9"), "the flushed tool call still reaches the client");
+        assert.ok(out.includes("upstream stream truncated"), "must surface the error, not silently re-request");
+        assert.ok(!out.includes("重试后完整输出"), "retry content must not land behind the emitted tool call in the same stream");
+    });
+});
+
+test("issue #221: zero-content truncation on the final round surfaces the error (no degenerate empty completion)", async () => {
+    await withTruncationRetries("2", async () => {
+        // Rounds 1-9: proxy-tool (compress) re-request loop. Round 10 (the last):
+        // zero-content truncation — nothing left to re-request into, so the error
+        // must surface instead of a silent stop_reason "length" completion.
+        const upstreams = [...Array(8).fill(ROUND1_COMPRESS), TRUNCATED_EMPTY];
+        const out = await drain(streamOf(ROUND1_COMPRESS), upstreams, makeCtx());
+        assert.ok(out.includes("upstream stream truncated (no completion event; round 10"), "final-round truncation must surface");
+        assert.ok(!out.includes('"stop_reason":"length"'), "must not end with a degenerate length completion");
+    });
+});
+
 test("issue #221 follow-up: truncated final round surfaces a visible error instead of silent end_turn", async () => {
     const out = await drain(streamOf(TRUNCATED_CONCLUSION), [], makeCtx());
     assert.ok(out.includes("本周总结"), "partial conclusion text should still reach the client");

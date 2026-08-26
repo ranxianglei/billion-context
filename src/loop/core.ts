@@ -407,17 +407,23 @@ export async function* runCompressLoop(
             // compress returns its failure as the tool output, so the model is not
             // blind to why it failed. MAX_LOOP_ROUNDS bounds runaway loops.
             const reRequest = proxyResults.length > 0 && realCalls === 0;
-            // A truncated stream that produced NO content (no text, no reasoning)
-            // is a clean re-send: nothing meaningful reached the client, so
-            // re-requesting the same body cannot duplicate anything. This recovers
-            // the relay-timeout case where a long-running request (e.g. a model
-            // thinking server-side for minutes) is cut before any token is emitted
-            // (issue #221). A partial-content truncation is NOT retried here — the
-            // model would regenerate from scratch and duplicate the already-streamed
-            // prefix, so that case still surfaces the visible error below.
+            // A truncated stream that produced NO content (no text, no reasoning,
+            // no tool call) is a clean re-send: nothing meaningful reached the
+            // client, so re-requesting the same body cannot duplicate anything.
+            // This recovers the relay-timeout case where a long-running request
+            // (e.g. a model thinking server-side for minutes) is cut before any
+            // token is emitted (issue #221). NOT retried — the visible error
+            // below still surfaces — when: (a) partial content was already
+            // streamed (the model would regenerate from scratch and duplicate the
+            // prefix); (b) a real tool call was already flushed to the client
+            // (the client will execute it and follow up, and a re-sent response
+            // would land behind that tool call in the same stream); (c) this is
+            // the final round (nothing left to re-request into — surfacing the
+            // error beats a degenerate empty completion).
             const zeroContent = assistantText.length === 0 && assistantReasoning.length === 0;
             const canRetryTruncation =
-                !sawDone && zeroContent && truncationRetries < maxTruncationRetries();
+                !sawDone && zeroContent && realCalls === 0 &&
+                round < MAX_LOOP_ROUNDS && truncationRetries < maxTruncationRetries();
             if (!reRequest && !canRetryTruncation) {
                 if (!sawDone) {
                     const partialText = assistantText.length;
@@ -446,7 +452,7 @@ export async function* runCompressLoop(
                 return;
             }
 
-            if (canRetryTruncation) {
+            if (canRetryTruncation && !reRequest) {
                 truncationRetries += 1;
                 const max = maxTruncationRetries();
                 ctx.log(`[acp-loop] round ${round}: upstream truncated with no content; auto-retrying (attempt ${truncationRetries}/${max})`);
