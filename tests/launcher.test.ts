@@ -1573,3 +1573,80 @@ test("runLaunch dsh: DSH_HOME overlay + DEEPSEEK_BASE_URL env, real home untouch
         fs.rmSync(home, { recursive: true, force: true });
     }
 });
+
+test("runLaunch omp: launcher hands per-model windows to the spawned proxy", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-mw-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevClientBin = process.env.BILI_CLIENT_BIN;
+    const prevOmpDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    delete process.env.PI_CODING_AGENT_DIR;
+    const fakeOmp = path.join(home, "fake-omp");
+    fs.writeFileSync(fakeOmp, "");
+    process.env.BILI_CLIENT_BIN = fakeOmp;
+    const ompHome = path.join(home, ".omp", "agent");
+    fs.mkdirSync(ompHome, { recursive: true });
+    fs.writeFileSync(
+        path.join(ompHome, "models.yml"),
+        [
+            "providers:",
+            "  sglang-responses:",
+            "    baseUrl: http://127.0.0.1:8199/v1",
+            "    models:",
+            "      - id: qwen3.8-27b",
+            "        contextWindow: 262144",
+            "      - id: tiny",
+            "        contextWindow: 4096",
+        ].join("\n"),
+    );
+
+    const proxyEnvs: (NodeJS.ProcessEnv | undefined)[] = [];
+    const spawnImpl: SpawnFn = (cmd, args, opts) => {
+        if (cmd === fakeOmp) {
+            const child = makeFakeChild(0);
+            const orig = child.on.bind(child);
+            (child as { on: SpawnChild["on"] }).on = (event, listener) => {
+                orig(event, listener);
+                if (event === "exit") setTimeout(() => listener(0, null), 0);
+                return child;
+            };
+            return child;
+        }
+        proxyEnvs.push((opts as { env?: NodeJS.ProcessEnv } | undefined)?.env);
+        return makeFakeChild(42422);
+    };
+    const fetchImpl = async () => ({ ok: true });
+
+    const prevExit = process.exit;
+    const exitCalls: number[] = [];
+    process.exit = ((code?: number) => {
+        exitCalls.push(code ?? 0);
+        return undefined as never;
+    }) as typeof process.exit;
+
+    try {
+        await runLaunch(
+            { client: "omp", clientArgs: [], overrides: {} },
+            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.deepEqual(exitCalls, [0]);
+        assert.equal(proxyEnvs.length, 1, "proxy spawned once");
+        const raw = proxyEnvs[0]?.BILI_LAUNCHER_MODEL_WINDOWS;
+        assert.ok(typeof raw === "string", "BILI_LAUNCHER_MODEL_WINDOWS handed to the proxy");
+        const windows = JSON.parse(raw as string) as Record<string, number>;
+        assert.equal(windows["qwen3.8-27b"], 262144);
+        assert.equal(windows.tiny, 4096);
+    } finally {
+        process.exit = prevExit;
+        if (prevClientBin === undefined) delete process.env.BILI_CLIENT_BIN;
+        else process.env.BILI_CLIENT_BIN = prevClientBin;
+        process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        if (prevOmpDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+        else process.env.PI_CODING_AGENT_DIR = prevOmpDir;
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});

@@ -355,6 +355,7 @@ Environment variables take precedence over the config file. They are useful for 
 | `BILI_SESSIONS_DIR` | Directory for persisted session state (default XDG data dir). |
 | `BILLION_CONTEXT_PROXY` | Exported by the launcher; client-side bili plugins/extensions detect it and self-disable their own compression (no double compression). |
 | `BILLION_CONTEXT_PLUGIN` | Set `0` to disable plugin mode entirely (wire-level tool injection resumes). |
+| `BILI_LAUNCHER_MODEL_WINDOWS` | Internal: the launcher hands the client's own per-model context windows (pi `models.json`, omp `models.yml`, opencode `models.<id>.limit`, codex `model_context_window`) to the spawned proxy as JSON, so the nudge denominator matches the real window for self-hosted models. Only the launcher sets it — no user configuration. |
 | `BILI_LAUNCHER_PLUGIN` | Set `1` to have the launcher inject the bili MCP server for claude/codex (native tools). See [Launcher Reference](#launcher-reference). |
 | `BILI_LAUNCHER_DIRECT` | Set `1` for direct-URL routing in the launcher (drop MITM/CA trust). See [Launcher Reference](#launcher-reference). |
 | `BILI_CLAUDE_UPSTREAM` | claude direct mode: your relay endpoint, when `ANTHROPIC_BASE_URL` already points at a relay the launcher would otherwise bypass. |

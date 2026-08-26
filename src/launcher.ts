@@ -42,7 +42,7 @@ import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom } from "./plugin-in
 function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
-import { nonEmpty, resolvePiHome, resolveOmpHome, resolveHermesHome, resolveDshHome, loadClientConfig, type ClientConfig, resolveOpencodeConfigFile, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider } from "./client-config.js";
+import { nonEmpty, resolvePiHome, resolveOmpHome, resolveHermesHome, resolveDshHome, loadClientConfig, collectModelWindows, type ClientConfig, resolveOpencodeConfigFile, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider } from "./client-config.js";
 
 export {
     type ClaudeSettings,
@@ -110,6 +110,11 @@ export interface LaunchOptions {
     passthrough: boolean;
     debug: boolean;
     mitmDomains?: string[];
+    /** Per-model context windows read from the client's own config (pi
+     *  models.json / omp models.yml / …). Handed to the spawned proxy via
+     *  BILI_LAUNCHER_MODEL_WINDOWS so the nudge denominator matches the
+     *  client's real window instead of the built-in table guess. */
+    modelWindows?: Record<string, number>;
 }
 
 export interface ProxyHandle {
@@ -1036,6 +1041,9 @@ export async function ensureProxyRunning(
                     ...(opts.mitmDomains && opts.mitmDomains.length
                         ? { BILI_MITM_DOMAINS: opts.mitmDomains.join(",") }
                         : {}),
+                    ...(opts.modelWindows && Object.keys(opts.modelWindows).length > 0
+                        ? { BILI_LAUNCHER_MODEL_WINDOWS: JSON.stringify(opts.modelWindows) }
+                        : {}),
                 },
             },
         );
@@ -1162,7 +1170,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     const base = baseClientName(params.client);
     const routes = discoverRoutes(base, config);
     const domains = dedupeInOrder([...routes.httpsDomains, ...(params.mitmDomains ?? [])]);
-    const handle = await ensureProxyRunning({ host, port, passthrough, debug, mitmDomains: domains }, deps);
+    const handle = await ensureProxyRunning({ host, port, passthrough, debug, mitmDomains: domains, modelWindows: collectModelWindows(config) }, deps);
     console.error(
         `bili: started proxy at ${handle.origin} (MITM domains: ${domains.length ? domains.join(", ") : "defaults"})` +
             (routes.httpRewrites.length > 0 ? ` (HTTP /bili/ rewrites: ${routes.httpRewrites.length})` : "") +
@@ -1351,7 +1359,7 @@ export async function runTestPi(params: RunTestPiParams, deps: LauncherDeps = {}
         ...discoverDomains("pi", config),
         ...(params.mitmDomains ?? []),
     ]);
-    const handle = await ensureProxyRunning({ host, port, passthrough, debug, mitmDomains: domains }, deps);
+    const handle = await ensureProxyRunning({ host, port, passthrough, debug, mitmDomains: domains, modelWindows: collectModelWindows(config) }, deps);
     console.error(
         `bili: started proxy at ${handle.origin} (MITM domains: ${domains.length ? domains.join(", ") : "defaults"})`,
     );

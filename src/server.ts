@@ -61,6 +61,34 @@ import { isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, shoul
 
 import { decodeRequestBody } from "./content-encoding.js";
 
+// Per-model context windows handed over by a `bili <client>` launcher
+// (BILI_LAUNCHER_MODEL_WINDOWS, JSON model-id → window), read from the
+// client's OWN config (pi models.json / omp models.yml / …) at launch time.
+// Ranked between the plugin report and the models.dev registry in the
+// native-window chain — the client's own number is authoritative for its
+// deployment (it is what the client itself truncates at), unlike the generic
+// registry.
+export function parseLauncherModelWindows(raw: string | undefined): Record<string, number> {
+    if (!raw) return {};
+    try {
+        const parsed: unknown = JSON.parse(raw);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+        const out: Record<string, number> = {};
+        for (const [id, v] of Object.entries(parsed as Record<string, unknown>)) {
+            if (typeof v === "number" && Number.isFinite(v) && v > 0) out[id] = Math.floor(v);
+        }
+        return out;
+    } catch {
+        return {};
+    }
+}
+
+const LAUNCHER_MODEL_WINDOWS: Readonly<Record<string, number>> = parseLauncherModelWindows(process.env.BILI_LAUNCHER_MODEL_WINDOWS);
+
+function launcherContextWindow(model: string): number | undefined {
+    return LAUNCHER_MODEL_WINDOWS[model];
+}
+
 const UPSTREAM_HOP_HEADERS = new Set([
     "host",
     "content-length",
@@ -643,7 +671,11 @@ async function handle(
             // Native-window resolution order: (1) a cooperative plugin's
             // report (the agent's own config — most authoritative, gated on
             // the x-bili-plugin marker so a plain client cannot rewrite the
-            // nudge denominator by name); (2) a WARM models.dev registry
+            // nudge denominator by name); (1b) the launcher's per-model
+            // windows (BILI_LAUNCHER_MODEL_WINDOWS — the client's own
+            // models.json/models.yml contextWindow, authoritative for this
+            // deployment, no header trust needed since only the launcher
+            // sets the env); (2) a WARM models.dev registry
             // cache (daily refresh — outranks the static table whenever
             // already resident; peek never fetches, cold start skips to (3)
             // without blocking); (3) resolveContextLimit = user's per-route
@@ -652,6 +684,7 @@ async function handle(
             // outranks everything inside resolveRequestConfig.
             const host = (() => { try { return embeddedUrl ? new URL(embeddedUrl).host : undefined; } catch { return undefined; } })();
             let native = pluginReportedContextWindow(req.headers)
+                ?? launcherContextWindow(model)
                 ?? (host ? peekRegistryContext(model, host) : undefined)
                 ?? resolveContextLimit(opts.routes, embeddedUrl, model);
             if (!native && host) {
@@ -919,6 +952,9 @@ function prepareAnthropic(
         const tokenCount = session.stats.lastInputTokens;
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
+        // The fold from last turn's compress has now materialized in state —
+        // future usage reports are post-fold reality, drop the credit.
+        session.stats.compressCreditTokens = 0;
         // Drop sub-viability fragments before any consumer sees them: a tiny
         // range in the list makes batched compress attempts fail atomically
         // (kernel validates the whole batch). Mirrors billion-context-pi.
@@ -1006,6 +1042,9 @@ function prepareOpenai(
         const tokenCount = session.stats.lastInputTokens;
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
+        // The fold from last turn's compress has now materialized in state —
+        // future usage reports are post-fold reality, drop the credit.
+        session.stats.compressCreditTokens = 0;
         // Drop sub-viability fragments before any consumer sees them: a tiny
         // range in the list makes batched compress attempts fail atomically
         // (kernel validates the whole batch). Mirrors billion-context-pi.
@@ -1112,6 +1151,9 @@ function prepareResponses(
         const tokenCount = session.stats.lastInputTokens;
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" });
         session.state = turn.state;
+        // The fold from last turn's compress has now materialized in state —
+        // future usage reports are post-fold reality, drop the credit.
+        session.stats.compressCreditTokens = 0;
         // Drop sub-viability fragments before any consumer sees them: a tiny
         // range in the list makes batched compress attempts fail atomically
         // (kernel validates the whole batch). Mirrors billion-context-pi.
@@ -1776,8 +1818,13 @@ async function forward(
                 const { total, cached } = usageTotals(prepared.protocol, u);
                 if (typeof total === "number") {
                     prepared.session.stats.inputTokens += total;
-                    // lastInputTokens = true TOTAL context (protocol-correct).
-                    prepared.session.stats.lastInputTokens = total;
+                    // lastInputTokens = true TOTAL context (protocol-correct),
+                    // net of this turn's compress savings (see stream.ts
+                    // applyRanges — the fold lands on the NEXT request).
+                    prepared.session.stats.lastInputTokens = Math.max(
+                        0,
+                        total - (prepared.session.stats.compressCreditTokens ?? 0),
+                    );
                     if (typeof cached === "number") {
                         prepared.session.stats.cachedTokens += cached;
                         prepared.session.stats.cacheSamples += 1;
