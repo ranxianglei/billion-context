@@ -20,6 +20,11 @@ type ToolDefinition = {
     name: string;
     description?: string;
     parameters: unknown;
+    // omp 17.x mounts extension tools that omit loadMode under xd:// devices
+    // (invisible to the main turn's tools array — only title requests see
+    // them). Declaring "essential" keeps ACP tools top-level; pi upstream
+    // ignores the field.
+    loadMode?: string;
     execute: (toolCallId: string, params: Record<string, unknown>, signal: AbortSignal | undefined, onUpdate: ((u: unknown) => void) | undefined, ctx: Ctx) => Promise<ToolResult>;
 };
 
@@ -87,6 +92,7 @@ function manifestToTool(proxyBase: string, tool: ManifestTool, agent: string): T
         name: tool.name,
         description: tool.description,
         parameters: tool.inputSchema,
+        loadMode: "essential",
         execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
             const conversationId = sessionIdOf(ctx) ?? "unknown";
             try {
@@ -101,7 +107,21 @@ function manifestToTool(proxyBase: string, tool: ManifestTool, agent: string): T
 
 const RETRY_INTERVAL_MS = 10000;
 
-type RegisterState = { sid?: string; toolsReady?: boolean; pending?: Promise<void>; retryAt?: number };
+type RegisterState = { sid?: string; toolsReady?: boolean; pending?: Promise<void>; retryAt?: number; identityAt?: string };
+
+// omp never emits before_provider_headers, so the x-bili-plugin marker cannot
+// be stamped per request. Register the conversation id once (after tools are
+// ready): the proxy binds any request carrying that id into plugin mode —
+// same launcher path claude/codex use (#162).
+async function postIdentityRegister(proxyBase: string, conversationId: string, agent: string): Promise<void> {
+    const res = await fetch(`${proxyBase}/__bili/plugin/register`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ conversationId, agent, identity: true }),
+        signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) throw new Error(`register HTTP ${res.status}`);
+}
 
 async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, agent: string): Promise<void> {
     const proxyBase = proxyBaseForCtx(ctx);
@@ -127,6 +147,15 @@ async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, a
             state.sid = sid;
             state.toolsReady = true;
             state.retryAt = undefined;
+            if (agent === "omp" && sid !== "" && state.identityAt !== sid) {
+                try {
+                    await postIdentityRegister(proxyBase, sid, agent);
+                    state.identityAt = sid;
+                } catch (err) {
+                    state.retryAt = Date.now() + RETRY_INTERVAL_MS;
+                    console.error(`bili-plugin(${agent}): identity register failed (${err instanceof Error ? err.message : String(err)}) — retrying in ${RETRY_INTERVAL_MS / 1000}s`);
+                }
+            }
         } catch (err) {
             state.sid = undefined;
             state.retryAt = Date.now() + RETRY_INTERVAL_MS;
@@ -219,6 +248,12 @@ export function createBiliPlugin(agentOverride?: string): (pi: ExtensionAPI) => 
             } catch (err) {
                 console.error(`bili-plugin(${agent}): header stamp skipped (${err instanceof Error ? err.message : String(err)})`);
             }
+            void registerTools(pi, ctx, state, agent).catch((err: unknown) => console.error(`bili-plugin(${agent}): ${err instanceof Error ? err.message : String(err)}`));
+        });
+        pi.on("before_provider_request", (_event, ctx) => {
+            // omp emits this per model request (but never before_provider_headers);
+            // it doubles as the retry driver when the session_start manifest
+            // fetch raced the proxy startup. Cached by sid, throttled by retryAt.
             void registerTools(pi, ctx, state, agent).catch((err: unknown) => console.error(`bili-plugin(${agent}): ${err instanceof Error ? err.message : String(err)}`));
         });
         pi.on("session_start", (_event, ctx) => {
