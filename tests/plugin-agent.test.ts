@@ -786,3 +786,74 @@ test("omp identity register failure throttles and retries later", async () => {
         await proxy.close();
     }
 });
+
+// #266: omp's chat-completions payloads carry NO conversation signal, so the
+// plugin stamps prompt_cache_key with the omp session id. The
+// before_provider_request return value REPLACES the whole outgoing payload
+// (omp onPayload chain), so the matrix below drives the real handler and
+// asserts exactly which payload shapes get stamped. fakeCtx(undefined) keeps
+// registerTools a no-op (no proxy) so the test is pure.
+test("omp before_provider_request stamps prompt_cache_key only for chat-completions payloads (injection matrix)", async () => {
+    const sid = "omp-uuid-abc";
+    const mk = (): FakePi => {
+        const pi = makeFakePi();
+        createBiliPlugin("omp")(pi as never);
+        return pi;
+    };
+    const handler = (pi: FakePi, payload: unknown) =>
+        pi.events.get("before_provider_request")!({ type: "before_provider_request", payload }, fakeCtx(undefined, sid));
+
+    // chat payload (messages, no input, no max_tokens, no native pck) → stamped
+    {
+        const pi = mk();
+        const payload = { model: "glm-4", messages: [{ role: "user", content: "hi" }] };
+        const out = handler(pi, payload) as Record<string, unknown>;
+        assert.equal(out.prompt_cache_key, sid, "chat payload stamped with the omp session id");
+        assert.deepEqual(out.messages, payload.messages, "rest of the payload preserved");
+        assert.equal(payload.prompt_cache_key, undefined, "original payload not mutated");
+    }
+    // native prompt_cache_key already present → not overridden
+    {
+        const pi = mk();
+        const out = handler(pi, { messages: [{ role: "user", content: "hi" }], prompt_cache_key: "native-pck" });
+        assert.equal(out, undefined, "native pck is not overridden");
+    }
+    // responses payload (input array) → untouched
+    {
+        const pi = mk();
+        const out = handler(pi, { input: [{ role: "user", content: "hi" }] });
+        assert.equal(out, undefined, "responses payload (input) untouched");
+    }
+    // anthropic wire (max_tokens) → untouched
+    {
+        const pi = mk();
+        const out = handler(pi, { messages: [{ role: "user", content: "hi" }], max_tokens: 1024, system: "s" });
+        assert.equal(out, undefined, "anthropic wire (max_tokens) untouched");
+    }
+    // no session id → untouched
+    {
+        const pi = mk();
+        const out = pi.events.get("before_provider_request")!({ type: "before_provider_request", payload: { messages: [{ role: "user", content: "hi" }] } }, fakeCtx(undefined, ""));
+        assert.equal(out, undefined, "no session id → untouched");
+    }
+    // non-object payload → untouched
+    {
+        const pi = mk();
+        assert.equal(handler(pi, "not an object"), undefined, "non-object payload untouched");
+        assert.equal(handler(pi, null), undefined, "null payload untouched");
+        assert.equal(handler(pi, [1, 2, 3]), undefined, "array payload untouched");
+    }
+    // no messages array → untouched
+    {
+        const pi = mk();
+        assert.equal(handler(pi, { model: "x" }), undefined, "no messages → untouched");
+        assert.equal(handler(pi, { messages: "nope" }), undefined, "non-array messages → untouched");
+    }
+});
+
+test("pi agent never stamps prompt_cache_key (it stamps headers instead)", async () => {
+    const pi = makeFakePi();
+    createBiliPlugin("pi")(pi as never);
+    const out = pi.events.get("before_provider_request")!({ type: "before_provider_request", payload: { messages: [{ role: "user", content: "hi" }] } }, fakeCtx(undefined, "pi-uuid"));
+    assert.equal(out, undefined, "pi agent never stamps the body");
+});

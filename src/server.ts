@@ -729,10 +729,29 @@ async function handle(
                   parsed as ResponsesRequestBody,
               )
             : undefined;
+        // OpenAI chat mirrors the responses pck promotion: clients that replay
+        // full history statelessly (omp chat-completions via a relay) send NO
+        // conversation headers, so the kernel's openai signal falls to a hash of
+        // the first user message that never matches the session id the agent
+        // plugin registered (identity register is keyed by the omp session
+        // uuid). prompt_cache_key (stamped by the omp plugin, or sent natively)
+        // is the client's own stable per-conversation id — promote it over the
+        // fingerprint only; a real conversation header stays stronger.
+        const openaiSignal = protocol === "openai"
+            ? conversationSignalOpenai(parsed as OpenAIRequestBody, convHeader)
+            : "";
+        const openaiIdentity = protocol === "openai"
+            ? preferPromptCacheKeyIdentity(
+                  convHeader
+                    ? { value: openaiSignal, source: "header" as const, clientProvided: true }
+                    : { value: openaiSignal, source: "content-fingerprint" as const, clientProvided: false },
+                  parsed as { prompt_cache_key?: unknown },
+              )
+            : undefined;
         const conversation = protocol === "anthropic"
             ? conversationSignalAnthropic(parsed as AnthropicRequestBody, convHeader)
             : protocol === "openai"
-              ? conversationSignalOpenai(parsed as OpenAIRequestBody, convHeader)
+              ? openaiIdentity?.value ?? openaiSignal
               : subagentNamespace(
                   responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
                   (parsed as ResponsesRequestBody).instructions,
@@ -747,13 +766,14 @@ async function handle(
         //    body.session_id) — never the synthetic one — so a user can tell
         //    at a glance which client owns a session. pi sends nothing, so its
         //    label stays empty (shown as "—" in the UI).
-        const affinity = affinityToken(responsesIdentity ?? {
+        const bodyIdentity = responsesIdentity ?? openaiIdentity;
+        const affinity = affinityToken(bodyIdentity ?? {
             value: clientConv ?? conversation,
             source: clientConv ? "header" : "generated",
             clientProvided: !!clientConv,
         });
-        const clientLabel = responsesIdentity?.clientProvided
-            ? responsesIdentity.value
+        const clientLabel = bodyIdentity?.clientProvided
+            ? bodyIdentity.value
             : clientConversationHeader(req.headers);
         const session = getSession(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? undefined });
         // Launcher-mode binding (#162): prefer identity — claude code sends
@@ -782,16 +802,17 @@ async function handle(
             session.metadata.effectiveContextLimit = reqConfig.modelContextLimit;
             recordPluginSession(pluginConversation ?? conversation, session.id);
         }
-        // Responses clients that send their own session id as `prompt_cache_key`
-        // (omp) get that conversation recorded even WITHOUT the x-bili-plugin
-        // header, so the /acp command — which looks the session up by the
-        // client's session id — can find it. The session id itself now ALSO
-        // derives from prompt_cache_key (preferPromptCacheKeyIdentity above,
-        // which only kicks in when the kernel would have fallen to a
-        // per-request content fingerprint) — this lookup binding remains for
-        // clients that send a real conversation header or session_id.
-        if (protocol === "responses") {
-            const pck = (parsed as ResponsesRequestBody).prompt_cache_key;
+        // Responses AND OpenAI-chat clients that send their own session id as
+        // `prompt_cache_key` (omp) get that conversation recorded even WITHOUT
+        // the x-bili-plugin header, so the /acp command — which looks the
+        // session up by the client's session id — can find it. The session id
+        // itself now ALSO derives from prompt_cache_key (the
+        // preferPromptCacheKeyIdentity calls above, which only kick in when the
+        // kernel would have fallen to a per-request content fingerprint) — this
+        // lookup binding remains for clients that send a real conversation
+        // header or session_id.
+        if (protocol === "responses" || protocol === "openai") {
+            const pck = (parsed as { prompt_cache_key?: unknown }).prompt_cache_key;
             if (typeof pck === "string" && pck.trim().length > 0) {
                 recordPluginSession(pck.trim(), session.id);
             }
