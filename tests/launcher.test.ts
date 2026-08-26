@@ -486,7 +486,7 @@ test("ompPluginLoadedFrom: only entries whose file exists count as loaded", () =
         assert.equal(ompPluginLoadedFrom(ompHome), false);
         // `~`-prefixed loadable entry counts as loaded (omp expands it too).
         fs.writeFileSync(path.join(ompHome, "config.yml"), `extensions:\n  - ~/live/dist/agent/omp.js\n`);
-        const realHome = live.slice(0, live.indexOf("/live/"));
+        const realHome = path.dirname(path.dirname(path.dirname(path.dirname(live))));
         const savedHome = os.homedir();
         try {
             Object.defineProperty(os, "homedir", { value: () => realHome, configurable: true });
