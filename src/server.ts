@@ -50,7 +50,7 @@ import { log as loggerLog, configureLogger, getLogPath, closeLogger } from "./lo
 import { defaultLogFile, stateDir, proxyOriginFile } from "./paths.js";
 import { compressLoopResponsesJson } from "./compress-loop-responses.js";
 import { runCompressLoop, pickAdapter } from "./loop/index.js";
-import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages } from "./loop/adapter-responses.js";
+import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeResponsesMessageItems } from "./loop/adapter-responses.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { emitStreamError } from "./stream-error.js";
@@ -1160,7 +1160,15 @@ function prepareResponses(
     // #242: over-long input item ids (poisoned rollouts) 400 upstream on every
     // request; rewrite them to short deterministic ids before anything reads
     // or replays the input.
+    // omp-style type-less user items must be typed before the projection
+    // drops them (see normalizeResponsesMessageItems) — before id sanitize and
+    // whitespace drop so those see the canonical form.
+    const typedItems = normalizeResponsesMessageItems(parsed.input);
+    if (typedItems > 0) {
+        log("info", `[${sessionId}] stamped type:"message" on ${typedItems} type-less input item(s) before projection (omp wire form)`);
+    }
     sanitizeResponsesInputIds(parsed.input);
+
     const droppedEmpty = dropWhitespaceResponsesMessages(parsed.input);
     if (droppedEmpty > 0) {
         log("info", `[${sessionId}] dropped ${droppedEmpty} whitespace-only message item(s) before projection (flattened-turn artifact)`);

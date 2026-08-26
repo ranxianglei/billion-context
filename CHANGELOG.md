@@ -5,6 +5,10 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ## [Unreleased]
 
+### Fixes
+
+- **Responses: stamp `type:"message"` on type-less input items at ingress.** omp (pi-ai) sends user items without the spec-required `type` field; the kernel wire projection switches on `item.type` and silently dropped them, so user prompts never entered the compression state (no refs, never tagged, never compressible, invisible to nudge/preflight — #247 testing caught this).
+
 ### Features
 
 - **Launcher-handed context windows (`BILI_LAUNCHER_MODEL_WINDOWS`)**: `bili <client>` launchers already read the client's own model config when rewriting endpoints — they now also capture each model's declared context window (pi `models.json` `contextWindow`, omp `models.yml` `contextWindow`, opencode `opencode.json` `models.<id>.limit`, codex `config.toml` `model` + `model_context_window`) and hand the map to the spawned proxy via the `BILI_LAUNCHER_MODEL_WINDOWS` env var. The proxy ranks it between the plugin report and the models.dev registry in the native-window chain, so a self-hosted model named like a known family (`qwen3.8-27b` → table guessed 128k) no longer gets the built-in table's denominator — the nudge percent reflects the client's real window (262k in the wild-caught case, where an omp session was being compressed at 29% real usage because the proxy computed 81% against a wrong 95k denominator). No user configuration needed; only the launcher sets the env.
