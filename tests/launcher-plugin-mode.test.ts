@@ -94,6 +94,7 @@ async function startRig(): Promise<Rig> {
     await listen(proxy);
     const proxyPort = (proxy.address() as { port: number }).port;
     return {
+        proxyPort,
         upstreamPort,
         proxyUrl: (path) => `http://127.0.0.1:${proxyPort}${path}`,
         modelUrl: () => `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`,
@@ -168,6 +169,42 @@ test("launcher headless pending binding: register BEFORE the first request binds
         assert.ok(status.ok, "pending register consumed by the new session");
         assert.equal(status.pluginAgent, "mcp");
     } finally {
+        await rig.closeAll();
+    }
+});
+
+test("launcher identity binding survives model switches (one conversation, multiple sessions)", async () => {
+    const rig = await startRig();
+    const upstream2Bodies: string[] = [];
+    const upstream2 = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c: Buffer) => chunks.push(c));
+        req.on("end", () => {
+            upstream2Bodies.push(Buffer.concat(chunks).toString("utf8"));
+            res.writeHead(200, { "content-type": "text/event-stream" });
+            res.end(textScript());
+        });
+    });
+    upstream2.listen(0, "127.0.0.1");
+    await listen(upstream2);
+    try {
+        const port2 = (upstream2.address() as { port: number }).port;
+        const postUpstream2 = (): Promise<Response> => fetch(`http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${port2}/v1/messages`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-claude-code-session-id": "sess-switch" },
+            body: JSON.stringify({ model: "l162-model", max_tokens: 10, stream: true, messages: [{ role: "user", content: "hello" }] }),
+        });
+        // First model (upstream A): binds via identity as usual.
+        await register(rig, "sess-switch", { agent: "omp", identity: true });
+        await postModel(rig, "sess-switch");
+        assert.ok(!rig.upstreamBodies[0]!.includes("\"compress\""), "upstream A: wire injection suppressed after identity binding");
+        // Model switch mid-conversation: upstream B resolves a NEW session
+        // under the SAME conversation id. The omp TUI flow (e.g. GLM chat →
+        // qwen responses) must keep plugin mode on the new session too.
+        await postUpstream2();
+        assert.ok(!upstream2Bodies[0]!.includes("\"compress\""), "upstream B: identity binding survives the model switch");
+    } finally {
+        await close(upstream2);
         await rig.closeAll();
     }
 });
