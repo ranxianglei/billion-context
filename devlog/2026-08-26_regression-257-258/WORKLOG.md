@@ -38,3 +38,12 @@
 
 - mock 路由**按请求内容**（有无 tools / 有无 function_call_output），不要按轮次计数——omp 的 title 请求（无 tools）会抢走第一轮脚本
 - omp headless 单次 `-p` 运行天然多轮：主回合工具调用 → omp 执行 → 回放 function_call+output 即第二轮请求，足够验证 #258
+
+### 补漏（review 发现，合并后追加）
+
+- 上面的本地 merge 只拉进了两个 PR 的**初始 commit**（f5342f3 / 7e7fbb1），漏掉了各自 review 期间推上的修复：
+  - `2a1bd22`（#257 分支）：identity register 失败后重试——不修则 register 失败会把整个 session 钉死在 wire 模式（ACP 工具双份）
+  - `21fa531`（#258 分支）：CHANGELOG 重复的 `### Fixes` 标题
+- 补两个 merge（零冲突）：`a05cba5`（merge #257 head）+ `cffc5d5`（merge #258 head）
+- 重跑预检：typecheck ✓ / **636/636** / build ✓（dist/index.js 2.48 MB，dist/agent/omp.js 11.79 KB）
+- e2e 结论对新树仍成立：2a1bd22 只改 register **失败**路径（e2e 走的是首请求即绑定成功的 happy path，终态一致）；21fa531 纯 docs
