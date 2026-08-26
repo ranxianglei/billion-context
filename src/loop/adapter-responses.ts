@@ -30,6 +30,26 @@ const RESPONSES_ITEM_ID_MAX = 64;
  * request otherwise). Rewrites in place, deterministically, so repeated
  * requests keep referencing the same replacement id (#242).
  */
+export function normalizeResponsesMessageItems(input: unknown): number {
+    if (!Array.isArray(input)) return 0;
+    let typed = 0;
+    for (const item of input) {
+        if (typeof item !== "object" || item === null) continue;
+        const rec = item as Record<string, unknown>;
+        if (rec["type"] !== undefined) continue;
+        if (rec["role"] !== "user" && rec["role"] !== "assistant") continue;
+        if (rec["content"] === undefined) continue;
+        // omp (pi-ai) sends user items without the spec-required "type" field;
+        // responsesToCore switches on item.type and silently drops type-less
+        // items, so user prompts never enter the kernel (no refs, never
+        // compressible, invisible to nudge/preflight). Stamp the standard
+        // type at ingress.
+        rec["type"] = "message";
+        typed++;
+    }
+    return typed;
+}
+
 export function sanitizeResponsesInputIds(input: unknown): void {
     if (!Array.isArray(input)) return;
     for (const item of input) {
