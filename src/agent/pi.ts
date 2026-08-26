@@ -264,11 +264,30 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             }
             void registerTools(pi, ctx, state, agent).catch((err: unknown) => console.error(`bili-plugin(${agent}): ${err instanceof Error ? err.message : String(err)}`));
         });
-        pi.on("before_provider_request", (_event, ctx) => {
+        pi.on("before_provider_request", (event, ctx) => {
             // omp emits this per model request (but never before_provider_headers);
             // it doubles as the retry driver when the session_start manifest
             // fetch raced the proxy startup. Cached by sid, throttled by retryAt.
             void registerTools(pi, ctx, state, agent).catch((err: unknown) => console.error(`bili-plugin(${agent}): ${err instanceof Error ? err.message : String(err)}`));
+            // omp's chat-completions payloads carry no conversation marker at
+            // all (no prompt_cache_key / session / user field — verified against
+            // omp 17.3.8), so the proxy falls back to hashing the first user
+            // message: the identity register and the /acp conversation lookup
+            // (both keyed by the omp session id) never match. Responses
+            // payloads already carry prompt_cache_key natively — stamp it onto
+            // chat-shaped payloads the same way. The handler's return value
+            // REPLACES the outgoing payload (omp emits onPayload → this event).
+            if (agent !== "omp") return undefined;
+            const payload = (event as { payload?: unknown }).payload;
+            if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return undefined;
+            const p = payload as Record<string, unknown>;
+            if (!Array.isArray(p["messages"])) return undefined;
+            if (Array.isArray(p["input"])) return undefined;
+            if (typeof p["max_tokens"] === "number") return undefined;
+            if (typeof p["prompt_cache_key"] === "string") return undefined;
+            const sid = sessionIdOf(ctx);
+            if (sid === undefined || sid === "") return undefined;
+            return { ...p, prompt_cache_key: sid };
         });
         pi.on("session_start", (_event, ctx) => {
             state.sid = undefined;

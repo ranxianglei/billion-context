@@ -786,3 +786,33 @@ test("omp identity register failure throttles and retries later", async () => {
         await proxy.close();
     }
 });
+
+test("omp plugin stamps prompt_cache_key on chat-shaped provider payloads", async () => {
+    const proxy = await startFakeProxy();
+    try {
+        const pi = makeFakePi();
+        ompPlugin(pi as never);
+        await pi.events.get("session_start")!({}, fakeCtx(proxy, "omp-sess-pck"));
+        await waitForTools(pi, 2);
+        const chat = { model: "glm-5.3", messages: [{ role: "user", content: "hi" }], stream: true };
+        const out = await pi.events.get("before_provider_request")!({ payload: chat }, fakeCtx(proxy, "omp-sess-pck"));
+        assert.equal((out as Record<string, unknown>)["prompt_cache_key"], "omp-sess-pck");
+        assert.equal((out as Record<string, unknown>)["model"], "glm-5.3");
+        // responses-shaped payloads already carry it natively — untouched
+        const resp = { model: "m", input: [{ type: "message", role: "user", content: "hi" }], prompt_cache_key: "native" };
+        const out2 = await pi.events.get("before_provider_request")!({ payload: resp }, fakeCtx(proxy, "omp-sess-pck"));
+        assert.equal(out2, undefined);
+        // anthropic wire (max_tokens) — untouched
+        const anth = { model: "m", messages: [{ role: "user", content: "hi" }], max_tokens: 1024 };
+        assert.equal(await pi.events.get("before_provider_request")!({ payload: anth }, fakeCtx(proxy, "omp-sess-pck")), undefined);
+        // no session id — untouched
+        assert.equal(await pi.events.get("before_provider_request")!({ payload: { ...chat } }, fakeCtx(proxy, "")), undefined);
+        // pi plugin (agent==="pi") never rewrites payloads
+        const piCli = makeFakePi();
+        biliPlugin(piCli as never);
+        await piCli.events.get("session_start")!({}, fakeCtx(proxy, "pi-sess"));
+        assert.equal(await piCli.events.get("before_provider_request")!({ payload: { ...chat } }, fakeCtx(proxy, "pi-sess")), undefined);
+    } finally {
+        await proxy.close();
+    }
+});

@@ -729,10 +729,23 @@ async function handle(
                   parsed as ResponsesRequestBody,
               )
             : undefined;
+        // OpenAI chat payloads carry no native session marker; omp's plugin
+        // stamps prompt_cache_key onto them (before_provider_request) for the
+        // same identity/record benefits the responses path gets natively.
+        const openaiIdentity = protocol === "openai"
+            ? preferPromptCacheKeyIdentity(
+                  {
+                      value: conversationSignalOpenai(parsed as OpenAIRequestBody, convHeader),
+                      source: convHeader ? "header" : "content-fingerprint",
+                      clientProvided: !!convHeader,
+                  },
+                  parsed as unknown as { prompt_cache_key?: unknown },
+              )
+            : undefined;
         const conversation = protocol === "anthropic"
             ? conversationSignalAnthropic(parsed as AnthropicRequestBody, convHeader)
             : protocol === "openai"
-              ? conversationSignalOpenai(parsed as OpenAIRequestBody, convHeader)
+              ? openaiIdentity?.value ?? conversationSignalOpenai(parsed as OpenAIRequestBody, convHeader)
               : subagentNamespace(
                   responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
                   (parsed as ResponsesRequestBody).instructions,
@@ -747,14 +760,16 @@ async function handle(
         //    body.session_id) — never the synthetic one — so a user can tell
         //    at a glance which client owns a session. pi sends nothing, so its
         //    label stays empty (shown as "—" in the UI).
-        const affinity = affinityToken(responsesIdentity ?? {
+        const affinity = affinityToken(responsesIdentity ?? openaiIdentity ?? {
             value: clientConv ?? conversation,
             source: clientConv ? "header" : "generated",
             clientProvided: !!clientConv,
         });
         const clientLabel = responsesIdentity?.clientProvided
             ? responsesIdentity.value
-            : clientConversationHeader(req.headers);
+            : openaiIdentity?.clientProvided
+              ? openaiIdentity.value
+              : clientConversationHeader(req.headers);
         const session = getSession(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? undefined });
         // Launcher-mode binding (#162): prefer identity — claude code sends
         // x-claude-code-session-id on every request, equal to the
@@ -790,7 +805,7 @@ async function handle(
         // which only kicks in when the kernel would have fallen to a
         // per-request content fingerprint) — this lookup binding remains for
         // clients that send a real conversation header or session_id.
-        if (protocol === "responses") {
+        if (protocol === "responses" || protocol === "openai") {
             const pck = (parsed as ResponsesRequestBody).prompt_cache_key;
             if (typeof pck === "string" && pck.trim().length > 0) {
                 recordPluginSession(pck.trim(), session.id);
