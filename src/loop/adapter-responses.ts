@@ -40,6 +40,64 @@ export function sanitizeResponsesInputIds(input: unknown): void {
     }
 }
 
+/**
+ * Responses input flattens a mixed assistant turn (text + tool calls) into
+ * separate items, so the whitespace-only text deltas SGLang/vllm-class models
+ * emit before tool calls land as standalone 1-2 token message items (omp
+ * serializes exactly this shape). Left alone, every one gets an acp render
+ * tag — a 42-token wrapper around pure whitespace — and burns a message ref
+ * the model later has to reason about. Content-free by definition, so drop
+ * them before projection; deterministic per request, keeping refs stable.
+ */
+export function dropWhitespaceResponsesMessages(input: unknown): number {
+    if (!Array.isArray(input)) return 0;
+    let dropped = 0;
+    for (let i = input.length - 1; i >= 0; i--) {
+        const rec = input[i] as Record<string, unknown>;
+        if (rec === null || typeof rec !== "object") continue;
+        const type = rec.type;
+        // message items carry type "message"; omp's user items omit the field
+        // entirely (role + content only) — treat those as messages too.
+        if (type !== "message" && type !== undefined) continue;
+        const role = rec.role;
+        if (role !== "user" && role !== "assistant") continue;
+        const content = rec.content;
+        let text: string | undefined;
+        if (typeof content === "string") text = content;
+        else if (Array.isArray(content)) {
+            let mixed = false;
+            let joined = "";
+            for (const part of content) {
+                const p = part as Record<string, unknown>;
+                if (p === null || typeof p !== "object") continue;
+                const pt = p.type;
+                if (pt !== undefined && pt !== "input_text" && pt !== "output_text" && pt !== "text") {
+                    mixed = true;
+                    break;
+                }
+                if (typeof p.text === "string") joined += p.text;
+            }
+            if (!mixed) text = joined;
+        }
+        // Replay stickiness: an originally-whitespace message comes back on
+        // every later request carrying the render tag a previous turn
+        // stamped onto it (tag + whitespace, still semantically empty). A
+        // tag wrapping a real ref over real content keeps the message alive;
+        // only tag-over-nothing is droppable.
+        if (text !== undefined && stripRenderTags(text).trim() === "") {
+            input.splice(i, 1);
+            dropped++;
+        }
+    }
+    return dropped;
+}
+
+const RENDER_TAG_RE = /\x3cacp\s[^>]*\x3e[^<]*\x3c\/acp\x3e|\x3cacp\s[^>]*\/\x3e/g;
+
+function stripRenderTags(text: string): string {
+    return text.replace(RENDER_TAG_RE, "");
+}
+
 interface MappedItem {
     id: string;
     index: number;
