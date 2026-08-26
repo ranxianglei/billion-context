@@ -42,7 +42,7 @@ import { getSession, listSessions, type Session, initSessions, markDirty, flushA
 import { COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressHybridSystemPrompt } from "./compress-tool.js";
 import { rewriteSseStream, rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
-import { preflightCompress } from "./preflight.js";
+import { preflightCompress, estimateCoreMessages } from "./preflight.js";
 import { renderUI, handleConfigGet, handleConfigPut } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { getStore } from "./persist.js";
@@ -1501,7 +1501,10 @@ async function preflightCompressIfNeeded(
 ): Promise<Prepared> {
     const session = prepared.session;
     const limit = config.modelContextLimit;
-    const tokenCount = session.stats.lastInputTokens;
+    // A fresh session (id rotated, e.g. after a model switch) has
+    // lastInputTokens = 0 while still carrying a full raw history; size the
+    // trigger on the real post-fold payload too.
+    const tokenCount = Math.max(session.stats.lastInputTokens, estimateCoreMessages(prepared.processedMessages));
     if (limit <= 0 || !model || tokenCount < limit) return prepared;
     if ((prepared.nudge?.compressibleRanges ?? []).length === 0) return prepared;
     log("warn", `[${session.id}] context ${tokenCount} tokens exceeds model window ${limit} (model=${model}); preflight compressing before forward`);

@@ -66,6 +66,12 @@ function refNum(ref: string): number {
     return Number(ref.replace(/\D/g, "")) || 0;
 }
 
+export function estimateCoreMessages(messages: CoreMessage[]): number {
+    let tokens = 0;
+    for (const m of messages) tokens += estimateTokensFast(m.text ?? "");
+    return tokens;
+}
+
 function rangeChars(messages: CoreMessage[], startIdx: number, endIdx: number): number {
     let chars = 0;
     for (let i = startIdx; i <= endIdx && i < messages.length; i++) {
@@ -193,13 +199,17 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     const limit = deps.config.modelContextLimit;
     const result: PreflightResult = { compressedRanges: 0, savedTokens: 0 };
     if (limit <= 0) return result;
-    const startTokens = deps.session.stats.lastInputTokens;
     const budget = Math.max(MIN_CHUNK_TOKENS, Math.floor(limit * CHUNK_FRACTION));
     // applyCompression rejects ranges below config.compress.minCompressRange
     // chars, so never spend a summarization call on a chunk that can't apply.
     const minChars = deps.config.compress.minCompressRange;
+    // The fit check runs on the real post-fold payload size, not on
+    // stats.lastInputTokens: a fresh session (its id rotated, e.g. after a
+    // model switch) starts at 0 while still carrying a full raw history that
+    // overflows the smaller window.
+    let currentTokens = deps.session.stats.lastInputTokens;
+    let startTokens = -1;
     for (let round = 0; round < MAX_PREFLIGHT_ROUNDS; round++) {
-        if (deps.session.stats.lastInputTokens < limit) break;
         if (deps.signal?.aborted) break;
         // Re-run the pipeline each round: every successful compress renumbers
         // the surviving refs, so the previous round's range refs are stale.
@@ -207,10 +217,13 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             messages,
             state: deps.session.state,
             config: deps.config,
-            tokenCount: deps.session.stats.lastInputTokens,
+            tokenCount: currentTokens,
             renderTags: "text-only",
         });
         deps.session.state = turn.state;
+        currentTokens = estimateCoreMessages(turn.messages);
+        if (startTokens < 0) startTokens = currentTokens;
+        if (currentTokens < limit) break;
         const ranges = viableRanges(turn.nudge?.compressibleRanges ?? []);
         if (ranges.length === 0) break;
         const range = [...ranges].sort((a, b) => refNum(a.startRef) - refNum(b.startRef))[0];
@@ -220,7 +233,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         if (startIdx === undefined || endIdx === undefined || startIdx > endIdx) break;
         let appliedThisRound = 0;
         for (const [cs, ce] of splitChunks(messages, startIdx, endIdx, budget)) {
-            if (deps.session.stats.lastInputTokens < limit) break;
+            if (currentTokens < limit) break;
             if (deps.signal?.aborted) break;
             const maps = refMaps(messages, deps.session.state);
             const startRef = maps.idxToRef.get(cs);
@@ -248,19 +261,23 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 session: deps.session,
                 log: (msg) => deps.log("info", msg),
             };
+            const creditBefore = deps.session.stats.compressCreditTokens;
             const applied = applyRanges(parseCompressInput({ content: [{ startId: startRef, endId: endRef, summary, topic: "preflight overflow compress" }] }), ctx);
             if (applied.startsWith("[Compression FAILED")) {
                 deps.log("warn", `[preflight] ${applied}`);
                 continue;
             }
-            // The summary itself re-enters the payload; net its cost back so
-            // the fit check sees the true post-fold size.
+            // The summary itself re-enters the payload; net its cost against
+            // both the folded size and the session's input baseline.
+            const compressed = deps.session.stats.compressCreditTokens - creditBefore;
+            currentTokens = Math.max(0, currentTokens - compressed + estimateTokensFast(summary));
             deps.session.stats.lastInputTokens += estimateTokensFast(summary);
             appliedThisRound += 1;
             result.compressedRanges += 1;
         }
         if (appliedThisRound === 0) break;
     }
-    result.savedTokens = Math.max(0, startTokens - deps.session.stats.lastInputTokens);
+    if (result.compressedRanges > 0) deps.session.stats.lastInputTokens = currentTokens;
+    result.savedTokens = Math.max(0, startTokens - currentTokens);
     return result;
 }

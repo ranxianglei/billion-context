@@ -11,22 +11,25 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions } from "../src/session.ts";
 
-// #247: mid-session model switch from a 1M-context model to a 260k one.
-// The session's real context (previous turn's upstream input_tokens) exceeds
-// the new model's window, so the payload overflows at forward time and the
-// reactive nudge can never fire (the request itself is rejected before the
-// model sees it) — the session is stuck. The proxy must proactively compress
-// the oldest compressible ranges BEFORE forwarding (dedicated summarization
-// calls sized to fit the smaller window), then rebuild and forward a payload
-// that fits.
+// #247: mid-session model switch to a smaller-window model. The trigger and
+// the fit check run on the REAL post-fold payload size (max of the session's
+// lastInputTokens and the current payload estimate), so preflight fires both
+// for a stable session whose measured context exceeds the new window AND for
+// a fresh session (id rotated by the switch) whose lastInputTokens is 0 but
+// whose raw history overflows. Without it the payload overflows at forward
+// time and the reactive nudge can never fire (the request itself is rejected
+// before the model sees it) — the session is stuck. The proxy must
+// proactively compress the oldest compressible ranges BEFORE forwarding
+// (dedicated summarization calls sized to fit the smaller window), then
+// rebuild and forward a payload that fits.
 //
 // Scenario:
 //   1. Request 1 on claude-big (400k window), upstream reports
 //      input_tokens=300000 → session.lastInputTokens = 300000.
-//   2. Request 2 on claude-small (260k window) with a 12-message
-//      conversation. 300000 >= 260000 → preflight fires: the oldest
-//      compressible ranges are summarized (non-streaming JSON calls to the
-//      upstream) and folded into blocks; the rebuilt payload (recent
+//   2. Request 2 on claude-small (10k window) with a ~13k-token
+//      conversation: the payload itself overflows → preflight fires: the
+//      oldest compressible ranges are summarized (non-streaming JSON calls
+//      to the upstream) and folded into blocks; the rebuilt payload (recent
 //      protected messages + summaries) is forwarded and gets a 200.
 
 const SUMMARY_TEXT =
@@ -98,7 +101,7 @@ test("e2e: model switch to a smaller window → preflight compresses before forw
         port: 0,
         host: "127.0.0.1",
         upstream: "http://127.0.0.1",
-        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-big": { context: 400_000 }, "claude-small": { context: 260_000 } } } },
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-big": { context: 400_000 }, "claude-small": { context: 10_000 } } } },
         modelContextLimit: 400_000,
         kernelConfig: defaultConfig(400_000),
         compress: { injectTool: true, injectNudge: true },
@@ -152,14 +155,14 @@ test("e2e: model switch to a smaller window → preflight compresses before forw
 
         // The forwarded payload is the rebuilt one: oldest messages folded
         // into summaries, recent protected messages intact. (MARKER_0_ is the
-        // FIRST user message — the kernel's prune always preserves it, so it
-        // is the only original that may remain.)
+        // FIRST user message — the kernel's prune always preserves it; the
+        // exact fold boundary depends on the kernel's range partitioning, so
+        // only the oldest and newest markers are asserted.)
         const forwards = calls.filter((c) => c.stream);
         const lastForward = forwards[forwards.length - 1];
         assert.ok(lastForward, "a forward happened");
         assert.ok(!lastForward.body.includes("MARKER_1_"), "compressed messages are out of the payload");
-        assert.ok(!lastForward.body.includes("MARKER_4_"), "compressed messages are out of the payload");
-        assert.ok(!lastForward.body.includes("MARKER_6_"), "compressed messages are out of the payload");
+        assert.ok(lastForward.body.includes("MARKER_7_"), "recent messages remain in the payload");
         assert.ok(lastForward.body.includes("MARKER_11_"), "recent protected messages remain in the payload");
         assert.ok(lastForward.body.includes(SUMMARY_TEXT), "the preflight summary is in the rebuilt payload");
 
@@ -242,6 +245,99 @@ test("e2e: no preflight when the context fits the (small) model window", async (
         assert.equal(calls.filter((c) => !c.stream).length, 0, "no summarization calls when the context fits");
         const s = listSessions()[0];
         assert.equal((s?.state.blocks ?? []).filter((b) => b.active).length, 0, "no blocks created");
+    } finally {
+        proxy.close();
+        await once(proxy, "close");
+        upstream.close();
+        await once(upstream, "close");
+    }
+});
+
+test("e2e: fresh session (lastInputTokens=0) whose raw history overflows the window → preflight compresses", async () => {
+    const calls: Array<{ stream: boolean; body: string }> = [];
+    const upstream = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c: Buffer) => chunks.push(c));
+        req.on("end", () => {
+            const raw = Buffer.concat(chunks).toString("utf8");
+            let parsed: { stream?: boolean } = {};
+            try { parsed = JSON.parse(raw); } catch { /* keep {} */ }
+            calls.push({ stream: !!parsed.stream, body: raw });
+            if (parsed.stream) {
+                res.writeHead(200, { "content-type": "text/event-stream" });
+                res.end(okSse(1000));
+            } else {
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(JSON.stringify({
+                    id: "msg_summary", type: "message", role: "assistant", model: "claude-small",
+                    content: [{ type: "text", text: SUMMARY_TEXT }], stop_reason: "end_turn",
+                    usage: { input_tokens: 500, output_tokens: 50 },
+                }));
+            }
+        });
+    });
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = upstream.address().port;
+
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    const proxy = await startServer({
+        port: 0,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1",
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-small": { context: 10_000 } } } },
+        modelContextLimit: 400_000,
+        kernelConfig: defaultConfig(400_000),
+        compress: { injectTool: true, injectNudge: true },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        mitm: { enabled: false, domains: [] },
+    } as ProxyOptions);
+    await once(proxy, "listening");
+    const proxyPort = proxy.address().port;
+
+    try {
+        // No prior request: the session is brand new (lastInputTokens = 0),
+        // e.g. after a model switch rotated the session id and the client
+        // resends its full raw history. The ~13k-token history overflows the
+        // 10k window on the very first request — preflight must still fire
+        // (payload-size trigger, not lastInputTokens).
+        const r = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "preflight-fresh-sess" },
+            body: JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: bigConversation() }),
+        });
+        assert.equal(r.status, 200, "the fresh-session request succeeds (no context-full error)");
+        await r.text();
+
+        const summaryCalls = calls.filter((c) => !c.stream);
+        assert.ok(summaryCalls.length >= 1, `preflight made summarization call(s) before forwarding (got ${summaryCalls.length})`);
+        for (const c of summaryCalls) {
+            assert.ok(c.body.includes("Compression") || c.body.includes("compress"), "summarization call carries the compression rules");
+        }
+
+        const s = listSessions()[0];
+        const activeBlocks = (s?.state.blocks ?? []).filter((b) => b.active);
+        assert.ok(activeBlocks.length >= 1, `preflight created compression block(s) (got ${activeBlocks.length})`);
+        assert.ok(activeBlocks.every((b) => b.summary === SUMMARY_TEXT), "blocks hold the upstream-written summaries");
+
+        const forwards = calls.filter((c) => c.stream);
+        const lastForward = forwards[forwards.length - 1];
+        assert.ok(lastForward, "a forward happened");
+        assert.ok(!lastForward.body.includes("MARKER_1_"), "compressed messages are out of the payload");
+        assert.ok(lastForward.body.includes("MARKER_7_"), "recent messages remain in the payload");
+        assert.ok(lastForward.body.includes("MARKER_11_"), "recent protected messages remain in the payload");
+        assert.ok(lastForward.body.includes(SUMMARY_TEXT), "the preflight summary is in the rebuilt payload");
+
+        // The session's input baseline is corrected from 0 to the real
+        // (small) post-fold size via the usage report — the next turn is not
+        // stuck on a stale figure.
+        assert.equal(s?.stats.lastInputTokens, 1000);
     } finally {
         proxy.close();
         await once(proxy, "close");
