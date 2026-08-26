@@ -60,6 +60,10 @@ export interface HermesConfig {
     providers: Record<string, HermesProvider>;
 }
 
+export interface DshConfig {
+    baseUrls: string[];
+}
+
 export interface ClientConfig {
     claude?: ClaudeSettings;
     codex?: CodexConfig;
@@ -68,6 +72,7 @@ export interface ClientConfig {
     omp?: OmpConfig;
     opencode?: OpencodeConfig;
     hermes?: HermesConfig;
+    dsh?: DshConfig;
 }
 
 export function nonEmpty(s: unknown): s is string {
@@ -107,6 +112,42 @@ export function resolveHermesHome(env: NodeJS.ProcessEnv): string {
     const h = os.homedir();
     return nonEmpty(env.HERMES_HOME) ? env.HERMES_HOME!
         : path.join(h, ".hermes");
+}
+
+/** deepseek-harness (dsh) keeps settings under DSH_HOME (default ~/.dsh). */
+export function resolveDshHome(env: NodeJS.ProcessEnv): string {
+    const h = os.homedir();
+    return nonEmpty(env.DSH_HOME) ? env.DSH_HOME!
+        : path.join(h, ".dsh");
+}
+
+/** Line-based scanner for dsh settings.yaml: collects every http(s) URL that
+ *  appears as a baseURL/baseUrl/base_url value (llm-pi-ai provider profiles,
+ *  llm-deepseek baseURL, model-level overrides). Route discovery only needs
+ *  the endpoint set — the launcher rewrites the same lines in an overlay. */
+export function parseDshSettingsYaml(text: string): string[] {
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const rawLine of text.split(/\r?\n/)) {
+        const m = /^\s*(?:baseURL|baseUrl|base_url):\s*(\S+)(?:\s+#.*)?$/.exec(rawLine);
+        if (!m) continue;
+        const url = m[1].replace(/^["']|["']$/g, "");
+        if (!/^https?:\/\//i.test(url)) continue;
+        if (seen.has(url)) continue;
+        seen.add(url);
+        out.push(url);
+    }
+    return out;
+}
+
+export function readDshConfig(dshHome: string): DshConfig {
+    let text: string;
+    try {
+        text = fs.readFileSync(path.join(dshHome, "settings.yaml"), "utf8");
+    } catch {
+        return { baseUrls: [] };
+    }
+    return { baseUrls: parseDshSettingsYaml(text) };
 }
 
 export function readClaudeSettings(homeDir: string, cwd: string, env: NodeJS.ProcessEnv = process.env): ClaudeSettings {
@@ -410,5 +451,6 @@ export function loadClientConfig(env: NodeJS.ProcessEnv, cwd: string): ClientCon
     config.omp = readOmpConfig(resolveOmpHome(env));
     config.opencode = readOpencodeConfig(resolveOpencodeConfigFile(env));
     config.hermes = readHermesConfig(resolveHermesHome(env));
+    config.dsh = readDshConfig(resolveDshHome(env));
     return config;
 }

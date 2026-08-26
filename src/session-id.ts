@@ -2,7 +2,7 @@ import { hashId } from "./util.js";
 
 export type ConversationIdentity = {
     value: string;
-    source: "header" | "body-session" | "metadata-session" | "previous-response" | "content-fingerprint" | "generated";
+    source: "header" | "body-session" | "metadata-session" | "previous-response" | "prompt-cache-key" | "content-fingerprint" | "generated";
     clientProvided: boolean;
 };
 
@@ -123,4 +123,30 @@ export function deriveSessionId(
  */
 export function affinityToken(identity: ConversationIdentity): string | undefined {
     return identity.clientProvided ? identity.value : undefined;
+}
+
+/**
+ * Promote a Responses body's `prompt_cache_key` over a content-fingerprint
+ * identity. Clients that replay full history statelessly (omp, some codex
+ * builds) send NO conversation headers and NO previous_response_id, so the
+ * kernel's identity chain falls to a hash of the ENTIRE input array — which
+ * changes every turn as the conversation grows, minting a brand-new session
+ * per request. Consequences: compression state never accumulates (the nudge
+ * sees tokenCount=0 at evaluation time, so a 90%-full context is never
+ * compressed) and the upstream affinity token churns every turn.
+ *
+ * `prompt_cache_key` is exactly the missing signal: it is the client's own
+ * stable per-conversation id (the OpenAI Responses cache-routing field).
+ * It only replaces the fingerprint — real conversation headers, body
+ * session_ids, and previous_response_id all stay stronger, so this can never
+ * override an identity the client stated more explicitly.
+ */
+export function preferPromptCacheKeyIdentity<T extends ConversationIdentity>(
+    identity: T | undefined,
+    body: { prompt_cache_key?: unknown },
+): T | undefined {
+    if (!identity || identity.source !== "content-fingerprint") return identity;
+    const pck = typeof body.prompt_cache_key === "string" ? body.prompt_cache_key.trim() : "";
+    if (pck.length === 0) return identity;
+    return { ...identity, value: pck, source: "prompt-cache-key", clientProvided: true };
 }
