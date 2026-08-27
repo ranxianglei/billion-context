@@ -1172,6 +1172,14 @@ function prepareOpenai(
     }
 
     const rebuilt: OpenAIRequestBody = { ...parsed, messages: rebuiltMessages, tools: toolsOut as OpenAITool[] | undefined };
+    // prompt_cache_retention is an OpenAI-host-only cache directive; the dsh
+    // launcher forces PI_CACHE_RETENTION=long (for the session-id
+    // prompt_cache_key) which makes the client also emit it. Third-party
+    // OpenAI-compatible upstreams may reject unknown fields, and cache policy
+    // is the upstream's business — strip it. prompt_cache_key itself passes
+    // through: upstreams that ignore it lose nothing, upstreams that use it
+    // get a per-conversation routing hint.
+    delete (rebuilt as Record<string, unknown>).prompt_cache_retention;
     // OpenAI Chat Completions only emits a usage object in the final stream
     // chunk when the client sets stream_options.include_usage=true. Without
     // it, streaming sessions never learn their real input_tokens →
@@ -1320,6 +1328,10 @@ function prepareResponses(
     // (top-level instructions must stay empty for code_mode tool exposure).
     if (process.env.ACP_KEEP_RESPONSE_ID !== "1") delete rebuilt.previous_response_id;
     delete rebuilt.instructions;
+    // Same rationale as prepareOpenai: strip the OpenAI-host-only cache
+    // directive; keep prompt_cache_key. Sent by hermes' codex transport and
+    // by any PI_CACHE_RETENTION=long client.
+    delete (rebuilt as Record<string, unknown>).prompt_cache_retention;
     // Log the final tools we forward upstream so we can confirm ACP tools are
     // present. Distinguishes "compress" (top-level function) from Codex
     // namespace items (type:namespace/custom).

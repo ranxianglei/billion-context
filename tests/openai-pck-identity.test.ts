@@ -95,6 +95,14 @@ function postChat(rig: Rig, pck: string): Promise<Response> {
     });
 }
 
+function postChatRaw(rig: Rig, body: Record<string, unknown>): Promise<Response> {
+    return fetch(rig.chatUrl(), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ model: "glm-test", messages: [{ role: "user", content: "hello" }], ...body }),
+    });
+}
+
 async function register(rig: Rig, conversationId: string, agent: string, identity: boolean): Promise<void> {
     const res = await fetch(rig.proxyUrl("/__bili/plugin/register"), {
         method: "POST",
@@ -142,6 +150,19 @@ test("openai pck: identity register + matching pck binds pluginMode (wire inject
         const s = await status(rig, "omp-uuid-bind");
         assert.equal(s.ok, true, "bound conversation is found");
         assert.equal(s.pluginAgent, "omp", "pluginAgent recorded as omp");
+    } finally {
+        await rig.closeAll();
+    }
+});
+
+test("openai: prompt_cache_retention stripped, prompt_cache_key forwarded (dsh PI_CACHE_RETENTION=long)", async () => {
+    const rig = await startRig();
+    try {
+        await postChatRaw(rig, { prompt_cache_key: "dsh-session-uuid", prompt_cache_retention: "24h" });
+        assert.equal(rig.upstreamBodies.length, 1);
+        const sent = JSON.parse(rig.upstreamBodies[0]!) as Record<string, unknown>;
+        assert.equal(sent.prompt_cache_key, "dsh-session-uuid", "session id passes through");
+        assert.equal("prompt_cache_retention" in sent, false, "OpenAI-host-only cache directive stripped");
     } finally {
         await rig.closeAll();
     }
