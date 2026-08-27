@@ -11,11 +11,11 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { _resetSessionsForTest } from "../src/session.ts";
 
-// #286: strong-signal (clientProvided) conversation identities must key the
-// session on (protocol, conversation) only — credential rotation (ChatGPT
-// OAuth bearer) and upstream/relay switches must not orphan the session and
-// its compression state. Weak signals (content fingerprints) keep the full
-// 4-dim key (protocol|upstream|credential|conversation) for isolation.
+// #286: the session ID is the client-provided conversation value VERBATIM —
+// no hash, no other dimensions. Credential rotation (ChatGPT OAuth bearer),
+// upstream/relay switches, and even wire-protocol switches must not orphan
+// the session and its compression state. Requests WITHOUT a client-provided
+// identity are rejected with 400 (content-fingerprint sessions disabled).
 
 function responsesSse(): string {
     const block = (type: string, data: Record<string, unknown>): string => `event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`;
@@ -150,14 +150,17 @@ async function getSessions(h: Harness): Promise<StatsSession[]> {
 }
 
 async function post(h: Harness, upstreamIdx: number, path: string, body: Record<string, unknown>, headers: Record<string, string> = {}): Promise<void> {
+    const resp = await postRaw(h, upstreamIdx, path, body, headers);
+    assert.equal(resp.status, 200, `proxy returned ${resp.status}: ${await resp.text()}`);
+}
+
+async function postRaw(h: Harness, upstreamIdx: number, path: string, body: Record<string, unknown>, headers: Record<string, string> = {}): Promise<Response> {
     const up = h.upstreams[upstreamIdx]!;
-    const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${up.port}${path}`, {
+    return fetch(`http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${up.port}${path}`, {
         method: "POST",
         headers: { "content-type": "application/json", ...headers },
         body: JSON.stringify(body),
     });
-    assert.equal(resp.status, 200, `proxy returned ${resp.status}`);
-    await resp.text();
 }
 
 function responsesBody(extra: Record<string, unknown> = {}): Record<string, unknown> {
@@ -178,7 +181,7 @@ function chatBody(extra: Record<string, unknown> = {}): Record<string, unknown> 
     return { model: "gpt-test", stream: true, messages: [{ role: "user", content: "hello" }], ...extra };
 }
 
-test("e2e session identity: responses body.session_id survives bearer rotation (#286, #280)", async () => {
+test("e2e session identity: responses body.session_id survives bearer rotation; id is the value verbatim (#286, #280)", async () => {
     const h = await startHarness();
     try {
         const body = responsesBody({ session_id: "019fdc81-a420-7a00-bbd1-0a64e3eb772c" });
@@ -186,6 +189,7 @@ test("e2e session identity: responses body.session_id survives bearer rotation (
         await post(h, 0, "/v1/responses", body, { authorization: "Bearer bearer-new" });
         const sessions = await getSessions(h);
         assert.equal(sessions.length, 1, `expected 1 session, got ${JSON.stringify(sessions)}`);
+        assert.equal(sessions[0]!.id, "019fdc81-a420-7a00-bbd1-0a64e3eb772c");
         assert.equal(sessions[0]!.protocol, "responses");
         assert.equal(sessions[0]!.requests, 2);
     } finally {
@@ -193,7 +197,7 @@ test("e2e session identity: responses body.session_id survives bearer rotation (
     }
 });
 
-test("e2e session identity: responses session-id header survives bearer rotation (#286)", async () => {
+test("e2e session identity: responses session-id header survives bearer rotation; id is the value verbatim (#286)", async () => {
     const h = await startHarness();
     try {
         const body = responsesBody();
@@ -201,6 +205,7 @@ test("e2e session identity: responses session-id header survives bearer rotation
         await post(h, 0, "/v1/responses", body, { authorization: "Bearer bearer-new", "session-id": "019fdc81-a420-7a00-bbd1-0a64e3eb772c" });
         const sessions = await getSessions(h);
         assert.equal(sessions.length, 1, `expected 1 session, got ${JSON.stringify(sessions)}`);
+        assert.equal(sessions[0]!.id, "019fdc81-a420-7a00-bbd1-0a64e3eb772c");
         assert.equal(sessions[0]!.protocol, "responses");
         assert.equal(sessions[0]!.requests, 2);
     } finally {
@@ -216,6 +221,7 @@ test("e2e session identity: responses body.session_id survives upstream/relay sw
         await post(h, 1, "/v1/responses", body, { authorization: "Bearer keyA" });
         const sessions = await getSessions(h);
         assert.equal(sessions.length, 1, `expected 1 session, got ${JSON.stringify(sessions)}`);
+        assert.equal(sessions[0]!.id, "019fdc81-a420-7a00-bbd1-0a64e3eb772c");
         assert.equal(sessions[0]!.requests, 2);
     } finally {
         await h.close();
@@ -230,6 +236,7 @@ test("e2e session identity: anthropic x-claude-code-session-id survives x-api-ke
         await post(h, 0, "/v1/messages", body, { "x-api-key": "sk-ant-new", "x-claude-code-session-id": "claude-sess-1" });
         const sessions = await getSessions(h);
         assert.equal(sessions.length, 1, `expected 1 session, got ${JSON.stringify(sessions)}`);
+        assert.equal(sessions[0]!.id, "claude-sess-1");
         assert.equal(sessions[0]!.protocol, "anthropic");
         assert.equal(sessions[0]!.requests, 2);
     } finally {
@@ -245,6 +252,7 @@ test("e2e session identity: openai prompt_cache_key survives bearer rotation (#2
         await post(h, 0, "/v1/chat/completions", body, { authorization: "Bearer bearer-new" });
         const sessions = await getSessions(h);
         assert.equal(sessions.length, 1, `expected 1 session, got ${JSON.stringify(sessions)}`);
+        assert.equal(sessions[0]!.id, "pck-omp-1");
         assert.equal(sessions[0]!.protocol, "openai");
         assert.equal(sessions[0]!.requests, 2);
     } finally {
@@ -252,23 +260,59 @@ test("e2e session identity: openai prompt_cache_key survives bearer rotation (#2
     }
 });
 
-test("e2e session identity: weak signal (content fingerprint) keeps credential isolation (#286)", async () => {
+test("e2e session identity: same conversation value continues across a protocol switch (relay translation, #286)", async () => {
     const h = await startHarness();
     try {
-        const body = responsesBody();
-        // No session signal at all → content fingerprint. Same content, no
-        // credential → same session (fingerprint stability).
-        await post(h, 0, "/v1/responses", body, {});
-        await post(h, 0, "/v1/responses", body, {});
-        // Same content, different credential → different session: the 4-dim
-        // key still isolates anonymous content by account.
-        await post(h, 0, "/v1/responses", body, { authorization: "Bearer keyX" });
-        // Different content, no credential → different session.
-        await post(h, 0, "/v1/responses", responsesBody({ input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "different opener" }] }] }), {});
+        // The same client conversation id first speaks the Responses API, then
+        // the OpenAI chat API (e.g. a relay that translates between them).
+        // Session state is protocol-neutral, so the session must continue.
+        await post(h, 0, "/v1/responses", responsesBody({ session_id: "cross-proto-1" }), { authorization: "Bearer keyA" });
+        await post(h, 0, "/v1/chat/completions", chatBody(), { authorization: "Bearer keyA", "x-session-id": "cross-proto-1" });
         const sessions = await getSessions(h);
-        assert.equal(sessions.length, 3, `expected 3 sessions, got ${JSON.stringify(sessions)}`);
-        const requests = sessions.map((s) => s.requests).sort((a, b) => a - b);
-        assert.deepEqual(requests, [1, 1, 2]);
+        assert.equal(sessions.length, 1, `expected 1 session, got ${JSON.stringify(sessions)}`);
+        assert.equal(sessions[0]!.id, "cross-proto-1");
+        assert.equal(sessions[0]!.requests, 2);
+    } finally {
+        await h.close();
+    }
+});
+
+test("e2e session identity: anonymous responses request → 400, no session created (#286)", async () => {
+    const h = await startHarness();
+    try {
+        const resp = await postRaw(h, 0, "/v1/responses", responsesBody(), {});
+        assert.equal(resp.status, 400);
+        const json = (await resp.json()) as { error?: { message?: string } };
+        assert.match(json.error?.message ?? "", /Missing stable conversation identity/);
+        assert.equal((await getSessions(h)).length, 0);
+    } finally {
+        await h.close();
+    }
+});
+
+test("e2e session identity: anonymous anthropic request → 400 anthropic error shape (#286)", async () => {
+    const h = await startHarness();
+    try {
+        const resp = await postRaw(h, 0, "/v1/messages", anthropicBody(), { "x-api-key": "sk-ant" });
+        assert.equal(resp.status, 400);
+        const json = (await resp.json()) as { type?: string; error?: { type?: string; message?: string } };
+        assert.equal(json.type, "error");
+        assert.equal(json.error?.type, "invalid_request_error");
+        assert.match(json.error?.message ?? "", /Missing stable conversation identity/);
+        assert.equal((await getSessions(h)).length, 0);
+    } finally {
+        await h.close();
+    }
+});
+
+test("e2e session identity: anonymous openai request → 400, even with credentials (#286)", async () => {
+    const h = await startHarness();
+    try {
+        const resp = await postRaw(h, 0, "/v1/chat/completions", chatBody(), { authorization: "Bearer keyX" });
+        assert.equal(resp.status, 400);
+        const json = (await resp.json()) as { error?: { message?: string } };
+        assert.match(json.error?.message ?? "", /Missing stable conversation identity/);
+        assert.equal((await getSessions(h)).length, 0);
     } finally {
         await h.close();
     }
@@ -281,6 +325,8 @@ test("e2e session identity: distinct session_ids stay separate (#286)", async ()
         await post(h, 0, "/v1/responses", responsesBody({ session_id: "sess-B" }), { authorization: "Bearer keyA" });
         const sessions = await getSessions(h);
         assert.equal(sessions.length, 2, `expected 2 sessions, got ${JSON.stringify(sessions)}`);
+        const ids = sessions.map((s) => s.id).sort();
+        assert.deepEqual(ids, ["sess-A", "sess-B"]);
     } finally {
         await h.close();
     }

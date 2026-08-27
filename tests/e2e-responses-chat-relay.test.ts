@@ -217,6 +217,7 @@ async function callResponses(h: Harness, input: unknown[], tools?: unknown[]): P
         stream: true,
         instructions: "You are a test assistant.",
         input,
+        session_id: "e2e-responses-chat-relay",
     };
     if (tools) body.tools = tools;
     const resp = await fetch(url, {

@@ -213,7 +213,7 @@ async function callAnthropic(h: Harness, messages: AnthropicUserMessage[], tools
     const started = Date.now();
     const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1/messages`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", "x-acp-session": "e2e-anthropic" },
         body: JSON.stringify({
             model: "claude-test",
             max_tokens: 1024,

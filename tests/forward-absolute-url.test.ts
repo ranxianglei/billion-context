@@ -75,6 +75,7 @@ test("forward: absolute-URL proxy-mode request reaches the correct upstream (no 
                     headers: {
                         "content-type": "application/json",
                         host: upstreamHost,
+                        "x-acp-session": "forward-absolute-url-test",
                         "content-length": String(Buffer.byteLength(body)),
                     },
                 },
