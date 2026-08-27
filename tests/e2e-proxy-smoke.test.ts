@@ -155,7 +155,7 @@ test("e2e proxy smoke: compress tool-call -> re-request -> round-2 streams in re
     try {
         const resp = await fetch(url, {
             method: "POST",
-            headers: { "content-type": "application/json" },
+            headers: { "content-type": "application/json", "x-acp-session": "proxy-smoke-e2e" },
             body: JSON.stringify(body),
         });
         assert.equal(resp.status, 200);

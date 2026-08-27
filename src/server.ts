@@ -54,7 +54,7 @@ import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeRe
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { emitStreamError } from "./stream-error.js";
-import { deriveSessionId as deriveProxySessionId, affinityToken, clientConversationHeader, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
+import { affinityToken, clientConversationHeader, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
 import { consumePluginRegisterFor, flushConversations, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, loadConversations, pipePluginJson, pipePluginResponsesWithStrip, pipeThroughWithUsage, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
@@ -89,6 +89,20 @@ const LAUNCHER_MODEL_WINDOWS: Readonly<Record<string, number>> = parseLauncherMo
 function launcherContextWindow(model: string): number | undefined {
     return LAUNCHER_MODEL_WINDOWS[model];
 }
+
+/** Session ids are client-provided verbatim (#286) — sanitize before using
+ *  one in a debug-dump FILENAME so a hostile value cannot escape the dir. */
+function safeSessionId(id: string | undefined): string {
+    return (id ?? "unknown").replace(/[^a-zA-Z0-9._-]/g, "_");
+}
+
+/** 400 body for requests carrying no client-provided conversation identity.
+ *  Content-fingerprint sessions are disabled (#286): the fingerprint has a
+ *  real collision surface and a silent session would orphan state the moment
+ *  the account or relay changes, so anonymous requests fail explicitly. */
+const NO_IDENTITY_MESSAGE =
+    "Missing stable conversation identity. Send one of the headers: x-session-id, x-session-affinity, x-acp-session, x-opencode-session, x-claude-code-session-id, session-id — or body session_id / prompt_cache_key (responses/openai). " +
+    "Content-fingerprint sessions are disabled (#286).";
 
 const UPSTREAM_HOP_HEADERS = new Set([
     "host",
@@ -757,7 +771,27 @@ async function handle(
                   responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
                   (parsed as ResponsesRequestBody).instructions,
               );
-        const sessionId = deriveProxySessionId(req.headers, protocol, upstreamOrigin, conversation);
+        // The session ID is the client-provided conversation value VERBATIM —
+        // no hash, no protocol/credential/upstream dimensions (#286): those
+        // are all mutable mid-conversation (bearer rotation, relay switching,
+        // protocol translation), and only the client's own conversation id is
+        // bound to the conversation. Requests without a client-provided
+        // identity are rejected: content-fingerprint sessions have a real
+        // collision surface and would silently orphan state.
+        const clientProvided = protocol === "responses"
+            ? (responsesIdentity?.clientProvided ?? false)
+            : protocol === "openai"
+              ? (openaiIdentity?.clientProvided ?? false)
+              : !!convHeader;
+        if (!clientProvided) {
+            log("warn", `400: no stable conversation identity on ${protocol} request → ${upstreamOrigin}; refusing to create a content-fingerprint session (#286)`);
+            res.writeHead(400, { "content-type": "application/json" });
+            res.end(JSON.stringify(protocol === "anthropic"
+                ? { type: "error", error: { type: "invalid_request_error", message: NO_IDENTITY_MESSAGE } }
+                : { error: { type: "invalid_request_error", message: NO_IDENTITY_MESSAGE } }));
+            return;
+        }
+        const sessionId = conversation;
         // Two separate uses of the conversation signal:
         //  - `affinity`: header value forwarded upstream for sticky-routing /
         //    cache pools. Synthesized as ses_<conversation> when the client
@@ -878,7 +912,7 @@ async function handle(
                             ? prepareOpenai(parsed as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, pluginMode)
                             : responsesCompact
                               ? prepareResponsesCompact(bodyBuffer, parsed as ResponsesRequestBody, session)
-                              : prepareResponses(parsed as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, responsesIdentity!, pluginMode);
+                              : prepareResponses(parsed as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, responsesIdentity!, pluginMode, upstreamOrigin);
                 prepared = runPrepare();
                 if (!countTokens && !responsesCompact) {
                     prepared = await preflightCompressIfNeeded(
@@ -1138,6 +1172,14 @@ function prepareOpenai(
     }
 
     const rebuilt: OpenAIRequestBody = { ...parsed, messages: rebuiltMessages, tools: toolsOut as OpenAITool[] | undefined };
+    // prompt_cache_retention is an OpenAI-host-only cache directive; the dsh
+    // launcher forces PI_CACHE_RETENTION=long (for the session-id
+    // prompt_cache_key) which makes the client also emit it. Third-party
+    // OpenAI-compatible upstreams may reject unknown fields, and cache policy
+    // is the upstream's business — strip it. prompt_cache_key itself passes
+    // through: upstreams that ignore it lose nothing, upstreams that use it
+    // get a per-conversation routing hint.
+    delete (rebuilt as Record<string, unknown>).prompt_cache_retention;
     // OpenAI Chat Completions only emits a usage object in the final stream
     // chunk when the client sets stream_options.include_usage=true. Without
     // it, streaming sessions never learn their real input_tokens →
@@ -1163,6 +1205,7 @@ function prepareResponses(
     session: Session,
     identity: ConversationIdentity,
     pluginMode: boolean,
+    upstreamOrigin: string,
 ): Prepared {
     const sessionId = session.id;
     const stream = parsed.stream === true;
@@ -1197,8 +1240,11 @@ function prepareResponses(
 
     const shouldInject = opts.compress.injectTool;
     const injectTools = shouldInject && !pluginMode;
+    // Route config is keyed by the upstream THIS request goes to (#286: a
+    // session can outlive its first relay — session.meta.upstreamOrigin is
+    // first-wins and would silently ignore the new relay's route settings).
     const responsesTextProtocol = FORCE_TEXT_PROTOCOL ||
-        resolveCompressProtocol(opts.routes, session.meta.upstreamOrigin) === "marker";
+        resolveCompressProtocol(opts.routes, upstreamOrigin) === "marker";
 
     try {
         const projection = responsesToCore(parsed);
@@ -1260,11 +1306,14 @@ function prepareResponses(
     }
 
     const rebuilt: ResponsesRequestBody = { ...parsed, input: rebuiltInput, tools: toolsOut };
+    // Route with the upstream THIS request goes to — session.meta.upstreamOrigin
+    // is first-wins and would keep injecting pck toward a relay we switched
+    // away from (same class of bug as the compressProtocol fix above, #286).
     const promptCacheKey = resolvePromptCacheKey(
         rebuilt.prompt_cache_key,
         identity,
         opts.promptCache.routing,
-        session.meta.upstreamOrigin,
+        upstreamOrigin,
     );
     if (promptCacheKey && !rebuilt.prompt_cache_key) rebuilt.prompt_cache_key = promptCacheKey;
     // This adapter is stateless: we replay the FULL conversation in `input`.
@@ -1279,6 +1328,10 @@ function prepareResponses(
     // (top-level instructions must stay empty for code_mode tool exposure).
     if (process.env.ACP_KEEP_RESPONSE_ID !== "1") delete rebuilt.previous_response_id;
     delete rebuilt.instructions;
+    // Same rationale as prepareOpenai: strip the OpenAI-host-only cache
+    // directive; keep prompt_cache_key. Sent by hermes' codex transport and
+    // by any PI_CACHE_RETENTION=long client.
+    delete (rebuilt as Record<string, unknown>).prompt_cache_retention;
     // Log the final tools we forward upstream so we can confirm ACP tools are
     // present. Distinguishes "compress" (top-level function) from Codex
     // namespace items (type:namespace/custom).
@@ -1622,7 +1675,7 @@ async function forward(
                 const dumpDir = process.env.ACP_DUMP_DIR || `${stateDir()}/dumps`;
                 try { fs.mkdirSync(dumpDir, { recursive: true }); } catch { /* best-effort */ }
                 const sid = prepared?.session.id ?? "unknown";
-                const out = `${dumpDir}/req-${Date.now()}-${sid}.json`;
+                const out = `${dumpDir}/req-${Date.now()}-${safeSessionId(sid)}.json`;
                 try {
                     const pretty = JSON.stringify(JSON.parse(body), null, 2);
                     fs.writeFileSync(out, pretty);
@@ -1651,7 +1704,7 @@ async function forward(
                   try {
                       const rawDir = process.env.ACP_RAW_DUMP_DIR || `${stateDir()}/raw`;
                       fs.mkdirSync(rawDir, { recursive: true });
-                      return `${rawDir}/${Date.now()}-${prepared?.session.id ?? "unknown"}`;
+                      return `${rawDir}/${Date.now()}-${safeSessionId(prepared?.session.id)}`;
                   } catch {
                       return "";
                   }
@@ -1879,7 +1932,7 @@ async function forward(
         if (opts.dumpSse) {
             const [a, b] = (upstream.body as ReadableStream<Uint8Array>).tee();
             streamToRead = a;
-            dumpRaw = dumpStreamToFile(b, opts.dumpSse, `${Date.now()}-${prepared.session.id}-raw.sse`);
+            dumpRaw = dumpStreamToFile(b, opts.dumpSse, `${Date.now()}-${safeSessionId(prepared.session.id)}-raw.sse`);
         }
         // P1.1: wrap the rewriter loops in try/catch. If a rewriter throws
         // (decompress/search edge case, JSON.parse failure, fetch abort),

@@ -36,6 +36,7 @@ import {
     readHermesConfig,
     resolveHermesHome,
     prepareHermesHome,
+    writeHermesIdentityPlugin,
     parseDshSettingsYaml,
     readDshConfig,
     resolveDshHome,
@@ -1336,6 +1337,69 @@ test("prepareHermesHome: returns undefined for unreadable config even with rewri
     }
 });
 
+test("prepareHermesHome: rewrites quoted YAML api values (quotes stripped before match)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-home-"));
+    try {
+        fs.writeFileSync(path.join(dir, "config.yaml"), [
+            "providers:",
+            "  bili:",
+            '    api: "https://api.example.com/v1"',
+            "  glm:",
+            "    api: 'http://10.0.0.5:1234/v1'",
+        ].join("\n"));
+        const rewrites: HttpRewrite[] = [
+            { key: "bili", realUpstream: "https://api.example.com/v1" },
+            { key: "glm", realUpstream: "http://10.0.0.5:1234/v1" },
+        ];
+        const tmp = prepareHermesHome(dir, "http://127.0.0.1:8787", rewrites);
+        assert.ok(tmp, "quoted values must still be rewritten");
+        const txt = fs.readFileSync(path.join(tmp!, "config.yaml"), "utf8");
+        assert.ok(txt.includes("api: http://127.0.0.1:8787/bili/https://api.example.com/v1"));
+        assert.ok(txt.includes("api: http://127.0.0.1:8787/bili/http://10.0.0.5:1234/v1"));
+        fs.rmSync(tmp!, { recursive: true, force: true });
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("writeHermesIdentityPlugin: drops the identity plugin into the overlay, keyed by provider names", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-home-"));
+    try {
+        fs.writeFileSync(path.join(dir, "config.yaml"), "providers:\n  bili:\n    api: https://api.example.com/v1\n");
+        const rewrites: HttpRewrite[] = [{ key: "bili", realUpstream: "https://api.example.com/v1" }];
+        const overlay = prepareHermesHome(dir, "http://127.0.0.1:8787", rewrites);
+        assert.ok(overlay);
+        assert.equal(writeHermesIdentityPlugin(dir, overlay!, rewrites), true);
+        const init = fs.readFileSync(path.join(overlay!, "plugins/model-providers/bili-session-identity/__init__.py"), "utf8");
+        assert.ok(init.includes('_PROVIDER_KEYS = ["bili"]'));
+        assert.ok(init.includes('_register("custom", _custom, True)'));
+        assert.ok(init.includes('_register("custom:" + _key, _custom, False)'));
+        assert.ok(init.includes('top_level.setdefault("prompt_cache_key", sid[:64])'));
+        assert.ok(fs.existsSync(path.join(overlay!, "plugins/model-providers/bili-session-identity/plugin.yaml")));
+        // Idempotent rewrite on the next launch.
+        assert.equal(writeHermesIdentityPlugin(dir, overlay!, rewrites), true);
+        fs.rmSync(overlay!, { recursive: true, force: true });
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("writeHermesIdentityPlugin: skipped when the real home has its own plugins dir", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-home-"));
+    try {
+        fs.writeFileSync(path.join(dir, "config.yaml"), "providers:\n  bili:\n    api: https://api.example.com/v1\n");
+        fs.mkdirSync(path.join(dir, "plugins"), { recursive: true });
+        const rewrites: HttpRewrite[] = [{ key: "bili", realUpstream: "https://api.example.com/v1" }];
+        const overlay = prepareHermesHome(dir, "http://127.0.0.1:8787", rewrites);
+        assert.ok(overlay);
+        assert.equal(writeHermesIdentityPlugin(dir, overlay!, rewrites), false);
+        assert.ok(!fs.existsSync(path.join(overlay!, "plugins", "model-providers")));
+        fs.rmSync(overlay!, { recursive: true, force: true });
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
 test("readDshConfig + resolveDshHome + parseDshSettingsYaml", () => {
     assert.equal(resolveDshHome({ DSH_HOME: "/tmp/dd" }), "/tmp/dd");
     assert.ok(resolveDshHome({}).endsWith(path.join(".dsh")));
@@ -1547,6 +1611,9 @@ test("runLaunch dsh: DSH_HOME overlay + DEEPSEEK_BASE_URL env, real home untouch
         const origin = seenEnv.BILLION_CONTEXT_PROXY;
         assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(String(origin)));
         assert.equal(seenEnv.DEEPSEEK_BASE_URL, `${origin}/bili/https://api.deepseek.com`);
+        // Session identity for the proxy: forces dsh's pi-ai stack to stamp
+        // prompt_cache_key (the dsh session id) on every request.
+        assert.equal(seenEnv.PI_CACHE_RETENTION, "long");
         assert.equal(seenEnv.DSH_HOME, `${dshHome}-bili`);
         assert.deepEqual(exitCalls, [0]);
         assert.equal(fs.readFileSync(path.join(dshHome, "settings.yaml"), "utf8"), original);

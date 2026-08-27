@@ -795,7 +795,7 @@ export function prepareHermesHome(
         const rawLine = lines[i];
         const m = /^(\s*(?:api|base_url|url):\s*)(\S+)(\s+#.*)?$/.exec(rawLine);
         if (!m) continue;
-        const rawUrl = m[2];
+        const rawUrl = m[2].replace(/^["']|["']$/g, "");
         if (!/^https?:\/\//i.test(rawUrl)) continue;
         const real = unwrapUpstream(rawUrl);
         if (!wrapSet.has(real)) continue;
@@ -807,6 +807,113 @@ export function prepareHermesHome(
     if (!refreshOverlayHome(hermesHome, overlay, "config.yaml")) return undefined;
     writeOverlayFileAtomic(overlay, "config.yaml", lines.join(eol));
     return overlay;
+}
+
+/** Write the hermes session-identity plugin into the bili overlay home.
+ *  Hermes sends NO conversation identity on the wire by default: its native
+ *  `prompt_cache_key` support (transports/chat_completions.py) is gated on
+ *  `supports_prompt_cache_key`, which no bundled provider profile enables —
+ *  so every custom-provider request reaches the proxy anonymous and gets a
+ *  400 (#286). User plugins under $HERMES_HOME/plugins/model-providers/<name>/
+ *  override bundled profiles (discovery order bundled → user, last-writer-
+ *  wins), and the profile hook `build_api_kwargs_extras(session_id=...)`
+ *  receives the REAL hermes session id — its top_level return value is
+ *  merged straight into the request body. The generated plugin subclasses
+ *  the bundled "custom" profile and stamps prompt_cache_key = session_id,
+ *  giving the proxy the same stable per-conversation id omp/pi provide.
+ *  Registered names: "custom" (model.base_url / provider: custom) plus
+ *  "custom:<name>" for every provider key bili rewrites (named providers
+ *  resolve to that shape — agent_init only maps "custom"/"custom:<key>"
+ *  to custom endpoints, and a bare "custom:<key>" lookup otherwise misses
+ *  the profile registry and falls to the legacy no-pck path).
+ *  Skipped (returns false) when the REAL ~/.hermes already has a plugins/
+ *  dir — refreshOverlayHome symlinks it into the overlay, and writing
+ *  through the symlink would mutate the user's real home. The proxy then
+ *  400s anonymous requests with the fix-it message. */
+export function writeHermesIdentityPlugin(hermesHome: string, overlay: string, rewrites: HttpRewrite[]): boolean {
+    try {
+        if (fs.existsSync(path.join(hermesHome, "plugins"))) return false;
+    } catch {
+        return false;
+    }
+    const dir = path.join("plugins", "model-providers", "bili-session-identity");
+    try {
+        fs.mkdirSync(path.join(overlay, dir), { recursive: true });
+    } catch {
+        return false;
+    }
+    const keys = rewrites.map((r) => r.key);
+    const pluginDir = path.join(overlay, dir);
+    try {
+        fs.writeFileSync(path.join(pluginDir, "__init__.py"), hermesIdentityPluginSource(keys));
+        fs.writeFileSync(path.join(pluginDir, "plugin.yaml"), [
+        "name: bili-session-identity",
+        "kind: model-provider",
+        "version: 1.0.0",
+        "description: billion-context session identity (installed by `bili hermes` — safe to delete)",
+        "author: billion-context",
+        "",
+    ].join("\n"));
+    } catch {
+        return false;
+    }
+    try {
+        return fs.existsSync(path.join(overlay, dir, "__init__.py"));
+    } catch {
+        return false;
+    }
+}
+
+function hermesIdentityPluginSource(providerKeys: string[]): string {
+    return [
+        '"""Installed by `bili hermes` (billion-context) — safe to delete.',
+        "",
+        "Re-registers hermes's `custom` provider profile (plus a `custom:<name>`",
+        "profile for every provider the proxy fronts) with one addition: the",
+        "REAL hermes session id is sent as `prompt_cache_key` on every request,",
+        "which the billion-context proxy uses as the stable conversation",
+        'identity for its compression sessions. Removing this file restores',
+        'stock behavior (no prompt_cache_key)."""',
+        "from providers import get_provider_profile, register_provider",
+        "from providers.base import ProviderProfile",
+        "",
+        `_PROVIDER_KEYS = ${JSON.stringify(providerKeys)}`,
+        "",
+        '_custom = get_provider_profile("custom")',
+        "_BASE = type(_custom) if _custom is not None else ProviderProfile",
+        "",
+        "",
+        "class _BiliSessionIdentity(_BASE):",
+        "    def build_api_kwargs_extras(self, *, session_id=None, **ctx):",
+        "        extra_body, top_level = _BASE.build_api_kwargs_extras(",
+        "            self, session_id=session_id, **ctx",
+        "        )",
+        '        sid = str(session_id or "").strip()',
+        "        if sid:",
+        '            top_level.setdefault("prompt_cache_key", sid[:64])',
+        "        return extra_body, top_level",
+        "",
+        "",
+        "def _register(name, template, with_aliases):",
+        "    fields = {}",
+        "    if template is not None:",
+        "        # Aliases are copied ONLY for the canonical custom",
+        "        # re-registration: copying them onto custom:<name> entries",
+        "        # would steal the aliases (register_provider re-points each",
+        "        # alias at the registering name).",
+        '        for attr in ((\"aliases\",) if with_aliases else ()) + (\"env_vars\", \"base_url\", \"default_max_tokens\"):',
+        "            value = getattr(template, attr, None)",
+        "            if value:",
+        "                fields[attr] = value",
+        "    register_provider(_BiliSessionIdentity(name=name, **fields))",
+        "",
+        "",
+        "if _custom is not None:",
+        '    _register("custom", _custom, True)',
+        "for _key in _PROVIDER_KEYS:",
+        '    _register("custom:" + _key, _custom, False)',
+        "",
+    ].join("\n");
 }
 
 /** dsh counterpart of prepareHermesHome: a persistent `<dshHome>-bili` overlay
@@ -1257,6 +1364,17 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         hermesOverlayHome = prepareHermesHome(resolveHermesHome(process.env), origin, routes.httpRewrites);
         if (hermesOverlayHome) {
             env.HERMES_HOME = hermesOverlayHome;
+            // Session identity for the proxied custom providers: hermes sends
+            // no conversation id on the wire, so the proxy 400s anonymous
+            // requests (#286). The plugin stamps the real hermes session id as
+            // prompt_cache_key. Skipped (identity stays anonymous) when the
+            // real ~/.hermes already has a plugins/ dir — writing through the
+            // overlay symlink would mutate the user's home.
+            if (!writeHermesIdentityPlugin(resolveHermesHome(process.env), hermesOverlayHome, routes.httpRewrites)) {
+                console.error(
+                    "bili: ~/.hermes has its own plugins/ — skipping the session-identity plugin; hermes requests will be rejected by the proxy without an identity (see #286).",
+                );
+            }
         } else {
             console.error(
                 routes.httpRewrites.length === 0
@@ -1275,6 +1393,18 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // symlinks and the real ~/.dsh is never touched.
         env = { ...process.env, BILLION_CONTEXT_PROXY: origin };
         env.DEEPSEEK_BASE_URL = wrapUpstream(origin, "https://api.deepseek.com");
+        // Session identity for the proxy: dsh's pi-ai stack keys its
+        // `prompt_cache_key` body field (the dsh session id) off
+        // cacheRetention — every non-api.openai.com base URL defaults to
+        // "short", which sends NO key and leaves the request anonymous (the
+        // proxy then 400s, #286). "long" + compat.supportsLongCacheRetention
+        // (true for deepseek/custom base URLs) makes every request carry
+        // prompt_cache_key = the dsh session uuid. The extra
+        // prompt_cache_retention field this also emits is stripped by the
+        // proxy before forwarding upstream. A per-provider cacheRetention set
+        // in the user's own settings.yaml still wins (explicit profile value
+        // overrides the env fallback).
+        env.PI_CACHE_RETENTION = "long";
         const dshHomeDir = resolveDshHome(process.env);
         dshOverlayHome = prepareDshHome(dshHomeDir, origin, routes.httpRewrites);
         if (dshOverlayHome) {

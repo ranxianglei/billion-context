@@ -1,15 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { deriveSessionId, affinityToken, clientConversationHeader, preferPromptCacheKeyIdentity } from "../src/session-id.ts";
+import { affinityToken, clientConversationHeader, preferPromptCacheKeyIdentity } from "../src/session-id.ts";
 import { conversationIdentityResponses, conversationSignalResponses } from "acp-kernel/wire";
-
-/** Helper: build a minimal headers object. */
-function hdrs(auth?: string, sessionAffinity?: string): Record<string, string> {
-    const h: Record<string, string> = {};
-    if (auth) h.authorization = auth;
-    if (sessionAffinity) h["x-session-affinity"] = sessionAffinity;
-    return h;
-}
 
 test("preferPromptCacheKeyIdentity: fingerprint + prompt_cache_key → stable client-provided identity (omp stateless replay)", () => {
     // omp replays full history with no headers/session_id/previous_response_id:
@@ -60,84 +52,13 @@ test("preferPromptCacheKeyIdentity: no/blank/non-string prompt_cache_key keeps f
     assert.equal(preferPromptCacheKeyIdentity(undefined, { prompt_cache_key: "x" }), undefined);
 });
 
-test("preferPromptCacheKeyIdentity: derived session id stable across growing turns + affinity forwards it", () => {
+test("preferPromptCacheKeyIdentity: client-provided value IS the session id, stable across growing turns (#286)", () => {
     const body1 = { input: [{ type: "message", role: "user", content: "hi" }], prompt_cache_key: "pck-omp-1" };
     const body2 = { input: [...body1.input, { type: "message", role: "user", content: "turn 2" }], prompt_cache_key: "pck-omp-1" };
-    const h = hdrs("Bearer keyOmp");
     const id1 = preferPromptCacheKeyIdentity(conversationIdentityResponses(body1, undefined), body1)!;
     const id2 = preferPromptCacheKeyIdentity(conversationIdentityResponses(body2, undefined), body2)!;
-    assert.equal(
-        deriveSessionId(h, "responses", "http://127.0.0.1:8199", id1.value),
-        deriveSessionId(h, "responses", "http://127.0.0.1:8199", id2.value),
-    );
+    assert.equal(id1.value, id2.value);
     assert.equal(affinityToken(id1), "pck-omp-1");
-});
-
-test("deriveSessionId: same conversation + same key + same protocol + same upstream → stable", () => {
-    const a = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "hello world");
-    const b = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "hello world");
-    assert.equal(a, b);
-});
-
-test("deriveSessionId: stable for same (key, protocol, upstream, conversation)", () => {
-    const a = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "hello world");
-    const b = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "hello world");
-    assert.equal(a, b);
-});
-
-test("deriveSessionId: different API key → different session (no cross-account bleed)", () => {
-    const a = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "hello world");
-    const b = deriveSessionId(hdrs("Bearer keyB"), "anthropic", "https://bailian.example", "hello world");
-    assert.notEqual(a, b);
-});
-
-test("deriveSessionId: credentials remain case-sensitive opaque values", () => {
-    const upper = deriveSessionId(hdrs("Bearer AbCd"), "responses", "https://chatgpt.com", "session");
-    const lower = deriveSessionId(hdrs("Bearer abcd"), "responses", "https://chatgpt.com", "session");
-    assert.notEqual(upper, lower);
-});
-
-test("deriveSessionId: different upstream origin → different session (no cross-provider bleed)", () => {
-    const a = deriveSessionId(hdrs("Bearer keyA"), "openai", "https://zhipu.example", "hello");
-    const b = deriveSessionId(hdrs("Bearer keyA"), "openai", "https://bailian.example", "hello");
-    assert.notEqual(a, b);
-});
-
-test("deriveSessionId: different protocol → different session (no cross-format bleed)", () => {
-    const a = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "hello");
-    const b = deriveSessionId(hdrs("Bearer keyA"), "openai", "https://bailian.example", "hello");
-    assert.notEqual(a, b);
-});
-
-test("deriveSessionId: different conversation → different session", () => {
-    const a = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "hello");
-    const b = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "goodbye");
-    assert.notEqual(a, b);
-});
-
-test("deriveSessionId: conversation signal is the only conversation dimension", () => {
-    // The conversation dimension is whatever the caller passes — typically the
-    // output of conversationSignal*, which already prefers a client header
-    // and falls back to a content hash. Here we just confirm the passed value
-    // is what matters (same key/proto/upstream, different convo → different).
-    const a = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://up", "ses_111");
-    const b = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://up", "ses_222");
-    assert.notEqual(a, b);
-    // Same convo signal → same session, regardless of anything else.
-    assert.equal(a, deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://up", "ses_111"));
-});
-
-test("deriveSessionId: no Authorization header → still works (uses placeholder key)", () => {
-    const id = deriveSessionId({}, "anthropic", "https://up", "convo-1");
-    assert.ok(id.length > 0);
-    // Two keyless requests with same content → same session.
-    assert.equal(id, deriveSessionId({}, "anthropic", "https://up", "convo-1"));
-});
-
-test("deriveSessionId: empty conversation dimension THROWS (no silent collapse)", () => {
-    // A caller that forgets to pass the conversation signal must fail loudly,
-    // not silently collapse every anonymous session onto one id.
-    assert.throws(() => deriveSessionId({}, "anthropic", "https://up", ""), /conversation dimension is required/);
 });
 
 test("affinityToken: uses client signal when present (passthrough, preserves ses_ format)", () => {
@@ -164,8 +85,8 @@ test("clientConversationHeader: reads known session header names in priority ord
 });
 
 test("affinityToken: client-provided identity passes through verbatim (credentials never in scope)", () => {
-    // After the refactor, affinityToken receives only the resolved identity
-    // object ({ value, source, clientProvided }) — never raw headers or the
+    // affinityToken receives only the resolved identity object
+    // ({ value, source, clientProvided }) — never raw headers or the
     // API key — so credential leakage is impossible by construction.
     const token = affinityToken({ value: "client-session", source: "body-session", clientProvided: true });
     assert.equal(token, "client-session");
@@ -197,7 +118,7 @@ test("conversationSignalResponses: header (opencode x-session-affinity) still wi
     assert.equal(sig, "ses_opencode-123");
 });
 
-test("conversationIdentityResponses: previous_response_id provides a stable conversation link", () => {
+test("conversationIdentityResponses: previous_response_id is NOT client-provided (per-turn, not a stable conversation id)", () => {
     const body = {
         input: "hello",
         previous_response_id: "resp_xyz",
@@ -208,7 +129,7 @@ test("conversationIdentityResponses: previous_response_id provides a stable conv
     assert.equal(identity.clientProvided, false);
 });
 
-test("conversationIdentityResponses: identical anonymous openers share a content fingerprint (enables compression)", () => {
+test("conversationIdentityResponses: identical anonymous openers share a content fingerprint (rejected upstream by the server, #286)", () => {
     const body = { input: "hello world" } as unknown as Parameters<typeof conversationSignalResponses>[0];
     const a = conversationSignalResponses(body, undefined);
     const b = conversationSignalResponses({ input: "hello world" } as never, undefined);
