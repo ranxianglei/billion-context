@@ -155,3 +155,157 @@ test("e2e: upstream context overflow → learn window + arm shrink + pass throug
         await once(upstream, "close");
     }
 });
+
+// #280: Codex's overflow error carries NO window number ("context_window_exceeded"),
+// so the proxy can't learn the real window from the body. It must still recognize
+// the overflow, learn a CONSERVATIVE window from the rejected payload's size, and
+// on the next request the pre-flight must compress the oversized history below
+// that window before forwarding — instead of re-sending the same oversized
+// payload forever (the stuck loop the issue reports).
+
+const CODEX_OVERFLOW_BODY = JSON.stringify({
+    error: {
+        code: "context_window_exceeded",
+        message: "The model's context window was exceeded. Start a new thread or clear earlier history before retrying.",
+    },
+});
+
+const SUMMARY_TEXT =
+    "PREFLIGHT SUMMARY: the segment covered a multi-step debugging session. Key decisions: chose the preflight approach over lossy truncation because the payload must stay coherent. Files touched: src/a.ts:10, src/b.ts:20. Outcome: fixed and verified by tests.";
+
+function summaryJson(): string {
+    return JSON.stringify({
+        id: "msg_summary",
+        type: "message",
+        role: "assistant",
+        model: "claude-test",
+        content: [{ type: "text", text: SUMMARY_TEXT }],
+        stop_reason: "end_turn",
+        usage: { input_tokens: 500, output_tokens: 50 },
+    });
+}
+
+function bigConversation(): Array<{ role: string; content: string }> {
+    const msgs: Array<{ role: string; content: string }> = [];
+    for (let i = 0; i < 12; i++) {
+        const role = i % 2 === 0 ? "user" : "assistant";
+        msgs.push({ role, content: `Message ${i} of the long conversation. ` + `MARKER_${i}_content_`.repeat(250) });
+    }
+    return msgs;
+}
+
+test("e2e #280: Codex overflow without window number → learn conservative window → preflight recovers", async () => {
+    let streamingCall = 0;
+    let summaryCalls = 0;
+    const bodies: string[] = [];
+    const upstream = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c: Buffer) => chunks.push(c));
+        req.on("end", () => {
+            const raw = Buffer.concat(chunks).toString("utf8");
+            bodies.push(raw);
+            let parsed: { stream?: boolean } = {};
+            try {
+                parsed = JSON.parse(raw);
+            } catch {
+                parsed = {};
+            }
+            if (parsed.stream === false) {
+                // Pre-flight summarization call (non-streaming).
+                summaryCalls += 1;
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(summaryJson());
+                return;
+            }
+            // First streaming forward: Codex overflow (no window number).
+            if (streamingCall === 0) {
+                res.writeHead(400, { "content-type": "application/json" });
+                res.end(CODEX_OVERFLOW_BODY);
+            } else {
+                res.writeHead(200, { "content-type": "text/event-stream" });
+                res.end(okSse());
+            }
+            streamingCall += 1;
+        });
+    });
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = upstream.address().port;
+
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    const proxy = await startServer({
+        port: 0,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1",
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-test": { context: 400_000 } } } },
+        modelContextLimit: 400_000,
+        kernelConfig: defaultConfig(400_000),
+        compress: { injectTool: true, injectNudge: true },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        mitm: { enabled: false, domains: [] },
+    } as ProxyOptions);
+    await once(proxy, "listening");
+    const proxyPort = proxy.address().port;
+
+    try {
+        const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`;
+        const body = JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: true, messages: bigConversation() });
+
+        // --- Request 1: oversized history forwarded (no usage known yet) → Codex 400 ---
+        const r1 = await fetch(url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "codex-sess" },
+            body,
+        });
+        assert.equal(r1.status, 400);
+        const r1text = await r1.text();
+        assert.ok(r1text.includes("context_window_exceeded"), "Codex error passes through verbatim");
+
+        // The proxy recognized the overflow and learned a conservative window
+        // from the rejected payload's size (~13k tokens, NOT the configured 400k).
+        const s = listSessions().find(
+            (x) => (x.metadata.learnedContextLimits as Record<string, number> | undefined)?.["claude-test"] !== undefined,
+        );
+        assert.ok(s, "session learned a conservative window from the rejected payload");
+        const learned = (s!.metadata.learnedContextLimits as Record<string, number>)["claude-test"];
+        assert.ok(learned >= 1000 && learned < 20_000, `conservative window ≈ rejected payload size (got ${learned})`);
+        assert.ok(s!.stats.lastInputTokens >= learned, "emergency shrink armed (lastInputTokens >= learned window)");
+
+        // --- Request 2: same oversized history → self-heal re-centers the limit
+        // to the learned window → pre-flight compresses below it → recovery ---
+        const r2 = await fetch(url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "codex-sess" },
+            body,
+        });
+        assert.equal(r2.status, 200, "second request recovers");
+        await r2.text(); // drain
+
+        assert.ok(summaryCalls >= 1, "pre-flight made a summarization call before the forward");
+        const lastForward = bodies[bodies.length - 1];
+        // The kernel always keeps the first user message raw (task anchor), so
+        // the rest of the compressed range (markers 1-3) must be gone.
+        assert.ok(!lastForward.includes("MARKER_1_"), "compressed range folded out of the rebuilt payload");
+        assert.ok(!lastForward.includes("MARKER_2_"), "compressed range folded out of the rebuilt payload");
+        assert.ok(!lastForward.includes("MARKER_3_"), "compressed range folded out of the rebuilt payload");
+        assert.ok(lastForward.includes("MARKER_11_"), "recent messages retained");
+        assert.ok(lastForward.includes(SUMMARY_TEXT), "summary replaces the compressed range");
+
+        // The real usage report from the recovered turn overwrote the armed
+        // value. (The preflight summary call goes direct to the upstream, not
+        // through the proxy, so it lands no usage on this session.)
+        const s2 = listSessions().find((x) => x.id === s!.id);
+        assert.equal(s2?.stats.lastInputTokens, 5000);
+    } finally {
+        proxy.close();
+        await once(proxy, "close");
+        upstream.close();
+        await once(upstream, "close");
+    }
+});
