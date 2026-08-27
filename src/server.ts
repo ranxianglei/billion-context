@@ -1298,11 +1298,14 @@ function prepareResponses(
     }
 
     const rebuilt: ResponsesRequestBody = { ...parsed, input: rebuiltInput, tools: toolsOut };
+    // Route with the upstream THIS request goes to — session.meta.upstreamOrigin
+    // is first-wins and would keep injecting pck toward a relay we switched
+    // away from (same class of bug as the compressProtocol fix above, #286).
     const promptCacheKey = resolvePromptCacheKey(
         rebuilt.prompt_cache_key,
         identity,
         opts.promptCache.routing,
-        session.meta.upstreamOrigin,
+        upstreamOrigin,
     );
     if (promptCacheKey && !rebuilt.prompt_cache_key) rebuilt.prompt_cache_key = promptCacheKey;
     // This adapter is stateless: we replay the FULL conversation in `input`.
