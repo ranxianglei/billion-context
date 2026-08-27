@@ -3,6 +3,7 @@ import net from "node:net";
 import tls from "node:tls";
 import { ProxyAgent } from "undici";
 import type { ProviderRoutes } from "./config.js";
+import { isPublicApiHost, maskUrlForLog, PRIVATE_HOST } from "./log-mask.js";
 
 export type ParsedHttpProxy = {
     url: string;
@@ -432,13 +433,24 @@ export function formatUpstreamError(error: unknown, url: string, proxyUrl?: stri
     const chain = errorChain(error);
     const fields = ["code", "errno", "syscall", "address", "port"];
     const parts: string[] = [];
+    // Error text from undici/OS layers embeds the endpoint identity
+    // ("connect ECONNREFUSED 10.0.0.5:8443", "getaddrinfo ENOTFOUND
+    // relay.internal") — swap in the placeholder when the upstream is a
+    // non-public host so the failure log leaks nothing either.
+    const maskHostIn = (s: string): string => {
+        try {
+            const u = new URL(url);
+            if (!isPublicApiHost(u.hostname)) return s.split(u.hostname).join(PRIVATE_HOST);
+        } catch { /* not a URL — nothing to mask */ }
+        return s;
+    };
     for (const field of fields) {
         const value = chain.find((entry) => entry[field] !== undefined)?.[field];
-        if (value !== undefined) parts.push(`${field}=${String(value)}`);
+        if (value !== undefined) parts.push(`${field}=${maskHostIn(String(value))}`);
     }
-    const messages = chain.map((entry) => String(entry.message ?? "")).filter(Boolean);
+    const messages = chain.map((entry) => maskHostIn(String(entry.message ?? ""))).filter(Boolean);
     if (messages.length > 0) parts.push(`message=${messages.join(" <- ")}`);
-    parts.push(`url=${url}`);
+    parts.push(`url=${maskUrlForLog(url)}`);
     parts.push(`proxy=${redactProxyUrl(proxyUrl) ?? "direct"}`);
     return parts.join(" ");
 }

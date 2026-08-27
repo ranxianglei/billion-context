@@ -5,6 +5,7 @@ import { ensureRootCA, getSecureContext } from "./ca.js";
 import { connectThroughProxy } from "./upstream-proxy.js";
 import { discoverMitmDomains } from "./discover.js";
 import { isLoopbackAddress } from "./util.js";
+import { maskHostForLog, maskHostPortForLog } from "./log-mask.js";
 
 // Domains we transparently MITM. These are ONLY the model-inference endpoints
 // hardcoded in client BINARIES with no config file to discover from
@@ -76,7 +77,7 @@ export function setupMitm(
     server.on("connect", (req: http.IncomingMessage, clientSocket: net.Socket, head: Buffer) => {
         const remote = !isLoopbackAddress(clientSocket.remoteAddress);
         if (remote && !allowRemoteClients) {
-            log(`CONNECT ${req.url} rejected: non-loopback client ${clientSocket.remoteAddress} (bind a non-loopback --host to allow remote clients)`);
+            log(`CONNECT ${maskHostPortForLog(req.url ?? "")} rejected: non-loopback client ${clientSocket.remoteAddress} (bind a non-loopback --host to allow remote clients)`);
             // end() (not write+destroy) so the 403 bytes are flushed before close.
             clientSocket.end("HTTP/1.1 403 Forbidden\r\n\r\n");
             return;
@@ -89,7 +90,7 @@ export function setupMitm(
                 // client must not use this proxy as an open TCP relay to
                 // arbitrary hosts. Remote CONNECT is for MITM-whitelisted
                 // model endpoints only.
-                log(`CONNECT ${req.url} rejected: remote client ${clientSocket.remoteAddress} tunneling non-whitelisted host`);
+                log(`CONNECT ${maskHostPortForLog(req.url ?? "")} rejected: remote client ${clientSocket.remoteAddress} tunneling non-whitelisted host`);
                 clientSocket.end("HTTP/1.1 403 Forbidden\r\n\r\n");
                 return;
             }
@@ -134,7 +135,7 @@ function tunnelThrough(
     const connectTimer = setTimeout(() => {
         if (!established) {
             aborted = true;
-            log(`tunnel ${host}:${port} connect timeout`);
+            log(`tunnel ${maskHostForLog(host)}:${port} connect timeout`);
             clientSocket.write("HTTP/1.1 504 Gateway Timeout\r\n\r\n");
             clientSocket.destroy();
         }
@@ -151,7 +152,7 @@ function tunnelThrough(
         upstream.pipe(clientSocket);
         clientSocket.pipe(upstream);
         const cleanup = (where: string, err: Error) => {
-            log(`tunnel ${host}:${port} ${where} closed: ${err.message}`);
+            log(`tunnel ${maskHostForLog(host)}:${port} ${where} closed: ${err.message}`);
             upstream.destroy();
             clientSocket.destroy();
         };
@@ -160,7 +161,7 @@ function tunnelThrough(
     }).catch((err: Error) => {
         if (aborted) return;
         clearTimeout(connectTimer);
-        log(`tunnel ${host}:${port} connect failed: ${err.message}`);
+        log(`tunnel ${maskHostForLog(host)}:${port} connect failed: ${err.message}`);
         clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
         clientSocket.destroy();
     });
@@ -193,7 +194,7 @@ function doMitm(
             ALPNProtocols: ["http/1.1"],
         });
     } catch (e) {
-        log(`mitm ${host}:${port} TLS setup failed: ${(e as Error).message}`);
+        log(`mitm ${maskHostForLog(host)}:${port} TLS setup failed: ${(e as Error).message}`);
         clientSocket.destroy();
         return;
     }
@@ -206,7 +207,7 @@ function doMitm(
     // it as an uncaught exception and crashes the whole proxy. Destroy the
     // underlying socket and log — mirrors tunnelThrough()'s error handling.
     tlsSocket.on("error", (err: Error) => {
-        log(`mitm ${host}:${port} TLS error: ${err.message}`);
+        log(`mitm ${maskHostForLog(host)}:${port} TLS error: ${err.message}`);
         tlsSocket.destroy();
         clientSocket.destroy();
     });
@@ -215,7 +216,7 @@ function doMitm(
     // and our signed-cert context open indefinitely. Arm a handshake timeout;
     // clear it once the handshake completes ('secure'), or on error/close.
     const handshakeTimer = setTimeout(() => {
-        log(`mitm ${host}:${port} TLS handshake timeout`);
+        log(`mitm ${maskHostForLog(host)}:${port} TLS handshake timeout`);
         tlsSocket.destroy();
         clientSocket.destroy();
     }, mitmHandshakeTimeoutMs());
@@ -227,7 +228,7 @@ function doMitm(
     // the cleartext bytes — exactly the same path as a direct (non-proxy)
     // request, so handle()/forward() work unmodified.
     server.emit("connection", tlsSocket);
-    log(`mitm ${host}:${port} tunnel established (TLS terminated locally)`);
+    log(`mitm ${maskHostForLog(host)}:${port} tunnel established (TLS terminated locally)`);
 }
 
 /** Read the MITM upstream marker from a request's underlying socket.

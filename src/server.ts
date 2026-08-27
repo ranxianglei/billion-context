@@ -9,6 +9,7 @@ import { resolveContextLimit, resolveCompressProtocol } from "./config.js";
 import { contextFromRegistry, loadRegistry, peekRegistryContext } from "./registry.js";
 import { fetchWithTimeout, MAX_REQUEST_BYTES } from "./fetch-util.js";
 import { formatUpstreamError, getUpstreamConnectionStatus, recordUpstreamConnection, resolveProxy, resolveProxyDecision, proxyDispatcher } from "./upstream-proxy.js";
+import { maskHeaderForLog, maskUrlForLog, maskUrlsInText } from "./log-mask.js";
 // Protocol codecs live in the kernel now (single source of truth shared with
 // the omp/pi adapters): import from "acp-kernel/wire".
 import {
@@ -226,7 +227,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // built-in fast-fallback (e.g. Codex) that need a clean 426 to switch to
     // HTTP POST immediately.
     server.on("upgrade", (req, socket) => {
-        log("info", `[ws] rejected ${req.method} ${req.url ?? ""} host=${req.headers.host ?? "?"} with 426`);
+        log("info", `[ws] rejected ${req.method} ${maskUrlsInText(req.url ?? "")} host=${req.headers.host ?? "?"} with 426`);
         socket.on("error", () => {}); // client may vanish mid-write; don't let ECONNRESET crash the process
         const body = JSON.stringify({ error: "WebSocket upgrades are not supported; use HTTP POST" });
         socket.end(
@@ -909,7 +910,7 @@ async function handle(
     }
     if (!prepared) {
         if (protocol === null && !opts.passthrough) {
-            log("warn", `unrecognized path ${req.url ?? ""} — not a known protocol (/chat/completions, /v1/messages, /responses, /responses/compact); forwarding unchanged`);
+            log("warn", `unrecognized path ${maskUrlsInText(req.url ?? "")} — not a known protocol (/chat/completions, /v1/messages, /responses, /responses/compact); forwarding unchanged`);
         }
         await forward(req, res, opts, bodyBuffer, null, core, reqConfig, log, route, undefined);
     }
@@ -1592,7 +1593,7 @@ async function forward(
     // primary signal. The provider label is appended only for named routes —
     // zero-config requests have a single routing mode now, so the final
     // proxied URL is the only useful signal in the log.
-    log("info", `forward ${req.method} → ${upstreamUrl}`);
+    log("info", `forward ${req.method} → ${maskUrlForLog(upstreamUrl)}`);
     if (process.env.ACP_DEBUG && prepared) {
         const sid = prepared.session.id;
         const hdrKeys = Object.keys(req.headers);
@@ -1636,7 +1637,10 @@ async function forward(
     if (opts.debug) {
         const hdrLog: Record<string, string> = {};
         for (const [hk, hv] of Object.entries(headers)) {
-            if (typeof hv === "string") hdrLog[hk] = hv.length > 200 ? hv.slice(0, 200) + "..." : hv;
+            if (typeof hv === "string") {
+                const masked = maskHeaderForLog(hk, hv);
+                hdrLog[hk] = masked.length > 200 ? masked.slice(0, 200) + "..." : masked;
+            }
         }
         log("info", `[${prepared?.session.id ?? "unknown"}] → upstream headers: ${JSON.stringify(hdrLog)}`);
     }
@@ -1711,7 +1715,8 @@ async function forward(
         upstream.headers.forEach((v, k) => {
             const lower = k.toLowerCase();
             if (UPSTREAM_HOP_HEADERS.has(lower) || respConnNamed.has(lower)) return;
-            respLog[k] = v.length > 300 ? v.slice(0, 300) + "..." : v;
+            const masked = maskHeaderForLog(k, v);
+            respLog[k] = masked.length > 300 ? masked.slice(0, 300) + "..." : masked;
         });
         log("info", `[${prepared?.session.id ?? "unknown"}] ← upstream response headers: ${JSON.stringify(respLog)}`);
     }
