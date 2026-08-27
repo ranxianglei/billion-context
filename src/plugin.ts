@@ -7,6 +7,8 @@ import { acquireInFlight, listSessions, markDirty, peekSession, releaseInFlight,
 import { ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, PROXY_TOOL_NAMES } from "./compress-tool.js";
 import { executeProxyTool } from "./loop/core.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
+import { containsRenderTagText, createTagEchoFilter, stripResponsesText } from "./loop/tag-echo-filter.js";
+import { log as loggerLog } from "./logger.js";
 import type { WireProtocol } from "./util.js";
 import { stateDir } from "./paths.js";
 
@@ -244,7 +246,16 @@ const registeredIds = new Map<string, string>();
  *  ordering race with the shell's initialize. */
 export function consumePluginRegisterFor(conversationId: string): string | undefined {
     const agent = registeredIds.get(conversationId);
-    if (agent !== undefined) registeredIds.delete(conversationId);
+    if (agent !== undefined) {
+        // The registration describes the CONVERSATION, not a one-shot token:
+        // switching models/upstreams mid-conversation resolves to a NEW
+        // session (session key = protocol|upstream|apiKey|conversation) that
+        // must still bind — omp TUI flows that switch models would otherwise
+        // drop back to wire mode on every switch. Keep the entry and refresh
+        // LRU order so the size cap evicts least-recently-active conversations.
+        registeredIds.delete(conversationId);
+        registeredIds.set(conversationId, agent);
+    }
     return agent;
 }
 
@@ -480,7 +491,9 @@ function applyUsageSample(session: Session, sample: UsageSample, protocol?: Wire
             sample.inputTokens +
             (!includesCached && sample.cachedTokens !== undefined ? sample.cachedTokens : 0);
         session.stats.inputTokens += total;
-        session.stats.lastInputTokens = total;
+        // Net out pending compress savings (see stream.ts applyRanges): plugin
+        // compress tool results shrink the next request, not this report.
+        session.stats.lastInputTokens = Math.max(0, total - (session.stats.compressCreditTokens ?? 0));
     }
     if (sample.outputTokens !== undefined) session.stats.outputTokens += sample.outputTokens;
 }
@@ -552,6 +565,146 @@ export async function pipeThroughWithUsage(
 
 /** Plugin-mode non-streaming passthrough: same contract as
  *  pipeThroughWithUsage but for a single JSON body. */
+/**
+ * Plugin-mode Responses passthrough with render-tag stripping (#206 parity
+ * for VERBATIM plugin streams). In plugin mode the native tool loop owns the
+ * tool surface, so function_call events must reach the agent untouched — but
+ * the model's *prose* can still echo ACP render tags (observed with omp/
+ * qwen: tags flatten into standalone messages, get stamped with refs, replay,
+ * and amplify). This pipe keeps every event byte-identical except
+ * `response.output_text.delta`, whose delta text streams through the same
+ * tag-echo state machine the compress loop uses. A held tail is flushed as a
+ * final delta before the first done/completed event so the client's assembled
+ * text never loses content.
+ */
+export async function pipePluginResponsesWithStrip(
+    stream: ReadableStream<Uint8Array>,
+    res: import("node:http").ServerResponse,
+    session: Session,
+    log?: (msg: string) => void,
+): Promise<void> {
+    const reader = stream.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buf = "";
+    const acc: UsageSample = {};
+    const tagFilter = createTagEchoFilter((snippet) => {
+        loggerLog("warn", `[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+        log?.(`[tag-echo] stripped model-emitted render tag from plugin passthrough text`);
+    });
+    const write = (s: string) => {
+        if (!res.write(Buffer.from(s, "utf8"))) {
+            return new Promise<void>((r) => res.once("drain", () => r()));
+        }
+    };
+    let lastDeltaMeta: { item_id?: unknown; output_index?: unknown } | null = null;
+    const flushTail = (after: string) => {
+        const tail = tagFilter.flush();
+        if (tail.length > 0) {
+            const meta = lastDeltaMeta ?? {};
+            return `data: ${JSON.stringify({ type: "response.output_text.delta", ...meta, delta: tail })}\n\n` + after;
+        }
+        return after;
+    };
+    try {
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (value && value.length > 0) {
+                buf = normalizeSseLineEndings(buf + decoder.decode(value, { stream: true }));
+                let idx: number;
+                while ((idx = buf.indexOf("\n\n")) !== -1) {
+                    const rawEvent = buf.slice(0, idx);
+                    buf = buf.slice(idx + 2);
+                    const dataLines = rawEvent.split("\n").filter((l) => l.startsWith("data:"));
+                    if (dataLines.length === 0) continue;
+                    const jsonStr = dataLines.map((l) => l.slice(5).replace(/^ /, "")).join("\n").trim();
+                    if (!jsonStr || jsonStr === "[DONE]") {
+                        await write(rawEvent + "\n\n");
+                        continue;
+                    }
+                    let ev: Record<string, unknown>;
+                    try {
+                        ev = JSON.parse(jsonStr) as Record<string, unknown>;
+                    } catch {
+                        await write(rawEvent + "\n\n");
+                        continue;
+                    }
+                    const sample = usageFromSseEvent(ev);
+                    if (sample) mergeUsageSample(acc, sample);
+                    const type = ev["type"];
+                    if (
+                        type === "response.output_text.done" ||
+                        type === "response.content_part.done" ||
+                        type === "response.output_item.done" ||
+                        type === "response.completed" ||
+                        type === "response.failed" ||
+                        type === "response.incomplete"
+                    ) {
+                        // done-family events also carry full text payloads — strip those too.
+                        const out = containsRenderTagText(jsonStr) ? rebuildEvent(rawEvent, stripResponsesText(ev)) : rawEvent + "\n\n";
+                        await write(flushTail(out));
+                        continue;
+                    }
+                    if (type === "response.output_text.delta" && typeof ev["delta"] === "string") {
+                        const delta = ev["delta"] as string;
+                        if (delta.length === 0) {
+                            await write(rawEvent + "\n\n");
+                            continue;
+                        }
+                        if (!containsRenderTagText(delta) && !tagFilter.pending()) {
+                            await write(rawEvent + "\n\n");
+                            continue;
+                        }
+                        const clean = tagFilter.push(delta);
+                        lastDeltaMeta = { item_id: ev["item_id"], output_index: ev["output_index"] };
+                        if (clean.length === 0) continue;
+                        if (clean === delta) {
+                            await write(rawEvent + "\n\n");
+                            continue;
+                        }
+                        await write(rebuildEvent(rawEvent, { ...ev, delta: clean }));
+                        continue;
+                    }
+                    await write(rawEvent + "\n\n");
+                }
+            }
+            if (res.destroyed || res.writableEnded) break;
+        }
+        // Stream cut without a done-family event: flush whatever the tag
+        // filter still holds so prose is never silently lost.
+        if (!res.destroyed && !res.writableEnded) {
+            const rest = flushTail("");
+            if (rest.length > 0) await write(rest);
+        }
+        if (acc.inputTokens !== undefined || acc.outputTokens !== undefined || acc.cachedTokens !== undefined) {
+            applyUsageSample(session, acc, "responses");
+            markDirty(session);
+        }
+    } finally {
+        reader.releaseLock();
+        res.end();
+    }
+}
+
+function rebuildEvent(rawEvent: string, ev: Record<string, unknown>): string {
+    const lines = rawEvent.split("\n");
+    let replaced = false;
+    const out: string[] = [];
+    for (const l of lines) {
+        if (l.startsWith("data:")) {
+            // Multi-line data payloads (never emitted by real upstreams, but
+            // tolerated by the parser) collapse into the single rebuilt line —
+            // leaving the extra data lines would fuse two JSON payloads.
+            if (replaced) continue;
+            replaced = true;
+            out.push(`data: ${JSON.stringify(ev)}`);
+            continue;
+        }
+        out.push(l);
+    }
+    return replaced ? out.join("\n") + "\n\n" : `data: ${JSON.stringify(ev)}\n\n`;
+}
+
 export async function pipePluginJson(
     stream: ReadableStream<Uint8Array>,
     res: import("node:http").ServerResponse,
@@ -585,6 +738,18 @@ export async function pipePluginJson(
             }
         }
     } catch { /* non-JSON body — forward verbatim */ }
+    if (protocol === "responses") {
+        // #206 parity for the non-streaming plugin path: the compress loop's
+        // JSON branch strips render tags from every round (compressLoopResponsesJson);
+        // a verbatim plugin JSON response would re-feed the model's tag echoes.
+        try {
+            const json = JSON.parse(text) as Record<string, unknown>;
+            if (containsRenderTagText(text)) {
+                res.end(Buffer.from(JSON.stringify(stripResponsesText(json)), "utf8"));
+                return;
+            }
+        } catch { /* fall through to verbatim */ }
+    }
     res.end(text);
 }
 

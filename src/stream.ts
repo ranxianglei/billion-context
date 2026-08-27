@@ -267,6 +267,14 @@ export function applyRanges(ranges: ReturnType<typeof parseCompressInput>, ctx: 
         const warn = r.warnings.length > 0 ? ` ${r.warnings.join("; ")}` : "";
         const msg = `[Compressed ${detail} → ${r.blocksCreated} block(s), ~${r.tokensCompressed} tokens saved.${warn}]`;
         ctx.log(`[acp-proxy: ${msg}]`);
+        // The fold materializes only at the NEXT request's processTurn; the
+        // post-compress re-request re-sends the unfolded history (prefix-cache
+        // friendly), so usage reports until then over-report. Net the savings
+        // out immediately and keep them as a credit the usage recorders apply,
+        // so the next nudge decision sees post-compress reality instead of
+        // re-firing on the stale pre-compress number (#252 double-inject).
+        ctx.session.stats.compressCreditTokens = (ctx.session.stats.compressCreditTokens ?? 0) + r.tokensCompressed;
+        ctx.session.stats.lastInputTokens = Math.max(0, ctx.session.stats.lastInputTokens - r.tokensCompressed);
         return msg;
     } catch (err) {
         ctx.log(`[acp-proxy: compress failed: ${String(err)}]`);

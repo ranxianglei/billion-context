@@ -24,6 +24,8 @@ export interface TagEchoFilter {
     push(delta: string): string;
     flush(): string;
     dropped(): boolean;
+    /** True while the filter holds a partial-tag tail that a later push may complete. */
+    pending(): boolean;
 }
 
 export function stripAcpTags(text: string): string {
@@ -127,6 +129,9 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
         },
         dropped(): boolean {
             return droppedAny;
+        },
+        pending(): boolean {
+            return held.length > 0 || swallowUntilClose;
         },
     };
 }

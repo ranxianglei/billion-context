@@ -172,7 +172,10 @@ function recordUsage(
         (typeof prompt === "number" ? prompt : 0) +
         (!includesCached && typeof cached === "number" ? cached : 0);
     if (total > 0) ctx.session.stats.inputTokens += total;
-    ctx.session.stats.lastInputTokens = total;
+    // Net out this turn's compress credit: the post-compress re-request
+    // re-sends the unfolded history, so its usage report over-reports the
+    // context the NEXT request will actually carry (see stream.ts applyRanges).
+    ctx.session.stats.lastInputTokens = Math.max(0, total - (ctx.session.stats.compressCreditTokens ?? 0));
     if (typeof cached === "number") {
         ctx.session.stats.cachedTokens += cached;
         ctx.session.stats.cacheSamples += 1;

@@ -56,11 +56,13 @@ test("proxyBaseFromEnv accepts BILLION_CONTEXT_PROXY, detectProxyBase honors kil
 type FakeProxy = {
     origin: string;
     toolCalls: Array<{ conversationId: string; tool: string; args: unknown }>;
+    registers: Array<{ conversationId: string; agent: string; identity: boolean }>;
     close(): Promise<void>;
 };
 
-async function startFakeProxy(): Promise<FakeProxy> {
+async function startFakeProxy(opts: { failRegister?: number } = {}): Promise<FakeProxy> {
     const toolCalls: FakeProxy["toolCalls"] = [];
+    const registers: FakeProxy["registers"] = [];
     const server = http.createServer((req, res) => {
         const url = req.url ?? "";
         if (url === "/__bili/plugin/manifest") {
@@ -86,6 +88,22 @@ async function startFakeProxy(): Promise<FakeProxy> {
             });
             return;
         }
+        if (url === "/__bili/plugin/register" && req.method === "POST") {
+            let body = "";
+            req.on("data", (c) => (body += c));
+            req.on("end", () => {
+                const data = JSON.parse(body) as { conversationId?: string; agent?: string; identity?: boolean };
+                registers.push({ conversationId: data.conversationId ?? "", agent: data.agent ?? "", identity: data.identity === true });
+                if (opts.failRegister !== undefined) {
+                    res.writeHead(opts.failRegister);
+                    res.end("{}");
+                } else {
+                    res.writeHead(200, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ ok: true }));
+                }
+            });
+            return;
+        }
         if (url.startsWith("/__bili/plugin/status")) {
             res.writeHead(200, { "content-type": "application/json" });
             res.end(JSON.stringify({ ok: true, contextTokens: 1234 }));
@@ -97,7 +115,7 @@ async function startFakeProxy(): Promise<FakeProxy> {
     server.listen(0, "127.0.0.1");
     await once(server, "listening");
     const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
-    return { origin, toolCalls, close: () => new Promise<void>((resolve) => server.close(() => resolve())) };
+    return { origin, toolCalls, registers, close: () => new Promise<void>((resolve) => server.close(() => resolve())) };
 }
 
 test("shared manifest/tool/status against a fake proxy", async () => {
@@ -136,6 +154,7 @@ type FakePi = {
     events: Map<string, (event: unknown, ctx: unknown) => unknown>;
     tools: RecordedTool[];
     commands: Map<string, RecordedCommand>;
+    readonly registerCalls: number;
     on: (event: string, handler: (event: never, ctx: never) => unknown) => void;
     registerTool: (tool: RecordedTool) => void;
     registerCommand: (name: string, options: RecordedCommand) => void;
@@ -145,12 +164,15 @@ function makeFakePi(): FakePi {
     const events = new Map<string, (event: unknown, ctx: unknown) => unknown>();
     const tools: RecordedTool[] = [];
     const commands = new Map<string, RecordedCommand>();
+    let registerCallCount = 0;
     return {
         events,
         tools,
         commands,
+        get registerCalls() { return registerCallCount; },
         on: (event, handler) => events.set(event, handler as (event: never, ctx: never) => unknown),
         registerTool: (tool) => {
+            registerCallCount++;
             const i = tools.findIndex((t) => t.name === tool.name);
             if (i >= 0) tools[i] = tool;
             else tools.push(tool);
@@ -666,4 +688,172 @@ test("mcp forwardTool times out against a hanging proxy", async () => {
         await assert.rejects(() => mcpForwardTool("compress", {}, 200), /timed out after 200ms/);
     });
     await new Promise<void>((resolve) => server.close(() => resolve()));
+});
+
+test("registered tools declare loadMode essential so omp 17.x keeps them top-level", async () => {
+    const proxy = await startFakeProxy();
+    try {
+        const pi = makeFakePi();
+        biliPlugin(pi as never);
+        await pi.events.get("session_start")!({}, fakeCtx(proxy));
+        await waitForTools(pi, 2);
+        // omp mounts extension tools that omit loadMode under xd:// devices —
+        // invisible to the main turn's tools array. "essential" keeps them in.
+        for (const tool of pi.tools) {
+            assert.equal((tool as unknown as { loadMode?: string }).loadMode, "essential");
+        }
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("omp plugin identity-registers the conversation once tools are ready", async () => {
+    const proxy = await startFakeProxy();
+    try {
+        const pi = makeFakePi();
+        ompPlugin(pi as never);
+        await pi.events.get("session_start")!({}, fakeCtx(proxy, "omp-sess-7"));
+        await waitForTools(pi, 2);
+        // omp never emits before_provider_headers, so the plugin must bind the
+        // conversation via the launcher identity register (#162 semantics).
+        const deadline = Date.now() + 15000;
+        while (proxy.registers.length === 0 && Date.now() < deadline) {
+            await new Promise((r) => setTimeout(r, 25));
+        }
+        assert.deepEqual(proxy.registers, [{ conversationId: "omp-sess-7", agent: "omp", identity: true }]);
+        // Re-driving per-request events must not re-POST (identityAt caches by sid).
+        await pi.events.get("before_provider_request")!({}, fakeCtx(proxy, "omp-sess-7"));
+        await flush();
+        assert.equal(proxy.registers.length, 1);
+        // A new session re-registers under its own id.
+        await pi.events.get("session_start")!({}, fakeCtx(proxy, "omp-sess-8"));
+        const deadline2 = Date.now() + 15000;
+        while (proxy.registers.length < 2 && Date.now() < deadline2) {
+            await new Promise((r) => setTimeout(r, 25));
+        }
+        assert.deepEqual(proxy.registers[1], { conversationId: "omp-sess-8", agent: "omp", identity: true });
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("pi plugin does not identity-register (it stamps headers instead)", async () => {
+    const proxy = await startFakeProxy();
+    try {
+        const pi = makeFakePi();
+        biliPlugin(pi as never);
+        await pi.events.get("session_start")!({}, fakeCtx(proxy));
+        await waitForTools(pi, 2);
+        await pi.events.get("before_provider_request")!({}, fakeCtx(proxy));
+        await flush();
+        assert.deepEqual(proxy.registers, []);
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("omp identity register failure throttles and retries later", async () => {
+    const proxy = await startFakeProxy({ failRegister: 500 });
+    try {
+        const pi = makeFakePi();
+        createBiliPlugin("omp", { retryIntervalMs: 500 })(pi as never);
+        await pi.events.get("session_start")!({}, fakeCtx(proxy, "omp-sess-9"));
+        await waitForTools(pi, 2);
+        const deadline = Date.now() + 15000;
+        while (proxy.registers.length < 1 && Date.now() < deadline) {
+            await new Promise((r) => setTimeout(r, 25));
+        }
+        assert.equal(proxy.registers.length, 1);
+        // Throttled: a burst of per-request events right after the failure must
+        // not hammer the endpoint (retryAt gates re-entry).
+        for (let i = 0; i < 5; i++) {
+            await pi.events.get("before_provider_request")!({}, fakeCtx(proxy, "omp-sess-9"));
+            await flush();
+        }
+        assert.equal(proxy.registers.length, 1, "throttled — no immediate retry");
+        // After the throttle window, a per-request event retries ONLY the
+        // register (re-fetches manifest, re-POSTs register; tools are NOT
+        // re-registered).
+        await new Promise((r) => setTimeout(r, 700));
+        await pi.events.get("before_provider_request")!({}, fakeCtx(proxy, "omp-sess-9"));
+        const deadline2 = Date.now() + 5000;
+        while (proxy.registers.length < 2 && Date.now() < deadline2) {
+            await new Promise((r) => setTimeout(r, 25));
+        }
+        assert.equal(proxy.registers.length, 2, "retried after the throttle window");
+        assert.equal(pi.registerCalls, 2, "tools registered once, not re-registered on retry");
+    } finally {
+        await proxy.close();
+    }
+});
+
+// #266: omp's chat-completions payloads carry NO conversation signal, so the
+// plugin stamps prompt_cache_key with the omp session id. The
+// before_provider_request return value REPLACES the whole outgoing payload
+// (omp onPayload chain), so the matrix below drives the real handler and
+// asserts exactly which payload shapes get stamped. fakeCtx(undefined) keeps
+// registerTools a no-op (no proxy) so the test is pure.
+test("omp before_provider_request stamps prompt_cache_key only for chat-completions payloads (injection matrix)", async () => {
+    const sid = "omp-uuid-abc";
+    const mk = (): FakePi => {
+        const pi = makeFakePi();
+        createBiliPlugin("omp")(pi as never);
+        return pi;
+    };
+    const handler = (pi: FakePi, payload: unknown) =>
+        pi.events.get("before_provider_request")!({ type: "before_provider_request", payload }, fakeCtx(undefined, sid));
+
+    // chat payload (messages, no input, no max_tokens, no native pck) → stamped
+    {
+        const pi = mk();
+        const payload = { model: "glm-4", messages: [{ role: "user", content: "hi" }] };
+        const out = handler(pi, payload) as Record<string, unknown>;
+        assert.equal(out.prompt_cache_key, sid, "chat payload stamped with the omp session id");
+        assert.deepEqual(out.messages, payload.messages, "rest of the payload preserved");
+        assert.equal(payload.prompt_cache_key, undefined, "original payload not mutated");
+    }
+    // native prompt_cache_key already present → not overridden
+    {
+        const pi = mk();
+        const out = handler(pi, { messages: [{ role: "user", content: "hi" }], prompt_cache_key: "native-pck" });
+        assert.equal(out, undefined, "native pck is not overridden");
+    }
+    // responses payload (input array) → untouched
+    {
+        const pi = mk();
+        const out = handler(pi, { input: [{ role: "user", content: "hi" }] });
+        assert.equal(out, undefined, "responses payload (input) untouched");
+    }
+    // anthropic wire (max_tokens) → untouched
+    {
+        const pi = mk();
+        const out = handler(pi, { messages: [{ role: "user", content: "hi" }], max_tokens: 1024, system: "s" });
+        assert.equal(out, undefined, "anthropic wire (max_tokens) untouched");
+    }
+    // no session id → untouched
+    {
+        const pi = mk();
+        const out = pi.events.get("before_provider_request")!({ type: "before_provider_request", payload: { messages: [{ role: "user", content: "hi" }] } }, fakeCtx(undefined, ""));
+        assert.equal(out, undefined, "no session id → untouched");
+    }
+    // non-object payload → untouched
+    {
+        const pi = mk();
+        assert.equal(handler(pi, "not an object"), undefined, "non-object payload untouched");
+        assert.equal(handler(pi, null), undefined, "null payload untouched");
+        assert.equal(handler(pi, [1, 2, 3]), undefined, "array payload untouched");
+    }
+    // no messages array → untouched
+    {
+        const pi = mk();
+        assert.equal(handler(pi, { model: "x" }), undefined, "no messages → untouched");
+        assert.equal(handler(pi, { messages: "nope" }), undefined, "non-array messages → untouched");
+    }
+});
+
+test("pi agent never stamps prompt_cache_key (it stamps headers instead)", async () => {
+    const pi = makeFakePi();
+    createBiliPlugin("pi")(pi as never);
+    const out = pi.events.get("before_provider_request")!({ type: "before_provider_request", payload: { messages: [{ role: "user", content: "hi" }] } }, fakeCtx(undefined, "pi-uuid"));
+    assert.equal(out, undefined, "pi agent never stamps the body");
 });
