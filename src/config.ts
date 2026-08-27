@@ -144,6 +144,17 @@ export function lookupContextLimit(model: string | undefined): number | undefine
     return undefined;
 }
 
+/** Floor for the EFFECTIVE context window (after output-headroom reservation)
+ *  when the window came from a low-confidence fallback — the built-in table
+ *  above or the env default — rather than an authoritative source (plugin
+ *  report, launcher declaration, models.dev registry, per-route config, or a
+ *  learned upstream overflow). Fallback values are guesses, and the two error
+ *  directions are asymmetric: a too-small guess strands the session on a
+ *  permanent compression treadmill (issue #282: 128k table value − 64k
+ *  max_tokens → 64k effective for a 1M-window model), while a too-large guess
+ *  self-heals on the first upstream overflow. */
+export const FALLBACK_EFFECTIVE_WINDOW_FLOOR = 100_000;
+
 /** Resolve the context-window limit for a request. Priority:
  *  1. Per-URL per-model declaration in config (user-controlled, most accurate).
  *     The upstreamUrl is matched against config keys by **longest-prefix wins**

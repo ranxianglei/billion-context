@@ -5,7 +5,7 @@ import { resolveCompress, resolveCompressPrompts, resolveRequestConfig } from ".
 import type { ProxyOptions } from "./config.js";
 import { loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
-import { resolveContextLimit, resolveCompressProtocol } from "./config.js";
+import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, lookupContextLimit, resolveConfiguredContextLimit, resolveCompressProtocol } from "./config.js";
 import { contextFromRegistry, loadRegistry, peekRegistryContext } from "./registry.js";
 import { fetchWithTimeout, MAX_REQUEST_BYTES } from "./fetch-util.js";
 import { formatUpstreamError, getUpstreamConnectionStatus, recordUpstreamConnection, resolveProxy, resolveProxyDecision, proxyDispatcher } from "./upstream-proxy.js";
@@ -659,6 +659,12 @@ async function handle(
     // absolute number, a "70%" string of the native window, or unset → native)
     // overrides the table.
     let reqConfig = config;
+    // True when the resolved native window came from a low-confidence fallback
+    // (built-in table / env default) instead of an authoritative source — such
+    // windows get an effective-floor after output-headroom reservation (see
+    // FALLBACK_EFFECTIVE_WINDOW_FLOOR). Cleared if a learned overflow limit or
+    // an async registry hit replaces the value.
+    let nativeFromFallback = false;
     // Effective compression prompts for this request: resolved from the same
     // three-level cascade (global → provider → model) as the limit above, then
     // threaded into every prepare* path so the system prompt, the nudge text,
@@ -684,12 +690,23 @@ async function handle(
             // fallback. Operator tuning via compress.modelContextLimit still
             // outranks everything inside resolveRequestConfig.
             const host = (() => { try { return embeddedUrl ? new URL(embeddedUrl).host : undefined; } catch { return undefined; } })();
-            let native = pluginReportedContextWindow(req.headers)
-                ?? launcherContextWindow(model)
-                ?? (host ? peekRegistryContext(model, host) : undefined)
-                ?? resolveContextLimit(opts.routes, embeddedUrl, model);
+            const pluginWindow = pluginReportedContextWindow(req.headers);
+            const launcherWindow = launcherContextWindow(model);
+            const peekWindow = host ? peekRegistryContext(model, host) : undefined;
+            const configuredWindow = resolveConfiguredContextLimit(opts.routes, embeddedUrl, model);
+            let native = pluginWindow
+                ?? launcherWindow
+                ?? peekWindow
+                ?? configuredWindow
+                ?? lookupContextLimit(model);
+            // Fallback = no authoritative source AND the operator did not
+            // explicitly tune the window via compress.modelContextLimit (an
+            // explicit tuning is owned by the operator — never floored).
+            const operatorWindowTuned = resolveCompress(opts.routes, embeddedUrl, model, opts.compress).modelContextLimit !== undefined;
+            nativeFromFallback = !pluginWindow && !launcherWindow && !peekWindow && !configuredWindow && !operatorWindowTuned;
             if (!native && host) {
                 native = await contextFromRegistry(model, host);
+                if (native) nativeFromFallback = false;
             }
             reqConfig = resolveRequestConfig(config, opts.routes, embeddedUrl, model, native, opts.compress);
             reqPrompts = resolveCompressPrompts(resolveCompress(opts.routes, embeddedUrl, model, opts.compress));
@@ -837,6 +854,9 @@ async function handle(
         if (learnedLimit && learnedLimit > 0 && learnedLimit < reqConfig.modelContextLimit) {
             const resolved = reqConfig.modelContextLimit;
             reqConfig = { ...reqConfig, modelContextLimit: learnedLimit };
+            // A learned limit is ground truth from a real overflow — it must
+            // not be floored back up (that would undo the self-heal).
+            nativeFromFallback = false;
             log("info", `[${session.id}] self-healed context window: ${resolved} → ${learnedLimit} (learned from an upstream overflow)`);
         }
         // Reserve the model's OUTPUT budget for this turn from the window so the
@@ -857,7 +877,16 @@ async function handle(
             const p = parsed as Record<string, unknown>;
             const rawMax = p.max_tokens ?? p.max_completion_tokens ?? p.max_output_tokens;
             const maxOutput = typeof rawMax === "number" ? rawMax : 0;
-            const reserved = reserveOutputHeadroom(reqConfig.modelContextLimit, maxOutput);
+            let reserved = reserveOutputHeadroom(reqConfig.modelContextLimit, maxOutput);
+            // Fallback-derived windows are optimistic guesses: never let the
+            // output-headroom reservation push the effective window below the
+            // floor (issue #282: 128k table − 64k max_tokens → 64k effective
+            // for a 1M-window model). If the real window is smaller, the first
+            // upstream overflow self-heals it.
+            if (nativeFromFallback && reserved < FALLBACK_EFFECTIVE_WINDOW_FLOOR) {
+                log("info", `[${session.id}] fallback context window floored: ${reserved} → ${FALLBACK_EFFECTIVE_WINDOW_FLOOR} (model=${String(p.model ?? "?")} not authoritatively identified; self-heal corrects it if the real window is smaller)`);
+                reserved = FALLBACK_EFFECTIVE_WINDOW_FLOOR;
+            }
             if (reserved !== reqConfig.modelContextLimit) reqConfig = { ...reqConfig, modelContextLimit: reserved };
         }
         // acquireInFlight must precede the lock so evictOldest() cannot flush
