@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import { gzipSync } from "node:zlib";
-import { createInitialState, defaultConfig } from "acp-kernel";
+import { createCore, createInitialState, defaultConfig } from "acp-kernel";
+import { responsesToCore } from "acp-kernel/wire";
 import { startServer, hasTerminalResponsesCompactionTrigger, isChatGptCodexUpstream, isCodexResponsesLite, shouldInjectPromptCacheKey, resolvePromptCacheKey } from "../src/server.ts";
 import { listSessions } from "../src/session.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
@@ -30,6 +31,11 @@ test("Codex official transport preserves OAuth headers, decodes bodies, and reba
         req.on("data", (chunk: Buffer) => chunks.push(chunk));
         req.on("end", () => {
             captured.push({ url: req.url ?? "", headers: req.headers, body: Buffer.concat(chunks) });
+            if (req.url?.includes("semantic-fail=1")) {
+                res.writeHead(200, { "content-type": "text/event-stream" });
+                res.end(`data: ${JSON.stringify({ type: "response.failed", response: { id: "resp_failed", status: "failed", error: { message: "context window exceeded" } } })}\n\n`);
+                return;
+            }
             if (req.url?.includes("fail=1")) {
                 res.writeHead(500, { "content-type": "application/json" });
                 res.end(JSON.stringify({ error: "compact failed" }));
@@ -172,9 +178,66 @@ test("Codex official transport preserves OAuth headers, decodes bodies, and reba
                     role: index % 2 === 0 ? "user" : "assistant",
                     content: `${index}:${"x".repeat(40_000)}`,
                 })),
+                {
+                    type: "function_call",
+                    id: "fc_seed",
+                    call_id: "call_seed",
+                    name: "compress",
+                    arguments: JSON.stringify({
+                        content: [{ startId: "m00001", endId: "m00007", summary: "seeded ACP summary retained intact for native compaction replay" }],
+                    }),
+                },
+                { type: "function_call_output", call_id: "call_seed", output: "compressed as b1" },
                 { type: "compaction_trigger" },
             ],
         };
+        // The preceding ordinary turn legitimately assigned refs after the
+        // earlier native rebase. Start this independent fixture from the same
+        // clean compression state a newly seeded conversation would have.
+        session.state = createInitialState();
+        session.blockContents.clear();
+        const seedCore = createCore();
+        const seedProjection = responsesToCore(triggerBody);
+        const seededTurn = seedCore.processTurn({
+            messages: seedProjection.msgs,
+            state: session.state,
+            config: opts.kernelConfig,
+            tokenCount: session.stats.lastInputTokens,
+            renderTags: "none",
+        });
+        const seeded = seedCore.applyCompression({
+            ranges: [{
+                startRef: "m00001",
+                endRef: "m00007",
+                summary: "seeded ACP summary retained intact for native compaction replay",
+                compressCallId: "call_seed",
+            }],
+            messages: seededTurn.messages,
+            state: seededTurn.state,
+            config: opts.kernelConfig,
+        });
+        assert.equal(seeded.result.blocksCreated, 1, `failed to seed active ACP block: ${seeded.result.errors.join("; ")}`);
+        session.state = seeded.state;
+        session.blockContents.set("b1", { one: { text: "seed", count: 1 }, full: { text: "seed", count: 1 } });
+        const stateBeforeFailedTrigger = JSON.stringify(session.state);
+
+        const failedTrigger = await fetch(`${base}/responses?semantic-fail=1`, {
+            method: "POST",
+            headers: {
+                authorization: "Bearer AbCdEf",
+                "chatgpt-account-id": "account-123",
+                "session-id": sessionId,
+                "content-type": "application/json",
+            },
+            body: JSON.stringify(triggerBody),
+        });
+        assert.equal(failedTrigger.status, 200, "Responses failures can arrive inside HTTP 200 SSE");
+        assert.match(await failedTrigger.text(), /response\.failed/);
+        assert.equal(JSON.stringify(session.state), stateBeforeFailedTrigger, "native compaction projection is read-only when upstream fails");
+        assert.equal(session.state.blocks.filter((block) => block.active).length, 1, "semantic failure keeps the active ACP block");
+        assert.equal(session.blockContents.size, 1, "semantic failure keeps cached ACP block content");
+        assert.notEqual((session.metadata.nativeCompactionBoundary as Record<string, unknown> | undefined)?.pendingRebase, true);
+
         const trigger = await fetch(`${base}/responses`, {
             method: "POST",
             headers: {
@@ -187,11 +250,14 @@ test("Codex official transport preserves OAuth headers, decodes bodies, and reba
         });
         assert.equal(trigger.status, 200);
         await trigger.arrayBuffer();
-        const forwardedTrigger = JSON.parse(captured[3].body.toString("utf8")) as typeof triggerBody;
+        const forwardedTrigger = JSON.parse(captured.at(-1)!.body.toString("utf8")) as typeof triggerBody;
         assert.deepEqual({ ...forwardedTrigger, input: [] }, { ...triggerBody, input: [] });
         assert.match(forwardedTrigger.input[0].id, /^msg-fix-/);
         assert.ok(forwardedTrigger.input[0].id.length <= 64);
-        assert.deepEqual(forwardedTrigger.input.slice(1), triggerBody.input.slice(1));
+        assert.ok(forwardedTrigger.input.length < triggerBody.input.length, "active ACP coverage shrinks the native compaction request");
+        assert.ok(!forwardedTrigger.input.some((item) => item.type === "message" && String(item.content).startsWith("2:")), "covered history is omitted");
+        assert.ok(forwardedTrigger.input.some((item) => item.type === "message" && item.content === triggerBody.input[11].content), "uncovered recent history is byte-preserved");
+        assert.ok(forwardedTrigger.input.some((item) => item.type === "function_call" && item.call_id === "call_seed"), "active compress call carrying the summary is retained");
         assert.equal(forwardedTrigger.input.at(-1)?.type, "compaction_trigger");
         assert.equal(listSessions().filter((candidate) => candidate.meta.label === sessionId).length, 1);
         assert.equal((session.metadata.nativeCompactionBoundary as Record<string, unknown>).pendingRebase, true);

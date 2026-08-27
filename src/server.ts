@@ -1092,12 +1092,53 @@ function prepareResponses(
     // processing reads and replays the input.
     sanitizeResponsesInputIds(parsed.input);
     if (nativeCompactionTrigger) {
-        log("info", `[${sessionId}] terminal compaction_trigger detected; forwarding without ACP injection`);
+        // Native compaction is itself just another Responses request and must
+        // fit in the model window.  Forwarding the client's full raw history
+        // here defeats every ACP block we already built, which is especially
+        // harmful because Codex triggers this request close to its own input
+        // budget.  Project the history through the existing ACP state, but do
+        // not inject ACP prompts/tools/nudges.  The codec keeps opaque preamble
+        // items (including compaction_trigger) in their original order, so the
+        // trigger remains the final input item as required by the API.
+        let processedMessages: CoreMessage[] = [];
+        let originalMessages: CoreMessage[] = [];
+        const sanitizedInput = parsed.input;
+        try {
+            const projection = responsesToCore(parsed);
+            originalMessages = projection.msgs;
+            const beforeCount = Array.isArray(parsed.input) ? parsed.input.length : 0;
+            const turn = core.processTurn({
+                messages: projection.msgs,
+                state: session.state,
+                config,
+                tokenCount: session.stats.lastInputTokens,
+                // Native compaction does not involve the model-facing ACP
+                // protocol, so preserve every surviving item byte-for-byte.
+                // The kernel still prunes active blocks and consumed compress
+                // calls with rendering disabled; it simply does not prepend
+                // <acp> refs to otherwise unchanged messages.
+                renderTags: "none",
+            });
+            processedMessages = stripKernelSummaries(turn.messages);
+            parsed.input = patchResponsesInput(projection, processedMessages);
+            if (!hasTerminalResponsesCompactionTrigger(parsed.input)) {
+                throw new Error("ACP projection displaced the terminal compaction_trigger");
+            }
+            const afterCount = Array.isArray(parsed.input) ? parsed.input.length : 0;
+            log("info", `[${sessionId}] terminal compaction_trigger projected through ACP state: ${beforeCount} → ${afterCount} input items; no ACP injection`);
+        } catch (err) {
+            // Preserve the existing safe fallback: a codec/kernel failure must
+            // not swallow Codex's native compaction request.
+            parsed.input = sanitizedInput;
+            log("warn", `[${sessionId}] native compaction ACP projection failed, forwarding sanitized input unchanged: ${String(err)}`);
+            processedMessages = [];
+            originalMessages = [];
+        }
         return {
             body: JSON.stringify(parsed),
             session,
-            processedMessages: [],
-            originalMessages: [],
+            processedMessages,
+            originalMessages,
             protocol: "responses",
             stream,
             compressInjected: false,
@@ -1668,8 +1709,7 @@ async function forward(
         res.end();
         clearUpstreamTimer();
         if (prepared?.resetAfterSuccess) {
-            markNativeCompactionBoundary(prepared.session);
-            log("info", `[${prepared.session.id}] native Responses compact completed; rebase scheduled for next Responses turn`);
+            log("warn", `[${prepared.session.id}] native Responses compact returned no body; ACP rebase not scheduled without semantic completion`);
         }
         return;
     }
@@ -1697,11 +1737,15 @@ async function forward(
         prepared.compressInjected &&
         prepared.processedMessages.length > 0;
     if (!useRewriter || prepared === null) {
-        await pipeThrough(upstream.body, res);
+        const completion = await pipeThrough(upstream.body, res, prepared?.resetAfterSuccess === true);
         clearUpstreamTimer();
         if (prepared?.resetAfterSuccess) {
-            markNativeCompactionBoundary(prepared.session);
-            log("info", `[${prepared.session.id}] native Responses compact completed; rebase scheduled for next Responses turn`);
+            if (completion === "completed") {
+                markNativeCompactionBoundary(prepared.session);
+                log("info", `[${prepared.session.id}] native Responses compact completed semantically; rebase scheduled for next Responses turn`);
+            } else {
+                log("warn", `[${prepared.session.id}] native Responses compact HTTP 2xx ended with semantic status ${completion}; ACP rebase not scheduled`);
+            }
         }
         return;
     }
@@ -1858,20 +1902,94 @@ async function readStreamToBuffer(stream: ReadableStream<Uint8Array>, maxBytes =
     return Buffer.concat(chunks);
 }
 
-async function pipeThrough(stream: ReadableStream<Uint8Array>, res: http.ServerResponse): Promise<void> {
+type ResponsesCompletion = "completed" | "failed" | "unknown";
+
+/** Pass a body through byte-for-byte while optionally observing the terminal
+ * Responses status. Responses errors are commonly delivered as response.failed
+ * inside an HTTP 200 SSE stream, so HTTP status alone cannot authorize an ACP
+ * rebase. The observer is deliberately side-band: it never rewrites or delays
+ * bytes sent to the client. */
+async function pipeThrough(
+    stream: ReadableStream<Uint8Array>,
+    res: http.ServerResponse,
+    observeResponsesCompletion = false,
+): Promise<ResponsesCompletion> {
     const reader = stream.getReader();
+    const decoder = observeResponsesCompletion ? new TextDecoder() : undefined;
+    let completion: ResponsesCompletion = "unknown";
+    let ssePending = "";
+    let captured = "";
+    let captureTruncated = false;
+    const maxCaptureChars = 2 << 20;
+
+    const inspectEvent = (block: string): void => {
+        let event = block.match(/(?:^|\r?\n)event:\s*([^\r\n]+)/)?.[1]?.trim();
+        if (!event) {
+            const data = block.match(/(?:^|\r?\n)data:\s*([^\r\n]+)/)?.[1]?.trim();
+            if (data && data !== "[DONE]") {
+                try {
+                    event = (JSON.parse(data) as Record<string, unknown>).type as string | undefined;
+                } catch {
+                    // Ignore malformed data; an unambiguous terminal event is required.
+                }
+            }
+        }
+        if (event === "response.completed") completion = "completed";
+        else if (event === "response.failed" || event === "response.incomplete" || event === "response.error" || event === "error") completion = "failed";
+    };
+
+    const inspectText = (text: string): void => {
+        if (!text) return;
+        if (captured.length < maxCaptureChars) {
+            const remaining = maxCaptureChars - captured.length;
+            captured += text.slice(0, remaining);
+            if (text.length > remaining) captureTruncated = true;
+        } else {
+            captureTruncated = true;
+        }
+        ssePending += text;
+        for (;;) {
+            const boundary = /\r?\n\r?\n/.exec(ssePending);
+            if (!boundary || boundary.index === undefined) break;
+            inspectEvent(ssePending.slice(0, boundary.index));
+            ssePending = ssePending.slice(boundary.index + boundary[0].length);
+        }
+        // A malformed/non-SSE multi-megabyte body must not make the observer
+        // retain unbounded memory. Terminal SSE events are tiny and delimited.
+        if (ssePending.length > maxCaptureChars) ssePending = ssePending.slice(-8192);
+    };
     try {
         for (;;) {
             const { done, value } = await reader.read();
             if (done) break;
+            if (decoder) inspectText(decoder.decode(value, { stream: true }));
             if (!res.write(Buffer.from(value))) {
                 await new Promise<void>((r) => res.once("drain", () => r()));
+            }
+        }
+        if (decoder) {
+            inspectText(decoder.decode());
+            if (ssePending) inspectEvent(ssePending);
+            // Non-streaming /responses/compact returns JSON rather than SSE.
+            // Only parse when the capture is complete; an unknown outcome is
+            // safer than rebasing on a truncated body.
+            if (completion === "unknown" && !captureTruncated) {
+                try {
+                    const json = JSON.parse(captured) as Record<string, unknown>;
+                    const response = (json.response as Record<string, unknown> | undefined) ?? json;
+                    const status = response.status;
+                    if (status === "completed") completion = "completed";
+                    else if (status === "failed" || status === "incomplete" || response.error) completion = "failed";
+                } catch {
+                    // Not JSON (normally SSE); the event observer above is authoritative.
+                }
             }
         }
     } finally {
         reader.releaseLock();
         res.end();
     }
+    return completion;
 }
 
 async function dumpStreamToFile(stream: ReadableStream<Uint8Array>, dir: string, name: string): Promise<void> {
