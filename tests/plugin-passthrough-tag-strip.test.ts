@@ -148,7 +148,7 @@ test("plugin passthrough preserves SSE framing for tag-free done-family events (
     assert.ok(text.endsWith("\n\n"), "stream keeps event framing to the end");
 });
 
-test("plugin passthrough flushes held tail when stream ends without a done-family event", async () => {
+test("plugin passthrough resolves held tail at stream end without a done-family event", async () => {
     const out: string[] = [];
     const res = makeRes(out);
     const session = makeSession();
@@ -158,7 +158,16 @@ test("plugin passthrough flushes held tail when stream ends without a done-famil
     await pipePluginResponsesWithStrip(streamOf(events), res, session);
     const text = out.join("");
     assert.ok(text.includes("prose "), "clean prefix passes");
-    assert.ok(text.includes("m0"), "held unterminated fragment is flushed at stream end, not lost");
+    assert.ok(!text.includes("m0"), "content of an unclosed tag is dropped at stream end, not flushed as junk");
+
+    const out2: string[] = [];
+    const res2 = makeRes(out2);
+    const events2 = [
+        sse({ type: "response.output_text.delta", item_id: "msg_9", output_index: 0, delta: `prose \x3cac` }),
+    ];
+    await pipePluginResponsesWithStrip(streamOf(events2), res2, session);
+    const text2 = out2.join("");
+    assert.ok(text2.includes(`"delta":"prose \x3cac"`), "ambiguous prefix passes through untouched at stream end");
 });
 
 test("plugin passthrough rebuildEvent collapses multi-line data payloads into one line", async () => {
