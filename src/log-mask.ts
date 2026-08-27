@@ -93,3 +93,21 @@ export function maskHeadersForLog(headers: Record<string, string>): Record<strin
     for (const [k, v] of Object.entries(headers)) out[k] = maskHeaderForLog(k, v);
     return out;
 }
+
+/** Scrub a specific host (the tunnel/forward target) from arbitrary error
+ *  text. OS/undici error messages embed the endpoint ("connect ECONNREFUSED
+ *  10.0.0.5:8443", "getaddrinfo ENOTFOUND relay.internal"), so a log line
+ *  that masks the host in its template still leaks it via `err.message`.
+ *  Only the given host is replaced — other addresses in the text (e.g. the
+ *  proxy's) are left as-is, matching the `proxy=` design decision. Handles
+ *  both the bracketed ([::1]) and bare (::1) IPv6 forms. */
+export function maskHostInText(text: string, host: string): string {
+    if (!host || isPublicApiHost(host)) return text;
+    const bare = host.replace(/^\[|\]$/g, "");
+    const forms = new Set<string>([host, bare]);
+    if (bare.includes(":")) forms.add(`[${bare}]`);
+    for (const form of forms) {
+        if (form.length > 0) text = text.split(form).join(PRIVATE_HOST);
+    }
+    return text;
+}

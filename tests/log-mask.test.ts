@@ -5,6 +5,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { once } from "node:events";
+import net from "node:net";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
@@ -17,6 +18,7 @@ import {
     maskHeaderForLog,
     maskHeadersForLog,
     maskHostForLog,
+    maskHostInText,
     maskHostPortForLog,
     maskUrlForLog,
     maskUrlsInText,
@@ -97,6 +99,35 @@ test("maskHeadersForLog: masks the whole record", () => {
     assert.equal(out.authorization, "<masked 16 chars>");
     assert.equal(out["content-type"], "application/json");
     assert.equal(out.host, "<private-host>:8443");
+});
+
+test("maskHostInText: scrubs the tunnel target from error text, leaves other addresses", () => {
+    assert.equal(
+        maskHostInText("connect ECONNREFUSED 192.168.1.50:8443", "192.168.1.50"),
+        "connect ECONNREFUSED <private-host>:8443",
+    );
+    assert.equal(
+        maskHostInText("getaddrinfo ENOTFOUND relay.internal", "relay.internal"),
+        "getaddrinfo ENOTFOUND <private-host>",
+    );
+    assert.equal(
+        maskHostInText("connect ECONNREFUSED api.openai.com:443", "api.openai.com"),
+        "connect ECONNREFUSED api.openai.com:443",
+    );
+    assert.equal(
+        maskHostInText("proxy connect ECONNREFUSED 10.1.2.3:3128", "192.168.1.50"),
+        "proxy connect ECONNREFUSED 10.1.2.3:3128",
+    );
+    assert.equal(
+        maskHostInText("connect ECONNREFUSED [::1]:8443", "[::1]"),
+        "connect ECONNREFUSED <private-host>:8443",
+    );
+    assert.equal(
+        maskHostInText("connect ECONNREFUSED ::1:8443", "::1"),
+        "connect ECONNREFUSED <private-host>:8443",
+    );
+    assert.equal(maskHostInText("no host here", "192.168.1.50"), "no host here");
+    assert.equal(maskHostInText("connect ECONNREFUSED 192.168.1.50:8443", ""), "connect ECONNREFUSED 192.168.1.50:8443");
 });
 
 test("formatUpstreamError: non-public url and endpoint identity masked", () => {
@@ -255,6 +286,65 @@ test("proxy error log: connection failure to non-public upstream leaks nothing (
         const errLine = captured.find((c) => c.msg.includes("upstream request failed"));
         assert.ok(errLine, `error log missing:\n${all}`);
         assert.ok(errLine.msg.includes("<private-host>"), errLine.msg);
+    } finally {
+        setLogCapture(null);
+        if (prev.xdgState === undefined) delete process.env.XDG_STATE_HOME;
+        else process.env.XDG_STATE_HOME = prev.xdgState;
+        await close(proxy!);
+        fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+});
+
+test("mitm CONNECT tunnel failure: err.message host scrubbed from log (#255)", async () => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bili-log-mask-mitm-"));
+    const prev = { xdgState: process.env.XDG_STATE_HOME };
+    process.env.XDG_STATE_HOME = tmpRoot;
+    const captured: Captured[] = [];
+    setLogCapture((level, msg) => captured.push({ level, msg }));
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    let proxy: http.Server | undefined;
+    try {
+        const holder = http.createServer();
+        holder.listen(0, "127.0.0.1");
+        await once(holder, "listening");
+        const deadPort = (holder.address() as { port: number }).port;
+        await close(holder);
+        const opts: ProxyOptions = {
+            port: 0,
+            host: "127.0.0.1",
+            upstream: "http://127.0.0.1",
+            routes: {
+                "http://127.0.0.1:1": { models: { "gpt-test": { context: 400_000 } } },
+            },
+            modelContextLimit: 400_000,
+            kernelConfig: defaultConfig(400_000),
+            compress: { injectTool: false, injectNudge: false },
+            promptCache: { routing: "auto" },
+            sessionHeader: "x-acp-session",
+            log: true,
+            debug: false,
+            passthrough: false,
+            autoUpdate: false,
+            mitm: { enabled: true, domains: [] },
+        };
+        proxy = await startServer(opts);
+        await once(proxy, "listening");
+        const proxyPort = (proxy.address() as { port: number }).port;
+        const sock = net.connect(proxyPort, "127.0.0.1");
+        let buf = "";
+        await new Promise<void>((resolve, reject) => {
+            sock.on("data", (d) => { buf += d.toString(); if (buf.includes("\r\n\r\n")) resolve(); });
+            sock.on("error", reject);
+            sock.write(`CONNECT 127.0.0.1:${deadPort} HTTP/1.1\r\nHost: 127.0.0.1:${deadPort}\r\n\r\n`);
+        });
+        sock.destroy();
+        assert.ok(buf.startsWith("HTTP/1.1 502"), buf);
+        const all = captured.map((c) => c.msg).join("\n");
+        const tunnelLine = captured.find((c) => c.msg.includes("connect failed"));
+        assert.ok(tunnelLine, `tunnel failure log missing:\n${all}`);
+        assert.ok(tunnelLine.msg.includes(`<private-host>:${deadPort}`), tunnelLine.msg);
+        assert.ok(!all.includes(`127.0.0.1:${deadPort}`), `raw tunnel target leaked into logs via err.message:\n${all}`);
     } finally {
         setLogCapture(null);
         if (prev.xdgState === undefined) delete process.env.XDG_STATE_HOME;

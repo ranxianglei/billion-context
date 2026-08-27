@@ -5,7 +5,7 @@ import { ensureRootCA, getSecureContext } from "./ca.js";
 import { connectThroughProxy } from "./upstream-proxy.js";
 import { discoverMitmDomains } from "./discover.js";
 import { isLoopbackAddress } from "./util.js";
-import { maskHostForLog, maskHostPortForLog } from "./log-mask.js";
+import { maskHostForLog, maskHostInText, maskHostPortForLog } from "./log-mask.js";
 
 // Domains we transparently MITM. These are ONLY the model-inference endpoints
 // hardcoded in client BINARIES with no config file to discover from
@@ -152,7 +152,7 @@ function tunnelThrough(
         upstream.pipe(clientSocket);
         clientSocket.pipe(upstream);
         const cleanup = (where: string, err: Error) => {
-            log(`tunnel ${maskHostForLog(host)}:${port} ${where} closed: ${err.message}`);
+            log(`tunnel ${maskHostForLog(host)}:${port} ${where} closed: ${maskHostInText(err.message, host)}`);
             upstream.destroy();
             clientSocket.destroy();
         };
@@ -161,7 +161,7 @@ function tunnelThrough(
     }).catch((err: Error) => {
         if (aborted) return;
         clearTimeout(connectTimer);
-        log(`tunnel ${maskHostForLog(host)}:${port} connect failed: ${err.message}`);
+        log(`tunnel ${maskHostForLog(host)}:${port} connect failed: ${maskHostInText(err.message, host)}`);
         clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
         clientSocket.destroy();
     });
