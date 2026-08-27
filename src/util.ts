@@ -106,11 +106,13 @@ export interface ContextOverflowInfo {
 // client should back off on), not a context overflow.
 const CONTEXT_OVERFLOW_PATTERNS: RegExp[] = [
     /context_length_exceeded/i,
+    /context_window_exceeded/i,
     /context length exceeded/i,
     /maximum context length/i,
     /max context length/i,
     /maximum context size/i,
     /exceeds the context window/i,
+    /out of room in the model/i,
     /exceeded model token limit/i,
     /prompt is too long/i,
     /prompt_too_long/i,

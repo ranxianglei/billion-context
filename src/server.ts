@@ -1877,7 +1877,22 @@ async function forward(
                     s.metadata.learnedContextLimits = learnedMap;
                     log("warn", `[${s.id}] upstream context overflow — learned real window ${info.window} for ${reqModel ?? "(unknown model)"} (was ${prev ?? "unset"}); arming emergency shrink`);
                 } else {
-                    log("warn", `[${s.id}] upstream context overflow (window not parseable): ${info.message}`);
+                    // No window number in the body (e.g. Codex's
+                    // "context_window_exceeded" error). The rejected payload's
+                    // size is a safe upper bound on the real window — learn it
+                    // so the next turn re-centers the limit and the pre-flight
+                    // compresses below it. Only shrink, never grow: a previously
+                    // learned (smaller) value is the tighter bound.
+                    const payloadEstimate = estimateCoreMessages(prepared.processedMessages);
+                    const prev = (reqModel ? learnedMap[reqModel] : undefined) ?? (s.metadata.learnedContextLimit as number | undefined);
+                    if (payloadEstimate >= 1000 && (prev === undefined || payloadEstimate < prev)) {
+                        if (reqModel) learnedMap[reqModel] = payloadEstimate;
+                        else s.metadata.learnedContextLimit = payloadEstimate;
+                        s.metadata.learnedContextLimits = learnedMap;
+                        log("warn", `[${s.id}] upstream context overflow (window not parseable) — learned conservative window ${payloadEstimate} for ${reqModel ?? "(unknown model)"} from rejected payload size (was ${prev ?? "unset"}); arming emergency shrink`);
+                    } else {
+                        log("warn", `[${s.id}] upstream context overflow (window not parseable): ${info.message}`);
+                    }
                 }
                 // Arm the emergency shrink: force the next turn's usage to >=100%
                 // so the kernel's emergency nudge + tool-result truncate fire.

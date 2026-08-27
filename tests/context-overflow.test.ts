@@ -67,6 +67,30 @@ test("overflow with no parseable window → isOverflow true, window undefined", 
     assert.equal(info.window, undefined);
 });
 
+test("Codex: context_window_exceeded code (no window number) → overflow, window undefined", () => {
+    // Codex/ChatGPT relays reject an oversized context with this body — no
+    // window number anywhere, so self-heal must fall back to the rejected
+    // payload size (see the e2e in e2e-overflow-selfheal.test.ts).
+    const body = JSON.stringify({
+        error: {
+            code: "context_window_exceeded",
+            message: "The model's context window was exceeded. Start a new thread or clear earlier history before retrying.",
+        },
+    });
+    const info = inspectContextOverflow(400, body);
+    assert.equal(info.isOverflow, true);
+    assert.equal(info.window, undefined);
+});
+
+test("Codex client phrasing 'ran out of room in the model's context window' → overflow", () => {
+    const info = inspectContextOverflow(
+        400,
+        "Codex ran out of room in the model's context window. Start a new thread or clear earlier history before retrying.",
+    );
+    assert.equal(info.isOverflow, true);
+    assert.equal(info.window, undefined);
+});
+
 test("auth error (400, no context marker) is NOT an overflow", () => {
     const info = inspectContextOverflow(400, '{"error":{"message":"Invalid API key","type":"authentication_error"}}');
     assert.equal(info.isOverflow, false);
