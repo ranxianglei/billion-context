@@ -44,9 +44,27 @@ export interface PreflightDeps {
     log: (level: string, msg: string) => void;
 }
 
+export type PreflightFailureKind = "upstream" | "exhausted" | "aborted";
+
+export interface PreflightFailure {
+    kind: PreflightFailureKind;
+    /** Upstream HTTP status when kind === "upstream" and the failure was an HTTP response. */
+    status?: number;
+    /** Human-readable cause (safe to surface to the client). */
+    detail: string;
+}
+
 export interface PreflightResult {
     compressedRanges: number;
     savedTokens: number;
+    /** Token estimate of the final (post-fold) payload, from the payload
+     *  itself — NOT floored on the session's lastInputTokens, which can be
+     *  stale (e.g. a double-counted usage report, #300). The caller uses it
+     *  to decide whether forwarding as-is is actually safe. */
+    payloadEstimate: number;
+    /** Why the loop stopped while the payload still overflows the window.
+     *  Undefined when the payload fits. */
+    failure?: PreflightFailure;
 }
 
 function refMaps(messages: CoreMessage[], state: Session["state"]): { refToIdx: Map<string, number>; idxToRef: Map<number, string> } {
@@ -198,9 +216,11 @@ async function summarizeRange(deps: PreflightDeps, content: string, startRef: st
     }
 }
 
+const ABORTED_FAILURE: PreflightFailure = { kind: "aborted", detail: "the client disconnected during preflight compression" };
+
 export async function preflightCompress(deps: PreflightDeps, messages: CoreMessage[]): Promise<PreflightResult> {
     const limit = deps.config.modelContextLimit;
-    const result: PreflightResult = { compressedRanges: 0, savedTokens: 0 };
+    const result: PreflightResult = { compressedRanges: 0, savedTokens: 0, payloadEstimate: estimateCoreMessages(messages) };
     if (limit <= 0) return result;
     const budget = Math.max(MIN_CHUNK_TOKENS, Math.floor(limit * CHUNK_FRACTION));
     // applyCompression rejects ranges below config.compress.minCompressRange
@@ -212,8 +232,12 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     // overflows the smaller window.
     let currentTokens = deps.session.stats.lastInputTokens;
     let startTokens = -1;
+    let failure: PreflightFailure | undefined;
     for (let round = 0; round < MAX_PREFLIGHT_ROUNDS; round++) {
-        if (deps.signal?.aborted) break;
+        if (deps.signal?.aborted) {
+            failure = ABORTED_FAILURE;
+            break;
+        }
         // Re-run the pipeline each round: every successful compress renumbers
         // the surviving refs, so the previous round's range refs are stale.
         const turn = deps.core.processTurn({
@@ -228,19 +252,31 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         // input_tokens also covers the system prompt + tool definitions, which
         // are not in turn.messages, so the direct estimate can undershoot.
         currentTokens = Math.max(deps.session.stats.lastInputTokens, estimateCoreMessages(turn.messages));
+        // The caller's forward/fail-fast gate uses the payload's own estimate
+        // (the floor can be stale — see PreflightResult.payloadEstimate).
+        result.payloadEstimate = estimateCoreMessages(turn.messages);
         if (startTokens < 0) startTokens = currentTokens;
         if (currentTokens < limit) break;
         const ranges = viableRanges(turn.nudge?.compressibleRanges ?? []);
-        if (ranges.length === 0) break;
+        if (ranges.length === 0) {
+            failure = { kind: "exhausted", detail: "no compressible ranges remain in the conversation" };
+            break;
+        }
         const range = [...ranges].sort((a, b) => refNum(a.startRef) - refNum(b.startRef))[0];
         const { refToIdx } = refMaps(messages, deps.session.state);
         const startIdx = refToIdx.get(range.startRef);
         const endIdx = refToIdx.get(range.endRef);
-        if (startIdx === undefined || endIdx === undefined || startIdx > endIdx) break;
+        if (startIdx === undefined || endIdx === undefined || startIdx > endIdx) {
+            failure = { kind: "exhausted", detail: "the compressible range no longer resolves to payload messages" };
+            break;
+        }
         let appliedThisRound = 0;
         for (const [cs, ce] of splitChunks(messages, startIdx, endIdx, budget)) {
             if (currentTokens < limit) break;
-            if (deps.signal?.aborted) break;
+            if (deps.signal?.aborted) {
+                failure = ABORTED_FAILURE;
+                break;
+            }
             const maps = refMaps(messages, deps.session.state);
             const startRef = maps.idxToRef.get(cs);
             const endRef = maps.idxToRef.get(ce);
@@ -253,8 +289,19 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 summary = await summarizeRange(deps, content, startRef, endRef);
             } catch (err) {
                 if (err instanceof UpstreamHttpError) {
+                    failure = {
+                        kind: "upstream",
+                        status: err.status,
+                        detail: err.status === 429
+                            ? `the summarization call was rate-limited by the upstream (HTTP 429)`
+                            : `the summarization call was rejected by the upstream (HTTP ${err.status})`,
+                    };
                     deps.log("warn", `[preflight] summarization failed: HTTP ${err.status} ${err.body.slice(0, 200)}`);
+                } else if (deps.signal?.aborted) {
+                    failure = ABORTED_FAILURE;
+                    deps.log("warn", `[preflight] summarization aborted: client disconnected`);
                 } else {
+                    failure = { kind: "upstream", detail: `the summarization call failed: ${String(err)}` };
                     deps.log("warn", `[preflight] summarization failed: ${String(err)}`);
                 }
                 break;
@@ -281,9 +328,18 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             appliedThisRound += 1;
             result.compressedRanges += 1;
         }
-        if (appliedThisRound === 0) break;
+        if (appliedThisRound === 0) {
+            if (!failure) {
+                failure = { kind: "exhausted", detail: "no range could be compressed (chunks below minCompressRange or the summarization responses were unusable)" };
+            }
+            break;
+        }
+    }
+    if (!failure && currentTokens >= limit) {
+        failure = { kind: "exhausted", detail: `the compress budget was exhausted after ${MAX_PREFLIGHT_ROUNDS} rounds` };
     }
     if (result.compressedRanges > 0) deps.session.stats.lastInputTokens = currentTokens;
     result.savedTokens = Math.max(0, startTokens - currentTokens);
+    if (currentTokens >= limit) result.failure = failure;
     return result;
 }
