@@ -7,17 +7,24 @@
 // underscore-namespaced text-protocol triggers (`\x3cacp_compress>` etc.) and
 // ordinary prose containing `<` pass through untouched.
 
-const PAIRED = /\x3cacp\s[^<>]*>([^<>]{0,64})<\/acp>/;
-const LONE = /<\/?acp(?=[\s>])[^<>]*>/;
+// Opening-tag attrs are bounded: a render tag opening is short (tokens + type,
+// < 50 chars). An unbounded \x3cacp …\x3e match would swallow a long prose span
+// that merely starts with \x3cacp and contains a \x3e somewhere later.
+const PAIRED = /\x3cacp\s[^<>]{0,256}>([^<>]{0,64})<\/acp>/;
+const LONE_OPEN = /\x3cacp(?:\s[^<>]{0,256})?>/;
+const LONE_CLOSE = /<\/acp(?=[\s>])[^<>]{0,32}>/;
 // A suffix of the buffer that could still grow into a render tag: either an
 // unterminated `\x3cacp …` opening (attrs so far, no `>` yet) or a short
 // ambiguous prefix like `<`, `<a`, `</ac`, …
 const PARTIAL_TAIL = /(\x3cacp\s[^<>]*|<\/?a?c?p?)$/;
-// An unterminated render-tag opening that already shows a quoted tokens=
-// attribute — always an imitation truncated mid-tag, never prose.
-const TRUNCATED_TAG = /\x3cacp\s[^<>]*tokens\s*=\s*"[^<>"]*"[^<>]*$/;
+// An unterminated render-tag opening at the end of a string: `<acp ` plus
+// attrs, no `>` — a truncated imitation, never prose (triggers use `<acp_`).
+const TRUNC_OPEN = /\x3cacp\s[^<>]*$/;
 const CLOSE_TAG = "\x3c/acp";
 const HOLD_LIMIT = 128;
+// Hold cap for a definite unterminated opening tail — far beyond any real tag
+// opening; beyond this the tail is dropped instead of held or passed through.
+const TAG_OPEN_CAP = 4096;
 const SWALLOW_CAP = 80;
 
 export interface TagEchoFilter {
@@ -31,8 +38,9 @@ export interface TagEchoFilter {
 export function stripAcpTags(text: string): string {
     return text
         .replace(new RegExp(PAIRED.source, "g"), "")
-        .replace(new RegExp(LONE.source, "g"), "")
-        .replace(new RegExp(TRUNCATED_TAG.source), "");
+        .replace(new RegExp(LONE_OPEN.source, "g"), "")
+        .replace(new RegExp(LONE_CLOSE.source, "g"), "")
+        .replace(new RegExp(TRUNC_OPEN.source), "");
 }
 
 // Cheap pre-check on a raw wire string (SSE event or JSON body): does it
@@ -81,15 +89,30 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
                 return out;
             }
             const p = PAIRED.exec(buf);
-            const l = LONE.exec(buf);
-            let m: RegExpExecArray | null;
-            if (p && l) m = p.index <= l.index ? p : l;
-            else m = p ?? l;
+            const o = LONE_OPEN.exec(buf);
+            const c = LONE_CLOSE.exec(buf);
+            let m: RegExpExecArray | null = null;
+            for (const cand of [p, o, c]) {
+                if (cand && (m === null || cand.index < m.index)) m = cand;
+            }
             if (!m) {
                 const t = PARTIAL_TAIL.exec(buf);
-                if (t && t[0].length <= HOLD_LIMIT) {
-                    held = t[0];
-                    out += buf.slice(0, buf.length - t[0].length);
+                if (t) {
+                    // A definite \x3cacp opening is never prose — hold it far
+                    // past HOLD_LIMIT (drop it past TAG_OPEN_CAP); a short
+                    // ambiguous prefix stays on the small hold cap so prose
+                    // is never delayed or lost.
+                    const definite = /^\x3cacp\s/.test(t[0]);
+                    const cap = definite ? TAG_OPEN_CAP : HOLD_LIMIT;
+                    if (t[0].length <= cap) {
+                        held = t[0];
+                        out += buf.slice(0, buf.length - t[0].length);
+                    } else if (definite) {
+                        drop(t[0]);
+                        out += buf.slice(0, buf.length - t[0].length);
+                    } else {
+                        out += buf;
+                    }
                 } else {
                     out += buf;
                 }
@@ -99,10 +122,9 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
             out += buf.slice(0, m.index);
             buf = buf.slice(m.index + m[0].length);
             // A PAIRED match is by definition a complete open+content+close
-            // span — only a LONE opening tag leaves the stream mid-tag and
-            // needs to swallow until its close arrives.
-            const wasPaired = m === p;
-            if (!wasPaired && /^\x3cacp\s/.test(m[0])) {
+            // span — only an attrs-bearing LONE_OPEN leaves the stream
+            // mid-tag and needs to swallow until its close arrives.
+            if (m === o && /^\x3cacp\s/.test(m[0])) {
                 swallowUntilClose = true;
                 swallowed = "";
             }
@@ -116,14 +138,21 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
             return process(chunk);
         },
         flush(): string {
-            let rest = swallowed + held;
+            const rest = swallowed + held;
+            const wasSwallowing = swallowUntilClose;
             swallowed = "";
             held = "";
             swallowUntilClose = false;
-            const t = new RegExp(TRUNCATED_TAG.source).exec(rest);
+            if (wasSwallowing) {
+                // Stream ended inside an unclosed render tag: the held content
+                // is tag content (a ref), not prose.
+                if (rest.length > 0) drop(rest);
+                return "";
+            }
+            const t = new RegExp(TRUNC_OPEN.source).exec(rest);
             if (t) {
                 drop(t[0]);
-                rest = rest.slice(0, t.index);
+                return rest.slice(0, t.index);
             }
             return rest;
         },

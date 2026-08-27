@@ -304,3 +304,64 @@ test("non-stream rewriters leave tag-free text untouched", async () => {
     const rewrittenOpenai = rewriteOpenaiJsonResponse(structuredClone(openaiBody), { core: createCore(), config: { modelContextLimit: 200000 } as Config, messages: [], session: makeCtx("ns-openai-clean").session, log: () => {} });
     assert.equal((rewrittenOpenai as { choices: Array<{ message: { content: string } }> }).choices[0].message.content, "clean 5 < 6 text");
 });
+
+test("streaming filter holds a definite open tail beyond the small hold cap instead of leaking it", () => {
+    const f = createTagEchoFilter();
+    const attrs = "x".repeat(200);
+    assert.equal(f.push(`text ${OPEN}${attrs}`), "text ");
+    assert.ok(f.pending());
+    assert.equal(f.push(`>m00001${CLOSE}`), "");
+    assert.equal(f.flush(), "");
+});
+
+test("streaming filter drops a definite open tail beyond the tag-open cap instead of passing it through", () => {
+    let dropped = "";
+    const f = createTagEchoFilter((s) => { dropped = s; });
+    assert.equal(f.push(`text ${OPEN}` + "x".repeat(5000)), "text ");
+    assert.equal(dropped.length, 5005);
+    assert.equal(f.push(`>m00001${CLOSE}`), ">m00001");
+    assert.equal(f.flush(), "");
+    assert.ok(f.dropped());
+});
+
+test("stripAcpTags drops arbitrary truncated open fragments, keeps ambiguous prefixes", () => {
+    assert.equal(stripAcpTags(`text ${OPEN}type="text" tokens=`), "text ");
+    assert.equal(stripAcpTags(`text ${OPEN}tok`), "text ");
+    assert.equal(stripAcpTags(`text ${LT}acp`), `text ${LT}acp`);
+    assert.equal(stripAcpTags(`text ${LT}/acp`), `text ${LT}/acp`);
+});
+
+test("streaming flush drops arbitrary truncated open fragments", () => {
+    const f = createTagEchoFilter();
+    assert.equal(f.push(`text ${OPEN}type="text" tokens=`), "text ");
+    assert.equal(f.flush(), "");
+    const g = createTagEchoFilter();
+    assert.equal(g.push(`text ${LT}acp`), "text ");
+    assert.equal(g.flush(), `${LT}acp`);
+});
+
+test("streaming flush drops content of a tag left unclosed at end of stream", () => {
+    const f = createTagEchoFilter();
+    assert.equal(f.push(`text ${OPEN}tokens="1" type="text">m00001`), "text ");
+    assert.equal(f.flush(), "");
+    assert.ok(f.dropped());
+});
+
+test("long tag-like spans are prose, not tags (bounded open match)", () => {
+    const span = `${OPEN}${"x".repeat(300)}>`;
+    assert.equal(stripAcpTags(`before ${span} after`), `before ${span} after`);
+    const f = createTagEchoFilter();
+    assert.equal(f.push(`before ${span} after`) + f.flush(), `before ${span} after`);
+    const g = createTagEchoFilter();
+    assert.equal(g.push(`before ${OPEN}${"x".repeat(300)}`), "before ");
+    assert.ok(g.pending());
+    assert.equal(g.push(`> after`), `${span} after`);
+    assert.equal(g.flush(), "");
+});
+
+test("prose with a tag-like opening beyond the attr bound survives intact", () => {
+    const prose = `${OPEN}${"word ".repeat(60)}end > kept`;
+    assert.equal(stripAcpTags(prose), prose);
+    const f = createTagEchoFilter();
+    assert.equal(f.push(prose) + f.flush(), prose);
+});
