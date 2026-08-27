@@ -227,15 +227,15 @@ test("launcher injection builders: direct-URL env, MCP config JSON, codex -c arg
     assert.equal(launcherDirectUrl({ BILI_LAUNCHER_DIRECT: "1" }), true, "direct URL is opt-in");
     assert.equal(launcherDirectUrl({ BILI_LAUNCHER_DIRECT: "0" }), false, "explicit opt-out honored");
 
-    // MCP injection is OPT-IN (#163): spawn args change when enabled and
-    // hosts older than the verified builds (claude 2.1.227, codex 0.147.0)
-    // are untested against the injection flags — default-off keeps existing
-    // `bili claude` / `bili codex` spawns byte-identical.
-    assert.equal(launcherInjectMcp({}, "claude"), false, "plugin injection off by default (claude)");
-    assert.equal(launcherInjectMcp({}, "codex"), false, "plugin injection off by default (codex)");
-    assert.equal(launcherInjectMcp({ BILI_LAUNCHER_PLUGIN: "0" }, "claude"), false, "explicit opt-out honored");
-    assert.equal(launcherInjectMcp({ BILI_LAUNCHER_PLUGIN: "1" }, "claude"), true, "opt-in enables injection");
-    assert.equal(launcherInjectMcp({ BILI_LAUNCHER_PLUGIN: "1" }, "codex"), true, "opt-in enables injection (codex)");
+    // MCP injection is ON by default for claude/codex (#290): zero-config
+    // native tools, mirroring the pi/omp/opencode auto-injection.
+    // BILI_LAUNCHER_PLUGIN=0 is the kill switch back to pure wire mode for
+    // hosts older than the verified builds (claude 2.1.227, codex 0.147.0).
+    assert.equal(launcherInjectMcp({}, "claude"), true, "plugin injection on by default (claude)");
+    assert.equal(launcherInjectMcp({}, "codex"), true, "plugin injection on by default (codex)");
+    assert.equal(launcherInjectMcp({ BILI_LAUNCHER_PLUGIN: "0" }, "claude"), false, "explicit opt-out honored (claude)");
+    assert.equal(launcherInjectMcp({ BILI_LAUNCHER_PLUGIN: "0" }, "codex"), false, "explicit opt-out honored (codex)");
+    assert.equal(launcherInjectMcp({ BILI_LAUNCHER_PLUGIN: "1" }, "claude"), true, "explicit opt-in still works");
     assert.equal(launcherInjectMcp({ BILI_LAUNCHER_PLUGIN: "1" }, "pi"), false, "pi always excluded (native extension #154)");
 
     const env = buildClaudePluginEnv("http://127.0.0.1:8787", true, { HOME: "/h" });
