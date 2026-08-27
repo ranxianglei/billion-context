@@ -1,5 +1,6 @@
 import http from "node:http";
 import fs from "node:fs";
+import { randomUUID } from "node:crypto";
 import { createCore, type CompressionCore, type CompressionState, type Config, type CoreMessage, type NudgeDecision, type Prompts, defaultPrompts, estimateTokensFast, renderNudgeText, deactivateBlock, viableRanges } from "acp-kernel";
 import { resolveCompress, resolveCompressPrompts, resolveRequestConfig } from "./compress-settings.js";
 import type { ProxyOptions } from "./config.js";
@@ -71,6 +72,15 @@ import { decodeRequestBody } from "./content-encoding.js";
 function bodyDumpEnabled(): boolean {
     return process.env.ACP_DUMP_BODY === "1";
 }
+
+// #300: bili→bili chain marker. When a bili instance forwards a request it has
+// processed upstream, it stamps this header with its own instance id. A bili
+// instance that RECEIVES a request already carrying it knows an upstream bili
+// already ran the compression pipeline on this request — processing it again
+// would double-compress and corrupt session state (issue #292). Clients never
+// send this header, so its presence on an inbound request always means "came
+// from a bili instance".
+export const BILI_HOP_HEADER = "x-bili-hop";
 
 // Per-model context windows handed over by a `bili <client>` launcher
 // (BILI_LAUNCHER_MODEL_WINDOWS, JSON model-id → window), read from the
@@ -216,6 +226,11 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     const core = createCore();
     const config: Config = opts.kernelConfig;
     const log = (level: string, msg: string) => logMsg(opts, level, msg);
+    // #300: per-server identity stamped into the x-bili-hop marker on outbound
+    // forwards. Per-server (not module-level) so two servers in one process
+    // (tests) are distinct instances; a restart changing the id is harmless
+    // (the chain check only compares against the other running instance).
+    const instanceId = randomUUID();
     // Reload persisted compression state before accepting traffic so sessions
     // that survived a restart keep their folded view (otherwise long sessions
     // re-send oversized raw history and hang).
@@ -231,7 +246,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     void loadRegistry();
     const server = http.createServer(async (req, res) => {
         try {
-            await handle(req, res, opts, core, config, log);
+            await handle(req, res, opts, core, config, log, instanceId);
         } catch (err) {
             const msg = String(err);
             log("error", msg);
@@ -453,6 +468,7 @@ async function handle(
     core: CompressionCore,
     config: Config,
     log: (level: string, msg: string) => void,
+    instanceId: string,
 ): Promise<void> {
     // SECURITY: the /__bili/ management endpoints (config read/write, reload,
     // session stats) are privileged — a remote caller who can reach them can
@@ -646,6 +662,20 @@ async function handle(
         res.end(JSON.stringify({ error: { type: "invalid_request", message: String(err) } }));
         return;
     }
+    // #300: bili→bili chain detection. If the inbound request already carries
+    // the x-bili-hop marker, an upstream bili instance already ran the
+    // compression pipeline on it. Processing it again would double-compress
+    // and corrupt session state (#292). Skip ALL processing (no tool/tag
+    // injection, no acp-loop, no session state) and pass the request through
+    // verbatim. Clients never send this header, so its presence on an inbound
+    // request always means "came from a bili instance".
+    const hopMarker = headerValue(req, BILI_HOP_HEADER);
+    if (hopMarker !== undefined) {
+        const selfLoop = hopMarker === instanceId;
+        log("warn", selfLoop
+            ? `[chain] inbound request carries THIS instance's ${BILI_HOP_HEADER} marker (${hopMarker}) — self-loop detected. Passing through without processing; check your upstream config (it may point back to this instance).`
+            : `[chain] inbound request carries ${BILI_HOP_HEADER} from another bili instance (${hopMarker}) — bili→bili chain detected. Passing through without processing to avoid double compression; keep only one bili instance in the chain.`);
+    }
     const countTokens = isCountTokensRequest(req.method ?? "GET", urlPath, bodyBuffer.length > 0);
     // Per-request context limit: look up body.model against the per-route model
     // declaration in providers.json first (same model can have different
@@ -740,7 +770,10 @@ async function handle(
         }
     }
     let prepared: Prepared | null = null;
-    if (!opts.passthrough && protocol && parsed && typeof parsed === "object") {
+    // #300: `hopMarker !== undefined` means an upstream bili already processed
+    // this request — skip the whole pipeline (prepared stays null) so the
+    // passthrough path below forwards it verbatim.
+    if (!opts.passthrough && hopMarker === undefined && protocol && parsed && typeof parsed === "object") {
         const sessionHeader = headerValue(req, opts.sessionHeader);
         // Plugin mode (issue #1, "内外呼应"): a cooperative agent-side plugin
         // announces itself with x-bili-plugin. The proxy then treats the
@@ -969,9 +1002,10 @@ async function handle(
                         route,
                         affinity,
                         log,
+                        instanceId,
                     );
                 }
-                await forward(req, res, opts, prepared!.body, prepared!, core, reqConfig, log, route, affinity);
+                await forward(req, res, opts, prepared!.body, prepared!, core, reqConfig, log, route, instanceId, affinity);
                 // Remember for ALL modes (not just plugin): wire clients (dsh,
                 // hermes, unplug'd pi) read the same panel via /__bili/plugin/status
                 // and need the nudge/breakdown sections too.
@@ -987,7 +1021,7 @@ async function handle(
         if (protocol === null && !opts.passthrough) {
             log("warn", `unrecognized path ${maskUrlsInText(req.url ?? "")} — not a known protocol (/chat/completions, /v1/messages, /responses, /responses/compact); forwarding unchanged`);
         }
-        await forward(req, res, opts, bodyBuffer, null, core, reqConfig, log, route, undefined);
+        await forward(req, res, opts, bodyBuffer, null, core, reqConfig, log, route, instanceId, undefined);
     }
 }
 
@@ -1577,6 +1611,7 @@ function buildForwardTarget(
     opts: ProxyOptions,
     route: ReturnType<typeof resolveUpstream>,
     affinity?: string,
+    hopMarker?: string,
 ): ForwardTarget {
     // rewrittenUrl may use a `mitm://` scheme (for config-lookup distinction
     // — see resolveUpstream). fetch needs the real https:// scheme, so strip
@@ -1592,6 +1627,11 @@ function buildForwardTarget(
         if (UPSTREAM_HOP_HEADERS.has(lower) || reqConnNamed.has(lower) || v === undefined) continue;
         headers[k] = Array.isArray(v) ? v.join(", ") : v;
     }
+    // #300: stamp the chain marker AFTER copying inbound headers so it wins
+    // over any inbound value (only set when this instance processed the
+    // request; a passthrough leaves the inbound marker — if any — intact so it
+    // keeps propagating down the chain).
+    if (hopMarker !== undefined) headers[BILI_HOP_HEADER] = hopMarker;
     headers["host"] = new URL(upstreamUrl).host;
     // codex advertises its own server-side context compaction via this beta
     // feature. It conflicts with bili's client-side compress (bili IS the
@@ -1634,6 +1674,7 @@ async function preflightCompressIfNeeded(
     route: ReturnType<typeof resolveUpstream>,
     affinity: string | undefined,
     log: (level: string, msg: string) => void,
+    instanceId: string,
 ): Promise<Prepared> {
     const session = prepared.session;
     const limit = config.modelContextLimit;
@@ -1644,7 +1685,9 @@ async function preflightCompressIfNeeded(
     if (limit <= 0 || !model || tokenCount < limit) return prepared;
     if ((prepared.nudge?.compressibleRanges ?? []).length === 0) return prepared;
     log("warn", `[${session.id}] context ${tokenCount} tokens exceeds model window ${limit} (model=${model}); preflight compressing before forward`);
-    const { upstreamUrl, headers, proxyUrl } = buildForwardTarget(req, opts, route, affinity);
+    // #300: stamp the chain marker so a downstream bili skips these
+    // summarization calls too (preflight always processes).
+    const { upstreamUrl, headers, proxyUrl } = buildForwardTarget(req, opts, route, affinity, instanceId);
     const clientAbort = new AbortController();
     res.on("close", () => {
         if (!res.writableEnded) clientAbort.abort();
@@ -1688,9 +1731,16 @@ async function forward(
     config: Config,
     log: (level: string, msg: string) => void,
     route: ReturnType<typeof resolveUpstream>,
+    instanceId: string,
     affinity?: string,
 ): Promise<void> {
-    const { upstreamUrl, headers, proxyUrl } = buildForwardTarget(req, opts, route, affinity);
+    // #300: stamp the chain marker ONLY when this instance actually processed
+    // the request (prepared !== null). A passthrough forward (prepared === null)
+    // must NOT claim processing — otherwise a downstream processing bili would
+    // wrongly skip and the user loses compression. When prepared is null any
+    // inbound marker (from an upstream bili) is preserved verbatim by
+    // buildForwardTarget, so the marker keeps propagating down the chain.
+    const { upstreamUrl, headers, proxyUrl } = buildForwardTarget(req, opts, route, affinity, prepared !== null ? instanceId : undefined);
     // Show the final proxied URL (where the request actually lands) as the
     // primary signal. The provider label is appended only for named routes —
     // zero-config requests have a single routing mode now, so the final
