@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
+import { rm } from "node:fs/promises";
 import * as path from "node:path";
-import { StateStore, type PersistedEnvelope } from "acp-kernel/persist";
+import { StateStore, flatFileNameFor, type PersistedEnvelope } from "acp-kernel/persist";
 import { sessionsDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { createInitialState, type CompressionState, type CoreMessage } from "acp-kernel";
@@ -163,13 +164,15 @@ function relPathFor(id: string, protocol?: string, upstreamOrigin?: string): str
  *  server.ts / export.ts. */
 export class SessionStore {
     readonly enabled: boolean;
+    private readonly dir: string;
     private readonly store: StateStore<PersistedSession>;
 
     constructor(opts?: { dir?: string; debounceMs?: number; enabled?: boolean; log?: Logger }) {
         const debounceMs = opts?.debounceMs ?? defaultDebounce();
         this.enabled = (opts?.enabled ?? true) && debounceMs >= 0;
+        this.dir = opts?.dir ?? defaultDir();
         this.store = new StateStore<PersistedSession>({
-            dir: opts?.dir ?? defaultDir(),
+            dir: this.dir,
             version: PERSIST_VERSION,
             debounceMs: Math.max(0, debounceMs),
             enabled: this.enabled,
@@ -194,6 +197,72 @@ export class SessionStore {
             out.set(id, buildSession(envelope.payload));
         }
         return out;
+    }
+
+    /** One-time migration for the #286 identity change: sessions persisted
+     *  under the old derived hash id are re-keyed to the client-provided
+     *  conversation value stored in meta.label (which is now the session id
+     *  itself). Collisions on the same label keep the most recently saved
+     *  record; the losers, and any label already claimed by a new-format
+     *  session, are deleted. Records without a label cannot be mapped and are
+     *  left in place (they load under their old id but are never requested
+     *  again — the new proxy 400s anonymous requests). Self-terminating:
+     *  after one pass no loaded id differs from its label. */
+    async migrateLegacyIds(): Promise<void> {
+        if (!this.enabled) return;
+        const loaded = await this.store.loadAll();
+        const claimed = new Set<string>();
+        const byLabel = new Map<string, { id: string; savedAt: number; session: Session }>();
+        let unlabeled = 0;
+        for (const [id, envelope] of loaded) {
+            const session = buildSession(envelope.payload);
+            const label = session.meta.label;
+            if (!label) {
+                unlabeled++;
+                continue;
+            }
+            if (label === id) {
+                claimed.add(id);
+                continue;
+            }
+            const prev = byLabel.get(label);
+            if (!prev || envelope.savedAt >= prev.savedAt) {
+                if (prev) await this.removeLegacyFile(prev.id, prev.session);
+                byLabel.set(label, { id, savedAt: envelope.savedAt, session });
+            } else {
+                await this.removeLegacyFile(id, session);
+            }
+        }
+        let rekeyed = 0;
+        for (const [label, { id, session }] of byLabel) {
+            if (claimed.has(label)) {
+                await this.removeLegacyFile(id, session);
+                continue;
+            }
+            session.id = label;
+            await this.store.writeNow(label, () => buildRecord(session));
+            await this.removeLegacyFile(id, session);
+            claimed.add(label);
+            rekeyed++;
+        }
+        if (rekeyed || unlabeled) {
+            loggerLog("info", `[persist] one-time migration (#286): rekeyed ${rekeyed} legacy session(s), left ${unlabeled} unlabeled legacy file(s) in place`);
+        }
+    }
+
+    /** Remove a legacy session file. The kernel store never deletes (cleanup
+     *  is downstream policy), so the path is recomputed here: the namespaced
+     *  layout for v2+/v3 files, the _unknown/ fallback, and the flat default
+     *  name for pre-envelope v1 files. */
+    private async removeLegacyFile(id: string, session: Session): Promise<void> {
+        const candidates = new Set([
+            relPathFor(id, session.meta.protocol, session.meta.upstreamOrigin),
+            relPathFor(id),
+            flatFileNameFor(id),
+        ]);
+        for (const rel of candidates) {
+            await rm(path.join(this.dir, rel), { force: true }).catch(() => {});
+        }
     }
 
     /** Synchronous reload of a single session. Used on a memory miss (after

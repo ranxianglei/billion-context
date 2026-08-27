@@ -114,6 +114,7 @@ export async function initSessions(): Promise<void> {
     initialized = true;
     const store = getStore();
     if (!store.enabled) return;
+    await store.migrateLegacyIds();
     const loaded = await store.loadAll();
     if (loaded.size > MAX_SESSIONS) {
         const entries = [...loaded.entries()].sort((a, b) => (b[1].createdAt ?? 0) - (a[1].createdAt ?? 0));
