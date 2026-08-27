@@ -161,6 +161,80 @@ test("anthropic adapter: relay-echoed message_delta with input_tokens: 0 must NO
     assert.equal(ctx.session.stats.cachedTokens, 11, "cached portion from message_start preserved");
 });
 
+test("anthropic adapter (#299): stitched stream — terminal's complete usage adopts atomically, no double-count", async () => {
+    // After a compress re-request, the stream handed to a downstream bili is
+    // two rounds stitched: round1's message_start (pre-compress cache_read) +
+    // the final synthetic terminal (post-compress input, cache_read
+    // legitimately 0). The terminal carries a COMPLETE usage object
+    // (input_tokens > 0 AND cache_read_input_tokens present), so it must be
+    // adopted atomically — the 0 overwrites the stale cache_read, else the
+    // total double-counts (142543 + 118663 = 261206 instead of 142543 →
+    // false 131% EMERGENCY nudge + preflight compression).
+    const stitched = [
+        `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_1", usage: { input_tokens: 50000, cache_read_input_tokens: 118663 } } })}\n\n`,
+        `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}\n\n`,
+        `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } })}\n\n`,
+        `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`,
+        `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { input_tokens: 142543, cache_read_input_tokens: 0, output_tokens: 7 } })}\n\n`,
+        `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+    ].join("");
+    const ctx = { ...makeCtx("anthropic-stitched"), protocol: "anthropic" };
+    await drain(
+        new Response(stitched, { status: 200 }).body!,
+        ctx,
+        createAnthropicAdapter({ model: "claude" }),
+        { model: "claude", messages: [], stream: true, max_tokens: 10 },
+    );
+    assert.equal(ctx.session.stats.lastInputTokens, 142543, "total = terminal input(142543) + terminal cache(0); stale message_start cache_read(118663) NOT double-counted");
+    assert.equal(ctx.session.stats.cachedTokens, 0, "cached portion = terminal's 0 (atomically adopted)");
+});
+
+test("anthropic adapter (#299): stitched terminal after proxy-tool re-request carries complete authoritative usage", async () => {
+    // Generation-side contract: the synthetic terminal emitted after a
+    // compress/proxy-tool re-request must carry BOTH input_tokens and
+    // cache_read_input_tokens with the final round's true values (0 included)
+    // so a downstream parser can adopt the usage atomically.
+    const round1 = [
+        `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_1", usage: { input_tokens: 50000, cache_read_input_tokens: 118663 } } })}\n\n`,
+        `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_s", name: "acp_status", input: {} } })}\n\n`,
+        `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: "{}" } })}\n\n`,
+        `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`,
+        `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 1 } })}\n\n`,
+        `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+    ].join("");
+    const round2 = [
+        `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_2", usage: { input_tokens: 142543, cache_read_input_tokens: 0 } } })}\n\n`,
+        `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}\n\n`,
+        `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "done" } })}\n\n`,
+        `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`,
+        `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 3 } })}\n\n`,
+        `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+    ].join("");
+    let fetchCalls = 0;
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async () => { fetchCalls++; return new Response(round2, { status: 200 }); }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(round1, { status: 200 }).body!,
+            makeCtx("anthropic-stitched-terminal"),
+            createAnthropicAdapter({ model: "claude" }),
+            { model: "claude", messages: [], stream: true, max_tokens: 10 },
+        );
+        assert.equal(fetchCalls, 1, "re-request after proxy tool");
+        const terminalLines = out
+            .split("\n")
+            .filter((l) => l.startsWith("data: ") && l.includes('"message_delta"'))
+            .map((l) => JSON.parse(l.slice("data: ".length)) as Record<string, unknown>);
+        assert.equal(terminalLines.length, 1, "exactly one (synthetic) message_delta in the stitched output");
+        const usage = (terminalLines[0]?.usage ?? {}) as Record<string, unknown>;
+        assert.equal(usage.input_tokens, 142543, "terminal carries final round's input_tokens");
+        assert.equal(usage.cache_read_input_tokens, 0, "terminal carries final round's cache_read (explicit 0, so downstream can adopt atomically)");
+        assert.equal(usage.output_tokens, 3, "terminal carries final round's output_tokens");
+    } finally {
+        globalThis.fetch = orig;
+    }
+});
+
 test("anthropic adapter: acp_status-only round → marker + re-request, no crash", async () => {
     const round1 = [
         `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_1", usage: { input_tokens: 3 } } })}\n\n`,

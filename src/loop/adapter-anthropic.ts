@@ -288,15 +288,31 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                 } else if (type === "message_delta") {
                     const u = (data.usage ?? {}) as Record<string, unknown>;
                     if (typeof u.output_tokens === "number") roundOutput = u.output_tokens;
-                    // The input context is FIXED within a turn, so message_start is
-                    // authoritative for input/cache tokens. Some relays echo a
-                    // schema-shaped `usage` in message_delta with `input_tokens: 0`
-                    // (the field is normally absent); adopting a 0 would overwrite
-                    // message_start's real value and under-report the context size
-                    // (→ nudge/compression never fires, cache hit rate collapses).
-                    // A 0 can never be a legitimate update, so adopt only > 0.
-                    if (typeof u.input_tokens === "number" && u.input_tokens > 0) roundInput = u.input_tokens;
-                    if (typeof u.cache_read_input_tokens === "number" && u.cache_read_input_tokens > 0) roundCached = u.cache_read_input_tokens;
+                    const input = typeof u.input_tokens === "number" ? u.input_tokens : undefined;
+                    const cached = typeof u.cache_read_input_tokens === "number" ? u.cache_read_input_tokens : undefined;
+                    if (input !== undefined && input > 0 && cached !== undefined) {
+                        // Complete authoritative usage object — e.g. the synthetic
+                        // terminal of a stitched multi-round stream (round1
+                        // message_start + final-round terminal). Adopt atomically so
+                        // the final round's cache_read — legitimately 0 after a
+                        // compress re-request — overwrites the stale value carried by
+                        // an earlier round's message_start. Per-field merging would
+                        // double-count (new input + old cache) and trip false
+                        // EMERGENCY nudges (issue #299).
+                        roundInput = input;
+                        roundCached = cached;
+                    } else {
+                        // Incomplete usage object: the input context is FIXED within
+                        // a turn, so message_start is authoritative for input/cache
+                        // tokens. Some relays echo a schema-shaped `usage` in
+                        // message_delta with `input_tokens: 0` (the field is normally
+                        // absent); adopting a 0 would overwrite message_start's real
+                        // value and under-report the context size (→ nudge/compression
+                        // never fires, cache hit rate collapses). A 0 can never be a
+                        // legitimate update, so adopt only > 0.
+                        if (input !== undefined && input > 0) roundInput = input;
+                        if (cached !== undefined && cached > 0) roundCached = cached;
+                    }
                     const d = (data.delta ?? {}) as Record<string, unknown>;
                     if (typeof d.stop_reason === "string") stopReason = d.stop_reason;
                     if (!usageYielded) {
