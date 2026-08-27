@@ -341,3 +341,45 @@ await withTempStore("pre-envelope flat file is adopted and re-persisted as envel
     assert.ok("payload" in envelope, "re-persisted as envelope");
     assert.equal(envelope.payload.stats.requests, 6, "payload carries the update");
 });
+
+await withTempStore("one-time migration re-keys legacy hash-id sessions to their client-provided label (#286)", async (store, dir) => {
+    const label = "conv-legacy-1";
+    const legacyA = "legacy-" + "a".repeat(24);
+    const legacyB = "legacy-" + "b".repeat(24);
+
+    const a = makeSession(legacyA);
+    a.meta.label = label;
+    a.meta.protocol = "responses";
+    a.meta.upstreamOrigin = "https://chatgpt.com";
+    a.stats.requests = 7;
+    await store.writeNow(a);
+
+    const b = makeSession(legacyB);
+    b.meta.label = label;
+    b.meta.protocol = "responses";
+    b.meta.upstreamOrigin = "https://chatgpt.com";
+    b.stats.requests = 1;
+    await store.writeNow(b);
+
+    const fileB = jsonFilesUnder(dir).find((f) => JSON.parse(readFileSync(f, "utf8")).id === legacyB)!;
+    const envB = JSON.parse(readFileSync(fileB, "utf8"));
+    envB.savedAt -= 1000; // A is newer → A wins the same-label collision
+    writeFileSync(fileB, JSON.stringify(envB));
+
+    // A fresh store mirrors a new process: no discovered-file cache.
+    const cold = new SessionStore({ dir, debounceMs: 5, enabled: true });
+    try {
+        await cold.migrateLegacyIds();
+
+        const all = await cold.loadAll();
+        assert.ok(all.has(label), "re-keyed under the client-provided label");
+        assert.ok(!all.has(legacyA) && !all.has(legacyB), "legacy ids no longer resolve");
+        assert.equal(all.get(label)!.stats.requests, 7, "newest savedAt wins the collision");
+        assert.equal(jsonFilesUnder(dir).length, 1, "loser and old files removed");
+
+        await cold.migrateLegacyIds();
+        assert.equal((await cold.loadAll()).size, 1, "second migration is a no-op");
+    } finally {
+        cold.cancelAll();
+    }
+});

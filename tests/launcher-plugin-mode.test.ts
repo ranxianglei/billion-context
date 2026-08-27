@@ -163,7 +163,10 @@ test("launcher headless pending binding: register BEFORE the first request binds
     const rig = await startRig();
     try {
         await register(rig, "headless-conv-1", { agent: "mcp" });
-        await postModel(rig); // no session header at all
+        // Strong signal that does NOT match the registered id (#286: anonymous
+        // requests are 400 now), so the identity lookup misses and the headless
+        // pending path has to fire.
+        await postModel(rig, "headless-req-1");
         assert.ok(!rig.upstreamBodies[0]!.includes("\"compress\""), "wire tool injection suppressed from the very first request");
         const status = await (await fetch(rig.proxyUrl("/__bili/plugin/status?conversationId=headless-conv-1"))).json() as { ok: boolean; pluginAgent?: string };
         assert.ok(status.ok, "pending register consumed by the new session");
@@ -355,8 +358,11 @@ test("mcp stdio shell (codex style): BILI_CONVERSATION_ID self-register → head
                 if (lines.length === 1) {
                     // initialize answered → the headless register has landed
                     // (the shell awaits it before responding). Consume it via
-                    // a fresh model session, then ask for tools.
-                    void postModel(rig).then(() => {
+                    // a fresh model session, then ask for tools. The model
+                    // request carries a strong signal that does NOT match the
+                    // self-registered conversation id (#286: anonymous requests
+                    // are 400 now), so the headless pending path has to fire.
+                    void postModel(rig, "codex-e2e-req-1").then(() => {
                         send({ jsonrpc: "2.0", id: 2, method: "tools/list" });
                         send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "acp_status", arguments: {} } });
                     });

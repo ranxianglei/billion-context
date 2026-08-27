@@ -1,5 +1,3 @@
-import { hashId } from "./util.js";
-
 export type ConversationIdentity = {
     value: string;
     source: "header" | "body-session" | "metadata-session" | "previous-response" | "prompt-cache-key" | "content-fingerprint" | "generated";
@@ -9,41 +7,30 @@ export type ConversationIdentity = {
 /**
  * Session identity for the proxy's OWN compression state.
  *
- * A session is uniquely keyed by FOUR dimensions (all AND-ed):
- *   1. protocol  — "anthropic" | "openai" | "responses"  (different wire
- *                  formats must never share compression state)
- *   2. upstream  — the resolved upstream origin, e.g. "https://open.bigmodel.cn"
- *                  (same key hitting two providers must not share state)
- *   3. apiKey    — the account credential from Authorization / x-api-key
- *                  (different accounts must never share state, even if they
- *                  happen to send the same conversation content)
- *   4. conversation — the client's own notion of "which conversation this is",
- *                  taken from a client-provided signal when available, falling
- *                  back to a content fingerprint.
+ * The session ID is the client-provided conversation value VERBATIM — no hash,
+ * no other dimensions. The client explicitly states which conversation this
+ * is (codex `session-id`/`thread-id`, claude `x-claude-code-session-id`,
+ * opencode `x-opencode-session`, Responses body `session_id` /
+ * `metadata.session_id`, `prompt_cache_key`, ...), and that value is the only
+ * invariant that actually binds to the conversation. Everything else is
+ * mutable mid-conversation and must not break session continuity (#280, #286):
+ * credentials rotate (ChatGPT OAuth bearers), users switch relays/upstreams,
+ * and the wire protocol itself can change (relay translation, cross-protocol
+ * model switches).
  *
- * The result is a stable, opaque id used ONLY inside the proxy (to key the
- * compression-state store). It is NEVER sent upstream — it embeds the key and
- * upstream origin, which the upstream either already knows or must not see.
+ * A protocol switch is safe under one id because session state is
+ * protocol-neutral (kernel-normalized CompressionState, text block contents,
+ * CoreMessage snapshots) and the client re-sends the full history every turn,
+ * where the current protocol's adapter re-normalizes it.
  *
- * If a client-provided per-conversation signal is needed for upstream routing,
- * use `affinityToken()` below. Generated proxy identities are never forwarded.
+ * Requests WITHOUT a client-provided identity are rejected with 400 by the
+ * server: the content-fingerprint fallback has a real collision surface and
+ * would silently orphan state, so anonymous requests fail explicitly instead.
+ *
+ * The id is used ONLY inside the proxy (compression-state store, persistence,
+ * UI label). It is NEVER sent upstream — if a per-conversation signal is
+ * needed for upstream routing, use `affinityToken()` below.
  */
-
-/** Extract the account credential from common auth headers, verbatim.
- *  The value is fed into a hash — it is NEVER stored, logged, or compared.
- *  Normalization is intentionally minimal: trim whitespace only. We do NOT
- *  lowercase: while that reduces hash collisions in theory (two keys that
- *  differ only in case would hash the same), in practice API keys are
- *  case-sensitive and a lowercase normalization would collapse two distinct
- *  valid keys into one hash bucket — a silent isolation violation. Keep the
- *  raw value so each distinct key hashes distinctly. */
-function extractKey(headers: Record<string, string | string[] | undefined>): string {
-    const auth = headers["authorization"];
-    if (typeof auth === "string" && auth.length > 0) return auth.trim();
-    const apiKey = headers["x-api-key"];
-    if (typeof apiKey === "string" && apiKey.length > 0) return `key:${apiKey.trim()}`;
-    return "(no-key)";
-}
 
 /** Pull a client-provided conversation signal from headers, if any. */
 export function clientConversationHeader(headers: Record<string, string | string[] | undefined>): string | undefined {
@@ -67,26 +54,6 @@ export function clientConversationHeader(headers: Record<string, string | string
         if (typeof v === "string" && v.trim().length > 0) return v.trim();
     }
     return undefined;
-}
-
-/**
- * Derive the proxy-internal session id. The conversation dimension MUST be
- * supplied by the caller via `extra.conversation` (typically the output of
- * the per-protocol conversationSignal* helper, which already falls back to a
- * hash of the first user message). There is intentionally NO content-
- * fingerprint fallback inside this function — a silent "" default would
- * collapse every anonymous session onto one id. If `conversation` is missing
- * the caller has a bug and we throw rather than silently mis-isolating.
- */
-export function deriveSessionId(
-    headers: Record<string, string | string[] | undefined>,
-    protocol: "anthropic" | "openai" | "responses",
-    upstream: string,
-    conversation: string,
-): string {
-    if (!conversation) throw new Error("deriveSessionId: conversation dimension is required (pass the conversationSignal* output)");
-    const key = extractKey(headers);
-    return hashId(`${protocol}|${upstream}|${key}|${conversation}`);
 }
 
 /**

@@ -106,6 +106,7 @@ test("vscode-copilot #177 (1): OpenAI streaming final chunk carries total_tokens
             headers: {
                 "content-type": "application/json",
                 authorization: "Bearer fake-key",
+                "x-acp-session": "vscode-copilot-test",
             },
             body: JSON.stringify({
                 model: "deepseek-v4-flash",
