@@ -378,14 +378,16 @@ export function launcherDirectUrl(env: NodeJS.ProcessEnv): boolean {
     return env.BILI_LAUNCHER_DIRECT === "1";
 }
 
-/** Plugin-in-launcher MCP injection is OPT-IN (`BILI_LAUNCHER_PLUGIN=1`):
- *  enabling it changes the spawn args of claude/codex, and hosts older than
- *  the verified builds (claude 2.1.227, codex 0.147.0) have not been tested
- *  against `--mcp-config` / `-c mcp_servers.*`. Flip the default to on (with
- *  `!== "0"` semantics) once the flags have soaked; pi is always excluded —
- *  it has its own native extension (billion-context-pi #154). */
+/** Plugin-in-launcher MCP injection is ON by default for claude/codex
+ *  (zero-config, mirroring the pi/omp/opencode auto-injection): the launcher
+ *  injects a single `bili` MCP server so the host gets native tools instead
+ *  of wire-injected ones. `BILI_LAUNCHER_PLUGIN=0` is the kill switch back to
+ *  pure wire mode — for hosts older than the verified builds (claude 2.1.227,
+ *  codex 0.147.0) that have not been tested against `--mcp-config` /
+ *  `-c mcp_servers.*`. pi/omp/opencode/hermes/dsh are always excluded — they
+ *  have their own native plugin surface (or none). */
 export function launcherInjectMcp(env: NodeJS.ProcessEnv, base: string): boolean {
-    return base !== "pi" && base !== "omp" && base !== "opencode" && base !== "hermes" && base !== "dsh" && env.BILI_LAUNCHER_PLUGIN === "1";
+    return base !== "pi" && base !== "omp" && base !== "opencode" && base !== "hermes" && base !== "dsh" && env.BILI_LAUNCHER_PLUGIN !== "0";
 }
 
 /** Ephemeral MCP config for --mcp-config / -c mcp_servers.bili.*: a single
@@ -1310,8 +1312,10 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         }
     }
     const injectMcp = launcherInjectMcp(process.env, base);
-    if (!injectMcp && (base === "claude" || base === "codex")) {
-        console.error("bili: plugin mode off — set BILI_LAUNCHER_PLUGIN=1 to enable native MCP tools (experimental; verified with claude 2.1.227 / codex 0.147.0).");
+    if (injectMcp) {
+        console.error(`bili: injecting native bili MCP tools for ${base} (disable with BILI_LAUNCHER_PLUGIN=0).`);
+    } else if (base === "claude" || base === "codex") {
+        console.error("bili: native MCP tools disabled (BILI_LAUNCHER_PLUGIN=0) — running in pure wire mode.");
     }
     const origin = handle.origin;
     if (base === "pi") {
