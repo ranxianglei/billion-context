@@ -129,6 +129,32 @@ PR merges are a **human-only operation**. The Agent MUST NEVER merge any PR unde
 
 > I can't merge PRs — AGENTS.md forbids Agents from merging. Please merge yourself: [PR URL].
 
+### Opening PRs without the `gh` CLI
+
+This environment has **no `gh` CLI** — but `git push` works (credential
+helper) and the same credential can open PRs through the GitHub REST API:
+
+```bash
+# 1. push the branch
+git push origin HEAD
+
+# 2. get a token from the credential helper
+TOKEN=$(printf 'protocol=https\nhost=github.com\n\n' \
+  | git credential fill | sed -n 's/^password=//p')
+
+# 3. open the PR (base is master)
+curl -s -X POST \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Accept: application/vnd.github+json" \
+  https://api.github.com/repos/ranxianglei/billion-context/pulls \
+  -d '{"title":"fix: …","head":"<branch>","base":"master","body":"…"}'
+```
+
+A successful response contains `"state": "open"` and the `html_url` to post
+back to the issue. `git credential fill` may prompt on first use in a fresh
+session — it reads from the same store the push uses, so if push worked,
+this works. Never print the token; keep it in the variable only.
+
 ### npm Publish — Absolute Prohibition
 
 `npm publish` is **handled by CI automatically** (see §5). The Agent MUST
