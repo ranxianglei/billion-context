@@ -8,7 +8,7 @@ import {
     type CoreMessage,
     type NudgeDecision,
 } from "acp-kernel";
-import type { Session } from "../session.js";
+import { lastCompressSuffix, type Session } from "../session.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import {
     parseCompressInput,
@@ -441,8 +441,11 @@ export async function* runCompressLoop(
                     undefined,
                     signal,
                     (info) => {
-                        ctx.log(`[acp-proxy: upstream rejected replay (HTTP ${info.status}: ${info.detail.slice(0, 120)}); likely provider risk-control — retrying in ${info.delayMs}ms (attempt ${info.attempt}/${info.maxAttempts})]`);
-                        loggerLog("warn", `[acp-loop] upstream rejected replay (HTTP ${info.status}); retrying in ${info.delayMs}ms (attempt ${info.attempt}/${info.maxAttempts})`);
+                        // #189: correlate the rejection with the rewrite that
+                        // preceded it (shrink ratio + fold point), if any.
+                        const lc = lastCompressSuffix(ctx.session.lastCompress);
+                        ctx.log(`[acp-proxy: upstream rejected replay (HTTP ${info.status}: ${info.detail.slice(0, 120)}); likely provider risk-control — retrying in ${info.delayMs}ms (attempt ${info.attempt}/${info.maxAttempts})${lc}]`);
+                        loggerLog("warn", `[acp-loop] upstream rejected replay (HTTP ${info.status}); retrying in ${info.delayMs}ms (attempt ${info.attempt}/${info.maxAttempts})${lc}`);
                     },
                 );
 

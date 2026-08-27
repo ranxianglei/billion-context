@@ -5,7 +5,7 @@ import {
     type Config,
     type CoreMessage,
 } from "acp-kernel";
-import type { Session } from "./session.js";
+import { lastCompressSuffix, type Session } from "./session.js";
 import { parseCompressInput, PROXY_TOOL_NAMES, MUTATING_PROXY_TOOLS, COMPRESS_TOOL_NAME, ACP_TEXT_OPEN, ACP_TEXT_CLOSE } from "./compress-tool.js";
 import { log as loggerLog } from "./logger.js";
 import { applyRanges } from "./stream.js";
@@ -219,8 +219,10 @@ export async function compressLoopResponsesJson(
             body: JSON.stringify(requestBody),
             ...(ctx.proxyUrl ? { dispatcher: proxyDispatcher(ctx.proxyUrl) } : {}),
         }, undefined, undefined, (info) => {
-            ctx.log(`[acp-proxy: responses upstream rejected replay (HTTP ${info.status}: ${info.detail.slice(0, 120)}); likely provider risk-control — retrying in ${info.delayMs}ms (attempt ${info.attempt}/${info.maxAttempts})]`);
-            loggerLog("warn", `[acp-compress-responses] upstream rejected replay (HTTP ${info.status}); retrying in ${info.delayMs}ms (attempt ${info.attempt}/${info.maxAttempts})`);
+            // #189: correlate the rejection with the rewrite that preceded it.
+            const lc = lastCompressSuffix(ctx.session.lastCompress);
+            ctx.log(`[acp-proxy: responses upstream rejected replay (HTTP ${info.status}: ${info.detail.slice(0, 120)}); likely provider risk-control — retrying in ${info.delayMs}ms (attempt ${info.attempt}/${info.maxAttempts})${lc}]`);
+            loggerLog("warn", `[acp-compress-responses] upstream rejected replay (HTTP ${info.status}); retrying in ${info.delayMs}ms (attempt ${info.attempt}/${info.maxAttempts})${lc}`);
         }).catch((e) => {
             if (e instanceof UpstreamHttpError) {
                 const suffix = e.attempts > 1 ? ` after ${e.attempts} attempt(s)` : "";

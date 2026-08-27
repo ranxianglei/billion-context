@@ -10,7 +10,7 @@ import { buildCompressSystemPrompt, parseCompressInput } from "./compress-tool.j
 import { applyRanges, type RewriteCtx } from "./stream.js";
 import { fetchWithRetry, UpstreamHttpError } from "./fetch-util.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
-import type { Session } from "./session.js";
+import { lastCompressSuffix, type Session } from "./session.js";
 
 // #247: proactive pre-forward compression. When the session's real context
 // (previous turn's upstream input_tokens) exceeds the current model's window
@@ -175,7 +175,10 @@ async function summarizeRange(deps: PreflightDeps, content: string, startRef: st
         },
         undefined,
         deps.signal,
-        (info) => deps.log("warn", `[preflight] summary attempt ${info.attempt} got HTTP ${info.status}; retrying in ${info.delayMs}ms`),
+        (info) => {
+            // #189: correlate the rejection with the rewrite that preceded it.
+            deps.log("warn", `[preflight] summary attempt ${info.attempt} got HTTP ${info.status}; retrying in ${info.delayMs}ms${lastCompressSuffix(deps.session.lastCompress)}`);
+        },
     );
     try {
         const text = await response.text();

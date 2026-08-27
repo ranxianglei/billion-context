@@ -126,6 +126,17 @@ export function replayBaseDelayMs(): number {
     return Number.isFinite(raw) && raw >= 0 ? raw : 1500;
 }
 
+/** Max shrink FRACTION (0,1] a single compress may remove before the proxy
+ *  steers the model toward smaller, tail-biased ranges (#189 staged
+ *  compression). A rewrite larger than this is the request-shape change that
+ *  trips provider risk-control (GLM 3007); capping it keeps each round's
+ *  transition gentle and the prefix cache alive. Unset (or out of range) =
+ *  no steering (legacy behavior). Read on each call so tests can tune it live. */
+export function maxShrinkPerCompress(): number | undefined {
+    const raw = Number(process.env.BILI_MAX_SHRINK_PER_COMPRESS);
+    return Number.isFinite(raw) && raw > 0 && raw <= 1 ? raw : undefined;
+}
+
 /** Exponential backoff for the given 1-based attempt: base * 2^(attempt-1). */
 export function replayBackoffMs(attempt: number): number {
     return replayBaseDelayMs() * 2 ** (attempt - 1);
