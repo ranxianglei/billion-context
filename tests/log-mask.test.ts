@@ -353,3 +353,63 @@ test("mitm CONNECT tunnel failure: err.message host scrubbed from log (#255)", a
         fs.rmSync(tmpRoot, { recursive: true, force: true });
     }
 });
+
+test("ws upgrade rejection: host header scrubbed from log (#255)", async () => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bili-log-mask-ws-"));
+    const prev = { xdgState: process.env.XDG_STATE_HOME };
+    process.env.XDG_STATE_HOME = tmpRoot;
+    const captured: Captured[] = [];
+    setLogCapture((level, msg) => captured.push({ level, msg }));
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    let proxy: http.Server | undefined;
+    try {
+        const opts: ProxyOptions = {
+            port: 0,
+            host: "127.0.0.1",
+            upstream: "http://127.0.0.1",
+            routes: {
+                "http://127.0.0.1:59999": { models: { "gpt-test": { context: 400_000 } } },
+            },
+            modelContextLimit: 400_000,
+            kernelConfig: defaultConfig(400_000),
+            compress: { injectTool: false, injectNudge: false },
+            promptCache: { routing: "auto" },
+            sessionHeader: "x-acp-session",
+            log: true,
+            debug: false,
+            passthrough: false,
+            autoUpdate: false,
+            mitm: { enabled: false, domains: [] },
+        };
+        proxy = await startServer(opts);
+        await once(proxy, "listening");
+        const proxyPort = (proxy.address() as { port: number }).port;
+
+        const sock = net.connect(proxyPort, "127.0.0.1");
+        sock.write(
+            "GET /v1/messages HTTP/1.1\r\n" +
+                "Host: relay.internal:443\r\n" +
+                "Upgrade: websocket\r\n" +
+                "Connection: Upgrade\r\n" +
+                "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+                "Sec-WebSocket-Version: 13\r\n\r\n",
+        );
+        const raw = await once(sock, "data");
+        const head = String(raw[0]).split("\r\n")[0];
+        assert.ok(head.includes("426"), `expected 426, got: ${head}`);
+
+        const all = captured.map((c) => c.msg).join("\n");
+        assert.ok(!all.includes("relay.internal"), `ws host header leaked into log:\n${all}`);
+        const wsLine = captured.find((c) => c.msg.includes("[ws] rejected"));
+        assert.ok(wsLine, `ws rejection log missing:\n${all}`);
+        assert.ok(wsLine.msg.includes("<private-host>"), wsLine.msg);
+        sock.destroy();
+    } finally {
+        setLogCapture(null);
+        if (prev.xdgState === undefined) delete process.env.XDG_STATE_HOME;
+        else process.env.XDG_STATE_HOME = prev.xdgState;
+        await close(proxy!);
+        fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+});
