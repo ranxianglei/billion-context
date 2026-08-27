@@ -447,7 +447,7 @@ export async function* runCompressLoop(
                 );
 
             let newBody = adapter.buildRequest(coreMessages, systemPrompt, requestBody);
-            if (process.env.ACP_DUMP_REQ !== "0" && ctx.debug) {
+            if (process.env.ACP_DUMP_BODY === "1") {
                 try {
                     const fs = await import("node:fs");
                     const dumpDir = process.env.ACP_DUMP_DIR || `${process.env.HOME}/.local/state/billion-context/dumps`;

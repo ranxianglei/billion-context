@@ -9,6 +9,7 @@ import { resolveContextLimit, resolveCompressProtocol } from "./config.js";
 import { contextFromRegistry, loadRegistry, peekRegistryContext } from "./registry.js";
 import { fetchWithTimeout, MAX_REQUEST_BYTES } from "./fetch-util.js";
 import { formatUpstreamError, getUpstreamConnectionStatus, recordUpstreamConnection, resolveProxy, resolveProxyDecision, proxyDispatcher } from "./upstream-proxy.js";
+import { maskHeaderForLog, maskHeadersForLog, maskHostPortForLog, maskUrlForLog, maskUrlsInText } from "./log-mask.js";
 // Protocol codecs live in the kernel now (single source of truth shared with
 // the omp/pi adapters): import from "acp-kernel/wire".
 import {
@@ -61,6 +62,15 @@ import type { BiliMessage } from "acp-kernel/wire";
 import { isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, shouldReserveOutputHeadroom, usageTotals } from "./util.js";
 
 import { decodeRequestBody } from "./content-encoding.js";
+
+// Body dumps (dumps/req-*.json, raw/*-REQ.txt, raw/*-RES.txt, raw/*-INCOMING.txt,
+// req-*-REREQUEST.json) write the full plaintext request body and are off by
+// default. They are decoupled from --debug (verbose logging) and enabled only
+// with ACP_DUMP_BODY=1 so `bili <client>` users don't leak conversation bodies
+// to disk by default (#276).
+function bodyDumpEnabled(): boolean {
+    return process.env.ACP_DUMP_BODY === "1";
+}
 
 // Per-model context windows handed over by a `bili <client>` launcher
 // (BILI_LAUNCHER_MODEL_WINDOWS, JSON model-id → window), read from the
@@ -240,7 +250,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // built-in fast-fallback (e.g. Codex) that need a clean 426 to switch to
     // HTTP POST immediately.
     server.on("upgrade", (req, socket) => {
-        log("info", `[ws] rejected ${req.method} ${req.url ?? ""} host=${req.headers.host ?? "?"} with 426`);
+        log("info", `[ws] rejected ${req.method} ${maskUrlsInText(req.url ?? "")} host=${req.headers.host ? maskHostPortForLog(req.headers.host) : "?"} with 426`);
         socket.on("error", () => {}); // client may vanish mid-write; don't let ECONNRESET crash the process
         const body = JSON.stringify({ error: "WebSocket upgrades are not supported; use HTTP POST" });
         socket.end(
@@ -653,17 +663,20 @@ async function handle(
     // Capture the CLIENT's raw incoming request (before bili rebuilds) to
     // resolve whether codex sends previous_response_id + full input vs delta.
     if (opts.debug && parsed && typeof parsed === "object") {
+        const p = parsed as Record<string, unknown>;
+        const hasPrev = p.previous_response_id !== undefined;
+        const inLen = Array.isArray(p.input) ? p.input.length : 0;
+        log("info", `[debug] INCOMING previous_response_id=${hasPrev ? String(p.previous_response_id).slice(0, 16) : "absent"} input_items=${inLen} instructions=${p.instructions !== undefined ? "present" : "absent"}`);
+    }
+    if (bodyDumpEnabled() && parsed && typeof parsed === "object") {
         try {
-            const p = parsed as Record<string, unknown>;
-            const hasPrev = p.previous_response_id !== undefined;
-            const inLen = Array.isArray(p.input) ? p.input.length : 0;
-            log("info", `[debug] INCOMING previous_response_id=${hasPrev ? String(p.previous_response_id).slice(0, 16) : "absent"} input_items=${inLen} instructions=${p.instructions !== undefined ? "present" : "absent"}`);
-            const rawDir = `${stateDir()}/raw`;
+            const rawDir = process.env.ACP_RAW_DUMP_DIR || `${stateDir()}/raw`;
             try { fs.mkdirSync(rawDir, { recursive: true }); } catch { /* best-effort */ }
-            const hdrs = Object.entries(req.headers)
-                .filter(([k]) => !/authorization|x-api-key|cookie/i.test(k))
-                .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(",") : v}`).join("\n");
-            fs.writeFileSync(`${rawDir}/${Date.now()}-INCOMING.txt`, `${req.method} ${req.url}\n${hdrs}\n\n${bodyBuffer.toString("utf8")}`);
+            const hdrs = maskHeadersForLog(
+                Object.fromEntries(Object.entries(req.headers).map(([k, v]) => [k, Array.isArray(v) ? v.join(",") : String(v)])),
+            );
+            const hdrText = Object.entries(hdrs).map(([k, v]) => `${k}: ${v}`).join("\n");
+            fs.writeFileSync(`${rawDir}/${Date.now()}-INCOMING.txt`, `${req.method} ${maskUrlsInText(req.url ?? "")}\n${hdrText}\n\n${bodyBuffer.toString("utf8")}`);
         } catch { /* best-effort dump */ }
     }
     // Per-request context limit + compression tuning: look up body.model against
@@ -943,7 +956,7 @@ async function handle(
     }
     if (!prepared) {
         if (protocol === null && !opts.passthrough) {
-            log("warn", `unrecognized path ${req.url ?? ""} — not a known protocol (/chat/completions, /v1/messages, /responses, /responses/compact); forwarding unchanged`);
+            log("warn", `unrecognized path ${maskUrlsInText(req.url ?? "")} — not a known protocol (/chat/completions, /v1/messages, /responses, /responses/compact); forwarding unchanged`);
         }
         await forward(req, res, opts, bodyBuffer, null, core, reqConfig, log, route, undefined);
     }
@@ -1645,7 +1658,7 @@ async function forward(
     // primary signal. The provider label is appended only for named routes —
     // zero-config requests have a single routing mode now, so the final
     // proxied URL is the only useful signal in the log.
-    log("info", `forward ${req.method} → ${upstreamUrl}`);
+    log("info", `forward ${req.method} → ${maskUrlForLog(upstreamUrl)}`);
     if (process.env.ACP_DEBUG && prepared) {
         const sid = prepared.session.id;
         const hdrKeys = Object.keys(req.headers);
@@ -1662,16 +1675,18 @@ async function forward(
             }
         }
     }
-    if (opts.debug && typeof body === "string") {
+    if (typeof body === "string" && (opts.debug || bodyDumpEnabled())) {
         try {
             const parsed = JSON.parse(body);
-            const toolNames = (parsed.tools ?? []).map((t: Record<string, unknown>) => {
-                const fn = t.function as { name?: string } | undefined;
-                // chat completions nests under `function`; Responses API is flat.
-                return fn?.name ?? (t.name as string | undefined) ?? "?";
-            });
-            log("info", `[debug] tools=[${toolNames.join(",")}] msgs=${parsed.messages?.length ?? 0} stream=${parsed.stream ?? false} system_len=${JSON.stringify(parsed.messages?.find((m: Record<string, string>) => m.role === "system")?.content ?? "").length}`);
-            if (process.env.ACP_DUMP_REQ !== "0") {
+            if (opts.debug) {
+                const toolNames = (parsed.tools ?? []).map((t: Record<string, unknown>) => {
+                    const fn = t.function as { name?: string } | undefined;
+                    // chat completions nests under `function`; Responses API is flat.
+                    return fn?.name ?? (t.name as string | undefined) ?? "?";
+                });
+                log("info", `[debug] tools=[${toolNames.join(",")}] msgs=${parsed.messages?.length ?? 0} stream=${parsed.stream ?? false} system_len=${JSON.stringify(parsed.messages?.find((m: Record<string, string>) => m.role === "system")?.content ?? "").length}`);
+            }
+            if (bodyDumpEnabled() && process.env.ACP_DUMP_REQ !== "0") {
                 const dumpDir = process.env.ACP_DUMP_DIR || `${stateDir()}/dumps`;
                 try { fs.mkdirSync(dumpDir, { recursive: true }); } catch { /* best-effort */ }
                 const sid = prepared?.session.id ?? "unknown";
@@ -1689,17 +1704,20 @@ async function forward(
     if (opts.debug) {
         const hdrLog: Record<string, string> = {};
         for (const [hk, hv] of Object.entries(headers)) {
-            if (typeof hv === "string") hdrLog[hk] = hv.length > 200 ? hv.slice(0, 200) + "..." : hv;
+            if (typeof hv === "string") {
+                const masked = maskHeaderForLog(hk, hv);
+                hdrLog[hk] = masked.length > 200 ? masked.slice(0, 200) + "..." : masked;
+            }
         }
         log("info", `[${prepared?.session.id ?? "unknown"}] → upstream headers: ${JSON.stringify(hdrLog)}`);
     }
     // Raw HTTP capture: dump the COMPLETE exchange (request method/URL/all
     // headers/exact body bytes; response status+headers) so two consecutive
     // requests can be byte-diffed to locate a cache-breaker that the JSON body
-    // dump (which re-formats and omits headers) may hide. Enabled with --debug
-    // (headers written verbatim minus credential values).
+    // dump (which re-formats and omits headers) may hide. Enabled with
+    // ACP_DUMP_BODY=1 (credential header values + non-public hosts masked).
     const rawBase =
-        opts.debug
+        bodyDumpEnabled()
             ? (() => {
                   try {
                       const rawDir = process.env.ACP_RAW_DUMP_DIR || `${stateDir()}/raw`;
@@ -1712,10 +1730,8 @@ async function forward(
             : "";
     if (rawBase) {
         try {
-            const maskHdr = (k: string, v: string) =>
-                /key|auth|token/i.test(k) ? `<masked ${v.length} chars>` : v;
-            const hdrText = Object.entries(headers)
-                .map(([k, v]) => `${k}: ${maskHdr(k, String(v))}`)
+            const hdrText = Object.entries(maskHeadersForLog(headers))
+                .map(([k, v]) => `${k}: ${v}`)
                 .join("\n");
             const bodyText =
                 req.method === "GET" || req.method === "HEAD"
@@ -1724,7 +1740,7 @@ async function forward(
                       ? body
                       : Buffer.from(body).toString("utf8");
             const reqPath = `${rawBase}-REQ.txt`;
-            fs.writeFileSync(reqPath, `${req.method ?? "POST"} ${upstreamUrl}\n${hdrText}\n\n${bodyText}`);
+            fs.writeFileSync(reqPath, `${req.method ?? "POST"} ${maskUrlForLog(upstreamUrl)}\n${hdrText}\n\n${bodyText}`);
             log("info", `[debug] RAW request dump: ${reqPath}`);
         } catch { /* best-effort */ }
     }
@@ -1764,16 +1780,15 @@ async function forward(
         upstream.headers.forEach((v, k) => {
             const lower = k.toLowerCase();
             if (UPSTREAM_HOP_HEADERS.has(lower) || respConnNamed.has(lower)) return;
-            respLog[k] = v.length > 300 ? v.slice(0, 300) + "..." : v;
+            const masked = maskHeaderForLog(k, v);
+            respLog[k] = masked.length > 300 ? masked.slice(0, 300) + "..." : masked;
         });
         log("info", `[${prepared?.session.id ?? "unknown"}] ← upstream response headers: ${JSON.stringify(respLog)}`);
     }
     if (rawBase) {
         try {
-            const maskHdr = (k: string, v: string) =>
-                /key|auth|token/i.test(k) ? `<masked ${v.length} chars>` : v;
-            const hdrText = Object.entries(respHeaders)
-                .map(([k, v]) => `${k}: ${maskHdr(k, v)}`)
+            const hdrText = Object.entries(maskHeadersForLog(respHeaders))
+                .map(([k, v]) => `${k}: ${v}`)
                 .join("\n");
             const resPath = `${rawBase}-RES.txt`;
             fs.writeFileSync(resPath, `${upstream.status}\n${hdrText}\n`);
