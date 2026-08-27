@@ -1241,7 +1241,15 @@ function prepareResponses(
         } else if (projection.systemParts.length > 0) {
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, projection.systemParts.join("\n\n---\n\n"));
         }
-        if (opts.compress.injectNudge && turn.nudge?.shouldInject && shouldInject) {
+        // Codex's native remote-compact request ends with a `compaction_trigger`
+        // item that the upstream requires to be the FINAL input item (else 400
+        // "must be the final input item"). A nudge appended after it would break
+        // Codex's own compaction, and is redundant — the native compact IS the
+        // compression. Skip the nudge for such requests.
+        const triggerFinal = Array.isArray(rebuiltInput)
+            && rebuiltInput.length > 0
+            && rebuiltInput[rebuiltInput.length - 1]!.type === "compaction_trigger";
+        if (opts.compress.injectNudge && turn.nudge?.shouldInject && shouldInject && !triggerFinal) {
             try {
                 const rendered = renderNudgeText(turn.nudge, prompts);
                 if (rendered.text) {
