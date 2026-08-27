@@ -3,7 +3,7 @@ import net from "node:net";
 import tls from "node:tls";
 import { ProxyAgent } from "undici";
 import type { ProviderRoutes } from "./config.js";
-import { isPublicApiHost, maskUrlForLog, PRIVATE_HOST } from "./log-mask.js";
+import { maskHostInText, maskUrlForLog } from "./log-mask.js";
 
 export type ParsedHttpProxy = {
     url: string;
@@ -439,8 +439,7 @@ export function formatUpstreamError(error: unknown, url: string, proxyUrl?: stri
     // non-public host so the failure log leaks nothing either.
     const maskHostIn = (s: string): string => {
         try {
-            const u = new URL(url);
-            if (!isPublicApiHost(u.hostname)) return s.split(u.hostname).join(PRIVATE_HOST);
+            return maskHostInText(s, new URL(url).hostname);
         } catch { /* not a URL — nothing to mask */ }
         return s;
     };
