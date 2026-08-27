@@ -800,7 +800,9 @@ test("buildClaudeEnv: no ANTHROPIC_BASE_URL rewrite → env.ANTHROPIC_BASE_URL u
 });
 
 test("preparePiHttpRewrite: rewrites matching provider, leaves others, symlinks siblings", () => {
-    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-pihome-"));
+    // realpath: on macOS os.tmpdir() is /var/folders (a symlink to /private/var);
+    // the realpathSync asserts below compare canonical forms on both sides.
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-pihome-")));
     fs.writeFileSync(
         path.join(home, "models.json"),
         JSON.stringify({
@@ -946,7 +948,9 @@ test("discoverRoutes: omp http + https providers → splits httpsDomains + httpR
 });
 
 test("prepareOmpHttpRewrite: rewrites matching provider, leaves others, symlinks siblings", () => {
-    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-"));
+    // realpath: on macOS os.tmpdir() is /var/folders (a symlink to /private/var);
+    // the realpathSync asserts below compare canonical forms on both sides.
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-")));
     fs.writeFileSync(
         path.join(home, "models.yml"),
         [
