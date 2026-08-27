@@ -757,7 +757,17 @@ async function handle(
                   responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
                   (parsed as ResponsesRequestBody).instructions,
               );
-        const sessionId = deriveProxySessionId(req.headers, protocol, upstreamOrigin, conversation);
+        // Strong-signal sessions (client-provided conversation id) key on
+        // (protocol, conversation) only — AND-ing credential/upstream would
+        // orphan the session state on bearer rotation or relay switching
+        // (#286). Weak-signal (content fingerprint) keeps the 4-dim key so the
+        // account/upstream dimensions still isolate colliding fingerprints.
+        const clientProvided = protocol === "responses"
+            ? (responsesIdentity?.clientProvided ?? false)
+            : protocol === "openai"
+              ? (openaiIdentity?.clientProvided ?? false)
+              : !!convHeader;
+        const sessionId = deriveProxySessionId(req.headers, protocol, upstreamOrigin, conversation, clientProvided);
         // Two separate uses of the conversation signal:
         //  - `affinity`: header value forwarded upstream for sticky-routing /
         //    cache pools. Synthesized as ses_<conversation> when the client

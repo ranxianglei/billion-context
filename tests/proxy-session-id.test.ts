@@ -67,77 +67,118 @@ test("preferPromptCacheKeyIdentity: derived session id stable across growing tur
     const id1 = preferPromptCacheKeyIdentity(conversationIdentityResponses(body1, undefined), body1)!;
     const id2 = preferPromptCacheKeyIdentity(conversationIdentityResponses(body2, undefined), body2)!;
     assert.equal(
-        deriveSessionId(h, "responses", "http://127.0.0.1:8199", id1.value),
-        deriveSessionId(h, "responses", "http://127.0.0.1:8199", id2.value),
+        deriveSessionId(h, "responses", "http://127.0.0.1:8199", id1.value, id1.clientProvided),
+        deriveSessionId(h, "responses", "http://127.0.0.1:8199", id2.value, id2.clientProvided),
     );
     assert.equal(affinityToken(id1), "pck-omp-1");
 });
 
-test("deriveSessionId: same conversation + same key + same protocol + same upstream → stable", () => {
-    const a = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "hello world");
-    const b = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "hello world");
+test("deriveSessionId: same conversation + same key + same protocol + same upstream → stable (weak signal)", () => {
+    const a = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "hello world", false);
+    const b = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "hello world", false);
     assert.equal(a, b);
 });
 
-test("deriveSessionId: stable for same (key, protocol, upstream, conversation)", () => {
-    const a = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "hello world");
-    const b = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "hello world");
+test("deriveSessionId: stable for same (key, protocol, upstream, conversation) (weak signal)", () => {
+    const a = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "hello world", false);
+    const b = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "hello world", false);
     assert.equal(a, b);
 });
 
-test("deriveSessionId: different API key → different session (no cross-account bleed)", () => {
-    const a = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "hello world");
-    const b = deriveSessionId(hdrs("Bearer keyB"), "anthropic", "https://bailian.example", "hello world");
+test("deriveSessionId: different API key → different session (no cross-account bleed, weak signal)", () => {
+    const a = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "hello world", false);
+    const b = deriveSessionId(hdrs("Bearer keyB"), "anthropic", "https://bailian.example", "hello world", false);
     assert.notEqual(a, b);
 });
 
-test("deriveSessionId: credentials remain case-sensitive opaque values", () => {
-    const upper = deriveSessionId(hdrs("Bearer AbCd"), "responses", "https://chatgpt.com", "session");
-    const lower = deriveSessionId(hdrs("Bearer abcd"), "responses", "https://chatgpt.com", "session");
+test("deriveSessionId: credentials remain case-sensitive opaque values (weak signal)", () => {
+    const upper = deriveSessionId(hdrs("Bearer AbCd"), "responses", "https://chatgpt.com", "session", false);
+    const lower = deriveSessionId(hdrs("Bearer abcd"), "responses", "https://chatgpt.com", "session", false);
     assert.notEqual(upper, lower);
 });
 
-test("deriveSessionId: different upstream origin → different session (no cross-provider bleed)", () => {
-    const a = deriveSessionId(hdrs("Bearer keyA"), "openai", "https://zhipu.example", "hello");
-    const b = deriveSessionId(hdrs("Bearer keyA"), "openai", "https://bailian.example", "hello");
+test("deriveSessionId: different upstream origin → different session (no cross-provider bleed, weak signal)", () => {
+    const a = deriveSessionId(hdrs("Bearer keyA"), "openai", "https://zhipu.example", "hello", false);
+    const b = deriveSessionId(hdrs("Bearer keyA"), "openai", "https://bailian.example", "hello", false);
     assert.notEqual(a, b);
 });
 
-test("deriveSessionId: different protocol → different session (no cross-format bleed)", () => {
-    const a = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "hello");
-    const b = deriveSessionId(hdrs("Bearer keyA"), "openai", "https://bailian.example", "hello");
+test("deriveSessionId: different protocol → different session (no cross-format bleed, weak signal)", () => {
+    const a = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "hello", false);
+    const b = deriveSessionId(hdrs("Bearer keyA"), "openai", "https://bailian.example", "hello", false);
     assert.notEqual(a, b);
 });
 
-test("deriveSessionId: different conversation → different session", () => {
-    const a = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "hello");
-    const b = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "goodbye");
+test("deriveSessionId: different conversation → different session (weak signal)", () => {
+    const a = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "hello", false);
+    const b = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://bailian.example", "goodbye", false);
     assert.notEqual(a, b);
 });
 
-test("deriveSessionId: conversation signal is the only conversation dimension", () => {
+test("deriveSessionId: conversation signal is the only conversation dimension (weak signal)", () => {
     // The conversation dimension is whatever the caller passes — typically the
     // output of conversationSignal*, which already prefers a client header
     // and falls back to a content hash. Here we just confirm the passed value
     // is what matters (same key/proto/upstream, different convo → different).
-    const a = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://up", "ses_111");
-    const b = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://up", "ses_222");
+    const a = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://up", "ses_111", false);
+    const b = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://up", "ses_222", false);
     assert.notEqual(a, b);
     // Same convo signal → same session, regardless of anything else.
-    assert.equal(a, deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://up", "ses_111"));
+    assert.equal(a, deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://up", "ses_111", false));
 });
 
-test("deriveSessionId: no Authorization header → still works (uses placeholder key)", () => {
-    const id = deriveSessionId({}, "anthropic", "https://up", "convo-1");
+test("deriveSessionId: no Authorization header → still works (uses placeholder key, weak signal)", () => {
+    const id = deriveSessionId({}, "anthropic", "https://up", "convo-1", false);
     assert.ok(id.length > 0);
     // Two keyless requests with same content → same session.
-    assert.equal(id, deriveSessionId({}, "anthropic", "https://up", "convo-1"));
+    assert.equal(id, deriveSessionId({}, "anthropic", "https://up", "convo-1", false));
 });
 
 test("deriveSessionId: empty conversation dimension THROWS (no silent collapse)", () => {
     // A caller that forgets to pass the conversation signal must fail loudly,
     // not silently collapse every anonymous session onto one id.
-    assert.throws(() => deriveSessionId({}, "anthropic", "https://up", ""), /conversation dimension is required/);
+    assert.throws(() => deriveSessionId({}, "anthropic", "https://up", "", false), /conversation dimension is required/);
+});
+
+test("deriveSessionId: strong signal ignores credential rotation (ChatGPT OAuth bearer, #286)", () => {
+    const convo = "019fdc81-a420-7a00-bbd1-0a64e3eb772c";
+    const a = deriveSessionId(hdrs("Bearer bearer-old"), "responses", "https://chatgpt.com", convo, true);
+    const b = deriveSessionId(hdrs("Bearer bearer-new"), "responses", "https://chatgpt.com", convo, true);
+    assert.equal(a, b);
+});
+
+test("deriveSessionId: strong signal survives upstream/relay switching (#286)", () => {
+    const convo = "019fdc81-a420-7a00-bbd1-0a64e3eb772c";
+    const a = deriveSessionId(hdrs("Bearer keyA"), "responses", "https://relay-1.example", convo, true);
+    const b = deriveSessionId(hdrs("Bearer keyA"), "responses", "https://relay-2.example", convo, true);
+    assert.equal(a, b);
+});
+
+test("deriveSessionId: strong signal stable for same (protocol, conversation)", () => {
+    const a = deriveSessionId(hdrs("Bearer keyA"), "responses", "https://chatgpt.com", "convo-1", true);
+    const b = deriveSessionId(hdrs("Bearer keyB"), "responses", "https://other.example", "convo-1", true);
+    assert.equal(a, b);
+});
+
+test("deriveSessionId: strong signal different conversation → different session", () => {
+    const a = deriveSessionId(hdrs("Bearer keyA"), "responses", "https://chatgpt.com", "convo-1", true);
+    const b = deriveSessionId(hdrs("Bearer keyA"), "responses", "https://chatgpt.com", "convo-2", true);
+    assert.notEqual(a, b);
+});
+
+test("deriveSessionId: strong signal different protocol → different session (no cross-format bleed)", () => {
+    const a = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://chatgpt.com", "convo-1", true);
+    const b = deriveSessionId(hdrs("Bearer keyA"), "responses", "https://chatgpt.com", "convo-1", true);
+    assert.notEqual(a, b);
+});
+
+test("deriveSessionId: strong and weak tiers never collide for the same conversation value", () => {
+    // hash(protocol|convo) and hash(protocol|upstream|key|convo) are different
+    // hash inputs, so a session must not migrate between tiers when the
+    // client's signal strength changes mid-flight.
+    const strong = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://up", "hello", true);
+    const weak = deriveSessionId(hdrs("Bearer keyA"), "anthropic", "https://up", "hello", false);
+    assert.notEqual(strong, weak);
 });
 
 test("affinityToken: uses client signal when present (passthrough, preserves ses_ format)", () => {

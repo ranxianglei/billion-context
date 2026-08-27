@@ -9,21 +9,41 @@ export type ConversationIdentity = {
 /**
  * Session identity for the proxy's OWN compression state.
  *
- * A session is uniquely keyed by FOUR dimensions (all AND-ed):
+ * A session is keyed in one of two tiers:
+ *
+ * Strong signal (clientProvided = true) — the client explicitly stated which
+ * conversation this is (codex `session-id`/`thread-id`, claude
+ * `x-claude-code-session-id`, opencode `x-opencode-session`, Responses body
+ * `session_id` / `metadata.session_id`, `prompt_cache_key`, ...). The id is
  *   1. protocol  — "anthropic" | "openai" | "responses"  (different wire
  *                  formats must never share compression state)
+ *   2. conversation — the client-provided identity value.
+ *
+ * Weak signal (clientProvided = false) — the conversation value is a content
+ * fingerprint (hash of the first user message / whole input), which has a real
+ * collision surface, so isolation is restored with the full key (all AND-ed):
+ *   1. protocol
  *   2. upstream  — the resolved upstream origin, e.g. "https://open.bigmodel.cn"
- *                  (same key hitting two providers must not share state)
+ *                  (same content hitting two providers must not share state)
  *   3. apiKey    — the account credential from Authorization / x-api-key
  *                  (different accounts must never share state, even if they
  *                  happen to send the same conversation content)
- *   4. conversation — the client's own notion of "which conversation this is",
- *                  taken from a client-provided signal when available, falling
- *                  back to a content fingerprint.
+ *   4. conversation — the content fingerprint.
+ *
+ * Why two tiers: the credential and upstream dimensions are NOT stable across
+ * a client's life — ChatGPT OAuth bearers rotate, users switch relays and
+ * accounts at will. AND-ing them into the id orphans every bit of compression
+ * state (in-memory blocks, lastInputTokens, persisted records) the moment any
+ * one of them changes, and the client then replays full raw history into a
+ * window it has already compressed (#280). A client-provided conversation id
+ * is the only invariant that actually binds to the conversation, so strong-
+ * signal sessions key on (protocol, conversation) alone and survive
+ * credential/upstream changes.
  *
  * The result is a stable, opaque id used ONLY inside the proxy (to key the
- * compression-state store). It is NEVER sent upstream — it embeds the key and
- * upstream origin, which the upstream either already knows or must not see.
+ * compression-state store). It is NEVER sent upstream — the weak-signal form
+ * embeds the key and upstream origin, which the upstream either already knows
+ * or must not see.
  *
  * If a client-provided per-conversation signal is needed for upstream routing,
  * use `affinityToken()` below. Generated proxy identities are never forwarded.
@@ -77,14 +97,22 @@ export function clientConversationHeader(headers: Record<string, string | string
  * fingerprint fallback inside this function — a silent "" default would
  * collapse every anonymous session onto one id. If `conversation` is missing
  * the caller has a bug and we throw rather than silently mis-isolating.
+ *
+ * `clientProvided` selects the keying tier (see module docs above): true →
+ * hash(protocol|conversation), stable across credential rotation and
+ * upstream/relay switching; false → the full 4-dimension hash, where
+ * credential + upstream restore isolation for the collision-prone content
+ * fingerprint.
  */
 export function deriveSessionId(
     headers: Record<string, string | string[] | undefined>,
     protocol: "anthropic" | "openai" | "responses",
     upstream: string,
     conversation: string,
+    clientProvided: boolean,
 ): string {
     if (!conversation) throw new Error("deriveSessionId: conversation dimension is required (pass the conversationSignal* output)");
+    if (clientProvided) return hashId(`${protocol}|${conversation}`);
     const key = extractKey(headers);
     return hashId(`${protocol}|${upstream}|${key}|${conversation}`);
 }
