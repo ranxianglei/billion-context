@@ -9,7 +9,20 @@ export type ConversationIdentity = {
 /**
  * Session identity for the proxy's OWN compression state.
  *
- * A session is uniquely keyed by FOUR dimensions (all AND-ed):
+ * A session is keyed by protocol + conversation, where the conversation
+ * dimension is the client's own notion of "which conversation this is" —
+ * taken from a client-provided signal when available, falling back to a
+ * content fingerprint.
+ *
+ * When the conversation is a CLIENT-PROVIDED native session id (session
+ * header, body session_id, prompt_cache_key), the final id is
+ * hash(protocol | conversation) only (issue #286): the session id is the
+ * only invariant tied to a conversation, and the account credential
+ * (rotating OAuth bearer) or the upstream (relay switch) changing must not
+ * orphan the conversation's compression state.
+ *
+ * When the conversation is a CONTENT FINGERPRINT (no client signal), the id
+ * keeps FOUR dimensions (all AND-ed):
  *   1. protocol  — "anthropic" | "openai" | "responses"  (different wire
  *                  formats must never share compression state)
  *   2. upstream  — the resolved upstream origin, e.g. "https://open.bigmodel.cn"
@@ -17,9 +30,8 @@ export type ConversationIdentity = {
  *   3. apiKey    — the account credential from Authorization / x-api-key
  *                  (different accounts must never share state, even if they
  *                  happen to send the same conversation content)
- *   4. conversation — the client's own notion of "which conversation this is",
- *                  taken from a client-provided signal when available, falling
- *                  back to a content fingerprint.
+ *   4. conversation — the content fingerprint (a content hash with a real
+ *                  collision surface, hence the isolation dimensions).
  *
  * The result is a stable, opaque id used ONLY inside the proxy (to key the
  * compression-state store). It is NEVER sent upstream — it embeds the key and
@@ -71,20 +83,34 @@ export function clientConversationHeader(headers: Record<string, string | string
 
 /**
  * Derive the proxy-internal session id. The conversation dimension MUST be
- * supplied by the caller via `extra.conversation` (typically the output of
- * the per-protocol conversationSignal* helper, which already falls back to a
- * hash of the first user message). There is intentionally NO content-
- * fingerprint fallback inside this function — a silent "" default would
- * collapse every anonymous session onto one id. If `conversation` is missing
- * the caller has a bug and we throw rather than silently mis-isolating.
+ * supplied by the caller (typically the output of the per-protocol
+ * conversationSignal* helper, which already falls back to a content hash).
+ * There is intentionally NO content-fingerprint fallback inside this
+ * function — a silent "" default would collapse every anonymous session onto
+ * one id. If `conversation` is missing the caller has a bug and we throw
+ * rather than silently mis-isolating.
+ *
+ * Identity strength (issue #286): when the caller passes a
+ * client-provided identity (native session header, body session_id,
+ * prompt_cache_key — `identity.clientProvided`), the id is
+ * `hash(protocol | conversation)` ONLY. The native session id is the only
+ * invariant tied to a conversation: the account credential rotates (OAuth
+ * bearer) and the upstream can change (relay) without the conversation
+ * changing, so neither may break continuity. The 4-way hash
+ * (protocol|upstream|credential|conversation) is kept for the
+ * content-fingerprint fallback, where the "conversation" is a content hash
+ * with a real collision surface and needs the account and upstream
+ * dimensions to stay isolated.
  */
 export function deriveSessionId(
     headers: Record<string, string | string[] | undefined>,
     protocol: "anthropic" | "openai" | "responses",
     upstream: string,
     conversation: string,
+    identity?: ConversationIdentity,
 ): string {
     if (!conversation) throw new Error("deriveSessionId: conversation dimension is required (pass the conversationSignal* output)");
+    if (identity?.clientProvided) return hashId(`${protocol}|${conversation}`);
     const key = extractKey(headers);
     return hashId(`${protocol}|${upstream}|${key}|${conversation}`);
 }

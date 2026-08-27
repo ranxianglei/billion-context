@@ -140,6 +140,61 @@ test("deriveSessionId: empty conversation dimension THROWS (no silent collapse)"
     assert.throws(() => deriveSessionId({}, "anthropic", "https://up", ""), /conversation dimension is required/);
 });
 
+test("deriveSessionId: codex native session id stays stable across bearer rotation and relay switch (#286)", () => {
+    // Codex sends its per-conversation session-id header on every request;
+    // the OAuth bearer in Authorization rotates and the upstream can be a
+    // relay. Neither must mint a new session (issue #280 root cause).
+    const body = { input: [{ type: "message", role: "user", content: "hi" }] };
+    const identity = conversationIdentityResponses(body, "019fdc81-a420-7a00-bbd1-0a64e3eb772c")!;
+    assert.equal(identity.source, "header");
+    assert.equal(identity.clientProvided, true);
+    const a = deriveSessionId({ authorization: "Bearer oauth-token-1" }, "responses", "https://chatgpt.com", identity.value, identity);
+    const b = deriveSessionId({ authorization: "Bearer oauth-token-2" }, "responses", "https://chatgpt.com", identity.value, identity);
+    assert.equal(a, b, "rotating OAuth bearer must not break session continuity");
+    const c = deriveSessionId({ authorization: "Bearer oauth-token-1" }, "responses", "https://relay.example", identity.value, identity);
+    assert.equal(a, c, "relay/upstream switch must not break session continuity");
+    const d = deriveSessionId({ authorization: "Bearer oauth-token-1" }, "responses", "https://chatgpt.com", "different-session", identity);
+    assert.notEqual(a, d, "different conversation → different session");
+    const e = deriveSessionId({ authorization: "Bearer oauth-token-1" }, "anthropic", "https://chatgpt.com", identity.value, identity);
+    assert.notEqual(a, e, "different protocol → different session");
+});
+
+test("deriveSessionId: body session_id and prompt_cache_key identities are also credential-independent (#286)", () => {
+    const bodySession = conversationIdentityResponses({ input: [], session_id: "sess-1" } as never, undefined)!;
+    assert.equal(
+        deriveSessionId({ authorization: "Bearer k1" }, "responses", "https://chatgpt.com", bodySession.value, bodySession),
+        deriveSessionId({ authorization: "Bearer k2" }, "responses", "https://chatgpt.com", bodySession.value, bodySession),
+    );
+    const pck = preferPromptCacheKeyIdentity(conversationIdentityResponses({ input: [{ type: "message", role: "user", content: "x" }] }, undefined), { prompt_cache_key: "pck-omp-1" })!;
+    assert.equal(pck.source, "prompt-cache-key");
+    assert.equal(
+        deriveSessionId({ authorization: "Bearer k1" }, "responses", "https://up", pck.value, pck),
+        deriveSessionId({ authorization: "Bearer k2" }, "responses", "https://other-up", pck.value, pck),
+    );
+});
+
+test("deriveSessionId: content-fingerprint identity keeps the 4-way hash (isolation preserved) (#286)", () => {
+    const fp = conversationIdentityResponses({ input: [{ type: "message", role: "user", content: "anonymous opener" }] }, undefined)!;
+    assert.equal(fp.source, "content-fingerprint");
+    assert.equal(fp.clientProvided, false);
+    // No client signal: different accounts / upstreams must stay isolated.
+    assert.notEqual(
+        deriveSessionId({ authorization: "Bearer k1" }, "responses", "https://up", fp.value, fp),
+        deriveSessionId({ authorization: "Bearer k2" }, "responses", "https://up", fp.value, fp),
+    );
+    assert.notEqual(
+        deriveSessionId({ authorization: "Bearer k1" }, "responses", "https://up", fp.value, fp),
+        deriveSessionId({ authorization: "Bearer k1" }, "responses", "https://other", fp.value, fp),
+    );
+    // previous_response_id is clientDerived (clientProvided:false) → 4-way too.
+    const prev = conversationIdentityResponses({ input: [], previous_response_id: "resp_1" } as never, undefined)!;
+    assert.equal(prev.clientProvided, false);
+    assert.notEqual(
+        deriveSessionId({ authorization: "Bearer k1" }, "responses", "https://up", prev.value, prev),
+        deriveSessionId({ authorization: "Bearer k2" }, "responses", "https://up", prev.value, prev),
+    );
+});
+
 test("affinityToken: uses client signal when present (passthrough, preserves ses_ format)", () => {
     const t = affinityToken({ value: "ses_opencode_xyz", source: "header", clientProvided: true });
     assert.equal(t, "ses_opencode_xyz");

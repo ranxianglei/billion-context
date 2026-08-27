@@ -756,8 +756,20 @@ async function handle(
               : subagentNamespace(
                   responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
                   (parsed as ResponsesRequestBody).instructions,
-              );
-        const sessionId = deriveProxySessionId(req.headers, protocol, upstreamOrigin, conversation);
+                );
+        // #286: a client-provided native session id (codex session-id header,
+        // claude x-claude-code-session-id, body session_id, prompt_cache_key…)
+        // is the only invariant tied to a conversation — key the session on
+        // protocol+conversation only, so credential rotation (OAuth bearer)
+        // and relay/upstream switches don't orphan the compression state.
+        const identity: ConversationIdentity | undefined = protocol === "anthropic"
+            ? convHeader
+              ? { value: conversation, source: "header", clientProvided: true }
+              : { value: conversation, source: "content-fingerprint", clientProvided: false }
+            : protocol === "openai"
+              ? openaiIdentity
+              : responsesIdentity;
+        const sessionId = deriveProxySessionId(req.headers, protocol, upstreamOrigin, conversation, identity);
         // Two separate uses of the conversation signal:
         //  - `affinity`: header value forwarded upstream for sticky-routing /
         //    cache pools. Synthesized as ses_<conversation> when the client
