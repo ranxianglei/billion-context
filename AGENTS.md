@@ -120,6 +120,7 @@ artifact.
 | **NEVER force-push to `master`** | Under no circumstances. (GitHub branch protection also blocks this.) |
 | **NEVER merge PRs** | PR merges are human-only. The Agent MUST NEVER merge. |
 | **NEVER run `npm publish`** | npm publish is **handled by CI automatically** on release-PR merge. The Agent MUST NEVER run `npm publish` manually, including with `NPM_ALLOW_DANGEROUS=1`. (See §5.) |
+| **NEVER print the GitHub PAT** | The token stays in a shell variable only. See "Opening PRs without the `gh` CLI" below. |
 | **Branch naming** | `YYYY-MM-DD_short-title` |
 | **NEVER modify `version` on non-release branches** | The `"version"` field in `package.json` is touched ONLY on `*_release-v*` branches. Content commits must NEVER bump it. (See §4 Version Bumps below.) |
 
@@ -128,6 +129,46 @@ artifact.
 PR merges are a **human-only operation**. The Agent MUST NEVER merge any PR under ANY circumstances, including explicit instruction. If a human instructs merge, reply:
 
 > I can't merge PRs — AGENTS.md forbids Agents from merging. Please merge yourself: [PR URL].
+
+### Opening PRs without the `gh` CLI
+
+This environment has **no `gh` CLI** — but `git push` works (credential
+helper) and the same credential can open PRs through the GitHub REST API:
+
+```bash
+# 1. push the branch (auth is automatic via the git credential helper)
+git push origin HEAD
+
+# 2. get a token from the credential helper (shell variable only — never print it)
+TOKEN=$(printf 'protocol=https\nhost=github.com\n\n' \
+  | git credential fill | sed -n 's/^password=//p')
+
+# 3. write the PR payload to a file (safe for multi-line markdown bodies)
+cat > /tmp/pr.json <<'EOF'
+{
+  "title": "fix: short summary",
+  "head": "YYYY-MM-DD_short-title",
+  "base": "master",
+  "body": "what changed, why, and pre-flight results (typecheck / test / build)"
+}
+EOF
+
+# 4. open the PR (base is master)
+curl -sS -f -X POST \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Accept: application/vnd.github+json" \
+  -H "X-GitHub-Api-Version: 2022-11-28" \
+  -H "Content-Type: application/json" \
+  https://api.github.com/repos/ranxianglei/billion-context/pulls \
+  -d @/tmp/pr.json
+```
+
+A successful response contains `"state": "open"` and the `html_url` to post
+back to the issue; `-f` makes API errors (401/422) fail loudly instead of
+exiting 0 with an error JSON body. The credential helper is
+non-interactive — it either serves the token or fails, so if `git push`
+worked, the token extraction works. Never print the token; keep it in the
+variable only. Merging the PR stays human-only (see above).
 
 ### npm Publish — Absolute Prohibition
 
