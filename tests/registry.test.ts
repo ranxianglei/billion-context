@@ -34,6 +34,47 @@ test("peekRegistryContext resolves provider-qualified keys from the warm cache",
     assert.equal(peekRegistryContext("deepseek-chat", "api.minimax.chat"), undefined);
 });
 
+test("unknown relay host falls back to provider-prefixed registry keys", () => {
+    _setForTest({
+        "deepseek/deepseek-v4-flash": { limit: { context: 1_000_000 } },
+        "minimax/MiniMax-M2.1": { limit: { context: 204_800 } },
+        "gpt-x": { limit: { context: 400_000 } },
+    });
+    // Relay host absent from HOST_TO_PROVIDER: bare name misses, but the
+    // provider-prefixed key still resolves (issue #282).
+    assert.equal(peekRegistryContext("deepseek-v4-flash", "freeinference.org"), 1_000_000);
+    assert.equal(peekRegistryContext("MiniMax-M2.1", "some-relay.example"), 204_800);
+    // No host at all triggers the same fallback scan.
+    assert.equal(peekRegistryContext("deepseek-v4-flash"), 1_000_000);
+    // A bare key, when present, still wins without scanning.
+    assert.equal(peekRegistryContext("gpt-x", "freeinference.org"), 400_000);
+});
+
+test("conflicting provider-prefixed matches do not guess", () => {
+    _setForTest({
+        "prov-a/ambig": { limit: { context: 100_000 } },
+        "prov-b/ambig": { limit: { context: 200_000 } },
+    });
+    assert.equal(peekRegistryContext("ambig", "relay.example"), undefined);
+});
+
+test("relay fallback scan is slash-bounded (no partial-name matches)", () => {
+    _setForTest({ "deepseek/deepseek-v4-flash": { limit: { context: 1_000_000 } } });
+    assert.equal(peekRegistryContext("v4-flash", "relay.example"), undefined);
+    assert.equal(peekRegistryContext("flash", "relay.example"), undefined);
+});
+
+test("known-provider host does not cross-provider scan on a miss", () => {
+    _setForTest({ "deepseek/deepseek-chat": { limit: { context: 1_000_000 } } });
+    assert.equal(peekRegistryContext("deepseek-chat", "api.minimax.chat"), undefined);
+});
+
+test("bundled snapshot resolves relay-style bare names via provider-prefixed keys", () => {
+    // The exact #282 scenario: freeinference.org serving "deepseek-v4-flash",
+    // which the registry stores only as "deepseek/deepseek-v4-flash" (1M).
+    assert.equal(bundledSnapshotLookup("deepseek-v4-flash", "freeinference.org"), 1_000_000);
+});
+
 test("contextFromRegistry resolves from the warm cache (same lookup, async)", async () => {
     _setForTest({ "minimax/MiniMax-M3": { limit: { context: 512_000 } } });
     assert.equal(await contextFromRegistry("MiniMax-M3", "api.minimax.chat"), 512_000);

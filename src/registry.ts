@@ -261,6 +261,25 @@ function registryLookup(reg: RegistryShape | null, model: string, host?: string)
         const ctx = entry?.limit?.context;
         if (typeof ctx === "number" && ctx > 0) return ctx;
     }
+    // Relay host (not in HOST_TO_PROVIDER): the bare name can miss while the
+    // model exists under a provider-prefixed key (a relay serving
+    // "deepseek-v4-flash" is stored as "deepseek/deepseek-v4-flash"). Scan
+    // */<model> and adopt the value only when every match agrees — a
+    // conflict means different deployments, and guessing is worse than the
+    // static table. Known-provider hosts keep the old behavior: a miss there
+    // means the model is genuinely unlisted for that provider.
+    if (provider === undefined) {
+        const suffix = `/${model}`;
+        let agreed: number | undefined;
+        for (const key of Object.keys(reg)) {
+            if (!key.endsWith(suffix)) continue;
+            const ctx = reg[key].limit?.context;
+            if (typeof ctx !== "number" || ctx <= 0) continue;
+            if (agreed === undefined) agreed = ctx;
+            else if (agreed !== ctx) return undefined;
+        }
+        return agreed;
+    }
     return undefined;
 }
 
