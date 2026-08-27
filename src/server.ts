@@ -45,6 +45,7 @@ import { applyRanges } from "./stream.js";
 import { preflightCompress, estimateCoreMessages } from "./preflight.js";
 import { renderUI, handleConfigGet, handleConfigPut } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
+import { gcDebugDir } from "./state-gc.js";
 import { getStore } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger } from "./logger.js";
 import { defaultLogFile, stateDir, proxyOriginFile } from "./paths.js";
@@ -650,6 +651,7 @@ async function handle(
                 .filter(([k]) => !/authorization|x-api-key|cookie/i.test(k))
                 .map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(",") : v}`).join("\n");
             fs.writeFileSync(`${rawDir}/${Date.now()}-INCOMING.txt`, `${req.method} ${req.url}\n${hdrs}\n\n${bodyBuffer.toString("utf8")}`);
+            gcDebugDir(rawDir);
         } catch { /* best-effort dump */ }
     }
     // Per-request context limit + compression tuning: look up body.model against
@@ -1629,6 +1631,7 @@ async function forward(
                 } catch {
                     fs.writeFileSync(out, body);
                 }
+                gcDebugDir(dumpDir);
                 log("info", `[debug] forwarded body written to ${out}`);
             }
         } catch { /* best-effort */ }
@@ -1645,11 +1648,12 @@ async function forward(
     // requests can be byte-diffed to locate a cache-breaker that the JSON body
     // dump (which re-formats and omits headers) may hide. Enabled with --debug
     // (headers written verbatim minus credential values).
+    let rawDir = "";
     const rawBase =
         opts.debug
             ? (() => {
                   try {
-                      const rawDir = process.env.ACP_RAW_DUMP_DIR || `${stateDir()}/raw`;
+                      rawDir = process.env.ACP_RAW_DUMP_DIR || `${stateDir()}/raw`;
                       fs.mkdirSync(rawDir, { recursive: true });
                       return `${rawDir}/${Date.now()}-${prepared?.session.id ?? "unknown"}`;
                   } catch {
@@ -1672,6 +1676,7 @@ async function forward(
                       : Buffer.from(body).toString("utf8");
             const reqPath = `${rawBase}-REQ.txt`;
             fs.writeFileSync(reqPath, `${req.method ?? "POST"} ${upstreamUrl}\n${hdrText}\n\n${bodyText}`);
+            gcDebugDir(rawDir);
             log("info", `[debug] RAW request dump: ${reqPath}`);
         } catch { /* best-effort */ }
     }
@@ -1724,6 +1729,7 @@ async function forward(
                 .join("\n");
             const resPath = `${rawBase}-RES.txt`;
             fs.writeFileSync(resPath, `${upstream.status}\n${hdrText}\n`);
+            gcDebugDir(rawDir);
             log("info", `[debug] RAW response dump: ${resPath}`);
         } catch { /* best-effort */ }
     }
@@ -2055,7 +2061,7 @@ async function dumpStreamToFile(stream: ReadableStream<Uint8Array>, dir: string,
             }
         } finally {
             reader.releaseLock();
-            ws.end();
+            ws.end(() => gcDebugDir(dir));
         }
     } catch {
         // best-effort dump

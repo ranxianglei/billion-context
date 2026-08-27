@@ -12,7 +12,7 @@
  *   - If stderr's reader is gone (broken pipe), process.stderr.write throws
  *     EPIPE — swallowed so logging can never crash the server.
  */
-import { createWriteStream, mkdirSync, statSync, renameSync, type WriteStream } from "node:fs";
+import { createWriteStream, mkdirSync, statSync, renameSync, unlinkSync, type WriteStream } from "node:fs";
 import path from "node:path";
 
 const MAX_BYTES = 10 * 1024 * 1024; // 10 MB → rotate
@@ -31,6 +31,9 @@ function openStream(file: string): WriteStream {
         existingSize = statSync(file).size;
         if (existingSize >= MAX_BYTES) {
             try {
+                // Drop the previous generation first: keep at most one .old,
+                // and on Windows renameSync cannot overwrite an existing target.
+                try { unlinkSync(file + ".old"); } catch { /* no previous generation */ }
                 renameSync(file, file + ".old");
                 existingSize = 0;
             } catch {
