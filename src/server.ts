@@ -56,7 +56,7 @@ import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { emitStreamError } from "./stream-error.js";
 import { affinityToken, clientConversationHeader, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
-import { affinityPartition, prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
+import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { consumePluginRegisterFor, flushConversations, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, loadConversations, pipePluginJson, pipePluginResponsesWithStrip, pipeThroughWithUsage, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
@@ -816,16 +816,16 @@ async function handle(
         // Anonymous fallback (#309): clients with no identity signal at all
         // (no headers, no session_id/prompt_cache_key) still replay their full
         // history — resolve them by longest-prefix affinity instead of the
-        // #286 hard 400. Requests with no usable conversation signal (empty /
-        // system-only) keep the explicit 400.
+        // #286 hard 400. Resolution is content-only (#286 lesson): protocol,
+        // upstream and credentials are mutable mid-conversation and MUST NOT
+        // fork the session. Requests with no usable conversation signal
+        // (empty / system-only) keep the explicit 400.
         let anonAffinity: AnonymousAffinity | null = null;
         if (!clientProvided) {
-            const authValue = headerValue(req, "authorization") ?? headerValue(req, "x-api-key") ?? "";
             const anonMessages = protocol === "responses"
                 ? (parsed as { input?: unknown }).input ?? []
                 : (parsed as { messages?: unknown }).messages ?? [];
-            const partition = affinityPartition(protocol, upstreamOrigin, authValue);
-            anonAffinity = prefixAffinity.resolve(partition, Array.isArray(anonMessages) ? anonMessages : []);
+            anonAffinity = prefixAffinity.resolve(Array.isArray(anonMessages) ? anonMessages : []);
             if (!anonAffinity) {
                 log("warn", `400: no stable conversation identity on ${protocol} request → ${upstreamOrigin}; refusing to create a content-fingerprint session (#286)`);
                 res.writeHead(400, { "content-type": "application/json" });
@@ -835,11 +835,11 @@ async function handle(
                 return;
             }
             if (anonAffinity.matchedDepth > 0) {
-                log("info", `[prefix-affinity] anonymous ${protocol} request → session ${anonAffinity.sessionId} (prefix match depth=${anonAffinity.matchedDepth}/${anonAffinity.incomingDepth}, partition=${anonAffinity.partition.slice(0, 8)}, tail=${anonAffinity.tailHash.slice(0, 8)}; fork semantics: diverged histories split on their next request)`);
-                loggerLog("info", `[prefix-affinity] session ${anonAffinity.sessionId} matched at depth ${anonAffinity.matchedDepth}/${anonAffinity.incomingDepth} (partition=${anonAffinity.partition.slice(0, 8)}, tail=${anonAffinity.tailHash.slice(0, 8)})`);
+                log("info", `[prefix-affinity] anonymous ${protocol} request → session ${anonAffinity.sessionId} (prefix match depth=${anonAffinity.matchedDepth}/${anonAffinity.incomingDepth}, tail=${anonAffinity.tailHash.slice(0, 8)}; fork semantics: diverged histories split on their next request)`);
+                loggerLog("info", `[prefix-affinity] session ${anonAffinity.sessionId} matched at depth ${anonAffinity.matchedDepth}/${anonAffinity.incomingDepth} (tail=${anonAffinity.tailHash.slice(0, 8)})`);
             } else {
-                log("info", `[prefix-affinity] new anonymous session ${anonAffinity.sessionId} (depth=${anonAffinity.incomingDepth}, partition=${anonAffinity.partition.slice(0, 8)}, tail=${anonAffinity.tailHash.slice(0, 8)})`);
-                loggerLog("info", `[prefix-affinity] new session ${anonAffinity.sessionId} at depth ${anonAffinity.incomingDepth} (partition=${anonAffinity.partition.slice(0, 8)}, tail=${anonAffinity.tailHash.slice(0, 8)})`);
+                log("info", `[prefix-affinity] new anonymous session ${anonAffinity.sessionId} (depth=${anonAffinity.incomingDepth}, tail=${anonAffinity.tailHash.slice(0, 8)})`);
+                loggerLog("info", `[prefix-affinity] new session ${anonAffinity.sessionId} at depth ${anonAffinity.incomingDepth} (tail=${anonAffinity.tailHash.slice(0, 8)})`);
             }
         }
         const sessionId = anonAffinity ? anonAffinity.sessionId : conversation;
@@ -863,9 +863,8 @@ async function handle(
             : clientConversationHeader(req.headers);
         const session = getSession(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? (anonAffinity ? "prefix-affinity" : undefined) });
         if (anonAffinity) {
-            prefixAffinity.note(anonAffinity.partition, sessionId, anonAffinity.incomingDepth, anonAffinity.tailHash);
+            prefixAffinity.note(sessionId, anonAffinity.incomingDepth, anonAffinity.tailHash);
             session.metadata.anonymousPrefixAffinity = {
-                partition: anonAffinity.partition,
                 depth: anonAffinity.incomingDepth,
                 tailHash: anonAffinity.tailHash,
             };

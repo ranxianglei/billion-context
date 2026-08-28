@@ -23,8 +23,14 @@ import { createHash } from "node:crypto";
  * most recently extended it. Two truly distinct conversations merge only
  * while byte-identical.
  *
- * Partitioning: resolution is scoped to (protocol | upstreamOrigin | auth
- * hash) so state never leaks across credentials or upstreams.
+ * Partitioning — deliberately absent (#286 lesson): protocol, upstream
+ * origin and credentials are all MUTABLE MID-CONVERSATION (bearer rotation,
+ * relay switching, protocol-translating relays). Partitioning by them orphans
+ * state exactly when the user keeps talking. The content chain is the only
+ * immutable anchor: the same person switching keys or relays mid-conversation
+ * keeps the session, which is the correct semantics. Safety: matching a stored
+ * chain requires possessing a byte-identical history, so the folded state
+ * reveals nothing the requester does not already hold.
  */
 
 /** Creation/match floor on the canonical size of the hashed messages.
@@ -32,14 +38,15 @@ import { createHash } from "node:crypto";
  *  usable conversation signal. Below it the request keeps the #286 400. */
 const MIN_CANONICAL_BYTES = 24;
 
-/** Upper bound on tracked chains per partition (LRU-evicted). */
-const MAX_SESSIONS_PER_PARTITION = 64;
+/** Upper bound on tracked chains (LRU-evicted, global — content is the
+ *  only key, so there are no per-credential buckets). */
+const MAX_TRACKED_SESSIONS = 256;
 
 /** Chains unused for this long stop matching (sessions may outlive tracking). */
 const TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 export interface AnonymousAffinity {
-    /** Stable session id: "pfa-" + short hash of (partition, tail, depth). */
+    /** Stable session id: "pfa-" + short hash of (tail, depth). */
     sessionId: string;
     /** Depth of the matched stored chain; 0 when this request creates the session. */
     matchedDepth: number;
@@ -49,8 +56,6 @@ export interface AnonymousAffinity {
     incomingDepth: number;
     /** Chain hash of the incoming tail (log correlation). */
     tailHash: string;
-    /** Partition key (log correlation, never contains raw secrets). */
-    partition: string;
 }
 
 interface ChainEntry {
@@ -81,12 +86,6 @@ function sha256(text: string): string {
     return createHash("sha256").update(text, "utf8").digest("hex");
 }
 
-/** Partition key: (protocol, upstream origin, credential) — hashed, never
- *  logged raw. Anonymous state stays scoped per credential+upstream. */
-export function affinityPartition(protocol: string, upstreamOrigin: string, auth: string): string {
-    return sha256(`${protocol}\u0000${upstreamOrigin}\u0000${auth}`).slice(0, 16);
-}
-
 function hasUserMessage(messages: unknown[]): boolean {
     return messages.some((m) => !!m && typeof m === "object" && (m as { role?: unknown }).role === "user");
 }
@@ -106,19 +105,19 @@ function chainHashes(messages: unknown[]): string[] {
 }
 
 export class PrefixAffinityResolver {
-    private partitions = new Map<string, Map<string, ChainEntry>>();
+    private trackedChains = new Map<string, ChainEntry>();
 
     /**
      * Resolve an anonymous request to a session id.
      * Returns null when the request carries no usable conversation signal
      * (caller keeps the #286 explicit 400).
      */
-    resolve(partition: string, messages: unknown[]): AnonymousAffinity | null {
+    resolve(messages: unknown[]): AnonymousAffinity | null {
         const hashes = chainHashes(messages);
         if (hashes.length === 0 || !hasUserMessage(messages)) return null;
         const tailHash = hashes[hashes.length - 1]!;
-        const tracked = this.tracked(partition);
-        this.expire(partition, tracked);
+        const tracked = this.trackedChains;
+        this.expire(tracked);
 
         let best: ChainEntry | undefined;
         for (const entry of tracked.values()) {
@@ -134,24 +133,23 @@ export class PrefixAffinityResolver {
                 storedDepth: best.depth,
                 incomingDepth: hashes.length,
                 tailHash,
-                partition,
             };
         }
 
         // No stored chain is a prefix of the incoming history: this request
         // starts a session, anchored deterministically on its current tail so
         // an identical replay after a proxy restart reattaches the same id.
-        const sessionId = `pfa-${sha256(`${partition}\u0000${tailHash}\u0000${hashes.length}`).slice(0, 16)}`;
-        return { sessionId, matchedDepth: 0, storedDepth: 0, incomingDepth: hashes.length, tailHash, partition };
+        const sessionId = `pfa-${sha256(`${tailHash}\u0000${hashes.length}`).slice(0, 16)}`;
+        return { sessionId, matchedDepth: 0, storedDepth: 0, incomingDepth: hashes.length, tailHash };
     }
 
     /** Record the chain of a session (on creation and after every anonymous
      *  request — the incoming history is the truth, appends extend it). */
-    note(partition: string, sessionId: string, depth: number, tailHash: string): void {
-        const tracked = this.tracked(partition);
+    note(sessionId: string, depth: number, tailHash: string): void {
+        const tracked = this.trackedChains;
         tracked.delete(sessionId);
         tracked.set(sessionId, { sessionId, depth, tailHash, lastSeen: Date.now() });
-        while (tracked.size > MAX_SESSIONS_PER_PARTITION) {
+        while (tracked.size > MAX_TRACKED_SESSIONS) {
             const oldest = [...tracked.values()].sort((a, b) => a.lastSeen - b.lastSeen)[0];
             if (!oldest) break;
             tracked.delete(oldest.sessionId);
@@ -159,24 +157,15 @@ export class PrefixAffinityResolver {
     }
 
     /** Drop tracking for a removed session. */
-    forget(partition: string, sessionId: string): void {
-        this.partitions.get(partition)?.delete(sessionId);
+    forget(sessionId: string): void {
+        this.trackedChains.delete(sessionId);
     }
 
-    trackedSessionIds(partition: string): string[] {
-        return [...this.partitions.get(partition)?.keys() ?? []];
+    trackedSessionIds(): string[] {
+        return [...this.trackedChains.keys()];
     }
 
-    private tracked(partition: string): Map<string, ChainEntry> {
-        let tracked = this.partitions.get(partition);
-        if (!tracked) {
-            tracked = new Map();
-            this.partitions.set(partition, tracked);
-        }
-        return tracked;
-    }
-
-    private expire(partition: string, tracked: Map<string, ChainEntry>): void {
+    private expire(tracked: Map<string, ChainEntry>): void {
         if (tracked.size === 0) return;
         const now = Date.now();
         for (const [id, entry] of tracked) {
