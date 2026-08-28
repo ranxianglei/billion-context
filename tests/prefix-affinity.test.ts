@@ -15,7 +15,7 @@ test("prefix-affinity: append-only continuation resolves to the same session", (
     assert.ok(a);
     assert.equal(a.matchedDepth, 0);
     assert.match(a.sessionId, /^pfa-[0-9a-f]{16}$/);
-    r.note(a.sessionId, a.incomingDepth, a.tailHash);
+    r.note(a.sessionId, a.incomingDepth, a.tailHash, a.itemHashes);
 
     const b = r.resolve([user("hello there friend"), { role: "assistant", content: "hi" }, user("second question")]);
     assert.ok(b);
@@ -27,7 +27,7 @@ test("prefix-affinity: append-only continuation resolves to the same session", (
 test("prefix-affinity: different conversations with distinct roots stay separate", () => {
     const r = new PrefixAffinityResolver();
     const a = r.resolve([user("project one setup question")]);
-    r.note(a!.sessionId, a!.incomingDepth, a!.tailHash);
+    r.note(a!.sessionId, a!.incomingDepth, a!.tailHash, a!.itemHashes);
     const b = r.resolve([user("totally different topic opener")]);
     assert.notEqual(b!.sessionId, a!.sessionId, "different content must not collide");
     assert.equal(b!.matchedDepth, 0);
@@ -37,12 +37,12 @@ test("prefix-affinity: shared opening, divergent continuation forks on the next 
     const r = new PrefixAffinityResolver();
     const shared = [user("same opening message with substance"), { role: "assistant", content: "ok" }];
     const a = r.resolve(shared);
-    r.note(a!.sessionId, a!.incomingDepth, a!.tailHash);
+    r.note(a!.sessionId, a!.incomingDepth, a!.tailHash, a!.itemHashes);
 
     // Branch A extends first — it keeps the session.
     const aNext = r.resolve([...shared, user("branch A continuation")]);
     assert.equal(aNext!.sessionId, a!.sessionId);
-    r.note(aNext!.sessionId, aNext!.incomingDepth, aNext!.tailHash);
+    r.note(aNext!.sessionId, aNext!.incomingDepth, aNext!.tailHash, aNext!.itemHashes);
 
     // Branch B diverges: its history does not extend the stored chain (hash
     // at stored depth differs), so it starts its own session.
@@ -54,7 +54,7 @@ test("prefix-affinity: shared opening, divergent continuation forks on the next 
 test("prefix-affinity: identical replay after restart reattaches the same deterministic id", () => {
     const first = new PrefixAffinityResolver();
     const a = first.resolve([user("persistent conversation anchor")]);
-    first.note(a!.sessionId, a!.incomingDepth, a!.tailHash);
+    first.note(a!.sessionId, a!.incomingDepth, a!.tailHash, a!.itemHashes);
 
     // Fresh process: no in-memory index, same first-turn content.
     const second = new PrefixAffinityResolver();
@@ -66,7 +66,7 @@ test("prefix-affinity: trimmed history no longer matches — safe new session", 
     const r = new PrefixAffinityResolver();
     const full = [user("first message with content"), { role: "assistant", content: "r1" }, user("second message")];
     const a = r.resolve(full);
-    r.note(a!.sessionId, a!.incomingDepth, a!.tailHash);
+    r.note(a!.sessionId, a!.incomingDepth, a!.tailHash, a!.itemHashes);
 
     // Client-side microcompact drops the middle turn: the stored 3-deep chain
     // is NOT a prefix of the trimmed history (it is longer).
@@ -80,7 +80,7 @@ test("prefix-affinity: no environmental partitioning — same content survives c
     const r = new PrefixAffinityResolver();
     const history = [user("same words across rotating credentials")];
     const a = r.resolve(history);
-    r.note(a!.sessionId, a!.incomingDepth, a!.tailHash);
+    r.note(a!.sessionId, a!.incomingDepth, a!.tailHash, a!.itemHashes);
     // #286 lesson: bearer rotation / relay switching / protocol translation
     // happen MID-CONVERSATION. There is no partition surface at all, so the
     // identical replay keeps resolving to the same session.
@@ -106,7 +106,7 @@ test("prefix-affinity: system+user openai shape (shared system must not collide)
     const r = new PrefixAffinityResolver();
     const sys = { role: "system", content: "You are ZCode, a shared IDE system prompt injected into every conversation." };
     const a = r.resolve([sys, user("question about project A")]);
-    r.note(a!.sessionId, a!.incomingDepth, a!.tailHash);
+    r.note(a!.sessionId, a!.incomingDepth, a!.tailHash, a!.itemHashes);
     const b = r.resolve([sys, user("question about project B")]);
     assert.notEqual(b!.sessionId, a!.sessionId, "identical system prefix must not merge distinct conversations");
 });
@@ -115,7 +115,7 @@ test("prefix-affinity: LRU cap bounds tracked sessions", () => {
     const r = new PrefixAffinityResolver();
     for (let i = 0; i < 262; i++) {
         const a = r.resolve([user(`unique conversation number ${i} with filler content`)]);
-        r.note(a!.sessionId, a!.incomingDepth, a!.tailHash);
+        r.note(a!.sessionId, a!.incomingDepth, a!.tailHash, a!.itemHashes);
     }
     assert.equal(r.trackedSessionIds().length, 256);
 });
@@ -130,7 +130,7 @@ test("prefix-affinity: stableStringify sorts keys recursively", () => {
 test("prefix-affinity: key-order differences across replays still match", () => {
     const r = new PrefixAffinityResolver();
     const a = r.resolve([{ role: "user", content: "key order robustness check", meta: { x: 1, y: 2 } }]);
-    r.note(a!.sessionId, a!.incomingDepth, a!.tailHash);
+    r.note(a!.sessionId, a!.incomingDepth, a!.tailHash, a!.itemHashes);
     const b = r.resolve([{ meta: { y: 2, x: 1 }, content: "key order robustness check", role: "user" }]);
     assert.equal(b!.sessionId, a!.sessionId, "same logical message in different key order must match");
 });

@@ -45,6 +45,27 @@ const MAX_TRACKED_SESSIONS = 256;
 /** Chains unused for this long stop matching (sessions may outlive tracking). */
 const TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
+/** Tail-window reattach window (#316 / PR-B): how many of the incoming's
+ *  LEADING items are compared against each stored chain's TRAILING items to
+ *  reattach a truncated replay (a client that drops its oldest messages keeps
+ *  a fixed-size recent window, so the incoming head == the stored tail). */
+const TAIL_WINDOW = 8;
+
+/** Minimum window size (items) for a tail-window reattach to be trusted. A
+ *  1-2 item window is too weak a signal (a single shared message is common);
+ *  below this the request falls through to a new session as before. */
+const MIN_TAIL_MATCH = 3;
+
+/** Per tracked chain, store at most this many per-item hashes (the trailing
+ *  ones). Bounds memory (256 chains × 64 × 64B ≈ 1MB) and keeps the tail
+ *  window (8) comfortably available. Chains deeper than this lose their head,
+ *  so fork-lineage prefix detection is best-effort for very long chains. */
+const MAX_STORED_ITEMS = 64;
+
+/** Minimum shared prefix (items) to record a "forked" lineage on a new
+ *  session. UI/debug only — never used for matching. */
+const MIN_FORK_PREFIX = 3;
+
 export interface AnonymousAffinity {
     /** Stable session id: "pfa-" + short hash of (tail, depth). */
     sessionId: string;
@@ -56,6 +77,16 @@ export interface AnonymousAffinity {
     incomingDepth: number;
     /** Chain hash of the incoming tail (log correlation). */
     tailHash: string;
+    /** How the session was resolved: a full-prefix match, a tail-window
+     *  reattach (truncated replay), or a brand-new session. */
+    via: "prefix" | "tail-window" | "new";
+    /** Per-item hashes of the incoming (trailing, capped at MAX_STORED_ITEMS) —
+     *  passed to note() so the tracked chain can serve future tail-window
+     *  reattach + fork-lineage lookups. */
+    itemHashes: string[];
+    /** Lineage for a NEW session: the discarded match candidates and why they
+     *  were abandoned. Recorded for UI/debug only — NEVER used for matching. */
+    lineage?: { parents: string[]; reason: "truncated" | "forked"; sharedPrefix?: number };
 }
 
 interface ChainEntry {
@@ -63,6 +94,9 @@ interface ChainEntry {
     depth: number;
     tailHash: string;
     lastSeen: number;
+    /** Per-item hashes (position-independent sha256 of each canonical
+     *  message), trailing, capped at MAX_STORED_ITEMS. */
+    itemHashes: string[];
 }
 
 /** Deterministic JSON with recursively sorted object keys, so two replays
@@ -104,6 +138,22 @@ function chainHashes(messages: unknown[]): string[] {
     return bytes >= MIN_CANONICAL_BYTES ? hashes : [];
 }
 
+/** Position-INDEPENDENT per-item hashes: itemHashes[i] = sha256(canonical(msg_i)).
+ *  Unlike the progressive chainHashes (which depend on the full prefix and so
+ *  cannot match across a truncation), these let a window of the incoming head
+ *  be compared against a window of a stored tail item-for-item. */
+function perItemHashes(messages: unknown[]): string[] {
+    return messages.map((m) => sha256(stableStringify(m)));
+}
+
+/** Length of the longest common prefix of two per-item hash arrays. */
+function lcpLength(a: string[], b: string[]): number {
+    const n = Math.min(a.length, b.length);
+    let i = 0;
+    while (i < n && a[i] === b[i]) i++;
+    return i;
+}
+
 export class PrefixAffinityResolver {
     private trackedChains = new Map<string, ChainEntry>();
 
@@ -115,40 +165,103 @@ export class PrefixAffinityResolver {
     resolve(messages: unknown[]): AnonymousAffinity | null {
         const hashes = chainHashes(messages);
         if (hashes.length === 0 || !hasUserMessage(messages)) return null;
-        const tailHash = hashes[hashes.length - 1]!;
+        const incomingDepth = hashes.length;
+        const tailHash = hashes[incomingDepth - 1]!;
+        const incItemHashes = perItemHashes(messages);
+        const storedItemHashes = incItemHashes.slice(-MAX_STORED_ITEMS);
         const tracked = this.trackedChains;
         this.expire(tracked);
 
+        // 1. Full-depth prefix match (the original radix-style resolution).
         let best: ChainEntry | undefined;
         for (const entry of tracked.values()) {
-            if (entry.depth > hashes.length) continue;
+            if (entry.depth > incomingDepth) continue;
             if (hashes[entry.depth - 1] !== entry.tailHash) continue;
             if (!best || entry.depth > best.depth || (entry.depth === best.depth && entry.lastSeen > best.lastSeen)) best = entry;
         }
-
         if (best) {
             return {
                 sessionId: best.sessionId,
                 matchedDepth: best.depth,
                 storedDepth: best.depth,
-                incomingDepth: hashes.length,
+                incomingDepth,
                 tailHash,
+                via: "prefix",
+                itemHashes: storedItemHashes,
             };
         }
 
-        // No stored chain is a prefix of the incoming history: this request
-        // starts a session, anchored deterministically on its current tail so
-        // an identical replay after a proxy restart reattaches the same id.
-        const sessionId = `pfa-${sha256(`${tailHash}\u0000${hashes.length}`).slice(0, 16)}`;
-        return { sessionId, matchedDepth: 0, storedDepth: 0, incomingDepth: hashes.length, tailHash };
+        // 2. Tail-window reattach (#316 / PR-B): a client that dropped its
+        //    oldest messages replays a fixed recent window, so the incoming
+        //    HEAD aligns with a stored chain's TAIL. Compare the incoming's
+        //    leading items against each stored chain's trailing items.
+        const candidates: ChainEntry[] = [];
+        for (const entry of tracked.values()) {
+            const w = Math.min(TAIL_WINDOW, incomingDepth, entry.depth);
+            if (w < MIN_TAIL_MATCH) continue;
+            const tailBase = entry.itemHashes.length - w;
+            if (tailBase < 0) continue;
+            let match = true;
+            for (let i = 0; i < w; i++) {
+                if (incItemHashes[i] !== entry.itemHashes[tailBase + i]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) candidates.push(entry);
+        }
+        if (candidates.length === 1) {
+            const entry = candidates[0]!;
+            const w = Math.min(TAIL_WINDOW, incomingDepth, entry.depth);
+            return {
+                sessionId: entry.sessionId,
+                matchedDepth: w,
+                storedDepth: entry.depth,
+                incomingDepth,
+                tailHash,
+                via: "tail-window",
+                itemHashes: storedItemHashes,
+            };
+        }
+
+        // 3. New session, anchored deterministically on its current tail so an
+        //    identical replay after a proxy restart reattaches the same id.
+        //    Record lineage (UI/debug only) for the discarded candidates.
+        let lineage: AnonymousAffinity["lineage"];
+        if (candidates.length > 1) {
+            lineage = { parents: candidates.map((c) => c.sessionId), reason: "truncated" };
+        } else {
+            let forkParent: ChainEntry | undefined;
+            let forkLcp = 0;
+            for (const entry of tracked.values()) {
+                if (entry.depth > MAX_STORED_ITEMS) continue;
+                const lcp = lcpLength(incItemHashes, entry.itemHashes);
+                if (lcp >= MIN_FORK_PREFIX && lcp > forkLcp) {
+                    forkLcp = lcp;
+                    forkParent = entry;
+                }
+            }
+            if (forkParent) lineage = { parents: [forkParent.sessionId], reason: "forked", sharedPrefix: forkLcp };
+        }
+        const sessionId = `pfa-${sha256(`${tailHash}\u0000${incomingDepth}`).slice(0, 16)}`;
+        return {
+            sessionId,
+            matchedDepth: 0,
+            storedDepth: 0,
+            incomingDepth,
+            tailHash,
+            via: "new",
+            itemHashes: storedItemHashes,
+            ...(lineage ? { lineage } : {}),
+        };
     }
 
     /** Record the chain of a session (on creation and after every anonymous
      *  request — the incoming history is the truth, appends extend it). */
-    note(sessionId: string, depth: number, tailHash: string): void {
+    note(sessionId: string, depth: number, tailHash: string, itemHashes: string[]): void {
         const tracked = this.trackedChains;
         tracked.delete(sessionId);
-        tracked.set(sessionId, { sessionId, depth, tailHash, lastSeen: Date.now() });
+        tracked.set(sessionId, { sessionId, depth, tailHash, itemHashes, lastSeen: Date.now() });
         while (tracked.size > MAX_TRACKED_SESSIONS) {
             const oldest = [...tracked.values()].sort((a, b) => a.lastSeen - b.lastSeen)[0];
             if (!oldest) break;
