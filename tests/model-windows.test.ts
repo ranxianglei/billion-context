@@ -11,7 +11,7 @@ import {
     collectModelWindows,
     type ClientConfig,
 } from "../src/client-config.ts";
-import { parseLauncherModelWindows } from "../src/server.ts";
+import { parseLauncherModelWindows, anthropicBetaContextWindow } from "../src/server.ts";
 
 test("parseOmpYaml: captures per-model contextWindow (models after baseUrl)", () => {
     const yml = [
@@ -146,4 +146,47 @@ test("parseLauncherModelWindows: valid JSON, invalid input, non-numeric filtered
     assert.deepEqual(parseLauncherModelWindows("not json"), {});
     assert.deepEqual(parseLauncherModelWindows('["array"]'), {});
     assert.deepEqual(parseLauncherModelWindows('{"bad": "str", "neg": -5, "zero": 0}'), {});
+});
+
+// #302: an `anthropic-beta: context-1m-…` header means the client negotiated a
+// 1M window with the upstream — the model table's 200K default must be
+// overridden. The parser is per-request (the header may appear/disappear
+// between requests of the same session).
+
+test("anthropicBetaContextWindow: context-1m beta → 1,000,000", () => {
+    assert.equal(anthropicBetaContextWindow({ "anthropic-beta": "context-1m-2025-08-07" }), 1_000_000);
+});
+
+test("anthropicBetaContextWindow: no header / no context beta → undefined (model default)", () => {
+    assert.equal(anthropicBetaContextWindow({}), undefined);
+    assert.equal(anthropicBetaContextWindow({ "anthropic-beta": "prompt-caching-2024-07-31, interleaved-thinking-2025-05-14" }), undefined);
+    assert.equal(anthropicBetaContextWindow({ "anthropic-beta": "" }), undefined);
+});
+
+test("anthropicBetaContextWindow: mixed beta list picks the context beta", () => {
+    assert.equal(
+        anthropicBetaContextWindow({ "anthropic-beta": "prompt-caching-2024-07-31, context-1m-2025-08-07, fine-grained-tool-streaming-2025-05-14" }),
+        1_000_000,
+    );
+});
+
+test("anthropicBetaContextWindow: array header value is joined", () => {
+    assert.equal(anthropicBetaContextWindow({ "anthropic-beta": ["context-1m-2025-08-07"] }), 1_000_000);
+    assert.equal(anthropicBetaContextWindow({ "anthropic-beta": ["prompt-caching-2024-07-31", "context-1m-2025-08-07"] }), 1_000_000);
+});
+
+test("anthropicBetaContextWindow: case-insensitive + surrounding whitespace", () => {
+    assert.equal(anthropicBetaContextWindow({ "anthropic-beta": "  Context-1M-2025-08-07  " }), 1_000_000);
+});
+
+test("anthropicBetaContextWindow: future larger-context beta generalizes (context-Nm → N×1M)", () => {
+    assert.equal(anthropicBetaContextWindow({ "anthropic-beta": "context-2m-2026-01-01" }), 2_000_000);
+    // Largest wins when several context betas are present.
+    assert.equal(anthropicBetaContextWindow({ "anthropic-beta": "context-1m-2025-08-07, context-2m-2026-01-01" }), 2_000_000);
+});
+
+test("anthropicBetaContextWindow: rejects malformed / non-context tokens", () => {
+    assert.equal(anthropicBetaContextWindow({ "anthropic-beta": "context-m-2025-08-07" }), undefined);
+    assert.equal(anthropicBetaContextWindow({ "anthropic-beta": "context-1x-2025-08-07" }), undefined);
+    assert.equal(anthropicBetaContextWindow({ "anthropic-beta": "my-context-1m-2025-08-07" }), undefined);
 });

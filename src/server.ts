@@ -111,6 +111,31 @@ function launcherContextWindow(model: string): number | undefined {
     return LAUNCHER_MODEL_WINDOWS[model];
 }
 
+/** Parse an `anthropic-beta` header for a larger-context beta (e.g.
+ *  `context-1m-2025-08-07` → 1,000,000). The beta lets the CLIENT negotiate a
+ *  window beyond the model's standard size, so it is the most direct per-request
+ *  evidence of the window the upstream will actually serve — it outranks the
+ *  model table / registry (which list the STANDARD window, e.g. 200K for claude)
+ *  and must be re-read on every request (the header may appear/disappear between
+ *  requests of the same session, #302). `context-Nm` generalizes to future
+ *  larger-context betas (N × 1,000,000). Returns the largest requested window,
+ *  or undefined when no context beta is present. */
+export function anthropicBetaContextWindow(headers: Record<string, string | string[] | undefined>): number | undefined {
+    const raw = headers["anthropic-beta"];
+    if (raw === undefined) return undefined;
+    const list = Array.isArray(raw) ? raw.join(",") : raw;
+    let best: number | undefined;
+    for (const part of list.split(",")) {
+        const m = /^context-(\d+)m\b/.exec(part.trim().toLowerCase());
+        if (!m) continue;
+        const n = Number.parseInt(m[1], 10);
+        if (!Number.isFinite(n) || n <= 0) continue;
+        const w = n * 1_000_000;
+        if (best === undefined || w > best) best = w;
+    }
+    return best;
+}
+
 /** Session ids are client-provided verbatim (#286) — sanitize before using
  *  one in a debug-dump FILENAME so a hostile value cannot escape the dir. */
 function safeSessionId(id: string | undefined): string {
@@ -732,9 +757,13 @@ async function handle(
         const model = (parsed as { model?: string }).model;
         if (model) {
             const embeddedUrl = route?.rewrittenUrl;
-            // Native-window resolution order: (1) a cooperative plugin's
-            // report (the agent's own config — most authoritative, gated on
-            // the x-bili-plugin marker so a plain client cannot rewrite the
+            // Native-window resolution order: (0) the client's `anthropic-beta`
+            // larger-context negotiation (context-1m-… → 1,000,000) — the most
+            // direct per-request evidence of the window the upstream will serve,
+            // so it outranks every static source (the model table / registry
+            // list the STANDARD window, e.g. 200K for claude); (1) a cooperative
+            // plugin's report (the agent's own config — most authoritative, gated
+            // on the x-bili-plugin marker so a plain client cannot rewrite the
             // nudge denominator by name); (1b) the launcher's per-model
             // windows (BILI_LAUNCHER_MODEL_WINDOWS — the client's own
             // models.json/models.yml contextWindow, authoritative for this
@@ -747,20 +776,24 @@ async function handle(
             // fallback. Operator tuning via compress.modelContextLimit still
             // outranks everything inside resolveRequestConfig.
             const host = (() => { try { return embeddedUrl ? new URL(embeddedUrl).host : undefined; } catch { return undefined; } })();
+            const betaWindow = anthropicBetaContextWindow(req.headers);
             const pluginWindow = pluginReportedContextWindow(req.headers);
             const launcherWindow = launcherContextWindow(model);
             const peekWindow = host ? peekRegistryContext(model, host) : undefined;
             const configuredWindow = resolveConfiguredContextLimit(opts.routes, embeddedUrl, model);
-            let native = pluginWindow
+            let native = betaWindow
+                ?? pluginWindow
                 ?? launcherWindow
                 ?? peekWindow
                 ?? configuredWindow
                 ?? lookupContextLimit(model);
             // Fallback = no authoritative source AND the operator did not
             // explicitly tune the window via compress.modelContextLimit (an
-            // explicit tuning is owned by the operator — never floored).
+            // explicit tuning is owned by the operator — never floored). The
+            // beta window is authoritative (the client's own runtime
+            // negotiation), so it also clears the fallback flag.
             const operatorWindowTuned = resolveCompress(opts.routes, embeddedUrl, model, opts.compress).modelContextLimit !== undefined;
-            nativeFromFallback = !pluginWindow && !launcherWindow && !peekWindow && !configuredWindow && !operatorWindowTuned;
+            nativeFromFallback = !betaWindow && !pluginWindow && !launcherWindow && !peekWindow && !configuredWindow && !operatorWindowTuned;
             if (!native && host) {
                 native = await contextFromRegistry(model, host);
                 if (native) nativeFromFallback = false;
