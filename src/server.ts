@@ -53,6 +53,7 @@ import { defaultLogFile, stateDir, proxyOriginFile } from "./paths.js";
 import { compressLoopResponsesJson } from "./compress-loop-responses.js";
 import { runCompressLoop, pickAdapter } from "./loop/index.js";
 import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeResponsesMessageItems } from "./loop/adapter-responses.js";
+import { codexCompactMode, isCodexClient, hasCompactionTrigger, stripBiliCompactionItems, codexCompactGate, buildTriggerForgeSse } from "./codex-compact.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { emitStreamError } from "./stream-error.js";
@@ -444,11 +445,15 @@ type Prepared = {
      *  rebuilt payload and compress-loop round must re-inject it. */
     openaiSystemText?: string;
     nudge?: NudgeDecision;
-    /** Effective compression prompts for this request (three-level cascade,
-     *  defaults to the kernel's defaultPrompts). Carried so the compress loop
-     *  in forward() rebuilds the SAME system prompt the request was prepared
-     *  with. */
+     /** Effective compression prompts for this request (three-level cascade,
+      *  defaults to the kernel's defaultPrompts). Carried so the compress loop
+      *  in forward() rebuilds the SAME system prompt the request was prepared
+      *  with. */
     prompts?: Prompts;
+    /** Set when a codex native-compaction request was intercepted and a
+     *  success response was forged locally (BILI_CODEX_COMPACT=intercept +
+     *  gate passed). forward() serves `body` without contacting upstream. */
+    codexForge?: { kind: "endpoint" | "trigger"; body: string; contentType: string };
 };
 
 
@@ -1047,7 +1052,7 @@ async function handle(
                           : protocol === "openai"
                             ? prepareOpenai(parsed as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, pluginMode)
                             : responsesCompact
-                              ? prepareResponsesCompact(bodyBuffer, parsed as ResponsesRequestBody, session)
+                               ? prepareResponsesCompact(bodyBuffer, parsed as ResponsesRequestBody, session, req, core, reqConfig, log)
                               : prepareResponses(parsed as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, responsesIdentity!, pluginMode, upstreamOrigin);
                 prepared = runPrepare();
                 if (!countTokens && !responsesCompact) {
@@ -1375,12 +1380,24 @@ function prepareResponses(
         log("info", `[${sessionId}] reconciled ACP state after native Responses compact boundary`);
     }
 
+    // A codex client echoes our forged compaction item back in the next request;
+    // drop it so the summary is sourced from state (no double-count). Real
+    // OpenAI blobs carry no bili marker and pass through untouched.
+    if (Array.isArray(parsed.input)) {
+        const cleaned = stripBiliCompactionItems(parsed.input);
+        if (cleaned.length !== parsed.input.length) {
+            log("info", `[${sessionId}] stripped ${parsed.input.length - cleaned.length} bili compaction item(s) echoed by codex`);
+            parsed.input = cleaned;
+        }
+    }
+
     let processedMessages: CoreMessage[] = [];
     let originalMessages: CoreMessage[] = [];
     let nudge: NudgeDecision | undefined;
     let responsesProjection: ResponsesProjection | undefined;
     let rebuiltInput: ResponseInputItem[] | string = parsed.input;
     let toolsOut = parsed.tools;
+    let transformOk = false;
 
     // #242: over-long input item ids (poisoned rollouts) 400 upstream on every
     // request; rewrite them to short deterministic ids before anything reads
@@ -1469,9 +1486,31 @@ function prepareResponses(
             } catch {
             }
         }
+        transformOk = true;
     } catch (err) {
         log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
         processedMessages = [];
+    }
+
+    // E2 trigger form: codex's native remote-compaction request (final input item
+    // is compaction_trigger). When the kill-switch is on, the client is codex, and
+    // the safety gate passes, forge a success SSE (one compaction item +
+    // response.completed) and skip upstream — a deterministic handoff to the ACP
+    // state instead of a foreign compaction blob.
+    let codexForge: Prepared["codexForge"] | undefined;
+    if (transformOk
+        && codexCompactMode() === "intercept"
+        && isCodexClient(req.headers)
+        && hasCompactionTrigger(parsed.input)
+        && codexCompactGate(session, config.modelContextLimit, transformOk)) {
+        const summaries = session.state.blocks.filter((b) => b.active).map((b) => b.summary);
+        const total = session.stats.lastInputTokens;
+        codexForge = {
+            kind: "trigger",
+            body: buildTriggerForgeSse(summaries.join("\n\n"), { inputTokens: total, outputTokens: 0, totalTokens: total }),
+            contentType: "text/event-stream",
+        };
+        log("info", `[${sessionId}] codex compact intercepted (trigger); forged SSE with ${summaries.length} block summary(s), upstream not contacted`);
     }
 
     const rebuilt: ResponsesRequestBody = { ...parsed, input: rebuiltInput, tools: toolsOut };
@@ -1527,6 +1566,7 @@ function prepareResponses(
         responsesTextProtocol,
         nudge,
         prompts,
+        codexForge,
     };
 }
 
@@ -1576,9 +1616,17 @@ export function prepareCountTokens(
     }
 }
 
-function prepareResponsesCompact(body: Buffer, parsed: ResponsesRequestBody, session: Session): Prepared {
+function prepareResponsesCompact(
+    body: Buffer,
+    parsed: ResponsesRequestBody,
+    session: Session,
+    req: http.IncomingMessage,
+    core: CompressionCore,
+    config: Config,
+    log: (level: string, msg: string) => void,
+): Prepared {
     ++session.stats.requests;
-    return {
+    const base: Prepared = {
         body,
         session,
         processedMessages: [],
@@ -1588,6 +1636,33 @@ function prepareResponsesCompact(body: Buffer, parsed: ResponsesRequestBody, ses
         compressInjected: false,
         resetAfterSuccess: true,
     };
+    if (codexCompactMode() !== "intercept" || !isCodexClient(req.headers) || !Array.isArray(parsed.input)) {
+        return base;
+    }
+    // E2 endpoint form: /responses/compact. When the gate passes, run the same
+    // fold pipeline as a normal turn and forge the compacted history as
+    // {"output": [...]} — a deterministic handoff to the ACP state instead of a
+    // foreign compaction blob.
+    const cleaned = stripBiliCompactionItems(parsed.input);
+    const forgeBody: ResponsesRequestBody = { ...parsed, input: cleaned };
+    let transformOk = false;
+    try {
+        const projection = responsesToCore(forgeBody);
+        const turn = core.processTurn({ messages: projection.msgs, state: session.state, config, tokenCount: session.stats.lastInputTokens, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" });
+        session.state = turn.state;
+        transformOk = true;
+        if (!codexCompactGate(session, config.modelContextLimit, transformOk)) return base;
+        const processed = stripKernelSummaries(turn.messages, turn.state);
+        const output = patchResponsesInput(projection, processed);
+        if (typeof output === "string") return base;
+        snapshotMessages(session, projection.msgs);
+        markDirty(session);
+        log("info", `[${session.id}] codex compact intercepted (endpoint); forged history with ${output.length} item(s), upstream not contacted`);
+        return { ...base, codexForge: { kind: "endpoint", body: JSON.stringify({ output }), contentType: "application/json" } };
+    } catch (err) {
+        log("warn", `[${session.id}] codex compact forge failed (${String(err)}); passing through to upstream`);
+        return base;
+    }
 }
 
 export function isChatGptCodexUpstream(upstream: string | undefined): boolean {
@@ -1867,6 +1942,14 @@ async function forward(
     instanceId: string,
     affinity?: string,
 ): Promise<void> {
+    // E2: a codex native-compaction request intercepted in prepare() carries a
+    // forged success response — serve it without contacting upstream.
+    if (prepared?.codexForge) {
+        log("info", `[${prepared.session.id}] codex compact served locally (${prepared.codexForge.kind}); upstream not contacted`);
+        res.writeHead(200, { "content-type": prepared.codexForge.contentType });
+        res.end(prepared.codexForge.body);
+        return;
+    }
     // #300: stamp the chain marker ONLY when this instance actually processed
     // the request (prepared !== null). A passthrough forward (prepared === null)
     // must NOT claim processing — otherwise a downstream processing bili would
