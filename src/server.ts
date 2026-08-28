@@ -56,6 +56,7 @@ import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { emitStreamError } from "./stream-error.js";
 import { affinityToken, clientConversationHeader, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
+import { affinityPartition, prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { consumePluginRegisterFor, flushConversations, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, loadConversations, pipePluginJson, pipePluginResponsesWithStrip, pipeThroughWithUsage, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
@@ -106,13 +107,12 @@ function safeSessionId(id: string | undefined): string {
     return (id ?? "unknown").replace(/[^a-zA-Z0-9._-]/g, "_");
 }
 
-/** 400 body for requests carrying no client-provided conversation identity.
- *  Content-fingerprint sessions are disabled (#286): the fingerprint has a
- *  real collision surface and a silent session would orphan state the moment
- *  the account or relay changes, so anonymous requests fail explicitly. */
+/** 400 body for requests carrying no client-provided conversation identity
+ *  AND no usable replayed history. Anonymous requests with a real message
+ *  history are resolved by prefix affinity (#309); only degenerate probes
+ *  (empty / system-only, or a fingerprint-sized history) fail explicitly. */
 const NO_IDENTITY_MESSAGE =
-    "Missing stable conversation identity. Send one of the headers: x-session-id, x-session-affinity, x-acp-session, x-opencode-session, x-claude-code-session-id, session-id — or body session_id / prompt_cache_key (responses/openai). " +
-    "Content-fingerprint sessions are disabled (#286).";
+    "Missing stable conversation identity. Send one of the headers: x-session-id, x-session-affinity, x-acp-session, x-opencode-session, x-claude-code-session-id, session-id — or body session_id / prompt_cache_key (responses/openai). Requests replaying a conversation history are matched by content prefix affinity (#309); this one carries no usable history signal.";
 
 const UPSTREAM_HOP_HEADERS = new Set([
     "host",
@@ -813,15 +813,36 @@ async function handle(
             : protocol === "openai"
               ? (openaiIdentity?.clientProvided ?? false)
               : !!convHeader;
+        // Anonymous fallback (#309): clients with no identity signal at all
+        // (no headers, no session_id/prompt_cache_key) still replay their full
+        // history — resolve them by longest-prefix affinity instead of the
+        // #286 hard 400. Requests with no usable conversation signal (empty /
+        // system-only) keep the explicit 400.
+        let anonAffinity: AnonymousAffinity | null = null;
         if (!clientProvided) {
-            log("warn", `400: no stable conversation identity on ${protocol} request → ${upstreamOrigin}; refusing to create a content-fingerprint session (#286)`);
-            res.writeHead(400, { "content-type": "application/json" });
-            res.end(JSON.stringify(protocol === "anthropic"
-                ? { type: "error", error: { type: "invalid_request_error", message: NO_IDENTITY_MESSAGE } }
-                : { error: { type: "invalid_request_error", message: NO_IDENTITY_MESSAGE } }));
-            return;
+            const authValue = headerValue(req, "authorization") ?? headerValue(req, "x-api-key") ?? "";
+            const anonMessages = protocol === "responses"
+                ? (parsed as { input?: unknown }).input ?? []
+                : (parsed as { messages?: unknown }).messages ?? [];
+            const partition = affinityPartition(protocol, upstreamOrigin, authValue);
+            anonAffinity = prefixAffinity.resolve(partition, Array.isArray(anonMessages) ? anonMessages : []);
+            if (!anonAffinity) {
+                log("warn", `400: no stable conversation identity on ${protocol} request → ${upstreamOrigin}; refusing to create a content-fingerprint session (#286)`);
+                res.writeHead(400, { "content-type": "application/json" });
+                res.end(JSON.stringify(protocol === "anthropic"
+                    ? { type: "error", error: { type: "invalid_request_error", message: NO_IDENTITY_MESSAGE } }
+                    : { error: { type: "invalid_request_error", message: NO_IDENTITY_MESSAGE } }));
+                return;
+            }
+            if (anonAffinity.matchedDepth > 0) {
+                log("info", `[prefix-affinity] anonymous ${protocol} request → session ${anonAffinity.sessionId} (prefix match depth=${anonAffinity.matchedDepth}/${anonAffinity.incomingDepth}, partition=${anonAffinity.partition.slice(0, 8)}, tail=${anonAffinity.tailHash.slice(0, 8)}; fork semantics: diverged histories split on their next request)`);
+                loggerLog("info", `[prefix-affinity] session ${anonAffinity.sessionId} matched at depth ${anonAffinity.matchedDepth}/${anonAffinity.incomingDepth} (partition=${anonAffinity.partition.slice(0, 8)}, tail=${anonAffinity.tailHash.slice(0, 8)})`);
+            } else {
+                log("info", `[prefix-affinity] new anonymous session ${anonAffinity.sessionId} (depth=${anonAffinity.incomingDepth}, partition=${anonAffinity.partition.slice(0, 8)}, tail=${anonAffinity.tailHash.slice(0, 8)})`);
+                loggerLog("info", `[prefix-affinity] new session ${anonAffinity.sessionId} at depth ${anonAffinity.incomingDepth} (partition=${anonAffinity.partition.slice(0, 8)}, tail=${anonAffinity.tailHash.slice(0, 8)})`);
+            }
         }
-        const sessionId = conversation;
+        const sessionId = anonAffinity ? anonAffinity.sessionId : conversation;
         // Two separate uses of the conversation signal:
         //  - `affinity`: header value forwarded upstream for sticky-routing /
         //    cache pools. Synthesized as ses_<conversation> when the client
@@ -840,13 +861,21 @@ async function handle(
         const clientLabel = bodyIdentity?.clientProvided
             ? bodyIdentity.value
             : clientConversationHeader(req.headers);
-        const session = getSession(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? undefined });
+        const session = getSession(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? (anonAffinity ? "prefix-affinity" : undefined) });
+        if (anonAffinity) {
+            prefixAffinity.note(anonAffinity.partition, sessionId, anonAffinity.incomingDepth, anonAffinity.tailHash);
+            session.metadata.anonymousPrefixAffinity = {
+                partition: anonAffinity.partition,
+                depth: anonAffinity.incomingDepth,
+                tailHash: anonAffinity.tailHash,
+            };
+        }
         // Launcher-mode binding (#162): prefer identity — claude code sends
         // x-claude-code-session-id on every request, equal to the
         // CLAUDE_CODE_SESSION_ID the MCP shell registered, so binding is
         // race-free. Fall back to the headless pending queue (codex spawn)
         // for the first request that creates a new session.
-        if (!pluginAgent) {
+        if (!pluginAgent && !anonAffinity) {
             const identityAgent = consumePluginRegisterFor(clientConv ?? conversation);
             if (identityAgent) {
                 pluginAgent = identityAgent;
