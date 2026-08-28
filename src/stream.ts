@@ -4,6 +4,7 @@ import { COMPRESS_TOOL_NAME, parseCompressInput, PROXY_TOOL_NAMES } from "./comp
 import { resolveDecompress } from "./decompress-shared.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
 import { containsRenderTagText, stripAcpTags } from "./loop/tag-echo-filter.js";
+import { maxShrinkPerCompress } from "./fetch-util.js";
 
 export type RewriteCtx = {
     core: CompressionCore;
@@ -218,6 +219,12 @@ function executeAnthropicProxyTool(toolName: string, args: Record<string, unknow
     return `[Unknown proxy tool: ${toolName}]`;
 }
 
+/** Numeric part of a ref ("m00042" → 42, "b3" → 3); 0 for non-numeric. Used to
+ *  order ranges by position when picking the fold point (#189 observability). */
+function refNum(ref: string): number {
+    return Number(ref.replace(/\D/g, "")) || 0;
+}
+
 export function applyRanges(ranges: ReturnType<typeof parseCompressInput>, ctx: RewriteCtx): string {
     if (ranges.length === 0) {
         ctx.log("[acp-proxy: compress call had no valid ranges; nothing compressed.]");
@@ -264,8 +271,26 @@ export function applyRanges(ranges: ReturnType<typeof parseCompressInput>, ctx: 
             return `[Compression FAILED: ${errs}]`;
         }
 
+        // #189 observability: record the rewrite magnitude + fold point so a
+        // downstream transient rejection (GLM 3007) can be correlated with it.
+        // preContext is read BEFORE the credit netting below (lastInputTokens
+        // still holds the pre-compress context at this point).
+        const preContext = ctx.session.stats.lastInputTokens;
+        const shrinkRatio = preContext > 0 ? r.tokensCompressed / preContext : 0;
+        const foldPoint = [...ranges].sort((a, b) => refNum(a.startRef) - refNum(b.startRef))[0]?.startRef ?? "unknown";
+        ctx.session.lastCompress = { at: Date.now(), shrinkRatio, foldPoint, blocks: r.blocksCreated, tokensCompressed: r.tokensCompressed };
+        ctx.log(`[acp-compress-obs] shrink ${Math.round(shrinkRatio * 100)}% (~${r.tokensCompressed}/${preContext} tok) foldPoint=${foldPoint} blocks=${r.blocksCreated}`);
+
         const warn = r.warnings.length > 0 ? ` ${r.warnings.join("; ")}` : "";
-        const msg = `[Compressed ${detail} → ${r.blocksCreated} block(s), ~${r.tokensCompressed} tokens saved.${warn}]`;
+        let msg = `[Compressed ${detail} → ${r.blocksCreated} block(s), ~${r.tokensCompressed} tokens saved.${warn}]`;
+        // #189 staged compression (gated): a rewrite above the configured max
+        // shrink is the shape that trips provider risk-control; steer the model
+        // toward smaller, tail-biased ranges so the prefix (m00001..foldPoint)
+        // survives for prefix caching and each round's transition stays gentle.
+        const maxShrink = maxShrinkPerCompress();
+        if (maxShrink !== undefined && shrinkRatio > maxShrink) {
+            msg += ` [Staged-compress: this rewrite shrank context ${Math.round(shrinkRatio * 100)}%, above your ${Math.round(maxShrink * 100)}% per-compress target — the shape that trips provider risk-control (3007). Next time compress a SMALLER, TAIL-biased range (the most recent large content) and keep the stable prefix intact.]`;
+        }
         ctx.log(`[acp-proxy: ${msg}]`);
         // The fold materializes only at the NEXT request's processTurn; the
         // post-compress re-request re-sends the unfolded history (prefix-cache

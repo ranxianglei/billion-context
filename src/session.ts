@@ -6,6 +6,26 @@ export type BlockContent = {
     full: { text: string; count: number };
 };
 
+/** One successful compress, recorded for #189 observability: correlating a
+ *  downstream transient upstream rejection (e.g. GLM 3007 captcha) with the
+ *  context rewrite that preceded it. `shrinkRatio` is the fraction of the
+ *  pre-compress context removed by this compress; `foldPoint` is the start ref
+ *  of the earliest folded range (where the prefix structure rewrites). */
+export type LastCompressInfo = {
+    at: number;
+    shrinkRatio: number;
+    foldPoint: string;
+    blocks: number;
+    tokensCompressed: number;
+};
+
+/** Compact suffix for retry/error logs: the rewrite that may have triggered a
+ *  transient upstream rejection. Empty when no compress has been recorded. */
+export function lastCompressSuffix(info: LastCompressInfo | undefined): string {
+    if (!info) return "";
+    return ` [after compress: shrink ${Math.round(info.shrinkRatio * 100)}% foldPoint=${info.foldPoint} blocks=${info.blocks} ~${info.tokensCompressed}tok]`;
+}
+
 export type Session = {
     id: string;
     /** Identity / descriptive metadata. Populated on first request. */
@@ -92,6 +112,11 @@ export type Session = {
      *  drop a never-persisted session on flush failure (that would be a
      *  permanent loss). */
     persisted: boolean;
+    /** In-memory only (NOT persisted — buildRecord omits it): the most recent
+     *  successful compress, set by applyRanges and read by the replay/preflight
+     *  retry callbacks to correlate a transient upstream rejection with the
+     *  rewrite that preceded it (#189). A fresh process has none. */
+    lastCompress?: LastCompressInfo;
     /** Promise chain for per-session serialization. Two concurrent requests
      *  sharing a session id would interleave processTurn / stream-rewriter
      *  mutations on session.state, corrupting it. withSessionLock chains each

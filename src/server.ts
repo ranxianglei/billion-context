@@ -41,7 +41,7 @@ import {
     subagentNamespace,
 } from "acp-kernel/wire";
 import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages } from "./session.js";
-import { COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressHybridSystemPrompt } from "./compress-tool.js";
+import { COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withStagedCompressGuidance } from "./compress-tool.js";
 import { rewriteSseStream, rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
 import { preflightCompress, estimateCoreMessages } from "./preflight.js";
@@ -1224,7 +1224,7 @@ function prepareAnthropic(
             try {
                 const rendered = renderNudgeText(turn.nudge, prompts);
                 if (rendered.text) {
-                    rebuiltMessages = [...rebuiltMessages, { role: "user", content: rendered.text }];
+                    rebuiltMessages = [...rebuiltMessages, { role: "user", content: withStagedCompressGuidance(rendered.text) }];
                 }
             } catch {
             }
@@ -1322,7 +1322,7 @@ function prepareOpenai(
             try {
                 const rendered = renderNudgeText(turn.nudge, prompts);
                 if (rendered.text) {
-                    rebuiltMessages = [...rebuiltMessages, { role: "user", content: rendered.text }];
+                    rebuiltMessages = [...rebuiltMessages, { role: "user", content: withStagedCompressGuidance(rendered.text) }];
                 }
             } catch {
             }
@@ -1463,7 +1463,7 @@ function prepareResponses(
                     const inputItems: ResponseInputItem[] = typeof rebuiltInput === "string"
                         ? [{ type: "message", role: "user", content: rebuiltInput }]
                         : rebuiltInput;
-                    inputItems.push({ type: "message", role: "user", content: rendered.text });
+                    inputItems.push({ type: "message", role: "user", content: withStagedCompressGuidance(rendered.text) });
                     rebuiltInput = inputItems;
                 }
             } catch {
