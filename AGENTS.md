@@ -170,6 +170,21 @@ non-interactive — it either serves the token or fails, so if `git push`
 worked, the token extraction works. Never print the token; keep it in the
 variable only. Merging the PR stays human-only (see above).
 
+### Issue Work — Required Deliverables
+
+When an Agent picks up an issue, these deliverables are MANDATORY:
+
+1. **Finished development → PR.** When the development for an issue is
+   complete, open a PR (recipe above). An issue is NEVER "done" without a PR —
+   always reply in the issue thread with the PR link.
+2. **Major problems / big bugs found while working → report + open an issue.**
+   Significant defects (broken functionality, data-loss risk, security issues,
+   architectural problems) must be (a) reported in the current issue thread AND
+   (b) filed as a separate new issue with repro, impact, and a suggested fix.
+3. **Minor problems → report only.** Small issues (typos, cosmetic defects,
+   minor UX quirks) are reported in the current issue thread only — do NOT
+   open separate issues for them.
+
 ### npm Publish — Absolute Prohibition
 
 `npm publish` is **handled by CI automatically** (see §5). The Agent MUST
