@@ -4,6 +4,7 @@ import { dirname } from "node:path";
 import { configFile } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { validateHttpProxy, type ProxyFallbackOptions } from "./upstream-proxy.js";
+import { peekRegistryContext } from "./registry.js";
 
 export function safeReadJson(path: string): unknown {
     try {
@@ -141,6 +142,35 @@ export function lookupContextLimit(model: string | undefined): number | undefine
     for (const entry of CONTEXT_LIMIT_TABLE) {
         if (entry.match.test(model)) return entry.limit;
     }
+    return undefined;
+}
+
+export type StaticWindowSource = "launcher" | "registry" | "config" | "table";
+
+/** Static (sync, never-fetch) resolution of bili's effective context window
+ *  for a model — the exact source chain and order the request pipeline walks
+ *  before its async registry upgrade: launcher-declared window → warm
+ *  models.dev cache → per-route config → built-in table. Shared by the server
+ *  (per request) and the `bili codex` launcher (spawn-time budget
+ *  coordination, #320) so both read one source of truth. */
+export function resolveStaticWindow(
+    model: string | undefined,
+    host: string | undefined,
+    routes: ProviderRoutes,
+    upstreamUrl: string | undefined,
+    launcherWindows: Record<string, number> | undefined,
+): { window: number; source: StaticWindowSource } | undefined {
+    if (!model) return undefined;
+    const launcher = launcherWindows?.[model];
+    if (typeof launcher === "number" && launcher > 0) {
+        return { window: launcher, source: "launcher" };
+    }
+    const peeked = peekRegistryContext(model, host);
+    if (peeked !== undefined) return { window: peeked, source: "registry" };
+    const configured = resolveConfiguredContextLimit(routes, upstreamUrl, model);
+    if (configured !== undefined) return { window: configured, source: "config" };
+    const table = lookupContextLimit(model);
+    if (table !== undefined) return { window: table, source: "table" };
     return undefined;
 }
 

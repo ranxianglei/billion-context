@@ -28,6 +28,8 @@ export interface CodexProvider {
 export interface CodexConfig {
     modelProvider?: string;
     openaiBaseUrl?: string;
+    /** Top-level `model` — the model codex will run (default model). */
+    model?: string;
     /** Top-level `model` + `model_context_window` override pair (if set). */
     modelWindows?: ModelWindow[];
     providers: Record<string, CodexProvider>;
@@ -220,7 +222,7 @@ export function parseCodexToml(text: string): CodexConfig {
             if (table === "") {
                 if (key === "model_provider") result.modelProvider = val;
                 else if (key === "openai_base_url") result.openaiBaseUrl = val;
-                else if (key === "model") codexModel = val;
+                else if (key === "model") { codexModel = val; result.model = val; }
             } else if (curProvider && key === "base_url") {
                 result.providers[curProvider].baseUrl = val;
             }

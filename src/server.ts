@@ -6,8 +6,9 @@ import { resolveCompress, resolveCompressPrompts, resolveRequestConfig } from ".
 import type { ProxyOptions } from "./config.js";
 import { loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
-import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, lookupContextLimit, resolveConfiguredContextLimit, resolveCompressProtocol } from "./config.js";
-import { contextFromRegistry, loadRegistry, peekRegistryContext } from "./registry.js";
+import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, resolveCompressProtocol, resolveStaticWindow } from "./config.js";
+import { contextFromRegistry, loadRegistry } from "./registry.js";
+import { codexModelWindow, isCodexClient } from "./codex-models.js";
 import { fetchWithTimeout, MAX_REQUEST_BYTES } from "./fetch-util.js";
 import { formatUpstreamError, getUpstreamConnectionStatus, recordUpstreamConnection, resolveProxy, resolveProxyDecision, proxyDispatcher } from "./upstream-proxy.js";
 import { maskHeaderForLog, maskHeadersForLog, maskHostPortForLog, maskUrlForLog, maskUrlsInText } from "./log-mask.js";
@@ -40,7 +41,7 @@ import {
     conversationSignalResponses,
     subagentNamespace,
 } from "acp-kernel/wire";
-import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages } from "./session.js";
+import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, resetSessionCompression, snapshotMessages } from "./session.js";
 import { COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withStagedCompressGuidance } from "./compress-tool.js";
 import { rewriteSseStream, rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
@@ -106,10 +107,6 @@ export function parseLauncherModelWindows(raw: string | undefined): Record<strin
 }
 
 const LAUNCHER_MODEL_WINDOWS: Readonly<Record<string, number>> = parseLauncherModelWindows(process.env.BILI_LAUNCHER_MODEL_WINDOWS);
-
-function launcherContextWindow(model: string): number | undefined {
-    return LAUNCHER_MODEL_WINDOWS[model];
-}
 
 /** Parse an `anthropic-beta` header for a larger-context beta (e.g.
  *  `context-1m-2025-08-07` → 1,000,000). The beta lets the CLIENT negotiate a
@@ -437,6 +434,9 @@ type Prepared = {
     pluginMode?: boolean;
     responsesTextProtocol?: boolean;
     resetAfterSuccess?: boolean;
+    /** #320 PR-C: trigger-final requests are read-only projections — preflight
+     *  must not inject a compress call AFTER the terminal compaction_trigger. */
+    skipPreflight?: boolean;
     responsesProjection?: ResponsesProjection;
     anthropicSystem?: AnthropicRequestBody["system"];
     /** Original leading system/developer prefix text captured by the kernel's
@@ -778,25 +778,27 @@ async function handle(
             const host = (() => { try { return embeddedUrl ? new URL(embeddedUrl).host : undefined; } catch { return undefined; } })();
             const betaWindow = anthropicBetaContextWindow(req.headers);
             const pluginWindow = pluginReportedContextWindow(req.headers);
-            const launcherWindow = launcherContextWindow(model);
-            const peekWindow = host ? peekRegistryContext(model, host) : undefined;
-            const configuredWindow = resolveConfiguredContextLimit(opts.routes, embeddedUrl, model);
-            let native = betaWindow
-                ?? pluginWindow
-                ?? launcherWindow
-                ?? peekWindow
-                ?? configuredWindow
-                ?? lookupContextLimit(model);
+            const staticWindow = resolveStaticWindow(model, host, opts.routes, embeddedUrl, LAUNCHER_MODEL_WINDOWS);
+            let native = betaWindow ?? pluginWindow ?? staticWindow?.window;
             // Fallback = no authoritative source AND the operator did not
             // explicitly tune the window via compress.modelContextLimit (an
             // explicit tuning is owned by the operator — never floored). The
             // beta window is authoritative (the client's own runtime
             // negotiation), so it also clears the fallback flag.
             const operatorWindowTuned = resolveCompress(opts.routes, embeddedUrl, model, opts.compress).modelContextLimit !== undefined;
-            nativeFromFallback = !betaWindow && !pluginWindow && !launcherWindow && !peekWindow && !configuredWindow && !operatorWindowTuned;
+            nativeFromFallback = !betaWindow && !pluginWindow && (staticWindow === undefined || staticWindow.source === "table") && !operatorWindowTuned;
             if (!native && host) {
                 native = await contextFromRegistry(model, host);
                 if (native) nativeFromFallback = false;
+            }
+            // #320 PR-E1: codex's auto-compact ledger follows its own model
+            // table, not bili's window — clamp down to codex's knowledge so
+            // ACP always fires first. Models absent from the codex table are
+            // never auto-compacted by codex, so no clamp applies.
+            const codexClamp = applyCodexWindowClamp(native, model, req.headers);
+            if (codexClamp.clamped) {
+                native = codexClamp.window;
+                nativeFromFallback = false;
             }
             reqConfig = resolveRequestConfig(config, opts.routes, embeddedUrl, model, native, opts.compress);
             reqPrompts = resolveCompressPrompts(resolveCompress(opts.routes, embeddedUrl, model, opts.compress));
@@ -1030,6 +1032,13 @@ async function handle(
             }
             if (reserved !== reqConfig.modelContextLimit) reqConfig = { ...reqConfig, modelContextLimit: reserved };
         }
+        // #320 PR-E2: with BILI_CODEX_COMPACT=intercept and healthy ACP state,
+        // forge codex's compaction response locally (deterministic handoff);
+        // otherwise pass through — the PR-C semantic gate rebases only on a
+        // genuinely completed native compaction.
+        if (await forgeCodexCompactIfEligible(req, res, session, reqConfig, responsesCompact, parsed, log)) {
+            return;
+        }
         // acquireInFlight must precede the lock so evictOldest() cannot flush
         // this session between getSession and lock acquisition (inFlight===0
         // window). Released in the outer finally after forward completes.
@@ -1050,7 +1059,7 @@ async function handle(
                               ? prepareResponsesCompact(bodyBuffer, parsed as ResponsesRequestBody, session)
                               : prepareResponses(parsed as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, responsesIdentity!, pluginMode, upstreamOrigin);
                 prepared = runPrepare();
-                if (!countTokens && !responsesCompact) {
+                if (!countTokens && !responsesCompact && !prepared.skipPreflight) {
                     const outcome = await preflightCompressIfNeeded(
                         prepared,
                         runPrepare,
@@ -1399,6 +1408,52 @@ function prepareResponses(
         log("info", `[${sessionId}] dropped ${droppedEmpty} whitespace-only message item(s) before projection (flattened-turn artifact)`);
     }
 
+    // #320 PR-E2: replay forged compaction summaries — items whose id bili
+    // forged are swapped in place for a developer message carrying the summary
+    // (real/native compaction items with unknown ids pass through untouched).
+    const forgedReplayed = rewriteForgedCompactions(parsed.input, session);
+    if (forgedReplayed > 0) {
+        log("info", `[${sessionId}] replayed ${forgedReplayed} forged compaction summary(s) as developer message(s)`);
+    }
+
+    // #320 PR-C: a request whose FINAL input item is `compaction_trigger` is a
+    // native remote-compact call (codex requires the trigger to stay final or
+    // the upstream 400s). Forward it as a READ-ONLY projection: sanitized
+    // original input, no kernel state mutation, no compress prompt/tools, no
+    // nudge, no preflight. Unknown item types round-trip byte-identical
+    // through the kernel, so the trigger survives this path untouched.
+    const triggerFinal = Array.isArray(parsed.input)
+        && parsed.input.length > 0
+        && (parsed.input[parsed.input.length - 1] as { type?: string })?.type === "compaction_trigger";
+    if (triggerFinal) {
+        const rebuilt: ResponsesRequestBody = { ...parsed };
+        const promptCacheKey = resolvePromptCacheKey(
+            rebuilt.prompt_cache_key,
+            identity,
+            opts.promptCache.routing,
+            upstreamOrigin,
+        );
+        if (promptCacheKey && !rebuilt.prompt_cache_key) rebuilt.prompt_cache_key = promptCacheKey;
+        if (process.env.ACP_KEEP_RESPONSE_ID !== "1") delete rebuilt.previous_response_id;
+        delete rebuilt.instructions;
+        delete (rebuilt as Record<string, unknown>).prompt_cache_retention;
+        log("info", `[${sessionId}] compaction_trigger final — read-only projection (no injection, no state mutation, no preflight)`);
+        markDirty(session);
+        return {
+            body: JSON.stringify(rebuilt),
+            session,
+            processedMessages: [],
+            originalMessages: [],
+            protocol: "responses",
+            stream,
+            compressInjected: false,
+            pluginMode,
+            nudge: undefined,
+            prompts,
+            skipPreflight: true,
+        };
+    }
+
     const shouldInject = opts.compress.injectTool;
     const injectTools = shouldInject && !pluginMode;
     // Route config is keyed by the upstream THIS request goes to (#286: a
@@ -1448,15 +1503,7 @@ function prepareResponses(
         } else if (projection.systemParts.length > 0) {
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, projection.systemParts.join("\n\n---\n\n"));
         }
-        // Codex's native remote-compact request ends with a `compaction_trigger`
-        // item that the upstream requires to be the FINAL input item (else 400
-        // "must be the final input item"). A nudge appended after it would break
-        // Codex's own compaction, and is redundant — the native compact IS the
-        // compression. Skip the nudge for such requests.
-        const triggerFinal = Array.isArray(rebuiltInput)
-            && rebuiltInput.length > 0
-            && rebuiltInput[rebuiltInput.length - 1]!.type === "compaction_trigger";
-        if (opts.compress.injectNudge && turn.nudge?.shouldInject && shouldInject && !triggerFinal) {
+        if (opts.compress.injectNudge && turn.nudge?.shouldInject && shouldInject) {
             try {
                 const rendered = renderNudgeText(turn.nudge, prompts);
                 if (rendered.text) {
@@ -2126,9 +2173,10 @@ async function forward(
     if (!upstream.body) {
         res.end();
         clearUpstreamTimer();
+        // #320 PR-C: a body-less 2xx (e.g. 204) carries no terminal event —
+        // outcome unknown; the safe default is NOT to rebase ACP state.
         if (prepared?.resetAfterSuccess) {
-            markNativeCompactionBoundary(prepared.session);
-            log("info", `[${prepared.session.id}] native Responses compact completed; rebase scheduled for next Responses turn`);
+            log("warn", `[${prepared.session.id}] native Responses compact returned an empty body (status ${upstream.status}); outcome unknown, NOT rebasing ACP state`);
         }
         return;
     }
@@ -2160,11 +2208,24 @@ async function forward(
         prepared.compressInjected &&
         prepared.processedMessages.length > 0;
     if (!useRewriter || prepared === null) {
-        await pipeThrough(upstream.body, res);
-        clearUpstreamTimer();
         if (prepared?.resetAfterSuccess) {
-            markNativeCompactionBoundary(prepared.session);
-            log("info", `[${prepared.session.id}] native Responses compact completed; rebase scheduled for next Responses turn`);
+            // #320 PR-C: semantic rebase gate — observe the response terminal
+            // event instead of trusting HTTP 2xx. Responses failures arrive as
+            // response.failed/incomplete INSIDE a 200 SSE stream; rebasing ACP
+            // state on those discards recoverable compression state.
+            const outcome = prepared.stream
+                ? await pipeThroughObservingSse(upstream.body, res)
+                : await pipeThroughObservingJson(upstream.body, res);
+            clearUpstreamTimer();
+            if (outcome === "completed") {
+                markNativeCompactionBoundary(prepared.session);
+                log("info", `[${prepared.session.id}] native Responses compact completed; rebase scheduled for next Responses turn`);
+            } else {
+                log("warn", `[${prepared.session.id}] native Responses compact outcome=${outcome}; NOT rebasing ACP state`);
+            }
+        } else {
+            await pipeThrough(upstream.body, res);
+            clearUpstreamTimer();
         }
         return;
     }
@@ -2342,6 +2403,98 @@ async function pipeThrough(stream: ReadableStream<Uint8Array>, res: http.ServerR
     }
 }
 
+type CompactOutcome = "completed" | "failed" | "unknown";
+
+function sseTerminalOutcome(block: string): CompactOutcome {
+    // Cheap prefilter: only blocks mentioning a terminal type are parsed. A
+    // model's text can contain these literals inside item content — the JSON
+    // `type` field of the parsed event is authoritative, so false positives
+    // from the prefilter resolve to "unknown".
+    if (!block.includes("response.completed") && !block.includes("response.failed") && !block.includes("response.incomplete")) {
+        return "unknown";
+    }
+    let eventType: string | undefined;
+    for (const line of block.split("\n")) {
+        if (line.startsWith("event:")) {
+            eventType = line.slice(6).trim();
+            continue;
+        }
+        if (line.startsWith("data:")) {
+            const raw = line.slice(5).trim();
+            if (!raw) continue;
+            try {
+                const ev = JSON.parse(raw) as { type?: unknown };
+                if (typeof ev.type === "string") eventType = ev.type;
+            } catch {
+                // non-JSON data line — not a terminal event
+            }
+        }
+    }
+    if (eventType === "response.completed") return "completed";
+    if (eventType === "response.failed" || eventType === "response.incomplete") return "failed";
+    return "unknown";
+}
+
+async function pipeThroughObservingSse(stream: ReadableStream<Uint8Array>, res: http.ServerResponse): Promise<CompactOutcome> {
+    const reader = stream.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let outcome: CompactOutcome = "unknown";
+    try {
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            const chunk = Buffer.from(value);
+            if (!res.write(chunk)) {
+                await new Promise<void>((r) => res.once("drain", () => r()));
+            }
+            if (outcome === "unknown") {
+                buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+                let sep: number;
+                while ((sep = buffer.indexOf("\n\n")) !== -1) {
+                    const block = buffer.slice(0, sep);
+                    buffer = buffer.slice(sep + 2);
+                    const terminal = sseTerminalOutcome(block);
+                    if (terminal !== "unknown") {
+                        outcome = terminal;
+                        buffer = "";
+                        break;
+                    }
+                }
+            }
+        }
+    } finally {
+        reader.releaseLock();
+        res.end();
+    }
+    return outcome;
+}
+
+async function pipeThroughObservingJson(stream: ReadableStream<Uint8Array>, res: http.ServerResponse): Promise<CompactOutcome> {
+    const chunks: Buffer[] = [];
+    const reader = stream.getReader();
+    try {
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            const chunk = Buffer.from(value);
+            chunks.push(chunk);
+            if (!res.write(chunk)) {
+                await new Promise<void>((r) => res.once("drain", () => r()));
+            }
+        }
+    } finally {
+        reader.releaseLock();
+        res.end();
+    }
+    try {
+        JSON.parse(Buffer.concat(chunks).toString("utf8"));
+        return "completed";
+    } catch {
+        return "unknown";
+    }
+}
+
 async function dumpStreamToFile(stream: ReadableStream<Uint8Array>, dir: string, name: string): Promise<void> {
     const { mkdirSync, createWriteStream } = await import("node:fs");
     const { join } = await import("node:path");
@@ -2461,4 +2614,108 @@ export function readBody(req: http.IncomingMessage): Promise<Buffer> {
 function logMsg(opts: ProxyOptions, level: string, msg: string): void {
     if (!opts.log) return;
     loggerLog(level, msg);
+}
+
+// #320 PR-E1: clamp bili's effective window to codex's own model-table
+// knowledge for codex-originated requests (see the call site above).
+export function applyCodexWindowClamp(
+    native: number | undefined,
+    model: string | undefined,
+    headers: http.IncomingHttpHeaders,
+): { window: number | undefined; clamped: boolean } {
+    if (!isCodexClient(headers)) return { window: native, clamped: false };
+    const codexWindow = codexModelWindow(model);
+    if (codexWindow !== undefined && (native === undefined || codexWindow < native)) {
+        return { window: codexWindow, clamped: true };
+    }
+    return { window: native, clamped: false };
+}
+
+// #320 PR-E2: replay bili-forged compaction items (ids recorded in
+// session.metadata.forgedCompactions) as developer messages carrying the ACP
+// summary, so the next upstream turn actually sees the summary. Items with
+// unknown ids (real server-side compactions) pass through untouched.
+export function rewriteForgedCompactions(input: unknown, session: Session): number {
+    if (!Array.isArray(input)) return 0;
+    const forged = session.metadata.forgedCompactions as Record<string, unknown> | undefined;
+    if (!forged) return 0;
+    let count = 0;
+    for (let i = 0; i < input.length; i++) {
+        const item = input[i] as { type?: string; id?: string };
+        if (item && item.type === "compaction" && item.id && typeof forged[item.id] === "string") {
+            input[i] = { type: "message", role: "developer", content: forged[item.id] };
+            count++;
+        }
+    }
+    return count;
+}
+
+// #320 PR-E2: conditional interception. Forges only when the kill-switch is
+// on, the client is codex, the request IS a compaction request (trailing
+// compaction_trigger or /responses/compact), and ACP state is healthy
+// (steady-state usage below the window AND compression state exists). A
+// forged compaction resets the ACP state; the summary travels with the forged
+// item id and is replayed on the next request (rewriteForgedCompactions).
+async function forgeCodexCompactIfEligible(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    session: Session,
+    reqConfig: Config,
+    responsesCompact: boolean,
+    parsed: unknown,
+    log: (level: string, msg: string) => void,
+): Promise<boolean> {
+    if (process.env.BILI_CODEX_COMPACT !== "intercept") return false;
+    if (!isCodexClient(req.headers)) return false;
+    const body = parsed as { model?: string; stream?: boolean; input?: unknown };
+    const triggerFinal = Array.isArray(body?.input)
+        && body.input.length > 0
+        && (body.input[body.input.length - 1] as { type?: string })?.type === "compaction_trigger";
+    if (!responsesCompact && !triggerFinal) return false;
+    const limit = reqConfig.modelContextLimit;
+    const steady = session.stats.lastInputTokens < limit;
+    const hasState = session.state.blocks.length > 0 || session.lastCompress !== undefined;
+    if (!steady || !hasState) return false;
+    const summary = session.state.blocks
+        .map((b) => (b.topic ? `## ${b.topic}\n${b.summary}` : b.summary))
+        .join("\n\n");
+    if (!summary) return false;
+    const cmpId = `cmp_${randomUUID()}`;
+    const respId = `resp_${randomUUID()}`;
+    await withSessionLock(session, async () => {
+        resetSessionCompression(session);
+        const prev = (session.metadata.forgedCompactions as Record<string, string> | undefined) ?? {};
+        const next: Record<string, string> = { ...prev, [cmpId]: summary };
+        const keys = Object.keys(next);
+        while (keys.length > 32) {
+            const oldest = keys.shift();
+            if (oldest === undefined) break;
+            delete next[oldest];
+        }
+        session.metadata.forgedCompactions = next;
+        markDirty(session);
+    });
+    if (body?.stream === true) {
+        res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+        res.write(`event: response.output_item.done\ndata: ${JSON.stringify({
+            type: "response.output_item.done",
+            item: { type: "compaction", id: cmpId, encrypted_content: summary },
+        })}\n\n`);
+        res.write(`event: response.completed\ndata: ${JSON.stringify({
+            type: "response.completed",
+            response: {
+                id: respId,
+                status: "completed",
+                model: body.model ?? "",
+                output: [],
+                usage: { input_tokens: 1, output_tokens: 0, total_tokens: 1 },
+            },
+        })}\n\n`);
+        res.end();
+    } else {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ output: [{ type: "compaction", id: cmpId, encrypted_content: summary }] }));
+    }
+    log("info", `[${session.id}] codex compaction forged (BILI_CODEX_COMPACT=intercept): ${responsesCompact ? "/responses/compact" : "compaction_trigger"} → ${summary.length} chars summary, ACP state reset`);
+    return true;
 }

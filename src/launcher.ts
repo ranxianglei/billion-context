@@ -43,6 +43,8 @@ function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
 import { nonEmpty, resolvePiHome, resolveOmpHome, resolveHermesHome, resolveDshHome, loadClientConfig, collectModelWindows, type ClientConfig, resolveOpencodeConfigFile, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider } from "./client-config.js";
+import { loadRoutes, resolveStaticWindow } from "./config.js";
+import { codexModelWindow } from "./codex-models.js";
 
 export {
     type ClaudeSettings,
@@ -347,6 +349,28 @@ export function buildCodexArgs(
     }
     args.push(...extra);
     return args;
+}
+
+/** #320 PR-D: point codex's auto-compact ledger at bili's effective window so
+ *  ACP (55-75%) always fires before codex native auto-compact (90%). Both keys
+ *  get the SAME value on purpose: codex internally clamps the compact limit to
+ *  min(configured, 90% x window). The min() against codexModelWindow is
+ *  load-bearing — never tell codex a window bigger than its own table assumes. */
+export function codexBudgetArgs(config: ClientConfig): string[] {
+    const codex = config.codex;
+    const model = codex?.model;
+    if (!codex || !model) return [];
+    const upstream = codex.providers?.[codex.modelProvider ?? ""]?.baseUrl ?? codex.openaiBaseUrl;
+    let host: string | undefined;
+    if (upstream) {
+        try { host = new URL(upstream).host; } catch { host = undefined; }
+    }
+    const win = resolveStaticWindow(model, host, loadRoutes(process.env), upstream, collectModelWindows(config));
+    if (!win) return [];
+    const codexWindow = codexModelWindow(model);
+    const effective = codexWindow !== undefined ? Math.min(win.window, codexWindow) : win.window;
+    console.error(`[bili] codex budget: model=${model} window=${effective} (bili ${win.source}=${win.window}${codexWindow !== undefined ? `, codex table=${codexWindow}` : ""})`);
+    return ["-c", `model_context_window=${effective}`, "-c", `model_auto_compact_token_limit=${effective}`];
 }
 
 export function buildClaudeEnv(
@@ -1435,7 +1459,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
             if (codexConversationId) clientArgs = [...buildCodexMcpArgs(origin, codexConversationId), ...clientArgs];
         } else {
             env = buildCodexEnv(origin, resolveCombinedCaPath(process.env), process.env);
-            clientArgs = buildCodexArgs(origin, routes.httpRewrites, routes.httpsRewrites, clientArgs);
+            clientArgs = buildCodexArgs(origin, routes.httpRewrites, routes.httpsRewrites, [...codexBudgetArgs(config), ...clientArgs]);
             if (injectMcp && codexConversationId) clientArgs = [...buildCodexMcpArgs(origin, codexConversationId), ...clientArgs];
         }
     } else {
