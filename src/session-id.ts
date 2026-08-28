@@ -89,3 +89,53 @@ export function preferPromptCacheKeyIdentity<T extends ConversationIdentity>(
     if (pck.length === 0) return identity;
     return { ...identity, value: pck, source: "prompt-cache-key", clientProvided: true };
 }
+
+/**
+ * Codex turn-metadata partitioning (#316 / PR-A).
+ *
+ * Codex (>=0.147) sends `x-codex-turn-metadata` (JSON) on every Responses
+ * request carrying `thread_source` ("user" for the root thread, "subagent"
+ * for spawned agent threads) and `thread_id`. Subagent threads REUSE the
+ * root's `session-id` header, so the legacy identity chain maps every thread
+ * of one task onto a single session — subagents inherit the root's
+ * compression state, which breaks #150's isolation (a guardian subagent must
+ * read the user's original authorization verbatim, never a compressed
+ * summary).
+ *
+ * When the metadata is present AND cross-checked (metadata.thread_id ===
+ * `thread-id` header), partition by thread_source:
+ *   - "user"     → the `session-id` header (current root semantics, stable
+ *                  across turns)
+ *   - "subagent" → the `thread-id` header (fresh independent state per
+ *                  thread; self-contained replay is lossless)
+ * Any other thread_source, unparseable JSON, missing/mismatched thread_id, or
+ * a missing `session-id` header on a "user" turn → undefined: the caller
+ * falls through to the legacy chain unchanged.
+ */
+export type CodexTurnIdentity = {
+    value: string;
+    threadSource: "user" | "subagent";
+};
+
+export function codexTurnIdentity(headers: Record<string, string | string[] | undefined>): CodexTurnIdentity | undefined {
+    const raw = headers["x-codex-turn-metadata"];
+    if (typeof raw !== "string" || raw.trim().length === 0) return undefined;
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(raw);
+    } catch {
+        return undefined;
+    }
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+    const record = parsed as Record<string, unknown>;
+    const threadSource = record["thread_source"];
+    if (threadSource !== "user" && threadSource !== "subagent") return undefined;
+    const metaThreadId = record["thread_id"];
+    if (typeof metaThreadId !== "string" || metaThreadId.trim().length === 0) return undefined;
+    const threadHeader = headers["thread-id"];
+    if (typeof threadHeader !== "string" || threadHeader.trim() !== metaThreadId.trim()) return undefined;
+    if (threadSource === "subagent") return { value: threadHeader.trim(), threadSource };
+    const sessionHeader = headers["session-id"];
+    if (typeof sessionHeader !== "string" || sessionHeader.trim().length === 0) return undefined;
+    return { value: sessionHeader.trim(), threadSource };
+}

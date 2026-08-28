@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { affinityToken, clientConversationHeader, preferPromptCacheKeyIdentity } from "../src/session-id.ts";
+import { affinityToken, clientConversationHeader, codexTurnIdentity, preferPromptCacheKeyIdentity } from "../src/session-id.ts";
 import { conversationIdentityResponses, conversationSignalResponses } from "acp-kernel/wire";
 
 test("preferPromptCacheKeyIdentity: fingerprint + prompt_cache_key → stable client-provided identity (omp stateless replay)", () => {
@@ -135,4 +135,85 @@ test("conversationIdentityResponses: identical anonymous openers share a content
     const b = conversationSignalResponses({ input: "hello world" } as never, undefined);
     assert.equal(a, b);
     assert.match(a, /^[0-9a-f]{16}$/);
+});
+
+// ---- codexTurnIdentity (#316 / PR-A): codex turn-metadata partitioning ----
+
+const ROOT_SESSION = "01a048b8-c704-7c00-8000-000000000000";
+const SUB_THREAD = "01a048b8-c728-7c00-8000-000000000000";
+const rootMeta = (over: Record<string, unknown> = {}) =>
+    JSON.stringify({ request_kind: "turn", thread_source: "user", thread_id: ROOT_SESSION, turn_id: "turn-1", window_id: "win-1", ...over });
+const subMeta = (over: Record<string, unknown> = {}) =>
+    JSON.stringify({ request_kind: "turn", thread_source: "subagent", thread_id: SUB_THREAD, turn_id: "turn-2", window_id: "win-1", ...over });
+
+test("codexTurnIdentity: thread_source user → session-id header (current root semantics)", () => {
+    const id = codexTurnIdentity({
+        "session-id": ROOT_SESSION,
+        "thread-id": ROOT_SESSION,
+        "x-codex-turn-metadata": rootMeta(),
+    });
+    assert.deepEqual(id, { value: ROOT_SESSION, threadSource: "user" });
+});
+
+test("codexTurnIdentity: thread_source subagent → thread-id header (fresh per-thread state, #150)", () => {
+    // A subagent REUSES the root's session-id header but carries its own
+    // thread-id — it must resolve to the thread-id, NOT the root session.
+    const id = codexTurnIdentity({
+        "session-id": ROOT_SESSION,
+        "thread-id": SUB_THREAD,
+        "x-codex-turn-metadata": subMeta(),
+    });
+    assert.deepEqual(id, { value: SUB_THREAD, threadSource: "subagent" });
+});
+
+test("codexTurnIdentity: root identity is stable across turns (turn_id/window_id churn is irrelevant)", () => {
+    const a = codexTurnIdentity({ "session-id": ROOT_SESSION, "thread-id": ROOT_SESSION, "x-codex-turn-metadata": rootMeta({ turn_id: "turn-1", window_id: "w1" }) });
+    const b = codexTurnIdentity({ "session-id": ROOT_SESSION, "thread-id": ROOT_SESSION, "x-codex-turn-metadata": rootMeta({ turn_id: "turn-99", window_id: "w42" }) });
+    assert.deepEqual(a, b);
+    assert.equal(a!.value, ROOT_SESSION);
+});
+
+test("codexTurnIdentity: metadata.thread_id must equal the thread-id header (cross-check, PR #249)", () => {
+    // metadata says one thread, header says another → do not trust.
+    const mismatch = codexTurnIdentity({
+        "session-id": ROOT_SESSION,
+        "thread-id": SUB_THREAD,
+        "x-codex-turn-metadata": rootMeta({ thread_id: "01a048b8-ffff-7c00-8000-000000000000" }),
+    });
+    assert.equal(mismatch, undefined);
+    // header missing entirely → do not trust.
+    const noHeader = codexTurnIdentity({
+        "session-id": ROOT_SESSION,
+        "x-codex-turn-metadata": subMeta(),
+    });
+    assert.equal(noHeader, undefined);
+});
+
+test("codexTurnIdentity: JSON parse failure / non-object → do not trust (legacy chain)", () => {
+    assert.equal(codexTurnIdentity({ "session-id": ROOT_SESSION, "thread-id": ROOT_SESSION, "x-codex-turn-metadata": "{not json" }), undefined);
+    assert.equal(codexTurnIdentity({ "session-id": ROOT_SESSION, "thread-id": ROOT_SESSION, "x-codex-turn-metadata": "42" }), undefined);
+    assert.equal(codexTurnIdentity({ "session-id": ROOT_SESSION, "thread-id": ROOT_SESSION, "x-codex-turn-metadata": "[1,2,3]" }), undefined);
+    assert.equal(codexTurnIdentity({ "session-id": ROOT_SESSION, "thread-id": ROOT_SESSION, "x-codex-turn-metadata": "null" }), undefined);
+    assert.equal(codexTurnIdentity({ "session-id": ROOT_SESSION, "thread-id": ROOT_SESSION, "x-codex-turn-metadata": "   " }), undefined);
+});
+
+test("codexTurnIdentity: unknown/missing thread_source → do not trust (legacy chain)", () => {
+    assert.equal(codexTurnIdentity({ "session-id": ROOT_SESSION, "thread-id": ROOT_SESSION, "x-codex-turn-metadata": rootMeta({ thread_source: "system" }) }), undefined);
+    assert.equal(codexTurnIdentity({ "session-id": ROOT_SESSION, "thread-id": ROOT_SESSION, "x-codex-turn-metadata": rootMeta({ thread_source: undefined }) }), undefined);
+    assert.equal(codexTurnIdentity({ "session-id": ROOT_SESSION, "thread-id": ROOT_SESSION, "x-codex-turn-metadata": rootMeta({ thread_id: 123 }) }), undefined);
+});
+
+test("codexTurnIdentity: user turn with no session-id header → do not trust (legacy chain)", () => {
+    assert.equal(codexTurnIdentity({ "thread-id": ROOT_SESSION, "x-codex-turn-metadata": rootMeta() }), undefined);
+});
+
+test("codexTurnIdentity: no metadata header (omp / other Responses clients) → undefined, legacy chain untouched", () => {
+    // omp-style stateless replay: prompt_cache_key identity, no codex headers.
+    // codexTurnIdentity must return undefined so the pck promotion chain runs.
+    const id = codexTurnIdentity({});
+    assert.equal(id, undefined);
+    const body = { input: [{ type: "message", role: "user", content: "hi" }], prompt_cache_key: "omp-pck-1" };
+    const promoted = preferPromptCacheKeyIdentity(conversationIdentityResponses(body, undefined), body);
+    assert.equal(promoted!.source, "prompt-cache-key");
+    assert.equal(promoted!.value, "omp-pck-1");
 });
