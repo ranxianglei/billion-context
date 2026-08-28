@@ -105,6 +105,8 @@ Options (override config file / env):
   --debug                          verbose logging
   --passthrough                    forward without compression
   --no-passthrough                 force compression on (overrides config)
+  --allow-fingerprint-sessions     let header-less clients fall back to a content-fingerprint session instead of 400 (#286 opt-in, #309)
+  --no-allow-fingerprint-sessions  force the #286 hard-reject for anonymous requests (overrides config)
   --no-auto-update                 disable background self-update this run
 
 Config: ${defaultConfigFile()}
@@ -173,6 +175,12 @@ export function parseArgs(argv: string[]): Parsed {
                 break;
             case "--no-passthrough":
                 overrides.ACP_PASSTHROUGH = "0";
+                break;
+            case "--allow-fingerprint-sessions":
+                overrides.BILI_ALLOW_FINGERPRINT_SESSIONS = "1";
+                break;
+            case "--no-allow-fingerprint-sessions":
+                overrides.BILI_ALLOW_FINGERPRINT_SESSIONS = "0";
                 break;
             case "--mitm-domain": {
                 const val = argv[++i];

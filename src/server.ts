@@ -55,7 +55,7 @@ import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeRe
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { emitStreamError } from "./stream-error.js";
-import { affinityToken, clientConversationHeader, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
+import { affinityToken, clientConversationHeader, deriveFingerprintSessionId, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
 import { consumePluginRegisterFor, flushConversations, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, loadConversations, pipePluginJson, pipePluginResponsesWithStrip, pipeThroughWithUsage, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
@@ -813,15 +813,29 @@ async function handle(
             : protocol === "openai"
               ? (openaiIdentity?.clientProvided ?? false)
               : !!convHeader;
+        let sessionId: string;
+        let isFingerprint = false;
         if (!clientProvided) {
-            log("warn", `400: no stable conversation identity on ${protocol} request → ${upstreamOrigin}; refusing to create a content-fingerprint session (#286)`);
-            res.writeHead(400, { "content-type": "application/json" });
-            res.end(JSON.stringify(protocol === "anthropic"
-                ? { type: "error", error: { type: "invalid_request_error", message: NO_IDENTITY_MESSAGE } }
-                : { error: { type: "invalid_request_error", message: NO_IDENTITY_MESSAGE } }));
-            return;
+            if (opts.allowFingerprintSessions) {
+                // #286 opt-in (issue #309): an anonymous request (no client-provided
+                // identity) falls back to a content-fingerprint session with the
+                // pre-#286 4-dim isolation key (protocol|upstream|apiKey|conversation),
+                // so header-less third-party harnesses (dsh web, …) keep compression
+                // instead of 400ing. Different accounts/upstreams never share state.
+                sessionId = deriveFingerprintSessionId(req.headers, protocol, upstreamOrigin, conversation);
+                isFingerprint = true;
+                log("warn", `anonymous ${protocol} request → ${upstreamOrigin}: content-fingerprint session ${sessionId} (allowFingerprintSessions=true, #286 opt-in; state orphans if credentials/upstream rotate)`);
+            } else {
+                log("warn", `400: no stable conversation identity on ${protocol} request → ${upstreamOrigin}; refusing to create a content-fingerprint session (#286)`);
+                res.writeHead(400, { "content-type": "application/json" });
+                res.end(JSON.stringify(protocol === "anthropic"
+                    ? { type: "error", error: { type: "invalid_request_error", message: NO_IDENTITY_MESSAGE } }
+                    : { error: { type: "invalid_request_error", message: NO_IDENTITY_MESSAGE } }));
+                return;
+            }
+        } else {
+            sessionId = conversation;
         }
-        const sessionId = conversation;
         // Two separate uses of the conversation signal:
         //  - `affinity`: header value forwarded upstream for sticky-routing /
         //    cache pools. Synthesized as ses_<conversation> when the client
@@ -840,7 +854,7 @@ async function handle(
         const clientLabel = bodyIdentity?.clientProvided
             ? bodyIdentity.value
             : clientConversationHeader(req.headers);
-        const session = getSession(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? undefined });
+        const session = getSession(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? (isFingerprint ? "[fingerprint]" : undefined) });
         // Launcher-mode binding (#162): prefer identity — claude code sends
         // x-claude-code-session-id on every request, equal to the
         // CLAUDE_CODE_SESSION_ID the MCP shell registered, so binding is

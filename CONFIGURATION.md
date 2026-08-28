@@ -107,6 +107,13 @@ Top-level keys that control how the proxy listens and behaves globally.
 - **Status:** ACTIVE
 - **Description:** Forward every request to the upstream **without** compression, tool injection, or nudging. Equivalent to `ACP_PASSTHROUGH=1`. Handy for A/B comparison against the uncompressed baseline.
 
+### `allowFingerprintSessions`
+
+- **Type:** `boolean`
+- **Default:** `false`
+- **Status:** ACTIVE
+- **Description:** #286 opt-in (issue #309). When `true`, requests that carry **no** client-provided conversation id (no session header, no body `session_id`/`prompt_cache_key`) fall back to a content-fingerprint session — keyed by the 4-dimension hash `(protocol, upstream, credential, content)` so different accounts/upstreams never share compression state — instead of being rejected with `400`. Anonymous sessions are logged with a warning and labeled `[fingerprint]` in the web UI. Keep `false` (the default) to preserve #286's hard-reject semantics. See the README *Third-party harnesses* section.
+
 ### `proxy`
 
 - **Type:** `string`
@@ -332,6 +339,7 @@ Environment variables take precedence over the config file. They are useful for 
 |----------|--------|
 | `ACP_DEBUG` | Set to `1` for verbose logging (same as `"debug": true`). |
 | `ACP_PASSTHROUGH` | Set to `1` to forward without compression (same as `"passthrough": true`). |
+| `BILI_ALLOW_FINGERPRINT_SESSIONS` | Set to `1` to let header-less (anonymous) requests fall back to a content-fingerprint session instead of `400` (same as `"allowFingerprintSessions": true`). See #286 / #309. |
 | `ACP_COMPRESS_TOOL` | Set to `0` to disable tool injection (same as `"compress.injectTool": false`). |
 | `ACP_COMPRESS_NUDGE` | Set to `0` to disable nudge injection (same as `"compress.injectNudge": false`). |
 | `ACP_MODEL_CONTEXT_LIMIT` | Override the context limit globally (absolute token count). |
@@ -399,6 +407,8 @@ Anything after `--` in a launcher command is passed through to the client verbat
 | `--debug` | Verbose logging |
 | `--passthrough` | Forward without compression |
 | `--no-passthrough` | Force compression on (overrides config) |
+| `--allow-fingerprint-sessions` | Let header-less (anonymous) requests fall back to a content-fingerprint session instead of `400` (#286 opt-in, #309) |
+| `--no-allow-fingerprint-sessions` | Force the #286 hard-reject for anonymous requests (overrides config) |
 | `--no-auto-update` | Disable background self-update for this run |
 | `--mitm-domain <domain>` | Extra MITM whitelist entry (repeatable; launcher only) |
 

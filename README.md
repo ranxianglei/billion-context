@@ -145,6 +145,7 @@ bili --passthrough           # forward without compression (smoke-test mode)
 bili --config ~/my-bili.json # use a different config file
 bili update                  # check & install a newer version now (bypasses throttle)
 bili --no-auto-update        # disable self-update for this run
+bili --allow-fingerprint-sessions  # let header-less clients fall back to a content-fingerprint session instead of 400 (see below)
 ```
 
 Flags override env vars and the config file. `bili --help` lists them all.
@@ -201,6 +202,39 @@ notice — **restart `bili` to pick up the new version**.
 
 Disable permanently via config (`"autoUpdate": false`) or env
 (`ACP_AUTO_UPDATE=0`).
+
+### Third-party harnesses (no session headers)
+
+The proxy keys compression state on a **client-provided conversation id** — a
+header (`x-session-id`, `x-acp-session`, `x-claude-code-session-id`, …) or a
+body field (`session_id`, `prompt_cache_key`). Clients that send **none** of
+these are *anonymous* and, by default, are **rejected with 400** rather than
+silently sharing a content-fingerprint session (which has a collision surface
+and orphans state when credentials/upstream rotate — #286).
+
+- **Preferred:** launch through the matching `bili <client>` launcher. It
+  injects the session identity for you (e.g. `bili dsh` sets
+  `PI_CACHE_RETENTION=long` so dsh's pi-ai stack stamps `prompt_cache_key`
+  with the dsh session uuid) and rewrites the client's config to route through
+  the proxy — you never point the client's `baseURL` at bili by hand.
+- **Manual integration** (you changed the client's `baseURL` to bili yourself
+  and run the client directly): the client must send a conversation id. If it
+  cannot, enable the fingerprint fallback so anonymous requests get a
+  per-`(protocol, upstream, credential, content)` session instead of 400:
+
+  ```bash
+  bili --allow-fingerprint-sessions        # or env BILI_ALLOW_FINGERPRINT_SESSIONS=1
+  # or config:  "allowFingerprintSessions": true
+  ```
+
+  The id is derived from a 4-dimension key, so different accounts/upstreams
+  never share compression state. Anonymous sessions are logged with a warning
+  and labeled `[fingerprint]` in the web UI. **Trade-off:** if the client's
+  credentials or upstream change mid-conversation, the session (and its
+  compression state) orphans — the client then re-sends full history, which is
+  equivalent to starting fresh. For a harness that relies on bili for all of
+  its compression (no built-in compaction), this is the only way to keep
+  compression without the launcher.
 
 ## Configuration
 

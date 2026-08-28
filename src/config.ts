@@ -231,6 +231,11 @@ export type ProxyOptions = {
     debug: boolean;
     dumpSse?: string;
     passthrough: boolean;
+    /** #286 opt-in (issue #309): allow requests WITHOUT a client-provided
+     *  conversation identity to fall back to a content-fingerprint session
+     *  (4-dim key protocol|upstream|apiKey|conversation) instead of 400ing.
+     *  Absent/false keeps #286's hard-reject semantics. */
+    allowFingerprintSessions?: boolean;
     autoUpdate: boolean;
     logFile?: string;
     /** MITM transparent-proxy mode. When enabled, an HTTP CONNECT handler is
@@ -349,6 +354,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         debug: (env.ACP_DEBUG ?? (fileConfig.debug ? "1" : "0")) === "1",
         dumpSse: env.ACP_DUMP_SSE || fileConfig.dumpSse || undefined,
         passthrough: (env.ACP_PASSTHROUGH ?? (fileConfig.passthrough ? "1" : "0")) === "1",
+        allowFingerprintSessions: (env.BILI_ALLOW_FINGERPRINT_SESSIONS ?? (fileConfig.allowFingerprintSessions ? "1" : "0")) === "1",
         autoUpdate: (env.ACP_AUTO_UPDATE ?? (fileConfig.autoUpdate === false ? "0" : "1")) !== "0",
         logFile: env.ACP_LOG_FILE !== undefined ? (env.ACP_LOG_FILE || undefined) : fileConfig.logFile,
         mitm: {
@@ -380,6 +386,7 @@ type FileConfig = {
     debug?: boolean;
     dumpSse?: string;
     passthrough?: boolean;
+    allowFingerprintSessions?: boolean;
     autoUpdate?: boolean;
     upstreamProxy?: string;
     upstreamProxyMode?: string;

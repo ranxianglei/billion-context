@@ -1,3 +1,5 @@
+import { hashId } from "./util.js";
+
 export type ConversationIdentity = {
     value: string;
     source: "header" | "body-session" | "metadata-session" | "previous-response" | "prompt-cache-key" | "content-fingerprint" | "generated";
@@ -88,4 +90,37 @@ export function preferPromptCacheKeyIdentity<T extends ConversationIdentity>(
     const pck = typeof body.prompt_cache_key === "string" ? body.prompt_cache_key.trim() : "";
     if (pck.length === 0) return identity;
     return { ...identity, value: pck, source: "prompt-cache-key", clientProvided: true };
+}
+
+/**
+ * Compute a content-fingerprint session id for an anonymous request (no
+ * client-provided identity), used ONLY when `allowFingerprintSessions` is
+ * enabled (#286 opt-in, issue #309). Restores the pre-#286 fallback with its
+ * 4-dimension isolation key so different accounts/upstreams never share
+ * compression state:
+ *
+ *   hash(protocol | upstream | apiKey | conversation)
+ *
+ * `conversation` is the kernel's content-fingerprint signal (already a stable
+ * hash of the request's first user message / whole input). The 4-dim key keeps
+ * the collision surface bounded (same account + upstream + content) while
+ * letting header-less third-party harnesses (dsh web, …) keep compression
+ * instead of 400ing. The id is proxy-internal only — never sent upstream.
+ */
+export function deriveFingerprintSessionId(
+    headers: Record<string, string | string[] | undefined>,
+    protocol: "anthropic" | "openai" | "responses",
+    upstream: string,
+    conversation: string,
+): string {
+    if (!conversation) throw new Error("deriveFingerprintSessionId: empty conversation signal");
+    return hashId(`${protocol}|${upstream}|${extractKey(headers)}|${conversation}`);
+}
+
+function extractKey(headers: Record<string, string | string[] | undefined>): string {
+    const auth = headers["authorization"];
+    if (typeof auth === "string" && auth.length > 0) return auth.trim();
+    const apiKey = headers["x-api-key"];
+    if (typeof apiKey === "string" && apiKey.length > 0) return `key:${apiKey.trim()}`;
+    return "(no-key)";
 }

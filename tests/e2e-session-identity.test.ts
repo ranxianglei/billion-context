@@ -10,6 +10,7 @@ import { startServer, type ProxyOptions } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { _resetSessionsForTest } from "../src/session.ts";
+import { deriveFingerprintSessionId } from "../src/session-id.ts";
 
 // #286: the session ID is the client-provided conversation value VERBATIM —
 // no hash, no other dimensions. Credential rotation (ChatGPT OAuth bearer),
@@ -96,7 +97,7 @@ interface Harness {
     close(): Promise<void>;
 }
 
-async function startHarness(upstreamCount = 1): Promise<Harness> {
+async function startHarness(upstreamCount = 1, allowFingerprintSessions = false): Promise<Harness> {
     const upstreams: MockUpstream[] = [];
     for (let i = 0; i < upstreamCount; i++) upstreams.push(await startMockUpstream());
     _resetSessionsForTest();
@@ -119,6 +120,7 @@ async function startHarness(upstreamCount = 1): Promise<Harness> {
         sessionHeader: "x-acp-session",
         debug: false,
         passthrough: false,
+        allowFingerprintSessions,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
     });
@@ -327,6 +329,90 @@ test("e2e session identity: distinct session_ids stay separate (#286)", async ()
         assert.equal(sessions.length, 2, `expected 2 sessions, got ${JSON.stringify(sessions)}`);
         const ids = sessions.map((s) => s.id).sort();
         assert.deepEqual(ids, ["sess-A", "sess-B"]);
+    } finally {
+        await h.close();
+    }
+});
+
+// --- #286 opt-in (issue #309): allowFingerprintSessions lets header-less
+// third-party harnesses fall back to a content-fingerprint session instead of
+// 400ing. Default (absent/false) keeps the hard-reject above. ---
+
+test("deriveFingerprintSessionId: 4-dim key isolates by protocol/upstream/credential/conversation", () => {
+    const base = { authorization: "Bearer keyA" };
+    const same = deriveFingerprintSessionId(base, "responses", "http://up1", "conv-1");
+    assert.ok(same.length > 0, "non-empty id");
+    assert.equal(deriveFingerprintSessionId(base, "responses", "http://up1", "conv-1"), same, "identical inputs → identical id");
+    assert.notEqual(deriveFingerprintSessionId({ authorization: "Bearer keyB" }, "responses", "http://up1", "conv-1"), same, "different credential → different id");
+    assert.notEqual(deriveFingerprintSessionId(base, "responses", "http://up2", "conv-1"), same, "different upstream → different id");
+    assert.notEqual(deriveFingerprintSessionId(base, "anthropic", "http://up1", "conv-1"), same, "different protocol → different id");
+    assert.notEqual(deriveFingerprintSessionId(base, "responses", "http://up1", "conv-2"), same, "different conversation → different id");
+    assert.throws(() => deriveFingerprintSessionId(base, "responses", "http://up1", ""), /empty conversation signal/);
+});
+
+test("opt-in: anonymous responses request → 200, a fingerprint session is created (#309)", async () => {
+    const h = await startHarness(1, true);
+    try {
+        const resp = await postRaw(h, 0, "/v1/responses", responsesBody(), { authorization: "Bearer keyA" });
+        assert.equal(resp.status, 200, `expected 200 with opt-in, got ${resp.status}: ${await resp.text()}`);
+        const sessions = await getSessions(h);
+        assert.equal(sessions.length, 1, `expected 1 fingerprint session, got ${JSON.stringify(sessions)}`);
+        const s = sessions[0]!;
+        assert.equal(s.protocol, "responses");
+        assert.ok(s.id.length > 0 && s.id !== "hello", "id is a derived fingerprint, not the verbatim content");
+    } finally {
+        await h.close();
+    }
+});
+
+test("opt-in: identical anonymous requests continue one fingerprint session (stable key)", async () => {
+    const h = await startHarness(1, true);
+    try {
+        await post(h, 0, "/v1/responses", responsesBody(), { authorization: "Bearer keyA" });
+        await post(h, 0, "/v1/responses", responsesBody(), { authorization: "Bearer keyA" });
+        const sessions = await getSessions(h);
+        assert.equal(sessions.length, 1, `expected 1 session for identical content, got ${JSON.stringify(sessions)}`);
+        assert.equal(sessions[0]!.requests, 2, "both requests land on the same fingerprint session");
+    } finally {
+        await h.close();
+    }
+});
+
+test("opt-in: different credentials → separate fingerprint sessions (4-dim isolation)", async () => {
+    const h = await startHarness(1, true);
+    try {
+        await post(h, 0, "/v1/responses", responsesBody(), { authorization: "Bearer keyA" });
+        await post(h, 0, "/v1/responses", responsesBody(), { authorization: "Bearer keyB" });
+        const sessions = await getSessions(h);
+        assert.equal(sessions.length, 2, `expected 2 sessions for different credentials, got ${JSON.stringify(sessions)}`);
+    } finally {
+        await h.close();
+    }
+});
+
+test("opt-in: different content → separate fingerprint sessions (content dimension)", async () => {
+    const h = await startHarness(1, true);
+    try {
+        await post(h, 0, "/v1/responses", responsesBody(), { authorization: "Bearer keyA" });
+        await post(h, 0, "/v1/responses", responsesBody({ input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "a totally different prompt" }] }] }), { authorization: "Bearer keyA" });
+        const sessions = await getSessions(h);
+        assert.equal(sessions.length, 2, `expected 2 sessions for different content, got ${JSON.stringify(sessions)}`);
+    } finally {
+        await h.close();
+    }
+});
+
+test("opt-in: a client-provided identity still wins over the fingerprint fallback (#309)", async () => {
+    const h = await startHarness(1, true);
+    try {
+        // Anonymous → fingerprint session.
+        await post(h, 0, "/v1/responses", responsesBody(), { authorization: "Bearer keyA" });
+        // Same content but WITH a session_id → verbatim id, separate session.
+        await post(h, 0, "/v1/responses", responsesBody({ session_id: "explicit-1" }), { authorization: "Bearer keyA" });
+        const sessions = await getSessions(h);
+        assert.equal(sessions.length, 2, `expected 2 sessions (fingerprint + explicit), got ${JSON.stringify(sessions)}`);
+        const ids = sessions.map((s) => s.id).sort();
+        assert.ok(ids.includes("explicit-1"), "the explicit session_id is recorded verbatim");
     } finally {
         await h.close();
     }
