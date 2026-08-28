@@ -36,6 +36,32 @@ test("tail-window: truncated replay (drop oldest) reattaches the original sessio
     assert.equal(b.incomingDepth, 9);
 });
 
+test("tail-window: rolling-window client retaining > TAIL_WINDOW items reattaches at any offset", () => {
+    // A dsh-style web client keeps a 20-30 item rolling window: the retained
+    // suffix is LONGER than TAIL_WINDOW, so the incoming head matches the
+    // stored chain in the middle, not at its tail. The any-offset substring
+    // search must still find it (tail-pinned matching would orphan it).
+    const r = new PrefixAffinityResolver();
+    const full = chain(30);
+    const a = r.resolve(full)!;
+    assert.equal(a.via, "new");
+    r.note(a.sessionId, a.incomingDepth, a.tailHash, a.itemHashes);
+
+    // Sliding window: retains the last 20 (> TAIL_WINDOW=8), appends 1 new.
+    const slid = [...full.slice(10), user("a brand new turn after the window slid")];
+    const b = r.resolve(slid)!;
+    assert.equal(b.sessionId, a.sessionId, "a >8-item rolling window must reattach the original session");
+    assert.equal(b.via, "tail-window");
+    assert.equal(b.matchedDepth, 8);
+
+    // Deeper slides keep reattaching as the window keeps sliding.
+    r.note(b.sessionId, b.incomingDepth, b.tailHash, b.itemHashes);
+    const slid2 = [...full.slice(20), user("yet another turn after sliding again")];
+    const c = r.resolve(slid2)!;
+    assert.equal(c.sessionId, a.sessionId, "a second slide must reattach the same session");
+    assert.equal(c.via, "tail-window");
+});
+
 test("tail-window: append-only continuation still resolves via prefix (regression)", () => {
     const r = new PrefixAffinityResolver();
     const base = chain(4);

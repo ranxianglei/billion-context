@@ -45,10 +45,11 @@ const MAX_TRACKED_SESSIONS = 256;
 /** Chains unused for this long stop matching (sessions may outlive tracking). */
 const TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
-/** Tail-window reattach window (#316 / PR-B): how many of the incoming's
- *  LEADING items are compared against each stored chain's TRAILING items to
- *  reattach a truncated replay (a client that drops its oldest messages keeps
- *  a fixed-size recent window, so the incoming head == the stored tail). */
+/** Tail-window reattach window (#316 / PR-B): the incoming's LEADING items
+ *  are searched for as a contiguous run at ANY offset inside each stored
+ *  chain's per-item hashes (the incoming head is the retained suffix of the
+ *  stored history, but a rolling-window client may retain any number of
+ *  items, so the match offset must be free — not pinned to the stored tail). */
 const TAIL_WINDOW = 8;
 
 /** Minimum window size (items) for a tail-window reattach to be trusted. A
@@ -57,10 +58,10 @@ const TAIL_WINDOW = 8;
 const MIN_TAIL_MATCH = 3;
 
 /** Per tracked chain, store at most this many per-item hashes (the trailing
- *  ones). Bounds memory (256 chains × 64 × 64B ≈ 1MB) and keeps the tail
+ *  ones). Bounds memory (256 chains × 128 × 64B ≈ 2MB) and keeps the tail
  *  window (8) comfortably available. Chains deeper than this lose their head,
  *  so fork-lineage prefix detection is best-effort for very long chains. */
-const MAX_STORED_ITEMS = 64;
+const MAX_STORED_ITEMS = 128;
 
 /** Minimum shared prefix (items) to record a "forked" lineage on a new
  *  session. UI/debug only — never used for matching. */
@@ -192,23 +193,30 @@ export class PrefixAffinityResolver {
         }
 
         // 2. Tail-window reattach (#316 / PR-B): a client that dropped its
-        //    oldest messages replays a fixed recent window, so the incoming
-        //    HEAD aligns with a stored chain's TAIL. Compare the incoming's
-        //    leading items against each stored chain's trailing items.
+        //    oldest messages replays a retained suffix of the stored history
+        //    (plus new appends), so the incoming's LEADING items must appear
+        //    as a contiguous run somewhere inside the stored chain's item
+        //    hashes — at any offset, not just the stored tail (a rolling-window
+        //    client may retain more items than TAIL_WINDOW).
+        const w = Math.min(TAIL_WINDOW, incomingDepth);
         const candidates: ChainEntry[] = [];
-        for (const entry of tracked.values()) {
-            const w = Math.min(TAIL_WINDOW, incomingDepth, entry.depth);
-            if (w < MIN_TAIL_MATCH) continue;
-            const tailBase = entry.itemHashes.length - w;
-            if (tailBase < 0) continue;
-            let match = true;
-            for (let i = 0; i < w; i++) {
-                if (incItemHashes[i] !== entry.itemHashes[tailBase + i]) {
-                    match = false;
-                    break;
+        if (w >= MIN_TAIL_MATCH) {
+            for (const entry of tracked.values()) {
+                const stored = entry.itemHashes;
+                for (let j = 0; j + w <= stored.length; j++) {
+                    let match = true;
+                    for (let i = 0; i < w; i++) {
+                        if (incItemHashes[i] !== stored[j + i]) {
+                            match = false;
+                            break;
+                        }
+                    }
+                    if (match) {
+                        candidates.push(entry);
+                        break;
+                    }
                 }
             }
-            if (match) candidates.push(entry);
         }
         if (candidates.length === 1) {
             const entry = candidates[0]!;
