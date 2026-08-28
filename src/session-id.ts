@@ -106,15 +106,22 @@ export function preferPromptCacheKeyIdentity<T extends ConversationIdentity>(
  * `thread-id` header), partition by thread_source:
  *   - "user"     → the `session-id` header (current root semantics, stable
  *                  across turns)
- *   - "subagent" → the `thread-id` header (fresh independent state per
- *                  thread; self-contained replay is lossless)
- * Any other thread_source, unparseable JSON, missing/mismatched thread_id, or
- * a missing `session-id` header on a "user" turn → undefined: the caller
- * falls through to the legacy chain unchanged.
+ *   - anything else → the `thread-id` header (fresh independent state per
+ *                  thread; self-contained replay is lossless). codex's
+ *                  ThreadSource serializes more than user/subagent —
+ *                  "guardian_review" (review sessions), "memory_consolidation",
+ *                  and arbitrary Feature strings such as "guardian_classifier"
+ *                  (guardian-v2 async scorer) — all of which are internal
+ *                  threads that need #150 isolation just as much, so the
+ *                  discrimination is inverted: only "user" joins the root
+ *                  session, every other source gets its own thread state.
+ * A non-string/empty thread_source, unparseable JSON, missing/mismatched
+ * thread_id, or a missing `session-id` header on a "user" turn → undefined:
+ * the caller falls through to the legacy chain unchanged.
  */
 export type CodexTurnIdentity = {
     value: string;
-    threadSource: "user" | "subagent";
+    threadSource: string;
 };
 
 export function codexTurnIdentity(headers: Record<string, string | string[] | undefined>): CodexTurnIdentity | undefined {
@@ -129,13 +136,15 @@ export function codexTurnIdentity(headers: Record<string, string | string[] | un
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
     const record = parsed as Record<string, unknown>;
     const threadSource = record["thread_source"];
-    if (threadSource !== "user" && threadSource !== "subagent") return undefined;
+    if (typeof threadSource !== "string" || threadSource.trim().length === 0) return undefined;
     const metaThreadId = record["thread_id"];
     if (typeof metaThreadId !== "string" || metaThreadId.trim().length === 0) return undefined;
     const threadHeader = headers["thread-id"];
     if (typeof threadHeader !== "string" || threadHeader.trim() !== metaThreadId.trim()) return undefined;
-    if (threadSource === "subagent") return { value: threadHeader.trim(), threadSource };
-    const sessionHeader = headers["session-id"];
-    if (typeof sessionHeader !== "string" || sessionHeader.trim().length === 0) return undefined;
-    return { value: sessionHeader.trim(), threadSource };
+    if (threadSource.trim() === "user") {
+        const sessionHeader = headers["session-id"];
+        if (typeof sessionHeader !== "string" || sessionHeader.trim().length === 0) return undefined;
+        return { value: sessionHeader.trim(), threadSource: "user" };
+    }
+    return { value: threadHeader.trim(), threadSource };
 }

@@ -197,10 +197,28 @@ test("codexTurnIdentity: JSON parse failure / non-object → do not trust (legac
     assert.equal(codexTurnIdentity({ "session-id": ROOT_SESSION, "thread-id": ROOT_SESSION, "x-codex-turn-metadata": "   " }), undefined);
 });
 
-test("codexTurnIdentity: unknown/missing thread_source → do not trust (legacy chain)", () => {
-    assert.equal(codexTurnIdentity({ "session-id": ROOT_SESSION, "thread-id": ROOT_SESSION, "x-codex-turn-metadata": rootMeta({ thread_source: "system" }) }), undefined);
+test("codexTurnIdentity: non-string/missing thread_source → do not trust (legacy chain)", () => {
     assert.equal(codexTurnIdentity({ "session-id": ROOT_SESSION, "thread-id": ROOT_SESSION, "x-codex-turn-metadata": rootMeta({ thread_source: undefined }) }), undefined);
+    assert.equal(codexTurnIdentity({ "session-id": ROOT_SESSION, "thread-id": ROOT_SESSION, "x-codex-turn-metadata": rootMeta({ thread_source: 42 }) }), undefined);
+    assert.equal(codexTurnIdentity({ "session-id": ROOT_SESSION, "thread-id": ROOT_SESSION, "x-codex-turn-metadata": rootMeta({ thread_source: "  " }) }), undefined);
     assert.equal(codexTurnIdentity({ "session-id": ROOT_SESSION, "thread-id": ROOT_SESSION, "x-codex-turn-metadata": rootMeta({ thread_id: 123 }) }), undefined);
+});
+
+test("codexTurnIdentity: any non-user thread_source partitions by thread-id (guardian family, #150)", () => {
+    // codex ThreadSource serializes more than user/subagent: review sessions
+    // send "guardian_review", the guardian-v2 async scorer sends
+    // "guardian_classifier" (Feature string), and memory consolidation sends
+    // "memory_consolidation". All are internal threads that must NOT inherit
+    // the root session's compression state — the discrimination is inverted:
+    // only "user" joins the root, everything else gets its own thread state.
+    for (const source of ["subagent", "guardian_review", "guardian_classifier", "memory_consolidation", "collab_spawn", "system"]) {
+        const id = codexTurnIdentity({
+            "session-id": ROOT_SESSION,
+            "thread-id": SUB_THREAD,
+            "x-codex-turn-metadata": subMeta({ thread_source: source, thread_id: SUB_THREAD }),
+        });
+        assert.deepEqual(id, { value: SUB_THREAD, threadSource: source }, `thread_source=${source}`);
+    }
 });
 
 test("codexTurnIdentity: user turn with no session-id header → do not trust (legacy chain)", () => {
