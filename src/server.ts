@@ -1051,7 +1051,7 @@ async function handle(
                               : prepareResponses(parsed as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, responsesIdentity!, pluginMode, upstreamOrigin);
                 prepared = runPrepare();
                 if (!countTokens && !responsesCompact) {
-                    prepared = await preflightCompressIfNeeded(
+                    const outcome = await preflightCompressIfNeeded(
                         prepared,
                         runPrepare,
                         req,
@@ -1065,6 +1065,30 @@ async function handle(
                         log,
                         instanceId,
                     );
+                    if (isPreflightFailFast(outcome)) {
+                        // #301: the payload still overflows the window and
+                        // preflight could not fix it — answer with a
+                        // structured error instead of forwarding.
+                        if (outcome.respond && !res.headersSent && !res.destroyed) {
+                            // Retry-After on the 503 (rate-limited) path: gives
+                            // well-behaved clients a backoff signal instead of
+                            // hammering the rate-limited upstream (#301).
+                            res.writeHead(outcome.status, {
+                                "content-type": "application/json",
+                                ...(outcome.status === 503 ? { "retry-after": "30" } : {}),
+                            });
+                            res.end(JSON.stringify({
+                                error: {
+                                    type: "server_error",
+                                    code: "preflight_compress_failed",
+                                    message: outcome.message,
+                                    retryable: outcome.retryable,
+                                },
+                            }));
+                        }
+                        return;
+                    }
+                    prepared = outcome;
                 }
                 await forward(req, res, opts, prepared!.body, prepared!, core, reqConfig, log, route, instanceId, affinity);
                 // Remember for ALL modes (not just plugin): wire clients (dsh,
@@ -1723,6 +1747,23 @@ function buildForwardTarget(
 // the model sees it), so the session would be stuck. Compress oldest
 // compressible ranges first (summarization calls sized to fit the smaller
 // window), then rebuild the payload.
+/** Fail-fast outcome (#301): the payload still overflows the window and
+ *  preflight could not fix it, so the proxy answers with a structured error
+ *  instead of forwarding a guaranteed-400 payload (wasted quota + retry
+ *  storms). */
+interface PreflightFailFast {
+    failFast: true;
+    status: number;
+    message: string;
+    retryable: boolean;
+    /** False when the client already disconnected — there is nothing to write. */
+    respond: boolean;
+}
+
+function isPreflightFailFast(outcome: Prepared | PreflightFailFast): outcome is PreflightFailFast {
+    return "failFast" in outcome;
+}
+
 async function preflightCompressIfNeeded(
     prepared: Prepared,
     runPrepare: () => Prepared,
@@ -1736,15 +1777,35 @@ async function preflightCompressIfNeeded(
     affinity: string | undefined,
     log: (level: string, msg: string) => void,
     instanceId: string,
-): Promise<Prepared> {
+): Promise<Prepared | PreflightFailFast> {
     const session = prepared.session;
     const limit = config.modelContextLimit;
     // A fresh session (id rotated, e.g. after a model switch) has
     // lastInputTokens = 0 while still carrying a full raw history; size the
     // trigger on the real post-fold payload too.
-    const tokenCount = Math.max(session.stats.lastInputTokens, estimateCoreMessages(prepared.processedMessages));
+    const payloadEstimate = estimateCoreMessages(prepared.processedMessages);
+    const tokenCount = Math.max(session.stats.lastInputTokens, payloadEstimate);
     if (limit <= 0 || !model || tokenCount < limit) return prepared;
-    if ((prepared.nudge?.compressibleRanges ?? []).length === 0) return prepared;
+    // #301: forwarding as-is is safe ONLY when the payload's own estimate
+    // fits the window. The trigger (and the loop's fit check) floor on
+    // session.stats.lastInputTokens, which can be stale — e.g. a
+    // double-counted usage report (#300) — and must not turn a fitting
+    // payload into a fail-fast false positive.
+    const failFast = (status: number, detail: string, retryable: boolean): PreflightFailFast => {
+        const message =
+            `context ~${tokenCount} tokens exceeds the model window ${limit} (model=${model}) ` +
+            `and preflight compression could not bring it under: ${detail}. ` +
+            `The over-window payload was NOT forwarded.`;
+        log("error", `[${session.id}] preflight fail-fast ${status} (retryable=${retryable}): ${message}`);
+        return { failFast: true, status, message, retryable, respond: !res.writableEnded };
+    };
+    if ((prepared.nudge?.compressibleRanges ?? []).length === 0) {
+        if (payloadEstimate < limit) {
+            log("warn", `[${session.id}] preflight trigger fired on a stale baseline (~${tokenCount}) but the payload fits (~${payloadEstimate}/${limit}); forwarding as-is`);
+            return prepared;
+        }
+        return failFast(502, "no part of the conversation is compressible (nothing left to fold)", false);
+    }
     log("warn", `[${session.id}] context ${tokenCount} tokens exceeds model window ${limit} (model=${model}); preflight compressing before forward`);
     // #300: stamp the chain marker so a downstream bili skips these
     // summarization calls too (preflight always processes).
@@ -1770,16 +1831,27 @@ async function preflightCompressIfNeeded(
         },
         prepared.originalMessages,
     );
-    if (result.compressedRanges > 0) {
-        log("info", `[${session.id}] preflight compressed ${result.compressedRanges} range(s), ~${result.savedTokens} tokens saved (${tokenCount} → ${session.stats.lastInputTokens}) in ${Date.now() - started}ms; rebuilding payload`);
-        const rebuilt = runPrepare();
-        // runPrepare re-incremented stats.requests; the rebuild is internal
-        // to this single client request.
-        session.stats.requests -= 1;
-        return rebuilt;
+    if (result.payloadEstimate < limit) {
+        if (result.compressedRanges > 0) {
+            log("info", `[${session.id}] preflight compressed ${result.compressedRanges} range(s), ~${result.savedTokens} tokens saved (${tokenCount} → ${session.stats.lastInputTokens}) in ${Date.now() - started}ms; rebuilding payload`);
+            const rebuilt = runPrepare();
+            // runPrepare re-incremented stats.requests; the rebuild is internal
+            // to this single client request.
+            session.stats.requests -= 1;
+            return rebuilt;
+        }
+        log("warn", `[${session.id}] preflight made no progress but the payload fits (~${result.payloadEstimate}/${limit}); forwarding as-is`);
+        return prepared;
     }
-    log("warn", `[${session.id}] preflight could not compress enough (~${result.savedTokens} tokens saved); forwarding as-is`);
-    return prepared;
+    // The payload still overflows the window: fail fast with a diagnostic
+    // error instead of forwarding a guaranteed-400 payload (#301).
+    const f = result.failure;
+    if (f?.kind === "aborted") {
+        log("warn", `[${session.id}] preflight aborted (${f.detail}); not forwarding`);
+        return { failFast: true, status: 0, message: f.detail, retryable: false, respond: false };
+    }
+    const status = f?.kind === "upstream" && f.status === 429 ? 503 : 502;
+    return failFast(status, f?.detail ?? "unknown reason", status === 503);
 }
 
 async function forward(
