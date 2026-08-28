@@ -55,6 +55,7 @@ import { runCompressLoop, pickAdapter } from "./loop/index.js";
 import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeResponsesMessageItems } from "./loop/adapter-responses.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesJsonResponse } from "./stream-responses.js";
+import { observeResponsesTerminalState } from "./stream-terminal.js";
 import { emitStreamError } from "./stream-error.js";
 import { affinityToken, clientConversationHeader, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
@@ -1401,6 +1402,12 @@ function prepareResponses(
 
     const shouldInject = opts.compress.injectTool;
     const injectTools = shouldInject && !pluginMode;
+    // Codex native remote-compact request: no compress prompt/tools (the model
+    // produces the compaction itself), no acp tags, plain passthrough so the
+    // response terminal state can gate the rebase marker.
+    const isCompactionTrigger = Array.isArray(parsed.input)
+        && parsed.input.length > 0
+        && parsed.input[parsed.input.length - 1]!.type === "compaction_trigger";
     // Route config is keyed by the upstream THIS request goes to (#286: a
     // session can outlive its first relay — session.meta.upstreamOrigin is
     // first-wins and would silently ignore the new relay's route settings).
@@ -1416,7 +1423,7 @@ function prepareResponses(
             log("info", `[${sessionId}] input items: ${Array.isArray(parsed.input) ? parsed.input.map((i: ResponseInputItem) => i.type).join(",") : "(string)"}`);
         }
         const tokenCount = session.stats.lastInputTokens;
-        const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" });
+        const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: process.env.ACP_RENDER_NONE || isCompactionTrigger ? "none" : "text-only" });
         session.state = turn.state;
         // The fold from last turn's compress has now materialized in state —
         // future usage reports are post-fold reality, drop the credit.
@@ -1436,7 +1443,7 @@ function prepareResponses(
         processedMessages = stripKernelSummaries(turn.messages, turn.state);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltInput = patchResponsesInput(projection, processedMessages);
-        if (shouldInject && !process.env.ACP_NO_COMPRESS_PROMPT) {
+        if (shouldInject && !isCompactionTrigger && !process.env.ACP_NO_COMPRESS_PROMPT) {
             const prompt = responsesTextProtocol ? buildCompressHybridSystemPrompt(prompts) : buildCompressSystemPrompt(prompts);
             const devContent = [...projection.systemParts, prompt].join("\n\n---\n\n");
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent);
@@ -1448,15 +1455,10 @@ function prepareResponses(
         } else if (projection.systemParts.length > 0) {
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, projection.systemParts.join("\n\n---\n\n"));
         }
-        // Codex's native remote-compact request ends with a `compaction_trigger`
-        // item that the upstream requires to be the FINAL input item (else 400
-        // "must be the final input item"). A nudge appended after it would break
-        // Codex's own compaction, and is redundant — the native compact IS the
-        // compression. Skip the nudge for such requests.
-        const triggerFinal = Array.isArray(rebuiltInput)
-            && rebuiltInput.length > 0
-            && rebuiltInput[rebuiltInput.length - 1]!.type === "compaction_trigger";
-        if (opts.compress.injectNudge && turn.nudge?.shouldInject && shouldInject && !triggerFinal) {
+        // A nudge appended after a trailing `compaction_trigger` would break
+        // the upstream's "must be the final input item" requirement and is
+        // redundant — the native compact IS the compression.
+        if (opts.compress.injectNudge && turn.nudge?.shouldInject && shouldInject && !isCompactionTrigger) {
             try {
                 const rendered = renderNudgeText(turn.nudge, prompts);
                 if (rendered.text) {
@@ -1522,11 +1524,12 @@ function prepareResponses(
         responsesProjection,
         protocol: "responses",
         stream,
-        compressInjected: injectTools,
+        compressInjected: injectTools && !isCompactionTrigger,
         pluginMode,
         responsesTextProtocol,
         nudge,
         prompts,
+        resetAfterSuccess: isCompactionTrigger,
     };
 }
 
@@ -2127,8 +2130,7 @@ async function forward(
         res.end();
         clearUpstreamTimer();
         if (prepared?.resetAfterSuccess) {
-            markNativeCompactionBoundary(prepared.session);
-            log("info", `[${prepared.session.id}] native Responses compact completed; rebase scheduled for next Responses turn`);
+            log("warn", `[${prepared.session.id}] native compact response had no body; rebase NOT scheduled`);
         }
         return;
     }
@@ -2160,11 +2162,21 @@ async function forward(
         prepared.compressInjected &&
         prepared.processedMessages.length > 0;
     if (!useRewriter || prepared === null) {
-        await pipeThrough(upstream.body, res);
-        clearUpstreamTimer();
-        if (prepared?.resetAfterSuccess) {
-            markNativeCompactionBoundary(prepared.session);
-            log("info", `[${prepared.session.id}] native Responses compact completed; rebase scheduled for next Responses turn`);
+        if (prepared && prepared.resetAfterSuccess) {
+            const [toClient, toObserve] = upstream.body.tee();
+            const observed = observeResponsesTerminalState(toObserve, prepared.stream);
+            await pipeThrough(toClient, res);
+            clearUpstreamTimer();
+            const terminal = await observed;
+            if (terminal === "completed") {
+                markNativeCompactionBoundary(prepared.session);
+                log("info", `[${prepared.session.id}] native Responses compact completed; rebase scheduled for next Responses turn`);
+            } else {
+                log("warn", `[${prepared.session.id}] native compact response terminal=${terminal}; rebase NOT scheduled`);
+            }
+        } else {
+            await pipeThrough(upstream.body, res);
+            clearUpstreamTimer();
         }
         return;
     }
