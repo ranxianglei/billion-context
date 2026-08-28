@@ -449,6 +449,20 @@ Run `codex login` as usual; the OAuth token travels in the `Authorization` heade
 "baseUrl": "http://localhost:8787/bili/https://api.anthropic.com"
 ```
 
+**Claude Code** — set the `ANTHROPIC_BASE_URL` env var to the `/bili/` URL. (claude's undici fetch ignores `HTTPS_PROXY`, so the `/bili/` URL form is the only manual option — cert MITM cannot intercept it.)
+
+```bash
+export ANTHROPIC_BASE_URL="http://localhost:8787/bili/https://api.anthropic.com"
+```
+
+> **Auto-compact alignment (manual mode only).** The `bili claude` launcher automatically sets `CLAUDE_CODE_AUTO_COMPACT_WINDOW` to bili's effective window for your model, so claude's own auto-compact threshold lines up with bili's compression budget. In manual `/bili/` mode you must do this yourself — otherwise claude may run its own local auto-compact (a "summarize the conversation" turn) on a threshold that doesn't match bili's window. That is usually harmless (same session-id, so bili re-derives state from the truncation) but noisier than needed. Set it to bili's effective window for your model:
+>
+> ```bash
+> export CLAUDE_CODE_AUTO_COMPACT_WINDOW=<bili effective window in tokens>
+> ```
+>
+> claude clamps this value **down** to the window it perceives for the model (never up), so over-setting is safe. You can also set it persistently via claude's settings (`autoCompactWindow`).
+
 **Other API-key clients** (Cursor / Aider / Continue …) — wherever the upstream URL is configured, prepend `http://localhost:8787/bili/`. Nothing else changes.
 
 The `/bili/` prefix doubles as a **self-detection signal**: billion-context client extensions (billion-context-pi / opencode-acp) recognize it in their own baseUrl and self-disable, so you never get double compression.
