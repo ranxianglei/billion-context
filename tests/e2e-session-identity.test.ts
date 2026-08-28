@@ -277,27 +277,49 @@ test("e2e session identity: same conversation value continues across a protocol 
     }
 });
 
-test("e2e session identity: anonymous responses request → 400, no session created (#286)", async () => {
+test("e2e session identity: anonymous responses request with history → prefix-affinity session, continuation sticks (#309)", async () => {
     const h = await startHarness();
     try {
-        const resp = await postRaw(h, 0, "/v1/responses", responsesBody(), {});
-        assert.equal(resp.status, 400);
-        const json = (await resp.json()) as { error?: { message?: string } };
-        assert.match(json.error?.message ?? "", /Missing stable conversation identity/);
-        assert.equal((await getSessions(h)).length, 0);
+        const body = responsesBody();
+        await post(h, 0, "/v1/responses", body, { authorization: "Bearer anon-key" });
+        const sessions1 = await getSessions(h);
+        assert.equal(sessions1.length, 1);
+        assert.match(sessions1[0]!.id, /^pfa-[0-9a-f]{16}$/);
+        assert.equal(sessions1[0]!.requests, 1);
+        // Replay the same history + one appended turn → same session.
+        const extended = responsesBody();
+        (extended.input as unknown[]).push({ type: "message", role: "user", content: [{ type: "input_text", text: "next turn" }] });
+        await post(h, 0, "/v1/responses", extended, { authorization: "Bearer anon-key" });
+        const sessions2 = await getSessions(h);
+        assert.equal(sessions2.length, 1, `expected 1 session, got ${JSON.stringify(sessions2)}`);
+        assert.equal(sessions2[0]!.id, sessions1[0]!.id);
+        assert.equal(sessions2[0]!.requests, 2);
     } finally {
         await h.close();
     }
 });
 
-test("e2e session identity: anonymous anthropic request → 400 anthropic error shape (#286)", async () => {
+test("e2e session identity: anonymous anthropic request with history → prefix-affinity session (#309)", async () => {
     const h = await startHarness();
     try {
         const resp = await postRaw(h, 0, "/v1/messages", anthropicBody(), { "x-api-key": "sk-ant" });
+        assert.equal(resp.status, 200, `proxy returned ${resp.status}: ${await resp.text()}`);
+        const sessions = await getSessions(h);
+        assert.equal(sessions.length, 1);
+        assert.match(sessions[0]!.id, /^pfa-[0-9a-f]{16}$/);
+        assert.equal(sessions[0]!.protocol, "anthropic");
+    } finally {
+        await h.close();
+    }
+});
+
+test("e2e session identity: anonymous degenerate request (no history signal) → 400 (#286 remnant)", async () => {
+    const h = await startHarness();
+    try {
+        // No messages at all: nothing to anchor prefix affinity on.
+        const resp = await postRaw(h, 0, "/v1/messages", { model: "claude-test", max_tokens: 1024, stream: true, system: "system only", messages: [] }, { "x-api-key": "sk-ant" });
         assert.equal(resp.status, 400);
-        const json = (await resp.json()) as { type?: string; error?: { type?: string; message?: string } };
-        assert.equal(json.type, "error");
-        assert.equal(json.error?.type, "invalid_request_error");
+        const json = (await resp.json()) as { type?: string; error?: { message?: string } };
         assert.match(json.error?.message ?? "", /Missing stable conversation identity/);
         assert.equal((await getSessions(h)).length, 0);
     } finally {
@@ -305,14 +327,15 @@ test("e2e session identity: anonymous anthropic request → 400 anthropic error 
     }
 });
 
-test("e2e session identity: anonymous openai request → 400, even with credentials (#286)", async () => {
+test("e2e session identity: anonymous openai request → prefix-affinity session; distinct conversations split (#309)", async () => {
     const h = await startHarness();
     try {
-        const resp = await postRaw(h, 0, "/v1/chat/completions", chatBody(), { authorization: "Bearer keyX" });
-        assert.equal(resp.status, 400);
-        const json = (await resp.json()) as { error?: { message?: string } };
-        assert.match(json.error?.message ?? "", /Missing stable conversation identity/);
-        assert.equal((await getSessions(h)).length, 0);
+        await post(h, 0, "/v1/chat/completions", chatBody(), { authorization: "Bearer keyX" });
+        const different = { model: "gpt-test", stream: true, messages: [{ role: "user", content: "a completely different topic" }] };
+        await post(h, 0, "/v1/chat/completions", different, { authorization: "Bearer keyX" });
+        const sessions = await getSessions(h);
+        assert.equal(sessions.length, 2, `expected 2 sessions, got ${JSON.stringify(sessions)}`);
+        assert.ok(sessions.every((s) => /^pfa-[0-9a-f]{16}$/.test(s.id)));
     } finally {
         await h.close();
     }
