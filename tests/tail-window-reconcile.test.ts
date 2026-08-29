@@ -83,6 +83,22 @@ test("tail-window: brand-new conversation resolves via new (regression)", () => 
     assert.notEqual(b.sessionId, a.sessionId);
 });
 
+test("tail-window: distinct conversation sharing a long templated head must NOT merge (offset-0 guard)", () => {
+    const r = new PrefixAffinityResolver();
+    const sharedHead = chain(8, "templated-onboarding");
+    const aFull = [...sharedHead, ...chain(4, "conv-a-body")];
+    const a = r.resolve(aFull)!;
+    r.note(a.sessionId, a.incomingDepth, a.tailHash, a.itemHashes);
+
+    // B shares the entire 8-item head and diverges after it. A truncation
+    // reattach can never start at the stored head (such a client would be
+    // caught by the full-prefix step), so B must NOT be merged into A.
+    const bIncoming = [...sharedHead, ...chain(3, "conv-b-body")];
+    const b = r.resolve(bIncoming)!;
+    assert.equal(b.via, "new", "a shared templated head must not reattach the other conversation");
+    assert.notEqual(b.sessionId, a.sessionId);
+});
+
 test("fork lineage: divergent continuation records forked lineage (UI/debug only)", () => {
     const r = new PrefixAffinityResolver();
     const shared = chain(4, "shared");

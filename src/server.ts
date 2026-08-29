@@ -1686,8 +1686,14 @@ function prepareResponsesCompact(
     log: (level: string, msg: string) => void,
 ): Prepared {
     ++session.stats.requests;
+    // A bili-forged compaction item is never for the upstream (it carries our
+    // sentinel blob) — strip it on every forwarding path, same as the normal
+    // /responses pipeline does.
+    const cleaned = Array.isArray(parsed.input) ? stripBiliCompactionItems(parsed.input) : parsed.input;
+    const stripped = Array.isArray(parsed.input) && cleaned.length !== parsed.input.length;
+    const forgeBody: ResponsesRequestBody = { ...parsed, input: cleaned };
     const base: Prepared = {
-        body,
+        body: stripped ? Buffer.from(JSON.stringify(forgeBody)) : body,
         session,
         processedMessages: [],
         originalMessages: [],
@@ -1703,8 +1709,6 @@ function prepareResponsesCompact(
     // fold pipeline as a normal turn and forge the compacted history as
     // {"output": [...]} — a deterministic handoff to the ACP state instead of a
     // foreign compaction blob.
-    const cleaned = stripBiliCompactionItems(parsed.input);
-    const forgeBody: ResponsesRequestBody = { ...parsed, input: cleaned };
     let transformOk = false;
     try {
         const projection = responsesToCore(forgeBody);

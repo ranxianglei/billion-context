@@ -197,13 +197,17 @@ export class PrefixAffinityResolver {
         //    (plus new appends), so the incoming's LEADING items must appear
         //    as a contiguous run somewhere inside the stored chain's item
         //    hashes — at any offset, not just the stored tail (a rolling-window
-        //    client may retain more items than TAIL_WINDOW).
+        //    client may retain more items than TAIL_WINDOW). Offset 0 is
+        //    excluded: a head-to-head match is either a full-prefix case
+        //    (step 1) or a distinct conversation sharing a templated head —
+        //    never a truncation reattach (the retained suffix of a truncation
+        //    starts strictly inside the stored chain).
         const w = Math.min(TAIL_WINDOW, incomingDepth);
         const candidates: ChainEntry[] = [];
         if (w >= MIN_TAIL_MATCH) {
             for (const entry of tracked.values()) {
                 const stored = entry.itemHashes;
-                for (let j = 0; j + w <= stored.length; j++) {
+                for (let j = 1; j + w <= stored.length; j++) {
                     let match = true;
                     for (let i = 0; i < w; i++) {
                         if (incItemHashes[i] !== stored[j + i]) {
