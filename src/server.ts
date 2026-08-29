@@ -57,7 +57,7 @@ import { runCompressLoop, pickAdapter } from "./loop/index.js";
 import { containsToolCallXmlFragment } from "./loop/tag-echo-filter.js";
 import { isFakeCompletion, injectFakeCompletionHint, maxFakeCompletionRetries, fakeBufCap } from "./fake-completion.js";
 import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeResponsesMessageItems } from "./loop/adapter-responses.js";
-import { codexCompactMode, isCodexClient, hasCompactionTrigger, stripBiliCompactionItems, replaceBiliCompactionItems, codexCompactGate, buildTriggerForgeBody, mergeForgedSummaries } from "./codex-compact.js";
+import { codexCompactMode, isCodexClient, hasCompactionTrigger, stripBiliCompactionItems, replaceBiliCompactionItems, codexCompactGate, codexCompactGatePre, buildTriggerForgeBody, mergeForgedSummaries } from "./codex-compact.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { observeResponsesTerminalState } from "./stream-terminal.js";
@@ -1281,6 +1281,32 @@ async function handle(
                             : responsesCompact
                                ? prepareResponsesCompact(bodyBuffer, parsed as ResponsesRequestBody, session, req, core, reqConfig, log)
                                : prepareResponses(parsed as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow);
+                // #332: codex's native remote-compaction request (trigger form)
+                // is dispatched BEFORE prepare/preflight. When it is not
+                // intercepted, the upstream must receive exactly what codex
+                // sent: a preflight-compressed/rebuilt payload diverges from
+                // codex's local history, non-OpenAI backends 400 the
+                // compaction_trigger item, and folding bili's state as a side
+                // effect of handling codex's own compaction is wrong.
+                const isCodexCompactTrigger =
+                    protocol === "responses" &&
+                    !responsesCompact &&
+                    isCodexClient(req.headers) &&
+                    hasCompactionTrigger((parsed as ResponsesRequestBody).input);
+                if (isCodexCompactTrigger) {
+                    const mode = codexCompactMode();
+                    const gatePre = codexCompactGatePre(session, reqConfig.modelContextLimit);
+                    if (mode === "intercept" && gatePre) prepared = runPrepare();
+                    if (prepared?.codexForge) {
+                        await forward(req, res, opts, prepared.body, prepared, core, reqConfig, log, route, instanceId, affinity);
+                        rememberPluginMessages(sessionId, prepared.processedMessages, prepared.originalMessages, prepared.nudge);
+                        return;
+                    }
+                    const why = mode !== "intercept" ? "BILI_CODEX_COMPACT=pass" : !gatePre ? "gate preconditions not met" : "transform/forge failed";
+                    log("info", `[${session.id}] codex compaction_trigger request not intercepted (${why}) — forwarding verbatim (no preflight, no rebuild, no window clamp)`);
+                    await forward(req, res, opts, bodyBuffer, null, core, reqConfig, log, route, instanceId, affinity);
+                    return;
+                }
                 prepared = runPrepare();
                 if (!countTokens && !responsesCompact) {
                     const outcome = await preflightCompressIfNeeded(
@@ -2013,7 +2039,11 @@ function prepareResponsesCompact(
         compressInjected: false,
         resetAfterSuccess: true,
     };
-    if (codexCompactMode() !== "intercept" || !isCodexClient(req.headers) || !Array.isArray(parsed.input)) {
+    // #332: gate preconditions BEFORE the transform — when they fail the
+    // request passes through verbatim without running processTurn (no state
+    // mutation as a side effect of a compact that will not be intercepted).
+    if (codexCompactMode() !== "intercept" || !isCodexClient(req.headers) || !Array.isArray(parsed.input)
+        || !codexCompactGatePre(session, config.modelContextLimit)) {
         return base;
     }
     // The state commit below is all-or-nothing: every non-forge path restores
