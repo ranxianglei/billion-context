@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { CompressionBlock } from "acp-kernel";
 import type { Session } from "./session.js";
 
 export const CODEX_COMPACT_ID_PREFIX = "fc_bili_";
@@ -81,4 +82,32 @@ export function buildTriggerForgeSse(
     const frame1 = `data: ${JSON.stringify({ type: "response.output_item.done", item: compactionItem })}\n\n`;
     const frame2 = `data: ${JSON.stringify({ type: "response.completed", response: completed })}\n\n`;
     return frame1 + frame2;
+}
+
+// The kernel renders block summaries as system messages with this header
+// (acp-kernel SUMMARY_HEADER). Reuse the exact format so the model reads a
+// captured handoff summary the same way it reads a live kernel-rendered one.
+const FORGED_SUMMARY_HEADER = "[Compressed conversation section]";
+
+export function renderForgedSummary(block: Pick<CompressionBlock, "summary" | "topic">): string {
+    const body = block.summary.trim();
+    const topicLine = block.topic ? `${FORGED_SUMMARY_HEADER} — ${block.topic}` : FORGED_SUMMARY_HEADER;
+    return body.length === 0 ? topicLine : `${topicLine}\n${body}`;
+}
+
+// The forged compaction item is opaque to the model and codex truncates its
+// history to [compaction_item, tail…], so the kernel deactivates the blocks
+// covering the truncated prefix on the next replay and their summaries would
+// vanish from the model's view. Capture them (kernel render format) at forge
+// time; the server re-injects them into the developer message every turn
+// (endpoint-form semantics). Append-only + exact-text dedup: a second forge
+// accumulates, re-capture of deactivated blocks adds nothing.
+export function mergeForgedSummaries(existing: string[] | undefined, blocks: readonly CompressionBlock[]): string[] {
+    const merged = existing ? [...existing] : [];
+    for (const block of blocks) {
+        if (!block.active) continue;
+        const rendered = renderForgedSummary(block);
+        if (!merged.includes(rendered)) merged.push(rendered);
+    }
+    return merged;
 }

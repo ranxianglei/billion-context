@@ -54,7 +54,7 @@ import { defaultLogFile, stateDir, proxyOriginFile } from "./paths.js";
 import { compressLoopResponsesJson } from "./compress-loop-responses.js";
 import { runCompressLoop, pickAdapter } from "./loop/index.js";
 import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeResponsesMessageItems } from "./loop/adapter-responses.js";
-import { codexCompactMode, isCodexClient, hasCompactionTrigger, stripBiliCompactionItems, codexCompactGate, buildTriggerForgeSse } from "./codex-compact.js";
+import { codexCompactMode, isCodexClient, hasCompactionTrigger, stripBiliCompactionItems, codexCompactGate, buildTriggerForgeSse, mergeForgedSummaries } from "./codex-compact.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { observeResponsesTerminalState } from "./stream-terminal.js";
@@ -1428,6 +1428,16 @@ function prepareResponses(
         if (cleaned.length !== parsed.input.length) {
             log("info", `[${sessionId}] stripped ${parsed.input.length - cleaned.length} bili compaction item(s) echoed by codex`);
             parsed.input = cleaned;
+            // The truncated replay deactivates the blocks covering the dropped
+            // prefix during the processTurn below — capture their summaries
+            // while still active (also covers sessions forged by an older
+            // build that never captured them).
+            const prevForged = session.metadata.codexForgedSummaries as string[] | undefined;
+            const captured = mergeForgedSummaries(prevForged, session.state.blocks);
+            if (captured.length !== (prevForged?.length ?? 0)) {
+                session.metadata.codexForgedSummaries = captured;
+                markDirty(session);
+            }
         }
     }
 
@@ -1499,17 +1509,19 @@ function prepareResponses(
         processedMessages = stripKernelSummaries(turn.messages, turn.state);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltInput = patchResponsesInput(projection, processedMessages);
+        const forgedSummaries = (session.metadata.codexForgedSummaries as string[] | undefined) ?? [];
         if (shouldInject && !isCompactionTrigger && !process.env.ACP_NO_COMPRESS_PROMPT) {
             const prompt = responsesTextProtocol ? buildCompressHybridSystemPrompt(prompts) : buildCompressSystemPrompt(prompts);
-            const devContent = [...projection.systemParts, prompt].join("\n\n---\n\n");
+            const devContent = [...projection.systemParts, ...forgedSummaries, prompt].join("\n\n---\n\n");
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent);
             if (!process.env.ACP_NO_INJECT_TOOL && injectTools) {
                 toolsOut = responsesTextProtocol
                     ? injectResponsesTool(parsed.tools, ACP_READONLY_TOOLS_RESPONSES)
                     : injectResponsesTool(parsed.tools);
             }
-        } else if (projection.systemParts.length > 0) {
-            rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, projection.systemParts.join("\n\n---\n\n"));
+        } else if (projection.systemParts.length > 0 || forgedSummaries.length > 0) {
+            const devContent = [...projection.systemParts, ...forgedSummaries].join("\n\n---\n\n");
+            rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent);
         }
         // A nudge appended after a trailing `compaction_trigger` would break
         // the upstream's "must be the final input item" requirement and is
@@ -1545,6 +1557,12 @@ function prepareResponses(
         && hasCompactionTrigger(parsed.input)
         && codexCompactGate(session, config.modelContextLimit, transformOk)) {
         const summaries = session.state.blocks.filter((b) => b.active).map((b) => b.summary);
+        const prevForged = session.metadata.codexForgedSummaries as string[] | undefined;
+        const captured = mergeForgedSummaries(prevForged, session.state.blocks);
+        if (captured.length !== (prevForged?.length ?? 0)) {
+            session.metadata.codexForgedSummaries = captured;
+            markDirty(session);
+        }
         const total = session.stats.lastInputTokens;
         codexForge = {
             kind: "trigger",

@@ -212,6 +212,49 @@ test("e2e E2 (trigger form): intercept + nothing compressed yet → forwarded (n
     });
 });
 
+test("e2e E2 (trigger form): post-forge turn — echo stripped, forged summary re-injected as developer message", async () => {
+    await withHarness({ mode: "intercept", firstTurnTokens: 1000 }, async (h) => {
+        const afterSetup = await setupCompressedSession(h);
+
+        // Turn 2: codex native auto-compact trigger → intercepted + forged.
+        const r2 = await fetch(h.url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "user-agent": CODEX_UA },
+            body: JSON.stringify({ model: "gpt-resp", stream: true, session_id: SESSION, instructions: "You are the test coding agent.", input: [...conversation(), { type: "compaction_trigger" }] }),
+        });
+        assert.equal(r2.status, 200);
+        const frames = (await r2.text()).split("\n\n").filter((f) => f.startsWith("data: "));
+        const e1 = JSON.parse(frames[0]!.slice("data: ".length)) as { item: { type: string; id: string; encrypted_content: string } };
+        assert.equal(e1.item.type, "compaction", "forge returned the compaction item");
+
+        // Turn 3: codex replays [forged compaction item, retained tail, new
+        // turn]. The kernel deactivates the block (its messages are gone from
+        // the replay), so the summary must survive via the captured
+        // developer-message re-injection — and the echoed bili item must not
+        // reach upstream.
+        const r3 = await fetch(h.url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "user-agent": CODEX_UA },
+            body: JSON.stringify({ model: "gpt-resp", stream: true, session_id: SESSION, instructions: "You are the test coding agent.", input: [e1.item, ...conversation().slice(-2), { type: "message", role: "user", content: "continue the work" }] }),
+        });
+        assert.equal(r3.status, 200);
+        await r3.text();
+        assert.equal(h.bodies.length, afterSetup + 1, "post-forge turn forwarded to upstream exactly once");
+
+        const s = listSessions().find((x) => x.meta.label === SESSION)!;
+        const captured = s.metadata.codexForgedSummaries as string[] | undefined;
+        assert.ok(Array.isArray(captured) && captured.length > 0, "forge captured the active block summaries");
+        assert.ok(captured.some((t) => t.includes("MAIN-SUMMARY-SETUP")), "captured summary is the setup block's");
+
+        const fwd = h.bodies[h.bodies.length - 1];
+        assert.ok(!fwd.includes("fc_bili_"), "echoed bili compaction item stripped before forwarding");
+        const fwdBody = JSON.parse(fwd) as { input: Array<{ type: string; role?: string; content?: unknown }> };
+        const dev = fwdBody.input.find((i) => i.type === "message" && i.role === "developer");
+        assert.ok(dev, "developer message present in forwarded input");
+        assert.ok(String(dev!.content).includes("MAIN-SUMMARY-SETUP"), "pre-compaction summary re-injected for the model");
+    });
+});
+
 test("e2e E2 (endpoint form): intercept + healthy ACP → forged JSON {output}, upstream untouched", async () => {
     await withHarness({ mode: "intercept", firstTurnTokens: 1000 }, async (h) => {
         const afterSetup = await setupCompressedSession(h);

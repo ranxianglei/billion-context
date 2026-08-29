@@ -13,6 +13,8 @@ import {
     stripBiliCompactionItems,
     codexCompactGate,
     buildTriggerForgeSse,
+    renderForgedSummary,
+    mergeForgedSummaries,
     CODEX_COMPACT_ID_PREFIX,
     CODEX_COMPACT_SENTINEL,
 } from "../src/codex-compact.ts";
@@ -129,4 +131,34 @@ test("buildTriggerForgeSse: minimal legal 2-frame stream", () => {
     assert.equal(e2.response.usage.input_tokens, 1000);
     assert.equal(e2.response.usage.output_tokens, 0);
     assert.equal(e2.response.usage.total_tokens, 1000);
+});
+
+function blockWith(summary: string, active: boolean, topic?: string): CompressionBlock {
+    const b = block(active);
+    b.summary = summary;
+    if (topic !== undefined) b.topic = topic;
+    return b;
+}
+
+test("renderForgedSummary: kernel render format (topic, no topic, empty body)", () => {
+    assert.equal(renderForgedSummary({ summary: "S", topic: "T" }), "[Compressed conversation section] — T\nS");
+    assert.equal(renderForgedSummary({ summary: "S" }), "[Compressed conversation section]\nS");
+    assert.equal(renderForgedSummary({ summary: "   " }), "[Compressed conversation section]");
+});
+
+test("mergeForgedSummaries: append active, skip inactive, dedup, accumulate across forges", () => {
+    const a = blockWith("SUMMARY-A", true, "Topic A");
+    const b = blockWith("SUMMARY-B", true);
+    const c = blockWith("SUMMARY-C", false);
+    let merged = mergeForgedSummaries(undefined, [a, b, c]);
+    assert.equal(merged.length, 2, "inactive block skipped");
+    assert.equal(merged[0], "[Compressed conversation section] — Topic A\nSUMMARY-A");
+    assert.equal(merged[1], "[Compressed conversation section]\nSUMMARY-B");
+    merged = mergeForgedSummaries(merged, [a, b]);
+    assert.equal(merged.length, 2, "exact-text dedup on re-capture");
+    const d = blockWith("SUMMARY-D", true);
+    merged = mergeForgedSummaries(merged, [d]);
+    assert.equal(merged.length, 3, "second forge accumulates");
+    assert.equal(merged[2], "[Compressed conversation section]\nSUMMARY-D");
+    assert.deepEqual(mergeForgedSummaries(undefined, []), []);
 });
