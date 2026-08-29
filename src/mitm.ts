@@ -168,6 +168,7 @@ function tunnelThrough(
         if (head.length > 0) upstream.write(head);
         upstream.pipe(clientSocket);
         clientSocket.pipe(upstream);
+        log(`tunnel ${maskHostForLog(host)}:${port} established (blind TCP, not decrypted)`);
         const cleanup = (where: string, err: Error) => {
             log(`tunnel ${maskHostForLog(host)}:${port} ${where} closed: ${maskHostInText(err.message, host)}`);
             upstream.destroy();
