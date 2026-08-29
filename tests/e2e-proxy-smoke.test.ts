@@ -23,7 +23,7 @@ function sseLine(obj: unknown): string {
     return `data: ${JSON.stringify(obj)}\n\n`;
 }
 
-const DELAY_MS = 40;
+const DELAY_MS = 80;
 
 test("e2e proxy smoke: compress tool-call -> re-request -> round-2 streams in real-time", async () => {
     _setStoreForTest(new SessionStore({ enabled: false }));
