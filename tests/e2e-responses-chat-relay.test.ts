@@ -26,7 +26,7 @@ function sseLine(obj: unknown): string {
     return `data: ${JSON.stringify(obj)}\n\n`;
 }
 
-const DELAY_MS = 40;
+const DELAY_MS = 80;
 
 function startMockChatRelay(script: ChatRelayScript, captured: Captured[]): http.Server {
     const server = http.createServer((req, res) => {
