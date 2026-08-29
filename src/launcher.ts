@@ -42,7 +42,9 @@ import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom } from "./plugin-in
 function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
-import { nonEmpty, resolvePiHome, resolveOmpHome, resolveHermesHome, resolveDshHome, loadClientConfig, collectModelWindows, type ClientConfig, resolveOpencodeConfigFile, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider } from "./client-config.js";
+import { nonEmpty, resolvePiHome, resolveOmpHome, resolveHermesHome, resolveDshHome, loadClientConfig, collectModelWindows, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider } from "./client-config.js";
+import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, type ProviderRoutes } from "./config.js";
+import { contextFromRegistry } from "./registry.js";
 
 export {
     type ClaudeSettings,
@@ -349,6 +351,108 @@ export function buildCodexArgs(
     return args;
 }
 
+/**
+ * PR-D (#321): budget alignment for launcher-spawned agents. Resolves the
+ * context window bili will use as its compression denominator for `model` —
+ * the same chain the proxy applies, minus the per-request-only sources
+ * (anthropic-beta header, plugin report, launcher window):
+ *   per-route per-model config declaration → built-in CONTEXT_LIMIT_TABLE
+ *   → models.dev registry (snapshot-first, offline-safe).
+ */
+export async function resolveLauncherWindow(
+    model: string | undefined,
+    routes: ProviderRoutes,
+    upstreamUrl: string | undefined,
+): Promise<number | undefined> {
+    if (!model) return undefined;
+    let host: string | undefined;
+    if (upstreamUrl) {
+        try {
+            host = new URL(upstreamUrl).hostname;
+        } catch {
+            host = undefined;
+        }
+    }
+    return (
+        resolveConfiguredContextLimit(routes, upstreamUrl, model) ??
+        lookupContextLimit(model) ??
+        (await contextFromRegistry(model, host))
+    );
+}
+
+/**
+ * PR-D (#321): codex's auto-compact budget is keyed off the window CODEX
+ * believes the model has (its bundled model table — bili has no say in it),
+ * while bili's ACP compression is keyed off bili's own window resolution.
+ * Two uncoordinated budgets (#292): when bili's window exceeds codex's
+ * perception, codex's ledger (server-reported usage, which bili sees) crosses
+ * codex's ~90% threshold first and fires its native compaction ahead of ACP.
+ *
+ * Injecting `-c model_context_window=<W> -c model_auto_compact_token_limit=<W>`
+ * (W = bili's effective window) makes codex's auto-compact threshold 90%×W —
+ * ACP (≈55%×W) always fires first, and codex's LOCAL compaction (benign for
+ * bili: same-session truncation the kernel deactivates by message id) only
+ * backstops when ACP fails, before codex's 95% hard cap. codex clamps both
+ * values to its own max_context_window, so an over-generous W degrades to
+ * codex's own perception instead of overshooting.
+ *
+ * Returns [] (no injection) when:
+ *  - no model is configured (nothing to resolve a window for),
+ *  - the user already set `model_context_window` in codex's config.toml
+ *    (bili's proxy uses exactly that value as its launcher window — the
+ *    budget is already aligned by the user's own declaration),
+ *  - bili resolves no window for the model (no authoritative value to inject).
+ * A user-set `model_auto_compact_token_limit` is honored (not overridden).
+ */
+/** The base URL codex will actually call: the selected provider's
+ *  `base_url`, else top-level `openai_base_url`, else codex's built-in
+ *  OpenAI default (model-provider-info: `https://api.openai.com/v1`). */
+export function codexUpstreamUrl(codex: CodexConfig | undefined): string {
+    const provider = codex?.modelProvider ? codex?.providers?.[codex.modelProvider]?.baseUrl : undefined;
+    return provider ?? codex?.openaiBaseUrl ?? "https://api.openai.com/v1";
+}
+
+export async function resolveCodexBudgetArgs(opts: {
+    model: string | undefined;
+    clientWindow: number | undefined;
+    clientAutoCompactLimit: number | undefined;
+    routes: ProviderRoutes;
+    upstreamUrl: string | undefined;
+}): Promise<string[]> {
+    const { model, clientWindow, clientAutoCompactLimit, routes, upstreamUrl } = opts;
+    if (!model || clientWindow) return [];
+    const window = await resolveLauncherWindow(model, routes, upstreamUrl);
+    if (!window) return [];
+    const limit = clientAutoCompactLimit ?? window;
+    return ["-c", `model_context_window=${window}`, "-c", `model_auto_compact_token_limit=${limit}`];
+}
+
+/**
+ * PR-D (#321): claude-code's auto-compact window is a single env knob —
+ * `CLAUDE_CODE_AUTO_COMPACT_WINDOW` outranks settings and is clamped DOWN to
+ * the model window claude itself perceives (never up), so injecting bili's
+ * window is always safe: it tightens claude's threshold to bili's budget when
+ * bili's window is smaller, and is a no-op when it is larger.
+ *
+ * Returns {} (no injection) when: no model resolvable, the user already set
+ * an explicit auto-compact window (settings `autoCompactWindow` or
+ * `env.CLAUDE_CODE_AUTO_COMPACT_WINDOW`, or a shell-exported env var), or
+ * bili resolves no window for the model.
+ */
+export async function resolveClaudeBudgetEnv(opts: {
+    model: string | undefined;
+    userAutoCompactWindow: number | undefined;
+    shellAutoCompactWindow: string | undefined;
+    routes: ProviderRoutes;
+    upstreamUrl: string | undefined;
+}): Promise<NodeJS.ProcessEnv> {
+    const { model, userAutoCompactWindow, shellAutoCompactWindow, routes, upstreamUrl } = opts;
+    if (!model || userAutoCompactWindow !== undefined || nonEmpty(shellAutoCompactWindow)) return {};
+    const window = await resolveLauncherWindow(model, routes, upstreamUrl);
+    if (!window) return {};
+    return { CLAUDE_CODE_AUTO_COMPACT_WINDOW: String(window) };
+}
+
 export function buildClaudeEnv(
     origin: string,
     caPath: string,
@@ -378,6 +482,48 @@ export function launcherDirectUrl(env: NodeJS.ProcessEnv): boolean {
     return env.BILI_LAUNCHER_DIRECT === "1";
 }
 
+/** True when the host points at self-hosted inference: loopback, RFC1918,
+ *  link-local, IPv6 ULA, or an mDNS/LAN name. Those servers (sglang/vllm/
+ *  ollama/llama.cpp) do not understand codex's `namespace` tool type, so
+ *  MCP-injected tools would be silently invisible to the model. */
+export function isPrivateUpstreamHost(raw: string): boolean {
+    let host: string;
+    try {
+        host = new URL(raw).hostname.toLowerCase();
+    } catch {
+        return false;
+    }
+    if (host === "localhost" || host.endsWith(".local") || host.endsWith(".lan") || host.endsWith(".internal")) return true;
+    if (host.startsWith("[")) host = host.slice(1, -1);
+    if (host.includes(":")) {
+        if (host === "::1" || host === "::") return true;
+        const first = host.split(":")[0] ?? "";
+        if (/^f[cd]/.test(first)) return true;
+        if (/^fe[89ab]/.test(first)) return true;
+        const dotted = /::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(host);
+        if (dotted && isPrivateIPv4(dotted[1]!)) return true;
+        const hex = /::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(host);
+        if (hex) {
+            const w1 = Number.parseInt(hex[1]!, 16);
+            const w2 = Number.parseInt(hex[2]!, 16);
+            if (isPrivateIPv4(`${w1 >> 8}.${w1 & 0xff}.${w2 >> 8}.${w2 & 0xff}`)) return true;
+        }
+        return false;
+    }
+    if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) return isPrivateIPv4(host);
+    return false;
+}
+
+function isPrivateIPv4(host: string): boolean {
+    const a = Number.parseInt(host.split(".")[0] ?? "", 10);
+    const b = Number.parseInt(host.split(".")[1] ?? "", 10);
+    if (a === 127 || a === 10 || a === 0) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 169 && b === 254) return true;
+    return false;
+}
+
 /** Plugin-in-launcher MCP injection is ON by default for claude/codex
  *  (zero-config, mirroring the pi/omp/opencode auto-injection): the launcher
  *  injects a single `bili` MCP server so the host gets native tools instead
@@ -385,9 +531,22 @@ export function launcherDirectUrl(env: NodeJS.ProcessEnv): boolean {
  *  pure wire mode — for hosts older than the verified builds (claude 2.1.227,
  *  codex 0.147.0) that have not been tested against `--mcp-config` /
  *  `-c mcp_servers.*`. pi/omp/opencode/hermes/dsh are always excluded — they
- *  have their own native plugin surface (or none). */
-export function launcherInjectMcp(env: NodeJS.ProcessEnv, base: string): boolean {
-    return base !== "pi" && base !== "omp" && base !== "opencode" && base !== "hermes" && base !== "dsh" && env.BILI_LAUNCHER_PLUGIN !== "0";
+ *  have their own native plugin surface (or none).
+ *
+ *  codex auto-fallback: codex 0.147 ships MCP tools to the model as a
+ *  `namespace` tool type. Self-hosted upstreams (sglang/vllm/ollama) do not
+ *  parse it — the injected tools become silently invisible and the model
+ *  fumbles for them. When the codex upstream is a local/private endpoint and
+ *  the user has not chosen explicitly, wire mode (flat tools every server
+ *  understands) is the sane default. `BILI_LAUNCHER_PLUGIN=1` forces plugin
+ *  mode regardless of the upstream. */
+export function launcherInjectMcp(env: NodeJS.ProcessEnv, base: string, codexUpstream?: string): boolean {
+    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh") return false;
+    if (env.BILI_LAUNCHER_PLUGIN === "0") return false;
+    if (base === "codex" && env.BILI_LAUNCHER_PLUGIN === undefined && codexUpstream !== undefined && isPrivateUpstreamHost(codexUpstream)) {
+        return false;
+    }
+    return true;
 }
 
 /** Ephemeral MCP config for --mcp-config / -c mcp_servers.bili.*: a single
@@ -1278,6 +1437,9 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     const config = loadClientConfig(process.env, process.cwd());
     const base = baseClientName(params.client);
     const routes = discoverRoutes(base, config);
+    // bili's own route graph (same sources the spawned proxy child reads —
+    // used to resolve the budget-alignment window, #321).
+    const biliRoutes = loadRoutes(process.env);
     const domains = dedupeInOrder([...routes.httpsDomains, ...(params.mitmDomains ?? [])]);
     const handle = await ensureProxyRunning({ host, port, passthrough, debug, mitmDomains: domains, modelWindows: collectModelWindows(config) }, deps);
     console.error(
@@ -1311,11 +1473,16 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
             );
         }
     }
-    const injectMcp = launcherInjectMcp(process.env, base);
+    const codexUpstream = base === "codex" ? codexUpstreamUrl(config.codex) : undefined;
+    const injectMcp = launcherInjectMcp(process.env, base, codexUpstream);
     if (injectMcp) {
         console.error(`bili: injecting native bili MCP tools for ${base} (disable with BILI_LAUNCHER_PLUGIN=0).`);
     } else if (base === "claude" || base === "codex") {
-        console.error("bili: native MCP tools disabled (BILI_LAUNCHER_PLUGIN=0) — running in pure wire mode.");
+        if (process.env.BILI_LAUNCHER_PLUGIN === "0") {
+            console.error("bili: native MCP tools disabled (BILI_LAUNCHER_PLUGIN=0) — running in pure wire mode.");
+        } else {
+            console.error(`bili: codex upstream ${codexUpstream} is local/private — self-hosted models cannot see codex namespace MCP tools; using wire-injected flat tools instead (force MCP with BILI_LAUNCHER_PLUGIN=1).`);
+        }
     }
     const origin = handle.origin;
     if (base === "pi") {
@@ -1436,6 +1603,17 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         } else {
             env = buildCodexEnv(origin, resolveCombinedCaPath(process.env), process.env);
             clientArgs = buildCodexArgs(origin, routes.httpRewrites, routes.httpsRewrites, clientArgs);
+            const budgetArgs = await resolveCodexBudgetArgs({
+                model: config.codex?.model,
+                clientWindow: config.codex?.contextWindow,
+                clientAutoCompactLimit: config.codex?.autoCompactLimit,
+                routes: biliRoutes,
+                upstreamUrl: codexUpstreamUrl(config.codex),
+            });
+            if (budgetArgs.length > 0) {
+                clientArgs = [...budgetArgs, ...clientArgs];
+                console.error(`bili: codex budget aligned — ${budgetArgs.slice(2).join(", ")} (model: ${config.codex?.model})`);
+            }
             if (injectMcp && codexConversationId) clientArgs = [...buildCodexMcpArgs(origin, codexConversationId), ...clientArgs];
         }
     } else {
@@ -1443,6 +1621,17 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
             ? buildClaudePluginEnv(origin, true, process.env)
             : buildClaudeEnv(origin, ca, routes.httpRewrites, routes.httpsRewrites, process.env);
         if (directUrl) env.BILLION_CONTEXT_PROXY = origin;
+        const claudeBudget = await resolveClaudeBudgetEnv({
+            model: nonEmpty(process.env.ANTHROPIC_MODEL) ? process.env.ANTHROPIC_MODEL : config.claude?.model,
+            userAutoCompactWindow: config.claude?.autoCompactWindow,
+            shellAutoCompactWindow: process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW,
+            routes: biliRoutes,
+            upstreamUrl: config.claude?.anthropicBaseUrl ?? "https://api.anthropic.com",
+        });
+        Object.assign(env, claudeBudget);
+        if (claudeBudget.CLAUDE_CODE_AUTO_COMPACT_WINDOW !== undefined) {
+            console.error(`bili: claude budget aligned — CLAUDE_CODE_AUTO_COMPACT_WINDOW=${claudeBudget.CLAUDE_CODE_AUTO_COMPACT_WINDOW}`);
+        }
         if (injectMcp) {
             const mcpFile = path.join(os.tmpdir(), `bili-mcp-${Date.now()}.json`);
             fs.writeFileSync(mcpFile, JSON.stringify(buildMcpConfig(origin)));

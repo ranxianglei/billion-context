@@ -280,6 +280,16 @@ test("e2e codex: warmup / load / ACP compress / purity / (forge)", { skip: skipR
         ["-c", "model_auto_compact_token_limit=3000"]);
     assert.strictEqual(f2.code, 0, `post-forge exit=${f2.code}`);
     assert.ok(f2.last.includes("9600"), `post-forge recall wrong: ${f2.last}`);
+    // Pre-forge compressed recall: 档案#6's sentinel was folded into an ACP
+    // block in phase 3 (phase 4 proved it recallable from the summary) and is
+    // NOT in codex's retained tail after the forge — it must survive via the
+    // forged-summary handoff (developer-message re-injection), not via the
+    // opaque compaction item.
+    const f3 = await turnExpect(ctx, "只回答一个数字: 档案#6 的哨兵值是多少?",
+        (last) => digits(last).includes(SENTINELS[5]),
+        ["-c", "model_auto_compact_token_limit=999999"]);
+    assert.strictEqual(f3.code, 0, `pre-forge-compressed recall exit=${f3.code}`);
+    assert.ok(digits(f3.last).includes(SENTINELS[5]), `pre-forge compressed value lost after forge: ${f3.last}`);
     const sessionsDir = path.join(ctx.codexHome, "sessions");
     let rolloutHasForgeItem = false;
     if (fs.existsSync(sessionsDir)) {

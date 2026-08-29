@@ -48,12 +48,18 @@ import {
     findFreePort,
     ensureProxyRunning,
     stopProxy,
+    resolveLauncherWindow,
+    resolveCodexBudgetArgs,
+    resolveClaudeBudgetEnv,
+    codexUpstreamUrl,
+    readClaudeSettings,
     type SpawnChild,
     type SpawnFn,
     runLaunch,
     type ClientConfig,
     type HttpRewrite,
 } from "../src/launcher.ts";
+import { _setForTest as registrySetForTest, _resetForTest as registryResetForTest } from "../src/registry.ts";
 
 test("isLaunchClient: pi/claude/codex/omp/opencode/pi-test true, others false", () => {
     assert.equal(isLaunchClient("pi"), true);
@@ -1718,6 +1724,330 @@ test("runLaunch omp: launcher hands per-model windows to the spawned proxy", asy
         else process.env.USERPROFILE = prevUserProfile;
         if (prevOmpDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
         else process.env.PI_CODING_AGENT_DIR = prevOmpDir;
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+// --- PR-D (#321): launcher budget alignment (codex -c / claude env) ---
+
+test("codexUpstreamUrl: provider base_url > openai_base_url > built-in default", () => {
+    assert.equal(codexUpstreamUrl(undefined), "https://api.openai.com/v1");
+    assert.equal(codexUpstreamUrl({ providers: {} }), "https://api.openai.com/v1");
+    assert.equal(
+        codexUpstreamUrl({ providers: {}, openaiBaseUrl: "https://relay.example.com/v1" }),
+        "https://relay.example.com/v1",
+    );
+    assert.equal(
+        codexUpstreamUrl({
+            modelProvider: "relay",
+            openaiBaseUrl: "https://openai.example.com/v1",
+            providers: { relay: { baseUrl: "https://relay.example.com/v1" } },
+        }),
+        "https://relay.example.com/v1",
+    );
+    assert.equal(
+        codexUpstreamUrl({ modelProvider: "missing", openaiBaseUrl: "https://openai.example.com/v1", providers: {} }),
+        "https://openai.example.com/v1",
+    );
+});
+
+test("resolveLauncherWindow: config route > built-in table > registry > nothing", async () => {
+    const routes = { "https://api.openai.com/v1": { models: { "gpt-x": { context: 123456 } } } };
+    registrySetForTest({});
+    try {
+        assert.equal(await resolveLauncherWindow("gpt-x", routes, "https://api.openai.com/v1"), 123456);
+        assert.equal(await resolveLauncherWindow("gpt-5.5", {}, "https://api.openai.com/v1"), 400000);
+        registrySetForTest({ "openai/bili-fallback-model": { limit: { context: 333333 } } });
+        assert.equal(await resolveLauncherWindow("bili-fallback-model", {}, "https://api.openai.com/v1"), 333333);
+        assert.equal(await resolveLauncherWindow("bili-nonexistent-model-xyz", {}, "https://api.openai.com/v1"), undefined);
+        assert.equal(await resolveLauncherWindow(undefined, routes, "https://api.openai.com/v1"), undefined);
+    } finally {
+        registryResetForTest();
+    }
+});
+
+test("resolveCodexBudgetArgs: injects window + same-value limit from bili's chain", async () => {
+    registrySetForTest({});
+    try {
+        assert.deepEqual(
+            await resolveCodexBudgetArgs({ model: "gpt-5.5", clientWindow: undefined, clientAutoCompactLimit: undefined, routes: {}, upstreamUrl: "https://api.openai.com/v1" }),
+            ["-c", "model_context_window=400000", "-c", "model_auto_compact_token_limit=400000"],
+        );
+        const routes = { "https://relay.example.com/v1": { models: { "gpt-x": { context: 123456 } } } };
+        assert.deepEqual(
+            await resolveCodexBudgetArgs({ model: "gpt-x", clientWindow: undefined, clientAutoCompactLimit: undefined, routes, upstreamUrl: "https://relay.example.com/v1" }),
+            ["-c", "model_context_window=123456", "-c", "model_auto_compact_token_limit=123456"],
+        );
+        registrySetForTest({ "openai/bili-fallback-model": { limit: { context: 333333 } } });
+        assert.deepEqual(
+            await resolveCodexBudgetArgs({ model: "bili-fallback-model", clientWindow: undefined, clientAutoCompactLimit: undefined, routes: {}, upstreamUrl: "https://api.openai.com/v1" }),
+            ["-c", "model_context_window=333333", "-c", "model_auto_compact_token_limit=333333"],
+        );
+    } finally {
+        registryResetForTest();
+    }
+});
+
+test("resolveCodexBudgetArgs: no injection when user self-aligned or unresolvable", async () => {
+    registrySetForTest({});
+    try {
+        assert.deepEqual(await resolveCodexBudgetArgs({ model: "gpt-5.5", clientWindow: 1000000, clientAutoCompactLimit: undefined, routes: {}, upstreamUrl: "https://api.openai.com/v1" }), []);
+        assert.deepEqual(await resolveCodexBudgetArgs({ model: undefined, clientWindow: undefined, clientAutoCompactLimit: undefined, routes: {}, upstreamUrl: "https://api.openai.com/v1" }), []);
+        assert.deepEqual(await resolveCodexBudgetArgs({ model: "bili-nonexistent-model-xyz", clientWindow: undefined, clientAutoCompactLimit: undefined, routes: {}, upstreamUrl: "https://api.openai.com/v1" }), []);
+    } finally {
+        registryResetForTest();
+    }
+});
+
+test("resolveCodexBudgetArgs: honors user-set model_auto_compact_token_limit", async () => {
+    assert.deepEqual(
+        await resolveCodexBudgetArgs({ model: "gpt-5.5", clientWindow: undefined, clientAutoCompactLimit: 111111, routes: {}, upstreamUrl: "https://api.openai.com/v1" }),
+        ["-c", "model_context_window=400000", "-c", "model_auto_compact_token_limit=111111"],
+    );
+});
+
+test("resolveClaudeBudgetEnv: injects CLAUDE_CODE_AUTO_COMPACT_WINDOW from bili's chain", async () => {
+    registrySetForTest({});
+    try {
+        assert.deepEqual(
+            await resolveClaudeBudgetEnv({ model: "claude-sonnet-4-5", userAutoCompactWindow: undefined, shellAutoCompactWindow: undefined, routes: {}, upstreamUrl: "https://api.anthropic.com" }),
+            { CLAUDE_CODE_AUTO_COMPACT_WINDOW: "200000" },
+        );
+        const routes = { "https://relay.example.com": { models: { "claude-x": { context: 123456 } } } };
+        assert.deepEqual(
+            await resolveClaudeBudgetEnv({ model: "claude-x", userAutoCompactWindow: undefined, shellAutoCompactWindow: undefined, routes, upstreamUrl: "https://relay.example.com" }),
+            { CLAUDE_CODE_AUTO_COMPACT_WINDOW: "123456" },
+        );
+        registrySetForTest({ "anthropic/bili-fallback-model": { limit: { context: 333333 } } });
+        assert.deepEqual(
+            await resolveClaudeBudgetEnv({ model: "bili-fallback-model", userAutoCompactWindow: undefined, shellAutoCompactWindow: undefined, routes: {}, upstreamUrl: "https://api.anthropic.com" }),
+            { CLAUDE_CODE_AUTO_COMPACT_WINDOW: "333333" },
+        );
+    } finally {
+        registryResetForTest();
+    }
+});
+
+test("resolveClaudeBudgetEnv: no injection when user self-aligned or unresolvable", async () => {
+    registrySetForTest({});
+    try {
+        assert.deepEqual(await resolveClaudeBudgetEnv({ model: "claude-sonnet-4-5", userAutoCompactWindow: 300000, shellAutoCompactWindow: undefined, routes: {}, upstreamUrl: "https://api.anthropic.com" }), {});
+        assert.deepEqual(await resolveClaudeBudgetEnv({ model: "claude-sonnet-4-5", userAutoCompactWindow: undefined, shellAutoCompactWindow: "250000", routes: {}, upstreamUrl: "https://api.anthropic.com" }), {});
+        assert.deepEqual(await resolveClaudeBudgetEnv({ model: undefined, userAutoCompactWindow: undefined, shellAutoCompactWindow: undefined, routes: {}, upstreamUrl: "https://api.anthropic.com" }), {});
+        assert.deepEqual(await resolveClaudeBudgetEnv({ model: "bili-nonexistent-model-xyz", userAutoCompactWindow: undefined, shellAutoCompactWindow: undefined, routes: {}, upstreamUrl: "https://api.anthropic.com" }), {});
+    } finally {
+        registryResetForTest();
+    }
+});
+
+test("parseCodexToml: stores model / model_context_window / model_auto_compact_token_limit", () => {
+    const cfg = parseCodexToml(`
+model = "gpt-5.5"
+model_context_window = 1000000
+model_auto_compact_token_limit = 900000
+
+[model_providers.relay]
+base_url = "https://relay.example.com/v1"
+`);
+    assert.equal(cfg.model, "gpt-5.5");
+    assert.equal(cfg.contextWindow, 1000000);
+    assert.equal(cfg.autoCompactLimit, 900000);
+    assert.deepEqual(cfg.modelWindows, [{ id: "gpt-5.5", contextWindow: 1000000 }]);
+    const bare = parseCodexToml(`model = "gpt-5.5"\n`);
+    assert.equal(bare.model, "gpt-5.5");
+    assert.equal(bare.contextWindow, undefined);
+    assert.equal(bare.autoCompactLimit, undefined);
+    assert.equal(bare.modelWindows, undefined);
+});
+
+test("readClaudeSettings: model from env block / top-level, autoCompactWindow from both forms", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-claude-settings-"));
+    try {
+        const settingsDir = path.join(home, ".claude");
+        fs.mkdirSync(settingsDir, { recursive: true });
+        // top-level model + autoCompactWindow
+        fs.writeFileSync(path.join(settingsDir, "settings.json"), JSON.stringify({ model: "claude-sonnet-4-5", autoCompactWindow: 300000 }));
+        let cfg = readClaudeSettings(home, os.tmpdir(), {});
+        assert.equal(cfg.model, "claude-sonnet-4-5");
+        assert.equal(cfg.autoCompactWindow, 300000);
+        // env block beats same-file top-level
+        fs.writeFileSync(
+            path.join(settingsDir, "settings.json"),
+            JSON.stringify({ model: "claude-sonnet-4-5", autoCompactWindow: 300000, env: { ANTHROPIC_MODEL: "claude-opus-4-5", CLAUDE_CODE_AUTO_COMPACT_WINDOW: "250000" } }),
+        );
+        cfg = readClaudeSettings(home, os.tmpdir(), {});
+        assert.equal(cfg.model, "claude-opus-4-5");
+        assert.equal(cfg.autoCompactWindow, 250000);
+        // nothing set → empty object
+        fs.writeFileSync(path.join(settingsDir, "settings.json"), JSON.stringify({}));
+        cfg = readClaudeSettings(home, os.tmpdir(), {});
+        assert.deepEqual(cfg, {});
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("runLaunch codex: budget args injected for MITM mode (built-in table window)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-codex-budget-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevClientBin = process.env.BILI_CLIENT_BIN;
+    const prevAnthropicModel = process.env.ANTHROPIC_MODEL;
+    const prevAutoCompact = process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    delete process.env.ANTHROPIC_MODEL;
+    delete process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW;
+    const fakeCodex = path.join(home, "fake-codex");
+    fs.writeFileSync(fakeCodex, "");
+    process.env.BILI_CLIENT_BIN = fakeCodex;
+    const codexHome = path.join(home, ".codex");
+    fs.mkdirSync(codexHome, { recursive: true });
+    fs.writeFileSync(path.join(codexHome, "config.toml"), 'model = "gpt-5.5"\n');
+
+    const clientArgsSeen: string[][] = [];
+    const spawnImpl: SpawnFn = (cmd, args) => {
+        if (cmd === fakeCodex) {
+            clientArgsSeen.push([...args]);
+            const child = makeFakeChild(0);
+            const orig = child.on.bind(child);
+            (child as { on: SpawnChild["on"] }).on = (event, listener) => {
+                orig(event, listener);
+                if (event === "exit") setTimeout(() => listener(0, null), 0);
+                return child;
+            };
+            return child;
+        }
+        return makeFakeChild(42422);
+    };
+    const fetchImpl = async () => ({ ok: true });
+    const prevExit = process.exit;
+    process.exit = (() => undefined) as typeof process.exit;
+
+    try {
+        await runLaunch(
+            { client: "codex", clientArgs: [], overrides: {} },
+            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(clientArgsSeen.length, 1);
+        const args = clientArgsSeen[0];
+        const i = args.indexOf("model_context_window=400000");
+        assert.ok(i > -1, `expected model_context_window=400000 in ${JSON.stringify(args)}`);
+        assert.equal(args[i - 1], "-c");
+        const j = args.indexOf("model_auto_compact_token_limit=400000");
+        assert.ok(j > -1, `expected model_auto_compact_token_limit=400000 in ${JSON.stringify(args)}`);
+        assert.equal(args[j - 1], "-c");
+
+        // user self-aligned (model_context_window in config.toml) → no injection
+        fs.writeFileSync(path.join(codexHome, "config.toml"), 'model = "gpt-5.5"\nmodel_context_window = 1000000\n');
+        clientArgsSeen.length = 0;
+        await runLaunch(
+            { client: "codex", clientArgs: [], overrides: {} },
+            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(clientArgsSeen.length, 1);
+        assert.ok(!clientArgsSeen[0].some((a) => a.startsWith("model_context_window=")), JSON.stringify(clientArgsSeen[0]));
+
+        // no model in config.toml → no injection
+        fs.writeFileSync(path.join(codexHome, "config.toml"), "");
+        clientArgsSeen.length = 0;
+        await runLaunch(
+            { client: "codex", clientArgs: [], overrides: {} },
+            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(clientArgsSeen.length, 1);
+        assert.ok(!clientArgsSeen[0].some((a) => a.startsWith("model_context_window=")), JSON.stringify(clientArgsSeen[0]));
+    } finally {
+        process.exit = prevExit;
+        process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        if (prevClientBin === undefined) delete process.env.BILI_CLIENT_BIN;
+        else process.env.BILI_CLIENT_BIN = prevClientBin;
+        if (prevAnthropicModel === undefined) delete process.env.ANTHROPIC_MODEL;
+        else process.env.ANTHROPIC_MODEL = prevAnthropicModel;
+        if (prevAutoCompact === undefined) delete process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW;
+        else process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = prevAutoCompact;
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("runLaunch claude: CLAUDE_CODE_AUTO_COMPACT_WINDOW injected (built-in table window)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-claude-budget-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevClientBin = process.env.BILI_CLIENT_BIN;
+    const prevAnthropicModel = process.env.ANTHROPIC_MODEL;
+    const prevAutoCompact = process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    delete process.env.ANTHROPIC_MODEL;
+    delete process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW;
+    const fakeClaude = path.join(home, "fake-claude");
+    fs.writeFileSync(fakeClaude, "");
+    process.env.BILI_CLIENT_BIN = fakeClaude;
+    const claudeDir = path.join(home, ".claude");
+    fs.mkdirSync(claudeDir, { recursive: true });
+    fs.writeFileSync(path.join(claudeDir, "settings.json"), JSON.stringify({ model: "claude-sonnet-4-5" }));
+
+    const clientEnvs: (NodeJS.ProcessEnv | undefined)[] = [];
+    const spawnImpl: SpawnFn = (cmd, args, opts) => {
+        if (cmd === fakeClaude) {
+            clientEnvs.push((opts as { env?: NodeJS.ProcessEnv } | undefined)?.env);
+            const child = makeFakeChild(0);
+            const orig = child.on.bind(child);
+            (child as { on: SpawnChild["on"] }).on = (event, listener) => {
+                orig(event, listener);
+                if (event === "exit") setTimeout(() => listener(0, null), 0);
+                return child;
+            };
+            return child;
+        }
+        return makeFakeChild(42422);
+    };
+    const fetchImpl = async () => ({ ok: true });
+    const prevExit = process.exit;
+    process.exit = (() => undefined) as typeof process.exit;
+
+    try {
+        await runLaunch(
+            { client: "claude", clientArgs: [], overrides: {} },
+            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(clientEnvs.length, 1);
+        assert.equal(clientEnvs[0]?.CLAUDE_CODE_AUTO_COMPACT_WINDOW, "200000");
+
+        // user self-aligned (settings autoCompactWindow) → no injection
+        fs.writeFileSync(path.join(claudeDir, "settings.json"), JSON.stringify({ model: "claude-sonnet-4-5", autoCompactWindow: 300000 }));
+        clientEnvs.length = 0;
+        await runLaunch(
+            { client: "claude", clientArgs: [], overrides: {} },
+            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(clientEnvs.length, 1);
+        assert.equal(clientEnvs[0]?.CLAUDE_CODE_AUTO_COMPACT_WINDOW, undefined);
+
+        // shell-exported ANTHROPIC_MODEL wins over settings model
+        fs.writeFileSync(path.join(claudeDir, "settings.json"), JSON.stringify({ model: "claude-sonnet-4-5" }));
+        process.env.ANTHROPIC_MODEL = "claude-opus-4-5";
+        clientEnvs.length = 0;
+        await runLaunch(
+            { client: "claude", clientArgs: [], overrides: {} },
+            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(clientEnvs.length, 1);
+        assert.equal(clientEnvs[0]?.CLAUDE_CODE_AUTO_COMPACT_WINDOW, "200000");
+    } finally {
+        process.exit = prevExit;
+        process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        if (prevClientBin === undefined) delete process.env.BILI_CLIENT_BIN;
+        else process.env.BILI_CLIENT_BIN = prevClientBin;
+        if (prevAnthropicModel === undefined) delete process.env.ANTHROPIC_MODEL;
+        else process.env.ANTHROPIC_MODEL = prevAnthropicModel;
+        if (prevAutoCompact === undefined) delete process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW;
+        else process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = prevAutoCompact;
         fs.rmSync(home, { recursive: true, force: true });
     }
 });
