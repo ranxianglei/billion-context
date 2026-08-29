@@ -75,14 +75,11 @@ jobs:
 
       - name: Create GitHub Release
         if: steps.check.outputs.is_release == 'true'
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: v${{ steps.version.outputs.version }}
-          release_name: v${{ steps.version.outputs.version }}
-          prerelease: ${{ steps.pre.outputs.prerelease }}
-          body: |
-            ## Release v${{ steps.version.outputs.version }}
-
-            See [commits since last tag](https://github.com/${{ github.repository }}/compare/$(git describe --tags --abbrev=0 v${{ steps.version.outputs.version }}^ 2>/dev/null || echo HEAD~10)...v${{ steps.version.outputs.version }})
+        run: |
+          VER="${{ steps.version.outputs.version }}"
+          curl -sS -f -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${{ github.repository }}/releases" \
+            -d "{\"tag_name\":\"v${VER}\",\"name\":\"v${VER}\",\"prerelease\":${{ steps.pre.outputs.prerelease }},\"generate_release_notes\":true}"
