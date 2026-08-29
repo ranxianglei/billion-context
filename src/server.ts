@@ -775,24 +775,28 @@ async function handle(
             // windows (BILI_LAUNCHER_MODEL_WINDOWS — the client's own
             // models.json/models.yml contextWindow, authoritative for this
             // deployment, no header trust needed since only the launcher
-            // sets the env); (2) a WARM models.dev registry
+            // sets the env); (2) the user's per-route per-model declaration —
+            // operator-controlled and deployment-specific: the same model name
+            // can have different windows behind different relays (a private
+            // relay may serve gpt-5.6-sol at 272K while models.dev lists the
+            // official 1M), so an explicit declaration always outranks the
+            // auto-fetched registry (#344); (3) a WARM models.dev registry
             // cache (daily refresh — outranks the static table whenever
-            // already resident; peek never fetches, cold start skips to (3)
-            // without blocking); (3) resolveContextLimit = user's per-route
-            // per-model declaration, then the built-in CONTEXT_LIMIT_TABLE
+            // already resident; peek never fetches, cold start skips to (4)
+            // without blocking); (4) the built-in CONTEXT_LIMIT_TABLE
             // fallback. Operator tuning via compress.modelContextLimit still
             // outranks everything inside resolveRequestConfig.
             const host = (() => { try { return embeddedUrl ? new URL(embeddedUrl).host : undefined; } catch { return undefined; } })();
             const betaWindow = anthropicBetaContextWindow(req.headers);
             const pluginWindow = pluginReportedContextWindow(req.headers);
             const launcherWindow = launcherContextWindow(model);
-            const peekWindow = host ? peekRegistryContext(model, host) : undefined;
             const configuredWindow = resolveConfiguredContextLimit(opts.routes, embeddedUrl, model);
+            const peekWindow = host ? peekRegistryContext(model, host) : undefined;
             let native = betaWindow
                 ?? pluginWindow
                 ?? launcherWindow
-                ?? peekWindow
                 ?? configuredWindow
+                ?? peekWindow
                 ?? lookupContextLimit(model);
             // Fallback = no authoritative source AND the operator did not
             // explicitly tune the window via compress.modelContextLimit (an
