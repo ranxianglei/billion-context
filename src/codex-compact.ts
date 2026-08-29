@@ -4,7 +4,7 @@ import type { Session } from "./session.js";
 export const CODEX_COMPACT_ID_PREFIX = "fc_bili_";
 export const CODEX_COMPACT_SENTINEL = "bili:acp:";
 
-const CODEX_UA_PREFIX = "codex_cli_rs/";
+const CODEX_UA_PREFIXES = ["codex_cli_rs/", "codex_exec/"];
 
 export type CodexCompactMode = "intercept" | "pass";
 
@@ -22,7 +22,7 @@ export function isCodexClient(headers: Record<string, string | string[] | undefi
     const ua = headers["user-agent"];
     if (!ua) return false;
     const s = Array.isArray(ua) ? ua[0] : ua;
-    return typeof s === "string" && s.startsWith(CODEX_UA_PREFIX);
+    return typeof s === "string" && CODEX_UA_PREFIXES.some((p) => s.startsWith(p));
 }
 
 export function hasCompactionTrigger(input: unknown): boolean {
