@@ -148,3 +148,59 @@ test("admin endpoints work with port: 0 (dynamic port assignment)", async () => 
         try { rmSync(root, { recursive: true, force: true }); } catch { /* best-effort */ }
     }
 });
+
+test("unknown /__bili/ path → 404 locally, not forwarded to upstream (#346)", async () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    const root = path.join(tmpdir(), `bili-admin-404-${process.pid}-${Date.now()}`);
+    mkdirSync(root, { recursive: true });
+    const biliConfig = path.join(root, "billion-context.json");
+    writeFileSync(biliConfig, '{"providers":{}}\n', "utf8");
+    const prevConfig = process.env.BILI_CONFIG_FILE;
+    process.env.BILI_CONFIG_FILE = biliConfig;
+
+    // Dead upstream: if the unknown /__bili/ path were (wrongly) forwarded,
+    // this would 502/hang instead of answering 404 immediately.
+    const opts: ProxyOptions = {
+        port: 0,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1:1",
+        routes: {},
+        proxy: "",
+        proxyMode: "direct",
+        proxySource: "direct",
+        modelContextLimit: 400_000,
+        kernelConfig: defaultConfig(400_000),
+        compress: { injectTool: true, injectNudge: true },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        mitm: { enabled: false, domains: [] },
+    };
+    const proxy = await startServer(opts);
+    if (!proxy.listening) await once(proxy, "listening");
+    const actualPort = (proxy.address() as { port: number }).port;
+    try {
+        const res = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+            const req = http.request(
+                { host: "127.0.0.1", port: actualPort, path: "/__bili/api/sessions", headers: { host: `127.0.0.1:${actualPort}` } },
+                (r) => {
+                    let body = "";
+                    r.on("data", (c: Buffer) => { body += c.toString("utf8"); });
+                    r.on("end", () => resolve({ status: r.statusCode ?? 0, body }));
+                },
+            );
+            req.once("error", reject);
+            req.end();
+        });
+        assert.equal(res.status, 404, "unknown /__bili/ path must 404 locally, not be forwarded to the upstream");
+    } finally {
+        process.env.BILI_CONFIG_FILE = prevConfig;
+        proxy.closeAllConnections?.();
+        await close(proxy);
+        try { rmSync(root, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+});

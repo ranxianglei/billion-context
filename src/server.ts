@@ -647,6 +647,14 @@ async function handle(
             return;
         }
     }
+    // Unknown /__bili/ or /__acp/ path → 404 locally. These are bili's own
+    // management prefixes; forwarding would leak the internal path to the
+    // upstream (which 403s it) — #346.
+    if (isAdminPath) {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { type: "not_found", message: "no such management endpoint" } }));
+        return;
+    }
 
     // NOTE: WebSocket upgrades are answered by the dedicated 'upgrade' listener
     // in startServer() (above), which is the only reliable path — Node routes
