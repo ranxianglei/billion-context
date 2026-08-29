@@ -48,11 +48,13 @@ test("not in table: 272K fallback (codex's model_info_from_slug), NOT unlimited"
     assert.equal(codexWindowForModel("a/b/gpt-5.5"), 272_000, "double slash → no retry → fallback");
 });
 
-test("isCodexClient: UA prefix codex_cli_rs/ only", () => {
+test("isCodexClient: UA prefixes codex_cli_rs/ and codex_exec/", () => {
     assert.equal(isCodexClient({ "user-agent": CODEX_UA }), true);
+    assert.equal(isCodexClient({ "user-agent": "codex_exec/0.147.0" }), true, "exec-mode UA");
     assert.equal(isCodexClient({ "user-agent": "node-fetch/3.1" }), false);
     assert.equal(isCodexClient({}), false);
-    assert.equal(isCodexClient({ "user-agent": ["node-fetch/3.1", CODEX_UA] }), true, "array headers");
+    assert.equal(isCodexClient({ "user-agent": [CODEX_UA, "node-fetch/3.1"] }), true, "array headers (first entry)");
+    assert.equal(isCodexClient({ "user-agent": ["node-fetch/3.1", CODEX_UA] }), false, "array headers use first entry");
     assert.equal(isCodexClient({ "user-agent": "Codex_CLI_RS/0.53.0" }), false, "case-sensitive");
 });
 

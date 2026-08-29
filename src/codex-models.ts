@@ -1,4 +1,7 @@
 import snapshot from "./codex-models-snapshot.json" with { type: "json" };
+import { isCodexClient } from "./codex-compact.js";
+
+export { isCodexClient };
 
 /** One entry of codex's bundled model table (slim form — see
  *  scripts/update-codex-models-snapshot.mjs). Mirrors the window fields of
@@ -73,22 +76,10 @@ export function codexWindowForModel(model: string): number {
     return lookupWindow(model);
 }
 
-/** True when the request carries codex CLI's User-Agent. codex sets
- *  `{originator}/{version} (...)` with DEFAULT_ORIGINATOR = `codex_cli_rs`
- *  (login/src/auth/default_client.rs) on every request. */
-export function isCodexClient(headers: Record<string, unknown>): boolean {
-    const ua = headers["user-agent"];
-    const list = Array.isArray(ua) ? ua : ua === undefined ? [] : [ua];
-    return list.some((h) => typeof h === "string" && h.startsWith("codex_cli_rs/"));
-}
-
-/** E1 min() alignment: cap bili's effective window at codex's own perception
- *  when the client is codex. Non-codex clients and limits already at or below
- *  the perception pass through untouched. */
 export function codexAlignedWindow(
     limit: number,
     model: string,
-    headers: Record<string, unknown>,
+    headers: Record<string, string | string[] | undefined>,
 ): { limit: number; clamped: boolean } {
     if (!isCodexClient(headers)) return { limit, clamped: false };
     const w = codexWindowForModel(model);
