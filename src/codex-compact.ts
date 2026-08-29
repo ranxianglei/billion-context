@@ -13,7 +13,7 @@ export type CodexCompactMode = "intercept" | "pass";
 // kill-switch without a restart.
 export function codexCompactMode(): CodexCompactMode {
     const v = process.env.BILI_CODEX_COMPACT?.trim().toLowerCase();
-    return v === "intercept" ? "intercept" : "pass";
+    return v === "pass" ? "pass" : "intercept";
 }
 
 // The `originator` header is only sent for non-default thread originators, so

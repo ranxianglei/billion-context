@@ -166,8 +166,8 @@ test("e2e E2 (trigger form): intercept + healthy ACP → forged 2-frame SSE, ups
     });
 });
 
-test("e2e E2 (trigger form): kill-switch off (default) → forwarded to upstream", async () => {
-    await withHarness({ mode: undefined, firstTurnTokens: 1000 }, async (h) => {
+test("e2e E2 (trigger form): kill-switch off (BILI_CODEX_COMPACT=pass) → forwarded to upstream", async () => {
+    await withHarness({ mode: "pass", firstTurnTokens: 1000 }, async (h) => {
         const afterSetup = await setupCompressedSession(h);
         const r2 = await fetch(h.url, {
             method: "POST",

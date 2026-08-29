@@ -24,17 +24,17 @@ test("codexCompactMode: kill-switch two states + default + case/trim", () => {
     const prev = process.env.BILI_CODEX_COMPACT;
     try {
         delete process.env.BILI_CODEX_COMPACT;
-        assert.equal(codexCompactMode(), "pass", "default is pass");
+        assert.equal(codexCompactMode(), "intercept", "default is intercept");
         process.env.BILI_CODEX_COMPACT = "pass";
         assert.equal(codexCompactMode(), "pass");
         process.env.BILI_CODEX_COMPACT = "intercept";
         assert.equal(codexCompactMode(), "intercept");
         process.env.BILI_CODEX_COMPACT = "INTERCEPT";
         assert.equal(codexCompactMode(), "intercept", "case-insensitive");
-        process.env.BILI_CODEX_COMPACT = "  intercept  ";
-        assert.equal(codexCompactMode(), "intercept", "trimmed");
-        process.env.BILI_CODEX_COMPACT = "bogus";
-        assert.equal(codexCompactMode(), "pass", "unknown value falls back to pass");
+        process.env.BILI_CODEX_COMPACT = "  pass  ";
+        assert.equal(codexCompactMode(), "pass", "trimmed");
+        process.env.BILI_CODEX_COMPACT = "banana";
+        assert.equal(codexCompactMode(), "intercept", "unknown value stays on intercept");
     } finally {
         if (prev === undefined) delete process.env.BILI_CODEX_COMPACT;
         else process.env.BILI_CODEX_COMPACT = prev;
