@@ -82,10 +82,10 @@ test("e2e #280r2 (Responses): trailing compaction_trigger stays final — nudge 
     const proxyPort = proxy.address().port;
     const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/responses`;
 
-    const post = (input: unknown) => fetch(url, {
+    const post = (input: unknown, session = "trig-sess") => fetch(url, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ model: "gpt-resp", stream: true, session_id: "trig-sess", instructions: "You are the test coding agent.", input }),
+        body: JSON.stringify({ model: "gpt-resp", stream: true, session_id: session, instructions: "You are the test coding agent.", input }),
     });
 
     try {
@@ -108,9 +108,15 @@ test("e2e #280r2 (Responses): trailing compaction_trigger stays final — nudge 
         assert.equal(lastItem.type, "compaction_trigger", "compaction_trigger is the final input item");
         assert.ok(!bodies[bodies.length - 1].includes("Context limit reached"), "no nudge appended after the trigger");
 
-        // Control: same armed session, normal trailing user message — the
-        // nudge must still be injected.
-        const r3 = await post([...conversation(), { type: "message", role: "user", content: "What should we do next?" }]);
+        // Control: normal trailing user message — the nudge must still be
+        // injected. Runs on a SEPARATE session: since #321 PR-C a completed
+        // trigger response marks a native-compaction boundary, so the next
+        // turn on trig-sess rebases (usage reset) and the nudge would be
+        // legitimately unarmed there. The warmup turn arms the usage report.
+        const r3a = await post(conversation(), "trig-ctl");
+        assert.equal(r3a.status, 200);
+        await r3a.text();
+        const r3 = await post([...conversation(), { type: "message", role: "user", content: "What should we do next?" }], "trig-ctl");
         assert.equal(r3.status, 200);
         await r3.text();
         assert.ok(bodies[bodies.length - 1].includes("Context limit reached"), "nudge still injected on a normal request");

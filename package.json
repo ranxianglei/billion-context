@@ -11,6 +11,7 @@
   "scripts": {
     "build": "tsup",
     "registry:snapshot": "node scripts/update-registry-snapshot.mjs",
+    "codex-models:snapshot": "node scripts/update-codex-models-snapshot.mjs",
     "typecheck": "tsc --noEmit --project tsconfig.build.json",
     "test": "node --import tsx --test tests/*.test.ts",
     "start": "node dist/index.js",

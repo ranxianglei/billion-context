@@ -1,13 +1,14 @@
 import http from "node:http";
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
-import { createCore, type CompressionCore, type CompressionState, type Config, type CoreMessage, type NudgeDecision, type Prompts, defaultPrompts, estimateTokensFast, renderNudgeText, deactivateBlock, viableRanges } from "acp-kernel";
+import { createCore, type CompressionCore, type CompressionState, type Config, type CoreMessage, type NudgeDecision, type Prompts, defaultPrompts, defaultCountTokens, estimateTokensFast, renderNudgeText, deactivateBlock, viableRanges } from "acp-kernel";
 import { resolveCompress, resolveCompressPrompts, resolveRequestConfig } from "./compress-settings.js";
 import type { ProxyOptions } from "./config.js";
 import { loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
 import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, lookupContextLimit, resolveConfiguredContextLimit, resolveCompressProtocol } from "./config.js";
 import { contextFromRegistry, loadRegistry, peekRegistryContext } from "./registry.js";
+import { codexAlignedWindow } from "./codex-models.js";
 import { fetchWithTimeout, MAX_REQUEST_BYTES } from "./fetch-util.js";
 import { formatUpstreamError, getUpstreamConnectionStatus, recordUpstreamConnection, resolveProxy, resolveProxyDecision, proxyDispatcher } from "./upstream-proxy.js";
 import { maskHeaderForLog, maskHeadersForLog, maskHostPortForLog, maskUrlForLog, maskUrlsInText } from "./log-mask.js";
@@ -53,10 +54,12 @@ import { defaultLogFile, stateDir, proxyOriginFile } from "./paths.js";
 import { compressLoopResponsesJson } from "./compress-loop-responses.js";
 import { runCompressLoop, pickAdapter } from "./loop/index.js";
 import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeResponsesMessageItems } from "./loop/adapter-responses.js";
+import { codexCompactMode, isCodexClient, hasCompactionTrigger, stripBiliCompactionItems, replaceBiliCompactionItems, codexCompactGate, buildTriggerForgeBody, mergeForgedSummaries } from "./codex-compact.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesJsonResponse } from "./stream-responses.js";
+import { observeResponsesTerminalState } from "./stream-terminal.js";
 import { emitStreamError } from "./stream-error.js";
-import { affinityToken, clientConversationHeader, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
+import { affinityToken, clientConversationHeader, codexTurnIdentity, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { consumePluginRegisterFor, flushConversations, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, loadConversations, pipePluginJson, pipePluginResponsesWithStrip, pipeThroughWithUsage, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
@@ -444,11 +447,15 @@ type Prepared = {
      *  rebuilt payload and compress-loop round must re-inject it. */
     openaiSystemText?: string;
     nudge?: NudgeDecision;
-    /** Effective compression prompts for this request (three-level cascade,
-     *  defaults to the kernel's defaultPrompts). Carried so the compress loop
-     *  in forward() rebuilds the SAME system prompt the request was prepared
-     *  with. */
+     /** Effective compression prompts for this request (three-level cascade,
+      *  defaults to the kernel's defaultPrompts). Carried so the compress loop
+      *  in forward() rebuilds the SAME system prompt the request was prepared
+      *  with. */
     prompts?: Prompts;
+    /** Set when a codex native-compaction request was intercepted and a
+     *  success response was forged locally (BILI_CODEX_COMPACT=intercept +
+     *  gate passed). forward() serves `body` without contacting upstream. */
+    codexForge?: { kind: "endpoint" | "trigger"; body: string; contentType: string };
 };
 
 
@@ -799,6 +806,25 @@ async function handle(
                 if (native) nativeFromFallback = false;
             }
             reqConfig = resolveRequestConfig(config, opts.routes, embeddedUrl, model, native, opts.compress);
+            // #321 PR-E1: a codex client carries its OWN window perception
+            // (bundled model table + 272K unknown-model fallback) and
+            // auto-compacts at 90% of it. If bili's budget exceeds what codex
+            // believes, codex's native compaction fires first — the #292
+            // misalignment. Cap the effective window at codex's perception.
+            // An operator's explicit compress.modelContextLimit is exempt
+            // (operator tuning is owned by the operator — never floored and
+            // never clamped); the clamped value is authoritative for this
+            // client (codex's own config), so it also clears the
+            // low-confidence fallback flag.
+            const aligned = operatorWindowTuned
+                ? { limit: reqConfig.modelContextLimit, clamped: false }
+                : codexAlignedWindow(reqConfig.modelContextLimit, model, req.headers);
+            if (aligned.clamped) {
+                const before = reqConfig.modelContextLimit;
+                reqConfig = { ...reqConfig, modelContextLimit: aligned.limit };
+                nativeFromFallback = false;
+                log("info", `[codex] effective window clamped ${before} → ${aligned.limit} (codex's own perception for model=${model}; ACP now compresses before codex's native auto-compact)`);
+            }
             reqPrompts = resolveCompressPrompts(resolveCompress(opts.routes, embeddedUrl, model, opts.compress));
         }
     }
@@ -834,11 +860,22 @@ async function handle(
         // shared 200-char prefix and leak compression state across sessions.
         const clientConv = clientConversationHeader(req.headers);
         const convHeader = clientConv ?? sessionHeader;
+        // Codex turn-metadata partitioning (#316 / PR-A): when the explicit
+        // Codex turn metadata is present and cross-checked against the
+        // thread-id header, partition compression state by thread_source.
+        // Root ("user") turns keep the session-id header (current semantics,
+        // stable across turns); subagents get their own thread-id (fresh
+        // independent state per thread, #150). Untrusted metadata (absent /
+        // unparseable / mismatched / unknown thread_source) → undefined, and
+        // the legacy chain below is unchanged.
+        const codexTurn = protocol === "responses" ? codexTurnIdentity(req.headers) : undefined;
         const responsesIdentity = protocol === "responses"
-            ? preferPromptCacheKeyIdentity(
-                  conversationIdentityResponses(parsed as ResponsesRequestBody, convHeader),
-                  parsed as ResponsesRequestBody,
-              )
+            ? (codexTurn
+                ? { value: codexTurn.value, source: "header" as const, clientProvided: true }
+                : preferPromptCacheKeyIdentity(
+                      conversationIdentityResponses(parsed as ResponsesRequestBody, convHeader),
+                      parsed as ResponsesRequestBody,
+                  ))
             : undefined;
         // OpenAI chat mirrors the responses pck promotion: clients that replay
         // full history statelessly (omp chat-completions via a relay) send NO
@@ -863,10 +900,16 @@ async function handle(
             ? conversationSignalAnthropic(parsed as AnthropicRequestBody, convHeader)
             : protocol === "openai"
               ? openaiIdentity?.value ?? openaiSignal
-              : subagentNamespace(
-                  responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
-                  (parsed as ResponsesRequestBody).instructions,
-              );
+              : codexTurn
+                // Trusted Codex turn id enters the verbatim session chain
+                // directly — do NOT route it through subagentNamespace (the
+                // kernel's empty-instructions non-anchoring path is left
+                // untouched for metadata-less clients).
+                ? codexTurn.value
+                : subagentNamespace(
+                      responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
+                      (parsed as ResponsesRequestBody).instructions,
+                  );
         // The session ID is the client-provided conversation value VERBATIM —
         // no hash, no protocol/credential/upstream dimensions (#286): those
         // are all mutable mid-conversation (bearer rotation, relay switching,
@@ -900,12 +943,16 @@ async function handle(
                     : { error: { type: "invalid_request_error", message: NO_IDENTITY_MESSAGE } }));
                 return;
             }
-            if (anonAffinity.matchedDepth > 0) {
+            if (anonAffinity.via === "tail-window") {
+                log("info", `[prefix-affinity] anonymous ${protocol} request → session ${anonAffinity.sessionId} (tail-window reattach window=${anonAffinity.matchedDepth}/${anonAffinity.incomingDepth}, tail=${anonAffinity.tailHash.slice(0, 8)}; truncated replay reattached, kernel reconciles by message id)`);
+                loggerLog("info", `[prefix-affinity] session ${anonAffinity.sessionId} reattached via tail-window (window ${anonAffinity.matchedDepth}/${anonAffinity.incomingDepth}, tail=${anonAffinity.tailHash.slice(0, 8)})`);
+            } else if (anonAffinity.matchedDepth > 0) {
                 log("info", `[prefix-affinity] anonymous ${protocol} request → session ${anonAffinity.sessionId} (prefix match depth=${anonAffinity.matchedDepth}/${anonAffinity.incomingDepth}, tail=${anonAffinity.tailHash.slice(0, 8)}; fork semantics: diverged histories split on their next request)`);
                 loggerLog("info", `[prefix-affinity] session ${anonAffinity.sessionId} matched at depth ${anonAffinity.matchedDepth}/${anonAffinity.incomingDepth} (tail=${anonAffinity.tailHash.slice(0, 8)})`);
             } else {
-                log("info", `[prefix-affinity] new anonymous session ${anonAffinity.sessionId} (depth=${anonAffinity.incomingDepth}, tail=${anonAffinity.tailHash.slice(0, 8)})`);
-                loggerLog("info", `[prefix-affinity] new session ${anonAffinity.sessionId} at depth ${anonAffinity.incomingDepth} (tail=${anonAffinity.tailHash.slice(0, 8)})`);
+                const lineage = anonAffinity.lineage ? `; lineage=${anonAffinity.lineage.reason} of ${anonAffinity.lineage.parents.join(",")}` : "";
+                log("info", `[prefix-affinity] new anonymous session ${anonAffinity.sessionId} (depth=${anonAffinity.incomingDepth}, tail=${anonAffinity.tailHash.slice(0, 8)}${lineage})`);
+                loggerLog("info", `[prefix-affinity] new session ${anonAffinity.sessionId} at depth ${anonAffinity.incomingDepth} (tail=${anonAffinity.tailHash.slice(0, 8)}${lineage})`);
             }
         }
         const sessionId = anonAffinity ? anonAffinity.sessionId : conversation;
@@ -929,10 +976,12 @@ async function handle(
             : clientConversationHeader(req.headers);
         const session = getSession(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? (anonAffinity ? "prefix-affinity" : undefined) });
         if (anonAffinity) {
-            prefixAffinity.note(sessionId, anonAffinity.incomingDepth, anonAffinity.tailHash);
+            prefixAffinity.note(sessionId, anonAffinity.incomingDepth, anonAffinity.tailHash, anonAffinity.itemHashes);
             session.metadata.anonymousPrefixAffinity = {
                 depth: anonAffinity.incomingDepth,
                 tailHash: anonAffinity.tailHash,
+                via: anonAffinity.via,
+                ...(anonAffinity.lineage ? { lineage: anonAffinity.lineage } : {}),
             };
         }
         // Launcher-mode binding (#162): prefer identity — claude code sends
@@ -947,7 +996,10 @@ async function handle(
                 pluginConversation = clientConv ?? conversation;
             }
         }
-        if (!pluginAgent && session.stats.requests === 0) {
+        if (!pluginAgent && session.stats.requests === 0 && codexTurnIdentity(req.headers) === undefined) {
+            // A codex subagent thread mints a fresh session too, but it must
+            // not claim the ROOT conversation's pending register (the plugin
+            // binding belongs to the root session, #317).
             const pending = takePendingPluginRegister();
             if (pending) {
                 pluginAgent = pending.agent;
@@ -1047,7 +1099,7 @@ async function handle(
                           : protocol === "openai"
                             ? prepareOpenai(parsed as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, pluginMode)
                             : responsesCompact
-                              ? prepareResponsesCompact(bodyBuffer, parsed as ResponsesRequestBody, session)
+                               ? prepareResponsesCompact(bodyBuffer, parsed as ResponsesRequestBody, session, req, core, reqConfig, log)
                               : prepareResponses(parsed as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, responsesIdentity!, pluginMode, upstreamOrigin);
                 prepared = runPrepare();
                 if (!countTokens && !responsesCompact) {
@@ -1375,12 +1427,28 @@ function prepareResponses(
         log("info", `[${sessionId}] reconciled ACP state after native Responses compact boundary`);
     }
 
+    // A codex client echoes our forged compaction item back in the next
+    // request; replace it with a plain summary-carrying user message so the
+    // handoff rides the replayable history (kernel-compressible, retained by
+    // codex's own user-message rule) instead of a foreign opaque blob. Real
+    // OpenAI blobs carry no bili marker and pass through untouched.
+    let echoReplaced = false;
+    if (Array.isArray(parsed.input)) {
+        const { items, replaced, dropped } = replaceBiliCompactionItems(parsed.input);
+        if (replaced > 0 || dropped > 0) {
+            echoReplaced = true;
+            log("info", `[${sessionId}] replaced ${replaced} echoed bili compaction item(s) with summary handoff message(s)${dropped > 0 ? `, dropped ${dropped} legacy marker item(s)` : ""}`);
+            parsed.input = items as typeof parsed.input;
+        }
+    }
+
     let processedMessages: CoreMessage[] = [];
     let originalMessages: CoreMessage[] = [];
     let nudge: NudgeDecision | undefined;
     let responsesProjection: ResponsesProjection | undefined;
     let rebuiltInput: ResponseInputItem[] | string = parsed.input;
     let toolsOut = parsed.tools;
+    let transformOk = false;
 
     // #242: over-long input item ids (poisoned rollouts) 400 upstream on every
     // request; rewrite them to short deterministic ids before anything reads
@@ -1401,6 +1469,10 @@ function prepareResponses(
 
     const shouldInject = opts.compress.injectTool;
     const injectTools = shouldInject && !pluginMode;
+    // Codex native remote-compact request: no compress prompt/tools (the model
+    // produces the compaction itself), no acp tags, plain passthrough so the
+    // response terminal state can gate the rebase marker.
+    const isCompactionTrigger = hasCompactionTrigger(parsed.input);
     // Route config is keyed by the upstream THIS request goes to (#286: a
     // session can outlive its first relay — session.meta.upstreamOrigin is
     // first-wins and would silently ignore the new relay's route settings).
@@ -1416,7 +1488,7 @@ function prepareResponses(
             log("info", `[${sessionId}] input items: ${Array.isArray(parsed.input) ? parsed.input.map((i: ResponseInputItem) => i.type).join(",") : "(string)"}`);
         }
         const tokenCount = session.stats.lastInputTokens;
-        const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" });
+        const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: process.env.ACP_RENDER_NONE || isCompactionTrigger ? "none" : "text-only" });
         session.state = turn.state;
         // The fold from last turn's compress has now materialized in state —
         // future usage reports are post-fold reality, drop the credit.
@@ -1436,27 +1508,32 @@ function prepareResponses(
         processedMessages = stripKernelSummaries(turn.messages, turn.state);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltInput = patchResponsesInput(projection, processedMessages);
-        if (shouldInject && !process.env.ACP_NO_COMPRESS_PROMPT) {
+        // Fallback path: when the echo did NOT come back this turn (client
+        // dropped it / restarted), the history-borne handoff is absent and the
+        // forge-time captured summaries are re-injected into the developer
+        // message so the pre-compaction content is never lost. When the echo
+        // DID come back, the replacement message carries the summaries and
+        // the injection is suppressed to avoid duplicating them.
+        const forgedSummaries = echoReplaced
+            ? []
+            : (session.metadata.codexForgedSummaries as string[] | undefined) ?? [];
+        if (shouldInject && !isCompactionTrigger && !process.env.ACP_NO_COMPRESS_PROMPT) {
             const prompt = responsesTextProtocol ? buildCompressHybridSystemPrompt(prompts) : buildCompressSystemPrompt(prompts);
-            const devContent = [...projection.systemParts, prompt].join("\n\n---\n\n");
+            const devContent = [...projection.systemParts, ...forgedSummaries, prompt].join("\n\n---\n\n");
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent);
             if (!process.env.ACP_NO_INJECT_TOOL && injectTools) {
                 toolsOut = responsesTextProtocol
                     ? injectResponsesTool(parsed.tools, ACP_READONLY_TOOLS_RESPONSES)
                     : injectResponsesTool(parsed.tools);
             }
-        } else if (projection.systemParts.length > 0) {
-            rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, projection.systemParts.join("\n\n---\n\n"));
+        } else if (projection.systemParts.length > 0 || forgedSummaries.length > 0) {
+            const devContent = [...projection.systemParts, ...forgedSummaries].join("\n\n---\n\n");
+            rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent);
         }
-        // Codex's native remote-compact request ends with a `compaction_trigger`
-        // item that the upstream requires to be the FINAL input item (else 400
-        // "must be the final input item"). A nudge appended after it would break
-        // Codex's own compaction, and is redundant — the native compact IS the
-        // compression. Skip the nudge for such requests.
-        const triggerFinal = Array.isArray(rebuiltInput)
-            && rebuiltInput.length > 0
-            && rebuiltInput[rebuiltInput.length - 1]!.type === "compaction_trigger";
-        if (opts.compress.injectNudge && turn.nudge?.shouldInject && shouldInject && !triggerFinal) {
+        // A nudge appended after a trailing `compaction_trigger` would break
+        // the upstream's "must be the final input item" requirement and is
+        // redundant — the native compact IS the compression.
+        if (opts.compress.injectNudge && turn.nudge?.shouldInject && shouldInject && !isCompactionTrigger) {
             try {
                 const rendered = renderNudgeText(turn.nudge, prompts);
                 if (rendered.text) {
@@ -1469,9 +1546,42 @@ function prepareResponses(
             } catch {
             }
         }
+        transformOk = true;
     } catch (err) {
         log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
         processedMessages = [];
+    }
+
+    // E2 trigger form: codex's native remote-compaction request (final input item
+    // is compaction_trigger). When the kill-switch is on, the client is codex, and
+    // the safety gate passes, forge a success SSE (one compaction item +
+    // response.completed) and skip upstream — a deterministic handoff to the ACP
+    // state instead of a foreign compaction blob.
+    let codexForge: Prepared["codexForge"] | undefined;
+    if (transformOk
+        && codexCompactMode() === "intercept"
+        && isCodexClient(req.headers)
+        && hasCompactionTrigger(parsed.input)
+        && codexCompactGate(session, config.modelContextLimit, transformOk)) {
+        const summaries = session.state.blocks.filter((b) => b.active).map((b) => b.summary);
+        const prevForged = session.metadata.codexForgedSummaries as string[] | undefined;
+        const captured = mergeForgedSummaries(prevForged, session.state.blocks);
+        if (captured.length !== (prevForged?.length ?? 0)) {
+            session.metadata.codexForgedSummaries = captured;
+            markDirty(session);
+        }
+        // Codex recomputes its ledger from the next real request, but the
+        // usage we mint here must not read as an empty context: fall back to
+        // estimating the trigger payload itself when lastInputTokens is
+        // stale/zero. The reply honors parsed.stream (JSON body when not
+        // streaming).
+        const est = defaultCountTokens(typeof parsed.input === "string" ? parsed.input : JSON.stringify(parsed.input ?? ""));
+        const total = Math.max(session.stats.lastInputTokens, est, 1);
+        codexForge = {
+            kind: "trigger",
+            ...buildTriggerForgeBody(summaries.join("\n\n"), { inputTokens: total, outputTokens: 0, totalTokens: total }, stream),
+        };
+        log("info", `[${sessionId}] codex compact intercepted (trigger); forged SSE with ${summaries.length} block summary(s), upstream not contacted`);
     }
 
     const rebuilt: ResponsesRequestBody = { ...parsed, input: rebuiltInput, tools: toolsOut };
@@ -1522,11 +1632,13 @@ function prepareResponses(
         responsesProjection,
         protocol: "responses",
         stream,
-        compressInjected: injectTools,
+        compressInjected: injectTools && !isCompactionTrigger,
         pluginMode,
         responsesTextProtocol,
         nudge,
         prompts,
+        resetAfterSuccess: isCompactionTrigger,
+        codexForge,
     };
 }
 
@@ -1576,10 +1688,24 @@ export function prepareCountTokens(
     }
 }
 
-function prepareResponsesCompact(body: Buffer, parsed: ResponsesRequestBody, session: Session): Prepared {
+function prepareResponsesCompact(
+    body: Buffer,
+    parsed: ResponsesRequestBody,
+    session: Session,
+    req: http.IncomingMessage,
+    core: CompressionCore,
+    config: Config,
+    log: (level: string, msg: string) => void,
+): Prepared {
     ++session.stats.requests;
-    return {
-        body,
+    // A bili-forged compaction item is never for the upstream (it carries our
+    // sentinel blob) — strip it on every forwarding path, same as the normal
+    // /responses pipeline does.
+    const cleaned = Array.isArray(parsed.input) ? stripBiliCompactionItems(parsed.input) : parsed.input;
+    const stripped = Array.isArray(parsed.input) && cleaned.length !== parsed.input.length;
+    const forgeBody: ResponsesRequestBody = { ...parsed, input: cleaned };
+    const base: Prepared = {
+        body: stripped ? Buffer.from(JSON.stringify(forgeBody)) : body,
         session,
         processedMessages: [],
         originalMessages: [],
@@ -1588,6 +1714,43 @@ function prepareResponsesCompact(body: Buffer, parsed: ResponsesRequestBody, ses
         compressInjected: false,
         resetAfterSuccess: true,
     };
+    if (codexCompactMode() !== "intercept" || !isCodexClient(req.headers) || !Array.isArray(parsed.input)) {
+        return base;
+    }
+    // The state commit below is all-or-nothing: every non-forge path restores
+    // the pre-turn state so a passthrough compact is not raced against a
+    // half-applied fold (the upstream's own compaction boundary is handled by
+    // markNativeCompactionBoundary + rebase instead).
+    const prevState = session.state;
+    // E2 endpoint form: /responses/compact. When the gate passes, run the same
+    // fold pipeline as a normal turn and forge the compacted history as
+    // {"output": [...]} — a deterministic handoff to the ACP state instead of a
+    // foreign compaction blob.
+    let transformOk = false;
+    try {
+        const projection = responsesToCore(forgeBody);
+        const turn = core.processTurn({ messages: projection.msgs, state: session.state, config, tokenCount: session.stats.lastInputTokens, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" });
+        session.state = turn.state;
+        transformOk = true;
+        if (!codexCompactGate(session, config.modelContextLimit, transformOk)) {
+            session.state = prevState;
+            return base;
+        }
+        const processed = stripKernelSummaries(turn.messages, turn.state);
+        const output = patchResponsesInput(projection, processed);
+        if (typeof output === "string") {
+            session.state = prevState;
+            return base;
+        }
+        snapshotMessages(session, projection.msgs);
+        markDirty(session);
+        log("info", `[${session.id}] codex compact intercepted (endpoint); forged history with ${output.length} item(s), upstream not contacted`);
+        return { ...base, codexForge: { kind: "endpoint", body: JSON.stringify({ output }), contentType: "application/json" } };
+    } catch (err) {
+        session.state = prevState;
+        log("warn", `[${session.id}] codex compact forge failed (${String(err)}); passing through to upstream`);
+        return base;
+    }
 }
 
 export function isChatGptCodexUpstream(upstream: string | undefined): boolean {
@@ -1867,6 +2030,14 @@ async function forward(
     instanceId: string,
     affinity?: string,
 ): Promise<void> {
+    // E2: a codex native-compaction request intercepted in prepare() carries a
+    // forged success response — serve it without contacting upstream.
+    if (prepared?.codexForge) {
+        log("info", `[${prepared.session.id}] codex compact served locally (${prepared.codexForge.kind}); upstream not contacted`);
+        res.writeHead(200, { "content-type": prepared.codexForge.contentType });
+        res.end(prepared.codexForge.body);
+        return;
+    }
     // #300: stamp the chain marker ONLY when this instance actually processed
     // the request (prepared !== null). A passthrough forward (prepared === null)
     // must NOT claim processing — otherwise a downstream processing bili would
@@ -2127,8 +2298,7 @@ async function forward(
         res.end();
         clearUpstreamTimer();
         if (prepared?.resetAfterSuccess) {
-            markNativeCompactionBoundary(prepared.session);
-            log("info", `[${prepared.session.id}] native Responses compact completed; rebase scheduled for next Responses turn`);
+            log("warn", `[${prepared.session.id}] native compact response had no body; rebase NOT scheduled`);
         }
         return;
     }
@@ -2160,11 +2330,21 @@ async function forward(
         prepared.compressInjected &&
         prepared.processedMessages.length > 0;
     if (!useRewriter || prepared === null) {
-        await pipeThrough(upstream.body, res);
-        clearUpstreamTimer();
-        if (prepared?.resetAfterSuccess) {
-            markNativeCompactionBoundary(prepared.session);
-            log("info", `[${prepared.session.id}] native Responses compact completed; rebase scheduled for next Responses turn`);
+        if (prepared && prepared.resetAfterSuccess) {
+            const [toClient, toObserve] = upstream.body.tee();
+            const observed = observeResponsesTerminalState(toObserve, prepared.stream);
+            await pipeThrough(toClient, res);
+            clearUpstreamTimer();
+            const terminal = await observed;
+            if (terminal === "completed") {
+                markNativeCompactionBoundary(prepared.session);
+                log("info", `[${prepared.session.id}] native Responses compact completed; rebase scheduled for next Responses turn`);
+            } else {
+                log("warn", `[${prepared.session.id}] native compact response terminal=${terminal}; rebase NOT scheduled`);
+            }
+        } else {
+            await pipeThrough(upstream.body, res);
+            clearUpstreamTimer();
         }
         return;
     }
