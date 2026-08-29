@@ -106,6 +106,41 @@ because `package.json` has proper `bin` + `files` fields. Either approach is
 fine; the registry install is preferred for testing the real published
 artifact.
 
+### E2E Regression (real client through bili)
+
+`tests/e2e/e2e-codex.test.ts` drives the **real `codex` CLI** through a built
+proxy against a real Responses-compatible upstream and asserts the full
+context lifecycle end-to-end: warmup → load growth → ACP compress → purity →
+native-compact interception (last phase gated by `E2E_FORGE=1`). Full phase
+details, env vars, and mechanics: `tests/e2e/README.md`.
+
+```bash
+# zero-token preflight (codex binary + dist + upstream reachable)
+E2E_CHECK=1 node --import tsx --test tests/e2e/e2e-codex.test.ts
+
+# full run (defaults to local sglang at http://127.0.0.1:8199/v1, zero cost)
+npm run build
+ACP_TEST_E2E=1 node --import tsx --test tests/e2e/e2e-codex.test.ts
+
+# + native-compact interception phase
+ACP_TEST_E2E=1 E2E_FORGE=1 node --import tsx --test tests/e2e/e2e-codex.test.ts
+```
+
+Rules:
+
+- The suite **skips by default** so `npm test` stays free; never remove the
+  `ACP_TEST_E2E` gate.
+- Run it (at least the 4-phase core) before merging changes to the request
+  pipeline — `server.ts`, `src/loop/`, adapters, preflight/compact paths.
+  It is the only coverage that exercises real client behavior (codex UA,
+  wire quirks, retry loops).
+- Any Responses-compatible upstream works via `E2E_UPSTREAM_URL` /
+  `E2E_UPSTREAM_KEY`; the provider is configured as `name = "OpenAI"` so codex
+  stays on the remote compaction (V2) path — do not "fix" this.
+- CI (`.github/workflows/ci-e2e.yml`) is manual-dispatch only and needs repo
+  secrets `E2E_UPSTREAM_URL` / `E2E_UPSTREAM_KEY`; a hosted runner cannot
+  reach `127.0.0.1` upstreams.
+
 ### Code Quality
 
 - **No `as any`**, **No `@ts-ignore`**
