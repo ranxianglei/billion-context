@@ -8,6 +8,12 @@ import path from "node:path";
 
 export interface ClaudeSettings {
     anthropicBaseUrl?: string;
+    /** Model claude runs: settings `env.ANTHROPIC_MODEL` ?? top-level `model`. */
+    model?: string;
+    /** The user's explicit auto-compact window (settings `autoCompactWindow`
+     *  or `env.CLAUDE_CODE_AUTO_COMPACT_WINDOW`) — when set, the launcher
+     *  must NOT override it with its own budget injection (#321). */
+    autoCompactWindow?: number;
 }
 
 export interface ModelWindow {
@@ -28,6 +34,12 @@ export interface CodexProvider {
 export interface CodexConfig {
     modelProvider?: string;
     openaiBaseUrl?: string;
+    /** Top-level `model` — the model codex runs (budget alignment, #321). */
+    model?: string;
+    /** Top-level `model_context_window` override (if set). */
+    contextWindow?: number;
+    /** Top-level `model_auto_compact_token_limit` override (if set). */
+    autoCompactLimit?: number;
     /** Top-level `model` + `model_context_window` override pair (if set). */
     modelWindows?: ModelWindow[];
     providers: Record<string, CodexProvider>;
@@ -173,18 +185,35 @@ export function readClaudeSettings(homeDir: string, cwd: string, env: NodeJS.Pro
         path.join(cwd, ".claude", "settings.json"),
     ];
     let anthropicBaseUrl: string | undefined;
+    let model: string | undefined;
+    let autoCompactWindow: number | undefined;
     for (const f of files) {
         const obj = readJsonObject(f);
         const settingsEnv = obj?.env;
         if (settingsEnv && typeof settingsEnv === "object" && !Array.isArray(settingsEnv)) {
-            const v = (settingsEnv as Record<string, unknown>).ANTHROPIC_BASE_URL;
+            const e = settingsEnv as Record<string, unknown>;
+            const v = e.ANTHROPIC_BASE_URL;
             if (nonEmpty(v)) anthropicBaseUrl = v;
+            // env-block values beat same-file top-level settings (claude applies
+            // the env block as real environment, which outranks settings).
+            const m = e.ANTHROPIC_MODEL;
+            if (nonEmpty(m)) model = String(m);
+            const acw = Number(e.CLAUDE_CODE_AUTO_COMPACT_WINDOW);
+            if (Number.isFinite(acw) && acw > 0) autoCompactWindow = acw;
         }
+        const tm = obj?.model;
+        if (nonEmpty(tm) && model === undefined) model = String(tm);
+        const tacw = Number(obj?.autoCompactWindow);
+        if (Number.isFinite(tacw) && tacw > 0 && autoCompactWindow === undefined) autoCompactWindow = tacw;
     }
     // Honor a shell-exported ANTHROPIC_BASE_URL (claude's native override) so
     // the launcher wraps the relay the user actually uses, not the default.
     if (!anthropicBaseUrl && nonEmpty(env.ANTHROPIC_BASE_URL)) anthropicBaseUrl = env.ANTHROPIC_BASE_URL;
-    return anthropicBaseUrl ? { anthropicBaseUrl } : {};
+    return {
+        ...(anthropicBaseUrl ? { anthropicBaseUrl } : {}),
+        ...(model ? { model } : {}),
+        ...(autoCompactWindow ? { autoCompactWindow } : {}),
+    };
 }
 
 /**
@@ -198,6 +227,7 @@ export function parseCodexToml(text: string): CodexConfig {
     let curProvider: string | null = null;
     let codexModel: string | undefined;
     let codexContextWindow: number | undefined;
+    let codexAutoCompactLimit: number | undefined;
     for (const rawLine of text.split(/\r?\n/)) {
         const line = rawLine.trim();
         if (!line || line.startsWith("#")) continue;
@@ -224,10 +254,14 @@ export function parseCodexToml(text: string): CodexConfig {
             } else if (curProvider && key === "base_url") {
                 result.providers[curProvider].baseUrl = val;
             }
-        } else if (numMatch && table === "" && numMatch[1] === "model_context_window") {
-            codexContextWindow = Number(numMatch[2]);
+        } else if (numMatch && table === "") {
+            if (numMatch[1] === "model_context_window") codexContextWindow = Number(numMatch[2]);
+            else if (numMatch[1] === "model_auto_compact_token_limit") codexAutoCompactLimit = Number(numMatch[2]);
         }
     }
+    if (codexModel) result.model = codexModel;
+    if (codexContextWindow) result.contextWindow = codexContextWindow;
+    if (codexAutoCompactLimit) result.autoCompactLimit = codexAutoCompactLimit;
     const win = toModelWindow(codexModel, codexContextWindow);
     if (win) result.modelWindows = [win];
     return result;
