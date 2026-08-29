@@ -67,6 +67,15 @@ function isNewer(latest: string, current: string): boolean {
     return false;
 }
 
+/** Stale-install decision for the up-to-date branch of an update check —
+ *  exported for tests. "restart" means the on-disk install is newer than the
+ *  running process: an auto-update landed in-place but the process was never
+ *  restarted, so the one-time "Restart to finish" message is long gone and
+ *  every "up to date" line since has been misleading (#327). */
+export function staleInstallStatus(diskVersion: string | undefined, runningVersion: string): "restart" | "current" {
+    return diskVersion !== undefined && isNewer(diskVersion, runningVersion) ? "restart" : "current";
+}
+
 async function readLastCheck(): Promise<number> {
     try {
         const data = await readFile(THROTTLE_FILE, "utf-8");
@@ -354,7 +363,11 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         const currentVersion = diskVersion ?? opts.currentVersion;
 
         if (!isNewer(latest, currentVersion)) {
-            loggerLog("info", `[update] current=${currentVersion} latest=${latest} (up to date)`);
+            if (staleInstallStatus(diskVersion, opts.currentVersion) === "restart") {
+                loggerLog("warn", `[update] running v${opts.currentVersion} but v${diskVersion} is installed — restart bili to activate (auto-update replaced the on-disk install; this process is still on the old code)`);
+            } else {
+                loggerLog("info", `[update] current=${currentVersion} latest=${latest} (up to date)`);
+            }
             return;
         }
 
