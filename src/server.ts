@@ -59,7 +59,7 @@ import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { observeResponsesTerminalState } from "./stream-terminal.js";
 import { emitStreamError } from "./stream-error.js";
-import { affinityToken, clientConversationHeader, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
+import { affinityToken, clientConversationHeader, codexTurnIdentity, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { consumePluginRegisterFor, flushConversations, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, loadConversations, pipePluginJson, pipePluginResponsesWithStrip, pipeThroughWithUsage, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
@@ -856,11 +856,22 @@ async function handle(
         // shared 200-char prefix and leak compression state across sessions.
         const clientConv = clientConversationHeader(req.headers);
         const convHeader = clientConv ?? sessionHeader;
+        // Codex turn-metadata partitioning (#316 / PR-A): when the explicit
+        // Codex turn metadata is present and cross-checked against the
+        // thread-id header, partition compression state by thread_source.
+        // Root ("user") turns keep the session-id header (current semantics,
+        // stable across turns); subagents get their own thread-id (fresh
+        // independent state per thread, #150). Untrusted metadata (absent /
+        // unparseable / mismatched / unknown thread_source) → undefined, and
+        // the legacy chain below is unchanged.
+        const codexTurn = protocol === "responses" ? codexTurnIdentity(req.headers) : undefined;
         const responsesIdentity = protocol === "responses"
-            ? preferPromptCacheKeyIdentity(
-                  conversationIdentityResponses(parsed as ResponsesRequestBody, convHeader),
-                  parsed as ResponsesRequestBody,
-              )
+            ? (codexTurn
+                ? { value: codexTurn.value, source: "header" as const, clientProvided: true }
+                : preferPromptCacheKeyIdentity(
+                      conversationIdentityResponses(parsed as ResponsesRequestBody, convHeader),
+                      parsed as ResponsesRequestBody,
+                  ))
             : undefined;
         // OpenAI chat mirrors the responses pck promotion: clients that replay
         // full history statelessly (omp chat-completions via a relay) send NO
@@ -885,10 +896,16 @@ async function handle(
             ? conversationSignalAnthropic(parsed as AnthropicRequestBody, convHeader)
             : protocol === "openai"
               ? openaiIdentity?.value ?? openaiSignal
-              : subagentNamespace(
-                  responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
-                  (parsed as ResponsesRequestBody).instructions,
-              );
+              : codexTurn
+                // Trusted Codex turn id enters the verbatim session chain
+                // directly — do NOT route it through subagentNamespace (the
+                // kernel's empty-instructions non-anchoring path is left
+                // untouched for metadata-less clients).
+                ? codexTurn.value
+                : subagentNamespace(
+                      responsesIdentity?.value ?? conversationSignalResponses(parsed as ResponsesRequestBody, convHeader),
+                      (parsed as ResponsesRequestBody).instructions,
+                  );
         // The session ID is the client-provided conversation value VERBATIM —
         // no hash, no protocol/credential/upstream dimensions (#286): those
         // are all mutable mid-conversation (bearer rotation, relay switching,
