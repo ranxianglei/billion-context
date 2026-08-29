@@ -11,6 +11,7 @@ import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { WEB_CLIENT } from "../src/web/client.ts";
+import { rootCaPath } from "../src/ca.ts";
 import { parseCompressSettings } from "../src/config.ts";
 
 function close(server: http.Server): Promise<void> {
@@ -73,6 +74,17 @@ test("Web UI exposes upstream controls without inline handlers", async () => {
         assert.match(ui, /addEventListener/);
         assert.doesNotMatch(ui, /\sonclick=/i);
         assert.match(ui, /escapeHtml/);
+
+        // #342: the ZCode card must show this machine's real CA path (absolute,
+        // copy-paste ready) instead of a hardcoded ~/... that ZCode on Windows
+        // cannot expand.
+        const caPath = rootCaPath();
+        const caPathEsc = caPath.replace(/[&<>"']/g, (c) =>
+            c === "&" ? "&amp;" : c === "<" ? "&lt;" : c === ">" ? "&gt;" : c === '"' ? "&quot;" : "&#39;");
+        assert.match(ui, /复制 CA 路径/);
+        assert.ok(ui.includes(caPathEsc), "ZCode card shows the machine's real CA path");
+        assert.match(ui, /data-copy="[^"]*root-ca\.pem"/);
+        assert.doesNotMatch(ui, /~\/\.local\/share\/billion-context\/ca\/root-ca\.pem/);
 
         const saveProxy = await fetch(`${base}/__bili/config`, {
             method: "PUT",
