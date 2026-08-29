@@ -1,0 +1,44 @@
+name: E2E (real codex)
+
+on:
+  workflow_dispatch:
+    inputs:
+      forge:
+        description: "run forge phase (needs BILI_CODEX_COMPACT support in master)"
+        type: boolean
+        default: false
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install codex CLI
+        run: npm install -g @openai/codex@latest
+      - run: npm ci
+      - run: npm run build
+      - name: Preflight
+        run: E2E_CHECK=1 node --import tsx --test tests/e2e/e2e-codex.test.ts
+        env:
+          E2E_UPSTREAM_URL: ${{ secrets.E2E_UPSTREAM_URL }}
+          E2E_UPSTREAM_KEY: ${{ secrets.E2E_UPSTREAM_KEY }}
+      - name: E2E suite
+        run: ACP_TEST_E2E=1 node --import tsx --test tests/e2e/e2e-codex.test.ts
+        env:
+          E2E_UPSTREAM_URL: ${{ secrets.E2E_UPSTREAM_URL }}
+          E2E_UPSTREAM_KEY: ${{ secrets.E2E_UPSTREAM_KEY }}
+          E2E_FORGE: ${{ inputs.forge && '1' || '' }}
+      - name: Collect artifacts
+        if: always()
+        run: |
+          mkdir -p artifacts && cp -r tmp/e2e-codex-* artifacts/ 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-logs
+          path: artifacts/
+          retention-days: 7
