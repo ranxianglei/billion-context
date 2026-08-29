@@ -8,6 +8,7 @@ import { loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
 import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, lookupContextLimit, resolveConfiguredContextLimit, resolveCompressProtocol } from "./config.js";
 import { contextFromRegistry, loadRegistry, peekRegistryContext } from "./registry.js";
+import { codexAlignedWindow } from "./codex-models.js";
 import { fetchWithTimeout, MAX_REQUEST_BYTES } from "./fetch-util.js";
 import { formatUpstreamError, getUpstreamConnectionStatus, recordUpstreamConnection, resolveProxy, resolveProxyDecision, proxyDispatcher } from "./upstream-proxy.js";
 import { maskHeaderForLog, maskHeadersForLog, maskHostPortForLog, maskUrlForLog, maskUrlsInText } from "./log-mask.js";
@@ -800,6 +801,21 @@ async function handle(
                 if (native) nativeFromFallback = false;
             }
             reqConfig = resolveRequestConfig(config, opts.routes, embeddedUrl, model, native, opts.compress);
+            // #321 PR-E1: a codex client carries its OWN window perception
+            // (bundled model table + 272K unknown-model fallback) and
+            // auto-compacts at 90% of it. If bili's budget exceeds what codex
+            // believes, codex's native compaction fires first — the #292
+            // misalignment. Cap the effective window at codex's perception;
+            // the clamped value is authoritative for this client (codex's own
+            // config), so it also clears the low-confidence fallback flag
+            // (no effective-floor after output-headroom reservation).
+            const aligned = codexAlignedWindow(reqConfig.modelContextLimit, model, req.headers);
+            if (aligned.clamped) {
+                const before = reqConfig.modelContextLimit;
+                reqConfig = { ...reqConfig, modelContextLimit: aligned.limit };
+                nativeFromFallback = false;
+                log("info", `[codex] effective window clamped ${before} → ${aligned.limit} (codex's own perception for model=${model}; ACP now compresses before codex's native auto-compact)`);
+            }
             reqPrompts = resolveCompressPrompts(resolveCompress(opts.routes, embeddedUrl, model, opts.compress));
         }
     }
