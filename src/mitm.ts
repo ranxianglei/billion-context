@@ -1,7 +1,7 @@
 import http from "node:http";
 import net from "node:net";
 import tls from "node:tls";
-import { ensureRootCA, getSecureContext } from "./ca.js";
+import { ensureRootCA, getSecureContext, rootCaPath } from "./ca.js";
 import { connectThroughProxy } from "./upstream-proxy.js";
 import { discoverMitmDomains } from "./discover.js";
 import { isLoopbackAddress } from "./util.js";
@@ -22,6 +22,23 @@ export const DEFAULT_MITM_DOMAINS = [
 /** Socket marker: when we MITM a CONNECT tunnel, we stash the original
  *  host the CONNECT tunnel targeted. */
 export const MITM_UPSTREAM_KEY = "__biliMitmUpstream";
+
+// A client that rejects our MITM cert (root CA not trusted) can flood the log
+// with hundreds of identical handshake failures. Warn once, with the fix.
+let warnedCertRejected = false;
+const CERT_REJECT_RE = /alert (?:certificate unknown|unknown ca|bad certificate|certificate expired|certificate revoked|unsupported certificate)/i;
+
+export function noteMitmTlsError(host: string, port: number, message: string, log: Logger): void {
+    log(`mitm ${maskHostForLog(host)}:${port} TLS error: ${message}`);
+    if (CERT_REJECT_RE.test(message) && !warnedCertRejected) {
+        warnedCertRejected = true;
+        log(`mitm ${maskHostForLog(host)}:${port} client REJECTED the MITM certificate — it does not trust bili's root CA. Install it in the client's/system trust store, then restart the client. CA: ${rootCaPath()}`);
+    }
+}
+
+export function _resetCertRejectionWarningForTest(): void {
+    warnedCertRejected = false;
+}
 
 /** Max ms to wait for a MITM client to finish the TLS handshake after we
  *  return CONNECT 200. Bounds slowloris-style resource hold (a client that
@@ -207,7 +224,7 @@ function doMitm(
     // it as an uncaught exception and crashes the whole proxy. Destroy the
     // underlying socket and log — mirrors tunnelThrough()'s error handling.
     tlsSocket.on("error", (err: Error) => {
-        log(`mitm ${maskHostForLog(host)}:${port} TLS error: ${err.message}`);
+        noteMitmTlsError(host, port, err.message, log);
         tlsSocket.destroy();
         clientSocket.destroy();
     });

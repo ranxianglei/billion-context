@@ -7,7 +7,7 @@ import tls from "node:tls";
 import net from "node:net";
 import { once } from "node:events";
 import http from "node:http";
-import { isMitmHost, readMitmUpstream, MITM_UPSTREAM_KEY, setupMitm } from "../src/mitm.js";
+import { isMitmHost, readMitmUpstream, MITM_UPSTREAM_KEY, setupMitm, noteMitmTlsError, _resetCertRejectionWarningForTest } from "../src/mitm.js";
 import { ensureRootCA, rootCaPath, getSecureContext, _resetForTest } from "../src/ca.js";
 import { _resetDiscoveryCacheForTest } from "../src/discover.js";
 
@@ -288,4 +288,32 @@ await test("setupMitm e2e: remote CONNECT policy (#77, #240)", async (t) => {
             openServer.closeAllConnections?.();
         }
     });
+});
+
+// A real client (e.g. ZCode, #346) that does not trust the root CA sends a
+// TLS "certificate unknown" alert; the handler must turn that into exactly ONE
+// actionable "install the root CA" warning, deduplicated across the hundreds
+// of identical failures a single misconfigured client produces.
+test("noteMitmTlsError: cert-rejection alert → one actionable CA warning, deduplicated (#346)", () => {
+    _resetCertRejectionWarningForTest();
+    const logs: string[] = [];
+    const log = (msg: string) => { logs.push(msg); };
+    const realAlert = "705F0000:error:0A000416:SSL routines:ssl3_read_bytes:ssl/tls alert certificate unknown:openssl\\ssl\\record\\rec_layer_s3.c:918:SSL alert number 46";
+    noteMitmTlsError("api.anthropic.com", 443, realAlert, log);
+    noteMitmTlsError("api.anthropic.com", 443, "ssl/tls alert certificate unknown", log);
+    noteMitmTlsError("api.anthropic.com", 443, "ssl/tls alert unknown ca", log);
+    const warnings = logs.filter((l) => l.includes("REJECTED the MITM certificate"));
+    assert.equal(warnings.length, 1, `expected exactly one CA warning, got ${warnings.length}: ${JSON.stringify(logs)}`);
+    assert.match(warnings[0], /root-ca\.pem/, "warning must point at the root CA file path");
+    assert.equal(logs.filter((l) => l.includes("TLS error")).length, 3, "the raw TLS error line is always logged");
+});
+
+test("noteMitmTlsError: non-cert TLS errors (reset/close) do NOT trigger the CA warning", () => {
+    _resetCertRejectionWarningForTest();
+    const logs: string[] = [];
+    const log = (msg: string) => { logs.push(msg); };
+    noteMitmTlsError("api.anthropic.com", 443, "socket hang up", log);
+    noteMitmTlsError("api.anthropic.com", 443, "read ECONNRESET", log);
+    assert.equal(logs.filter((l) => l.includes("REJECTED the MITM certificate")).length, 0);
+    assert.equal(logs.length, 2, "raw TLS error lines still logged");
 });
