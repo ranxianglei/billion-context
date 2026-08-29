@@ -11,7 +11,7 @@ import { startServer, type ProxyOptions } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
-import { buildClaudePluginEnv, buildCodexMcpArgs, buildMcpConfig, launcherDirectUrl, launcherInjectMcp } from "../src/launcher.ts";
+import { buildClaudePluginEnv, buildCodexMcpArgs, buildMcpConfig, isPrivateUpstreamHost, launcherDirectUrl, launcherInjectMcp } from "../src/launcher.ts";
 
 // Launcher mode (#162): hosts that cannot attach per-request headers
 // (claude/codex spawned by `bili claude` / `bili codex`) bind into plugin mode
@@ -236,7 +236,27 @@ test("launcher injection builders: direct-URL env, MCP config JSON, codex -c arg
     // hosts older than the verified builds (claude 2.1.227, codex 0.147.0).
     assert.equal(launcherInjectMcp({}, "claude"), true, "plugin injection on by default (claude)");
     assert.equal(launcherInjectMcp({}, "codex"), true, "plugin injection on by default (codex)");
-    assert.equal(launcherInjectMcp({ BILI_LAUNCHER_PLUGIN: "0" }, "claude"), false, "explicit opt-out honored (claude)");
+    assert.equal(launcherInjectMcp({}, "codex", "http://127.0.0.1:8199/v1"), false, "loopback codex upstream falls back to wire tools");
+    assert.equal(launcherInjectMcp({}, "codex", "http://localhost:8000/v1"), false, "localhost falls back");
+    assert.equal(launcherInjectMcp({}, "codex", "http://192.168.1.5:8000/v1"), false, "RFC1918 codex upstream falls back");
+    assert.equal(launcherInjectMcp({}, "codex", "http://10.0.0.3:11434/v1"), false, "10/8 falls back (ollama-style)");
+    assert.equal(launcherInjectMcp({}, "codex", "http://[::1]:8080/v1"), false, "IPv6 loopback falls back");
+    assert.equal(launcherInjectMcp({}, "codex", "http://[fd00::1]:8080/v1"), false, "IPv6 ULA falls back");
+    assert.equal(launcherInjectMcp({}, "codex", "http://mybox.local:8000/v1"), false, "mDNS name falls back");
+    assert.equal(launcherInjectMcp({ BILI_LAUNCHER_PLUGIN: "1" }, "codex", "http://127.0.0.1:8199/v1"), true, "explicit opt-in overrides the local-upstream fallback");
+    assert.equal(launcherInjectMcp({ BILI_LAUNCHER_PLUGIN: "0" }, "codex", "http://127.0.0.1:8199/v1"), false, "explicit opt-out still honored");
+    assert.equal(launcherInjectMcp({}, "codex", "https://api.openai.com/v1"), true, "public codex upstream keeps MCP tools");
+    assert.equal(launcherInjectMcp({}, "codex", "https://gwv1701.comfly.org/v1"), true, "public relay keeps MCP tools");
+    assert.equal(launcherInjectMcp({}, "codex", "not a url"), true, "unparseable upstream: keep MCP tools (conservative)");
+    assert.equal(launcherInjectMcp({}, "claude", "http://127.0.0.1:8199"), true, "auto-fallback is codex-only (claude flattens MCP tools itself)");
+    assert.equal(isPrivateUpstreamHost("http://127.0.0.1:8199/v1"), true);
+    assert.equal(isPrivateUpstreamHost("http://172.16.0.1/v1"), true);
+    assert.equal(isPrivateUpstreamHost("http://172.32.0.1/v1"), false, "172 outside 16-31 is public");
+    assert.equal(isPrivateUpstreamHost("http://169.254.1.1/v1"), true, "link-local");
+    assert.equal(isPrivateUpstreamHost("http://8.8.8.8/v1"), false);
+    assert.equal(isPrivateUpstreamHost("http://[::ffff:10.1.2.3]:9/v1"), true, "IPv4-mapped IPv6");
+    assert.equal(isPrivateUpstreamHost("http://[2001:db8::1]:9/v1"), false, "global IPv6");
+    assert.equal(isPrivateUpstreamHost(""), false, "empty string unparseable");    assert.equal(launcherInjectMcp({ BILI_LAUNCHER_PLUGIN: "0" }, "claude"), false, "explicit opt-out honored (claude)");
     assert.equal(launcherInjectMcp({ BILI_LAUNCHER_PLUGIN: "0" }, "codex"), false, "explicit opt-out honored (codex)");
     assert.equal(launcherInjectMcp({ BILI_LAUNCHER_PLUGIN: "1" }, "claude"), true, "explicit opt-in still works");
     assert.equal(launcherInjectMcp({ BILI_LAUNCHER_PLUGIN: "1" }, "pi"), false, "pi always excluded (native extension #154)");
