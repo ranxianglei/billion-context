@@ -1804,7 +1804,14 @@ async function preflightCompressIfNeeded(
             log("warn", `[${session.id}] preflight trigger fired on a stale baseline (~${tokenCount}) but the payload fits (~${payloadEstimate}/${limit}); forwarding as-is`);
             return prepared;
         }
-        return failFast(502, "no part of the conversation is compressible (nothing left to fold)", false);
+        // #333: nothing left to fold is a STATIC state — failing fast here is
+        // a permanent 502 loop (every retry hits the same wall; the EMERGENCY
+        // nudge can never reach the model). Forward as-is: the upstream either
+        // accepts (its real window is larger than this limit — often a
+        // fallback/learned estimate) or rejects with a truthful 400 the client
+        // can act on (and the overflow self-heal learns the real window).
+        log("warn", `[${session.id}] preflight exhausted before starting: no part of the conversation is compressible (payload ~${payloadEstimate}/${limit}, model=${model}); forwarding the over-window payload as-is (#333)`);
+        return prepared;
     }
     log("warn", `[${session.id}] context ${tokenCount} tokens exceeds model window ${limit} (model=${model}); preflight compressing before forward`);
     // #300: stamp the chain marker so a downstream bili skips these
@@ -1843,13 +1850,31 @@ async function preflightCompressIfNeeded(
         log("warn", `[${session.id}] preflight made no progress but the payload fits (~${result.payloadEstimate}/${limit}); forwarding as-is`);
         return prepared;
     }
-    // The payload still overflows the window: fail fast with a diagnostic
-    // error instead of forwarding a guaranteed-400 payload (#301).
+    // The payload still overflows the window.
     const f = result.failure;
     if (f?.kind === "aborted") {
         log("warn", `[${session.id}] preflight aborted (${f.detail}); not forwarding`);
         return { failFast: true, status: 0, message: f.detail, retryable: false, respond: false };
     }
+    if (f?.kind === "exhausted") {
+        // #333: exhaustion is a STATIC state — no retry can ever create a
+        // compressible range, so failing fast here is a permanent 502 loop.
+        // Forward the best payload we have (keeping any partial compression
+        // preflight already applied): the upstream either accepts (its real
+        // window is larger than this limit) and the injected nudge lets the
+        // model self-heal, or it rejects with a truthful 400 the client can
+        // act on (and the overflow self-heal learns the real window).
+        if (result.compressedRanges > 0) {
+            log("warn", `[${session.id}] preflight exhausted (${f.detail}) after ${result.compressedRanges} range(s), ~${result.savedTokens} tokens saved; forwarding the rebuilt over-window payload as-is (#333)`);
+            const rebuilt = runPrepare();
+            session.stats.requests -= 1;
+            return rebuilt;
+        }
+        log("warn", `[${session.id}] preflight exhausted (${f.detail}); forwarding the over-window payload as-is (#333)`);
+        return prepared;
+    }
+    // Transient upstream failure on the summarization call: fail fast with a
+    // diagnostic error instead of forwarding a guaranteed-400 payload (#301).
     const status = f?.kind === "upstream" && f.status === 429 ? 503 : 502;
     return failFast(status, f?.detail ?? "unknown reason", status === 503);
 }
