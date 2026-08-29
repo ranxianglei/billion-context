@@ -41,6 +41,7 @@ test("codexCompactMode: kill-switch two states + default + case/trim", () => {
 test("isCodexClient: UA prefix detection (Node lowercases header keys)", () => {
     assert.equal(isCodexClient({ "user-agent": "codex_cli_rs/0.1.0 (linux x86_64)" }), true);
     assert.equal(isCodexClient({ "user-agent": "codex_cli_rs/0.2.1" }), true);
+    assert.equal(isCodexClient({ "user-agent": "codex_exec/0.147.0 (linux x86_64)" }), true, "exec-mode originator (codex 0.147 real-device UA)");
     assert.equal(isCodexClient({ "user-agent": "openai-node/3.0" }), false);
     assert.equal(isCodexClient({}), false, "no UA");
     assert.equal(isCodexClient({ "user-agent": ["codex_cli_rs/0.1.0", "other"] }), true, "array UA takes first");
