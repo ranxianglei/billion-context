@@ -48,6 +48,46 @@ export function stripBiliCompactionItems<T>(input: T[]): T[] {
     return input.filter((item) => !isBiliCompactionItem(item));
 }
 
+// The summary text a forged blob carries (sentinel-prefixed plaintext).
+export function extractBiliSummary(item: unknown): string | undefined {
+    const it = item as { encrypted_content?: unknown } | null;
+    if (!it || typeof it.encrypted_content !== "string") return undefined;
+    if (!it.encrypted_content.startsWith(CODEX_COMPACT_SENTINEL)) return undefined;
+    const text = it.encrypted_content.slice(CODEX_COMPACT_SENTINEL.length);
+    return text.length > 0 ? text : undefined;
+}
+
+// An echoed fc_bili_ compaction item is REPLACED (in place) by a plain user
+// message carrying the extracted summary — a history-borne handoff the kernel
+// can fold again and codex's retention keeps. Rare bounded duplication (a
+// block whose anchors survived the truncation also renders) is accepted over
+// data loss. Marker items without an extractable blob (id-prefix-only, e.g.
+// minted by an older build) are still dropped; real OpenAI blobs pass through
+// untouched.
+export function replaceBiliCompactionItems<T>(input: T[]): { items: T[]; replaced: number; dropped: number } {
+    const items: T[] = [];
+    let replaced = 0;
+    let dropped = 0;
+    for (const item of input) {
+        if (!isBiliCompactionItem(item)) {
+            items.push(item);
+            continue;
+        }
+        const summary = extractBiliSummary(item);
+        if (summary === undefined) {
+            dropped++;
+            continue;
+        }
+        items.push({
+            type: "message",
+            role: "user",
+            content: [{ type: "input_text", text: `[bili] context summary after compaction:\n${summary}` }],
+        } as T);
+        replaced++;
+    }
+    return { items, replaced, dropped };
+}
+
 // Safety valve: forge ONLY when the transform succeeded, the steady-state
 // context is below the 90% threshold (codex's own auto-compact point — above
 // it, bili's ACP has failed to keep up and native compaction must backstop),
@@ -58,30 +98,36 @@ export function codexCompactGate(session: Session, effectiveLimit: number, trans
     return session.state.blocks.some((b) => b.active);
 }
 
-// Minimal legal forged SSE stream for the trigger form: exactly one compaction
-// output item + response.completed. Codex's parser (codex-api/src/sse/responses.rs)
-// ignores every other event kind and requires response.completed to parse with
-// id + usage{input_tokens,output_tokens,total_tokens}.
-export function buildTriggerForgeSse(
+// Minimal legal forged reply for the trigger form. Streaming: exactly one
+// compaction output item + response.completed (codex's parser,
+// codex-api/src/sse/responses.rs, ignores every other event kind and requires
+// response.completed to parse with id + usage). Non-streaming: the JSON
+// response shape {id, output, usage}.
+export function buildTriggerForgeBody(
     summaryText: string,
     usage: { inputTokens: number; outputTokens: number; totalTokens: number },
-): string {
+    stream: boolean,
+): { body: string; contentType: string } {
     const compactionItem = {
         type: "compaction",
         id: `${CODEX_COMPACT_ID_PREFIX}${randomUUID()}`,
         encrypted_content: `${CODEX_COMPACT_SENTINEL}${summaryText}`,
     };
-    const completed = {
-        id: `resp_bili_${randomUUID()}`,
-        usage: {
-            input_tokens: usage.inputTokens,
-            output_tokens: usage.outputTokens,
-            total_tokens: usage.totalTokens,
-        },
+    const usageJson = {
+        input_tokens: usage.inputTokens,
+        output_tokens: usage.outputTokens,
+        total_tokens: usage.totalTokens,
     };
+    const id = `resp_bili_${randomUUID()}`;
+    if (!stream) {
+        return {
+            body: JSON.stringify({ id, output: [compactionItem], usage: usageJson }),
+            contentType: "application/json",
+        };
+    }
     const frame1 = `data: ${JSON.stringify({ type: "response.output_item.done", item: compactionItem })}\n\n`;
-    const frame2 = `data: ${JSON.stringify({ type: "response.completed", response: completed })}\n\n`;
-    return frame1 + frame2;
+    const frame2 = `data: ${JSON.stringify({ type: "response.completed", response: { id, usage: usageJson } })}\n\n`;
+    return { body: frame1 + frame2, contentType: "text/event-stream" };
 }
 
 // The kernel renders block summaries as system messages with this header

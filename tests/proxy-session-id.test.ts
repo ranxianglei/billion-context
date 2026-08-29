@@ -146,13 +146,13 @@ const rootMeta = (over: Record<string, unknown> = {}) =>
 const subMeta = (over: Record<string, unknown> = {}) =>
     JSON.stringify({ request_kind: "turn", thread_source: "subagent", thread_id: SUB_THREAD, turn_id: "turn-2", window_id: "win-1", ...over });
 
-test("codexTurnIdentity: thread_source user → session-id header (current root semantics)", () => {
+test("codexTurnIdentity: thread_source user → undefined (legacy precedence chain owns the root id)", () => {
     const id = codexTurnIdentity({
         "session-id": ROOT_SESSION,
         "thread-id": ROOT_SESSION,
         "x-codex-turn-metadata": rootMeta(),
     });
-    assert.deepEqual(id, { value: ROOT_SESSION, threadSource: "user" });
+    assert.equal(id, undefined, "validated root turn must fall through to the legacy chain (stronger headers may win)");
 });
 
 test("codexTurnIdentity: thread_source subagent → thread-id header (fresh per-thread state, #150)", () => {
@@ -170,7 +170,7 @@ test("codexTurnIdentity: root identity is stable across turns (turn_id/window_id
     const a = codexTurnIdentity({ "session-id": ROOT_SESSION, "thread-id": ROOT_SESSION, "x-codex-turn-metadata": rootMeta({ turn_id: "turn-1", window_id: "w1" }) });
     const b = codexTurnIdentity({ "session-id": ROOT_SESSION, "thread-id": ROOT_SESSION, "x-codex-turn-metadata": rootMeta({ turn_id: "turn-99", window_id: "w42" }) });
     assert.deepEqual(a, b);
-    assert.equal(a!.value, ROOT_SESSION);
+    assert.equal(a, undefined);
 });
 
 test("codexTurnIdentity: metadata.thread_id must equal the thread-id header (cross-check, PR #249)", () => {

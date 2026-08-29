@@ -212,7 +212,7 @@ test("e2e E2 (trigger form): intercept + nothing compressed yet → forwarded (n
     });
 });
 
-test("e2e E2 (trigger form): post-forge turn — echo stripped, forged summary re-injected as developer message", async () => {
+test("e2e E2 (trigger form): post-forge turn — echo replaced by a history-borne handoff; dev re-injection only when the echo is absent", async () => {
     await withHarness({ mode: "intercept", firstTurnTokens: 1000 }, async (h) => {
         const afterSetup = await setupCompressedSession(h);
 
@@ -228,10 +228,9 @@ test("e2e E2 (trigger form): post-forge turn — echo stripped, forged summary r
         assert.equal(e1.item.type, "compaction", "forge returned the compaction item");
 
         // Turn 3: codex replays [forged compaction item, retained tail, new
-        // turn]. The kernel deactivates the block (its messages are gone from
-        // the replay), so the summary must survive via the captured
-        // developer-message re-injection — and the echoed bili item must not
-        // reach upstream.
+        // turn]. The echo is REPLACED by a summary-carrying user message — a
+        // history-borne handoff the kernel can fold again — and the developer
+        // re-injection is suppressed for this turn to avoid duplication.
         const r3 = await fetch(h.url, {
             method: "POST",
             headers: { "content-type": "application/json", "user-agent": CODEX_UA },
@@ -247,11 +246,29 @@ test("e2e E2 (trigger form): post-forge turn — echo stripped, forged summary r
         assert.ok(captured.some((t) => t.includes("MAIN-SUMMARY-SETUP")), "captured summary is the setup block's");
 
         const fwd = h.bodies[h.bodies.length - 1];
-        assert.ok(!fwd.includes("fc_bili_"), "echoed bili compaction item stripped before forwarding");
+        assert.ok(!fwd.includes("fc_bili_"), "echoed bili compaction item replaced before forwarding");
         const fwdBody = JSON.parse(fwd) as { input: Array<{ type: string; role?: string; content?: unknown }> };
+        const handoff = fwdBody.input.find((i) => JSON.stringify(i).includes("[bili] context summary after compaction"));
+        assert.ok(handoff, "summary handoff user message present in forwarded input");
+        assert.ok(JSON.stringify(handoff).includes("MAIN-SUMMARY-SETUP"), "pre-compaction summary carried by the handoff");
         const dev = fwdBody.input.find((i) => i.type === "message" && i.role === "developer");
-        assert.ok(dev, "developer message present in forwarded input");
-        assert.ok(String(dev!.content).includes("MAIN-SUMMARY-SETUP"), "pre-compaction summary re-injected for the model");
+        assert.ok(!dev || !JSON.stringify(dev).includes("MAIN-SUMMARY-SETUP"), "developer re-injection suppressed while the echo handoff carries the summary");
+
+        // Turn 4: the echo did NOT come back (codex dropped / restarted) —
+        // now the captured summaries must surface via the developer-message
+        // re-injection fallback instead.
+        const r4 = await fetch(h.url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "user-agent": CODEX_UA },
+            body: JSON.stringify({ model: "gpt-resp", stream: true, session_id: SESSION, instructions: "You are the test coding agent.", input: [...conversation().slice(-2), { type: "message", role: "user", content: "still here" }] }),
+        });
+        assert.equal(r4.status, 200);
+        await r4.text();
+        const fwd4 = h.bodies[h.bodies.length - 1];
+        const fwd4Body = JSON.parse(fwd4) as { input: Array<{ type: string; role?: string; content?: unknown }> };
+        const dev4 = fwd4Body.input.find((i) => i.type === "message" && i.role === "developer");
+        assert.ok(dev4, "developer message present when the echo is absent");
+        assert.ok(JSON.stringify(dev4).includes("MAIN-SUMMARY-SETUP"), "captured summary re-injected via the fallback path");
     });
 });
 

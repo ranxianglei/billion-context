@@ -11,8 +11,9 @@ import {
     hasCompactionTrigger,
     isBiliCompactionItem,
     stripBiliCompactionItems,
+    replaceBiliCompactionItems,
     codexCompactGate,
-    buildTriggerForgeSse,
+    buildTriggerForgeBody,
     renderForgedSummary,
     mergeForgedSummaries,
     CODEX_COMPACT_ID_PREFIX,
@@ -115,8 +116,34 @@ test("codexCompactGate: safety-valve matrix", () => {
     assert.equal(codexCompactGate(mockSession(1_000, [block(true)]), 0, true), false, "zero limit → pass through");
 });
 
-test("buildTriggerForgeSse: minimal legal 2-frame stream", () => {
-    const sse = buildTriggerForgeSse("SUMMARY-TEXT", { inputTokens: 1000, outputTokens: 0, totalTokens: 1000 });
+test("replaceBiliCompactionItems: echo becomes a summary handoff message in place", () => {
+    const ours = { type: "compaction", id: `${CODEX_COMPACT_ID_PREFIX}x`, encrypted_content: `${CODEX_COMPACT_SENTINEL}summary text` };
+    const real = { type: "compaction", id: "fc_real", encrypted_content: "opaque" };
+    const msg = { type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] };
+    const { items, replaced, dropped } = replaceBiliCompactionItems([msg, ours, real]);
+    assert.equal(replaced, 1);
+    assert.equal(dropped, 0);
+    assert.equal(items.length, 3, "position-preserving replacement, real blob kept");
+    const handoff = items[1] as { type: string; role: string; content: { type: string; text: string }[] };
+    assert.equal(handoff.type, "message");
+    assert.equal(handoff.role, "user");
+    assert.equal(handoff.content[0]!.type, "input_text");
+    assert.ok(handoff.content[0]!.text.includes("summary text"), "extracted summary rides in the message");
+    assert.ok(items.includes(real) && items.includes(msg), "neighbors untouched");
+});
+
+test("replaceBiliCompactionItems: legacy id-only marker items still drop; empty blob drops", () => {
+    const legacy = { type: "compaction", id: `${CODEX_COMPACT_ID_PREFIX}old`, encrypted_content: "not-ours" };
+    const empty = { type: "compaction", id: `${CODEX_COMPACT_ID_PREFIX}e`, encrypted_content: CODEX_COMPACT_SENTINEL };
+    const { items, replaced, dropped } = replaceBiliCompactionItems([legacy, empty]);
+    assert.equal(replaced, 0);
+    assert.equal(dropped, 2);
+    assert.equal(items.length, 0);
+});
+
+test("buildTriggerForgeBody: minimal legal 2-frame stream", () => {
+    const { body: sse, contentType } = buildTriggerForgeBody("SUMMARY-TEXT", { inputTokens: 1000, outputTokens: 0, totalTokens: 1000 }, true);
+    assert.equal(contentType, "text/event-stream");
     const frames = sse.split("\n\n").filter((f) => f.length > 0);
     assert.equal(frames.length, 2, "exactly two data frames");
     const e1 = JSON.parse(frames[0]!.slice("data: ".length)) as { type: string; item: { type: string; id: string; encrypted_content: string } };
@@ -131,6 +158,19 @@ test("buildTriggerForgeSse: minimal legal 2-frame stream", () => {
     assert.equal(e2.response.usage.input_tokens, 1000);
     assert.equal(e2.response.usage.output_tokens, 0);
     assert.equal(e2.response.usage.total_tokens, 1000);
+});
+
+test("buildTriggerForgeBody: non-streaming JSON shape", () => {
+    const { body, contentType } = buildTriggerForgeBody("S", { inputTokens: 7, outputTokens: 0, totalTokens: 7 }, false);
+    assert.equal(contentType, "application/json");
+    const parsed = JSON.parse(body) as { id: string; output: { type: string; id: string; encrypted_content: string }[]; usage: { input_tokens: number; total_tokens: number } };
+    assert.ok(parsed.id.startsWith("resp_bili_"));
+    assert.equal(parsed.output.length, 1);
+    assert.equal(parsed.output[0]!.type, "compaction");
+    assert.ok(parsed.output[0]!.id.startsWith(CODEX_COMPACT_ID_PREFIX));
+    assert.ok(parsed.output[0]!.encrypted_content.startsWith(CODEX_COMPACT_SENTINEL));
+    assert.equal(parsed.usage.input_tokens, 7);
+    assert.equal(parsed.usage.total_tokens, 7);
 });
 
 function blockWith(summary: string, active: boolean, topic?: string): CompressionBlock {

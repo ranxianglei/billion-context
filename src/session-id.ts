@@ -104,8 +104,13 @@ export function preferPromptCacheKeyIdentity<T extends ConversationIdentity>(
  *
  * When the metadata is present AND cross-checked (metadata.thread_id ===
  * `thread-id` header), partition by thread_source:
- *   - "user"     → the `session-id` header (current root semantics, stable
- *                  across turns)
+ *   - "user"     → undefined (validated, but the id resolves through the
+ *                  legacy precedence chain — binding the session-id header
+ *                  directly would leapfrog stronger headers such as
+ *                  x-bili-plugin-conversation and flip the identity when a
+ *                  wrapper adds/drops the metadata mid-session; the legacy
+ *                  chain reads the same session-id header for plain codex
+ *                  traffic, so the root value is unchanged)
  *   - anything else → the `thread-id` header (fresh independent state per
  *                  thread; self-contained replay is lossless). codex's
  *                  ThreadSource serializes more than user/subagent —
@@ -115,9 +120,9 @@ export function preferPromptCacheKeyIdentity<T extends ConversationIdentity>(
  *                  threads that need #150 isolation just as much, so the
  *                  discrimination is inverted: only "user" joins the root
  *                  session, every other source gets its own thread state.
- * A non-string/empty thread_source, unparseable JSON, missing/mismatched
- * thread_id, or a missing `session-id` header on a "user" turn → undefined:
- * the caller falls through to the legacy chain unchanged.
+ * A non-string/empty thread_source, unparseable JSON, or missing/mismatched
+ * thread_id → undefined: the caller falls through to the legacy chain
+ * unchanged.
  */
 export type CodexTurnIdentity = {
     value: string;
@@ -142,9 +147,14 @@ export function codexTurnIdentity(headers: Record<string, string | string[] | un
     const threadHeader = headers["thread-id"];
     if (typeof threadHeader !== "string" || threadHeader.trim() !== metaThreadId.trim()) return undefined;
     if (threadSource.trim() === "user") {
-        const sessionHeader = headers["session-id"];
-        if (typeof sessionHeader !== "string" || sessionHeader.trim().length === 0) return undefined;
-        return { value: sessionHeader.trim(), threadSource: "user" };
+        // A root turn's headers are validated (the pair cross-checks), but the
+        // session id still resolves through the legacy precedence chain:
+        // binding directly to the session-id header here would leapfrog
+        // stronger headers (e.g. x-bili-plugin-conversation) and flip the
+        // identity when a wrapper adds or drops the metadata mid-session. The
+        // legacy chain reads the same session-id header for plain codex
+        // traffic, so the root value is unchanged.
+        return undefined;
     }
     return { value: threadHeader.trim(), threadSource };
 }

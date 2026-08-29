@@ -1,7 +1,7 @@
 import http from "node:http";
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
-import { createCore, type CompressionCore, type CompressionState, type Config, type CoreMessage, type NudgeDecision, type Prompts, defaultPrompts, estimateTokensFast, renderNudgeText, deactivateBlock, viableRanges } from "acp-kernel";
+import { createCore, type CompressionCore, type CompressionState, type Config, type CoreMessage, type NudgeDecision, type Prompts, defaultPrompts, defaultCountTokens, estimateTokensFast, renderNudgeText, deactivateBlock, viableRanges } from "acp-kernel";
 import { resolveCompress, resolveCompressPrompts, resolveRequestConfig } from "./compress-settings.js";
 import type { ProxyOptions } from "./config.js";
 import { loadOptions, loadRoutes } from "./config.js";
@@ -54,7 +54,7 @@ import { defaultLogFile, stateDir, proxyOriginFile } from "./paths.js";
 import { compressLoopResponsesJson } from "./compress-loop-responses.js";
 import { runCompressLoop, pickAdapter } from "./loop/index.js";
 import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeResponsesMessageItems } from "./loop/adapter-responses.js";
-import { codexCompactMode, isCodexClient, hasCompactionTrigger, stripBiliCompactionItems, codexCompactGate, buildTriggerForgeSse, mergeForgedSummaries } from "./codex-compact.js";
+import { codexCompactMode, isCodexClient, hasCompactionTrigger, stripBiliCompactionItems, replaceBiliCompactionItems, codexCompactGate, buildTriggerForgeBody, mergeForgedSummaries } from "./codex-compact.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { observeResponsesTerminalState } from "./stream-terminal.js";
@@ -810,11 +810,15 @@ async function handle(
             // (bundled model table + 272K unknown-model fallback) and
             // auto-compacts at 90% of it. If bili's budget exceeds what codex
             // believes, codex's native compaction fires first — the #292
-            // misalignment. Cap the effective window at codex's perception;
-            // the clamped value is authoritative for this client (codex's own
-            // config), so it also clears the low-confidence fallback flag
-            // (no effective-floor after output-headroom reservation).
-            const aligned = codexAlignedWindow(reqConfig.modelContextLimit, model, req.headers);
+            // misalignment. Cap the effective window at codex's perception.
+            // An operator's explicit compress.modelContextLimit is exempt
+            // (operator tuning is owned by the operator — never floored and
+            // never clamped); the clamped value is authoritative for this
+            // client (codex's own config), so it also clears the
+            // low-confidence fallback flag.
+            const aligned = operatorWindowTuned
+                ? { limit: reqConfig.modelContextLimit, clamped: false }
+                : codexAlignedWindow(reqConfig.modelContextLimit, model, req.headers);
             if (aligned.clamped) {
                 const before = reqConfig.modelContextLimit;
                 reqConfig = { ...reqConfig, modelContextLimit: aligned.limit };
@@ -992,7 +996,10 @@ async function handle(
                 pluginConversation = clientConv ?? conversation;
             }
         }
-        if (!pluginAgent && session.stats.requests === 0) {
+        if (!pluginAgent && session.stats.requests === 0 && codexTurnIdentity(req.headers) === undefined) {
+            // A codex subagent thread mints a fresh session too, but it must
+            // not claim the ROOT conversation's pending register (the plugin
+            // binding belongs to the root session, #317).
             const pending = takePendingPluginRegister();
             if (pending) {
                 pluginAgent = pending.agent;
@@ -1420,24 +1427,18 @@ function prepareResponses(
         log("info", `[${sessionId}] reconciled ACP state after native Responses compact boundary`);
     }
 
-    // A codex client echoes our forged compaction item back in the next request;
-    // drop it so the summary is sourced from state (no double-count). Real
+    // A codex client echoes our forged compaction item back in the next
+    // request; replace it with a plain summary-carrying user message so the
+    // handoff rides the replayable history (kernel-compressible, retained by
+    // codex's own user-message rule) instead of a foreign opaque blob. Real
     // OpenAI blobs carry no bili marker and pass through untouched.
+    let echoReplaced = false;
     if (Array.isArray(parsed.input)) {
-        const cleaned = stripBiliCompactionItems(parsed.input);
-        if (cleaned.length !== parsed.input.length) {
-            log("info", `[${sessionId}] stripped ${parsed.input.length - cleaned.length} bili compaction item(s) echoed by codex`);
-            parsed.input = cleaned;
-            // The truncated replay deactivates the blocks covering the dropped
-            // prefix during the processTurn below — capture their summaries
-            // while still active (also covers sessions forged by an older
-            // build that never captured them).
-            const prevForged = session.metadata.codexForgedSummaries as string[] | undefined;
-            const captured = mergeForgedSummaries(prevForged, session.state.blocks);
-            if (captured.length !== (prevForged?.length ?? 0)) {
-                session.metadata.codexForgedSummaries = captured;
-                markDirty(session);
-            }
+        const { items, replaced, dropped } = replaceBiliCompactionItems(parsed.input);
+        if (replaced > 0 || dropped > 0) {
+            echoReplaced = true;
+            log("info", `[${sessionId}] replaced ${replaced} echoed bili compaction item(s) with summary handoff message(s)${dropped > 0 ? `, dropped ${dropped} legacy marker item(s)` : ""}`);
+            parsed.input = items as typeof parsed.input;
         }
     }
 
@@ -1471,9 +1472,7 @@ function prepareResponses(
     // Codex native remote-compact request: no compress prompt/tools (the model
     // produces the compaction itself), no acp tags, plain passthrough so the
     // response terminal state can gate the rebase marker.
-    const isCompactionTrigger = Array.isArray(parsed.input)
-        && parsed.input.length > 0
-        && parsed.input[parsed.input.length - 1]!.type === "compaction_trigger";
+    const isCompactionTrigger = hasCompactionTrigger(parsed.input);
     // Route config is keyed by the upstream THIS request goes to (#286: a
     // session can outlive its first relay — session.meta.upstreamOrigin is
     // first-wins and would silently ignore the new relay's route settings).
@@ -1509,7 +1508,15 @@ function prepareResponses(
         processedMessages = stripKernelSummaries(turn.messages, turn.state);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltInput = patchResponsesInput(projection, processedMessages);
-        const forgedSummaries = (session.metadata.codexForgedSummaries as string[] | undefined) ?? [];
+        // Fallback path: when the echo did NOT come back this turn (client
+        // dropped it / restarted), the history-borne handoff is absent and the
+        // forge-time captured summaries are re-injected into the developer
+        // message so the pre-compaction content is never lost. When the echo
+        // DID come back, the replacement message carries the summaries and
+        // the injection is suppressed to avoid duplicating them.
+        const forgedSummaries = echoReplaced
+            ? []
+            : (session.metadata.codexForgedSummaries as string[] | undefined) ?? [];
         if (shouldInject && !isCompactionTrigger && !process.env.ACP_NO_COMPRESS_PROMPT) {
             const prompt = responsesTextProtocol ? buildCompressHybridSystemPrompt(prompts) : buildCompressSystemPrompt(prompts);
             const devContent = [...projection.systemParts, ...forgedSummaries, prompt].join("\n\n---\n\n");
@@ -1563,11 +1570,16 @@ function prepareResponses(
             session.metadata.codexForgedSummaries = captured;
             markDirty(session);
         }
-        const total = session.stats.lastInputTokens;
+        // Codex recomputes its ledger from the next real request, but the
+        // usage we mint here must not read as an empty context: fall back to
+        // estimating the trigger payload itself when lastInputTokens is
+        // stale/zero. The reply honors parsed.stream (JSON body when not
+        // streaming).
+        const est = defaultCountTokens(typeof parsed.input === "string" ? parsed.input : JSON.stringify(parsed.input ?? ""));
+        const total = Math.max(session.stats.lastInputTokens, est, 1);
         codexForge = {
             kind: "trigger",
-            body: buildTriggerForgeSse(summaries.join("\n\n"), { inputTokens: total, outputTokens: 0, totalTokens: total }),
-            contentType: "text/event-stream",
+            ...buildTriggerForgeBody(summaries.join("\n\n"), { inputTokens: total, outputTokens: 0, totalTokens: total }, stream),
         };
         log("info", `[${sessionId}] codex compact intercepted (trigger); forged SSE with ${summaries.length} block summary(s), upstream not contacted`);
     }
@@ -1705,6 +1717,11 @@ function prepareResponsesCompact(
     if (codexCompactMode() !== "intercept" || !isCodexClient(req.headers) || !Array.isArray(parsed.input)) {
         return base;
     }
+    // The state commit below is all-or-nothing: every non-forge path restores
+    // the pre-turn state so a passthrough compact is not raced against a
+    // half-applied fold (the upstream's own compaction boundary is handled by
+    // markNativeCompactionBoundary + rebase instead).
+    const prevState = session.state;
     // E2 endpoint form: /responses/compact. When the gate passes, run the same
     // fold pipeline as a normal turn and forge the compacted history as
     // {"output": [...]} — a deterministic handoff to the ACP state instead of a
@@ -1715,15 +1732,22 @@ function prepareResponsesCompact(
         const turn = core.processTurn({ messages: projection.msgs, state: session.state, config, tokenCount: session.stats.lastInputTokens, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" });
         session.state = turn.state;
         transformOk = true;
-        if (!codexCompactGate(session, config.modelContextLimit, transformOk)) return base;
+        if (!codexCompactGate(session, config.modelContextLimit, transformOk)) {
+            session.state = prevState;
+            return base;
+        }
         const processed = stripKernelSummaries(turn.messages, turn.state);
         const output = patchResponsesInput(projection, processed);
-        if (typeof output === "string") return base;
+        if (typeof output === "string") {
+            session.state = prevState;
+            return base;
+        }
         snapshotMessages(session, projection.msgs);
         markDirty(session);
         log("info", `[${session.id}] codex compact intercepted (endpoint); forged history with ${output.length} item(s), upstream not contacted`);
         return { ...base, codexForge: { kind: "endpoint", body: JSON.stringify({ output }), contentType: "application/json" } };
     } catch (err) {
+        session.state = prevState;
         log("warn", `[${session.id}] codex compact forge failed (${String(err)}); passing through to upstream`);
         return base;
     }
