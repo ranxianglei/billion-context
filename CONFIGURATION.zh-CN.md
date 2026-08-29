@@ -359,6 +359,7 @@
 | `BILI_LAUNCHER_PLUGIN` | 设 `0` 关闭 launcher 为 claude/codex 注入 bili MCP 服务器（退回纯 wire 模式）。原生 MCP 工具默认注入。见[启动器参考](#启动器参考)。 |
 | `BILI_LAUNCHER_DIRECT` | 设 `1` 启用 launcher 直连 URL 路由（放弃 MITM/CA 信任）。见[启动器参考](#启动器参考)。 |
 | `BILI_CLAUDE_UPSTREAM` | claude 直连模式：当 `ANTHROPIC_BASE_URL` 已指向某个 relay 时，用它指定你的 relay 端点（否则会被旁路）。 |
+| `BILI_CODEX_COMPACT` | codex 原生压缩处理：`pass`（默认）把 codex 的压缩请求转发给上游（原生压缩兜底）；`intercept` 在安全门通过时（transform 成功 + 稳态用量 < 窗口 90% + 至少一个活跃压缩块）在本地伪造向 ACP 状态的交接 —— trigger 形态伪造 2 帧 SSE，endpoint 形态伪造 `{output}` —— 且不接触上游。伪造的 ACP 摘要会在之后的每个回合以 developer 消息重新注入，保证 codex 截断历史后压缩内容仍可见。任一安全门失败则原样透传。 |
 
 ---
 
