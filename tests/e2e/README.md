@@ -51,9 +51,10 @@ prints codex version, dist path, and an upstream `/models` probe.
 - Full isolation: `CODEX_HOME`, `XDG_{CONFIG,CACHE,STATE}_HOME` and the work
   dir (`tmp/e2e-codex-*` in the repo — **not** `/tmp`, codex refuses TMPDIR
   homes) are throwaway.
-- The bili window is forced via a `routes.*.models.*.context` config override
-  so compression triggers deterministically on every run, independent of the
-  upstream's advertised window and of which window-alignment PRs are merged.
+- The bili window is forced via the `BILI_LAUNCHER_MODEL_WINDOWS` env
+  (per-model override; wins over registry peek) so compression triggers
+  deterministically on every run, independent of the upstream's advertised
+  window and of which window-alignment PRs are merged.
 - Provider `name = "OpenAI"` in `config.toml` keeps codex on the remote
   compaction path (V2) so the forge phase exercises the real interception.
 - Assertions scrape bili's own log lines (`[acp-usage]`, `preflight
