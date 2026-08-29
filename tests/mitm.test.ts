@@ -290,6 +290,50 @@ await test("setupMitm e2e: remote CONNECT policy (#77, #240)", async (t) => {
     });
 });
 
+await test("setupMitm e2e: blind TCP tunnel to a non-whitelisted host passes bytes both ways (#346)", async () => {
+    await withTmpCa(async () => {
+        const upstream = net.createServer((sock) => {
+            sock.on("data", (c) => sock.write("UPSTREAM-SAW:" + c.toString("utf8")));
+        });
+        upstream.listen(0, "127.0.0.1");
+        await once(upstream, "listening");
+        const upPort = (upstream.address() as { port: number }).port;
+
+        const logs: string[] = [];
+        const server = http.createServer((_req, res) => { res.writeHead(500); res.end(); });
+        setupMitm(server, [], (msg) => { logs.push(msg); });
+        server.listen(0, "127.0.0.1");
+        await once(server, "listening");
+        const port = (server.address() as { port: number }).port;
+        try {
+            // 127.0.0.1 is an IP, not a domain → isMitmHost is false → blind tunnel.
+            const { statusLine, socket } = await rawConnect(port, "127.0.0.1", `127.0.0.1:${upPort}`);
+            assert.match(statusLine, /^HTTP\/1\.1 200/, "blind tunnel must answer CONNECT with 200");
+            const reply = Promise.withResolvers<string>();
+            let out = "";
+            let settled = false;
+            socket.on("data", (c: Buffer) => {
+                out += c.toString("utf8");
+                if (!settled && out.includes("UPSTREAM-SAW:")) { settled = true; reply.resolve(out); }
+            });
+            socket.once("close", () => { if (!settled) reply.reject(new Error("tunnel closed before reply")); });
+            socket.write("hello-zcode");
+            const body = await reply.promise;
+            assert.match(body, /UPSTREAM-SAW:hello-zcode/, "bytes must flow client→tunnel→upstream and back");
+            assert.ok(
+                logs.some((l) => /tunnel .* established \(blind TCP, not decrypted\)/.test(l)),
+                "established blind tunnel must be logged for diagnostics",
+            );
+            socket.destroy();
+        } finally {
+            server.close();
+            server.closeAllConnections?.();
+            upstream.close();
+            upstream.closeAllConnections?.();
+        }
+    });
+});
+
 // A real client (e.g. ZCode, #346) that does not trust the root CA sends a
 // TLS "certificate unknown" alert; the handler must turn that into exactly ONE
 // actionable "install the root CA" warning, deduplicated across the hundreds
