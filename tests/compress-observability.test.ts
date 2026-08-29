@@ -111,6 +111,15 @@ test("#189: failed compress records no lastCompress", () => {
     assert.equal(ctx.session.lastCompress, undefined, "no lastCompress on failure");
 });
 
+test("#349: empty compress args → actionable no-valid-ranges message (missing-content)", () => {
+    const ctx = makeCompressibleCtx();
+    const out = runApply(ctx, {});
+    assert.ok(out.startsWith("[Compression FAILED"), `expected failure, got: ${out}`);
+    assert.ok(out.includes("non-empty 'content' array"), `steers to a content array: ${out}`);
+    assert.ok(out.includes("startId, endId, summary"), `names the required fields: ${out}`);
+    assert.ok(!out.includes("Check your startId/endId parameters"), "old misleading hint removed");
+});
+
 test("#189: staged-compress steering note appended when shrink exceeds the configured max", () => {
     const prev = process.env.BILI_MAX_SHRINK_PER_COMPRESS;
     process.env.BILI_MAX_SHRINK_PER_COMPRESS = "0.05";

@@ -228,7 +228,7 @@ function refNum(ref: string): number {
 export function applyRanges(ranges: ReturnType<typeof parseCompressInput>, ctx: RewriteCtx): string {
     if (ranges.length === 0) {
         ctx.log("[acp-proxy: compress call had no valid ranges; nothing compressed.]");
-        return "[Compression FAILED: no valid ranges parsed from the tool call. Check your startId/endId parameters.]";
+        return "[Compression FAILED: no valid ranges parsed. compress requires a non-empty 'content' array of {startId, endId, summary} ranges, where startId/endId are mNNNNN message refs from the conversation. Re-issue the compress call with a valid content array.]";
     }
     ctx.log(`[acp-proxy: compress requested ${ranges.length} range(s): ${ranges.map((r) => `${r.startRef}–${r.endRef}`).join(", ")}]`);
     ctx.log(`[acp-proxy: ctx has ${ctx.messages.length} message(s), state has ${ctx.session.state.messageRefs?.byRef?.size ?? "?"} ref(s) mapped]`);

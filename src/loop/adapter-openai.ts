@@ -335,7 +335,8 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                         const fn = tc.function as Record<string, unknown> | undefined;
                         const name = typeof fn?.name === "string" ? fn.name : "";
                         const id = typeof tc.id === "string" ? tc.id : "";
-                        const args = typeof fn?.arguments === "string" ? fn.arguments : "";
+                        const rawArgs = fn?.arguments;
+                        const args = typeof rawArgs === "string" ? rawArgs : (rawArgs !== null && typeof rawArgs === "object" ? JSON.stringify(rawArgs) : "");
                         let buf = pending.get(idx);
                         if (!buf) {
                             buf = { index: idx, id, name, arguments: args };
