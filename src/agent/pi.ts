@@ -65,9 +65,14 @@ function sessionIdOf(ctx: Ctx): string | undefined {
 // by the omp session uuid). The before_provider_request return value REPLACES
 // the whole outgoing payload (omp onPayload chain, verified in the omp 17.3.8
 // dist), so stamp prompt_cache_key with the omp session id: the proxy binds
-// pluginMode by that identity and /acp finds the session by it. Chat shape only
-// (messages array, no responses `input`, no anthropic `max_tokens`, no native
-// prompt_cache_key); pi is untouched (it stamps x-bili-plugin-conversation in
+// pluginMode by that identity and /acp finds the session by it.
+// Chat shape = messages array, no responses `input`, no native prompt_cache_key.
+// max_tokens is NOT a discriminator: omp's openai-compat providers send it in
+// every chat-completions body (maxTokensField:"max_tokens") exactly like the
+// anthropic wire — excluding it meant the target shape was never stamped
+// (#268). The anthropic wire gets stamped too: the proxy records the mapping
+// from the body pck there as well and strips the field before forwarding to
+// the real Anthropic. pi is untouched (it stamps x-bili-plugin-conversation in
 // before_provider_headers, which outranks the body field).
 function stampPromptCacheKey(event: unknown, ctx: Ctx, agent: string): Record<string, unknown> | undefined {
     if (agent !== "omp") return undefined;
@@ -75,7 +80,7 @@ function stampPromptCacheKey(event: unknown, ctx: Ctx, agent: string): Record<st
     if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return undefined;
     const p = payload as Record<string, unknown>;
     if (!Array.isArray(p.messages)) return undefined;
-    if (p.input !== undefined || p.max_tokens !== undefined) return undefined;
+    if (p.input !== undefined) return undefined;
     if (typeof p.prompt_cache_key === "string" && p.prompt_cache_key.trim().length > 0) return undefined;
     const sid = sessionIdOf(ctx);
     if (sid === undefined || sid.length === 0) return undefined;

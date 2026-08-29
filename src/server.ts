@@ -896,8 +896,24 @@ async function handle(
                   parsed as { prompt_cache_key?: unknown },
               )
             : undefined;
-        const conversation = protocol === "anthropic"
+        // Anthropic mirrors the openai pck promotion (#268): the omp plugin
+        // stamps prompt_cache_key on every chat-shaped payload — it cannot
+        // tell the anthropic wire apart by shape (both carry max_tokens). The
+        // proxy consumes the field on this wire too (identity + mapping);
+        // prepareAnthropic strips it before the real Anthropic sees it.
+        const anthropicSignal = protocol === "anthropic"
             ? conversationSignalAnthropic(parsed as AnthropicRequestBody, convHeader)
+            : "";
+        const anthropicIdentity = protocol === "anthropic"
+            ? preferPromptCacheKeyIdentity(
+                  convHeader
+                    ? { value: anthropicSignal, source: "header" as const, clientProvided: true }
+                    : { value: anthropicSignal, source: "content-fingerprint" as const, clientProvided: false },
+                  parsed as { prompt_cache_key?: unknown },
+              )
+            : undefined;
+        const conversation = protocol === "anthropic"
+            ? anthropicIdentity?.value ?? anthropicSignal
             : protocol === "openai"
               ? openaiIdentity?.value ?? openaiSignal
               : codexTurn
@@ -921,7 +937,9 @@ async function handle(
             ? (responsesIdentity?.clientProvided ?? false)
             : protocol === "openai"
               ? (openaiIdentity?.clientProvided ?? false)
-              : !!convHeader;
+              : protocol === "anthropic"
+                ? (anthropicIdentity?.clientProvided ?? false)
+                : !!convHeader;
         // Anonymous fallback (#309): clients with no identity signal at all
         // (no headers, no session_id/prompt_cache_key) still replay their full
         // history — resolve them by longest-prefix affinity instead of the
@@ -965,7 +983,7 @@ async function handle(
         //    body.session_id) — never the synthetic one — so a user can tell
         //    at a glance which client owns a session. pi sends nothing, so its
         //    label stays empty (shown as "—" in the UI).
-        const bodyIdentity = responsesIdentity ?? openaiIdentity;
+        const bodyIdentity = responsesIdentity ?? openaiIdentity ?? anthropicIdentity;
         const affinity = affinityToken(bodyIdentity ?? {
             value: clientConv ?? conversation,
             source: clientConv ? "header" : "generated",
@@ -1013,16 +1031,16 @@ async function handle(
             session.metadata.effectiveContextLimit = reqConfig.modelContextLimit;
             recordPluginSession(pluginConversation ?? conversation, session.id);
         }
-        // Responses AND OpenAI-chat clients that send their own session id as
-        // `prompt_cache_key` (omp) get that conversation recorded even WITHOUT
-        // the x-bili-plugin header, so the /acp command — which looks the
-        // session up by the client's session id — can find it. The session id
-        // itself now ALSO derives from prompt_cache_key (the
+        // Responses, OpenAI-chat AND Anthropic-wire clients that send their
+        // own session id as `prompt_cache_key` (omp) get that conversation
+        // recorded even WITHOUT the x-bili-plugin header, so the /acp command
+        // — which looks the session up by the client's session id — can find
+        // it. The session id itself now ALSO derives from prompt_cache_key (the
         // preferPromptCacheKeyIdentity calls above, which only kick in when the
         // kernel would have fallen to a per-request content fingerprint) — this
         // lookup binding remains for clients that send a real conversation
         // header or session_id.
-        if (protocol === "responses" || protocol === "openai") {
+        if (protocol === "responses" || protocol === "openai" || protocol === "anthropic") {
             const pck = (parsed as { prompt_cache_key?: unknown }).prompt_cache_key;
             if (typeof pck === "string" && pck.trim().length > 0) {
                 recordPluginSession(pck.trim(), session.id);
@@ -1289,6 +1307,10 @@ function prepareAnthropic(
     markDirty(session);
 
     const rebuilt: AnthropicRequestBody = { ...parsed, messages: rebuiltMessages, system: systemOut, tools: toolsOut };
+    // prompt_cache_key is the omp plugin's session id stamped for the proxy's
+    // identity chain (#268), not part of the Anthropic Messages API — strip it
+    // so the real upstream never sees a field it doesn't know.
+    delete (rebuilt as Record<string, unknown>).prompt_cache_key;
     return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts } as Prepared;
 }
 
