@@ -496,9 +496,11 @@ MITM 只对一份**白名单**中的模型域名生效（`open.bigmodel.cn`、`a
 
 2. 在客户端的 **设置 → 网络 / 代理** 里设：
    - **HTTP 代理**： `http://127.0.0.1:8787`
-   - **代理 CA 证书路径**： `~/.local/share/billion-context/ca/root-ca.pem`
+   - **代理 CA 证书路径**： 本机 bili 实际生成的 CA 文件 —— Linux/macOS 为 `~/.local/share/billion-context/ca/root-ca.pem`，Windows 为 `%USERPROFILE%\.local\share\billion-context\ca\root-ca.pem`。Web UI「接入」页的 ZCode 卡片直接显示本机实际路径并提供复制按钮，照抄即可。
    - （可选）**No-proxy 列表**： `localhost,127.0.0.1`
    - （ZCode 具体位置：**Settings → Network**。Claude Code 则设 `HTTPS_PROXY` 环境变量、`NODE_EXTRA_CA_CERTS` 指向 CA 路径。）
+
+   > **Windows 注意：** ZCode 在 Windows 上**不会展开 `~`**，填 `~/...` 形式的路径会找不到文件（与当前工作目录无关，每个目录都识别不了）。必须填完整绝对路径，例如 `C:\Users\<用户名>\.local\share\billion-context\ca\root-ca.pem`（#342）。
 
 3. 重启客户端。它的模型流量从此流经 billion-context 并注入压缩。发一条消息，在代理日志（`~/.local/state/billion-context/bili.log`）里找 `mitm <host>:443 tunnel established`。
 

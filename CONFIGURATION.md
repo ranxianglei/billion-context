@@ -496,9 +496,11 @@ One-time setup (trust the root CA in the client):
 
 2. In the client's **Settings → Network / Proxy** set:
    - **HTTP Proxy**: `http://127.0.0.1:8787`
-   - **Proxy CA certificate path**: `~/.local/share/billion-context/ca/root-ca.pem`
+   - **Proxy CA certificate path**: the CA file bili actually generated on this machine — `~/.local/share/billion-context/ca/root-ca.pem` on Linux/macOS, `%USERPROFILE%\.local\share\billion-context\ca\root-ca.pem` on Windows. The ZCode card on the web UI's routing page shows the real path on this machine with a copy button — just paste it.
    - (optional) **No-proxy list**: `localhost,127.0.0.1`
    - (For ZCode specifically: **Settings → Network**. For Claude Code, set the `HTTPS_PROXY` env var and `NODE_EXTRA_CA_CERTS` to the CA path.)
+
+   > **Windows note:** ZCode on Windows does **not** expand `~` — a `~/...` path is not found (independent of the current working directory). Enter the full absolute path, e.g. `C:\Users\<user>\.local\share\billion-context\ca\root-ca.pem` (#342).
 
 3. Restart the client. Its model traffic now flows through billion-context with compression injected. Send a message and check the proxy log (`~/.local/state/billion-context/bili.log`) for `mitm <host>:443 tunnel established`.
 
