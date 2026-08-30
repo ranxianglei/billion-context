@@ -812,6 +812,14 @@ test("omp before_provider_request stamps prompt_cache_key only for chat-completi
         assert.deepEqual(out.messages, payload.messages, "rest of the payload preserved");
         assert.equal(payload.prompt_cache_key, undefined, "original payload not mutated");
     }
+    // real-world chat-completions payload carries max_tokens (omp's openai-compat
+    // providers use maxTokensField:"max_tokens") → stamped (#268)
+    {
+        const pi = mk();
+        const out = handler(pi, { model: "glm-4", messages: [{ role: "user", content: "hi" }], max_tokens: 4096, temperature: 0.7 }) as Record<string, unknown>;
+        assert.equal(out.prompt_cache_key, sid, "chat-completions payload WITH max_tokens stamped");
+        assert.equal(out.max_tokens, 4096, "max_tokens preserved");
+    }
     // native prompt_cache_key already present → not overridden
     {
         const pi = mk();
@@ -824,11 +832,14 @@ test("omp before_provider_request stamps prompt_cache_key only for chat-completi
         const out = handler(pi, { input: [{ role: "user", content: "hi" }] });
         assert.equal(out, undefined, "responses payload (input) untouched");
     }
-    // anthropic wire (max_tokens) → untouched
+    // anthropic wire shape (messages + max_tokens) → stamped too: the plugin
+    // cannot tell the wires apart by shape, and the proxy records the mapping
+    // from the body pck on the anthropic path and strips the field before
+    // forwarding to the real Anthropic (#268)
     {
         const pi = mk();
-        const out = handler(pi, { messages: [{ role: "user", content: "hi" }], max_tokens: 1024, system: "s" });
-        assert.equal(out, undefined, "anthropic wire (max_tokens) untouched");
+        const out = handler(pi, { messages: [{ role: "user", content: "hi" }], max_tokens: 1024, system: "s" }) as Record<string, unknown>;
+        assert.equal(out.prompt_cache_key, sid, "anthropic wire shape stamped (proxy strips before forward)");
     }
     // no session id → untouched
     {
