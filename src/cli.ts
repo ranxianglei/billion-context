@@ -98,10 +98,10 @@ Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili h
     bili dsh --profile web "task"         # launch deepseek-harness through the proxy (/bili/ rewrite of ~/.dsh/settings.yaml)
     bili test pi                          # quick end-to-end check of the pi path
     bili --mitm-domain api.foo.com pi     # add a domain to the MITM whitelist (flags precede the client)
-    bili -F http://127.0.0.1:7897 codex   # route bili's upstream through a proxy (gost-style -F/--forward)
+    bili -F http://127.0.0.1:7897 codex   # route bili's upstream through a proxy (gost-style -F)
 
 Options (override config file / env):
-  -F <url>                         upstream proxy to forward through (gost-style --forward;
+  -F <url>                         upstream proxy to forward through (gost-style;
                                    http://host:port; must precede the client name)
   --port <N>                       listen port (default 8787)
   --host <ADDR>                    listen host (default 127.0.0.1)
