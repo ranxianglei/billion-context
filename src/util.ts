@@ -175,6 +175,40 @@ export function reserveOutputHeadroom(window: number, maxOutput: number): number
 }
 
 /**
+ * Move mid-conversation system/developer messages to the leading system-prefix
+ * position, preserving relative order. acp-kernel renders compressed summaries
+ * as role:"system" anchored at the earliest message their block covered; when
+ * that anchor sits after an uncompressed message (multi-segment compress with
+ * an uncovered user message between segments), the OpenAI wire carries a
+ * system message mid-conversation, which strict OpenAI-compatible backends
+ * (sglang: "System message must be at the beginning") reject with 400 (#355).
+ * A summary is a stand-in for the folded history, so moving it to the head
+ * preserves semantics. Messages stay SEPARATE (not merged into the head) so
+ * the head system message — the prefix-cache anchor — keeps its bytes stable
+ * across compress turns. No-op (same array) when there is nothing to hoist.
+ */
+export function hoistMidSystemMessages<T extends { role: string }>(messages: T[]): T[] {
+    let lead = 0;
+    while (lead < messages.length && (messages[lead].role === "system" || messages[lead].role === "developer")) lead++;
+    if (lead === messages.length) return messages;
+    let midCount = 0;
+    for (let i = lead; i < messages.length; i++) {
+        const r = messages[i].role;
+        if (r === "system" || r === "developer") midCount++;
+    }
+    if (midCount === 0) return messages;
+    const head = messages.slice(0, lead);
+    const mid: T[] = [];
+    const rest: T[] = [];
+    for (let i = lead; i < messages.length; i++) {
+        const r = messages[i].role;
+        if (r === "system" || r === "developer") mid.push(messages[i]);
+        else rest.push(messages[i]);
+    }
+    return [...head, ...mid, ...rest];
+}
+
+/**
  * Whether the OUTPUT budget should be reserved from the context window at all.
  * Anthropic's Messages API enforces the input limit INDEPENDENTLY of
  * max_tokens (the output budget is separate — input up to the window works
