@@ -321,3 +321,42 @@ test("e2e anthropic: compress tool_use round-trip — 2nd upstream request carri
         await h.close();
     }
 });
+
+test("e2e anthropic: auto-mode classifier (stop_sequences </severity>/</block>) bypasses compress injection (#353)", async () => {
+    const h = await startHarness([textScript()]);
+    try {
+        const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1/messages`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "e2e-classifier" },
+            body: JSON.stringify({
+                model: "claude-test",
+                max_tokens: 64,
+                stream: true,
+                system: "You are a safety classifier. Respond with <severity>N</severity>.",
+                messages: [{ role: "user", content: "Is this command safe? rm -rf /" }],
+                stop_sequences: ["</severity>"],
+            }),
+        });
+        assert.equal(resp.status, 200);
+        const raw = await resp.text();
+
+        const upstreamReq = JSON.parse(h.captured[0]!.body) as {
+            tools?: Array<{ name: string }>;
+            system?: string | Array<{ type: string; text?: string }>;
+            stop_sequences?: string[];
+        };
+        assert.deepEqual(upstreamReq.stop_sequences, ["</severity>"], "classifier stop_sequences must reach the upstream verbatim");
+        const toolNames = upstreamReq.tools?.map((t) => t.name) ?? [];
+        for (const banned of ["compress", "decompress", "search_context", "acp_status"]) {
+            assert.ok(!toolNames.includes(banned), `classifier request must not carry the ${banned} tool: ${JSON.stringify(toolNames)}`);
+        }
+        const sysText = typeof upstreamReq.system === "string" ? upstreamReq.system : (upstreamReq.system ?? []).map((b) => b.text ?? "").join("\n");
+        assert.ok(!/compress/i.test(sysText), `classifier system must not gain the compress prompt: ${JSON.stringify(sysText)}`);
+        assert.match(sysText, /safety classifier/);
+
+        const events = parseAnthropicSse(raw);
+        assert.equal(events.filter((e) => e.event === "message_stop").length, 1, "classifier verdict stream must reach the client unrewritten");
+    } finally {
+        await h.close();
+    }
+});
