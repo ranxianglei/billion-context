@@ -1225,6 +1225,11 @@ function prepareAnthropic(
     ++session.stats.requests;
     const injectTools = opts.compress.injectTool && !pluginMode;
 
+    if (isAutoModeClassifier(parsed)) {
+        log("info", `[${sessionId}] auto-mode classifier passthrough (skipping compress injection)`);
+        return { body: JSON.stringify(parsed), session, processedMessages: [], originalMessages: [], anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: false, pluginMode, nudge: undefined, prompts } as Prepared;
+    }
+
     let processedMessages: CoreMessage[] = [];
     let originalMessages: CoreMessage[] = [];
     let nudge: NudgeDecision | undefined;
@@ -1791,6 +1796,20 @@ export function resolvePromptCacheKey(
     if (explicit?.trim()) return explicit;
     if (!identity.clientProvided || !shouldInjectPromptCacheKey(routing, upstream)) return undefined;
     return identity.value;
+}
+
+// Claude Code's auto-mode safety classifier one-shots expect a strict XML
+// verdict — the default `xml_2stage` mode stops the response at `</severity>`
+// or `</block>`. These are not compressible conversations: the compress
+// system-prompt + ACP tools (or the kernel round-trip) derailed the small model
+// from that verdict, so the classifier reported "could not evaluate" (#353).
+// The magic stop sequences are the only in-body signal; forward them untouched.
+const AUTO_MODE_CLASSIFIER_STOPS = new Set(["</severity>", "</block>"]);
+
+function isAutoModeClassifier(parsed: AnthropicRequestBody): boolean {
+    const stops = parsed.stop_sequences;
+    if (!Array.isArray(stops)) return false;
+    return stops.some((s) => typeof s === "string" && AUTO_MODE_CLASSIFIER_STOPS.has(s));
 }
 
 function injectSystem(
