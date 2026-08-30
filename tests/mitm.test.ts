@@ -7,7 +7,7 @@ import tls from "node:tls";
 import net from "node:net";
 import { once } from "node:events";
 import http from "node:http";
-import { isMitmHost, readMitmUpstream, MITM_UPSTREAM_KEY, setupMitm } from "../src/mitm.js";
+import { isMitmHost, readMitmUpstream, MITM_UPSTREAM_KEY, setupMitm, noteMitmTlsError, _resetCertRejectionWarningForTest } from "../src/mitm.js";
 import { ensureRootCA, rootCaPath, getSecureContext, _resetForTest } from "../src/ca.js";
 import { _resetDiscoveryCacheForTest } from "../src/discover.js";
 
@@ -288,4 +288,76 @@ await test("setupMitm e2e: remote CONNECT policy (#77, #240)", async (t) => {
             openServer.closeAllConnections?.();
         }
     });
+});
+
+await test("setupMitm e2e: blind TCP tunnel to a non-whitelisted host passes bytes both ways (#346)", async () => {
+    await withTmpCa(async () => {
+        const upstream = net.createServer((sock) => {
+            sock.on("data", (c) => sock.write("UPSTREAM-SAW:" + c.toString("utf8")));
+        });
+        upstream.listen(0, "127.0.0.1");
+        await once(upstream, "listening");
+        const upPort = (upstream.address() as { port: number }).port;
+
+        const logs: string[] = [];
+        const server = http.createServer((_req, res) => { res.writeHead(500); res.end(); });
+        setupMitm(server, [], (msg) => { logs.push(msg); });
+        server.listen(0, "127.0.0.1");
+        await once(server, "listening");
+        const port = (server.address() as { port: number }).port;
+        try {
+            // 127.0.0.1 is an IP, not a domain → isMitmHost is false → blind tunnel.
+            const { statusLine, socket } = await rawConnect(port, "127.0.0.1", `127.0.0.1:${upPort}`);
+            assert.match(statusLine, /^HTTP\/1\.1 200/, "blind tunnel must answer CONNECT with 200");
+            const reply = Promise.withResolvers<string>();
+            let out = "";
+            let settled = false;
+            socket.on("data", (c: Buffer) => {
+                out += c.toString("utf8");
+                if (!settled && out.includes("UPSTREAM-SAW:")) { settled = true; reply.resolve(out); }
+            });
+            socket.once("close", () => { if (!settled) reply.reject(new Error("tunnel closed before reply")); });
+            socket.write("hello-zcode");
+            const body = await reply.promise;
+            assert.match(body, /UPSTREAM-SAW:hello-zcode/, "bytes must flow client→tunnel→upstream and back");
+            assert.ok(
+                logs.some((l) => /tunnel .* established \(blind TCP, not decrypted\)/.test(l)),
+                "established blind tunnel must be logged for diagnostics",
+            );
+            socket.destroy();
+        } finally {
+            server.close();
+            server.closeAllConnections?.();
+            upstream.close();
+            upstream.closeAllConnections?.();
+        }
+    });
+});
+
+// A real client (e.g. ZCode, #346) that does not trust the root CA sends a
+// TLS "certificate unknown" alert; the handler must turn that into exactly ONE
+// actionable "install the root CA" warning, deduplicated across the hundreds
+// of identical failures a single misconfigured client produces.
+test("noteMitmTlsError: cert-rejection alert → one actionable CA warning, deduplicated (#346)", () => {
+    _resetCertRejectionWarningForTest();
+    const logs: string[] = [];
+    const log = (msg: string) => { logs.push(msg); };
+    const realAlert = "705F0000:error:0A000416:SSL routines:ssl3_read_bytes:ssl/tls alert certificate unknown:openssl\\ssl\\record\\rec_layer_s3.c:918:SSL alert number 46";
+    noteMitmTlsError("api.anthropic.com", 443, realAlert, log);
+    noteMitmTlsError("api.anthropic.com", 443, "ssl/tls alert certificate unknown", log);
+    noteMitmTlsError("api.anthropic.com", 443, "ssl/tls alert unknown ca", log);
+    const warnings = logs.filter((l) => l.includes("REJECTED the MITM certificate"));
+    assert.equal(warnings.length, 1, `expected exactly one CA warning, got ${warnings.length}: ${JSON.stringify(logs)}`);
+    assert.match(warnings[0], /root-ca\.pem/, "warning must point at the root CA file path");
+    assert.equal(logs.filter((l) => l.includes("TLS error")).length, 3, "the raw TLS error line is always logged");
+});
+
+test("noteMitmTlsError: non-cert TLS errors (reset/close) do NOT trigger the CA warning", () => {
+    _resetCertRejectionWarningForTest();
+    const logs: string[] = [];
+    const log = (msg: string) => { logs.push(msg); };
+    noteMitmTlsError("api.anthropic.com", 443, "socket hang up", log);
+    noteMitmTlsError("api.anthropic.com", 443, "read ECONNRESET", log);
+    assert.equal(logs.filter((l) => l.includes("REJECTED the MITM certificate")).length, 0);
+    assert.equal(logs.length, 2, "raw TLS error lines still logged");
 });
