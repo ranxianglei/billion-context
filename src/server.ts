@@ -64,7 +64,7 @@ import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { consumePluginRegisterFor, flushConversations, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, loadConversations, pipePluginJson, pipePluginResponsesWithStrip, pipeThroughWithUsage, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
-import { isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, shouldReserveOutputHeadroom, usageTotals } from "./util.js";
+import { hoistMidSystemMessages, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, shouldReserveOutputHeadroom, usageTotals } from "./util.js";
 
 import { decodeRequestBody } from "./content-encoding.js";
 
@@ -1363,7 +1363,7 @@ function prepareOpenai(
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model));
         processedMessages = stripKernelSummaries(turn.messages, turn.state);
         reapOrphanBlocks(session, msgs, deactivateBlock);
-        rebuiltMessages = coreToOpenai(processedMessages as BiliMessage[]);
+        rebuiltMessages = hoistMidSystemMessages(coreToOpenai(processedMessages as BiliMessage[]));
 
         // ONLY the static compress prompt goes into the system message — the
         // system prompt is the prefix-cache anchor and must be byte-stable

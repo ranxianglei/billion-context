@@ -3,6 +3,7 @@ import { coreToOpenai, injectOpenaiSystem } from "acp-kernel/wire";
 import { buildVisibilityMarker } from "../compress-loop.js";
 import { createTagEchoFilter } from "./tag-echo-filter.js";
 import { log as loggerLog } from "../logger.js";
+import { hoistMidSystemMessages } from "../util.js";
 
 import type {
     CompressLoopAdapter,
@@ -171,7 +172,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
             // runtime state), so coreMessages no longer carries it — re-inject
             // the CLIENT's original system ahead of the compress prompt,
             // mirroring the anthropic adapter's anthropicSystem path.
-            const messages = coreToOpenai(coreMessages);
+            const messages = hoistMidSystemMessages(coreToOpenai(coreMessages));
             const withSys = injectOpenaiSystem(messages, [clientSystem, systemPrompt].filter((p): p is string => typeof p === "string" && p.length > 0));
             return { ...body, messages: withSys };
         },
