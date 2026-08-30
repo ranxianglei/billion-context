@@ -59,6 +59,7 @@ import { containsToolCallXmlFragment } from "./loop/tag-echo-filter.js";
 import { isFakeCompletion, injectFakeCompletionHint, maxFakeCompletionRetries, fakeBufCap } from "./fake-completion.js";
 import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeResponsesMessageItems } from "./loop/adapter-responses.js";
 import { codexCompactMode, isCodexClient, hasCompactionTrigger, stripBiliCompactionItems, replaceBiliCompactionItems, codexCompactGate, codexCompactGatePre, buildTriggerForgeBody, mergeForgedSummaries } from "./codex-compact.js";
+import { stripAcpPanelMessages, stripAcpPanelResponsesInput } from "./acp-panel.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { observeResponsesTerminalState } from "./stream-terminal.js";
@@ -1566,6 +1567,13 @@ function prepareAnthropic(
     let systemOut = parsed.system;
     let toolsOut = parsed.tools;
 
+    // The classifier passthrough above and prepareResponsesCompact return before
+    // this strip; no client emits an ACP panel on those paths, so that's safe.
+    const strippedPanels = stripAcpPanelMessages(parsed.messages);
+    if (strippedPanels > 0) {
+        log("info", `[${sessionId}] stripped ${strippedPanels} ACP panel message(s) before projection (UI-only, issue #359)`);
+    }
+
     try {
         const { msgs, cacheControls } = anthropicToCore(parsed);
         originalMessages = msgs;
@@ -1737,6 +1745,11 @@ function prepareOpenai(
     const shouldInject = opts.compress.injectTool && !isTitleGen;
     const injectTools = shouldInject && !pluginMode;
 
+    const strippedPanels = stripAcpPanelMessages(parsed.messages);
+    if (strippedPanels > 0) {
+        log("info", `[${sessionId}] stripped ${strippedPanels} ACP panel message(s) before projection (UI-only, issue #359)`);
+    }
+
     try {
         // Kernel 0.0.37 hoists the contiguous leading system/developer prefix
         // OUT of the fold space: system content is host runtime state and
@@ -1888,6 +1901,11 @@ function prepareResponses(
     const droppedEmpty = dropWhitespaceResponsesMessages(parsed.input);
     if (droppedEmpty > 0) {
         log("info", `[${sessionId}] dropped ${droppedEmpty} whitespace-only message item(s) before projection (flattened-turn artifact)`);
+    }
+
+    const strippedPanels = stripAcpPanelResponsesInput(parsed.input);
+    if (strippedPanels > 0) {
+        log("info", `[${sessionId}] stripped ${strippedPanels} ACP panel message(s) before projection (UI-only, issue #359)`);
     }
 
     const shouldInject = opts.compress.injectTool;

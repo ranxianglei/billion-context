@@ -555,6 +555,104 @@ test("/acp shows armed info when the proxy is live but the session is unknown", 
     }
 });
 
+test("/acp emits a persistent custom message via pi.sendMessage when available (issue #359)", async () => {
+    const server = http.createServer((req, res) => {
+        if (req.url?.startsWith("/__bili/plugin/status")) {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true, panel: "PANEL-BODY", contextTokens: 12345 }));
+            return;
+        }
+        res.writeHead(404);
+        res.end("{}");
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    try {
+        const sent: Array<{ customType: string; content: string; display: boolean }> = [];
+        const notes: string[] = [];
+        const pi = { ...makeFakePi(), sendMessage: (m: { customType: string; content: string; display: boolean }) => sent.push(m) };
+        biliPlugin(pi as never);
+        const cmd = pi.commands.get("acp")!;
+        const ctx = {
+            sessionManager: { getSessionId: () => "sess-send" },
+            model: { baseUrl: `${origin}/bili/https://api.example.com/v1` },
+            ui: { notify: (msg: string) => notes.push(msg) },
+        };
+        await cmd.handler("", ctx);
+        assert.equal(sent.length, 1, "one custom message sent");
+        assert.equal(notes.length, 0, "notify must not fire when sendMessage is available");
+        assert.equal(sent[0]!.customType, "bili-acp-status");
+        assert.equal(sent[0]!.display, true);
+        assert.equal(sent[0]!.content, "PANEL-BODY");
+    } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+});
+
+test("/acp sends renderAcpStatus fallback content via sendMessage when no panel string", async () => {
+    const server = http.createServer((req, res) => {
+        if (req.url?.startsWith("/__bili/plugin/status")) {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true, contextLimit: 200000, contextTokens: 12345, inputTokens: 10000, outputTokens: 1234, cachedTokens: 8000, requests: 7, blocks: [{ id: "b1", tier: 1, active: true }] }));
+            return;
+        }
+        res.writeHead(404);
+        res.end("{}");
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    try {
+        const sent: Array<{ customType: string; content: string; display: boolean }> = [];
+        const pi = { ...makeFakePi(), sendMessage: (m: { customType: string; content: string; display: boolean }) => sent.push(m) };
+        biliPlugin(pi as never);
+        const cmd = pi.commands.get("acp")!;
+        const ctx = {
+            sessionManager: { getSessionId: () => "sess-send2" },
+            model: { baseUrl: `${origin}/bili/https://api.example.com/v1` },
+            ui: { notify: () => { throw new Error("notify must not fire"); } },
+        };
+        await cmd.handler("", ctx);
+        assert.equal(sent.length, 1);
+        assert.equal(sent[0]!.customType, "bili-acp-status");
+        assert.match(sent[0]!.content, /📊 ACP status/);
+    } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+});
+
+test("/acp falls back to notify when pi.sendMessage throws", async () => {
+    const server = http.createServer((req, res) => {
+        if (req.url?.startsWith("/__bili/plugin/status")) {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true, panel: "PANEL-BODY", contextTokens: 1 }));
+            return;
+        }
+        res.writeHead(404);
+        res.end("{}");
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    try {
+        const notes: string[] = [];
+        const pi = { ...makeFakePi(), sendMessage: () => { throw new Error("host sendMessage failed"); } };
+        biliPlugin(pi as never);
+        const cmd = pi.commands.get("acp")!;
+        const ctx = {
+            sessionManager: { getSessionId: () => "sess-send3" },
+            model: { baseUrl: `${origin}/bili/https://api.example.com/v1` },
+            ui: { notify: (msg: string) => notes.push(msg) },
+        };
+        await cmd.handler("", ctx);
+        assert.equal(notes.length, 1, "notify fallback fires");
+        assert.equal(notes[0], "PANEL-BODY");
+    } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+});
+
 test("omp entry reports x-bili-plugin: omp without env vars", async () => {
     const proxy = await startFakeProxy();
     try {

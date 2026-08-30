@@ -48,6 +48,10 @@ type ExtensionAPI = {
     // session model, so the extension must re-pin it via setModel (see the
     // session_start handler below). Optional because pi hosts lack it.
     setModel?: (model: Record<string, unknown> & { baseUrl?: string }) => Promise<boolean | void> | boolean | void;
+    // Persistent transcript output (rendered by TUI and web hosts like
+    // pi-web); notify() is a transient toast — only the fallback for hosts
+    // without sendMessage (issue #359).
+    sendMessage?: (message: { customType: string; content: string; display: boolean }) => void;
 };
 
 function agentName(override: string | undefined): string {
@@ -363,7 +367,21 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                         return;
                     }
                     const panel = typeof status.panel === "string" ? status.panel : undefined;
-                    notify(panel ?? renderAcpStatus(status), "info");
+                    const text = panel ?? renderAcpStatus(status);
+                    // Persistent transcript output (TUI + web hosts like pi-web).
+                    // The proxy strips this message from the model context by
+                    // content signature (src/acp-panel.ts), so it never reaches
+                    // the LLM; notify() is the fallback for hosts without
+                    // sendMessage (older pi).
+                    if (typeof pi.sendMessage === "function") {
+                        try {
+                            pi.sendMessage({ customType: "bili-acp-status", content: text, display: true });
+                            return;
+                        } catch (err) {
+                            console.error(`bili-plugin(${agent}): sendMessage failed (${err instanceof Error ? err.message : String(err)}) — falling back to notify`);
+                        }
+                    }
+                    notify(text, "info");
                 },
             });
         }
