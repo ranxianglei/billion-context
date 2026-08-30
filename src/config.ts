@@ -292,8 +292,16 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
     const webProxy = nonEmpty(fileConfig.upstreamProxy);
     const configProxy = nonEmpty(fileConfig.proxy);
     const rawProxyMode = env.BILI_UPSTREAM_PROXY_MODE ?? fileConfig.upstreamProxyMode ?? (webProxy ? "manual" : undefined);
-    const proxyMode = parseUpstreamProxyMode(rawProxyMode);
-    const explicitDirect = proxyMode === "direct" && rawProxyMode === "direct";
+    // Unset mode means "direct" (matches the web UI's 直连（默认） and ZCode's
+    // default), NOT auto-detect. To follow the system/env proxy, set mode "auto".
+    const effectiveMode = rawProxyMode ?? "direct";
+    const proxyMode = parseUpstreamProxyMode(effectiveMode);
+    // explicitDirect short-circuits an EMPTY global proxy to "direct" (instead of
+    // env/system auto-detect). It is true for the unset-defaults-to-direct case and
+    // explicit "direct" mode, but false when an explicit proxy (BILI_UPSTREAM_PROXY)
+    // is set so that proxy still wins (globalProxy is non-empty, so the short-circuit
+    // is skipped regardless).
+    const explicitDirect = proxyMode === "direct" && !biliProxy;
     const proxy = biliProxy ?? (proxyMode === "direct" ? "" : proxyMode === "manual" ? webProxy ?? configProxy : configProxy);
     const proxySource: ProxyOptions["proxySource"] = biliProxy
         ? "bili-env"

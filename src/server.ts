@@ -10,7 +10,7 @@ import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, lookupContextLimit, resolveConfiguredC
 import { contextFromRegistry, loadRegistry, peekRegistryContext } from "./registry.js";
 import { codexAlignedWindow } from "./codex-models.js";
 import { fetchWithTimeout, MAX_REQUEST_BYTES } from "./fetch-util.js";
-import { formatUpstreamError, getUpstreamConnectionStatus, recordUpstreamConnection, resolveProxy, resolveProxyDecision, proxyDispatcher } from "./upstream-proxy.js";
+import { formatUpstreamError, getUpstreamConnectionStatus, recordUpstreamConnection, resolveProxy, resolveProxyDecision, proxyDispatcher, type UpstreamProxyDecision } from "./upstream-proxy.js";
 import { maskHeaderForLog, maskHeadersForLog, maskHostPortForLog, maskUrlForLog, maskUrlsInText } from "./log-mask.js";
 // Protocol codecs live in the kernel now (single source of truth shared with
 // the omp/pi adapters): import from "acp-kernel/wire".
@@ -1854,6 +1854,27 @@ type ForwardTarget = {
     proxyUrl: string | undefined;
 };
 
+// Log each unique (host, proxy, source) upstream-proxy decision once so the
+// proxy choice is visible without per-request spam. Catches the "silent proxy"
+// case where an env/system proxy is picked up unexpectedly.
+const loggedUpstreamProxyDecisions = new Set<string>();
+function logUpstreamProxyDecision(opts: ProxyOptions, upstreamUrl: string | undefined, decision: UpstreamProxyDecision): void {
+    if (!upstreamUrl) return;
+    let host = upstreamUrl;
+    try {
+        host = new URL(upstreamUrl).host;
+    } catch {
+        /* keep the raw url as the key */
+    }
+    // Dedup key uses the real host (internal, never logged); the log line masks
+    // non-public hosts (#255) so a private upstream/proxy address never leaks.
+    const key = `${host}|${decision.proxy ?? ""}|${decision.source}`;
+    if (loggedUpstreamProxyDecisions.has(key)) return;
+    loggedUpstreamProxyDecisions.add(key);
+    const via = decision.proxy ? `via ${maskUrlForLog(decision.proxy)}` : "direct";
+    logMsg(opts, "info", `[upstream-proxy] ${maskHostPortForLog(host)} ${via} (source=${decision.source})`);
+}
+
 function buildForwardTarget(
     req: http.IncomingMessage,
     opts: ProxyOptions,
@@ -1900,8 +1921,9 @@ function buildForwardTarget(
     if (affinity && !clientConversationHeader(req.headers)) {
         headers["x-session-id"] = affinity;
     }
-    const proxyUrl = resolveProxy(opts.routes, opts.proxy, route?.rewrittenUrl ?? upstreamUrl, opts.proxyFallback);
-    return { upstreamUrl, headers, proxyUrl };
+    const decision = resolveProxyDecision(opts.routes, opts.proxy, route?.rewrittenUrl ?? upstreamUrl, opts.proxyFallback);
+    logUpstreamProxyDecision(opts, upstreamUrl, decision);
+    return { upstreamUrl, headers, proxyUrl: decision.proxy };
 }
 
 // #247: context exceeds the (new) model's window — usually right after a

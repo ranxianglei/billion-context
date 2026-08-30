@@ -166,6 +166,47 @@ test("loadOptions keeps BILI_UPSTREAM_PROXY above config/environment fallback", 
     });
 });
 
+test("default (unset mode) is direct, not env auto-detect (#346)", () => {
+    const prevConfig = process.env.BILI_CONFIG_FILE;
+    process.env.BILI_CONFIG_FILE = "/nonexistent/bili-test-config.json";
+    try {
+        // No BILI_UPSTREAM_PROXY_MODE and no BILI_UPSTREAM_PROXY, but HTTPS_PROXY is
+        // set in the environment. Before the #346 fix, unset mode auto-detected the
+        // env proxy; now unset means "direct" (matches the web UI default + ZCode).
+        const opts = loadOptions({
+            ACP_PORT: "9101",
+            HTTPS_PROXY: "http://fallback.example:8080",
+        });
+        assert.equal(opts.proxy, "");
+        assert.equal(opts.proxySource, "direct");
+        assert.equal(opts.proxyFallback.explicitDirect, true);
+        const decision = resolveProxyDecision(opts.routes, opts.proxy, "https://api.example.com/v1", opts.proxyFallback);
+        assert.deepEqual(decision, { source: "direct" });
+    } finally {
+        if (prevConfig === undefined) delete process.env.BILI_CONFIG_FILE;
+        else process.env.BILI_CONFIG_FILE = prevConfig;
+    }
+});
+
+test("explicit 'auto' mode still follows the env proxy (#346 opt-in)", () => {
+    const prevConfig = process.env.BILI_CONFIG_FILE;
+    process.env.BILI_CONFIG_FILE = "/nonexistent/bili-test-config.json";
+    try {
+        const opts = loadOptions({
+            ACP_PORT: "9102",
+            BILI_UPSTREAM_PROXY_MODE: "auto",
+            HTTPS_PROXY: "http://fallback.example:8080",
+        });
+        assert.equal(opts.proxySource, "auto");
+        assert.equal(opts.proxyFallback.explicitDirect, false);
+        const decision = resolveProxyDecision(opts.routes, opts.proxy, "https://api.example.com/v1", opts.proxyFallback);
+        assert.deepEqual(decision, { proxy: "http://fallback.example:8080/", source: "HTTPS_PROXY" });
+    } finally {
+        if (prevConfig === undefined) delete process.env.BILI_CONFIG_FILE;
+        else process.env.BILI_CONFIG_FILE = prevConfig;
+    }
+});
+
 test("PR #67 ProxyAgent remains the sole HTTP egress transport", async () => {
     const upstream = http.createServer((_req, res) => {
         res.writeHead(201, { "content-type": "text/plain" });
