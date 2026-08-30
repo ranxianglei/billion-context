@@ -16,10 +16,13 @@ const LONE_CLOSE = /<\/acp(?=[\s>])[^<>]{0,32}>/;
 // A suffix of the buffer that could still grow into a render tag: either an
 // unterminated `\x3cacp …` opening (attrs so far, no `>` yet) or a short
 // ambiguous prefix like `<`, `<a`, `</ac`, …
-const PARTIAL_TAIL = /(\x3cacp\s[^<>]*|<\/?a?c?p?)$/;
+const PARTIAL_TAIL = /(\x3cacp\s[^<>]*|\x3c\/acp(?:\s[^<>]*)?|<\/?a?c?p?)$/;
 // An unterminated render-tag opening at the end of a string: `<acp ` plus
 // attrs, no `>` — a truncated imitation, never prose (triggers use `<acp_`).
 const TRUNC_OPEN = /\x3cacp\s[^<>]*$/;
+// A truncated render-tag CLOSE at the end of a string: `` or `` —
+// a truncated imitation close, never prose. Mirrors TRUNC_OPEN on the close side.
+const TRUNC_CLOSE = /\x3c\/acp(?:\s[^<>]*)?$/;
 const CLOSE_TAG = "\x3c/acp";
 const HOLD_LIMIT = 128;
 // Hold cap for a definite unterminated opening tail — far beyond any real tag
@@ -40,15 +43,27 @@ export function stripAcpTags(text: string): string {
         .replace(new RegExp(PAIRED.source, "g"), "")
         .replace(new RegExp(LONE_OPEN.source, "g"), "")
         .replace(new RegExp(LONE_CLOSE.source, "g"), "")
-        .replace(new RegExp(TRUNC_OPEN.source), "");
+        .replace(new RegExp(TRUNC_OPEN.source), "")
+        .replace(new RegExp(TRUNC_CLOSE.source), "");
 }
 
 // Cheap pre-check on a raw wire string (SSE event or JSON body): does it
 // contain anything that looks like a render tag (literal or JSON-escaped
 // `\u003c` form)? Callers use this to skip re-serializing chunks that need
 // no stripping, preserving byte-identical passthrough.
+const RENDER_TAG_DETECT = /\x3c\/?acp(?=[\s>])|\\u003c\/?acp(?=[\s>\\])/;
 export function containsRenderTagText(s: string): boolean {
-    return /\x3c\/?acp(?=[\s>])/.test(s) || /\\u003c\/?acp(?=[\s>\\])/.test(s);
+    return RENDER_TAG_DETECT.test(s);
+}
+
+// #361: tool-call XML template fragments a model may echo from the context
+// (same source as acp tag echo — the model "writes the tool call as text").
+// Detected + warned for attribution, NOT stripped: a closing tool-XML tag
+// cannot be distinguished from legitimate prose discussing tool-call code,
+// so stripping would corrupt real content (see #295 review).
+const TOOL_CALL_XML = /\x3c\/?(?:antml:)?(invoke|tool_calls|tool_call|parameter|parameters)\b[^<>]*\x3e|\\u003c\/?(?:antml:)?(invoke|tool_calls|tool_call|parameter|parameters)\b|\x3c\/?antml:[a-z_]+/i;
+export function containsToolCallXmlFragment(s: string): boolean {
+    return TOOL_CALL_XML.test(s);
 }
 
 export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEchoFilter {
@@ -102,7 +117,7 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
                     // past HOLD_LIMIT (drop it past TAG_OPEN_CAP); a short
                     // ambiguous prefix stays on the small hold cap so prose
                     // is never delayed or lost.
-                    const definite = /^\x3cacp\s/.test(t[0]);
+                    const definite = /^\x3cacp\s/.test(t[0]) || /^\x3c\/acp/.test(t[0]);
                     const cap = definite ? TAG_OPEN_CAP : HOLD_LIMIT;
                     if (t[0].length <= cap) {
                         held = t[0];
@@ -153,6 +168,11 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
             if (t) {
                 drop(t[0]);
                 return rest.slice(0, t.index);
+            }
+            const tc = new RegExp(TRUNC_CLOSE.source).exec(rest);
+            if (tc) {
+                drop(tc[0]);
+                return rest.slice(0, tc.index);
             }
             return rest;
         },

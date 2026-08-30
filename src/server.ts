@@ -53,6 +53,7 @@ import { log as loggerLog, configureLogger, getLogPath, closeLogger } from "./lo
 import { defaultLogFile, stateDir, proxyOriginFile } from "./paths.js";
 import { compressLoopResponsesJson } from "./compress-loop-responses.js";
 import { runCompressLoop, pickAdapter } from "./loop/index.js";
+import { containsToolCallXmlFragment } from "./loop/tag-echo-filter.js";
 import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeResponsesMessageItems } from "./loop/adapter-responses.js";
 import { codexCompactMode, isCodexClient, hasCompactionTrigger, stripBiliCompactionItems, replaceBiliCompactionItems, codexCompactGate, buildTriggerForgeBody, mergeForgedSummaries } from "./codex-compact.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
@@ -2462,12 +2463,16 @@ async function forward(
                 systemPrompt,
                 clientAbort.signal,
             );
+            let protocolFragmentWarned = false;
             for await (const chunk of loop) {
                 if (res.destroyed || res.writableEnded) break;
                 {
                     const s = chunk.toString("utf8");
                     if (s.includes("\x3cacp ") || s.includes("\x3c/acp")) {
                         log("warn", `[${prepared.session.id}] tag echo: ${prepared.protocol} response stream contains \x3cacp tag`);
+                    } else if (!protocolFragmentWarned && containsToolCallXmlFragment(s)) {
+                        protocolFragmentWarned = true;
+                        log("warn", `[${prepared.session.id}] tag echo: ${prepared.protocol} response stream contains tool-call XML fragment (possible tag echo; not stripped)`);
                     }
                 }
                 res.write(chunk);

@@ -4,7 +4,7 @@ import type { Config, CoreMessage } from "acp-kernel";
 import { createCore, createInitialState } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 import { runCompressLoop, createOpenaiAdapter, createAnthropicAdapter, createResponsesAdapter } from "../src/loop/index.ts";
-import { stripAcpTags, createTagEchoFilter, containsRenderTagText } from "../src/loop/tag-echo-filter.ts";
+import { stripAcpTags, createTagEchoFilter, containsRenderTagText, containsToolCallXmlFragment } from "../src/loop/tag-echo-filter.ts";
 import { rewriteJsonResponse } from "../src/stream.ts";
 import { rewriteOpenaiJsonResponse } from "../src/stream-openai.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
@@ -328,7 +328,13 @@ test("stripAcpTags drops arbitrary truncated open fragments, keeps ambiguous pre
     assert.equal(stripAcpTags(`text ${OPEN}type="text" tokens=`), "text ");
     assert.equal(stripAcpTags(`text ${OPEN}tok`), "text ");
     assert.equal(stripAcpTags(`text ${LT}acp`), `text ${LT}acp`);
-    assert.equal(stripAcpTags(`text ${LT}/acp`), `text ${LT}/acp`);
+    assert.equal(stripAcpTags(`text ${LT}/ac`), `text ${LT}/ac`);
+});
+
+test("stripAcpTags drops truncated close fragments (close side of #361)", () => {
+    assert.equal(stripAcpTags(`text ${LT}/acp`), "text ");
+    assert.equal(stripAcpTags(`text ${LT}/acp x="y"`), "text ");
+    assert.equal(stripAcpTags(`text ${CLOSE}`), "text ");
 });
 
 test("streaming flush drops arbitrary truncated open fragments", () => {
@@ -338,6 +344,17 @@ test("streaming flush drops arbitrary truncated open fragments", () => {
     const g = createTagEchoFilter();
     assert.equal(g.push(`text ${LT}acp`), "text ");
     assert.equal(g.flush(), `${LT}acp`);
+});
+
+test("streaming filter drops truncated close fragments (close side of #361)", () => {
+    const f = createTagEchoFilter();
+    assert.equal(f.push(`text ${LT}/acp`) + f.flush(), "text ");
+    const g = createTagEchoFilter();
+    assert.equal(g.push(`text ${LT}/acp `), "text ");
+    assert.ok(g.pending());
+    assert.equal(g.push(`x="y">`) + g.flush(), "");
+    const h = createTagEchoFilter();
+    assert.equal(h.push(`text ${LT}/acp `) + h.push(`>`) + h.flush(), "text ");
 });
 
 test("streaming flush drops content of a tag left unclosed at end of stream", () => {
@@ -364,4 +381,21 @@ test("prose with a tag-like opening beyond the attr bound survives intact", () =
     assert.equal(stripAcpTags(prose), prose);
     const f = createTagEchoFilter();
     assert.equal(f.push(prose) + f.flush(), prose);
+});
+
+test("containsToolCallXmlFragment detects tool-call XML fragments, not prose", () => {
+    assert.equal(containsToolCallXmlFragment(`done ${LT}/invoke>`), true);
+    assert.equal(containsToolCallXmlFragment(`x ${LT}/tool_calls> y`), true);
+    assert.equal(containsToolCallXmlFragment(`x ${LT}/parameter> y`), true);
+    assert.equal(containsToolCallXmlFragment(`x ${LT}antml:invoke name="t"> y`), true);
+    assert.equal(containsToolCallXmlFragment(`x ${LT}/antml:invoke> y`), true);
+    assert.equal(containsToolCallXmlFragment("escaped \\u003c/invoke\\u003e"), true);
+    assert.equal(containsToolCallXmlFragment(`plain text with ${LT} b and invoke() calls`), false);
+    assert.equal(containsToolCallXmlFragment(`the ${LT}/abcd> tag`), false);
+});
+
+test("tag-echo filter does not strip tool-call XML fragments (warn-only, #361)", () => {
+    const f = createTagEchoFilter();
+    const out = f.push(`done ${LT}/invoke> ${LT}/tool_calls>`) + f.flush();
+    assert.equal(out, `done ${LT}/invoke> ${LT}/tool_calls>`);
 });
