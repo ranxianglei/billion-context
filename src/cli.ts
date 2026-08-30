@@ -86,6 +86,8 @@ Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili h
   auto-whitelisted for MITM so the proxy TLS-terminates exactly the hosts the
   client uses; HTTP / localhost providers go direct. pi/claude trust the CA
   via NODE_EXTRA_CA_CERTS, codex via SSL_CERT_FILE. Proxy killed on client exit.
+  bili flags (-F, --mitm-domain, --port, ...) must precede the client name;
+  everything after the client name is passed through to the client.
     bili pi                               # launch pi through the proxy
     bili pi -- print "hi"                 # args after the client are passed through
     bili pi-test                          # pi through the proxy with extensions off (proxy owns compression)
@@ -95,9 +97,12 @@ Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili h
     bili hermes                           # launch hermes-agent through the proxy (/bili/ rewrite of ~/.hermes/config.yaml)
     bili dsh --profile web "task"         # launch deepseek-harness through the proxy (/bili/ rewrite of ~/.dsh/settings.yaml)
     bili test pi                          # quick end-to-end check of the pi path
-    bili pi --mitm-domain api.foo.com     # add a domain to the MITM whitelist
+    bili --mitm-domain api.foo.com pi     # add a domain to the MITM whitelist (flags precede the client)
+    bili -F http://127.0.0.1:7897 codex   # route bili's upstream through a proxy (gost-style -F/--forward)
 
 Options (override config file / env):
+  -F <url>                         upstream proxy to forward through (gost-style --forward;
+                                   http://host:port; must precede the client name)
   --port <N>                       listen port (default 8787)
   --host <ADDR>                    listen host (default 127.0.0.1)
   --mitm-domain <domain>           extra MITM domain (repeatable; launcher only)
@@ -195,6 +200,7 @@ export function parseArgs(argv: string[]): Parsed {
                 exportOutput = val;
                 break;
             }
+            case "-F":
             case "--port":
             case "--host":
             case "--config":
@@ -211,6 +217,7 @@ export function parseArgs(argv: string[]): Parsed {
                 else if (a === "--config") overrides.BILI_CONFIG_FILE = val;
                 else if (a === "--origin") overrides.BILI_MCP_PROXY = val;
                 else if (a === "--bin") process.env.BILI_CLIENT_BIN = val;
+                else if (a === "-F") overrides.BILI_UPSTREAM_PROXY = val;
                 else overrides.BILI_PLUGIN_AGENT = val;
                 break;
             }
