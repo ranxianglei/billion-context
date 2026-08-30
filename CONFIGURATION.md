@@ -146,7 +146,9 @@ A shallow key (`https://open.bigmodel.cn`) matches every path on that host. A de
 - **Type:** `Record<string, { context?: number; output?: number; compress?: CompressSettings }>`
 - **Default:** *(none)*
 - **Status:** ACTIVE
-- **Description:** Maps a model name to its context-window declaration. The LLM `/models` endpoint does **not** return context windows (verified across OpenAI, Anthropic, zhipu, comfly), so the proxy cannot discover them at runtime — you must declare them here. `context` is the model's context window in tokens; `output` is the max output size. When a model is not declared, the proxy falls back to its built-in context table or the models.dev registry. Each model entry may also carry a per-model `compress` block (see [Compression Tuning](#compression-tuning)).
+- **Description:** Maps a model name to its context-window declaration. The LLM `/models` endpoint does **not** return context windows (verified across OpenAI, Anthropic, zhipu, comfly), so the proxy cannot discover them at runtime. `context` is the model's context window in tokens; `output` is the max output size.
+
+  **Resolution order (first match wins):** (1) per-request sources — the client's `anthropic-beta` larger-context negotiation, a cooperative plugin's report, and the launcher's per-model windows; (2) the **warm** models.dev registry cache, when the model is listed (relay/private hosts match the bare model name against the registry's provider-prefixed entries); (3) this per-model `context` declaration; (4) the built-in context table. So when the models.dev registry already lists the model, the registry value **outranks this declaration** — this matters for relay/private deployments, where the registry's standard window can differ from the window the relay actually serves. To pin the effective window reliably, set `compress.modelContextLimit` instead (highest-priority source, always wins). Each model entry may also carry a per-model `compress` block (see [Compression Tuning](#compression-tuning)).
 
 ### `proxy`
 
