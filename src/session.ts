@@ -287,6 +287,82 @@ export function reconcileNativeCompactionBoundary(session: Session): boolean {
     return true;
 }
 
+/** Mark a client-side native compaction (omp /compact on the anthropic wire).
+ *  The sid does NOT rotate on in-session compaction, so the per-sid registry
+ *  reuses the same key with stale state. Consumed by the NEXT processTurn via
+ *  applyCompactionArchive (#395). Distinct from nativeCompactionBoundary
+ *  (Responses/codex, which rebases by resetting state). */
+export function markCompactionBoundary(session: Session): void {
+    session.metadata.compactionBoundary = {
+        at: Date.now(),
+        pending: true,
+    };
+    markDirty(session);
+}
+
+type PreCompactionArchive = Record<string, { at: number; reason: string }>;
+
+function readPreCompactionArchive(session: Session): PreCompactionArchive {
+    const raw = session.metadata.preCompactionArchive;
+    if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+        return raw as PreCompactionArchive;
+    }
+    return {};
+}
+
+export function preCompactionArchiveOf(session: Session): PreCompactionArchive {
+    return readPreCompactionArchive(session);
+}
+
+// Must run AFTER the processTurn that followed markCompactionBoundary (so
+// syncBlocks has deactivated the blocks whose raw ids left the shortened
+// history). Blocks active in `activeBefore` but inactive now are archived;
+// byRaw/byRef are pruned to liveRawIds (stops the #390 additive leak).
+// nextIndex is left alone so a freed ref slot is never re-allocated onto a
+// retained tail's live tag.
+export function applyCompactionArchive(
+    session: Session,
+    activeBefore: Set<string>,
+    liveRawIds: Set<string>,
+    log: (level: string, msg: string) => void,
+): void {
+    const boundary = session.metadata.compactionBoundary;
+    if (!boundary || typeof boundary !== "object" || !(boundary as Record<string, unknown>).pending) {
+        return;
+    }
+    const activeAfter = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
+    const deactivated = [...activeBefore].filter((id) => !activeAfter.has(id));
+    if (deactivated.length > 0) {
+        const archive = readPreCompactionArchive(session);
+        const at = Date.now();
+        for (const id of deactivated) {
+            archive[id] = { at, reason: "content replaced by client native compaction summary" };
+        }
+        session.metadata.preCompactionArchive = archive;
+    }
+
+    const { byRaw, byRef } = session.state.messageRefs;
+    const prunedByRaw: Record<string, string> = {};
+    for (const [rawId, ref] of Object.entries(byRaw)) {
+        if (liveRawIds.has(rawId)) prunedByRaw[rawId] = ref;
+    }
+    const prunedByRef: Record<string, string> = {};
+    for (const [ref, rawId] of Object.entries(byRef)) {
+        if (liveRawIds.has(rawId)) prunedByRef[ref] = rawId;
+    }
+    session.state.messageRefs.byRaw = prunedByRaw;
+    session.state.messageRefs.byRef = prunedByRef;
+
+    session.metadata.compactionBoundary = {
+        ...(boundary as Record<string, unknown>),
+        pending: false,
+        archivedAt: Date.now(),
+        archivedBlocks: deactivated,
+    };
+    markDirty(session);
+    log("info", `[${session.id}] native compaction boundary: archived ${deactivated.length} pre-compaction block(s)${deactivated.length > 0 ? ` (${deactivated.join(", ")})` : ""}; pruned ref maps to ${prunedByRaw.length} live raw id(s)`);
+}
+
 /** Flush a session to disk and drop it from memory (LRU eviction). Refuses to
  *  evict sessions that are in-flight or whose flush failed (would lose a
  *  never-persisted session permanently). Returns true if a slot was freed. */

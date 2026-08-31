@@ -304,6 +304,22 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             state.sid = undefined;
             void registerTools(pi, ctx, state, agent).catch((err: unknown) => console.error(`bili-plugin(${agent}): ${err instanceof Error ? err.message : String(err)}`));
         });
+        // omp fires session_compact on in-session native compaction (sid does
+        // not rotate), so the proxy reuses stale state — notify it to archive
+        // the now-unreachable blocks (#395). Fire-and-forget: a failed
+        // notification must never break the agent's compaction.
+        pi.on("session_compact", (_event, ctx) => {
+            const proxyBase = proxyBaseForCtx(ctx);
+            if (proxyBase === undefined) return;
+            const sid = sessionIdOf(ctx);
+            if (sid === undefined || sid.length === 0) return;
+            fetch(`${proxyBase}/__bili/plugin/compact`, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ conversationId: sid }),
+                signal: AbortSignal.timeout(5000),
+            }).catch(() => {});
+        });
     };
 }
 

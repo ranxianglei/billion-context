@@ -8,7 +8,7 @@ import {
 import { mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
-import type { Session } from "./session.js";
+import { preCompactionArchiveOf, type Session } from "./session.js";
 
 /** Bounded retention for large-decompress temp files. Each decompress with
  *  body > 10000 writes one file under tmpdir(); the reaper unlinks oldest past
@@ -73,6 +73,10 @@ export function resolveDecompress(
     const blockId = rawBlockId.trim();
     const block = ctx.core.decompress(blockId, ctx.session.state);
     if (!block) return `[Block ${blockId} not found]`;
+    const archived = preCompactionArchiveOf(ctx.session);
+    if (archived[blockId] !== undefined) {
+        return `[decompress FAILED: block ${blockId} is a pre-compaction archive — its content was in the history BEFORE the client's native compaction and is no longer reachable (replaced by the client's compaction summary). decompress is unavailable for archived blocks.]`;
+    }
 
     const full = args.full === true;
     const cached = ctx.session.blockContents.get(blockId);
