@@ -5,6 +5,7 @@ import type { PathLike, SymlinkType } from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import type { ProxyInstanceFile as InstanceFile } from "../src/instance.ts";
 import {
     LAUNCHER_DEFAULT_HOST,
     isLaunchClient,
@@ -516,7 +517,7 @@ function makeFakeChild(pid: number): SpawnChild {
     };
 }
 
-test("ensureProxyRunning: always spawns a fresh proxy, never reuses a listener", async () => {
+test("ensureProxyRunning: spawns a fresh proxy when no live instance is recorded", async () => {
     let spawnCalls = 0;
     const spawnImpl: SpawnFn = () => {
         spawnCalls++;
@@ -525,7 +526,7 @@ test("ensureProxyRunning: always spawns a fresh proxy, never reuses a listener",
     const fetchImpl = async () => ({ ok: true });
     const handle = await ensureProxyRunning(
         { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
-        { fetchImpl, spawnImpl },
+        { fetchImpl, spawnImpl, readInstanceFile: () => undefined },
     );
     assert.equal(spawnCalls, 1);
     assert.ok(handle.child);
@@ -546,7 +547,7 @@ test("ensureProxyRunning: spawns when not healthy, polls until healthy", async (
     };
     const handle = await ensureProxyRunning(
         { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
-        { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+        { fetchImpl, spawnImpl, sleep: () => Promise.resolve(), readInstanceFile: () => undefined },
     );
     assert.equal(handle.child?.pid, 42421);
     assert.ok(spawnedArgs !== null);
@@ -570,10 +571,113 @@ test("ensureProxyRunning: throws when never healthy within deadline", async () =
     await assert.rejects(
         ensureProxyRunning(
             { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
-            { fetchImpl, spawnImpl, now, sleep },
+            { fetchImpl, spawnImpl, now, sleep, readInstanceFile: () => undefined },
         ),
         /did not become healthy/,
     );
+});
+
+function recordedInstance(over: Partial<InstanceFile> = {}): InstanceFile {
+    return {
+        origin: "http://127.0.0.1:8787",
+        instanceId: "inst-1",
+        pid: process.pid,
+        startedAt: Date.now(),
+        host: "127.0.0.1",
+        port: 8787,
+        passthrough: false,
+        mitmDomains: [],
+        modelWindows: {},
+        ...over,
+    };
+}
+
+test("ensureProxyRunning: attaches to a compatible healthy instance instead of doubling (#394)", async () => {
+    let spawnCalls = 0;
+    const spawnImpl: SpawnFn = () => {
+        spawnCalls++;
+        return makeFakeChild(42431);
+    };
+    const handle = await ensureProxyRunning(
+        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
+        {
+            spawnImpl,
+            fetchImpl: async () => ({ ok: true }),
+            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1" }),
+            readInstanceFile: () => recordedInstance(),
+        },
+    );
+    assert.equal(spawnCalls, 0);
+    assert.equal(handle.attached, true);
+    assert.equal(handle.origin, "http://127.0.0.1:8787");
+    let killed = false;
+    stopProxy({ ...handle, child: { pid: 77777, kill: () => { killed = true; return true; } } });
+    assert.equal(killed, false);
+});
+
+test("ensureProxyRunning: incompatible recorded instance (modelWindows) is not attached", async () => {
+    let spawnCalls = 0;
+    const spawnImpl: SpawnFn = () => {
+        spawnCalls++;
+        return makeFakeChild(42434);
+    };
+    let reads = 0;
+    const handle = await ensureProxyRunning(
+        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, modelWindows: { "m1": 100000 } },
+        {
+            spawnImpl,
+            fetchImpl: async () => ({ ok: true }),
+            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1" }),
+            readInstanceFile: () => (reads++ === 0 ? recordedInstance() : undefined),
+            sleep: () => Promise.resolve(),
+        },
+    );
+    assert.equal(spawnCalls, 1);
+    assert.equal(handle.attached, undefined);
+});
+
+test("ensureProxyRunning: dead recorded pid is ignored (no attach)", async () => {
+    let spawnCalls = 0;
+    const spawnImpl: SpawnFn = () => {
+        spawnCalls++;
+        return makeFakeChild(42435);
+    };
+    const handle = await ensureProxyRunning(
+        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
+        {
+            spawnImpl,
+            fetchImpl: async () => ({ ok: true }),
+            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1" }),
+            readInstanceFile: () => recordedInstance({ pid: 99999999 }),
+            sleep: () => Promise.resolve(),
+        },
+    );
+    assert.equal(spawnCalls, 1);
+});
+
+test("ensureProxyRunning: launchToken handshake returns the child's real port (#407)", async () => {
+    let handshaked: InstanceFile | undefined;
+    const spawnImpl: SpawnFn = (_cmd, _args, options) => {
+        const token = (options.env?.BILI_LAUNCH_TOKEN as string) ?? "";
+        const parentPid = Number(options.env?.BILI_PARENT_PID);
+        assert.ok(token.length > 0, "spawn env carries BILI_LAUNCH_TOKEN");
+        assert.equal(parentPid, process.pid);
+        setImmediate(() => {
+            handshaked = recordedInstance({ origin: "http://127.0.0.1:8799", port: 8799, launchToken: token });
+        });
+        return makeFakeChild(42436);
+    };
+    const handle = await ensureProxyRunning(
+        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
+        {
+            spawnImpl,
+            fetchImpl: async (url: string) => ({ ok: url.startsWith("http://127.0.0.1:8799") }),
+            readInstanceFile: () => handshaked,
+            sleep: () => new Promise((r) => setTimeout(r, 0)),
+        },
+    );
+    assert.equal(handle.port, 8799);
+    assert.equal(handle.origin, "http://127.0.0.1:8799");
 });
 
 test("stopProxy: no-op when child missing pid", () => {
@@ -582,7 +686,7 @@ test("stopProxy: no-op when child missing pid", () => {
     );
 });
 
-test("stopProxy: kills the owned child", () => {
+test("stopProxy: POSIX kills the owned child, win32 defers to the parent-gone watcher (#414)", () => {
     let killed = false;
     const child: SpawnChild = {
         pid: 77777,
@@ -592,7 +696,11 @@ test("stopProxy: kills the owned child", () => {
         },
     };
     stopProxy({ origin: "http://127.0.0.1:8787", port: 8787, reused: false, child });
-    assert.equal(killed, true);
+    if (process.platform === "win32") {
+        assert.equal(killed, false, "win32 child.kill is TerminateProcess (no flush) — shutdown belongs to BILI_PARENT_PID watcher");
+    } else {
+        assert.equal(killed, true);
+    }
 });
 
 test("isOnPath: finds a known binary on PATH, misses bogus name", () => {

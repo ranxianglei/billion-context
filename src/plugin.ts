@@ -106,13 +106,21 @@ const remembered = new Map<string, RememberedMessages>();
 // before the debounced write just means the next model request repopulates it.
 const conversationsFile = () => path.join(stateDir(), "plugin-conversations.json");
 let conversationsSaveTimer: NodeJS.Timeout | undefined;
+let conversationsDirty = false;
 
 function writeConversationsFile(): void {
+    if (!conversationsDirty) return;
     try {
         const obj: Record<string, ConversationEntry> = {};
         for (const [k, v] of conversations) obj[k] = v;
         fs.mkdirSync(stateDir(), { recursive: true });
-        fs.writeFileSync(conversationsFile(), JSON.stringify(obj));
+        // #406: the only state file that used to be written in place — a
+        // torn write or a dying dual instance must not zero every route.
+        const filePath = conversationsFile();
+        const draft = `${filePath}.${process.pid}.bili-tmp`;
+        fs.writeFileSync(draft, JSON.stringify(obj));
+        fs.renameSync(draft, filePath);
+        conversationsDirty = false;
     } catch {
         // best-effort persistence; ignore write failures
     }
@@ -138,8 +146,13 @@ export function flushConversations(): void {
 /** Restore the persisted conversationId → session map. Called at startup,
  *  AFTER initSessions so the referenced sessions are already loaded. */
 export function loadConversations(): void {
+    let raw: string;
     try {
-        const raw = fs.readFileSync(conversationsFile(), "utf8");
+        raw = fs.readFileSync(conversationsFile(), "utf8");
+    } catch {
+        return;
+    }
+    try {
         const obj = JSON.parse(raw) as Record<string, ConversationEntry>;
         for (const [k, v] of Object.entries(obj)) {
             if (v && typeof v.sessionId === "string" && v.sessionId.length > 0) {
@@ -147,8 +160,14 @@ export function loadConversations(): void {
             }
         }
     } catch {
-        // no file or corrupt — start empty
+        // #406: preserve the corrupt bytes for forensics instead of
+        // silently zeroing every route on the next debounced write.
+        try {
+            fs.renameSync(conversationsFile(), `${conversationsFile()}.corrupt-${Date.now()}`);
+        } catch {}
+        loggerLog("warn", "[plugin] plugin-conversations.json is corrupt — backed up beside the original, starting an empty routing table");
     }
+    conversationsDirty = false;
 }
 
 /** Index a plugin session by its conversation id (the key the plugin uses on
@@ -157,6 +176,7 @@ export function loadConversations(): void {
 export function recordPluginSession(conversationId: string, sessionId: string): void {
     conversations.delete(conversationId);
     conversations.set(conversationId, { sessionId, lastSeen: Date.now() });
+    conversationsDirty = true;
     // remembered[sessionId] is intentionally left alone here: this runs OUTSIDE
     // the session lock. rememberPluginMessages() rewrites it under the lock
     // after forward(), and the tool API reads it under the lock — so no

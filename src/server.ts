@@ -50,7 +50,8 @@ import { renderUI, handleConfigGet, handleConfigPut } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { getStore } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger } from "./logger.js";
-import { defaultLogFile, stateDir, proxyOriginFile } from "./paths.js";
+import { defaultLogFile, stateDir } from "./paths.js";
+import { atomicWriteInstanceFile, clearProxyInstanceFile, isPidAlive, registerInstanceAndWarn, unregisterInstance } from "./instance.js";
 import { compressLoopResponsesJson } from "./compress-loop-responses.js";
 import { runCompressLoop, pickAdapter } from "./loop/index.js";
 import { containsToolCallXmlFragment } from "./loop/tag-echo-filter.js";
@@ -293,6 +294,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // (tests) are distinct instances; a restart changing the id is harmless
     // (the chain check only compares against the other running instance).
     const instanceId = randomUUID();
+    const instanceStartedAt = Date.now();
     // Reload persisted compression state before accepting traffic so sessions
     // that survived a restart keep their folded view (otherwise long sessions
     // re-send oversized raw history and hang).
@@ -308,7 +310,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     void loadRegistry();
     const server = http.createServer(async (req, res) => {
         try {
-            await handle(req, res, opts, core, config, log, instanceId);
+            await handle(req, res, opts, core, config, log, instanceId, instanceStartedAt);
         } catch (err) {
             const msg = String(err);
             log("error", msg);
@@ -347,53 +349,89 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         const allowRemoteConnect = opts.host === "0.0.0.0" || opts.host === "::" || !isLoopbackAddress(opts.host);
         setupMitm(server, opts.mitm.domains, (msg) => log("info", msg), (host) => resolveProxy(opts.routes, opts.proxy, `https://${host}`, opts.proxyFallback), allowRemoteConnect);
     }
-    server.listen(opts.port, opts.host, () => {
+    // Launcher mode handshake (#407): the child self-binds and retries on
+    // EADDRINUSE instead of dying, reporting the real origin via the instance
+    // file (launchToken match). Manual `bili start` keeps fail-fast semantics.
+    const launchToken = process.env.BILI_LAUNCH_TOKEN?.trim();
+    const MAX_LISTEN_ATTEMPTS = 17;
+    let listenAttempts = 0;
+    let lastTriedPort = opts.port;
+    const announceListening = (): void => {
+        const actualPort = server.address() === null ? opts.port : (server.address() as { port: number }).port;
         const nonLoopbackBind = opts.host === "0.0.0.0" || opts.host === "::" || !isLoopbackAddress(opts.host);
         // Honest bind display: a wildcard bind shows as 0.0.0.0 (the user
         // chose to expose the proxy — hiding it behind "localhost" made
         // remote setups look broken in the log, see #240).
         const displayHost = nonLoopbackBind ? opts.host : opts.host === "0.0.0.0" ? "localhost" : opts.host;
+        // Discovery origin local MCP shells dial: collapse wildcard
+        // binds to loopback (localhost may resolve to ::1, where an
+        // IPv4-only listener is absent) and bracket bare IPv6 literals
+        // so the file always holds a valid URL.
+        const originHost = opts.host === "0.0.0.0" || opts.host === "::" || opts.host === "localhost" ? "127.0.0.1" : opts.host.includes(":") && !opts.host.startsWith("[") ? `[${opts.host}]` : opts.host;
+        const origin = `http://${originHost}:${actualPort}`;
         try {
             fs.mkdirSync(stateDir(), { recursive: true });
-            // Discovery origin local MCP shells dial: collapse wildcard
-            // binds to loopback (localhost may resolve to ::1, where an
-            // IPv4-only listener is absent) and bracket bare IPv6 literals
-            // so the file always holds a valid URL.
-            const originHost = opts.host === "0.0.0.0" || opts.host === "::" || opts.host === "localhost" ? "127.0.0.1" : opts.host.includes(":") && !opts.host.startsWith("[") ? `[${opts.host}]` : opts.host;
-            fs.writeFileSync(proxyOriginFile(), `http://${originHost}:${server.address() === null ? opts.port : (server.address() as { port: number }).port}\n`);
+            atomicWriteInstanceFile({
+                origin,
+                instanceId,
+                pid: process.pid,
+                startedAt: instanceStartedAt,
+                host: opts.host,
+                port: actualPort,
+                passthrough: opts.passthrough,
+                mitmDomains: opts.mitm.enabled ? opts.mitm.domains : [],
+                modelWindows: { ...LAUNCHER_MODEL_WINDOWS },
+                launchToken: launchToken || undefined,
+            });
         } catch {
             // best-effort discovery hint for host-spawned MCP shells
         }
+        registerInstanceAndWarn(
+            { instanceId, pid: process.pid, port: actualPort, origin, startedAt: instanceStartedAt },
+            (msg) => log("warn", `[instances] ${msg}`),
+        );
         const nOverrides = Object.keys(opts.routes).length;
         log(
             "info",
-            `acp-proxy listening on http://${displayHost}:${opts.port}` +
-                ` — web UI: http://${displayHost}:${opts.port}/__bili/` +
-                ` — zero-config: prefix any baseURL with http://${displayHost}:${opts.port}/bili/` +
+            `acp-proxy listening on http://${displayHost}:${actualPort}` +
+                ` — web UI: http://${displayHost}:${actualPort}/__bili/` +
+                ` — zero-config: prefix any baseURL with http://${displayHost}:${actualPort}/bili/` +
                 (nOverrides ? ` — context overrides for ${nOverrides} upstream URL(s)` : "")
                 + (opts.mitm.enabled ? ` — MITM proxy on (whitelist)${opts.mitm.domains.length ? ` +${opts.mitm.domains.join(",")}` : ""}` : ""),
         );
         if (nonLoopbackBind) {
             log(
                 "warn",
-                `[security] bound to ${opts.host} — proxy endpoints (/bili/, CONNECT for whitelisted model hosts) are reachable from the network with NO authentication; /__bili/ management endpoints stay loopback-only. Restrict access with a firewall on untrusted networks. Remote agents: point baseURL at http://<this-host>:${opts.port}/bili/`,
+                `[security] bound to ${opts.host} — proxy endpoints (/bili/, CONNECT for whitelisted model hosts) are reachable from the network with NO authentication; /__bili/ management endpoints stay loopback-only. Restrict access with a firewall on untrusted networks. Remote agents: point baseURL at http://<this-host>:${actualPort}/bili/`,
             );
         }
         if (opts.debug) {
             log("info", `[debug] build features: raw-HTTP-capture(on) | remote_compaction_v2-strip(on) | cert-MITM-launcher(on) | strip-acp-summary(on) — seeing this line confirms the launcher build (not registry 0.1.34)`);
         }
-    });
+    };
+    const attemptListen = (port: number): void => {
+        lastTriedPort = port;
+        server.listen(port, opts.host, announceListening);
+    };
+    attemptListen(opts.port);
     // Listen errors (EADDRINUSE port taken, EACCES privileged port, EAFNOSUPPORT
     // bad host) surface as an 'error' event on the server. Without a listener
     // Node treats it as an unhandled 'error' and throws, aborting before the
     // graceful-shutdown flush can run. Catch, log a human-readable message,
     // flush sessions, and exit cleanly (exit code 1 so callers/scripts notice).
     server.on("error", (err: NodeJS.ErrnoException) => {
+        if (err.code === "EADDRINUSE" && launchToken && listenAttempts < MAX_LISTEN_ATTEMPTS) {
+            listenAttempts += 1;
+            const next = listenAttempts === MAX_LISTEN_ATTEMPTS ? 0 : lastTriedPort + 1;
+            log("warn", `port ${lastTriedPort} busy — ${next === 0 ? "retrying on an ephemeral port" : `retrying on port ${next}`}`);
+            attemptListen(next);
+            return;
+        }
         const hint =
             err.code === "EADDRINUSE"
-                ? ` — port ${opts.port} is already in use. Stop the other process or use --port <N>.`
+                ? ` — port ${lastTriedPort} is already in use. Stop the other process or use --port <N>.`
                 : err.code === "EACCES"
-                  ? ` — port ${opts.port} requires privileges. Use a port >= 1024.`
+                  ? ` — port ${lastTriedPort} requires privileges. Use a port >= 1024.`
                   : "";
         log("error", `listen failed: ${err.code ?? ""} ${err.message}${hint}`);
         shuttingDown = true;
@@ -417,6 +455,12 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // not lose recent compression state. SIGKILL/power loss cannot flush, but
     // debounced writes keep disk within ~500ms of in-memory state.
     let shuttingDown = false;
+    const finishShutdown = (): void => {
+        clearProxyInstanceFile(instanceId);
+        unregisterInstance(instanceId);
+        closeLogger();
+        process.exit(0);
+    };
     const shutdown = (sig: string) => {
         if (shuttingDown) return;
         shuttingDown = true;
@@ -428,20 +472,14 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         // rather than being yanked mid-chunk.
         server.close(() => {
             flushConversations();
-            void flushAllSessions().finally(() => {
-                closeLogger();
-                process.exit(0);
-            });
+            void flushAllSessions().finally(finishShutdown);
         });
         // Hard fallback: if connections hang (client never closes), don't
         // block shutdown forever — force-exit after a grace window.
         setTimeout(() => {
             log("warn", "shutdown grace window elapsed; forcing exit");
             flushConversations();
-            void flushAllSessions().finally(() => {
-                closeLogger();
-                process.exit(0);
-            });
+            void flushAllSessions().finally(finishShutdown);
         }, 10_000).unref?.();
     };
     process.on("SIGTERM", () => shutdown("SIGTERM"));
@@ -451,6 +489,16 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // raise SIGBREAK, so hook it to the same graceful-shutdown path there.
     if (process.platform === "win32") {
         process.on("SIGBREAK", () => shutdown("SIGBREAK"));
+    }
+    // Launcher children have no console and TerminateProcess leaves no room
+    // for a flush (#414): they watch the launcher pid and run the graceful
+    // path themselves when it disappears (≤2s after the parent exits).
+    const parentPid = Number.parseInt(process.env.BILI_PARENT_PID ?? "", 10);
+    if (Number.isInteger(parentPid) && parentPid > 0 && parentPid !== process.pid) {
+        const watcher = setInterval(() => {
+            if (!isPidAlive(parentPid)) shutdown(`parent-gone (pid ${parentPid})`);
+        }, 2_000);
+        watcher.unref?.();
     }
     return server;
 }
@@ -535,6 +583,7 @@ async function handle(
     config: Config,
     log: (level: string, msg: string) => void,
     instanceId: string,
+    instanceStartedAt: number,
 ): Promise<void> {
     // SECURITY: the /__bili/ management endpoints (config read/write, reload,
     // session stats) are privileged — a remote caller who can reach them can
@@ -574,7 +623,7 @@ async function handle(
     }
     if (req.method === "GET" && req.url === "/__bili/health") {
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: true, upstream: opts.upstream }));
+        res.end(JSON.stringify({ ok: true, upstream: opts.upstream, instanceId, pid: process.pid, startedAt: instanceStartedAt }));
         return;
     }
     // Web config UI (served as HTML, separate from the JSON health check above).

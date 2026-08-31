@@ -9,7 +9,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { proxyOriginFile } from "./paths.js";
+import { readProxyInstanceFile } from "./instance.js";
 
 const VERSION = (() => {
     try {
@@ -37,11 +37,8 @@ const DEFAULT_PROXY_ORIGIN = "http://127.0.0.1:8787";
 export function resolveProxyOrigin(): string {
     const fromEnv = process.env.BILI_MCP_PROXY?.trim();
     if (fromEnv && fromEnv.length > 0) return fromEnv;
-    try {
-        const discovered = fs.readFileSync(proxyOriginFile(), "utf8").trim();
-        if (/^https?:\/\/\S+$/.test(discovered)) return discovered;
-    } catch {
-    }
+    const discovered = readProxyInstanceFile();
+    if (discovered && /^https?:\/\/\S+$/.test(discovered.origin)) return discovered.origin;
     return DEFAULT_PROXY_ORIGIN;
 }
 
