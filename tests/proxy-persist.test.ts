@@ -52,6 +52,21 @@ async function settle(ms = 30): Promise<void> {
     await new Promise((r) => setTimeout(r, ms));
 }
 
+// Poll until a debounced write has actually landed on disk. A fixed settle()
+// is racy on slow CI runners (esp. windows-latest): the debounce timer fires,
+// the async write is still in flight when the test's finally-block rmSync()s
+// the tmpdir, and the in-flight rename then fails with ENOENT (same root cause
+// as the PR #158 flake documented below). Polling loadSync waits for the write
+// to complete (or times out with a clear failure) before the test tears down.
+async function waitForWrite(store: SessionStore, id: string, timeoutMs = 5000): Promise<void> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+        if (store.loadSync(id)) return;
+        await new Promise((r) => setTimeout(r, 10));
+    }
+    assert.fail(`persist write for ${id} did not complete within ${timeoutMs}ms`);
+}
+
 await withTempStore("writeNow round-trips state + blockContents", async (store, dir) => {
     const s = makeSession("sess-1");
     s.stats.requests = 42;
@@ -103,7 +118,7 @@ await withTempStore("scheduleSave debounces and eventually writes", async (store
     store.scheduleSave(s);
     s.stats.requests = 3;
     store.scheduleSave(s);
-    await settle();
+    await waitForWrite(store, "debounce-1");
     assert.equal(readdirSync(dir).length, 1, "exactly one top-level entry (the _unknown subdir) happened");
     const loaded = store.loadSync("debounce-1");
     assert.equal(loaded!.stats.requests, 3, "latest value persisted");
@@ -219,7 +234,10 @@ await withTempStore("hasPending reflects the debounce timer", async (store) => {
     assert.equal(store.hasPending(s.id), false);
     store.scheduleSave(s);
     assert.equal(store.hasPending(s.id), true);
-    await settle();
+    const pendingStart = Date.now();
+    while (store.hasPending(s.id) && Date.now() - pendingStart < 5000) {
+        await new Promise((r) => setTimeout(r, 10));
+    }
     assert.equal(store.hasPending(s.id), false);
 });
 
