@@ -51,7 +51,12 @@ export { ACP_TOOL_NAMES as PROXY_TOOL_NAMES, ACP_MUTATING_TOOLS as MUTATING_PROX
 export function parseCompressInput(input: unknown, callId?: string) {
     const { ranges, diagnostics } = parseCompressArgs(input, { callId });
     if (!diagnostics.ok && diagnostics.kind !== "ok") {
-        loggerLog("warn", `[acp-compress-input] rejected: kind=${diagnostics.kind} invalidItems=${diagnostics.invalidItems}${diagnostics.keys ? ` keys=[${diagnostics.keys.join(",")}]` : ""}${diagnostics.length !== undefined ? ` len=${diagnostics.length}` : ""}`);
+        const category = diagnostics.kind === "missing-content" || diagnostics.kind === "empty-input"
+            ? "empty-call"
+            : diagnostics.kind === "malformed-json" || diagnostics.kind === "truncated"
+                ? "stream-concat"
+                : "validation";
+        loggerLog("warn", `[acp-compress-input] rejected: category=${category} kind=${diagnostics.kind} invalidItems=${diagnostics.invalidItems}${diagnostics.keys ? ` keys=[${diagnostics.keys.join(",")}]` : ""}${diagnostics.length !== undefined ? ` len=${diagnostics.length}` : ""}${callId ? ` callId=${callId}` : ""}`);
     }
     return ranges;
 }
