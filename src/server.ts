@@ -77,6 +77,39 @@ function bodyDumpEnabled(): boolean {
     return process.env.ACP_DUMP_BODY === "1";
 }
 
+// Raw dumps are best-effort: a failure (disk full, locked dir, EPERM) must not
+// break the request, but a silently-stopped dump hides real problems (#362).
+// Rate-limited so a stuck dir doesn't spam the log.
+let dumpFailCount = 0;
+let lastDumpFailLog = 0;
+export function logDumpFailure(where: string, err: unknown): void {
+    dumpFailCount++;
+    const now = Date.now();
+    if (dumpFailCount === 1 || now - lastDumpFailLog >= 60_000) {
+        lastDumpFailLog = now;
+        const msg = err instanceof Error ? err.message : String(err);
+        loggerLog("warn", `[dump] ${where} failed (total ${dumpFailCount}x): ${msg}`);
+    }
+}
+
+// Non-protocol paths (client telemetry like /api/v1/event/report, ...) are
+// forwarded unchanged — expected, not an error. Logging every hit spammed the
+// log (~20k lines in one user's capture, #362). Per-path: first 3 at warn, one
+// "suppressed" notice, then silent.
+const unrecognizedPathCounts = new Map<string, number>();
+export function logUnrecognizedPath(log: (level: string, msg: string) => void, url: string): void {
+    // Strip the query before masking: a varying query (?ts=…) would otherwise
+    // split one endpoint into unbounded keys and defeat the rate limit.
+    const key = maskUrlsInText(url.split("?")[0]);
+    const n = (unrecognizedPathCounts.get(key) ?? 0) + 1;
+    unrecognizedPathCounts.set(key, n);
+    if (n <= 3) {
+        log("warn", `unrecognized path ${key} — not a known protocol (/chat/completions, /v1/messages, /responses, /responses/compact); forwarding unchanged`);
+    } else if (n === 4) {
+        log("info", `unrecognized path ${key}: forwarding unchanged; further occurrences suppressed`);
+    }
+}
+
 // #300: bili→bili chain marker. When a bili instance forwards a request it has
 // processed upstream, it stamps this header with its own instance id. A bili
 // instance that RECEIVES a request already carrying it knows an upstream bili
@@ -747,7 +780,7 @@ async function handle(
             );
             const hdrText = Object.entries(hdrs).map(([k, v]) => `${k}: ${v}`).join("\n");
             fs.writeFileSync(`${rawDir}/${Date.now()}-INCOMING.txt`, `${req.method} ${maskUrlsInText(req.url ?? "")}\n${hdrText}\n\n${bodyBuffer.toString("utf8")}`);
-        } catch { /* best-effort dump */ }
+        } catch (err) { logDumpFailure("INCOMING dump", err); }
     }
     // Per-request context limit + compression tuning: look up body.model against
     // the per-route model declaration first, then the built-in table / registry.
@@ -1186,7 +1219,7 @@ async function handle(
     }
     if (!prepared) {
         if (protocol === null && !opts.passthrough) {
-            log("warn", `unrecognized path ${maskUrlsInText(req.url ?? "")} — not a known protocol (/chat/completions, /v1/messages, /responses, /responses/compact); forwarding unchanged`);
+            logUnrecognizedPath(log, req.url ?? "");
         }
         await forward(req, res, opts, bodyBuffer, null, core, reqConfig, log, route, instanceId, undefined);
     }
@@ -2212,7 +2245,7 @@ async function forward(
             const reqPath = `${rawBase}-REQ.txt`;
             fs.writeFileSync(reqPath, `${req.method ?? "POST"} ${maskUrlForLog(upstreamUrl)}\n${hdrText}\n\n${bodyText}`);
             log("info", `[debug] RAW request dump: ${reqPath}`);
-        } catch { /* best-effort */ }
+        } catch (err) { logDumpFailure("REQ dump", err); }
     }
     const dispatcher = proxyDispatcher(proxyUrl);
     const init: Omit<RequestInit, "dispatcher"> & { dispatcher?: object } = {
@@ -2263,7 +2296,7 @@ async function forward(
             const resPath = `${rawBase}-RES.txt`;
             fs.writeFileSync(resPath, `${upstream.status}\n${hdrText}\n`);
             log("info", `[debug] RAW response dump: ${resPath}`);
-        } catch { /* best-effort */ }
+        } catch (err) { logDumpFailure("RES dump", err); }
     }
     // P1.2: if the upstream returned a non-2xx (auth, rate-limit, context too
     // long, ...), do NOT route the error body through the SSE rewriter — it has
@@ -2607,7 +2640,7 @@ async function dumpStreamToFile(stream: ReadableStream<Uint8Array>, dir: string,
     try {
         mkdirSync(dir, { recursive: true });
         const ws = createWriteStream(join(dir, name));
-        ws.on("error", (e) => { loggerLog("debug", `[dump] write stream error: ${(e as Error).message ?? e}`); });
+        ws.on("error", (e) => { logDumpFailure("SSE stream dump", e); });
         const reader = stream.getReader();
         try {
             for (;;) {
@@ -2619,8 +2652,8 @@ async function dumpStreamToFile(stream: ReadableStream<Uint8Array>, dir: string,
             reader.releaseLock();
             ws.end();
         }
-    } catch {
-        // best-effort dump
+    } catch (err) {
+        logDumpFailure("SSE stream dump", err);
     }
 }
 
