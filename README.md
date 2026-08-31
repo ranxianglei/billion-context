@@ -162,6 +162,15 @@ bili --host 0.0.0.0           # all interfaces (or use your LAN IP)
 - MITM-mode `CONNECT` then also accepts remote clients — for **whitelisted
   model hosts only**. Blind tunnels to arbitrary hosts stay loopback-only, so
   the proxy can never be used as an open relay.
+- The `/bili/<absolute-url>` tunnel has destination admission (#409): the
+  proxy itself and link-local/metadata addresses are **always denied**;
+  loopback/private destinations are allowed for local clients (self-hosted
+  upstreams) and **denied for remote clients** unless listed in
+  `BILI_TUNNEL_ALLOWED_HOSTS` (`host` or `host:port`, comma-separated) — a
+  remote peer must not use the proxy as an SSRF pivot into your LAN, and the
+  management plane is unreachable through the tunnel even via NAT hairpin
+  (tunneled requests carry an internal `x-bili-tunnel` marker that `/__bili/`
+  rejects).
 - There is **no authentication**: only do this on a trusted LAN or behind a
   firewall. The `/__bili/` management endpoints remain loopback-only.
 - A startup `[security]` warning reminds you of the above.
