@@ -137,9 +137,55 @@ function piStatus(): string {
 
 // — omp ———————————————————————————————————————————————————————————————
 
+// An extensions entry that loads the bili omp plugin (any install): a path
+// ending in dist/agent/omp.js. Shared by install/remove/status and the
+// launcher's loader check so all four agree on what "installed" means.
+const OMP_ENTRY_RE = /[\\/]dist[\\/]agent[\\/]omp\.js$/;
+
+// Line indices of the `- ` items inside the top-level `extensions:` block.
+// The block starts at the column-0 `extensions:` key and ends at the first
+// non-blank, non-comment line that is not a list item. Returns [] when there
+// is no top-level key or when it appears more than once (ambiguous — refuse
+// to guess). Matching is scoped to this block, so a same-valued line under
+// any other key is never counted as installed and never removed.
+function ompExtensionItemLines(text: string): number[] {
+    const lines = text.split("\n");
+    let keyIdx = -1;
+    for (let i = 0; i < lines.length; i++) {
+        if (/^extensions:(\s+(#.*)?)?$/.test(lines[i]!)) {
+            if (keyIdx !== -1) return [];
+            keyIdx = i;
+        }
+    }
+    if (keyIdx === -1) return [];
+    const items: number[] = [];
+    for (let i = keyIdx + 1; i < lines.length; i++) {
+        const t = lines[i]!.trimStart();
+        if (t === "" || t.startsWith("#")) continue;
+        if (t === "-" || t.startsWith("- ")) items.push(i);
+        else break;
+    }
+    return items;
+}
+
+// The config.yml the plugin commands read/write. When PI_CODING_AGENT_DIR
+// points at a bili overlay (<home>-bili, created by `bili omp`), redirect to
+// the real home: the overlay's config.yml may be a stale copy (a merge
+// conflict leaves a .bili-conflict instead of the live file), so editing it
+// would silently miss the real config. A note is printed so the user sees
+// which file was actually touched.
 function ompConfigFile(): string {
     const raw = process.env.PI_CODING_AGENT_DIR?.trim();
-    if (raw && raw.length > 0) return path.join(raw, "config.yml");
+    if (raw && raw.length > 0) {
+        if (raw.endsWith("-bili") && raw.length > "-bili".length) {
+            const realHome = raw.slice(0, -"-bili".length);
+            process.stderr.write(
+                `bili plugin: PI_CODING_AGENT_DIR points at the bili overlay ${raw} — operating on the real omp home ${realHome} instead\n`,
+            );
+            return path.join(realHome, "config.yml");
+        }
+        return path.join(raw, "config.yml");
+    }
     return path.join(os.homedir(), ".omp", "agent", "config.yml");
 }
 
@@ -151,16 +197,24 @@ function ompEntryValue(line: string): string {
     return line.replace(/#.*$/, "").trim().replace(/^-\s*/, "").replace(/^["']|["']$/g, "").trim();
 }
 
+function ompBlockLoaded(text: string): boolean {
+    const lines = text.split("\n");
+    return ompExtensionItemLines(text).some((i) => {
+        const v = ompEntryValue(lines[i]!);
+        return OMP_ENTRY_RE.test(v) && fs.existsSync(v);
+    });
+}
+
 function ompRemove(): string {
     const file = ompConfigFile();
-    const entry = ompExtensionPath();
     if (!fs.existsSync(file)) return `omp: not installed (${file})`;
     const text = fs.readFileSync(file, "utf8");
-    const cleaned = text
-        .split("\n")
-        .filter((line) => ompEntryValue(line) !== entry)
-        .join("\n");
-    if (cleaned === text) return `omp: not installed (${file})`;
+    const lines = text.split("\n");
+    const drop = new Set(
+        ompExtensionItemLines(text).filter((i) => OMP_ENTRY_RE.test(ompEntryValue(lines[i]!))),
+    );
+    if (drop.size === 0) return `omp: not installed (${file})`;
+    const cleaned = lines.filter((_, i) => !drop.has(i)).join("\n");
     backupOnce(file);
     fs.writeFileSync(file, cleaned);
     return `omp: removed from ${file}`;
@@ -171,8 +225,15 @@ function ompInstall(): string {
     const entry = ompExtensionPath();
     requireDistFile(entry);
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    const text = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
-    if (text.split("\n").some((line) => ompEntryValue(line) === entry)) return `omp: already installed (${file})`;
+    let text = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
+    if (ompBlockLoaded(text)) return `omp: already installed (${file})`;
+    // Drop any stale copy of OUR exact entry (points at a vanished file) so
+    // the insert below leaves exactly one copy instead of a duplicate.
+    {
+        const lines = text.split("\n");
+        const stale = new Set(ompExtensionItemLines(text).filter((i) => ompEntryValue(lines[i]!) === entry));
+        if (stale.size > 0) text = lines.filter((_, i) => !stale.has(i)).join("\n");
+    }
     const keyCount = (text.match(/^extensions:/gm) ?? []).length;
     if (keyCount > 1) throw new Error(`${file}: multiple \`extensions:\` keys — fix the file first, refusing to edit`);
     if (/^extensions:\s*\S/m.test(text) && !/^extensions:\s*$/m.test(text)) {
@@ -199,7 +260,8 @@ function ompInstall(): string {
         out = text.endsWith("\n") || text.length === 0 ? text : text + "\n";
         out += `extensions:\n  - ${entry}\n`;
     }
-    const occurrences = out.split("\n").filter((line) => ompEntryValue(line) === entry).length;
+    const outLines = out.split("\n");
+    const occurrences = ompExtensionItemLines(out).filter((i) => ompEntryValue(outLines[i]!) === entry).length;
     if (occurrences !== 1) {
         throw new Error(`${file}: edit would leave ${occurrences} copies of the entry — aborting without writing`);
     }
@@ -211,7 +273,15 @@ function ompInstall(): string {
 function ompStatus(): string {
     const file = ompConfigFile();
     const text = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
-    return text.split("\n").some((line) => ompEntryValue(line) === ompExtensionPath()) ? "installed" : "not installed";
+    const lines = text.split("\n");
+    let broken = false;
+    for (const i of ompExtensionItemLines(text)) {
+        const v = ompEntryValue(lines[i]!);
+        if (!OMP_ENTRY_RE.test(v)) continue;
+        if (fs.existsSync(v)) return "installed";
+        broken = true;
+    }
+    return broken ? "broken" : "not installed";
 }
 
 /** True when the given omp home's config.yml carries a bili plugin entry
@@ -223,11 +293,7 @@ function ompStatus(): string {
  *  launcher must supply the working plugin itself. */
 export function ompPluginLoadedFrom(ompHome: string): boolean {
     try {
-        const text = fs.readFileSync(path.join(ompHome, "config.yml"), "utf8");
-        return text.split("\n").some((line) => {
-            const v = ompEntryValue(line);
-            return /[\\/]dist[\\/]agent[\\/]omp\.js$/.test(v) && fs.existsSync(v);
-        });
+        return ompBlockLoaded(fs.readFileSync(path.join(ompHome, "config.yml"), "utf8"));
     } catch {
         return false;
     }
