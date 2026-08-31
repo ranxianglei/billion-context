@@ -394,6 +394,67 @@ test("loop #9 (S2): responses round yields usage → session.stats populated (nu
     }
 });
 
+test("loop #422a: compress round → re-request body carries the one-shot continue-driver (task-continuity across the compression boundary)", async () => {
+    const ctx = withRefs(makeCtx([
+        textMsg("raw_1", "user", bigText(5000)),
+        textMsg("raw_2", "assistant", bigText(5000)),
+        textMsg("raw_3", "user", bigText(5000)),
+        textMsg("raw_4", "assistant", bigText(5000)),
+        textMsg("raw_5", "user", bigText(5000)),
+        textMsg("raw_6", "assistant", bigText(5000)),
+        textMsg("raw_7", "user", bigText(5000)),
+    ]));
+    const compressArgs = JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "PAIR-SUMMARY-PAYLOAD-THAT-IS-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" }] });
+    const round1 = [
+        sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+        fcEvents(0, "call_c", "compress", compressArgs),
+        COMPLETED,
+    ].join("");
+    const probe = reFetchProbe();
+    try {
+        await drain(
+            new Response(round1, { status: 200 }).body!,
+            ctx,
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        const bodies = probe.bodies();
+        assert.ok(bodies.length >= 1, "re-request fires after compress");
+        const body = bodies[0];
+        assert.ok(body.includes("housekeeping, not your task"), "re-request carries the one-shot continue-driver so the model resumes its in-progress task instead of stopping at the compression boundary (#422)");
+        assert.ok(body.includes("stop normally"), "driver grants the model the right to stop if the task is actually complete (reverse-risk guard)");
+    } finally {
+        probe.restore();
+    }
+});
+
+test("loop #422b: read-only acp_status round → re-request body does NOT carry the continue-driver (scoped to context-mutating tools)", async () => {
+    const ctx = makeCtx([
+        textMsg("m00001", "user", "hello"),
+        textMsg("m00002", "assistant", "hi"),
+    ]);
+    const round1 = [
+        sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+        fcEvents(0, "call_s", "acp_status", "{}"),
+        COMPLETED,
+    ].join("");
+    const probe = reFetchProbe();
+    try {
+        await drain(
+            new Response(round1, { status: 200 }).body!,
+            ctx,
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        const bodies = probe.bodies();
+        assert.ok(bodies.length >= 1, "re-request fires after acp_status");
+        const body = bodies[0];
+        assert.ok(!body.includes("housekeeping, not your task"), "no continue-driver for read-only queries — they don't replace the context, so the model continues naturally");
+    } finally {
+        probe.restore();
+    }
+});
+
 test("loop #10 (S3): upstream 500 mid-loop terminates cleanly (timer cleared, no hang)", async () => {
     process.env.BILI_REPLAY_RETRY_BASE_MS = "1";
     const ctx = makeCtx([

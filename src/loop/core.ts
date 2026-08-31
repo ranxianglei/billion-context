@@ -13,6 +13,7 @@ import type { BiliMessage } from "acp-kernel/wire";
 import {
     parseCompressInput,
     PROXY_TOOL_NAMES,
+    MUTATING_PROXY_TOOLS,
 } from "../compress-tool.js";
 import { applyRanges } from "../stream.js";
 import { resolveDecompress } from "../decompress-shared.js";
@@ -23,6 +24,17 @@ import { log as loggerLog } from "../logger.js";
 import type { WireProtocol } from "../util.js";
 
 export const MAX_LOOP_ROUNDS = 10;
+
+// #422: one-shot task-continuity driver for the re-request after a
+// context-mutating proxy tool — the compression boundary is where the model's
+// task-continuity is weakest (it stops, interrupting the in-progress task).
+// Injected into the re-request only; never persisted to session state. Text is
+// outcome-neutral (true for compress-success, compress-failure, and decompress
+// alike) and grants the model the right to stop if the task is actually done
+// (guards the reverse risk: over-driving a finished turn).
+export const CONTINUE_DRIVER_TEXT =
+    "[ACP] A context-management step (compress or decompress) just ran — that was housekeeping, not your task. " +
+    "Continue with your next planned action (the next tool call in your plan). If your task is in fact already complete, stop normally.";
 
 function isLoopThinking(m: CoreMessage): boolean {
     return m.contentType === "reasoning" && typeof m.id === "string" && m.id.startsWith("acp_loop_");
@@ -423,6 +435,21 @@ export async function* runCompressLoop(
                 loggerLog("warn", `[acp-loop] loop limit (${MAX_LOOP_ROUNDS}) reached; completing gracefully`);
                 yield adapter.emitCompletion({ finishReason: "length", usage });
                 return;
+            }
+
+            // #422: drive task-continuity across the compression boundary
+            // (mutating tools only — read-only queries don't replace context).
+            if (proxyResults.some((pr) => MUTATING_PROXY_TOOLS.has(pr.name))) {
+                const driverId = "acp_loop_continue_driver";
+                if (!coreMessages.some((m) => m.id === driverId)) {
+                    coreMessages.push({
+                        id: driverId,
+                        role: "user",
+                        contentType: "text",
+                        text: CONTINUE_DRIVER_TEXT,
+                    });
+                    ctx.log(`[acp-loop] round ${round}: injected continue-driver after context-mutating proxy tool (#422)`);
+                }
             }
 
             ctx.log(`[acp-loop] round ${round}: proxy tool executed; re-requesting so the model sees the result`);
