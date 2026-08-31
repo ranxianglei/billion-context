@@ -8,7 +8,7 @@
  *    kernel's ACP_* names ("proxy" is a misnomer once shared);
  *  - parseCompressInput wires the kernel's onWarn hook into the proxy logger.
  */
-import { parseCompressArgs } from "acp-kernel";
+import { parseCompressArgs, type CompressParseKind } from "acp-kernel";
 import { log as loggerLog } from "./logger.js";
 import { maxShrinkPerCompress } from "./fetch-util.js";
 
@@ -48,10 +48,24 @@ export {
 export type { ParsedRange } from "acp-kernel";
 export { ACP_TOOL_NAMES as PROXY_TOOL_NAMES, ACP_MUTATING_TOOLS as MUTATING_PROXY_TOOLS, ACP_READONLY_TOOLS as READONLY_PROXY_TOOLS } from "acp-kernel";
 
+// #366: rejection categories by attribution — only stream-concat is
+// adapter-attributable; empty-call is a model empty call, validation is a
+// valid-range validation failure.
+const REJECT_CATEGORY: Record<CompressParseKind, string> = {
+    ok: "",
+    "empty-input": "empty-call",
+    "missing-content": "empty-call",
+    "malformed-json": "stream-concat",
+    "truncated": "stream-concat",
+    "no-valid-ranges": "validation",
+    "content-not-array": "validation",
+    "not-object": "validation",
+};
+
 export function parseCompressInput(input: unknown, callId?: string) {
     const { ranges, diagnostics } = parseCompressArgs(input, { callId });
     if (!diagnostics.ok && diagnostics.kind !== "ok") {
-        loggerLog("warn", `[acp-compress-input] rejected: kind=${diagnostics.kind} invalidItems=${diagnostics.invalidItems}${diagnostics.keys ? ` keys=[${diagnostics.keys.join(",")}]` : ""}${diagnostics.length !== undefined ? ` len=${diagnostics.length}` : ""}`);
+        loggerLog("warn", `[acp-compress-input] rejected: kind=${diagnostics.kind} category=${REJECT_CATEGORY[diagnostics.kind]}${callId ? ` callId=${callId}` : ""} invalidItems=${diagnostics.invalidItems}${diagnostics.keys ? ` keys=[${diagnostics.keys.join(",")}]` : ""}${diagnostics.length !== undefined ? ` len=${diagnostics.length}` : ""}`);
     }
     return ranges;
 }
