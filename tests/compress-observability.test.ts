@@ -8,6 +8,7 @@ import { maxShrinkPerCompress } from "../src/fetch-util.ts";
 import { withStagedCompressGuidance } from "../src/compress-tool.ts";
 import { parseCompressInput } from "../src/compress-tool.ts";
 import { applyRanges, type RewriteCtx } from "../src/stream.ts";
+import { setLogCapture } from "../src/logger.ts";
 
 type Ctx = Omit<RewriteCtx, "log"> & { log: (m: string) => void; logs: string[] };
 
@@ -188,6 +189,55 @@ test("#189: maxShrinkPerCompress parses the env fraction; rejects out-of-range",
     } finally {
         if (prev === undefined) delete process.env.BILI_MAX_SHRINK_PER_COMPRESS;
         else process.env.BILI_MAX_SHRINK_PER_COMPRESS = prev;
+    }
+});
+
+test("#366: rejected log carries category by kind (all 7 kinds) and none on success", () => {
+    const captured: { level: string; msg: string }[] = [];
+    setLogCapture((level, msg) => captured.push({ level, msg }));
+    try {
+        const cases: Array<[label: string, input: unknown, kind: string, category: string]> = [
+            ["empty-input", null, "empty-input", "empty-call"],
+            ["missing-content", {}, "missing-content", "empty-call"],
+            ["malformed-json", "nope", "malformed-json", "stream-concat"],
+            ["truncated", '{"content":[{"startId":"m1","endId":"m2","summar', "truncated", "stream-concat"],
+            ["no-valid-ranges", { content: [{ startId: "m1" }] }, "no-valid-ranges", "validation"],
+            ["content-not-array", { content: 42 }, "content-not-array", "validation"],
+            ["not-object", 42, "not-object", "validation"],
+        ];
+        for (const [label, input, kind, category] of cases) {
+            captured.length = 0;
+            parseCompressInput(input);
+            const line = captured.find((c) => c.msg.includes("[acp-compress-input] rejected"));
+            assert.ok(line, `rejected line logged for ${label}`);
+            assert.ok(line!.msg.includes(`kind=${kind} `), `${label}: kind=${kind} in log: ${line!.msg}`);
+            assert.ok(line!.msg.includes(`category=${category}`), `${label}: category=${category} in log: ${line!.msg}`);
+            assert.equal(line!.level, "warn", `${label}: logged at warn level`);
+        }
+        captured.length = 0;
+        parseCompressInput({ content: [{ startId: "m1", endId: "m2", summary: "a valid summary" }] });
+        assert.equal(captured.filter((c) => c.msg.includes("[acp-compress-input] rejected")).length, 0, "no rejected line on success");
+    } finally {
+        setLogCapture(null);
+    }
+});
+
+test("#366: rejected log includes callId when the path supplies one, omits it otherwise", () => {
+    const captured: { level: string; msg: string }[] = [];
+    setLogCapture((level, msg) => captured.push({ level, msg }));
+    try {
+        parseCompressInput(null, "call_abc123");
+        let line = captured.find((c) => c.msg.includes("[acp-compress-input] rejected"));
+        assert.ok(line, "rejected line logged with callId");
+        assert.ok(line!.msg.includes("callId=call_abc123"), `callId in log: ${line!.msg}`);
+
+        captured.length = 0;
+        parseCompressInput(null);
+        line = captured.find((c) => c.msg.includes("[acp-compress-input] rejected"));
+        assert.ok(line, "rejected line logged without callId");
+        assert.ok(!line!.msg.includes("callId="), `no callId field: ${line!.msg}`);
+    } finally {
+        setLogCapture(null);
     }
 });
 
