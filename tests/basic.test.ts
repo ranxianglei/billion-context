@@ -119,7 +119,7 @@ test("parseCompressInput handles batch {content:[...]} form", () => {
             { startId: "m00001", endId: "m00010", summary: "first batch", topic: "intro" },
             { startId: "m00020", endId: "m00030", summary: "second batch" },
         ],
-    });
+    }).ranges;
     assert.equal(parsed.length, 2);
     assert.equal(parsed[0]?.startRef, "m00001");
     assert.equal(parsed[0]?.endRef, "m00010");
@@ -129,7 +129,7 @@ test("parseCompressInput handles batch {content:[...]} form", () => {
 });
 
 test("parseCompressInput handles single {startId,endId,summary} form", () => {
-    const parsed = parseCompressInput({ startId: "m00005", endId: "m00008", summary: "solo" });
+    const parsed = parseCompressInput({ startId: "m00005", endId: "m00008", summary: "solo" }).ranges;
     assert.equal(parsed.length, 1);
     assert.equal(parsed[0]?.startRef, "m00005");
     assert.equal(parsed[0]?.endRef, "m00008");
@@ -137,10 +137,10 @@ test("parseCompressInput handles single {startId,endId,summary} form", () => {
 });
 
 test("parseCompressInput returns empty for malformed input", () => {
-    assert.deepEqual(parseCompressInput(null), []);
-    assert.deepEqual(parseCompressInput("nope"), []);
-    assert.deepEqual(parseCompressInput({ content: "not-an-array" }), []);
-    assert.deepEqual(parseCompressInput({ content: [{ startId: "m1" }] }), []);
+    assert.deepEqual(parseCompressInput(null).ranges, []);
+    assert.deepEqual(parseCompressInput("nope").ranges, []);
+    assert.deepEqual(parseCompressInput({ content: "not-an-array" }).ranges, []);
+    assert.deepEqual(parseCompressInput({ content: [{ startId: "m1" }] }).ranges, []);
 });
 
 test("parseCompressInput accepts JSON-string content (non-strict providers stringify arrays)", () => {
@@ -149,7 +149,7 @@ test("parseCompressInput accepts JSON-string content (non-strict providers strin
             { startId: "m00001", endId: "m00010", summary: "first", topic: "intro" },
             { startId: "m00020", endId: "m00030", summary: "second" },
         ]),
-    });
+    }).ranges;
     assert.equal(parsed.length, 2);
     assert.equal(parsed[0]?.startRef, "m00001");
     assert.equal(parsed[0]?.endRef, "m00010");
@@ -157,7 +157,7 @@ test("parseCompressInput accepts JSON-string content (non-strict providers strin
     assert.equal(parsed[0]?.topic, "intro");
     assert.equal(parsed[1]?.startRef, "m00020");
     assert.equal(parsed[1]?.endRef, "m00030");
-    assert.deepEqual(parseCompressInput({ content: "not-json" }), []);
+    assert.deepEqual(parseCompressInput({ content: "not-json" }).ranges, []);
 });
 
 test("buildCompressSystemPrompt includes compression philosophy", () => {

@@ -4,3 +4,4 @@ dist/
 .env
 *.tgz
 .bili-coop-build-stamp
+tmp/
