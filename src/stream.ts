@@ -1,4 +1,4 @@
-import { buildStatusReport, collectBlockContent, estimateTokensFast, type CompressionCore, type Config, type CoreMessage, type CompressionState } from "acp-kernel";
+import { buildStatusReport, collectBlockContent, defaultCountTokens, type CompressionCore, type Config, type CoreMessage, type CompressionState } from "acp-kernel";
 import { type Session, cacheBlockContent } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput, PROXY_TOOL_NAMES } from "./compress-tool.js";
 import { resolveDecompress } from "./decompress-shared.js";
@@ -43,7 +43,7 @@ function executeAnthropicProxyTool(toolName: string, args: Record<string, unknow
         return `Found ${blocks.length} block(s) for "${query}":\n\n${lines.join("\n\n")}`;
     }
     if (toolName === "acp_status") {
-        return buildStatusReport(ctx.session.state, ctx.messages, estimateTokensFast);
+        return buildStatusReport(ctx.session.state, ctx.messages, defaultCountTokens);
     }
     return `[Unknown proxy tool: ${toolName}]`;
 }

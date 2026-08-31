@@ -1,6 +1,6 @@
 import {
     buildStatusReport,
-    estimateTokensFast,
+    defaultCountTokens,
     type CompressionCore,
     type Config,
     type CoreMessage,
@@ -102,7 +102,7 @@ function executeProxyTool(
         return `Found ${blocks.length} block(s) for "${query}":\n\n${lines.join("\n\n")}`;
     }
     if (toolName === "acp_status") {
-        return buildStatusReport(ctx.session.state, ctx.messages, estimateTokensFast);
+        return buildStatusReport(ctx.session.state, ctx.messages, defaultCountTokens);
     }
     return `[Unknown proxy tool: ${toolName}]`;
 }
