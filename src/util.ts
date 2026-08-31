@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { OpenAIMessage } from "acp-kernel/wire";
 
 /**
  * Cryptographic hash of a string, truncated to a 64-bit id (16 hex chars).
@@ -175,37 +176,32 @@ export function reserveOutputHeadroom(window: number, maxOutput: number): number
 }
 
 /**
- * Move mid-conversation system/developer messages to the leading system-prefix
- * position, preserving relative order. acp-kernel renders compressed summaries
- * as role:"system" anchored at the earliest message their block covered; when
- * that anchor sits after an uncompressed message (multi-segment compress with
- * an uncovered user message between segments), the OpenAI wire carries a
- * system message mid-conversation, which strict OpenAI-compatible backends
- * (sglang: "System message must be at the beginning") reject with 400 (#355).
- * A summary is a stand-in for the folded history, so moving it to the head
- * preserves semantics. Messages stay SEPARATE (not merged into the head) so
- * the head system message — the prefix-cache anchor — keeps its bytes stable
- * across compress turns. No-op (same array) when there is nothing to hoist.
+ * Merge ALL system/developer messages (head- or mid-position) into a single
+ * leading system message, preserving the relative order of every other
+ * message. acp-kernel renders each compressed block's summary as its own
+ * role:"system" message anchored at the block's earliest covered message, so
+ * with 2+ active blocks the OpenAI wire carries 2+ system messages; strict
+ * OpenAI-compatible backends (sglang/vLLM with the Qwen3-family "system-first"
+ * chat template) reject that with 400 "System message must be at the
+ * beginning" (#377) — they require EXACTLY ONE system message at index 0, not
+ * merely a contiguous leading prefix (#355). `sysParts` (the client's original
+ * leading system + the static compress prompt) is placed FIRST so the stable
+ * prefix-cache anchor stays at the head across compress turns; the block
+ * summaries follow in their original anchor order. A summary is a stand-in for
+ * the folded history, so merging preserves semantics. Returns the same array
+ * when there is no system content to merge.
  */
-export function hoistMidSystemMessages<T extends { role: string }>(messages: T[]): T[] {
-    let lead = 0;
-    while (lead < messages.length && (messages[lead].role === "system" || messages[lead].role === "developer")) lead++;
-    if (lead === messages.length) return messages;
-    let midCount = 0;
-    for (let i = lead; i < messages.length; i++) {
-        const r = messages[i].role;
-        if (r === "system" || r === "developer") midCount++;
+export function mergeSystemMessages(messages: OpenAIMessage[], sysParts: string[]): OpenAIMessage[] {
+    const sys: OpenAIMessage[] = [];
+    const rest: OpenAIMessage[] = [];
+    for (const m of messages) {
+        if (m.role === "system" || m.role === "developer") sys.push(m);
+        else rest.push(m);
     }
-    if (midCount === 0) return messages;
-    const head = messages.slice(0, lead);
-    const mid: T[] = [];
-    const rest: T[] = [];
-    for (let i = lead; i < messages.length; i++) {
-        const r = messages[i].role;
-        if (r === "system" || r === "developer") mid.push(messages[i]);
-        else rest.push(messages[i]);
-    }
-    return [...head, ...mid, ...rest];
+    const sysContents = sys.map((m) => (typeof m.content === "string" ? m.content : m.content == null ? "" : JSON.stringify(m.content)));
+    const parts = [...sysParts, ...sysContents].filter((s) => s.length > 0);
+    if (parts.length === 0) return messages;
+    return [{ role: "system", content: parts.join("\n\n---\n\n") }, ...rest];
 }
 
 /**

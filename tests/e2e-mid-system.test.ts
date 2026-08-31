@@ -29,8 +29,9 @@ import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 // excludes the last ~11 visible messages from compression at any point, so
 // compress #2 must fire once enough NEW messages have accumulated past the
 // zone (refs.length >= 25 ⇒ zone starts at m00029, ranges end at m00022).
-// The assertion is sglang's exact validation: in every upstream request, all
-// system/developer messages must form a contiguous leading prefix.
+// The assertion is sglang's exact validation: in every upstream request there
+// is EXACTLY ONE system/developer message, at index 0 (#377 — a second system
+// anywhere, even inside the leading prefix, is a 400).
 
 const TURN_COUNT = 23;
 
@@ -177,19 +178,19 @@ test("e2e #355: multi-segment compress never puts a system message mid-conversat
 
         for (let i = 0; i < captured.length; i++) {
             const sent = JSON.parse(captured[i]!) as { messages: Array<{ role: string; content?: unknown }> };
-            let firstNonSystem = -1;
+            let systemCount = 0;
             for (let j = 0; j < sent.messages.length; j++) {
                 const r = sent.messages[j]!.role;
-                if (r !== "system" && r !== "developer") { firstNonSystem = j; break; }
+                if (r === "system" || r === "developer") systemCount++;
             }
-            if (firstNonSystem === -1) continue;
-            for (let j = firstNonSystem; j < sent.messages.length; j++) {
-                const r = sent.messages[j]!.role;
-                assert.ok(
-                    r !== "system" && r !== "developer",
-                    `upstream request ${i + 1}: role "${r}" at index ${j} AFTER the leading system prefix — sglang would 400 "System message must be at the beginning"`,
-                );
-            }
+            assert.equal(
+                systemCount, 1,
+                `upstream request ${i + 1}: ${systemCount} system/developer messages — sglang requires EXACTLY one at index 0 (#377)`,
+            );
+            assert.equal(
+                sent.messages[0]!.role, "system",
+                `upstream request ${i + 1}: leading message role is "${sent.messages[0]!.role}", expected "system"`,
+            );
         }
 
         const last = JSON.parse(captured[captured.length - 1]!) as { messages: Array<{ role: string; content?: unknown }> };

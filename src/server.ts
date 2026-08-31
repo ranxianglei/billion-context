@@ -25,7 +25,6 @@ import {
 import {
     openaiToCore,
     coreToOpenai,
-    injectOpenaiSystem,
     conversationSignalOpenai,
     type OpenAIRequestBody,
     type OpenAITool,
@@ -65,7 +64,7 @@ import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { consumePluginRegisterFor, flushConversations, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, loadConversations, pipePluginJson, pipePluginResponsesWithStrip, pipeThroughWithUsage, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
-import { hoistMidSystemMessages, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, shouldReserveOutputHeadroom, usageTotals } from "./util.js";
+import { mergeSystemMessages, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, shouldReserveOutputHeadroom, usageTotals } from "./util.js";
 
 import { decodeRequestBody } from "./content-encoding.js";
 
@@ -1427,18 +1426,20 @@ function prepareOpenai(
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model));
         processedMessages = stripKernelSummaries(turn.messages, turn.state);
         reapOrphanBlocks(session, msgs, deactivateBlock);
-        rebuiltMessages = hoistMidSystemMessages(coreToOpenai(processedMessages as BiliMessage[]));
+        rebuiltMessages = coreToOpenai(processedMessages as BiliMessage[]);
 
-        // ONLY the static compress prompt goes into the system message — the
-        // system prompt is the prefix-cache anchor and must be byte-stable
-        // across turns. The nudge (which changes every turn: token count,
-        // growth %, dynamic example) is appended as a trailing user message
-        // instead, mirroring pai-acp's design. Putting the nudge in system
-        // would invalidate the cache every turn.
+        // Only stable content goes into the system message — the client's
+        // original system, the static compress prompt, and the folded block
+        // summaries (merged to one leading message by mergeSystemMessages).
+        // It is the prefix-cache anchor and must be byte-stable across turns.
+        // The nudge (which changes every turn: token count, growth %, dynamic
+        // example) is appended as a trailing user message instead, mirroring
+        // pai-acp's design. Putting the nudge in system would invalidate the
+        // cache every turn.
         const sysParts: string[] = [];
         if (systemText) sysParts.push(systemText);
         if (shouldInject) sysParts.push(buildCompressSystemPrompt(prompts));
-        rebuiltMessages = injectOpenaiSystem(rebuiltMessages, sysParts);
+        rebuiltMessages = mergeSystemMessages(rebuiltMessages, sysParts);
         if (injectTools) {
             toolsOut = injectOpenaiTool(parsed.tools);
         }
