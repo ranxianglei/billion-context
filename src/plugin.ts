@@ -327,7 +327,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     if (entry) entry.lastSeen = Date.now();
     const limit = session.metadata.effectiveContextLimit;
     const mem = remembered.get(session.id);
-    const modelContextLimit = typeof limit === "number" && limit > 0 ? limit : 200000;
+    const modelContextLimit = typeof limit === "number" && limit > 0 ? limit : 0;
     let panel: string | undefined;
     try {
         panel = buildStatusPanel({

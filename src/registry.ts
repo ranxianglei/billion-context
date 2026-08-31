@@ -252,33 +252,70 @@ export function bundledSnapshotLookup(model: string, host?: string): number | un
     return registryLookup(bundledSnapshotRegistry(), model, host);
 }
 
+// Inference-mode suffixes denoting the SAME base model under a different
+// reasoning setting (a "-thinking" variant shares the base model's context
+// window). Longest-first so "-interleaved-thinking" wins over "-thinking".
+const VARIANT_SUFFIXES = [
+    "-interleaved-thinking",
+    "-thinking",
+    "-reasoning",
+    "-extended",
+    "-fast",
+    "-high",
+    "-medium",
+    "-low",
+];
+
+export function modelVariants(name: string): string[] {
+    const variants: string[] = [name];
+    let current = name;
+    for (;;) {
+        let stripped = false;
+        for (const suffix of VARIANT_SUFFIXES) {
+            if (current.length > suffix.length && current.endsWith(suffix)) {
+                current = current.slice(0, -suffix.length);
+                variants.push(current);
+                stripped = true;
+                break;
+            }
+        }
+        if (!stripped) break;
+    }
+    return variants;
+}
+
 function registryLookup(reg: RegistryShape | null, model: string, host?: string): number | undefined {
     if (!reg || !model) return undefined;
     const provider = host ? providerFromHost(host) : undefined;
-    const candidates = provider ? [`${provider}/${model}`, model] : [model];
-    for (const key of candidates) {
-        const entry = reg[key];
-        const ctx = entry?.limit?.context;
-        if (typeof ctx === "number" && ctx > 0) return ctx;
-    }
-    // Relay host (not in HOST_TO_PROVIDER): the bare name can miss while the
-    // model exists under a provider-prefixed key (a relay serving
-    // "deepseek-v4-flash" is stored as "deepseek/deepseek-v4-flash"). Scan
-    // */<model> and adopt the value only when every match agrees — a
-    // conflict means different deployments, and guessing is worse than the
-    // static table. Known-provider hosts keep the old behavior: a miss there
-    // means the model is genuinely unlisted for that provider.
-    if (provider === undefined) {
-        const suffix = `/${model}`;
-        let agreed: number | undefined;
-        for (const key of Object.keys(reg)) {
-            if (!key.endsWith(suffix)) continue;
-            const ctx = reg[key].limit?.context;
-            if (typeof ctx !== "number" || ctx <= 0) continue;
-            if (agreed === undefined) agreed = ctx;
-            else if (agreed !== ctx) return undefined;
+    for (const name of modelVariants(model)) {
+        const candidates = provider ? [`${provider}/${name}`, name] : [name];
+        for (const key of candidates) {
+            const entry = reg[key];
+            const ctx = entry?.limit?.context;
+            if (typeof ctx === "number" && ctx > 0) return ctx;
         }
-        return agreed;
+        // Relay host (not in HOST_TO_PROVIDER): the bare name can miss while
+        // the model exists under a provider-prefixed key (a relay serving
+        // "deepseek-v4-flash" is stored as "deepseek/deepseek-v4-flash"). Scan
+        // */<name> and adopt the value only when every match agrees — a
+        // conflict means different deployments, and guessing is worse than the
+        // static table. A conflicting/missing original name falls through to
+        // the next (stripped) variant. Known-provider hosts keep the old
+        // behavior: a miss there means the model is genuinely unlisted for
+        // that provider.
+        if (provider === undefined) {
+            const suffix = `/${name}`;
+            let agreed: number | undefined;
+            let conflicted = false;
+            for (const key of Object.keys(reg)) {
+                if (!key.endsWith(suffix)) continue;
+                const ctx = reg[key].limit?.context;
+                if (typeof ctx !== "number" || ctx <= 0) continue;
+                if (agreed === undefined) agreed = ctx;
+                else if (agreed !== ctx) { conflicted = true; break; }
+            }
+            if (!conflicted && agreed !== undefined) return agreed;
+        }
     }
     return undefined;
 }

@@ -111,6 +111,13 @@ export function logUnrecognizedPath(log: (level: string, msg: string) => void, u
     }
 }
 
+// Model-enumeration endpoints clients probe at startup (omp's openai-models-list
+// discovery). Expected passthroughs, not unknown protocols — #393: exempt from
+// the warn-level "unrecognized path" log.
+function isModelDiscoveryPath(path: string): boolean {
+    return path.replace(/\/+$/, "").endsWith("/models");
+}
+
 // #300: bili→bili chain marker. When a bili instance forwards a request it has
 // processed upstream, it stamps this header with its own instance id. A bili
 // instance that RECEIVES a request already carrying it knows an upstream bili
@@ -833,7 +840,7 @@ async function handle(
             const pluginWindow = pluginReportedContextWindow(req.headers);
             const launcherWindow = launcherContextWindow(model);
             const configuredWindow = resolveConfiguredContextLimit(opts.routes, embeddedUrl, model);
-            const peekWindow = host ? peekRegistryContext(model, host) : undefined;
+            const peekWindow = peekRegistryContext(model, host);
             let native = betaWindow
                 ?? pluginWindow
                 ?? launcherWindow
@@ -847,7 +854,7 @@ async function handle(
             // negotiation), so it also clears the fallback flag.
             const operatorWindowTuned = resolveCompress(opts.routes, embeddedUrl, model, opts.compress).modelContextLimit !== undefined;
             nativeFromFallback = !betaWindow && !pluginWindow && !launcherWindow && !peekWindow && !configuredWindow && !operatorWindowTuned;
-            if (!native && host) {
+            if (!native) {
                 native = await contextFromRegistry(model, host);
                 if (native) nativeFromFallback = false;
             }
@@ -1074,7 +1081,6 @@ async function handle(
         if (pluginAgent && !pluginConversation) pluginConversation = conversation;
         if (pluginAgent) {
             if (session.metadata.pluginAgent !== pluginAgent) session.metadata.pluginAgent = pluginAgent;
-            session.metadata.effectiveContextLimit = reqConfig.modelContextLimit;
             recordPluginSession(pluginConversation ?? conversation, session.id);
         }
         // Responses, OpenAI-chat AND Anthropic-wire clients that send their
@@ -1115,6 +1121,33 @@ async function handle(
             // not be floored back up (that would undo the self-heal).
             nativeFromFallback = false;
             log("info", `[${session.id}] self-healed context window: ${resolved} → ${learnedLimit} (learned from an upstream overflow)`);
+        } else if (nativeFromFallback && reqModel) {
+            // Self-heal UPWARD — complement of the overflow self-heal above. An
+            // overflow only proves the window is SMALLER; a too-small fallback
+            // guess never overflows (we compress early), so the only signal that
+            // can raise it is a prior SUCCESSFUL turn whose reported input
+            // EXCEEDED the window it was measured under (prevWindow, stored in
+            // metadata at the end of prepare()). A context that merely FIT inside
+            // a larger (e.g. beta) window is not evidence. Fires only on a
+            // low-confidence fallback (nativeFromFallback) — an authoritative
+            // window is never second-guessed from one turn. lastInputTokens is a
+            // lower bound on the real window, so raising to it is safe (overshoot
+            // self-corrects via the overflow path).
+            const prevInput = session.stats.lastInputTokens ?? 0;
+            const prevWindow = session.metadata.lastTurnWindow as number | undefined;
+            const resolved = reqConfig.modelContextLimit;
+            if (prevWindow !== undefined && prevInput > prevWindow && prevInput > resolved && prevInput >= 1000) {
+                const map = (session.metadata.learnedContextLimits as Record<string, number> | undefined) ?? {};
+                const prev = map[reqModel];
+                if (prev === undefined || prevInput > prev) {
+                    map[reqModel] = prevInput;
+                    session.metadata.learnedContextLimits = map;
+                    markDirty(session);
+                }
+                reqConfig = { ...reqConfig, modelContextLimit: prevInput };
+                nativeFromFallback = false;
+                log("info", `[${session.id}] self-healed context window upward: ${resolved} → ${prevInput} (a prior turn used ${prevInput} input tokens, exceeding the fallback window)`);
+            }
         }
         // Reserve the model's OUTPUT budget for this turn from the window so the
         // kernel's nudge/truncate bands sit below (window - maxOutput) and a
@@ -1146,6 +1179,16 @@ async function handle(
             }
             if (reserved !== reqConfig.modelContextLimit) reqConfig = { ...reqConfig, modelContextLimit: reserved };
         }
+        // Record the FINAL effective window (post self-heal + output-headroom)
+        // so the status panel / acp_status show the window the kernel is actually
+        // using, in every mode (plugin AND wire). #393: previously this was set
+        // pre-self-heal and only for plugin sessions, so wire-mode panels fell
+        // back to a hardcoded 200K.
+        session.metadata.effectiveContextLimit = reqConfig.modelContextLimit;
+        // Window THIS turn runs under — read by the NEXT turn's upward self-heal
+        // to tell "context exceeded our window" (evidence) from "context fit
+        // inside a larger window" (not evidence). #393.
+        session.metadata.lastTurnWindow = reqConfig.modelContextLimit;
         // acquireInFlight must precede the lock so evictOldest() cannot flush
         // this session between getSession and lock acquisition (inFlight===0
         // window). Released in the outer finally after forward completes.
@@ -1219,7 +1262,7 @@ async function handle(
         }
     }
     if (!prepared) {
-        if (protocol === null && !opts.passthrough) {
+        if (protocol === null && !opts.passthrough && !isModelDiscoveryPath(urlPath)) {
             logUnrecognizedPath(log, req.url ?? "");
         }
         await forward(req, res, opts, bodyBuffer, null, core, reqConfig, log, route, instanceId, undefined);
