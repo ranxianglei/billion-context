@@ -1,7 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import type { PathLike, SymlinkType } from "node:fs";
+import type { PathLike } from "node:fs";
+type SymlinkKind = "dir" | "file" | "junction";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -1154,7 +1155,7 @@ test("prepareOmpHttpRewrite: EPERM fallback links dir→junction, file→hardlin
     fs.writeFileSync(path.join(home, "settings.json"), "real-settings");
     const rw = [{ key: "a", realUpstream: "http://example.com/v1" }];
     const realSymlinkSync = fs.symlinkSync;
-    fs.symlinkSync = ((target: PathLike, link: PathLike, type?: SymlinkType) => {
+    fs.symlinkSync = ((target: PathLike, link: PathLike, type?: SymlinkKind) => {
         if (type === "junction") return realSymlinkSync(target, link, "junction");
         throw denyErr("EPERM");
     }) as typeof fs.symlinkSync;
@@ -1184,7 +1185,7 @@ test("prepareOmpHttpRewrite: EPERM fallback copies file when hardlink also denie
     const rw = [{ key: "a", realUpstream: "http://example.com/v1" }];
     const realSymlinkSync = fs.symlinkSync;
     const realLinkSync = fs.linkSync;
-    fs.symlinkSync = ((target: PathLike, link: PathLike, type?: SymlinkType) => {
+    fs.symlinkSync = ((target: PathLike, link: PathLike, type?: SymlinkKind) => {
         if (type === "junction") return realSymlinkSync(target, link, "junction");
         throw denyErr("EPERM");
     }) as typeof fs.symlinkSync;
@@ -1296,7 +1297,7 @@ test("prepareOmpHttpRewrite: write-through hardlink is re-pointed, never merged 
     const rw = [{ key: "a", realUpstream: "http://example.com/v1" }];
     const overlay = `${home}-bili`;
     const realSymlinkSync = fs.symlinkSync;
-    fs.symlinkSync = ((target: PathLike, link: PathLike, type?: SymlinkType) => {
+    fs.symlinkSync = ((target: PathLike, link: PathLike, type?: SymlinkKind) => {
         if (type === "junction") return realSymlinkSync(target, link, "junction");
         throw denyErr("EPERM");
     }) as typeof fs.symlinkSync;
@@ -1314,6 +1315,91 @@ test("prepareOmpHttpRewrite: write-through hardlink is re-pointed, never merged 
         assert.equal(fs.existsSync(path.join(home, "settings.json.bili-conflict")), false, "not merged (no .bili-conflict)");
     } finally {
         fs.symlinkSync = realSymlinkSync;
+        if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("prepareOmpHttpRewrite: SQLite set adjudicated by main db — no cross-side WAL splice (#381)", () => {
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-")));
+    fs.writeFileSync(path.join(home, "models.yml"), ["providers:", "  a:", "    baseUrl: http://example.com/v1"].join("\n"));
+    const now = Date.now();
+    fs.writeFileSync(path.join(home, "agent.db"), "real-db");
+    fs.writeFileSync(path.join(home, "agent.db-wal"), "real-wal");
+    const overlay = `${home}-bili`;
+    fs.mkdirSync(overlay);
+    fs.writeFileSync(path.join(overlay, "agent.db"), "overlay-db");
+    fs.writeFileSync(path.join(overlay, "agent.db-wal"), "overlay-wal");
+    // main db: real newer than overlay; wal: overlay newer than real — the
+    // cross-generational splice per-member mtime adjudication would produce.
+    fs.utimesSync(path.join(home, "agent.db"), new Date(now - 10000), new Date(now - 10000));
+    fs.utimesSync(path.join(home, "agent.db-wal"), new Date(now - 50000), new Date(now - 50000));
+    fs.utimesSync(path.join(overlay, "agent.db"), new Date(now - 60000), new Date(now - 60000));
+    fs.utimesSync(path.join(overlay, "agent.db-wal"), new Date(now - 5000), new Date(now - 5000));
+    const rw = [{ key: "a", realUpstream: "http://example.com/v1" }];
+    let tmp: string | undefined;
+    try {
+        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
+        assert.equal(tmp, overlay);
+        assert.equal(fs.readFileSync(path.join(home, "agent.db"), "utf8"), "real-db", "real main db (newer) wins");
+        assert.equal(fs.readFileSync(path.join(home, "agent.db-wal"), "utf8"), "real-wal", "wal comes from the SAME side as the db (no splice)");
+        assert.equal(fs.readFileSync(path.join(home, "agent.db.bili-conflict"), "utf8"), "overlay-db", "losing overlay db preserved");
+        assert.equal(fs.readFileSync(path.join(home, "agent.db-wal.bili-conflict"), "utf8"), "overlay-wal", "losing overlay wal preserved");
+    } finally {
+        if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("prepareOmpHttpRewrite: SQLite -journal sidecar moves with the set, not separately (#381)", () => {
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-")));
+    fs.writeFileSync(path.join(home, "models.yml"), ["providers:", "  a:", "    baseUrl: http://example.com/v1"].join("\n"));
+    const now = Date.now();
+    fs.writeFileSync(path.join(home, "agent.db"), "real-db");
+    const overlay = `${home}-bili`;
+    fs.mkdirSync(overlay);
+    fs.writeFileSync(path.join(overlay, "agent.db"), "overlay-db");
+    fs.writeFileSync(path.join(overlay, "agent.db-journal"), "overlay-journal");
+    // real main db newer than overlay's; the overlay journal must NOT be
+    // spliced in as an active file against the real (newer) db.
+    fs.utimesSync(path.join(home, "agent.db"), new Date(now - 10000), new Date(now - 10000));
+    fs.utimesSync(path.join(overlay, "agent.db"), new Date(now - 60000), new Date(now - 60000));
+    fs.utimesSync(path.join(overlay, "agent.db-journal"), new Date(now - 5000), new Date(now - 5000));
+    const rw = [{ key: "a", realUpstream: "http://example.com/v1" }];
+    let tmp: string | undefined;
+    try {
+        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
+        assert.equal(tmp, overlay);
+        assert.equal(fs.readFileSync(path.join(home, "agent.db"), "utf8"), "real-db", "real main db (newer) wins");
+        assert.equal(fs.existsSync(path.join(home, "agent.db-journal")), false, "journal NOT spliced in as an active file");
+        assert.equal(fs.readFileSync(path.join(home, "agent.db-journal.bili-conflict"), "utf8"), "overlay-journal", "journal preserved as a conflict (same side as the losing db)");
+    } finally {
+        if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("prepareOmpHttpRewrite: conflict rename never clobbers a previous round's loser (#381)", () => {
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-")));
+    fs.writeFileSync(path.join(home, "models.yml"), ["providers:", "  a:", "    baseUrl: http://example.com/v1"].join("\n"));
+    const now = Date.now();
+    fs.writeFileSync(path.join(home, "agent.db"), "real-db");
+    fs.writeFileSync(path.join(home, "agent.db.bili-conflict"), "previous-loser");
+    const overlay = `${home}-bili`;
+    fs.mkdirSync(overlay);
+    fs.writeFileSync(path.join(overlay, "agent.db"), "overlay-db-v1");
+    fs.writeFileSync(path.join(overlay, "agent.db-wal"), "overlay-wal-v1");
+    fs.utimesSync(path.join(home, "agent.db"), new Date(now - 10000), new Date(now - 10000));
+    fs.utimesSync(path.join(overlay, "agent.db"), new Date(now - 60000), new Date(now - 60000));
+    const rw = [{ key: "a", realUpstream: "http://example.com/v1" }];
+    let tmp: string | undefined;
+    try {
+        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
+        assert.equal(tmp, overlay);
+        assert.equal(fs.readFileSync(path.join(home, "agent.db"), "utf8"), "real-db", "real main db (newer) wins");
+        assert.equal(fs.readFileSync(path.join(home, "agent.db.bili-conflict"), "utf8"), "previous-loser", "previous round's loser NOT overwritten");
+        assert.equal(fs.readFileSync(path.join(home, "agent.db.bili-conflict.1"), "utf8"), "overlay-db-v1", "this round's loser gets a suffixed name");
+    } finally {
         if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
         fs.rmSync(home, { recursive: true, force: true });
     }

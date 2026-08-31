@@ -645,28 +645,35 @@ function livePidHoldsOverlay(overlay: string): number | undefined {
 }
 
 /**
- * Link one real-home entry into the overlay: plain symlink first (the Linux/
- * macOS path, and the Windows path when Developer Mode grants
- * SeCreateSymbolicLinkPrivilege). On EPERM/EACCES/EINVAL — the default for an
- * unprivileged Windows process, #381 — fall back to privilege-free links so
- * the overlay is populated instead of silently hollow: directories → junction
- * (mklink /J), files → hardlink (same volume, write-through) → copy.
+ * Link one real-home entry into the overlay. The reparse-point kind is chosen
+ * explicitly from the target's type: on Windows a directory must be a junction
+ * (privilege-free, unambiguous) — libuv's type-omitted default creates a
+ * file-tag symlink for dirs that Win32 readdir(withFileTypes) and some
+ * backup/indexers don't follow (#381 review) — while a file is a 'file'
+ * symlink (needs SeCreateSymbolicLinkPrivilege). Non-Windows ignores the type,
+ * so "dir"/"file" are just plain symlinks there. On EPERM/EACCES/EINVAL — the
+ * default for an unprivileged Windows process, #381 — a file falls back to a
+ * privilege-free hardlink (same volume, write-through) → copy; a directory
+ * retries the junction.
  */
 function linkOverlayEntry(realHome: string, overlay: string, entry: string): boolean {
     const target = path.join(realHome, entry);
     const link = path.join(overlay, entry);
-    try {
-        fs.symlinkSync(target, link);
-        return true;
-    } catch (err) {
-        const code = (err as NodeJS.ErrnoException).code;
-        if (code !== "EPERM" && code !== "EACCES" && code !== "EINVAL") return false;
-    }
     let st: fs.Stats;
     try {
         st = fs.lstatSync(target);
     } catch {
         return false;
+    }
+    const kind: "dir" | "file" | "junction" = st.isDirectory()
+        ? (process.platform === "win32" ? "junction" : "dir")
+        : "file";
+    try {
+        fs.symlinkSync(target, link, kind);
+        return true;
+    } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== "EPERM" && code !== "EACCES" && code !== "EINVAL") return false;
     }
     if (st.isDirectory()) {
         try {
@@ -702,26 +709,61 @@ function isWriteThroughHardlink(overlayPath: string, realPath: string, st: fs.St
     }
 }
 
-/** SQLite three-piece set for a main-db name. A WAL is only valid against its
- *  exact main db, so the set must move as a unit — splitting it corrupts the
+/** SQLite set for a main-db name: the db plus its WAL, shared-memory, and
+ *  rollback-journal sidecars. A WAL/journal is only valid against its exact
+ *  main db, so the set must move as a unit — splitting it corrupts the
  *  database (#381). */
 function sqliteSetMembers(base: string): string[] {
-    return [base, `${base}-wal`, `${base}-shm`];
+    return [base, `${base}-wal`, `${base}-shm`, `${base}-journal`];
+}
+
+/** A `<name>.bili-conflict` target that does not already exist, so a retry
+ *  round never silently overwrites a previous round's preserved loser (#381
+ *  review): renameSync clobbers an existing target, so append `.1`, `.2`, …
+ *  until the name is free. */
+function freeConflictName(dst: string): string {
+    let candidate = `${dst}.bili-conflict`;
+    let n = 1;
+    while (n < 100000) {
+        try {
+            fs.lstatSync(candidate);
+            candidate = `${dst}.bili-conflict.${n}`;
+            n += 1;
+        } catch {
+            return candidate;
+        }
+    }
+    return candidate;
 }
 
 /** Move a SQLite set (see sqliteSetMembers) from overlay to real home as one
- *  unit (#381): all present members move together, and if any rename fails
- *  (real db open/locked on Windows) the moved ones roll back and the set stays
- *  for the next launch. Per member mtime-newer wins (loser → .bili-conflict). */
+ *  unit (#381). The authoritative generation is decided ONCE by the main db's
+ *  mtime — a WAL/journal is only valid against its exact main db, so the whole
+ *  set must come from a single side: per-member mtime adjudication could splice
+ *  a newer main db with a newer WAL from the other side and corrupt the
+ *  database. The winner's members become the real home's active set; every
+ *  losing member is preserved as `<name>.bili-conflict` (never overwritten). A
+ *  set with no main db on either side (orphan sidecars) is stale residue and is
+ *  preserved wholesale as conflicts, never moved in as an active db. If any
+ *  rename fails (real db open/locked on Windows) the moved ones roll back and
+ *  the set stays for the next launch. */
 function mergeSqliteSet(overlay: string, realHome: string, base: string): boolean {
-    const members = sqliteSetMembers(base).filter((m) => {
+    const members = sqliteSetMembers(base);
+    const statFile = (dir: string, m: string): fs.Stats | undefined => {
         try {
-            return fs.lstatSync(path.join(overlay, m)).isFile();
+            const st = fs.lstatSync(path.join(dir, m));
+            return st.isFile() ? st : undefined;
         } catch {
-            return false;
+            return undefined;
         }
-    });
-    if (members.length === 0) return true;
+    };
+    const oMain = statFile(overlay, base);
+    const rMain = statFile(realHome, base);
+    let winner: "overlay" | "real" | "orphan";
+    if (oMain && rMain) winner = rMain.mtimeMs >= oMain.mtimeMs ? "real" : "overlay";
+    else if (oMain) winner = "overlay";
+    else if (rMain) winner = "real";
+    else winner = "orphan";
     const undo: (() => void)[] = [];
     const rollback = (): void => {
         for (const step of undo.reverse()) {
@@ -731,45 +773,38 @@ function mergeSqliteSet(overlay: string, realHome: string, base: string): boolea
         }
         undo.length = 0;
     };
+    const movePreserving = (src: string, dst: string): void => {
+        let dstStat: fs.Stats | undefined;
+        try {
+            dstStat = fs.lstatSync(dst);
+        } catch {}
+        if (dstStat) {
+            if (dstStat.isDirectory()) throw new Error("target is a directory");
+            const conflict = freeConflictName(dst);
+            fs.renameSync(dst, conflict);
+            undo.push(() => fs.renameSync(conflict, dst));
+        }
+        fs.renameSync(src, dst);
+        undo.push(() => fs.renameSync(dst, src));
+    };
+    const preserveAsConflict = (src: string, name: string): void => {
+        const conflict = freeConflictName(path.join(realHome, name));
+        fs.renameSync(src, conflict);
+        undo.push(() => fs.renameSync(conflict, src));
+    };
     try {
         for (const m of members) {
-            const src = path.join(overlay, m);
-            const dst = path.join(realHome, m);
-            let dstStat: fs.Stats | undefined;
-            try {
-                dstStat = fs.lstatSync(dst);
-            } catch {}
-            if (dstStat && dstStat.isDirectory()) {
-                rollback();
-                return false;
+            const o = statFile(overlay, m);
+            const r = statFile(realHome, m);
+            if (winner === "overlay") {
+                if (o) movePreserving(path.join(overlay, m), path.join(realHome, m));
+                else if (r) preserveAsConflict(path.join(realHome, m), m);
+            } else if (winner === "real") {
+                if (o) preserveAsConflict(path.join(overlay, m), m);
+            } else {
+                if (o) preserveAsConflict(path.join(overlay, m), m);
+                else if (r) preserveAsConflict(path.join(realHome, m), m);
             }
-            const srcStat = fs.lstatSync(src);
-            if (dstStat && dstStat.mtimeMs >= srcStat.mtimeMs) {
-                try {
-                    fs.renameSync(src, `${dst}.bili-conflict`);
-                } catch {
-                    rollback();
-                    return false;
-                }
-                undo.push(() => fs.renameSync(`${dst}.bili-conflict`, src));
-                continue;
-            }
-            if (dstStat) {
-                try {
-                    fs.renameSync(dst, `${dst}.bili-conflict`);
-                } catch {
-                    rollback();
-                    return false;
-                }
-                undo.push(() => fs.renameSync(`${dst}.bili-conflict`, dst));
-            }
-            try {
-                fs.renameSync(src, dst);
-            } catch {
-                rollback();
-                return false;
-            }
-            undo.push(() => fs.renameSync(dst, src));
         }
         return true;
     } catch {
@@ -935,7 +970,7 @@ function mergeOverlayEntry(src: string, dst: string): boolean {
     if (st.isDirectory()) {
         if (dstStat && !dstStat.isDirectory()) {
             try {
-                fs.renameSync(dst, `${dst}.bili-conflict`);
+                fs.renameSync(dst, freeConflictName(dst));
                 dstStat = undefined;
             } catch {
                 return false;
@@ -960,7 +995,7 @@ function mergeOverlayEntry(src: string, dst: string): boolean {
     }
     if (dstStat && dstStat.isDirectory()) {
         try {
-            fs.renameSync(src, `${dst}.bili-conflict`);
+            fs.renameSync(src, freeConflictName(dst));
             return true;
         } catch {
             return false;
@@ -982,7 +1017,7 @@ function mergeOverlayEntry(src: string, dst: string): boolean {
     }
     if (dstStat && dstStat.mtimeMs >= st.mtimeMs) {
         try {
-            fs.renameSync(src, `${dst}.bili-conflict`);
+            fs.renameSync(src, freeConflictName(dst));
             return true;
         } catch {
             return false;
@@ -990,7 +1025,7 @@ function mergeOverlayEntry(src: string, dst: string): boolean {
     }
     if (dstStat) {
         try {
-            fs.renameSync(dst, `${dst}.bili-conflict`);
+            fs.renameSync(dst, freeConflictName(dst));
         } catch {
             return false;
         }
