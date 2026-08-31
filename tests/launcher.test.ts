@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import type { PathLike, SymlinkType } from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -1131,6 +1132,189 @@ test("prepareOmpHttpRewrite: returns undefined when models.yml missing", () => {
         const rw = [{ key: "a", realUpstream: "http://example.com/v1" }];
         assert.equal(prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []), undefined);
     } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+// #381: Windows overlay symlink EPERM fallback. Unprivileged Windows
+// processes lack SeCreateSymbolicLinkPrivilege, so plain symlinkSync throws
+// EPERM and the overlay would be silently hollowed (fresh, unconfigured
+// client every launch). Simulated on Linux by denying fs.symlinkSync for
+// non-junction links (junctions stay allowed).
+function denyErr(code: string): NodeJS.ErrnoException {
+    const err = new Error(`${code}: operation not permitted`) as NodeJS.ErrnoException;
+    err.code = code;
+    return err;
+}
+
+test("prepareOmpHttpRewrite: EPERM fallback links dir→junction, file→hardlink, overlay not hollow (#381)", () => {
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-")));
+    fs.writeFileSync(path.join(home, "models.yml"), ["providers:", "  a:", "    baseUrl: http://example.com/v1"].join("\n"));
+    fs.mkdirSync(path.join(home, "sessions"));
+    fs.writeFileSync(path.join(home, "settings.json"), "real-settings");
+    const rw = [{ key: "a", realUpstream: "http://example.com/v1" }];
+    const realSymlinkSync = fs.symlinkSync;
+    fs.symlinkSync = ((target: PathLike, link: PathLike, type?: SymlinkType) => {
+        if (type === "junction") return realSymlinkSync(target, link, "junction");
+        throw denyErr("EPERM");
+    }) as typeof fs.symlinkSync;
+    let tmp: string | undefined;
+    try {
+        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
+        assert.equal(tmp, `${home}-bili`, "overlay returned, not hollow");
+        const overlay = tmp!;
+        assert.equal(fs.lstatSync(path.join(overlay, "sessions")).isSymbolicLink(), true, "dir linked via junction");
+        assert.equal(fs.realpathSync(path.join(overlay, "sessions")), path.join(home, "sessions"), "junction points at real dir");
+        const st = fs.lstatSync(path.join(overlay, "settings.json"));
+        const realSt = fs.lstatSync(path.join(home, "settings.json"));
+        assert.equal(st.isSymbolicLink(), false, "file is a hardlink, not a symlink");
+        assert.equal(st.nlink, 2, "hardlink has nlink 2");
+        assert.ok(st.dev === realSt.dev && st.ino === realSt.ino, "hardlink shares inode with real file");
+    } finally {
+        fs.symlinkSync = realSymlinkSync;
+        if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("prepareOmpHttpRewrite: EPERM fallback copies file when hardlink also denied (#381)", () => {
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-")));
+    fs.writeFileSync(path.join(home, "models.yml"), ["providers:", "  a:", "    baseUrl: http://example.com/v1"].join("\n"));
+    fs.writeFileSync(path.join(home, "settings.json"), "real-settings");
+    const rw = [{ key: "a", realUpstream: "http://example.com/v1" }];
+    const realSymlinkSync = fs.symlinkSync;
+    const realLinkSync = fs.linkSync;
+    fs.symlinkSync = ((target: PathLike, link: PathLike, type?: SymlinkType) => {
+        if (type === "junction") return realSymlinkSync(target, link, "junction");
+        throw denyErr("EPERM");
+    }) as typeof fs.symlinkSync;
+    fs.linkSync = (() => { throw denyErr("EPERM"); }) as typeof fs.linkSync;
+    let tmp: string | undefined;
+    try {
+        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
+        assert.equal(tmp, `${home}-bili`);
+        const st = fs.lstatSync(path.join(tmp!, "settings.json"));
+        assert.equal(st.isSymbolicLink(), false, "file is a copy, not a symlink");
+        assert.equal(st.nlink, 1, "copy has nlink 1 (not a hardlink)");
+        assert.equal(fs.readFileSync(path.join(tmp!, "settings.json"), "utf8"), "real-settings", "copy content matches");
+    } finally {
+        fs.symlinkSync = realSymlinkSync;
+        fs.linkSync = realLinkSync;
+        if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("prepareOmpHttpRewrite: all link fallbacks fail → hollow overlay → returns undefined (#381)", () => {
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-")));
+    fs.writeFileSync(path.join(home, "models.yml"), ["providers:", "  a:", "    baseUrl: http://example.com/v1"].join("\n"));
+    fs.mkdirSync(path.join(home, "sessions"));
+    fs.writeFileSync(path.join(home, "settings.json"), "real-settings");
+    const rw = [{ key: "a", realUpstream: "http://example.com/v1" }];
+    const realSymlinkSync = fs.symlinkSync;
+    const realLinkSync = fs.linkSync;
+    const realCopyFileSync = fs.copyFileSync;
+    fs.symlinkSync = (() => { throw denyErr("EPERM"); }) as typeof fs.symlinkSync;
+    fs.linkSync = (() => { throw denyErr("EPERM"); }) as typeof fs.linkSync;
+    fs.copyFileSync = (() => { throw denyErr("EPERM"); }) as typeof fs.copyFileSync;
+    try {
+        const tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
+        assert.equal(tmp, undefined, "hollow overlay → undefined (fail loudly, not silent)");
+    } finally {
+        fs.symlinkSync = realSymlinkSync;
+        fs.linkSync = realLinkSync;
+        fs.copyFileSync = realCopyFileSync;
+        fs.rmSync(`${home}-bili`, { recursive: true, force: true });
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("prepareOmpHttpRewrite: SQLite three-piece set (.db/.db-wal/.db-shm) moves as a unit (#381)", () => {
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-")));
+    fs.writeFileSync(path.join(home, "models.yml"), ["providers:", "  a:", "    baseUrl: http://example.com/v1"].join("\n"));
+    const rw = [{ key: "a", realUpstream: "http://example.com/v1" }];
+    const overlay = `${home}-bili`;
+    let tmp: string | undefined;
+    try {
+        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
+        assert.equal(tmp, overlay);
+        fs.writeFileSync(path.join(overlay, "agent.db"), "db-content");
+        fs.writeFileSync(path.join(overlay, "agent.db-wal"), "wal-content");
+        fs.writeFileSync(path.join(overlay, "agent.db-shm"), "shm-content");
+        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
+        assert.equal(fs.readFileSync(path.join(home, "agent.db"), "utf8"), "db-content", "db moved to real home");
+        assert.equal(fs.readFileSync(path.join(home, "agent.db-wal"), "utf8"), "wal-content", "wal moved with the db");
+        assert.equal(fs.readFileSync(path.join(home, "agent.db-shm"), "utf8"), "shm-content", "shm moved with the db");
+        assert.equal(fs.existsSync(path.join(overlay, "agent.db")), false, "db left the overlay");
+        assert.equal(fs.existsSync(path.join(overlay, "agent.db-wal")), false, "wal left the overlay");
+        assert.equal(fs.existsSync(path.join(overlay, "agent.db-shm")), false, "shm left the overlay");
+    } finally {
+        if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("prepareOmpHttpRewrite: SQLite set merge failure rolls back, keeps set in overlay (#381)", () => {
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-")));
+    fs.writeFileSync(path.join(home, "models.yml"), ["providers:", "  a:", "    baseUrl: http://example.com/v1"].join("\n"));
+    fs.writeFileSync(path.join(home, "agent.db"), "real-original-db");
+    const old = new Date(Date.now() - 60000);
+    fs.utimesSync(path.join(home, "agent.db"), old, old);
+    const rw = [{ key: "a", realUpstream: "http://example.com/v1" }];
+    const overlay = `${home}-bili`;
+    let tmp: string | undefined;
+    const realRenameSync = fs.renameSync;
+    try {
+        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
+        assert.equal(tmp, overlay);
+        fs.rmSync(path.join(overlay, "agent.db"));
+        fs.writeFileSync(path.join(overlay, "agent.db"), "overlay-db");
+        fs.writeFileSync(path.join(overlay, "agent.db-wal"), "overlay-wal");
+        fs.writeFileSync(path.join(overlay, "agent.db-shm"), "overlay-shm");
+        fs.renameSync = ((src: PathLike, dst: PathLike) => {
+            if (String(src).endsWith("agent.db-shm")) throw denyErr("EPERM");
+            return realRenameSync(src, dst);
+        }) as typeof fs.renameSync;
+        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
+        assert.equal(fs.readFileSync(path.join(home, "agent.db"), "utf8"), "real-original-db", "real db restored after rollback");
+        assert.equal(fs.existsSync(path.join(home, "agent.db-wal")), false, "wal rolled back to overlay");
+        assert.equal(fs.existsSync(path.join(home, "agent.db-shm")), false, "shm rolled back to overlay");
+        assert.equal(fs.readFileSync(path.join(overlay, "agent.db"), "utf8"), "overlay-db", "db stays in overlay");
+        assert.equal(fs.readFileSync(path.join(overlay, "agent.db-wal"), "utf8"), "overlay-wal", "wal stays in overlay");
+        assert.equal(fs.readFileSync(path.join(overlay, "agent.db-shm"), "utf8"), "overlay-shm", "shm stays in overlay");
+    } finally {
+        fs.renameSync = realRenameSync;
+        if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("prepareOmpHttpRewrite: write-through hardlink is re-pointed, never merged back (#381)", () => {
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-")));
+    fs.writeFileSync(path.join(home, "models.yml"), ["providers:", "  a:", "    baseUrl: http://example.com/v1"].join("\n"));
+    fs.writeFileSync(path.join(home, "settings.json"), "real-settings");
+    const rw = [{ key: "a", realUpstream: "http://example.com/v1" }];
+    const overlay = `${home}-bili`;
+    const realSymlinkSync = fs.symlinkSync;
+    fs.symlinkSync = ((target: PathLike, link: PathLike, type?: SymlinkType) => {
+        if (type === "junction") return realSymlinkSync(target, link, "junction");
+        throw denyErr("EPERM");
+    }) as typeof fs.symlinkSync;
+    let tmp: string | undefined;
+    try {
+        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
+        assert.equal(tmp, overlay);
+        assert.equal(fs.lstatSync(path.join(overlay, "settings.json")).nlink, 2, "file linked as a hardlink");
+        fs.appendFileSync(path.join(overlay, "settings.json"), "-appended");
+        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
+        assert.equal(fs.readFileSync(path.join(home, "settings.json"), "utf8"), "real-settings-appended", "write-through reached the real file");
+        const st = fs.lstatSync(path.join(overlay, "settings.json"));
+        assert.equal(st.isSymbolicLink(), false, "re-pointed as a hardlink, not a symlink");
+        assert.equal(st.nlink, 2, "still a hardlink after re-point");
+        assert.equal(fs.existsSync(path.join(home, "settings.json.bili-conflict")), false, "not merged (no .bili-conflict)");
+    } finally {
+        fs.symlinkSync = realSymlinkSync;
+        if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
         fs.rmSync(home, { recursive: true, force: true });
     }
 });

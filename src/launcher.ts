@@ -644,6 +644,140 @@ function livePidHoldsOverlay(overlay: string): number | undefined {
     return pid;
 }
 
+/**
+ * Link one real-home entry into the overlay: plain symlink first (the Linux/
+ * macOS path, and the Windows path when Developer Mode grants
+ * SeCreateSymbolicLinkPrivilege). On EPERM/EACCES/EINVAL — the default for an
+ * unprivileged Windows process, #381 — fall back to privilege-free links so
+ * the overlay is populated instead of silently hollow: directories → junction
+ * (mklink /J), files → hardlink (same volume, write-through) → copy.
+ */
+function linkOverlayEntry(realHome: string, overlay: string, entry: string): boolean {
+    const target = path.join(realHome, entry);
+    const link = path.join(overlay, entry);
+    try {
+        fs.symlinkSync(target, link);
+        return true;
+    } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== "EPERM" && code !== "EACCES" && code !== "EINVAL") return false;
+    }
+    let st: fs.Stats;
+    try {
+        st = fs.lstatSync(target);
+    } catch {
+        return false;
+    }
+    if (st.isDirectory()) {
+        try {
+            fs.symlinkSync(target, link, "junction");
+            return true;
+        } catch {
+            return false;
+        }
+    }
+    try {
+        fs.linkSync(target, link);
+        return true;
+    } catch {
+        try {
+            fs.copyFileSync(target, link);
+            return true;
+        } catch {
+            return false;
+        }
+    }
+}
+
+/** True when overlayPath hardlinks realPath (same dev+ino, nlink>1) — the
+ *  Windows file fallback (#381). Its writes already reached the real home, so
+ *  on refresh it is re-pointed (drop + re-link), never merged back. */
+function isWriteThroughHardlink(overlayPath: string, realPath: string, st: fs.Stats): boolean {
+    if (st.isDirectory() || st.isSymbolicLink() || st.nlink <= 1) return false;
+    try {
+        const realSt = fs.lstatSync(realPath);
+        return st.dev === realSt.dev && st.ino === realSt.ino;
+    } catch {
+        return false;
+    }
+}
+
+/** SQLite three-piece set for a main-db name. A WAL is only valid against its
+ *  exact main db, so the set must move as a unit — splitting it corrupts the
+ *  database (#381). */
+function sqliteSetMembers(base: string): string[] {
+    return [base, `${base}-wal`, `${base}-shm`];
+}
+
+/** Move a SQLite set (see sqliteSetMembers) from overlay to real home as one
+ *  unit (#381): all present members move together, and if any rename fails
+ *  (real db open/locked on Windows) the moved ones roll back and the set stays
+ *  for the next launch. Per member mtime-newer wins (loser → .bili-conflict). */
+function mergeSqliteSet(overlay: string, realHome: string, base: string): boolean {
+    const members = sqliteSetMembers(base).filter((m) => {
+        try {
+            return fs.lstatSync(path.join(overlay, m)).isFile();
+        } catch {
+            return false;
+        }
+    });
+    if (members.length === 0) return true;
+    const undo: (() => void)[] = [];
+    const rollback = (): void => {
+        for (const step of undo.reverse()) {
+            try {
+                step();
+            } catch {}
+        }
+        undo.length = 0;
+    };
+    try {
+        for (const m of members) {
+            const src = path.join(overlay, m);
+            const dst = path.join(realHome, m);
+            let dstStat: fs.Stats | undefined;
+            try {
+                dstStat = fs.lstatSync(dst);
+            } catch {}
+            if (dstStat && dstStat.isDirectory()) {
+                rollback();
+                return false;
+            }
+            const srcStat = fs.lstatSync(src);
+            if (dstStat && dstStat.mtimeMs >= srcStat.mtimeMs) {
+                try {
+                    fs.renameSync(src, `${dst}.bili-conflict`);
+                } catch {
+                    rollback();
+                    return false;
+                }
+                undo.push(() => fs.renameSync(`${dst}.bili-conflict`, src));
+                continue;
+            }
+            if (dstStat) {
+                try {
+                    fs.renameSync(dst, `${dst}.bili-conflict`);
+                } catch {
+                    rollback();
+                    return false;
+                }
+                undo.push(() => fs.renameSync(`${dst}.bili-conflict`, dst));
+            }
+            try {
+                fs.renameSync(src, dst);
+            } catch {
+                rollback();
+                return false;
+            }
+            undo.push(() => fs.renameSync(dst, src));
+        }
+        return true;
+    } catch {
+        rollback();
+        return false;
+    }
+}
+
 function refreshOverlayHome(realHome: string, overlay: string, generatedFile: string): boolean {
     try {
         fs.mkdirSync(overlay, { recursive: true });
@@ -664,7 +798,36 @@ function refreshOverlayHome(realHome: string, overlay: string, generatedFile: st
         for (const entry of fs.readdirSync(realHome)) realEntries.add(entry);
     } catch {}
     try {
-        for (const entry of fs.readdirSync(overlay)) {
+        let overlayEntries: string[];
+        try {
+            overlayEntries = fs.readdirSync(overlay);
+        } catch {
+            overlayEntries = [];
+        }
+        // SQLite sets in the overlay root move as a unit (#381). A set whose
+        // main db is a write-through hardlink keeps its -wal/-shm in the
+        // overlay (SQLite recovers them in place on next open) and only
+        // re-points the db; any other set moves wholesale.
+        const dbSets: { base: string; keepSidecars: boolean }[] = [];
+        for (const entry of overlayEntries) {
+            if (!entry.endsWith(".db") || entry === generatedFile) continue;
+            const members = sqliteSetMembers(entry);
+            if (!members.some((m) => m !== entry && overlayEntries.includes(m))) continue;
+            let mainSt: fs.Stats | undefined;
+            try {
+                mainSt = fs.lstatSync(path.join(overlay, entry));
+            } catch {}
+            const keepSidecars =
+                mainSt !== undefined && isWriteThroughHardlink(path.join(overlay, entry), path.join(realHome, entry), mainSt);
+            dbSets.push({ base: entry, keepSidecars });
+        }
+        const skipEntries = new Set<string>();
+        for (const { base, keepSidecars } of dbSets) {
+            for (const m of sqliteSetMembers(base)) {
+                if (keepSidecars ? m !== base : true) skipEntries.add(m);
+            }
+        }
+        for (const entry of overlayEntries) {
             if (entry === generatedFile) continue;
             const overlayPath = path.join(overlay, entry);
             if (entry.startsWith(`.${generatedFile}.`) && entry.endsWith(".tmp")) {
@@ -673,6 +836,7 @@ function refreshOverlayHome(realHome: string, overlay: string, generatedFile: st
                 } catch {}
                 continue;
             }
+            if (skipEntries.has(entry)) continue;
             let st: fs.Stats;
             try {
                 st = fs.lstatSync(overlayPath);
@@ -691,7 +855,12 @@ function refreshOverlayHome(realHome: string, overlay: string, generatedFile: st
                     } catch {}
                 }
             } else if (realEntries.has(entry)) {
-                if (mergeOverlayEntry(overlayPath, path.join(realHome, entry))) {
+                const realPath = path.join(realHome, entry);
+                if (isWriteThroughHardlink(overlayPath, realPath, st)) {
+                    try {
+                        fs.unlinkSync(overlayPath);
+                    } catch {}
+                } else if (mergeOverlayEntry(overlayPath, realPath)) {
                     try {
                         fs.rmSync(overlayPath, { recursive: true, force: true });
                     } catch {}
@@ -700,11 +869,53 @@ function refreshOverlayHome(realHome: string, overlay: string, generatedFile: st
                 }
             }
         }
+        for (const { base, keepSidecars } of dbSets) {
+            if (keepSidecars) continue;
+            if (!mergeSqliteSet(overlay, realHome, base)) {
+                console.error(
+                    `bili: could not merge the SQLite set ${base} / ${base}-wal / ${base}-shm into ${realHome} ` +
+                        `(the real db is likely open/locked) — kept in the overlay, retry on the next launch.`,
+                );
+            }
+        }
+        let accessible = 0;
+        let total = 0;
+        const linkFailures: string[] = [];
         for (const entry of realEntries) {
             if (entry === generatedFile) continue;
+            total += 1;
+            const overlayPath = path.join(overlay, entry);
+            let present = false;
             try {
-                fs.symlinkSync(path.join(realHome, entry), path.join(overlay, entry));
+                fs.lstatSync(overlayPath);
+                present = true;
             } catch {}
+            // A correct link left in place by the per-entry loop (or a SQLite
+            // set that failed to merge and rolled back) already makes the entry
+            // accessible — re-linking would EEXIST, so skip it.
+            if (present) {
+                accessible += 1;
+                continue;
+            }
+            if (linkOverlayEntry(realHome, overlay, entry)) {
+                accessible += 1;
+            } else {
+                linkFailures.push(entry);
+            }
+        }
+        if (total > 0 && accessible === 0) {
+            console.error(
+                `bili: overlay ${overlay} is HOLLOW — none of ${total} real-home entries is reachable ` +
+                    `(on Windows, symlink creation is denied without Developer Mode and the junction/hardlink/copy fallbacks also failed). ` +
+                    `The client will start from its real home without the bili config rewrite.`,
+            );
+            return false;
+        }
+        if (linkFailures.length > 0) {
+            console.error(
+                `bili: overlay ${overlay} — could not link ${linkFailures.length} entr${linkFailures.length === 1 ? "y" : "ies"}: ${linkFailures.join(", ")}. ` +
+                    `The client may miss those (on Windows, enable Developer Mode for full symlink support).`,
+            );
         }
     } catch {}
     return true;
