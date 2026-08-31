@@ -686,7 +686,7 @@ test("stopProxy: no-op when child missing pid", () => {
     );
 });
 
-test("stopProxy: kills the owned child", () => {
+test("stopProxy: POSIX kills the owned child, win32 defers to the parent-gone watcher (#414)", () => {
     let killed = false;
     const child: SpawnChild = {
         pid: 77777,
@@ -696,7 +696,11 @@ test("stopProxy: kills the owned child", () => {
         },
     };
     stopProxy({ origin: "http://127.0.0.1:8787", port: 8787, reused: false, child });
-    assert.equal(killed, true);
+    if (process.platform === "win32") {
+        assert.equal(killed, false, "win32 child.kill is TerminateProcess (no flush) — shutdown belongs to BILI_PARENT_PID watcher");
+    } else {
+        assert.equal(killed, true);
+    }
 });
 
 test("isOnPath: finds a known binary on PATH, misses bogus name", () => {
