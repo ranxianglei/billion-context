@@ -16,6 +16,7 @@ import {
 } from "../compress-tool.js";
 import { applyRanges } from "../stream.js";
 import { resolveDecompress } from "../decompress-shared.js";
+import { handleSearchContext } from "../search-context.js";
 import { buildVisibilityMarker } from "../compress-loop.js";
 import { fetchWithRetry, UpstreamHttpError } from "../fetch-util.js";
 import { proxyDispatcher } from "../upstream-proxy.js";
@@ -109,17 +110,7 @@ export function executeProxyTool(
         return resolveDecompress(args, ctx);
     }
     if (toolName === "search_context") {
-        const query = typeof args.query === "string" ? args.query : "";
-        if (query.length === 0) return "[search_context FAILED: query is required]";
-        const limit = typeof args.limit === "number" && args.limit > 0 ? Math.floor(args.limit) : 5;
-        const blocks = ctx.core.search(query, ctx.session.state).slice(0, limit);
-        if (blocks.length === 0) return `[No blocks matched "${query}"]`;
-        const lines = blocks.map((b) => {
-            const topic = b.topic ?? "(no topic)";
-            const preview = b.summary.length > 200 ? b.summary.slice(0, 200) + "..." : b.summary;
-            return `${b.blockId} (T${b.tier}) "${topic}"\n  ${preview}`;
-        });
-        return `Found ${blocks.length} block(s) for "${query}":\n\n${lines.join("\n\n")}`;
+        return handleSearchContext(args, ctx.session.state, ctx.messages);
     }
     if (toolName === "acp_status") {
         return handleAcpStatus(args, ctx);
