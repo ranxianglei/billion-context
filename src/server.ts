@@ -67,6 +67,7 @@ import { consumePluginRegisterFor, flushConversations, handlePluginManifest, han
 import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import { hoistMidSystemMessages, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, shouldReserveOutputHeadroom, usageTotals } from "./util.js";
+import { BILI_TUNNEL_HEADER, checkTunnelDestination, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
 
 import { decodeRequestBody } from "./content-encoding.js";
 
@@ -232,7 +233,7 @@ function buildForwardHeaders(headers: Record<string, string>): Record<string, st
     return out;
 }
 
-export function resolveUpstream(_opts: ProxyOptions, reqUrl: string, req?: http.IncomingMessage): { upstream: string; rewrittenUrl: string; explicitProtocol?: "openai" | "anthropic" | "responses" } | undefined {
+export function resolveUpstream(_opts: ProxyOptions, reqUrl: string, req?: http.IncomingMessage): { upstream: string; rewrittenUrl: string; explicitProtocol?: "openai" | "anthropic" | "responses"; tunnel?: boolean } | undefined {
     // MITM mode: the request arrived over a CONNECT tunnel we terminated
     // locally (client set HTTP_PROXY and issued CONNECT host:443). The socket
     // carries the real upstream origin; the request path has no /bili/ prefix
@@ -273,7 +274,7 @@ export function resolveUpstream(_opts: ProxyOptions, reqUrl: string, req?: http.
         if (rest.startsWith("http://") || rest.startsWith("https://")) {
             try {
                 const u = new URL(rest);
-                return { upstream: `${u.protocol}//${u.host}`, rewrittenUrl: rest, explicitProtocol };
+                return { upstream: `${u.protocol}//${u.host}`, rewrittenUrl: rest, explicitProtocol, tunnel: true };
             } catch {
                 // malformed embedded URL
             }
@@ -301,6 +302,11 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     await initSessions();
     loadConversations();
     log("info", `[persist] ${getStore().enabled ? "enabled" : "disabled"}`);
+    // #405 (silent env knobs): the tunnel allowlist is security-relevant —
+    // surface it at startup so a remote-client deployment shows WHY private
+    // destinations pass or fail.
+    const tunnelAllowlist = tunnelAllowlistFromEnv();
+    if (tunnelAllowlist.length > 0) log("info", `[tunnel] remote-client allowlist: ${tunnelAllowlist.join(", ")}`);
     if (filePath) {
         log("info", `[log] writing to ${filePath}`);
     }
@@ -593,6 +599,18 @@ async function handle(
     // in that case we still must NOT expose management to the LAN. Only the
     // proxy /bili/ and CONNECT (model traffic) endpoints remain open to all.
     const isAdminPath = req.url === "/__bili/" || req.url?.startsWith("/__bili/") || req.url === "/__acp/" || req.url?.startsWith("/__acp/");
+    // #409: management must never be reachable THROUGH the bili tunnel, not
+    // even from a loopback client: the tunnel's inner connection originates
+    // from the proxy itself, so the remoteAddress gate alone is satisfied and
+    // a `--host 0.0.0.0` peer could otherwise PUT /__bili/config over the
+    // tunnel. forward() stamps this marker on every /bili/ absolute-URL
+    // forward; clients have no legitimate reason to send it, and a spoofed
+    // value only locks the spoofer out of admin paths.
+    if (isAdminPath && headerValue(req, BILI_TUNNEL_HEADER) !== undefined) {
+        res.writeHead(403, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "management endpoints are not reachable through the bili tunnel" }));
+        return;
+    }
     if (isAdminPath && !isLoopbackAddress(req.socket.remoteAddress)) {
         res.writeHead(403, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: "management endpoints are loopback-only; access denied for " + (req.socket.remoteAddress ?? "unknown") }));
@@ -754,6 +772,23 @@ async function handle(
         urlPath = url.split("?", 2)[0];
         responsesCompact = urlPath.endsWith("/responses/compact");
         route = resolveUpstream(opts, req.url ?? "", req);
+        // #409: destination admission for the zero-config /bili/ absolute-URL
+        // tunnel. CONNECT has its own gates (mitm.ts); this is the /bili/
+        // counterpart — self-proxy, link-local/metadata always denied;
+        // loopback/private denied for remote clients unless allowlisted.
+        if (route?.tunnel) {
+            const verdict = await checkTunnelDestination(route.upstream, {
+                selfPort: req.socket.localPort ?? undefined,
+                clientLoopback: isLoopbackAddress(req.socket.remoteAddress),
+                allowlist: tunnelAllowlistFromEnv(),
+            });
+            if (!verdict.ok) {
+                log("warn", `[tunnel] denied ${maskUrlsInText(route.upstream)}: ${verdict.message}`);
+                res.writeHead(403, { "content-type": "application/json" });
+                res.end(JSON.stringify({ error: verdict.message, code: "tunnel_destination_denied", detail: verdict.code }));
+                return;
+            }
+        }
         upstreamOrigin = route ? route.upstream : /^https?:\/\//i.test(url) ? new URL(url).origin : opts.upstream;
         protocol =
             route?.explicitProtocol
@@ -2041,6 +2076,10 @@ function buildForwardTarget(
     // request; a passthrough leaves the inbound marker — if any — intact so it
     // keeps propagating down the chain).
     if (hopMarker !== undefined) headers[BILI_HOP_HEADER] = hopMarker;
+    // #409: mark every /bili/ absolute-URL forward so a management plane
+    // reached through this tunnel (self, NAT hairpin, chained bili) can
+    // recognize and reject it — see the admin gate in handle().
+    if (route?.tunnel) headers[BILI_TUNNEL_HEADER] = "1";
     headers["host"] = new URL(upstreamUrl).host;
     // codex advertises its own server-side context compaction via this beta
     // feature. It conflicts with bili's client-side compress (bili IS the
