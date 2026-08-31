@@ -471,7 +471,6 @@ export async function handlePluginTool(
                 messages,
                 session,
                 log: (m) => deps.log("info", `[${session.id}] [plugin] ${m}`),
-                nudge: mem?.nudge,
             }, callId);
         });
     } catch (err) {

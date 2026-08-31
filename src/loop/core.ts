@@ -1,14 +1,11 @@
 import {
-    buildStatusReport,
-    estimateTokensFast,
-    formatRanges,
     hideConsumedCompressCalls,
     type CompressionCore,
     type Config,
     type CoreMessage,
-    type NudgeDecision,
 } from "acp-kernel";
-import { lastCompressSuffix, preCompactionArchiveOf, type Session } from "../session.js";
+import { handleAcpStatus } from "../acp-status.js";
+import { lastCompressSuffix, type Session } from "../session.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import {
     parseCompressInput,
@@ -45,7 +42,6 @@ export interface LoopCtx {
     proxyUrl?: string;
     textProtocol?: boolean;
     debug?: boolean;
-    nudge?: NudgeDecision;
     /** #422: host hook that re-runs the kernel fold (processTurn) on the
      *  original messages with the CURRENT session state, re-attaching this
      *  loop's round records. Called after a successful compress so the
@@ -134,41 +130,6 @@ export function executeProxyTool(
         return handleAcpStatus(args, ctx);
     }
     return `[Unknown proxy tool: ${toolName}]`;
-}
-
-// Aligns with billion-context-pi's handleStatus: appends compressible ranges
-// to the default overview so the model picks valid refs (else it guesses
-// covered/protected refs → 0-char compress failures).
-function handleAcpStatus(args: Record<string, unknown>, ctx: LoopCtx): string {
-    const scope = typeof args.scope === "string" ? (args.scope as "compressed" | "uncompressed") : undefined;
-    const view = typeof args.view === "string" ? (args.view as "ranges" | "messages") : undefined;
-    const tool = typeof args.tool === "string" ? args.tool : undefined;
-    const sort = typeof args.sort === "string" ? (args.sort as "size" | "time" | "tool" | "age") : undefined;
-    const limit = typeof args.limit === "number" ? args.limit : undefined;
-    const base = buildStatusReport(ctx.session.state, ctx.messages, estimateTokensFast, { scope, view, tool, sort, limit });
-    if (scope) return base;
-    const nudge = ctx.nudge;
-    const ranges = nudge?.compressibleRanges ?? [];
-    const protectedRanges = nudge?.protectedRanges ?? [];
-    const archive = preCompactionArchiveOf(ctx.session);
-    const archivedIds = Object.keys(archive);
-    const extra: string[] = [];
-    if (nudge) {
-        extra.push("");
-        extra.push(nudge.shouldInject ? `Nudge: ACTIVE — ${nudge.reason}` : `Nudge: idle — ${nudge.reason}`);
-    }
-    if (ranges.length > 0 || protectedRanges.length > 0) {
-        extra.push("");
-        extra.push(formatRanges(ranges, protectedRanges));
-    }
-    if (archivedIds.length > 0) {
-        extra.push("");
-        extra.push(`PRE-COMPACTION ARCHIVE — ${archivedIds.length} block(s): content was replaced by the client's native compaction summary, so it is no longer in the session history and decompress is unavailable.`);
-        for (const id of archivedIds) {
-            extra.push(`  ${id} — ${archive[id].reason}`);
-        }
-    }
-    return extra.length > 0 ? `${base}\n${extra.join("\n")}` : base;
 }
 
 function recordUsage(

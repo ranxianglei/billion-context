@@ -1,10 +1,9 @@
 import {
-    buildStatusReport,
-    estimateTokensFast,
     type CompressionCore,
     type Config,
     type CoreMessage,
 } from "acp-kernel";
+import { handleAcpStatus } from "./acp-status.js";
 import { lastCompressSuffix, type Session } from "./session.js";
 import { parseCompressInput, PROXY_TOOL_NAMES, MUTATING_PROXY_TOOLS, COMPRESS_TOOL_NAME, ACP_TEXT_OPEN, ACP_TEXT_CLOSE } from "./compress-tool.js";
 import { log as loggerLog } from "./logger.js";
@@ -102,7 +101,7 @@ function executeProxyTool(
         return `Found ${blocks.length} block(s) for "${query}":\n\n${lines.join("\n\n")}`;
     }
     if (toolName === "acp_status") {
-        return buildStatusReport(ctx.session.state, ctx.messages, estimateTokensFast);
+        return handleAcpStatus(args, ctx);
     }
     return `[Unknown proxy tool: ${toolName}]`;
 }
