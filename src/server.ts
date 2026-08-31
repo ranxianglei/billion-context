@@ -380,7 +380,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             );
         }
         if (opts.debug) {
-            log("info", `[debug] build features: raw-HTTP-capture(on) | remote_compaction_v2-strip(on) | cert-MITM-launcher(on) | strip-acp-summary(on) — seeing this line confirms the launcher build (not registry 0.1.34)`);
+            log("info", `[debug] build features: raw-HTTP-capture(${bodyDumpEnabled() ? "on" : "off"}) | remote_compaction_v2-strip(on) | cert-MITM-launcher(on) | strip-acp-summary(on) — seeing this line confirms the launcher build (not registry 0.1.34)`);
         }
     });
     // Listen errors (EADDRINUSE port taken, EACCES privileged port, EAFNOSUPPORT
