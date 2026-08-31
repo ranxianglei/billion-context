@@ -492,6 +492,16 @@ type Prepared = {
     codexForge?: { kind: "endpoint" | "trigger"; body: string; contentType: string };
 };
 
+// #388: side requests (title-gen etc.) share the main session key but must not
+// touch kernel state. Identified by a tiny output budget (same heuristic as
+// prepareOpenai's isTitleGen); a missing/non-positive budget is never a side req.
+const SIDE_REQUEST_MAX_TOKENS = 200;
+export function isSideRequest(parsed: unknown): boolean {
+    if (!parsed || typeof parsed !== "object") return false;
+    const p = parsed as Record<string, unknown>;
+    const raw = p.max_tokens ?? p.max_completion_tokens ?? p.max_output_tokens;
+    return typeof raw === "number" && raw > 0 && raw <= SIDE_REQUEST_MAX_TOKENS;
+}
 
 function isTrustedAdminOrigin(origin: string | undefined, host: string | undefined, trustedHosts: Set<string>): boolean {
     // Host must be one of OUR listen identities regardless of whether an
@@ -1093,6 +1103,14 @@ async function handle(
             }
         }
         const pluginMode = pluginAgent !== undefined;
+        // #388: side requests (title-gen etc.) share the main session key but
+        // must not touch kernel state (processTurn/snapshot/usage would pollute
+        // the main view) — pure passthrough, prepared=null.
+        if (!countTokens && !responsesCompact && protocol !== null && isSideRequest(parsed)) {
+            log("info", `[${session.id}] side request (max_tokens<=${SIDE_REQUEST_MAX_TOKENS}) → pure passthrough, kernel state untouched`);
+            await forward(req, res, opts, bodyBuffer, null, core, reqConfig, log, route, instanceId, affinity);
+            return;
+        }
         // Self-heal the context window: a prior upstream overflow may have
         // taught us the real window (forward()'s overflow detection persists it
         // to metadata.learnedContextLimits, keyed by model, or the legacy scalar
