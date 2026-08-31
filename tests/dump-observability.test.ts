@@ -36,6 +36,15 @@ test("logUnrecognizedPath: distinct paths are counted independently", () => {
     assert.ok(lines[1].msg.includes("/p2"));
 });
 
+test("logUnrecognizedPath: a varying query string does not split the per-path key", () => {
+    const lines: Line[] = [];
+    const log = (level: string, msg: string) => { lines.push({ level, msg }); };
+    for (let i = 0; i < 4; i++) logUnrecognizedPath(log, `/api/v1/event/report?ts=${i}`);
+    assert.equal(lines.length, 4);
+    assert.equal(lines[3].level, "info");
+    assert.ok(lines[3].msg.includes("suppressed"));
+});
+
 // #362: a raw dump that fails (disk full, locked dir, EPERM) must not break the
 // request, but a silently-stopped dump hides real problems. First failure logs
 // immediately, repeats within the window are suppressed, and it re-logs after

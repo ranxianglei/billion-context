@@ -98,7 +98,9 @@ export function logDumpFailure(where: string, err: unknown): void {
 // "suppressed" notice, then silent.
 const unrecognizedPathCounts = new Map<string, number>();
 export function logUnrecognizedPath(log: (level: string, msg: string) => void, url: string): void {
-    const key = maskUrlsInText(url);
+    // Strip the query before masking: a varying query (?ts=…) would otherwise
+    // split one endpoint into unbounded keys and defeat the rate limit.
+    const key = maskUrlsInText(url.split("?")[0]);
     const n = (unrecognizedPathCounts.get(key) ?? 0) + 1;
     unrecognizedPathCounts.set(key, n);
     if (n <= 3) {
