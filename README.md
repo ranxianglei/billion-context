@@ -50,6 +50,67 @@ Agent (Claude Code / Codex / Cursor / Aider ...)
 
 The proxy injects four context-management tools (`compress`, `decompress`, `search_context`, `acp_status`) into the conversation. The model calls `compress` when the conversation grows, and the proxy executes it server-side — the compressed ranges are folded into the conversation history before the next turn.
 
+### Two compression modes — who executes `compress`
+
+The proxy runs in one of two modes, and **the mode decides who executes
+`compress`, which in turn decides how the summary travels to the model** (the
+"carrier"). This distinction is the root of #377.
+
+| | **Launcher / plugin mode** (`bili pi`, `bili codex`, …) | **Proxy mode** (plain client → `/bili/`) |
+|---|---|---|
+| Client | ACP-native agent with the bili extension (pi/omp) | Any OpenAI/Anthropic client, no extension |
+| Who executes `compress` | **The agent** (pi runs it locally) | **The proxy** (server-side compress loop) |
+| `compress` tool call in the re-sent history? | Yes — part of the agent's own conversation | No — ephemeral proxy-loop traffic |
+| Preflight blocks (no tool call)? | No — overflow forces the model to call `compress` | Yes — `src/preflight.ts` compresses behind the client's back |
+| **Summary carrier on the wire** | **the `compress` tool call** | **an `acp_summary` user message** |
+| System messages on the wire | always exactly 1 (client + prompt) | always exactly 1 (client + prompt) — summaries ride on user messages |
+| SGLang "single system" 400 (#377) | cannot happen | cannot happen (summaries are user messages, not system) |
+| Proxy-injected tools + nudge | none (agent owns compression) | the 4 context tools + nudge (when enabled) |
+
+**Why the carriers differ.** In plugin mode the agent owns compression: the
+`compress` call + result live in the agent's own history and are re-sent every
+turn, so the summary rides on the tool call and the agent's view never renders
+the kernel's `acp_summary` fallback (`billion-context-pi` `src/messages.ts`
+skips `acp_summary_*`). In proxy mode the client is not ACP-native, so the
+proxy executes `compress` server-side; the tool call never enters the client's
+history, and preflight blocks have no tool call at all — so the kernel's
+`acp_summary` message is the only carrier. The kernel renders it as role
+`system`, but strict OpenAI-compatible backends (SGLang) require exactly one
+system message at index 0, so `systemToUser` (`src/util.ts`) re-voices it as a
+`user` message, leaving it at its anchor position. This keeps the head system
+message (the prefix-cache anchor) byte-stable across compress turns, so a new
+block does not invalidate the whole-conversation prefix.
+
+**Why `user`, not `system` or a forged tool call.** A mid-stream `system`
+message is what SGLang rejects (#377). A forged `compress` tool call would be
+the "pure" carrier, but in proxy mode it requires fabricating an
+assistant `tool_calls` + `user` `tool_result` pair by id, declaring the tool in
+the request, and handling preflight blocks that have no authentic call — far
+more invasive than re-voicing a standalone note. A `user` message is allowed
+anywhere in the conversation, so it is the minimal change that satisfies both
+SGLang's one-system rule and prefix-cache stability. The accepted trade-off:
+a summary is a stand-in for the folded history, and re-voicing it as a user
+turn is a semantic mismatch the model tolerates (it is clearly marked
+`[Compressed conversation section]`).
+
+**Do the two modes coexist?**
+
+- **Same proxy instance: yes, by design.** One proxy serves plugin and plain
+  clients at once; `pluginMode` is decided per request (`x-bili-plugin` header)
+  and bound per session (`session.metadata.pluginAgent`). The launcher reuses a
+  running proxy.
+- **Same session: the mode is sticky.** A session created in plugin mode stays
+  plugin mode (metadata inheritance); a plain session can only be *upgraded* to
+  plugin mode if a plugin request arrives with a matching conversation id (the
+  header outranks) — and never downgraded. In practice a plain→plugin upgrade
+  requires the plugin client's conversation id to match an existing plain
+  session id, which doesn't happen (each client generates its own id).
+- **Cross-mode block hazard: theoretical only.** It would require the same
+  conversation id to span a mode switch. plugin→proxy is safe (the tool call is
+  in the shared history); proxy→plugin could orphan proxy-created block
+  summaries (their tool call isn't in the agent's history and the agent's view
+  skips `acp_summary`) — but that needs the id match above, which doesn't occur.
+
 ## Install
 
 ```bash
