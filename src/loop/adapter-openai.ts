@@ -97,6 +97,23 @@ function rewriteContentChunk(parsed: Record<string, unknown>, content: string): 
     return Buffer.from(`data: ${JSON.stringify(clone)}\n\n`, "utf8");
 }
 
+// A chunk forwarded verbatim must never carry finish_reason: the ACP loop may run
+// another upstream round after this one (core.ts reRequest), and the completion is
+// emitted once, at the end, by emitCompletion. Leaking an early finish makes every
+// later token "content after the finish reason" to the client.
+function stripFinishReasonChunk(buf: Buffer): Buffer {
+    const m = /^data: (.*)\n\n$/s.exec(buf.toString("utf8"));
+    if (!m) return buf;
+    try {
+        const parsed = JSON.parse(m[1]) as { choices?: Array<Record<string, unknown>> };
+        if (!Array.isArray(parsed.choices)) return buf;
+        parsed.choices = parsed.choices.map((c) => ({ ...c, finish_reason: null }));
+        return Buffer.from(`data: ${JSON.stringify(parsed)}\n\n`, "utf8");
+    } catch {
+        return buf;
+    }
+}
+
 export function createOpenaiAdapter(requestBody: Record<string, unknown>, clientSystem?: string): CompressLoopAdapter {
     const model = (requestBody.model as string) ?? "unknown";
     let responseId = `chatcmpl-proxy-${Date.now()}`;
@@ -312,8 +329,13 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                         cachedTokens: typeof pd?.cached_tokens === "number" ? pd.cached_tokens : undefined,
                     } as ParsedStreamEvent;
                     if (sawRealToolCall) {
+                        // This verbatim chunk IS the round's authoritative completion
+                        // (suppressCompletion); write it once and never fall through
+                        // to the text/reasoning branches (which would re-emit the same
+                        // bytes after the finish reason).
                         yield { kind: "meta", chunk: rawBuf } as ParsedStreamEvent;
                         yield { kind: "done", finishReason, suppressCompletion: true } as ParsedStreamEvent;
+                        continue;
                     } else {
                         yield {
                             kind: "done",
@@ -325,7 +347,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                 if (!delta) continue;
 
                 if (typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0) {
-                    yield { kind: "reasoning", delta: delta.reasoning_content, raw: rawBuf } as ParsedStreamEvent;
+                    yield { kind: "reasoning", delta: delta.reasoning_content, raw: finishReason ? stripFinishReasonChunk(rawBuf) : rawBuf } as ParsedStreamEvent;
                 }
 
                 if (delta.tool_calls) {
@@ -362,10 +384,10 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                         const clean = tagFilter.push(delta.content);
                         if (clean.length > 0) {
                             const raw = clean === delta.content ? rawBuf : rewriteContentChunk(parsed, clean);
-                            yield { kind: "text", delta: clean, ...(hasReasoning ? {} : { raw }) } as ParsedStreamEvent;
+                            yield { kind: "text", delta: clean, ...(hasReasoning ? {} : { raw: finishReason ? stripFinishReasonChunk(raw) : raw }) } as ParsedStreamEvent;
                         }
                 } else if (!hasReasoning && (delta.role || (Object.keys(delta).length === 0 && !finishReason))) {
-                    yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
+                    yield { kind: "meta", chunk: finishReason ? stripFinishReasonChunk(rawBuf) : rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
                 }
             }
         },
