@@ -110,7 +110,7 @@ export function executeProxyTool(
         return resolveDecompress(args, ctx);
     }
     if (toolName === "search_context") {
-        return handleSearchContext(args, ctx.session.state, ctx.messages);
+        return handleSearchContext(args, ctx.session, ctx.messages);
     }
     if (toolName === "acp_status") {
         return handleAcpStatus(args, ctx);
