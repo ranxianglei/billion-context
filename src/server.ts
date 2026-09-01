@@ -1711,6 +1711,7 @@ function prepareOpenai(
     const sessionId = session.id;
     const stream = parsed.stream === true;
     ++session.stats.requests;
+    session.hostCreditTokens = 0;
     let openaiSystemText = "";
     let processedMessages: CoreMessage[] = [];
     let originalMessages: CoreMessage[] = [];
@@ -1816,6 +1817,16 @@ function prepareOpenai(
     if (stream && (rebuilt as Record<string, unknown>).stream_options === undefined) {
         (rebuilt as Record<string, unknown>).stream_options = { include_usage: true };
     }
+    // #408: tokens folded out of the forwarded view vs the host's own (unfolded)
+    // view — added back into the usage reported to the host so its anchor
+    // reflects the uncompressed baseline. Same estimator both sides, so
+    // systematic error cancels in the difference.
+    session.hostCreditTokens = processedMessages.length > 0
+        ? Math.max(0, estimateCoreMessages(originalMessages) - estimateCoreMessages(processedMessages))
+        : 0;
+    if (session.hostCreditTokens > 0) {
+        log("info", `[${sessionId}] host usage backfill armed: +${session.hostCreditTokens} tok (forwarded view is folded); host usage will report the uncompressed baseline`);
+    }
     snapshotMessages(session, originalMessages);
     markDirty(session);
     return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: injectTools, pluginMode, nudge, prompts, openaiSystemText, renderTags: "text-only" } as Prepared;
@@ -1838,6 +1849,7 @@ function prepareResponses(
     const sessionId = session.id;
     const stream = parsed.stream === true;
     ++session.stats.requests;
+    session.hostCreditTokens = 0;
     if (reconcileNativeCompactionBoundary(session)) {
         log("info", `[${sessionId}] reconciled ACP state after native Responses compact boundary`);
     }
@@ -2045,6 +2057,16 @@ function prepareResponses(
             return `${r.type as string}:${(r.name as string) ?? "?"}${sub}`;
         });
         log("info", `[${sessionId}] responses forward tools=[${fwdTools.join(",")}] injectTool=${injectTools}${pluginMode ? " (plugin mode: wire injection suppressed)" : ""} NO_INJECT_TOOL=${!!process.env.ACP_NO_INJECT_TOOL} NO_COMPRESS_PROMPT=${!!process.env.ACP_NO_COMPRESS_PROMPT}`);
+    }
+    // #408: tokens folded out of the forwarded view vs the host's own (unfolded)
+    // view — added back into the usage reported to the host so its anchor
+    // reflects the uncompressed baseline. Same estimator both sides, so
+    // systematic error cancels in the difference.
+    session.hostCreditTokens = processedMessages.length > 0
+        ? Math.max(0, estimateCoreMessages(originalMessages) - estimateCoreMessages(processedMessages))
+        : 0;
+    if (session.hostCreditTokens > 0) {
+        log("info", `[${sessionId}] host usage backfill armed: +${session.hostCreditTokens} tok (forwarded view is folded); host usage will report the uncompressed baseline`);
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);

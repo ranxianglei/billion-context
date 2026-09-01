@@ -933,7 +933,7 @@ export async function pipePluginResponsesWithStrip(
                             // (usageFromSseEvent ran above) — the internal
                             // ledger stays post-fold, the host gets the
                             // uncompressed baseline.
-                            const credit = session.hostCreditTokens ?? 0;
+                            const credit = session?.hostCreditTokens ?? 0;
                             const usage = (evOut["response"] as Record<string, unknown> | undefined)?.["usage"] as Record<string, unknown> | undefined;
                             if (credit > 0 && usage && backfillHostUsage("responses", usage, credit)) {
                                 rebuild = true;
