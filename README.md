@@ -65,6 +65,7 @@ The proxy runs in one of two modes, and **the mode decides who executes
 | **Summary carrier on the wire** | **the `compress` tool call** | **an `acp_summary` user message** |
 | System messages on the wire | always exactly 1 (client + prompt) | always exactly 1 (client + prompt) — summaries ride on user messages |
 | SGLang "single system" 400 (#377) | cannot happen | cannot happen (summaries are user messages, not system) |
+| Proxy-injected tools + nudge | none (agent owns compression) | the 4 context tools + nudge (when enabled) |
 
 **Why the carriers differ.** In plugin mode the agent owns compression: the
 `compress` call + result live in the agent's own history and are re-sent every
