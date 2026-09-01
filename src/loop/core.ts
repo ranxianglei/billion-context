@@ -194,6 +194,9 @@ function recordUsage(
     // re-sends the unfolded history, so its usage report over-reports the
     // context the NEXT request will actually carry (see stream.ts applyRanges).
     ctx.session.stats.lastInputTokens = Math.max(0, total - (ctx.session.stats.compressCreditTokens ?? 0));
+    // #408: remember the input-side total reported to the host AFTER the
+    // prepare-time fold backfill (uncompressed baseline), for the /acp panel.
+    ctx.session.hostContextTokens = total + (ctx.session.hostCreditTokens ?? 0);
     if (typeof cached === "number") {
         ctx.session.stats.cachedTokens += cached;
         ctx.session.stats.cacheSamples += 1;
@@ -368,6 +371,15 @@ export async function* runCompressLoop(
                 usage.cachedTokens !== undefined
             ) {
                 recordUsage(ctx, usage, round);
+            }
+            // #408: the provider measured the FOLDED (post-compress) view; add
+            // the prepare-time credit back so the completion event the host
+            // anchors on reports the uncompressed baseline. recordUsage above
+            // already ran on the un-backfilled numbers (internal ledger stays
+            // post-fold).
+            const hostCredit = ctx.session.hostCreditTokens ?? 0;
+            if (hostCredit > 0 && typeof usage.inputTokens === "number") {
+                usage.inputTokens += hostCredit;
             }
 
             let resolvedText = assistantText;

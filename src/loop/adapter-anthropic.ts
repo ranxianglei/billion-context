@@ -116,7 +116,7 @@ function buildTextDeltaEvent(index: number, text: string): Buffer {
     );
 }
 
-export function createAnthropicAdapter(requestBody: Record<string, unknown>, originalSystem?: AnthropicRequestBody["system"]): CompressLoopAdapter {
+export function createAnthropicAdapter(requestBody: Record<string, unknown>, originalSystem?: AnthropicRequestBody["system"], hostCredit = 0): CompressLoopAdapter {
     const model = (requestBody.model as string) ?? undefined;
     let messageId: string | undefined;
     let clientIndex = 0;
@@ -235,8 +235,26 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                     if (typeof u.input_tokens === "number") roundInput = u.input_tokens;
                     if (typeof u.cache_read_input_tokens === "number") roundCached = u.cache_read_input_tokens;
                     if (round === 1) {
+                        // #408: this raw message_start (post-fold input_tokens)
+                        // reaches the host verbatim — add the prepare-time
+                        // credit back so the host anchors on the uncompressed
+                        // baseline.
+                        let chunk = rawBuf;
+                        if (hostCredit > 0 && typeof u.input_tokens === "number") {
+                            const patched = structuredClone(data);
+                            const pmsg = patched["message"] as Record<string, unknown> | undefined;
+                            const pu = (pmsg?.["usage"] ?? {}) as Record<string, unknown>;
+                            if (typeof pu.input_tokens === "number") {
+                                pu.input_tokens += hostCredit;
+                                const out = eventStr
+                                    .split("\n")
+                                    .map((l) => (l.startsWith("data:") ? `data: ${JSON.stringify(patched)}` : l))
+                                    .join("\n");
+                                chunk = Buffer.from(out + "\n\n", "utf8");
+                            }
+                        }
                         messageStartForwarded = true;
-                        yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
+                        yield { kind: "meta", chunk, firstRoundOnly: true } as ParsedStreamEvent;
                     }
                 } else if (type === "ping") {
                     yield { kind: "meta", chunk: rawBuf } as ParsedStreamEvent;
