@@ -66,7 +66,7 @@ import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { consumePluginRegisterFor, flushConversations, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, loadConversations, pipePluginJson, pipePluginResponsesWithStrip, pipeThroughWithUsage, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
-import { hoistMidSystemMessages, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, shouldReserveOutputHeadroom, usageTotals } from "./util.js";
+import { systemToUser, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, shouldReserveOutputHeadroom, usageTotals } from "./util.js";
 import { BILI_TUNNEL_HEADER, checkTunnelDestination, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
 
 import { decodeRequestBody } from "./content-encoding.js";
@@ -1176,6 +1176,20 @@ async function handle(
                 recordPluginSession(pck.trim(), session.id);
             }
         }
+        // Two compression modes, decided here per request and bound per session
+        // (see README "Two compression modes"):
+        //  - pluginMode (x-bili-plugin header / registered agent): the ACP-native
+        //    agent (pi/omp) OWNS compression — it executes `compress` locally, the
+        //    call+result live in its own re-sent history, and the summary carrier
+        //    is the TOOL CALL. The proxy suppresses tool injection (injectTools
+        //    below) and the agent's view never renders the kernel's acp_summary.
+        //  - proxy mode (no header): a plain client can't run `compress`, so the
+        //    proxy executes it server-side; the tool call is ephemeral (never in
+        //    the client's history) and preflight blocks have none, so the summary
+        //    carrier is the acp_summary message — which systemToUser re-voices as
+        //    a USER message (leaving it at its anchor) so strict backends (SGLang:
+        //    exactly one system at index 0, #377) accept it and the head system
+        //    message stays byte-stable for the prefix cache.
         const pluginMode = pluginAgent !== undefined;
         // Self-heal the context window: a prior upstream overflow may have
         // taught us the real window (forward()'s overflow detection persists it
@@ -1319,6 +1333,14 @@ const ACP_TAG_MARK = "\x3cacp ";
 // prefix-cache breakpoint. Blocks created without a tool call (preflight
 // compression, src/preflight.ts — #247) have NO other carrier: their anchor is
 // the only place the summary reaches the model, so it must survive.
+//
+// Per mode (see README "Two compression modes"): in plugin/launcher mode the
+// tool call is ALWAYS in the re-sent history (the agent owns compression), so
+// this strips every acp_summary and the carrier is the tool call; in proxy mode
+// the tool call is usually absent (ephemeral server-side execution) or
+// nonexistent (preflight), so acp_summary survives as the carrier and
+// systemToUser later re-voices the survivors as USER messages (leaving them at
+// their anchors) for strict backends (#377).
 function stripKernelSummaries(messages: BiliMessage[], state: CompressionState): BiliMessage[] {
     const carried = new Set<string>();
     for (const b of state.blocks) {
@@ -1511,7 +1533,7 @@ function prepareOpenai(
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model));
         processedMessages = stripKernelSummaries(turn.messages, turn.state);
         reapOrphanBlocks(session, msgs, deactivateBlock);
-        rebuiltMessages = hoistMidSystemMessages(coreToOpenai(processedMessages as BiliMessage[]));
+        rebuiltMessages = systemToUser(coreToOpenai(processedMessages as BiliMessage[]));
 
         // ONLY the static compress prompt goes into the system message — the
         // system prompt is the prefix-cache anchor and must be byte-stable
