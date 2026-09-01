@@ -1447,7 +1447,9 @@ function prepareAnthropic(
         }
         // Nudge as a separate trailing user message (cache-friendly): the
         // system block stays byte-stable so the prefix cache survives.
-        if (opts.compress.injectNudge && turn.nudge?.shouldInject) {
+        // Gated by !pluginMode: in plugin mode the agent owns compression
+        // (its own overflow self-heal), so a proxy-injected nudge is redundant.
+        if (opts.compress.injectNudge && !pluginMode && turn.nudge?.shouldInject) {
             try {
                 const rendered = renderNudgeText(turn.nudge, prompts);
                 if (rendered.text) {
@@ -1549,7 +1551,9 @@ function prepareOpenai(
             toolsOut = injectOpenaiTool(parsed.tools);
         }
         // Nudge as a separate trailing user message (cache-friendly).
-        if (opts.compress.injectNudge && turn.nudge?.shouldInject && shouldInject) {
+        // Gated by !pluginMode: in plugin mode the agent owns compression
+        // (its own overflow self-heal), so a proxy-injected nudge is redundant.
+        if (opts.compress.injectNudge && !pluginMode && turn.nudge?.shouldInject && shouldInject) {
             try {
                 const rendered = renderNudgeText(turn.nudge, prompts);
                 if (rendered.text) {
@@ -1711,8 +1715,10 @@ function prepareResponses(
         }
         // A nudge appended after a trailing `compaction_trigger` would break
         // the upstream's "must be the final input item" requirement and is
-        // redundant — the native compact IS the compression.
-        if (opts.compress.injectNudge && turn.nudge?.shouldInject && shouldInject && !isCompactionTrigger) {
+        // redundant — the native compact IS the compression. Gated by
+        // !pluginMode: in plugin mode the agent owns compression (its own
+        // overflow self-heal), so a proxy-injected nudge is redundant.
+        if (opts.compress.injectNudge && !pluginMode && turn.nudge?.shouldInject && shouldInject && !isCompactionTrigger) {
             try {
                 const rendered = renderNudgeText(turn.nudge, prompts);
                 if (rendered.text) {
