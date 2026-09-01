@@ -216,6 +216,34 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
             // So: buffer EVERYTHING, decide once at finish.
             const rawToolChunks: { json: string; parsed: Record<string, unknown> }[] = [];
             let sawRealToolCall = false;
+            // bufferRaw=false for the terminal chunk: it is forwarded once via
+            // rawBuf in the settle branch, so its fragments must not also be
+            // buffered into rawToolChunks (double-forward).
+            const accumulateToolCalls = (
+                tcs: Array<Record<string, unknown>>,
+                jsonStr: string,
+                parsed: Record<string, unknown>,
+                bufferRaw: boolean,
+            ): void => {
+                if (bufferRaw) rawToolChunks.push({ json: jsonStr, parsed });
+                for (const tc of tcs) {
+                    const idx = typeof tc.index === "number" ? tc.index : 0;
+                    const fn = tc.function as Record<string, unknown> | undefined;
+                    const name = typeof fn?.name === "string" ? fn.name : "";
+                    const id = typeof tc.id === "string" ? tc.id : "";
+                    const rawArgs = fn?.arguments;
+                    const args = typeof rawArgs === "string" ? rawArgs : (rawArgs !== null && typeof rawArgs === "object" ? JSON.stringify(rawArgs) : "");
+                    let buf = pending.get(idx);
+                    if (!buf) {
+                        buf = { index: idx, id, name, arguments: args };
+                        pending.set(idx, buf);
+                    } else {
+                        if (id) buf.id = id;
+                        buf.name += name;
+                        buf.arguments += args;
+                    }
+                }
+            };
             const flushPendingAsStructured = function* (): Generator<ParsedStreamEvent> {
                 for (const [, tc] of pending) {
                     if (tc.name.length > 0 || tc.id.length > 0) {
@@ -316,6 +344,14 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                 const delta = choice.delta as Record<string, unknown> | undefined;
                 const finishReason = typeof choice.finish_reason === "string" ? choice.finish_reason : undefined;
 
+                // #431: accumulate this chunk's tool_calls BEFORE the
+                // finishReason block's settleToolCalls() so a merged terminal
+                // chunk (tool_calls + finish_reason in the same chunk) is seen
+                // by the settle and not dropped.
+                if (delta && delta.tool_calls) {
+                    accumulateToolCalls(delta.tool_calls as Array<Record<string, unknown>>, jsonStr, parsed, !finishReason);
+                }
+
                 if (finishReason) {
                     yield* flushFilter();
                     const hadToolCalls = [...pending.values()].some((tc) => tc.name.length > 0 || tc.id.length > 0);
@@ -351,25 +387,8 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                 }
 
                 if (delta.tool_calls) {
-                    const tcs = delta.tool_calls as Array<Record<string, unknown>>;
-                    rawToolChunks.push({ json: jsonStr, parsed });
-                    for (const tc of tcs) {
-                        const idx = typeof tc.index === "number" ? tc.index : 0;
-                        const fn = tc.function as Record<string, unknown> | undefined;
-                        const name = typeof fn?.name === "string" ? fn.name : "";
-                        const id = typeof tc.id === "string" ? tc.id : "";
-                        const rawArgs = fn?.arguments;
-                        const args = typeof rawArgs === "string" ? rawArgs : (rawArgs !== null && typeof rawArgs === "object" ? JSON.stringify(rawArgs) : "");
-                        let buf = pending.get(idx);
-                        if (!buf) {
-                            buf = { index: idx, id, name, arguments: args };
-                            pending.set(idx, buf);
-                        } else {
-                            if (id) buf.id = id;
-                            buf.name += name;
-                            buf.arguments += args;
-                        }
-                    }
+                    // tool_calls already accumulated above (before settle); only
+                    // yield any content merged into the same chunk now.
                     if (typeof delta.content === "string" && delta.content.length > 0) {
                         const clean = tagFilter.push(delta.content);
                         if (clean.length > 0) {
