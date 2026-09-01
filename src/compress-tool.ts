@@ -71,13 +71,12 @@ export {
     buildCompressHybridSystemPrompt,
 } from "acp-kernel";
 
-// The proxy's search_context indexes the FOLDED ORIGINALS of active blocks
-// (error text, paths, variable names that summaries drop) with each summary
-// as a secondary signal (src/search-context.ts); the kernel schema only
-// promises block summaries, so the description is overridden to match the
-// implementation.
+// The proxy's search_context indexes the ORIGINAL text of folded-away
+// messages across ALL blocks (active or inactive) plus block summaries as a
+// secondary signal (src/search-context.ts); the kernel schema only promises
+// summaries, so the description is overridden to match the implementation.
 const SEARCH_CONTEXT_DESCRIPTION =
-    "Searches the FOLDED ORIGINAL CONTENT of compressed blocks — error text, file paths, and variable names that summaries drop — plus each block's summary as a secondary signal (English + Chinese/CJK). Use BEFORE decompressing to find the right block; every hit is a decompressable blockId. Hits marked [summary-only] mean the block's originals are gone from every payload and only its summary was searched.";
+    "Searches the ORIGINAL text of folded-away messages across ALL compressed blocks (any tier, active or archived) plus block summaries as a secondary signal (English + Chinese/CJK). Visible messages are not indexed — they are already in context. Use to locate which block holds a detail (an exact error string, a path, a value); message hits name the owning block, then decompress it. Hits marked summary-only mean the block's originals are gone from every payload and only its summary was searched.";
 
 export const SEARCH_CONTEXT_TOOL = { ..._SEARCH_CONTEXT_TOOL, description: SEARCH_CONTEXT_DESCRIPTION };
 export const SEARCH_CONTEXT_TOOL_OPENAI = {
