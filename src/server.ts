@@ -2583,7 +2583,17 @@ async function forward(
         if (prepared && prepared.resetAfterSuccess) {
             const [toClient, toObserve] = upstream.body.tee();
             const observed = observeResponsesTerminalState(toObserve, prepared.stream);
-            await pipeThrough(toClient, res);
+            const tagLog = (msg: string) => log("info", `[${prepared.session.id}] ${msg}`);
+            // #460 residual: a native compaction turn is by definition the
+            // compression-triggered one, so its context necessarily carries
+            // render tags — its echoed prose is the likeliest leak of any
+            // Responses stream. Same pipe as the non-injected branch below;
+            // no session, so usage accounting stays off.
+            if ((upstream.headers.get("content-type") ?? "").includes("text/event-stream")) {
+                await pipePluginResponsesWithStrip(toClient, res, undefined, tagLog);
+            } else {
+                await pipeThrough(toClient, res);
+            }
             clearUpstreamTimer();
             const terminal = await observed;
             if (terminal === "completed") {
@@ -2609,6 +2619,17 @@ async function forward(
             } else {
                 await pipePluginChatWithStrip(upstream.body as ReadableStream<Uint8Array>, res, p.protocol, undefined, tagLog);
             }
+            clearUpstreamTimer();
+        } else if (
+            prepared &&
+            (upstream.headers.get("content-type") ?? "").includes("application/json")
+        ) {
+            // #460 residual: the non-streaming twin of the branch above. The
+            // compress loop's JSON rewriters strip render tags from every round,
+            // so a non-injected JSON response must not hand the model's echoes
+            // back untouched. Same pipe as plugin mode; no session, so usage
+            // accounting stays off for the same reason as above.
+            await pipePluginJson(upstream.body as ReadableStream<Uint8Array>, res, undefined, prepared.protocol);
             clearUpstreamTimer();
         } else {
             await pipeThrough(upstream.body, res);

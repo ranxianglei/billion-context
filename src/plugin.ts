@@ -875,9 +875,11 @@ function rebuildEvent(rawEvent: string, ev: Record<string, unknown>): string {
 export async function pipePluginJson(
     stream: ReadableStream<Uint8Array>,
     res: import("node:http").ServerResponse,
-    session: Session,
+    session?: Session,
     protocol?: WireProtocol,
 ): Promise<void> {
+    // Also serves proxy-mode JSON responses that skipped compress injection
+    // (#460 residual) — pass no session there so usage accounting stays off.
     const reader = stream.getReader();
     const chunks: Buffer[] = [];
     for (;;) {
@@ -890,7 +892,7 @@ export async function pipePluginJson(
     try {
         const json = JSON.parse(text) as Record<string, unknown>;
         const usage = json["usage"] as Record<string, unknown> | undefined;
-        if (usage) {
+        if (session && usage) {
             const input = num(usage["prompt_tokens"]) ?? num(usage["input_tokens"]);
             if (input !== undefined) {
                 applyUsageSample(session, {
