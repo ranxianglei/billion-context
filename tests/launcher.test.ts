@@ -48,6 +48,7 @@ import {
     readOpencodeConfig,
     resolveOpencodeConfigFile,
     findFreePort,
+    pickEphemeralPort,
     ensureProxyRunning,
     stopProxy,
     resolveLauncherWindow,
@@ -271,6 +272,11 @@ test("findFreePort: returns another port when preferred is occupied", async () =
     } finally {
         blocker.close();
     }
+});
+
+test("pickEphemeralPort: returns a live OS-assigned port", async () => {
+    const port = await pickEphemeralPort(LAUNCHER_DEFAULT_HOST);
+    assert.ok(Number.isInteger(port) && port > 0 && port <= 65535);
 });
 
 import { selfPackageRoot, ompPluginLoadedFrom } from "../src/plugin-install.js";
@@ -592,10 +598,12 @@ function recordedInstance(over: Partial<InstanceFile> = {}): InstanceFile {
     };
 }
 
-test("ensureProxyRunning: attaches to a compatible healthy instance instead of doubling (#394)", async () => {
+test("ensureProxyRunning: always spawns its own proxy, never attaches to a recorded one (#446)", async () => {
     let spawnCalls = 0;
-    const spawnImpl: SpawnFn = () => {
+    let capturedToken = "";
+    const spawnImpl: SpawnFn = (_cmd, _args, options) => {
         spawnCalls++;
+        capturedToken = (options.env?.BILI_LAUNCH_TOKEN as string) ?? "";
         return makeFakeChild(42431);
     };
     const handle = await ensureProxyRunning(
@@ -603,56 +611,16 @@ test("ensureProxyRunning: attaches to a compatible healthy instance instead of d
         {
             spawnImpl,
             fetchImpl: async () => ({ ok: true }),
-            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1" }),
-            readInstanceFile: () => recordedInstance(),
+            // A fully compatible, healthy instance is already recorded — under the
+            // old #394/#417 attach model this would short-circuit and reuse it. We
+            // must ignore it and trust only our own child's report (launchToken).
+            readInstanceFile: () =>
+                capturedToken ? recordedInstance({ launchToken: capturedToken }) : undefined,
         },
     );
-    assert.equal(spawnCalls, 0);
-    assert.equal(handle.attached, true);
+    assert.equal(spawnCalls, 1, "spawned our own proxy instead of attaching");
+    assert.ok(handle.child, "handle owns the spawned child");
     assert.equal(handle.origin, "http://127.0.0.1:8787");
-    let killed = false;
-    stopProxy({ ...handle, child: { pid: 77777, kill: () => { killed = true; return true; } } });
-    assert.equal(killed, false);
-});
-
-test("ensureProxyRunning: incompatible recorded instance (modelWindows) is not attached", async () => {
-    let spawnCalls = 0;
-    const spawnImpl: SpawnFn = () => {
-        spawnCalls++;
-        return makeFakeChild(42434);
-    };
-    let reads = 0;
-    const handle = await ensureProxyRunning(
-        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, modelWindows: { "m1": 100000 } },
-        {
-            spawnImpl,
-            fetchImpl: async () => ({ ok: true }),
-            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1" }),
-            readInstanceFile: () => (reads++ === 0 ? recordedInstance() : undefined),
-            sleep: () => Promise.resolve(),
-        },
-    );
-    assert.equal(spawnCalls, 1);
-    assert.equal(handle.attached, undefined);
-});
-
-test("ensureProxyRunning: dead recorded pid is ignored (no attach)", async () => {
-    let spawnCalls = 0;
-    const spawnImpl: SpawnFn = () => {
-        spawnCalls++;
-        return makeFakeChild(42435);
-    };
-    const handle = await ensureProxyRunning(
-        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
-        {
-            spawnImpl,
-            fetchImpl: async () => ({ ok: true }),
-            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1" }),
-            readInstanceFile: () => recordedInstance({ pid: 99999999 }),
-            sleep: () => Promise.resolve(),
-        },
-    );
-    assert.equal(spawnCalls, 1);
 });
 
 test("ensureProxyRunning: launchToken handshake returns the child's real port (#407)", async () => {

@@ -51,7 +51,7 @@ import { reapOrphanBlocks } from "./orphan-gc.js";
 import { getStore } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger } from "./logger.js";
 import { defaultLogFile, stateDir } from "./paths.js";
-import { atomicWriteInstanceFile, clearProxyInstanceFile, isPidAlive, registerInstanceAndWarn, unregisterInstance } from "./instance.js";
+import { atomicWriteInstanceFile, clearProxyInstanceFile, isPidAlive, launchTokenFilePath, registerInstanceAndWarn, unregisterInstance } from "./instance.js";
 import { compressLoopResponsesJson } from "./compress-loop-responses.js";
 import { runCompressLoop, pickAdapter } from "./loop/index.js";
 import { containsToolCallXmlFragment } from "./loop/tag-echo-filter.js";
@@ -375,20 +375,25 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         // so the file always holds a valid URL.
         const originHost = opts.host === "0.0.0.0" || opts.host === "::" || opts.host === "localhost" ? "127.0.0.1" : opts.host.includes(":") && !opts.host.startsWith("[") ? `[${opts.host}]` : opts.host;
         const origin = `http://${originHost}:${actualPort}`;
+        const instanceInfo = {
+            origin,
+            instanceId,
+            pid: process.pid,
+            startedAt: instanceStartedAt,
+            host: opts.host,
+            port: actualPort,
+            passthrough: opts.passthrough,
+            mitmDomains: opts.mitm.enabled ? opts.mitm.domains : [],
+            modelWindows: { ...LAUNCHER_MODEL_WINDOWS },
+            launchToken: launchToken || undefined,
+        };
         try {
             fs.mkdirSync(stateDir(), { recursive: true });
-            atomicWriteInstanceFile({
-                origin,
-                instanceId,
-                pid: process.pid,
-                startedAt: instanceStartedAt,
-                host: opts.host,
-                port: actualPort,
-                passthrough: opts.passthrough,
-                mitmDomains: opts.mitm.enabled ? opts.mitm.domains : [],
-                modelWindows: { ...LAUNCHER_MODEL_WINDOWS },
-                launchToken: launchToken || undefined,
-            });
+            atomicWriteInstanceFile(instanceInfo);
+            // #446: per-launchToken report so concurrent isolated launchers don't
+            // clobber each other's handshake record (the shared file above is a
+            // "latest proxy" discovery hint only).
+            if (launchToken) atomicWriteInstanceFile(instanceInfo, launchTokenFilePath(launchToken));
         } catch {
             // best-effort discovery hint for host-spawned MCP shells
         }
@@ -463,6 +468,11 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     let shuttingDown = false;
     const finishShutdown = (): void => {
         clearProxyInstanceFile(instanceId);
+        if (launchToken) {
+            try {
+                fs.unlinkSync(launchTokenFilePath(launchToken));
+            } catch {}
+        }
         unregisterInstance(instanceId);
         closeLogger();
         process.exit(0);

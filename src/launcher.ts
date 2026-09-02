@@ -33,7 +33,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { spawn, type StdioOptions } from "node:child_process";
 import { DEFAULT_MITM_DOMAINS } from "./mitm.js";
-import { isProxyInstanceFile, isPidAlive, readProxyInstanceFile, type ProxyInstanceFile } from "./instance.js";
+import { isProxyInstanceFile, isPidAlive, launchTokenFilePath, readProxyInstanceFile, type ProxyInstanceFile } from "./instance.js";
 import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom } from "./plugin-install.js";
 
 /** Absolute path of a file inside our dist/, resolved via the package root
@@ -82,7 +82,6 @@ export {
 } from "./client-config.js";
 
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
-export const LAUNCHER_DEFAULT_PORT = 8787;
 export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "pi-test"] as const;
 export type ClientName = (typeof LAUNCH_CLIENTS)[number];
 export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh";
@@ -125,12 +124,10 @@ export interface ProxyHandle {
     port: number;
     child?: SpawnChild;
     logPath?: string;
-    attached?: boolean;
 }
 
 export interface LauncherDeps {
     fetchImpl?: (url: string) => Promise<{ ok: boolean }>;
-    fetchHealthInfo?: (origin: string) => Promise<{ ok: boolean; instanceId?: string } | undefined>;
     readInstanceFile?: () => ProxyInstanceFile | { origin: string } | undefined;
     spawnImpl?: SpawnFn;
     now?: () => number;
@@ -1517,43 +1514,21 @@ async function probeHealth(
     }
 }
 
-interface HealthInfo {
-    ok: boolean;
-    instanceId?: string;
-}
-
-async function fetchHealthInfoDefault(origin: string): Promise<HealthInfo | undefined> {
-    try {
-        const res = await fetch(healthUrl(origin), { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
-        if (!res.ok) return undefined;
-        const data = (await res.json()) as { ok?: boolean; instanceId?: string };
-        return { ok: Boolean(data.ok), instanceId: typeof data.instanceId === "string" ? data.instanceId : undefined };
-    } catch {
-        return undefined;
-    }
-}
-
-function instanceCompatible(inst: ProxyInstanceFile, opts: LaunchOptions): boolean {
-    if (inst.host !== opts.host || inst.passthrough !== opts.passthrough) return false;
-    const wantDomains = opts.mitmDomains ?? [];
-    if (inst.mitmDomains.length !== wantDomains.length || inst.mitmDomains.some((d, i) => d !== wantDomains[i])) return false;
-    const wantWindows = opts.modelWindows ?? {};
-    const keys = Object.keys(wantWindows);
-    if (Object.keys(inst.modelWindows).length !== keys.length) return false;
-    return keys.every((k) => inst.modelWindows[k] === wantWindows[k]);
-}
-
-async function probeExistingInstance(
-    readInstance: () => ProxyInstanceFile | { origin: string } | undefined,
-    fetchHealthInfo: (origin: string) => Promise<HealthInfo | undefined>,
-): Promise<ProxyInstanceFile | undefined> {
-    const inst = readInstance();
-    if (!isProxyInstanceFile(inst)) return undefined;
-    if (!isPidAlive(inst.pid)) return undefined;
-    const health = await fetchHealthInfo(inst.origin);
-    if (!health || !health.ok) return undefined;
-    if (health.instanceId !== undefined && health.instanceId !== inst.instanceId) return undefined;
-    return inst;
+/** Bind a throwaway server on an OS-assigned port and return that port. The
+ *  launcher default: every launch gets its own free port so isolated launches
+ *  never collide (#446). */
+export function pickEphemeralPort(host = LAUNCHER_DEFAULT_HOST): Promise<number> {
+    return new Promise<number>((resolve, reject) => {
+        const srv = net.createServer();
+        srv.once("error", reject);
+        srv.listen(0, host, () => {
+            const addr = srv.address();
+            srv.close(() => {
+                if (addr && typeof addr === "object") resolve(addr.port);
+                else reject(new Error("could not allocate a free port"));
+            });
+        });
+    });
 }
 
 export function findFreePort(preferred: number, host = LAUNCHER_DEFAULT_HOST): Promise<number> {
@@ -1564,20 +1539,7 @@ export function findFreePort(preferred: number, host = LAUNCHER_DEFAULT_HOST): P
             srv.once("listening", () => srv.close(() => resolve(true)));
             srv.listen(port, host);
         });
-    return tryBind(preferred).then((free) => {
-        if (free) return preferred;
-        return new Promise<number>((resolve, reject) => {
-            const srv = net.createServer();
-            srv.once("error", reject);
-            srv.listen(0, host, () => {
-                const addr = srv.address();
-                srv.close(() => {
-                    if (addr && typeof addr === "object") resolve(addr.port);
-                    else reject(new Error("could not allocate a free port"));
-                });
-            });
-        });
-    });
+    return tryBind(preferred).then((free) => (free ? Promise.resolve(preferred) : pickEphemeralPort(host)));
 }
 
 const INHERITED_PROXY_VARS = ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"];
@@ -1600,25 +1562,17 @@ export async function ensureProxyRunning(
     deps: LauncherDeps = {},
 ): Promise<ProxyHandle> {
     const fetchImpl = deps.fetchImpl ?? defaultFetch;
-    const fetchHealthInfo = deps.fetchHealthInfo ?? fetchHealthInfoDefault;
-    const readInstance = deps.readInstanceFile ?? readProxyInstanceFile;
     const spawnImpl = deps.spawnImpl ?? (spawn as SpawnFn);
     const now = deps.now ?? Date.now;
     const sleepImpl = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
 
-    // #394/#417: a healthy proxy with a compatible config is SHARED, not
-    // doubled — two concurrent launches of the same client would otherwise
-    // spawn two writers over one sessions dir.
-    const existing = await probeExistingInstance(readInstance, fetchHealthInfo);
-    if (existing && instanceCompatible(existing, opts)) {
-        console.error(`bili: attaching to running proxy at ${existing.origin} (pid ${existing.pid})`);
-        return { origin: existing.origin, port: existing.port, attached: true };
-    }
-
-    // #407: no probe-release-rebind. The child binds the preferred port
-    // itself and retries on EADDRINUSE, reporting the real origin through
-    // the instance file via this launchToken.
+    // #407/#446: no probe-release-rebind and no attach/share. Every launch
+    // spawns its own proxy on the requested (random free) port; the child
+    // self-binds, retries on EADDRINUSE, and reports the real origin through a
+    // per-launchToken file so concurrent isolated launches don't clobber one
+    // record.
     const launchToken = randomUUID();
+    const readInstance = deps.readInstanceFile ?? (() => readProxyInstanceFile(launchTokenFilePath(launchToken)));
     const port = opts.port;
     const script = process.argv[1];
     if (!script) throw new Error("bili: cannot resolve launcher script path");
@@ -1678,7 +1632,6 @@ export async function ensureProxyRunning(
 }
 
 export function stopProxy(handle: ProxyHandle): void {
-    if (handle.attached) return;
     const child = handle.child;
     if (!child || child.pid === undefined) return;
     if (process.platform === "win32") {
@@ -1769,8 +1722,11 @@ export interface RunLaunchParams {
     overrides: Record<string, string | undefined>;
 }
 
-function parsePort(raw: string | undefined): number {
-    const port = raw && raw.trim() ? parseInt(raw, 10) : LAUNCHER_DEFAULT_PORT;
+// No explicit --port -> undefined: the launcher allocates a random free port
+// so isolated launches never collide on a fixed default (#446).
+function parsePort(raw: string | undefined): number | undefined {
+    if (!raw || !raw.trim()) return undefined;
+    const port = parseInt(raw, 10);
     if (!Number.isFinite(port) || port <= 0 || port > 65535) {
         console.error(`bili: invalid --port "${raw}"`);
         process.exit(2);
@@ -1780,7 +1736,8 @@ function parsePort(raw: string | undefined): number {
 
 export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}): Promise<void> {
     const host = params.overrides.ACP_HOST?.trim() || LAUNCHER_DEFAULT_HOST;
-    const port = parsePort(params.overrides.ACP_PORT ?? process.env.ACP_PORT);
+    const requestedPort = parsePort(params.overrides.ACP_PORT ?? process.env.ACP_PORT);
+    const port = requestedPort ?? (await pickEphemeralPort(host));
     const passthrough = params.overrides.ACP_PASSTHROUGH === "1";
     const debug = params.overrides.ACP_DEBUG === "1";
 
@@ -2023,7 +1980,8 @@ export interface RunTestPiParams {
 
 export async function runTestPi(params: RunTestPiParams, deps: LauncherDeps = {}): Promise<number> {
     const host = params.overrides.ACP_HOST?.trim() || LAUNCHER_DEFAULT_HOST;
-    const port = parsePort(params.overrides.ACP_PORT ?? process.env.ACP_PORT);
+    const requestedPort = parsePort(params.overrides.ACP_PORT ?? process.env.ACP_PORT);
+    const port = requestedPort ?? (await pickEphemeralPort(host));
     const passthrough = params.overrides.ACP_PASSTHROUGH === "1";
     const debug = params.overrides.ACP_DEBUG === "1";
 

@@ -70,6 +70,14 @@ export function instanceFilePath(): string {
     return path.join(stateDir(), "proxy-origin");
 }
 
+/** Per-launch handshake report (#446): keyed by launchToken so concurrent
+ *  launcher-spawned proxies don't clobber each other's single proxy-origin
+ *  record. The launcher reads only its own child's report (matched by
+ *  construction — it generated the token), so N isolated launchers coexist. */
+export function launchTokenFilePath(token: string): string {
+    return path.join(stateDir(), `proxy-origin-${token}`);
+}
+
 /** tmp+fsync+rename (same shape as web/api.ts atomicWriteConfig) — a torn
  *  write must never leave a half-origin behind (#406 family). */
 export function atomicWriteInstanceFile(info: ProxyInstanceFile, file?: string): void {
