@@ -7,7 +7,7 @@ import { acquireInFlight, listSessions, markDirty, peekSession, releaseInFlight,
 import { ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, PROXY_TOOL_NAMES } from "./compress-tool.js";
 import { executeProxyTool } from "./loop/core.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
-import { containsRenderTagText, createTagEchoFilter, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
+import { containsRenderTagText, createTagEchoFilter, mayStartRenderTag, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
 import type { WireProtocol } from "./util.js";
 import { stateDir } from "./paths.js";
@@ -615,7 +615,7 @@ export async function pipePluginChatWithStrip(
                 const v = dd[field];
                 if (typeof v !== "string") continue;
                 hadText = true;
-                if (!containsRenderTagText(v) && !anyPending()) {
+                if (!mayStartRenderTag(v) && !anyPending()) {
                     if (v.length > 0) keptText = true;
                     continue;
                 }
@@ -655,7 +655,7 @@ export async function pipePluginChatWithStrip(
             return rawEvent + "\n\n";
         }
         const raw = d[field] as string;
-        if (!containsRenderTagText(raw) && !anyPending()) {
+        if (!mayStartRenderTag(raw) && !anyPending()) {
             return rawEvent + "\n\n";
         }
         const [clean, changed] = pushField(field, index, raw);
@@ -809,7 +809,7 @@ export async function pipePluginResponsesWithStrip(
                             await write(rawEvent + "\n\n");
                             continue;
                         }
-                        if (!containsRenderTagText(delta) && !tagFilter.pending()) {
+                        if (!mayStartRenderTag(delta) && !tagFilter.pending()) {
                             await write(rawEvent + "\n\n");
                             continue;
                         }

@@ -4,7 +4,7 @@ import type { Config, CoreMessage } from "acp-kernel";
 import { createCore, createInitialState } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 import { runCompressLoop, createOpenaiAdapter, createAnthropicAdapter, createResponsesAdapter } from "../src/loop/index.ts";
-import { stripAcpTags, createTagEchoFilter, containsRenderTagText, containsToolCallXmlFragment } from "../src/loop/tag-echo-filter.ts";
+import { stripAcpTags, createTagEchoFilter, containsRenderTagText, containsToolCallXmlFragment, mayStartRenderTag } from "../src/loop/tag-echo-filter.ts";
 import { rewriteJsonResponse } from "../src/stream.ts";
 import { rewriteOpenaiJsonResponse } from "../src/stream-openai.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
@@ -398,4 +398,19 @@ test("tag-echo filter does not strip tool-call XML fragments (warn-only, #361)",
     const f = createTagEchoFilter();
     const out = f.push(`done ${LT}/invoke> ${LT}/tool_calls>`) + f.flush();
     assert.equal(out, `done ${LT}/invoke> ${LT}/tool_calls>`);
+});
+
+test("mayStartRenderTag engages on complete tags and tag-head tails, not prose", () => {
+    assert.equal(mayStartRenderTag(TAG("m0042")), true);
+    assert.equal(mayStartRenderTag(`prose ${OPEN}tokens="1"`), true);
+    assert.equal(mayStartRenderTag("ok \x3c"), true);
+    assert.equal(mayStartRenderTag("ok \x3c/"), true);
+    assert.equal(mayStartRenderTag("ok \x3ca"), true);
+    assert.equal(mayStartRenderTag("ok \x3cac"), true);
+    assert.equal(mayStartRenderTag(`x ${LT}/ac`), true);
+    assert.equal(mayStartRenderTag(""), false);
+    assert.equal(mayStartRenderTag("plain text"), false);
+    assert.equal(mayStartRenderTag("a < b"), false);
+    assert.equal(mayStartRenderTag("x\x3caction y"), false);
+    assert.equal(mayStartRenderTag("\x3cdiv>"), false);
 });
