@@ -143,6 +143,55 @@ test("plugin chat passthrough keeps tool_calls deltas byte-identical", async () 
     assert.ok(text.includes(plain.trim()), "clean delta untouched");
 });
 
+test("plugin chat passthrough strips a tag streamed in tokenizer-sized fragments (#468)", async () => {
+    const out: string[] = [];
+    const res = makeRes(out);
+    const session = makeSession();
+    const whole = `ok ${TAG_OPEN}m00042${TAG_CLOSE} tail`;
+    const micro = whole.match(/.{1,4}/g) ?? [];
+    const events = [...micro.map((piece) => chatChunk({ content: piece })), DONE];
+    await pipePluginChatWithStrip(streamOf(events), res, session, "openai");
+    const text = out.join("");
+    assert.ok(!text.includes("m00042"), "micro-fragmented tag never reassembles downstream");
+    assert.ok(!text.includes("\x3cacp") && !text.includes("\x3c/acp"), "no tag fragment survives");
+    const joined = text
+        .split("\n")
+        .filter((l) => l.startsWith("data:"))
+        .filter((l) => !l.includes("[DONE]"))
+        .map((l) => JSON.parse(l.slice(5).trim()) as { choices?: Array<{ delta?: { content?: string } }> })
+        .map((c) => c.choices?.[0]?.delta?.content ?? "")
+        .join("");
+    assert.equal(joined, "ok  tail", "surrounding prose reassembles to the tag-free text");
+    const dataLines = text.split("\n").filter((l) => l.startsWith("data:")).filter((l) => !l.includes("[DONE]"));
+    for (const l of dataLines) {
+        assert.doesNotThrow(() => JSON.parse(l.slice(5).trim()), "every forwarded data line stays valid JSON");
+    }
+});
+
+test("plugin anthropic passthrough strips a tag streamed in tokenizer-sized fragments (#468)", async () => {
+    const out: string[] = [];
+    const res = makeRes(out);
+    const session = makeSession();
+    const whole = `ok ${TAG_OPEN}m00042${TAG_CLOSE} tail`;
+    const micro = whole.match(/.{1,4}/g) ?? [];
+    const events = [
+        ...micro.map((piece) => `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: piece } })}\n\n`),
+        `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" } })}\n\n`,
+    ];
+    await pipePluginChatWithStrip(streamOf(events), res, session, "anthropic");
+    const text = out.join("");
+    assert.ok(!text.includes("m00042"), "micro-fragmented tag never reassembles downstream");
+    assert.ok(!text.includes("\x3cacp") && !text.includes("\x3c/acp"), "no tag fragment survives");
+    const joined = text
+        .split("\n")
+        .filter((l) => l.startsWith("data:"))
+        .map((l) => JSON.parse(l.slice(5).trim()) as { delta?: { type?: string; text?: string } })
+        .filter((ev) => ev.delta?.type === "text_delta")
+        .map((ev) => ev.delta?.text ?? "")
+        .join("");
+    assert.equal(joined, "ok  tail", "surrounding prose reassembles to the tag-free text");
+});
+
 test("plugin chat passthrough resolves held tail at stream end without [DONE]", async () => {
     const out: string[] = [];
     const res = makeRes(out);
