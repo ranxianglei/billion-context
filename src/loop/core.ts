@@ -206,8 +206,30 @@ export async function* runCompressLoop(
 ): AsyncGenerator<Buffer> {
     let activeClearTimer: (() => void) | null = null;
     let currentUpstream = upstream;
+    let roundBody: Record<string, unknown> = requestBody;
     const coreMessages: CoreMessage[] = [...ctx.messages];
     let degradedRetried = false;
+    let truncationRetried = false;
+
+    const fetchUpstream = (body: Record<string, unknown>) =>
+        fetchWithRetry(
+            requestOptions.url,
+            {
+                method: "POST",
+                headers: requestOptions.headers,
+                body: JSON.stringify(body),
+                ...(ctx.proxyUrl ? { dispatcher: proxyDispatcher(ctx.proxyUrl) } : {}),
+            },
+            undefined,
+            signal,
+            (info) => {
+                // #189: correlate the rejection with the rewrite that
+                // preceded it (shrink ratio + fold point), if any.
+                const lc = lastCompressSuffix(ctx.session.lastCompress);
+                ctx.log(`[acp-proxy: upstream rejected replay (HTTP ${info.status}: ${info.detail.slice(0, 120)}); likely provider risk-control — retrying in ${info.delayMs}ms (attempt ${info.attempt}/${info.maxAttempts})${lc}]`);
+                loggerLog("warn", `[acp-loop] upstream rejected replay (HTTP ${info.status}); retrying in ${info.delayMs}ms (attempt ${info.attempt}/${info.maxAttempts})${lc}`);
+            },
+        );
 
     try {
         for (let round = 1; round <= MAX_LOOP_ROUNDS; round++) {
@@ -221,15 +243,32 @@ export async function* runCompressLoop(
             let finishReason: string | undefined;
             let sawDone = false;
             let suppressCompletion = false;
+            let forwardedAny = false;
+            const fwd = (chunk: Buffer): Buffer => {
+                forwardedAny = true;
+                return chunk;
+            };
 
-            for await (const ev of adapter.parseStream(currentUpstream, round)) {
-                if (signal?.aborted) break;
+            for (;;) {
+                assistantText = "";
+                assistantReasoning = "";
+                reasoningSegments.length = 0;
+                reasoningSealed = true;
+                calls.length = 0;
+                usage = {};
+                finishReason = undefined;
+                sawDone = false;
+                suppressCompletion = false;
+                forwardedAny = false;
+
+                for await (const ev of adapter.parseStream(currentUpstream, round)) {
+                    if (signal?.aborted) break;
                     if (ev.kind === "text") {
                         assistantText += ev.delta;
                         if (!ctx.textProtocol && ev.raw) {
-                            yield ev.raw;
+                            yield fwd(ev.raw);
                         } else if (!ctx.textProtocol && round > 1 && ev.delta.length > 0) {
-                            yield adapter.emitText(ev.delta);
+                            yield fwd(adapter.emitText(ev.delta));
                         }
                     } else if (ev.kind === "reasoning") {
                         assistantReasoning += ev.delta;
@@ -250,22 +289,59 @@ export async function* runCompressLoop(
                             }
                         }
                     } else if (ev.kind === "tool_call") {
-                    calls.push({ name: ev.name, callId: ev.callId, arguments: ev.arguments, passthrough: ev.passthrough });
-                } else if (ev.kind === "usage") {
-                    usage = {
-                        inputTokens: ev.inputTokens,
-                        outputTokens: ev.outputTokens,
-                        cachedTokens: ev.cachedTokens,
-                    };
-                } else if (ev.kind === "done") {
-                    sawDone = true;
-                    finishReason = ev.finishReason;
-                    suppressCompletion = ev.suppressCompletion === true;
-                } else if (ev.kind === "meta") {
-                    if (round === 1 || !ev.firstRoundOnly) {
-                        yield ev.chunk;
+                        calls.push({ name: ev.name, callId: ev.callId, arguments: ev.arguments, passthrough: ev.passthrough });
+                    } else if (ev.kind === "usage") {
+                        usage = {
+                            inputTokens: ev.inputTokens,
+                            outputTokens: ev.outputTokens,
+                            cachedTokens: ev.cachedTokens,
+                        };
+                    } else if (ev.kind === "done") {
+                        sawDone = true;
+                        finishReason = ev.finishReason;
+                        suppressCompletion = ev.suppressCompletion === true;
+                    } else if (ev.kind === "meta") {
+                        if (round === 1 || !ev.firstRoundOnly) {
+                            yield fwd(ev.chunk);
+                        }
                     }
                 }
+
+                // #413: zero-side-effect truncation — the client received
+                // nothing from this attempt (no text/reasoning/meta/tool
+                // bytes), so re-fetching the same round is invisible to it.
+                // One retry per request; 200+early-EOF flakiness (common on
+                // relays) no longer lands in the agent session.
+                if (
+                    !sawDone &&
+                    !forwardedAny &&
+                    calls.length === 0 &&
+                    !(ctx.textProtocol && assistantText.length > 0) &&
+                    !signal?.aborted &&
+                    !truncationRetried
+                ) {
+                    truncationRetried = true;
+                    ctx.log(`[acp-loop] round ${round}: upstream truncated before any content reached the client; retrying fetch once`);
+                    try {
+                        const respResult = await fetchUpstream(roundBody);
+                        if (!respResult.response.body) {
+                            respResult.clearTimer();
+                            throw new UpstreamHttpError(respResult.response.status, "(empty response body)", 1);
+                        }
+                        currentUpstream = respResult.response.body as ReadableStream<Uint8Array>;
+                        if (activeClearTimer) activeClearTimer();
+                        activeClearTimer = respResult.clearTimer;
+                        continue;
+                    } catch (e) {
+                        if (e instanceof UpstreamHttpError) {
+                            const suffix = e.attempts > 1 ? ` after ${e.attempts} attempt(s)` : "";
+                            ctx.log(`[acp-loop] round ${round}: truncation retry failed (upstream error ${e.status}${suffix}: ${e.body.slice(0, 200)})`);
+                        } else {
+                            ctx.log(`[acp-loop] round ${round}: truncation retry failed (${e instanceof Error ? e.message : String(e)})`);
+                        }
+                    }
+                }
+                break;
             }
 
             if (
@@ -435,7 +511,6 @@ export async function* runCompressLoop(
                     const partialReasoning = assistantReasoning.length;
                     const msg = `upstream stream truncated (no completion event; round ${round}, ${partialText} text chars + ${partialReasoning} reasoning chars received)`;
                     ctx.log(`[acp-loop] round ${round}: ${msg}`);
-                    loggerLog("error", `[acp-loop] ${msg}`);
                     yield adapter.emitError(msg);
                     return;
                 }
@@ -460,26 +535,6 @@ export async function* runCompressLoop(
             ctx.log(`[acp-loop] round ${round}: proxy tool executed; re-requesting so the model sees the result`);
 
             if (signal?.aborted) break;
-
-            const fetchUpstream = (body: Record<string, unknown>) =>
-                fetchWithRetry(
-                    requestOptions.url,
-                    {
-                        method: "POST",
-                        headers: requestOptions.headers,
-                        body: JSON.stringify(body),
-                        ...(ctx.proxyUrl ? { dispatcher: proxyDispatcher(ctx.proxyUrl) } : {}),
-                    },
-                    undefined,
-                    signal,
-                    (info) => {
-                        // #189: correlate the rejection with the rewrite that
-                        // preceded it (shrink ratio + fold point), if any.
-                        const lc = lastCompressSuffix(ctx.session.lastCompress);
-                        ctx.log(`[acp-proxy: upstream rejected replay (HTTP ${info.status}: ${info.detail.slice(0, 120)}); likely provider risk-control — retrying in ${info.delayMs}ms (attempt ${info.attempt}/${info.maxAttempts})${lc}]`);
-                        loggerLog("warn", `[acp-loop] upstream rejected replay (HTTP ${info.status}); retrying in ${info.delayMs}ms (attempt ${info.attempt}/${info.maxAttempts})${lc}`);
-                    },
-                );
 
             let newBody = adapter.buildRequest(coreMessages, systemPrompt, requestBody);
             if (process.env.ACP_DUMP_BODY === "1") {
@@ -530,6 +585,7 @@ export async function* runCompressLoop(
             }
 
             currentUpstream = respResult.response.body as ReadableStream<Uint8Array>;
+            roundBody = newBody;
             if (activeClearTimer) activeClearTimer();
             activeClearTimer = respResult.clearTimer;
         }
