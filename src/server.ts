@@ -55,6 +55,7 @@ import { atomicWriteInstanceFile, clearProxyInstanceFile, isPidAlive, registerIn
 import { compressLoopResponsesJson } from "./compress-loop-responses.js";
 import { runCompressLoop, pickAdapter } from "./loop/index.js";
 import { containsToolCallXmlFragment } from "./loop/tag-echo-filter.js";
+import { isFakeCompletion, injectFakeCompletionHint, maxFakeCompletionRetries, fakeBufCap } from "./fake-completion.js";
 import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeResponsesMessageItems } from "./loop/adapter-responses.js";
 import { codexCompactMode, isCodexClient, hasCompactionTrigger, stripBiliCompactionItems, replaceBiliCompactionItems, codexCompactGate, buildTriggerForgeBody, mergeForgedSummaries } from "./codex-compact.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
@@ -66,7 +67,7 @@ import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { consumePluginRegisterFor, flushConversations, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
-import { systemToUser, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, shouldReserveOutputHeadroom, usageTotals } from "./util.js";
+import { systemToUser, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, shouldReserveOutputHeadroom, usageTotals, type WireProtocol } from "./util.js";
 import { BILI_TUNNEL_HEADER, checkTunnelDestination, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
 
 import { decodeRequestBody } from "./content-encoding.js";
@@ -2569,6 +2570,23 @@ async function forward(
         clearUpstreamTimer();
         return;
     }
+    // #371: detect + retry a fake completion for every non-plugin streaming
+    // response (any turn, not just compress-injected). Buffering is required:
+    // the retry re-requests before the client sees the fake completion.
+    let responseBody: ReadableStream<Uint8Array> = upstream.body;
+    if (prepared !== null && prepared.stream && maxFakeCompletionRetries() > 0) {
+        const resolvedBuf = await resolveFakeCompletion(upstream.body, {
+            protocol: prepared.protocol,
+            body,
+            upstreamUrl,
+            reqHeaders: buildForwardHeaders(headers),
+            proxyUrl,
+            signal: clientAbort.signal,
+            session: prepared.session,
+            log,
+        });
+        responseBody = bufferToStream(resolvedBuf);
+    }
     // We only rewrite when THIS request actually had the compress tool
     // injected (per-request). Non-injected requests (OpenAI title-gen
     // exclusion, ACP_NO_INJECT_TOOL, auto-mode classifier bypass) must NOT
@@ -2581,7 +2599,7 @@ async function forward(
         prepared.processedMessages.length > 0;
     if (!useRewriter || prepared === null) {
         if (prepared && prepared.resetAfterSuccess) {
-            const [toClient, toObserve] = upstream.body.tee();
+            const [toClient, toObserve] = responseBody.tee();
             const observed = observeResponsesTerminalState(toObserve, prepared.stream);
             await pipeThrough(toClient, res);
             clearUpstreamTimer();
@@ -2605,13 +2623,13 @@ async function forward(
             const p = prepared;
             const tagLog = (msg: string) => log("info", `[${p.session.id}] ${msg}`);
             if (p.protocol === "responses") {
-                await pipePluginResponsesWithStrip(upstream.body as ReadableStream<Uint8Array>, res, undefined, tagLog);
+                await pipePluginResponsesWithStrip(responseBody, res, undefined, tagLog);
             } else {
-                await pipePluginChatWithStrip(upstream.body as ReadableStream<Uint8Array>, res, p.protocol, undefined, tagLog);
+                await pipePluginChatWithStrip(responseBody, res, p.protocol, undefined, tagLog);
             }
             clearUpstreamTimer();
         } else {
-            await pipeThrough(upstream.body, res);
+            await pipeThrough(responseBody, res);
             clearUpstreamTimer();
         }
         return;
@@ -2625,10 +2643,10 @@ async function forward(
         debug: opts.debug,
     };
     if (prepared.stream) {
-        let streamToRead = upstream.body as ReadableStream<Uint8Array>;
+        let streamToRead = responseBody;
         let dumpRaw: Promise<void> | undefined;
         if (opts.dumpSse) {
-            const [a, b] = (upstream.body as ReadableStream<Uint8Array>).tee();
+            const [a, b] = responseBody.tee();
             streamToRead = a;
             dumpRaw = dumpStreamToFile(b, opts.dumpSse, `${Date.now()}-${safeSessionId(prepared.session.id)}-raw.sse`);
         }
@@ -2792,6 +2810,78 @@ async function readStreamToBuffer(stream: ReadableStream<Uint8Array>, maxBytes =
         reader.releaseLock();
     }
     return Buffer.concat(chunks);
+}
+
+function bufferToStream(buf: Buffer): ReadableStream<Uint8Array> {
+    return new ReadableStream<Uint8Array>({
+        start(controller) {
+            controller.enqueue(new Uint8Array(buf));
+            controller.close();
+        },
+    });
+}
+
+// #371: buffer the raw upstream response, detect a fake completion (tool-call
+// XML, no real tool block), and — bounded per turn and per session — re-request
+// upstream with a corrective hint. Returns the bytes to stream to the client
+// (the retry's response when a retry recovered, else the original). The session
+// streak (metadata.fakeCompletionStreak) counts consecutive fake-completion
+// turns: it gates retries (skip once >= cap) and resets to 0 on a clean turn.
+async function resolveFakeCompletion(
+    stream: ReadableStream<Uint8Array>,
+    opts: {
+        protocol: WireProtocol;
+        body: string | Buffer;
+        upstreamUrl: string;
+        reqHeaders: Record<string, string>;
+        proxyUrl?: string;
+        signal: AbortSignal;
+        session: Session;
+        log: (level: string, msg: string) => void;
+    },
+): Promise<Buffer> {
+    let buffer = await readStreamToBuffer(stream, fakeBufCap());
+    const max = maxFakeCompletionRetries();
+    const sid = opts.session.id;
+    const priorStreak = (opts.session.metadata.fakeCompletionStreak as number | undefined) ?? 0;
+    if (max > 0 && priorStreak < max && isFakeCompletion(opts.protocol, buffer.toString("utf8"))) {
+        for (let attempt = 1; attempt <= max && !opts.signal.aborted; attempt++) {
+            const hinted = injectFakeCompletionHint(opts.protocol, opts.body);
+            if (hinted === null) break;
+            opts.log("warn", `[${sid}] fake completion (tool-call XML, no tool block); retry ${attempt}/${max} with corrective hint`);
+            let r: Awaited<ReturnType<typeof fetchWithTimeout>>;
+            try {
+                r = await fetchWithTimeout(
+                    opts.upstreamUrl,
+                    {
+                        method: "POST",
+                        headers: opts.reqHeaders,
+                        body: hinted,
+                        ...(opts.proxyUrl ? { dispatcher: proxyDispatcher(opts.proxyUrl) } : {}),
+                    },
+                    undefined,
+                    opts.signal,
+                );
+            } catch (e) {
+                opts.log("warn", `[${sid}] fake-completion retry failed: ${String(e)}; presenting original`);
+                break;
+            }
+            try {
+                if (!r.response.ok || !r.response.body) {
+                    opts.log("warn", `[${sid}] fake-completion retry rejected (HTTP ${r.response.status}); presenting original`);
+                    break;
+                }
+                buffer = await readStreamToBuffer(r.response.body, fakeBufCap());
+            } finally {
+                r.clearTimer();
+            }
+            if (!isFakeCompletion(opts.protocol, buffer.toString("utf8"))) break;
+        }
+    }
+    const stillFake = isFakeCompletion(opts.protocol, buffer.toString("utf8"));
+    opts.session.metadata.fakeCompletionStreak = stillFake ? priorStreak + 1 : 0;
+    markDirty(opts.session);
+    return buffer;
 }
 
 async function pipeThrough(stream: ReadableStream<Uint8Array>, res: http.ServerResponse): Promise<void> {
