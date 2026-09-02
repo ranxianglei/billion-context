@@ -2561,7 +2561,7 @@ async function forward(
             if (prepared.protocol === "responses") {
                 await pipePluginResponsesWithStrip(upstream.body as ReadableStream<Uint8Array>, res, prepared.session, (msg) => log("info", `[${prepared.session.id}] ${msg}`));
             } else {
-                await pipePluginChatWithStrip(upstream.body as ReadableStream<Uint8Array>, res, prepared.session, prepared.protocol, (msg) => log("info", `[${prepared.session.id}] ${msg}`));
+                await pipePluginChatWithStrip(upstream.body as ReadableStream<Uint8Array>, res, prepared.protocol, prepared.session, (msg) => log("info", `[${prepared.session.id}] ${msg}`));
             }
         } else {
             await pipePluginJson(upstream.body as ReadableStream<Uint8Array>, res, prepared.session, prepared.protocol);
@@ -2570,11 +2570,11 @@ async function forward(
         return;
     }
     // We only rewrite when THIS request actually had the compress tool
-    // injected (per-request). For the OpenAI title-gen path
-    // (`compressInjected === false`) we must NOT route the stream into a
-    // rewriter — `rewriteSseStream` below is the *Anthropic* SSE rewriter
-    // and would mishandle OpenAI `choices[].delta` events. Plain passthrough
-    // is correct there.
+    // injected (per-request). Non-injected requests (OpenAI title-gen
+    // exclusion, ACP_NO_INJECT_TOOL, auto-mode classifier bypass) must NOT
+    // enter the compress loop — but their chat SSE still gets render-tag
+    // echo stripping (#460) below, so history-borne tags echoed in model
+    // prose cannot leak to the client and amplify via its replay.
     const useRewriter =
         prepared !== null &&
         prepared.compressInjected &&
@@ -2592,6 +2592,24 @@ async function forward(
             } else {
                 log("warn", `[${prepared.session.id}] native compact response terminal=${terminal}; rebase NOT scheduled`);
             }
+        } else if (
+            prepared &&
+            prepared.stream &&
+            (upstream.headers.get("content-type") ?? "").includes("text/event-stream")
+        ) {
+            // #460: same strip pipes as plugin mode; byte-identical for
+            // tag-free streams. No session is passed: usage accounting must
+            // stay off here, or a title-gen call's tiny input_tokens would
+            // clobber lastInputTokens and break compression triggering for
+            // the main conversation (see pipePluginChatWithStrip docs).
+            const p = prepared;
+            const tagLog = (msg: string) => log("info", `[${p.session.id}] ${msg}`);
+            if (p.protocol === "responses") {
+                await pipePluginResponsesWithStrip(upstream.body as ReadableStream<Uint8Array>, res, undefined, tagLog);
+            } else {
+                await pipePluginChatWithStrip(upstream.body as ReadableStream<Uint8Array>, res, p.protocol, undefined, tagLog);
+            }
+            clearUpstreamTimer();
         } else {
             await pipeThrough(upstream.body, res);
             clearUpstreamTimer();
