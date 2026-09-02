@@ -610,6 +610,7 @@ export async function pipePluginChatWithStrip(
         }
         let rebuilt: Record<string, unknown> | null = null;
         let droppedText = false;
+        let keptText = false;
         let hadText = false;
         for (let ci = 0; ci < choices.length; ci++) {
             const ch = choices[ci] as Record<string, unknown> | null;
@@ -620,10 +621,14 @@ export async function pipePluginChatWithStrip(
                 const v = dd[field];
                 if (typeof v !== "string") continue;
                 hadText = true;
-                if (!containsRenderTagText(v) && !anyPending()) continue;
+                if (!containsRenderTagText(v) && !anyPending()) {
+                    if (v.length > 0) keptText = true;
+                    continue;
+                }
                 const index = typeof ch?.["index"] === "number" ? ch["index"] : ci;
                 const [clean, changed] = pushField(field, index, v);
                 if (clean.length === 0) droppedText = true;
+                else keptText = true;
                 if (changed) {
                     if (!rebuilt) {
                         rebuilt = { ...ev, choices: choices.map((c) => ({ ...(c as Record<string, unknown>), delta: { ...((c as Record<string, unknown>)["delta"] as Record<string, unknown>) } })) };
@@ -633,9 +638,11 @@ export async function pipePluginChatWithStrip(
             }
         }
         if (rebuilt) {
-            // Delta carried nothing but the (now-stripped) text: drop the whole
-            // chunk instead of forwarding an empty content delta.
-            if (droppedText && !hadTextOtherThanTextFields(rebuilt["choices"])) {
+            // Delta carried no visible text after stripping: drop the whole
+            // chunk instead of forwarding an empty content delta. Only when
+            // EVERY managed text field emptied out — a sibling field with real
+            // content must survive (#462).
+            if (droppedText && !keptText && !hadTextOtherThanTextFields(rebuilt["choices"])) {
                 return "";
             }
             return rebuildEvent(rawEvent, rebuilt);
