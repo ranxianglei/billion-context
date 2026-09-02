@@ -7,7 +7,7 @@ import { acquireInFlight, listSessions, markDirty, peekSession, releaseInFlight,
 import { ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, PROXY_TOOL_NAMES } from "./compress-tool.js";
 import { executeProxyTool } from "./loop/core.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
-import { containsRenderTagText, createTagEchoFilter, stripResponsesText } from "./loop/tag-echo-filter.js";
+import { containsRenderTagText, createTagEchoFilter, stripAnthropicText, stripOpenAIText, stripResponsesText } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
 import type { WireProtocol } from "./util.js";
 import { stateDir } from "./paths.js";
@@ -529,10 +529,15 @@ function mergeUsageSample(acc: UsageSample, sample: UsageSample): void {
     if (sample.outputTokens !== undefined) acc.outputTokens = sample.outputTokens;
 }
 
-/** Plugin-mode streaming passthrough: forward upstream bytes verbatim (the
- *  agent's native tool loop must see the model's tool calls untouched) while
- *  sniffing usage out of the SSE events — without this, lastInputTokens
- *  would never update and compression nudges would never fire. */
+/** Plugin-mode streaming passthrough for the OpenAI / Anthropic wires:
+ *  structural events (tool_calls / tool_use / usage frames) reach the agent
+ *  byte-identical — the native tool loop must see the model's calls
+ *  untouched — while prose text deltas (openai choices[].delta.content,
+ *  anthropic text_delta) stream through the same tag-echo state machine as
+ *  pipePluginResponsesWithStrip (#206 parity, #457): models can echo ACP
+ *  render tags in visible text, which the client stores in its history and
+ *  replays next turn, amplifying. Usage is sniffed from the same parsed
+ *  events so lastInputTokens keeps tracking reality. */
 export async function pipeThroughWithUsage(
     stream: ReadableStream<Uint8Array>,
     res: import("node:http").ServerResponse,
@@ -543,31 +548,111 @@ export async function pipeThroughWithUsage(
     const decoder = new TextDecoder("utf-8");
     let buf = "";
     const acc: UsageSample = {};
+    const stripText = protocol === "openai" || protocol === "anthropic";
+    const tagFilter = createTagEchoFilter((snippet) => {
+        loggerLog("warn", `[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+    });
+    let lastChunkBase: Record<string, unknown> | null = null;
+    let lastChoiceIndex = 0;
+    let lastBlockIndex = 0;
+    const write = async (s: string): Promise<void> => {
+        if (!res.write(Buffer.from(s, "utf8"))) {
+            await new Promise<void>((r) => res.once("drain", () => r()));
+        }
+    };
+    // Emit the filter's held tail as one synthetic text delta so prose is
+    // never lost when the stream ends mid-hold. Must only be called at
+    // terminal events / stream end: flushing mid-stream would drop a
+    // partially-swallowed tag before its close can arrive.
+    const flushTail = (): string => {
+        const tail = tagFilter.flush();
+        if (tail.length === 0) return "";
+        if (protocol === "openai") {
+            const base = lastChunkBase ? { ...lastChunkBase } : {};
+            delete base["usage"];
+            return `data: ${JSON.stringify({ ...base, choices: [{ index: lastChoiceIndex, delta: { content: tail }, finish_reason: null }] })}\n\n`;
+        }
+        return `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: lastBlockIndex, delta: { type: "text_delta", text: tail } })}\n\n`;
+    };
     try {
         for (;;) {
             const { done, value } = await reader.read();
             if (done) break;
             if (value && value.length > 0) {
-                if (!res.write(Buffer.from(value))) {
-                    await new Promise<void>((r) => res.once("drain", () => r()));
-                }
                 buf = normalizeSseLineEndings(buf + decoder.decode(value, { stream: true }));
                 let idx: number;
                 while ((idx = buf.indexOf("\n\n")) !== -1) {
                     const rawEvent = buf.slice(0, idx);
                     buf = buf.slice(idx + 2);
                     const dataLines = rawEvent.split("\n").filter((l) => l.startsWith("data:"));
-                    if (dataLines.length === 0) continue;
+                    if (dataLines.length === 0) {
+                        await write(rawEvent + "\n\n");
+                        continue;
+                    }
                     const jsonStr = dataLines.map((l) => l.slice(5).replace(/^ /, "")).join("\n").trim();
-                    if (!jsonStr || jsonStr === "[DONE]") continue;
+                    if (!jsonStr || jsonStr === "[DONE]") {
+                        await write(flushTail() + rawEvent + "\n\n");
+                        continue;
+                    }
+                    let ev: Record<string, unknown>;
                     try {
-                        const ev = JSON.parse(jsonStr) as Record<string, unknown>;
-                        const sample = usageFromSseEvent(ev);
-                        if (sample) mergeUsageSample(acc, sample);
-                    } catch { /* non-JSON data line */ }
+                        ev = JSON.parse(jsonStr) as Record<string, unknown>;
+                    } catch {
+                        await write(rawEvent + "\n\n");
+                        continue;
+                    }
+                    const sample = usageFromSseEvent(ev);
+                    if (sample) mergeUsageSample(acc, sample);
+                    if (!stripText) {
+                        await write(rawEvent + "\n\n");
+                        continue;
+                    }
+                    let dirty = false;
+                    let terminal = false;
+                    if (protocol === "openai") {
+                        const choices = ev["choices"];
+                        if (Array.isArray(choices)) {
+                            for (let i = 0; i < choices.length; i++) {
+                                const choice = (choices[i] ?? {}) as Record<string, unknown>;
+                                const fr = choice["finish_reason"];
+                                if (typeof fr === "string" && fr !== "null") terminal = true;
+                                const delta = choice["delta"] as Record<string, unknown> | undefined;
+                                const content = delta?.["content"];
+                                if (delta && typeof content === "string" && content.length > 0) {
+                                    lastChunkBase = ev;
+                                    lastChoiceIndex = i;
+                                    if (!containsRenderTagText(content) && !tagFilter.pending()) continue;
+                                    delta["content"] = tagFilter.push(content);
+                                    dirty = true;
+                                }
+                            }
+                        }
+                    } else {
+                        const t = ev["type"];
+                        if (t === "message_delta" || t === "message_stop") terminal = true;
+                        if (t === "content_block_delta") {
+                            const delta = ev["delta"] as Record<string, unknown> | undefined;
+                            const text = delta?.["text"];
+                            if (delta?.["type"] === "text_delta" && typeof text === "string" && text.length > 0) {
+                                lastBlockIndex = typeof ev["index"] === "number" ? ev["index"] : 0;
+                                if (containsRenderTagText(text) || tagFilter.pending()) {
+                                    delta["text"] = tagFilter.push(text);
+                                    dirty = true;
+                                }
+                            }
+                        }
+                    }
+                    if (terminal) await write(flushTail());
+                    await write(dirty ? rebuildEvent(rawEvent, ev) : rawEvent + "\n\n");
                 }
             }
             if (res.destroyed || res.writableEnded) break;
+        }
+        // Stream cut without a terminal event: flush whatever the tag filter
+        // still holds so prose is never silently lost.
+        if (!res.destroyed && !res.writableEnded) {
+            const rest = flushTail();
+            if (rest.length > 0) await write(rest);
         }
         // Apply BEFORE res.end() in the finally below: the client can issue
         // its next request (e.g. /__bili/plugin/status, or the follow-up turn
@@ -758,14 +843,18 @@ export async function pipePluginJson(
             }
         }
     } catch { /* non-JSON body — forward verbatim */ }
-    if (protocol === "responses") {
-        // #206 parity for the non-streaming plugin path: the compress loop's
-        // JSON branch strips render tags from every round (compressLoopResponsesJson);
-        // a verbatim plugin JSON response would re-feed the model's tag echoes.
+    if (protocol !== undefined) {
+        // #206/#457 parity for the non-streaming plugin path: the compress loop's
+        // JSON branch strips render tags from every round; a verbatim plugin JSON
+        // response would re-feed the model's tag echoes into its own history.
         try {
             const json = JSON.parse(text) as Record<string, unknown>;
             if (containsRenderTagText(text)) {
-                res.end(Buffer.from(JSON.stringify(stripResponsesText(json)), "utf8"));
+                const stripped =
+                    protocol === "responses" ? stripResponsesText(json)
+                        : protocol === "openai" ? stripOpenAIText(json)
+                            : stripAnthropicText(json);
+                res.end(Buffer.from(JSON.stringify(stripped), "utf8"));
                 return;
             }
         } catch { /* fall through to verbatim */ }

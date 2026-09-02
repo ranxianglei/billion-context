@@ -231,3 +231,50 @@ export function stripResponsesText<T>(obj: T): T {
     }
     return obj;
 }
+
+// Strip render tags from OpenAI chat-completion text fields:
+// .choices[].message.content (a string, or an array of {type:"text",text}
+// parts on some providers). Structural fields (tool_calls and their argument
+// strings) are never touched — the model's tool calls must pass through.
+export function stripOpenAIText<T>(obj: T): T {
+    if (!obj || typeof obj !== "object") return obj;
+    const o = obj as Record<string, unknown>;
+    const choices = o["choices"];
+    if (!Array.isArray(choices)) return obj;
+    o["choices"] = choices.map((c) => {
+        if (!c || typeof c !== "object") return c;
+        const choice = { ...(c as Record<string, unknown>) };
+        const msg = choice["message"];
+        if (!msg || typeof msg !== "object") return choice;
+        const message = { ...(msg as Record<string, unknown>) };
+        const content = message["content"];
+        if (typeof content === "string" && containsRenderTagText(content)) {
+            message["content"] = stripAcpTags(content);
+        } else if (Array.isArray(content)) {
+            message["content"] = stripParts(content);
+        }
+        choice["message"] = message;
+        return choice;
+    });
+    return obj;
+}
+
+// Strip render tags from Anthropic message text blocks (.content[] entries
+// with type === "text"). tool_use / thinking / other blocks pass through
+// untouched — tool input JSON is structural, not prose.
+export function stripAnthropicText<T>(obj: T): T {
+    if (!obj || typeof obj !== "object") return obj;
+    const o = obj as Record<string, unknown>;
+    const content = o["content"];
+    if (!Array.isArray(content)) return obj;
+    o["content"] = content.map((blk) => {
+        if (blk && typeof blk === "object" && (blk as Record<string, unknown>).type === "text" && typeof (blk as Record<string, unknown>).text === "string") {
+            const b = blk as Record<string, unknown>;
+            if (containsRenderTagText(b.text as string)) {
+                return { ...b, text: stripAcpTags(b.text as string) };
+            }
+        }
+        return blk;
+    });
+    return obj;
+}

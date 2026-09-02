@@ -2538,10 +2538,12 @@ async function forward(
         }
         return;
     }
-    // Plugin mode: the agent's native loop owns the tool surface — pass the
-    // response through VERBATIM (a model-emitted compress call must reach the
-    // plugin untouched) while sniffing usage so lastInputTokens (the input to
-    // the next nudge decision) keeps tracking reality.
+    // Plugin mode: the agent's native loop owns the tool surface — structural
+    // events (tool calls, usage frames) pass through VERBATIM (a model-emitted
+    // compress call must reach the plugin untouched) while prose text streams
+    // through render-tag stripping on every wire (#206/#457). Usage is sniffed
+    // so lastInputTokens (the input to the next nudge decision) keeps tracking
+    // reality.
     if (prepared?.pluginMode) {
         if (prepared.stream) {
             if (prepared.protocol === "responses") {
