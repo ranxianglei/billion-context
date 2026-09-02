@@ -475,7 +475,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                 }
             }
             if (!terminalKind) {
-                yield { kind: "done", finishReason: "failed" } as ParsedStreamEvent;
+                yield { kind: "done", finishReason: "failed", truncated: true } as ParsedStreamEvent;
             }
         },
 

@@ -79,26 +79,69 @@ function assertCreatedBeforeFailed(events: OutEvent[]): void {
     assert.ok(createdIdx < failedIdx, `response.created (idx ${createdIdx}) precedes response.failed (idx ${failedIdx})`);
 }
 
+function mockFetch(handler: () => Response): { calls: () => number; restore: () => void } {
+    let n = 0;
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async () => {
+        n++;
+        return handler();
+    }) as typeof fetch;
+    return { calls: () => n, restore: () => { globalThis.fetch = orig; } };
+}
+
 test("#440 T1: 0-event EOF → first event is response.created, failed preceded by created", async () => {
+    process.env.BILI_REPLAY_RETRY_MAX = "1";
     const ctx = makeCtx("resp-orphan-t1");
-    const out = await drain(new Response("", { status: 200 }).body!, ctx);
-    const events = parseOut(out);
-    assert.ok(events.length > 0, "stream non-empty");
-    assert.equal(events[0].event, "response.created", `first event must be response.created (got ${events[0].event})`);
-    assertCreatedBeforeFailed(events);
+    const mock = mockFetch(() => new Response('{"error":"boom"}', { status: 500, headers: { "content-type": "application/json" } }));
+    try {
+        const out = await drain(new Response("", { status: 200 }).body!, ctx);
+        assert.equal(mock.calls(), 1, "zero-side-effect truncation retried exactly once (responses adapter too)");
+        const events = parseOut(out);
+        assert.ok(events.length > 0, "stream non-empty");
+        assert.equal(events[0].event, "response.created", `first event must be response.created (got ${events[0].event})`);
+        assertCreatedBeforeFailed(events);
+    } finally {
+        mock.restore();
+        delete process.env.BILI_REPLAY_RETRY_MAX;
+    }
 });
 
-test("#440 T2: truncation after created forwarded → single created, failed references same id", async () => {
+test("#440 T2: truncation after created forwarded → single created, failed references same id, no retry", async () => {
     const round1 = sse("response.created", { response: { id: "resp_1", status: "in_progress", output: [] } });
     const ctx = makeCtx("resp-orphan-t2");
-    const out = await drain(new Response(round1, { status: 200 }).body!, ctx);
-    const events = parseOut(out);
+    const mock = mockFetch(() => new Response("{}", { status: 200 }));
+    try {
+        const out = await drain(new Response(round1, { status: 200 }).body!, ctx);
+        assert.equal(mock.calls(), 0, "no retry: created already reached the client");
+        const events = parseOut(out);
     const created = events.filter((e) => e.event === "response.created");
     assert.equal(created.length, 1, `exactly one response.created (no synthetic duplicate); got ${created.length}`);
     assertCreatedBeforeFailed(events);
     const failed = events.find((e) => e.event === "response.failed")!;
     const failedId = (failed.data.response as Record<string, unknown>)?.id;
     assert.equal(failedId, "resp_1", "failed references the forwarded created's id");
+    } finally {
+        mock.restore();
+    }
+});
+
+test("#440 T4: 0-event EOF → retry succeeds → clean completion, no failed event", async () => {
+    const created = sse("response.created", { response: { id: "resp_retry", status: "in_progress", output: [] } });
+    const item = sse("response.output_item.added", { output_index: 0, item: { type: "message", id: "msg_1", role: "assistant", status: "in_progress", content: [] } });
+    const textDelta = sse("response.output_text.delta", { item_id: "msg_1", output_index: 0, content_index: 0, delta: "RETRY OK" });
+    const textDone = sse("response.output_text.done", { item_id: "msg_1", output_index: 0, content_index: 0, text: "RETRY OK" });
+    const itemDone = sse("response.output_item.done", { output_index: 0, item: { type: "message", id: "msg_1", role: "assistant", status: "completed", content: [{ type: "output_text", text: "RETRY OK", annotations: [] }] } });
+    const completed = sse("response.completed", { response: { id: "resp_retry", status: "completed", output: [] } });
+    const mock = mockFetch(() => new Response(created + item + textDelta + textDone + itemDone + completed, { status: 200 }));
+    const ctx = makeCtx("resp-orphan-t4");
+    try {
+        const out = await drain(new Response("", { status: 200 }).body!, ctx);
+        assert.equal(mock.calls(), 1, "retried once");
+        assert.ok(out.includes("RETRY OK"), "retried round's content delivered");
+        assert.ok(!out.includes("response.failed"), "no failed event on successful retry");
+    } finally {
+        mock.restore();
+    }
 });
 
 test("#440 T3: emitError with no created forwarded → synthesizes created before failed", () => {

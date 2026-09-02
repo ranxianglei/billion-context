@@ -67,7 +67,7 @@ export type ParsedStreamEvent =
     | { kind: "reasoning"; delta: string; raw?: Buffer; signature?: string; blockEnd?: boolean }
     | { kind: "tool_call"; name: string; callId: string; arguments: string; passthrough?: boolean }
     | { kind: "usage"; inputTokens?: number; outputTokens?: number; cachedTokens?: number }
-    | { kind: "done"; finishReason?: string; suppressCompletion?: boolean }
+    | { kind: "done"; finishReason?: string; suppressCompletion?: boolean; truncated?: boolean }
     | { kind: "meta"; chunk: Buffer; firstRoundOnly?: boolean };
 
 export interface EmitCompletionOpts {
@@ -243,6 +243,7 @@ export async function* runCompressLoop(
             let finishReason: string | undefined;
             let sawDone = false;
             let suppressCompletion = false;
+            let truncatedDone = false;
             let forwardedAny = false;
             const fwd = (chunk: Buffer): Buffer => {
                 forwardedAny = true;
@@ -259,6 +260,7 @@ export async function* runCompressLoop(
                 finishReason = undefined;
                 sawDone = false;
                 suppressCompletion = false;
+                truncatedDone = false;
                 forwardedAny = false;
 
                 for await (const ev of adapter.parseStream(currentUpstream, round)) {
@@ -283,9 +285,9 @@ export async function* runCompressLoop(
                         if (ev.blockEnd) reasoningSealed = true;
                         if (!ctx.textProtocol) {
                             if (ev.raw) {
-                                yield ev.raw;
+                                yield fwd(ev.raw);
                             } else if (round > 1 && ev.delta.length > 0 && adapter.emitReasoning) {
-                                yield adapter.emitReasoning(ev.delta);
+                                yield fwd(adapter.emitReasoning(ev.delta));
                             }
                         }
                     } else if (ev.kind === "tool_call") {
@@ -300,6 +302,7 @@ export async function* runCompressLoop(
                         sawDone = true;
                         finishReason = ev.finishReason;
                         suppressCompletion = ev.suppressCompletion === true;
+                        truncatedDone = ev.truncated === true;
                     } else if (ev.kind === "meta") {
                         if (round === 1 || !ev.firstRoundOnly) {
                             yield fwd(ev.chunk);
@@ -312,8 +315,11 @@ export async function* runCompressLoop(
                 // bytes), so re-fetching the same round is invisible to it.
                 // One retry per request; 200+early-EOF flakiness (common on
                 // relays) no longer lands in the agent session.
+                // `truncatedDone` covers adapters that surface truncation as a
+                // synthetic failed done (responses) instead of ending with
+                // !sawDone (anthropic) — same retry, both shapes.
                 if (
-                    !sawDone &&
+                    (!sawDone || truncatedDone) &&
                     !forwardedAny &&
                     calls.length === 0 &&
                     !(ctx.textProtocol && assistantText.length > 0) &&
