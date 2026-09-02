@@ -7,7 +7,7 @@ import { acquireInFlight, listSessions, markDirty, peekSession, releaseInFlight,
 import { ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, PROXY_TOOL_NAMES } from "./compress-tool.js";
 import { executeProxyTool } from "./loop/core.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
-import { containsRenderTagText, createTagEchoFilter, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
+import { containsRenderTagText, createTagEchoFilter, mayStartRenderTag, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
 import type { WireProtocol } from "./util.js";
 import { stateDir } from "./paths.js";
@@ -536,12 +536,18 @@ function mergeUsageSample(acc: UsageSample, sample: UsageSample): void {
  *  model prose through the tag-echo state machine — #206 parity with
  *  pipePluginResponsesWithStrip. The verbatim variant let a model-emitted
  *  render tag echo land in the agent's replayed history and amplify into the
- *  "endless blank output" loop observed with pi + qwen (issue #14). */
+ *  "endless blank output" loop observed with pi + qwen (issue #14).
+ *
+ *  Also serves proxy-mode chat SSE that skipped compress injection (#460:
+ *  title-gen exclusion / ACP_NO_INJECT_TOOL / classifier bypass). Pass no
+ *  session there — usage accounting must be skipped or a title-gen call's
+ *  tiny input_tokens would clobber lastInputTokens and break compression
+ *  triggering for the main conversation. */
 export async function pipePluginChatWithStrip(
     stream: ReadableStream<Uint8Array>,
     res: import("node:http").ServerResponse,
-    session: Session,
     protocol: WireProtocol,
+    session?: Session,
     log?: (msg: string) => void,
 ): Promise<void> {
     const reader = stream.getReader();
@@ -604,6 +610,7 @@ export async function pipePluginChatWithStrip(
         }
         let rebuilt: Record<string, unknown> | null = null;
         let droppedText = false;
+        let keptText = false;
         let hadText = false;
         for (let ci = 0; ci < choices.length; ci++) {
             const ch = choices[ci] as Record<string, unknown> | null;
@@ -614,10 +621,14 @@ export async function pipePluginChatWithStrip(
                 const v = dd[field];
                 if (typeof v !== "string") continue;
                 hadText = true;
-                if (!containsRenderTagText(v) && !anyPending()) continue;
+                if (!mayStartRenderTag(v) && !anyPending()) {
+                    if (v.length > 0) keptText = true;
+                    continue;
+                }
                 const index = typeof ch?.["index"] === "number" ? ch["index"] : ci;
                 const [clean, changed] = pushField(field, index, v);
                 if (clean.length === 0) droppedText = true;
+                else keptText = true;
                 if (changed) {
                     if (!rebuilt) {
                         rebuilt = { ...ev, choices: choices.map((c) => ({ ...(c as Record<string, unknown>), delta: { ...((c as Record<string, unknown>)["delta"] as Record<string, unknown>) } })) };
@@ -627,9 +638,11 @@ export async function pipePluginChatWithStrip(
             }
         }
         if (rebuilt) {
-            // Delta carried nothing but the (now-stripped) text: drop the whole
-            // chunk instead of forwarding an empty content delta.
-            if (droppedText && !hadTextOtherThanTextFields(rebuilt["choices"])) {
+            // Delta carried no visible text after stripping: drop the whole
+            // chunk instead of forwarding an empty content delta. Only when
+            // EVERY managed text field emptied out — a sibling field with real
+            // content must survive (#462).
+            if (droppedText && !keptText && !hadTextOtherThanTextFields(rebuilt["choices"])) {
                 return "";
             }
             return rebuildEvent(rawEvent, rebuilt);
@@ -648,7 +661,7 @@ export async function pipePluginChatWithStrip(
             return rawEvent + "\n\n";
         }
         const raw = d[field] as string;
-        if (!containsRenderTagText(raw) && !anyPending()) {
+        if (!mayStartRenderTag(raw) && !anyPending()) {
             return rawEvent + "\n\n";
         }
         const [clean, changed] = pushField(field, index, raw);
@@ -691,7 +704,7 @@ export async function pipePluginChatWithStrip(
         }
         const rest = flushTails();
         if (rest.length > 0 && !res.destroyed && !res.writableEnded) await write(rest);
-        if (acc.inputTokens !== undefined || acc.outputTokens !== undefined || acc.cachedTokens !== undefined) {
+        if (session && (acc.inputTokens !== undefined || acc.outputTokens !== undefined || acc.cachedTokens !== undefined)) {
             applyUsageSample(session, acc, protocol);
             markDirty(session);
         }
@@ -727,11 +740,14 @@ function hadTextOtherThanTextFields(choices: unknown): boolean {
  * tag-echo state machine the compress loop uses. A held tail is flushed as a
  * final delta before the first done/completed event so the client's assembled
  * text never loses content.
- */
+ *
+ *  Also serves proxy-mode Responses SSE that skipped compress injection
+ *  (#460, e.g. ACP_NO_INJECT_TOOL). Pass no session there — see
+ *  pipePluginChatWithStrip for why usage accounting must be skipped. */
 export async function pipePluginResponsesWithStrip(
     stream: ReadableStream<Uint8Array>,
     res: import("node:http").ServerResponse,
-    session: Session,
+    session?: Session,
     log?: (msg: string) => void,
 ): Promise<void> {
     const reader = stream.getReader();
@@ -802,7 +818,7 @@ export async function pipePluginResponsesWithStrip(
                             await write(rawEvent + "\n\n");
                             continue;
                         }
-                        if (!containsRenderTagText(delta) && !tagFilter.pending()) {
+                        if (!mayStartRenderTag(delta) && !tagFilter.pending()) {
                             await write(rawEvent + "\n\n");
                             continue;
                         }
@@ -827,7 +843,7 @@ export async function pipePluginResponsesWithStrip(
             const rest = flushTail("");
             if (rest.length > 0) await write(rest);
         }
-        if (acc.inputTokens !== undefined || acc.outputTokens !== undefined || acc.cachedTokens !== undefined) {
+        if (session && (acc.inputTokens !== undefined || acc.outputTokens !== undefined || acc.cachedTokens !== undefined)) {
             applyUsageSample(session, acc, "responses");
             markDirty(session);
         }
