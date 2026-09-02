@@ -2623,9 +2623,9 @@ async function forward(
             const p = prepared;
             const tagLog = (msg: string) => log("info", `[${p.session.id}] ${msg}`);
             if (p.protocol === "responses") {
-                await pipePluginResponsesWithStrip(upstream.body as ReadableStream<Uint8Array>, res, undefined, tagLog);
+                await pipePluginResponsesWithStrip(responseBody, res, undefined, tagLog);
             } else {
-                await pipePluginChatWithStrip(upstream.body as ReadableStream<Uint8Array>, res, p.protocol, undefined, tagLog);
+                await pipePluginChatWithStrip(responseBody, res, p.protocol, undefined, tagLog);
             }
             clearUpstreamTimer();
         } else {
