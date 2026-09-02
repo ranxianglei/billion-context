@@ -1233,6 +1233,7 @@ async function handle(
         // otherwise the request is degenerate (output >= whole window) and the
         // self-heal above handles the resulting overflow. Feeds reqConfig (→
         // processTurn `config`), so diagNudge shows the reserved window (no extra log).
+        const nativeWindow = reqConfig.modelContextLimit;
         if (shouldReserveOutputHeadroom(protocol)) {
             const p = parsed as Record<string, unknown>;
             const rawMax = p.max_tokens ?? p.max_completion_tokens ?? p.max_output_tokens;
@@ -1264,10 +1265,10 @@ async function handle(
                         : protocol === "anthropic"
                           ? prepareAnthropic(parsed as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, pluginMode)
                           : protocol === "openai"
-                            ? prepareOpenai(parsed as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, pluginMode)
+                             ? prepareOpenai(parsed as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, pluginMode, nativeWindow)
                             : responsesCompact
                                ? prepareResponsesCompact(bodyBuffer, parsed as ResponsesRequestBody, session, req, core, reqConfig, log)
-                              : prepareResponses(parsed as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, responsesIdentity!, pluginMode, upstreamOrigin);
+                               : prepareResponses(parsed as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow);
                 prepared = runPrepare();
                 if (!countTokens && !responsesCompact) {
                     const outcome = await preflightCompressIfNeeded(
@@ -1382,7 +1383,9 @@ function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; cont
     // "INJECT" only when the nudge actually reaches the upstream payload. When
     // armed but suppressed by config/mode, say so explicitly so the log never
     // lies about delivery (#451, same class as #413).
-    const inject = !n.shouldInject ? "idle" : willInject ? `INJECT T${n.tier ?? "?"}` : `ARMED-SUPPRESSED T${n.tier ?? "?"}`;
+    const inject = willInject
+        ? (n.shouldInject ? `INJECT T${n.tier ?? "?"}` : `INJECT-ESC T${n.tier ?? "?"}`)
+        : (n.shouldInject ? `ARMED-SUPPRESSED T${n.tier ?? "?"}` : "idle");
     const modelTag = model ? ` model=${model}` : "";
     return `[${sessionId}] nudge ${inject}: usage=${pct} (${tokenCount}/${limit}), growth=${growth}/${floor} (ref=${ref}, interval=${interval}), pendingT1=${pendingT1}/${interval}${modelTag}, reason="${n.reason.slice(0, 120)}"`;
 }
@@ -1444,7 +1447,7 @@ function prepareAnthropic(
             if (t) session.meta.title = t;
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
-        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge?.shouldInject;
+        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
         processedMessages = stripKernelSummaries(turn.messages, turn.state);
         reapOrphanBlocks(session, msgs, deactivateBlock);
@@ -1485,6 +1488,70 @@ function prepareAnthropic(
     return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, renderTags: "text-only" } as Prepared;
 }
 
+// #453 hard backstop: cap the forwarded output budget so input+output can never
+// exceed the window on request-rebuilding upstreams (vLLM rejects an oversized
+// total instead of clamping). Non-Anthropic only — Anthropic enforces its input
+// limit independently of max_tokens (see shouldReserveOutputHeadroom). The proxy
+// owns both sides of the sum, so capping output to (window - input - margin)
+// makes the overflow impossible even when the agent ignores the compress nudge.
+const OUTPUT_CLAMP_MARGIN_PCT = 0.05;
+const OUTPUT_CLAMP_MIN_MARGIN = 2048;
+const OUTPUT_CLAMP_FLOOR = 1024;
+// #453 mitigation: host-side escalation line. The kernel already force-injects
+// every turn once usage >= nudge.maxContextLimitPct (its pressure branch has no
+// cadence gate), so the only cadence-silent zone is BELOW that line. Force the
+// nudge each turn once usage reaches this — kept under the default 0.75
+// over-limit line so it fills the pre-limit silent climb seen in #453/#14. Pure
+// host-side: renderNudgeText does not depend on shouldInject.
+const EMERGENCY_NUDGE_ESCALATION_PCT = 0.7;
+
+/** Conservative outbound-input estimate: the larger of the upstream-reported
+ *  previous-turn input (real tokenizer count, already includes system+tools) and
+ *  a fresh count of the rebuilt conversation text + system + tool definitions
+ *  (needed on turn 1 / right after a shrink, when lastInputTokens lags). */
+export function estimateInputTokens(processedMessages: CoreMessage[], systemText: string | undefined, tools: unknown, lastInputTokens: number): number {
+    const est = estimateCoreMessages(processedMessages)
+        + defaultCountTokens(systemText ?? "")
+        + defaultCountTokens(JSON.stringify(tools ?? []));
+    return Math.max(lastInputTokens > 0 ? lastInputTokens : 0, est);
+}
+
+/** Output-budget cap so input+output <= window. Returns the clamped budget, or
+ *  undefined when no reduction is needed (requested already fits, or the cap
+ *  drops below OUTPUT_CLAMP_FLOOR — i.e. input alone nearly fills the window,
+ *  which is preflight/self-heal territory, not output starvation). */
+export function clampOutputBudget(requested: number, inputEstimate: number, nativeWindow: number): number | undefined {
+    const margin = Math.max(OUTPUT_CLAMP_MIN_MARGIN, Math.ceil(inputEstimate * OUTPUT_CLAMP_MARGIN_PCT));
+    const cap = nativeWindow - inputEstimate - margin;
+    if (cap < OUTPUT_CLAMP_FLOOR || cap >= requested) return undefined;
+    return cap;
+}
+
+// Only override genuine cadence silences: skip the kernel's deliberate
+// "nothing compressible to offer" suppression (empty ranges).
+export function emergencyNudge(nudge: NudgeDecision | null | undefined, escalationPct: number = EMERGENCY_NUDGE_ESCALATION_PCT): boolean {
+    if (!nudge || nudge.shouldInject) return false;
+    if (nudge.compressibleRanges.length === 0) return false;
+    return nudge.contextUsage >= escalationPct;
+}
+
+function clampOutgoingOutput(
+    rebuilt: Record<string, unknown>,
+    field: "max_tokens" | "max_completion_tokens" | "max_output_tokens",
+    ctx: { systemText: string; tools: unknown; processedMessages: CoreMessage[]; lastInputTokens: number; nativeWindow: number },
+    sessionId: string,
+    log: (level: string, msg: string) => void,
+): void {
+    const raw = rebuilt[field];
+    if (typeof raw !== "number") return;
+    const inputEstimate = estimateInputTokens(ctx.processedMessages, ctx.systemText, ctx.tools, ctx.lastInputTokens);
+    const capped = clampOutputBudget(raw, inputEstimate, ctx.nativeWindow);
+    if (capped !== undefined) {
+        rebuilt[field] = capped;
+        log("info", `[${sessionId}] output budget clamped ${raw} -> ${capped} (input~${inputEstimate}, window=${ctx.nativeWindow}); prevents input+output overflow (#453)`);
+    }
+}
+
 function prepareOpenai(
     parsed: OpenAIRequestBody,
     req: http.IncomingMessage,
@@ -1495,6 +1562,7 @@ function prepareOpenai(
     log: (level: string, msg: string) => void,
     session: Session,
     pluginMode: boolean,
+    nativeWindow: number,
 ): Prepared {
     const sessionId = session.id;
     const stream = parsed.stream === true;
@@ -1544,7 +1612,7 @@ function prepareOpenai(
             if (t) session.meta.title = t;
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
-        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge?.shouldInject && shouldInject;
+        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
         processedMessages = stripKernelSummaries(turn.messages, turn.state);
         reapOrphanBlocks(session, msgs, deactivateBlock);
@@ -1584,6 +1652,7 @@ function prepareOpenai(
     }
 
     const rebuilt: OpenAIRequestBody = { ...parsed, messages: rebuiltMessages, tools: toolsOut as OpenAITool[] | undefined };
+    clampOutgoingOutput(rebuilt as Record<string, unknown>, typeof (parsed as Record<string, unknown>).max_completion_tokens === "number" ? "max_completion_tokens" : "max_tokens", { systemText: openaiSystemText, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, nativeWindow }, sessionId, log);
     // prompt_cache_retention is an OpenAI-host-only cache directive; the dsh
     // launcher forces PI_CACHE_RETENTION=long (for the session-id
     // prompt_cache_key) which makes the client also emit it. Third-party
@@ -1618,6 +1687,7 @@ function prepareResponses(
     identity: ConversationIdentity,
     pluginMode: boolean,
     upstreamOrigin: string,
+    nativeWindow: number,
 ): Prepared {
     const sessionId = session.id;
     const stream = parsed.stream === true;
@@ -1704,7 +1774,7 @@ function prepareResponses(
             if (t) session.meta.title = t;
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
-        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge?.shouldInject && shouldInject && !isCompactionTrigger;
+        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !isCompactionTrigger && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
         processedMessages = stripKernelSummaries(turn.messages, turn.state);
         reapOrphanBlocks(session, msgs, deactivateBlock);
@@ -1790,6 +1860,9 @@ function prepareResponses(
     }
 
     const rebuilt: ResponsesRequestBody = { ...parsed, input: rebuiltInput, tools: toolsOut };
+    if (!isCompactionTrigger) {
+        clampOutgoingOutput(rebuilt as Record<string, unknown>, "max_output_tokens", { systemText: (responsesProjection?.systemParts ?? []).join("\n"), tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, nativeWindow }, sessionId, log);
+    }
     // Route with the upstream THIS request goes to — session.meta.upstreamOrigin
     // is first-wins and would keep injecting pck toward a relay we switched
     // away from (same class of bug as the compressProtocol fix above, #286).
