@@ -536,12 +536,18 @@ function mergeUsageSample(acc: UsageSample, sample: UsageSample): void {
  *  model prose through the tag-echo state machine — #206 parity with
  *  pipePluginResponsesWithStrip. The verbatim variant let a model-emitted
  *  render tag echo land in the agent's replayed history and amplify into the
- *  "endless blank output" loop observed with pi + qwen (issue #14). */
+ *  "endless blank output" loop observed with pi + qwen (issue #14).
+ *
+ *  Also serves proxy-mode chat SSE that skipped compress injection (#460:
+ *  title-gen exclusion / ACP_NO_INJECT_TOOL / classifier bypass). Pass no
+ *  session there — usage accounting must be skipped or a title-gen call's
+ *  tiny input_tokens would clobber lastInputTokens and break compression
+ *  triggering for the main conversation. */
 export async function pipePluginChatWithStrip(
     stream: ReadableStream<Uint8Array>,
     res: import("node:http").ServerResponse,
-    session: Session,
     protocol: WireProtocol,
+    session?: Session,
     log?: (msg: string) => void,
 ): Promise<void> {
     const reader = stream.getReader();
@@ -698,7 +704,7 @@ export async function pipePluginChatWithStrip(
         }
         const rest = flushTails();
         if (rest.length > 0 && !res.destroyed && !res.writableEnded) await write(rest);
-        if (acc.inputTokens !== undefined || acc.outputTokens !== undefined || acc.cachedTokens !== undefined) {
+        if (session && (acc.inputTokens !== undefined || acc.outputTokens !== undefined || acc.cachedTokens !== undefined)) {
             applyUsageSample(session, acc, protocol);
             markDirty(session);
         }
@@ -734,11 +740,14 @@ function hadTextOtherThanTextFields(choices: unknown): boolean {
  * tag-echo state machine the compress loop uses. A held tail is flushed as a
  * final delta before the first done/completed event so the client's assembled
  * text never loses content.
- */
+ *
+ *  Also serves proxy-mode Responses SSE that skipped compress injection
+ *  (#460, e.g. ACP_NO_INJECT_TOOL). Pass no session there — see
+ *  pipePluginChatWithStrip for why usage accounting must be skipped. */
 export async function pipePluginResponsesWithStrip(
     stream: ReadableStream<Uint8Array>,
     res: import("node:http").ServerResponse,
-    session: Session,
+    session?: Session,
     log?: (msg: string) => void,
 ): Promise<void> {
     const reader = stream.getReader();
@@ -834,7 +843,7 @@ export async function pipePluginResponsesWithStrip(
             const rest = flushTail("");
             if (rest.length > 0) await write(rest);
         }
-        if (acc.inputTokens !== undefined || acc.outputTokens !== undefined || acc.cachedTokens !== undefined) {
+        if (session && (acc.inputTokens !== undefined || acc.outputTokens !== undefined || acc.cachedTokens !== undefined)) {
             applyUsageSample(session, acc, "responses");
             markDirty(session);
         }
