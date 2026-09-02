@@ -130,7 +130,7 @@ test("plugin chat passthrough drops a chunk whose delta stripped to empty", asyn
     }
 });
 
-test("plugin chat passthrough keeps sibling text when one field is a pure tag echo (#462)", async () => {
+test("plugin chat passthrough keeps sibling text when one field is a pure tag echo (#463)", async () => {
     const out: string[] = [];
     const res = makeRes(out);
     const session = makeSession();
@@ -138,13 +138,13 @@ test("plugin chat passthrough keeps sibling text when one field is a pure tag ec
         chatChunk({ content: "real answer", reasoning_content: `${TAG_OPEN}m00044${TAG_CLOSE}` }),
         DONE,
     ];
-    await pipePluginChatWithStrip(streamOf(events), res, session, "openai");
+    await pipePluginChatWithStrip(streamOf(events), res, "openai", session);
     const text = out.join("");
     assert.ok(!text.includes("m00044"), "echo-only sibling field stripped");
     assert.ok(text.includes("real answer"), "sibling field with real content must survive");
 });
 
-test("plugin chat passthrough still drops a chunk where every managed field is a pure tag echo (#462)", async () => {
+test("plugin chat passthrough still drops a chunk where every managed field is a pure tag echo (#463)", async () => {
     const out: string[] = [];
     const res = makeRes(out);
     const session = makeSession();
@@ -152,7 +152,7 @@ test("plugin chat passthrough still drops a chunk where every managed field is a
         chatChunk({ content: `${TAG_OPEN}m1${TAG_CLOSE}`, reasoning_content: `${TAG_OPEN}m2${TAG_CLOSE}` }),
         DONE,
     ];
-    await pipePluginChatWithStrip(streamOf(events), res, session, "openai");
+    await pipePluginChatWithStrip(streamOf(events), res, "openai", session);
     const text = out.join("");
     assert.ok(!text.includes("m1") && !text.includes("m2"), "echoes stripped");
     const dataLines = text.split("\n").filter((l) => l.startsWith("data:")).filter((l) => !l.includes("[DONE]"));
