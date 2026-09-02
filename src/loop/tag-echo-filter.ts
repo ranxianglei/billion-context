@@ -56,6 +56,17 @@ export function containsRenderTagText(s: string): boolean {
     return RENDER_TAG_DETECT.test(s);
 }
 
+// #468: some upstreams stream a model-imitated render tag in tokenizer-sized
+// fragments ("\x3cac", "p tokens", ...) so no single chunk ever trips
+// RENDER_TAG_DETECT. Per-chunk gates must also engage when the chunk contains
+// or ends with the head of a render tag, so the streaming state machine can
+// stitch it back together. Pure-prose chunks still skip the machine
+// (byte-identical passthrough); only chunks with a `<`-head tail ("<", "</",
+// "<a", "<ac", "<acp ...attrs", "\x3c/acp ...") engage it.
+export function mayStartRenderTag(s: string): boolean {
+    return RENDER_TAG_DETECT.test(s) || PARTIAL_TAIL.test(s);
+}
+
 // #361: tool-call XML template fragments a model may echo from the context
 // (same source as acp tag echo — the model "writes the tool call as text").
 // Detected + warned for attribution, NOT stripped: a closing tool-XML tag
