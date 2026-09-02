@@ -179,7 +179,7 @@ test("plugin chat passthrough strips a tag streamed in tokenizer-sized fragments
     const whole = `ok ${TAG_OPEN}m00042${TAG_CLOSE} tail`;
     const micro = whole.match(/.{1,4}/g) ?? [];
     const events = [...micro.map((piece) => chatChunk({ content: piece })), DONE];
-    await pipePluginChatWithStrip(streamOf(events), res, session, "openai");
+    await pipePluginChatWithStrip(streamOf(events), res, "openai", session);
     const text = out.join("");
     assert.ok(!text.includes("m00042"), "micro-fragmented tag never reassembles downstream");
     assert.ok(!text.includes("\x3cacp") && !text.includes("\x3c/acp"), "no tag fragment survives");
@@ -207,7 +207,7 @@ test("plugin anthropic passthrough strips a tag streamed in tokenizer-sized frag
         ...micro.map((piece) => `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: piece } })}\n\n`),
         `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" } })}\n\n`,
     ];
-    await pipePluginChatWithStrip(streamOf(events), res, session, "anthropic");
+    await pipePluginChatWithStrip(streamOf(events), res, "anthropic", session);
     const text = out.join("");
     assert.ok(!text.includes("m00042"), "micro-fragmented tag never reassembles downstream");
     assert.ok(!text.includes("\x3cacp") && !text.includes("\x3c/acp"), "no tag fragment survives");
