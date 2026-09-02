@@ -641,7 +641,7 @@ export async function pipePluginChatWithStrip(
             // Delta carried no visible text after stripping: drop the whole
             // chunk instead of forwarding an empty content delta. Only when
             // EVERY managed text field emptied out — a sibling field with real
-            // content must survive (#462).
+            // content must survive (#463).
             if (droppedText && !keptText && !hadTextOtherThanTextFields(rebuilt["choices"])) {
                 return "";
             }
