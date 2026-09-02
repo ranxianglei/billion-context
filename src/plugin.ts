@@ -7,7 +7,7 @@ import { acquireInFlight, listSessions, markDirty, peekSession, releaseInFlight,
 import { ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, PROXY_TOOL_NAMES } from "./compress-tool.js";
 import { executeProxyTool } from "./loop/core.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
-import { containsRenderTagText, createTagEchoFilter, stripResponsesText } from "./loop/tag-echo-filter.js";
+import { containsRenderTagText, createTagEchoFilter, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
 import type { WireProtocol } from "./util.js";
 import { stateDir } from "./paths.js";
@@ -529,28 +529,138 @@ function mergeUsageSample(acc: UsageSample, sample: UsageSample): void {
     if (sample.outputTokens !== undefined) acc.outputTokens = sample.outputTokens;
 }
 
-/** Plugin-mode streaming passthrough: forward upstream bytes verbatim (the
- *  agent's native tool loop must see the model's tool calls untouched) while
- *  sniffing usage out of the SSE events — without this, lastInputTokens
- *  would never update and compression nudges would never fire. */
-export async function pipeThroughWithUsage(
+/** Plugin-mode streaming passthrough for the OpenAI chat-completions and
+ *  Anthropic wires: forward upstream events byte-identical (the agent's
+ *  native tool loop must see the model's tool calls untouched) while (a)
+ *  sniffing usage so lastInputTokens keeps tracking reality and (b) running
+ *  model prose through the tag-echo state machine — #206 parity with
+ *  pipePluginResponsesWithStrip. The verbatim variant let a model-emitted
+ *  render tag echo land in the agent's replayed history and amplify into the
+ *  "endless blank output" loop observed with pi + qwen (issue #14). */
+export async function pipePluginChatWithStrip(
     stream: ReadableStream<Uint8Array>,
     res: import("node:http").ServerResponse,
     session: Session,
-    protocol?: WireProtocol,
+    protocol: WireProtocol,
+    log?: (msg: string) => void,
 ): Promise<void> {
     const reader = stream.getReader();
     const decoder = new TextDecoder("utf-8");
     let buf = "";
     const acc: UsageSample = {};
+    const onDrop = (snippet: string) => {
+        loggerLog("warn", `[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+        log?.(`[tag-echo] stripped model-emitted render tag from plugin passthrough text`);
+    };
+    // One state machine per (field, block/choice index) — interleaved choices
+    // or content blocks must not share partial-tag state.
+    const streams = new Map<string, { filter: TagEchoFilter; field: string; index: number }>();
+    const filterFor = (field: string, index: number) => {
+        const key = `${field}:${index}`;
+        let s = streams.get(key);
+        if (!s) {
+            s = { filter: createTagEchoFilter(onDrop), field, index };
+            streams.set(key, s);
+        }
+        return s;
+    };
+    const anyPending = () => {
+        for (const s of streams.values()) if (s.filter.pending()) return true;
+        return false;
+    };
+    let lastChunkMeta: Record<string, unknown> = {};
+    const syntheticTail = (field: string, index: number, tail: string): string => {
+        if (protocol === "anthropic") {
+            const deltaType = field === "text" ? "text_delta" : "thinking_delta";
+            return `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index, delta: { type: deltaType, [field]: tail } })}\n\n`;
+        }
+        return `data: ${JSON.stringify({ ...lastChunkMeta, object: "chat.completion.chunk", choices: [{ index, delta: { [field]: tail } }] })}\n\n`;
+    };
+    const flushTails = (): string => {
+        let out = "";
+        for (const s of streams.values()) {
+            const tail = s.filter.flush();
+            if (tail.length > 0) out += syntheticTail(s.field, s.index, tail);
+        }
+        return out;
+    };
+    const write = (s: string) => {
+        if (!res.write(Buffer.from(s, "utf8"))) {
+            return new Promise<void>((r) => res.once("drain", () => r()));
+        }
+    };
+    const pushField = (field: string, index: number, text: string): [string, boolean] => {
+        const s = filterFor(field, index);
+        const clean = s.filter.push(text);
+        return [clean, clean !== text];
+    };
+    const processOpenai = (ev: Record<string, unknown>, rawEvent: string): string => {
+        if (typeof ev["id"] === "string" || typeof ev["model"] === "string") {
+            lastChunkMeta = { id: ev["id"], created: ev["created"], model: ev["model"] };
+        }
+        const choices = ev["choices"];
+        if (!Array.isArray(choices)) {
+            return anyPending() ? flushTails() + rawEvent + "\n\n" : rawEvent + "\n\n";
+        }
+        let rebuilt: Record<string, unknown> | null = null;
+        let droppedText = false;
+        let hadText = false;
+        for (let ci = 0; ci < choices.length; ci++) {
+            const ch = choices[ci] as Record<string, unknown> | null;
+            const d = ch?.["delta"];
+            if (!d || typeof d !== "object") continue;
+            const dd = d as Record<string, unknown>;
+            for (const field of ["content", "reasoning_content", "reasoning"]) {
+                const v = dd[field];
+                if (typeof v !== "string") continue;
+                hadText = true;
+                if (!containsRenderTagText(v) && !anyPending()) continue;
+                const index = typeof ch?.["index"] === "number" ? ch["index"] : ci;
+                const [clean, changed] = pushField(field, index, v);
+                if (clean.length === 0) droppedText = true;
+                if (changed) {
+                    if (!rebuilt) {
+                        rebuilt = { ...ev, choices: choices.map((c) => ({ ...(c as Record<string, unknown>), delta: { ...((c as Record<string, unknown>)["delta"] as Record<string, unknown>) } })) };
+                    }
+                    (rebuilt["choices"] as Record<string, unknown>[])[ci]["delta"] = { ...((rebuilt["choices"] as Record<string, unknown>[])[ci]["delta"] as Record<string, unknown>), [field]: clean };
+                }
+            }
+        }
+        if (rebuilt) {
+            // Delta carried nothing but the (now-stripped) text: drop the whole
+            // chunk instead of forwarding an empty content delta.
+            if (droppedText && !hadTextOtherThanTextFields(rebuilt["choices"])) {
+                return "";
+            }
+            return rebuildEvent(rawEvent, rebuilt);
+        }
+        if (!hadText && anyPending()) return flushTails() + rawEvent + "\n\n";
+        return rawEvent + "\n\n";
+    };
+    const processAnthropic = (ev: Record<string, unknown>, rawEvent: string): string => {
+        if (ev["type"] !== "content_block_delta") {
+            return anyPending() ? flushTails() + rawEvent + "\n\n" : rawEvent + "\n\n";
+        }
+        const d = ev["delta"] as Record<string, unknown> | undefined;
+        const index = typeof ev["index"] === "number" ? ev["index"] : 0;
+        const field = d?.["type"] === "thinking_delta" ? "thinking" : d?.["type"] === "text_delta" ? "text" : null;
+        if (field === null || typeof d?.[field] !== "string") {
+            return rawEvent + "\n\n";
+        }
+        const raw = d[field] as string;
+        if (!containsRenderTagText(raw) && !anyPending()) {
+            return rawEvent + "\n\n";
+        }
+        const [clean, changed] = pushField(field, index, raw);
+        if (!changed) return rawEvent + "\n\n";
+        if (clean.length === 0 && Object.keys(d ?? {}).length <= 2) return "";
+        return rebuildEvent(rawEvent, { ...ev, delta: { ...d, [field]: clean } });
+    };
     try {
         for (;;) {
             const { done, value } = await reader.read();
             if (done) break;
             if (value && value.length > 0) {
-                if (!res.write(Buffer.from(value))) {
-                    await new Promise<void>((r) => res.once("drain", () => r()));
-                }
                 buf = normalizeSseLineEndings(buf + decoder.decode(value, { stream: true }));
                 let idx: number;
                 while ((idx = buf.indexOf("\n\n")) !== -1) {
@@ -559,20 +669,28 @@ export async function pipeThroughWithUsage(
                     const dataLines = rawEvent.split("\n").filter((l) => l.startsWith("data:"));
                     if (dataLines.length === 0) continue;
                     const jsonStr = dataLines.map((l) => l.slice(5).replace(/^ /, "")).join("\n").trim();
-                    if (!jsonStr || jsonStr === "[DONE]") continue;
+                    if (!jsonStr) continue;
+                    if (jsonStr === "[DONE]") {
+                        await write(flushTails() + rawEvent + "\n\n");
+                        continue;
+                    }
+                    let ev: Record<string, unknown>;
                     try {
-                        const ev = JSON.parse(jsonStr) as Record<string, unknown>;
-                        const sample = usageFromSseEvent(ev);
-                        if (sample) mergeUsageSample(acc, sample);
-                    } catch { /* non-JSON data line */ }
+                        ev = JSON.parse(jsonStr) as Record<string, unknown>;
+                    } catch {
+                        await write(rawEvent + "\n\n");
+                        continue;
+                    }
+                    const sample = usageFromSseEvent(ev);
+                    if (sample) mergeUsageSample(acc, sample);
+                    const out = protocol === "anthropic" ? processAnthropic(ev, rawEvent) : processOpenai(ev, rawEvent);
+                    if (out.length > 0) await write(out);
                 }
             }
             if (res.destroyed || res.writableEnded) break;
         }
-        // Apply BEFORE res.end() in the finally below: the client can issue
-        // its next request (e.g. /__bili/plugin/status, or the follow-up turn
-        // that reads lastInputTokens for the nudge decision) the moment the
-        // stream completes, and those must already see this usage.
+        const rest = flushTails();
+        if (rest.length > 0 && !res.destroyed && !res.writableEnded) await write(rest);
         if (acc.inputTokens !== undefined || acc.outputTokens !== undefined || acc.cachedTokens !== undefined) {
             applyUsageSample(session, acc, protocol);
             markDirty(session);
@@ -583,8 +701,21 @@ export async function pipeThroughWithUsage(
     }
 }
 
-/** Plugin-mode non-streaming passthrough: same contract as
- *  pipeThroughWithUsage but for a single JSON body. */
+function hadTextOtherThanTextFields(choices: unknown): boolean {
+    if (!Array.isArray(choices)) return true;
+    for (const c of choices) {
+        if (!c || typeof c !== "object") continue;
+        const ch = c as Record<string, unknown>;
+        if (typeof ch["finish_reason"] === "string") return true;
+        const d = ch["delta"] as Record<string, unknown> | undefined;
+        if (!d) continue;
+        for (const k of Object.keys(d)) {
+            if (k !== "content" && k !== "reasoning_content" && k !== "reasoning") return true;
+        }
+    }
+    return false;
+}
+
 /**
  * Plugin-mode Responses passthrough with render-tag stripping (#206 parity
  * for VERBATIM plugin streams). In plugin mode the native tool loop owns the
@@ -758,16 +889,15 @@ export async function pipePluginJson(
             }
         }
     } catch { /* non-JSON body — forward verbatim */ }
-    if (protocol === "responses") {
+    if (containsRenderTagText(text)) {
         // #206 parity for the non-streaming plugin path: the compress loop's
-        // JSON branch strips render tags from every round (compressLoopResponsesJson);
-        // a verbatim plugin JSON response would re-feed the model's tag echoes.
+        // JSON branch strips render tags from every round; a verbatim plugin
+        // JSON response would re-feed the model's tag echoes.
         try {
             const json = JSON.parse(text) as Record<string, unknown>;
-            if (containsRenderTagText(text)) {
-                res.end(Buffer.from(JSON.stringify(stripResponsesText(json)), "utf8"));
-                return;
-            }
+            const stripped = protocol === "responses" ? stripResponsesText(json) : protocol === "anthropic" ? stripAnthropicText(json) : stripOpenaiChatText(json);
+            res.end(Buffer.from(JSON.stringify(stripped), "utf8"));
+            return;
         } catch { /* fall through to verbatim */ }
     }
     res.end(text);

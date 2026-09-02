@@ -63,7 +63,7 @@ import { observeResponsesTerminalState } from "./stream-terminal.js";
 import { emitStreamError } from "./stream-error.js";
 import { affinityToken, clientConversationHeader, codexTurnIdentity, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
-import { consumePluginRegisterFor, flushConversations, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, loadConversations, pipePluginJson, pipePluginResponsesWithStrip, pipeThroughWithUsage, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
+import { consumePluginRegisterFor, flushConversations, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import { systemToUser, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, shouldReserveOutputHeadroom, usageTotals } from "./util.js";
@@ -2561,7 +2561,7 @@ async function forward(
             if (prepared.protocol === "responses") {
                 await pipePluginResponsesWithStrip(upstream.body as ReadableStream<Uint8Array>, res, prepared.session, (msg) => log("info", `[${prepared.session.id}] ${msg}`));
             } else {
-                await pipeThroughWithUsage(upstream.body as ReadableStream<Uint8Array>, res, prepared.session, prepared.protocol);
+                await pipePluginChatWithStrip(upstream.body as ReadableStream<Uint8Array>, res, prepared.session, prepared.protocol, (msg) => log("info", `[${prepared.session.id}] ${msg}`));
             }
         } else {
             await pipePluginJson(upstream.body as ReadableStream<Uint8Array>, res, prepared.session, prepared.protocol);

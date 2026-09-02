@@ -202,6 +202,61 @@ function stripItemContent(it: unknown): unknown {
     return it;
 }
 
+function stripIfString(v: unknown): unknown {
+    return typeof v === "string" ? stripAcpTags(v) : v;
+}
+
+// Plugin-passthrough parity for the OpenAI chat-completions wire (issue #14:
+// pi + qwen echoed render tags through the verbatim plugin stream): strip the
+// text fields a chat chunk / completion carries — `choices[].delta.{content,
+// reasoning_content, reasoning}` on streams and `choices[].message.*` on
+// non-streaming bodies. Mutates in place, mirroring stripResponsesText.
+export function stripOpenaiChatText<T>(obj: T): T {
+    if (!obj || typeof obj !== "object") return obj;
+    const o = obj as Record<string, unknown>;
+    if (!Array.isArray(o["choices"])) return obj;
+    o["choices"] = (o["choices"] as unknown[]).map((c) => {
+        if (!c || typeof c !== "object") return c;
+        const ch = c as Record<string, unknown>;
+        for (const holder of ["delta", "message"]) {
+            const h = ch[holder];
+            if (h && typeof h === "object") {
+                const hh = { ...(h as Record<string, unknown>) };
+                hh["content"] = stripIfString(hh["content"]);
+                hh["reasoning_content"] = stripIfString(hh["reasoning_content"]);
+                hh["reasoning"] = stripIfString(hh["reasoning"]);
+                ch[holder] = hh;
+            }
+        }
+        return ch;
+    });
+    return obj;
+}
+
+// Plugin-passthrough parity for the Anthropic wire: strip `delta.{text,
+// thinking}` on content_block_delta streams and `content[].{text,thinking}`
+// on non-streaming message bodies. Mutates in place.
+export function stripAnthropicText<T>(obj: T): T {
+    if (!obj || typeof obj !== "object") return obj;
+    const o = obj as Record<string, unknown>;
+    const d = o["delta"];
+    if (d && typeof d === "object") {
+        const dd = { ...(d as Record<string, unknown>) };
+        dd["text"] = stripIfString(dd["text"]);
+        dd["thinking"] = stripIfString(dd["thinking"]);
+        o["delta"] = dd;
+    }
+    if (Array.isArray(o["content"])) {
+        o["content"] = (o["content"] as unknown[]).map((c) => {
+            if (!c || typeof c !== "object") return c;
+            const cc = c as Record<string, unknown>;
+            if (typeof cc["text"] !== "string" && typeof cc["thinking"] !== "string") return c;
+            return { ...cc, text: stripIfString(cc["text"]), thinking: stripIfString(cc["thinking"]) };
+        });
+    }
+    return obj;
+}
+
 // Strip render tags from the text fields of a Responses-API event/response
 // object (mutates in place). Handles the shapes that carry literal text:
 // output_text.done `.text`, content_part.done `.part.text`,
