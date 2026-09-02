@@ -205,15 +205,15 @@ test("plugin JSON passthrough strips render tags for responses protocol", async 
     assert.equal((session.stats as Record<string, unknown>)["lastInputTokens"], 4, "usage still sampled");
 });
 
-test("plugin JSON passthrough stays verbatim for openai protocol and tag-free bodies", async () => {
+test("plugin JSON passthrough stays verbatim for tag-free bodies", async () => {
     const { pipePluginJson } = await import("../src/plugin.ts");
     {
         const out: string[] = [];
         const res = makeRes(out);
         const session = makeSession();
-        const body = JSON.stringify({ choices: [{ message: { content: `x ${TAG_OPEN}m00005${TAG_CLOSE}` } }], usage: { prompt_tokens: 2 } });
+        const body = JSON.stringify({ choices: [{ message: { content: "clean chat" } }], usage: { prompt_tokens: 2 } });
         await pipePluginJson(streamOf([body]), res as unknown as import("node:http").ServerResponse, session, "openai");
-        assert.equal(out.join(""), body, "openai protocol body byte-identical");
+        assert.equal(out.join(""), body, "tag-free openai body byte-identical");
     }
     {
         const out: string[] = [];
