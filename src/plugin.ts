@@ -7,7 +7,7 @@ import { acquireInFlight, listSessions, markDirty, peekSession, releaseInFlight,
 import { ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, PROXY_TOOL_NAMES } from "./compress-tool.js";
 import { executeProxyTool } from "./loop/core.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
-import { containsRenderTagText, createTagEchoFilter, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
+import { containsRenderTagText, endsPartialTag, createTagEchoFilter, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
 import type { WireProtocol } from "./util.js";
 import { stateDir } from "./paths.js";
@@ -621,7 +621,7 @@ export async function pipePluginChatWithStrip(
                 const v = dd[field];
                 if (typeof v !== "string") continue;
                 hadText = true;
-                if (!containsRenderTagText(v) && !anyPending()) {
+                if (!containsRenderTagText(v) && !endsPartialTag(v) && !anyPending()) {
                     if (v.length > 0) keptText = true;
                     continue;
                 }
@@ -661,7 +661,7 @@ export async function pipePluginChatWithStrip(
             return rawEvent + "\n\n";
         }
         const raw = d[field] as string;
-        if (!containsRenderTagText(raw) && !anyPending()) {
+        if (!containsRenderTagText(raw) && !endsPartialTag(raw) && !anyPending()) {
             return rawEvent + "\n\n";
         }
         const [clean, changed] = pushField(field, index, raw);
@@ -818,7 +818,7 @@ export async function pipePluginResponsesWithStrip(
                             await write(rawEvent + "\n\n");
                             continue;
                         }
-                        if (!containsRenderTagText(delta) && !tagFilter.pending()) {
+                        if (!containsRenderTagText(delta) && !endsPartialTag(delta) && !tagFilter.pending()) {
                             await write(rawEvent + "\n\n");
                             continue;
                         }
@@ -875,9 +875,11 @@ function rebuildEvent(rawEvent: string, ev: Record<string, unknown>): string {
 export async function pipePluginJson(
     stream: ReadableStream<Uint8Array>,
     res: import("node:http").ServerResponse,
-    session: Session,
+    session?: Session,
     protocol?: WireProtocol,
 ): Promise<void> {
+    // Also serves proxy-mode JSON responses that skipped compress injection
+    // (#460 residual) — pass no session there so usage accounting stays off.
     const reader = stream.getReader();
     const chunks: Buffer[] = [];
     for (;;) {
@@ -890,7 +892,7 @@ export async function pipePluginJson(
     try {
         const json = JSON.parse(text) as Record<string, unknown>;
         const usage = json["usage"] as Record<string, unknown> | undefined;
-        if (usage) {
+        if (session && usage) {
             const input = num(usage["prompt_tokens"]) ?? num(usage["input_tokens"]);
             if (input !== undefined) {
                 applyUsageSample(session, {

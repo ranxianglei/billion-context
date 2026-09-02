@@ -56,6 +56,16 @@ export function containsRenderTagText(s: string): boolean {
     return RENDER_TAG_DETECT.test(s);
 }
 
+// Fast-path callers (plugin passthrough pipes) skip the state machine for text
+// with no visible tag — but a render tag whose OPENING straddles a stream chunk
+// boundary ("…<ac" | "p tokens=…">") matches no detector on any single chunk,
+// so the filter is never fed, never goes pending, and the whole tag echoes to
+// the client (#460). A chunk that merely ENDS with a tag-like fragment must
+// reach the filter too: it holds the fragment and the next chunk completes it.
+export function endsPartialTag(s: string): boolean {
+    return PARTIAL_TAIL.exec(s) !== null;
+}
+
 // #361: tool-call XML template fragments a model may echo from the context
 // (same source as acp tag echo — the model "writes the tool call as text").
 // Detected + warned for attribution, NOT stripped: a closing tool-XML tag
@@ -196,11 +206,17 @@ function stripParts(content: unknown): unknown {
 }
 
 function stripItemContent(it: unknown): unknown {
-    if (it && typeof it === "object" && Array.isArray((it as Record<string, unknown>).content)) {
-        return { ...(it as Record<string, unknown>), content: stripParts((it as Record<string, unknown>).content) };
+    if (!it || typeof it !== "object") return it;
+    const i = it as Record<string, unknown>;
+    if (typeof i["text"] !== "string" && !Array.isArray(i["content"])) return it;
+    // An output item carries prose either in `content[].text` (message items)
+    // or, on bridges that flatten parts, in a top-level `text` — strip both.
+    return {
+        ...i,
+        ...(typeof i["text"] === "string" ? { text: stripAcpTags(i["text"]) } : {}),
+        ...(Array.isArray(i["content"]) ? { content: stripParts(i["content"]) } : {}),
+        };
     }
-    return it;
-}
 
 function stripIfString(v: unknown): unknown {
     return typeof v === "string" ? stripAcpTags(v) : v;

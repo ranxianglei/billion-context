@@ -167,7 +167,8 @@ test("plugin passthrough resolves held tail at stream end without a done-family 
     ];
     await pipePluginResponsesWithStrip(streamOf(events2), res2, session);
     const text2 = out2.join("");
-    assert.ok(text2.includes(`"delta":"prose \x3cac"`), "ambiguous prefix passes through untouched at stream end");
+    assert.ok(text2.includes('"delta":"prose "'), "clean prefix passes");
+    assert.ok(text2.includes('"delta":"\x3cac"'), "ambiguous prefix is emitted at stream end, never swallowed");
 });
 
 test("plugin passthrough rebuildEvent collapses multi-line data payloads into one line", async () => {
