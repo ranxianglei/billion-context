@@ -44,6 +44,13 @@ export interface LoopCtx {
     textProtocol?: boolean;
     debug?: boolean;
     nudge?: NudgeDecision;
+    /** #422: host hook that re-runs the kernel fold (processTurn) on the
+     *  original messages with the CURRENT session state, re-attaching this
+     *  loop's round records. Called after a successful compress so the
+     *  re-request reflects the compression the model just performed instead
+     *  of the pre-compress view (stale view = model sees zero effect + a
+     *  finished deliverable → wraps up and stops). */
+    refreshFolded?: (current: CoreMessage[]) => CoreMessage[];
     // Which wire protocol produced the usage the loop records. Needed to
     // compute the true context total correctly (Anthropic reports
     // input_tokens as NEW-only; OpenAI/Responses report the TOTAL).
@@ -379,6 +386,31 @@ export async function* runCompressLoop(
                         ctx.log(`[acp-loop] round ${round} hideConsumed hid ${hidden.hidden} compress record(s)`);
                         coreMessages.length = 0;
                         coreMessages.push(...hidden.messages);
+                    }
+                }
+                // #422: a successful compress changed the session state — refresh
+                // the fold so the re-request shows the post-compress view. Falls
+                // back to the pre-compress view (previous behavior) if the host
+                // hook is absent or throws.
+                if (
+                    ctx.refreshFolded &&
+                    proxyResults.some((pr) => pr.name === "compress" && !pr.result.includes("FAILED"))
+                ) {
+                    try {
+                        const refreshed = ctx.refreshFolded(coreMessages);
+                        if (refreshed.length > 0) {
+                            coreMessages.length = 0;
+                            coreMessages.push(...refreshed);
+                            // The fold has now materialized in a request the
+                            // model actually sees — the next usage report is
+                            // post-fold reality; keeping the credit would net
+                            // the savings twice (recordUsage).
+                            ctx.session.stats.compressCreditTokens = 0;
+                            ctx.log(`[acp-loop] round ${round}: re-request view refreshed to post-compress fold`);
+                        }
+                    } catch (err) {
+                        ctx.log(`[acp-loop] round ${round}: fold refresh failed (${String(err)}); keeping pre-compress view`);
+                        loggerLog("warn", `[acp-loop] fold refresh failed: ${String(err)}`);
                     }
                 }
             }

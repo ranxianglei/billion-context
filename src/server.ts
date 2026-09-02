@@ -535,6 +535,11 @@ type Prepared = {
      *  rebuilt payload and compress-loop round must re-inject it. */
     openaiSystemText?: string;
     nudge?: NudgeDecision;
+    /** Render strategy the prepare used for processTurn ("none" for codex
+     *  compaction triggers / ACP_RENDER_NONE). The #422 fold-refresh hook in
+     *  forward() re-runs processTurn with the same strategy so the re-request
+     *  renders tags exactly like the request that produced it. */
+    renderTags?: "text-only" | "none";
      /** Effective compression prompts for this request (three-level cascade,
       *  defaults to the kernel's defaultPrompts). Carried so the compress loop
       *  in forward() rebuilds the SAME system prompt the request was prepared
@@ -1470,7 +1475,7 @@ function prepareAnthropic(
     // identity chain (#268), not part of the Anthropic Messages API — strip it
     // so the real upstream never sees a field it doesn't know.
     delete (rebuilt as Record<string, unknown>).prompt_cache_key;
-    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, renderTags: "text-only" } as Prepared;
 }
 
 function prepareOpenai(
@@ -1587,7 +1592,7 @@ function prepareOpenai(
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: injectTools, pluginMode, nudge, prompts, openaiSystemText } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: injectTools, pluginMode, nudge, prompts, openaiSystemText, renderTags: "text-only" } as Prepared;
 }
 
 function prepareResponses(
@@ -1661,6 +1666,7 @@ function prepareResponses(
     // first-wins and would silently ignore the new relay's route settings).
     const responsesTextProtocol = FORCE_TEXT_PROTOCOL ||
         resolveCompressProtocol(opts.routes, upstreamOrigin) === "marker";
+    const renderTags: "text-only" | "none" = process.env.ACP_RENDER_NONE || isCompactionTrigger ? "none" : "text-only";
 
     try {
         const projection = responsesToCore(parsed);
@@ -1671,7 +1677,7 @@ function prepareResponses(
             log("info", `[${sessionId}] input items: ${Array.isArray(parsed.input) ? parsed.input.map((i: ResponseInputItem) => i.type).join(",") : "(string)"}`);
         }
         const tokenCount = session.stats.lastInputTokens;
-        const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: process.env.ACP_RENDER_NONE || isCompactionTrigger ? "none" : "text-only" });
+        const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags });
         session.state = turn.state;
         // The fold from last turn's compress has now materialized in state —
         // future usage reports are post-fold reality, drop the credit.
@@ -1822,6 +1828,7 @@ function prepareResponses(
         responsesTextProtocol,
         nudge,
         prompts,
+        renderTags,
         resetAfterSuccess: isCompactionTrigger,
         codexForge,
     };
@@ -2603,9 +2610,25 @@ async function forward(
             const textProtocol = prepared.protocol === "responses" && !!prepared.responsesTextProtocol;
             const systemPrompt = textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts);
             const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText);
+            const refreshFolded = (current: CoreMessage[]): CoreMessage[] => {
+                // #422: mirror the prepare's fold with the post-compress state so
+                // the re-request shows the compression the model just performed.
+                // Records from this loop round (acp_loop_* namespace) ride on top
+                // so the model still sees its own compress call + result.
+                const turn = core.processTurn({
+                    messages: prepared.originalMessages,
+                    state: prepared.session.state,
+                    config,
+                    tokenCount: prepared.session.stats.lastInputTokens,
+                    renderTags: prepared.renderTags ?? "text-only",
+                });
+                prepared.session.state = turn.state;
+                const records = current.filter((m) => typeof m.id === "string" && m.id.startsWith("acp_loop_"));
+                return stripKernelSummaries([...turn.messages, ...records] as BiliMessage[], turn.state) as CoreMessage[];
+            };
             const loop = runCompressLoop(
                 streamToRead,
-                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, protocol: prepared.protocol, textProtocol, debug: opts.debug, nudge: prepared.nudge },
+                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, protocol: prepared.protocol, textProtocol, debug: opts.debug, nudge: prepared.nudge, refreshFolded },
                 parsedReq,
                 { url: upstreamUrl, headers: reqHeaders },
                 adapter,
