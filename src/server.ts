@@ -1369,7 +1369,7 @@ function diagTagSummary(messages: CoreMessage[], sessionId: string, strategy: st
     return `[${sessionId}] processTurn: ${messages.length} msgs, renderTags=${strategy}, ${textTagged} text tagged, ${toolTagged} tool tagged (should be 0 with text-only)`;
 }
 
-function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; contextUsage: number; tier: number | null; breakdown?: Record<string, number> } | null }, sessionId: string, tokenCount: number, limit: number, model?: string): string {
+function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; contextUsage: number; tier: number | null; breakdown?: Record<string, number> } | null }, sessionId: string, tokenCount: number, limit: number, model: string | undefined, willInject: boolean): string {
     const n = turn.nudge;
     if (!n) return `[${sessionId}] nudge: unavailable`;
     const b = n.breakdown ?? {};
@@ -1379,7 +1379,10 @@ function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; cont
     const interval = b["nudgeGrowthTokens"] ?? 0;
     const pendingT1 = b["pendingT1"] ?? 0;
     const ref = b["growthReference"] ?? 0;
-    const inject = n.shouldInject ? `INJECT T${n.tier ?? "?"}` : "idle";
+    // "INJECT" only when the nudge actually reaches the upstream payload. When
+    // armed but suppressed by config/mode, say so explicitly so the log never
+    // lies about delivery (#451, same class as #413).
+    const inject = !n.shouldInject ? "idle" : willInject ? `INJECT T${n.tier ?? "?"}` : `ARMED-SUPPRESSED T${n.tier ?? "?"}`;
     const modelTag = model ? ` model=${model}` : "";
     return `[${sessionId}] nudge ${inject}: usage=${pct} (${tokenCount}/${limit}), growth=${growth}/${floor} (ref=${ref}, interval=${interval}), pendingT1=${pendingT1}/${interval}${modelTag}, reason="${n.reason.slice(0, 120)}"`;
 }
@@ -1441,7 +1444,8 @@ function prepareAnthropic(
             if (t) session.meta.title = t;
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
-        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model));
+        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge?.shouldInject;
+        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
         processedMessages = stripKernelSummaries(turn.messages, turn.state);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = coreToAnthropic(processedMessages as BiliMessage[], cacheControls);
@@ -1452,9 +1456,12 @@ function prepareAnthropic(
         }
         // Nudge as a separate trailing user message (cache-friendly): the
         // system block stays byte-stable so the prefix cache survives.
-        // Gated by !pluginMode: in plugin mode the agent owns compression
-        // (its own overflow self-heal), so a proxy-injected nudge is redundant.
-        if (opts.compress.injectNudge && !pluginMode && turn.nudge?.shouldInject) {
+        // Injected in BOTH modes (#451): in plugin mode the agent supplies the
+        // ACP tools but has NO nudge channel of its own, so this proxy-side
+        // nudge IS the proactive trigger — preflight alone only fires at the
+        // hard limit. Ephemeral user message: not persisted, never enters the
+        // agent's re-sent history, safe for the prefix-cache anchor.
+        if (willInjectNudge && turn.nudge) {
             try {
                 const rendered = renderNudgeText(turn.nudge, prompts);
                 if (rendered.text) {
@@ -1537,7 +1544,8 @@ function prepareOpenai(
             if (t) session.meta.title = t;
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
-        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model));
+        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge?.shouldInject && shouldInject;
+        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
         processedMessages = stripKernelSummaries(turn.messages, turn.state);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = systemToUser(coreToOpenai(processedMessages as BiliMessage[]));
@@ -1555,10 +1563,13 @@ function prepareOpenai(
         if (injectTools) {
             toolsOut = injectOpenaiTool(parsed.tools);
         }
-        // Nudge as a separate trailing user message (cache-friendly).
-        // Gated by !pluginMode: in plugin mode the agent owns compression
-        // (its own overflow self-heal), so a proxy-injected nudge is redundant.
-        if (opts.compress.injectNudge && !pluginMode && turn.nudge?.shouldInject && shouldInject) {
+        // Nudge as a separate trailing user message (cache-friendly). Injected
+        // in BOTH modes (#451): plugin agents supply the ACP tools but have no
+        // nudge channel of their own, so this proxy-side nudge is the proactive
+        // trigger (preflight alone fires only at the hard limit). Ephemeral user
+        // message — not persisted, never enters the agent's re-sent history,
+        // prefix-cache-anchor safe.
+        if (willInjectNudge && turn.nudge) {
             try {
                 const rendered = renderNudgeText(turn.nudge, prompts);
                 if (rendered.text) {
@@ -1693,7 +1704,8 @@ function prepareResponses(
             if (t) session.meta.title = t;
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
-        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model));
+        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge?.shouldInject && shouldInject && !isCompactionTrigger;
+        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
         processedMessages = stripKernelSummaries(turn.messages, turn.state);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltInput = patchResponsesInput(projection, processedMessages);
@@ -1721,10 +1733,12 @@ function prepareResponses(
         }
         // A nudge appended after a trailing `compaction_trigger` would break
         // the upstream's "must be the final input item" requirement and is
-        // redundant — the native compact IS the compression. Gated by
-        // !pluginMode: in plugin mode the agent owns compression (its own
-        // overflow self-heal), so a proxy-injected nudge is redundant.
-        if (opts.compress.injectNudge && !pluginMode && turn.nudge?.shouldInject && shouldInject && !isCompactionTrigger) {
+        // redundant — the native compact IS the compression. Otherwise injected
+        // in BOTH modes (#451): plugin agents supply the ACP tools but have no
+        // nudge channel of their own, so this proxy-side nudge is the proactive
+        // trigger (preflight alone fires only at the hard limit). Ephemeral user
+        // message — not persisted, prefix-cache-anchor safe.
+        if (willInjectNudge && turn.nudge) {
             try {
                 const rendered = renderNudgeText(turn.nudge, prompts);
                 if (rendered.text) {
