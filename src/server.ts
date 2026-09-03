@@ -2647,7 +2647,7 @@ async function forward(
             // so a non-injected JSON response must not hand the model's echoes
             // back untouched. Same pipe as plugin mode; no session, so usage
             // accounting stays off for the same reason as above.
-            await pipePluginJson(upstream.body as ReadableStream<Uint8Array>, res, undefined, prepared.protocol);
+            await pipePluginJson(responseBody, res, undefined, prepared.protocol);
             clearUpstreamTimer();
         } else {
             await pipeThrough(responseBody, res);
