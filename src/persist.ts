@@ -215,6 +215,13 @@ export class SessionStore {
         const byLabel = new Map<string, { id: string; savedAt: number; session: Session }>();
         let unlabeled = 0;
         for (const [id, envelope] of loaded) {
+            // #499: anonymous prefix-affinity sessions (#309) carry the shared
+            // display label "prefix-affinity" ≠ their pfa- id — they are
+            // CURRENT-format, not legacy derived-hash sessions. Migrating them
+            // would rekey every pfa session to the single id "prefix-affinity"
+            // and DELETE all but the newest sibling on every boot (silent data
+            // loss of saved compression state).
+            if (id.startsWith("pfa-")) continue;
             const session = buildSession(envelope.payload);
             const label = session.meta.label;
             if (!label) {
