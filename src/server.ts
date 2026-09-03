@@ -1388,6 +1388,39 @@ function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; cont
     return `[${sessionId}] nudge ${inject}: usage=${pct} (${tokenCount}/${limit}), growth=${growth}/${floor} (ref=${ref}, interval=${interval}), pendingT1=${pendingT1}/${interval}${modelTag}, reason="${n.reason.slice(0, 120)}"`;
 }
 
+// #436: the kernel re-arms its nudge cadence from lastShownByTier (stamped on
+// injection, NOT on a successful compress). When the model ignores a nudge that
+// reference stays high, so the full growth floor must re-accumulate before the
+// next nudge even with a large ready range un-compressed ("blocked: T1
+// (cadence)"). Force a repeat tier-1 nudge at a shorter cadence. Mutates the
+// decision post-processTurn (kernel lastShownByTier untouched); tracks its own
+// interval in session.metadata so it doesn't nudge every turn.
+function maybeForceRepeatNudge(
+    turn: { nudge?: NudgeDecision | null },
+    session: Session,
+    pluginMode: boolean,
+    log: (level: string, msg: string) => void,
+): void {
+    if (pluginMode) return;
+    const nudge = turn.nudge;
+    if (!nudge || nudge.shouldInject) return;
+    const bd = nudge.breakdown;
+    const pendingT1 = bd.pendingT1;
+    const interval = bd.nudgeGrowthTokens;
+    if (interval <= 0 || pendingT1 < interval) return;
+    const lastShown = session.state.nudge?.lastNudgeShownTokens ?? 0;
+    if (lastShown <= 0) return;
+    const shortCadence = Math.max(5000, Math.floor(bd.growthFloor / 2));
+    const tokenCount = bd.growthReference + bd.growth;
+    const lastForced = (session.metadata.lastForcedNudgeTokens as number | undefined) ?? 0;
+    if (tokenCount - lastForced < shortCadence) return;
+    nudge.shouldInject = true;
+    nudge.tier = 1;
+    nudge.reason = `forced repeat nudge: model ignored prior nudge (ready T1 ${pendingT1}, growth ${bd.growth} since injection at ${lastShown})`;
+    session.metadata.lastForcedNudgeTokens = tokenCount;
+    log("info", `[${session.id}] nudge FORCED repeat T1: model ignored prior nudge (ready T1 ${pendingT1}, growth ${bd.growth} since injection at ${lastShown}, now ${tokenCount})`);
+}
+
 function prepareAnthropic(
     parsed: AnthropicRequestBody,
     req: http.IncomingMessage,
@@ -1439,6 +1472,7 @@ function prepareAnthropic(
         // (kernel validates the whole batch). Mirrors billion-context-pi.
         if (turn.nudge) turn.nudge.compressibleRanges = viableRanges(turn.nudge.compressibleRanges);
         nudge = turn.nudge;
+        maybeForceRepeatNudge(turn, session, pluginMode, log);
         session.stats.contextTokens = tokenCount;
         if (!session.meta.title) {
             const t = deriveTitle(msgs);
@@ -1539,6 +1573,7 @@ function prepareOpenai(
         // (kernel validates the whole batch). Mirrors billion-context-pi.
         if (turn.nudge) turn.nudge.compressibleRanges = viableRanges(turn.nudge.compressibleRanges);
         nudge = turn.nudge;
+        maybeForceRepeatNudge(turn, session, pluginMode, log);
         session.stats.contextTokens = tokenCount;
         if (!session.meta.title) {
             const t = deriveTitle(msgs);
@@ -1699,6 +1734,7 @@ function prepareResponses(
         // (kernel validates the whole batch). Mirrors billion-context-pi.
         if (turn.nudge) turn.nudge.compressibleRanges = viableRanges(turn.nudge.compressibleRanges);
         nudge = turn.nudge;
+        maybeForceRepeatNudge(turn, session, pluginMode, log);
         session.stats.contextTokens = tokenCount;
         if (!session.meta.title) {
             const t = deriveTitle(msgs);
