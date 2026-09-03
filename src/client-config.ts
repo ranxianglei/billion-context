@@ -566,17 +566,34 @@ export function loadClientConfig(env: NodeJS.ProcessEnv, cwd: string): ClientCon
     return config;
 }
 
-/** Collect per-model context windows from every client config the launcher
- *  can read (pi models.json, omp models.yml, opencode opencode.json, codex
- *  config.toml). Same model id under multiple providers → the LARGEST window
- *  wins (the client will route by id; the proxy only needs the denominator). */
-export function collectModelWindows(config: ClientConfig): Record<string, number> {
+/** The client a launcher run targets. Scopes model-window collection so a
+ *  launched client's own declarations are authoritative (#436: launching
+ *  `bili omp` with omp's models.yml declaring 131072 must not be overridden by
+ *  another client's larger declaration for the same model id). */
+export type ModelWindowScope = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh";
+
+/** Collect per-model context windows from client configs the launcher can
+ *  read (pi models.json, omp models.yml, opencode opencode.json, codex
+ *  config.toml). With `scope`, ONLY that client's declarations are collected —
+ *  the launched client's config is authoritative for its own proxy (#436:
+ *  cross-client max-wins silently discarded the user's smaller configured
+ *  window). Without `scope`, merges every client (legacy behavior). Same model
+ *  id under multiple providers of the same client → the LARGEST window wins
+ *  (the client will route by id; the proxy only needs the denominator). */
+export function collectModelWindows(config: ClientConfig, scope?: ModelWindowScope): Record<string, number> {
     const out: Record<string, number> = {};
     const add = (wins: ModelWindow[] | undefined): void => {
         for (const w of wins ?? []) {
             if (!out[w.id] || w.contextWindow > out[w.id]) out[w.id] = w.contextWindow;
         }
     };
+    if (scope) {
+        if (scope === "codex") add(config.codex?.modelWindows);
+        else if (scope === "pi") for (const p of Object.values(config.pi?.providers ?? {})) add(p.models);
+        else if (scope === "omp") for (const p of Object.values(config.omp?.providers ?? {})) add(p.models);
+        else if (scope === "opencode") for (const p of Object.values(config.opencode?.providers ?? {})) add(p.models);
+        return out;
+    }
     for (const p of Object.values(config.pi?.providers ?? {})) add(p.models);
     for (const p of Object.values(config.omp?.providers ?? {})) add(p.models);
     for (const p of Object.values(config.opencode?.providers ?? {})) add(p.models);
