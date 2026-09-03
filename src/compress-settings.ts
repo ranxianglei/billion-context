@@ -41,6 +41,12 @@ export function mergeCompress(
     // provider-level compressPhilosophy. The kernel's resolvePrompts then
     // fills any still-missing sub-fields from defaultPrompts.
     const promptLevels = [global?.prompts, provider?.prompts, model?.prompts].filter(Boolean) as Partial<Prompts>[];
+    // minCompressRangeChars is the canonical name; minCompressRange is a
+    // deprecated alias. Resolve the alias per LEVEL first (same level: new
+    // name wins), then deepest defined level wins — so a model-level old-name
+    // value still beats a global-level new-name value. The merged output
+    // always carries the canonical name only.
+    const rangeOf = (s?: CompressSettings): number | undefined => s?.minCompressRangeChars ?? s?.minCompressRange;
     return {
         modelContextLimit: pick("modelContextLimit"),
         maxContextLimit: pick("maxContextLimit"),
@@ -48,7 +54,7 @@ export function mergeCompress(
         nudgeGrowthTokens: pick("nudgeGrowthTokens"),
         preserveRecentMessages: pick("preserveRecentMessages"),
         preserveRecentTokens: pick("preserveRecentTokens"),
-        minCompressRange: pick("minCompressRange"),
+        minCompressRangeChars: rangeOf(model) ?? rangeOf(provider) ?? rangeOf(global),
         tiers: pick("tiers"),
         prompts: promptLevels.length > 0 ? Object.assign({}, ...promptLevels) : undefined,
         acknowledgePromptsRisk: pick("acknowledgePromptsRisk"),
@@ -110,7 +116,8 @@ export function hasCompressSettings(s: CompressSettings): boolean {
  *  - `nudgeGrowthTokens` → flattens the adaptive band to a fixed step
  *    (sets both `nudge.growthFloor` and `nudge.growthCap`).
  *  - `preserveRecentMessages` / `preserveRecentTokens` → top-level Config.
- *  - `minCompressRange` → `compress.minCompressRange`.
+ *  - `minCompressRangeChars` (deprecated alias: `minCompressRange`) →
+ *    `compress.minCompressRange`. The unit is characters.
  *  - `tiers` → `tiers.enabled`. */
 export function applyCompressSettings(base: Config, limit: number, s: CompressSettings): Config {
     const nudge = { ...base.nudge };
@@ -137,7 +144,7 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
         preserveRecentTokens: s.preserveRecentTokens ?? base.preserveRecentTokens,
         compress: {
             ...base.compress,
-            minCompressRange: s.minCompressRange ?? base.compress.minCompressRange,
+            minCompressRange: s.minCompressRangeChars ?? s.minCompressRange ?? base.compress.minCompressRange,
         },
     };
 }
