@@ -206,7 +206,8 @@ export function parseArgs(argv: string[]): Parsed {
             case "--config":
             case "--origin":
             case "--agent":
-            case "--bin": {
+            case "--bin":
+            case "--handshake-file": {
                 const val = argv[++i];
                 if (val === undefined || val.length === 0) {
                     console.error(`bili: ${a} requires a non-empty value`);
@@ -218,6 +219,7 @@ export function parseArgs(argv: string[]): Parsed {
                 else if (a === "--origin") overrides.BILI_MCP_PROXY = val;
                 else if (a === "--bin") process.env.BILI_CLIENT_BIN = val;
                 else if (a === "-F") overrides.BILI_UPSTREAM_PROXY = val;
+                else if (a === "--handshake-file") overrides.BILI_HANDSHAKE_FILE = val;
                 else overrides.BILI_PLUGIN_AGENT = val;
                 break;
             }

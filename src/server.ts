@@ -1,5 +1,6 @@
 import http from "node:http";
 import fs from "node:fs";
+import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { createCore, type CompressionCore, type CompressionState, type Config, type CoreMessage, type NudgeDecision, type Prompts, defaultPrompts, defaultCountTokens, estimateTokensFast, renderNudgeText, deactivateBlock, viableRanges } from "acp-kernel";
 import { resolveCompress, resolveCompressPrompts, resolveRequestConfig } from "./compress-settings.js";
@@ -347,48 +348,74 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         const allowRemoteConnect = opts.host === "0.0.0.0" || opts.host === "::" || !isLoopbackAddress(opts.host);
         setupMitm(server, opts.mitm.domains, (msg) => log("info", msg), (host) => resolveProxy(opts.routes, opts.proxy, `https://${host}`, opts.proxyFallback), allowRemoteConnect);
     }
-    server.listen(opts.port, opts.host, () => {
+    // Discovery origin local MCP shells dial: collapse wildcard binds to
+    // loopback (localhost may resolve to ::1, where an IPv4-only listener is
+    // absent) and bracket bare IPv6 literals so the file always holds a valid URL.
+    const originHost = opts.host === "0.0.0.0" || opts.host === "::" || opts.host === "localhost" ? "127.0.0.1" : opts.host.includes(":") && !opts.host.startsWith("[") ? `[${opts.host}]` : opts.host;
+    const onListening = () => {
         const nonLoopbackBind = opts.host === "0.0.0.0" || opts.host === "::" || !isLoopbackAddress(opts.host);
         // Honest bind display: a wildcard bind shows as 0.0.0.0 (the user
         // chose to expose the proxy — hiding it behind "localhost" made
         // remote setups look broken in the log, see #240).
         const displayHost = nonLoopbackBind ? opts.host : opts.host === "0.0.0.0" ? "localhost" : opts.host;
+        const actualPort = server.address() === null ? opts.port : (server.address() as { port: number }).port;
         try {
             fs.mkdirSync(stateDir(), { recursive: true });
-            // Discovery origin local MCP shells dial: collapse wildcard
-            // binds to loopback (localhost may resolve to ::1, where an
-            // IPv4-only listener is absent) and bracket bare IPv6 literals
-            // so the file always holds a valid URL.
-            const originHost = opts.host === "0.0.0.0" || opts.host === "::" || opts.host === "localhost" ? "127.0.0.1" : opts.host.includes(":") && !opts.host.startsWith("[") ? `[${opts.host}]` : opts.host;
-            fs.writeFileSync(proxyOriginFile(), `http://${originHost}:${server.address() === null ? opts.port : (server.address() as { port: number }).port}\n`);
+            fs.writeFileSync(proxyOriginFile(), `http://${originHost}:${actualPort}\n`);
         } catch {
             // best-effort discovery hint for host-spawned MCP shells
+        }
+        if (opts.handshakeFile) {
+            // Atomic publish (tmp+rename): the spawning launcher polls this
+            // file and must never observe a half-written handshake (#401).
+            try {
+                fs.mkdirSync(path.dirname(opts.handshakeFile), { recursive: true });
+                const hsTmp = `${opts.handshakeFile}.tmp`;
+                fs.writeFileSync(hsTmp, JSON.stringify({ origin: `http://${originHost}:${actualPort}`, pid: process.pid }) + "\n");
+                fs.renameSync(hsTmp, opts.handshakeFile);
+            } catch {
+                // best-effort: the launcher falls back to its health-poll deadline
+            }
         }
         const nOverrides = Object.keys(opts.routes).length;
         log(
             "info",
-            `acp-proxy listening on http://${displayHost}:${opts.port}` +
-                ` — web UI: http://${displayHost}:${opts.port}/__bili/` +
-                ` — zero-config: prefix any baseURL with http://${displayHost}:${opts.port}/bili/` +
+            `acp-proxy listening on http://${displayHost}:${actualPort}` +
+                ` — web UI: http://${displayHost}:${actualPort}/__bili/` +
+                ` — zero-config: prefix any baseURL with http://${displayHost}:${actualPort}/bili/` +
                 (nOverrides ? ` — context overrides for ${nOverrides} upstream URL(s)` : "")
                 + (opts.mitm.enabled ? ` — MITM proxy on (whitelist)${opts.mitm.domains.length ? ` +${opts.mitm.domains.join(",")}` : ""}` : ""),
         );
         if (nonLoopbackBind) {
             log(
                 "warn",
-                `[security] bound to ${opts.host} — proxy endpoints (/bili/, CONNECT for whitelisted model hosts) are reachable from the network with NO authentication; /__bili/ management endpoints stay loopback-only. Restrict access with a firewall on untrusted networks. Remote agents: point baseURL at http://<this-host>:${opts.port}/bili/`,
+                `[security] bound to ${opts.host} — proxy endpoints (/bili/, CONNECT for whitelisted model hosts) are reachable from the network with NO authentication; /__bili/ management endpoints stay loopback-only. Restrict access with a firewall on untrusted networks. Remote agents: point baseURL at http://<this-host>:${actualPort}/bili/`,
             );
         }
         if (opts.debug) {
             log("info", `[debug] build features: raw-HTTP-capture(on) | remote_compaction_v2-strip(on) | cert-MITM-launcher(on) | strip-acp-summary(on) — seeing this line confirms the launcher build (not registry 0.1.34)`);
         }
-    });
+    };
+    const listenOn = (port: number) => {
+        server.listen(port, opts.host, onListening);
+    };
+    listenOn(opts.port);
     // Listen errors (EADDRINUSE port taken, EACCES privileged port, EAFNOSUPPORT
     // bad host) surface as an 'error' event on the server. Without a listener
     // Node treats it as an unhandled 'error' and throws, aborting before the
     // graceful-shutdown flush can run. Catch, log a human-readable message,
     // flush sessions, and exit cleanly (exit code 1 so callers/scripts notice).
+    let handshakeFallbackUsed = false;
     server.on("error", (err: NodeJS.ErrnoException) => {
+        // #401: in launcher handshake mode the preferred port may be taken at
+        // bind time — fall back to an OS-assigned port (atomic, no probe
+        // window) and report the actual origin via the handshake file.
+        if (err.code === "EADDRINUSE" && opts.handshakeFile && !handshakeFallbackUsed && !server.listening) {
+            handshakeFallbackUsed = true;
+            log("warn", `listen: port ${opts.port} is already in use — falling back to an OS-assigned free port (launcher handshake mode)`);
+            listenOn(0);
+            return;
+        }
         const hint =
             err.code === "EADDRINUSE"
                 ? ` — port ${opts.port} is already in use. Stop the other process or use --port <N>.`

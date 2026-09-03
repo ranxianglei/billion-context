@@ -46,7 +46,6 @@ import {
     dshArgsWithPatch,
     readOpencodeConfig,
     resolveOpencodeConfigFile,
-    findFreePort,
     ensureProxyRunning,
     stopProxy,
     resolveLauncherWindow,
@@ -247,31 +246,6 @@ tools.web_search = false
     assert.equal(cfg.providers["bili-openai"].baseUrl, "http://127.0.0.1:8787/bili/https://api.openai.com/v1");
 });
 
-test("findFreePort: returns preferred when it is free", async () => {
-    const port = 50000 + Math.floor(Math.random() * 1000);
-    const got = await findFreePort(port, LAUNCHER_DEFAULT_HOST);
-    assert.equal(got, port);
-});
-
-test("findFreePort: returns another port when preferred is occupied", async () => {
-    const blocker = net.createServer();
-    const occupied = await new Promise<number>((resolve, reject) => {
-        blocker.once("error", reject);
-        blocker.listen(0, LAUNCHER_DEFAULT_HOST, () => {
-            const addr = blocker.address();
-            if (addr && typeof addr === "object") resolve(addr.port);
-            else reject(new Error("no port"));
-        });
-    });
-    try {
-        const got = await findFreePort(occupied, LAUNCHER_DEFAULT_HOST);
-        assert.notEqual(got, occupied);
-        assert.ok(got > 0);
-    } finally {
-        blocker.close();
-    }
-});
-
 import { selfPackageRoot, ompPluginLoadedFrom } from "../src/plugin-install.js";
 
 test("runLaunch pi: native -e plugin injected only when not installed", async () => {
@@ -317,7 +291,7 @@ test("runLaunch pi: native -e plugin injected only when not installed", async ()
             };
             return child;
         }
-        return makeFakeChild(42422);
+        return fakeProxyChild(args, 42422);
     };
     const fetchImpl = async () => ({ ok: true });
 
@@ -423,7 +397,7 @@ test("runLaunch omp: native -e plugin injected only when no loadable config entr
             };
             return child;
         }
-        return makeFakeChild(42422);
+        return fakeProxyChild(args, 42422);
     };
     const fetchImpl = async () => ({ ok: true });
 
@@ -500,12 +474,19 @@ test("ompPluginLoadedFrom: only entries whose file exists count as loaded", () =
     }
 });
 
-function makeFakeChild(pid: number): SpawnChild {
+interface FakeChild extends SpawnChild {
+    fire(event: string, ...args: unknown[]): void;
+    killed: boolean;
+}
+
+function makeFakeChild(pid: number): FakeChild {
     const handlers = new Map<string, ((...args: unknown[]) => void)[]>();
-    return {
+    const child: FakeChild = {
         pid,
+        killed: false,
         unref() {},
         kill() {
+            child.killed = true;
             return true;
         },
         on(event, listener) {
@@ -513,64 +494,181 @@ function makeFakeChild(pid: number): SpawnChild {
             list.push(listener);
             handlers.set(event, list);
         },
+        fire(event, ...args) {
+            for (const h of handlers.get(event) ?? []) h(...args);
+        },
     };
+    return child;
 }
 
-test("ensureProxyRunning: always spawns a fresh proxy, never reuses a listener", async () => {
-    let spawnCalls = 0;
-    const spawnImpl: SpawnFn = () => {
-        spawnCalls++;
-        return makeFakeChild(0);
-    };
-    const fetchImpl = async () => ({ ok: true });
-    const handle = await ensureProxyRunning(
-        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
-        { fetchImpl, spawnImpl },
-    );
-    assert.equal(spawnCalls, 1);
-    assert.ok(handle.child);
-    assert.equal(handle.origin, `http://127.0.0.1:${handle.port}`);
-    assert.notEqual(handle.child, null);
-});
+function writeHandshakeFromArgs(args: readonly string[], info: { origin: string; pid?: number }): void {
+    fs.writeFileSync(args[args.indexOf("--handshake-file") + 1], JSON.stringify(info));
+}
 
-test("ensureProxyRunning: spawns when not healthy, polls until healthy", async () => {
-    let probes = 0;
-    const fetchImpl = async () => {
-        probes++;
-        return { ok: probes >= 2 };
-    };
-    let spawnedArgs: string[] | null = null;
+function fakeProxyChild(args: readonly string[], pid: number): FakeChild {
+    const host = args[args.indexOf("--host") + 1];
+    const port = args[args.indexOf("--port") + 1];
+    writeHandshakeFromArgs(args, { origin: `http://${host}:${port}`, pid });
+    return makeFakeChild(pid);
+}
+
+test("ensureProxyRunning: spawns once and attaches to the origin the child reports", async () => {
+    let spawnCalls = 0;
+    let seenHandshakeFile = "";
     const spawnImpl: SpawnFn = (_cmd, args) => {
-        spawnedArgs = [...args];
+        spawnCalls++;
+        seenHandshakeFile = args[args.indexOf("--handshake-file") + 1];
+        writeHandshakeFromArgs(args, { origin: "http://127.0.0.1:8787", pid: 42421 });
         return makeFakeChild(42421);
     };
     const handle = await ensureProxyRunning(
         { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
-        { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+        { fetchImpl: async () => ({ ok: true }), spawnImpl, sleep: () => Promise.resolve() },
     );
-    assert.equal(handle.child?.pid, 42421);
-    assert.ok(spawnedArgs !== null);
-    assert.ok(spawnedArgs.includes("start"));
-    assert.ok(spawnedArgs.includes("--host"));
-    const portIdx = spawnedArgs.indexOf("--port");
-    assert.ok(portIdx >= 0, "spawn args include --port");
-    assert.equal(spawnedArgs[portIdx + 1], String(handle.port));
-    assert.ok(probes >= 2);
+    assert.equal(spawnCalls, 1);
+    assert.ok(handle.child);
+    assert.equal(handle.origin, "http://127.0.0.1:8787");
+    assert.equal(handle.port, 8787);
+    assert.match(seenHandshakeFile, /bili-handshake-.*\.json$/);
+    assert.equal(fs.existsSync(seenHandshakeFile), false, "handshake file removed after attach");
 });
 
-test("ensureProxyRunning: throws when never healthy within deadline", async () => {
-    const fetchImpl = async () => ({ ok: false });
-    const spawnImpl: SpawnFn = () => makeFakeChild(42422);
-    let ticks = 0;
-    const now = () => ticks * 1000;
-    const sleep = () => {
-        ticks += 10;
-        return Promise.resolve();
+test("ensureProxyRunning: preferred port stolen → attaches to own child's fallback origin, never the stealer (#401)", async () => {
+    const blocker = net.createServer();
+    const stolenPort = await new Promise<number>((resolve, reject) => {
+        blocker.once("error", reject);
+        blocker.listen(0, LAUNCHER_DEFAULT_HOST, () => {
+            const addr = blocker.address();
+            if (addr && typeof addr === "object") resolve(addr.port);
+            else reject(new Error("no port"));
+        });
+    });
+    try {
+        const fallbackPort = stolenPort === 59999 ? 59998 : 59999;
+        const probedUrls: string[] = [];
+        const spawnImpl: SpawnFn = (_cmd, args) => {
+            writeHandshakeFromArgs(args, { origin: `http://127.0.0.1:${fallbackPort}`, pid: 42424 });
+            return makeFakeChild(42424);
+        };
+        const handle = await ensureProxyRunning(
+            { host: LAUNCHER_DEFAULT_HOST, port: stolenPort, passthrough: false, debug: false },
+            {
+                fetchImpl: async (url) => {
+                    probedUrls.push(url);
+                    return { ok: true };
+                },
+                spawnImpl,
+                sleep: () => Promise.resolve(),
+            },
+        );
+        assert.notEqual(fallbackPort, stolenPort);
+        assert.equal(handle.origin, `http://127.0.0.1:${fallbackPort}`);
+        assert.equal(handle.port, fallbackPort);
+        assert.ok(probedUrls.length >= 1, "health probe happened");
+        for (const url of probedUrls) {
+            assert.ok(url.includes(`:${fallbackPort}/`), `probed own child only, got ${url}`);
+            assert.ok(!url.includes(`:${stolenPort}/`), `must never probe the stealer, got ${url}`);
+        }
+    } finally {
+        blocker.close();
+    }
+});
+
+test("ensureProxyRunning: child dies before reporting bind → fails fast (<5s) with log path (#401)", async () => {
+    let probes = 0;
+    const child = makeFakeChild(42423);
+    const spawnImpl: SpawnFn = () => {
+        setImmediate(() => child.fire("exit", 1, null));
+        return child;
+    };
+    const t0 = Date.now();
+    await assert.rejects(
+        ensureProxyRunning(
+            { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
+            {
+                fetchImpl: async () => {
+                    probes++;
+                    return { ok: true };
+                },
+                spawnImpl,
+            },
+        ),
+        (err: Error) => {
+            assert.match(err.message, /exited before reporting its bind/);
+            assert.match(err.message, /proxy log:/);
+            assert.equal(probes, 0, "never probed when the child died pre-handshake");
+            return true;
+        },
+    );
+    assert.ok(Date.now() - t0 < 5000, "failure must be fast, not a 20s hang");
+    assert.equal(child.killed, true, "failed launch kills the child");
+});
+
+test("ensureProxyRunning: handshake pid mismatch refuses to attach (#401)", async () => {
+    const spawnImpl: SpawnFn = (_cmd, args) => {
+        writeHandshakeFromArgs(args, { origin: "http://127.0.0.1:8787", pid: 11111 });
+        return makeFakeChild(22222);
     };
     await assert.rejects(
         ensureProxyRunning(
             { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
-            { fetchImpl, spawnImpl, now, sleep },
+            { fetchImpl: async () => ({ ok: true }), spawnImpl, sleep: () => Promise.resolve() },
+        ),
+        /ownership check failed/,
+    );
+});
+
+test("ensureProxyRunning: --debug is never forced — inherited from parent opts only (#401)", async () => {
+    const run = async (debug: boolean): Promise<string[]> => {
+        let seenArgs: string[] | null = null;
+        const spawnImpl: SpawnFn = (_cmd, args) => {
+            seenArgs = [...args];
+            writeHandshakeFromArgs(args, { origin: "http://127.0.0.1:8787", pid: 42425 });
+            return makeFakeChild(42425);
+        };
+        await ensureProxyRunning(
+            { host: "127.0.0.1", port: 8787, passthrough: false, debug },
+            { fetchImpl: async () => ({ ok: true }), spawnImpl, sleep: () => Promise.resolve() },
+        );
+        return seenArgs!;
+    };
+    assert.ok(!(await run(false)).includes("--debug"), "debug off → no --debug flag");
+    assert.ok((await run(true)).includes("--debug"), "debug on → --debug passed through");
+});
+
+test("ensureProxyRunning: polls until healthy; throws when never healthy within deadline", async () => {
+    let probes = 0;
+    const spawnImpl: SpawnFn = (_cmd, args) => {
+        writeHandshakeFromArgs(args, { origin: "http://127.0.0.1:8787", pid: 42421 });
+        return makeFakeChild(42421);
+    };
+    const handle = await ensureProxyRunning(
+        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
+        {
+            fetchImpl: async () => {
+                probes++;
+                return { ok: probes >= 2 };
+            },
+            spawnImpl,
+            sleep: () => Promise.resolve(),
+        },
+    );
+    assert.equal(handle.child?.pid, 42421);
+    assert.ok(probes >= 2);
+
+    let ticks = 0;
+    await assert.rejects(
+        ensureProxyRunning(
+            { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
+            {
+                fetchImpl: async () => ({ ok: false }),
+                spawnImpl,
+                now: () => ticks * 1000,
+                sleep: () => {
+                    ticks += 10;
+                    return Promise.resolve();
+                },
+            },
         ),
         /did not become healthy/,
     );
@@ -1785,7 +1883,7 @@ test("runLaunch dsh: DSH_HOME overlay + DEEPSEEK_BASE_URL env, real home untouch
             };
             return child;
         }
-        return makeFakeChild(42423);
+        return fakeProxyChild(args, 42423);
     };
 
     const prevExit = process.exit;
@@ -1876,7 +1974,7 @@ test("runLaunch omp: launcher hands per-model windows to the spawned proxy", asy
             return child;
         }
         proxyEnvs.push((opts as { env?: NodeJS.ProcessEnv } | undefined)?.env);
-        return makeFakeChild(42422);
+        return fakeProxyChild(args, 42422);
     };
     const fetchImpl = async () => ({ ok: true });
 
@@ -2102,7 +2200,7 @@ test("runLaunch codex: budget args injected for MITM mode (built-in table window
             };
             return child;
         }
-        return makeFakeChild(42422);
+        return fakeProxyChild(args, 42422);
     };
     const fetchImpl = async () => ({ ok: true });
     const prevExit = process.exit;
@@ -2187,7 +2285,7 @@ test("runLaunch claude: CLAUDE_CODE_AUTO_COMPACT_WINDOW injected (built-in table
             };
             return child;
         }
-        return makeFakeChild(42422);
+        return fakeProxyChild(args, 42422);
     };
     const fetchImpl = async () => ({ ok: true });
     const prevExit = process.exit;

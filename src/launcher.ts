@@ -27,7 +27,6 @@
  */
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
-import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -90,6 +89,12 @@ const HEALTH_PATH = "/__bili/health";
 const HEALTH_POLL_INTERVAL_MS = 200;
 const SPAWN_WAIT_MS = 20000;
 const PROBE_TIMEOUT_MS = 1500;
+// #401 handshake protocol: how long to wait for OUR child to report its actual
+// bind (origin + pid) before giving up. Polls are fast because a dead child is
+// detected as soon as its "exit" event fires, so a crashed proxy fails in ms
+// instead of the old 20s health-timeout.
+const HANDSHAKE_WAIT_MS = 10000;
+const HANDSHAKE_POLL_INTERVAL_MS = 50;
 
 const DEFAULT_MITM_DOMAIN_SET = new Set(DEFAULT_MITM_DOMAINS.map((d) => d.toLowerCase()));
 
@@ -1452,30 +1457,6 @@ async function probeHealth(
     }
 }
 
-export function findFreePort(preferred: number, host = LAUNCHER_DEFAULT_HOST): Promise<number> {
-    const tryBind = (port: number): Promise<boolean> =>
-        new Promise((resolve) => {
-            const srv = net.createServer();
-            srv.once("error", () => resolve(false));
-            srv.once("listening", () => srv.close(() => resolve(true)));
-            srv.listen(port, host);
-        });
-    return tryBind(preferred).then((free) => {
-        if (free) return preferred;
-        return new Promise<number>((resolve, reject) => {
-            const srv = net.createServer();
-            srv.once("error", reject);
-            srv.listen(0, host, () => {
-                const addr = srv.address();
-                srv.close(() => {
-                    if (addr && typeof addr === "object") resolve(addr.port);
-                    else reject(new Error("could not allocate a free port"));
-                });
-            });
-        });
-    });
-}
-
 const INHERITED_PROXY_VARS = ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"];
 
 export function stripInheritedProxy(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -1484,11 +1465,45 @@ export function stripInheritedProxy(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     return cleaned;
 }
 
-function proxyStartArgs(opts: LaunchOptions): string[] {
-    const args = ["start", "--host", opts.host, "--port", String(opts.port)];
+function proxyStartArgs(opts: LaunchOptions, handshakeFile: string): string[] {
+    // The preferred port is only a HINT: the child binds it itself and, if it
+    // is taken by then, falls back to an OS-assigned port and reports the
+    // actual origin through the handshake file (#401 — no parent-side probe).
+    const args = ["start", "--host", opts.host, "--port", String(opts.port), "--handshake-file", handshakeFile];
     if (opts.passthrough) args.push("--passthrough");
     if (opts.debug) args.push("--debug");
     return args;
+}
+
+interface HandshakeInfo {
+    origin: string;
+    pid?: number;
+}
+
+function readHandshake(file: string): HandshakeInfo | undefined {
+    let raw: string;
+    try {
+        raw = fs.readFileSync(file, "utf8");
+    } catch {
+        return undefined;
+    }
+    try {
+        const parsed = JSON.parse(raw) as { origin?: unknown; pid?: unknown };
+        if (typeof parsed.origin === "string" && parsed.origin.startsWith("http")) {
+            return { origin: parsed.origin, pid: typeof parsed.pid === "number" ? parsed.pid : undefined };
+        }
+        return undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+function originPort(origin: string): number {
+    try {
+        return Number(new URL(origin).port) || 0;
+    } catch {
+        return 0;
+    }
 }
 
 export async function ensureProxyRunning(
@@ -1500,18 +1515,21 @@ export async function ensureProxyRunning(
     const now = deps.now ?? Date.now;
     const sleepImpl = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
 
-    const port = await findFreePort(opts.port, opts.host);
-    const spawnedOrigin = proxyOrigin(opts.host, port);
+    // Per-launch handshake file: only OUR child writes it, so whatever origin
+    // it reports is ours by construction — attaching to a foreign instance is
+    // impossible even when another bili grabs the preferred port (#401).
+    const launchId = randomUUID();
+    const handshakeFile = path.join(os.tmpdir(), `bili-handshake-${launchId}.json`);
 
     const script = process.argv[1];
     if (!script) throw new Error("bili: cannot resolve launcher script path");
-    const logPath = path.join(os.tmpdir(), `bili-proxy-${port}.log`);
+    const logPath = path.join(os.tmpdir(), `bili-proxy-${launchId}.log`);
     const logFd = fs.openSync(logPath, "a");
     let child: SpawnChild;
     try {
         child = spawnImpl(
             process.execPath,
-            [script, ...proxyStartArgs({ ...opts, port, debug: true })],
+            [script, ...proxyStartArgs(opts, handshakeFile)],
             {
                 detached: true,
                 stdio: ["ignore", logFd, logFd],
@@ -1535,14 +1553,51 @@ export async function ensureProxyRunning(
         child.unref?.();
     } catch {}
 
+    let childExited = false;
+    child.on?.("exit", () => {
+        childExited = true;
+    });
+
+    const cleanup = (): void => {
+        try {
+            fs.rmSync(handshakeFile, { force: true });
+        } catch {}
+    };
+    function fail(reason: string): never {
+        cleanup();
+        stopProxy({ origin: "", port: 0, child });
+        throw new Error(`bili: ${reason} (proxy log: ${logPath})`);
+    }
+
+    const handshakeDeadline = now() + HANDSHAKE_WAIT_MS;
+    let handshake: HandshakeInfo | undefined;
+    while (!handshake && now() < handshakeDeadline) {
+        if (childExited) break;
+        await sleepImpl(HANDSHAKE_POLL_INTERVAL_MS);
+        handshake = readHandshake(handshakeFile);
+    }
+    if (!handshake) {
+        fail(childExited
+            ? "proxy child exited before reporting its bind"
+            : `proxy did not report its bind within ${HANDSHAKE_WAIT_MS}ms`);
+    }
+    if (child.pid !== undefined && handshake.pid !== undefined && handshake.pid !== child.pid) {
+        fail(`handshake ownership check failed (expected pid ${child.pid}, got ${handshake.pid}) — refusing to attach`);
+    }
+
+    const origin = handshake.origin;
     const deadline = now() + SPAWN_WAIT_MS;
     while (now() < deadline) {
+        if (childExited) break;
         await sleepImpl(HEALTH_POLL_INTERVAL_MS);
-        if (await probeHealth(spawnedOrigin, fetchImpl)) {
-            return { origin: spawnedOrigin, port, child, logPath };
+        if (await probeHealth(origin, fetchImpl)) {
+            cleanup();
+            return { origin, port: originPort(origin), child, logPath };
         }
     }
-    throw new Error(`bili: proxy did not become healthy at ${spawnedOrigin} within ${SPAWN_WAIT_MS}ms`);
+    fail(childExited
+        ? `proxy child exited before becoming healthy at ${origin}`
+        : `proxy did not become healthy at ${origin} within ${SPAWN_WAIT_MS}ms`);
 }
 
 export function stopProxy(handle: ProxyHandle): void {

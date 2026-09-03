@@ -233,6 +233,10 @@ export type ProxyOptions = {
     passthrough: boolean;
     autoUpdate: boolean;
     logFile?: string;
+    /** Launcher handshake (#401): EADDRINUSE on the preferred port falls back
+     *  to an OS-assigned port, and the actual origin + pid are written here
+     *  after bind so the spawning parent attaches to exactly this child. */
+    handshakeFile?: string;
     /** MITM transparent-proxy mode. When enabled, an HTTP CONNECT handler is
      *  attached so clients that only know how to set HTTP_PROXY (ZCode with a
      *  locked-in endpoint) can route through the proxy. Whitelisted model
@@ -359,6 +363,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         passthrough: (env.ACP_PASSTHROUGH ?? (fileConfig.passthrough ? "1" : "0")) === "1",
         autoUpdate: (env.ACP_AUTO_UPDATE ?? (fileConfig.autoUpdate === false ? "0" : "1")) !== "0",
         logFile: env.ACP_LOG_FILE !== undefined ? (env.ACP_LOG_FILE || undefined) : fileConfig.logFile,
+        handshakeFile: env.BILI_HANDSHAKE_FILE || undefined,
         mitm: {
             enabled: (env.BILI_MITM ?? (fileConfig.mitm?.enabled === false ? "0" : "1")) !== "0",
             domains: dedupeDomains([
