@@ -578,6 +578,41 @@ test("ensureProxyRunning: throws when never healthy within deadline", async () =
     );
 });
 
+test("ensureProxyRunning: fails fast when the child exits before becoming healthy (#481)", async () => {
+    const listeners = new Map<string, ((...args: unknown[]) => void)[]>();
+    const spawnImpl: SpawnFn = () => {
+        setImmediate(() => {
+            for (const l of listeners.get("exit") ?? []) l(1, null);
+        });
+        return {
+            pid: 42440,
+            unref() {},
+            kill() {
+                return true;
+            },
+            on(event, listener) {
+                const list = listeners.get(event) ?? [];
+                list.push(listener);
+                listeners.set(event, list);
+            },
+        };
+    };
+    const started = Date.now();
+    await assert.rejects(
+        ensureProxyRunning(
+            { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
+            { fetchImpl: async () => ({ ok: false }), spawnImpl, readInstanceFile: () => undefined },
+        ),
+        (err: unknown) => {
+            assert.ok(err instanceof Error);
+            assert.match(err.message, /exited before becoming healthy \(code 1\)/);
+            assert.match(err.message, /bili-proxy-8787\.log/);
+            assert.ok(Date.now() - started < 5000, `rejected in ${Date.now() - started}ms (< 5s)`);
+            return true;
+        },
+    );
+});
+
 function recordedInstance(over: Partial<InstanceFile> = {}): InstanceFile {
     return {
         origin: "http://127.0.0.1:8787",

@@ -1689,8 +1689,15 @@ export async function ensureProxyRunning(
         child.unref?.();
     } catch {}
 
+    // #481: fail fast on pre-bind child death (bad config, missing upstream,
+    // startup crash) instead of burning SPAWN_WAIT_MS and reporting a timeout.
+    let childExit: [unknown, unknown] | undefined;
+    child.on?.("exit", (...rest: unknown[]) => {
+        childExit = [rest[0], rest[1]];
+    });
+
     const deadline = now() + SPAWN_WAIT_MS;
-    while (now() < deadline) {
+    while (!childExit && now() < deadline) {
         await sleepImpl(HEALTH_POLL_INTERVAL_MS);
         const inst = readInstance();
         if (isProxyInstanceFile(inst) && inst.launchToken === launchToken) {
@@ -1708,6 +1715,13 @@ export async function ensureProxyRunning(
         if (stale && (await probeHealth(proxyOrigin(opts.host, port), fetchImpl))) {
             return { origin: proxyOrigin(opts.host, port), port, child, logPath };
         }
+    }
+    if (childExit) {
+        const parts: string[] = [];
+        if (typeof childExit[0] === "number") parts.push(`code ${childExit[0]}`);
+        if (typeof childExit[1] === "string") parts.push(`signal ${childExit[1]}`);
+        const detail = parts.length > 0 ? parts.join(", ") : "unknown";
+        throw new Error(`bili: proxy child exited before becoming healthy (${detail}) (log: ${logPath})`);
     }
     throw new Error(`bili: proxy did not become healthy within ${SPAWN_WAIT_MS}ms (log: ${logPath})`);
 }
