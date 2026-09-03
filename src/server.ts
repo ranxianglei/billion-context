@@ -151,6 +151,8 @@ function launcherContextWindow(model: string): number | undefined {
     return LAUNCHER_MODEL_WINDOWS[model];
 }
 
+const windowSourceLogged = new Set<string>();
+
 /** Parse an `anthropic-beta` header for a larger-context beta (e.g.
  *  `context-1m-2025-08-07` → 1,000,000). The beta lets the CLIENT negotiate a
  *  window beyond the model's standard size, so it is the most direct per-request
@@ -953,6 +955,13 @@ async function handle(
                 if (native) nativeFromFallback = false;
             }
             reqConfig = resolveRequestConfig(config, opts.routes, embeddedUrl, model, native, opts.compress);
+            {
+                if (!windowSourceLogged.has(model)) {
+                    windowSourceLogged.add(model);
+                    const wsSource = betaWindow ? "anthropic-beta" : pluginWindow ? "plugin" : launcherWindow ? "launcher" : configuredWindow ? "configured" : peekWindow ? "registry-peek" : native ? "table-or-registry" : "default";
+                    log("info", `[window] model=${model} source=${wsSource} native=${native ?? "none"} effective=${reqConfig.modelContextLimit} launcher=${launcherWindow ?? "none"} configured=${configuredWindow ?? "none"} peek=${peekWindow ?? "none"} fallback=${nativeFromFallback}`);
+                }
+            }
             // #321 PR-E1: a codex client carries its OWN window perception
             // (bundled model table + 272K unknown-model fallback) and
             // auto-compacts at 90% of it. If bili's budget exceeds what codex
