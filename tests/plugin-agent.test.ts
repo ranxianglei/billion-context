@@ -542,6 +542,14 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
         assert.match(pluginRemove("pi"), /removed/);
         assert.deepEqual((JSON.parse(fs.readFileSync(path.join(piAgentDir, "settings.json"), "utf8")) as { packages: string[] }).packages, ["/home/x/other-package"]);
 
+        // omp install/status/remove verify the entry's target exists, so
+        // materialize the (gitignored) dist artifact for this sub-test.
+        const ompDistFile = path.join(root, "dist", "agent", "omp.js");
+        const createdOmpDist = !fs.existsSync(ompDistFile);
+        if (createdOmpDist) {
+            fs.mkdirSync(path.dirname(ompDistFile), { recursive: true });
+            fs.writeFileSync(ompDistFile, "// test stub\n");
+        }
         fs.mkdirSync(path.join(home, ".omp/agent"), { recursive: true });
         await withEnv({ PI_CODING_AGENT_DIR: path.join(home, ".omp/agent") }, async () => {
         fs.writeFileSync(path.join(home, ".omp/agent/config.yml"), "extensions:\n  - /some/other/ext.js\nfirstRunComplete: true\n");
@@ -580,6 +588,7 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
         assert.match(pluginRemove("omp"), /removed/);
         assert.equal(fs.readFileSync(path.join(home, ".omp/agent/config.yml"), "utf8"), "extensions:\n");
         });
+        if (createdOmpDist) fs.rmSync(ompDistFile, { force: true });
 
         assert.match(pluginInstall("codex"), /installed/);
         const toml = fs.readFileSync(path.join(home, "config.toml"), "utf8");
@@ -622,6 +631,77 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
         assert.equal(rows.length, 5);
         assert.deepEqual(PLUGIN_AGENTS, ["pi", "omp", "claude", "codex", "opencode"]);
     });
+    fs.rmSync(home, { recursive: true, force: true });
+});
+
+test("omp plugin: scoped matching, existence check, overlay redirect (issue #392)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-plugin-omp-"));
+    const root = selfPackageRoot();
+    const ompDistFile = path.join(root, "dist", "agent", "omp.js");
+    const createdOmpDist = !fs.existsSync(ompDistFile);
+    if (createdOmpDist) {
+        fs.mkdirSync(path.dirname(ompDistFile), { recursive: true });
+        fs.writeFileSync(ompDistFile, "// test stub\n");
+    }
+    try {
+        const stale = "/does/not/exist/dist/agent/omp.js";
+
+        // (a) a same-valued line OUTSIDE the extensions block must not block install
+        {
+            const agentDir = path.join(home, "a", ".omp", "agent");
+            fs.mkdirSync(agentDir, { recursive: true });
+            fs.writeFileSync(path.join(agentDir, "config.yml"),
+                `extensions:\n  - ${stale}\nother:\n  - ${stale}\nfirstRunComplete: true\n`);
+            await withEnv({ PI_CODING_AGENT_DIR: agentDir }, async () => {
+                assert.match(pluginInstall("omp"), /installed/);
+                assert.equal(pluginStatusAll().find((r) => r.agent === "omp")?.status, "installed");
+            });
+            assert.match(fs.readFileSync(path.join(agentDir, "config.yml"), "utf8"),
+                /extensions:\n  - \/does\/not\/exist\/dist\/agent\/omp\.js\n  - .*dist[\\/]agent[\\/]omp\.js\nother:\n  - \/does\/not\/exist\/dist\/agent\/omp\.js\n/);
+        }
+
+        // (b) remove only deletes in-block entries; the out-of-block line stays
+        {
+            const agentDir = path.join(home, "b", ".omp", "agent");
+            fs.mkdirSync(agentDir, { recursive: true });
+            fs.writeFileSync(path.join(agentDir, "config.yml"),
+                `extensions:\n  - ${stale}\nother:\n  - ${stale}\nfirstRunComplete: true\n`);
+            await withEnv({ PI_CODING_AGENT_DIR: agentDir }, async () => {
+                assert.match(pluginRemove("omp"), /removed/);
+            });
+            assert.equal(fs.readFileSync(path.join(agentDir, "config.yml"), "utf8"),
+                `extensions:\nother:\n  - ${stale}\nfirstRunComplete: true\n`);
+        }
+
+        // (c) PI_CODING_AGENT_DIR pointing at a bili overlay redirects to the real home
+        {
+            const realHome = path.join(home, "c", ".omp", "agent");
+            const overlay = realHome + "-bili";
+            fs.mkdirSync(realHome, { recursive: true });
+            fs.mkdirSync(overlay, { recursive: true });
+            fs.writeFileSync(path.join(realHome, "config.yml"), "firstRunComplete: true\n");
+            fs.writeFileSync(path.join(overlay, "config.yml"), "extensions:\n  - /stale/overlay/dist/agent/omp.js\n");
+            await withEnv({ PI_CODING_AGENT_DIR: overlay }, async () => {
+                assert.match(pluginInstall("omp"), /installed/);
+            });
+            assert.match(fs.readFileSync(path.join(realHome, "config.yml"), "utf8"),
+                /extensions:\n  - .*dist[\\/]agent[\\/]omp\.js\n/);
+            assert.equal(fs.readFileSync(path.join(overlay, "config.yml"), "utf8"),
+                "extensions:\n  - /stale/overlay/dist/agent/omp.js\n");
+        }
+
+        // (d) a stale entry (target file gone) reports "broken"
+        {
+            const agentDir = path.join(home, "d", ".omp", "agent");
+            fs.mkdirSync(agentDir, { recursive: true });
+            fs.writeFileSync(path.join(agentDir, "config.yml"), `extensions:\n  - ${stale}\n`);
+            await withEnv({ PI_CODING_AGENT_DIR: agentDir }, async () => {
+                assert.equal(pluginStatusAll().find((r) => r.agent === "omp")?.status, "broken");
+            });
+        }
+    } finally {
+        if (createdOmpDist) fs.rmSync(ompDistFile, { force: true });
+    }
     fs.rmSync(home, { recursive: true, force: true });
 });
 

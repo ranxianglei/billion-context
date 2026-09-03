@@ -1,6 +1,5 @@
 import {
     collectBlockContent,
-    deactivateBlock,
     type CompressionCore,
     type Config,
     type CoreMessage,
@@ -48,6 +47,9 @@ export type ProxyToolCtx = {
     core: CompressionCore;
     config: Config;
     messages: CoreMessage[];
+    /** Unfolded original history. Loop paths hand the folded view as
+     *  `messages`; decompress's cache-miss fallback must scan this instead. */
+    compressMessages?: CoreMessage[];
     session: Session;
     log: (msg: string) => void;
 };
@@ -55,13 +57,16 @@ export type ProxyToolCtx = {
 /** Resolve a decompress request to a result string, honoring the `full` flag
  *  and the cross-round original-content cache on the session.
  *
+ *  STATELESS RETRIEVAL: decompress is copy-paste — it changes no state. The
+ *  block stays active, the forwarded view keeps folding, the cache is kept
+ *  (repeat decompresses are free), and there is no expand/re-fold cycle.
+ *
  *  - If the block has cached originals (captured at compress time), use the
  *    cached `one` or `full` view per the flag. This is the cross-round-safe
  *    path: ctx.messages only holds the folded view by the time decompress runs.
- *  - Otherwise fall back to collectBlockContent against ctx.messages; if that
- *    yields nothing (originals already folded out), return the block summary.
- *  - deactivateBlock + delete the cache ONLY when content was actually
- *    recovered. A 0-count, no-cache result leaves the block active for retries. */
+ *  - Otherwise fall back to collectBlockContent against the unfolded view
+ *    (ctx.compressMessages ?? ctx.messages); if that yields nothing, return
+ *    the block summary. */
 export function resolveDecompress(
     args: Record<string, unknown>,
     ctx: ProxyToolCtx,
@@ -86,20 +91,12 @@ export function resolveDecompress(
         body = view.text;
         count = view.count;
     } else {
-        const collected = collectBlockContent(ctx.session.state, block, ctx.messages, { full });
+        const collected = collectBlockContent(ctx.session.state, block, ctx.compressMessages ?? ctx.messages, { full });
         body = collected.text || block.summary;
         count = collected.count;
     }
 
-    if (count > 0 || cached) {
-        ctx.session.state = deactivateBlock(ctx.session.state, [blockId]);
-        // Drop the cached originals now that the block is deactivated — it
-        // cannot be decompressed again, and keeping large original messages
-        // around grows memory unbounded over a long session.
-        ctx.session.blockContents.delete(blockId);
-    }
-
-    const header = `[Restored block ${blockId} — ${count} item(s)${full ? ", full" : ""}]`;
+    const header = `[Block ${blockId} content — ${count} item(s)${full ? ", full" : ""}]`;
     const safeBlockId = blockId.replace(/[^a-zA-Z0-9_-]/g, "-");
     const outPath = body.length > 10000 ? join(tmpdir(), `acp-decompress-${safeBlockId}-${Date.now()}.txt`) : null;
     if (outPath) {

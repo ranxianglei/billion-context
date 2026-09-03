@@ -33,6 +33,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { spawn, type StdioOptions } from "node:child_process";
 import { DEFAULT_MITM_DOMAINS } from "./mitm.js";
+import { isProxyInstanceFile, isPidAlive, readProxyInstanceFile, type ProxyInstanceFile } from "./instance.js";
 import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom } from "./plugin-install.js";
 
 /** Absolute path of a file inside our dist/, resolved via the package root
@@ -122,12 +123,15 @@ export interface LaunchOptions {
 export interface ProxyHandle {
     origin: string;
     port: number;
-    child: SpawnChild;
+    child?: SpawnChild;
     logPath?: string;
+    attached?: boolean;
 }
 
 export interface LauncherDeps {
     fetchImpl?: (url: string) => Promise<{ ok: boolean }>;
+    fetchHealthInfo?: (origin: string) => Promise<{ ok: boolean; instanceId?: string } | undefined>;
+    readInstanceFile?: () => ProxyInstanceFile | { origin: string } | undefined;
     spawnImpl?: SpawnFn;
     now?: () => number;
     sleep?: (ms: number) => Promise<void>;
@@ -895,7 +899,7 @@ function refreshOverlayHome(realHome: string, overlay: string, generatedFile: st
                     try {
                         fs.unlinkSync(overlayPath);
                     } catch {}
-                } else if (mergeOverlayEntry(overlayPath, realPath)) {
+                } else if (mergeOverlayEntry(overlayPath, realPath, generatedFile)) {
                     try {
                         fs.rmSync(overlayPath, { recursive: true, force: true });
                     } catch {}
@@ -956,7 +960,7 @@ function refreshOverlayHome(realHome: string, overlay: string, generatedFile: st
     return true;
 }
 
-function mergeOverlayEntry(src: string, dst: string): boolean {
+function mergeOverlayEntry(src: string, dst: string, excludedName?: string): boolean {
     let st: fs.Stats;
     try {
         st = fs.lstatSync(src);
@@ -989,7 +993,11 @@ function mergeOverlayEntry(src: string, dst: string): boolean {
         }
         let ok = true;
         for (const entry of entries) {
-            if (!mergeOverlayEntry(path.join(src, entry), path.join(dst, entry))) ok = false;
+            // #410: generated configs must never merge back into the real
+            // home, at ANY depth — a nested promote bakes proxy URLs into
+            // the user's real config.
+            if (excludedName !== undefined && entry === excludedName) continue;
+            if (!mergeOverlayEntry(path.join(src, entry), path.join(dst, entry), excludedName)) ok = false;
         }
         return ok;
     }
@@ -1119,14 +1127,71 @@ export function preparePiHttpRewrite(
  * refreshOverlayHome — comments, ordering and formatting are preserved
  * verbatim, and the real models.yml is never touched.
  */
+function atomicWriteTextFile(filePath: string, contents: string): void {
+    const draft = `${filePath}.${process.pid}.bili-tmp`;
+    try {
+        fs.writeFileSync(draft, contents);
+        fs.renameSync(draft, filePath);
+    } catch {
+        try {
+            fs.rmSync(draft, { force: true });
+        } catch {}
+        throw new Error(`bili: could not write ${filePath}`);
+    }
+}
+
+export function liveProxyPorts(): Set<number> {
+    const ports = new Set<number>();
+    const inst = readProxyInstanceFile();
+    if (isProxyInstanceFile(inst)) {
+        if (isPidAlive(inst.pid)) ports.add(inst.port);
+    } else if (inst) {
+        try {
+            ports.add(new URL(inst.origin).port === "" ? 80 : Number(new URL(inst.origin).port));
+        } catch {}
+    }
+    return ports;
+}
+
+/** #410: repair a real config that had proxy-prefixed URLs baked in. The
+ *  original upstream is embedded in the /bili/ path, so dead-origin wraps
+ *  unpack mechanically; a LIVE origin is left alone (the user may have
+ *  pointed the config at a running proxy deliberately). */
+export function unpackDeadProxyUrlsInFile(filePath: string, livePorts: Set<number>): number {
+    let txt: string;
+    try {
+        txt = fs.readFileSync(filePath, "utf8");
+    } catch {
+        return 0;
+    }
+    const re = /https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):(\d+)\/bili\/(https?:\/\/\S+)/g;
+    let changed = 0;
+    const out = txt.replace(re, (full, portStr: string, raw: string) => {
+        if (livePorts.has(Number(portStr))) return full;
+        changed += 1;
+        return raw;
+    });
+    if (changed === 0) return 0;
+    try {
+        atomicWriteTextFile(filePath, out);
+    } catch {
+        return 0;
+    }
+    return changed;
+}
+
 export function prepareOmpHttpRewrite(
     ompHome: string,
     origin: string,
     httpRewrites: HttpRewrite[],
     httpsRewrites: HttpRewrite[],
 ): string | undefined {
-    if (httpRewrites.length === 0 && httpsRewrites.length === 0) return undefined;
     const modelsPath = path.join(ompHome, "models.yml");
+    const unpacked = unpackDeadProxyUrlsInFile(modelsPath, liveProxyPorts());
+    if (unpacked > 0) {
+        console.error(`bili: unpacked ${unpacked} dead proxy URL(s) from the real ${modelsPath}`);
+    }
+    if (httpRewrites.length === 0 && httpsRewrites.length === 0) return undefined;
     let txt: string;
     try {
         txt = fs.readFileSync(modelsPath, "utf8");
@@ -1487,6 +1552,45 @@ async function probeHealth(
     }
 }
 
+interface HealthInfo {
+    ok: boolean;
+    instanceId?: string;
+}
+
+async function fetchHealthInfoDefault(origin: string): Promise<HealthInfo | undefined> {
+    try {
+        const res = await fetch(healthUrl(origin), { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
+        if (!res.ok) return undefined;
+        const data = (await res.json()) as { ok?: boolean; instanceId?: string };
+        return { ok: Boolean(data.ok), instanceId: typeof data.instanceId === "string" ? data.instanceId : undefined };
+    } catch {
+        return undefined;
+    }
+}
+
+function instanceCompatible(inst: ProxyInstanceFile, opts: LaunchOptions): boolean {
+    if (inst.host !== opts.host || inst.passthrough !== opts.passthrough) return false;
+    const wantDomains = opts.mitmDomains ?? [];
+    if (inst.mitmDomains.length !== wantDomains.length || inst.mitmDomains.some((d, i) => d !== wantDomains[i])) return false;
+    const wantWindows = opts.modelWindows ?? {};
+    const keys = Object.keys(wantWindows);
+    if (Object.keys(inst.modelWindows).length !== keys.length) return false;
+    return keys.every((k) => inst.modelWindows[k] === wantWindows[k]);
+}
+
+async function probeExistingInstance(
+    readInstance: () => ProxyInstanceFile | { origin: string } | undefined,
+    fetchHealthInfo: (origin: string) => Promise<HealthInfo | undefined>,
+): Promise<ProxyInstanceFile | undefined> {
+    const inst = readInstance();
+    if (!isProxyInstanceFile(inst)) return undefined;
+    if (!isPidAlive(inst.pid)) return undefined;
+    const health = await fetchHealthInfo(inst.origin);
+    if (!health || !health.ok) return undefined;
+    if (health.instanceId !== undefined && health.instanceId !== inst.instanceId) return undefined;
+    return inst;
+}
+
 export function findFreePort(preferred: number, host = LAUNCHER_DEFAULT_HOST): Promise<number> {
     const tryBind = (port: number): Promise<boolean> =>
         new Promise((resolve) => {
@@ -1531,13 +1635,26 @@ export async function ensureProxyRunning(
     deps: LauncherDeps = {},
 ): Promise<ProxyHandle> {
     const fetchImpl = deps.fetchImpl ?? defaultFetch;
+    const fetchHealthInfo = deps.fetchHealthInfo ?? fetchHealthInfoDefault;
+    const readInstance = deps.readInstanceFile ?? readProxyInstanceFile;
     const spawnImpl = deps.spawnImpl ?? (spawn as SpawnFn);
     const now = deps.now ?? Date.now;
     const sleepImpl = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
 
-    const port = await findFreePort(opts.port, opts.host);
-    const spawnedOrigin = proxyOrigin(opts.host, port);
+    // #394/#417: a healthy proxy with a compatible config is SHARED, not
+    // doubled — two concurrent launches of the same client would otherwise
+    // spawn two writers over one sessions dir.
+    const existing = await probeExistingInstance(readInstance, fetchHealthInfo);
+    if (existing && instanceCompatible(existing, opts)) {
+        console.error(`bili: attaching to running proxy at ${existing.origin} (pid ${existing.pid})`);
+        return { origin: existing.origin, port: existing.port, attached: true };
+    }
 
+    // #407: no probe-release-rebind. The child binds the preferred port
+    // itself and retries on EADDRINUSE, reporting the real origin through
+    // the instance file via this launchToken.
+    const launchToken = randomUUID();
+    const port = opts.port;
     const script = process.argv[1];
     if (!script) throw new Error("bili: cannot resolve launcher script path");
     const logPath = path.join(os.tmpdir(), `bili-proxy-${port}.log`);
@@ -1546,12 +1663,14 @@ export async function ensureProxyRunning(
     try {
         child = spawnImpl(
             process.execPath,
-            [script, ...proxyStartArgs({ ...opts, port, debug: true })],
+            [script, ...proxyStartArgs(opts)],
             {
                 detached: true,
                 stdio: ["ignore", logFd, logFd],
                 env: {
                     ...stripInheritedProxy(process.env),
+                    BILI_LAUNCH_TOKEN: launchToken,
+                    BILI_PARENT_PID: String(process.pid),
                     ...(opts.mitmDomains && opts.mitmDomains.length
                         ? { BILI_MITM_DOMAINS: opts.mitmDomains.join(",") }
                         : {}),
@@ -1573,17 +1692,37 @@ export async function ensureProxyRunning(
     const deadline = now() + SPAWN_WAIT_MS;
     while (now() < deadline) {
         await sleepImpl(HEALTH_POLL_INTERVAL_MS);
-        if (await probeHealth(spawnedOrigin, fetchImpl)) {
-            return { origin: spawnedOrigin, port, child, logPath };
+        const inst = readInstance();
+        if (isProxyInstanceFile(inst) && inst.launchToken === launchToken) {
+            if (await probeHealth(inst.origin, fetchImpl)) {
+                return { origin: inst.origin, port: inst.port, child, logPath };
+            }
+            continue;
+        }
+        // Fallback for a child that cannot write the instance file (broken
+        // state dir) or an old pre-handshake binary: only trust the preferred
+        // origin when NO record vouches for it — a LIVE record's owner owns
+        // the discovery surface and our child is retry-binding elsewhere.
+        // A stale record (dead pid / legacy plain) cannot vouch for anything.
+        const stale = !isProxyInstanceFile(inst) || !isPidAlive(inst.pid);
+        if (stale && (await probeHealth(proxyOrigin(opts.host, port), fetchImpl))) {
+            return { origin: proxyOrigin(opts.host, port), port, child, logPath };
         }
     }
-    throw new Error(`bili: proxy did not become healthy at ${spawnedOrigin} within ${SPAWN_WAIT_MS}ms`);
+    throw new Error(`bili: proxy did not become healthy within ${SPAWN_WAIT_MS}ms (log: ${logPath})`);
 }
 
 export function stopProxy(handle: ProxyHandle): void {
+    if (handle.attached) return;
     const child = handle.child;
     if (!child || child.pid === undefined) return;
-    if (process.platform !== "win32" && child.pid > 0) {
+    if (process.platform === "win32") {
+        // #414: child.kill() on win32 is TerminateProcess — zero flush.
+        // Launcher children watch BILI_PARENT_PID and run the graceful path
+        // themselves once this process exits (≤2s later).
+        return;
+    }
+    if (child.pid > 0) {
         try {
             process.kill(-child.pid);
         } catch {

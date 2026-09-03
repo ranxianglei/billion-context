@@ -7,7 +7,7 @@ import { acquireInFlight, listSessions, markDirty, peekSession, releaseInFlight,
 import { ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, PROXY_TOOL_NAMES } from "./compress-tool.js";
 import { executeProxyTool } from "./loop/core.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
-import { containsRenderTagText, createTagEchoFilter, stripResponsesText } from "./loop/tag-echo-filter.js";
+import { containsRenderTagText, createTagEchoFilter, mayStartRenderTag, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
 import type { WireProtocol } from "./util.js";
 import { stateDir } from "./paths.js";
@@ -106,13 +106,21 @@ const remembered = new Map<string, RememberedMessages>();
 // before the debounced write just means the next model request repopulates it.
 const conversationsFile = () => path.join(stateDir(), "plugin-conversations.json");
 let conversationsSaveTimer: NodeJS.Timeout | undefined;
+let conversationsDirty = false;
 
 function writeConversationsFile(): void {
+    if (!conversationsDirty) return;
     try {
         const obj: Record<string, ConversationEntry> = {};
         for (const [k, v] of conversations) obj[k] = v;
         fs.mkdirSync(stateDir(), { recursive: true });
-        fs.writeFileSync(conversationsFile(), JSON.stringify(obj));
+        // #406: the only state file that used to be written in place — a
+        // torn write or a dying dual instance must not zero every route.
+        const filePath = conversationsFile();
+        const draft = `${filePath}.${process.pid}.bili-tmp`;
+        fs.writeFileSync(draft, JSON.stringify(obj));
+        fs.renameSync(draft, filePath);
+        conversationsDirty = false;
     } catch {
         // best-effort persistence; ignore write failures
     }
@@ -138,8 +146,13 @@ export function flushConversations(): void {
 /** Restore the persisted conversationId → session map. Called at startup,
  *  AFTER initSessions so the referenced sessions are already loaded. */
 export function loadConversations(): void {
+    let raw: string;
     try {
-        const raw = fs.readFileSync(conversationsFile(), "utf8");
+        raw = fs.readFileSync(conversationsFile(), "utf8");
+    } catch {
+        return;
+    }
+    try {
         const obj = JSON.parse(raw) as Record<string, ConversationEntry>;
         for (const [k, v] of Object.entries(obj)) {
             if (v && typeof v.sessionId === "string" && v.sessionId.length > 0) {
@@ -147,8 +160,14 @@ export function loadConversations(): void {
             }
         }
     } catch {
-        // no file or corrupt — start empty
+        // #406: preserve the corrupt bytes for forensics instead of
+        // silently zeroing every route on the next debounced write.
+        try {
+            fs.renameSync(conversationsFile(), `${conversationsFile()}.corrupt-${Date.now()}`);
+        } catch {}
+        loggerLog("warn", "[plugin] plugin-conversations.json is corrupt — backed up beside the original, starting an empty routing table");
     }
+    conversationsDirty = false;
 }
 
 /** Index a plugin session by its conversation id (the key the plugin uses on
@@ -157,6 +176,7 @@ export function loadConversations(): void {
 export function recordPluginSession(conversationId: string, sessionId: string): void {
     conversations.delete(conversationId);
     conversations.set(conversationId, { sessionId, lastSeen: Date.now() });
+    conversationsDirty = true;
     // remembered[sessionId] is intentionally left alone here: this runs OUTSIDE
     // the session lock. rememberPluginMessages() rewrites it under the lock
     // after forward(), and the tool API reads it under the lock — so no
@@ -509,28 +529,151 @@ function mergeUsageSample(acc: UsageSample, sample: UsageSample): void {
     if (sample.outputTokens !== undefined) acc.outputTokens = sample.outputTokens;
 }
 
-/** Plugin-mode streaming passthrough: forward upstream bytes verbatim (the
- *  agent's native tool loop must see the model's tool calls untouched) while
- *  sniffing usage out of the SSE events — without this, lastInputTokens
- *  would never update and compression nudges would never fire. */
-export async function pipeThroughWithUsage(
+/** Plugin-mode streaming passthrough for the OpenAI chat-completions and
+ *  Anthropic wires: forward upstream events byte-identical (the agent's
+ *  native tool loop must see the model's tool calls untouched) while (a)
+ *  sniffing usage so lastInputTokens keeps tracking reality and (b) running
+ *  model prose through the tag-echo state machine — #206 parity with
+ *  pipePluginResponsesWithStrip. The verbatim variant let a model-emitted
+ *  render tag echo land in the agent's replayed history and amplify into the
+ *  "endless blank output" loop observed with pi + qwen (issue #14).
+ *
+ *  Also serves proxy-mode chat SSE that skipped compress injection (#460:
+ *  title-gen exclusion / ACP_NO_INJECT_TOOL / classifier bypass). Pass no
+ *  session there — usage accounting must be skipped or a title-gen call's
+ *  tiny input_tokens would clobber lastInputTokens and break compression
+ *  triggering for the main conversation. */
+export async function pipePluginChatWithStrip(
     stream: ReadableStream<Uint8Array>,
     res: import("node:http").ServerResponse,
-    session: Session,
-    protocol?: WireProtocol,
+    protocol: WireProtocol,
+    session?: Session,
+    log?: (msg: string) => void,
 ): Promise<void> {
     const reader = stream.getReader();
     const decoder = new TextDecoder("utf-8");
     let buf = "";
     const acc: UsageSample = {};
+    const onDrop = (snippet: string) => {
+        loggerLog("warn", `[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+        log?.(`[tag-echo] stripped model-emitted render tag from plugin passthrough text`);
+    };
+    // One state machine per (field, block/choice index) — interleaved choices
+    // or content blocks must not share partial-tag state.
+    const streams = new Map<string, { filter: TagEchoFilter; field: string; index: number }>();
+    const filterFor = (field: string, index: number) => {
+        const key = `${field}:${index}`;
+        let s = streams.get(key);
+        if (!s) {
+            s = { filter: createTagEchoFilter(onDrop), field, index };
+            streams.set(key, s);
+        }
+        return s;
+    };
+    const anyPending = () => {
+        for (const s of streams.values()) if (s.filter.pending()) return true;
+        return false;
+    };
+    let lastChunkMeta: Record<string, unknown> = {};
+    const syntheticTail = (field: string, index: number, tail: string): string => {
+        if (protocol === "anthropic") {
+            const deltaType = field === "text" ? "text_delta" : "thinking_delta";
+            return `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index, delta: { type: deltaType, [field]: tail } })}\n\n`;
+        }
+        return `data: ${JSON.stringify({ ...lastChunkMeta, object: "chat.completion.chunk", choices: [{ index, delta: { [field]: tail } }] })}\n\n`;
+    };
+    const flushTails = (): string => {
+        let out = "";
+        for (const s of streams.values()) {
+            const tail = s.filter.flush();
+            if (tail.length > 0) out += syntheticTail(s.field, s.index, tail);
+        }
+        return out;
+    };
+    const write = (s: string) => {
+        if (!res.write(Buffer.from(s, "utf8"))) {
+            return new Promise<void>((r) => res.once("drain", () => r()));
+        }
+    };
+    const pushField = (field: string, index: number, text: string): [string, boolean] => {
+        const s = filterFor(field, index);
+        const clean = s.filter.push(text);
+        return [clean, clean !== text];
+    };
+    const processOpenai = (ev: Record<string, unknown>, rawEvent: string): string => {
+        if (typeof ev["id"] === "string" || typeof ev["model"] === "string") {
+            lastChunkMeta = { id: ev["id"], created: ev["created"], model: ev["model"] };
+        }
+        const choices = ev["choices"];
+        if (!Array.isArray(choices)) {
+            return anyPending() ? flushTails() + rawEvent + "\n\n" : rawEvent + "\n\n";
+        }
+        let rebuilt: Record<string, unknown> | null = null;
+        let droppedText = false;
+        let keptText = false;
+        let hadText = false;
+        for (let ci = 0; ci < choices.length; ci++) {
+            const ch = choices[ci] as Record<string, unknown> | null;
+            const d = ch?.["delta"];
+            if (!d || typeof d !== "object") continue;
+            const dd = d as Record<string, unknown>;
+            for (const field of ["content", "reasoning_content", "reasoning"]) {
+                const v = dd[field];
+                if (typeof v !== "string") continue;
+                hadText = true;
+                if (!mayStartRenderTag(v) && !anyPending()) {
+                    if (v.length > 0) keptText = true;
+                    continue;
+                }
+                const index = typeof ch?.["index"] === "number" ? ch["index"] : ci;
+                const [clean, changed] = pushField(field, index, v);
+                if (clean.length === 0) droppedText = true;
+                else keptText = true;
+                if (changed) {
+                    if (!rebuilt) {
+                        rebuilt = { ...ev, choices: choices.map((c) => ({ ...(c as Record<string, unknown>), delta: { ...((c as Record<string, unknown>)["delta"] as Record<string, unknown>) } })) };
+                    }
+                    (rebuilt["choices"] as Record<string, unknown>[])[ci]["delta"] = { ...((rebuilt["choices"] as Record<string, unknown>[])[ci]["delta"] as Record<string, unknown>), [field]: clean };
+                }
+            }
+        }
+        if (rebuilt) {
+            // Delta carried no visible text after stripping: drop the whole
+            // chunk instead of forwarding an empty content delta. Only when
+            // EVERY managed text field emptied out — a sibling field with real
+            // content must survive (#463).
+            if (droppedText && !keptText && !hadTextOtherThanTextFields(rebuilt["choices"])) {
+                return "";
+            }
+            return rebuildEvent(rawEvent, rebuilt);
+        }
+        if (!hadText && anyPending()) return flushTails() + rawEvent + "\n\n";
+        return rawEvent + "\n\n";
+    };
+    const processAnthropic = (ev: Record<string, unknown>, rawEvent: string): string => {
+        if (ev["type"] !== "content_block_delta") {
+            return anyPending() ? flushTails() + rawEvent + "\n\n" : rawEvent + "\n\n";
+        }
+        const d = ev["delta"] as Record<string, unknown> | undefined;
+        const index = typeof ev["index"] === "number" ? ev["index"] : 0;
+        const field = d?.["type"] === "thinking_delta" ? "thinking" : d?.["type"] === "text_delta" ? "text" : null;
+        if (field === null || typeof d?.[field] !== "string") {
+            return rawEvent + "\n\n";
+        }
+        const raw = d[field] as string;
+        if (!mayStartRenderTag(raw) && !anyPending()) {
+            return rawEvent + "\n\n";
+        }
+        const [clean, changed] = pushField(field, index, raw);
+        if (!changed) return rawEvent + "\n\n";
+        if (clean.length === 0 && Object.keys(d ?? {}).length <= 2) return "";
+        return rebuildEvent(rawEvent, { ...ev, delta: { ...d, [field]: clean } });
+    };
     try {
         for (;;) {
             const { done, value } = await reader.read();
             if (done) break;
             if (value && value.length > 0) {
-                if (!res.write(Buffer.from(value))) {
-                    await new Promise<void>((r) => res.once("drain", () => r()));
-                }
                 buf = normalizeSseLineEndings(buf + decoder.decode(value, { stream: true }));
                 let idx: number;
                 while ((idx = buf.indexOf("\n\n")) !== -1) {
@@ -539,21 +682,29 @@ export async function pipeThroughWithUsage(
                     const dataLines = rawEvent.split("\n").filter((l) => l.startsWith("data:"));
                     if (dataLines.length === 0) continue;
                     const jsonStr = dataLines.map((l) => l.slice(5).replace(/^ /, "")).join("\n").trim();
-                    if (!jsonStr || jsonStr === "[DONE]") continue;
+                    if (!jsonStr) continue;
+                    if (jsonStr === "[DONE]") {
+                        await write(flushTails() + rawEvent + "\n\n");
+                        continue;
+                    }
+                    let ev: Record<string, unknown>;
                     try {
-                        const ev = JSON.parse(jsonStr) as Record<string, unknown>;
-                        const sample = usageFromSseEvent(ev);
-                        if (sample) mergeUsageSample(acc, sample);
-                    } catch { /* non-JSON data line */ }
+                        ev = JSON.parse(jsonStr) as Record<string, unknown>;
+                    } catch {
+                        await write(rawEvent + "\n\n");
+                        continue;
+                    }
+                    const sample = usageFromSseEvent(ev);
+                    if (sample) mergeUsageSample(acc, sample);
+                    const out = protocol === "anthropic" ? processAnthropic(ev, rawEvent) : processOpenai(ev, rawEvent);
+                    if (out.length > 0) await write(out);
                 }
             }
             if (res.destroyed || res.writableEnded) break;
         }
-        // Apply BEFORE res.end() in the finally below: the client can issue
-        // its next request (e.g. /__bili/plugin/status, or the follow-up turn
-        // that reads lastInputTokens for the nudge decision) the moment the
-        // stream completes, and those must already see this usage.
-        if (acc.inputTokens !== undefined || acc.outputTokens !== undefined || acc.cachedTokens !== undefined) {
+        const rest = flushTails();
+        if (rest.length > 0 && !res.destroyed && !res.writableEnded) await write(rest);
+        if (session && (acc.inputTokens !== undefined || acc.outputTokens !== undefined || acc.cachedTokens !== undefined)) {
             applyUsageSample(session, acc, protocol);
             markDirty(session);
         }
@@ -563,8 +714,21 @@ export async function pipeThroughWithUsage(
     }
 }
 
-/** Plugin-mode non-streaming passthrough: same contract as
- *  pipeThroughWithUsage but for a single JSON body. */
+function hadTextOtherThanTextFields(choices: unknown): boolean {
+    if (!Array.isArray(choices)) return true;
+    for (const c of choices) {
+        if (!c || typeof c !== "object") continue;
+        const ch = c as Record<string, unknown>;
+        if (typeof ch["finish_reason"] === "string") return true;
+        const d = ch["delta"] as Record<string, unknown> | undefined;
+        if (!d) continue;
+        for (const k of Object.keys(d)) {
+            if (k !== "content" && k !== "reasoning_content" && k !== "reasoning") return true;
+        }
+    }
+    return false;
+}
+
 /**
  * Plugin-mode Responses passthrough with render-tag stripping (#206 parity
  * for VERBATIM plugin streams). In plugin mode the native tool loop owns the
@@ -576,11 +740,14 @@ export async function pipeThroughWithUsage(
  * tag-echo state machine the compress loop uses. A held tail is flushed as a
  * final delta before the first done/completed event so the client's assembled
  * text never loses content.
- */
+ *
+ *  Also serves proxy-mode Responses SSE that skipped compress injection
+ *  (#460, e.g. ACP_NO_INJECT_TOOL). Pass no session there — see
+ *  pipePluginChatWithStrip for why usage accounting must be skipped. */
 export async function pipePluginResponsesWithStrip(
     stream: ReadableStream<Uint8Array>,
     res: import("node:http").ServerResponse,
-    session: Session,
+    session?: Session,
     log?: (msg: string) => void,
 ): Promise<void> {
     const reader = stream.getReader();
@@ -651,7 +818,7 @@ export async function pipePluginResponsesWithStrip(
                             await write(rawEvent + "\n\n");
                             continue;
                         }
-                        if (!containsRenderTagText(delta) && !tagFilter.pending()) {
+                        if (!mayStartRenderTag(delta) && !tagFilter.pending()) {
                             await write(rawEvent + "\n\n");
                             continue;
                         }
@@ -676,7 +843,7 @@ export async function pipePluginResponsesWithStrip(
             const rest = flushTail("");
             if (rest.length > 0) await write(rest);
         }
-        if (acc.inputTokens !== undefined || acc.outputTokens !== undefined || acc.cachedTokens !== undefined) {
+        if (session && (acc.inputTokens !== undefined || acc.outputTokens !== undefined || acc.cachedTokens !== undefined)) {
             applyUsageSample(session, acc, "responses");
             markDirty(session);
         }
@@ -708,9 +875,11 @@ function rebuildEvent(rawEvent: string, ev: Record<string, unknown>): string {
 export async function pipePluginJson(
     stream: ReadableStream<Uint8Array>,
     res: import("node:http").ServerResponse,
-    session: Session,
+    session?: Session,
     protocol?: WireProtocol,
 ): Promise<void> {
+    // Also serves proxy-mode JSON responses that skipped compress injection
+    // (#460 residual) — pass no session there so usage accounting stays off.
     const reader = stream.getReader();
     const chunks: Buffer[] = [];
     for (;;) {
@@ -723,7 +892,7 @@ export async function pipePluginJson(
     try {
         const json = JSON.parse(text) as Record<string, unknown>;
         const usage = json["usage"] as Record<string, unknown> | undefined;
-        if (usage) {
+        if (session && usage) {
             const input = num(usage["prompt_tokens"]) ?? num(usage["input_tokens"]);
             if (input !== undefined) {
                 applyUsageSample(session, {
@@ -738,16 +907,15 @@ export async function pipePluginJson(
             }
         }
     } catch { /* non-JSON body — forward verbatim */ }
-    if (protocol === "responses") {
+    if (containsRenderTagText(text)) {
         // #206 parity for the non-streaming plugin path: the compress loop's
-        // JSON branch strips render tags from every round (compressLoopResponsesJson);
-        // a verbatim plugin JSON response would re-feed the model's tag echoes.
+        // JSON branch strips render tags from every round; a verbatim plugin
+        // JSON response would re-feed the model's tag echoes.
         try {
             const json = JSON.parse(text) as Record<string, unknown>;
-            if (containsRenderTagText(text)) {
-                res.end(Buffer.from(JSON.stringify(stripResponsesText(json)), "utf8"));
-                return;
-            }
+            const stripped = protocol === "responses" ? stripResponsesText(json) : protocol === "anthropic" ? stripAnthropicText(json) : stripOpenaiChatText(json);
+            res.end(Buffer.from(JSON.stringify(stripped), "utf8"));
+            return;
         } catch { /* fall through to verbatim */ }
     }
     res.end(text);
