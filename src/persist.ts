@@ -60,6 +60,13 @@ import type { Session, BlockContent } from "./session.js";
 
 const PERSIST_VERSION = 3;
 
+/** On-disk block content view. `one` is optional: when it is byte-identical
+ *  to `full` (all leaf blocks) only `full` is written (#407). */
+interface PersistedBlockContent {
+    one?: { text: string; count: number };
+    full: { text: string; count: number };
+}
+
 interface PersistedSession {
     version: number;
     savedAt: number;
@@ -101,8 +108,10 @@ interface PersistedSession {
     lastInputTokens?: number;
     contextTokens?: number;
     state: CompressionState;
-    /** blockContents serialized as a plain record (Maps do not survive JSON). */
-    blockContents: Record<string, BlockContent>;
+    /** blockContents serialized as a plain record (Maps do not survive JSON).
+     *  `one` is omitted when byte-identical to `full` (always true for leaf
+     *  blocks — #407); buildSession restores it on load. */
+    blockContents: Record<string, PersistedBlockContent>;
     /** Latest full-conversation snapshot (v3+): the client's raw messages
      *  from its most recent request, overwritten every turn. Absent on v2
      *  files — export falls back to block-only rendering. */
@@ -164,15 +173,18 @@ function relPathFor(id: string, protocol?: string, upstreamOrigin?: string): str
  *  server.ts / export.ts. */
 export class SessionStore {
     readonly enabled: boolean;
-    private readonly dir: string;
+    get dir(): string {
+        return this.root;
+    }
+    private readonly root: string;
     private readonly store: StateStore<PersistedSession>;
 
     constructor(opts?: { dir?: string; debounceMs?: number; enabled?: boolean; log?: Logger }) {
         const debounceMs = opts?.debounceMs ?? defaultDebounce();
         this.enabled = (opts?.enabled ?? true) && debounceMs >= 0;
-        this.dir = opts?.dir ?? defaultDir();
+        this.root = opts?.dir ?? defaultDir();
         this.store = new StateStore<PersistedSession>({
-            dir: this.dir,
+            dir: this.root,
             version: PERSIST_VERSION,
             debounceMs: Math.max(0, debounceMs),
             enabled: this.enabled,
@@ -199,55 +211,67 @@ export class SessionStore {
         return out;
     }
 
-    /** One-time migration for the #286 identity change: sessions persisted
-     *  under the old derived hash id are re-keyed to the client-provided
-     *  conversation value stored in meta.label (which is now the session id
-     *  itself). Collisions on the same label keep the most recently saved
-     *  record; the losers, and any label already claimed by a new-format
-     *  session, are deleted. Records without a label cannot be mapped and are
-     *  left in place (they load under their old id but are never requested
-     *  again — the new proxy 400s anonymous requests). Self-terminating:
-     *  after one pass no loaded id differs from its label. */
-    async migrateLegacyIds(): Promise<void> {
-        if (!this.enabled) return;
+    /** Startup load: ONE directory walk + parse (previously #286's
+     *  migrateLegacyIds ran its own loadAll before initSessions' second
+     *  loadAll — two full walks per boot, #407), with the legacy-id rekey
+     *  applied in-memory on the same data. The #286 migration: sessions
+     *  persisted under the old derived hash id are re-keyed to the
+     *  client-provided conversation value stored in meta.label (which is now
+     *  the session id itself). Collisions on the same label keep the most
+     *  recently saved record; the losers, and any label already claimed by a
+     *  new-format session, are deleted. Records without a label cannot be
+     *  mapped and are left in place (they load under their old id but are
+     *  never requested again — the new proxy 400s anonymous requests).
+     *  Self-terminating: after one pass no loaded id differs from its label,
+     *  so the log fires exactly once ever instead of on every boot. */
+    async loadAllMigrated(): Promise<Map<string, Session>> {
+        const out = new Map<string, Session>();
+        if (!this.enabled) return out;
         const loaded = await this.store.loadAll();
         const claimed = new Set<string>();
         const byLabel = new Map<string, { id: string; savedAt: number; session: Session }>();
-        let unlabeled = 0;
+        const dropped = new Set<string>();
         for (const [id, envelope] of loaded) {
             const session = buildSession(envelope.payload);
+            out.set(id, session);
             const label = session.meta.label;
-            if (!label) {
-                unlabeled++;
-                continue;
-            }
+            if (!label) continue;
             if (label === id) {
                 claimed.add(id);
                 continue;
             }
             const prev = byLabel.get(label);
             if (!prev || envelope.savedAt >= prev.savedAt) {
-                if (prev) await this.removeLegacyFile(prev.id, prev.session);
+                if (prev) {
+                    await this.removeLegacyFile(prev.id, prev.session);
+                    dropped.add(prev.id);
+                }
                 byLabel.set(label, { id, savedAt: envelope.savedAt, session });
             } else {
                 await this.removeLegacyFile(id, session);
+                dropped.add(id);
             }
         }
         let rekeyed = 0;
         for (const [label, { id, session }] of byLabel) {
             if (claimed.has(label)) {
                 await this.removeLegacyFile(id, session);
+                dropped.add(id);
                 continue;
             }
             session.id = label;
             await this.store.writeNow(label, () => buildRecord(session));
             await this.removeLegacyFile(id, session);
+            out.delete(id);
+            out.set(label, session);
             claimed.add(label);
             rekeyed++;
         }
-        if (rekeyed || unlabeled) {
-            loggerLog("info", `[persist] one-time migration (#286): rekeyed ${rekeyed} legacy session(s), left ${unlabeled} unlabeled legacy file(s) in place`);
+        for (const id of dropped) out.delete(id);
+        if (rekeyed > 0) {
+            loggerLog("info", `[persist] migration (#286): rekeyed ${rekeyed} legacy session(s)`);
         }
+        return out;
     }
 
     /** Remove a legacy session file. The kernel store never deletes (cleanup
@@ -337,15 +361,31 @@ function buildRecord(session: Session): PersistedSession {
         messages: session.lastMessages,
         metadata: { ...session.metadata },
         state: session.state,
-        blockContents: Object.fromEntries(session.blockContents),
+        blockContents: serializeBlockContents(session.blockContents),
         createdAt: session.createdAt,
     };
+}
+
+/** Leaf blocks always have byte-identical one/full views (kernel
+ *  collectBlockContent: no nested children ⇒ same message set), so the body
+ *  would be stored twice per file (#407). Store one copy when identical. */
+function serializeBlockContents(map: Map<string, BlockContent>): Record<string, PersistedBlockContent> {
+    const out: Record<string, PersistedBlockContent> = {};
+    for (const [bid, c] of map) {
+        out[bid] = c.one.text === c.full.text && c.one.count === c.full.count ? { full: c.full } : c;
+    }
+    return out;
 }
 
 function buildSession(parsed: PersistedSession): Session {
     const blockContents = new Map<string, BlockContent>();
     for (const [bid, content] of Object.entries(parsed.blockContents ?? {})) {
-        if (content && typeof content === "object") blockContents.set(bid, content);
+        if (!content || typeof content !== "object" || typeof content.full?.text !== "string") continue;
+        const full = { text: content.full.text, count: content.full.count ?? 0 };
+        const one = content.one && typeof content.one.text === "string"
+            ? { text: content.one.text, count: content.one.count ?? 0 }
+            : { ...full };
+        blockContents.set(bid, { one, full });
     }
     // Read grouped shape (v2+); fall back to flat fields for v1 files.
     const meta = parsed.meta ?? {};

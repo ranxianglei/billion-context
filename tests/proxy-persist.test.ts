@@ -6,6 +6,8 @@ import { mkdirSync, mkdtempSync, rmSync, readdirSync, readFileSync, statSync, wr
 import { SessionStore } from "../src/persist.ts";
 import { dirname, join, relative, sep } from "node:path";
 import type { Session, BlockContent } from "../src/session.ts";
+import { cacheBlockContent } from "../src/session.ts";
+import { setLogCapture } from "../src/logger.ts";
 import { createInitialState } from "acp-kernel";
 /** Recursively collect *.json files under dir (sessions are namespaced into
  *  protocol/ subdirs). */
@@ -369,17 +371,66 @@ await withTempStore("one-time migration re-keys legacy hash-id sessions to their
     // A fresh store mirrors a new process: no discovered-file cache.
     const cold = new SessionStore({ dir, debounceMs: 5, enabled: true });
     try {
-        await cold.migrateLegacyIds();
-
-        const all = await cold.loadAll();
+        const all = await cold.loadAllMigrated();
         assert.ok(all.has(label), "re-keyed under the client-provided label");
         assert.ok(!all.has(legacyA) && !all.has(legacyB), "legacy ids no longer resolve");
         assert.equal(all.get(label)!.stats.requests, 7, "newest savedAt wins the collision");
         assert.equal(jsonFilesUnder(dir).length, 1, "loser and old files removed");
 
-        await cold.migrateLegacyIds();
-        assert.equal((await cold.loadAll()).size, 1, "second migration is a no-op");
+        assert.equal((await cold.loadAllMigrated()).size, 1, "second pass is a no-op");
     } finally {
         cold.cancelAll();
+    }
+});
+
+await withTempStore("identical one/full views persist once (leaf-block dedup, #407)", async (store, dir) => {
+    const s = makeSession("dedup-1");
+    const body = "x".repeat(100_000);
+    cacheBlockContent(s, "b1", { one: { text: body, count: 5 }, full: { text: body, count: 5 } });
+    cacheBlockContent(s, "b2", { one: { text: "one-view", count: 1 }, full: { text: "full-view", count: 2 } });
+    s.state.nextBlockId = 3;
+    await store.writeNow(s);
+
+    const file = jsonFilesUnder(dir)[0];
+    const raw = JSON.parse(readFileSync(file, "utf8")).payload.blockContents;
+    assert.equal(raw.b1.one, undefined, "identical view stored once on disk");
+    assert.equal(raw.b1.full.text, body);
+    assert.ok(raw.b2.one && raw.b2.full, "distinct views keep both");
+    const forced = JSON.stringify({ one: { text: body, count: 5 }, full: { text: body, count: 5 } }).length;
+    const actual = JSON.stringify(raw.b1).length;
+    assert.ok(actual <= forced / 2 + 32, `deduped record ≈half size (actual=${actual}, forced=${forced})`);
+
+    const loaded = store.loadSync("dedup-1")!;
+    const c1 = loaded.blockContents.get("b1")!;
+    assert.equal(c1.one.text, body, "one restored from full when omitted");
+    assert.equal(c1.one.count, 5);
+    assert.equal(c1.full.text, body);
+    assert.notEqual(c1.one, c1.full, "restored views are independent objects");
+});
+
+await withTempStore("migration log fires only when a rekey actually happens (#407)", async (store, dir) => {
+    const lines: string[] = [];
+    setLogCapture((level, msg) => lines.push(`${level}: ${msg}`));
+    const legacy = "legacy-" + "c".repeat(24);
+    const s = makeSession(legacy);
+    s.meta.label = "conv-407";
+    s.meta.protocol = "responses";
+    s.meta.upstreamOrigin = "https://chatgpt.com";
+    try {
+        await store.writeNow(s);
+        const cold = new SessionStore({ dir, debounceMs: 5, enabled: true });
+        try {
+            const first = await cold.loadAllMigrated();
+            assert.ok(first.has("conv-407"), "rekeyed under the label");
+            assert.ok(lines.some((l) => l.includes("rekeyed 1 legacy")), "first boot logs the migration");
+            const before = lines.length;
+            const second = await cold.loadAllMigrated();
+            assert.equal(second.size, 1, "second boot still sees the session");
+            assert.ok(!lines.slice(before).some((l) => l.includes("migration (#286)")), "second boot logs nothing");
+        } finally {
+            cold.cancelAll();
+        }
+    } finally {
+        setLogCapture(null);
     }
 });

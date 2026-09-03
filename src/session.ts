@@ -1,5 +1,6 @@
 import { createInitialState, type CompressionState, type CoreMessage } from "acp-kernel";
 import { getStore } from "./persist.js";
+import { gcSessionFiles, gcOptionsFromEnv } from "./session-gc.js";
 
 export type BlockContent = {
     one: { text: string; count: number };
@@ -131,16 +132,19 @@ let MAX_SESSIONS = Math.max(1, Number.parseInt(process.env.BILI_MAX_SESSIONS ?? 
 
 let initialized = false;
 
-/** Bulk-load persisted sessions from disk into the in-memory map. Called once
- *  at server startup before listening. Caps at MAX_SESSIONS by createdAt
- *  (keeps the most recent) so a huge backlog cannot OOM on boot. Idempotent. */
+/** Startup: GC the on-disk registry (stat-only; expired/over-budget files
+ *  are removed BEFORE anything is read, so they cost no parse time), then
+ *  bulk-load the survivors into the in-memory map with a single directory
+ *  walk (loadAllMigrated folds the #286 legacy-id migration into that same
+ *  pass). Caps at MAX_SESSIONS by createdAt (keeps the most recent) so a
+ *  huge backlog cannot OOM on boot. Idempotent. */
 export async function initSessions(): Promise<void> {
     if (initialized) return;
     initialized = true;
     const store = getStore();
     if (!store.enabled) return;
-    await store.migrateLegacyIds();
-    const loaded = await store.loadAll();
+    gcSessionFiles(store.dir, gcOptionsFromEnv());
+    const loaded = await store.loadAllMigrated();
     if (loaded.size > MAX_SESSIONS) {
         const entries = [...loaded.entries()].sort((a, b) => (b[1].createdAt ?? 0) - (a[1].createdAt ?? 0));
         for (const [id, s] of entries) {
@@ -250,9 +254,16 @@ export function markDirty(session: Session): void {
     getStore().scheduleSave(session);
 }
 
-/** Record original block content at compress time. */
+/** Record original block content at compress time. Identical one/full views
+ *  (all leaf blocks — #407) share one object so the body is held once in
+ *  memory and serialized once on disk; consumers are read-only. */
 export function cacheBlockContent(session: Session, blockId: string, content: BlockContent): void {
-    session.blockContents.set(blockId, content);
+    if (content.one.text === content.full.text && content.one.count === content.full.count) {
+        const view = { text: content.full.text, count: content.full.count };
+        session.blockContents.set(blockId, { one: view, full: view });
+    } else {
+        session.blockContents.set(blockId, content);
+    }
 }
 
 export function resetSessionCompression(session: Session): void {
@@ -322,6 +333,7 @@ export async function flushAllSessions(): Promise<void> {
 
 export function _resetSessionsForTest(max?: number): void {
     if (max !== undefined) MAX_SESSIONS = Math.max(1, Math.floor(max));
+    initialized = false;
     for (const s of sessions.values()) {
         if (s.inFlight > 0) s.inFlight = 0;
     }
