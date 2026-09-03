@@ -3123,6 +3123,7 @@ function sendStats(res: http.ServerResponse): void {
         cacheSamples: s.stats.cacheSamples,
         cacheHitPct: s.stats.cacheSamples > 0 && s.stats.inputTokens > 0 ? Math.round(s.stats.cachedTokens / s.stats.inputTokens * 100) : null,
         lastSeen: new Date(s.lastSeen).toISOString(),
+        restored: s.restored === true,
     }));
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ sessions }, null, 2));

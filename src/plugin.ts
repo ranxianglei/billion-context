@@ -358,12 +358,20 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     let session = entry ? peekSession(entry.sessionId) : undefined;
     let viaFallback = false;
     if ((!entry || !session) && fallbackLatest) {
+        // #404: only sessions with real activity in THIS process qualify.
+        // Before the fix every boot-restored session carried lastSeen =
+        // restore time, so a 245-way tie resolved by insertion (readdir)
+        // order and could attach a fresh client to an unrelated old session.
         const latest = listSessions()
-            .filter((s) => typeof s.lastSeen === "number")
+            .filter((s) => s.restored !== true)
             .sort((a, b) => (b.lastSeen ?? 0) - (a.lastSeen ?? 0))[0];
         if (latest) {
             session = latest;
             viaFallback = true;
+        } else {
+            res.writeHead(404, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: "no session with activity since boot — issue a model request or pass the conversation id" }));
+            return;
         }
     }
     if (!session) {
