@@ -1093,6 +1093,7 @@ test("prepareOmpHttpRewrite: rewrites matching provider, leaves others, symlinks
         ].join("\n"),
     );
     fs.writeFileSync(path.join(home, "config.yml"), "extensions:\n  - /x/omp.js\n");
+    fs.writeFileSync(path.join(home, "auth.json"), '{"key":"x"}');
     const tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", [
         { key: "a", realUpstream: "http://example.com/v1" },
     ], []);
@@ -1101,11 +1102,88 @@ test("prepareOmpHttpRewrite: rewrites matching provider, leaves others, symlinks
         const out = fs.readFileSync(path.join(tmp!, "models.yml"), "utf8");
         assert.ok(out.includes("baseUrl: http://127.0.0.1:8787/bili/http://example.com/v1"), "a rewritten");
         assert.ok(out.includes("baseUrl: https://secure.example.com"), "b unchanged");
-        assert.equal(fs.lstatSync(path.join(tmp!, "config.yml")).isSymbolicLink(), true);
-        assert.equal(fs.realpathSync(path.join(tmp!, "config.yml")), path.join(home, "config.yml"));
+        assert.equal(fs.lstatSync(path.join(tmp!, "auth.json")).isSymbolicLink(), true, "sibling symlinked");
+        assert.equal(fs.realpathSync(path.join(tmp!, "auth.json")), path.join(home, "auth.json"));
+        assert.equal(fs.lstatSync(path.join(tmp!, "config.yml")).isSymbolicLink(), false, "config.yml generated, not symlinked");
+        const cfg = fs.readFileSync(path.join(tmp!, "config.yml"), "utf8");
+        assert.ok(cfg.includes("extensions:"), "config.yml preserves other keys");
+        assert.ok(cfg.includes("compaction:"), "config.yml has compaction block");
+        assert.ok(cfg.includes("enabled: false"), "omp native compaction disabled");
     } finally {
         if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
         fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("prepareOmpHttpRewrite: non-existent home → undefined", () => {
+    assert.equal(prepareOmpHttpRewrite("/nonexistent-bili-omp-home-xyz", "http://127.0.0.1:8787", [], []), undefined);
+});
+
+test("prepareOmpHttpRewrite: no rewrites → overlay built, omp native compaction disabled, models.yml copied verbatim", () => {
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-")));
+    fs.writeFileSync(path.join(home, "models.yml"), "providers:\n  a:\n    baseUrl: https://keep.example.com\n");
+    try {
+        const overlay = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", [], []);
+        assert.ok(typeof overlay === "string" && overlay.length > 0);
+        const cfg = fs.readFileSync(path.join(overlay!, "config.yml"), "utf8");
+        assert.ok(cfg.includes("enabled: false"), "omp native compaction disabled");
+        const out = fs.readFileSync(path.join(overlay!, "models.yml"), "utf8");
+        assert.ok(out.includes("baseUrl: https://keep.example.com"), "no rewrite → baseUrl untouched");
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+        fs.rmSync(`${home}-bili`, { recursive: true, force: true });
+    }
+});
+
+test("prepareOmpHttpRewrite: preserves other config.yml keys, disables only compaction", () => {
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-")));
+    fs.writeFileSync(path.join(home, "config.yml"), "theme: dark\nmodel: omp/large\nextensions:\n  - /x/omp.js\n");
+    try {
+        const overlay = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", [], []);
+        assert.ok(typeof overlay === "string");
+        const cfg = fs.readFileSync(path.join(overlay!, "config.yml"), "utf8");
+        assert.ok(cfg.includes("theme: dark"), "theme preserved");
+        assert.ok(cfg.includes("model: omp/large"), "model preserved");
+        assert.ok(cfg.includes("extensions:"), "extensions preserved");
+        assert.ok(cfg.includes("compaction:"), "compaction block added");
+        assert.ok(cfg.includes("enabled: false"), "compaction disabled");
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+        fs.rmSync(`${home}-bili`, { recursive: true, force: true });
+    }
+});
+
+test("prepareOmpHttpRewrite: existing compaction block → enabled overridden to false, other compaction keys preserved", () => {
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-")));
+    fs.writeFileSync(path.join(home, "config.yml"), "theme: dark\ncompaction:\n  enabled: true\n  reserveTokens: 8000\n");
+    try {
+        const overlay = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", [], []);
+        assert.ok(typeof overlay === "string");
+        const cfg = fs.readFileSync(path.join(overlay!, "config.yml"), "utf8");
+        assert.ok(cfg.includes("theme: dark"), "theme preserved");
+        assert.ok(cfg.includes("enabled: false"), "enabled overridden to false");
+        assert.ok(!cfg.includes("enabled: true"), "old enabled: true gone");
+        assert.ok(cfg.includes("reserveTokens: 8000"), "other compaction keys preserved");
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+        fs.rmSync(`${home}-bili`, { recursive: true, force: true });
+    }
+});
+
+test("prepareOmpHttpRewrite: legacy settings.json (no config.yml) → config.yml generated from it, compaction disabled", () => {
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-")));
+    fs.writeFileSync(path.join(home, "settings.json"), JSON.stringify({ theme: "dark", compaction: { reserveTokens: 1234 } }));
+    try {
+        const overlay = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", [], []);
+        assert.ok(typeof overlay === "string");
+        const cfg = fs.readFileSync(path.join(overlay!, "config.yml"), "utf8");
+        const parsed = JSON.parse(cfg);
+        assert.equal(parsed.compaction.enabled, false, "compaction disabled");
+        assert.equal(parsed.compaction.reserveTokens, 1234, "other compaction keys preserved");
+        assert.equal(parsed.theme, "dark", "theme preserved");
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+        fs.rmSync(`${home}-bili`, { recursive: true, force: true });
     }
 });
 
@@ -1250,13 +1328,18 @@ test("prepareOmpHttpRewrite: returns undefined when no rewrites", () => {
     assert.equal(prepareOmpHttpRewrite("/whatever", "http://127.0.0.1:8787", [], []), undefined);
 });
 
-test("prepareOmpHttpRewrite: returns undefined when models.yml missing", () => {
-    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-"));
+test("prepareOmpHttpRewrite: models.yml missing → overlay still built (config.yml generated), no models.yml", () => {
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-")));
     try {
         const rw = [{ key: "a", realUpstream: "http://example.com/v1" }];
-        assert.equal(prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []), undefined);
+        const overlay = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
+        assert.equal(overlay, `${home}-bili`);
+        assert.equal(fs.existsSync(path.join(overlay!, "config.yml")), true, "config.yml generated");
+        assert.ok(fs.readFileSync(path.join(overlay!, "config.yml"), "utf8").includes("enabled: false"), "omp native compaction disabled");
+        assert.equal(fs.existsSync(path.join(overlay!, "models.yml")), false, "no models.yml copied");
     } finally {
         fs.rmSync(home, { recursive: true, force: true });
+        fs.rmSync(`${home}-bili`, { recursive: true, force: true });
     }
 });
 

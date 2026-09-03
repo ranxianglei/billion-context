@@ -1202,60 +1202,157 @@ export function unpackDeadProxyUrlsInFile(filePath: string, livePorts: Set<numbe
     return changed;
 }
 
+function mergeOmpCompactionDisabledYaml(text: string): string {
+    const lines = text.split(/\r?\n/);
+    let compactionLine = -1;
+    for (let i = 0; i < lines.length; i++) {
+        const rawLine = lines[i];
+        const trimmed = rawLine.trim();
+        if (!trimmed || trimmed.startsWith("#")) continue;
+        const indent = rawLine.length - rawLine.trimStart().length;
+        if (indent === 0 && /^compaction:\s*(#.*)?$/.test(trimmed)) {
+            compactionLine = i;
+            break;
+        }
+    }
+    if (compactionLine === -1) {
+        const base = text === "" || text.endsWith("\n") ? text : `${text}\n`;
+        return `${base}compaction:\n  enabled: false\n`;
+    }
+    for (let i = compactionLine + 1; i < lines.length; i++) {
+        const rawLine = lines[i];
+        const trimmed = rawLine.trim();
+        if (!trimmed || trimmed.startsWith("#")) continue;
+        const indent = rawLine.length - rawLine.trimStart().length;
+        if (indent === 0) break;
+        if (/^enabled:/.test(trimmed)) {
+            const leading = rawLine.slice(0, rawLine.length - rawLine.trimStart().length);
+            const commentMatch = /\s+#.*$/.exec(rawLine);
+            const comment = commentMatch ? commentMatch[0] : "";
+            lines[i] = `${leading}enabled: false${comment}`;
+            return lines.join("\n");
+        }
+    }
+    let childIndent = 2;
+    for (let i = compactionLine + 1; i < lines.length; i++) {
+        const rawLine = lines[i];
+        const trimmed = rawLine.trim();
+        if (!trimmed || trimmed.startsWith("#")) continue;
+        const indent = rawLine.length - rawLine.trimStart().length;
+        if (indent === 0) break;
+        childIndent = indent;
+        break;
+    }
+    lines.splice(compactionLine + 1, 0, `${" ".repeat(childIndent)}enabled: false`);
+    return lines.join("\n");
+}
+
+function writeOmpCompactionDisabledConfig(ompHome: string, overlay: string): void {
+    // omp reads config.yml at runtime (settings.json is only a one-time migration
+    // source, renamed to .bak). Merge compaction.enabled=false over the real
+    // config.yml / config.yaml / settings.json so the native auto-compaction
+    // never fires alongside bili's ACP compression. JSON is a valid YAML subset,
+    // so the settings.json fallback is written as JSON and parsed by omp fine.
+    let base: string | undefined;
+    let baseIsJson = false;
+    for (const name of ["config.yml", "config.yaml"]) {
+        try {
+            base = fs.readFileSync(path.join(ompHome, name), "utf8");
+            break;
+        } catch {}
+    }
+    if (base === undefined) {
+        try {
+            base = fs.readFileSync(path.join(ompHome, "settings.json"), "utf8");
+            baseIsJson = true;
+        } catch {}
+    }
+    let merged: string;
+    if (base === undefined) {
+        merged = "compaction:\n  enabled: false\n";
+    } else if (baseIsJson) {
+        let settings: Record<string, unknown> = {};
+        try {
+            const parsed: unknown = JSON.parse(base);
+            if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+                settings = parsed as Record<string, unknown>;
+            }
+        } catch {}
+        const compactionRaw = settings.compaction;
+        const compaction =
+            compactionRaw && typeof compactionRaw === "object" && !Array.isArray(compactionRaw)
+                ? { ...(compactionRaw as Record<string, unknown>) }
+                : {};
+        compaction.enabled = false;
+        settings.compaction = compaction;
+        merged = JSON.stringify(settings, null, 2);
+    } else {
+        merged = mergeOmpCompactionDisabledYaml(base);
+    }
+    writeOverlayFileAtomic(overlay, "config.yml", merged);
+}
+
 export function prepareOmpHttpRewrite(
     ompHome: string,
     origin: string,
     httpRewrites: HttpRewrite[],
     httpsRewrites: HttpRewrite[],
 ): string | undefined {
+    if (!fs.existsSync(ompHome)) return undefined;
+    const overlay = `${ompHome}-bili`;
+    // #449: the overlay always carries a config.yml disabling omp's native
+    // auto-compaction (its summarizer must never fire alongside bili's ACP
+    // compression); models.yml is generated only when present, so both stay
+    // out of the real-home symlink set.
+    const generated: string[] = ["config.yml"];
     const modelsPath = path.join(ompHome, "models.yml");
     const unpacked = unpackDeadProxyUrlsInFile(modelsPath, liveProxyPorts());
     if (unpacked > 0) {
         console.error(`bili: unpacked ${unpacked} dead proxy URL(s) from the real ${modelsPath}`);
     }
-    if (httpRewrites.length === 0 && httpsRewrites.length === 0) return undefined;
-    let txt: string;
+    let modelsText: string | undefined;
     try {
-        txt = fs.readFileSync(modelsPath, "utf8");
-    } catch {
-        return undefined;
-    }
-    const httpMap = new Map(httpRewrites.map((r) => [r.key, wrapUpstream(origin, r.realUpstream)]));
-    const httpsMap = new Map(httpsRewrites.map((r) => [r.key, r.realUpstream]));
-    const lines = txt.split(/\r?\n/);
-    let providersIndent = -1;
-    let providerIndent = -1;
-    let currentProvider: string | null = null;
-    for (let i = 0; i < lines.length; i++) {
-        const rawLine = lines[i];
-        const trimmed = rawLine.trim();
-        if (!trimmed || trimmed.startsWith("#")) continue;
-        const indent = rawLine.length - rawLine.trimStart().length;
-        if (providersIndent === -1) {
-            if (/^providers:\s*(#.*)?$/.test(trimmed)) providersIndent = indent;
-            continue;
-        }
-        if (indent <= providersIndent) break;
-        if (providerIndent === -1) providerIndent = indent;
-        if (indent === providerIndent) {
-            const m = /^([A-Za-z0-9_.-]+):/.exec(trimmed);
-            currentProvider = m ? m[1] : null;
-        } else if (indent > providerIndent && currentProvider) {
-            const baseMatch = /^(baseUrl:\s*)(\S+)/.exec(trimmed);
-            if (baseMatch) {
-                const target = httpMap.get(currentProvider) ?? httpsMap.get(currentProvider);
-                if (target) {
-                    const leading = rawLine.slice(0, rawLine.length - rawLine.trimStart().length);
-                    const commentMatch = /\s+#.*$/.exec(rawLine);
-                    const comment = commentMatch ? commentMatch[0] : "";
-                    lines[i] = `${leading}baseUrl: ${target}${comment}`;
+        modelsText = fs.readFileSync(modelsPath, "utf8");
+        generated.push("models.yml");
+    } catch {}
+    if (!refreshOverlayHome(ompHome, overlay, generated)) return undefined;
+    if (modelsText !== undefined) {
+        const httpMap = new Map(httpRewrites.map((r) => [r.key, wrapUpstream(origin, r.realUpstream)]));
+        const httpsMap = new Map(httpsRewrites.map((r) => [r.key, r.realUpstream]));
+        const lines = modelsText.split(/\r?\n/);
+        let providersIndent = -1;
+        let providerIndent = -1;
+        let currentProvider: string | null = null;
+        for (let i = 0; i < lines.length; i++) {
+            const rawLine = lines[i];
+            const trimmed = rawLine.trim();
+            if (!trimmed || trimmed.startsWith("#")) continue;
+            const indent = rawLine.length - rawLine.trimStart().length;
+            if (providersIndent === -1) {
+                if (/^providers:\s*(#.*)?$/.test(trimmed)) providersIndent = indent;
+                continue;
+            }
+            if (indent <= providersIndent) break;
+            if (providerIndent === -1) providerIndent = indent;
+            if (indent === providerIndent) {
+                const m = /^([A-Za-z0-9_.-]+):/.exec(trimmed);
+                currentProvider = m ? m[1] : null;
+            } else if (indent > providerIndent && currentProvider) {
+                const baseMatch = /^(baseUrl:\s*)(\S+)/.exec(trimmed);
+                if (baseMatch) {
+                    const target = httpMap.get(currentProvider) ?? httpsMap.get(currentProvider);
+                    if (target) {
+                        const leading = rawLine.slice(0, rawLine.length - rawLine.trimStart().length);
+                        const commentMatch = /\s+#.*$/.exec(rawLine);
+                        const comment = commentMatch ? commentMatch[0] : "";
+                        lines[i] = `${leading}baseUrl: ${target}${comment}`;
+                    }
                 }
             }
         }
+        writeOverlayFileAtomic(overlay, "models.yml", lines.join("\n"));
     }
-    const overlay = `${ompHome}-bili`;
-    if (!refreshOverlayHome(ompHome, overlay, "models.yml")) return undefined;
-    writeOverlayFileAtomic(overlay, "models.yml", lines.join("\n"));
+    writeOmpCompactionDisabledConfig(ompHome, overlay);
     return overlay;
 }
 
@@ -1916,8 +2013,8 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // ship the bili plugin — when the config carries no loadable entry,
         // ride omp's `-e <file>` (loads for this run only, writes nothing)
         // instead of dropping to wire-mode fallback. A loadable entry (the
-        // overlay symlinks config.yml from the real home) already provides
-        // the plugin; adding `-e` too would double-register tools/commands.
+        // overlay's generated config.yml preserves the real home's entries)
+        // already provides the plugin; adding `-e` too would double-register.
         const ompExt = selfDistFile("agent/omp.js");
         if (ompExt && fs.existsSync(ompExt) && !ompPluginLoadedFrom(resolveOmpHome(process.env))) {
             clientArgs = ["-e", ompExt, ...clientArgs];
