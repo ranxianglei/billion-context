@@ -83,6 +83,28 @@ billion-context/
 5. **acp-kernel MUST be pinned to an exact version** (e.g. `"acp-kernel": "0.0.17"`, NEVER `"^0.0.17"`). Because acp-kernel is a build-time dependency that tsup bundles inline into `dist`, a caret range makes the resolved version drift if `package-lock.json` is regenerated or absent, breaking reproducible builds. When bumping acp-kernel: set the exact version in `package.json`, run `npm install` to refresh the lockfile, then rebuild. The `package-lock.json` is committed and kept in sync.
 6. **Two compression modes with different summary carriers** — `pluginMode` (the `x-bili-plugin` header / registered agent, e.g. `bili pi`) means the ACP-native agent OWNS compression: it executes `compress` locally, the call+result live in its own re-sent history, and the summary carrier on the wire is the **tool call** (the proxy suppresses tool + nudge injection; the agent's view never renders the kernel's `acp_summary`). Proxy mode (plain client, no header) means the proxy executes `compress` server-side: the tool call is ephemeral (never enters the client's history) and preflight blocks have none, so the summary carrier is the **`acp_summary` message**, which the kernel renders as role `system` but `systemToUser` (`src/util.ts`) re-voices as a **`user` message** (leaving it at its anchor) so strict backends (SGLang: exactly one system at index 0, #377) accept it and the head system message stays byte-stable for the prefix cache. The mode is decided per request and bound per session (`session.metadata.pluginAgent`, sticky, upgrade-only). See README "Two compression modes".
 
+### Kernel Contract: Message Ids Are Never Reused
+
+The kernel (`acp-kernel`) guarantees, and billion-context RELIES on: within a
+session, a raw content-hash id and a ref number (`mNNNNN`) denote exactly one
+message forever — **never reused, never duplicated**, even after the message
+dies (edited/truncated/folded). The model can cite any number it has ever
+seen (summaries cite tags across turns), so a re-issued number silently
+misattributes on decompress. Consequences for this repo:
+
+- Host code must NOT prune/repack `session.state.messageRefs` in ways that
+  let a freed number be re-issued (kernel `assignRefsNode` computes its
+  cursor as `highestUsedIndex(map)+1`, so shrinking the map can drop the
+  cursor and re-issue numbers).
+- Known residual: `applyCompactionArchive` (#421, `src/session.ts`) prunes
+  `byRaw/byRef` to live raw ids on native-compaction boundaries. In practice
+  the highest-numbered (newest) messages stay resident so the cursor does not
+  drop, but this is a theoretical re-issue window — drop the map-prune once
+  the kernel's ref-space widening (post-#191 direction) makes it unnecessary.
+- Do not bump `acp-kernel` to ≥0.0.48/0.0.49 (contain ref-slot reclamation,
+  reverted in kernel #191); resume bumping at the release that lands the
+  revert.
+
 ## 3. Development Standards
 
 ### Build Commands
