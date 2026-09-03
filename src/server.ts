@@ -48,6 +48,7 @@ import { applyRanges } from "./stream.js";
 import { preflightCompress, estimateCoreMessages } from "./preflight.js";
 import { renderUI, handleConfigGet, handleConfigPut } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
+import { gcMessageRefs } from "./ref-gc.js";
 import { getStore } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger } from "./logger.js";
 import { defaultLogFile, stateDir } from "./paths.js";
@@ -1472,6 +1473,7 @@ function prepareAnthropic(
         processedMessages = stripKernelSummaries(turn.messages, turn.state);
         applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
         reapOrphanBlocks(session, msgs, deactivateBlock);
+        gcMessageRefs(session, msgs, turn.messages, log);
         rebuiltMessages = coreToAnthropic(processedMessages as BiliMessage[], cacheControls);
 
         systemOut = injectSystem(parsed, opts, prompts);
@@ -1639,6 +1641,7 @@ function prepareOpenai(
         processedMessages = stripKernelSummaries(turn.messages, turn.state);
         applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
         reapOrphanBlocks(session, msgs, deactivateBlock);
+        gcMessageRefs(session, msgs, turn.messages, log);
         rebuiltMessages = systemToUser(coreToOpenai(processedMessages as BiliMessage[]));
 
         // ONLY the static compress prompt goes into the system message — the
@@ -1801,6 +1804,7 @@ function prepareResponses(
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
         processedMessages = stripKernelSummaries(turn.messages, turn.state);
         reapOrphanBlocks(session, msgs, deactivateBlock);
+        gcMessageRefs(session, msgs, turn.messages, log);
         rebuiltInput = patchResponsesInput(projection, processedMessages);
         // Fallback path: when the echo did NOT come back this turn (client
         // dropped it / restarted), the history-borne handoff is absent and the
