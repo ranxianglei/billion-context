@@ -130,7 +130,7 @@ test("plugin chat passthrough drops a chunk whose delta stripped to empty", asyn
     }
 });
 
-test("plugin chat passthrough keeps sibling text when one field is a pure tag echo (#462)", async () => {
+test("plugin chat passthrough keeps sibling text when one field is a pure tag echo (#463)", async () => {
     const out: string[] = [];
     const res = makeRes(out);
     const session = makeSession();
@@ -144,7 +144,7 @@ test("plugin chat passthrough keeps sibling text when one field is a pure tag ec
     assert.ok(text.includes("real answer"), "sibling field with real content must survive");
 });
 
-test("plugin chat passthrough still drops a chunk where every managed field is a pure tag echo (#462)", async () => {
+test("plugin chat passthrough still drops a chunk where every managed field is a pure tag echo (#463)", async () => {
     const out: string[] = [];
     const res = makeRes(out);
     const session = makeSession();

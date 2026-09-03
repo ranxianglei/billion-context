@@ -7,6 +7,7 @@ import { runCompressLoop, createOpenaiAdapter, createAnthropicAdapter, createRes
 import { stripAcpTags, createTagEchoFilter, containsRenderTagText, containsToolCallXmlFragment, mayStartRenderTag } from "../src/loop/tag-echo-filter.ts";
 import { rewriteJsonResponse } from "../src/stream.ts";
 import { rewriteOpenaiJsonResponse } from "../src/stream-openai.ts";
+import { rewriteResponsesJsonResponse } from "../src/stream-responses.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
 
 const TAG = (ref: string, tokens = 177) => `\x3cacp tokens="${tokens}" type="text">${ref}\x3c/acp>`;
@@ -293,6 +294,45 @@ test("non-stream openai rewriteOpenaiJsonResponse strips echoed tags", () => {
     const rewritten = rewriteOpenaiJsonResponse(structuredClone(body), { core: createCore(), config: { modelContextLimit: 200000 } as Config, messages: [], session: makeCtx("ns-openai").session, log: () => {} });
     const parsed = rewritten as { choices: Array<{ message: { content: string } }> };
     assert.equal(parsed.choices[0].message.content, "answer  done");
+});
+
+test("non-stream responses rewriteResponsesJsonResponse strips echoed tags with no compress call (#460)", () => {
+    const body = {
+        id: "resp_1",
+        output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: `answer ${TAG("m00155")} done` }] }],
+        status: "incomplete",
+    };
+    const rewritten = rewriteResponsesJsonResponse(structuredClone(body), { core: createCore(), config: { modelContextLimit: 200000 } as Config, messages: [], session: makeCtx("ns-responses").session, log: () => {} });
+    const parsed = rewritten as { output: Array<{ content: Array<{ text: string }> }> };
+    assert.equal(parsed.output[0].content[0].text, "answer  done");
+    assert.equal(JSON.stringify(rewritten).includes(OPEN), false, "a render tag survived the responses JSON rewrite");
+});
+
+test("non-stream responses rewriteResponsesJsonResponse strips sibling prose but never the compress note (#460)", () => {
+    const args = "{\"content\":[]}";
+    const clean = {
+        id: "resp_c",
+        output: [
+        { type: "message", role: "assistant", content: [{ type: "output_text", text: "plain prose" }] },
+        { type: "function_call", name: "compress", call_id: "c1", arguments: args },
+    ],
+    };
+    const echoed = structuredClone(clean) as { output: Array<{ content: Array<{ text: string }> }> };
+    echoed.output[0].content[0].text = `plain prose${TAG("m00155")}`;
+    const cleanOut = rewriteResponsesJsonResponse(structuredClone(clean), { core: createCore(), config: { modelContextLimit: 200000 } as Config, messages: [], session: makeCtx("ns-note-clean").session, log: () => {} });
+    const echoOut = rewriteResponsesJsonResponse(echoed, { core: createCore(), config: { modelContextLimit: 200000 } as Config, messages: [], session: makeCtx("ns-note-echo").session, log: () => {} });
+    const note = (r: unknown) => {
+        const o = (r as { output?: Array<{ content?: Array<{ text: string }> }> }).output ?? [];
+        return o[0]?.content?.[0]?.text ?? "";
+    };
+    const prose = (r: unknown) => {
+        const o = (r as { output?: Array<{ content?: Array<{ text: string }> }> }).output ?? [];
+        return o[1]?.content?.[0]?.text ?? "";
+    };
+    assert.equal(note(cleanOut), note(echoOut), "the synthesized compress record must not be edited by the strip");
+    assert.equal(prose(cleanOut), prose(echoOut), "echoed sibling prose must be stripped to the same text as clean prose");
+    assert.ok(note(echoOut).length > 0, "no note was injected at all");
+    assert.equal(JSON.stringify(echoOut).includes(OPEN), false, "no render tag reached the client body");
 });
 
 test("non-stream rewriters leave tag-free text untouched", async () => {
