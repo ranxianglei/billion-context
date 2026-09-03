@@ -817,7 +817,10 @@ function mergeSqliteSet(overlay: string, realHome: string, base: string): boolea
     }
 }
 
-function refreshOverlayHome(realHome: string, overlay: string, generatedFile: string): boolean {
+function refreshOverlayHome(realHome: string, overlay: string, generatedFile: string | string[]): boolean {
+    const generatedFiles = new Set(Array.isArray(generatedFile) ? generatedFile : [generatedFile]);
+    const isGeneratedDraft = (name: string): boolean =>
+        [...generatedFiles].some((g) => name.startsWith(`.${g}.`) && name.endsWith(".tmp"));
     try {
         fs.mkdirSync(overlay, { recursive: true });
     } catch {
@@ -849,7 +852,7 @@ function refreshOverlayHome(realHome: string, overlay: string, generatedFile: st
         // re-points the db; any other set moves wholesale.
         const dbSets: { base: string; keepSidecars: boolean }[] = [];
         for (const entry of overlayEntries) {
-            if (!entry.endsWith(".db") || entry === generatedFile) continue;
+            if (!entry.endsWith(".db") || generatedFiles.has(entry)) continue;
             const members = sqliteSetMembers(entry);
             if (!members.some((m) => m !== entry && overlayEntries.includes(m))) continue;
             let mainSt: fs.Stats | undefined;
@@ -867,9 +870,9 @@ function refreshOverlayHome(realHome: string, overlay: string, generatedFile: st
             }
         }
         for (const entry of overlayEntries) {
-            if (entry === generatedFile) continue;
+            if (generatedFiles.has(entry)) continue;
             const overlayPath = path.join(overlay, entry);
-            if (entry.startsWith(`.${generatedFile}.`) && entry.endsWith(".tmp")) {
+            if (isGeneratedDraft(entry)) {
                 try {
                     fs.unlinkSync(overlayPath);
                 } catch {}
@@ -899,7 +902,7 @@ function refreshOverlayHome(realHome: string, overlay: string, generatedFile: st
                     try {
                         fs.unlinkSync(overlayPath);
                     } catch {}
-                } else if (mergeOverlayEntry(overlayPath, realPath, generatedFile)) {
+                } else if (mergeOverlayEntry(overlayPath, realPath, generatedFiles)) {
                     try {
                         fs.rmSync(overlayPath, { recursive: true, force: true });
                     } catch {}
@@ -921,7 +924,7 @@ function refreshOverlayHome(realHome: string, overlay: string, generatedFile: st
         let total = 0;
         const linkFailures: string[] = [];
         for (const entry of realEntries) {
-            if (entry === generatedFile) continue;
+            if (generatedFiles.has(entry)) continue;
             total += 1;
             const overlayPath = path.join(overlay, entry);
             let present = false;
@@ -960,7 +963,7 @@ function refreshOverlayHome(realHome: string, overlay: string, generatedFile: st
     return true;
 }
 
-function mergeOverlayEntry(src: string, dst: string, excludedName?: string): boolean {
+function mergeOverlayEntry(src: string, dst: string, excludedNames?: ReadonlySet<string>): boolean {
     let st: fs.Stats;
     try {
         st = fs.lstatSync(src);
@@ -996,8 +999,8 @@ function mergeOverlayEntry(src: string, dst: string, excludedName?: string): boo
             // #410: generated configs must never merge back into the real
             // home, at ANY depth — a nested promote bakes proxy URLs into
             // the user's real config.
-            if (excludedName !== undefined && entry === excludedName) continue;
-            if (!mergeOverlayEntry(path.join(src, entry), path.join(dst, entry), excludedName)) ok = false;
+            if (excludedNames?.has(entry)) continue;
+            if (!mergeOverlayEntry(path.join(src, entry), path.join(dst, entry), excludedNames)) ok = false;
         }
         return ok;
     }
@@ -1073,50 +1076,69 @@ function writeOverlayFileAtomic(overlay: string, fileName: string, contents: str
     }
 }
 
+function writePiCompactionDisabledSettings(piHome: string, overlay: string): void {
+    let settings: Record<string, unknown> = {};
+    try {
+        const parsed: unknown = JSON.parse(fs.readFileSync(path.join(piHome, "settings.json"), "utf8"));
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            settings = parsed as Record<string, unknown>;
+        }
+    } catch {}
+    const compactionRaw = settings.compaction;
+    const compaction =
+        compactionRaw && typeof compactionRaw === "object" && !Array.isArray(compactionRaw)
+            ? { ...(compactionRaw as Record<string, unknown>) }
+            : {};
+    compaction.enabled = false;
+    settings.compaction = compaction;
+    writeOverlayFileAtomic(overlay, "settings.json", JSON.stringify(settings, null, 2));
+}
+
 export function preparePiHttpRewrite(
     piHome: string,
     origin: string,
     httpRewrites: HttpRewrite[],
     httpsRewrites: HttpRewrite[],
 ): string | undefined {
-    if (httpRewrites.length === 0 && httpsRewrites.length === 0) return undefined;
-    const modelsPath = path.join(piHome, "models.json");
-    let txt: string;
-    try {
-        txt = fs.readFileSync(modelsPath, "utf8");
-    } catch {
-        return undefined;
-    }
-    let parsed: unknown;
-    try {
-        parsed = JSON.parse(txt);
-    } catch {
-        return undefined;
-    }
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
-    const root = parsed as Record<string, unknown>;
-    const providersVal = root.providers;
-    if (providersVal && typeof providersVal === "object" && !Array.isArray(providersVal)) {
-        const providers = providersVal as Record<string, unknown>;
-        for (const r of httpRewrites) {
-            const prov = providers[r.key];
-            if (prov && typeof prov === "object" && !Array.isArray(prov)) {
-                const p = prov as { baseUrl?: unknown };
-                const existing = typeof p.baseUrl === "string" ? p.baseUrl : r.realUpstream;
-                p.baseUrl = wrapUpstream(origin, unwrapUpstream(existing));
-            }
-        }
-        for (const r of httpsRewrites) {
-            const prov = providers[r.key];
-            if (prov && typeof prov === "object" && !Array.isArray(prov)) {
-                const p = prov as { baseUrl?: unknown };
-                p.baseUrl = r.realUpstream;
-            }
-        }
-    }
+    if (!fs.existsSync(piHome)) return undefined;
     const overlay = `${piHome}-bili`;
-    if (!refreshOverlayHome(piHome, overlay, "models.json")) return undefined;
-    writeOverlayFileAtomic(overlay, "models.json", JSON.stringify(root));
+    // #447: the overlay always carries a settings.json disabling pi's native
+    // auto-compaction (its summarizer must never fire alongside bili's ACP
+    // compression); models.json is generated only when present, so both stay
+    // out of the real-home symlink set.
+    const generated: string[] = ["settings.json"];
+    let modelsRoot: Record<string, unknown> | undefined;
+    try {
+        const parsed: unknown = JSON.parse(fs.readFileSync(path.join(piHome, "models.json"), "utf8"));
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            modelsRoot = parsed as Record<string, unknown>;
+            generated.push("models.json");
+        }
+    } catch {}
+    if (!refreshOverlayHome(piHome, overlay, generated)) return undefined;
+    if (modelsRoot) {
+        const providersVal = modelsRoot.providers;
+        if (providersVal && typeof providersVal === "object" && !Array.isArray(providersVal)) {
+            const providers = providersVal as Record<string, unknown>;
+            for (const r of httpRewrites) {
+                const prov = providers[r.key];
+                if (prov && typeof prov === "object" && !Array.isArray(prov)) {
+                    const p = prov as { baseUrl?: unknown };
+                    const existing = typeof p.baseUrl === "string" ? p.baseUrl : r.realUpstream;
+                    p.baseUrl = wrapUpstream(origin, unwrapUpstream(existing));
+                }
+            }
+            for (const r of httpsRewrites) {
+                const prov = providers[r.key];
+                if (prov && typeof prov === "object" && !Array.isArray(prov)) {
+                    const p = prov as { baseUrl?: unknown };
+                    p.baseUrl = r.realUpstream;
+                }
+            }
+        }
+        writeOverlayFileAtomic(overlay, "models.json", JSON.stringify(modelsRoot));
+    }
+    writePiCompactionDisabledSettings(piHome, overlay);
     return overlay;
 }
 
@@ -1877,7 +1899,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // Native tooling out of the box: when the user has NOT installed the
         // plugin, ride pi's `-e <file>` (loads for this run only, writes
         // nothing) instead of leaving them on wire-mode fallback. When they
-        // HAVE installed it, settings.json (symlinked into the overlay home)
+        // HAVE installed it, settings.json (merged into the overlay home)
         // already loads it — adding `-e` too would double-register.
         const piExt = selfDistFile("agent/pi.js");
         if (piExt && fs.existsSync(piExt) && !piPluginInstalled(resolvePiHome(process.env))) {

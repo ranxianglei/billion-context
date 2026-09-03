@@ -939,36 +939,51 @@ test("preparePiHttpRewrite: rewrites matching provider, leaves others, symlinks 
         assert.equal(out.providers.b.baseUrl, "https://secure.example.com");
         assert.equal(fs.lstatSync(path.join(tmp!, "auth.json")).isSymbolicLink(), true);
         assert.equal(fs.realpathSync(path.join(tmp!, "auth.json")), path.join(home, "auth.json"));
+        const settings = JSON.parse(fs.readFileSync(path.join(tmp!, "settings.json"), "utf8"));
+        assert.equal(settings.compaction.enabled, false, "pi native compaction disabled");
     } finally {
         if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
         fs.rmSync(home, { recursive: true, force: true });
     }
 });
 
-test("preparePiHttpRewrite: returns undefined when no rewrites", () => {
-    assert.equal(preparePiHttpRewrite("/whatever", "http://127.0.0.1:8787", [], []), undefined);
+test("preparePiHttpRewrite: non-existent home → undefined", () => {
+    assert.equal(preparePiHttpRewrite("/nonexistent-bili-pi-home-xyz", "http://127.0.0.1:8787", [], []), undefined);
 });
 
-test("preparePiHttpRewrite: returns undefined when models.json missing or unparseable", () => {
-    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-pihome-"));
-    const rw: HttpRewrite[] = [{ key: "a", realUpstream: "http://x/v1" }];
+test("preparePiHttpRewrite: no rewrites → overlay built, pi native compaction disabled, models.json copied verbatim", () => {
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-pihome-")));
+    fs.writeFileSync(path.join(home, "models.json"), JSON.stringify({ providers: { a: { baseUrl: "https://keep.example.com" } } }));
     try {
-        assert.equal(preparePiHttpRewrite(home, "http://127.0.0.1:8787", rw, []), undefined);
-        fs.writeFileSync(path.join(home, "models.json"), "not-json{");
-        assert.equal(preparePiHttpRewrite(home, "http://127.0.0.1:8787", rw, []), undefined);
+        const overlay = preparePiHttpRewrite(home, "http://127.0.0.1:8787", [], []);
+        assert.ok(typeof overlay === "string" && overlay.length > 0);
+        const settings = JSON.parse(fs.readFileSync(path.join(overlay!, "settings.json"), "utf8"));
+        assert.equal(settings.compaction.enabled, false, "pi native compaction disabled");
+        const out = JSON.parse(fs.readFileSync(path.join(overlay!, "models.json"), "utf8"));
+        assert.equal(out.providers.a.baseUrl, "https://keep.example.com", "no rewrite → baseUrl untouched");
     } finally {
         fs.rmSync(home, { recursive: true, force: true });
+        fs.rmSync(`${home}-bili`, { recursive: true, force: true });
     }
 });
 
-test("preparePiHttpRewrite: returns undefined when models.json is not an object", () => {
-    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-pihome-"));
-    const rw: HttpRewrite[] = [{ key: "a", realUpstream: "http://x/v1" }];
+test("preparePiHttpRewrite: preserves other settings.json keys, disables only compaction", () => {
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-pihome-")));
+    fs.writeFileSync(
+        path.join(home, "settings.json"),
+        JSON.stringify({ packages: ["/opt/pi-plugin"], theme: "dark", compaction: { reserveTokens: 9999 } }),
+    );
     try {
-        fs.writeFileSync(path.join(home, "models.json"), JSON.stringify([1, 2, 3]));
-        assert.equal(preparePiHttpRewrite(home, "http://127.0.0.1:8787", rw, []), undefined);
+        const overlay = preparePiHttpRewrite(home, "http://127.0.0.1:8787", [], []);
+        assert.ok(typeof overlay === "string");
+        const settings = JSON.parse(fs.readFileSync(path.join(overlay!, "settings.json"), "utf8"));
+        assert.equal(settings.compaction.enabled, false, "compaction disabled");
+        assert.equal(settings.compaction.reserveTokens, 9999, "other compaction keys preserved");
+        assert.deepEqual(settings.packages, ["/opt/pi-plugin"], "packages preserved");
+        assert.equal(settings.theme, "dark", "theme preserved");
     } finally {
         fs.rmSync(home, { recursive: true, force: true });
+        fs.rmSync(`${home}-bili`, { recursive: true, force: true });
     }
 });
 
