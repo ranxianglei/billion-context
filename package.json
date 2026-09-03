@@ -1,6 +1,6 @@
 {
   "name": "billion-context",
-  "version": "0.1.75",
+  "version": "0.1.77",
   "description": "Universal context-compression proxy for AI coding agents. Sits between any agent and its model API, rewriting Anthropic/OpenAI streams with acp-kernel compression. Any agent that can set a base URL (Claude Code, Codex, Cursor, Aider) works out of the box.",
   "type": "module",
   "main": "dist/index.js",
@@ -44,7 +44,7 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@types/node-forge": "^1.3.14",
-    "acp-kernel": "0.0.47",
+    "acp-kernel": "0.0.50",
     "fzstd": "0.1.1",
     "node-forge": "^1.4.0",
     "tar": "^7.5.22",
