@@ -2651,20 +2651,36 @@ async function forward(
     // Plugin mode: the agent's native loop owns the tool surface — pass the
     // response through VERBATIM (a model-emitted compress call must reach the
     // plugin untouched) while sniffing usage so lastInputTokens (the input to
-    // the next nudge decision) keeps tracking reality.
+    // the next nudge decision) keeps tracking reality. The one exception: the
+    // opt-in #371 fake-completion backstop buffers + retries first, same as
+    // proxy mode (#473).
     if (prepared?.pluginMode) {
         // #411: clear the idle timer on the abort path too — the pipes rethrow
         // when the client is still connected, and a client cancel throws from
         // inside them; without a finally each abort leaked a 10-minute timer.
         try {
+            let pluginBody = upstream.body as ReadableStream<Uint8Array>;
+            if (prepared.stream && maxFakeCompletionRetries() > 0) {
+                const resolvedBuf = await resolveFakeCompletion(pluginBody, {
+                    protocol: prepared.protocol,
+                    body,
+                    upstreamUrl,
+                    reqHeaders: buildForwardHeaders(headers),
+                    proxyUrl,
+                    signal: clientAbort.signal,
+                    session: prepared.session,
+                    log,
+                });
+                pluginBody = bufferToStream(resolvedBuf);
+            }
             if (prepared.stream) {
                 if (prepared.protocol === "responses") {
-                    await pipePluginResponsesWithStrip(upstream.body as ReadableStream<Uint8Array>, res, prepared.session, (msg) => log("info", `[${prepared.session.id}] ${msg}`));
+                    await pipePluginResponsesWithStrip(pluginBody, res, prepared.session, (msg) => log("info", `[${prepared.session.id}] ${msg}`));
                 } else {
-                    await pipePluginChatWithStrip(upstream.body as ReadableStream<Uint8Array>, res, prepared.protocol, prepared.session, (msg) => log("info", `[${prepared.session.id}] ${msg}`));
+                    await pipePluginChatWithStrip(pluginBody, res, prepared.protocol, prepared.session, (msg) => log("info", `[${prepared.session.id}] ${msg}`));
                 }
             } else {
-                await pipePluginJson(upstream.body as ReadableStream<Uint8Array>, res, prepared.session, prepared.protocol);
+                await pipePluginJson(pluginBody, res, prepared.session, prepared.protocol);
             }
         } finally {
             clearUpstreamTimer();
