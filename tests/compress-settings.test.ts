@@ -20,7 +20,7 @@ test("mergeCompress: model beats provider beats global, per field", () => {
     assert.equal(merged.nudgeGrowthTokens, 90000);
     assert.equal(merged.emergencyThresholdPercent, 0.9);
     assert.equal(merged.preserveRecentMessages, 10);
-    assert.equal(merged.minCompressRange, 4000);
+    assert.equal(merged.minCompressRangeChars, 4000);
 });
 
 test("mergeCompress: undefined at deeper level does not clear shallower value", () => {

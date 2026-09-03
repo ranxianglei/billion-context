@@ -112,6 +112,13 @@ export type Session = {
      *  drop a never-persisted session on flush failure (that would be a
      *  permanent loss). */
     persisted: boolean;
+    /** In-memory only (NOT persisted — buildRecord omits it): true while the
+     *  session was restored from disk and has seen no request in THIS process
+     *  (#404). Restored sessions carry their on-disk savedAt as lastSeen (not
+     *  Date.now()), so consumers can tell boot-restore staleness from real
+     *  activity; fallback=latest skips restored sessions rather than guessing
+     *  among a readdir-order tie. Cleared on the first real request touch. */
+    restored?: boolean;
     /** In-memory only (NOT persisted — buildRecord omits it): the most recent
      *  successful compress, set by applyRanges and read by the replay/preflight
      *  retry callbacks to correlate a transient upstream rejection with the
@@ -132,8 +139,11 @@ let MAX_SESSIONS = Math.max(1, Number.parseInt(process.env.BILI_MAX_SESSIONS ?? 
 let initialized = false;
 
 /** Bulk-load persisted sessions from disk into the in-memory map. Called once
- *  at server startup before listening. Caps at MAX_SESSIONS by createdAt
- *  (keeps the most recent) so a huge backlog cannot OOM on boot. Idempotent. */
+ *  at server startup before listening. Caps at MAX_SESSIONS by the most
+ *  recently active of createdAt/lastSeen-from-disk (keeps the freshest; a
+ *  session that is old but was active until recently must not lose its slot
+ *  to a newer-created-but-idle one, #404) so a huge backlog cannot OOM on
+ *  boot. Idempotent. */
 export async function initSessions(): Promise<void> {
     if (initialized) return;
     initialized = true;
@@ -142,7 +152,8 @@ export async function initSessions(): Promise<void> {
     await store.migrateLegacyIds();
     const loaded = await store.loadAll();
     if (loaded.size > MAX_SESSIONS) {
-        const entries = [...loaded.entries()].sort((a, b) => (b[1].createdAt ?? 0) - (a[1].createdAt ?? 0));
+        const freshness = (s: Session) => Math.max(s.createdAt ?? 0, s.lastSeen ?? 0);
+        const entries = [...loaded.entries()].sort((a, b) => freshness(b[1]) - freshness(a[1]));
         for (const [id, s] of entries) {
             if (sessions.size >= MAX_SESSIONS) break;
             sessions.set(id, s);
@@ -156,6 +167,7 @@ export function getSession(id: string, meta?: { protocol?: Session["meta"]["prot
     const existing = sessions.get(id);
     if (existing) {
         existing.lastSeen = Date.now();
+        existing.restored = false;
         // Fill in protocol/upstream/label meta on an existing session if the caller
         // now knows it (e.g. a session was created by loadAll without meta).
         if (meta?.protocol && !existing.meta.protocol) existing.meta.protocol = meta.protocol;
@@ -167,7 +179,10 @@ export function getSession(id: string, meta?: { protocol?: Session["meta"]["prot
     const store = getStore();
     const reloaded = store.loadSync(id, meta);
     if (reloaded) {
+        // A memory-miss reload is triggered by a real request: stamp fresh
+        // activity, not the restored-from-disk state (#404).
         reloaded.lastSeen = Date.now();
+        reloaded.restored = false;
         reloaded.persisted = true;
         sessions.set(id, reloaded);
         return reloaded;

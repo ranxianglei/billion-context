@@ -11,6 +11,15 @@
 export const MAX_REQUEST_BYTES = 100 * 1024 * 1024;
 export const UPSTREAM_TIMEOUT_MS = 10 * 60 * 1000;
 
+const liveUpstreamTimers = new Set<ReturnType<typeof setTimeout>>();
+/** Test hook: how many fetchWithTimeout idle-timers are currently armed.
+ *  #411: an aborted passthrough used to leak its 10-minute timer because
+ *  clearTimer was only called on the success path — tests assert this stays
+ *  at zero after a client abort. */
+export function _liveUpstreamTimersForTest(): number {
+    return liveUpstreamTimers.size;
+}
+
 /** undici's fetch accepts a `dispatcher` option (its own Dispatcher type) that
  *  @types/node's RequestInit already declares — but typed as the internal
  *  `Dispatcher` interface, which conflicts with the `undici` package's
@@ -43,10 +52,19 @@ export async function fetchWithTimeout(
     externalSignal?: AbortSignal,
 ): Promise<{ response: Response; clearTimer: () => void }> {
     const controller = new AbortController();
-    let timer = setTimeout(() => controller.abort(), timeoutMs);
+    const armTimer = () => {
+        const t = setTimeout(() => {
+            liveUpstreamTimers.delete(t);
+            controller.abort();
+        }, timeoutMs);
+        liveUpstreamTimers.add(t);
+        return t;
+    };
+    let timer = armTimer();
     const rearm = () => {
         clearTimeout(timer);
-        timer = setTimeout(() => controller.abort(), timeoutMs);
+        liveUpstreamTimers.delete(timer);
+        timer = armTimer();
     };
     let onExternalAbort: (() => void) | null = null;
     if (externalSignal) {
@@ -58,6 +76,7 @@ export async function fetchWithTimeout(
     }
     const cleanup = () => {
         clearTimeout(timer);
+        liveUpstreamTimers.delete(timer);
         if (onExternalAbort && externalSignal) externalSignal.removeEventListener("abort", onExternalAbort);
     };
     try {

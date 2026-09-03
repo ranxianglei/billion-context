@@ -320,7 +320,14 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             await handle(req, res, opts, core, config, log, instanceId, instanceStartedAt);
         } catch (err) {
             const msg = String(err);
-            log("error", msg);
+            const e = err as { name?: string; message?: string };
+            // #411: a client cancel aborts the upstream fetch via
+            // res.on("close") — normal agent behavior, not a proxy failure.
+            // With the client already gone it is logged as info instead of
+            // feeding the context-free [error] AbortError storm.
+            const clientAbort = (e?.name === "AbortError" || /abort/i.test(String(e?.message ?? ""))) && (res.destroyed || res.writableEnded);
+            if (clientAbort) log("info", `client aborted mid-stream: ${msg}`);
+            else log("error", msg);
             if (!res.headersSent) {
                 const status = msg.includes("exceeds") ? 413 : 502;
                 res.writeHead(status, { "content-type": "application/json" });
@@ -2674,37 +2681,64 @@ async function forward(
     // Plugin mode: the agent's native loop owns the tool surface — pass the
     // response through VERBATIM (a model-emitted compress call must reach the
     // plugin untouched) while sniffing usage so lastInputTokens (the input to
-    // the next nudge decision) keeps tracking reality.
+    // the next nudge decision) keeps tracking reality. The one exception: the
+    // opt-in #371 fake-completion backstop buffers + retries first, same as
+    // proxy mode (#473).
     if (prepared?.pluginMode) {
-        if (prepared.stream) {
-            if (prepared.protocol === "responses") {
-                await pipePluginResponsesWithStrip(upstream.body as ReadableStream<Uint8Array>, res, prepared.session, (msg) => log("info", `[${prepared.session.id}] ${msg}`));
-            } else {
-                await pipePluginChatWithStrip(upstream.body as ReadableStream<Uint8Array>, res, prepared.protocol, prepared.session, (msg) => log("info", `[${prepared.session.id}] ${msg}`));
+        // #411: clear the idle timer on the abort path too — the pipes rethrow
+        // when the client is still connected, and a client cancel throws from
+        // inside them; without a finally each abort leaked a 10-minute timer.
+        try {
+            let pluginBody = upstream.body as ReadableStream<Uint8Array>;
+            if (prepared.stream && maxFakeCompletionRetries() > 0) {
+                const resolvedBuf = await resolveFakeCompletion(pluginBody, {
+                    protocol: prepared.protocol,
+                    body,
+                    upstreamUrl,
+                    reqHeaders: buildForwardHeaders(headers),
+                    proxyUrl,
+                    signal: clientAbort.signal,
+                    session: prepared.session,
+                    log,
+                });
+                pluginBody = bufferToStream(resolvedBuf);
             }
-        } else {
-            await pipePluginJson(upstream.body as ReadableStream<Uint8Array>, res, prepared.session, prepared.protocol);
+            if (prepared.stream) {
+                if (prepared.protocol === "responses") {
+                    await pipePluginResponsesWithStrip(pluginBody, res, prepared.session, (msg) => log("info", `[${prepared.session.id}] ${msg}`));
+                } else {
+                    await pipePluginChatWithStrip(pluginBody, res, prepared.protocol, prepared.session, (msg) => log("info", `[${prepared.session.id}] ${msg}`));
+                }
+            } else {
+                await pipePluginJson(pluginBody, res, prepared.session, prepared.protocol);
+            }
+        } finally {
+            clearUpstreamTimer();
         }
-        clearUpstreamTimer();
         return;
     }
     // #371: detect + retry a fake completion for every non-plugin streaming
     // response (any turn, not just compress-injected). Buffering is required:
     // the retry re-requests before the client sees the fake completion.
     let responseBody: ReadableStream<Uint8Array> = upstream.body;
-    if (prepared !== null && prepared.stream && maxFakeCompletionRetries() > 0) {
-        const resolvedBuf = await resolveFakeCompletion(upstream.body, {
-            protocol: prepared.protocol,
-            body,
-            upstreamUrl,
-            reqHeaders: buildForwardHeaders(headers),
-            proxyUrl,
-            signal: clientAbort.signal,
-            session: prepared.session,
-            log,
-        });
-        responseBody = bufferToStream(resolvedBuf);
-    }
+    // #411: every body-consuming path below must clear the upstream idle timer
+    // even when it throws (client abort / upstream cut) — previously an abort
+    // skipped the trailing clearUpstreamTimer and leaked a live 10-minute
+    // timer plus its socket for the full window.
+    try {
+        if (prepared !== null && prepared.stream && maxFakeCompletionRetries() > 0) {
+            const resolvedBuf = await resolveFakeCompletion(upstream.body, {
+                protocol: prepared.protocol,
+                body,
+                upstreamUrl,
+                reqHeaders: buildForwardHeaders(headers),
+                proxyUrl,
+                signal: clientAbort.signal,
+                session: prepared.session,
+                log,
+            });
+            responseBody = bufferToStream(resolvedBuf);
+        }
     // We only rewrite when THIS request actually had the compress tool
     // injected (per-request). Non-injected requests (OpenAI title-gen
     // exclusion, ACP_NO_INJECT_TOOL, auto-mode classifier bypass) must NOT
@@ -2730,7 +2764,6 @@ async function forward(
             } else {
                 await pipeThrough(toClient, res);
             }
-            clearUpstreamTimer();
             const terminal = await observed;
             if (terminal === "completed") {
                 markNativeCompactionBoundary(prepared.session);
@@ -2755,7 +2788,6 @@ async function forward(
             } else {
                 await pipePluginChatWithStrip(responseBody, res, p.protocol, undefined, tagLog);
             }
-            clearUpstreamTimer();
         } else if (
             prepared &&
             (upstream.headers.get("content-type") ?? "").includes("application/json")
@@ -2766,10 +2798,8 @@ async function forward(
             // back untouched. Same pipe as plugin mode; no session, so usage
             // accounting stays off for the same reason as above.
             await pipePluginJson(responseBody, res, undefined, prepared.protocol);
-            clearUpstreamTimer();
         } else {
             await pipeThrough(responseBody, res);
-            clearUpstreamTimer();
         }
         return;
     }
@@ -2851,6 +2881,10 @@ async function forward(
         } finally {
             clearUpstreamTimer();
             if (dumpRaw) await dumpRaw;
+            // #411: persist the final snapshot on every exit (see the
+            // non-streaming twin below) — state may have mutated during
+            // streaming (compress created a block, decompress deactivated one).
+            markDirty(prepared.session);
         }
     } else {
         // Wrap the whole non-streaming branch in try/finally so the upstream
@@ -2915,11 +2949,20 @@ async function forward(
             }
         } finally {
             clearUpstreamTimer();
+            // #411: persist even when arrayBuffer() throws (client cancel /
+            // connection reset) — the comment above promised this, but
+            // markDirty sat outside the try and was skipped on the throw path.
+            markDirty(prepared.session);
         }
     }
-    // State may have mutated during response streaming (compress created a
-    // block, decompress deactivated one) — persist the final snapshot.
-    markDirty(prepared.session);
+    } finally {
+        // #411 safety net: clears on every exit — the early returns above, the
+        // rewriter throws, and the fall-through completion. The rewriter paths
+        // clear earlier in their own finallys (double-clear is idempotent);
+        // this one must sit at the very end so clearing never happens while a
+        // live stream still needs the external-abort listener.
+        clearUpstreamTimer();
+    }
 }
 
 /** Read a (small) fetch Response body stream fully into a Buffer. Used for the
@@ -3110,6 +3153,7 @@ function sendStats(res: http.ServerResponse): void {
         cacheSamples: s.stats.cacheSamples,
         cacheHitPct: s.stats.cacheSamples > 0 && s.stats.inputTokens > 0 ? Math.round(s.stats.cachedTokens / s.stats.inputTokens * 100) : null,
         lastSeen: new Date(s.lastSeen).toISOString(),
+        restored: s.restored === true,
     }));
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ sessions }, null, 2));

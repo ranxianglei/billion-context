@@ -358,12 +358,20 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     let session = entry ? peekSession(entry.sessionId) : undefined;
     let viaFallback = false;
     if ((!entry || !session) && fallbackLatest) {
+        // #404: only sessions with real activity in THIS process qualify.
+        // Before the fix every boot-restored session carried lastSeen =
+        // restore time, so a 245-way tie resolved by insertion (readdir)
+        // order and could attach a fresh client to an unrelated old session.
         const latest = listSessions()
-            .filter((s) => typeof s.lastSeen === "number")
+            .filter((s) => s.restored !== true)
             .sort((a, b) => (b.lastSeen ?? 0) - (a.lastSeen ?? 0))[0];
         if (latest) {
             session = latest;
             viaFallback = true;
+        } else {
+            res.writeHead(404, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: "no session with activity since boot — issue a model request or pass the conversation id" }));
+            return;
         }
     }
     if (!session) {
@@ -622,6 +630,16 @@ export async function pipePluginChatWithStrip(
             return new Promise<void>((r) => res.once("drain", () => r()));
         }
     };
+    // #411: an aborted read (client cancel / upstream cut) must still land the
+    // usage sniffed so far — anthropic message_start reports input_tokens
+    // before any prose, and dropping it froze lastInputTokens at the previous
+    // turn's value, corrupting every later nudge decision.
+    const settleUsage = () => {
+        if (session && (acc.inputTokens !== undefined || acc.outputTokens !== undefined || acc.cachedTokens !== undefined)) {
+            applyUsageSample(session, acc, protocol);
+            markDirty(session);
+        }
+    };
     const pushField = (field: string, index: number, text: string): [string, boolean] => {
         const s = filterFor(field, index);
         const clean = s.filter.push(text);
@@ -731,10 +749,14 @@ export async function pipePluginChatWithStrip(
         }
         const rest = flushTails();
         if (rest.length > 0 && !res.destroyed && !res.writableEnded) await write(rest);
-        if (session && (acc.inputTokens !== undefined || acc.outputTokens !== undefined || acc.cachedTokens !== undefined)) {
-            applyUsageSample(session, acc, protocol);
-            markDirty(session);
+        settleUsage();
+    } catch (e) {
+        settleUsage();
+        if (res.destroyed || res.writableEnded) {
+            log?.("client aborted mid-stream");
+            return;
         }
+        throw e;
     } finally {
         reader.releaseLock();
         res.end();
@@ -788,6 +810,14 @@ export async function pipePluginResponsesWithStrip(
     const write = (s: string) => {
         if (!res.write(Buffer.from(s, "utf8"))) {
             return new Promise<void>((r) => res.once("drain", () => r()));
+        }
+    };
+    // #411: keep the usage sniffed before an abort (see
+    // pipePluginChatWithStrip).
+    const settleUsage = () => {
+        if (session && (acc.inputTokens !== undefined || acc.outputTokens !== undefined || acc.cachedTokens !== undefined)) {
+            applyUsageSample(session, acc, "responses");
+            markDirty(session);
         }
     };
     let lastDeltaMeta: { item_id?: unknown; output_index?: unknown } | null = null;
@@ -870,10 +900,14 @@ export async function pipePluginResponsesWithStrip(
             const rest = flushTail("");
             if (rest.length > 0) await write(rest);
         }
-        if (session && (acc.inputTokens !== undefined || acc.outputTokens !== undefined || acc.cachedTokens !== undefined)) {
-            applyUsageSample(session, acc, "responses");
-            markDirty(session);
+        settleUsage();
+    } catch (e) {
+        settleUsage();
+        if (res.destroyed || res.writableEnded) {
+            log?.("client aborted mid-stream");
+            return;
         }
+        throw e;
     } finally {
         reader.releaseLock();
         res.end();
@@ -909,10 +943,19 @@ export async function pipePluginJson(
     // (#460 residual) — pass no session there so usage accounting stays off.
     const reader = stream.getReader();
     const chunks: Buffer[] = [];
-    for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (value && value.length > 0) chunks.push(Buffer.from(value));
+    try {
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (value && value.length > 0) chunks.push(Buffer.from(value));
+        }
+    } catch (e) {
+        // #411: a non-stream body cut mid-read has nothing parseable left, but
+        // the response must still end and a client cancel must not surface as
+        // a context-free error.
+        if (!res.writableEnded) res.end();
+        if (res.destroyed || res.writableEnded) return;
+        throw e;
     }
     reader.releaseLock();
     const text = Buffer.concat(chunks).toString("utf8");

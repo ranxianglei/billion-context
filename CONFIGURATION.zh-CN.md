@@ -227,12 +227,18 @@
 - **状态：** ACTIVE
 - **说明：** 为最近消息保护预留的 token 预算。映射到内核字段 `preserveRecentTokens`。
 
-#### `minCompressRange`
+#### `minCompressRangeChars`
 
 - **类型：** `number`
 - **默认值：** *（内核默认值，通常为 `5000`）*
 - **状态：** ACTIVE
-- **说明：** 一个消息范围可被纳入压缩的最小 token 数；更小的范围会被跳过。映射到内核字段 `compress.minCompressRange`。
+- **说明：** 一个消息范围可被纳入压缩的最小长度，单位为**字符**（不是 token）；更小的范围会被跳过。英文/代码平均约 4 字符/token，CJK 约 1-2 字符/token，同一数值对英文的实际语义比 token 直觉宽松约 4 倍。映射到内核字段 `compress.minCompressRange`。
+
+#### `minCompressRange`
+
+- **类型：** `number`
+- **状态：** DEPRECATED（`minCompressRangeChars` 的弃用别名，向后兼容保留）
+- **说明：** `minCompressRangeChars` 的旧名，内核映射（`compress.minCompressRange`）与单位（字符）完全相同。同层两键并存时新名优先；跨层时更深层优先，与键名无关。
 
 #### `tiers`
 
