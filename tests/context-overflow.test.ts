@@ -38,6 +38,20 @@ test("OpenAI Responses: 'exceeds the model's maximum context size of N' → over
     assert.equal(info.isOverflow, true);
     assert.equal(info.window, 128000);
 });
+test("sglang: 'input (N tokens) is longer than the model's context length (M tokens)' → overflow + window M", () => {
+    // Captured verbatim from a real sglang server; both wire formats share the
+    // message. The learned window must be the LIMIT (M), not the input size (N)
+    // — learning N would self-heal to a window larger than the real one.
+    const message = "The input (400013 tokens) is longer than the model's context length (262144 tokens).";
+    const chatBody = JSON.stringify({ object: "error", message, type: "BadRequestError", param: null, code: 400 });
+    const info = inspectContextOverflow(400, chatBody);
+    assert.equal(info.isOverflow, true);
+    assert.equal(info.window, 262144);
+    const responsesBody = JSON.stringify({ error: { message, type: "invalid_request_error", param: null, code: 400 } });
+    const info2 = inspectContextOverflow(400, responsesBody);
+    assert.equal(info2.isOverflow, true);
+    assert.equal(info2.window, 262144);
+});
 
 test("Anthropic: 'prompt is too long: X tokens > Y maximum' → window is Y", () => {    const body = JSON.stringify({
         type: "error",
