@@ -8,11 +8,16 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
-// Regression for #355: a multi-segment compress whose segments are separated
-// by an uncovered user message made the kernel render a compressed summary
-// (role:"system") mid-conversation on the OpenAI wire; strict OpenAI-compatible
-// backends (sglang: "System message must be at the beginning") then reject
-// EVERY subsequent request for that provider with 400.
+// Regression for #355/#377: a multi-segment compress whose segments are
+// separated by an uncovered user message makes the kernel render a compressed
+// summary (role:"system") mid-conversation on the OpenAI wire; strict
+// OpenAI-compatible backends (sglang: "System message must be at the
+// beginning") then reject EVERY subsequent request for that provider with 400.
+//
+// The fix (systemToUser) converts the mid-stream acp_summary system messages
+// to role "user", leaving them at their anchor position. This keeps the head
+// system message (the prefix-cache anchor) byte-stable across compress turns
+// and satisfies sglang's "exactly one system at index 0" constraint.
 //
 // Repro shape, driven through the REAL proxy (startServer) against a mock
 // upstream that captures every forwarded body:
@@ -193,13 +198,22 @@ test("e2e #355: multi-segment compress never puts a system message mid-conversat
         }
 
         const last = JSON.parse(captured[captured.length - 1]!) as { messages: Array<{ role: string; content?: unknown }> };
-        const leadingSystems = last.messages
+        const allContent = last.messages
+            .map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content)))
+            .join("\n");
+        assert.ok(allContent.includes("SUMMARY-ONE-MARKER"), "head-anchored summary missing from the wire");
+        assert.ok(allContent.includes("SUMMARY-TWO-A-MARKER"), "first mid segment summary missing from the wire");
+        assert.ok(allContent.includes("SUMMARY-TWO-B-MARKER"), "second mid segment summary (the #355 offender) missing from the wire");
+        // The summaries must ride on USER messages (mid-stream), NOT leak into
+        // the single leading system message — that would break sglang's
+        // one-system rule and invalidate the prefix-cache anchor.
+        const systemContent = last.messages
             .filter((m) => m.role === "system" || m.role === "developer")
             .map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content)))
             .join("\n");
-        assert.ok(leadingSystems.includes("SUMMARY-ONE-MARKER"), "head-anchored summary missing from the leading system prefix");
-        assert.ok(leadingSystems.includes("SUMMARY-TWO-A-MARKER"), "first mid segment summary missing from the leading system prefix");
-        assert.ok(leadingSystems.includes("SUMMARY-TWO-B-MARKER"), "second mid segment summary (the #355 offender) missing from the leading system prefix");
+        assert.ok(!systemContent.includes("SUMMARY-ONE-MARKER"), "summary leaked into the system message");
+        assert.ok(!systemContent.includes("SUMMARY-TWO-A-MARKER"), "summary leaked into the system message");
+        assert.ok(!systemContent.includes("SUMMARY-TWO-B-MARKER"), "summary leaked into the system message");
     } finally {
         await close(proxy);
         await close(upstream);

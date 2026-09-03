@@ -418,3 +418,40 @@ test("mcp stdio shell (codex style): BILI_CONVERSATION_ID self-register → head
     assert.equal(status.ok, true, "conversation bound after the model request");
     assert.equal(status.pluginAgent, "mcp");
 });
+
+// POST /__bili/plugin/compact (#395 / PR #421): the omp agent notifies the
+// proxy of an in-session native compaction; the boundary must land on the
+// bound session and be consumed by the next model request.
+test("plugin compact endpoint: validation, boundary marking, consumption on next turn", async () => {
+    const rig = await startRig();
+    try {
+        const post = (body: string): Promise<Response> => fetch(rig.proxyUrl("/__bili/plugin/compact"), {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body,
+        });
+        assert.equal((await post("not json")).status, 400, "invalid JSON rejected");
+        assert.equal((await post("{}")).status, 400, "missing conversationId rejected");
+        assert.equal((await post(JSON.stringify({ conversationId: "never-registered" }))).status, 404, "unknown conversation rejected");
+
+        const { listSessions } = await import("../src/session.ts");
+        const before = new Set(listSessions().map((s) => s.id));
+        await register(rig, "compact-conv", { agent: "pi" });
+        await postModel(rig, "compact-req-1");
+        const mine = listSessions().find((s) => !before.has(s.id));
+        assert.ok(mine, "the model request created a new session");
+
+        const okRes = await post(JSON.stringify({ conversationId: "compact-conv" }));
+        assert.equal(okRes.status, 200, "compact accepted for a bound conversation");
+        assert.equal((await okRes.json() as { ok: boolean }).ok, true);
+        const boundary = mine!.metadata.compactionBoundary as { pending: boolean } | undefined;
+        assert.equal(boundary?.pending, true, "boundary marked pending on the session");
+
+        await postModel(rig, "compact-req-1");
+        const consumed = mine!.metadata.compactionBoundary as { pending: boolean; archivedBlocks?: string[] };
+        assert.equal(consumed.pending, false, "boundary consumed by the next model request");
+        assert.ok(Array.isArray(consumed.archivedBlocks), "archivedBlocks recorded");
+    } finally {
+        await rig.closeAll();
+    }
+});
