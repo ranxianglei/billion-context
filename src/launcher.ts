@@ -1945,7 +1945,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     // used to resolve the budget-alignment window, #321).
     const biliRoutes = loadRoutes(process.env);
     const domains = dedupeInOrder([...routes.httpsDomains, ...(params.mitmDomains ?? [])]);
-    const handle = await ensureProxyRunning({ host, port, passthrough, debug, mitmDomains: domains, modelWindows: collectModelWindows(config) }, deps);
+    const handle = await ensureProxyRunning({ host, port, passthrough, debug, mitmDomains: domains, modelWindows: collectModelWindows(config, base) }, deps);
     console.error(
         `bili: started proxy at ${handle.origin} (MITM domains: ${domains.length ? domains.join(", ") : "defaults"})` +
             (routes.httpRewrites.length > 0 ? ` (HTTP /bili/ rewrites: ${routes.httpRewrites.length})` : "") +
@@ -2186,7 +2186,7 @@ export async function runTestPi(params: RunTestPiParams, deps: LauncherDeps = {}
         ...discoverDomains("pi", config),
         ...(params.mitmDomains ?? []),
     ]);
-    const handle = await ensureProxyRunning({ host, port, passthrough, debug, mitmDomains: domains, modelWindows: collectModelWindows(config) }, deps);
+    const handle = await ensureProxyRunning({ host, port, passthrough, debug, mitmDomains: domains, modelWindows: collectModelWindows(config, "pi") }, deps);
     console.error(
         `bili: started proxy at ${handle.origin} (MITM domains: ${domains.length ? domains.join(", ") : "defaults"})`,
     );
