@@ -46,6 +46,7 @@ import { COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONS
 import { rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
 import { preflightCompress, estimateCoreMessages } from "./preflight.js";
+import { imageTokensInRawBody, imageTokensInParsedBody } from "./image-tokens.js";
 import { renderUI, handleConfigGet, handleConfigPut } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { getStore } from "./persist.js";
@@ -1559,13 +1560,15 @@ export function emergencyNudge(nudge: NudgeDecision | null | undefined, escalati
 function clampOutgoingOutput(
     rebuilt: Record<string, unknown>,
     field: "max_tokens" | "max_completion_tokens" | "max_output_tokens",
-    ctx: { systemText: string; tools: unknown; processedMessages: CoreMessage[]; lastInputTokens: number; nativeWindow: number },
+    ctx: { systemText: string; tools: unknown; processedMessages: CoreMessage[]; lastInputTokens: number; nativeWindow: number; imageTokens: number },
     sessionId: string,
     log: (level: string, msg: string) => void,
 ): void {
     const raw = rebuilt[field];
     if (typeof raw !== "number") return;
-    const inputEstimate = estimateInputTokens(ctx.processedMessages, ctx.systemText, ctx.tools, ctx.lastInputTokens);
+    // #488: images ride along in the rebuilt body but are invisible to the text model —
+    // without them the cap is too generous and input+output can still overflow.
+    const inputEstimate = estimateInputTokens(ctx.processedMessages, ctx.systemText, ctx.tools, ctx.lastInputTokens) + ctx.imageTokens;
     const capped = clampOutputBudget(raw, inputEstimate, ctx.nativeWindow);
     if (capped !== undefined) {
         rebuilt[field] = capped;
@@ -1675,7 +1678,7 @@ function prepareOpenai(
     }
 
     const rebuilt: OpenAIRequestBody = { ...parsed, messages: rebuiltMessages, tools: toolsOut as OpenAITool[] | undefined };
-    clampOutgoingOutput(rebuilt as Record<string, unknown>, typeof (parsed as Record<string, unknown>).max_completion_tokens === "number" ? "max_completion_tokens" : "max_tokens", { systemText: openaiSystemText, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, nativeWindow }, sessionId, log);
+    clampOutgoingOutput(rebuilt as Record<string, unknown>, typeof (parsed as Record<string, unknown>).max_completion_tokens === "number" ? "max_completion_tokens" : "max_tokens", { systemText: openaiSystemText, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, nativeWindow, imageTokens: imageTokensInParsedBody("openai", rebuilt) }, sessionId, log);
     // prompt_cache_retention is an OpenAI-host-only cache directive; the dsh
     // launcher forces PI_CACHE_RETENTION=long (for the session-id
     // prompt_cache_key) which makes the client also emit it. Third-party
@@ -1884,7 +1887,7 @@ function prepareResponses(
 
     const rebuilt: ResponsesRequestBody = { ...parsed, input: rebuiltInput, tools: toolsOut };
     if (!isCompactionTrigger) {
-        clampOutgoingOutput(rebuilt as Record<string, unknown>, "max_output_tokens", { systemText: (responsesProjection?.systemParts ?? []).join("\n"), tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, nativeWindow }, sessionId, log);
+        clampOutgoingOutput(rebuilt as Record<string, unknown>, "max_output_tokens", { systemText: (responsesProjection?.systemParts ?? []).join("\n"), tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, nativeWindow, imageTokens: imageTokensInParsedBody("responses", rebuilt) }, sessionId, log);
     }
     // Route with the upstream THIS request goes to — session.meta.upstreamOrigin
     // is first-wins and would keep injecting pck toward a relay we switched
@@ -2292,7 +2295,10 @@ async function preflightCompressIfNeeded(
     // A fresh session (id rotated, e.g. after a model switch) has
     // lastInputTokens = 0 while still carrying a full raw history; size the
     // trigger on the real post-fold payload too.
-    const payloadEstimate = estimateCoreMessages(prepared.processedMessages);
+    // #488: images are forwarded verbatim but invisible to the kernel's text model —
+    // add their cost to every size decision here (trigger, fit gates, self-heal).
+    const imageTokens = imageTokensInRawBody(prepared.protocol, prepared.body);
+    const payloadEstimate = estimateCoreMessages(prepared.processedMessages) + imageTokens;
     const tokenCount = Math.max(session.stats.lastInputTokens, payloadEstimate);
     if (limit <= 0 || !model || tokenCount < limit) return prepared;
     // #301: forwarding as-is is safe ONLY when the payload's own estimate
@@ -2301,10 +2307,14 @@ async function preflightCompressIfNeeded(
     // double-counted usage report (#300) — and must not turn a fitting
     // payload into a fail-fast false positive.
     const failFast = (status: number, detail: string, retryable: boolean): PreflightFailFast => {
+        const imageNote = imageTokens >= limit
+            ? ` Images alone account for ~${imageTokens} tokens (≥ window ${limit}); compression cannot remove them — shrink or remove the images, or raise the window.`
+            : "";
         const message =
             `context ~${tokenCount} tokens exceeds the model window ${limit} (model=${model}) ` +
-            `and preflight compression could not bring it under: ${detail}. ` +
-            `The over-window payload was NOT forwarded.`;
+            `and preflight compression could not bring it under: ${detail}.` +
+            imageNote +
+            ` The over-window payload was NOT forwarded.`;
         log("error", `[${session.id}] preflight fail-fast ${status} (retryable=${retryable}): ${message}`);
         return { failFast: true, status, message, retryable, respond: !res.writableEnded };
     };
@@ -2337,6 +2347,7 @@ async function preflightCompressIfNeeded(
             proxyUrl,
             signal: clientAbort.signal,
             log,
+            imageFloor: imageTokens,
         },
         prepared.originalMessages,
     );
@@ -2560,9 +2571,13 @@ async function forward(
                 // model that produced the overflow (per-model scoping: a stale
                 // limit from another model must not cap this one).
                 let reqModel: string | undefined;
+                let rejectedImageTokens = 0;
                 try {
                     const rawBody = typeof prepared.body === "string" ? prepared.body : prepared.body.toString("utf8");
-                    reqModel = (JSON.parse(rawBody) as { model?: string }).model;
+                    const parsedBody = JSON.parse(rawBody) as Record<string, unknown>;
+                    reqModel = typeof parsedBody.model === "string" ? parsedBody.model : undefined;
+                    // #488: the rejected payload's size must include its images (they were forwarded verbatim).
+                    rejectedImageTokens = imageTokensInParsedBody(prepared.protocol, parsedBody);
                 } catch {
                     reqModel = undefined; // non-JSON body — fall back to the legacy scalar
                 }
@@ -2583,7 +2598,7 @@ async function forward(
                     // so the next turn re-centers the limit and the pre-flight
                     // compresses below it. Only shrink, never grow: a previously
                     // learned (smaller) value is the tighter bound.
-                    const payloadEstimate = estimateCoreMessages(prepared.processedMessages);
+                    const payloadEstimate = estimateCoreMessages(prepared.processedMessages) + rejectedImageTokens;
                     const prev = (reqModel ? learnedMap[reqModel] : undefined) ?? (s.metadata.learnedContextLimit as number | undefined);
                     if (payloadEstimate >= 1000 && (prev === undefined || payloadEstimate < prev)) {
                         if (reqModel) learnedMap[reqModel] = payloadEstimate;
