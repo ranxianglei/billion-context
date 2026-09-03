@@ -91,7 +91,9 @@ export function resolveDecompress(
         // Honor the full flag: `one` = direct msgs + nested child summaries,
         // `full` = all original messages. Returning the cached full text
         // unconditionally would break the default one-level semantics.
-        const view = full ? cached.full : cached.one;
+        // `one === null` means the two views were byte-identical at cache
+        // time and deduped to one copy (#478).
+        const view = full ? cached.full : (cached.one ?? cached.full);
         body = view.text;
         count = view.count;
     } else {

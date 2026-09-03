@@ -363,6 +363,8 @@ Environment variables take precedence over the config file. They are useful for 
 | `BILI_TUNNEL_ALLOWED_HOSTS` | `/bili/<absolute-url>` tunnel admission for **remote clients** (#409): comma-separated `host` or `host:port` entries that unlock loopback/private destinations (e.g. a LAN relay or the machine's own sglang) for non-loopback clients. The proxy itself and link-local/metadata addresses are always denied; local (loopback) clients always pass. |
 | `BILI_MAX_SESSIONS` | Max sessions held in memory (default `256`; LRU eviction — disk is the source of truth). |
 | `BILI_SESSIONS_DIR` | Directory for persisted session state (default XDG data dir). |
+| `BILI_SESSIONS_RETENTION_DAYS` | Session-file retention window in days (default `90`). Session state is derived (the conversation itself lives client-side), so at boot, files not saved within the window are deleted. `0` or negative disables age-based pruning. See #478. |
+| `BILI_SESSIONS_MAX_BYTES` | Total on-disk budget for session storage in bytes (default `1073741824` = 1 GiB). If the store exceeds it at boot, oldest files are pruned until under budget. `0` or negative disables size-based pruning. See #478. |
 | `BILLION_CONTEXT_PROXY` | Exported by the launcher; client-side bili plugins/extensions detect it and self-disable their own compression (no double compression). |
 | `BILLION_CONTEXT_PLUGIN` | Set `0` to disable plugin mode entirely (wire-level tool injection resumes). |
 | `BILI_LAUNCHER_MODEL_WINDOWS` | Internal: the launcher hands the client's own per-model context windows (pi `models.json`, omp `models.yml`, opencode `models.<id>.limit`, codex `model_context_window`) to the spawned proxy as JSON, so the nudge denominator matches the real window for self-hosted models. Only the launcher sets it — no user configuration. |
@@ -633,6 +635,15 @@ Compression state (blocks, summaries, original message cache) lives **in the pro
 
 - If you point the client back at the real upstream (or stop the proxy), the client replays its **full local history** every turn. After a long compressed session this can exceed the model's context window (`context_window_exceeded`).
 - There is no way to "unpack" a compression block into the client's local history — the client never saw the compressed form.
+
+### Storage lifecycle at boot (#478)
+
+Session files are derived state, so the proxy bounds them at boot with a **single** directory walk+parse (load, the one-time #286 identity migration, and GC all run over the same parsed map):
+
+- **Retention** — files not saved within `BILI_SESSIONS_RETENTION_DAYS` (default `90`) are deleted.
+- **Size budget** — if total on-disk bytes exceed `BILI_SESSIONS_MAX_BYTES` (default 1 GiB), oldest files are pruned until under budget.
+- A pruned session simply starts fresh if its client returns.
+- The #286 migration writes a `.bili-migration-286.done` marker after its first pass, so it never re-scans or re-logs on later boots.
 
 ### Migrating off the proxy
 
