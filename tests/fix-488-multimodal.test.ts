@@ -165,7 +165,7 @@ test("e2e #488-B (Responses): preflight summary requests carry store:false so co
     }
 });
 
-test("e2e #488-A (Responses): images alone over the window are withheld with an actionable error, never forwarded", async () => {
+test("e2e #488-A/#496 (Responses): image-dominated payload with no overflow evidence is forwarded once; tile upstream accepts", async () => {
     const streamForwards: boolean[] = [];
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
@@ -173,8 +173,11 @@ test("e2e #488-A (Responses): images alone over the window are withheld with an 
         req.on("end", () => {
             const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { stream?: boolean };
             streamForwards.push(parsed.stream === true);
+            // Pixel-tile upstream shape: accepts the payload and reports a SMALL real
+            // input cost despite the large base64 body (a 60k-char screenshot bills as
+            // ~1.6K tiles upstream, not the 15K tokens bili estimates from b64/4).
             res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
-            res.write(completed(100));
+            res.write(completed(3000));
             res.end();
         });
     });
@@ -184,8 +187,13 @@ test("e2e #488-A (Responses): images alone over the window are withheld with an 
     const { proxy, url } = await startProxy(upstreamPort);
 
     try {
-        // 7 screenshots × 60k base64 chars = 7 × 15_000 = 105_000 image tokens,
-        // against a 10_000 window — no amount of text folding can fix this.
+        // 7 screenshots × 60k base64 chars = 7 × 15_000 = 105_000 ESTIMATED image
+        // tokens against a 10_000 window. Text is trivially small, so images are the
+        // sole over-window component. Fresh session (lastInputTokens=0, no learned
+        // limit) → no upstream overflow evidence → #496 forward-once-then-learn lets
+        // the upstream arbitrate the true billing instead of a hard 502 (#488's
+        // original expectation was withheld+never-forwarded; that was the false
+        // positive for tile-billed upstreams this issue fixes).
         const bigB64 = "A".repeat(60_000);
         const input = [
             {
@@ -202,11 +210,27 @@ test("e2e #488-A (Responses): images alone over the window are withheld with an 
             headers: { "content-type": "application/json" },
             body: JSON.stringify({ model: "gpt-resp", stream: true, session_id: "img-sess-a", instructions: "You are the test coding agent.", input }),
         });
-        assert.equal(r.status, 502, "over-window multimodal payload is withheld");
-        const err = JSON.parse(await r.text()) as { error?: { code?: string; message?: string; retryable?: boolean } };
-        assert.equal(err.error?.code, "preflight_compress_failed");
-        assert.match(err.error?.message ?? "", /Images alone account for ~105000 tokens/);
-        assert.ok(!streamForwards.includes(true), "the over-window payload was never forwarded upstream");
+        assert.equal(r.status, 200, "tile-billed upstream accepts the forwarded payload (#496: no hard 502)");
+        await r.text();
+        assert.ok(streamForwards.includes(true), "the image-dominated payload was forwarded once for the upstream to arbitrate");
+
+        // Steady state: a follow-up turn on the same session also forwards and succeeds
+        // (real usage stays under the window), so multimodal sessions keep working.
+        const r2 = await fetch(url, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+                model: "gpt-resp", stream: true, session_id: "img-sess-a", instructions: "You are the test coding agent.",
+                input: [
+                    ...input,
+                    { type: "message", role: "assistant", content: "I see the failing screen." },
+                    { type: "message", role: "user", content: [{ type: "input_text", text: "and one more screenshot" }, { type: "input_image", image_url: `data:image/png;base64,${bigB64}` }] },
+                ],
+            }),
+        });
+        assert.equal(r2.status, 200, "follow-up multimodal turn still succeeds (no fail-fast regression)");
+        await r2.text();
+        assert.ok(streamForwards.filter(Boolean).length >= 2, "both turns were forwarded");
     } finally {
         await closeAll(proxy, upstream);
     }

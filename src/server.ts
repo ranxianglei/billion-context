@@ -2298,9 +2298,29 @@ async function preflightCompressIfNeeded(
     // #488: images are forwarded verbatim but invisible to the kernel's text model —
     // add their cost to every size decision here (trigger, fit gates, self-heal).
     const imageTokens = imageTokensInRawBody(prepared.protocol, prepared.body);
-    const payloadEstimate = estimateCoreMessages(prepared.processedMessages) + imageTokens;
+    const textEstimate = estimateCoreMessages(prepared.processedMessages);
+    const payloadEstimate = textEstimate + imageTokens;
     const tokenCount = Math.max(session.stats.lastInputTokens, payloadEstimate);
     if (limit <= 0 || !model || tokenCount < limit) return prepared;
+    // #496 forward-once-then-learn: the default image cost (base64/4) matches byte
+    // relays (#488) but overestimates pixel-tile upstreams (a 400KB JPEG ≈ 1.6K real
+    // tokens, not ~133K), so an image-dominated payload can clear the window on ESTIMATE
+    // alone. When images are the sole over-window component (text fits) and we hold no
+    // upstream overflow evidence (measured baseline under window + no learned limit for
+    // this model), forward once and let the upstream arbitrate billing: tile upstreams
+    // accept it; byte relays reject it (400) → forward()'s self-heal learns the window
+    // (it counts rejected image tokens) → later requests fail-fast. #488's 400 loop stays
+    // broken (exactly one rejected forward). With either evidence signal present we trust
+    // the estimate and fall through to fold / fail-fast below.
+    const learnedMap = session.metadata.learnedContextLimits as Record<string, number> | undefined;
+    const learnedLimit =
+        (model ? learnedMap?.[model] : undefined) ??
+        (session.metadata.learnedContextLimit as number | undefined);
+    const noOverflowEvidence = session.stats.lastInputTokens < limit && learnedLimit === undefined;
+    if (imageTokens > 0 && textEstimate < limit && noOverflowEvidence) {
+        log("warn", `[${session.id}] image-dominated payload (~${textEstimate} text + ~${imageTokens} image tokens) exceeds window ${limit} by estimate only, no upstream overflow evidence — forwarding once so the upstream arbitrates billing (#496)`);
+        return prepared;
+    }
     // #301: forwarding as-is is safe ONLY when the payload's own estimate
     // fits the window. The trigger (and the loop's fit check) floor on
     // session.stats.lastInputTokens, which can be stale — e.g. a
