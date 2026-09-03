@@ -229,12 +229,18 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Status:** ACTIVE
 - **Description:** Token budget reserved for recent-message protection. Maps to the kernel field `preserveRecentTokens`.
 
-#### `minCompressRange`
+#### `minCompressRangeChars`
 
 - **Type:** `number`
 - **Default:** *(kernel default, typically `5000`)*
 - **Status:** ACTIVE
-- **Description:** Minimum token count for a message range to be eligible for compression; smaller ranges are skipped. Maps to the kernel field `compress.minCompressRange`.
+- **Description:** Minimum range size, in **characters** (not tokens), for a message range to be eligible for compression; smaller ranges are skipped. English/code averages ~4 chars per token, CJK ~1-2, so the same number reads ~4× more permissive for English text than a token-based mental model. Maps to the kernel field `compress.minCompressRange`.
+
+#### `minCompressRange`
+
+- **Type:** `number`
+- **Status:** DEPRECATED (alias of `minCompressRangeChars`, kept for backward compatibility)
+- **Description:** Legacy name for `minCompressRangeChars` — same kernel mapping (`compress.minCompressRange`), same unit (characters). When both keys are set at the same level the canonical name wins; across levels the deeper level wins regardless of which name it uses.
 
 #### `tiers`
 
