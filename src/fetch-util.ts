@@ -11,6 +11,15 @@
 export const MAX_REQUEST_BYTES = 100 * 1024 * 1024;
 export const UPSTREAM_TIMEOUT_MS = 10 * 60 * 1000;
 
+const liveUpstreamTimers = new Set<ReturnType<typeof setTimeout>>();
+/** Test hook: how many fetchWithTimeout idle-timers are currently armed.
+ *  #411: an aborted passthrough used to leak its 10-minute timer because
+ *  clearTimer was only called on the success path — tests assert this stays
+ *  at zero after a client abort. */
+export function _liveUpstreamTimersForTest(): number {
+    return liveUpstreamTimers.size;
+}
+
 /** undici's fetch accepts a `dispatcher` option (its own Dispatcher type) that
  *  @types/node's RequestInit already declares — but typed as the internal
  *  `Dispatcher` interface, which conflicts with the `undici` package's
@@ -19,11 +28,15 @@ export const UPSTREAM_TIMEOUT_MS = 10 * 60 * 1000;
  *  is accepted, without `as any`. */
 export type FetchOptions = Omit<RequestInit, "dispatcher"> & { dispatcher?: object };
 
-/** Abort a fetch after `timeoutMs`. Unlike the naive version, the timer is
- *  NOT cleared when headers arrive — it must cover the response BODY too
- *  (LLM SSE streams can stall mid-stream). Callers receive a `clearTimer`
- *  callback and invoke it once the response stream has been fully consumed;
- *  otherwise the timer correctly fires and aborts a stuck stream.
+/** Abort a fetch after `timeoutMs` of IDLE time. The timer starts when the
+ *  fetch begins (bounding time-to-first-byte / headers) and is RE-ARMED on
+ *  every response-body chunk, so it becomes an idle timeout once the body is
+ *  streaming: a healthy stream that keeps producing chunks is never aborted
+ *  mid-flight (LLM generations can legitimately run for minutes — a total
+ *  timer would kill a healthy 12-minute stream at the 10-minute mark), while a
+ *  genuinely stuck stream (no chunk for `timeoutMs`) still trips the abort.
+ *  Callers receive a `clearTimer` callback and invoke it once the response
+ *  stream has been fully consumed (or on the error path) to stop the timer.
  *
  *  `opts.dispatcher` (optional) routes the fetch through an upstream proxy
  *  (an `undici.ProxyAgent`). When omitted, fetch uses its default agent.
@@ -39,7 +52,20 @@ export async function fetchWithTimeout(
     externalSignal?: AbortSignal,
 ): Promise<{ response: Response; clearTimer: () => void }> {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const armTimer = () => {
+        const t = setTimeout(() => {
+            liveUpstreamTimers.delete(t);
+            controller.abort();
+        }, timeoutMs);
+        liveUpstreamTimers.add(t);
+        return t;
+    };
+    let timer = armTimer();
+    const rearm = () => {
+        clearTimeout(timer);
+        liveUpstreamTimers.delete(timer);
+        timer = armTimer();
+    };
     let onExternalAbort: (() => void) | null = null;
     if (externalSignal) {
         if (externalSignal.aborted) controller.abort();
@@ -48,6 +74,11 @@ export async function fetchWithTimeout(
             externalSignal.addEventListener("abort", onExternalAbort, { once: true });
         }
     }
+    const cleanup = () => {
+        clearTimeout(timer);
+        liveUpstreamTimers.delete(timer);
+        if (onExternalAbort && externalSignal) externalSignal.removeEventListener("abort", onExternalAbort);
+    };
     try {
         const finalOpts: Omit<RequestInit, "dispatcher"> & { dispatcher?: object } = { ...opts, signal: controller.signal };
         // `fetch` is undici's global; it accepts `dispatcher` at runtime. @types/node
@@ -55,19 +86,51 @@ export async function fetchWithTimeout(
         // which structurally conflicts with the `undici` package's exported
         // Dispatcher — but at runtime they're the same thing. Assert to the
         // concrete RequestInit type (no `as any`) to satisfy the call site.
-        const response = await fetch(url, finalOpts as RequestInit);
-        return {
-            response: response as Response,
-            clearTimer: () => {
-                clearTimeout(timer);
-                if (onExternalAbort && externalSignal) externalSignal.removeEventListener("abort", onExternalAbort);
-            },
-        };
+        const raw = await fetch(url, finalOpts as RequestInit) as Response;
+        if (raw.body) {
+            // Wrap the body so each chunk re-arms the timer (idle timeout); carry
+            // status/headers onto a fresh Response so callers see an identical shape.
+            const wrapped = armIdleBody(raw.body, rearm);
+            return {
+                response: new Response(wrapped, {
+                    status: raw.status,
+                    statusText: raw.statusText,
+                    headers: raw.headers,
+                }),
+                clearTimer: cleanup,
+            };
+        }
+        return { response: raw, clearTimer: cleanup };
     } catch (e) {
-        clearTimeout(timer);
-        if (onExternalAbort && externalSignal) externalSignal.removeEventListener("abort", onExternalAbort);
+        cleanup();
         throw e;
     }
+}
+
+function armIdleBody(body: ReadableStream<Uint8Array>, rearm: () => void): ReadableStream<Uint8Array> {
+    const reader = body.getReader();
+    return new ReadableStream<Uint8Array>({
+        async pull(controller) {
+            try {
+                const result = await reader.read();
+                if (result.done) {
+                    controller.close();
+                    return;
+                }
+                rearm();
+                controller.enqueue(result.value);
+            } catch (e) {
+                controller.error(e);
+            }
+        },
+        async cancel(reason) {
+            try {
+                await reader.cancel(reason);
+            } catch {
+                /* already closed */
+            }
+        },
+    });
 }
 
 /** Upstream HTTP failure after all retry attempts are exhausted (or a

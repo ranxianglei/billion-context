@@ -115,11 +115,21 @@ Context-level visibility for plugin UIs (status bars / slash commands):
 
 `contextTokens` is the last reported context size (input + cache-read) — the same value the nudge decision reads. Errors: `400` missing `conversationId`, `404` unknown conversation.
 
-### 5. MITM transparent-proxy mode
+### 5. `POST /__bili/plugin/compact`
+
+Notify the proxy that the agent performed an **in-session native compaction** (e.g. omp's `/compact` or its auto threshold): the next model request re-sends a shortened history (compaction summary + retained tail) under the SAME conversation id. Fire-and-forget is fine — a failed notification must never break the agent's compaction.
+
+```json
+{ "conversationId": "the same value you send as x-bili-plugin-conversation" }
+```
+
+Effect: the proxy marks a one-shot compaction boundary on the session. On the next model request, blocks that were active before the compaction but no longer anchor into the shortened history are downgraded to a pre-compaction archive (listed by `acp_status` with a reason; `decompress` on one returns an explicit "unavailable" error instead of failing silently), and stale `byRaw`/`byRef` mappings are pruned to the live ids. Errors: `400` invalid JSON / missing `conversationId`, `404` unknown conversation.
+
+### 6. MITM transparent-proxy mode
 
 The `/bili/` prefix is absent in MITM mode, so URL-based detection cannot work. Instead the proxy's own launcher (`bili pi` / `bili codex` / `bili claude`) exports `BILLION_CONTEXT_PROXY=http://127.0.0.1:<port>` in the child env, next to the `HTTPS_PROXY` + CA vars it already sets. A plugin detects cooperative mode by reading that env var (the proxy origin for all `/__bili/plugin/*` calls); everything else (headers, tool forwarding, status) is identical — the `x-bili-plugin*` headers pass through the MITM tunnel into the same pipeline. This is also where `x-bili-plugin-context-window` matters most: MITM upstreams are often private relays the models.dev registry doesn't know.
 
-### 6. Lifecycle of one compression (what the plugin does)
+### 7. Lifecycle of one compression (what the plugin does)
 
 1. Model replies with a native `compress` tool call (args contain `startId`/`endId` refs it read from the tag-annotated context).
 2. The agent ends the assistant turn; the plugin's tool handler fires.

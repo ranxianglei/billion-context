@@ -16,6 +16,7 @@ type RegistryShape = Record<string, ModelEntry>;
 
 let cache: RegistryShape | null = null;
 let loading: Promise<RegistryShape | null> | null = null;
+const warnedConflicts = new Set<string>();
 
 /** Full models.dev snapshot committed at src/registry-snapshot.json
  *  (refresh with `npm run registry:snapshot`) and inlined into dist at build
@@ -297,24 +298,34 @@ function registryLookup(reg: RegistryShape | null, model: string, host?: string)
         // Relay host (not in HOST_TO_PROVIDER): the bare name can miss while
         // the model exists under a provider-prefixed key (a relay serving
         // "deepseek-v4-flash" is stored as "deepseek/deepseek-v4-flash"). Scan
-        // */<name> and adopt the value only when every match agrees — a
-        // conflict means different deployments, and guessing is worse than the
-        // static table. A conflicting/missing original name falls through to
-        // the next (stripped) variant. Known-provider hosts keep the old
-        // behavior: a miss there means the model is genuinely unlisted for
-        // that provider.
+        // */<name> and take the MAXIMUM window across matches when they
+        // disagree: max is never smaller than any single declared deployment,
+        // so compression thresholds never fire earlier than some real
+        // deployment would allow; conflicts are logged once per name. Zero
+        // valid matches falls through to the next (stripped) variant.
+        // Known-provider hosts do not cross-provider scan: a miss means the
+        // model is genuinely unlisted for that provider (its stripped
+        // variants still get their exact-key chance above).
         if (provider === undefined) {
             const suffix = `/${name}`;
-            let agreed: number | undefined;
-            let conflicted = false;
+            let max: number | undefined;
+            const distinct = new Set<number>();
+            const parts: string[] = [];
             for (const key of Object.keys(reg)) {
                 if (!key.endsWith(suffix)) continue;
                 const ctx = reg[key].limit?.context;
                 if (typeof ctx !== "number" || ctx <= 0) continue;
-                if (agreed === undefined) agreed = ctx;
-                else if (agreed !== ctx) { conflicted = true; break; }
+                if (max === undefined || ctx > max) max = ctx;
+                distinct.add(ctx);
+                parts.push(`${key}=${ctx}`);
             }
-            if (!conflicted && agreed !== undefined) return agreed;
+            if (max !== undefined) {
+                if (distinct.size > 1 && !warnedConflicts.has(name)) {
+                    warnedConflicts.add(name);
+                    loggerLog("warn", `[acp-registry] conflicting context windows for "${name}" (${parts.join(", ")}) — using max ${max}`);
+                }
+                return max;
+            }
         }
     }
     return undefined;
@@ -323,6 +334,7 @@ function registryLookup(reg: RegistryShape | null, model: string, host?: string)
 export function _resetForTest(): void {
     cache = null;
     loading = null;
+    warnedConflicts.clear();
 }
 
 export function _setForTest(data: RegistryShape): void {

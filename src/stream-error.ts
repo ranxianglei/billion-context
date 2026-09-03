@@ -5,7 +5,7 @@ import type http from "node:http";
  * failure and ends cleanly, instead of a bare socket close.
  *
  * WHY: server.ts forward() routes streams through protocol rewriters
- * (rewriteSseStream / runCompressLoop). If a
+ * (runCompressLoop / the tag-echo passthrough pipes). If a
  * rewriter throws (e.g. executeProxyTool hits an edge case, JSON.parse fails),
  * the `for await` loop aborts and — without this — `res.end()` is skipped,
  * leaving the client with a truncated stream and no finish event. The request

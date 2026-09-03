@@ -31,7 +31,7 @@ function compressARange() {
     session.state = turn.state;
     const ctx = { core, config, messages: turn.messages, session, log: () => {} };
     applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00007", summary: "Early history: messages 1-7 covered initial setup, configuration, and baseline testing of the compression pipeline. This is the cached summary used by the one-level view." }] }), ctx as never);
-    return { ctx, core, config, session };
+    return { ctx, core, config, session, msgs };
 }
 
 test("resolveDecompress: default (full:false) returns one-level view, not nested full text", () => {
@@ -39,7 +39,7 @@ test("resolveDecompress: default (full:false) returns one-level view, not nested
     const blockId = [...session.state.blocks].slice(-1)[0]?.blockId;
     assert.ok(blockId, "a block was created");
     const out = resolveDecompress({ blockId }, ctx);
-    assert.match(out, /Restored block b\d+/);
+    assert.match(out, /Block b\d+ content/);
     // one-level view: count reflects direct messages + nested child summaries
     // (for a fresh leaf block there are no nested children, so count == direct msgs)
     assert.doesNotMatch(out, /written to:/, "small body not spilled to a temp file");
@@ -63,12 +63,29 @@ test("resolveDecompress: full:true returns all original messages", () => {
     assert.match(fullOut, /full/);
 });
 
-test("resolveDecompress: successful decompress deletes the cache", () => {
+test("resolveDecompress: stateless — cache kept, block stays active, repeat is idempotent", () => {
     const { ctx, session } = compressARange();
     const blockId = [...session.state.blocks].slice(-1)[0]?.blockId!;
     assert.ok(session.blockContents.has(blockId), "cache populated at compress time");
-    resolveDecompress({ blockId }, ctx);
-    assert.ok(!session.blockContents.has(blockId), "cache deleted after decompress");
+    const out1 = resolveDecompress({ blockId }, ctx);
+    assert.ok(session.blockContents.has(blockId), "cache retained after decompress (stateless retrieval)");
+    const block = session.state.blocks.find((b) => b.blockId === blockId);
+    assert.equal(block?.active, true, "block NOT deactivated — decompress changes no state");
+    const out2 = resolveDecompress({ blockId }, ctx);
+    assert.equal(out1, out2, "repeat decompress returns identical content");
+});
+
+test("resolveDecompress: cache miss falls back to originals via compressMessages (unfolded view)", () => {
+    const { core, config, session, msgs } = compressARange();
+    const blockId = [...session.state.blocks].slice(-1)[0]?.blockId!;
+    session.blockContents.delete(blockId);
+    // Loop paths hand the folded view as `messages` and the original history
+    // as `compressMessages`; the fallback must scan the latter, not the former.
+    const foldedCtx = { core, config, messages: [] as CoreMessage[], compressMessages: msgs, session, log: () => {} };
+    const out = resolveDecompress({ blockId }, foldedCtx as never);
+    assert.match(out, /Historical detail 0\./, "originals recovered from the unfolded view");
+    const block = session.state.blocks.find((b) => b.blockId === blockId);
+    assert.equal(block?.active, true, "block stays active after fallback retrieval");
 });
 
 test("resolveDecompress: missing cache + folded messages returns summary, keeps block active", () => {
@@ -81,7 +98,7 @@ test("resolveDecompress: missing cache + folded messages returns summary, keeps 
     assert.ok(blockBefore?.active, "block active before decompress");
     const out = resolveDecompress({ blockId }, emptyCtx);
     // Falls back to summary (count 0 → summary used); block stays active.
-    assert.match(out, /Restored block/);
+    assert.match(out, /Block b\d+ content/);
     const blockAfter = session.state.blocks.find((b) => b.blockId === blockId);
     assert.equal(blockAfter?.active, true, "block NOT deactivated when no content recovered and no cache");
 });
