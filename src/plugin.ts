@@ -3,7 +3,7 @@ import { buildStatusPanel } from "acp-kernel/panel";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import path from "node:path";
-import { acquireInFlight, listSessions, markDirty, peekSession, releaseInFlight, withSessionLock, type Session } from "./session.js";
+import { acquireInFlight, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, withSessionLock, type Session } from "./session.js";
 import { ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, PROXY_TOOL_NAMES } from "./compress-tool.js";
 import { executeProxyTool } from "./loop/core.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
@@ -297,6 +297,33 @@ export function handlePluginRegister(payload: string, res: import("node:http").S
     const agent = typeof parsed.agent === "string" && parsed.agent.trim() ? parsed.agent.trim() : "launcher";
     queuePluginRegister(conversationId, agent, parsed.identity === true);
     res.end(JSON.stringify({ ok: true, conversationId, agent }));
+}
+
+export function handlePluginCompact(payload: string, res: import("node:http").ServerResponse): void {
+    let parsed: { conversationId?: unknown };
+    try {
+        parsed = JSON.parse(payload) as { conversationId?: unknown };
+    } catch {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "invalid JSON body" }));
+        return;
+    }
+    const conversationId = typeof parsed.conversationId === "string" ? parsed.conversationId.trim() : "";
+    if (!conversationId) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "conversationId is required" }));
+        return;
+    }
+    const entry = conversations.get(conversationId);
+    const session = entry ? peekSession(entry.sessionId) : undefined;
+    if (!entry || !session) {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: false, error: "unknown plugin conversation (no model request has arrived with this conversation id yet)" }));
+        return;
+    }
+    markCompactionBoundary(session);
+    entry.lastSeen = Date.now();
+    res.end(JSON.stringify({ ok: true, conversationId }));
 }
 
 export function handlePluginManifest(res: import("node:http").ServerResponse): void {

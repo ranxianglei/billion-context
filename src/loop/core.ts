@@ -8,7 +8,7 @@ import {
     type CoreMessage,
     type NudgeDecision,
 } from "acp-kernel";
-import { lastCompressSuffix, type Session } from "../session.js";
+import { lastCompressSuffix, preCompactionArchiveOf, type Session } from "../session.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import {
     parseCompressInput,
@@ -148,6 +148,8 @@ function handleAcpStatus(args: Record<string, unknown>, ctx: LoopCtx): string {
     const nudge = ctx.nudge;
     const ranges = nudge?.compressibleRanges ?? [];
     const protectedRanges = nudge?.protectedRanges ?? [];
+    const archive = preCompactionArchiveOf(ctx.session);
+    const archivedIds = Object.keys(archive);
     const extra: string[] = [];
     if (nudge) {
         extra.push("");
@@ -156,6 +158,13 @@ function handleAcpStatus(args: Record<string, unknown>, ctx: LoopCtx): string {
     if (ranges.length > 0 || protectedRanges.length > 0) {
         extra.push("");
         extra.push(formatRanges(ranges, protectedRanges));
+    }
+    if (archivedIds.length > 0) {
+        extra.push("");
+        extra.push(`PRE-COMPACTION ARCHIVE — ${archivedIds.length} block(s): content was replaced by the client's native compaction summary, so it is no longer in the session history and decompress is unavailable.`);
+        for (const id of archivedIds) {
+            extra.push(`  ${id} — ${archive[id].reason}`);
+        }
     }
     return extra.length > 0 ? `${base}\n${extra.join("\n")}` : base;
 }

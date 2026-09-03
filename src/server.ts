@@ -41,7 +41,7 @@ import {
     conversationSignalResponses,
     subagentNamespace,
 } from "acp-kernel/wire";
-import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages } from "./session.js";
+import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive } from "./session.js";
 import { COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withStagedCompressGuidance } from "./compress-tool.js";
 import { rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
@@ -64,7 +64,7 @@ import { observeResponsesTerminalState } from "./stream-terminal.js";
 import { emitStreamError } from "./stream-error.js";
 import { affinityToken, clientConversationHeader, codexTurnIdentity, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
-import { consumePluginRegisterFor, flushConversations, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
+import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import { systemToUser, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, shouldReserveOutputHeadroom, usageTotals, type WireProtocol } from "./util.js";
@@ -754,6 +754,17 @@ async function handle(
             return;
         }
     }
+    if (req.method === "POST" && req.url === "/__bili/plugin/compact") {
+        try {
+            const body = await readBody(req);
+            handlePluginCompact(body.toString("utf8"), res);
+            return;
+        } catch (err) {
+            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: String(err) }));
+            return;
+        }
+    }
     // Unknown /__bili/ or /__acp/ path → 404 locally. These are bili's own
     // management prefixes; forwarding would leak the internal path to the
     // upstream (which 403s it) — #346.
@@ -1429,6 +1440,7 @@ function prepareAnthropic(
         // estimates to the kernel.
         extractSystem(parsed.system);
         const tokenCount = session.stats.lastInputTokens;
+        const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
         // The fold from last turn's compress has now materialized in state —
@@ -1448,6 +1460,7 @@ function prepareAnthropic(
         const willInjectNudge = opts.compress.injectNudge && !!turn.nudge?.shouldInject;
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
         processedMessages = stripKernelSummaries(turn.messages, turn.state);
+        applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = coreToAnthropic(processedMessages as BiliMessage[], cacheControls);
 
@@ -1529,6 +1542,7 @@ function prepareOpenai(
         // tokenCount = upstream's real input_tokens from the previous turn
         // (see anthropic branch comment). Never an estimate.
         const tokenCount = session.stats.lastInputTokens;
+        const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
         const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
         // The fold from last turn's compress has now materialized in state —
@@ -1548,6 +1562,7 @@ function prepareOpenai(
         const willInjectNudge = opts.compress.injectNudge && !!turn.nudge?.shouldInject && shouldInject;
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
         processedMessages = stripKernelSummaries(turn.messages, turn.state);
+        applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = systemToUser(coreToOpenai(processedMessages as BiliMessage[]));
 
