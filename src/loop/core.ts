@@ -19,6 +19,8 @@ import { resolveDecompress } from "../decompress-shared.js";
 import { buildVisibilityMarker } from "../compress-loop.js";
 import { fetchWithRetry, UpstreamHttpError } from "../fetch-util.js";
 import { proxyDispatcher } from "../upstream-proxy.js";
+import { noteWeakOverflow } from "../weak-overflow.js";
+import { warnCacheCollapse } from "../cache-warn.js";
 import { log as loggerLog } from "../logger.js";
 import type { WireProtocol } from "../util.js";
 
@@ -199,6 +201,7 @@ function recordUsage(
     if (typeof out === "number") ctx.session.stats.outputTokens += out;
     const hitPct =
         typeof cached === "number" && total > 0 ? Math.round((cached / total) * 100) : 0;
+    warnCacheCollapse(ctx.session, total, cached ?? 0);
     ctx.log(
         `[acp-usage] round ${round} input=${total} cached=${cached ?? 0} (cache hit ${hitPct}%)`,
     );
@@ -521,6 +524,18 @@ export async function* runCompressLoop(
             // blind to why it failed. MAX_LOOP_ROUNDS bounds runaway loops.
             const reRequest = proxyResults.length > 0 && realCalls === 0;
             if (!reRequest) {
+                // #498: a stream that cut without a completion event is a weak
+                // overflow signal (sglang-style backends accept an oversized
+                // prompt then die mid-stream). Both shapes: !sawDone (chat /
+                // anthropic) and truncatedDone (responses synthetic failed done).
+                if (!sawDone || truncatedDone) {
+                    const reqModel = typeof requestBody["model"] === "string" ? requestBody["model"] : undefined;
+                    noteWeakOverflow(ctx.session, {
+                        inputTokens: usage.inputTokens,
+                        model: reqModel,
+                        reason: `round ${round}: upstream stream truncated without a completion event`,
+                    });
+                }
                 if (!sawDone) {
                     const partialText = assistantText.length;
                     const partialReasoning = assistantReasoning.length;
@@ -589,6 +604,12 @@ export async function* runCompressLoop(
                 const suffix = e.attempts > 1 ? ` after ${e.attempts} attempt(s)` : "";
                 ctx.log(`[acp-proxy: compress loop upstream error ${e.status}${suffix}: ${e.body.slice(0, 200)}]`);
                 loggerLog("error", `[acp-loop] upstream error ${e.status}${suffix}: ${e.body.slice(0, 200)}`);
+                const reqModel = typeof requestBody["model"] === "string" ? requestBody["model"] : undefined;
+                noteWeakOverflow(ctx.session, {
+                    inputTokens: usage.inputTokens,
+                    model: reqModel,
+                    reason: `round ${round}: upstream error ${e.status}${suffix}`,
+                });
                 yield adapter.emitError(`upstream error ${e.status}${suffix}: ${e.body.slice(0, 200)}`);
                 return;
             }
