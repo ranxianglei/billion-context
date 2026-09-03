@@ -267,10 +267,10 @@ function registryLookup(reg: RegistryShape | null, model: string, host?: string)
     // "deepseek-v4-flash" is stored as "deepseek/deepseek-v4-flash"). Scan
     // */<model> and take the MAXIMUM window across matches when they
     // disagree: a conflicting value used to return undefined (silent static
-    // fallback, typically 200K) — max is never smaller than any deployment
-    // and never below what the fallback would have produced, so the safer
-    // direction is to keep the largest declared window. Conflicts are logged
-    // once per model. Known-provider hosts keep the old behavior: a miss there
+    // fallback, typically 200K). Max is never smaller than any single
+    // declared deployment, so compression thresholds never fire earlier
+    // than some real deployment would allow. Conflicts are logged once per
+    // model. Known-provider hosts keep the old behavior: a miss there
     // means the model is genuinely unlisted for that provider.
     if (provider === undefined) {
         const suffix = `/${model}`;
