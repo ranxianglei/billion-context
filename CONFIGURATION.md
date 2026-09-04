@@ -634,6 +634,10 @@ Compression state (blocks, summaries, original message cache) lives **in the pro
 - If you point the client back at the real upstream (or stop the proxy), the client replays its **full local history** every turn. After a long compressed session this can exceed the model's context window (`context_window_exceeded`).
 - There is no way to "unpack" a compression block into the client's local history — the client never saw the compressed form.
 
+### Storage lifecycle at boot (#401)
+
+The proxy boots session storage with a **single** directory walk+parse (load and the one-time #286 identity migration run over the same parsed map). Sessions are kept permanently — the design goal is that a year-long conversation is never lost — so there is no retention or size-budget pruning. The #286 migration writes a `.bili-migration-286.done` marker after its first pass, so it never re-scans or re-logs on later boots.
+
 ### Migrating off the proxy
 
 Export the session and paste it into a fresh conversation as a handoff:

@@ -1,11 +1,12 @@
 import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import * as path from "node:path";
 import { StateStore, flatFileNameFor, type PersistedEnvelope } from "acp-kernel/persist";
 import { sessionsDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { createInitialState, type CompressionState, type CoreMessage } from "acp-kernel";
-import type { Session, BlockContent } from "./session.js";
+import type { Session, BlockContent, BlockView } from "./session.js";
 
 /**
  * On-disk persistence for proxy sessions.
@@ -59,6 +60,9 @@ import type { Session, BlockContent } from "./session.js";
  */
 
 const PERSIST_VERSION = 3;
+/** Dotfile (invisible to the kernel's .json walk): written after the first
+ *  successful #286 migration pass so later boots skip the scan entirely. */
+const MIGRATION_MARKER = ".bili-migration-286.done";
 
 interface PersistedSession {
     version: number;
@@ -199,6 +203,22 @@ export class SessionStore {
         return out;
     }
 
+    /** Single-pass boot (#401): ONE loadAll walk+parse, then the #286
+     *  identity migration over the SAME parsed map (no extra directory
+     *  walk), then hydration into Sessions. initSessions calls this instead
+     *  of migrateLegacyIds()+loadAll(), which walked and parsed the whole
+     *  tree twice per start. */
+    async boot(): Promise<Map<string, Session>> {
+        if (!this.enabled) return new Map();
+        const loaded = await this.store.loadAll();
+        await this.applyLegacyMigration(loaded);
+        const out = new Map<string, Session>();
+        for (const [id, envelope] of loaded) {
+            out.set(id, buildSession(envelope.payload));
+        }
+        return out;
+    }
+
     /** One-time migration for the #286 identity change: sessions persisted
      *  under the old derived hash id are re-keyed to the client-provided
      *  conversation value stored in meta.label (which is now the session id
@@ -207,10 +227,27 @@ export class SessionStore {
      *  session, are deleted. Records without a label cannot be mapped and are
      *  left in place (they load under their old id but are never requested
      *  again — the new proxy 400s anonymous requests). Self-terminating:
-     *  after one pass no loaded id differs from its label. */
+     *  after one pass no loaded id differs from its label. A completion
+     *  marker makes it run ONCE EVER (#401): the old code re-scanned the tree
+     *  on every boot because unlabeled files are intentionally kept, so the
+     *  "one-time" log line repeated forever. */
     async migrateLegacyIds(): Promise<void> {
         if (!this.enabled) return;
+        if (existsSync(this.markerPath())) return;
         const loaded = await this.store.loadAll();
+        await this.applyLegacyMigration(loaded);
+    }
+
+    private markerPath(): string {
+        return path.join(this.dir, MIGRATION_MARKER);
+    }
+
+    private async applyLegacyMigration(loaded: Map<string, PersistedEnvelope<PersistedSession>>): Promise<void> {
+        // Marker gate lives HERE (not just in migrateLegacyIds) because boot()
+        // invokes this directly — unlabeled files are intentionally kept
+        // forever, so without the gate the "one-time" pass would re-run and
+        // re-log on every single start (#401 root cause 3).
+        if (existsSync(this.markerPath())) return;
         const claimed = new Set<string>();
         const byLabel = new Map<string, { id: string; savedAt: number; session: Session }>();
         let unlabeled = 0;
@@ -234,23 +271,39 @@ export class SessionStore {
             }
             const prev = byLabel.get(label);
             if (!prev || envelope.savedAt >= prev.savedAt) {
-                if (prev) await this.removeLegacyFile(prev.id, prev.session);
+                if (prev) {
+                    await this.removeLegacyFile(prev.id, prev.session);
+                    loaded.delete(prev.id);
+                }
                 byLabel.set(label, { id, savedAt: envelope.savedAt, session });
             } else {
                 await this.removeLegacyFile(id, session);
+                loaded.delete(id);
             }
         }
         let rekeyed = 0;
         for (const [label, { id, session }] of byLabel) {
             if (claimed.has(label)) {
                 await this.removeLegacyFile(id, session);
+                loaded.delete(id);
                 continue;
             }
             session.id = label;
             await this.store.writeNow(label, () => buildRecord(session));
             await this.removeLegacyFile(id, session);
+            const envelope = loaded.get(id);
+            if (envelope) {
+                loaded.set(label, { ...envelope, id: label, payload: { ...envelope.payload, id: label } });
+            }
+            loaded.delete(id);
             claimed.add(label);
             rekeyed++;
+        }
+        try {
+            mkdirSync(this.dir, { recursive: true });
+            writeFileSync(this.markerPath(), String(Date.now()), "utf8");
+        } catch {
+            // Read-only dir — migration re-runs next boot (it is idempotent).
         }
         if (rekeyed || unlabeled) {
             loggerLog("info", `[persist] one-time migration (#286): rekeyed ${rekeyed} legacy session(s), left ${unlabeled} unlabeled legacy file(s) in place`);
@@ -349,10 +402,24 @@ function buildRecord(session: Session): PersistedSession {
     };
 }
 
+function isBlockView(v: unknown): v is BlockView {
+    return !!v && typeof v === "object" && typeof (v as BlockView).text === "string" && typeof (v as BlockView).count === "number";
+}
+
 function buildSession(parsed: PersistedSession): Session {
     const blockContents = new Map<string, BlockContent>();
     for (const [bid, content] of Object.entries(parsed.blockContents ?? {})) {
-        if (content && typeof content === "object") blockContents.set(bid, content);
+        if (!content || typeof content !== "object") continue;
+        const full = (content as Record<string, unknown>).full;
+        if (!isBlockView(full)) continue;
+        // Legacy files stored byte-identical one/full pairs (#401); normalize
+        // to the single-copy form on load so the next write persists it once.
+        const one = (content as Record<string, unknown>).one;
+        const oneView = isBlockView(one) ? one : null;
+        blockContents.set(bid, {
+            one: oneView && !(oneView.text === full.text && oneView.count === full.count) ? oneView : null,
+            full,
+        });
     }
     // Read grouped shape (v2+); fall back to flat fields for v1 files.
     const meta = parsed.meta ?? {};

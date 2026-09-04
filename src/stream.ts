@@ -83,13 +83,17 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // work in later rounds where ctx.messages no longer carries the originals.
         // Two views are cached so decompress can honor the `full` flag: `one`
         // (direct messages + nested child summaries) and `full` (all originals).
+        // Leaf blocks have no active nested children, so both kernel paths
+        // emit byte-identical text — persist a single copy in that case
+        // (#401: the duplicate was 50% of blockContents bytes on disk).
         for (const b of res.state.blocks) {
             if (beforeIds.has(b.blockId)) continue;
             const full = collectBlockContent(res.state, b, ctx.messages, { full: true });
             const one = collectBlockContent(res.state, b, ctx.messages, { full: false });
             if (full.count > 0 || one.count > 0) {
+                const sameView = one.text === full.text && one.count === full.count;
                 cacheBlockContent(ctx.session, b.blockId, {
-                    one: { text: one.text, count: one.count },
+                    one: sameView ? null : { text: one.text, count: one.count },
                     full: { text: full.text, count: full.count },
                 });
             }
