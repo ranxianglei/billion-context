@@ -656,6 +656,41 @@ test("ensureProxyRunning: dead recorded pid is ignored (no attach)", async () =>
     assert.equal(spawnCalls, 1);
 });
 
+test("ensureProxyRunning: port 0 (no explicit --port) spawns on an OS-assigned ephemeral port (#446)", async () => {
+    let spawnedArgs: string[] | null = null;
+    const spawnImpl: SpawnFn = (_cmd, args) => {
+        spawnedArgs = [...args];
+        return makeFakeChild(42437);
+    };
+    const handle = await ensureProxyRunning(
+        { host: "127.0.0.1", port: 0, passthrough: false, debug: false },
+        { fetchImpl: async () => ({ ok: true }), spawnImpl, sleep: () => Promise.resolve(), readInstanceFile: () => undefined },
+    );
+    assert.ok(spawnedArgs !== null);
+    const portIdx = spawnedArgs.indexOf("--port");
+    assert.ok(portIdx >= 0, "spawn args include --port");
+    const childPort = Number(spawnedArgs[portIdx + 1]);
+    assert.ok(Number.isInteger(childPort) && childPort >= 1024 && childPort <= 65535, `ephemeral port assigned, got ${childPort}`);
+    assert.equal(handle.port, childPort);
+    assert.equal(handle.origin, `http://127.0.0.1:${childPort}`);
+});
+
+test("ensureProxyRunning: explicit port is honored verbatim (no ephemeral reassignment)", async () => {
+    let spawnedArgs: string[] | null = null;
+    const spawnImpl: SpawnFn = (_cmd, args) => {
+        spawnedArgs = [...args];
+        return makeFakeChild(42438);
+    };
+    const handle = await ensureProxyRunning(
+        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
+        { fetchImpl: async () => ({ ok: true }), spawnImpl, sleep: () => Promise.resolve(), readInstanceFile: () => undefined },
+    );
+    assert.ok(spawnedArgs !== null);
+    const portIdx = spawnedArgs.indexOf("--port");
+    assert.equal(spawnedArgs[portIdx + 1], "8787");
+    assert.equal(handle.port, 8787);
+});
+
 test("ensureProxyRunning: launchToken handshake returns the child's real port (#407)", async () => {
     let handshaked: InstanceFile | undefined;
     const spawnImpl: SpawnFn = (_cmd, _args, options) => {
@@ -2090,7 +2125,9 @@ test("runLaunch dsh: DSH_HOME overlay + DEEPSEEK_BASE_URL env, real home untouch
     try {
         await runLaunch(
             { client: "dsh", clientArgs: ["--profile", "headless", "task"], overrides: {} },
-            { fetchImpl: async () => ({ ok: true }), spawnImpl, sleep: () => Promise.resolve() },
+            // hermetic: never attach to / handshake against a real proxy
+            // whose instance file happens to live on this machine
+            { fetchImpl: async () => ({ ok: true }), spawnImpl, sleep: () => Promise.resolve(), readInstanceFile: () => undefined },
         );
         assert.equal(envSeen.length, 1);
         const seenEnv = envSeen[0];

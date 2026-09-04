@@ -82,7 +82,6 @@ export {
 } from "./client-config.js";
 
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
-export const LAUNCHER_DEFAULT_PORT = 8787;
 export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "pi-test"] as const;
 export type ClientName = (typeof LAUNCH_CLIENTS)[number];
 export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh";
@@ -1734,6 +1733,20 @@ export function findFreePort(preferred: number, host = LAUNCHER_DEFAULT_HOST): P
     });
 }
 
+export function pickEphemeralPort(host = LAUNCHER_DEFAULT_HOST): Promise<number> {
+    return new Promise((resolve, reject) => {
+        const srv = net.createServer();
+        srv.once("error", reject);
+        srv.listen(0, host, () => {
+            const addr = srv.address();
+            srv.close(() => {
+                if (addr && typeof addr === "object") resolve(addr.port);
+                else reject(new Error("could not allocate a free port"));
+            });
+        });
+    });
+}
+
 const INHERITED_PROXY_VARS = ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"];
 
 export function stripInheritedProxy(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -1773,7 +1786,11 @@ export async function ensureProxyRunning(
     // itself and retries on EADDRINUSE, reporting the real origin through
     // the instance file via this launchToken.
     const launchToken = randomUUID();
-    const port = opts.port;
+    // #446: with no explicit --port the launcher binds an OS-assigned
+    // ephemeral port — its private proxy never squats on 8787, so clients
+    // pointed there only ever reach an explicitly-started `bili start`.
+    // The child's EADDRINUSE retry covers the pick/spawn race.
+    const port = opts.port > 0 ? opts.port : await pickEphemeralPort(opts.host);
     const script = process.argv[1];
     if (!script) throw new Error("bili: cannot resolve launcher script path");
     const logPath = path.join(os.tmpdir(), `bili-proxy-${port}.log`);
@@ -1782,7 +1799,7 @@ export async function ensureProxyRunning(
     try {
         child = spawnImpl(
             process.execPath,
-            [script, ...proxyStartArgs(opts)],
+            [script, ...proxyStartArgs({ ...opts, port })],
             {
                 detached: true,
                 stdio: ["ignore", logFd, logFd],
@@ -1924,8 +1941,10 @@ export interface RunLaunchParams {
 }
 
 function parsePort(raw: string | undefined): number {
-    const port = raw && raw.trim() ? parseInt(raw, 10) : LAUNCHER_DEFAULT_PORT;
-    if (!Number.isFinite(port) || port <= 0 || port > 65535) {
+    // 0 = no explicit --port → spawn on an OS-assigned ephemeral port (#446)
+    if (!raw || !raw.trim()) return 0;
+    const port = parseInt(raw, 10);
+    if (!Number.isFinite(port) || port < 1 || port > 65535) {
         console.error(`bili: invalid --port "${raw}"`);
         process.exit(2);
     }

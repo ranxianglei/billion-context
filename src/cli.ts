@@ -103,7 +103,7 @@ Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili h
 Options (override config file / env):
   -F <url>                         upstream proxy to forward through (gost-style;
                                    http://host:port; must precede the client name)
-  --port <N>                       listen port (default 8787)
+  --port <N>                       listen port (start: 8787; launcher default: random free port)
   --host <ADDR>                    listen host (default 127.0.0.1)
   --mitm-domain <domain>           extra MITM domain (repeatable; launcher only)
   --config <FILE>                  path to config JSON (default: XDG location)
