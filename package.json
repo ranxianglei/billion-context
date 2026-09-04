@@ -29,7 +29,8 @@
     "codex",
     "aider",
     "anthropic",
-    "openai"
+    "openai",
+    "pi-package"
   ],
   "license": "MIT",
   "author": "ranxianglei",
