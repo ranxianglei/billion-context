@@ -118,6 +118,19 @@ export interface LaunchOptions {
      *  BILI_LAUNCHER_MODEL_WINDOWS so the nudge denominator matches the
      *  client's real window instead of the built-in table guess. */
     modelWindows?: Record<string, number>;
+    /** Skip the attach-to-existing step: always spawn a fresh, owned
+     *  instance (per-session isolation for `bili daemon`, #518). */
+    fresh?: boolean;
+    /** Per-session handshake file: passed to the child as BILI_RESULT_FILE;
+     *  the child writes its bind record there after a successful listen and
+     *  this caller polls ONLY that file (concurrent daemons must not clobber
+     *  each other's handshake through the single global instance file). */
+    resultFile?: string;
+    /** Host process to watch via BILI_PARENT_PID (#414 parent-gone reaping).
+     *  undefined → this process (launcher semantics); null → no watcher env
+     *  at all (daemon without --parent-pid; defaulting to the daemon's own
+     *  pid would suicide the proxy within 2s). */
+    parentPid?: number | null;
 }
 
 export interface ProxyHandle {
@@ -1591,6 +1604,24 @@ async function probeExistingInstance(
     return inst;
 }
 
+/** Bind-0 probe: ask the kernel for an ephemeral port on `host`. The port
+ *  may be stolen before the proxy child binds it — the child's EADDRINUSE
+ *  retry (#407) plus the launch-token handshake reporting the REAL origin
+ *  make the race harmless. */
+export function allocateDynamicPort(host = LAUNCHER_DEFAULT_HOST): Promise<number> {
+    return new Promise((resolve, reject) => {
+        const srv = net.createServer();
+        srv.once("error", reject);
+        srv.listen(0, host, () => {
+            const addr = srv.address();
+            srv.close(() => {
+                if (addr && typeof addr === "object") resolve(addr.port);
+                else reject(new Error("could not allocate a free port"));
+            });
+        });
+    });
+}
+
 export function findFreePort(preferred: number, host = LAUNCHER_DEFAULT_HOST): Promise<number> {
     const tryBind = (port: number): Promise<boolean> =>
         new Promise((resolve) => {
@@ -1599,20 +1630,7 @@ export function findFreePort(preferred: number, host = LAUNCHER_DEFAULT_HOST): P
             srv.once("listening", () => srv.close(() => resolve(true)));
             srv.listen(port, host);
         });
-    return tryBind(preferred).then((free) => {
-        if (free) return preferred;
-        return new Promise<number>((resolve, reject) => {
-            const srv = net.createServer();
-            srv.once("error", reject);
-            srv.listen(0, host, () => {
-                const addr = srv.address();
-                srv.close(() => {
-                    if (addr && typeof addr === "object") resolve(addr.port);
-                    else reject(new Error("could not allocate a free port"));
-                });
-            });
-        });
-    });
+    return tryBind(preferred).then((free) => (free ? Promise.resolve(preferred) : allocateDynamicPort(host)));
 }
 
 const INHERITED_PROXY_VARS = ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"];
@@ -1643,11 +1661,14 @@ export async function ensureProxyRunning(
 
     // #394/#417: a healthy proxy with a compatible config is SHARED, not
     // doubled — two concurrent launches of the same client would otherwise
-    // spawn two writers over one sessions dir.
-    const existing = await probeExistingInstance(readInstance, fetchHealthInfo);
-    if (existing && instanceCompatible(existing, opts)) {
-        console.error(`bili: attaching to running proxy at ${existing.origin} (pid ${existing.pid})`);
-        return { origin: existing.origin, port: existing.port, attached: true };
+    // spawn two writers over one sessions dir. fresh (#518 daemon) skips this:
+    // per-session instances must never attach to someone else's proxy.
+    if (!opts.fresh) {
+        const existing = await probeExistingInstance(readInstance, fetchHealthInfo);
+        if (existing && instanceCompatible(existing, opts)) {
+            console.error(`bili: attaching to running proxy at ${existing.origin} (pid ${existing.pid})`);
+            return { origin: existing.origin, port: existing.port, attached: true };
+        }
     }
 
     // #407: no probe-release-rebind. The child binds the preferred port
@@ -1670,7 +1691,8 @@ export async function ensureProxyRunning(
                 env: {
                     ...stripInheritedProxy(process.env),
                     BILI_LAUNCH_TOKEN: launchToken,
-                    BILI_PARENT_PID: String(process.pid),
+                    ...(opts.parentPid === null ? {} : { BILI_PARENT_PID: String(opts.parentPid ?? process.pid) }),
+                    ...(opts.resultFile ? { BILI_RESULT_FILE: opts.resultFile } : {}),
                     ...(opts.mitmDomains && opts.mitmDomains.length
                         ? { BILI_MITM_DOMAINS: opts.mitmDomains.join(",") }
                         : {}),
@@ -1689,10 +1711,16 @@ export async function ensureProxyRunning(
         child.unref?.();
     } catch {}
 
+    // With a resultFile the child reports into OUR file (BILI_RESULT_FILE),
+    // so concurrent daemons never clobber each other's handshake through the
+    // single global instance file (#518).
+    const readHandshake = (): ReturnType<typeof readProxyInstanceFile> =>
+        opts.resultFile ? readProxyInstanceFile(opts.resultFile) : readInstance();
+
     const deadline = now() + SPAWN_WAIT_MS;
     while (now() < deadline) {
         await sleepImpl(HEALTH_POLL_INTERVAL_MS);
-        const inst = readInstance();
+        const inst = readHandshake();
         if (isProxyInstanceFile(inst) && inst.launchToken === launchToken) {
             if (await probeHealth(inst.origin, fetchImpl)) {
                 return { origin: inst.origin, port: inst.port, child, logPath };
@@ -1732,6 +1760,89 @@ export function stopProxy(handle: ProxyHandle): void {
     try {
         child.kill?.();
     } catch {}
+}
+
+export interface DaemonParams {
+    overrides: Record<string, string | undefined>;
+    mitmDomains?: string[];
+    /** Host agent's pid for BILI_PARENT_PID reaping (#414). Omitted → the
+     *  child gets NO watcher env (never defaults to this process: the daemon
+     *  exits right away and would suicide the proxy within 2s). */
+    parentPid?: number;
+}
+
+export interface DaemonResult {
+    origin: string;
+    port: number;
+    pid: number;
+    logPath?: string;
+}
+
+export async function spawnDaemonProxy(
+    opts: {
+        host: string;
+        port?: number;
+        passthrough: boolean;
+        debug: boolean;
+        mitmDomains?: string[];
+        parentPid?: number | null;
+        resultFile?: string;
+    },
+    deps: LauncherDeps = {},
+): Promise<DaemonResult> {
+    const port = opts.port ?? (await allocateDynamicPort(opts.host));
+    const handle = await ensureProxyRunning(
+        {
+            host: opts.host,
+            port,
+            passthrough: opts.passthrough,
+            debug: opts.debug,
+            mitmDomains: opts.mitmDomains,
+            fresh: true,
+            resultFile: opts.resultFile,
+            parentPid: opts.parentPid,
+        },
+        deps,
+    );
+    if (!handle.child || handle.child.pid === undefined) {
+        throw new Error("bili daemon: proxy handle has no child pid");
+    }
+    return { origin: handle.origin, port: handle.port, pid: handle.child.pid, logPath: handle.logPath };
+}
+
+export async function runDaemon(params: DaemonParams, deps: LauncherDeps = {}): Promise<void> {
+    const host = params.overrides.ACP_HOST?.trim() || LAUNCHER_DEFAULT_HOST;
+    const rawPort = params.overrides.ACP_PORT ?? process.env.ACP_PORT;
+    const port = rawPort && rawPort.trim() ? parsePort(rawPort) : undefined;
+    const passthrough = params.overrides.ACP_PASSTHROUGH === "1";
+    const debug = params.overrides.ACP_DEBUG === "1";
+
+    const envParent = parseInt(process.env.BILI_PARENT_PID ?? "", 10);
+    const hostPid = params.parentPid ?? (!Number.isNaN(envParent) && envParent > 0 ? envParent : undefined);
+    if (hostPid === undefined) {
+        console.error("bili daemon: no --parent-pid given — the proxy keeps running after this command exits (no auto-stop)");
+    }
+
+    const resultFile = path.join(os.tmpdir(), `bili-daemon-${randomUUID()}.json`);
+    try {
+        const res = await spawnDaemonProxy(
+            { host, port, passthrough, debug, mitmDomains: params.mitmDomains, parentPid: hostPid ?? null, resultFile },
+            deps,
+        );
+        try {
+            fs.unlinkSync(resultFile);
+        } catch {}
+        // Single-line JSON on stdout is a machine contract (#518) — keep stdout
+        // free of anything else. exitCode (not process.exit) so the pipe flushes.
+        process.stdout.write(`${JSON.stringify(res)}\n`);
+        process.exitCode = 0;
+    } catch (err) {
+        try {
+            fs.unlinkSync(resultFile);
+        } catch {}
+        console.error(`bili daemon: ${err instanceof Error ? err.message : String(err)}`);
+        process.exitCode = 1;
+    }
 }
 
 export function runClient(

@@ -211,6 +211,28 @@ bili --no-auto-update        # disable self-update for this run
 
 Flags override env vars and the config file. `bili --help` lists them all.
 
+### Per-session proxy (`bili daemon`)
+
+Agent-side plugins can start a dedicated, isolated proxy per session instead of
+sharing one long-lived instance:
+
+```bash
+bili daemon --parent-pid <agent-pid>
+# stdout: {"origin":"http://127.0.0.1:<port>","port":<port>,"pid":<pid>,"logPath":"…"}
+# exit 0 on success; non-zero + stderr explanation on failure
+```
+
+- The port is allocated dynamically (ephemeral bind-0 probe). An explicit
+  `--port` / `ACP_PORT` is preferred first, with automatic fallback on conflict.
+- A fresh instance is **always** started — it never attaches to an existing
+  proxy, so sessions stay isolated from each other.
+- With `--parent-pid` (or an inherited `BILI_PARENT_PID`), the proxy stops
+  itself when that process exits — the same mechanism `bili <client>` uses.
+  Without it, a warning is printed and the proxy keeps running until killed.
+- Concurrency-safe: daemons handshakes through a per-session result file, so
+  parallel daemons never clobber each other. The global instance file is still
+  written (last-writer-wins) for MCP-shell/install discovery.
+
 ### Remote agents (`--host`)
 
 By default the proxy binds `127.0.0.1` and only accepts loopback

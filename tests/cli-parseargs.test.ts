@@ -33,3 +33,32 @@ test("parseArgs: -F composes with other bili flags before the client (#346)", ()
     assert.equal(r.overrides.BILI_UPSTREAM_PROXY, "http://127.0.0.1:7897");
     assert.deepEqual(r.clientArgs, []);
 });
+
+test("parseArgs: daemon command with --parent-pid (#518)", () => {
+    const r = parseArgs(["daemon", "--parent-pid", "42"]);
+    assert.equal(r.command, "daemon");
+    assert.equal(r.parentPid, 42);
+});
+
+test("parseArgs: bare daemon command has no parent pid (#518)", () => {
+    const r = parseArgs(["daemon"]);
+    assert.equal(r.command, "daemon");
+    assert.equal(r.parentPid, undefined);
+});
+
+test("parseArgs: --parent-pid rejects non-numeric, zero, and missing values (#518)", () => {
+    const prevExit = process.exit;
+    let exited: number | undefined;
+    process.exit = ((code?: number) => {
+        exited = code;
+        throw new Error(`process.exit(${code})`);
+    }) as typeof process.exit;
+    try {
+        for (const bad of [["abc"], ["0"], ["-5"], []]) {
+            assert.throws(() => parseArgs(["daemon", "--parent-pid", ...bad]));
+            assert.equal(exited, 2);
+        }
+    } finally {
+        process.exit = prevExit;
+    }
+});

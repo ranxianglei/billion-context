@@ -51,7 +51,7 @@ import { reapOrphanBlocks } from "./orphan-gc.js";
 import { getStore } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger } from "./logger.js";
 import { defaultLogFile, stateDir } from "./paths.js";
-import { atomicWriteInstanceFile, clearProxyInstanceFile, isPidAlive, registerInstanceAndWarn, unregisterInstance } from "./instance.js";
+import { atomicWriteInstanceFile, clearProxyInstanceFile, isPidAlive, isProxyInstanceFile, readProxyInstanceFile, registerInstanceAndWarn, unregisterInstance } from "./instance.js";
 import { compressLoopResponsesJson } from "./compress-loop-responses.js";
 import { runCompressLoop, pickAdapter } from "./loop/index.js";
 import { containsToolCallXmlFragment } from "./loop/tag-echo-filter.js";
@@ -360,6 +360,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // EADDRINUSE instead of dying, reporting the real origin via the instance
     // file (launchToken match). Manual `bili start` keeps fail-fast semantics.
     const launchToken = process.env.BILI_LAUNCH_TOKEN?.trim();
+    const resultFile = process.env.BILI_RESULT_FILE?.trim() || undefined;
     const MAX_LISTEN_ATTEMPTS = 17;
     let listenAttempts = 0;
     let lastTriedPort = opts.port;
@@ -376,20 +377,24 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         // so the file always holds a valid URL.
         const originHost = opts.host === "0.0.0.0" || opts.host === "::" || opts.host === "localhost" ? "127.0.0.1" : opts.host.includes(":") && !opts.host.startsWith("[") ? `[${opts.host}]` : opts.host;
         const origin = `http://${originHost}:${actualPort}`;
+        const instanceInfo = {
+            origin,
+            instanceId,
+            pid: process.pid,
+            startedAt: instanceStartedAt,
+            host: opts.host,
+            port: actualPort,
+            passthrough: opts.passthrough,
+            mitmDomains: opts.mitm.enabled ? opts.mitm.domains : [],
+            modelWindows: { ...LAUNCHER_MODEL_WINDOWS },
+            launchToken: launchToken || undefined,
+        };
         try {
             fs.mkdirSync(stateDir(), { recursive: true });
-            atomicWriteInstanceFile({
-                origin,
-                instanceId,
-                pid: process.pid,
-                startedAt: instanceStartedAt,
-                host: opts.host,
-                port: actualPort,
-                passthrough: opts.passthrough,
-                mitmDomains: opts.mitm.enabled ? opts.mitm.domains : [],
-                modelWindows: { ...LAUNCHER_MODEL_WINDOWS },
-                launchToken: launchToken || undefined,
-            });
+            atomicWriteInstanceFile(instanceInfo);
+            // Per-session handshake file (#518): daemon parents poll ONLY their
+            // own file, so concurrent daemons never clobber each other's token.
+            if (resultFile) atomicWriteInstanceFile(instanceInfo, resultFile);
         } catch {
             // best-effort discovery hint for host-spawned MCP shells
         }
@@ -464,6 +469,15 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     let shuttingDown = false;
     const finishShutdown = (): void => {
         clearProxyInstanceFile(instanceId);
+        // Per-session handshake file (#518): parents normally delete it right
+        // after the handshake; this covers the parent-died-early case. Guarded
+        // like clearProxyInstanceFile — never unlink a record we don't own.
+        if (resultFile) {
+            try {
+                const rec = readProxyInstanceFile(resultFile);
+                if (isProxyInstanceFile(rec) && rec.instanceId === instanceId) fs.unlinkSync(resultFile);
+            } catch {}
+        }
         unregisterInstance(instanceId);
         closeLogger();
         process.exit(0);

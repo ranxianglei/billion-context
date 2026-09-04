@@ -26,7 +26,7 @@ import { configFile as defaultConfigFile } from "./paths.js";
 import { checkForUpdate, startAutoUpdate } from "./update.js";
 import { runMcpStdio } from "./mcp.js";
 import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, type PluginAgent } from "./plugin-install.js";
-import { runLaunch, runTestPi, isLaunchClient, type ClientName } from "./launcher.js";
+import { runDaemon, runLaunch, runTestPi, isLaunchClient, type ClientName } from "./launcher.js";
 import { exportSession } from "./export.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -69,8 +69,11 @@ Usage:
   bili test pi                     non-polluting pi smoke test through the proxy
   bili export [session] [--full]   list sessions / export one as a Markdown handoff
                                     (--full includes original messages; --output FILE)
-  bili update                      check for & install a newer version now
-  bili plugin install <agent>      install the thin plugin into a host (pi/omp/
+   bili update                      check for & install a newer version now
+   bili daemon [--parent-pid N]     start a per-session proxy on a dynamic port
+                                     (always a fresh instance; prints one JSON line
+                                     {origin,port,pid,logPath} to stdout, exit 0)
+   bili plugin install <agent>      install the thin plugin into a host (pi/omp/
                                     claude/codex/opencode; original backed up once)
   bili plugin remove <agent>       remove it again
   bili plugin list                 show install status for every host
@@ -108,9 +111,11 @@ Options (override config file / env):
   --mitm-domain <domain>           extra MITM domain (repeatable; launcher only)
   --config <FILE>                  path to config JSON (default: XDG location)
   --debug                          verbose logging
-  --passthrough                    forward without compression
-  --no-passthrough                 force compression on (overrides config)
-  --no-auto-update                 disable background self-update this run
+   --passthrough                    forward without compression
+   --no-passthrough                 force compression on (overrides config)
+   --no-auto-update                 disable background self-update this run
+   --parent-pid <N>                 host pid to watch for auto-stop (daemon only;
+                                    also honored from BILI_PARENT_PID env)
 
 Config: ${defaultConfigFile()}
   Set port/host/debug/providers/compress/autoUpdate there. See README §Configuration.
@@ -120,7 +125,7 @@ Docs: https://github.com/ranxianglei/billion-context
 `;
 
 type Parsed = {
-    command: "start" | "update" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp" | "plugin";
+    command: "start" | "update" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp" | "plugin" | "daemon";
     client?: ClientName;
     clientArgs: string[];
     mitmDomains: string[];
@@ -129,6 +134,7 @@ type Parsed = {
     exportOutput?: string;
     exportFull?: boolean;
     registerConversationId?: string;
+    parentPid?: number;
     pluginAction?: "install" | "remove" | "list";
     pluginAgent?: PluginAgent;
 };
@@ -142,6 +148,7 @@ export function parseArgs(argv: string[]): Parsed {
     const mitmDomains: string[] = [];
     let exportSelector: string | undefined;
     let registerConversationId: string | undefined;
+    let parentPid: number | undefined;
     let exportOutput: string | undefined;
     let exportFull = false;
     let pluginAction: Parsed["pluginAction"];
@@ -186,6 +193,15 @@ export function parseArgs(argv: string[]): Parsed {
                     process.exit(2);
                 }
                 mitmDomains.push(val);
+                break;
+            }
+            case "--parent-pid": {
+                const val = argv[++i];
+                if (val === undefined || !/^\d+$/.test(val) || Number(val) <= 0) {
+                    console.error(`bili: ${a} requires a positive integer pid`);
+                    process.exit(2);
+                }
+                parentPid = Number(val);
                 break;
             }
             case "--full":
@@ -247,6 +263,8 @@ export function parseArgs(argv: string[]): Parsed {
             command = command === "help" || command === "version" ? command : "start";
         } else if (cmd === "update") {
             command = "update";
+        } else if (cmd === "daemon") {
+            command = "daemon";
         } else if (cmd === "export") {
             command = "export";
             exportSelector = positional[1];
@@ -291,11 +309,11 @@ export function parseArgs(argv: string[]): Parsed {
         }
     }
 
-    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, registerConversationId, pluginAction, pluginAgent };
+    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, registerConversationId, parentPid, pluginAction, pluginAgent };
 }
 
 export async function main(): Promise<void> {
-    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, registerConversationId, pluginAction, pluginAgent } = parseArgs(process.argv.slice(2));
+    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, registerConversationId, parentPid, pluginAction, pluginAgent } = parseArgs(process.argv.slice(2));
     if (command === "help") {
         process.stdout.write(HELP);
         return;
@@ -388,6 +406,16 @@ export async function main(): Promise<void> {
     }
     if (command === "launch") {
         await runLaunch({ client: client!, clientArgs, mitmDomains, overrides });
+        return;
+    }
+    if (command === "daemon") {
+        // Merge overrides into env BEFORE spawning: the proxy child inherits
+        // this process's env, and the generic merge below runs only on the
+        // server path (which this branch returns ahead of).
+        for (const [k, v] of Object.entries(overrides)) {
+            if (v !== undefined) process.env[k] = v;
+        }
+        await runDaemon({ overrides, mitmDomains, parentPid });
         return;
     }
 
