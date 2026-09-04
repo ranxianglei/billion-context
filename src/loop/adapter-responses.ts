@@ -143,6 +143,7 @@ function rebuildResponsesEvent(type: string, obj: Record<string, unknown>): Buff
 
 async function* iterSseEvents(stream: ReadableStream<Uint8Array>): AsyncGenerator<string> {
     const reader = stream.getReader();
+    const decoder = new TextDecoder();
     let buf = "";
     try {
         while (true) {
@@ -154,7 +155,7 @@ async function* iterSseEvents(stream: ReadableStream<Uint8Array>): AsyncGenerato
                 break;
             }
             if (done) break;
-            buf += new TextDecoder().decode(value, { stream: true });
+            buf += decoder.decode(value, { stream: true });
             buf = buf.replace(/\r\n|\r/g, "\n");
             let idx: number;
             while ((idx = buf.indexOf("\n\n")) >= 0) {
