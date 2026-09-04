@@ -18,6 +18,7 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { resolvePiHome } from "./client-config.js";
 import { isPidAlive, isProxyInstanceFile, readProxyInstanceFile } from "./instance.js";
+import { stateDir } from "./paths.js";
 
 /** #403: never freeze a dead or unverifiable origin into a client's
  *  persistent config — the MCP shell would dial it forever. An explicit
@@ -451,22 +452,70 @@ function opencodeStatus(): string {
     return mcp && "bili" in mcp ? "installed" : "not installed";
 }
 
+// — native mode marker (#519) ————————————————————————————————————————
+// `bili plugin install <agent> --native` records that the extension may start
+// its own per-session proxy (`bili daemon --fresh`) when no launcher proxy is
+// detected. The key must stay in step with readNativeMarker() in
+// src/agent/pi.ts: <stateDir>/native.json, one boolean per agent.
+
+// Native spawning lives in the bundled extension (src/agent/pi.ts factory).
+// Only agents whose fetch interception has been validated may opt in; the MCP
+// shells (claude/codex/opencode) have no in-process hook at all.
+const NATIVE_CAPABLE_AGENTS: readonly PluginAgent[] = ["pi"];
+
+function nativeMarkerFile(): string {
+    return path.join(stateDir(), "native.json");
+}
+
+function readNativeMarkers(): Record<string, unknown> {
+    try {
+        const obj: unknown = JSON.parse(fs.readFileSync(nativeMarkerFile(), "utf8"));
+        if (obj !== null && typeof obj === "object" && !Array.isArray(obj)) return obj as Record<string, unknown>;
+    } catch {
+        // missing or corrupt → treat as empty
+    }
+    return {};
+}
+
+function setNativeMarker(agent: PluginAgent, enabled: boolean): void {
+    if (readNativeMarkers()[agent] === enabled) return;
+    const markers = readNativeMarkers();
+    if (enabled) markers[agent] = true;
+    else delete markers[agent];
+    const file = nativeMarkerFile();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    backupOnce(file);
+    fs.writeFileSync(file, JSON.stringify(markers, null, 2) + "\n");
+}
+
+function nativeEnabled(agent: PluginAgent): boolean {
+    return readNativeMarkers()[agent] === true;
+}
+
 // — dispatch ————————————————————————————————————————————————————————————
 
 export function isPluginAgent(value: string): value is PluginAgent {
     return (PLUGIN_AGENTS as readonly string[]).includes(value);
 }
 
-export function pluginInstall(agent: PluginAgent): string {
-    return agent === "pi" ? piInstall() : agent === "omp" ? ompInstall() : agent === "claude" ? claudeInstall() : agent === "codex" ? codexInstall() : opencodeInstall();
+export function pluginInstall(agent: PluginAgent, opts?: { native?: boolean }): string {
+    const msg = agent === "pi" ? piInstall() : agent === "omp" ? ompInstall() : agent === "claude" ? claudeInstall() : agent === "codex" ? codexInstall() : opencodeInstall();
+    if (opts?.native !== true) return msg;
+    if (!(NATIVE_CAPABLE_AGENTS as readonly string[]).includes(agent)) {
+        throw new Error(`--native supports: ${NATIVE_CAPABLE_AGENTS.join(", ")} (not ${agent})`);
+    }
+    setNativeMarker(agent, true);
+    return `${msg} (native mode enabled)`;
 }
 
 export function pluginRemove(agent: PluginAgent): string {
-    return agent === "pi" ? piRemove() : agent === "omp" ? ompRemove() : agent === "claude" ? claudeRemove() : agent === "codex" ? codexRemove() : opencodeRemove();
+    const msg = agent === "pi" ? piRemove() : agent === "omp" ? ompRemove() : agent === "claude" ? claudeRemove() : agent === "codex" ? codexRemove() : opencodeRemove();
+    setNativeMarker(agent, false);
+    return msg;
 }
 
-export function pluginStatusAll(): Array<{ agent: string; status: string }> {
-    const checks: Array<[string, () => string]> = [
+export function pluginStatusAll(): Array<{ agent: string; status: string; native: boolean }> {
+    const checks: Array<[PluginAgent, () => string]> = [
         ["pi", piStatus],
         ["omp", ompStatus],
         ["claude", claudeStatus],
@@ -475,9 +524,9 @@ export function pluginStatusAll(): Array<{ agent: string; status: string }> {
     ];
     return checks.map(([agent, check]) => {
         try {
-            return { agent, status: check() };
+            return { agent, status: check(), native: nativeEnabled(agent) };
         } catch (err) {
-            return { agent, status: `error: ${err instanceof Error ? err.message : String(err)}` };
+            return { agent, status: `error: ${err instanceof Error ? err.message : String(err)}`, native: nativeEnabled(agent) };
         }
     });
 }
