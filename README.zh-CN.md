@@ -50,44 +50,16 @@ AI 编程助手的<strong>通用上下文压缩代理</strong>
 
 代理向对话注入四个上下文管理工具(`compress`、`decompress`、`search_context`、`acp_status`)。模型在对话增长时调用 `compress`,代理在服务端执行 —— 压缩后的范围在下一轮之前折叠进对话历史。
 
-## 该选哪个?—— billion-context / billion-context-pi / opencode-acp
+## 该选哪个?
 
-围绕这个项目经常会出现三个名字。它们是<strong>同一件事(编程助手的上下文压缩)的不同层次</strong>,<em>不是三选一的对立产品</em>。关键看你的客户端有没有<strong>「上下文 hook」</strong>(能装一个进程内扩展、把 `compress` 工具注册进去并在本地跑压缩的地方):
+按客户端选:
 
-| 名字 | 是什么 | 跑在哪 | 什么时候选它 |
-|---|---|---|---|
-| **billion-context-pi** | 独立的<strong>进程内 pi 扩展</strong>(纯扩展模式 —— acp-kernel 直接集成进 pi;参考实现)。不需要外部代理。 | pi 进程内 | <strong>pi 首选。</strong>活跃,并未被取代。 |
-| **opencode-acp** | 独立的<strong>进程内 opencode 扩展</strong>(同样思路,面向 opencode)。不需要外部代理。 | opencode 进程内 | 想要纯进程内、不跑代理时,opencode 首选。 |
-| **billion-context**(`bili`) | 外部<strong>压缩代理</strong> + 启动器 + 内置客户端插件。<strong>主要面向没有上下文 hook 的客户端。</strong> | 本地代理进程 | 无 hook 客户端(Claude Code、Codex、Cursor、Aider、ZCode…)的默认选择;也是驱动 **omp** 的方式(没有独立的 omp 扩展包 —— 用 `bili` 内置插件)。 |
-
-```
-你的客户端有没有「上下文 hook」(能装进程内扩展的地方)?
-
-  ├─ 有 → 优先进程内扩展(不跑外部代理)
-  │    • pi       → billion-context-pi    ← 首选
-  │    • opencode → opencode-acp
-  │    • omp      → billion-context(内置 omp 插件;无独立 omp 包)
-  │
-  └─ 没有 → billion-context 外部代理(bili)
-       Claude Code / Codex / Cursor / Aider / ZCode …
-       两种方式(优先启动器):
-         ✅ bili <client>   启动器模式   ← 首选
-         ○  /bili/ 前缀      纯代理模式
-```
-
-<strong>什么时候选哪个:</strong>
-
-- <strong>客户端有上下文 hook</strong> → 优先用进程内扩展(集成最紧、不额外跑一个代理进程):
-  - <strong>pi</strong> → <strong>`billion-context-pi`</strong> —— 参考实现,也是 pi 跑压缩的主要方式,acp-kernel 直接在 pi 进程里跑。
-  - <strong>opencode</strong> → <strong>`opencode-acp`</strong> —— opencode 的同款思路。
-  - <strong>omp</strong> → <strong>`billion-context`</strong> —— omp 没有自己的独立扩展包,所以走 `billion-context` 内置的 omp 插件(`bili omp`)。
-- <strong>客户端没有上下文 hook</strong> → <strong>`billion-context`</strong>(`bili`)外部代理 —— 这是它的主场。任何能设 base URL、但装不了进程内扩展的客户端:Claude Code、Codex、Cursor、Aider、ZCode 等。两种方式,<strong>优先启动器</strong>:
-  - `bili <client>` —— <strong>启动器模式</strong>(自动拉起代理并接好客户端;推荐)。
-  - `/bili/` base-URL 前缀 —— 纯代理模式(你自己把客户端指向已运行的代理)。
-
-> 说明:`billion-context` 也自带针对 pi / omp / opencode 的轻量内置插件,让这些有 hook 的客户端<strong>可以</strong>选择性走同一个共享代理(`bili pi` / `bili opencode`)。此时任何独立扩展(如 `billion-context-pi`)会经 `BILLION_CONTEXT_PROXY` 自禁用,避免双层压缩。对 pi 而言,独立的 `billion-context-pi` 仍是首选路径;代理是兜底 / 统一入口的选项。
-
-<strong>一句话总结:</strong>pi → `billion-context-pi`;opencode → `opencode-acp`;omp 和所有无 hook 客户端 → `billion-context`(`bili`),优先启动器模式。
+| 客户端 | 用这个 |
+|---|---|
+| **pi** | [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi)(进程内扩展) |
+| **opencode** | [`opencode-acp`](https://github.com/ranxianglei/opencode-acp)(进程内扩展) |
+| **omp** | [`billion-context`](https://github.com/ranxianglei/billion-context),`bili omp`(内置插件) |
+| **其余所有**(没有上下文 hook) | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili <client>`(启动器,优先)或 `/bili/` 前缀 |
 
 ## 安装
 
