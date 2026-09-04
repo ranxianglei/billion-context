@@ -38,6 +38,10 @@ type ExtensionAPI = {
     on: (event: string, handler: (event: never, ctx: Ctx) => unknown) => void;
     registerTool: (tool: ToolDefinition) => void;
     registerCommand?: (name: string, options: { description?: string; handler: (args: string, ctx: CommandCtx) => void | Promise<void> }) => void;
+    // #535: launcher passes provider URL rewrites via env; the extension
+    // overrides each provider's baseUrl at load (file-free routing — no
+    // models.json overlay). Optional because older hosts may lack it.
+    registerProvider?: (name: string, config: { baseUrl: string }) => void;
 };
 
 function agentName(override: string | undefined): string {
@@ -134,6 +138,25 @@ function manifestToTool(proxyBase: string, tool: ManifestTool, agent: string): T
     };
 }
 
+function parseProviderRewrites(env: NodeJS.ProcessEnv): Record<string, string> | undefined {
+    const raw = env.BILI_PROVIDER_REWRITES;
+    if (raw === undefined || raw.trim().length === 0) return undefined;
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(raw);
+    } catch {
+        console.error("bili-plugin: BILI_PROVIDER_REWRITES is not valid JSON — provider URLs left untouched");
+        return undefined;
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    const out: Record<string, string> = {};
+    for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+        if (typeof value !== "string" || !/^https?:\/\//i.test(value)) continue;
+        out[key] = value;
+    }
+    return Object.keys(out).length > 0 ? out : undefined;
+}
+
 const RETRY_INTERVAL_MS = 10000;
 
 type RegisterState = { sid?: string; toolsFor?: string; toolsReady?: boolean; pending?: Promise<void>; retryAt?: number; identityAt?: string; retryIntervalMs: number };
@@ -216,6 +239,35 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
     return function biliPlugin(pi: ExtensionAPI): void {
         const agent = agentName(agentOverride);
         const state: RegisterState = { retryIntervalMs: opts?.retryIntervalMs ?? RETRY_INTERVAL_MS };
+        // #535: file-free routing — override provider baseUrls at load from
+        // the launcher-passed manifest (see buildPiEnv). registerProvider is
+        // queued during initial extension load and applied before any model
+        // traffic, so every request (including round 1) rides the proxy.
+        const rewrites = parseProviderRewrites(process.env);
+        if (rewrites !== undefined && typeof pi.registerProvider === "function") {
+            for (const [key, url] of Object.entries(rewrites)) {
+                try {
+                    pi.registerProvider(key, { baseUrl: url });
+                } catch (err) {
+                    console.error(`bili-plugin: registerProvider(${key}) failed: ${err instanceof Error ? err.message : String(err)} — traffic for this provider goes direct`);
+                }
+            }
+        }
+        // #535: cancel pi's NATIVE auto-compaction (threshold + overflow) so
+        // its summarizer never fires alongside bili's ACP compression — the
+        // in-extension replacement for the old settings.json compaction-off
+        // injection. `reason` gates to the auto paths only: manual /compact
+        // stays user-owned. omp's session_before_compact event has no reason
+        // field yet (upstream PR pending), so omp keeps its config.yml
+        // compaction-off entry until then. Only armed under `bili` launch:
+        // plain `pi` with the plugin installed must behave fully native.
+        if (agent === "pi" && process.env.BILLION_CONTEXT_PROXY !== undefined) {
+            pi.on("session_before_compact", (event) => {
+                const reason = (event as unknown as { reason?: unknown }).reason;
+                if (reason === "threshold" || reason === "overflow") return { cancel: true };
+                return undefined;
+            });
+        }
         if (typeof pi.registerCommand === "function") {
             pi.registerCommand("acp", {
                 description: "Show ACP context-compression status for this session",

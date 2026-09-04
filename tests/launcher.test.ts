@@ -20,7 +20,6 @@ import {
     buildCodexEnv,
     buildClaudeEnv,
     buildCodexArgs,
-    preparePiHttpRewrite,
     prepareOmpHttpRewrite,
     prepareOpencodeHttpRewrite,
     stripInheritedProxy,
@@ -382,6 +381,84 @@ test("runLaunch pi: native -e plugin injected only when not installed", async ()
         if (prevPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
         else process.env.PI_CODING_AGENT_DIR = prevPiDir;
         if (stubbed) fs.rmSync(distAgent, { force: true });
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("runLaunch pi #535: refuses launch when http rewrites needed and extension cannot load; no overlay files written", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-pirefuse-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevPiDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    delete process.env.PI_CODING_AGENT_DIR;
+    const piHome = path.join(home, ".pi/agent");
+    fs.mkdirSync(piHome, { recursive: true });
+    fs.writeFileSync(path.join(piHome, "models.json"), JSON.stringify({ providers: { glm: { baseUrl: "http://127.0.0.1:8199/v1" } } }));
+
+    const root = selfPackageRoot();
+    const distAgent = path.join(root, "dist", "agent", "pi.js");
+    const distBackup = `${distAgent}.bak-test`;
+    const distExisted = fs.existsSync(distAgent);
+    if (distExisted) fs.renameSync(distAgent, distBackup);
+
+    const fakePi = path.join(home, "fake-pi");
+    fs.writeFileSync(fakePi, "");
+    const prevPiBin = process.env.PI_BIN;
+    process.env.PI_BIN = fakePi;
+    const prevExit = process.exit;
+    const exitCalls: number[] = [];
+    process.exit = ((code?: number) => {
+        exitCalls.push(code ?? 0);
+        return undefined as never;
+    }) as typeof process.exit;
+    const clientArgsSeen: string[][] = [];
+    const spawnImpl: SpawnFn = (cmd, args) => {
+        if (cmd === fakePi) {
+            clientArgsSeen.push([...args]);
+            const child = makeFakeChild(0);
+            const orig = child.on.bind(child);
+            (child as { on: SpawnChild["on"] }).on = (event, listener) => {
+                orig(event, listener);
+                if (event === "exit") setTimeout(() => listener(0, null), 0);
+                return child;
+            };
+            return child;
+        }
+        return makeFakeChild(42422);
+    };
+    try {
+        // no dist file, no installed plugin entry → refuse, and refuse BEFORE
+        // spawning anything (no proxy child, no client)
+        await assert.rejects(
+            runLaunch({ client: "pi", clientArgs: [], overrides: {} }, { fetchImpl: async () => ({ ok: true }), spawnImpl, sleep: () => Promise.resolve() }),
+            /needs provider URL rewrites but the bili extension cannot load/,
+        );
+        assert.equal(clientArgsSeen.length, 0);
+        // no overlay dir was created for pi anymore (#535)
+        assert.equal(fs.existsSync(`${piHome}-bili`), false, "no pi overlay dir");
+
+        // plugin installed in settings.json → extension loadable → launch proceeds
+        fs.writeFileSync(path.join(piHome, "settings.json"), JSON.stringify({ packages: [root] }));
+        await runLaunch(
+            { client: "pi", clientArgs: [], overrides: {} },
+            { fetchImpl: async () => ({ ok: true }), spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(clientArgsSeen.length, 1);
+        assert.ok(!clientArgsSeen[0].includes("-e"), "installed entry loads the plugin — no -e double load");
+        assert.equal(fs.existsSync(`${piHome}-bili`), false, "still no overlay dir");
+        assert.deepEqual(exitCalls, [0]);
+    } finally {
+        process.exit = prevExit;
+        if (prevPiBin === undefined) delete process.env.PI_BIN;
+        else process.env.PI_BIN = prevPiBin;
+        process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        if (prevPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+        else process.env.PI_CODING_AGENT_DIR = prevPiDir;
+        if (distExisted) fs.renameSync(distBackup, distAgent);
         fs.rmSync(home, { recursive: true, force: true });
     }
 });
@@ -950,76 +1027,31 @@ test("buildClaudeEnv: no ANTHROPIC_BASE_URL rewrite → env.ANTHROPIC_BASE_URL u
     assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
 });
 
-test("preparePiHttpRewrite: rewrites matching provider, leaves others, symlinks siblings", () => {
-    // realpath: on macOS os.tmpdir() is /var/folders (a symlink to /private/var);
-    // the realpathSync asserts below compare canonical forms on both sides.
-    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-pihome-")));
-    fs.writeFileSync(
-        path.join(home, "models.json"),
-        JSON.stringify({
-            providers: {
-                a: { baseUrl: "http://example.com/v1" },
-                b: { baseUrl: "https://secure.example.com" },
-            },
-        }),
-    );
-    fs.writeFileSync(path.join(home, "auth.json"), '{"key":"x"}');
-    const tmp = preparePiHttpRewrite(home, "http://127.0.0.1:8787", [
+test("buildPiEnv: http rewrites → BILI_PROVIDER_REWRITES manifest (#535 file-free routing)", () => {
+    const env = buildPiEnv("http://127.0.0.1:8787", "/tmp/ca.pem", { PATH: "/usr/bin" }, [
         { key: "a", realUpstream: "http://example.com/v1" },
-    ], []);
-    try {
-        assert.ok(typeof tmp === "string" && tmp.length > 0);
-        const out = JSON.parse(fs.readFileSync(path.join(tmp!, "models.json"), "utf8"));
-        assert.equal(out.providers.a.baseUrl, "http://127.0.0.1:8787/bili/http://example.com/v1");
-        assert.equal(out.providers.b.baseUrl, "https://secure.example.com");
-        assert.equal(fs.lstatSync(path.join(tmp!, "auth.json")).isSymbolicLink(), true);
-        assert.equal(fs.realpathSync(path.join(tmp!, "auth.json")), path.join(home, "auth.json"));
-        const settings = JSON.parse(fs.readFileSync(path.join(tmp!, "settings.json"), "utf8"));
-        assert.equal(settings.compaction.enabled, false, "pi native compaction disabled");
-    } finally {
-        if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
-        fs.rmSync(home, { recursive: true, force: true });
-    }
+        { key: "b", realUpstream: "http://other.example.com" },
+    ]);
+    assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
+    assert.equal(env.BILLION_CONTEXT_PROXY, "http://127.0.0.1:8787");
+    const manifest = JSON.parse(env.BILI_PROVIDER_REWRITES ?? "null");
+    assert.deepEqual(manifest, {
+        a: "http://127.0.0.1:8787/bili/http://example.com/v1",
+        b: "http://127.0.0.1:8787/bili/http://other.example.com",
+    });
 });
 
-test("preparePiHttpRewrite: non-existent home → undefined", () => {
-    assert.equal(preparePiHttpRewrite("/nonexistent-bili-pi-home-xyz", "http://127.0.0.1:8787", [], []), undefined);
+test("buildPiEnv: no rewrites → no manifest env", () => {
+    const env = buildPiEnv("http://127.0.0.1:8787", "/tmp/ca.pem", { PATH: "/usr/bin" }, []);
+    assert.equal(env.BILI_PROVIDER_REWRITES, undefined);
 });
 
-test("preparePiHttpRewrite: no rewrites → overlay built, pi native compaction disabled, models.json copied verbatim", () => {
-    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-pihome-")));
-    fs.writeFileSync(path.join(home, "models.json"), JSON.stringify({ providers: { a: { baseUrl: "https://keep.example.com" } } }));
-    try {
-        const overlay = preparePiHttpRewrite(home, "http://127.0.0.1:8787", [], []);
-        assert.ok(typeof overlay === "string" && overlay.length > 0);
-        const settings = JSON.parse(fs.readFileSync(path.join(overlay!, "settings.json"), "utf8"));
-        assert.equal(settings.compaction.enabled, false, "pi native compaction disabled");
-        const out = JSON.parse(fs.readFileSync(path.join(overlay!, "models.json"), "utf8"));
-        assert.equal(out.providers.a.baseUrl, "https://keep.example.com", "no rewrite → baseUrl untouched");
-    } finally {
-        fs.rmSync(home, { recursive: true, force: true });
-        fs.rmSync(`${home}-bili`, { recursive: true, force: true });
-    }
-});
-
-test("preparePiHttpRewrite: preserves other settings.json keys, disables only compaction", () => {
-    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-pihome-")));
-    fs.writeFileSync(
-        path.join(home, "settings.json"),
-        JSON.stringify({ packages: ["/opt/pi-plugin"], theme: "dark", compaction: { reserveTokens: 9999 } }),
-    );
-    try {
-        const overlay = preparePiHttpRewrite(home, "http://127.0.0.1:8787", [], []);
-        assert.ok(typeof overlay === "string");
-        const settings = JSON.parse(fs.readFileSync(path.join(overlay!, "settings.json"), "utf8"));
-        assert.equal(settings.compaction.enabled, false, "compaction disabled");
-        assert.equal(settings.compaction.reserveTokens, 9999, "other compaction keys preserved");
-        assert.deepEqual(settings.packages, ["/opt/pi-plugin"], "packages preserved");
-        assert.equal(settings.theme, "dark", "theme preserved");
-    } finally {
-        fs.rmSync(home, { recursive: true, force: true });
-        fs.rmSync(`${home}-bili`, { recursive: true, force: true });
-    }
+test("buildPiEnv: empty-key/empty-upstream entries skipped", () => {
+    const env = buildPiEnv("http://127.0.0.1:8787", "/tmp/ca.pem", { PATH: "/usr/bin" }, [
+        { key: "", realUpstream: "http://example.com/v1" },
+        { key: "b", realUpstream: "" },
+    ]);
+    assert.equal(env.BILI_PROVIDER_REWRITES, undefined);
 });
 
 test("stripInheritedProxy: removes generic proxy redirector vars, keeps the rest", () => {
