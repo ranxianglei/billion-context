@@ -343,6 +343,7 @@ Environment variables take precedence over the config file. They are useful for 
 | `ACP_COMPRESS_TOOL` | Set to `0` to disable tool injection (same as `"compress.injectTool": false`). |
 | `ACP_COMPRESS_NUDGE` | Set to `0` to disable nudge injection (same as `"compress.injectNudge": false`). |
 | `ACP_MODEL_CONTEXT_LIMIT` | Override the context limit globally (absolute token count). |
+| `BILI_IMAGE_TOKEN_CAP` | Cap the per-image token estimate used by the preflight size gate and output clamp (#488/#496). By default an inline `data:` image counts as `base64 length / 4` tokens with **no cap** — correct for byte-billing relays, but a large over-estimate for pixel-tile upstreams (official Anthropic/OpenAI), which bill each image at roughly 1.1K–1.6K tokens regardless of byte size. Set this to your upstream's per-image tile cost so the gate reflects real billing; unset = no cap (current default). |
 | `BILI_CONFIG_FILE` | Override the config file path (point at any JSON file). |
 | `ACP_PORT` / `PORT` | Override the listen port. |
 | `ACP_HOST` | Override the listen host. |
