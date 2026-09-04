@@ -112,6 +112,63 @@ turn is a semantic mismatch the model tolerates (it is clearly marked
   summaries (their tool call isn't in the agent's history and the agent's view
   skips `acp_summary`) — but that needs the id match above, which doesn't occur.
 
+## Which do I need? — billion-context vs billion-context-pi vs opencode-acp
+
+Three names keep appearing around this project. They are **different layers of
+the same idea** — context compression for coding agents — not three competing
+products you must pick one of. Here is how they relate:
+
+| Name | What it is | Where it runs | Status today |
+|---|---|---|---|
+| **billion-context** (`bili`) | The universal compression **proxy**, plus thin built-in client-side plugins for pi / omp / opencode. One install covers every client. | A local proxy process; a small plugin injected per client | ✅ **The one you install.** Active, maintained in this repo. |
+| **billion-context-pi** | The original standalone **pi extension** (the 0.1.x reference implementation). Its pi plugin has since moved *into* `billion-context`. | Inside the pi process | 🟡 **Superseded.** Now lives inside `billion-context`; the old package self-disables when run behind `bili`. Do not install it separately. |
+| **opencode-acp** | A standalone **opencode plugin** that provides native ACP compression with no proxy at all. | Inside the opencode process | 🟢 Standalone option, **opencode only**. Self-disables automatically when run behind `bili`. |
+
+```
+            ┌────────────────────────────────────────────────┐
+            │  billion-context  (bili)      ← install THIS   │
+            │                                                │
+            │    the proxy ────── wire-level compression     │
+            │    + built-in plugins (pi / omp / opencode)    │
+            └────────────────────────────────────────────────┘
+                   ▲                    ▲                 ▲
+    any client ────┘      pi / omp ─────┘      opencode ───┘
+    via /bili/ or MITM   bili pi / bili omp   bili opencode
+                         (built-in plugin)    (built-in plugin)
+
+  billion-context-pi = legacy standalone pi ext → merged into billion-context
+  opencode-acp       = standalone opencode-only native compression (no proxy)
+```
+
+**When to pick which:**
+
+- **Default — use `billion-context` (`bili`).** Any coding agent that can set a
+  base URL: point it at `/bili/`, or run `bili <client>`. One tool handles every
+  client and owns all compression state. If you remember only one row above,
+  remember this one.
+- **pi / omp** → use `billion-context`'s built-in plugin: `bili pi` / `bili omp`
+  (launcher), or `bili plugin install pi` for a persistent install. **Do not
+  install the old `billion-context-pi` package** — it was merged into
+  `billion-context` and self-disables behind `bili`. A stale `npm:billion-context-pi`
+  entry is replaced automatically by `bili plugin install pi`.
+  - **omp specifically:** omp is pi-based, so it rides the same mechanism as pi
+    but with its own plugin — `billion-context` ships `dist/agent/omp.js`,
+    injected by the launcher over a persistent overlay home (your real omp config
+    is never touched). In short: **omp goes through `billion-context`, not
+    `billion-context-pi`.**
+- **opencode** → two options:
+  - **Standalone, no proxy:** install [`opencode-acp`](https://github.com/ranxianglei/opencode-acp)
+    alone → native ACP compression inside opencode, no `bili` process. Good if
+    opencode is your only client and you don't want a separate proxy running.
+  - **Behind `bili`:** run `bili opencode` → `billion-context`'s built-in
+    opencode plugin takes over, and your host's `opencode-acp` auto self-disables
+    so the proxy owns the ACP tools (no double compression). Good if you also
+    route other clients through the same proxy.
+
+**TL;DR:** only opencode and no proxy wanted → `opencode-acp`. Anything else
+(any client, or several clients) → `billion-context`. Never install
+`billion-context-pi` on its own again — it lives inside `billion-context` now.
+
 ## Install
 
 ```bash
@@ -382,7 +439,7 @@ pass an explicit `x-acp-session` header per conversation to avoid collisions.
 
 Early. Protocol handling and compression work against mock tests (500+ passing). Real-model integration testing is the next milestone. Expect rough edges.
 
-See [billion-context-pi](https://github.com/ranxianglei/billion-context-pi) for the pi-extension mode (in-process, tighter integration, the reference implementation).
+The pi / omp / opencode client extensions now live **inside `billion-context`** (`dist/agent/*.js`). See the **"Which do I need?"** section above for how `billion-context`, the legacy `billion-context-pi` package, and `opencode-acp` relate.
 
 ## License
 
