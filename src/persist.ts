@@ -60,6 +60,8 @@ import type { Session, BlockContent } from "./session.js";
 
 const PERSIST_VERSION = 3;
 
+const STALE_WARN_THROTTLE_MS = 60_000;
+
 interface PersistedSession {
     version: number;
     savedAt: number;
@@ -166,11 +168,14 @@ export class SessionStore {
     readonly enabled: boolean;
     private readonly dir: string;
     private readonly store: StateStore<PersistedSession>;
+    private readonly log: Logger;
+    private readonly staleWarnAt = new Map<string, number>();
 
     constructor(opts?: { dir?: string; debounceMs?: number; enabled?: boolean; log?: Logger }) {
         const debounceMs = opts?.debounceMs ?? defaultDebounce();
         this.enabled = (opts?.enabled ?? true) && debounceMs >= 0;
         this.dir = opts?.dir ?? defaultDir();
+        this.log = opts?.log ?? defaultLogger;
         this.store = new StateStore<PersistedSession>({
             dir: this.dir,
             version: PERSIST_VERSION,
@@ -276,19 +281,66 @@ export class SessionStore {
      *  LRU eviction). Sync fs is acceptable here because a miss is rare and
      *  reads a single small file (~1ms). Returns null if missing/corrupt or the
      *  body id does not match what we asked for. */
-    loadSync(id: string, meta?: { protocol?: string; upstreamOrigin?: string }): Session | null {
-        if (!this.enabled) return null;
-        // Namespaced path first (current convention), then the _unknown/
-        // location for sessions persisted before protocol meta was captured.
-        // The kernel store also probes the flat legacy name on each call.
+    /** Shared envelope probe for the sync read paths: namespaced path
+     *  first, then the _unknown/ location, letting the kernel store layer
+     *  also check its discovered map and the flat legacy name. */
+    private loadEnvelope(id: string, meta?: { protocol?: string; upstreamOrigin?: string }): PersistedEnvelope<PersistedSession> | null {
         const envelopes = [
             this.store.loadSync(id, relPathFor(id, meta?.protocol, meta?.upstreamOrigin)),
             meta?.protocol ? this.store.loadSync(id, relPathFor(id)) : null,
         ];
         for (const envelope of envelopes) {
-            if (envelope) return buildSession(envelope.payload);
+            if (envelope) return envelope;
         }
         return null;
+    }
+
+    loadSync(id: string, meta?: { protocol?: string; upstreamOrigin?: string }): Session | null {
+        if (!this.enabled) return null;
+        const envelope = this.loadEnvelope(id, meta);
+        if (!envelope) return null;
+        return buildSession(envelope.payload);
+    }
+
+    /** #405 fix #4: dual-instance rollback guard. When two proxy processes
+     *  share BILI_SESSIONS_DIR, whoever saves last used to win — an instance
+     *  holding a STALE in-memory copy would roll counters back (requests:3 →
+     *  2). Both signals below are monotonic per session id, so either being
+     *  strictly smaller proves staleness. Returns the fresher-on-disk payload
+     *  when the incoming record is stale, else null. */
+    private staleDiskPayload(incoming: PersistedSession): PersistedSession | null {
+        const envelope = this.loadEnvelope(incoming.id, incoming.meta);
+        if (!envelope) return null;
+        const disk = envelope.payload;
+        const diskRequests = disk.stats?.requests ?? disk.requests ?? 0;
+        const incRequests = incoming.stats?.requests ?? incoming.requests ?? 0;
+        if (incRequests < diskRequests) return disk;
+        if (incRequests === diskRequests) {
+            const diskBlocks = disk.state?.nextBlockId ?? 0;
+            const incBlocks = incoming.state?.nextBlockId ?? 0;
+            if (incBlocks < diskBlocks) return disk;
+        }
+        return null;
+    }
+
+    private guardedBuild(session: Session): () => PersistedSession {
+        return () => {
+            const record = buildRecord(session);
+            const disk = this.staleDiskPayload(record);
+            if (disk === null) return record;
+            const now = Date.now();
+            const last = this.staleWarnAt.get(record.id) ?? 0;
+            if (now - last >= STALE_WARN_THROTTLE_MS) {
+                this.staleWarnAt.set(record.id, now);
+                this.log(
+                    "warn",
+                    `[persist] rejected stale snapshot for session ${record.id}: in-memory copy is older than the on-disk one (another bili instance holds newer state) — keeping disk state, no rollback (#405)`,
+                );
+            }
+            // Rewrite the disk's own payload: content-identical no-op that
+            // preserves the newer state while satisfying the write chain.
+            return disk;
+        };
     }
 
     /** Schedule a debounced write for a session. Multiple calls within the
@@ -296,14 +348,14 @@ export class SessionStore {
      *  session state is persisted. Safe to call on the hot path. No-op if
      *  disabled. */
     scheduleSave(session: Session): void {
-        this.store.scheduleSave(session.id, () => buildRecord(session));
+        this.store.scheduleSave(session.id, this.guardedBuild(session));
     }
 
     /** Asynchronously persist a session right now (skips the debounce). Throws
      *  on write failure so callers can react (e.g. avoid evicting). Serialized
      *  per-session by the kernel store's write chains. */
     async writeNow(session: Session): Promise<void> {
-        await this.store.writeNow(session.id, () => buildRecord(session));
+        await this.store.writeNow(session.id, this.guardedBuild(session));
     }
 
     /** Synchronous flush for a single session. Used on memory eviction so a
@@ -312,7 +364,7 @@ export class SessionStore {
      *  Returns true on success, false on failure (caller must NOT evict on
      *  failure for a never-persisted session or it is lost permanently). */
     flushSync(session: Session): boolean {
-        return this.store.flushSync(session.id, () => buildRecord(session));
+        return this.store.flushSync(session.id, this.guardedBuild(session));
     }
 
     /** Flush all dirty sessions with a pending debounce timer. Called on
