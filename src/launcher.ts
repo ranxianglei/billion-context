@@ -1246,6 +1246,164 @@ function mergeOmpCompactionDisabledYaml(text: string): string {
     return lines.join("\n");
 }
 
+/** Index of the top-level `compaction:` header, scanning with the same rules
+ *  as mergeOmpCompactionDisabledYaml (blank/comment lines skipped, indent-0
+ *  key only). -1 when absent. */
+function topLevelCompactionHeader(lines: string[]): number {
+    for (let i = 0; i < lines.length; i++) {
+        const raw = lines[i];
+        const trimmed = raw.trim();
+        if (!trimmed || trimmed.startsWith("#")) continue;
+        if (raw.length - raw.trimStart().length !== 0) continue;
+        if (/^compaction:\s*(#.*)?$/.test(trimmed)) return i;
+    }
+    return -1;
+}
+
+/** The compaction block's first `enabled:` child under the top-level header —
+ *  the exact line mergeOmpCompactionDisabledYaml would replace/insert. */
+function findCompactionEnabledLine(lines: string[]): number {
+    const header = topLevelCompactionHeader(lines);
+    if (header === -1) return -1;
+    for (let i = header + 1; i < lines.length; i++) {
+        const raw = lines[i];
+        const trimmed = raw.trim();
+        if (!trimmed || trimmed.startsWith("#")) continue;
+        if (raw.length - raw.trimStart().length === 0) break;
+        if (/^enabled:/.test(trimmed)) return i;
+    }
+    return -1;
+}
+
+/** True when the top-level compaction block exists and has no children left. */
+function compactionBlockEmpty(lines: string[]): boolean {
+    const header = topLevelCompactionHeader(lines);
+    if (header === -1) return false;
+    for (let i = header + 1; i < lines.length; i++) {
+        const raw = lines[i];
+        const trimmed = raw.trim();
+        if (!trimmed || trimmed.startsWith("#")) continue;
+        return raw.length - raw.trimStart().length > 0;
+    }
+    return true;
+}
+
+/** #531: inverse of mergeOmpCompactionDisabledYaml — undo bili's
+ *  `compaction.enabled: false` injection so the overlay's generated config.yml
+ *  can be merged back into the real home without baking the flag into it.
+ *  When the real file has its own `enabled:` line it is copied back verbatim
+ *  (a user's own `enabled: false` therefore survives); otherwise the injected
+ *  line is removed and an emptied block collapses away. With no user edits the
+ *  result is byte-identical to the real file, which makes the merge-back a
+ *  clean no-op. A non-`false` value means the user overrode the injection in
+ *  the overlay — that choice propagates to the real home untouched. */
+function stripOmpCompactionInjection(overlayText: string, realText: string | undefined): string {
+    const oLines = overlayText.split("\n");
+    const oe = findCompactionEnabledLine(oLines);
+    if (oe === -1) return overlayText;
+    const m = /^enabled:\s*(\S+)/.exec(oLines[oe].trim());
+    if (!m || m[1] !== "false") return overlayText;
+    const rLines = realText !== undefined ? realText.split("\n") : undefined;
+    const re = rLines ? findCompactionEnabledLine(rLines) : -1;
+    if (re !== -1 && rLines) {
+        oLines[oe] = rLines[re];
+        return oLines.join("\n");
+    }
+    oLines.splice(oe, 1);
+    if (compactionBlockEmpty(oLines)) {
+        const h = topLevelCompactionHeader(oLines);
+        if (h !== -1) oLines.splice(h, 1);
+    }
+    return oLines.join("\n");
+}
+
+/**
+ * #531: merge user edits made in the overlay's generated config.yml back into
+ * the real home before the next regeneration clobbers them. Since #449 the
+ * file sits in the generated set (skipped by refreshOverlayHome's merge-back),
+ * so settings omp saves inside a `bili omp` session evaporated on restart.
+ * This file is safe to merge back — unlike models.yml it carries no per-launch
+ * proxy content (#410), only the strippable compaction injection. Adjudication
+ * mirrors every other overlay entry: byte-identical-after-strip → no-op;
+ * overlay newer → its content becomes the real file (no fossil — the main
+ * flow must stay fossil-free); real newer → the real side wins and the
+ * divergent overlay version is preserved as a `.bili-conflict` fossil unless a
+ * concurrent bili launch still holds the overlay (its running session keeps
+ * reading this file, so it is left in place for the next clean launch).
+ */
+function mergeBackOmpOverlayConfig(ompHome: string, overlay: string, holderActive: boolean): void {
+    try {
+        const overlayCfg = path.join(overlay, "config.yml");
+        let oSt: fs.Stats;
+        try {
+            oSt = fs.lstatSync(overlayCfg);
+        } catch {
+            return;
+        }
+        if (!oSt.isFile()) return;
+        // Target resolution mirrors writeOmpCompactionDisabledConfig's base
+        // priority, restricted to the YAML names it reads first.
+        let target: string | undefined;
+        for (const name of ["config.yml", "config.yaml"]) {
+            try {
+                const st = fs.lstatSync(path.join(ompHome, name));
+                if (st.isFile()) {
+                    target = path.join(ompHome, name);
+                    break;
+                }
+            } catch {}
+        }
+        let realText: string | undefined;
+        if (target) {
+            try {
+                realText = fs.readFileSync(target, "utf8");
+            } catch {
+                return;
+            }
+        } else if (fs.existsSync(path.join(ompHome, "settings.json"))) {
+            // JSON base: settings.json is omp's one-time migration source
+            // (renamed away on first bare run) — creating a config.yml beside
+            // it would reshape the user's home, so skip.
+            return;
+        }
+        let oText: string;
+        try {
+            oText = fs.readFileSync(overlayCfg, "utf8");
+        } catch {
+            return;
+        }
+        // The generator normalizes CRLF to LF, so compare and write in a
+        // canonical form and restore the real file's own line-ending style —
+        // otherwise a CRLF config would churn on every launch.
+        const norm = (t: string): string => t.replace(/\r\n/g, "\n");
+        const stripped = norm(stripOmpCompactionInjection(oText, realText));
+        if (target) {
+            if (realText !== undefined && stripped === norm(realText)) return;
+            let rSt: fs.Stats;
+            try {
+                rSt = fs.lstatSync(target);
+            } catch {
+                return;
+            }
+            if (rSt.mtimeMs >= oSt.mtimeMs) {
+                if (!holderActive) {
+                    try {
+                        fs.renameSync(overlayCfg, freeConflictName(target));
+                    } catch {}
+                }
+                return;
+            }
+            const crlf = realText !== undefined && realText.includes("\r\n");
+            atomicWriteTextFile(target, crlf ? stripped.replace(/\n/g, "\r\n") : stripped);
+            return;
+        }
+        if (stripped.trim() === "") return;
+        atomicWriteTextFile(path.join(ompHome, "config.yml"), stripped);
+    } catch (err) {
+        console.error(`bili: could not merge the overlay config.yml back into ${ompHome}: ${(err as Error).message}`);
+    }
+}
+
 function writeOmpCompactionDisabledConfig(ompHome: string, overlay: string): void {
     // omp reads config.yml at runtime (settings.json is only a one-time migration
     // source, renamed to .bak). Merge compaction.enabled=false over the real
@@ -1304,6 +1462,10 @@ export function prepareOmpHttpRewrite(
     // compression); models.yml is generated only when present, so both stay
     // out of the real-home symlink set.
     const generated: string[] = ["config.yml"];
+    // #531: read the holder BEFORE refreshOverlayHome overwrites the marker
+    // with our own pid — decides whether regenerating the shared overlay's
+    // config.yml would clobber a still-running session's saved settings.
+    const holder = livePidHoldsOverlay(overlay);
     const modelsPath = path.join(ompHome, "models.yml");
     const unpacked = unpackDeadProxyUrlsInFile(modelsPath, liveProxyPorts());
     if (unpacked > 0) {
@@ -1315,6 +1477,7 @@ export function prepareOmpHttpRewrite(
         generated.push("models.yml");
     } catch {}
     if (!refreshOverlayHome(ompHome, overlay, generated)) return undefined;
+    mergeBackOmpOverlayConfig(ompHome, overlay, holder !== undefined);
     if (modelsText !== undefined) {
         const httpMap = new Map(httpRewrites.map((r) => [r.key, wrapUpstream(origin, r.realUpstream)]));
         const httpsMap = new Map(httpsRewrites.map((r) => [r.key, r.realUpstream]));
@@ -1351,7 +1514,14 @@ export function prepareOmpHttpRewrite(
         }
         writeOverlayFileAtomic(overlay, "models.yml", lines.join("\n"));
     }
-    writeOmpCompactionDisabledConfig(ompHome, overlay);
+    if (holder !== undefined) {
+        console.error(
+            `bili: another bili omp (pid ${holder}) is still running — skipping the config.yml regeneration so ` +
+                `the shared overlay keeps its saved settings (this session inherits them; its proxy port still wins in models.yml).`,
+        );
+    } else {
+        writeOmpCompactionDisabledConfig(ompHome, overlay);
+    }
     return overlay;
 }
 
