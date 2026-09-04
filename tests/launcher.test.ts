@@ -681,6 +681,41 @@ test("ensureProxyRunning: launchToken handshake returns the child's real port (#
     assert.equal(handle.origin, "http://127.0.0.1:8799");
 });
 
+test("ensureProxyRunning: spawned child exits pre-bind → fails fast (<5s) with log path (#401/#480)", async () => {
+    const child: SpawnChild = {
+        pid: 42441,
+        unref() {},
+        kill() {
+            return true;
+        },
+        on(event, listener) {
+            if (event === "exit") setImmediate(() => listener(1, null));
+            return undefined;
+        },
+    };
+    const spawnImpl: SpawnFn = () => child;
+    const t0 = Date.now();
+    await assert.rejects(
+        ensureProxyRunning(
+            { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
+            {
+                spawnImpl,
+                fetchImpl: async () => ({ ok: false }),
+                fetchHealthInfo: async () => undefined,
+                readInstanceFile: () => undefined,
+                sleep: () => new Promise((r) => setTimeout(r, 1)),
+            },
+        ),
+        (err: Error) => {
+            assert.match(err.message, /exited before becoming healthy/);
+            assert.match(err.message, /code 1/);
+            assert.match(err.message, /log:/);
+            return true;
+        },
+    );
+    assert.ok(Date.now() - t0 < 5000, `fast-fail took ${Date.now() - t0}ms; must not burn the full poll window`);
+});
+
 test("stopProxy: no-op when child missing pid", () => {
     assert.doesNotThrow(() =>
         stopProxy({ origin: "http://127.0.0.1:8787", port: 8787, child: { pid: 0 } }),

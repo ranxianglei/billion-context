@@ -1808,8 +1808,20 @@ export async function ensureProxyRunning(
         child.unref?.();
     } catch {}
 
+    // #401/#480: fail fast when OUR spawned child dies before becoming
+    // healthy — otherwise a startup crash (bad config, missing upstream, …)
+    // burns the whole SPAWN_WAIT_MS poll window before erroring.
+    let childExit: { code: number | null; signal: string | null } | undefined;
+    child.on?.("exit", (...rest: unknown[]) => {
+        childExit = {
+            code: typeof rest[0] === "number" ? rest[0] : null,
+            signal: typeof rest[1] === "string" ? rest[1] : null,
+        };
+    });
+
     const deadline = now() + SPAWN_WAIT_MS;
     while (now() < deadline) {
+        if (childExit) break;
         await sleepImpl(HEALTH_POLL_INTERVAL_MS);
         const inst = readInstance();
         if (isProxyInstanceFile(inst) && inst.launchToken === launchToken) {
@@ -1827,6 +1839,12 @@ export async function ensureProxyRunning(
         if (stale && (await probeHealth(proxyOrigin(opts.host, port), fetchImpl))) {
             return { origin: proxyOrigin(opts.host, port), port, child, logPath };
         }
+    }
+    if (childExit) {
+        const detail = childExit.code !== null
+            ? `code ${childExit.code}`
+            : childExit.signal ? `signal ${childExit.signal}` : "unknown reason";
+        throw new Error(`bili: proxy child exited before becoming healthy (${detail}) (log: ${logPath})`);
     }
     throw new Error(`bili: proxy did not become healthy within ${SPAWN_WAIT_MS}ms (log: ${logPath})`);
 }
