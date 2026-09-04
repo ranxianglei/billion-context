@@ -262,6 +262,19 @@ export function resolveUpstream(_opts: ProxyOptions, reqUrl: string, req?: http.
         const mitmKey = mitmUpstream.replace(/^https:\/\//, "mitm://");
         return { upstream: mitmUpstream, rewrittenUrl: mitmKey + (reqUrl ?? "") };
     }
+    // Forward-proxy mode (#535): a standard absolute-form request line
+    // (`POST http://host/path`) arrives from clients that route their traffic
+    // through us via HTTP_PROXY (hermes's httpx stack). Same routing semantics
+    // as the /bili/ path form below — full pipeline plus #409 destination
+    // admission (tunnel: true), which also rejects self/link-local targets.
+    if (/^https?:\/\//i.test(reqUrl)) {
+        try {
+            const u = new URL(reqUrl);
+            return { upstream: `${u.protocol}//${u.host}`, rewrittenUrl: reqUrl, tunnel: true };
+        } catch {
+            // malformed absolute URL — fall through to no-route passthrough
+        }
+    }
     // Zero-config mode: a request like `/bili/https://open.bigmodel.cn/api/anthropic`
     // embeds the full upstream URL after the `/bili/` prefix. Strip the prefix,
     // take the rest verbatim as the upstream. This is the ONLY routing mode —
