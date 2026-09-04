@@ -1,9 +1,18 @@
 import { createInitialState, type CompressionState, type CoreMessage } from "acp-kernel";
 import { getStore } from "./persist.js";
 
+export type BlockView = { text: string; count: number };
+
+/** Original content of a compressed block, captured at compress time. `full`
+ *  (all original messages) is always stored. `one` (one-level: direct messages
+ *  + nested child summaries) is `null` when it is byte-identical to `full` —
+ *  always the case for leaf blocks, since nested children are deactivated at
+ *  creation and the one-level view skips inactive children — and is persisted
+ *  as a single copy in that case (#401: the duplicated copy was 50% of
+ *  blockContents bytes on disk). */
 export type BlockContent = {
-    one: { text: string; count: number };
-    full: { text: string; count: number };
+    one: BlockView | null;
+    full: BlockView;
 };
 
 /** One successful compress, recorded for #189 observability: correlating a
@@ -89,9 +98,11 @@ export type Session = {
      *  the source messages are still present in the request. decompress reads
      *  from here instead of scanning ctx.messages (which only holds the
      *  post-compression / folded view and loses originals across rounds).
-     *  Two views are cached: `one` (one-level: direct messages + nested
+     *  Two views are cached — `one` (one-level: direct messages + nested
      *  child summaries) and `full` (all original messages), matching the
-     *  collectBlockContent full flag semantics.
+     *  collectBlockContent full flag semantics — but when the views are
+     *  byte-identical (leaf blocks) only one copy is kept (`one: null`,
+     *  #401).
      *  Unbounded in memory by design — block summaries are small relative to
      *  the history they replace, and disk persistence keeps the source of
      *  truth; the MAX_SESSIONS cap bounds the number of concurrent sessions
@@ -139,18 +150,19 @@ let MAX_SESSIONS = Math.max(1, Number.parseInt(process.env.BILI_MAX_SESSIONS ?? 
 let initialized = false;
 
 /** Bulk-load persisted sessions from disk into the in-memory map. Called once
- *  at server startup before listening. Caps at MAX_SESSIONS by the most
- *  recently active of createdAt/lastSeen-from-disk (keeps the freshest; a
- *  session that is old but was active until recently must not lose its slot
- *  to a newer-created-but-idle one, #404) so a huge backlog cannot OOM on
- *  boot. Idempotent. */
+ *  at server startup before listening. boot() does ONE loadAll pass plus the
+ *  #286 migration over the same parsed map (#401: the
+ *  old migrateLegacyIds()+loadAll() pair walked and parsed the tree twice).
+ *  Caps at MAX_SESSIONS by the most recently active of createdAt/lastSeen-
+ *  from-disk (keeps the freshest; a session that is old but was active until
+ *  recently must not lose its slot to a newer-created-but-idle one, #404) so
+ *  a huge backlog cannot OOM on boot. Idempotent. */
 export async function initSessions(): Promise<void> {
     if (initialized) return;
     initialized = true;
     const store = getStore();
     if (!store.enabled) return;
-    await store.migrateLegacyIds();
-    const loaded = await store.loadAll();
+    const loaded = await store.boot();
     if (loaded.size > MAX_SESSIONS) {
         const freshness = (s: Session) => Math.max(s.createdAt ?? 0, s.lastSeen ?? 0);
         const entries = [...loaded.entries()].sort((a, b) => freshness(b[1]) - freshness(a[1]));
