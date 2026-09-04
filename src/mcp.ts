@@ -9,7 +9,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { readProxyInstanceFile } from "./instance.js";
+import { isPidAlive, isProxyInstanceFile, readProxyInstanceFile, type ProxyInstanceFile } from "./instance.js";
 
 const VERSION = (() => {
     try {
@@ -34,11 +34,34 @@ type McpToolDef = {
 // request id — binding is headless (next NEW session).
 const DEFAULT_PROXY_ORIGIN = "http://127.0.0.1:8787";
 
+let staleOriginNoted = false;
+
+function noteStaleOrigin(rec: ProxyInstanceFile): void {
+    if (staleOriginNoted) return;
+    staleOriginNoted = true;
+    try {
+        process.stderr.write(
+            `[bili-mcp] proxy-origin record is stale (instance ${rec.instanceId.slice(0, 8)} pid ${rec.pid} not running) — falling back to ${DEFAULT_PROXY_ORIGIN}; if your proxy runs elsewhere, set BILI_MCP_PROXY (#405)\n`,
+        );
+    } catch {}
+}
+
 export function resolveProxyOrigin(): string {
     const fromEnv = process.env.BILI_MCP_PROXY?.trim();
     if (fromEnv && fromEnv.length > 0) return fromEnv;
     const discovered = readProxyInstanceFile();
-    if (discovered && /^https?:\/\/\S+$/.test(discovered.origin)) return discovered.origin;
+    if (discovered && /^https?:\/\/\S+$/.test(discovered.origin)) {
+        // #405: a JSON record left behind by a crashed/killed proxy names a
+        // port nothing listens on. pid liveness is the cheap check (no HTTP
+        // probe on the hot path); a dead record falls back to the default
+        // origin — where a replacement proxy binds. pid 0 means the record
+        // makes no liveness claim (foreign writer) — keep the legacy trust.
+        if (isProxyInstanceFile(discovered) && discovered.pid > 0 && !isPidAlive(discovered.pid)) {
+            noteStaleOrigin(discovered);
+            return DEFAULT_PROXY_ORIGIN;
+        }
+        return discovered.origin;
+    }
     return DEFAULT_PROXY_ORIGIN;
 }
 
