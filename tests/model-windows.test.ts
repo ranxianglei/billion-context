@@ -140,6 +140,32 @@ test("collectModelWindows: same id across providers → largest window wins", ()
     assert.deepEqual(collectModelWindows(config), { m: 3000, "codex-m": 272000 });
 });
 
+test("collectModelWindows(scope): launched client's own declaration wins, other clients ignored (#436)", () => {
+    const config: ClientConfig = {
+        pi: { providers: { a: { baseUrl: "http://a", models: [{ id: "/mnt/m/qwen", contextWindow: 262144 }] } } },
+        omp: { providers: { b: { baseUrl: "http://b", models: [{ id: "/mnt/m/qwen", contextWindow: 131072 }] } } },
+        opencode: { providers: { c: { baseURL: "http://c", models: [{ id: "/mnt/m/qwen", contextWindow: 262144 }] } } },
+        codex: { providers: {}, modelWindows: [{ id: "codex-m", contextWindow: 272000 }] },
+    };
+    assert.deepEqual(collectModelWindows(config, "omp"), { "/mnt/m/qwen": 131072 });
+    assert.deepEqual(collectModelWindows(config, "pi"), { "/mnt/m/qwen": 262144 });
+    assert.deepEqual(collectModelWindows(config, "opencode"), { "/mnt/m/qwen": 262144 });
+    assert.deepEqual(collectModelWindows(config, "codex"), { "codex-m": 272000 });
+    assert.deepEqual(collectModelWindows(config, "hermes"), {});
+});
+
+test("collectModelWindows(scope): same id across providers of the SAME client → largest still wins", () => {
+    const config: ClientConfig = {
+        omp: {
+            providers: {
+                a: { baseUrl: "http://a", models: [{ id: "m", contextWindow: 1000 }] },
+                b: { baseUrl: "http://b", models: [{ id: "m", contextWindow: 3000 }] },
+            },
+        },
+    };
+    assert.deepEqual(collectModelWindows(config, "omp"), { m: 3000 });
+});
+
 test("parseLauncherModelWindows: valid JSON, invalid input, non-numeric filtered", () => {
     assert.deepEqual(parseLauncherModelWindows('{"qwen3.8-27b": 262144.9, "x": 100}'), { "qwen3.8-27b": 262144, x: 100 });
     assert.deepEqual(parseLauncherModelWindows(undefined), {});

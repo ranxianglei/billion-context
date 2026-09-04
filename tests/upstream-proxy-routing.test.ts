@@ -34,21 +34,25 @@ test("/bili/ resolves upstream host and full path from embedded URL", () => {
         upstream: "https://relay.example",
         rewrittenUrl: "https://relay.example/openai/v1/responses?foo=a%2Fb",
         explicitProtocol: undefined,
+        tunnel: true,
     });
     assert.deepEqual(resolveUpstream(opts, "/bili/https://relay.example/openai/v1/future/unknown?x=1"), {
         upstream: "https://relay.example",
         rewrittenUrl: "https://relay.example/openai/v1/future/unknown?x=1",
         explicitProtocol: undefined,
+        tunnel: true,
     });
     assert.deepEqual(resolveUpstream(opts, "/bili/responses/https://relay.example/custom-path"), {
         upstream: "https://relay.example",
         rewrittenUrl: "https://relay.example/custom-path",
         explicitProtocol: "responses",
+        tunnel: true,
     });
     assert.deepEqual(resolveUpstream(opts, "/bili/anthropic/https://relay.example/api/generate"), {
         upstream: "https://relay.example",
         rewrittenUrl: "https://relay.example/api/generate",
         explicitProtocol: "anthropic",
+        tunnel: true,
     });
     assert.equal(resolveUpstream(opts, "/bili-not-owned/responses"), undefined);
 });

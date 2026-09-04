@@ -88,14 +88,19 @@ export function replaceBiliCompactionItems<T>(input: T[]): { items: T[]; replace
     return { items, replaced, dropped };
 }
 
-// Safety valve: forge ONLY when the transform succeeded, the steady-state
-// context is below the 90% threshold (codex's own auto-compact point — above
-// it, bili's ACP has failed to keep up and native compaction must backstop),
-// and there is at least one active block (a real summary to hand off).
-export function codexCompactGate(session: Session, effectiveLimit: number, transformOk: boolean): boolean {
-    if (!transformOk || effectiveLimit <= 0) return false;
+// Safety valve preconditions (#332): evaluable BEFORE the kernel transform so
+// the pipeline can dispatch a compaction request (forge vs verbatim
+// passthrough) before prepare/preflight touch payload or state. 90% is codex's
+// own auto-compact point — above it, native compaction must backstop.
+export function codexCompactGatePre(session: Session, effectiveLimit: number): boolean {
+    if (effectiveLimit <= 0) return false;
     if (session.stats.lastInputTokens >= effectiveLimit * 0.9) return false;
     return session.state.blocks.some((b) => b.active);
+}
+
+// Full safety valve: forge only when the kernel transform also succeeded.
+export function codexCompactGate(session: Session, effectiveLimit: number, transformOk: boolean): boolean {
+    return transformOk && codexCompactGatePre(session, effectiveLimit);
 }
 
 // Minimal legal forged reply for the trigger form. Streaming: exactly one

@@ -429,3 +429,139 @@ test("loop #10 (S3): upstream 500 mid-loop terminates cleanly (timer cleared, no
         globalThis.fetch = orig;
     }
 });
+
+// #422: after a successful compress the re-request must reflect the post-
+// compress fold (host refreshFolded hook), not the stale pre-compress view.
+// The stale view is what made the model stop: it was told "~N tokens saved"
+// while staring at the identical context it had just compressed.
+test("loop #422a: successful compress → re-request carries the refreshed fold + round records", async () => {
+    // 7 messages: kernel protects the last 5, so m00001/m00002 are compressible.
+    const ctx = withRefs(
+        makeCtx([
+            textMsg("raw_1", "user", "task: audit files. " + bigText(5000)),
+            textMsg("raw_2", "user", "consumed content " + bigText(5000)),
+            textMsg("raw_3", "user", bigText(5000)),
+            textMsg("raw_4", "assistant", bigText(5000)),
+            textMsg("raw_5", "user", bigText(5000)),
+            textMsg("raw_6", "assistant", bigText(5000)),
+            textMsg("raw_7", "user", bigText(5000)),
+        ]),
+    );
+    const compressArgs = JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "SUMMARY-422: task kickoff plus consumed file read distilled into one dense block." }] });
+    const round1 = [
+        sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+        fcEvents(0, "call_c", "compress", compressArgs),
+        COMPLETED,
+    ].join("");
+    const probe = reFetchProbe();
+    let refreshCalls = 0;
+    try {
+        ctx.refreshFolded = (current) => {
+            refreshCalls++;
+            // Host mirror: fresh fold for the new state + this round's records.
+            const records = current.filter((m) => typeof m.id === "string" && m.id.startsWith("acp_loop_"));
+            assert.ok(records.length >= 2, `refreshFolded must receive the round records (call+result), got ${records.length}`);
+            assert.ok(records.some((m) => m.contentType === "tool-call" && m.toolName === "compress"), "records include the compress tool-call");
+            assert.ok(records.some((m) => m.contentType === "tool-result"), "records include the compress tool-result");
+            return [
+                textMsg("m00001", "user", "FRESH-FOLDED-VIEW-422 (old span folded away)"),
+                textMsg("m00003", "assistant", "recent tail"),
+                ...records,
+            ];
+        };
+        await drain(
+            new Response(round1, { status: 200 }).body!,
+            ctx,
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.ok(probe.calls() >= 1, "re-request fired");
+        const body = probe.bodies()[0]!;
+        assert.ok(body.includes("FRESH-FOLDED-VIEW-422"), "re-request carries the refreshed post-compress fold");
+        assert.ok(!body.includes("consumed content"), "consumed content is folded out of the re-request");
+        assert.ok(body.includes("SUMMARY-422"), "round records (compress call args) ride on top of the fresh fold");
+        assert.ok(body.includes("[Compressed m00001"), "compress tool-result present in the re-request tail");
+        assert.equal(refreshCalls, 1, "refreshFolded called exactly once for one successful compress");
+        assert.equal(ctx.session.stats.compressCreditTokens, 0, "credit cleared once the fold reached a model-visible request");
+    } finally {
+        probe.restore();
+    }
+});
+
+// Scope guard: a FAILED compress changes no state — no refresh, stale view kept.
+test("loop #422b: failed compress → no fold refresh (stale view kept)", async () => {
+    const ctx = withRefs(
+        makeCtx([
+            textMsg("m00001", "user", "hello"),
+            textMsg("m00002", "assistant", "hi"),
+        ]),
+    );
+    // invalid refs → applyRanges returns FAILED, no block created
+    const compressArgs = JSON.stringify({ content: [{ startId: "b99", endId: "b99", summary: "x".repeat(60) }] });
+    const round1 = [
+        sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+        fcEvents(0, "call_f", "compress", compressArgs),
+        COMPLETED,
+    ].join("");
+    const probe = reFetchProbe();
+    try {
+        ctx.refreshFolded = () => {
+            throw new Error("refreshFolded must NOT be called for a failed compress");
+        };
+        await drain(
+            new Response(round1, { status: 200 }).body!,
+            ctx,
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.ok(probe.calls() >= 1, "re-request still fires so the model sees the failure");
+        assert.ok(probe.bodies()[0]!.includes("hello"), "stale view preserved on failure");
+        assert.ok(probe.bodies()[0]!.includes("Compression FAILED"), "failure surfaced to the model");
+    } finally {
+        probe.restore();
+    }
+});
+
+// Degradation guard: a throwing refreshFolded falls back to the pre-compress
+// view (previous behavior) instead of killing the loop.
+test("loop #422c: refreshFolded throws → re-request keeps the pre-compress view", async () => {
+    // 7 messages: kernel protects the last 5, so m00001/m00002 are compressible
+    // and refreshFolded IS invoked (then throws) — not a protected-zone failure.
+    const ctx = withRefs(
+        makeCtx([
+            textMsg("raw_1", "user", "task: audit files. " + bigText(5000)),
+            textMsg("raw_2", "user", "consumed content " + bigText(5000)),
+            textMsg("raw_3", "user", bigText(5000)),
+            textMsg("raw_4", "assistant", bigText(5000)),
+            textMsg("raw_5", "user", bigText(5000)),
+            textMsg("raw_6", "assistant", bigText(5000)),
+            textMsg("raw_7", "user", bigText(5000)),
+        ]),
+    );
+    const compressArgs = JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "SUMMARY-422c: the consumed span distilled into one dense audit block for later." }] });
+    const round1 = [
+        sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+        fcEvents(0, "call_c", "compress", compressArgs),
+        COMPLETED,
+    ].join("");
+    const probe = reFetchProbe();
+    try {
+        let refreshCalled = false;
+        ctx.refreshFolded = () => {
+            refreshCalled = true;
+            throw new Error("host fold blew up");
+        };
+        const out = await drain(
+            new Response(round1, { status: 200 }).body!,
+            ctx,
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.ok(refreshCalled, "compress succeeded and refreshFolded was invoked (the throw path is what we test)");
+        assert.ok(probe.calls() >= 1, "re-request fired despite the refresh failure");
+        assert.ok(probe.bodies()[0]!.includes("consumed content"), "pre-compress view kept as fallback");
+        assert.ok(/response\.completed/.test(out), "loop completed gracefully");
+    } finally {
+        probe.restore();
+    }
+});

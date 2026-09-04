@@ -91,8 +91,16 @@ export type CompressSettings = {
     preserveRecentMessages?: number;
     /** Token budget reserved for recent messages (kernel `preserveRecentTokens`). */
     preserveRecentTokens?: number;
-    /** Minimum compressible range size in tokens; smaller ranges are skipped
-     *  (kernel `compress.minCompressRange`). */
+    /** Minimum compressible range size, in CHARACTERS (not tokens); smaller
+     *  ranges are skipped. English/code averages ~4 chars per token, CJK
+     *  ~1-2 chars per token, so the same number is ~4× more permissive for
+     *  English text than a token-based reading. Maps to kernel
+     *  `compress.minCompressRange` (default 5000 chars). */
+    minCompressRangeChars?: number;
+    /** Deprecated alias of {@link minCompressRangeChars} kept for backward
+     *  compatibility. When both keys are set at the same level the new name
+     *  wins; across levels the deeper level wins regardless of which name it
+     *  uses. */
     minCompressRange?: number;
     /** Enable multi-tier (T2/T3) distillation (kernel `tiers.enabled`). */
     tiers?: boolean;
@@ -511,7 +519,7 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
         if (!numberOrPercent(obj[key])) { ok = false; continue; }
         (out as Record<string, unknown>)[key] = typeof obj[key] === "string" ? (obj[key] as string).trim() : obj[key];
     }
-    for (const key of ["nudgeGrowthTokens", "preserveRecentMessages", "preserveRecentTokens", "minCompressRange"] as const) {
+    for (const key of ["nudgeGrowthTokens", "preserveRecentMessages", "preserveRecentTokens", "minCompressRange", "minCompressRangeChars"] as const) {
         takeNumber(key);
     }
     if ("tiers" in obj) {

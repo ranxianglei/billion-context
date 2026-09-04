@@ -47,6 +47,15 @@ function conversation() {
     }
     return input;
 }
+// 14 messages ≈ 15.4k tokens — OVER the 10k window, so preflight WOULD fire
+// if this payload went through the normal pipeline (#332 regression input).
+function bigConversation() {
+    const input: { type: string; role: string; content: string }[] = [];
+    for (let i = 0; i < 14; i++) {
+        input.push({ type: "message", role: i % 2 === 0 ? "user" : "assistant", content: `Message ${i} of the working session. ` + `WORK_${i}_content_`.repeat(290) });
+    }
+    return input;
+}
 
 type Harness = {
     proxy: http.Server;
@@ -286,5 +295,96 @@ test("e2e E2 (endpoint form): intercept + healthy ACP → forged JSON {output}, 
         assert.ok(Array.isArray(parsed.output), "output is an array");
         assert.ok(parsed.output.length > 0, "output carries the compacted history");
         assert.equal(h.bodies.length, afterSetup, "upstream NOT contacted for the intercepted endpoint compact");
+    });
+});
+
+// Issue #332: a compaction_trigger request that is NOT intercepted must reach
+// upstream byte-identical — no preflight overflow-compress, no payload
+// rebuild, no window clamp, no session-state folding as a side effect. The
+// oversized payload (14 msgs ≈ 15.4k > 10k window) is what made the old
+// ordering fire preflight before the compact detection ran.
+
+test("e2e #332 (trigger form): pass mode + oversized payload → forwarded byte-identical, no state mutation", async () => {
+    await withHarness({ mode: "pass", firstTurnTokens: 1000 }, async (h) => {
+        const afterSetup = await setupCompressedSession(h);
+        const before = listSessions().find((x) => x.meta.label === SESSION)!;
+        const stateBefore = JSON.stringify(before.state);
+
+        const rawBody = JSON.stringify({ model: "gpt-resp", stream: true, session_id: SESSION, instructions: "You are the test coding agent.", input: [...bigConversation(), { type: "compaction_trigger" }] });
+        const r2 = await fetch(h.url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "user-agent": CODEX_UA },
+            body: rawBody,
+        });
+        assert.equal(r2.status, 200, "verbatim passthrough returns the upstream status");
+        await r2.text();
+        assert.equal(h.bodies.length, afterSetup + 1, "compact request forwarded to upstream");
+        assert.equal(h.bodies[h.bodies.length - 1], rawBody, "upstream received the EXACT bytes codex sent (no preflight, no rebuild)");
+        const after = listSessions().find((x) => x.meta.label === SESSION)!;
+        assert.equal(JSON.stringify(after.state), stateBefore, "session state untouched (no folding as a side effect)");
+    });
+});
+
+test("e2e #332 (trigger form): intercept + gate preconditions fail (≥90%) + oversized payload → forwarded byte-identical", async () => {
+    await withHarness({ mode: "intercept", firstTurnTokens: 15000 }, async (h) => {
+        const afterSetup = await setupCompressedSession(h);
+        const before = listSessions().find((x) => x.meta.label === SESSION)!;
+        assert.ok(before.stats.lastInputTokens >= 9000, "high steady-state usage → gate preconditions fail");
+        const stateBefore = JSON.stringify(before.state);
+
+        const rawBody = JSON.stringify({ model: "gpt-resp", stream: true, session_id: SESSION, instructions: "You are the test coding agent.", input: [...bigConversation(), { type: "compaction_trigger" }] });
+        const r2 = await fetch(h.url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "user-agent": CODEX_UA },
+            body: rawBody,
+        });
+        assert.equal(r2.status, 200);
+        await r2.text();
+        assert.equal(h.bodies.length, afterSetup + 1, "compact request forwarded to upstream");
+        assert.equal(h.bodies[h.bodies.length - 1], rawBody, "unhealthy ACP → verbatim passthrough (issue log scenario: no more 400 loop on rebuilt payload)");
+        const after = listSessions().find((x) => x.meta.label === SESSION)!;
+        assert.equal(JSON.stringify(after.state), stateBefore, "session state untouched");
+    });
+});
+
+test("e2e #332 (trigger form): intercept + healthy ACP + oversized payload → forged, upstream untouched", async () => {
+    await withHarness({ mode: "intercept", firstTurnTokens: 1000 }, async (h) => {
+        const afterSetup = await setupCompressedSession(h);
+        const s = listSessions().find((x) => x.meta.label === SESSION)!;
+        assert.ok(s.stats.lastInputTokens < 9000, "low steady-state usage → gate preconditions pass");
+
+        const r2 = await fetch(h.url, {
+            method: "POST",
+            headers: { "content-type": "application/json", "user-agent": CODEX_UA },
+            body: JSON.stringify({ model: "gpt-resp", stream: true, session_id: SESSION, instructions: "You are the test coding agent.", input: [...bigConversation(), { type: "compaction_trigger" }] }),
+        });
+        assert.equal(r2.status, 200);
+        assert.equal(r2.headers.get("content-type"), "text/event-stream", "forged SSE");
+        const text = await r2.text();
+        assert.ok(text.includes("fc_bili_"), "forged compaction item");
+        assert.ok(text.includes("resp_bili_"), "forged response id");
+        assert.equal(h.bodies.length, afterSetup, "upstream NOT contacted (preflight no longer interferes with the forge)");
+    });
+});
+
+test("e2e #332 (endpoint form): intercept + gate preconditions fail → raw body forwarded, no state mutation", async () => {
+    await withHarness({ mode: "intercept", firstTurnTokens: 15000 }, async (h) => {
+        const afterSetup = await setupCompressedSession(h);
+        const before = listSessions().find((x) => x.meta.label === SESSION)!;
+        assert.ok(before.stats.lastInputTokens >= 9000, "high steady-state usage → gate preconditions fail");
+        const stateBefore = JSON.stringify(before.state);
+
+        const rawBody = JSON.stringify({ model: "gpt-resp", stream: false, session_id: SESSION, instructions: "You are the test coding agent.", input: conversation() });
+        const r2 = await fetch(h.compactUrl, {
+            method: "POST",
+            headers: { "content-type": "application/json", "user-agent": CODEX_UA },
+            body: rawBody,
+        });
+        assert.equal(r2.status, 200);
+        await r2.text();
+        assert.equal(h.bodies.length, afterSetup + 1, "endpoint compact forwarded to upstream");
+        assert.equal(h.bodies[h.bodies.length - 1], rawBody, "upstream received the exact bytes sent");
+        const after = listSessions().find((x) => x.meta.label === SESSION)!;
+        assert.equal(JSON.stringify(after.state), stateBefore, "processTurn skipped when the gate cannot pass");
     });
 });

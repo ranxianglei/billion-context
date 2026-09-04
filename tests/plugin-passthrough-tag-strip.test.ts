@@ -94,6 +94,30 @@ test("plugin passthrough strips tags split across deltas and flushes tail before
     assert.ok((blocks[flushIdx] ?? "").includes("msg_1"), "flushed tail delta carries item_id");
 });
 
+test("plugin passthrough strips a tag streamed in tokenizer-sized fragments (#468)", async () => {
+    const out: string[] = [];
+    const res = makeRes(out);
+    const session = makeSession();
+    const whole = `ok ${TAG_OPEN}m00042${TAG_CLOSE} tail`;
+    const micro = whole.match(/.{1,4}/g) ?? [];
+    const events = [
+        ...micro.map((piece) => sse({ type: "response.output_text.delta", item_id: "msg_1", output_index: 0, delta: piece })),
+        sse({ type: "response.completed", response: { usage: { input_tokens: 7, output_tokens: 3 } } }),
+    ];
+    await pipePluginResponsesWithStrip(streamOf(events), res, session);
+    const text = out.join("");
+    assert.ok(!text.includes("m00042"), "micro-fragmented tag never reassembles downstream");
+    assert.ok(!text.includes("\x3cacp") && !text.includes("\x3c/acp"), "no tag fragment survives");
+    const joined = text
+        .split("\n")
+        .filter((l) => l.startsWith("data:"))
+        .map((l) => JSON.parse(l.slice(5).trim()) as { type?: string; delta?: string })
+        .filter((ev) => ev.type === "response.output_text.delta" && typeof ev.delta === "string")
+        .map((ev) => ev.delta as string)
+        .join("");
+    assert.equal(joined, "ok  tail", "surrounding prose reassembles to the tag-free text");
+});
+
 test("plugin passthrough keeps function_call and non-tag events byte-identical", async () => {
     const out: string[] = [];
     const res = makeRes(out);
@@ -167,7 +191,8 @@ test("plugin passthrough resolves held tail at stream end without a done-family 
     ];
     await pipePluginResponsesWithStrip(streamOf(events2), res2, session);
     const text2 = out2.join("");
-    assert.ok(text2.includes(`"delta":"prose \x3cac"`), "ambiguous prefix passes through untouched at stream end");
+    assert.ok(text2.includes(`"delta":"prose "`), "clean prefix passes once the ambiguous head is held");
+    assert.ok(text2.includes(`"delta":"\x3cac"`), "ambiguous prefix flushed as its own delta at stream end, never lost");
 });
 
 test("plugin passthrough rebuildEvent collapses multi-line data payloads into one line", async () => {
@@ -205,15 +230,15 @@ test("plugin JSON passthrough strips render tags for responses protocol", async 
     assert.equal((session.stats as Record<string, unknown>)["lastInputTokens"], 4, "usage still sampled");
 });
 
-test("plugin JSON passthrough stays verbatim for openai protocol and tag-free bodies", async () => {
+test("plugin JSON passthrough stays verbatim for tag-free bodies", async () => {
     const { pipePluginJson } = await import("../src/plugin.ts");
     {
         const out: string[] = [];
         const res = makeRes(out);
         const session = makeSession();
-        const body = JSON.stringify({ choices: [{ message: { content: `x ${TAG_OPEN}m00005${TAG_CLOSE}` } }], usage: { prompt_tokens: 2 } });
+        const body = JSON.stringify({ choices: [{ message: { content: "clean chat" } }], usage: { prompt_tokens: 2 } });
         await pipePluginJson(streamOf([body]), res as unknown as import("node:http").ServerResponse, session, "openai");
-        assert.equal(out.join(""), body, "openai protocol body byte-identical");
+        assert.equal(out.join(""), body, "tag-free openai body byte-identical");
     }
     {
         const out: string[] = [];

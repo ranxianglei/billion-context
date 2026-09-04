@@ -2,7 +2,6 @@ import { buildStatusReport, collectBlockContent, estimateTokensFast, type Compre
 import { type Session, cacheBlockContent } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput, PROXY_TOOL_NAMES } from "./compress-tool.js";
 import { resolveDecompress } from "./decompress-shared.js";
-import { normalizeSseLineEndings } from "./sse-util.js";
 import { containsRenderTagText, stripAcpTags } from "./loop/tag-echo-filter.js";
 import { maxShrinkPerCompress } from "./fetch-util.js";
 
@@ -19,180 +18,10 @@ export type RewriteCtx = {
     debug?: boolean;
 };
 
-type BlockState = { toolName: string | null; json: string; hadRealToolUse: boolean };
-
-const NOOP = Symbol("noop");
-
-export async function* rewriteSseStream(
-    upstream: ReadableStream<Uint8Array>,
-    ctx: RewriteCtx,
-): AsyncGenerator<Buffer> {
-    const reader = upstream.getReader();
-    const decoder = new TextDecoder("utf-8");
-    let buf = "";
-    const blocks = new Map<number, BlockState>();
-    let convertedAny = false;
-    let sawRealToolUse = false;
-    let capturedUsage: Record<string, unknown> | undefined;
-    let output = "";
-
-    const flush = (): Buffer => {
-        const out = Buffer.from(output, "utf8");
-        output = "";
-        return out;
-    };
-
-    try {
-        for (;;) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            buf += decoder.decode(value, { stream: true });
-            buf = normalizeSseLineEndings(buf);
-            let idx: number;
-            while ((idx = buf.indexOf("\n\n")) !== -1) {
-                const rawEvent = buf.slice(0, idx);
-                buf = buf.slice(idx + 2);
-                const ev = parseSseEvent(rawEvent);
-                if (!ev) continue;
-                const routed = routeEvent(ev, blocks, ctx, (c) => (convertedAny = c || convertedAny), () => (sawRealToolUse = true), () => convertedAny, (u) => (capturedUsage = u));
-                if (routed === NOOP) continue;
-                output += routed;
-                if (output.length >= 8192) yield flush();
-            }
-        }
-        if (convertedAny) {
-            const finalDelta = buildStopReasonRewrite(sawRealToolUse, capturedUsage);
-            if (finalDelta) output += finalDelta;
-        }
-        if (buf) {
-            output += buf;
-            buf = "";
-        }
-        if (output) yield flush();
-    } finally {
-        reader.releaseLock();
-    }
-}
-
-function routeEvent(
-    ev: SseEvent,
-    blocks: Map<number, BlockState>,
-    ctx: RewriteCtx,
-    markConverted: (v: boolean) => void,
-    markRealToolUse: () => void,
-    getConverted: () => boolean,
-    setUsage: (u: Record<string, unknown>) => void,
-): string | typeof NOOP {
-    const d = ev.data;
-    if (!d || typeof d !== "object") return emitEvent(ev);
-    const t = (d as { type?: string }).type;
-    if (t === "content_block_start") {
-        const index = (d as { index?: number }).index ?? 0;
-        const cb = (d as { content_block?: { type?: string; name?: string } }).content_block;
-        if (cb?.type === "tool_use" && typeof cb.name === "string" && PROXY_TOOL_NAMES.has(cb.name)) {
-            blocks.set(index, { toolName: cb.name, json: "", hadRealToolUse: false });
-            markConverted(true);
-            return NOOP;
-        }
-        if (cb?.type === "tool_use") markRealToolUse();
-        return emitEvent(ev);
-    }
-    if (t === "content_block_delta") {
-        const index = (d as { index?: number }).index ?? 0;
-        const st = blocks.get(index);
-        if (st && st.toolName) {
-            const partial = (d as { delta?: { partial_json?: string } }).delta?.partial_json;
-            if (typeof partial === "string") st.json += partial;
-            return NOOP;
-        }
-        const dt = (d as { delta?: { text?: string } }).delta;
-        if (dt?.text && containsRenderTagText(dt.text)) {
-            ctx.log(`[warn: tag echo] model emitted <acp tag in text delta: ${dt.text.slice(0, 120).replace(/\n/g, " ")}`);
-        }
-        return emitEvent(ev);
-    }
-    if (t === "content_block_stop") {
-        const index = (d as { index?: number }).index ?? 0;
-        const st = blocks.get(index);
-        if (st && st.toolName) {
-            blocks.delete(index);
-            return emitToolReplacement(st.toolName, st.json, ctx, index);
-        }
-        return emitEvent(ev);
-    }
-    // Suppress terminal events ONLY when we converted a compress tool_use
-    // (we re-emit a rewritten stop reason at stream end). Without this guard,
-    // plain text responses (the common case) never receive message_delta /
-    // message_stop and the client hangs until timeout.
-    // While here, record upstream usage into the session for the web UI / stats
-    // — but ONLY on the non-converted path (when we replaced the response with
-    // a compress note, the upstream usage is not the real completion).
-    if (t === "message_delta") {
-        // Capture upstream usage on BOTH paths: when not converted we need it
-        // for stats; when converted (tool_use replaced by text) the upstream
-        // message_delta is suppressed (NOOP below) but we still need its usage
-        // to emit a well-formed synthetic message_delta — ZCode's Zod schema
-        // requires usage.output_tokens:number, so hardcoding {} fails.
-        const u = (d as { usage?: Record<string, unknown> }).usage;
-        if (u) {
-            setUsage(u);
-            if (!getConverted()) {
-                const out = u.output_tokens;
-                if (typeof out === "number") ctx.session.stats.outputTokens += out;
-            }
-        }
-        return getConverted() ? NOOP : emitEvent(ev);
-    }
-    if (t === "message_start" && !getConverted()) {
-        const u = (d as { message?: { usage?: Record<string, unknown> } }).message?.usage;
-        if (u) {
-            const inp = u.input_tokens;
-            const cc = u.cache_creation_input_tokens;
-            const cr = u.cache_read_input_tokens;
-            if (typeof inp === "number") ctx.session.stats.inputTokens += inp;
-            if (typeof cr === "number") {
-                ctx.session.stats.cachedTokens += cr;
-                ctx.session.stats.cacheSamples += 1;
-            } else if (typeof inp === "number") {
-                ctx.session.stats.cacheSamples += 1;
-            }
-            // Anthropic bills cache writes separately; track them under input
-            // so the cumulative input reflects real prompt cost.
-            if (typeof cc === "number") ctx.session.stats.inputTokens += cc;
-        }
-    }
-    if (t === "message_stop") {
-        return getConverted() ? NOOP : emitEvent(ev);
-    }
-    return emitEvent(ev);
-}
-
-function emitToolReplacement(toolName: string, jsonInput: string, ctx: RewriteCtx, index: number): string {
-    let parsed: unknown = {};
-    try {
-        parsed = jsonInput ? JSON.parse(jsonInput) : {}
-    } catch {
-        parsed = {};
-    }
-    const args = (parsed && typeof parsed === "object" ? parsed : {}) as Record<string, unknown>;
-    const text = executeAnthropicProxyTool(toolName, args, ctx);
-    // Reuse the suppressed tool_use block's own index instead of hardcoding 0.
-    // Hardcoding 0 re-opens an already-closed text block (index 0 is usually a
-    // preceding text block), producing malformed SSE.
-    return (
-        `event: content_block_start\n` +
-        `data: ${JSON.stringify({ type: "content_block_start", index, content_block: { type: "text", text: "" } })}\n\n` +
-        `event: content_block_delta\n` +
-        `data: ${JSON.stringify({ type: "content_block_delta", index, delta: { type: "text_delta", text } })}\n\n` +
-        `event: content_block_stop\n` +
-        `data: ${JSON.stringify({ type: "content_block_stop", index })}\n\n`
-    );
-}
-
 // Dispatch all four ACP proxy tools to the same logic the OpenAI/Responses
 // path uses (compress-loop.ts executeProxyTool). compress mutates context
 // (handled by applyRanges); the other three are read-only queries whose result
-// is emitted as a text delta replacing the intercepted tool_use block.
+// becomes a text block replacing the intercepted tool_use.
 function executeAnthropicProxyTool(toolName: string, args: Record<string, unknown>, ctx: RewriteCtx): string {
     if (toolName === COMPRESS_TOOL_NAME) {
         return applyRanges(parseCompressInput(args), ctx);
@@ -308,42 +137,6 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         ctx.log(`[acp-proxy: compress failed: ${String(err)}]`);
         return `[Compression FAILED: ${String(err)}]`;
     }
-}
-
-function buildStopReasonRewrite(sawRealToolUse: boolean, usage?: Record<string, unknown>): string {
-    const stop_reason = sawRealToolUse ? "tool_use" : "end_turn";
-    // Preserve upstream usage (output_tokens etc.). Default output_tokens:0 so
-    // strict clients (ZCode Zod) that require output_tokens:number still pass
-    // even if the upstream omitted it.
-    const u = { output_tokens: 0, ...(usage ?? {}) };
-    return (
-        `event: message_delta\n` +
-        `data: ${JSON.stringify({ type: "message_delta", delta: { stop_reason }, usage: u })}\n\n` +
-        `event: message_stop\n` +
-        `data: ${JSON.stringify({ type: "message_stop" })}\n\n`
-    );
-}
-
-type SseEvent = { raw: string; data: unknown | null };
-
-function parseSseEvent(raw: string): SseEvent | null {
-    const lines = raw.split("\n");
-    let dataLine: string | null = null;
-    for (const l of lines) {
-        if (l.startsWith("data:")) {
-            dataLine = l.slice(5).trim();
-        }
-    }
-    if (dataLine === null) return { raw, data: null };
-    try {
-        return { raw, data: JSON.parse(dataLine) };
-    } catch {
-        return { raw, data: dataLine };
-    }
-}
-
-function emitEvent(ev: SseEvent): string {
-    return ev.raw + "\n\n";
 }
 
 export function rewriteJsonResponse(body: unknown, ctx: RewriteCtx): unknown {

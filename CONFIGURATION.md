@@ -148,7 +148,7 @@ A shallow key (`https://open.bigmodel.cn`) matches every path on that host. A de
 - **Status:** ACTIVE
 - **Description:** Maps a model name to its context-window declaration. The LLM `/models` endpoint does **not** return context windows (verified across OpenAI, Anthropic, zhipu, comfly), so the proxy cannot discover them at runtime. `context` is the model's context window in tokens; `output` is the max output size.
 
-  **Resolution order (first match wins):** (1) per-request sources — the client's `anthropic-beta` larger-context negotiation, a cooperative plugin's report, and the launcher's per-model windows; (2) the **warm** models.dev registry cache, when the model is listed (relay/private hosts match the bare model name against the registry's provider-prefixed entries); (3) this per-model `context` declaration; (4) the built-in context table. So when the models.dev registry already lists the model, the registry value **outranks this declaration** — this matters for relay/private deployments, where the registry's standard window can differ from the window the relay actually serves. To pin the effective window reliably, set `compress.modelContextLimit` instead (highest-priority source, always wins). Each model entry may also carry a per-model `compress` block (see [Compression Tuning](#compression-tuning)).
+  **Resolution order (first match wins):** (1) per-request sources — the client's `anthropic-beta` larger-context negotiation, a cooperative plugin's report, and the launcher's per-model windows; (2) this per-model `context` declaration; (3) the **warm** models.dev registry cache, when the model is listed (relay/private hosts match the bare model name against the registry's provider-prefixed entries); (4) the built-in context table. So this per-model `context` declaration **outranks the registry** — set it to the window your relay/private deployment actually serves, and it wins even when models.dev lists a different (usually larger) window for the model. `compress.modelContextLimit` remains the highest-priority source (always wins) when you want to pin the window across every route. Each model entry may also carry a per-model `compress` block (see [Compression Tuning](#compression-tuning)).
 
 ### `proxy`
 
@@ -229,12 +229,18 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Status:** ACTIVE
 - **Description:** Token budget reserved for recent-message protection. Maps to the kernel field `preserveRecentTokens`.
 
-#### `minCompressRange`
+#### `minCompressRangeChars`
 
 - **Type:** `number`
 - **Default:** *(kernel default, typically `5000`)*
 - **Status:** ACTIVE
-- **Description:** Minimum token count for a message range to be eligible for compression; smaller ranges are skipped. Maps to the kernel field `compress.minCompressRange`.
+- **Description:** Minimum range size, in **characters** (not tokens), for a message range to be eligible for compression; smaller ranges are skipped. English/code averages ~4 chars per token, CJK ~1-2, so the same number reads ~4× more permissive for English text than a token-based mental model. Maps to the kernel field `compress.minCompressRange`.
+
+#### `minCompressRange`
+
+- **Type:** `number`
+- **Status:** DEPRECATED (alias of `minCompressRangeChars`, kept for backward compatibility)
+- **Description:** Legacy name for `minCompressRangeChars` — same kernel mapping (`compress.minCompressRange`), same unit (characters). When both keys are set at the same level the canonical name wins; across levels the deeper level wins regardless of which name it uses.
 
 #### `tiers`
 
@@ -337,6 +343,7 @@ Environment variables take precedence over the config file. They are useful for 
 | `ACP_COMPRESS_TOOL` | Set to `0` to disable tool injection (same as `"compress.injectTool": false`). |
 | `ACP_COMPRESS_NUDGE` | Set to `0` to disable nudge injection (same as `"compress.injectNudge": false`). |
 | `ACP_MODEL_CONTEXT_LIMIT` | Override the context limit globally (absolute token count). |
+| `BILI_IMAGE_TOKEN_CAP` | Cap the per-image token estimate used by the preflight size gate and output clamp (#488/#496). By default an inline `data:` image counts as `base64 length / 4` tokens with **no cap** — correct for byte-billing relays, but a large over-estimate for pixel-tile upstreams (official Anthropic/OpenAI), which bill each image at roughly 1.1K–1.6K tokens regardless of byte size. Set this to your upstream's per-image tile cost so the gate reflects real billing; unset = no cap (current default). |
 | `BILI_CONFIG_FILE` | Override the config file path (point at any JSON file). |
 | `ACP_PORT` / `PORT` | Override the listen port. |
 | `ACP_HOST` | Override the listen host. |
@@ -353,6 +360,7 @@ Environment variables take precedence over the config file. They are useful for 
 | `BILI_UPSTREAM_PROXY` | Upstream proxy for the proxy's own outbound connections — highest priority, above per-URL/per-provider config. See the README *Upstream proxy* section. |
 | `BILI_PERSIST` | Set `0` to disable session persistence (in-memory only, lost on restart). |
 | `BILI_PERSIST_DEBOUNCE_MS` | Debounce window for persistence writes to disk, in ms (default `500`). |
+| `BILI_TUNNEL_ALLOWED_HOSTS` | `/bili/<absolute-url>` tunnel admission for **remote clients** (#409): comma-separated `host` or `host:port` entries that unlock loopback/private destinations (e.g. a LAN relay or the machine's own sglang) for non-loopback clients. The proxy itself and link-local/metadata addresses are always denied; local (loopback) clients always pass. |
 | `BILI_MAX_SESSIONS` | Max sessions held in memory (default `256`; LRU eviction — disk is the source of truth). |
 | `BILI_SESSIONS_DIR` | Directory for persisted session state (default XDG data dir). |
 | `BILLION_CONTEXT_PROXY` | Exported by the launcher; client-side bili plugins/extensions detect it and self-disable their own compression (no double compression). |

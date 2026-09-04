@@ -120,6 +120,35 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
     const model = (requestBody.model as string) ?? undefined;
     let messageId: string | undefined;
     let clientIndex = 0;
+    let messageStartForwarded = false;
+    const openBlocks: number[] = [];
+
+    const removeOpenBlock = (index: number): void => {
+        const i = openBlocks.indexOf(index);
+        if (i >= 0) openBlocks.splice(i, 1);
+    };
+
+    // #413: emitError must terminate a well-formed stream even when the
+    // upstream died before sending message_start — synthesize the start frame
+    // so content blocks are never orphaned (strict clients reject them).
+    const buildSyntheticMessageStart = (): Buffer => {
+        const extra: Record<string, unknown> = {};
+        if (model) extra.model = model;
+        const msg: Record<string, unknown> = {
+            id: messageId ?? `msg_acp_error_${Date.now()}`,
+            type: "message",
+            role: "assistant",
+            content: [],
+            stop_reason: null,
+            stop_sequence: null,
+            usage: { input_tokens: 0, output_tokens: 0 },
+            ...extra,
+        };
+        return Buffer.from(
+            `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: msg })}\n\n`,
+            "utf8",
+        );
+    };
 
     const buildTextBlock = (index: number, text: string): Buffer =>
         Buffer.from(
@@ -206,6 +235,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                     if (typeof u.input_tokens === "number") roundInput = u.input_tokens;
                     if (typeof u.cache_read_input_tokens === "number") roundCached = u.cache_read_input_tokens;
                     if (round === 1) {
+                        messageStartForwarded = true;
                         yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
                     }
                 } else if (type === "ping") {
@@ -221,6 +251,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                         if (block.type === "thinking" || block.type === "redacted_thinking") thinkingIndexes.add(upstreamIndex);
                         const ci = clientIndex++;
                         indexMap.set(upstreamIndex, ci);
+                        openBlocks.push(ci);
                         yield { kind: "meta", chunk: remapIndexInEvent(eventStr, ci), firstRoundOnly: round === 1 } as ParsedStreamEvent;
                     }
                 } else if (type === "content_block_delta") {
@@ -272,10 +303,12 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                         // Seal the current thinking segment so interleaved thinking
                         // blocks each keep their own signature on rebuild.
                         const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
+                        removeOpenBlock(ci);
                         yield { kind: "meta", chunk: remapIndexInEvent(eventStr, ci), firstRoundOnly: false } as ParsedStreamEvent;
                         yield { kind: "reasoning", delta: "", blockEnd: true } as ParsedStreamEvent;
                     } else {
                         const ci = indexMap.get(upstreamIndex) ?? upstreamIndex;
+                        removeOpenBlock(ci);
                         if (lastTextIndex !== null) {
                             const tail = tagFilter.flush();
                             if (tail.length > 0) {
@@ -385,8 +418,17 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
         },
 
         emitError(message) {
-            const errBlock = buildTextBlock(clientIndex++, `\n[acp-proxy: ${message}]\n`);
-            return Buffer.concat([errBlock, buildTerminal("end_turn", 0, 0, 0)]);
+            const parts: Buffer[] = [];
+            if (!messageStartForwarded) {
+                parts.push(buildSyntheticMessageStart());
+                messageStartForwarded = true;
+            }
+            for (const index of openBlocks.splice(0)) {
+                parts.push(Buffer.from(`event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index })}\n\n`, "utf8"));
+            }
+            parts.push(buildTextBlock(clientIndex++, `\n[acp-proxy: ${message}]\n`));
+            parts.push(buildTerminal("end_turn", 0, 0, 0));
+            return Buffer.concat(parts);
         },
     };
 }

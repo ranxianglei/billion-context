@@ -112,6 +112,13 @@ export type Session = {
      *  drop a never-persisted session on flush failure (that would be a
      *  permanent loss). */
     persisted: boolean;
+    /** In-memory only (NOT persisted — buildRecord omits it): true while the
+     *  session was restored from disk and has seen no request in THIS process
+     *  (#404). Restored sessions carry their on-disk savedAt as lastSeen (not
+     *  Date.now()), so consumers can tell boot-restore staleness from real
+     *  activity; fallback=latest skips restored sessions rather than guessing
+     *  among a readdir-order tie. Cleared on the first real request touch. */
+    restored?: boolean;
     /** In-memory only (NOT persisted — buildRecord omits it): the most recent
      *  successful compress, set by applyRanges and read by the replay/preflight
      *  retry callbacks to correlate a transient upstream rejection with the
@@ -132,8 +139,11 @@ let MAX_SESSIONS = Math.max(1, Number.parseInt(process.env.BILI_MAX_SESSIONS ?? 
 let initialized = false;
 
 /** Bulk-load persisted sessions from disk into the in-memory map. Called once
- *  at server startup before listening. Caps at MAX_SESSIONS by createdAt
- *  (keeps the most recent) so a huge backlog cannot OOM on boot. Idempotent. */
+ *  at server startup before listening. Caps at MAX_SESSIONS by the most
+ *  recently active of createdAt/lastSeen-from-disk (keeps the freshest; a
+ *  session that is old but was active until recently must not lose its slot
+ *  to a newer-created-but-idle one, #404) so a huge backlog cannot OOM on
+ *  boot. Idempotent. */
 export async function initSessions(): Promise<void> {
     if (initialized) return;
     initialized = true;
@@ -142,7 +152,8 @@ export async function initSessions(): Promise<void> {
     await store.migrateLegacyIds();
     const loaded = await store.loadAll();
     if (loaded.size > MAX_SESSIONS) {
-        const entries = [...loaded.entries()].sort((a, b) => (b[1].createdAt ?? 0) - (a[1].createdAt ?? 0));
+        const freshness = (s: Session) => Math.max(s.createdAt ?? 0, s.lastSeen ?? 0);
+        const entries = [...loaded.entries()].sort((a, b) => freshness(b[1]) - freshness(a[1]));
         for (const [id, s] of entries) {
             if (sessions.size >= MAX_SESSIONS) break;
             sessions.set(id, s);
@@ -156,6 +167,7 @@ export function getSession(id: string, meta?: { protocol?: Session["meta"]["prot
     const existing = sessions.get(id);
     if (existing) {
         existing.lastSeen = Date.now();
+        existing.restored = false;
         // Fill in protocol/upstream/label meta on an existing session if the caller
         // now knows it (e.g. a session was created by loadAll without meta).
         if (meta?.protocol && !existing.meta.protocol) existing.meta.protocol = meta.protocol;
@@ -167,7 +179,10 @@ export function getSession(id: string, meta?: { protocol?: Session["meta"]["prot
     const store = getStore();
     const reloaded = store.loadSync(id, meta);
     if (reloaded) {
+        // A memory-miss reload is triggered by a real request: stamp fresh
+        // activity, not the restored-from-disk state (#404).
         reloaded.lastSeen = Date.now();
+        reloaded.restored = false;
         reloaded.persisted = true;
         sessions.set(id, reloaded);
         return reloaded;
@@ -285,6 +300,82 @@ export function reconcileNativeCompactionBoundary(session: Session): boolean {
     };
     markDirty(session);
     return true;
+}
+
+/** Mark a client-side native compaction (omp /compact on the anthropic wire).
+ *  The sid does NOT rotate on in-session compaction, so the per-sid registry
+ *  reuses the same key with stale state. Consumed by the NEXT processTurn via
+ *  applyCompactionArchive (#395). Distinct from nativeCompactionBoundary
+ *  (Responses/codex, which rebases by resetting state). */
+export function markCompactionBoundary(session: Session): void {
+    session.metadata.compactionBoundary = {
+        at: Date.now(),
+        pending: true,
+    };
+    markDirty(session);
+}
+
+type PreCompactionArchive = Record<string, { at: number; reason: string }>;
+
+function readPreCompactionArchive(session: Session): PreCompactionArchive {
+    const raw = session.metadata.preCompactionArchive;
+    if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+        return raw as PreCompactionArchive;
+    }
+    return {};
+}
+
+export function preCompactionArchiveOf(session: Session): PreCompactionArchive {
+    return readPreCompactionArchive(session);
+}
+
+// Must run AFTER the processTurn that followed markCompactionBoundary (so
+// syncBlocks has deactivated the blocks whose raw ids left the shortened
+// history). Blocks active in `activeBefore` but inactive now are archived;
+// byRaw/byRef are pruned to liveRawIds (stops the #390 additive leak).
+// nextIndex is left alone so a freed ref slot is never re-allocated onto a
+// retained tail's live tag.
+export function applyCompactionArchive(
+    session: Session,
+    activeBefore: Set<string>,
+    liveRawIds: Set<string>,
+    log: (level: string, msg: string) => void,
+): void {
+    const boundary = session.metadata.compactionBoundary;
+    if (!boundary || typeof boundary !== "object" || !(boundary as Record<string, unknown>).pending) {
+        return;
+    }
+    const activeAfter = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
+    const deactivated = [...activeBefore].filter((id) => !activeAfter.has(id));
+    if (deactivated.length > 0) {
+        const archive = readPreCompactionArchive(session);
+        const at = Date.now();
+        for (const id of deactivated) {
+            archive[id] = { at, reason: "content replaced by client native compaction summary" };
+        }
+        session.metadata.preCompactionArchive = archive;
+    }
+
+    const { byRaw, byRef } = session.state.messageRefs;
+    const prunedByRaw: Record<string, string> = {};
+    for (const [rawId, ref] of Object.entries(byRaw)) {
+        if (liveRawIds.has(rawId)) prunedByRaw[rawId] = ref;
+    }
+    const prunedByRef: Record<string, string> = {};
+    for (const [ref, rawId] of Object.entries(byRef)) {
+        if (liveRawIds.has(rawId)) prunedByRef[ref] = rawId;
+    }
+    session.state.messageRefs.byRaw = prunedByRaw;
+    session.state.messageRefs.byRef = prunedByRef;
+
+    session.metadata.compactionBoundary = {
+        ...(boundary as Record<string, unknown>),
+        pending: false,
+        archivedAt: Date.now(),
+        archivedBlocks: deactivated,
+    };
+    markDirty(session);
+    log("info", `[${session.id}] native compaction boundary: archived ${deactivated.length} pre-compaction block(s)${deactivated.length > 0 ? ` (${deactivated.join(", ")})` : ""}; pruned ref maps to ${prunedByRaw.length} live raw id(s)`);
 }
 
 /** Flush a session to disk and drop it from memory (LRU eviction). Refuses to

@@ -227,12 +227,18 @@
 - **状态：** ACTIVE
 - **说明：** 为最近消息保护预留的 token 预算。映射到内核字段 `preserveRecentTokens`。
 
-#### `minCompressRange`
+#### `minCompressRangeChars`
 
 - **类型：** `number`
 - **默认值：** *（内核默认值，通常为 `5000`）*
 - **状态：** ACTIVE
-- **说明：** 一个消息范围可被纳入压缩的最小 token 数；更小的范围会被跳过。映射到内核字段 `compress.minCompressRange`。
+- **说明：** 一个消息范围可被纳入压缩的最小长度，单位为**字符**（不是 token）；更小的范围会被跳过。英文/代码平均约 4 字符/token，CJK 约 1-2 字符/token，同一数值对英文的实际语义比 token 直觉宽松约 4 倍。映射到内核字段 `compress.minCompressRange`。
+
+#### `minCompressRange`
+
+- **类型：** `number`
+- **状态：** DEPRECATED（`minCompressRangeChars` 的弃用别名，向后兼容保留）
+- **说明：** `minCompressRangeChars` 的旧名，内核映射（`compress.minCompressRange`）与单位（字符）完全相同。同层两键并存时新名优先；跨层时更深层优先，与键名无关。
 
 #### `tiers`
 
@@ -335,6 +341,7 @@
 | `ACP_COMPRESS_TOOL` | 设为 `0` 禁用工具注入（等同 `"compress.injectTool": false`）。 |
 | `ACP_COMPRESS_NUDGE` | 设为 `0` 禁用 nudge 注入（等同 `"compress.injectNudge": false`）。 |
 | `ACP_MODEL_CONTEXT_LIMIT` | 全局覆盖上下文上限（绝对 token 数）。 |
+| `BILI_IMAGE_TOKEN_CAP` | 预检尺寸门与输出钳制用的单图 token 估算上限（#488/#496）。默认内联 `data:` 图片按 `base64 长度 / 4` 计 token、**无上限** —— 对字节计费 relay 正确，但对像素 tile 计费的官方上游（Anthropic/OpenAI）会严重高估（后者无论字节多少，每图约计 1.1K–1.6K token）。设为你上游的单图 tile 成本，可让尺寸门反映真实计费；不设置 = 无上限（当前默认）。 |
 | `BILI_CONFIG_FILE` | 覆盖配置文件路径（指向任意 JSON 文件）。 |
 | `ACP_PORT` / `PORT` | 覆盖监听端口。 |
 | `ACP_HOST` | 覆盖监听主机。 |

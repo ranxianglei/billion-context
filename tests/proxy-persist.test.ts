@@ -383,3 +383,47 @@ await withTempStore("one-time migration re-keys legacy hash-id sessions to their
         cold.cancelAll();
     }
 });
+
+await withTempStore("migration leaves anonymous pfa sessions untouched (#499)", async (store, dir) => {
+    // Anonymous prefix-affinity sessions (#309) all share the display label
+    // "prefix-affinity" ≠ their id, which trips the #286 self-termination
+    // invariant: without the guard, every boot re-keys them all to the single
+    // id "prefix-affinity" and deletes every sibling but the newest — silent
+    // loss of saved compression state for anonymous clients.
+    const mk = (id: string, requests: number) => {
+        const s = makeSession(id);
+        s.meta.label = "prefix-affinity";
+        s.meta.protocol = "openai";
+        s.meta.upstreamOrigin = "https://relay.example/v1";
+        s.stats.requests = requests;
+        return s;
+    };
+    await store.writeNow(mk("pfa-bc1eaaaaaaaaaaaa", 7));
+    await store.writeNow(mk("pfa-8588bbbbbbbbbbbb", 3));
+
+    const fileB = jsonFilesUnder(dir).find((f) => JSON.parse(readFileSync(f, "utf8")).id === "pfa-8588bbbbbbbbbbbb")!;
+    const envB = JSON.parse(readFileSync(fileB, "utf8"));
+    envB.savedAt -= 1000; // bc1e is newer → it would win a label collision if migrated
+    writeFileSync(fileB, JSON.stringify(envB));
+
+    const legacy = makeSession("legacy-" + "c".repeat(24));
+    legacy.meta.label = "conv-legacy-499";
+    legacy.meta.protocol = "responses";
+    legacy.meta.upstreamOrigin = "https://chatgpt.com";
+    legacy.stats.requests = 2;
+    await store.writeNow(legacy);
+
+    const cold = new SessionStore({ dir, debounceMs: 5, enabled: true });
+    try {
+        await cold.migrateLegacyIds();
+        const all = await cold.loadAll();
+        assert.ok(all.has("pfa-bc1eaaaaaaaaaaaa"), "newer anonymous session survives");
+        assert.ok(all.has("pfa-8588bbbbbbbbbbbb"), "older anonymous sibling survives (no shared-label deletion)");
+        assert.equal(all.get("pfa-bc1eaaaaaaaaaaaa")!.stats.requests, 7, "state intact");
+        assert.ok(!all.has("legacy-" + "c".repeat(24)), "true legacy session is still re-keyed");
+        assert.ok(all.has("conv-legacy-499"), "legacy re-key still works alongside the guard");
+        assert.equal(all.size, 3, "exactly the two pfa sessions plus the re-keyed legacy one");
+    } finally {
+        cold.cancelAll();
+    }
+});

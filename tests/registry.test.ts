@@ -50,12 +50,21 @@ test("unknown relay host falls back to provider-prefixed registry keys", () => {
     assert.equal(peekRegistryContext("gpt-x", "freeinference.org"), 400_000);
 });
 
-test("conflicting provider-prefixed matches do not guess", () => {
+test("conflicting provider-prefixed matches take the max window (no silent static fallback)", () => {
     _setForTest({
         "prov-a/ambig": { limit: { context: 100_000 } },
         "prov-b/ambig": { limit: { context: 200_000 } },
     });
-    assert.equal(peekRegistryContext("ambig", "relay.example"), undefined);
+    assert.equal(peekRegistryContext("ambig", "relay.example"), 200_000);
+});
+
+test("variant conflict takes max before falling through to the base name", () => {
+    _setForTest({
+        "prov-a/v-ambig-thinking": { limit: { context: 100_000 } },
+        "prov-b/v-ambig-thinking": { limit: { context: 300_000 } },
+        "prov-c/v-ambig": { limit: { context: 200_000 } },
+    });
+    assert.equal(peekRegistryContext("v-ambig-thinking", "relay.example"), 300_000);
 });
 
 test("relay fallback scan is slash-bounded (no partial-name matches)", () => {

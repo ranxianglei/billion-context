@@ -252,6 +252,19 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
     let responseObj: Record<string, unknown> | null = null;
     let terminalRaw: Buffer | null = null;
     let terminalKind: string | null = null;
+    // #440: response.failed with no preceding response.created is an orphan that
+    // crashes strict clients (codex) — same class as the anthropic gap (#413).
+    let createdForwarded = false;
+    let createdRespId: string | null = null;
+    const ensureCreated = (): Buffer | null => {
+        if (createdForwarded) return null;
+        createdForwarded = true;
+        if (!createdRespId) createdRespId = `resp-proxy-${Date.now()}`;
+        return Buffer.from(
+            `event: response.created\ndata: ${JSON.stringify({ type: "response.created", response: { id: createdRespId, status: "in_progress", output: [] } })}\n\n`,
+            "utf8",
+        );
+    };
 
     return {
         buildRequest(coreMessages, systemPrompt, requestBody) {
@@ -318,6 +331,11 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                 }
 
                 if (type === "response.created" || type === "response.in_progress") {
+                    if (type === "response.created") {
+                        const resp = obj.response as Record<string, unknown> | undefined;
+                        if (resp && typeof resp.id === "string") createdRespId = resp.id;
+                        if (round === 1) createdForwarded = true;
+                    }
                     yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
                 } else if (type === "response.output_item.added") {
                     const item = obj.item as Record<string, unknown> | undefined;
@@ -457,7 +475,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                 }
             }
             if (!terminalKind) {
-                yield { kind: "done", finishReason: "failed" } as ParsedStreamEvent;
+                yield { kind: "done", finishReason: "failed", truncated: true } as ParsedStreamEvent;
             }
         },
 
@@ -484,15 +502,19 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                 return terminalRaw;
             }
             if (!responseObj && opts?.finishReason === "failed") {
+                const parts: Buffer[] = [];
+                const created = ensureCreated();
+                if (created) parts.push(created);
                 const failed = {
-                    id: `resp-error-${Date.now()}`,
+                    id: createdRespId ?? `resp-error-${Date.now()}`,
                     status: "failed",
                     error: { code: "server_error", message: "upstream returned no response" },
                 };
-                return Buffer.from(
+                parts.push(Buffer.from(
                     `event: response.failed\ndata: ${JSON.stringify({ type: "response.failed", response: failed })}\n\n`,
                     "utf8",
-                );
+                ));
+                return Buffer.concat(parts);
             }
             let resp = responseObj
                 ? ({ ...responseObj } as Record<string, unknown>)
@@ -517,15 +539,19 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
         },
 
         emitError(message) {
+            const parts: Buffer[] = [];
+            const created = ensureCreated();
+            if (created) parts.push(created);
             const resp = {
-                id: `resp-error-${Date.now()}`,
+                id: createdRespId ?? `resp-error-${Date.now()}`,
                 status: "failed",
                 error: { code: "server_error", message },
             };
-            return Buffer.from(
+            parts.push(Buffer.from(
                 `event: response.failed\ndata: ${JSON.stringify({ type: "response.failed", response: resp })}\n\n`,
                 "utf8",
-            );
+            ));
+            return Buffer.concat(parts);
         },
 
         extractTextTriggers(text) {

@@ -111,6 +111,7 @@ const CONTEXT_OVERFLOW_PATTERNS: RegExp[] = [
     /maximum context length/i,
     /max context length/i,
     /maximum context size/i,
+    /longer than the model'?s context length/i,
     /exceeds the context window/i,
     /out of room in the model/i,
     /exceeded model token limit/i,
@@ -140,6 +141,7 @@ function parseOverflowWindow(text: string): number | undefined {
         text.match(/maximum context length of (\d[\d,]*)/i) ??
         text.match(/maximum context size (?:is|of) (\d[\d,]*)/i) ??
         text.match(/(?:maximum|max)\s+(?:context\s+)?length\s+(?:is\s+)?(\d[\d,]*)/i) ??
+        text.match(/context length\s*\((\d[\d,]*)\s*token/i) ??
         text.match(/limit of (\d[\d,]*)\s*token/i) ??
         text.match(/(\d[\d,]*)\s*maximum\b/i);
     if (m) return toTokenNumber(m[1]);
@@ -175,37 +177,38 @@ export function reserveOutputHeadroom(window: number, maxOutput: number): number
 }
 
 /**
- * Move mid-conversation system/developer messages to the leading system-prefix
- * position, preserving relative order. acp-kernel renders compressed summaries
- * as role:"system" anchored at the earliest message their block covered; when
- * that anchor sits after an uncompressed message (multi-segment compress with
- * an uncovered user message between segments), the OpenAI wire carries a
- * system message mid-conversation, which strict OpenAI-compatible backends
- * (sglang: "System message must be at the beginning") reject with 400 (#355).
- * A summary is a stand-in for the folded history, so moving it to the head
- * preserves semantics. Messages stay SEPARATE (not merged into the head) so
- * the head system message — the prefix-cache anchor — keeps its bytes stable
- * across compress turns. No-op (same array) when there is nothing to hoist.
+ * Convert mid-conversation system/developer messages to role "user", leaving
+ * them at their original (mid-conversation) position. acp-kernel renders each
+ * compressed block's summary as role:"system" anchored at the earliest message
+ * its block covered. In PROXY mode (plain OpenAI client) the `compress` tool
+ * call is ephemeral — it runs in the proxy's server-side loop and never enters
+ * the client's re-sent history — and preflight blocks have no tool call at all,
+ * so the summary must ride on a standalone message. A "user" message is allowed
+ * anywhere in the conversation, whereas strict OpenAI-compatible backends
+ * (sglang/vLLM with the Qwen3-family "system-first" chat template) require
+ * EXACTLY ONE "system" message at index 0 and reject a mid-conversation or
+ * second system message with 400 "System message must be at the beginning"
+ * (#377). Keeping the summary mid-stream at its anchor (instead of hoisting it
+ * to the head) also keeps the head system message — the prefix-cache anchor —
+ * byte-stable across compress turns, so a new block does not invalidate the
+ * whole-conversation prefix. In plugin/launcher mode the summary carrier is the
+ * `compress` tool call (in the agent's own re-sent history), so the kernel's
+ * acp_summary is stripped by stripKernelSummaries and this is a no-op there.
+ * A summary is a stand-in for the folded history; re-voicing it as a user turn
+ * is the accepted trade-off for SGLang compatibility + cache stability. No-op
+ * (same array) when there is no system/developer message to convert.
  */
-export function hoistMidSystemMessages<T extends { role: string }>(messages: T[]): T[] {
-    let lead = 0;
-    while (lead < messages.length && (messages[lead].role === "system" || messages[lead].role === "developer")) lead++;
-    if (lead === messages.length) return messages;
-    let midCount = 0;
-    for (let i = lead; i < messages.length; i++) {
-        const r = messages[i].role;
-        if (r === "system" || r === "developer") midCount++;
+export function systemToUser<T extends { role: string }>(messages: T[]): T[] {
+    let hasSys = false;
+    for (const m of messages) {
+        if (m.role === "system" || m.role === "developer") { hasSys = true; break; }
     }
-    if (midCount === 0) return messages;
-    const head = messages.slice(0, lead);
-    const mid: T[] = [];
-    const rest: T[] = [];
-    for (let i = lead; i < messages.length; i++) {
-        const r = messages[i].role;
-        if (r === "system" || r === "developer") mid.push(messages[i]);
-        else rest.push(messages[i]);
-    }
-    return [...head, ...mid, ...rest];
+    if (!hasSys) return messages;
+    return messages.map((m) =>
+        m.role === "system" || m.role === "developer"
+            ? ({ ...m, role: "user" } as T)
+            : m
+    );
 }
 
 /**
