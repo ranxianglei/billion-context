@@ -57,6 +57,30 @@ test("/bili/ resolves upstream host and full path from embedded URL", () => {
     assert.equal(resolveUpstream(opts, "/bili-not-owned/responses"), undefined);
 });
 
+test("#535: absolute-form request URLs route as forward-proxy targets (self-host guard)", () => {
+    const opts = loadOptions({ ACP_PORT: "8787" });
+    // httpx through an http_proxy emits absolute form for plain-http base URLs
+    assert.deepEqual(resolveUpstream(opts, "http://127.0.0.1:8199/v1/chat/completions", { headers: { host: "127.0.0.1:8787" } } as never), {
+        upstream: "http://127.0.0.1:8199",
+        rewrittenUrl: "http://127.0.0.1:8199/v1/chat/completions",
+        tunnel: true,
+    });
+    assert.deepEqual(resolveUpstream(opts, "https://relay.example/v1/responses?x=1", { headers: { host: "127.0.0.1:8787" } } as never), {
+        upstream: "https://relay.example",
+        rewrittenUrl: "https://relay.example/v1/responses?x=1",
+        tunnel: true,
+    });
+    // a target equal to the request's own Host header is the proxy itself —
+    // forwarding would loop the request back into handle(); fall through.
+    assert.equal(
+        resolveUpstream(opts, "http://127.0.0.1:8787/v1/chat/completions", { headers: { host: "127.0.0.1:8787" } } as never),
+        undefined,
+        "self-target falls through to own-API routing",
+    );
+    assert.equal(resolveUpstream(opts, "http://127.0.0.1:8787:bad/v1"), undefined, "malformed absolute URL falls through");
+    assert.equal(resolveUpstream(opts, "/v1/chat/completions", { headers: { host: "127.0.0.1:8787" } } as never), undefined, "origin-form stays own-API");
+});
+
 test("/bili/ integration preserves query, subscription, account and thread headers", async () => {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});

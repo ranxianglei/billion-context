@@ -270,10 +270,17 @@ test("#535: session_before_compact cancels only pi auto compaction under bili la
         assert.equal(handler({ reason: "manual" }, undefined), undefined, "manual /compact stays user-owned");
         assert.equal(handler({ reason: "startup" }, undefined), undefined, "unknown reason → not cancelled");
 
-        // omp: no reason field upstream yet → handler must NOT be registered
+        // omp: the event carries no reason field, so under bili ALL compaction
+        // is cancelled (manual native /compact would destroy the ACP-tagged
+        // context just like the auto path; the host shows "Compaction
+        // cancelled" and the user should reach for /acp instead).
         const omp = makeFakePi();
         createBiliPlugin("omp")(omp as never);
-        assert.equal(omp.events.get("session_before_compact"), undefined, "omp: no cancel handler until upstream reason PR");
+        const ompHandler = omp.events.get("session_before_compact");
+        assert.ok(ompHandler, "omp under bili launch: cancel-all handler registered");
+        assert.deepEqual(ompHandler({}, undefined), { cancel: true });
+        assert.deepEqual(ompHandler({ reason: "manual" }, undefined), { cancel: true });
+        assert.deepEqual(ompHandler({ reason: "threshold" }, undefined), { cancel: true });
     } finally {
         if (prevProxy === undefined) delete process.env.BILLION_CONTEXT_PROXY;
         else process.env.BILLION_CONTEXT_PROXY = prevProxy;

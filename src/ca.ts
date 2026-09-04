@@ -94,7 +94,7 @@ function generateRootCA(): { cert: string; key: string } {
     cert.setSubject(attrs);
     cert.setIssuer(attrs);
     cert.setExtensions([
-        { name: "basicConstraints", cA: true },
+        { name: "basicConstraints", cA: true, critical: true },
         { name: "keyUsage", keyCertSign: true, cRLSign: true, digitalSignature: true },
         { name: "subjectKeyIdentifier" },
     ]);
@@ -135,6 +135,43 @@ export function ensureRootCA(): void {
     writeCombinedBundle();
 }
 
+/** Mint a leaf certificate for `host` signed by the root CA (with the
+ *  strict-OpenSSL-3 extension set Python/httpx requires: SKI + AKI matching
+ *  the root's SKI — see getSecureContext). */
+export function mintHostCert(host: string): { certPem: string; keyPem: string } {
+    if (!rootCertPem || !rootKeyPem || !rootCert || !rootKey) {
+        throw new Error("CA not initialized — call ensureRootCA() first");
+    }
+    const keys = forge.pki.rsa.generateKeyPair({ bits: 2048 });
+    const cert = forge.pki.createCertificate();
+    cert.publicKey = keys.publicKey;
+    cert.serialNumber = Date.now().toString() + Math.floor(Math.random() * 1e6).toString();
+    cert.validity.notBefore = new Date();
+    cert.validity.notAfter = new Date();
+    cert.validity.notAfter.setFullYear(cert.validity.notBefore.getFullYear() + 2);
+    cert.setSubject([{ name: "commonName", value: host }]);
+    cert.setIssuer(rootCert.subject.attributes);
+    // AKI must point at the ROOT's key (explicit bytes — forge's `true` form
+    // would stamp the leaf's own SKI here since options.cert is the leaf).
+    // Python's OpenSSL 3 chain verification rejects leaves without AKI
+    // ("certificate verify failed: Missing Authority Key Identifier") even
+    // though curl tolerates them — hermes/httpx is the client that hit it.
+    const rootSki = rootCert.generateSubjectKeyIdentifier().getBytes();
+    cert.setExtensions([
+        { name: "basicConstraints", cA: false },
+        { name: "keyUsage", digitalSignature: true, keyEncipherment: true },
+        { name: "extKeyUsage", serverAuth: true },
+        { name: "subjectAltName", altNames: [{ type: 2, value: host }] },
+        { name: "subjectKeyIdentifier" },
+        { name: "authorityKeyIdentifier", keyIdentifier: rootSki },
+    ]);
+    cert.sign(rootKey as forge.pki.rsa.PrivateKey, forge.md.sha256.create());
+    return {
+        certPem: forge.pki.certificateToPem(cert),
+        keyPem: forge.pki.privateKeyToPem(keys.privateKey),
+    };
+}
+
 /** Return a tls.SecureContext that presents a certificate for `host`, signed
  *  by our root CA. Cached per host — RSA keygen (~100ms) only happens once
  *  per unique hostname, then the cached context is reused for the lifetime of
@@ -150,26 +187,11 @@ export function getSecureContext(host: string): tls.SecureContext {
         return cached;
     }
 
-    const keys = forge.pki.rsa.generateKeyPair({ bits: 2048 });
-    const cert = forge.pki.createCertificate();
-    cert.publicKey = keys.publicKey;
-    cert.serialNumber = Date.now().toString() + Math.floor(Math.random() * 1e6).toString();
-    cert.validity.notBefore = new Date();
-    cert.validity.notAfter = new Date();
-    cert.validity.notAfter.setFullYear(cert.validity.notBefore.getFullYear() + 2);
-    cert.setSubject([{ name: "commonName", value: host }]);
-    cert.setIssuer(rootCert.subject.attributes);
-    cert.setExtensions([
-        { name: "basicConstraints", cA: false },
-        { name: "keyUsage", digitalSignature: true, keyEncipherment: true },
-        { name: "extKeyUsage", serverAuth: true },
-        { name: "subjectAltName", altNames: [{ type: 2, value: host }] },
-    ]);
-    cert.sign(rootKey as forge.pki.rsa.PrivateKey, forge.md.sha256.create());
+    const { certPem, keyPem } = mintHostCert(host);
 
     const ctx = tls.createSecureContext({
-        cert: forge.pki.certificateToPem(cert),
-        key: forge.pki.privateKeyToPem(keys.privateKey),
+        cert: certPem,
+        key: keyPem,
         ca: rootCertPem,
     });
     secureContextCache.set(host, ctx);
