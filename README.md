@@ -112,6 +112,17 @@ turn is a semantic mismatch the model tolerates (it is clearly marked
   summaries (their tool call isn't in the agent's history and the agent's view
   skips `acp_summary`) — but that needs the id match above, which doesn't occur.
 
+## Which do I need?
+
+Pick by your client:
+
+| Client | Use |
+|---|---|
+| **pi** | [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi) (in-process extension) |
+| **opencode** | [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) (in-process extension) |
+| **omp** | [`billion-context`](https://github.com/ranxianglei/billion-context) via `bili omp` (built-in plugin) |
+| **everything else** (no context hook) | [`billion-context`](https://github.com/ranxianglei/billion-context) — `bili <client>` (launcher, preferred) or `/bili/` prefix |
+
 ## Install
 
 ```bash
@@ -382,7 +393,7 @@ pass an explicit `x-acp-session` header per conversation to avoid collisions.
 
 Early. Protocol handling and compression work against mock tests (500+ passing). Real-model integration testing is the next milestone. Expect rough edges.
 
-See [billion-context-pi](https://github.com/ranxianglei/billion-context-pi) for the pi-extension mode (in-process, tighter integration, the reference implementation).
+Client-side plugins for pi / omp / opencode ship inside `billion-context` (`dist/agent/*.js`) for the cooperative-proxy path. See the **"Which do I need?"** section above for how `billion-context`, the standalone `billion-context-pi`, and `opencode-acp` relate.
 
 ## License
 

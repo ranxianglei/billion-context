@@ -50,6 +50,17 @@ AI 编程助手的<strong>通用上下文压缩代理</strong>
 
 代理向对话注入四个上下文管理工具(`compress`、`decompress`、`search_context`、`acp_status`)。模型在对话增长时调用 `compress`,代理在服务端执行 —— 压缩后的范围在下一轮之前折叠进对话历史。
 
+## 该选哪个?
+
+按客户端选:
+
+| 客户端 | 用这个 |
+|---|---|
+| **pi** | [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi)(进程内扩展) |
+| **opencode** | [`opencode-acp`](https://github.com/ranxianglei/opencode-acp)(进程内扩展) |
+| **omp** | [`billion-context`](https://github.com/ranxianglei/billion-context),`bili omp`(内置插件) |
+| **其余所有**(没有上下文 hook) | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili <client>`(启动器,优先)或 `/bili/` 前缀 |
+
 ## 安装
 
 ```bash
@@ -258,7 +269,7 @@ Windows 下会自动发现常见 Clash/Mihomo 静态系统代理;Web UI 会显�
 
 早期。协议处理和压缩已通过 mock 测试(500+ 项通过)。真实模型集成测试是下一里程碑。预期会有粗糙的地方。
 
-pi 扩展模式(进程内、更紧密集成、参考实现)见 [billion-context-pi](https://github.com/ranxianglei/billion-context-pi)。
+针对 pi / omp / opencode 的客户端插件随 `billion-context` 一起发布(`dist/agent/*.js`),用于协作代理路径。三者(`billion-context`、独立的 `billion-context-pi`、`opencode-acp`)如何取舍,见上文「该选哪个?」一节。
 
 ## 许可证
 
