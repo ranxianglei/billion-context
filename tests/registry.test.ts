@@ -58,6 +58,15 @@ test("conflicting provider-prefixed matches take the max window (no silent stati
     assert.equal(peekRegistryContext("ambig", "relay.example"), 200_000);
 });
 
+test("variant conflict takes max before falling through to the base name", () => {
+    _setForTest({
+        "prov-a/v-ambig-thinking": { limit: { context: 100_000 } },
+        "prov-b/v-ambig-thinking": { limit: { context: 300_000 } },
+        "prov-c/v-ambig": { limit: { context: 200_000 } },
+    });
+    assert.equal(peekRegistryContext("v-ambig-thinking", "relay.example"), 300_000);
+});
+
 test("relay fallback scan is slash-bounded (no partial-name matches)", () => {
     _setForTest({ "deepseek/deepseek-v4-flash": { limit: { context: 1_000_000 } } });
     assert.equal(peekRegistryContext("v4-flash", "relay.example"), undefined);

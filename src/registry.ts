@@ -253,43 +253,80 @@ export function bundledSnapshotLookup(model: string, host?: string): number | un
     return registryLookup(bundledSnapshotRegistry(), model, host);
 }
 
+// Inference-mode suffixes denoting the SAME base model under a different
+// reasoning setting (a "-thinking" variant shares the base model's context
+// window). Longest-first so "-interleaved-thinking" wins over "-thinking".
+const VARIANT_SUFFIXES = [
+    "-interleaved-thinking",
+    "-thinking",
+    "-reasoning",
+    "-extended",
+    "-fast",
+    "-high",
+    "-medium",
+    "-low",
+];
+
+export function modelVariants(name: string): string[] {
+    const variants: string[] = [name];
+    let current = name;
+    for (;;) {
+        let stripped = false;
+        for (const suffix of VARIANT_SUFFIXES) {
+            if (current.length > suffix.length && current.endsWith(suffix)) {
+                current = current.slice(0, -suffix.length);
+                variants.push(current);
+                stripped = true;
+                break;
+            }
+        }
+        if (!stripped) break;
+    }
+    return variants;
+}
+
 function registryLookup(reg: RegistryShape | null, model: string, host?: string): number | undefined {
     if (!reg || !model) return undefined;
     const provider = host ? providerFromHost(host) : undefined;
-    const candidates = provider ? [`${provider}/${model}`, model] : [model];
-    for (const key of candidates) {
-        const entry = reg[key];
-        const ctx = entry?.limit?.context;
-        if (typeof ctx === "number" && ctx > 0) return ctx;
-    }
-    // Relay host (not in HOST_TO_PROVIDER): the bare name can miss while the
-    // model exists under a provider-prefixed key (a relay serving
-    // "deepseek-v4-flash" is stored as "deepseek/deepseek-v4-flash"). Scan
-    // */<model> and take the MAXIMUM window across matches when they
-    // disagree: a conflicting value used to return undefined (silent static
-    // fallback, typically 200K). Max is never smaller than any single
-    // declared deployment, so compression thresholds never fire earlier
-    // than some real deployment would allow. Conflicts are logged once per
-    // model. Known-provider hosts keep the old behavior: a miss there
-    // means the model is genuinely unlisted for that provider.
-    if (provider === undefined) {
-        const suffix = `/${model}`;
-        let max: number | undefined;
-        const distinct = new Set<number>();
-        const parts: string[] = [];
-        for (const key of Object.keys(reg)) {
-            if (!key.endsWith(suffix)) continue;
-            const ctx = reg[key].limit?.context;
-            if (typeof ctx !== "number" || ctx <= 0) continue;
-            if (max === undefined || ctx > max) max = ctx;
-            distinct.add(ctx);
-            parts.push(`${key}=${ctx}`);
+    for (const name of modelVariants(model)) {
+        const candidates = provider ? [`${provider}/${name}`, name] : [name];
+        for (const key of candidates) {
+            const entry = reg[key];
+            const ctx = entry?.limit?.context;
+            if (typeof ctx === "number" && ctx > 0) return ctx;
         }
-        if (max !== undefined && distinct.size > 1 && !warnedConflicts.has(model)) {
-            warnedConflicts.add(model);
-            loggerLog("warn", `[acp-registry] conflicting context windows for "${model}" (${parts.join(", ")}) — using max ${max}`);
+        // Relay host (not in HOST_TO_PROVIDER): the bare name can miss while
+        // the model exists under a provider-prefixed key (a relay serving
+        // "deepseek-v4-flash" is stored as "deepseek/deepseek-v4-flash"). Scan
+        // */<name> and take the MAXIMUM window across matches when they
+        // disagree: max is never smaller than any single declared deployment,
+        // so compression thresholds never fire earlier than some real
+        // deployment would allow; conflicts are logged once per name. Zero
+        // valid matches falls through to the next (stripped) variant.
+        // Known-provider hosts do not cross-provider scan: a miss means the
+        // model is genuinely unlisted for that provider (its stripped
+        // variants still get their exact-key chance above).
+        if (provider === undefined) {
+            const suffix = `/${name}`;
+            let max: number | undefined;
+            const distinct = new Set<number>();
+            const parts: string[] = [];
+            for (const key of Object.keys(reg)) {
+                if (!key.endsWith(suffix)) continue;
+                const ctx = reg[key].limit?.context;
+                if (typeof ctx !== "number" || ctx <= 0) continue;
+                if (max === undefined || ctx > max) max = ctx;
+                distinct.add(ctx);
+                parts.push(`${key}=${ctx}`);
+            }
+            if (max !== undefined) {
+                if (distinct.size > 1 && !warnedConflicts.has(name)) {
+                    warnedConflicts.add(name);
+                    loggerLog("warn", `[acp-registry] conflicting context windows for "${name}" (${parts.join(", ")}) — using max ${max}`);
+                }
+                return max;
+            }
         }
-        return max;
     }
     return undefined;
 }
