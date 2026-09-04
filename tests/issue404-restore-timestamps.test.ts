@@ -75,12 +75,16 @@ await test("boot restore: lastSeen=savedAt, restored flag, freshness-keyed trunc
     const store = new SessionStore({ dir, debounceMs: 5, enabled: true });
     _setStoreForTest(store);
     try {
-        // Freshness by max(createdAt, savedAt): A=9000, C=8000, B=5000.
+        // Freshness by max(createdAt, savedAt): A=freshest, C=second, B=stalest
+        // (savedAt must be RECENT absolute epochs — the #478 boot GC prunes any
+        // record older than the retention window, and hand-written 1970-era
+        // timestamps would be pruned before truncation ever runs).
         // The OLD truncation key (createdAt only: B=5000 > A=1000 > C=2000)
         // would keep B and drop C — the active-but-old A / idle-but-new B mix.
-        writeEnvelope(dir, "sess-A", 1000, 9000);
-        writeEnvelope(dir, "sess-B", 5000, 5000);
-        writeEnvelope(dir, "sess-C", 2000, 8000);
+        const recent = Date.now() - 60_000;
+        writeEnvelope(dir, "sess-A", 1000, recent + 3000);
+        writeEnvelope(dir, "sess-B", 5000, recent + 1000);
+        writeEnvelope(dir, "sess-C", 2000, recent + 2000);
 
         _resetSessionsForTest(2);
         await initSessions();
@@ -90,7 +94,7 @@ await test("boot restore: lastSeen=savedAt, restored flag, freshness-keyed trunc
         const c = peekSession("sess-C");
         assert.ok(a && c, "the two freshest sessions by max(createdAt, savedAt) survive boot truncation");
         assert.equal(b, undefined, "newer-created but idle-since-boot session loses its slot to the active-but-old one");
-        assert.equal(a!.lastSeen, 9000, "restored lastSeen is the on-disk savedAt, not the restore moment");
+        assert.equal(a!.lastSeen, recent + 3000, "restored lastSeen is the on-disk savedAt, not the restore moment");
         assert.equal(a!.restored, true, "restored sessions are flagged until their first request in this process");
         assert.equal(c!.restored, true);
 
