@@ -119,7 +119,7 @@ async function register(rig: Rig, conversationId: string): Promise<void> {
 }
 
 function modelBody(stream: boolean): string {
-    return JSON.stringify({ model: "i411-model", max_tokens: 10, stream, messages: [{ role: "user", content: "hello" }] });
+    return JSON.stringify({ model: "i411-model", max_tokens: 8192, stream, messages: [{ role: "user", content: "hello" }] });
 }
 
 async function waitFor(cond: () => boolean, ms = 3000): Promise<void> {

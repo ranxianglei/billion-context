@@ -396,10 +396,13 @@ test("#475 G3: fake-completion buffering + streaming request answered with JSON 
     const completion = { id: "chatcmpl_fc_json", object: "chat.completion", created: 1, model: "gpt-test", choices: [{ index: 0, message: { role: "assistant", content: full }, finish_reason: "stop" }] };
     const h = await startHarness({ injectTool: false, injectNudge: false }, [[JSON.stringify(completion)]], true);
     try {
+        // Not a side request (budget > 200) so the fake-completion buffering
+        // block runs — this test guards against it draining upstream.body
+        // before the G3 JSON strip branch reads responseBody.
         const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1/chat/completions`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-acp-session": "noinject-fc-json" },
-            body: JSON.stringify({ model: "gpt-test", max_tokens: 100, stream: true, messages: [{ role: "user", content: "hello" }] }),
+            body: JSON.stringify({ model: "gpt-test", max_tokens: 4096, stream: true, messages: [{ role: "user", content: "hello" }] }),
         });
         assert.equal(resp.status, 200);
         let bodyText = "";

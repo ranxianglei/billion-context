@@ -112,7 +112,7 @@ function postModel(rig: Rig, sessionHeader?: string): Promise<Response> {
     return fetch(rig.modelUrl(), {
         method: "POST",
         headers,
-        body: JSON.stringify({ model: "l162-model", max_tokens: 10, stream: true, messages: [{ role: "user", content: "hello" }] }),
+        body: JSON.stringify({ model: "l162-model", max_tokens: 8192, stream: true, messages: [{ role: "user", content: "hello" }] }),
     });
 }
 
@@ -195,7 +195,7 @@ test("launcher identity binding survives model switches (one conversation, multi
         const postUpstream2 = (): Promise<Response> => fetch(`http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${port2}/v1/messages`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-claude-code-session-id": "sess-switch" },
-            body: JSON.stringify({ model: "l162-model", max_tokens: 10, stream: true, messages: [{ role: "user", content: "hello" }] }),
+            body: JSON.stringify({ model: "l162-model", max_tokens: 8192, stream: true, messages: [{ role: "user", content: "hello" }] }),
         });
         // First model (upstream A): binds via identity as usual.
         await register(rig, "sess-switch", { agent: "omp", identity: true });
