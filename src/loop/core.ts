@@ -422,10 +422,21 @@ export async function* runCompressLoop(
             // never in coreMessages), and hideConsumedCompressCalls runs each
             // round so consumed compress records cannot re-prime the model.
             if (proxyResults.length > 0) {
+                // #539: only Anthropic verifies thinking+signature pairs, so it alone
+                // needs a signature to replay a thinking block. OpenAI/DeepSeek and
+                // Responses echo reasoning_content back verbatim and emit no signature
+                // — gating on one dropped every such round's reasoning from the
+                // re-request, leaving the proxy-tool assistant message without
+                // reasoning_content (DeepSeek 400 invalid_request_error: "reasoning_
+                // content ... must be passed back"). Relax ONLY for the known non-
+                // signature protocols; anything else (incl. unset) keeps the strict
+                // #221 posture, since dropping unsigned thinking never 400s but
+                // keeping it can.
+                const requiresThinkingSignature = ctx.protocol !== "openai" && ctx.protocol !== "responses";
                 if (reasoningSegments.length > 0) {
                     for (let i = 0; i < reasoningSegments.length; i++) {
                         const seg = reasoningSegments[i];
-                        if (seg.text.length === 0 || seg.signature.length === 0) continue;
+                        if (seg.text.length === 0 || (requiresThinkingSignature && seg.signature.length === 0)) continue;
                         const reasoningMsg: BiliMessage = {
                             id: i === 0 ? `acp_loop_r${round}_reasoning` : `acp_loop_r${round}_reasoning_${i + 1}`,
                             role: "assistant",
