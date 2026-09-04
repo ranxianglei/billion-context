@@ -133,13 +133,38 @@ test("instance registry: registers, warns on a second live instance, prunes dead
         );
         assert.equal(warnings.length, 1);
         assert.match(warnings[0], /another bili instance is running/);
-        const file = path.join(st.dir, "billion-context", "instances.json");
-        const after = JSON.parse(fs.readFileSync(file, "utf8")) as { instances: { instanceId: string }[] };
-        assert.equal(after.instances.length, 2);
+        const regDir = path.join(st.dir, "billion-context", "instances");
+        const markerNames = () => fs.readdirSync(regDir).filter((n) => n.endsWith(".json")).sort();
+        assert.deepEqual(markerNames(), ["a.json", "b.json"]);
 
         unregisterInstance("a");
-        const after2 = JSON.parse(fs.readFileSync(file, "utf8")) as { instances: { instanceId: string }[] };
-        assert.deepEqual(after2.instances.map((e) => e.instanceId), ["b"]);
+        assert.deepEqual(markerNames(), ["b.json"]);
+    } finally {
+        setLogCapture(null);
+        st.restore();
+    }
+});
+
+test("instance registry folds a live legacy instances.json entry read-only (no rewrite)", () => {
+    const st = tmpStateDir();
+    const warnings: string[] = [];
+    setLogCapture((_level, msg) => warnings.push(msg));
+    try {
+        const stateRoot = path.join(st.dir, "billion-context");
+        fs.mkdirSync(stateRoot, { recursive: true });
+        fs.writeFileSync(
+            path.join(stateRoot, "instances.json"),
+            JSON.stringify({ instances: [{ instanceId: "legacy", pid: process.pid, port: 9, origin: "http://127.0.0.1:9", startedAt: 1 }] }),
+        );
+        registerInstanceAndWarn(
+            { instanceId: "new", pid: process.pid, port: 10, origin: "http://127.0.0.1:10", startedAt: 2 },
+            (msg) => warnings.push(msg),
+        );
+        assert.equal(warnings.length, 1);
+        assert.match(warnings[0], /another bili instance is running/);
+        assert.ok(fs.existsSync(path.join(stateRoot, "instances", "new.json")));
+        const legacyAfter = JSON.parse(fs.readFileSync(path.join(stateRoot, "instances.json"), "utf8")) as { instances: { instanceId: string }[] };
+        assert.deepEqual(legacyAfter.instances.map((e) => e.instanceId), ["legacy"]);
     } finally {
         setLogCapture(null);
         st.restore();
