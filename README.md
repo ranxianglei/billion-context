@@ -70,8 +70,9 @@ Two ways to use it — pick one:
 ### Option 1 — Launcher (`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode` / `bili hermes` / `bili dsh`)
 
 The launcher wraps a client in one command: it starts a proxy on an
-independent port (a fresh instance is always spawned — a port is never
-reused), then points the client at it — **certificate-based MITM** where the
+independent port (an already-healthy instance on the preferred port is
+REUSED — #405; otherwise a fresh instance is spawned on a free port), then
+points the client at it — **certificate-based MITM** where the
 client honors proxy/CA env vars, or an isolated **`/bili/` config rewrite**
 where it doesn't. No real config file is ever edited; the client's own
 config is READ to discover which HTTPS upstream hosts it talks to, and those

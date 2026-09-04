@@ -516,7 +516,7 @@ function makeFakeChild(pid: number): SpawnChild {
     };
 }
 
-test("ensureProxyRunning: always spawns a fresh proxy, never reuses a listener", async () => {
+test("ensureProxyRunning: healthy instance on preferred port is reused, nothing spawned (#405)", async () => {
     let spawnCalls = 0;
     const spawnImpl: SpawnFn = () => {
         spawnCalls++;
@@ -527,10 +527,31 @@ test("ensureProxyRunning: always spawns a fresh proxy, never reuses a listener",
         { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
         { fetchImpl, spawnImpl },
     );
+    assert.equal(spawnCalls, 0, "no second instance spawned");
+    assert.equal(handle.child, undefined, "reused handle owns no child");
+    assert.equal(handle.origin, "http://127.0.0.1:8787", "points at the existing instance");
+    assert.doesNotThrow(() => stopProxy(handle), "stopProxy is a no-op on a reused handle");
+});
+
+test("ensureProxyRunning: unhealthy preferred port still spawns on a free port", async () => {
+    let spawnCalls = 0;
+    const spawnImpl: SpawnFn = () => {
+        spawnCalls++;
+        return makeFakeChild(42423);
+    };
+    // first probe = preferred-port check (dead); later probes = spawned-instance poll (healthy)
+    let probes = 0;
+    const fetchImpl = async () => {
+        probes++;
+        return { ok: probes >= 2 };
+    };
+    const handle = await ensureProxyRunning(
+        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
+        { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+    );
     assert.equal(spawnCalls, 1);
-    assert.ok(handle.child);
-    assert.equal(handle.origin, `http://127.0.0.1:${handle.port}`);
-    assert.notEqual(handle.child, null);
+    assert.equal(handle.child?.pid, 42423);
+    assert.equal(handle.origin, `http://127.0.0.1:${handle.port}`, "handle points at the spawned instance");
 });
 
 test("ensureProxyRunning: spawns when not healthy, polls until healthy", async () => {
@@ -1878,7 +1899,12 @@ test("runLaunch omp: launcher hands per-model windows to the spawned proxy", asy
         proxyEnvs.push((opts as { env?: NodeJS.ProcessEnv } | undefined)?.env);
         return makeFakeChild(42422);
     };
-    const fetchImpl = async () => ({ ok: true });
+    // first probe = preferred-port check (dead) so a proxy IS spawned; later probes = health poll
+    let probes = 0;
+    const fetchImpl = async () => {
+        probes++;
+        return { ok: probes >= 2 };
+    };
 
     const prevExit = process.exit;
     const exitCalls: number[] = [];

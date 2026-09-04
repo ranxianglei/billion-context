@@ -50,7 +50,8 @@ import { renderUI, handleConfigGet, handleConfigPut } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { getStore } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger } from "./logger.js";
-import { defaultLogFile, stateDir, proxyOriginFile } from "./paths.js";
+import { defaultLogFile, stateDir } from "./paths.js";
+import { claimProxyOrigin, releaseProxyOrigin } from "./proxy-origin.js";
 import { compressLoopResponsesJson } from "./compress-loop-responses.js";
 import { runCompressLoop, pickAdapter } from "./loop/index.js";
 import { containsToolCallXmlFragment } from "./loop/tag-echo-filter.js";
@@ -293,6 +294,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // (tests) are distinct instances; a restart changing the id is harmless
     // (the chain check only compares against the other running instance).
     const instanceId = randomUUID();
+    let claimedOrigin: string | null = null;
     // Reload persisted compression state before accepting traffic so sessions
     // that survived a restart keep their folded view (otherwise long sessions
     // re-send oversized raw history and hang).
@@ -353,17 +355,15 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         // chose to expose the proxy — hiding it behind "localhost" made
         // remote setups look broken in the log, see #240).
         const displayHost = nonLoopbackBind ? opts.host : opts.host === "0.0.0.0" ? "localhost" : opts.host;
-        try {
-            fs.mkdirSync(stateDir(), { recursive: true });
-            // Discovery origin local MCP shells dial: collapse wildcard
-            // binds to loopback (localhost may resolve to ::1, where an
-            // IPv4-only listener is absent) and bracket bare IPv6 literals
-            // so the file always holds a valid URL.
-            const originHost = opts.host === "0.0.0.0" || opts.host === "::" || opts.host === "localhost" ? "127.0.0.1" : opts.host.includes(":") && !opts.host.startsWith("[") ? `[${opts.host}]` : opts.host;
-            fs.writeFileSync(proxyOriginFile(), `http://${originHost}:${server.address() === null ? opts.port : (server.address() as { port: number }).port}\n`);
-        } catch {
-            // best-effort discovery hint for host-spawned MCP shells
-        }
+        // Discovery origin local MCP shells dial: collapse wildcard
+        // binds to loopback (localhost may resolve to ::1, where an
+        // IPv4-only listener is absent) and bracket bare IPv6 literals
+        // so the pointer always holds a valid URL.
+        const originHost = opts.host === "0.0.0.0" || opts.host === "::" || opts.host === "localhost" ? "127.0.0.1" : opts.host.includes(":") && !opts.host.startsWith("[") ? `[${opts.host}]` : opts.host;
+        claimedOrigin = `http://${originHost}:${server.address() === null ? opts.port : (server.address() as { port: number }).port}`;
+        // #405 fix #2: claim, don't clobber — if another LIVE instance owns
+        // the pointer we keep it instead of hijacking discovery.
+        void claimProxyOrigin(claimedOrigin, { origin: claimedOrigin, pid: process.pid, bootedAt: Date.now(), instanceId }, (level, msg) => log(level, msg));
         const nOverrides = Object.keys(opts.routes).length;
         log(
             "info",
@@ -421,6 +421,9 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         if (shuttingDown) return;
         shuttingDown = true;
         log("info", `${sig} received — flushing sessions…`);
+        // #405 fix #2: give back the discovery pointer we own so readers fall
+        // through to the next live instance instead of dialing a dead port.
+        if (claimedOrigin !== null) releaseProxyOrigin(claimedOrigin, instanceId, (level, msg) => log(level, msg));
         // Stop accepting new requests BEFORE flushing, otherwise a late request
         // could mutate state after its snapshot is taken and be lost.
         // server.close(cb) waits for all keep-alive connections to drain
@@ -569,12 +572,12 @@ async function handle(
             return;
         }
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: true, upstream: opts.upstream }));
+        res.end(JSON.stringify({ ok: true, upstream: opts.upstream, instanceId }));
         return;
     }
     if (req.method === "GET" && req.url === "/__bili/health") {
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: true, upstream: opts.upstream }));
+        res.end(JSON.stringify({ ok: true, upstream: opts.upstream, instanceId }));
         return;
     }
     // Web config UI (served as HTML, separate from the JSON health check above).

@@ -383,3 +383,75 @@ await withTempStore("one-time migration re-keys legacy hash-id sessions to their
         cold.cancelAll();
     }
 });
+
+// #405: two proxy processes sharing BILI_SESSIONS_DIR used to fork session
+// state — the instance holding the STALER in-memory copy rolled counters back
+// whenever it saved later (atomic writes prevent torn files, not rollbacks).
+await withTempStore("rollback guard: stale snapshot rejected, on-disk state kept (#405)", async (store, dir) => {
+    const warnings: string[] = [];
+    const fresh = makeSession("fork-1");
+    fresh.stats.requests = 3;
+    fresh.state.nextBlockId = 6;
+    await store.writeNow(fresh);
+
+    // A second "process": its in-memory copy was loaded earlier and never saw
+    // requests 3 — it saves AFTER the first instance did.
+    const cold = new SessionStore({ dir, debounceMs: 5, enabled: true, log: (_level, msg) => warnings.push(msg) });
+    try {
+        const stale = makeSession("fork-1");
+        stale.stats.requests = 2;
+        stale.state.nextBlockId = 5;
+        await cold.writeNow(stale);
+        assert.equal(store.loadSync("fork-1")!.stats.requests, 3, "requests did NOT roll back");
+        assert.equal(store.loadSync("fork-1")!.state.nextBlockId, 6, "block progress did NOT roll back");
+        assert.ok(warnings.some((w) => w.includes("rejected stale snapshot")), `warn logged: ${warnings.join(" | ")}`);
+
+        // flushSync on a stale copy reports success: disk already holds the
+        // newer state, so eviction may safely drop the stale in-memory copy.
+        assert.equal(cold.flushSync(stale), true);
+        assert.equal(store.loadSync("fork-1")!.stats.requests, 3);
+
+        // A genuinely newer snapshot still lands.
+        const newer = makeSession("fork-1");
+        newer.stats.requests = 4;
+        await cold.writeNow(newer);
+        assert.equal(store.loadSync("fork-1")!.stats.requests, 4, "newer snapshot accepted");
+    } finally {
+        cold.cancelAll();
+    }
+});
+
+await withTempStore("rollback guard: equal requests but fewer blocks is stale (#405)", async (store, dir) => {
+    const fresh = makeSession("fork-2");
+    fresh.stats.requests = 3;
+    fresh.state.nextBlockId = 7;
+    await store.writeNow(fresh);
+
+    const cold = new SessionStore({ dir, debounceMs: 5, enabled: true });
+    try {
+        const stale = makeSession("fork-2");
+        stale.stats.requests = 3; // same request count…
+        stale.state.nextBlockId = 4; // …but missing compression progress
+        await cold.writeNow(stale);
+        assert.equal(store.loadSync("fork-2")!.state.nextBlockId, 7, "compression progress did NOT roll back");
+    } finally {
+        cold.cancelAll();
+    }
+});
+
+await withTempStore("rollback guard: scheduleSave path is guarded too (#405)", async (store, dir) => {
+    const fresh = makeSession("fork-3");
+    fresh.stats.requests = 9;
+    await store.writeNow(fresh);
+
+    const cold = new SessionStore({ dir, debounceMs: 5, enabled: true });
+    try {
+        const stale = makeSession("fork-3");
+        stale.stats.requests = 1;
+        cold.scheduleSave(stale);
+        await settle(50);
+        assert.equal(store.loadSync("fork-3")!.stats.requests, 9, "debounced stale write rejected");
+    } finally {
+        cold.cancelAll();
+    }
+});

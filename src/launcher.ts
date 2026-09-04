@@ -122,7 +122,8 @@ export interface LaunchOptions {
 export interface ProxyHandle {
     origin: string;
     port: number;
-    child: SpawnChild;
+    /** Absent when an already-healthy instance was reused (#405) — stopProxy is a no-op then. */
+    child?: SpawnChild;
     logPath?: string;
 }
 
@@ -1499,6 +1500,19 @@ export async function ensureProxyRunning(
     const spawnImpl = deps.spawnImpl ?? (spawn as SpawnFn);
     const now = deps.now ?? Date.now;
     const sleepImpl = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+
+    // #405 fix #3: a healthy instance on the preferred port is REUSED. The old
+    // behavior always spawned a second instance on an ephemeral port, which
+    // hijacked the global proxy-origin pointer and forked session state across
+    // two processes (whoever saved last won).
+    const preferredOrigin = proxyOrigin(opts.host, opts.port);
+    if (await probeHealth(preferredOrigin, fetchImpl)) {
+        console.error(`bili: reusing healthy proxy at ${preferredOrigin} (no second instance spawned)`);
+        if (opts.mitmDomains && opts.mitmDomains.length > 0) {
+            console.error(`bili: note: custom MITM domains (${opts.mitmDomains.join(",")}) only apply to instances started with them — the reused instance keeps its own whitelist`);
+        }
+        return { origin: preferredOrigin, port: opts.port };
+    }
 
     const port = await findFreePort(opts.port, opts.host);
     const spawnedOrigin = proxyOrigin(opts.host, port);

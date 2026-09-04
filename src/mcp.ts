@@ -9,7 +9,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { proxyOriginFile } from "./paths.js";
+import { probeOrigin, readPointerOrigin } from "./proxy-origin.js";
 
 const VERSION = (() => {
     try {
@@ -32,17 +32,60 @@ type McpToolDef = {
 // every model request (x-claude-code-session-id), so binding is by identity.
 // BILI_CONVERSATION_ID (launcher-spawned hosts like codex) has no matching
 // request id — binding is headless (next NEW session).
-const DEFAULT_PROXY_ORIGIN = "http://127.0.0.1:8787";
+/** Stable discovery default baked into host configs by `bili plugin install`
+ *  (#405): never an ephemeral launcher port, or one install would point the
+ *  host at a dead port forever. */
+export const DEFAULT_PROXY_ORIGIN = "http://127.0.0.1:8787";
 
 export function resolveProxyOrigin(): string {
     const fromEnv = process.env.BILI_MCP_PROXY?.trim();
     if (fromEnv && fromEnv.length > 0) return fromEnv;
+    return readPointerOrigin() ?? DEFAULT_PROXY_ORIGIN;
+}
+
+const LIVE_PROBE_TIMEOUT_MS = 1500;
+let liveOrigin: { origin: string; instanceId?: string } | null = null;
+
+function noteRebind(msg: string): void {
     try {
-        const discovered = fs.readFileSync(proxyOriginFile(), "utf8").trim();
-        if (/^https?:\/\/\S+$/.test(discovered)) return discovered;
-    } catch {
+        process.stderr.write(`[bili-mcp] ${msg}\n`);
+    } catch {}
+}
+
+/** Liveness-checked origin resolution (#405 fix #1): env → pointer file →
+ *  default, probing /__bili/health on each and returning the first LIVE one.
+ *  A killed ephemeral proxy therefore self-heals on the NEXT tool call — no
+ *  host-client restart. The result is cached; any network failure invalidates
+ *  it so the next call re-resolves against the current pointer file. */
+export async function resolveLiveOrigin(): Promise<string> {
+    if (liveOrigin) return liveOrigin.origin;
+    const candidates: string[] = [];
+    const push = (o: string | null | undefined): void => {
+        if (o && o.length > 0 && !candidates.includes(o)) candidates.push(o);
+    };
+    push(process.env.BILI_MCP_PROXY?.trim());
+    push(readPointerOrigin());
+    push(DEFAULT_PROXY_ORIGIN);
+    for (const origin of candidates) {
+        const probe = await probeOrigin(origin, LIVE_PROBE_TIMEOUT_MS);
+        if (probe.live) {
+            if (candidates.length > 1 && origin !== candidates[0]) {
+                noteRebind(`proxy origin rebound ${candidates[0]} -> ${origin}${probe.instanceId ? ` (instance ${probe.instanceId.slice(0, 8)})` : ""}`);
+            }
+            liveOrigin = { origin, instanceId: probe.instanceId };
+            return origin;
+        }
     }
-    return DEFAULT_PROXY_ORIGIN;
+    return candidates[0];
+}
+
+export function forgetLiveOrigin(): void {
+    liveOrigin = null;
+}
+
+/** Test hook: drop the cached live origin between cases. */
+export function _resetMcpLiveOriginForTest(): void {
+    liveOrigin = null;
 }
 
 const TOOL_TIMEOUT_MS = 60_000;
@@ -67,7 +110,14 @@ function sendError(id: JsonRpcId, code: number, message: string): void {
 }
 
 async function fetchManifest(): Promise<void> {
-    const res = await fetch(`${resolveProxyOrigin()}/__bili/plugin/manifest`, { signal: AbortSignal.timeout(5000) });
+    const origin = await resolveLiveOrigin();
+    let res: Response;
+    try {
+        res = await fetch(`${origin}/__bili/plugin/manifest`, { signal: AbortSignal.timeout(5000) });
+    } catch (err) {
+        forgetLiveOrigin();
+        throw err;
+    }
     if (!res.ok) throw new Error(`manifest fetch failed: ${res.status}`);
     const data = (await res.json()) as { tools?: Record<string, { name: string; description?: string; input_schema?: unknown }[]> };
     // Anthropic wire shape is the canonical MCP-compatible schema source.
@@ -86,15 +136,17 @@ function ensureManifest(): Promise<void> {
 }
 
 export async function forwardTool(tool: string, args: unknown, timeoutMs: number = TOOL_TIMEOUT_MS): Promise<string> {
+    const origin = await resolveLiveOrigin();
     let res: Response;
     try {
-        res = await fetch(`${resolveProxyOrigin()}/__bili/plugin/tool`, {
+        res = await fetch(`${origin}/__bili/plugin/tool`, {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify({ conversationId, tool, args }),
             signal: AbortSignal.timeout(timeoutMs),
         });
     } catch (err) {
+        forgetLiveOrigin();
         if (err instanceof Error && err.name === "TimeoutError") throw new Error(`tool forward timed out after ${timeoutMs}ms: ${tool}`);
         throw err;
     }
@@ -128,12 +180,20 @@ async function handleMessage(msg: {
             if (fromMeta) conversationId ??= fromMeta;
             initialized = true;
             if (conversationId && !registered) {
-                const registerFetch = fetch(`${resolveProxyOrigin()}/__bili/plugin/register`, {
-                    method: "POST",
-                    headers: { "content-type": "application/json" },
-                    body: JSON.stringify({ conversationId, agent: "mcp", identity: IDENTITY_BINDING }),
-                    signal: AbortSignal.timeout(5000),
-                });
+                const registerFetch = (async () => {
+                    const origin = await resolveLiveOrigin();
+                    try {
+                        return await fetch(`${origin}/__bili/plugin/register`, {
+                            method: "POST",
+                            headers: { "content-type": "application/json" },
+                            body: JSON.stringify({ conversationId, agent: "mcp", identity: IDENTITY_BINDING }),
+                            signal: AbortSignal.timeout(5000),
+                        });
+                    } catch (err) {
+                        forgetLiveOrigin();
+                        throw err;
+                    }
+                })();
                 registered = true; // issue-once: a repeated initialize must not re-register
                 if (IDENTITY_BINDING) {
                     // Identity-mode binding survives any arrival order —

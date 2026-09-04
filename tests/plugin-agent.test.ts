@@ -11,7 +11,7 @@ process.env.NODE_ENV = "test";
 import { proxyBaseFromUrl, proxyBaseFromEnv, detectProxyBase, fetchManifest, forwardTool, fetchStatus } from "../src/agent/shared.ts";
 import biliPlugin, { createBiliPlugin } from "../src/agent/pi.ts";
 import ompPlugin from "../src/agent/omp.ts";
-import { pluginInstall, pluginRemove, pluginStatusAll, PLUGIN_AGENTS, selfPackageRoot } from "../src/plugin-install.ts";
+import { pluginInstall, pluginRemove, pluginStatusAll, PLUGIN_AGENTS, selfPackageRoot, bakedProxyOrigin } from "../src/plugin-install.ts";
 import { resolveProxyOrigin, forwardTool as mcpForwardTool } from "../src/mcp.ts";
 
 function withEnv(vars: Record<string, string | undefined>, fn: () => void | Promise<void>): Promise<void> {
@@ -637,6 +637,23 @@ test("resolveProxyOrigin discovers the running proxy via the state file", async 
     });
     await withEnv({ XDG_STATE_HOME: state, BILI_MCP_PROXY: "http://10.0.0.5:9000" }, () => {
         assert.equal(resolveProxyOrigin(), "http://10.0.0.5:9000");
+    });
+    fs.rmSync(state, { recursive: true, force: true });
+});
+
+test("bakedProxyOrigin never freezes a transient pointer into persistent config (#405)", async () => {
+    const state = fs.mkdtempSync(path.join(os.tmpdir(), "bili-state-"));
+    fs.mkdirSync(path.join(state, "billion-context"), { recursive: true });
+    fs.writeFileSync(path.join(state, "billion-context", "proxy-origin"), "http://127.0.0.1:57645\n");
+    await withEnv({ XDG_STATE_HOME: state, BILI_MCP_PROXY: undefined }, () => {
+        assert.equal(
+            bakedProxyOrigin(),
+            "http://127.0.0.1:8787",
+            "a transient ephemeral pointer must not be frozen into persistent client config",
+        );
+    });
+    await withEnv({ XDG_STATE_HOME: state, BILI_MCP_PROXY: "http://10.0.0.5:9000" }, () => {
+        assert.equal(bakedProxyOrigin(), "http://10.0.0.5:9000", "explicit operator intent still wins");
     });
     fs.rmSync(state, { recursive: true, force: true });
 });

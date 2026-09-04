@@ -332,11 +332,11 @@ export async function main(): Promise<void> {
         return;
     }
     if (command === "plugin") {
-        // Installers read resolveProxyOrigin() (env first) at dispatch time.
-        // Apply --origin BEFORE handling the subcommand: the generic env
-        // merge further down runs only on the server path, which this
-        // branch returns ahead of — without this, a stale ~/.bili/
-        // proxy-origin discovery file would silently win over the flag.
+        // Installers bake bakedProxyOrigin() (explicit BILI_MCP_PROXY wins,
+        // else the stable default — #405) at dispatch time. Apply --origin
+        // BEFORE handling the subcommand: the generic env merge further down
+        // runs only on the server path, which this branch returns ahead of —
+        // without this, the flag would be ignored.
         if (overrides.BILI_MCP_PROXY !== undefined) process.env.BILI_MCP_PROXY = overrides.BILI_MCP_PROXY;
         if (pluginAction === "list") {
             for (const row of pluginStatusAll()) {
