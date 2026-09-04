@@ -535,8 +535,8 @@ MITM 只对一份**白名单**中的模型域名生效（`open.bigmodel.cn`、`a
 | codex | `HTTPS_PROXY` + `-c key=value` 覆盖 | `SSL_CERT_FILE` → `combined-ca.pem` |
 | claude | `ANTHROPIC_BASE_URL` = `/bili/` URL | 无需 |
 | opencode | `HTTPS_PROXY` + 隔离 `OPENCODE_CONFIG` | `NODE_EXTRA_CA_CERTS` |
-| hermes | 隔离 `HERMES_HOME`；**全部**上游走 `/bili/` | 无（certifi 忽略 `SSL_CERT_FILE`） |
-| dsh | 隔离 `DSH_HOME` + `DEEPSEEK_BASE_URL`；**全部**上游走 `/bili/` | 无（纯 fetch，无代理/CA 接口） |
+| hermes | `HTTPS_PROXY`（存在明文 http 上游时加 `HTTP_PROXY`）；继承的 `NO_PROXY` 做回环清洗 | `HERMES_CA_BUNDLE` → `combined-ca.pem` |
+| dsh | `HTTPS_PROXY`（非回环明文上游加 `HTTP_PROXY`）；**回环**上游 → `settings.yaml` overlay `DSH_HOME`；继承的 `NO_PROXY` 做回环清洗 | `NODE_EXTRA_CA_CERTS` |
 
 `NODE_EXTRA_CA_CERTS` 是**追加**到内置信任库，所以只指向 MITM 根证书（`root-ca.pem`）即可。`SSL_CERT_FILE` 会**替换**默认 CA bundle，所以 codex 指向 `combined-ca.pem` —— 包含 MITM 根证书**加上**系统/Node 公共根 —— 保证子进程环境里 pip/git/curl 类 TLS（盲转发、真证书）不受影响（#152）。
 
@@ -552,7 +552,7 @@ Claude Code 的 undici fetch 忽略 `HTTPS_PROXY`，所以证书 MITM 拦不到�
 | Claude Code | `ANTHROPIC_BASE_URL` 环境变量，否则硬编码 `api.anthropic.com` |
 | OpenCode | `~/.config/opencode/opencode.json` —— 各 provider 的 `baseURL` |
 | hermes | `~/.hermes/config.yaml` —— 各 provider 的端点行 |
-| dsh | `~/.dsh/settings.yaml` —— 每个 `baseURL`/`baseUrl`/`base_url` 值；内置 `deepseek-official` 路由另经 `$DEEPSEEK_BASE_URL` 接管 |
+| dsh | `~/.dsh/settings.yaml` —— 每个 `baseURL`/`baseUrl`/`base_url` 值；内置 `deepseek-official` 主机 `api.deepseek.com`（纳入 MITM 白名单） |
 
 ### 隔离临时配置（写了什么）
 
@@ -560,8 +560,8 @@ Claude Code 的 undici fetch 忽略 `HTTPS_PROXY`，所以证书 MITM 拦不到�
 
 - **pi / omp** —— 隔离的 `PI_CODING_AGENT_DIR`（在 `/tmp` 下），里面只有一份重写后的 `models.json` / `models.yml`（明文 baseUrl 包上 `/bili/`）。其余一切（`settings.json`、`sessions/`、`auth.json`、扩展……）都**符号链接**到真实 pi/omp 主目录，所以会话与登录互通：launcher 里开的会话在裸客户端里无缝继续，反之亦然。
 - **opencode** —— 临时 `opencode.json`（由 `OPENCODE_CONFIG` 指向），`baseURL` 重写为 `/bili/` 形式，**并追加了薄 `/acp` 插件**（开箱即原生工具；独立的 `opencode-acp` 插件检测到 `BILLION_CONTEXT_PROXY` 后自禁用）。
-- **hermes** —— 隔离的 `HERMES_HOME`，重写后的 `config.yaml` 让**所有**上游（HTTP 和 HTTPS）都走 `/bili/`（httpx 自建 CA bundle 且忽略 `SSL_CERT_FILE`，证书 MITM 不可行）。`skills/`、`memories/`、`sessions/` 符号链接共享。若没配置任何 provider —— 或 `config.yaml` 无法重写 —— 启动器打印警告，hermes 将**不经代理**运行（无压缩）。
-- **dsh** —— 隔离的 `DSH_HOME`（持久 overlay `~/.dsh-bili`），重写后的 `settings.yaml` 让所有已配置上游都走 `/bili/`（纯 `fetch`，无代理/CA 接口，证书 MITM 不可行）。`profiles/`、凭据、会话符号链接共享。内置 `deepseek-official` 路由另行经 `$DEEPSEEK_BASE_URL` 接管（dsh 解析顺序为 settings `llm-deepseek.baseURL` ?? 环境变量 ?? 默认值，重写过的用户配置优先，环境变量作零配置兜底）—— 即便没有任何自定义 provider，内置 deepseek 路由也照样走代理。
+- **hermes** —— 零文件写入（#535）：https 上游主机纳入 MITM 白名单，经 `HTTPS_PROXY` 到达；`HERMES_CA_BUNDLE` 指向 `combined-ca.pem`（httpx 用该 env 自建 CA bundle，合并 bundle 保留系统根证书，盲转发的主机不受影响）；明文 http 上游经 `HTTP_PROXY` 以 absolute-form 请求到达。继承的 `NO_PROXY` 会被清洗掉回环条目，本地上游仍能到 bili。会话身份插件（#286）**幂等装入真实** `~/.hermes/plugins/model-providers/bili-session-identity/`——bili 自有文件，与用户插件共存；其余什么都不写。若没配置任何 provider，启动器打印警告，LLM 流量将绕过代理（无压缩）。
+- **dsh** —— 按目标分流（#535）：非回环 https 主机纳入 MITM 白名单（`HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS`），非回环明文 http 走 `HTTP_PROXY`，内置 `deepseek-official` 路由通过白名单 `api.deepseek.com` 接管（不再覆写用户可能设置的 `$DEEPSEEK_BASE_URL`）。**回环目标是文档化例外**：dsh 对 localhost/127.0.0.1/::1 无条件绕过代理（`LOOPBACK_NO_PROXY`，“bypass is not optional”），所以回环上游保留旧的 `settings.yaml` 重写（隔离 `DSH_HOME` overlay `~/.dsh-bili`，其余符号链接共享）。继承的 `NO_PROXY` 会被清洗掉回环条目。
 
 ### 启动器里的原生工具
 

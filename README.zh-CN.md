@@ -88,8 +88,8 @@ bili codex                            # 拉起 codex
 bili claude                           # 拉起 claude
 bili omp                              # pi 同款 MITM 环境变量 + 隔离临时 models.yml
 bili opencode                         # HTTPS 走 MITM + 临时 opencode.json(HTTP 走 /bili/)+ 轻量 /acp 插件
-bili hermes                           # 无法 MITM(certifi CA)—— 隔离 HERMES_HOME,全部流量 /bili/
-bili dsh                              # deepseek-harness:内置 deepseek 路由走 DEEPSEEK_BASE_URL + 隔离 DSH_HOME(~/.dsh-bili),全部流量 /bili/,经 --patch 注入原生 /acp 命令
+bili hermes                           # HTTPS_PROXY 证书 MITM(HERMES_CA_BUNDLE)+ HTTP_PROXY 走明文上游;身份插件装入真实 ~/.hermes
+bili dsh                              # deepseek-harness:MITM 环境变量(含内置 deepseek 路由)+ HTTP_PROXY 走非回环明文上游;回环上游保留 settings.yaml overlay(~/.dsh-bili);经 --patch 注入原生 /acp 命令
 bili pi --mitm-domain api.foo.com     # 向 MITM 白名单追加域名
 ```
 

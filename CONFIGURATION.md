@@ -538,8 +538,8 @@ How each client is pointed at the proxy (set automatically in the child env):
 | codex | `HTTPS_PROXY` + `-c key=value` overrides | `SSL_CERT_FILE` → `combined-ca.pem` |
 | claude | `ANTHROPIC_BASE_URL` = `/bili/` URL | none needed |
 | opencode | `HTTPS_PROXY` + isolated `OPENCODE_CONFIG` | `NODE_EXTRA_CA_CERTS` |
-| hermes | isolated `HERMES_HOME`; **all** upstreams `/bili/` | none (certifi ignores `SSL_CERT_FILE`) |
-| dsh | isolated `DSH_HOME` + `DEEPSEEK_BASE_URL`; **all** upstreams `/bili/` | none (plain fetch, no proxy/CA knobs) |
+| hermes | `HTTPS_PROXY` (+`HTTP_PROXY` when plaintext-http upstreams exist); inherited `NO_PROXY` loopback-sanitized | `HERMES_CA_BUNDLE` → `combined-ca.pem` |
+| dsh | `HTTPS_PROXY` (+`HTTP_PROXY` for non-loopback plaintext); **loopback** upstreams → `settings.yaml` overlay `DSH_HOME`; inherited `NO_PROXY` loopback-sanitized | `NODE_EXTRA_CA_CERTS` |
 
 `NODE_EXTRA_CA_CERTS` *appends* to the built-in trust store, so it points at the MITM root alone (`root-ca.pem`). `SSL_CERT_FILE` *replaces* the default CA bundle, so for codex it points at `combined-ca.pem` — a bundle containing the MITM root **plus** the system/Node public roots — keeping pip/git/curl style TLS (blind-tunnelled, real certificates) working inside the child env (#152).
 
@@ -555,7 +555,7 @@ Where upstreams are discovered from (read-only):
 | Claude Code | `ANTHROPIC_BASE_URL` env var, else hardcoded `api.anthropic.com` |
 | OpenCode | `~/.config/opencode/opencode.json` — each provider's `baseURL` |
 | hermes | `~/.hermes/config.yaml` — each provider's endpoint lines |
-| dsh | `~/.dsh/settings.yaml` — every `baseURL`/`baseUrl`/`base_url` value; plus the built-in `deepseek-official` route via `$DEEPSEEK_BASE_URL` |
+| dsh | `~/.dsh/settings.yaml` — every `baseURL`/`baseUrl`/`base_url` value; plus the built-in `deepseek-official` host `api.deepseek.com` (MITM-whitelisted) |
 
 ### Isolated temp config (what gets written)
 
@@ -563,8 +563,8 @@ The `/bili/` rewrite modes write a **temp copy** — the real config is never ed
 
 - **pi / omp** — an isolated `PI_CODING_AGENT_DIR` (under `/tmp`) containing only a rewritten `models.json` / `models.yml` with the `/bili/`-wrapped plaintext baseUrls. Everything else (`settings.json`, `sessions/`, `auth.json`, extensions…) is **symlinked** to the real pi/omp home, so sessions and logins are shared: a conversation started under the launcher continues seamlessly in a bare client, and vice versa.
 - **opencode** — a temp `opencode.json` pointed at by `OPENCODE_CONFIG`, with `/bili/`-rewritten baseURLs **plus the thin `/acp` plugin appended** (native tools out of the box; the standalone `opencode-acp` plugin self-disables via `BILLION_CONTEXT_PROXY`).
-- **hermes** — an isolated `HERMES_HOME` with a rewritten `config.yaml` routing **every** upstream (HTTP and HTTPS) through `/bili/` (httpx builds its own CA bundle and ignores `SSL_CERT_FILE`, so cert MITM is impossible). `skills/`, `memories/`, `sessions/` are symlinked through. If no providers are configured — or `config.yaml` can't be rewritten — the launcher prints a warning and hermes runs **unproxied** (compression off).
-- **dsh** — an isolated `DSH_HOME` (persistent overlay `~/.dsh-bili`) with a rewritten `settings.yaml` routing every configured upstream through `/bili/` (plain `fetch`, no proxy/CA knobs, so cert MITM is impossible). `profiles/`, credentials and sessions are symlinked through. The built-in `deepseek-official` route is captured separately via `$DEEPSEEK_BASE_URL` (dsh resolves `settings llm-deepseek.baseURL` ?? env ?? default, so a rewritten user setting wins and the env is the zero-config fallback) — with no custom providers the deepseek route is still proxied out of the box.
+- **hermes** — zero file writes (#535): https upstream hosts are MITM-whitelisted and reached via `HTTPS_PROXY`, with `HERMES_CA_BUNDLE` pointing at `combined-ca.pem` (httpx builds its own bundle from that env, so the combined bundle keeps system roots working for blind-tunnelled hosts); plaintext-http upstreams ride `HTTP_PROXY` as absolute-form requests. Inherited `NO_PROXY` is sanitized of loopback entries so local upstreams still reach bili. The session-identity plugin (#286) is installed idempotently into the REAL `~/.hermes/plugins/model-providers/bili-session-identity/` — bili-owned files that coexist with user plugins; nothing else is written. If no providers are configured, the launcher warns and LLM traffic bypasses the proxy (compression off).
+- **dsh** — split by destination (#535): non-loopback https hosts are MITM-whitelisted (`HTTPS_PROXY` + `NODE_EXTRA_CA_CERTS`), non-loopback plaintext-http rides `HTTP_PROXY`, and the built-in `deepseek-official` route is captured by whitelisting `api.deepseek.com` (no more `$DEEPSEEK_BASE_URL` clobbering of a user-set value). **Loopback destinations are the documented exception**: dsh unconditionally bypasses proxies for localhost/127.0.0.1/::1 (`LOOPBACK_NO_PROXY`, "the bypass is not optional"), so loopback upstreams keep the legacy `settings.yaml` rewrite in an isolated `DSH_HOME` overlay (`~/.dsh-bili`) with everything else symlinked through. Inherited `NO_PROXY` is sanitized of loopback entries.
 
 ### Native tools in the launcher
 

@@ -112,6 +112,18 @@ turn is a semantic mismatch the model tolerates (it is clearly marked
   summaries (their tool call isn't in the agent's history and the agent's view
   skips `acp_summary`) — but that needs the id match above, which doesn't occur.
 
+### Injection priority — no files unless unavoidable
+
+How the launcher points a client at the proxy follows a strict priority
+(#535): **env vars** (`HTTPS_PROXY` cert-MITM for discovered upstream hosts,
+`HTTP_PROXY` absolute-form requests for plaintext-http upstreams, plus the
+per-client CA trust variable) > **client-native CLI flags / extension APIs**
+> **generated config files** (last resort — today omp's overlay and dsh's
+loopback exception). No real config file is ever edited, and bili never owns
+user data: clients run against their real home directory, and pre-existing
+overlay dirs from older versions (e.g. `~/.hermes-bili`) are left in place,
+unmigrated.
+
 ## Which do I need?
 
 Pick by your client:
@@ -157,8 +169,8 @@ bili codex                            # launch codex through the proxy
 bili claude                           # launch claude through the proxy
 bili omp                              # pi-style: MITM env + persistent overlay home (~/.omp/agent-bili, real config untouched)
 bili opencode                         # MITM for HTTPS + temp opencode.json (/bili/ for HTTP) + thin /acp plugin
-bili hermes                           # no MITM possible (certifi CA) — persistent overlay home (~/.hermes-bili), all traffic /bili/
-bili dsh                              # deepseek-harness: built-in deepseek route via DEEPSEEK_BASE_URL + overlay DSH_HOME (~/.dsh-bili), all traffic /bili/, native /acp command injected via --patch
+bili hermes                           # HTTPS_PROXY cert-MITM (HERMES_CA_BUNDLE) + HTTP_PROXY for plaintext upstreams; identity plugin in real ~/.hermes
+bili dsh                              # deepseek-harness: MITM env incl. built-in deepseek route + HTTP_PROXY for non-loopback plaintext; loopback keeps settings.yaml overlay (~/.dsh-bili); native /acp via --patch
 bili pi --mitm-domain api.foo.com     # add a domain to the MITM whitelist
 ```
 
