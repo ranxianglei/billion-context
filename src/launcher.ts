@@ -179,6 +179,26 @@ export interface DiscoveredRoutes {
     httpsDomains: string[];
     httpRewrites: HttpRewrite[];
     httpsRewrites: HttpRewrite[];
+    /** #535: plaintext-http upstreams routed purely through HTTP_PROXY as
+     *  standard absolute-form forward-proxy requests (no client-side URL
+     *  rewrite). hermes: every http upstream; dsh: non-loopback only — its
+     *  loopback no-proxy bypass is unconditional, those keep the settings.yaml
+     *  /bili/ form in httpRewrites below. */
+    httpEnvRoutes: string[];
+    /** #535: discovered provider names whose traffic rides the proxy. hermes
+     *  feeds these to the session-identity plugin, which must register a
+     *  profile for every named provider it fronts. */
+    providerKeys: string[];
+}
+
+/** Loopback destinations a client's own no-proxy list would normally exclude —
+ *  bili's proxy itself lives on the loopback, so inherited NO_PROXY entries
+ *  for these hosts would shadow the routing (see stripLoopbackNoProxy). */
+export function isLoopbackHost(host: string): boolean {
+    const h = host.toLowerCase();
+    if (h === "localhost" || h === "::1" || h === "[::1]") return true;
+    const m = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(h);
+    return m !== null && m[1] === "127";
 }
 
 export function resolveCaCertPath(env: NodeJS.ProcessEnv): string {
@@ -215,6 +235,8 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
     const httpsDomains: string[] = [];
     const httpRewrites: HttpRewrite[] = [];
     const httpsRewrites: HttpRewrite[] = [];
+    const httpEnvRoutes: string[] = [];
+    const providerKeys: string[] = [];
     const httpsSeen = new Set<string>();
     const rewriteKeys = new Set<string>();
     const httpsRewriteKeys = new Set<string>();
@@ -276,43 +298,73 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
             classify(prov.baseURL, name);
         }
     } else if (client === "hermes") {
-        // hermes rides /bili/ for EVERY upstream (http AND https): its httpx
-        // client builds its own CA bundle from certifi, so cert-MITM would
-        // need extra trust config. Wrapping the URL form needs no cert at all.
+        // #535 file-free routing: hermes's httpx stack honors the standard
+        // proxy env vars (run_agent.py _get_proxy_for_base_url), so NO
+        // config.yaml rewrite happens anymore — https upstreams ride
+        // HTTPS_PROXY + cert-MITM (host whitelisted here; the CA bundle is
+        // trusted via HERMES_CA_BUNDLE in runLaunch), plaintext http upstreams
+        // ride HTTP_PROXY as absolute-form forward-proxy requests. providerKeys
+        // feeds the session-identity plugin (prompt_cache_key, #286).
         const hermesSeen = new Set<string>();
         for (const [name, prov] of Object.entries(config.hermes?.providers ?? {})) {
             if (!nonEmpty(prov.api)) continue;
             const real = unwrapUpstream(prov.api!);
+            let url: URL;
             try {
-                const url = new URL(real);
-                if (url.protocol !== "http:" && url.protocol !== "https:") continue;
-                if (hermesSeen.has(name)) continue;
-                hermesSeen.add(name);
-                rewriteKeys.add(name);
-                httpRewrites.push({ key: name, realUpstream: real });
+                url = new URL(real);
             } catch {
-                // Unparseable endpoint: skip.
+                continue;
+            }
+            if (url.protocol !== "http:" && url.protocol !== "https:") continue;
+            if (hermesSeen.has(name)) continue;
+            hermesSeen.add(name);
+            rewriteKeys.add(name);
+            providerKeys.push(name);
+            if (url.protocol === "https:") {
+                const host = url.hostname;
+                if (host && !httpsSeen.has(host.toLowerCase())) {
+                    httpsSeen.add(host.toLowerCase());
+                    httpsDomains.push(host);
+                }
+            } else {
+                httpEnvRoutes.push(real);
             }
         }
     } else if (client === "dsh") {
-        // dsh (deepseek-harness) has no proxy/CA knobs in its fetch stack:
-        // every configured upstream rides the /bili/ URL form. The built-in
-        // deepseek-official route is captured via $DEEPSEEK_BASE_URL in
-        // runLaunch; user-configured settings.yaml endpoints here.
+        // #535: dsh's undici dispatcher honors the standard proxy env vars,
+        // BUT its loopback no-proxy list (localhost/127.0.0.1/::1) is
+        // unconditional ("the bypass is not optional") — env routing can never
+        // reach a loopback upstream. Loopback destinations therefore keep the
+        // settings.yaml /bili/ rewrite (documented exception); everything else
+        // rides env — https via HTTPS_PROXY + cert-MITM (domain whitelisted
+        // here), plaintext http via HTTP_PROXY. The built-in deepseek-official
+        // route is MITM-whitelisted in runLaunch instead of wrapping
+        // $DEEPSEEK_BASE_URL.
         const dshSeen = new Set<string>();
         let anon = 0;
         for (const raw of config.dsh?.baseUrls ?? []) {
             const real = unwrapUpstream(raw);
+            let url: URL;
             try {
-                const url = new URL(real);
-                if (url.protocol !== "http:" && url.protocol !== "https:") continue;
-                if (dshSeen.has(real)) continue;
-                dshSeen.add(real);
+                url = new URL(real);
+            } catch {
+                continue;
+            }
+            if (url.protocol !== "http:" && url.protocol !== "https:") continue;
+            if (dshSeen.has(real)) continue;
+            dshSeen.add(real);
+            if (isLoopbackHost(url.hostname)) {
                 anon += 1;
                 rewriteKeys.add(`dsh-${anon}`);
                 httpRewrites.push({ key: `dsh-${anon}`, realUpstream: real });
-            } catch {
-                // Unparseable endpoint: skip.
+            } else if (url.protocol === "https:") {
+                const host = url.hostname;
+                if (!httpsSeen.has(host.toLowerCase())) {
+                    httpsSeen.add(host.toLowerCase());
+                    httpsDomains.push(host);
+                }
+            } else {
+                httpEnvRoutes.push(real);
             }
         }
     } else {
@@ -322,7 +374,7 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
         classify(config.codex?.openaiBaseUrl, "openai_base_url");
     }
 
-    return { httpsDomains, httpRewrites, httpsRewrites };
+    return { httpsDomains, httpRewrites, httpsRewrites, httpEnvRoutes, providerKeys };
 }
 
 export function discoverDomains(client: ClientName, config: ClientConfig): string[] {
@@ -1355,51 +1407,7 @@ export function prepareOmpHttpRewrite(
     return overlay;
 }
 
-/**
- * hermes counterpart of prepareOmpHttpRewrite: a persistent `<hermesHome>-bili`
- * overlay (every ~/.hermes sibling symlinked so skills/memories/sessions stay
- * shared) holding a rewritten copy of config.yaml. Every provider endpoint
- * line (api: / base_url: / url:) is rewrapped as origin + "/bili/" + raw
- * upstream — http AND https alike, since hermes's httpx stack can't consume
- * the MITM CA without extra trust config. The real ~/.hermes is never
- * touched. Returns the overlay dir (undefined when nothing is rewritable).
- */
-export function prepareHermesHome(
-    hermesHome: string,
-    origin: string,
-    rewrites: HttpRewrite[],
-): string | undefined {
-    if (rewrites.length === 0) return undefined;
-    const cfgPath = path.join(hermesHome, "config.yaml");
-    let txt: string;
-    try {
-        txt = fs.readFileSync(cfgPath, "utf8");
-    } catch {
-        return undefined;
-    }
-    const wrapSet = new Set(rewrites.map((r) => r.realUpstream));
-    const eol = txt.includes("\r\n") ? "\r\n" : "\n";
-    const lines = txt.split(/\r?\n/);
-    let changed = false;
-    for (let i = 0; i < lines.length; i++) {
-        const rawLine = lines[i];
-        const m = /^(\s*(?:api|base_url|url):\s*)(\S+)(\s+#.*)?$/.exec(rawLine);
-        if (!m) continue;
-        const rawUrl = m[2].replace(/^["']|["']$/g, "");
-        if (!/^https?:\/\//i.test(rawUrl)) continue;
-        const real = unwrapUpstream(rawUrl);
-        if (!wrapSet.has(real)) continue;
-        lines[i] = `${m[1]}${wrapUpstream(origin, real)}${m[3] ?? ""}`;
-        changed = true;
-    }
-    if (!changed) return undefined;
-    const overlay = `${hermesHome}-bili`;
-    if (!refreshOverlayHome(hermesHome, overlay, "config.yaml")) return undefined;
-    writeOverlayFileAtomic(overlay, "config.yaml", lines.join(eol));
-    return overlay;
-}
-
-/** Write the hermes session-identity plugin into the bili overlay home.
+/** Write the hermes session-identity plugin into the user's REAL home.
  *  Hermes sends NO conversation identity on the wire by default: its native
  *  `prompt_cache_key` support (transports/chat_completions.py) is gated on
  *  `supports_prompt_cache_key`, which no bundled provider profile enables —
@@ -1412,43 +1420,34 @@ export function prepareHermesHome(
  *  the bundled "custom" profile and stamps prompt_cache_key = session_id,
  *  giving the proxy the same stable per-conversation id omp/pi provide.
  *  Registered names: "custom" (model.base_url / provider: custom) plus
- *  "custom:<name>" for every provider key bili rewrites (named providers
+ *  "custom:<name>" for every provider key bili fronts (named providers
  *  resolve to that shape — agent_init only maps "custom"/"custom:<key>"
  *  to custom endpoints, and a bare "custom:<key>" lookup otherwise misses
  *  the profile registry and falls to the legacy no-pck path).
- *  Skipped (returns false) when the REAL ~/.hermes already has a plugins/
- *  dir — refreshOverlayHome symlinks it into the overlay, and writing
- *  through the symlink would mutate the user's real home. The proxy then
- *  400s anonymous requests with the fix-it message. */
-export function writeHermesIdentityPlugin(hermesHome: string, overlay: string, rewrites: HttpRewrite[]): boolean {
+ *  #535 file-free routing: installed under <hermesHome>/plugins/model-
+ *  providers/bili-session-identity/ — a bili-owned subdir in the real home
+ *  that coexists with the user's own plugins (unique dir name, no
+ *  collision) and is overwritten idempotently on every launch. Safe to
+ *  delete (stock behavior returns: anonymous requests, proxy 400 fix-it
+ *  message). */
+export function writeHermesIdentityPlugin(hermesHome: string, providerKeys: string[]): boolean {
+    const dir = path.join(hermesHome, "plugins", "model-providers", "bili-session-identity");
     try {
-        if (fs.existsSync(path.join(hermesHome, "plugins"))) return false;
-    } catch {
-        return false;
-    }
-    const dir = path.join("plugins", "model-providers", "bili-session-identity");
-    try {
-        fs.mkdirSync(path.join(overlay, dir), { recursive: true });
-    } catch {
-        return false;
-    }
-    const keys = rewrites.map((r) => r.key);
-    const pluginDir = path.join(overlay, dir);
-    try {
-        fs.writeFileSync(path.join(pluginDir, "__init__.py"), hermesIdentityPluginSource(keys));
-        fs.writeFileSync(path.join(pluginDir, "plugin.yaml"), [
-        "name: bili-session-identity",
-        "kind: model-provider",
-        "version: 1.0.0",
-        "description: billion-context session identity (installed by `bili hermes` — safe to delete)",
-        "author: billion-context",
-        "",
-    ].join("\n"));
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(path.join(dir, "__init__.py"), hermesIdentityPluginSource(providerKeys));
+        fs.writeFileSync(path.join(dir, "plugin.yaml"), [
+            "name: bili-session-identity",
+            "kind: model-provider",
+            "version: 1.0.0",
+            "description: billion-context session identity (installed by `bili hermes` — safe to delete)",
+            "author: billion-context",
+            "",
+        ].join("\n"));
     } catch {
         return false;
     }
     try {
-        return fs.existsSync(path.join(overlay, dir, "__init__.py"));
+        return fs.existsSync(path.join(dir, "__init__.py"));
     } catch {
         return false;
     }
@@ -1506,13 +1505,16 @@ function hermesIdentityPluginSource(providerKeys: string[]): string {
     ].join("\n");
 }
 
-/** dsh counterpart of prepareHermesHome: a persistent `<dshHome>-bili` overlay
+/** dsh loopback exception (#535): a persistent `<dshHome>-bili` overlay
  *  (every ~/.dsh sibling symlinked so credentials/profiles/sessions stay
- *  shared) holding a rewritten copy of settings.yaml. Every baseURL/baseUrl/
- *  base_url value is rewrapped as origin + "/bili/" + raw upstream — http AND
- *  https alike, since dsh's fetch stack exposes no proxy/CA trust knobs. The
- *  real ~/.dsh is never touched. Returns the overlay dir (undefined when the
- *  settings file is unreadable or nothing is rewritable). */
+ *  shared) holding a rewritten copy of settings.yaml. Only LOOPBACK upstreams
+ *  land here — dsh's unconditional loopback no-proxy bypass makes env routing
+ *  impossible for them, so they keep the /bili/ URL form; every other
+ *  destination rides the proxy env vars instead (see discoverRoutes). Every
+ *  baseURL/baseUrl/base_url value matching a loopback rewrite is rewrapped as
+ *  origin + "/bili/" + raw upstream. The real ~/.dsh is never touched.
+ *  Returns the overlay dir (undefined when the settings file is unreadable or
+ *  nothing is rewritable). */
 export function prepareDshHome(
     dshHome: string,
     origin: string,
@@ -1755,6 +1757,24 @@ export function stripInheritedProxy(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     return cleaned;
 }
 
+// Clients that route their LLM traffic through bili via the standard proxy
+// env vars (hermes httpx, dsh undici dispatcher) also honor NO_PROXY — and a
+// user's inherited NO_PROXY almost always excludes localhost, which would
+// silently shadow bili's own loopback origin for every local upstream
+// (sglang & co). Strip loopback entries from the child env only; the user's
+// own shell is untouched.
+export function stripLoopbackNoProxy(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    const out: NodeJS.ProcessEnv = { ...env };
+    for (const key of ["NO_PROXY", "no_proxy"]) {
+        const value = out[key];
+        if (typeof value !== "string" || value.length === 0) continue;
+        const kept = value.split(",").map((s) => s.trim()).filter((s) => s.length > 0 && !isLoopbackHost(s));
+        if (kept.length > 0) out[key] = kept.join(",");
+        else delete out[key];
+    }
+    return out;
+}
+
 function proxyStartArgs(opts: LaunchOptions): string[] {
     const args = ["start", "--host", opts.host, "--port", String(opts.port)];
     if (opts.passthrough) args.push("--passthrough");
@@ -1963,12 +1983,19 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     // bili's own route graph (same sources the spawned proxy child reads —
     // used to resolve the budget-alignment window, #321).
     const biliRoutes = loadRoutes(process.env);
-    const domains = dedupeInOrder([...routes.httpsDomains, ...(params.mitmDomains ?? [])]);
+    // #535: dsh's built-in deepseek-official route (default
+    // https://api.deepseek.com; user settings/env may point elsewhere) is
+    // captured by MITM-whitelisting the official host instead of wrapping
+    // $DEEPSEEK_BASE_URL — the whitelist entry is inert unless traffic to it
+    // actually flows.
+    const builtinDomains = base === "dsh" ? ["api.deepseek.com"] : [];
+    const domains = dedupeInOrder([...routes.httpsDomains, ...builtinDomains, ...(params.mitmDomains ?? [])]);
     const handle = await ensureProxyRunning({ host, port, passthrough, debug, mitmDomains: domains, modelWindows: collectModelWindows(config, base) }, deps);
     console.error(
         `bili: started proxy at ${handle.origin} (MITM domains: ${domains.length ? domains.join(", ") : "defaults"})` +
             (routes.httpRewrites.length > 0 ? ` (HTTP /bili/ rewrites: ${routes.httpRewrites.length})` : "") +
             (routes.httpsRewrites.length > 0 ? ` (HTTPS cert rewrites: ${routes.httpsRewrites.length})` : "") +
+            (routes.httpEnvRoutes.length > 0 ? ` (HTTP proxy-env routes: ${routes.httpEnvRoutes.length})` : "") +
             (params.client === "pi-test" ? " (no extensions)" : ""),
     );
     if (handle.logPath) {
@@ -1981,7 +2008,6 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     let piOverlayHome: string | undefined;
     let ompOverlayHome: string | undefined;
     let opencodeTmpFile: string | undefined;
-    let hermesOverlayHome: string | undefined;
     let dshOverlayHome: string | undefined;
     const tmpFiles: string[] = [];
     const directUrl = launcherDirectUrl(process.env);
@@ -2049,44 +2075,56 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         opencodeTmpFile = prepareOpencodeHttpRewrite(resolveOpencodeConfigFile(process.env), origin, routes.httpRewrites, routes.httpsRewrites, opencodePluginPath);
         if (opencodeTmpFile) env.OPENCODE_CONFIG = opencodeTmpFile;
     } else if (base === "hermes") {
-        // hermes: no plugin, no MITM cert trust (httpx builds its own CA
-        // bundle) — every upstream rides the /bili/ URL form via a persistent
-        // overlay HERMES_HOME (~/.hermes-bili) whose config.yaml is rewritten.
-        // skills/memories/sessions stay shared through symlinks; the real
-        // ~/.hermes is never touched.
-        env = { ...process.env };
-        hermesOverlayHome = prepareHermesHome(resolveHermesHome(process.env), origin, routes.httpRewrites);
-        if (hermesOverlayHome) {
-            env.HERMES_HOME = hermesOverlayHome;
+        // #535 file-free routing: NOTHING in ~/.hermes is rewritten anymore —
+        // hermes keeps writing its own config.yaml however it likes and bili
+        // never owns it. https upstreams ride HTTPS_PROXY + cert-MITM
+        // (whitelisted hosts; HERMES_CA_BUNDLE points at the COMBINED bundle
+        // because hermes replaces its trust store wholesale, so blind-
+        // tunneled hosts still need the system roots inside it); plaintext
+        // http upstreams ride HTTP_PROXY as absolute-form forward-proxy
+        // requests. Inherited NO_PROXY loses its loopback entries so a user's
+        // localhost exclusion can't shadow bili's own loopback origin.
+        env = stripLoopbackNoProxy({
+            ...process.env,
+            HTTPS_PROXY: origin,
+            HERMES_CA_BUNDLE: resolveCombinedCaPath(process.env),
+            ...(routes.httpEnvRoutes.length > 0 ? { HTTP_PROXY: origin } : {}),
+        });
+        if (routes.providerKeys.length > 0) {
             // Session identity for the proxied custom providers: hermes sends
             // no conversation id on the wire, so the proxy 400s anonymous
             // requests (#286). The plugin stamps the real hermes session id as
-            // prompt_cache_key. Skipped (identity stays anonymous) when the
-            // real ~/.hermes already has a plugins/ dir — writing through the
-            // overlay symlink would mutate the user's home.
-            if (!writeHermesIdentityPlugin(resolveHermesHome(process.env), hermesOverlayHome, routes.httpRewrites)) {
+            // prompt_cache_key.
+            if (!writeHermesIdentityPlugin(resolveHermesHome(process.env), routes.providerKeys)) {
                 console.error(
-                    "bili: ~/.hermes has its own plugins/ — skipping the session-identity plugin; hermes requests will be rejected by the proxy without an identity (see #286).",
+                    "bili: could not install the session-identity plugin into ~/.hermes/plugins — hermes requests will be rejected by the proxy without an identity (see #286).",
                 );
             }
         } else {
             console.error(
-                routes.httpRewrites.length === 0
-                    ? "bili: no hermes providers found in ~/.hermes/config.yaml — traffic will NOT go through the proxy (configure a provider first)."
-                    : "bili: hermes config.yaml could not be rewritten (unreadable or no matching provider endpoints) — traffic will NOT go through the proxy.",
+                "bili: no hermes providers found in ~/.hermes/config.yaml — LLM traffic will NOT go through the proxy (configure a provider first).",
             );
         }
     } else if (base === "dsh") {
-        // dsh (deepseek-harness): no plugin surface, no MITM cert trust (plain
-        // fetch) — the built-in deepseek-official route is captured through
-        // $DEEPSEEK_BASE_URL (its resolution order is settings baseURL ?? env
-        // ?? https://api.deepseek.com, so a rewritten user setting wins and
-        // this env is the no-settings fallback). Custom providers in
-        // ~/.dsh/settings.yaml ride a persistent overlay DSH_HOME
-        // (~/.dsh-bili); credentials/profiles/sessions stay shared through
-        // symlinks and the real ~/.dsh is never touched.
-        env = { ...process.env, BILLION_CONTEXT_PROXY: origin };
-        env.DEEPSEEK_BASE_URL = wrapUpstream(origin, "https://api.deepseek.com");
+        // #535: dsh's fetch stack honors the standard proxy env vars —
+        // EXCEPT its loopback no-proxy list is unconditional, so only LOOPBACK
+        // custom providers keep the settings.yaml /bili/ rewrite via a
+        // persistent overlay DSH_HOME (~/.dsh-bili; credentials/profiles/
+        // sessions shared through symlinks, real ~/.dsh untouched). Every
+        // other destination rides env: https via HTTPS_PROXY + cert-MITM
+        // (NODE_EXTRA_CA_CERTS), plaintext http via HTTP_PROXY as absolute-
+        // form forward-proxy requests. The built-in deepseek-official route
+        // is captured by MITM-whitelisting api.deepseek.com (see domains
+        // above) instead of wrapping $DEEPSEEK_BASE_URL — which also stops us
+        // clobbering a user-set DEEPSEEK_BASE_URL. Inherited NO_PROXY loses
+        // its loopback entries for the same reason as hermes above.
+        env = stripLoopbackNoProxy({
+            ...process.env,
+            BILLION_CONTEXT_PROXY: origin,
+            HTTPS_PROXY: origin,
+            NODE_EXTRA_CA_CERTS: ca,
+            ...(routes.httpEnvRoutes.length > 0 ? { HTTP_PROXY: origin } : {}),
+        });
         // Session identity for the proxy: dsh's pi-ai stack keys its
         // `prompt_cache_key` body field (the dsh session id) off
         // cacheRetention — every non-api.openai.com base URL defaults to
@@ -2100,17 +2138,15 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // overrides the env fallback).
         env.PI_CACHE_RETENTION = "long";
         const dshHomeDir = resolveDshHome(process.env);
-        dshOverlayHome = prepareDshHome(dshHomeDir, origin, routes.httpRewrites);
-        if (dshOverlayHome) {
-            env.DSH_HOME = dshOverlayHome;
-        } else if (routes.httpRewrites.length > 0) {
-            console.error(
-                "bili: dsh settings.yaml could not be rewritten (unreadable or no matching endpoints) — custom providers will NOT go through the proxy; the built-in deepseek route still does.",
-            );
-        } else {
-            console.error(
-                "bili: no custom providers found in ~/.dsh/settings.yaml — proxying the built-in deepseek route via DEEPSEEK_BASE_URL only.",
-            );
+        if (routes.httpRewrites.length > 0) {
+            dshOverlayHome = prepareDshHome(dshHomeDir, origin, routes.httpRewrites);
+            if (dshOverlayHome) {
+                env.DSH_HOME = dshOverlayHome;
+            } else {
+                console.error(
+                    "bili: dsh settings.yaml could not be rewritten (unreadable or no matching loopback endpoints) — loopback custom providers will NOT go through the proxy.",
+                );
+            }
         }
         // Native /acp command rides a --patch overlay (independent of the
         // settings rewrite above), so it exists on every profile dsh boots.

@@ -16,6 +16,7 @@ import {
     healthUrl,
     wrapUpstream,
     unwrapUpstream,
+    isLoopbackHost,
     buildPiEnv,
     buildCodexEnv,
     buildClaudeEnv,
@@ -24,6 +25,7 @@ import {
     prepareOmpHttpRewrite,
     prepareOpencodeHttpRewrite,
     stripInheritedProxy,
+    stripLoopbackNoProxy,
     resolvePiHome,
     resolveOmpHome,
     extractDomains,
@@ -38,7 +40,6 @@ import {
     parseHermesYaml,
     readHermesConfig,
     resolveHermesHome,
-    prepareHermesHome,
     writeHermesIdentityPlugin,
     parseDshSettingsYaml,
     readDshConfig,
@@ -878,9 +879,10 @@ test("discoverRoutes: pi with one http provider → rewrite keyed by provider na
     ]);
 });
 
-test("discoverRoutes: empty config → {httpsDomains:[], httpRewrites:[]}", () => {
-    assert.deepEqual(discoverRoutes("pi", {}), { httpsDomains: [], httpRewrites: [], httpsRewrites: [] });
-    assert.deepEqual(discoverRoutes("codex", {}), { httpsDomains: [], httpRewrites: [], httpsRewrites: [] });
+test("discoverRoutes: empty config → all route lists empty", () => {
+    const empty = { httpsDomains: [], httpRewrites: [], httpsRewrites: [], httpEnvRoutes: [], providerKeys: [] };
+    assert.deepEqual(discoverRoutes("pi", {}), empty);
+    assert.deepEqual(discoverRoutes("codex", {}), empty);
 });
 
 test("discoverRoutes: codex /bili/-wrapped HTTPS provider → httpsRewrites to raw upstream", () => {
@@ -1768,7 +1770,7 @@ test("readHermesConfig + resolveHermesHome", () => {
     }
 });
 
-test("discoverRoutes: hermes wraps http AND https via /bili/ (no MITM domains)", () => {
+test("discoverRoutes: hermes splits https→MITM domains, http→proxy-env routes, keys every provider (#535)", () => {
     const config: ClientConfig = {};
     (config as Record<string, unknown>).hermes = {
         providers: {
@@ -1779,143 +1781,60 @@ test("discoverRoutes: hermes wraps http AND https via /bili/ (no MITM domains)",
         },
     };
     const routes = discoverRoutes("hermes", config);
-    assert.deepEqual(routes.httpsDomains, []);
-    assert.deepEqual(routes.httpRewrites.map((r) => r.key).sort(), ["glm", "sglang", "wrapped"]);
-    const glm = routes.httpRewrites.find((r) => r.key === "glm");
-    assert.equal(glm?.realUpstream, "https://open.bigmodel.cn/api/paas/v4");
-    const wrapped = routes.httpRewrites.find((r) => r.key === "wrapped");
-    assert.equal(wrapped?.realUpstream, "https://api.foo.io/v1");
+    // https upstreams ride HTTPS_PROXY cert-MITM (host whitelisted), legacy
+    // /bili/ wraps self-heal back to their raw upstream.
+    assert.deepEqual(routes.httpsDomains, ["open.bigmodel.cn", "api.foo.io"]);
+    // plaintext http upstreams ride HTTP_PROXY absolute-form — no rewrite at all.
+    assert.deepEqual(routes.httpEnvRoutes, ["http://127.0.0.1:8199/v1"]);
+    // identity plugin must register a profile per named provider it fronts.
+    assert.deepEqual(routes.providerKeys, ["sglang", "glm", "wrapped"]);
+    assert.deepEqual(routes.httpRewrites, []);
 });
 
-test("prepareHermesHome: rewrites api lines, shares siblings, never touches the real home", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-home-"));
-    try {
-        fs.writeFileSync(path.join(dir, "config.yaml"), [
-            "model:",
-            "  default: qwen3.8-27b",
-            "providers:",
-            "  bili:",
-            "    api: http://127.0.0.1:8199/v1  # local sglang",
-            "  glm:",
-            "    api: https://open.bigmodel.cn/api/paas/v4",
-            "custom_providers:",
-            "  - name: legacy",
-            "    base_url: http://10.0.0.5:1234/v1",
-        ].join("\n"));
-        fs.writeFileSync(path.join(dir, "SOUL.md"), "soul");
-        fs.mkdirSync(path.join(dir, "skills"));
-        const original = fs.readFileSync(path.join(dir, "config.yaml"), "utf8");
-
-        const rewrites: HttpRewrite[] = [
-            { key: "bili", realUpstream: "http://127.0.0.1:8199/v1" },
-            { key: "glm", realUpstream: "https://open.bigmodel.cn/api/paas/v4" },
-            { key: "legacy", realUpstream: "http://10.0.0.5:1234/v1" },
-        ];
-        const tmp = prepareHermesHome(dir, "http://127.0.0.1:8787", rewrites);
-        assert.ok(tmp);
-        const txt = fs.readFileSync(path.join(tmp, "config.yaml"), "utf8");
-        assert.ok(txt.includes("api: http://127.0.0.1:8787/bili/http://127.0.0.1:8199/v1  # local sglang"));
-        assert.ok(txt.includes("api: http://127.0.0.1:8787/bili/https://open.bigmodel.cn/api/paas/v4"));
-        assert.ok(txt.includes("base_url: http://127.0.0.1:8787/bili/http://10.0.0.5:1234/v1"));
-        assert.equal(fs.readFileSync(path.join(dir, "config.yaml"), "utf8"), original);
-        assert.equal(fs.readFileSync(path.join(tmp, "SOUL.md"), "utf8"), "soul");
-        assert.ok(fs.lstatSync(path.join(tmp, "skills")).isSymbolicLink());
-        fs.rmSync(tmp, { recursive: true, force: true });
-
-        assert.equal(prepareHermesHome(dir, "http://127.0.0.1:8787", []), undefined);
-    } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+test("isLoopbackHost: recognizes loopback forms, rejects everything else", () => {
+    for (const h of ["localhost", "LOCALHOST", "::1", "[::1]", "127.0.0.1", "127.5.6.7"]) {
+        assert.equal(isLoopbackHost(h), true, h);
+    }
+    for (const h of ["1270.0.0.1", "10.0.0.1", "192.168.1.1", "open.bigmodel.cn", ""]) {
+        assert.equal(isLoopbackHost(h), false, h);
     }
 });
 
-test("prepareHermesHome: preserves CRLF line endings when rewriting", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-home-"));
-    try {
-        fs.writeFileSync(
-            path.join(dir, "config.yaml"),
-            ["model:", "  default: qwen3.8-27b", "providers:", "  bili:", "    api: http://127.0.0.1:8199/v1"].join("\r\n") + "\r\n",
-        );
-        const rewrites: HttpRewrite[] = [{ key: "bili", realUpstream: "http://127.0.0.1:8199/v1" }];
-        const tmp = prepareHermesHome(dir, "http://127.0.0.1:8787", rewrites);
-        assert.ok(tmp);
-        const txt = fs.readFileSync(path.join(tmp, "config.yaml"), "utf8");
-        assert.ok(txt.includes("\r\n"), "CRLF preserved");
-        assert.ok(!/\r\n\r\n/.test(txt), "no doubled newlines");
-        assert.ok(txt.includes("api: http://127.0.0.1:8787/bili/http://127.0.0.1:8199/v1\r"));
-        fs.rmSync(tmp, { recursive: true, force: true });
-    } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
-    }
+test("stripLoopbackNoProxy: drops loopback entries only, deletes emptied vars, leaves user shell untouched", () => {
+    // The launcher strips loopback entries from the CHILD env so an inherited
+    // NO_PROXY=localhost can't shadow bili's own loopback origin (#535).
+    let env = stripLoopbackNoProxy({ NO_PROXY: "localhost, .internal, 127.0.0.1,example.com" } as NodeJS.ProcessEnv);
+    assert.equal(env.NO_PROXY, ".internal,example.com");
+    env = stripLoopbackNoProxy({ no_proxy: "::1,[::1],foo" } as NodeJS.ProcessEnv);
+    assert.equal(env.no_proxy, "foo");
+    env = stripLoopbackNoProxy({ NO_PROXY: "localhost,127.0.0.1" } as NodeJS.ProcessEnv);
+    assert.equal(env.NO_PROXY, undefined);
+    assert.deepEqual(stripLoopbackNoProxy({} as NodeJS.ProcessEnv), {});
+    const input = { NO_PROXY: "localhost" } as NodeJS.ProcessEnv;
+    stripLoopbackNoProxy(input);
+    assert.equal(input.NO_PROXY, "localhost", "input env object is not mutated");
 });
 
-test("prepareHermesHome: returns undefined for unreadable config even with rewrites pending", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-home-"));
-    try {
-        const rewrites: HttpRewrite[] = [{ key: "bili", realUpstream: "http://127.0.0.1:8199/v1" }];
-        assert.equal(prepareHermesHome(dir, "http://127.0.0.1:8787", rewrites), undefined);
-    } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
-    }
-});
-
-test("prepareHermesHome: rewrites quoted YAML api values (quotes stripped before match)", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-home-"));
-    try {
-        fs.writeFileSync(path.join(dir, "config.yaml"), [
-            "providers:",
-            "  bili:",
-            '    api: "https://api.example.com/v1"',
-            "  glm:",
-            "    api: 'http://10.0.0.5:1234/v1'",
-        ].join("\n"));
-        const rewrites: HttpRewrite[] = [
-            { key: "bili", realUpstream: "https://api.example.com/v1" },
-            { key: "glm", realUpstream: "http://10.0.0.5:1234/v1" },
-        ];
-        const tmp = prepareHermesHome(dir, "http://127.0.0.1:8787", rewrites);
-        assert.ok(tmp, "quoted values must still be rewritten");
-        const txt = fs.readFileSync(path.join(tmp!, "config.yaml"), "utf8");
-        assert.ok(txt.includes("api: http://127.0.0.1:8787/bili/https://api.example.com/v1"));
-        assert.ok(txt.includes("api: http://127.0.0.1:8787/bili/http://10.0.0.5:1234/v1"));
-        fs.rmSync(tmp!, { recursive: true, force: true });
-    } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
-    }
-});
-
-test("writeHermesIdentityPlugin: drops the identity plugin into the overlay, keyed by provider names", () => {
+test("writeHermesIdentityPlugin: installs into the REAL home (#535 zero-file), keyed by provider names", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-home-"));
     try {
         fs.writeFileSync(path.join(dir, "config.yaml"), "providers:\n  bili:\n    api: https://api.example.com/v1\n");
-        const rewrites: HttpRewrite[] = [{ key: "bili", realUpstream: "https://api.example.com/v1" }];
-        const overlay = prepareHermesHome(dir, "http://127.0.0.1:8787", rewrites);
-        assert.ok(overlay);
-        assert.equal(writeHermesIdentityPlugin(dir, overlay!, rewrites), true);
-        const init = fs.readFileSync(path.join(overlay!, "plugins/model-providers/bili-session-identity/__init__.py"), "utf8");
+        assert.equal(writeHermesIdentityPlugin(dir, ["bili"]), true);
+        const init = fs.readFileSync(path.join(dir, "plugins/model-providers/bili-session-identity/__init__.py"), "utf8");
         assert.ok(init.includes('_PROVIDER_KEYS = ["bili"]'));
         assert.ok(init.includes('_register("custom", _custom, True)'));
         assert.ok(init.includes('_register("custom:" + _key, _custom, False)'));
         assert.ok(init.includes('top_level.setdefault("prompt_cache_key", sid[:64])'));
-        assert.ok(fs.existsSync(path.join(overlay!, "plugins/model-providers/bili-session-identity/plugin.yaml")));
+        assert.ok(fs.existsSync(path.join(dir, "plugins/model-providers/bili-session-identity/plugin.yaml")));
         // Idempotent rewrite on the next launch.
-        assert.equal(writeHermesIdentityPlugin(dir, overlay!, rewrites), true);
-        fs.rmSync(overlay!, { recursive: true, force: true });
-    } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
-    }
-});
-
-test("writeHermesIdentityPlugin: skipped when the real home has its own plugins dir", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-home-"));
-    try {
-        fs.writeFileSync(path.join(dir, "config.yaml"), "providers:\n  bili:\n    api: https://api.example.com/v1\n");
-        fs.mkdirSync(path.join(dir, "plugins"), { recursive: true });
-        const rewrites: HttpRewrite[] = [{ key: "bili", realUpstream: "https://api.example.com/v1" }];
-        const overlay = prepareHermesHome(dir, "http://127.0.0.1:8787", rewrites);
-        assert.ok(overlay);
-        assert.equal(writeHermesIdentityPlugin(dir, overlay!, rewrites), false);
-        assert.ok(!fs.existsSync(path.join(overlay!, "plugins", "model-providers")));
-        fs.rmSync(overlay!, { recursive: true, force: true });
+        assert.equal(writeHermesIdentityPlugin(dir, ["bili"]), true);
+        // Coexists with user plugins elsewhere in the same plugins/ tree and
+        // picks up newly discovered provider keys on re-install.
+        fs.mkdirSync(path.join(dir, "plugins/my-custom"), { recursive: true });
+        assert.equal(writeHermesIdentityPlugin(dir, ["bili", "other"]), true);
+        const init2 = fs.readFileSync(path.join(dir, "plugins/model-providers/bili-session-identity/__init__.py"), "utf8");
+        assert.ok(init2.includes('_PROVIDER_KEYS = ["bili","other"]'));
+        assert.ok(fs.existsSync(path.join(dir, "plugins/my-custom")));
     } finally {
         fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -1957,24 +1876,25 @@ test("readDshConfig + resolveDshHome + parseDshSettingsYaml", () => {
     }
 });
 
-test("discoverRoutes: dsh wraps every settings.yaml endpoint via /bili/", () => {
+test("discoverRoutes: dsh splits loopback→settings rewrite, https→MITM, http→proxy-env (#535)", () => {
     const config: ClientConfig = {};
     (config as Record<string, unknown>).dsh = {
         baseUrls: [
             "http://127.0.0.1:8199/v1",
             "https://open.bigmodel.cn/api/paas/v4",
+            "http://10.0.0.5:1234/v1",
             "http://127.0.0.1:8787/bili/https://api.foo.io/v1",
             "http://127.0.0.1:8199/v1",
             "::::",
         ],
     };
     const routes = discoverRoutes("dsh", config);
-    assert.deepEqual(routes.httpsDomains, []);
-    assert.deepEqual(routes.httpRewrites.map((r) => r.realUpstream).sort(), [
-        "http://127.0.0.1:8199/v1",
-        "https://api.foo.io/v1",
-        "https://open.bigmodel.cn/api/paas/v4",
-    ]);
+    // Loopback keeps the settings.yaml /bili/ rewrite — dsh's loopback
+    // no-proxy bypass is unconditional, env routing can't reach it.
+    assert.deepEqual(routes.httpRewrites.map((r) => r.realUpstream), ["http://127.0.0.1:8199/v1"]);
+    // Everything else rides env vars; legacy /bili/ wraps self-heal to raw.
+    assert.deepEqual(routes.httpsDomains, ["open.bigmodel.cn", "api.foo.io"]);
+    assert.deepEqual(routes.httpEnvRoutes, ["http://10.0.0.5:1234/v1"]);
 });
 
 test("prepareDshHome: rewrites baseURL lines, shares siblings, never touches the real home", () => {
@@ -2075,7 +1995,7 @@ test("prepareDshHome: returns undefined for unreadable settings even with rewrit
     }
 });
 
-test("runLaunch dsh: DSH_HOME overlay + DEEPSEEK_BASE_URL env, real home untouched", async () => {
+test("runLaunch dsh: loopback-only settings overlay + proxy envs, real home untouched (#535)", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-launch-"));
     const prevBin = process.env.BILI_CLIENT_BIN;
     const prevDshHome = process.env.DSH_HOME;
@@ -2088,6 +2008,8 @@ test("runLaunch dsh: DSH_HOME overlay + DEEPSEEK_BASE_URL env, real home untouch
             "  providers:",
             "    anthropic:",
             "      baseURL: https://api.anthropic.com",
+            "    sglang:",
+            "      baseURL: http://127.0.0.1:8199/v1",
         ].join("\n"),
     );
     fs.mkdirSync(path.join(dshHome, "profiles"));
@@ -2099,6 +2021,7 @@ test("runLaunch dsh: DSH_HOME overlay + DEEPSEEK_BASE_URL env, real home untouch
 
     const envSeen: NodeJS.ProcessEnv[] = [];
     const argsSeen: string[][] = [];
+    const proxyEnvs: (NodeJS.ProcessEnv | undefined)[] = [];
     const spawnImpl: SpawnFn = (cmd, args, options) => {
         if (cmd === fakeDsh) {
             if (options?.env) envSeen.push(options.env);
@@ -2112,6 +2035,7 @@ test("runLaunch dsh: DSH_HOME overlay + DEEPSEEK_BASE_URL env, real home untouch
             };
             return child;
         }
+        proxyEnvs.push((options as { env?: NodeJS.ProcessEnv } | undefined)?.env);
         return makeFakeChild(42423);
     };
 
@@ -2133,7 +2057,16 @@ test("runLaunch dsh: DSH_HOME overlay + DEEPSEEK_BASE_URL env, real home untouch
         const seenEnv = envSeen[0];
         const origin = seenEnv.BILLION_CONTEXT_PROXY;
         assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(String(origin)));
-        assert.equal(seenEnv.DEEPSEEK_BASE_URL, `${origin}/bili/https://api.deepseek.com`);
+        // #535: no more $DEEPSEEK_BASE_URL wrap — the built-in deepseek route
+        // is MITM-whitelisted instead (asserted below via proxyEnvs), and all
+        // other traffic rides the standard proxy env vars.
+        assert.equal(seenEnv.DEEPSEEK_BASE_URL, undefined);
+        assert.equal(seenEnv.HTTPS_PROXY, origin);
+        assert.ok(String(seenEnv.NODE_EXTRA_CA_CERTS).endsWith(path.join("billion-context", "ca", "root-ca.pem")));
+        assert.equal(seenEnv.HTTP_PROXY, undefined, "no plaintext-http upstreams in this fixture");
+        const mitmDomains = String(proxyEnvs.find((e) => e)?.BILI_MITM_DOMAINS ?? "");
+        assert.ok(mitmDomains.split(",").includes("api.anthropic.com"), mitmDomains);
+        assert.ok(mitmDomains.split(",").includes("api.deepseek.com"), mitmDomains);
         // Session identity for the proxy: forces dsh's pi-ai stack to stamp
         // prompt_cache_key (the dsh session id) on every request.
         assert.equal(seenEnv.PI_CACHE_RETENTION, "long");
@@ -2143,7 +2076,10 @@ test("runLaunch dsh: DSH_HOME overlay + DEEPSEEK_BASE_URL env, real home untouch
         const overlay = `${dshHome}-bili`;
         assert.ok(fs.existsSync(path.join(overlay, "settings.yaml")));
         const overlayTxt = fs.readFileSync(path.join(overlay, "settings.yaml"), "utf8");
-        assert.ok(overlayTxt.includes(`baseURL: ${origin}/bili/https://api.anthropic.com`));
+        // Only the loopback upstream gets the /bili/ rewrite (documented #535
+        // exception); the remote https host stays raw — it rides HTTPS_PROXY MITM.
+        assert.ok(overlayTxt.includes(`baseURL: ${origin}/bili/http://127.0.0.1:8199/v1`));
+        assert.ok(overlayTxt.includes("baseURL: https://api.anthropic.com"));
         assert.ok(fs.lstatSync(path.join(overlay, "profiles")).isSymbolicLink());
         // /acp command injection: --patch flag spliced before user args, and
         // the patch overlay file exists pointing at our bundled cordis plugin.
@@ -2160,6 +2096,89 @@ test("runLaunch dsh: DSH_HOME overlay + DEEPSEEK_BASE_URL env, real home untouch
         else process.env.BILI_CLIENT_BIN = prevBin;
         if (prevDshHome === undefined) delete process.env.DSH_HOME;
         else process.env.DSH_HOME = prevDshHome;
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("runLaunch hermes: proxy envs + real-home identity plugin, no HERMES_HOME overlay (#535)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-hermes-launch-"));
+    const prevBin = process.env.BILI_CLIENT_BIN;
+    const prevHermesHome = process.env.HERMES_HOME;
+    const prevNoProxy = process.env.NO_PROXY;
+    const hermesHome = path.join(home, ".hermes");
+    fs.mkdirSync(hermesHome);
+    fs.writeFileSync(
+        path.join(hermesHome, "config.yaml"),
+        [
+            "providers:",
+            "  glm:",
+            "    api: https://open.bigmodel.cn/api/paas/v4",
+            "  sglang:",
+            "    api: http://127.0.0.1:8199/v1",
+        ].join("\n"),
+    );
+    const original = fs.readFileSync(path.join(hermesHome, "config.yaml"), "utf8");
+    const fakeHermes = path.join(home, "fake-hermes");
+    fs.writeFileSync(fakeHermes, "");
+    process.env.BILI_CLIENT_BIN = fakeHermes;
+    process.env.HERMES_HOME = hermesHome;
+    // Inherited NO_PROXY with a loopback entry must not survive into the child
+    // env or it would shadow bili's own loopback origin for sglang.
+    process.env.NO_PROXY = "localhost,.corp";
+
+    const envSeen: NodeJS.ProcessEnv[] = [];
+    const spawnImpl: SpawnFn = (cmd, args, options) => {
+        if (cmd === fakeHermes) {
+            if (options?.env) envSeen.push(options.env);
+            const child = makeFakeChild(0);
+            const orig = child.on.bind(child);
+            (child as { on: SpawnChild["on"] }).on = (event, listener) => {
+                orig(event, listener);
+                if (event === "exit") setTimeout(() => listener(0, null), 0);
+                return child;
+            };
+            return child;
+        }
+        return makeFakeChild(42424);
+    };
+
+    const prevExit = process.exit;
+    const exitCalls: number[] = [];
+    process.exit = ((code?: number) => {
+        exitCalls.push(code ?? 0);
+        return undefined as never;
+    }) as typeof process.exit;
+
+    try {
+        await runLaunch(
+            { client: "hermes", clientArgs: [], overrides: {} },
+            // hermetic: never attach to / handshake against a real proxy
+            // whose instance file happens to live on this machine
+            { fetchImpl: async () => ({ ok: true }), spawnImpl, sleep: () => Promise.resolve(), readInstanceFile: () => undefined },
+        );
+        assert.equal(envSeen.length, 1);
+        const seenEnv = envSeen[0];
+        const origin = String(seenEnv.HTTPS_PROXY);
+        assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(origin));
+        assert.equal(seenEnv.HTTP_PROXY, origin, "plaintext-http upstream present → HTTP_PROXY set");
+        assert.ok(String(seenEnv.HERMES_CA_BUNDLE).endsWith(path.join("billion-context", "ca", "combined-ca.pem")));
+        assert.equal(seenEnv.NO_PROXY, ".corp", "loopback entries stripped from child NO_PROXY");
+        // Zero-file: no overlay home, config.yaml byte-identical in place.
+        assert.equal(seenEnv.HERMES_HOME, hermesHome);
+        assert.ok(!fs.existsSync(`${hermesHome}-bili`));
+        assert.equal(fs.readFileSync(path.join(hermesHome, "config.yaml"), "utf8"), original);
+        // Session identity installed into the REAL home for every provider.
+        const init = fs.readFileSync(path.join(hermesHome, "plugins/model-providers/bili-session-identity/__init__.py"), "utf8");
+        assert.ok(init.includes('_PROVIDER_KEYS = ["glm","sglang"]'));
+        assert.deepEqual(exitCalls, [0]);
+    } finally {
+        process.exit = prevExit;
+        if (prevBin === undefined) delete process.env.BILI_CLIENT_BIN;
+        else process.env.BILI_CLIENT_BIN = prevBin;
+        if (prevHermesHome === undefined) delete process.env.HERMES_HOME;
+        else process.env.HERMES_HOME = prevHermesHome;
+        if (prevNoProxy === undefined) delete process.env.NO_PROXY;
+        else process.env.NO_PROXY = prevNoProxy;
         fs.rmSync(home, { recursive: true, force: true });
     }
 });

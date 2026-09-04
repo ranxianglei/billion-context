@@ -23,12 +23,14 @@ test("forward: absolute-URL proxy-mode request reaches the correct upstream (no 
 
     let capturedUrl = "";
     let capturedHost = "";
+    let capturedTunnel = "";
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
         req.on("data", (c: Buffer) => chunks.push(c));
         req.on("end", () => {
             capturedUrl = req.url ?? "";
             capturedHost = String(req.headers["host"] ?? "");
+            capturedTunnel = String(req.headers["x-bili-tunnel"] ?? "");
             res.writeHead(200, { "content-type": "application/json" });
             res.end(JSON.stringify({ ok: true }));
         });
@@ -99,8 +101,65 @@ test("forward: absolute-URL proxy-mode request reaches the correct upstream (no 
             upstreamHost,
             `upstream Host header must be the real upstream host, not the default; got "${capturedHost}"`,
         );
+        // #409: absolute-form forwards ride the same destination admission as
+        // /bili/ tunnels, so the management-plane marker must be stamped.
+        assert.equal(capturedTunnel, "1", "tunneled forward must carry the x-bili-tunnel marker");
     } finally {
         await close(proxy);
         await close(upstream);
+    }
+});
+
+test("forward: absolute-form request targeting the proxy itself is denied (#409 admission)", async () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+
+    const opts: ProxyOptions = {
+        port: 0,
+        host: "127.0.0.1",
+        upstream: "https://api.anthropic.com",
+        routes: {},
+        modelContextLimit: 400_000,
+        kernelConfig: defaultConfig(400_000),
+        compress: { injectTool: true, injectNudge: true },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        mitm: { enabled: false, domains: [] },
+    };
+    const proxy = await startServer(opts);
+    await listen(proxy);
+    const proxyPort = (proxy.address() as { port: number }).port;
+
+    try {
+        const status = await new Promise<number>((resolve, reject) => {
+            const req = http.request(
+                {
+                    host: "127.0.0.1",
+                    port: proxyPort,
+                    method: "POST",
+                    path: `http://127.0.0.1:${proxyPort}/v1/chat/completions`,
+                    headers: {
+                        "content-type": "application/json",
+                        host: `127.0.0.1:${proxyPort}`,
+                        "x-acp-session": "forward-absolute-self-test",
+                        "content-length": "2",
+                    },
+                },
+                (res) => {
+                    res.on("data", () => {});
+                    res.on("end", () => resolve(res.statusCode ?? 0));
+                },
+            );
+            req.on("error", reject);
+            req.write("{}");
+            req.end();
+        });
+        assert.equal(status, 403, "self-destination must be denied by #409 tunnel admission");
+    } finally {
+        await close(proxy);
     }
 });
