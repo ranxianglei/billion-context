@@ -1,6 +1,6 @@
 import {
     buildStatusReport,
-    estimateTokensFast,
+    defaultCountTokens,
     formatRanges,
     hideConsumedCompressCalls,
     type CompressionCore,
@@ -145,7 +145,7 @@ function handleAcpStatus(args: Record<string, unknown>, ctx: LoopCtx): string {
     const tool = typeof args.tool === "string" ? args.tool : undefined;
     const sort = typeof args.sort === "string" ? (args.sort as "size" | "time" | "tool" | "age") : undefined;
     const limit = typeof args.limit === "number" ? args.limit : undefined;
-    const base = buildStatusReport(ctx.session.state, ctx.messages, estimateTokensFast, { scope, view, tool, sort, limit });
+    const base = buildStatusReport(ctx.session.state, ctx.messages, defaultCountTokens, { scope, view, tool, sort, limit });
     if (scope) return base;
     const nudge = ctx.nudge;
     const ranges = nudge?.compressibleRanges ?? [];

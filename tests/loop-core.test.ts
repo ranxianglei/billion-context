@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { Config, CoreMessage } from "acp-kernel";
-import { createCore, createInitialState } from "acp-kernel";
+import { assignRefs, createCore, createInitialState } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 import { runCompressLoop, createResponsesAdapter } from "../src/loop/index.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
@@ -87,6 +87,43 @@ test("loop #1: acp_status-only round → marker surfaced + re-request (avoids to
         assert.ok(out.includes("[ACP]"), "acp_status visibility marker surfaced to client");
         assert.ok(/response\.completed/.test(out), "graceful completion present (no 炸锅)");
         assert.equal(fetchCalls, 1, "re-request after acp_status so model can continue (not finish_reason=tool_calls with no body)");
+    } finally {
+        globalThis.fetch = orig;
+    }
+});
+
+test("loop #390: acp_status breakdown uses the CJK-aware scale (no 4x underestimate)", async () => {
+    // 4000 CJK chars = 4000 tokens on defaultCountTokens (the nudge's scale),
+    // 1000 on estimateTokensFast — the old acp_status scale (issue #390).
+    const messages: CoreMessage[] = [
+        { id: "m1", role: "user", contentType: "text", text: "中".repeat(4_000) },
+    ];
+    const ctx = makeCtx(messages, "responses");
+    ctx.session.state.messageRefs = assignRefs(messages, {
+        existing: ctx.session.state.messageRefs,
+        nextIndex: 1,
+    }).map;
+    const round1 = [
+        sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+        fcEvents(0, "call_status", "acp_status", "{}"),
+        COMPLETED,
+    ].join("");
+    let captured = "";
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+        captured = typeof init?.body === "string" ? init.body : "";
+        return new Response(COMPLETED, { status: 200 });
+    }) as typeof fetch;
+    try {
+        await drain(
+            new Response(round1, { status: 200 }).body!,
+            ctx,
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.ok(captured, "re-request after acp_status carries the report");
+        assert.match(captured, /4\.0K text \(100%\)/, "CJK counted 1:1, not chars/4");
+        assert.doesNotMatch(captured, /1\.0K text \(100%\)/, "chars/4 scale must not appear");
     } finally {
         globalThis.fetch = orig;
     }
