@@ -84,13 +84,14 @@ test("resolveProxyDecision: explicit global proxy (manual mode) still wins over 
 
 // --- Bug 2: loadOptions rejects out-of-range ports. ---
 
-for (const bad of ["0", "-1", "99999", "65536", "abc"]) {
+// 0 is valid: OS-assigned port for the #521 daemon handshake.
+for (const bad of ["-1", "99999", "65536", "abc"]) {
     test(`loadOptions: port ${JSON.stringify(bad)} throws`, () => {
-        assert.throws(() => loadOptions({ ACP_PORT: bad }), /Invalid port .* must be 1-65535/);
+        assert.throws(() => loadOptions({ ACP_PORT: bad }), /Invalid port .* must be 0-65535/);
     });
 }
 
-for (const good of ["1", "80", "8787", "65535"]) {
+for (const good of ["0", "1", "80", "8787", "65535"]) {
     test(`loadOptions: port ${good} accepted`, () => {
         const opts = loadOptions({ ACP_PORT: good });
         assert.equal(opts.port, Number(good));
@@ -98,7 +99,7 @@ for (const good of ["1", "80", "8787", "65535"]) {
 }
 
 test("loadOptions: PORT env also validated (ACP_PORT absent)", () => {
-    assert.throws(() => loadOptions({ PORT: "0" }), /Invalid port/);
+    assert.throws(() => loadOptions({ PORT: "-1" }), /Invalid port/);
     assert.throws(() => loadOptions({ PORT: "99999" }), /Invalid port/);
 });
 

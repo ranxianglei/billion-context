@@ -1,6 +1,7 @@
 import http from "node:http";
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
+import { dirname } from "node:path";
 import { createCore, type CompressionCore, type CompressionState, type Config, type CoreMessage, type NudgeDecision, type Prompts, defaultPrompts, defaultCountTokens, estimateTokensFast, renderNudgeText, deactivateBlock, viableRanges } from "acp-kernel";
 import { resolveCompress, resolveCompressPrompts, resolveRequestConfig } from "./compress-settings.js";
 import type { ProxyOptions } from "./config.js";
@@ -376,6 +377,11 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // EADDRINUSE instead of dying, reporting the real origin via the instance
     // file (launchToken match). Manual `bili start` keeps fail-fast semantics.
     const launchToken = process.env.BILI_LAUNCH_TOKEN?.trim();
+    // Set by `bili daemon` for per-session proxies: the instance record goes
+    // ONLY to this file (the parent polls it) instead of the shared global
+    // one, so N concurrent agent sessions don't clobber each other's records
+    // or pile up dual-writer warnings in instances.json (#394).
+    const sessionInstanceFile = process.env.BILI_INSTANCE_FILE?.trim() || undefined;
     const MAX_LISTEN_ATTEMPTS = 17;
     let listenAttempts = 0;
     let lastTriedPort = opts.port;
@@ -393,7 +399,8 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         const originHost = opts.host === "0.0.0.0" || opts.host === "::" || opts.host === "localhost" ? "127.0.0.1" : opts.host.includes(":") && !opts.host.startsWith("[") ? `[${opts.host}]` : opts.host;
         const origin = `http://${originHost}:${actualPort}`;
         try {
-            fs.mkdirSync(stateDir(), { recursive: true });
+            if (sessionInstanceFile) fs.mkdirSync(dirname(sessionInstanceFile), { recursive: true });
+            else fs.mkdirSync(stateDir(), { recursive: true });
             hydratePrefixAffinity();
             atomicWriteInstanceFile({
                 origin,
@@ -406,14 +413,16 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 mitmDomains: opts.mitm.enabled ? opts.mitm.domains : [],
                 modelWindows: { ...LAUNCHER_MODEL_WINDOWS },
                 launchToken: launchToken || undefined,
-            });
+            }, sessionInstanceFile);
         } catch {
             // best-effort discovery hint for host-spawned MCP shells
         }
-        registerInstanceAndWarn(
-            { instanceId, pid: process.pid, port: actualPort, origin, startedAt: instanceStartedAt },
-            (msg) => log("warn", `[instances] ${msg}`),
-        );
+        if (!sessionInstanceFile) {
+            registerInstanceAndWarn(
+                { instanceId, pid: process.pid, port: actualPort, origin, startedAt: instanceStartedAt },
+                (msg) => log("warn", `[instances] ${msg}`),
+            );
+        }
         const nOverrides = Object.keys(opts.routes).length;
         log(
             "info",
@@ -482,6 +491,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     const finishShutdown = (): void => {
         flushPrefixAffinity();
         clearProxyInstanceFile(instanceId);
+        if (sessionInstanceFile) clearProxyInstanceFile(instanceId, sessionInstanceFile);
         unregisterInstance(instanceId);
         closeLogger();
         process.exit(0);

@@ -287,9 +287,11 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
     const fileConfig = loadConfigFile();
 
     // --- Source 2: env vars (highest priority) ---
+    // 0 = OS-assigned port (#521): `bili daemon` spawns per-session proxies and
+    // learns the real port from the instance-file handshake after bind.
     const port = parseInt(env.ACP_PORT ?? env.PORT ?? `${fileConfig.port ?? 8787}`, 10);
-    if (!Number.isInteger(port) || port < 1 || port > 65535) {
-        throw new Error(`Invalid port ${Number.isNaN(port) ? "(not a number)" : port}; must be 1-65535`);
+    if (!Number.isInteger(port) || port < 0 || port > 65535) {
+        throw new Error(`Invalid port ${Number.isNaN(port) ? "(not a number)" : port}; must be 0-65535`);
     }
     const rawHost = env.ACP_HOST ?? fileConfig.host ?? "127.0.0.1";
     const host = rawHost === "localhost" ? "127.0.0.1" : rawHost;

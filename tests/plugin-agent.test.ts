@@ -11,7 +11,8 @@ process.env.NODE_ENV = "test";
 import { proxyBaseFromUrl, proxyBaseFromEnv, detectProxyBase, fetchManifest, forwardTool, fetchStatus } from "../src/agent/shared.ts";
 import biliPlugin, { createBiliPlugin } from "../src/agent/pi.ts";
 import ompPlugin from "../src/agent/omp.ts";
-import { pluginInstall, pluginRemove, pluginStatusAll, PLUGIN_AGENTS, selfPackageRoot } from "../src/plugin-install.ts";
+import { pluginInstall, pluginRemove, pluginStatusAll, PLUGIN_AGENTS, selfPackageRoot, dshNativeInstalled } from "../src/plugin-install.ts";
+import { pathToFileURL } from "node:url";
 import { resolveProxyOrigin, forwardTool as mcpForwardTool } from "../src/mcp.ts";
 
 function withEnv(vars: Record<string, string | undefined>, fn: () => void | Promise<void>): Promise<void> {
@@ -628,8 +629,8 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
         assert.match(pluginRemove("claude"), /not installed/);
 
         const rows = pluginStatusAll();
-        assert.equal(rows.length, 5);
-        assert.deepEqual(PLUGIN_AGENTS, ["pi", "omp", "claude", "codex", "opencode"]);
+        assert.equal(rows.length, 6);
+        assert.deepEqual(PLUGIN_AGENTS, ["pi", "omp", "claude", "codex", "opencode", "dsh"]);
     });
     fs.rmSync(home, { recursive: true, force: true });
 });
@@ -750,7 +751,7 @@ test("plugin list survives a broken host config (per-row error, no crash)", asyn
     await withEnv(hintEnv(home, piAgentDir), async () => {
         fs.writeFileSync(path.join(home, ".claude.json"), "{ broken json");
         const rows = pluginStatusAll();
-        assert.equal(rows.length, 5);
+        assert.equal(rows.length, 6);
         const claude = rows.find((r) => r.agent === "claude")!;
         assert.match(claude.status, /error: .*not valid JSON/);
         const pi = rows.find((r) => r.agent === "pi")!;
@@ -947,4 +948,68 @@ test("pi agent never stamps prompt_cache_key (it stamps headers instead)", async
     createBiliPlugin("pi")(pi as never);
     const out = pi.events.get("before_provider_request")!({ type: "before_provider_request", payload: { messages: [{ role: "user", content: "hi" }] } }, fakeCtx(undefined, "pi-uuid"));
     assert.equal(out, undefined, "pi agent never stamps the body");
+});
+
+// #521: dsh native plugin — cordis.patch.yml entries in every profile under a fake DSH_HOME.
+test("plugin dsh install/remove/status roundtrip under a fake DSH_HOME (#521)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-plugin-dsh-"));
+    const root = selfPackageRoot();
+    const dshDistFile = path.join(root, "dist", "agent", "dsh-acp.js");
+    const createdDshDist = !fs.existsSync(dshDistFile);
+    if (createdDshDist) {
+        fs.mkdirSync(path.dirname(dshDistFile), { recursive: true });
+        fs.writeFileSync(dshDistFile, "// test stub\n");
+    }
+    const entry = pathToFileURL(dshDistFile).href;
+    try {
+        for (const name of ["headless", "web"]) {
+            const dir = path.join(home, "profiles", name);
+            fs.mkdirSync(dir, { recursive: true });
+            fs.writeFileSync(path.join(dir, "cordis.yml"), "[]\n");
+            fs.writeFileSync(path.join(dir, "cordis.patch.yml"), "[]\n");
+        }
+        await withEnv({ DSH_HOME: home }, () => {
+            assert.equal(dshNativeInstalled(home), false);
+            assert.match(pluginInstall("dsh"), /installed -> cordis\.patch\.yml in 2 profile\(s\)/);
+            for (const name of ["headless", "web"]) {
+                const text = fs.readFileSync(path.join(home, "profiles", name, "cordis.patch.yml"), "utf8");
+                assert.ok(text.includes("- insert:\n    - name: " + entry), `${name} carries the insert block`);
+                assert.ok(!text.includes("["), `${name}: bare [] replaced`);
+            }
+            assert.equal(dshNativeInstalled(home), true);
+            assert.equal(pluginStatusAll().find((r) => r.agent === "dsh")?.status, "installed");
+            assert.match(pluginInstall("dsh"), /already installed \(profiles: headless, web\)/);
+
+            // shared insert group: removing bili must keep the other plugin's item and the group header
+            const sharedHeadless = path.join(home, "profiles", "headless", "cordis.patch.yml");
+            fs.writeFileSync(sharedHeadless, `- insert:\n    - name: /opt/other/plugin.js\n    - name: ${entry}\n`);
+            assert.match(pluginRemove("dsh"), /removed from 2 profile\(s\)/);
+            const cleaned = fs.readFileSync(sharedHeadless, "utf8");
+            assert.equal(cleaned, `- insert:\n    - name: /opt/other/plugin.js\n`);
+            assert.equal(pluginStatusAll().find((r) => r.agent === "dsh")?.status, "not installed");
+            assert.equal(dshNativeInstalled(home), false);
+            assert.match(pluginRemove("dsh"), /^dsh: not installed$/);
+
+            // stale entry (module file gone) → broken status, and the launcher gate stays false
+            fs.writeFileSync(path.join(home, "profiles", "web", "cordis.patch.yml"), `- insert:\n    - name: /nope/dist/agent/dsh-acp.js\n`);
+            assert.equal(pluginStatusAll().find((r) => r.agent === "dsh")?.status, "broken");
+            assert.equal(dshNativeInstalled(home), false);
+            assert.match(pluginRemove("dsh"), /removed from 1 profile\(s\)/);
+            assert.equal(pluginStatusAll().find((r) => r.agent === "dsh")?.status, "not installed");
+        });
+
+        // no profiles at all → install fails with an actionable message
+        const emptyHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-plugin-dsh-empty-"));
+        try {
+            await withEnv({ DSH_HOME: emptyHome }, () => {
+                assert.throws(() => pluginInstall("dsh"), /no dsh profiles found .* run `dsh` once/s);
+                assert.equal(dshNativeInstalled(emptyHome), false);
+            });
+        } finally {
+            fs.rmSync(emptyHome, { recursive: true, force: true });
+        }
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+        if (createdDshDist) fs.rmSync(dshDistFile, { force: true });
+    }
 });
