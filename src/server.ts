@@ -65,6 +65,7 @@ import { observeResponsesTerminalState } from "./stream-terminal.js";
 import { emitStreamError } from "./stream-error.js";
 import { affinityToken, clientConversationHeader, codexTurnIdentity, preferPromptCacheKeyIdentity, type ConversationIdentity } from "./session-id.js";
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
+import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "./affinity-persist.js";
 import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
@@ -386,6 +387,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         const origin = `http://${originHost}:${actualPort}`;
         try {
             fs.mkdirSync(stateDir(), { recursive: true });
+            hydratePrefixAffinity();
             atomicWriteInstanceFile({
                 origin,
                 instanceId,
@@ -471,6 +473,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // debounced writes keep disk within ~500ms of in-memory state.
     let shuttingDown = false;
     const finishShutdown = (): void => {
+        flushPrefixAffinity();
         clearProxyInstanceFile(instanceId);
         unregisterInstance(instanceId);
         closeLogger();
@@ -1150,6 +1153,7 @@ async function handle(
         const session = getSession(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? (anonAffinity ? "prefix-affinity" : undefined) });
         if (anonAffinity) {
             prefixAffinity.note(sessionId, anonAffinity.incomingDepth, anonAffinity.tailHash, anonAffinity.itemHashes);
+            scheduleAffinityPersist();
             session.metadata.anonymousPrefixAffinity = {
                 depth: anonAffinity.incomingDepth,
                 tailHash: anonAffinity.tailHash,

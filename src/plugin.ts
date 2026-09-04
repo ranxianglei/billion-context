@@ -9,6 +9,8 @@ import { executeProxyTool } from "./loop/core.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
 import { containsRenderTagText, createTagEchoFilter, mayStartRenderTag, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
+import { noteWeakOverflow } from "./weak-overflow.js";
+import { warnCacheCollapse } from "./cache-warn.js";
 import type { WireProtocol } from "./util.js";
 import { stateDir } from "./paths.js";
 
@@ -549,6 +551,7 @@ function applyUsageSample(session: Session, sample: UsageSample, protocol?: Wire
         // Net out pending compress savings (see stream.ts applyRanges): plugin
         // compress tool results shrink the next request, not this report.
         session.stats.lastInputTokens = Math.max(0, total - (session.stats.compressCreditTokens ?? 0));
+        warnCacheCollapse(session, total, sample.cachedTokens ?? 0);
     }
     if (sample.outputTokens !== undefined) session.stats.outputTokens += sample.outputTokens;
 }
@@ -640,6 +643,17 @@ export async function pipePluginChatWithStrip(
             markDirty(session);
         }
     };
+    // #498: whether a terminal event ([DONE] / message_stop) was seen. A
+    // stream that ends without one was cut mid-flight — a weak overflow
+    // signal on high-usage sessions.
+    let sawTerminal = false;
+    const maybeNoteTruncated = () => {
+        if (sawTerminal || !session || res.destroyed || res.writableEnded) return;
+        noteWeakOverflow(session, {
+            inputTokens: acc.inputTokens,
+            reason: "plugin chat passthrough stream ended without a completion event",
+        });
+    };
     const pushField = (field: string, index: number, text: string): [string, boolean] => {
         const s = filterFor(field, index);
         const clean = s.filter.push(text);
@@ -729,6 +743,7 @@ export async function pipePluginChatWithStrip(
                     const jsonStr = dataLines.map((l) => l.slice(5).replace(/^ /, "")).join("\n").trim();
                     if (!jsonStr) continue;
                     if (jsonStr === "[DONE]") {
+                        sawTerminal = true;
                         await write(flushTails() + rawEvent + "\n\n");
                         continue;
                     }
@@ -739,6 +754,7 @@ export async function pipePluginChatWithStrip(
                         await write(rawEvent + "\n\n");
                         continue;
                     }
+                    if (ev["type"] === "message_stop") sawTerminal = true;
                     const sample = usageFromSseEvent(ev);
                     if (sample) mergeUsageSample(acc, sample);
                     const out = protocol === "anthropic" ? processAnthropic(ev, rawEvent) : processOpenai(ev, rawEvent);
@@ -750,8 +766,10 @@ export async function pipePluginChatWithStrip(
         const rest = flushTails();
         if (rest.length > 0 && !res.destroyed && !res.writableEnded) await write(rest);
         settleUsage();
+        maybeNoteTruncated();
     } catch (e) {
         settleUsage();
+        maybeNoteTruncated();
         if (res.destroyed || res.writableEnded) {
             log?.("client aborted mid-stream");
             return;
@@ -820,6 +838,17 @@ export async function pipePluginResponsesWithStrip(
             markDirty(session);
         }
     };
+    // #498: whether a terminal event (done-family / [DONE]) was seen. A
+    // stream that ends without one was cut mid-flight — a weak overflow
+    // signal on high-usage sessions.
+    let sawTerminal = false;
+    const maybeNoteTruncated = () => {
+        if (sawTerminal || !session || res.destroyed || res.writableEnded) return;
+        noteWeakOverflow(session, {
+            inputTokens: acc.inputTokens,
+            reason: "plugin responses passthrough stream ended without a completion event",
+        });
+    };
     let lastDeltaMeta: { item_id?: unknown; output_index?: unknown } | null = null;
     const flushTail = (after: string) => {
         const tail = tagFilter.flush();
@@ -843,6 +872,7 @@ export async function pipePluginResponsesWithStrip(
                     if (dataLines.length === 0) continue;
                     const jsonStr = dataLines.map((l) => l.slice(5).replace(/^ /, "")).join("\n").trim();
                     if (!jsonStr || jsonStr === "[DONE]") {
+                        if (jsonStr === "[DONE]") sawTerminal = true;
                         await write(rawEvent + "\n\n");
                         continue;
                     }
@@ -864,6 +894,7 @@ export async function pipePluginResponsesWithStrip(
                         type === "response.failed" ||
                         type === "response.incomplete"
                     ) {
+                        if (type === "response.completed" || type === "response.failed" || type === "response.incomplete") sawTerminal = true;
                         // done-family events also carry full text payloads — strip those too.
                         const out = containsRenderTagText(jsonStr) ? rebuildEvent(rawEvent, stripResponsesText(ev)) : rawEvent + "\n\n";
                         await write(flushTail(out));
@@ -901,8 +932,10 @@ export async function pipePluginResponsesWithStrip(
             if (rest.length > 0) await write(rest);
         }
         settleUsage();
+        maybeNoteTruncated();
     } catch (e) {
         settleUsage();
+        maybeNoteTruncated();
         if (res.destroyed || res.writableEnded) {
             log?.("client aborted mid-stream");
             return;

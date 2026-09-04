@@ -100,6 +100,18 @@ interface ChainEntry {
     itemHashes: string[];
 }
 
+/** On-disk snapshot entry (#499 P1a): the tracked chains persisted across
+ *  restarts so an anonymous replay reattaches its session instead of
+ *  forking a fresh one with zero compression state (the #351 failure mode:
+ *  a 458K-token history resent raw because the affinity was in-memory). */
+export interface AffinitySnapshotEntry {
+    sessionId: string;
+    depth: number;
+    tailHash: string;
+    itemHashes: string[];
+    lastSeen: number;
+}
+
 /** Deterministic JSON with recursively sorted object keys, so two replays
  *  of the same logical message hash identically regardless of key order. */
 export function stableStringify(value: unknown): string {
@@ -288,6 +300,50 @@ export class PrefixAffinityResolver {
 
     trackedSessionIds(): string[] {
         return [...this.trackedChains.keys()];
+    }
+
+    /** Serializable copy of the tracked chains (for #499 P1a persistence). */
+    exportSnapshot(): AffinitySnapshotEntry[] {
+        return [...this.trackedChains.values()].map((e) => ({
+            sessionId: e.sessionId,
+            depth: e.depth,
+            tailHash: e.tailHash,
+            itemHashes: e.itemHashes,
+            lastSeen: e.lastSeen,
+        }));
+    }
+
+    /** Load chains persisted by a previous process. Entries older than the
+     *  TTL are dropped (they would not match anyway). Returns the count
+     *  actually imported. Defensive: a corrupt/hand-edited file must never
+     *  crash the proxy — malformed entries are skipped. */
+    importSnapshot(entries: unknown): number {
+        if (!Array.isArray(entries)) return 0;
+        const now = Date.now();
+        let imported = 0;
+        for (const raw of entries) {
+            if (!raw || typeof raw !== "object") continue;
+            const e = raw as Record<string, unknown>;
+            if (typeof e.sessionId !== "string" || typeof e.depth !== "number" || typeof e.tailHash !== "string") continue;
+            if (!Array.isArray(e.itemHashes) || e.itemHashes.some((h) => typeof h !== "string")) continue;
+            if (typeof e.lastSeen !== "number" || now - e.lastSeen > TTL_MS) continue;
+            const entry: ChainEntry = {
+                sessionId: e.sessionId,
+                depth: e.depth,
+                tailHash: e.tailHash,
+                itemHashes: (e.itemHashes as string[]).slice(-MAX_STORED_ITEMS),
+                lastSeen: e.lastSeen,
+            };
+            this.trackedChains.delete(entry.sessionId);
+            this.trackedChains.set(entry.sessionId, entry);
+            imported++;
+        }
+        while (this.trackedChains.size > MAX_TRACKED_SESSIONS) {
+            const oldest = [...this.trackedChains.values()].sort((a, b) => a.lastSeen - b.lastSeen)[0];
+            if (!oldest) break;
+            this.trackedChains.delete(oldest.sessionId);
+        }
+        return imported;
     }
 
     private expire(tracked: Map<string, ChainEntry>): void {
