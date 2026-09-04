@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import type { Config, CoreMessage } from "acp-kernel";
 import { createCore, createInitialState } from "acp-kernel";
 import type { Session } from "../src/session.ts";
-import { runCompressLoop, createResponsesAdapter } from "../src/loop/index.ts";
+import { runCompressLoop, createResponsesAdapter, MAX_LOOP_ROUNDS } from "../src/loop/index.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
 import type { WireProtocol } from "../src/util.ts";
 import { isTransientUpstreamError, REPLAY_MAX_ATTEMPTS, replayBackoffMs, replayMaxAttempts } from "../src/fetch-util.ts";
@@ -190,6 +190,57 @@ test("loop #5: limit-hit graceful — 10 mutating rounds never degenerate empty,
         assert.ok(!/^data: \[\]\n\n$/.test(out), "no degenerate empty payload");
         const completedCount = (out.match(/event: response\.completed/g) || []).length;
         assert.equal(completedCount, 1, "exactly one completion event (one SSE event line)");
+    } finally {
+        globalThis.fetch = orig;
+    }
+});
+
+// #156: identical failing compress re-submitted every round is a deterministic
+// failure — re-requesting only burns real upstream calls, so break early.
+test("loop #156: identical failing compress re-submitted → breaks early, not MAX_LOOP_ROUNDS", async () => {
+    const failingRound = [
+        sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+        fcEvents(0, "call_c", "compress", JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "s" }] })),
+        COMPLETED,
+    ].join("");
+    let fetchCalls = 0;
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async () => { fetchCalls++; return new Response(failingRound, { status: 200 }); }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(failingRound, { status: 200 }).body!,
+            makeCtx(),
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.ok(/response\.completed/.test(out), "graceful completion present (not degenerate empty)");
+        assert.ok(fetchCalls < MAX_LOOP_ROUNDS - 1, `broke early (fetchCalls=${fetchCalls} < ${MAX_LOOP_ROUNDS - 1}) instead of burning all rounds`);
+    } finally {
+        globalThis.fetch = orig;
+    }
+});
+
+// #156 guard: a failing compress that is NOT the model's only action this round
+// must not trigger the early break (the model may still be making progress).
+test("loop #156 guard: failing compress + other proxy call → no early break", async () => {
+    const mixedRound = [
+        sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+        fcEvents(0, "call_c", "compress", JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: "s" }] })),
+        fcEvents(1, "call_status", "acp_status", "{}"),
+        COMPLETED,
+    ].join("");
+    let fetchCalls = 0;
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async () => { fetchCalls++; return new Response(mixedRound, { status: 200 }); }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(mixedRound, { status: 200 }).body!,
+            makeCtx(),
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.ok(/response\.completed/.test(out), "graceful completion present");
+        assert.equal(fetchCalls, MAX_LOOP_ROUNDS - 1, "NOT broken early: ran to the normal loop limit");
     } finally {
         globalThis.fetch = orig;
     }
