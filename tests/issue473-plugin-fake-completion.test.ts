@@ -200,7 +200,7 @@ test("#473 plugin anthropic: fake completion retried with the hint merged; recov
         const res = await fetch(rig.modelUrl(), {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ model: "i473-model", max_tokens: 64, stream: true, messages: [{ role: "user", content: "call the weather tool" }] }),
+            body: JSON.stringify({ model: "i473-model", max_tokens: 1024, stream: true, messages: [{ role: "user", content: "call the weather tool" }] }),
         });
         assert.equal(res.status, 200);
         const text = await readAll(res);

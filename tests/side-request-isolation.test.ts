@@ -58,9 +58,13 @@ interface Rig {
     upstreamPort: number;
     proxy: http.Server;
     upstream: http.Server;
+    /** When set, served verbatim for side requests (max_tokens<=200) instead
+     *  of the generated okSse stream. */
+    sideScript: string | null;
 }
 
 async function startRig(): Promise<Rig> {
+    const rig: Rig = { proxyPort: 0, upstreamPort: 0, proxy: null as unknown as http.Server, upstream: null as unknown as http.Server, sideScript: null };
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
         req.on("data", (c: Buffer) => chunks.push(c));
@@ -73,7 +77,7 @@ async function startRig(): Promise<Rig> {
             // usage — that is exactly the pollution this regression guards.
             const isSide = typeof parsed.max_tokens === "number" && parsed.max_tokens <= 200;
             res.writeHead(200, { "content-type": "text/event-stream" });
-            res.end(okSse(isSide ? SIDE_INPUT_TOKENS : MAIN_INPUT_TOKENS));
+            res.end(isSide && rig.sideScript ? rig.sideScript : okSse(isSide ? SIDE_INPUT_TOKENS : MAIN_INPUT_TOKENS));
         });
     });
     upstream.listen(0, "127.0.0.1");
@@ -100,7 +104,8 @@ async function startRig(): Promise<Rig> {
     } as ProxyOptions);
     await once(proxy, "listening");
     const proxyPort = proxy.address().port as number;
-    return { proxyPort, upstreamPort, proxy, upstream };
+    rig.proxy = proxy; rig.upstream = upstream; rig.proxyPort = proxyPort; rig.upstreamPort = upstreamPort;
+    return rig;
 }
 
 async function closeRig(rig: Rig): Promise<void> {
@@ -109,6 +114,40 @@ async function closeRig(rig: Rig): Promise<void> {
     rig.upstream.close();
     await once(rig.upstream, "close");
 }
+
+test("e2e: side request response still gets render-tag stripping (#460 contract)", async () => {
+    const LT = "\x3c";
+    const GT = "\x3e";
+    const OPEN_MARK = `${LT}acp `;
+    const CLOSE_MARK = `${LT}/acp${GT}`;
+    const rig = await startRig();
+    try {
+        const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/messages`;
+        const headers: Record<string, string> = { "content-type": "application/json", "x-acp-session": SESSION };
+        // Main request first so the session has a real view.
+        const r1 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 1024, stream: true, messages: mainConversation(8) }) });
+        await r1.text();
+        const stateAfterMain = JSON.stringify(getSession(SESSION).state);
+        // Side request whose stream echoes a render tag (a model echoing the
+        // compressed history into a title). The strip pipes must still run for
+        // side requests — kernel state untouched, response hygiene intact.
+        const tagged = `title: ${LT}acp tokens="12" type="text"${GT}m00009${LT}/acp${GT}ok`;
+        const sse =
+            `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "m1", role: "assistant", usage: { input_tokens: SIDE_INPUT_TOKENS } } })}\n\n` +
+            `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: tagged } })}\n\n` +
+            `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`;
+        rig.sideScript = sse;
+        const r2 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 100, stream: true, messages: [{ role: "user", content: "Generate a short title." }] }) });
+        assert.equal(r2.status, 200);
+        let raw = "";
+        for await (const chunk of r2.body) raw += Buffer.from(chunk).toString("utf8");
+        assert.equal(raw.includes(OPEN_MARK), false, "side-request stream leaked a render open tag");
+        assert.equal(raw.includes(CLOSE_MARK), false, "side-request stream leaked a render close tag");
+        assert.equal(JSON.stringify(getSession(SESSION).state), stateAfterMain, "tag-strip pipe must not touch kernel state (session stays off)");
+    } finally {
+        await closeRig(rig);
+    }
+});
 
 test("e2e: anthropic side request (title-gen) leaves main session kernel state untouched", async () => {
     const rig = await startRig();

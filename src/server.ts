@@ -564,6 +564,11 @@ type Prepared = {
       *  in forward() rebuilds the SAME system prompt the request was prepared
       *  with. */
     prompts?: Prompts;
+    /** #388: side request (title-gen etc.) — transport with render-tag strip
+     *  only. Skips preflight (handle() returns before it), the fake-completion
+     *  retry wrapper, the compress loop, and every usage-sniffing pipe; the
+     *  #460 strip pipes in forward() run with session=undefined. */
+    sidePassthrough?: boolean;
     /** Set when a codex native-compaction request was intercepted and a
      *  success response was forged locally (BILI_CODEX_COMPACT=intercept +
      *  gate passed). forward() serves `body` without contacting upstream. */
@@ -1238,10 +1243,23 @@ async function handle(
         const pluginMode = pluginAgent !== undefined;
         // #388: side requests (title-gen etc.) share the main session key but
         // must not touch kernel state (processTurn/snapshot/usage would pollute
-        // the main view) — pure passthrough, prepared=null.
+        // the main view). Forward with a minimal prepared marked sidePassthrough:
+        // the #460 render-tag strip pipes still run (response hygiene), while
+        // preflight / fake-completion retry / the loop / usage sniffing are all
+        // skipped. processedMessages stays empty so the loop can never engage.
         if (!countTokens && !responsesCompact && protocol !== null && isSideRequest(parsed)) {
-            log("info", `[${session.id}] side request (max_tokens<=${SIDE_REQUEST_MAX_TOKENS}) → pure passthrough, kernel state untouched`);
-            await forward(req, res, opts, bodyBuffer, null, core, reqConfig, log, route, instanceId, affinity);
+            log("info", `[${session.id}] side request (max_tokens<=${SIDE_REQUEST_MAX_TOKENS}) → passthrough + tag strip only, kernel state untouched`);
+            const sidePrepared: Prepared = {
+                body: bodyBuffer,
+                session,
+                processedMessages: [],
+                originalMessages: [],
+                protocol,
+                stream: (parsed as { stream?: unknown }).stream === true,
+                compressInjected: false,
+                sidePassthrough: true,
+            };
+            await forward(req, res, opts, bodyBuffer, sidePrepared, core, reqConfig, log, route, instanceId, affinity);
             return;
         }
         // Self-heal the context window: a prior upstream overflow may have
@@ -2826,7 +2844,7 @@ async function forward(
     // skipped the trailing clearUpstreamTimer and leaked a live 10-minute
     // timer plus its socket for the full window.
     try {
-        if (prepared !== null && prepared.stream && maxFakeCompletionRetries() > 0) {
+        if (prepared !== null && prepared.stream && !prepared.sidePassthrough && maxFakeCompletionRetries() > 0) {
             const resolvedBuf = await resolveFakeCompletion(upstream.body, {
                 protocol: prepared.protocol,
                 body,
