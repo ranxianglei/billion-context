@@ -233,6 +233,40 @@ bili daemon --parent-pid <agent-pid>
   parallel daemons never clobber each other. The global instance file is still
   written (last-writer-wins) for MCP-shell/install discovery.
 
+### Native mode (`bili plugin install pi --native`)
+
+For hosts where the proxy must not be started by a launcher at all — the user
+just runs their plain client and everything works in-process:
+
+```bash
+bili plugin install pi --native   # installs the plugin + enables native mode
+pi                               # that's it — no bili wrapper, no env vars
+```
+
+How it works:
+
+1. The installed pi extension sees the native-mode marker
+   (`~/.local/state/billion-context/native.json`) and starts its own
+   per-session proxy via `bili daemon --parent-pid <pi-pid>` (dynamic port).
+2. It then wraps `globalThis.fetch` inside the running pi process: requests
+   whose target origin matches the active model's upstream are rewritten to
+   `http://127.0.0.1:<port>/bili/<original-url>`; everything else passes
+   through untouched.
+3. When pi exits, the proxy reaps itself via the parent-pid watcher.
+
+Notes:
+
+- The first provider request of a session can outrun daemon startup (~1s);
+  it goes direct to the upstream unproxied. From the second request on, all
+  traffic flows through the proxy, and since agents resend full history,
+  context tracking self-heals within one turn.
+- A launcher-provided proxy (env or `/bili/` URL) always wins over native
+  mode — running `bili pi` with a native install behaves exactly like before.
+- No marker → the plugin stays inert (current behavior), so launcher-mode
+  users are never surprised by auto-spawned proxies.
+- `bili plugin remove pi` clears the marker again. Currently supported for
+  `pi` only (the validated host); other agents keep launcher/MCP wiring.
+
 ### Remote agents (`--host`)
 
 By default the proxy binds `127.0.0.1` and only accepts loopback

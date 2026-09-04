@@ -73,8 +73,11 @@ Usage:
    bili daemon [--parent-pid N]     start a per-session proxy on a dynamic port
                                      (always a fresh instance; prints one JSON line
                                      {origin,port,pid,logPath} to stdout, exit 0)
-   bili plugin install <agent>      install the thin plugin into a host (pi/omp/
-                                    claude/codex/opencode; original backed up once)
+   bili plugin install <agent> [--native]
+                                install the thin plugin into a host (pi/omp/
+                                    claude/codex/opencode; original backed up once;
+                                    --native (pi only): the plugin starts its own
+                                    per-session proxy — no launcher needed)
   bili plugin remove <agent>       remove it again
   bili plugin list                 show install status for every host
   bili mcp                         run the bili MCP server standalone (stdio)
@@ -137,6 +140,7 @@ type Parsed = {
     parentPid?: number;
     pluginAction?: "install" | "remove" | "list";
     pluginAgent?: PluginAgent;
+    pluginNative?: boolean;
 };
 
 export function parseArgs(argv: string[]): Parsed {
@@ -153,6 +157,7 @@ export function parseArgs(argv: string[]): Parsed {
     let exportFull = false;
     let pluginAction: Parsed["pluginAction"];
     let pluginAgent: Parsed["pluginAgent"];
+    let pluginNative = false;
 
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i]!;
@@ -204,6 +209,9 @@ export function parseArgs(argv: string[]): Parsed {
                 parentPid = Number(val);
                 break;
             }
+            case "--native":
+                pluginNative = true;
+                break;
             case "--full":
                 exportFull = true;
                 break;
@@ -309,11 +317,11 @@ export function parseArgs(argv: string[]): Parsed {
         }
     }
 
-    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, registerConversationId, parentPid, pluginAction, pluginAgent };
+    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, registerConversationId, parentPid, pluginAction, pluginAgent, pluginNative };
 }
 
 export async function main(): Promise<void> {
-    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, registerConversationId, parentPid, pluginAction, pluginAgent } = parseArgs(process.argv.slice(2));
+    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, registerConversationId, parentPid, pluginAction, pluginAgent, pluginNative } = parseArgs(process.argv.slice(2));
     if (command === "help") {
         process.stdout.write(HELP);
         return;
@@ -358,13 +366,13 @@ export async function main(): Promise<void> {
         if (overrides.BILI_MCP_PROXY !== undefined) process.env.BILI_MCP_PROXY = overrides.BILI_MCP_PROXY;
         if (pluginAction === "list") {
             for (const row of pluginStatusAll()) {
-                console.log(`${row.agent.padEnd(10)} ${row.status}`);
+                console.log(`${row.agent.padEnd(10)} ${row.status}${row.native ? " (native)" : ""}`);
             }
             return;
         }
         if (pluginAction === "install") {
             try {
-                console.log(pluginInstall(pluginAgent!));
+                console.log(pluginInstall(pluginAgent!, { native: pluginNative }));
             } catch (error) {
                 console.error(`bili plugin: ${error instanceof Error ? error.message : String(error)}`);
                 process.exit(1);
