@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import type { PathLike } from "node:fs";
 type SymlinkKind = "dir" | "file" | "junction";
@@ -1326,6 +1327,186 @@ test("prepareOmpHttpRewrite: file-vs-dir type clash preserves both sides", () =>
 
 test("prepareOmpHttpRewrite: returns undefined when no rewrites", () => {
     assert.equal(prepareOmpHttpRewrite("/whatever", "http://127.0.0.1:8787", [], []), undefined);
+});
+
+test("prepareOmpHttpRewrite: in-session config.yml edit merges back into real home on next launch (#531)", () => {
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-")));
+    fs.writeFileSync(path.join(home, "config.yml"), "theme: dark\nmodelRoles:\n  default: claude-opus-5\n");
+    const overlay = `${home}-bili`;
+    try {
+        prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", [], []);
+        fs.writeFileSync(
+            path.join(overlay, "config.yml"),
+            "theme: dark\nmodelRoles:\n  default: qwen3.8-max-0902:xhigh\ncompaction:\n  enabled: false\n",
+        );
+        const now = Date.now();
+        fs.utimesSync(path.join(overlay, "config.yml"), new Date(now), new Date(now));
+        fs.utimesSync(path.join(home, "config.yml"), new Date(now - 4000), new Date(now - 4000));
+        prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", [], []);
+        const real = fs.readFileSync(path.join(home, "config.yml"), "utf8");
+        assert.ok(real.includes("default: qwen3.8-max-0902:xhigh"), "new default merged into real home");
+        assert.ok(!real.includes("compaction:"), "injected compaction block not baked into real home");
+        const cfg = fs.readFileSync(path.join(overlay, "config.yml"), "utf8");
+        assert.ok(cfg.includes("default: qwen3.8-max-0902:xhigh"), "regenerated overlay keeps the new default");
+        assert.ok(cfg.includes("enabled: false"), "regenerated overlay disables native compaction");
+        const fossils = [...fs.readdirSync(home), ...fs.readdirSync(overlay)].filter((f) => f.includes(".bili-conflict"));
+        assert.deepEqual(fossils, [], "main flow produces no .bili-conflict fossils");
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+        fs.rmSync(overlay, { recursive: true, force: true });
+    }
+});
+
+test("prepareOmpHttpRewrite: untouched config.yml → real home byte-identical, no churn or fossils (#531)", () => {
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-")));
+    fs.writeFileSync(path.join(home, "config.yml"), "theme: dark\nmodelRoles:\n  default: claude-opus-5\n");
+    const overlay = `${home}-bili`;
+    try {
+        prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", [], []);
+        const before = fs.readFileSync(path.join(home, "config.yml"), "utf8");
+        const mtimeBefore = fs.lstatSync(path.join(home, "config.yml")).mtimeMs;
+        prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", [], []);
+        assert.equal(fs.readFileSync(path.join(home, "config.yml"), "utf8"), before, "real file byte-identical");
+        assert.equal(fs.lstatSync(path.join(home, "config.yml")).mtimeMs, mtimeBefore, "no rewrite churn");
+        const fossils = [...fs.readdirSync(home), ...fs.readdirSync(overlay)].filter((f) => f.includes(".bili-conflict"));
+        assert.deepEqual(fossils, [], "idempotent relaunch leaves no fossils");
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+        fs.rmSync(overlay, { recursive: true, force: true });
+    }
+});
+
+test("prepareOmpHttpRewrite: CRLF config.yml untouched by relaunch (no EOL churn) (#531)", () => {
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-")));
+    fs.writeFileSync(path.join(home, "config.yml"), "theme: dark\r\nmodelRoles:\r\n  default: claude-opus-5\r\n");
+    const overlay = `${home}-bili`;
+    try {
+        prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", [], []);
+        const before = fs.readFileSync(path.join(home, "config.yml"));
+        prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", [], []);
+        assert.ok(before.equals(fs.readFileSync(path.join(home, "config.yml"))), "CRLF real file byte-identical after relaunch");
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+        fs.rmSync(overlay, { recursive: true, force: true });
+    }
+});
+
+test("prepareOmpHttpRewrite: concurrent edit — newer real home wins, overlay version kept as fossil (#531)", () => {
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-")));
+    fs.writeFileSync(path.join(home, "config.yml"), "theme: dark\nmodelRoles:\n  default: old\n");
+    const overlay = `${home}-bili`;
+    try {
+        prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", [], []);
+        fs.writeFileSync(
+            path.join(overlay, "config.yml"),
+            "theme: dark\nmodelRoles:\n  default: session-edit\ncompaction:\n  enabled: false\n",
+        );
+        fs.writeFileSync(path.join(home, "config.yml"), "theme: dark\nmodelRoles:\n  default: bare-edit\n");
+        const now = Date.now();
+        fs.utimesSync(path.join(overlay, "config.yml"), new Date(now - 2000), new Date(now - 2000));
+        fs.utimesSync(path.join(home, "config.yml"), new Date(now), new Date(now));
+        prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", [], []);
+        const real = fs.readFileSync(path.join(home, "config.yml"), "utf8");
+        assert.ok(real.includes("default: bare-edit"), "newer real-home edit wins");
+        assert.ok(!real.includes("session-edit"), "stale overlay value not merged over newer real");
+        assert.ok(
+            fs.readFileSync(path.join(home, "config.yml.bili-conflict"), "utf8").includes("default: session-edit"),
+            "divergent overlay version preserved as fossil",
+        );
+        const cfg = fs.readFileSync(path.join(overlay, "config.yml"), "utf8");
+        assert.ok(cfg.includes("default: bare-edit"), "overlay regenerated from the winning real content");
+        assert.ok(cfg.includes("enabled: false"), "injection reapplied after regeneration");
+        assert.ok(!cfg.includes("session-edit"), "lost overlay value gone from regenerated overlay");
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+        fs.rmSync(overlay, { recursive: true, force: true });
+    }
+});
+
+test("prepareOmpHttpRewrite: concurrent bili omp holding overlay → regeneration skipped with warn, edits preserved (#531)", async () => {
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-")));
+    fs.writeFileSync(path.join(home, "config.yml"), "theme: dark\nmodelRoles:\n  default: old\n");
+    const overlay = `${home}-bili`;
+    const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
+    const errors: string[] = [];
+    const origError = console.error;
+    console.error = (...args: unknown[]) => {
+        errors.push(args.map(String).join(" "));
+    };
+    let savedBytes = "";
+    try {
+        await new Promise((r) => setTimeout(r, 100));
+        prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", [], []);
+        savedBytes = "theme: dark\nmodelRoles:\n  default: session-a\ncompaction:\n  enabled: false\n";
+        fs.writeFileSync(path.join(overlay, "config.yml"), savedBytes);
+        const now = Date.now();
+        fs.utimesSync(path.join(overlay, "config.yml"), new Date(now), new Date(now));
+        fs.utimesSync(path.join(home, "config.yml"), new Date(now - 4000), new Date(now - 4000));
+        fs.writeFileSync(path.join(overlay, ".bili-launch.pid"), `${child.pid}\n`);
+        prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", [], []);
+        assert.equal(fs.readFileSync(path.join(overlay, "config.yml"), "utf8"), savedBytes, "overlay NOT regenerated while holder alive");
+        assert.ok(
+            fs.readFileSync(path.join(home, "config.yml"), "utf8").includes("default: session-a"),
+            "merge-back still persisted the running session's edit into real home",
+        );
+        assert.ok(errors.some((e) => e.includes("skipping the config.yml regeneration")), "explicit concurrent-launch warning emitted");
+    } finally {
+        console.error = origError;
+        child.kill();
+        fs.rmSync(home, { recursive: true, force: true });
+        fs.rmSync(overlay, { recursive: true, force: true });
+    }
+});
+
+test("prepareOmpHttpRewrite: real home's own compaction.enabled restored on merge-back (#531)", () => {
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-")));
+    fs.writeFileSync(path.join(home, "config.yml"), "theme: dark\ncompaction:\n  enabled: true\n  reserveTokens: 8000\n");
+    const overlay = `${home}-bili`;
+    try {
+        prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", [], []);
+        fs.writeFileSync(
+            path.join(overlay, "config.yml"),
+            "theme: light\ncompaction:\n  enabled: false\n  reserveTokens: 8000\n",
+        );
+        const now = Date.now();
+        fs.utimesSync(path.join(overlay, "config.yml"), new Date(now), new Date(now));
+        fs.utimesSync(path.join(home, "config.yml"), new Date(now - 4000), new Date(now - 4000));
+        prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", [], []);
+        const real = fs.readFileSync(path.join(home, "config.yml"), "utf8");
+        assert.ok(real.includes("enabled: true"), "user's own enabled: true restored verbatim");
+        assert.ok(real.includes("reserveTokens: 8000"), "other compaction keys preserved");
+        assert.ok(real.includes("theme: light"), "unrelated user edit merged in");
+        assert.ok(!real.includes("enabled: false"), "injected false not baked into real home");
+        const fossils = fs.readdirSync(home).filter((f) => f.includes(".bili-conflict"));
+        assert.deepEqual(fossils, [], "no fossils in the non-concurrent flow");
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+        fs.rmSync(overlay, { recursive: true, force: true });
+    }
+});
+
+test("prepareOmpHttpRewrite: no config in real home → user edit creates it without injection (#531)", () => {
+    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-")));
+    fs.writeFileSync(path.join(home, "models.yml"), "providers:\n  a:\n    baseUrl: https://keep.example.com\n");
+    const overlay = `${home}-bili`;
+    try {
+        prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", [], []);
+        fs.writeFileSync(
+            path.join(overlay, "config.yml"),
+            "modelRoles:\n  default: qwen3.8-max-0902:xhigh\ncompaction:\n  enabled: false\n",
+        );
+        const now = Date.now();
+        fs.utimesSync(path.join(overlay, "config.yml"), new Date(now), new Date(now));
+        prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", [], []);
+        const real = fs.readFileSync(path.join(home, "config.yml"), "utf8");
+        assert.ok(real.includes("default: qwen3.8-max-0902:xhigh"), "real config.yml created from the user edit");
+        assert.ok(!real.includes("compaction:"), "created file carries no injected block");
+        const cfg = fs.readFileSync(path.join(overlay, "config.yml"), "utf8");
+        assert.ok(cfg.includes("default: qwen3.8-max-0902:xhigh") && cfg.includes("enabled: false"), "overlay regenerated with injection");
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+        fs.rmSync(overlay, { recursive: true, force: true });
+    }
 });
 
 test("prepareOmpHttpRewrite: models.yml missing → overlay still built (config.yml generated), no models.yml", () => {
