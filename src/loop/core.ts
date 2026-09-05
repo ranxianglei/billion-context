@@ -422,10 +422,19 @@ export async function* runCompressLoop(
             // never in coreMessages), and hideConsumedCompressCalls runs each
             // round so consumed compress records cannot re-prime the model.
             if (proxyResults.length > 0) {
+                // #539: only Anthropic verifies thinking+signature pairs, so it alone
+                // needs a signature to replay a thinking block. OpenAI/DeepSeek and
+                // Responses echo reasoning_content back verbatim and emit no signature
+                // — gating on one dropped every such round's reasoning from the
+                // re-request, leaving the proxy-tool assistant message without
+                // reasoning_content (DeepSeek 400 invalid_request_error: "reasoning_
+                // content ... must be passed back"). Relies on the invariant that the
+                // single production call site (server.ts) always populates ctx.protocol.
+                const requiresThinkingSignature = ctx.protocol === "anthropic";
                 if (reasoningSegments.length > 0) {
                     for (let i = 0; i < reasoningSegments.length; i++) {
                         const seg = reasoningSegments[i];
-                        if (seg.text.length === 0 || seg.signature.length === 0) continue;
+                        if (seg.text.length === 0 || (requiresThinkingSignature && seg.signature.length === 0)) continue;
                         const reasoningMsg: BiliMessage = {
                             id: i === 0 ? `acp_loop_r${round}_reasoning` : `acp_loop_r${round}_reasoning_${i + 1}`,
                             role: "assistant",
@@ -581,11 +590,17 @@ export async function* runCompressLoop(
                 try {
                     respResult = await fetchUpstream(newBody);
                 } catch (e) {
+                    // #539 follow-up: stripping replayed thinking only recovers a
+                    // backend where thinking is OPTIONAL (Anthropic). On
+                    // OpenAI/DeepSeek thinking mode reasoning_content is MANDATORY,
+                    // so a strip-retry there guarantees another 400 plus a
+                    // misleading log — gate the degraded retry to Anthropic.
                     if (
                         !(e instanceof UpstreamHttpError) ||
                         e.status < 400 ||
                         e.status >= 500 ||
                         degradedRetried ||
+                        ctx.protocol !== "anthropic" ||
                         !coreMessages.some(isLoopThinking)
                     ) {
                         throw e;
