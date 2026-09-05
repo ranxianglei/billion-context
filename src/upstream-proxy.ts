@@ -1,9 +1,10 @@
 import { execFileSync } from "node:child_process";
 import net from "node:net";
 import tls from "node:tls";
-import { ProxyAgent } from "undici";
+import { Pool, ProxyAgent } from "undici";
 import type { ProviderRoutes } from "./config.js";
 import { maskHostInText, maskUrlForLog } from "./log-mask.js";
+import { upstreamTimeoutMs } from "./fetch-util.js";
 
 export type ParsedHttpProxy = {
     url: string;
@@ -278,12 +279,26 @@ export function resolveProxy(
     return resolveProxyDecision(routes, globalProxy, upstreamUrl, fallback).proxy;
 }
 
-export function proxyDispatcher(proxyUrl: string | undefined): object | undefined {
+/** Proxy dispatchers carry the same timeout policy as direct ones (#551):
+ *  headersTimeout/bodyTimeout on the ProxyAgent cover every origin pool it
+ *  creates (undici spreads its options into the internal Agent), while the
+ *  explicit factory/clientFactory set them on hops undici builds with a bare
+ *  `{ connect }` option bag (proxy-side CONNECT client, HTTP/1 proxy wrapper). */
+export function proxyDispatcher(proxyUrl: string | undefined, timeoutMs?: number): object | undefined {
     if (!proxyUrl) return undefined;
-    let agent = dispatcherCache.get(proxyUrl);
+    const t = timeoutMs ?? upstreamTimeoutMs();
+    const key = `${proxyUrl}\u0000${t}`;
+    let agent = dispatcherCache.get(key);
     if (!agent) {
-        agent = new ProxyAgent({ uri: proxyUrl });
-        dispatcherCache.set(proxyUrl, agent);
+        const withTimeouts = (options: object): object => ({ ...options, headersTimeout: t, bodyTimeout: t });
+        agent = new ProxyAgent({
+            uri: proxyUrl,
+            headersTimeout: t,
+            bodyTimeout: t,
+            factory: (origin, options) => new Pool(origin, withTimeouts(options)),
+            clientFactory: (origin, options) => new Pool(origin, withTimeouts(options)),
+        });
+        dispatcherCache.set(key, agent);
     }
     return agent;
 }

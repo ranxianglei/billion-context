@@ -100,7 +100,7 @@ function diskCacheFresh(): boolean {
  *  (proxyDispatcher caches the ProxyAgent); fall back to a direct fetch
  *  when no proxy is configured or the proxied attempt fails. */
 async function fetchFresh(): Promise<RegistryShape | null> {
-    const dispatcher = proxyDispatcher(process.env.https_proxy || process.env.HTTPS_PROXY || process.env.http_proxy || process.env.HTTP_PROXY);
+    const dispatcher = proxyDispatcher(process.env.https_proxy || process.env.HTTPS_PROXY || process.env.http_proxy || process.env.HTTP_PROXY, 15_000);
     const attempts: Array<{ opts: Parameters<typeof fetchWithTimeout>[1]; label: string }> = dispatcher
         ? [{ opts: { dispatcher }, label: "via proxy" }, { opts: {}, label: "direct" }]
         : [{ opts: {}, label: "direct" }];
