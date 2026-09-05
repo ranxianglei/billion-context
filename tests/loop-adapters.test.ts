@@ -579,6 +579,70 @@ test("F7: anthropic buildRequest preserves client system + cache_control + merge
     assert.ok(hasCc, "cache_control marker preserved on system block (Anthropic prefix-cache anchor)");
 });
 
+function byteStream(chunks: Uint8Array[]): ReadableStream<Uint8Array> {
+    return new ReadableStream<Uint8Array>({
+        start(controller) {
+            for (const c of chunks) controller.enqueue(c);
+            controller.close();
+        },
+    });
+}
+
+function splitAfterLeadByte(full: Uint8Array, ch: string): [Uint8Array, Uint8Array] {
+    const needle = new TextEncoder().encode(ch);
+    let off = -1;
+    for (let i = 0; i + needle.length <= full.length && off < 0; i++) {
+        let match = true;
+        for (let j = 0; j < needle.length; j++) {
+            if (full[i + j] !== needle[j]) { match = false; break; }
+        }
+        if (match) off = i;
+    }
+    assert.ok(off >= 0, `bytes of ${ch} found in payload`);
+    return [full.slice(0, off + 1), full.slice(off + 1)];
+}
+
+async function cjkChunkSplitRoundTrip(
+    name: string,
+    adapter: ReturnType<typeof createResponsesAdapter> | ReturnType<typeof createOpenaiAdapter> | ReturnType<typeof createAnthropicAdapter>,
+    payload: string,
+): Promise<void> {
+    const [c1, c2] = splitAfterLeadByte(new TextEncoder().encode(payload), "留");
+    const events = await collectParseEvents(adapter, byteStream([c1, c2]), 1);
+    let text = "";
+    for (const ev of events) {
+        if (ev.kind === "text") text += ev.delta;
+    }
+    assert.equal(text, "残留", `${name}: multi-byte CJK split across chunk boundary round-trips intact`);
+    assert.ok(!text.includes("\uFFFD"), `${name}: no U+FFFD replacement characters`);
+}
+
+test("F8 (#541): responses adapter — CJK char split across SSE chunk boundary decodes intact (no U+FFFD)", async () => {
+    const payload = sseLf("response.output_text.delta", {
+        type: "response.output_text.delta",
+        item_id: "m1",
+        output_index: 0,
+        delta: "残留",
+    });
+    await cjkChunkSplitRoundTrip("responses", createResponsesAdapter(), payload);
+});
+
+test("F8 (#541): openai adapter — CJK char split across SSE chunk boundary decodes intact (no U+FFFD)", async () => {
+    const payload =
+        `data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", created: 1, model: "gpt", choices: [{ index: 0, delta: { content: "残留" }, finish_reason: null }] })}\n\n` +
+        `data: [DONE]\n\n`;
+    await cjkChunkSplitRoundTrip("openai", createOpenaiAdapter({ model: "gpt" }), payload);
+});
+
+test("F8 (#541): anthropic adapter — CJK char split across SSE chunk boundary decodes intact (no U+FFFD)", async () => {
+    const payload = sseLf("content_block_delta", {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text: "残留" },
+    });
+    await cjkChunkSplitRoundTrip("anthropic", createAnthropicAdapter({ model: "claude" }), payload);
+});
+
 test("openai emitCompletion: usage with absent token counts still serializes complete numeric fields (#dsh)", () => {
     const adapter = createOpenaiAdapter({ model: "deepseek-v4-flash" });
     const out = adapter.emitCompletion({ finishReason: "stop", usage: { inputTokens: undefined, outputTokens: undefined } }).toString("utf8");
