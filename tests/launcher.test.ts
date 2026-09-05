@@ -16,6 +16,7 @@ import {
     healthUrl,
     wrapUpstream,
     unwrapUpstream,
+    isLoopbackHost,
     buildPiEnv,
     buildCodexEnv,
     buildClaudeEnv,
@@ -1144,8 +1145,8 @@ test("discoverRoutes: pi with one http provider → rewrite keyed by provider na
 });
 
 test("discoverRoutes: empty config → {httpsDomains:[], httpRewrites:[]}", () => {
-    assert.deepEqual(discoverRoutes("pi", {}), { httpsDomains: [], httpRewrites: [], httpsRewrites: [] });
-    assert.deepEqual(discoverRoutes("codex", {}), { httpsDomains: [], httpRewrites: [], httpsRewrites: [] });
+    assert.deepEqual(discoverRoutes("pi", {}), { httpsDomains: [], httpRewrites: [], httpsRewrites: [], httpEnvRoutes: [] });
+    assert.deepEqual(discoverRoutes("codex", {}), { httpsDomains: [], httpRewrites: [], httpsRewrites: [], httpEnvRoutes: [] });
 });
 
 test("discoverRoutes: codex /bili/-wrapped HTTPS provider → httpsRewrites to raw upstream", () => {
@@ -1534,24 +1535,38 @@ test("readDshConfig + resolveDshHome + parseDshSettingsYaml", () => {
     }
 });
 
-test("discoverRoutes: dsh wraps every settings.yaml endpoint via /bili/", () => {
+test("discoverRoutes: dsh splits by destination — loopback rewrote, rest proxied (#535 phase 4)", () => {
     const config: ClientConfig = {};
     (config as Record<string, unknown>).dsh = {
         baseUrls: [
             "http://127.0.0.1:8199/v1",
+            "https://localhost:8443/v1",
             "https://open.bigmodel.cn/api/paas/v4",
             "http://127.0.0.1:8787/bili/https://api.foo.io/v1",
+            "http://10.0.0.5:1234/v1",
             "http://127.0.0.1:8199/v1",
             "::::",
         ],
     };
     const routes = discoverRoutes("dsh", config);
-    assert.deepEqual(routes.httpsDomains, []);
-    assert.deepEqual(routes.httpRewrites.map((r) => r.realUpstream).sort(), [
-        "http://127.0.0.1:8199/v1",
-        "https://api.foo.io/v1",
-        "https://open.bigmodel.cn/api/paas/v4",
-    ]);
+    // loopback (http OR https) → settings.yaml /bili/ rewrite; non-loopback
+    // https → cert-MITM whitelist; wrapped values unwrap first (legacy
+    // self-heal); non-loopback plain-http → HTTP_PROXY absolute-form routing.
+    assert.deepEqual(
+        routes.httpRewrites.map((r) => r.realUpstream).sort(),
+        ["http://127.0.0.1:8199/v1", "https://localhost:8443/v1"],
+    );
+    assert.deepEqual(routes.httpsDomains, ["open.bigmodel.cn", "api.foo.io"]);
+    assert.deepEqual(routes.httpEnvRoutes, ["http://10.0.0.5:1234/v1"]);
+});
+
+test("isLoopbackHost: localhost / ::1 / 127.x only", () => {
+    for (const h of ["localhost", "LOCALHOST", "::1", "[::1]", "127.0.0.1", "127.5.6.7"]) {
+        assert.equal(isLoopbackHost(h), true, h);
+    }
+    for (const h of ["1270.0.0.1", "10.0.0.1", "192.168.1.1", "open.bigmodel.cn", ""]) {
+        assert.equal(isLoopbackHost(h), false, h);
+    }
 });
 
 test("prepareDshHome: rewrites baseURL lines, shares siblings, never touches the real home", () => {
@@ -1652,10 +1667,11 @@ test("prepareDshHome: returns undefined for unreadable settings even with rewrit
     }
 });
 
-test("runLaunch dsh: DSH_HOME overlay + DEEPSEEK_BASE_URL env, real home untouched", async () => {
+test("runLaunch dsh: non-loopback upstreams ride proxy envs, loopback keeps the overlay (#535 phase 4)", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-launch-"));
     const prevBin = process.env.BILI_CLIENT_BIN;
     const prevDshHome = process.env.DSH_HOME;
+    const prevNoProxy = process.env.NO_PROXY;
     const dshHome = path.join(home, ".dsh");
     fs.mkdirSync(dshHome);
     fs.writeFileSync(
@@ -1665,6 +1681,8 @@ test("runLaunch dsh: DSH_HOME overlay + DEEPSEEK_BASE_URL env, real home untouch
             "  providers:",
             "    anthropic:",
             "      baseURL: https://api.anthropic.com",
+            "    sglang:",
+            "      baseURL: http://127.0.0.1:8199/v1",
         ].join("\n"),
     );
     fs.mkdirSync(path.join(dshHome, "profiles"));
@@ -1673,9 +1691,11 @@ test("runLaunch dsh: DSH_HOME overlay + DEEPSEEK_BASE_URL env, real home untouch
     fs.writeFileSync(fakeDsh, "");
     process.env.BILI_CLIENT_BIN = fakeDsh;
     process.env.DSH_HOME = dshHome;
+    process.env.NO_PROXY = "localhost,.corp";
 
     const envSeen: NodeJS.ProcessEnv[] = [];
     const argsSeen: string[][] = [];
+    const proxyEnvs: NodeJS.ProcessEnv[] = [];
     const spawnImpl: SpawnFn = (cmd, args, options) => {
         if (cmd === fakeDsh) {
             if (options?.env) envSeen.push(options.env);
@@ -1689,6 +1709,7 @@ test("runLaunch dsh: DSH_HOME overlay + DEEPSEEK_BASE_URL env, real home untouch
             };
             return child;
         }
+        if (options?.env) proxyEnvs.push(options.env);
         return makeFakeChild(42423);
     };
 
@@ -1714,14 +1735,27 @@ test("runLaunch dsh: DSH_HOME overlay + DEEPSEEK_BASE_URL env, real home untouch
         // Session identity for the proxy: forces dsh's pi-ai stack to stamp
         // prompt_cache_key (the dsh session id) on every request.
         assert.equal(seenEnv.PI_CACHE_RETENTION, "long");
+        // Non-loopback upstreams ride the proxy envs; the combined bundle is
+        // mandatory because SSL_CERT_FILE replaces dsh's trust store. Proxy
+        // vars are fully stripped (same contract as hermes): dsh's loopback
+        // exclusion comes from its built-in policy, not from NO_PROXY.
+        assert.equal(seenEnv.HTTPS_PROXY, origin);
+        assert.ok(String(seenEnv.SSL_CERT_FILE).endsWith(path.join("billion-context", "ca", "combined-ca.pem")));
+        assert.equal(seenEnv.HTTP_PROXY, undefined);
+        assert.equal(seenEnv.NO_PROXY, undefined);
+        // Loopback sglang stays on the /bili/ rewrite path via the persistent
+        // overlay — and ONLY the loopback endpoint gets rewritten there.
         assert.equal(seenEnv.DSH_HOME, `${dshHome}-bili`);
         assert.deepEqual(exitCalls, [0]);
         assert.equal(fs.readFileSync(path.join(dshHome, "settings.yaml"), "utf8"), original);
         const overlay = `${dshHome}-bili`;
-        assert.ok(fs.existsSync(path.join(overlay, "settings.yaml")));
         const overlayTxt = fs.readFileSync(path.join(overlay, "settings.yaml"), "utf8");
-        assert.ok(overlayTxt.includes(`baseURL: ${origin}/bili/https://api.anthropic.com`));
+        assert.ok(overlayTxt.includes(`baseURL: ${origin}/bili/http://127.0.0.1:8199/v1`));
+        assert.ok(overlayTxt.includes("baseURL: https://api.anthropic.com"));
         assert.ok(fs.lstatSync(path.join(overlay, "profiles")).isSymbolicLink());
+        // The MITM whitelist carries the non-loopback https host.
+        assert.ok(proxyEnvs.length > 0);
+        assert.ok(String(proxyEnvs[0].BILI_MITM_DOMAINS).split(",").includes("api.anthropic.com"));
         // /acp command injection: --patch flag spliced before user args, and
         // the patch overlay file exists pointing at our bundled cordis plugin.
         const patchFile = path.join(overlay, ".bili-acp.patch.yml");
@@ -1731,6 +1765,77 @@ test("runLaunch dsh: DSH_HOME overlay + DEEPSEEK_BASE_URL env, real home untouch
         assert.ok(/- name: file:\/\/\/.*dsh-acp\.js\n/.test(patchTxt));
         assert.deepEqual(argsSeen[0], ["--patch", patchFile, "--profile", "headless", "task"]);
         fs.rmSync(overlay, { recursive: true, force: true });
+    } finally {
+        process.exit = prevExit;
+        if (prevBin === undefined) delete process.env.BILI_CLIENT_BIN;
+        else process.env.BILI_CLIENT_BIN = prevBin;
+        if (prevDshHome === undefined) delete process.env.DSH_HOME;
+        else process.env.DSH_HOME = prevDshHome;
+        if (prevNoProxy === undefined) delete process.env.NO_PROXY;
+        else process.env.NO_PROXY = prevNoProxy;
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("runLaunch dsh: no loopback custom providers — no DSH_HOME overlay (#535 phase 4)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-launch-"));
+    const prevBin = process.env.BILI_CLIENT_BIN;
+    const prevDshHome = process.env.DSH_HOME;
+    const dshHome = path.join(home, ".dsh");
+    fs.mkdirSync(dshHome);
+    fs.writeFileSync(
+        path.join(dshHome, "settings.yaml"),
+        [
+            "llm-pi-ai:",
+            "  providers:",
+            "    anthropic:",
+            "      baseURL: https://api.anthropic.com",
+        ].join("\n"),
+    );
+    const fakeDsh = path.join(home, "fake-dsh");
+    fs.writeFileSync(fakeDsh, "");
+    process.env.BILI_CLIENT_BIN = fakeDsh;
+    process.env.DSH_HOME = dshHome;
+
+    const envSeen: NodeJS.ProcessEnv[] = [];
+    const spawnImpl: SpawnFn = (cmd, args, options) => {
+        if (cmd === fakeDsh) {
+            if (options?.env) envSeen.push(options.env);
+            const child = makeFakeChild(0);
+            const orig = child.on.bind(child);
+            (child as { on: SpawnChild["on"] }).on = (event, listener) => {
+                orig(event, listener);
+                if (event === "exit") setTimeout(() => listener(0, null), 0);
+                return child;
+            };
+            return child;
+        }
+        return makeFakeChild(42423);
+    };
+
+    const prevExit = process.exit;
+    process.exit = ((code?: number) => {
+        return undefined as never;
+    }) as typeof process.exit;
+
+    try {
+        await runLaunch(
+            { client: "dsh", clientArgs: [], overrides: {} },
+            { fetchImpl: async () => ({ ok: true }), spawnImpl, sleep: () => Promise.resolve(), readInstanceFile: () => undefined },
+        );
+        assert.equal(envSeen.length, 1);
+        const seenEnv = envSeen[0];
+        const origin = seenEnv.BILLION_CONTEXT_PROXY;
+        assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(String(origin)));
+        // The single non-loopback https provider still rides cert MITM...
+        assert.equal(seenEnv.HTTPS_PROXY, origin);
+        // ...but nothing needs the settings rewrite, so no overlay redirect —
+        // the inherited DSH_HOME (the real home discovery read) passes through
+        // unchanged; the -bili dir only holds the /acp patch file written by
+        // writeDshAcpPatch.
+        assert.equal(seenEnv.DSH_HOME, dshHome);
+        assert.equal(fs.existsSync(path.join(`${dshHome}-bili`, "settings.yaml")), false);
+        assert.ok(fs.existsSync(path.join(`${dshHome}-bili`, ".bili-acp.patch.yml")));
     } finally {
         process.exit = prevExit;
         if (prevBin === undefined) delete process.env.BILI_CLIENT_BIN;

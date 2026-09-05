@@ -78,6 +78,10 @@ npm install -g billion-context
 
 
 
+### 注入优先级 —— 能不写文件就不写(#535)
+
+bili 永不拥有用户数据:每个被启动的客户端都跑在**真实 home** 上,运行期写入落在用户预期的位置。把客户端指向代理时,启动器按优先级选择——**优先 env 变量**(hermes/dsh/codex 的代理/CA env;pi/omp 的 `BILI_PROVIDER_REWRITES` URL 清单,由扩展加载时经 `registerProvider` 消费),其次 **CLI 参数或扩展 API**(codex `-c key=value`、opencode 插件),最后才是**生成文件**——目前仅剩 opencode 的临时 `opencode.json`(退出即删)和 dsh 的回环例外:dsh 的 fetch 栈对回环目标无条件绕过代理 env,所以本地上游保留持久 `~/.dsh-bili` overlay 改写,直到 dsh 提供 settings-path env 或上游支持回环 opt-out。旧版本创建的 overlay 目录原地保留,绝不合并回真实 home。
+
 ### 方式 1 —— 启动器(`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode` / `bili hermes` / `bili dsh`)
 
 启动器把客户端包进一条命令:在独立端口拉起一个代理(总是全新实例,绝不复用端口),再按客户端支持的机制把它指向代理 —— 能吃代理/CA 环境变量的走**证书 MITM**,不吃的走隔离的**`/bili/` 配置重写**。真实配置文件从不被修改;客户端自己的配置只被**读取**,用来发现它实际连接的 HTTPS 上游主机,把这些主机加入 MITM 白名单 —— 代理只 TLS 终结它们,其余流量盲透传。
@@ -89,7 +93,7 @@ bili claude                           # 拉起 claude
 bili omp                              # pi 同款,file-free(#535):环境变量 + 扩展 registerProvider + 压缩取消,真实 ~/.omp 不动
 bili opencode                         # HTTPS 走 MITM + 临时 opencode.json(HTTP 走 /bili/)+ 轻量 /acp 插件
 bili hermes                           # file-free(#535):hermes 代理环境变量(HTTPS_PROXY + HERMES_CA_BUNDLE)—— https 走 CONNECT MITM,http 走绝对形式转发;真实 ~/.hermes 不动
-bili dsh                              # deepseek-harness:内置 deepseek 路由走 DEEPSEEK_BASE_URL + 隔离 DSH_HOME(~/.dsh-bili),全部流量 /bili/,经 --patch 注入原生 /acp 命令
+bili dsh                              # deepseek-harness:非回环上游走代理 env(https MITM、http absolute-form),回环上游保留 overlay DSH_HOME(~/.dsh-bili)改写(#535),内置 deepseek 路由走 DEEPSEEK_BASE_URL,经 --patch 注入原生 /acp 命令
 bili pi --mitm-domain api.foo.com     # 向 MITM 白名单追加域名
 ```
 
