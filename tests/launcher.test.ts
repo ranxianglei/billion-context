@@ -1768,6 +1768,13 @@ test("runLaunch omp: launcher hands per-model windows to the spawned proxy", asy
             "        contextWindow: 4096",
         ].join("\n"),
     );
+    // A loadable config.yml entry makes the extension available regardless
+    // of whether dist/ is built — CI runs the tests without a prior build, so
+    // the #535 omp refusal must not fire here (models.yml has rewrites).
+    const otherInstall = path.join(home, "other-install", "dist", "agent", "omp.js");
+    fs.mkdirSync(path.dirname(otherInstall), { recursive: true });
+    fs.writeFileSync(otherInstall, "");
+    fs.writeFileSync(path.join(ompHome, "config.yml"), `extensions:\n  - ${otherInstall}\n`);
 
     const proxyEnvs: (NodeJS.ProcessEnv | undefined)[] = [];
     const spawnImpl: SpawnFn = (cmd, args, opts) => {
