@@ -353,6 +353,7 @@ Environment variables take precedence over the config file. They are useful for 
 | `ACP_PROVIDERS` | Path to an external `providers.json` (legacy / shared file). |
 | `BILI_REPLAY_RETRY_BASE_MS` | Base backoff delay (ms) for acp-loop replay retries after a transient upstream rejection (default `1500`; set `0` to disable the delay). See #189. |
 | `BILI_REPLAY_RETRY_MAX` | Total attempts for acp-loop replay retries (default `3`; set `1` to disable retries entirely — legacy fail-fast behavior). See #189. |
+| `BILI_UPSTREAM_TIMEOUT_MS` | Idle budget (ms) for upstream requests: time-to-first-byte and time between body chunks (default `600000` = 10 min). A healthy stream that keeps producing chunks is never cut mid-flight; a silent one is. The same value drives the underlying HTTP client's transport timeouts, so this single knob bounds long local-model prefills end-to-end (#551). |
 | `ACP_SESSION_HEADER` | Conversation-id header name (default `x-acp-session`). |
 | `ACP_REASONING_KEEP` | Responses API only: set `none` to drop all reasoning items. Default routes reasoning through the compression pipeline so it is hidden automatically once its turn is summarized (prevents the unbounded accumulation that broke Codex's prompt-cache prefix). |
 | `ACP_LOG_FILE` | Log file path (default XDG state path; `off` disables the file, keeps stderr). Auto-rotates at 10 MB. |

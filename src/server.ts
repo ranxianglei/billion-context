@@ -827,7 +827,7 @@ async function handle(
         try {
             const result = await fetchWithTimeout(targetUrl, {
                 method: "HEAD",
-                ...(proxyUrl ? { dispatcher: proxyDispatcher(proxyUrl) } : {}),
+                ...(proxyUrl ? { dispatcher: proxyDispatcher(proxyUrl, 15_000) } : {}),
             }, 15_000);
             result.clearTimer();
             recordUpstreamConnection(targetUrl, proxyUrl);
