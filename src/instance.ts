@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { stateDir } from "./paths.js";
@@ -71,15 +71,15 @@ export function instanceFilePath(): string {
 }
 
 /** tmp+fsync+rename (same shape as web/api.ts atomicWriteConfig) — a torn
- *  write must never leave a half-origin behind (#406 family). */
-export function atomicWriteInstanceFile(info: ProxyInstanceFile, file?: string): void {
-    const filePath = file ?? instanceFilePath();
+ *  write must never leave a half-file behind (#406 family). Shared by the
+ *  proxy-origin record and every registry marker. */
+function atomicWriteJson(obj: unknown, filePath: string): void {
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
     const tempPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
     let descriptor: number | undefined;
     try {
         descriptor = fs.openSync(tempPath, "wx", 0o644);
-        fs.writeSync(descriptor, JSON.stringify(info) + "\n", null, "utf8");
+        fs.writeSync(descriptor, JSON.stringify(obj) + "\n", null, "utf8");
         fs.fsyncSync(descriptor);
         fs.closeSync(descriptor);
         descriptor = undefined;
@@ -95,6 +95,10 @@ export function atomicWriteInstanceFile(info: ProxyInstanceFile, file?: string):
         } catch {}
         throw error;
     }
+}
+
+export function atomicWriteInstanceFile(info: ProxyInstanceFile, file?: string): void {
+    atomicWriteJson(info, file ?? instanceFilePath());
 }
 
 /** Remove our record on shutdown — but only if the file still carries OUR
@@ -129,46 +133,113 @@ interface RegistryEntry {
     startedAt: number;
 }
 
-function registryFilePath(): string {
+/** Cross-instance liveness registry (#394/#527): one marker file per instance
+ *  under <state>/instances/<id>.json, so the registry IS the directory listing
+ *  and removal unlinks exactly one file — no shared read-modify-write, hence no
+ *  cross-process lost update. Dead owners are reaped on the next registration;
+ *  legacy instances.json is folded in read-only. Best-effort. */
+function registryDirPath(): string {
+    return path.join(stateDir(), "instances");
+}
+
+function legacyRegistryFilePath(): string {
     return path.join(stateDir(), "instances.json");
 }
 
-/** Cross-instance liveness registry (#394): every proxy registers itself at
- *  listen time; a second live registrant triggers the dual-writer warning.
- *  Entries whose pid is dead are pruned on read. Best-effort throughout. */
-export function registerInstanceAndWarn(entry: RegistryEntry, warn: (msg: string) => void): void {
-    const file = registryFilePath();
-    const entries: RegistryEntry[] = [];
+const SAFE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+function safeRegistryName(instanceId: string): string {
+    if (instanceId !== "." && instanceId !== ".." && instanceId.length <= 128 && SAFE_NAME_RE.test(instanceId)) {
+        return instanceId;
+    }
+    return createHash("sha256").update(instanceId).digest("hex");
+}
+
+function registryEntryFile(instanceId: string): string {
+    return path.join(registryDirPath(), `${safeRegistryName(instanceId)}.json`);
+}
+
+function safeReadJson(file: string): unknown {
     try {
-        const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as { instances?: RegistryEntry[] };
-        if (Array.isArray(parsed.instances)) {
-            for (const e of parsed.instances) {
-                if (e && typeof e.instanceId === "string" && e.instanceId !== entry.instanceId && isPidAlive(e.pid)) {
-                    entries.push(e);
-                }
+        return JSON.parse(fs.readFileSync(file, "utf8"));
+    } catch {
+        return undefined;
+    }
+}
+
+function coerceEntry(value: unknown): RegistryEntry | undefined {
+    if (!value || typeof value !== "object") return undefined;
+    const o = value as Record<string, unknown>;
+    if (typeof o.instanceId !== "string" || o.instanceId === "") return undefined;
+    return {
+        instanceId: o.instanceId,
+        pid: typeof o.pid === "number" ? o.pid : 0,
+        port: typeof o.port === "number" ? o.port : 0,
+        origin: typeof o.origin === "string" ? o.origin : "",
+        startedAt: typeof o.startedAt === "number" ? o.startedAt : 0,
+    };
+}
+
+function readMarkerNames(): string[] {
+    try {
+        return fs.readdirSync(registryDirPath());
+    } catch {
+        return [];
+    }
+}
+
+function readAllRegistryEntries(): RegistryEntry[] {
+    const seen = new Set<string>();
+    const out: RegistryEntry[] = [];
+    for (const name of readMarkerNames()) {
+        if (!name.endsWith(".json")) continue;
+        const entry = coerceEntry(safeReadJson(path.join(registryDirPath(), name)));
+        if (entry && !seen.has(entry.instanceId)) {
+            seen.add(entry.instanceId);
+            out.push(entry);
+        }
+    }
+    const legacy = safeReadJson(legacyRegistryFilePath()) as { instances?: unknown } | undefined;
+    if (legacy && Array.isArray(legacy.instances)) {
+        for (const raw of legacy.instances) {
+            const entry = coerceEntry(raw);
+            if (entry && !seen.has(entry.instanceId)) {
+                seen.add(entry.instanceId);
+                out.push(entry);
             }
         }
-    } catch {}
-    for (const other of entries) {
+    }
+    return out;
+}
+
+function reapDeadMarkers(ours: string): void {
+    for (const name of readMarkerNames()) {
+        if (!name.endsWith(".json")) continue;
+        const file = path.join(registryDirPath(), name);
+        const entry = coerceEntry(safeReadJson(file));
+        if (!entry || entry.instanceId === ours || isPidAlive(entry.pid)) continue;
+        try {
+            fs.unlinkSync(file);
+        } catch {}
+    }
+}
+
+export function registerInstanceAndWarn(entry: RegistryEntry, warn: (msg: string) => void): void {
+    const others = readAllRegistryEntries().filter((e) => e.instanceId !== entry.instanceId && isPidAlive(e.pid));
+    for (const other of others) {
         warn(
             `another bili instance is running (pid ${other.pid}, ${other.origin}) — both processes will write the same sessions directory; stop one to avoid state pollution (#394)`,
         );
     }
-    entries.push(entry);
+    reapDeadMarkers(entry.instanceId);
     try {
-        fs.mkdirSync(path.dirname(file), { recursive: true });
-        fs.writeFileSync(file, JSON.stringify({ instances: entries }) + "\n");
+        atomicWriteJson(entry, registryEntryFile(entry.instanceId));
     } catch {}
 }
 
+/** Unlinks only our own marker; cannot clobber another instance's entry (#527). */
 export function unregisterInstance(instanceId: string): void {
-    const file = registryFilePath();
     try {
-        const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as { instances?: RegistryEntry[] };
-        if (!Array.isArray(parsed.instances)) return;
-        const kept = parsed.instances.filter(
-            (e) => !(e && typeof e.instanceId === "string" && e.instanceId === instanceId) && isPidAlive(e.pid),
-        );
-        fs.writeFileSync(file, JSON.stringify({ instances: kept }) + "\n");
+        fs.unlinkSync(registryEntryFile(instanceId));
     } catch {}
 }
