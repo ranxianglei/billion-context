@@ -9,7 +9,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { readProxyInstanceFile } from "./instance.js";
+import { isPidAlive, isProxyInstanceFile, readProxyInstanceFile } from "./instance.js";
 
 const VERSION = (() => {
     try {
@@ -33,12 +33,27 @@ type McpToolDef = {
 // BILI_CONVERSATION_ID (launcher-spawned hosts like codex) has no matching
 // request id — binding is headless (next NEW session).
 const DEFAULT_PROXY_ORIGIN = "http://127.0.0.1:8787";
+let warnedStaleRecord = false;
 
 export function resolveProxyOrigin(): string {
     const fromEnv = process.env.BILI_MCP_PROXY?.trim();
     if (fromEnv && fromEnv.length > 0) return fromEnv;
     const discovered = readProxyInstanceFile();
-    if (discovered && /^https?:\/\/\S+$/.test(discovered.origin)) return discovered.origin;
+    if (discovered && /^https?:\/\/\S+$/.test(discovered.origin)) {
+        // #405: a JSON record naming a dead writer pid points at a port nothing
+        // listens on — skip it for the default origin instead of dialing it
+        // forever. The `pid > 0` guard is deliberate: pid 0 (foreign writer)
+        // and legacy plain-URL pointers make no liveness claim and keep the
+        // old trust semantics (unlike plugin-install, which refuses them).
+        if (isProxyInstanceFile(discovered) && discovered.pid > 0 && !isPidAlive(discovered.pid)) {
+            if (!warnedStaleRecord) {
+                warnedStaleRecord = true;
+                process.stderr.write(`[bili-mcp] recorded bili proxy (${discovered.origin}, pid ${discovered.pid}) is not running — falling back to ${DEFAULT_PROXY_ORIGIN}; set BILI_MCP_PROXY if your proxy listens elsewhere\n`);
+            }
+            return DEFAULT_PROXY_ORIGIN;
+        }
+        return discovered.origin;
+    }
     return DEFAULT_PROXY_ORIGIN;
 }
 

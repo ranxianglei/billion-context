@@ -110,6 +110,38 @@ test("resolveProxyOrigin: env wins, JSON file parsed, default fallback", () => {
     }
 });
 
+test("resolveProxyOrigin: dead-pid record falls back to default origin, live pid and pid 0 trusted (#405)", () => {
+    const st = tmpStateDir();
+    const prevEnv = process.env.BILI_MCP_PROXY;
+    const origStderrWrite = process.stderr.write;
+    const stderrOut: string[] = [];
+    process.stderr.write = ((chunk: string | Uint8Array) => {
+        stderrOut.push(String(chunk));
+        return true;
+    }) as typeof process.stderr.write;
+    try {
+        delete process.env.BILI_MCP_PROXY;
+
+        atomicWriteInstanceFile(sampleInstance({ origin: "http://127.0.0.1:4242", pid: deadPid() }));
+        assert.equal(resolveProxyOrigin(), "http://127.0.0.1:8787", "dead-pid record skipped");
+        assert.equal(resolveProxyOrigin(), "http://127.0.0.1:8787", "re-resolves on every call");
+        const notes = stderrOut.filter((l) => l.includes("is not running"));
+        assert.equal(notes.length, 1, "one-time stderr note");
+        assert.match(notes[0], /BILI_MCP_PROXY/);
+
+        atomicWriteInstanceFile(sampleInstance({ origin: "http://127.0.0.1:4242" }));
+        assert.equal(resolveProxyOrigin(), "http://127.0.0.1:4242", "live pid trusted");
+
+        atomicWriteInstanceFile(sampleInstance({ origin: "http://127.0.0.1:4242", pid: 0 }));
+        assert.equal(resolveProxyOrigin(), "http://127.0.0.1:4242", "pid 0 makes no liveness claim");
+    } finally {
+        process.stderr.write = origStderrWrite;
+        if (prevEnv === undefined) delete process.env.BILI_MCP_PROXY;
+        else process.env.BILI_MCP_PROXY = prevEnv;
+        st.restore();
+    }
+});
+
 test("isPidAlive: self alive, dead pid not", () => {
     assert.equal(isPidAlive(process.pid), true);
     assert.equal(isPidAlive(deadPid()), false);
