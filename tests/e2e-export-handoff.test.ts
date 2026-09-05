@@ -165,12 +165,16 @@ test("e2e export: real proxy compresses via real tool call, block persists, bili
             `compression result not observed: bodies=${bodies.length} final=${finalText.slice(0, 120)}`,
         );
 
-        // debounceMs: 0 — the debounced persistence write lands within a tick.
-        await new Promise((r) => setTimeout(r, 100));
-
-        // `bili export` reads the SAME dir with a fresh store — proving the
-        // on-disk file is self-sufficient, not an artifact of the live session.
-        const sessions = await listSessions({ dir });
+        // debounceMs: 0 — the debounced write lands within a tick, BUT a
+        // transient ENOENT (CI Windows temp sweep) defers the flush into the
+        // kernel's retry ladder (~1.5s) or the spill. Poll with headroom
+        // instead of a fixed 100ms sleep.
+        const deadline = Date.now() + 10_000;
+        let sessions = await listSessions({ dir });
+        while ((sessions.length < 1 || (sessions[0]?.blocks ?? 0) < 1) && Date.now() < deadline) {
+            await new Promise((r) => setTimeout(r, 25));
+            sessions = await listSessions({ dir });
+        }
         assert.equal(sessions.length, 1, `expected 1 persisted session, got ${sessions.length}: ${sessions.map((s) => s.id).join(",")}`);
         assert.ok(sessions[0]!.blocks >= 1, "real compression block did not persist");
 
