@@ -244,6 +244,12 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
         // queued during initial extension load and applied before any model
         // traffic, so every request (including round 1) rides the proxy.
         const rewrites = parseProviderRewrites(process.env);
+        if (rewrites !== undefined && typeof pi.registerProvider !== "function") {
+            console.error(
+                "bili-plugin: BILI_PROVIDER_REWRITES is set but this pi build has no registerProvider API — " +
+                    "provider traffic goes DIRECT (uncompressed). Update pi, or reinstall the bili plugin: `bili plugin install pi`.",
+            );
+        }
         if (rewrites !== undefined && typeof pi.registerProvider === "function") {
             for (const [key, url] of Object.entries(rewrites)) {
                 try {

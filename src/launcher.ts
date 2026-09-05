@@ -329,16 +329,28 @@ export function discoverDomains(client: ClientName, config: ClientConfig): strin
     return discoverRoutes(client, config).httpsDomains;
 }
 
-export function buildPiEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv, httpRewrites: HttpRewrite[] = []): NodeJS.ProcessEnv {
+export function buildPiEnv(
+    origin: string,
+    caPath: string,
+    baseEnv: NodeJS.ProcessEnv,
+    httpRewrites: HttpRewrite[] = [],
+    httpsRewrites: HttpRewrite[] = [],
+): NodeJS.ProcessEnv {
     // #535: provider URL rewrites ride env, not a generated models.json —
     // the bili extension (agent/pi.js) consumes this manifest at load and
     // overrides each provider's baseUrl via registerProvider before any
-    // model traffic. https upstreams need no entry: their real baseUrls
-    // stay untouched and ride HTTPS_PROXY cert-MITM.
+    // model traffic. https upstreams whose models.json baseUrl was already
+    // hand-wrapped to `<origin>/bili/https://...` (README Option 2) ALSO
+    // need an entry — with the RAW https value, which repoints them off the
+    // stale embedded origin onto the cert-MITM path (HTTPS_PROXY + CA).
     const manifest: Record<string, string> = {};
     for (const r of httpRewrites) {
         if (r.key.length === 0 || r.realUpstream.length === 0) continue;
         manifest[r.key] = wrapUpstream(origin, r.realUpstream);
+    }
+    for (const r of httpsRewrites) {
+        if (r.key.length === 0 || r.realUpstream.length === 0) continue;
+        manifest[r.key] = r.realUpstream;
     }
     return {
         ...baseEnv,
@@ -1093,7 +1105,7 @@ function writeOverlayFileAtomic(overlay: string, fileName: string, contents: str
 
 /**
  * omp models.yml rewrite (line-based, indentation-tracked): HTTP → /bili/ wrap, wrapped-HTTPS → raw https for cert
- * MITM) riding the persistent `<ompHome>-bili` overlay from
+ * MITM, riding the persistent `<ompHome>-bili` overlay from
  * refreshOverlayHome — comments, ordering and formatting are preserved
  * verbatim, and the real models.yml is never touched.
  */
@@ -1920,7 +1932,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     const piRealHome = resolvePiHome({ ...process.env, PI_CODING_AGENT_DIR: undefined });
     // #535: validate pi's extension availability BEFORE spawning the proxy —
     // a refusal after ensureProxyRunning would leak a detached proxy child.
-    if (base === "pi" && routes.httpRewrites.length > 0) {
+    if (base === "pi" && (routes.httpRewrites.length > 0 || routes.httpsRewrites.length > 0)) {
         const piExt = selfDistFile("agent/pi.js");
         const extAvailable = (piExt !== undefined && fs.existsSync(piExt)) || piPluginInstalled(piRealHome);
         if (!extAvailable) {
@@ -1984,7 +1996,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // at extension load from the env manifest (registerProvider; see
         // buildPiEnv), and the old settings.json compaction-off generation is
         // replaced by the extension's session_before_compact cancel.
-        env = buildPiEnv(origin, ca, process.env, routes.httpRewrites);
+        env = buildPiEnv(origin, ca, process.env, routes.httpRewrites, routes.httpsRewrites);
         // #535: never let a stale inherited overlay redirect (from a legacy
         // launch or a shell exported inside one) leak into the child — pi
         // always runs on its REAL home now.

@@ -463,6 +463,46 @@ test("runLaunch pi #535: refuses launch when http rewrites needed and extension 
     }
 });
 
+test("runLaunch pi #535: refuses launch when ONLY https (hand-wrapped) rewrites needed and extension cannot load", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-pirefuse2-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevPiDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    delete process.env.PI_CODING_AGENT_DIR;
+    const piHome = path.join(home, ".pi/agent");
+    fs.mkdirSync(piHome, { recursive: true });
+    // README Option 2: baseUrl already hand-wrapped to a stale origin — without
+    // the manifest repin it would point at a dead embedded proxy origin.
+    fs.writeFileSync(
+        path.join(piHome, "models.json"),
+        JSON.stringify({ providers: { openai: { baseUrl: "http://127.0.0.1:8787/bili/https://api.openai.com/v1" } } }),
+    );
+
+    const root = selfPackageRoot();
+    const distAgent = path.join(root, "dist", "agent", "pi.js");
+    const distBackup = `${distAgent}.bak-test`;
+    const distExisted = fs.existsSync(distAgent);
+    if (distExisted) fs.renameSync(distAgent, distBackup);
+
+    const spawnImpl: SpawnFn = () => makeFakeChild(42422);
+    try {
+        await assert.rejects(
+            runLaunch({ client: "pi", clientArgs: [], overrides: {} }, { fetchImpl: async () => ({ ok: true }), spawnImpl, sleep: () => Promise.resolve() }),
+            /needs provider URL rewrites but the bili extension cannot load/,
+        );
+    } finally {
+        process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        if (prevPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+        else process.env.PI_CODING_AGENT_DIR = prevPiDir;
+        if (distExisted) fs.renameSync(distBackup, distAgent);
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
 test("runLaunch omp: native -e plugin injected only when no loadable config entry", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-ompe-"));
     const prevHome = process.env.HOME;
@@ -1044,6 +1084,21 @@ test("buildPiEnv: http rewrites → BILI_PROVIDER_REWRITES manifest (#535 file-f
 test("buildPiEnv: no rewrites → no manifest env", () => {
     const env = buildPiEnv("http://127.0.0.1:8787", "/tmp/ca.pem", { PATH: "/usr/bin" }, []);
     assert.equal(env.BILI_PROVIDER_REWRITES, undefined);
+});
+
+test("buildPiEnv: https rewrites merge RAW values (hand-wrapped baseUrl repointed onto cert-MITM)", () => {
+    const env = buildPiEnv(
+        "http://127.0.0.1:8787",
+        "/tmp/ca.pem",
+        { PATH: "/usr/bin" },
+        [{ key: "httpProv", realUpstream: "http://example.com/v1" }],
+        [{ key: "httpsProv", realUpstream: "https://api.openai.com/v1" }],
+    );
+    const manifest = JSON.parse(env.BILI_PROVIDER_REWRITES ?? "null");
+    assert.deepEqual(manifest, {
+        httpProv: "http://127.0.0.1:8787/bili/http://example.com/v1",
+        httpsProv: "https://api.openai.com/v1",
+    });
 });
 
 test("buildPiEnv: empty-key/empty-upstream entries skipped", () => {
