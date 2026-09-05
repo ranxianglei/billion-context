@@ -170,6 +170,15 @@ export function unwrapUpstream(url: string): string {
     return idx >= 0 ? url.slice(idx + "/bili/".length) : url;
 }
 
+/** Loopback destinations (localhost / ::1 / 127.x). dsh's fetch stack bypasses
+ *  proxy envs for these unconditionally (LOOPBACK_NO_PROXY), so they are the
+ *  only upstreams that need the /bili/ URL rewrite (#535 phase 4). */
+export function isLoopbackHost(host: string): boolean {
+    const h = host.toLowerCase();
+    if (h === "localhost" || h === "::1" || h === "[::1]") return true;
+    return h.split(".")[0] === "127";
+}
+
 export interface HttpRewrite {
     key: string;
     realUpstream: string;
@@ -179,6 +188,11 @@ export interface DiscoveredRoutes {
     httpsDomains: string[];
     httpRewrites: HttpRewrite[];
     httpsRewrites: HttpRewrite[];
+    // Plaintext-http upstreams routed purely via HTTP_PROXY absolute-form
+    // forward-proxy requests (no URL rewriting). dsh-only today, and never
+    // loopback — dsh bypasses proxy envs for loopback targets unconditionally,
+    // so those ride httpRewrites instead (#535 phase 4).
+    httpEnvRoutes: string[];
 }
 
 export function resolveCaCertPath(env: NodeJS.ProcessEnv): string {
@@ -215,6 +229,7 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
     const httpsDomains: string[] = [];
     const httpRewrites: HttpRewrite[] = [];
     const httpsRewrites: HttpRewrite[] = [];
+    const httpEnvRoutes: string[] = [];
     const httpsSeen = new Set<string>();
     const rewriteKeys = new Set<string>();
     const httpsRewriteKeys = new Set<string>();
@@ -306,10 +321,15 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
             }
         }
     } else if (client === "dsh") {
-        // dsh (deepseek-harness) has no proxy/CA knobs in its fetch stack:
-        // every configured upstream rides the /bili/ URL form. The built-in
-        // deepseek-official route is captured via $DEEPSEEK_BASE_URL in
-        // runLaunch; user-configured settings.yaml endpoints here.
+        // #535 phase 4: split by destination. dsh's fetch stack honors proxy
+        // envs EXCEPT for an unconditional loopback bypass (LOOPBACK_NO_PROXY —
+        // "the bypass is not optional"), so only non-loopback upstreams can
+        // ride the proxy: https → cert MITM (host whitelisted below), plain
+        // http → absolute-form forward-proxy requests (httpEnvRoutes).
+        // Loopback destinations (http OR https) still need the /bili/ URL
+        // rewrite in settings.yaml — the documented file exception. The
+        // built-in deepseek-official route is captured via $DEEPSEEK_BASE_URL
+        // in runLaunch.
         const dshSeen = new Set<string>();
         let anon = 0;
         for (const raw of config.dsh?.baseUrls ?? []) {
@@ -320,8 +340,18 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
                 if (dshSeen.has(real)) continue;
                 dshSeen.add(real);
                 anon += 1;
-                rewriteKeys.add(`dsh-${anon}`);
-                httpRewrites.push({ key: `dsh-${anon}`, realUpstream: real });
+                if (isLoopbackHost(url.hostname)) {
+                    rewriteKeys.add(`dsh-${anon}`);
+                    httpRewrites.push({ key: `dsh-${anon}`, realUpstream: real });
+                } else if (url.protocol === "https:") {
+                    const host = url.hostname.toLowerCase();
+                    if (host && !httpsSeen.has(host)) {
+                        httpsSeen.add(host);
+                        httpsDomains.push(host);
+                    }
+                } else if (!httpEnvRoutes.includes(real)) {
+                    httpEnvRoutes.push(real);
+                }
             } catch {
                 // Unparseable endpoint: skip.
             }
@@ -333,7 +363,7 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
         classify(config.codex?.openaiBaseUrl, "openai_base_url");
     }
 
-    return { httpsDomains, httpRewrites, httpsRewrites };
+    return { httpsDomains, httpRewrites, httpsRewrites, httpEnvRoutes };
 }
 
 export function discoverDomains(client: ClientName, config: ClientConfig): string[] {
@@ -1173,13 +1203,14 @@ export function unpackDeadProxyUrlsInFile(filePath: string, livePorts: Set<numbe
     return changed;
 }
 
-/** dsh counterpart of prepareHermesHome: a persistent `<dshHome>-bili` overlay
- *  (every ~/.dsh sibling symlinked so credentials/profiles/sessions stay
- *  shared) holding a rewritten copy of settings.yaml. Every baseURL/baseUrl/
- *  base_url value is rewrapped as origin + "/bili/" + raw upstream — http AND
- *  https alike, since dsh's fetch stack exposes no proxy/CA trust knobs. The
- *  real ~/.dsh is never touched. Returns the overlay dir (undefined when the
- *  settings file is unreadable or nothing is rewritable). */
+/** dsh loopback exception (#535 phase 4): dsh's fetch stack bypasses proxy
+ *  envs for loopback targets unconditionally, so ONLY loopback upstreams need
+ *  the /bili/ URL rewrite. A persistent `<dshHome>-bili` overlay (every
+ *  ~/.dsh sibling symlinked so credentials/profiles/sessions stay shared)
+ *  holds a rewritten copy of settings.yaml; matching baseURL/baseUrl/base_url
+ *  values are rewrapped as origin + "/bili/" + raw upstream. The real ~/.dsh
+ *  is never touched. Returns the overlay dir (undefined when the settings
+ *  file is unreadable or nothing is rewritable). */
 export function prepareDshHome(
     dshHome: string,
     origin: string,
@@ -1682,6 +1713,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         `bili: started proxy at ${handle.origin} (MITM domains: ${domains.length ? domains.join(", ") : "defaults"})` +
             (routes.httpRewrites.length > 0 ? ` (HTTP /bili/ rewrites: ${routes.httpRewrites.length})` : "") +
             (routes.httpsRewrites.length > 0 ? ` (HTTPS cert rewrites: ${routes.httpsRewrites.length})` : "") +
+            (routes.httpEnvRoutes.length > 0 ? ` (HTTP proxy-env routes: ${routes.httpEnvRoutes.length})` : "") +
             (params.client === "pi-test" ? " (no extensions)" : ""),
     );
     if (handle.logPath) {
@@ -1782,16 +1814,29 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
             );
         }
     } else if (base === "dsh") {
-        // dsh (deepseek-harness): no plugin surface, no MITM cert trust (plain
-        // fetch) — the built-in deepseek-official route is captured through
-        // $DEEPSEEK_BASE_URL (its resolution order is settings baseURL ?? env
-        // ?? https://api.deepseek.com, so a rewritten user setting wins and
-        // this env is the no-settings fallback). Custom providers in
-        // ~/.dsh/settings.yaml ride a persistent overlay DSH_HOME
-        // (~/.dsh-bili); credentials/profiles/sessions stay shared through
-        // symlinks and the real ~/.dsh is never touched.
-        env = { ...process.env, BILLION_CONTEXT_PROXY: origin };
+        // #535 phase 4: split by destination (see discoverRoutes). Non-loopback
+        // upstreams ride the proxy envs — https via CONNECT + cert MITM
+        // (HTTPS_PROXY + SSL_CERT_FILE), plain-http via absolute-form forward-
+        // proxy requests (HTTP_PROXY). SSL_CERT_FILE gets the COMBINED bundle
+        // because it REPLACES dsh's trust store — system roots must survive for
+        // blind-tunneled hosts (same pattern as codex). The built-in
+        // deepseek-official route stays captured through $DEEPSEEK_BASE_URL
+        // (resolution order: settings baseURL ?? env ?? default, so a user
+        // setting wins and this env is the no-settings fallback). ONLY loopback
+        // destinations take the settings.yaml /bili/ rewrite below (persistent
+        // overlay DSH_HOME ~/.dsh-bili; real ~/.dsh never touched) — dsh
+        // bypasses proxy envs for loopback unconditionally. Proxy envs are set
+        // only when something actually routes through them, so a launch with
+        // no non-loopback custom providers behaves exactly as before.
+        const usesProxyEnv = routes.httpsDomains.length > 0 || routes.httpEnvRoutes.length > 0;
+        env = usesProxyEnv ? stripInheritedProxy(process.env) : { ...process.env };
+        env.BILLION_CONTEXT_PROXY = origin;
         env.DEEPSEEK_BASE_URL = wrapUpstream(origin, "https://api.deepseek.com");
+        if (usesProxyEnv) {
+            env.HTTPS_PROXY = origin;
+            env.SSL_CERT_FILE = resolveCombinedCaPath(process.env);
+        }
+        if (routes.httpEnvRoutes.length > 0) env.HTTP_PROXY = origin;
         // Session identity for the proxy: dsh's pi-ai stack keys its
         // `prompt_cache_key` body field (the dsh session id) off
         // cacheRetention — every non-api.openai.com base URL defaults to
@@ -1805,14 +1850,14 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // overrides the env fallback).
         env.PI_CACHE_RETENTION = "long";
         const dshHomeDir = resolveDshHome(process.env);
-        dshOverlayHome = prepareDshHome(dshHomeDir, origin, routes.httpRewrites);
+        dshOverlayHome = routes.httpRewrites.length > 0 ? prepareDshHome(dshHomeDir, origin, routes.httpRewrites) : undefined;
         if (dshOverlayHome) {
             env.DSH_HOME = dshOverlayHome;
         } else if (routes.httpRewrites.length > 0) {
             console.error(
-                "bili: dsh settings.yaml could not be rewritten (unreadable or no matching endpoints) — custom providers will NOT go through the proxy; the built-in deepseek route still does.",
+                "bili: dsh settings.yaml could not be rewritten (unreadable or no matching endpoints) — loopback custom providers will NOT go through the proxy; other routes still do.",
             );
-        } else {
+        } else if (!usesProxyEnv) {
             console.error(
                 "bili: no custom providers found in ~/.dsh/settings.yaml — proxying the built-in deepseek route via DEEPSEEK_BASE_URL only.",
             );
