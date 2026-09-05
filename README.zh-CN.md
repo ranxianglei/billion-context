@@ -83,7 +83,7 @@ npm install -g billion-context
 启动器把客户端包进一条命令:在独立端口拉起一个代理(总是全新实例,绝不复用端口),再按客户端支持的机制把它指向代理 —— 能吃代理/CA 环境变量的走**证书 MITM**,不吃的走隔离的**`/bili/` 配置重写**。真实配置文件从不被修改;客户端自己的配置只被**读取**,用来发现它实际连接的 HTTPS 上游主机,把这些主机加入 MITM 白名单 —— 代理只 TLS 终结它们,其余流量盲透传。
 
 ```bash
-bili pi                               # 拉起 pi,走代理
+bili pi                               # 拉起 pi,走代理 —— file-free(#535):环境变量 + 扩展 registerProvider,真实 ~/.pi 不动
 bili codex                            # 拉起 codex
 bili claude                           # 拉起 claude
 bili omp                              # pi 同款 MITM 环境变量 + 隔离临时 models.yml
