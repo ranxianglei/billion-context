@@ -9,6 +9,7 @@ import {
     parseCompressSettings,
     parseRouteEntry,
     parseUpstreamProxyMode,
+    passthroughState,
     safeReadJson,
     type ProviderRoute,
     type ProviderRoutes,
@@ -85,6 +86,7 @@ export async function handleConfigGet(res: ServerResponse): Promise<void> {
         upstreamProxy: upstream.proxy ?? null,
         upstreamProxyMode: upstream.mode,
         compress: config.compress ?? null,
+        passthrough: passthroughState(process.env),
         ...(parseError ? { parseError } : {}),
     }, null, 2));
 }
@@ -109,7 +111,8 @@ export async function handleConfigPut(
     const hasProxy = Object.prototype.hasOwnProperty.call(body, "upstreamProxy");
     const hasMode = Object.prototype.hasOwnProperty.call(body, "upstreamProxyMode");
     const hasCompress = Object.prototype.hasOwnProperty.call(body, "compress");
-    if (!hasProviders && !hasProxy && !hasMode && !hasCompress) return sendError(res, 400, "expected providers, upstream proxy, or compress settings");
+    const hasPassthrough = Object.prototype.hasOwnProperty.call(body, "passthrough");
+    if (!hasProviders && !hasProxy && !hasMode && !hasCompress && !hasPassthrough) return sendError(res, 400, "expected providers, upstream proxy, compress, or passthrough settings");
 
     const routes: Record<string, ProviderRoute> = {};
     if (hasProviders) {
@@ -153,6 +156,19 @@ export async function handleConfigPut(
         if (compress === undefined) return sendError(res, 400, "invalid compress settings");
     }
 
+    // #405: the panel must be able to READ and CLEAR passthrough. An env
+    // ACP_PASSTHROUGH (or --passthrough flag, which lands in env) outranks
+    // the file on every reload — a file write would be a silent no-op, so
+    // refuse with the exact way out instead.
+    if (hasPassthrough) {
+        if (body.passthrough !== null && typeof body.passthrough !== "boolean") {
+            return sendError(res, 400, "passthrough must be a boolean or null");
+        }
+        if (passthroughState(process.env).source === "env") {
+            return sendError(res, 409, "passthrough is forced by the ACP_PASSTHROUGH environment variable (or --passthrough flag); unset it and restart to change here");
+        }
+    }
+
     const config = readConfig();
     if (hasProviders) config.providers = routes;
     if (hasProxy) {
@@ -164,6 +180,10 @@ export async function handleConfigPut(
         if (compress && Object.keys(compress).length > 0) config.compress = compress;
         else delete config.compress;
     }
+    if (hasPassthrough) {
+        if (body.passthrough === true) config.passthrough = true;
+        else delete config.passthrough;
+    }
     try {
         atomicWriteConfig(config);
         onChanged?.();
@@ -174,6 +194,7 @@ export async function handleConfigPut(
     if (hasProviders) changed.push(`${Object.keys(routes).length} routes`);
     if (hasProxy || hasMode) changed.push("network");
     if (hasCompress) changed.push("compress");
+    if (hasPassthrough) changed.push("passthrough");
     log("info", `[acp-web] configuration updated (${changed.join(", ") || "none"})`);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true, providers: hasProviders ? Object.keys(routes).length : undefined }));
