@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { mkdirSync, mkdtempSync, rmSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { SessionStore } from "../src/persist.ts";
+import { setLogCapture } from "../src/logger.ts";
 import { dirname, join, relative, sep } from "node:path";
 import type { Session, BlockContent } from "../src/session.ts";
 import { createInitialState } from "acp-kernel";
@@ -443,5 +444,32 @@ await withTempStore("migration leaves anonymous pfa sessions untouched (#499)", 
         assert.equal(all.size, 3, "exactly the two pfa sessions plus the re-keyed legacy one");
     } finally {
         cold.cancelAll();
+    }
+});
+
+test("SessionStore routes write failures through the EPERM detector (no false alert on non-lock error)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bili-eperm-wire-"));
+    rmSync(dir, { recursive: true, force: true });
+    writeFileSync(dir, "block", "utf8");
+    const store = new SessionStore({ dir, debounceMs: 5, enabled: true });
+    const captured: { level: string; msg: string }[] = [];
+    setLogCapture((level, msg) => captured.push({ level, msg }));
+    try {
+        store.scheduleSave(makeSession("wire-1"));
+        // acp-kernel 0.0.53 retries the whole write cycle on transient
+        // ENOTDIR (~1.5s ladder) before the failure line is logged — poll
+        // with headroom instead of a fixed settle().
+        await waitFor(
+            () => captured.find((c) => c.level === "error" && c.msg.startsWith("[persist] write failed for ")) ?? null,
+            5000,
+            "kernel write-failure line to reach the wrapped log",
+        );
+        const failLines = captured.filter((c) => c.level === "error" && c.msg.startsWith("[persist] write failed for "));
+        assert.ok(failLines.some((c) => c.msg.includes("wire-1")), "failure is for our session id");
+        assert.equal(captured.filter((c) => c.msg.includes("Defender exclusions")).length, 0, "no EPERM alert for a non-lock (ENOTDIR) error");
+    } finally {
+        setLogCapture(null);
+        store.cancelAll();
+        rmSync(dir, { force: true });
     }
 });

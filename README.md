@@ -389,6 +389,23 @@ recommended** for many concurrent conversations because of the collision
 risk — until pi grows its own session-id signal. For pi multi-agent use,
 pass an explicit `x-acp-session` header per conversation to avoid collisions.
 
+### Windows: exclude the sessions dir from antivirus (#362)
+
+The proxy persists each session's compression state to the sessions dir
+(`%USERPROFILE%\.local\share\billion-context\` by default) and rewrites the
+file every turn of a long session. On Windows, real-time antivirus (Windows
+Defender), the search indexer, or a sync tool (OneDrive) can lock that
+directory mid-write, so the rename fails with `EPERM` and every persist for
+that session fails until the lock clears.
+
+When the same session fails N consecutive writes (default `5`), the proxy
+logs a one-time, actionable alert naming the directory to exclude. To fix it
+at the root: add `%USERPROFILE%\.local\share\billion-context\` to your
+antivirus **exclusions** (Windows Defender: Settings → Virus & threat
+protection → Manage settings → Exclusions → Add an exclusion → Folder) and
+make sure no sync tool (OneDrive / Dropbox / …) is syncing that path. Full
+steps in [CONFIGURATION.md](CONFIGURATION.md#windows-exclude-the-sessions-dir-from-antivirus-362).
+
 ## Status
 
 Early. Protocol handling and compression work against mock tests (500+ passing). Real-model integration testing is the next milestone. Expect rough edges.
