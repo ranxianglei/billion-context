@@ -154,21 +154,25 @@ type FakePi = {
     events: Map<string, (event: unknown, ctx: unknown) => unknown>;
     tools: RecordedTool[];
     commands: Map<string, RecordedCommand>;
+    providers: Map<string, string>;
     readonly registerCalls: number;
     on: (event: string, handler: (event: never, ctx: never) => unknown) => void;
     registerTool: (tool: RecordedTool) => void;
     registerCommand: (name: string, options: RecordedCommand) => void;
+    registerProvider?: (name: string, config: { baseUrl: string }) => void;
 };
 
 function makeFakePi(): FakePi {
     const events = new Map<string, (event: unknown, ctx: unknown) => unknown>();
     const tools: RecordedTool[] = [];
     const commands = new Map<string, RecordedCommand>();
+    const providers = new Map<string, string>();
     let registerCallCount = 0;
     return {
         events,
         tools,
         commands,
+        providers,
         get registerCalls() { return registerCallCount; },
         on: (event, handler) => events.set(event, handler as (event: never, ctx: never) => unknown),
         registerTool: (tool) => {
@@ -179,6 +183,9 @@ function makeFakePi(): FakePi {
         },
         registerCommand: (name, options) => {
             commands.set(name, options);
+        },
+        registerProvider: (name, config) => {
+            providers.set(name, config.baseUrl);
         },
     };
 }
@@ -204,6 +211,87 @@ async function waitForTools(pi: FakePi, count: number, timeoutMs = 15000): Promi
         await new Promise((r) => setTimeout(r, 25));
     }
 }
+
+test("#535: provider URL rewrites from env manifest applied at load", () => {
+    const prevRewrites = process.env.BILI_PROVIDER_REWRITES;
+    process.env.BILI_PROVIDER_REWRITES = JSON.stringify({
+        glm: "http://127.0.0.1:8787/bili/http://127.0.0.1:8199/v1",
+        other: "http://127.0.0.1:8787/bili/http://example.com",
+    });
+    try {
+        const pi = makeFakePi();
+        createBiliPlugin()(pi as never);
+        assert.deepEqual(Object.fromEntries(pi.providers), {
+            glm: "http://127.0.0.1:8787/bili/http://127.0.0.1:8199/v1",
+            other: "http://127.0.0.1:8787/bili/http://example.com",
+        });
+    } finally {
+        if (prevRewrites === undefined) delete process.env.BILI_PROVIDER_REWRITES;
+        else process.env.BILI_PROVIDER_REWRITES = prevRewrites;
+    }
+});
+
+test("#535: invalid BILI_PROVIDER_REWRITES JSON → no rewrites applied", () => {
+    const prevRewrites = process.env.BILI_PROVIDER_REWRITES;
+    process.env.BILI_PROVIDER_REWRITES = "{not json";
+    try {
+        const pi = makeFakePi();
+        createBiliPlugin()(pi as never);
+        assert.equal(pi.providers.size, 0);
+    } finally {
+        if (prevRewrites === undefined) delete process.env.BILI_PROVIDER_REWRITES;
+        else process.env.BILI_PROVIDER_REWRITES = prevRewrites;
+    }
+});
+
+test("#535: non-http(s) manifest entries are dropped", () => {
+    const prevRewrites = process.env.BILI_PROVIDER_REWRITES;
+    process.env.BILI_PROVIDER_REWRITES = JSON.stringify({ good: "http://x.example/v1", bad: "ftp://x.example", bad2: "not-a-url" });
+    try {
+        const pi = makeFakePi();
+        createBiliPlugin()(pi as never);
+        assert.deepEqual(Object.fromEntries(pi.providers), { good: "http://x.example/v1" });
+    } finally {
+        if (prevRewrites === undefined) delete process.env.BILI_PROVIDER_REWRITES;
+        else process.env.BILI_PROVIDER_REWRITES = prevRewrites;
+    }
+});
+
+test("#535: session_before_compact cancels only pi auto compaction under bili launch", () => {
+    const prevProxy = process.env.BILLION_CONTEXT_PROXY;
+    process.env.BILLION_CONTEXT_PROXY = "http://127.0.0.1:8787";
+    try {
+        const pi = makeFakePi();
+        createBiliPlugin("pi")(pi as never);
+        const handler = pi.events.get("session_before_compact");
+        assert.ok(handler, "pi under bili launch: handler registered");
+        assert.deepEqual(handler({ reason: "threshold" }, undefined), { cancel: true });
+        assert.deepEqual(handler({ reason: "overflow" }, undefined), { cancel: true });
+        assert.equal(handler({ reason: "manual" }, undefined), undefined, "manual /compact stays user-owned");
+        assert.equal(handler({ reason: "startup" }, undefined), undefined, "unknown reason → not cancelled");
+
+        // omp: no reason field upstream yet → handler must NOT be registered
+        const omp = makeFakePi();
+        createBiliPlugin("omp")(omp as never);
+        assert.equal(omp.events.get("session_before_compact"), undefined, "omp: no cancel handler until upstream reason PR");
+    } finally {
+        if (prevProxy === undefined) delete process.env.BILLION_CONTEXT_PROXY;
+        else process.env.BILLION_CONTEXT_PROXY = prevProxy;
+    }
+});
+
+test("#535: plain pi (no BILLION_CONTEXT_PROXY) → no compaction cancel handler", () => {
+    const prevProxy = process.env.BILLION_CONTEXT_PROXY;
+    delete process.env.BILLION_CONTEXT_PROXY;
+    try {
+        const pi = makeFakePi();
+        createBiliPlugin("pi")(pi as never);
+        assert.equal(pi.events.get("session_before_compact"), undefined, "native run stays fully native");
+    } finally {
+        if (prevProxy === undefined) delete process.env.BILLION_CONTEXT_PROXY;
+        else process.env.BILLION_CONTEXT_PROXY = prevProxy;
+    }
+});
 
 test("pi extension registers manifest tools and stamps headers when proxied", async () => {
     const proxy = await startFakeProxy();

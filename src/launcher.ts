@@ -6,8 +6,8 @@
  *     discovered hosts whitelisted for TLS interception).
  *   - HTTP upstreams → `/bili/` baseURL rewrite (cert MITM can't intercept
  *     plaintext), applied via the client's own mechanism: codex `-c key=value`,
- *     claude `ANTHROPIC_BASE_URL` env, pi via an isolated `PI_CODING_AGENT_DIR`
- *     pointing at a temp copy of the pi home with a rewritten `models.json`.
+ *     claude `ANTHROPIC_BASE_URL` env, pi via `registerProvider` in the bili
+ *     extension (#535 — manifest passed through BILI_PROVIDER_REWRITES).
  *
  *   bili pi     [-- client args...]   HTTPS_PROXY + NODE_EXTRA_CA_CERTS
  *   bili codex  [-- client args...]   HTTPS_PROXY + SSL_CERT_FILE
@@ -329,8 +329,36 @@ export function discoverDomains(client: ClientName, config: ClientConfig): strin
     return discoverRoutes(client, config).httpsDomains;
 }
 
-export function buildPiEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-    return { ...baseEnv, HTTPS_PROXY: origin, NODE_EXTRA_CA_CERTS: caPath, BILLION_CONTEXT_PROXY: origin };
+export function buildPiEnv(
+    origin: string,
+    caPath: string,
+    baseEnv: NodeJS.ProcessEnv,
+    httpRewrites: HttpRewrite[] = [],
+    httpsRewrites: HttpRewrite[] = [],
+): NodeJS.ProcessEnv {
+    // #535: provider URL rewrites ride env, not a generated models.json —
+    // the bili extension (agent/pi.js) consumes this manifest at load and
+    // overrides each provider's baseUrl via registerProvider before any
+    // model traffic. https upstreams whose models.json baseUrl was already
+    // hand-wrapped to `<origin>/bili/https://...` (README Option 2) ALSO
+    // need an entry — with the RAW https value, which repoints them off the
+    // stale embedded origin onto the cert-MITM path (HTTPS_PROXY + CA).
+    const manifest: Record<string, string> = {};
+    for (const r of httpRewrites) {
+        if (r.key.length === 0 || r.realUpstream.length === 0) continue;
+        manifest[r.key] = wrapUpstream(origin, r.realUpstream);
+    }
+    for (const r of httpsRewrites) {
+        if (r.key.length === 0 || r.realUpstream.length === 0) continue;
+        manifest[r.key] = r.realUpstream;
+    }
+    return {
+        ...baseEnv,
+        HTTPS_PROXY: origin,
+        NODE_EXTRA_CA_CERTS: caPath,
+        BILLION_CONTEXT_PROXY: origin,
+        ...(Object.keys(manifest).length > 0 ? { BILI_PROVIDER_REWRITES: JSON.stringify(manifest) } : {}),
+    };
 }
 
 export function buildCodexEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -1075,76 +1103,9 @@ function writeOverlayFileAtomic(overlay: string, fileName: string, contents: str
     }
 }
 
-function writePiCompactionDisabledSettings(piHome: string, overlay: string): void {
-    let settings: Record<string, unknown> = {};
-    try {
-        const parsed: unknown = JSON.parse(fs.readFileSync(path.join(piHome, "settings.json"), "utf8"));
-        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-            settings = parsed as Record<string, unknown>;
-        }
-    } catch {}
-    const compactionRaw = settings.compaction;
-    const compaction =
-        compactionRaw && typeof compactionRaw === "object" && !Array.isArray(compactionRaw)
-            ? { ...(compactionRaw as Record<string, unknown>) }
-            : {};
-    compaction.enabled = false;
-    settings.compaction = compaction;
-    writeOverlayFileAtomic(overlay, "settings.json", JSON.stringify(settings, null, 2));
-}
-
-export function preparePiHttpRewrite(
-    piHome: string,
-    origin: string,
-    httpRewrites: HttpRewrite[],
-    httpsRewrites: HttpRewrite[],
-): string | undefined {
-    if (!fs.existsSync(piHome)) return undefined;
-    const overlay = `${piHome}-bili`;
-    // #447: the overlay always carries a settings.json disabling pi's native
-    // auto-compaction (its summarizer must never fire alongside bili's ACP
-    // compression); models.json is generated only when present, so both stay
-    // out of the real-home symlink set.
-    const generated: string[] = ["settings.json"];
-    let modelsRoot: Record<string, unknown> | undefined;
-    try {
-        const parsed: unknown = JSON.parse(fs.readFileSync(path.join(piHome, "models.json"), "utf8"));
-        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-            modelsRoot = parsed as Record<string, unknown>;
-            generated.push("models.json");
-        }
-    } catch {}
-    if (!refreshOverlayHome(piHome, overlay, generated)) return undefined;
-    if (modelsRoot) {
-        const providersVal = modelsRoot.providers;
-        if (providersVal && typeof providersVal === "object" && !Array.isArray(providersVal)) {
-            const providers = providersVal as Record<string, unknown>;
-            for (const r of httpRewrites) {
-                const prov = providers[r.key];
-                if (prov && typeof prov === "object" && !Array.isArray(prov)) {
-                    const p = prov as { baseUrl?: unknown };
-                    const existing = typeof p.baseUrl === "string" ? p.baseUrl : r.realUpstream;
-                    p.baseUrl = wrapUpstream(origin, unwrapUpstream(existing));
-                }
-            }
-            for (const r of httpsRewrites) {
-                const prov = providers[r.key];
-                if (prov && typeof prov === "object" && !Array.isArray(prov)) {
-                    const p = prov as { baseUrl?: unknown };
-                    p.baseUrl = r.realUpstream;
-                }
-            }
-        }
-        writeOverlayFileAtomic(overlay, "models.json", JSON.stringify(modelsRoot));
-    }
-    writePiCompactionDisabledSettings(piHome, overlay);
-    return overlay;
-}
-
 /**
- * omp counterpart of preparePiHttpRewrite: line-based (indentation-tracked)
- * models.yml rewrite (HTTP → /bili/ wrap, wrapped-HTTPS → raw https for cert
- * MITM) riding the persistent `<ompHome>-bili` overlay from
+ * omp models.yml rewrite (line-based, indentation-tracked): HTTP → /bili/ wrap, wrapped-HTTPS → raw https for cert
+ * MITM, riding the persistent `<ompHome>-bili` overlay from
  * refreshOverlayHome — comments, ordering and formatting are preserved
  * verbatim, and the real models.yml is never touched.
  */
@@ -1957,9 +1918,31 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     const passthrough = params.overrides.ACP_PASSTHROUGH === "1";
     const debug = params.overrides.ACP_DEBUG === "1";
 
-    const config = loadClientConfig(process.env, process.cwd());
     const base = baseClientName(params.client);
+    // #535: for pi, discovery must read the REAL home — a stale inherited
+    // PI_CODING_AGENT_DIR (legacy overlay launch) would discover routes from
+    // an old overlay's rewritten models.json.
+    const discoveryEnv = base === "pi" ? { ...process.env, PI_CODING_AGENT_DIR: undefined } : process.env;
+    const config = loadClientConfig(discoveryEnv, process.cwd());
     const routes = discoverRoutes(base, config);
+    // #535: pi's REAL home — resolvePiHome honors a possibly-stale inherited
+    // PI_CODING_AGENT_DIR (e.g. launching `bili pi` from inside a shell that
+    // a legacy bili overlay launch exported it into); the new file-free
+    // design must never let that redirect pi at an old overlay dir.
+    const piRealHome = resolvePiHome({ ...process.env, PI_CODING_AGENT_DIR: undefined });
+    // #535: validate pi's extension availability BEFORE spawning the proxy —
+    // a refusal after ensureProxyRunning would leak a detached proxy child.
+    if (base === "pi" && (routes.httpRewrites.length > 0 || routes.httpsRewrites.length > 0)) {
+        const piExt = selfDistFile("agent/pi.js");
+        const extAvailable = (piExt !== undefined && fs.existsSync(piExt)) || piPluginInstalled(piRealHome);
+        if (!extAvailable) {
+            throw new Error(
+                "bili: pi needs provider URL rewrites but the bili extension cannot load " +
+                    "(dist/agent/pi.js missing and the plugin is not installed in ~/.pi/agent/settings.json) — " +
+                    "reinstall billion-context or run `bili plugin install pi`",
+            );
+        }
+    }
     // bili's own route graph (same sources the spawned proxy child reads —
     // used to resolve the budget-alignment window, #321).
     const biliRoutes = loadRoutes(process.env);
@@ -1978,7 +1961,6 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     const ca = resolveCaCertPath(process.env);
     let env: NodeJS.ProcessEnv;
     let clientArgs = params.clientArgs;
-    let piOverlayHome: string | undefined;
     let ompOverlayHome: string | undefined;
     let opencodeTmpFile: string | undefined;
     let hermesOverlayHome: string | undefined;
@@ -2009,16 +1991,23 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     }
     const origin = handle.origin;
     if (base === "pi") {
-        env = buildPiEnv(origin, ca, process.env);
-        piOverlayHome = preparePiHttpRewrite(resolvePiHome(process.env), origin, routes.httpRewrites, routes.httpsRewrites);
-        if (piOverlayHome) env.PI_CODING_AGENT_DIR = piOverlayHome;
+        // #535: file-free injection — no overlay, no PI_CODING_AGENT_DIR
+        // redirect. pi runs on its REAL home: provider baseUrls are overridden
+        // at extension load from the env manifest (registerProvider; see
+        // buildPiEnv), and the old settings.json compaction-off generation is
+        // replaced by the extension's session_before_compact cancel.
+        env = buildPiEnv(origin, ca, process.env, routes.httpRewrites, routes.httpsRewrites);
+        // #535: never let a stale inherited overlay redirect (from a legacy
+        // launch or a shell exported inside one) leak into the child — pi
+        // always runs on its REAL home now.
+        delete env.PI_CODING_AGENT_DIR;
         // Native tooling out of the box: when the user has NOT installed the
         // plugin, ride pi's `-e <file>` (loads for this run only, writes
         // nothing) instead of leaving them on wire-mode fallback. When they
-        // HAVE installed it, settings.json (merged into the overlay home)
-        // already loads it — adding `-e` too would double-register.
+        // HAVE installed it, settings.json already loads it — adding `-e` too
+        // would double-register.
         const piExt = selfDistFile("agent/pi.js");
-        if (piExt && fs.existsSync(piExt) && !piPluginInstalled(resolvePiHome(process.env))) {
+        if (piExt && fs.existsSync(piExt) && !piPluginInstalled(piRealHome)) {
             clientArgs = ["-e", piExt, ...clientArgs];
         }
     } else if (base === "omp") {

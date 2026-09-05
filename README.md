@@ -152,7 +152,7 @@ hosts are whitelisted for MITM so the proxy can TLS-terminate exactly them
 and blind-tunnel everything else.
 
 ```bash
-bili pi                               # launch pi through the proxy
+bili pi                               # launch pi through the proxy — file-free (#535): env + extension registerProvider, real ~/.pi untouched
 bili codex                            # launch codex through the proxy
 bili claude                           # launch claude through the proxy
 bili omp                              # pi-style: MITM env + persistent overlay home (~/.omp/agent-bili, real config untouched)
