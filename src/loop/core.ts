@@ -428,11 +428,9 @@ export async function* runCompressLoop(
                 // — gating on one dropped every such round's reasoning from the
                 // re-request, leaving the proxy-tool assistant message without
                 // reasoning_content (DeepSeek 400 invalid_request_error: "reasoning_
-                // content ... must be passed back"). Relax ONLY for the known non-
-                // signature protocols; anything else (incl. unset) keeps the strict
-                // #221 posture, since dropping unsigned thinking never 400s but
-                // keeping it can.
-                const requiresThinkingSignature = ctx.protocol !== "openai" && ctx.protocol !== "responses";
+                // content ... must be passed back"). Relies on the invariant that the
+                // single production call site (server.ts) always populates ctx.protocol.
+                const requiresThinkingSignature = ctx.protocol === "anthropic";
                 if (reasoningSegments.length > 0) {
                     for (let i = 0; i < reasoningSegments.length; i++) {
                         const seg = reasoningSegments[i];

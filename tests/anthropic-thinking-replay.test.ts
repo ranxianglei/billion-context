@@ -12,6 +12,7 @@ function makeCtx(messages: CoreMessage[] = []) {
         core: createCore(),
         config: { modelContextLimit: 200000 } as Config,
         messages,
+        protocol: "anthropic",
         session: {
             id: "thinking-replay-test",
             meta: {},
