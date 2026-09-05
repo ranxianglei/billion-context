@@ -95,6 +95,35 @@ export function estimateCoreMessages(messages: CoreMessage[]): number {
     return tokens;
 }
 
+// #554: side requests bypass the pipeline (#388) and are forwarded VERBATIM,
+// so their fit decision must be made on the RAW client body — the kernel view
+// is empty on that path (processedMessages: []). Walks every string leaf of
+// the parsed body through the same CJK-aware defaultCountTokens; binary-
+// carrying fields (base64 image data, data-URLs) are excluded because
+// imageTokensInParsedBody charges those separately. Slightly overcounts (ids,
+// roles, structural strings) — a conservative bias is right for a guard that
+// fails closed.
+const NON_TEXT_BODY_KEYS = new Set(["data", "url", "b64_json"]);
+
+export function estimateRawBodyTokens(parsed: unknown): number {
+    let tokens = 0;
+    const walk = (value: unknown, key?: string): void => {
+        if (typeof value === "string") {
+            if (!key || !NON_TEXT_BODY_KEYS.has(key)) tokens += defaultCountTokens(value);
+            return;
+        }
+        if (Array.isArray(value)) {
+            for (const item of value) walk(item, key);
+            return;
+        }
+        if (value && typeof value === "object") {
+            for (const [k, v] of Object.entries(value as Record<string, unknown>)) walk(v, k);
+        }
+    };
+    walk(parsed);
+    return tokens;
+}
+
 function rangeChars(messages: CoreMessage[], startIdx: number, endIdx: number): number {
     let chars = 0;
     for (let i = startIdx; i <= endIdx && i < messages.length; i++) {

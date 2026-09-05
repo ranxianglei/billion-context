@@ -45,7 +45,7 @@ import { getSession, listSessions, type Session, initSessions, markDirty, flushA
 import { COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withStagedCompressGuidance } from "./compress-tool.js";
 import { rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
-import { preflightCompress, estimateCoreMessages } from "./preflight.js";
+import { preflightCompress, estimateCoreMessages, estimateRawBodyTokens } from "./preflight.js";
 import { imageTokensInRawBody, imageTokensInParsedBody } from "./image-tokens.js";
 import { renderUI, handleConfigGet, handleConfigPut } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
@@ -668,6 +668,29 @@ export function restoreOutputBudget(
         p[field] = highWater;
         log("info", `[${session.id}] output budget restored ${value} -> ${highWater} (#546: client shrank it from its raw-history estimate)`);
     }
+}
+
+/** #554: side requests are forwarded VERBATIM (no pipeline, #388), so a payload
+ *  over the upstream window is a guaranteed 400 that the learned self-heal can
+ *  never fix from this path — the gate fires before the self-heal read and
+ *  never consults reqConfig.modelContextLimit. Block here instead of forwarding:
+ *  estimate the RAW body (CJK-aware text + image tokens) against the effective
+ *  window = resolved ∩ learned (learned only ever shrinks) minus the output
+ *  reservation on wires where output counts against the window. blocked=false
+ *  with limit<=0 means "window unknown — forward as before". */
+export function sideRequestGuard(
+    parsed: unknown,
+    protocol: WireProtocol,
+    modelContextLimit: number,
+    learnedLimit: number | undefined,
+): { blocked: boolean; estimate: number; limit: number } {
+    let limit = modelContextLimit;
+    if (typeof learnedLimit === "number" && learnedLimit > 0 && learnedLimit < limit) limit = learnedLimit;
+    const field = outputBudgetField(parsed);
+    const maxOut = field ? ((parsed as Record<string, unknown>)[field] as number) : 0;
+    if (limit > 0 && shouldReserveOutputHeadroom(protocol)) limit = reserveOutputHeadroom(limit, maxOut);
+    const estimate = estimateRawBodyTokens(parsed) + imageTokensInParsedBody(protocol, parsed);
+    return { blocked: limit > 0 && estimate >= limit, estimate, limit };
 }
 
 function isTrustedAdminOrigin(origin: string | undefined, host: string | undefined, trustedHosts: Set<string>): boolean {
@@ -1344,6 +1367,32 @@ async function handle(
         // preflight / fake-completion retry / the loop / usage sniffing are all
         // skipped. processedMessages stays empty so the loop can never engage.
         if (!countTokens && !responsesCompact && protocol !== null && isSideRequest(parsed)) {
+            // #554: the passthrough below skips EVERY input-side guard by design
+            // (#388) — a full-history side request over the window is a
+            // guaranteed upstream 400 (and title-gen/probe clients re-issue it,
+            // hammering the upstream). Gate on the raw body estimate and fail
+            // fast locally instead of forwarding (#301 precedent).
+            const reqModel = (parsed as { model?: string }).model;
+            const learnedMap = session.metadata.learnedContextLimits as Record<string, number> | undefined;
+            const learnedLimit =
+                (reqModel && learnedMap ? learnedMap[reqModel] : undefined) ??
+                (session.metadata.learnedContextLimit as number | undefined);
+            const guard = sideRequestGuard(parsed, protocol, reqConfig.modelContextLimit, learnedLimit);
+            if (guard.blocked) {
+                log("warn", `[${session.id}] side request (~${guard.estimate} tokens) ≥ effective window ${guard.limit} (model=${reqModel ?? "?"}) — NOT forwarded: guaranteed upstream 400 (side requests bypass preflight by design, #388)`);
+                if (!res.headersSent && !res.writableEnded && !res.destroyed) {
+                    res.writeHead(413, { "content-type": "application/json" });
+                    res.end(JSON.stringify({
+                        error: {
+                            type: "server_error",
+                            code: "side_request_payload_too_large",
+                            message: `side request payload ~${guard.estimate} tokens reaches the effective context window ${guard.limit} (model=${reqModel ?? "unknown"}); NOT forwarded — side requests (max_tokens<=${SIDE_REQUEST_MAX_TOKENS}) bypass compression by design (#388). Shrink the conversation or raise the model's context window.`,
+                            retryable: false,
+                        },
+                    }));
+                }
+                return;
+            }
             log("info", `[${session.id}] side request (max_tokens<=${SIDE_REQUEST_MAX_TOKENS}) → passthrough + tag strip only, kernel state untouched`);
             const sidePrepared: Prepared = {
                 body: bodyBuffer,
@@ -2818,9 +2867,10 @@ async function forward(
                 // limit from another model must not cap this one).
                 let reqModel: string | undefined;
                 let rejectedImageTokens = 0;
+                let parsedBody: Record<string, unknown> | undefined;
                 try {
                     const rawBody = typeof prepared.body === "string" ? prepared.body : prepared.body.toString("utf8");
-                    const parsedBody = JSON.parse(rawBody) as Record<string, unknown>;
+                    parsedBody = JSON.parse(rawBody) as Record<string, unknown>;
                     reqModel = typeof parsedBody.model === "string" ? parsedBody.model : undefined;
                     // #488: the rejected payload's size must include its images (they were forwarded verbatim).
                     rejectedImageTokens = imageTokensInParsedBody(prepared.protocol, parsedBody);
@@ -2844,7 +2894,11 @@ async function forward(
                     // so the next turn re-centers the limit and the pre-flight
                     // compresses below it. Only shrink, never grow: a previously
                     // learned (smaller) value is the tighter bound.
-                    const payloadEstimate = estimateCoreMessages(prepared.processedMessages) + rejectedImageTokens;
+                    // #554: side passthrough has an EMPTY kernel view (processedMessages=[]),
+                    // so estimate from the raw body — exactly what was forwarded verbatim.
+                    const payloadEstimate = (prepared.processedMessages.length > 0
+                        ? estimateCoreMessages(prepared.processedMessages)
+                        : estimateRawBodyTokens(parsedBody)) + rejectedImageTokens;
                     const prev = (reqModel ? learnedMap[reqModel] : undefined) ?? (s.metadata.learnedContextLimit as number | undefined);
                     if (payloadEstimate >= 1000 && (prev === undefined || payloadEstimate < prev)) {
                         if (reqModel) learnedMap[reqModel] = payloadEstimate;

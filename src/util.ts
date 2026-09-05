@@ -120,6 +120,9 @@ const CONTEXT_OVERFLOW_PATTERNS: RegExp[] = [
     /prompt_is_too_long/i,
     /request_too_large/i,
     /token limit exceeded/i,
+    // #554: llama.cpp-family "exceed_context_size_error (A / B > W)" — carried by
+    // side requests that bypass preflight; without it the learned channel learns nothing.
+    /exceed[_\s]?context[_\s]?size/i,
 ];
 
 function toTokenNumber(s: string): number | undefined {
@@ -135,6 +138,11 @@ function toTokenNumber(s: string): number | undefined {
 function parseOverflowWindow(text: string): number | undefined {
     // "130000 tokens > 128000 maximum" (Anthropic) → the maximum, not the total.
     let m = text.match(/>\s*(\d[\d,]*)\s*maximum/i);
+    if (m) return toTokenNumber(m[1]);
+    // #554: "exceed_context_size_error (198,277 / 198,661 > 150,528)" (llama.cpp
+    // family) — A/B are payload sizes; only the number after ">" inside the
+    // parens is the limit.
+    m = text.match(/\(\s*\d[\d,]*\s*\/\s*\d[\d,]*\s*>\s*(\d[\d,]+)\s*\)/);
     if (m) return toTokenNumber(m[1]);
     m =
         text.match(/maximum context length is (\d[\d,]*)/i) ??
