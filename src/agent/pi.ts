@@ -9,7 +9,7 @@ import { detectProxyBase, fetchManifest, forwardTool, fetchStatus, fetchProxyVer
 
 type Ctx = {
     sessionManager?: { getSessionId?: () => string } | undefined;
-    model?: { contextWindow?: number; baseUrl?: string } | undefined;
+    model?: { contextWindow?: number; baseUrl?: string; provider?: string; id?: string; [key: string]: unknown } | undefined;
     cwd?: string;
 };
 
@@ -42,6 +42,12 @@ type ExtensionAPI = {
     // overrides each provider's baseUrl at load (file-free routing — no
     // models.json overlay). Optional because older hosts may lack it.
     registerProvider?: (name: string, config: { baseUrl: string }) => void;
+    // #535 omp-only: omp pins the session's Model object from the static
+    // catalog BEFORE extensions load, and its registerProvider — unlike
+    // pi's _refreshCurrentModelFromRegistry — never re-resolves the live
+    // session model, so the extension must re-pin it via setModel (see the
+    // session_start handler below). Optional because pi hosts lack it.
+    setModel?: (model: Record<string, unknown> & { baseUrl?: string }) => Promise<boolean | void> | boolean | void;
 };
 
 function agentName(override: string | undefined): string {
@@ -259,20 +265,57 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 }
             }
         }
-        // #535: cancel pi's NATIVE auto-compaction (threshold + overflow) so
-        // its summarizer never fires alongside bili's ACP compression — the
-        // in-extension replacement for the old settings.json compaction-off
-        // injection. `reason` gates to the auto paths only: manual /compact
-        // stays user-owned. omp's session_before_compact event has no reason
-        // field yet (upstream PR pending), so omp keeps its config.yml
-        // compaction-off entry until then. Only armed under `bili` launch:
-        // plain `pi` with the plugin installed must behave fully native.
-        if (agent === "pi" && process.env.BILLION_CONTEXT_PROXY !== undefined) {
+        // #535: cancel the host's NATIVE compaction so its summarizer never
+        // fires alongside bili's ACP compression — the in-extension
+        // replacement for the old compaction-off config injection. pi's event
+        // carries `reason`: cancel only threshold + overflow so manual
+        // /compact stays user-owned. omp's event has no reason field, so omp
+        // cancels ALL compaction — under bili, manual native /compact is
+        // equally harmful (the native summarizer would destroy the
+        // ACP-tagged context), the host shows "Compaction cancelled", and
+        // the user should reach for /acp instead. Only armed under `bili`
+        // launch: plain pi/omp with the plugin installed stays fully native.
+        if ((agent === "pi" || agent === "omp") && process.env.BILLION_CONTEXT_PROXY !== undefined) {
             pi.on("session_before_compact", (event) => {
-                const reason = (event as unknown as { reason?: unknown }).reason;
-                if (reason === "threshold" || reason === "overflow") return { cancel: true };
-                return undefined;
+                if (agent === "pi") {
+                    const reason = (event as unknown as { reason?: unknown }).reason;
+                    if (reason === "threshold" || reason === "overflow") return { cancel: true };
+                    return undefined;
+                }
+                return { cancel: true };
             });
+        }
+        // #535 omp-only: omp resolves modelRoles.default into options.model
+        // from the PRE-extension static catalog (main.ts: "scope is resolved
+        // before extensions register their providers"), and omp's fork lacks
+        // pi's registerProvider → _refreshCurrentModelFromRegistry hop — the
+        // registry gets the rewritten baseUrl but the live session keeps the
+        // direct one, so every request bypasses the proxy (fetch trace →
+        // http://127.0.0.1:8197/v1/responses with zero proxy forwards). Re-pin
+        // the session model at load + on every session switch: spread the
+        // current model with the rewritten baseUrl through the host setModel
+        // (keyed-provider-gated; local providers carry dummy keys). Mid-session
+        // /model picks resolve from the already-overridden registry, so only
+        // session start/restore need this.
+        if (agent === "omp" && rewrites !== undefined && typeof pi.setModel === "function") {
+            const repin = async (ctx: Ctx): Promise<void> => {
+                const model = ctx?.model;
+                if (model === null || typeof model !== "object") return;
+                const provider = model.provider;
+                if (typeof provider !== "string" || provider === "") return;
+                const rewritten = rewrites[provider];
+                if (rewritten === undefined || model.baseUrl === rewritten) return;
+                try {
+                    const switched = await pi.setModel?.({ ...model, baseUrl: rewritten });
+                    if (switched === false) {
+                        console.error(`bili-plugin: omp setModel(${provider}/${String(model.id)}) rejected (no API key) — traffic for this provider goes direct`);
+                    }
+                } catch (err) {
+                    console.error(`bili-plugin: omp setModel failed: ${err instanceof Error ? err.message : String(err)} — traffic goes direct`);
+                }
+            };
+            pi.on("session_start", (_event, ctx) => repin(ctx));
+            pi.on("session_switch", (_event, ctx) => repin(ctx));
         }
         if (typeof pi.registerCommand === "function") {
             pi.registerCommand("acp", {

@@ -43,7 +43,7 @@ import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom } from "./plugin-in
 function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
-import { nonEmpty, resolvePiHome, resolveOmpHome, resolveHermesHome, resolveDshHome, loadClientConfig, collectModelWindows, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider } from "./client-config.js";
+import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, loadClientConfig, collectModelWindows, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider } from "./client-config.js";
 import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, type ProviderRoutes } from "./config.js";
 import { contextFromRegistry } from "./registry.js";
 
@@ -276,9 +276,12 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
             classify(prov.baseURL, name);
         }
     } else if (client === "hermes") {
-        // hermes rides /bili/ for EVERY upstream (http AND https): its httpx
-        // client builds its own CA bundle from certifi, so cert-MITM would
-        // need extra trust config. Wrapping the URL form needs no cert at all.
+        // #535 phase 2: hermes rides its httpx proxy env for every upstream —
+        // https via CONNECT + cert MITM (host whitelisted for the CA),
+        // plain-http via absolute-form forward-proxy requests the server
+        // understands. No URL rewriting anywhere, so the real config.yaml is
+        // never touched. httpRewrites is inventory-only here: it feeds the
+        // banner and the no-provider warning; the child never consumes it.
         const hermesSeen = new Set<string>();
         for (const [name, prov] of Object.entries(config.hermes?.providers ?? {})) {
             if (!nonEmpty(prov.api)) continue;
@@ -288,8 +291,16 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
                 if (url.protocol !== "http:" && url.protocol !== "https:") continue;
                 if (hermesSeen.has(name)) continue;
                 hermesSeen.add(name);
-                rewriteKeys.add(name);
-                httpRewrites.push({ key: name, realUpstream: real });
+                if (url.protocol === "https:") {
+                    const host = url.hostname.toLowerCase();
+                    if (host && !httpsSeen.has(host)) {
+                        httpsSeen.add(host);
+                        httpsDomains.push(host);
+                    }
+                } else if (!rewriteKeys.has(name)) {
+                    rewriteKeys.add(name);
+                    httpRewrites.push({ key: name, realUpstream: real });
+                }
             } catch {
                 // Unparseable endpoint: skip.
             }
@@ -632,10 +643,11 @@ export function buildCodexMcpArgs(origin: string, conversationId: string): strin
 }
 
 /**
- * Shared persistent-overlay machinery for home-dir-based launchers (pi / omp /
- * hermes). The overlay (`<realHome>-bili`) symlinks every real-home entry
- * except the launcher-generated file (models.json / models.yml / config.yaml),
- * which is rewritten in place atomically.
+ * Shared persistent-overlay machinery for the remaining home-dir launcher
+ * (dsh; pi/omp/hermes went file-free in #535 — env routing + extension, no
+ * overlay). The overlay (`<realHome>-bili`) symlinks every real-home entry
+ * except the launcher-generated file (settings.yaml), which is rewritten in
+ * place atomically.
  *
  * The overlay is PERSISTENT and never deleted: these agents record absolute
  * paths derived from their home override into shared state (resume pointers
@@ -1104,10 +1116,9 @@ function writeOverlayFileAtomic(overlay: string, fileName: string, contents: str
 }
 
 /**
- * omp models.yml rewrite (line-based, indentation-tracked): HTTP → /bili/ wrap, wrapped-HTTPS → raw https for cert
- * MITM, riding the persistent `<ompHome>-bili` overlay from
- * refreshOverlayHome — comments, ordering and formatting are preserved
- * verbatim, and the real models.yml is never touched.
+ * Atomic text write via rename (draft + rename, never a torn file) — used for
+ * the generated overlay files (e.g. dsh's rewritten settings.yaml) and the
+ * dead-proxy-URL unpacker below.
  */
 function atomicWriteTextFile(filePath: string, contents: string): void {
     const draft = `${filePath}.${process.pid}.bili-tmp`;
@@ -1160,311 +1171,6 @@ export function unpackDeadProxyUrlsInFile(filePath: string, livePorts: Set<numbe
         return 0;
     }
     return changed;
-}
-
-function mergeOmpCompactionDisabledYaml(text: string): string {
-    const lines = text.split(/\r?\n/);
-    let compactionLine = -1;
-    for (let i = 0; i < lines.length; i++) {
-        const rawLine = lines[i];
-        const trimmed = rawLine.trim();
-        if (!trimmed || trimmed.startsWith("#")) continue;
-        const indent = rawLine.length - rawLine.trimStart().length;
-        if (indent === 0 && /^compaction:\s*(#.*)?$/.test(trimmed)) {
-            compactionLine = i;
-            break;
-        }
-    }
-    if (compactionLine === -1) {
-        const base = text === "" || text.endsWith("\n") ? text : `${text}\n`;
-        return `${base}compaction:\n  enabled: false\n`;
-    }
-    for (let i = compactionLine + 1; i < lines.length; i++) {
-        const rawLine = lines[i];
-        const trimmed = rawLine.trim();
-        if (!trimmed || trimmed.startsWith("#")) continue;
-        const indent = rawLine.length - rawLine.trimStart().length;
-        if (indent === 0) break;
-        if (/^enabled:/.test(trimmed)) {
-            const leading = rawLine.slice(0, rawLine.length - rawLine.trimStart().length);
-            const commentMatch = /\s+#.*$/.exec(rawLine);
-            const comment = commentMatch ? commentMatch[0] : "";
-            lines[i] = `${leading}enabled: false${comment}`;
-            return lines.join("\n");
-        }
-    }
-    let childIndent = 2;
-    for (let i = compactionLine + 1; i < lines.length; i++) {
-        const rawLine = lines[i];
-        const trimmed = rawLine.trim();
-        if (!trimmed || trimmed.startsWith("#")) continue;
-        const indent = rawLine.length - rawLine.trimStart().length;
-        if (indent === 0) break;
-        childIndent = indent;
-        break;
-    }
-    lines.splice(compactionLine + 1, 0, `${" ".repeat(childIndent)}enabled: false`);
-    return lines.join("\n");
-}
-
-function writeOmpCompactionDisabledConfig(ompHome: string, overlay: string): void {
-    // omp reads config.yml at runtime (settings.json is only a one-time migration
-    // source, renamed to .bak). Merge compaction.enabled=false over the real
-    // config.yml / config.yaml / settings.json so the native auto-compaction
-    // never fires alongside bili's ACP compression. JSON is a valid YAML subset,
-    // so the settings.json fallback is written as JSON and parsed by omp fine.
-    let base: string | undefined;
-    let baseIsJson = false;
-    for (const name of ["config.yml", "config.yaml"]) {
-        try {
-            base = fs.readFileSync(path.join(ompHome, name), "utf8");
-            break;
-        } catch {}
-    }
-    if (base === undefined) {
-        try {
-            base = fs.readFileSync(path.join(ompHome, "settings.json"), "utf8");
-            baseIsJson = true;
-        } catch {}
-    }
-    let merged: string;
-    if (base === undefined) {
-        merged = "compaction:\n  enabled: false\n";
-    } else if (baseIsJson) {
-        let settings: Record<string, unknown> = {};
-        try {
-            const parsed: unknown = JSON.parse(base);
-            if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-                settings = parsed as Record<string, unknown>;
-            }
-        } catch {}
-        const compactionRaw = settings.compaction;
-        const compaction =
-            compactionRaw && typeof compactionRaw === "object" && !Array.isArray(compactionRaw)
-                ? { ...(compactionRaw as Record<string, unknown>) }
-                : {};
-        compaction.enabled = false;
-        settings.compaction = compaction;
-        merged = JSON.stringify(settings, null, 2);
-    } else {
-        merged = mergeOmpCompactionDisabledYaml(base);
-    }
-    writeOverlayFileAtomic(overlay, "config.yml", merged);
-}
-
-export function prepareOmpHttpRewrite(
-    ompHome: string,
-    origin: string,
-    httpRewrites: HttpRewrite[],
-    httpsRewrites: HttpRewrite[],
-): string | undefined {
-    if (!fs.existsSync(ompHome)) return undefined;
-    const overlay = `${ompHome}-bili`;
-    // #449: the overlay always carries a config.yml disabling omp's native
-    // auto-compaction (its summarizer must never fire alongside bili's ACP
-    // compression); models.yml is generated only when present, so both stay
-    // out of the real-home symlink set.
-    const generated: string[] = ["config.yml"];
-    const modelsPath = path.join(ompHome, "models.yml");
-    const unpacked = unpackDeadProxyUrlsInFile(modelsPath, liveProxyPorts());
-    if (unpacked > 0) {
-        console.error(`bili: unpacked ${unpacked} dead proxy URL(s) from the real ${modelsPath}`);
-    }
-    let modelsText: string | undefined;
-    try {
-        modelsText = fs.readFileSync(modelsPath, "utf8");
-        generated.push("models.yml");
-    } catch {}
-    if (!refreshOverlayHome(ompHome, overlay, generated)) return undefined;
-    if (modelsText !== undefined) {
-        const httpMap = new Map(httpRewrites.map((r) => [r.key, wrapUpstream(origin, r.realUpstream)]));
-        const httpsMap = new Map(httpsRewrites.map((r) => [r.key, r.realUpstream]));
-        const lines = modelsText.split(/\r?\n/);
-        let providersIndent = -1;
-        let providerIndent = -1;
-        let currentProvider: string | null = null;
-        for (let i = 0; i < lines.length; i++) {
-            const rawLine = lines[i];
-            const trimmed = rawLine.trim();
-            if (!trimmed || trimmed.startsWith("#")) continue;
-            const indent = rawLine.length - rawLine.trimStart().length;
-            if (providersIndent === -1) {
-                if (/^providers:\s*(#.*)?$/.test(trimmed)) providersIndent = indent;
-                continue;
-            }
-            if (indent <= providersIndent) break;
-            if (providerIndent === -1) providerIndent = indent;
-            if (indent === providerIndent) {
-                const m = /^([A-Za-z0-9_.-]+):/.exec(trimmed);
-                currentProvider = m ? m[1] : null;
-            } else if (indent > providerIndent && currentProvider) {
-                const baseMatch = /^(baseUrl:\s*)(\S+)/.exec(trimmed);
-                if (baseMatch) {
-                    const target = httpMap.get(currentProvider) ?? httpsMap.get(currentProvider);
-                    if (target) {
-                        const leading = rawLine.slice(0, rawLine.length - rawLine.trimStart().length);
-                        const commentMatch = /\s+#.*$/.exec(rawLine);
-                        const comment = commentMatch ? commentMatch[0] : "";
-                        lines[i] = `${leading}baseUrl: ${target}${comment}`;
-                    }
-                }
-            }
-        }
-        writeOverlayFileAtomic(overlay, "models.yml", lines.join("\n"));
-    }
-    writeOmpCompactionDisabledConfig(ompHome, overlay);
-    return overlay;
-}
-
-/**
- * hermes counterpart of prepareOmpHttpRewrite: a persistent `<hermesHome>-bili`
- * overlay (every ~/.hermes sibling symlinked so skills/memories/sessions stay
- * shared) holding a rewritten copy of config.yaml. Every provider endpoint
- * line (api: / base_url: / url:) is rewrapped as origin + "/bili/" + raw
- * upstream — http AND https alike, since hermes's httpx stack can't consume
- * the MITM CA without extra trust config. The real ~/.hermes is never
- * touched. Returns the overlay dir (undefined when nothing is rewritable).
- */
-export function prepareHermesHome(
-    hermesHome: string,
-    origin: string,
-    rewrites: HttpRewrite[],
-): string | undefined {
-    if (rewrites.length === 0) return undefined;
-    const cfgPath = path.join(hermesHome, "config.yaml");
-    let txt: string;
-    try {
-        txt = fs.readFileSync(cfgPath, "utf8");
-    } catch {
-        return undefined;
-    }
-    const wrapSet = new Set(rewrites.map((r) => r.realUpstream));
-    const eol = txt.includes("\r\n") ? "\r\n" : "\n";
-    const lines = txt.split(/\r?\n/);
-    let changed = false;
-    for (let i = 0; i < lines.length; i++) {
-        const rawLine = lines[i];
-        const m = /^(\s*(?:api|base_url|url):\s*)(\S+)(\s+#.*)?$/.exec(rawLine);
-        if (!m) continue;
-        const rawUrl = m[2].replace(/^["']|["']$/g, "");
-        if (!/^https?:\/\//i.test(rawUrl)) continue;
-        const real = unwrapUpstream(rawUrl);
-        if (!wrapSet.has(real)) continue;
-        lines[i] = `${m[1]}${wrapUpstream(origin, real)}${m[3] ?? ""}`;
-        changed = true;
-    }
-    if (!changed) return undefined;
-    const overlay = `${hermesHome}-bili`;
-    if (!refreshOverlayHome(hermesHome, overlay, "config.yaml")) return undefined;
-    writeOverlayFileAtomic(overlay, "config.yaml", lines.join(eol));
-    return overlay;
-}
-
-/** Write the hermes session-identity plugin into the bili overlay home.
- *  Hermes sends NO conversation identity on the wire by default: its native
- *  `prompt_cache_key` support (transports/chat_completions.py) is gated on
- *  `supports_prompt_cache_key`, which no bundled provider profile enables —
- *  so every custom-provider request reaches the proxy anonymous and gets a
- *  400 (#286). User plugins under $HERMES_HOME/plugins/model-providers/<name>/
- *  override bundled profiles (discovery order bundled → user, last-writer-
- *  wins), and the profile hook `build_api_kwargs_extras(session_id=...)`
- *  receives the REAL hermes session id — its top_level return value is
- *  merged straight into the request body. The generated plugin subclasses
- *  the bundled "custom" profile and stamps prompt_cache_key = session_id,
- *  giving the proxy the same stable per-conversation id omp/pi provide.
- *  Registered names: "custom" (model.base_url / provider: custom) plus
- *  "custom:<name>" for every provider key bili rewrites (named providers
- *  resolve to that shape — agent_init only maps "custom"/"custom:<key>"
- *  to custom endpoints, and a bare "custom:<key>" lookup otherwise misses
- *  the profile registry and falls to the legacy no-pck path).
- *  Skipped (returns false) when the REAL ~/.hermes already has a plugins/
- *  dir — refreshOverlayHome symlinks it into the overlay, and writing
- *  through the symlink would mutate the user's real home. The proxy then
- *  400s anonymous requests with the fix-it message. */
-export function writeHermesIdentityPlugin(hermesHome: string, overlay: string, rewrites: HttpRewrite[]): boolean {
-    try {
-        if (fs.existsSync(path.join(hermesHome, "plugins"))) return false;
-    } catch {
-        return false;
-    }
-    const dir = path.join("plugins", "model-providers", "bili-session-identity");
-    try {
-        fs.mkdirSync(path.join(overlay, dir), { recursive: true });
-    } catch {
-        return false;
-    }
-    const keys = rewrites.map((r) => r.key);
-    const pluginDir = path.join(overlay, dir);
-    try {
-        fs.writeFileSync(path.join(pluginDir, "__init__.py"), hermesIdentityPluginSource(keys));
-        fs.writeFileSync(path.join(pluginDir, "plugin.yaml"), [
-        "name: bili-session-identity",
-        "kind: model-provider",
-        "version: 1.0.0",
-        "description: billion-context session identity (installed by `bili hermes` — safe to delete)",
-        "author: billion-context",
-        "",
-    ].join("\n"));
-    } catch {
-        return false;
-    }
-    try {
-        return fs.existsSync(path.join(overlay, dir, "__init__.py"));
-    } catch {
-        return false;
-    }
-}
-
-function hermesIdentityPluginSource(providerKeys: string[]): string {
-    return [
-        '"""Installed by `bili hermes` (billion-context) — safe to delete.',
-        "",
-        "Re-registers hermes's `custom` provider profile (plus a `custom:<name>`",
-        "profile for every provider the proxy fronts) with one addition: the",
-        "REAL hermes session id is sent as `prompt_cache_key` on every request,",
-        "which the billion-context proxy uses as the stable conversation",
-        'identity for its compression sessions. Removing this file restores',
-        'stock behavior (no prompt_cache_key)."""',
-        "from providers import get_provider_profile, register_provider",
-        "from providers.base import ProviderProfile",
-        "",
-        `_PROVIDER_KEYS = ${JSON.stringify(providerKeys)}`,
-        "",
-        '_custom = get_provider_profile("custom")',
-        "_BASE = type(_custom) if _custom is not None else ProviderProfile",
-        "",
-        "",
-        "class _BiliSessionIdentity(_BASE):",
-        "    def build_api_kwargs_extras(self, *, session_id=None, **ctx):",
-        "        extra_body, top_level = _BASE.build_api_kwargs_extras(",
-        "            self, session_id=session_id, **ctx",
-        "        )",
-        '        sid = str(session_id or "").strip()',
-        "        if sid:",
-        '            top_level.setdefault("prompt_cache_key", sid[:64])',
-        "        return extra_body, top_level",
-        "",
-        "",
-        "def _register(name, template, with_aliases):",
-        "    fields = {}",
-        "    if template is not None:",
-        "        # Aliases are copied ONLY for the canonical custom",
-        "        # re-registration: copying them onto custom:<name> entries",
-        "        # would steal the aliases (register_provider re-points each",
-        "        # alias at the registering name).",
-        '        for attr in ((\"aliases\",) if with_aliases else ()) + (\"env_vars\", \"base_url\", \"default_max_tokens\"):',
-        "            value = getattr(template, attr, None)",
-        "            if value:",
-        "                fields[attr] = value",
-        "    register_provider(_BiliSessionIdentity(name=name, **fields))",
-        "",
-        "",
-        "if _custom is not None:",
-        '    _register("custom", _custom, True)',
-        "for _key in _PROVIDER_KEYS:",
-        '    _register("custom:" + _key, _custom, False)',
-        "",
-    ].join("\n");
 }
 
 /** dsh counterpart of prepareHermesHome: a persistent `<dshHome>-bili` overlay
@@ -1708,7 +1414,16 @@ export function pickEphemeralPort(host = LAUNCHER_DEFAULT_HOST): Promise<number>
     });
 }
 
-const INHERITED_PROXY_VARS = ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"];
+const INHERITED_PROXY_VARS = [
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "no_proxy",
+    "NO_PROXY",
+];
 
 export function stripInheritedProxy(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     const cleaned: NodeJS.ProcessEnv = { ...env };
@@ -1919,10 +1634,11 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     const debug = params.overrides.ACP_DEBUG === "1";
 
     const base = baseClientName(params.client);
-    // #535: for pi, discovery must read the REAL home — a stale inherited
-    // PI_CODING_AGENT_DIR (legacy overlay launch) would discover routes from
-    // an old overlay's rewritten models.json.
-    const discoveryEnv = base === "pi" ? { ...process.env, PI_CODING_AGENT_DIR: undefined } : process.env;
+    // #535: for pi and omp, discovery must read the REAL home — a stale
+    // inherited PI_CODING_AGENT_DIR (legacy overlay launch) would discover
+    // routes from an old overlay's rewritten models.json/models.yml.
+    const discoveryEnv =
+        base === "pi" || base === "omp" ? { ...process.env, PI_CODING_AGENT_DIR: undefined } : process.env;
     const config = loadClientConfig(discoveryEnv, process.cwd());
     const routes = discoverRoutes(base, config);
     // #535: pi's REAL home — resolvePiHome honors a possibly-stale inherited
@@ -1930,8 +1646,11 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     // a legacy bili overlay launch exported it into); the new file-free
     // design must never let that redirect pi at an old overlay dir.
     const piRealHome = resolvePiHome({ ...process.env, PI_CODING_AGENT_DIR: undefined });
-    // #535: validate pi's extension availability BEFORE spawning the proxy —
-    // a refusal after ensureProxyRunning would leak a detached proxy child.
+    // #535 phase 3: omp's REAL home, resolved with the same stale-inheritance
+    // strip as pi (resolveOmpHome honors PI_CODING_AGENT_DIR too).
+    const ompRealHome = resolveOmpHome({ ...process.env, PI_CODING_AGENT_DIR: undefined });
+    // #535: validate extension availability BEFORE spawning the proxy — a
+    // refusal after ensureProxyRunning would leak a detached proxy child.
     if (base === "pi" && (routes.httpRewrites.length > 0 || routes.httpsRewrites.length > 0)) {
         const piExt = selfDistFile("agent/pi.js");
         const extAvailable = (piExt !== undefined && fs.existsSync(piExt)) || piPluginInstalled(piRealHome);
@@ -1940,6 +1659,17 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
                 "bili: pi needs provider URL rewrites but the bili extension cannot load " +
                     "(dist/agent/pi.js missing and the plugin is not installed in ~/.pi/agent/settings.json) — " +
                     "reinstall billion-context or run `bili plugin install pi`",
+            );
+        }
+    }
+    if (base === "omp" && routes.httpRewrites.length > 0) {
+        const ompExt = selfDistFile("agent/omp.js");
+        const extAvailable = (ompExt !== undefined && fs.existsSync(ompExt)) || ompPluginLoadedFrom(ompRealHome);
+        if (!extAvailable) {
+            throw new Error(
+                "bili: omp needs provider URL rewrites but the bili extension cannot load " +
+                    "(dist/agent/omp.js missing and the plugin is not installed in ~/.omp/agent/config.yml) — " +
+                    "reinstall billion-context or run `bili plugin install omp`",
             );
         }
     }
@@ -1961,9 +1691,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     const ca = resolveCaCertPath(process.env);
     let env: NodeJS.ProcessEnv;
     let clientArgs = params.clientArgs;
-    let ompOverlayHome: string | undefined;
     let opencodeTmpFile: string | undefined;
-    let hermesOverlayHome: string | undefined;
     let dshOverlayHome: string | undefined;
     const tmpFiles: string[] = [];
     const directUrl = launcherDirectUrl(process.env);
@@ -2011,20 +1739,18 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
             clientArgs = ["-e", piExt, ...clientArgs];
         }
     } else if (base === "omp") {
-        // omp is pi-based: same env as pi (HTTPS_PROXY + CA + BILLION_CONTEXT_PROXY);
-        // the /bili/ rewrite rides a persistent overlay PI_CODING_AGENT_DIR
-        // (~/.omp/agent-bili; real models.yml untouched, session paths stay resolvable).
-        env = buildPiEnv(origin, ca, process.env);
-        ompOverlayHome = prepareOmpHttpRewrite(resolveOmpHome(process.env), origin, routes.httpRewrites, routes.httpsRewrites);
-        if (ompOverlayHome) env.PI_CODING_AGENT_DIR = ompOverlayHome;
-        // Native tooling out of the box (same rationale as pi): omp does NOT
-        // ship the bili plugin — when the config carries no loadable entry,
-        // ride omp's `-e <file>` (loads for this run only, writes nothing)
-        // instead of dropping to wire-mode fallback. A loadable entry (the
-        // overlay's generated config.yml preserves the real home's entries)
-        // already provides the plugin; adding `-e` too would double-register.
+        // #535 phase 3: file-free — omp is pi-based and runs on its REAL home
+        // (no overlay, no PI_CODING_AGENT_DIR redirect). Provider baseUrls are
+        // overridden at extension load from the env manifest (omp's fork keeps
+        // pi's registerProvider), and native compaction — auto AND manual — is
+        // cancelled by the extension's session_before_compact handler (omp's
+        // event carries no reason field, so under bili every compaction is
+        // cancelled; the native summarizer would destroy the ACP-tagged
+        // context). https upstreams ride cert-MITM like pi.
+        env = buildPiEnv(origin, ca, process.env, routes.httpRewrites);
+        delete env.PI_CODING_AGENT_DIR;
         const ompExt = selfDistFile("agent/omp.js");
-        if (ompExt && fs.existsSync(ompExt) && !ompPluginLoadedFrom(resolveOmpHome(process.env))) {
+        if (ompExt && fs.existsSync(ompExt) && !ompPluginLoadedFrom(ompRealHome)) {
             clientArgs = ["-e", ompExt, ...clientArgs];
         }
     } else if (base === "opencode") {
@@ -2038,31 +1764,21 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         opencodeTmpFile = prepareOpencodeHttpRewrite(resolveOpencodeConfigFile(process.env), origin, routes.httpRewrites, routes.httpsRewrites, opencodePluginPath);
         if (opencodeTmpFile) env.OPENCODE_CONFIG = opencodeTmpFile;
     } else if (base === "hermes") {
-        // hermes: no plugin, no MITM cert trust (httpx builds its own CA
-        // bundle) — every upstream rides the /bili/ URL form via a persistent
-        // overlay HERMES_HOME (~/.hermes-bili) whose config.yaml is rewritten.
-        // skills/memories/sessions stay shared through symlinks; the real
-        // ~/.hermes is never touched.
-        env = { ...process.env };
-        hermesOverlayHome = prepareHermesHome(resolveHermesHome(process.env), origin, routes.httpRewrites);
-        if (hermesOverlayHome) {
-            env.HERMES_HOME = hermesOverlayHome;
-            // Session identity for the proxied custom providers: hermes sends
-            // no conversation id on the wire, so the proxy 400s anonymous
-            // requests (#286). The plugin stamps the real hermes session id as
-            // prompt_cache_key. Skipped (identity stays anonymous) when the
-            // real ~/.hermes already has a plugins/ dir — writing through the
-            // overlay symlink would mutate the user's home.
-            if (!writeHermesIdentityPlugin(resolveHermesHome(process.env), hermesOverlayHome, routes.httpRewrites)) {
-                console.error(
-                    "bili: ~/.hermes has its own plugins/ — skipping the session-identity plugin; hermes requests will be rejected by the proxy without an identity (see #286).",
-                );
-            }
-        } else {
+        // #535 phase 2: file-free — no overlay HERMES_HOME, no config.yaml
+        // runs on its REAL home — including a user-set HERMES_HOME (discovery
+        // resolved the same path, so the MITM whitelist matches). Its httpx
+        // stack resolves ONE proxy env var (HTTPS_PROXY first) for both
+        // schemes and trusts custom CAs via HERMES_CA_BUNDLE: https upstreams
+        // ride CONNECT + cert MITM, plain-http upstreams ride absolute-form
+        // forward-proxy requests the server understands. Sessions bind by
+        // persisted content-prefix affinity when no identity carrier is
+        // present (anonymous requests are accepted, #286).
+        env = stripInheritedProxy(process.env);
+        env.HTTPS_PROXY = origin;
+        env.HERMES_CA_BUNDLE = ca;
+        if (routes.httpRewrites.length === 0 && routes.httpsDomains.length === 0) {
             console.error(
-                routes.httpRewrites.length === 0
-                    ? "bili: no hermes providers found in ~/.hermes/config.yaml — traffic will NOT go through the proxy (configure a provider first)."
-                    : "bili: hermes config.yaml could not be rewritten (unreadable or no matching provider endpoints) — traffic will NOT go through the proxy.",
+                "bili: no hermes providers found in ~/.hermes/config.yaml — traffic will NOT go through the proxy (configure a provider first).",
             );
         }
     } else if (base === "dsh") {
