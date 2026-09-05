@@ -387,15 +387,24 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     const modelContextLimit = typeof limit === "number" && limit > 0 ? limit : 0;
     let panel: string | undefined;
     try {
+        // #532: the kernel breakdown classifies messages only; bili measured
+        // the outbound system+tools overhead at prepare time (same source as
+        // estimateInputTokens) and stored it on the session. Feeding it in is
+        // what makes Sent/SysPrompt reflect reality instead of undercounting
+        // by the full system+tools size every turn. unprunedTokens gets the
+        // same addition so the Session-only derivation (unpruned − sent) still
+        // isolates pruned originals on one scale.
+        const sysTokRaw = session.metadata.systemPromptTokens;
+        const systemPromptTokens = typeof sysTokRaw === "number" && Number.isFinite(sysTokRaw) && sysTokRaw > 0 ? sysTokRaw : 0;
         panel = buildStatusPanel({
             version: `billion-context@${PROXY_VERSION}`,
             tokenCount: session.stats.lastInputTokens,
-            systemPromptTokens: 0,
+            systemPromptTokens,
             state: session.state,
             nudge: mem?.nudge,
             modelContextLimit,
             unprunedTokens: mem && mem.original.length > 0
-                ? mem.original.reduce((sum, m) => sum + defaultCountTokens(m.text ?? ""), 0)
+                ? mem.original.reduce((sum, m) => sum + defaultCountTokens(m.text ?? ""), 0) + systemPromptTokens
                 : undefined,
         });
     } catch {
