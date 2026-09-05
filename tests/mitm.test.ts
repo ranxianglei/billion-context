@@ -8,7 +8,7 @@ import net from "node:net";
 import { once } from "node:events";
 import http from "node:http";
 import { isMitmHost, readMitmUpstream, MITM_UPSTREAM_KEY, setupMitm, noteMitmTlsError, _resetCertRejectionWarningForTest } from "../src/mitm.js";
-import { ensureRootCA, rootCaPath, getSecureContext, _resetForTest } from "../src/ca.js";
+import { ensureRootCA, rootCaPath, getSecureContext, mintHostCert, _resetForTest } from "../src/ca.js";
 import { _resetDiscoveryCacheForTest } from "../src/discover.js";
 
 // isMitmHost now calls discoverMitmDomains(), which reads real client config
@@ -135,6 +135,26 @@ await test("getSecureContext: returns a usable SecureContext", async () => {
         ensureRootCA();
         const ctx = getSecureContext("open.bigmodel.cn");
         assert.ok(ctx, "should return a SecureContext");
+    });
+});
+
+await test("#535: MITM certs satisfy strict OpenSSL 3 chain verification (Python/hermes)", async () => {
+    await withTmpCa(async () => {
+        ensureRootCA();
+        const forge = (await import("node-forge")).default;
+        const root = forge.pki.certificateFromPem(fs.readFileSync(rootCaPath(), "utf8"));
+        const rootBc = root.getExtension("basicConstraints");
+        assert.ok(rootBc, "root has basicConstraints");
+        assert.equal(rootBc.critical, true, "CA basicConstraints must be critical (python OpenSSL 3 rejects otherwise)");
+        const rootSkiHex = root.generateSubjectKeyIdentifier().toHex();
+        assert.match(rootSkiHex, /^[0-9a-f]{40}$/i, "root SKI is a sha1 key id");
+        const leaf = forge.pki.certificateFromPem(mintHostCert("api.openai.com").certPem);
+        const aki = leaf.getExtension("authorityKeyIdentifier");
+        assert.ok(aki, "leaf has authorityKeyIdentifier (python OpenSSL 3 rejects without)");
+        assert.ok(aki.value.includes(forge.util.hexToBytes(rootSkiHex)), "leaf AKI carries the root SKI (forge keeps parsed AKI as raw DER)");
+        assert.ok(leaf.getExtension("subjectKeyIdentifier"), "leaf has subjectKeyIdentifier");
+        const verified = root.verify(leaf);
+        assert.ok(verified, "leaf is really signed by the root");
     });
 });
 

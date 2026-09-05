@@ -155,9 +155,9 @@ and blind-tunnel everything else.
 bili pi                               # launch pi through the proxy — file-free (#535): env + extension registerProvider, real ~/.pi untouched
 bili codex                            # launch codex through the proxy
 bili claude                           # launch claude through the proxy
-bili omp                              # pi-style: MITM env + persistent overlay home (~/.omp/agent-bili, real config untouched)
+bili omp                              # pi-style, file-free (#535): env + extension registerProvider + compaction cancel, real ~/.omp untouched
 bili opencode                         # MITM for HTTPS + temp opencode.json (/bili/ for HTTP) + thin /acp plugin
-bili hermes                           # no MITM possible (certifi CA) — persistent overlay home (~/.hermes-bili), all traffic /bili/
+bili hermes                           # file-free (#535): hermes proxy env (HTTPS_PROXY + HERMES_CA_BUNDLE) — https via CONNECT MITM, http via absolute-form forward proxy; real ~/.hermes untouched
 bili dsh                              # deepseek-harness: built-in deepseek route via DEEPSEEK_BASE_URL + overlay DSH_HOME (~/.dsh-bili), all traffic /bili/, native /acp command injected via --patch
 bili pi --mitm-domain api.foo.com     # add a domain to the MITM whitelist
 ```

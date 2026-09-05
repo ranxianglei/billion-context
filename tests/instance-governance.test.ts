@@ -16,7 +16,7 @@ import {
 } from "../src/instance.ts";
 import { resolveProxyOrigin } from "../src/mcp.ts";
 import { loadConversations, recordPluginSession, flushConversations } from "../src/plugin.ts";
-import { unpackDeadProxyUrlsInFile, liveProxyPorts, prepareOmpHttpRewrite } from "../src/launcher.ts";
+import { unpackDeadProxyUrlsInFile, liveProxyPorts, prepareDshHome } from "../src/launcher.ts";
 import { pluginInstall } from "../src/plugin-install.ts";
 import { setLogCapture } from "../src/logger.ts";
 
@@ -207,20 +207,20 @@ test("unpackDeadProxyUrlsInFile: dead-origin wraps unpacked, live-origin wraps k
     }
 });
 
-test("omp overlay: nested generated models.yml is never promoted into the real home (#410)", () => {
-    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-omp-nest-"));
+test("dsh overlay: nested generated settings.yaml is never promoted into the real home (#410)", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-nest-"));
     const overlay = `${home}-bili`;
-    fs.writeFileSync(path.join(home, "models.yml"), ["providers:", "  a:", "    baseUrl: http://example.com/v1"].join("\n"));
+    fs.writeFileSync(path.join(home, "settings.yaml"), ["llm-pi-ai:", "  providers:", "    a:", "      baseURL: http://example.com/v1"].join("\n"));
     fs.mkdirSync(path.join(home, "sessions"), { recursive: true });
     fs.mkdirSync(path.join(overlay, "sessions"), { recursive: true });
-    fs.writeFileSync(path.join(overlay, "sessions", "models.yml"), "providers:\n  poisoned:\n    baseUrl: http://127.0.0.1:8787/bili/http://evil.example.com/v1\n");
+    fs.writeFileSync(path.join(overlay, "sessions", "settings.yaml"), "llm-pi-ai:\n  providers:\n    poisoned:\n      baseURL: http://127.0.0.1:8787/bili/http://evil.example.com/v1\n");
     let tmp: string | undefined;
     try {
-        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", [{ key: "a", realUpstream: "http://example.com/v1" }], []);
+        tmp = prepareDshHome(home, "http://127.0.0.1:8787", [{ key: "dsh-1", realUpstream: "http://example.com/v1" }]);
         assert.ok(tmp);
-        assert.equal(fs.existsSync(path.join(home, "sessions", "models.yml")), false, "nested generated file NOT promoted");
-        const real = fs.readFileSync(path.join(home, "models.yml"), "utf8");
-        assert.ok(!real.includes("poisoned"), "real models.yml clean");
+        assert.equal(fs.existsSync(path.join(home, "sessions", "settings.yaml")), false, "nested generated file NOT promoted");
+        const real = fs.readFileSync(path.join(home, "settings.yaml"), "utf8");
+        assert.ok(!real.includes("poisoned"), "real settings.yaml clean");
     } finally {
         if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
         fs.rmSync(home, { recursive: true, force: true });

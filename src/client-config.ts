@@ -387,6 +387,7 @@ export function readOmpConfig(ompHome: string): OmpConfig {
  *  launcher route discovery. */
 export function parseHermesYaml(text: string): HermesConfig {
     const result: HermesConfig = { providers: {} };
+    const candidates = new Map<string, string>();
     type Mode = "none" | "dict" | "list";
     let mode: Mode = "none";
     let sectionIndent = -1;
@@ -433,8 +434,10 @@ export function parseHermesYaml(text: string): HermesConfig {
                 current = m ? m[1] : null;
                 if (current && !result.providers[current]) result.providers[current] = {};
             } else if (indent > entryIndent && current) {
-                const apiMatch = /^api:\s*(\S+)/.exec(trimmed);
-                if (apiMatch) result.providers[current].api = apiMatch[1];
+                // hermes accepts base_url / url / api (priority order) — collect
+                // all and resolve after the scan.
+                const apiMatch = /^(base_url|url|api):\s*(\S+)/.exec(trimmed);
+                if (apiMatch) candidates.set(`${current}\u0000${apiMatch[1]}`, apiMatch[2]);
             }
         } else {
             // Legacy list: "- name: x" opens an entry; nested base_url/api/url lines.
@@ -451,6 +454,10 @@ export function parseHermesYaml(text: string): HermesConfig {
                 if (urlMatch) result.providers[current].api = urlMatch[1];
             }
         }
+    }
+    for (const name of Object.keys(result.providers)) {
+        const pick = candidates.get(`${name}\u0000base_url`) ?? candidates.get(`${name}\u0000url`) ?? candidates.get(`${name}\u0000api`);
+        if (pick !== undefined) result.providers[name].api = pick;
     }
     return result;
 }

@@ -86,9 +86,9 @@ npm install -g billion-context
 bili pi                               # 拉起 pi,走代理 —— file-free(#535):环境变量 + 扩展 registerProvider,真实 ~/.pi 不动
 bili codex                            # 拉起 codex
 bili claude                           # 拉起 claude
-bili omp                              # pi 同款 MITM 环境变量 + 隔离临时 models.yml
+bili omp                              # pi 同款,file-free(#535):环境变量 + 扩展 registerProvider + 压缩取消,真实 ~/.omp 不动
 bili opencode                         # HTTPS 走 MITM + 临时 opencode.json(HTTP 走 /bili/)+ 轻量 /acp 插件
-bili hermes                           # 无法 MITM(certifi CA)—— 隔离 HERMES_HOME,全部流量 /bili/
+bili hermes                           # file-free(#535):hermes 代理环境变量(HTTPS_PROXY + HERMES_CA_BUNDLE)—— https 走 CONNECT MITM,http 走绝对形式转发;真实 ~/.hermes 不动
 bili dsh                              # deepseek-harness:内置 deepseek 路由走 DEEPSEEK_BASE_URL + 隔离 DSH_HOME(~/.dsh-bili),全部流量 /bili/,经 --patch 注入原生 /acp 命令
 bili pi --mitm-domain api.foo.com     # 向 MITM 白名单追加域名
 ```

@@ -20,7 +20,6 @@ import {
     buildCodexEnv,
     buildClaudeEnv,
     buildCodexArgs,
-    prepareOmpHttpRewrite,
     prepareOpencodeHttpRewrite,
     stripInheritedProxy,
     resolvePiHome,
@@ -37,8 +36,6 @@ import {
     parseHermesYaml,
     readHermesConfig,
     resolveHermesHome,
-    prepareHermesHome,
-    writeHermesIdentityPlugin,
     parseDshSettingsYaml,
     readDshConfig,
     resolveDshHome,
@@ -463,6 +460,157 @@ test("runLaunch pi #535: refuses launch when http rewrites needed and extension 
     }
 });
 
+test("runLaunch omp #535: refuses launch when http rewrites needed and extension cannot load; no overlay files written", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-omprefuse-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevClientBin = process.env.BILI_CLIENT_BIN;
+    const prevOmpDir = process.env.PI_CODING_AGENT_DIR;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    delete process.env.PI_CODING_AGENT_DIR;
+    process.env.BILI_CLIENT_BIN = path.join(home, "fake-omp");
+    fs.writeFileSync(process.env.BILI_CLIENT_BIN, "");
+    const ompHome = path.join(home, ".omp", "agent");
+    fs.mkdirSync(ompHome, { recursive: true });
+    fs.writeFileSync(path.join(ompHome, "models.yml"), "providers:\n  glm:\n    baseUrl: http://127.0.0.1:8199/v1\n");
+
+    const root = selfPackageRoot();
+    const distAgent = path.join(root, "dist", "agent", "omp.js");
+    const distBackup = `${distAgent}.bak-test`;
+    const distExisted = fs.existsSync(distAgent);
+    if (distExisted) fs.renameSync(distAgent, distBackup);
+
+    const clientArgsSeen: string[][] = [];
+    const spawnImpl: SpawnFn = (cmd, args) => {
+        if (cmd === process.env.BILI_CLIENT_BIN) {
+            clientArgsSeen.push([...args]);
+            const child = makeFakeChild(0);
+            const orig = child.on.bind(child);
+            (child as { on: SpawnChild["on"] }).on = (event, listener) => {
+                orig(event, listener);
+                if (event === "exit") setTimeout(() => listener(0, null), 0);
+                return child;
+            };
+            return child;
+        }
+        return makeFakeChild(42422);
+    };
+    const prevExit = process.exit;
+    const exitCalls: number[] = [];
+    process.exit = ((code?: number) => {
+        exitCalls.push(code ?? 0);
+        return undefined as never;
+    }) as typeof process.exit;
+    try {
+        // no dist file, no installed config.yml entry → refuse BEFORE spawning
+        // anything (no proxy child, no client)
+        await assert.rejects(
+            runLaunch({ client: "omp", clientArgs: [], overrides: {} }, { fetchImpl: async () => ({ ok: true }), spawnImpl, sleep: () => Promise.resolve() }),
+            /omp needs provider URL rewrites but the bili extension cannot load/,
+        );
+        assert.equal(clientArgsSeen.length, 0);
+        assert.equal(fs.existsSync(`${ompHome}-bili`), false, "no omp overlay dir");
+
+        // plugin entry in config.yml (existing file) → extension loadable → launch proceeds
+        const otherInstall = path.join(home, "other-install", "dist", "agent", "omp.js");
+        fs.mkdirSync(path.dirname(otherInstall), { recursive: true });
+        fs.writeFileSync(otherInstall, "");
+        fs.writeFileSync(path.join(ompHome, "config.yml"), `extensions:\n  - ${otherInstall}\n`);
+        await runLaunch(
+            { client: "omp", clientArgs: [], overrides: {} },
+            { fetchImpl: async () => ({ ok: true }), spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(clientArgsSeen.length, 1);
+        assert.ok(!clientArgsSeen[0].includes("-e"), "installed entry loads the plugin — no -e double load");
+        assert.equal(fs.existsSync(`${ompHome}-bili`), false, "still no overlay dir");
+        assert.deepEqual(exitCalls, [0]);
+    } finally {
+        process.exit = prevExit;
+        if (prevClientBin === undefined) delete process.env.BILI_CLIENT_BIN;
+        else process.env.BILI_CLIENT_BIN = prevClientBin;
+        process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        if (prevOmpDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+        else process.env.PI_CODING_AGENT_DIR = prevOmpDir;
+        if (distExisted) fs.renameSync(distBackup, distAgent);
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("runLaunch hermes #535: proxy env routing, no HERMES_HOME overlay, real config untouched", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-hermesenv-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevHermesHome = process.env.HERMES_HOME;
+    const prevHttpsProxy = process.env.HTTPS_PROXY;
+    const prevClientBin = process.env.BILI_CLIENT_BIN;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    delete process.env.HTTPS_PROXY;
+    const fakeHermes = path.join(home, "fake-hermes");
+    fs.writeFileSync(fakeHermes, "");
+    process.env.BILI_CLIENT_BIN = fakeHermes;
+    const hermesHome = path.join(home, ".hermes");
+    fs.mkdirSync(hermesHome, { recursive: true });
+    fs.writeFileSync(
+        path.join(hermesHome, "config.yaml"),
+        "providers:\n  sglang:\n    api: http://127.0.0.1:8199/v1\n",
+    );
+    // Custom real home: a user-set HERMES_HOME points at their actual hermes
+    // install (discovery resolved the same path) and must survive to the child.
+    process.env.HERMES_HOME = hermesHome;
+    const configStat = fs.statSync(path.join(hermesHome, "config.yaml"));
+
+    let childEnv: NodeJS.ProcessEnv | undefined;
+    const spawnImpl: SpawnFn = (cmd, _args, options) => {
+        if (cmd === fakeHermes) {
+            childEnv = options.env;
+            const child = makeFakeChild(0);
+            const orig = child.on.bind(child);
+            (child as { on: SpawnChild["on"] }).on = (event, listener) => {
+                orig(event, listener);
+                if (event === "exit") setTimeout(() => listener(0, null), 0);
+                return child;
+            };
+            return child;
+        }
+        return makeFakeChild(42422);
+    };
+    const prevExit = process.exit;
+    const exitCalls: number[] = [];
+    process.exit = ((code?: number) => {
+        exitCalls.push(code ?? 0);
+        return undefined as never;
+    }) as typeof process.exit;
+    try {
+        await runLaunch(
+            { client: "hermes", clientArgs: [], overrides: {} },
+            { fetchImpl: async () => ({ ok: true }), spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.deepEqual(exitCalls, [0]);
+        assert.ok(childEnv, "client spawned");
+        assert.match(childEnv!.HTTPS_PROXY ?? "", /^http:\/\/127\.0\.0\.1:\d+$/);
+        assert.ok(childEnv!.HERMES_CA_BUNDLE, "CA bundle exported");
+        assert.equal(childEnv!.HERMES_HOME, hermesHome, "user-set real home survives to the child");
+        assert.equal(fs.existsSync(`${hermesHome}-bili`), false, "no hermes overlay dir");
+        const after = fs.statSync(path.join(hermesHome, "config.yaml"));
+        assert.equal(after.mtimeMs, configStat.mtimeMs, "real config.yaml untouched");
+    } finally {
+        process.exit = prevExit;
+        if (prevClientBin === undefined) delete process.env.BILI_CLIENT_BIN;
+        else process.env.BILI_CLIENT_BIN = prevClientBin;
+        if (prevHermesHome === undefined) delete process.env.HERMES_HOME;
+        else process.env.HERMES_HOME = prevHermesHome;
+        if (prevHttpsProxy === undefined) delete process.env.HTTPS_PROXY;
+        else process.env.HTTPS_PROXY = prevHttpsProxy;
+        process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
 test("runLaunch pi #535: refuses launch when ONLY https (hand-wrapped) rewrites needed and extension cannot load", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-pirefuse2-"));
     const prevHome = process.env.HOME;
@@ -1086,21 +1234,6 @@ test("buildPiEnv: no rewrites → no manifest env", () => {
     assert.equal(env.BILI_PROVIDER_REWRITES, undefined);
 });
 
-test("buildPiEnv: https rewrites merge RAW values (hand-wrapped baseUrl repointed onto cert-MITM)", () => {
-    const env = buildPiEnv(
-        "http://127.0.0.1:8787",
-        "/tmp/ca.pem",
-        { PATH: "/usr/bin" },
-        [{ key: "httpProv", realUpstream: "http://example.com/v1" }],
-        [{ key: "httpsProv", realUpstream: "https://api.openai.com/v1" }],
-    );
-    const manifest = JSON.parse(env.BILI_PROVIDER_REWRITES ?? "null");
-    assert.deepEqual(manifest, {
-        httpProv: "http://127.0.0.1:8787/bili/http://example.com/v1",
-        httpsProv: "https://api.openai.com/v1",
-    });
-});
-
 test("buildPiEnv: empty-key/empty-upstream entries skipped", () => {
     const env = buildPiEnv("http://127.0.0.1:8787", "/tmp/ca.pem", { PATH: "/usr/bin" }, [
         { key: "", realUpstream: "http://example.com/v1" },
@@ -1123,10 +1256,12 @@ test("stripInheritedProxy: removes generic proxy redirector vars, keeps the rest
         PATH: "/usr/bin",
         HOME: "/home/dog",
     });
-    for (const k of ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"]) {
+    for (const k of ["http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "no_proxy", "NO_PROXY"]) {
         assert.equal(cleaned[k], undefined, `${k} should be stripped`);
     }
-    assert.equal(cleaned.no_proxy, "127.0.0.1", "no_proxy kept");
+    // #535: no_proxy/NO_PROXY are stripped too — an inherited exclusion list
+    // could punch holes in the proxy routing we inject (hermes/httpx honors
+    // no_proxy per-URL).
     assert.equal(cleaned.BILI_UPSTREAM_PROXY, "http://relay:9999", "BILI_UPSTREAM_PROXY kept (explicit chaining)");
     assert.equal(cleaned.PATH, "/usr/bin", "PATH kept");
     assert.equal(cleaned.HOME, "/home/dog", "HOME kept");
@@ -1198,539 +1333,6 @@ test("discoverRoutes: omp http + https providers → splits httpsDomains + httpR
     assert.deepEqual(routes.httpRewrites, [
         { key: "sglang", realUpstream: "http://127.0.0.1:8199/v1" },
     ]);
-});
-
-test("prepareOmpHttpRewrite: rewrites matching provider, leaves others, symlinks siblings", () => {
-    // realpath: on macOS os.tmpdir() is /var/folders (a symlink to /private/var);
-    // the realpathSync asserts below compare canonical forms on both sides.
-    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-")));
-    fs.writeFileSync(
-        path.join(home, "models.yml"),
-        [
-            "providers:",
-            "  a:",
-            "    baseUrl: http://example.com/v1",
-            "  b:",
-            "    baseUrl: https://secure.example.com",
-        ].join("\n"),
-    );
-    fs.writeFileSync(path.join(home, "config.yml"), "extensions:\n  - /x/omp.js\n");
-    fs.writeFileSync(path.join(home, "auth.json"), '{"key":"x"}');
-    const tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", [
-        { key: "a", realUpstream: "http://example.com/v1" },
-    ], []);
-    try {
-        assert.equal(tmp, `${home}-bili`);
-        const out = fs.readFileSync(path.join(tmp!, "models.yml"), "utf8");
-        assert.ok(out.includes("baseUrl: http://127.0.0.1:8787/bili/http://example.com/v1"), "a rewritten");
-        assert.ok(out.includes("baseUrl: https://secure.example.com"), "b unchanged");
-        assert.equal(fs.lstatSync(path.join(tmp!, "auth.json")).isSymbolicLink(), true, "sibling symlinked");
-        assert.equal(fs.realpathSync(path.join(tmp!, "auth.json")), path.join(home, "auth.json"));
-        assert.equal(fs.lstatSync(path.join(tmp!, "config.yml")).isSymbolicLink(), false, "config.yml generated, not symlinked");
-        const cfg = fs.readFileSync(path.join(tmp!, "config.yml"), "utf8");
-        assert.ok(cfg.includes("extensions:"), "config.yml preserves other keys");
-        assert.ok(cfg.includes("compaction:"), "config.yml has compaction block");
-        assert.ok(cfg.includes("enabled: false"), "omp native compaction disabled");
-    } finally {
-        if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
-        fs.rmSync(home, { recursive: true, force: true });
-    }
-});
-
-test("prepareOmpHttpRewrite: non-existent home → undefined", () => {
-    assert.equal(prepareOmpHttpRewrite("/nonexistent-bili-omp-home-xyz", "http://127.0.0.1:8787", [], []), undefined);
-});
-
-test("prepareOmpHttpRewrite: no rewrites → overlay built, omp native compaction disabled, models.yml copied verbatim", () => {
-    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-")));
-    fs.writeFileSync(path.join(home, "models.yml"), "providers:\n  a:\n    baseUrl: https://keep.example.com\n");
-    try {
-        const overlay = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", [], []);
-        assert.ok(typeof overlay === "string" && overlay.length > 0);
-        const cfg = fs.readFileSync(path.join(overlay!, "config.yml"), "utf8");
-        assert.ok(cfg.includes("enabled: false"), "omp native compaction disabled");
-        const out = fs.readFileSync(path.join(overlay!, "models.yml"), "utf8");
-        assert.ok(out.includes("baseUrl: https://keep.example.com"), "no rewrite → baseUrl untouched");
-    } finally {
-        fs.rmSync(home, { recursive: true, force: true });
-        fs.rmSync(`${home}-bili`, { recursive: true, force: true });
-    }
-});
-
-test("prepareOmpHttpRewrite: preserves other config.yml keys, disables only compaction", () => {
-    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-")));
-    fs.writeFileSync(path.join(home, "config.yml"), "theme: dark\nmodel: omp/large\nextensions:\n  - /x/omp.js\n");
-    try {
-        const overlay = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", [], []);
-        assert.ok(typeof overlay === "string");
-        const cfg = fs.readFileSync(path.join(overlay!, "config.yml"), "utf8");
-        assert.ok(cfg.includes("theme: dark"), "theme preserved");
-        assert.ok(cfg.includes("model: omp/large"), "model preserved");
-        assert.ok(cfg.includes("extensions:"), "extensions preserved");
-        assert.ok(cfg.includes("compaction:"), "compaction block added");
-        assert.ok(cfg.includes("enabled: false"), "compaction disabled");
-    } finally {
-        fs.rmSync(home, { recursive: true, force: true });
-        fs.rmSync(`${home}-bili`, { recursive: true, force: true });
-    }
-});
-
-test("prepareOmpHttpRewrite: existing compaction block → enabled overridden to false, other compaction keys preserved", () => {
-    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-")));
-    fs.writeFileSync(path.join(home, "config.yml"), "theme: dark\ncompaction:\n  enabled: true\n  reserveTokens: 8000\n");
-    try {
-        const overlay = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", [], []);
-        assert.ok(typeof overlay === "string");
-        const cfg = fs.readFileSync(path.join(overlay!, "config.yml"), "utf8");
-        assert.ok(cfg.includes("theme: dark"), "theme preserved");
-        assert.ok(cfg.includes("enabled: false"), "enabled overridden to false");
-        assert.ok(!cfg.includes("enabled: true"), "old enabled: true gone");
-        assert.ok(cfg.includes("reserveTokens: 8000"), "other compaction keys preserved");
-    } finally {
-        fs.rmSync(home, { recursive: true, force: true });
-        fs.rmSync(`${home}-bili`, { recursive: true, force: true });
-    }
-});
-
-test("prepareOmpHttpRewrite: legacy settings.json (no config.yml) → config.yml generated from it, compaction disabled", () => {
-    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-")));
-    fs.writeFileSync(path.join(home, "settings.json"), JSON.stringify({ theme: "dark", compaction: { reserveTokens: 1234 } }));
-    try {
-        const overlay = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", [], []);
-        assert.ok(typeof overlay === "string");
-        const cfg = fs.readFileSync(path.join(overlay!, "config.yml"), "utf8");
-        const parsed = JSON.parse(cfg);
-        assert.equal(parsed.compaction.enabled, false, "compaction disabled");
-        assert.equal(parsed.compaction.reserveTokens, 1234, "other compaction keys preserved");
-        assert.equal(parsed.theme, "dark", "theme preserved");
-    } finally {
-        fs.rmSync(home, { recursive: true, force: true });
-        fs.rmSync(`${home}-bili`, { recursive: true, force: true });
-    }
-});
-
-test("prepareOmpHttpRewrite: overlay is stable, refreshes symlinks, keeps bili-created entries", () => {
-    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-"));
-    const modelsYml = ["providers:", "  a:", "    baseUrl: http://example.com/v1"].join("\n");
-    fs.writeFileSync(path.join(home, "models.yml"), modelsYml);
-    fs.mkdirSync(path.join(home, "sessions"));
-    const rw = [{ key: "a", realUpstream: "http://example.com/v1" }];
-    let tmp: string | undefined;
-    try {
-        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
-        assert.equal(tmp, `${home}-bili`);
-        assert.equal(fs.lstatSync(path.join(tmp!, "sessions")).isSymbolicLink(), true);
-        fs.writeFileSync(path.join(tmp!, "agent.db"), "state-created-inside-overlay");
-        const tmp2 = prepareOmpHttpRewrite(home, "http://127.0.0.1:9999", rw, []);
-        assert.equal(tmp2, tmp);
-        assert.equal(fs.readFileSync(path.join(tmp!, "agent.db"), "utf8"), "state-created-inside-overlay");
-        const rewritten = fs.readFileSync(path.join(tmp!, "models.yml"), "utf8");
-        assert.ok(rewritten.includes("baseUrl: http://127.0.0.1:9999/bili/http://example.com/v1"), "port updated");
-        fs.mkdirSync(path.join(home, "memories"));
-        const tmp3 = prepareOmpHttpRewrite(home, "http://127.0.0.1:9999", rw, []);
-        assert.equal(tmp3, tmp);
-        assert.equal(fs.lstatSync(path.join(tmp!, "memories")).isSymbolicLink(), true);
-        const leftovers = fs.readdirSync(tmp!).filter((f) => /^\.models\.yml\.\d+\.tmp$/.test(f));
-        assert.deepEqual(leftovers, [], "no leftover models.yml tmp files");
-    } finally {
-        if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
-        fs.rmSync(home, { recursive: true, force: true });
-    }
-});
-
-test("prepareOmpHttpRewrite: drops dead symlinks and merges shadowed dirs into real home", () => {
-    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-"));
-    const modelsYml = ["providers:", "  a:", "    baseUrl: http://example.com/v1"].join("\n");
-    fs.writeFileSync(path.join(home, "models.yml"), modelsYml);
-    fs.mkdirSync(path.join(home, "sessions"));
-    const rw = [{ key: "a", realUpstream: "http://example.com/v1" }];
-    const overlay = `${home}-bili`;
-    let tmp: string | undefined;
-    try {
-        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
-        fs.symlinkSync(path.join(home, "gone-entry"), path.join(overlay, "gone-entry"));
-        fs.rmSync(path.join(overlay, "sessions"));
-        fs.mkdirSync(path.join(overlay, "sessions"));
-        fs.writeFileSync(path.join(overlay, "sessions", "orphaned.jsonl"), "session-created-under-bili");
-        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
-        assert.equal(fs.existsSync(path.join(overlay, "gone-entry")), false, "dead symlink dropped");
-        assert.equal(fs.lstatSync(path.join(overlay, "sessions")).isSymbolicLink(), true, "shadow dir re-linked");
-        assert.equal(
-            fs.readFileSync(path.join(home, "sessions", "orphaned.jsonl"), "utf8"),
-            "session-created-under-bili",
-            "shadow dir merged into real home",
-        );
-    } finally {
-        if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
-        fs.rmSync(home, { recursive: true, force: true });
-    }
-});
-
-test("prepareOmpHttpRewrite: shadow FILE merged newer-wins, loser kept as .bili-conflict", () => {
-    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-"));
-    const modelsYml = ["providers:", "  a:", "    baseUrl: http://example.com/v1"].join("\n");
-    fs.writeFileSync(path.join(home, "models.yml"), modelsYml);
-    fs.writeFileSync(path.join(home, "settings.json"), "stale-from-real-home");
-    fs.writeFileSync(path.join(home, "older.json"), "real-newer");
-    const rw = [{ key: "a", realUpstream: "http://example.com/v1" }];
-    const overlay = `${home}-bili`;
-    let tmp: string | undefined;
-    try {
-        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
-        assert.equal(fs.readFileSync(path.join(overlay, ".bili-launch.pid"), "utf8").trim(), `${process.pid}`, "launch pid marker written");
-        fs.rmSync(path.join(overlay, "settings.json"));
-        fs.writeFileSync(path.join(overlay, "settings.json"), "client-newer-write");
-        const now = Date.now();
-        fs.utimesSync(path.join(home, "settings.json"), new Date(now - 4000), new Date(now - 4000));
-        fs.rmSync(path.join(overlay, "older.json"));
-        fs.writeFileSync(path.join(overlay, "older.json"), "overlay-stale");
-        fs.utimesSync(path.join(overlay, "older.json"), new Date(now - 4000), new Date(now - 4000));
-        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
-        assert.equal(fs.readFileSync(path.join(home, "settings.json"), "utf8"), "client-newer-write", "newer overlay file wins");
-        assert.equal(fs.readFileSync(path.join(home, "settings.json.bili-conflict"), "utf8"), "stale-from-real-home", "loser preserved as conflict copy");
-        assert.equal(fs.lstatSync(path.join(overlay, "settings.json")).isSymbolicLink(), true, "shadow file re-linked");
-        assert.equal(fs.readFileSync(path.join(home, "older.json"), "utf8"), "real-newer", "newer real-home file wins");
-        assert.equal(fs.readFileSync(path.join(home, "older.json.bili-conflict"), "utf8"), "overlay-stale", "stale overlay copy preserved as conflict");
-        assert.equal(fs.lstatSync(path.join(overlay, "older.json")).isSymbolicLink(), true, "re-linked after merge");
-    } finally {
-        if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
-        fs.rmSync(home, { recursive: true, force: true });
-    }
-});
-
-test("prepareOmpHttpRewrite: recursive dir merge keeps deep new files when both sides share a subdir", () => {
-    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-"));
-    const modelsYml = ["providers:", "  a:", "    baseUrl: http://example.com/v1"].join("\n");
-    fs.writeFileSync(path.join(home, "models.yml"), modelsYml);
-    fs.mkdirSync(path.join(home, "sessions", "sub"), { recursive: true });
-    fs.writeFileSync(path.join(home, "sessions", "sub", "old.jsonl"), "old");
-    const rw = [{ key: "a", realUpstream: "http://example.com/v1" }];
-    const overlay = `${home}-bili`;
-    let tmp: string | undefined;
-    try {
-        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
-        fs.rmSync(path.join(overlay, "sessions"));
-        fs.mkdirSync(path.join(overlay, "sessions", "sub"), { recursive: true });
-        fs.writeFileSync(path.join(overlay, "sessions", "sub", "new.jsonl"), "deep-new-session");
-        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
-        assert.equal(fs.readFileSync(path.join(home, "sessions", "sub", "old.jsonl"), "utf8"), "old", "existing deep file untouched");
-        assert.equal(fs.readFileSync(path.join(home, "sessions", "sub", "new.jsonl"), "utf8"), "deep-new-session", "deep new file merged, not destroyed");
-        assert.equal(fs.lstatSync(path.join(overlay, "sessions")).isSymbolicLink(), true, "shadow dir re-linked");
-    } finally {
-        if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
-        fs.rmSync(home, { recursive: true, force: true });
-    }
-});
-
-test("prepareOmpHttpRewrite: file-vs-dir type clash preserves both sides", () => {
-    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-"));
-    const modelsYml = ["providers:", "  a:", "    baseUrl: http://example.com/v1"].join("\n");
-    fs.writeFileSync(path.join(home, "models.yml"), modelsYml);
-    fs.writeFileSync(path.join(home, "state.bin"), "v1-file");
-    const rw = [{ key: "a", realUpstream: "http://example.com/v1" }];
-    const overlay = `${home}-bili`;
-    let tmp: string | undefined;
-    try {
-        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
-        fs.rmSync(path.join(overlay, "state.bin"));
-        fs.mkdirSync(path.join(overlay, "state.bin", "x"), { recursive: true });
-        fs.writeFileSync(path.join(overlay, "state.bin", "x", "precious.txt"), "precious");
-        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
-        assert.equal(fs.statSync(path.join(home, "state.bin")).isDirectory(), true, "merged dir took the canonical name");
-        assert.equal(fs.readFileSync(path.join(home, "state.bin", "x", "precious.txt"), "utf8"), "precious", "overlay subtree preserved, not destroyed");
-        assert.equal(fs.readFileSync(path.join(home, "state.bin.bili-conflict"), "utf8"), "v1-file", "displaced real-home file preserved as conflict copy");
-        assert.equal(fs.lstatSync(path.join(overlay, "state.bin")).isSymbolicLink(), true, "re-linked after merge");
-    } finally {
-        if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
-        fs.rmSync(home, { recursive: true, force: true });
-    }
-});
-
-test("prepareOmpHttpRewrite: returns undefined when no rewrites", () => {
-    assert.equal(prepareOmpHttpRewrite("/whatever", "http://127.0.0.1:8787", [], []), undefined);
-});
-
-test("prepareOmpHttpRewrite: models.yml missing → overlay still built (config.yml generated), no models.yml", () => {
-    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-")));
-    try {
-        const rw = [{ key: "a", realUpstream: "http://example.com/v1" }];
-        const overlay = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
-        assert.equal(overlay, `${home}-bili`);
-        assert.equal(fs.existsSync(path.join(overlay!, "config.yml")), true, "config.yml generated");
-        assert.ok(fs.readFileSync(path.join(overlay!, "config.yml"), "utf8").includes("enabled: false"), "omp native compaction disabled");
-        assert.equal(fs.existsSync(path.join(overlay!, "models.yml")), false, "no models.yml copied");
-    } finally {
-        fs.rmSync(home, { recursive: true, force: true });
-        fs.rmSync(`${home}-bili`, { recursive: true, force: true });
-    }
-});
-
-// #381: Windows overlay symlink EPERM fallback. Unprivileged Windows
-// processes lack SeCreateSymbolicLinkPrivilege, so plain symlinkSync throws
-// EPERM and the overlay would be silently hollowed (fresh, unconfigured
-// client every launch). Simulated on Linux by denying fs.symlinkSync for
-// non-junction links (junctions stay allowed).
-function denyErr(code: string): NodeJS.ErrnoException {
-    const err = new Error(`${code}: operation not permitted`) as NodeJS.ErrnoException;
-    err.code = code;
-    return err;
-}
-
-test("prepareOmpHttpRewrite: EPERM fallback links dir→junction, file→hardlink, overlay not hollow (#381)", () => {
-    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-")));
-    fs.writeFileSync(path.join(home, "models.yml"), ["providers:", "  a:", "    baseUrl: http://example.com/v1"].join("\n"));
-    fs.mkdirSync(path.join(home, "sessions"));
-    fs.writeFileSync(path.join(home, "settings.json"), "real-settings");
-    const rw = [{ key: "a", realUpstream: "http://example.com/v1" }];
-    const realSymlinkSync = fs.symlinkSync;
-    fs.symlinkSync = ((target: PathLike, link: PathLike, type?: SymlinkKind) => {
-        if (type === "junction") return realSymlinkSync(target, link, "junction");
-        throw denyErr("EPERM");
-    }) as typeof fs.symlinkSync;
-    let tmp: string | undefined;
-    try {
-        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
-        assert.equal(tmp, `${home}-bili`, "overlay returned, not hollow");
-        const overlay = tmp!;
-        assert.equal(fs.lstatSync(path.join(overlay, "sessions")).isSymbolicLink(), true, "dir linked via junction");
-        assert.equal(fs.realpathSync(path.join(overlay, "sessions")), path.join(home, "sessions"), "junction points at real dir");
-        const st = fs.lstatSync(path.join(overlay, "settings.json"));
-        const realSt = fs.lstatSync(path.join(home, "settings.json"));
-        assert.equal(st.isSymbolicLink(), false, "file is a hardlink, not a symlink");
-        assert.equal(st.nlink, 2, "hardlink has nlink 2");
-        assert.ok(st.dev === realSt.dev && st.ino === realSt.ino, "hardlink shares inode with real file");
-    } finally {
-        fs.symlinkSync = realSymlinkSync;
-        if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
-        fs.rmSync(home, { recursive: true, force: true });
-    }
-});
-
-test("prepareOmpHttpRewrite: EPERM fallback copies file when hardlink also denied (#381)", () => {
-    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-")));
-    fs.writeFileSync(path.join(home, "models.yml"), ["providers:", "  a:", "    baseUrl: http://example.com/v1"].join("\n"));
-    fs.writeFileSync(path.join(home, "settings.json"), "real-settings");
-    const rw = [{ key: "a", realUpstream: "http://example.com/v1" }];
-    const realSymlinkSync = fs.symlinkSync;
-    const realLinkSync = fs.linkSync;
-    fs.symlinkSync = ((target: PathLike, link: PathLike, type?: SymlinkKind) => {
-        if (type === "junction") return realSymlinkSync(target, link, "junction");
-        throw denyErr("EPERM");
-    }) as typeof fs.symlinkSync;
-    fs.linkSync = (() => { throw denyErr("EPERM"); }) as typeof fs.linkSync;
-    let tmp: string | undefined;
-    try {
-        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
-        assert.equal(tmp, `${home}-bili`);
-        const st = fs.lstatSync(path.join(tmp!, "settings.json"));
-        assert.equal(st.isSymbolicLink(), false, "file is a copy, not a symlink");
-        assert.equal(st.nlink, 1, "copy has nlink 1 (not a hardlink)");
-        assert.equal(fs.readFileSync(path.join(tmp!, "settings.json"), "utf8"), "real-settings", "copy content matches");
-    } finally {
-        fs.symlinkSync = realSymlinkSync;
-        fs.linkSync = realLinkSync;
-        if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
-        fs.rmSync(home, { recursive: true, force: true });
-    }
-});
-
-test("prepareOmpHttpRewrite: all link fallbacks fail → hollow overlay → returns undefined (#381)", () => {
-    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-")));
-    fs.writeFileSync(path.join(home, "models.yml"), ["providers:", "  a:", "    baseUrl: http://example.com/v1"].join("\n"));
-    fs.mkdirSync(path.join(home, "sessions"));
-    fs.writeFileSync(path.join(home, "settings.json"), "real-settings");
-    const rw = [{ key: "a", realUpstream: "http://example.com/v1" }];
-    const realSymlinkSync = fs.symlinkSync;
-    const realLinkSync = fs.linkSync;
-    const realCopyFileSync = fs.copyFileSync;
-    fs.symlinkSync = (() => { throw denyErr("EPERM"); }) as typeof fs.symlinkSync;
-    fs.linkSync = (() => { throw denyErr("EPERM"); }) as typeof fs.linkSync;
-    fs.copyFileSync = (() => { throw denyErr("EPERM"); }) as typeof fs.copyFileSync;
-    try {
-        const tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
-        assert.equal(tmp, undefined, "hollow overlay → undefined (fail loudly, not silent)");
-    } finally {
-        fs.symlinkSync = realSymlinkSync;
-        fs.linkSync = realLinkSync;
-        fs.copyFileSync = realCopyFileSync;
-        fs.rmSync(`${home}-bili`, { recursive: true, force: true });
-        fs.rmSync(home, { recursive: true, force: true });
-    }
-});
-
-test("prepareOmpHttpRewrite: SQLite three-piece set (.db/.db-wal/.db-shm) moves as a unit (#381)", () => {
-    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-")));
-    fs.writeFileSync(path.join(home, "models.yml"), ["providers:", "  a:", "    baseUrl: http://example.com/v1"].join("\n"));
-    const rw = [{ key: "a", realUpstream: "http://example.com/v1" }];
-    const overlay = `${home}-bili`;
-    let tmp: string | undefined;
-    try {
-        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
-        assert.equal(tmp, overlay);
-        fs.writeFileSync(path.join(overlay, "agent.db"), "db-content");
-        fs.writeFileSync(path.join(overlay, "agent.db-wal"), "wal-content");
-        fs.writeFileSync(path.join(overlay, "agent.db-shm"), "shm-content");
-        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
-        assert.equal(fs.readFileSync(path.join(home, "agent.db"), "utf8"), "db-content", "db moved to real home");
-        assert.equal(fs.readFileSync(path.join(home, "agent.db-wal"), "utf8"), "wal-content", "wal moved with the db");
-        assert.equal(fs.readFileSync(path.join(home, "agent.db-shm"), "utf8"), "shm-content", "shm moved with the db");
-        assert.equal(fs.existsSync(path.join(overlay, "agent.db")), false, "db left the overlay");
-        assert.equal(fs.existsSync(path.join(overlay, "agent.db-wal")), false, "wal left the overlay");
-        assert.equal(fs.existsSync(path.join(overlay, "agent.db-shm")), false, "shm left the overlay");
-    } finally {
-        if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
-        fs.rmSync(home, { recursive: true, force: true });
-    }
-});
-
-test("prepareOmpHttpRewrite: SQLite set merge failure rolls back, keeps set in overlay (#381)", () => {
-    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-")));
-    fs.writeFileSync(path.join(home, "models.yml"), ["providers:", "  a:", "    baseUrl: http://example.com/v1"].join("\n"));
-    fs.writeFileSync(path.join(home, "agent.db"), "real-original-db");
-    const old = new Date(Date.now() - 60000);
-    fs.utimesSync(path.join(home, "agent.db"), old, old);
-    const rw = [{ key: "a", realUpstream: "http://example.com/v1" }];
-    const overlay = `${home}-bili`;
-    let tmp: string | undefined;
-    const realRenameSync = fs.renameSync;
-    try {
-        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
-        assert.equal(tmp, overlay);
-        fs.rmSync(path.join(overlay, "agent.db"));
-        fs.writeFileSync(path.join(overlay, "agent.db"), "overlay-db");
-        fs.writeFileSync(path.join(overlay, "agent.db-wal"), "overlay-wal");
-        fs.writeFileSync(path.join(overlay, "agent.db-shm"), "overlay-shm");
-        fs.renameSync = ((src: PathLike, dst: PathLike) => {
-            if (String(src).endsWith("agent.db-shm")) throw denyErr("EPERM");
-            return realRenameSync(src, dst);
-        }) as typeof fs.renameSync;
-        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
-        assert.equal(fs.readFileSync(path.join(home, "agent.db"), "utf8"), "real-original-db", "real db restored after rollback");
-        assert.equal(fs.existsSync(path.join(home, "agent.db-wal")), false, "wal rolled back to overlay");
-        assert.equal(fs.existsSync(path.join(home, "agent.db-shm")), false, "shm rolled back to overlay");
-        assert.equal(fs.readFileSync(path.join(overlay, "agent.db"), "utf8"), "overlay-db", "db stays in overlay");
-        assert.equal(fs.readFileSync(path.join(overlay, "agent.db-wal"), "utf8"), "overlay-wal", "wal stays in overlay");
-        assert.equal(fs.readFileSync(path.join(overlay, "agent.db-shm"), "utf8"), "overlay-shm", "shm stays in overlay");
-    } finally {
-        fs.renameSync = realRenameSync;
-        if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
-        fs.rmSync(home, { recursive: true, force: true });
-    }
-});
-
-test("prepareOmpHttpRewrite: write-through hardlink is re-pointed, never merged back (#381)", () => {
-    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-")));
-    fs.writeFileSync(path.join(home, "models.yml"), ["providers:", "  a:", "    baseUrl: http://example.com/v1"].join("\n"));
-    fs.writeFileSync(path.join(home, "settings.json"), "real-settings");
-    const rw = [{ key: "a", realUpstream: "http://example.com/v1" }];
-    const overlay = `${home}-bili`;
-    const realSymlinkSync = fs.symlinkSync;
-    fs.symlinkSync = ((target: PathLike, link: PathLike, type?: SymlinkKind) => {
-        if (type === "junction") return realSymlinkSync(target, link, "junction");
-        throw denyErr("EPERM");
-    }) as typeof fs.symlinkSync;
-    let tmp: string | undefined;
-    try {
-        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
-        assert.equal(tmp, overlay);
-        assert.equal(fs.lstatSync(path.join(overlay, "settings.json")).nlink, 2, "file linked as a hardlink");
-        fs.appendFileSync(path.join(overlay, "settings.json"), "-appended");
-        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
-        assert.equal(fs.readFileSync(path.join(home, "settings.json"), "utf8"), "real-settings-appended", "write-through reached the real file");
-        const st = fs.lstatSync(path.join(overlay, "settings.json"));
-        assert.equal(st.isSymbolicLink(), false, "re-pointed as a hardlink, not a symlink");
-        assert.equal(st.nlink, 2, "still a hardlink after re-point");
-        assert.equal(fs.existsSync(path.join(home, "settings.json.bili-conflict")), false, "not merged (no .bili-conflict)");
-    } finally {
-        fs.symlinkSync = realSymlinkSync;
-        if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
-        fs.rmSync(home, { recursive: true, force: true });
-    }
-});
-
-test("prepareOmpHttpRewrite: SQLite set adjudicated by main db — no cross-side WAL splice (#381)", () => {
-    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-")));
-    fs.writeFileSync(path.join(home, "models.yml"), ["providers:", "  a:", "    baseUrl: http://example.com/v1"].join("\n"));
-    const now = Date.now();
-    fs.writeFileSync(path.join(home, "agent.db"), "real-db");
-    fs.writeFileSync(path.join(home, "agent.db-wal"), "real-wal");
-    const overlay = `${home}-bili`;
-    fs.mkdirSync(overlay);
-    fs.writeFileSync(path.join(overlay, "agent.db"), "overlay-db");
-    fs.writeFileSync(path.join(overlay, "agent.db-wal"), "overlay-wal");
-    // main db: real newer than overlay; wal: overlay newer than real — the
-    // cross-generational splice per-member mtime adjudication would produce.
-    fs.utimesSync(path.join(home, "agent.db"), new Date(now - 10000), new Date(now - 10000));
-    fs.utimesSync(path.join(home, "agent.db-wal"), new Date(now - 50000), new Date(now - 50000));
-    fs.utimesSync(path.join(overlay, "agent.db"), new Date(now - 60000), new Date(now - 60000));
-    fs.utimesSync(path.join(overlay, "agent.db-wal"), new Date(now - 5000), new Date(now - 5000));
-    const rw = [{ key: "a", realUpstream: "http://example.com/v1" }];
-    let tmp: string | undefined;
-    try {
-        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
-        assert.equal(tmp, overlay);
-        assert.equal(fs.readFileSync(path.join(home, "agent.db"), "utf8"), "real-db", "real main db (newer) wins");
-        assert.equal(fs.readFileSync(path.join(home, "agent.db-wal"), "utf8"), "real-wal", "wal comes from the SAME side as the db (no splice)");
-        assert.equal(fs.readFileSync(path.join(home, "agent.db.bili-conflict"), "utf8"), "overlay-db", "losing overlay db preserved");
-        assert.equal(fs.readFileSync(path.join(home, "agent.db-wal.bili-conflict"), "utf8"), "overlay-wal", "losing overlay wal preserved");
-    } finally {
-        if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
-        fs.rmSync(home, { recursive: true, force: true });
-    }
-});
-
-test("prepareOmpHttpRewrite: SQLite -journal sidecar moves with the set, not separately (#381)", () => {
-    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-")));
-    fs.writeFileSync(path.join(home, "models.yml"), ["providers:", "  a:", "    baseUrl: http://example.com/v1"].join("\n"));
-    const now = Date.now();
-    fs.writeFileSync(path.join(home, "agent.db"), "real-db");
-    const overlay = `${home}-bili`;
-    fs.mkdirSync(overlay);
-    fs.writeFileSync(path.join(overlay, "agent.db"), "overlay-db");
-    fs.writeFileSync(path.join(overlay, "agent.db-journal"), "overlay-journal");
-    // real main db newer than overlay's; the overlay journal must NOT be
-    // spliced in as an active file against the real (newer) db.
-    fs.utimesSync(path.join(home, "agent.db"), new Date(now - 10000), new Date(now - 10000));
-    fs.utimesSync(path.join(overlay, "agent.db"), new Date(now - 60000), new Date(now - 60000));
-    fs.utimesSync(path.join(overlay, "agent.db-journal"), new Date(now - 5000), new Date(now - 5000));
-    const rw = [{ key: "a", realUpstream: "http://example.com/v1" }];
-    let tmp: string | undefined;
-    try {
-        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
-        assert.equal(tmp, overlay);
-        assert.equal(fs.readFileSync(path.join(home, "agent.db"), "utf8"), "real-db", "real main db (newer) wins");
-        assert.equal(fs.existsSync(path.join(home, "agent.db-journal")), false, "journal NOT spliced in as an active file");
-        assert.equal(fs.readFileSync(path.join(home, "agent.db-journal.bili-conflict"), "utf8"), "overlay-journal", "journal preserved as a conflict (same side as the losing db)");
-    } finally {
-        if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
-        fs.rmSync(home, { recursive: true, force: true });
-    }
-});
-
-test("prepareOmpHttpRewrite: conflict rename never clobbers a previous round's loser (#381)", () => {
-    const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bili-omphome-")));
-    fs.writeFileSync(path.join(home, "models.yml"), ["providers:", "  a:", "    baseUrl: http://example.com/v1"].join("\n"));
-    const now = Date.now();
-    fs.writeFileSync(path.join(home, "agent.db"), "real-db");
-    fs.writeFileSync(path.join(home, "agent.db.bili-conflict"), "previous-loser");
-    const overlay = `${home}-bili`;
-    fs.mkdirSync(overlay);
-    fs.writeFileSync(path.join(overlay, "agent.db"), "overlay-db-v1");
-    fs.writeFileSync(path.join(overlay, "agent.db-wal"), "overlay-wal-v1");
-    fs.utimesSync(path.join(home, "agent.db"), new Date(now - 10000), new Date(now - 10000));
-    fs.utimesSync(path.join(overlay, "agent.db"), new Date(now - 60000), new Date(now - 60000));
-    const rw = [{ key: "a", realUpstream: "http://example.com/v1" }];
-    let tmp: string | undefined;
-    try {
-        tmp = prepareOmpHttpRewrite(home, "http://127.0.0.1:8787", rw, []);
-        assert.equal(tmp, overlay);
-        assert.equal(fs.readFileSync(path.join(home, "agent.db"), "utf8"), "real-db", "real main db (newer) wins");
-        assert.equal(fs.readFileSync(path.join(home, "agent.db.bili-conflict"), "utf8"), "previous-loser", "previous round's loser NOT overwritten");
-        assert.equal(fs.readFileSync(path.join(home, "agent.db.bili-conflict.1"), "utf8"), "overlay-db-v1", "this round's loser gets a suffixed name");
-    } finally {
-        if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
-        fs.rmSync(home, { recursive: true, force: true });
-    }
 });
 
 test("readOpencodeConfig: reads provider baseURLs from opencode.json", () => {
@@ -1841,6 +1443,28 @@ test("parseHermesYaml: v12 providers dict + legacy custom_providers list", () =>
     assert.equal(legacy.providers["custom-1"]?.api, "http://other:1/v1");
 });
 
+test("parseHermesYaml: v12 dict base_url/url forms + base_url wins over api", () => {
+    const canonical = parseHermesYaml([
+        "providers:",
+        "  bili:",
+        "    name: bili",
+        "    base_url: http://127.0.0.1:8199/v1",
+        "    transport: openai_chat",
+    ].join("\n"));
+    assert.equal(canonical.providers.bili?.api, "http://127.0.0.1:8199/v1", "base_url is hermes' canonical form");
+
+    const urlForm = parseHermesYaml("providers:\n  u:\n    url: http://u:1/v1\n");
+    assert.equal(urlForm.providers.u?.api, "http://u:1/v1");
+
+    const priority = parseHermesYaml([
+        "providers:",
+        "  p:",
+        "    api: http://stale:1/v1",
+        "    base_url: http://fresh:1/v1",
+    ].join("\n"));
+    assert.equal(priority.providers.p?.api, "http://fresh:1/v1", "base_url beats api (hermes priority)");
+});
+
 test("readHermesConfig + resolveHermesHome", () => {
     assert.equal(resolveHermesHome({ HERMES_HOME: "/tmp/hh" }), "/tmp/hh");
     assert.ok(resolveHermesHome({}).endsWith(path.join(".hermes")));
@@ -1855,7 +1479,7 @@ test("readHermesConfig + resolveHermesHome", () => {
     }
 });
 
-test("discoverRoutes: hermes wraps http AND https via /bili/ (no MITM domains)", () => {
+test("discoverRoutes: hermes splits https → MITM domains, http → forward-proxy inventory (#535)", () => {
     const config: ClientConfig = {};
     (config as Record<string, unknown>).hermes = {
         providers: {
@@ -1866,146 +1490,12 @@ test("discoverRoutes: hermes wraps http AND https via /bili/ (no MITM domains)",
         },
     };
     const routes = discoverRoutes("hermes", config);
-    assert.deepEqual(routes.httpsDomains, []);
-    assert.deepEqual(routes.httpRewrites.map((r) => r.key).sort(), ["glm", "sglang", "wrapped"]);
-    const glm = routes.httpRewrites.find((r) => r.key === "glm");
-    assert.equal(glm?.realUpstream, "https://open.bigmodel.cn/api/paas/v4");
-    const wrapped = routes.httpRewrites.find((r) => r.key === "wrapped");
-    assert.equal(wrapped?.realUpstream, "https://api.foo.io/v1");
-});
-
-test("prepareHermesHome: rewrites api lines, shares siblings, never touches the real home", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-home-"));
-    try {
-        fs.writeFileSync(path.join(dir, "config.yaml"), [
-            "model:",
-            "  default: qwen3.8-27b",
-            "providers:",
-            "  bili:",
-            "    api: http://127.0.0.1:8199/v1  # local sglang",
-            "  glm:",
-            "    api: https://open.bigmodel.cn/api/paas/v4",
-            "custom_providers:",
-            "  - name: legacy",
-            "    base_url: http://10.0.0.5:1234/v1",
-        ].join("\n"));
-        fs.writeFileSync(path.join(dir, "SOUL.md"), "soul");
-        fs.mkdirSync(path.join(dir, "skills"));
-        const original = fs.readFileSync(path.join(dir, "config.yaml"), "utf8");
-
-        const rewrites: HttpRewrite[] = [
-            { key: "bili", realUpstream: "http://127.0.0.1:8199/v1" },
-            { key: "glm", realUpstream: "https://open.bigmodel.cn/api/paas/v4" },
-            { key: "legacy", realUpstream: "http://10.0.0.5:1234/v1" },
-        ];
-        const tmp = prepareHermesHome(dir, "http://127.0.0.1:8787", rewrites);
-        assert.ok(tmp);
-        const txt = fs.readFileSync(path.join(tmp, "config.yaml"), "utf8");
-        assert.ok(txt.includes("api: http://127.0.0.1:8787/bili/http://127.0.0.1:8199/v1  # local sglang"));
-        assert.ok(txt.includes("api: http://127.0.0.1:8787/bili/https://open.bigmodel.cn/api/paas/v4"));
-        assert.ok(txt.includes("base_url: http://127.0.0.1:8787/bili/http://10.0.0.5:1234/v1"));
-        assert.equal(fs.readFileSync(path.join(dir, "config.yaml"), "utf8"), original);
-        assert.equal(fs.readFileSync(path.join(tmp, "SOUL.md"), "utf8"), "soul");
-        assert.ok(fs.lstatSync(path.join(tmp, "skills")).isSymbolicLink());
-        fs.rmSync(tmp, { recursive: true, force: true });
-
-        assert.equal(prepareHermesHome(dir, "http://127.0.0.1:8787", []), undefined);
-    } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
-    }
-});
-
-test("prepareHermesHome: preserves CRLF line endings when rewriting", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-home-"));
-    try {
-        fs.writeFileSync(
-            path.join(dir, "config.yaml"),
-            ["model:", "  default: qwen3.8-27b", "providers:", "  bili:", "    api: http://127.0.0.1:8199/v1"].join("\r\n") + "\r\n",
-        );
-        const rewrites: HttpRewrite[] = [{ key: "bili", realUpstream: "http://127.0.0.1:8199/v1" }];
-        const tmp = prepareHermesHome(dir, "http://127.0.0.1:8787", rewrites);
-        assert.ok(tmp);
-        const txt = fs.readFileSync(path.join(tmp, "config.yaml"), "utf8");
-        assert.ok(txt.includes("\r\n"), "CRLF preserved");
-        assert.ok(!/\r\n\r\n/.test(txt), "no doubled newlines");
-        assert.ok(txt.includes("api: http://127.0.0.1:8787/bili/http://127.0.0.1:8199/v1\r"));
-        fs.rmSync(tmp, { recursive: true, force: true });
-    } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
-    }
-});
-
-test("prepareHermesHome: returns undefined for unreadable config even with rewrites pending", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-home-"));
-    try {
-        const rewrites: HttpRewrite[] = [{ key: "bili", realUpstream: "http://127.0.0.1:8199/v1" }];
-        assert.equal(prepareHermesHome(dir, "http://127.0.0.1:8787", rewrites), undefined);
-    } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
-    }
-});
-
-test("prepareHermesHome: rewrites quoted YAML api values (quotes stripped before match)", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-home-"));
-    try {
-        fs.writeFileSync(path.join(dir, "config.yaml"), [
-            "providers:",
-            "  bili:",
-            '    api: "https://api.example.com/v1"',
-            "  glm:",
-            "    api: 'http://10.0.0.5:1234/v1'",
-        ].join("\n"));
-        const rewrites: HttpRewrite[] = [
-            { key: "bili", realUpstream: "https://api.example.com/v1" },
-            { key: "glm", realUpstream: "http://10.0.0.5:1234/v1" },
-        ];
-        const tmp = prepareHermesHome(dir, "http://127.0.0.1:8787", rewrites);
-        assert.ok(tmp, "quoted values must still be rewritten");
-        const txt = fs.readFileSync(path.join(tmp!, "config.yaml"), "utf8");
-        assert.ok(txt.includes("api: http://127.0.0.1:8787/bili/https://api.example.com/v1"));
-        assert.ok(txt.includes("api: http://127.0.0.1:8787/bili/http://10.0.0.5:1234/v1"));
-        fs.rmSync(tmp!, { recursive: true, force: true });
-    } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
-    }
-});
-
-test("writeHermesIdentityPlugin: drops the identity plugin into the overlay, keyed by provider names", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-home-"));
-    try {
-        fs.writeFileSync(path.join(dir, "config.yaml"), "providers:\n  bili:\n    api: https://api.example.com/v1\n");
-        const rewrites: HttpRewrite[] = [{ key: "bili", realUpstream: "https://api.example.com/v1" }];
-        const overlay = prepareHermesHome(dir, "http://127.0.0.1:8787", rewrites);
-        assert.ok(overlay);
-        assert.equal(writeHermesIdentityPlugin(dir, overlay!, rewrites), true);
-        const init = fs.readFileSync(path.join(overlay!, "plugins/model-providers/bili-session-identity/__init__.py"), "utf8");
-        assert.ok(init.includes('_PROVIDER_KEYS = ["bili"]'));
-        assert.ok(init.includes('_register("custom", _custom, True)'));
-        assert.ok(init.includes('_register("custom:" + _key, _custom, False)'));
-        assert.ok(init.includes('top_level.setdefault("prompt_cache_key", sid[:64])'));
-        assert.ok(fs.existsSync(path.join(overlay!, "plugins/model-providers/bili-session-identity/plugin.yaml")));
-        // Idempotent rewrite on the next launch.
-        assert.equal(writeHermesIdentityPlugin(dir, overlay!, rewrites), true);
-        fs.rmSync(overlay!, { recursive: true, force: true });
-    } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
-    }
-});
-
-test("writeHermesIdentityPlugin: skipped when the real home has its own plugins dir", () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hermes-home-"));
-    try {
-        fs.writeFileSync(path.join(dir, "config.yaml"), "providers:\n  bili:\n    api: https://api.example.com/v1\n");
-        fs.mkdirSync(path.join(dir, "plugins"), { recursive: true });
-        const rewrites: HttpRewrite[] = [{ key: "bili", realUpstream: "https://api.example.com/v1" }];
-        const overlay = prepareHermesHome(dir, "http://127.0.0.1:8787", rewrites);
-        assert.ok(overlay);
-        assert.equal(writeHermesIdentityPlugin(dir, overlay!, rewrites), false);
-        assert.ok(!fs.existsSync(path.join(overlay!, "plugins", "model-providers")));
-        fs.rmSync(overlay!, { recursive: true, force: true });
-    } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
-    }
+    assert.deepEqual(routes.httpsDomains, ["open.bigmodel.cn", "api.foo.io"]);
+    // httpRewrites is inventory-only for hermes (banner + no-provider
+    // warning); nothing is rewritten and the real config.yaml is untouched.
+    assert.deepEqual(routes.httpRewrites.map((r) => r.key).sort(), ["sglang"]);
+    const sglang = routes.httpRewrites.find((r) => r.key === "sglang");
+    assert.equal(sglang?.realUpstream, "http://127.0.0.1:8199/v1");
 });
 
 test("readDshConfig + resolveDshHome + parseDshSettingsYaml", () => {

@@ -290,6 +290,25 @@ export function resolveUpstream(_opts: ProxyOptions, reqUrl: string, req?: http.
             }
         }
     }
+    // Forward-proxy mode (#535 phase 2): a client honoring an http_proxy env
+    // sent this request in absolute form (`GET http://host/path HTTP/1.1`) —
+    // exactly what httpx emits for plain-http base URLs through a proxy. Route
+    // it like the /bili/ embedded form: the absolute URL IS the upstream, same
+    // tunnel semantics. A target equal to this request's own Host header means
+    // the client is asking the proxy to fetch ITSELF — forwarding that would
+    // loop the request straight back into handle(), so fall through (own-API
+    // routing) instead.
+    if (reqUrl.startsWith("http://") || reqUrl.startsWith("https://")) {
+        try {
+            const u = new URL(reqUrl);
+            const ownHost = (req?.headers.host ?? "").toLowerCase();
+            if (u.host.toLowerCase() !== ownHost) {
+                return { upstream: `${u.protocol}//${u.host}`, rewrittenUrl: reqUrl, tunnel: true };
+            }
+        } catch {
+            // malformed absolute URL
+        }
+    }
     return undefined;
 }
 
