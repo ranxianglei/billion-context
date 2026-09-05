@@ -34,7 +34,7 @@ import { pathToFileURL } from "node:url";
 import { spawn, type StdioOptions } from "node:child_process";
 import { DEFAULT_MITM_DOMAINS } from "./mitm.js";
 import { isProxyInstanceFile, isPidAlive, readProxyInstanceFile, type ProxyInstanceFile } from "./instance.js";
-import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom } from "./plugin-install.js";
+import { dshNativeInstalled, selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom } from "./plugin-install.js";
 
 /** Absolute path of a file inside our dist/, resolved via the package root
  * (import.meta.url-based) so it survives global-installed symlink bins
@@ -117,6 +117,17 @@ export interface LaunchOptions {
      *  BILI_LAUNCHER_MODEL_WINDOWS so the nudge denominator matches the
      *  client's real window instead of the built-in table guess. */
     modelWindows?: Record<string, number>;
+    /** Skip the shared-instance attach probe and always spawn a fresh proxy.
+     *  Used by `bili daemon` (#521): per-session proxies are never shared. */
+    forceFresh?: boolean;
+    /** PID that owns this proxy; the child self-reaps when it dies (#414). */
+    parentPid?: number;
+    /** Write the instance record ONLY here (child env BILI_INSTANCE_FILE)
+     *  instead of the global file; the caller polls it for the real origin. */
+    instanceFile?: string;
+    /** Spawn with --no-auto-update: session proxies must not self-upgrade
+     *  mid-conversation under a running agent. */
+    autoUpdateOff?: boolean;
 }
 
 export interface ProxyHandle {
@@ -130,7 +141,7 @@ export interface ProxyHandle {
 export interface LauncherDeps {
     fetchImpl?: (url: string) => Promise<{ ok: boolean }>;
     fetchHealthInfo?: (origin: string) => Promise<{ ok: boolean; instanceId?: string } | undefined>;
-    readInstanceFile?: () => ProxyInstanceFile | { origin: string } | undefined;
+    readInstanceFile?: (file?: string) => ProxyInstanceFile | { origin: string } | undefined;
     spawnImpl?: SpawnFn;
     now?: () => number;
     sleep?: (ms: number) => Promise<void>;
@@ -1435,6 +1446,7 @@ function proxyStartArgs(opts: LaunchOptions): string[] {
     const args = ["start", "--host", opts.host, "--port", String(opts.port)];
     if (opts.passthrough) args.push("--passthrough");
     if (opts.debug) args.push("--debug");
+    if (opts.autoUpdateOff) args.push("--no-auto-update");
     return args;
 }
 
@@ -1444,7 +1456,8 @@ export async function ensureProxyRunning(
 ): Promise<ProxyHandle> {
     const fetchImpl = deps.fetchImpl ?? defaultFetch;
     const fetchHealthInfo = deps.fetchHealthInfo ?? fetchHealthInfoDefault;
-    const readInstance = deps.readInstanceFile ?? readProxyInstanceFile;
+    const readInstanceBase = deps.readInstanceFile ?? readProxyInstanceFile;
+    const readInstance = () => readInstanceBase(opts.instanceFile);
     const spawnImpl = deps.spawnImpl ?? (spawn as SpawnFn);
     const now = deps.now ?? Date.now;
     const sleepImpl = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
@@ -1452,10 +1465,12 @@ export async function ensureProxyRunning(
     // #394/#417: a healthy proxy with a compatible config is SHARED, not
     // doubled — two concurrent launches of the same client would otherwise
     // spawn two writers over one sessions dir.
-    const existing = await probeExistingInstance(readInstance, fetchHealthInfo);
-    if (existing && instanceCompatible(existing, opts)) {
-        console.error(`bili: attaching to running proxy at ${existing.origin} (pid ${existing.pid})`);
-        return { origin: existing.origin, port: existing.port, attached: true };
+    if (!opts.forceFresh) {
+        const existing = await probeExistingInstance(readInstance, fetchHealthInfo);
+        if (existing && instanceCompatible(existing, opts)) {
+            console.error(`bili: attaching to running proxy at ${existing.origin} (pid ${existing.pid})`);
+            return { origin: existing.origin, port: existing.port, attached: true };
+        }
     }
 
     // #407: no probe-release-rebind. The child binds the preferred port
@@ -1469,7 +1484,9 @@ export async function ensureProxyRunning(
     const port = opts.port > 0 ? opts.port : await pickEphemeralPort(opts.host);
     const script = process.argv[1];
     if (!script) throw new Error("bili: cannot resolve launcher script path");
-    const logPath = path.join(os.tmpdir(), `bili-proxy-${port}.log`);
+    // Port 0 means "ephemeral": many session proxies can run at once, so the
+    // log name must not collide on the literal "0".
+    const logPath = path.join(os.tmpdir(), `bili-proxy-${port === 0 ? launchToken.slice(0, 8) : port}.log`);
     const logFd = fs.openSync(logPath, "a");
     let child: SpawnChild;
     try {
@@ -1482,7 +1499,8 @@ export async function ensureProxyRunning(
                 env: {
                     ...stripInheritedProxy(process.env),
                     BILI_LAUNCH_TOKEN: launchToken,
-                    BILI_PARENT_PID: String(process.pid),
+                    BILI_PARENT_PID: String(opts.parentPid ?? process.pid),
+                    ...(opts.instanceFile ? { BILI_INSTANCE_FILE: opts.instanceFile } : {}),
                     ...(opts.mitmDomains && opts.mitmDomains.length
                         ? { BILI_MITM_DOMAINS: opts.mitmDomains.join(",") }
                         : {}),
@@ -1817,9 +1835,12 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
                 "bili: no custom providers found in ~/.dsh/settings.yaml — proxying the built-in deepseek route via DEEPSEEK_BASE_URL only.",
             );
         }
-        // Native /acp command rides a --patch overlay (independent of the
-        // settings rewrite above), so it exists on every profile dsh boots.
-        const dshAcpPatch = writeDshAcpPatch(dshHomeDir);
+        // Native /acp command: prefer the persistent cordis.patch.yml entry
+        // installed by `bili plugin install dsh` (#521); fall back to the
+        // ephemeral --patch overlay when no profile has a live native entry.
+        // ANY-profile rule: loading the same module through both layers would
+        // double-register /acp in partially installed setups.
+        const dshAcpPatch = dshNativeInstalled(dshHomeDir) ? undefined : writeDshAcpPatch(dshHomeDir);
         if (dshAcpPatch) clientArgs = dshArgsWithPatch(clientArgs, dshAcpPatch);
     } else if (base === "codex") {
         // Per-spawn conversation id for the MCP shell's headless

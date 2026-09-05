@@ -26,9 +26,11 @@ import { configFile as defaultConfigFile } from "./paths.js";
 import { checkForUpdate, startAutoUpdate } from "./update.js";
 import { runMcpStdio } from "./mcp.js";
 import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, type PluginAgent } from "./plugin-install.js";
-import { runLaunch, runTestPi, isLaunchClient, type ClientName } from "./launcher.js";
+import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, runLaunch, runTestPi, isLaunchClient, type ClientName } from "./launcher.js";
 import { exportSession } from "./export.js";
-import { readFileSync } from "node:fs";
+import { readFileSync, unlinkSync } from "node:fs";
+import os from "node:os";
+import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
@@ -97,6 +99,7 @@ Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili h
     bili hermes                           # launch hermes-agent through the proxy (/bili/ rewrite of ~/.hermes/config.yaml)
     bili dsh --profile web "task"         # launch deepseek-harness through the proxy (/bili/ rewrite of ~/.dsh/settings.yaml)
     bili test pi                          # quick end-to-end check of the pi path
+    bili daemon --fresh --json --parent-pid N   # internal: per-session proxy for agent plugins (JSON on stdout)
     bili --mitm-domain api.foo.com pi     # add a domain to the MITM whitelist (flags precede the client)
     bili -F http://127.0.0.1:7897 codex   # route bili's upstream through a proxy (gost-style -F)
 
@@ -120,7 +123,7 @@ Docs: https://github.com/ranxianglei/billion-context
 `;
 
 type Parsed = {
-    command: "start" | "update" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp" | "plugin";
+    command: "start" | "update" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp" | "plugin" | "daemon";
     client?: ClientName;
     clientArgs: string[];
     mitmDomains: string[];
@@ -131,6 +134,9 @@ type Parsed = {
     registerConversationId?: string;
     pluginAction?: "install" | "remove" | "list";
     pluginAgent?: PluginAgent;
+    daemonFresh?: boolean;
+    daemonJson?: boolean;
+    daemonParentPid?: string;
 };
 
 export function parseArgs(argv: string[]): Parsed {
@@ -146,6 +152,9 @@ export function parseArgs(argv: string[]): Parsed {
     let exportFull = false;
     let pluginAction: Parsed["pluginAction"];
     let pluginAgent: Parsed["pluginAgent"];
+    let daemonFresh = false;
+    let daemonJson = false;
+    let daemonParentPid: string | undefined;
 
     for (let i = 0; i < argv.length; i++) {
         const a = argv[i]!;
@@ -172,6 +181,12 @@ export function parseArgs(argv: string[]): Parsed {
                 break;
             case "--no-auto-update":
                 overrides.ACP_AUTO_UPDATE = "0";
+                break;
+            case "--fresh":
+                daemonFresh = true;
+                break;
+            case "--json":
+                daemonJson = true;
                 break;
             case "--passthrough":
                 overrides.ACP_PASSTHROUGH = "1";
@@ -206,7 +221,8 @@ export function parseArgs(argv: string[]): Parsed {
             case "--config":
             case "--origin":
             case "--agent":
-            case "--bin": {
+            case "--bin":
+            case "--parent-pid": {
                 const val = argv[++i];
                 if (val === undefined || val.length === 0) {
                     console.error(`bili: ${a} requires a non-empty value`);
@@ -218,6 +234,7 @@ export function parseArgs(argv: string[]): Parsed {
                 else if (a === "--origin") overrides.BILI_MCP_PROXY = val;
                 else if (a === "--bin") process.env.BILI_CLIENT_BIN = val;
                 else if (a === "-F") overrides.BILI_UPSTREAM_PROXY = val;
+                else if (a === "--parent-pid") daemonParentPid = val;
                 else overrides.BILI_PLUGIN_AGENT = val;
                 break;
             }
@@ -255,6 +272,8 @@ export function parseArgs(argv: string[]): Parsed {
             registerConversationId = positional[1];
         } else if (cmd === "mcp") {
             command = "mcp";
+        } else if (cmd === "daemon") {
+            command = "daemon";
         } else if (cmd === "plugin") {
             command = "plugin";
             const action = positional[1];
@@ -291,11 +310,50 @@ export function parseArgs(argv: string[]): Parsed {
         }
     }
 
-    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, registerConversationId, pluginAction, pluginAgent };
+    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, registerConversationId, pluginAction, pluginAgent, daemonFresh, daemonJson, daemonParentPid };
+}
+
+async function runDaemon(fresh: boolean, json: boolean, parentPidArg: string | undefined): Promise<void> {
+    if (!fresh || !json) {
+        console.error("bili daemon: requires --fresh --json (internal subcommand used by bili agent plugins)");
+        process.exit(2);
+    }
+    const parentPid = Number(parentPidArg);
+    if (!Number.isInteger(parentPid) || parentPid <= 0) {
+        console.error(`bili daemon: --parent-pid must be a positive integer (got ${parentPidArg ?? ""})`);
+        process.exit(2);
+    }
+    // Per-session proxy (#521): ephemeral port (0 → child self-binds), a
+    // session-only instance file the caller polls for the real origin, and
+    // self-reap when this process dies (BILI_PARENT_PID watcher in server.ts).
+    const sessionFile = path.join(os.tmpdir(), `bili-daemon-${process.pid}-${randomUUID()}.json`);
+    try {
+        const handle = await ensureProxyRunning({
+            host: LAUNCHER_DEFAULT_HOST,
+            port: 0,
+            passthrough: false,
+            debug: false,
+            forceFresh: true,
+            parentPid,
+            instanceFile: sessionFile,
+            autoUpdateOff: true,
+        });
+        process.stdout.write(`${JSON.stringify({
+            origin: handle.origin,
+            port: handle.port,
+            pid: handle.child?.pid ?? -1,
+            logPath: handle.logPath ?? "",
+        })}\n`);
+    } catch (error) {
+        console.error(`bili daemon: ${error instanceof Error ? error.message : String(error)}`);
+        process.exitCode = 1;
+    } finally {
+        try { unlinkSync(sessionFile); } catch { /* already gone */ }
+    }
 }
 
 export async function main(): Promise<void> {
-    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, registerConversationId, pluginAction, pluginAgent } = parseArgs(process.argv.slice(2));
+    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, registerConversationId, pluginAction, pluginAgent, daemonFresh, daemonJson, daemonParentPid } = parseArgs(process.argv.slice(2));
     if (command === "help") {
         process.stdout.write(HELP);
         return;
@@ -376,6 +434,10 @@ export async function main(): Promise<void> {
     if (command === "update") {
         // Manual one-shot update — bypasses the throttle.
         await checkForUpdate({ packageName: PACKAGE_NAME, currentVersion: VERSION, autoUpdate: true }, true);
+        return;
+    }
+    if (command === "daemon") {
+        await runDaemon(daemonFresh === true, daemonJson === true, daemonParentPid);
         return;
     }
     if (command === "test") {
