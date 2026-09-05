@@ -52,6 +52,21 @@ async function settle(ms = 30): Promise<void> {
     await new Promise((r) => setTimeout(r, ms));
 }
 
+/** Poll probe() until it returns non-nullish, failing after deadlineMs.
+ *  Used where a write can legitimately land late: acp-kernel retries
+ *  transient ENOENT/ENOTDIR (CI Windows temp sweeps) with backoff, so a
+ *  debounced flush may surface seconds after its 5ms timer — a fixed
+ *  sleep would flake even though the data is safe. */
+async function waitFor<T>(probe: () => T | null | undefined, deadlineMs: number, what: string): Promise<T> {
+    const start = Date.now();
+    for (;;) {
+        const v = probe();
+        if (v != null) return v;
+        if (Date.now() - start > deadlineMs) throw new Error(`timed out after ${deadlineMs}ms waiting for ${what}`);
+        await settle(10);
+    }
+}
+
 await withTempStore("writeNow round-trips state + blockContents", async (store, dir) => {
     const s = makeSession("sess-1");
     s.stats.requests = 42;
@@ -103,9 +118,12 @@ await withTempStore("scheduleSave debounces and eventually writes", async (store
     store.scheduleSave(s);
     s.stats.requests = 3;
     store.scheduleSave(s);
-    await settle();
+    // Poll rather than one fixed settle(): if the flush hits a transient
+    // ENOENT (temp sweep) the kernel retries with backoff, so the write can
+    // land well past the 5ms debounce. Deadline covers the retry ladder
+    // (~1.5s) with headroom.
+    const loaded = await waitFor(() => store.loadSync("debounce-1"), 5000, "debounced write to land");
     assert.equal(readdirSync(dir).length, 1, "exactly one top-level entry (the _unknown subdir) happened");
-    const loaded = store.loadSync("debounce-1");
     assert.equal(loaded!.stats.requests, 3, "latest value persisted");
 });
 
