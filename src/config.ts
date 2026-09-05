@@ -239,6 +239,10 @@ export type ProxyOptions = {
     debug: boolean;
     dumpSse?: string;
     passthrough: boolean;
+    /** Where `passthrough` came from: "env" (ACP_PASSTHROUGH or --passthrough
+     *  flag), "file" (config `passthrough: true`), or null (default off).
+     *  Drives the #405 boot warning and the web panel's source display. */
+    passthroughSource: "env" | "file" | null;
     autoUpdate: boolean;
     logFile?: string;
     /** MITM transparent-proxy mode. When enabled, an HTTP CONNECT handler is
@@ -280,6 +284,14 @@ export function loadRoutes(env: NodeJS.ProcessEnv = process.env): ProviderRoutes
     return routes;
 }
 
+/** Resolved passthrough state shared by loadOptions and the web config API
+ *  (single source of truth — the GET handler must not re-derive it). */
+export function passthroughState(env: NodeJS.ProcessEnv): { enabled: boolean; source: "env" | "file" | null } {
+    const filePassthrough = loadConfigFile().passthrough === true;
+    if (env.ACP_PASSTHROUGH !== undefined) return { enabled: env.ACP_PASSTHROUGH === "1", source: "env" };
+    return { enabled: filePassthrough, source: filePassthrough ? "file" : null };
+}
+
 export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions {
     // --- Source 1: JSON config file (~/.config/billion-context/billion-context.json) ---
     // The canonical, user-editable config. Loaded first so env vars below can
@@ -295,6 +307,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
     const host = rawHost === "localhost" ? "127.0.0.1" : rawHost;
     const upstream = (env.ACP_UPSTREAM ?? fileConfig.upstream ?? "https://api.anthropic.com").replace(/\/$/, "");
     const routes = loadRoutes(env);
+    const passthrough = passthroughState(env);
     const modelContextLimit = parseInt(env.ACP_MODEL_CONTEXT_LIMIT ?? `${fileConfig.modelContextLimit ?? 200000}`, 10);
     const biliProxy = nonEmpty(env.BILI_UPSTREAM_PROXY);
     const webProxy = nonEmpty(fileConfig.upstreamProxy);
@@ -364,7 +377,8 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         log: env.ACP_LOG !== "0" && fileConfig.log !== false,
         debug: (env.ACP_DEBUG ?? (fileConfig.debug ? "1" : "0")) === "1",
         dumpSse: env.ACP_DUMP_SSE || fileConfig.dumpSse || undefined,
-        passthrough: (env.ACP_PASSTHROUGH ?? (fileConfig.passthrough ? "1" : "0")) === "1",
+        passthrough: passthrough.enabled,
+        passthroughSource: passthrough.source,
         autoUpdate: (env.ACP_AUTO_UPDATE ?? (fileConfig.autoUpdate === false ? "0" : "1")) !== "0",
         logFile: env.ACP_LOG_FILE !== undefined ? (env.ACP_LOG_FILE || undefined) : fileConfig.logFile,
         mitm: {
