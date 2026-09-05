@@ -224,6 +224,27 @@ async function summarizeRange(deps: PreflightDeps, content: string, startRef: st
 
 const ABORTED_FAILURE: PreflightFailure = { kind: "aborted", detail: "the client disconnected during preflight compression" };
 
+// #330: the soft-protected recent zone (preserveRecentMessages /
+// preserveRecentTokens / most-recent user message) can cover ALL foldable
+// content when one large recent message pushes the payload over a small
+// window — preflight then 502s forever with no recovery path. Under overflow
+// the soft zone is a preference, not a constraint: relax it to zero so its
+// oldest content becomes foldable. The hard protectedTools exclusion is
+// computed independently of preserveRecent* and still applies.
+function relaxedConfig(config: Config): Config {
+    return { ...config, preserveRecentMessages: 0, preserveRecentTokens: 0 };
+}
+
+// #330: the preflight's fit check must reflect the durable payload, not the
+// per-turn emergency-truncate side effect — that node would trim the very tool
+// output overflowing the window, making currentTokens undershoot and the loop
+// break before the soft zone is relaxed. Inflate the window so usage stays
+// below truncate.threshold; compressible ranges derive from the protected zone,
+// not usage, so this is safe.
+function noEmergencyTruncate(config: Config): Config {
+    return { ...config, modelContextLimit: config.modelContextLimit * 100 };
+}
+
 export async function preflightCompress(deps: PreflightDeps, messages: CoreMessage[]): Promise<PreflightResult> {
     const limit = deps.config.modelContextLimit;
     const result: PreflightResult = { compressedRanges: 0, savedTokens: 0, payloadEstimate: estimateCoreMessages(messages) + (deps.imageFloor ?? 0) };
@@ -239,6 +260,12 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     let currentTokens = deps.session.stats.lastInputTokens;
     let startTokens = -1;
     let failure: PreflightFailure | undefined;
+    let activeConfig = deps.config;
+    let relaxed = false;
+    const relaxedExhaustedDetail =
+        `the payload still exceeds the window after folding everything compressible, including the soft-protected recent zone ` +
+        `(last ${deps.config.preserveRecentMessages} messages + most recent user message), which was relaxed under overflow; hard protectedTools remain excluded. ` +
+        `Raise the model context window or restart the session to recover.`;
     for (let round = 0; round < MAX_PREFLIGHT_ROUNDS; round++) {
         if (deps.signal?.aborted) {
             failure = ABORTED_FAILURE;
@@ -249,7 +276,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         const turn = deps.core.processTurn({
             messages,
             state: deps.session.state,
-            config: deps.config,
+            config: noEmergencyTruncate(activeConfig),
             tokenCount: currentTokens,
             renderTags: "text-only",
         });
@@ -265,7 +292,19 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         if (currentTokens < limit) break;
         const ranges = viableRanges(turn.nudge?.compressibleRanges ?? []);
         if (ranges.length === 0) {
-            failure = { kind: "exhausted", detail: "no compressible ranges remain in the conversation" };
+            // #330: nothing foldable outside the soft-protected recent zone.
+            // Relax the soft zone (oldest-first within it) and retry — the hard
+            // protectedTools exclusion still applies. Gate on the payload's own
+            // estimate (not currentTokens, which is floored by a possibly-stale
+            // lastInputTokens from a prior model): if the real payload already
+            // fits, stop instead of folding protected content.
+            if (!relaxed && result.payloadEstimate >= limit) {
+                activeConfig = relaxedConfig(deps.config);
+                relaxed = true;
+                deps.log("warn", "[preflight] no compressible ranges outside the protected recent zone; relaxing soft protection (preserveRecentMessages/Tokens -> 0) and retrying");
+                continue;
+            }
+            failure = { kind: "exhausted", detail: relaxed ? relaxedExhaustedDetail : "no compressible ranges remain in the conversation" };
             break;
         }
         const range = [...ranges].sort((a, b) => refNum(a.startRef) - refNum(b.startRef))[0];
@@ -315,7 +354,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             if (!summary) continue;
             const ctx: RewriteCtx = {
                 core: deps.core,
-                config: deps.config,
+                config: activeConfig,
                 messages,
                 session: deps.session,
                 log: (msg) => deps.log("info", msg),
@@ -342,7 +381,12 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         }
     }
     if (!failure && currentTokens >= limit) {
-        failure = { kind: "exhausted", detail: `the compress budget was exhausted after ${MAX_PREFLIGHT_ROUNDS} rounds` };
+        failure = {
+            kind: "exhausted",
+            detail: relaxed
+                ? relaxedExhaustedDetail
+                : `the compress budget was exhausted after ${MAX_PREFLIGHT_ROUNDS} rounds`,
+        };
     }
     if (result.compressedRanges > 0) deps.session.stats.lastInputTokens = currentTokens;
     result.savedTokens = Math.max(0, startTokens - currentTokens);

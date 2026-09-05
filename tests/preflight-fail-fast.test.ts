@@ -8,7 +8,7 @@ process.env.NODE_ENV = "test";
 // exponential backoff — these tests are about the post-retry behavior.
 process.env.BILI_REPLAY_RETRY_MAX = "1";
 
-import { defaultConfig } from "acp-kernel";
+import { defaultConfig, type Config } from "acp-kernel";
 import { startServer, type ProxyOptions } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
@@ -64,7 +64,30 @@ function makeUpstream429(calls?: Call[]): http.Server {
     });
 }
 
-function startProxy(upstreamPort: number, models: Record<string, { context: number }>): Promise<http.Server> {
+// Upstream that succeeds on BOTH the forwarded (stream) request and the
+// preflight summarization (non-stream) call — needed to exercise the #330
+// relaxed-zone fold path end to end.
+function makeUpstreamOk(calls?: Call[]): http.Server {
+    return http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c: Buffer) => chunks.push(c));
+        req.on("end", () => {
+            const raw = Buffer.concat(chunks).toString("utf8");
+            let parsed: { stream?: boolean } = {};
+            try { parsed = JSON.parse(raw); } catch { /* keep {} */ }
+            calls?.push({ stream: !!parsed.stream, body: raw });
+            if (parsed.stream) {
+                res.writeHead(200, { "content-type": "text/event-stream" });
+                res.end(okSse(1000));
+            } else {
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(JSON.stringify({ content: [{ type: "text", text: "SUMMARY: the large recent user message was a deterministic load-growth payload; its raw content is no longer needed." }] }));
+            }
+        });
+    });
+}
+
+function startProxy(upstreamPort: number, models: Record<string, { context: number }>, kernelOverrides?: Partial<Config>): Promise<http.Server> {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     return startServer({
@@ -73,7 +96,7 @@ function startProxy(upstreamPort: number, models: Record<string, { context: numb
         upstream: "http://127.0.0.1",
         routes: { [`http://127.0.0.1:${upstreamPort}`]: { models } },
         modelContextLimit: 400_000,
-        kernelConfig: defaultConfig(400_000),
+        kernelConfig: defaultConfig(400_000, kernelOverrides),
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
@@ -197,27 +220,83 @@ test("e2e #301: over-window payload with nothing compressible → structured 502
     await once(upstream, "listening");
     const upstreamPort = upstream.address().port;
 
-    const proxy = await startProxy(upstreamPort, { "claude-small": { context: 10_000 } });
+    // #330: a lone large user message is now foldable (the soft recent zone is
+    // relaxed under overflow), so the truly-incompressible case is a large
+    // HARD-protected tool result: its paired tool_use (name "bash") is in
+    // protectedTools, so the result is excluded from every compressible range
+    // — even after the soft zone is relaxed.
+    const proxy = await startProxy(upstreamPort, { "claude-small": { context: 10_000 } }, { protectedTools: ["bash"] });
     await once(proxy, "listening");
     const proxyPort = proxy.address().port;
 
     try {
-        // A single ~12k-token message against a 10k window: over-window, but
-        // the kernel never folds the lone (first) user message → no
-        // compressible ranges → preflight cannot proceed at all.
         const filler = "FILLER_".repeat(7000);
         const r = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-acp-session": "preflight-exhausted-sess" },
-            body: JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: [{ role: "user", content: filler }] }),
+            body: JSON.stringify({
+                model: "claude-small",
+                max_tokens: 1024,
+                stream: true,
+                messages: [
+                    { role: "assistant", content: [{ type: "tool_use", id: "call_1", name: "bash", input: { command: "echo hi" } }] },
+                    { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: filler }] },
+                ],
+            }),
         });
         assert.equal(r.status, 502, "fail-fast 502 when nothing is compressible");
         const json = JSON.parse(await r.text()) as { error?: { code?: string; message?: string; retryable?: boolean } };
         assert.equal(json.error?.code, "preflight_compress_failed");
         assert.equal(json.error?.retryable, false);
         assert.ok(json.error?.message?.includes("NOT forwarded"), `message states the payload was withheld (got: ${json.error?.message})`);
+        assert.ok(json.error?.message?.includes("Raise the model context window"), `actionable error names the operator remedy (got: ${json.error?.message})`);
         assert.equal(calls.filter((c) => !c.stream).length, 0, "no summarization call was spent on an incompressible payload");
         assert.equal(calls.filter((c) => c.stream).length, 0, "the over-window payload was NOT forwarded upstream");
+    } finally {
+        proxy.close();
+        await once(proxy, "close");
+        upstream.close();
+        await once(upstream, "close");
+    }
+});
+
+test("e2e #330: over-window payload whose only foldable content is in the protected recent zone → soft zone relaxed, folded, forwarded", async () => {
+    const calls: Call[] = [];
+    const upstream = makeUpstreamOk(calls);
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = upstream.address().port;
+
+    const proxy = await startProxy(upstreamPort, { "claude-small": { context: 10_000 } });
+    await once(proxy, "listening");
+    const proxyPort = proxy.address().port;
+
+    try {
+        // Three messages against a 10k window: a small opener plus two large
+        // recent messages (~8k tokens each, ~16k total). All three sit inside
+        // the soft-protected recent zone (preserveRecentMessages=5 covers all
+        // three), so the normal pass finds nothing foldable. Before #330 this
+        // 502'd forever; now preflight relaxes the soft zone, folds the oldest
+        // large message, and forwards the now-fitting payload.
+        const big1 = "A".repeat(32000);
+        const big2 = "B".repeat(32000);
+        const r = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "preflight-relax-sess" },
+            body: JSON.stringify({
+                model: "claude-small",
+                max_tokens: 1024,
+                stream: true,
+                messages: [
+                    { role: "user", content: "start the task" },
+                    { role: "assistant", content: big1 },
+                    { role: "user", content: big2 },
+                ],
+            }),
+        });
+        assert.equal(r.status, 200, "the over-window payload is folded and forwarded, not 502'd");
+        assert.ok(calls.filter((c) => !c.stream).length >= 1, "preflight made the summarization call to fold the protected message");
+        assert.equal(calls.filter((c) => c.stream).length, 1, "the folded payload was forwarded upstream");
     } finally {
         proxy.close();
         await once(proxy, "close");
