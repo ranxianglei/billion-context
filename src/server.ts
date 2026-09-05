@@ -45,7 +45,7 @@ import { getSession, listSessions, type Session, initSessions, markDirty, flushA
 import { COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withStagedCompressGuidance } from "./compress-tool.js";
 import { rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
-import { preflightCompress, estimateCoreMessages } from "./preflight.js";
+import { preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper } from "./preflight.js";
 import { renderUI, handleConfigGet, handleConfigPut } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { getStore } from "./persist.js";
@@ -1282,6 +1282,7 @@ async function handle(
                         (parsed as { model?: string }).model,
                         route,
                         affinity,
+                        anonAffinity !== null,
                         log,
                         instanceId,
                     );
@@ -2189,16 +2190,27 @@ async function preflightCompressIfNeeded(
     model: string | undefined,
     route: ReturnType<typeof resolveUpstream>,
     affinity: string | undefined,
+    anonymous: boolean,
     log: (level: string, msg: string) => void,
     instanceId: string,
 ): Promise<Prepared | PreflightFailFast> {
     const session = prepared.session;
     const limit = config.modelContextLimit;
-    // A fresh session (id rotated, e.g. after a model switch) has
-    // lastInputTokens = 0 while still carrying a full raw history; size the
-    // trigger on the real post-fold payload too.
+    // #553: anonymous requests resolve their session by prefix affinity. After
+    // an ACP compression breaks the chain hash, the client's replay mints a NEW
+    // session id (a fork) whose lastInputTokens is 0 — yet it carries the full
+    // raw history. Judging that on the optimistic chars/4 estimate undercounts
+    // code/JSON replays by up to ~4x, so an over-window payload triggers
+    // nothing and is forwarded raw (upstream 400 / long-prefill timeout). Judge
+    // exactly those sessions by the char-count upper bound (never undershoots).
+    // Sessions with a client-provided identity keep the optimistic path: their
+    // 0-baseline means a genuinely new conversation or a post-native-compaction
+    // replay, both small enough to self-heal via the learned-window path.
+    const unknownBaseline = anonymous && session.stats.lastInputTokens <= 0;
     const payloadEstimate = estimateCoreMessages(prepared.processedMessages);
-    const tokenCount = Math.max(session.stats.lastInputTokens, payloadEstimate);
+    const tokenCount = unknownBaseline
+        ? estimateCoreMessagesUpper(prepared.processedMessages)
+        : Math.max(session.stats.lastInputTokens, payloadEstimate);
     if (limit <= 0 || !model || tokenCount < limit) return prepared;
     // #301: forwarding as-is is safe ONLY when the payload's own estimate
     // fits the window. The trigger (and the loop's fit check) floor on
@@ -2214,7 +2226,10 @@ async function preflightCompressIfNeeded(
         return { failFast: true, status, message, retryable, respond: !res.writableEnded };
     };
     if ((prepared.nudge?.compressibleRanges ?? []).length === 0) {
-        if (payloadEstimate < limit) {
+        // #553: only a trusted optimistic fit may clear a raw forward; an
+        // unknown-baseline session's true size is unmeasured, so fail fast
+        // instead of gambling a raw forward past the window.
+        if (!unknownBaseline && payloadEstimate < limit) {
             log("warn", `[${session.id}] preflight trigger fired on a stale baseline (~${tokenCount}) but the payload fits (~${payloadEstimate}/${limit}); forwarding as-is`);
             return prepared;
         }
@@ -2242,10 +2257,11 @@ async function preflightCompressIfNeeded(
             proxyUrl,
             signal: clientAbort.signal,
             log,
+            unknownBaseline,
         },
         prepared.originalMessages,
     );
-    if (result.payloadEstimate < limit) {
+            if (result.fitsWindow) {
         if (result.compressedRanges > 0) {
             log("info", `[${session.id}] preflight compressed ${result.compressedRanges} range(s), ~${result.savedTokens} tokens saved (${tokenCount} → ${session.stats.lastInputTokens}) in ${Date.now() - started}ms; rebuilding payload`);
             const rebuilt = runPrepare();
