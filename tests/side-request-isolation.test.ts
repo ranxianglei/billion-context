@@ -2,11 +2,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
-import { defaultConfig, createInitialState } from "acp-kernel";
-import { startServer, type ProxyOptions, isSideRequest, outputBudgetField, restoreOutputBudget } from "../src/server.ts";
+import { defaultConfig, createInitialState, defaultCountTokens } from "acp-kernel";
+import { startServer, type ProxyOptions, isSideRequest, outputBudgetField, restoreOutputBudget, sideRequestGuard } from "../src/server.ts";
+import { estimateRawBodyTokens } from "../src/preflight.ts";
+import { inspectContextOverflow } from "../src/util.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { getSession } from "../src/session.ts";
+import { getSession, _resetSessionsForTest } from "../src/session.ts";
 
 // #388: side requests (title-gen / small utility calls) share the main session
 // key but must not touch kernel state. The proxy routes them as pure passthrough
@@ -86,6 +88,75 @@ const SESSION = "side-iso-sess";
 const MAIN_INPUT_TOKENS = 50_000;
 const SIDE_INPUT_TOKENS = 56;
 
+test("estimateRawBodyTokens: counts string leaves, skips binary-carrying keys (#554)", () => {
+    const txt = "z".repeat(800);
+    const body = { model: MODEL, max_tokens: 100, messages: [{ role: "user", content: txt }] };
+    assert.equal(
+        estimateRawBodyTokens(body),
+        defaultCountTokens(MODEL) + defaultCountTokens("user") + defaultCountTokens(txt),
+        "every counted string leaf goes through the CJK-aware estimator",
+    );
+    // Binary-carrying fields are excluded (image-tokens charges them separately).
+    const data = "A".repeat(8000);
+    const imgBody = { model: MODEL, max_tokens: 100, messages: [{ role: "user", content: [
+        { type: "text", text: txt },
+        { type: "image", source: { type: "base64", media_type: "image/png", data } },
+    ] }] };
+    assert.equal(
+        estimateRawBodyTokens(imgBody),
+        defaultCountTokens(MODEL) + defaultCountTokens("user")
+        + defaultCountTokens("text") + defaultCountTokens(txt)
+        + defaultCountTokens("image") + defaultCountTokens("base64") + defaultCountTokens("image/png"),
+        "data field excluded, structural strings still counted",
+    );
+    assert.equal(estimateRawBodyTokens({ url: "http://x/y".repeat(1000) }), 0, "url field excluded");
+    assert.equal(estimateRawBodyTokens({ b64_json: "A".repeat(10_000) }), 0, "b64_json field excluded");
+    assert.equal(estimateRawBodyTokens(null), 0, "null body");
+    assert.equal(estimateRawBodyTokens(42), 0, "non-object body");
+    // CJK must not be undercounted by the chars/4 fast path.
+    assert.ok(estimateRawBodyTokens({ content: "汉".repeat(100) }) >= 100, "CJK counted per-char");
+});
+
+test("inspectContextOverflow: exceed_context_size_error pattern + (A / B > W) window parse (#554)", () => {
+    const llama = JSON.stringify({ error: { message: "exceed_context_size_error (198,277 / 198,661 > 150,528)" } });
+    const hit = inspectContextOverflow(400, llama);
+    assert.equal(hit.isOverflow, true, "llama.cpp-family marker recognized");
+    assert.equal(hit.window, 150_528, "window is the limit after '>' inside the parens, not A or B");
+    assert.equal(inspectContextOverflow(200, llama).isOverflow, false, "status gate: 200 is not an overflow");
+    assert.equal(inspectContextOverflow(418, llama).isOverflow, false, "status gate: only 400/413 count");
+    // Existing markers still work (regression).
+    assert.equal(inspectContextOverflow(400, JSON.stringify({ error: { message: "context_length_exceeded" } })).isOverflow, true);
+    const openai = inspectContextOverflow(400, JSON.stringify({ error: { message: "maximum context length is 131072 tokens" } }));
+    assert.equal(openai.isOverflow, true);
+    assert.equal(openai.window, 131_072);
+});
+
+test("sideRequestGuard: raw-body fit against resolved ∩ learned window minus output headroom (#554)", () => {
+    const txt = "z".repeat(8000);
+    const body = { model: MODEL, max_tokens: 100, stream: true, messages: [{ role: "user", content: txt }] };
+    const est = estimateRawBodyTokens(body);
+    assert.ok(est > 0);
+    assert.equal(sideRequestGuard(body, "anthropic", 0, undefined).blocked, false, "unknown window → forward as before");
+    assert.equal(sideRequestGuard(body, "anthropic", est + 1, undefined).blocked, false, "fits");
+    assert.equal(sideRequestGuard(body, "anthropic", est, undefined).blocked, true, "boundary: estimate == limit blocks");
+    assert.equal(sideRequestGuard(body, "anthropic", 1_000_000, est - 1).blocked, true, "learned smaller → blocks");
+    assert.equal(sideRequestGuard(body, "anthropic", est + 1, 1_000_000).blocked, false, "learned larger than resolved is ignored");
+    // OpenAI wire: the output budget counts against the window → headroom reserved.
+    const oa = { model: MODEL, max_completion_tokens: 2_000, stream: true, messages: [{ role: "user", content: txt }] };
+    const oaEst = estimateRawBodyTokens(oa);
+    const g = sideRequestGuard(oa, "openai", oaEst + 2_000, undefined);
+    assert.equal(g.limit, oaEst, "limit reduced by max_completion_tokens");
+    assert.equal(g.blocked, true, "boundary after reservation blocks");
+    assert.equal(sideRequestGuard(oa, "openai", oaEst + 2_001, undefined).blocked, false);
+    // Image tokens count toward the estimate.
+    const imgBody = { model: MODEL, max_tokens: 100, messages: [{ role: "user", content: [
+        { type: "text", text: "z".repeat(4000) },
+        { type: "image", source: { type: "base64", media_type: "image/png", data: "A".repeat(8000) } },
+    ] }] };
+    const imgEst = estimateRawBodyTokens(imgBody) + Math.ceil(8000 / 4);
+    assert.equal(sideRequestGuard(imgBody, "anthropic", imgEst, undefined).blocked, true, "image cost included at boundary");
+});
+
 function okSse(inputTokens: number): string {
     return (
         `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "m1", role: "assistant", usage: { input_tokens: inputTokens } } })}\n\n` +
@@ -115,10 +186,21 @@ interface Rig {
     sideScript: string | null;
     /** Last request body received by the upstream (for wire assertions). */
     lastBody: Record<string, unknown> | null;
+    /** Total requests received by the upstream (hit-count assertions). */
+    upstreamHits: number;
+    /** When set, side requests get this status + JSON body instead of okSse. */
+    sideErrorStatus: number | null;
+    sideErrorBody: string | null;
 }
 
-async function startRig(): Promise<Rig> {
-    const rig: Rig = { proxyPort: 0, upstreamPort: 0, proxy: null as unknown as http.Server, upstream: null as unknown as http.Server, sideScript: null, lastBody: null };
+// modelContextLimit alone is NOT enough to shrink the effective window: per-
+// request resolution re-resolves it from the registry/static table (claude-
+// sonnet-4-5 → 200k) unless the operator explicitly tunes
+// compress.modelContextLimit, which outranks everything (#344). The rig exposes
+// both so tests can pin the exact window the guard sees.
+async function startRig(opts?: { modelContextLimit?: number; compressModelContextLimit?: number }): Promise<Rig> {
+    const modelContextLimit = opts?.modelContextLimit ?? 200_000;
+    const rig: Rig = { proxyPort: 0, upstreamPort: 0, proxy: null as unknown as http.Server, upstream: null as unknown as http.Server, sideScript: null, lastBody: null, upstreamHits: 0, sideErrorStatus: null, sideErrorBody: null };
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
         req.on("data", (c: Buffer) => chunks.push(c));
@@ -127,10 +209,16 @@ async function startRig(): Promise<Rig> {
             let parsed: { max_tokens?: number } = {};
             try { parsed = JSON.parse(raw); } catch { /* keep {} */ }
             rig.lastBody = parsed as Record<string, unknown>;
+            rig.upstreamHits++;
             // Side requests (tiny max_tokens) report a TINY context; main requests
             // report a large one. The proxy must NOT capture the side request's
             // usage — that is exactly the pollution this regression guards.
             const isSide = typeof parsed.max_tokens === "number" && parsed.max_tokens <= 200;
+            if (isSide && rig.sideErrorStatus !== null) {
+                res.writeHead(rig.sideErrorStatus, { "content-type": "application/json" });
+                res.end(rig.sideErrorBody ?? "{}");
+                return;
+            }
             res.writeHead(200, { "content-type": "text/event-stream" });
             res.end(isSide && rig.sideScript ? rig.sideScript : okSse(isSide ? SIDE_INPUT_TOKENS : MAIN_INPUT_TOKENS));
         });
@@ -141,14 +229,15 @@ async function startRig(): Promise<Rig> {
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
+    _resetSessionsForTest();
     const proxy = await startServer({
         port: 0,
         host: "127.0.0.1",
         upstream: "http://127.0.0.1",
         routes: { [`http://127.0.0.1:${upstreamPort}`]: {} },
-        modelContextLimit: 200_000,
-        kernelConfig: defaultConfig(200_000),
-        compress: { injectTool: true, injectNudge: true },
+        modelContextLimit,
+        kernelConfig: defaultConfig(modelContextLimit),
+        compress: { injectTool: true, injectNudge: true, ...(opts?.compressModelContextLimit !== undefined ? { modelContextLimit: opts.compressModelContextLimit } : {}) },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,
@@ -291,6 +380,71 @@ test("e2e: starved tool-carrying main request re-enters pipeline at restored bud
         const s3 = getSession(SESSION);
         assert.equal(JSON.stringify(s3.state), stateBeforeSide, "side request left kernel state untouched");
         assert.equal(JSON.stringify(s3.stats), statsBeforeSide, "side request left stats untouched");
+    } finally {
+        await closeRig(rig);
+    }
+});
+
+test("e2e: oversized side request is blocked locally (413), never reaches the upstream (#554)", async () => {
+    const rig = await startRig({ modelContextLimit: 4_000, compressModelContextLimit: 4_000 });
+    try {
+        const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/messages`;
+        const headers: Record<string, string> = { "content-type": "application/json", "x-acp-session": SESSION };
+
+        // ~40 × ~130 tokens ≈ 5k+ > 4_000 window → guaranteed upstream 400 if forwarded.
+        const r = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 100, stream: true, messages: mainConversation(40) }) });
+        assert.equal(r.status, 413);
+        const j = (await r.json()) as { error: { type: string; code: string; retryable: boolean; message: string } };
+        assert.equal(j.error.type, "server_error");
+        assert.equal(j.error.code, "side_request_payload_too_large");
+        assert.equal(j.error.retryable, false);
+        assert.match(j.error.message, /NOT forwarded/);
+        assert.equal(rig.upstreamHits, 0, "oversized side request must NOT reach the upstream");
+
+        // A fitting side request on the same rig still passes through verbatim.
+        const r2 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 100, stream: true, messages: [{ role: "user", content: "Generate a short title." }] }) });
+        assert.equal(r2.status, 200);
+        await r2.text();
+        assert.equal(rig.upstreamHits, 1, "fitting side request reaches the upstream");
+        assert.equal(rig.lastBody?.max_tokens, 100, "body untouched (verbatim passthrough preserved)");
+
+        const s = getSession(SESSION);
+        assert.ok(s, "session row exists (created before the gate)");
+        assert.equal(JSON.stringify(s.state), JSON.stringify(createInitialState()), "kernel state untouched by side requests (blocked or not)");
+        assert.equal(s.stats.requests, 0, "side requests do not count as main requests");
+    } finally {
+        await closeRig(rig);
+    }
+});
+
+test("e2e: overflow 400 on a side request learns the real window; next one is blocked locally (#554)", async () => {
+    const rig = await startRig(); // 200_000 configured window
+    try {
+        const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/messages`;
+        const headers: Record<string, string> = { "content-type": "application/json", "x-acp-session": SESSION };
+
+        // ~1200 × ~130 ≈ 155k tokens: below the 200k configured window (so the
+        // first attempt forwards) but above the real 150,528 window the upstream
+        // reports in its overflow marker.
+        const big = mainConversation(1200);
+        rig.sideErrorStatus = 400;
+        rig.sideErrorBody = JSON.stringify({ error: { message: "exceed_context_size_error (198,277 / 198,661 > 150,528)" } });
+
+        const r1 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 100, stream: true, messages: big }) });
+        assert.equal(r1.status, 400, "first overflow surfaces to the client");
+        await r1.text();
+        const s1 = getSession(SESSION);
+        assert.ok(s1);
+        assert.equal((s1.metadata.learnedContextLimits as Record<string, number>)[MODEL], 150_528, "real window learned from the overflow marker");
+        assert.equal(s1.stats.lastInputTokens, 150_528, "emergency shrink armed at the learned window");
+
+        // Identical second request: now blocked locally — no second upstream hit.
+        const r2 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 100, stream: true, messages: big }) });
+        assert.equal(r2.status, 413);
+        const j = (await r2.json()) as { error: { code: string } };
+        assert.equal(j.error.code, "side_request_payload_too_large");
+        assert.equal(rig.upstreamHits, 1, "second oversized side request must NOT reach the upstream again");
+        assert.equal(JSON.stringify(getSession(SESSION).state), JSON.stringify(createInitialState()), "kernel state untouched throughout");
     } finally {
         await closeRig(rig);
     }
