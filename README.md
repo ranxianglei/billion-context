@@ -140,6 +140,21 @@ Two ways to use it — pick one:
 - **URL change (persistent):** prefix your client's baseURL with the proxy
   origin + `/bili/`.
 
+### Injection priority — no files unless unavoidable (#535)
+
+bili never owns user data: every launched client runs on its **real home**, so
+runtime writes land where the user expects them. When pointing a client at the
+proxy, the launcher picks by priority — **env vars first** (proxy/CA envs for
+hermes/dsh/codex; the `BILI_PROVIDER_REWRITES` URL manifest for pi/omp,
+consumed by their extension's `registerProvider` at load), then **CLI flags or
+extension APIs** (codex `-c key=value`, opencode plugin), and **generated files
+last** — today only opencode's temp `opencode.json` (deleted on exit) and dsh's
+loopback exception: dsh's fetch stack bypasses proxy envs for loopback targets
+unconditionally, so local upstreams keep the persistent `~/.dsh-bili` overlay
+rewrite until dsh gains a settings-path env or an upstream loopback opt-out.
+Overlay dirs created by older versions are left in place and never merged back
+into the real home.
+
 ### Option 1 — Launcher (`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode` / `bili hermes` / `bili dsh`)
 
 The launcher wraps a client in one command: it starts a proxy on an
@@ -158,7 +173,7 @@ bili claude                           # launch claude through the proxy
 bili omp                              # pi-style, file-free (#535): env + extension registerProvider + compaction cancel, real ~/.omp untouched
 bili opencode                         # MITM for HTTPS + temp opencode.json (/bili/ for HTTP) + thin /acp plugin
 bili hermes                           # file-free (#535): hermes proxy env (HTTPS_PROXY + HERMES_CA_BUNDLE) — https via CONNECT MITM, http via absolute-form forward proxy; real ~/.hermes untouched
-bili dsh                              # deepseek-harness: built-in deepseek route via DEEPSEEK_BASE_URL + overlay DSH_HOME (~/.dsh-bili), all traffic /bili/, native /acp command injected via --patch
+bili dsh                              # deepseek-harness: non-loopback upstreams ride proxy envs (https MITM, http absolute-form), loopback keeps the overlay DSH_HOME (~/.dsh-bili) rewrite (#535), built-in deepseek route via DEEPSEEK_BASE_URL, native /acp command injected via --patch
 bili pi --mitm-domain api.foo.com     # add a domain to the MITM whitelist
 ```
 

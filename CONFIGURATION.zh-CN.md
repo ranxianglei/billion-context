@@ -530,13 +530,13 @@ MITM 只对一份**白名单**中的模型域名生效（`open.bigmodel.cn`、`a
 
 | 客户端 | 重定向方式 | CA 信任 |
 |---|---|---|
-| pi | `HTTPS_PROXY` + 隔离 `PI_CODING_AGENT_DIR` | `NODE_EXTRA_CA_CERTS` |
-| omp | `HTTPS_PROXY` + 隔离 `PI_CODING_AGENT_DIR` | `NODE_EXTRA_CA_CERTS` |
+| pi | `HTTPS_PROXY` + `BILI_PROVIDER_REWRITES` env 清单（扩展 `registerProvider`） | `NODE_EXTRA_CA_CERTS` |
+| omp | `HTTPS_PROXY` + `BILI_PROVIDER_REWRITES` env 清单（扩展 `registerProvider`） | `NODE_EXTRA_CA_CERTS` |
 | codex | `HTTPS_PROXY` + `-c key=value` 覆盖 | `SSL_CERT_FILE` → `combined-ca.pem` |
 | claude | `ANTHROPIC_BASE_URL` = `/bili/` URL | 无需 |
 | opencode | `HTTPS_PROXY` + 隔离 `OPENCODE_CONFIG` | `NODE_EXTRA_CA_CERTS` |
-| hermes | 隔离 `HERMES_HOME`；**全部**上游走 `/bili/` | 无（certifi 忽略 `SSL_CERT_FILE`） |
-| dsh | 隔离 `DSH_HOME` + `DEEPSEEK_BASE_URL`；**全部**上游走 `/bili/` | 无（纯 fetch，无代理/CA 接口） |
+| hermes | `HTTPS_PROXY`（明文 http 走 absolute-form 正向代理请求） | `HERMES_CA_BUNDLE` → `root-ca.pem` |
+| dsh | `HTTPS_PROXY`（明文 http 另加 `HTTP_PROXY`）+ `DEEPSEEK_BASE_URL`；**仅回环**隔离 `DSH_HOME` | `SSL_CERT_FILE` → `combined-ca.pem` |
 
 `NODE_EXTRA_CA_CERTS` 是**追加**到内置信任库，所以只指向 MITM 根证书（`root-ca.pem`）即可。`SSL_CERT_FILE` 会**替换**默认 CA bundle，所以 codex 指向 `combined-ca.pem` —— 包含 MITM 根证书**加上**系统/Node 公共根 —— 保证子进程环境里 pip/git/curl 类 TLS（盲转发、真证书）不受影响（#152）。
 
@@ -552,16 +552,16 @@ Claude Code 的 undici fetch 忽略 `HTTPS_PROXY`，所以证书 MITM 拦不到�
 | Claude Code | `ANTHROPIC_BASE_URL` 环境变量，否则硬编码 `api.anthropic.com` |
 | OpenCode | `~/.config/opencode/opencode.json` —— 各 provider 的 `baseURL` |
 | hermes | `~/.hermes/config.yaml` —— 各 provider 的端点行 |
-| dsh | `~/.dsh/settings.yaml` —— 每个 `baseURL`/`baseUrl`/`base_url` 值；内置 `deepseek-official` 路由另经 `$DEEPSEEK_BASE_URL` 接管 |
+| dsh | `~/.dsh/settings.yaml` —— 每个 `baseURL`/`baseUrl`/`base_url` 值，按目的地分流（回环 → `/bili/` 重写；非回环 https → MITM 白名单；非回环 http → `HTTP_PROXY`）；内置 `deepseek-official` 路由另经 `$DEEPSEEK_BASE_URL` 接管 |
 
-### 隔离临时配置（写了什么）
+### 生成文件（写了什么 —— 最后手段，#535）
 
-`/bili/` 重写模式写的是**临时副本** —— 真实配置绝不编辑 —— 客户端退出时临时目录一并删除：
+启动器优先零文件注入（env > CLI 参数/扩展 API > 生成文件；见 [README —— 注入优先级](README.zh-CN.md)）。确实绕不开文件时写的都是**副本** —— 真实配置绝不编辑：
 
-- **pi / omp** —— 隔离的 `PI_CODING_AGENT_DIR`（在 `/tmp` 下），里面只有一份重写后的 `models.json` / `models.yml`（明文 baseUrl 包上 `/bili/`）。其余一切（`settings.json`、`sessions/`、`auth.json`、扩展……）都**符号链接**到真实 pi/omp 主目录，所以会话与登录互通：launcher 里开的会话在裸客户端里无缝继续，反之亦然。
-- **opencode** —— 临时 `opencode.json`（由 `OPENCODE_CONFIG` 指向），`baseURL` 重写为 `/bili/` 形式，**并追加了薄 `/acp` 插件**（开箱即原生工具；独立的 `opencode-acp` 插件检测到 `BILLION_CONTEXT_PROXY` 后自禁用）。
-- **hermes** —— 隔离的 `HERMES_HOME`，重写后的 `config.yaml` 让**所有**上游（HTTP 和 HTTPS）都走 `/bili/`（httpx 自建 CA bundle 且忽略 `SSL_CERT_FILE`，证书 MITM 不可行）。`skills/`、`memories/`、`sessions/` 符号链接共享。若没配置任何 provider —— 或 `config.yaml` 无法重写 —— 启动器打印警告，hermes 将**不经代理**运行（无压缩）。
-- **dsh** —— 隔离的 `DSH_HOME`（持久 overlay `~/.dsh-bili`），重写后的 `settings.yaml` 让所有已配置上游都走 `/bili/`（纯 `fetch`，无代理/CA 接口，证书 MITM 不可行）。`profiles/`、凭据、会话符号链接共享。内置 `deepseek-official` 路由另行经 `$DEEPSEEK_BASE_URL` 接管（dsh 解析顺序为 settings `llm-deepseek.baseURL` ?? 环境变量 ?? 默认值，重写过的用户配置优先，环境变量作零配置兜底）—— 即便没有任何自定义 provider，内置 deepseek 路由也照样走代理。
+- **pi / omp** —— 不写任何文件（#535）：provider baseUrl 走 `BILI_PROVIDER_REWRITES` env 清单，由 bili 扩展加载时消费（`registerProvider`）；原生压缩改由扩展内取消（`session_before_compact`）。真实 `~/.pi` / `~/.omp` 主目录原样不动。
+- **opencode** —— 临时 `opencode.json`（由 `OPENCODE_CONFIG` 指向，客户端退出时删除），明文 `baseURL` 重写为 `/bili/` 形式，**并追加了薄 `/acp` 插件**（开箱即原生工具；独立的 `opencode-acp` 插件检测到 `BILLION_CONTEXT_PROXY` 后自禁用）。
+- **hermes** —— 不写任何文件（#535）：其 httpx 栈走 `HTTPS_PROXY`（+ `HERMES_CA_BUNDLE`）—— https 经 CONNECT 证书 MITM，明文 http 经 absolute-form 正向代理请求。若没配置任何 provider，启动器打印警告，hermes 将**不经代理**运行（无压缩）。
+- **dsh** —— 按目的地分流（#535）：dsh 的 fetch 栈尊重代理 env，但对回环目标无条件绕过，所以**非回环**上游走 `HTTPS_PROXY`（证书 MITM）/ `HTTP_PROXY`（absolute-form 正向代理请求），`SSL_CERT_FILE` → `combined-ca.pem`；仅**回环**上游保留持久 overlay `DSH_HOME`（`~/.dsh-bili`），重写后的 `settings.yaml` 让它们走 `/bili/`。`profiles/`、凭据、会话符号链接共享；真实 `~/.dsh` 绝不触碰。内置 `deepseek-official` 路由另行经 `$DEEPSEEK_BASE_URL` 接管（dsh 解析顺序为 settings `llm-deepseek.baseURL` ?? 环境变量 ?? 默认值，用户配置优先，环境变量作零配置兜底）—— 即便没有任何自定义 provider，内置 deepseek 路由也照样走代理。
 
 ### 启动器里的原生工具
 

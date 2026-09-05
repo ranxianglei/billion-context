@@ -387,7 +387,7 @@ Full command surface (`bili --help` prints an abridged version). Precedence ever
 | `bili omp [opts --] [args]` | Proxy + **omp** (pi-based) |
 | `bili opencode [opts --] [args]` | Proxy + **opencode** |
 | `bili hermes [opts --] [args]` | Proxy + **hermes-agent** (`/bili/` rewrite) |
-| `bili dsh [opts --] [args]` | Proxy + **deepseek-harness** (`/bili/` rewrite; args like `--profile web "task"` pass through) |
+| `bili dsh [opts --] [args]` | Proxy + **deepseek-harness** (non-loopback upstreams via proxy envs, loopback via `/bili/` rewrite — #535; args like `--profile web "task"` pass through) |
 | `bili test pi` | Non-polluting end-to-end smoke test of the pi path |
 | `bili export [session] [--full] [--output FILE]` | List persisted sessions / export one as a Markdown handoff — see [Sessions & Migration](#sessions--migration) |
 | `bili update` | Check for & install a newer version now (bypasses the 3-minute throttle) |
@@ -533,13 +533,13 @@ How each client is pointed at the proxy (set automatically in the child env):
 
 | Client | Redirect | CA trust |
 |---|---|---|
-| pi | `HTTPS_PROXY` + isolated `PI_CODING_AGENT_DIR` | `NODE_EXTRA_CA_CERTS` |
-| omp | `HTTPS_PROXY` + isolated `PI_CODING_AGENT_DIR` | `NODE_EXTRA_CA_CERTS` |
+| pi | `HTTPS_PROXY` + `BILI_PROVIDER_REWRITES` env manifest (extension `registerProvider`) | `NODE_EXTRA_CA_CERTS` |
+| omp | `HTTPS_PROXY` + `BILI_PROVIDER_REWRITES` env manifest (extension `registerProvider`) | `NODE_EXTRA_CA_CERTS` |
 | codex | `HTTPS_PROXY` + `-c key=value` overrides | `SSL_CERT_FILE` → `combined-ca.pem` |
 | claude | `ANTHROPIC_BASE_URL` = `/bili/` URL | none needed |
 | opencode | `HTTPS_PROXY` + isolated `OPENCODE_CONFIG` | `NODE_EXTRA_CA_CERTS` |
-| hermes | isolated `HERMES_HOME`; **all** upstreams `/bili/` | none (certifi ignores `SSL_CERT_FILE`) |
-| dsh | isolated `DSH_HOME` + `DEEPSEEK_BASE_URL`; **all** upstreams `/bili/` | none (plain fetch, no proxy/CA knobs) |
+| hermes | `HTTPS_PROXY` (plain-http rides absolute-form forward-proxy requests) | `HERMES_CA_BUNDLE` → `root-ca.pem` |
+| dsh | `HTTPS_PROXY` (+ `HTTP_PROXY` for plain-http) + `DEEPSEEK_BASE_URL`; **loopback-only** isolated `DSH_HOME` | `SSL_CERT_FILE` → `combined-ca.pem` |
 
 `NODE_EXTRA_CA_CERTS` *appends* to the built-in trust store, so it points at the MITM root alone (`root-ca.pem`). `SSL_CERT_FILE` *replaces* the default CA bundle, so for codex it points at `combined-ca.pem` — a bundle containing the MITM root **plus** the system/Node public roots — keeping pip/git/curl style TLS (blind-tunnelled, real certificates) working inside the child env (#152).
 
@@ -555,16 +555,16 @@ Where upstreams are discovered from (read-only):
 | Claude Code | `ANTHROPIC_BASE_URL` env var, else hardcoded `api.anthropic.com` |
 | OpenCode | `~/.config/opencode/opencode.json` — each provider's `baseURL` |
 | hermes | `~/.hermes/config.yaml` — each provider's endpoint lines |
-| dsh | `~/.dsh/settings.yaml` — every `baseURL`/`baseUrl`/`base_url` value; plus the built-in `deepseek-official` route via `$DEEPSEEK_BASE_URL` |
+| dsh | `~/.dsh/settings.yaml` — every `baseURL`/`baseUrl`/`base_url` value, split by destination (loopback → `/bili/` rewrite; non-loopback https → MITM whitelist; non-loopback http → `HTTP_PROXY`); plus the built-in `deepseek-official` route via `$DEEPSEEK_BASE_URL` |
 
-### Isolated temp config (what gets written)
+### Generated files (what gets written — last resort only, #535)
 
-The `/bili/` rewrite modes write a **temp copy** — the real config is never edited — and the temp dir is removed when the client exits:
+The launcher prefers file-free injection (env vars > CLI flags/extension APIs > generated files; see README, “Injection priority” section). Where a file is unavoidable it is a **copy** — the real config is never edited:
 
-- **pi / omp** — an isolated `PI_CODING_AGENT_DIR` (under `/tmp`) containing only a rewritten `models.json` / `models.yml` with the `/bili/`-wrapped plaintext baseUrls. Everything else (`settings.json`, `sessions/`, `auth.json`, extensions…) is **symlinked** to the real pi/omp home, so sessions and logins are shared: a conversation started under the launcher continues seamlessly in a bare client, and vice versa.
-- **opencode** — a temp `opencode.json` pointed at by `OPENCODE_CONFIG`, with `/bili/`-rewritten baseURLs **plus the thin `/acp` plugin appended** (native tools out of the box; the standalone `opencode-acp` plugin self-disables via `BILLION_CONTEXT_PROXY`).
-- **hermes** — an isolated `HERMES_HOME` with a rewritten `config.yaml` routing **every** upstream (HTTP and HTTPS) through `/bili/` (httpx builds its own CA bundle and ignores `SSL_CERT_FILE`, so cert MITM is impossible). `skills/`, `memories/`, `sessions/` are symlinked through. If no providers are configured — or `config.yaml` can't be rewritten — the launcher prints a warning and hermes runs **unproxied** (compression off).
-- **dsh** — an isolated `DSH_HOME` (persistent overlay `~/.dsh-bili`) with a rewritten `settings.yaml` routing every configured upstream through `/bili/` (plain `fetch`, no proxy/CA knobs, so cert MITM is impossible). `profiles/`, credentials and sessions are symlinked through. The built-in `deepseek-official` route is captured separately via `$DEEPSEEK_BASE_URL` (dsh resolves `settings llm-deepseek.baseURL` ?? env ?? default, so a rewritten user setting wins and the env is the zero-config fallback) — with no custom providers the deepseek route is still proxied out of the box.
+- **pi / omp** — nothing is written (#535): provider baseUrls ride the `BILI_PROVIDER_REWRITES` env manifest consumed by the bili extension at load (`registerProvider`), and native compaction is cancelled in-extension (`session_before_compact`). The real `~/.pi` / `~/.omp` homes are untouched.
+- **opencode** — a temp `opencode.json` pointed at by `OPENCODE_CONFIG` (removed when the client exits), with `/bili/`-rewritten plaintext baseURLs **plus the thin `/acp` plugin appended** (native tools out of the box; the standalone `opencode-acp` plugin self-disables via `BILLION_CONTEXT_PROXY`).
+- **hermes** — nothing is written (#535): its httpx stack rides `HTTPS_PROXY` (+ `HERMES_CA_BUNDLE`) — https via CONNECT cert-MITM, plain-http via absolute-form forward-proxy requests. If no providers are configured, the launcher prints a warning and hermes runs **unproxied** (compression off).
+- **dsh** — split by destination (#535): dsh's fetch stack honors proxy envs except for an unconditional loopback bypass, so **non-loopback** upstreams ride `HTTPS_PROXY` (cert MITM) / `HTTP_PROXY` (absolute-form forward-proxy requests) with `SSL_CERT_FILE` → `combined-ca.pem`; only **loopback** upstreams keep the persistent overlay `DSH_HOME` (`~/.dsh-bili`) with a rewritten `settings.yaml` routing them through `/bili/`. `profiles/`, credentials and sessions are symlinked through; the real `~/.dsh` is never touched. The built-in `deepseek-official` route is captured separately via `$DEEPSEEK_BASE_URL` (dsh resolves `settings llm-deepseek.baseURL` ?? env ?? default, so a user setting wins and the env is the zero-config fallback) — with no custom providers the deepseek route is still proxied out of the box.
 
 ### Native tools in the launcher
 
