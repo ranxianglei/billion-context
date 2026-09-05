@@ -246,7 +246,20 @@ tools.web_search = false
 });
 
 test("findFreePort: returns preferred when it is free", async () => {
-    const port = 50000 + Math.floor(Math.random() * 1000);
+    // Ask the OS for a port (listen 0), release it, then verify findFreePort
+    // prefers it. A random pick from a fixed range races the OS: on Windows
+    // the ephemeral range (49152-65535) covers 50000-50999, so an unrelated
+    // outbound connection can occupy the "free" port mid-test.
+    const probe = net.createServer();
+    const port = await new Promise<number>((resolve, reject) => {
+        probe.once("error", reject);
+        probe.listen(0, LAUNCHER_DEFAULT_HOST, () => {
+            const addr = probe.address();
+            if (addr && typeof addr === "object") resolve(addr.port);
+            else reject(new Error("no port"));
+        });
+    });
+    await new Promise<void>((resolve) => probe.close(() => resolve()));
     const got = await findFreePort(port, LAUNCHER_DEFAULT_HOST);
     assert.equal(got, port);
 });
