@@ -2564,13 +2564,19 @@ async function preflightCompressIfNeeded(
         log("error", `[${session.id}] preflight fail-fast ${status} (retryable=${retryable}): ${message}`);
         return { failFast: true, status, message, retryable, respond: !res.writableEnded };
     };
-    if ((prepared.nudge?.compressibleRanges ?? []).length === 0) {
-        if (payloadEstimate < limit) {
-            log("warn", `[${session.id}] preflight trigger fired on a stale baseline (~${tokenCount}) but the payload fits (~${payloadEstimate}/${limit}); forwarding as-is`);
-            return prepared;
-        }
-        return failFast(502, "no part of the conversation is compressible (nothing left to fold)", false);
+    if ((prepared.nudge?.compressibleRanges ?? []).length === 0 && payloadEstimate < limit) {
+        // #300: the trigger fired on a stale baseline (lastInputTokens) but the
+        // payload's own estimate fits the window — forwarding as-is is safe.
+        log("warn", `[${session.id}] preflight trigger fired on a stale baseline (~${tokenCount}) but the payload fits (~${payloadEstimate}/${limit}); forwarding as-is`);
+        return prepared;
     }
+    // #330: the payload overflows the window (or nothing is foldable in the
+    // normal pass but it doesn't fit). Let preflightCompress try to fold it —
+    // it relaxes the soft-protected recent zone when nothing is foldable
+    // outside it, and fails fast with an actionable error only when truly
+    // nothing is foldable (no summarization call is spent in that case). The
+    // old pre-check failed fast here on the normal-config compressibleRanges,
+    // which excluded the soft zone — bricking the #330 livelock.
     log("warn", `[${session.id}] context ${tokenCount} tokens exceeds model window ${limit} (model=${model}); preflight compressing before forward`);
     // #300: stamp the chain marker so a downstream bili skips these
     // summarization calls too (preflight always processes).
@@ -2597,16 +2603,21 @@ async function preflightCompressIfNeeded(
         },
         prepared.originalMessages,
     );
-    if (result.payloadEstimate < limit) {
-        if (result.compressedRanges > 0) {
-            log("info", `[${session.id}] preflight compressed ${result.compressedRanges} range(s), ~${result.savedTokens} tokens saved (${tokenCount} → ${session.stats.lastInputTokens}) in ${Date.now() - started}ms; rebuilding payload`);
-            const rebuilt = runPrepare();
-            // runPrepare re-incremented stats.requests; the rebuild is internal
-            // to this single client request.
-            session.stats.requests -= 1;
-            return rebuilt;
-        }
-        log("warn", `[${session.id}] preflight made no progress but the payload fits (~${result.payloadEstimate}/${limit}); forwarding as-is`);
+    // #330: decide forward/fail on the payload actually forwarded, not
+    // result.payloadEstimate — the preflight's relaxed-zone processTurn trims
+    // that estimate more than the normal-config prepare does, which can turn a
+    // guaranteed-400 forward into a false "fits". Images ride the payload
+    // verbatim (#488): add their cost back or #496's image-dominated payload
+    // would look "fitting" on its text estimate alone.
+    if (result.compressedRanges > 0) {
+        log("info", `[${session.id}] preflight compressed ${result.compressedRanges} range(s), ~${result.savedTokens} tokens saved (${tokenCount} → ${session.stats.lastInputTokens}) in ${Date.now() - started}ms; rebuilding payload`);
+        const rebuilt = runPrepare();
+        // runPrepare re-incremented stats.requests; the rebuild is internal
+        // to this single client request.
+        session.stats.requests -= 1;
+        if (estimateCoreMessages(rebuilt.processedMessages) + imageTokens < limit) return rebuilt;
+    } else if (estimateCoreMessages(prepared.processedMessages) + imageTokens < limit) {
+        log("warn", `[${session.id}] preflight made no progress but the payload fits; forwarding as-is`);
         return prepared;
     }
     // The payload still overflows the window: fail fast with a diagnostic
@@ -2617,7 +2628,7 @@ async function preflightCompressIfNeeded(
         return { failFast: true, status: 0, message: f.detail, retryable: false, respond: false };
     }
     const status = f?.kind === "upstream" && f.status === 429 ? 503 : 502;
-    return failFast(status, f?.detail ?? "unknown reason", status === 503);
+    return failFast(status, f?.detail ?? "the payload still exceeds the window after preflight compression", status === 503);
 }
 
 async function forward(
