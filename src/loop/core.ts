@@ -590,11 +590,17 @@ export async function* runCompressLoop(
                 try {
                     respResult = await fetchUpstream(newBody);
                 } catch (e) {
+                    // #539 follow-up: stripping replayed thinking only recovers a
+                    // backend where thinking is OPTIONAL (Anthropic). On
+                    // OpenAI/DeepSeek thinking mode reasoning_content is MANDATORY,
+                    // so a strip-retry there guarantees another 400 plus a
+                    // misleading log — gate the degraded retry to Anthropic.
                     if (
                         !(e instanceof UpstreamHttpError) ||
                         e.status < 400 ||
                         e.status >= 500 ||
                         degradedRetried ||
+                        ctx.protocol !== "anthropic" ||
                         !coreMessages.some(isLoopThinking)
                     ) {
                         throw e;
