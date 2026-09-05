@@ -316,15 +316,21 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                 }
             };
             for await (const eventStr of iterSseEvents(upstream)) {
-                const type = extractEventType(eventStr);
+                const explicitType = extractEventType(eventStr);
                 const dataLine = extractDataLine(eventStr);
-                if (!type || !dataLine) continue;
+                if (!dataLine) continue;
                 let obj: Record<string, unknown>;
                 try {
                     obj = JSON.parse(dataLine);
                 } catch {
                     continue;
                 }
+                // #549: `event:` is optional per the WHATWG SSE spec (defaults to
+                // "message"); many OpenAI-compatible gateways emit pure data: frames.
+                // Responses payloads carry a `type` equal to the event name — fall
+                // back to it when no event: line is present (explicit line still wins).
+                const type = explicitType ?? (typeof obj.type === "string" ? obj.type : null);
+                if (!type) continue;
                 const rawBuf = Buffer.from(eventStr + "\n\n", "utf8");
                 if (round === 1 && typeof obj.output_index === "number") {
                     outputIndex = Math.max(outputIndex, obj.output_index + 1);

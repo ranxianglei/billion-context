@@ -41,7 +41,7 @@ function makeCtx(id: string, messages: CoreMessage[] = []): {
 async function drain(
     stream: ReadableStream<Uint8Array>,
     ctx: ReturnType<typeof makeCtx>,
-    adapter: ReturnType<typeof createOpenaiAdapter> | ReturnType<typeof createAnthropicAdapter>,
+    adapter: ReturnType<typeof createOpenaiAdapter> | ReturnType<typeof createAnthropicAdapter> | ReturnType<typeof createResponsesAdapter>,
     requestBody: Record<string, unknown>,
 ): Promise<string> {
     const chunks: Buffer[] = [];
@@ -593,4 +593,51 @@ test("openai emitCompletion: usage with absent token counts still serializes com
     const realLine = real.split("\n").find((l) => l.startsWith("data: ") && l.includes("finish_reason"));
     const realParsed = JSON.parse(realLine!.slice("data: ".length)) as { usage?: Record<string, unknown> };
     assert.deepEqual({ p: realParsed.usage!.prompt_tokens, c: realParsed.usage!.completion_tokens, t: realParsed.usage!.total_tokens }, { p: 7, c: 3, t: 10 });
+});
+
+test("F8 (#549): responses adapter accepts data-only SSE frames (no event: lines)", async () => {
+    const stream = mockStream(
+        `data: ${JSON.stringify({ type: "response.created", response: { id: "resp_1", status: "in_progress", output: [] } })}\n\n`,
+        `data: ${JSON.stringify({ type: "response.output_item.added", output_index: 0, item: { type: "message", id: "m1", role: "assistant", content: [] } })}\n\n`,
+        `data: ${JSON.stringify({ type: "response.output_text.delta", item_id: "m1", output_index: 0, delta: "HelloDataOnly" })}\n\n`,
+        `data: ${JSON.stringify({ type: "response.completed", response: { id: "resp_1", status: "completed", output: [], usage: { input_tokens: 10, output_tokens: 5 } } })}\n\n`,
+    );
+    const events = await collectParseEvents(createResponsesAdapter(), stream, 1);
+    const textEv = events.find((e) => e.kind === "text");
+    assert.ok(textEv, "text delta yielded from data-only frame");
+    if (textEv && textEv.kind === "text") assert.equal(textEv.delta, "HelloDataOnly", "delta content intact");
+    const done = events.find((e) => e.kind === "done");
+    assert.ok(done, "terminal done yielded");
+    if (done && done.kind === "done") {
+        assert.equal(done.finishReason, "completed", "terminal kind taken from data payload type");
+        assert.notEqual(done.truncated, true, "not a synthetic truncation failure");
+    }
+});
+
+test("F8 (#549): explicit event: line wins over data payload type", async () => {
+    const stream = mockStream(
+        `event: response.completed\ndata: ${JSON.stringify({ type: "response.output_text.delta", item_id: "m1", output_index: 0, delta: "X" })}\n\n`,
+    );
+    const events = await collectParseEvents(createResponsesAdapter(), stream, 1);
+    const done = events.find((e) => e.kind === "done");
+    assert.ok(done, "done yielded");
+    if (done && done.kind === "done") assert.equal(done.finishReason, "completed", "explicit event: takes precedence over data type");
+});
+
+test("F8 (#549): data-only responses stream completes cleanly end-to-end (no synthetic failure)", async () => {
+    const round1 = [
+        `data: ${JSON.stringify({ type: "response.created", response: { id: "resp_1", status: "in_progress", output: [] } })}\n\n`,
+        `data: ${JSON.stringify({ type: "response.output_item.added", output_index: 0, item: { type: "message", id: "m1", role: "assistant", content: [] } })}\n\n`,
+        `data: ${JSON.stringify({ type: "response.output_text.delta", item_id: "m1", output_index: 0, delta: "HelloDataOnly" })}\n\n`,
+        `data: ${JSON.stringify({ type: "response.completed", response: { id: "resp_1", status: "completed", output: [], usage: { input_tokens: 10, output_tokens: 5 } } })}\n\n`,
+    ].join("");
+    const out = await drain(
+        new Response(round1, { status: 200 }).body!,
+        makeCtx("responses-dataonly"),
+        createResponsesAdapter(),
+        { model: "gpt-5", input: [], stream: true },
+    );
+    assert.ok(out.includes("HelloDataOnly"), "text streamed live");
+    assert.ok(out.includes('"status":"completed"'), "completion emitted with completed status");
+    assert.ok(!out.includes("upstream returned no response"), "no synthetic failure for a valid data-only stream");
 });
