@@ -52,6 +52,7 @@ import {
     resolveClaudeBudgetEnv,
     codexUpstreamUrl,
     readClaudeSettings,
+    gcStaleProxyLogs,
     type SpawnChild,
     type SpawnFn,
     runLaunch,
@@ -1014,6 +1015,42 @@ test("stopProxy: POSIX kills the owned child, win32 defers to the parent-gone wa
         assert.equal(killed, false, "win32 child.kill is TerminateProcess (no flush) — shutdown belongs to BILI_PARENT_PID watcher");
     } else {
         assert.equal(killed, true);
+    }
+});
+
+test("stopProxy: unlinks the temp log", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-stoplog-"));
+    const logPath = path.join(dir, "bili-proxy-8787.log");
+    fs.writeFileSync(logPath, "proxy output");
+    const child: SpawnChild = { pid: 77778, kill: () => true };
+    stopProxy({ origin: "http://127.0.0.1:8787", port: 8787, child, logPath });
+    assert.equal(fs.existsSync(logPath), false);
+    fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("gcStaleProxyLogs: removes only stale bili-proxy-*.log files", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-stale-"));
+    try {
+        const oldLog = path.join(dir, "bili-proxy-8787.log");
+        const freshLog = path.join(dir, "bili-proxy-8788.log");
+        const other = path.join(dir, "other.log");
+        const sub = path.join(dir, "bili-proxy-8789.log.d");
+        for (const p of [oldLog, freshLog, other]) fs.writeFileSync(p, "x");
+        fs.mkdirSync(sub);
+        const now = Date.now();
+        const oldT = new Date(now - 25 * 60 * 60 * 1000);
+        const freshT = new Date(now - 60 * 1000);
+        fs.utimesSync(oldLog, oldT, oldT);
+        fs.utimesSync(freshLog, freshT, freshT);
+        fs.utimesSync(other, oldT, oldT);
+        const removed = gcStaleProxyLogs(dir, now);
+        assert.equal(removed, 1);
+        assert.equal(fs.existsSync(oldLog), false);
+        assert.equal(fs.existsSync(freshLog), true);
+        assert.equal(fs.existsSync(other), true);
+        assert.ok(fs.existsSync(sub));
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
     }
 });
 

@@ -1449,6 +1449,7 @@ export async function ensureProxyRunning(
     const now = deps.now ?? Date.now;
     const sleepImpl = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
 
+    gcStaleProxyLogs();
     // #394/#417: a healthy proxy with a compatible config is SHARED, not
     // doubled — two concurrent launches of the same client would otherwise
     // spawn two writers over one sessions dir.
@@ -1526,6 +1527,11 @@ export async function ensureProxyRunning(
 
 export function stopProxy(handle: ProxyHandle): void {
     if (handle.attached) return;
+    if (handle.logPath) {
+        try {
+            fs.unlinkSync(handle.logPath);
+        } catch {}
+    }
     const child = handle.child;
     if (!child || child.pid === undefined) return;
     if (process.platform === "win32") {
@@ -1544,6 +1550,33 @@ export function stopProxy(handle: ProxyHandle): void {
     try {
         child.kill?.();
     } catch {}
+}
+
+// Orphan sweep for launcher temp logs left behind when a launcher crashes or
+// is killed before stopProxy runs. A live proxy rewrites its log on every
+// request, so anything older than 24 h is dead.
+const STALE_PROXY_LOG_MS = 24 * 60 * 60 * 1000;
+
+export function gcStaleProxyLogs(tmpDir: string = os.tmpdir(), nowMs: number = Date.now()): number {
+    let names: string[];
+    try {
+        names = fs.readdirSync(tmpDir);
+    } catch {
+        return 0;
+    }
+    let removed = 0;
+    for (const name of names) {
+        if (!name.startsWith("bili-proxy-") || !name.endsWith(".log")) continue;
+        const p = path.join(tmpDir, name);
+        try {
+            const st = fs.statSync(p);
+            if (st.isFile() && nowMs - st.mtimeMs > STALE_PROXY_LOG_MS) {
+                fs.unlinkSync(p);
+                removed++;
+            }
+        } catch {}
+    }
+    return removed;
 }
 
 export function runClient(

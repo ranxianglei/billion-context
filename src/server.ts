@@ -49,6 +49,7 @@ import { preflightCompress, estimateCoreMessages } from "./preflight.js";
 import { imageTokensInRawBody, imageTokensInParsedBody } from "./image-tokens.js";
 import { renderUI, handleConfigGet, handleConfigPut } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
+import { gcDebugDir } from "./state-gc.js";
 import { getStore } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger } from "./logger.js";
 import { configFile, defaultLogFile, stateDir } from "./paths.js";
@@ -1007,6 +1008,7 @@ async function handle(
             );
             const hdrText = Object.entries(hdrs).map(([k, v]) => `${k}: ${v}`).join("\n");
             fs.writeFileSync(`${rawDir}/${Date.now()}-INCOMING.txt`, `${req.method} ${maskUrlsInText(req.url ?? "")}\n${hdrText}\n\n${bodyBuffer.toString("utf8")}`);
+            gcDebugDir(rawDir);
         } catch (err) { logDumpFailure("INCOMING dump", err); }
     }
     // Per-request context limit + compression tuning: look up body.model against
@@ -2691,6 +2693,7 @@ async function forward(
                 } catch {
                     fs.writeFileSync(out, body);
                 }
+                gcDebugDir(dumpDir);
                 log("info", `[debug] forwarded body written to ${out}`);
             }
         } catch { /* best-effort */ }
@@ -2710,11 +2713,12 @@ async function forward(
     // requests can be byte-diffed to locate a cache-breaker that the JSON body
     // dump (which re-formats and omits headers) may hide. Enabled with
     // ACP_DUMP_BODY=1 (credential header values + non-public hosts masked).
+    let rawDir = "";
     const rawBase =
         bodyDumpEnabled()
             ? (() => {
                   try {
-                      const rawDir = process.env.ACP_RAW_DUMP_DIR || `${stateDir()}/raw`;
+                      rawDir = process.env.ACP_RAW_DUMP_DIR || `${stateDir()}/raw`;
                       fs.mkdirSync(rawDir, { recursive: true });
                       return `${rawDir}/${Date.now()}-${safeSessionId(prepared?.session.id)}`;
                   } catch {
@@ -2735,6 +2739,7 @@ async function forward(
                       : Buffer.from(body).toString("utf8");
             const reqPath = `${rawBase}-REQ.txt`;
             fs.writeFileSync(reqPath, `${req.method ?? "POST"} ${maskUrlForLog(upstreamUrl)}\n${hdrText}\n\n${bodyText}`);
+            gcDebugDir(rawDir);
             log("info", `[debug] RAW request dump: ${reqPath}`);
         } catch (err) { logDumpFailure("REQ dump", err); }
     }
@@ -2786,6 +2791,7 @@ async function forward(
                 .join("\n");
             const resPath = `${rawBase}-RES.txt`;
             fs.writeFileSync(resPath, `${upstream.status}\n${hdrText}\n`);
+            gcDebugDir(rawDir);
             log("info", `[debug] RAW response dump: ${resPath}`);
         } catch (err) { logDumpFailure("RES dump", err); }
     }
@@ -3329,7 +3335,7 @@ async function dumpStreamToFile(stream: ReadableStream<Uint8Array>, dir: string,
             }
         } finally {
             reader.releaseLock();
-            ws.end();
+            ws.end(() => gcDebugDir(dir));
         }
     } catch (err) {
         logDumpFailure("SSE stream dump", err);
