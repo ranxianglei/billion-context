@@ -115,7 +115,7 @@ function stripFinishReasonChunk(buf: Buffer): Buffer {
     }
 }
 
-export function createOpenaiAdapter(requestBody: Record<string, unknown>, clientSystem?: string): CompressLoopAdapter {
+export function createOpenaiAdapter(requestBody: Record<string, unknown>, clientSystem?: string, hostCredit = 0): CompressLoopAdapter {
     const model = (requestBody.model as string) ?? "unknown";
     let responseId = `chatcmpl-proxy-${Date.now()}`;
     let toolIndex = 0;
@@ -330,11 +330,35 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                         cachedTokens: typeof pd?.cached_tokens === "number" ? pd.cached_tokens : undefined,
                     } as ParsedStreamEvent;
                     if (sawRealToolCall) {
+                        // #408: this raw finish chunk (with the provider's
+                        // post-fold usage) reaches the host verbatim — add the
+                        // prepare-time credit back so the host anchors on the
+                        // uncompressed baseline.
+                        let chunk = rawBuf;
+                        if (hostCredit > 0 && u) {
+                            const pu = typeof u.prompt_tokens === "number" ? u.prompt_tokens : undefined;
+                            const tu = typeof u.total_tokens === "number" ? u.total_tokens : undefined;
+                            if (pu !== undefined || tu !== undefined) {
+                                const patched = {
+                                    ...parsed,
+                                    usage: {
+                                        ...u,
+                                        ...(pu !== undefined ? { prompt_tokens: pu + hostCredit } : {}),
+                                        ...(tu !== undefined ? { total_tokens: tu + hostCredit } : {}),
+                                    },
+                                };
+                                const out = eventStr
+                                    .split("\n")
+                                    .map((l) => (l.startsWith("data:") ? `data: ${JSON.stringify(patched)}` : l))
+                                    .join("\n");
+                                chunk = Buffer.from(out + "\n\n", "utf8");
+                            }
+                        }
                         // This verbatim chunk IS the round's authoritative completion
                         // (suppressCompletion); write it once and never fall through
                         // to the text/reasoning branches (which would re-emit the same
                         // bytes after the finish reason).
-                        yield { kind: "meta", chunk: rawBuf } as ParsedStreamEvent;
+                        yield { kind: "meta", chunk } as ParsedStreamEvent;
                         yield { kind: "done", finishReason, suppressCompletion: true } as ParsedStreamEvent;
                         continue;
                     } else {

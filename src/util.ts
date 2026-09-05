@@ -90,6 +90,34 @@ export function usageTotals(
     };
 }
 
+/** #408: add the prepare-time fold credit back into a usage object's
+ *  input-side fields, in place, so the host's usage anchor reports the
+ *  uncompressed baseline instead of the post-fold value the provider measured.
+ *  Field names per protocol: Anthropic/Responses `input_tokens` (TOTAL there),
+ *  OpenAI `prompt_tokens` (+ `total_tokens` to keep the sum consistent).
+ *  Returns true when anything was patched. */
+export function backfillHostUsage(
+    protocol: WireProtocol,
+    usage: Record<string, unknown>,
+    credit: number,
+): boolean {
+    if (!Number.isFinite(credit) || credit <= 0) return false;
+    let patched = false;
+    const add = (key: string): void => {
+        if (typeof usage[key] === "number" && Number.isFinite(usage[key])) {
+            usage[key] = (usage[key] as number) + credit;
+            patched = true;
+        }
+    };
+    if (protocol === "openai") {
+        add("prompt_tokens");
+        add("total_tokens");
+    } else {
+        add("input_tokens");
+    }
+    return patched;
+}
+
 /** Result of inspecting an upstream response for a "context too long" error. */
 export interface ContextOverflowInfo {
     /** True if the response looks like an upstream context-overflow error. */

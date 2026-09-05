@@ -135,6 +135,19 @@ export type Session = {
      *  retry callbacks to correlate a transient upstream rejection with the
      *  rewrite that preceded it (#189). A fresh process has none. */
     lastCompress?: LastCompressInfo;
+    /** In-memory only (NOT persisted): tokens folded out of THIS request's
+     *  forwarded view vs the host's own (unfolded) view, computed in prepare*
+     *  as est(originalMessages) − est(processedMessages). Usage recorders add
+     *  this back into the input-side usage field before forwarding to the host,
+     *  so the host's usage anchor carries the uncompressed baseline instead of
+     *  the post-fold value (#408). Overwritten each prepare(); 0 when nothing
+     *  was folded this request. */
+    hostCreditTokens?: number;
+    /** In-memory only (NOT persisted): last input-side usage total reported to
+     *  the host AFTER the hostCreditTokens backfill (uncompressed baseline).
+     *  Feeds the /acp panel tokenCount so it matches what the host footer
+     *  shows (#408). 0/undefined until the first backfilled usage lands. */
+    hostContextTokens?: number;
     /** Promise chain for per-session serialization. Two concurrent requests
      *  sharing a session id would interleave processTurn / stream-rewriter
      *  mutations on session.state, corrupting it. withSessionLock chains each
@@ -287,6 +300,8 @@ export function resetSessionCompression(session: Session): void {
     session.blockContents.clear();
     session.stats.lastInputTokens = 0;
     session.stats.contextTokens = 0;
+    session.hostCreditTokens = 0;
+    session.hostContextTokens = 0;
     session.metadata.nativeCompactionAt = Date.now();
     markDirty(session);
 }

@@ -122,6 +122,10 @@ function renderAcpStatus(s: Record<string, unknown>): string {
         const pct = contextLimit !== null && contextLimit > 0 ? ` (${((contextTokens / contextLimit) * 100).toFixed(1)}%)` : "";
         lines.push(`  context: ${fmtTok(contextTokens)}${contextLimit !== null ? ` / ${fmtTok(contextLimit)}` : ""}${pct}`);
     }
+    const hostCredit = num(s.hostCredit);
+    if (hostCredit !== null && hostCredit > 0) {
+        lines.push(`  host baseline: uncompressed (proxy backfilled +${fmtTok(hostCredit)} tok)`);
+    }
     if (inputTokens !== null || outputTokens !== null || cachedTokens !== null) {
         lines.push(`  in/out/cached: ${fmtTok(inputTokens ?? 0)} / ${fmtTok(outputTokens ?? 0)} / ${fmtTok(cachedTokens ?? 0)}`);
     }

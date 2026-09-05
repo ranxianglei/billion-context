@@ -197,8 +197,20 @@ export class SessionStore {
     async loadAll(): Promise<Map<string, Session>> {
         const out = new Map<string, Session>();
         if (!this.enabled) return out;
+        let clamped = 0;
         for (const [id, envelope] of await this.store.loadAll()) {
-            out.set(id, buildSession(envelope.payload));
+            const session = buildSession(envelope.payload);
+            if (hasNegativePersistedTokens(envelope.payload)) {
+                // #408 one-time migration: the in-memory value is already
+                // clamped by buildSession — rewrite the stale file so the
+                // negative value is gone from disk.
+                await this.store.writeNow(id, () => buildRecord(session));
+                clamped++;
+            }
+            out.set(id, session);
+        }
+        if (clamped > 0) {
+            loggerLog("info", `[persist] one-time migration (#408): clamped negative lastInputTokens/contextTokens in ${clamped} session(s) to 0`);
         }
         return out;
     }
@@ -339,7 +351,16 @@ export class SessionStore {
             meta?.protocol ? this.store.loadSync(id, relPathFor(id)) : null,
         ];
         for (const envelope of envelopes) {
-            if (envelope) return buildSession(envelope.payload);
+            if (envelope) {
+                const session = buildSession(envelope.payload);
+                if (hasNegativePersistedTokens(envelope.payload)) {
+                    // #408: sync context — debounce the stale-file rewrite
+                    // (buildSession already clamped the in-memory value).
+                    this.scheduleSave(session);
+                    loggerLog("info", `[persist] clamped negative token stats on reload for ${id} (#408)`);
+                }
+                return session;
+            }
         }
         return null;
     }
@@ -439,10 +460,14 @@ function buildSession(parsed: PersistedSession): Session {
             cachedTokens: stats.cachedTokens ?? parsed.cachedTokens ?? 0,
             outputTokens: stats.outputTokens ?? parsed.outputTokens ?? 0,
             cacheSamples: stats.cacheSamples ?? parsed.cacheSamples ?? 0,
-            lastInputTokens: stats.lastInputTokens ?? parsed.lastInputTokens ?? 0,
+            // #408: clamp at restore — pre-clamp versions persisted negative
+            // values (lastInputTokens = total − credit before the Math.max
+            // guard existed) which would otherwise revive after upgrade and
+            // feed the /acp panel + web stats as negative percentages.
+            lastInputTokens: Math.max(0, stats.lastInputTokens ?? parsed.lastInputTokens ?? 0),
             // In-memory only — a fresh process has no pending compress fold.
             compressCreditTokens: 0,
-            contextTokens: stats.contextTokens ?? parsed.contextTokens ?? 0,
+            contextTokens: Math.max(0, stats.contextTokens ?? parsed.contextTokens ?? 0),
         },
         metadata: parsed.metadata ?? {},
         state: mergeState(parsed.state),
@@ -465,6 +490,17 @@ function isValidRecord(parsed: unknown): parsed is PersistedSession {
     if (!parsed || typeof parsed !== "object") return false;
     const r = parsed as Partial<PersistedSession>;
     return typeof r.id === "string" && typeof r.state === "object" && r.state !== null && Array.isArray(r.state.blocks);
+}
+
+/** #408: true when a persisted record (grouped v2+ or flat v1) carries a
+ *  negative lastInputTokens/contextTokens — only possible in files written by
+ *  pre-clamp versions. buildSession clamps on read; this lets the loaders
+ *  rewrite the stale file once so the negative value is gone from disk. */
+function hasNegativePersistedTokens(parsed: PersistedSession): boolean {
+    const stats = parsed.stats ?? {};
+    const last = stats.lastInputTokens ?? parsed.lastInputTokens;
+    const ctx = stats.contextTokens ?? parsed.contextTokens;
+    return (typeof last === "number" && last < 0) || (typeof ctx === "number" && ctx < 0);
 }
 
 function defaultDir(): string {
