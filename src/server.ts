@@ -618,12 +618,56 @@ type Prepared = {
 // #388: side requests (title-gen etc.) share the main session key but must not
 // touch kernel state. Identified by a tiny output budget (same heuristic as
 // prepareOpenai's isTitleGen); a missing/non-positive budget is never a side req.
+// #546: a non-empty tools array marks an agent MAIN turn — clients that size the
+// output budget from their raw (uncompressed) history shrink max_tokens to
+// <=200 on long sessions; that must never demote the request to a side pass
+// (title-gen requests never carry tools).
 const SIDE_REQUEST_MAX_TOKENS = 200;
 export function isSideRequest(parsed: unknown): boolean {
     if (!parsed || typeof parsed !== "object") return false;
     const p = parsed as Record<string, unknown>;
+    if (Array.isArray(p.tools) && p.tools.length > 0) return false;
     const raw = p.max_tokens ?? p.max_completion_tokens ?? p.max_output_tokens;
     return typeof raw === "number" && raw > 0 && raw <= SIDE_REQUEST_MAX_TOKENS;
+}
+
+export type OutputBudgetField = "max_tokens" | "max_completion_tokens" | "max_output_tokens";
+
+export function outputBudgetField(parsed: unknown): OutputBudgetField | null {
+    if (!parsed || typeof parsed !== "object") return null;
+    const p = parsed as Record<string, unknown>;
+    for (const field of ["max_tokens", "max_completion_tokens", "max_output_tokens"] as const) {
+        if (typeof p[field] === "number" && (p[field] as number) > 0) return field;
+    }
+    return null;
+}
+
+/** #546: clients that derive the output budget from their RAW (uncompressed)
+ *  history drive it down to <=200 tokens on long sessions, then truncate every
+ *  reply mid-thought — the model cannot even emit a compress tool call, so the
+ *  loop can never rescue the session. The proxy's compressed view still fits
+ *  the window, so remember the healthy budget per session (last non-starved
+ *  value wins) and restore it on tool-carrying main requests whose budget has
+ *  starved. Mutates `parsed` in place BEFORE prepare() serializes it. */
+export function restoreOutputBudget(
+    parsed: unknown,
+    session: { id: string; metadata: Record<string, unknown> },
+    log: (level: string, msg: string) => void,
+): void {
+    const field = outputBudgetField(parsed);
+    if (!field) return;
+    const p = parsed as Record<string, unknown>;
+    const value = p[field] as number;
+    if (value > SIDE_REQUEST_MAX_TOKENS) {
+        session.metadata.outputBudgetHighWater = value;
+        return;
+    }
+    if (!Array.isArray(p.tools) || p.tools.length === 0) return;
+    const highWater = session.metadata.outputBudgetHighWater;
+    if (typeof highWater === "number" && highWater > SIDE_REQUEST_MAX_TOKENS) {
+        p[field] = highWater;
+        log("info", `[${session.id}] output budget restored ${value} -> ${highWater} (#546: client shrank it from its raw-history estimate)`);
+    }
 }
 
 function isTrustedAdminOrigin(origin: string | undefined, host: string | undefined, trustedHosts: Set<string>): boolean {
@@ -1289,6 +1333,10 @@ async function handle(
         //    exactly one system at index 0, #377) accept it and the head system
         //    message stays byte-stable for the prefix cache.
         const pluginMode = pluginAgent !== undefined;
+        // #546: restore a client-shrunk output budget BEFORE the side gate so a
+        // tool-carrying main request re-enters the pipeline at full budget (see
+        // restoreOutputBudget for the starvation mechanism).
+        restoreOutputBudget(parsed, session, log);
         // #388: side requests (title-gen etc.) share the main session key but
         // must not touch kernel state (processTurn/snapshot/usage would pollute
         // the main view). Forward with a minimal prepared marked sidePassthrough:
