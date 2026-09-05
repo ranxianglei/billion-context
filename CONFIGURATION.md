@@ -360,6 +360,8 @@ Environment variables take precedence over the config file. They are useful for 
 | `BILI_UPSTREAM_PROXY` | Upstream proxy for the proxy's own outbound connections — highest priority, above per-URL/per-provider config. See the README *Upstream proxy* section. |
 | `BILI_PERSIST` | Set `0` to disable session persistence (in-memory only, lost on restart). |
 | `BILI_PERSIST_DEBOUNCE_MS` | Debounce window for persistence writes to disk, in ms (default `500`). |
+| `BILI_PERSIST_EPERM_ALERT_THRESHOLD` | N consecutive persist write failures (`EPERM`/`EBUSY`/`EACCES`) on one session before the one-time "add this dir to antivirus exclusions" alert fires (default `5`). Windows only. See [Windows: exclude the sessions dir](#windows-exclude-the-sessions-dir-from-antivirus-362). |
+| `BILI_PERSIST_EPERM_ALERT_REPEAT_MS` | Re-alert window for the persist EPERM alert, in ms. `0` (default) = alert once then stay silent; `>0` = re-alert at most every that many ms while the failures continue. |
 | `BILI_TUNNEL_ALLOWED_HOSTS` | `/bili/<absolute-url>` tunnel admission for **remote clients** (#409): comma-separated `host` or `host:port` entries that unlock loopback/private destinations (e.g. a LAN relay or the machine's own sglang) for non-loopback clients. The proxy itself and link-local/metadata addresses are always denied; local (loopback) clients always pass. |
 | `BILI_MAX_SESSIONS` | Max sessions held in memory (default `256`; LRU eviction — disk is the source of truth). |
 | `BILI_SESSIONS_DIR` | Directory for persisted session state (default XDG data dir). |
@@ -656,3 +658,16 @@ Then start a new conversation in the client (direct to upstream) and paste the h
 Codex subagents (e.g. the `guardian_subagent` approval reviewer) reuse the main conversation's `session_id`, so on the wire they look like the same session. Without care their requests inherit the main conversation's compression state — a subagent turn can get its context folded (losing the verbatim user authorization it must read back) and the two roles' usage estimates pollute each other.
 
 billion-context detects this via the `instructions` field: subagent requests carry their own role prompt. The **first** instructions seen for a conversation anchor the main namespace (stable even if the main prompt drifts); any other instructions value maps to a separate `|sub:` namespace with its own empty compression state. Subagent requests are self-contained replays, so the fresh namespace is lossless — and the web UI's session list shows the two namespaces as separate sessions sharing the same client label.
+
+### Windows: exclude the sessions dir from antivirus (#362)
+
+billion-context persists each session's compression state to one JSON file per session under the sessions dir (`%USERPROFILE%\.local\share\billion-context\` by default) and rewrites that file on every turn of a long session. On Windows, real-time antivirus (Windows Defender), the search indexer, or a sync tool (OneDrive) can lock that directory mid-write. When the lock holds across several writes, the rename fails with `EPERM` and every persist for that session fails until the lock is cleared.
+
+When the same session fails N consecutive writes (default `5`, tunable via `BILI_PERSIST_EPERM_ALERT_THRESHOLD`), the proxy logs a **one-time, actionable alert** naming the exact directory to exclude. It does not repeat (set `BILI_PERSIST_EPERM_ALERT_REPEAT_MS > 0` to re-alert at most every M minutes while the failures continue).
+
+To stop the failures at the root, add the sessions dir to your antivirus exclusions and keep it out of any sync folder:
+
+1. **Windows Defender exclusions:** Settings → Privacy & security → Windows Security → Virus & threat protection → Manage settings → **Exclusions** → **Add an exclusion** → *Folder* → select `%USERPROFILE%\.local\share\billion-context\`.
+2. **Do not sync this directory.** Make sure OneDrive (or Dropbox / Google Drive / similar) is not syncing `%USERPROFILE%\.local\share\billion-context\`. If it lives under a synced folder, relocate it with `BILI_SESSIONS_DIR` to a non-synced path.
+
+High-frequency persist writes otherwise re-trigger the real-time scan on every turn — which is what produces the `EPERM` write failures. Once the directory is excluded, the alerts stop.

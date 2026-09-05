@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { StateStore, flatFileNameFor, type PersistedEnvelope } from "acp-kernel/persist";
 import { sessionsDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
+import { PersistEpermAlert } from "./persist-eperm.js";
 import { createInitialState, type CompressionState, type CoreMessage } from "acp-kernel";
 import type { Session, BlockContent, BlockView } from "./session.js";
 
@@ -175,12 +176,21 @@ export class SessionStore {
         const debounceMs = opts?.debounceMs ?? defaultDebounce();
         this.enabled = (opts?.enabled ?? true) && debounceMs >= 0;
         this.dir = opts?.dir ?? defaultDir();
+        const baseLog = opts?.log ?? defaultLogger;
+        const epermAlert = new PersistEpermAlert({
+            dir: this.dir,
+            threshold: epermAlertThreshold(),
+            repeatMs: epermAlertRepeatMs(),
+        });
         this.store = new StateStore<PersistedSession>({
             dir: this.dir,
             version: PERSIST_VERSION,
             debounceMs: Math.max(0, debounceMs),
             enabled: this.enabled,
-            log: opts?.log ?? defaultLogger,
+            log: (level, msg) => {
+                epermAlert.observe(level, msg);
+                baseLog(level, msg);
+            },
             relPath: (id, payload) =>
                 relPathFor(id, payload.meta?.protocol ?? payload.protocol, payload.meta?.upstreamOrigin ?? payload.upstreamOrigin),
             // Adopt the pre-envelope flat format this store itself wrote
@@ -484,6 +494,24 @@ function persistEnabled(): boolean {
     const env = process.env.BILI_PERSIST;
     if (env === "0" || env === "false") return false;
     return true;
+}
+
+function epermAlertThreshold(): number {
+    const env = process.env.BILI_PERSIST_EPERM_ALERT_THRESHOLD;
+    if (env) {
+        const n = Number.parseInt(env, 10);
+        if (Number.isFinite(n) && n > 0) return n;
+    }
+    return 5;
+}
+
+function epermAlertRepeatMs(): number {
+    const env = process.env.BILI_PERSIST_EPERM_ALERT_REPEAT_MS;
+    if (env) {
+        const n = Number.parseInt(env, 10);
+        if (Number.isFinite(n) && n >= 0) return n;
+    }
+    return 0;
 }
 
 function defaultLogger(level: string, m: string): void {
