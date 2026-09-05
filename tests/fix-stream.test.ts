@@ -112,7 +112,18 @@ test("client-abort: signal aborted during a re-request stops further re-requests
 test("client-abort control: without a signal, mutating rounds keep re-requesting up to the loop limit", async () => {
     let fetchCalls = 0;
     const orig = globalThis.fetch;
-    globalThis.fetch = (() => { fetchCalls++; return new Response(mutatingRound(), { status: 200 }); }) as typeof fetch;
+    globalThis.fetch = (() => {
+        fetchCalls++;
+        // Vary the summary each round so no two are byte-identical — the #156
+        // early-break must not fire; this control is about the abort signal, not
+        // the loop limit.
+        const round = [
+            sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+            fcEvents(0, "call_c", "compress", JSON.stringify({ content: [{ startId: "m00001", endId: "m00002", summary: `s${fetchCalls}` }] })),
+            COMPLETED,
+        ].join("");
+        return new Response(round, { status: 200 });
+    }) as typeof fetch;
     try {
         await drainSig(new Response(mutatingRound(), { status: 200 }).body!, makeCtx(), undefined);
         assert.ok(fetchCalls > 1, `control path re-requested multiple times (fetchCalls=${fetchCalls}); abort is what stops it`);

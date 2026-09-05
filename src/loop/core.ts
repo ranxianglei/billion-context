@@ -34,6 +34,27 @@ function stripLoopThinking(messages: CoreMessage[]): CoreMessage[] {
     return messages.filter((m) => !isLoopThinking(m));
 }
 
+// Canonical args for repeat-detection: key-order/whitespace differences must not
+// defeat an identical-call match, so parse + re-stringify with sorted keys.
+function canonicalArgs(args: string): string {
+    try {
+        return JSON.stringify(sortKeys(JSON.parse(args)));
+    } catch {
+        return args;
+    }
+}
+
+function sortKeys(v: unknown): unknown {
+    if (Array.isArray(v)) return v.map(sortKeys);
+    if (v !== null && typeof v === "object") {
+        const src = v as Record<string, unknown>;
+        const out: Record<string, unknown> = {};
+        for (const k of Object.keys(src).sort()) out[k] = sortKeys(src[k]);
+        return out;
+    }
+    return v;
+}
+
 export interface LoopCtx {
     core: CompressionCore;
     config: Config;
@@ -242,6 +263,11 @@ export async function* runCompressLoop(
                 loggerLog("warn", `[acp-loop] upstream rejected replay (HTTP ${info.status}); retrying in ${info.delayMs}ms (attempt ${info.attempt}/${info.maxAttempts})${lc}`);
             },
         );
+
+    // #156: compress/decompress calls already failed this loop. Validation is
+    // deterministic (identical args → identical failure), so a byte-identical
+    // re-submission can never succeed — break early instead of at MAX_LOOP_ROUNDS.
+    const failedSignatures = new Set<string>();
 
     try {
         for (let round = 1; round <= MAX_LOOP_ROUNDS; round++) {
@@ -570,6 +596,23 @@ export async function* runCompressLoop(
                 yield adapter.emitCompletion({ finishReason: "length", usage });
                 return;
             }
+
+            // #156: if this round is only failed compress/decompress and one of
+            // them re-submits args that already failed, the model is stuck in a
+            // deterministic failure loop — break early instead of burning rounds.
+            const failedMutating = proxyResults.filter(
+                (pr) => (pr.name === "compress" || pr.name === "decompress") && pr.result.includes("FAILED"),
+            );
+            if (reRequest && failedMutating.length > 0 && failedMutating.length === proxyResults.length) {
+                const repeated = failedMutating.some((pr) => failedSignatures.has(`${pr.name}\u0000${canonicalArgs(pr.arguments)}`));
+                if (repeated) {
+                    ctx.log(`[acp-loop] round ${round}: model re-submitted an already-failed compress with identical arguments; stopping after ${round} round(s) instead of ${MAX_LOOP_ROUNDS}`);
+                    loggerLog("warn", `[acp-loop] repeated identical compress failure at round ${round}; breaking early (#156)`);
+                    yield adapter.emitCompletion({ finishReason: "length", usage });
+                    return;
+                }
+            }
+            for (const pr of failedMutating) failedSignatures.add(`${pr.name}\u0000${canonicalArgs(pr.arguments)}`);
 
             ctx.log(`[acp-loop] round ${round}: proxy tool executed; re-requesting so the model sees the result`);
 
