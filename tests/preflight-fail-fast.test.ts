@@ -85,6 +85,34 @@ function startProxy(upstreamPort: number, models: Record<string, { context: numb
     } as ProxyOptions);
 }
 
+const FOLD_SUMMARY =
+    "PREFLIGHT SUMMARY: the segment covered a multi-step debugging session. " +
+    "Key decisions, files touched, and outcome are condensed here.";
+
+function makeUpstreamSummarize(calls?: Call[]): http.Server {
+    return http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c: Buffer) => chunks.push(c));
+        req.on("end", () => {
+            const raw = Buffer.concat(chunks).toString("utf8");
+            let parsed: { stream?: boolean } = {};
+            try { parsed = JSON.parse(raw); } catch { /* keep {} */ }
+            calls?.push({ stream: !!parsed.stream, body: raw });
+            if (parsed.stream) {
+                res.writeHead(200, { "content-type": "text/event-stream" });
+                res.end(okSse(1000));
+            } else {
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(JSON.stringify({
+                    id: "msg_summary", type: "message", role: "assistant", model: "claude-small",
+                    content: [{ type: "text", text: FOLD_SUMMARY }], stop_reason: "end_turn",
+                    usage: { input_tokens: 500, output_tokens: 50 },
+                }));
+            }
+        });
+    });
+}
+
 test("e2e #301: overflow + summary upstream 429 → structured 503, over-window payload NOT forwarded", async () => {
     const calls: Call[] = [];
     // The preflight summarization call hits the same rate-limited upstream as
@@ -218,6 +246,45 @@ test("e2e #301: over-window payload with nothing compressible → structured 502
         assert.ok(json.error?.message?.includes("NOT forwarded"), `message states the payload was withheld (got: ${json.error?.message})`);
         assert.equal(calls.filter((c) => !c.stream).length, 0, "no summarization call was spent on an incompressible payload");
         assert.equal(calls.filter((c) => c.stream).length, 0, "the over-window payload was NOT forwarded upstream");
+    } finally {
+        proxy.close();
+        await once(proxy, "close");
+        upstream.close();
+        await once(upstream, "close");
+    }
+});
+
+test("e2e #470: text fits the window alone but system+tools push the billed input over → preflight folds and forwards", async () => {
+    const calls: Call[] = [];
+    const upstream = makeUpstreamSummarize(calls);
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = upstream.address().port;
+
+    // bigConversation() is 13.1k tokens: under a 15k window on TEXT alone
+    // (master's estimateCoreMessages would skip preflight), yet the injected
+    // compress prompt + ACP tools (~2.4k) push the BILLED input to 15.5k, past
+    // the window. Only counting the envelope makes preflight fire, fold, and
+    // forward — otherwise the over-window body goes up as-is (upstream 400).
+    const proxy = await startProxy(upstreamPort, { "claude-small": { context: 15_000 } });
+    await once(proxy, "listening");
+    const proxyPort = proxy.address().port;
+
+    try {
+        const r = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "preflight-envelope-sess" },
+            body: JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: bigConversation() }),
+        });
+        assert.equal(r.status, 200, "envelope-driven overflow is folded and forwarded (not fail-fast, not blind forward)");
+        await r.text();
+
+        assert.ok(calls.filter((c) => !c.stream).length >= 1, "preflight made a summarization call (master skipped preflight entirely)");
+        const forwards = calls.filter((c) => c.stream);
+        const lastForward = forwards[forwards.length - 1];
+        assert.ok(lastForward, "the folded payload was forwarded");
+        assert.ok(!lastForward.body.includes("MARKER_1_"), "an early message was folded out of the forwarded body");
+        assert.ok(lastForward.body.includes(FOLD_SUMMARY), "the folded summary is in the rebuilt payload");
     } finally {
         proxy.close();
         await once(proxy, "close");

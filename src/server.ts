@@ -1761,6 +1761,55 @@ export function clampOutputBudget(requested: number, inputEstimate: number, nati
     return cap;
 }
 
+function isObj(v: unknown): v is Record<string, unknown> {
+    return typeof v === "object" && v !== null;
+}
+
+/** #470: system/instructions + tools billed on top of the messages (which
+ *  estimateCoreMessages omits). Read from the rebuilt body so it's mode-correct;
+ *  text-only, so it never double-counts imageTokensInRawBody. Unparseable -> 0. */
+export function estimateWireOverhead(protocol: "anthropic" | "openai" | "responses", body: string | Buffer): number {
+    const s = typeof body === "string" ? body : body.toString("utf8");
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(s);
+    } catch {
+        return 0;
+    }
+    if (!isObj(parsed)) return 0;
+    const textOf = (content: unknown): string => {
+        if (typeof content === "string") return content;
+        if (!Array.isArray(content)) return "";
+        let out = "";
+        for (const part of content) if (isObj(part) && typeof part.text === "string") out += part.text;
+        return out;
+    };
+    let systemText = "";
+    if (protocol === "anthropic") {
+        const sys = parsed.system;
+        if (typeof sys === "string") systemText = sys;
+        else if (Array.isArray(sys)) for (const blk of sys) if (isObj(blk) && typeof blk.text === "string") systemText += blk.text;
+    } else if (protocol === "openai") {
+        const msgs = parsed.messages;
+        if (Array.isArray(msgs)) {
+            for (const m of msgs) {
+                if (!isObj(m) || (m.role !== "system" && m.role !== "developer")) continue;
+                systemText += textOf(m.content);
+            }
+        }
+    } else {
+        if (typeof parsed.instructions === "string") systemText += parsed.instructions;
+        const input = parsed.input;
+        if (Array.isArray(input)) {
+            for (const item of input) {
+                if (!isObj(item) || item.role !== "developer") continue;
+                systemText += textOf(item.content);
+            }
+        }
+    }
+    return defaultCountTokens(systemText) + defaultCountTokens(JSON.stringify(parsed.tools ?? []));
+}
+
 // Only override genuine cadence silences: skip the kernel's deliberate
 // "nothing compressible to offer" suppression (empty ranges).
 export function emergencyNudge(nudge: NudgeDecision | null | undefined, escalationPct: number = EMERGENCY_NUDGE_ESCALATION_PCT): boolean {
@@ -2524,8 +2573,10 @@ async function preflightCompressIfNeeded(
     // #488: images are forwarded verbatim but invisible to the kernel's text model —
     // add their cost to every size decision here (trigger, fit gates, self-heal).
     const imageTokens = imageTokensInRawBody(prepared.protocol, prepared.body);
+    // #470: system/instructions + tools are billed but invisible to estimateCoreMessages; count them or the trigger fires late and the post-fold gates pass over-window payloads.
+    const wireOverhead = estimateWireOverhead(prepared.protocol, prepared.body);
     const textEstimate = estimateCoreMessages(prepared.processedMessages);
-    const payloadEstimate = textEstimate + imageTokens;
+    const payloadEstimate = textEstimate + imageTokens + wireOverhead;
     const tokenCount = Math.max(session.stats.lastInputTokens, payloadEstimate);
     if (limit <= 0 || !model || tokenCount < limit) return prepared;
     // #496 forward-once-then-learn: the default image cost (base64/4) matches byte
@@ -2543,8 +2594,8 @@ async function preflightCompressIfNeeded(
         (model ? learnedMap?.[model] : undefined) ??
         (session.metadata.learnedContextLimit as number | undefined);
     const noOverflowEvidence = session.stats.lastInputTokens < limit && learnedLimit === undefined;
-    if (imageTokens > 0 && textEstimate < limit && noOverflowEvidence) {
-        log("warn", `[${session.id}] image-dominated payload (~${textEstimate} text + ~${imageTokens} image tokens) exceeds window ${limit} by estimate only, no upstream overflow evidence — forwarding once so the upstream arbitrates billing (#496)`);
+    if (imageTokens > 0 && textEstimate + wireOverhead < limit && noOverflowEvidence) {
+        log("warn", `[${session.id}] image-dominated payload (~${textEstimate + wireOverhead} non-image + ~${imageTokens} image tokens) exceeds window ${limit} by estimate only, no upstream overflow evidence — forwarding once so the upstream arbitrates billing (#496)`);
         return prepared;
     }
     // #301: forwarding as-is is safe ONLY when the payload's own estimate
@@ -2594,6 +2645,7 @@ async function preflightCompressIfNeeded(
             signal: clientAbort.signal,
             log,
             imageFloor: imageTokens,
+            wireOverhead,
         },
         prepared.originalMessages,
     );

@@ -30,14 +30,14 @@ function completed(inputTokens: number): string {
     });
 }
 
-// 7 messages × ~4400 chars (~1100 tokens each, ~7700 total). Above the
-// kernel's 5000-token recent-tail protection so m00001/m00002 stay
-// compressible (a tier-1 pending range for the nudge), but below the 10k
-// window so preflight never fires.
+// 7 messages sized so the turn's billed input (text + system/instructions +
+// tools, #470) stays under the 10k window (preflight never fires on turn 1)
+// while m00001/m00002 remain above the recent-tail protection — the pending
+// range the over-limit nudge points at.
 function conversation() {
     const input: { type: string; role: string; content: string }[] = [];
     for (let i = 0; i < 7; i++) {
-        input.push({ type: "message", role: i % 2 === 0 ? "user" : "assistant", content: `Message ${i} of the working session. ` + `WORK_${i}_content_`.repeat(290) });
+        input.push({ type: "message", role: i % 2 === 0 ? "user" : "assistant", content: `Message ${i} of the working session. ` + `WORK_${i}_content_`.repeat(250) });
     }
     return input;
 }

@@ -162,37 +162,38 @@ function turn2Compressible(): Record<string, unknown>[] {
 }
 
 test("#453 clamp: oversized max_tokens is reduced when input+system nearly fills the window", async () => {
-    // window 100k, requested max_tokens 40k -> reserved window 60k. The core
-    // conversation estimates ~48k (under 60k, so preflight skips — it ignores the
-    // system), but the 60k-char system pushes the TRUE input past 60k. Only the
-    // clamp sees the system, so it lowers max_tokens to keep input+output under 100k.
+    // window 400k / max_tokens 150k -> reserved input budget 250k. Billed input
+    // (core+system+tools) is sized just under 250k so preflight skips, yet adding
+    // the 150k output pushes input+output over the window -> only the clamp acts.
+    // Re-sized from 100k/40k (#470): preflight now counts the envelope, so the old
+    // shape tripped preflight instead of isolating the clamp.
     const fired = await drive({
         sessionId: "clamp-fire",
-        window: 100_000,
+        window: 400_000,
         turn1PromptTokens: 5_000,
         turn2Body: {
-            model: "m", max_tokens: 40_000,
+            model: "m", max_tokens: 150_000,
             messages: [
-                { role: "system", content: "z".repeat(60_000) },
+                { role: "system", content: "z".repeat(380_000) },
                 { role: "user", content: "hi" },
-                { role: "assistant", content: "y".repeat(192_000) },
+                { role: "assistant", content: "y".repeat(576_000) },
                 { role: "user", content: "now" },
             ],
         },
     });
     const out = typeof fired.turn2Body.max_tokens === "number" ? fired.turn2Body.max_tokens : undefined;
     assert.ok(out !== undefined, "forwarded body carries a numeric max_tokens");
-    assert.ok(out! < 40_000, `max_tokens clamped below the 40k request (got ${out})`);
+    assert.ok(out! < 150_000, `max_tokens clamped below the 150k request (got ${out})`);
     assert.ok(out! > 0, "clamped budget stays positive");
 
     // Control: no oversized system -> input fits -> max_tokens passes through.
     const ctrl = await drive({
         sessionId: "clamp-ctrl",
-        window: 100_000,
+        window: 400_000,
         turn1PromptTokens: 5_000,
-        turn2Body: { model: "m", max_tokens: 40_000, messages: turn2Compressible() },
+        turn2Body: { model: "m", max_tokens: 150_000, messages: turn2Compressible() },
     });
-    assert.equal(ctrl.turn2Body.max_tokens, 40_000, "unclamped when input fits the window");
+    assert.equal(ctrl.turn2Body.max_tokens, 150_000, "unclamped when input fits the window");
 });
 
 test("#453 escalation: nudge injected at the escalation line though the kernel cadence-stays silent", async () => {

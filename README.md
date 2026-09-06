@@ -61,7 +61,7 @@ The proxy runs in one of two modes, and **the mode decides who executes
 | Client | ACP-native agent with the bili extension (pi/omp) | Any OpenAI/Anthropic client, no extension |
 | Who executes `compress` | **The agent** (pi runs it locally) | **The proxy** (server-side compress loop) |
 | `compress` tool call in the re-sent history? | Yes — part of the agent's own conversation | No — ephemeral proxy-loop traffic |
-| Preflight blocks (no tool call)? | No — overflow forces the model to call `compress` | Yes — `src/preflight.ts` compresses behind the client's back |
+| Preflight blocks (no tool call)? | Yes — active here too as a last-resort backstop (e.g. #453); normally the agent's own `compress` fires first via the nudge | Yes — `src/preflight.ts` compresses behind the client's back |
 | **Summary carrier on the wire** | **the `compress` tool call** | **an `acp_summary` user message** |
 | System messages on the wire | always exactly 1 (client + prompt) | always exactly 1 (client + prompt) — summaries ride on user messages |
 | SGLang "single system" 400 (#377) | cannot happen | cannot happen (summaries are user messages, not system) |

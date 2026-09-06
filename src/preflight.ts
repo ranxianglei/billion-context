@@ -44,6 +44,8 @@ export interface PreflightDeps {
     log: (level: string, msg: string) => void;
     /** Constant floor on the forwarded-payload size for this request (image bytes, #488). Folding only ever removes images, so adding this to every text estimate keeps the fit decision sound for multimodal payloads. */
     imageFloor?: number;
+    /** Constant billed-but-not-in-messages envelope cost (system/instructions + tools, #470). Folding never removes it, so it floors every size decision — without it the loop stops at "text fits" while the billed input overflows and the caller's overhead-aware gate fail-fasts a foldable payload. */
+    wireOverhead?: number;
 }
 
 export type PreflightFailureKind = "upstream" | "exhausted" | "aborted";
@@ -226,7 +228,7 @@ const ABORTED_FAILURE: PreflightFailure = { kind: "aborted", detail: "the client
 
 export async function preflightCompress(deps: PreflightDeps, messages: CoreMessage[]): Promise<PreflightResult> {
     const limit = deps.config.modelContextLimit;
-    const result: PreflightResult = { compressedRanges: 0, savedTokens: 0, payloadEstimate: estimateCoreMessages(messages) + (deps.imageFloor ?? 0) };
+    const result: PreflightResult = { compressedRanges: 0, savedTokens: 0, payloadEstimate: estimateCoreMessages(messages) + (deps.imageFloor ?? 0) + (deps.wireOverhead ?? 0) };
     if (limit <= 0) return result;
     const budget = Math.max(MIN_CHUNK_TOKENS, Math.floor(limit * CHUNK_FRACTION));
     // applyCompression rejects ranges below config.compress.minCompressRange
@@ -257,10 +259,10 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         // Floor on the session's measured input baseline: the upstream's
         // input_tokens also covers the system prompt + tool definitions, which
         // are not in turn.messages, so the direct estimate can undershoot.
-        currentTokens = Math.max(deps.session.stats.lastInputTokens, estimateCoreMessages(turn.messages) + (deps.imageFloor ?? 0));
+        currentTokens = Math.max(deps.session.stats.lastInputTokens, estimateCoreMessages(turn.messages) + (deps.imageFloor ?? 0) + (deps.wireOverhead ?? 0));
         // The caller's forward/fail-fast gate uses the payload's own estimate
         // (the floor can be stale — see PreflightResult.payloadEstimate).
-        result.payloadEstimate = estimateCoreMessages(turn.messages) + (deps.imageFloor ?? 0);
+        result.payloadEstimate = estimateCoreMessages(turn.messages) + (deps.imageFloor ?? 0) + (deps.wireOverhead ?? 0);
         if (startTokens < 0) startTokens = currentTokens;
         if (currentTokens < limit) break;
         const ranges = viableRanges(turn.nudge?.compressibleRanges ?? []);
