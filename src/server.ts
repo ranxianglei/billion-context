@@ -1737,13 +1737,17 @@ function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; cont
     return `[${sessionId}] nudge ${inject}: usage=${pct} (${tokenCount}/${limit}), growth=${growth}/${floor} (ref=${ref}, interval=${interval}), pendingT1=${pendingT1}/${interval}${modelTag}, reason="${n.reason.slice(0, 120)}"`;
 }
 
-// #590: hosts that get the #408 uncompressed-baseline usage backfill. pi's
-// plugin cancels pi's own auto-compaction (billion-context-pi
-// wireCompactionDisable: "ACP owns compression"), so the baseline drives
-// nothing there — reporting it only put a >100% footer on the host that
-// mismatches the folded request actually forwarded. Hosts whose native
-// compaction stays live (omp anchored-rewrite accounting, codex native-compact
-// interception, plain proxy clients) keep the #408 behavior.
+// #408/#590/#623: hosts that get the #408 uncompressed-baseline usage
+// backfill. pi's AND omp's bili extensions cancel the host's NATIVE compaction
+// so ACP owns compression — pi cancels auto-compaction, omp cancels ALL
+// compaction (its session_before_compact event carries no reason field, so
+// manual /compact can't be preserved). With the host's compaction off, the
+// uncompressed baseline drives nothing on the host side; reporting it only puts
+// a >100% footer that mismatches the folded request actually forwarded
+// (#590 pi 302.7%, #623 omp 205%). Gate on pluginAgent so ONLY the
+// bili-launched extensions are exempted: plain proxy clients and codex
+// native-compact interception keep the #408 behavior (their native compaction
+// stays live and consumes the baseline).
 function armHostUsageCredit(
     session: Session,
     originalMessages: CoreMessage[],
@@ -1751,7 +1755,7 @@ function armHostUsageCredit(
     log: (level: string, msg: string) => void,
 ): void {
     session.hostCreditTokens = 0;
-    if (session.metadata.pluginAgent === "pi") return;
+    if (session.metadata.pluginAgent === "pi" || session.metadata.pluginAgent === "omp") return;
     // #408: tokens folded out of the forwarded view vs the host's own (unfolded)
     // view — added back into the usage reported to the host so its anchor
     // reflects the uncompressed baseline. Same estimator both sides, so

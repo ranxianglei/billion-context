@@ -632,3 +632,119 @@ test("#590: pi plugin mode reports folded usage — host backfill suppressed", a
         await new Promise<void>((resolve, reject) => relay.close((e) => (e ? reject(e) : resolve())));
     }
 });
+
+test("#623: omp plugin mode reports folded usage — host backfill suppressed", async () => {
+    // Mirrors the #590 pi e2e, binding the session as omp. The wire is
+    // incidental — armHostUsageCredit's pluginAgent gate is protocol-agnostic;
+    // reusing the proven pi fixture guarantees a real fold (not a vacuous pass).
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    _resetPluginStateForTest();
+    const upstreamBodies: string[] = [];
+    const anthropicSse = (event: string, data: unknown): string => `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+    const relay = http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c: Buffer) => chunks.push(c));
+        req.on("end", () => {
+            const body = Buffer.concat(chunks).toString("utf8");
+            upstreamBodies.push(body);
+            res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+            res.write(anthropicSse("message_start", { type: "message_start", message: { id: "msg_omp_1", role: "assistant", usage: { input_tokens: 100, output_tokens: 3 } } }));
+            res.write(anthropicSse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }));
+            res.write(anthropicSse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } }));
+            res.write(anthropicSse("content_block_stop", { type: "content_block_stop", index: 0 }));
+            res.write(anthropicSse("message_delta", { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 3 } }));
+            res.write(anthropicSse("message_stop", { type: "message_stop" }));
+            res.end();
+        });
+    });
+    relay.listen(0, "127.0.0.1");
+    await once(relay, "listening");
+    const relayPort = (relay.address() as { port: number }).port;
+    const opts: ProxyOptions = {
+        port: 0,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1",
+        routes: { [`http://127.0.0.1:${relayPort}`]: { models: { "claude-test": { context: 400_000 } } } } as ProxyOptions["routes"],
+        modelContextLimit: 400_000,
+        kernelConfig: defaultConfig(400_000),
+        compress: { injectTool: true, injectNudge: false },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        mitm: { enabled: false, domains: [] },
+    };
+    const proxy = await startServer(opts);
+    await once(proxy, "listening");
+    const proxyPort = (proxy.address() as { port: number }).port;
+    const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${relayPort}/v1/messages`;
+    const headFiller = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. ".repeat(28);
+    const tailFiller = "enim ad minim veniam quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat duis aute irure dolor in reprehenderit in voluptate. ".repeat(28);
+    type AnthropicMessage = { role: string; content: string | Array<Record<string, unknown>> };
+    const history: AnthropicMessage[] = [];
+    for (let i = 1; i <= 2; i++) {
+        history.push({ role: "user", content: `turn-${i}-marker question: ${headFiller}` });
+        history.push({ role: "assistant", content: `turn-${i}-marker ${i === 1 ? "SENTINEL_FOLD_GONE " : ""}answer: ${headFiller}` });
+    }
+    for (let i = 3; i <= 5; i++) {
+        history.push({ role: "user", content: `turn-${i} padding question: ${tailFiller}` });
+        history.push({ role: "assistant", content: `turn-${i} padding answer: ${tailFiller}` });
+    }
+    const conv = "omp-folded-usage-1";
+    const post = async (messages: AnthropicMessage[]): Promise<string> => {
+        const res = await fetch(url, {
+            method: "POST",
+            headers: {
+                "content-type": "application/json",
+                "x-acp-session": conv,
+                "x-bili-plugin": "omp",
+                "x-bili-plugin-conversation": conv,
+            },
+            body: JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: true, system: "You are a test assistant.", messages }),
+        });
+        if (!res.ok) {
+            const text = await res.text();
+            assert.fail(`HTTP ${res.status}: ${text}`);
+        }
+        let raw = "";
+        for await (const chunk of res.body!) raw += Buffer.from(chunk).toString("utf8");
+        return raw;
+    };
+    const inputTokensOf = (raw: string): number => {
+        const m = raw.match(/"input_tokens":(\d+)/);
+        assert.ok(m, `message_start usage missing: ${raw.slice(0, 400)}`);
+        return Number(m[1]);
+    };
+    try {
+        const r1 = await post(history);
+        assert.equal(inputTokensOf(r1), 100, "pre-fold turn must pass the raw usage through");
+
+        const toolResp = await fetch(`http://127.0.0.1:${proxyPort}/__bili/plugin/tool`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+                conversationId: conv,
+                tool: "compress",
+                args: { content: [{ topic: "omp-folded-usage", startId: "m00001", endId: "m00002", summary: "omp-side compress of the two early turns covering the lorem-ipsum questions and answers" }] },
+            }),
+        });
+        assert.equal(toolResp.status, 200);
+        const toolJson = (await toolResp.json()) as { ok: boolean; result: string };
+        assert.equal(toolJson.ok, true, `compress tool reported failure: ${toolJson.result}`);
+
+        const r2 = await post([
+            ...history,
+            { role: "assistant", content: [{ type: "tool_use", id: "toolu_omp_1", name: "compress", input: { startId: "m00001", endId: "m00002", topic: "omp-folded-usage", summary: "omp-side compress of the two early turns covering the lorem-ipsum questions and answers" } }] },
+            { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_omp_1", content: toolJson.result }] },
+        ]);
+        assert.equal(upstreamBodies.length, 2);
+        assert.ok(!upstreamBodies[1]!.includes("SENTINEL_FOLD_GONE"), "post-fold upstream body must not carry the folded head content");
+        assert.equal(inputTokensOf(r2), 100, "omp plugin mode must report the folded request's own usage — no uncompressed-baseline backfill (#623)");
+    } finally {
+        await new Promise<void>((resolve, reject) => proxy.close((e) => (e ? reject(e) : resolve())));
+        await new Promise<void>((resolve, reject) => relay.close((e) => (e ? reject(e) : resolve())));
+    }
+});
