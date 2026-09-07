@@ -2,6 +2,12 @@ import { DEFAULT_ABSORB_CONFIG, defaultPrompts, resolvePrompts, type AbsorbConfi
 import { findRoute, type CompressSettings, type ProviderRoutes } from "./config.js";
 import { log as loggerLog } from "./logger.js";
 
+/** Host-side policy default for `compress.stripImagesKeepRecent` (#617): how
+ *  many of the most recent messages keep their image payloads when stripping
+ *  is enabled. The strip mechanism itself lives in acp-kernel's wire layer
+ *  (kernel #215) — only the opt-in policy stays host-side. */
+export const DEFAULT_STRIP_IMAGES_KEEP_RECENT = 5;
+
 /** Resolve a raw `contextLimit` value to an absolute token count.
  *  - `number` → used as-is (absolute window).
  *  - `string` ending in `%` (e.g. `"70%"`) → that fraction of `nativeLimit`.

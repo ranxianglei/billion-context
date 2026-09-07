@@ -151,11 +151,13 @@ export type CompressSettings = {
         toolName?: string;
     };
 
-/** Opt-in removal of historical image payloads (src/strip-images.ts). When
-     *  true, every message except the most recent {@link stripImagesKeepRecent}
-     *  has its image parts dropped before the wire rebuild (image-only content
-     *  collapses to an "[image]" placeholder). Off by default — the #488 image
-     *  floor / overflow 502 stays the opt-in signal until this is enabled. */
+    /** Opt-in removal of historical image payloads, executed by the kernel's
+     *  wire-layer primitive `stripHistoricalImages` from "acp-kernel/wire"
+     *  (kernel #215; host-side policy only). When true, every message except
+     *  the most recent {@link stripImagesKeepRecent} has its image parts dropped
+     *  before the wire rebuild (image-only content collapses to an "[image]"
+     *  placeholder). Off by default — the #488 image floor / overflow 502 stays
+     *  the opt-in signal until this is enabled. */
     stripImages?: boolean;
     /** With {@link stripImages}, how many trailing messages keep their images
      *  verbatim (default 5). Ignored unless stripImages is true. */
