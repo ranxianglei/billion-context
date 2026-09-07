@@ -33,3 +33,19 @@ test("parseArgs: -F composes with other bili flags before the client (#346)", ()
     assert.equal(r.overrides.BILI_UPSTREAM_PROXY, "http://127.0.0.1:7897");
     assert.deepEqual(r.clientArgs, []);
 });
+
+// #521: internal `daemon` subcommand used by bili agent plugins (dsh native).
+test("parseArgs: daemon subcommand flags (#521)", () => {
+    const r = parseArgs(["daemon", "--fresh", "--json", "--parent-pid", "42"]);
+    assert.equal(r.command, "daemon");
+    assert.equal(r.daemonFresh, true);
+    assert.equal(r.daemonJson, true);
+    assert.equal(r.daemonParentPid, "42");
+});
+
+test("parseArgs: daemon without flags parses as plain command (#521)", () => {
+    const r = parseArgs(["daemon"]);
+    assert.equal(r.command, "daemon");
+    assert.equal(r.daemonFresh, false);
+    assert.equal(r.daemonParentPid, undefined);
+});

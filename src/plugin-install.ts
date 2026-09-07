@@ -8,6 +8,7 @@
 //   claude   `claude mcp add` (user scope; writes ~/.claude.json)
 //   codex    ~/.codex/config.toml        [mcp_servers.bili]
 //   opencode ~/.config/opencode/opencode.json  mcp.bili
+//   dsh      <DSH_HOME>/profiles/*/cordis.patch.yml  insert: [dist/agent/dsh-acp.js]
 // Installers throw on failure (bad/locked config, missing host CLI); the CLI
 // layer catches, prints `bili plugin: <msg>` and exits 1.
 
@@ -15,8 +16,8 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { execFileSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
-import { resolvePiHome } from "./client-config.js";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { resolvePiHome, resolveDshHome } from "./client-config.js";
 import { isPidAlive, isProxyInstanceFile, readProxyInstanceFile } from "./instance.js";
 
 /** #403: never freeze a dead or unverifiable origin into a client's
@@ -36,7 +37,7 @@ function proxyOriginForInstall(): string {
     return inst.origin;
 }
 
-export const PLUGIN_AGENTS = ["pi", "omp", "claude", "codex", "opencode"] as const;
+export const PLUGIN_AGENTS = ["pi", "omp", "claude", "codex", "opencode", "dsh"] as const;
 export type PluginAgent = (typeof PLUGIN_AGENTS)[number];
 
 export function selfPackageRoot(): string {
@@ -451,6 +452,168 @@ function opencodeStatus(): string {
     return mcp && "bili" in mcp ? "installed" : "not installed";
 }
 
+// — dsh ————————————————————————————————————————————————————————————————
+
+// A cordis.patch.yml entry that loads the bili dsh plugin (any install):
+// `- name:` value ending in dist/agent/dsh-acp.js (file:// URL or bare path).
+const DSH_ENTRY_RE = /[\\/]dist[\\/]agent[\\/]dsh\-acp\.js$/;
+
+function dshPluginFile(): string {
+    return path.join(selfPackageRoot(), "dist", "agent", "dsh-acp.js");
+}
+
+function dshProfileDirs(home: string): string[] {
+    const profilesDir = path.join(home, "profiles");
+    let names: string[];
+    try {
+        names = fs.readdirSync(profilesDir, { withFileTypes: true })
+            .filter((d) => d.isDirectory() && d.name !== "node_modules")
+            .map((d) => d.name);
+    } catch {
+        return [];
+    }
+    return names
+        .map((n) => path.join(profilesDir, n))
+        .filter((dir) => fs.existsSync(path.join(dir, "cordis.yml")) || fs.existsSync(path.join(dir, "package.json")));
+}
+
+function dshEntryValue(line: string): string {
+    const t = line.trim().replace(/#.*$/, "");
+    const m = /^-\s*name:\s*(.+)$/.exec(t);
+    return m ? m[1]!.trim().replace(/^["']|["']$/g, "") : "";
+}
+
+function dshEntryValues(text: string): string[] {
+    return text.split("\n").map(dshEntryValue).filter((v) => v.length > 0 && DSH_ENTRY_RE.test(v));
+}
+
+function dshEntryTarget(value: string): string | undefined {
+    try {
+        return value.startsWith("file://") ? fileURLToPath(value) : value;
+    } catch {
+        return undefined;
+    }
+}
+
+// Drop every bili dsh entry from the patch file. An entry is one `- name:`
+// item inside a top-level `- insert:` group; the group itself goes only when
+// no other items remain (other plugins may share it).
+function stripDshEntries(text: string): string {
+    const lines = text.split("\n");
+    const drop = new Set<number>();
+    for (let i = 0; i < lines.length; i++) {
+        if (!/^\s*- insert:\s*(#.*)?$/.test(lines[i]!)) continue;
+        const parentIndent = indentOf(lines[i]!);
+        let remaining = 0;
+        let hasOurs = false;
+        for (let j = i + 1; j < lines.length; j++) {
+            const raw = lines[j]!;
+            const t = raw.trimStart();
+            if (t === "" || t.startsWith("#")) continue;
+            if (indentOf(raw) <= parentIndent || !t.startsWith("- ")) break;
+            const value = dshEntryValue(raw);
+            if (value !== "" && DSH_ENTRY_RE.test(value)) {
+                drop.add(j);
+                hasOurs = true;
+            } else {
+                remaining++;
+            }
+        }
+        if (hasOurs && remaining === 0) drop.add(i);
+    }
+    if (drop.size === 0) return text;
+    return lines.filter((_, i) => !drop.has(i)).join("\n");
+}
+
+function indentOf(line: string): number {
+    return /^\s*/.exec(line)![0].length;
+}
+
+function insertDshEntry(text: string, entry: string): string {
+    const lines = stripDshEntries(text).split("\n");
+    const emptyIdx = lines.findIndex((l) => l.trim() === "[]");
+    if (emptyIdx >= 0) {
+        lines.splice(emptyIdx, 1, "- insert:", `    - name: ${entry}`);
+        return lines.join("\n");
+    }
+    let head = lines.join("\n");
+    if (head.length > 0 && !head.endsWith("\n")) head += "\n";
+    return `${head}- insert:\n    - name: ${entry}\n`;
+}
+
+function dshLiveIn(file: string): boolean {
+    if (!fs.existsSync(file)) return false;
+    return dshEntryValues(fs.readFileSync(file, "utf8")).some((v) => {
+        const target = dshEntryTarget(v);
+        return target !== undefined && fs.existsSync(target);
+    });
+}
+
+/** True when ANY profile under the given dsh home carries a live native
+ *  entry. The launcher consults this to skip its `--patch` overlay: loading
+ *  the same module through both layers would double-register /acp. */
+export function dshNativeInstalled(dshHome?: string): boolean {
+    const home = dshHome && dshHome.trim().length > 0 ? dshHome.trim() : resolveDshHome(process.env);
+    return dshProfileDirs(home).some((dir) => dshLiveIn(path.join(dir, "cordis.patch.yml")));
+}
+
+function dshInstall(): string {
+    const file = dshPluginFile();
+    requireDistFile(file);
+    const entry = pathToFileURL(file).href;
+    const home = resolveDshHome(process.env);
+    const dirs = dshProfileDirs(home);
+    if (dirs.length === 0) {
+        throw new Error(`no dsh profiles found under ${path.join(home, "profiles")} — run \`dsh\` once so the profile tree exists, then retry`);
+    }
+    let touched = 0;
+    for (const dir of dirs) {
+        const patchFile = path.join(dir, "cordis.patch.yml");
+        const text = fs.existsSync(patchFile) ? fs.readFileSync(patchFile, "utf8") : "";
+        if (dshEntryValues(text).includes(entry)) continue;
+        backupOnce(patchFile);
+        fs.writeFileSync(patchFile, insertDshEntry(text, entry));
+        touched++;
+    }
+    return touched === 0
+        ? `dsh: already installed (profiles: ${dirs.map((d) => path.basename(d)).join(", ")})`
+        : `dsh: installed -> cordis.patch.yml in ${touched} profile(s) under ${path.join(home, "profiles")} (originals backed up once)`;
+}
+
+function dshRemove(): string {
+    const home = resolveDshHome(process.env);
+    const dirs = dshProfileDirs(home);
+    if (dirs.length === 0) return `dsh: not installed (no profiles under ${path.join(home, "profiles")})`;
+    let touched = 0;
+    for (const dir of dirs) {
+        const patchFile = path.join(dir, "cordis.patch.yml");
+        if (!fs.existsSync(patchFile)) continue;
+        const text = fs.readFileSync(patchFile, "utf8");
+        const cleaned = stripDshEntries(text);
+        if (cleaned === text) continue;
+        backupOnce(patchFile);
+        fs.writeFileSync(patchFile, cleaned);
+        touched++;
+    }
+    return touched === 0 ? `dsh: not installed` : `dsh: removed from ${touched} profile(s) under ${path.join(home, "profiles")}`;
+}
+
+function dshStatus(): string {
+    const dirs = dshProfileDirs(resolveDshHome(process.env));
+    let live = 0;
+    let broken = 0;
+    for (const dir of dirs) {
+        const patchFile = path.join(dir, "cordis.patch.yml");
+        if (!fs.existsSync(patchFile)) continue;
+        for (const v of dshEntryValues(fs.readFileSync(patchFile, "utf8"))) {
+            const target = dshEntryTarget(v);
+            if (target !== undefined && fs.existsSync(target)) live++;
+            else broken++;
+        }
+    }
+    return live > 0 ? "installed" : broken > 0 ? "broken" : "not installed";
+}
+
 // — dispatch ————————————————————————————————————————————————————————————
 
 export function isPluginAgent(value: string): value is PluginAgent {
@@ -458,11 +621,11 @@ export function isPluginAgent(value: string): value is PluginAgent {
 }
 
 export function pluginInstall(agent: PluginAgent): string {
-    return agent === "pi" ? piInstall() : agent === "omp" ? ompInstall() : agent === "claude" ? claudeInstall() : agent === "codex" ? codexInstall() : opencodeInstall();
+    return agent === "pi" ? piInstall() : agent === "omp" ? ompInstall() : agent === "claude" ? claudeInstall() : agent === "codex" ? codexInstall() : agent === "dsh" ? dshInstall() : opencodeInstall();
 }
 
 export function pluginRemove(agent: PluginAgent): string {
-    return agent === "pi" ? piRemove() : agent === "omp" ? ompRemove() : agent === "claude" ? claudeRemove() : agent === "codex" ? codexRemove() : opencodeRemove();
+    return agent === "pi" ? piRemove() : agent === "omp" ? ompRemove() : agent === "claude" ? claudeRemove() : agent === "codex" ? codexRemove() : agent === "dsh" ? dshRemove() : opencodeRemove();
 }
 
 export function pluginStatusAll(): Array<{ agent: string; status: string }> {
@@ -472,6 +635,7 @@ export function pluginStatusAll(): Array<{ agent: string; status: string }> {
         ["claude", claudeStatus],
         ["codex", codexStatus],
         ["opencode", opencodeStatus],
+        ["dsh", dshStatus],
     ];
     return checks.map(([agent, check]) => {
         try {
