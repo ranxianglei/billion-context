@@ -4,9 +4,8 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { createCore, type CompressionCore, type CompressionState, type Config, type CoreMessage, type NudgeDecision, type Prompts, type PackSurface, type ToolPrompts, applyAcpToolOverrides, defaultPrompts, defaultCountTokens, estimateTokensFast, renderNudgeText, deactivateBlock, viableRanges } from "acp-kernel";
-import { resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig } from "./compress-settings.js";
+import { DEFAULT_STRIP_IMAGES_KEEP_RECENT, resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig } from "./compress-settings.js";
 import { dropCompressReasoning, type CompressReasoningConfig } from "./reasoning-drop.js";
-import { DEFAULT_STRIP_IMAGES_KEEP_RECENT, stripHistoricalImages } from "./strip-images.js";
 import type { ProxyOptions } from "./config.js";
 import { loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
@@ -16,14 +15,16 @@ import { codexAlignedWindow } from "./codex-models.js";
 import { fetchWithTimeout, MAX_REQUEST_BYTES, upstreamTimeoutMs } from "./fetch-util.js";
 import { formatUpstreamError, getUpstreamConnectionStatus, recordUpstreamConnection, resolveProxy, resolveProxyDecision, proxyDispatcher, type UpstreamProxyDecision } from "./upstream-proxy.js";
 import { maskHeaderForLog, maskHeadersForLog, maskHostPortForLog, setMaskHostsEnabled, maskUrlForLog, maskUrlsInText } from "./log-mask.js";
-// Protocol codecs live in the kernel now (single source of truth shared with
-// the omp/pi adapters): import from "acp-kernel/wire".
+// Protocol codecs + the historical-image strip primitive live in the kernel now
+// (single source of truth shared with the omp/pi adapters): import from
+// "acp-kernel/wire" (kernel #215).
 import {
     anthropicToCore,
     coreToAnthropic,
     conversationSignalAnthropic,
     extractSystem,
     buildSystem,
+    stripHistoricalImages,
     type AnthropicRequestBody,
 } from "acp-kernel/wire";
 import {
