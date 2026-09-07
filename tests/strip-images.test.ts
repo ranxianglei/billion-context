@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_STRIP_IMAGES_KEEP_RECENT, stripHistoricalImages } from "../src/strip-images.ts";
+// The mechanism moved to acp-kernel's wire layer (kernel #215); these tests
+// stay as host-level regression coverage over the bundled kernel export.
+import { stripHistoricalImages } from "acp-kernel/wire";
+import { DEFAULT_STRIP_IMAGES_KEEP_RECENT } from "../src/compress-settings.ts";
 
 test("default keep-recent constant is 5", () => {
     assert.equal(DEFAULT_STRIP_IMAGES_KEEP_RECENT, 5);
