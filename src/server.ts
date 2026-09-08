@@ -77,6 +77,7 @@ import { resolveConfirmedLimit, resolveLearnedLimit, resolveSpeculativeLimit, re
 import { BILI_TUNNEL_HEADER, checkTunnelDestination, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
 
 import { decodeRequestBody, DecompressedTooLargeError } from "./content-encoding.js";
+import { biliEnsureTodoContinuity } from "./todo-continuity.js";
 import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSystemPlacementError, resolveCompatRoles, type CompatRoles } from "./compat-roles.js";
 
 // Body dumps (dumps/req-*.json, raw/*-REQ.txt, raw/*-RES.txt, raw/*-INCOMING.txt,
@@ -1930,7 +1931,10 @@ function prepareAnthropic(
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
-        processedMessages = stripKernelSummaries(turn.messages, turn.state);
+        processedMessages = biliEnsureTodoContinuity(
+            stripKernelSummaries(turn.messages, turn.state),
+            originalMessages,
+        );
         applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = coreToAnthropic(processedMessages as BiliMessage[], cacheControls);
@@ -2161,7 +2165,10 @@ function prepareOpenai(
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
-        processedMessages = stripKernelSummaries(turn.messages, turn.state);
+        processedMessages = biliEnsureTodoContinuity(
+            stripKernelSummaries(turn.messages, turn.state),
+            originalMessages,
+        );
         applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = systemToUser(coreToOpenai(processedMessages as BiliMessage[]));
@@ -2350,7 +2357,10 @@ function prepareResponses(
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !isCompactionTrigger && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
-        processedMessages = repairResponsesAssistantOrdering(stripKernelSummaries(turn.messages, turn.state), originalMessages);
+        processedMessages = biliEnsureTodoContinuity(
+            repairResponsesAssistantOrdering(stripKernelSummaries(turn.messages, turn.state), originalMessages),
+            originalMessages,
+        );
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltInput = patchResponsesInput(projection, processedMessages);
         // Fallback path: when the echo did NOT come back this turn (client
@@ -2614,7 +2624,10 @@ function prepareResponsesCompact(
             return base;
         }
         const viewed = applyAbsorbView(turn.messages, turn.state, compactConfig, session.stats.lastInputTokens);
-        const processed = repairResponsesAssistantOrdering(stripKernelSummaries(viewed, turn.state), projection.msgs);
+        const processed = biliEnsureTodoContinuity(
+            repairResponsesAssistantOrdering(stripKernelSummaries(viewed, turn.state), projection.msgs),
+            projection.msgs,
+        );
         const output = patchResponsesInput(projection, processed);
         if (typeof output === "string") {
             session.state = prevState;
@@ -3772,7 +3785,10 @@ async function forward(
                 prepared.session.state = turn.state;
                 const viewed = applyAbsorbView(turn.messages, turn.state, loopConfig, prepared.session.stats.lastInputTokens);
                 const records = current.filter((m) => typeof m.id === "string" && m.id.startsWith("acp_loop_"));
-                return repairResponsesAssistantOrdering(stripKernelSummaries([...viewed, ...records] as BiliMessage[], turn.state), prepared.originalMessages);
+                return biliEnsureTodoContinuity(
+                    repairResponsesAssistantOrdering(stripKernelSummaries([...viewed, ...records] as BiliMessage[], turn.state), prepared.originalMessages),
+                    prepared.originalMessages,
+                );
             };
             const loop = runCompressLoop(
                 streamToRead,
