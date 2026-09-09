@@ -1,5 +1,6 @@
 import {
     defaultCountTokens,
+    collectBlockContent,
     viableRanges,
     type CompressionCore,
     type Config,
@@ -167,23 +168,21 @@ function rangeChars(messages: CoreMessage[], startIdx: number, endIdx: number): 
     return chars;
 }
 
-function renderRange(messages: CoreMessage[], startIdx: number, endIdx: number): string {
-    const parts: string[] = [];
-    for (let i = startIdx; i <= endIdx && i < messages.length; i++) {
-        const m = messages[i];
-        const text = (m.text ?? "").trim();
-        if (!text) continue;
-        const label =
-            m.contentType === "tool-call"
-                ? `assistant tool-call ${m.toolName ?? "?"}`
-                : m.contentType === "tool-result"
-                  ? `tool result ${m.toolName ?? "?"}`
-                  : m.contentType === "reasoning"
-                    ? "assistant reasoning"
-                    : m.role;
-        parts.push(`[${label}]\n${text}`);
+function splitSummaryContent(content: string, budget: number, countTokens: (text: string) => number): string[] {
+    const chunks: string[] = [];
+    let offset = 0;
+    while (offset < content.length) {
+        let low = offset + 1;
+        let high = content.length;
+        while (low < high) {
+            const mid = Math.ceil((low + high) / 2);
+            if (countTokens(content.slice(offset, mid)) <= budget) low = mid;
+            else high = mid - 1;
+        }
+        chunks.push(content.slice(offset, low));
+        offset = low;
     }
-    return parts.join("\n\n");
+    return chunks;
 }
 
 // minUnits: never close a chunk below this many countText units while more
@@ -474,7 +473,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             // estimate (not currentTokens, which is floored by a possibly-stale
             // lastInputTokens from a prior model): if the real payload already
             // fits, stop instead of folding protected content.
-            if (!relaxed && result.payloadEstimate >= limit) {
+            if (!relaxed && (baselineKnown ? result.payloadEstimate : finalUpper) >= limit) {
                 activeConfig = relaxedConfig(deps.config);
                 relaxed = true;
                 // #575-merge: the summarization budget counts per protection
@@ -522,17 +521,36 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 const startRef = maps.idxToRef.get(cs);
                 const endRef = maps.idxToRef.get(ce);
                 if (!startRef || !endRef) continue;
-                if (rangeChars(messages, cs, ce) < minChars) continue;
-                const content = renderRange(messages, cs, ce);
+                const preview = deps.core.applyCompression({
+                    messages,
+                    state: deps.session.state,
+                    config: activeConfig,
+                    ranges: [{ startRef, endRef, summary: "x".repeat(Math.max(MIN_SUMMARY_CHARS, activeConfig.compress.minSummaryLength)) }],
+                });
+                const previousBlockIds = new Set(deps.session.state.blocks.map((block) => block.blockId));
+                const planned = preview.state.blocks.find((block) => !previousBlockIds.has(block.blockId));
+                if (!planned) continue;
+                // Use the original state so consumed child blocks are still active and render as summaries.
+                const content = collectBlockContent(deps.session.state, planned, messages, { full: false }).text;
                 if (content.length === 0) continue;
-                if (summaryCalls >= MAX_SUMMARY_CALLS_PER_PREFLIGHT) {
-                    budgetHit = true;
-                    break;
-                }
-                summaryCalls += 1;
-                let summary: string | null;
+                let summary: string | null = null;
                 try {
-                    summary = await summarizeRange(deps, content, startRef, endRef);
+                    const parts: string[] = [];
+                    const chunks = splitSummaryContent(content, budget, countText);
+                    for (const chunk of chunks) {
+                        if (summaryCalls >= MAX_SUMMARY_CALLS_PER_PREFLIGHT) {
+                            budgetHit = true;
+                            break;
+                        }
+                        summaryCalls += 1;
+                        const part = await summarizeRange(deps, chunk, startRef, endRef);
+                        if (!part) break;
+                        parts.push(part);
+                    }
+                    if (!budgetHit && parts.length === chunks.length) {
+                        const candidate = parts.join("\n\n");
+                        if (activeConfig.compress.maxSummaryLength <= 0 || candidate.length <= activeConfig.compress.maxSummaryLength) summary = candidate || null;
+                    }
                 } catch (err) {
                     if (err instanceof UpstreamHttpError) {
                         failure = {
@@ -576,7 +594,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 // baseline currentTokens is char-based, so net the folded span's
                 // char count against it instead of the token-based credit.
                 const compressed = deps.session.stats.compressCreditTokens - creditBefore;
-                const folded = baselineKnown ? compressed : rangeChars(messages, cs, ce);
+                const folded = baselineKnown ? compressed : messages.filter((message) => planned.directMessageIds.includes(message.id)).reduce((total, message) => total + (message.text ?? "").length, 0);
                 currentTokens = Math.max(0, currentTokens - folded + countText(summary));
                 deps.session.stats.lastInputTokens += defaultCountTokens(summary);
                 appliedThisRound += 1;
@@ -586,7 +604,17 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             if (appliedThisRound > 0) break;
             if (failure || budgetHit) break;
         }
-        if (appliedThisRound === 0) break;
+        if (appliedThisRound === 0) {
+            if (!failure && !budgetHit && !relaxed && (baselineKnown ? result.payloadEstimate : finalUpper) >= limit) {
+                activeConfig = relaxedConfig(deps.config);
+                relaxed = true;
+                summaryCalls = 0;
+                budgetHit = false;
+                deps.log("warn", "[preflight] no usable ranges outside the protected recent zone; relaxing soft protection (preserveRecentMessages/Tokens -> 0) and retrying");
+                continue;
+            }
+            break;
+        }
     }
     if (currentTokens >= limit && !failure) {
         if (budgetHit) {
