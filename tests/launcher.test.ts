@@ -55,6 +55,12 @@ import {
     resolveLauncherWindow,
     resolveCodexBudgetArgs,
     resolveClaudeBudgetEnv,
+    resolveQoderBudgetEnv,
+    buildQoderEnv,
+    readQoderConfig,
+    resolveQoderHome,
+    qoderIsCnSite,
+    QODER_DEFAULT_MODEL_HOSTS,
     codexUpstreamUrl,
     readClaudeSettings,
     type SpawnChild,
@@ -73,6 +79,7 @@ test("isLaunchClient: pi/claude/codex/omp/opencode/pi-test true, others false", 
     assert.equal(isLaunchClient("opencode"), true);
     assert.equal(isLaunchClient("hermes"), true);
     assert.equal(isLaunchClient("dsh"), true);
+    assert.equal(isLaunchClient("qoder"), true);
     assert.equal(isLaunchClient("pi-test"), true);
     assert.equal(isLaunchClient("start"), false);
     assert.equal(isLaunchClient(""), false);
@@ -2451,6 +2458,244 @@ test("runLaunch claude: CLAUDE_CODE_AUTO_COMPACT_WINDOW injected (built-in table
         else process.env.ANTHROPIC_MODEL = prevAnthropicModel;
         if (prevAutoCompact === undefined) delete process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW;
         else process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = prevAutoCompact;
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("qoderIsCnSite: QODERCLI_SITE and CN-prefixed envs decide the site", () => {
+    assert.equal(qoderIsCnSite({ QODERCLI_SITE: "cn" }), true);
+    assert.equal(qoderIsCnSite({ QODERCLI_SITE: "CN " }), true);
+    assert.equal(qoderIsCnSite({ QODERCLI_SITE: "intl" }), false);
+    assert.equal(qoderIsCnSite({ QODERCN_CONFIG_DIR: "/tmp/qcn" }), true);
+    assert.equal(qoderIsCnSite({ QODERCN_CLI_HOME: "/tmp/qcn" }), true);
+    assert.equal(qoderIsCnSite({ QODER_CONFIG_DIR: "/tmp/q" }), false);
+});
+
+test("qoderIsCnSite: on-disk config dirs only break the tie (no dirs → intl)", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-qoder-site-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    try {
+        assert.equal(qoderIsCnSite({}), false, "no config dirs → intl");
+        fs.mkdirSync(path.join(home, ".qoder-cn"));
+        assert.equal(qoderIsCnSite({}), true, "only .qoder-cn present → cn");
+        fs.mkdirSync(path.join(home, ".qoder"));
+        assert.equal(qoderIsCnSite({}), false, "both present → intl (default)");
+    } finally {
+        process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("resolveQoderHome: env override > CLI_HOME+dir name > site default", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-qoder-home-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    try {
+        assert.equal(resolveQoderHome({ QODER_CONFIG_DIR: "/tmp/qc" }), "/tmp/qc");
+        assert.equal(resolveQoderHome({ QODERCLI_SITE: "cn", QODERCN_CONFIG_DIR: "/tmp/qcn" }), "/tmp/qcn");
+        assert.equal(resolveQoderHome({ QODER_CLI_HOME: "/tmp/parent" }), path.join("/tmp/parent", ".qoder"));
+        assert.equal(resolveQoderHome({ QODER_CONFIG_DIR_NAME: ".qoder-x" }), path.join(home, ".qoder-x"));
+        assert.equal(
+            resolveQoderHome({ QODERCLI_SITE: "cn", QODERCN_CLI_HOME: "/tmp/parent", QODERCN_CONFIG_DIR_NAME: ".qcn" }),
+            path.join("/tmp/parent", ".qcn"),
+        );
+        assert.equal(resolveQoderHome({}), path.join(home, ".qoder"));
+        assert.equal(resolveQoderHome({ QODERCLI_SITE: "cn" }), path.join(home, ".qoder-cn"));
+    } finally {
+        process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("readQoderConfig: settings.json model (string + object) and model server host env", () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-qoder-cfg-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    const dir = path.join(home, ".qoder");
+    fs.mkdirSync(dir, { recursive: true });
+    try {
+        assert.deepEqual(readQoderConfig(dir, {}), {});
+        fs.writeFileSync(path.join(dir, "settings.json"), JSON.stringify({ model: { name: "qwen3-max" } }));
+        assert.deepEqual(readQoderConfig(dir, {}), { model: "qwen3-max" });
+        fs.writeFileSync(path.join(dir, "settings.json"), JSON.stringify({ model: "qwen3-max", mcpServers: {} }));
+        assert.deepEqual(readQoderConfig(dir, {}), { model: "qwen3-max" });
+        fs.writeFileSync(path.join(dir, "settings.json"), "not-json{");
+        assert.deepEqual(readQoderConfig(dir, {}), {});
+        fs.writeFileSync(path.join(dir, "settings.json"), JSON.stringify({ model: { name: "qwen3-max" } }));
+        const withHost = readQoderConfig(dir, { QODER_MODEL_SERVER_HOST: "https://my-relay.example.com:8443/" });
+        assert.equal(withHost.model, "qwen3-max");
+        assert.equal(withHost.modelServerHost, "my-relay.example.com:8443");
+        const cnHost = readQoderConfig(dir, { QODERCLI_SITE: "cn", QODERCN_MODEL_SERVER_HOST: "cn-relay.example.com" });
+        assert.equal(cnHost.modelServerHost, "cn-relay.example.com");
+        const mixed = readQoderConfig(dir, { QODERCLI_SITE: "cn", QODER_MODEL_SERVER_HOST: "intl.example.com" });
+        assert.equal(mixed.modelServerHost, undefined, "intl-prefixed host ignored on CN site");
+    } finally {
+        process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        fs.rmSync(home, { recursive: true, force: true });
+    }
+});
+
+test("discoverRoutes: qoder → default MITM hosts, no rewrites (#653)", () => {
+    const routes = discoverRoutes("qoder", {});
+    assert.deepEqual(routes.httpsDomains, QODER_DEFAULT_MODEL_HOSTS);
+    assert.deepEqual(routes.httpRewrites, []);
+    assert.deepEqual(routes.httpsRewrites, []);
+    assert.deepEqual(routes.httpEnvRoutes, []);
+});
+
+test("discoverRoutes: qoder modelServerHost replaces the default map", () => {
+    const config: ClientConfig = { qoder: { model: "m", modelServerHost: "my-relay.example.com" } };
+    const routes = discoverRoutes("qoder", config);
+    assert.deepEqual(routes.httpsDomains, ["my-relay.example.com"]);
+});
+
+test("buildQoderEnv: HTTPS_PROXY + NODE_EXTRA_CA_CERTS + BILLION_CONTEXT_PROXY, baseEnv preserved", () => {
+    const env = buildQoderEnv("http://127.0.0.1:8787", "/tmp/ca.pem", { FOO: "bar" });
+    assert.equal(env.HTTPS_PROXY, "http://127.0.0.1:8787");
+    assert.equal(env.NODE_EXTRA_CA_CERTS, "/tmp/ca.pem");
+    assert.equal(env.BILLION_CONTEXT_PROXY, "http://127.0.0.1:8787");
+    assert.equal(env.FOO, "bar");
+});
+
+test("resolveQoderBudgetEnv: injects the site-prefixed window key from bili's chain", async () => {
+    registrySetForTest({});
+    try {
+        assert.deepEqual(
+            await resolveQoderBudgetEnv({ model: "claude-sonnet-4-5", userAutoCompactWindow: undefined, windowKey: "QODER_AUTOCOMPACT_WINDOW", routes: {}, upstreamUrl: "https://api2-v2.qoder.sh" }),
+            { QODER_AUTOCOMPACT_WINDOW: "200000" },
+        );
+        const routes = { "https://relay.example.com": { models: { "qoder-x": { context: 123456 } } } };
+        assert.deepEqual(
+            await resolveQoderBudgetEnv({ model: "qoder-x", userAutoCompactWindow: undefined, windowKey: "QODERCN_AUTOCOMPACT_WINDOW", routes, upstreamUrl: "https://relay.example.com" }),
+            { QODERCN_AUTOCOMPACT_WINDOW: "123456" },
+        );
+        registrySetForTest({ "anthropic/bili-fallback-model": { limit: { context: 333333 } } });
+        assert.deepEqual(
+            await resolveQoderBudgetEnv({ model: "bili-fallback-model", userAutoCompactWindow: undefined, windowKey: "QODER_AUTOCOMPACT_WINDOW", routes: {}, upstreamUrl: "https://api.anthropic.com" }),
+            { QODER_AUTOCOMPACT_WINDOW: "333333" },
+        );
+    } finally {
+        registryResetForTest();
+    }
+});
+
+test("resolveQoderBudgetEnv: no injection when user self-aligned or unresolvable", async () => {
+    registrySetForTest({});
+    try {
+        assert.deepEqual(await resolveQoderBudgetEnv({ model: "claude-sonnet-4-5", userAutoCompactWindow: "300000", windowKey: "QODER_AUTOCOMPACT_WINDOW", routes: {}, upstreamUrl: "https://api2-v2.qoder.sh" }), {});
+        assert.deepEqual(await resolveQoderBudgetEnv({ model: undefined, userAutoCompactWindow: undefined, windowKey: "QODER_AUTOCOMPACT_WINDOW", routes: {}, upstreamUrl: "https://api2-v2.qoder.sh" }), {});
+        assert.deepEqual(await resolveQoderBudgetEnv({ model: "qoder-nonexistent-model-xyz", userAutoCompactWindow: undefined, windowKey: "QODER_AUTOCOMPACT_WINDOW", routes: {}, upstreamUrl: "https://api2-v2.qoder.sh" }), {});
+    } finally {
+        registryResetForTest();
+    }
+});
+
+test("resolveClientCommand: qoder resolves `qoder`, falls back to `qodercli`", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-qoder-bin-"));
+    try {
+        const env: NodeJS.ProcessEnv = { PATH: dir };
+        assert.deepEqual(resolveClientCommand("qoder", env), { command: "qoder", prefixArgs: [] });
+        fs.writeFileSync(path.join(dir, "qodercli"), "");
+        assert.deepEqual(resolveClientCommand("qoder", env), { command: path.join(dir, "qodercli"), prefixArgs: [] });
+        fs.writeFileSync(path.join(dir, "qoder"), "");
+        assert.deepEqual(resolveClientCommand("qoder", env), { command: path.join(dir, "qoder"), prefixArgs: [] });
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("runLaunch qoder: cert-MITM envs, transport forced, budget aligned, default MITM whitelist (#653)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-qoder-launch-"));
+    const prevHome = process.env.HOME;
+    const prevUserProfile = process.env.USERPROFILE;
+    const prevBin = process.env.BILI_CLIENT_BIN;
+    const prevModel = process.env.QODER_MODEL;
+    const prevWindow = process.env.QODER_AUTOCOMPACT_WINDOW;
+    const prevTransport = process.env.QODER_MODEL_TRANSPORT;
+    const prevNoProxy = process.env.NO_PROXY;
+    process.env.HOME = home;
+    if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
+    delete process.env.QODER_MODEL;
+    delete process.env.QODER_AUTOCOMPACT_WINDOW;
+    delete process.env.QODER_MODEL_TRANSPORT;
+    const qoderDir = path.join(home, ".qoder");
+    fs.mkdirSync(qoderDir, { recursive: true });
+    fs.writeFileSync(path.join(qoderDir, "settings.json"), JSON.stringify({ model: { name: "claude-sonnet-4-5" } }));
+    const fakeQoder = path.join(home, "fake-qoder");
+    fs.writeFileSync(fakeQoder, "");
+    process.env.BILI_CLIENT_BIN = fakeQoder;
+    process.env.NO_PROXY = "localhost,.corp";
+
+    const clientEnvs: (NodeJS.ProcessEnv | undefined)[] = [];
+    const proxyEnvs: (NodeJS.ProcessEnv | undefined)[] = [];
+    const spawnImpl: SpawnFn = (cmd, args, opts) => {
+        const env = (opts as { env?: NodeJS.ProcessEnv } | undefined)?.env;
+        if (cmd === fakeQoder) {
+            clientEnvs.push(env);
+            const child = makeFakeChild(0);
+            const orig = child.on.bind(child);
+            (child as { on: SpawnChild["on"] }).on = (event, listener) => {
+                orig(event, listener);
+                if (event === "exit") setTimeout(() => listener(0, null), 0);
+                return child;
+            };
+            return child;
+        }
+        proxyEnvs.push(env);
+        return makeFakeChild(42424);
+    };
+    const fetchImpl = async () => ({ ok: true });
+    const prevExit = process.exit;
+    process.exit = (() => undefined) as typeof process.exit;
+
+    try {
+        await runLaunch(
+            { client: "qoder", clientArgs: [], overrides: {} },
+            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(clientEnvs.length, 1);
+        const seenEnv = clientEnvs[0]!;
+        const origin = seenEnv.BILLION_CONTEXT_PROXY;
+        assert.ok(/^http:\/\/127\.0\.0\.1:\d+$/.test(String(origin)), `origin: ${origin}`);
+        assert.equal(seenEnv.HTTPS_PROXY, origin);
+        assert.ok(String(seenEnv.NODE_EXTRA_CA_CERTS).endsWith(path.join("billion-context", "ca", "root-ca.pem")), String(seenEnv.NODE_EXTRA_CA_CERTS));
+        assert.equal(seenEnv.HTTP_PROXY, undefined, "inherited HTTP_PROXY stripped");
+        assert.equal(seenEnv.NO_PROXY, undefined, "inherited NO_PROXY stripped");
+        assert.equal(seenEnv.QODER_MODEL_TRANSPORT, "http");
+        assert.equal(seenEnv.QODER_AUTOCOMPACT_WINDOW, "200000", "budget aligned from built-in table");
+        assert.ok(proxyEnvs.length > 0, "proxy child spawned");
+        const mitm = String(proxyEnvs[0]!.BILI_MITM_DOMAINS).split(",");
+        for (const h of QODER_DEFAULT_MODEL_HOSTS) {
+            assert.ok(mitm.includes(h), `whitelist has ${h}: ${mitm.join(",")}`);
+        }
+    } finally {
+        process.exit = prevExit;
+        process.env.HOME = prevHome;
+        if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+        else process.env.USERPROFILE = prevUserProfile;
+        if (prevBin === undefined) delete process.env.BILI_CLIENT_BIN;
+        else process.env.BILI_CLIENT_BIN = prevBin;
+        if (prevModel === undefined) delete process.env.QODER_MODEL;
+        else process.env.QODER_MODEL = prevModel;
+        if (prevWindow === undefined) delete process.env.QODER_AUTOCOMPACT_WINDOW;
+        else process.env.QODER_AUTOCOMPACT_WINDOW = prevWindow;
+        if (prevTransport === undefined) delete process.env.QODER_MODEL_TRANSPORT;
+        else process.env.QODER_MODEL_TRANSPORT = prevTransport;
+        if (prevNoProxy === undefined) delete process.env.NO_PROXY;
+        else process.env.NO_PROXY = prevNoProxy;
         fs.rmSync(home, { recursive: true, force: true });
     }
 });

@@ -93,6 +93,16 @@ export interface DshConfig {
     baseUrls: string[];
 }
 
+export interface QoderConfig {
+    /** Model qoder runs: settings.json `model` (gemini-cli-style `model.name`
+     *  or bare string) — budget alignment (#321 pattern, #653). */
+    model?: string;
+    /** `QODER_MODEL_SERVER_HOST` (undocumented env, scheme/trailing-slash
+     *  stripped) — when set, qoder talks to this host INSTEAD of the
+     *  binary's static default map, so it replaces the MITM whitelist. */
+    modelServerHost?: string;
+}
+
 export interface ClientConfig {
     claude?: ClaudeSettings;
     codex?: CodexConfig;
@@ -102,6 +112,81 @@ export interface ClientConfig {
     opencode?: OpencodeConfig;
     hermes?: HermesConfig;
     dsh?: DshConfig;
+    qoder?: QoderConfig;
+}
+
+/** qoder's default model-inference hosts, hardcoded in the binary (no config
+ *  file to discover from): prod + regional (US/SG/JP) + the CN gateway.
+ *  daily/test variants are deliberately NOT included. */
+export const QODER_DEFAULT_MODEL_HOSTS = [
+    "api2-v2.qoder.sh",
+    "api1.qoder.sh",
+    "api2.qoder.sh",
+    "api3.qoder.sh",
+    "gateway.qoder.com.cn",
+];
+
+/** CN-site detection rule (#653 open question 4): the launcher picks the
+ *  `QODER_` vs `QODERCN_` env prefix by, in order — (1) `QODERCLI_SITE=cn`,
+ *  (2) a CN-prefixed config env being set (`QODERCN_CONFIG_DIR` /
+ *  `QODERCN_CLI_HOME`), (3) only the CN config dir existing on disk (the CN
+ *  package defaults to `~/.qoder-cn`, the intl one to `~/.qoder`), else intl.
+ *  Known edge: with BOTH packages installed, a CN launch is detected as intl
+ *  (degrades to no budget injection / wrong-prefix transport env — never
+ *  breaks the launch). */
+export function qoderIsCnSite(env: NodeJS.ProcessEnv = process.env): boolean {
+    const site = env.QODERCLI_SITE?.trim().toLowerCase();
+    if (site === "cn") return true;
+    if (nonEmpty(env.QODERCN_CONFIG_DIR) || nonEmpty(env.QODERCN_CLI_HOME)) return true;
+    const h = os.homedir();
+    const cnDir = path.join(h, ".qoder-cn");
+    const intlDir = path.join(h, ".qoder");
+    try {
+        if (fs.existsSync(cnDir) && !fs.existsSync(intlDir)) return true;
+    } catch {}
+    return false;
+}
+
+/** qoder's config root: `QODER_CONFIG_DIR`/`QODERCN_CONFIG_DIR` (full path)
+ *  > `QODER_CLI_HOME`/`QODERCN_CLI_HOME` + dir name > `~/.qoder` (intl) /
+ *  `~/.qoder-cn` (CN); `QODER_CONFIG_DIR_NAME`/`QODERCN_CONFIG_DIR_NAME`
+ *  override the dir name. The site prefix family is chosen by qoderIsCnSite. */
+export function resolveQoderHome(env: NodeJS.ProcessEnv = process.env): string {
+    const h = os.homedir();
+    const cn = qoderIsCnSite(env);
+    const configDir = cn ? env.QODERCN_CONFIG_DIR : env.QODER_CONFIG_DIR;
+    if (nonEmpty(configDir)) return configDir!;
+    const cliHomeEnv = cn ? env.QODERCN_CLI_HOME : env.QODER_CLI_HOME;
+    const cliHome = nonEmpty(cliHomeEnv) ? cliHomeEnv! : h;
+    const dirNameEnv = cn ? env.QODERCN_CONFIG_DIR_NAME : env.QODER_CONFIG_DIR_NAME;
+    const dirName = nonEmpty(dirNameEnv) ? dirNameEnv! : (cn ? ".qoder-cn" : ".qoder");
+    return path.join(cliHome, dirName);
+}
+
+/** Read-only discovery of qoder's `<configDir>/settings.json` (gemini-cli
+ *  style): the selected model for budget alignment. qoder has no local model
+ *  catalog (server-driven), so no windows are collected here. The model host
+ *  override env is read too — it decides which host the MITM whitelist must
+ *  carry. */
+export function readQoderConfig(qoderHome: string, env: NodeJS.ProcessEnv = process.env): QoderConfig {
+    const result: QoderConfig = {};
+    const obj = readJsonObject(path.join(qoderHome, "settings.json"));
+    const model = obj?.model;
+    if (typeof model === "string" && model.trim().length > 0) {
+        result.model = model.trim();
+    } else if (model && typeof model === "object" && !Array.isArray(model)) {
+        const name = (model as Record<string, unknown>).name;
+        if (nonEmpty(name)) result.model = name!.trim();
+    }
+    const cn = qoderIsCnSite(env);
+    const host = nonEmpty(cn ? env.QODERCN_MODEL_SERVER_HOST : env.QODER_MODEL_SERVER_HOST)
+        ? (cn ? env.QODERCN_MODEL_SERVER_HOST : env.QODER_MODEL_SERVER_HOST)!
+        : undefined;
+    if (host) {
+        const bare = host.trim().replace(/^https?:\/\//i, "").replace(/\/+$/, "");
+        if (bare.length > 0) result.modelServerHost = bare;
+    }
+    return result;
 }
 
 export function nonEmpty(s: unknown): s is string {
@@ -579,6 +664,7 @@ export function loadClientConfig(env: NodeJS.ProcessEnv, cwd: string): ClientCon
     config.opencode = readOpencodeConfig(resolveOpencodeConfigFile(env));
     config.hermes = readHermesConfig(resolveHermesHome(env));
     config.dsh = readDshConfig(resolveDshHome(env));
+    config.qoder = readQoderConfig(resolveQoderHome(env), env);
     return config;
 }
 
@@ -586,7 +672,7 @@ export function loadClientConfig(env: NodeJS.ProcessEnv, cwd: string): ClientCon
  *  launched client's own declarations are authoritative (#436: launching
  *  `bili omp` with omp's models.yml declaring 131072 must not be overridden by
  *  another client's larger declaration for the same model id). */
-export type ModelWindowScope = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh";
+export type ModelWindowScope = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "qoder";
 
 /** Collect per-model context windows from client configs the launcher can
  *  read (pi models.json, omp models.yml, opencode opencode.json, codex

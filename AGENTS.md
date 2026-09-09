@@ -41,7 +41,7 @@ billion-context/
 │   ├── session-id.ts             # Session ID generation
 │   ├── persist.ts                # On-disk session persistence (kernel StateStore)
 │   ├── update.ts                 # Auto-update: checks npm, auto-installs latest
-│   ├── launcher.ts               # `bili <client>` launchers (pi/codex/claude/omp/opencode/hermes)
+│   ├── launcher.ts               # `bili <client>` launchers (pi/codex/claude/omp/opencode/hermes/dsh/qoder)
 │   ├── client-config.ts          # READ-only discovery of each client's upstream config
 │   ├── mitm.ts / ca.ts           # Cert-MITM proxying + lazily generated root CA
 │   ├── mcp.ts                    # Plugin-in-launcher MCP shell (spawn-time injection)

@@ -43,7 +43,7 @@ import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom } from "./plugin-in
 function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
-import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, loadClientConfig, collectModelWindows, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider } from "./client-config.js";
+import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, loadClientConfig, collectModelWindows, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS } from "./client-config.js";
 import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, type ProviderRoutes } from "./config.js";
 import { contextFromRegistry } from "./registry.js";
 
@@ -80,12 +80,17 @@ export {
     readOpencodeConfig,
     type OpencodeConfig,
     type OpencodeProvider,
+    readQoderConfig,
+    resolveQoderHome,
+    qoderIsCnSite,
+    QODER_DEFAULT_MODEL_HOSTS,
+    type QoderConfig,
 } from "./client-config.js";
 
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
-export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "pi-test"] as const;
+export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "qoder", "pi-test"] as const;
 export type ClientName = (typeof LAUNCH_CLIENTS)[number];
-export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh";
+export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "qoder";
 
 const HEALTH_PATH = "/__bili/health";
 const HEALTH_POLL_INTERVAL_MS = 200;
@@ -359,6 +364,21 @@ export function discoverRoutes(client: ClientName, config: ClientConfig): Discov
                 // Unparseable endpoint: skip.
             }
         }
+    } else if (client === "qoder") {
+        // #653: qoder's model endpoint scheme is hardcoded https with no
+        // base-URL override env, so /bili/ rewrites cannot reach it — cert
+        // MITM is the only route (qoder honors HTTPS_PROXY +
+        // NODE_EXTRA_CA_CERTS). Whitelist is the binary's static host map
+        // (prod + regional + CN gateway); an explicit QODER_MODEL_SERVER_HOST
+        // REPLACES it (qoder's own resolution order: env > static map).
+        const hosts = nonEmpty(config.qoder?.modelServerHost) ? [config.qoder!.modelServerHost!] : QODER_DEFAULT_MODEL_HOSTS;
+        for (const host of hosts) {
+            const h = host.toLowerCase();
+            if (h && !httpsSeen.has(h)) {
+                httpsSeen.add(h);
+                httpsDomains.push(h);
+            }
+        }
     } else {
         for (const [name, prov] of Object.entries(config.codex?.providers ?? {})) {
             classify(prov.baseUrl, `model_providers.${name}.base_url`);
@@ -543,6 +563,42 @@ export function buildClaudeEnv(
     return env;
 }
 
+/** #653: qoder's model endpoint scheme is hardcoded https (no base-URL
+ *  override env), so the launcher can only route it via cert MITM: its
+ *  built-in undici stack honors HTTPS_PROXY, and NODE_EXTRA_CA_CERTS is
+ *  ADDITIVE (unlike codex's SSL_CERT_FILE), so the plain root CA suffices.
+ *  No base-URL rewrite of any kind. */
+export function buildQoderEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    return { ...baseEnv, HTTPS_PROXY: origin, NODE_EXTRA_CA_CERTS: caPath, BILLION_CONTEXT_PROXY: origin };
+}
+
+/**
+ * #653: qoder's auto-compact window is a single env knob —
+ * `QODER_AUTOCOMPACT_WINDOW` (`QODERCN_` prefix on the CN site) caps the
+ * effective context window (`min(modelWindow, env)`), so injecting bili's
+ * window is always safe (same #321 pattern as claude).
+ *
+ * Returns {} (no injection) when: no model resolvable, the user already set
+ * an explicit auto-compact window (shell-exported env var), or bili resolves
+ * no window for the model. qoder's model catalog is server-driven, so its
+ * model names are usually absent from bili's configured limits and the
+ * models.dev registry — the common outcome is no injection, with the user's
+ * own `QODER_AUTOCOMPACT_WINDOW` as the fallback (issue #653 open question 3).
+ */
+export async function resolveQoderBudgetEnv(opts: {
+    model: string | undefined;
+    userAutoCompactWindow: string | undefined;
+    windowKey: string;
+    routes: ProviderRoutes;
+    upstreamUrl: string | undefined;
+}): Promise<NodeJS.ProcessEnv> {
+    const { model, userAutoCompactWindow, windowKey, routes, upstreamUrl } = opts;
+    if (!model || nonEmpty(userAutoCompactWindow)) return {};
+    const window = await resolveLauncherWindow(model, routes, upstreamUrl);
+    if (!window) return {};
+    return { [windowKey]: String(window) };
+}
+
 // --- Launcher plugin mode (#162): inject the MCP shell + session hooks as
 // spawn-time flags, never touching host config files on disk. ---
 
@@ -616,7 +672,7 @@ function isPrivateIPv4(host: string): boolean {
  *  understands) is the sane default. `BILI_LAUNCHER_PLUGIN=1` forces plugin
  *  mode regardless of the upstream. */
 export function launcherInjectMcp(env: NodeJS.ProcessEnv, base: string, codexUpstream?: string): boolean {
-    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh") return false;
+    if (base === "pi" || base === "omp" || base === "opencode" || base === "hermes" || base === "dsh" || base === "qoder") return false;
     if (env.BILI_LAUNCHER_PLUGIN === "0") return false;
     if (base === "codex" && env.BILI_LAUNCHER_PLUGIN === undefined && codexUpstream !== undefined && isPrivateUpstreamHost(codexUpstream)) {
         return false;
@@ -1787,6 +1843,12 @@ export function resolveClientCommand(
         );
         return { command: process.execPath, prefixArgs: [cli] };
     }
+    if (client === "qoder") {
+        // npm bin names: `qoder` (primary) with `qodercli` as the alternate
+        // registration (both packages ship either).
+        const resolved = resolveOnPath("qoder", env) ?? resolveOnPath("qodercli", env);
+        return { command: resolved ?? "qoder", prefixArgs: [] };
+    }
     const resolved = resolveOnPath(client, env);
     return { command: resolved ?? client, prefixArgs: [] };
 }
@@ -1886,6 +1948,10 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         } else if (base === "claude") {
             console.error(
                 "bili: direct-URL mode — claude's ANTHROPIC_BASE_URL is overridden to the proxy; a pre-configured relay is bypassed unless BILI_CLAUDE_UPSTREAM=<relay> is set. OAuth-subscription traffic requires the default MITM mode.",
+            );
+        } else if (base === "qoder") {
+            console.error(
+                "bili: BILI_LAUNCHER_DIRECT has no effect for qoder — its model endpoint scheme is hardcoded https with no base-URL override env, so qoder always runs in cert-MITM mode.",
             );
         }
     }
@@ -2017,6 +2083,30 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // settings rewrite above), so it exists on every profile dsh boots.
         const dshAcpPatch = writeDshAcpPatch(dshHomeDir);
         if (dshAcpPatch) clientArgs = dshArgsWithPatch(clientArgs, dshAcpPatch);
+    } else if (base === "qoder") {
+        // #653: cert-MITM only — the model endpoint scheme is hardcoded https
+        // (no base-URL override env), so /bili/ rewrites cannot reach it.
+        // qoder's undici stack honors HTTPS_PROXY + NODE_EXTRA_CA_CERTS
+        // (additive, so the plain root CA suffices). Proxy vars are fully
+        // stripped (same contract as hermes). QODER_MODEL_TRANSPORT=http
+        // forces the OpenAI chat-completions wire: the default transport is a
+        // server feature-gate whose `legacy` fallback wire is unverified
+        // (#653 open question 1). The env prefix family follows the CN-site
+        // detection (qoderIsCnSite).
+        env = buildQoderEnv(origin, ca, stripInheritedProxy(process.env));
+        const qoderPrefix = qoderIsCnSite(process.env) ? "QODERCN" : "QODER";
+        env[`${qoderPrefix}_MODEL_TRANSPORT`] = "http";
+        const qoderBudget = await resolveQoderBudgetEnv({
+            model: nonEmpty(process.env[`${qoderPrefix}_MODEL`]) ? process.env[`${qoderPrefix}_MODEL`] : config.qoder?.model,
+            userAutoCompactWindow: process.env[`${qoderPrefix}_AUTOCOMPACT_WINDOW`],
+            windowKey: `${qoderPrefix}_AUTOCOMPACT_WINDOW`,
+            routes: biliRoutes,
+            upstreamUrl: `https://${config.qoder?.modelServerHost ?? QODER_DEFAULT_MODEL_HOSTS[0]}`,
+        });
+        Object.assign(env, qoderBudget);
+        if (qoderBudget[`${qoderPrefix}_AUTOCOMPACT_WINDOW`] !== undefined) {
+            console.error(`bili: qoder budget aligned — ${qoderPrefix}_AUTOCOMPACT_WINDOW=${qoderBudget[`${qoderPrefix}_AUTOCOMPACT_WINDOW`]}`);
+        }
     } else if (base === "codex") {
         // Per-spawn conversation id for the MCP shell's headless
         // self-registration (codex provides no session id of its own).

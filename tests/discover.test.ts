@@ -11,6 +11,7 @@ import {
 import {
     parseZcodeConfig,
     readZcodeConfig,
+    QODER_DEFAULT_MODEL_HOSTS,
     type ClientConfig,
 } from "../src/client-config.ts";
 
@@ -117,6 +118,11 @@ test("extractHttpsHosts: dedupes, lowercases, drops http, unwraps /bili/", () =>
 
 test("extractHttpsHosts: empty config → []", () => {
     assert.deepEqual(extractHttpsHosts({}), []);
+});
+
+test("extractHttpsHosts: qoder → default model hosts; modelServerHost replaces them (#653)", () => {
+    assert.deepEqual(extractHttpsHosts({ qoder: {} }), QODER_DEFAULT_MODEL_HOSTS);
+    assert.deepEqual(extractHttpsHosts({ qoder: { modelServerHost: "my-relay.example.com" } }), ["my-relay.example.com"]);
 });
 
 async function withTempHome<T>(fn: (home: string, env: NodeJS.ProcessEnv) => Promise<T>): Promise<T> {
