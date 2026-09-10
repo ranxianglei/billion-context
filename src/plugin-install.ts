@@ -374,12 +374,20 @@ function codexInstall(): string {
     const text = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
     const existing = /^[ \t]*\[mcp_servers\.bili\][ \t]*$/m.exec(text);
     if (existing !== null) {
-        const block = text.slice(existing.index, text.indexOf("\n[", existing.index + 1) === -1 ? undefined : text.indexOf("\n[", existing.index + 1));
-        if (block.includes(`BILI_MCP_PROXY = ${JSON.stringify(proxyOriginForInstall())}`)) return `codex: already installed (${file})`;
-        const refreshed = text.slice(0, existing.index) + codexBlock().replace(/^\n/, "") + text.slice(existing.index + block.length);
+        const blockEnd = text.indexOf("\n[", existing.index + 1);
+        const block = text.slice(existing.index, blockEnd === -1 ? text.length : blockEnd);
+        const canonical = codexBlock().replace(/^\n/, "");
+        // #638: "already installed" must mean the WHOLE block matches the
+        // canonical one, not just the BILI_MCP_PROXY line — a block whose
+        // args/command drifted (e.g. args written as a string) must be
+        // rewritten, or the self-heal path is a silent no-op.
+        if (block.replace(/\s+$/, "") === canonical.replace(/\s+$/, "")) return `codex: already installed (${file})`;
+        const before = text.slice(0, existing.index);
+        const after = text.slice(blockEnd === -1 ? text.length : blockEnd);
+        const spliced = blockEnd === -1 ? before + canonical : before + canonical.replace(/\n$/, "") + after;
         backupOnce(file);
-        fs.writeFileSync(file, refreshed);
-        return `codex: refreshed proxy origin -> ${file} [mcp_servers.bili]`;
+        fs.writeFileSync(file, spliced);
+        return `codex: refreshed [mcp_servers.bili] -> ${file}`;
     }
     fs.mkdirSync(path.dirname(file), { recursive: true });
     backupOnce(file);

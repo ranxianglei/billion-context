@@ -797,6 +797,18 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
         assert.doesNotMatch(tomlAfter, /mcp_servers\.bili/);
         assert.match(tomlAfter, /\[mcp_servers\.other\]\ncommand = "x"\n/);
 
+        // #638 regression: a block whose env line matches the current origin
+        // but whose args is a STRING (not an array) must be rewritten, not
+        // reported as "already installed" (the old check only compared the
+        // BILI_MCP_PROXY line, so the self-heal path was a silent no-op).
+        fs.writeFileSync(path.join(home, "config.toml"),
+            `[mcp_servers.bili]\ncommand = "node"\nargs = '["${path.join(root, "dist", "mcp.js")}"']\nenv = { BILI_MCP_PROXY = "http://127.0.0.1:8787" }\n`);
+        assert.match(pluginInstall("codex"), /refreshed/);
+        const tomlFixed = fs.readFileSync(path.join(home, "config.toml"), "utf8");
+        assert.match(tomlFixed, /args = \["/);
+        assert.doesNotMatch(tomlFixed, /args = '/);
+        assert.match(pluginInstall("codex"), /already installed/);
+
         // Regression: a header-only [mcp_servers.bili] block as the final
         // line with no trailing newline must be fully removed (previously
         // the header line survived because the next-table search matched
