@@ -15,7 +15,9 @@
     "typecheck": "tsc --noEmit --project tsconfig.build.json",
     "test": "node --import tsx --test tests/*.test.ts",
     "start": "node dist/index.js",
-    "test:e2e": "node --import tsx --test tests/e2e/e2e-codex.test.ts"
+    "test:e2e": "node --import tsx --test tests/e2e/e2e-codex.test.ts",
+    "e2e:docker": "bash scripts/e2e-docker/run.sh full",
+    "e2e:docker:preflight": "bash scripts/e2e-docker/run.sh preflight"
   },
   "keywords": [
     "context",

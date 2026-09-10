@@ -1,0 +1,35 @@
+name: E2E (real codex, Docker)
+
+on:
+  workflow_dispatch:
+    inputs:
+      forge:
+        description: "run forge phase (needs BILI_CODEX_COMPACT support in master)"
+        type: boolean
+        default: false
+
+jobs:
+  e2e-docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Preflight (in container)
+        run: bash scripts/e2e-docker/run.sh preflight
+        env:
+          E2E_UPSTREAM_URL: ${{ secrets.E2E_UPSTREAM_URL }}
+          E2E_UPSTREAM_KEY: ${{ secrets.E2E_UPSTREAM_KEY }}
+      - name: E2E suite (in container)
+        run: bash scripts/e2e-docker/run.sh full
+        env:
+          E2E_UPSTREAM_URL: ${{ secrets.E2E_UPSTREAM_URL }}
+          E2E_UPSTREAM_KEY: ${{ secrets.E2E_UPSTREAM_KEY }}
+          E2E_FORGE: ${{ inputs.forge && '1' || '' }}
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-docker-logs
+          path: tmp/docker-e2e/
+          retention-days: 7
+          if-no-files-found: ignore
