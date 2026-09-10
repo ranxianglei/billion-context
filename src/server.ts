@@ -212,10 +212,6 @@ const UPSTREAM_HOP_HEADERS = new Set([
     "connection",
     "keep-alive",
     "transfer-encoding",
-    // Node's fetch transparently decodes compressed responses. Do not
-    // forward the upstream encoding marker when the body is rewritten or
-    // streamed from fetch, otherwise clients try to decompress plain bytes.
-    "content-encoding",
     // RFC 7230 §6.1 hop-by-hop headers. proxy-authorization in particular
     // carries client→proxy credentials that must never reach the model
     // endpoint. (#80)
@@ -226,6 +222,18 @@ const UPSTREAM_HOP_HEADERS = new Set([
     "trailer",
     "upgrade",
 ]);
+
+// content-encoding is end-to-end (RFC 9110 §7.2), NOT hop-by-hop — but the two
+// directions need opposite treatment. RESPONSES: Node's fetch transparently
+// decodes compressed bodies, so the upstream's encoding marker must not reach
+// the client (it would try to decompress already-plain bytes) — stripped at
+// the response-forward sites below. REQUESTS: the marker describes exactly the
+// bytes bili forwards — decoded/rebuilt bodies have it dropped at decode time
+// (handle()), while verbatim passthrough bodies (#619 undecodable encodings,
+// unknown paths) MUST keep it so upstream applies its own decode; forwarding
+// encoded request bytes without the marker made upstream reject undeclared
+// binary bodies (#677).
+const RESPONSE_ONLY_STRIP_HEADERS = new Set(["content-encoding"]);
 
 // RFC 7230 §6.1: the Connection header names additional hop-by-hop headers
 // that must be stripped per-message. Returns their lowercased names.
@@ -3448,14 +3456,14 @@ async function forward(
     const respConnNamed = connectionNamedHeaders(upstream.headers.get("connection") ?? undefined);
     upstream.headers.forEach((v, k) => {
         const lower = k.toLowerCase();
-        if (UPSTREAM_HOP_HEADERS.has(lower) || respConnNamed.has(lower)) return;
+        if (UPSTREAM_HOP_HEADERS.has(lower) || RESPONSE_ONLY_STRIP_HEADERS.has(lower) || respConnNamed.has(lower)) return;
         respHeaders[k] = v;
     });
     if (opts.debug) {
         const respLog: Record<string, string> = {};
         upstream.headers.forEach((v, k) => {
             const lower = k.toLowerCase();
-            if (UPSTREAM_HOP_HEADERS.has(lower) || respConnNamed.has(lower)) return;
+            if (UPSTREAM_HOP_HEADERS.has(lower) || RESPONSE_ONLY_STRIP_HEADERS.has(lower) || respConnNamed.has(lower)) return;
             const masked = maskHeaderForLog(k, v);
             respLog[k] = masked.length > 300 ? masked.slice(0, 300) + "..." : masked;
         });
