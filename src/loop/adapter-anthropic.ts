@@ -2,6 +2,7 @@ import type { CoreMessage } from "acp-kernel";
 import { coreToAnthropic, extractSystem, buildSystem, type AnthropicRequestBody } from "acp-kernel/wire";
 import { buildVisibilityMarker } from "../compress-loop.js";
 import { createTagEchoFilter } from "./tag-echo-filter.js";
+import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
 import type {
     CompressLoopAdapter,
@@ -222,6 +223,17 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                 loggerLog("warn", `[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
             });
             let lastTextIndex: number | null = null;
+            let sawThinking = false;
+            let toolCallsEmitted = 0;
+            let degenerateWarned = false;
+            const maybeWarnDegenerate = (reason: string | undefined) => {
+                if (degenerateWarned) return;
+                const msg = degenerateTurnWarning({ reason, terminalReason: "end_turn", toolCalls: toolCallsEmitted, text: tagFilter.stats(), sawThinking, wire: "anthropic" });
+                if (msg) {
+                    degenerateWarned = true;
+                    loggerLog("warn", msg);
+                }
+            };
 
             for await (const eventStr of iterSseEvents(upstream)) {
                 const parsed = parseAnthropicSse(eventStr);
@@ -267,7 +279,10 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                         const id = typeof block.id === "string" ? block.id : `toolu_${upstreamIndex}`;
                         pending.set(upstreamIndex, { id, name, json: "" });
                     } else {
-                        if (block.type === "thinking" || block.type === "redacted_thinking") thinkingIndexes.add(upstreamIndex);
+                        if (block.type === "thinking" || block.type === "redacted_thinking") {
+                            thinkingIndexes.add(upstreamIndex);
+                            sawThinking = true;
+                        }
                         const ci = clientIndex++;
                         indexMap.set(upstreamIndex, ci);
                         openBlocks.push(ci);
@@ -312,6 +327,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                     const tb = pending.get(upstreamIndex);
                     if (tb) {
                         pending.delete(upstreamIndex);
+                        toolCallsEmitted++;
                         yield {
                             kind: "tool_call",
                             name: tb.name,
@@ -376,6 +392,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                             cachedTokens: roundCached,
                         } as ParsedStreamEvent;
                     }
+                    maybeWarnDegenerate(stopReason);
                     yield { kind: "done", finishReason: stopReason } as ParsedStreamEvent;
                 } else if (type === "message_stop") {
                     if (lastTextIndex !== null) {
@@ -394,6 +411,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                             cachedTokens: roundCached,
                         } as ParsedStreamEvent;
                     }
+                    maybeWarnDegenerate(stopReason);
                     yield { kind: "done", finishReason: stopReason ?? "end_turn" } as ParsedStreamEvent;
                 } else if (round === 1) {
                     yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;

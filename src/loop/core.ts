@@ -641,6 +641,19 @@ export async function* runCompressLoop(
                 }
             } catch (e) {
                 if (!(e instanceof UpstreamHttpError)) throw e;
+                // #684 learn-on-failure: a 400 mentioning reasoning_content on
+                // a thinking session is the split-turn signature — remember it
+                // on the session so #651's reasoning-drop never fires here
+                // again (kernel gate prevents the split; this closes the loop).
+                if (
+                    e.status === 400 &&
+                    /reasoning_content/i.test(e.body) &&
+                    ctx.session.metadata.strictReasoningEcho !== true
+                ) {
+                    ctx.session.metadata.strictReasoningEcho = true;
+                    ctx.log(`[acp-loop] 400 mentions reasoning_content — learned strict reasoning echo for this session; #651 reasoning-drop disabled (#684)`);
+                    loggerLog("warn", `[acp-loop] learned strictReasoningEcho (session ${ctx.session.id}); reasoning-drop disabled (#684)`);
+                }
                 const suffix = e.attempts > 1 ? ` after ${e.attempts} attempt(s)` : "";
                 ctx.log(`[acp-proxy: compress loop upstream error ${e.status}${suffix}: ${e.body.slice(0, 200)}]`);
                 loggerLog("error", `[acp-loop] upstream error ${e.status}${suffix}: ${e.body.slice(0, 200)}`);

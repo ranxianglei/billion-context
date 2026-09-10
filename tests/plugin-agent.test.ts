@@ -807,6 +807,22 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
         assert.doesNotMatch(tomlEdge, /mcp_servers\.bili/);
         assert.match(tomlEdge, /\[mcp_servers\.other\]\ncommand = "x"\n/);
 
+        // #638: a malformed block (args as string - legal TOML, invalid codex
+        // schema) with a matching origin must NOT short-circuit to "already
+        // installed"; reinstall must self-heal it to the canonical block.
+        const selfRoot = path.dirname(path.dirname(path.resolve("src/plugin-install.ts")));
+        const malformed = `[mcp_servers.other]\ncommand = "x"\n[mcp_servers.bili]\ncommand = "node"\nargs = '[\"${path.join(selfRoot, "dist", "mcp.js")}\"]'\nenv = { BILI_MCP_PROXY = "http://127.0.0.1:8787" }\n`;
+        fs.writeFileSync(path.join(home, "config.toml"), malformed);
+        const healedMsg = pluginInstall("codex");
+        assert.match(healedMsg, /repaired args: was not an array/);
+        const tomlHealed = fs.readFileSync(path.join(home, "config.toml"), "utf8");
+        assert.match(tomlHealed, /args = \[/);
+        assert.doesNotMatch(tomlHealed, /args = '\[/);
+        assert.match(tomlHealed, /\[mcp_servers\.other\]\ncommand = "x"\n/);
+        // A now-canonical block stays "already installed" on rerun.
+        assert.match(pluginInstall("codex"), /already installed/);
+        assert.match(pluginRemove("codex"), /removed/);
+
         assert.match(pluginInstall("opencode"), /installed/);
         const oc = JSON.parse(fs.readFileSync(path.join(home, ".config/opencode/opencode.json"), "utf8")) as { mcp: Record<string, { command: string[]; environment?: Record<string, string> }> };
         assert.equal(oc.mcp.bili.command[1]!.endsWith(path.join("dist", "mcp.js")), true);

@@ -155,6 +155,15 @@ export function resolveDshHome(env: NodeJS.ProcessEnv): string {
         : path.join(h, ".dsh");
 }
 
+/** codex keeps everything under CODEX_HOME (default ~/.codex): config.toml,
+ *  auth.json, sessions. Same resolution the discovery + plugin-install paths
+ *  already use (client-config.ts / plugin-install.ts `codexToml`). */
+export function resolveCodexHome(env: NodeJS.ProcessEnv): string {
+    const h = os.homedir();
+    return nonEmpty(env.CODEX_HOME) ? env.CODEX_HOME!
+        : path.join(h, ".codex");
+}
+
 /** Line-based scanner for dsh settings.yaml: collects every http(s) URL that
  *  appears as a baseURL/baseUrl/base_url value (llm-pi-ai provider profiles,
  *  llm-deepseek baseURL, model-level overrides). Route discovery only needs

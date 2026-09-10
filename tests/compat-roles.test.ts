@@ -113,9 +113,13 @@ function upstreamServer(status: number, onBody: (path: string, body: unknown) =>
 
 interface StartOpts {
     compatJson: string;
+    /** G/H drive the #583 ladder with injectTool/injectNudge OFF so the wire is
+     *  the bare conversation — bili's own injected system prompt would otherwise
+     *  sit at index 0 and muddy the placement asserts. */
+    bareWire?: boolean;
 }
 
-async function startProxy(upstream: http.Server, { compatJson }: StartOpts): Promise<{ port: number; opts: ProxyOptions; stop: () => Promise<void>; cleanup: () => void }> {
+async function startProxy(upstream: http.Server, { compatJson, bareWire }: StartOpts): Promise<{ port: number; opts: ProxyOptions; stop: () => Promise<void>; cleanup: () => void }> {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const root = path.join(tmpdir(), `bili-compat-roles-${process.pid}-${Date.now()}`);
@@ -136,7 +140,7 @@ async function startProxy(upstream: http.Server, { compatJson }: StartOpts): Pro
         proxySource: "direct",
         modelContextLimit: 400_000,
         kernelConfig: defaultConfig(400_000),
-        compress: { injectTool: true, injectNudge: true },
+        compress: bareWire ? { injectTool: false, injectNudge: false } : { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
         compat: { roles: parseCompatRoles(JSON.parse(compatJson).compat?.roles) ?? {} },
         sessionHeader: "x-acp-session",
@@ -397,22 +401,27 @@ function rolesOf(body: unknown): string[] {
     return [...(b.input ?? []), ...(b.messages ?? [])].map((m) => m.role ?? "?");
 }
 
-// Payload that keeps a developer MID-LIST at the forward boundary. A well-formed
-// TYPED developer is hoisted to index 0 by the kernel (injectResponsesDeveloperMessage),
-// so the primary developer→system retry already lands at index 0 and succeeds — it
-// can never produce a mid-list system. A non-normalized type-less item is left in
-// place by the projection, which is exactly the precondition #583 needs.
-const MIDLIST_DEV_PAYLOAD = JSON.stringify({ model: "test", input: [
-    { type: "message", role: "user", content: "a" },
-    { role: "developer", content: "sys" },
-    { type: "message", role: "user", content: "b" },
+// Payload that still reaches the #583 placement edge after kernel #102 — via
+// the OPENAI chat path and a mid-list ASSISTANT. On Responses every developer
+// (typed or, post-#102, type-less EasyInput) collapses into the single
+// injected prefix message; on the openai path a mid-list developer is hoisted
+// into the index-0 system too. The one conversation role that survives
+// mid-list on the rebuilt wire is ASSISTANT (openaiToCore/coreToOpenai keep
+// conversation messages in place), so an assistant→system rewrite produces a
+// system at index 1 — exactly the #377-class "system only at index 0"
+// placement 400 the second-chance hop needs.
+const MIDLIST_ASSISTANT_PAYLOAD = JSON.stringify({ model: "test", messages: [
+    { role: "user", content: "a" },
+    { role: "assistant", content: "sys" },
+    { role: "user", content: "b" },
 ]});
 
-// Upstream enforcing BOTH halves of the #583 edge: rejects any unknown role
-// (developer) AND enforces system-at-index-0 only (a mid-list system is a
-// #377-class placement 400). acceptUser decides whether the final developer→user
-// rewrite is accepted (true = second-chance succeeds; false = every hop fails,
-// exercising the hard cap). Records every hit's roles.
+// Upstream enforcing BOTH halves of the #583 edge: rejects the unsupported
+// mid-list role (assistant — any of developer/assistant trips it) AND enforces
+// system-at-index-0 only (a mid-list system is a #377-class placement 400).
+// acceptUser decides whether the final assistant→user rewrite is accepted
+// (true = second-chance succeeds; false = every hop fails, exercising the hard
+// cap). Records every hit's roles.
 function ladderUpstream(acceptUser: boolean): Promise<{ server: http.Server; seen: string[][] }> {
     const seen: string[][] = [];
     const server = http.createServer((req, res) => {
@@ -424,9 +433,10 @@ function ladderUpstream(acceptUser: boolean): Promise<{ server: http.Server; see
             seen.push(roles);
             const json = (obj: unknown) => JSON.stringify(obj);
             const offZero = roles.map((r, i) => (r === "system" ? i : -1)).filter((i) => i >= 0).find((i) => i !== 0);
-            if (roles.includes("developer")) {
+            const odd = roles.find((r) => r === "developer" || r === "assistant");
+            if (odd) {
                 res.writeHead(400, { "content-type": "application/json" });
-                res.end(json({ error: { message: "Invalid role: developer" } }));
+                res.end(json({ error: { message: `Invalid role: ${odd}` } }));
             } else if (offZero !== undefined) {
                 res.writeHead(400, { "content-type": "application/json" });
                 res.end(json({ error: { message: `Value error: system messages are only allowed at index 0 (found system at index ${offZero})` } }));
@@ -435,37 +445,37 @@ function ladderUpstream(acceptUser: boolean): Promise<{ server: http.Server; see
                 res.end(json({ ok: true }));
             } else {
                 res.writeHead(400, { "content-type": "application/json" });
-                res.end(json({ error: { message: "Invalid role: developer" } }));
+                res.end(json({ error: { message: "Invalid role: assistant" } }));
             }
         });
     });
     return new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve({ server, seen })));
 }
 
-test("e2e #583 G: mid-list developer→system 400s on a placement-strict backend; second-chance learns developer→user", async () => {
+test("e2e #583 G: mid-list assistant→system 400s on a placement-strict backend; second-chance learns assistant→user", async () => {
     const { server: upstream, seen } = await ladderUpstream(true);
-    const harness = await startProxy(upstream, { compatJson: `{"providers":{}}` });
+    const harness = await startProxy(upstream, { compatJson: `{"providers":{}}`, bareWire: true });
     try {
-        const res1 = await fetch(`http://127.0.0.1:${harness.port}/v1/responses`, {
+        const res1 = await fetch(`http://127.0.0.1:${harness.port}/v1/chat/completions`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-session-id": "compat-second-chance" },
-            body: MIDLIST_DEV_PAYLOAD,
+            body: MIDLIST_ASSISTANT_PAYLOAD,
         });
         assert.equal(res1.status, 200, "client sees a transparent 200 after the second-chance retry");
-        assert.equal(seen.length, 3, `expected 3 upstream hits (dev→sys→user), got ${JSON.stringify(seen)}`);
-        assert.ok(seen[0].includes("developer"), "hit 1 carries a developer role → rejected");
-        assert.ok(!seen[1].includes("developer") && seen[1].includes("system"), "hit 2: primary hop rewrote developer→system (mid-list → placement 400)");
-        assert.ok(!seen[2].includes("developer") && !seen[2].includes("system"), "hit 3: second-chance rewrote developer→user → accepted");
-        // Second request: the session learned developer→user, so every developer
-        // (typed or type-less) is pre-rewritten BEFORE fetch — no 400 round-trip.
-        const res2 = await fetch(`http://127.0.0.1:${harness.port}/v1/responses`, {
+        assert.equal(seen.length, 3, `expected 3 upstream hits (asst→sys→user), got ${JSON.stringify(seen)}`);
+        assert.ok(seen[0].includes("assistant"), "hit 1 carries an assistant role → rejected");
+        assert.ok(!seen[1].includes("assistant") && seen[1].includes("system"), "hit 2: primary hop rewrote assistant→system (mid-list → placement 400)");
+        assert.ok(!seen[2].includes("assistant") && !seen[2].includes("system"), "hit 3: second-chance rewrote assistant→user → accepted");
+        // Second request: the session learned assistant→user, so every assistant
+        // is pre-rewritten BEFORE fetch — no 400 round-trip.
+        const res2 = await fetch(`http://127.0.0.1:${harness.port}/v1/chat/completions`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-session-id": "compat-second-chance" },
-            body: MIDLIST_DEV_PAYLOAD,
+            body: MIDLIST_ASSISTANT_PAYLOAD,
         });
         assert.equal(res2.status, 200);
         assert.equal(seen.length, 4, `expected 4 upstream hits total (3 + 1), got ${JSON.stringify(seen)}`);
-        assert.ok(!seen[3].includes("developer") && !seen[3].includes("system"), "second request pre-rewritten via learned map");
+        assert.ok(!seen[3].includes("assistant") && !seen[3].includes("system"), "second request pre-rewritten via learned map");
         await waitFor(() => _liveUpstreamTimersForTest() === 0);
         assert.equal(_liveUpstreamTimersForTest(), 0, "abandoned retry bodies must not re-arm the idle timer");
     } finally {
@@ -477,16 +487,16 @@ test("e2e #583 G: mid-list developer→system 400s on a placement-strict backend
 
 test("e2e #583 H: ladder is capped — every hop failing passes the ORIGINAL 400 verbatim, no loop", async () => {
     const { server: upstream, seen } = await ladderUpstream(false);
-    const harness = await startProxy(upstream, { compatJson: `{"providers":{}}` });
+    const harness = await startProxy(upstream, { compatJson: `{"providers":{}}`, bareWire: true });
     try {
-        const res = await fetch(`http://127.0.0.1:${harness.port}/v1/responses`, {
+        const res = await fetch(`http://127.0.0.1:${harness.port}/v1/chat/completions`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-session-id": "compat-second-chance-cap" },
-            body: MIDLIST_DEV_PAYLOAD,
+            body: MIDLIST_ASSISTANT_PAYLOAD,
         });
         assert.equal(res.status, 400, "client receives a 400 when every hop fails");
         const text = await res.text();
-        assert.ok(text.includes("Invalid role: developer"), `original error preserved verbatim, got: ${text}`);
+        assert.ok(text.includes("Invalid role: assistant"), `original error preserved verbatim, got: ${text}`);
         assert.equal(seen.length, 3, `expected exactly 3 upstream hits (original + 2 retries), got ${JSON.stringify(seen)}`);
         await waitFor(() => _liveUpstreamTimersForTest() === 0);
         assert.equal(_liveUpstreamTimersForTest(), 0, "abandoned retry bodies must not re-arm the idle timer");

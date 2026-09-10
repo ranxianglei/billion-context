@@ -51,6 +51,7 @@ export function mergeCompress(
     // like `prompts`: a model-level minToolTokens must not discard a
     // provider-level excludeTools.
     const absorbLevels = [global?.absorb, provider?.absorb, model?.absorb].filter(Boolean) as NonNullable<CompressSettings["absorb"]>[];
+    const reasoningLevels = [global?.reasoning, provider?.reasoning, model?.reasoning].filter(Boolean) as NonNullable<CompressSettings["reasoning"]>[];
     return {
         modelContextLimit: pick("modelContextLimit"),
         maxContextLimit: pick("maxContextLimit"),
@@ -66,6 +67,10 @@ export function mergeCompress(
 
 stripImages: pick("stripImages"),
         stripImagesKeepRecent: pick("stripImagesKeepRecent"),
+        // `reasoning` is a third nested-object field merged sub-field-wise
+        // exactly like `absorb`/`prompts`: a model-level `threshold` must not
+        // discard a provider-level `drop: false`.
+        reasoning: reasoningLevels.length > 0 ? Object.assign({}, ...reasoningLevels) : undefined,
     };
 }
 

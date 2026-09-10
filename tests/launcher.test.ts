@@ -47,6 +47,10 @@ import {
     prepareDshHome,
     writeDshAcpPatch,
     dshArgsWithPatch,
+    buildCodexMcpArgs,
+    prepareCodexHome,
+    prepareCodexMcpInjection,
+    resolveCodexHome,
     readOpencodeConfig,
     resolveOpencodeConfigFile,
     findFreePort,
@@ -303,7 +307,7 @@ test("runLaunch pi: native -e plugin injected only when not installed", async ()
     // home and the second assertion fails.
     if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
     delete process.env.PI_CODING_AGENT_DIR;
-    const fakePi = path.join(home, "fake-pi");
+    const fakePi = path.join(home, process.platform === "win32" ? "fake-pi.exe" : "fake-pi");
     fs.writeFileSync(fakePi, "");
     process.env.PI_BIN = fakePi;
     const piHome = path.join(home, ".pi/agent");
@@ -419,7 +423,7 @@ test("runLaunch pi #535: refuses launch when http rewrites needed and extension 
     const distExisted = fs.existsSync(distAgent);
     if (distExisted) fs.renameSync(distAgent, distBackup);
 
-    const fakePi = path.join(home, "fake-pi");
+    const fakePi = path.join(home, process.platform === "win32" ? "fake-pi.exe" : "fake-pi");
     fs.writeFileSync(fakePi, "");
     const prevPiBin = process.env.PI_BIN;
     process.env.PI_BIN = fakePi;
@@ -488,7 +492,7 @@ test("runLaunch omp #535: refuses launch when http rewrites needed and extension
     process.env.HOME = home;
     if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
     delete process.env.PI_CODING_AGENT_DIR;
-    process.env.BILI_CLIENT_BIN = path.join(home, "fake-omp");
+    process.env.BILI_CLIENT_BIN = path.join(home, process.platform === "win32" ? "fake-omp.exe" : "fake-omp");
     fs.writeFileSync(process.env.BILI_CLIENT_BIN, "");
     const ompHome = path.join(home, ".omp", "agent");
     fs.mkdirSync(ompHome, { recursive: true });
@@ -568,7 +572,7 @@ test("runLaunch hermes #535: proxy env routing, no HERMES_HOME overlay, real con
     process.env.HOME = home;
     if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
     delete process.env.HTTPS_PROXY;
-    const fakeHermes = path.join(home, "fake-hermes");
+    const fakeHermes = path.join(home, process.platform === "win32" ? "fake-hermes.exe" : "fake-hermes");
     fs.writeFileSync(fakeHermes, "");
     process.env.BILI_CLIENT_BIN = fakeHermes;
     const hermesHome = path.join(home, ".hermes");
@@ -679,7 +683,7 @@ test("runLaunch omp: native -e plugin injected only when no loadable config entr
     process.env.HOME = home;
     if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
     delete process.env.PI_CODING_AGENT_DIR;
-    const fakeOmp = path.join(home, "fake-omp");
+    const fakeOmp = path.join(home, process.platform === "win32" ? "fake-omp.exe" : "fake-omp");
     fs.writeFileSync(fakeOmp, "");
     process.env.BILI_CLIENT_BIN = fakeOmp;
     const ompHome = path.join(home, ".omp", "agent");
@@ -1066,15 +1070,42 @@ test("isOnPath: finds a known binary on PATH, misses bogus name", () => {
     assert.equal(isOnPath(nodeName, {}), false);
 });
 
-test("resolveClientCommand: codex/claude resolve to themselves", () => {
-    assert.deepEqual(resolveClientCommand("codex", { PATH: "/usr/bin" }), {
-        command: "codex",
-        prefixArgs: [],
-    });
-    assert.deepEqual(resolveClientCommand("claude", { PATH: "/usr/bin" }), {
-        command: "claude",
-        prefixArgs: [],
-    });
+test("resolveClientCommand: codex/claude not on PATH fall back to bare name", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-path-"));
+    try {
+        assert.deepEqual(resolveClientCommand("codex", { PATH: tmp }), {
+            command: "codex",
+            prefixArgs: [],
+        });
+        assert.deepEqual(resolveClientCommand("claude", { PATH: tmp }), {
+            command: "claude",
+            prefixArgs: [],
+        });
+    } finally {
+        fs.rmdirSync(tmp);
+    }
+});
+
+test("resolveClientCommand: codex/claude on PATH resolve to full path", () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-path-"));
+    const codexFile = path.join(tmp, "codex");
+    const claudeFile = path.join(tmp, "claude");
+    fs.writeFileSync(codexFile, "#!/bin/sh\necho codex\n", { mode: 0o755 });
+    fs.writeFileSync(claudeFile, "#!/bin/sh\necho claude\n", { mode: 0o755 });
+    try {
+        assert.deepEqual(resolveClientCommand("codex", { PATH: tmp }), {
+            command: codexFile,
+            prefixArgs: [],
+        });
+        assert.deepEqual(resolveClientCommand("claude", { PATH: tmp }), {
+            command: claudeFile,
+            prefixArgs: [],
+        });
+    } finally {
+        fs.unlinkSync(codexFile);
+        fs.unlinkSync(claudeFile);
+        fs.rmdirSync(tmp);
+    }
 });
 
 test("resolveClientCommand: pi prefers PI_BIN env", () => {
@@ -1720,6 +1751,128 @@ test("prepareDshHome: returns undefined for unreadable settings even with rewrit
     }
 });
 
+test("resolveCodexHome: honours CODEX_HOME, defaults to ~/.codex", () => {
+    assert.equal(resolveCodexHome({ CODEX_HOME: "/tmp/cx" }), "/tmp/cx");
+    assert.ok(resolveCodexHome({}).endsWith(".codex"));
+});
+
+test("prepareCodexHome: no real config → overlay holds only the bili MCP block, siblings shared, real home untouched (#681)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cx-home-"));
+    const origin = "http://127.0.0.1:8787";
+    const cid = "conv-1";
+    try {
+        fs.writeFileSync(path.join(dir, "auth.json"), '{"id_token":"x"}');
+        fs.mkdirSync(path.join(dir, "sessions"));
+        const authOriginal = fs.readFileSync(path.join(dir, "auth.json"), "utf8");
+
+        const overlay = prepareCodexHome(dir, origin, cid);
+        assert.ok(overlay);
+        assert.equal(overlay, `${dir}-bili`);
+        const txt = fs.readFileSync(path.join(overlay, "config.toml"), "utf8");
+        assert.equal((txt.match(/\[mcp_servers\.bili\]/g) ?? []).length, 1);
+        assert.ok(txt.includes(`command = ${JSON.stringify(process.execPath)}`));
+        assert.match(txt, /args = \[.*mcp\.js.*\]/);
+        assert.ok(txt.includes(`BILI_MCP_PROXY = ${JSON.stringify(origin)}`));
+        assert.ok(txt.includes(`BILI_CONVERSATION_ID = ${JSON.stringify(cid)}`));
+        // the command value must be a quoted TOML basic string — only then does a spaced/quoted Windows path survive being read from the file
+        assert.match(txt, /^command = ".+"$/m);
+        assert.ok(fs.lstatSync(path.join(overlay, "auth.json")).isSymbolicLink());
+        assert.ok(fs.lstatSync(path.join(overlay, "sessions")).isSymbolicLink());
+        assert.equal(fs.readFileSync(path.join(dir, "auth.json"), "utf8"), authOriginal);
+        assert.ok(!fs.existsSync(path.join(dir, "config.toml")));
+        fs.rmSync(overlay, { recursive: true, force: true });
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("prepareCodexHome: real config without bili → original preserved, block appended once (#681)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cx-home-"));
+    try {
+        fs.writeFileSync(
+            path.join(dir, "config.toml"),
+            ['model = "gpt-5"', "", '[model_providers.openai]', 'name = "OpenAI"', ''].join("\n"),
+        );
+        const original = fs.readFileSync(path.join(dir, "config.toml"), "utf8");
+        const overlay = prepareCodexHome(dir, "http://127.0.0.1:8787", "conv-2");
+        assert.ok(overlay);
+        const txt = fs.readFileSync(path.join(overlay, "config.toml"), "utf8");
+        assert.ok(txt.includes('model = "gpt-5"'));
+        assert.ok(txt.includes('[model_providers.openai]'));
+        assert.equal((txt.match(/\[mcp_servers\.bili\]/g) ?? []).length, 1);
+        assert.equal(fs.readFileSync(path.join(dir, "config.toml"), "utf8"), original);
+        fs.rmSync(overlay, { recursive: true, force: true });
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("prepareCodexHome: pre-existing [mcp_servers.bili] is replaced, never duplicated (#681)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cx-home-"));
+    try {
+        fs.writeFileSync(
+            path.join(dir, "config.toml"),
+            [
+                "model = \"gpt-5\"",
+                "",
+                "[mcp_servers.bili]",
+                "command = \"/old/path/node\"",
+                "args = [\"/old/mcp.js\"]",
+                "env = { BILI_MCP_PROXY = \"http://old:1\" }",
+                "",
+                "[other_table]",
+                "keep = \"me\"",
+                "",
+            ].join("\n"),
+        );
+        const overlay = prepareCodexHome(dir, "http://127.0.0.1:8787", "conv-3");
+        assert.ok(overlay);
+        const txt = fs.readFileSync(path.join(overlay, "config.toml"), "utf8");
+        assert.equal((txt.match(/\[mcp_servers\.bili\]/g) ?? []).length, 1, "exactly one bili block");
+        assert.ok(!txt.includes("/old/path/node"), "stale install block removed");
+        assert.ok(!txt.includes("http://old:1"), "stale proxy origin removed");
+        assert.ok(txt.includes(`BILI_CONVERSATION_ID = ${JSON.stringify("conv-3")}`), "per-spawn conversation id added");
+        assert.ok(txt.includes('model = "gpt-5"'), "unrelated top-level key kept");
+        assert.ok(txt.includes('[other_table]') && txt.includes('keep = "me"'), "unrelated table kept");
+        fs.rmSync(overlay, { recursive: true, force: true });
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("prepareCodexMcpInjection: POSIX keeps inline -c args, no CODEX_HOME redirect (#681)", () => {
+    const r = prepareCodexMcpInjection({
+        platform: "linux",
+        codexHome: "/nonexistent-codex-home",
+        origin: "http://127.0.0.1:8787",
+        conversationId: "conv-x",
+    });
+    assert.deepEqual(r.clientArgs, buildCodexMcpArgs("http://127.0.0.1:8787", "conv-x"));
+    assert.deepEqual(r.envPatch, {});
+    assert.equal(r.warning, undefined);
+});
+
+test("prepareCodexMcpInjection: win32 redirects CODEX_HOME to the overlay, drops inline args (#681)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cx-home-"));
+    try {
+        fs.writeFileSync(path.join(dir, "auth.json"), "{}");
+        const r = prepareCodexMcpInjection({
+            platform: "win32",
+            codexHome: dir,
+            origin: "http://127.0.0.1:8787",
+            conversationId: "conv-w",
+        });
+        assert.deepEqual(r.clientArgs, [], "no inline -c args on Windows");
+        assert.equal(r.envPatch.CODEX_HOME, `${dir}-bili`);
+        assert.ok(fs.existsSync(path.join(`${dir}-bili`, "config.toml")));
+        const txt = fs.readFileSync(path.join(`${dir}-bili`, "config.toml"), "utf8");
+        assert.equal((txt.match(/\[mcp_servers\.bili\]/g) ?? []).length, 1);
+        fs.rmSync(`${dir}-bili`, { recursive: true, force: true });
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
 test("runLaunch dsh: non-loopback upstreams ride proxy envs, loopback keeps the overlay (#535 phase 4)", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-launch-"));
     const prevBin = process.env.BILI_CLIENT_BIN;
@@ -1740,7 +1893,7 @@ test("runLaunch dsh: non-loopback upstreams ride proxy envs, loopback keeps the 
     );
     fs.mkdirSync(path.join(dshHome, "profiles"));
     const original = fs.readFileSync(path.join(dshHome, "settings.yaml"), "utf8");
-    const fakeDsh = path.join(home, "fake-dsh");
+    const fakeDsh = path.join(home, process.platform === "win32" ? "fake-dsh.exe" : "fake-dsh");
     fs.writeFileSync(fakeDsh, "");
     process.env.BILI_CLIENT_BIN = fakeDsh;
     process.env.DSH_HOME = dshHome;
@@ -1845,7 +1998,7 @@ test("runLaunch dsh: no loopback custom providers — no DSH_HOME overlay (#535 
             "      baseURL: https://api.anthropic.com",
         ].join("\n"),
     );
-    const fakeDsh = path.join(home, "fake-dsh");
+    const fakeDsh = path.join(home, process.platform === "win32" ? "fake-dsh.exe" : "fake-dsh");
     fs.writeFileSync(fakeDsh, "");
     process.env.BILI_CLIENT_BIN = fakeDsh;
     process.env.DSH_HOME = dshHome;
@@ -1908,7 +2061,7 @@ test("runLaunch omp: launcher hands per-model windows to the spawned proxy", asy
     process.env.HOME = home;
     if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
     delete process.env.PI_CODING_AGENT_DIR;
-    const fakeOmp = path.join(home, "fake-omp");
+    const fakeOmp = path.join(home, process.platform === "win32" ? "fake-omp.exe" : "fake-omp");
     fs.writeFileSync(fakeOmp, "");
     process.env.BILI_CLIENT_BIN = fakeOmp;
     const ompHome = path.join(home, ".omp", "agent");
@@ -2153,7 +2306,7 @@ test("runLaunch codex: budget args injected for MITM mode (built-in table window
     if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
     delete process.env.ANTHROPIC_MODEL;
     delete process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW;
-    const fakeCodex = path.join(home, "fake-codex");
+    const fakeCodex = path.join(home, process.platform === "win32" ? "fake-codex.exe" : "fake-codex");
     fs.writeFileSync(fakeCodex, "");
     process.env.BILI_CLIENT_BIN = fakeCodex;
     const codexHome = path.join(home, ".codex");
@@ -2238,7 +2391,7 @@ test("runLaunch claude: CLAUDE_CODE_AUTO_COMPACT_WINDOW injected (built-in table
     if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
     delete process.env.ANTHROPIC_MODEL;
     delete process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW;
-    const fakeClaude = path.join(home, "fake-claude");
+    const fakeClaude = path.join(home, process.platform === "win32" ? "fake-claude.exe" : "fake-claude");
     fs.writeFileSync(fakeClaude, "");
     process.env.BILI_CLIENT_BIN = fakeClaude;
     const claudeDir = path.join(home, ".claude");

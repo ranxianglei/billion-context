@@ -51,6 +51,7 @@ test("not in table: 272K fallback (codex's model_info_from_slug), NOT unlimited"
 test("isCodexClient: UA prefixes codex_cli_rs/ and codex_exec/", () => {
     assert.equal(isCodexClient({ "user-agent": CODEX_UA }), true);
     assert.equal(isCodexClient({ "user-agent": "codex_exec/0.147.0" }), true, "exec-mode UA");
+    assert.equal(isCodexClient({ "user-agent": "codex_sdk_ts/0.153.4 (Ubuntu 24.4.0; x86_64) vt100 (codex_exec; 0.153.4)" }), true, "TS-SDK client (#645 real-device UA)");
     assert.equal(isCodexClient({ "user-agent": "node-fetch/3.1" }), false);
     assert.equal(isCodexClient({}), false);
     assert.equal(isCodexClient({ "user-agent": [CODEX_UA, "node-fetch/3.1"] }), true, "array headers (first entry)");

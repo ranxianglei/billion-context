@@ -2,7 +2,8 @@ import type { CoreMessage } from "acp-kernel";
 import { coreToResponses, injectResponsesDeveloperMessage, patchResponsesInput, type ResponseInputItem, type ResponsesProjection } from "acp-kernel/wire";
 import { buildVisibilityMarker } from "../compress-loop.js";
 import { hashId } from "../util.js";
-import { createTagEchoFilter, stripResponsesText, containsRenderTagText } from "./tag-echo-filter.js";
+import { createTagEchoFilter, stripResponsesText, containsRenderTagText, ACP_NAME_ALT } from "./tag-echo-filter.js";
+import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
 import { ACP_TEXT_OPEN, ACP_TEXT_CLOSE, ACP_STATUS_OPEN, ACP_STATUS_CLOSE, ACP_SEARCH_OPEN, ACP_SEARCH_CLOSE, ACP_DECOMPRESS_OPEN, ACP_DECOMPRESS_CLOSE, COMPRESS_TOOL_NAME, PROXY_TOOL_NAMES } from "../compress-tool.js";
 import type { BiliMessage } from "acp-kernel/wire";
@@ -117,7 +118,7 @@ export function dropWhitespaceResponsesMessages(input: unknown): number {
     return dropped;
 }
 
-const RENDER_TAG_RE = /\x3cacp\s[^>]*\x3e[^<]*\x3c\/acp\x3e|\x3cacp\s[^>]*\/\x3e/g;
+const RENDER_TAG_RE = new RegExp("\x3c" + ACP_NAME_ALT + "\\s[^\x3e]*\x3e[^\x3c]*\x3c\\/" + ACP_NAME_ALT + "\x3e|\x3c" + ACP_NAME_ALT + "\\s[^\x3e]*\\/\x3e", "g");
 
 function stripRenderTags(text: string): string {
     return text.replace(RENDER_TAG_RE, "");
@@ -316,6 +317,17 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                     yield { kind: "text", delta: tail, ...(raw ? { raw } : {}) } as ParsedStreamEvent;
                 }
             };
+            let sawReasoning = false;
+            let toolCallsEmitted = 0;
+            let degenerateWarned = false;
+            const maybeWarnDegenerate = (reason: string | undefined) => {
+                if (degenerateWarned) return;
+                const msg = degenerateTurnWarning({ reason, terminalReason: "completed", toolCalls: toolCallsEmitted, text: tagFilter.stats(), sawThinking: sawReasoning, wire: "responses" });
+                if (msg) {
+                    degenerateWarned = true;
+                    loggerLog("warn", msg);
+                }
+            };
             for await (const eventStr of iterSseEvents(upstream)) {
                 const explicitType = extractEventType(eventStr);
                 const dataLine = extractDataLine(eventStr);
@@ -332,6 +344,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                 // back to it when no event: line is present (explicit line still wins).
                 const type = explicitType ?? (typeof obj.type === "string" ? obj.type : null);
                 if (!type) continue;
+                if (type.startsWith("response.reasoning")) sawReasoning = true;
                 const rawBuf = Buffer.from(eventStr + "\n\n", "utf8");
                 if (round === 1 && typeof obj.output_index === "number") {
                     outputIndex = Math.max(outputIndex, obj.output_index + 1);
@@ -422,6 +435,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                         if (fc) {
                             if (typeof item.arguments === "string" && item.arguments) fc.arguments = item.arguments;
                             pending.delete(itemId);
+                            toolCallsEmitted++;
                             yield {
                                 kind: "tool_call",
                                 name: fc.name,
@@ -430,6 +444,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                             } as ParsedStreamEvent;
                         } else {
                             yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
+                            toolCallsEmitted++;
                             yield {
                                 kind: "tool_call",
                                 name: typeof item.name === "string" ? item.name : "",
@@ -468,6 +483,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                         outputTokens: typeof respUsage?.output_tokens === "number" ? respUsage.output_tokens : undefined,
                         cachedTokens: typeof pd?.cached_tokens === "number" ? pd.cached_tokens : undefined,
                     } as ParsedStreamEvent;
+                    maybeWarnDegenerate("completed");
                     yield { kind: "done", finishReason: "completed" } as ParsedStreamEvent;
                 } else if (type === "response.incomplete") {
                     yield* flushFilter();

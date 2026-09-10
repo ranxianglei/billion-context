@@ -9,6 +9,8 @@ import { rewriteJsonResponse } from "../src/stream.ts";
 import { rewriteOpenaiJsonResponse } from "../src/stream-openai.ts";
 import { rewriteResponsesJsonResponse } from "../src/stream-responses.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
+import { setLogCapture } from "../src/logger.ts";
+import { degenerateTurnWarning } from "../src/degenerate-turn.ts";
 
 const TAG = (ref: string, tokens = 177) => `\x3cacp tokens="${tokens}" type="text">${ref}\x3c/acp>`;
 const LT = "\x3c";
@@ -91,6 +93,63 @@ test("stripAcpTags: long paired content keeps content, strips tags", () => {
     assert.equal(stripAcpTags(`${OPEN}t="1">${long}${CLOSE}`), long);
 });
 
+// #644: a malformed render-tag close (the echoed `</acp` is missing its closing
+// `>`) used to make the close-side tail regexes (TRUNC_CLOSE, PARTIAL_TAIL)
+// swallow the ENTIRE following real content — they were unbounded, so `</acp`
+// + 300 chars of prose was held/dropped and only the bare ref survived. Bounding
+// the close-side tail to {0,32} (aligned with LONE_CLOSE) releases an over-long
+// tail as content instead of holding/dropping it.
+test("stripAcpTags: malformed close (missing >) does not eat following content (#644)", () => {
+    const content = "这是真实的正文内容，不应被过滤器吃掉。".repeat(12);
+    const malformed = `${LT}acp tokens="245" type="text">m01998${LT}/acp` + content;
+    const out = stripAcpTags(malformed);
+    assert.ok(out.includes(content), "real content survives the malformed close (not eaten)");
+    assert.ok(out.includes("m01998"), "the ref is preserved");
+    assert.notEqual(out, "m01998", "not stripped to the bare ref");
+});
+
+test("streaming filter matches stripAcpTags for a malformed close at every split position (#644)", () => {
+    const content = "这是真实的正文内容，不应被过滤器吃掉。".repeat(12);
+    const full = `${LT}acp tokens="245" type="text">m01998${LT}/acp` + content;
+    const expected = stripAcpTags(full);
+    for (let split = 0; split <= full.length; split++) {
+        const f = createTagEchoFilter();
+        const out = f.push(full.slice(0, split)) + f.push(full.slice(split)) + f.flush();
+        assert.equal(out, expected, `split=${split}`);
+    }
+});
+
+// A genuinely short truncated close at end-of-stream (<= 32 chars) is still a
+// truncated imitation and is dropped — the bound must not over-release.
+test("stripAcpTags: short truncated close at end is still dropped (#644 bound)", () => {
+    assert.equal(stripAcpTags(`ref m00001 ${LT}/acp`), "ref m00001 ");
+    assert.equal(stripAcpTags(`ref m00001 ${LT}/acp tokens`), "ref m00001 ");
+});
+
+// The actual #644 incident shape: whitespace right after the malformed
+// close. The unbounded close-side tails consumed content only through the
+// \s[^<>]* group, so the no-whitespace variants above never triggered the
+// bug on their own — this is the shape that ate the real prose.
+test("stripAcpTags: malformed close with trailing space does not eat following content (#644 incident shape)", () => {
+    const content = "这是真实的正文内容，不应被过滤器吃掉。".repeat(12);
+    const malformed = `${LT}acp tokens="245" type="text">m01998${LT}/acp ` + content;
+    const out = stripAcpTags(malformed);
+    assert.ok(out.includes(content), "real content survives the malformed close (not eaten)");
+    assert.ok(out.includes("m01998"), "the ref is preserved");
+    assert.notEqual(out, "m01998", "not stripped to the bare ref");
+});
+
+test("streaming filter matches stripAcpTags for the incident-shape malformed close at every split position (#644)", () => {
+    const content = "这是真实的正文内容，不应被过滤器吃掉。".repeat(12);
+    const full = `${LT}acp tokens="245" type="text">m01998${LT}/acp ` + content;
+    const expected = stripAcpTags(full);
+    for (let split = 0; split <= full.length; split++) {
+        const f = createTagEchoFilter();
+        const out = f.push(full.slice(0, split)) + f.push(full.slice(split)) + f.flush();
+        assert.equal(out, expected, `split=${split}`);
+    }
+});
+
 test("streaming filter matches stripAcpTags for every split position", () => {
     const cases = [
         `answer ${TAG("m00155")}${TAG("m00155", 44)} done`,
@@ -102,6 +161,10 @@ test("streaming filter matches stripAcpTags for every split position", () => {
         `${TAG("m1")}${TAG("m2")}`,
         `first ${TAG("m1")} mid prose ${TAG("m2")} last`,
         `好的 ${TAG("m00155")}${TAG("m00155", 44)}${TAG("m00156", 33)} 另外 5 < 6 成立${TAG("m00157")}完毕`,
+        `typo ${LT}acpi tokens="36" type="text"\x3em00473${LT}/acpi\x3e tail`,
+        `mixed ${LT}acp tokens="36" type="text"\x3em00473${LT}/acip\x3e tail`,
+        `rev ${LT}apic tokens="9" type="text"\x3em001${LT}/acp\x3e tail`,
+        `safe #include ${LT}acpi/acpi.h\x3e and ${LT}caption\x3ex${LT}/caption\x3e ${LT}app id="1"\x3erun${LT}/app\x3e`,
     ];
     for (const full of cases) {
         const expected = stripAcpTags(full);
@@ -453,4 +516,95 @@ test("mayStartRenderTag engages on complete tags and tag-head tails, not prose",
     assert.equal(mayStartRenderTag("a < b"), false);
     assert.equal(mayStartRenderTag("x\x3caction y"), false);
     assert.equal(mayStartRenderTag("\x3cdiv>"), false);
+});
+
+test("stripAcpTags removes typo'd acplike render tags (#673)", () => {
+    assert.equal(stripAcpTags(`${LT}acpi tokens="36" type="text"\x3em00473${LT}/acpi\x3e`), "");
+    assert.equal(stripAcpTags(`before ${LT}acp tokens="2" type="text"\x3em00473${LT}/acip\x3e after`), "before  after");
+    for (const name of ["acpi", "acip", "apic", "cap", "cpa", "pac", "pca"]) {
+        assert.equal(stripAcpTags(`${LT}${name} tokens="1" type="text"\x3em001${LT}/${name}\x3e`), "", name);
+    }
+});
+
+test("typo'd openers engage the streaming gate (#673)", () => {
+    for (const s of [`${LT}acip `, `${LT}acpi`, `${LT}/acip`]) {
+        assert.equal(mayStartRenderTag(s), true, s);
+        assert.equal(containsRenderTagText(s + "\x3e"), true, s);
+    }
+});
+
+test("legit angle-bracket text survives the loosened filter (#673)", () => {
+    const safe = [
+        "#include \\x3cacpi/acpi.h\\x3e",
+        "\\x3ccaption\\x3ehi\\x3c/caption\\x3e",
+        "\\x3capp id=\"1\"\\x3erun\\x3c/app\\x3e",
+        "\\x3cACPI_DEVICE\\x3e",
+        "a \\x3c b and b \\x3e c",
+        "\\x3cacp_compress\\x3ex\\x3c/acp_compress\\x3e",
+    ];
+    for (const s of safe) {
+        assert.equal(stripAcpTags(s), s);
+        for (let split = 0; split <= s.length; split++) {
+            const f = createTagEchoFilter();
+            const out = f.push(s.slice(0, split)) + f.push(s.slice(split)) + f.flush();
+            assert.equal(out, s, `split=${split} full=${JSON.stringify(s)}`);
+        }
+    }
+});
+
+test("filter stats() accumulates lifetime input/output/dropped (#673)", () => {
+    const first = `hello ${TAG("m1")}`;
+    const f = createTagEchoFilter();
+    f.push(first);
+    f.flush();
+    f.push("world");
+    const st = f.stats();
+    assert.equal(st.inputChars, first.length + 5);
+    assert.equal(st.outputChars, "hello world".length);
+    assert.equal(st.dropped, true);
+});
+
+test("degenerateTurnWarning fires only on terminal zero-text zero-tool turns (#673)", () => {
+    const base = {
+        reason: "end_turn" as string | undefined,
+        terminalReason: "end_turn",
+        toolCalls: 0,
+        text: { inputChars: 63, outputChars: 0, dropped: true },
+        sawThinking: true,
+        wire: "anthropic",
+    };
+    const hit = degenerateTurnWarning(base);
+    assert.match(hit ?? "", /\[degenerate-turn\] anthropic: turn ended end_turn/);
+    assert.match(hit ?? "", /thinking present/);
+    assert.match(hit ?? "", /stripped as render-tag echo/);
+    assert.equal(degenerateTurnWarning({ ...base, reason: "tool_use" }), null);
+    assert.equal(degenerateTurnWarning({ ...base, toolCalls: 1 }), null);
+    assert.equal(degenerateTurnWarning({ ...base, text: { inputChars: 5, outputChars: 3, dropped: false } }), null);
+    assert.match(degenerateTurnWarning({ ...base, sawThinking: false, text: { inputChars: 0, outputChars: 0, dropped: false } }) ?? "", /no visible text emitted/);
+});
+
+test("anthropic adapter warns on degenerate typo-tag-only turn (#673)", async () => {
+    const logs: string[] = [];
+    setLogCapture((_level, msg) => { logs.push(msg); });
+    try {
+        const echo = `${LT}acpi tokens="36" type="text"\x3em00473${LT}/acpi\x3e`;
+        const parts: string[] = [];
+        for (let i = 0; i < echo.length; i += 7) parts.push(echo.slice(i, i + 7));
+        const sseParts: string[] = [
+            `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_1", usage: { input_tokens: 100 } } })}\n\n`,
+            `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } })}\n\n`,
+            `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "next step: run the build" } })}\n\n`,
+            `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`,
+            `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 1, content_block: { type: "text", text: "" } })}\n\n`,
+            ...parts.map((p) => `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 1, delta: { type: "text_delta", text: p } })}\n\n`),
+            `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 1 })}\n\n`,
+            `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 5 } })}\n\n`,
+            `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+        ];
+        const out = await drain(sseFromStrings(sseParts), createAnthropicAdapter({ model: "test" }));
+        assert.ok(!out.includes("acpi"), "typo'd tag must not leak to the client");
+        assert.ok(logs.some((l) => l.includes("[degenerate-turn]")), `expected degenerate-turn warn, got: ${logs.join(" | ")}`);
+    } finally {
+        setLogCapture(null);
+    }
 });

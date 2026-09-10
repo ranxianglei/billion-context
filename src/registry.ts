@@ -109,6 +109,7 @@ async function fetchFresh(): Promise<RegistryShape | null> {
             const { response, clearTimer } = await fetchWithTimeout(REGISTRY_URL, {
                 ...opts,
                 headers: { Accept: "application/json" },
+                redirect: "follow",
             }, 15_000);
             const text = await response.text();
             clearTimer();

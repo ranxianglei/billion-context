@@ -2,6 +2,7 @@ import type { CoreMessage } from "acp-kernel";
 import { coreToOpenai, injectOpenaiSystem } from "acp-kernel/wire";
 import { buildVisibilityMarker } from "../compress-loop.js";
 import { createTagEchoFilter } from "./tag-echo-filter.js";
+import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
 import { systemToUser } from "../util.js";
 
@@ -229,6 +230,17 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                     yield { kind: "text", delta: tail, raw: buildContent(tail) } as ParsedStreamEvent;
                 }
             };
+            let sawReasoning = false;
+            let toolCallsEmitted = 0;
+            let degenerateWarned = false;
+            const maybeWarnDegenerate = (reason: string | undefined) => {
+                if (degenerateWarned) return;
+                const msg = degenerateTurnWarning({ reason, terminalReason: "stop", toolCalls: toolCallsEmitted, text: tagFilter.stats(), sawThinking: sawReasoning, wire: "openai" });
+                if (msg) {
+                    degenerateWarned = true;
+                    loggerLog("warn", msg);
+                }
+            };
             // Raw tool_call chunks in arrival order. Backends (SGLang/vLLM)
             // stream a tool name across MULTIPLE deltas — the first fragment
             // carries the name, continuation fragments carry empty names.
@@ -241,6 +253,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
             const flushPendingAsStructured = function* (): Generator<ParsedStreamEvent> {
                 for (const [, tc] of pending) {
                     if (tc.name.length > 0 || tc.id.length > 0) {
+                        toolCallsEmitted++;
                         yield {
                             kind: "tool_call",
                             name: tc.name,
@@ -269,6 +282,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                 }
                 for (const [idx, tc] of pending) {
                     if (realIndexes.has(idx) && (tc.name.length > 0 || tc.id.length > 0)) {
+                        toolCallsEmitted++;
                         yield {
                             kind: "tool_call",
                             name: tc.name,
@@ -288,6 +302,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                 }
                 for (const [idx, tc] of pending) {
                     if (!realIndexes.has(idx) && tc.name.length > 0) {
+                        toolCallsEmitted++;
                         yield {
                             kind: "tool_call",
                             name: tc.name,
@@ -312,6 +327,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                     if (sawRealToolCall) {
                         yield { kind: "meta", chunk: Buffer.from(eventStr + "\n\n", "utf8") } as ParsedStreamEvent;
                     }
+                    maybeWarnDegenerate("stop");
                     yield { kind: "done", finishReason: "stop", ...(sawRealToolCall ? { suppressCompletion: true } : {}) } as ParsedStreamEvent;
                     continue;
                 }
@@ -370,9 +386,11 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                         // to the text/reasoning branches (which would re-emit the same
                         // bytes after the finish reason).
                         yield { kind: "meta", chunk } as ParsedStreamEvent;
+                        maybeWarnDegenerate(finishReason);
                         yield { kind: "done", finishReason, suppressCompletion: true } as ParsedStreamEvent;
                         continue;
                     } else {
+                        maybeWarnDegenerate(finishReason);
                         yield {
                             kind: "done",
                             finishReason: hadToolCalls && finishReason === "stop" ? "tool_calls" : finishReason,
@@ -383,6 +401,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                 if (!delta) continue;
 
                 if (typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0) {
+                    sawReasoning = true;
                     yield { kind: "reasoning", delta: delta.reasoning_content, raw: finishReason ? stripFinishReasonChunk(rawBuf) : rawBuf } as ParsedStreamEvent;
                 }
 

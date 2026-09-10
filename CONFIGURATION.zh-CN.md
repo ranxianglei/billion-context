@@ -126,7 +126,7 @@
 
 ## Providers
 
-`providers` 块将**上游 URL** 映射到按 provider 的配置。每个键是一个 URL 前缀；每个值可以声明模型上下文窗口、按 provider 的代理、压缩协议以及压缩覆盖项。
+`providers` 块将**上游 URL** 映射到按 provider 的配置。每个键是一个 URL 前缀；每个值可以声明模型上下文窗口、按 provider 的代理、压缩协议、压缩覆盖项，以及按路由的透传开关。
 
 ```jsonc
 {
@@ -183,6 +183,21 @@
 - **默认值：** `{}`（禁用）
 - **状态：** ACTIVE
 - **说明：** 按 provider 的线上兼容覆盖。`roles` 把消息角色映射为该上游接受的角色名，例如 `{"developer": "system"}` —— 用于拒绝 `developer` 角色的上游（#552，新版 codex 客户端会发这个角色）。作用于最终转发的 `openai`/`responses` 请求体 —— 客户端发送的角色和 bili 自己注入的提示一视同仁 —— 压缩重试循环重发的请求体同样携带该改写。按键覆盖全局 `compat` 块（见[服务端设置](#服务端设置)）。默认 `{}` 逐字节透明转发。
+
+### `passthrough`
+
+- **类型：** `boolean`
+- **默认值：** *（无 —— 压缩开启）*
+- **状态：** ACTIVE
+- **说明：** 按路由覆盖全局 [`passthrough`](#passthrough) 设置。设为 `true` 时，匹配该路由的所有请求**逐字节转发**：不走 kernel 往返（不重序列化 messages、不注入 ACP 渲染标签、不删除 `prompt_cache_key`），响应原样 pipe，该路由不建立 session 状态。用于上游反作弊会拒绝 bili 改写后请求体的场景 —— 例如 ZCode 对 kernel 重建的 `messages` 请求体返回 `405 / 3012`（"request has been blocked due to unusual activity"，#661）。`mitm://` 键只命中该 host 的 MITM（登录态客户端）流量，普通 `https://` 键则同时覆盖 MITM 与 `/bili/`（API key）流量：
+
+  ```jsonc
+  {
+    "providers": {
+      "mitm://zcode.z.ai": { "passthrough": true }
+    }
+  }
+  ```
 
 ---
 
@@ -289,6 +304,18 @@
   - `toolName: string` — 重命名注入工具（默认 `"absorb"`）；模式、系统提示段与按会话裁决都跟随名称。
   注入跟随线上原生工具面：代理模式在 anthropic/openai/responses 原生工具线上注入工具 + 静态系统提示段，插件模式在插件清单中广告它（MCP shell 自动拾取）。Responses **marker/文本协议**路由不支持（无原生工具面 — 强制的 absorb 指令不可满足），标题生成请求（`max_tokens ≤ 200`）跳过注入如压缩提示一样。吸收配对在重启后保持隐藏（在会话状态持久化）。
 
+#### `reasoning`
+
+- **类型：** `object`（`{ drop?, threshold? }`）
+- **默认值：** `drop: true`、`threshold: 2048` — 默认开启
+- **状态：** ACTIVE
+- **说明：** **压缩回执 reasoning 卫生**（issue #651，对应 `billion-context-pi` #339/#348 / `opencode-acp` #377 的代理侧孪生）。把 `reasoning`/`thinking` 轨迹留在 wire 上的模型会积累一块永久不可压缩的地板：折叠的锚点是一条 `compress` 调用，而它**前方**的 reasoning 消息会作为受保护前缀活过每一次折叠——它们永远无法被重新摘要，只能被剥离。在风暴会话里这块地板曾占到可见上下文的 ~50%。开启后，代理会剥离紧邻**已闭合** `compress` 调用之前的 reasoning 连续段，闭合判定按**回合证据**：该调用的工具结果（`contentType: "tool-result"`、`toolCallId` 匹配）已出现在更晚位置，且其后至少还有一条消息——**不要求用户消息**，长 agent 会话同样能闭合回合（#348 孪生）。安全门：**在飞回合**（结果未返回、或结果仍是最后一条消息）绝不动；普通工具调用（`read`、`bash` …）的 reasoning 保留；连续段按求和后的总长判定（2×1200 字符的段仍会命中 2048 门槛）；不连续的 reasoning（片段之间夹着正文）不动。子字段与其他 CompressSettings 字段一样按“深层覆盖”合并：
+  - `drop: boolean` — 总开关；`false` 完整还原旧行为。请求携带 `tools` 时要求 `reasoning` 原样往返的 thinking 模型必须按 provider 关闭——DeepSeek、GLM thinking、Qwen-QwQ 在未回传先前 `reasoning_content` 时返回 HTTP 400。#684 起这一步基本自动：`deepseek` 上游静态识别；任何上游以提及 `reasoning_content` 的 400 拒绝时会自动学得该会话需保留 reasoning（自愈，持久化；日志携带 `[acp-loop] learned strictReasoningEcho`）。该配置仍作为手动兑底手段（如非 deepseek 命名的严格网关）：
+    ```jsonc
+    "providers": { "https://api.deepseek.com": { "compress": { "reasoning": { "drop": false } } } }
+    ```
+  - `threshold: number` — 字符门槛；**严格大于**该值的段才被剥离（`0` = 只要非空就剥）。非法值回退默认而不是报错。
+
 #### `stripImages`
 
 - **类型：** `boolean`
@@ -391,6 +418,7 @@
 | `ACP_UPSTREAM` | 覆盖默认上游 base URL。 |
 | `ACP_LOG` | 设为 `0` 关闭请求日志。 |
 | `ACP_AUTO_UPDATE` | 设为 `0` 禁用自动更新检查。 |
+| `ACP_UPDATE_TAG` | 自动更新跟随的 dist-tag 通道（默认 `latest`，如 `dev`）。文件配置键：`updateTag`。`pr-N` 预览 tag 仅在显式配置时才会被跟随。 |
 | `ACP_PROVIDERS` | 指向外部 `providers.json` 的路径（旧版 / 共享文件）。 |
 | `BILI_REPLAY_RETRY_BASE_MS` | acp-loop 回放重试的基础退避延迟（毫秒）：上游瞬时拒绝后重试（默认 `1500`；设 `0` 关闭延迟）。见 #189。 |
 | `BILI_REPLAY_RETRY_MAX` | acp-loop 回放重试的总次数（默认 `3`；设 `1` 彻底关闭重试 —— 旧版 fail-fast 行为）。见 #189。 |
