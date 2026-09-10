@@ -25,6 +25,11 @@ jobs:
         run: |
           npm install --ignore-scripts --no-fund --no-audit
           npm run build
+      # Bare `bili` is not on the runner PATH after a local install; link the
+      # just-built package globally (dist is self-contained, so no extra fetch).
+      - name: Link locally-built bili onto PATH
+        shell: pwsh
+        run: npm install -g .
       - name: Install codex CLI
         shell: pwsh
         run: npm install -g @openai/codex
