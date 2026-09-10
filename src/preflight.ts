@@ -216,7 +216,7 @@ function splitChunks(
     return chunks;
 }
 
-function summaryPayload(protocol: PreflightProtocol, model: string, system: string, content: string, stream: boolean): Record<string, unknown> {
+function summaryPayload(protocol: PreflightProtocol, model: string, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean): Record<string, unknown> {
     if (protocol === "anthropic") {
         return { model, max_tokens: MAX_SUMMARY_OUTPUT_TOKENS, system, messages: [{ role: "user", content }], stream };
     }
@@ -224,7 +224,12 @@ function summaryPayload(protocol: PreflightProtocol, model: string, system: stri
         return { model, max_tokens: MAX_SUMMARY_OUTPUT_TOKENS, messages: [{ role: "system", content: system }, { role: "user", content }], stream };
     }
     // #488: codex relays reject Responses calls without store:false ("Store must be set to false").
-    return { model, max_output_tokens: MAX_SUMMARY_OUTPUT_TOKENS, instructions: system, input: [{ role: "user", content }], stream, store: false };
+    // #663: max_output_tokens is optional — omit it once the upstream has
+    // rejected the parameter (learned per URL+model); the model's default
+    // output cap then applies.
+    const payload: Record<string, unknown> = { model, instructions: system, input: [{ role: "user", content }], stream, store: false };
+    if (includeMaxOutputTokens) payload.max_output_tokens = MAX_SUMMARY_OUTPUT_TOKENS;
+    return payload;
 }
 
 // #626: some upstreams (ChatGPT-login codex backend) reject non-stream calls
@@ -232,6 +237,54 @@ function summaryPayload(protocol: PreflightProtocol, model: string, system: stri
 // enough to cover phrasing variants, narrowly enough that an unrelated 400
 // mentioning neither word never triggers a pointless stream retry.
 const STREAM_REQUIRED_RE = /\bstream\b[^\n]{0,60}\btrue\b/i;
+
+// #663: the same ChatGPT-login codex backend rejects the Responses
+// max_output_tokens parameter outright with 400 {"detail":"Unsupported
+// parameter: max_output_tokens"}. Matching the parameter name in a 400 body
+// is narrow enough — a 400 that names the parameter is about the parameter —
+// and robust to phrasing variants; omitting an optional parameter is always
+// a safe fallback (the model's default output cap applies).
+const MAX_OUTPUT_TOKENS_REJECTED_RE = /\bmax_output_tokens\b/i;
+
+// #663: per-endpoint learning of the max_output_tokens rejection. Keyed by
+// upstream URL + model (persisted with the session metadata, like #626's
+// stream flag) because the rejection is per-endpoint: a session can switch
+// models mid-conversation, and a model that accepts the limit must keep the
+// 8192 cap.
+function noMaxOutputTokensKey(deps: PreflightDeps): string {
+    return `${deps.url}\u0000${deps.model}`;
+}
+
+function hasLearnedNoMaxOutputTokens(deps: PreflightDeps): boolean {
+    const learned = deps.session.metadata.preflightNoMaxOutputTokens;
+    return typeof learned === "object" && learned !== null && (learned as Record<string, unknown>)[noMaxOutputTokensKey(deps)] === true;
+}
+
+function rememberNoMaxOutputTokens(deps: PreflightDeps): void {
+    const learned = deps.session.metadata.preflightNoMaxOutputTokens;
+    const map = (typeof learned === "object" && learned !== null ? learned : {}) as Record<string, unknown>;
+    map[noMaxOutputTokensKey(deps)] = true;
+    deps.session.metadata.preflightNoMaxOutputTokens = map;
+}
+
+// #663: request-shape-specific headers that must NOT ride the independently
+// constructed summary call. The main Codex request carries
+// x-openai-internal-codex-responses-lite, which the backend only accepts when
+// the body has reasoning.context: all_turns. The summary body is built
+// independently (no reasoning field), so carrying the header over makes the
+// backend reject it (400 "…requires `reasoning.context` to be `all_turns`").
+// The original model request keeps the header and its reasoning fields; only
+// the side summary call drops it. Auth/routing headers are preserved.
+const SUMMARY_STRIP_HEADERS = new Set(["x-openai-internal-codex-responses-lite"]);
+
+function summaryHeaders(deps: PreflightDeps): Record<string, string> {
+    const headers: Record<string, string> = {};
+    for (const [k, v] of Object.entries(deps.headers)) {
+        if (SUMMARY_STRIP_HEADERS.has(k.toLowerCase())) continue;
+        headers[k] = v;
+    }
+    return headers;
+}
 
 // Extract the summary text from a buffered SSE body (the streaming twin of
 // extractSummaryText). For Responses, prefer the response.completed event's
@@ -312,27 +365,44 @@ async function summarizeRange(deps: PreflightDeps, content: string, startRef: st
         `\n\nTASK: The conversation segment below (messages ${startRef}–${endRef}) must be compressed because the session context exceeds the current model's window. Write a tier-1 compression summary of the segment following every rule above. Output ONLY the summary text — no preamble, no closing remarks, no tool calls.`;
     // #626: the session remembers upstreams that require stream:true, so the
     // extra 400 round-trip is paid at most once per session (persisted with
-    // the session metadata).
-    const learned = deps.session.metadata.preflightStreamSummary === true;
-    try {
-        return await requestSummary(deps, system, content, learned);
-    } catch (err) {
-        if (err instanceof UpstreamHttpError && err.status === 400 && !learned && STREAM_REQUIRED_RE.test(err.body)) {
-            deps.session.metadata.preflightStreamSummary = true;
-            deps.log("info", "[preflight] upstream requires stream for summaries; retrying with SSE (learned for this session)");
-            return await requestSummary(deps, system, content, true);
+    // the session metadata). #663: likewise, per URL+model, upstreams that
+    // reject the max_output_tokens parameter. Each capability is learned at
+    // most once (guarded below), so the compatibility retries are bounded:
+    // at most one extra attempt per capability, in either rejection order.
+    let stream = deps.session.metadata.preflightStreamSummary === true;
+    let includeMaxOutputTokens = !(deps.protocol === "responses" && hasLearnedNoMaxOutputTokens(deps));
+    for (;;) {
+        try {
+            return await requestSummary(deps, system, content, stream, includeMaxOutputTokens);
+        } catch (err) {
+            if (err instanceof UpstreamHttpError && err.status === 400) {
+                let adapted = false;
+                if (!stream && STREAM_REQUIRED_RE.test(err.body)) {
+                    deps.session.metadata.preflightStreamSummary = true;
+                    stream = true;
+                    adapted = true;
+                    deps.log("info", "[preflight] upstream requires stream for summaries; retrying with SSE (learned for this session)");
+                }
+                if (deps.protocol === "responses" && includeMaxOutputTokens && MAX_OUTPUT_TOKENS_REJECTED_RE.test(err.body)) {
+                    rememberNoMaxOutputTokens(deps);
+                    includeMaxOutputTokens = false;
+                    adapted = true;
+                    deps.log("info", `[preflight] upstream rejects max_output_tokens for summaries (model=${deps.model}); retrying without it (learned for this session+upstream+model)`);
+                }
+                if (adapted) continue;
+            }
+            throw err;
         }
-        throw err;
     }
 }
 
-async function requestSummary(deps: PreflightDeps, system: string, content: string, stream: boolean): Promise<string | null> {
+async function requestSummary(deps: PreflightDeps, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean): Promise<string | null> {
     const { response, clearTimer } = await fetchWithRetry(
         deps.url,
         {
             method: "POST",
-            headers: { "content-type": "application/json", ...deps.headers },
-            body: JSON.stringify(summaryPayload(deps.protocol, deps.model, system, content, stream)),
+            headers: { "content-type": "application/json", ...summaryHeaders(deps) },
+            body: JSON.stringify(summaryPayload(deps.protocol, deps.model, system, content, stream, includeMaxOutputTokens)),
             dispatcher: proxyDispatcher(deps.proxyUrl),
         },
         undefined,

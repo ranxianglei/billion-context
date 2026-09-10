@@ -10,6 +10,7 @@ import { executeProxyTool } from "./loop/core.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
 import { containsRenderTagText, createTagEchoFilter, mayStartRenderTag, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
+import { degenerateTurnWarning } from "./degenerate-turn.js";
 import { noteWeakOverflow } from "./weak-overflow.js";
 import { warnCacheCollapse } from "./cache-warn.js";
 import { backfillHostUsage, promptInputTotal, type WireProtocol } from "./util.js";
@@ -359,12 +360,31 @@ export type PluginToolDeps = {
     log: (level: string, msg: string) => void;
 };
 
+/** Reverse-lookup the conversation id bound to a session id. #656: the
+ *  status endpoint's fallback branch picks the latest active SESSION, but a
+ *  caller that needs to ADOPT it (an MCP shim whose captured conversation id
+ *  went stale after the host resumed) must be told the session's conversation
+ *  id, not have its own stale id echoed back. Most-recently-seen binding wins
+ *  when several conversations share one session. */
+function conversationIdForSession(sessionId: string): string | undefined {
+    let bestId: string | undefined;
+    let bestSeen = -Infinity;
+    for (const [cid, entry] of conversations) {
+        if (entry.sessionId === sessionId && entry.lastSeen > bestSeen) {
+            bestId = cid;
+            bestSeen = entry.lastSeen;
+        }
+    }
+    return bestId;
+}
+
 /** Context-level visibility for plugin UIs (status bars / slash commands):
  *  the same usage the nudge decision sees, keyed by conversation id. */
 export function handlePluginStatus(conversationId: string, res: import("node:http").ServerResponse, deps: PluginToolDeps, fallbackLatest = false): void {
     let entry = conversations.get(conversationId);
     let session = entry ? peekSession(entry.sessionId) : undefined;
     let viaFallback = false;
+    let resolvedConversationId = conversationId;
     if ((!entry || !session) && fallbackLatest) {
         // #404: only sessions with real activity in THIS process qualify.
         // Before the fix every boot-restored session carried lastSeen =
@@ -376,6 +396,9 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         if (latest) {
             session = latest;
             viaFallback = true;
+            // #656: name the conversation that was actually resolved — the
+            // caller asked with a stale id and must learn the real one.
+            resolvedConversationId = conversationIdForSession(latest.id) ?? conversationId;
         } else {
             res.writeHead(404, { "content-type": "application/json" });
             res.end(JSON.stringify({ ok: false, error: "no session with activity since boot — issue a model request or pass the conversation id" }));
@@ -441,7 +464,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
         ok: true,
-        conversationId,
+        conversationId: resolvedConversationId,
         fallback: viaFallback || undefined,
         label: session.meta.label ?? null,
         pluginAgent: session.metadata.pluginAgent ?? null,
@@ -481,8 +504,18 @@ export async function handlePluginTool(
     const entry = conversations.get(conversationId);
     const session = entry ? peekSession(entry.sessionId) : undefined;
     if (!entry || !session) {
+        // #656: two distinct failures shared one message before. An id that was
+        // NEVER registered is the classic stale-shim-id case (host resumed its
+        // session after the MCP shim captured CLAUDE_CODE_SESSION_ID) — say so,
+        // and log it: these 404s used to be invisible in bili.log.
+        deps.log("warn", `[plugin] tool "${tool}" rejected for conversation ${conversationId}: ${entry ? "id registered but session not resident in this proxy instance" : "id never registered (stale shim session id after host resume?)"}`);
         res.writeHead(404, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: false, error: "unknown plugin conversation (no model request has arrived with this conversation id yet)" }));
+        res.end(JSON.stringify({
+            ok: false,
+            error: !entry
+                ? "unknown plugin conversation (no model request has arrived with this conversation id yet)"
+                : "unknown plugin conversation (id registered but its session is not resident in this proxy instance — a fresh model request re-binds it)",
+        }));
         return;
     }
     // Absorb enablement is per-session (last resolved config), so the gate
@@ -664,11 +697,19 @@ export async function pipePluginChatWithStrip(
         }
         return `data: ${JSON.stringify({ ...lastChunkMeta, object: "chat.completion.chunk", choices: [{ index, delta: { [field]: tail } }] })}\n\n`;
     };
+    // #673: turn-level observability for degenerate terminal turns.
+    let sawToolUse = false;
+    let sawThinking = false;
+    let visibleTextChars = 0;
+    let finalFinishReason: string | undefined;
     const flushTails = (): string => {
         let out = "";
         for (const s of streams.values()) {
             const tail = s.filter.flush();
-            if (tail.length > 0) out += syntheticTail(s.field, s.index, tail);
+            if (tail.length > 0) {
+                out += syntheticTail(s.field, s.index, tail);
+                if (s.field === "content" || s.field === "text") visibleTextChars += tail.length;
+            }
         }
         return out;
     };
@@ -698,6 +739,28 @@ export async function pipePluginChatWithStrip(
             reason: "plugin chat passthrough stream ended without a completion event",
         });
     };
+    const maybeWarnDegenerate = () => {
+        if (!sawTerminal || res.destroyed || res.writableEnded) return;
+        let inputChars = 0;
+        let dropped = false;
+        for (const s of streams.values()) {
+            const st = s.filter.stats();
+            inputChars += st.inputChars;
+            dropped = dropped || st.dropped;
+        }
+        const msg = degenerateTurnWarning({
+            reason: finalFinishReason,
+            terminalReason: protocol === "anthropic" ? "end_turn" : "stop",
+            toolCalls: sawToolUse ? 1 : 0,
+            text: { inputChars, outputChars: visibleTextChars, dropped },
+            sawThinking,
+            wire: `plugin-passthrough-${protocol}`,
+        });
+        if (msg) {
+            loggerLog("warn", msg);
+            log?.(msg);
+        }
+    };
     const pushField = (field: string, index: number, text: string): [string, boolean] => {
         const s = filterFor(field, index);
         const clean = s.filter.push(text);
@@ -717,21 +780,28 @@ export async function pipePluginChatWithStrip(
         let hadText = false;
         for (let ci = 0; ci < choices.length; ci++) {
             const ch = choices[ci] as Record<string, unknown> | null;
+            if (ch && typeof ch["finish_reason"] === "string") finalFinishReason = ch["finish_reason"] as string;
             const d = ch?.["delta"];
             if (!d || typeof d !== "object") continue;
             const dd = d as Record<string, unknown>;
+            if (dd["tool_calls"] !== undefined) sawToolUse = true;
             for (const field of ["content", "reasoning_content", "reasoning"]) {
                 const v = dd[field];
                 if (typeof v !== "string") continue;
                 hadText = true;
+                if (field !== "content" && v.length > 0) sawThinking = true;
                 if (!mayStartRenderTag(v) && !anyPending()) {
                     if (v.length > 0) keptText = true;
+                    if (field === "content") visibleTextChars += v.length;
                     continue;
                 }
                 const index = typeof ch?.["index"] === "number" ? ch["index"] : ci;
                 const [clean, changed] = pushField(field, index, v);
                 if (clean.length === 0) droppedText = true;
-                else keptText = true;
+                else {
+                    keptText = true;
+                    if (field === "content") visibleTextChars += clean.length;
+                }
                 if (changed) {
                     if (!rebuilt) {
                         rebuilt = { ...ev, choices: choices.map((c) => ({ ...(c as Record<string, unknown>), delta: { ...((c as Record<string, unknown>)["delta"] as Record<string, unknown>) } })) };
@@ -754,6 +824,13 @@ export async function pipePluginChatWithStrip(
         return rawEvent + "\n\n";
     };
     const processAnthropic = (ev: Record<string, unknown>, rawEvent: string): string => {
+        if (ev["type"] === "content_block_start") {
+            const cb = ev["content_block"] as Record<string, unknown> | undefined;
+            const bt = cb && typeof cb === "object" ? cb["type"] : undefined;
+            if (bt === "tool_use") sawToolUse = true;
+            else if (bt === "thinking" || bt === "redacted_thinking") sawThinking = true;
+            return anyPending() ? flushTails() + rawEvent + "\n\n" : rawEvent + "\n\n";
+        }
         if (ev["type"] !== "content_block_delta") {
             return anyPending() ? flushTails() + rawEvent + "\n\n" : rawEvent + "\n\n";
         }
@@ -764,11 +841,17 @@ export async function pipePluginChatWithStrip(
             return rawEvent + "\n\n";
         }
         const raw = d[field] as string;
+        if (field === "thinking" && raw.length > 0) sawThinking = true;
         if (!mayStartRenderTag(raw) && !anyPending()) {
+            if (field === "text" && raw.length > 0) visibleTextChars += raw.length;
             return rawEvent + "\n\n";
         }
         const [clean, changed] = pushField(field, index, raw);
-        if (!changed) return rawEvent + "\n\n";
+        if (!changed) {
+            if (field === "text" && raw.length > 0) visibleTextChars += raw.length;
+            return rawEvent + "\n\n";
+        }
+        if (field === "text" && clean.length > 0) visibleTextChars += clean.length;
         if (clean.length === 0 && Object.keys(d ?? {}).length <= 2) return "";
         return rebuildEvent(rawEvent, { ...ev, delta: { ...d, [field]: clean } });
     };
@@ -799,6 +882,10 @@ export async function pipePluginChatWithStrip(
                         continue;
                     }
                     if (ev["type"] === "message_stop") sawTerminal = true;
+                    if (ev["type"] === "message_delta") {
+                        const d = ev["delta"] as Record<string, unknown> | undefined;
+                        if (d && typeof d["stop_reason"] === "string") finalFinishReason = d["stop_reason"] as string;
+                    }
                     const sample = usageFromSseEvent(ev);
                     if (sample) mergeUsageSample(acc, sample);
                     // #408: backfill the input-side usage so the host anchors on
@@ -835,6 +922,7 @@ export async function pipePluginChatWithStrip(
         // stream completes, and those must already see this usage.
         settleUsage();
         maybeNoteTruncated();
+        maybeWarnDegenerate();
     } catch (e) {
         settleUsage();
         maybeNoteTruncated();
@@ -893,6 +981,10 @@ export async function pipePluginResponsesWithStrip(
         loggerLog("warn", `[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
         log?.(`[tag-echo] stripped model-emitted render tag from plugin passthrough text`);
     });
+    // #673: turn-level observability for degenerate terminal turns.
+    let sawFunctionCall = false;
+    let sawReasoning = false;
+    let responseStatus: string | undefined;
     const write = (s: string): Promise<void> => {
         if (!res.write(Buffer.from(s, "utf8"))) {
             return new Promise<void>((r) => res.once("drain", () => r()));
@@ -917,6 +1009,22 @@ export async function pipePluginResponsesWithStrip(
             inputTokens: acc.inputTokens,
             reason: "plugin responses passthrough stream ended without a completion event",
         });
+    };
+    const maybeWarnDegenerate = () => {
+        if (!sawTerminal || res.destroyed || res.writableEnded) return;
+        const st = tagFilter.stats();
+        const msg = degenerateTurnWarning({
+            reason: responseStatus,
+            terminalReason: "completed",
+            toolCalls: sawFunctionCall ? 1 : 0,
+            text: st,
+            sawThinking: sawReasoning,
+            wire: "plugin-passthrough-responses",
+        });
+        if (msg) {
+            loggerLog("warn", msg);
+            log?.(msg);
+        }
     };
     let lastDeltaMeta: { item_id?: unknown; output_index?: unknown } | null = null;
     const flushTail = (after: string) => {
@@ -955,6 +1063,16 @@ export async function pipePluginResponsesWithStrip(
                     const sample = usageFromSseEvent(ev);
                     if (sample) mergeUsageSample(acc, sample);
                     const type = ev["type"];
+                    if (typeof type === "string") {
+                        if (type.startsWith("response.reasoning")) sawReasoning = true;
+                        if (type === "response.output_item.added" || type === "response.output_item.done") {
+                            const item = ev["item"] as Record<string, unknown> | undefined;
+                            const it = item?.["type"];
+                            if (it === "function_call" || it === "custom_tool_call") sawFunctionCall = true;
+                        }
+                        const resp = ev["response"] as Record<string, unknown> | undefined;
+                        if (resp && typeof resp["status"] === "string") responseStatus = resp["status"] as string;
+                    }
                     if (
                         type === "response.output_text.done" ||
                         type === "response.content_part.done" ||
@@ -1014,6 +1132,7 @@ export async function pipePluginResponsesWithStrip(
             const rest = flushTail("");
             if (rest.length > 0) await write(rest);
         }
+        maybeWarnDegenerate();
         settleUsage();
         maybeNoteTruncated();
     } catch (e) {

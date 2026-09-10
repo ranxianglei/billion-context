@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { pipePluginChatWithStrip, pipePluginJson } from "../src/plugin.ts";
+import { setLogCapture } from "../src/logger.ts";
 import type { Session } from "../src/session.ts";
 
 function makeSession(): Session {
@@ -304,4 +305,110 @@ test("plugin JSON passthrough stays byte-identical for tag-free bodies", async (
     const body = JSON.stringify({ choices: [{ message: { content: "clean" } }], usage: { prompt_tokens: 2 } });
     await pipePluginJson(streamOf([body]), res as unknown as import("node:http").ServerResponse, session, "openai");
     assert.equal(out.join(""), body, "tag-free chat body byte-identical");
+});
+
+test("plugin passthrough strips typo'd acplike tags from anthropic text (#673)", async () => {
+    const out: string[] = [];
+    const res = makeRes(out);
+    const echo = "\x3cacpi tokens=\"36\" type=\"text\"\x3em00473\x3c/acpi\x3e";
+    const parts: string[] = [];
+    for (let i = 0; i < echo.length; i += 5) parts.push(echo.slice(i, i + 5));
+    const events: string[] = [
+        `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_1", usage: { input_tokens: 10 } } })}\n\n`,
+        `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}\n\n`,
+        ...parts.map((p) => `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: p } })}\n\n`),
+        `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`,
+        `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 4 } })}\n\n`,
+        `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+    ];
+    await pipePluginChatWithStrip(streamOf(events), res as unknown as import("node:http").ServerResponse, "anthropic", makeSession());
+    const text = out.join("");
+    assert.ok(!text.includes("acpi"), "typo'd tag must not leak to the client");
+    assert.ok(!text.includes("m00473"), "tag ref must not leak to the client");
+});
+
+test("plugin passthrough warns on degenerate typo-tag-only anthropic turn (#673)", async () => {
+    const logs: string[] = [];
+    setLogCapture((_level, msg) => { logs.push(msg); });
+    try {
+        const out: string[] = [];
+        const res = makeRes(out);
+        const echo = "\x3cacpi tokens=\"36\" type=\"text\"\x3em00473\x3c/acpi\x3e";
+        const parts: string[] = [];
+        for (let i = 0; i < echo.length; i += 5) parts.push(echo.slice(i, i + 5));
+        const events: string[] = [
+            `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_1", usage: { input_tokens: 10 } } })}\n\n`,
+            `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } })}\n\n`,
+            `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "plan the next step" } })}\n\n`,
+            `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`,
+            `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 1, content_block: { type: "text", text: "" } })}\n\n`,
+            ...parts.map((p) => `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 1, delta: { type: "text_delta", text: p } })}\n\n`),
+            `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 1 })}\n\n`,
+            `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 4 } })}\n\n`,
+            `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+        ];
+        await pipePluginChatWithStrip(streamOf(events), res as unknown as import("node:http").ServerResponse, "anthropic", makeSession());
+        assert.ok(logs.some((l) => l.includes("[degenerate-turn]")), `expected degenerate-turn warn, got: ${logs.join(" | ")}`);
+    } finally {
+        setLogCapture(null);
+    }
+});
+
+test("plugin passthrough does not warn on a clean anthropic turn (#673)", async () => {
+    const logs: string[] = [];
+    setLogCapture((_level, msg) => { logs.push(msg); });
+    try {
+        const out: string[] = [];
+        const res = makeRes(out);
+        const events: string[] = [
+            `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_1", usage: { input_tokens: 10 } } })}\n\n`,
+            `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}\n\n`,
+            `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "All done." } })}\n\n`,
+            `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`,
+            `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 4 } })}\n\n`,
+            `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+        ];
+        await pipePluginChatWithStrip(streamOf(events), res as unknown as import("node:http").ServerResponse, "anthropic", makeSession());
+        assert.ok(out.join("").includes("All done."), "clean text survives");
+        assert.ok(!logs.some((l) => l.includes("[degenerate-turn]")), "no warn on clean turn");
+    } finally {
+        setLogCapture(null);
+    }
+});
+
+test("plugin passthrough does not warn when openai turn ends with tool_calls (#673)", async () => {
+    const logs: string[] = [];
+    setLogCapture((_level, msg) => { logs.push(msg); });
+    try {
+        const out: string[] = [];
+        const res = makeRes(out);
+        const events: string[] = [
+            chatChunk({ role: "assistant" }),
+            chatChunk({ tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "f", arguments: "{}" } }] }),
+            `data: ${JSON.stringify({ id: "chatcmpl-1", object: "chat.completion.chunk", created: 1, model: "qwen", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`,
+            DONE,
+        ];
+        await pipePluginChatWithStrip(streamOf(events), res as unknown as import("node:http").ServerResponse, "openai", makeSession());
+        assert.ok(!logs.some((l) => l.includes("[degenerate-turn]")), "tool call present: not degenerate");
+    } finally {
+        setLogCapture(null);
+    }
+});
+
+test("plugin passthrough warns on degenerate zero-text openai stop turn (#673)", async () => {
+    const logs: string[] = [];
+    setLogCapture((_level, msg) => { logs.push(msg); });
+    try {
+        const out: string[] = [];
+        const res = makeRes(out);
+        const events: string[] = [
+            chatChunk({ role: "assistant" }),
+            `data: ${JSON.stringify({ id: "chatcmpl-1", object: "chat.completion.chunk", created: 1, model: "qwen", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`,
+            DONE,
+        ];
+        await pipePluginChatWithStrip(streamOf(events), res as unknown as import("node:http").ServerResponse, "openai", makeSession());
+        assert.ok(logs.some((l) => l.includes("[degenerate-turn]")), `expected degenerate-turn warn, got: ${logs.join(" | ")}`);
+    } finally {
+        setLogCapture(null);
+    }
 });

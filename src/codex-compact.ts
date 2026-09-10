@@ -17,13 +17,18 @@ export function codexCompactMode(): CodexCompactMode {
 }
 
 // The `originator` header is only sent for non-default thread originators, so
-// the UA prefix (DEFAULT_ORIGINATOR in codex's default_client.rs) is the
-// reliable client signal.
+// the UA (DEFAULT_ORIGINATOR in codex's default_client.rs) is the reliable
+// client signal. Codex ships multiple clients with different UA prefixes
+// (codex_cli_rs/, codex_exec/, codex_sdk_ts/, ...), so in addition to the known
+// prefixes match "codex" anywhere in the UA (case-sensitive) — a new client
+// variant must not silently fall out of detection (#645).
 export function isCodexClient(headers: Record<string, string | string[] | undefined>): boolean {
     const ua = headers["user-agent"];
     if (!ua) return false;
     const s = Array.isArray(ua) ? ua[0] : ua;
-    return typeof s === "string" && CODEX_UA_PREFIXES.some((p) => s.startsWith(p));
+    if (typeof s !== "string") return false;
+    if (CODEX_UA_PREFIXES.some((p) => s.startsWith(p))) return true;
+    return s.includes("codex");
 }
 
 export function hasCompactionTrigger(input: unknown): boolean {

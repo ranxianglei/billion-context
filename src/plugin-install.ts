@@ -369,17 +369,23 @@ function codexBlock(): string {
     return `\n[mcp_servers.bili]\ncommand = ${JSON.stringify(process.execPath)}\nargs = [${JSON.stringify(path.join(selfPackageRoot(), "dist", "mcp.js"))}]\nenv = { BILI_MCP_PROXY = ${JSON.stringify(proxyOriginForInstall())} }\n`;
 }
 
+function malformedCodexArgs(block: string): boolean {
+    return /^[ \t]*args[ \t]*=[ \t]*["']/m.test(block);
+}
+
 function codexInstall(): string {
     const file = codexToml();
     const text = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
     const existing = /^[ \t]*\[mcp_servers\.bili\][ \t]*$/m.exec(text);
     if (existing !== null) {
         const block = text.slice(existing.index, text.indexOf("\n[", existing.index + 1) === -1 ? undefined : text.indexOf("\n[", existing.index + 1));
-        if (block.includes(`BILI_MCP_PROXY = ${JSON.stringify(proxyOriginForInstall())}`)) return `codex: already installed (${file})`;
-        const refreshed = text.slice(0, existing.index) + codexBlock().replace(/^\n/, "") + text.slice(existing.index + block.length);
+        const canonical = codexBlock().replace(/^\n/, "");
+        if (block.trimEnd() === canonical.trimEnd()) return `codex: already installed (${file})`;
+        const refreshed = text.slice(0, existing.index) + canonical + text.slice(existing.index + block.length);
         backupOnce(file);
         fs.writeFileSync(file, refreshed);
-        return `codex: refreshed proxy origin -> ${file} [mcp_servers.bili]`;
+        const healed = malformedCodexArgs(block) ? " (repaired args: was not an array)" : "";
+        return `codex: refreshed [mcp_servers.bili] -> ${file}${healed}`;
     }
     fs.mkdirSync(path.dirname(file), { recursive: true });
     backupOnce(file);

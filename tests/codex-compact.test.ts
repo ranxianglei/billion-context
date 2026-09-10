@@ -45,10 +45,18 @@ test("isCodexClient: UA prefix detection (Node lowercases header keys)", () => {
     assert.equal(isCodexClient({ "user-agent": "codex_cli_rs/0.1.0 (linux x86_64)" }), true);
     assert.equal(isCodexClient({ "user-agent": "codex_cli_rs/0.2.1" }), true);
     assert.equal(isCodexClient({ "user-agent": "codex_exec/0.147.0 (linux x86_64)" }), true, "exec-mode originator (codex 0.147 real-device UA)");
+    assert.equal(isCodexClient({ "user-agent": "codex_sdk_ts/0.153.4 (Ubuntu 24.4.0; x86_64) vt100 (codex_exec; 0.153.4)" }), true, "TS-SDK client (#645 real-device UA)");
     assert.equal(isCodexClient({ "user-agent": "openai-node/3.0" }), false);
     assert.equal(isCodexClient({}), false, "no UA");
     assert.equal(isCodexClient({ "user-agent": ["codex_cli_rs/0.1.0", "other"] }), true, "array UA takes first");
     assert.equal(isCodexClient({ "user-agent": ["other", "codex_cli_rs/0.1.0"] }), false, "array UA first is not codex");
+});
+
+test("isCodexClient: lenient 'codex' substring fallback for unknown client variants (#645)", () => {
+    assert.equal(isCodexClient({ "user-agent": "codex_new_variant/9.9.9" }), true, "unknown prefix still contains codex");
+    assert.equal(isCodexClient({ "user-agent": "Mozilla/5.0 (codex-embed)" }), true, "codex mentioned mid-UA");
+    assert.equal(isCodexClient({ "user-agent": "Codex_CLI_RS/0.53.0" }), false, "case-sensitive: uppercase Codex does not match");
+    assert.equal(isCodexClient({ "user-agent": "node-fetch/3.1" }), false, "no codex at all");
 });
 
 test("hasCompactionTrigger: only a FINAL compaction_trigger counts", () => {

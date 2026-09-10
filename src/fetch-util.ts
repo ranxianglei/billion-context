@@ -129,6 +129,13 @@ export async function fetchWithTimeout(
             ...opts,
             signal: controller.signal,
             dispatcher: opts.dispatcher ?? directDispatcher(effective),
+            // Forward-proxy correctness: never silently follow a redirect.
+            // undici's default (follow) downgrades POST→GET and drops the body
+            // on 301/302/303, so a redirecting upstream (CDN/WAF) turns a valid
+            // POST into a 405 at the redirect target. Pass the 3xx through to
+            // the client, which follows it with its own policy. Internal bili
+            // fetches that want to follow (registry, upstream test) opt in.
+            redirect: opts.redirect ?? "manual",
         };
         // `fetch` is undici's global; it accepts `dispatcher` at runtime. @types/node
         // types RequestInit.dispatcher as its internal `Dispatcher` interface,

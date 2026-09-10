@@ -6,9 +6,9 @@
  * historical import paths and names stable:
  *  - PROXY_TOOL_NAMES / MUTATING_PROXY_TOOLS / READONLY_PROXY_TOOLS alias the
  *    kernel's ACP_* names ("proxy" is a misnomer once shared);
- *  - parseCompressInput wires the kernel's onWarn hook into the proxy logger
- *    and adds the #603 quote-salvage fallback (single→double quote repair)
- *    for the one malformation class the kernel ladder does not cover.
+ *  - parseCompressInput wires the kernel's onWarn hook into the proxy logger.
+ *    (The #603 single-quote salvage lives in the kernel ladder since 0.0.59;
+ *    this wrapper only surfaces its diagnostics.)
  */
 import { parseCompressArgs, ABSORB_TOOL_OPENAI } from "acp-kernel";
 import { log as loggerLog } from "./logger.js";
@@ -65,112 +65,14 @@ export const ABSORB_TOOL_RESPONSES = {
 };
 
 export function parseCompressInput(input: unknown, callId?: string) {
-    const first = parseCompressArgs(input, { callId });
-    // #603: the kernel ladder covers fences, trailing commas, raw newlines,
-    // double-stringification and truncated/prose-wrapped arrays — but not
-    // single-quoted JSON (the class weak local models actually emit, omp#121).
-    // Retry once with quotes normalized; keep whichever pass recovered more.
-    if (first.ranges.length === 0 || first.diagnostics.invalidItems > 0) {
-        const normalized = normalizeQuoteShape(input);
-        if (normalized !== undefined) {
-            const retry = parseCompressArgs(normalized, { callId });
-            if (retry.ranges.length > first.ranges.length) {
-                loggerLog("warn", `[acp-compress-input] quote-salvage: recovered ${retry.ranges.length} range(s) after single->double quote normalization (was ${first.ranges.length}, kind=${first.diagnostics.kind})`);
-                return { ranges: retry.ranges, diagnostics: retry.diagnostics };
-            }
-        }
+    const parsed = parseCompressArgs(input, { callId });
+    if (parsed.diagnostics.quoteSalvage === true) {
+        loggerLog("warn", `[acp-compress-input] quote-salvage: recovered ${parsed.ranges.length} range(s) after single->double quote normalization (kind=${parsed.diagnostics.kind})`);
     }
-    if (!first.diagnostics.ok && first.diagnostics.kind !== "ok") {
-        loggerLog("warn", `[acp-compress-input] rejected: kind=${first.diagnostics.kind} invalidItems=${first.diagnostics.invalidItems}${first.diagnostics.keys ? ` keys=[${first.diagnostics.keys.join(",")}]` : ""}${first.diagnostics.length !== undefined ? ` len=${first.diagnostics.length}` : ""}${first.diagnostics.invalidReasons && first.diagnostics.invalidReasons.length > 0 ? ` reasons=[${first.diagnostics.invalidReasons.join(" | ")}]` : ""}`);
+    if (!parsed.diagnostics.ok && parsed.diagnostics.kind !== "ok") {
+        loggerLog("warn", `[acp-compress-input] rejected: kind=${parsed.diagnostics.kind} invalidItems=${parsed.diagnostics.invalidItems}${parsed.diagnostics.keys ? ` keys=[${parsed.diagnostics.keys.join(",")}]` : ""}${parsed.diagnostics.length !== undefined ? ` len=${parsed.diagnostics.length}` : ""}${parsed.diagnostics.invalidReasons && parsed.diagnostics.invalidReasons.length > 0 ? ` reasons=[${parsed.diagnostics.invalidReasons.join(" | ")}]` : ""}`);
     }
-    return { ranges: first.ranges, diagnostics: first.diagnostics };
-}
-
-// #603: quote-shape salvage. Weak models emit single-quoted JSON args
-// ({'content': [...]}) or a single-quoted array as a stringified content
-// value; both hard-fail strict parsing and waste the round. This is a pure
-// text repair — it never invents structure, so anything it cannot make into
-// valid JSON simply stays unrecovered (the existing reject path applies).
-function normalizeQuoteShape(input: unknown): unknown {
-    if (typeof input === "string") return normalizeSingleQuotes(input);
-    if (input !== null && typeof input === "object" && !Array.isArray(input)) {
-        const obj = input as Record<string, unknown>;
-        if (typeof obj["content"] === "string") {
-            const fixed = normalizeSingleQuotes(obj["content"]);
-            if (fixed !== undefined) return { ...obj, content: fixed };
-        }
-    }
-    return undefined;
-}
-
-// State machine that converts single-quoted strings to double-quoted ones.
-// Apostrophes inside double-quoted strings are data and are copied verbatim;
-// control characters inside single-quoted regions become JSON escapes.
-// Returns undefined when nothing was converted (input unchanged).
-function normalizeSingleQuotes(raw: string): string | undefined {
-    if (!raw.includes("'") || (!raw.includes("{") && !raw.includes("["))) return undefined;
-    let out = "";
-    let changed = false;
-    let inDouble = false;
-    let inSingle = false;
-    for (let i = 0; i < raw.length; i++) {
-        const ch = raw.charAt(i);
-        if (inDouble) {
-            out += ch;
-            if (ch === "\\" && i + 1 < raw.length) {
-                out += raw.charAt(i + 1);
-                i++;
-            } else if (ch === '"') {
-                inDouble = false;
-            }
-            continue;
-        }
-        if (inSingle) {
-            if (ch === "\\" && i + 1 < raw.length) {
-                const next = raw.charAt(i + 1);
-                out += next === "'" ? "'" : "\\" + next;
-                i++;
-                continue;
-            }
-            if (ch === "'") {
-                out += '"';
-                inSingle = false;
-                changed = true;
-                continue;
-            }
-            if (ch === '"') {
-                out += '\\"';
-                continue;
-            }
-            if (ch === "\n") {
-                out += "\\n";
-                continue;
-            }
-            if (ch === "\r") {
-                out += "\\r";
-                continue;
-            }
-            if (ch === "\t") {
-                out += "\\t";
-                continue;
-            }
-            out += ch;
-            continue;
-        }
-        if (ch === '"') {
-            inDouble = true;
-            out += ch;
-            continue;
-        }
-        if (ch === "'") {
-            inSingle = true;
-            out += '"';
-            changed = true;
-            continue;
-        }
-        out += ch;
-    }
-    return changed ? out : undefined;
+    return { ranges: parsed.ranges, diagnostics: parsed.diagnostics };
 }
 
 // #189 staged-compression / prefix-survival guidance, appended to the nudge

@@ -60,6 +60,14 @@ export function resolveProxyOrigin(): string {
 const TOOL_TIMEOUT_MS = 60_000;
 const CONVERSATION_FROM_ENV = process.env.CLAUDE_CODE_SESSION_ID?.trim() || process.env.BILI_CONVERSATION_ID?.trim() || undefined;
 const IDENTITY_BINDING = Boolean(process.env.CLAUDE_CODE_SESSION_ID?.trim());
+// #656: hosts that resume a session (claude --resume forks a NEW session id)
+// do so after MCP children were spawned — the env-captured id goes stale and
+// every tool call 404s forever. When that exact failure is seen, adopt the
+// proxy's most-recent active conversation (status?fallback=latest) and retry
+// once. Only armed for identity-bound hosts (claude code); opt out with
+// BILI_MCP_NO_ORPHAN_ADOPT=1 when several host sessions share one proxy and
+// the resumed one must not adopt a sibling's conversation.
+const ORPHAN_ADOPT = IDENTITY_BINDING && process.env.BILI_MCP_NO_ORPHAN_ADOPT !== "1";
 let manifestTools: McpToolDef[] = [];
 let conversationId = CONVERSATION_FROM_ENV;
 let registered = false;
@@ -98,21 +106,55 @@ function ensureManifest(): Promise<void> {
 }
 
 export async function forwardTool(tool: string, args: unknown, timeoutMs: number = TOOL_TIMEOUT_MS): Promise<string> {
-    let res: Response;
-    try {
-        res = await fetch(`${resolveProxyOrigin()}/__bili/plugin/tool`, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ conversationId, tool, args }),
-            signal: AbortSignal.timeout(timeoutMs),
-        });
-    } catch (err) {
-        if (err instanceof Error && err.name === "TimeoutError") throw new Error(`tool forward timed out after ${timeoutMs}ms: ${tool}`);
-        throw err;
+    for (let attempt = 0; ; attempt++) {
+        let res: Response;
+        try {
+            res = await fetch(`${resolveProxyOrigin()}/__bili/plugin/tool`, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ conversationId, tool, args }),
+                signal: AbortSignal.timeout(timeoutMs),
+            });
+        } catch (err) {
+            if (err instanceof Error && err.name === "TimeoutError") throw new Error(`tool forward timed out after ${timeoutMs}ms: ${tool}`);
+            throw err;
+        }
+        const data = (await res.json()) as { ok?: boolean; result?: string; error?: string };
+        if (res.ok && data.ok) return data.result ?? "";
+        // #656: the shim's captured id was never registered — the host likely
+        // resumed its session and forked a new id after this shim spawned.
+        // Adopt the proxy's latest active conversation and retry once.
+        if (
+            res.status === 404 && attempt === 0 && ORPHAN_ADOPT && conversationId &&
+            typeof data.error === "string" && data.error.includes("no model request has arrived")
+        ) {
+            if (await adoptLatestActiveConversation()) continue;
+        }
+        throw new Error(data.error ?? `tool forward failed: ${res.status}`);
     }
-    const data = (await res.json()) as { ok?: boolean; result?: string; error?: string };
-    if (!res.ok || !data.ok) throw new Error(data.error ?? `tool forward failed: ${res.status}`);
-    return data.result ?? "";
+}
+
+/** One-shot recovery for a stale shim id (#656): resolve the proxy's
+ *  most-recent ACTIVE conversation via the status endpoint's fallback=latest
+ *  and adopt it for all subsequent tool calls. Returns true when an adoption
+ *  happened (caller should retry the tool call). */
+async function adoptLatestActiveConversation(): Promise<boolean> {
+    try {
+        const res = await fetch(
+            `${resolveProxyOrigin()}/__bili/plugin/status?conversationId=${encodeURIComponent(conversationId ?? "")}&fallback=latest`,
+            { signal: AbortSignal.timeout(5000) },
+        );
+        if (!res.ok) return false;
+        const data = (await res.json()) as { ok?: boolean; conversationId?: string; fallback?: boolean };
+        if (data.ok !== true || data.fallback !== true || !data.conversationId || data.conversationId === conversationId) return false;
+        process.stderr.write(
+            `[bili-mcp] conversation id no longer known by the proxy (host resumed its session?); adopting latest active conversation ${data.conversationId}\n`,
+        );
+        conversationId = data.conversationId;
+        return true;
+    } catch {
+        return false;
+    }
 }
 
 const ERR_TOOL = -32602;

@@ -25,6 +25,9 @@ jobs:
             - run: npm run build
 
             - name: Publish to npm with PR tag
+              # Repository secrets (NPM_TOKEN) are not available to workflows
+              # triggered by fork PRs — publishing would fail with ENEEDAUTH (#670).
+              if: github.event.pull_request.head.repo.full_name == github.repository
               run: |
                   PR_NUMBER="${{ github.event.pull_request.number }}"
                   RUN_NUMBER="${{ github.run_number }}"
@@ -65,12 +68,17 @@ jobs:
                       const sha = context.payload.pull_request.head.sha.slice(0, 7);
                       const branch = context.payload.pull_request.head.ref;
                       const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+                      const isFork = context.payload.pull_request.head.repo.full_name !== context.payload.repository.full_name;
 
                       const body = [
                           '## 📦 Built Package Artifact',
                           '',
                           `**Branch:** \`${branch}\` (${sha})`,
                           '',
+                          ...(isFork ? [
+                              '> Fork PR: the npm PR-tag publish is skipped (repository secrets are not shared with fork workflows).',
+                              '',
+                          ] : [
                           '### Option A — Install from npm PR tag (recommended)',
                           '',
                           '```bash',
@@ -79,7 +87,8 @@ jobs:
                           '',
                           'Each push to this PR publishes a new version under the `pr-' + prNumber + '` npm tag.',
                           '',
-                          '### Option B — Download artifact',
+                          ]),
+                          ...(isFork ? ['### Install from artifact'] : ['### Option B — Download artifact']),
                           '',
                           `1. Download the artifact from the [Actions run](${runUrl})`,
                           '2. Extract the tarball and install:',

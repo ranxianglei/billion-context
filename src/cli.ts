@@ -380,19 +380,23 @@ export async function main(): Promise<void> {
         // Manual one-shot update — bypasses the throttle. Apply flag
         // overrides first so `-F <proxy>` reaches loadOptions; the registry
         // and tarball egress then honor the same upstream-proxy decision as
-        // model traffic (#609).
+        // model traffic (#609), and the configured channel (updateTag) so
+        // `bili update` follows the same dist-tag as the background
+        // auto-updater.
         for (const [k, v] of Object.entries(overrides)) {
             if (v !== undefined) process.env[k] = v;
         }
         let updaterResolveProxy: ((url: string) => string | undefined) | undefined;
+        let updateTag: string | undefined;
         try {
             const o = loadOptions();
             updaterResolveProxy = (url) => resolveProxy(o.routes, o.proxy, url, o.proxyFallback);
+            updateTag = o.updateTag;
         } catch (e) {
             console.error(`bili update: config load failed (${String(e)}); updater egress goes direct`);
         }
         await checkForUpdate(
-            { packageName: PACKAGE_NAME, currentVersion: VERSION, autoUpdate: true, resolveProxy: updaterResolveProxy },
+            { packageName: PACKAGE_NAME, currentVersion: VERSION, autoUpdate: true, resolveProxy: updaterResolveProxy, updateTag },
             true,
         );
         return;
@@ -432,6 +436,7 @@ export async function main(): Promise<void> {
             currentVersion: VERSION,
             autoUpdate: true,
             resolveProxy: (url) => resolveProxy(opts.routes, opts.proxy, url, opts.proxyFallback),
+            updateTag: opts.updateTag,
         });
     }
 }

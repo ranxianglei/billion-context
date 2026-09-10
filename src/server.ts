@@ -3,11 +3,12 @@ import fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import { createCore, type CompressionCore, type CompressionState, type Config, type CoreMessage, type NudgeDecision, type Prompts, defaultPrompts, defaultCountTokens, estimateTokensFast, renderNudgeText, deactivateBlock, viableRanges } from "acp-kernel";
 import { resolveCompress, resolveCompressPrompts, resolveRequestConfig } from "./compress-settings.js";
+import { dropCompressReasoning, type CompressReasoningConfig } from "./reasoning-drop.js";
 import { DEFAULT_STRIP_IMAGES_KEEP_RECENT, stripHistoricalImages } from "./strip-images.js";
 import type { ProxyOptions } from "./config.js";
 import { loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
-import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, lookupContextLimit, resolveConfiguredContextLimit, resolveCompressProtocol } from "./config.js";
+import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, lookupContextLimit, resolveConfiguredContextLimit, resolveCompressProtocol } from "./config.js";
 import { contextFromRegistry, loadRegistry, peekRegistryContext } from "./registry.js";
 import { codexAlignedWindow } from "./codex-models.js";
 import { fetchWithTimeout, MAX_REQUEST_BYTES } from "./fetch-util.js";
@@ -872,6 +873,7 @@ async function handle(
         try {
             const result = await fetchWithTimeout(targetUrl, {
                 method: "HEAD",
+                redirect: "follow",
                 ...(proxyUrl ? { dispatcher: proxyDispatcher(proxyUrl, 15_000) } : {}),
             }, 15_000);
             result.clearTimer();
@@ -1164,10 +1166,17 @@ async function handle(
         }
     }
     let prepared: Prepared | null = null;
+    // #661: route-scoped passthrough — the global flag's semantics, limited to
+    // requests whose upstream URL matches a provider route with
+    // `passthrough: true` (upstreams that fingerprint the request body).
+    const routePassthrough = !opts.passthrough && findRoute(opts.routes, route?.rewrittenUrl)?.passthrough === true;
+    if (routePassthrough && hopMarker === undefined && protocol && parsed) {
+        log("info", `[route-passthrough] ${maskUrlsInText(route?.rewrittenUrl ?? "")} matches a passthrough route — forwarding verbatim, kernel bypassed`);
+    }
     // #300: `hopMarker !== undefined` means an upstream bili already processed
     // this request — skip the whole pipeline (prepared stays null) so the
     // passthrough path below forwards it verbatim.
-    if (!opts.passthrough && hopMarker === undefined && protocol && parsed && typeof parsed === "object") {
+    if (!opts.passthrough && !routePassthrough && hopMarker === undefined && protocol && parsed && typeof parsed === "object") {
         const sessionHeader = headerValue(req, opts.sessionHeader);
         // Plugin mode (issue #1, "内外呼应"): a cooperative agent-side plugin
         // announces itself with x-bili-plugin. The proxy then treats the
@@ -1558,6 +1567,7 @@ async function handle(
             await withSessionLock(session, async () => {
                 const runPrepare = (): Prepared => {
                     const cs = resolveCompress(opts.routes, route?.rewrittenUrl, (parsed as { model?: string }).model, opts.compress);
+                    const reasoningCfg = cs.reasoning;
                     const keepRecent = cs.stripImagesKeepRecent ?? DEFAULT_STRIP_IMAGES_KEEP_RECENT;
                     const stripped = cs.stripImages
                         ? stripHistoricalImages(parsed, protocol, keepRecent)
@@ -1569,16 +1579,16 @@ async function handle(
                     return countTokens
                         ? prepareCountTokens(work as AnthropicRequestBody, core, reqConfig, log, session)
                         : protocol === "anthropic"
-                          ? prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, pluginMode)
+                          ? prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, pluginMode, reasoningCfg)
                           : protocol === "openai"
-                             ? prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, pluginMode, nativeWindow)
+                             ? prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, pluginMode, nativeWindow, reasoningCfg)
                              : responsesCompact
                                 // #618 review nit: when no bili compaction item is present,
                                 // prepareResponsesCompact falls back to the raw bodyBuffer — forward
                                 // the re-serialized post-strip work instead so dropped images don't
                                 // ride along. Unchanged bodies keep the original buffer byte-identical.
                                 ? prepareResponsesCompact(stripped.removed > 0 ? Buffer.from(JSON.stringify(work)) : bodyBuffer, work as ResponsesRequestBody, session, req, core, reqConfig, log)
-                               : prepareResponses(work as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow);
+                               : prepareResponses(work as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg);
                 };
                 // #332: codex's native remote-compaction request (trigger form)
                 // is dispatched BEFORE prepare/preflight. When it is not
@@ -1682,7 +1692,7 @@ async function handle(
         }
     }
     if (!prepared) {
-        if (protocol === null && !opts.passthrough && !isModelDiscoveryPath(urlPath)) {
+        if (protocol === null && !opts.passthrough && !routePassthrough && !isModelDiscoveryPath(urlPath)) {
             logUnrecognizedPath(log, req.url ?? "");
         }
         await forward(req, res, opts, bodyBuffer, null, core, reqConfig, log, route, instanceId, undefined);
@@ -1706,6 +1716,21 @@ const ACP_TAG_MARK = "\x3cacp ";
 // nonexistent (preflight), so acp_summary survives as the carrier and
 // systemToUser later re-voices the survivors as USER messages (leaving them at
 // their anchors) for strict backends (#377).
+/** [#651] Strip oversized reasoning from closed compress turns (see
+ *  src/reasoning-drop.ts) with an ops log line when anything was dropped. */
+function withReasoningDrop(
+    msgs: BiliMessage[],
+    reasoning: CompressReasoningConfig | undefined,
+    log: (level: string, msg: string) => void,
+    sessionId: string,
+): BiliMessage[] {
+    const out = dropCompressReasoning(msgs, reasoning);
+    if (out.length !== msgs.length) {
+        log("info", `[${sessionId}] compress-reasoning: dropped ${msgs.length - out.length} reasoning message(s) from closed compress turns (#651)`);
+    }
+    return out;
+}
+
 export function stripKernelSummaries(messages: BiliMessage[], state: CompressionState): BiliMessage[] {
     const carried = new Set<string>();
     for (const b of state.blocks) {
@@ -1805,25 +1830,42 @@ function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; cont
     return `[${sessionId}] nudge ${inject}: usage=${pct} (${tokenCount}/${limit}), growth=${growth}/${floor} (ref=${ref}, interval=${interval}), pendingT1=${pendingT1}/${interval}${modelTag}, reason="${n.reason.slice(0, 120)}"`;
 }
 
-// #408/#590/#623: hosts that get the #408 uncompressed-baseline usage
+// #408/#590/#623/#645/#648: hosts that get the #408 uncompressed-baseline usage
 // backfill. pi's AND omp's bili extensions cancel the host's NATIVE compaction
 // so ACP owns compression — pi cancels auto-compaction, omp cancels ALL
 // compaction (its session_before_compact event carries no reason field, so
-// manual /compact can't be preserved). With the host's compaction off, the
-// uncompressed baseline drives nothing on the host side; reporting it only puts
-// a >100% footer that mismatches the folded request actually forwarded
-// (#590 pi 302.7%, #623 omp 205%). Gate on pluginAgent so ONLY the
-// bili-launched extensions are exempted: plain proxy clients and codex
-// native-compact interception keep the #408 behavior (their native compaction
-// stays live and consumes the baseline).
+// manual /compact can't be preserved). Codex is exempted the same way (#645):
+// the backfilled baseline is a virtual number the model never receives — it
+// drifts turn-to-turn (real post-fold usage + a character-based estimate of
+// the folded-out tokens, so the metric can decrement with no compress), it
+// exceeds the window (user saw 1315/950k = 138%), and it drives nothing in
+// codex: codex's auto-compact keys off total_tokens, which the backfill never
+// touches. Detected by UA (same signal as native-compact interception) because
+// bili-launched codex sessions carry pluginAgent "mcp" (shared with claude).
+// With the host's compaction off (pi/omp) or the backfill inert (codex),
+// reporting the baseline only puts a >100% footer that mismatches the folded
+// request actually forwarded (#590 pi 302.7%, #623 omp 205%, #645 codex 138%).
+// Plain proxy clients keep the #408 behavior by default (their native
+// compaction stays live and consumes the baseline); the `hostUsageCredit`
+// config option (#648) additionally lets such a client opt out entirely
+// ("off") — ZCode and similar plain anthropic clients otherwise show the
+// cumulative, drifting baseline as inflated context in their UI.
 function armHostUsageCredit(
     session: Session,
     originalMessages: CoreMessage[],
     processedMessages: CoreMessage[],
+    headers: http.IncomingHttpHeaders,
+    hostUsageCredit: "auto" | "off",
     log: (level: string, msg: string) => void,
 ): void {
     session.hostCreditTokens = 0;
+    // #648: "off" disables the #408 uncompressed-baseline backfill — the host
+    // sees the actually-forwarded (folded) request, matching [acp-usage]
+    // input=. Plain proxy clients (ZCode) otherwise show a cumulative,
+    // drifting baseline that overstates real context pressure.
+    if (hostUsageCredit === "off") return;
     if (session.metadata.pluginAgent === "pi" || session.metadata.pluginAgent === "omp") return;
+    if (isCodexClient(headers)) return;
     // #408: tokens folded out of the forwarded view vs the host's own (unfolded)
     // view — added back into the usage reported to the host so its anchor
     // reflects the uncompressed baseline. Same estimator both sides, so
@@ -1859,12 +1901,14 @@ function prepareAnthropic(
     log: (level: string, msg: string) => void,
     session: Session,
     pluginMode: boolean,
+    reasoning: CompressReasoningConfig | undefined,
 ): Prepared {
     const sessionId = session.id;
     const stream = parsed.stream === true;
     ++session.stats.requests;
     session.hostCreditTokens = 0;
     const injectTools = opts.compress.injectTool && !pluginMode;
+    const stripReasoning = (msgs: BiliMessage[]): BiliMessage[] => withReasoningDrop(msgs, reasoning, log, sessionId);
 
     if (isAutoModeClassifier(parsed)) {
         log("info", `[${sessionId}] auto-mode classifier passthrough (skipping compress injection)`);
@@ -1930,7 +1974,7 @@ function prepareAnthropic(
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
-        processedMessages = stripKernelSummaries(turn.messages, turn.state);
+        processedMessages = stripReasoning(stripKernelSummaries(turn.messages, turn.state));
         applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = coreToAnthropic(processedMessages as BiliMessage[], cacheControls);
@@ -1971,7 +2015,7 @@ function prepareAnthropic(
     // identity chain (#268), not part of the Anthropic Messages API — strip it
     // so the real upstream never sees a field it doesn't know.
     delete (rebuilt as Record<string, unknown>).prompt_cache_key;
-    armHostUsageCredit(session, originalMessages, processedMessages, log);
+    armHostUsageCredit(session, originalMessages, processedMessages, req.headers, opts.hostUsageCredit, log);
     return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, renderTags: "text-only" } as Prepared;
 }
 
@@ -2094,12 +2138,14 @@ function prepareOpenai(
     session: Session,
     pluginMode: boolean,
     nativeWindow: number,
+    reasoning: CompressReasoningConfig | undefined,
 ): Prepared {
     const sessionId = session.id;
     const stream = parsed.stream === true;
     ++session.stats.requests;
     session.hostCreditTokens = 0;
     let openaiSystemText = "";
+    const stripReasoning = (msgs: BiliMessage[]): BiliMessage[] => withReasoningDrop(msgs, reasoning, log, sessionId);
     let openaiOutboundSystem: string | undefined;
     let processedMessages: CoreMessage[] = [];
     let originalMessages: CoreMessage[] = [];
@@ -2161,7 +2207,7 @@ function prepareOpenai(
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
-        processedMessages = stripKernelSummaries(turn.messages, turn.state);
+        processedMessages = stripReasoning(stripKernelSummaries(turn.messages, turn.state));
         applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltMessages = systemToUser(coreToOpenai(processedMessages as BiliMessage[]));
@@ -2224,7 +2270,7 @@ function prepareOpenai(
     if (stream && (rebuilt as Record<string, unknown>).stream_options === undefined) {
         (rebuilt as Record<string, unknown>).stream_options = { include_usage: true };
     }
-    armHostUsageCredit(session, originalMessages, processedMessages, log);
+    armHostUsageCredit(session, originalMessages, processedMessages, req.headers, opts.hostUsageCredit, log);
     // #532: title-gen side requests carry their own tiny system and would
     // clobber the conversation's measured overhead — skip them.
     if (!isTitleGen && openaiOutboundSystem !== undefined) {
@@ -2248,11 +2294,13 @@ function prepareResponses(
     pluginMode: boolean,
     upstreamOrigin: string,
     nativeWindow: number,
+    reasoning: CompressReasoningConfig | undefined,
 ): Prepared {
     const sessionId = session.id;
     const stream = parsed.stream === true;
     ++session.stats.requests;
     session.hostCreditTokens = 0;
+    const stripReasoning = (msgs: BiliMessage[]): BiliMessage[] => withReasoningDrop(msgs, reasoning, log, sessionId);
     if (reconcileNativeCompactionBoundary(session)) {
         log("info", `[${sessionId}] reconciled ACP state after native Responses compact boundary`);
     }
@@ -2350,7 +2398,7 @@ function prepareResponses(
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
         const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !isCompactionTrigger && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
-        processedMessages = repairResponsesAssistantOrdering(stripKernelSummaries(turn.messages, turn.state), originalMessages);
+        processedMessages = repairResponsesAssistantOrdering(stripReasoning(stripKernelSummaries(turn.messages, turn.state)), originalMessages);
         reapOrphanBlocks(session, msgs, deactivateBlock);
         rebuiltInput = patchResponsesInput(projection, processedMessages);
         // Fallback path: when the echo did NOT come back this turn (client
@@ -2478,7 +2526,7 @@ function prepareResponses(
         });
         log("info", `[${sessionId}] responses forward tools=[${fwdTools.join(",")}] injectTool=${injectTools}${pluginMode ? " (plugin mode: wire injection suppressed)" : ""} NO_INJECT_TOOL=${!!process.env.ACP_NO_INJECT_TOOL} NO_COMPRESS_PROMPT=${!!process.env.ACP_NO_COMPRESS_PROMPT}`);
     }
-    armHostUsageCredit(session, originalMessages, processedMessages, log);
+    armHostUsageCredit(session, originalMessages, processedMessages, req.headers, opts.hostUsageCredit, log);
     // #532: measure the outbound developer(system)+tools overhead for the panel.
     // On this wire the system rides the injected developer message outside the
     // fold space, so counting devContent + tools does not double-count the

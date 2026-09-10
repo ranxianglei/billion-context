@@ -1,6 +1,6 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { prune, type CoreMessage } from "acp-kernel";
+import { matchSession as matchSessionKernel, renderHandoff as renderHandoffKernel, type HandoffBlockFull } from "acp-kernel";
 import type { Session } from "./session.js";
 import { SessionStore } from "./persist.js";
 
@@ -48,6 +48,41 @@ function latestBlockTime(s: Session): number {
 }
 
 export function renderHandoff(s: Session, full: boolean): string {
+    const messages = s.lastMessages;
+    if (messages && messages.length > 0) {
+        const folded = s.lastMessagesFolded === true;
+        const blocksFull: HandoffBlockFull[] | undefined =
+            full && folded
+                ? s.state.blocks
+                      .filter((b) => b.active)
+                      .map((b): HandoffBlockFull | undefined => {
+                          const content = s.blockContents.get(b.blockId);
+                          return content ? { blockId: b.blockId, topic: b.topic, count: content.full.count, fullText: content.full.text } : undefined;
+                      })
+                      .filter((x) => x !== undefined)
+                : undefined;
+        return renderHandoffKernel({
+            coreMessages: messages,
+            state: s.state,
+            full,
+            folded,
+            blocksFull,
+            meta: {
+                title: s.meta.title,
+                label: s.meta.label,
+                sessionId: s.id,
+                contextTokens: s.stats.contextTokens,
+                extraBullets: [
+                    ...(s.meta.protocol ? [`- protocol: ${s.meta.protocol}`] : []),
+                    ...(s.meta.upstreamOrigin ? [`- upstream: ${s.meta.upstreamOrigin}`] : []),
+                    `- requests: ${s.stats.requests}`,
+                ],
+            },
+        });
+    }
+
+    // v2 fallback: no snapshot persisted. Block summaries (+ originals with
+    // --full from the blockContents cache) are all that is recoverable offline.
     const lines: string[] = [];
     lines.push(`# billion-context session handoff`);
     lines.push("");
@@ -60,56 +95,6 @@ export function renderHandoff(s: Session, full: boolean): string {
     if (s.stats.contextTokens) lines.push(`- last context tokens: ~${s.stats.contextTokens}`);
     lines.push(`- compression blocks: ${s.state.blocks.length} (active ${s.state.blocks.filter((b) => b.active).length})`);
     lines.push("");
-
-    const messages = s.lastMessages;
-    if (messages && messages.length > 0) {
-        // Conversation snapshot (v3 files): render exactly what the model
-        // saw. Default = folded view via the kernel's own renderer (summaries
-        // in place of compressed ranges); --full = every original message.
-        // A restored #401 snapshot is ALREADY pruned (and truncated) — its
-        // message ids no longer align with the state ranges, so re-running
-        // prune() would resurrect dropped summaries at index 0. Render it
-        // as-is; --full recovers folded originals from blockContents below.
-        const folded = s.lastMessagesFolded === true;
-        const view = full || folded ? messages : prune(messages, s.state);
-        lines.push(
-            full && !folded
-                ? `## Full conversation (${messages.length} messages)`
-                : folded
-                  ? `## Conversation (persisted folded snapshot, ${messages.length} messages)`
-                  : `## Conversation (folded view as the model saw it, ${messages.length} client messages)`,
-        );
-        lines.push("");
-        let lastRole = "";
-        for (const m of view) {
-            if (m.role !== lastRole) {
-                lines.push(`### ${m.role}`);
-                lines.push("");
-                lastRole = m.role;
-            }
-            lines.push(renderMessage(m));
-        }
-        lines.push("");
-        // A folded snapshot has no originals of the folded ranges — --full
-        // recovers them from the blockContents cache (same source the v2
-        // fallback uses).
-        if (full && folded) {
-            for (const b of s.state.blocks.filter((x) => x.active)) {
-                const content = s.blockContents.get(b.blockId);
-                if (!content) continue;
-                lines.push(`## Block ${b.blockId}${b.topic ? ` — ${b.topic}` : ""}`);
-                lines.push("");
-                lines.push(`### Original messages (${content.full.count})`);
-                lines.push("");
-                lines.push(content.full.text.trim());
-                lines.push("");
-            }
-        }
-        return lines.join("\n");
-    }
-
-    // v2 fallback: no snapshot persisted. Block summaries (+ originals with
-    // --full from the blockContents cache) are all that is recoverable offline.
     const active = s.state.blocks.filter((b) => b.active);
     if (active.length === 0) {
         lines.push("No active compression blocks and no persisted conversation snapshot (v2 session file). Original messages are only persisted when they are compressed into a block, so this session's conversation content is not available for export.");
@@ -139,35 +124,8 @@ export function renderHandoff(s: Session, full: boolean): string {
     return lines.join("\n");
 }
 
-/** Render one CoreMessage as markdown. tool-call / tool-result / reasoning
- *  carry their structured fields; text carries the body. */
-function renderMessage(m: CoreMessage): string {
-    const parts: string[] = [];
-    switch (m.contentType) {
-        case "text":
-            parts.push(m.text ?? "");
-            break;
-        case "tool-call":
-            parts.push(`\`${m.toolName ?? "?"}(${m.toolCallId ?? ""})\` args: ${m.text ?? ""}`);
-            break;
-        case "tool-result":
-            parts.push(`\`${m.toolName ?? "?"}(${m.toolCallId ?? ""})\` → ${m.text ?? ""}`);
-            break;
-        case "reasoning":
-            parts.push(`_reasoning_: ${m.text ?? ""}`);
-            break;
-    }
-    const body = parts.join("\n").trim();
-    return body === "" ? "_(empty)_" : body + "\n";
-}
-
 function matchSession(sessions: Session[], selector: string): Session[] {
-    const exact = sessions.filter((s) => s.id === selector);
-    if (exact.length > 0) return exact;
-    const byLabel = sessions.filter((s) => s.meta.label === selector);
-    if (byLabel.length > 0) return byLabel;
-    const byPrefix = sessions.filter((s) => s.id.startsWith(selector) || (s.meta.label ?? "").startsWith(selector));
-    return byPrefix;
+    return matchSessionKernel(sessions, selector, (s) => s.meta.label);
 }
 
 export async function exportSession(selector: string | undefined, opts: ExportOptions = {}): Promise<string> {

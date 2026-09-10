@@ -49,6 +49,13 @@ export type ProviderRoute = {
      *  client-sent roles and bili's own injected prompt alike (#552). Wins
      *  per key over the global `compat` block. */
     compat?: { roles?: Record<string, string> };
+    /** Route-scoped passthrough (#661): same semantics as the global
+     *  `passthrough` flag, but only for requests whose upstream URL matches
+     *  this route — request body forwarded byte-for-byte (no kernel
+     *  round-trip, no render tags, no re-serialization), response piped
+     *  verbatim, no session state. For upstreams whose anti-cheat fingerprints
+     *  the request body (e.g. ZCode 405/3012). */
+    passthrough?: boolean;
 };
 export type ProviderRoutes = Record<string, ProviderRoute>; // key = upstream URL prefix (the /bili/<this> string)
 
@@ -160,6 +167,20 @@ export type CompressSettings = {
     /** With {@link stripImages}, how many trailing messages keep their images
      *  verbatim (default 5). Ignored unless stripImages is true. */
     stripImagesKeepRecent?: number;
+    /** [#651] Drop oversized reasoning (thinking) from closed-turn `compress`
+     *  tool calls at request time (src/reasoning-drop.ts, aligned with
+     *  billion-context-pi #336/#339 and opencode-acp #377). Compress turns
+     *  are hard-exempt from compression, so their reasoning is otherwise an
+     *  unreclaimable context floor. Merged sub-field-wise across the three
+     *  config levels like `absorb`. */
+    reasoning?: {
+        /** Master switch (default true). Set `drop: false` per-provider for
+         *  models whose reasoning must round-trip unmodified. */
+        drop?: boolean;
+        /** A closed turn's reasoning run must exceed this many chars to be
+         *  dropped (default 2048). */
+        threshold?: number;
+    };
 };
 export type PromptCacheRouting = "auto" | "enabled" | "disabled";
 export type UpstreamProxyMode = "auto" | "manual" | "direct";
@@ -293,6 +314,17 @@ export type ProxyOptions = {
      *  Drives the #405 boot warning and the web panel's source display. */
     passthroughSource: "env" | "file" | null;
     autoUpdate: boolean;
+    /** Dist-tag channel the auto-updater follows (default "latest"). */
+    updateTag: string;
+    /** #408 host-usage backfill mode. "auto" (default) = the uncompressed-
+     *  baseline backfill is armed for plain proxy clients (the bili-launched
+     *  pi/omp extensions are exempted — their host compaction is cancelled, so
+     *  the baseline drives nothing on the host side). "off" = never backfill —
+     *  the usage reported to the host is the actually-forwarded (folded)
+     *  request, matching [acp-usage] input= (#648: plain anthropic proxy
+     *  clients like ZCode otherwise show a cumulative, drifting baseline that
+     *  overstates real context pressure). */
+    hostUsageCredit: "auto" | "off";
     logFile?: string;
     /** MITM transparent-proxy mode. When enabled, an HTTP CONNECT handler is
      *  attached so clients that only know how to set HTTP_PROXY (ZCode with a
@@ -430,6 +462,8 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         passthrough: passthrough.enabled,
         passthroughSource: passthrough.source,
         autoUpdate: (env.ACP_AUTO_UPDATE ?? (fileConfig.autoUpdate === false ? "0" : "1")) !== "0",
+        hostUsageCredit: parseHostUsageCredit(env.BILI_HOST_USAGE_CREDIT ?? fileConfig.hostUsageCredit),
+        updateTag: (env.ACP_UPDATE_TAG ?? fileConfig.updateTag ?? "latest").trim() || "latest",
         logFile: env.ACP_LOG_FILE !== undefined ? (env.ACP_LOG_FILE || undefined) : fileConfig.logFile,
         mitm: {
             enabled: (env.BILI_MITM ?? (fileConfig.mitm?.enabled === false ? "0" : "1")) !== "0",
@@ -461,6 +495,9 @@ type FileConfig = {
     dumpSse?: string;
     passthrough?: boolean;
     autoUpdate?: boolean;
+    /** Dist-tag channel the auto-updater follows (default "latest"). */
+    updateTag?: string;
+    hostUsageCredit?: "auto" | "off";
     upstreamProxy?: string;
     upstreamProxyMode?: string;
     logFile?: string;
@@ -549,13 +586,14 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
     // is the KEY in the providers map (identical to the /bili/<url> string),
     // so it is NOT repeated inside the value.
     if (v && typeof v === "object" && !Array.isArray(v)) {
-        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; compress?: CompressSettings; compat?: { roles?: unknown } };
+        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; compress?: CompressSettings; compat?: { roles?: unknown }; passthrough?: boolean };
         const route: ProviderRoute = { models: obj.models };
         if (typeof obj.proxy === "string") route.proxy = obj.proxy;
         if (obj.compressProtocol === "marker" || obj.compressProtocol === "tools") route.compressProtocol = obj.compressProtocol;
         if (obj.compress) route.compress = obj.compress;
         const compatRoles = parseCompatRoles(obj.compat?.roles);
         if (compatRoles) route.compat = { roles: compatRoles };
+        if (typeof obj.passthrough === "boolean") route.passthrough = obj.passthrough;
         return route;
     }
     // A bare value (e.g. null) means "this upstream exists, no overrides".
@@ -569,6 +607,10 @@ export function parsePromptCacheRouting(value: string | undefined): PromptCacheR
 
 export function parseUpstreamProxyMode(value: string | undefined): UpstreamProxyMode {
     return value === "manual" || value === "auto" ? value : "direct";
+}
+
+export function parseHostUsageCredit(value: string | undefined): "auto" | "off" {
+    return value === "off" ? "off" : "auto";
 }
 
 export function parseCompressSettings(v: unknown): (CompressSettings & { injectTool?: boolean; injectNudge?: boolean }) | undefined {

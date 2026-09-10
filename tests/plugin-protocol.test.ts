@@ -186,6 +186,25 @@ async function callPluginAnthropic(
     return { raw, events: parseAnthropicSse(raw), json: undefined };
 }
 
+async function claudeIdentityRequest(h: Harness, sessionId: string, messages: AnthropicMessage[]): Promise<number> {
+    const resp = await fetch(`http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1/messages`, {
+        method: "POST",
+        headers: {
+            "content-type": "application/json",
+            "x-claude-code-session-id": sessionId,
+        },
+        body: JSON.stringify({
+            model: "claude-test",
+            max_tokens: 1024,
+            stream: true,
+            system: UPSTREAM_SYSTEM,
+            messages,
+        }),
+    });
+    if (resp.body) for await (const _ of resp.body) {}
+    return resp.status;
+}
+
 test("plugin manifest serves the exact wire tool schemas, headers and version", async () => {
     const h = await startHarness([textScript()]);
     try {
@@ -405,6 +424,85 @@ test("plugin tool API error paths: bad JSON, unknown tool, unknown conversation"
         const errJson = (await unknownConv.json()) as { ok: boolean; error: string };
         assert.equal(errJson.ok, false);
         assert.match(errJson.error, /unknown plugin conversation/i);
+        // #656: a never-registered id must say so explicitly (stale shim id
+        // after host resume) — not the generic wording.
+        assert.match(errJson.error, /no model request has arrived/);
+    } finally {
+        await h.close();
+    }
+});
+
+test("#656: status fallback=latest resolves the active conversation for a stale shim id, and the adopted id then works for tool calls", async () => {
+    const h = await startHarness([textScript()]);
+    try {
+        const conv = "plug-conv-after-resume";
+        // The host resumed and now sends traffic under a NEW id; the shim
+        // still holds the pre-resume one ("stale-shim-id").
+        await callPluginAnthropic(h, conv, [{ role: "user", content: "hello after resume" }]);
+
+        // Shim adoption step 1: status asked with the stale id falls back to
+        // the latest active conversation and reports the adoption.
+        const statusResp = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/status?conversationId=stale-shim-id&fallback=latest`);
+        assert.equal(statusResp.status, 200);
+        const status = (await statusResp.json()) as { ok: boolean; conversationId: string; fallback?: boolean };
+        assert.equal(status.ok, true);
+        assert.equal(status.fallback, true);
+        assert.equal(status.conversationId, conv);
+
+        // Shim adoption step 2: the retry with the adopted id succeeds.
+        const adopted = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/tool`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ conversationId: conv, tool: "acp_status", args: {} }),
+        });
+        assert.equal(adopted.status, 200);
+        const adoptedJson = (await adopted.json()) as { ok: boolean };
+        assert.equal(adoptedJson.ok, true);
+    } finally {
+        await h.close();
+    }
+});
+
+test("#656 identity binding: a stale x-claude-code-session-id recovers via status fallback=latest", async () => {
+    const h = await startHarness([textScript()]);
+    try {
+        const OLD = "claude-session-before-resume";
+        const NEW = "claude-session-after-resume";
+        // Identity binding (#162): the shell registers its captured id; after
+        // a resume the host forks NEW and the shell re-registers it, leaving
+        // the stale OLD id with no model traffic.
+        queuePluginRegister(OLD, "mcp", true);
+        queuePluginRegister(NEW, "mcp", true);
+        assert.equal(await claudeIdentityRequest(h, NEW, [{ role: "user", content: "after resume" }]), 200);
+
+        const toolOld = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/tool`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ conversationId: OLD, tool: "acp_status", args: {} }),
+        });
+        assert.equal(toolOld.status, 404);
+        const toolOldJson = (await toolOld.json()) as { ok: boolean; error: string };
+        assert.equal(toolOldJson.ok, false);
+        assert.match(toolOldJson.error, /no model request has arrived/);
+
+        // Adoption step 1: status with the stale id falls back to the latest
+        // active conversation and reports NEW (the resolved id), not the stale one.
+        const statusResp = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/status?conversationId=${OLD}&fallback=latest`);
+        assert.equal(statusResp.status, 200);
+        const status = (await statusResp.json()) as { ok: boolean; conversationId: string; fallback?: boolean };
+        assert.equal(status.ok, true);
+        assert.equal(status.fallback, true);
+        assert.equal(status.conversationId, NEW);
+
+        // Adoption step 2: the retry with the adopted id succeeds.
+        const toolNew = await fetch(`http://127.0.0.1:${h.proxyPort}/__bili/plugin/tool`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ conversationId: NEW, tool: "acp_status", args: {} }),
+        });
+        assert.equal(toolNew.status, 200);
+        const toolNewJson = (await toolNew.json()) as { ok: boolean };
+        assert.equal(toolNewJson.ok, true);
     } finally {
         await h.close();
     }

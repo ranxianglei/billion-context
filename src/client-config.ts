@@ -169,6 +169,15 @@ export function resolveDshHome(env: NodeJS.ProcessEnv): string {
         : path.join(h, ".dsh");
 }
 
+/** codex keeps everything under CODEX_HOME (default ~/.codex): config.toml,
+ *  auth.json, sessions. Same resolution the discovery + plugin-install paths
+ *  already use (client-config.ts / plugin-install.ts `codexToml`). */
+export function resolveCodexHome(env: NodeJS.ProcessEnv): string {
+    const h = os.homedir();
+    return nonEmpty(env.CODEX_HOME) ? env.CODEX_HOME!
+        : path.join(h, ".codex");
+}
+
 /** codebuddy (Tencent CodeBuddy Code CLI) keeps its config under
  *  CODEBUDDY_CONFIG_DIR (default ~/.codebuddy). */
 export function resolveCodebuddyHome(env: NodeJS.ProcessEnv): string {

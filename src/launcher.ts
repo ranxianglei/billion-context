@@ -43,7 +43,7 @@ import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom } from "./plugin-in
 function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
-import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, loadClientConfig, collectModelWindows, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider } from "./client-config.js";
+import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, loadClientConfig, collectModelWindows, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider } from "./client-config.js";
 import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, type ProviderRoutes } from "./config.js";
 import { contextFromRegistry } from "./registry.js";
 
@@ -75,6 +75,7 @@ export {
     readDshConfig,
     parseDshSettingsYaml,
     resolveDshHome,
+    resolveCodexHome,
     resolveOpencodeConfigFile,
     readOpencodeConfig,
     type OpencodeConfig,
@@ -107,7 +108,7 @@ export interface SpawnChild {
 export type SpawnFn = (
     command: string,
     args: readonly string[],
-    options: { detached?: boolean; stdio?: StdioOptions; env?: NodeJS.ProcessEnv; shell?: boolean },
+    options: { detached?: boolean; stdio?: StdioOptions; env?: NodeJS.ProcessEnv; shell?: boolean; windowsVerbatimArguments?: boolean },
 ) => SpawnChild;
 
 export interface LaunchOptions {
@@ -753,6 +754,36 @@ export function buildCodexMcpArgs(origin: string, conversationId: string): strin
     ];
 }
 
+/** #681: how the bili MCP server reaches the spawned codex. On POSIX the
+ *  inline `-c mcp_servers.bili.*` values are safe (no shell re-parses argv),
+ *  so buildCodexMcpArgs stands. On Windows every codex launch rides a .cmd
+ *  shim through cmd.exe, and a `-c` value embedding an absolute path carries
+ *  both quotes and spaces — cmd.exe strips the TOML-required quotes (it has no
+ *  literal-quote escape), leaving malformed TOML. There the definition is
+ *  delivered via a file instead: a persistent <CODEX_HOME>-bili overlay whose
+ *  merged config.toml holds [mcp_servers.bili], pointed at by CODEX_HOME.
+ *  When the overlay cannot be built the injection degrades to nothing (wire
+ *  mode still compresses server-side) with a warning. */
+export function prepareCodexMcpInjection(opts: {
+    platform: NodeJS.Platform;
+    codexHome: string;
+    origin: string;
+    conversationId: string;
+}): { clientArgs: string[]; envPatch: Record<string, string>; warning?: string } {
+    if (opts.platform !== "win32") {
+        return { clientArgs: buildCodexMcpArgs(opts.origin, opts.conversationId), envPatch: {} };
+    }
+    const overlay = prepareCodexHome(opts.codexHome, opts.origin, opts.conversationId);
+    if (!overlay) {
+        return {
+            clientArgs: [],
+            envPatch: {},
+            warning: "could not prepare the codex MCP overlay (<CODEX_HOME>-bili) — launching without native bili MCP tools; wire-injected compression is still active.",
+        };
+    }
+    return { clientArgs: [], envPatch: { CODEX_HOME: overlay } };
+}
+
 /**
  * Shared persistent-overlay machinery for the remaining home-dir launcher
  * (dsh; pi/omp/hermes went file-free in #535 — env routing + extension, no
@@ -1325,6 +1356,56 @@ export function prepareDshHome(
     return overlay;
 }
 
+/** Strip any existing [mcp_servers.bili] block from codex config text so the
+ *  launcher can append a fresh one without duplicating the table. Table
+ *  boundaries follow plugin-install.ts `codexRemove`. */
+function stripCodexBiliBlock(text: string): string {
+    const m = /^[ \t]*\[mcp_servers\.bili\][ \t]*$/m.exec(text);
+    if (m === null) return text;
+    const start = m.index;
+    const lineStart = text.lastIndexOf("\n", start - 1) + 1;
+    const after = text.slice(start);
+    const firstNewline = after.indexOf("\n");
+    const nextTable = firstNewline < 0 ? -1 : after.slice(firstNewline + 1).search(/^[ \t]*\[/m);
+    const end = nextTable >= 0 ? start + firstNewline + 1 + nextTable : text.length;
+    return (text.slice(0, lineStart).replace(/\n+$/, "\n") + text.slice(end)).replace(/^\n+/, "");
+}
+
+/** Real config.toml text with the launcher's [mcp_servers.bili] merged in: a
+ *  pre-existing block (e.g. from `bili plugin install codex`) is replaced by
+ *  the current launch's command/args/env — adding the per-spawn
+ *  BILI_CONVERSATION_ID the persistent install lacks. Values are
+ *  JSON.stringify'd exactly like plugin-install.ts `codexBlock`, which yields
+ *  valid TOML basic strings (both escape backslashes as \\). */
+function mergeCodexBiliBlock(text: string, origin: string, conversationId: string): string {
+    const script = selfDistFile("mcp.js");
+    const block =
+        "\n[mcp_servers.bili]\n" +
+        `command = ${JSON.stringify(process.execPath)}\n` +
+        `args = [${JSON.stringify(script)}]\n` +
+        `env = { BILI_MCP_PROXY = ${JSON.stringify(origin)}, BILI_CONVERSATION_ID = ${JSON.stringify(conversationId)} }\n`;
+    const base = stripCodexBiliBlock(text);
+    return base + (base.endsWith("\n") || base.length === 0 ? "" : "\n") + block;
+}
+
+/** #681: persistent <CODEX_HOME>-bili overlay carrying the bili MCP server in
+ *  config.toml instead of inline `-c` args (which cmd.exe cannot transmit when
+ *  they embed a spaced/quoted Windows path). Every real-home entry except
+ *  config.toml is shared (auth.json, sessions, model settings survive); the
+ *  generated config.toml is the real contents plus [mcp_servers.bili]. Returns
+ *  the overlay dir to point CODEX_HOME at, or undefined when it cannot be
+ *  built (caller then skips native MCP injection). */
+export function prepareCodexHome(codexHome: string, origin: string, conversationId: string): string | undefined {
+    let txt = "";
+    try {
+        txt = fs.readFileSync(path.join(codexHome, "config.toml"), "utf8");
+    } catch {}
+    const overlay = `${codexHome}-bili`;
+    if (!refreshOverlayHome(codexHome, overlay, "config.toml")) return undefined;
+    writeOverlayFileAtomic(overlay, "config.toml", mergeCodexBiliBlock(txt, origin, conversationId));
+    return overlay;
+}
+
 /** Write the `--patch` overlay file that inserts the bili /acp command
  *  plugin into whatever profile dsh boots. Lives in the persistent
  *  `<dshHome>-bili` dir, INDEPENDENT of the settings.yaml rewrite — the
@@ -1676,15 +1757,65 @@ export function stopProxy(handle: ProxyHandle): void {
     } catch {}
 }
 
+/** #679: quote one token for cmd.exe's line parser. Only whitespace-bearing
+ *  tokens get wrapped in double quotes, so a space-free launch produces a
+ *  byte-identical line to the old shell:true form. A token containing an
+ *  embedded double quote stays bare: cmd.exe has no escape mechanism for
+ *  quotes, so wrapping would only change how it is mangled (today's behavior
+ *  preserved). */
+export function quoteWinToken(token: string): string {
+    if (!/\s/.test(token) || token.includes('"')) return token;
+    return `"${token}"`;
+}
+
+/** #679: full command line for `comspec /d /s /c <line>` — tokens quoted as
+ *  needed, wrapped in one extra outer pair that cmd's /s strips before
+ *  parsing the inner tokens with their own quoting intact (the documented /s
+ *  form; same trick cross-spawn uses). */
+export function buildWindowsCommandLine(cmd: string, args: readonly string[]): string {
+    return `"${[cmd, ...args].map(quoteWinToken).join(" ")}"`;
+}
+
+/** #679: which spawn form a resolved client needs on Windows. Only .cmd/.bat
+ *  shims and unresolved bare names need cmd.exe — CreateProcess cannot
+ *  execute a batch file, and an extensionless name needs cmd's PATHEXT
+ *  resolution. Everything else (.exe, node, an existing path with an
+ *  extension) spawns directly and the OS quotes the executable and argv
+ *  itself, spaces included. shell:true is never used anymore: no DEP0190, no
+ *  cmd.exe re-splitting of spaced paths at their first space (which truncated
+ *  both the command and its args). */
+export function planClientSpawn(
+    cmd: string,
+    args: readonly string[],
+    env: NodeJS.ProcessEnv,
+    platform: NodeJS.Platform = process.platform,
+): { command: string; args: string[]; windowsVerbatimArguments?: boolean } {
+    if (platform !== "win32") return { command: cmd, args: [...args] };
+    const lower = cmd.toLowerCase();
+    const base = cmd.slice(Math.max(cmd.lastIndexOf("/"), cmd.lastIndexOf("\\")) + 1);
+    const needsCmd = lower.endsWith(".cmd") || lower.endsWith(".bat") || !path.extname(base);
+    if (!needsCmd) return { command: cmd, args: [...args] };
+    const comspec = nonEmpty(env.COMSPEC) ? env.COMSPEC : "cmd.exe";
+    return {
+        command: comspec,
+        args: ["/d", "/s", "/c", buildWindowsCommandLine(cmd, args)],
+        windowsVerbatimArguments: true,
+    };
+}
+
 export function runClient(
     cmd: string,
     args: string[],
     env: NodeJS.ProcessEnv,
-    deps?: { spawnImpl?: SpawnFn },
+    deps?: { spawnImpl?: SpawnFn; platform?: NodeJS.Platform },
 ): Promise<number> {
+    // #679: never shell:true — besides DEP0190, cmd.exe re-splits the unquoted
+    // line on whitespace and truncated spaced client/-e paths at their first
+    // space; planClientSpawn picks the direct-vs-comspec form instead.
     const spawnImpl = deps?.spawnImpl ?? (spawn as SpawnFn);
+    const plan = planClientSpawn(cmd, args, env, deps?.platform);
     return new Promise((resolve, reject) => {
-        const child = spawnImpl(cmd, args, { stdio: "inherit", env, shell: process.platform === "win32" });
+        const child = spawnImpl(plan.command, plan.args, { stdio: "inherit", env, windowsVerbatimArguments: plan.windowsVerbatimArguments });
         child.on?.("error", (...rest: unknown[]) => reject(rest[0]));
         child.on?.("exit", (...rest: unknown[]) => {
             const code = rest[0];
@@ -1975,7 +2106,6 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         const codexConversationId = injectMcp ? randomUUID() : undefined;
         if (directUrl) {
             env = { ...process.env, BILLION_CONTEXT_PROXY: origin };
-            if (codexConversationId) clientArgs = [...buildCodexMcpArgs(origin, codexConversationId), ...clientArgs];
         } else {
             env = buildCodexEnv(origin, resolveCombinedCaPath(process.env), process.env);
             clientArgs = buildCodexArgs(origin, routes.httpRewrites, routes.httpsRewrites, clientArgs);
@@ -1990,7 +2120,17 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
                 clientArgs = [...budgetArgs, ...clientArgs];
                 console.error(`bili: codex budget aligned — ${budgetArgs.slice(2).join(", ")} (model: ${config.codex?.model})`);
             }
-            if (injectMcp && codexConversationId) clientArgs = [...buildCodexMcpArgs(origin, codexConversationId), ...clientArgs];
+        }
+        if (injectMcp && codexConversationId) {
+            const inj = prepareCodexMcpInjection({
+                platform: process.platform,
+                codexHome: resolveCodexHome(process.env),
+                origin,
+                conversationId: codexConversationId,
+            });
+            if (inj.clientArgs.length > 0) clientArgs = [...inj.clientArgs, ...clientArgs];
+            Object.assign(env, inj.envPatch);
+            if (inj.warning) console.error(`bili: ${inj.warning}`);
         }
     } else if (base === "codebuddy") {
         env = buildCodebuddyEnv(origin, ca, routes.httpRewrites, routes.httpsRewrites, process.env);
