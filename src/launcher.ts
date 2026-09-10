@@ -103,7 +103,13 @@ export interface SpawnChild {
 export type SpawnFn = (
     command: string,
     args: readonly string[],
-    options: { detached?: boolean; stdio?: StdioOptions; env?: NodeJS.ProcessEnv; shell?: boolean },
+    options: {
+        detached?: boolean;
+        stdio?: StdioOptions;
+        env?: NodeJS.ProcessEnv;
+        shell?: boolean;
+        windowsVerbatimArguments?: boolean;
+    },
 ) => SpawnChild;
 
 export interface LaunchOptions {
@@ -1597,6 +1603,28 @@ export function stopProxy(handle: ProxyHandle): void {
     } catch {}
 }
 
+const WINDOWS_BATCH = /\.(cmd|bat)$/i;
+
+function quoteWinToken(token: string): string {
+    return /[\s"]/.test(token) ? `"${token.replace(/"/g, '""')}"` : token;
+}
+
+/**
+ * Build the line handed to `cmd.exe /d /s /c` for a `.cmd`/`.bat` shim.
+ *
+ * cmd.exe re-splits this line on whitespace, so a client binary or an
+ * `-e <extension>` path containing a space (a profile like
+ * `C:\Users\John Doe`) is cut at the first space: the launch dies with
+ * `'C:\Users\John' is not recognized`, or — when the truncated path happens to
+ * exist — runs on a wrong extension path and compression never turns on.
+ * Tokens stay bare unless they contain whitespace; the outer pair of quotes is
+ * the documented cmd.exe `/s` form, which cmd strips before parsing the inner
+ * tokens with their own quoting intact.
+ */
+export function buildWindowsCommandLine(cmd: string, args: string[]): string {
+    return `"${[cmd, ...args].map(quoteWinToken).join(" ")}"`;
+}
+
 export function runClient(
     cmd: string,
     args: string[],
@@ -1604,8 +1632,20 @@ export function runClient(
     deps?: { spawnImpl?: SpawnFn },
 ): Promise<number> {
     const spawnImpl = deps?.spawnImpl ?? (spawn as SpawnFn);
+    // Only .cmd/.bat shims (npm-installed CLIs) need a shell, and they get an
+    // explicitly quoted line because cmd.exe would re-split an unquoted one.
+    // Everything else — a real .exe, node, an extensionless binary — is
+    // spawned directly: no shell layer, and the OS quotes the executable path
+    // and argv itself, spaces included.
+    const batch = process.platform === "win32" && WINDOWS_BATCH.test(cmd);
+    const command = batch ? env.ComSpec || "cmd.exe" : cmd;
+    const commandArgs = batch ? ["/d", "/s", "/c", buildWindowsCommandLine(cmd, args)] : args;
     return new Promise((resolve, reject) => {
-        const child = spawnImpl(cmd, args, { stdio: "inherit", env, shell: process.platform === "win32" });
+        const child = spawnImpl(command, commandArgs, {
+            stdio: "inherit",
+            env,
+            windowsVerbatimArguments: batch,
+        });
         child.on?.("error", (...rest: unknown[]) => reject(rest[0]));
         child.on?.("exit", (...rest: unknown[]) => {
             const code = rest[0];

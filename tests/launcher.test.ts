@@ -55,6 +55,8 @@ import {
     readClaudeSettings,
     type SpawnChild,
     type SpawnFn,
+    runClient,
+    buildWindowsCommandLine,
     runLaunch,
     type ClientConfig,
     type HttpRewrite,
@@ -1129,6 +1131,117 @@ test("resolveClientCommand: pi falls back to node + cli.js when not on PATH and 
         r.prefixArgs[0].split(path.sep).join("/").endsWith("pi-coding-agent/dist/cli.js"),
         `prefixArgs[0]=${r.prefixArgs[0]}`,
     );
+});
+
+test("buildWindowsCommandLine: quotes spaced tokens and wraps the line for cmd /s", () => {
+    assert.equal(
+        buildWindowsCommandLine(String.raw`C:\Users\John Doe\AppData\Local\omp\omp.exe`, [
+            "-e",
+            String.raw`C:\Users\John Doe\.omp\agent\ext.js`,
+            "--version",
+        ]),
+        String.raw`""C:\Users\John Doe\AppData\Local\omp\omp.exe" -e "C:\Users\John Doe\.omp\agent\ext.js" --version"`,
+    );
+});
+
+test("buildWindowsCommandLine: a space-free line stays byte-identical to the old shell:true line", () => {
+    assert.equal(
+        buildWindowsCommandLine("omp", ["-e", "C:/bili/dist/agent/omp.js"]),
+        '"omp -e C:/bili/dist/agent/omp.js"',
+    );
+});
+
+test("buildWindowsCommandLine: doubles inner quotes instead of dropping them", () => {
+    assert.equal(buildWindowsCommandLine("cmd", ['a"b c']), '"cmd "a""b c""');
+});
+
+function recordingSpawn(
+    calls: { command: string; args: readonly string[]; verbatim: boolean | undefined }[],
+): SpawnFn {
+    return (command, args, options) => {
+        calls.push({ command, args, verbatim: options.windowsVerbatimArguments });
+        const child = makeFakeChild(0);
+        const orig = child.on.bind(child);
+        (child as { on: SpawnChild["on"] }).on = (event, listener) => {
+            orig(event, listener);
+            if (event === "exit") setTimeout(() => listener(0, null), 0);
+            return child;
+        };
+        return child;
+    };
+}
+
+test("runClient: win32 routes a .cmd shim through cmd.exe with a quoted verbatim line", { skip: process.platform !== "win32" }, async () => {
+    const calls: { command: string; args: readonly string[]; verbatim: boolean | undefined }[] = [];
+    const code = await runClient(
+        String.raw`C:\Users\John Doe\AppData\Roaming\npm\codex.cmd`,
+        ["-e", String.raw`C:\Users\John Doe\.omp\agent\ext.js`],
+        { ComSpec: "cmd.exe" },
+        { spawnImpl: recordingSpawn(calls) },
+    );
+    assert.equal(code, 0);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]!.command, "cmd.exe");
+    assert.deepEqual(calls[0]!.args, [
+        "/d",
+        "/s",
+        "/c",
+        String.raw`""C:\Users\John Doe\AppData\Roaming\npm\codex.cmd" -e "C:\Users\John Doe\.omp\agent\ext.js""`,
+    ]);
+    assert.equal(calls[0]!.verbatim, true);
+});
+
+test("runClient: a real .exe is spawned directly, with no shell to re-split a spaced path", async () => {
+    const calls: { command: string; args: readonly string[]; verbatim: boolean | undefined }[] = [];
+    const exe = String.raw`C:\Users\John Doe\AppData\Local\omp\omp.exe`;
+    const code = await runClient(
+        exe,
+        ["-e", String.raw`C:\Users\John Doe\.omp\agent\ext.js`],
+        {},
+        { spawnImpl: recordingSpawn(calls) },
+    );
+    assert.equal(code, 0);
+    assert.deepEqual(calls, [
+        { command: exe, args: ["-e", String.raw`C:\Users\John Doe\.omp\agent\ext.js`], verbatim: false },
+    ]);
+});
+
+test("runClient: win32 launches for real with spaces in the argument paths", { skip: process.platform !== "win32" }, async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili space "));
+    const script = path.join(dir, "probe.js");
+    const out = path.join(dir, "argv out.json");
+    const ext = path.join(dir, "dist agent", "omp.js");
+    fs.writeFileSync(
+        script,
+        `require("node:fs").writeFileSync(process.argv[2], JSON.stringify(process.argv.slice(3)))`,
+    );
+    try {
+        const code = await runClient(process.execPath, [script, out, "-e", ext], process.env);
+        assert.equal(code, 0);
+        assert.deepEqual(JSON.parse(fs.readFileSync(out, "utf8")), ["-e", ext]);
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("runClient: win32 launches a .cmd shim for real under paths containing spaces", { skip: process.platform !== "win32" }, async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili space "));
+    const script = path.join(dir, "probe.js");
+    const out = path.join(dir, "argv out.json");
+    const shim = path.join(dir, "probe shim.cmd");
+    const ext = path.join(dir, "dist agent", "omp.js");
+    fs.writeFileSync(
+        script,
+        `require("node:fs").writeFileSync(process.argv[2], JSON.stringify(process.argv.slice(3)))`,
+    );
+    fs.writeFileSync(shim, `@echo off\r\n"${process.execPath}" "${script}" %*\r\n`);
+    try {
+        const code = await runClient(shim, [out, "-e", ext], process.env);
+        assert.equal(code, 0);
+        assert.deepEqual(JSON.parse(fs.readFileSync(out, "utf8")), ["-e", ext]);
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
 });
 
 test("resolvePiHome: PI_CODING_AGENT_DIR > PI_HOME > default ~/.pi/agent", () => {
