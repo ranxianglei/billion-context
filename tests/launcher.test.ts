@@ -2716,7 +2716,7 @@ test("runLaunch codebuddy: CODEBUDDY_BASE_URL /bili/ rewrite + budget injected (
     delete process.env.CODEBUDDY_BASE_URL;
     delete process.env.CODEBUDDY_AUTO_COMPACT_WINDOW;
     delete process.env.CODEBUDDY_CONFIG_DIR;
-    const fakeCodebuddy = path.join(home, "fake-codebuddy");
+    const fakeCodebuddy = path.join(home, process.platform === "win32" ? "fake-codebuddy.exe" : "fake-codebuddy");
     fs.writeFileSync(fakeCodebuddy, "");
     process.env.BILI_CLIENT_BIN = fakeCodebuddy;
     const cbDir = path.join(home, ".codebuddy");
