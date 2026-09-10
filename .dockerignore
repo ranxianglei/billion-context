@@ -1,0 +1,8 @@
+node_modules
+dist
+tmp
+artifacts
+*.log
+.env
+*.tgz
+.git
