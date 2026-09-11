@@ -1,4 +1,4 @@
-import { test } from "node:test";
+import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import type { PathLike } from "node:fs";
@@ -6,7 +6,12 @@ type SymlinkKind = "dir" | "file" | "junction";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import type { ProxyInstanceFile as InstanceFile } from "../src/instance.ts";
+import {
+    claimStartingMarker,
+    readStartingMarker,
+    removeStartingMarker,
+    type ProxyInstanceFile as InstanceFile,
+} from "../src/instance.ts";
 import {
     LAUNCHER_DEFAULT_HOST,
     isLaunchClient,
@@ -79,6 +84,16 @@ import {
     type HttpRewrite,
 } from "../src/launcher.ts";
 import { _setForTest as registrySetForTest, _resetForTest as registryResetForTest } from "../src/registry.ts";
+
+// ensureProxyRunning coordinates across processes via <state>/proxy-starting (#707)
+// — point the state dir at a throwaway so these tests never touch the real one.
+const prevXdgState = process.env.XDG_STATE_HOME;
+process.env.XDG_STATE_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "bili-launcher-state-"));
+after(() => {
+    removeStartingMarker();
+    if (prevXdgState === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = prevXdgState;
+});
 
 test("isLaunchClient: pi/claude/codex/omp/opencode/pi-test true, others false", () => {
     assert.equal(isLaunchClient("pi"), true);
@@ -954,6 +969,196 @@ test("ensureProxyRunning: dead recorded pid is ignored (no attach)", async () =>
         },
     );
     assert.equal(spawnCalls, 1);
+});
+
+test("ensureProxyRunning: active starting marker → waits, then attaches instead of spawning (#707)", async () => {
+    try {
+        claimStartingMarker({ token: "starter-a", pid: process.pid, host: "127.0.0.1", port: 8788, startedAt: Date.now() });
+        let reads = 0;
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
+            {
+                spawnImpl: () => {
+                    throw new Error("double-spawn: another launch was still bringing its proxy up");
+                },
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-9" }),
+                readInstanceFile: () => (reads++ < 2 ? undefined : recordedInstance({ instanceId: "inst-9", origin: "http://127.0.0.1:8788", port: 8788 })),
+                sleep: () => Promise.resolve(),
+            },
+        );
+        assert.equal(handle.attached, true);
+        assert.equal(handle.origin, "http://127.0.0.1:8788");
+    } finally {
+        removeStartingMarker();
+    }
+});
+
+test("ensureProxyRunning: stale starting marker (dead owner) → removed, then spawns (#707)", async () => {
+    try {
+        claimStartingMarker({ token: "starter-b", pid: 99999999, host: "127.0.0.1", port: 8789, startedAt: Date.now() });
+        let spawnCalls = 0;
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
+            {
+                spawnImpl: () => {
+                    spawnCalls++;
+                    return makeFakeChild(42451);
+                },
+                fetchImpl: async () => ({ ok: true }),
+                readInstanceFile: () => undefined,
+                sleep: () => Promise.resolve(),
+            },
+        );
+        assert.equal(spawnCalls, 1);
+        assert.ok(handle.child);
+        assert.equal(readStartingMarker(), undefined);
+    } finally {
+        removeStartingMarker();
+    }
+});
+
+test("ensureProxyRunning: expired starting marker (hung owner) → spawns (#707)", async () => {
+    try {
+        claimStartingMarker({ token: "starter-c", pid: process.pid, host: "127.0.0.1", port: 8789, startedAt: Date.now() - 55_000 });
+        let spawnCalls = 0;
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
+            {
+                spawnImpl: () => {
+                    spawnCalls++;
+                    return makeFakeChild(42452);
+                },
+                fetchImpl: async () => ({ ok: true }),
+                readInstanceFile: () => undefined,
+                sleep: () => Promise.resolve(),
+            },
+        );
+        assert.equal(spawnCalls, 1);
+        assert.ok(handle.child);
+        assert.equal(readStartingMarker(), undefined);
+    } finally {
+        removeStartingMarker();
+    }
+});
+
+test("ensureProxyRunning: waiter bails early when the starter clears its marker (#707)", async () => {
+    try {
+        claimStartingMarker({ token: "starter-d", pid: process.pid, host: "127.0.0.1", port: 8790, startedAt: Date.now() });
+        let sleeps = 0;
+        let spawnCalls = 0;
+        const t0 = Date.now();
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
+            {
+                spawnImpl: () => {
+                    spawnCalls++;
+                    return makeFakeChild(42453);
+                },
+                fetchImpl: async () => ({ ok: true }),
+                readInstanceFile: () => undefined,
+                sleep: () => {
+                    if (++sleeps === 1) removeStartingMarker();
+                    return Promise.resolve();
+                },
+            },
+        );
+        assert.equal(spawnCalls, 1);
+        assert.ok(handle.child);
+        assert.ok(Date.now() - t0 < 2000, `early bail took ${Date.now() - t0}ms; must not burn the full wait window`);
+    } finally {
+        removeStartingMarker();
+    }
+});
+
+test("ensureProxyRunning: starter claims marker before spawning and clears it when done (#707)", async () => {
+    try {
+        let childToken = "";
+        let markerTokenAtSpawn: string | undefined;
+        const spawnImpl: SpawnFn = (_cmd, _args, options) => {
+            childToken = (options.env?.BILI_LAUNCH_TOKEN as string) ?? "";
+            markerTokenAtSpawn = readStartingMarker()?.token;
+            return makeFakeChild(42454);
+        };
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
+            {
+                spawnImpl,
+                fetchImpl: async () => ({ ok: true }),
+                readInstanceFile: () => (childToken ? recordedInstance({ launchToken: childToken }) : undefined),
+                sleep: () => new Promise((r) => setTimeout(r, 0)),
+            },
+        );
+        assert.ok(childToken.length > 0);
+        assert.equal(markerTokenAtSpawn, childToken);
+        assert.ok(handle.child);
+        assert.equal(readStartingMarker(), undefined);
+    } finally {
+        removeStartingMarker();
+    }
+});
+
+test("ensureProxyRunning: starter clears marker when the child exits pre-bind (#707)", async () => {
+    try {
+        const child: SpawnChild = {
+            pid: 42455,
+            unref() {},
+            kill() {
+                return true;
+            },
+            on(event, listener) {
+                if (event === "exit") setImmediate(() => listener(1, null));
+                return undefined;
+            },
+        };
+        await assert.rejects(
+            ensureProxyRunning(
+                { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
+                {
+                    spawnImpl: () => child,
+                    fetchImpl: async () => ({ ok: false }),
+                    fetchHealthInfo: async () => undefined,
+                    readInstanceFile: () => undefined,
+                    sleep: () => new Promise((r) => setTimeout(r, 1)),
+                },
+            ),
+            /exited before becoming healthy/,
+        );
+        assert.equal(readStartingMarker(), undefined);
+    } finally {
+        removeStartingMarker();
+    }
+});
+
+test("ensureProxyRunning: incompatible bring-up (modelWindows) is not attached — spawns anyway (#707)", async () => {
+    try {
+        claimStartingMarker({ token: "starter-g", pid: process.pid, host: "127.0.0.1", port: 8791, startedAt: Date.now() });
+        let spawnCalls = 0;
+        let ticks = 0;
+        await assert.rejects(
+            ensureProxyRunning(
+                { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, modelWindows: { m1: 100000 } },
+                {
+                    spawnImpl: () => {
+                        spawnCalls++;
+                        return makeFakeChild(42456);
+                    },
+                    fetchImpl: async () => ({ ok: false }),
+                    fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1" }),
+                    readInstanceFile: () => recordedInstance(),
+                    now: () => ticks * 1000,
+                    sleep: () => {
+                        ticks += 10;
+                        return Promise.resolve();
+                    },
+                },
+            ),
+            /did not become healthy/,
+        );
+        assert.equal(spawnCalls, 1);
+    } finally {
+        removeStartingMarker();
+    }
 });
 
 test("ensureProxyRunning: port 0 (no explicit --port) spawns on an OS-assigned ephemeral port (#446)", async () => {
