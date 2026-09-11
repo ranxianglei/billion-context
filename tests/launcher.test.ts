@@ -10,6 +10,7 @@ import {
     claimStartingMarker,
     readStartingMarker,
     removeStartingMarker,
+    startingMarkerPath,
     type ProxyInstanceFile as InstanceFile,
 } from "../src/instance.ts";
 import {
@@ -1156,6 +1157,97 @@ test("ensureProxyRunning: incompatible bring-up (modelWindows) is not attached �
             /did not become healthy/,
         );
         assert.equal(spawnCalls, 1);
+    } finally {
+        removeStartingMarker();
+    }
+});
+
+test("ensureProxyRunning: unreadable starting marker is self-healed — removed, slot re-claimed (#707)", async () => {
+    try {
+        fs.writeFileSync(startingMarkerPath(), "{{{garbage");
+        let spawnCalls = 0;
+        let childToken = "";
+        let markerTokenAtSpawn: string | undefined;
+        const spawnImpl: SpawnFn = (_cmd, _args, options) => {
+            spawnCalls++;
+            childToken = (options.env?.BILI_LAUNCH_TOKEN as string) ?? "";
+            markerTokenAtSpawn = readStartingMarker()?.token;
+            return makeFakeChild(42460);
+        };
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
+            {
+                spawnImpl,
+                fetchImpl: async () => ({ ok: true }),
+                readInstanceFile: () => (childToken ? recordedInstance({ launchToken: childToken }) : undefined),
+                sleep: () => new Promise((r) => setTimeout(r, 0)),
+            },
+        );
+        assert.equal(spawnCalls, 1);
+        assert.ok(handle.child);
+        assert.equal(markerTokenAtSpawn, childToken, "re-claim after garbage removal carries our token");
+        assert.equal(readStartingMarker(), undefined, "marker cleared after success");
+    } finally {
+        removeStartingMarker();
+    }
+});
+
+test("ensureProxyRunning: instance appearing at the wait deadline is attached, not double-spawned (#707)", async () => {
+    try {
+        claimStartingMarker({ token: "starter-h", pid: process.pid, host: "127.0.0.1", port: 8792, startedAt: Date.now() });
+        let ticks = 0;
+        let reads = 0;
+        const handle = await ensureProxyRunning(
+            { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
+            {
+                spawnImpl: () => {
+                    throw new Error("double-spawn: instance appeared at the deadline");
+                },
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-b" }),
+                readInstanceFile: () =>
+                    reads++ < 3 ? undefined : recordedInstance({ instanceId: "inst-b", origin: "http://127.0.0.1:8792", port: 8792 }),
+                now: () => ticks * 1000,
+                sleep: () => {
+                    ticks += 10;
+                    return Promise.resolve();
+                },
+            },
+        );
+        assert.equal(handle.attached, true);
+        assert.equal(handle.origin, "http://127.0.0.1:8792");
+    } finally {
+        removeStartingMarker();
+    }
+});
+
+test("ensureProxyRunning: hung starter (marker never clears) is bounded — waits max twice, then spawns (#707)", async () => {
+    try {
+        claimStartingMarker({ token: "starter-j", pid: process.pid, host: "127.0.0.1", port: 8793, startedAt: Date.now() });
+        let spawnCalls = 0;
+        let ticks = 0;
+        await assert.rejects(
+            ensureProxyRunning(
+                { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
+                {
+                    spawnImpl: () => {
+                        spawnCalls++;
+                        return makeFakeChild(42461);
+                    },
+                    fetchImpl: async () => ({ ok: false }),
+                    fetchHealthInfo: async () => undefined,
+                    readInstanceFile: () => undefined,
+                    now: () => ticks * 1000,
+                    sleep: () => {
+                        ticks += 10;
+                        return Promise.resolve();
+                    },
+                },
+            ),
+            /did not become healthy/,
+        );
+        assert.equal(spawnCalls, 1, "bounded waits end in a spawn attempt, never an infinite loop");
+        assert.equal(readStartingMarker()?.token, "starter-j", "foreign marker left untouched");
     } finally {
         removeStartingMarker();
     }

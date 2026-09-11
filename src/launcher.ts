@@ -1673,6 +1673,30 @@ async function probeExistingInstance(
     return inst;
 }
 
+/** #707: wait for another launcher's in-flight bring-up to produce a live
+ *  instance. Bounded by SPAWN_WAIT_MS; breaks early when the starting marker
+ *  disappears (starter gave up / crashed). The final probe closes the
+ *  deadline-boundary sliver: the starter's own poll window ends ~now, and its
+ *  success path clears the marker — indistinguishable from a failure bail
+ *  without one last look. */
+async function waitForStarterInstance(
+    readInstance: () => ProxyInstanceFile | { origin: string } | undefined,
+    fetchHealthInfo: (origin: string) => Promise<HealthInfo | undefined>,
+    now: () => number,
+    sleepImpl: (ms: number) => Promise<void>,
+): Promise<ProxyInstanceFile | undefined> {
+    const deadline = now() + SPAWN_WAIT_MS;
+    let inst: ProxyInstanceFile | undefined;
+    while (now() < deadline) {
+        await sleepImpl(HEALTH_POLL_INTERVAL_MS);
+        inst = await probeExistingInstance(readInstance, fetchHealthInfo);
+        if (inst) break;
+        const still = readStartingMarker();
+        if (!still || !isStartingMarkerActive(still, now())) break;
+    }
+    return inst ?? (await probeExistingInstance(readInstance, fetchHealthInfo));
+}
+
 export function findFreePort(preferred: number, host = LAUNCHER_DEFAULT_HOST): Promise<number> {
     const tryBind = (port: number): Promise<boolean> =>
         new Promise((resolve) => {
@@ -1760,27 +1784,24 @@ export async function ensureProxyRunning(
     // the attach above saw nothing). Wait for ITS instance instead of spawning
     // a second writer over the same sessions dir. In-process dedup is separate
     // (singleFlight, #706); this is the cross-process half.
+    const waitForOtherStarter = async (): Promise<ProxyHandle | undefined> => {
+        console.error("bili: another bili launch is bringing up a proxy — waiting for it instead of spawning a second");
+        const waited = await waitForStarterInstance(readInstance, fetchHealthInfo, now, sleepImpl);
+        if (waited && instanceCompatible(waited, opts)) {
+            console.error(`bili: attaching to running proxy at ${waited.origin} (pid ${waited.pid})`);
+            return { origin: waited.origin, port: waited.port, attached: true };
+        }
+        // starter failed/timed out (or incompatible config) — caller falls
+        // through and spawns itself, as before
+        return undefined;
+    };
     const marker = readStartingMarker();
     if (marker) {
         if (!isStartingMarkerActive(marker, now())) {
             removeStartingMarker();
         } else {
-            console.error("bili: another bili launch is bringing up a proxy — waiting for it instead of spawning a second");
-            const waitedDeadline = now() + SPAWN_WAIT_MS;
-            let waited: ProxyInstanceFile | undefined;
-            while (now() < waitedDeadline) {
-                await sleepImpl(HEALTH_POLL_INTERVAL_MS);
-                waited = await probeExistingInstance(readInstance, fetchHealthInfo);
-                if (waited) break;
-                const still = readStartingMarker();
-                if (!still || !isStartingMarkerActive(still, now())) break;
-            }
-            if (waited && instanceCompatible(waited, opts)) {
-                console.error(`bili: attaching to running proxy at ${waited.origin} (pid ${waited.pid})`);
-                return { origin: waited.origin, port: waited.port, attached: true };
-            }
-            // starter failed/timed out (or incompatible config) — fall through
-            // and spawn ourselves, as before
+            const attached = await waitForOtherStarter();
+            if (attached) return attached;
         }
     }
 
@@ -1798,10 +1819,31 @@ export async function ensureProxyRunning(
     const logPath = path.join(os.tmpdir(), `bili-proxy-${port}.log`);
     const logFd = fs.openSync(logPath, "a");
     // #707: publish the starting marker BEFORE spawning so concurrent launches
-    // wait for this bring-up instead of double-spawning. Cleared on every
-    // terminal path below; a hard crash leaves a stale marker that the
-    // dead-owner/TTL check treats as inert.
-    claimStartingMarker({ token: launchToken, pid: process.pid, host: opts.host, port, startedAt: now() });
+    // wait for this bring-up instead of double-spawning. The O_EXCL claim is
+    // the cross-process arbiter: the read above is only a fast path, so a
+    // loser of the claim must re-check and wait instead of spawning blindly.
+    // Cleared on every terminal path below; a hard crash leaves a stale marker
+    // that the dead-owner/TTL check treats as inert.
+    const claimMarker = (): boolean =>
+        claimStartingMarker({ token: launchToken, pid: process.pid, host: opts.host, port, startedAt: now() });
+    let claimed = claimMarker();
+    if (!claimed) {
+        const holder = readStartingMarker();
+        if (holder && isStartingMarkerActive(holder, now())) {
+            // Lost the read→claim race to a live starter — honor its bring-up.
+            const attached = await waitForOtherStarter();
+            if (attached) return attached;
+            claimed = claimMarker();
+        } else {
+            // Stale or unreadable (crash mid-write): safe to remove — while any
+            // marker file exists, O_EXCL bars a newer claimant, so we cannot
+            // clobber a live coordinator. Retry once to take the slot.
+            removeStartingMarker();
+            claimed = claimMarker();
+        }
+        // Still unclaimed (unwritable state dir, or lost the retry race):
+        // degrade to pre-#707 behavior — spawn without coordinating.
+    }
     try {
         let child: SpawnChild;
         try {
@@ -1873,7 +1915,7 @@ export async function ensureProxyRunning(
         }
         throw new Error(`bili: proxy did not become healthy within ${SPAWN_WAIT_MS}ms (log: ${logPath})`);
     } finally {
-        clearStartingMarker(launchToken);
+        if (claimed) clearStartingMarker(launchToken);
     }
 }
 
