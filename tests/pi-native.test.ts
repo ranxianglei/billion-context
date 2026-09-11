@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { shouldBootstrapNative, nativeProxyScriptPath, singleFlight } from "../src/agent/pi-native.ts";
 import { ensureProxyRunning, type SpawnChild, type SpawnFn } from "../src/launcher.ts";
 
@@ -20,8 +21,12 @@ test("shouldBootstrapNative: false when a bili launch already owns a proxy", () 
 });
 
 test("nativeProxyScriptPath: dist/agent/pi-native.js resolves to the package bin", () => {
-    const resolved = nativeProxyScriptPath("file:///opt/pkg/dist/agent/pi-native.js");
-    assert.equal(resolved, path.resolve("/opt/pkg/dist/index.js"));
+    // Build the from-URL from a platform-native absolute path: a hardcoded
+    // file:///opt/... URL is invalid on Windows (no drive letter —
+    // fileURLToPath throws ERR_INVALID_FILE_URL_PATH).
+    const agentFile = path.resolve(path.sep, "opt", "pkg", "dist", "agent", "pi-native.js");
+    const resolved = nativeProxyScriptPath(pathToFileURL(agentFile).href);
+    assert.equal(resolved, path.resolve(path.sep, "opt", "pkg", "dist", "index.js"));
 });
 
 function makeFakeChild(pid: number): SpawnChild {
