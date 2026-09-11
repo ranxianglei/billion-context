@@ -3,7 +3,7 @@ import { handleAcpStatus } from "./acp-status.js";
 import { type Session, cacheBlockContent } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME } from "./compress-tool.js";
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "./absorb.js";
-import { resolveDecompress } from "./decompress-shared.js";
+import { executeSearchContext, resolveDecompress } from "./decompress-shared.js";
 import { containsRenderTagText, stripAcpTags } from "./loop/tag-echo-filter.js";
 import { maxShrinkPerCompress } from "./fetch-util.js";
 
@@ -32,17 +32,7 @@ function executeAnthropicProxyTool(toolName: string, args: Record<string, unknow
         return resolveDecompress(args, ctx);
     }
     if (toolName === "search_context") {
-        const query = typeof args.query === "string" ? args.query : "";
-        if (query.length === 0) return "[search_context FAILED: query is required]";
-        const limit = typeof args.limit === "number" && args.limit > 0 ? Math.floor(args.limit) : 5;
-        const blocks = ctx.core.search(query, ctx.session.state).slice(0, limit);
-        if (blocks.length === 0) return `[No blocks matched "${query}"]`;
-        const lines = blocks.map((b) => {
-            const topic = b.topic ?? "(no topic)";
-            const preview = b.summary.length > 200 ? b.summary.slice(0, 200) + "..." : b.summary;
-            return `${b.blockId} (T${b.tier}) "${topic}"\n  ${preview}`;
-        });
-        return `Found ${blocks.length} block(s) for "${query}":\n\n${lines.join("\n\n")}`;
+        return executeSearchContext(args, ctx.core, ctx.session.state);
     }
     if (toolName === "acp_status") {
         return handleAcpStatus(args, ctx);

@@ -117,6 +117,35 @@ test("loop #2: search_context-only round → marker surfaced + re-request", asyn
     }
 });
 
+// #714: search_context before any compress used to surface "No blocks matched"
+// with a ❌ failure icon, driving premature-search retry loops. Zero active
+// blocks must render as a non-failure empty-state message instead.
+test("loop #714: search_context with zero blocks → empty-state marker, NOT ❌", async () => {
+    const round1 = [
+        sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
+        fcEvents(0, "call_search", "search_context", JSON.stringify({ query: "anything" })),
+        COMPLETED,
+    ].join("");
+    const round2 = COMPLETED;
+    let fetchCalls = 0;
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async () => { fetchCalls++; return new Response(round2, { status: 200 }); }) as typeof fetch;
+    try {
+        const out = await drain(
+            new Response(round1, { status: 200 }).body!,
+            makeCtx(),
+            { model: "gpt-4o", input: [], stream: true },
+            { url: "http://mock", headers: {} },
+        );
+        assert.ok(out.includes("No compressed blocks exist yet"), "empty-state message surfaced");
+        assert.ok(out.includes("🔍"), "search icon, not failure");
+        assert.ok(!out.includes("❌"), "NOT rendered as a failure");
+        assert.equal(fetchCalls, 1, "re-request so model can continue");
+    } finally {
+        globalThis.fetch = orig;
+    }
+});
+
 test("loop #8: real-tool passthrough → emitted to client, loop ends (no re-request)", async () => {
     const round1 = [
         sse("response.created", { response: { id: "resp_1", status: "in_progress" } }),
