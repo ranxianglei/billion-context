@@ -1,6 +1,6 @@
 {
   "name": "billion-context",
-  "version": "0.1.105",
+  "version": "0.1.106",
   "description": "Context-compression proxy that lets AI coding agents run for days — billions of tokens through one context window. Sits between any agent (Claude Code, Codex, Cursor, Aider, …) and its model API, folding consumed conversation into reversible, prefix-cache-friendly summaries. Zero per-agent code: just point your base URL at the proxy.",
   "type": "module",
   "main": "dist/index.js",
