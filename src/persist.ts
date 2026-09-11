@@ -278,9 +278,10 @@ export class SessionStore {
      * every .json under the sessions dir lacking the BILIENC1 magic is
      * re-encoded in place — temp write + rename onto the SAME path, so the
      * atomic replace IS the old-file deletion (no window where both, or
-     * neither, copy exists). A crash mid-run leaves each file either old or
-     * new; the next boot finishes the job. Self-terminating: the 8-byte
-     * magic peek decides per file, so later boots cost O(files × 8 bytes). */
+     *  neither, copy exists). A crash mid-run leaves each file either old or
+     *  new; the next boot finishes the job and sweeps the crashed run's
+     *  orphaned temps. Self-terminating: the 8-byte magic peek decides per
+     *  file, so later boots cost O(files × 8 bytes). */
     private async migrateLegacyFiles(): Promise<void> {
         if (!this.codec) return;
         let files: string[];
@@ -292,6 +293,10 @@ export class SessionStore {
         let migrated = 0;
         let failed = 0;
         for (const file of files) {
+            if (STALE_ENC_TEMP_RE.test(path.basename(file))) {
+                await rm(file, { force: true }).catch(() => {});
+                continue;
+            }
             let head: Buffer;
             try {
                 head = await readFileHead(file);
@@ -665,6 +670,12 @@ function persistEnabled(): boolean {
     return true;
 }
 
+/** Temp name used by migrateLegacyFiles: `<file>.tmp-enc-<pid>-<ts>`. A
+ *  process death between write and rename orphans it; any such name present
+ *  at boot is stale by definition (the walk runs before this boot writes
+ *  anything) and gets swept. */
+const STALE_ENC_TEMP_RE = /\.tmp-enc-\d+-\d+$/;
+
 async function walkJsonFiles(dir: string): Promise<string[]> {
     const entries = await readdir(dir, { withFileTypes: true });
     const out: string[] = [];
@@ -672,7 +683,7 @@ async function walkJsonFiles(dir: string): Promise<string[]> {
         const full = path.join(dir, e.name);
         if (e.isDirectory()) {
             out.push(...(await walkJsonFiles(full)));
-        } else if (e.isFile() && e.name.endsWith(".json") && !e.name.startsWith(".tmp-")) {
+        } else if (e.isFile() && (STALE_ENC_TEMP_RE.test(e.name) || (e.name.endsWith(".json") && !e.name.startsWith(".tmp-")))) {
             out.push(full);
         }
     }

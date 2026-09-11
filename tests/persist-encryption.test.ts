@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
 import { createHash, randomBytes } from "node:crypto";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { SessionStore } from "../src/persist.ts";
 import { createSessionCodec, ENCRYPT_MAGIC, parseEncryptionKey } from "../src/encrypt.ts";
@@ -160,6 +160,29 @@ await withTempDir("migration covers spill-style .fb.json files and leaves corrup
         assert.ok(readFileSync(spill).subarray(0, ENCRYPT_MAGIC.length).equals(ENCRYPT_MAGIC), "spill file re-encoded");
         assert.equal(readFileSync(corrupt, "utf8"), "%%% not json %%%", "unreadable file left in place");
         assert.ok(h.logs.some((l) => l.level === "warn" && l.msg.includes("leaving unreadable file in place")));
+    } finally {
+        store.cancelAll();
+    }
+});
+
+await withTempDir("boot sweeps orphaned .tmp-enc-* temps left by a crashed migration", async (h) => {
+    const legacy = newStore(h);
+    await legacy.writeNow(makeSession("s-crash"));
+    legacy.cancelAll();
+
+    // Simulate a process death between the temp write and the rename: a
+    // stale temp sits next to an unencoded legacy file.
+    const file = join(h.dir, "openai", "upstream_" + createHash("sha256").update("s-crash", "utf8").digest("hex").slice(0, 24) + ".json");
+    const orphan = `${file}.tmp-enc-99999-1700000000000`;
+    writeFileSync(orphan, "stale temp from a crashed migration");
+
+    process.env.BILI_ENCRYPTION_KEY = KEY;
+    const store = newStore(h);
+    try {
+        const loaded = await store.boot();
+        assert.equal(loaded.size, 1, "legacy session loads after migration");
+        assert.ok(readFileSync(file).subarray(0, ENCRYPT_MAGIC.length).equals(ENCRYPT_MAGIC), "file re-encoded in place");
+        assert.equal(existsSync(orphan), false, "orphaned temp swept on next boot");
     } finally {
         store.cancelAll();
     }
