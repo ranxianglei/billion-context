@@ -15,7 +15,8 @@
     "typecheck": "tsc --noEmit --project tsconfig.build.json",
     "test": "node --import tsx --test tests/*.test.ts",
     "start": "node dist/index.js",
-    "test:e2e": "node --import tsx --test tests/e2e/e2e-codex.test.ts"
+    "test:e2e": "node --import tsx --test tests/e2e/e2e-codex.test.ts",
+    "test:e2e:fake": "node --import tsx --test tests/e2e/e2e-codex-fake.test.ts"
   },
   "keywords": [
     "context",
