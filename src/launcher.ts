@@ -33,7 +33,17 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { spawn, type StdioOptions } from "node:child_process";
 import { DEFAULT_MITM_DOMAINS } from "./mitm.js";
-import { isProxyInstanceFile, isPidAlive, readProxyInstanceFile, type ProxyInstanceFile } from "./instance.js";
+import {
+    claimStartingMarker,
+    clearStartingMarker,
+    isPidAlive,
+    isProxyInstanceFile,
+    readProxyInstanceFile,
+    readStartingMarker,
+    removeStartingMarker,
+    type ProxyInstanceFile,
+    type ProxyStartingMarker,
+} from "./instance.js";
 import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom } from "./plugin-install.js";
 
 /** Absolute path of a file inside our dist/, resolved via the package root
@@ -104,6 +114,10 @@ const HEALTH_PATH = "/__bili/health";
 const HEALTH_POLL_INTERVAL_MS = 200;
 const SPAWN_WAIT_MS = 20000;
 const PROBE_TIMEOUT_MS = 1500;
+// #707: max age of a starting marker still treated as an in-progress bring-up.
+// A well-behaved starter resolves within SPAWN_WAIT_MS; the slack covers slow
+// disks and client teardown before it clears the marker.
+const STARTING_MARKER_TTL_MS = SPAWN_WAIT_MS + 30_000;
 
 const DEFAULT_MITM_DOMAIN_SET = new Set(DEFAULT_MITM_DOMAINS.map((d) => d.toLowerCase()));
 
@@ -1630,6 +1644,12 @@ async function fetchHealthInfoDefault(origin: string): Promise<HealthInfo | unde
     }
 }
 
+/** #707: the marker's owner must still be plausibly mid-bring-up — alive AND
+ *  young. A crashed starter leaves a dead-owner marker; a hung one ages out. */
+function isStartingMarkerActive(marker: ProxyStartingMarker, nowMs: number): boolean {
+    return isPidAlive(marker.pid) && nowMs - marker.startedAt < STARTING_MARKER_TTL_MS;
+}
+
 function instanceCompatible(inst: ProxyInstanceFile, opts: LaunchOptions): boolean {
     if (inst.host !== opts.host || inst.passthrough !== opts.passthrough) return false;
     const wantDomains = opts.mitmDomains ?? [];
@@ -1651,6 +1671,30 @@ async function probeExistingInstance(
     if (!health || !health.ok) return undefined;
     if (health.instanceId !== undefined && health.instanceId !== inst.instanceId) return undefined;
     return inst;
+}
+
+/** #707: wait for another launcher's in-flight bring-up to produce a live
+ *  instance. Bounded by SPAWN_WAIT_MS; breaks early when the starting marker
+ *  disappears (starter gave up / crashed). The final probe closes the
+ *  deadline-boundary sliver: the starter's own poll window ends ~now, and its
+ *  success path clears the marker — indistinguishable from a failure bail
+ *  without one last look. */
+async function waitForStarterInstance(
+    readInstance: () => ProxyInstanceFile | { origin: string } | undefined,
+    fetchHealthInfo: (origin: string) => Promise<HealthInfo | undefined>,
+    now: () => number,
+    sleepImpl: (ms: number) => Promise<void>,
+): Promise<ProxyInstanceFile | undefined> {
+    const deadline = now() + SPAWN_WAIT_MS;
+    let inst: ProxyInstanceFile | undefined;
+    while (now() < deadline) {
+        await sleepImpl(HEALTH_POLL_INTERVAL_MS);
+        inst = await probeExistingInstance(readInstance, fetchHealthInfo);
+        if (inst) break;
+        const still = readStartingMarker();
+        if (!still || !isStartingMarkerActive(still, now())) break;
+    }
+    return inst ?? (await probeExistingInstance(readInstance, fetchHealthInfo));
 }
 
 export function findFreePort(preferred: number, host = LAUNCHER_DEFAULT_HOST): Promise<number> {
@@ -1735,6 +1779,32 @@ export async function ensureProxyRunning(
         return { origin: existing.origin, port: existing.port, attached: true };
     }
 
+    // #707: cross-process startup window — another launcher may be mid-bring-up
+    // right now (its child hasn't bound yet, so no instance record exists and
+    // the attach above saw nothing). Wait for ITS instance instead of spawning
+    // a second writer over the same sessions dir. In-process dedup is separate
+    // (singleFlight, #706); this is the cross-process half.
+    const waitForOtherStarter = async (): Promise<ProxyHandle | undefined> => {
+        console.error("bili: another bili launch is bringing up a proxy — waiting for it instead of spawning a second");
+        const waited = await waitForStarterInstance(readInstance, fetchHealthInfo, now, sleepImpl);
+        if (waited && instanceCompatible(waited, opts)) {
+            console.error(`bili: attaching to running proxy at ${waited.origin} (pid ${waited.pid})`);
+            return { origin: waited.origin, port: waited.port, attached: true };
+        }
+        // starter failed/timed out (or incompatible config) — caller falls
+        // through and spawns itself, as before
+        return undefined;
+    };
+    const marker = readStartingMarker();
+    if (marker) {
+        if (!isStartingMarkerActive(marker, now())) {
+            removeStartingMarker();
+        } else {
+            const attached = await waitForOtherStarter();
+            if (attached) return attached;
+        }
+    }
+
     // #407: no probe-release-rebind. The child binds the preferred port
     // itself and retries on EADDRINUSE, reporting the real origin through
     // the instance file via this launchToken.
@@ -1748,75 +1818,105 @@ export async function ensureProxyRunning(
     if (!script) throw new Error("bili: cannot resolve launcher script path");
     const logPath = path.join(os.tmpdir(), `bili-proxy-${port}.log`);
     const logFd = fs.openSync(logPath, "a");
-    let child: SpawnChild;
+    // #707: publish the starting marker BEFORE spawning so concurrent launches
+    // wait for this bring-up instead of double-spawning. The O_EXCL claim is
+    // the cross-process arbiter: the read above is only a fast path, so a
+    // loser of the claim must re-check and wait instead of spawning blindly.
+    // Cleared on every terminal path below; a hard crash leaves a stale marker
+    // that the dead-owner/TTL check treats as inert.
+    const claimMarker = (): boolean =>
+        claimStartingMarker({ token: launchToken, pid: process.pid, host: opts.host, port, startedAt: now() });
+    let claimed = claimMarker();
+    if (!claimed) {
+        const holder = readStartingMarker();
+        if (holder && isStartingMarkerActive(holder, now())) {
+            // Lost the read→claim race to a live starter — honor its bring-up.
+            const attached = await waitForOtherStarter();
+            if (attached) return attached;
+            claimed = claimMarker();
+        } else {
+            // Stale or unreadable (crash mid-write): safe to remove — while any
+            // marker file exists, O_EXCL bars a newer claimant, so we cannot
+            // clobber a live coordinator. Retry once to take the slot.
+            removeStartingMarker();
+            claimed = claimMarker();
+        }
+        // Still unclaimed (unwritable state dir, or lost the retry race):
+        // degrade to pre-#707 behavior — spawn without coordinating.
+    }
     try {
-        child = spawnImpl(
-            process.execPath,
-            [script, ...proxyStartArgs({ ...opts, port })],
-            {
-                detached: true,
-                stdio: ["ignore", logFd, logFd],
-                env: {
-                    ...stripInheritedProxy(process.env),
-                    BILI_LAUNCH_TOKEN: launchToken,
-                    BILI_PARENT_PID: String(process.pid),
-                    ...(opts.mitmDomains && opts.mitmDomains.length
-                        ? { BILI_MITM_DOMAINS: opts.mitmDomains.join(",") }
-                        : {}),
-                    ...(opts.modelWindows && Object.keys(opts.modelWindows).length > 0
-                        ? { BILI_LAUNCHER_MODEL_WINDOWS: JSON.stringify(opts.modelWindows) }
-                        : {}),
-                },
-            },
-        );
-    } finally {
+        let child: SpawnChild;
         try {
-            fs.closeSync(logFd);
+            child = spawnImpl(
+                process.execPath,
+                [script, ...proxyStartArgs({ ...opts, port })],
+                {
+                    detached: true,
+                    stdio: ["ignore", logFd, logFd],
+                    env: {
+                        ...stripInheritedProxy(process.env),
+                        BILI_LAUNCH_TOKEN: launchToken,
+                        BILI_PARENT_PID: String(process.pid),
+                        ...(opts.mitmDomains && opts.mitmDomains.length
+                            ? { BILI_MITM_DOMAINS: opts.mitmDomains.join(",") }
+                            : {}),
+                        ...(opts.modelWindows && Object.keys(opts.modelWindows).length > 0
+                            ? { BILI_LAUNCHER_MODEL_WINDOWS: JSON.stringify(opts.modelWindows) }
+                            : {}),
+                    },
+                },
+            );
+        } finally {
+            try {
+                fs.closeSync(logFd);
+            } catch {}
+        }
+        try {
+            child.unref?.();
         } catch {}
-    }
-    try {
-        child.unref?.();
-    } catch {}
 
-    // #401/#480: fail fast when OUR spawned child dies before becoming
-    // healthy — otherwise a startup crash (bad config, missing upstream, …)
-    // burns the whole SPAWN_WAIT_MS poll window before erroring.
-    let childExit: { code: number | null; signal: string | null } | undefined;
-    child.on?.("exit", (...rest: unknown[]) => {
-        childExit = {
-            code: typeof rest[0] === "number" ? rest[0] : null,
-            signal: typeof rest[1] === "string" ? rest[1] : null,
-        };
-    });
+        // #401/#480: fail fast when OUR spawned child dies before becoming
+        // healthy — otherwise a startup crash (bad config, missing upstream, …)
+        // burns the whole SPAWN_WAIT_MS poll window before erroring.
+        let childExit: { code: number | null; signal: string | null } | undefined;
+        child.on?.("exit", (...rest: unknown[]) => {
+            childExit = {
+                code: typeof rest[0] === "number" ? rest[0] : null,
+                signal: typeof rest[1] === "string" ? rest[1] : null,
+            };
+        });
 
-    const deadline = now() + SPAWN_WAIT_MS;
-    while (now() < deadline) {
-        if (childExit) break;
-        await sleepImpl(HEALTH_POLL_INTERVAL_MS);
-        const inst = readInstance();
-        if (isProxyInstanceFile(inst) && inst.launchToken === launchToken) {
-            if (await probeHealth(inst.origin, fetchImpl)) {
-                return { origin: inst.origin, port: inst.port, child, logPath };
+        const deadline = now() + SPAWN_WAIT_MS;
+        while (now() < deadline) {
+            if (childExit) break;
+            await sleepImpl(HEALTH_POLL_INTERVAL_MS);
+            const inst = readInstance();
+            if (isProxyInstanceFile(inst) && inst.launchToken === launchToken) {
+                if (await probeHealth(inst.origin, fetchImpl)) {
+                    return { origin: inst.origin, port: inst.port, child, logPath };
+                }
+                continue;
             }
-            continue;
+            // Fallback for a child that cannot write the instance file (broken
+            // state dir) or an old pre-handshake binary: only trust the preferred
+            // origin when NO record vouches for it — a LIVE record's owner owns
+            // the discovery surface and our child is retry-binding elsewhere.
+            // A stale record (dead pid / legacy plain) cannot vouch for anything.
+            const stale = !isProxyInstanceFile(inst) || !isPidAlive(inst.pid);
+            if (stale && (await probeHealth(proxyOrigin(opts.host, port), fetchImpl))) {
+                return { origin: proxyOrigin(opts.host, port), port, child, logPath };
+            }
         }
-        // Fallback for a child that cannot write the instance file (broken
-        // state dir) or an old pre-handshake binary: only trust the preferred
-        // origin when NO record vouches for it — a LIVE record's owner owns
-        // the discovery surface and our child is retry-binding elsewhere.
-        // A stale record (dead pid / legacy plain) cannot vouch for anything.
-        const stale = !isProxyInstanceFile(inst) || !isPidAlive(inst.pid);
-        if (stale && (await probeHealth(proxyOrigin(opts.host, port), fetchImpl))) {
-            return { origin: proxyOrigin(opts.host, port), port, child, logPath };
+        if (childExit) {
+            const detail = childExit.code !== null
+                ? `code ${childExit.code}`
+                : childExit.signal ? `signal ${childExit.signal}` : "unknown reason";
+            throw new Error(`bili: proxy child exited before becoming healthy (${detail}) (log: ${logPath})`);
         }
+        throw new Error(`bili: proxy did not become healthy within ${SPAWN_WAIT_MS}ms (log: ${logPath})`);
+    } finally {
+        if (claimed) clearStartingMarker(launchToken);
     }
-    if (childExit) {
-        const detail = childExit.code !== null
-            ? `code ${childExit.code}`
-            : childExit.signal ? `signal ${childExit.signal}` : "unknown reason";
-        throw new Error(`bili: proxy child exited before becoming healthy (${detail}) (log: ${logPath})`);
-    }
-    throw new Error(`bili: proxy did not become healthy within ${SPAWN_WAIT_MS}ms (log: ${logPath})`);
 }
 
 export function stopProxy(handle: ProxyHandle): void {

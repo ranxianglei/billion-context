@@ -113,6 +113,91 @@ export function clearProxyInstanceFile(instanceId: string, file?: string): void 
     }
 }
 
+/** Cross-process starting marker (#707): while a launcher sits between spawn
+ *  and healthy, no instance record exists yet, so concurrent launches see
+ *  nothing to attach to and double-spawn — two writers over one sessions dir.
+ *  The starter claims this file with O_EXCL before spawning; concurrent
+ *  callers find it and wait for the bring-up instead of spawning their own. */
+export interface ProxyStartingMarker {
+    token: string;
+    pid: number;
+    host: string;
+    port: number;
+    startedAt: number;
+}
+
+export function startingMarkerPath(): string {
+    return path.join(stateDir(), "proxy-starting");
+}
+
+export function readStartingMarker(file?: string): ProxyStartingMarker | undefined {
+    let raw: string;
+    try {
+        raw = fs.readFileSync(file ?? startingMarkerPath(), "utf8");
+    } catch {
+        return undefined;
+    }
+    try {
+        const parsed = JSON.parse(raw) as Partial<ProxyStartingMarker>;
+        if (typeof parsed.token !== "string" || parsed.token === "") return undefined;
+        if (typeof parsed.pid !== "number" || !Number.isInteger(parsed.pid) || parsed.pid <= 0) return undefined;
+        if (typeof parsed.startedAt !== "number") return undefined;
+        return {
+            token: parsed.token,
+            pid: parsed.pid,
+            host: typeof parsed.host === "string" ? parsed.host : "",
+            port: typeof parsed.port === "number" ? parsed.port : 0,
+            startedAt: parsed.startedAt,
+        };
+    } catch {
+        return undefined;
+    }
+}
+
+/** Claim the marker atomically across processes (O_EXCL create — a rename-based
+ *  write would leave the same race at the marker level). Returns false when a
+ *  claimant already holds it or the state dir is unwritable; coordination then
+ *  degrades to the pre-#707 behavior instead of failing the launch. */
+export function claimStartingMarker(marker: ProxyStartingMarker, file?: string): boolean {
+    const filePath = file ?? startingMarkerPath();
+    let descriptor: number | undefined;
+    try {
+        fs.mkdirSync(path.dirname(filePath), { recursive: true });
+        descriptor = fs.openSync(filePath, "wx", 0o644);
+        fs.writeSync(descriptor, JSON.stringify(marker) + "\n", null, "utf8");
+        fs.fsyncSync(descriptor);
+        descriptor = undefined;
+        return true;
+    } catch {
+        if (descriptor !== undefined) {
+            try {
+                fs.closeSync(descriptor);
+            } catch {}
+        }
+        return false;
+    }
+}
+
+/** Remove the marker only if it still carries OUR token (a newer claimant may
+ *  have taken it over). Mirrors clearProxyInstanceFile. */
+export function clearStartingMarker(token: string, file?: string): void {
+    const filePath = file ?? startingMarkerPath();
+    const current = readStartingMarker(filePath);
+    if (current && current.token === token) {
+        try {
+            fs.unlinkSync(filePath);
+        } catch {}
+    }
+}
+
+/** Unconditional best-effort removal — used only on markers the caller has
+ *  already verified stale (dead owner / expired). */
+export function removeStartingMarker(file?: string): void {
+    try {
+        fs.unlinkSync(file ?? startingMarkerPath());
+    } catch {}
+}
+
 /** pid liveness (kill-0). EPERM means the process exists but is owned by
  *  another user — still alive. */
 export function isPidAlive(pid: number): boolean {
