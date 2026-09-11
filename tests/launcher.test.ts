@@ -1959,6 +1959,9 @@ test("runLaunch dsh: non-loopback upstreams ride proxy envs, loopback keeps the 
         // exclusion comes from its built-in policy, not from NO_PROXY.
         assert.equal(seenEnv.HTTPS_PROXY, origin);
         assert.ok(String(seenEnv.SSL_CERT_FILE).endsWith(path.join("billion-context", "ca", "combined-ca.pem")));
+        // #710: Windows official Node ignores SSL_CERT_FILE and reads only
+        // NODE_EXTRA_CA_CERTS — both must carry the combined bundle.
+        assert.ok(String(seenEnv.NODE_EXTRA_CA_CERTS).endsWith(path.join("billion-context", "ca", "combined-ca.pem")));
         assert.equal(seenEnv.HTTP_PROXY, undefined);
         assert.equal(seenEnv.NO_PROXY, undefined);
         // Loopback sglang stays on the /bili/ rewrite path via the persistent
