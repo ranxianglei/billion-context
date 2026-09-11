@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import path from "node:path";
-import { shouldBootstrapNative, nativeProxyScriptPath } from "../src/agent/pi-native.ts";
+import { shouldBootstrapNative, nativeProxyScriptPath, singleFlight } from "../src/agent/pi-native.ts";
 import { ensureProxyRunning, type SpawnChild, type SpawnFn } from "../src/launcher.ts";
 
 test("shouldBootstrapNative: true in a bare host with no bili env", () => {
@@ -34,6 +34,22 @@ function makeFakeChild(pid: number): SpawnChild {
         on() {},
     };
 }
+
+test("singleFlight: concurrent callers share one in-flight run, then re-arm", async () => {
+    let runs = 0;
+    const start = singleFlight(async () => {
+        runs++;
+        await new Promise((r) => setTimeout(r, 20));
+        return "http://127.0.0.1:40001";
+    });
+    const [a, b, c] = await Promise.all([start(), start(), start()]);
+    assert.equal(runs, 1, "three concurrent callers → one bootstrap");
+    assert.deepEqual([a, b, c], ["http://127.0.0.1:40001", "http://127.0.0.1:40001", "http://127.0.0.1:40001"]);
+    // after settling, the next call starts fresh (a later respawn is allowed)
+    const d = await start();
+    assert.equal(runs, 2);
+    assert.equal(d, "http://127.0.0.1:40001");
+});
 
 test("ensureProxyRunning: deps.scriptPath overrides process.argv[1] for the spawned proxy (#519)", async () => {
     let spawnScriptArg = "";

@@ -287,13 +287,24 @@ test("#535: session_before_compact cancels only pi auto compaction under bili la
     }
 });
 
-test("#535: plain pi (no BILLION_CONTEXT_PROXY) → no compaction cancel handler", () => {
+test("#535/#519: no proxy at factory time → cancel inert until a proxy appears", () => {
     const prevProxy = process.env.BILLION_CONTEXT_PROXY;
     delete process.env.BILLION_CONTEXT_PROXY;
     try {
         const pi = makeFakePi();
         createBiliPlugin("pi")(pi as never);
-        assert.equal(pi.events.get("session_before_compact"), undefined, "native run stays fully native");
+        const handler = pi.events.get("session_before_compact");
+        assert.ok(handler, "handler registered; arming decided at event time");
+        assert.equal(handler({ reason: "threshold" }, undefined), undefined, "no proxy → native compaction untouched");
+        // native mode (#519): BILLION_CONTEXT_PROXY lands only AFTER the factory ran
+        process.env.BILLION_CONTEXT_PROXY = "http://127.0.0.1:8787";
+        assert.deepEqual(handler({ reason: "threshold" }, undefined), { cancel: true });
+        assert.deepEqual(handler({ reason: "overflow" }, undefined), { cancel: true });
+        assert.equal(handler({ reason: "manual" }, undefined), undefined, "manual /compact stays user-owned");
+        // /bili/ baseUrl routing (no env at all) arms the cancel too
+        delete process.env.BILLION_CONTEXT_PROXY;
+        const biliCtx = { model: { baseUrl: "http://127.0.0.1:8787/bili/https://api.example.com/v1" } };
+        assert.deepEqual(handler({ reason: "threshold" }, biliCtx), { cancel: true });
     } finally {
         if (prevProxy === undefined) delete process.env.BILLION_CONTEXT_PROXY;
         else process.env.BILLION_CONTEXT_PROXY = prevProxy;

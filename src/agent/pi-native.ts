@@ -60,11 +60,27 @@ async function bootstrap(): Promise<string | undefined> {
     }
 }
 
+/** Concurrent callers share one in-flight bootstrap — a burst of TypeErrors
+ *  (the proxy died mid-session) must not spawn one proxy per failing request:
+ *  ensureProxyRunning has no in-flight dedup of its own. */
+export function singleFlight(fn: () => Promise<string | undefined>): () => Promise<string | undefined> {
+    let inFlight: Promise<string | undefined> | undefined;
+    return (): Promise<string | undefined> => {
+        if (inFlight === undefined) {
+            inFlight = fn().finally(() => {
+                inFlight = undefined;
+            });
+        }
+        return inFlight;
+    };
+}
+
 // node:test imports this module for shouldBootstrapNative/nativeProxyScriptPath —
 // never bootstrap a real proxy from inside a test run.
 if (process.env.NODE_TEST_CONTEXT === undefined && shouldBootstrapNative(process.env)) {
-    state.respawn = bootstrap;
-    state.ready = bootstrap();
+    const start = singleFlight(bootstrap);
+    state.respawn = start;
+    state.ready = start();
     installNativeFetchIntercept(state);
 }
 
