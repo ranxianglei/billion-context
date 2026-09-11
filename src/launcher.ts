@@ -2150,25 +2150,31 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     } else if (base === "dsh") {
         // #535 phase 4: split by destination (see discoverRoutes). Non-loopback
         // upstreams ride the proxy envs — https via CONNECT + cert MITM
-        // (HTTPS_PROXY + SSL_CERT_FILE), plain-http via absolute-form forward-
-        // proxy requests (HTTP_PROXY). SSL_CERT_FILE gets the COMBINED bundle
-        // because it REPLACES dsh's trust store — system roots must survive for
-        // blind-tunneled hosts (same pattern as codex). The built-in
-        // deepseek-official route stays captured through $DEEPSEEK_BASE_URL
-        // (resolution order: settings baseURL ?? env ?? default, so a user
-        // setting wins and this env is the no-settings fallback). ONLY loopback
-        // destinations take the settings.yaml /bili/ rewrite below (persistent
-        // overlay DSH_HOME ~/.dsh-bili; real ~/.dsh never touched) — dsh
-        // bypasses proxy envs for loopback unconditionally. Proxy envs are set
-        // only when something actually routes through them, so a launch with
-        // no non-loopback custom providers behaves exactly as before.
+        // (HTTPS_PROXY + CA), plain-http via absolute-form forward-proxy
+        // requests (HTTP_PROXY). The COMBINED bundle goes to BOTH SSL_CERT_FILE
+        // (OpenSSL replace-semantics readers) and NODE_EXTRA_CA_CERTS (Node
+        // append-semantics readers): dsh is a Node program, but Windows' official
+        // Node ignores SSL_CERT_FILE and trusts only NODE_EXTRA_CA_CERTS (#710),
+        // so both must be set for the MITM CA to be trusted cross-platform. The
+        // combined bundle carries system roots, so blind-tunneled hosts still
+        // validate under either mechanism. The built-in deepseek-official route
+        // stays captured through $DEEPSEEK_BASE_URL (resolution order: settings
+        // baseURL ?? env ?? default, so a user setting wins and this env is the
+        // no-settings fallback). ONLY loopback destinations take the settings.yaml
+        // /bili/ rewrite below (persistent overlay DSH_HOME ~/.dsh-bili; real
+        // ~/.dsh never touched) — dsh bypasses proxy envs for loopback
+        // unconditionally. Proxy envs are set only when something actually routes
+        // through them, so a launch with no non-loopback custom providers behaves
+        // exactly as before.
         const usesProxyEnv = routes.httpsDomains.length > 0 || routes.httpEnvRoutes.length > 0;
         env = usesProxyEnv ? stripInheritedProxy(process.env) : { ...process.env };
         env.BILLION_CONTEXT_PROXY = origin;
         env.DEEPSEEK_BASE_URL = wrapUpstream(origin, "https://api.deepseek.com");
         if (usesProxyEnv) {
+            const caBundle = resolveCombinedCaPath(process.env);
             env.HTTPS_PROXY = origin;
-            env.SSL_CERT_FILE = resolveCombinedCaPath(process.env);
+            env.SSL_CERT_FILE = caBundle;
+            env.NODE_EXTRA_CA_CERTS = caBundle;
         }
         if (routes.httpEnvRoutes.length > 0) env.HTTP_PROXY = origin;
         // Session identity for the proxy: dsh's pi-ai stack keys its
