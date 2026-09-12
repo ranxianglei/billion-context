@@ -72,6 +72,55 @@ export function emitStreamError(res: http.ServerResponse, protocol: Protocol, me
 }
 
 /**
+ * #721: the upstream stream ended without a terminal event — clean EOF with
+ * no [DONE] / message_stop / completed-family event, or a read failure while
+ * the client is still connected. Without intervention the client sees a bare
+ * cut-off SSE and persists the partial turn as complete (the #719 chain).
+ * Two shapes:
+ *  - finished=true: a finish reason WAS delivered (OpenAI finish_reason chunk
+ *    / Anthropic message_delta stop_reason); only the final terminal byte was
+ *    lost → synthesize just that byte (silent completion).
+ *  - finished=false: true mid-generation cut → protocol-native in-band error
+ *    event, same shapes as emitPreflightError (#568): openai top-level `error`
+ *    data frame + [DONE]; anthropic/responses `event: error`. A fabricated
+ *    response.failed lifecycle object is deliberately avoided — the pipe does
+ *    not track the full output-item list, and strict clients (codex) crash on
+ *    half-consistent terminal payloads (see emitStreamError). The responses
+ *    wire has no separate finish-reason concept (terminal events carry the
+ *    status), so !sawTerminal ⇒ finished=false always there.
+ * Never throws.
+ */
+export function emitUpstreamTruncation(res: http.ServerResponse, protocol: Protocol, finished: boolean, log?: (msg: string) => void): void {
+    const message = "upstream stream ended before a completion event; this turn may be incomplete";
+    log?.(`[acp-proxy: upstream stream truncated (${protocol})${finished ? " — finish reason seen, synthesizing missing terminal byte" : " — emitting in-band error"}]`);
+    try {
+        if (protocol === "openai") {
+            if (finished) {
+                safeWrite(res, "data: [DONE]\n\n");
+            } else {
+                safeWrite(res, `data: ${JSON.stringify({ error: { type: "server_error", code: "upstream_stream_truncated", message } })}\n\ndata: [DONE]\n\n`);
+            }
+        } else if (protocol === "responses") {
+            safeWrite(res, `event: error\ndata: ${JSON.stringify({ type: "error", code: "upstream_stream_truncated", message })}\n\n`);
+        } else {
+            if (finished) {
+                safeWrite(res, `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`);
+            } else {
+                safeWrite(res, `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "server_error", code: "upstream_stream_truncated", message } })}\n\n`);
+            }
+        }
+    } catch {
+        /* best-effort */
+    } finally {
+        try {
+            res.end();
+        } catch {
+            /* already closed */
+        }
+    }
+}
+
+/**
  * #568: deliver a preflight fail-fast error IN-BAND, after the proxy already
  * committed `200` early to hold the client through a long compression (see
  * beginPreflightHold in server.ts). The status line can no longer change, so

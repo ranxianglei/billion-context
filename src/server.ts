@@ -3698,9 +3698,10 @@ async function forward(
     // opt-in #371 fake-completion backstop buffers + retries first, same as
     // proxy mode (#473).
     if (prepared?.pluginMode) {
-        // #411: clear the idle timer on the abort path too — the pipes rethrow
-        // when the client is still connected, and a client cancel throws from
-        // inside them; without a finally each abort leaked an idle timer.
+        // #411: clear the idle timer on every path — resolveFakeCompletion and
+        // other failures still escape these pipes; without a finally each one
+        // leaked a live idle timer. (#721: the SSE pipes themselves no longer
+        // rethrow an upstream cut — they emit an in-band truncation signal.)
         try {
             let pluginBody = upstream.body as ReadableStream<Uint8Array>;
             if (prepared.stream && maxFakeCompletionRetries() > 0) {

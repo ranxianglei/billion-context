@@ -10,6 +10,7 @@ import { executeProxyTool } from "./loop/core.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
 import { containsRenderTagText, createTagEchoFilter, mayStartRenderTag, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
+import { emitUpstreamTruncation } from "./stream-error.js";
 import { degenerateTurnWarning } from "./degenerate-turn.js";
 import { noteWeakOverflow } from "./weak-overflow.js";
 import { warnCacheCollapse } from "./cache-warn.js";
@@ -900,7 +901,17 @@ export async function pipePluginChatWithStrip(
             }
             if (res.destroyed || res.writableEnded) break;
         }
-        if (buf.length > 0 && !res.destroyed && !res.writableEnded) await write(buf);
+        // #721: upstream EOF without a terminal event must not close the
+        // stream bare — the agent would persist the partial turn as complete
+        // (the #719 chain). finished=true when a finish reason was delivered:
+        // only the trailing terminal byte ([DONE]/message_stop) is missing.
+        const truncated = !sawTerminal && !res.destroyed && !res.writableEnded;
+        // A dangling partial event left in buf by a mid-event cut would fuse
+        // with the next complete frame — SSE joins every data line inside one
+        // blank-line-delimited block — corrupting the truncation signal. Drop
+        // it when the signal follows: an unterminated event is unparseable by
+        // the client anyway (same as the pre-#721 bare end).
+        if (!truncated && buf.length > 0 && !res.destroyed && !res.writableEnded) await write(buf);
         const rest = flushTails();
         if (rest.length > 0 && !res.destroyed && !res.writableEnded) await write(rest);
         // Settle BEFORE res.end() in the finally below: the client can issue
@@ -910,6 +921,10 @@ export async function pipePluginChatWithStrip(
         settleUsage();
         maybeNoteTruncated();
         maybeWarnDegenerate();
+        if (truncated) {
+            emitUpstreamTruncation(res, protocol, finalFinishReason !== undefined, log);
+            return;
+        }
     } catch (e) {
         settleUsage();
         maybeNoteTruncated();
@@ -917,7 +932,21 @@ export async function pipePluginChatWithStrip(
             log?.("client aborted mid-stream");
             return;
         }
-        throw e;
+        // #721: upstream read failed while the client is still connected —
+        // deliver the in-band truncation signal instead of rethrowing into
+        // the top-level handler, which would close the stream bare. Flush
+        // held tag tails first so partial prose is never silently lost. The
+        // dangling partial event left in buf is dropped (see EOF path above):
+        // written raw it would fuse with the signal frame.
+        try {
+            const rest = flushTails();
+            if (rest.length > 0) await write(rest);
+        } catch {
+            /* client half-gone; the emission below is best-effort too */
+        }
+        loggerLog("warn", `[plugin] upstream stream read failed (${protocol}): ${String(e instanceof Error ? e.message : e)} — emitting in-band truncation signal`);
+        emitUpstreamTruncation(res, protocol, finalFinishReason !== undefined, log);
+        return;
     } finally {
         reader.releaseLock();
         res.end();
@@ -1111,6 +1140,13 @@ export async function pipePluginResponsesWithStrip(
         maybeWarnDegenerate();
         settleUsage();
         maybeNoteTruncated();
+        // #721: same as the chat-pipe twin — never close bare on a missing
+        // done-family event. Responses has no separate finish-reason concept
+        // (terminal events carry the status), so this is always the error shape.
+        if (!sawTerminal && !res.destroyed && !res.writableEnded) {
+            emitUpstreamTruncation(res, "responses", false, log);
+            return;
+        }
     } catch (e) {
         settleUsage();
         maybeNoteTruncated();
@@ -1118,7 +1154,19 @@ export async function pipePluginResponsesWithStrip(
             log?.("client aborted mid-stream");
             return;
         }
-        throw e;
+        // #721: upstream read failed while the client is still connected —
+        // deliver the in-band truncation signal instead of rethrowing into
+        // the top-level handler, which would close the stream bare. Flush
+        // held tag tails first so partial prose is never silently lost.
+        try {
+            const rest = flushTail("");
+            if (rest.length > 0) await write(rest);
+        } catch {
+            /* client half-gone; the emission below is best-effort too */
+        }
+        loggerLog("warn", `[plugin] upstream stream read failed (responses): ${String(e instanceof Error ? e.message : e)} — emitting in-band truncation signal`);
+        emitUpstreamTruncation(res, "responses", false, log);
+        return;
     } finally {
         reader.releaseLock();
         res.end();
