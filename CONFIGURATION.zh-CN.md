@@ -289,6 +289,14 @@
 - **类型：** `boolean`
 - **默认值：** `false`
 - **状态：** ACTIVE
+- **说明：** 必须为 `true`，`prompts` 覆盖才生效。设置它即表示知悉上述摘要质量风险。
+
+#### `promptPack`
+
+- **类型：** `string`（包名，如 `"lean"`）
+- **默认值：** *（未设置 —— 恒等表面，全部使用内核默认值）*
+- **状态：** ACTIVE
+- **说明：** 选择一个具名 prompt pack —— 一套策划好的表面预设，覆盖工具描述、压缩系统提示词段落、nudge 段落 —— 从内核的包解析链解析：**项目** `./.billion-context/packs/<name>.json` → **用户** `<configDir>/packs/<name>.json` → **内置**（`default`、`lean`）。内置 `lean` 把四个 ACP 工具描述换成单行版（无 snippet/guideline 包装），压缩规则保持默认。未知包名回退到恒等表面并记录一次警告。与其他字段一样三级级联合并；包的表面覆盖（工具/段落）直接生效，不经 `acknowledgePromptsRisk` 门控（该门控只管 `compress.prompts` 的规则文本覆盖）。需要 `acp-kernel` >= 0.0.66。
 - **说明：** 必须为 `true`，`prompts` 覆盖才会生效。设置它即表示知悉上文所述的摘要质量风险。
 
 #### `absorb`

@@ -131,6 +131,12 @@ export type CompressSettings = {
     /** Must be true for `prompts` overrides to take effect. Acknowledges the
      *  summary-quality risk documented on `prompts`. */
     acknowledgePromptsRisk?: boolean;
+    /** Named prompt pack (kernel pack registry): a curated surface preset —
+     *  tool descriptions, system-prompt sections, nudge sections — resolved
+     *  from [project `./.billion-context/packs` > user `<configDir>/packs` >
+     *  builtin (`default`, `lean`)]. Deepest-wins like every other field;
+     *  unknown names fall back to the identity surface. Kernel >= 0.0.66. */
+    promptPack?: string;
     /** Instant tool-result absorption (kernel absorb API, acp-kernel >= 0.0.54).
      *  When `enabled`, eligible large tool results carry a forced [ACP absorb]
      *  instruction and the model distills them via the injected `absorb` tool;
@@ -688,6 +694,10 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
             }
             if (ok) out.prompts = cleaned;
         }
+    }
+    if ("promptPack" in obj && obj.promptPack !== undefined) {
+        if (typeof obj.promptPack !== "string" || obj.promptPack.trim().length === 0) ok = false;
+        else out.promptPack = obj.promptPack.trim();
     }
     if (!ok) return undefined;
     return out;
