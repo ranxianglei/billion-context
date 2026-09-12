@@ -70,6 +70,13 @@ export interface PreflightFailure {
     detail: string;
 }
 
+// #726: a summarization call can return HTTP 200 yet carry no usable summary
+// text (in-stream error event, truncated stream, empty completion). The
+// unusable branch carries a diagnosis of what the body actually contained so
+// it is logged and surfaced in the fail-fast message instead of the generic
+// "summary too short".
+type SummaryOutcome = { summary: string } | { unusable: string };
+
 export interface PreflightResult {
     compressedRanges: number;
     savedTokens: number;
@@ -165,6 +172,14 @@ function rangeChars(messages: CoreMessage[], startIdx: number, endIdx: number): 
         chars += (messages[i].text ?? "").length;
     }
     return chars;
+}
+
+function spanUnitsOf(messages: CoreMessage[], startIdx: number, endIdx: number, countText: (text: string) => number): number {
+    let units = 0;
+    for (let i = startIdx; i <= endIdx && i < messages.length; i++) {
+        units += countText(messages[i].text ?? "");
+    }
+    return units;
 }
 
 function renderRange(messages: CoreMessage[], startIdx: number, endIdx: number): string {
@@ -359,7 +374,78 @@ function extractSummaryText(protocol: PreflightProtocol, json: Record<string, un
         .join("");
 }
 
-async function summarizeRange(deps: PreflightDeps, content: string, startRef: string, endRef: string): Promise<string | null> {
+// #726: an HTTP-200 summarization body can still be a rejection — the upstream
+// may end its SSE stream with an error event (`error`, `response.failed`) or an
+// incomplete response, or answer with a bare JSON error object. Without this
+// scan such bodies are silently discarded and the only trace is "summary too
+// short (0 chars)" with no way to tell size-driven from systemic failures.
+function extractStreamError(o: Record<string, unknown>): string | null {
+    const t = typeof o.type === "string" ? o.type : undefined;
+    if (t === "error") {
+        const e = o.error;
+        if (e && typeof e === "object") {
+            const eo = e as Record<string, unknown>;
+            return `the upstream reported an in-stream error: ${typeof eo.message === "string" ? eo.message : JSON.stringify(eo).slice(0, 200)}`;
+        }
+        if (typeof o.message === "string") return `the upstream reported an in-stream error: ${o.message}`;
+        return "the upstream reported an in-stream error";
+    }
+    if (t === "response.failed" || t === "response.error") {
+        const resp = o.response;
+        if (resp && typeof resp === "object") {
+            const e = (resp as Record<string, unknown>).error;
+            if (e && typeof e === "object") {
+                const eo = e as Record<string, unknown>;
+                const code = typeof eo.code === "string" ? ` (${eo.code})` : "";
+                return `the upstream stream ended with a failed response${code}: ${typeof eo.message === "string" ? eo.message : JSON.stringify(eo).slice(0, 200)}`;
+            }
+        }
+        return "the upstream stream ended with a failed response";
+    }
+    if (t === "response.incomplete") {
+        const resp = (o.response ?? {}) as Record<string, unknown>;
+        const status = typeof resp.status === "string" ? resp.status : "unknown";
+        const e = resp.error as Record<string, unknown> | undefined;
+        const msg = e && typeof e.message === "string" ? ` (${e.message})` : "";
+        return `the upstream stream ended incomplete (status=${status}${msg})`;
+    }
+    if (!t && o.error && typeof o.error === "object") {
+        const eo = o.error as Record<string, unknown>;
+        return `the upstream reported an error: ${typeof eo.message === "string" ? eo.message : JSON.stringify(eo).slice(0, 200)}`;
+    }
+    return null;
+}
+
+export function diagnoseEmptySummary(text: string, json?: unknown): string {
+    if (json && typeof json === "object") {
+        const err = extractStreamError(json as Record<string, unknown>);
+        if (err) return err;
+    }
+    let sseEvents = 0;
+    let firstPayload = "";
+    for (const line of text.split("\n")) {
+        if (!line.startsWith("data:")) continue;
+        const payload = line.slice(5).trim();
+        if (!payload || payload === "[DONE]") continue;
+        if (!firstPayload) firstPayload = payload.slice(0, 200);
+        let obj: unknown;
+        try {
+            obj = JSON.parse(payload);
+        } catch {
+            continue;
+        }
+        if (!obj || typeof obj !== "object") continue;
+        sseEvents += 1;
+        const err = extractStreamError(obj as Record<string, unknown>);
+        if (err) return err;
+    }
+    if (sseEvents > 0) return `the upstream stream carried ${sseEvents} SSE event(s) but no summary text (first event: ${firstPayload})`;
+    const trimmed = text.trim();
+    if (!trimmed) return "the upstream returned an empty body";
+    return `the upstream returned a non-SSE body with no summary text (first 200 bytes: ${trimmed.slice(0, 200)})`;
+}
+
+async function summarizeRange(deps: PreflightDeps, content: string, startRef: string, endRef: string): Promise<SummaryOutcome> {
     const system =
         buildCompressSystemPrompt(deps.prompts) +
         `\n\nTASK: The conversation segment below (messages ${startRef}–${endRef}) must be compressed because the session context exceeds the current model's window. Write a tier-1 compression summary of the segment following every rule above. Output ONLY the summary text — no preamble, no closing remarks, no tool calls.`;
@@ -396,7 +482,7 @@ async function summarizeRange(deps: PreflightDeps, content: string, startRef: st
     }
 }
 
-async function requestSummary(deps: PreflightDeps, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean): Promise<string | null> {
+async function requestSummary(deps: PreflightDeps, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean): Promise<SummaryOutcome> {
     const { response, clearTimer } = await fetchWithRetry(
         deps.url,
         {
@@ -431,10 +517,11 @@ async function requestSummary(deps: PreflightDeps, system: string, content: stri
             deps.log("warn", `[preflight] summary response was not JSON: ${text.slice(0, 200)}`);
         }
         if (summary.length < MIN_SUMMARY_CHARS) {
-            deps.log("warn", `[preflight] summary too short (${summary.length} chars); skipping range`);
-            return null;
+            const diagnosis = diagnoseEmptySummary(text, json);
+            deps.log("warn", `[preflight] summary too short (${summary.length} chars): ${diagnosis}`);
+            return { unusable: diagnosis };
         }
-        return summary;
+        return { summary };
     } finally {
         clearTimer();
     }
@@ -486,6 +573,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     let finalUpper = baselineKnown ? 0 : estimateCoreMessagesUpper(messages);
     let startTokens = -1;
     let failure: PreflightFailure | undefined;
+    let lastUnusableDetail: string | undefined;
     let activeConfig = deps.config;
     let relaxed = false;
     const relaxedExhaustedDetail =
@@ -581,13 +669,23 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             // minUnits only in the char regime: with the optimistic token budget a
             // sub-minimum chunk is already rare, and keeping minUnits = 0 there
             // preserves the historical packing exactly.
-            for (const [cs, ce] of splitChunks(messages, startIdx, endIdx, budget, baselineKnown ? 0 : minChars, countText)) {
+            // #726: spans form a worklist instead of a flat pass. A chunk whose
+            // summary comes back unusable is halved (oldest half first) and
+            // retried down to a floor before the whole range is given up: the
+            // prime suspect for an empty summary is a CHUNK_FRACTION-sized chunk
+            // exceeding the upstream's real input cap, and halving recovers
+            // exactly those cases. Bounded by the per-regime call budget below.
+            const spans: Array<[number, number]> = splitChunks(messages, startIdx, endIdx, budget, baselineKnown ? 0 : minChars, countText).slice().reverse();
+            while (spans.length > 0) {
                 if (currentTokens < limit) break;
                 if (deps.signal?.aborted) {
                     failure = ABORTED_FAILURE;
                     break;
                 }
                 if (budgetHit) break;
+                const span = spans.pop();
+                if (!span) break;
+                const [cs, ce] = span;
                 const maps = refMaps(messages, deps.session.state);
                 const startRef = maps.idxToRef.get(cs);
                 const endRef = maps.idxToRef.get(ce);
@@ -600,9 +698,9 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     break;
                 }
                 summaryCalls += 1;
-                let summary: string | null;
+                let outcome: SummaryOutcome;
                 try {
-                    summary = await summarizeRange(deps, content, startRef, endRef);
+                    outcome = await summarizeRange(deps, content, startRef, endRef);
                 } catch (err) {
                     if (err instanceof UpstreamHttpError) {
                         failure = {
@@ -622,11 +720,21 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     }
                     break;
                 }
-                if (!summary) {
-                    deps.log("warn", `[preflight] range ${skipKey} produced no usable summary; skipping it`);
+                if ("unusable" in outcome) {
+                    lastUnusableDetail = outcome.unusable;
+                    const floorUnits = baselineKnown ? 2 * MIN_CHUNK_TOKENS : 2 * minChars;
+                    if (ce > cs && spanUnitsOf(messages, cs, ce, countText) >= floorUnits) {
+                        deps.log("warn", `[preflight] chunk ${startRef}:${endRef} produced no usable summary (${outcome.unusable}); retrying with smaller chunks`);
+                        const mid = Math.floor((cs + ce) / 2);
+                        spans.push([mid + 1, ce]);
+                        spans.push([cs, mid]);
+                        continue;
+                    }
+                    deps.log("warn", `[preflight] range ${skipKey} produced no usable summary even at minimum size (${outcome.unusable}); skipping it`);
                     skipSet.add(skipKey);
                     break;
                 }
+                const summary = outcome.summary;
                 const ctx: RewriteCtx = {
                     core: deps.core,
                     config: activeConfig,
@@ -659,14 +767,18 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         if (appliedThisRound === 0) break;
     }
     if (currentTokens >= limit && !failure) {
+        // #726: carry the most recent unusable-summary diagnosis into the
+        // fail-fast message — "no range could be compressed" with no reason is
+        // undiagnosable from the client side.
+        const unusableNote = lastUnusableDetail ? ` Last unusable summary: ${lastUnusableDetail.slice(0, 300)}.` : "";
         if (budgetHit) {
-            failure = { kind: "exhausted", detail: `the preflight summarization budget (${MAX_SUMMARY_CALLS_PER_PREFLIGHT} calls per protection regime) was exhausted before the payload fit the window` };
+            failure = { kind: "exhausted", detail: `the preflight summarization budget (${MAX_SUMMARY_CALLS_PER_PREFLIGHT} calls per protection regime) was exhausted before the payload fit the window${unusableNote}` };
         } else if (relaxed && result.compressedRanges > 0) {
             failure = { kind: "exhausted", detail: relaxedExhaustedDetail };
         } else if (result.compressedRanges === 0) {
-            failure = { kind: "exhausted", detail: `no range could be compressed across ${rangesTried} viable range${rangesTried === 1 ? "" : "s"} (each was below minCompressRange, had an unusable summary, or failed to apply)` };
+            failure = { kind: "exhausted", detail: `no range could be compressed across ${rangesTried} viable range${rangesTried === 1 ? "" : "s"} (each was below minCompressRange, had an unusable summary, or failed to apply)${unusableNote}` };
         } else {
-            failure = { kind: "exhausted", detail: `the compress budget was exhausted after ${MAX_PREFLIGHT_ROUNDS} rounds` };
+            failure = { kind: "exhausted", detail: `the compress budget was exhausted after ${MAX_PREFLIGHT_ROUNDS} rounds${unusableNote}` };
         }
     }
     if (result.compressedRanges > 0) deps.session.stats.lastInputTokens = currentTokens;

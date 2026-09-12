@@ -2972,6 +2972,23 @@ function preflightHoldGraceMs(): number {
     return Number.isFinite(v) && v >= 0 ? Math.floor(v) : PREFLIGHT_HOLD_GRACE_DEFAULT_MS;
 }
 
+// #726: a preflight that failed WITHOUT folding anything hit a deterministic
+// rejection under the current session state — a client that retries verbatim
+// (codex auto-retries every few seconds) re-runs the same doomed walk, burning
+// upstream quota on identical large summarization calls. Such failures arm a
+// per-session cooldown: matching requests fail fast with the cached diagnosis
+// and ZERO upstream calls until it expires. Any preflight outcome without a
+// failure clears the marker (the state changed — client shrank the
+// conversation, or the upstream recovered). Aborted failures never arm it.
+const PREFLIGHT_DEAD_END_COOLDOWN_DEFAULT_MS = 5 * 60_000;
+
+function preflightDeadEndCooldownMs(): number {
+    const raw = process.env.BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS;
+    if (!raw) return PREFLIGHT_DEAD_END_COOLDOWN_DEFAULT_MS;
+    const v = Number(raw);
+    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : PREFLIGHT_DEAD_END_COOLDOWN_DEFAULT_MS;
+}
+
 /** #568: commit the response early so a long preflight cannot lose the client
  *  to its header timeout. Streaming clients get an SSE stream with keep-alive
  *  comment lines (`: bili-preflight` — a spec-mandated no-op for every SSE
@@ -3109,6 +3126,21 @@ async function preflightCompressIfNeeded(
         // the only foldable content, and its exhaustion detail carries the
         // operator remedy wording.
     }
+    // #726: dead-end cooldown — an identical over-window state already failed
+    // preflight without folding anything, so re-running the walk is doomed; fail
+    // fast with the cached diagnosis and spend ZERO upstream summarization calls.
+    // Sits AFTER every safe-forward path above (#496 image arbitration, #300
+    // stale-baseline fit): those return without running the walk, so the
+    // cooldown must not convert a fitting payload into a false fail-fast while
+    // a marker from a larger earlier request is still warm.
+    const deadEnd = session.metadata.preflightDeadEnd;
+    if (deadEnd && typeof deadEnd === "object") {
+        const de = deadEnd as Record<string, unknown>;
+        if (typeof de.key === "string" && de.key === `${model}\u0000${limit}` && typeof de.until === "number" && de.until > Date.now() && typeof de.message === "string") {
+            log("warn", `[${session.id}] preflight dead-end cooldown active (${Math.ceil((de.until - Date.now()) / 1000)}s left); failing fast without upstream calls (#726)`);
+            return { failFast: true, status: typeof de.status === "number" ? de.status : 502, message: de.message, retryable: de.retryable === true, respond: !res.writableEnded };
+        }
+    }
     // #330: the payload overflows the window (or nothing is foldable in the
     // normal pass but it doesn't fit). Let preflightCompress try to fold it —
     // it relaxes the soft-protected recent zone when nothing is foldable
@@ -3155,6 +3187,9 @@ async function preflightCompressIfNeeded(
         clearTimeout(holdTimer);
         stopHold?.();
     }
+    // #726: a preflight that did not end in failure clears any dead-end marker
+    // — the state changed (conversation shrank, upstream recovered).
+    if (!result.failure) delete session.metadata.preflightDeadEnd;
     // #330: decide forward/fail on the payload actually forwarded, not
     // result.payloadEstimate — the preflight's relaxed-zone processTurn trims
     // that estimate more than the normal-config prepare does, which can turn a
@@ -3187,7 +3222,20 @@ async function preflightCompressIfNeeded(
         return { failFast: true, status: 0, message: f.detail, retryable: false, respond: false };
     }
     const status = f?.kind === "upstream" && f.status === 429 ? 503 : 502;
-    return failFast(status, f?.detail ?? "the payload still exceeds the window after preflight compression", status === 503);
+    const ff = failFast(status, f?.detail ?? "the payload still exceeds the window after preflight compression", status === 503);
+    // #726: zero-progress failure under unchanged state is a deterministic
+    // dead-end — arm the cooldown so client auto-retries stop re-burning
+    // upstream quota on the identical doomed summarization walk. Aborted
+    // failures never reach here.
+    if (f && result.compressedRanges === 0) {
+        const cooldownMs = preflightDeadEndCooldownMs();
+        if (cooldownMs > 0) {
+            ff.message += ` Preflight will not call the upstream again for the next ${Math.max(1, Math.round(cooldownMs / 60_000))}m while the context is unchanged (identical failure); restarting the session recovers immediately.`;
+            session.metadata.preflightDeadEnd = { key: `${model}\u0000${limit}`, until: Date.now() + cooldownMs, status: ff.status, retryable: ff.retryable, message: ff.message };
+            markDirty(session);
+        }
+    }
+    return ff;
 }
 
 /** #604: arm the emergency shrink after an upstream failure that will never
