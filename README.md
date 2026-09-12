@@ -120,6 +120,17 @@ turn is a semantic mismatch the model tolerates (it is clearly marked
   summaries (their tool call isn't in the agent's history and the agent's view
   skips `acp_summary`) — but that needs the id match above, which doesn't occur.
 
+**Verifying that a compression actually landed.** After executing `compress`,
+the proxy emits a confirmation marker (`📦 [ACP] Compressed …`) as plain
+assistant text — but under sustained context pressure a model was observed
+*writing that marker format itself* without ever calling the tool (#717): 17
+fake "compressions" over ~2 hours while real usage climbed to 89%. A marker
+line visible in the transcript is therefore not proof of persistence — verify
+with `acp_status` (block count increased, compressible-range start advanced)
+before trusting it. As a backstop, the proxy strips any marker-shaped line the
+model emits on its own and logs a `[marker-echo]` warning, and both the nudge
+and the injected prompt state explicitly that markers are proxy-emitted only.
+
 
 ## Which do I need?
 
