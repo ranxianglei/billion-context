@@ -241,6 +241,25 @@ export function systemToUser<T extends { role: string }>(messages: T[]): T[] {
     );
 }
 
+/** #719: Some OpenAI-compatible backends (DeepSeek) reject assistant messages
+ * whose `content` is null — they require a string content (possibly "") or
+ * tool_calls ("Invalid assistant message: content or tool_calls must be set").
+ * coreToOpenai emits `content: null` for reasoning-only assistant turns (an
+ * upstream stream truncated before any completion event leaves 0 text chars +
+ * N reasoning chars; openaiToCore drops empty text, so both `content:""` and
+ * `content:null` inputs rebuild as null). Force an empty string so the rebuilt
+ * wire payload is always accepted; no-op when content is already a string or
+ * an array of parts. Deterministic across turns → prefix-cache stable.
+ */
+export function hardenOpenaiAssistantContent<T extends { role: string }>(messages: T[]): T[] {
+    return messages.map((m) => {
+        if (m.role !== "assistant") return m;
+        const c = (m as { content?: unknown }).content;
+        if (c === null || c === undefined) return { ...m, content: "" } as T;
+        return m;
+    });
+}
+
 /**
  * Whether the OUTPUT budget should be reserved from the context window at all.
  * Anthropic's Messages API enforces the input limit INDEPENDENTLY of
