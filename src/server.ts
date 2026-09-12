@@ -1928,13 +1928,35 @@ function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; cont
 // anonymously (prefix-affinity forks/reloads, #553): they carry the full raw
 // history but no measurement yet, so feeding 0 blinds the nudge (usage 0%,
 // growth ref 0) and no compression trigger fires until overflow. Explicit-
-// identity zero-baseline sessions stay at 0 — first-turn or post-native-
-// compaction payloads that are small by construction and self-heal via the
-// next measured usage report.
+// identity zero-baseline sessions previously stayed at 0 on the assumption
+// that they "self-heal via the next measured usage report" — an assumption
+// that breaks for upstreams that NEVER report usage (ChatGPT-login backends,
+// #728): lastInputTokens stays 0 for the whole session, and the kernel's
+// decideNudge is structurally unfireable at tokenCount == 0 (growth ref falls
+// back to tokenCount itself → growth ≡ 0; firstSightMassReady/pressure bands
+// all require usage >= their pct lines). #728 fix: such sessions fall back to
+// the PREVIOUS turn's locally-measured outbound payload upper bound
+// (session.stats.localInputEstimate, recorded in prepare* each turn). The
+// estimator only errs EARLY (char-count upper bound → compress earlier, never
+// later), is active only while lastInputTokens == 0 (a real usage report takes
+// precedence immediately — same invariant as #604's armFailureShrink
+// exception), and self-corrects after every fold (the post-fold payload
+// shrinks → the next estimate drops). Turn 1 of a fresh explicit session
+// still feeds 0 (nothing measured yet; nothing pending either), so
+// first-turn behavior is byte-identical to pre-#728.
 function effectiveTokenCount(session: Session, msgs: CoreMessage[]): number {
     if (session.stats.lastInputTokens > 0) return session.stats.lastInputTokens;
-    if (!session.metadata.anonymousPrefixAffinity) return 0;
-    return estimateCoreMessagesUpper(msgs);
+    if (session.metadata.anonymousPrefixAffinity) return estimateCoreMessagesUpper(msgs);
+    const est = session.stats.localInputEstimate ?? 0;
+    if (est <= 0) return 0;
+    // Cap by THIS request's inbound upper bound: the recorded estimate lags by
+    // one turn, so after a client-side shrink (native compaction echo, history
+    // edit) the previous turn's payload can be larger than what is in front of
+    // us now — never claim more context than the current request could hold.
+    // In steady state est <= raw bound always (the outbound fold is never
+    // larger than the inbound history), so this is a no-op there.
+    const raw = estimateCoreMessagesUpper(msgs);
+    return Math.min(est, raw);
 }
 
 function prepareAnthropic(
@@ -2062,6 +2084,16 @@ function prepareAnthropic(
     // identity chain (#268), not part of the Anthropic Messages API — strip it
     // so the real upstream never sees a field it doesn't know.
     delete (rebuilt as Record<string, unknown>).prompt_cache_key;
+    // #728: record the char-count upper bound of THIS turn's outbound payload
+    // (post-fold messages + system/tools overhead + images) as the fallback
+    // token source for upstreams that never report usage — read only while
+    // lastInputTokens == 0 (effectiveTokenCount). When the kernel transform
+    // above failed, processedMessages is empty and the forwarded body is the
+    // UNPROCESSED projection — measure that instead so the fallback isn't
+    // blinded to a system+tools-only floor.
+    session.stats.localInputEstimate = estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages)
+        + countSystemAndToolsTokens(extractSystem(systemOut), toolsOut)
+        + imageTokensInParsedBody("anthropic", rebuilt);
     return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, renderTags: "text-only" } as Prepared;
 }
 
@@ -2322,6 +2354,15 @@ function prepareOpenai(
     if (!isTitleGen && openaiOutboundSystem !== undefined) {
         session.metadata.systemPromptTokens = countSystemAndToolsTokens(openaiOutboundSystem, toolsOut);
     }
+    // #728: record this turn's outbound payload upper bound as the fallback
+    // token source for upstreams that never report usage (see effectiveTokenCount).
+    // Title-gen side requests are skipped like the overhead row above — their
+    // tiny payload would clobber the conversation's measurement.
+    if (!isTitleGen) {
+        session.stats.localInputEstimate = estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages)
+            + countSystemAndToolsTokens(openaiOutboundSystem || openaiSystemText, toolsOut)
+            + imageTokensInParsedBody("openai", rebuilt);
+    }
     snapshotMessages(session, originalMessages);
     markDirty(session);
     return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: injectTools, pluginMode, nudge, prompts, openaiSystemText, renderTags: "text-only" } as Prepared;
@@ -2578,6 +2619,15 @@ function prepareResponses(
     // mid-history items the kernel already classifies.
     if (transformOk) {
         session.metadata.systemPromptTokens = countSystemAndToolsTokens(responsesDevContent ?? "", toolsOut);
+    }
+    // #728: record this turn's outbound payload upper bound as the fallback
+    // token source for upstreams that never report usage (see effectiveTokenCount).
+    // Compaction-trigger requests are the compression mechanism itself — no
+    // incremental decision hangs off them, so don't leave a stale reading.
+    if (!isCompactionTrigger) {
+        session.stats.localInputEstimate = estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages)
+            + countSystemAndToolsTokens(responsesDevContent ?? "", toolsOut)
+            + imageTokensInParsedBody("responses", rebuilt);
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);

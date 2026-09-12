@@ -90,6 +90,16 @@ export type Session = {
         pendingFoldUsage?: boolean;
         /** Current in-context (uncompressed) token count at last processTurn. */
         contextTokens: number;
+        /** #728: char-count upper bound of the LAST turn's outbound payload
+         *  (post-fold processed messages + system/tools overhead + images),
+         *  recorded locally in prepare* each turn. Read ONLY while
+         *  lastInputTokens == 0, as the fallback tokenCount for upstreams
+         *  that never report usage (ChatGPT-login-style backends — see
+         *  effectiveTokenCount in server.ts). Self-correcting: a successful
+         *  fold shrinks the next turn's payload and thus the estimate.
+         *  Cleared by resetSessionCompression (native-compaction boundary).
+         *  Persisted (survives restart like the rest of stats). */
+        localInputEstimate?: number;
     };
     /** Free-form escape hatch for future fields not yet promoted to typed
      *  members. Persisted as-is (must be JSON-serializable). Use sparingly —
@@ -300,6 +310,10 @@ export function resetSessionCompression(session: Session): void {
     session.state = createInitialState();
     session.blockContents.clear();
     session.stats.lastInputTokens = 0;
+    // #728: the pre-compaction outbound payload is gone — the old estimate
+    // (measured against the pre-compaction wire) would read high and blind
+    // the nudge fallback early; let the next prepare* re-measure.
+    session.stats.localInputEstimate = 0;
     session.stats.contextTokens = 0;
     session.metadata.nativeCompactionAt = Date.now();
     markDirty(session);
