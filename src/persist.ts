@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { rm } from "node:fs/promises";
+import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { open, readdir, readFile, rm } from "node:fs/promises";
 import * as path from "node:path";
-import { StateStore, flatFileNameFor, type PersistedEnvelope } from "acp-kernel/persist";
+import { StateStore, flatFileNameFor, type PersistedEnvelope, type StateStoreCodec } from "acp-kernel/persist";
 import { sessionsDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
+import { createSessionCodec, ENCRYPT_MAGIC, parseEncryptionKey } from "./encrypt.js";
 import { PersistEpermAlert } from "./persist-eperm.js";
 import { createInitialState, defaultCountTokens, prune, type CompressionState, type CoreMessage } from "acp-kernel";
 import type { Session, BlockContent, BlockView } from "./session.js";
@@ -33,6 +34,11 @@ import type { Session, BlockContent, BlockView } from "./session.js";
  *  - Forward-compat: `mergeState` fills any fields missing on a file written
  *    by an older version, so a schema change never breaks old files.
  *  - Disable with BILI_PERSIST=0 for ephemeral/test runs.
+ *  - Encryption at rest (#708): BILI_ENCRYPTION_KEY (hex/base64, exactly 32
+ *    bytes) wraps every file as BILIENC1 AES-256-GCM(zstd(JSON)) via the
+ *    kernel store's codec hook. Legacy plaintext files are re-encoded in
+ *    place once at boot (migrateLegacyFiles); key material never touches
+ *    disk or logs.
  *
  * MECHANISM lives in `acp-kernel/persist` (StateStore: atomic write, rename
  * retries, debounce, per-id serialization, corrupt-tolerant load, recursive
@@ -186,6 +192,7 @@ export class SessionStore {
     private readonly store: StateStore<PersistedSession>;
     private readonly log: Logger;
     private readonly staleWarnAt = new Map<string, number>();
+    private readonly codec?: StateStoreCodec;
 
     constructor(opts?: { dir?: string; debounceMs?: number; enabled?: boolean; log?: Logger }) {
         const debounceMs = opts?.debounceMs ?? defaultDebounce();
@@ -193,6 +200,14 @@ export class SessionStore {
         this.dir = opts?.dir ?? defaultDir();
         const baseLog = opts?.log ?? defaultLogger;
         this.log = baseLog;
+        // #708: env-only key (a key file next to the data sits on the same
+        // untrusted filesystem). Invalid values throw here — fail fast at
+        // startup instead of running silently unencrypted.
+        const keyEnv = process.env.BILI_ENCRYPTION_KEY;
+        if (keyEnv) {
+            this.codec = createSessionCodec(parseEncryptionKey(keyEnv));
+            baseLog("info", "[persist] session-file encryption enabled (AES-256-GCM)");
+        }
         const epermAlert = new PersistEpermAlert({
             dir: this.dir,
             threshold: epermAlertThreshold(),
@@ -203,6 +218,7 @@ export class SessionStore {
             version: PERSIST_VERSION,
             debounceMs: Math.max(0, debounceMs),
             enabled: this.enabled,
+            codec: this.codec,
             log: (level, msg) => {
                 epermAlert.observe(level, msg);
                 baseLog(level, msg);
@@ -248,6 +264,7 @@ export class SessionStore {
      *  tree twice per start. */
     async boot(): Promise<Map<string, Session>> {
         if (!this.enabled) return new Map();
+        await this.migrateLegacyFiles();
         const loaded = await this.store.loadAll();
         await this.applyLegacyMigration(loaded);
         const out = new Map<string, Session>();
@@ -255,6 +272,63 @@ export class SessionStore {
             out.set(id, buildSession(envelope.payload));
         }
         return out;
+    }
+
+    /** #708: when encryption is enabled, take over legacy plaintext files:
+     * every .json under the sessions dir lacking the BILIENC1 magic is
+     * re-encoded in place — temp write + rename onto the SAME path, so the
+     * atomic replace IS the old-file deletion (no window where both, or
+     *  neither, copy exists). A crash mid-run leaves each file either old or
+     *  new; the next boot finishes the job and sweeps the crashed run's
+     *  orphaned temps. Self-terminating: the 8-byte magic peek decides per
+     *  file, so later boots cost O(files × 8 bytes). */
+    private async migrateLegacyFiles(): Promise<void> {
+        if (!this.codec) return;
+        let files: string[];
+        try {
+            files = await walkJsonFiles(this.dir);
+        } catch {
+            return;
+        }
+        let migrated = 0;
+        let failed = 0;
+        for (const file of files) {
+            if (STALE_ENC_TEMP_RE.test(path.basename(file))) {
+                await rm(file, { force: true }).catch(() => {});
+                continue;
+            }
+            let head: Buffer;
+            try {
+                head = await readFileHead(file);
+            } catch {
+                continue;
+            }
+            if (head.equals(ENCRYPT_MAGIC)) continue;
+            let parsed: unknown;
+            try {
+                parsed = JSON.parse(await readFile(file, "utf8"));
+            } catch {
+                failed++;
+                this.log("warn", `[persist] encryption migration (#708): leaving unreadable file in place: ${file}`);
+                continue;
+            }
+            const tmp = `${file}.tmp-enc-${process.pid}-${Date.now()}`;
+            try {
+                writeFileSync(tmp, this.codec.encode(JSON.stringify(parsed)));
+                renameSync(tmp, file);
+                migrated++;
+            } catch {
+                failed++;
+                this.log("warn", `[persist] encryption migration (#708): failed to re-encode: ${file}`);
+                await rm(tmp, { force: true }).catch(() => {});
+            }
+        }
+        if (migrated > 0 || failed > 0) {
+            this.log(
+                failed > 0 ? "warn" : "info",
+                `[persist] encryption migration (#708): re-encoded ${migrated} legacy session file(s)${failed > 0 ? `, ${failed} failed` : ""}`,
+            );
+        }
     }
 
     /** One-time migration for the #286 identity change: sessions persisted
@@ -594,6 +668,37 @@ function persistEnabled(): boolean {
     const env = process.env.BILI_PERSIST;
     if (env === "0" || env === "false") return false;
     return true;
+}
+
+/** Temp name used by migrateLegacyFiles: `<file>.tmp-enc-<pid>-<ts>`. A
+ *  process death between write and rename orphans it; any such name present
+ *  at boot is stale by definition (the walk runs before this boot writes
+ *  anything) and gets swept. */
+const STALE_ENC_TEMP_RE = /\.tmp-enc-\d+-\d+$/;
+
+async function walkJsonFiles(dir: string): Promise<string[]> {
+    const entries = await readdir(dir, { withFileTypes: true });
+    const out: string[] = [];
+    for (const e of entries) {
+        const full = path.join(dir, e.name);
+        if (e.isDirectory()) {
+            out.push(...(await walkJsonFiles(full)));
+        } else if (e.isFile() && (STALE_ENC_TEMP_RE.test(e.name) || (e.name.endsWith(".json") && !e.name.startsWith(".tmp-")))) {
+            out.push(full);
+        }
+    }
+    return out;
+}
+
+async function readFileHead(file: string, len: number = ENCRYPT_MAGIC.length): Promise<Buffer> {
+    const fh = await open(file, "r");
+    try {
+        const buf = Buffer.alloc(len);
+        const { bytesRead } = await fh.read(buf, 0, len, 0);
+        return buf.subarray(0, bytesRead);
+    } finally {
+        await fh.close();
+    }
 }
 
 /** Token budget for the persisted folded-view snapshot (#401). The raw full
