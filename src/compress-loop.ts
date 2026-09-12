@@ -4,7 +4,6 @@ export function buildVisibilityMarker(toolName: string, result: string): string 
         l.includes("FAILED")
         || l.includes("not found")
         || l.includes("is required")
-        || l.includes("No blocks matched")
     );
     const icons: Record<string, string> = {
         compress: "📦",
