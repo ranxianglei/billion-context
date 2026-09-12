@@ -54,13 +54,13 @@ export const ERROR_DELIVERY: Record<WireExitId, ExitCell> = {
     },
     "plugin-chat-sse": {
         implementer: [pipePluginChatWithStrip],
-        contract: "byte-faithful passthrough: pre-stream fetch failure → JSON `{error: formatUpstreamError}` before any SSE byte; mid-stream cut → stream simply ends (no synthetic error event — the agent's tool loop must not see fabricated events)",
-        coveredBy: ["tests/issue411-abort-usage.test.ts", "tests/plugin-agent.test.ts"],
+        contract: "byte-faithful passthrough: pre-stream fetch failure → JSON `{error: formatUpstreamError}` before any SSE byte; upstream cut without terminal event → synthesized terminal byte when a finish reason was delivered, else protocol-native in-band error event (#721); client abort → clean end",
+        coveredBy: ["tests/issue411-abort-usage.test.ts", "tests/plugin-agent.test.ts", "tests/plugin-truncation-weak-overflow.test.ts"],
     },
     "plugin-responses-sse": {
         implementer: [pipePluginResponsesWithStrip],
         contract: "same as plugin-chat-sse, responses wire",
-        coveredBy: ["tests/issue411-abort-usage.test.ts"],
+        coveredBy: ["tests/issue411-abort-usage.test.ts", "tests/plugin-truncation-weak-overflow.test.ts"],
     },
     "plugin-json": {
         implementer: [pipePluginJson],
