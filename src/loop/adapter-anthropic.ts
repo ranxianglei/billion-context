@@ -382,7 +382,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                         } as ParsedStreamEvent;
                     }
                     maybeWarnDegenerate(stopReason);
-                    yield { kind: "done", finishReason: stopReason } as ParsedStreamEvent;
+                    yield { kind: "done", finishReason: stopReason, thinking: sawThinking } as ParsedStreamEvent;
                 } else if (type === "message_stop") {
                     if (lastTextIndex !== null) {
                         const tail = tagFilter.flush();
@@ -401,7 +401,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                         } as ParsedStreamEvent;
                     }
                     maybeWarnDegenerate(stopReason);
-                    yield { kind: "done", finishReason: stopReason ?? "end_turn" } as ParsedStreamEvent;
+                    yield { kind: "done", finishReason: stopReason ?? "end_turn", thinking: sawThinking } as ParsedStreamEvent;
                 } else if (round === 1) {
                     yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
                 }
