@@ -8,7 +8,7 @@ import { ABSORB_TOOL, ABSORB_TOOL_NAME, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSE
 import { effectiveAbsorbConfig, isProxyToolFor } from "./absorb.js";
 import { executeProxyTool } from "./loop/core.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
-import { containsRenderTagText, createTagEchoFilter, mayStartRenderTag, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
+import { composeStreamFilters, containsMarkerLineText, containsRenderTagText, createMarkerLineFilter, createTagEchoFilter, mayStartMarkerLine, mayStartRenderTag, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
 import { emitUpstreamTruncation } from "./stream-error.js";
 import { degenerateTurnWarning } from "./degenerate-turn.js";
@@ -672,9 +672,13 @@ export async function pipePluginChatWithStrip(
     const decoder = new TextDecoder("utf-8");
     let buf = "";
     const acc: UsageSample = {};
-    const onDrop = (snippet: string) => {
+    const onTagDrop = (snippet: string) => {
         loggerLog("warn", `[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
         log?.(`[tag-echo] stripped model-emitted render tag from plugin passthrough text`);
+    };
+    const onMarkerDrop = (snippet: string) => {
+        loggerLog("warn", `[marker-echo] stripped model-emitted ACP confirmation marker (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+        log?.(`[marker-echo] stripped model-emitted ACP confirmation marker from plugin passthrough text`);
     };
     // One state machine per (field, block/choice index) — interleaved choices
     // or content blocks must not share partial-tag state.
@@ -683,7 +687,7 @@ export async function pipePluginChatWithStrip(
         const key = `${field}:${index}`;
         let s = streams.get(key);
         if (!s) {
-            s = { filter: createTagEchoFilter(onDrop), field, index };
+            s = { filter: composeStreamFilters(createTagEchoFilter(onTagDrop), createMarkerLineFilter(onMarkerDrop)), field, index };
             streams.set(key, s);
         }
         return s;
@@ -793,7 +797,7 @@ export async function pipePluginChatWithStrip(
                 if (typeof v !== "string") continue;
                 hadText = true;
                 if (field !== "content" && v.length > 0) sawThinking = true;
-                if (!mayStartRenderTag(v) && !anyPending()) {
+                if (!mayStartRenderTag(v) && !mayStartMarkerLine(v) && !anyPending()) {
                     if (v.length > 0) keptText = true;
                     if (field === "content") visibleTextChars += v.length;
                     continue;
@@ -845,7 +849,7 @@ export async function pipePluginChatWithStrip(
         }
         const raw = d[field] as string;
         if (field === "thinking" && raw.length > 0) sawThinking = true;
-        if (!mayStartRenderTag(raw) && !anyPending()) {
+        if (!mayStartRenderTag(raw) && !mayStartMarkerLine(raw) && !anyPending()) {
             if (field === "text" && raw.length > 0) visibleTextChars += raw.length;
             return rawEvent + "\n\n";
         }
@@ -993,10 +997,16 @@ export async function pipePluginResponsesWithStrip(
     const decoder = new TextDecoder("utf-8");
     let buf = "";
     const acc: UsageSample = {};
-    const tagFilter = createTagEchoFilter((snippet) => {
-        loggerLog("warn", `[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
-        log?.(`[tag-echo] stripped model-emitted render tag from plugin passthrough text`);
-    });
+    const tagFilter = composeStreamFilters(
+        createTagEchoFilter((snippet) => {
+            loggerLog("warn", `[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+            log?.(`[tag-echo] stripped model-emitted render tag from plugin passthrough text`);
+        }),
+        createMarkerLineFilter((snippet) => {
+            loggerLog("warn", `[marker-echo] stripped model-emitted ACP confirmation marker (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+            log?.(`[marker-echo] stripped model-emitted ACP confirmation marker from plugin passthrough text`);
+        }),
+    );
     // #673: turn-level observability for degenerate terminal turns.
     let sawFunctionCall = false;
     let sawReasoning = false;
@@ -1100,7 +1110,7 @@ export async function pipePluginResponsesWithStrip(
                         if (type === "response.completed" || type === "response.failed" || type === "response.incomplete") sawTerminal = true;
                         // done-family events also carry full text payloads — strip those too.
                         let evOut = ev;
-                        let rebuild = containsRenderTagText(jsonStr);
+                        let rebuild = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr);
                         if (rebuild) evOut = stripResponsesText(ev);
                         const out = rebuild ? rebuildEvent(rawEvent, evOut) : rawEvent + "\n\n";
                         await write(flushTail(out));
@@ -1112,7 +1122,7 @@ export async function pipePluginResponsesWithStrip(
                             await write(rawEvent + "\n\n");
                             continue;
                         }
-                        if (!mayStartRenderTag(delta) && !tagFilter.pending()) {
+                        if (!mayStartRenderTag(delta) && !mayStartMarkerLine(delta) && !tagFilter.pending()) {
                             await write(rawEvent + "\n\n");
                             continue;
                         }
@@ -1238,7 +1248,7 @@ export async function pipePluginJson(
             }
         }
     } catch { /* non-JSON body — forward verbatim */ }
-    if (json && containsRenderTagText(text)) {
+        if (json && (containsRenderTagText(text) || containsMarkerLineText(text))) {
         // #206 parity for the non-streaming plugin path: the compress loop's
         // JSON branch strips render tags from every round; a verbatim plugin
         // JSON response would re-feed the model's tag echoes. Strips mutate in

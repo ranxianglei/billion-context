@@ -44,7 +44,7 @@ import {
     subagentNamespace,
 } from "acp-kernel/wire";
 import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive } from "./session.js";
-import { ABSORB_TOOL, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildAbsorbSystemPrompt, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withStagedCompressGuidance } from "./compress-tool.js";
+import { ABSORB_TOOL, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildAbsorbSystemPrompt, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withMarkerIntegrityNote, withStagedCompressGuidance } from "./compress-tool.js";
 import { applyAbsorbView, absorbEnabled, absorbToolName, storeEffectiveAbsorb } from "./absorb.js";
 import { rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
@@ -2040,7 +2040,7 @@ function prepareAnthropic(
             try {
                 const rendered = renderNudgeText(turn.nudge, prompts);
                 if (rendered.text) {
-                    rebuiltMessages = [...rebuiltMessages, { role: "user", content: withStagedCompressGuidance(rendered.text) }];
+                    rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withStagedCompressGuidance(rendered.text)) }];
                 }
             } catch {
             }
@@ -2266,7 +2266,7 @@ function prepareOpenai(
         // would invalidate the cache every turn.
         const sysParts: string[] = [];
         if (systemText) sysParts.push(systemText);
-        if (shouldInject) sysParts.push(buildCompressSystemPrompt(prompts));
+        if (shouldInject) sysParts.push(withMarkerIntegrityNote(buildCompressSystemPrompt(prompts)));
         if (absorbActive) sysParts.push(buildAbsorbSystemPrompt(absorbToolName(config)));
         rebuiltMessages = injectOpenaiSystem(rebuiltMessages, sysParts);
         // #532: capture what bili injects outside the fold space (client system
@@ -2287,7 +2287,7 @@ function prepareOpenai(
             try {
                 const rendered = renderNudgeText(turn.nudge, prompts);
                 if (rendered.text) {
-                    rebuiltMessages = [...rebuiltMessages, { role: "user", content: withStagedCompressGuidance(rendered.text) }];
+                    rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withStagedCompressGuidance(rendered.text)) }];
                 }
             } catch {
             }
@@ -2456,7 +2456,7 @@ function prepareResponses(
             ? []
             : (session.metadata.codexForgedSummaries as string[] | undefined) ?? [];
         if (shouldInject && !isCompactionTrigger && !process.env.ACP_NO_COMPRESS_PROMPT) {
-            const prompt = responsesTextProtocol ? buildCompressHybridSystemPrompt(prompts) : buildCompressSystemPrompt(prompts);
+            const prompt = withMarkerIntegrityNote(responsesTextProtocol ? buildCompressHybridSystemPrompt(prompts) : buildCompressSystemPrompt(prompts));
             const devParts = [...projection.systemParts, ...forgedSummaries, prompt];
             if (absorbActive) devParts.push(buildAbsorbSystemPrompt(absorbToolName(config)));
             const devContent = devParts.join("\n\n---\n\n");
@@ -2486,7 +2486,7 @@ function prepareResponses(
                     const inputItems: ResponseInputItem[] = typeof rebuiltInput === "string"
                         ? [{ type: "message", role: "user", content: rebuiltInput }]
                         : rebuiltInput;
-                    inputItems.push({ type: "message", role: "user", content: withStagedCompressGuidance(rendered.text) });
+                    inputItems.push({ type: "message", role: "user", content: withMarkerIntegrityNote(withStagedCompressGuidance(rendered.text)) });
                     rebuiltInput = inputItems;
                 }
             } catch {
@@ -2790,7 +2790,7 @@ function injectSystem(
     // the caller (prepareAnthropic), never merged into system.
     const baseText = extractSystem(parsed.system);
     const parts: string[] = [];
-    if (opts.compress.injectTool) parts.push(buildCompressSystemPrompt(prompts));
+    if (opts.compress.injectTool) parts.push(withMarkerIntegrityNote(buildCompressSystemPrompt(prompts)));
     if (opts.compress.injectTool && absorbEnabled(config)) parts.push(buildAbsorbSystemPrompt(absorbToolName(config)));
     if (parts.length === 0) return parsed.system;
     const full = baseText ? `${baseText}\n\n---\n\n${parts.join("\n\n")}` : parts.join("\n\n");
@@ -3849,7 +3849,7 @@ async function forward(
             const absorbSection = absorbActive
                 ? `\n\n---\n\n${buildAbsorbSystemPrompt(absorbToolName(loopConfig))}`
                 : "";
-            const systemPrompt = (textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts)) + absorbSection;
+            const systemPrompt = withMarkerIntegrityNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts)) + absorbSection;
             const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined);
             const refreshFolded = (current: CoreMessage[]): CoreMessage[] => {
                 // #422: mirror the prepare's fold with the post-compress state so

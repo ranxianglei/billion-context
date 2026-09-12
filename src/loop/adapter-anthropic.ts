@@ -1,7 +1,7 @@
 import type { CoreMessage } from "acp-kernel";
 import { coreToAnthropic, extractSystem, buildSystem, type AnthropicRequestBody } from "acp-kernel/wire";
 import { buildVisibilityMarker } from "../compress-loop.js";
-import { createTagEchoFilter } from "./tag-echo-filter.js";
+import { composeStreamFilters, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
 import type {
@@ -219,9 +219,14 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             // they reach the client (and before coreText accumulates them for
             // re-request rounds). Flush at the owning block's stop so held-back
             // fragments still emit while the block is open.
-            const tagFilter = createTagEchoFilter((snippet) => {
-                loggerLog("warn", `[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
-            });
+            const tagFilter = composeStreamFilters(
+                createTagEchoFilter((snippet) => {
+                    loggerLog("warn", `[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                }),
+                createMarkerLineFilter((snippet) => {
+                    loggerLog("warn", `[marker-echo] stripped model-emitted ACP confirmation marker: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                }),
+            );
             let lastTextIndex: number | null = null;
             let sawThinking = false;
             let toolCallsEmitted = 0;
