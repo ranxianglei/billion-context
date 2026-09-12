@@ -3075,17 +3075,6 @@ async function preflightCompressIfNeeded(
         ? estimateCoreMessagesUpper(prepared.processedMessages) + overheadEstimate + imageTokens
         : Math.max(session.stats.lastInputTokens, payloadEstimate);
     if (limit <= 0 || !model || tokenCount < limit) return prepared;
-    // #726: dead-end cooldown — an identical over-window state already failed
-    // preflight without folding anything, so re-running the walk is doomed; fail
-    // fast with the cached diagnosis and spend ZERO upstream summarization calls.
-    const deadEnd = session.metadata.preflightDeadEnd;
-    if (deadEnd && typeof deadEnd === "object") {
-        const de = deadEnd as Record<string, unknown>;
-        if (typeof de.key === "string" && de.key === `${model}\u0000${limit}` && typeof de.until === "number" && de.until > Date.now() && typeof de.message === "string") {
-            log("warn", `[${session.id}] preflight dead-end cooldown active (${Math.ceil((de.until - Date.now()) / 1000)}s left); failing fast without upstream calls (#726)`);
-            return { failFast: true, status: typeof de.status === "number" ? de.status : 502, message: de.message, retryable: false, respond: !res.writableEnded };
-        }
-    }
     // #496 forward-once-then-learn: the default image cost (base64/4) matches byte
     // relays (#488) but overestimates pixel-tile upstreams (a 400KB JPEG ≈ 1.6K real
     // tokens, not ~133K), so an image-dominated payload can clear the window on ESTIMATE
@@ -3136,6 +3125,21 @@ async function preflightCompressIfNeeded(
         // relax path (#330) folds the soft-protected recent zone when that is
         // the only foldable content, and its exhaustion detail carries the
         // operator remedy wording.
+    }
+    // #726: dead-end cooldown — an identical over-window state already failed
+    // preflight without folding anything, so re-running the walk is doomed; fail
+    // fast with the cached diagnosis and spend ZERO upstream summarization calls.
+    // Sits AFTER every safe-forward path above (#496 image arbitration, #300
+    // stale-baseline fit): those return without running the walk, so the
+    // cooldown must not convert a fitting payload into a false fail-fast while
+    // a marker from a larger earlier request is still warm.
+    const deadEnd = session.metadata.preflightDeadEnd;
+    if (deadEnd && typeof deadEnd === "object") {
+        const de = deadEnd as Record<string, unknown>;
+        if (typeof de.key === "string" && de.key === `${model}\u0000${limit}` && typeof de.until === "number" && de.until > Date.now() && typeof de.message === "string") {
+            log("warn", `[${session.id}] preflight dead-end cooldown active (${Math.ceil((de.until - Date.now()) / 1000)}s left); failing fast without upstream calls (#726)`);
+            return { failFast: true, status: typeof de.status === "number" ? de.status : 502, message: de.message, retryable: de.retryable === true, respond: !res.writableEnded };
+        }
     }
     // #330: the payload overflows the window (or nothing is foldable in the
     // normal pass but it doesn't fit). Let preflightCompress try to fold it —
@@ -3227,7 +3231,7 @@ async function preflightCompressIfNeeded(
         const cooldownMs = preflightDeadEndCooldownMs();
         if (cooldownMs > 0) {
             ff.message += ` Preflight will not call the upstream again for the next ${Math.max(1, Math.round(cooldownMs / 60_000))}m while the context is unchanged (identical failure); restarting the session recovers immediately.`;
-            session.metadata.preflightDeadEnd = { key: `${model}\u0000${limit}`, until: Date.now() + cooldownMs, status: ff.status, message: ff.message };
+            session.metadata.preflightDeadEnd = { key: `${model}\u0000${limit}`, until: Date.now() + cooldownMs, status: ff.status, retryable: ff.retryable, message: ff.message };
             markDirty(session);
         }
     }

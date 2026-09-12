@@ -51,14 +51,14 @@ function okSummarySse(res: http.ServerResponse): void {
     res.end();
 }
 
-function forwardSse(res: http.ServerResponse): void {
+function forwardSse(res: http.ServerResponse, inputTokens = 800): void {
     res.write(sse("response.completed", {
         type: "response.completed",
         response: {
             id: "resp_fwd",
             status: "completed",
             output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "ok" }] }],
-            usage: { input_tokens: 800, output_tokens: 4 },
+            usage: { input_tokens: inputTokens, output_tokens: 4 },
         },
     }));
     res.end();
@@ -84,7 +84,7 @@ function inputContentChars(parsed: ParsedBody): number {
     return typeof c === "string" ? c.length : 0;
 }
 
-function makeUpstream(calls: Call[], failAboveChars: number): http.Server {
+function makeUpstream(calls: Call[], failAboveChars: number, forwardInputTokens = 800): http.Server {
     return http.createServer((req, res) => {
         const chunks: Buffer[] = [];
         req.on("data", (c: Buffer) => chunks.push(c));
@@ -107,7 +107,7 @@ function makeUpstream(calls: Call[], failAboveChars: number): http.Server {
                 res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
                 okSummarySse(res);
             } else {
-                forwardSse(res);
+                forwardSse(res, forwardInputTokens);
             }
         });
     });
@@ -236,6 +236,46 @@ test("#726 systemic empty summary: diagnosis surfaced, bounded calls, cooldown b
         const r3 = await driveResponses(proxyPort, upstreamPort, "s726-deadend", "gpt-7-sol", longResponsesInput(12));
         assert.equal(r3.status, 502, `post-expiry retry must fail again, got ${r3.status}`);
         assert.ok(calls.length > callsBeforeExpire, "after the cooldown expires the walk must run again");
+    } finally {
+        proxy.close();
+        upstream.close();
+        await new Promise<void>((resolve, reject) => {
+            void Promise.allSettled([once(proxy, "close"), once(upstream, "close")]).then(() => resolve(), reject);
+        });
+    }
+});
+
+test("#726 dead-end cooldown must not block safe-forwards: fitting payload under a warm marker still goes out", async () => {
+    const calls: Call[] = [];
+    // failAboveChars=0 → every summary call fails; forwardInputTokens=15_000 lets
+    // a successful turn seed a stale-high usage baseline above the 10_000 window (#300 shape).
+    const upstream = makeUpstream(calls, 0, 15_000);
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = (upstream.address() as { port: number }).port;
+
+    const proxy = await startProxy(upstreamPort, { "gpt-7-sol": { context: 10_000 } });
+    await once(proxy, "listening");
+    const proxyPort = (proxy.address() as { port: number }).port;
+
+    try {
+        const seed = await driveResponses(proxyPort, upstreamPort, "s726-stale", "gpt-7-sol", longResponsesInput(1));
+        assert.equal(seed.status, 200, `seed request must forward, got ${seed.status}`);
+        let sess = listSessions().find((s) => s.id.includes("s726-stale"));
+        assert.ok(sess && sess.stats.lastInputTokens >= 10_000, `seed must leave a high baseline, got ${sess?.stats.lastInputTokens}`);
+
+        const r1 = await driveResponses(proxyPort, upstreamPort, "s726-stale", "gpt-7-sol", longResponsesInput(12));
+        assert.equal(r1.status, 502, `systemic failure must fail-fast, got ${r1.status}`);
+        sess = listSessions().find((s) => s.id.includes("s726-stale"));
+        assert.ok(sess?.metadata?.preflightDeadEnd, "zero-progress failure must arm the dead-end marker");
+
+        // Same session, smaller payload: its own estimate fits the window; only
+        // the stale baseline trips the trigger. The cooldown suppresses the
+        // doomed walk — it must not convert this safe forward into a false 502.
+        const callsBeforeSmall = calls.length;
+        const r2 = await driveResponses(proxyPort, upstreamPort, "s726-stale", "gpt-7-sol", [{ type: "message", role: "user", content: "small follow-up" }]);
+        assert.equal(r2.status, 200, `fitting payload under a warm marker must still forward, got ${r2.status}`);
+        assert.ok(calls.length > callsBeforeSmall && calls[calls.length - 1].summary === false, "the small payload was forwarded to the upstream");
     } finally {
         proxy.close();
         upstream.close();
