@@ -1,8 +1,8 @@
 import http from "node:http";
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
-import { createCore, type CompressionCore, type CompressionState, type Config, type CoreMessage, type NudgeDecision, type Prompts, defaultPrompts, defaultCountTokens, estimateTokensFast, renderNudgeText, deactivateBlock, viableRanges } from "acp-kernel";
-import { resolveCompress, resolveCompressPrompts, resolveRequestConfig } from "./compress-settings.js";
+import { createCore, type CompressionCore, type CompressionState, type Config, type CoreMessage, type NudgeDecision, type Prompts, type PackSurface, type ToolPrompts, applyAcpToolOverrides, defaultPrompts, defaultCountTokens, estimateTokensFast, renderNudgeText, deactivateBlock, viableRanges } from "acp-kernel";
+import { resolveCompress, resolveCompressPrompts, resolveCompressSurface, resolveRequestConfig } from "./compress-settings.js";
 import { dropCompressReasoning, type CompressReasoningConfig } from "./reasoning-drop.js";
 import { DEFAULT_STRIP_IMAGES_KEEP_RECENT, stripHistoricalImages } from "./strip-images.js";
 import type { ProxyOptions } from "./config.js";
@@ -625,6 +625,10 @@ type Prepared = {
       *  in forward() rebuilds the SAME system prompt the request was prepared
       *  with. */
     prompts?: Prompts;
+    /** Effective pack surface (promptPack) for this request: tool prompts,
+      *  system-prompt sections, nudge sections. Same carrying rationale as
+      *  prompts — the compress loop must rebuild the identical surface. */
+    surface?: PackSurface;
     /** #388: side request (title-gen etc.) — transport with render-tag strip
      *  only. Skips preflight (handle() returns before it), the fake-completion
      *  retry wrapper, the compress loop, and every usage-sniffing pipe; the
@@ -1094,6 +1098,7 @@ async function handle(
     // and the compress-loop system prompt all use one consistent Prompts set
     // (kernel contract: renderNudgeText and the adapter prompt must match).
     let reqPrompts: Prompts = defaultPrompts;
+    let reqSurface: PackSurface = {};
     if (parsed && typeof parsed === "object") {
         const model = (parsed as { model?: string }).model;
         if (model) {
@@ -1170,7 +1175,9 @@ async function handle(
                 nativeFromFallback = false;
                 log("info", `[codex] effective window clamped ${before} → ${aligned.limit} (codex's own perception for model=${model}; ACP now compresses before codex's native auto-compact)`);
             }
-            reqPrompts = resolveCompressPrompts(resolveCompress(opts.routes, embeddedUrl, model, opts.compress));
+            const compressCfg = resolveCompress(opts.routes, embeddedUrl, model, opts.compress);
+            reqPrompts = resolveCompressPrompts(compressCfg);
+            reqSurface = resolveCompressSurface(compressCfg);
         }
     }
     let prepared: Prepared | null = null;
@@ -1587,16 +1594,16 @@ async function handle(
                     return countTokens
                         ? prepareCountTokens(work as AnthropicRequestBody, core, reqConfig, log, session)
                         : protocol === "anthropic"
-                          ? prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, pluginMode, upstreamOrigin, reasoningCfg)
+                          ? prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg)
                           : protocol === "openai"
-                             ? prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg)
+                             ? prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg)
                              : responsesCompact
                                 // #618 review nit: when no bili compaction item is present,
                                 // prepareResponsesCompact falls back to the raw bodyBuffer — forward
                                 // the re-serialized post-strip work instead so dropped images don't
                                 // ride along. Unchanged bodies keep the original buffer byte-identical.
                                 ? prepareResponsesCompact(stripped.removed > 0 ? Buffer.from(JSON.stringify(work)) : bodyBuffer, work as ResponsesRequestBody, session, req, core, reqConfig, log)
-                               : prepareResponses(work as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg);
+                               : prepareResponses(work as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg);
                 };
                 // #332: codex's native remote-compaction request (trigger form)
                 // is dispatched BEFORE prepare/preflight. When it is not
@@ -1944,6 +1951,7 @@ function prepareAnthropic(
     core: CompressionCore,
     config: Config,
     prompts: Prompts,
+    surface: PackSurface,
     log: (level: string, msg: string) => void,
     session: Session,
     pluginMode: boolean,
@@ -1958,7 +1966,7 @@ function prepareAnthropic(
 
     if (isAutoModeClassifier(parsed)) {
         log("info", `[${sessionId}] auto-mode classifier passthrough (skipping compress injection)`);
-        return { body: JSON.stringify(parsed), session, processedMessages: [], originalMessages: [], anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: false, pluginMode, nudge: undefined, prompts } as Prepared;
+        return { body: JSON.stringify(parsed), session, processedMessages: [], originalMessages: [], anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: false, pluginMode, nudge: undefined, prompts, surface } as Prepared;
     }
 
     let processedMessages: CoreMessage[] = [];
@@ -2038,7 +2046,7 @@ function prepareAnthropic(
         // agent's re-sent history, safe for the prefix-cache anchor.
         if (willInjectNudge && turn.nudge) {
             try {
-                const rendered = renderNudgeText(turn.nudge, prompts);
+                const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections);
                 if (rendered.text) {
                     rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withStagedCompressGuidance(rendered.text)) }];
                 }
@@ -2062,7 +2070,7 @@ function prepareAnthropic(
     // identity chain (#268), not part of the Anthropic Messages API — strip it
     // so the real upstream never sees a field it doesn't know.
     delete (rebuilt as Record<string, unknown>).prompt_cache_key;
-    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, renderTags: "text-only" } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, renderTags: "text-only" } as Prepared;
 }
 
 // #453 hard backstop: cap the forwarded output budget so input+output can never
@@ -2180,6 +2188,7 @@ function prepareOpenai(
     core: CompressionCore,
     config: Config,
     prompts: Prompts,
+    surface: PackSurface,
     log: (level: string, msg: string) => void,
     session: Session,
     pluginMode: boolean,
@@ -2266,7 +2275,7 @@ function prepareOpenai(
         // would invalidate the cache every turn.
         const sysParts: string[] = [];
         if (systemText) sysParts.push(systemText);
-        if (shouldInject) sysParts.push(withMarkerIntegrityNote(buildCompressSystemPrompt(prompts)));
+        if (shouldInject) sysParts.push(withMarkerIntegrityNote(buildCompressSystemPrompt(prompts, surface?.promptSections)));
         if (absorbActive) sysParts.push(buildAbsorbSystemPrompt(absorbToolName(config)));
         rebuiltMessages = injectOpenaiSystem(rebuiltMessages, sysParts);
         // #532: capture what bili injects outside the fold space (client system
@@ -2285,7 +2294,7 @@ function prepareOpenai(
         // prefix-cache-anchor safe.
         if (willInjectNudge && turn.nudge) {
             try {
-                const rendered = renderNudgeText(turn.nudge, prompts);
+                const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections);
                 if (rendered.text) {
                     rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withStagedCompressGuidance(rendered.text)) }];
                 }
@@ -2324,7 +2333,7 @@ function prepareOpenai(
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: injectTools, pluginMode, nudge, prompts, openaiSystemText, renderTags: "text-only" } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, openaiSystemText, renderTags: "text-only" } as Prepared;
 }
 
 function prepareResponses(
@@ -2334,6 +2343,7 @@ function prepareResponses(
     core: CompressionCore,
     config: Config,
     prompts: Prompts,
+    surface: PackSurface,
     log: (level: string, msg: string) => void,
     session: Session,
     identity: ConversationIdentity,
@@ -2456,7 +2466,7 @@ function prepareResponses(
             ? []
             : (session.metadata.codexForgedSummaries as string[] | undefined) ?? [];
         if (shouldInject && !isCompactionTrigger && !process.env.ACP_NO_COMPRESS_PROMPT) {
-            const prompt = withMarkerIntegrityNote(responsesTextProtocol ? buildCompressHybridSystemPrompt(prompts) : buildCompressSystemPrompt(prompts));
+            const prompt = withMarkerIntegrityNote(responsesTextProtocol ? buildCompressHybridSystemPrompt(prompts, surface?.promptSections) : buildCompressSystemPrompt(prompts, surface?.promptSections));
             const devParts = [...projection.systemParts, ...forgedSummaries, prompt];
             if (absorbActive) devParts.push(buildAbsorbSystemPrompt(absorbToolName(config)));
             const devContent = devParts.join("\n\n---\n\n");
@@ -2481,7 +2491,7 @@ function prepareResponses(
         // message — not persisted, prefix-cache-anchor safe.
         if (willInjectNudge && turn.nudge) {
             try {
-                const rendered = renderNudgeText(turn.nudge, prompts);
+                const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections);
                 if (rendered.text) {
                     const inputItems: ResponseInputItem[] = typeof rebuiltInput === "string"
                         ? [{ type: "message", role: "user", content: rebuiltInput }]
@@ -2594,6 +2604,7 @@ function prepareResponses(
         responsesTextProtocol,
         nudge,
         prompts,
+        surface,
         renderTags,
         resetAfterSuccess: isCompactionTrigger,
         codexForge,
@@ -2783,6 +2794,7 @@ function injectSystem(
     opts: ProxyOptions,
     prompts: Prompts = defaultPrompts,
     config: Config,
+    surface?: PackSurface,
 ): string | AnthropicRequestBody["system"] {
     // ONLY the static compress prompt goes into the system block — it is the
     // prefix-cache anchor and must stay byte-stable across turns. The nudge
@@ -2790,30 +2802,32 @@ function injectSystem(
     // the caller (prepareAnthropic), never merged into system.
     const baseText = extractSystem(parsed.system);
     const parts: string[] = [];
-    if (opts.compress.injectTool) parts.push(withMarkerIntegrityNote(buildCompressSystemPrompt(prompts)));
+    if (opts.compress.injectTool) parts.push(withMarkerIntegrityNote(buildCompressSystemPrompt(prompts, surface?.promptSections)));
     if (opts.compress.injectTool && absorbEnabled(config)) parts.push(buildAbsorbSystemPrompt(absorbToolName(config)));
     if (parts.length === 0) return parsed.system;
     const full = baseText ? `${baseText}\n\n---\n\n${parts.join("\n\n")}` : parts.join("\n\n");
     return buildSystem(full, parsed.system);
 }
 
-function injectTool(tools: unknown[] | undefined, extra?: { name: string }): unknown[] {
-    if (!Array.isArray(tools)) return extra ? [...ACP_TOOLS_ANTHROPIC, extra] : [...ACP_TOOLS_ANTHROPIC];
+function injectTool(tools: unknown[] | undefined, extra?: { name: string }, toolPrompts?: ToolPrompts): unknown[] {
+    const acp = applyAcpToolOverrides(ACP_TOOLS_ANTHROPIC, toolPrompts);
+    if (!Array.isArray(tools)) return extra ? [...acp, extra] : [...acp];
     const names = new Set(tools.map((t) => (t as { name?: string })?.name));
-    const missing = ACP_TOOLS_ANTHROPIC.filter((t) => !names.has(t.name));
+    const missing = acp.filter((t) => !names.has(t.name));
     const extraMissing = extra && !names.has(extra.name);
     if (missing.length === 0 && !extraMissing) return tools;
     return [...tools, ...missing, ...(extraMissing ? [extra] : [])];
 }
 
-function injectOpenaiTool(tools: OpenAITool[] | undefined, extra?: OpenAITool): OpenAITool[] {
-    if (!Array.isArray(tools)) return extra ? [...ACP_TOOLS_OPENAI, extra] as OpenAITool[] : ([...ACP_TOOLS_OPENAI] as OpenAITool[]);
+function injectOpenaiTool(tools: OpenAITool[] | undefined, extra?: OpenAITool, toolPrompts?: ToolPrompts): OpenAITool[] {
+    const acp = applyAcpToolOverrides(ACP_TOOLS_OPENAI, toolPrompts) as OpenAITool[];
+    if (!Array.isArray(tools)) return extra ? [...acp, extra] : ([...acp] as OpenAITool[]);
     const present = new Set(
         tools
             .map((t) => t?.function?.name)
             .filter((n): n is string => typeof n === "string"),
     );
-    const additions = ACP_TOOLS_OPENAI.filter((t) => !present.has(t.function.name));
+    const additions = acp.filter((t) => !present.has(t.function.name));
     const out = [...tools, ...(additions as OpenAITool[])];
     if (extra && !out.some((t) => t?.function?.name === extra.function?.name)) out.push(extra);
     return out;
@@ -2828,14 +2842,15 @@ const FORCE_TEXT_PROTOCOL = process.env.ACP_COMPRESS_PROTOCOL === "text";
 /** Inject all ACP tools (compress/decompress/search_context/acp_status) in
  *  Responses API flat format, matching the PROXY_TOOL_NAMES set the compress
  *  loop dispatches on. Idempotent. */
-function injectResponsesTool(tools: unknown[] | undefined, toolsToAdd: readonly { name: string }[] = ACP_TOOLS_RESPONSES): unknown[] {
-    if (!Array.isArray(tools)) return [...toolsToAdd];
+function injectResponsesTool(tools: unknown[] | undefined, toolsToAdd: readonly { name: string }[] = ACP_TOOLS_RESPONSES, toolPrompts?: ToolPrompts): unknown[] {
+    const base = applyAcpToolOverrides(toolsToAdd, toolPrompts);
+    if (!Array.isArray(tools)) return [...base];
     const present = new Set(
         tools
             .map((t) => (t as { name?: string })?.name)
             .filter((n): n is string => typeof n === "string"),
     );
-    const additions = toolsToAdd.filter((t) => !present.has(t.name));
+    const additions = base.filter((t) => !present.has(t.name));
     return [...tools, ...additions];
 }
 
@@ -3170,6 +3185,7 @@ async function preflightCompressIfNeeded(
                 session,
                 config,
                 prompts: prepared.prompts ?? defaultPrompts,
+                surface: prepared.surface,
                 protocol: prepared.protocol,
                 url: upstreamUrl,
                 headers,
@@ -3897,7 +3913,7 @@ async function forward(
             const absorbSection = absorbActive
                 ? `\n\n---\n\n${buildAbsorbSystemPrompt(absorbToolName(loopConfig))}`
                 : "";
-            const systemPrompt = withMarkerIntegrityNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts)) + absorbSection;
+            const systemPrompt = withMarkerIntegrityNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections)) + absorbSection;
             const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined);
             const refreshFolded = (current: CoreMessage[]): CoreMessage[] => {
                 // #422: mirror the prepare's fold with the post-compress state so

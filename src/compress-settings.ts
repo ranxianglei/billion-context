@@ -1,5 +1,7 @@
-import { DEFAULT_ABSORB_CONFIG, defaultPrompts, resolvePrompts, type AbsorbConfig, type Config, type Prompts } from "acp-kernel";
+import { DEFAULT_ABSORB_CONFIG, defaultPrompts, resolvePrompts, createPackResolver, defaultPackSources, isValidPackName, type AbsorbConfig, type Config, type PackSurface, type Prompts } from "acp-kernel";
+import * as path from "node:path";
 import { findRoute, type CompressSettings, type ProviderRoutes } from "./config.js";
+import { configDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 
 /** Resolve a raw `contextLimit` value to an absolute token count.
@@ -71,6 +73,7 @@ stripImages: pick("stripImages"),
         // exactly like `absorb`/`prompts`: a model-level `threshold` must not
         // discard a provider-level `drop: false`.
         reasoning: reasoningLevels.length > 0 ? Object.assign({}, ...reasoningLevels) : undefined,
+        promptPack: pick("promptPack"),
     };
 }
 
@@ -110,6 +113,37 @@ export function resolveCompressPrompts(s: CompressSettings): Prompts {
     } catch {
         return defaultPrompts;
     }
+}
+
+let warnedUnknownPack = new Set<string>();
+
+/** Resolve the pack surface for one request: `promptPack` names a pack in the
+ *  kernel's resolver chain [project `./.billion-context/packs` > user
+ *  `<configDir>/packs` > builtin registry]. Unknown names fall back to the
+ *  identity surface ({} — kernel defaults everywhere) with a one-time-per-name
+ *  warning, so a typo never degrades the compression prompts. Directory
+ *  layout is host policy; resolution/sanitization is the kernel's. */
+export function resolveCompressSurface(
+    s: CompressSettings,
+    dirs?: { projectDir?: string; userDirs?: readonly string[] },
+): PackSurface {
+    const name = s.promptPack;
+    if (typeof name !== "string" || name === "default" || !isValidPackName(name)) return {};
+    const resolver = createPackResolver(
+        defaultPackSources({
+            projectDir: dirs?.projectDir ?? path.join(process.cwd(), ".billion-context", "packs"),
+            userDirs: dirs?.userDirs ?? [path.join(configDir(), "packs")],
+        }),
+    );
+    const pack = resolver.resolve(name);
+    if (!pack) {
+        if (!warnedUnknownPack.has(name)) {
+            warnedUnknownPack.add(name);
+            loggerLog("warn", `[compress] promptPack "${name}" not found (project/user/builtin); using default surface`);
+        }
+        return {};
+    }
+    return pack.surface;
 }
 
 /** True when a CompressSettings carries at least one configured field (i.e. it

@@ -293,6 +293,13 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Status:** ACTIVE
 - **Description:** Must be `true` for `prompts` overrides to take effect. Setting it acknowledges the summary-quality risk documented above.
 
+#### `promptPack`
+
+- **Type:** `string` (pack name, e.g. `"lean"`)
+- **Default:** *(unset — identity surface, kernel defaults everywhere)*
+- **Status:** ACTIVE
+- **Description:** Select a named prompt pack — a curated surface preset covering tool descriptions, compress system-prompt sections, and nudge sections — resolved from the kernel's pack chain: **project** `./.billion-context/packs/<name>.json` → **user** `<configDir>/packs/<name>.json` → **builtin** (`default`, `lean`). Built-in `lean` swaps the four ACP tool descriptions for one-liners (no snippet/guideline chrome) while keeping the compression rules default. Unknown names fall back to the identity surface with a one-time warning. Same three-level merge as the other fields; a pack's `prompts` overrides are subject to `acknowledgePromptsRisk` only when applied via `compress.prompts` — pack-surface sections (tool/section overrides) apply directly. Requires `acp-kernel` >= 0.0.66.
+
 #### `absorb`
 
 - **Type:** `object` (`{ enabled?, minToolTokens?, contextThresholdPct?, excludeTools?, toolName? }`)

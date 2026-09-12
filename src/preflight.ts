@@ -5,6 +5,7 @@ import {
     type Config,
     type CoreMessage,
     type Prompts,
+    type PackSurface,
 } from "acp-kernel";
 import { buildCompressSystemPrompt, parseCompressInput } from "./compress-tool.js";
 import { applyAbsorbView } from "./absorb.js";
@@ -39,6 +40,7 @@ export interface PreflightDeps {
     session: Session;
     config: Config;
     prompts: Prompts;
+    surface?: PackSurface;
     protocol: PreflightProtocol;
     url: string;
     headers: Record<string, string>;
@@ -447,7 +449,7 @@ export function diagnoseEmptySummary(text: string, json?: unknown): string {
 
 async function summarizeRange(deps: PreflightDeps, content: string, startRef: string, endRef: string): Promise<SummaryOutcome> {
     const system =
-        buildCompressSystemPrompt(deps.prompts) +
+        buildCompressSystemPrompt(deps.prompts, deps.surface?.promptSections) +
         `\n\nTASK: The conversation segment below (messages ${startRef}–${endRef}) must be compressed because the session context exceeds the current model's window. Write a tier-1 compression summary of the segment following every rule above. Output ONLY the summary text — no preamble, no closing remarks, no tool calls.`;
     // #626: the session remembers upstreams that require stream:true, so the
     // extra 400 round-trip is paid at most once per session (persisted with
