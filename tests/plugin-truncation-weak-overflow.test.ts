@@ -118,3 +118,133 @@ test("responses pipe: response.completed terminates, no signal", async () => {
     }
     assert.equal(learnedOf(session), undefined);
 });
+
+// #721: a plugin-mode stream that ends without a terminal event must hand the
+// client a well-formed end of stream (synthesized terminal byte or in-band
+// error event) instead of a bare cut-off SSE.
+
+const TRUNC_MARKER = "upstream_stream_truncated";
+
+function failingStream(chunks: string[], err: Error): ReadableStream<Uint8Array> {
+    const enc = new TextEncoder();
+    let i = 0;
+    return new ReadableStream<Uint8Array>({
+        pull(controller) {
+            if (i < chunks.length) {
+                controller.enqueue(enc.encode(chunks[i]));
+                i += 1;
+            } else {
+                controller.error(err);
+            }
+        },
+    });
+}
+
+test("#721 chat pipe (openai): mid-generation cut emits in-band error frame + [DONE]", async () => {
+    const { res, chunks } = makeRes();
+    await pipePluginChatWithStrip(streamOf([chatChunk({ content: "partial" })]), res, "openai", makeSession());
+    const out = chunks.join("");
+    assert.ok(out.includes('"content":"partial"'), "partial content still forwarded");
+    const errIdx = out.indexOf(TRUNC_MARKER);
+    const doneIdx = out.indexOf("data: [DONE]");
+    assert.ok(errIdx !== -1, "in-band error frame emitted");
+    assert.ok(doneIdx !== -1 && doneIdx > errIdx, "[DONE] terminates the stream after the error frame");
+    assert.ok(out.includes(`"type":"server_error"`), "error frame carries the server_error type");
+});
+
+test("#721 chat pipe (openai): finish_reason seen, [DONE] lost → bare [DONE] synthesized, no error", async () => {
+    const finish = `data: ${JSON.stringify({ id: "chatcmpl-1", object: "chat.completion.chunk", created: 1, model: "qwen", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`;
+    const { res, chunks } = makeRes();
+    await pipePluginChatWithStrip(streamOf([chatChunk({ content: "done turn" }), finish]), res, "openai", makeSession());
+    const out = chunks.join("");
+    assert.ok(!out.includes(TRUNC_MARKER), "no error frame when a finish reason was delivered");
+    assert.ok(out.endsWith("data: [DONE]\n\n"), "missing terminal byte synthesized");
+});
+
+test("#721 chat pipe (anthropic): stop_reason seen, message_stop lost → message_stop synthesized, no error", async () => {
+    const start = `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { usage: { input_tokens: 95000 } } })}\n\n`;
+    const mdelta = `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 5 } })}\n\n`;
+    const { res, chunks } = makeRes();
+    await pipePluginChatWithStrip(streamOf([start, mdelta]), res, "anthropic", makeSession());
+    const out = chunks.join("");
+    assert.ok(!out.includes(TRUNC_MARKER), "no error event when stop_reason was delivered");
+    assert.ok(out.endsWith(`event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`), "missing message_stop synthesized");
+});
+
+test("#721 chat pipe (anthropic): cut before stop_reason → in-band error event", async () => {
+    const start = `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { usage: { input_tokens: 95000 } } })}\n\n`;
+    const { res, chunks } = makeRes();
+    await pipePluginChatWithStrip(streamOf([start]), res, "anthropic", makeSession());
+    const out = chunks.join("");
+    const errIdx = out.indexOf(TRUNC_MARKER);
+    assert.ok(errIdx !== -1, "in-band error event emitted");
+    const evIdx = out.indexOf("event: error");
+    assert.ok(evIdx !== -1 && evIdx < errIdx, "delivered on the Anthropic error event channel");
+});
+
+test("#721 chat pipe (openai): upstream read failure emits in-band error instead of rethrowing", async () => {
+    const { res, chunks } = makeRes();
+    await assert.doesNotReject(
+        pipePluginChatWithStrip(failingStream([chatChunk({ content: "partial" })], new Error("other side closed")), res, "openai", makeSession()),
+    );
+    const out = chunks.join("");
+    assert.ok(out.includes('"content":"partial"'), "partial content still forwarded before the failure");
+    const errIdx = out.indexOf(TRUNC_MARKER);
+    const doneIdx = out.lastIndexOf("data: [DONE]");
+    assert.ok(errIdx !== -1, "in-band error frame emitted");
+    assert.ok(doneIdx > errIdx, "[DONE] terminates the stream after the error frame");
+});
+
+test("#721 chat pipe (openai): read failure AFTER finish_reason → bare [DONE], no error", async () => {
+    const finish = `data: ${JSON.stringify({ id: "chatcmpl-1", object: "chat.completion.chunk", created: 1, model: "qwen", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`;
+    const { res, chunks } = makeRes();
+    await assert.doesNotReject(
+        pipePluginChatWithStrip(failingStream([chatChunk({ content: "x" }), finish], new Error("socket hang up")), res, "openai", makeSession()),
+    );
+    const out = chunks.join("");
+    assert.ok(!out.includes(TRUNC_MARKER));
+    assert.ok(out.endsWith("data: [DONE]\n\n"));
+});
+
+test("#721 responses pipe: mid-stream cut emits in-band error event instead of bare close", async () => {
+    const delta = `data: ${JSON.stringify({ type: "response.output_text.delta", delta: "hello" })}\n\n`;
+    const { res, chunks } = makeRes();
+    await pipePluginResponsesWithStrip(streamOf([delta]), res, makeSession());
+    const out = chunks.join("");
+    const errIdx = out.indexOf(TRUNC_MARKER);
+    assert.ok(errIdx !== -1, "in-band error event emitted");
+    const evIdx = out.indexOf("event: error");
+    assert.ok(evIdx !== -1 && evIdx < errIdx, "delivered on the Responses error event channel");
+});
+
+test("#721 responses pipe: upstream read failure emits in-band error instead of rethrowing", async () => {
+    const delta = `data: ${JSON.stringify({ type: "response.output_text.delta", delta: "hello" })}\n\n`;
+    const { res, chunks } = makeRes();
+    await assert.doesNotReject(pipePluginResponsesWithStrip(failingStream([delta], new Error("fetch failed")), res, makeSession()));
+    const out = chunks.join("");
+    assert.ok(out.includes('"delta":"hello"'));
+    assert.ok(out.indexOf(TRUNC_MARKER) !== -1);
+});
+
+test("#721 chat pipe: client abort suppresses the synthesized terminal/error", async () => {
+    const { res, chunks } = makeRes();
+    res.destroyed = true;
+    await pipePluginChatWithStrip(streamOf([chatChunk({ content: "x" })]), res, "openai", makeSession());
+    assert.ok(!chunks.join("").includes(TRUNC_MARKER), "no in-band error for a gone client");
+});
+
+test("#721 responses pipe: client abort suppresses the synthesized terminal/error", async () => {
+    const delta = `data: ${JSON.stringify({ type: "response.output_text.delta", delta: "hello" })}\n\n`;
+    const { res, chunks } = makeRes();
+    res.destroyed = true;
+    await pipePluginResponsesWithStrip(failingStream([delta], new Error("aborted")), res, makeSession());
+    assert.ok(!chunks.join("").includes(TRUNC_MARKER), "no in-band error for a gone client");
+});
+
+test("#721 chat pipe: no session (#460 non-injected branch) still gets the in-band error", async () => {
+    const { res, chunks } = makeRes();
+    await pipePluginChatWithStrip(streamOf([chatChunk({ content: "x" })]), res, "openai");
+    const out = chunks.join("");
+    assert.ok(out.includes(TRUNC_MARKER));
+    assert.ok(out.includes("data: [DONE]"));
+});
