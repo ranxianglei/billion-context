@@ -312,7 +312,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                         yield { kind: "meta", chunk: Buffer.from(eventStr + "\n\n", "utf8") } as ParsedStreamEvent;
                     }
                     maybeWarnDegenerate("stop");
-                    yield { kind: "done", finishReason: "stop", ...(sawRealToolCall ? { suppressCompletion: true } : {}) } as ParsedStreamEvent;
+                    yield { kind: "done", finishReason: "stop", thinking: sawReasoning, ...(sawRealToolCall ? { suppressCompletion: true } : {}) } as ParsedStreamEvent;
                     continue;
                 }
                 let parsed: Record<string, unknown>;
@@ -369,13 +369,14 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                         // bytes after the finish reason).
                         yield { kind: "meta", chunk } as ParsedStreamEvent;
                         maybeWarnDegenerate(finishReason);
-                        yield { kind: "done", finishReason, suppressCompletion: true } as ParsedStreamEvent;
+                        yield { kind: "done", finishReason, suppressCompletion: true, thinking: sawReasoning } as ParsedStreamEvent;
                         continue;
                     } else {
                         maybeWarnDegenerate(finishReason);
                         yield {
                             kind: "done",
                             finishReason: hadToolCalls && finishReason === "stop" ? "tool_calls" : finishReason,
+                            thinking: sawReasoning,
                         } as ParsedStreamEvent;
                     }
                 }
