@@ -59,8 +59,8 @@ function agentName(override: string | undefined): string {
     return process.env.BILLION_CONTEXT_PLUGIN_AGENT === "omp" ? "omp" : "pi";
 }
 
-function proxyBaseForCtx(ctx: Ctx): string | undefined {
-    return detectProxyBase(ctx.model?.baseUrl);
+function proxyBaseForCtx(ctx: Ctx | undefined): string | undefined {
+    return detectProxyBase(ctx?.model?.baseUrl);
 }
 
 function sessionIdOf(ctx: Ctx): string | undefined {
@@ -281,10 +281,16 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
         // cancels ALL compaction — under bili, manual native /compact is
         // equally harmful (the native summarizer would destroy the
         // ACP-tagged context), the host shows "Compaction cancelled", and
-        // the user should reach for /acp instead. Only armed under `bili`
-        // launch: plain pi/omp with the plugin installed stays fully native.
-        if ((agent === "pi" || agent === "omp") && process.env.BILLION_CONTEXT_PROXY !== undefined) {
-            pi.on("session_before_compact", (event) => {
+        // the user should reach for /acp instead. Whether we own compression
+        // is decided at EVENT time, not load time: in native mode (#519) the
+        // proxy origin lands in BILLION_CONTEXT_PROXY only after the async
+        // bootstrap finishes, so a load-time check would leave the cancel
+        // disarmed for the whole session. Plain pi/omp with the plugin
+        // installed but NO reachable proxy (incl. a failed bootstrap) stays
+        // fully native.
+        if (agent === "pi" || agent === "omp") {
+            pi.on("session_before_compact", (event, ctx) => {
+                if (proxyBaseForCtx(ctx) === undefined) return undefined;
                 if (agent === "pi") {
                     const reason = (event as unknown as { reason?: unknown }).reason;
                     if (reason === "threshold" || reason === "overflow") return { cancel: true };

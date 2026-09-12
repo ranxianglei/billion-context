@@ -162,6 +162,10 @@ export interface LauncherDeps {
     spawnImpl?: SpawnFn;
     now?: () => number;
     sleep?: (ms: number) => Promise<void>;
+    /** #519 native mode: the proxy entry script to spawn. The launcher
+     *  default (process.argv[1]) is WRONG inside a host process like pi —
+     *  pi-native.ts passes its own package's dist/index.js instead. */
+    scriptPath?: string;
 }
 
 export function isLaunchClient(value: string): value is ClientName {
@@ -1814,7 +1818,7 @@ export async function ensureProxyRunning(
     // pointed there only ever reach an explicitly-started `bili start`.
     // The child's EADDRINUSE retry covers the pick/spawn race.
     const port = opts.port > 0 ? opts.port : await pickEphemeralPort(opts.host);
-    const script = process.argv[1];
+    const script = deps.scriptPath ?? process.argv[1];
     if (!script) throw new Error("bili: cannot resolve launcher script path");
     const logPath = path.join(os.tmpdir(), `bili-proxy-${port}.log`);
     const logFd = fs.openSync(logPath, "a");
