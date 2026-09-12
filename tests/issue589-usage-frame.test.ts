@@ -31,27 +31,20 @@ async function collect(adapter: ReturnType<typeof createOpenaiAdapter>, events: 
     return { meta, kinds };
 }
 
-test("#589: raw tool-call round forwards the trailing usage-only frame, patched with credit", async () => {
-    const adapter = createOpenaiAdapter({ model: "m" }, undefined, 40000);
+test("#589: raw tool-call round forwards the trailing usage-only frame verbatim", async () => {
+    const adapter = createOpenaiAdapter({ model: "m" });
     const { meta } = await collect(adapter, [chunk(toolDelta), chunk(finishChunk), chunk(usageFrame), "data: [DONE]\n\n"]);
-    const usageAt = meta.indexOf('"prompt_tokens":90000');
+    const usageAt = meta.indexOf('"prompt_tokens":50000');
     const finishAt = meta.indexOf('"finish_reason":"tool_calls"');
     const doneAt = meta.indexOf("[DONE]");
     assert.ok(usageAt >= 0, `expected patched usage frame in client stream: ${meta}`);
-    assert.ok(meta.includes('"total_tokens":90010'), meta);
+    assert.ok(meta.includes('"total_tokens":50010'), meta);
     assert.ok(finishAt >= 0 && usageAt > finishAt, `usage frame must come after the finish chunk: ${meta}`);
     assert.ok(doneAt >= 0 && usageAt < doneAt, `usage frame must come before [DONE]: ${meta}`);
 });
 
-test("#589: trailing usage-only frame forwarded verbatim when no credit", async () => {
-    const adapter = createOpenaiAdapter({ model: "m" }, undefined, 0);
-    const { meta } = await collect(adapter, [chunk(toolDelta), chunk(finishChunk), chunk(usageFrame), "data: [DONE]\n\n"]);
-    assert.ok(meta.includes('"prompt_tokens":50000'), meta);
-    assert.ok(!meta.includes('"prompt_tokens":90000'), meta);
-});
-
 test("#589: non-tool rounds keep swallowing the trailing frame (rebuild embeds usage)", async () => {
-    const adapter = createOpenaiAdapter({ model: "m" }, undefined, 40000);
+    const adapter = createOpenaiAdapter({ model: "m" });
     const textDelta = { id: "c1", object: "chat.completion.chunk", created: 1, model: "m", choices: [{ index: 0, delta: { content: "hi there" } }] };
     const finishText = { id: "c1", object: "chat.completion.chunk", created: 1, model: "m", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] };
     const { meta } = await collect(adapter, [chunk(textDelta), chunk(finishText), chunk(usageFrame), "data: [DONE]\n\n"]);
@@ -59,7 +52,7 @@ test("#589: non-tool rounds keep swallowing the trailing frame (rebuild embeds u
 });
 
 test("#589: usage-only frame without usage field is not forwarded", async () => {
-    const adapter = createOpenaiAdapter({ model: "m" }, undefined, 40000);
+    const adapter = createOpenaiAdapter({ model: "m" });
     const emptyChoices = { id: "c1", object: "chat.completion.chunk", created: 1, model: "m", choices: [] };
     const { meta } = await collect(adapter, [chunk(toolDelta), chunk(finishChunk), chunk(emptyChoices), "data: [DONE]\n\n"]);
     assert.ok(!meta.includes("chat.completion.chunk\" }"), meta);

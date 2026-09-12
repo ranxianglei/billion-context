@@ -5,12 +5,17 @@ import os from "node:os";
 import path from "node:path";
 import {
     atomicWriteInstanceFile,
+    claimStartingMarker,
     clearProxyInstanceFile,
+    clearStartingMarker,
     instanceFilePath,
     isPidAlive,
     isProxyInstanceFile,
     readProxyInstanceFile,
+    readStartingMarker,
     registerInstanceAndWarn,
+    removeStartingMarker,
+    startingMarkerPath,
     unregisterInstance,
     type ProxyInstanceFile,
 } from "../src/instance.ts";
@@ -85,6 +90,45 @@ test("clearProxyInstanceFile: only removes its own record", () => {
         assert.ok(isProxyInstanceFile(readProxyInstanceFile()));
         clearProxyInstanceFile("inst-abc");
         assert.equal(readProxyInstanceFile(), undefined);
+    } finally {
+        st.restore();
+    }
+});
+
+test("starting marker: claim is exclusive, read validates, clear is token-checked (#707)", () => {
+    const st = tmpStateDir();
+    try {
+        const m1 = { token: "t1", pid: process.pid, host: "127.0.0.1", port: 8787, startedAt: 1_000_000 };
+        assert.equal(claimStartingMarker(m1), true, "first claim wins");
+        assert.equal(claimStartingMarker({ ...m1, token: "t2" }), false, "O_EXCL: second claimant rejected");
+        assert.deepEqual(readStartingMarker(), m1);
+
+        clearStartingMarker("t2");
+        assert.ok(readStartingMarker(), "token mismatch → not removed");
+        clearStartingMarker("t1");
+        assert.equal(readStartingMarker(), undefined);
+        assert.equal(claimStartingMarker(m1), true, "claim succeeds again after clear");
+
+        removeStartingMarker();
+        assert.equal(readStartingMarker(), undefined);
+    } finally {
+        st.restore();
+    }
+});
+
+test("starting marker: garbage file reads as absent but still blocks a claim (#707)", () => {
+    const st = tmpStateDir();
+    try {
+        fs.mkdirSync(path.join(st.dir, "billion-context"), { recursive: true });
+        fs.writeFileSync(startingMarkerPath(), "{{{garbage");
+        assert.equal(readStartingMarker(), undefined);
+        fs.writeFileSync(startingMarkerPath(), JSON.stringify({ token: "", pid: 1, startedAt: 1 }));
+        assert.equal(readStartingMarker(), undefined, "empty token invalid");
+        assert.equal(
+            claimStartingMarker({ token: "t", pid: process.pid, host: "h", port: 0, startedAt: 2 }),
+            false,
+            "existing file blocks the claim; caller degrades to pre-#707 behavior",
+        );
     } finally {
         st.restore();
     }

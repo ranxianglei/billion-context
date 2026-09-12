@@ -1,10 +1,10 @@
 import type { CoreMessage } from "acp-kernel";
 import { coreToOpenai, injectOpenaiSystem } from "acp-kernel/wire";
 import { buildVisibilityMarker } from "../compress-loop.js";
-import { createTagEchoFilter } from "./tag-echo-filter.js";
+import { composeStreamFilters, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
-import { systemToUser } from "../util.js";
+import { hardenOpenaiAssistantContent, systemToUser } from "../util.js";
 
 import type {
     CompressLoopAdapter,
@@ -116,28 +116,7 @@ function stripFinishReasonChunk(buf: Buffer): Buffer {
     }
 }
 
-function patchUsageChunk(eventStr: string, parsed: Record<string, unknown>, u: Record<string, unknown>, hostCredit: number): Buffer {
-    const pu = typeof u.prompt_tokens === "number" ? u.prompt_tokens : undefined;
-    const tu = typeof u.total_tokens === "number" ? u.total_tokens : undefined;
-    if (hostCredit > 0 && (pu !== undefined || tu !== undefined)) {
-        const patched = {
-            ...parsed,
-            usage: {
-                ...u,
-                ...(pu !== undefined ? { prompt_tokens: pu + hostCredit } : {}),
-                ...(tu !== undefined ? { total_tokens: tu + hostCredit } : {}),
-            },
-        };
-        const out = eventStr
-            .split("\n")
-            .map((l) => (l.startsWith("data:") ? `data: ${JSON.stringify(patched)}` : l))
-            .join("\n");
-        return Buffer.from(out + "\n\n", "utf8");
-    }
-    return Buffer.from(eventStr + "\n\n", "utf8");
-}
-
-export function createOpenaiAdapter(requestBody: Record<string, unknown>, clientSystem?: string, hostCredit = 0, absorbName?: string): CompressLoopAdapter {
+export function createOpenaiAdapter(requestBody: Record<string, unknown>, clientSystem?: string, absorbName?: string): CompressLoopAdapter {
     const model = (requestBody.model as string) ?? "unknown";
     let responseId = `chatcmpl-proxy-${Date.now()}`;
     let toolIndex = 0;
@@ -212,7 +191,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
             // runtime state), so coreMessages no longer carries it — re-inject
             // the CLIENT's original system ahead of the compress prompt,
             // mirroring the anthropic adapter's anthropicSystem path.
-            const messages = systemToUser(coreToOpenai(coreMessages));
+            const messages = systemToUser(hardenOpenaiAssistantContent(coreToOpenai(coreMessages)));
             const withSys = injectOpenaiSystem(messages, [clientSystem, systemPrompt].filter((p): p is string => typeof p === "string" && p.length > 0));
             return { ...body, messages: withSys };
         },
@@ -221,9 +200,14 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
             const pending = new Map<number, ToolCallBuffer>();
             // #206: strip model-imitated render tags from content deltas; the
             // filter may hold back a short tail, flushed at finish/[DONE].
-            const tagFilter = createTagEchoFilter((snippet) => {
-                loggerLog("warn", `[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
-            });
+            const tagFilter = composeStreamFilters(
+                createTagEchoFilter((snippet) => {
+                    loggerLog("warn", `[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                }),
+                createMarkerLineFilter((snippet) => {
+                    loggerLog("warn", `[marker-echo] stripped model-emitted ACP confirmation marker: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                }),
+            );
             const flushFilter = function* (): Generator<ParsedStreamEvent> {
                 const tail = tagFilter.flush();
                 if (tail.length > 0) {
@@ -352,10 +336,10 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                         } as ParsedStreamEvent;
                         // #589: include_usage clients (dsh, OpenAI SDK) read usage
                         // from this trailing empty-choices frame; raw tool-call rounds
-                        // must forward it (with the prepare-time credit), not swallow
-                        // it into the internal ledger.
+                        // must forward it verbatim, not swallow it into the internal
+                        // ledger.
                         if (sawRealToolCall) {
-                            yield { kind: "meta", chunk: patchUsageChunk(eventStr, parsed, u, hostCredit) } as ParsedStreamEvent;
+                            yield { kind: "meta", chunk: rawBuf } as ParsedStreamEvent;
                         }
                     }
                     continue;
@@ -376,11 +360,9 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                         cachedTokens: typeof pd?.cached_tokens === "number" ? pd.cached_tokens : undefined,
                     } as ParsedStreamEvent;
                     if (sawRealToolCall) {
-                        // #408: this raw finish chunk (with the provider's
-                        // post-fold usage) reaches the host verbatim — add the
-                        // prepare-time credit back so the host anchors on the
-                        // uncompressed baseline.
-                        const chunk = patchUsageChunk(eventStr, parsed, u ?? {}, hostCredit);
+                        // The raw finish chunk (provider-measured usage) reaches
+                        // the host verbatim — no rewriting.
+                        const chunk = rawBuf;
                         // This verbatim chunk IS the round's authoritative completion
                         // (suppressCompletion); write it once and never fall through
                         // to the text/reasoning branches (which would re-emit the same

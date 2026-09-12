@@ -316,15 +316,6 @@ export type ProxyOptions = {
     autoUpdate: boolean;
     /** Dist-tag channel the auto-updater follows (default "latest"). */
     updateTag: string;
-    /** #408 host-usage backfill mode. "auto" (default) = the uncompressed-
-     *  baseline backfill is armed for plain proxy clients (the bili-launched
-     *  pi/omp extensions are exempted — their host compaction is cancelled, so
-     *  the baseline drives nothing on the host side). "off" = never backfill —
-     *  the usage reported to the host is the actually-forwarded (folded)
-     *  request, matching [acp-usage] input= (#648: plain anthropic proxy
-     *  clients like ZCode otherwise show a cumulative, drifting baseline that
-     *  overstates real context pressure). */
-    hostUsageCredit: "auto" | "off";
     logFile?: string;
     /** MITM transparent-proxy mode. When enabled, an HTTP CONNECT handler is
      *  attached so clients that only know how to set HTTP_PROXY (ZCode with a
@@ -462,7 +453,6 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         passthrough: passthrough.enabled,
         passthroughSource: passthrough.source,
         autoUpdate: (env.ACP_AUTO_UPDATE ?? (fileConfig.autoUpdate === false ? "0" : "1")) !== "0",
-        hostUsageCredit: parseHostUsageCredit(env.BILI_HOST_USAGE_CREDIT ?? fileConfig.hostUsageCredit),
         updateTag: (env.ACP_UPDATE_TAG ?? fileConfig.updateTag ?? "latest").trim() || "latest",
         logFile: env.ACP_LOG_FILE !== undefined ? (env.ACP_LOG_FILE || undefined) : fileConfig.logFile,
         mitm: {
@@ -497,7 +487,6 @@ type FileConfig = {
     autoUpdate?: boolean;
     /** Dist-tag channel the auto-updater follows (default "latest"). */
     updateTag?: string;
-    hostUsageCredit?: "auto" | "off";
     upstreamProxy?: string;
     upstreamProxyMode?: string;
     logFile?: string;
@@ -607,10 +596,6 @@ export function parsePromptCacheRouting(value: string | undefined): PromptCacheR
 
 export function parseUpstreamProxyMode(value: string | undefined): UpstreamProxyMode {
     return value === "manual" || value === "auto" ? value : "direct";
-}
-
-export function parseHostUsageCredit(value: string | undefined): "auto" | "off" {
-    return value === "off" ? "off" : "auto";
 }
 
 export function parseCompressSettings(v: unknown): (CompressSettings & { injectTool?: boolean; injectNudge?: boolean }) | undefined {

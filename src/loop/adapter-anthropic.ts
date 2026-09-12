@@ -1,7 +1,7 @@
 import type { CoreMessage } from "acp-kernel";
 import { coreToAnthropic, extractSystem, buildSystem, type AnthropicRequestBody } from "acp-kernel/wire";
 import { buildVisibilityMarker } from "../compress-loop.js";
-import { createTagEchoFilter } from "./tag-echo-filter.js";
+import { composeStreamFilters, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
 import type {
@@ -118,7 +118,7 @@ function buildTextDeltaEvent(index: number, text: string): Buffer {
     );
 }
 
-export function createAnthropicAdapter(requestBody: Record<string, unknown>, originalSystem?: AnthropicRequestBody["system"], hostCredit = 0): CompressLoopAdapter {
+export function createAnthropicAdapter(requestBody: Record<string, unknown>, originalSystem?: AnthropicRequestBody["system"]): CompressLoopAdapter {
     const model = (requestBody.model as string) ?? undefined;
     let messageId: string | undefined;
     let clientIndex = 0;
@@ -219,9 +219,14 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             // they reach the client (and before coreText accumulates them for
             // re-request rounds). Flush at the owning block's stop so held-back
             // fragments still emit while the block is open.
-            const tagFilter = createTagEchoFilter((snippet) => {
-                loggerLog("warn", `[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
-            });
+            const tagFilter = composeStreamFilters(
+                createTagEchoFilter((snippet) => {
+                    loggerLog("warn", `[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                }),
+                createMarkerLineFilter((snippet) => {
+                    loggerLog("warn", `[marker-echo] stripped model-emitted ACP confirmation marker: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                }),
+            );
             let lastTextIndex: number | null = null;
             let sawThinking = false;
             let toolCallsEmitted = 0;
@@ -248,26 +253,10 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                     if (typeof u.input_tokens === "number") roundInput = u.input_tokens;
                     if (typeof u.cache_read_input_tokens === "number") roundCached = u.cache_read_input_tokens;
                     if (round === 1) {
-                        // #408: this raw message_start (post-fold input_tokens)
-                        // reaches the host verbatim — add the prepare-time
-                        // credit back so the host anchors on the uncompressed
-                        // baseline.
-                        let chunk = rawBuf;
-                        if (hostCredit > 0 && typeof u.input_tokens === "number") {
-                            const patched = structuredClone(data);
-                            const pmsg = patched["message"] as Record<string, unknown> | undefined;
-                            const pu = (pmsg?.["usage"] ?? {}) as Record<string, unknown>;
-                            if (typeof pu.input_tokens === "number") {
-                                pu.input_tokens += hostCredit;
-                                const out = eventStr
-                                    .split("\n")
-                                    .map((l) => (l.startsWith("data:") ? `data: ${JSON.stringify(patched)}` : l))
-                                    .join("\n");
-                                chunk = Buffer.from(out + "\n\n", "utf8");
-                            }
-                        }
+                        // The raw message_start (with the provider's measured
+                        // usage) reaches the host verbatim — no rewriting.
                         messageStartForwarded = true;
-                        yield { kind: "meta", chunk, firstRoundOnly: true } as ParsedStreamEvent;
+                        yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
                     }
                 } else if (type === "ping") {
                     yield { kind: "meta", chunk: rawBuf } as ParsedStreamEvent;

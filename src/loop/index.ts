@@ -25,11 +25,10 @@ export function pickAdapter(
     responsesProjection?: ResponsesProjection,
     anthropicSystem?: AnthropicRequestBody["system"],
     openaiSystem?: string,
-    hostCredit = 0,
     absorbName?: string,
 ): CompressLoopAdapter {
     if (protocol === "responses") return createResponsesAdapter(textProtocol, responsesProjection, absorbName);
-    if (protocol === "openai") return createOpenaiAdapter(requestBody, openaiSystem, hostCredit, absorbName);
-    if (protocol === "anthropic") return createAnthropicAdapter(requestBody, anthropicSystem, hostCredit);
+    if (protocol === "openai") return createOpenaiAdapter(requestBody, openaiSystem, absorbName);
+    if (protocol === "anthropic") return createAnthropicAdapter(requestBody, anthropicSystem);
     throw new Error(`[acp-loop] unknown protocol: ${protocol}`);
 }

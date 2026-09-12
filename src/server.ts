@@ -44,7 +44,7 @@ import {
     subagentNamespace,
 } from "acp-kernel/wire";
 import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive } from "./session.js";
-import { ABSORB_TOOL, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildAbsorbSystemPrompt, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withStagedCompressGuidance } from "./compress-tool.js";
+import { ABSORB_TOOL, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildAbsorbSystemPrompt, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withMarkerIntegrityNote, withStagedCompressGuidance } from "./compress-tool.js";
 import { applyAbsorbView, absorbEnabled, absorbToolName, storeEffectiveAbsorb } from "./absorb.js";
 import { rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
@@ -73,7 +73,7 @@ import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } f
 import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginRegister, handlePluginStatus, handlePluginTool, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginReportedContextWindow, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
-import { backfillHostUsage, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, shouldReserveOutputHeadroom, systemToUser, usageTotals, type WireProtocol } from "./util.js";
+import { hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, shouldReserveOutputHeadroom, systemToUser, usageTotals, type WireProtocol } from "./util.js";
 import { resolveConfirmedLimit, resolveLearnedLimit, resolveSpeculativeLimit, retractStaleLearnedLimits } from "./weak-overflow.js";
 import { BILI_TUNNEL_HEADER, checkTunnelDestination, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
 
@@ -212,10 +212,6 @@ const UPSTREAM_HOP_HEADERS = new Set([
     "connection",
     "keep-alive",
     "transfer-encoding",
-    // Node's fetch transparently decodes compressed responses. Do not
-    // forward the upstream encoding marker when the body is rewritten or
-    // streamed from fetch, otherwise clients try to decompress plain bytes.
-    "content-encoding",
     // RFC 7230 §6.1 hop-by-hop headers. proxy-authorization in particular
     // carries client→proxy credentials that must never reach the model
     // endpoint. (#80)
@@ -226,6 +222,18 @@ const UPSTREAM_HOP_HEADERS = new Set([
     "trailer",
     "upgrade",
 ]);
+
+// content-encoding is end-to-end (RFC 9110 §7.2), NOT hop-by-hop — but the two
+// directions need opposite treatment. RESPONSES: Node's fetch transparently
+// decodes compressed bodies, so the upstream's encoding marker must not reach
+// the client (it would try to decompress already-plain bytes) — stripped at
+// the response-forward sites below. REQUESTS: the marker describes exactly the
+// bytes bili forwards — decoded/rebuilt bodies have it dropped at decode time
+// (handle()), while verbatim passthrough bodies (#619 undecodable encodings,
+// unknown paths) MUST keep it so upstream applies its own decode; forwarding
+// encoded request bytes without the marker made upstream reject undeclared
+// binary bodies (#677).
+const RESPONSE_ONLY_STRIP_HEADERS = new Set(["content-encoding"]);
 
 // RFC 7230 §6.1: the Connection header names additional hop-by-hop headers
 // that must be stripped per-message. Returns their lowercased names.
@@ -1916,54 +1924,6 @@ function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; cont
     return `[${sessionId}] nudge ${inject}: usage=${pct} (${tokenCount}/${limit}), growth=${growth}/${floor} (ref=${ref}, interval=${interval}), pendingT1=${pendingT1}/${interval}${modelTag}, reason="${n.reason.slice(0, 120)}"`;
 }
 
-// #408/#590/#623/#645/#648: hosts that get the #408 uncompressed-baseline usage
-// backfill. pi's AND omp's bili extensions cancel the host's NATIVE compaction
-// so ACP owns compression — pi cancels auto-compaction, omp cancels ALL
-// compaction (its session_before_compact event carries no reason field, so
-// manual /compact can't be preserved). Codex is exempted the same way (#645):
-// the backfilled baseline is a virtual number the model never receives — it
-// drifts turn-to-turn (real post-fold usage + a character-based estimate of
-// the folded-out tokens, so the metric can decrement with no compress), it
-// exceeds the window (user saw 1315/950k = 138%), and it drives nothing in
-// codex: codex's auto-compact keys off total_tokens, which the backfill never
-// touches. Detected by UA (same signal as native-compact interception) because
-// bili-launched codex sessions carry pluginAgent "mcp" (shared with claude).
-// With the host's compaction off (pi/omp) or the backfill inert (codex),
-// reporting the baseline only puts a >100% footer that mismatches the folded
-// request actually forwarded (#590 pi 302.7%, #623 omp 205%, #645 codex 138%).
-// Plain proxy clients keep the #408 behavior by default (their native
-// compaction stays live and consumes the baseline); the `hostUsageCredit`
-// config option (#648) additionally lets such a client opt out entirely
-// ("off") — ZCode and similar plain anthropic clients otherwise show the
-// cumulative, drifting baseline as inflated context in their UI.
-function armHostUsageCredit(
-    session: Session,
-    originalMessages: CoreMessage[],
-    processedMessages: CoreMessage[],
-    headers: http.IncomingHttpHeaders,
-    hostUsageCredit: "auto" | "off",
-    log: (level: string, msg: string) => void,
-): void {
-    session.hostCreditTokens = 0;
-    // #648: "off" disables the #408 uncompressed-baseline backfill — the host
-    // sees the actually-forwarded (folded) request, matching [acp-usage]
-    // input=. Plain proxy clients (ZCode) otherwise show a cumulative,
-    // drifting baseline that overstates real context pressure.
-    if (hostUsageCredit === "off") return;
-    if (session.metadata.pluginAgent === "pi" || session.metadata.pluginAgent === "omp") return;
-    if (isCodexClient(headers)) return;
-    // #408: tokens folded out of the forwarded view vs the host's own (unfolded)
-    // view — added back into the usage reported to the host so its anchor
-    // reflects the uncompressed baseline. Same estimator both sides, so
-    // systematic error cancels in the difference.
-    session.hostCreditTokens = processedMessages.length > 0
-        ? Math.max(0, estimateCoreMessages(originalMessages) - estimateCoreMessages(processedMessages))
-        : 0;
-    if (session.hostCreditTokens > 0) {
-        log("info", `[${session.id}] host usage backfill armed: +${session.hostCreditTokens} tok (forwarded view is folded); host usage will report the uncompressed baseline`);
-    }
-}
-
 // Zero-baseline sessions are judged conservatively ONLY when they arrived
 // anonymously (prefix-affinity forks/reloads, #553): they carry the full raw
 // history but no measurement yet, so feeding 0 blinds the nudge (usage 0%,
@@ -1993,7 +1953,6 @@ function prepareAnthropic(
     const sessionId = session.id;
     const stream = parsed.stream === true;
     ++session.stats.requests;
-    session.hostCreditTokens = 0;
     const injectTools = opts.compress.injectTool && !pluginMode;
     const stripReasoning = (msgs: BiliMessage[]): BiliMessage[] => withReasoningDrop(msgs, reasoning, log, sessionId, isStrictReasoningEcho(session, upstreamOrigin));
 
@@ -2081,7 +2040,7 @@ function prepareAnthropic(
             try {
                 const rendered = renderNudgeText(turn.nudge, prompts);
                 if (rendered.text) {
-                    rebuiltMessages = [...rebuiltMessages, { role: "user", content: withStagedCompressGuidance(rendered.text) }];
+                    rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withStagedCompressGuidance(rendered.text)) }];
                 }
             } catch {
             }
@@ -2103,7 +2062,6 @@ function prepareAnthropic(
     // identity chain (#268), not part of the Anthropic Messages API — strip it
     // so the real upstream never sees a field it doesn't know.
     delete (rebuilt as Record<string, unknown>).prompt_cache_key;
-    armHostUsageCredit(session, originalMessages, processedMessages, req.headers, opts.hostUsageCredit, log);
     return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, anthropicSystem: parsed.system, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, renderTags: "text-only" } as Prepared;
 }
 
@@ -2232,7 +2190,6 @@ function prepareOpenai(
     const sessionId = session.id;
     const stream = parsed.stream === true;
     ++session.stats.requests;
-    session.hostCreditTokens = 0;
     let openaiSystemText = "";
     const stripReasoning = (msgs: BiliMessage[]): BiliMessage[] => withReasoningDrop(msgs, reasoning, log, sessionId, isStrictReasoningEcho(session, upstreamOrigin));
     let openaiOutboundSystem: string | undefined;
@@ -2299,7 +2256,7 @@ function prepareOpenai(
         processedMessages = stripReasoning(stripKernelSummaries(turn.messages, turn.state));
         applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
         reapOrphanBlocks(session, msgs, deactivateBlock);
-        rebuiltMessages = systemToUser(coreToOpenai(processedMessages as BiliMessage[]));
+        rebuiltMessages = systemToUser(hardenOpenaiAssistantContent(coreToOpenai(processedMessages as BiliMessage[])));
 
         // ONLY the static compress prompt goes into the system message — the
         // system prompt is the prefix-cache anchor and must be byte-stable
@@ -2309,7 +2266,7 @@ function prepareOpenai(
         // would invalidate the cache every turn.
         const sysParts: string[] = [];
         if (systemText) sysParts.push(systemText);
-        if (shouldInject) sysParts.push(buildCompressSystemPrompt(prompts));
+        if (shouldInject) sysParts.push(withMarkerIntegrityNote(buildCompressSystemPrompt(prompts)));
         if (absorbActive) sysParts.push(buildAbsorbSystemPrompt(absorbToolName(config)));
         rebuiltMessages = injectOpenaiSystem(rebuiltMessages, sysParts);
         // #532: capture what bili injects outside the fold space (client system
@@ -2330,7 +2287,7 @@ function prepareOpenai(
             try {
                 const rendered = renderNudgeText(turn.nudge, prompts);
                 if (rendered.text) {
-                    rebuiltMessages = [...rebuiltMessages, { role: "user", content: withStagedCompressGuidance(rendered.text) }];
+                    rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withStagedCompressGuidance(rendered.text)) }];
                 }
             } catch {
             }
@@ -2360,7 +2317,6 @@ function prepareOpenai(
     if (stream && (rebuilt as Record<string, unknown>).stream_options === undefined) {
         (rebuilt as Record<string, unknown>).stream_options = { include_usage: true };
     }
-    armHostUsageCredit(session, originalMessages, processedMessages, req.headers, opts.hostUsageCredit, log);
     // #532: title-gen side requests carry their own tiny system and would
     // clobber the conversation's measured overhead — skip them.
     if (!isTitleGen && openaiOutboundSystem !== undefined) {
@@ -2389,7 +2345,6 @@ function prepareResponses(
     const sessionId = session.id;
     const stream = parsed.stream === true;
     ++session.stats.requests;
-    session.hostCreditTokens = 0;
     const stripReasoning = (msgs: BiliMessage[]): BiliMessage[] => withReasoningDrop(msgs, reasoning, log, sessionId, isStrictReasoningEcho(session, upstreamOrigin));
     if (reconcileNativeCompactionBoundary(session)) {
         log("info", `[${sessionId}] reconciled ACP state after native Responses compact boundary`);
@@ -2501,7 +2456,7 @@ function prepareResponses(
             ? []
             : (session.metadata.codexForgedSummaries as string[] | undefined) ?? [];
         if (shouldInject && !isCompactionTrigger && !process.env.ACP_NO_COMPRESS_PROMPT) {
-            const prompt = responsesTextProtocol ? buildCompressHybridSystemPrompt(prompts) : buildCompressSystemPrompt(prompts);
+            const prompt = withMarkerIntegrityNote(responsesTextProtocol ? buildCompressHybridSystemPrompt(prompts) : buildCompressSystemPrompt(prompts));
             const devParts = [...projection.systemParts, ...forgedSummaries, prompt];
             if (absorbActive) devParts.push(buildAbsorbSystemPrompt(absorbToolName(config)));
             const devContent = devParts.join("\n\n---\n\n");
@@ -2531,7 +2486,7 @@ function prepareResponses(
                     const inputItems: ResponseInputItem[] = typeof rebuiltInput === "string"
                         ? [{ type: "message", role: "user", content: rebuiltInput }]
                         : rebuiltInput;
-                    inputItems.push({ type: "message", role: "user", content: withStagedCompressGuidance(rendered.text) });
+                    inputItems.push({ type: "message", role: "user", content: withMarkerIntegrityNote(withStagedCompressGuidance(rendered.text)) });
                     rebuiltInput = inputItems;
                 }
             } catch {
@@ -2617,7 +2572,6 @@ function prepareResponses(
         });
         log("info", `[${sessionId}] responses forward tools=[${fwdTools.join(",")}] injectTool=${injectTools}${pluginMode ? " (plugin mode: wire injection suppressed)" : ""} NO_INJECT_TOOL=${!!process.env.ACP_NO_INJECT_TOOL} NO_COMPRESS_PROMPT=${!!process.env.ACP_NO_COMPRESS_PROMPT}`);
     }
-    armHostUsageCredit(session, originalMessages, processedMessages, req.headers, opts.hostUsageCredit, log);
     // #532: measure the outbound developer(system)+tools overhead for the panel.
     // On this wire the system rides the injected developer message outside the
     // fold space, so counting devContent + tools does not double-count the
@@ -2836,7 +2790,7 @@ function injectSystem(
     // the caller (prepareAnthropic), never merged into system.
     const baseText = extractSystem(parsed.system);
     const parts: string[] = [];
-    if (opts.compress.injectTool) parts.push(buildCompressSystemPrompt(prompts));
+    if (opts.compress.injectTool) parts.push(withMarkerIntegrityNote(buildCompressSystemPrompt(prompts)));
     if (opts.compress.injectTool && absorbEnabled(config)) parts.push(buildAbsorbSystemPrompt(absorbToolName(config)));
     if (parts.length === 0) return parsed.system;
     const full = baseText ? `${baseText}\n\n---\n\n${parts.join("\n\n")}` : parts.join("\n\n");
@@ -3555,14 +3509,14 @@ async function forward(
     const respConnNamed = connectionNamedHeaders(upstream.headers.get("connection") ?? undefined);
     upstream.headers.forEach((v, k) => {
         const lower = k.toLowerCase();
-        if (UPSTREAM_HOP_HEADERS.has(lower) || respConnNamed.has(lower)) return;
+        if (UPSTREAM_HOP_HEADERS.has(lower) || RESPONSE_ONLY_STRIP_HEADERS.has(lower) || respConnNamed.has(lower)) return;
         respHeaders[k] = v;
     });
     if (opts.debug) {
         const respLog: Record<string, string> = {};
         upstream.headers.forEach((v, k) => {
             const lower = k.toLowerCase();
-            if (UPSTREAM_HOP_HEADERS.has(lower) || respConnNamed.has(lower)) return;
+            if (UPSTREAM_HOP_HEADERS.has(lower) || RESPONSE_ONLY_STRIP_HEADERS.has(lower) || respConnNamed.has(lower)) return;
             const masked = maskHeaderForLog(k, v);
             respLog[k] = masked.length > 300 ? masked.slice(0, 300) + "..." : masked;
         });
@@ -3744,9 +3698,10 @@ async function forward(
     // opt-in #371 fake-completion backstop buffers + retries first, same as
     // proxy mode (#473).
     if (prepared?.pluginMode) {
-        // #411: clear the idle timer on the abort path too — the pipes rethrow
-        // when the client is still connected, and a client cancel throws from
-        // inside them; without a finally each abort leaked an idle timer.
+        // #411: clear the idle timer on every path — resolveFakeCompletion and
+        // other failures still escape these pipes; without a finally each one
+        // leaked a live idle timer. (#721: the SSE pipes themselves no longer
+        // rethrow an upstream cut — they emit an in-band truncation signal.)
         try {
             let pluginBody = upstream.body as ReadableStream<Uint8Array>;
             if (prepared.stream && maxFakeCompletionRetries() > 0) {
@@ -3894,8 +3849,8 @@ async function forward(
             const absorbSection = absorbActive
                 ? `\n\n---\n\n${buildAbsorbSystemPrompt(absorbToolName(loopConfig))}`
                 : "";
-            const systemPrompt = (textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts)) + absorbSection;
-            const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, prepared.session.hostCreditTokens ?? 0, absorbActive ? absorbToolName(loopConfig) : undefined);
+            const systemPrompt = withMarkerIntegrityNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts)) + absorbSection;
+            const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined);
             const refreshFolded = (current: CoreMessage[]): CoreMessage[] => {
                 // #422: mirror the prepare's fold with the post-compress state so
                 // the re-request shows the compression the model just performed.
@@ -4003,13 +3958,6 @@ async function forward(
                     }
                     const out = u.completion_tokens ?? u.output_tokens;
                     if (typeof out === "number") prepared.session.stats.outputTokens += out;
-                }
-                // #408: the provider measured the folded view — add the
-                // prepare-time credit back so the host anchors on the
-                // uncompressed baseline.
-                const credit = prepared.session.hostCreditTokens ?? 0;
-                if (credit > 0 && backfillHostUsage(prepared.protocol, u, credit)) {
-                    prepared.session.hostContextTokens = (typeof total === "number" ? total : 0) + credit;
                 }
                 if (prepared.protocol === "openai") {
                     rewriteOpenaiJsonResponse(json, ctx);

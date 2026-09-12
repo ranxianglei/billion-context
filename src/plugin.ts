@@ -8,12 +8,13 @@ import { ABSORB_TOOL, ABSORB_TOOL_NAME, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSE
 import { effectiveAbsorbConfig, isProxyToolFor } from "./absorb.js";
 import { executeProxyTool } from "./loop/core.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
-import { containsRenderTagText, createTagEchoFilter, mayStartRenderTag, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
+import { composeStreamFilters, containsMarkerLineText, containsRenderTagText, createMarkerLineFilter, createTagEchoFilter, mayStartMarkerLine, mayStartRenderTag, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
+import { emitUpstreamTruncation } from "./stream-error.js";
 import { degenerateTurnWarning } from "./degenerate-turn.js";
 import { noteWeakOverflow } from "./weak-overflow.js";
 import { warnCacheCollapse } from "./cache-warn.js";
-import { backfillHostUsage, promptInputTotal, type WireProtocol } from "./util.js";
+import { promptInputTotal, type WireProtocol } from "./util.js";
 import { stateDir } from "./paths.js";
 
 // The proxy's own version, read from package.json at runtime (works in both dev
@@ -449,7 +450,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         const systemPromptTokens = typeof sysTokRaw === "number" && Number.isFinite(sysTokRaw) && sysTokRaw > 0 ? sysTokRaw : 0;
         panel = buildStatusPanel({
             version: `billion-context@${PROXY_VERSION}`,
-            tokenCount: session.hostContextTokens ?? session.stats.lastInputTokens,
+            tokenCount: session.stats.lastInputTokens,
             systemPromptTokens,
             state: session.state,
             nudge,
@@ -469,8 +470,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         label: session.meta.label ?? null,
         pluginAgent: session.metadata.pluginAgent ?? null,
         contextLimit: typeof limit === "number" ? limit : null,
-        contextTokens: session.hostContextTokens ?? session.stats.lastInputTokens,
-        hostCredit: session.hostCreditTokens ?? 0,
+        contextTokens: session.stats.lastInputTokens,
         inputTokens: session.stats.inputTokens,
         outputTokens: session.stats.outputTokens,
         cachedTokens: session.stats.cachedTokens,
@@ -626,14 +626,12 @@ export function applyUsageSample(session: Session, sample: UsageSample, protocol
         // compress tool results shrink the next request, not this report.
         session.stats.lastInputTokens = Math.max(0, total - (session.stats.compressCreditTokens ?? 0));
         warnCacheCollapse(session, total, sample.cachedTokens ?? 0);
-        // #408: host-facing baseline = this report + prepare-time fold credit.
-        session.hostContextTokens = total + (session.hostCreditTokens ?? 0);
         // #695: per-request parity with the wire path's [acp-usage] — without
         // this, post-fold cache cliffs cannot be attributed from logs.
         const hit = sample.cachedTokens === undefined || total <= 0 ? undefined : Math.round((100 * (sample.cachedTokens ?? 0)) / total);
         const foldNew = session.stats.pendingFoldUsage === true;
         if (foldNew) session.stats.pendingFoldUsage = false;
-        loggerLog("info", `[${session.id}] [plugin] [acp-usage] input=${total} cached=${sample.cachedTokens ?? "n/a"}${hit === undefined ? "" : ` (cache hit ${hit}%)`} ctx=${session.hostContextTokens}${foldNew ? " fold=new" : ""}`);
+        loggerLog("info", `[${session.id}] [plugin] [acp-usage] input=${total} cached=${sample.cachedTokens ?? "n/a"}${hit === undefined ? "" : ` (cache hit ${hit}%)`}${foldNew ? " fold=new" : ""}`);
     }
     if (sample.outputTokens !== undefined) session.stats.outputTokens += sample.outputTokens;
 }
@@ -674,10 +672,13 @@ export async function pipePluginChatWithStrip(
     const decoder = new TextDecoder("utf-8");
     let buf = "";
     const acc: UsageSample = {};
-    const credit = session?.hostCreditTokens ?? 0;
-    const onDrop = (snippet: string) => {
+    const onTagDrop = (snippet: string) => {
         loggerLog("warn", `[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
         log?.(`[tag-echo] stripped model-emitted render tag from plugin passthrough text`);
+    };
+    const onMarkerDrop = (snippet: string) => {
+        loggerLog("warn", `[marker-echo] stripped model-emitted ACP confirmation marker (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+        log?.(`[marker-echo] stripped model-emitted ACP confirmation marker from plugin passthrough text`);
     };
     // One state machine per (field, block/choice index) — interleaved choices
     // or content blocks must not share partial-tag state.
@@ -686,7 +687,7 @@ export async function pipePluginChatWithStrip(
         const key = `${field}:${index}`;
         let s = streams.get(key);
         if (!s) {
-            s = { filter: createTagEchoFilter(onDrop), field, index };
+            s = { filter: composeStreamFilters(createTagEchoFilter(onTagDrop), createMarkerLineFilter(onMarkerDrop)), field, index };
             streams.set(key, s);
         }
         return s;
@@ -796,7 +797,7 @@ export async function pipePluginChatWithStrip(
                 if (typeof v !== "string") continue;
                 hadText = true;
                 if (field !== "content" && v.length > 0) sawThinking = true;
-                if (!mayStartRenderTag(v) && !anyPending()) {
+                if (!mayStartRenderTag(v) && !mayStartMarkerLine(v) && !anyPending()) {
                     if (v.length > 0) keptText = true;
                     if (field === "content") visibleTextChars += v.length;
                     continue;
@@ -848,7 +849,7 @@ export async function pipePluginChatWithStrip(
         }
         const raw = d[field] as string;
         if (field === "thinking" && raw.length > 0) sawThinking = true;
-        if (!mayStartRenderTag(raw) && !anyPending()) {
+        if (!mayStartRenderTag(raw) && !mayStartMarkerLine(raw) && !anyPending()) {
             if (field === "text" && raw.length > 0) visibleTextChars += raw.length;
             return rawEvent + "\n\n";
         }
@@ -898,28 +899,23 @@ export async function pipePluginChatWithStrip(
                     // the uncompressed baseline. Patch `ev` BEFORE the tag-echo
                     // processors run and only rebuild when they return the event
                     // verbatim — otherwise their render-tag stripping is lost.
-                    // message_delta input_tokens is normally absent (or a 0 echo)
-                    // — only patch a real echo.
-                    let backfilled = false;
-                    if (credit > 0 && protocol) {
-                        const usage =
-                            ev["type"] === "message_start"
-                                ? ((ev["message"] as Record<string, unknown> | undefined)?.["usage"] as Record<string, unknown> | undefined)
-                                : (ev["usage"] as Record<string, unknown> | undefined);
-                        const deltaEcho = ev["type"] === "message_delta" && (num(usage?.["input_tokens"]) ?? 0) <= 0;
-                        if (usage && !deltaEcho && backfillHostUsage(protocol, usage, credit)) backfilled = true;
-                    }
                     const out = protocol === "anthropic" ? processAnthropic(ev, rawEvent) : processOpenai(ev, rawEvent);
-                    if (backfilled && out === rawEvent + "\n\n") {
-                        await write(rebuildEvent(rawEvent, ev));
-                    } else if (out.length > 0) {
-                        await write(out);
-                    }
+                    if (out.length > 0) await write(out);
                 }
             }
             if (res.destroyed || res.writableEnded) break;
         }
-        if (buf.length > 0 && !res.destroyed && !res.writableEnded) await write(buf);
+        // #721: upstream EOF without a terminal event must not close the
+        // stream bare — the agent would persist the partial turn as complete
+        // (the #719 chain). finished=true when a finish reason was delivered:
+        // only the trailing terminal byte ([DONE]/message_stop) is missing.
+        const truncated = !sawTerminal && !res.destroyed && !res.writableEnded;
+        // A dangling partial event left in buf by a mid-event cut would fuse
+        // with the next complete frame — SSE joins every data line inside one
+        // blank-line-delimited block — corrupting the truncation signal. Drop
+        // it when the signal follows: an unterminated event is unparseable by
+        // the client anyway (same as the pre-#721 bare end).
+        if (!truncated && buf.length > 0 && !res.destroyed && !res.writableEnded) await write(buf);
         const rest = flushTails();
         if (rest.length > 0 && !res.destroyed && !res.writableEnded) await write(rest);
         // Settle BEFORE res.end() in the finally below: the client can issue
@@ -929,6 +925,10 @@ export async function pipePluginChatWithStrip(
         settleUsage();
         maybeNoteTruncated();
         maybeWarnDegenerate();
+        if (truncated) {
+            emitUpstreamTruncation(res, protocol, finalFinishReason !== undefined, log);
+            return;
+        }
     } catch (e) {
         settleUsage();
         maybeNoteTruncated();
@@ -936,7 +936,21 @@ export async function pipePluginChatWithStrip(
             log?.("client aborted mid-stream");
             return;
         }
-        throw e;
+        // #721: upstream read failed while the client is still connected —
+        // deliver the in-band truncation signal instead of rethrowing into
+        // the top-level handler, which would close the stream bare. Flush
+        // held tag tails first so partial prose is never silently lost. The
+        // dangling partial event left in buf is dropped (see EOF path above):
+        // written raw it would fuse with the signal frame.
+        try {
+            const rest = flushTails();
+            if (rest.length > 0) await write(rest);
+        } catch {
+            /* client half-gone; the emission below is best-effort too */
+        }
+        loggerLog("warn", `[plugin] upstream stream read failed (${protocol}): ${String(e instanceof Error ? e.message : e)} — emitting in-band truncation signal`);
+        emitUpstreamTruncation(res, protocol, finalFinishReason !== undefined, log);
+        return;
     } finally {
         reader.releaseLock();
         res.end();
@@ -983,10 +997,16 @@ export async function pipePluginResponsesWithStrip(
     const decoder = new TextDecoder("utf-8");
     let buf = "";
     const acc: UsageSample = {};
-    const tagFilter = createTagEchoFilter((snippet) => {
-        loggerLog("warn", `[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
-        log?.(`[tag-echo] stripped model-emitted render tag from plugin passthrough text`);
-    });
+    const tagFilter = composeStreamFilters(
+        createTagEchoFilter((snippet) => {
+            loggerLog("warn", `[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+            log?.(`[tag-echo] stripped model-emitted render tag from plugin passthrough text`);
+        }),
+        createMarkerLineFilter((snippet) => {
+            loggerLog("warn", `[marker-echo] stripped model-emitted ACP confirmation marker (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+            log?.(`[marker-echo] stripped model-emitted ACP confirmation marker from plugin passthrough text`);
+        }),
+    );
     // #673: turn-level observability for degenerate terminal turns.
     let sawFunctionCall = false;
     let sawReasoning = false;
@@ -1090,19 +1110,8 @@ export async function pipePluginResponsesWithStrip(
                         if (type === "response.completed" || type === "response.failed" || type === "response.incomplete") sawTerminal = true;
                         // done-family events also carry full text payloads — strip those too.
                         let evOut = ev;
-                        let rebuild = containsRenderTagText(jsonStr);
+                        let rebuild = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr);
                         if (rebuild) evOut = stripResponsesText(ev);
-                        if (type === "response.completed") {
-                            // #408: acc already holds the pre-backfill sample
-                            // (usageFromSseEvent ran above) — the internal
-                            // ledger stays post-fold, the host gets the
-                            // uncompressed baseline.
-                            const credit = session?.hostCreditTokens ?? 0;
-                            const usage = (evOut["response"] as Record<string, unknown> | undefined)?.["usage"] as Record<string, unknown> | undefined;
-                            if (credit > 0 && usage && backfillHostUsage("responses", usage, credit)) {
-                                rebuild = true;
-                            }
-                        }
                         const out = rebuild ? rebuildEvent(rawEvent, evOut) : rawEvent + "\n\n";
                         await write(flushTail(out));
                         continue;
@@ -1113,7 +1122,7 @@ export async function pipePluginResponsesWithStrip(
                             await write(rawEvent + "\n\n");
                             continue;
                         }
-                        if (!mayStartRenderTag(delta) && !tagFilter.pending()) {
+                        if (!mayStartRenderTag(delta) && !mayStartMarkerLine(delta) && !tagFilter.pending()) {
                             await write(rawEvent + "\n\n");
                             continue;
                         }
@@ -1141,6 +1150,13 @@ export async function pipePluginResponsesWithStrip(
         maybeWarnDegenerate();
         settleUsage();
         maybeNoteTruncated();
+        // #721: same as the chat-pipe twin — never close bare on a missing
+        // done-family event. Responses has no separate finish-reason concept
+        // (terminal events carry the status), so this is always the error shape.
+        if (!sawTerminal && !res.destroyed && !res.writableEnded) {
+            emitUpstreamTruncation(res, "responses", false, log);
+            return;
+        }
     } catch (e) {
         settleUsage();
         maybeNoteTruncated();
@@ -1148,7 +1164,19 @@ export async function pipePluginResponsesWithStrip(
             log?.("client aborted mid-stream");
             return;
         }
-        throw e;
+        // #721: upstream read failed while the client is still connected —
+        // deliver the in-band truncation signal instead of rethrowing into
+        // the top-level handler, which would close the stream bare. Flush
+        // held tag tails first so partial prose is never silently lost.
+        try {
+            const rest = flushTail("");
+            if (rest.length > 0) await write(rest);
+        } catch {
+            /* client half-gone; the emission below is best-effort too */
+        }
+        loggerLog("warn", `[plugin] upstream stream read failed (responses): ${String(e instanceof Error ? e.message : e)} — emitting in-band truncation signal`);
+        emitUpstreamTruncation(res, "responses", false, log);
+        return;
     } finally {
         reader.releaseLock();
         res.end();
@@ -1217,15 +1245,10 @@ export async function pipePluginJson(
                         num(usage["cache_read_input_tokens"]),
                 }, protocol);
                 markDirty(session);
-                // #408: backfill mutates json.usage in place — reserialize below.
-                const credit = session.hostCreditTokens ?? 0;
-                if (credit > 0 && protocol && backfillHostUsage(protocol, usage, credit)) {
-                    mutated = true;
-                }
             }
         }
     } catch { /* non-JSON body — forward verbatim */ }
-    if (json && containsRenderTagText(text)) {
+        if (json && (containsRenderTagText(text) || containsMarkerLineText(text))) {
         // #206 parity for the non-streaming plugin path: the compress loop's
         // JSON branch strips render tags from every round; a verbatim plugin
         // JSON response would re-feed the model's tag echoes. Strips mutate in

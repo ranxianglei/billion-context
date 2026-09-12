@@ -1,5 +1,4 @@
 import { emitStreamError, emitPreflightError } from "./stream-error.js";
-import { backfillHostUsage } from "./util.js";
 import { pipePluginChatWithStrip, pipePluginResponsesWithStrip, pipePluginJson } from "./plugin.js";
 import { startServer } from "./server.js";
 
@@ -55,18 +54,18 @@ export const ERROR_DELIVERY: Record<WireExitId, ExitCell> = {
     },
     "plugin-chat-sse": {
         implementer: [pipePluginChatWithStrip],
-        contract: "byte-faithful passthrough: pre-stream fetch failure → JSON `{error: formatUpstreamError}` before any SSE byte; mid-stream cut → stream simply ends (no synthetic error event — the agent's tool loop must not see fabricated events)",
-        coveredBy: ["tests/issue411-abort-usage.test.ts", "tests/plugin-agent.test.ts"],
+        contract: "byte-faithful passthrough: pre-stream fetch failure → JSON `{error: formatUpstreamError}` before any SSE byte; upstream cut without terminal event → synthesized terminal byte when a finish reason was delivered, else protocol-native in-band error event (#721); client abort → clean end",
+        coveredBy: ["tests/issue411-abort-usage.test.ts", "tests/plugin-agent.test.ts", "tests/plugin-truncation-weak-overflow.test.ts"],
     },
     "plugin-responses-sse": {
         implementer: [pipePluginResponsesWithStrip],
         contract: "same as plugin-chat-sse, responses wire",
-        coveredBy: ["tests/issue411-abort-usage.test.ts"],
+        coveredBy: ["tests/issue411-abort-usage.test.ts", "tests/plugin-truncation-weak-overflow.test.ts"],
     },
     "plugin-json": {
         implementer: [pipePluginJson],
         contract: "upstream non-2xx/fetch failure → `{error: formatUpstreamError}` JSON; client abort mid-body → clean end, timer cleared",
-        coveredBy: ["tests/issue411-abort-usage.test.ts", "tests/host-usage-backfill.test.ts"],
+        coveredBy: ["tests/issue411-abort-usage.test.ts", "tests/host-usage-postfold.test.ts"],
     },
 };
 
@@ -108,48 +107,48 @@ export const ABORT_PROPAGATION: Record<WireExitId, ExitCell> = {
     },
 };
 
-export const HOST_USAGE_BACKFILL: Record<WireExitId, ExitCell> = {
+export const HOST_USAGE_PASSTHROUGH: Record<WireExitId, ExitCell> = {
     "proxy-openai-sse": {
-        implementer: [backfillHostUsage],
-        contract: "usage frame from the upstream terminal event is credited to the session (input/cached/output), fallback samples on truncation",
-        coveredBy: ["tests/host-usage-backfill.test.ts"],
+        implementer: [startServer],
+        contract: "provider-measured (post-fold) usage credited to the internal ledger and forwarded to the host verbatim — no baseline backfill (#660)",
+        coveredBy: ["tests/host-usage-postfold.test.ts"],
     },
     "proxy-anthropic-sse": {
-        implementer: [backfillHostUsage],
-        contract: "message_start/message_delta usage frames credited",
-        coveredBy: ["tests/host-usage-backfill.test.ts"],
+        implementer: [startServer],
+        contract: "message_start/message_delta usage frames credited, forwarded verbatim",
+        coveredBy: ["tests/host-usage-postfold.test.ts"],
     },
     "proxy-responses-sse": {
-        implementer: [backfillHostUsage],
-        contract: "response.completed usage frame credited (issue #589 frame shape)",
-        coveredBy: ["tests/issue589-usage-frame.test.ts", "tests/host-usage-backfill.test.ts"],
+        implementer: [startServer],
+        contract: "response.completed usage frame credited (issue #589 frame shape), forwarded verbatim",
+        coveredBy: ["tests/issue589-usage-frame.test.ts", "tests/host-usage-postfold.test.ts"],
     },
     "proxy-json": {
-        implementer: [backfillHostUsage],
-        contract: "non-stream usage object credited; no session → skipped (title-gen must not clobber lastInputTokens)",
-        coveredBy: ["tests/host-usage-backfill.test.ts"],
+        implementer: [startServer],
+        contract: "non-stream usage object credited; no session → skipped (title-gen must not clobber lastInputTokens); forwarded verbatim",
+        coveredBy: ["tests/host-usage-postfold.test.ts"],
     },
     "plugin-chat-sse": {
-        implementer: [pipePluginChatWithStrip, backfillHostUsage],
-        contract: "sniffed usage credited unless the call is session-less (#460 title-gen skip)",
-        coveredBy: ["tests/host-usage-backfill.test.ts", "tests/issue411-abort-usage.test.ts"],
+        implementer: [pipePluginChatWithStrip],
+        contract: "sniffed usage credited unless the call is session-less (#460 title-gen skip); stream bytes untouched",
+        coveredBy: ["tests/host-usage-postfold.test.ts", "tests/issue411-abort-usage.test.ts"],
     },
     "plugin-responses-sse": {
-        implementer: [pipePluginResponsesWithStrip, backfillHostUsage],
+        implementer: [pipePluginResponsesWithStrip],
         contract: "sniffed usage credited; verbatim variant skips accounting by design",
-        coveredBy: ["tests/host-usage-backfill.test.ts"],
+        coveredBy: ["tests/host-usage-postfold.test.ts"],
     },
     "plugin-json": {
-        implementer: [pipePluginJson, backfillHostUsage],
-        contract: "JSON usage object credited",
-        coveredBy: ["tests/host-usage-backfill.test.ts"],
+        implementer: [pipePluginJson],
+        contract: "JSON usage object credited; response body forwarded verbatim",
+        coveredBy: ["tests/host-usage-postfold.test.ts"],
     },
 };
 
 export const EXIT_CONCERNS = {
     errorDelivery: ERROR_DELIVERY,
     abortPropagation: ABORT_PROPAGATION,
-    hostUsageBackfill: HOST_USAGE_BACKFILL,
+    hostUsagePassthrough: HOST_USAGE_PASSTHROUGH,
 } as const;
 
 export type ExitConcernId = keyof typeof EXIT_CONCERNS;

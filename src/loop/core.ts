@@ -13,7 +13,7 @@ import {
 } from "../compress-tool.js";
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "../absorb.js";
 import { applyRanges } from "../stream.js";
-import { resolveDecompress } from "../decompress-shared.js";
+import { executeSearchContext, resolveDecompress } from "../decompress-shared.js";
 import { buildVisibilityMarker } from "../compress-loop.js";
 import { fetchWithRetry, UpstreamHttpError } from "../fetch-util.js";
 import { proxyDispatcher } from "../upstream-proxy.js";
@@ -141,17 +141,7 @@ export function executeProxyTool(
         return resolveDecompress(args, ctx);
     }
     if (toolName === "search_context") {
-        const query = typeof args.query === "string" ? args.query : "";
-        if (query.length === 0) return "[search_context FAILED: query is required]";
-        const limit = typeof args.limit === "number" && args.limit > 0 ? Math.floor(args.limit) : 5;
-        const blocks = ctx.core.search(query, ctx.session.state).slice(0, limit);
-        if (blocks.length === 0) return `[No blocks matched "${query}"]`;
-        const lines = blocks.map((b) => {
-            const topic = b.topic ?? "(no topic)";
-            const preview = b.summary.length > 200 ? b.summary.slice(0, 200) + "..." : b.summary;
-            return `${b.blockId} (T${b.tier}) "${topic}"\n  ${preview}`;
-        });
-        return `Found ${blocks.length} block(s) for "${query}":\n\n${lines.join("\n\n")}`;
+        return executeSearchContext(args, ctx.core, ctx.session.state);
     }
     if (toolName === "acp_status") {
         return handleAcpStatus(args, ctx);
@@ -177,9 +167,6 @@ function recordUsage(
     // re-sends the unfolded history, so its usage report over-reports the
     // context the NEXT request will actually carry (see stream.ts applyRanges).
     ctx.session.stats.lastInputTokens = Math.max(0, total - (ctx.session.stats.compressCreditTokens ?? 0));
-    // #408: remember the input-side total reported to the host AFTER the
-    // prepare-time fold backfill (uncompressed baseline), for the /acp panel.
-    ctx.session.hostContextTokens = total + (ctx.session.hostCreditTokens ?? 0);
     if (typeof cached === "number") {
         ctx.session.stats.cachedTokens += cached;
         ctx.session.stats.cacheSamples += 1;
@@ -362,16 +349,6 @@ export async function* runCompressLoop(
             ) {
                 recordUsage(ctx, usage, round);
             }
-            // #408: the provider measured the FOLDED (post-compress) view; add
-            // the prepare-time credit back so the completion event the host
-            // anchors on reports the uncompressed baseline. recordUsage above
-            // already ran on the un-backfilled numbers (internal ledger stays
-            // post-fold).
-            const hostCredit = ctx.session.hostCreditTokens ?? 0;
-            if (hostCredit > 0 && typeof usage.inputTokens === "number") {
-                usage.inputTokens += hostCredit;
-            }
-
             let resolvedText = assistantText;
             let allCalls = calls;
             if (ctx.textProtocol && assistantText.length > 0 && adapter.extractTextTriggers) {
