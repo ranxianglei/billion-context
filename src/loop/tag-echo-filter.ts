@@ -98,16 +98,37 @@ export interface TagEchoFilter {
 // through the model-output path (the proxy injects them itself), so any
 // marker-shaped line in upstream model output is by definition forged: strip
 // the line and warn, breaking the self-reinforcing loop. Shape: line start +
-// exactly one non-ASCII symbol char (every real icon is a single code point;
-// the u flag makes astral emoji count as one) + optional single space/tab +
-// literal "[ACP]". Strictly no leading whitespace: an indented occurrence is
-// quoting the format (code block, docs) and must pass through. The multi-line
+// exactly one Unicode symbol char (\p{So} — every real marker icon is a single
+// So code point; letters such as CJK hanzi are prose, not markers, so a line
+// like "见[ACP]标记的含义" must survive) + optional single space/tab + literal
+// "[ACP]". Strictly no leading whitespace: an indented occurrence is quoting
+// the format (code block, docs) and must pass through. The multi-line
 // acp_status variant only has its head line stripped — without the head the
 // body reads as unattributed prose, and no reliable terminator exists to
 // swallow it safely.
-const MARKER_HEAD = /^[^\x00-\x7F](?:[ \t])?\[ACP\]/u;
+const MARKER_HEAD = /^\p{So}(?:[ \t])?\[ACP\]/u;
+// Deliberately BROADER than MARKER_HEAD: the streaming state machine must
+// hold ANY non-ASCII line-start prefix (CJK, accented letters, and lone
+// surrogates produced when a chunk boundary splits an astral icon) because
+// it cannot know whether the next chunk completes a forged head. Holding is
+// cheap and lossless (flush/content-preservation resolves it); the strict
+// \p{So} decision happens only in MARKER_HEAD, so prose is never stripped.
 const MARKER_HEAD_PREFIX = /^[^\x00-\x7F](?:[ \t])?(?:\[ACP\]|\[ACP|\[AC|\[A|\[)?$/u;
-const MARKER_LINE = /^[^\x00-\x7F](?:[ \t])?\[ACP\][^\n]*\n?/gmu;
+const MARKER_LINE = /^\p{So}(?:[ \t])?\[ACP\][^\n]*\n?/gmu;
+// Conservative tail probe for the streaming fast-path gate below: the chunk's
+// last line is still an undecidable marker-head prefix (icon alone, or icon +
+// partial "[ACP"), so the next chunk must flow through the filter. Any
+// non-ASCII lead is accepted here on purpose — over-pushing costs one no-op
+// filter pass, under-pushing leaks a forged marker.
+const MARKER_TAIL = /(?:^|\n)[^\x00-\x7F](?:[ \t])?(?:\[ACP|\[AC|\[A|\[)?$/u;
+
+/** Fast-path gate for the streaming pipes (#717): could this chunk contain a
+ *  forged marker line, or leave a marker head undecidable across the chunk
+ *  boundary? Coarse by design — a false positive costs one no-op filter pass,
+ *  but skipping a chunk that carries or starts a forged line forwards it raw. */
+export function mayStartMarkerLine(s: string): boolean {
+    return s.includes("[ACP]") || MARKER_TAIL.test(s);
+}
 
 export function stripMarkerLines(text: string): string {
     return text.replace(MARKER_LINE, "");

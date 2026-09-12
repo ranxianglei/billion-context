@@ -2790,7 +2790,7 @@ function injectSystem(
     // the caller (prepareAnthropic), never merged into system.
     const baseText = extractSystem(parsed.system);
     const parts: string[] = [];
-        if (opts.compress.injectTool) parts.push(withMarkerIntegrityNote(buildCompressSystemPrompt(prompts)));
+    if (opts.compress.injectTool) parts.push(withMarkerIntegrityNote(buildCompressSystemPrompt(prompts)));
     if (opts.compress.injectTool && absorbEnabled(config)) parts.push(buildAbsorbSystemPrompt(absorbToolName(config)));
     if (parts.length === 0) return parsed.system;
     const full = baseText ? `${baseText}\n\n---\n\n${parts.join("\n\n")}` : parts.join("\n\n");

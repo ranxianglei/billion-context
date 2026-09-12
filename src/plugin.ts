@@ -8,7 +8,7 @@ import { ABSORB_TOOL, ABSORB_TOOL_NAME, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSE
 import { effectiveAbsorbConfig, isProxyToolFor } from "./absorb.js";
 import { executeProxyTool } from "./loop/core.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
-import { composeStreamFilters, containsMarkerLineText, containsRenderTagText, createMarkerLineFilter, createTagEchoFilter, mayStartRenderTag, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
+import { composeStreamFilters, containsMarkerLineText, containsRenderTagText, createMarkerLineFilter, createTagEchoFilter, mayStartMarkerLine, mayStartRenderTag, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
 import { emitUpstreamTruncation } from "./stream-error.js";
 import { degenerateTurnWarning } from "./degenerate-turn.js";
@@ -797,7 +797,7 @@ export async function pipePluginChatWithStrip(
                 if (typeof v !== "string") continue;
                 hadText = true;
                 if (field !== "content" && v.length > 0) sawThinking = true;
-                if (!mayStartRenderTag(v) && !anyPending()) {
+                if (!mayStartRenderTag(v) && !mayStartMarkerLine(v) && !anyPending()) {
                     if (v.length > 0) keptText = true;
                     if (field === "content") visibleTextChars += v.length;
                     continue;
@@ -849,7 +849,7 @@ export async function pipePluginChatWithStrip(
         }
         const raw = d[field] as string;
         if (field === "thinking" && raw.length > 0) sawThinking = true;
-        if (!mayStartRenderTag(raw) && !anyPending()) {
+        if (!mayStartRenderTag(raw) && !mayStartMarkerLine(raw) && !anyPending()) {
             if (field === "text" && raw.length > 0) visibleTextChars += raw.length;
             return rawEvent + "\n\n";
         }
@@ -1122,7 +1122,7 @@ export async function pipePluginResponsesWithStrip(
                             await write(rawEvent + "\n\n");
                             continue;
                         }
-                        if (!mayStartRenderTag(delta) && !tagFilter.pending()) {
+                        if (!mayStartRenderTag(delta) && !mayStartMarkerLine(delta) && !tagFilter.pending()) {
                             await write(rawEvent + "\n\n");
                             continue;
                         }

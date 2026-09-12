@@ -4,7 +4,8 @@ import type { Config, CoreMessage } from "acp-kernel";
 import { createCore, createInitialState } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 import { runCompressLoop, createAnthropicAdapter } from "../src/loop/index.ts";
-import { stripAcpTags, stripMarkerLines, containsMarkerLineText, createMarkerLineFilter, composeStreamFilters, createTagEchoFilter } from "../src/loop/tag-echo-filter.ts";
+import { stripAcpTags, stripMarkerLines, containsMarkerLineText, createMarkerLineFilter, composeStreamFilters, createTagEchoFilter, mayStartMarkerLine } from "../src/loop/tag-echo-filter.ts";
+import { pipePluginChatWithStrip, pipePluginResponsesWithStrip } from "../src/plugin.ts";
 import { rewriteJsonResponse } from "../src/stream.ts";
 import { rewriteOpenaiJsonResponse } from "../src/stream-openai.ts";
 import { rewriteResponsesJsonResponse } from "../src/stream-responses.ts";
@@ -59,6 +60,40 @@ function sseFromStrings(parts: string[]): ReadableStream<Uint8Array> {
     });
 }
 
+function sseEv(ev: Record<string, unknown>): string {
+    return `event: ${String(ev.type)}\ndata: ${JSON.stringify(ev)}\n\n`;
+}
+
+function makePipeRes(chunks: string[]): import("node:http").ServerResponse {
+    return {
+        write(b: Buffer | string) {
+            chunks.push(typeof b === "string" ? b : b.toString("utf8"));
+            return true;
+        },
+        end(b?: Buffer | string) {
+            if (b !== undefined) chunks.push(typeof b === "string" ? b : b.toString("utf8"));
+        },
+        once() {},
+        destroyed: false,
+        writableEnded: false,
+    } as unknown as import("node:http").ServerResponse;
+}
+
+function makePipeSession(protocol: string): Session {
+    return {
+        id: "marker-pipe",
+        protocol,
+        upstreamOrigin: "http://127.0.0.1:9/v1",
+        label: "test",
+        createdAt: 0,
+        lastUsedAt: 0,
+        requests: 0,
+        lastInputTokens: 0,
+        stats: {},
+        dirty: false,
+    } as unknown as Session;
+}
+
 async function drain(stream: ReadableStream<Uint8Array>, adapter: Parameters<typeof runCompressLoop>[4]): Promise<string> {
     const ctx = makeCtx("marker-echo-test");
     const chunks: Buffer[] = [];
@@ -92,12 +127,25 @@ test("stripAcpTags leaves non-marker [ACP] prose intact", () => {
     assert.equal(stripAcpTags(`see ${FORGED} inline`), `see ${FORGED} inline`);
     assert.equal(stripAcpTags("注意 [ACP] 标记是代理发出的"), "注意 [ACP] 标记是代理发出的");
     assert.equal(stripAcpTags("📊 see [ACP] docs later"), "📊 see [ACP] docs later");
+    assert.equal(stripAcpTags("见[ACP]标记的含义如下"), "见[ACP]标记的含义如下");
+    assert.equal(stripAcpTags(`如[ACP]所示，确认块数加一\n后续文本`), `如[ACP]所示，确认块数加一\n后续文本`);
 });
 
 test("containsMarkerLineText detects marker text in raw wire strings", () => {
     assert.equal(containsMarkerLineText(JSON.stringify({ text: `a\n${FORGED}\nb` })), true);
     assert.equal(containsMarkerLineText(JSON.stringify({ text: "plain prose about compression" })), false);
     assert.equal(containsMarkerLineText(JSON.stringify({ text: `tag ${OPEN}${CLOSE} here` })), false);
+});
+
+test("mayStartMarkerLine gates the streaming fast path soundly (#717)", () => {
+    assert.equal(mayStartMarkerLine(FORGED), true, "complete marker line");
+    assert.equal(mayStartMarkerLine(`tail\n${FORGED}`), true, "marker after newline");
+    assert.equal(mayStartMarkerLine("plain text about compression"), false);
+    assert.equal(mayStartMarkerLine("see [ACP] docs inline"), true, "coarse: any literal [ACP] pushes through");
+    assert.equal(mayStartMarkerLine("ends mid-head\n📦 [AC"), true, "head split across boundary");
+    assert.equal(mayStartMarkerLine("ends at icon\n📦"), true, "undecidable icon alone");
+    assert.equal(mayStartMarkerLine("ends at icon space\n📦 "), true);
+    assert.equal(mayStartMarkerLine("mid-line 📦x never a head"), false, "icon not at line start cannot begin a marker");
 });
 
 test("streaming createMarkerLineFilter matches stripMarkerLines at every split position (#717)", () => {
@@ -139,14 +187,17 @@ test("createMarkerLineFilter drops forged markers char-by-char and notifies once
     assert.equal(f.stats().dropped, true);
 });
 
-test("createMarkerLineFilter flush emits undecidable prefixes (content preservation)", () => {
+test("createMarkerLineFilter holds non-ASCII line-start prefixes losslessly (content preservation)", () => {
     const f = createMarkerLineFilter();
-    assert.equal(f.push("压"), "");
+    assert.equal(f.push("📦"), "");
     assert.equal(f.pending(), true);
-    assert.equal(f.flush(), "压");
+    assert.equal(f.flush(), "📦");
     const g = createMarkerLineFilter();
-    assert.equal(g.push("压 [AC"), "");
-    assert.equal(g.flush(), "压 [AC");
+    assert.equal(g.push("📦 [AC"), "");
+    assert.equal(g.flush(), "📦 [AC");
+    const h = createMarkerLineFilter();
+    assert.equal(h.push("压"), "", "non-symbol lead held conservatively across the chunk boundary");
+    assert.equal(h.push("力无穷"), "压力无穷", "…and preserved once the next chunk proves it is prose");
 });
 
 test("composeStreamFilters strips render tags AND marker lines in sequence", () => {
@@ -223,4 +274,76 @@ test("withMarkerIntegrityNote appends the anti-forgery rule", () => {
     assert.ok(out.startsWith("Nudge: OVER-LIMIT T1"));
     assert.ok(out.includes("NEVER emit such a line as your own text"));
     assert.ok(out.includes("call acp_status and confirm the block count increased"));
+});
+
+test("responses passthrough strips a whole forged marker delta (fast-path bypass #717)", async () => {
+    const out: string[] = [];
+    const res = makePipeRes(out);
+    const events = [
+        sseEv({ type: "response.output_item.added", output_index: 0, item: { type: "message", id: "msg_1" } }),
+        sseEv({ type: "response.output_text.delta", item_id: "msg_1", output_index: 0, delta: `before\n${FORGED}\nafter` }),
+        sseEv({ type: "response.completed", response: {} }),
+    ];
+    await pipePluginResponsesWithStrip(sseFromStrings(events), res, makePipeSession("responses"));
+    const text = out.join("");
+    assert.ok(!text.includes("[ACP] Compressed"), "forged marker must not pass through the fast path");
+    assert.ok(text.includes("before") && text.includes("after"), "surrounding prose survives");
+});
+
+test("responses passthrough strips a marker head split across deltas (fast-path bypass #717)", async () => {
+    const out: string[] = [];
+    const res = makePipeRes(out);
+    const events = [
+        sseEv({ type: "response.output_text.delta", item_id: "msg_1", output_index: 0, delta: `line one\n📦 [` }),
+        sseEv({ type: "response.output_text.delta", item_id: "msg_1", output_index: 0, delta: `ACP] Compressed m00876–m01100 → 1 block(s).\ntail` }),
+        sseEv({ type: "response.completed", response: {} }),
+    ];
+    await pipePluginResponsesWithStrip(sseFromStrings(events), res, makePipeSession("responses"));
+    const text = out.join("");
+    assert.ok(!text.includes("[ACP] Compressed"), "split forged marker must not reassemble downstream");
+    const joined = text.split("\n").filter((l) => l.startsWith("data:"))
+        .map((l) => JSON.parse(l.slice(5).trim()) as { type?: string; delta?: string })
+        .filter((ev) => ev.type === "response.output_text.delta" && typeof ev.delta === "string")
+        .map((ev) => ev.delta as string).join("");
+    assert.equal(joined, "line one\ntail", "surrounding prose reassembles cleanly");
+});
+
+test("chat passthrough (anthropic) strips a forged marker text_delta (fast-path bypass #717)", async () => {
+    const out: string[] = [];
+    const res = makePipeRes(out);
+    const events = [
+        `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}\n\n`,
+        `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: `start\n${FORGED}\nend` } })}\n\n`,
+        `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`,
+        `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 3 } })}\n\n`,
+    ];
+    // no session: mirrors the #460 proxy-mode non-injection path
+    await pipePluginChatWithStrip(sseFromStrings(events), res, "anthropic");
+    const text = out.join("");
+    assert.ok(!text.includes("[ACP] Compressed"), "forged marker must not pass through the fast path");
+    const joined = text.split("\n").filter((l) => l.startsWith("data:"))
+        .map((l) => JSON.parse(l.slice(5).trim()) as { type?: string; delta?: Record<string, string> | null })
+        .filter((ev) => ev.type === "content_block_delta" && ev.delta?.type === "text_delta")
+        .map((ev) => (ev.delta as Record<string, string>).text).join("");
+    assert.equal(joined, "start\nend", "surrounding prose reassembles cleanly");
+});
+
+test("chat passthrough (openai) strips a marker head split across chunks (fast-path bypass #717)", async () => {
+    const out: string[] = [];
+    const res = makePipeRes(out);
+    const chunk = (delta: Record<string, unknown>, finish: string | null): string =>
+        `data: ${JSON.stringify({ id: "chatcmpl-1", object: "chat.completion.chunk", created: 1, model: "qwen", choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
+    const events = [
+        chunk({ content: `s\n📦 [` }, null),
+        chunk({ content: `ACP] Compressed m00876–m01100 → 1 block(s).\ne` }, null),
+        chunk({}, "stop"),
+        "data: [DONE]\n\n",
+    ];
+    await pipePluginChatWithStrip(sseFromStrings(events), res, "openai", makePipeSession("openai"));
+    const text = out.join("");
+    assert.ok(!text.includes("[ACP] Compressed"), "split forged marker must not reassemble downstream");
+    const joined = text.split("\n").filter((l) => l.startsWith("data:") && !l.includes("[DONE]"))
+        .map((l) => JSON.parse(l.slice(5).trim()) as { choices?: Array<{ delta?: { content?: string } }> })
+        .flatMap((ev) => (ev.choices ?? []).map((c) => c.delta?.content ?? "")).join("");
+    assert.equal(joined, "s\ne", "surrounding prose reassembles cleanly");
 });
