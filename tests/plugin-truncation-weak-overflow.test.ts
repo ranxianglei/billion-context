@@ -248,3 +248,43 @@ test("#721 chat pipe: no session (#460 non-injected branch) still gets the in-ba
     assert.ok(out.includes(TRUNC_MARKER));
     assert.ok(out.includes("data: [DONE]"));
 });
+
+// #721 review: a cut landing MID-EVENT leaves a dangling partial SSE line in
+// the pipe's buffer. SSE joins every `data:` line inside one blank-line-
+// delimited block, so writing that fragment before the synthesized signal
+// fuses the two into a single malformed frame (corrupting the signal). The
+// fragment must be dropped — matching the responses pipe, which never writes
+// raw buf. These assert every emitted data payload is standalone-parseable.
+function sseDataEvents(out: string): string[] {
+    return out.split("\n\n").filter((b) => b.trim().length > 0).map((block) =>
+        block.split("\n").filter((l) => l.startsWith("data:")).map((l) => l.slice(5).replace(/^ /, "")).join("\n"),
+    );
+}
+
+const PARTIAL_CHUNK = `data: ${JSON.stringify({ id: "c1", object: "chat.completion.chunk", created: 1, model: "qwen", choices: [{ index: 0, delta: { content: "tial" }, finish_reason: null }] })}`; // NO trailing \n\n
+
+test("#721 review (openai, EOF): mid-event cut drops the dangling fragment; signal stays well-formed", async () => {
+    const { res, chunks } = makeRes();
+    await pipePluginChatWithStrip(streamOf([chatChunk({ content: "par" }), PARTIAL_CHUNK]), res, "openai", makeSession());
+    const out = chunks.join("");
+    assert.ok(!out.includes("tial"), "dangling partial event must be dropped, not fused into the signal");
+    for (const ev of sseDataEvents(out)) {
+        if (ev === "[DONE]") continue;
+        JSON.parse(ev);
+    }
+    assert.ok(sseDataEvents(out).some((ev) => ev.includes(TRUNC_MARKER)), "error frame still delivered as its own event");
+});
+
+test("#721 review (openai, read failure): mid-event cut drops the dangling fragment; signal stays well-formed", async () => {
+    const { res, chunks } = makeRes();
+    await assert.doesNotReject(
+        pipePluginChatWithStrip(failingStream([chatChunk({ content: "par" }), PARTIAL_CHUNK], new Error("other side closed")), res, "openai", makeSession()),
+    );
+    const out = chunks.join("");
+    assert.ok(!out.includes("tial"), "dangling partial event must be dropped on the read-failure path too");
+    for (const ev of sseDataEvents(out)) {
+        if (ev === "[DONE]") continue;
+        JSON.parse(ev);
+    }
+    assert.ok(sseDataEvents(out).some((ev) => ev.includes(TRUNC_MARKER)), "error frame still delivered as its own event");
+});

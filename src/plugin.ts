@@ -901,7 +901,17 @@ export async function pipePluginChatWithStrip(
             }
             if (res.destroyed || res.writableEnded) break;
         }
-        if (buf.length > 0 && !res.destroyed && !res.writableEnded) await write(buf);
+        // #721: upstream EOF without a terminal event must not close the
+        // stream bare — the agent would persist the partial turn as complete
+        // (the #719 chain). finished=true when a finish reason was delivered:
+        // only the trailing terminal byte ([DONE]/message_stop) is missing.
+        const truncated = !sawTerminal && !res.destroyed && !res.writableEnded;
+        // A dangling partial event left in buf by a mid-event cut would fuse
+        // with the next complete frame — SSE joins every data line inside one
+        // blank-line-delimited block — corrupting the truncation signal. Drop
+        // it when the signal follows: an unterminated event is unparseable by
+        // the client anyway (same as the pre-#721 bare end).
+        if (!truncated && buf.length > 0 && !res.destroyed && !res.writableEnded) await write(buf);
         const rest = flushTails();
         if (rest.length > 0 && !res.destroyed && !res.writableEnded) await write(rest);
         // Settle BEFORE res.end() in the finally below: the client can issue
@@ -911,11 +921,7 @@ export async function pipePluginChatWithStrip(
         settleUsage();
         maybeNoteTruncated();
         maybeWarnDegenerate();
-        // #721: upstream EOF without a terminal event must not close the
-        // stream bare — the agent would persist the partial turn as complete
-        // (the #719 chain). finished=true when a finish reason was delivered:
-        // only the trailing terminal byte ([DONE]/message_stop) is missing.
-        if (!sawTerminal && !res.destroyed && !res.writableEnded) {
+        if (truncated) {
             emitUpstreamTruncation(res, protocol, finalFinishReason !== undefined, log);
             return;
         }
@@ -929,9 +935,10 @@ export async function pipePluginChatWithStrip(
         // #721: upstream read failed while the client is still connected —
         // deliver the in-band truncation signal instead of rethrowing into
         // the top-level handler, which would close the stream bare. Flush
-        // held tag tails first so partial prose is never silently lost.
+        // held tag tails first so partial prose is never silently lost. The
+        // dangling partial event left in buf is dropped (see EOF path above):
+        // written raw it would fuse with the signal frame.
         try {
-            if (buf.length > 0) await write(buf);
             const rest = flushTails();
             if (rest.length > 0) await write(rest);
         } catch {
