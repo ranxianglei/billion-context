@@ -282,7 +282,7 @@
 - **类型：** `object`（`{ compressPhilosophy?, howToCompressRules?, tier2DistillRules?, tier3CondenseRules? }`，均为字符串）
 - **默认值：** *（内核默认值 —— 见 `acp-kernel` 的 `defaultPrompts`）*
 - **状态：** ACTIVE
-- **说明：** 覆盖注入到系统提示词与 nudge 消息中的压缩提示词文本。每个字段都是**承重的（load-bearing）**：内核规则经过数月生产调优，覆盖它们可能降低摘要质量（丢失路径 / 签名 / 决策 → 检索失效）。只有当同一（胜出的）层级同时设置了 `acknowledgePromptsRisk: true` 时覆盖才生效；否则会被忽略并记录一次警告。非字符串字段会被静默丢弃（畸形的局部配置不会破坏正常默认值）。主要用于非英文或小模型调优 —— 见 issue #156。
+- **说明：** 覆盖注入到系统提示词与 nudge 消息中的压缩提示词文本。每个字段都是**承重的（load-bearing）**：内核规则经过数月生产调优，覆盖它们可能降低摘要质量（丢失路径 / 签名 / 决策 → 检索失效）。只有在解析后的配置里 `acknowledgePromptsRisk: true` 生效时覆盖才生效——该标志自身按“最深层级定义者优先”独立解析，不必与 `prompts` 写在同一层级（全局标志 + 模型级 `prompts` 覆盖照样生效）；否则覆盖会被忽略并记录一次警告。非字符串字段会被静默丢弃（畸形的局部配置不会破坏正常默认值）。主要用于非英文或小模型调优 —— 见 issue #156。
 
 #### `acknowledgePromptsRisk`
 
