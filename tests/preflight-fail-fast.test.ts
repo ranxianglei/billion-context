@@ -428,3 +428,62 @@ test("e2e #736: operator-shrunk window (compress.modelContextLimit below the mod
         await once(upstream, "close");
     }
 });
+
+// #737 review: the shrink note must fire ONLY when bili deliberately shrank the
+// window (operator override / codex align). On a NON-Anthropic turn the per-request
+// output-headroom reservation (reserveOutputHeadroom = window - max_tokens) ALSO
+// lowers reqConfig.modelContextLimit below the resolved native window — with no
+// operator setting involved. Gating the note on `limit < resolvedNativeWindow` alone
+// (the pre-fix logic) therefore blamed compress.modelContextLimit for a reduction
+// the operator never made. This guards that path: an OpenAI-chat incompressible
+// payload under a headroom-shrunk window must NOT carry the shrink note.
+test("e2e #737: output-headroom-shrunk window (non-Anthropic, no operator override) → fail-fast does NOT name compress.modelContextLimit", async () => {
+    const calls: Call[] = [];
+    const upstream = makeUpstream429(calls);
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = upstream.address().port;
+
+    // Model declares a 10k window (registry table), NO operator override. The
+    // OpenAI-chat endpoint reserves output headroom: max_tokens 4000 shrinks the
+    // effective window 10000 -> 6000. A ~12k incompressible (hard-protected bash)
+    // tool result overflows 6000 → fail-fast.
+    const proxy = await startProxy(upstreamPort, { "gpt-small": { context: 10_000 } }, { protectedTools: ["bash"] });
+    await once(proxy, "listening");
+    const proxyPort = proxy.address().port;
+
+    try {
+        const filler = "FILLER_".repeat(7000);
+        const r = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/chat/completions`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "preflight-headroom-sess" },
+            body: JSON.stringify({
+                model: "gpt-small",
+                max_tokens: 4_000,
+                stream: true,
+                messages: [
+                    { role: "assistant", content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "bash", arguments: JSON.stringify({ command: "echo hi" }) } }] },
+                    { role: "tool", tool_call_id: "call_1", content: filler },
+                ],
+            }),
+        });
+        assert.equal(r.status, 502, "fail-fast 502 when nothing is compressible under the headroom-shrunk window");
+        const json = JSON.parse(await r.text()) as { error?: { code?: string; message?: string } };
+        assert.equal(json.error?.code, "preflight_compress_failed");
+        const msg = json.error?.message ?? "";
+        assert.ok(msg.includes("NOT forwarded"), `payload withheld (got: ${msg})`);
+        // Proves the headroom path was exercised: the reported window is the
+        // reserved 6000, not the declared 10000.
+        assert.ok(msg.includes("model window 6000"), `effective window reflects headroom reservation (got: ${msg})`);
+        // Regression guard: the reduction here came from output-headroom, NOT an
+        // operator setting — the shrink note must stay silent.
+        assert.ok(!msg.includes("full window"), `no shrink note for a headroom-shrunk window (got: ${msg})`);
+        assert.ok(!msg.includes("compress.modelContextLimit"), `does not blame an untouched operator setting (got: ${msg})`);
+        assert.equal(calls.length, 0, "no upstream call was spent on an incompressible payload");
+    } finally {
+        proxy.close();
+        await once(proxy, "close");
+        upstream.close();
+        await once(upstream, "close");
+    }
+});
