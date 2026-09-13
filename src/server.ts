@@ -1086,6 +1086,12 @@ async function handle(
     // absolute number, a "70%" string of the native window, or unset → native)
     // overrides the table.
     let reqConfig = config;
+    // #736: the resolved NATIVE window (before the compress.modelContextLimit
+    // override and the codex align) plus what shrank the effective window below
+    // it — threaded into preflightCompressIfNeeded so a fail-fast can tell the
+    // operator that their own setting, not the upstream, is the wall they hit.
+    let resolvedNativeWindow: number | undefined;
+    let windowShrinkReason: "operator" | "codex" | undefined;
     // True when the resolved native window came from a low-confidence fallback
     // (built-in table / env default) instead of an authoritative source — such
     // windows get an effective-floor after output-headroom reservation (see
@@ -1156,6 +1162,7 @@ async function handle(
                     log("info", `[window] model=${model} source=${wsSource} native=${native ?? "none"} effective=${reqConfig.modelContextLimit} launcher=${launcherWindow ?? "none"} configured=${configuredWindow ?? "none"} peek=${peekWindow ?? "none"} fallback=${nativeFromFallback}`);
                 }
             }
+            resolvedNativeWindow = native;
             // #321 PR-E1: a codex client carries its OWN window perception
             // (bundled model table + 272K unknown-model fallback) and
             // auto-compacts at 90% of it. If bili's budget exceeds what codex
@@ -1173,7 +1180,10 @@ async function handle(
                 const before = reqConfig.modelContextLimit;
                 reqConfig = { ...reqConfig, modelContextLimit: aligned.limit };
                 nativeFromFallback = false;
+                windowShrinkReason = "codex";
                 log("info", `[codex] effective window clamped ${before} → ${aligned.limit} (codex's own perception for model=${model}; ACP now compresses before codex's native auto-compact)`);
+            } else if (operatorWindowTuned && native !== undefined && reqConfig.modelContextLimit < native) {
+                windowShrinkReason = "operator";
             }
             const compressCfg = resolveCompress(opts.routes, embeddedUrl, model, opts.compress);
             reqPrompts = resolveCompressPrompts(compressCfg);
@@ -1642,6 +1652,8 @@ async function handle(
                         core,
                         reqConfig,
                         (parsed as { model?: string }).model,
+                        resolvedNativeWindow,
+                        windowShrinkReason,
                         route,
                         affinity,
                         anonAffinity !== null,
@@ -3054,6 +3066,8 @@ async function preflightCompressIfNeeded(
     core: CompressionCore,
     config: Config,
     model: string | undefined,
+    resolvedNativeWindow: number | undefined,
+    windowShrinkReason: "operator" | "codex" | undefined,
     route: ReturnType<typeof resolveUpstream>,
     affinity: string | undefined,
     anonymous: boolean,
@@ -3115,10 +3129,20 @@ async function preflightCompressIfNeeded(
         const imageNote = imageTokens >= limit
             ? ` Images alone account for ~${imageTokens} tokens (≥ window ${limit}); compression cannot remove them — shrink or remove the images, or raise the window.`
             : "";
+        // #736: when the wall is bili's own shrunken window, say so — "raise the
+        // model context window" otherwise sends operators to the upstream when
+        // their compress.modelContextLimit is the actual ceiling.
+        const shrinkNote = resolvedNativeWindow !== undefined && limit < resolvedNativeWindow
+            ? ` Note: bili's effective window ${limit} is below the model's full window ${resolvedNativeWindow} — ` +
+                (windowShrinkReason === "codex"
+                    ? `it was aligned down to codex's own window perception; set compress.modelContextLimit explicitly if your upstream serves the larger window.`
+                    : `your compress.modelContextLimit setting overrides it; if the upstream actually serves the larger window, raise or remove that setting (hot-reloaded, no session restart needed).`)
+            : "";
         const message =
             `context ~${tokenCount} tokens exceeds the model window ${limit} (model=${model}) ` +
-            `and preflight compression could not bring it under: ${detail}.` +
+            `and preflight compression could not bring it under: ${detail.replace(/\.\s*$/, "")}.` +
             imageNote +
+            shrinkNote +
             ` The over-window payload was NOT forwarded.`;
         log("error", `[${session.id}] preflight fail-fast ${status} (retryable=${retryable}): ${message}`);
         return { failFast: true, status, message, retryable, respond: !res.writableEnded };
