@@ -1,0 +1,49 @@
+name: CI Windows codex overlay (#686)
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+
+# Real-machine layer for issue #686: on a hosted Windows runner, confirm codex
+# accepts the `<CODEX_HOME>-bili` overlay from `bili codex` and registers bili.
+# Headless and key-free because `codex mcp list` reads config.toml only and
+# never calls a model (the secret-backed ubuntu e2e still covers model round-trip).
+jobs:
+  windows-codex-overlay:
+    name: codex accepts CODEX_HOME overlay + registers bili MCP
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install deps + build
+        shell: pwsh
+        run: |
+          npm install --ignore-scripts --no-fund --no-audit
+          npm run build
+      # Bare `bili` is not on the runner PATH after a local install; link the
+      # just-built package globally (dist is self-contained, so no extra fetch).
+      - name: Link locally-built bili onto PATH
+        shell: pwsh
+        run: npm install -g .
+      - name: Install codex CLI
+        shell: pwsh
+        run: npm install -g @openai/codex
+      # Non-obvious on purpose: do NOT remove continue-on-error until one clean
+      # run proves codex boots unauthenticated on windows-latest. The transcript
+      # artifact shows what happened so this can then become a hard gate.
+      - name: Headless verify (codex reads overlay, registers bili)
+        continue-on-error: true
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File scripts/windows-codex-mcp-check.ps1
+      - name: Upload transcript
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-codex-mcp-output
+          path: windows-codex-mcp-output.txt
+          if-no-files-found: ignore
