@@ -69,6 +69,8 @@ The proxy injects four context-management tools (`compress`, `decompress`, `sear
 
 An opt-in fifth tool, `absorb` (`compress.absorb.enabled: true` — see [CONFIGURATION.md](CONFIGURATION.md)), compresses **individual tool results the moment they arrive**: large results (builds, logs, greps) get a forced absorb instruction, the model distills each into a compact summary, and the original pair is hidden from the wire from the next turn on — keeping mid-session pressure lower between fold rounds (#605).
 
+An opt-in sixth tool, `acp_rule` (`compress.rules: true` — see [CONFIGURATION.md](CONFIGURATION.md)), records **persistent principle-level reminders**: a short rule recorded by the model (user-emphasized lessons, behaviors to remember, major pitfalls hit) is hard-protected from compression — the call and its result stay in context across every fold — and omitting the argument lists the recorded rules ([ranxianglei/billion-context-pi#433](https://github.com/ranxianglei/billion-context-pi/issues/433)).
+
 ### Two compression modes — who executes `compress`
 
 The proxy runs in one of two modes, and **the mode decides who executes

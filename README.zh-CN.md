@@ -69,6 +69,8 @@ AI 编程助手的<strong>通用上下文压缩代理</strong>
 
 可选的第五个工具 `absorb`(`compress.absorb.enabled: true` —— 见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md))对**各个工具结果即时压缩**:大结果(构建、日志、grep)被附带强制吸收指令,模型将各自蒸馏为紧凑摘要,原配对从下一轮起从线上隐藏 —— 使折叠轮之间的中间会话压力更低(#605)。
 
+可选的第六个工具 `acp_rule`(`compress.rules: true` —— 见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md))记录**持久化的原则级提醒**:模型记录的简短规则(用户强调的教训、要求记住的行为、撞到的大坑)受硬性保护不被压缩——调用及结果在每次折叠中都保留在上下文中——省略参数则列出已记录规则([ranxianglei/billion-context-pi#433](https://github.com/ranxianglei/billion-context-pi/issues/433))。
+
 **如何确认压缩真的生效了。** 代理执行 `compress` 后会以普通 assistant 文本发出确认标记(`📦 [ACP] Compressed …`)—— 但曾观察到模型在持续上下文压力下*自行书写该标记格式*而从未调用工具(#717):约 2 小时内 17 次假"压缩",真实用量一路爬到 89%。因此对话中看到的标记行本身不是持久化完成的证据 —— 请先用 `acp_status` 复核(块数 +1、可压缩区间起点前移)再采信。作为兜底,代理会剥离模型自发的标记形文本并记录 `[marker-echo]` 警告;注入的 nudge 与系统提示词也明确声明标记只由代理发出。
 
 ## 该选哪个?

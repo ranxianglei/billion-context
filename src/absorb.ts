@@ -11,7 +11,8 @@ import {
     type Config,
     type CoreMessage,
 } from "acp-kernel";
-import { PROXY_TOOL_NAMES } from "./compress-tool.js";
+import { PROXY_TOOL_NAMES, RULE_TOOL_NAME } from "./compress-tool.js";
+import { effectiveRulesConfig } from "./rules-feature.js";
 import { log as loggerLog } from "./logger.js";
 import type { Session } from "./session.js";
 
@@ -46,7 +47,8 @@ export function storeEffectiveAbsorb(session: Session, config: Config): void {
 export function isProxyToolFor(name: string, session: Session | undefined, config: Config): boolean {
     if (PROXY_TOOL_NAMES.has(name)) return true;
     const absorb = effectiveAbsorbConfig(session, config);
-    return absorb?.enabled === true && name === (absorb.toolName ?? ABSORB_TOOL_NAME);
+    if (absorb?.enabled === true && name === (absorb.toolName ?? ABSORB_TOOL_NAME)) return true;
+    return effectiveRulesConfig(session, config)?.enabled === true && name === RULE_TOOL_NAME;
 }
 
 // Per-turn view transform: drop absorbed tool-call/result pairs, then append

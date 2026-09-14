@@ -10,8 +10,10 @@ import type { BiliMessage } from "acp-kernel/wire";
 import {
     parseCompressInput,
     ABSORB_TOOL_NAME,
+    RULE_TOOL_NAME,
 } from "../compress-tool.js";
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "../absorb.js";
+import { effectiveRulesConfig, executeRule } from "../rules-feature.js";
 import { applyRanges } from "../stream.js";
 import { executeSearchContext, resolveDecompress } from "../decompress-shared.js";
 import { buildVisibilityMarker } from "../compress-loop.js";
@@ -157,6 +159,9 @@ export function executeProxyTool(
     const absorb = effectiveAbsorbConfig(ctx.session, ctx.config);
     if (absorb?.enabled === true && toolName === (absorb.toolName ?? ABSORB_TOOL_NAME)) {
         return executeAbsorb(args, callId, absorb, ctx);
+    }
+    if (effectiveRulesConfig(ctx.session, ctx.config)?.enabled === true && toolName === RULE_TOOL_NAME) {
+        return executeRule(args, ctx);
     }
     return `[Unknown proxy tool: ${toolName}]`;
 }

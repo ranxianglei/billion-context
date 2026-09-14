@@ -173,6 +173,16 @@ export type CompressSettings = {
          *  the client's own tool names or the agent will call its own tool. */
         toolName?: string;
     };
+    /** Persistent rule reminders (kernel `Config.rules`, acp-kernel >= 0.0.70).
+     *  When `enabled`, an `acp_rule` tool is injected (or advertised in the
+     *  plugin manifest): passing a short `rule` records a principle-level
+     *  reminder that is hard-protected from compression and stays in context
+     *  for the life of the session; omitting the argument lists recorded
+     *  rules for human review. The feature deliberately adds NO system-prompt
+     *  content (all guidance rides in the tool description). Maps to kernel
+     *  `Config.rules = { enabled }`. Off unless explicitly enabled at some
+     *  level. Deepest-wins like every other scalar field. */
+    rules?: boolean;
 
 /** Opt-in removal of historical image payloads (src/strip-images.ts). When
      *  true, every message except the most recent {@link stripImagesKeepRecent}
@@ -665,6 +675,10 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     if ("stripImages" in obj) {
         if (typeof obj.stripImages !== "boolean") ok = false;
         else out.stripImages = obj.stripImages;
+    }
+    if ("rules" in obj) {
+        if (typeof obj.rules !== "boolean") ok = false;
+        else out.rules = obj.rules;
     }
     // Injection toggles are file-level fields (FileConfig.compress) honored by
     // loadOptions via `=== false`; the web UI shows them from the raw file

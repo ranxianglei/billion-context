@@ -335,6 +335,13 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
   - `toolName: string` — rename the injected tool (default `"absorb"`); the schema, system-prompt section and per-session adjudication all follow the name.
   Injection follows the wire's native-tool surface: proxy mode injects the tool + a static system-prompt section on the anthropic/openai/responses native-tools wires, plugin mode advertises it in the plugin manifest (the MCP shell picks it up for free). Responses **marker/text-protocol** routes are not supported (no native tool surface — the REQUIRED absorb instruction would be unsatisfiable), and title-generation requests (`max_tokens ≤ 200`) skip injection like the compress prompt does. Absorbed pairs stay hidden across restarts (persisted in the session state).
 
+#### `rules`
+
+- **Type:** `boolean`
+- **Default:** `false`
+- **Status:** ACTIVE
+- **Description:** Opt-in **persistent model reminders** (issue [ranxianglei/billion-context-pi#433](https://github.com/ranxianglei/billion-context-pi/issues/433), via the `acp-kernel` rules API). When enabled, an `acp_rule` tool is injected alongside the ACP tools: calling it with a short `rule` argument records a principle-level reminder that is **hard-protected** from compression (the call + result stay in context across every fold), and omitting the argument lists the recorded rules. Guidance on *when* to record (user-emphasized lessons, behaviors the user asks to remember, major pitfalls hit) lives entirely in the tool description — nothing is added to the system prompt. Kernel limits apply (50 rules × 300 chars each); duplicate text is rejected pointing at the existing id. Injection follows the wire's native-tool surface exactly like `absorb`: proxy mode injects the tool on the anthropic/openai/responses native-tools wires, plugin mode advertises it in the plugin manifest (execution gated per session). Recorded rules persist across restarts in the session state. Requires `acp-kernel` >= 0.0.70.
+
 #### `reasoning`
 
 - **Type:** `object` (`{ drop?, threshold? }`)

@@ -333,6 +333,13 @@
   - `toolName: string` — 重命名注入工具（默认 `"absorb"`）；模式、系统提示段与按会话裁决都跟随名称。
   注入跟随线上原生工具面：代理模式在 anthropic/openai/responses 原生工具线上注入工具 + 静态系统提示段，插件模式在插件清单中广告它（MCP shell 自动拾取）。Responses **marker/文本协议**路由不支持（无原生工具面 — 强制的 absorb 指令不可满足），标题生成请求（`max_tokens ≤ 200`）跳过注入如压缩提示一样。吸收配对在重启后保持隐藏（在会话状态持久化）。
 
+#### `rules`
+
+- **类型：** `boolean`
+- **默认值：** `false`
+- **状态：** ACTIVE
+- **说明：** 可选开启的**持久化模型提醒**（issue [ranxianglei/billion-context-pi#433](https://github.com/ranxianglei/billion-context-pi/issues/433)，经由 `acp-kernel` rules API）。启用后，一个 `acp_rule` 工具随 ACP 工具一同注入：传入简短的 `rule` 参数调用可记录一条**原则级提醒**，该提醒受**硬性保护**免于压缩（调用及结果在每次折叠中都保留在上下文中）；省略参数则列出已记录的规则。关于*何时*记录（用户强调的教训、用户要求记住的行为、遇到的重大陷阱）的指导完全写在工具描述里——不向系统提示词添加任何内容。受内核限制约束（50 条规则 × 每条 300 字符）；重复文本会被拒绝并指向已有的 id。注入跟随线上原生工具面，与 `absorb` 完全一致：代理模式在 anthropic/openai/responses 原生工具线上注入该工具，插件模式在插件清单中声明（执行按会话门控）。已记录的规则在会话状态中持久化，跨重启保留。要求 `acp-kernel` >= 0.0.70。
+
 #### `reasoning`
 
 - **类型：** `object`（`{ drop?, threshold? }`）

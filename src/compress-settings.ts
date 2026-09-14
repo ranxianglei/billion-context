@@ -67,6 +67,7 @@ export function mergeCompress(
         prompts: promptLevels.length > 0 ? Object.assign({}, ...promptLevels) : undefined,
         acknowledgePromptsRisk: pick("acknowledgePromptsRisk"),
         absorb: absorbLevels.length > 0 ? Object.assign({}, ...absorbLevels) : undefined,
+        rules: pick("rules"),
 
 stripImages: pick("stripImages"),
         stripImagesKeepRecent: pick("stripImagesKeepRecent"),
@@ -190,7 +191,9 @@ export function hasCompressSettings(s: CompressSettings): boolean {
   *  - `absorb` → `absorb` (kernel AbsorbConfig; unset fields inherit the
   *    kernel DEFAULT_ABSORB_CONFIG, so a partial user block still resolves
   *    fully). Absent `s.absorb` leaves `base.absorb` untouched — the feature
-  *    stays off unless some level enables it. */
+  *    stays off unless some level enables it.
+  *  - `rules` → `rules = { enabled }` (kernel RuleFeatureConfig; limits stay
+  *    at kernel defaults). Absent `s.rules` leaves `base.rules` untouched. */
 export function applyCompressSettings(base: Config, limit: number, s: CompressSettings): Config {
     const nudge = { ...base.nudge };
     const truncate = { ...base.truncate };
@@ -230,6 +233,7 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
             minCompressRange: s.minCompressRangeChars ?? s.minCompressRange ?? base.compress.minCompressRange,
         },
         ...(absorb !== undefined ? { absorb } : {}),
+        ...(s.rules !== undefined ? { rules: { enabled: s.rules === true } } : {}),
     };
 }
 

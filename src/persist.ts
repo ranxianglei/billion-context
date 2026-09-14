@@ -147,6 +147,7 @@ function mergeState(parsed: CompressionState): CompressionState {
         // Without this, a restart re-exposes absorbed tool outputs: state
         // resurrects with absorbed=[] and hideAbsorbedMessages has nothing to hide.
         absorbed: parsed.absorbed ?? fresh.absorbed,
+        rules: parsed.rules ?? fresh.rules,
     };
 }
 

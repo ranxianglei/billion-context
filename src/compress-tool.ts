@@ -50,6 +50,11 @@ export {
     ABSORB_TOOL,
     ABSORB_TOOL_OPENAI,
     buildAbsorbSystemPrompt,
+    RULE_TOOL_NAME,
+    RULE_TOOL_DESCRIPTION,
+    RULE_TOOL,
+    RULE_TOOL_OPENAI,
+    RULE_TOOL_RESPONSES,
 } from "acp-kernel";
 export type { ParsedRange, AbsorbConfig } from "acp-kernel";
 export { ACP_TOOL_NAMES as PROXY_TOOL_NAMES, ACP_MUTATING_TOOLS as MUTATING_PROXY_TOOLS, ACP_READONLY_TOOLS as READONLY_PROXY_TOOLS } from "acp-kernel";

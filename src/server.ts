@@ -44,8 +44,9 @@ import {
     subagentNamespace,
 } from "acp-kernel/wire";
 import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive } from "./session.js";
-import { ABSORB_TOOL, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildAbsorbSystemPrompt, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withMarkerIntegrityNote, withStagedCompressGuidance } from "./compress-tool.js";
+import { ABSORB_TOOL, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, RULE_TOOL, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, buildAbsorbSystemPrompt, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withMarkerIntegrityNote, withStagedCompressGuidance } from "./compress-tool.js";
 import { applyAbsorbView, absorbEnabled, absorbToolName, storeEffectiveAbsorb } from "./absorb.js";
+import { rulesEnabled, storeEffectiveRules } from "./rules-feature.js";
 import { rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
 import { preflightCompress, estimateCoreMessages, estimateRawBodyTokens, estimateCoreMessagesUpper, type PreflightResult } from "./preflight.js";
@@ -2030,6 +2031,10 @@ function prepareAnthropic(
         // reaches the wire. Hiding recorded absorptions is unaffected
         // (applyAbsorbView hides regardless of enablement).
         const absorbActive = absorbEnabled(config) && opts.compress.injectTool;
+        // acp_rule has no processTurn side effect (no markers/instructions are
+        // ever injected into messages), so unlike absorb it needs no loop-
+        // config stripping — only tool availability matters.
+        const rulesActive = rulesEnabled(config) && opts.compress.injectTool;
         const loopConfig = absorbActive ? config : { ...config, absorb: undefined };
         const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
@@ -2037,6 +2042,7 @@ function prepareAnthropic(
         // future usage reports are post-fold reality, drop the credit.
         session.stats.compressCreditTokens = 0;
         storeEffectiveAbsorb(session, loopConfig);
+        storeEffectiveRules(session, config);
         turn.messages = applyAbsorbView(turn.messages, session.state, loopConfig, tokenCount);
         // Drop sub-viability fragments before any consumer sees them: a tiny
         // range in the list makes batched compress attempts fail atomically
@@ -2058,7 +2064,7 @@ function prepareAnthropic(
 
         systemOut = injectSystem(parsed, opts, prompts, loopConfig);
         if (injectTools) {
-            toolsOut = injectTool(parsed.tools, absorbActive ? ABSORB_TOOL : undefined);
+            toolsOut = injectTool(parsed.tools, [...(absorbActive ? [ABSORB_TOOL] : []), ...(rulesActive ? [RULE_TOOL] : [])]);
         }
         // Nudge as a separate trailing user message (cache-friendly): the
         // system block stays byte-stable so the prefix cache survives.
@@ -2265,6 +2271,7 @@ function prepareOpenai(
         // config.absorb). Title-gen requests skip ALL injection for
         // prefix-cache stability, so strip absorb from the loop config there.
         const absorbActive = absorbEnabled(config) && shouldInject;
+        const rulesActive = rulesEnabled(config) && shouldInject;
         const loopConfig = absorbActive ? config : { ...config, absorb: undefined };
         const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: "text-only" });
         session.state = turn.state;
@@ -2272,6 +2279,7 @@ function prepareOpenai(
         // future usage reports are post-fold reality, drop the credit.
         session.stats.compressCreditTokens = 0;
         storeEffectiveAbsorb(session, loopConfig);
+        storeEffectiveRules(session, config);
         turn.messages = applyAbsorbView(turn.messages, session.state, loopConfig, tokenCount);
         // Drop sub-viability fragments before any consumer sees them: a tiny
         // range in the list makes batched compress attempts fail atomically
@@ -2308,7 +2316,7 @@ function prepareOpenai(
         // avoids double-counting it.
         openaiOutboundSystem = sysParts.join("\n\n");
         if (injectTools) {
-            toolsOut = injectOpenaiTool(parsed.tools, absorbActive ? ABSORB_TOOL_OPENAI : undefined);
+            toolsOut = injectOpenaiTool(parsed.tools, [...(absorbActive ? [ABSORB_TOOL_OPENAI] : []), ...(rulesActive ? [RULE_TOOL_OPENAI] : [])]);
         }
         // Nudge as a separate trailing user message (cache-friendly). Injected
         // in BOTH modes (#451): plugin agents supply the ACP tools but have no
@@ -2460,6 +2468,7 @@ function prepareResponses(
         // config.absorb). The marker/text protocol has no native tool channel,
         // so strip absorb from the loop config there (both modes).
         const absorbActive = absorbEnabled(config) && shouldInject && !isCompactionTrigger && !responsesTextProtocol;
+        const rulesActive = rulesEnabled(config) && shouldInject && !isCompactionTrigger && !responsesTextProtocol;
         const loopConfig = absorbActive ? config : { ...config, absorb: undefined };
         const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags });
         session.state = turn.state;
@@ -2467,6 +2476,7 @@ function prepareResponses(
         // future usage reports are post-fold reality, drop the credit.
         session.stats.compressCreditTokens = 0;
         storeEffectiveAbsorb(session, loopConfig);
+        storeEffectiveRules(session, config);
         turn.messages = applyAbsorbView(turn.messages, session.state, loopConfig, tokenCount);
         // Drop sub-viability fragments before any consumer sees them: a tiny
         // range in the list makes batched compress attempts fail atomically
@@ -2502,9 +2512,10 @@ function prepareResponses(
             responsesDevContent = devContent;
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent);
             if (!process.env.ACP_NO_INJECT_TOOL && injectTools) {
+                const respExtra = [...(absorbActive ? [ABSORB_TOOL_RESPONSES] : []), ...(rulesActive ? [RULE_TOOL_RESPONSES] : [])];
                 toolsOut = responsesTextProtocol
                     ? injectResponsesTool(parsed.tools, ACP_READONLY_TOOLS_RESPONSES)
-                    : injectResponsesTool(parsed.tools, absorbActive ? [...ACP_TOOLS_RESPONSES, ABSORB_TOOL_RESPONSES] : ACP_TOOLS_RESPONSES);
+                    : injectResponsesTool(parsed.tools, respExtra.length > 0 ? [...ACP_TOOLS_RESPONSES, ...respExtra] : ACP_TOOLS_RESPONSES);
             }
         } else if (projection.systemParts.length > 0 || forgedSummaries.length > 0) {
             const devContent = [...projection.systemParts, ...forgedSummaries].join("\n\n---\n\n");
@@ -2839,28 +2850,30 @@ function injectSystem(
     return buildSystem(full, parsed.system);
 }
 
-function injectTool(tools: unknown[] | undefined, extra?: { name: string }, toolPrompts?: ToolPrompts): unknown[] {
+function injectTool(tools: unknown[] | undefined, extras?: readonly { name: string }[], toolPrompts?: ToolPrompts): unknown[] {
     const acp = applyAcpToolOverrides(ACP_TOOLS_ANTHROPIC, toolPrompts);
-    if (!Array.isArray(tools)) return extra ? [...acp, extra] : [...acp];
+    const extrasList = extras ?? [];
+    if (!Array.isArray(tools)) return [...acp, ...extrasList];
     const names = new Set(tools.map((t) => (t as { name?: string })?.name));
     const missing = acp.filter((t) => !names.has(t.name));
-    const extraMissing = extra && !names.has(extra.name);
-    if (missing.length === 0 && !extraMissing) return tools;
-    return [...tools, ...missing, ...(extraMissing ? [extra] : [])];
+    const extraMissing = extrasList.filter((t) => !names.has(t.name));
+    if (missing.length === 0 && extraMissing.length === 0) return tools;
+    return [...tools, ...missing, ...extraMissing];
 }
 
-function injectOpenaiTool(tools: OpenAITool[] | undefined, extra?: OpenAITool, toolPrompts?: ToolPrompts): OpenAITool[] {
+function injectOpenaiTool(tools: OpenAITool[] | undefined, extras?: readonly OpenAITool[], toolPrompts?: ToolPrompts): OpenAITool[] {
     const acp = applyAcpToolOverrides(ACP_TOOLS_OPENAI, toolPrompts) as OpenAITool[];
-    if (!Array.isArray(tools)) return extra ? [...acp, extra] : ([...acp] as OpenAITool[]);
+    const list = Array.isArray(tools) ? tools : [];
     const present = new Set(
-        tools
+        list
             .map((t) => t?.function?.name)
             .filter((n): n is string => typeof n === "string"),
     );
     const additions = acp.filter((t) => !present.has(t.function.name));
-    const out = [...tools, ...(additions as OpenAITool[])];
-    if (extra && !out.some((t) => t?.function?.name === extra.function?.name)) out.push(extra);
-    return out;
+    const extraAdditions = (extras ?? []).filter((t) => !present.has(t.function?.name));
+    if (list.length === 0) return [...additions, ...extraAdditions] as OpenAITool[];
+    if (additions.length === 0 && extraAdditions.length === 0) return tools as OpenAITool[];
+    return [...list, ...additions, ...extraAdditions] as OpenAITool[];
 }
 
 /** When true, the Responses path teaches compression via a text trigger
