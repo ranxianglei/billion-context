@@ -34,6 +34,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { execFileSync, spawn, type StdioOptions } from "node:child_process";
 import { DEFAULT_MITM_DOMAINS } from "./mitm.js";
+import { findNodeRuntime } from "./agent/shared.js";
 import {
     claimStartingMarker,
     clearStartingMarker,
@@ -1938,6 +1939,11 @@ export async function ensureProxyRunning(
     const port = opts.port > 0 ? opts.port : await pickEphemeralPort(opts.host);
     const script = process.argv[1];
     if (!script) throw new Error("bili: cannot resolve launcher script path");
+    // #706/#809: never assume process.execPath is Node — pi-native spawn-in-plugin
+    // reuses this path under the host binary. In the CLI/daemon context execPath
+    // IS node, so findNodeRuntime() resolves to the same value as before.
+    const node = findNodeRuntime();
+    if (!node) throw new Error("bili: cannot resolve a Node runtime to spawn the proxy (set BILLION_CONTEXT_NODE)");
     const logPath = path.join(os.tmpdir(), `bili-proxy-${port}.log`);
     const logFd = fs.openSync(logPath, "a");
     // #707: publish the starting marker BEFORE spawning so concurrent launches
@@ -1970,7 +1976,7 @@ export async function ensureProxyRunning(
         let child: SpawnChild;
         try {
             child = spawnImpl(
-                process.execPath,
+                node,
                 [script, ...proxyStartArgs({ ...opts, port })],
                 {
                     detached: true,

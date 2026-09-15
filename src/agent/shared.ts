@@ -5,6 +5,9 @@
 // source of truth), (3) forwards tool executes, (4) reads status. Same
 // package as the proxy ⇒ same version ⇒ no kernel-skew bug class.
 
+import path from "node:path";
+import { existsSync } from "node:fs";
+
 export type ManifestTool = {
     name: string;
     description?: string;
@@ -155,4 +158,64 @@ export async function fetchProxyVersion(proxyBase: string): Promise<string | und
     if (!ok || !json || typeof json !== "object") return undefined;
     const version = (json as { version?: unknown }).version;
     return typeof version === "string" && version.length > 0 ? version : undefined;
+}
+
+/** Identity + protocol probe for lazy local spawn (#809): one manifest GET that
+ *  both confirms the origin is OUR proxy (not a foreign service squatting the
+ *  port) and reads its protocol/version. Soft-fail by design — `connected:false`
+ *  covers both "nothing listening" and "something else answered", so callers can
+ *  distinguish adopt-vs-spawn-vs-stand-down without try/catch. */
+export interface ProxyProbe {
+    connected: boolean;
+    identityOk: boolean;
+    protocolVersion?: number;
+    version?: string;
+}
+
+export async function probeProxy(proxyBase: string, timeoutMs = STATUS_TIMEOUT_MS): Promise<ProxyProbe> {
+    try {
+        const { ok, json } = await fetchJson(`${proxyBase}/__bili/plugin/manifest`, undefined, timeoutMs);
+        if (!ok || !json || typeof json !== "object") return { connected: false, identityOk: false };
+        const data = json as { proxy?: unknown; protocolVersion?: unknown; version?: unknown };
+        return {
+            connected: true,
+            identityOk: data.proxy === "billion-context",
+            protocolVersion: typeof data.protocolVersion === "number" ? data.protocolVersion : undefined,
+            version: typeof data.version === "string" ? data.version : undefined,
+        };
+    } catch {
+        return { connected: false, identityOk: false };
+    }
+}
+
+/** Resolve a real Node runtime for spawning the proxy from INSIDE a host process
+ *  (#809). process.execPath is NOT reliable there: under a native host binary
+ *  (e.g. the Mach-O arm64 OpenCode CLI) it points at the host executable, not Node,
+ *  so spawning it with dist/index.js just prints CLI help and exits. Order:
+ *  execPath if it is node -> BILLION_CONTEXT_NODE override -> PATH walk -> undefined
+ *  (caller fails loud-and-inert). Preferring an already-running Node keeps the
+ *  launcher path byte-identical regardless of env. Dependency-injectable so every
+ *  branch is testable. REUSE for ALL in-host proxy spawns (pi-native #706 / #519) —
+ *  never assume process.execPath is Node. */
+export interface NodeLookupOpts {
+    execPath?: string;
+    pathEnv?: string;
+    exists?: (p: string) => boolean;
+}
+
+export function findNodeRuntime(opts: NodeLookupOpts = {}): string | undefined {
+    const execPath = opts.execPath ?? process.execPath;
+    const pathEnv = opts.pathEnv ?? process.env.PATH ?? "";
+    const exists = opts.exists ?? existsSync;
+    if (/^node(\.exe)?$/i.test(path.basename(execPath))) return execPath;
+    const override = process.env.BILLION_CONTEXT_NODE;
+    if (override && override.length > 0 && exists(override)) return override;
+    for (const dir of pathEnv.split(path.delimiter)) {
+        if (!dir) continue;
+        for (const name of ["node.exe", "node"]) {
+            const candidate = path.join(dir, name);
+            if (exists(candidate)) return candidate;
+        }
+    }
+    return undefined;
 }
