@@ -54,7 +54,7 @@ import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom } from "./plugin-in
 function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
-import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, loadClientConfig, collectModelWindows, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider } from "./client-config.js";
+import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, loadClientConfig, collectModelWindows, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider } from "./client-config.js";
 import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, type ProviderRoutes } from "./config.js";
 import { contextFromRegistry } from "./registry.js";
 
@@ -1653,10 +1653,12 @@ export function opencodeMajorVersion(command: string): number {
  * (JSONC-tolerant, merged) config with the discovered providers' baseURL
  * rewritten (HTTP → /bili/ wrap, wrapped-HTTPS → raw https for cert MITM) into
  * a temp dir, and point OPENCODE_CONFIG at it. The real config files are never
- * touched. With pluginDirMode (OpenCode 2.x), the plugin rides as a temp
- * directory whose index.js re-exports pluginPath — 2.x rejects bare file paths
- * in `plugin`. Returns the temp config FILE path (undefined when there is
- * nothing to do).
+ * touched. Relative local plugin specs (./x, ../x) are re-anchored to absolute
+ * paths before the copy is written — opencode resolves them against the
+ * declaring file's dir, which the clone no longer is (#826). With pluginDirMode
+ * (OpenCode 2.x), the plugin rides as a temp directory whose index.js
+ * re-exports pluginPath — 2.x rejects bare file paths in `plugin`. Returns the
+ * temp config FILE path (undefined when there is nothing to do).
  */
 export function prepareOpencodeHttpRewrite(
     userRoot: Record<string, unknown> | undefined,
@@ -1665,6 +1667,7 @@ export function prepareOpencodeHttpRewrite(
     httpsRewrites: HttpRewrite[],
     pluginPath?: string,
     pluginDirMode?: boolean,
+    env: NodeJS.ProcessEnv = process.env,
 ): string | undefined {
     if (httpRewrites.length === 0 && httpsRewrites.length === 0 && !pluginPath) return undefined;
     // deep-clone: the rewrite below mutates provider entries, and the caller's
@@ -1695,7 +1698,9 @@ export function prepareOpencodeHttpRewrite(
         pluginEntry = wrapDir;
     }
     if (pluginEntry) {
-        const plugins = Array.isArray(root.plugin) ? root.plugin.filter((p): p is string => typeof p === "string") : [];
+        // copy, don't filter: non-string entries (v1 tuple form [spec, options])
+        // are valid Specs and must survive the clone
+        const plugins = Array.isArray(root.plugin) ? [...(root.plugin as unknown[])] : [];
         if (!plugins.includes(pluginEntry)) plugins.push(pluginEntry);
         root.plugin = plugins;
     }
@@ -1708,9 +1713,35 @@ export function prepareOpencodeHttpRewrite(
         ...(existingCompaction && typeof existingCompaction === "object" && !Array.isArray(existingCompaction) ? existingCompaction as Record<string, unknown> : {}),
         auto: false,
     };
+    for (const key of ["plugin", "plugins"] as const) {
+        if (Array.isArray(root[key])) {
+            const baseDir = opencodePluginBaseDir(env, key);
+            root[key] = (root[key] as unknown[]).map((entry) => absolutizePluginEntry(baseDir, entry));
+        }
+    }
     const tmpFile = path.join(tmp, "opencode.json");
     fs.writeFileSync(tmpFile, JSON.stringify(root));
     return tmpFile;
+}
+
+function isRelativeLocalPluginSpec(spec: unknown): spec is string {
+    return typeof spec === "string" && spec.startsWith(".") && !path.isAbsolute(spec);
+}
+
+function absolutizePluginEntry(baseDir: string, entry: unknown): unknown {
+    if (typeof entry === "string") {
+        return isRelativeLocalPluginSpec(entry) ? path.resolve(baseDir, entry) : entry;
+    }
+    if (Array.isArray(entry) && entry.length > 0 && typeof entry[0] === "string") {
+        // v1 tuple form [spec, options?] — only the spec is location-bound
+        if (!isRelativeLocalPluginSpec(entry[0])) return entry;
+        return [path.resolve(baseDir, entry[0]), ...entry.slice(1)];
+    }
+    if (entry !== null && typeof entry === "object" && !Array.isArray(entry) && "package" in entry) {
+        const obj = entry as Record<string, unknown>;
+        if (isRelativeLocalPluginSpec(obj.package)) return { ...obj, package: path.resolve(baseDir, obj.package as string) };
+    }
+    return entry;
 }
 
 function dedupeInOrder(list: string[]): string[] {

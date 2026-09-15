@@ -1927,6 +1927,69 @@ test("prepareOpencodeHttpRewrite: pluginDirMode wraps the plugin in an index.js 
     }
 });
 
+test("prepareOpencodeHttpRewrite: re-anchors relative local plugin specs against the declaring dir (#826)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "oc-rw3-"));
+    try {
+        const xdg = path.join(dir, "xdg");
+        const cfgDir = path.join(xdg, "opencode");
+        fs.mkdirSync(cfgDir, { recursive: true });
+        const original = JSON.stringify({
+            plugin: ["./ntfy.js", "../up/other.js", ["./tupled.js", { flag: true }], "opencode-tps-meter@latest", "/abs/already.js"],
+            plugins: [{ package: "./ntfy", options: {} }, { package: "../up/other" }, { package: "npm-pkg@1" }, { package: "/abs/dir" }],
+        });
+        fs.writeFileSync(path.join(cfgDir, "opencode.json"), original);
+        const env = { XDG_CONFIG_HOME: xdg };
+        const root = readOpencodeConfigRoot(env);
+        const tmpFile = prepareOpencodeHttpRewrite(root, "http://127.0.0.1:8787", [], [], "/opt/bili/dist/agent/opencode.js", true, env);
+        assert.ok(tmpFile);
+        const cloned = JSON.parse(fs.readFileSync(tmpFile, "utf8"));
+        assert.deepEqual(cloned.plugin.slice(0, 5), [
+            path.resolve(cfgDir, "./ntfy.js"),
+            path.resolve(cfgDir, "../up/other.js"),
+            [path.resolve(cfgDir, "./tupled.js"), { flag: true }],
+            "opencode-tps-meter@latest",
+            "/abs/already.js",
+        ]);
+        const shimDir = cloned.plugin[cloned.plugin.length - 1] as string;
+        assert.notEqual(shimDir, "/opt/bili/dist/agent/opencode.js");
+        assert.ok(fs.statSync(shimDir).isDirectory());
+        assert.deepEqual(cloned.plugins, [
+            { package: path.resolve(cfgDir, "./ntfy"), options: {} },
+            { package: path.resolve(cfgDir, "../up/other") },
+            { package: "npm-pkg@1" },
+            { package: "/abs/dir" },
+        ]);
+        // original file untouched and the caller's merged root stays pristine
+        assert.equal(fs.readFileSync(path.join(cfgDir, "opencode.json"), "utf8"), original);
+        assert.equal((root.plugin as unknown[])[0], "./ntfy.js");
+        assert.equal(((root.plugins as Array<Record<string, unknown>>)[0] as Record<string, unknown>).package, "./ntfy");
+        fs.rmSync(path.dirname(tmpFile), { recursive: true, force: true });
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("prepareOpencodeHttpRewrite: OPENCODE_CONFIG dir wins as the relative-spec base (#826)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "oc-rw4-"));
+    try {
+        const xdg = path.join(dir, "xdg");
+        fs.mkdirSync(path.join(xdg, "opencode"), { recursive: true });
+        const ocDir = path.join(dir, "project");
+        fs.mkdirSync(ocDir, { recursive: true });
+        const ocFile = path.join(ocDir, "opencode.json");
+        fs.writeFileSync(ocFile, JSON.stringify({ plugins: [{ package: "./local" }] }));
+        const env = { XDG_CONFIG_HOME: xdg, OPENCODE_CONFIG: ocFile };
+        const root = readOpencodeConfigRoot(env);
+        const tmpFile = prepareOpencodeHttpRewrite(root, "http://127.0.0.1:8787", [], [], "/opt/bili/dist/agent/opencode.js", false, env);
+        assert.ok(tmpFile);
+        const cloned = JSON.parse(fs.readFileSync(tmpFile, "utf8"));
+        assert.deepEqual(cloned.plugins, [{ package: path.resolve(ocDir, "./local") }]);
+        fs.rmSync(path.dirname(tmpFile), { recursive: true, force: true });
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
 test("opencodeMajorVersion: parses --version output, defaults to 1 on failure", () => {
     assert.equal(parseOpencodeMajor("opencode v2.0.3"), 2);
     assert.equal(parseOpencodeMajor("1.14.46"), 1);

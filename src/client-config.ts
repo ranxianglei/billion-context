@@ -948,6 +948,23 @@ export function readOpencodeConfigRoot(env: NodeJS.ProcessEnv): Record<string, u
     return root;
 }
 
+// Base dir for re-anchoring relative local plugin specs when the launcher
+// clones the merged config into a temp dir (#826): opencode resolves a relative
+// spec against the directory of the file that DECLARED it (at load time, before
+// merging), so the surviving array's base is the last readable file in the same
+// load order as readOpencodeConfigRoot that declares the key — arrays are
+// replaced wholesale by later files. The three global files share one dir, so
+// only a user-set OPENCODE_CONFIG elsewhere can shift the base.
+export function opencodePluginBaseDir(env: NodeJS.ProcessEnv, key: "plugin" | "plugins"): string {
+    const oc = env.OPENCODE_CONFIG;
+    if (nonEmpty(oc)) {
+        const parsed = readConfigFileRoot(oc);
+        if (parsed !== undefined && key in parsed) return path.dirname(oc);
+    }
+    const xdg = nonEmpty(env.XDG_CONFIG_HOME) ? env.XDG_CONFIG_HOME : path.join(os.homedir(), ".config");
+    return path.join(xdg, "opencode");
+}
+
 export function parseOpencodeProviders(parsed: Record<string, unknown> | undefined): OpencodeConfig {
     const providers: Record<string, OpencodeProvider> = {};
     if (parsed !== undefined) {
