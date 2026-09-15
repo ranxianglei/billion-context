@@ -1,0 +1,70 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+import { shouldBootstrapNative, nativeProxyScriptPath, singleFlight } from "../src/agent/pi-native.ts";
+import { ensureProxyRunning, type SpawnChild, type SpawnFn } from "../src/launcher.ts";
+
+test("shouldBootstrapNative: true in a bare host with no bili env", () => {
+    assert.equal(shouldBootstrapNative({}), true);
+});
+
+test("shouldBootstrapNative: false when the plugin or native mode is opted out", () => {
+    assert.equal(shouldBootstrapNative({ BILLION_CONTEXT_PLUGIN: "0" }), false);
+    assert.equal(shouldBootstrapNative({ BILI_NATIVE_PI: "0" }), false);
+});
+
+test("shouldBootstrapNative: false when a bili launch already owns a proxy", () => {
+    assert.equal(shouldBootstrapNative({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:36485" }), false);
+    assert.equal(shouldBootstrapNative({ BILLION_CONTEXT_PROXY: "  " }), true);
+    assert.equal(shouldBootstrapNative({ BILI_PROVIDER_REWRITES: '{"vllm":"http://127.0.0.1:1/bili/http://x"}' }), false);
+});
+
+test("nativeProxyScriptPath: dist/agent/pi-native.js resolves to the package bin", () => {
+    // Build the from-URL from a platform-native absolute path: a hardcoded
+    // file:///opt/... URL is invalid on Windows (no drive letter —
+    // fileURLToPath throws ERR_INVALID_FILE_URL_PATH).
+    const agentFile = path.resolve(path.sep, "opt", "pkg", "dist", "agent", "pi-native.js");
+    const resolved = nativeProxyScriptPath(pathToFileURL(agentFile).href);
+    assert.equal(resolved, path.resolve(path.sep, "opt", "pkg", "dist", "index.js"));
+});
+
+function makeFakeChild(pid: number): SpawnChild {
+    return {
+        pid,
+        unref() {},
+        kill() {
+            return true;
+        },
+        on() {},
+    };
+}
+
+test("singleFlight: concurrent callers share one in-flight run, then re-arm", async () => {
+    let runs = 0;
+    const start = singleFlight(async () => {
+        runs++;
+        await new Promise((r) => setTimeout(r, 20));
+        return "http://127.0.0.1:40001";
+    });
+    const [a, b, c] = await Promise.all([start(), start(), start()]);
+    assert.equal(runs, 1, "three concurrent callers → one bootstrap");
+    assert.deepEqual([a, b, c], ["http://127.0.0.1:40001", "http://127.0.0.1:40001", "http://127.0.0.1:40001"]);
+    // after settling, the next call starts fresh (a later respawn is allowed)
+    const d = await start();
+    assert.equal(runs, 2);
+    assert.equal(d, "http://127.0.0.1:40001");
+});
+
+test("ensureProxyRunning: deps.scriptPath overrides process.argv[1] for the spawned proxy (#519)", async () => {
+    let spawnScriptArg = "";
+    const spawnImpl: SpawnFn = (_command, args) => {
+        spawnScriptArg = args[0];
+        return makeFakeChild(42431);
+    };
+    await ensureProxyRunning(
+        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
+        { fetchImpl: async () => ({ ok: true }), spawnImpl, readInstanceFile: () => undefined, scriptPath: "/opt/pkg/dist/index.js" },
+    );
+    assert.equal(spawnScriptArg, "/opt/pkg/dist/index.js");
+});
