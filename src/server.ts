@@ -1,6 +1,6 @@
 import http from "node:http";
 import fs from "node:fs";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createCore, type CompressionCore, type CompressionState, type Config, type CoreMessage, type NudgeDecision, type Prompts, type PackSurface, type ToolPrompts, applyAcpToolOverrides, defaultPrompts, defaultCountTokens, estimateTokensFast, renderNudgeText, deactivateBlock, viableRanges } from "acp-kernel";
 import { resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig } from "./compress-settings.js";
 import { dropCompressReasoning, type CompressReasoningConfig } from "./reasoning-drop.js";
@@ -36,13 +36,12 @@ import {
     type ResponsesRequestBody,
     type ResponseInputItem,
     type ResponsesProjection,
-    responsesToCore,
-    patchResponsesInput,
     injectResponsesDeveloperMessage,
     conversationIdentityResponses,
     conversationSignalResponses,
     subagentNamespace,
 } from "acp-kernel/wire";
+import { responsesToCoreWithToolImages as responsesToCore, patchResponsesInputWithToolImages as patchResponsesInput } from "./responses-tool-output.js";
 import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive, ensureCanonicalId } from "./session.js";
 import { ABSORB_TOOL, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, COMPRESS_TOOL, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildAbsorbSystemPrompt, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withConversationIdNote, withMarkerIntegrityNote, withStagedCompressGuidance } from "./compress-tool.js";
 import { applyAbsorbView, absorbEnabled, absorbToolName, storeEffectiveAbsorb } from "./absorb.js";
@@ -2730,14 +2729,8 @@ function preflightHoldGraceMs(): number {
     return Number.isFinite(v) && v >= 0 ? Math.floor(v) : PREFLIGHT_HOLD_GRACE_DEFAULT_MS;
 }
 
-// #726: a preflight that failed WITHOUT folding anything hit a deterministic
-// rejection under the current session state — a client that retries verbatim
-// (codex auto-retries every few seconds) re-runs the same doomed walk, burning
-// upstream quota on identical large summarization calls. Such failures arm a
-// per-session cooldown: matching requests fail fast with the cached diagnosis
-// and ZERO upstream calls until it expires. Any preflight outcome without a
-// failure clears the marker (the state changed — client shrank the
-// conversation, or the upstream recovered). Aborted failures never arm it.
+// Cache exhausted walks and non-transient HTTP rejections only for the same
+// forwarded body. Transport failures do not establish a content dead end.
 const PREFLIGHT_DEAD_END_COOLDOWN_DEFAULT_MS = 5 * 60_000;
 
 function preflightDeadEndCooldownMs(): number {
@@ -2895,14 +2888,17 @@ async function preflightCompressIfNeeded(
     // stale-baseline fit): those return without running the walk, so the
     // cooldown must not convert a fitting payload into a false fail-fast while
     // a marker from a larger earlier request is still warm.
+    const deadEndKey = `${model}\u0000${limit}\u0000${createHash("sha256").update(prepared.body).digest("hex")}`;
     const deadEnd = session.metadata.preflightDeadEnd;
     if (deadEnd && typeof deadEnd === "object") {
         const de = deadEnd as Record<string, unknown>;
-        if (typeof de.key === "string" && de.key === `${model}\u0000${limit}` && typeof de.until === "number" && de.until > Date.now() && typeof de.message === "string") {
+        if (de.key === deadEndKey && typeof de.until === "number" && de.until > Date.now() && typeof de.message === "string") {
             if (payloadFitsWindow) return prepared;
             log("warn", `[${session.id}] preflight dead-end cooldown active (${Math.ceil((de.until - Date.now()) / 1000)}s left); failing fast without upstream calls (#726)`);
             return { failFast: true, status: typeof de.status === "number" ? de.status : 502, message: de.message, retryable: de.retryable === true, respond: !res.writableEnded };
         }
+        delete session.metadata.preflightDeadEnd;
+        markDirty(session);
     }
     // #330: the payload overflows the window (or nothing is foldable in the
     // normal pass but it doesn't fit). Let preflightCompress try to fold it —
@@ -2988,16 +2984,14 @@ async function preflightCompressIfNeeded(
         return { failFast: true, status: 0, message: f.detail, retryable: false, respond: false };
     }
     const status = f?.kind === "upstream" && f.status === 429 ? 503 : 502;
-    const ff = failFast(status, f?.detail ?? "the payload still exceeds the window after preflight compression", status === 503);
-    // #726: zero-progress failure under unchanged state is a deterministic
-    // dead-end — arm the cooldown so client auto-retries stop re-burning
-    // upstream quota on the identical doomed summarization walk. Aborted
-    // failures never reach here.
-    if (f && result.compressedRanges === 0) {
+    const retryable = f?.retryable === true || (f?.kind === "upstream" && f.status !== undefined && (f.status === 429 || f.status >= 500));
+    const ff = failFast(status, f?.detail ?? "the payload still exceeds the window after preflight compression", retryable);
+    const contentDeadEnd = f?.kind === "exhausted" || (f?.kind === "upstream" && f.status !== undefined && f.status >= 400 && f.status < 500 && !retryable);
+    if (contentDeadEnd && result.compressedRanges === 0) {
         const cooldownMs = preflightDeadEndCooldownMs();
         if (cooldownMs > 0) {
-            ff.message += ` Preflight will not call the upstream again for the next ${Math.max(1, Math.round(cooldownMs / 60_000))}m while the context is unchanged (identical failure); restarting the session recovers immediately.`;
-            session.metadata.preflightDeadEnd = { key: `${model}\u0000${limit}`, until: Date.now() + cooldownMs, status: ff.status, retryable: ff.retryable, message: ff.message };
+            ff.message += ` Preflight will not call the upstream again for the next ${Math.max(1, Math.round(cooldownMs / 60_000))}m for this identical request. Change the request or wait for the cooldown before retrying.`;
+            session.metadata.preflightDeadEnd = { key: deadEndKey, until: Date.now() + cooldownMs, status: ff.status, retryable: ff.retryable, message: ff.message };
             markDirty(session);
         }
     }

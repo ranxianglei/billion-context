@@ -11,7 +11,7 @@ import { buildCompressSystemPrompt, parseCompressInput } from "./compress-tool.j
 import { IMAGE_PLACEHOLDER, imagePlaceholders } from "./image-note.js";
 import { applyAbsorbView } from "./absorb.js";
 import { applyRanges, type RewriteCtx } from "./stream.js";
-import { fetchWithRetry, UpstreamHttpError } from "./fetch-util.js";
+import { fetchWithTimeout, isTransientUpstreamError, replayMaxAttempts, replayBackoffMs, sleep, UpstreamHttpError } from "./fetch-util.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import { lastCompressSuffix, type Session } from "./session.js";
 
@@ -69,6 +69,8 @@ export type PreflightFailureKind = "upstream" | "exhausted" | "aborted";
 
 export interface PreflightFailure {
     kind: PreflightFailureKind;
+    /** A temporary transport failure, not evidence that this context cannot be compressed. */
+    retryable?: boolean;
     /** Upstream HTTP status when kind === "upstream" and the failure was an HTTP response. */
     status?: number;
     /** Human-readable cause (safe to surface to the client). */
@@ -552,49 +554,93 @@ async function summarizeRange(deps: PreflightDeps, content: string, startRef: st
     }
 }
 
-async function requestSummary(deps: PreflightDeps, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean): Promise<SummaryOutcome> {
-    const { response, clearTimer } = await fetchWithRetry(
-        deps.url,
-        {
-            method: "POST",
-            headers: { "content-type": "application/json", ...summaryHeaders(deps) },
-            body: JSON.stringify(summaryPayload(deps.protocol, deps.model, system, content, stream, includeMaxOutputTokens)),
-            dispatcher: proxyDispatcher(deps.proxyUrl),
-        },
-        undefined,
-        deps.signal,
-        (info) => {
-            // #189: correlate the rejection with the rewrite that preceded it.
-            deps.log("warn", `[preflight] summary attempt ${info.attempt} got HTTP ${info.status}; retrying in ${info.delayMs}ms${lastCompressSuffix(deps.session.lastCompress)}`);
-        },
-    );
-    try {
-        const text = await response.text();
-        let json: unknown;
-        try {
-            json = JSON.parse(text);
-        } catch {
-            json = null;
+const TRANSIENT_SUMMARY_CODES = new Set(["ECONNRESET", "ECONNREFUSED", "EPIPE", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH", "UND_ERR_SOCKET"]);
+const SUMMARY_DIAGNOSTIC_CODES = new Set([
+    ...TRANSIENT_SUMMARY_CODES, "ETIMEDOUT", "ENOTFOUND", "UND_ERR_ABORTED", "UND_ERR_CONNECT_TIMEOUT",
+    "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT", "Z_DATA_ERROR", "Z_BUF_ERROR", "Z_MEM_ERROR",
+    "ERR_TLS_CERT_ALTNAME_INVALID", "CERT_HAS_EXPIRED", "DEPTH_ZERO_SELF_SIGNED_CERT",
+]);
+
+class SummaryTransportError extends Error {
+    readonly retryable: boolean;
+    constructor(stage: "request" | "response body", error: unknown, attempts: number) {
+        let code: string | undefined;
+        let aborted = false;
+        let cause: unknown = error;
+        for (let depth = 0; depth < 6 && cause && typeof cause === "object"; depth++) {
+            const value = cause as { name?: unknown; code?: unknown; cause?: unknown };
+            if (value.name === "AbortError" || value.name === "TimeoutError") aborted = true;
+            if (!code && typeof value.code === "string" && SUMMARY_DIAGNOSTIC_CODES.has(value.code)) code = value.code;
+            cause = value.cause;
         }
-        // Streaming bodies are SSE, but a non-conforming upstream may answer a
-        // stream:true call with plain JSON — accept either shape.
-        const summary = (json && typeof json === "object"
-            ? extractSummaryText(deps.protocol, json as Record<string, unknown>)
-            : stream
-                ? extractSummaryFromSse(deps.protocol, text)
-                : "").trim();
-        if (!json && !stream) {
-            deps.log("warn", `[preflight] summary response was not JSON: ${text.slice(0, 200)}`);
-        }
-        if (summary.length < MIN_SUMMARY_CHARS) {
-            const diagnosis = diagnoseEmptySummary(text, json);
-            deps.log("warn", `[preflight] summary too short (${summary.length} chars): ${diagnosis}`);
-            return { unusable: diagnosis };
-        }
-        return { summary };
-    } finally {
-        clearTimer();
+        const name = error instanceof Error && ["Error", "TypeError", "AbortError", "TimeoutError"].includes(error.name) ? error.name : "Error";
+        super(`summary ${stage} failed (${name}${code ? `, code=${code}` : ""}; ${attempts} attempt${attempts === 1 ? "" : "s"})`);
+        this.name = "SummaryTransportError";
+        this.retryable = !aborted && code !== undefined && TRANSIENT_SUMMARY_CODES.has(code);
     }
+}
+
+async function requestSummaryBody(deps: PreflightDeps, body: string): Promise<string> {
+    const maxAttempts = replayMaxAttempts();
+    for (let attempt = 1; ; attempt++) {
+        deps.signal?.throwIfAborted();
+        let clearTimer: (() => void) | undefined;
+        let stage: "request" | "response body" = "request";
+        let retryDetail: string;
+        try {
+            const result = await fetchWithTimeout(deps.url, {
+                method: "POST",
+                headers: { "content-type": "application/json", ...summaryHeaders(deps) },
+                body,
+                dispatcher: proxyDispatcher(deps.proxyUrl),
+            }, undefined, deps.signal);
+            clearTimer = result.clearTimer;
+            stage = "response body";
+            const text = await result.response.text();
+            deps.signal?.throwIfAborted();
+            if (!result.response.ok) throw new UpstreamHttpError(result.response.status, text, attempt);
+            return text;
+        } catch (err) {
+            deps.signal?.throwIfAborted();
+            const failure = err instanceof UpstreamHttpError ? err : new SummaryTransportError(stage, err, attempt);
+            const retryable = failure instanceof UpstreamHttpError
+                ? isTransientUpstreamError(failure.status, failure.body)
+                : failure.retryable;
+            if (!retryable || attempt >= maxAttempts) throw failure;
+            retryDetail = failure instanceof UpstreamHttpError ? `HTTP ${failure.status}` : failure.message;
+        } finally {
+            clearTimer?.();
+        }
+        const delayMs = replayBackoffMs(attempt);
+        deps.log("warn", `[preflight] summary attempt ${attempt} got ${retryDetail}; retrying in ${delayMs}ms${lastCompressSuffix(deps.session.lastCompress)}`);
+        await sleep(delayMs, deps.signal);
+    }
+}
+
+async function requestSummary(deps: PreflightDeps, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean): Promise<SummaryOutcome> {
+    const text = await requestSummaryBody(deps, JSON.stringify(summaryPayload(deps.protocol, deps.model, system, content, stream, includeMaxOutputTokens)));
+    let json: unknown;
+    try {
+        json = JSON.parse(text);
+    } catch {
+        json = null;
+    }
+    // Streaming bodies are SSE, but a non-conforming upstream may answer a
+    // stream:true call with plain JSON — accept either shape.
+    const summary = (json && typeof json === "object"
+        ? extractSummaryText(deps.protocol, json as Record<string, unknown>)
+        : stream
+            ? extractSummaryFromSse(deps.protocol, text)
+            : "").trim();
+    if (!json && !stream) {
+        deps.log("warn", `[preflight] summary response was not JSON: ${text.slice(0, 200)}`);
+    }
+    if (summary.length < MIN_SUMMARY_CHARS) {
+        const diagnosis = diagnoseEmptySummary(text, json);
+        deps.log("warn", `[preflight] summary too short (${summary.length} chars): ${diagnosis}`);
+        return { unusable: diagnosis };
+    }
+    return { summary };
 }
 
 const ABORTED_FAILURE: PreflightFailure = { kind: "aborted", detail: "the client disconnected during preflight compression" };
@@ -778,17 +824,21 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                         failure = {
                             kind: "upstream",
                             status: err.status,
+                            retryable: isTransientUpstreamError(err.status, err.body),
                             detail: err.status === 429
                                 ? `the summarization call was rate-limited by the upstream (HTTP 429)`
                                 : `the summarization call was rejected by the upstream (HTTP ${err.status})`,
                         };
-                        deps.log("warn", `[preflight] summarization failed: HTTP ${err.status} ${err.body.slice(0, 200)}`);
+                        deps.log("warn", `[preflight] summarization failed: HTTP ${err.status} after ${err.attempts} attempt(s)`);
                     } else if (deps.signal?.aborted) {
                         failure = ABORTED_FAILURE;
                         deps.log("warn", `[preflight] summarization aborted: client disconnected`);
+                    } else if (err instanceof SummaryTransportError) {
+                        failure = { kind: "upstream", detail: `the summarization call failed: ${err.message}`, ...(err.retryable ? { retryable: true } : {}) };
+                        deps.log("warn", `[preflight] summarization failed: ${err.message}`);
                     } else {
-                        failure = { kind: "upstream", detail: `the summarization call failed: ${String(err)}` };
-                        deps.log("warn", `[preflight] summarization failed: ${String(err)}`);
+                        failure = { kind: "upstream", detail: "the summarization call failed unexpectedly" };
+                        deps.log("warn", "[preflight] summarization failed unexpectedly");
                     }
                     break;
                 }

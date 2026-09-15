@@ -13,6 +13,7 @@
 import type { CoreMessage } from "acp-kernel";
 import { parseDataUrl, type BiliMessage } from "acp-kernel/wire";
 import { decodeImageDims } from "./image-tokens.js";
+import { responsesToolImageParts } from "./responses-tool-output.js";
 
 /** The codec's own placeholder for an anthropic image block (wire/index.js).
  *  renderRange replaces exactly this string with the richer note below. */
@@ -54,9 +55,10 @@ export function messageImages(m: CoreMessage): ImageRef[] {
     // Responses: the original item keeps every input_image part (the singular
     // imageBase64 sidecar covers only the first), so walk it when present.
     const ri = mm.rawResponsesItem;
-    if (isObj(ri) && Array.isArray(ri.content)) {
+    const responseParts = isObj(ri) && Array.isArray(ri.content) ? ri.content : responsesToolImageParts(ri);
+    if (responseParts) {
         const refs: ImageRef[] = [];
-        for (const part of ri.content) {
+        for (const part of responseParts) {
             if (!isObj(part) || part.type !== "input_image") continue;
             refs.push(refFromDataUrl(part.image_url) ?? {});
         }

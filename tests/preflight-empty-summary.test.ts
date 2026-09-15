@@ -165,6 +165,75 @@ async function driveResponses(proxyPort: number, upstreamPort: number, session: 
     });
 }
 
+test("changed over-window content bypasses a previous dead-end cooldown", async () => {
+    const calls: Call[] = [];
+    const upstream = makeUpstream(calls, 0);
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = (upstream.address() as { port: number }).port;
+    const proxy = await startProxy(upstreamPort, { "gpt-7-sol": { context: 10_000 } });
+    await once(proxy, "listening");
+    const proxyPort = (proxy.address() as { port: number }).port;
+    try {
+        const input = longResponsesInput(12);
+        const first = await driveResponses(proxyPort, upstreamPort, "changed-cooldown", "gpt-7-sol", input);
+        assert.equal(first.status, 502);
+        await first.text();
+        const session = listSessions().find((s) => s.id.includes("changed-cooldown"));
+        const marker = session?.metadata.preflightDeadEnd as Record<string, unknown>;
+        assert.ok(marker);
+        marker.until = Date.now() + 60_000;
+        const callsBefore = calls.length;
+        input[8].content = input[8].content.replace("Message", "Updated");
+        const changed = await driveResponses(proxyPort, upstreamPort, "changed-cooldown", "gpt-7-sol", input);
+        assert.equal(changed.status, 502);
+        await changed.text();
+        assert.ok(calls.length > callsBefore, "changed content must retry preflight even at the same length/model/window");
+    } finally {
+        proxy.close();
+        upstream.close();
+        await Promise.all([once(proxy, "close"), once(upstream, "close")]);
+    }
+});
+
+for (const [status, responseBody] of [
+    [503, { error: "Temporary failure" }],
+    [400, { code: 3007, msg: "captcha verify failed" }],
+] as const) {
+test(`temporary summary HTTP ${status} failure does not cache a deterministic dead end`, async () => {
+    let calls = 0;
+    const upstream = http.createServer((req, res) => {
+        req.resume();
+        req.on("end", () => {
+            calls++;
+            res.writeHead(status, { "content-type": "application/json" });
+            res.end(JSON.stringify(responseBody));
+        });
+    });
+    upstream.listen(0, "127.0.0.1");
+    await once(upstream, "listening");
+    const upstreamPort = (upstream.address() as { port: number }).port;
+    const proxy = await startProxy(upstreamPort, { "gpt-7-sol": { context: 10_000 } });
+    await once(proxy, "listening");
+    const proxyPort = (proxy.address() as { port: number }).port;
+    try {
+        const first = await driveResponses(proxyPort, upstreamPort, "transient-cooldown", "gpt-7-sol", longResponsesInput(12));
+        const body = await first.json() as { error: { retryable: boolean } };
+        assert.equal(body.error.retryable, true);
+        const session = listSessions().find((s) => s.id.includes("transient-cooldown"));
+        assert.equal(session?.metadata.preflightDeadEnd, undefined);
+        const callsBefore = calls;
+        const next = await driveResponses(proxyPort, upstreamPort, "transient-cooldown", "gpt-7-sol", longResponsesInput(12));
+        await next.text();
+        assert.ok(calls > callsBefore, "next request must reach the upstream");
+    } finally {
+        proxy.close();
+        upstream.close();
+        await Promise.all([once(proxy, "close"), once(upstream, "close")]);
+    }
+});
+}
+
 test("#726 size-driven empty summary: oversized chunk fails, halved chunk recovers, session continues", async () => {
     const calls: Call[] = [];
     const upstream = makeUpstream(calls, FAIL_ABOVE_CHARS);
@@ -226,7 +295,7 @@ test("#726 systemic empty summary: diagnosis surfaced, bounded calls, cooldown b
             `fail-fast message must carry the upstream diagnosis, got: ${j1.error?.message}`,
         );
         assert.ok(
-            j1.error?.message?.includes("restarting the session recovers immediately"),
+            j1.error?.message?.includes("Change the request or wait for the cooldown before retrying"),
             `fail-fast message must carry the recovery hint, got: ${j1.error?.message}`,
         );
         const summaries1 = calls.filter((c) => c.summary);
@@ -236,7 +305,7 @@ test("#726 systemic empty summary: diagnosis surfaced, bounded calls, cooldown b
         const sess = listSessions().find((s) => s.id.includes("s726-deadend"));
         const marker = sess?.metadata?.preflightDeadEnd as Record<string, unknown> | undefined;
         assert.ok(marker && typeof marker === "object", "zero-progress failure must arm the dead-end marker");
-        assert.equal(marker?.key, "gpt-7-sol\u000010000", "marker scoped to model + window");
+        assert.match(String(marker?.key), /^gpt-7-sol\u000010000\u0000[0-9a-f]{64}$/, "marker scoped to model, window and request body");
 
         const callsBeforeRetry = calls.length;
         const r2 = await driveResponses(proxyPort, upstreamPort, "s726-deadend", "gpt-7-sol", longResponsesInput(12));

@@ -20,6 +20,8 @@
 //            PIXEL_IMAGE_FALLBACK_TOKENS. Mode resolution: explicit config wins;
 //            "auto" classifies known first-party pixel-tile hosts.
 
+import { responsesToolImageParts } from "./responses-tool-output.js";
+
 export const REMOTE_IMAGE_TOKENS = 4096;
 
 /** #767: flat per-image cost in pixels mode when the container has no parsable
@@ -213,8 +215,10 @@ export function imageTokensInParsedBody(protocol: "anthropic" | "openai" | "resp
         const input = body.input;
         if (!Array.isArray(input)) return 0;
         for (const item of input) {
-            if (!isObj(item) || !Array.isArray(item.content)) continue;
-            for (const part of item.content) {
+            if (!isObj(item)) continue;
+            const parts = Array.isArray(item.content) ? item.content : responsesToolImageParts(item);
+            if (!parts) continue;
+            for (const part of parts) {
                 if (!isObj(part) || part.type !== "input_image") continue;
                 const url = urlOf(part.image_url);
                 if (url) total += costForUrl(url, billing);
