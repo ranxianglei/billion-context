@@ -72,6 +72,7 @@ import {
     resolveClaudeBudgetEnv,
     resolveQoderBudgetEnv,
     buildQoderEnv,
+    resolveQoderTransport,
     readQoderConfig,
     resolveQoderHome,
     qoderIsCnSite,
@@ -3366,6 +3367,15 @@ test("buildQoderEnv: HTTPS_PROXY + NODE_EXTRA_CA_CERTS + BILLION_CONTEXT_PROXY, 
     assert.equal(env.FOO, "bar");
 });
 
+test("resolveQoderTransport: #764 — no default forcing; explicit BILI_*_TRANSPORT opt-in only", () => {
+    assert.equal(resolveQoderTransport("QODER", {}), undefined, "unset → undefined (leave qoder's own default transport)");
+    assert.equal(resolveQoderTransport("QODER", { BILI_QODER_TRANSPORT: "   " }), undefined, "blank → undefined");
+    assert.equal(resolveQoderTransport("QODER", { BILI_QODER_TRANSPORT: "http" }), "http", "intl opt-in passed through");
+    assert.equal(resolveQoderTransport("QODERCN", { BILI_QODERCN_TRANSPORT: "http" }), "http", "CN opt-in uses BILI_QODERCN_TRANSPORT");
+    assert.equal(resolveQoderTransport("QODERCN", { BILI_QODER_TRANSPORT: "http" }), undefined, "CN site ignores the intl var name");
+    assert.equal(resolveQoderTransport("QODER", { QODER_MODEL_TRANSPORT: "http" }), undefined, "the raw qoder knob is not auto-forwarded by bili");
+});
+
 test("resolveQoderBudgetEnv: injects the site-prefixed window key from bili's chain", async () => {
     registrySetForTest({});
     try {
@@ -3413,7 +3423,7 @@ test("resolveClientCommand: qoder resolves `qoder`, falls back to `qodercli`", (
     }
 });
 
-test("runLaunch qoder: cert-MITM envs, transport forced, budget aligned, default MITM whitelist (#653)", async () => {
+test("runLaunch qoder: cert-MITM envs, transport default-legacy unless BILI_QODER_TRANSPORT set, budget aligned, default MITM whitelist (#653/#764)", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-qoder-launch-"));
     const prevHome = process.env.HOME;
     const prevUserProfile = process.env.USERPROFILE;
@@ -3421,12 +3431,14 @@ test("runLaunch qoder: cert-MITM envs, transport forced, budget aligned, default
     const prevModel = process.env.QODER_MODEL;
     const prevWindow = process.env.QODER_AUTOCOMPACT_WINDOW;
     const prevTransport = process.env.QODER_MODEL_TRANSPORT;
+    const prevBiliTransport = process.env.BILI_QODER_TRANSPORT;
     const prevNoProxy = process.env.NO_PROXY;
     process.env.HOME = home;
     if (prevUserProfile !== undefined) process.env.USERPROFILE = home;
     delete process.env.QODER_MODEL;
     delete process.env.QODER_AUTOCOMPACT_WINDOW;
     delete process.env.QODER_MODEL_TRANSPORT;
+    delete process.env.BILI_QODER_TRANSPORT;
     const qoderDir = path.join(home, ".qoder");
     fs.mkdirSync(qoderDir, { recursive: true });
     fs.writeFileSync(path.join(qoderDir, "settings.json"), JSON.stringify({ model: { name: "claude-sonnet-4-5" } }));
@@ -3470,13 +3482,21 @@ test("runLaunch qoder: cert-MITM envs, transport forced, budget aligned, default
         assert.ok(String(seenEnv.NODE_EXTRA_CA_CERTS).endsWith(path.join("billion-context", "ca", "root-ca.pem")), String(seenEnv.NODE_EXTRA_CA_CERTS));
         assert.equal(seenEnv.HTTP_PROXY, undefined, "inherited HTTP_PROXY stripped");
         assert.equal(seenEnv.NO_PROXY, undefined, "inherited NO_PROXY stripped");
-        assert.equal(seenEnv.QODER_MODEL_TRANSPORT, "http");
+        assert.equal(seenEnv.QODER_MODEL_TRANSPORT, undefined, "#764: no transport forced by default (legacy kept)");
         assert.equal(seenEnv.QODER_AUTOCOMPACT_WINDOW, "200000", "budget aligned from built-in table");
         assert.ok(proxyEnvs.length > 0, "proxy child spawned");
         const mitm = String(proxyEnvs[0]!.BILI_MITM_DOMAINS).split(",");
         for (const h of QODER_DEFAULT_MODEL_HOSTS) {
             assert.ok(mitm.includes(h), `whitelist has ${h}: ${mitm.join(",")}`);
         }
+
+        process.env.BILI_QODER_TRANSPORT = "http";
+        await runLaunch(
+            { client: "qoder", clientArgs: [], overrides: {} },
+            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+        );
+        assert.equal(clientEnvs.length, 2);
+        assert.equal(clientEnvs[1]!.QODER_MODEL_TRANSPORT, "http", "#764: BILI_QODER_TRANSPORT=http forwards end-to-end");
     } finally {
         process.exit = prevExit;
         process.env.HOME = prevHome;
@@ -3490,6 +3510,8 @@ test("runLaunch qoder: cert-MITM envs, transport forced, budget aligned, default
         else process.env.QODER_AUTOCOMPACT_WINDOW = prevWindow;
         if (prevTransport === undefined) delete process.env.QODER_MODEL_TRANSPORT;
         else process.env.QODER_MODEL_TRANSPORT = prevTransport;
+        if (prevBiliTransport === undefined) delete process.env.BILI_QODER_TRANSPORT;
+        else process.env.BILI_QODER_TRANSPORT = prevBiliTransport;
         if (prevNoProxy === undefined) delete process.env.NO_PROXY;
         else process.env.NO_PROXY = prevNoProxy;
         fs.rmSync(home, { recursive: true, force: true });
