@@ -48,6 +48,7 @@ import { ABSORB_TOOL, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, COMPRESS_TOOL, 
 import { applyAbsorbView, absorbEnabled, absorbToolName, storeEffectiveAbsorb } from "./absorb.js";
 import { rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
+import { buildSessionCacheReport } from "./cache-ledger.js";
 import { preflightCompress, estimateCoreMessages, estimateRawBodyTokens, estimateCoreMessagesUpper, type PreflightResult } from "./preflight.js";
 import { imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, type ResolvedImageBilling } from "./image-tokens.js";
 import { renderUI, handleConfigGet, handleConfigPut } from "./web/index.js";
@@ -562,6 +563,7 @@ async function handle(
         return;
     }
     if (req.method === "GET" && req.url === "/__bili/stats") return sendStats(res);
+    if (req.method === "GET" && req.url?.startsWith("/__bili/cache-report")) return sendCacheReport(res, req.url);
     if (req.method === "GET" && req.url === "/") {
         // Browser visits root → redirect to the web UI. curl / health probes
         // (Accept: */* or no Accept) still get the JSON health check so
@@ -3861,6 +3863,24 @@ function handleConfigReload(opts: ProxyOptions, res: http.ServerResponse, log: (
     log("info", `[acp-web] routes hot-reloaded (${names.length} providers): ${names.join(", ") || "(none)"}`);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ ok: true, count: names.length, routes: names }));
+}
+
+function sendCacheReport(res: http.ServerResponse, url: string): void {
+    const sessionParam = new URL(url, "http://localhost").searchParams.get("session");
+    let sessions = listSessions();
+    if (sessionParam !== null) {
+        const hit = sessions.filter((s) => s.id === sessionParam);
+        if (hit.length === 0) {
+            res.writeHead(404, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: `unknown session: ${sessionParam}` }));
+            return;
+        }
+        sessions = hit;
+    } else {
+        sessions = sessions.slice().sort((a, b) => b.lastSeen - a.lastSeen);
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ reports: sessions.map((s) => ({ id: s.id, report: buildSessionCacheReport(s) })) }, null, 2));
 }
 
 function sendStats(res: http.ServerResponse): void {

@@ -5,6 +5,7 @@ import {
     type CoreMessage,
 } from "acp-kernel";
 import { handleAcpStatus } from "../acp-status.js";
+import { handleAcpCache, recordCacheSample } from "../cache-ledger.js";
 import { lastCompressSuffix, type Session } from "../session.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import {
@@ -154,6 +155,9 @@ export function executeProxyTool(
     if (toolName === "acp_status") {
         return handleAcpStatus(args, ctx);
     }
+    if (toolName === "acp_cache") {
+        return handleAcpCache(ctx.session);
+    }
     const absorb = effectiveAbsorbConfig(ctx.session, ctx.config);
     if (absorb?.enabled === true && toolName === (absorb.toolName ?? ABSORB_TOOL_NAME)) {
         return executeAbsorb(args, callId, absorb, ctx);
@@ -192,6 +196,9 @@ function recordUsage(
     ctx.log(
         `[acp-usage] round ${round} input=${total} cached=${cached ?? 0} (cache hit ${hitPct}%)${foldNew ? " fold=new" : ""}${total <= 0 ? " (zero-total: lastInputTokens kept)" : ""}`,
     );
+    if (total > 0 || typeof cached === "number") {
+        recordCacheSample(ctx.session, { at: Date.now(), input: total, cached: cached ?? 0, output: out });
+    }
 }
 
 export async function* runCompressLoop(

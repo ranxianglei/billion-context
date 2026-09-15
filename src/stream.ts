@@ -1,5 +1,6 @@
 import { collectBlockContent, type CompressionCore, type Config, type CoreMessage, type CompressionState } from "acp-kernel";
 import { handleAcpStatus } from "./acp-status.js";
+import { handleAcpCache, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
 import { type Session, cacheBlockContent } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME } from "./compress-tool.js";
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "./absorb.js";
@@ -36,6 +37,9 @@ function executeAnthropicProxyTool(toolName: string, args: Record<string, unknow
     }
     if (toolName === "acp_status") {
         return handleAcpStatus(args, ctx);
+    }
+    if (toolName === "acp_cache") {
+        return handleAcpCache(ctx.session);
     }
     const absorb = effectiveAbsorbConfig(ctx.session, ctx.config);
     if (absorb?.enabled === true && toolName === (absorb.toolName ?? ABSORB_TOOL_NAME)) {
@@ -121,6 +125,13 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         const postCtx = Math.max(0, preContext - r.tokensCompressed);
         const ceiling = postCtx > 0 ? Math.floor((100 * anchorTok) / postCtx) : 0;
         ctx.log(`[acp-compress-obs] shrink ${Math.round(shrinkRatio * 100)}% (~${r.tokensCompressed}/${preContext} tok) foldPoint=${foldPoint} blocks=${r.blocksCreated} anchor≈${anchorTok} tok (${res.state.blocks.filter((b) => b.active).length} active blocks, sys excluded) postCtx≈${postCtx} → next-request cache ceiling ≥${ceiling}%`);
+        // #800: feed the cache ledger — the next request's usage report will
+        // attribute its re-pay cliff to these folds via decomposeSample.
+        recordCacheFoldsFromBlocks(
+            ctx.session,
+            res.state.blocks.filter((b) => !beforeIds.has(b.blockId)),
+            { V: preContext, Vp: postCtx },
+        );
 
         const warn = r.warnings.length > 0 ? ` ${r.warnings.join("; ")}` : "";
         let msg = `[Compressed ${detail} → ${r.blocksCreated} block(s), ~${r.tokensCompressed} tokens saved.${warn}]`;
