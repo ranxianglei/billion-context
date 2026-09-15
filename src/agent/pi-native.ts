@@ -14,28 +14,19 @@
 // `bili` MITM launch, or BILI_PROVIDER_REWRITES set by a `bili` /bili/
 // launch) or opted out (BILI_NATIVE_PI=0).
 
-import path from "node:path";
-import { fileURLToPath } from "node:url";
-import { createBiliPlugin } from "./pi.js";
-import { installNativeFetchIntercept, type NativeInterceptState } from "./native-intercept.js";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
+import { createBiliPlugin } from "./pi.js";
+import { nativeBootstrapGate, nativeProxyScriptPath, singleFlight } from "./native-bootstrap.js";
+import { installNativeFetchIntercept, type NativeInterceptState } from "./native-intercept.js";
+import { fetchStatus } from "./shared.js";
 
-/** dist/agent/pi-native.js → dist/index.js (the package bin). Resolved at
- *  runtime so the artifact works from any install root. */
-export function nativeProxyScriptPath(fromUrl: string = import.meta.url): string {
-    return path.resolve(path.dirname(fileURLToPath(fromUrl)), "..", "index.js");
-}
+// Shared plumbing lives in native-bootstrap.ts (side-effect-free — importing
+// pi-native.ts from another host entry must not run pi's bootstrap).
+export { nativeProxyScriptPath, singleFlight } from "./native-bootstrap.js";
 
 /** Decides whether the native bootstrap should run in this process. */
 export function shouldBootstrapNative(env: NodeJS.ProcessEnv): boolean {
-    if (env.BILLION_CONTEXT_PLUGIN === "0") return false;
-    if (env.BILI_NATIVE_PI === "0") return false;
-    // A `bili` launch already owns a proxy — attach to its mode instead of
-    // spawning a second one (MITM transparent sets BILLION_CONTEXT_PROXY;
-    // /bili/ rewrite mode sets BILI_PROVIDER_REWRITES).
-    if (env.BILLION_CONTEXT_PROXY !== undefined && env.BILLION_CONTEXT_PROXY.trim().length > 0) return false;
-    if (env.BILI_PROVIDER_REWRITES !== undefined) return false;
-    return true;
+    return nativeBootstrapGate(env, "BILI_NATIVE_PI");
 }
 
 function errMessage(err: unknown): string {
@@ -58,21 +49,6 @@ async function bootstrap(): Promise<string | undefined> {
         console.error(`bili-native: proxy bootstrap failed — model traffic goes direct (uncompressed): ${errMessage(err)}`);
         return undefined;
     }
-}
-
-/** Concurrent callers share one in-flight bootstrap — a burst of TypeErrors
- *  (the proxy died mid-session) must not spawn one proxy per failing request:
- *  ensureProxyRunning has no in-flight dedup of its own. */
-export function singleFlight(fn: () => Promise<string | undefined>): () => Promise<string | undefined> {
-    let inFlight: Promise<string | undefined> | undefined;
-    return (): Promise<string | undefined> => {
-        if (inFlight === undefined) {
-            inFlight = fn().finally(() => {
-                inFlight = undefined;
-            });
-        }
-        return inFlight;
-    };
 }
 
 // node:test imports this module for shouldBootstrapNative/nativeProxyScriptPath —

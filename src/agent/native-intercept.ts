@@ -79,7 +79,7 @@ async function withTimeout(p: Promise<string | undefined>, ms: number): Promise<
     }
 }
 
-async function readyOrigin(state: NativeInterceptState): Promise<string | undefined> {
+export async function readyOrigin(state: NativeInterceptState): Promise<string | undefined> {
     if (state.origin !== undefined) return state.origin;
     return withTimeout(state.ready, state.readyTimeoutMs ?? 15000);
 }

@@ -7,7 +7,7 @@
 //   omp      ~/.omp/agent/config.yml     extensions: [<abs>/dist/agent/omp.js]
 //   claude   `claude mcp add` (user scope; writes ~/.claude.json)
 //   codex    ~/.codex/config.toml        [mcp_servers.bili]
-//   opencode ~/.config/opencode/opencode.json  mcp.bili
+//   opencode ~/.config/opencode/opencode.json  mcp.bili + native plugin dir + compaction.auto=false
 // Installers throw on failure (bad/locked config, missing host CLI); the CLI
 // layer catches, prints `bili plugin: <msg>` and exits 1.
 
@@ -434,33 +434,117 @@ function opencodeJson(): string {
     return path.join(os.homedir(), ".config", "opencode", "opencode.json");
 }
 
+// #820 native mode: OpenCode 2.x rejects bare FILE paths in `plugin` — the
+// entry must be a DIRECTORY whose index.js is the entrypoint (#754 probe). The
+// wrapper directory lives next to the config so it survives config moves.
+function opencodePluginDir(configFile: string): string {
+    return path.join(path.dirname(configFile), "plugins", "billion-context");
+}
+
 function opencodeInstall(): string {
     const file = opencodeJson();
-    const mcpJs = path.join(selfPackageRoot(), "dist", "mcp.js");
-    requireDistFile(mcpJs);
     const data = readJson(file);
-    const mcp = (data.mcp as Record<string, unknown> | undefined) ?? {};
-    if ("bili" in mcp) return `opencode: already installed (${file})`;
-    mcp.bili = { type: "local", command: [process.execPath, mcpJs], environment: { BILI_MCP_PROXY: proxyOriginForInstall() }, enabled: true };
-    data.mcp = mcp;
+    const notes: string[] = [];
+
+    // MCP shell is optional: the native plugin below self-spawns a proxy, so a
+    // missing live origin skips the shell instead of failing the install.
+    try {
+        const mcpJs = path.join(selfPackageRoot(), "dist", "mcp.js");
+        requireDistFile(mcpJs);
+        const mcp = (data.mcp as Record<string, unknown> | undefined) ?? {};
+        if ("bili" in mcp) notes.push("mcp.bili present");
+        else {
+            mcp.bili = { type: "local", command: [process.execPath, mcpJs], environment: { BILI_MCP_PROXY: proxyOriginForInstall() }, enabled: true };
+            data.mcp = mcp;
+            notes.push("mcp.bili written");
+        }
+    } catch (err) {
+        notes.push(`mcp.bili skipped (${err instanceof Error ? err.message : String(err)})`);
+    }
+
+    // Native plugin (#820): self-spawned proxy + http.request URL rewrite.
+    const agentJs = path.join(selfPackageRoot(), "dist", "agent", "opencode-native.js");
+    requireDistFile(agentJs);
+    const dir = opencodePluginDir(file);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "index.js"), `export { default } from ${JSON.stringify(agentJs)};\n`);
+    const plugins = Array.isArray(data.plugin) ? (data.plugin as unknown[]).filter((x): x is string => typeof x === "string") : [];
+    if (!plugins.includes(dir)) {
+        plugins.push(dir);
+        data.plugin = plugins;
+        notes.push(`plugin -> ${dir}`);
+    } else {
+        notes.push("plugin present");
+    }
+
+    // Single compression owner: with the native plugin installed, ACP owns
+    // compression — disable host auto-compaction (merge-preserving; the key is
+    // ignored on OpenCode 1.x). Restored from the pre-install backup on remove.
+    const existingCompaction = data.compaction;
+    data.compaction = {
+        ...(existingCompaction !== null && typeof existingCompaction === "object" && !Array.isArray(existingCompaction) ? existingCompaction as Record<string, unknown> : {}),
+        auto: false,
+    };
+
     writeJson(file, data);
-    return `opencode: installed -> ${file} mcp.bili`;
+    return `opencode: installed -> ${file} (${notes.join("; ")})`;
 }
 
 function opencodeRemove(): string {
     const file = opencodeJson();
     const data = readJson(file);
+    const notes: string[] = [];
+
     const mcp = data.mcp as Record<string, unknown> | undefined;
-    if (!mcp || !("bili" in mcp)) return `opencode: not installed (${file})`;
-    delete mcp.bili;
-    if (Object.keys(mcp).length === 0) delete data.mcp;
-    writeJson(file, data);
-    return `opencode: removed from ${file}`;
+    if (mcp && "bili" in mcp) {
+        delete mcp.bili;
+        if (Object.keys(mcp).length === 0) delete data.mcp;
+        notes.push("mcp.bili removed");
+    }
+
+    const dir = opencodePluginDir(file);
+    const plugins = Array.isArray(data.plugin) ? (data.plugin as unknown[]).filter((x): x is string => typeof x === "string") : [];
+    if (plugins.includes(dir)) {
+        const remaining = plugins.filter((p) => p !== dir);
+        if (remaining.length === 0) delete data.plugin;
+        else data.plugin = remaining;
+        fs.rmSync(dir, { recursive: true, force: true });
+        notes.push(`plugin dir removed (${dir})`);
+    }
+
+    if (notes.length > 0) {
+        const cur = data.compaction as Record<string, unknown> | undefined;
+        if (cur && cur.auto === false) {
+            const bak = `${file}.bili-bak`;
+            if (fs.existsSync(bak)) {
+                try {
+                    const bakData = JSON.parse(fs.readFileSync(bak, "utf8")) as { compaction?: unknown };
+                    if (bakData.compaction === undefined) delete data.compaction;
+                    else data.compaction = bakData.compaction;
+                    notes.push("compaction restored from backup");
+                } catch {
+                    // unreadable backup — leave current settings untouched
+                }
+            } else if (Object.keys(cur).length === 1) {
+                // no pre-install config existed, so our {auto:false} is the entire
+                // key — dropping it restores the pre-install state exactly; with
+                // extra keys present we can't tell user edits apart, so leave them
+                delete data.compaction;
+                notes.push("compaction removed (no prior config)");
+            }
+        }
+    }
+
+    if (notes.length > 0) writeJson(file, data);
+    return notes.length > 0 ? `opencode: removed from ${file} (${notes.join("; ")})` : `opencode: not installed (${file})`;
 }
 
 function opencodeStatus(): string {
-    const mcp = readJson(opencodeJson()).mcp as Record<string, unknown> | undefined;
-    return mcp && "bili" in mcp ? "installed" : "not installed";
+    const file = opencodeJson();
+    const data = readJson(file);
+    const mcp = data.mcp as Record<string, unknown> | undefined;
+    const plugins = Array.isArray(data.plugin) ? (data.plugin as unknown[]).filter((x): x is string => typeof x === "string") : [];
+    return (mcp !== undefined && "bili" in mcp) || plugins.includes(opencodePluginDir(file)) ? "installed" : "not installed";
 }
 
 // — dispatch ————————————————————————————————————————————————————————————

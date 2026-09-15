@@ -66,6 +66,7 @@ import {
     resolveOpencodeConfigFile,
     findFreePort,
     ensureProxyRunning,
+    resolveNodeRuntime,
     stopProxy,
     resolveLauncherWindow,
     resolveCodexBudgetArgs,
@@ -2529,6 +2530,58 @@ test("runLaunch dsh: no loopback custom providers — no DSH_HOME overlay (#535 
         else process.env.DSH_HOME = prevDshHome;
         fs.rmSync(home, { recursive: true, force: true });
     }
+});
+
+test("resolveNodeRuntime: a live Node executable wins without consulting PATH (#819)", () => {
+    assert.equal(resolveNodeRuntime("/usr/local/bin/node", { PATH: "" }, "linux", () => false), "/usr/local/bin/node");
+    assert.equal(resolveNodeRuntime("C:/nodejs/node.exe", {}, "win32", () => false), "C:/nodejs/node.exe");
+});
+
+test("resolveNodeRuntime: non-Node host uses the BILLION_CONTEXT_NODE override when it exists", () => {
+    const exists = (p: string): boolean => p === "/opt/runtimes/node";
+    assert.equal(
+        resolveNodeRuntime("/usr/bin/opencode", { BILLION_CONTEXT_NODE: "  /opt/runtimes/node ", PATH: "" }, "linux", exists),
+        "/opt/runtimes/node",
+    );
+    // an override pointing at a missing file is ignored — the PATH search still runs
+    assert.equal(
+        resolveNodeRuntime("/usr/bin/opencode", { BILLION_CONTEXT_NODE: "/missing/node", PATH: "/usr/local/bin" }, "linux", (p) => p === "/usr/local/bin/node"),
+        "/usr/local/bin/node",
+    );
+});
+
+test("resolveNodeRuntime: PATH search finds node for non-Node hosts (posix + win32 shapes)", () => {
+    const posixExists = (p: string): boolean => p === "/opt/host/bin/node";
+    assert.equal(
+        resolveNodeRuntime("/snap/opencode/current/usr/bin/opencode", { PATH: "/nonexistent:/opt/host/bin" }, "linux", posixExists),
+        "/opt/host/bin/node",
+    );
+    // forward-slash fake paths keep the join platform-independent on any CI host
+    const winExists = (p: string): boolean => p === "C:/Program Files/nodejs/node.exe";
+    assert.equal(
+        resolveNodeRuntime("C:/opencode/opencode.exe", { PATH: "C:/nope;C:/Program Files/nodejs" }, "win32", winExists),
+        "C:/Program Files/nodejs/node.exe",
+    );
+});
+
+test("resolveNodeRuntime: throws with the actionable message when nothing resolves", () => {
+    assert.throws(
+        () => resolveNodeRuntime("/usr/bin/opencode", { PATH: "/nonexistent" }, "linux", () => false),
+        /BILLION_CONTEXT_NODE/,
+    );
+});
+
+test("ensureProxyRunning: spawns the resolved Node runtime, not blind process.execPath (#819)", async () => {
+    let spawnedCmd: string | null = null;
+    const spawnImpl: SpawnFn = (cmd) => {
+        spawnedCmd = cmd as string;
+        return makeFakeChild(42425);
+    };
+    await ensureProxyRunning(
+        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
+        { fetchImpl: async () => ({ ok: true }), spawnImpl, readInstanceFile: () => undefined, nodeRuntime: "/custom/node" },
+    );
+    assert.equal(spawnedCmd, "/custom/node");
 });
 
 test("runLaunch omp: launcher hands per-model windows to the spawned proxy", async () => {

@@ -175,6 +175,10 @@ export interface LauncherDeps {
      *  default (process.argv[1]) is WRONG inside a host process like pi —
      *  pi-native.ts passes its own package's dist/index.js instead. */
     scriptPath?: string;
+    /** #819: explicit Node executable for spawning the proxy. Inside a host
+     *  process (opencode/pi native binary) process.execPath is NOT Node;
+     *  defaults to resolveNodeRuntime(). */
+    nodeRuntime?: string;
 }
 
 export function isLaunchClient(value: string): value is ClientName {
@@ -1885,6 +1889,33 @@ function proxyStartArgs(opts: LaunchOptions): string[] {
     return args;
 }
 
+/** #819: resolve the executable that runs the proxy entry script. In a plain
+ *  Node CLI, process.execPath is correct; inside a host process (the opencode
+ *  or pi native binary) it is the HOST executable — spawning it with a .js
+ *  argv passes the script to the wrong program. A live Node always wins, then
+ *  an explicit BILLION_CONTEXT_NODE override, then a PATH search. */
+export function resolveNodeRuntime(
+    execPath: string = process.execPath,
+    env: NodeJS.ProcessEnv = process.env,
+    platform: NodeJS.Platform = process.platform,
+    existsImpl: (p: string) => boolean = fs.existsSync,
+): string {
+    const base = path.basename(execPath).toLowerCase();
+    if (base === "node" || base === "node.exe") return execPath;
+    const override = typeof env.BILLION_CONTEXT_NODE === "string" ? env.BILLION_CONTEXT_NODE.trim() : "";
+    if (override.length > 0 && existsImpl(override)) return override;
+    const sep = platform === "win32" ? ";" : ":";
+    const names = platform === "win32" ? ["node.exe"] : ["node"];
+    for (const dir of (env.PATH ?? "").split(sep)) {
+        if (!dir) continue;
+        for (const name of names) {
+            const candidate = path.join(dir, name);
+            if (existsImpl(candidate)) return candidate;
+        }
+    }
+    throw new Error("bili: cannot find a Node runtime to spawn the proxy (this process is not Node) — set BILLION_CONTEXT_NODE");
+}
+
 export async function ensureProxyRunning(
     opts: LaunchOptions,
     deps: LauncherDeps = {},
@@ -1974,7 +2005,7 @@ export async function ensureProxyRunning(
         let child: SpawnChild;
         try {
             child = spawnImpl(
-                process.execPath,
+                deps.nodeRuntime ?? resolveNodeRuntime(),
                 [script, ...proxyStartArgs({ ...opts, port })],
                 {
                     detached: true,
