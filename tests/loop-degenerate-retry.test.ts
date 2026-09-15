@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import type { Config, CoreMessage } from "acp-kernel";
 import { createCore, createInitialState } from "acp-kernel";
 import type { Session } from "../src/session.ts";
-import { runCompressLoop, createResponsesAdapter } from "../src/loop/index.ts";
+import { runCompressLoop, createResponsesAdapter, createOpenaiAdapter } from "../src/loop/index.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
 
 // #732: invisible single-retry for a degenerate terminal turn (reasoning-only
@@ -15,7 +15,7 @@ function sse(event: string, obj: Record<string, unknown>): string {
     return `event: ${event}\ndata: ${JSON.stringify({ type: event, ...obj })}\n\n`;
 }
 
-function makeCtx(id: string) {
+function makeCtx(id: string, protocol: "responses" | "openai" = "responses") {
     return {
         core: createCore(),
         config: { modelContextLimit: 200000 } as Config,
@@ -33,7 +33,7 @@ function makeCtx(id: string) {
             persisted: false,
         } as unknown as Session,
         log: () => {},
-        protocol: "responses" as const,
+        protocol,
     };
 }
 
@@ -113,4 +113,79 @@ test("#732 D2: one-shot bound — a degenerate RETRY is not retried again", asyn
     // fire. Without the bound this would loop until MAX_LOOP_ROUNDS.
     const { fetchCalls } = await drain([ROUND_DEGENERATE, ROUND_DEGENERATE], "deg-d2");
     assert.equal(fetchCalls, 2, "re-request + one retry; the degenerate retry must not trigger a second retry");
+});
+
+// #821: round-1 thinking-only terminal turn on the OpenAI wire. reasoning_content
+// deltas stream verbatim to the client before done (forwardedAny=true), which made
+// the #732 retry unreachable there; the gate is now !forwardedVisible, so the retry
+// appends its content to the SAME stream after the already-forwarded thinking prefix.
+
+function openaiSse(frames: Array<Record<string, unknown>>): string {
+    return frames.map((f) => `data: ${JSON.stringify(f)}\n\n`).join("") + "data: [DONE]\n\n";
+}
+
+const OPENAI_THINKING_ONLY = openaiSse([
+    { id: "chatcmpl_1", object: "chat.completion.chunk", choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }] },
+    { id: "chatcmpl_1", choices: [{ index: 0, delta: { reasoning_content: "the context looks small, I think we are done here" }, finish_reason: null }] },
+    { id: "chatcmpl_1", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+]);
+
+const OPENAI_EMPTY_NO_THINKING = openaiSse([
+    { id: "chatcmpl_3", object: "chat.completion.chunk", choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }] },
+    { id: "chatcmpl_3", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+]);
+
+const OPENAI_GOOD = openaiSse([
+    { id: "chatcmpl_2", object: "chat.completion.chunk", choices: [{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: null }] },
+    { id: "chatcmpl_2", choices: [{ index: 0, delta: { content: "continued after nudge" }, finish_reason: null }] },
+    { id: "chatcmpl_2", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
+]);
+
+async function drainOpenai(first: string, retries: string[], id: string): Promise<{ out: string; fetchCalls: number; bodies: string[] }> {
+    let fetchCalls = 0;
+    const bodies: string[] = [];
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async (_url: unknown, init?: { body?: unknown }) => {
+        fetchCalls++;
+        if (init?.body !== undefined) bodies.push(typeof init.body === "string" ? init.body : String(init.body));
+        const body = retries[fetchCalls - 1] ?? "";
+        return new Response(body, { status: 200 });
+    }) as typeof fetch;
+    const chunks: Buffer[] = [];
+    try {
+        const ctx = makeCtx(id, "openai");
+        for await (const chunk of runCompressLoop(
+            new Response(first, { status: 200 }).body!,
+            ctx,
+            { model: "deepseek-chat", stream: true },
+            { url: "http://mock", headers: {} },
+            createOpenaiAdapter({ model: "deepseek-chat", stream: true }),
+            buildCompressSystemPrompt(),
+        )) {
+            chunks.push(chunk);
+        }
+    } finally {
+        globalThis.fetch = orig;
+    }
+    return { out: Buffer.concat(chunks).toString("utf8"), fetchCalls, bodies };
+}
+
+test("#821 O1: openai-wire round-1 thinking-only turn → one auto-retry appended to the same stream", async () => {
+    const { out, fetchCalls, bodies } = await drainOpenai(OPENAI_THINKING_ONLY, [OPENAI_GOOD], "deg-o1");
+    assert.equal(fetchCalls, 1, "exactly one degenerate auto-retry fired");
+    assert.ok(
+        bodies[0].includes("no visible text and no tool call"),
+        "the retry body carries the ephemeral continuation nudge",
+    );
+    assert.ok(out.includes("the context looks small"), "the thinking prefix was streamed to the client");
+    assert.ok(out.includes("continued after nudge"), "the retried turn's content was delivered on the same stream");
+    assert.ok(
+        out.indexOf("the context looks small") < out.indexOf("continued after nudge"),
+        "the thinking prefix precedes the retried content",
+    );
+});
+
+test("#821 O2: genuinely empty (no-reasoning) terminal turn is NOT retried", async () => {
+    const { fetchCalls } = await drainOpenai(OPENAI_EMPTY_NO_THINKING, [OPENAI_GOOD], "deg-o2");
+    assert.equal(fetchCalls, 0, "sawThinking=false → the empty turn passes through untouched");
 });

@@ -262,8 +262,14 @@ export async function* runCompressLoop(
             let truncatedDone = false;
             let sawThinking = false;
             let forwardedAny = false;
-            const fwd = (chunk: Buffer): Buffer => {
+            // #821: on wires that stream reasoning verbatim (openai/anthropic) a thinking-only
+            // turn sets forwardedAny before done, making the #732 retry unreachable there. Track
+            // model-VISIBLE output separately: a reasoning prefix is invisible to host turn
+            // semantics, so the degenerate retry may still append a fresh attempt to the stream.
+            let forwardedVisible = false;
+            const fwd = (chunk: Buffer, visible = false): Buffer => {
                 forwardedAny = true;
+                if (visible) forwardedVisible = true;
                 return chunk;
             };
 
@@ -281,15 +287,16 @@ export async function* runCompressLoop(
                 truncatedDone = false;
                 sawThinking = false;
                 forwardedAny = false;
+                forwardedVisible = false;
 
                 for await (const ev of adapter.parseStream(currentUpstream, round)) {
                     if (signal?.aborted) break;
                     if (ev.kind === "text") {
                         assistantText += ev.delta;
                         if (!ctx.textProtocol && ev.raw) {
-                            yield fwd(ev.raw);
+                            yield fwd(ev.raw, true);
                         } else if (!ctx.textProtocol && round > 1 && ev.delta.length > 0) {
-                            yield fwd(adapter.emitText(ev.delta));
+                            yield fwd(adapter.emitText(ev.delta), true);
                         }
                     } else if (ev.kind === "reasoning") {
                         assistantReasoning += ev.delta;
@@ -382,7 +389,7 @@ export async function* runCompressLoop(
                     }
                 }
 
-                // #732 (completes the auto-retry groundwork of #673/#674): a reasoning model can end a turn with ONLY a thinking block — zero visible text, zero tool calls, status completed — most often right after a post-compress re-request, where it sees the freshly-shrunk context and "wraps up" into a silent thought. The client then receives an empty completed turn and stalls until manually nudged. When NOTHING reached the client yet (forwardedAny=false — true for these rounds on wires whose round>1 framing is suppressed, e.g. Responses), the retry is invisible to the client: re-fetch once with a continuation nudge (a plain re-fetch reproduces the same silent output deterministically). One-shot per request. `sawThinking` is mandatory so a genuinely empty (no-reasoning) terminal turn is left untouched — only the "silent thought" shape retries.
+                // #732 (completes the auto-retry groundwork of #673/#674), extended by #821: a reasoning model can end a turn with ONLY a thinking block — zero visible text, zero tool calls, status completed — most often right after a post-compress re-request, where it sees the freshly-shrunk context and "wraps up" into a silent thought. The client then receives an empty completed turn and stalls until manually nudged. Retriable when no VISIBLE output reached the client yet (!forwardedVisible): on Responses rounds the framing is suppressed so nothing was forwarded at all; on openai/anthropic a thinking-only prefix WAS streamed verbatim, but it is invisible to host turn semantics and its chunks carry no finish_reason, so appending the retry's content to the same stream is safe. Re-fetch once with a continuation nudge (a plain re-fetch reproduces the same silent output deterministically). One-shot per request. `sawThinking` is mandatory so a genuinely empty (no-reasoning) terminal turn is left untouched — only the "silent thought" shape retries.
                 if (
                     !degenerateRetried &&
                     sawDone &&
@@ -395,11 +402,11 @@ export async function* runCompressLoop(
                     finishReason !== "error" &&
                     assistantText.length === 0 &&
                     calls.length === 0 &&
-                    !forwardedAny &&
+                    !forwardedVisible &&
                     !signal?.aborted
                 ) {
                     degenerateRetried = true;
-                    ctx.log(`[acp-loop] round ${round}: degenerate terminal turn (completed, zero text/tool calls) invisible to client; retrying once with continuation nudge (#732)`);
+                    ctx.log(`[acp-loop] round ${round}: degenerate terminal turn (completed, zero visible output); retrying once with continuation nudge (#732/#821)`);
                     loggerLog("warn", `[acp-loop] degenerate-turn auto-retry round ${round} (session ${ctx.session.id})`);
                     const nudge: CoreMessage = {
                         id: `acp_degenerate_retry_r${round}`,
