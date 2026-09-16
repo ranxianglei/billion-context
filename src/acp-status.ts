@@ -55,7 +55,11 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         if (nudge) {
             extra.push("");
             extra.push(nudge.shouldInject ? `Nudge: ACTIVE — ${nudge.reason}` : `Nudge: idle — ${nudge.reason}`);
-            const ranges = viableRanges(nudge.compressibleRanges);
+            // #847: only advertise ranges the submit gate accepts — the gate
+            // counts raw chars (minCompressRange), not tokens, so a range can
+            // be "viable" yet deterministically uncompressible.
+            const minChars = ctx.config.compress.minCompressRange;
+            const ranges = viableRanges(nudge.compressibleRanges).filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars);
             const protectedRanges = nudge.protectedRanges ?? [];
             if (ranges.length > 0 || protectedRanges.length > 0) {
                 extra.push("");
