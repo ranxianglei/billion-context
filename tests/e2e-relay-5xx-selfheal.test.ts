@@ -32,7 +32,7 @@ import { listSessions, type Session } from "../src/session.ts";
 
 const WINDOW = 32_000;
 const RELAY_WINDOW = 29_500; // the relay's hidden tolerance (tokens, chars/4)
-const BIG = 12_370; // chars per tool_result (well over minOutputTokens 1000)
+const BIG = 12_000; // chars per tool_result (well over minOutputTokens 1000)
 const STEPS = 9; // big tool steps (outside the protected recent zone)
 
 const RELAY_ERROR_BODY = JSON.stringify({

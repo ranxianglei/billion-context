@@ -101,7 +101,7 @@ test("e2e: model switch to a smaller window → preflight compresses before forw
         port: 0,
         host: "127.0.0.1",
         upstream: "http://127.0.0.1",
-        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-big": { context: 400_000 }, "claude-small": { context: 10_000 } } } },
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-big": { context: 400_000 }, "claude-small": { context: 10_600 } } } },
         modelContextLimit: 400_000,
         kernelConfig: defaultConfig(400_000),
         compress: { injectTool: true, injectNudge: true },
@@ -162,7 +162,7 @@ test("e2e: model switch to a smaller window → preflight compresses before forw
         const lastForward = forwards[forwards.length - 1];
         assert.ok(lastForward, "a forward happened");
         assert.ok(!lastForward.body.includes("MARKER_1_"), "compressed messages are out of the payload");
-        assert.ok(lastForward.body.includes("MARKER_7_"), "recent messages remain in the payload");
+        assert.ok(lastForward.body.includes("MARKER_9_"), "recent messages remain in the payload");
         assert.ok(lastForward.body.includes("MARKER_11_"), "recent protected messages remain in the payload");
         assert.ok(lastForward.body.includes(SUMMARY_TEXT), "the preflight summary is in the rebuilt payload");
 
@@ -286,7 +286,7 @@ test("e2e: fresh session (lastInputTokens=0) whose raw history overflows the win
         port: 0,
         host: "127.0.0.1",
         upstream: "http://127.0.0.1",
-        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-small": { context: 10_000 } } } },
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-small": { context: 10_600 } } } },
         modelContextLimit: 400_000,
         kernelConfig: defaultConfig(400_000),
         compress: { injectTool: true, injectNudge: true },
@@ -330,7 +330,7 @@ test("e2e: fresh session (lastInputTokens=0) whose raw history overflows the win
         const lastForward = forwards[forwards.length - 1];
         assert.ok(lastForward, "a forward happened");
         assert.ok(!lastForward.body.includes("MARKER_1_"), "compressed messages are out of the payload");
-        assert.ok(lastForward.body.includes("MARKER_7_"), "recent messages remain in the payload");
+        assert.ok(lastForward.body.includes("MARKER_9_"), "recent messages remain in the payload");
         assert.ok(lastForward.body.includes("MARKER_11_"), "recent protected messages remain in the payload");
         assert.ok(lastForward.body.includes(SUMMARY_TEXT), "the preflight summary is in the rebuilt payload");
 

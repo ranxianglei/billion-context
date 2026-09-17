@@ -9,7 +9,7 @@ import { pipePluginChatWithStrip, pipePluginResponsesWithStrip } from "../src/pl
 import { rewriteJsonResponse } from "../src/stream.ts";
 import { rewriteOpenaiJsonResponse } from "../src/stream-openai.ts";
 import { rewriteResponsesJsonResponse } from "../src/stream-responses.ts";
-import { buildCompressSystemPrompt, withMarkerIntegrityNote } from "../src/compress-tool.ts";
+import { buildCompressSystemPrompt, withMarkerIntegrityNote, withSummaryBudgetNote } from "../src/compress-tool.ts";
 import { setLogCapture } from "../src/logger.ts";
 
 const LT = "\x3c";
@@ -274,6 +274,24 @@ test("withMarkerIntegrityNote appends the anti-forgery rule", () => {
     assert.ok(out.startsWith("Nudge: OVER-LIMIT T1"));
     assert.ok(out.includes("NEVER emit such a line as your own text"));
     assert.ok(out.includes("call acp_status and confirm the block count increased"));
+});
+
+test("#888: withSummaryBudgetNote steers large/dense ranges into split multi-range calls", () => {
+    const out = withSummaryBudgetNote("Nudge: OVER-LIMIT T1");
+    assert.ok(out.startsWith("Nudge: OVER-LIMIT T1"), "input preserved verbatim");
+    assert.ok(out.includes("Per-summary length budget"));
+    assert.ok(out.includes("fails the WHOLE compress call"));
+    assert.ok(out.includes("SPLIT it into several smaller ranges"));
+    assert.ok(out.includes("batch all the ranges in one compress call"));
+    // Names the dense-subagent scenario from #888 so the model recognizes it.
+    assert.ok(out.includes("subagent results"));
+});
+
+test("#888: withSummaryBudgetNote is a byte-stable constant (prefix-cache safe)", () => {
+    const a = withSummaryBudgetNote("AAA");
+    const b = withSummaryBudgetNote("BBB");
+    // Same suffix regardless of input → no dynamic values leak into the anchor.
+    assert.equal(a.slice(3), b.slice(3));
 });
 
 test("responses passthrough strips a whole forged marker delta (fast-path bypass #717)", async () => {
