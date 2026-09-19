@@ -171,3 +171,24 @@ export function withMarkerIntegrityNote(text: string): string {
 export function withConversationIdNote(text: string, conversationId: string): string {
     return text + `\n\n[Your bili conversation id: ${conversationId}. When calling the bili compression tools, pass this value as the conversation_id argument so a shared MCP process can route the call to THIS session.]`;
 }
+
+// #888 per-summary length budget. acp-kernel rejects a compress call atomically
+// when ANY single range's summary exceeds compress.maxSummaryLength (default
+// 20000 chars) — "Summary too long (…)". Under dense workloads (many subagent
+// results, long tool outputs) a model is tempted to fold a large range into ONE
+// monolithic summary that blows the cap, failing the whole call. This rule
+// steers the model — at the moment it picks the range and in the persistent
+// philosophy prompt — to split large/dense ranges into several smaller ranges,
+// each with its own concise summary, batched in one call. Byte-stable constant
+// (no dynamic values) so the prefix-cache anchor stays intact; phrased without
+// a hard number so it stays correct regardless of the configured cap (the exact
+// limit is already reported verbatim in the kernel's failure message).
+const SUMMARY_BUDGET_NOTE =
+    "\n\n[Per-summary length budget: every compress summary has a hard character cap, and a single oversized summary fails the WHOLE compress call — nothing gets folded. Dense content (many subagent results, long tool outputs) tempts you into writing one giant summary for a big range; don't. When a range is large or dense, SPLIT it into several smaller ranges at logical boundaries and give EACH its own concise, scannable summary, then batch all the ranges in one compress call (content: [{startId,endId,summary}, {…}]). Prefer several tight blocks over one bloated block: each stays under the cap, and smaller blocks are cheaper to re-send and independently searchable/decompressible.]";
+
+/** Append the per-summary length-budget rule to a nudge or system-prompt text.
+ *  Unconditional (like withMarkerIntegrityNote): the cap always exists, so the
+ *  guidance must be present whenever compression is possible. */
+export function withSummaryBudgetNote(text: string): string {
+    return text + SUMMARY_BUDGET_NOTE;
+}
