@@ -3726,6 +3726,11 @@ async function forward(
         clearUpstreamTimer();
         if (prepared?.resetAfterSuccess) {
             log("warn", `[${prepared.session.id}] native compact response had no body; rebase NOT scheduled`);
+        } else {
+            // #821: a 2xx with a null body (e.g. upstream answered 204/304) is a
+            // SILENT empty response — the client receives zero SSE chunks and
+            // reports an "empty stream" with no trace in the log. Name it.
+            loggerLog("warn", `[${prepared?.session.id ?? "unknown"}] ← upstream ${upstream.status} returned a null body; responding empty to client`);
         }
         return;
     }
