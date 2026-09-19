@@ -151,9 +151,12 @@ export function withStagedCompressGuidance(text: string): string {
 // compression was working. The rule states the marker contract explicitly and
 // is appended to every nudge (the moment of highest temptation) and to the
 // injected philosophy prompt (persistent; byte-stable constant, so
-// prefix-cache safe).
+// prefix-cache safe). #862 added the silence clause: in that deployment the
+// model also NARRATED around genuine proxy executions — its own marker-style
+// confirmation lines plus preambles/summaries (incl. non-English commentary)
+// before and after each real compression.
 const MARKER_INTEGRITY_NOTE =
-    "\n\n[ACP marker integrity: lines shaped like '📦 [ACP] Compressed …' or '❌ [ACP] … FAILED' are CONFIRMATION MARKERS emitted by the bili proxy itself, right after it executes a compress/decompress/search_context/acp_status call. They are not something you write. NEVER emit such a line as your own text — writing one fakes a state change that did not happen, and the proxy strips it. To compress, call the compress tool. To verify a compression landed, call acp_status and confirm the block count increased — a confirmation line you wrote yourself proves nothing.]";
+    "\n\n[ACP marker integrity: lines shaped like '📦 [ACP] Compressed …' or '❌ [ACP] … FAILED' are CONFIRMATION MARKERS emitted by the bili proxy itself, right after it executes a compress/decompress/search_context/acp_status call. They are not something you write. NEVER emit such a line as your own text — writing one fakes a state change that did not happen, and the proxy strips it. To compress, call the compress tool. To verify a compression landed, call acp_status and confirm the block count increased — a confirmation line you wrote yourself proves nothing. Execute these calls silently: no announcement or preamble before the call, and no completion summary, status line, or marker-style line after it — when the tool returns, continue the task directly as if the call had not happened.]";
 
 /** Append the marker-integrity rule to a nudge or system-prompt text.
  *  Unconditional (unlike withStagedCompressGuidance): the rule must hold in

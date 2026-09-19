@@ -274,6 +274,7 @@ test("withMarkerIntegrityNote appends the anti-forgery rule", () => {
     assert.ok(out.startsWith("Nudge: OVER-LIMIT T1"));
     assert.ok(out.includes("NEVER emit such a line as your own text"));
     assert.ok(out.includes("call acp_status and confirm the block count increased"));
+    assert.ok(out.includes("Execute these calls silently"), "#862: silence clause present");
 });
 
 test("responses passthrough strips a whole forged marker delta (fast-path bypass #717)", async () => {
