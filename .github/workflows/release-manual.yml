@@ -110,7 +110,12 @@ jobs:
             exit 0
           fi
           echo "::warning::direct push to master was blocked (branch protection). Fallback: release prepared on a branch; a PR is needed to publish."
-          BR="$(date -u +%Y-%m-%d)_release-v${VER}"
+          BASE_BR="$(date -u +%Y-%m-%d)_release-v${VER}"
+          BR="$BASE_BR"
+          if git ls-remote --exit-code --heads origin "$BR" >/dev/null 2>&1; then
+            BR="${BASE_BR}-$(date -u +%H%M%S)"
+            echo "::warning::fallback branch ${BASE_BR} already exists on origin (stale earlier run of the same version+date); using ${BR} instead."
+          fi
           if ! git push -q origin "HEAD:$BR"; then
             echo "::error::fallback branch push to ${BR} failed — nothing published, aborting."
             exit 1
