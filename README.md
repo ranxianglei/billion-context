@@ -622,6 +622,7 @@ bili --passthrough           # forward without compression (smoke-test mode)
 bili --config ~/my-bili.json # use a different config file
 bili update                  # check & install a newer version now (bypasses throttle)
 bili --no-auto-update        # disable self-update for this run
+bili --auto-restart-on-update   # self-restart when a new version is installed (default off)
 ```
 
 Flags override env vars and the config file. `bili --help` lists them all.
@@ -682,8 +683,30 @@ so you can measure prefix-cache health directly from the log.
 ### Self-update
 
 The proxy checks npm for a newer version on startup and every 3 minutes. When a
-newer version is found it installs it globally (`npm install -g`) and logs a
-notice — **restart `bili` to pick up the new version**.
+newer version is found it installs it in place (tarball over the install dir)
+and logs a notice — **restart `bili` to pick up the new version**.
+
+While the running process is behind the on-disk install ("stale"), the state is
+visible without digging through logs:
+
+- The web UI (`/__bili/`) shows a banner on the overview page: which version is
+  running vs installed, and whether auto-restart is enabled.
+- `GET /__bili/status` returns `{version, diskVersion, stale,
+  autoRestartOnUpdate, inFlight}` for scripting.
+- A one-time `[update] … restart bili to activate` warning per version pair
+  stays in the log.
+
+**Opt-in self-restart.** With `--auto-restart-on-update` (or env
+`ACP_AUTO_RESTART_ON_UPDATE=1`, or `"autoRestartOnUpdate": true` in the config
+file — default OFF) the proxy re-execs itself instead of waiting for a human:
+when the on-disk version is newer and there are **zero in-flight requests**, it
+verifies the new install, stops accepting connections, drains, spawns a
+replacement process on the same port, waits until it accepts connections, then
+exits. Clients reconnect to the same port automatically; session state survives
+(persisted on disk). Safety gates: zero in-flight at decision time *and*
+through the drain window; an install sanity check before re-exec; a 10-minute
+cooldown marker so a flapping version can never loop-restart. Any failure
+resumes the original listener and falls back to the plain reminder.
 
 Disable permanently via config (`"autoUpdate": false`) or env
 (`ACP_AUTO_UPDATE=0`).

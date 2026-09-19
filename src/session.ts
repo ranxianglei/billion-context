@@ -287,6 +287,14 @@ export function releaseInFlight(session: Session): void {
     if (session.inFlight > 0) session.inFlight--;
 }
 
+/** Total in-flight requests across all sessions (sum of per-session
+ *  counters). The self-restart gate (#811) requires this to be zero. */
+export function totalInFlight(): number {
+    let n = 0;
+    for (const s of sessions.values()) n += s.inFlight;
+    return n;
+}
+
 /** Serialize a critical section per session. Each call chains onto the
  *  previous lockChain, so concurrent requests for the same session execute
  *  strictly one-at-a-time. This prevents two processTurn / stream-rewriter

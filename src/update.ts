@@ -174,8 +174,9 @@ async function writeLastCheck(ts: number): Promise<void> {
 /**
  * Walk up from this module's location until we find the directory whose
  * package.json `name` matches `packageName`. This is the install directory.
+ * Exported for the pre-re-exec gate (#811).
  */
-async function findInstallDir(packageName: string): Promise<string | undefined> {
+export async function findInstallDir(packageName: string): Promise<string | undefined> {
     let dir = path.dirname(fileURLToPath(import.meta.url));
     for (;;) {
         try {
@@ -465,7 +466,28 @@ export type UpdateOptions = {
     /** Dist-tag channel to follow (default "latest"), e.g. "dev", "stable".
      *  Publishing a PR (pr-N tag) never pulls a user on another channel. */
     updateTag?: string;
+    /** Fired whenever this process detects the on-disk install is newer than
+     *  the running code (#811): right after a successful in-place install and
+     *  on every subsequent up-to-date check while the process stays stale.
+     *  The CLI wires in the opt-in self-restart handler; absent = no-op.
+     *  Failures are logged, never propagated into the update loop. */
+    onStaleInstall?: (info: { diskVersion: string; runningVersion: string }) => void | Promise<void>;
 };
+
+/** Fire the stale-install hook (#811) without ever letting a handler failure
+ *  break the update loop. Absent hook = no-op (default behavior unchanged). */
+function notifyStaleInstall(opts: UpdateOptions, diskVersion: string): void {
+    const hook = opts.onStaleInstall;
+    if (!hook) return;
+    try {
+        const result = hook({ diskVersion, runningVersion: opts.currentVersion });
+        if (result instanceof Promise) {
+            result.catch((e) => loggerLog("warn", `[update] stale-install handler failed: ${String(e)}`));
+        }
+    } catch (e) {
+        loggerLog("warn", `[update] stale-install handler failed: ${String(e)}`);
+    }
+}
 
 /** Fetch dispatcher for updater egress (#609). undici's global fetch ignores
  *  HTTP(S)_PROXY env vars, so without an explicit dispatcher the registry
@@ -571,7 +593,14 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         const diskVersion = installDir ? await readDiskVersion(installDir) : undefined;
         const currentVersion = diskVersion ?? opts.currentVersion;
 
-        if (reportNotNewer(latest, tag, diskVersion, opts.currentVersion, loggerLog)) return;
+        if (reportNotNewer(latest, tag, diskVersion, opts.currentVersion, loggerLog)) {
+            // Up to date, but this process is behind the on-disk install —
+            // surface it to the opt-in self-restart handler (#811).
+            if (diskVersion && staleInstallStatus(diskVersion, opts.currentVersion) === "restart") {
+                notifyStaleInstall(opts, diskVersion);
+            }
+            return;
+        }
 
         const tarballUrl = data.dist?.tarball;
         const integrity = data.dist?.integrity;
@@ -598,6 +627,7 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
                 // the old version next to the new global one (#953). Best-effort:
                 // never fails the update itself.
                 await refreshDshProfileBundles(latest, loggerLog);
+                notifyStaleInstall(opts, latest);
             } else {
                 loggerLog("warn", `[update] install failed: ${result.error}. Will retry next cycle.`);
             }
@@ -826,6 +856,30 @@ export async function installViaTarball(
     await rm(backupDir, { recursive: true, force: true });
 
     return { ok: true };
+}
+
+/** Sanity-check an on-disk install with the same entry verification a fresh
+ *  auto-update applies to its staging dir: package.json readable, every
+ *  declared entry present and parseable. Returns null or a short reason. The
+ *  pre-re-exec gate (#811) uses it so a half-written install can never take
+ *  over the process. */
+export async function verifyInstallLoadable(installDir: string): Promise<string | null> {
+    return verifyEntries(installDir, "install verification failed");
+}
+
+/** Stale-install view for the web UI (#811): the on-disk version and whether
+ *  it is newer than the running process. Source checkouts report no stale
+ *  state — they never self-update. */
+export async function detectStaleInstall(
+    packageName: string,
+    runningVersion: string,
+): Promise<{ diskVersion: string | undefined; stale: boolean }> {
+    const installDir = await findInstallDir(packageName);
+    if (!installDir || (await isGitWorkingTree(installDir))) {
+        return { diskVersion: undefined, stale: false };
+    }
+    const diskVersion = await readDiskVersion(installDir);
+    return { diskVersion, stale: staleInstallStatus(diskVersion, runningVersion) === "restart" };
 }
 
 export function startAutoUpdate(opts: UpdateOptions): void {

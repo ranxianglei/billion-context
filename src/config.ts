@@ -396,6 +396,9 @@ export type ProxyOptions = {
      *  Drives the #405 boot warning and the web panel's source display. */
     passthroughSource: "env" | "file" | null;
     autoUpdate: boolean;
+    /** Opt-in self-restart when a newer version is already installed on disk
+     *  (#811): re-exec at zero in-flight requests. Default OFF. */
+    autoRestartOnUpdate: boolean;
     /** Dist-tag channel the auto-updater follows (default "latest"). */
     updateTag: string;
     logFile?: string;
@@ -569,6 +572,9 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         passthrough: passthrough.enabled,
         passthroughSource: passthrough.source,
         autoUpdate: (env.ACP_AUTO_UPDATE ?? (fileConfig.autoUpdate === false ? "0" : "1")) !== "0",
+        // Default OFF: unlike autoUpdate, self-restart touches process
+        // liveness, so it requires an explicit opt-in (#811).
+        autoRestartOnUpdate: (env.ACP_AUTO_RESTART_ON_UPDATE ?? (fileConfig.autoRestartOnUpdate === true ? "1" : "0")) !== "0",
         updateTag: (env.ACP_UPDATE_TAG ?? fileConfig.updateTag ?? "latest").trim() || "latest",
         logFile: env.ACP_LOG_FILE !== undefined ? (env.ACP_LOG_FILE || undefined) : fileConfig.logFile,
         mitm: {
@@ -603,6 +609,8 @@ type FileConfig = {
     dumpSse?: string;
     passthrough?: boolean;
     autoUpdate?: boolean;
+    /** Opt-in self-restart when a newer version is installed on disk (#811). */
+    autoRestartOnUpdate?: boolean;
     /** Dist-tag channel the auto-updater follows (default "latest"). */
     updateTag?: string;
     upstreamProxy?: string;

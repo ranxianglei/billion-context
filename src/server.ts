@@ -44,7 +44,9 @@ import {
     subagentNamespace,
 } from "acp-kernel/wire";
 import { responsesToCoreWithToolImages as responsesToCore, patchResponsesInputWithToolImages as patchResponsesInput } from "./responses-tool-output.js";
-import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive, detectUnannouncedHistoryRewrite, markCompactionBoundary, ensureCanonicalId, storeEffectiveConfig } from "./session.js";
+import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive, detectUnannouncedHistoryRewrite, markCompactionBoundary, ensureCanonicalId, storeEffectiveConfig } from "./session.js";
+import { detectStaleInstall } from "./update.js";
+import { PACKAGE_NAME, VERSION } from "./version.js";
 import { ABSORB_TOOL, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, COMPRESS_TOOL, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildAbsorbSystemPrompt, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withConversationIdNote, withMarkerIntegrityNote, withStagedCompressGuidance } from "./compress-tool.js";
 import { applyAbsorbView, absorbEnabled, absorbToolName, storeEffectiveAbsorb } from "./absorb.js";
 import { rewriteJsonResponse, type RewriteCtx } from "./stream.js";
@@ -646,6 +648,7 @@ async function handle(
     }
     if (req.method === "GET" && req.url === "/__bili/stats") return sendStats(res);
     if (req.method === "GET" && req.url?.startsWith("/__bili/cache-report")) return sendCacheReport(res, req.url);
+    if (req.method === "GET" && req.url === "/__bili/status") return sendStatus(res, opts);
     if (req.method === "GET" && req.url === "/") {
         // Browser visits root → redirect to the web UI. curl / health probes
         // (Accept: */* or no Accept) still get the JSON health check so
@@ -4286,6 +4289,21 @@ function sendStats(res: http.ServerResponse): void {
     }));
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ sessions, blindTunnels: getBlindTunnelStats() }, null, 2));
+}
+
+/** Stale-install state for the web UI badge (#811): whether the on-disk
+ *  version is newer than the running process, plus the opt-in flag state and
+ *  the live in-flight request count. */
+async function sendStatus(res: http.ServerResponse, opts: ProxyOptions): Promise<void> {
+    let diskVersion: string | undefined;
+    let stale = false;
+    try {
+        ({ diskVersion, stale } = await detectStaleInstall(PACKAGE_NAME, VERSION));
+    } catch {
+        // fs hiccup: report running state only, never fail the status endpoint
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ version: VERSION, diskVersion, stale, autoRestartOnUpdate: opts.autoRestartOnUpdate, inFlight: totalInFlight() }, null, 2));
 }
 
 function headerValue(req: http.IncomingMessage, name: string): string | undefined {

@@ -23,6 +23,8 @@
 import { loadOptions, ensureConfigTemplate } from "./config.js";
 import { startServer } from "./server.js";
 import { configFile as defaultConfigFile } from "./paths.js";
+import { log as loggerLog } from "./logger.js";
+import { createAutoRestartHandler } from "./restart.js";
 import { checkForUpdate, startAutoUpdate } from "./update.js";
 import { resolveProxy } from "./upstream-proxy.js";
 import { runMcpStdio } from "./mcp.js";
@@ -105,6 +107,7 @@ Options (override config file / env):
   --passthrough                    forward without compression
   --no-passthrough                 force compression on (overrides config)
   --no-auto-update                 disable background self-update this run
+  --auto-restart-on-update         self-restart when a newer version is already installed on disk (default off)
 
 Config: ${defaultConfigFile()}
   Set port/host/debug/providers/compress/autoUpdate there. See README §Configuration.
@@ -168,6 +171,9 @@ export function parseArgs(argv: string[]): Parsed {
                 break;
             case "--no-auto-update":
                 overrides.ACP_AUTO_UPDATE = "0";
+                break;
+            case "--auto-restart-on-update":
+                overrides.ACP_AUTO_RESTART_ON_UPDATE = "1";
                 break;
             case "--passthrough":
                 overrides.ACP_PASSTHROUGH = "1";
@@ -453,7 +459,7 @@ export async function main(): Promise<void> {
     // than a bare error. No-op if it already exists.
     ensureConfigTemplate();
     const opts = loadOptions();
-    await startServer(opts);
+    const server = await startServer(opts);
 
     // Start background auto-update after the server is listening so a slow
     // registry check never delays startup or races the listen socket.
@@ -466,6 +472,17 @@ export async function main(): Promise<void> {
             autoUpdate: true,
             resolveProxy: (url) => resolveProxy(opts.routes, opts.proxy, url, opts.proxyFallback),
             updateTag: opts.updateTag,
+            onStaleInstall: createAutoRestartHandler({
+                enabled: opts.autoRestartOnUpdate,
+                packageName: PACKAGE_NAME,
+                server,
+                host: opts.host,
+                portProvider: () => {
+                    const addr = server.address();
+                    return addr && typeof addr === "object" ? addr.port : opts.port;
+                },
+                log: loggerLog,
+            }),
         });
     }
 }
