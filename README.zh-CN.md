@@ -83,6 +83,7 @@ AI 编程助手的<strong>通用上下文压缩代理</strong>
 | **dsh** | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili dsh`（启动器，经 `--patch` 注入完整原生插件：工具、会话绑定 `/acp`、fetch 拦截）或 `bili plugin install dsh` ≡ `dsh plugin --profile <name> add billion-context`（统一泳道 —— pnpm 把包装进各 profile、由 dsh 挂载包内 patch 层；bili 形式只是替你按 profile 驱动 dsh 自己的通道，并顺带迁移旧版受管块） |
 | **kimi** | `bili plugin install kimi`（自拉起原生插件，免启动器 —— 需 Kimi Code ≥ 2.0.0；每会话在 `~/.kimi-code/config.toml` 写入路由块）或 `bili kimi`（启动器，证书 MITM）或 `/bili/` 前缀 |
 | **claude** | `bili claude`(启动器)或 `bili plugin install claude`(原生姿态,#964 —— 受管 settings 块 + 会话自管代理;见下方"注意") |
+| **jcode** | [`billion-context`](https://github.com/ranxianglei/billion-context)，`bili jcode`（启动器，cert-MITM）或 `/bili/` 前缀 —— 无法做原生插件：编译型 Rust 二进制、无插件接缝，其静态 provider 配置无法按请求打头（[#962](https://github.com/ranxianglei/billion-context/issues/962)） |
 | **其余所有**（没有上下文 hook） | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili <client>`（启动器，优先）或 `/bili/` 前缀 |
 
 **原生模式 vs 独立扩展。** 宿主原生插件(`bili plugin install pi` / `opencode` —— 代理在宿主进程内拉起)与独立进程内扩展(`billion-context-pi`、`opencode-acp`)**互斥**:两者同时生效意味着双重压缩。安装器负责切换:`bili plugin install pi` 会替换旧的 `npm:billion-context-pi` 条目;`bili plugin install opencode` 会从全局 opencode.json 里剔除旧的 `opencode-acp` 条目 —— 裸名、`npm:` 别名、带版本号(`opencode-acp@stable`)、路径形式都认,数组/对象两种形态都处理;原配置会快照到 `opencode.json.bili-bak`。**项目级**安装(`opencode plugin opencode-acp` 写的是 `<project>/.opencode/opencode.json`,不是全局配置)不会被碰 —— 需手动移除,安装器输出里会提醒。作为手动安装的运行期安全网,原生入口在加载时同步设置 `BILLION_CONTEXT_NATIVE=<host>`,让独立扩展在动作时自动退出 —— 它自己的加载期 `BILLION_CONTEXT_PROXY` 检查看不见原生模式异步拉起的代理,`/bili/` baseURL 检查也看不见 fetch 层改写。
@@ -139,6 +140,7 @@ pi / omp / kimi / claude 没有客户端侧通道 —— 它们的配置条目�
 - `kimi` 仅在自举时上报 runtime-info(静态 `custom_headers` 无法承载逐请求的窗口/模型头,否则会在模型切换后过期),子代理会话按每次调用的 `conversation_id` 绑定 —— 完整机制见下文「Kimi Code」小节。
 - `claude` 有**原生姿态**(#964):`bili plugin install claude` 写入受管 settings 块(静态 `/bili/` URL + `SessionStart` hook)+ 指向稳定端口的 MCP shell —— 代理随会话生灭。`BILI_NATIVE_CLAUDE=0` 退出(passthrough)。机制细节:[TECHNICAL-NOTES.zh-CN.md](TECHNICAL-NOTES.zh-CN.md)。
 - `codex` / `omp` 也有配套安装(MCP shell 与轻量扩展),但它们需要一个在跑的代理 —— 不属于原生模式。
+- `jcode` 则完全没有原生模式:它是编译型 Rust 二进制、无插件/扩展接缝,唯一的 provider 级请求头是静态 TOML 表(对每个请求原样附加),MCP server 又是跨所有会话共享的全局池 —— 既无法在进程内改写模型流量,也无法打上 plugin 模式所需的按请求头(`x-bili-plugin`、会话 id、runtime-info)。完整源码级分析见 [#962](https://github.com/ranxianglei/billion-context/issues/962)(已按 wontfix 关闭)。请用 `bili jcode`(启动器)。
 
 ### 方式 2 —— 启动器(`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode` / `bili hermes` / `bili dsh` / `bili codebuddy` / `bili qoder` / `bili trae` / `bili jcode` / `bili kimi`)
 

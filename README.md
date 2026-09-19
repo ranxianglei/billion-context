@@ -155,6 +155,7 @@ Pick by your client:
 | **dsh** | `bili dsh` (launcher — full native plugin via `--patch`: tools, session-bound `/acp`, fetch intercept) or `bili plugin install dsh` ≡ `dsh plugin --profile <name> add billion-context` (one unified lane — pnpm-installs the package into each profile so dsh mounts the bundled patch layer; the bili form just drives dsh's own channel per profile and migrates legacy managed blocks) |
 | **kimi** | `bili plugin install kimi` (self-spawning native plugin, no launcher — Kimi Code ≥ 2.0.0; per-session routing block in `~/.kimi-code/config.toml`) or `bili kimi` (launcher, cert-MITM) or `/bili/` prefix |
 | **claude** | `bili claude` (launcher) or `bili plugin install claude` (native posture, #964 — managed settings block + session-owned proxy; see the notes below) |
+| **jcode** | [`billion-context`](https://github.com/ranxianglei/billion-context) via `bili jcode` (launcher, cert-MITM) or `/bili/` prefix — no native plugin possible: compiled Rust binary with no plugin seam, and its static per-provider config can't stamp per-request headers ([#962](https://github.com/ranxianglei/billion-context/issues/962)) |
 | **everything else** (no context hook) | [`billion-context`](https://github.com/ranxianglei/billion-context) — `bili <client>` (launcher, preferred) or `/bili/` prefix |
 
 **Native mode vs standalone extensions.** The host-native plugins (`bili plugin install pi` / `opencode` — they spawn the proxy inside the host process) and the standalone in-process extensions (`billion-context-pi`, `opencode-acp`) are **mutually exclusive**: both active means double compression. The installer makes the switch: `bili plugin install pi` replaces the legacy `npm:billion-context-pi` entry (with a reminder that a project-scope entry in `<project>/.pi/settings.json` from `pi install -l` lives outside the global settings), and `bili plugin install opencode` strips legacy `opencode-acp` entries from the global opencode.json — bare name, `npm:` alias, versioned (`opencode-acp@stable`), or path form, array or object shape; the original config is snapshotted to `.bili-bak` once. A **project-local** install (`opencode plugin opencode-acp` writes `<project>/.opencode/opencode.json`, not the global config) is not touched — remove it by hand; the installer note reminds you. As a runtime safety net for manual installs, the native entries set `BILLION_CONTEXT_NATIVE=<host>` synchronously at load so a standalone extension can stand down at action time — its own load-time `BILLION_CONTEXT_PROXY` check cannot see a proxy that native mode spawns asynchronously, and its `/bili/` baseUrl check never sees the fetch-layer rewrite. On the pi side the marker needs `billion-context-pi` **0.1.72+** (the per-event re-check landed after 0.1.71); the pi-native entry additionally scans both pi settings files once its proxy is up and warns loudly when it spots a co-resident legacy entry the installer never saw — that warning is the only visible signal while an old `billion-context-pi` silently double-compresses.
@@ -281,6 +282,14 @@ Notes:
   proxy lives and dies with the session. Opt out with
   `BILI_NATIVE_CLAUDE=0` (passthrough). Mechanics:
   [TECHNICAL-NOTES.md](TECHNICAL-NOTES.md).
+- `jcode` has no native mode at all: it is a compiled Rust binary with no
+  plugin or extension seam, its only per-provider request surface is a static
+  TOML header table applied verbatim to every request, and its MCP servers
+  run in a global pool shared across all sessions — so there is neither a
+  way to rewrite model traffic in-process nor one to stamp the per-request
+  headers plugin mode requires (`x-bili-plugin`, conversation id,
+  runtime-info). Full source-level analysis: [#962](https://github.com/ranxianglei/billion-context/issues/962)
+  (closed wontfix). Use `bili jcode`.
 
 ### Option 2 — Launcher (`bili pi` / `bili codex` / `bili claude` / `bili omp` / `bili opencode` / `bili hermes` / `bili dsh` / `bili codebuddy` / `bili qoder` / `bili trae` / `bili jcode` / `bili kimi`)
 
