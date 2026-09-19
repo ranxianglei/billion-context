@@ -169,16 +169,35 @@ function errMessage(err: unknown): string {
     return err instanceof Error ? err.message : String(err);
 }
 
+/** Apply a freshly-resolved proxy origin to the in-process routing state.
+ *  #983: deliberately does NOT write BILLION_CONTEXT_PROXY — that var is the
+ *  external-preset attach channel (launcher/user), and freezing our own
+ *  ephemeral port there makes a later apply() mis-plan a liveness-unchecked
+ *  attach to a dead port (every tool fetch-fails until the host restarts). */
+function adoptOrigin(origin: string): string {
+    state.origin = origin;
+    register.base = origin;
+    return origin;
+}
+
+/** Give-up handler: the proxy died and the last respawn failed. Clear the
+ *  proxy-owned routing state and arm the backoff so maybeRetry can re-bootstrap
+ *  and re-register once the proxy recovers (#983) instead of bricking until the
+ *  host restarts. */
+function giveUp(): void {
+    delete process.env.BILLION_CONTEXT_PROXY;
+    register.base = undefined;
+    register.toolsReady = false;
+    register.retryAt = Date.now() + RETRY_INTERVAL_MS;
+}
+
 async function bootstrap(): Promise<string | undefined> {
     try {
         const handle = await ensureProxyRunning(
             { host: LAUNCHER_DEFAULT_HOST, port: 0, passthrough: false, debug: false },
             { scriptPath: nativeProxyScriptPath() },
         );
-        state.origin = handle.origin;
-        register.base = handle.origin;
-        process.env.BILLION_CONTEXT_PROXY = handle.origin;
-        return handle.origin;
+        return adoptOrigin(handle.origin);
     } catch (err) {
         console.error(`bili-native-dsh: proxy bootstrap failed — model traffic goes direct (uncompressed): ${errMessage(err)}`);
         return undefined;
@@ -231,11 +250,37 @@ async function registerTools(ctx: PluginContext): Promise<void> {
     return register.pending;
 }
 
+async function reestablishBase(): Promise<string | undefined> {
+    const respawn = state.respawn;
+    if (respawn === undefined) return undefined;
+    await respawn();
+    return register.base;
+}
+
 function maybeRetry(ctx: PluginContext): void {
-    if (register.dead || register.toolsReady || register.base === undefined) return;
+    if (register.dead || register.toolsReady) return;
     if (register.pending !== undefined) return;
     if (Date.now() < register.retryAt) return;
-    void registerTools(ctx).catch(() => {});
+    if (register.base !== undefined) {
+        void registerTools(ctx).catch(() => {});
+        return;
+    }
+    // #983: base was cleared by onGiveUp after a failed respawn, and every
+    // caller above bails on base===undefined — so without this branch the tools
+    // stay unregistered until the host restarts. Re-run the single-flight
+    // bootstrap so a recovered proxy re-registers them; a failed re-bootstrap
+    // re-arms the backoff (armed in onGiveUp).
+    void reestablishBase()
+        .then((base) => {
+            if (base === undefined) {
+                register.retryAt = Date.now() + RETRY_INTERVAL_MS;
+                return;
+            }
+            return registerTools(ctx);
+        })
+        .catch(() => {
+            register.retryAt = Date.now() + RETRY_INTERVAL_MS;
+        });
 }
 
 function sessionIdOf(ctx: PluginContext): string | undefined {
@@ -304,11 +349,7 @@ export function apply(ctx: PluginContext): void {
         markNativeHost(process.env, "dsh");
         const start = singleFlight(bootstrap);
         state.respawn = start;
-        state.onGiveUp = () => {
-            delete process.env.BILLION_CONTEXT_PROXY;
-            register.base = undefined;
-            register.toolsReady = false;
-        };
+        state.onGiveUp = giveUp;
         state.ready = start();
     }
 
@@ -376,4 +417,25 @@ export function _resetRegisterForTest(base: string | undefined): void {
 
 export function _stateHeadersForTest(): ((url: string) => Record<string, string> | undefined) | undefined {
     return state.headersFor;
+}
+
+/** Test hook (#983): wire the spawn-mode recovery state (respawn + give-up)
+ *  without spawning a proxy or patching fetch, so suites can drive the
+ *  give-up → re-bootstrap → re-register cycle and assert it recovers. */
+export function _armSpawnRecoveryForTest(respawn: () => Promise<string | undefined>): { giveUp: () => void; clearBackoff: () => void } {
+    state.respawn = respawn;
+    state.onGiveUp = giveUp;
+    return {
+        giveUp,
+        clearBackoff: () => {
+            register.retryAt = 0;
+        },
+    };
+}
+
+/** Test hook (#983): expose the origin-adoption side effect so a suite can
+ *  assert a self-spawned origin is routed in-process WITHOUT freezing
+ *  BILLION_CONTEXT_PROXY (the removed write that caused #983). */
+export function _adoptOriginForTest(origin: string): string {
+    return adoptOrigin(origin);
 }

@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { apply, planNativeDsh, shouldBootstrapNativeDsh, _resetRegisterForTest, _stateHeadersForTest } from "../src/agent/dsh-native.ts";
+import { apply, planNativeDsh, shouldBootstrapNativeDsh, _resetRegisterForTest, _stateHeadersForTest, _adoptOriginForTest, _armSpawnRecoveryForTest } from "../src/agent/dsh-native.ts";
 import { dshManagedPatchBlock, dshNativeInstalled, dshProfileDirs, mergeDshManagedPatch, stripDshManagedPatch, dshBundleInstalled, pluginInstall, pluginRemove, pluginStatusAll } from "../src/plugin-install.ts";
 
 test("planNativeDsh: kill-switches > attach > spawn precedence (#941)", () => {
@@ -508,6 +508,64 @@ test("apply() runtime-info (#956): a mid-resolve model switch discards the stale
             assert.equal(stamp()?.["x-bili-plugin-model"], "qwen-b");
             assert.equal(stamp()?.["x-bili-plugin-max-output"], "4096");
         });
+    } finally {
+        proxy.close();
+        fs.rmSync(home, { recursive: true, force: true });
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("self-spawn adoption does not freeze BILLION_CONTEXT_PROXY (#983): re-plan stays spawn", async () => {
+    await withEnv(
+        { BILLION_CONTEXT_PROXY: undefined, BILI_NATIVE_DSH: undefined, BILLION_CONTEXT_PLUGIN: undefined, BILI_PROVIDER_REWRITES: undefined },
+        () => {
+            _resetRegisterForTest(undefined);
+            const adopted = _adoptOriginForTest("http://127.0.0.1:49999");
+            assert.equal(adopted, "http://127.0.0.1:49999");
+            // #983 root cause: a self-spawned ephemeral origin was written into the
+            // attach-trusted env var, so a later in-process plan mis-read it as an
+            // attach target with no liveness check → every tool fetch-failed until
+            // the host restarted. Adoption must route in-process only.
+            assert.equal(process.env.BILLION_CONTEXT_PROXY, undefined);
+            assert.deepEqual(planNativeDsh(process.env), { mode: "spawn" });
+        },
+    );
+});
+
+test("give-up → recovered proxy re-registers tools without a host restart (#983)", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-giveup-"));
+    try {
+        await withEnv(
+            { DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined, BILI_NATIVE_DSH: undefined, BILLION_CONTEXT_PLUGIN: undefined, BILI_PROVIDER_REWRITES: undefined },
+            async () => {
+                _resetRegisterForTest(proxy.origin);
+                const ctx = mockCtx();
+                apply(ctx); // spawn plan under node:test → sets headersFor, no fetch intercept
+                const recovery = _armSpawnRecoveryForTest(async () => {
+                    _adoptOriginForTest(proxy.origin); // simulate the recovered proxy being re-adopted
+                    return proxy.origin;
+                });
+                ctx.setInitiator({ session: { id: "s-giveup" } });
+
+                // first model request drives initial registration
+                void _stateHeadersForTest()?.("https://api.deepseek.com/chat/completions");
+                await waitFor(() => ctx.registeredTools.length === 1, "initial tool registration");
+                assert.equal(_stateHeadersForTest()?.("https://api.deepseek.com/chat/completions")?.["x-bili-plugin"], "dsh");
+
+                // proxy died and the last respawn failed → give-up clears routing state
+                recovery.giveUp();
+                // backoff is armed immediately: a request in the window must NOT recover yet
+                assert.equal(_stateHeadersForTest()?.("https://api.deepseek.com/chat/completions"), undefined);
+
+                // the proxy recovers; past the backoff the next request re-bootstraps
+                // and re-registers instead of bricking until the host restarts
+                recovery.clearBackoff();
+                void _stateHeadersForTest()?.("https://api.deepseek.com/chat/completions");
+                await waitFor(() => ctx.registeredTools.length === 2, "post-give-up re-registration");
+                assert.equal(_stateHeadersForTest()?.("https://api.deepseek.com/chat/completions")?.["x-bili-plugin"], "dsh");
+            },
+        );
     } finally {
         proxy.close();
         fs.rmSync(home, { recursive: true, force: true });
