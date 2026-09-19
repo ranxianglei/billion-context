@@ -799,6 +799,24 @@ export function buildQoderEnv(origin: string, caPath: string, baseEnv: NodeJS.Pr
 }
 
 /**
+ * #764: qoder model-transport selection. bili does NOT force the OpenAI
+ * chat-completions wire (MODEL_TRANSPORT=http) by default: that endpoint
+ * (api2-v2.qoder.sh /model/v1/chat/completions) is served by an upstream
+ * gateway that emits malformed, mid-chunk-cut SSE (no DONE marker,
+ * half-terminated JSON data lines, sometimes no finish_reason), so every
+ * tool-calling turn fails, while qoder's default (legacy) transport works.
+ * Returns the user's explicit opt-in value (BILI_QODER_TRANSPORT on the intl
+ * site, BILI_QODERCN_TRANSPORT on CN) when set — so the OpenAI wire can be
+ * re-enabled once the gateway is fixed and bili's compress loop can parse it —
+ * otherwise undefined (leave qoder's own default transport alone).
+ */
+export function resolveQoderTransport(qoderPrefix: string, env: NodeJS.ProcessEnv): string | undefined {
+    const varName = `BILI_${qoderPrefix}_TRANSPORT`;
+    const v = env[varName];
+    return nonEmpty(v) ? v : undefined;
+}
+
+/**
  * #653: qoder's auto-compact window is a single env knob —
  * `QODER_AUTOCOMPACT_WINDOW` (`QODERCN_` prefix on the CN site) caps the
  * effective context window (`min(modelWindow, env)`), so injecting bili's
@@ -2699,14 +2717,26 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // (no base-URL override env), so /bili/ rewrites cannot reach it.
         // qoder's undici stack honors HTTPS_PROXY + NODE_EXTRA_CA_CERTS
         // (additive, so the plain root CA suffices). Proxy vars are fully
-        // stripped (same contract as hermes). QODER_MODEL_TRANSPORT=http
-        // forces the OpenAI chat-completions wire: the default transport is a
-        // server feature-gate whose `legacy` fallback wire is unverified
-        // (#653 open question 1). The env prefix family follows the CN-site
-        // detection (qoderIsCnSite).
+        // stripped (same contract as hermes). The env prefix family follows
+        // the CN-site detection (qoderIsCnSite).
+        //
+        // Transport: do NOT force MODEL_TRANSPORT=http by default (#764). The
+        // http wire (api2-v2.qoder.sh /model/v1/chat/completions) is served by
+        // an upstream gateway that emits malformed, mid-chunk-cut SSE — no
+        // [DONE], half-terminated JSON data lines, sometimes no finish_reason —
+        // so every tool-calling turn fails while the default (legacy) transport
+        // succeeds. bili therefore leaves qoder's own transport selection alone;
+        // opt back into the OpenAI wire with BILI_QODER_TRANSPORT (BILI_QODERCN_
+        // TRANSPORT on CN) once the gateway is fixed.
         env = buildQoderEnv(origin, ca, stripInheritedProxy(process.env));
         const qoderPrefix = qoderIsCnSite(process.env) ? "QODERCN" : "QODER";
-        env[`${qoderPrefix}_MODEL_TRANSPORT`] = "http";
+        const forcedTransport = resolveQoderTransport(qoderPrefix, process.env);
+        if (forcedTransport) {
+            env[`${qoderPrefix}_MODEL_TRANSPORT`] = forcedTransport;
+            console.error(`bili: qoder model transport forced to ${forcedTransport} (${qoderPrefix}_MODEL_TRANSPORT) — bili's compress loop only parses the OpenAI chat-completions wire`);
+        } else {
+            console.error("bili: qoder default transport (legacy SSE) kept — bili does not force MODEL_TRANSPORT=http because the api2-v2 chat-completions gateway emits truncated/malformed SSE (set BILI_QODER_TRANSPORT=http to opt into the OpenAI wire once it is fixed)");
+        }
         const qoderBudget = await resolveQoderBudgetEnv({
             model: nonEmpty(process.env[`${qoderPrefix}_MODEL`]) ? process.env[`${qoderPrefix}_MODEL`] : config.qoder?.model,
             userAutoCompactWindow: process.env[`${qoderPrefix}_AUTOCOMPACT_WINDOW`],
