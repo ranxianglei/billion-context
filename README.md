@@ -379,7 +379,11 @@ Two lanes, same plugin (#941):
   (round 1 rides wire mode). Opt-out: `BILI_NATIVE_DSH=0`. Remove with
   `bili plugin remove dsh` or `dsh plugin --profile <name> remove
   billion-context` — both go through the same channel. Registry installs
-  require a published release that carries `dsh.bundle.patch.yml`.
+  require a published release that carries `dsh.bundle.patch.yml`. If dsh
+  fails to boot right after an add with `ERR_MODULE_NOT_FOUND` on
+  `billion-context/dsh`, the profile resolved a pre-bundle copy from a stale
+  package-metadata cache (#953) — re-add pinned: `dsh plugin --profile
+  <name> add billion-context@latest`.
 - **Auto-update keeps profiles in lockstep:** after a global self-update,
   bili scans `~/.dsh/profiles/*/package.json` and brings any registry-pinned
   `billion-context` dependency back to the new global version, so the loaded
