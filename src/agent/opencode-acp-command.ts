@@ -8,7 +8,7 @@
 // origin only after bootstrap; the launcher variant captures the env value at
 // module load and serves it verbatim.
 
-import { fetchProxyVersion } from "./shared.js";
+import { armedIdleNotice, fetchProxyVersion, noSessionWarning } from "./shared.js";
 
 export interface OpencodeCommandConfig {
     template: string;
@@ -97,9 +97,7 @@ export function createAcpCommandHooks(getProxyBase: () => string | undefined, ct
                         } catch {
                             version = undefined;
                         }
-                        text = version !== undefined
-                            ? `billion-context@${version} — proxy connected, no ACP session yet. Send a model request, then run /acp again.`
-                            : "bili: no ACP session yet (send a model request first, then run /acp)";
+                        text = version !== undefined ? armedIdleNotice(version) : noSessionWarning();
                     } else {
                         text = "bili: proxy returned no status panel";
                     }

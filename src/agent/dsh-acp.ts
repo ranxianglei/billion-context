@@ -5,7 +5,7 @@
 // discipline as the other agent plugins: no acp-kernel import, every byte of
 // displayed data comes from the proxy's HTTP endpoints.
 
-import { proxyBaseFromEnv, fetchProxyVersion, fetchStatusLatest } from "./shared.js";
+import { proxyBaseFromEnv, fetchProxyVersion, fetchStatusLatest, armedIdleNotice } from "./shared.js";
 
 export const name = "bili-acp";
 export const inject = ["commands"];
@@ -36,10 +36,7 @@ async function statusOutcome(): Promise<CommandOutcome> {
     }
     const version = await fetchProxyVersion(base);
     if (version) {
-        return {
-            kind: "success",
-            text: `billion-context@${version} — proxy connected, compression armed. No model request seen yet; send one, then run /acp again.`,
-        };
+        return { kind: "success", text: armedIdleNotice(version) };
     }
     return {
         kind: "error",

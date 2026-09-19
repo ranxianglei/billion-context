@@ -6,7 +6,7 @@
 // from the host at runtime (the host duck-types us in).
 
 import { wrapCacheReport } from "../acp-panel.js";
-import { detectProxyBase, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, reportRuntimeInfoOnChange, type ManifestTool } from "./shared.js";
+import { detectProxyBase, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, type ManifestTool } from "./shared.js";
 
 type Ctx = {
     sessionManager?: { getSessionId?: () => string } | undefined;
@@ -398,12 +398,9 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                             version = undefined;
                         }
                         if (version !== undefined) {
-                            notify(
-                                `billion-context@${version} — proxy connected, compression armed. No model request in this conversation yet; send one, then run /acp again.`,
-                                "info",
-                            );
+                            notify(armedIdleNotice(version), "info");
                         } else {
-                            notify("bili: no ACP session yet (send a model request first, then run /acp)", "warning");
+                            notify(noSessionWarning(), "warning");
                         }
                         return;
                     }
