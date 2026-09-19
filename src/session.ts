@@ -294,7 +294,7 @@ export function releaseInFlight(session: Session): void {
  *
  *  For single-agent workflows (the common case) there is no contention and
  *  the chain resolves immediately. The cost is one Promise allocation. */
-export async function withSessionLock<T>(session: Session, fn: () => Promise<T>): Promise<T> {
+export async function withSessionLock<T>(session: Session, fn: () => T | Promise<T>): Promise<T> {
     const prev = session.lockChain ?? Promise.resolve();
     let release!: () => void;
     const done = new Promise<void>((resolve) => { release = resolve; });

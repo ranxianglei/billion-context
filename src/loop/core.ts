@@ -6,7 +6,7 @@ import {
 } from "acp-kernel";
 import { handleAcpStatus } from "../acp-status.js";
 import { handleAcpCache, recordCacheSample } from "../cache-ledger.js";
-import { lastCompressSuffix, type Session } from "../session.js";
+import { lastCompressSuffix, withSessionLock, type Session } from "../session.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import {
     parseCompressInput,
@@ -86,7 +86,7 @@ export interface LoopCtx {
      *  re-request reflects the compression the model just performed instead
      *  of the pre-compress view (stale view = model sees zero effect + a
      *  finished deliverable → wraps up and stops). */
-    refreshFolded?: (current: CoreMessage[]) => CoreMessage[];
+     refreshFolded?: (current: CoreMessage[]) => CoreMessage[] | Promise<CoreMessage[]>;
     // Which wire protocol produced the usage the loop records. Needed to
     // compute the true context total correctly (Anthropic reports
     // input_tokens as NEW-only; OpenAI/Responses report the TOTAL).
@@ -572,7 +572,7 @@ export async function* runCompressLoop(
                     } catch {
                         parsedArgs = {};
                     }
-                    const result = executeProxyTool(call.name, parsedArgs, ctx, call.callId);
+                    const result = await withSessionLock(ctx.session, () => executeProxyTool(call.name, parsedArgs, ctx, call.callId));
                     proxyResults.push({ name: call.name, callId: call.callId, result, arguments: call.arguments });
                     if (ctx.visibilityMarkers !== false) yield adapter.emitMarker(call.name, result);
                 } else {
@@ -685,7 +685,7 @@ export async function* runCompressLoop(
                     proxyResults.some((pr) => (pr.name === "compress" || pr.name === absorbName) && !pr.result.includes("FAILED"))
                 ) {
                     try {
-                        const refreshed = ctx.refreshFolded(coreMessages);
+                        const refreshed = await ctx.refreshFolded(coreMessages);
                         if (refreshed.length > 0) {
                             coreMessages.length = 0;
                             coreMessages.push(...refreshed);

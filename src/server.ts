@@ -1543,10 +1543,15 @@ async function handle(
         // window). Released in the outer finally after forward completes.
         acquireInFlight(session);
         try {
-            // Serialize per-session: prepare (processTurn mutates state) + forward
-            // (stream rewriter mutates state via compress/decompress) must not
-            // interleave across concurrent requests on the same session.
-            await withSessionLock(session, async () => {
+            // #970: lock covers ONLY the fast state-mutating prep (prepare +
+            // preflight). forward() runs UNLOCKED below on purpose — holding it
+            // here would head-of-line-block every concurrent request sharing this
+            // session id (Claude Code subagents) behind one slow upstream stream.
+            // forward() re-acquires the lock around its own discrete mutation
+            // sections; do not re-wrap the whole forward in this lock.
+            const pendingForward = await withSessionLock(
+                session,
+                async (): Promise<{ body: string | Buffer; prepared: Prepared | null } | null> => {
                 const runPrepare = (): Prepared => {
                     const cs = resolveCompress(opts.routes, route?.rewrittenUrl, (parsed as { model?: string }).model, opts.compress);
                     const reasoningCfg = cs.reasoning;
@@ -1590,9 +1595,7 @@ async function handle(
                     if (mode === "intercept" && gatePre) prepared = runPrepare();
                     if (prepared?.codexForge) {
                         logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, prepared.body);
-                        await forward(req, res, opts, prepared.body, prepared, core, reqConfig, log, route, instanceId, affinity);
-                        rememberPluginMessages(sessionId, prepared.processedMessages, prepared.originalMessages, prepared.nudge);
-                        return;
+                        return { body: prepared.body, prepared };
                     }
                     // runPrepare may have mutated parsed before failing to forge.
                     // Normalize the original wire input only: fc_bili_* records
@@ -1604,8 +1607,7 @@ async function handle(
                     const why = mode !== "intercept" ? "BILI_CODEX_COMPACT=pass" : !gatePre ? "gate preconditions not met" : "transform/forge failed";
                     log("info", `[${session.id}] codex compaction_trigger request not intercepted (${why}) — forwarding ${normalized ? `with bili summaries normalized (replaced=${replaced}, dropped=${dropped})` : "verbatim"} (no preflight, no rebuild, no window clamp)`);
                     logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, forwardBody);
-                    await forward(req, res, opts, forwardBody, null, core, reqConfig, log, route, instanceId, affinity);
-                    return;
+                    return { body: forwardBody, prepared: null };
                 }
                 prepared = runPrepare();
                 if (!countTokens && !responsesCompact) {
@@ -1669,19 +1671,24 @@ async function handle(
                             }
                         }
                         logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0);
-                        return;
+                        return null;
                     }
                     prepared = outcome;
                 }
                 logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, prepared!.body);
-                await forward(req, res, opts, prepared!.body, prepared!, core, reqConfig, log, route, instanceId, affinity);
+                return { body: prepared!.body, prepared: prepared! };
+            });
+            if (pendingForward) {
+                await forward(req, res, opts, pendingForward.body, pendingForward.prepared, core, reqConfig, log, route, instanceId, affinity);
                 // Remember for ALL modes (not just plugin): wire clients (dsh,
                 // hermes, unplug'd pi) read the same panel via /__bili/plugin/status
-                // and need the nudge/breakdown sections too.
-                if (prepared) {
-                    rememberPluginMessages(sessionId, prepared.processedMessages, prepared.originalMessages, prepared.nudge);
+                // and need the nudge/breakdown sections too; locked so a racing
+                // plugin tool call sees a consistent window.
+                if (pendingForward.prepared) {
+                    const preparedToRemember = pendingForward.prepared;
+                    await withSessionLock(session, () => rememberPluginMessages(sessionId, preparedToRemember.processedMessages, preparedToRemember.originalMessages, preparedToRemember.nudge));
                 }
-            });
+            }
         } finally {
             releaseInFlight(session);
         }
@@ -3902,7 +3909,7 @@ async function forward(
             }
             const terminal = await observed;
             if (terminal === "completed") {
-                markNativeCompactionBoundary(prepared.session);
+                await withSessionLock(prepared.session, () => markNativeCompactionBoundary(prepared.session));
                 log("info", `[${prepared.session.id}] native Responses compact completed; rebase scheduled for next Responses turn`);
             } else {
                 log("warn", `[${prepared.session.id}] native compact response terminal=${terminal}; rebase NOT scheduled`);
@@ -4006,22 +4013,24 @@ async function forward(
                 : "";
             const systemPrompt = withMarkerIntegrityNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections)) + absorbSection;
             const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined);
-            const refreshFolded = (current: CoreMessage[]): CoreMessage[] => {
-                // #422: mirror the prepare's fold with the post-compress state so
-                // the re-request shows the compression the model just performed.
-                // Records from this loop round (acp_loop_* namespace) ride on top
-                // so the model still sees its own compress call + result.
-                const turn = core.processTurn({
-                    messages: prepared.originalMessages,
-                    state: prepared.session.state,
-                    config: loopConfig,
-                    tokenCount: prepared.session.stats.lastInputTokens,
-                    renderTags: prepared.renderTags ?? "text-only",
+            const refreshFolded = async (current: CoreMessage[]): Promise<CoreMessage[]> => {
+                return withSessionLock(prepared.session, () => {
+                    // #422: mirror the prepare's fold with the post-compress state so
+                    // the re-request shows the compression the model just performed.
+                    // Records from this loop round (acp_loop_* namespace) ride on top
+                    // so the model still sees its own compress call + result.
+                    const turn = core.processTurn({
+                        messages: prepared.originalMessages,
+                        state: prepared.session.state,
+                        config: loopConfig,
+                        tokenCount: prepared.session.stats.lastInputTokens,
+                        renderTags: prepared.renderTags ?? "text-only",
+                    });
+                    prepared.session.state = turn.state;
+                    const viewed = applyAbsorbView(turn.messages, turn.state, loopConfig, prepared.session.stats.lastInputTokens);
+                    const records = current.filter((m) => typeof m.id === "string" && m.id.startsWith("acp_loop_"));
+                    return repairResponsesAssistantOrdering(stripKernelSummaries([...viewed, ...records] as BiliMessage[], turn.state), prepared.originalMessages);
                 });
-                prepared.session.state = turn.state;
-                const viewed = applyAbsorbView(turn.messages, turn.state, loopConfig, prepared.session.stats.lastInputTokens);
-                const records = current.filter((m) => typeof m.id === "string" && m.id.startsWith("acp_loop_"));
-                return repairResponsesAssistantOrdering(stripKernelSummaries([...viewed, ...records] as BiliMessage[], turn.state), prepared.originalMessages);
             };
             const visibilityMarkers = resolveCompress(opts.routes, route?.rewrittenUrl, (parsedReq as { model?: string }).model, opts.compress).visibilityMarkers ?? true;
             const loop = runCompressLoop(
@@ -4118,11 +4127,11 @@ async function forward(
                     if (typeof out === "number") prepared.session.stats.outputTokens += out;
                 }
                 if (prepared.protocol === "openai") {
-                    rewriteOpenaiJsonResponse(json, ctx);
+                    await withSessionLock(prepared.session, () => rewriteOpenaiJsonResponse(json, ctx));
                 } else if (prepared.protocol === "responses") {
-                    rewriteResponsesJsonResponse(json, ctx);
+                    await withSessionLock(prepared.session, () => rewriteResponsesJsonResponse(json, ctx));
                 } else {
-                    rewriteJsonResponse(json, ctx);
+                    await withSessionLock(prepared.session, () => rewriteJsonResponse(json, ctx));
                 }
                 res.end(JSON.stringify(json));
             } catch {

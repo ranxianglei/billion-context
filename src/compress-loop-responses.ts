@@ -5,7 +5,7 @@ import {
 } from "acp-kernel";
 import { handleAcpStatus } from "./acp-status.js";
 import { handleAcpCache } from "./cache-ledger.js";
-import { lastCompressSuffix, type Session } from "./session.js";
+import { lastCompressSuffix, withSessionLock, type Session } from "./session.js";
 import { parseCompressInput, PROXY_TOOL_NAMES, MUTATING_PROXY_TOOLS, COMPRESS_TOOL_NAME, ACP_TEXT_OPEN, ACP_TEXT_CLOSE } from "./compress-tool.js";
 import { log as loggerLog } from "./logger.js";
 import { applyRanges } from "./stream.js";
@@ -217,7 +217,7 @@ export async function compressLoopResponsesJson(
             } catch (error) {
                 loggerLog("warn", `[acp-compress-args] ${call.name} JSON.parse failed: ${String(error)}`);
             }
-            const result = executeProxyTool(call.name, args, ctx);
+            const result = await withSessionLock(ctx.session, () => executeProxyTool(call.name, args, ctx));
             ctx.log(`[acp-proxy: responses JSON ${call.name} → ${result.slice(0, 120).replace(/\n/g, " ")}]`);
             if (ctx.visibilityMarkers !== false) inputItems.push({ type: "message", role: "developer", content: buildVisibilityMarker(call.name, result) });
         }
