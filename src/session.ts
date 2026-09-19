@@ -1,6 +1,7 @@
 import { createInitialState, type CompressionState, type Config, type CoreMessage } from "acp-kernel";
 import { createHash } from "node:crypto";
 import { getStore } from "./persist.js";
+import type { WireProtocol } from "./util.js";
 
 export type BlockView = { text: string; count: number };
 
@@ -45,7 +46,7 @@ export type Session = {
          *  be namespaced by protocol/provider (e.g.
          *  sessions/anthropic/bailian_<hash>.json) and a human can tell
          *  sessions apart at a glance. */
-        protocol?: "anthropic" | "openai" | "responses";
+        protocol?: WireProtocol;
         /** Upstream origin URL this session routes to. */
         upstreamOrigin?: string;
         /** Human-readable conversation label (the affinity token), e.g.

@@ -139,6 +139,30 @@ test("#780 openai: in-stream bare error object invalidates accumulated text", ()
     assert.equal(extractSummaryFromSse("openai", body), "");
 });
 
+// Gemini carries summary text in candidates[0].content.parts[].text, and a
+// `thought:true` part is the model's reasoning rather than summary output, so
+// it must not reach the summary. The wire reached production with no case here
+// at all — every one of these shapes was unverified (#829).
+const G_TEXT = (text: string, thought = false): string =>
+    `data: ${JSON.stringify({ candidates: [{ index: 0, content: { role: "model", parts: [{ text, ...(thought ? { thought: true } : {}) }] }, finishReason: "STOP" }] })}\n\n`;
+
+test("#780 google: text parts accumulate and thinking parts are skipped", () => {
+    assert.equal(extractSummaryFromSse("google", G_TEXT("weighing the segment", true) + G_TEXT("the ") + G_TEXT("summary")), "the summary");
+});
+
+test("#780 google: cleanly framed stream without a finishReason is tolerated (#764)", () => {
+    const bare = `data: ${JSON.stringify({ candidates: [{ index: 0, content: { role: "model", parts: [{ text: "lenient gemini text" }] } }] })}\n\n`;
+    assert.equal(extractSummaryFromSse("google", bare), "lenient gemini text");
+});
+
+test("#780 google: mid-frame truncation is rejected", () => {
+    assert.equal(extractSummaryFromSse("google", G_TEXT("partial ") + 'data: {"candidates":[{"content":{"parts":[{"tex'), "");
+});
+
+test("#780 google: in-stream error object invalidates accumulated text", () => {
+    assert.equal(extractSummaryFromSse("google", G_TEXT("kept ") + `data: ${JSON.stringify({ error: { code: 429, message: "quota exceeded" } })}\n\n`), "");
+});
+
 test("#780 CRLF-framed bodies are accepted", () => {
     const lf = R_DELTA("crlf ") + R_DELTA("ok") + R_COMPLETED("crlf ok");
     assert.equal(extractSummaryFromSse("responses", lf.replace(/\n/g, "\r\n")), "crlf ok");

@@ -45,7 +45,19 @@ import {
 } from "acp-kernel/wire";
 import { responsesToCoreWithToolImages as responsesToCore, patchResponsesInputWithToolImages as patchResponsesInput } from "./responses-tool-output.js";
 import { getSession, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive, detectUnannouncedHistoryRewrite, markCompactionBoundary, ensureCanonicalId, storeEffectiveConfig } from "./session.js";
-import { ABSORB_TOOL, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, COMPRESS_TOOL, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildAbsorbSystemPrompt, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withConversationIdNote, withMarkerIntegrityNote, withStagedCompressGuidance } from "./compress-tool.js";
+import {
+    coreToGoogle,
+    googleToCore,
+    googleSystemText,
+    injectGoogleSystem,
+    conversationSignalGoogle,
+    type GoogleContent,
+    type GoogleFunctionDeclaration,
+    type GoogleRequestBody,
+    type GoogleSystemInstruction,
+    type GoogleTool,
+} from "acp-kernel/wire";
+import { ABSORB_TOOL, ABSORB_TOOL_GOOGLE, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, COMPRESS_TOOL, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, buildAbsorbSystemPrompt, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withConversationIdNote, withMarkerIntegrityNote, withStagedCompressGuidance } from "./compress-tool.js";
 import { applyAbsorbView, absorbEnabled, absorbToolName, storeEffectiveAbsorb } from "./absorb.js";
 import { rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
@@ -71,6 +83,7 @@ import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeRe
 import { CODEX_COMPACT_HEALTH_RATIO, codexCompactMode, isCodexClient, hasCompactionTrigger, stripBiliCompactionItems, replaceBiliCompactionItems, codexCompactGate, codexCompactGatePre, buildTriggerForgeBody, mergeForgedSummaries } from "./codex-compact.js";
 import { stripAcpPanelMessages, stripAcpPanelResponsesInput } from "./acp-panel.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
+import { rewriteGoogleJsonResponse } from "./stream-google.js";
 import { rewriteResponsesJsonResponse } from "./stream-responses.js";
 import { observeResponsesTerminalState } from "./stream-terminal.js";
 import { emitPreflightError, emitStreamError } from "./stream-error.js";
@@ -80,7 +93,7 @@ import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } f
 import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRuntimeInfoFor, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream, getBlindTunnelStats } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
-import { BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageTotals, type WireProtocol } from "./util.js";
+import { BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageOutputTotal, usageTotals, type WireProtocol } from "./util.js";
 
 import { BILI_TUNNEL_HEADER, checkTunnelDestination, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
 import { dumpRejectedBody } from "./error-dump.js";
@@ -94,7 +107,7 @@ import { isSideRequest, outputBudgetField, restoreOutputBudget, SIDE_REQUEST_MAX
 import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead } from "./server/budget.js";
 import { bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./server/stream-io.js";
 
-export function resolveUpstream(_opts: ProxyOptions, reqUrl: string, req?: http.IncomingMessage): { upstream: string; rewrittenUrl: string; explicitProtocol?: "openai" | "anthropic" | "responses"; tunnel?: boolean } | undefined {
+export function resolveUpstream(_opts: ProxyOptions, reqUrl: string, req?: http.IncomingMessage): { upstream: string; rewrittenUrl: string; explicitProtocol?: WireProtocol; tunnel?: boolean } | undefined {
     // MITM mode: the request arrived over a CONNECT tunnel we terminated
     // locally (client set HTTP_PROXY and issued CONNECT host:443). The socket
     // carries the real upstream origin; the request path has no /bili/ prefix
@@ -120,10 +133,10 @@ export function resolveUpstream(_opts: ProxyOptions, reqUrl: string, req?: http.
     // client-side billion-context extensions (billion-context-pi / opencode-acp)
     // can detect it in their own baseUrl and self-disable, avoiding double
     // compression.
-    const KNOWN_PROTOCOLS = ["responses", "anthropic", "openai"] as const;
+    const KNOWN_PROTOCOLS = ["responses", "anthropic", "openai", "google"] as const;
     if (reqUrl.startsWith("/bili/")) {
         let rest = reqUrl.slice(6);
-        let explicitProtocol: "openai" | "anthropic" | "responses" | undefined;
+        let explicitProtocol: WireProtocol | undefined;
         for (const p of KNOWN_PROTOCOLS) {
             const prefix = `${p}/`;
             if (rest.startsWith(prefix + "http://") || rest.startsWith(prefix + "https://")) {
@@ -227,6 +240,36 @@ function armRequestWatchdog(req: http.IncomingMessage, res: http.ServerResponse,
     }) as typeof res.write;
     res.on("close", () => { if (timer) clearTimeout(timer); });
     arm();
+}
+
+/** Classify a Gemini native request path. The model and the method both live
+ *  in the path, never in the body: `/v1beta/models/<model>:streamGenerateContent`
+ *  (streaming, usually with `alt=sse`), `:generateContent` (single shot) and
+ *  `:countTokens`. Returns null for every other path (model listing, files,
+ *  cachedContents, the OpenAI-compatible `/v1beta/openai/...` mirror). */
+export type GooglePathKind = "stream-generate" | "generate" | "count-tokens";
+
+export function googlePathKind(urlPath: string): GooglePathKind | null {
+    if (urlPath.includes(":streamGenerateContent")) return "stream-generate";
+    if (urlPath.includes(":generateContent")) return "generate";
+    if (urlPath.includes(":countTokens")) return "count-tokens";
+    return null;
+}
+
+/** The Gemini request carries the model in the URL path, never in the body
+ *  (`POST /v1beta/models/gemini-3.8-flash:streamGenerateContent`). Every
+ *  model-keyed decision (window resolution, thresholds, the summarization
+ *  adapter, degenerate-turn analysis) reads it from here instead of
+ *  `parsed.model`. Returns undefined when the path carries no model or an
+ *  undecodable one. */
+export function googleModelFromPath(urlPath: string): string | undefined {
+    const m = /\/models\/([^/:?]+):(?:streamGenerateContent|generateContent|countTokens)\b/.exec(urlPath);
+    if (!m || !m[1]) return undefined;
+    try {
+        return decodeURIComponent(m[1]);
+    } catch {
+        return m[1];
+    }
 }
 
 export async function startServer(opts: ProxyOptions): Promise<http.Server> {
@@ -509,7 +552,7 @@ type Prepared = {
      *  text (collectBlockContent reads message text by id); processedMessages
      *  has compressed messages replaced with placeholders → empty content. */
     originalMessages: CoreMessage[];
-    protocol: "anthropic" | "openai" | "responses";
+    protocol: WireProtocol;
     stream: boolean;
     compressInjected: boolean;
     /** True when the session is driven by a cooperative agent-side plugin
@@ -525,6 +568,11 @@ type Prepared = {
      *  openai hoist (0.0.37). The fold space no longer carries it, so every
      *  rebuilt payload and compress-loop round must re-inject it. */
     openaiSystemText?: string;
+    /** Google wire: the client's own `systemInstruction` text (the kernel hoists
+     *  it out of the fold space) and the path-derived model. Both are needed to
+     *  rebuild `systemInstruction` and to synthesize chunks on every compress
+     *  loop round. */
+    google?: { system?: string; model?: string };
     nudge?: NudgeDecision;
     /** Render strategy the prepare used for processTurn ("none" for codex
      *  compaction triggers / ACP_RENDER_NONE). The #422 fold-refresh hook in
@@ -819,7 +867,10 @@ async function handle(
     let responsesCompact: boolean;
     let route: ReturnType<typeof resolveUpstream>;
     let upstreamOrigin: string;
-    let protocol: "anthropic" | "openai" | "responses" | null;
+    let protocol: WireProtocol | null;
+    /** Gemini's model, resolved from the request path (its body never carries
+     *  one). Undefined for every other protocol. */
+    let googleModel: string | undefined;
     // #903: cost clock starts BEFORE the body read — local= covers body
     // reception + parse + processTurn + rebuild/serialize, i.e. everything bili
     // does before handing off. inboundBytes stays the raw wire size (pre-decode).
@@ -859,8 +910,14 @@ async function handle(
                       ? "anthropic"
                       : urlPath.endsWith("/responses") || responsesCompact
                         ? "responses"
-                        : null
+                        : googlePathKind(urlPath) !== null
+                          ? "google"
+                          : null
                 : null);
+        // Gemini carries the model in the PATH, not the body — resolve it here so
+        // the window/config block below and every later model-keyed decision see
+        // it on a request whose body has no `model` field (#google).
+        googleModel = protocol === "google" ? googleModelFromPath(urlPath) : undefined;
         // Issue #99: decode body only for known protocols — passthrough requests
         // (e.g. GET /models) must forward raw bytes without content-encoding decode.
         if (protocol !== null && bodyBuffer.length > 0) {
@@ -953,6 +1010,10 @@ async function handle(
             return;
         }
     }
+    // The effective model for this request. Every wire carries it in the body
+    // except Gemini, whose URL path holds it (`/v1beta/models/<model>:…`).
+    const bodyModel = parsed && typeof parsed === "object" && "model" in parsed && typeof parsed.model === "string" ? parsed.model : undefined;
+    const requestModel = bodyModel ?? googleModel;
     // Capture the CLIENT's raw incoming request (before bili rebuilds) to
     // resolve whether codex sends previous_response_id + full input vs delta.
     if (opts.debug && parsed && typeof parsed === "object") {
@@ -996,7 +1057,9 @@ async function handle(
     let wsSourceForLog: string | undefined;
     let reqModelId: string | undefined;
     if (parsed && typeof parsed === "object") {
-        const model = (parsed as { model?: string }).model;
+        // Gemini's model lives in the request path, every other wire carries it
+        // in the body — either way the window/config block below needs one.
+        const model = requestModel;
         reqModelId = typeof model === "string" ? model : undefined;
         if (model) {
             const embeddedUrl = route?.rewrittenUrl;
@@ -1192,7 +1255,24 @@ async function handle(
                   parsed as { prompt_cache_key?: unknown },
               )
             : undefined;
-        const conversation = protocol === "anthropic"
+        // Gemini native wire: no conversation-header convention, and no
+        // prompt_cache_key to promote (a Gemini body has no such field, so the
+        // omp plugin cannot stamp one). Identity therefore rests on the
+        // client's own conversation header when it sends one, and on content
+        // prefix affinity over `contents` otherwise (anonymous branch, #309).
+        const googleSignal = protocol === "google"
+            ? conversationSignalGoogle(parsed as GoogleRequestBody, convHeader)
+            : "";
+        const googleIdentity = protocol === "google"
+            ? {
+                  value: googleSignal,
+                  source: convHeader ? ("header" as const) : ("content-fingerprint" as const),
+                  clientProvided: !!convHeader,
+              }
+            : undefined;
+        const conversation = protocol === "google"
+            ? (googleIdentity?.value ?? googleSignal)
+            : protocol === "anthropic"
             ? // #970: a subagent's conversation value gets its own
               // `<id>|sub:<agent-id>` namespace so it lands on its own session
               // (own lock chain, own compression state) instead of queueing
@@ -1228,7 +1308,9 @@ async function handle(
               ? (openaiIdentity?.clientProvided ?? false)
               : protocol === "anthropic"
                 ? (anthropicIdentity?.clientProvided ?? false)
-                : !!convHeader;
+                : protocol === "google"
+                  ? (googleIdentity?.clientProvided ?? false)
+                  : !!convHeader;
         // Anonymous fallback (#309): clients with no identity signal at all
         // (no headers, no session_id/prompt_cache_key) still replay their full
         // history — resolve them by longest-prefix affinity instead of the
@@ -1239,8 +1321,10 @@ async function handle(
         let anonAffinity: AnonymousAffinity | null = null;
         if (!clientProvided) {
             const anonMessages = protocol === "responses"
-                ? (parsed as { input?: unknown }).input ?? []
-                : (parsed as { messages?: unknown }).messages ?? [];
+                ? ((parsed as { input?: unknown }).input ?? [])
+                : protocol === "google"
+                  ? ((parsed as GoogleRequestBody).contents ?? [])
+                  : ((parsed as { messages?: unknown }).messages ?? []);
             anonAffinity = prefixAffinity.resolve(Array.isArray(anonMessages) ? anonMessages : []);
             if (!anonAffinity) {
                 log("warn", `400: no stable conversation identity on ${protocol} request → ${upstreamOrigin}; refusing to create a content-fingerprint session (#286)`);
@@ -1272,7 +1356,7 @@ async function handle(
         //    body.session_id) — never the synthetic one — so a user can tell
         //    at a glance which client owns a session. pi sends nothing, so its
         //    label stays empty (shown as "—" in the UI).
-        const bodyIdentity = responsesIdentity ?? openaiIdentity ?? anthropicIdentity;
+        const bodyIdentity = responsesIdentity ?? openaiIdentity ?? anthropicIdentity ?? googleIdentity;
         const affinity = affinityToken(bodyIdentity ?? {
             value: clientConv ?? conversation,
             source: clientConv ? "header" : "generated",
@@ -1385,7 +1469,7 @@ async function handle(
             // guaranteed upstream 400 (and title-gen/probe clients re-issue it,
             // hammering the upstream). Gate on the raw body estimate and fail
             // fast locally instead of forwarding (#301 precedent).
-            const reqModel = (parsed as { model?: string }).model;
+            const reqModel = requestModel;
             const armedForGuard = session.stats.lastInputTokensSource === "usage" ? session.stats.lastInputTokens : 0;
             const guard = sideRequestGuard(parsed, protocol, reqConfig.modelContextLimit, imageBillingFor(opts, route?.rewrittenUrl ?? upstreamOrigin), headroomCap, armedForGuard);
             if (guard.blocked) {
@@ -1548,7 +1632,7 @@ async function handle(
             // interleave across concurrent requests on the same session.
             await withSessionLock(session, async () => {
                 const runPrepare = (): Prepared => {
-                    const cs = resolveCompress(opts.routes, route?.rewrittenUrl, (parsed as { model?: string }).model, opts.compress);
+                    const cs = resolveCompress(opts.routes, route?.rewrittenUrl, requestModel, opts.compress);
                     const reasoningCfg = cs.reasoning;
                     const keepRecent = cs.stripImagesKeepRecent ?? DEFAULT_STRIP_IMAGES_KEEP_RECENT;
                     const stripped = cs.stripImages
@@ -1558,19 +1642,28 @@ async function handle(
                         log("info", `[debug] strip-images: dropped ${stripped.removed} historical image part(s), kept last ${keepRecent} (session=${session.id})`);
                     }
                     const work = stripped.body;
-                    return countTokens
-                        ? prepareCountTokens(work as AnthropicRequestBody, core, reqConfig, log, session)
-                        : protocol === "anthropic"
-                          ? prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg)
-                          : protocol === "openai"
-                              ? prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, route?.rewrittenUrl)
-                             : responsesCompact
-                                // #618 review nit: when no bili compaction item is present,
-                                // prepareResponsesCompact falls back to the raw bodyBuffer — forward
-                                // the re-serialized post-strip work instead so dropped images don't
-                                // ride along. Unchanged bodies keep the original buffer byte-identical.
-                                ? prepareResponsesCompact(stripped.removed > 0 ? Buffer.from(JSON.stringify(work)) : bodyBuffer, work as ResponsesRequestBody, session, req, core, reqConfig, log)
-                                : prepareResponses(work as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, route?.rewrittenUrl);
+                    if (countTokens) {
+                        return protocol === "google"
+                            ? prepareGoogleCountTokens(work as GoogleRequestBody, core, reqConfig, log, session)
+                            : prepareCountTokens(work as AnthropicRequestBody, core, reqConfig, log, session);
+                    }
+                    if (protocol === "google") {
+                        // Both the model and the stream flag live in the URL path
+                        // for this wire (the body carries neither), so they are
+                        // derived here instead of read off `work`.
+                        return prepareGoogle(work as GoogleRequestBody, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, nativeWindow, googleModel, googlePathKind(urlPath) === "stream-generate");
+                    }
+                    return protocol === "anthropic"
+                        ? prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg)
+                        : protocol === "openai"
+                          ? prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, route?.rewrittenUrl)
+                          : responsesCompact
+                            // #618 review nit: when no bili compaction item is present,
+                            // prepareResponsesCompact falls back to the raw bodyBuffer — forward
+                            // the re-serialized post-strip work instead so dropped images don't
+                            // ride along. Unchanged bodies keep the original buffer byte-identical.
+                            ? prepareResponsesCompact(stripped.removed > 0 ? Buffer.from(JSON.stringify(work)) : bodyBuffer, work as ResponsesRequestBody, session, req, core, reqConfig, log)
+                            : prepareResponses(work as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, route?.rewrittenUrl);
                 };
                 // #332: codex's native remote-compaction request (trigger form)
                 // is dispatched BEFORE prepare/preflight. When it is not
@@ -1619,7 +1712,7 @@ async function handle(
                         core,
                         reqConfig,
                         nativeWindow,
-                        (parsed as { model?: string }).model,
+                        requestModel,
                         route,
                         affinity,
                         anonAffinity !== null,
@@ -2271,6 +2364,182 @@ function prepareOpenai(
     return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, openaiSystemText, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" } as Prepared;
 }
 
+/** Append the ephemeral nudge to a Gemini `contents` array. Gemini is
+ *  strict about role alternation, so a trailing user turn is merged into
+ *  rather than appended to (the nudge then reads as the model's last input,
+ *  which is where it belongs); a model-final history gets a fresh user turn
+ *  because a request must not end on the model side. */
+function appendGoogleNudge(contents: GoogleContent[], text: string): GoogleContent[] {
+    const last = contents[contents.length - 1];
+    if (last && (last.role ?? "user") !== "model") {
+        const parts = Array.isArray(last.parts) ? last.parts : [];
+        return [...contents.slice(0, -1), { ...last, parts: [...parts, { text }] }];
+    }
+    return [...contents, { role: "user", parts: [{ text }] }];
+}
+
+/** Gemini native wire (`POST /v1beta/models/<model>:generateContent|
+ *  :streamGenerateContent`): the OpenAI branch's twin — hoist the system
+ *  dimension out of the fold space, fold, re-inject — with three wire-specific
+ *  differences:
+ *    - the model, and whether the reply streams, live in the URL PATH, so the
+ *      caller passes both in (the body carries neither);
+ *    - the system rides in `systemInstruction`, never inside `contents`;
+ *    - Gemini rejects non-alternating roles, which coreToGoogle enforces by
+ *      merging same-side core runs, so the nudge merges into the trailing user
+ *      turn instead of starting a new one.
+ *  #651's reasoning drop deliberately does NOT apply here: Gemini 3 validates
+ *  the `thoughtSignature` of replayed parts, and dropping a thought part takes
+ *  its signature with it (400 INVALID_ARGUMENT). */
+function prepareGoogle(
+    parsed: GoogleRequestBody,
+    opts: ProxyOptions,
+    core: CompressionCore,
+    config: Config,
+    prompts: Prompts,
+    surface: PackSurface,
+    log: (level: string, msg: string) => void,
+    session: Session,
+    pluginMode: boolean,
+    nativeWindow: number,
+    model: string | undefined,
+    stream: boolean,
+): Prepared {
+    const sessionId = session.id;
+    ++session.stats.requests;
+    let googleClientSystem = "";
+    let googleOutboundSystem: string | undefined;
+    let systemInstruction: GoogleSystemInstruction | undefined = parsed.systemInstruction;
+    let processedMessages: CoreMessage[] = [];
+    let originalMessages: CoreMessage[] = [];
+    let nudge: NudgeDecision | undefined;
+    let rebuiltContents: GoogleContent[] = Array.isArray(parsed.contents) ? parsed.contents : [];
+    let toolsOut: GoogleTool[] | undefined = parsed.tools;
+
+    const genConfig = parsed.generationConfig;
+    const declaredMax = genConfig ? genConfig.maxOutputTokens : undefined;
+    const maxTokens = typeof declaredMax === "number" ? declaredMax : 8192;
+    // Title-generation requests (tiny budget) get no compress tooling — same
+    // heuristic and same prefix-cache rationale as prepareOpenai.
+    const isTitleGen = maxTokens <= 200;
+    const shouldInject = opts.compress.injectTool && !isTitleGen;
+    const injectTools = shouldInject && !pluginMode;
+
+    try {
+        const { msgs, systemText } = googleToCore(parsed);
+        googleClientSystem = systemText;
+        originalMessages = msgs;
+        const tokenCount = effectiveTokenCount(session, msgs);
+        const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
+        const absorbActive = absorbEnabled(config) && shouldInject;
+        const loopConfig = absorbActive ? config : { ...config, absorb: undefined };
+        const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: "text-only" });
+        session.state = turn.state;
+        // The fold from last turn's compress has materialized in state — future
+        // usage reports are post-fold reality, drop the credit.
+        session.stats.compressCreditTokens = 0;
+        storeEffectiveAbsorb(session, loopConfig);
+        turn.messages = applyAbsorbView(turn.messages, session.state, loopConfig, tokenCount);
+        // Drop sub-viability fragments before any consumer sees them (the
+        // kernel validates a compress batch atomically).
+        if (turn.nudge) turn.nudge.compressibleRanges = viableRanges(turn.nudge.compressibleRanges);
+        nudge = turn.nudge;
+        session.stats.contextTokens = tokenCount;
+        if (!session.meta.title) {
+            const t = deriveTitle(msgs);
+            if (t) session.meta.title = t;
+        }
+        log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
+        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
+        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, model, willInjectNudge));
+        processedMessages = stripKernelSummaries(turn.messages, turn.state);
+        applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
+        reapOrphanBlocks(session, msgs, deactivateBlock);
+        rebuiltContents = coreToGoogle(processedMessages as BiliMessage[]);
+
+        // ONLY the static compress prompt joins the client's system text — the
+        // system instruction is the prefix-cache anchor and must stay
+        // byte-stable across turns. The per-turn nudge is appended to the
+        // trailing user content below (see prepareOpenai for the rationale).
+        const sysParts: string[] = [];
+        if (systemText) sysParts.push(systemText);
+        if (shouldInject) sysParts.push(withMarkerIntegrityNote(buildCompressSystemPrompt(prompts, surface?.promptSections)));
+        if (absorbActive) sysParts.push(buildAbsorbSystemPrompt(absorbToolName(config)));
+        googleOutboundSystem = sysParts.join("\n\n");
+        // Untouched when nothing was added beyond the client's own text: the
+        // original `systemInstruction` object then rides through byte-identical
+        // instead of being re-serialized into a new shape.
+        const extraSystemParts = sysParts.slice(systemText ? 1 : 0);
+        systemInstruction = extraSystemParts.length > 0 ? { parts: sysParts.map((text) => ({ text })) } : parsed.systemInstruction;
+        if (injectTools) {
+            toolsOut = injectGoogleTool(parsed.tools, absorbActive ? ABSORB_TOOL_GOOGLE : undefined);
+        }
+        if (willInjectNudge && turn.nudge) {
+            try {
+                const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections);
+                if (rendered.text) {
+                    rebuiltContents = appendGoogleNudge(rebuiltContents, withMarkerIntegrityNote(withStagedCompressGuidance(rendered.text)));
+                }
+            } catch {
+            }
+        }
+    } catch (err) {
+        log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
+        processedMessages = [];
+    }
+
+    const rebuilt: GoogleRequestBody = { ...parsed, contents: rebuiltContents, tools: toolsOut, systemInstruction };
+    clampOutgoingOutput(rebuilt as Record<string, unknown>, "generationConfig.maxOutputTokens", { systemText: googleClientSystem, tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, nativeWindow, imageTokens: imageTokensInParsedBody("google", rebuilt) }, sessionId, log);
+    // #532: title-gen side requests carry their own tiny system — skip them.
+    if (!isTitleGen && googleOutboundSystem !== undefined) {
+        session.metadata.systemPromptTokens = countSystemAndToolsTokens(googleOutboundSystem, toolsOut);
+    }
+    snapshotMessages(session, originalMessages);
+    markDirty(session);
+    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "google", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, google: { system: googleClientSystem, model }, renderTags: "text-only" } as Prepared;
+}
+
+/** `POST /v1beta/models/<model>:countTokens` — the fold-prune twin of
+ *  prepareCountTokens: the client measures the payload the proxy would
+ *  actually forward. Gemini's endpoint reads `contents`/`systemInstruction`
+ *  and answers `{totalTokens}`, so only the contents array is rewritten. */
+export function prepareGoogleCountTokens(
+    parsed: GoogleRequestBody,
+    core: CompressionCore,
+    config: Config,
+    log: (level: string, msg: string) => void,
+    session: Session,
+): Prepared {
+    const sessionId = session.id;
+    try {
+        const { msgs } = googleToCore(parsed);
+        const turn = core.processTurn({ messages: msgs, state: session.state, config, tokenCount: session.stats.lastInputTokens, renderTags: "text-only" });
+        const stripped = stripKernelSummaries(turn.messages, turn.state);
+        const rebuilt: GoogleRequestBody = { ...parsed, contents: coreToGoogle(stripped as BiliMessage[]) };
+        log("info", `[${sessionId}] countTokens pruned: ${msgs.length} → ${stripped.length} msgs`);
+        return {
+            body: JSON.stringify(rebuilt),
+            session,
+            processedMessages: [],
+            originalMessages: msgs,
+            protocol: "google",
+            stream: false,
+            compressInjected: false,
+        };
+    } catch (err) {
+        log("warn", `[${sessionId}] countTokens prune failed, forwarding unchanged: ${String(err)}`);
+        return {
+            body: JSON.stringify({ ...parsed }),
+            session,
+            processedMessages: [],
+            originalMessages: [],
+            protocol: "google",
+            stream: false,
+            compressInjected: false,
+        };
+    }
+}
+
 function prepareResponses(
     parsed: ResponsesRequestBody,
     req: http.IncomingMessage,
@@ -2562,7 +2831,7 @@ export function isCountTokensRequest(method: string, urlPath: string, hasBody: b
         method === "POST" &&
         hasBody &&
         process.env.ACP_COUNT_TOKENS_PASSTHROUGH !== "1" &&
-        urlPath.endsWith("/messages/count_tokens")
+        (urlPath.endsWith("/messages/count_tokens") || googlePathKind(urlPath) === "count-tokens")
     );
 }
 
@@ -2789,6 +3058,25 @@ function injectOpenaiTool(tools: OpenAITool[] | undefined, extra?: OpenAITool, t
     return out;
 }
 
+/** Merge the ACP declarations into the client's Gemini `tools` array. Gemini
+ *  nests declarations one level deeper than the OpenAI shape
+ *  (`tools[].functionDeclarations[]`), so presence is collected across every
+ *  entry and the missing declarations are appended as one new entry. */
+function injectGoogleTool(tools: GoogleTool[] | undefined, extra?: { name: string }, toolPrompts?: ToolPrompts): GoogleTool[] {
+    const acp = applyAcpToolOverrides(BILI_ACP_TOOLS_GOOGLE, toolPrompts) as GoogleFunctionDeclaration[];
+    const wanted: { name: string }[] = extra ? [...acp, extra] : [...acp];
+    if (!Array.isArray(tools)) return [{ functionDeclarations: wanted as GoogleFunctionDeclaration[] }];
+    const present = new Set<string>();
+    for (const tool of tools) {
+        for (const decl of tool?.functionDeclarations ?? []) {
+            if (typeof decl?.name === "string") present.add(decl.name);
+        }
+    }
+    const missing = wanted.filter((t) => !present.has(t.name));
+    if (missing.length === 0) return tools;
+    return [...tools, { functionDeclarations: missing as GoogleFunctionDeclaration[] }];
+}
+
 /** When true, the Responses path teaches compression via a text trigger
  *  instead of a function tool. Used for hosts (OpenAI Codex code_mode) whose
  *  server-side tools are disabled the moment any `tools` entry is declared.
@@ -2840,10 +3128,11 @@ function logUpstreamProxyDecision(opts: ProxyOptions, upstreamUrl: string | unde
 /** Infer the wire protocol from the request path for compat-role rewrites on
  *  requests the pipeline did not prepare (passthrough). Mirrors the path
  *  checks in handleRequest; returns null when unknown (no rewrite). */
-function inferWireProtocol(path: string): "openai" | "responses" | null {
+function inferWireProtocol(path: string): "openai" | "responses" | "google" | null {
     const p = path.split("?", 2)[0];
     if (p.endsWith("/chat/completions") || p.endsWith("/llm_raw_chat")) return "openai";
     if (p.endsWith("/responses") || p.endsWith("/responses/compact")) return "responses";
+    if (googlePathKind(p) !== null) return "google";
     return null;
 }
 
@@ -4005,7 +4294,7 @@ async function forward(
                 ? `\n\n---\n\n${buildAbsorbSystemPrompt(absorbToolName(loopConfig))}`
                 : "";
             const systemPrompt = withMarkerIntegrityNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections)) + absorbSection;
-            const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined);
+            const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.google);
             const refreshFolded = (current: CoreMessage[]): CoreMessage[] => {
                 // #422: mirror the prepare's fold with the post-compress state so
                 // the re-request shows the compression the model just performed.
@@ -4096,9 +4385,12 @@ async function forward(
                 //   Anthropic: input_tokens / cache_read_input_tokens / output_tokens
                 //   OpenAI: prompt_tokens / prompt_tokens_details.cached_tokens / completion_tokens
                 //   Responses: input_tokens / input_tokens_details.cached_tokens / output_tokens
+                //   Google: usageMetadata — promptTokenCount / cachedContentTokenCount /
+                //     candidatesTokenCount + thoughtsTokenCount
                 // usageTotals() normalizes the per-protocol semantics so
                 // `total` is always the true context size (see util.ts).
-                const u = (json.usage ?? {}) as Record<string, unknown>;
+                const rawUsage = prepared.protocol === "google" ? json.usageMetadata ?? json.usage : json.usage;
+                const u = (rawUsage ?? {}) as Record<string, unknown>;
                 const { total, cached } = usageTotals(prepared.protocol, u);
                 if (typeof total === "number") {
                     prepared.session.stats.inputTokens += total;
@@ -4114,13 +4406,15 @@ async function forward(
                         prepared.session.stats.cachedTokens += cached;
                         prepared.session.stats.cacheSamples += 1;
                     }
-                    const out = u.completion_tokens ?? u.output_tokens;
+                    const out = usageOutputTotal(prepared.protocol, u);
                     if (typeof out === "number") prepared.session.stats.outputTokens += out;
                 }
                 if (prepared.protocol === "openai") {
                     rewriteOpenaiJsonResponse(json, ctx);
                 } else if (prepared.protocol === "responses") {
                     rewriteResponsesJsonResponse(json, ctx);
+                } else if (prepared.protocol === "google") {
+                    rewriteGoogleJsonResponse(json, ctx);
                 } else {
                     rewriteJsonResponse(json, ctx);
                 }

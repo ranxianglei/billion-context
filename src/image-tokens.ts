@@ -208,9 +208,27 @@ function urlOf(v: unknown): string | undefined {
     return undefined;
 }
 
-export function imageTokensInParsedBody(protocol: "anthropic" | "openai" | "responses", body: unknown, billing: ResolvedImageBilling = "bytes"): number {
+export function imageTokensInParsedBody(protocol: "anthropic" | "openai" | "responses" | "google", body: unknown, billing: ResolvedImageBilling = "bytes"): number {
     if (!isObj(body)) return 0;
     let total = 0;
+    if (protocol === "google") {
+        // Gemini carries images as `inlineData` (raw base64 in `data`) or
+        // `fileData` (a remote `fileUri`) PARTS of `contents[].parts` — there is
+        // no separate content-array layer and no `type` discriminator.
+        const contents = body.contents;
+        if (!Array.isArray(contents)) return 0;
+        for (const c of contents) {
+            if (!isObj(c) || !Array.isArray(c.parts)) continue;
+            for (const part of c.parts) {
+                if (!isObj(part)) continue;
+                const inline = part.inlineData;
+                if (isObj(inline) && typeof inline.data === "string") total += base64ImageCost(inline.data, billing);
+                const file = part.fileData;
+                if (isObj(file) && typeof file.fileUri === "string") total += costForUrl(file.fileUri, billing);
+            }
+        }
+        return total;
+    }
     if (protocol === "responses") {
         const input = body.input;
         if (!Array.isArray(input)) return 0;
@@ -250,10 +268,11 @@ export function imageTokensInParsedBody(protocol: "anthropic" | "openai" | "resp
 // Cheap gate: most bodies carry no images — skip the JSON parse entirely then.
 // prepared.body is bili's own compact JSON.stringify, but client raw buffers
 // may carry spaces, so probe both forms.
-export function imageTokensInRawBody(protocol: "anthropic" | "openai" | "responses", raw: string | Buffer, billing: ResolvedImageBilling = "bytes"): number {
+export function imageTokensInRawBody(protocol: "anthropic" | "openai" | "responses" | "google", raw: string | Buffer, billing: ResolvedImageBilling = "bytes"): number {
     const s = typeof raw === "string" ? raw : raw.toString("utf8");
     const probe =
-        protocol === "responses" ? s.includes("input_image")
+        protocol === "google" ? s.includes("inlineData") || s.includes("fileData")
+        : protocol === "responses" ? s.includes("input_image")
         : protocol === "openai" ? s.includes("image_url")
         : s.includes('"type":"image"') || s.includes('"type": "image"');
     if (!probe) return 0;

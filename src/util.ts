@@ -47,7 +47,7 @@ export function isLoopbackAddress(addr: string | undefined): boolean {
     return !!addr && (addr.startsWith("127.") || addr === "::1" || addr.startsWith("::ffff:127."));
 }
 
-export type WireProtocol = "anthropic" | "openai" | "responses";
+export type WireProtocol = "anthropic" | "openai" | "responses" | "google";
 
 /**
  * Compute the true TOTAL input-token count and the cached subset from a
@@ -63,6 +63,8 @@ export type WireProtocol = "anthropic" | "openai" | "responses";
  *     normalized here, #779).
  *   - Responses: `input_tokens` is the TOTAL — it ALREADY includes the
  *     `input_tokens_details.cached_tokens` subset.
+ *   - Google: `promptTokenCount` is the TOTAL of the `usageMetadata` object —
+ *     it ALREADY includes the `cachedContentTokenCount` subset.
  *
  * The nudge decision (context size) and the cache-hit ratio both need the
  * TOTAL. The previous code computed `prompt + cached` uniformly, which is only
@@ -96,6 +98,17 @@ export function usageTotals(
             cached,
         };
     }
+    if (protocol === "google") {
+        // Gemini reports the whole context as promptTokenCount, already
+        // including the cachedContentTokenCount prefix (cached implicit
+        // caching) — the OpenAI/Responses shape, not Anthropic's split one.
+        const prompt = num(usage["promptTokenCount"]);
+        const cached = num(usage["cachedContentTokenCount"]);
+        return {
+            total: prompt !== undefined ? promptInputTotal("google", prompt, cached) : undefined,
+            cached,
+        };
+    }
     // responses
     return {
         total: num(usage["input_tokens"]),
@@ -121,12 +134,29 @@ export function promptInputTotal(
     creation?: number,
 ): number {
     if (input === undefined) return 0;
-    const includesCached = protocol === "openai" || protocol === "responses";
+    const includesCached = protocol === "openai" || protocol === "responses" || protocol === "google";
     const splitSemantics = !includesCached || (typeof cached === "number" && input < cached);
     const additive =
         (splitSemantics && typeof cached === "number" ? cached : 0) +
         (splitSemantics && typeof creation === "number" ? creation : 0);
     return input + additive;
+}
+
+/** Output-side counterpart of usageTotals: the tokens the upstream billed for
+ *  the reply. Google splits the number — `candidatesTokenCount` (visible text)
+ *  plus `thoughtsTokenCount` (thinking), both billed — while every other wire
+ *  reports a single field (kept permissive: some OpenAI-wire upstreams answer
+ *  with `output_tokens`). Returns undefined when nothing was reported. */
+export function usageOutputTotal(protocol: WireProtocol, usage: Record<string, unknown>): number | undefined {
+    const num = (v: unknown): number | undefined =>
+        typeof v === "number" && Number.isFinite(v) ? v : undefined;
+    if (protocol === "google") {
+        const candidates = num(usage["candidatesTokenCount"]);
+        const thoughts = num(usage["thoughtsTokenCount"]);
+        if (candidates === undefined && thoughts === undefined) return undefined;
+        return (candidates ?? 0) + (thoughts ?? 0);
+    }
+    return num(usage["completion_tokens"]) ?? num(usage["output_tokens"]);
 }
 
 /** Result of inspecting an upstream response for a "context too long" error. */
@@ -164,6 +194,9 @@ const CONTEXT_OVERFLOW_PATTERNS: RegExp[] = [
     // side requests that bypass preflight; its number arms the emergency shrink.
     // #570: its body also carries the real window, see parseOverflowWindow.
     /exceed[_\s]?context[_\s]?size/i,
+    // Gemini (generativelanguage.googleapis.com) 400 INVALID_ARGUMENT:
+    // "The input token count (N) exceeds the maximum number of tokens allowed (W)."
+    /exceeds the maximum number of tokens/i,
 ];
 
 function toTokenNumber(s: string): number | undefined {
@@ -184,6 +217,11 @@ function parseOverflowWindow(text: string): number | undefined {
     // (llama.cpp family) — A/B are payload sizes; only the number after ">" inside
     // the parens is the limit.
     m = text.match(/\(\s*\d[\d,]*\s*\/\s*\d[\d,]*\s*>\s*(\d[\d,]+)\s*\)/);
+    if (m) return toTokenNumber(m[1]);
+    // Gemini: "The input token count (1012345) exceeds the maximum number of
+    // tokens allowed (1048576)." — the number after "allowed" is the window; the
+    // first parenthesized number is the rejected payload and must not be used.
+    m = text.match(/maximum number of tokens allowed\s*\((\d[\d,]*)\)/i);
     if (m) return toTokenNumber(m[1]);
     m =
         text.match(/maximum context length is (\d[\d,]*)/i) ??

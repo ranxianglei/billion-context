@@ -13,7 +13,7 @@
 // is byte-identical downstream. Content-hash message ids shift once per message
 // when it ages out of the recent-N window (self-healing via orphan-GC).
 
-export type StripProtocol = "anthropic" | "openai" | "responses" | null;
+export type StripProtocol = "anthropic" | "openai" | "responses" | "google" | null;
 
 export interface StripResult {
     body: unknown;
@@ -31,14 +31,19 @@ function isObj(v: unknown): v is Record<string, unknown> {
 
 function isImagePart(protocol: Exclude<StripProtocol, null>, part: unknown): boolean {
     if (!isObj(part)) return false;
+    // Gemini has no per-part `type` discriminator: an image IS a part carrying
+    // an inlineData / fileData payload.
+    if (protocol === "google") return part.inlineData !== undefined || part.fileData !== undefined;
     if (protocol === "responses") return part.type === "input_image";
     if (protocol === "openai") return part.type === "image_url";
     return part.type === "image";
 }
 
 /** A single text part standing in for a dropped image-only payload. Responses
- *  uses `input_text`; OpenAI chat + Anthropic use `text`. */
+ *  uses `input_text`; OpenAI chat + Anthropic use `text`; Gemini parts are
+ *  undiscriminated — a bare `{text}` part. */
 function placeholderContent(protocol: Exclude<StripProtocol, null>): Record<string, unknown>[] {
+    if (protocol === "google") return [{ text: IMAGE_PLACEHOLDER }];
     const type = protocol === "responses" ? "input_text" : "text";
     return [{ type, text: IMAGE_PLACEHOLDER }];
 }
@@ -68,6 +73,32 @@ export function stripHistoricalImages(body: unknown, protocol: StripProtocol, ke
         });
         if (!touched) return { body, removed: 0 };
         return { body: { ...body, input: nextInput }, removed };
+    }
+
+    if (protocol === "google") {
+        // Gemini images are inlineData / fileData PARTS inside a content's
+        // parts array — dropping them leaves the surrounding text parts of the
+        // same content intact (the analogue of the per-message content arrays).
+        const contents = body.contents;
+        if (!Array.isArray(contents)) return { body, removed: 0 };
+        const cutoff = contents.length - recentCount;
+        let removed = 0;
+        let touched = false;
+        const nextContents = contents.map((c, i) => {
+            if (i < cutoff && isObj(c) && Array.isArray(c.parts)) {
+                const parts = c.parts as unknown[];
+                const imgs = parts.filter((p) => isImagePart("google", p)).length;
+                if (imgs > 0) {
+                    removed += imgs;
+                    touched = true;
+                    const kept = parts.filter((p) => !isImagePart("google", p));
+                    return { ...c, parts: kept.length > 0 ? kept : placeholderContent("google") };
+                }
+            }
+            return c;
+        });
+        if (!touched) return { body, removed: 0 };
+        return { body: { ...body, contents: nextContents }, removed };
     }
 
     const messages = body.messages;

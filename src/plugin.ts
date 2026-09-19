@@ -9,7 +9,7 @@ import { ABSORB_TOOL, ABSORB_TOOL_NAME, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSE
 import { effectiveAbsorbConfig, isProxyToolFor } from "./absorb.js";
 import { executeProxyTool } from "./loop/core.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
-import { composeStreamFilters, containsMarkerLineText, containsRenderTagText, createMarkerLineFilter, createTagEchoFilter, mayStartMarkerLine, mayStartRenderTag, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
+import { composeStreamFilters, containsMarkerLineText, containsRenderTagText, createMarkerLineFilter, createTagEchoFilter, mayStartMarkerLine, mayStartRenderTag, stripAcpTags, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
 import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
 import { degenerateTurnWarning } from "./degenerate-turn.js";
@@ -798,6 +798,23 @@ function num(v: unknown): number | undefined {
     return typeof v === "number" && Number.isFinite(v) ? v : undefined;
 }
 
+/** Gemini reports usage in a top-level `usageMetadata` object — identically on
+ *  an SSE chunk and on a non-streaming body: `promptTokenCount` is the whole
+ *  context (the `cachedContentTokenCount` prefix included) and thinking tokens
+ *  are billed ON TOP of the candidate's, so both count as output. */
+function googleUsageSample(obj: Record<string, unknown>): UsageSample | undefined {
+    const meta = obj["usageMetadata"];
+    if (!meta || typeof meta !== "object") return undefined;
+    const u = meta as Record<string, unknown>;
+    const cand = num(u["candidatesTokenCount"]);
+    const thoughts = num(u["thoughtsTokenCount"]);
+    return {
+        inputTokens: num(u["promptTokenCount"]),
+        outputTokens: cand === undefined && thoughts === undefined ? undefined : (cand ?? 0) + (thoughts ?? 0),
+        cachedTokens: num(u["cachedContentTokenCount"]),
+    };
+}
+
 function usageFromSseEvent(obj: Record<string, unknown>): UsageSample | undefined {
     const type = obj["type"];
     if (type === "message_start") {
@@ -845,6 +862,8 @@ function usageFromSseEvent(obj: Record<string, unknown>): UsageSample | undefine
             cachedTokens: num((usage["input_tokens_details"] as Record<string, unknown> | undefined)?.["cached_tokens"]),
         };
     }
+    const google = googleUsageSample(obj);
+    if (google) return google;
     const usage = obj["usage"] as Record<string, unknown> | undefined;
     if (usage && (num(usage["prompt_tokens"]) !== undefined || num(usage["completion_tokens"]) !== undefined)) {
         return {
@@ -997,6 +1016,21 @@ export async function pipePluginChatWithStrip(
         if (protocol === "anthropic") {
             const deltaType = s.field === "text" ? "text_delta" : s.field === "thinking" ? "thinking_delta" : "input_json_delta";
             return `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: s.index, delta: { type: deltaType, [s.field]: tail } })}\n\n`;
+        }
+        if (protocol === "google") {
+            // The tail rides a synthesized candidate chunk. It must REPEAT the
+            // finishReason observed so far (lastChunkMeta, set by processGoogle)
+            // because the Gemini client throws when the stream's final chunk
+            // carries none — flushing a held tail after the finishReason frame
+            // would otherwise end the stream reason-less.
+            const part = s.field === "thinking" ? { thought: true, text: tail } : { text: tail };
+            const candidate = {
+                index: s.index,
+                content: { role: "model", parts: [part] },
+                ...(typeof lastChunkMeta["finishReason"] === "string" ? { finishReason: lastChunkMeta["finishReason"] } : {}),
+            };
+            const frame = typeof lastChunkMeta["modelVersion"] === "string" ? { modelVersion: lastChunkMeta["modelVersion"], candidates: [candidate] } : { candidates: [candidate] };
+            return `data: ${JSON.stringify(frame)}\n\n`;
         }
         if (s.toolIndex !== undefined) {
             return `data: ${JSON.stringify({ ...lastChunkMeta, object: "chat.completion.chunk", choices: [{ index: s.choice ?? 0, delta: { tool_calls: [{ index: s.toolIndex, function: { arguments: tail } }] } }] })}\n\n`;
@@ -1154,7 +1188,7 @@ export async function pipePluginChatWithStrip(
         }
         const msg = degenerateTurnWarning({
             reason: finalFinishReason,
-            terminalReason: protocol === "anthropic" ? "end_turn" : "stop",
+            terminalReason: protocol === "anthropic" ? "end_turn" : protocol === "google" ? "STOP" : "stop",
             toolCalls: sawToolUse ? 1 : 0,
             text: { inputChars, outputChars: visibleTextChars, dropped },
             sawThinking,
@@ -1300,6 +1334,101 @@ export async function pipePluginChatWithStrip(
         if (clean.length === 0 && Object.keys(d ?? {}).length <= 2) return "";
         return rebuildEvent(rawEvent, { ...ev, delta: { ...d, [field]: clean } });
     };
+    /** Tag-echo state machine for the Gemini wire: prose AND reasoning live in
+     *  `candidates[*].content.parts[*].text` (a `thought:true` part is the
+     *  thinking). Multi-candidate streams and frames interleaving thought/text
+     *  parts are handled the way the OpenAI/Anthropic processors handle
+     *  choices/content blocks — one filter keyed per (candidate index, field) —
+     *  and a `finishReason` chunk is this wire's terminal event. */
+    const processGoogle = (ev: Record<string, unknown>, rawEvent: string): string => {
+        if (typeof ev["modelVersion"] === "string") lastChunkMeta = { ...lastChunkMeta, modelVersion: ev["modelVersion"] };
+        // A top-level `error` object is Gemini's other terminal shape (HTTP-level
+        // failures arrive mid-stream too): the client throws on it, so the turn
+        // is over and must not also be reported as an upstream truncation.
+        if (ev["error"] !== undefined) sawTerminal = true;
+        const candidates = ev["candidates"];
+        if (!Array.isArray(candidates)) {
+            return anyPending() ? flushTails() + rawEvent + "\n\n" : rawEvent + "\n\n";
+        }
+        let rebuilt: Record<string, unknown> | null = null;
+        let droppedText = false;
+        let keptText = false;
+        let hadText = false;
+        for (let ci = 0; ci < candidates.length; ci++) {
+            const cand = candidates[ci] as Record<string, unknown> | null;
+            if (!cand || typeof cand !== "object") continue;
+            if (typeof cand["finishReason"] === "string") {
+                // Gemini's terminal event IS this chunk — the client throws when
+                // a stream ends without one, so `lastChunkMeta` carries it for
+                // the synthetic tail (see syntheticTail).
+                finalFinishReason = cand["finishReason"] as string;
+                sawTerminal = true;
+                lastChunkMeta = { ...lastChunkMeta, finishReason: finalFinishReason };
+            }
+            const content = cand["content"];
+            if (!content || typeof content !== "object") continue;
+            const parts = (content as Record<string, unknown>)["parts"];
+            if (!Array.isArray(parts)) continue;
+            const index = typeof cand["index"] === "number" ? cand["index"] : ci;
+            for (let pi = 0; pi < parts.length; pi++) {
+                const p = parts[pi] as Record<string, unknown> | null;
+                if (!p || typeof p !== "object") continue;
+                if (p["functionCall"] !== undefined) sawToolUse = true;
+                if (p["thought"] === true) sawThinking = true;
+                const raw = p["text"];
+                if (typeof raw !== "string") continue;
+                hadText = true;
+                // A reasoning part streams through the same machine under its own
+                // field, so an interleaved thought/text pair in one frame never
+                // shares held-back state.
+                const field = p["thought"] === true ? "thinking" : "text";
+                if (!mayStartRenderTag(raw) && !mayStartMarkerLine(raw) && !anyPending()) {
+                    if (raw.length > 0) keptText = true;
+                    if (field === "text") visibleTextChars += raw.length;
+                    continue;
+                }
+                const [clean, changed] = pushField(field, index, raw);
+                if (clean.length === 0) droppedText = true;
+                else {
+                    keptText = true;
+                    if (field === "text") visibleTextChars += clean.length;
+                }
+                if (changed) {
+                    // Deep enough clone of the frame's candidates that the
+                    // rebuilt part's text can be replaced without mutating the
+                    // parsed event (callers keep `ev` for logs/usage).
+                    if (!rebuilt) {
+                        rebuilt = {
+                            ...ev,
+                            candidates: candidates.map((c) => {
+                                if (!c || typeof c !== "object") return c;
+                                const cand = { ...(c as Record<string, unknown>) };
+                                const cont = cand["content"];
+                                if (cont && typeof cont === "object" && Array.isArray((cont as Record<string, unknown>)["parts"])) {
+                                    const cc = cont as Record<string, unknown>;
+                                    cand["content"] = { ...cc, parts: (cc["parts"] as unknown[]).map((q) => (q && typeof q === "object" ? { ...(q as Record<string, unknown>) } : q)) };
+                                }
+                                return cand;
+                            }),
+                        };
+                    }
+                    const rparts = (((rebuilt["candidates"] as Record<string, unknown>[])[ci]["content"] as Record<string, unknown>)["parts"] as Record<string, unknown>[]);
+                    rparts[pi] = { ...rparts[pi], text: clean };
+                }
+            }
+        }
+        if (rebuilt) {
+            // Text carried was entirely stripped away: drop the whole chunk
+            // instead of forwarding an empty text part — but only when EVERY
+            // managed part emptied out and the frame carries nothing else (a
+            // finishReason / functionCall / usageMetadata sibling must survive,
+            // the chat processor's #463 rule).
+            if (droppedText && !keptText && !googleFrameHasNonText(rebuilt)) return "";
+            return rebuildEvent(rawEvent, rebuilt);
+        }
+        if (!hadText && anyPending()) return flushTails() + rawEvent + "\n\n";
+        return rawEvent + "\n\n";
+    };
     try {
         for (;;) {
             const { done, value } = await reader.read();
@@ -1357,7 +1486,9 @@ export async function pipePluginChatWithStrip(
                     // the uncompressed baseline. Patch `ev` BEFORE the tag-echo
                     // processors run and only rebuild when they return the event
                     // verbatim — otherwise their render-tag stripping is lost.
-                    const out = protocol === "anthropic" ? processAnthropic(ev, rawEvent) : processOpenai(ev, rawEvent);
+                    const out = protocol === "anthropic" ? processAnthropic(ev, rawEvent)
+                        : protocol === "google" ? processGoogle(ev, rawEvent)
+                        : processOpenai(ev, rawEvent);
                     // The gate runs AFTER this event is processed: a coalesced chunk
                     // can carry content AND the finish reason, so its own text has to
                     // count before the turn may be called empty. The event's output is
@@ -1428,6 +1559,32 @@ function hadTextOtherThanTextFields(choices: unknown): boolean {
         if (!d) continue;
         for (const k of Object.keys(d)) {
             if (k !== "content" && k !== "reasoning_content" && k !== "reasoning") return true;
+        }
+    }
+    return false;
+}
+
+/** The Gemini counterpart of hadTextOtherThanTextFields: does a frame whose
+ *  text parts were all stripped still carry something the client needs? A
+ *  finishReason, a functionCall/functionResponse part, usageMetadata or
+ *  promptFeedback keeps the chunk alive; a chunk that only ever held
+ *  render-tag echo is dropped whole. */
+function googleFrameHasNonText(ev: Record<string, unknown>): boolean {
+    if (ev["usageMetadata"] !== undefined || ev["promptFeedback"] !== undefined) return true;
+    const candidates = ev["candidates"];
+    if (!Array.isArray(candidates)) return true;
+    for (const c of candidates) {
+        if (!c || typeof c !== "object") continue;
+        const cand = c as Record<string, unknown>;
+        if (typeof cand["finishReason"] === "string") return true;
+        const content = cand["content"];
+        const parts = content && typeof content === "object" ? (content as Record<string, unknown>)["parts"] : undefined;
+        if (!Array.isArray(parts)) continue;
+        for (const p of parts) {
+            if (!p || typeof p !== "object") continue;
+            for (const k of Object.keys(p as Record<string, unknown>)) {
+                if (k !== "text" && k !== "thought" && k !== "thoughtSignature") return true;
+            }
         }
     }
     return false;
@@ -1906,6 +2063,50 @@ function rebuildEvent(rawEvent: string, ev: Record<string, unknown>): string {
     return replaced ? out.join("\n") + "\n\n" : `data: ${JSON.stringify(ev)}\n\n`;
 }
 
+// Plugin-passthrough parity for the Gemini wire: strip the model prose that
+// lives in `candidates[*].content.parts[*].text` — both plain text parts and
+// `thought:true` reasoning parts share that one field. Mirrors
+// stripOpenaiChatText / stripAnthropicText; mutates in place (the returned
+// reference is the input's).
+function stripGoogleChunk<T>(obj: T): T {
+    if (!obj || typeof obj !== "object") return obj;
+    const o = obj as Record<string, unknown>;
+    const candidates = o["candidates"];
+    if (!Array.isArray(candidates)) return obj;
+    o["candidates"] = candidates.map((c) => {
+        if (!c || typeof c !== "object") return c;
+        const cand = c as Record<string, unknown>;
+        const content = cand["content"];
+        if (!content || typeof content !== "object") return c;
+        const cont = content as Record<string, unknown>;
+        if (!Array.isArray(cont["parts"])) return c;
+        return {
+            ...cand,
+            content: {
+                ...cont,
+                parts: (cont["parts"] as unknown[]).map((p) =>
+                    p && typeof p === "object" && typeof (p as Record<string, unknown>)["text"] === "string"
+                        ? { ...(p as Record<string, unknown>), text: stripAcpTags((p as Record<string, unknown>)["text"] as string) }
+                        : p,
+                ),
+            },
+        };
+    });
+    return obj;
+}
+
+// Without `alt=sse` a Gemini streaming response is a JSON ARRAY of the same
+// chunk objects, so the non-stream strip applies to each element as well.
+function stripGoogleText<T>(obj: T): T {
+    if (Array.isArray(obj)) {
+        obj.forEach((c) => {
+            stripGoogleChunk(c);
+        });
+        return obj;
+    }
+    return stripGoogleChunk(obj);
+}
+
 export async function pipePluginJson(
     stream: ReadableStream<Uint8Array>,
     res: import("node:http").ServerResponse,
@@ -1956,6 +2157,17 @@ export async function pipePluginJson(
                 markDirty(session);
             }
         }
+        // Gemini reports its usage in a top-level `usageMetadata` instead of
+        // `usage` (same object on a non-streaming body as on an SSE chunk) —
+        // feed it too, so a `:generateContent` turn also anchors
+        // lastInputTokens for the nudge/fit decisions.
+        if (session && !usage) {
+            const sample = googleUsageSample(json);
+            if (sample && sample.inputTokens !== undefined) {
+                applyUsageSample(session, sample, protocol);
+                markDirty(session);
+            }
+        }
     } catch { /* non-JSON body — forward verbatim */ }
         if (json && (containsRenderTagText(text) || containsMarkerLineText(text))) {
         // #206 parity for the non-streaming plugin path: the compress loop's
@@ -1963,7 +2175,10 @@ export async function pipePluginJson(
         // JSON response would re-feed the model's tag echoes. Strips mutate in
         // place, so this composes with the #408 usage backfill above — one
         // parse, one reserialize.
-        json = protocol === "responses" ? stripResponsesText(json) : protocol === "anthropic" ? stripAnthropicText(json) : stripOpenaiChatText(json);
+        json = protocol === "responses" ? stripResponsesText(json)
+            : protocol === "anthropic" ? stripAnthropicText(json)
+            : protocol === "google" ? stripGoogleText(json)
+            : stripOpenaiChatText(json);
         mutated = true;
     }
     if (mutated && json) {

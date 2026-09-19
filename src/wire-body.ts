@@ -34,6 +34,22 @@ export function appendTrailingUserText(protocol: WireProtocol, body: string | Bu
         }
         return JSON.stringify(obj);
     }
+    if (protocol === "google") {
+        // Gemini has no `messages` array: the conversation is `contents`, and a
+        // trailing user turn is `{role:"user", parts:[{text}]}`. Merge into the
+        // last user content when there is one (back-to-back user contents break
+        // the client's own replay grouping), else start a new one.
+        const contents = obj.contents;
+        if (!Array.isArray(contents)) return null;
+        const arr = contents as Record<string, unknown>[];
+        const last = arr[arr.length - 1];
+        if (last && typeof last === "object" && last.role === "user" && Array.isArray(last.parts)) {
+            last.parts = [...(last.parts as unknown[]), { text }];
+        } else {
+            arr.push({ role: "user", parts: [{ text }] });
+        }
+        return JSON.stringify(obj);
+    }
     const messages = obj.messages;
     if (!Array.isArray(messages)) return null;
     const arr = messages as Record<string, unknown>[];

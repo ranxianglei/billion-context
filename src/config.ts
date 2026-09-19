@@ -244,6 +244,7 @@ const CONTEXT_LIMIT_TABLE: Array<{ match: RegExp; limit: number }> = [
     { match: /^gpt-4o/i, limit: 128_000 },
     { match: /^gpt-4-turbo/i, limit: 128_000 },
     { match: /^o[13]-/i, limit: 200_000 },
+    { match: /^gemini-3/i, limit: 1_048_576 },
     { match: /^gemini-2\.5/i, limit: 1_000_000 },
     { match: /^gemini-1\.5/i, limit: 1_000_000 },
     { match: /^glm-4\.6/i, limit: 128_000 },

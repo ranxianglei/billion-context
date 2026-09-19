@@ -16,12 +16,15 @@ import type http from "node:http";
  *               "stop"` chunk, then `data: [DONE]`.
  *  - anthropic: a `content_block_delta` text_delta, then `message_stop`.
  *  - responses: `response.output_text.delta`, then `response.completed`.
+ *  - google:    an in-stream `{"error":{code,message,status}}` frame — Gemini's
+ *               own error channel, which its SDK throws on; the stream then
+ *               ends (there is no separate terminal byte to synthesize).
  *
  * Best-effort: if writing the error itself throws (client already gone), we
  * still attempt res.end(). Never throws.
  */
 
-type Protocol = "anthropic" | "openai" | "responses";
+type Protocol = "anthropic" | "openai" | "responses" | "google";
 
 function safeWrite(res: http.ServerResponse, chunk: string): void {
     try {
@@ -54,6 +57,10 @@ export function emitStreamError(res: http.ServerResponse, protocol: Protocol, me
             safeWrite(res, `event: response.content_part.done\ndata: ${JSON.stringify({ type: "response.content_part.done", item_id: itemId, output_index: oi, part: { type: "output_text", text: visible } })}\n\n`);
             safeWrite(res, `event: response.output_item.done\ndata: ${JSON.stringify({ type: "response.output_item.done", output_index: oi, item: errorItem })}\n\n`);
             safeWrite(res, `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { status: "completed", output: [errorItem] } })}\n\n`);
+        } else if (protocol === "google") {
+            // Gemini's error object is `{code: number, message, status}` — a
+            // numeric code + gRPC-style status, no free-form `type`.
+            safeWrite(res, `data: ${JSON.stringify({ error: { code: 500, message: visible, status: "INTERNAL" } })}\n\n`);
         } else {
             // anthropic
             safeWrite(res, `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", delta: { type: "text_delta", text: visible } })}\n\n`);
@@ -82,17 +89,24 @@ export function emitStreamError(res: http.ServerResponse, protocol: Protocol, me
  *    lost → synthesize just that byte (silent completion).
  *  - finished=false: true mid-generation cut → protocol-native in-band error
  *    event, same shapes as emitPreflightError (#568): openai top-level `error`
- *    data frame + [DONE]; anthropic/responses `event: error`. A fabricated
+ *    data frame + [DONE]; anthropic/responses `event: error`; google an
+ *    `{"error":{code,message,status}}` frame. A fabricated
  *    response.failed lifecycle object is deliberately avoided — the pipe does
  *    not track the full output-item list, and strict clients (codex) crash on
  *    half-consistent terminal payloads (see emitStreamError). The responses
  *    wire has no separate finish-reason concept (terminal events carry the
- *    status), so !sawTerminal ⇒ finished=false always there.
+ *    status), so !sawTerminal ⇒ finished=false always there. Gemini has the
+ *    mirror-image property: its terminal event IS the finishReason chunk, so
+ *    finished=true leaves nothing to synthesize (and finished=false is the
+ *    only reachable case from a pipe that treats that chunk as terminal).
  * Never throws.
  */
 export function emitUpstreamTruncation(res: http.ServerResponse, protocol: Protocol, finished: boolean, log?: (msg: string) => void): void {
     const message = "upstream stream ended before a completion event; this turn may be incomplete";
-    log?.(`[acp-proxy: upstream stream truncated (${protocol})${finished ? " — finish reason seen, synthesizing missing terminal byte" : " — emitting in-band error"}]`);
+    const action = finished
+        ? protocol === "google" ? "finish reason already delivered, stream complete" : "finish reason seen, synthesizing missing terminal byte"
+        : "emitting in-band error";
+    log?.(`[acp-proxy: upstream stream truncated (${protocol}) — ${action}]`);
     try {
         if (protocol === "openai") {
             if (finished) {
@@ -102,6 +116,12 @@ export function emitUpstreamTruncation(res: http.ServerResponse, protocol: Proto
             }
         } else if (protocol === "responses") {
             safeWrite(res, `event: error\ndata: ${JSON.stringify({ type: "error", code: "upstream_stream_truncated", message })}\n\n`);
+        } else if (protocol === "google") {
+            // The finishReason chunk IS Gemini's stream terminator: when it was
+            // delivered, the client is already done and an extra terminal
+            // object would read as a second answer. Only the mid-flight cut
+            // needs the error frame (503/UNAVAILABLE — an upstream-cut stream).
+            if (!finished) safeWrite(res, `data: ${JSON.stringify({ error: { code: 503, message, status: "UNAVAILABLE" } })}\n\n`);
         } else {
             if (finished) {
                 safeWrite(res, `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`);
@@ -128,6 +148,9 @@ export function emitUpstreamTruncation(res: http.ServerResponse, protocol: Proto
  *  - openai:    top-level `error` in a data frame, then `[DONE]`.
  *  - anthropic: `event: error` (the SDK's standard API-error channel).
  *  - responses: `event: error` (Responses SSE spec).
+ *  - google:    an `{"error":{code,message,status}}` frame; the retryability
+ *               survives as the numeric-code/status pair (503 UNAVAILABLE vs
+ *               500 INTERNAL), Gemini having no free-form `type` field.
  * Never throws.
  */
 export function emitPreflightError(res: http.ServerResponse, protocol: Protocol, error: { message: string; retryable: boolean }, log?: (msg: string) => void): void {
@@ -138,6 +161,8 @@ export function emitPreflightError(res: http.ServerResponse, protocol: Protocol,
             safeWrite(res, `data: ${JSON.stringify({ error: err })}\n\ndata: [DONE]\n\n`);
         } else if (protocol === "responses") {
             safeWrite(res, `event: error\ndata: ${JSON.stringify({ type: "error", code: err.code, message: err.message })}\n\n`);
+        } else if (protocol === "google") {
+            safeWrite(res, `data: ${JSON.stringify({ error: { code: error.retryable ? 503 : 500, message: error.message, status: error.retryable ? "UNAVAILABLE" : "INTERNAL" } })}\n\n`);
         } else {
             safeWrite(res, `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "server_error", code: err.code, message: err.message } })}\n\n`);
         }

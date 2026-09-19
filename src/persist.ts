@@ -9,6 +9,7 @@ import { createSessionCodec, ENCRYPT_MAGIC, parseEncryptionKey } from "./encrypt
 import { PersistEpermAlert } from "./persist-eperm.js";
 import { createInitialState, defaultCountTokens, prune, type CompressionState, type CoreMessage } from "acp-kernel";
 import type { Session, BlockContent, BlockView } from "./session.js";
+import type { WireProtocol } from "./util.js";
 
 /**
  * On-disk persistence for proxy sessions.
@@ -80,7 +81,7 @@ interface PersistedSession {
     /** Identity / descriptive metadata (v2+). Absent on v1 files; read via the
      *  flat fallbacks below. */
     meta?: {
-        protocol?: "anthropic" | "openai" | "responses";
+        protocol?: WireProtocol;
         upstreamOrigin?: string;
         label?: string;
         title?: string;
@@ -103,7 +104,7 @@ interface PersistedSession {
     createdAt: number;
     // Legacy flat fields (v1). Kept optional only so buildSession can read
     // older files; v2 records emit grouped meta/stats instead.
-    protocol?: "anthropic" | "openai" | "responses";
+    protocol?: WireProtocol;
     upstreamOrigin?: string;
     label?: string;
     requests?: number;

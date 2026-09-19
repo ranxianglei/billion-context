@@ -16,19 +16,49 @@ export function isSideRequest(parsed: unknown): boolean {
     if (!parsed || typeof parsed !== "object") return false;
     const p = parsed as Record<string, unknown>;
     if (Array.isArray(p.tools) && p.tools.length > 0) return false;
-    const raw = p.max_tokens ?? p.max_completion_tokens ?? p.max_output_tokens;
+    const field = outputBudgetField(parsed);
+    if (!field) return false;
+    const raw = readOutputBudget(p, field);
     return typeof raw === "number" && raw > 0 && raw <= SIDE_REQUEST_MAX_TOKENS;
 }
 
-export type OutputBudgetField = "max_tokens" | "max_completion_tokens" | "max_output_tokens";
+export type OutputBudgetField = "max_tokens" | "max_completion_tokens" | "max_output_tokens" | "generationConfig.maxOutputTokens";
 
+/** The declared output budget, proto-agnostically. Gemini nests it under
+ *  `generationConfig` (the dotted field name above), the OpenAI/Anthropic
+ *  families keep it flat, so every reader goes through these two accessors. */
 export function outputBudgetField(parsed: unknown): OutputBudgetField | null {
     if (!parsed || typeof parsed !== "object") return null;
     const p = parsed as Record<string, unknown>;
     for (const field of ["max_tokens", "max_completion_tokens", "max_output_tokens"] as const) {
         if (typeof p[field] === "number" && (p[field] as number) > 0) return field;
     }
+    const gen = p.generationConfig;
+    if (gen && typeof gen === "object") {
+        const v = (gen as Record<string, unknown>).maxOutputTokens;
+        if (typeof v === "number" && v > 0) return "generationConfig.maxOutputTokens";
+    }
     return null;
+}
+
+export function readOutputBudget(parsed: Record<string, unknown>, field: OutputBudgetField): number | undefined {
+    if (field !== "generationConfig.maxOutputTokens") {
+        const v = parsed[field];
+        return typeof v === "number" ? v : undefined;
+    }
+    const gen = parsed.generationConfig;
+    if (!gen || typeof gen !== "object") return undefined;
+    const v = (gen as Record<string, unknown>).maxOutputTokens;
+    return typeof v === "number" ? v : undefined;
+}
+
+export function writeOutputBudget(parsed: Record<string, unknown>, field: OutputBudgetField, value: number): void {
+    if (field !== "generationConfig.maxOutputTokens") {
+        parsed[field] = value;
+        return;
+    }
+    const gen = parsed.generationConfig;
+    parsed.generationConfig = { ...(gen && typeof gen === "object" ? (gen as Record<string, unknown>) : {}), maxOutputTokens: value };
 }
 
 /** #546: clients that derive the output budget from their RAW (uncompressed)
@@ -46,7 +76,8 @@ export function restoreOutputBudget(
     const field = outputBudgetField(parsed);
     if (!field) return;
     const p = parsed as Record<string, unknown>;
-    const value = p[field] as number;
+    const value = readOutputBudget(p, field);
+    if (value === undefined) return;
     if (value > SIDE_REQUEST_MAX_TOKENS) {
         session.metadata.outputBudgetHighWater = value;
         return;
@@ -54,7 +85,7 @@ export function restoreOutputBudget(
     if (!Array.isArray(p.tools) || p.tools.length === 0) return;
     const highWater = session.metadata.outputBudgetHighWater;
     if (typeof highWater === "number" && highWater > SIDE_REQUEST_MAX_TOKENS) {
-        p[field] = highWater;
+        writeOutputBudget(p, field, highWater);
         log("info", `[${session.id}] output budget restored ${value} -> ${highWater} (#546: client shrank it from its raw-history estimate)`);
     }
 }
@@ -91,7 +122,7 @@ export function sideRequestGuard(
     // turn's usage overwrites it); it never re-centers the declared window.
     if (armedLimit > 0 && (limit <= 0 || armedLimit < limit)) limit = armedLimit;
     const field = outputBudgetField(parsed);
-    const maxOut = field ? ((parsed as Record<string, unknown>)[field] as number) : 0;
+    const maxOut = (field ? readOutputBudget(parsed as Record<string, unknown>, field) : undefined) ?? 0;
     if (limit > 0 && shouldReserveOutputHeadroom(protocol)) limit = reserveOutputHeadroom(limit, maxOut, headroomCap);
     const estimate = estimateRawBodyTokens(parsed) + imageTokensInParsedBody(protocol, parsed, imageBilling);
     return { blocked: limit > 0 && estimate >= limit * SIDE_REQUEST_GUARD_TOLERANCE, estimate, limit };

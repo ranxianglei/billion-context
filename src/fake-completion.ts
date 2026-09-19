@@ -40,6 +40,9 @@ export function fakeBufCap(): number {
 const ANTHROPIC_TOOL_BLOCK = /"type"\s*:\s*"tool_use"/;
 const OPENAI_TOOL_BLOCK = /"tool_calls"\s*:\s*\[\s*\{/;
 const RESPONSES_TOOL_BLOCK = /"type"\s*:\s*"function_call"/;
+// Gemini has no `type` discriminator: a real invocation is a functionCall PART
+// (`"functionCall":{"name":…}`) inside candidates[*].content.parts.
+const GOOGLE_TOOL_BLOCK = /"functionCall"\s*:\s*\{/;
 
 export function hasToolBlock(protocol: WireProtocol, rawText: string): boolean {
     switch (protocol) {
@@ -49,6 +52,8 @@ export function hasToolBlock(protocol: WireProtocol, rawText: string): boolean {
             return OPENAI_TOOL_BLOCK.test(rawText);
         case "responses":
             return RESPONSES_TOOL_BLOCK.test(rawText);
+        case "google":
+            return GOOGLE_TOOL_BLOCK.test(rawText);
     }
 }
 

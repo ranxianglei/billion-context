@@ -1,5 +1,7 @@
 import { defaultCountTokens, type CoreMessage, type NudgeDecision } from "acp-kernel";
+import { googleSystemText, type GoogleRequestBody } from "acp-kernel/wire";
 import { estimateCoreMessages } from "../preflight.js";
+import { readOutputBudget, writeOutputBudget, type OutputBudgetField } from "./side-request.js";
 
 // #453 hard backstop: cap the forwarded output budget so input+output can never
 // exceed the window on request-rebuilding upstreams (vLLM rejects an oversized
@@ -42,14 +44,18 @@ export function estimateInputTokens(processedMessages: CoreMessage[], systemText
  * the preflight trigger fires ~10-20K late on agent clients with big tool
  * manifests: text alone "fits" while the real billed input already overflows
  * the window. Same term estimateInputTokens applies to the output clamp (#467). */
-export function estimateWireOverhead(protocol: "anthropic" | "openai" | "responses", body: string | Buffer): number {
+export function estimateWireOverhead(protocol: "anthropic" | "openai" | "responses" | "google", body: string | Buffer): number {
     let parsed: Record<string, unknown>;
     try {
         parsed = JSON.parse(typeof body === "string" ? body : body.toString("utf8")) as Record<string, unknown>;
     } catch {
         return 0;
     }
-    const sysRaw = protocol === "responses" ? parsed.instructions : parsed.system;
+    const sysRaw = protocol === "responses"
+        ? parsed.instructions
+        : protocol === "google"
+          ? googleSystemText(parsed as GoogleRequestBody)
+          : parsed.system;
     let sysText = "";
     if (typeof sysRaw === "string") {
         sysText = sysRaw;
@@ -117,19 +123,19 @@ export function emergencyNudge(nudge: NudgeDecision | null | undefined, escalati
 
 export function clampOutgoingOutput(
     rebuilt: Record<string, unknown>,
-    field: "max_tokens" | "max_completion_tokens" | "max_output_tokens",
+    field: OutputBudgetField,
     ctx: { systemText: string; tools: unknown; processedMessages: CoreMessage[]; lastInputTokens: number; nativeWindow: number; imageTokens: number },
     sessionId: string,
     log: (level: string, msg: string) => void,
 ): void {
-    const raw = rebuilt[field];
+    const raw = readOutputBudget(rebuilt, field);
     if (typeof raw !== "number") return;
     // #488: images ride along in the rebuilt body but are invisible to the text model —
     // without them the cap is too generous and input+output can still overflow.
     const inputEstimate = estimateInputTokens(ctx.processedMessages, ctx.systemText, ctx.tools, ctx.lastInputTokens) + ctx.imageTokens;
     const capped = clampOutputBudget(raw, inputEstimate, ctx.nativeWindow);
     if (capped !== undefined) {
-        rebuilt[field] = capped;
+        writeOutputBudget(rebuilt, field, capped);
         log("info", `[${sessionId}] output budget clamped ${raw} -> ${capped} (input~${inputEstimate}, window=${ctx.nativeWindow}); prevents input+output overflow (#453)`);
     }
 }
