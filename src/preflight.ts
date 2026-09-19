@@ -772,7 +772,11 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         result.payloadEstimate = estimateCoreMessages(turn.messages) + (deps.imageFloor ?? 0) + (deps.wireOverhead ?? 0);
         if (startTokens < 0) startTokens = currentTokens;
         if (currentTokens < target) break;
-        const ranges = viableRanges(turn.nudge?.compressibleRanges ?? []);
+        // #847: drop sub-minimum ranges at list level too — every chunk of a
+        // sub-min range fails the apply-side gate, so walking them only burns
+        // rounds and misreports "N viable ranges tried"; with them gone the
+        // empty-list path below can reach the #330 soft-zone relaxation.
+        const ranges = viableRanges(turn.nudge?.compressibleRanges ?? []).filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars);
         rangesRemaining = ranges.length;
         if (ranges.length === 0) {
             // #330: nothing foldable outside the soft-protected recent zone.

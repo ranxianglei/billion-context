@@ -1,8 +1,8 @@
 import { collectBlockContent, type CompressionCore, type Config, type CoreMessage, type CompressionState } from "acp-kernel";
 import { handleAcpStatus } from "./acp-status.js";
 import { handleAcpCache, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
-import { type Session, cacheBlockContent } from "./session.js";
-import { COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME } from "./compress-tool.js";
+import { type Session, cacheBlockContent, markDirty } from "./session.js";
+import { COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME, type ParsedRange } from "./compress-tool.js";
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "./absorb.js";
 import { executeSearchContextTarget, resolveDecompress } from "./decompress-shared.js";
 import { containsMarkerLineText, containsRenderTagText, stripAcpTags } from "./loop/tag-echo-filter.js";
@@ -79,6 +79,45 @@ export function normalizeRangeOrder(ranges: Array<{ startRef: string; endRef: st
     return swapped;
 }
 
+// #847: the kernel normalizes reversed startId/endId silently (bounds are
+// swapped), so a parameter slip surfaces as an unrelated content error — the
+// model then imitates its own failed call in a loop. Surface the reversal.
+function reversedRanges(ranges: ParsedRange[]): ParsedRange[] {
+    return ranges.filter((r) => refNum(r.startRef) > refNum(r.endRef));
+}
+// #847: a rejected spec fails deterministically until the visible context
+// changes, so repeating it is pure context burn (the incident looped the same
+// call 7x over ~13 min while usage climbed 76%→89%). Track recent failed
+// specs per session and escalate on repeat instead of echoing the plain gate
+// error again. Stored on metadata (persisted) so the streak survives LRU
+// eviction/reload; stale keys after a ref reset are harmless (no match).
+const FAIL_STREAK_KEY = "compressFailKeys";
+const FAIL_STREAK_CAP = 5;
+function normalizedSpecKey(ranges: ParsedRange[]): string {
+    return ranges
+        .map((r) => (refNum(r.startRef) <= refNum(r.endRef) ? `${r.startRef}..${r.endRef}` : `${r.endRef}..${r.startRef}`))
+        .sort()
+        .join(",");
+}
+function recordCompressFailure(session: Session, key: string): string {
+    if (!key) return "";
+    const prev = session.metadata[FAIL_STREAK_KEY];
+    const keys = Array.isArray(prev) ? prev.filter((k): k is string => typeof k === "string") : [];
+    const occurrences = keys.filter((k) => k === key).length + 1;
+    keys.push(key);
+    while (keys.length > FAIL_STREAK_CAP) keys.shift();
+    session.metadata[FAIL_STREAK_KEY] = keys;
+    markDirty(session);
+    if (occurrences < 2) return "";
+    return ` [Repeat-failure guard: you have now requested this exact range set ${occurrences} time(s) in this session and it keeps failing with the same error. Repeating it deterministically fails the same way until the visible context changes — do NOT re-issue it. Call acp_status first and pick from its CURRENT compressible ranges, or extend your range(s) to cover more adjacent messages.]`;
+}
+function clearCompressFailures(session: Session): void {
+    if (session.metadata[FAIL_STREAK_KEY] !== undefined) {
+        delete session.metadata[FAIL_STREAK_KEY];
+        markDirty(session);
+    }
+}
+
 export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: RewriteCtx): string {
     const { ranges, diagnostics } = parsed;
     if (ranges.length === 0) {
@@ -87,6 +126,9 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         const why = reasons.length > 0 ? ` Rejected entries:\n${reasons.map((r) => `- ${r}`).join("\n")}` : "";
         return `[Compression FAILED: no valid ranges parsed (kind=${diagnostics.kind}, dropped=${diagnostics.invalidItems}).${why}\n compress requires a non-empty 'content' array where each element is EITHER an object {startId, endId, summary} OR one line-form string whose first line is 'mNNNNN–mNNNNN optional topic' with the summary markdown on the following lines (a separate summary-only element right after a bare header line is also accepted). startId/endId are mNNNNN message refs from the conversation. Re-issue the compress call with a valid content array.]`;
     }
+    // #847: detect reversed refs as SUBMITTED, before #1001 normalization
+    // rewrites them (order matters — normalizeRangeOrder mutates in place).
+    const revs = reversedRanges(ranges);
     const swappedRanges = normalizeRangeOrder(ranges);
     if (swappedRanges > 0) {
         ctx.log(`[acp-proxy: normalized ${swappedRanges} reversed range(s) to ascending ref order (#1001)]`);
@@ -129,12 +171,19 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         }
         const r = res.result;
         const detail = ranges.map((rg) => `${rg.startRef}–${rg.endRef}`).join(", ");
+        if (revs.length > 0) {
+            ctx.log(`[acp-proxy: reversed range(s) in compress call: ${revs.map((rg) => `${rg.startRef}->${rg.endRef}`).join(", ")}`);
+        }
 
         if (r.blocksCreated === 0) {
             const errs = r.errors.join("; ") || "no blocks created";
-            ctx.log(`[acp-proxy: compress FAILED ${detail} → 0 blocks. ${errs}]`);
-            return `[Compression FAILED: ${errs}]`;
+            const revNote = revs.length > 0
+                ? ` Note: startId > endId in range(s) ${revs.map((rg) => `${rg.startRef}→${rg.endRef}`).join(", ")} — your refs were reversed; they were normalized to ascending order before evaluation, so check your ref order.`
+                : "";
+            ctx.log(`[acp-proxy: compress FAILED ${detail} → 0 blocks. ${errs}${revs.length > 0 ? " [reversed refs]" : ""}]`);
+            return `[Compression FAILED: ${errs}${revNote}${recordCompressFailure(ctx.session, normalizedSpecKey(ranges))}]`;
         }
+        clearCompressFailures(ctx.session);
 
         // #189 observability: record the rewrite magnitude + fold point so a
         // downstream transient rejection (GLM 3007) can be correlated with it.
@@ -184,7 +233,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         return msg;
     } catch (err) {
         ctx.log(`[acp-proxy: compress failed: ${String(err)}]`);
-        return `[Compression FAILED: ${String(err)}]`;
+        return `[Compression FAILED: ${String(err)}${recordCompressFailure(ctx.session, normalizedSpecKey(ranges))}]`;
     }
 }
 
