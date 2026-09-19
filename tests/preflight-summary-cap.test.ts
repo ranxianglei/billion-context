@@ -24,7 +24,9 @@ afterEach(() => {
 // #853 end-to-end: the summary call carries the raised 32k default output cap
 // (the old 8192 starved reasoning-on-by-default models — observed
 // content:"" + finish_reason:"length" on deepseek-flash), and clamps it down
-// to the model's known models.dev ceiling when that is smaller.
+// to the model's known models.dev ceiling when that is smaller. The window is
+// large enough that #987's headroom clamp (input+output <= window) never
+// engages here — this test isolates the registry-ceiling clamp only.
 test("#853 summary output cap: 32k default, clamped to known model ceiling", async () => {
     // A live capped entry in the bundled models.dev snapshot, so the
     // assertion survives snapshot regeneration. The relay-style bare name
@@ -58,12 +60,12 @@ test("#853 summary output cap: 32k default, clamped to known model ceiling", asy
         const session = getSession(`summary-cap-${randomUUID()}`);
         const messages: CoreMessage[] = [
             { id: "first", role: "user", contentType: "text", text: "Keep the task goal and acceptance criteria." },
-            { id: "large", role: "assistant", contentType: "text", text: "FILLER_".repeat(4000) },
+            { id: "large", role: "assistant", contentType: "text", text: "FILLER_".repeat(60000) },
             { id: "last", role: "user", contentType: "text", text: "Continue the task." },
         ];
         const deps: PreflightDeps = {
             core: createCore(), session,
-            config: defaultConfig(6000, { preserveRecentMessages: 0, preserveRecentTokens: 0 }),
+            config: defaultConfig(100_000, { preserveRecentMessages: 0, preserveRecentTokens: 0 }),
             prompts: defaultPrompts, protocol: "openai",
             url: `http://127.0.0.1:${port}/v1/messages`,
             headers: {}, model,

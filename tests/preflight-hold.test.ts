@@ -286,12 +286,15 @@ test("#568: non-stream + slow preflight → early 200 + whitespace keep-alive, t
         req.on("data", (c: Buffer) => chunks.push(c));
         req.on("end", () => {
             const raw = Buffer.concat(chunks).toString("utf8");
-            let parsed: { stream?: boolean; max_tokens?: number } = {};
+            let parsed: { stream?: boolean; messages?: Array<{ role?: string }> } = {};
             try { parsed = JSON.parse(raw); } catch { /* keep {} */ }
             calls.push({ raw });
-            // Summarization calls are sized to MAX_SUMMARY_OUTPUT_TOKENS (32768);
-            // the main request keeps its own max_tokens (1024).
-            if (parsed.max_tokens === 32768) {
+            // #987: detect summarization calls by SHAPE (exactly two messages,
+            // system first), not by the 32768 cap — the cap is now clamped to
+            // the window headroom on small windows, so it no longer identifies
+            // them. The main request is a 12-message user/assistant conversation.
+            const msgs = parsed.messages;
+            if (Array.isArray(msgs) && msgs.length === 2 && msgs[0]?.role === "system") {
                 setTimeout(() => {
                     res.writeHead(200, { "content-type": "application/json" });
                     res.end(JSON.stringify({ choices: [{ message: { role: "assistant", content: SUMMARY_TEXT } }] }));
@@ -330,7 +333,11 @@ test("#568: non-stream + slow preflight → early 200 + whitespace keep-alive, t
         const json = JSON.parse(r.body) as { choices?: Array<{ message?: { content?: string } }> };
         assert.equal(json.choices?.[0]?.message?.content, "ok", "the JSON body stays parseable despite the padding byte");
 
-        const forwards = calls.filter((c) => !c.raw.includes('"max_tokens":32768'));
+        const forwards = calls.filter((c) => {
+            let p: { messages?: Array<{ role?: string }> } = {};
+            try { p = JSON.parse(c.raw); } catch { /* non-JSON never matches */ }
+            return !(Array.isArray(p.messages) && p.messages.length === 2 && p.messages[0]?.role === "system");
+        });
         assert.equal(forwards.length, 1, "exactly one forward upstream");
         assert.ok(forwards[0]!.raw.includes(SUMMARY_TEXT), "the rebuilt payload carries the preflight summary");
     } finally {

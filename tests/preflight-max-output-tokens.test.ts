@@ -275,8 +275,10 @@ test("e2e #663 (order B, param-first): max_output_tokens rejected before stream 
     }
 });
 
-// Standard Responses provider: accepts max_output_tokens — the 32768 cap must
-// be retained on every summary call, and NO capability may be learned.
+// Standard Responses provider: accepts max_output_tokens — the output limit
+// must be RETAINED on every summary call (32768, or lower when #987's
+// headroom clamp engages on these small test windows), and NO capability may
+// be learned.
 function makeStandardUpstream(calls: Call[]): http.Server {
     return http.createServer((req, res) => {
         const chunks: Buffer[] = [];
@@ -308,8 +310,8 @@ test("e2e #663 (standard provider): max_output_tokens retained, no capability le
         const summaries = calls.filter((c) => c.summary);
         assert.ok(summaries.length >= 1, "preflight summaries happened");
         assert.ok(
-            summaries.every((c) => c.maxOutputTokens === 32768),
-            `every summary must keep the 32768 output limit, got ${JSON.stringify(summaries)}`,
+            summaries.every((c) => typeof c.maxOutputTokens === "number" && c.maxOutputTokens >= 64 && c.maxOutputTokens <= 32768),
+            `every summary must keep an output limit (<= 32768; #987 may clamp it to the window headroom), got ${JSON.stringify(summaries)}`,
         );
         assert.ok(calls.some((c) => !c.summary), "the folded payload was forwarded");
 
@@ -356,7 +358,7 @@ test("e2e #663 (model scoping): rejection learned for model A keeps model B's 32
         // cap (rejected), then every retry — however many folds the payload
         // needs — is non-stream without the cap.
         assert.ok(astraSummaries.length >= 2, `model A: one rejected attempt + at least one retry, got ${JSON.stringify(astraSummaries)}`);
-        assert.equal(astraSummaries[0].maxOutputTokens, 32768, "model A first attempt carries the cap");
+        assert.ok(typeof astraSummaries[0].maxOutputTokens === "number" && astraSummaries[0].maxOutputTokens <= 32768, `model A first attempt carries the cap, got ${JSON.stringify(astraSummaries[0])}`);
         assert.ok(
             astraSummaries.slice(1).every((c) => c.maxOutputTokens === undefined),
             `every model A retry must drop the cap, got ${JSON.stringify(astraSummaries)}`,
@@ -370,8 +372,8 @@ test("e2e #663 (model scoping): rejection learned for model A keeps model B's 32
         const standardSummaries = calls.slice(callsBefore).filter((c) => c.summary);
         assert.ok(standardSummaries.length >= 1, "second request triggered preflight summaries");
         assert.ok(
-            standardSummaries.every((c) => c.model === "gpt-6-standard" && c.maxOutputTokens === 32768),
-            `model B summaries must keep the 32768 cap, got ${JSON.stringify(standardSummaries)}`,
+            standardSummaries.every((c) => c.model === "gpt-6-standard" && typeof c.maxOutputTokens === "number" && c.maxOutputTokens <= 32768),
+            `model B summaries must keep the output cap (<= 32768; #987 may clamp it), got ${JSON.stringify(standardSummaries)}`,
         );
 
         const sess = listSessions().find((s) => s.id.includes("s663-resp-d"));

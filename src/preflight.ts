@@ -276,8 +276,24 @@ function summaryOutputTokens(model: string, host?: string): number {
     return known === undefined ? MAX_SUMMARY_OUTPUT_TOKENS : Math.min(MAX_SUMMARY_OUTPUT_TOKENS, known);
 }
 
-function summaryPayload(protocol: PreflightProtocol, model: string, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean, host?: string): Record<string, unknown> {
-    const maxOutputTokens = summaryOutputTokens(model, host);
+// #987: the summary call's own payload must fit the model window too. Most
+// upstreams enforce input + output <= window; asking for 32k of output on a
+// small (often learned) window makes them answer with an EMPTY completion
+// instead of an error — every summary attempt reads as unusable and preflight
+// dead-ends on exactly the sessions this module exists to save. Clamp to the
+// headroom when it is smaller than the registry/default cap above.
+const SUMMARY_SCRAFFOLDING_TOKENS = 256;
+const MIN_CLAMPED_SUMMARY_OUTPUT = 64;
+function windowClampedOutput(base: number, window: number | undefined, system: string, content: string): number {
+    if (!window || window <= 0) return base;
+    const input = defaultCountTokens(system) + defaultCountTokens(content) + SUMMARY_SCRAFFOLDING_TOKENS;
+    const headroom = window - input;
+    if (headroom <= 0) return base; // input alone does not fit — clamping cannot save the call
+    return Math.min(base, Math.max(MIN_CLAMPED_SUMMARY_OUTPUT, headroom));
+}
+
+function summaryPayload(protocol: PreflightProtocol, model: string, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean, host?: string, window?: number): Record<string, unknown> {
+    const maxOutputTokens = windowClampedOutput(summaryOutputTokens(model, host), window, system, content);
     if (protocol === "anthropic") {
         return { model, max_tokens: maxOutputTokens, system, messages: [{ role: "user", content }], stream };
     }
@@ -544,7 +560,34 @@ export function diagnoseEmptySummary(text: string, json?: unknown): string {
     }
     const trimmed = text.trim();
     if (!trimmed) return "the upstream returned an empty body";
+    // #987: a plain-JSON completion with empty content is NOT "a non-SSE body" —
+    // name what it was, with the finish reason and the model id the upstream
+    // answered as (relays answer under their real model while the request named
+    // an alias — that mismatch is the actionable clue).
+    const detail = json && typeof json === "object" ? emptyCompletionDetail(json as Record<string, unknown>) : null;
+    if (detail !== null) return `the upstream returned a plain-JSON completion with empty content${detail}`;
     return `the upstream returned a non-SSE body with no summary text (first 200 bytes: ${trimmed.slice(0, 200)})`;
+}
+
+// Returns null when the parsed body is not a recognizable completion shape, so
+// unrelated JSON keeps the generic non-SSE diagnosis.
+function emptyCompletionDetail(json: Record<string, unknown>): string | null {
+    const parts: string[] = [];
+    const choices = json.choices;
+    if (Array.isArray(choices) && choices.length > 0) {
+        const first = choices[0];
+        if (!first || typeof first !== "object") return null;
+        const fr = (first as Record<string, unknown>).finish_reason;
+        if (typeof fr === "string") parts.push(`finish_reason=${fr}`);
+    } else if (typeof json.stop_reason === "string") {
+        parts.push(`stop_reason=${json.stop_reason}`);
+    } else if (Array.isArray(json.output)) {
+        if (typeof json.status === "string") parts.push(`status=${json.status}`);
+    } else {
+        return null;
+    }
+    if (typeof json.model === "string") parts.push(`answered as model=${json.model}`);
+    return parts.length > 0 ? ` (${parts.join(", ")})` : "";
 }
 
 async function summarizeRange(deps: PreflightDeps, content: string, startRef: string, endRef: string): Promise<SummaryOutcome> {
@@ -648,7 +691,7 @@ async function requestSummaryBody(deps: PreflightDeps, body: string): Promise<st
 }
 
 async function requestSummary(deps: PreflightDeps, system: string, content: string, stream: boolean, includeMaxOutputTokens: boolean): Promise<SummaryOutcome> {
-    const text = await requestSummaryBody(deps, JSON.stringify(summaryPayload(deps.protocol, deps.model, system, content, stream, includeMaxOutputTokens, safeHost(deps.url))));
+    const text = await requestSummaryBody(deps, JSON.stringify(summaryPayload(deps.protocol, deps.model, system, content, stream, includeMaxOutputTokens, safeHost(deps.url), deps.config.modelContextLimit)));
     let json: unknown;
     try {
         json = JSON.parse(text);

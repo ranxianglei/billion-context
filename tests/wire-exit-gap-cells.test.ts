@@ -159,8 +159,10 @@ function timedPost(url: string, headers: Record<string, string>, body: string): 
     });
 }
 
-/** Upstream whose summarization call (max_tokens 32768) is slow; the forward
- *  call gets `forwardStatus` immediately. */
+/** Upstream whose summarization call (detected by shape: two messages, system
+ *  first — the 32768 cap no longer identifies them since #987 clamps it to
+ *  the window headroom) is slow; the forward call gets `forwardStatus`
+ *  immediately. */
 function startUpstream(forwardStatus: number, forwardBody: string, summaryFails: boolean): Promise<{ server: http.Server; port: number; forwards: () => number }> {
     let forwards = 0;
     const server = http.createServer((req, res) => {
@@ -168,9 +170,10 @@ function startUpstream(forwardStatus: number, forwardBody: string, summaryFails:
         req.on("data", (c: Buffer) => chunks.push(c));
         req.on("end", () => {
             const raw = Buffer.concat(chunks).toString("utf8");
-            let parsed: { max_tokens?: number } = {};
+            let parsed: { messages?: Array<{ role?: string }> } = {};
             try { parsed = JSON.parse(raw); } catch { /* keep {} */ }
-            if (parsed.max_tokens === 32768) {
+            const msgs = parsed.messages;
+            if (Array.isArray(msgs) && msgs.length === 2 && msgs[0]?.role === "system") {
                 setTimeout(() => {
                     if (summaryFails) {
                         res.writeHead(429, { "content-type": "application/json" });

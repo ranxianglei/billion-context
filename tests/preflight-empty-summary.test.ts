@@ -397,6 +397,38 @@ test("#726 diagnoseEmptySummary: extracts terminal error signals from 200 bodies
     );
 });
 
+// #987: an upstream that enforces input+output <= window answers the summary
+// call with a plain-JSON completion whose content is EMPTY (observed on
+// muse-spark behind a 9router alias). That is valid JSON — calling it "a
+// non-SSE body" sends the operator looking for the wrong failure. The
+// diagnosis must name the shape, the finish reason, and the model id the
+// upstream answered as (the alias-vs-real-model mismatch is the clue).
+test("#987 diagnoseEmptySummary names plain-JSON empty completions precisely", () => {
+    const openai = JSON.stringify({
+        id: "chatcmpl-1789806312367", object: "chat.completion", model: "muse-spark-1.3-contributor",
+        choices: [{ index: 0, message: { role: "assistant", content: "" }, finish_reason: "stop" }],
+    });
+    assert.match(
+        diagnoseEmptySummary(openai, JSON.parse(openai)),
+        /plain-JSON completion with empty content \(finish_reason=stop, answered as model=muse-spark-1\.3-contributor\)/,
+    );
+    const anthropic = JSON.stringify({ id: "msg_1", model: "claude-x", content: [], stop_reason: "max_tokens" });
+    assert.match(
+        diagnoseEmptySummary(anthropic, JSON.parse(anthropic)),
+        /plain-JSON completion with empty content \(stop_reason=max_tokens, answered as model=claude-x\)/,
+    );
+    const responses = JSON.stringify({ id: "resp_1", status: "incomplete", output: [] });
+    assert.match(
+        diagnoseEmptySummary(responses, JSON.parse(responses)),
+        /plain-JSON completion with empty content \(status=incomplete\)/,
+    );
+    // Unrecognized JSON keeps the generic diagnosis (shape guard).
+    assert.match(
+        diagnoseEmptySummary('{"unrelated":"body"}', { unrelated: "body" }),
+        /non-SSE body with no summary text/,
+    );
+});
+
 test("#780 truncated summary stream is unusable: diagnosis names truncation, bounded calls, cooldown arms, nothing forwarded", async () => {
     const calls: Call[] = [];
     const upstream = makeUpstream(calls, 0, 800, true);
