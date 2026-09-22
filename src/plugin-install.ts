@@ -1179,9 +1179,21 @@ function opencodeInstall(withMcp = false): string {
  *  when there is nothing to do (dev-shim lane, no entry, or already
  *  current). Foreign entries are preserved verbatim (#1002). */
 export function repinOpencodeEntryTo(version: string, root: string = selfPackageRoot()): string | undefined {
+    if (!isNpmInstallForm(root)) return undefined;
+    return repinOpencodeEntryImpl(version);
+}
+
+/** Variant for a bili copy opencode itself manages (update.ts self-update
+ *  refusal branch): ownership was already established there, so the npm-form
+ *  check on OUR root is skipped — opencode's cache layout is opencode's
+ *  business, not ours. */
+export function repinOpencodeManagedEntry(version: string): string | undefined {
+    return repinOpencodeEntryImpl(version);
+}
+
+function repinOpencodeEntryImpl(version: string): string | undefined {
     const desired = opencodeNpmEntry(version);
     if (desired === OPENCODE_NPM_ENTRY) return undefined;
-    if (!isNpmInstallForm(root)) return undefined;
     const file = opencodeTargetFile();
     const { original, data } = loadOpencodeConfig(file);
     const touched = new Set<string>();

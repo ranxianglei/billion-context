@@ -206,9 +206,14 @@ test("pluginInstall/remove/status opencode end-to-end (dev form under tsx)", asy
     assert.match(pluginRemove("opencode"), /not installed/);
 });
 
-test("repinOpencodeEntryTo: stale pin re-pinned in place, foreign entries and position preserved (#1108)", () => {
+test("repinOpencodeEntryTo: stale pin re-pinned in place, foreign entries and position preserved (#1108)", (t) => {
+    const prevXdg = process.env.XDG_CONFIG_HOME;
     const xdg = tempDir("bili-oc-xdg-");
     process.env.XDG_CONFIG_HOME = xdg;
+    t.after(() => {
+        if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+        else process.env.XDG_CONFIG_HOME = prevXdg;
+    });
     fs.mkdirSync(path.join(xdg, "opencode"), { recursive: true });
     const file = path.join(xdg, "opencode", "opencode.json");
     const readCfg = (): OcCfg => JSON.parse(fs.readFileSync(file, "utf8")) as OcCfg;
@@ -221,9 +226,14 @@ test("repinOpencodeEntryTo: stale pin re-pinned in place, foreign entries and po
     assert.deepEqual(after.compaction, cfg.compaction, "unrelated keys untouched");
 });
 
-test("repinOpencodeEntryTo: legacy bare entry pinned, map form and unknown version handled", () => {
+test("repinOpencodeEntryTo: legacy bare entry pinned, map form and unknown version handled", (t) => {
+    const prevXdg = process.env.XDG_CONFIG_HOME;
     const xdg = tempDir("bili-oc-xdg-");
     process.env.XDG_CONFIG_HOME = xdg;
+    t.after(() => {
+        if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+        else process.env.XDG_CONFIG_HOME = prevXdg;
+    });
     fs.mkdirSync(path.join(xdg, "opencode"), { recursive: true });
     const file = path.join(xdg, "opencode", "opencode.json");
     const readCfg = (): OcCfg => JSON.parse(fs.readFileSync(file, "utf8")) as OcCfg;
@@ -238,9 +248,14 @@ test("repinOpencodeEntryTo: legacy bare entry pinned, map form and unknown versi
     assert.equal(repinOpencodeEntryTo("0.1.135", selfPackageRoot()), undefined, "dev checkout lane is the shim form — nothing to re-pin");
 });
 
-test("pluginUpdate opencode lane: re-pins a stale entry to the resolved latest, then confirms", async () => {
+test("pluginUpdate opencode lane: re-pins a stale entry to the resolved latest, then confirms", async (t) => {
+    const prevXdg = process.env.XDG_CONFIG_HOME;
     const xdg = tempDir("bili-oc-xdg-");
     process.env.XDG_CONFIG_HOME = xdg;
+    t.after(() => {
+        if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+        else process.env.XDG_CONFIG_HOME = prevXdg;
+    });
     fs.mkdirSync(path.join(xdg, "opencode"), { recursive: true });
     const file = path.join(xdg, "opencode", "opencode.json");
     const readCfg = (): OcCfg => JSON.parse(fs.readFileSync(file, "utf8")) as OcCfg;
