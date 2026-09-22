@@ -112,6 +112,16 @@ export type CompressSettings = {
      *  (bypasses growth-gate + cadence). Accepts a ratio (0.75) or percent
      *  string ("75%"). Maps to kernel `nudge.maxContextLimitPct`. */
     maxContextLimit?: number | string;
+    /** Lower bound of the nudge activity band: below this usage the proactive
+     *  (first-sight mass / tier-count) nudge paths stay dormant; above it they
+     *  arm normally. The over-band pressure branch of `maxContextLimit` is NOT
+     *  gated by this value — it fires at maxContextLimit regardless. Set it at
+     *  or below `maxContextLimit` when you lower the soft target well under the
+     *  kernel's 0.45 default (e.g. pinning context near 35% of a large native
+     *  window); otherwise the kernel logs a min>max validation warning (#1122).
+     *  Must be <= maxContextLimit <= emergencyThresholdPercent. Accepts a ratio
+     *  (0.35) or percent string ("35%"). Maps to kernel `nudge.minContextLimitPct`. */
+    minContextLimit?: number | string;
     /** Context usage percentage that triggers emergency truncation of large
      *  tool outputs. Accepts a ratio (0.95) or percent string ("95%"). Must
      *  be >= maxContextLimit. Maps to kernel `nudge.emergencyThresholdPct` +
@@ -916,7 +926,7 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
         if (typeof obj[key] !== "number" || !Number.isFinite(obj[key] as number)) ok = false;
         else (out as Record<string, unknown>)[key] = obj[key];
     };
-    for (const key of ["modelContextLimit", "maxContextLimit", "emergencyThresholdPercent"] as const) {
+    for (const key of ["modelContextLimit", "maxContextLimit", "minContextLimit", "emergencyThresholdPercent"] as const) {
         if (!(key in obj)) continue;
         if (!numberOrPercent(obj[key])) { ok = false; continue; }
         (out as Record<string, unknown>)[key] = typeof obj[key] === "string" ? (obj[key] as string).trim() : obj[key];

@@ -246,7 +246,7 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Type:** `number | string`
 - **Default:** *(the model's native window)*
 - **Status:** ACTIVE
-- **Description:** The context window size, in tokens. This is the **denominator** the engine uses for its usage ratio (`usage = tokens / modelContextLimit`) — it is **not** a truncation cap. Accepts an absolute number (`200000`) or a percent string (`"80%"` = 80% of the model's native window, resolved from the built-in table or models.dev registry). When omitted at every level, the native window is used. This is the highest-priority source for the model limit; it overrides the built-in table, the legacy per-model `context` field, and the top-level `modelContextLimit`.
+- **Description:** The context window size, in tokens. This is the **denominator** the engine uses for its usage ratio (`usage = tokens / modelContextLimit`) — it is **not** a truncation cap. Accepts an absolute number (`200000`) or a percent string (`"80%"` = 80% of the model's native window, resolved from the built-in table or models.dev registry). When omitted at every level, the native window is used. This is the highest-priority source for the model limit; it overrides the built-in table, the legacy per-model `context` field, and the top-level `modelContextLimit`. Note it also serves as the **hard preflight wall**: once a payload reaches this value the proxy proactively folds context before forwarding, and if folding cannot bring it under, the request fails fast instead of being sent upstream. To keep day-to-day context small while still letting large reads burst up to the native window, keep `modelContextLimit` at the native value and use `maxContextLimit` / `minContextLimit` as the soft bands instead (see [Soft target with elastic headroom](#soft-target-with-elastic-headroom-1122)).
 
 #### `outputHeadroomMaxPct`
 
@@ -260,7 +260,14 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Type:** `number | string`
 - **Default:** `"75%"`
 - **Status:** ACTIVE
-- **Description:** Context-usage threshold that triggers **forced compression** nudges. Once usage crosses this ratio, the engine fires a nudge that bypasses the growth-gate and cadence checks. Accepts a ratio (`0.75`) or a percent string (`"75%"`). Lower values compress earlier. Maps to the kernel field `nudge.maxContextLimitPct`.
+- **Description:** Context-usage threshold that triggers **forced compression** nudges. Once usage crosses this ratio, the engine fires a nudge that bypasses the growth-gate and cadence checks. While usage stays above this ratio, the nudge fires **every turn** (the pressure branch has no cadence gate), which is what pins context near the target when used as a soft limit. Accepts a ratio (`0.75`) or a percent string (`"75%"`). Lower values compress earlier. Maps to the kernel field `nudge.maxContextLimitPct`.
+
+#### `minContextLimit`
+
+- **Type:** `number | string`
+- **Default:** *(kernel default `0.45`)*
+- **Status:** ACTIVE
+- **Description:** Lower bound of the nudge activity band. Below this usage the proactive nudge paths (first-sight mass, tier counting) stay dormant; above it they arm normally. The over-band pressure branch of `maxContextLimit` is **not** gated by this value — forced nudges fire at `maxContextLimit` regardless. Set it at or below `maxContextLimit` whenever you lower the soft target well under the kernel's 0.45 default (e.g. pinning context near 35% of a large native window); otherwise the kernel logs a min>max validation warning on every turn (#1122). Accepts a ratio (`0.35`) or a percent string (`"35%"`). Must satisfy `minContextLimit <= maxContextLimit <= emergencyThresholdPercent`. Maps to the kernel field `nudge.minContextLimitPct`.
 
 #### `emergencyThresholdPercent`
 
@@ -436,6 +443,26 @@ These two toggles are honoured only at the **global** level. Setting them inside
 - **Default:** `true`
 - **Status:** ACTIVE
 - **Description:** Inject automatic compression-nudge messages when usage thresholds are crossed. Set `false` (or `ACP_COMPRESS_NUDGE=0`) to disable nudge injection. Disabling both `injectTool` and `injectNudge` is functionally similar to `passthrough`, except the proxy still tracks token usage.
+
+### Soft target with elastic headroom (#1122)
+
+Autonomous agents often want two things at once: keep the *active* context small (cost/latency), but allow a single task to burst well past that target when it genuinely needs to (e.g. reading a large file). Setting `modelContextLimit` below the model's native window cannot express that — it is simultaneously the soft-band denominator **and** the hard preflight wall, so any payload above it gets folded mid-task or fails fast.
+
+Express it with the soft bands instead: keep the limit at the native window, and pin the target with `maxContextLimit` (+ `minContextLimit` when the target sits under 45%):
+
+```jsonc
+// model with a 200k native window; keep ~70k active, allow bursts up to the real edge
+{
+  "compress": {
+    "modelContextLimit": 200000,   // = native window → hard wall only at the true edge
+    "maxContextLimit": "35%",      // soft target ≈ 70k: forced nudge every turn above this
+    "minContextLimit": "35%",      // match the target (required once under the 0.45 kernel default)
+    "emergencyThresholdPercent": "95%"
+  }
+}
+```
+
+Resulting behavior, all autonomous: below the band nothing is compressed; above it the engine nudges every turn until context drops back under the target; a large read in between is forwarded intact; only a payload beyond the true native window hits the preflight wall. The same fields work per-provider / per-model (three-level merge), and hot-reload via the web UI.
 
 ### Three-level merge example
 

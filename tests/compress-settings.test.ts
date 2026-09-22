@@ -324,6 +324,34 @@ test("mergeCompress: reasoningGuard absent at all levels stays undefined", () =>
     assert.equal(merged.reasoningGuard, undefined);
 });
 
+test("parseCompressSettings: parses minContextLimit (ratio | percent string), rejects malformed (#1122)", () => {
+    assert.equal(parseCompressSettings({ minContextLimit: 0.35 })?.minContextLimit, 0.35);
+    assert.equal(parseCompressSettings({ minContextLimit: "35%" })?.minContextLimit, "35%");
+    assert.equal(parseCompressSettings({})?.minContextLimit, undefined);
+    assert.equal(parseCompressSettings({ minContextLimit: "abc" }), undefined);
+    assert.equal(parseCompressSettings({ minContextLimit: Number.NaN }), undefined);
+    assert.equal(parseCompressSettings({ minContextLimit: null }), undefined);
+});
+
+test("mergeCompress: minContextLimit cascades deepest-wins per field (#1122)", () => {
+    const merged = mergeCompress(
+        { minContextLimit: "40%", maxContextLimit: "70%" },
+        { minContextLimit: "35%" },
+        { maxContextLimit: "35%" },
+    );
+    assert.equal(merged.minContextLimit, "35%");
+    assert.equal(merged.maxContextLimit, "35%");
+    assert.equal(mergeCompress({ minContextLimit: "30%" }, undefined, { nudgeGrowthTokens: 90000 }).minContextLimit, "30%");
+});
+
+test("applyCompressSettings: minContextLimit maps to nudge.minContextLimitPct, unset keeps kernel default (#1122)", () => {
+    const base = defaultConfig(200000);
+    assert.equal(base.nudge.minContextLimitPct, 0.45);
+    assert.equal(applyCompressSettings(base, 200000, { minContextLimit: "35%" }).nudge.minContextLimitPct, 0.35);
+    assert.equal(applyCompressSettings(base, 200000, { minContextLimit: 0.2 }).nudge.minContextLimitPct, 0.2);
+    assert.equal(applyCompressSettings(base, 200000, { maxContextLimit: "75%" }).nudge.minContextLimitPct, 0.45);
+});
+
 test("parseCompressSettings: parses reasoningGuard sub-fields and rejects malformed (#739)", () => {
     const ok = parseCompressSettings({
         reasoningGuard: { enabled: true, maxContinue: 3, maxTierN: 6, markerText: " go ", base: 518, offset: -2, debugLog: true },

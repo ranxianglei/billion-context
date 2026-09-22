@@ -244,7 +244,7 @@
 - **类型：** `number | string`
 - **默认值：** *（模型的原始窗口）*
 - **状态：** ACTIVE
-- **说明：** 上下文窗口大小，以 token 为单位。它是引擎用于计算使用率比例的**分母**（`usage = tokens / modelContextLimit`）—— 它**不是**截断上限。接受绝对数值（`200000`）或百分比字符串（`"80%"` = 模型原始窗口的 80%，从内置表或 models.dev 注册表解析）。在每个层级都省略时，使用原始窗口。这是模型上限的最高优先级来源；它会覆盖内置表、旧版按模型的 `context` 字段以及顶层的 `modelContextLimit`。
+- **说明：** 上下文窗口大小，以 token 为单位。它是引擎用于计算使用率比例的**分母**（`usage = tokens / modelContextLimit`）—— 它**不是**截断上限。接受绝对数值（`200000`）或百分比字符串（`"80%"` = 模型原始窗口的 80%，从内置表或 models.dev 注册表解析）。在每个层级都省略时，使用原始窗口。这是模型上限的最高优先级来源；它会覆盖内置表、旧版按模型的 `context` 字段以及顶层的 `modelContextLimit`。注意它同时也是**预检压缩的硬墙**：一旦载荷达到该值，代理会在转发前主动折叠上下文；若折叠后仍超出，请求会直接快速失败而不是发往上游。若希望日常上下文保持较小、同时允许大读取任务突发到原始窗口，请让 `modelContextLimit` 保持为原始窗口值，改用 `maxContextLimit` / `minContextLimit` 作为软档位（见[软目标与弹性余量](#软目标与弹性余量-1122)）。
 
 #### `outputHeadroomMaxPct`
 
@@ -258,7 +258,14 @@
 - **类型：** `number | string`
 - **默认值：** `"75%"`
 - **状态：** ACTIVE
-- **说明：** 触发**强制压缩** nudge 的上下文使用率阈值。一旦使用率越过该比例，引擎就会触发一个绕过 growth-gate 与节奏检查的 nudge。接受比例值（`0.75`）或百分比字符串（`"75%"`）。值越小，压缩越早。映射到内核字段 `nudge.maxContextLimitPct`。
+- **说明：** 触发**强制压缩** nudge 的上下文使用率阈值。一旦使用率越过该比例，引擎就会触发一个绕过 growth-gate 与节奏检查的 nudge。使用率持续高于该比例时，nudge **每轮**触发（压力分支无节奏门控），这正是将其用作软上限时把上下文钉在目标附近的原因。接受比例值（`0.75`）或百分比字符串（`"75%"`）。值越小，压缩越早。映射到内核字段 `nudge.maxContextLimitPct`。
+
+#### `minContextLimit`
+
+- **类型：** `number | string`
+- **默认值：** *（内核默认 `0.45`）*
+- **状态：** ACTIVE
+- **说明：** nudge 活动区间的下限。使用率低于该值时，主动性 nudge 路径（首见 mass、tier 计数）保持休眠；高于它则正常武装。`maxContextLimit` 的越档压力分支**不受**此值门控 —— 强制 nudge 在 `maxContextLimit` 处照发。当把软目标降到内核默认 0.45 以下较多时（例如把上下文钉在大原始窗口的 35% 附近），应把它设为不高于 `maxContextLimit`，否则内核每轮都会记录一条 min>max 校验警告（#1122）。接受比例值（`0.35`）或百分比字符串（`"35%"`）。须满足 `minContextLimit <= maxContextLimit <= emergencyThresholdPercent`。映射到内核字段 `nudge.minContextLimitPct`。
 
 #### `emergencyThresholdPercent`
 
@@ -436,6 +443,26 @@
 - **默认值：** `true`
 - **状态：** ACTIVE
 - **说明：** 当使用率越过阈值时注入自动压缩 nudge 消息。设为 `false`（或 `ACP_COMPRESS_NUDGE=0`）可禁用 nudge 注入。同时禁用 `injectTool` 和 `injectNudge` 在功能上类似 `passthrough`，区别在于代理仍会跟踪 token 使用量。
+
+### 软目标与弹性余量 (#1122)
+
+自主 agent 常常同时要两件事：日常**活跃**上下文保持较小（成本/延迟），但允许单个任务在确实需要时（例如读大文件）突发远超该目标。把 `modelContextLimit` 设到模型原始窗口以下无法表达这种需求 —— 它既是软档位分母**又是**预检硬墙，任何超过它的载荷都会在任务中途被折叠或直接快速失败。
+
+改用软档位来表达：limit 保持原始窗口，用 `maxContextLimit`（目标低于 45% 时再加 `minContextLimit`）钉住目标：
+
+```jsonc
+// 模型原始窗口 200k；日常保持 ~70k 活跃，允许突发到真实边缘
+{
+  "compress": {
+    "modelContextLimit": 200000,   // = 原始窗口 → 硬墙只在真实边缘生效
+    "maxContextLimit": "35%",      // 软目标 ≈ 70k：超过后每轮强制 nudge
+    "minContextLimit": "35%",      // 与目标一致（低于内核默认 0.45 时必须设置）
+    "emergencyThresholdPercent": "95%"
+  }
+}
+```
+
+得到的行为全部是自主的：低于档位不做任何压缩；高于档位时每轮 nudge，直到上下文回落至目标之下；其间的较大读取原样转发；只有超过真实原始窗口的载荷才会撞上预检硬墙。这些字段同样支持按 provider / 按模型（三层合并），并可通过 Web UI 热更新。
 
 ### 三层合并示例
 

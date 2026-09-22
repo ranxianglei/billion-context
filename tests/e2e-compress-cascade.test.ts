@@ -14,6 +14,9 @@ import type { CompressSettings, ProviderRoutes } from "../src/config.ts";
 const UPSTREAM = "http://127.0.0.1:9999";
 const BASE = defaultConfig(200_000);
 
+// No provider/model compress blocks — global settings apply untouched.
+const PLAIN_ROUTES: ProviderRoutes = { [UPSTREAM]: {} };
+
 function routes(): ProviderRoutes {
     return {
         [UPSTREAM]: {
@@ -121,4 +124,37 @@ test("e2e compress cascade: a 2w limit fires the compress nudge at 2w tokens; a 
         renderTags: "text-only",
     });
     assert.ok(!largeTurn.nudge?.shouldInject, "2w tokens at a 100w limit stays under threshold → no compression");
+});
+
+function kernelWarningsDuring(fn: () => void): string[] {
+    const warnings: string[] = [];
+    const origWarn = console.warn;
+    console.warn = (...args: unknown[]) => { for (const a of args) warnings.push(String(a)); };
+    try { fn(); } finally { console.warn = origWarn; }
+    return warnings;
+}
+
+test("e2e #1122: soft target below the 0.45 kernel default fires cleanly once minContextLimit is set", () => {
+    const core = createCore();
+    const cfg = resolveRequestConfig(BASE, PLAIN_ROUTES, UPSTREAM, "gpt-plain", 200_000, { maxContextLimit: "35%", minContextLimit: "35%" });
+    assert.equal(cfg.nudge.maxContextLimitPct, 0.35);
+    assert.equal(cfg.nudge.minContextLimitPct, 0.35);
+
+    const warnings = kernelWarningsDuring(() => {
+        const turn = core.processTurn({ messages: compressibleMessages(), state: createInitialState(), config: cfg, tokenCount: 80_000, renderTags: "text-only" });
+        assert.ok(turn.nudge?.shouldInject, "80k on a 200k window (40%) crosses the 35% soft band → forced nudge fires below the old 0.45 floor");
+    });
+    assert.ok(warnings.every((w) => !w.includes("minContextLimitPct")), `no min>max validation warning once minContextLimit tracks the target, got: ${warnings.join(" | ")}`);
+});
+
+test("e2e #1122 control: a low maxContextLimit alone still trips the kernel validation warning", () => {
+    const core = createCore();
+    const cfg = resolveRequestConfig(BASE, PLAIN_ROUTES, UPSTREAM, "gpt-plain", 200_000, { maxContextLimit: "35%" });
+    assert.equal(cfg.nudge.minContextLimitPct, 0.45, "kernel default stays when the knob is unset");
+
+    const warnings = kernelWarningsDuring(() => {
+        const turn = core.processTurn({ messages: compressibleMessages(), state: createInitialState(), config: cfg, tokenCount: 80_000, renderTags: "text-only" });
+        assert.ok(turn.nudge?.shouldInject, "pressure branch is not gated by min — it fires at maxContextLimit regardless");
+    });
+    assert.ok(warnings.some((w) => w.includes("minContextLimitPct must not exceed nudge.maxContextLimitPct")), "min>max warning present without the knob (what the knob removes)");
 });

@@ -65,6 +65,7 @@ export function mergeCompress(
         modelContextLimit: pick("modelContextLimit"),
         outputHeadroomMaxPct: pick("outputHeadroomMaxPct"),
         maxContextLimit: pick("maxContextLimit"),
+        minContextLimit: pick("minContextLimit"),
         emergencyThresholdPercent: pick("emergencyThresholdPercent"),
         nudgeGrowthTokens: pick("nudgeGrowthTokens"),
         preserveRecentMessages: pick("preserveRecentMessages"),
@@ -190,6 +191,10 @@ export function hasCompressSettings(s: CompressSettings): boolean {
  *  compress.modelContextLimit override). Unset fields inherit the base value
  *  untouched. Field mapping:
  *  - `maxContextLimit` → `nudge.maxContextLimitPct` (force-nudge trigger).
+ *  - `minContextLimit` → `nudge.minContextLimitPct` (dormancy floor for the
+ *    proactive nudge paths; NOT a gate on the over-band pressure branch. Set at
+ *    or below maxContextLimit when the soft target sits under the kernel's 0.45
+ *    default, or the kernel logs a min>max validation warning — #1122).
  *  - `emergencyThresholdPercent` → `nudge.emergencyThresholdPct` +
  *    `truncate.threshold` (emergency + hard-truncate).
  *  - `nudgeGrowthTokens` → flattens the adaptive band to a fixed step
@@ -215,6 +220,7 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
     const nudge = { ...base.nudge };
     const truncate = { ...base.truncate };
     if (s.maxContextLimit !== undefined) nudge.maxContextLimitPct = parsePercent(s.maxContextLimit);
+    if (s.minContextLimit !== undefined) nudge.minContextLimitPct = parsePercent(s.minContextLimit);
     if (s.emergencyThresholdPercent !== undefined) {
         const pct = parsePercent(s.emergencyThresholdPercent);
         nudge.emergencyThresholdPct = pct;
