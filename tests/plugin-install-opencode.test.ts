@@ -13,6 +13,7 @@ import {
     pluginRemove,
     pluginStatusAll,
     pluginUpdate,
+    repinOpencodeEntryTo,
     selfPackageRoot,
 } from "../src/plugin-install.ts";
 
@@ -203,20 +204,55 @@ test("pluginInstall/remove/status opencode end-to-end (dev form under tsx)", asy
     assert.equal(ocStatus(), "not installed");
 
     assert.match(pluginRemove("opencode"), /not installed/);
+});
 
-    // #1108: update lane reports a stale pin (opencode-managed copy, bili never
-    // overwrites it) and confirms a current pin without hinting a re-run.
-    const cfg2 = readCfg();
-    cfg2.plugin = ["billion-context@0.0.1"];
-    fs.writeFileSync(file, JSON.stringify(cfg2, null, 2));
-    assert.equal(ocStatus(), "installed", "a pinned entry counts as installed");
-    const updStale = (await pluginUpdate(["opencode"], { packageName: "billion-context" })).join("\n");
-    assert.match(updStale, /pinned \(billion-context@0\.0\.1\).*re-pin/);
-    assert.match(updStale, /bili plugin install opencode/);
-    cfg2.plugin = [`billion-context@${JSON.parse(fs.readFileSync(path.join(selfPackageRoot(), "package.json"), "utf8")).version}`];
-    fs.writeFileSync(file, JSON.stringify(cfg2, null, 2));
-    const updCur = (await pluginUpdate(["opencode"], { packageName: "billion-context" })).join("\n");
-    assert.match(updCur, /pinned at the current version/);
+test("repinOpencodeEntryTo: stale pin re-pinned in place, foreign entries and position preserved (#1108)", () => {
+    const xdg = tempDir("bili-oc-xdg-");
+    process.env.XDG_CONFIG_HOME = xdg;
+    fs.mkdirSync(path.join(xdg, "opencode"), { recursive: true });
+    const file = path.join(xdg, "opencode", "opencode.json");
+    const readCfg = (): OcCfg => JSON.parse(fs.readFileSync(file, "utf8")) as OcCfg;
+    const cfg: OcCfg = { plugin: ["other-pkg", "billion-context@0.1.100", "billion-context@0.1.101"], compaction: { auto: false } };
+    fs.writeFileSync(file, JSON.stringify(cfg, null, 2));
+    const note = repinOpencodeEntryTo("0.1.135", NPM_ROOT);
+    assert.equal(note, "re-pinned billion-context@0.1.100 -> billion-context@0.1.135 (opencode loads it at next boot; bili never touches its package copy, #991)");
+    const after = readCfg();
+    assert.deepEqual(after.plugin, ["other-pkg", PIN]);
+    assert.deepEqual(after.compaction, cfg.compaction, "unrelated keys untouched");
+});
+
+test("repinOpencodeEntryTo: legacy bare entry pinned, map form and unknown version handled", () => {
+    const xdg = tempDir("bili-oc-xdg-");
+    process.env.XDG_CONFIG_HOME = xdg;
+    fs.mkdirSync(path.join(xdg, "opencode"), { recursive: true });
+    const file = path.join(xdg, "opencode", "opencode.json");
+    const readCfg = (): OcCfg => JSON.parse(fs.readFileSync(file, "utf8")) as OcCfg;
+    fs.writeFileSync(file, JSON.stringify({ plugin: [OPENCODE_NPM_ENTRY] }, null, 2));
+    assert.match(repinOpencodeEntryTo("0.1.135", NPM_ROOT)!, /re-pinned billion-context -> billion-context@0\.1\.135/);
+    assert.deepEqual(readCfg().plugin, [PIN]);
+    fs.writeFileSync(file, JSON.stringify({ plugins: { "@org/x": { options: { z: 1 } }, "billion-context@0.1.100": true } }, null, 2));
+    assert.match(repinOpencodeEntryTo("0.1.135", NPM_ROOT)!, /re-pinned/);
+    assert.deepEqual((readCfg() as Record<string, unknown>).plugins, { "@org/x": { options: { z: 1 } }, [PIN]: true });
+    assert.equal(repinOpencodeEntryTo("0.1.135", NPM_ROOT), undefined, "already current");
+    assert.equal(repinOpencodeEntryTo("", NPM_ROOT), undefined, "unknown version — no pin to write");
+    assert.equal(repinOpencodeEntryTo("0.1.135", selfPackageRoot()), undefined, "dev checkout lane is the shim form — nothing to re-pin");
+});
+
+test("pluginUpdate opencode lane: re-pins a stale entry to the resolved latest, then confirms", async () => {
+    const xdg = tempDir("bili-oc-xdg-");
+    process.env.XDG_CONFIG_HOME = xdg;
+    fs.mkdirSync(path.join(xdg, "opencode"), { recursive: true });
+    const file = path.join(xdg, "opencode", "opencode.json");
+    const readCfg = (): OcCfg => JSON.parse(fs.readFileSync(file, "utf8")) as OcCfg;
+    fs.writeFileSync(file, JSON.stringify({ plugin: ["billion-context@0.0.1"] }, null, 2));
+    let resolved = "9.9.9";
+    const lines = await pluginUpdate(["opencode"], { packageName: "billion-context", resolveVersion: async () => resolved });
+    // under tsx bili runs from the repo (dev form) -> repin refuses; the lane reports the stale pin
+    assert.match(lines.join("\n"), /pinned to billion-context@0\.0\.1 while the newest is billion-context@9\.9\.9/);
+    assert.deepEqual(readCfg().plugin, ["billion-context@0.0.1"], "dev-form bili must not rewrite the entry");
+    resolved = "0.0.1";
+    const cur = await pluginUpdate(["opencode"], { packageName: "billion-context", resolveVersion: async () => resolved });
+    assert.match(cur.join("\n"), /pinned at the newest version/);
 });
 
 const MCP_PINNED = { type: "local", command: ["/usr/bin/node", "/opt/old/dist/mcp.js"], environment: { BILI_MCP_PROXY: "http://127.0.0.1:18787" }, enabled: true };
