@@ -34,6 +34,7 @@ import { refreshDshProfileBundles, isDshProfileCopy } from "./dsh-channel.js";
 import { resolveDshHome, resolveKimiHome, resolveOmpHome, resolvePiHome } from "./client-config.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import type { FetchOptions } from "./fetch-util.js";
+import { repinOpencodeManagedEntry } from "./plugin-install.js";
 
 // BILI_UPDATE_REGISTRY overrides the registry base URL (full URL, e.g. a
 // loopback verdaccio in the hermetic e2e suite, #1153). Unset = production
@@ -532,6 +533,26 @@ function fetchWithEgress(url: string, init: FetchOptions): Promise<Response> {
     return fetch(url, init as RequestInit);
 }
 
+/** #1108: self-update path for a bili copy opencode manages — instead of
+ *  self-installing (forbidden, #991), re-pin the opencode config entry to the
+ *  newest registry version; opencode's own manager fetches that version at
+ *  next boot and serves it from local cache afterwards. Pure orchestration
+ *  over fetchRegistryVersion + repinOpencodeManagedEntry so tests can drive
+ *  it offline with a fetch stub. Never throws. */
+export async function repinOpencodeLaneIfNewer(
+    opts: Pick<UpdateOptions, "packageName" | "currentVersion" | "resolveProxy" | "updateTag">,
+    log: (level: "info" | "warn", msg: string) => void = loggerLog,
+): Promise<void> {
+    try {
+        const latest = await fetchRegistryVersion(opts, opts.packageName);
+        if (latest === undefined || !isVersionNewer(latest, opts.currentVersion)) return;
+        const note = repinOpencodeManagedEntry(latest);
+        if (note) log("info", `[update] ${note}`);
+    } catch (err) {
+        log("warn", `[update] opencode lane re-pin failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+}
+
 /** Resolve the current version of `packageName` on the configured dist-tag
  *  channel. Shared by the self-updater and `bili plugin update` (dsh profile
  *  refresh). Returns undefined on any failure — callers treat "unknown" as
@@ -632,6 +653,15 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         // global self-updater.
         const managed = installDir ? hostManagedInstall(installDir) : undefined;
         if (managed && installDir) {
+            if (managed.owner === "opencode") {
+                // #1108: the opencode lane self-updates by re-pinning its
+                // config entry to the newest registry version — opencode's
+                // own manager fetches that version at next boot (from local
+                // cache afterwards). The copy itself is never written (#991).
+                // Fire-and-forget inside the refusal branch: a failure here
+                // can never affect the updater's own path.
+                await repinOpencodeLaneIfNewer(opts, loggerLog);
+            }
             loggerLog("info", `[update] install dir is managed by ${managed.owner} (${installDir}) \u2014 skipping in-place self-update; update it via ${managed.channel} (#991)`);
             // #1196: a copy living inside a dsh profile bundle cannot wait
             // for a global self-update that may never come (dsh-market users
