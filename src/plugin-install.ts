@@ -1232,6 +1232,57 @@ function opencodeInstall(withMcp = false): string {
     return `opencode: installed -> ${file} (${notes.join("; ")})`;
 }
 
+/** Re-pin opencode's npm-form plugin entry to `version` in place (#1108).
+ *  Sync and offline (the version is passed in by callers that already
+ *  resolved it — e.g. the update lane resolves the registry's latest).
+ *  Rewrites ONLY the entry string; the opencode-managed package copy is
+ *  never written (#991) — opencode itself fetches the pinned version at
+ *  next boot, from local cache. Returns a user-facing note, or undefined
+ *  when there is nothing to do (dev-shim lane, no entry, or already
+ *  current). Foreign entries are preserved verbatim (#1002). */
+export function repinOpencodeEntryTo(version: string, root: string = selfPackageRoot()): string | undefined {
+    const desired = opencodeNpmEntry(version);
+    if (desired === OPENCODE_NPM_ENTRY) return undefined;
+    if (!isNpmInstallForm(root)) return undefined;
+    const file = opencodeTargetFile();
+    const { original, data } = loadOpencodeConfig(file);
+    const touched = new Set<string>();
+    let from: string | undefined;
+    const swap = (x: string): boolean => isOpencodeNpmEntry(x) && x !== desired;
+    for (const key of PLUGIN_KEYS) {
+        const v = data[key];
+        if (Array.isArray(v)) {
+            for (let i = 0; i < v.length; i++) {
+                if (typeof v[i] === "string" && swap(v[i])) {
+                    if (from === undefined) {
+                        from = v[i] as string;
+                        v[i] = desired;
+                    } else {
+                        v.splice(i, 1);
+                        i--;
+                    }
+                    touched.add(key);
+                }
+            }
+        } else if (v !== null && typeof v === "object") {
+            const map = v as Record<string, unknown>;
+            for (const k of Object.keys(map)) {
+                if (swap(k)) {
+                    if (from === undefined) {
+                        from = k;
+                        map[desired] = map[k];
+                    }
+                    delete map[k];
+                    touched.add(key);
+                }
+            }
+        }
+    }
+    if (from === undefined) return undefined;
+    writeOpencodeConfig(file, original, data, touched);
+    return `re-pinned ${from} -> ${desired} (opencode loads it at next boot; bili never touches its package copy, #991)`;
+}
+
 function opencodeRemove(): string {
     const file = opencodeTargetFile();
     const { original, data } = loadOpencodeConfig(file);
@@ -2091,6 +2142,9 @@ export interface PluginUpdateOpts {
     packageName: string;
     resolveProxy?: (url: string) => string | undefined;
     updateTag?: string;
+    /** Resolves the newest registry version for a lane (default: live
+     *  fetchRegistryVersion). Tests inject a fake to stay offline. */
+    resolveVersion?: () => Promise<string | undefined>;
     /** Runs the global self-update check before per-lane reports. The CLI
      *  wires this to checkForUpdate(force); tests omit it to stay offline. */
     globalCheck?: () => Promise<void>;
@@ -2101,13 +2155,16 @@ export interface PluginUpdateOpts {
  *  date, each through its OWN owner (#991 single-writer):
  *  - reference lanes (omp/claude/codex/kimi) need nothing per-lane: they
  *    point at the global install, so only the global copy updates;
- *  - host-managed copies (pi npm entry, opencode plugin entry) are never
- *    overwritten by bili — the report says which host command upgrades
- *    them;
+ *  - host-managed copies (pi npm entry) are never overwritten by bili — the
+ *    report says which host command upgrades them;
+ *  - the opencode plugin entry is re-pinned to the newest registry version
+ *    (only the entry string — the opencode-managed package copy stays
+ *    opencode's, #991); the install lane pins the installing bili's version
+ *    (#1108), this lane reconciles it to npm latest;
  *  - dsh profile bundles are re-resolved to the latest registry version
  *    through dsh's own plugin channel.
- *  Returns user-facing lines. Network is only touched when a dsh profile
- *  actually depends on bili (version lookup) or globalCheck is provided. */
+ *  Returns user-facing lines. Network is only touched when the opencode or
+ *  dsh lane needs a version lookup, or globalCheck is provided. */
 export async function pluginUpdate(agents: readonly PluginAgent[] | undefined, opts: PluginUpdateOpts): Promise<string[]> {
     const log = opts.log ?? (() => {});
     const lines: string[] = [];
@@ -2139,17 +2196,17 @@ async function updateLane(agent: PluginAgent, opts: PluginUpdateOpts, log: (leve
         return ["pi: not installed"];
     }
     if (agent === "opencode") {
+        const latest = opts.resolveVersion ? await opts.resolveVersion() : await fetchRegistryVersion(opts, opts.packageName);
+        const want = opencodeNpmEntry(latest ?? selfVersion());
+        const note = repinOpencodeEntryTo(latest ?? selfVersion());
+        if (note) return [`opencode: ${note}`];
         const file = opencodeTargetFile();
         const { data } = loadOpencodeConfig(file);
         const dir = opencodePluginDir(file);
         const pins = PLUGIN_KEYS.flatMap((k) => pluginEntries(data, k)).filter((p) => isOpencodeNpmEntry(p));
         if (pins.length > 0) {
-            const cur = opencodeNpmEntry(selfVersion());
-            const stale = pins.filter((p) => p !== cur);
-            if (stale.length > 0) {
-                return [`opencode: plugin copy is opencode-managed and pinned (${stale.join(", ")}) while this bili is ${selfVersion()} — bili never overwrites it (#991); re-run \`bili plugin install opencode\` to re-pin`];
-            }
-            return ["opencode: the plugin copy is opencode-managed and pinned at the current version — bili never overwrites it (#991)"];
+            if (pins.every((p) => p === want)) return ["opencode: plugin entry pinned at the newest version — bili never overwrites its package copy (#991)"];
+            return [`opencode: plugin entry pinned to ${pins.join(", ")} while the newest is ${want} and this bili runs from a checkout that cannot re-pin it — global \`bili plugin update opencode\` re-pins`];
         }
         if (PLUGIN_KEYS.some((k) => pluginEntries(data, k).some((p) => p === dir))) {
             return ["opencode: plugin points at this checkout — rebuild the checkout (`npm run build`) to pick up changes"];
