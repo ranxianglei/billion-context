@@ -9,9 +9,11 @@
 //   codex    ~/.codex/config.toml        [mcp_servers.bili]
 //   opencode <cfg>/opencode.json{c}|config.json (highest-precedence existing; #927)
 //            mcp.bili + native plugin dir + compaction.auto=false
-//          (plugin entry #925: bare "billion-context" for npm installs — opencode
-//           loads it via exports["./server"] and manages install/upgrade itself;
-//           local shim dir for checkout/dev installs, which are not portable)
+//          (plugin entry #925: version-pinned "billion-context@<v>" for npm
+//           installs — opencode loads it via exports["./server"] and manages
+//           install/upgrade itself; pinned so boot resolves from local cache
+//           instead of re-asking the registry (#1108); local shim dir for
+//           checkout/dev installs, which are not portable)
 //   dsh      no file of its own — drives dsh's own plugin channel per profile
 //            (`dsh plugin --profile <name> add|remove`, #966); profile copies
 //            follow global self-updates via dsh-channel.refreshDshProfileBundles
@@ -1070,6 +1072,22 @@ export function isNpmInstallForm(root: string): boolean {
 
 export const OPENCODE_NPM_ENTRY = "billion-context";
 
+// #1108: a bare npm spec makes opencode's managed service re-resolve @latest
+// against the npm registry at EVERY boot — on large instances that round-trip
+// pushes cold start past the ~2s health window and the supervisor
+// respawn-loops forever. A version-pinned spec keys opencode's plugin cache by
+// concrete version, so boots after the first are served from local cache
+// without touching the network. `bili plugin install opencode` re-pins to the
+// running version; an unpinned/unknown version falls back to the bare name
+// (still loadable, just no boot-locality guarantee).
+export function opencodeNpmEntry(version: string): string {
+    return /^\d+\.\d+\.\d+/.test(version) && version !== "0.0.0" ? `${OPENCODE_NPM_ENTRY}@${version}` : OPENCODE_NPM_ENTRY;
+}
+
+export function isOpencodeNpmEntry(x: string): boolean {
+    return x === OPENCODE_NPM_ENTRY || x.startsWith(`${OPENCODE_NPM_ENTRY}@`);
+}
+
 const DEV_FORM_NOTE = "dev form: machine-local shim, not portable across machines — an npm install writes the bare package name instead";
 
 // #925: pick + apply the plugin entry for this install form. Replaces any
@@ -1082,14 +1100,13 @@ const DEV_FORM_NOTE = "dev form: machine-local shim, not portable across machine
 // scalars) are preserved verbatim in form and position. A strings-only
 // projection must never be written back, and "plugin present" must mean
 // the key was left untouched (no rewrite of the surrounding file either).
-export function applyOpencodePluginEntry(args: { data: Record<string, unknown>; root: string; shimDir: string; agentJs: string; key?: "plugin" | "plugins"; touched?: Set<string> }): string[] {
+export function applyOpencodePluginEntry(args: { data: Record<string, unknown>; root: string; shimDir: string; agentJs: string; key?: "plugin" | "plugins"; touched?: Set<string>; version?: string }): string[] {
     const { data, root, shimDir, agentJs } = args;
     const key = args.key ?? "plugin";
     const touched = args.touched ?? new Set<string>();
-    const ours = [OPENCODE_NPM_ENTRY, shimDir];
     const npmForm = isNpmInstallForm(root);
-    const entry = npmForm ? OPENCODE_NPM_ENTRY : shimDir;
-    const isOurs = (x: unknown): boolean => typeof x === "string" && ours.includes(x);
+    const entry = npmForm ? opencodeNpmEntry(args.version ?? "") : shimDir;
+    const isOurs = (x: unknown): boolean => typeof x === "string" && (isOpencodeNpmEntry(x) || x === shimDir);
     const raw = data[key];
     const oursIn = (): string[] => {
         if (Array.isArray(raw)) return raw.filter((x): x is string => isOurs(x));
@@ -1117,8 +1134,8 @@ export function applyOpencodePluginEntry(args: { data: Record<string, unknown>; 
     }
     touched.add(key);
     if (npmForm) {
-        if (replaced.length === 0) return [`plugin -> ${OPENCODE_NPM_ENTRY}`];
-        return [`plugin -> ${OPENCODE_NPM_ENTRY} (replaced ${replaced.join(", ")})`];
+        if (replaced.length === 0) return [`plugin -> ${entry}`];
+        return [`plugin -> ${entry} (replaced ${replaced.join(", ")})`];
     }
     if (replaced.length === 0) return [`plugin -> ${shimDir}`, DEV_FORM_NOTE];
     return [`plugin -> ${shimDir} (replaced ${replaced.join(", ")})`, DEV_FORM_NOTE];
@@ -1194,7 +1211,7 @@ function opencodeInstall(withMcp = false): string {
     // below snapshots the original config to .bili-bak (first write only).
     stripLegacyOpencodeAcp(data, notes, touched);
     // #927 entry key for this host + #925 entry form for this install form.
-    notes.push(...applyOpencodePluginEntry({ data, root, shimDir: opencodePluginDir(file), agentJs, key: pickPluginKey(detectOpencodeMajor()), touched }));
+    notes.push(...applyOpencodePluginEntry({ data, root, shimDir: opencodePluginDir(file), agentJs, key: pickPluginKey(detectOpencodeMajor()), touched, version: selfVersion() }));
 
     // Single compression owner: with the native plugin installed, ACP owns
     // compression — disable host auto-compaction (merge-preserving; the key is
@@ -1237,7 +1254,7 @@ function opencodeRemove(): string {
     const removed: string[] = [];
     for (const key of PLUGIN_KEYS) {
         const v = data[key];
-        const hit = (x: string): boolean => x === OPENCODE_NPM_ENTRY || x === dir;
+        const hit = (x: string): boolean => isOpencodeNpmEntry(x) || x === dir;
         if (Array.isArray(v)) {
             const survivors = v.filter((x) => !(typeof x === "string" && hit(x)));
             if (survivors.length === v.length) continue;
@@ -1297,7 +1314,7 @@ function opencodeStatus(): string {
     const { data } = loadOpencodeConfig(file);
     const mcp = data.mcp;
     const dir = opencodePluginDir(file);
-    const listed = PLUGIN_KEYS.some((k) => pluginEntries(data, k).some((p) => p === OPENCODE_NPM_ENTRY || p === dir));
+    const listed = PLUGIN_KEYS.some((k) => pluginEntries(data, k).some((p) => isOpencodeNpmEntry(p) || p === dir));
     return (isPlainMcpObject(mcp) && "bili" in mcp) || listed ? "installed" : "not installed";
 }
 
@@ -2125,8 +2142,14 @@ async function updateLane(agent: PluginAgent, opts: PluginUpdateOpts, log: (leve
         const file = opencodeTargetFile();
         const { data } = loadOpencodeConfig(file);
         const dir = opencodePluginDir(file);
-        if (PLUGIN_KEYS.some((k) => pluginEntries(data, k).some((p) => p === OPENCODE_NPM_ENTRY))) {
-            return ["opencode: the plugin copy is opencode-managed — upgrade/reload it via opencode's plugin manager; bili never overwrites it (#991)"];
+        const pins = PLUGIN_KEYS.flatMap((k) => pluginEntries(data, k)).filter((p) => isOpencodeNpmEntry(p));
+        if (pins.length > 0) {
+            const cur = opencodeNpmEntry(selfVersion());
+            const stale = pins.filter((p) => p !== cur);
+            if (stale.length > 0) {
+                return [`opencode: plugin copy is opencode-managed and pinned (${stale.join(", ")}) while this bili is ${selfVersion()} — bili never overwrites it (#991); re-run \`bili plugin install opencode\` to re-pin`];
+            }
+            return ["opencode: the plugin copy is opencode-managed and pinned at the current version — bili never overwrites it (#991)"];
         }
         if (PLUGIN_KEYS.some((k) => pluginEntries(data, k).some((p) => p === dir))) {
             return ["opencode: plugin points at this checkout — rebuild the checkout (`npm run build`) to pick up changes"];
