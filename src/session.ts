@@ -672,7 +672,7 @@ const REWRITE_MAX_KNOWN_RATIO = 0.5;
 // prior history (clients keep a tail through compaction), so require both
 // before treating the shrink as real. Missing a genuine rewrite is cheap
 // (stale map entries linger until session end); a false positive is fatal.
-const REWRITE_MIN_INCOMING_TOTAL = 10;
+export const REWRITE_MIN_INCOMING_TOTAL = 10;
 
 export interface RewriteDetection {
     detected: boolean;
@@ -700,6 +700,29 @@ export function detectUnannouncedHistoryRewrite(
         knownIncoming > 0 &&
         knownIncoming / incomingTotal < REWRITE_MAX_KNOWN_RATIO;
     return { detected, knownBefore, incomingTotal, knownIncoming };
+}
+
+/** #1195: message ids are content hashes — if a client resends history whose
+ *  bytes changed (resume/re-serialization, edit, duplicate-cluster shift), the
+ *  ids of compressed-range messages no longer match the block's covered set,
+ *  and those messages silently re-enter the wire unfolded even though the
+ *  compress result already reported them as saved. Returns how many of the
+ *  covered ids are present in the resent history, or null when coverage is
+ *  complete (or nothing was covered). */
+export interface FoldCoverage {
+    expected: number;
+    matched: number;
+}
+
+export function foldCoverage(
+    coveredBefore: ReadonlySet<string>,
+    liveRawIds: Iterable<string>,
+): FoldCoverage | null {
+    if (coveredBefore.size === 0) return null;
+    const incoming = new Set(liveRawIds);
+    let matched = 0;
+    for (const id of coveredBefore) if (incoming.has(id)) matched++;
+    return matched < coveredBefore.size ? { expected: coveredBefore.size, matched } : null;
 }
 
 /** Flush a session to disk and drop it from memory (LRU eviction). Refuses to
