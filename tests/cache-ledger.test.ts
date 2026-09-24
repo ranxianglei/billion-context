@@ -288,3 +288,87 @@ test("handleAcpCache rejects non-full detail values back to summary", () => {
     recordCacheSample(session, { at: T0 + 1000, input: 10000, cached: 9000 });
     assert.match(handleAcpCache(session, { detail: "everything" }), /\[summary/);
 });
+
+/** Two-fold session with ONE fully-cached sample between the folds (T stays 0,
+ *  k=1 on both the incremental and kernel-batch paths): fold #1 S=5000 σ=1000,
+ *  fold #2 S=1000 σ=100. */
+function makeTwoFoldSession(): Session {
+    const s = makeSession();
+    recordCacheSample(s, { at: T0 + 1000, input: 100000, cached: 99000 });
+    recordCacheFoldsFromBlocks(s, [block("b1", T0 + 1100, 5000, 4000)], { V: 100000, Vp: 96000 });
+    recordCacheSample(s, { at: T0 + 2000, input: 96000, cached: 96000 });
+    recordCacheFoldsFromBlocks(s, [block("b2", T0 + 3000, 1000, 400)], { V: 96000, Vp: 95100 });
+    recordCacheSample(s, { at: T0 + 4000, input: 95100, cached: 95100 });
+    return s;
+}
+
+test("unstamped sessions keep the pre-#1279 default profile and economics", () => {
+    const r = buildSessionCacheReport(makeTwoFoldSession());
+    assert.deepEqual(r.profile, { w: 1, r: 0.1, q: 4 });
+    const f = r.folds[0]!;
+    // (w−r)·T + q·σ − r·S with T=0 → 4·1000 − 0.1·5000
+    assert.equal(f.oneTimeCostUnits, 3500);
+    assert.equal(f.perTurnSavingUnits, 400);
+});
+
+test("stamped priceProfile re-prices fold economics end to end (#1279)", () => {
+    const baseline = buildSessionCacheReport(makeTwoFoldSession());
+    const ds = makeTwoFoldSession();
+    ds.metadata.cachePriceProfile = { w: 1, r: 0.1, q: 1.5 };
+    const r = buildSessionCacheReport(ds);
+
+    assert.deepEqual(r.profile, { w: 1, r: 0.1, q: 1.5 });
+    const fb = baseline.folds[0]!;
+    const fd = r.folds[0]!;
+    assert.equal(fd.T, fb.T);
+    assert.equal(fd.S, fb.S);
+    assert.equal(fd.sigma, fb.sigma);
+    assert.equal(fd.netTokenDelta, fb.netTokenDelta);
+    assert.equal(fd.turnsToNextFold, fb.turnsToNextFold);
+    assert.equal(fb.oneTimeCostUnits, 3500);
+    assert.equal(fd.oneTimeCostUnits, 1000);
+    assert.equal(fb.perTurnSavingUnits, 400);
+    assert.equal(fd.perTurnSavingUnits, 400);
+    assert.equal(fb.breakevenTurns, 8.75);
+    assert.equal(fd.breakevenTurns, 2.5);
+    assert.equal(fb.paidBack, false);
+    assert.equal(fd.paidBack, false);
+    assert.match(handleAcpCache(ds), /FOLD ECONOMICS \(2 folds @ w=1 r=0\.1 q=1\.5\)/);
+
+    const batch = buildCacheReport(
+        [
+            { at: T0 + 1000, input: 100000, cached: 99000 },
+            { at: T0 + 2000, input: 96000, cached: 96000 },
+            { at: T0 + 4000, input: 95100, cached: 95100 },
+        ],
+        [
+            { at: T0 + 1100, tokensCompressed: 5000, summaryTokens: 1000, viewBefore: 100000, viewAfter: 96000 },
+            { at: T0 + 3000, tokensCompressed: 1000, summaryTokens: 100, viewBefore: 96000, viewAfter: 95100 },
+        ],
+        { priceProfile: { w: 1, r: 0.1, q: 1.5 } },
+    );
+    const bf = batch.folds[0]!;
+    assert.deepEqual(r.profile, batch.profile);
+    assert.equal(fd.oneTimeCostUnits, bf.oneTimeCostUnits);
+    assert.equal(fd.perTurnSavingUnits, bf.perTurnSavingUnits);
+    assert.equal(fd.breakevenTurns, bf.breakevenTurns);
+    assert.equal(fd.paidBack, bf.paidBack);
+});
+
+test("partial stamped profile falls back per field to kernel defaults (#1279)", () => {
+    const s = makeTwoFoldSession();
+    s.metadata.cachePriceProfile = { q: 2 };
+    const r = buildSessionCacheReport(s);
+    assert.deepEqual(r.profile, { w: 1, r: 0.1, q: 2 });
+    assert.equal(r.folds[0]!.oneTimeCostUnits, 2 * 1000 - 0.1 * 5000);
+});
+
+test("corrupt stamped profile degrades to kernel defaults instead of poisoning the report (#1279)", () => {
+    for (const bad of ["junk", [1, 0.1], null, { w: -1 }, { r: "cheap" }, { q: Number.NaN }]) {
+        const s = makeTwoFoldSession();
+        (s.metadata as Record<string, unknown>).cachePriceProfile = bad;
+        const r = buildSessionCacheReport(s);
+        assert.deepEqual(r.profile, { w: 1, r: 0.1, q: 4 }, JSON.stringify(bad));
+        assert.equal(r.folds[0]!.oneTimeCostUnits, 3500, JSON.stringify(bad));
+    }
+});

@@ -883,6 +883,10 @@ API: `bili plugin install claude` writes a model-mediated
 `commands/acp-cache.md` markdown command whose prompt drives the `acp_cache`
 MCP tool and pastes the report back verbatim. codex/kimi/hermes expose no
 user-typable command seam — ask the model to call its `acp_cache` tool directly.
+Per-fold P&L verdicts are priced by the optional `compress.priceProfile`
+(normalized multipliers over the input-token unit; default = built-in
+Anthropic-ratio approximation) — set it per provider for non-Anthropic upstreams
+so breakeven/PAID BACK reflect their actual economics (CONFIGURATION.md, #1279).
 
 The same seam carries `/acp-rule` (#1251) — the human entry point to the
 persistent-rules feature (identical output to the `acp_rule` tool): pi/omp

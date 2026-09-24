@@ -432,12 +432,33 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
   - `markerText: string` — nudge text appended as a commentary message each continued round (default `"Continue thinking..."`).
   - `base: number` / `offset: number` — the lattice signature `tokens == base*n + offset` (defaults `518` / `-2`). Override if another model family truncates on a different lattice.
   - `debugLog: boolean` — verbose per-round logging (default `false`).
+   ```jsonc
+   // enable globally
+   { "compress": { "reasoningGuard": { "enabled": true } } }
+    // tune per provider (placement scopes it to that provider's traffic)
+    { "providers": { "https://your-relay.example": { "compress": { "reasoningGuard": { "enabled": true, "maxContinue": 2 } } } } }
+   ```
+
+#### `priceProfile`
+
+- **Type:** `object` (`{ w?, r?, q? }`, all non-negative numbers)
+- **Default:** *(unset — each unset field falls back to `w: 1`, `r: 0.1`, `q: 4`, the built-in Anthropic-ratio approximation; reports are byte-identical to pre-#1279 output when the key is absent)*
+- **Status:** ACTIVE
+- **Description:** Price profile for the **cache-economics verdicts** in the session cache report (`acp_cache` tool / `/acp-cache` command / `GET /__bili/cache-report`, #800/#1279). The per-fold P&L fields (`oneTimeCostUnits`, `perTurnSavingUnits`, `breakevenTurns`, `paidBack`) are expressed in input-token-equivalent units using **normalized multipliers over the input-token unit (p_in = 1)**:
+  - `w` = cacheWrite price ÷ input price (write-through surcharge; `1` when the provider bills cache writes at the normal input rate)
+  - `r` = cacheRead price ÷ input price (cached-input discount factor)
+  - `q` = output price ÷ input price
+  The same fold therefore shows a different breakeven point and PAID BACK verdict under different providers' economics — e.g. under the default profile DeepSeek-class upstreams (low output multiple) look like they pay back slower than they really do (#1279). Sub-fields merge deepest-wins across the three levels like every other CompressSettings field (set `q` at provider level, refine one field at model level). The last request's effective value is stamped onto the session, so every report face prices folds with the profile that governed that session's most recent turn — no request-context plumbing needed. **Report-only**: the profile never affects compression triggers, cadence, or any wire behavior. Examples:
   ```jsonc
-  // enable globally
-  { "compress": { "reasoningGuard": { "enabled": true } } }
-   // tune per provider (placement scopes it to that provider's traffic)
-   { "providers": { "https://your-relay.example": { "compress": { "reasoningGuard": { "enabled": true, "maxContinue": 2 } } } } }
+  // Anthropic ≈ default: cheap cached reads (~0.1×), ~4× output multiple → omit the key
+  // DeepSeek-V3 ≈ low output multiple — the default overstates its breakeven ~2.7×
+  { "providers": { "https://api.deepseek.com": { "compress": { "priceProfile": { "w": 1, "r": 0.1, "q": 1.5 } } } } }
+  // OpenAI GPT-4o/o-series: 50% cached-read discount, flat writes, 4× output
+  { "providers": { "https://api.openai.com": { "compress": { "priceProfile": { "w": 1, "r": 0.5, "q": 4 } } } } }
+  // Self-hosted / free tier: everything costs zero tokens of your budget
+  { "compress": { "priceProfile": { "w": 0, "r": 0, "q": 0 } } }
   ```
+  Use list prices relative to the same model's normal input price; relays with custom markup should use their effective rates.
 
 #### `outputSteering`
 

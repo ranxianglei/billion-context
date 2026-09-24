@@ -432,12 +432,33 @@
   - `markerText: string` — 每个续写回合追加的 commentary 提示文本（默认 `"Continue thinking..."`）。
   - `base: number` / `offset: number` — 晶格签名 `tokens == base*n + offset`（默认 `518` / `-2`）。若其他模型家族在不同晶格上截断则覆盖。
   - `debugLog: boolean` — 逐回合详细日志（默认 `false`）。
+   ```jsonc
+   // 全局开启
+   { "compress": { "reasoningGuard": { "enabled": true } } }
+    // 按 provider 调参（放在哪一层就作用于哪一层的流量）
+    { "providers": { "https://your-relay.example": { "compress": { "reasoningGuard": { "enabled": true, "maxContinue": 2 } } } } }
+   ```
+
+#### `priceProfile`
+
+- **类型：** `object`（`{ w?, r?, q? }`，均为非负数）
+- **默认值：** *（未设置 —— 未设置的字段各自回落到 `w: 1`、`r: 0.1`、`q: 4`，内置的 Anthropic 比例近似；整键缺省时报告输出与 #1279 之前逐字节一致）*
+- **状态：** ACTIVE
+- **说明：** 会话缓存报告（`acp_cache` 工具 / `/acp-cache` 命令 / `GET /__bili/cache-report`，#800/#1279）中**压缩经济学判定**所用的价格档。每个 fold 的损益字段（`oneTimeCostUnits`、`perTurnSavingUnits`、`breakevenTurns`、`paidBack`）以输入 token 当量为单位，采用**相对输入 token 单价（p_in = 1）归一化的乘数**：
+  - `w` = cacheWrite 价格 ÷ input 价格（写穿透附加费；供应商按正常 input 价计费 cache 写入时为 `1`）
+  - `r` = cacheRead 价格 ÷ input 价格（缓存命中折扣因子）
+  - `q` = output 价格 ÷ input 价格
+  同一 fold 在不同供应商的价格体系下会给出不同的回本点与 PAID BACK 判定——例如默认档下 DeepSeek 类上游（output 倍数低）的回本点被高估约 2.7×（#1279）。子字段与其他 CompressSettings 字段一样按“深层覆盖”三级合并（provider 层设 `q`、model 层精调单个字段均可）。最近一次请求生效的值会被戳记到会话上，因此所有报告出口都用该会话最近一轮所适用的价格档计价——无需请求级上下文管道。**纯报表面**：价格档绝不影响压缩触发、频率或任何 wire 行为。示例：
   ```jsonc
-  // 全局开启
-  { "compress": { "reasoningGuard": { "enabled": true } } }
-   // 按 provider 调参（放在哪一层就作用于哪一层的流量）
-   { "providers": { "https://your-relay.example": { "compress": { "reasoningGuard": { "enabled": true, "maxContinue": 2 } } } } }
+  // Anthropic ≈ 默认档：缓存读取便宜（~0.1×）、output 倍数 ~4× → 直接省略该键
+  // DeepSeek-V3 ≈ output 倍数低 —— 默认档把它的回本点高估了约 2.7×
+  { "providers": { "https://api.deepseek.com": { "compress": { "priceProfile": { "w": 1, "r": 0.1, "q": 1.5 } } } } }
+  // OpenAI GPT-4o/o 系列：缓存读取五折、写入平价、output 4×
+  { "providers": { "https://api.openai.com": { "compress": { "priceProfile": { "w": 1, "r": 0.5, "q": 4 } } } } }
+  // 自托管 / 免费额度：一切不消耗你的 token 预算
+  { "compress": { "priceProfile": { "w": 0, "r": 0, "q": 0 } } }
   ```
+  请用同一模型正常输入价的相对挂牌价；有自定义加成的中转站应填实际生效费率。
 
 #### `outputSteering`
 

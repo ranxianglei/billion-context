@@ -2158,6 +2158,13 @@ async function handle(
             ): Promise<{ body: string | Buffer; prepared: Prepared | null } | null> => {
                 const runPrepare = async (): Promise<Prepared> => {
                     const cs = resolveCompress(opts.routes, route?.rewrittenUrl, requestModel, opts.compress);
+                    // #1279: stamp this request's effective cache-economics price
+                    // profile on the session so request-context-free report faces
+                    // (acp_cache / /acp-cache / __bili/cache-report) price folds
+                    // with the profile that governed this turn; unset clears it
+                    // (latest-wins, like activePack). Report-only — no trigger impact.
+                    if (cs.priceProfile !== undefined && Object.keys(cs.priceProfile).length > 0) session.metadata.cachePriceProfile = cs.priceProfile;
+                    else delete session.metadata.cachePriceProfile;
                     const visibilityMarkers = cs.visibilityMarkers ?? true;
                     const reasoningCfg = cs.reasoning;
                     const keepRecent = cs.stripImagesKeepRecent ?? DEFAULT_STRIP_IMAGES_KEEP_RECENT;
