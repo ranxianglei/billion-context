@@ -272,7 +272,7 @@ overwrites that copy in place:
 |------|---------------|------------|
 | global `bili` | npm global (`npm i -g billion-context`) | `bili update` / background auto-update |
 | **pi** | pi's package manager (npm form) | **`pi update`** — bili never overwrites it |
-| **opencode** | opencode's plugin dir | **opencode's plugin manager** — bili never overwrites it |
+| **opencode** | opencode's package cache (`~/.cache/opencode/packages/billion-context@*/node_modules/`) | **manual** — opencode never auto-updates installed plugins: remove the `billion-context@*` dirs and restart opencode (it reinstalls latest); bili never overwrites it (#1234) |
 | **dsh** | each profile's pnpm store | a periodic check re-runs dsh's plugin channel per profile — driven by the global bili self-update **or by the profile copy's own proxy** when the global isn't running (dsh-market installs, #1196); manual: `dsh plugin add billion-context@latest`. pnpm's hardlinked store must never be copied over in place |
 | omp / claude / codex / kimi / zcode | no copy — entries point at the global bili install | they update together with the global copy |
 | **hermes** | `~/.hermes/plugins/billion-context/` (copied files + `bili.json` sidecar pointing at the global dist) | **`bili plugin update hermes`** re-copies the files; the sidecar tracks the global install |
@@ -286,6 +286,11 @@ so direct callers cannot corrupt a store either. Mixing *commands* is fine
 mixing *writers* is what the guard forbids. `bili plugin update [client]`
 is the one command that drives every lane through its own owner and prints
 the per-lane update path (`bili plugin list` shows the same per-lane channel).
+The opencode lane gets extra **staleness visibility** (#1234): because
+opencode exposes no upgrade channel at all, its copy's proxy logs a
+rate-limited warning when it trails the registry, with the exact manual
+refresh command — the dsh lane instead self-heals, since dsh has a drivable
+channel.
 
 At load the plugin **spawns its own proxy** (attaches to a healthy running
 one only when it passes the attach gate below; a parent-pid watchdog tears
@@ -825,7 +830,15 @@ origin pin, so it survives the plugin's ephemeral-port proxy restarts (#926).
 Entry form depends on how THIS bili was installed: an **npm install** writes
 the bare package name (`"plugin": ["billion-context"]`) — the package
 publishes `exports["./server"]` → `dist/agent/opencode-native.js`, so
-opencode loads it through its own Npm.add machinery; zero absolute paths, portable. (That exact bare-name entry doubles as a hand-install without bili — see Option 1.) A **git checkout / dev build** falls back to a local shim dir
+opencode loads it through its own Npm.add machinery into
+`<XDG_CACHE_HOME>/opencode/packages/billion-context@*/node_modules/`; zero
+absolute paths, portable. **Note: opencode performs the first install only —
+it never auto-upgrades an installed plugin** (there is no upgrade channel,
+#1234), so the copy stays at its install version. Upgrading is manual: remove
+the `billion-context@*` dirs above and restart opencode (it reinstalls latest
+on next startup). bili never overwrites that copy (#991); its proxy logs a
+rate-limited warning when the copy trails the registry, with that exact command.
+(That exact bare-name entry doubles as a hand-install without bili — see Option 1.) A **git checkout / dev build** falls back to a local shim dir
 (`<configDir>/plugins/billion-context/index.js` → this checkout's
 `dist/agent/opencode-native.js`) — machine-local by construction; re-running
 install from an npm install migrates the entry back to the bare name.

@@ -235,14 +235,25 @@ export interface HostManagedInstall {
     channel: string;
 }
 
+/** #1234: opencode installs npm-form plugins under its XDG *cache* home
+ *  (<XDG_CACHE_HOME>/opencode/packages/<spec>/node_modules/<name>) — NOT under
+ *  the data home. Exported so user-facing messages can name the real path. */
+export function opencodeCacheHome(env: NodeJS.ProcessEnv = process.env): string {
+    const xdgCache = env.XDG_CACHE_HOME && env.XDG_CACHE_HOME.trim().length > 0 ? env.XDG_CACHE_HOME : path.join(os.homedir(), ".cache");
+    return path.join(xdgCache, "opencode");
+}
+
 /** #991 single-writer rule: detect install directories that are OWNED by a
  *  host's package manager — a pnpm virtual store (dsh profile bundles, pnpm
  *  global) or a host agent's data tree (pi's package dir, opencode's plugin
- *  dir, dsh/kimi homes). An in-place tarball copy over such a directory
+ *  dirs, dsh/kimi homes). An in-place tarball copy over such a directory
  *  corrupts the owner's bookkeeping (npm/pnpm metadata drift, #953) or, for
  *  pnpm, the hardlinked content files shared across every install in the
  *  store. Returns the owner + its update channel, or undefined when the copy
  *  is bili-owned (npm global, manual install) and may be updated in place.
+ *  opencode has TWO candidate homes (#1234): the XDG-data home (defensive)
+ *  and the XDG-cache home where opencode 1.x actually places npm-form
+ *  plugins — missing the cache home let copies there self-update in place.
  *  Exported for tests. */
 export function hostManagedInstall(installDir: string, env: NodeJS.ProcessEnv = process.env): HostManagedInstall | undefined {
     let real = installDir;
@@ -260,9 +271,14 @@ export function hostManagedInstall(installDir: string, env: NodeJS.ProcessEnv = 
         }
     }
     const xdgData = env.XDG_DATA_HOME && env.XDG_DATA_HOME.trim().length > 0 ? env.XDG_DATA_HOME : path.join(os.homedir(), ".local", "share");
+    const ocData = path.join(xdgData, "opencode");
+    const ocCache = opencodeCacheHome(env);
+    const ocChannel = (home: string): string =>
+        `opencode does not auto-update installed plugins — remove ${path.join(home, "packages", "billion-context@*")} and restart opencode (it reinstalls latest on next startup)`;
     const homes: Array<[string, string, string]> = [
         ["pi", resolvePiHome(env), "`pi update` (pi installs and upgrades the npm:billion-context entry itself)"],
-        ["opencode", path.join(xdgData, "opencode"), "opencode's own plugin manager (reload/reinstall the billion-context plugin)"],
+        ["opencode", ocData, ocChannel(ocData)],
+        ["opencode", ocCache, ocChannel(ocCache)],
         ["dsh", resolveDshHome(env), "the dsh plugin channel (the global bili self-update refreshes profiles, and so does the profile proxy's own periodic check; or `dsh plugin add billion-context@latest`)"],
         ["kimi", resolveKimiHome(env), "`bili plugin install kimi` after updating the global bili install"],
         ["omp", resolveOmpHome(env), "the global bili install (the extensions entry points at it)"],
@@ -598,6 +614,42 @@ export async function refreshDshProfileCopy(
     }
 }
 
+// #1234: opencode never re-resolves an already-installed npm plugin (its
+// Npm.add short-circuits on dir existence; no upgrade CLI exists), so the
+// opencode lane freezes at its install version. bili must not write into
+// opencode's tree (#991), so the live update path is the documented manual
+// refresh — surface drift once per version pair instead of failing silently.
+let opencodeStaleWarnKey: string | undefined;
+
+export function _resetOpencodeStaleWarnForTest(): void {
+    opencodeStaleWarnKey = undefined;
+}
+
+export async function warnOpencodeStaleCopy(
+    installDir: string,
+    opts: Pick<UpdateOptions, "packageName" | "currentVersion" | "resolveProxy" | "updateTag">,
+    channel: string,
+    log: Logger = loggerLog,
+): Promise<void> {
+    let latest: string | undefined;
+    try {
+        latest = await fetchRegistryVersion(opts, opts.packageName);
+    } catch {
+        return; // best-effort: a registry hiccup must not spam or break the loop
+    }
+    if (!latest) return;
+    const diskVersion = await readDiskVersion(installDir);
+    const currentVersion = diskVersion ?? opts.currentVersion;
+    if (!isVersionNewer(latest, currentVersion)) {
+        opencodeStaleWarnKey = undefined;
+        return;
+    }
+    const key = `${currentVersion}->${latest}`;
+    if (key === opencodeStaleWarnKey) return;
+    opencodeStaleWarnKey = key;
+    log("warn", `[update] opencode plugin copy is stale (${currentVersion} \u2192 ${latest}) \u2014 ${channel}`);
+}
+
 /** Run a single check (throttled unless `force`). Safe to call frequently. */
 export async function checkForUpdate(opts: UpdateOptions, force = false): Promise<void> {
     if (!opts.autoUpdate && !force) return;
@@ -633,6 +685,9 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         const managed = installDir ? hostManagedInstall(installDir) : undefined;
         if (managed && installDir) {
             loggerLog("info", `[update] install dir is managed by ${managed.owner} (${installDir}) \u2014 skipping in-place self-update; update it via ${managed.channel} (#991)`);
+            if (managed.owner === "opencode") {
+                await warnOpencodeStaleCopy(installDir, opts, managed.channel, loggerLog);
+            }
             // #1196: a copy living inside a dsh profile bundle cannot wait
             // for a global self-update that may never come (dsh-market users
             // often have no global install at all) — drive the lockstep
