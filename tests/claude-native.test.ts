@@ -1051,6 +1051,12 @@ test("watcher route: shared proxies take watcher registrations, daemons refuse (
         const ok = await post({ pid: keeperPid });
         assert.equal(ok.status, 200, "live pid accepted");
         assert.match(JSON.stringify(await ok.json()), /"ok":true/, "ok:true body");
+        // #1322: health must expose the lifecycle state so callers can tell a
+        // session-owned proxy from a daemon before they commit to it.
+        const armedHealth = (await (await fetch(`${origin}/__bili/health`)).json()) as { watchdog?: { armed?: boolean; parentPid?: number; watchers?: number[] } };
+        assert.equal(armedHealth.watchdog?.armed, true, "armed proxy reports armed");
+        assert.equal(armedHealth.watchdog?.parentPid, keeperPid, "spawning owner reported");
+        assert.deepEqual(armedHealth.watchdog?.watchers, [keeperPid], "owner seeded the set");
 
         // Grace: keeper1 dies, and BEFORE the idle grace expires a new owner
         // registers (the live race: spawner exits right after a second session
@@ -1076,11 +1082,100 @@ test("watcher route: shared proxies take watcher registrations, daemons refuse (
         assert.equal((await post({ pid: process.pid })).status, 409, "daemon refuses watchers");
         await new Promise((r) => setTimeout(r, 5000));
         assert.ok(await canConnect(port), "daemon stays up — no watchdog got armed");
+        // #1322: the refusal must be visible through health — this is the field
+        // that lets an attaching session notice the lifecycle contract is void.
+        const daemonHealth = (await (await fetch(`${origin}/__bili/health`)).json()) as { watchdog?: { armed?: boolean; parentPid?: number; watchers?: number[] } };
+        assert.equal(daemonHealth.watchdog?.armed, false, "unarmed proxy reports unarmed");
+        assert.equal(daemonHealth.watchdog?.parentPid, undefined, "no owner pid");
+        assert.deepEqual(daemonHealth.watchdog?.watchers, [], "refused registration joined nothing");
     } finally {
         if (keeperPid > 1) killPid(keeperPid);
         if (keeper2Pid > 1) killPid(keeper2Pid);
         if (armed > 1) killPid(armed);
         if (daemon > 1) killPid(daemon);
+        await rmHome(home);
+    }
+});
+
+// #1322 end-to-end: the reported failure shape — a manually started daemon
+// squats on the stable port BEFORE any session begins, so every claude
+// session attaches to it and its registration is refused (409). Old code
+// swallowed that silently: the "lives and dies with the session" contract was
+// void with zero signal. Now the hook must WARN loudly on stderr while
+// staying non-destructive (the daemon keeps serving; its fate is the
+// operator's). Linux-only like the other hook e2es (fake claude walks /proc).
+test("hook e2e: attaching to a squatting daemon warns instead of staying silent (#1322)", { timeout: 180_000, skip: LIVE_E2E ? process.platform !== "linux" : liveSkip }, async () => {
+    const distCli = path.resolve(import.meta.dirname, "..", "dist", "index.js");
+    const distScript = path.resolve(import.meta.dirname, "..", "dist", "claude-native-bootstrap.js");
+    ensureDistBuilt(distCli);
+    ensureDistBuilt(distScript);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-claude-squatter-"));
+    const xdg = { home, config: path.join(home, "cfg"), state: path.join(home, "state"), cache: path.join(home, "cache"), data: path.join(home, "data") };
+    fs.mkdirSync(path.join(home, "tmp"), { recursive: true });
+    const port = await freePort();
+    const baseEnv = {
+        PATH: process.env.PATH ?? "/usr/bin:/bin",
+        HOME: xdg.home,
+        XDG_CONFIG_HOME: xdg.config,
+        XDG_STATE_HOME: xdg.state,
+        XDG_CACHE_HOME: xdg.cache,
+        XDG_DATA_HOME: xdg.data,
+        NO_COLOR: "1",
+    };
+    const squatter = spawnProxy(distCli, port, baseEnv);
+    let claudePid = 0;
+    try {
+        assert.ok(await waitForPort(port, 60_000), "squatter daemon up on the stable port");
+        // Fake claude reproducing the live SessionStart shape: node-shebang
+        // binary (npm install form: argv [node, <path>/claude]), launches the
+        // hook through /bin/sh -c, captures hook stderr to a file, then
+        // OUTLIVES the hook like a real interactive session. Dynamic import
+        // (not require/import statements): an extensionless file's module
+        // system follows the NEAREST package.json, which differs per machine
+        // (real /tmp → CJS; sandboxed tmpdirs inside a checkout → ESM).
+        const binDir = path.join(home, "bin");
+        fs.mkdirSync(binDir, { recursive: true });
+        const claudeBin = path.join(binDir, "claude");
+        const errFile = path.join(home, "hook-stderr.txt");
+        const doneFile = path.join(home, "hook-done");
+        fs.writeFileSync(
+            claudeBin,
+            '#!/usr/bin/env node\n' +
+                'import("node:child_process").then(async ({ spawn }) => {\n' +
+                '  const fs = await import("node:fs");\n' +
+                '  const sh = spawn("/bin/sh", ["-c", process.env.HOOK_CMD], {\n' +
+                '    env: process.env,\n' +
+                '    stdio: ["ignore", fs.openSync(process.env.HOOK_ERRFILE, "w"), fs.openSync(process.env.HOOK_ERRFILE, "a")]\n' +
+                '  });\n' +
+                '  sh.on("exit", () => { try { fs.writeFileSync(process.env.HOOK_DONE, String(Date.now())); } catch {} });\n' +
+                '});\n' +
+                'setInterval(() => {}, 60000);\n',
+            { mode: 0o755 },
+        );
+        claudePid = spawn(claudeBin, [], {
+            env: { ...baseEnv, BILI_CLAUDE_NATIVE_PORT: String(port), HOOK_CMD: `"${process.execPath}" "${distScript}"`, HOOK_ERRFILE: errFile, HOOK_DONE: doneFile },
+            detached: true,
+            stdio: "ignore",
+        }).pid ?? 0;
+        assert.ok(claudePid > 1, "fake claude spawned");
+        const t0 = Date.now();
+        while (!fs.existsSync(doneFile) && Date.now() - t0 < 60_000) await new Promise((r) => setTimeout(r, 250));
+        assert.ok(fs.existsSync(doneFile), "hook completed");
+        const stderr = fs.readFileSync(errFile, "utf8");
+        assert.match(stderr, /attaching to running proxy/, "hook attached to the squatting daemon");
+        assert.match(stderr, /WARNING:.*NO session-lifecycle watchdog/s, "#1322: refusal surfaced instead of silently voiding the contract");
+        assert.match(stderr, /\(#1322\)/, "warning cites the issue for operators");
+        // Non-destructive: killing the session must NOT take the daemon down.
+        killPid(claudePid);
+        claudePid = 0;
+        await new Promise((r) => setTimeout(r, 15_000));
+        assert.ok(await canConnect(port), "daemon survives session end — operator decides its fate");
+        const h = (await (await fetch(`http://127.0.0.1:${port}/__bili/health`)).json()) as { watchdog?: { armed?: boolean; watchers?: number[] } };
+        assert.equal(h.watchdog?.armed, false, "health explains why the warning fired");
+        assert.deepEqual(h.watchdog?.watchers, []);
+    } finally {
+        if (claudePid > 1) killPid(claudePid);
+        if (squatter > 1) killPid(squatter);
         await rmHome(home);
     }
 });

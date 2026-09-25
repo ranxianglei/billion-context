@@ -1055,7 +1055,7 @@ test("ensureProxyRunning: attaches to a compatible healthy instance instead of d
             fetchImpl: async () => ({ ok: true }),
             fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1" }),
             readInstanceFile: () => recordedInstance(),
-            registerWatcher: async (origin, pid) => { registrations.push([origin, pid]); },
+            registerWatcher: async (origin, pid) => { registrations.push([origin, pid]); return "ok"; },
             scriptPath: FP_SCRIPT,
         },
     );
@@ -1072,7 +1072,7 @@ test("ensureProxyRunning: attaches to a compatible healthy instance instead of d
 
 test("ensureProxyRunning: attach registers opts.parentPid when given, never on spawn (#1190)", async () => {
     const registrations: Array<[string, number]> = [];
-    const registerWatcher = async (origin: string, pid: number) => { registrations.push([origin, pid]); };
+    const registerWatcher = async (origin: string, pid: number): Promise<"ok" | "refused" | "failed"> => { registrations.push([origin, pid]); return "ok"; };
 
     const attached = await ensureProxyRunning(
         { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, parentPid: 42424 },
@@ -1103,6 +1103,34 @@ test("ensureProxyRunning: attach registers opts.parentPid when given, never on s
     assert.equal(spawned, true);
     assert.equal(spawnedHandle.attached, undefined);
     assert.deepEqual(registrations, [], "spawn must not register (BILI_PARENT_PID already arms the watchdog)");
+});
+
+test("ensureProxyRunning: refused watcher registration flags the handle for host-native surfacing (#1322)", async () => {
+    const refused = await ensureProxyRunning(
+        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, parentPid: 42424 },
+        {
+            fetchImpl: async () => ({ ok: true }),
+            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1" }),
+            readInstanceFile: () => recordedInstance(),
+            registerWatcher: async () => "refused",
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.equal(refused.attached, true, "attach still succeeds on a daemon proxy");
+    assert.equal(refused.refusedWatcher, true, "refusal is flagged so claude-native can warn the operator");
+
+    const ok = await ensureProxyRunning(
+        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, parentPid: 42424 },
+        {
+            fetchImpl: async () => ({ ok: true }),
+            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1" }),
+            readInstanceFile: () => recordedInstance(),
+            registerWatcher: async () => "ok",
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.equal(ok.attached, true);
+    assert.notEqual(ok.refusedWatcher, true, "a successful registration leaves the flag unset");
 });
 
 test("ensureProxyRunning: same lane attaches, different declared lanes spawn separate proxies (#1225)", async () => {
@@ -1438,7 +1466,7 @@ test("ensureProxyRunning: active starting marker → waits, then attaches instea
                 fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-9" }),
                 readInstanceFile: () => (reads++ < 2 ? undefined : recordedInstance({ instanceId: "inst-9", origin: "http://127.0.0.1:8788", port: 8788 })),
                 sleep: () => Promise.resolve(),
-                registerWatcher: async () => {},
+                registerWatcher: async () => "ok" as const,
                 scriptPath: FP_SCRIPT,
             },
         );
