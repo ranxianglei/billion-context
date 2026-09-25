@@ -9,7 +9,7 @@ import { lastCompressSuffix, withSessionLock, type Session } from "./session.js"
 import { parseCompressInput, PROXY_TOOL_NAMES, MUTATING_PROXY_TOOLS, COMPRESS_TOOL_NAME, ACP_TEXT_OPEN, ACP_TEXT_CLOSE } from "./compress-tool.js";
 import { log as loggerLog } from "./logger.js";
 import { applyRanges } from "./stream.js";
-import { executeSearchContextTarget, resolveDecompress } from "./decompress-shared.js";
+import { executeSearchContextTarget, inheritedBlockIdsOf, resolveDecompress } from "./decompress-shared.js";
 import { ccrEnabled, drainPendingRetrievals, executeRetrieve, retrieveToolName } from "./store.js";
 import { buildVisibilityMarker } from "./compress-loop.js";
 import { hoistTrappedToolItems, type ToolPairItem } from "./tool-pair-order.js";
@@ -97,7 +97,7 @@ function executeProxyTool(
         return resolveDecompress(args, ctx);
     }
     if (toolName === "search_context") {
-        return executeSearchContextTarget(args, ctx.core, ctx.session.id, ctx.session.state);
+        return executeSearchContextTarget(args, ctx.core, ctx.session.id, ctx.session.state, inheritedBlockIdsOf(ctx.session));
     }
     if (toolName === "acp_status") {
         return handleAcpStatus(args, ctx);

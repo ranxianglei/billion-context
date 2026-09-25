@@ -314,23 +314,45 @@ function safePrefix(text: string, n: number): string {
     return text.slice(0, cut);
 }
 
+/** #1333: the derived session's inherited archive ids (seeded dormant by
+ *  seedDerivedSession). Stored on the persisted metadata so a reloaded session
+ *  knows which of its blocks came from the parent. */
+export function inheritedBlockIdsOf(session: Session): string[] {
+    const ids = session.metadata.inheritedBlockIds;
+    return Array.isArray(ids) ? ids.filter((x): x is string => typeof x === "string") : [];
+}
+
+/** Present the inherited archive as active for ONE scoring pass. The original
+ *  blocks stay inactive in the real state (never rendered into the view); this
+ *  shallow copy exists only so core.search — which scans active blocks — ranks
+ *  them alongside the session's own blocks without double-counting. */
+function withInheritedBlocksActive(state: CompressionState, inheritedIds: readonly string[]): CompressionState {
+    if (inheritedIds.length === 0) return state;
+    const ids = new Set(inheritedIds);
+    return { ...state, blocks: state.blocks.map((b) => (ids.has(b.blockId) ? { ...b, active: true } : b)) };
+}
+
 /** Shared search_context execution for all wire paths. Distinguishes "no active
  *  blocks at all" (searching is pointless until compress runs — an explicit
  *  message stops premature-search retry loops, #714) from "blocks exist but none
- *  matched". */
+ *  matched". `inheritedIds` (#1333) makes the derived session's dormant parent
+ *  archive searchable too — the host-adapter contract §2 parity ("child can
+ *  search everything the parent could"). */
 export function executeSearchContext(
     args: Record<string, unknown>,
     core: CompressionCore,
     state: CompressionState,
     foreignSessionId?: string,
+    inheritedIds?: readonly string[],
 ): string {
     const query = typeof args.query === "string" ? args.query : "";
     if (query.length === 0) return "[search_context FAILED: query is required]";
     const scope = foreignSessionId ? ` in session ${foreignSessionId}` : "";
     const limit = typeof args.limit === "number" && args.limit > 0 ? Math.floor(args.limit) : 5;
-    const blocks = core.search(query, state).slice(0, limit);
+    const searchState = inheritedIds !== undefined ? withInheritedBlocksActive(state, inheritedIds) : state;
+    const blocks = core.search(query, searchState).slice(0, limit);
     if (blocks.length === 0) {
-        if (!state.blocks.some((b) => b.active)) return `[No compressed blocks exist yet${scope} — nothing to search.]`;
+        if (!searchState.blocks.some((b) => b.active)) return `[No compressed blocks exist yet${scope} — nothing to search.]`;
         return `[No blocks matched "${query}"${scope}]`;
     }
     const lines = blocks.map((b) => {
@@ -363,16 +385,19 @@ export function executeSearchContextTarget(
     core: CompressionCore,
     sessionId: string,
     state: CompressionState,
+    inheritedIds?: readonly string[],
 ): string {
     const requested = typeof args.conversation_id === "string" ? args.conversation_id.trim() : "";
     // #1125: honor the param description's "Defaults to the current conversation" —
     // the literal "current" (any case) resolves to this session, not the foreign lookup.
-    if (!requested || requested === sessionId || requested.toLowerCase() === "current") return executeSearchContext(args, core, state);
+    if (!requested || requested === sessionId || requested.toLowerCase() === "current") return executeSearchContext(args, core, state, undefined, inheritedIds);
     // A self-reference under an alias form (canonical pfa-* id) keeps plain
     // current-session semantics — no "historical session" framing.
     const self = peekSession(requested) ?? findSessionByCanonicalId(requested);
-    if (self?.id === sessionId) return executeSearchContext(args, core, state);
+    if (self?.id === sessionId) return executeSearchContext(args, core, state, undefined, inheritedIds);
     const foreign = resolveForeignSessionState(requested);
     if (!foreign) return `[search_context FAILED: unknown session "${requested}"]`;
+    // Foreign sessions are searched as-is: their own live blocks only. Their
+    // dormant inherited archives belong to their own namespace (#1333).
     return executeSearchContext(args, core, foreign, requested);
 }

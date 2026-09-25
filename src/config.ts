@@ -590,6 +590,14 @@ export type ProxyOptions = {
      *  fully-present compression blocks instead of restarting at zero.
      *  Enable with `forkAdoption: true` or env BILI_FORK_ADOPTION=1. */
     forkAdoption?: boolean;
+    /** Derived-session inheritance (#1333): on a derived session's first
+     *  request, seed its compression archive from the declared parent
+     *  (x-bili-plugin-parent-conversation header / register parentId) so
+     *  search_context/decompress reach everything the parent could. Default
+     *  ON — the relationship is explicitly declared by the host (pi RLM
+     *  spawns, opencode task subagents), so no inference risk like #629.
+     *  Opt out with `rlmInherit: false` or env BILI_RLM_INHERIT=0. */
+    rlmInherit?: boolean;
     /** Content fallback of the bili→bili chain detection: when an inbound
      *  request carries ACP artifacts (render tags / ACP tool-call history)
      *  but no x-bili-hop header and no local compression state for the
@@ -775,6 +783,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         maskHosts: (env.BILI_LOG_MASK_HOSTS ?? (fileConfig.maskHosts === false ? "0" : "1")) !== "0",
         subagentSplit: (env.BILI_SUBAGENT_SPLIT ?? (fileConfig.subagentSplit === false ? "0" : "1")) !== "0",
         forkAdoption: (env.BILI_FORK_ADOPTION ?? (fileConfig.forkAdoption === true ? "1" : "0")) !== "0",
+        rlmInherit: (env.BILI_RLM_INHERIT ?? (fileConfig.rlmInherit === false ? "0" : "1")) !== "0",
         chainContentDetection: (env.BILI_CHAIN_CONTENT ?? (fileConfig.chainContentDetection === false ? "0" : "1")) !== "0",
         stableSystemAnchor: (env.BILI_STABLE_SYSTEM_ANCHOR ?? (fileConfig.stableSystemAnchor === true ? "1" : "0")) !== "0",
     };
@@ -827,6 +836,10 @@ type FileConfig = {
      *  zero compression state. Default false; env BILI_FORK_ADOPTION=1/0
      *  wins over the file. */
     forkAdoption?: boolean;
+    /** #1333: seed a derived session's compression archive from its declared
+     *  parent on first request. Default true; set false to opt out (env
+     *  BILI_RLM_INHERIT=0 wins over the file). */
+    rlmInherit?: boolean;
     /** Set `false` to disable the ACP-artifact content fallback of the
      *  bili→bili chain detection (#1086); x-bili-hop stays active either way.
      *  Env BILI_CHAIN_CONTENT=0 wins over the file. */

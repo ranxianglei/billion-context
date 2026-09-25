@@ -99,7 +99,8 @@ import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConver
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { maybeAdoptForkBlocks } from "./fork-adoption.js";
 import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "./affinity-persist.js";
-import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRuntimeInfoFor, recordChainVerdict, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
+import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginParentConversationHeader, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRuntimeInfoFor, recordChainVerdict, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
+import { seedDerivedSession } from "./rlm-inherit.js";
 import { setupMitm, readMitmUpstream, getBlindTunnelStats } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "./util.js";
@@ -1465,6 +1466,11 @@ async function handle(
         // increments inside prepare() below, so === 0 here means first sight.
         let pluginAgent = pluginAgentHeader(req.headers);
         let pluginConversation = pluginConversationHeader(req.headers);
+        // #1333: explicit parent declaration on derived sessions (pi RLM spawns,
+        // opencode task subagents). Honored only once the request has bound as a
+        // plugin — a stray header from a plain client must not be able to seed
+        // its session from another conversation's archive.
+        const declaredParentHeader = pluginParentConversationHeader(req.headers);
         // The client's own conversation header (x-session-id / x-session-affinity
         // / x-opencode-session / x-acp-session) is the STRONGEST signal that two
         // requests belong to the same conversation — much stronger than the
@@ -1761,11 +1767,13 @@ async function handle(
         // CLAUDE_CODE_SESSION_ID the MCP shell registered, so binding is
         // race-free. Fall back to the headless pending queue (codex spawn)
         // for the first request that creates a new session.
+        let registerParent: string | undefined;
         if (!pluginAgent && !anonAffinity) {
-            const identityAgent = consumePluginRegisterFor(clientConv ?? conversation);
-            if (identityAgent) {
-                pluginAgent = identityAgent;
+            const identityReg = consumePluginRegisterFor(clientConv ?? conversation);
+            if (identityReg) {
+                pluginAgent = identityReg.agent;
                 pluginConversation = clientConv ?? conversation;
+                registerParent = identityReg.parentId;
             }
         }
         if (!pluginAgent && session.stats.requests === 0 && codexTurnIdentity(req.headers) === undefined && claudeSub === undefined) {
@@ -1778,6 +1786,7 @@ async function handle(
             if (pending) {
                 pluginAgent = pending.agent;
                 pluginConversation = pending.conversationId;
+                registerParent = pending.parentId;
             }
         }
         if (!pluginAgent && typeof session.metadata.pluginAgent === "string") pluginAgent = session.metadata.pluginAgent;
@@ -1793,6 +1802,23 @@ async function handle(
             // stays reachable via its verbatim split id and its canonical
             // pfa-* (printed in wire notes).
             recordPluginSession(claudeSub !== undefined ? conversation : (pluginConversation ?? conversation), session.id);
+        }
+        // #1333: derived-session inheritance. On the child's FIRST request,
+        // seed its compression archive from the declared parent (dormant
+        // blocks + cached content) so search_context/decompress reach
+        // everything the parent could. A per-request header declaration wins
+        // over the register-carried one; both are absent for non-derived
+        // sessions. Gated on pluginAgent: a plain client's stray header must
+        // not be able to seed its session from another conversation's archive.
+        {
+            const declaredParent = declaredParentHeader ?? registerParent;
+            if (pluginAgent && session.stats.requests === 0 && !session.metadata.derivedFrom && declaredParent !== undefined && declaredParent !== session.id) {
+                try {
+                    seedDerivedSession({ session, parentId: declaredParent, protocol, upstreamOrigin, enabled: opts.rlmInherit !== false, log });
+                } catch (err) {
+                    log("warn", `[rlm-inherit] failed (${String(err)}); continuing with fresh state (#1333)`);
+                }
+            }
         }
         // Responses, OpenAI-chat AND Anthropic-wire clients that send their
         // own session id as `prompt_cache_key` (omp) get that conversation

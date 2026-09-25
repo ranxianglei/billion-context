@@ -446,6 +446,41 @@ function lastSessionFromMessages(messages: unknown): string | undefined {
     return undefined;
 }
 
+// #1333: opencode mints one session id per persona (#1102) — task-tool
+// subagents are child sessions whose record carries `parentID`. Resolve it
+// through the host SDK client (`session.get`) so the proxy can seed this
+// session's compression archive on its first request. Cached per session id;
+// every failure degrades to "no parent declared" (fresh session, as before).
+const OPENCODE_PARENT_CACHE_MAX = 256;
+const opencodeParentCache = new Map<string, string | undefined>();
+
+export async function resolveOpencodeParentId(client: V1PluginContext["client"], sid: string): Promise<string | undefined> {
+    if (sid.length === 0) return undefined;
+    if (opencodeParentCache.has(sid)) return opencodeParentCache.get(sid);
+    let parentId: string | undefined;
+    try {
+        const session = client?.session;
+        const get = session?.get;
+        if (typeof get === "function") {
+            // Explicit-this method call: the SDK routes through this._client,
+            // and a destructured call throws (same trap as prompt, see
+            // opencode-acp-command.ts).
+            const res: unknown = await get.call(session, { path: { id: sid } });
+            const data = res !== null && typeof res === "object" && "data" in res ? (res as { data?: unknown }).data : res;
+            if (data !== null && typeof data === "object") {
+                const pid = (data as { parentID?: unknown }).parentID;
+                if (typeof pid === "string" && pid.length > 0) parentId = pid;
+            }
+        }
+    } catch {}
+    if (opencodeParentCache.size >= OPENCODE_PARENT_CACHE_MAX) {
+        const oldest = opencodeParentCache.keys().next().value;
+        if (oldest !== undefined) opencodeParentCache.delete(oldest);
+    }
+    opencodeParentCache.set(sid, parentId);
+    return parentId;
+}
+
 // #1135: dynamic origin getter instead of a captured constant — after a
 // runtime death+recovery the live origin changes, and hooks bound to the
 // startup origin would keep forwarding tools to the dead port while traffic
@@ -533,6 +568,10 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
             if (base === undefined) return;
             output.headers["x-bili-plugin"] = "opencode";
             output.headers["x-bili-plugin-conversation"] = input.sessionID;
+            // #1333: subagent child sessions declare their parent so the proxy
+            // seeds this session's compression archive on its first request.
+            const parentSid = await resolveOpencodeParentId(ctx.client, input.sessionID);
+            if (parentSid !== undefined && parentSid !== input.sessionID) output.headers["x-bili-plugin-parent-conversation"] = parentSid;
             // #1102: opencode mints one session id per persona (task-tool
             // subagents get fresh child ids), so instruction drift (AGENTS.md
             // reconcile) must not fork the compression session.

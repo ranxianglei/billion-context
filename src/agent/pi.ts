@@ -5,12 +5,20 @@
 // minimal structural declarations — the bundled artifact imports NOTHING
 // from the host at runtime (the host duck-types us in).
 
+import { open as fsOpen } from "node:fs/promises";
 import { wrapCacheReport, wrapRuleReport } from "../acp-panel.js";
 import { awaitNativeProxyOrigin } from "./native-bootstrap.js";
 import { detectProxyBase, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, type ManifestTool } from "./shared.js";
 
 type Ctx = {
-    sessionManager?: { getSessionId?: () => string } | undefined;
+    sessionManager?: {
+        getSessionId?: () => string;
+        // #1333: pi's SessionManager exposes the session-file header (which
+        // carries `parentSession` for derived sessions) without any file IO.
+        // Optional — older hosts lack these methods.
+        getHeader?: () => { parentSession?: unknown } | null;
+        getSessionFile?: () => string | undefined;
+    } | undefined;
     model?: { contextWindow?: number; baseUrl?: string; provider?: string; id?: string; [key: string]: unknown } | undefined;
     cwd?: string;
 };
@@ -72,6 +80,64 @@ function sessionIdOf(ctx: Ctx): string | undefined {
     } catch {
         return undefined;
     }
+}
+
+// #1333: derived-session parent resolution. pi writes `parentSession` (the
+// parent session FILE path) into a derived session's file header — the same
+// mechanism Prime RLM inline spawns use and billion-context-pi reads in
+// readParentSessionPath. We need the parent's CONVERSATION id (its session id,
+// which is the header line's `id` field), so: own header via getHeader() when
+// the host offers it (zero IO), else first line of our own session file; then
+// first line of the parent file for its `id`. Session files can be many MB,
+// so every read is bounded to the first 64KB — never readFile() whole.
+const PARENT_HEADER_CACHE_MAX = 256;
+const parentConversationCache = new Map<string, string | undefined>();
+
+async function readFirstLineJson(filePath: string): Promise<Record<string, unknown> | undefined> {
+    const handle = await fsOpen(filePath, "r");
+    try {
+        const buf = Buffer.alloc(65536);
+        const { bytesRead } = await handle.read(buf, 0, buf.length, 0);
+        const text = buf.subarray(0, bytesRead).toString("utf8");
+        const nl = text.indexOf("\n");
+        const line = (nl >= 0 ? text.slice(0, nl) : text).trim();
+        if (!line.startsWith("{")) return undefined;
+        const parsed: unknown = JSON.parse(line);
+        return parsed !== null && typeof parsed === "object" ? parsed as Record<string, unknown> : undefined;
+    } finally {
+        await handle.close();
+    }
+}
+
+export async function resolveParentConversationId(ctx: Ctx): Promise<string | undefined> {
+    const sid = sessionIdOf(ctx);
+    if (sid === undefined || sid.length === 0) return undefined;
+    if (parentConversationCache.has(sid)) return parentConversationCache.get(sid);
+    let parentId: string | undefined;
+    try {
+        let parentPath: string | undefined;
+        try {
+            const header = ctx.sessionManager?.getHeader?.();
+            if (header && typeof header.parentSession === "string" && header.parentSession.length > 0) parentPath = header.parentSession;
+        } catch {}
+        if (parentPath === undefined) {
+            const selfFile = ctx.sessionManager?.getSessionFile?.();
+            if (typeof selfFile === "string" && selfFile.length > 0) {
+                const first = await readFirstLineJson(selfFile);
+                if (first && typeof first.parentSession === "string" && first.parentSession.length > 0) parentPath = first.parentSession;
+            }
+        }
+        if (parentPath !== undefined) {
+            const parentFirst = await readFirstLineJson(parentPath);
+            if (parentFirst && typeof parentFirst.id === "string" && parentFirst.id.length > 0) parentId = parentFirst.id;
+        }
+    } catch {}
+    if (parentConversationCache.size >= PARENT_HEADER_CACHE_MAX) {
+        const oldest = parentConversationCache.keys().next().value;
+        if (oldest !== undefined) parentConversationCache.delete(oldest);
+    }
+    parentConversationCache.set(sid, parentId);
+    return parentId;
 }
 
 // omp's chat-completions payloads carry NO conversation signal (no
@@ -193,11 +259,11 @@ type RegisterState = { sid?: string; toolsFor?: string; toolsReady?: boolean; pe
 // be stamped per request. Register the conversation id once (after tools are
 // ready): the proxy binds any request carrying that id into plugin mode —
 // same launcher path claude/codex use (#162).
-async function postIdentityRegister(proxyBase: string, conversationId: string, agent: string): Promise<void> {
+async function postIdentityRegister(proxyBase: string, conversationId: string, agent: string, parentId?: string): Promise<void> {
     const res = await fetch(`${proxyBase}/__bili/plugin/register`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ conversationId, agent, identity: true }),
+        body: JSON.stringify(parentId !== undefined ? { conversationId, agent, identity: true, parentId } : { conversationId, agent, identity: true }),
         signal: AbortSignal.timeout(5000),
     });
     if (!res.ok) throw new Error(`register HTTP ${res.status}`);
@@ -244,7 +310,9 @@ async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, a
             state.retryAt = undefined;
             if (agent === "omp" && sid !== "" && state.identityAt !== sid) {
                 try {
-                    await postIdentityRegister(proxyBase, sid, agent);
+                    // #1333: omp has no per-request header path, so the parent
+                    // declaration rides the one-shot identity register instead.
+                    await postIdentityRegister(proxyBase, sid, agent, await resolveParentConversationId(ctx));
                     state.identityAt = sid;
                 } catch (err) {
                     // Leave state.sid UNSET so the next per-request event
@@ -574,6 +642,11 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 if (state.toolsReady === true) {
                     const sid = sessionIdOf(ctx);
                     if (sid !== undefined) headers["x-bili-plugin-conversation"] = sid;
+                    // #1333: derived sessions declare their parent conversation
+                    // so the proxy seeds this session's compression archive on
+                    // its first request (cached after the first resolution).
+                    const parentSid = await resolveParentConversationId(ctx);
+                    if (parentSid !== undefined && sid !== undefined && parentSid !== sid) headers["x-bili-plugin-parent-conversation"] = parentSid;
                     headers["x-bili-plugin"] = agent;
                     const window = ctx.model?.contextWindow;
                     if (typeof window === "number" && Number.isFinite(window) && window > 0) {
@@ -632,6 +705,9 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
         });
         pi.on("session_start", (_event, ctx) => {
             state.sid = undefined;
+            // #1333: resolve the parent declaration while the user prompt is
+            // still being prepared, so the first provider request hits the cache.
+            void resolveParentConversationId(ctx);
             void registerTools(pi, ctx, state, agent).catch((err: unknown) => console.error(`bili-plugin(${agent}): ${err instanceof Error ? err.message : String(err)}`));
         });
         // omp fires session_compact on in-session native compaction (sid does

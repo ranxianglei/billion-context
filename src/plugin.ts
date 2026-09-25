@@ -43,16 +43,24 @@ const PROXY_VERSION = (() => {
 //      natively (single source of truth — zero schema drift between proxy
 //      and plugin),
 //   2. sends x-bili-plugin: <agent> + x-bili-plugin-conversation: <id> on
-//      every model request. The proxy then suppresses wire-level tool
-//      injection for that session (tools are native) and stops intercepting
-//      proxy-named tool calls — the model's compress call flows back to the
-//      agent untouched, the plugin forwards it to (3),
+//      every model request (derived sessions may additionally stamp
+//      x-bili-plugin-parent-conversation: <parent-id>, #1333). The proxy then
+//      suppresses wire-level tool injection for that session (tools are
+//      native) and stops intercepting proxy-named tool calls — the model's
+//      compress call flows back to the agent untouched, the plugin forwards
+//      it to (3),
 //   3. executes tools via POST /__bili/plugin/tool {conversationId, tool,
 //      args}, under the session lock, against the same executeProxyTool the
 //      wire-mode compress loop uses.
 
 export const PLUGIN_AGENT_HEADER = "x-bili-plugin";
 export const PLUGIN_CONVERSATION_HEADER = "x-bili-plugin-conversation";
+/** #1333: explicit parent/child declaration. Hosts that spawn derived
+ *  sessions (Prime RLM inline spawns write `parentSession` into the child
+ *  session-file header; opencode task-tool subagents carry `parentID`) stamp
+ *  the parent CONVERSATION id here so the proxy can seed the child's
+ *  compression archive from the parent on its first request (src/rlm-inherit.ts). */
+export const PLUGIN_PARENT_CONVERSATION_HEADER = "x-bili-plugin-parent-conversation";
 /** #920: legacy-lane marker. Set by the absorbed opencode-acp wrapper for
  *  sessions that still run through the legacy DCP machinery — the proxy
  *  forwards such requests VERBATIM (no wire injection, no session binding,
@@ -94,6 +102,13 @@ export function pluginAgentHeader(headers: Record<string, string | string[] | un
 
 export function pluginConversationHeader(headers: Record<string, string | string[] | undefined>): string | undefined {
     return headerValue(headers, PLUGIN_CONVERSATION_HEADER);
+}
+
+/** #1333: parent conversation id declared by the host on a derived session's
+ *  requests. Honored only alongside the conversation header (a stray parent
+ *  id without a child identity is meaningless). */
+export function pluginParentConversationHeader(headers: Record<string, string | string[] | undefined>): string | undefined {
+    return headerValue(headers, PLUGIN_PARENT_CONVERSATION_HEADER);
 }
 
 export function pluginBypassHeader(headers: Record<string, string | string[] | undefined>): string | undefined {
@@ -300,7 +315,7 @@ export function rememberPluginMessages(sessionId: string, processed: CoreMessage
 // (server.ts binding step): that session becomes plugin-mode (native tools,
 // wire injection suppressed) and the conversation id becomes its tool-API key
 // — no x-bili-plugin headers required.
-export type PendingPluginRegister = { conversationId: string; agent: string; ts: number };
+export type PendingPluginRegister = { conversationId: string; agent: string; ts: number; parentId?: string };
 
 /** Runtime-info protocol entry (#955): what the client's OWN config says it
  *  will run — reported at plugin bootstrap and on model switch, before (and
@@ -387,7 +402,7 @@ const pendingRegisters: PendingPluginRegister[] = [];
  *  false` (headless codex spawn) means requests carry no matching id — bind
  *  the next NEW session instead. Splitting the two keeps a foreign session
  *  from eating an identity registration it can never claim. */
-export function queuePluginRegister(conversationId: string, agent: string, identity: boolean): void {
+export function queuePluginRegister(conversationId: string, agent: string, identity: boolean, parentId?: string): void {
     if (!identity) {
         for (let i = 0; i < pendingRegisters.length; i++) {
             if (pendingRegisters[i]!.conversationId === conversationId) {
@@ -395,10 +410,10 @@ export function queuePluginRegister(conversationId: string, agent: string, ident
                 break;
             }
         }
-        pendingRegisters.push({ conversationId, agent, ts: Date.now() });
+        pendingRegisters.push({ conversationId, agent, ts: Date.now(), parentId });
         while (pendingRegisters.length > MAX_PENDING_REGISTERS) pendingRegisters.shift();
     } else {
-        registeredIds.set(conversationId, agent);
+        registeredIds.set(conversationId, { agent, parentId });
         while (registeredIds.size > MAX_PENDING_REGISTERS) {
             const oldest = registeredIds.keys().next().value;
             if (oldest !== undefined) registeredIds.delete(oldest);
@@ -424,16 +439,22 @@ export function takePendingPluginRegister(): PendingPluginRegister | undefined {
     }
     return pendingRegisters.shift();
 }
-const registeredIds = new Map<string, string>();
+const registeredIds = new Map<string, { agent: string; parentId?: string }>();
+
+export interface IdentityRegistration {
+    agent: string;
+    /** #1333: parent conversation declared at register time (headless lanes). */
+    parentId?: string;
+}
 
 /** Identity-driven binding (#162): hosts whose model requests carry the SAME
  *  id the MCP shell registered (claude code: every request has
  *  x-claude-code-session-id === CLAUDE_CODE_SESSION_ID === the registered
  *  conversation id) bind the moment any of their requests shows up — no
  *  ordering race with the shell's initialize. */
-export function consumePluginRegisterFor(conversationId: string): string | undefined {
-    const agent = registeredIds.get(conversationId);
-    if (agent !== undefined) {
+export function consumePluginRegisterFor(conversationId: string): IdentityRegistration | undefined {
+    const reg = registeredIds.get(conversationId);
+    if (reg !== undefined) {
         // The registration describes the CONVERSATION, not a one-shot token:
         // switching models/upstreams mid-conversation resolves to a NEW
         // session (session key = protocol|upstream|apiKey|conversation) that
@@ -441,15 +462,15 @@ export function consumePluginRegisterFor(conversationId: string): string | undef
         // drop back to wire mode on every switch. Keep the entry and refresh
         // LRU order so the size cap evicts least-recently-active conversations.
         registeredIds.delete(conversationId);
-        registeredIds.set(conversationId, agent);
+        registeredIds.set(conversationId, reg);
     }
-    return agent;
+    return reg;
 }
 
 export function handlePluginRegister(payload: string, res: import("node:http").ServerResponse): void {
-    let parsed: { conversationId?: unknown; agent?: unknown; identity?: unknown };
+    let parsed: { conversationId?: unknown; agent?: unknown; identity?: unknown; parentId?: unknown };
     try {
-        parsed = JSON.parse(payload) as { conversationId?: unknown; agent?: unknown; identity?: unknown };
+        parsed = JSON.parse(payload) as { conversationId?: unknown; agent?: unknown; identity?: unknown; parentId?: unknown };
     } catch {
         res.writeHead(400, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: false, error: "invalid JSON body" }));
@@ -462,7 +483,11 @@ export function handlePluginRegister(payload: string, res: import("node:http").S
         return;
     }
     const agent = typeof parsed.agent === "string" && parsed.agent.trim() ? parsed.agent.trim() : "launcher";
-    queuePluginRegister(conversationId, agent, parsed.identity === true);
+    // #1333: optional explicit parent declaration (derived sessions). A
+    // malformed value is dropped silently — inheritance is a best-effort
+    // optimization, never a registration failure.
+    const parentId = typeof parsed.parentId === "string" && parsed.parentId.trim().length > 0 && parsed.parentId.trim().length <= 128 ? parsed.parentId.trim() : undefined;
+    queuePluginRegister(conversationId, agent, parsed.identity === true, parentId);
     res.end(JSON.stringify({ ok: true, conversationId, agent }));
 }
 

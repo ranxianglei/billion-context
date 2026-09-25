@@ -33,6 +33,9 @@ export interface OpencodeClient {
             path: { id: string };
             body: { noReply: boolean; parts: OpencodePromptPart[] };
         }) => Promise<unknown>;
+        // #1333: SDK `session.get` returns the session record (incl.
+        // `parentID` for subagent child sessions). Optional — older hosts.
+        get?: (args: { path: { id: string } }) => Promise<unknown>;
     };
 }
 
