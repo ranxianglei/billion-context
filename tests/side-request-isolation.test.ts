@@ -2,8 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
-import { defaultConfig, createInitialState, defaultCountTokens } from "acp-kernel";
+import { defaultConfig, createInitialState, defaultCountTokens, type CoreMessage } from "acp-kernel";
 import { startServer, type ProxyOptions, isSideRequest, outputBudgetField, restoreOutputBudget, sideRequestGuard } from "../src/server.ts";
+import { rememberPluginMessages, _rememberedForTest, _resetPluginStateForTest } from "../src/plugin.ts";
 import { estimateRawBodyTokens } from "../src/preflight.ts";
 import { inspectContextOverflow } from "../src/util.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
@@ -618,5 +619,85 @@ test("e2e: the overflow arm survives a restart round-trip; usage after reload re
         store.cancelAll();
         store2?.cancelAll();
         rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+// ---------------------------------------------------------------------------
+// #1307 — auxiliary prompts (host auto-review/classifier/title-gen) share the
+// main session key but send NO tools and <=2 messages with a NORMAL output
+// budget, so isSideRequest()'s budget test misses them. rememberPluginMessages
+// must not let such a tiny view clobber the established anchor snapshot the
+// compress tool reads its refs from.
+// ---------------------------------------------------------------------------
+
+function coreMsgs(n: number, prefix = "m"): CoreMessage[] {
+    return Array.from({ length: n }, (_, i) => ({ id: `${prefix}${i}`, role: "user", contentType: "text", text: `${prefix}${i} body` }));
+}
+
+test("rememberPluginMessages: foreign side-shaped view does not clobber an established snapshot (#1307)", () => {
+    _resetPluginStateForTest();
+    const sid = "clobber-sess";
+    const logs: string[] = [];
+    const log = (_level: string, msg: string): void => { logs.push(msg); };
+
+    rememberPluginMessages(sid, coreMsgs(40), coreMsgs(40), undefined, log);
+    assert.equal(_rememberedForTest().get(sid)?.processed.length, 40, "main view stored");
+    assert.equal(logs.length, 0, "normal store is not logged as a skip");
+
+    // The #388-era bug: a 1-message review/classifier view used to overwrite here.
+    rememberPluginMessages(sid, coreMsgs(1, "side"), coreMsgs(1, "side"), undefined, log);
+    assert.equal(_rememberedForTest().get(sid)?.processed.length, 40, "ctx==1 foreign view must NOT shrink the snapshot");
+    assert.ok(logs.some((l) => l.includes("snapshot kept")), "the skip is logged for diagnosability");
+
+    rememberPluginMessages(sid, coreMsgs(2, "side"), coreMsgs(2, "side"), undefined, log);
+    assert.equal(_rememberedForTest().get(sid)?.processed.length, 40, "ctx==2 foreign view must NOT shrink either");
+
+    // Accepted cost (#1307): even a shrunk view that shares ids is held while it is <=2
+    // and smaller than the established snapshot; the next normal (>=3) request restores.
+    const cont: CoreMessage[] = [coreMsgs(40)[0], { id: "m-new", role: "assistant", contentType: "text", text: "reply" }];
+    rememberPluginMessages(sid, cont, cont);
+    assert.equal(_rememberedForTest().get(sid)?.processed.length, 40, "shrunk-to-2 view is deferred one turn (accepted cost)");
+
+    // Normal growth always updates.
+    rememberPluginMessages(sid, coreMsgs(55), coreMsgs(55));
+    assert.equal(_rememberedForTest().get(sid)?.processed.length, 55, "growth updates the snapshot");
+
+    // Fresh session: a small first view is stored (no prior snapshot to protect).
+    _resetPluginStateForTest();
+    rememberPluginMessages("fresh-sess", coreMsgs(1), coreMsgs(1));
+    assert.equal(_rememberedForTest().get("fresh-sess")?.processed.length, 1, "first small view is stored for a fresh session");
+});
+
+test("#1307 e2e: tool-less single-message request on an established session does not clobber the anchor snapshot", async () => {
+    _resetSessionsForTest();
+    _resetPluginStateForTest();
+    const rig = await startRig();
+    try {
+        const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/messages`;
+        const headers: Record<string, string> = { "content-type": "application/json", "x-acp-session": SESSION };
+
+        // Main turn: establishes refs + the remembered anchor snapshot (all modes remember).
+        const r1 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 4096, stream: true, messages: mainConversation(8) }) });
+        assert.equal(r1.status, 200);
+        await r1.text();
+        const afterMain = getSession(SESSION);
+        assert.ok(Object.keys(afterMain.state.messageRefs.byRaw ?? {}).length > 0, "main turn assigns refs");
+        assert.equal(afterMain.stats.lastInputTokens, MAIN_INPUT_TOKENS, "main turn captured usage");
+        const maxLenAfterMain = Math.max(0, ...[..._rememberedForTest().values()].map((v) => v.processed.length));
+        assert.ok(maxLenAfterMain > 2, "main turn establishes an anchor snapshot larger than any side view");
+        const hitsBefore = rig.upstreamHits;
+
+        // Auxiliary request: NORMAL output budget (isSideRequest's budget test misses it),
+        // NO tools, ONE synthetic user message, same session key. It runs the full pipeline,
+        // so its 1-message view reaches rememberPluginMessages — which must hold the snapshot.
+        const r2 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MODEL, max_tokens: 4096, stream: true, messages: [{ role: "user", content: "auto-review synthetic prompt" }] }) });
+        assert.equal(r2.status, 200, "auxiliary request is forwarded, not rejected");
+        await r2.text();
+
+        const maxLenAfter = Math.max(0, ...[..._rememberedForTest().values()].map((v) => v.processed.length));
+        assert.equal(maxLenAfter, maxLenAfterMain, "compress anchors survive the auxiliary request (#1307)");
+        assert.equal(rig.upstreamHits, hitsBefore + 1, "forwarded exactly once (not dropped)");
+    } finally {
+        await closeRig(rig);
     }
 });

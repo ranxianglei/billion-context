@@ -262,7 +262,25 @@ export function recordPluginSession(conversationId: string, sessionId: string): 
 /** Keep the last prepare()'s view for a plugin session so tool-API execution
  *  sees the exact refs the model was shown (mirrors the wire-mode loop, which
  *  runs executeProxyTool against prepared.processedMessages). */
-export function rememberPluginMessages(sessionId: string, processed: CoreMessage[], original: CoreMessage[], nudge?: NudgeDecision): void {
+export function rememberPluginMessages(
+    sessionId: string,
+    processed: CoreMessage[],
+    original: CoreMessage[],
+    nudge?: NudgeDecision,
+    log?: (level: string, msg: string) => void,
+): void {
+    const incoming = processed.length > 0 ? processed : original;
+    const previous = remembered.get(sessionId);
+    const previousLength = previous ? (previous.processed.length > 0 ? previous.processed : previous.original).length : 0;
+    // #1307: a <=2-message view strictly smaller than an established snapshot is an
+    // auxiliary prompt (auto-review/classifier/title-gen bound to this session), not the
+    // main conversation — skipping it keeps the compress anchor view intact (a genuine
+    // main turn always carries full history so this never fires for one). Accepted cost:
+    // a native-compaction shrink to <=2 is deferred one turn, self-heals next request.
+    if (incoming.length <= 2 && previousLength > incoming.length) {
+        log?.("info", `[${sessionId}] remembered snapshot kept (${previousLength} msgs > ${incoming.length}): side-shaped request must not shrink the anchor view (#1307)`);
+        return;
+    }
     const staleSessionIds = new Set(
         [...remembered.keys()].filter((id) => id === sessionId || !peekSession(id)),
     );
@@ -2319,4 +2337,8 @@ export function _resetPluginStateForTest(): void {
     registeredIds.clear();
     pluginRuntimeTable.clear();
     warnedNoModelRequests.clear();
+}
+
+export function _rememberedForTest(): Map<string, RememberedMessages> {
+    return remembered;
 }
