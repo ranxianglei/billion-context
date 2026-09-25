@@ -76,6 +76,21 @@ test("W2 guard: a delivered batch is never resurrected by a later failure", () =
     assert.equal(session.pendingRetrievals.length, 0, "delivered batch stays delivered");
 });
 
+test("W2 guard: disarming invalidates the in-flight ticket (no resurrection across a lane switch)", () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    const session = freshSession("w2-disarm");
+    session.pendingRetrievals.push(injection("i1", "delivered text"));
+
+    const delivered = drainPendingRetrievals(session);
+    trackRetrievalDrain(session, delivered);
+    // forward succeeded; then the lane switches to a non-CCR wire and an
+    // unrelated later request fails before upstream accepts.
+    storeEffectiveCcr(session, undefined);
+    requeueRetrievalsOnFailure(session, "unrelated later network failure");
+    assert.equal(session.pendingRetrievals.length, 0, "delivered batch stays delivered across disarm");
+    assert.equal(session.lastRetrievalDrain, undefined, "ticket cleared on disarm");
+});
+
 test("W3: disarming a lane with a queued batch drops it loudly (observable behavior)", () => {
     _setStoreForTest(new SessionStore({ enabled: false }));
     const session = freshSession("w3");

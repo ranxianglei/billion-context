@@ -36,6 +36,9 @@ export function storeEffectiveCcr(session: Session, ccr: CcrSettings | undefined
             loggerLog("warn", `[ccr] lane disarmed with ${session.pendingRetrievals.length} undelivered retrieval injection(s) (ack'd, never delivered) — dropping queue (#1343)`);
             session.pendingRetrievals.length = 0;
         }
+        // Invariant: a delivered batch must never be resurrected by an
+        // unrelated later forward failure once the lane re-arms (#1343).
+        session.lastRetrievalDrain = undefined;
     }
 }
 
