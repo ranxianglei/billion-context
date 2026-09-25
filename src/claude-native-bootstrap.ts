@@ -166,9 +166,14 @@ function defaultProcReader(): ProcReader {
  *  Tightening it would instead break real `node ~/bin/claude` launcher
  *  installs. Exported for tests. */
 export function isClaudeHostArgv(argv: string[]): boolean {
+    // PowerShell's Win32_Process CommandLine keeps the quotes around a token
+    // when the path needs them (e.g. `"C:\...\claude.exe"`), so a trailing `"`
+    // survives the split and defeats every basename match below —
+    // `claude.exe"` never equals `claude.exe`. Strip surrounding quotes.
+    const strip = (s: string): string => s.replace(/^["']+|["']+$/g, "");
     const base = (p: string): string => {
-        const parts = p.split(/[\\/]/).filter((seg) => seg.length > 0);
-        return parts[parts.length - 1] ?? "";
+        const parts = strip(p).split(/[\\/]/).filter((seg) => seg.length > 0);
+        return strip(parts[parts.length - 1] ?? "");
     };
     if (/^claude(\.exe)?$/i.test(base(argv[0] ?? ""))) return true;
     if (/^(node|bun|deno)(\.exe)?$/i.test(base(argv[0] ?? ""))) {
@@ -203,16 +208,20 @@ export function resolveClaudeHostPid(opts: { read?: ProcReader; startPid?: numbe
  *  (claude uses one of these to launch SessionStart hooks on every OS).
  *  Such wrappers exit the moment their command does. Exported for tests. */
 export function isTransientShArgv(argv: string[]): boolean {
-    const parts = (argv[0] ?? "").split(/[\\/]/).filter((seg) => seg.length > 0);
-    const shell = parts[parts.length - 1] ?? "";
+    // Same quote-survival problem as isClaudeHostArgv: a quoted argv[0]
+    // (`"D:\...\bash.exe"`) leaves a trailing `"` on the basename, so the
+    // shell match below misses and a transient wrapper looks permanent.
+    const strip = (s: string): string => s.replace(/^["']+|["']+$/g, "");
+    const parts = strip(argv[0] ?? "").split(/[\\/]/).filter((seg) => seg.length > 0);
+    const shell = strip(parts[parts.length - 1] ?? "");
     if (/^(sh|bash|dash|zsh|ksh|ash)(\.exe)?$/i.test(shell)) {
-        return argv.some((arg, i) => i > 0 && /^-[^-]*c$/.test(arg));
+        return argv.some((arg, i) => i > 0 && /^-[^-]*c$/.test(strip(arg)));
     }
     if (/^cmd(\.exe)?$/i.test(shell)) {
-        return argv.some((arg, i) => i > 0 && /^[-/]c$/i.test(arg));
+        return argv.some((arg, i) => i > 0 && /^[-/]c$/i.test(strip(arg)));
     }
     if (/^(powershell|pwsh)(\.exe)?$/i.test(shell)) {
-        return argv.some((arg, i) => i > 0 && /^-?(command|encodedcommand)$/i.test(arg));
+        return argv.some((arg, i) => i > 0 && /^-?(command|encodedcommand)$/i.test(strip(arg)));
     }
     return false;
 }
