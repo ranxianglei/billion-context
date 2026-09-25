@@ -1665,13 +1665,14 @@ async function handle(
             }
         }
         const sessionId = anonAffinity ? anonAffinity.sessionId : conversation;
-        // #1086: content-fallback chain verdict, now that identity is known.
+        // #1086/#1357: content-fallback chain observation, now that identity is known.
         // Artifacts + processed local state ⇒ self-produced: process normally.
-        // Artifacts + NO local state ⇒ an upstream bili already compressed
-        // this payload and its headers were stripped: forward verbatim and
-        // create no session state (same contract as the hop-marker path).
-        // Returning before getSession also skips note()/register consumption,
-        // so a foreign session leaves no trace in this instance.
+        // Artifacts + NO local state ⇒ ADVISORY observation (#1357 Phase 1): the
+        // content may be user-authored (AGENTS.md examples, docs, pastes), so it
+        // no longer forces byte-identical passthrough — record one observation for
+        // /acp diagnostics and fall through to processTurn so this session
+        // establishes its own ownership state. Decisive verbatim passthrough
+        // stays reserved for the x-bili-hop header (above).
         if (artifactSeed) {
             const artifactKind = detectAcpArtifacts(bodyBuffer, parsed);
             // #1197: a cooperative plugin announces itself with x-bili-plugin —
