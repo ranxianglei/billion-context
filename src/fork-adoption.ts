@@ -1,5 +1,6 @@
 import { anthropicToCore, openaiToCore } from "acp-kernel/wire";
-import type { CompressionBlock } from "acp-kernel";
+import { contentStoreStats, type CompressionBlock } from "acp-kernel";
+import { contentStoreOf } from "./store.js";
 import { stripAcpPanelMessages, stripAcpStatusMarkers } from "./acp-panel.js";
 import { peekSession, markDirty, type Session } from "./session.js";
 import { getStore } from "./persist.js";
@@ -173,6 +174,29 @@ export function applyForkAdoption(session: Session, plan: ForkAdoptionPlan, pare
     }
     session.state.nextBlockId = Math.max(session.state.nextBlockId, plan.nextBlockId);
     session.state.nextRunId = Math.max(session.state.nextRunId, plan.nextRunId);
+    // [#1341] The CCR content-store envelope rides along for adopted refs: v2's
+    // covered-ref surfacing promises "these refs are retrievable", but seeding
+    // blocks+refs alone leaves every acp_retrieve(adopted ref) missing — a
+    // half-adopted state. Copy-on-fork like the rest: filtered to the plan's
+    // refs, first write wins in the child (append-only store contract), and an
+    // entry whose content blob is gone from the parent (corrupt envelope) is
+    // skipped rather than copied as a broken hit.
+    const parentStore = contentStoreOf(parent);
+    const childStore = contentStoreOf(session);
+    let adoptedEntries = 0;
+    for (const ref of Object.keys(plan.refs.byRef)) {
+        const entry = parentStore.byRef[ref];
+        if (!entry || childStore.byRef[ref]) continue;
+        const text = parentStore.byHash[entry.hash];
+        if (typeof text !== "string") continue;
+        childStore.byRef[ref] = structuredClone(entry);
+        if (!(entry.hash in childStore.byHash)) childStore.byHash[entry.hash] = text;
+        adoptedEntries++;
+    }
+    if (adoptedEntries > 0) {
+        session.stats.storedBytes = contentStoreStats(childStore).totalChars;
+        session.contentStoreDirty = true;
+    }
     markDirty(session);
 }
 
