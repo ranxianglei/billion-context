@@ -207,6 +207,12 @@ export interface ProxyHandle {
     child?: SpawnChild;
     logPath?: string;
     attached?: boolean;
+    /** #1322: attach succeeded but the proxy REFUSED the session-watcher
+     *  registration (409 — it has no session-lifecycle watchdog, i.e. it was
+     *  started without BILI_PARENT_PID, e.g. manually on a stable port). The
+     *  proxy will outlive every session and ignore config edits until killed;
+     *  host-native bootstraps must surface this instead of staying silent. */
+    refusedWatcher?: boolean;
 }
 
 export interface LauncherDeps {
@@ -227,9 +233,10 @@ export interface LauncherDeps {
     /** #1190: watcher registration for ATTACHED shared proxies — tells the
      *  proxy's parent-gone watchdog which owner pid to track, so the proxy
      *  dies only after the LAST owner exits (#7/#1183). Default POSTs to
-     *  <origin>/__bili/watcher; 409 (daemon proxy) is silent, any failure
-     *  warns and degrades to the single-owner watchdog behavior. */
-    registerWatcher?: (origin: string, pid: number) => Promise<void>;
+     *  <origin>/__bili/watcher; 409 (daemon proxy) is refused-and-silent at
+     *  THIS layer but flags the handle (#1322), any other failure warns and
+     *  degrades to the single-owner watchdog behavior. */
+    registerWatcher?: (origin: string, pid: number) => Promise<WatcherRegistration>;
     /** #1292: simulated OS for spawn planning and platform-gated arg
      *  construction — tests drive win32 paths from a POSIX host. Defaults
      *  to process.platform. */
@@ -2407,12 +2414,17 @@ async function fetchHealthInfoDefault(origin: string): Promise<HealthInfo | unde
     }
 }
 
+/** Outcome of a session-watcher registration attempt (#1190). */
+export type WatcherRegistration = "ok" | "refused" | "failed";
+
 /** #1190: an ATTACHED shared proxy belongs to whoever SPAWNED it — its
  *  parent-gone watchdog tracks THAT owner's pid, so without registration the
  *  first owner's exit kills every attached session (#7/#1183). Registering our
  *  own owner makes the proxy die only after the LAST owner exits. Never throws:
- *  a failed registration degrades to the pre-fix single-owner behavior. */
-async function registerWatcherDefault(origin: string, pid: number): Promise<void> {
+ *  a failed registration degrades to the pre-fix single-owner behavior.
+ *  #1322: returns the outcome so callers can surface a refusal — attaching to
+ *  a daemon proxy means the "dies with the session" contract is void. */
+export async function registerWatcherDefault(origin: string, pid: number): Promise<WatcherRegistration> {
     try {
         const res = await fetch(`${origin}/__bili/watcher`, {
             method: "POST",
@@ -2420,10 +2432,17 @@ async function registerWatcherDefault(origin: string, pid: number): Promise<void
             body: JSON.stringify({ pid }),
             signal: AbortSignal.timeout(2_000),
         });
-        // 409 = daemon proxy (watchdog unarmed) — nothing to register there.
-        if (!res.ok && res.status !== 409) console.error(`bili: watcher registration returned HTTP ${res.status} — the shared proxy may exit when its first owner does`);
+        // 409 = daemon proxy (watchdog unarmed) — nothing to register there;
+        // silence stays at this layer, the handle carries the flag instead.
+        if (!res.ok) {
+            if (res.status === 409) return "refused";
+            console.error(`bili: watcher registration returned HTTP ${res.status} — the shared proxy may exit when its first owner does`);
+            return "failed";
+        }
+        return "ok";
     } catch (err) {
         console.error(`bili: watcher registration failed — the shared proxy may exit when its first owner does (${err instanceof Error ? err.message : String(err)})`);
+        return "failed";
     }
 }
 
@@ -2673,8 +2692,14 @@ export async function ensureProxyRunning(
     // window.
     const attachTo = async (inst: ProxyInstanceFile): Promise<ProxyHandle> => {
         console.error(`bili: attaching to running proxy at ${inst.origin} (pid ${inst.pid})`);
-        await registerWatcher(inst.origin, watchPid);
-        return { origin: inst.origin, port: inst.port, attached: true };
+        const reg = await registerWatcher(inst.origin, watchPid);
+        // #1322: a refusal means the shared proxy has NO session-lifecycle
+        // watchdog (started without BILI_PARENT_PID, e.g. manually on a stable
+        // port) — it will outlive every session; host-native bootstraps must
+        // say so instead of silently serving a voided lifecycle contract.
+        const handle: ProxyHandle = { origin: inst.origin, port: inst.port, attached: true };
+        if (reg === "refused") handle.refusedWatcher = true;
+        return handle;
     };
     const script = deps.scriptPath ?? process.argv[1];
     const codeFingerprint = entryScriptFingerprint(script);

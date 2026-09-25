@@ -882,7 +882,10 @@ async function handle(
     }
     if (req.method === "GET" && req.url === "/__bili/health") {
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: true, upstream: opts.upstream, instanceId, pid: process.pid, startedAt: instanceStartedAt, blindTunnels: getBlindTunnelStats() }));
+        // #1322: watchdog state is part of the health contract — attachers and
+        // operators can see whether this proxy dies with its sessions (armed)
+        // or outlives them all (daemon squatting a stable port).
+        res.end(JSON.stringify({ ok: true, upstream: opts.upstream, instanceId, pid: process.pid, startedAt: instanceStartedAt, blindTunnels: getBlindTunnelStats(), watchdog: { armed: initialWatcherPid !== null, parentPid: initialWatcherPid ?? undefined, watchers: [...proxyWatchers] } }));
         return;
     }
     // Web config UI (served as HTML, separate from the JSON health check above).

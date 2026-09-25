@@ -264,6 +264,15 @@ async function run(): Promise<void> {
         // (every native client registers there; claude's earlier copy was
         // redundant once the chokepoint covered all callers).
         log(`proxy ${handle.attached ? "attached" : "started"} at ${handle.origin}${plan.action === "passthrough" ? " (passthrough — compression off)" : ""}`);
+        if (handle.refusedWatcher) {
+            // #1322: attach landed on a daemon proxy (no BILI_PARENT_PID) whose
+            // watchdog refused our owner — the README's "lives and dies with the
+            // session" contract is void here. Say so loudly instead of silently
+            // serving a proxy that will outlive every session.
+            log(
+                `WARNING: proxy at ${handle.origin} has NO session-lifecycle watchdog (it was started without BILI_PARENT_PID, e.g. manually on this port) — it will outlive every session, and config edits only apply after that process is restarted. Kill it or start a session-owned proxy to restore the lifecycle contract (#1322).`,
+            );
+        }
     } catch (err) {
         log(
             `proxy bring-up failed on port ${plan.port} — ${err instanceof Error ? err.message : String(err)}` +
