@@ -105,7 +105,7 @@ test("seeds the parent's compression archive into the derived child as dormant b
         assert.equal(parent.blockContents.get(parentBlockId)!.full.text, "the original auth body", "parent content untouched");
         assert.deepEqual(structuredClone(parent.state), parentBefore, "parent state byte-identical after seeding");
 
-        assert.ok(logs.some((l) => l.startsWith("info:") && l.includes("[rlm-inherit]") && l.includes("inherited 1 block(s)") && l.includes("from parent rlm-parent")), `seed log present: ${JSON.stringify(logs)}`);
+        assert.ok(logs.some((l) => l.startsWith("info:") && l.includes("[rlm-inherit]") && l.includes("inherited 1 block(s)") && l.includes("refs up to m00040") && l.includes("from parent rlm-parent")), `seed log present with true ref ceiling: ${JSON.stringify(logs)}`);
     } finally {
         resetWorld();
     }

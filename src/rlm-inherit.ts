@@ -1,4 +1,4 @@
-import type { CompressionState } from "acp-kernel";
+import { highestUsedIndex } from "acp-kernel";
 import { findSessionByCanonicalId, markDirty, peekSession, type Session } from "./session.js";
 import { getStore } from "./persist.js";
 import type { WireProtocol } from "./util.js";
@@ -52,16 +52,6 @@ export interface SeedDerivedArgs {
     upstreamOrigin: string;
     enabled: boolean;
     log: (level: string, msg: string) => void;
-}
-
-/** Highest ref number used in a ref map (refs look like "m00042"). */
-function maxRefNumber(state: CompressionState): number {
-    let max = 0;
-    for (const key of Object.keys(state.messageRefs.byRef)) {
-        const n = Number(key);
-        if (Number.isFinite(n) && n > max) max = n;
-    }
-    return max;
 }
 
 export function seedDerivedSession(args: SeedDerivedArgs): void {
@@ -119,5 +109,5 @@ export function seedDerivedSession(args: SeedDerivedArgs): void {
     };
     session.metadata.inheritedBlockIds = inheritedIds;
     markDirty(session);
-    log("info", `[rlm-inherit] session ${session.id} inherited ${inheritedIds.length} block(s) (~${tokens} tokens, refs up to m${String(maxRefNumber(session.state)).padStart(5, "0")}) from parent ${parent.id} (#1333)`);
+    log("info", `[rlm-inherit] session ${session.id} inherited ${inheritedIds.length} block(s) (~${tokens} tokens, refs up to m${String(highestUsedIndex(session.state.messageRefs)).padStart(5, "0")}) from parent ${parent.id} (#1333)`);
 }
