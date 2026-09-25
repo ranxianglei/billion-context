@@ -1,8 +1,9 @@
 import { anthropicToCore, openaiToCore } from "acp-kernel/wire";
-import type { CompressionBlock } from "acp-kernel";
+import { contentStoreStats, type CompressionBlock, type MessageContentStore, type StoredEntry } from "acp-kernel";
 import { stripAcpPanelMessages, stripAcpStatusMarkers } from "./acp-panel.js";
 import { peekSession, markDirty, type Session } from "./session.js";
 import { getStore } from "./persist.js";
+import { adoptContentStore, contentStoreOf } from "./store.js";
 import type { WireProtocol } from "./util.js";
 
 /**
@@ -30,7 +31,11 @@ import type { WireProtocol } from "./util.js";
  *
  * Seeding is the disk-restore recipe (persist.ts buildSession → mergeState)
  * applied to a filtered subset: blocks + blockContents + the messageRefs
- * entries of the adopted ids (+ their tokenSnapshot). The kernel's assignRefs
+ * entries of the adopted ids (+ their tokenSnapshot) + the CCR content-store
+ * entries whose raw ids are still in the child's history (#1340 — CCR
+ * placeholders and block covered-ref spans cite the PARENT's ref numbers, so
+ * acp_retrieve must resolve them in the fork too; without this the fork keeps
+ * advertising refs it can never retrieve). The kernel's assignRefs
  * cursor is highestUsedIndex(map)+1, so seeded refs push fresh assignments
  * ABOVE the parent's ref space — within the new session a ref number still
  * denotes exactly one message, ever (the kernel's id-never-reused contract).
@@ -156,6 +161,33 @@ export function planForkAdoption(parent: Session, incomingIds: Set<string>): For
     };
 }
 
+/** Ref-filtered clone of the parent's CCR store (#1340). An entry survives
+ *  iff its frozen rawId alias is in the caller-supplied reachable-id set —
+ *  the ids of every message the child's view can cite (the incoming request
+ *  ∪ every id covered by an adopted block; under the current adoptability
+ *  gate the second term is already implied by the first, but coverage follows
+ *  the VIEW, not the gate, so a loosened gate cannot silently re-open the
+ *  miss class this fixes). Entries are cloned (copy-on-fork: the parent
+ *  envelope is never shared or mutated) and byHash carries exactly the
+ *  payloads the surviving entries reference. Null when nothing survives — a
+ *  CCR-less parent must not spawn an empty companion artifact in the fork. */
+export function planForkStoreAdoption(store: MessageContentStore, reachableIds: Set<string>): MessageContentStore | null {
+    const byRef: Record<string, StoredEntry> = {};
+    const hashes = new Set<string>();
+    for (const [ref, entry] of Object.entries(store.byRef)) {
+        if (!reachableIds.has(entry.rawId)) continue;
+        byRef[ref] = structuredClone(entry);
+        hashes.add(entry.hash);
+    }
+    if (Object.keys(byRef).length === 0) return null;
+    const byHash: Record<string, string> = {};
+    for (const hash of hashes) {
+        const text = store.byHash[hash];
+        if (typeof text === "string") byHash[hash] = text;
+    }
+    return { version: 1, byHash, byRef };
+}
+
 /** Seed a fresh fork session from the plan. Copy-on-fork: every value is a
  *  clone; the parent session is never touched. */
 export function applyForkAdoption(session: Session, plan: ForkAdoptionPlan, parent: Session): void {
@@ -213,4 +245,11 @@ export function maybeAdoptForkBlocks(args: {
     }
     applyForkAdoption(session, plan, parent);
     log("info", `[fork-adoption] session ${session.id} adopted ${plan.adoptedActive} block(s) (~${plan.adoptedTokens} tokens, refs up to ${plan.maxRef || "n/a"}) from parent ${parentId} across fork (#629)`);
+    const reachableIds = new Set(incomingIds);
+    for (const b of plan.blocks) for (const id of b.effectiveMessageIds) reachableIds.add(id);
+    const inheritedStore = planForkStoreAdoption(contentStoreOf(parent), reachableIds);
+    if (inheritedStore) {
+        adoptContentStore(session, inheritedStore);
+        log("info", `[fork-adoption] session ${session.id} inherited ${Object.keys(inheritedStore.byRef).length} stored original(s) (~${contentStoreStats(inheritedStore).totalChars} chars) from parent ${parentId}'s CCR store (#1340)`);
+    }
 }
