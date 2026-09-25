@@ -12,7 +12,7 @@ import { executeProxyTool } from "./loop/core.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
 import { composeStreamFilters, containsMarkerLineText, containsRenderTagText, createMarkerLineFilter, createTagEchoFilter, mayStartMarkerLine, mayStartRenderTag, stripAcpTags, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
-import { ccrEnabled, contentStoreOf, retrieveToolName } from "./store.js";
+import { advertisedRetrieveToolName, ccrEnabled, contentStoreOf, retrieveToolName } from "./store.js";
 import { imageUsageSuffix } from "./image-compress.js";
 import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
 import { degenerateTurnWarning } from "./degenerate-turn.js";
@@ -567,7 +567,7 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
     // openai lanes in plugin mode; the responses wire is deliberately NOT advertised —
     // that proxy disarms CCR there, so advertising would break #1192.
     const ccrOn = config.ccr?.enabled === true;
-    const ccrName = config.ccr?.toolName ?? RETRIEVE_TOOL_NAME;
+    const ccrName = advertisedRetrieveToolName(config.ccr);
     const ccrTools = ccrOn ? retrieveToolsFor(ccrName) : undefined;
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({

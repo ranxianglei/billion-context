@@ -39,6 +39,37 @@ export function effectiveCcr(session: Session | undefined): CcrSettings | undefi
     return undefined;
 }
 
+/** [#1345] The name the plugin manifest advertises: the BASE-config
+ *  ccr.toolName — handlePluginManifest reads only the global compress block,
+ *  route/model merges never reach it. */
+export function advertisedRetrieveToolName(ccr: CcrSettings | undefined): string {
+    return ccr?.toolName ?? RETRIEVE_TOOL_NAME;
+}
+
+/** [#1345] Plugin mode stamps the session under the ADVERTISED name: a
+ *  provider/model toolName override would otherwise dispatch under a name
+ *  the host never registered — the model's calls rejected as unknown tools
+ *  while CCR reports enabled. Proxy mode injects the tool per request under
+ *  the session name, so per-route renaming keeps working there. Warns once
+ *  per session. */
+export function normalizePluginCcrName(
+    stamped: CcrSettings,
+    optsCcr: CcrSettings | undefined,
+    session: Session,
+    log: (level: string, msg: string) => void,
+): CcrSettings {
+    const advertised = advertisedRetrieveToolName(optsCcr);
+    if ((stamped.toolName ?? RETRIEVE_TOOL_NAME) === advertised) return stamped;
+    if (session.metadata.ccrNameOverrideWarned !== true) {
+        log(
+            "warn",
+            `[ccr] plugin mode: ignoring provider/model ccr.toolName "${stamped.toolName ?? RETRIEVE_TOOL_NAME}" — the manifest advertises "${advertised}" (base config); per-route renaming stays a proxy-mode feature (#1345)`,
+        );
+        session.metadata.ccrNameOverrideWarned = true;
+    }
+    return { ...stamped, toolName: advertised };
+}
+
 export function ccrEnabled(session: Session | undefined): boolean {
     return effectiveCcr(session)?.enabled === true;
 }

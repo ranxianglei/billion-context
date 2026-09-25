@@ -1,4 +1,4 @@
-import { defaultConfig, type Config, type Prompts } from "acp-kernel";
+import { defaultConfig, RETRIEVE_TOOL_NAME, type Config, type Prompts } from "acp-kernel";
 import { readFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { configFile } from "./paths.js";
@@ -646,6 +646,27 @@ export function passthroughState(env: NodeJS.ProcessEnv): { enabled: boolean; so
     return { enabled: filePassthrough, source: filePassthrough ? "file" : null };
 }
 
+/** [#1345] ccr.toolName is part of the plugin manifest's static surface: the
+ *  manifest reads only the global compress block, so provider/model-level
+ *  overrides apply exclusively in proxy mode. Warn at load — a half-applied
+ *  override (declared one way, dispatched another) must surface here, never
+ *  as an unknown-tool rejection mid-session. */
+export function warnCcrToolNameOverrides(routes: ProviderRoutes, globalCcr: CompressSettings["ccr"]): void {
+    const base = globalCcr?.toolName ?? RETRIEVE_TOOL_NAME;
+    for (const [origin, route] of Object.entries(routes)) {
+        const pName = route.compress?.ccr?.toolName;
+        if (pName !== undefined && pName !== base) {
+            loggerLog("warn", `[acp-config] providers["${origin}"].compress.ccr.toolName="${pName}" differs from the base name "${base}" — plugin mode advertises the base name and ignores the override; proxy mode resolves deepest-wins (#1345)`);
+        }
+        for (const [model, entry] of Object.entries(route.models ?? {})) {
+            const mName = entry.compress?.ccr?.toolName;
+            if (mName !== undefined && mName !== base) {
+                loggerLog("warn", `[acp-config] providers["${origin}"].models["${model}"].compress.ccr.toolName="${mName}" differs from the base name "${base}" — plugin mode advertises the base name and ignores the override; proxy mode resolves deepest-wins (#1345)`);
+            }
+        }
+    }
+}
+
 export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions {
     // --- Source 1: JSON config file (~/.config/billion-context/billion-context.json) ---
     // The canonical, user-editable config. Loaded first so env vars below can
@@ -731,6 +752,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
             throw new Error(`[acp-config] invalid upstream proxy for ${url}: ${String(error)}`);
         }
     }
+    warnCcrToolNameOverrides(routes, fileConfig.compress?.ccr);
     return {
         port,
         host,
