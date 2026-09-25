@@ -3,9 +3,10 @@
 Installed by ``bili plugin install hermes`` — a plain ``hermes`` session then becomes a full
 billion-context client with no launcher, no env vars and no fixed port:
 
-* spawns its own bili proxy on an ephemeral port (or attaches to a healthy one) and routes
-  model traffic through it via ``HTTPS_PROXY`` + ``HERMES_CA_BUNDLE`` — the same wire path
-  the ``bili hermes`` launcher uses (CONNECT + certificate MITM);
+* spawns its own bili proxy on an ephemeral port (or attaches to a healthy one whose
+  session-lifecycle watchdog is armed — see the attach gate in TECHNICAL-NOTES.md, #1335)
+  and routes model traffic through it via ``HTTPS_PROXY`` + ``HERMES_CA_BUNDLE`` — the same
+  wire path the ``bili hermes`` launcher uses (CONNECT + certificate MITM);
 * registers the proxy's ACP tools (compress / decompress / acp_status) as native Hermes tools;
 * stamps plugin-mode headers on every LLM request once the tools are ready — round 1 rides
   wire mode so strict backends see a clean head;
@@ -42,6 +43,7 @@ AGENT_NAME = "hermes"
 PLUGIN_ID = "billion-context"
 OPT_OUT_ENV = "BILI_NATIVE_HERMES"
 ATTACH_ENV = "BILLION_CONTEXT_ATTACH"
+ATTACH_EXTERNAL_ENV = "BILI_NATIVE_ATTACH_EXTERNAL"
 MANIFEST_TIMEOUT_S = 5.0
 TOOL_TIMEOUT_S = 60.0
 RUNTIME_INFO_TIMEOUT_S = 5.0
@@ -73,6 +75,7 @@ def _reset_for_test() -> None:
     _state["env_applied"] = False
     _state["max_output"].clear()
     _state["runtime_info_sent"].clear()
+    _GATE_REFUSED.clear()
 
 
 # — paths ---------------------------------------------------------------------
@@ -176,12 +179,84 @@ def probe_proxy(origin: str) -> bool:
     return isinstance(manifest, dict) and bool(manifest.get("version"))
 
 
+def probe_health(origin: str) -> Optional[Dict[str, Any]]:
+    return http_get_json(origin.rstrip("/") + "/__bili/health", HEALTH_PROBE_TIMEOUT_S)
+
+
+def watchdog_armed(health: Optional[Dict[str, Any]]) -> Optional[bool]:
+    # None = field absent or not a bool — an unverifiable lifecycle.
+    if isinstance(health, dict):
+        wd = health.get("watchdog")
+        if isinstance(wd, dict) and isinstance(wd.get("armed"), bool):
+            return wd["armed"]
+    return None
+
+
+def config_file_path() -> Path:
+    raw = os.environ.get("BILI_CONFIG_FILE", "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    raw = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    base = Path(raw).expanduser() if raw else Path.home() / ".config"
+    return base / "billion-context" / "billion-context.json"
+
+
+def load_bili_config() -> Dict[str, Any]:
+    try:
+        data = json.loads(config_file_path().read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def resolve_attach_external() -> bool:
+    # Must stay behavior-identical to resolveNativeAttachExternal (src/config.ts, #1335):
+    # env 1/true vs 0/false wins; anything else falls through to the file value, which must
+    # be exactly true. Contract pinned in TECHNICAL-NOTES.md.
+    value = os.environ.get(ATTACH_EXTERNAL_ENV, "").strip().lower()
+    if value == "1" or value == "true":
+        return True
+    if value == "0" or value == "false":
+        return False
+    native = load_bili_config().get("native")
+    return isinstance(native, dict) and native.get("attachExternal") is True
+
+
+_GATE_REFUSED: set = set()
+
+
+def attach_gate_allows(armed: Optional[bool], attach_external: bool) -> bool:
+    # Default-deny unless the proxy proves its session-lifecycle watchdog is armed.
+    # Must stay behavior-identical to attachGateAllows (src/launcher.ts, #1335).
+    if attach_external:
+        return True
+    return armed is True
+
+
+def log_gate_refusal(origin: str, pid: Optional[int], armed: Optional[bool]) -> None:
+    # Once per origin per process: the discovery poll re-encounters the same refused
+    # candidate every tick while waiting for another starter.
+    if origin in _GATE_REFUSED:
+        return
+    _GATE_REFUSED.add(origin)
+    reason = ("it reports NO session-lifecycle watchdog (started without BILI_PARENT_PID, e.g. manual `bili start`)"
+              if armed is False else
+              "it does not report watchdog state (older bili build) — its lifecycle is unverifiable")
+    pid_part = f" (pid {pid})" if isinstance(pid, int) else ""
+    logger.warning("billion-context: refusing to attach to %s%s — %s. It would outlive this session and ignore "
+                   "config edits until killed (#1322/#1335). Starting a session-owned proxy instead; set "
+                   "native.attachExternal=true or BILI_NATIVE_ATTACH_EXTERNAL=1 to attach anyway.",
+                   origin, pid_part, reason)
+
+
 def register_watcher(origin: str) -> None:
     """Register this host pid as a watchdog owner of a shared proxy (#1199). The spawner's
     BILI_PARENT_PID watches only the FIRST session's process; without this, the shared proxy
     exits when that session dies while this one still runs. Same policy as the TS launcher:
-    409 = daemon proxy (no watchdog) → nothing to do; any other failure degrades to the
-    single-owner watchdog and never blocks session start."""
+    409 = unarmed watchdog → nothing to do (since #1338 auto-discovery refuses unarmed
+    daemons before attaching, this is reachable only via explicit attach / the
+    attachExternal escape hatch); any other failure degrades to the single-owner watchdog
+    and never blocks session start."""
     try:
         status, _body = http_post_json(origin + "/__bili/watcher", {"pid": os.getpid()}, HEALTH_PROBE_TIMEOUT_S)
         if status is None:
@@ -250,9 +325,17 @@ def discover_instance() -> Optional[str]:
         return None
     if inst["pid"] is not None and not pid_alive(inst["pid"]):
         return None
-    if probe_proxy(inst["origin"]):
-        return inst["origin"]
-    return None
+    origin = inst["origin"]
+    health = probe_health(origin)
+    if not isinstance(health, dict) or health.get("ok") is not True:
+        return None
+    armed = watchdog_armed(health)
+    if not attach_gate_allows(armed, resolve_attach_external()):
+        # #1335/#1338: lifecycle-less or unverifiable listener — never attach by
+        # default; ensure_origin falls through to spawning our own armed proxy.
+        log_gate_refusal(origin, inst["pid"], armed)
+        return None
+    return origin
 
 
 # — cross-process startup coordination (mirrors ensureProxyRunning, #707) ------
@@ -399,7 +482,8 @@ def _attach(origin: str) -> str:
 
 def ensure_origin(sidecar: Dict[str, str]) -> Optional[str]:
     """Return a healthy proxy origin. Attach when possible (explicit target, then any recorded
-    instance); otherwise spawn our own behind the starting-marker arbiter."""
+    instance that passes the attach gate — armed session-lifecycle watchdog, #1335); otherwise
+    spawn our own behind the starting-marker arbiter."""
     attach = (os.environ.get(ATTACH_ENV) or "").strip().rstrip("/")
     if attach:
         if probe_proxy(attach):

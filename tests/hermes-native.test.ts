@@ -203,13 +203,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 BASE = sys.argv[2]
 SCENARIO = sys.argv[1]
 
-for sub in ("state", "data", "home", "plugins/billion-context"):
+for sub in ("state", "data", "home", "config", "plugins/billion-context"):
     os.makedirs(os.path.join(BASE, sub), exist_ok=True)
 os.environ["XDG_STATE_HOME"] = os.path.join(BASE, "state")
 os.environ["XDG_DATA_HOME"] = os.path.join(BASE, "data")
+os.environ["XDG_CONFIG_HOME"] = os.path.join(BASE, "config")
 os.environ["HERMES_HOME"] = os.path.join(BASE, "home")
 for k in ("BILLION_CONTEXT_ATTACH", "BILLION_CONTEXT_PROXY", "BILI_NATIVE_HERMES",
           "BILLION_CONTEXT_PLUGIN", "BILI_PROVIDER_REWRITES",
+          "BILI_NATIVE_ATTACH_EXTERNAL", "BILI_CONFIG_FILE",
           "HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy",
           "ALL_PROXY", "all_proxy", "HERMES_CA_BUNDLE"):
     os.environ.pop(k, None)
@@ -234,6 +236,12 @@ class Handler(BaseHTTPRequestHandler):
                 {"name": "compress", "description": "compress a range", "input_schema": {"type": "object"}},
                 {"name": "decompress", "description": "decompress a block", "input_schema": {"type": "object"}},
                 {"name": "acp_status", "description": "context status", "input_schema": {"type": "object"}}]}})
+        elif self.path == "/__bili/health":
+            raw = os.environ.get("BC_HEALTH_JSON")
+            if raw is None:
+                self._send({"error": "not found"}, 404)
+            else:
+                self._send(json.loads(raw))
         else:
             self._send({"error": "not found"}, 404)
 
@@ -336,6 +344,30 @@ elif SCENARIO.startswith("attach"):
             "tool_result": tool_result,
             "no_session_result": no_session_result,
         })
+elif SCENARIO.startswith("discover-"):
+    # #1338: auto-discovery variants. The instance file points at the stub; BC_HEALTH_JSON
+    # (set by the TS test) decides what /__bili/health reports. Refused candidates fall
+    # through to spawn — the dummy sidecar exits at once, so bring-up fails fast and the
+    # plugin stays inert.
+    flag = SCENARIO[len("discover-"):]
+    install_sidecar(False)
+    mod.SPAWN_WAIT_S = 1.0
+    st_dir = os.path.join(os.environ["XDG_STATE_HOME"], "billion-context")
+    os.makedirs(st_dir, exist_ok=True)
+    with open(os.path.join(st_dir, "proxy-origin"), "w") as f:
+        json.dump({"origin": ORIGIN, "pid": os.getpid(), "launchToken": "test-token"}, f)
+    if flag == "escape-env":
+        os.environ["BILI_NATIVE_ATTACH_EXTERNAL"] = "1"
+    elif flag == "escape-config":
+        cfg_dir = os.path.join(os.environ["XDG_CONFIG_HOME"], "billion-context")
+        os.makedirs(cfg_dir, exist_ok=True)
+        with open(os.path.join(cfg_dir, "billion-context.json"), "w") as f:
+            json.dump({"native": {"attachExternal": True}}, f)
+    ca_dir = os.path.join(os.environ["XDG_DATA_HOME"], "billion-context", "ca")
+    os.makedirs(ca_dir, exist_ok=True)
+    with open(os.path.join(ca_dir, "root-ca.pem"), "w") as f:
+        f.write("dummy-ca\\n")
+    mod.register(ctx)
 else:
     raise SystemExit("unknown scenario: " + SCENARIO)
 
@@ -381,7 +413,7 @@ interface DriverOut {
     no_session_result?: string;
 }
 
-function runDriver(scenario: string, extraEnv: Record<string, string> = {}): { out: DriverOut | null; err: string } {
+function runDriver(scenario: string, extraEnv: Record<string, string> = {}): { out: DriverOut | null; err: string; stderr: string } {
     const base = track(makeTmp(scenario));
     const driver = path.join(base, "driver.py");
     fs.writeFileSync(driver, DRIVER);
@@ -391,11 +423,11 @@ function runDriver(scenario: string, extraEnv: Record<string, string> = {}): { o
         maxBuffer: 4 * 1024 * 1024,
         env: { ...process.env, BC_PLUGIN_SRC: HERMES_SRC_DIR, BC_NODE: process.execPath, ...extraEnv },
     });
-    if (r.error || r.status !== 0) return { out: null, err: `${r.error?.message ?? ""} stdout=${r.stdout} stderr=${r.stderr}` };
+    if (r.error || r.status !== 0) return { out: null, err: `${r.error?.message ?? ""} stdout=${r.stdout} stderr=${r.stderr}`, stderr: r.stderr ?? "" };
     try {
-        return { out: JSON.parse(r.stdout.trim().split("\n").pop()!) as DriverOut, err: "" };
+        return { out: JSON.parse(r.stdout.trim().split("\n").pop()!) as DriverOut, err: "", stderr: r.stderr ?? "" };
     } catch (err) {
-        return { out: null, err: `unparseable driver output: ${r.stdout} (${String(err)})` };
+        return { out: null, err: `unparseable driver output: ${r.stdout} (${String(err)})`, stderr: r.stderr ?? "" };
     }
 }
 
@@ -455,6 +487,85 @@ describe("python plugin runtime (subprocess)", () => {
         assert.deepEqual(out!.tools_registered, ["acp_status", "compress", "decompress"]);
         assert.equal(out!.env_https_proxy, out!.origin);
         assert.equal(out!.watcher_calls.length, 1, "registration was attempted before failing open");
+    });
+
+    // #1338: hermes auto-discovery must apply the same attach gate as the TS lanes —
+    // refuse lifecycle-less (or unverifiable) listeners by default, honor the same
+    // escape hatch, keep armed instances shareable, and leave explicit attach exempt.
+    const HEALTH_UNARMED = '{"ok":true,"instanceId":"i1","watchdog":{"armed":false,"watchers":[]}}';
+    const HEALTH_NO_FIELD = '{"ok":true,"instanceId":"i1"}';
+    const HEALTH_ARMED = '{"ok":true,"instanceId":"i1","watchdog":{"armed":true,"parentPid":4242,"watchers":[4242]}}';
+
+    test("discover an unarmed daemon: gate refuses by default, falls through to spawn, stays inert, logs the refusal", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err, stderr } = runDriver("discover-unarmed", { BC_HEALTH_JSON: HEALTH_UNARMED });
+        assert.ok(out, err);
+        assert.deepEqual(out!.tools_registered, []);
+        assert.equal(out!.env_https_proxy, null);
+        assert.equal(out!.marker_left, false);
+        assert.match(stderr!, /refusing to attach to .*it reports NO session-lifecycle watchdog/);
+    });
+
+    test("discover a pre-#1330 listener (no watchdog field): unverifiable -> refused (default-deny)", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err, stderr } = runDriver("discover-missing-field", { BC_HEALTH_JSON: HEALTH_NO_FIELD });
+        assert.ok(out, err);
+        assert.deepEqual(out!.tools_registered, []);
+        assert.equal(out!.env_https_proxy, null);
+        assert.match(stderr!, /does not report watchdog state.*unverifiable/);
+    });
+
+    test("escape hatch env: BILI_NATIVE_ATTACH_EXTERNAL=1 attaches to an unarmed daemon", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("discover-escape-env", { BC_HEALTH_JSON: HEALTH_UNARMED });
+        assert.ok(out, err);
+        assert.deepEqual(out!.tools_registered, ["acp_status", "compress", "decompress"]);
+        assert.equal(out!.env_https_proxy, out!.origin);
+        assert.deepEqual(out!.watcher_calls, [{ pid: out!.pid }]);
+    });
+
+    test("escape hatch config file: native.attachExternal=true attaches to an unarmed daemon", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("discover-escape-config", { BC_HEALTH_JSON: HEALTH_UNARMED });
+        assert.ok(out, err);
+        assert.deepEqual(out!.tools_registered, ["acp_status", "compress", "decompress"]);
+        assert.equal(out!.env_https_proxy, out!.origin);
+        assert.deepEqual(out!.watcher_calls, [{ pid: out!.pid }]);
+    });
+
+    test("armed instance stays attachable (sharing preserved, #394/#417)", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("discover-armed", { BC_HEALTH_JSON: HEALTH_ARMED });
+        assert.ok(out, err);
+        assert.deepEqual(out!.tools_registered, ["acp_status", "compress", "decompress"]);
+        assert.equal(out!.env_https_proxy, out!.origin);
+        assert.deepEqual(out!.watcher_calls, [{ pid: out!.pid }]);
+    });
+
+    test("explicit BILLION_CONTEXT_ATTACH bypasses the gate even against an unarmed health report (#1335 exemption)", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("attach-unarmed", { BC_HEALTH_JSON: HEALTH_UNARMED, BC_WATCHER_STATUS: "409" });
+        assert.ok(out, err);
+        assert.deepEqual(out!.tools_registered, ["acp_status", "compress", "decompress"]);
+        assert.equal(out!.env_https_proxy, out!.origin);
     });
 
     for (const [scenario, extraEnv] of [

@@ -7,14 +7,46 @@ here instead of between the options.
 ## Native plugin lifecycle (Option 1)
 
 At load the plugin **spawns its own proxy** (or attaches to a healthy
-running one — a parent-pid watchdog tears it down when the client exits),
-rewrites model traffic to `<proxy>/bili/<upstream-url>`, registers
+running one that passes the attach gate below — a parent-pid watchdog tears
+it down when the client exits), rewrites model traffic to
+`<proxy>/bili/<upstream-url>`, registers
 `compress` / `decompress` / `acp_status` as native client tools (plugin
 mode), and binds the `/acp` panel to the current session. It also reports
 the client's **own model config** to the proxy (runtime-info protocol,
 #955) so compression budgets use the real window instead of a registry
 guess. Opt-out envs: `BILI_NATIVE_PI=0`, `BILI_NATIVE_OMP=0`,
 `BILI_NATIVE_OPENCODE=0`, `BILI_NATIVE_DSH=0`, `BILI_NATIVE_KIMI=0`.
+
+## Native attach gate — health contract (#1335/#1338)
+
+A native hook may attach to an existing proxy only when it can prove the
+proxy's lifecycle is session-managed. A manually started `bili start` daemon
+has no such owner — attaching pins the session to a process that outlives it,
+swallows watcher-registration 409s, and may run an older bili build (#1322).
+The proof is the health endpoint, and this table is the contract **both**
+implementations are reviewed against so they cannot drift:
+
+| Contract point | Value |
+|---|---|
+| Endpoint | `GET /__bili/health` (loopback-only management namespace) |
+| Field | `watchdog.armed` (boolean) — exposed since #1330; absent on older builds |
+| Gate rule | attach iff `watchdog.armed === true`; missing field, non-boolean value, or unreachable/malformed health = **unverifiable → refuse** (default-deny) |
+| Escape hatch | env `BILI_NATIVE_ATTACH_EXTERNAL` (`1`/`true` opens, `0`/`false` closes, anything else falls through) > config file `native.attachExternal` (must be exactly `true`) > default `false`; env wins over file |
+| Exempt paths | explicit user-directed attach (`BILLION_CONTEXT_ATTACH`, launcher-preset `BILLION_CONTEXT_PROXY`) bypasses discovery and the gate entirely |
+| Refusal behavior | log loudly once per origin per bring-up, then fall through to spawning a session-owned proxy (ephemeral port, armed from birth, dies with the last session per #1186) |
+
+Implementations (behavior must stay identical):
+
+- TypeScript lanes — `attachGateAllows` / `pickAttachable` (`src/launcher.ts`) +
+  `resolveNativeAttachExternal` (`src/config.ts`); covers claude-native, kimi, dsh,
+  omp, opencode (V1+native), pi, zcode, and the MCP entries.
+- Hermes (Python) — `attach_gate_allows` / `discover_instance` /
+  `resolve_attach_external` (`hermes-plugin/__init__.py`); separate implementation
+  because hermes' plugin API is Python-only.
+
+Why default-deny on a missing field: pre-#1330 builds never report watchdog
+state, and those are exactly the stale manual daemons behind #1322 — attaching
+to them would keep pinning sessions to possibly-old code.
 
 ## Runtime-info protocol (#955)
 
