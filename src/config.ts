@@ -590,10 +590,11 @@ export type ProxyOptions = {
      *  fully-present compression blocks instead of restarting at zero.
      *  Enable with `forkAdoption: true` or env BILI_FORK_ADOPTION=1. */
     forkAdoption?: boolean;
-    /** Content fallback of the bili→bili chain detection: when an inbound
+    /** Content detection of the bili→bili chain awareness: when an inbound
      *  request carries ACP artifacts (render tags / ACP tool-call history)
      *  but no x-bili-hop header and no local compression state for the
-     *  session, pass it through verbatim instead of processing (#1086).
+     *  session, record one advisory observation and process normally (#1086,
+     *  advisory-only since #1357) — never verbatim passthrough.
      *  Default ON; escape valve via env BILI_CHAIN_CONTENT=0 or
      *  `chainContentDetection: false` in the config file (env wins). The
      *  x-bili-hop signal is unaffected by this switch. */
@@ -937,8 +938,9 @@ type FileConfig = {
      *  zero compression state. Default false; env BILI_FORK_ADOPTION=1/0
      *  wins over the file. */
     forkAdoption?: boolean;
-    /** Set `false` to disable the ACP-artifact content fallback of the
-     *  bili→bili chain detection (#1086); x-bili-hop stays active either way.
+    /** Set `false` to disable the ACP-artifact content detection of the
+     *  bili→bili chain awareness (#1086, advisory-only since #1357);
+     *  x-bili-hop stays active either way.
      *  Env BILI_CHAIN_CONTENT=0 wins over the file. */
     chainContentDetection?: boolean;
     /** Set `true` to enable the sticky head-system anchor (#1085, default

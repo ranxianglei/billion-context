@@ -686,12 +686,14 @@ export function _chainVerdictMapForTest(): Map<string, ChainVerdict> {
     return chainVerdicts;
 }
 
-/** #1218: the /acp panel rendered when a conversation is being passed through
- *  unprocessed. Every /acp surface (pi / dsh / opencode) displays `panel`
- *  verbatim, so the server renders the verdict once and all clients show it
- *  without agent-side changes. */
-function chainPassthroughPanel(v: ChainVerdict): string {
-    return `⚠️ billion-context: this conversation is being PASSED THROUGH UNPROCESSED — judged an external bili chain by the content fallback (evidence: ${v.kind}, protocol ${v.protocol}). No local compression session exists, so compression is silently disabled for this conversation. Last passthrough: ${new Date(v.at).toISOString()}. If this is your own client, disable the content fallback (chainContentDetection=false, env BILI_CHAIN_CONTENT=0); see the [chain] warn in the bili log.`;
+/** #1357 Phase 1: the /acp panel rendered when a conversation carried
+ *  historical ACP content with no prior local state. That content is now
+ *  ADVISORY-only — observed but NOT treated as a foreign chain, so the request
+ *  was processed normally and the conversation owns its own compression session.
+ *  Every /acp surface (pi / dsh / opencode) displays `panel` verbatim, so the
+ *  server renders it once and all clients show it without agent-side changes. */
+function chainAdvisoryPanel(v: ChainVerdict): string {
+    return `ℹ️ billion-context: this conversation carried ACP-shaped content (evidence: ${v.kind}, protocol ${v.protocol}) with no prior local compression state. Historical ACP content is advisory-only (#1357) — it was NOT treated as a foreign bili chain, so the request was processed normally and this conversation owns its own compression session. Last observation: ${new Date(v.at).toISOString()}. See the [chain] warn in the bili log.`;
 }
 
 export function handlePluginStatus(conversationId: string, res: import("node:http").ServerResponse, deps: PluginToolDeps, fallbackLatest = false): void {
@@ -716,15 +718,15 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         }
     }
     if (!session) {
-        // #1218: a chain/content-fallback verdict for THIS conversation means
-        // requests ARE arriving — passed through unprocessed — so the
-        // armed-idle notice would mislead ("no model request yet" is false).
-        // Answer 200 with a renderable panel; `phase` exposes the state for
-        // programmatic consumers.
+        // #1357 Phase 1: a content-fallback verdict for THIS conversation means
+        // requests ARE arriving and carried historical ACP content — now an
+        // ADVISORY observation (processed normally), so the armed-idle notice
+        // would mislead ("no model request yet" is false). Answer 200 with a
+        // renderable panel; `phase` exposes the state for programmatic consumers.
         const verdict = chainVerdictFor(conversationId);
         if (verdict !== undefined) {
             res.writeHead(200, { "content-type": "application/json" });
-            res.end(JSON.stringify({ ok: true, conversationId, phase: "chain-passthrough", chain: verdict, panel: chainPassthroughPanel(verdict) }));
+            res.end(JSON.stringify({ ok: true, conversationId, phase: "chain-advisory", chain: verdict, panel: chainAdvisoryPanel(verdict) }));
             return;
         }
         // Runtime-info protocol (#955): no session exists yet, but the client
