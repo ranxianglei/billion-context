@@ -62,7 +62,7 @@ import {
 } from "acp-kernel/wire";
 import { ABSORB_TOOL, ABSORB_TOOL_GOOGLE, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, COMPRESS_TOOL, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, IMAGE_FULL_TOOL, IMAGE_FULL_TOOL_GOOGLE, IMAGE_FULL_TOOL_OPENAI, IMAGE_FULL_TOOL_RESPONSES, RULE_TOOL, RULE_TOOL_GOOGLE, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, retrieveToolsFor, buildAbsorbSystemPrompt, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withConversationIdNote, withMarkerIntegrityNote, withStagedCompressGuidance, withSummaryBudgetNote } from "./compress-tool.js";
 import { applyAbsorbView, absorbEnabled, absorbToolName, storeEffectiveAbsorb } from "./absorb.js";
-import { adoptContentStore, ccrEnabled, ccrPluginWireOk, contentStoreOf, drainPendingRetrievals, executeRetrieve, retrieveToolName, storeEffectiveCcr, type CcrSettings } from "./store.js";
+import { adoptContentStore, ccrEnabled, ccrPluginWireOk, contentStoreOf, drainPendingRetrievals, executeRetrieve, requeueRetrievalsOnFailure, retrieveToolName, storeEffectiveCcr, trackRetrievalDrain, type CcrSettings } from "./store.js";
 import { applyImageCompressionPass, imageCompressionEnabled, imageFullTrailingNote, storeEffectiveImageCompression, type ImageCompressionSettings } from "./image-compress.js";
 import { rulesEnabled, storeEffectiveRules } from "./rules-feature.js";
 import { rewriteJsonResponse, type RewriteCtx } from "./stream.js";
@@ -2668,9 +2668,13 @@ async function prepareAnthropic(
         await applyImageCompressionPass(session, processedMessages as BiliMessage[], { config, billing: imageBillingFor(opts, upstreamOrigin), log });
         // [#1271] plugin mode: acp_retrieve ran via the tool API; ride the full original
         // back on this forward as a request-only trailing message (ephemeral, never persisted).
+        // [#1343] track the drained batch so a failed forward requeues it.
         if (pluginMode && ccrEnabled(session)) {
             const retrInj = drainPendingRetrievals(session);
-            if (retrInj.length > 0) processedMessages = [...processedMessages, ...retrInj];
+            if (retrInj.length > 0) {
+                processedMessages = [...processedMessages, ...retrInj];
+                trackRetrievalDrain(session, retrInj);
+            }
         }
         rebuiltMessages = coreToAnthropic(processedMessages as BiliMessage[], cacheControls);
         if (sysNotes.length > 0) {
@@ -2851,9 +2855,13 @@ async function prepareOpenai(
         await applyImageCompressionPass(session, processedMessages as BiliMessage[], { config, billing: imageBillingFor(opts, billingUpstream ?? upstreamOrigin), log });
         // [#1271] plugin mode: acp_retrieve ran via the tool API; ride the full original
         // back on this forward as a request-only trailing message (ephemeral, never persisted).
+        // [#1343] track the drained batch so a failed forward requeues it.
         if (pluginMode && ccrEnabled(session)) {
             const retrInj = drainPendingRetrievals(session);
-            if (retrInj.length > 0) processedMessages = [...processedMessages, ...retrInj];
+            if (retrInj.length > 0) {
+                processedMessages = [...processedMessages, ...retrInj];
+                trackRetrievalDrain(session, retrInj);
+            }
         }
         rebuiltMessages = systemToUser(hardenOpenaiAssistantContent(coreToOpenai(processedMessages as BiliMessage[])));
 
@@ -4471,6 +4479,9 @@ async function forward(
         // #604: a network-level failure (socket reset, timeout abort) also never
         // reports usage — arm the emergency shrink like the 5xx branch below.
         if (prepared && req.method !== "GET" && req.method !== "HEAD") armFailureShrink(prepared, log, "network failure");
+        // [#1343] the drained retrieval batch never reached upstream — give it
+        // back to the queue so the next forward delivers the promised text.
+        requeueRetrievalsOnFailure(prepared?.session, "upstream network failure");
         throw new Error(`upstream request failed: ${formatUpstreamError(error, upstreamUrl, proxyUrl)}`, { cause: error });
     }
     // #552 learn-on-failure: a converting upstream that rejects a role (codex
@@ -4774,6 +4785,9 @@ async function forward(
         // overflow path above could not have handled this response.
         if (prepared?.session && upstream.status >= 500) {
             armFailureShrink(prepared, log, `upstream ${upstream.status}`);
+            // [#1343] upstream rejected the request — the batch was never
+            // delivered; requeue for the client's retry.
+            requeueRetrievalsOnFailure(prepared.session, `upstream ${upstream.status}`);
         }
         // #174: always log a non-2xx upstream response (status + request-id +
         // body snippet) — a 4xx/5xx with zero log trace is a diagnostic

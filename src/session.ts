@@ -197,8 +197,15 @@ export type Session = {
     contentStoreDirty?: boolean;
     /** In-memory only (NOT persisted): full-text retrieval injections queued by
      *  executeRetrieve, drained into the next re-request after the tool-result
-     *  pair (request-only, same channel as nudges). */
+     *  pair (request-only, same channel as nudges). [#1343] The queue itself
+     *  now rides the persisted session file; only the delivery ticket below
+     *  stays transient. */
     pendingRetrievals: CoreMessage[];
+    /** [#1343] In-memory only (NOT persisted): the most recent drained
+     *  retrieval batch, held between drain and forward outcome so a failed
+     *  forward can requeue it. Any new drain clears it — a delivered batch
+     *  must never be resurrected. */
+    lastRetrievalDrain?: CoreMessage[];
     /** #1095 in-memory only (NOT persisted): deterministic encode cache keyed
      *  by sha256 of the ORIGINAL base64 → encoded payload. Identical inputs
      *  must yield identical wire bytes across turns/restarts (prefix-cache

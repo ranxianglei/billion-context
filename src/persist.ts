@@ -118,6 +118,10 @@ interface PersistedSession {
     };
     /** Free-form escape hatch (v2+). */
     metadata?: Record<string, unknown>;
+    /** [#1343] Undelivered retrieve injections: the ack already promised
+     *  delivery, so a restart restores the queue (bounded by the in-memory
+     *  cap) instead of silently dropping it. Absent on pre-#1343 files. */
+    pendingRetrievals?: CoreMessage[];
     createdAt: number;
     // Legacy flat fields (v1). Kept optional only so buildSession can read
     // older files; v2 records emit grouped meta/stats instead.
@@ -672,6 +676,7 @@ function buildRecord(session: Session): PersistedSession {
         metadata: { ...session.metadata },
         state: session.state,
         blockContents: Object.fromEntries(session.blockContents),
+        pendingRetrievals: session.pendingRetrievals.length > 0 ? session.pendingRetrievals : undefined,
         createdAt: session.createdAt,
     };
 }
@@ -753,8 +758,16 @@ function buildSession(parsed: PersistedSession): Session {
         lastMessagesFolded: parsed.messagesFolded === true,
         inFlight: 0,
         persisted: true,
-        pendingRetrievals: [],
+        pendingRetrievals: Array.isArray(parsed.pendingRetrievals)
+            ? parsed.pendingRetrievals.filter((m): m is CoreMessage => !!m && typeof m === "object" && typeof (m as CoreMessage).text === "string")
+            : [],
     };
+}
+
+/** Test-only exposure of the persistence record builder (#1343 round-trip
+ *  tests). */
+export function _buildRecordForTest(session: Session): PersistedSession {
+    return buildRecord(session);
 }
 
 function isValidRecord(parsed: unknown): parsed is PersistedSession {

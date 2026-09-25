@@ -10,6 +10,7 @@ import {
 } from "acp-kernel";
 import { log as loggerLog } from "./logger.js";
 import { getStore } from "./persist.js";
+import { markDirty } from "./session.js";
 import type { CompressSettings } from "./config.js";
 import type { Session } from "./session.js";
 
@@ -27,7 +28,15 @@ export function storeEffectiveCcr(session: Session, ccr: CcrSettings | undefined
     // flush as a stale trailing full-text message whenever the lane re-arms at
     // an unrelated conversation point. Not persisted either way (#persist resets
     // on load) — this only tightens the in-memory window.
-    if (!ccr) session.pendingRetrievals.length = 0;
+    if (!ccr) {
+        // [#1343] A disarmed lane cannot deliver queued full-text injections:
+        // the retrieve ack already promised the text, so log the loss loudly
+        // instead of clearing silently.
+        if (session.pendingRetrievals.length > 0) {
+            loggerLog("warn", `[ccr] lane disarmed with ${session.pendingRetrievals.length} undelivered retrieval injection(s) (ack'd, never delivered) — dropping queue (#1343)`);
+            session.pendingRetrievals.length = 0;
+        }
+    }
 }
 
 /** Read back the CCR policy stamped by {@link storeEffectiveCcr}. */
@@ -98,6 +107,8 @@ export function adoptContentStore(session: Session, store: MessageContentStore):
     session.contentStoreDirty = true;
 }
 
+const RETRIEVAL_QUEUE_MAX = 4;
+
 /** Execute a retrieve-tool call against the kernel store: resolve the ref,
  *  count hit/miss, and queue the full-text injection for the re-request path
  *  (request-only, same channel as nudges — never persisted, structurally
@@ -119,13 +130,49 @@ export function executeRetrieve(args: Record<string, unknown>, session: Session)
     }
     session.stats.retrieveHits = (session.stats.retrieveHits ?? 0) + 1;
     session.state = noteRetrieval(session.state);
+    // [#1343] Bound the queue: a lane that never drains (non-CCR wire after a
+    // mode switch, or a client that stops re-requesting) must not accumulate
+    // full-text injections indefinitely. Oldest is dropped with a log line —
+    // same honest-loss shape as the disarm clear above.
+    if (session.pendingRetrievals.length >= RETRIEVAL_QUEUE_MAX) {
+        const dropped = session.pendingRetrievals.shift();
+        loggerLog("warn", `[ccr] retrieval queue full (max ${RETRIEVAL_QUEUE_MAX}); dropping oldest undelivered injection ${dropped?.id ?? ""} (#1343)`);
+    }
     session.pendingRetrievals.push(result.injection);
+    markDirty(session);
     loggerLog("info", `[ccr] retrieve ${ref} (${result.entry.tokens} tok, ${result.entry.chars} chars)`);
     return result.ackText;
 }
 
 /** Drain queued retrieval injections: callers append them to the re-request
- *  message list AFTER the tool-result pair (ack first, full text second). */
+ *  message list AFTER the tool-result pair (ack first, full text second).
+ *  [#1343] A fresh drain invalidates the previous drain's requeue ticket:
+ *  only the most recent in-flight batch may be restored on forward failure —
+ *  a delivered batch must never be resurrected by a later request's error. */
 export function drainPendingRetrievals(session: Session): CoreMessage[] {
-    return session.pendingRetrievals?.length ? session.pendingRetrievals.splice(0) : [];
+    session.lastRetrievalDrain = undefined;
+    if (!session.pendingRetrievals?.length) return [];
+    const drained = session.pendingRetrievals.splice(0);
+    markDirty(session);
+    return drained;
+}
+
+/** Record a drained batch as in-flight so a failed forward can requeue it
+ *  (#1343, window 2: post-drain, pre-success). Call after appending the
+ *  drained messages to the outgoing list. */
+export function trackRetrievalDrain(session: Session, drained: CoreMessage[]): void {
+    if (drained.length > 0) session.lastRetrievalDrain = drained;
+}
+
+/** [#1343] A forward that failed before upstream accepted the request
+ *  requeues the tracked batch: the retrieve ack already told the model the
+ *  full text follows, so silent loss would strand the delivery contract.
+ *  The requeued injections ride the next successful forward. */
+export function requeueRetrievalsOnFailure(session: Session | undefined, reason: string): void {
+    const drained = session?.lastRetrievalDrain;
+    if (!drained || drained.length === 0) return;
+    session.pendingRetrievals.unshift(...drained);
+    session.lastRetrievalDrain = undefined;
+    markDirty(session);
+    loggerLog("warn", `[ccr] ${reason}: requeued ${drained.length} undelivered retrieval injection(s) — they ride the next successful forward (#1343)`);
 }
