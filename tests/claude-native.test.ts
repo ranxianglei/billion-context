@@ -23,7 +23,7 @@ import {
     resolveClaudeCli,
     stripClaudeManagedBlock,
 } from "../src/plugin-install.ts";
-import { CLAUDE_NATIVE_DEFAULT_PORT, clearClaudeNativePort, resolveClaudeNativePort, saveClaudeNativePort } from "../src/config.ts";
+import { CLAUDE_NATIVE_DEFAULT_PORT, clearClaudeNativePort, resolveClaudeNativePort, resolveNativeAttachExternal, saveClaudeNativePort } from "../src/config.ts";
 import { chooseWatchdogParentPid, isClaudeHostArgv, isTransientShArgv, planClaudeNativeBootstrap, readPsProcInfo, readWinProcInfo, resolveClaudeHostPid } from "../src/claude-native-bootstrap.ts";
 
 // #1248: the live tests below spawn real proxies/processes and observe real
@@ -146,6 +146,56 @@ test("resolveClaudeNativePort: env > default; rejects junk", () => {
     assert.equal(resolveClaudeNativePort({ BILI_CLAUDE_NATIVE_PORT: "49999" }), 49999);
     assert.equal(resolveClaudeNativePort({ BILI_CLAUDE_NATIVE_PORT: "0" }), CLAUDE_NATIVE_DEFAULT_PORT);
     assert.equal(resolveClaudeNativePort({ BILI_CLAUDE_NATIVE_PORT: "not-a-number" }), CLAUDE_NATIVE_DEFAULT_PORT);
+});
+
+// #1335: the attach-gate escape hatch — env BILI_NATIVE_ATTACH_EXTERNAL wins
+// over the config file's native.attachExternal; the file value must be exactly
+// true (garbage leaves the gate closed); default false.
+test("resolveNativeAttachExternal: env parsing (1/true open, 0/false close, junk falls through)", () => {
+    const prev = process.env.XDG_CONFIG_HOME;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-attachext-"));
+    process.env.XDG_CONFIG_HOME = dir;
+    try {
+        assert.equal(resolveNativeAttachExternal({}), false, "no env, no file → gate closed");
+        assert.equal(resolveNativeAttachExternal({ BILI_NATIVE_ATTACH_EXTERNAL: "" }), false, "blank env falls through to file");
+        assert.equal(resolveNativeAttachExternal({ BILI_NATIVE_ATTACH_EXTERNAL: "1" }), true);
+        assert.equal(resolveNativeAttachExternal({ BILI_NATIVE_ATTACH_EXTERNAL: "true" }), true);
+        assert.equal(resolveNativeAttachExternal({ BILI_NATIVE_ATTACH_EXTERNAL: " TRUE " }), true, "case-insensitive and trimmed");
+        assert.equal(resolveNativeAttachExternal({ BILI_NATIVE_ATTACH_EXTERNAL: "0" }), false);
+        assert.equal(resolveNativeAttachExternal({ BILI_NATIVE_ATTACH_EXTERNAL: "false" }), false);
+        assert.equal(resolveNativeAttachExternal({ BILI_NATIVE_ATTACH_EXTERNAL: "yes" }), false, "junk env is not a truthy answer");
+    } finally {
+        if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
+        else process.env.XDG_CONFIG_HOME = prev;
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("resolveNativeAttachExternal: file native.attachExternal requires exact true; env still wins", () => {
+    const prev = process.env.XDG_CONFIG_HOME;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-attachext-"));
+    const cfgDir = path.join(dir, "billion-context");
+    fs.mkdirSync(cfgDir, { recursive: true });
+    const cfgFile = path.join(cfgDir, "billion-context.json");
+    process.env.XDG_CONFIG_HOME = dir;
+    try {
+        fs.writeFileSync(cfgFile, JSON.stringify({ native: { attachExternal: true } }));
+        assert.equal(resolveNativeAttachExternal({}), true, "file opens the gate");
+        assert.equal(resolveNativeAttachExternal({ BILI_NATIVE_ATTACH_EXTERNAL: "0" }), false, "env 0 overrides a permissive file");
+
+        fs.writeFileSync(cfgFile, JSON.stringify({ native: { attachExternal: "true" } }));
+        assert.equal(resolveNativeAttachExternal({}), false, "string 'true' in the file is not a boolean true");
+
+        fs.writeFileSync(cfgFile, "{ not json");
+        assert.equal(resolveNativeAttachExternal({}), false, "malformed file degrades to gate-closed, never throws");
+
+        fs.rmSync(cfgFile);
+        assert.equal(resolveNativeAttachExternal({}), false, "absent file → default false");
+    } finally {
+        if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
+        else process.env.XDG_CONFIG_HOME = prev;
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
 });
 
 // — hook planner ————————————————————————————————————————————

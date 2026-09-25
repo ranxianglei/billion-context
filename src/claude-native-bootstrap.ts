@@ -276,7 +276,7 @@ async function run(): Promise<void> {
     } catch (err) {
         log(
             `proxy bring-up failed on port ${plan.port} — ${err instanceof Error ? err.message : String(err)}` +
-                (plan.action === "start" ? ` — claude will fail its model calls until this is fixed (free the port or set BILI_CLAUDE_NATIVE_PORT, then reinstall: bili plugin install claude)` : ""),
+                (plan.action === "start" ? ` — this port is NOT served by a session-managed proxy: model calls ride whatever answers there (an unmanaged or stale bili daemon has no lifecycle guarantees) or fail outright. Fix: kill the listener on this port or set BILI_CLAUDE_NATIVE_PORT, then reinstall (bili plugin install claude)` : ""),
         );
     }
 }

@@ -1053,7 +1053,7 @@ test("ensureProxyRunning: attaches to a compatible healthy instance instead of d
         {
             spawnImpl,
             fetchImpl: async () => ({ ok: true }),
-            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1" }),
+            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1", watchdog: { armed: true } }),
             readInstanceFile: () => recordedInstance(),
             registerWatcher: async (origin, pid) => { registrations.push([origin, pid]); return "ok"; },
             scriptPath: FP_SCRIPT,
@@ -1078,7 +1078,7 @@ test("ensureProxyRunning: attach registers opts.parentPid when given, never on s
         { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, parentPid: 42424 },
         {
             fetchImpl: async () => ({ ok: true }),
-            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1" }),
+            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1", watchdog: { armed: true } }),
             readInstanceFile: () => recordedInstance(),
             registerWatcher,
             scriptPath: FP_SCRIPT,
@@ -1105,7 +1105,9 @@ test("ensureProxyRunning: attach registers opts.parentPid when given, never on s
     assert.deepEqual(registrations, [], "spawn must not register (BILI_PARENT_PID already arms the watchdog)");
 });
 
-test("ensureProxyRunning: refused watcher registration flags the handle for host-native surfacing (#1322)", async () => {
+// #1335: an unarmed listener is never attached by default, so the post-attach
+// 409 path (#1322) is now reached through the escape hatch — pin it there.
+test("ensureProxyRunning: refused watcher registration flags the handle for host-native surfacing (#1322/#1335)", async () => {
     const refused = await ensureProxyRunning(
         { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, parentPid: 42424 },
         {
@@ -1113,10 +1115,11 @@ test("ensureProxyRunning: refused watcher registration flags the handle for host
             fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1" }),
             readInstanceFile: () => recordedInstance(),
             registerWatcher: async () => "refused",
+            resolveAttachExternal: () => true,
             scriptPath: FP_SCRIPT,
         },
     );
-    assert.equal(refused.attached, true, "attach still succeeds on a daemon proxy");
+    assert.equal(refused.attached, true, "opt-in attach still succeeds on a daemon proxy");
     assert.equal(refused.refusedWatcher, true, "refusal is flagged so claude-native can warn the operator");
 
     const ok = await ensureProxyRunning(
@@ -1126,6 +1129,7 @@ test("ensureProxyRunning: refused watcher registration flags the handle for host
             fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1" }),
             readInstanceFile: () => recordedInstance(),
             registerWatcher: async () => "ok",
+            resolveAttachExternal: () => true,
             scriptPath: FP_SCRIPT,
         },
     );
@@ -1146,7 +1150,7 @@ test("ensureProxyRunning: same lane attaches, different declared lanes spawn sep
         {
             spawnImpl,
             fetchImpl: async () => ({ ok: true }),
-            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1" }),
+            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1", watchdog: { armed: true } }),
             readInstanceFile: () => recordedInstance({ lane: "pi" }),
             scriptPath: FP_SCRIPT,
         },
@@ -1171,18 +1175,121 @@ test("ensureProxyRunning: same lane attaches, different declared lanes spawn sep
     assert.equal(lastSpawnEnv?.BILI_LAUNCHER_LANE, "codex");
 });
 
-test("ensureProxyRunning: manual daemon (no lane) stays shareable with any client lane (#1225)", async () => {
+test("ensureProxyRunning: armed daemon (no lane) stays shareable with any client lane (#1225)", async () => {
     const handle = await ensureProxyRunning(
         { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "pi" },
         {
             spawnImpl: () => makeFakeChild(42463),
             fetchImpl: async () => ({ ok: true }),
-            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1" }),
+            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1", watchdog: { armed: true } }),
             readInstanceFile: () => recordedInstance(),
             scriptPath: FP_SCRIPT,
         },
     );
     assert.equal(handle.attached, true);
+});
+
+// #1335: the attach gate — an unarmed listener (a manually started `bili start`
+// daemon: no BILI_PARENT_PID, refuses watchers, never dies with its users) is
+// never attached by default; the hook spawns its own session-owned proxy so
+// every session runs the currently installed bili and the proxy dies with the
+// last session (#1186 semantics).
+test("ensureProxyRunning: unarmed listener is not attached by default — self-managed spawn (#1335)", async () => {
+    let spawnCalls = 0;
+    let registered = 0;
+    let childToken = "";
+    let spawned = false;
+    const handle = await ensureProxyRunning(
+        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "claude-native" },
+        {
+            spawnImpl: (_cmd, _args, options) => {
+                spawned = true;
+                childToken = options.env?.BILI_LAUNCH_TOKEN ?? "";
+                spawnCalls++;
+                return makeFakeChild(42501);
+            },
+            fetchImpl: async () => ({ ok: true }),
+            fetchHealthInfo: async () => ({ ok: true, instanceId: "daemon-1", watchdog: { armed: false } }),
+            readInstanceFile: () => (spawned ? recordedInstance({ launchToken: childToken }) : recordedInstance({ instanceId: "daemon-1" })),
+            registerWatcher: async () => {
+                registered++;
+                return "refused";
+            },
+            sleep: () => new Promise((r) => setTimeout(r, 0)),
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.equal(spawnCalls, 1, "self-managed proxy spawned instead of attaching to the unarmed daemon");
+    assert.ok(handle.child);
+    assert.equal(handle.attached, undefined);
+    assert.equal(registered, 0, "no watcher registration is attempted against the refused daemon");
+});
+
+test("ensureProxyRunning: unverifiable listener (no watchdog field, pre-#1330 build) is treated as unarmed (#1335)", async () => {
+    let spawnCalls = 0;
+    let childToken = "";
+    let spawned = false;
+    const handle = await ensureProxyRunning(
+        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
+        {
+            spawnImpl: (_cmd, _args, options) => {
+                spawned = true;
+                childToken = options.env?.BILI_LAUNCH_TOKEN ?? "";
+                spawnCalls++;
+                return makeFakeChild(42502);
+            },
+            fetchImpl: async () => ({ ok: true }),
+            fetchHealthInfo: async () => ({ ok: true, instanceId: "stale-daemon" }),
+            readInstanceFile: () => (spawned ? recordedInstance({ launchToken: childToken }) : recordedInstance({ instanceId: "stale-daemon" })),
+            sleep: () => new Promise((r) => setTimeout(r, 0)),
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.equal(spawnCalls, 1, "missing watchdog field = unverifiable lifecycle = refused by default");
+    assert.ok(handle.child);
+});
+
+test("ensureProxyRunning: attachExternal escape hatch restores attaching to an unarmed listener (#1335)", async () => {
+    let spawnCalls = 0;
+    const handle = await ensureProxyRunning(
+        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "pi" },
+        {
+            spawnImpl: () => {
+                spawnCalls++;
+                return makeFakeChild(42503);
+            },
+            fetchImpl: async () => ({ ok: true }),
+            fetchHealthInfo: async () => ({ ok: true, instanceId: "daemon-1", watchdog: { armed: false } }),
+            readInstanceFile: () => recordedInstance({ instanceId: "daemon-1" }),
+            registerWatcher: async () => "ok",
+            resolveAttachExternal: () => true,
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.equal(spawnCalls, 0);
+    assert.equal(handle.attached, true, "deliberate setups keep the old behavior via the opt-in");
+});
+
+test("ensureProxyRunning: strictPort launch fails fast when its pinned port is held by an unarmed proxy (#1335/#964)", async () => {
+    let spawnCalls = 0;
+    await assert.rejects(
+        ensureProxyRunning(
+            { host: "127.0.0.1", port: 8799, passthrough: false, debug: false, lane: "claude-native", strictPort: true },
+            {
+                spawnImpl: () => {
+                    spawnCalls++;
+                    return makeFakeChild(42504);
+                },
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async () => ({ ok: true, instanceId: "daemon-1", watchdog: { armed: false } }),
+                readInstanceFile: () => recordedInstance({ origin: "http://127.0.0.1:8799", port: 8799, instanceId: "daemon-1" }),
+                sleep: () => Promise.resolve(),
+                scriptPath: FP_SCRIPT,
+            },
+        ),
+        /lifecycle-less bili proxy/,
+    );
+    assert.equal(spawnCalls, 0, "fail fast instead of burning the wait window into a confusing EADDRINUSE");
 });
 
 test("ensureProxyRunning: stale code (fingerprint mismatch) is not attached — rebuild takes effect (#1225)", async () => {
@@ -1262,7 +1369,7 @@ test("ensureProxyRunning: reattaches to own-lane instance when the instance file
                     return makeFakeChild(42470);
                 },
                 fetchImpl: async () => ({ ok: true }),
-                fetchHealthInfo: async (origin) => ({ ok: true, instanceId: origin.endsWith("8801") ? "inst-A" : "inst-B" }),
+                fetchHealthInfo: async (origin) => ({ ok: true, instanceId: origin.endsWith("8801") ? "inst-A" : "inst-B", watchdog: { armed: true } }),
                 readInstanceFile: () => B,
                 scriptPath: FP_SCRIPT,
             },
@@ -1293,7 +1400,7 @@ test("ensureProxyRunning: same-lane instance wins over a newer wildcard daemon f
                     return makeFakeChild(42471);
                 },
                 fetchImpl: async () => ({ ok: true }),
-                fetchHealthInfo: async (origin) => ({ ok: true, instanceId: origin.endsWith("8803") ? "inst-W" : "inst-A2" }),
+                fetchHealthInfo: async (origin) => ({ ok: true, instanceId: origin.endsWith("8803") ? "inst-W" : "inst-A2", watchdog: { armed: true } }),
                 readInstanceFile: () => W,
                 scriptPath: FP_SCRIPT,
             },
@@ -1322,7 +1429,7 @@ test("ensureProxyRunning: stale instance file still finds a live wildcard daemon
                     return makeFakeChild(42472);
                 },
                 fetchImpl: async () => ({ ok: true }),
-                fetchHealthInfo: async (origin) => (origin.endsWith("8805") ? { ok: true, instanceId: "inst-W3" } : undefined),
+                fetchHealthInfo: async (origin) => (origin.endsWith("8805") ? { ok: true, instanceId: "inst-W3", watchdog: { armed: true } } : undefined),
                 readInstanceFile: () => recordedInstance({ instanceId: "inst-dead", origin: "http://127.0.0.1:8806", port: 8806, pid: 4_000_000 }),
                 scriptPath: FP_SCRIPT,
             },
@@ -1463,7 +1570,7 @@ test("ensureProxyRunning: active starting marker → waits, then attaches instea
                     throw new Error("double-spawn: another launch was still bringing its proxy up");
                 },
                 fetchImpl: async () => ({ ok: true }),
-                fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-9" }),
+                fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-9", watchdog: { armed: true } }),
                 readInstanceFile: () => (reads++ < 2 ? undefined : recordedInstance({ instanceId: "inst-9", origin: "http://127.0.0.1:8788", port: 8788 })),
                 sleep: () => Promise.resolve(),
                 registerWatcher: async () => "ok" as const,
@@ -1686,7 +1793,7 @@ test("ensureProxyRunning: instance appearing at the wait deadline is attached, n
                     throw new Error("double-spawn: instance appeared at the deadline");
                 },
                 fetchImpl: async () => ({ ok: true }),
-                fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-b" }),
+                fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-b", watchdog: { armed: true } }),
                 readInstanceFile: () =>
                     reads++ < 3 ? undefined : recordedInstance({ instanceId: "inst-b", origin: "http://127.0.0.1:8792", port: 8792 }),
                 now: () => ticks * 1000,

@@ -58,7 +58,7 @@ function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
 import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, loadClientConfig, collectModelWindows, collectModelMaxOutputs, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, QWEN_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer, readMcodeConfig, resolveMcodeInstallDir, MCODE_DEFAULT_MODEL_HOSTS, type McodeConfig, discoverAiderArgUrls, AIDER_DEFAULT_MODEL_HOSTS, COPILOT_DEFAULT_MODEL_HOSTS, AMP_DEFAULT_MODEL_HOSTS, resolveGooseDirs, readGooseConfig, type GooseConfig, type GooseDirs } from "./client-config.js";
-import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, type ProviderRoutes } from "./config.js";
+import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, resolveNativeAttachExternal, type ProviderRoutes } from "./config.js";
 import { contextFromRegistry } from "./registry.js";
 
 export {
@@ -217,7 +217,10 @@ export interface ProxyHandle {
 
 export interface LauncherDeps {
     fetchImpl?: (url: string) => Promise<{ ok: boolean }>;
-    fetchHealthInfo?: (origin: string) => Promise<{ ok: boolean; instanceId?: string } | undefined>;
+    fetchHealthInfo?: (origin: string) => Promise<HealthInfo | undefined>;
+    /** #1335: resolves the attach-gate escape hatch. Default reads env
+     *  BILI_NATIVE_ATTACH_EXTERNAL > config `native.attachExternal` > false. */
+    resolveAttachExternal?: () => boolean;
     readInstanceFile?: () => ProxyInstanceFile | { origin: string } | undefined;
     spawnImpl?: SpawnFn;
     now?: () => number;
@@ -2398,17 +2401,24 @@ async function probeHealth(
     }
 }
 
-interface HealthInfo {
+export interface HealthInfo {
     ok: boolean;
     instanceId?: string;
+    /** #1330: watchdog state from /__bili/health. Absent on pre-#1330 builds —
+     *  unverifiable lifecycle, which the #1335 attach gate treats as unarmed. */
+    watchdog?: { armed: boolean };
 }
 
 async function fetchHealthInfoDefault(origin: string): Promise<HealthInfo | undefined> {
     try {
         const res = await fetch(healthUrl(origin), { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
         if (!res.ok) return undefined;
-        const data = (await res.json()) as { ok?: boolean; instanceId?: string };
-        return { ok: Boolean(data.ok), instanceId: typeof data.instanceId === "string" ? data.instanceId : undefined };
+        const data = (await res.json()) as { ok?: boolean; instanceId?: string; watchdog?: unknown };
+        const info: HealthInfo = { ok: Boolean(data.ok), instanceId: typeof data.instanceId === "string" ? data.instanceId : undefined };
+        if (data.watchdog && typeof data.watchdog === "object" && typeof (data.watchdog as { armed?: unknown }).armed === "boolean") {
+            info.watchdog = { armed: (data.watchdog as { armed: boolean }).armed };
+        }
+        return info;
     } catch {
         return undefined;
     }
@@ -2482,21 +2492,39 @@ function instanceCompatible(inst: ProxyInstanceFile, opts: LaunchOptions, codeFi
 async function probeLiveInstances(
     readInstance: () => ProxyInstanceFile | { origin: string } | undefined,
     fetchHealthInfo: (origin: string) => Promise<HealthInfo | undefined>,
-): Promise<ProxyInstanceFile[]> {
+): Promise<Array<{ inst: ProxyInstanceFile; health: HealthInfo }>> {
     const seen = new Map<string, ProxyInstanceFile>();
     const inst = readInstance();
     if (isProxyInstanceFile(inst)) seen.set(inst.instanceId || inst.origin, inst);
     for (const live of discoverLiveInstances()) seen.set(live.instanceId || live.origin, live);
     const checked = await Promise.all(
-        [...seen.values()].map(async (c): Promise<ProxyInstanceFile | undefined> => {
+        [...seen.values()].map(async (c): Promise<{ inst: ProxyInstanceFile; health: HealthInfo } | undefined> => {
             if (!isPidAlive(c.pid)) return undefined;
             const health = await fetchHealthInfo(c.origin);
             if (!health || !health.ok) return undefined;
             if (health.instanceId !== undefined && health.instanceId !== c.instanceId) return undefined;
-            return c;
+            return { inst: c, health };
         }),
     );
-    return checked.filter((c): c is ProxyInstanceFile => c !== undefined);
+    return checked.filter((c): c is { inst: ProxyInstanceFile; health: HealthInfo } => c !== undefined);
+}
+
+/** #1335: the attach gate — a listener may be attached to only when its
+ *  health reports an ARMED session-lifecycle watchdog, or the user explicitly
+ *  opted in via native.attachExternal / BILI_NATIVE_ATTACH_EXTERNAL. A missing
+ *  watchdog field (pre-#1330 build) is unverifiable and refused by default:
+ *  those are exactly the stale manually-started daemons behind #1322, and
+ *  riding them pins every session to possibly-old code that outlives it. */
+export function attachGateAllows(health: HealthInfo, attachExternal: boolean): boolean {
+    if (attachExternal) return true;
+    return health.watchdog?.armed === true;
+}
+
+function gateRefusalMessage(inst: ProxyInstanceFile, health: HealthInfo): string {
+    const reason = health.watchdog && health.watchdog.armed === false
+        ? "it reports NO session-lifecycle watchdog (started without BILI_PARENT_PID, e.g. manual `bili start`)"
+        : "it does not report watchdog state (older bili build) — its lifecycle is unverifiable";
+    return `bili: refusing to attach to ${inst.origin} (pid ${inst.pid}) — ${reason}. It would outlive this session and ignore config edits until killed (#1322/#1335). Starting a session-owned proxy instead; set native.attachExternal=true or BILI_NATIVE_ATTACH_EXTERNAL=1 to attach anyway.`;
 }
 
 /** #1232: choose the attach target among healthy candidates. Must be
@@ -2505,21 +2533,32 @@ async function probeLiveInstances(
  *  concurrent same-lane launches must converge on the lane's own instance,
  *  not a general-purpose daemon either could use — newest within class. */
 function pickAttachable(
-    candidates: ProxyInstanceFile[],
+    candidates: Array<{ inst: ProxyInstanceFile; health: HealthInfo }>,
     opts: LaunchOptions,
-    codeFingerprint?: string,
+    codeFingerprint: string | undefined,
+    attachExternal: boolean,
+    refusedLog: Set<string>,
 ): ProxyInstanceFile | undefined {
     let best: ProxyInstanceFile | undefined;
     let bestClass = 2;
     let bestStartedAt = Number.NEGATIVE_INFINITY;
     for (const c of candidates) {
-        if (!instanceCompatible(c, opts, codeFingerprint)) continue;
-        if (opts.strictPort && c.port !== opts.port) continue;
-        const cls = opts.lane !== undefined && c.lane === opts.lane ? 0 : 1;
-        if (cls < bestClass || (cls === bestClass && c.startedAt > bestStartedAt)) {
-            best = c;
+        if (!instanceCompatible(c.inst, opts, codeFingerprint)) continue;
+        if (opts.strictPort && c.inst.port !== opts.port) continue;
+        // #1335: lifecycle gate — an unarmed (or unverifiable) listener is
+        // never an attach target by default; log the refusal once per origin.
+        if (!attachGateAllows(c.health, attachExternal)) {
+            if (!refusedLog.has(c.inst.origin)) {
+                refusedLog.add(c.inst.origin);
+                console.error(gateRefusalMessage(c.inst, c.health));
+            }
+            continue;
+        }
+        const cls = opts.lane !== undefined && c.inst.lane === opts.lane ? 0 : 1;
+        if (cls < bestClass || (cls === bestClass && c.inst.startedAt > bestStartedAt)) {
+            best = c.inst;
             bestClass = cls;
-            bestStartedAt = c.startedAt;
+            bestStartedAt = c.inst.startedAt;
         }
     }
     return best;
@@ -2537,11 +2576,13 @@ async function waitForStarterInstance(
     now: () => number,
     sleepImpl: (ms: number) => Promise<void>,
     opts: LaunchOptions,
-    codeFingerprint?: string,
+    codeFingerprint: string | undefined,
+    attachExternal: boolean,
+    refusedLog: Set<string>,
 ): Promise<ProxyInstanceFile | undefined> {
     const deadline = now() + SPAWN_WAIT_MS;
     const probe = async (): Promise<ProxyInstanceFile | undefined> =>
-        pickAttachable(await probeLiveInstances(readInstance, fetchHealthInfo), opts, codeFingerprint);
+        pickAttachable(await probeLiveInstances(readInstance, fetchHealthInfo), opts, codeFingerprint, attachExternal, refusedLog);
     let inst: ProxyInstanceFile | undefined;
     while (now() < deadline) {
         await sleepImpl(HEALTH_POLL_INTERVAL_MS);
@@ -2682,6 +2723,14 @@ export async function ensureProxyRunning(
     const now = deps.now ?? Date.now;
     const sleepImpl = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
     const registerWatcher = deps.registerWatcher ?? registerWatcherDefault;
+    // #1335: attach-gate escape hatch, resolved once per bring-up (env > file >
+    // false). One knob for every lane — explicit user-directed attaches (kimi/dsh
+    // BILLION_CONTEXT_ATTACH / preset BILLION_CONTEXT_PROXY) never pass through
+    // this discovery path at all, so they are exempt by construction.
+    const attachExternal = (deps.resolveAttachExternal ?? resolveNativeAttachExternal)();
+    // Refusal log dedup: pickAttachable runs again on every starter-poll tick,
+    // so each refused origin is announced exactly once per bring-up.
+    const refusedLog = new Set<string>();
     // Same expression as the spawn path's BILI_PARENT_PID: one owner-pid
     // semantic for spawned AND attached proxies (#1190).
     const watchPid = opts.parentPid ?? process.pid;
@@ -2711,12 +2760,27 @@ export async function ensureProxyRunning(
     // candidates come from every live registry entry, not only the last
     // writer of the single proxy-origin file (that pointer can belong to
     // another client's per-lane proxy).
-    const existing = pickAttachable(await probeLiveInstances(readInstance, fetchHealthInfo), opts, codeFingerprint);
+    const probed = await probeLiveInstances(readInstance, fetchHealthInfo);
+    const existing = pickAttachable(probed, opts, codeFingerprint, attachExternal, refusedLog);
     if (existing) {
         // strictPort (#964) is enforced inside pickAttachable: the client
         // dials a STATIC url — attaching to a healthy proxy on a DIFFERENT
         // port would strand every request.
         return attachTo(existing);
+    }
+    if (!attachExternal && opts.strictPort) {
+        // #1335: the only compatible listener is an unarmed one squatting OUR
+        // pinned port — self-managed fallback is impossible here (we cannot
+        // bind that port either). Fail fast with an actionable error instead
+        // of burning SPAWN_WAIT_MS into a confusing EADDRINUSE.
+        const squatter = probed.find((c) => c.inst.port === opts.port && instanceCompatible(c.inst, opts, codeFingerprint));
+        if (squatter) {
+            throw new Error(
+                `bili: port ${opts.port} is held by a lifecycle-less bili proxy at ${squatter.inst.origin} (pid ${squatter.inst.pid}) — ` +
+                    `the #1335 attach gate refuses it by default and this launch pins the port, so no session-owned proxy can bind it either. ` +
+                    `Kill that process (kill ${squatter.inst.pid}) or set native.attachExternal=true / BILI_NATIVE_ATTACH_EXTERNAL=1 to attach to it anyway.`,
+            );
+        }
     }
 
     // #707: cross-process startup window — another launcher may be mid-bring-up
@@ -2726,7 +2790,7 @@ export async function ensureProxyRunning(
     // (singleFlight, #706); this is the cross-process half.
     const waitForOtherStarter = async (): Promise<ProxyHandle | undefined> => {
         console.error("bili: another bili launch is bringing up a proxy — waiting for it instead of spawning a second");
-        const waited = await waitForStarterInstance(readInstance, fetchHealthInfo, now, sleepImpl, opts, codeFingerprint);
+        const waited = await waitForStarterInstance(readInstance, fetchHealthInfo, now, sleepImpl, opts, codeFingerprint, attachExternal, refusedLog);
         if (waited) {
             return attachTo(waited);
         }

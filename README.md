@@ -268,7 +268,8 @@ is the one command that drives every lane through its own owner and prints
 the per-lane update path (`bili plugin list` shows the same per-lane channel).
 
 At load the plugin **spawns its own proxy** (attaches to a healthy running
-one if present; a parent-pid watchdog tears it down when the client exits),
+one only when it passes the attach gate below; a parent-pid watchdog tears
+it down when the client exits),
 rewrites model traffic to `<proxy>/bili/<upstream-url>`, registers
 `compress` / `decompress` / `acp_status` as native client tools (plugin
 mode), and reports the client's **own model config** to the proxy so
@@ -278,25 +279,58 @@ Opt-out envs: `BILI_NATIVE_PI=0`, `BILI_NATIVE_OMP=0`,
 `BILI_NATIVE_HERMES=0`, `BILI_NATIVE_ZCODE=0`. Full
 mechanics: [TECHNICAL-NOTES.md](TECHNICAL-NOTES.md).
 
-Reuse is identity-based (#1225): an existing proxy is attached only when it
-runs the **same code** (sha256 of the entry script, recorded in the
-instance file) and its **lane is compatible** — each launcher declares its
-client's lane, two *different declared* lanes never share, and an instance
-without a lane (manual `bili start`) stays shareable by every client.
+Reuse is identity-based (#1225) **and lifecycle-gated (#1335)**: an existing
+proxy is attached only when it runs the **same code** (sha256 of the entry
+script, recorded in the instance file), its **lane is compatible** — each
+launcher declares its client's lane, two *different declared* lanes never
+share — **and it owns a session lifecycle**: its health endpoint reports an
+armed parent-pid watchdog (`watchdog.armed == true`), i.e. it was spawned by
+a launcher with a parent pid and dies when the last attached session dies.
+An instance without a declared lane is wildcard-compatible on the lane axis,
+but that alone no longer makes it attachable (see the gate below).
 Instances written before #1225 carry no code fingerprint and are therefore
 never attached: a rebuilt or updated install always starts a fresh proxy on
 the next launch, so fixes take effect immediately instead of silently
 serving stale code.
 
+**The attach gate (#1335).** A native hook attaches to whatever answers on
+the port, so the three listener kinds get different treatment:
+
+| Listener | Lifecycle owner | Attach? |
+|---|---|---|
+| Its own session-spawned proxy | armed from birth | ✅ yes |
+| Another session's armed proxy (shared, watcher set #1186) | watcher set | ✅ yes — sharing stays the design |
+| Manually started `bili start` daemon | **none** — refuses watchers, never dies with sessions, often an older build | ❌ not by default |
+
+The hook probes the candidate's `/__bili/health` for `watchdog.armed` before
+attaching. Armed → attach + register a watcher (current behavior, README
+lifecycle contract holds). Unarmed — or a pre-#1330 build that reports no
+`watchdog` field at all (unverifiable, treated as unarmed) → **do not
+attach**; the hook spawns its own session-owned proxy (ephemeral port, armed
+from birth, dies with the last session). This also fixes version skew: every
+session now runs the **currently installed** bili instead of whatever a
+stale resident daemon happens to carry. The trade-off is one extra short-lived
+proxy process per session when no armed proxy exists (session state is shared
+on disk, so compression continuity is unaffected); the multi-instance warning
+(#394) becomes correspondingly more common. **Escape hatch:** deliberately
+run a resident daemon for your hooks to ride on → set
+`native.attachExternal: true` in the config file or
+`BILI_NATIVE_ATTACH_EXTERNAL=1`. That restores attaching to any compatible
+listener regardless of watchdog state — you then own the daemon's lifetime
+and version yourself. Explicit user-directed attaches (`BILLION_CONTEXT_ATTACH`
+/ preset `BILLION_CONTEXT_PROXY` for kimi/dsh) bypass discovery entirely and
+are exempt by construction.
+
 Attach discovery is lane-aware across **all** live instances (#1232): the
 launcher probes every live entry in the instance registry, not just the
 single instance file (last-writer-wins — under concurrent multi-client use
-it can point at another client's proxy). Among compatible candidates the
-newest instance with the launcher's own declared lane wins; an instance
-without a lane (manual `bili start`) remains shareable by every client.
-The `another bili instance is running` warning (#394) is lane-aware too: it
-fires for same-lane or lane-less coexistence, but stays silent between two
-*different* declared lanes, whose session files are disjoint.
+it can point at another client's proxy), and applies the gate above to every
+candidate. Among compatible candidates the newest instance with the launcher's
+own declared lane wins; an instance without a lane is wildcard-compatible on
+the lane axis (still subject to the gate). The `another bili instance is
+running` warning (#394) is lane-aware too: it fires for same-lane or lane-less
+coexistence, but stays silent between two *different* declared lanes, whose
+session files are disjoint.
 
 **Runtime-info protocol (#955).** A native plugin reads the model config
 the client itself will use and pushes it to the proxy (per-request headers

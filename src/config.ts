@@ -813,6 +813,13 @@ type FileConfig = {
      *  brings a proxy up on. Default CLAUDE_NATIVE_DEFAULT_PORT; env
      *  BILI_CLAUDE_NATIVE_PORT wins over both. */
     claude?: { nativePort?: number };
+    /** Native-hook attach policy (#1335): set `true` to let native hooks
+     *  attach to lifecycle-less listeners (a manually started `bili start`
+     *  daemon — no session-lifecycle watchdog, outlives every session, often
+     *  an older code version). Default false: hooks self-manage and spawn
+     *  their own armed session proxy instead (#1322). Env
+     *  BILI_NATIVE_ATTACH_EXTERNAL=1/0 wins over the file. */
+    native?: { attachExternal?: boolean };
 };
 
 function nonEmpty(value: string | undefined): string | undefined {
@@ -862,6 +869,18 @@ export function resolveClaudeNativePort(env: NodeJS.ProcessEnv = process.env): n
     const fromFile = loadConfigFile().claude?.nativePort;
     if (typeof fromFile === "number" && Number.isInteger(fromFile) && fromFile > 0 && fromFile < 65536) return fromFile;
     return CLAUDE_NATIVE_DEFAULT_PORT;
+}
+
+/** #1335: the native-hook attach-gate escape hatch. True when the user
+ *  deliberately runs lifecycle-less resident daemons for native hooks to ride:
+ *  env BILI_NATIVE_ATTACH_EXTERNAL (1/true vs 0/false) wins over the file's
+ *  `native.attachExternal`, which must be exactly `true` (any other value —
+ *  including garbage — leaves the gate closed). Default false. */
+export function resolveNativeAttachExternal(env: NodeJS.ProcessEnv = process.env): boolean {
+    const fromEnv = (env.BILI_NATIVE_ATTACH_EXTERNAL ?? "").trim().toLowerCase();
+    if (fromEnv === "1" || fromEnv === "true") return true;
+    if (fromEnv === "0" || fromEnv === "false") return false;
+    return loadConfigFile().native?.attachExternal === true;
 }
 
 /** Persist the claude-native port the installer baked into settings.json
