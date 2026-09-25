@@ -676,7 +676,7 @@ function buildRecord(session: Session): PersistedSession {
         metadata: { ...session.metadata },
         state: session.state,
         blockContents: Object.fromEntries(session.blockContents),
-        pendingRetrievals: session.pendingRetrievals.length > 0 ? session.pendingRetrievals : undefined,
+        pendingRetrievals: (session.pendingRetrievals?.length ?? 0) > 0 ? session.pendingRetrievals : undefined,
         createdAt: session.createdAt,
     };
 }
