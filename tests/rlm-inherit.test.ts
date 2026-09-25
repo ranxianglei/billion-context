@@ -6,7 +6,7 @@ import type { AddressInfo } from "node:net";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { tmpdir } from "node:os";
-import { createCore, createInitialState, defaultConfig } from "acp-kernel";
+import { createCore, createInitialState, defaultConfig, refToIndex } from "acp-kernel";
 import { anthropicToCore, type AnthropicRequestBody } from "acp-kernel/wire";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _resetSessionsForTest, getSession, type Session } from "../src/session.ts";
@@ -106,6 +106,49 @@ test("seeds the parent's compression archive into the derived child as dormant b
         assert.deepEqual(structuredClone(parent.state), parentBefore, "parent state byte-identical after seeding");
 
         assert.ok(logs.some((l) => l.startsWith("info:") && l.includes("[rlm-inherit]") && l.includes("inherited 1 block(s)") && l.includes("refs up to m00040") && l.includes("from parent rlm-parent")), `seed log present with true ref ceiling: ${JSON.stringify(logs)}`);
+    } finally {
+        resetWorld();
+    }
+});
+
+test("dormancy survives the child's own processTurn turns — expanded pins it against syncBlocks resurrection (#1333)", () => {
+    resetWorld();
+    try {
+        const parent = getSession("rlm-parent");
+        const parentBlockId = compressInto(parent, "auth token refresh design");
+        const parentMaxRef = Math.max(0, ...Object.values(parent.state.messageRefs.byRaw).map((r) => refToIndex(r) ?? 0));
+
+        const child = getSession("rlm-child");
+        seed(child, "rlm-parent");
+
+        // The RLM child's real requests carry ONLY its own fresh history — none
+        // of the parent's raw ids are present. The kernel's syncBlocks
+        // stillPresent pass would flip a plain inactive block active→inactive on
+        // every turn; `expanded: true` must keep the inherited block stably
+        // dormant instead (otherwise the archive flaps and orphan-gc-adjacent
+        // consumers see churn). Run two turns to prove stability.
+        const core = createCore();
+        const config = defaultConfig(200000);
+        const body: AnthropicRequestBody = { model: "claude-test", messages: [] };
+        for (let i = 0; i < 4; i++) body.messages.push({ role: i % 2 === 0 ? "user" : "assistant", content: `child fresh message ${i}` });
+        const { msgs } = anthropicToCore(body);
+
+        let state = child.state;
+        for (let turn = 1; turn <= 2; turn++) {
+            state = core.processTurn({ messages: msgs, state, config }).state;
+            const b = state.blocks.find((x) => x.blockId === parentBlockId);
+            assert.ok(b, `inherited block still present after turn ${turn}`);
+            assert.equal(b.active, false, `inherited block stays DORMANT after turn ${turn}`);
+            assert.equal(b.expanded, true, "expanded pin intact after syncBlocks");
+        }
+        // Refs continue from the inherited ceiling: the child's own messages must
+        // never re-issue a ref the parent used (the id-never-reused contract).
+        for (const m of msgs) {
+            const ref = state.messageRefs.byRaw[m.id];
+            assert.ok(ref !== undefined, "child message got a ref");
+            const idx = refToIndex(ref)!;
+            assert.ok(idx > parentMaxRef || !parent.state.messageRefs.byRef[ref], `child ref ${ref} does not collide with an inherited parent ref`);
+        }
     } finally {
         resetWorld();
     }
