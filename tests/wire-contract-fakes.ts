@@ -27,12 +27,6 @@ export interface WireRule {
 
 export const WIRE_RULES: readonly WireRule[] = [
     {
-        id: "WC-008",
-        wire: "openai-chat",
-        summary: "Copilot Gemini requires scalar schema types and self-contained typed anyOf alternatives",
-        provenance: "OpenCode V2 + Copilot Gemini synthetic reproduction: compress content type array and required-only object alternatives cause 400 invalid_request_body; explicit typed alternatives succeed",
-    },
-    {
         id: "WC-001",
         wire: "anthropic",
         summary: "tools[].input_schema must not carry top-level oneOf/allOf/anyOf/not",
@@ -83,6 +77,19 @@ export const WIRE_RULES: readonly WireRule[] = [
             "no top-level prompt_cache_key — not part of the Anthropic Messages API; strict-schema upstreams reject unknown fields ('Extra inputs are not permitted'). bili's omp plugin stamps it as the session id (#268), so the proxy strips it on EVERY forward path (processed + verbatim).",
         provenance:
             "bili #1403 production 400 (opencode zen https://opencode.ai/zen/v1/messages: 'prompt_cache_key: Extra inputs are not permitted', 2026-09-26); Anthropic Messages API reference (no such field)",
+    },
+    {
+        id: "WC-008",
+        wire: "openai-chat",
+        summary: "Copilot Gemini requires scalar schema types and self-contained typed anyOf alternatives",
+        // Durable references: issue #1415 (this PR) records the synthetic
+        // repro (opencode V2 -> bili -> Copilot Gemini, 400 invalid_request_body);
+        // Gemini REST docs "Schema" require type to be a single string value.
+        // NOTE: the kernel's current openai-chat compress schema still emits a
+        // type array on the content parameter; this rule documents the stricter
+        // Copilot/Gemini constraint with NO lane enforcing it yet — enforcement
+        // lands with the kernel schema change that resolves #1415's upstream PR.
+        provenance: "bili #1415 synthetic repro (opencode V2 -> Copilot Gemini 400) + Gemini REST Schema docs: type is a single string; acp-kernel openai-chat compress schema currently violates this (no lane enforced)",
     },
 ];
 
