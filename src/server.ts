@@ -10,6 +10,7 @@ import type { CompressSettings, ProxyOptions } from "./config.js";
 import { loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
 import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol } from "./config.js";
+import { resolveStickyPackAssignment } from "./pack-canary.js";
 import { contextFromRegistry, loadRegistry, peekRegistryContext, peekRegistryOutputLimit } from "./registry.js";
 import { codexAlignedWindow } from "./codex-models.js";
 import { fetchWithTimeout, MAX_REQUEST_BYTES, upstreamTimeoutMs } from "./fetch-util.js";
@@ -1322,6 +1323,12 @@ async function handle(
     let reqPrompts: Prompts = defaultPrompts;
     let reqSurface: PackSurface = {};
     let reqSurfacePack = "default";
+    // #1408: the three-level merge left compress.promptPack unset at every
+    // level — the ONLY case where the sticky lean canary may assign a pack —
+    // plus the merged cfg itself, needed to re-resolve the surface after the
+    // post-session-binding assignment below.
+    let promptPackUnset = false;
+    let mergedCompressCfg: CompressSettings | undefined;
     let wsSourceForLog: string | undefined;
     // [#1097] host-only CCR policy for this request scope (three-level
     // merge); resolved before the session is bound, then stamped onto it below so
@@ -1435,6 +1442,8 @@ async function handle(
             // level leaves resolvedCcrCfg undefined and the session never
             // arms. Turn it on only by setting compress.ccr.enabled=true at
             // some config level, after local verification.
+            mergedCompressCfg = compressCfg;
+            promptPackUnset = compressCfg.promptPack === undefined;
             resolvedCcrCfg = compressCfg.ccr;
         resolvedImageCompressionCfg = compressCfg.imageCompression;
             reqPrompts = resolveCompressPrompts(compressCfg);
@@ -1733,6 +1742,19 @@ async function handle(
             ? bodyIdentity.value
             : clientConversationHeader(req.headers);
         const session = getSession(sessionId, { protocol, upstreamOrigin, label: clientLabel ?? (anonAffinity ? "prefix-affinity" : undefined) });
+        // #1408: sticky prompt-pack canary — engages ONLY when compress.promptPack
+        // is unset at every level (any explicit setting, including an explicit
+        // "default", always wins and is never canaried). First such request
+        // assigns the session a builtin pack by deterministic id-hash and stamps
+        // it; later requests just read the stamp, so no re-roll ever happens.
+        if (promptPackUnset && mergedCompressCfg !== undefined) {
+            const assigned = resolveStickyPackAssignment(session, log);
+            if (assigned === "lean") {
+                const canaryRes = resolveCompressSurfaceDetailed({ ...mergedCompressCfg, promptPack: "lean" });
+                reqSurface = canaryRes.surface;
+                reqSurfacePack = canaryRes.packName;
+            }
+        }
         // Audit stamp (#730 forensics): the effective pack for the most recent
         // request (route/model can change it — latest wins). Persisted with the
         // session so post-hoc forensics never needs config-mtime archaeology.

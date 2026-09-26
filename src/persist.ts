@@ -90,6 +90,8 @@ interface PersistedSession {
         upstreamOrigin?: string;
         label?: string;
         title?: string;
+        activePack?: string;
+        packCanary?: "lean" | "default";
     };
     /** Cumulative usage stats (v2+). Absent on v1 files; read via the flat
      *  fallbacks below. */
@@ -707,6 +709,8 @@ function buildSession(parsed: PersistedSession): Session {
             upstreamOrigin: meta.upstreamOrigin ?? parsed.upstreamOrigin,
             label: meta.label ?? parsed.label,
             title: meta.title,
+            activePack: typeof meta.activePack === "string" ? meta.activePack : undefined,
+            packCanary: meta.packCanary === "lean" || meta.packCanary === "default" ? meta.packCanary : undefined,
         },
         stats: {
             requests: stats.requests ?? parsed.requests ?? 0,
