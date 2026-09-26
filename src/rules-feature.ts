@@ -12,8 +12,12 @@ import type { Session } from "./session.js";
 
 const EFFECTIVE_RULES_KEY = "effectiveRules";
 
+// #1399: default-ON since the owner decision "the model has full rights over
+// session rules" — an absent block means enabled, only an explicit
+// `enabled: false` (user `compress.rules: false`) disables the feature. The
+// pre-#1399 semantics were opt-in (`=== true`).
 export function rulesEnabled(config: Config): boolean {
-    return config.rules?.enabled === true;
+    return config.rules?.enabled ?? true;
 }
 
 // Two config sources exist (same split as absorb): wire paths carry the
@@ -31,6 +35,13 @@ export function effectiveRulesConfig(session: Session | undefined, fallback: Con
 
 export function storeEffectiveRules(session: Session, config: Config): void {
     session.metadata[EFFECTIVE_RULES_KEY] = config.rules ?? null;
+}
+
+// Session-level enablement for paths without a per-request resolved Config
+// (plugin tool API): last resolved block wins, base config otherwise — same
+// #1399 default-on semantics as rulesEnabled.
+export function effectiveRulesEnabled(session: Session | undefined, fallback: Config): boolean {
+    return effectiveRulesConfig(session, fallback)?.enabled ?? true;
 }
 
 export type RuleExecCtx = {
