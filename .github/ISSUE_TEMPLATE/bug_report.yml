@@ -1,0 +1,92 @@
+name: Bug report
+description: Report a billion-context (bili) problem — please fill the environment fields, they directly determine triage speed
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! Fields marked **\\*** are triage essentials
+        (version / mode / client / OS / upstream) — without them we can only
+        guess back and forth. Please scrub API keys and secrets from logs.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description *
+      description: What happened, what you expected, and how to trigger it (ordered repro steps). For compression-related bugs, state what happened before and after the fold.
+      placeholder: |
+        1. started … with …
+        2. after the conversation reached …
+        3. saw … (paste the exact error text)
+    validations:
+      required: true
+
+  - type: input
+    id: bili-version
+    attributes:
+      label: bili version *
+      description: "Output of `bili --version`. If not on the latest release, please upgrade and confirm it still reproduces first."
+      placeholder: "0.1.148"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Usage mode *
+      options:
+        - Proxy mode (client manually points its base URL at bili)
+        - Launcher (bili pi / bili codex / bili dsh / bili kimi …)
+        - Plugin native (bili plugin install …, runs inside the host process)
+        - MITM mode (bili start --mitm)
+        - Other / not sure
+    validations:
+      required: true
+
+  - type: input
+    id: client
+    attributes:
+      label: Client and version *
+      description: The exact client + version — e.g. pi 0.83.6 / opencode v2.x (state v1 vs v2 explicitly!) / codex 0.147.0 / dsh / kimi / claude code / other
+      placeholder: "pi 0.83.6"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system *
+      description: e.g. macOS 15 / Ubuntu 24.04 / Windows 11 (state whether WSL2)
+      placeholder: "Ubuntu 24.04"
+    validations:
+      required: true
+
+  - type: input
+    id: upstream
+    attributes:
+      label: Upstream and model *
+      description: Provider + model + context window if known — e.g. sglang · qwen3.8-27b · 262k / api.openai.com · gpt-5. Declared-window-vs-real-limit mismatch is a known root-cause family; fill this in honestly.
+      placeholder: "sglang, qwen3.8-27b, 262k"
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Compression-related config (optional)
+      description: Non-default parts of ~/.config/billion-context/ (ccr / absorb / rules / compress thresholds / nudge …) — only what you changed.
+      render: yaml
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log excerpt (strongly recommended)
+      description: Relevant bili log lines from ~/.local/state/billion-context/ around the repro window (scrub secrets first). For compression bugs include fold / Excluded / preflight lines.
+      render: text
+
+  - type: textarea
+    id: acp-state
+    attributes:
+      label: /acp or acp_status output (optional)
+      description: Context-state output at the moment of the problem (usage / cumulative tokens / block list) — decisive for compression issues.
+      render: text
