@@ -163,10 +163,13 @@ npm install -g billion-context@latest   # install from registry
 bili start --port 8787
 ```
 
-`npm install -g .` also works (installs from the local directory) and does NOT
-create a symlink here — npm copies the package into the global `node_modules`
-because `package.json` has proper `bin` + `files` fields. Either approach is
-fine; the registry install is preferred for testing the real published
+`npm install -g . --install-links` also works (installs a real copy of the
+local build — the `--install-links` flag is REQUIRED: npm ≥ 9 defaults
+local-directory global installs to a SYMLINK (`install-links=false`), which
+leaks dev-tree edits into the "installed" tool and silently re-links on
+reinstall; see #1225). Verify with
+`readlink $(npm root -g)/billion-context` — empty output means a real copy.
+The registry install remains preferred for testing the real published
 artifact.
 
 ### E2E Regression (real client through bili)
@@ -382,11 +385,14 @@ published artifact:
 npm install -g billion-context@latest
 ```
 
-`npm install -g .` is also acceptable (it copies the local package into the
-global `node_modules` — it does NOT create a symlink here, because
-`package.json` has proper `bin` + `files` fields). Just be aware the
-installed version reflects whatever is in the project directory at install
-time, not the registry.
+`npm install -g . --install-links` is also acceptable — it copies the local
+package into the global `node_modules`. The `--install-links` flag is
+REQUIRED on npm ≥ 9: without it the install is a SYMLINK to this working
+tree (`install-links=false` default), so dev-tree changes leak into the
+global `bili` and a reinstall silently re-links (#1225). Verify with
+`readlink $(npm root -g)/billion-context` (empty = real copy). Just be aware
+the installed version reflects whatever is in the project directory at
+install time, not the registry.
 
 ## 5. Release Workflow
 
