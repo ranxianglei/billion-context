@@ -166,6 +166,24 @@ test("zero-normalize round-trip: stamped body verifies as valid on every wire", 
     assert.equal(evaluateChain(sR, "responses", { nowMs: T0 + 2000 }).verdict, "valid");
 });
 
+test("zero-normalize round-trip: responses bare-string input normalizes to message array and verifies", () => {
+    const fields = { v: 1, processor: "bili-rt-str", issuedAt: T0 + 1000, requestId: "req-rt-str" };
+    const base = { model: "m", input: "hello" };
+    const digest = computeCheckpointDigest(base, "responses", fields)!;
+    const rendered = renderChainCheckpoint({ ...fields, digest });
+    const stamped = insertCheckpointCarrier(base, "responses", rendered)! as { input: { type?: string; content?: unknown }[] };
+    assert.ok(Array.isArray(stamped.input), "string input must be normalized to the array form");
+    assert.equal(stamped.input.length, 2);
+    assert.equal(stamped.input[0]!.type, "message");
+    assert.equal(stamped.input[0]!.content, "hello", "original text survives as its own message");
+    assert.equal(stamped.input[1]!.content, rendered, "carrier lands in the trailing user slot");
+    assert.equal(evaluateChain(stamped, "responses", { nowMs: T0 + 2000 }).verdict, "valid", "stamped string-input body must verify");
+    const baseEmpty = { model: "m", input: "" };
+    const dE = computeCheckpointDigest(baseEmpty, "responses", fields)!;
+    const sE = insertCheckpointCarrier(baseEmpty, "responses", renderChainCheckpoint({ ...fields, digest: dE }))!;
+    assert.equal(evaluateChain(sE, "responses", { nowMs: T0 + 2000 }).verdict, "valid", "empty string input round-trips too");
+});
+
 test("verdict matrix: digest×timestamp quadrants, selection priority, version gating", () => {
     const base = { model: "m", messages: [{ role: "user", content: "hello" }] };
     const stamp = (fields: typeof FIELDS, digest: string): unknown =>

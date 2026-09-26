@@ -279,7 +279,12 @@ export function insertCheckpointCarrier(parsed: unknown, wire: WireProtocol, tag
     }
     if (wire === "responses") {
         const input = body.input;
-        if (typeof input === "string") return { ...body, input: [{ type: "message", role: "user", content: [{ type: "input_text", text: input }, { type: "input_text", text: tag }] }] };
+        if (typeof input === "string") {
+            // Two-part messages are not carrier slots (singleText needs exactly
+            // one part) — normalize to array form or the stamp is never recognized.
+            const orig = input === "" ? [] : [{ type: "message", role: "user", content: input }];
+            return { ...body, input: [...orig, { type: "message", role: "user", content: tag }] };
+        }
         if (!Array.isArray(input)) return null;
         let insertAt = input.length;
         const last = input[insertAt - 1];
