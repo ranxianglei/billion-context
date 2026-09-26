@@ -27,6 +27,12 @@ export interface WireRule {
 
 export const WIRE_RULES: readonly WireRule[] = [
     {
+        id: "WC-008",
+        wire: "openai-chat",
+        summary: "Copilot Gemini requires scalar schema types and self-contained typed anyOf alternatives",
+        provenance: "OpenCode V2 + Copilot Gemini synthetic reproduction: compress content type array and required-only object alternatives cause 400 invalid_request_body; explicit typed alternatives succeed",
+    },
+    {
         id: "WC-001",
         wire: "anthropic",
         summary: "tools[].input_schema must not carry top-level oneOf/allOf/anyOf/not",
@@ -129,6 +135,9 @@ export function validateOpenAiChatBody(body: unknown): string[] {
         if (typeof fn.name !== "string" || !OPENAI_TOOL_NAME_RE.test(fn.name))
             out.push(`WC-004 ${label}: function.name must match ${OPENAI_TOOL_NAME_RE}`);
         const params = fn.parameters;
+        if (typeof body.model === "string" && body.model.startsWith("gemini-")) {
+            validateGeminiSchema(params, label, out);
+        }
         if (!isPlainObject(params) || params.type !== "object")
             out.push(`WC-004 ${label}: function.parameters must be an object with type:"object"`);
         for (const kw of TOP_LEVEL_COMBINATORS) {
@@ -137,6 +146,23 @@ export function validateOpenAiChatBody(body: unknown): string[] {
         }
     });
     return out;
+}
+
+function validateGeminiSchema(schema: unknown, path: string, out: string[]): void {
+    if (!isPlainObject(schema)) return;
+    if (Array.isArray(schema.type)) out.push(`WC-008 ${path}: type must be scalar`);
+    if (Array.isArray(schema.anyOf)) {
+        schema.anyOf.forEach((branch, i) => {
+            if (!isPlainObject(branch) || typeof branch.type !== "string")
+                out.push(`WC-008 ${path}.anyOf[${i}]: alternative must declare its type`);
+            validateGeminiSchema(branch, `${path}.anyOf[${i}]`, out);
+        });
+    }
+    if (isPlainObject(schema.properties)) {
+        for (const [key, value] of Object.entries(schema.properties))
+            validateGeminiSchema(value, `${path}.${key}`, out);
+    }
+    validateGeminiSchema(schema.items, `${path}.items`, out);
 }
 
 /** WC-005 on a Responses-API body (flat function entries). */
