@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { installNativeFetchIntercept, isModelApiUrl, _resetForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
+import { installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, _resetForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
 
 test("isModelApiUrl: matches model-API endpoint shapes", () => {
     assert.equal(isModelApiUrl("http://127.0.0.1:8199/v1/messages"), true);
@@ -731,4 +731,90 @@ test("install: routed /bili/ request whose recovery also fails degrades to direc
         _resetForTest();
     }
 
+});
+
+// #1365: routed-channel evidence — the fetch patch must record where this
+// process's model traffic actually goes BEFORE any gate await, so attach
+// recovery can see it even when the first request lands while tool
+// registration is still pending.
+
+test("#1365 noteRoutedOrigin: records origin, sticky per origin, hook fires on transitions only", () => {
+    const seen: string[] = [];
+    const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined), onRoutedOriginObserved: (o) => seen.push(o) };
+    noteRoutedOrigin(state, "http://127.0.0.1:8787/bili/https://api.anthropic.com/v1/messages");
+    assert.equal(state.routedOrigin, "http://127.0.0.1:8787");
+    noteRoutedOrigin(state, "http://127.0.0.1:8787/bili/http://127.0.0.1:8199/v1/chat/completions");
+    assert.deepEqual(seen, ["http://127.0.0.1:8787"], "same-origin re-observation is a no-op");
+    noteRoutedOrigin(state, "http://127.0.0.1:9999/bili/http://127.0.0.1:8199/v1/messages");
+    assert.equal(state.routedOrigin, "http://127.0.0.1:9999", "last observation wins");
+    assert.deepEqual(seen, ["http://127.0.0.1:8787", "http://127.0.0.1:9999"]);
+    noteRoutedOrigin(state, "not a url");
+    assert.equal(state.routedOrigin, "http://127.0.0.1:9999", "malformed input ignored");
+    assert.equal(seen.length, 2);
+});
+
+test("#1365 pre-gate proof: first routed request records evidence while toolsReady is still pending", async () => {
+    let releaseTools: () => void = () => {};
+    const toolsReady = new Promise<void>((r) => { releaseTools = r; });
+    const state: NativeInterceptState = {
+        origin: undefined,
+        ready: new Promise<string | undefined>(() => {}),
+        toolsReady,
+        readyTimeoutMs: 150,
+    };
+    const { sink } = await withPatchRecording(state, async (fetch) => {
+        const pending = fetch("http://127.0.0.1:8787/bili/https://api.anthropic.com/v1/messages");
+        // gate deliberately held — if evidence were recorded AFTER the gate,
+        // routedOrigin would be undefined here and observeRoutedOrigin would
+        // burn the full grace window → spawn fallback → the #1365 split-brain
+        await new Promise((r) => setTimeout(r, 30));
+        assert.equal(state.routedOrigin, "http://127.0.0.1:8787", "evidence recorded before any gate await");
+        releaseTools();
+        const res = await pending;
+        assert.equal(res.status, 200);
+    });
+    assert.equal(sink.length, 1);
+    assert.equal(sink[0].url, "http://127.0.0.1:8787/bili/https://api.anthropic.com/v1/messages");
+});
+
+test("#1365 unattributed /bili/ riders never record evidence (#1117 boundary)", async () => {
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:40001",
+        ready: Promise.resolve("http://127.0.0.1:40001"),
+        takeoverGate: () => false,
+    };
+    await withPatch(state, async (fetch) => {
+        const res = await fetch("http://127.0.0.1:8787/bili/http://127.0.0.1:8199/v1/messages");
+        assert.equal(res.status, 200);
+    });
+    assert.equal(state.routedOrigin, undefined, "another plugin's channel does not pin ours");
+});
+
+test("#1365 observeRoutedOrigin: pre-set evidence skips the window; expiry clean; mid-window arrival ends early", async () => {
+    const saved = process.env.BILI_ATTACH_EVIDENCE_GRACE_MS;
+    try {
+        process.env.BILI_ATTACH_EVIDENCE_GRACE_MS = "60000";
+        const withEvidence: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined), routedOrigin: "http://127.0.0.1:8787" };
+        const fast = await Promise.race([
+            observeRoutedOrigin(withEvidence),
+            new Promise<undefined>((r) => setTimeout(() => r(undefined), 2000)),
+        ]);
+        assert.equal(fast, "http://127.0.0.1:8787", "pre-set evidence must not pay the (60s) grace window");
+
+        process.env.BILI_ATTACH_EVIDENCE_GRACE_MS = "50";
+        const empty: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined) };
+        const t0 = Date.now();
+        assert.equal(await observeRoutedOrigin(empty), undefined, "no evidence within the window → legacy path");
+        assert.ok(Date.now() - t0 >= 40, "no-evidence path waits out the window");
+
+        process.env.BILI_ATTACH_EVIDENCE_GRACE_MS = "2000";
+        const late: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined) };
+        setTimeout(() => { late.routedOrigin = "http://127.0.0.1:9999"; }, 50);
+        const t1 = Date.now();
+        assert.equal(await observeRoutedOrigin(late), "http://127.0.0.1:9999", "mid-window arrival ends the wait early");
+        assert.ok(Date.now() - t1 < 1500, "early return on mid-window evidence");
+    } finally {
+        if (saved === undefined) delete process.env.BILI_ATTACH_EVIDENCE_GRACE_MS;
+        else process.env.BILI_ATTACH_EVIDENCE_GRACE_MS = saved;
+    }
 });

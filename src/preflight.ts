@@ -10,7 +10,7 @@ import {
 import { buildCompressSystemPrompt, parseCompressInput } from "./compress-tool.js";
 import { IMAGE_PLACEHOLDER, imagePlaceholders } from "./image-note.js";
 import { applyAbsorbView } from "./absorb.js";
-import { adoptContentStore, ccrEnabled, contentStoreOf } from "./store.js";
+import { adoptContentStore, ccrLoopConfig, contentStoreOf } from "./store.js";
 import { applyRanges, normalizeRangeOrder, type RewriteCtx } from "./stream.js";
 import { fetchWithTimeout, isTransientUpstreamError, replayMaxAttempts, replayBackoffMs, sleep, UpstreamHttpError } from "./fetch-util.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
@@ -832,6 +832,14 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     // skipSet keys are stable across folds because refs are content-fingerprinted,
     // so a range found unusable is never retried within this invocation.
     const skipSet = new Set<string>();
+    // #1372: every silent skip leaves a trace — preflight and the plugin compress
+    // path judge the same range at different pipeline positions, so their verdicts
+    // can legitimately diverge; recording where+why makes the divergence diffable.
+    const skipReasons: string[] = [];
+    const noteSkip = (reason: string): void => {
+        if (skipReasons.length < 8 && !skipReasons.includes(reason)) skipReasons.push(reason.slice(0, 200));
+    };
+    let subMinNoted = false;
     let summaryCalls = 0;
     let budgetHit = false;
     let rangesTried = 0;
@@ -848,7 +856,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         const turn = deps.core.processTurn({
             messages,
             state: deps.session.state,
-            config: noEmergencyTruncate(ccrEnabled(deps.session) ? activeConfig : { ...activeConfig, ccr: undefined }),
+            config: noEmergencyTruncate(ccrLoopConfig(deps.session, activeConfig)),
             tokenCount: currentTokens,
             renderTags: "text-only",
             contentStore: contentStoreOf(deps.session),
@@ -878,7 +886,16 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         // sub-min range fails the apply-side gate, so walking them only burns
         // rounds and misreports "N viable ranges tried"; with them gone the
         // empty-list path below can reach the #330 soft-zone relaxation.
-        const ranges = viableRanges(turn.nudge?.compressibleRanges ?? []).filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars);
+        const viable = viableRanges(turn.nudge?.compressibleRanges ?? []);
+        const ranges = viable.filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars);
+        // #1372: the list-level minCompressRange filter used to drop sub-minimum
+        // ranges silently — "no compressible ranges remain" gave no hint that
+        // ranges existed but were all under the gate.
+        if (ranges.length === 0 && viable.length > 0 && !subMinNoted) {
+            subMinNoted = true;
+            deps.log("warn", `[preflight] ${viable.length} viable range(s) are below minCompressRange (${minChars} chars); none foldable`);
+            noteSkip(`all ${viable.length} viable range(s) below minCompressRange (${minChars} chars)`);
+        }
         rangesRemaining = ranges.length;
         if (ranges.length === 0) {
             // #330: nothing foldable outside the soft-protected recent zone.
@@ -900,7 +917,9 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 deps.log("warn", "[preflight] no compressible ranges outside the protected recent zone; relaxing soft protection (preserveRecentMessages/Tokens -> 0) and retrying");
                 continue;
             }
-            failure = { kind: "exhausted", detail: relaxed ? relaxedExhaustedDetail : "no compressible ranges remain in the conversation" };
+            failure = { kind: "exhausted", detail: relaxed ? relaxedExhaustedDetail : subMinNoted
+                ? `no foldable compressible ranges remain: all ${viable.length} viable range(s) are below minCompressRange (${minChars} chars)`
+                : "no compressible ranges remain in the conversation" };
             break;
         }
         const ordered = [...ranges].sort((a, b) => refNum(a.startRef) - refNum(b.startRef));
@@ -919,6 +938,13 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             const endIdx = refToIdx.get(range.endRef);
             if (startIdx === undefined || endIdx === undefined || startIdx > endIdx) {
                 skipSet.add(skipKey);
+                const why = startIdx === undefined
+                    ? `start ref ${range.startRef} is absent from the current messages`
+                    : endIdx === undefined
+                        ? `end ref ${range.endRef} is absent from the current messages`
+                        : `position resolution inverted the range (${startIdx} > ${endIdx})`;
+                deps.log("warn", `[preflight] skipping range ${skipKey}: ${why}`);
+                noteSkip(`${skipKey}: ${why}`);
                 continue;
             }
             rangesTried += 1;
@@ -945,7 +971,11 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 const maps = refMaps(messages, deps.session.state);
                 let startRef = maps.idxToRef.get(cs);
                 let endRef = maps.idxToRef.get(ce);
-                if (!startRef || !endRef) continue;
+                if (!startRef || !endRef) {
+                    deps.log("warn", `[preflight] dropping span ${cs}..${ce} of range ${skipKey}: boundary message has no ref in the current state`);
+                    noteSkip(`${skipKey}: span ${cs}..${ce} boundary message has no ref`);
+                    continue;
+                }
                 // #1001: after a client history rewrite, ref numbers are not monotonic
                 // with position — emit ascending pairs (the kernel resolves by
                 // position anyway; this keeps specs, logs and the summary prompt honest).
@@ -961,15 +991,25 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 });
                 const previousBlockIds = new Set(deps.session.state.blocks.map((block) => block.blockId));
                 const planned = preview.state.blocks.find((block) => !previousBlockIds.has(block.blockId));
-                if (!planned) continue;
+                if (!planned) {
+                    // #1372: the kernel verdict used to be discarded here — this is where
+                    // "no range could be compressed" died silently (minCompressRange gate,
+                    // unknown/consumed refs, fully protected span, dummy summary length).
+                    const verdict = [...preview.result.errors, ...preview.result.warnings].join("; ").slice(0, 300)
+                        || "the kernel created no block and reported no error";
+                    deps.log("warn", `[preflight] preview rejected range ${skipKey}: ${verdict}`);
+                    noteSkip(`${skipKey}: preview rejected — ${verdict}`);
+                    continue;
+                }
                 // Direct raw messages render host-side: #781 image notes live in BiliMessage
                 // sidecars the kernel never sees. Consumed child blocks render through the
                 // kernel from the original state so they stay summaries.
                 const idxById = new Map(messages.map((m, i) => [m.id, i]));
                 const parts: string[] = [];
+                const droppedParts: string[] = [];
                 for (const id of planned.directMessageIds) {
                     const i = idxById.get(id);
-                    if (i === undefined) continue;
+                    if (i === undefined) { droppedParts.push(`message ${id} not found in current messages`); continue; }
                     const m = messages[i];
                     let text = m.text ?? "";
                     const notes = imagePlaceholders(m);
@@ -977,7 +1017,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                         const note = notes.join(" ");
                         text = text === IMAGE_PLACEHOLDER ? note : text ? `${text}\n${note}` : note;
                     }
-                    if (!text) continue;
+                    if (!text) { droppedParts.push(`message ${id} rendered no text`); continue; }
                     const label =
                         m.contentType === "tool-call"
                             ? `assistant tool-call ${m.toolName ?? "?"}`
@@ -992,12 +1032,19 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     const nb = deps.session.state.blocks.find((b) => b.blockId === nid);
                     // The child stays a summary: its raw text is already condensed, and
                     // re-expanding it would defeat the compression this fold performs.
-                    if (!nb) continue;
+                    if (!nb) { droppedParts.push(`child block ${nid} missing from state`); continue; }
                     const label = nb.topic ? `${nb.blockId}: ${nb.topic}` : nb.blockId;
                     parts.push(`[summarized ${label}]\n${nb.summary}`);
                 }
+                if (droppedParts.length > 0) {
+                    deps.log("debug", `[preflight] range ${skipKey}: ${droppedParts.length} part(s) rendered nothing (${droppedParts.slice(0, 3).join("; ")})`);
+                }
                 const content = parts.join("\n\n");
-                if (content.length === 0) continue;
+                if (content.length === 0) {
+                    deps.log("warn", `[preflight] planned block for range ${skipKey} rendered no text: ${droppedParts.slice(0, 5).join("; ") || "all parts empty"}`);
+                    noteSkip(`${skipKey}: planned block rendered no text (${droppedParts.slice(0, 3).join("; ") || "all parts empty"})`);
+                    continue;
+                }
                 let summary: string | null = null;
                 let outcome: SummaryOutcome | undefined;
                 try {
@@ -1062,6 +1109,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                         continue;
                     }
                     deps.log("warn", `[preflight] range ${skipKey} produced no usable summary even at minimum size (${unusableDetail}); skipping it`);
+                    noteSkip(`${skipKey}: no usable summary even at minimum size (${unusableDetail})`);
                     skipSet.add(skipKey);
                     break;
                 }
@@ -1076,6 +1124,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 const applied = applyRanges(parseCompressInput({ content: [{ startId: startRef, endId: endRef, summary, topic: "preflight overflow compress" }] }), ctx);
                 if (applied.startsWith("[Compression FAILED")) {
                     deps.log("warn", `[preflight] ${applied}`);
+                    noteSkip(`${skipKey}: apply failed — ${applied.replace(/^\[Compression FAILED[:\s]*/, "").slice(0, 200)}`);
                     skipSet.add(skipKey);
                     break;
                 }
@@ -1110,15 +1159,24 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         // #726: carry the most recent unusable-summary diagnosis into the
         // fail-fast message — "no range could be compressed" with no reason is
         // undiagnosable from the client side.
+        // #1372: carry the actual per-range skip reasons too — the old hardcoded
+        // parenthetical claimed causes that often had not happened (e.g. "below
+        // minCompressRange" for a range that died before any summary call).
         const unusableNote = lastUnusableDetail ? ` Last unusable summary: ${lastUnusableDetail.slice(0, 300)}.` : "";
+        const skipNote = skipReasons.length > 0 ? ` Skipped: ${skipReasons.slice(0, 3).join(" | ")}.` : "";
         if (budgetHit) {
-            failure = { kind: "exhausted", detail: `the preflight summarization budget (${MAX_SUMMARY_CALLS_PER_PREFLIGHT} calls per protection regime) was exhausted before the payload fit the window${unusableNote}` };
+            failure = { kind: "exhausted", detail: `the preflight summarization budget (${MAX_SUMMARY_CALLS_PER_PREFLIGHT} calls per protection regime) was exhausted before the payload fit the window${unusableNote}${skipNote}` };
         } else if (relaxed && result.compressedRanges > 0) {
-            failure = { kind: "exhausted", detail: relaxedExhaustedDetail };
+            failure = { kind: "exhausted", detail: `${relaxedExhaustedDetail}${skipNote}` };
         } else if (result.compressedRanges === 0) {
-            failure = { kind: "exhausted", detail: `no range could be compressed across ${rangesTried} viable range${rangesTried === 1 ? "" : "s"} (each was below minCompressRange, had an unusable summary, or failed to apply)${unusableNote}` };
+            const cause = skipReasons.length > 0
+                ? skipReasons.slice(0, 3).join(" | ")
+                : "each was below minCompressRange, had an unusable summary, or failed to apply";
+            failure = { kind: "exhausted", detail: rangesTried === 0
+                ? `no viable range could be compressed: ${cause}${unusableNote}`
+                : `no range could be compressed across ${rangesTried} viable range${rangesTried === 1 ? "" : "s"}: ${cause}${unusableNote}` };
         } else {
-            failure = { kind: "exhausted", detail: `the compress budget was exhausted after ${MAX_PREFLIGHT_ROUNDS} rounds${unusableNote}` };
+            failure = { kind: "exhausted", detail: `the compress budget was exhausted after ${MAX_PREFLIGHT_ROUNDS} rounds${unusableNote}${skipNote}` };
         }
     }
     if (result.compressedRanges > 0) {

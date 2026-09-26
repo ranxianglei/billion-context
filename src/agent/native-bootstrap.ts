@@ -59,6 +59,16 @@ export function nativeAttachOrigin(env: NodeJS.ProcessEnv): string | undefined {
     return url.replace(/\/+$/, "");
 }
 
+/** Millisecond env-var knob (#1365): a finite positive number wins, anything
+ *  else (unset, blank, garbage, non-positive) falls back to the default so a
+ *  bad value can never produce a zero/negative timeout. */
+export function envMillis(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
+    const raw = env[name];
+    if (raw === undefined) return fallback;
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+
 /** Coexistence marker (#820): tells standalone in-process bili extensions
  *  (billion-context-pi / opencode-acp) that a host-native entry owns THIS
  *  process so they back off instead of double-compressing. Set synchronously

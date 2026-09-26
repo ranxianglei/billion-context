@@ -7,12 +7,16 @@ import type { AddressInfo } from "node:net";
 // and static imports hoist above any assignment — so the value must be set
 // first and the module loaded dynamically.
 process.env.NODE_TEST_CONTEXT = "1";
+// #1365: legacy dead-attach suites must not pay the 5s routed-evidence grace
+// default (same waitFor-cap race as dsh-native.test.ts). Pinned-path tests
+// override per-test.
+process.env.BILI_ATTACH_EVIDENCE_GRACE_MS = "30";
 
 import type { NativeInterceptState } from "../src/agent/native-intercept.ts";
 import type { V2HttpRequestEvent, V2PluginContext, V2State } from "../src/agent/opencode-v2.ts";
 import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../src/compress-tool.ts";
 
-const { shouldBootstrapNativeOpencode, createNativeRoute, planNativeOpencode, armNativeOpencode, _resetNativeStateForTest, _setSpawnForTest, _stateRespawnForTest } = await import("../src/agent/opencode-native.ts");
+const { shouldBootstrapNativeOpencode, createNativeRoute, planNativeOpencode, armNativeOpencode, verifyAttachAndRecover, _resetNativeStateForTest, _setSpawnForTest, _stateRespawnForTest, _noteRoutedForTest } = await import("../src/agent/opencode-native.ts");
 const { createOpencodeV2Setup } = await import("../src/agent/opencode-v2.ts");
 const { markNativeHost, nativeAttachOrigin } = await import("../src/agent/native-bootstrap.ts");
 const nativeDefault = (await import("../src/agent/opencode-native.ts")).default;
@@ -530,4 +534,87 @@ test("route: a proxy that dies is detected within one TTL and degrades to direct
     await route(down, s);
     assert.equal((down.request as Request).url, MODEL_URL, "expected an unrewritten (direct) request after the proxy died");
     assert.ok(calls >= 2, "expected a re-probe within one TTL that observed the dead proxy");
+});
+
+// — #1365: pinned model channel — never spawn over a statically-routed target —
+
+async function reserveLoopbackPort(): Promise<number> {
+    return new Promise((resolve, reject) => {
+        const srv = createServer();
+        srv.listen(0, "127.0.0.1", () => {
+            const addr = srv.address() as AddressInfo;
+            srv.close(() => resolve(addr.port));
+        });
+        srv.on("error", reject);
+    });
+}
+
+test("#1365 verifyAttachAndRecover: routed evidence pins the channel — waits the target back, never spawns", async () => {
+    const port = await reserveLoopbackPort();
+    const origin = `http://127.0.0.1:${port}`;
+    const server = createServer((_req, res) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ version: "0.1.119", tools: {} }));
+    });
+    let spawnCalls = 0;
+    let upTimer: NodeJS.Timeout | undefined;
+    try {
+        _resetNativeStateForTest();
+        _setSpawnForTest(async () => {
+            spawnCalls += 1;
+            return "http://127.0.0.1:2";
+        });
+        process.env.BILLION_CONTEXT_PROXY = origin;
+        _noteRoutedForTest(`${origin}/bili/${MODEL_URL}`);
+        const pending = verifyAttachAndRecover(origin);
+        upTimer = setTimeout(() => server.listen(port, "127.0.0.1"), 120);
+        const recovered = await pending;
+        clearTimeout(upTimer);
+        assert.equal(recovered, origin, "recovery lands back on the pinned origin");
+        assert.equal(spawnCalls, 0, "no second instance may be spawned over a pinned channel");
+        assert.equal(process.env.BILLION_CONTEXT_PROXY, origin, "the user's target stays frozen");
+    } finally {
+        clearTimeout(upTimer);
+        server.close();
+        delete process.env.BILLION_CONTEXT_PROXY;
+        _setSpawnForTest(undefined);
+        _resetNativeStateForTest();
+    }
+});
+
+test("#1365 route: already-routed /bili/ URLs record pinned-channel evidence before the model-URL gate", async () => {
+    const origin = "http://127.0.0.1:9999";
+    const state: NativeInterceptState = { origin, ready: Promise.resolve(origin) };
+    const route = createNativeRoute(state, { probe: async () => true });
+    const s: V2State = {};
+    const routed = new Request(`${origin}/bili/${MODEL_URL}`);
+    const e: V2HttpRequestEvent = { request: routed };
+    await route(e, s);
+    assert.equal(e.request, routed, "already-routed requests stay untouched");
+    assert.equal(state.routedOrigin, origin, "routed traffic records the pinned channel even though isModelApiUrl skips it");
+});
+
+test("#1365 verifyAttachAndRecover: persistently dead pinned target — refuses to spawn, keeps the env", async () => {
+    const port = await reserveLoopbackPort();
+    const origin = `http://127.0.0.1:${port}`;
+    let spawnCalls = 0;
+    try {
+        _resetNativeStateForTest();
+        _setSpawnForTest(async () => {
+            spawnCalls += 1;
+            return "http://127.0.0.1:2";
+        });
+        process.env.BILLION_CONTEXT_PROXY = origin;
+        process.env.BILI_ATTACH_HEALTH_DEADLINE_MS = "150";
+        _noteRoutedForTest(`${origin}/bili/${MODEL_URL}`);
+        const recovered = await verifyAttachAndRecover(origin);
+        assert.equal(recovered, undefined);
+        assert.equal(spawnCalls, 0);
+        assert.equal(process.env.BILLION_CONTEXT_PROXY, origin, "the pinned target env must survive");
+    } finally {
+        delete process.env.BILLION_CONTEXT_PROXY;
+        delete process.env.BILI_ATTACH_HEALTH_DEADLINE_MS;
+        _setSpawnForTest(undefined);
+        _resetNativeStateForTest();
+    }
 });

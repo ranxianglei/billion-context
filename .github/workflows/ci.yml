@@ -2,7 +2,11 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    # Release branches also run CI on push: bot-authored auto-PRs can sit in
+    # `action_required` (manual approval gate), but check runs from the push
+    # event satisfy required-status-checks on the same sha → the auto-PR is
+    # mergeable without approving the PR-triggered runs (#772).
+    branches: [master, "*_release-v*"]
   pull_request:
     branches: [master]
 

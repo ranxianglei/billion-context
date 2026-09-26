@@ -37,8 +37,8 @@ import path from "node:path";
 import { defaultLogFile } from "../paths.js";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
-import { installNativeFetchIntercept, type NativeInterceptState } from "./native-intercept.js";
-import { fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportRuntimeInfo, type ManifestTool } from "./shared.js";
+import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, type NativeInterceptState } from "./native-intercept.js";
+import { fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 
 export const name = "bili-native";
 export const inject = ["tools", "commands", "agents"];
@@ -226,23 +226,51 @@ export function _setSpawnForTest(fn?: () => Promise<string | undefined>): void {
     _spawnForTest = fn;
 }
 
-/** #983/#1130: the attached origin can go stale — at startup (the `bili dsh`
- *  launcher's proxy died, or a pre-#983 build froze its spawned origin into
- *  process.env and cordis re-activated this plugin in the same process) or
- *  at runtime (the owning launcher of a SHARED proxy exits while this
- *  session still rides it). Probe before trusting it: healthy → attach as
- *  planned; dead → unfreeze the preset env and fall back to spawning our own
- *  proxy (instance discovery may find another healthy one first). Resolves
- *  to the origin the plugin should use — attachOrigin, the fallback origin,
- *  or undefined when even the fallback failed (register left base-less). */
+/** #983/#1130/#1365: the attached origin can go stale — at startup (the
+ *  `bili dsh` launcher's proxy died, or a pre-#983 build froze its spawned
+ *  origin into process.env and cordis re-activated this plugin in the same
+ *  process) or at runtime (the owning launcher of a SHARED proxy exits while
+ *  this session still rides it). Probe before trusting it: healthy → attach
+ *  as planned. DEAD + routed-channel evidence (#1365: /bili/-baked model
+ *  traffic was observed at some origin) → the session's context lives at
+ *  THAT origin, so wait for the pinned target to come back (bounded by
+ *  BILI_ATTACH_HEALTH_DEADLINE_MS) instead of spawning — a second instance
+ *  would serve tools while the model channel stays pinned elsewhere and
+ *  every bili tool call 404s against it (unrecoverable split). DEAD with no
+ *  evidence after the grace window (BILI_ATTACH_EVIDENCE_GRACE_MS) → unfreeze
+ *  the preset env and fall back to spawning our own proxy (instance
+ *  discovery may find another healthy one first). Resolves to the origin the
+ *  plugin should use — the (recovered) attach origin, the fallback origin,
+ *  or undefined when nothing came up (register left base-less; maybeRetry
+ *  keeps re-probing through the respawn hook). */
 async function verifyAttachAndRecover(attachOrigin: string): Promise<string | undefined> {
-    const version = await fetchProxyVersion(attachOrigin).catch(() => undefined);
+    // #1365: routed evidence outranks the planned origin — probe where the
+    // model channel actually points, not where the env says it should.
+    const home = state.routedOrigin ?? attachOrigin;
+    const version = await fetchProxyVersion(home).catch(() => undefined);
     if (version !== undefined) {
         // #1130: restore the interceptor's readyOrigin short-circuit — a
         // runtime recovery clears state.origin before re-probing, and a
         // transient blip must not leave it dangling.
-        state.origin = attachOrigin;
-        return attachOrigin;
+        state.origin = home;
+        register.base = home;
+        return home;
+    }
+    const pinned = state.routedOrigin ?? (await observeRoutedOrigin(state));
+    if (pinned !== undefined) {
+        const back = await waitForProxyVersion(pinned);
+        if (back !== undefined) {
+            state.origin = back;
+            register.base = back;
+            persistClientEvent(`attach target ${pinned} recovered while waiting — attached, no second instance spawned`);
+            console.log(`bili-native-dsh: attach target ${pinned} is healthy again — attached, no second instance spawned`);
+            return back;
+        }
+        persistClientEvent(`attach target ${pinned} unreachable within the health deadline — NOT spawning a second instance (model channel is pinned to it); re-checks continue`);
+        console.error(`bili-native-dsh: attach target ${pinned} is down and this process's model channel is pinned to it — refusing to spawn a second instance (bili tools would 404 against the other one). Start your proxy at ${pinned} or unset BILLION_CONTEXT_PROXY; bili keeps re-checking and self-heals when it comes back.`);
+        register.base = undefined;
+        register.toolsReady = false;
+        return undefined;
     }
     persistClientEvent(`attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`);
     console.error(`bili-native-dsh: attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`);
@@ -494,6 +522,21 @@ export function apply(ctx: PluginContext): void {
                 register.base = undefined;
                 register.toolsReady = false;
             };
+            // #1365: late routed evidence — if model traffic later arrives baked
+            // against a DIFFERENT origin than the one we attached to, rebind the
+            // tools there (the context lives where the models go). Fire-and-forget
+            // with a liveness check: only converge on a target we can actually reach.
+            state.onRoutedOriginObserved = (origin) => {
+                if (register.base === origin) return;
+                void fetchProxyVersion(origin).catch(() => undefined).then((version) => {
+                    if (version === undefined || register.base === origin) return;
+                    register.base = origin;
+                    state.origin = origin;
+                    const line = `bili-native-dsh: model channel pinned to ${origin} — rebinding bili tools there`;
+                    persistClientEvent(line);
+                    console.warn(line);
+                });
+            };
             state.ready = start();
         } else {
             state.ready = Promise.resolve(undefined);
@@ -673,4 +716,16 @@ export function _stateToolsReadyForTest(): Promise<unknown> | undefined {
  *  in native-intercept.test.ts; under NODE_TEST_CONTEXT it is not installed). */
 export function _stateRespawnForTest(): (() => Promise<string | undefined>) | undefined {
     return state.respawn;
+}
+
+/** Test hook (#1365): record routed-channel evidence exactly as the fetch
+ *  patch would (the patch is not installed under NODE_TEST_CONTEXT). */
+export function _noteRoutedForTest(url: string): void {
+    noteRoutedOrigin(state, url);
+}
+
+/** Test hook (#1365): clear the sticky routed-channel evidence between scenarios. */
+export function _resetRoutedForTest(): void {
+    state.routedOrigin = undefined;
+    state.onRoutedOriginObserved = undefined;
 }

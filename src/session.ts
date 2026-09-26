@@ -37,6 +37,20 @@ export function lastCompressSuffix(info: LastCompressInfo | undefined): string {
     return ` [after compress: shrink ${Math.round(info.shrinkRatio * 100)}% foldPoint=${info.foldPoint} blocks=${info.blocks} ~${info.tokensCompressed}tok]`;
 }
 
+/** [#1343] Queued full-text retrieval. `injection` is the ephemeral carrier
+ *  (never persisted); ref/tokens/chars/queuedAt back the durable
+ *  undelivered-ledger + TTL + drop logging. Lifecycle: queued → attached →
+ *  delivered | dropped (see store.ts). */
+export type PendingRetrieval = {
+    ref: string;
+    tokens: number;
+    chars: number;
+    queuedAt: number;
+    injection: CoreMessage;
+    /** CCR acp_retrieve riders carry the delivery ledger/TTL/counters; other ephemeral carriers (e.g. range restore #1207) only ride along and are removed at the delivery outcome. */
+    ccr?: boolean;
+};
+
 export type Session = {
     id: string;
     /** Identity / descriptive metadata. Populated on first request. */
@@ -134,6 +148,11 @@ export type Session = {
         retrieveHits: number;
         /** #1097: acp_retrieve calls that missed (unknown/hallucinated ref). */
         retrieveMisses: number;
+        /** #1343: acked retrieves whose full text was DROPPED undelivered
+         *  (post-drain upstream failure, disarm, TTL expiry, proxy restart). */
+        retrieveDropped?: number;
+        /** #1343: acked retrieves whose full text was confirmed delivered upstream. */
+        retrieveDelivered?: number;
         /** #1097: cumulative bytes of unique originals held in the store. */
         storedBytes: number;
         /** #1097: cumulative wire bytes saved by placeholder substitution. */
@@ -196,9 +215,11 @@ export type Session = {
     *  while this is set (adopt grew entries / reset cleared the store). */
     contentStoreDirty?: boolean;
     /** In-memory only (NOT persisted): full-text retrieval injections queued by
-     *  executeRetrieve, drained into the next re-request after the tool-result
-     *  pair (request-only, same channel as nudges). */
-    pendingRetrievals: CoreMessage[];
+     *  executeRetrieve, delivered on a later plugin-lane upstream request
+     *  (request-only, same channel as nudges). Durable bookkeeping for each
+     *  item lives in metadata.ccrUndelivered so an acked-but-undelivered
+     *  retrieve can be detected and reported across restarts (#1343). */
+    pendingRetrievals: PendingRetrieval[];
     /** #1095 in-memory only (NOT persisted): deterministic encode cache keyed
      *  by sha256 of the ORIGINAL base64 → encoded payload. Identical inputs
      *  must yield identical wire bytes across turns/restarts (prefix-cache
@@ -224,6 +245,12 @@ export type Session = {
      *  activity; fallback=latest skips restored sessions rather than guessing
      *  among a readdir-order tie. Cleared on the first real request touch. */
     restored?: boolean;
+    /** In-memory only (NOT persisted): one-shot set by persist's load (#1343).
+     *  getSession() clears `restored` on the first request touch, but
+     *  reconcileReloadedRetrievals runs LATER in that same request — so it
+     *  keys off this flag, which survives until the reconcile (or a full
+     *  reset) has actually run. */
+    ccrReconcilePending?: boolean;
     /** In-memory only (NOT persisted — buildRecord omits it): the most recent
      *  successful compress, set by applyRanges and read by the replay/preflight
      *  retry callbacks to correlate a transient upstream rejection with the
@@ -328,7 +355,7 @@ export function getSession(id: string, meta?: { protocol?: Session["meta"]["prot
     const session: Session = {
         id,
         meta: { protocol: meta?.protocol, upstreamOrigin: meta?.upstreamOrigin, label: meta?.label },
-        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
+        stats: { requests: 0, tokensSaved: 0, inputTokens: 0, cachedTokens: 0, outputTokens: 0, cacheSamples: 0, lastInputTokens: 0, compressCreditTokens: 0, contextTokens: 0, retrieveCalls: 0, retrieveHits: 0, retrieveMisses: 0, retrieveDropped: 0, retrieveDelivered: 0, storedBytes: 0, storeBytesSaved: 0, rangeRestores: 0 },
         metadata: {},
         state: createInitialState(),
         createdAt: Date.now(),
@@ -499,7 +526,14 @@ export function resetSessionCompression(session: Session): void {
     // deletes the on-disk envelope on the next save.
     session.contentStore = undefined;
     session.contentStoreDirty = true;
+    // #1343: rebase wipes both the queued injections and their acks (context
+    // rebuilt), so clear the durable ledger too — otherwise a later
+    // reconcileReloadedRetrievals would misattribute this expected loss as a
+    // proxy-restart drop.
     session.pendingRetrievals.length = 0;
+    delete session.metadata.ccrUndelivered;
+    delete session.metadata.ccrDropNotes;
+    session.ccrReconcilePending = false;
     // #1095: same ref-reissue rationale as the content store — encode-cache /
     // fingerprint entries keyed by old refs would misattribute after rebase.
     session.imageEncodeCache?.clear();

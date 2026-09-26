@@ -712,6 +712,10 @@ test("runLaunch hermes #535: proxy env routing, no HERMES_HOME overlay, real con
         assert.ok(childEnv, "client spawned");
         assert.match(childEnv!.HTTPS_PROXY ?? "", /^http:\/\/127\.0\.0\.1:\d+$/);
         assert.ok(childEnv!.HERMES_CA_BUNDLE, "CA bundle exported");
+        assert.ok(
+            String(childEnv!.SSL_CERT_FILE).endsWith(path.join("billion-context", "ca", "combined-ca.pem")),
+            "combined CA bundle exported (#1375)",
+        );
         assert.equal(childEnv!.HERMES_HOME, hermesHome, "user-set real home survives to the child");
         assert.equal(fs.existsSync(`${hermesHome}-bili`), false, "no hermes overlay dir");
         const after = fs.statSync(path.join(hermesHome, "config.yaml"));

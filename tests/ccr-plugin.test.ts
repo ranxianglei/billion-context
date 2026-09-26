@@ -14,6 +14,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import path from "node:path";
 
 process.env.NODE_ENV = "test";
 process.env.BILI_PERSIST = "0";
@@ -25,6 +27,8 @@ import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { listSessions } from "../src/session.ts";
 import { ccrEnabled, ccrPluginWireOk, contentStoreOf, PLUGIN_CCR_WIRES, retrieveToolName } from "../src/store.ts";
 import { handlePluginManifest } from "../src/plugin.ts";
+import { findCcrPluginDivergences, loadOptions } from "../src/config.ts";
+import { setLogCapture } from "../src/logger.ts";
 
 const MODEL = "test-model";
 const BIG_TEXT = "line of build output ".repeat(400);
@@ -92,7 +96,7 @@ function okJson(): string {
     });
 }
 
-async function startRig(mode?: "route-scoped"): Promise<Rig> {
+async function startRig(mode?: "route-scoped" | "name-divergent" | "enabled-divergent"): Promise<Rig> {
     const forwards: string[] = [];
     const upstream = http.createServer((req, res) => {
         let b = "";
@@ -111,10 +115,16 @@ async function startRig(mode?: "route-scoped"): Promise<Rig> {
     setRegistryForTest({});
     // "route-scoped": CCR enabled ONLY under the route block — the base config
     // stays off, so the plugin manifest never advertises acp_retrieve (#1273
-    // review regression rig).
+    // review regression rig). "name-divergent"/"enabled-divergent" (#1345):
+    // base CCR on + a route-level override of a DIFFERENT field — the exact
+    // config that used to split the advertised surface from the executed one.
     const routes = mode === "route-scoped"
         ? { [`http://127.0.0.1:${upstreamPort}`]: { compress: { ccr: { enabled: true, minToolTokens: 50 } } } }
-        : { [`http://127.0.0.1:${upstreamPort}`]: {} };
+        : mode === "name-divergent"
+            ? { [`http://127.0.0.1:${upstreamPort}`]: { compress: { ccr: { toolName: "retrieve_original" } } } }
+            : mode === "enabled-divergent"
+                ? { [`http://127.0.0.1:${upstreamPort}`]: { compress: { ccr: { enabled: false } } } }
+                : { [`http://127.0.0.1:${upstreamPort}`]: {} };
     const proxy = await startServer({
         port: 0,
         host: "127.0.0.1",
@@ -137,11 +147,15 @@ async function startRig(mode?: "route-scoped"): Promise<Rig> {
     return { proxyPort: proxy.address().port as number, upstreamPort, forwards, proxy, upstream };
 }
 
-async function postOpenai(rig: Rig, messages: unknown[]): Promise<void> {
+// The SessionStore is file-global (closeRig only closes sockets), so every
+// e2e test needs its own conversation id — reusing one inherits the earlier
+// test's message refs/content store and the kernel treats re-sent messages as
+// already-known instead of storing them fresh.
+async function postOpenai(rig: Rig, messages: unknown[], convId = "ccr-e2e-conv"): Promise<void> {
     const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/chat/completions`;
     const res = await fetch(url, {
         method: "POST",
-        headers: { "content-type": "application/json", "x-bili-plugin": "test-agent", "x-acp-session": "ccr-e2e-conv" },
+        headers: { "content-type": "application/json", "x-bili-plugin": "test-agent", "x-acp-session": convId },
         // max_tokens must exceed SIDE_REQUEST_MAX_TOKENS or the side-request
         // guard forwards verbatim without touching kernel state (#554).
         body: JSON.stringify({ model: MODEL, max_tokens: 64_000, messages }),
@@ -244,5 +258,176 @@ test("e2e route-scoped CCR: plugin lane stays verbatim, proxy lane arms", async 
         assert.ok(!f2.includes(BIG_TEXT), "full original must not leak on the proxy wire");
     } finally {
         await closeRig(rig);
+    }
+});
+
+// [#1345] In plugin mode the static manifest is the ONLY declaration of the
+// retrieve surface, so the whole ccr block follows the base config: a
+// route/model-level override of ANY field (toolName, enabled, thresholds)
+// must not split the advertised surface from the executed policy. Provider/
+// model ccr.* overrides stay proxy-lane-only (the proxy declares+dispatches
+// per request under the merged block).
+
+test("e2e #1345 toolName divergence: plugin lane executes the BASE name, proxy lane keeps the override", async () => {
+    const rig = await startRig("name-divergent");
+    try {
+        // The live manifest advertises only the base name — never the route override.
+        const mfRes = await fetch(`http://127.0.0.1:${rig.proxyPort}/__bili/plugin/manifest`);
+        const mf = JSON.parse(await mfRes.text()) as { toolNames: string[] };
+        assert.ok(mf.toolNames.includes("acp_retrieve"), "manifest advertises the base acp_retrieve");
+        assert.ok(!mf.toolNames.includes("retrieve_original"), "manifest must not advertise the route-level rename");
+
+        // Plugin lane: stored + placeholdered under the BASE name.
+        await postOpenai(rig, BASE_MSGS(), "ccr-e2e-name-conv");
+        assert.equal(rig.forwards.length, 1, "one outbound forward after the plugin turn");
+        const f1 = rig.forwards[0]!;
+        // Quotes are JSON-escaped in the forwarded body (\") — match accordingly.
+        assert.ok(f1.includes("[acp-stored"), "plugin lane stores the oversized result");
+        assert.ok(!f1.includes(BIG_TEXT), "full original must not leak on the plugin wire");
+        assert.ok(f1.includes('acp_retrieve(\\"'), "placeholder hint uses the BASE retrieve name");
+        assert.ok(!f1.includes("retrieve_original"), "placeholder hint must not use the route-level rename");
+        const sess = listSessions().find((s) => s.id === "ccr-e2e-name-conv");
+        assert.ok(sess && ccrEnabled(sess), "plugin session armed CCR from the base config");
+        assert.equal(retrieveToolName(sess!), "acp_retrieve", "session gate keeps the base name");
+        const ref = Object.keys(contentStoreOf(sess!).byRef)[0]!;
+        assert.ok(ref, "oversized result stored under a ref");
+
+        // The registered (base-name) tool works through the plugin endpoint...
+        let toolRes = await fetch(`http://127.0.0.1:${rig.proxyPort}/__bili/plugin/tool`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ conversationId: "ccr-e2e-name-conv", tool: "acp_retrieve", args: { ref } }),
+        });
+        let toolJson = JSON.parse(await toolRes.text()) as { ok: boolean; result?: string };
+        assert.ok(toolRes.status === 200 && toolJson.ok === true, `base-name retrieve returned ${toolRes.status}: ${JSON.stringify(toolJson)}`);
+        assert.match(toolJson.result!, new RegExp(`retrieved ${ref}: [\\d,]+ tok`), "base-name retrieve returns the ack receipt");
+
+        // ...while the overridden name is unknown to this session.
+        toolRes = await fetch(`http://127.0.0.1:${rig.proxyPort}/__bili/plugin/tool`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ conversationId: "ccr-e2e-name-conv", tool: "retrieve_original", args: { ref } }),
+        });
+        assert.equal(toolRes.status, 400, "route-level rename must not be executable on the plugin lane");
+
+        // Proxy lane (no plugin header, fresh conversation): the merged block
+        // governs there — per-route renames keep working.
+        const res = await fetch(`http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/chat/completions`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "ccr-e2e-proxy-name" },
+            body: JSON.stringify({ model: MODEL, max_tokens: 64_000, messages: BASE_MSGS() }),
+        });
+        const txt = await res.text();
+        assert.equal(res.status, 200, `proxy lane returned ${res.status}: ${txt}`);
+        assert.equal(rig.forwards.length, 2, "second outbound forward after the proxy turn");
+        const f2 = rig.forwards[1]!;
+        assert.ok(f2.includes("[acp-stored"), "proxy lane arms CCR from the merged config");
+        assert.ok(f2.includes('retrieve_original(\\"'), "proxy-lane placeholder hint uses the route-level rename");
+        assert.ok(!f2.includes(BIG_TEXT), "full original must not leak on the proxy wire");
+    } finally {
+        await closeRig(rig);
+    }
+});
+
+test("e2e #1345 enabled divergence: plugin lane stays ARMED (base governs), proxy lane disarms", async () => {
+    const rig = await startRig("enabled-divergent");
+    try {
+        // Plugin lane: base ccr.enabled=true governs — the route-level
+        // enabled=false must NOT disarm a session whose manifest advertises
+        // acp_retrieve (old behavior forwarded verbatim here: silent loss).
+        await postOpenai(rig, BASE_MSGS(), "ccr-e2e-enabled-conv");
+        assert.equal(rig.forwards.length, 1, "one outbound forward after the plugin turn");
+        const f1 = rig.forwards[0]!;
+        assert.ok(f1.includes("[acp-stored"), "plugin lane stores despite the route-level enabled=false");
+        assert.ok(!f1.includes(BIG_TEXT), "full original must not leak on the plugin wire");
+        const sess = listSessions().find((s) => s.id === "ccr-e2e-enabled-conv");
+        assert.ok(sess && ccrEnabled(sess), "plugin session stays armed from the base config");
+        const ref = Object.keys(contentStoreOf(sess!).byRef)[0]!;
+        assert.ok(ref, "oversized result stored under a ref");
+        const toolRes = await fetch(`http://127.0.0.1:${rig.proxyPort}/__bili/plugin/tool`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ conversationId: "ccr-e2e-enabled-conv", tool: "acp_retrieve", args: { ref } }),
+        });
+        const toolJson = JSON.parse(await toolRes.text()) as { ok: boolean; result?: string };
+        assert.ok(toolRes.status === 200 && toolJson.ok === true, `retrieve returned ${toolRes.status}: ${JSON.stringify(toolJson)}`);
+        assert.match(toolJson.result!, new RegExp(`retrieved ${ref}: [\\d,]+ tok`), "stored content stays reachable on the plugin lane");
+
+        // Proxy lane: the three-level merge still applies — enabled=false wins.
+        const res = await fetch(`http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/chat/completions`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "ccr-e2e-proxy-enabled" },
+            body: JSON.stringify({ model: MODEL, max_tokens: 64_000, messages: BASE_MSGS() }),
+        });
+        const txt = await res.text();
+        assert.equal(res.status, 200, `proxy lane returned ${res.status}: ${txt}`);
+        assert.equal(rig.forwards.length, 2, "second outbound forward after the proxy turn");
+        const f2 = rig.forwards[1]!;
+        assert.ok(f2.includes(BIG_TEXT), "proxy lane honors the route-level enabled=false (verbatim)");
+        assert.ok(!f2.includes("[acp-stored"), "no placeholder on the disarmed proxy lane");
+    } finally {
+        await closeRig(rig);
+    }
+});
+
+const DIV_URL = "https://api.example.com/v1";
+
+test("#1345 findCcrPluginDivergences: per-field report, silent when base disabled", () => {
+    // Base disabled → no plugin session can arm → nothing diverges (#1273
+    // route-scoped-only enablement is intended proxy-lane-only, no warning).
+    assert.deepEqual(findCcrPluginDivergences({ [DIV_URL]: { compress: { ccr: { enabled: true, toolName: "x" } } } }), []);
+    assert.deepEqual(findCcrPluginDivergences({ [DIV_URL]: { compress: { ccr: { enabled: true } } } }, { ccr: { enabled: false } }), []);
+
+    // Base enabled → every divergent field reported per level (field order stable).
+    const routes = {
+        [DIV_URL]: {
+            compress: { ccr: { toolName: "retrieve_original", minToolTokens: 999 } },
+            models: { "m-big": { compress: { ccr: { enabled: false, excludeTools: ["bash"] } } } },
+        },
+    };
+    assert.deepEqual(findCcrPluginDivergences(routes, { ccr: { enabled: true } }), [
+        { level: `provider ${DIV_URL}`, field: "toolName", value: "retrieve_original", effective: "acp_retrieve" },
+        { level: `provider ${DIV_URL}`, field: "minToolTokens", value: 999, effective: 4000 },
+        { level: `provider ${DIV_URL} model m-big`, field: "enabled", value: false, effective: true },
+        { level: `provider ${DIV_URL} model m-big`, field: "excludeTools", value: ["bash"], effective: [] },
+    ]);
+
+    // Equal values are not divergences; unset fields are not reported.
+    assert.deepEqual(findCcrPluginDivergences({ [DIV_URL]: { compress: { ccr: { toolName: "acp_retrieve" } } } }, { ccr: { enabled: true } }), []);
+    // A base-set value is the effective reference, not the kernel default.
+    assert.deepEqual(
+        findCcrPluginDivergences({ [DIV_URL]: { compress: { ccr: { toolName: "other" } } } }, { ccr: { enabled: true, toolName: "mine" } }),
+        [{ level: `provider ${DIV_URL}`, field: "toolName", value: "other", effective: "mine" }],
+    );
+});
+
+test("#1345 load-time diagnostic: one warn per divergent field at config load", () => {
+    const dir = mkdtempSync(path.join(process.env.TMPDIR ?? ".", "bili-1345-"));
+    const cfgPath = path.join(dir, "billion-context.json");
+    writeFileSync(cfgPath, JSON.stringify({
+        providers: {
+            [DIV_URL]: {
+                compress: { ccr: { toolName: "retrieve_original" } },
+                models: { "m-big": { compress: { ccr: { enabled: false } } } },
+            },
+        },
+        compress: { ccr: { enabled: true } },
+    }));
+    const prevCfg = process.env.BILI_CONFIG_FILE;
+    process.env.BILI_CONFIG_FILE = cfgPath;
+    const warns: string[] = [];
+    setLogCapture((level, msg) => { if (level === "warn") warns.push(msg); });
+    try {
+        loadOptions();
+        const hits = warns.filter((w) => w.includes("ccr override ignored in plugin sessions"));
+        assert.equal(hits.length, 2, `expected exactly two divergence warnings, got: ${JSON.stringify(warns)}`);
+        assert.match(hits[0]!, new RegExp(`provider ${DIV_URL.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} ccr\\.toolName="retrieve_original"`));
+        assert.match(hits[0]!, /plugin sessions use "acp_retrieve"/);
+        assert.match(hits[1]!, /model m-big ccr\.enabled=false/);
+        assert.match(hits[1]!, /plugin sessions use true/);
+    } finally {
+        setLogCapture(null);
+        if (prevCfg === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = prevCfg;
+        rmSync(dir, { recursive: true, force: true });
     }
 });

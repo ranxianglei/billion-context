@@ -211,7 +211,7 @@ os.environ["HERMES_HOME"] = os.path.join(BASE, "home")
 for k in ("BILLION_CONTEXT_ATTACH", "BILLION_CONTEXT_PROXY", "BILI_NATIVE_HERMES",
           "BILLION_CONTEXT_PLUGIN", "BILI_PROVIDER_REWRITES",
           "HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy",
-          "ALL_PROXY", "all_proxy", "HERMES_CA_BUNDLE"):
+          "ALL_PROXY", "all_proxy", "HERMES_CA_BUNDLE", "SSL_CERT_FILE"):
     os.environ.pop(k, None)
 
 RECORDED = {"tool": [], "runtime_info": [], "watcher": [], "health": []}
@@ -325,6 +325,8 @@ elif SCENARIO.startswith("attach"):
     ca_file = os.path.join(ca_dir, "root-ca.pem")
     with open(ca_file, "w") as f:
         f.write("dummy-ca\n")
+    with open(os.path.join(ca_dir, "combined-ca.pem"), "w") as f:
+        f.write("dummy-combined-ca\n")
     round1 = mod.on_llm_request(request={"model": "x"}, session_id="s1")
     mod.register(ctx)
     if ctx.middlewares.get("llm_request"):
@@ -362,6 +364,7 @@ out.update({
     "env_https_proxy": os.environ.get("HTTPS_PROXY"),
     "env_https_proxy_lc": os.environ.get("https_proxy"),
     "env_ca_bundle": os.environ.get("HERMES_CA_BUNDLE"),
+    "env_ssl_cert_file": os.environ.get("SSL_CERT_FILE"),
     "marker_left": os.path.exists(os.path.join(os.environ["XDG_STATE_HOME"], "billion-context", "proxy-starting")),
     "tool_calls": RECORDED["tool"],
     "runtime_info": RECORDED["runtime_info"],
@@ -384,6 +387,7 @@ interface DriverOut {
     env_https_proxy?: string | null;
     env_https_proxy_lc?: string | null;
     env_ca_bundle?: string | null;
+    env_ssl_cert_file?: string | null;
     marker_left?: boolean;
     tool_calls: Array<Record<string, unknown>>;
     runtime_info: Array<Record<string, unknown>>;
@@ -434,6 +438,7 @@ describe("python plugin runtime (subprocess)", () => {
         assert.equal(out!.env_https_proxy, out!.origin);
         assert.equal(out!.env_https_proxy_lc, out!.origin);
         assert.match(out!.env_ca_bundle!, /root-ca\.pem$/);
+        assert.match(out!.env_ssl_cert_file!, /combined-ca\.pem$/, "#1375: ambient trust rides the combined bundle");
         const h1 = out!.first_headers!;
         assert.equal(h1["x-bili-plugin"], "hermes");
         assert.equal(h1["x-bili-plugin-conversation"], "sess-1");
@@ -544,6 +549,7 @@ describe("python plugin runtime (subprocess)", () => {
             assert.deepEqual(out!.hooks, []);
             assert.equal(out!.env_https_proxy, null);
             assert.equal(out!.env_ca_bundle, null);
+            assert.equal(out!.env_ssl_cert_file, null);
         });
     }
 

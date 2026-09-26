@@ -58,7 +58,8 @@ function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
 import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, loadClientConfig, collectModelWindows, collectModelMaxOutputs, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, QWEN_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer, readMcodeConfig, resolveMcodeInstallDir, MCODE_DEFAULT_MODEL_HOSTS, type McodeConfig, discoverAiderArgUrls, AIDER_DEFAULT_MODEL_HOSTS, COPILOT_DEFAULT_MODEL_HOSTS, AMP_DEFAULT_MODEL_HOSTS, resolveGooseDirs, readGooseConfig, type GooseConfig, type GooseDirs } from "./client-config.js";
-import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, resolveNativeAttachExternal, type ProviderRoutes } from "./config.js";
+import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, resolveNativeAttachExternal, resolveMitmDomains, type ProviderRoutes } from "./config.js";
+import { discoverMitmDomains } from "./discover.js";
 import { contextFromRegistry } from "./registry.js";
 
 export {
@@ -804,6 +805,7 @@ export function buildPiEnv(
     baseEnv: NodeJS.ProcessEnv,
     httpRewrites: HttpRewrite[] = [],
     httpsRewrites: HttpRewrite[] = [],
+    mitmHosts: string[] = [],
 ): NodeJS.ProcessEnv {
     // #535: provider URL rewrites ride env, not a generated models.json —
     // the bili extension (agent/pi.js) consumes this manifest at load and
@@ -827,6 +829,11 @@ export function buildPiEnv(
         NODE_EXTRA_CA_CERTS: caPath,
         BILLION_CONTEXT_PROXY: origin,
         ...(Object.keys(manifest).length > 0 ? { BILI_PROVIDER_REWRITES: JSON.stringify(manifest) } : {}),
+        // #1403: the extension stamps prompt_cache_key only for destinations on
+        // this list (or /bili/-wrapped URLs) — exactly the hosts the proxy will
+        // MITM-decrypt and strip it from. Blind-tunnel destinations must NOT be
+        // stamped or strict-schema upstreams 400 the foreign field.
+        ...(mitmHosts.length > 0 ? { BILI_MITM_HOSTS: mitmHosts.join(",") } : {}),
     };
 }
 
@@ -3222,6 +3229,19 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     // used to resolve the budget-alignment window, #321).
     const biliRoutes = loadRoutes(process.env);
     const domains = dedupeInOrder([...routes.httpsDomains, ...(params.mitmDomains ?? [])]);
+    // #1403: mirror the proxy's EXACT MITM whitelist (built-in defaults ∪
+    // config-file/BILI_MITM_DOMAINS tier as the spawned child will see it ∪
+    // launcher-discovered domains ∪ dynamic client-config discovery) so the
+    // pi/omp extension stamps prompt_cache_key only for destinations the proxy
+    // will decrypt and strip it from. Blind-tunnel destinations get no stamp —
+    // strict-schema upstreams 400 the foreign top-level field otherwise.
+    const childMitmEnv: NodeJS.ProcessEnv =
+        domains.length > 0
+            ? { BILI_MITM_DOMAINS: domains.join(",") }
+            : { BILI_MITM_DOMAINS: process.env.BILI_MITM_DOMAINS };
+    const extMitmHosts = base === "pi" || base === "omp"
+        ? dedupeInOrder([...DEFAULT_MITM_DOMAINS, ...resolveMitmDomains(childMitmEnv), ...domains, ...discoverMitmDomains(discoveryEnv)])
+        : [];
     const handle = await ensureProxyRunning({ host, port, passthrough, debug, lane: base, mitmDomains: domains, modelWindows: collectModelWindows(config, base), modelMaxOutputs: collectModelMaxOutputs(config, base) }, deps);
     console.error(
         `bili: started proxy at ${handle.origin} (MITM domains: ${domains.length ? domains.join(", ") : "defaults"})` +
@@ -3275,7 +3295,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // at extension load from the env manifest (registerProvider; see
         // buildPiEnv), and the old settings.json compaction-off generation is
         // replaced by the extension's session_before_compact cancel.
-        env = buildPiEnv(origin, ca, stripInheritedProxy(process.env), routes.httpRewrites, routes.httpsRewrites);
+        env = buildPiEnv(origin, ca, stripInheritedProxy(process.env), routes.httpRewrites, routes.httpsRewrites, extMitmHosts);
         // #535: never let a stale inherited overlay redirect (from a legacy
         // launch or a shell exported inside one) leak into the child — pi
         // always runs on its REAL home now.
@@ -3299,7 +3319,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // (the native summarizer would destroy the ACP-tagged context); manual
         // /compact stays user-owned and its surviving summary is archived by
         // the proxy on session_compact. https upstreams ride cert-MITM like pi.
-        env = buildPiEnv(origin, ca, stripInheritedProxy(process.env), routes.httpRewrites);
+        env = buildPiEnv(origin, ca, stripInheritedProxy(process.env), routes.httpRewrites, [], extMitmHosts);
         delete env.PI_CODING_AGENT_DIR;
         const ompExt = selfDistFile("agent/omp.js");
         if (ompExt && fs.existsSync(ompExt) && !ompPluginLoadedFrom(ompRealHome)) {
@@ -3330,14 +3350,20 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // runs on its REAL home — including a user-set HERMES_HOME (discovery
         // resolved the same path, so the MITM whitelist matches). Its httpx
         // stack resolves ONE proxy env var (HTTPS_PROXY first) for both
-        // schemes and trusts custom CAs via HERMES_CA_BUNDLE: https upstreams
-        // ride CONNECT + cert MITM, plain-http upstreams ride absolute-form
-        // forward-proxy requests the server understands. Sessions bind by
-        // persisted content-prefix affinity when no identity carrier is
-        // present (anonymous requests are accepted, #286).
+        // schemes: https upstreams ride CONNECT + cert MITM, plain-http
+        // upstreams ride absolute-form forward-proxy requests the server
+        // understands. CA trust (#1375): current hermes resolves the main
+        // client via agent/ssl_verify.py — platform store + per-provider
+        // ssl_ca_cert, ambient trust only through SSL_CERT_FILE (OpenSSL
+        // replace semantics → the COMBINED bundle keeps blind-tunnelled hosts
+        // validating against public roots, #152). HERMES_CA_BUNDLE stays set
+        // for older builds and hermes' auth flows, which still read it.
+        // Sessions bind by persisted content-prefix affinity when no identity
+        // carrier is present (anonymous requests are accepted, #286).
         env = stripInheritedProxy(process.env);
         env.HTTPS_PROXY = origin;
         env.HERMES_CA_BUNDLE = ca;
+        env.SSL_CERT_FILE = resolveCombinedCaPath(process.env);
         if (routes.httpRewrites.length === 0 && routes.httpsDomains.length === 0) {
             console.error(
                 "bili: no hermes providers found in ~/.hermes/config.yaml — traffic will NOT go through the proxy (configure a provider first).",

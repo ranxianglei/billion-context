@@ -463,7 +463,11 @@ latest; type a full semver for minor/major/prerelease bumps. The workflow:
      since the last release tag); the same notes appear in the job summary as
      a paste-ready block for opening the PR manually. Merging that PR publishes
      via the standard flow; red is reserved for real failures (guard trips,
-     gate failures, or a failed branch push).
+     gate failures, or a failed branch push). `ci.yml` also runs on pushes to
+      release branches, so the required checks go green on the auto-PR's head
+      sha even when the pull_request-triggered runs sit in `action_required`
+      waiting for manual approval (bot-authored PRs can be gated this way) —
+      the auto-PR is immediately mergeable (#772).
 5. Publishes to npm (`latest`, or `dev` for prerelease), tags `v{VERSION}`,
    and creates the GitHub Release with notes generated from `git log` since
    the last tag.

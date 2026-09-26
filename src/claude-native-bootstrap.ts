@@ -123,6 +123,60 @@ export function readPsProcInfo(pid: number, exec: ExecFn = defaultExec): ProcInf
     return { argv: rest.length > 0 ? rest : null, ppid: Number.isFinite(ppid) ? ppid : null };
 }
 
+/** Windows CommandLineToArgvW semantics (#1388): whitespace separates
+ *  tokens, double quotes group (spaces inside stay one token), and
+ *  backslashes escape quotes per the classic 2n/2n+1 rule. Win32_Process
+ *  quotes paths that contain spaces (reporter-verified), so a naive
+ *  whitespace split shreds `"C:\Program Files\\..."` into C:\, Program,
+ *  Files... and the host-argv match below fails. Parsing can only GAIN a
+ *  match the old code lost — never invent one. Exported for tests. */
+export function splitWindowsCommandLine(line: string): string[] {
+    const out: string[] = [];
+    let cur = "";
+    let has = false;
+    let quoted = false;
+    let i = 0;
+    while (i < line.length) {
+        const c = line[i]!;
+        if (c === "\\") {
+            let n = 0;
+            while (line[i + n] === "\\") n++;
+            const next = line[i + n] ?? "";
+            if (next === '"') {
+                cur += "\\".repeat(Math.floor(n / 2));
+                if (n % 2 === 1) cur += '"';
+                i += n % 2 === 1 ? n + 1 : n;
+                has = true;
+                continue;
+            }
+            cur += "\\".repeat(n);
+            i += n;
+            has = true;
+            continue;
+        }
+        if (c === '"') {
+            quoted = !quoted;
+            has = true;
+            i++;
+            continue;
+        }
+        if (!quoted && (c === " " || c === "\t")) {
+            if (has) {
+                out.push(cur);
+                cur = "";
+                has = false;
+            }
+            i++;
+            continue;
+        }
+        cur += c;
+        has = true;
+        i++;
+    }
+    if (has || cur.length > 0) out.push(cur);
+    return out;
+}
+
 /** Windows fallback: one PowerShell call returns "<ppid>\t<CommandLine>"
  *  (ps/wmic are deprecated or absent). CommandLine can be empty for
  *  protected processes — argv null still lets the ppid chain walk on.
@@ -139,11 +193,9 @@ export function readWinProcInfo(pid: number, exec: ExecFn = defaultExec): ProcIn
     const tab = line.indexOf("\t");
     if (tab < 0) return null;
     const ppid = Number(line.slice(0, tab).trim());
-    const argv = line
-        .slice(tab + 1)
-        .trim()
-        .split(/\s+/)
-        .filter((part) => part.length > 0);
+    // #1388: quote-aware tokenize (paths with spaces survive as one token);
+    // trailing \r from PowerShell's CRLF endings is trimmed first.
+    const argv = splitWindowsCommandLine(line.slice(tab + 1).trim().replace(/\r$/, ""));
     return { argv: argv.length > 0 ? argv : null, ppid: Number.isFinite(ppid) ? ppid : null };
 }
 
@@ -155,6 +207,14 @@ function defaultProcReader(): ProcReader {
     return (pid) => readPsProcInfo(pid);
 }
 
+/** Windows keeps the surrounding quotes on a CommandLine token whose path
+ *  needs them (PowerShell Win32_Process.CommandLine, #1377); strip leading/
+ *  trailing quote chars so basename + flag matching sees the bare name. A
+ *  no-op for already-clean inputs (Unix NUL-split /proc argv, macOS ps). */
+function stripQuotes(s: string): string {
+    return s.replace(/^["']+|["']+$/g, "");
+}
+
 /** Is this argv the claude-code session binary? Matches `claude`/`claude.exe`
  *  and `node .../claude...` installs (`@anthropic-ai/claude-code` paths or a
  *  bare `claude` argument). Must NOT match this hook's own script
@@ -164,11 +224,12 @@ function defaultProcReader(): ProcReader {
  *  bottom-up and the REAL claude sits 2 hops up in every session — a closer
  *  match always wins, so a lookalike higher in the tree is unreachable.
  *  Tightening it would instead break real `node ~/bin/claude` launcher
- *  installs. Exported for tests. */
+ *  installs. Basename matching is quote-tolerant (Windows CommandLine keeps
+ *  token quotes — #1377). Exported for tests. */
 export function isClaudeHostArgv(argv: string[]): boolean {
     const base = (p: string): string => {
-        const parts = p.split(/[\\/]/).filter((seg) => seg.length > 0);
-        return parts[parts.length - 1] ?? "";
+        const parts = stripQuotes(p).split(/[\\/]/).filter((seg) => seg.length > 0);
+        return stripQuotes(parts[parts.length - 1] ?? "");
     };
     if (/^claude(\.exe)?$/i.test(base(argv[0] ?? ""))) return true;
     if (/^(node|bun|deno)(\.exe)?$/i.test(base(argv[0] ?? ""))) {
@@ -203,16 +264,16 @@ export function resolveClaudeHostPid(opts: { read?: ProcReader; startPid?: numbe
  *  (claude uses one of these to launch SessionStart hooks on every OS).
  *  Such wrappers exit the moment their command does. Exported for tests. */
 export function isTransientShArgv(argv: string[]): boolean {
-    const parts = (argv[0] ?? "").split(/[\\/]/).filter((seg) => seg.length > 0);
-    const shell = parts[parts.length - 1] ?? "";
+    const parts = stripQuotes(argv[0] ?? "").split(/[\\/]/).filter((seg) => seg.length > 0);
+    const shell = stripQuotes(parts[parts.length - 1] ?? "");
     if (/^(sh|bash|dash|zsh|ksh|ash)(\.exe)?$/i.test(shell)) {
-        return argv.some((arg, i) => i > 0 && /^-[^-]*c$/.test(arg));
+        return argv.some((arg, i) => i > 0 && /^-[^-]*c$/.test(stripQuotes(arg)));
     }
     if (/^cmd(\.exe)?$/i.test(shell)) {
-        return argv.some((arg, i) => i > 0 && /^[-/]c$/i.test(arg));
+        return argv.some((arg, i) => i > 0 && /^[-/]c$/i.test(stripQuotes(arg)));
     }
     if (/^(powershell|pwsh)(\.exe)?$/i.test(shell)) {
-        return argv.some((arg, i) => i > 0 && /^-?(command|encodedcommand)$/i.test(arg));
+        return argv.some((arg, i) => i > 0 && /^-?(command|encodedcommand)$/i.test(stripQuotes(arg)));
     }
     return false;
 }

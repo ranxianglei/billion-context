@@ -70,9 +70,9 @@ import { ACP_TOOLS_OPENAI } from "../compress-tool.js";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, unwrapUpstream, wrapUpstream } from "../launcher.js";
 import { createAcpCommandHooks, showAcpText } from "./opencode-acp-command.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
-import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, readyOrigin, replaceRequestTarget, type LiveOriginResolverDeps, type NativeInterceptState } from "./native-intercept.js";
+import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, replaceRequestTarget, routedBiliModelUrl, type LiveOriginResolverDeps, type NativeInterceptState } from "./native-intercept.js";
 import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2State } from "./opencode-v2.js";
-import { fetchProxyVersion, reportRuntimeInfoOnChange } from "./shared.js";
+import { fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, waitForProxyVersion } from "./shared.js";
 import { callLegacyAcpConfig, isLegacyAcpSession, loadLegacyAcp, type LegacyAcpModule } from "./opencode-legacy.js";
 
 /** Decides whether the native bootstrap should run in this process. */
@@ -111,6 +111,9 @@ export function createNativeRoute(state: NativeInterceptState, deps: OpencodeNat
     return async (e, s) => {
         const url = typeof e.request?.url === "string" ? e.request.url : undefined;
         if (url === undefined) return;
+        // #1365: routed URLs are skipped by isModelApiUrl by design — record
+        // the pinned model channel before that gate so attach recovery can see it.
+        if (routedBiliModelUrl(url) !== undefined) noteRoutedOrigin(state, url);
         if (!isModelApiUrl(url)) return;
 
         const target = await resolveLive();
@@ -153,24 +156,47 @@ export function _setSpawnForTest(fn?: () => Promise<string | undefined>): void {
     _spawnForTest = fn;
 }
 
-/** #1135: the attached origin can go stale — at startup (the owning launcher
- *  exited before this process started) or at runtime (it exits while this
- *  session still rides the shared proxy, #1130). Probe before trusting it:
- *  healthy → keep attaching (a transient blip costs nothing — the session
- *  never migrates); dead → unfreeze the preset env and fall back to spawning
- *  our own proxy (instance discovery may find another healthy one first),
- *  re-arming respawn as a pure spawn for subsequent deaths. Resolves to the
- *  origin the client should use — attachOrigin, the fallback origin, or
- *  undefined when even the fallback failed. */
+/** #1135/#1365: the attached origin can go stale — at startup (the owning
+ *  launcher exited before this process started) or at runtime (it exits while
+ *  this session still rides the shared proxy, #1130). Probe before trusting
+ *  it: healthy → keep attaching (a transient blip costs nothing — the session
+ *  never migrates). DEAD + routed-channel evidence (#1365: /bili/-baked model
+ *  traffic was observed at some origin) → the session's context lives at THAT
+ *  origin, so wait for the pinned target to come back (bounded by
+ *  BILI_ATTACH_HEALTH_DEADLINE_MS) instead of spawning — a second instance
+ *  would serve tools while the model channel stays pinned elsewhere and every
+ *  bili tool call 404s against it (unrecoverable split); the env is preserved
+ *  so the user's target stays declared. DEAD with no evidence after the grace
+ *  window (BILI_ATTACH_EVIDENCE_GRACE_MS) → unfreeze the preset env and fall
+ *  back to spawning our own proxy (instance discovery may find another
+ *  healthy one first), re-arming respawn as a pure spawn for subsequent
+ *  deaths. Resolves to the origin the client should use — the (recovered)
+ *  attach origin, the fallback origin, or undefined when nothing came up. */
 export async function verifyAttachAndRecover(attachOrigin: string): Promise<string | undefined> {
-    const version = await fetchProxyVersion(attachOrigin).catch(() => undefined);
+    // #1365: routed evidence outranks the planned origin — probe where the
+    // model channel actually points, not where the env says it should.
+    const home = state.routedOrigin ?? attachOrigin;
+    const version = await fetchProxyVersion(home).catch(() => undefined);
     if (version !== undefined) {
         // Restore the readyOrigin short-circuit — a runtime recovery clears
         // state.origin before re-probing, and a transient blip must not leave
         // it dangling.
-        state.origin = attachOrigin;
-        process.env.BILLION_CONTEXT_PROXY = attachOrigin;
-        return attachOrigin;
+        state.origin = home;
+        process.env.BILLION_CONTEXT_PROXY = home;
+        return home;
+    }
+    const pinned = state.routedOrigin ?? (await observeRoutedOrigin(state));
+    if (pinned !== undefined) {
+        const back = await waitForProxyVersion(pinned);
+        if (back !== undefined) {
+            state.origin = back;
+            process.env.BILLION_CONTEXT_PROXY = back;
+            console.log(`bili-native-opencode: attach target ${pinned} is healthy again — attached, no second instance spawned`);
+            return back;
+        }
+        console.error(`bili-native-opencode: attach target ${pinned} is down and this process's model channel is pinned to it — refusing to spawn a second instance (bili tools would 404 against the other one). Start your proxy at ${pinned} or unset BILLION_CONTEXT_PROXY; bili keeps re-checking and self-heals when it comes back.`);
+        state.origin = undefined;
+        return undefined;
     }
     console.error(`bili-native-opencode: attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`);
     delete process.env.BILLION_CONTEXT_PROXY;
@@ -218,6 +244,19 @@ export function armNativeOpencode(p: typeof plan): void {
             state.onGiveUp = () => {
                 delete process.env.BILLION_CONTEXT_PROXY;
             };
+            // #1365: late routed evidence — if model traffic later arrives baked
+            // against a DIFFERENT origin than the one we attached to, rebind there
+            // (the context lives where the models go). Fire-and-forget with a
+            // liveness check: only converge on a target we can actually reach.
+            state.onRoutedOriginObserved = (origin) => {
+                if (state.origin === origin) return;
+                void fetchProxyVersion(origin).catch(() => undefined).then((version) => {
+                    if (version === undefined || state.origin === origin) return;
+                    state.origin = origin;
+                    process.env.BILLION_CONTEXT_PROXY = origin;
+                    console.warn(`bili-native-opencode: model channel pinned to ${origin} — rebinding bili tools there`);
+                });
+            };
             state.ready = start();
         } else {
             state.ready = Promise.resolve(undefined);
@@ -239,11 +278,18 @@ export function _stateRespawnForTest(): (() => Promise<string | undefined>) | un
     return state.respawn;
 }
 
+/** Test hook (#1365): record routed-channel evidence without the fetch patch. */
+export function _noteRoutedForTest(url: string): void {
+    noteRoutedOrigin(state, url);
+}
+
 /** Test hook: reset the module-level state in place (closures capture the
  *  object reference) so suites can drive armNativeOpencode repeatedly. */
 export function _resetNativeStateForTest(): void {
     state.attach = undefined;
     state.origin = undefined;
+    state.routedOrigin = undefined;
+    state.onRoutedOriginObserved = undefined;
     state.respawn = undefined;
     state.onGiveUp = undefined;
     state.ready = Promise.resolve(undefined);
@@ -430,6 +476,9 @@ export interface V1NativeDeps {
     legacy?: LegacyAcpModule;
     /** Legacy-session predicate (tests inject; runtime = state file exists). */
     isLegacy?: (sessionId: string | undefined) => boolean;
+    /** Derived-report retry cooldown after a failed register (tests inject a
+     *  short window; runtime default 10s, same order as pi's RETRY_INTERVAL). */
+    derivedRetryMs?: number;
     log?: (msg: string) => void;
 }
 
@@ -458,6 +507,40 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
     const log = deps.log ?? ((msg: string) => console.log(msg));
     let windows = new Map<string, number>();
     let outputs = new Map<string, number>();
+    // #1362: derived-session inheritance for the V1 lane (same register
+    // channel as pi/omp, #1333). opencode mints a fresh session id per
+    // persona/subagent (#1102); a child's SDK session info declares its
+    // parent (session.get → data.parentID). Report each derived session once
+    // so the proxy records a read-only parent link (decompress/search_context
+    // fall back to the parent chain — no state is copied). Fire-and-forget
+    // with a per-sid cooldown after failure: a missed report degrades to "no
+    // inheritance", never to a broken request; root sessions send nothing.
+    const derivedReported = new Map<string, "pending" | "done" | "none">();
+    const derivedRetryAt = new Map<string, number>();
+    const derivedRetryMs = deps.derivedRetryMs ?? 10000;
+    const maybeReportDerived = (base: string, sid: string): void => {
+        const get = ctx.client?.session?.get;
+        if (!sid || typeof get !== "function") return;
+        if (derivedReported.has(sid)) return;
+        const retryAt = derivedRetryAt.get(sid);
+        if (retryAt !== undefined && Date.now() < retryAt) return;
+        derivedReported.set(sid, "pending");
+        void (async () => {
+            try {
+                const res = await get({ path: { id: sid } });
+                const parent = res?.data?.parentID;
+                if (typeof parent === "string" && parent.length > 0 && parent !== sid) {
+                    await postIdentityRegister(base, sid, "opencode", parent);
+                    derivedReported.set(sid, "done");
+                } else {
+                    derivedReported.set(sid, "none");
+                }
+            } catch {
+                derivedReported.delete(sid);
+                derivedRetryAt.set(sid, Date.now() + derivedRetryMs);
+            }
+        })();
+    };
     const hooks: V1Hooks = {
         config: async (cfg) => {
             if (legacy?.configHook !== undefined) {
@@ -547,6 +630,7 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
                 output.headers["x-bili-plugin-model"] = model.id;
                 reportRuntimeInfoOnChange(base, { agent: "opencode", model: model.id, contextWindow: w, maxOutput: o, source: "client-config" });
             }
+            maybeReportDerived(base, input.sessionID);
         };
         const forward = deps.forward ?? ((o, conversationId, tool, args) => import("./shared.js").then((m) => m.forwardTool(o, conversationId, tool, args)));
         if (legacy !== undefined) {

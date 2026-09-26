@@ -71,7 +71,10 @@ test("preflight skips fully covered raw chunks and relaxes unusable normal range
     assert.ok(summaries.every((content) => content.length <= Math.floor(272000 * 0.6) * 4), "each summary input obeys the chunk budget");
     assert.ok(summaries.every((content) => !content.includes("HIDDEN_RAW")), "covered raw chunks must not be resummarized by raw ref");
     assert.ok(logs.some((message) => message.includes("relaxing soft protection")));
-    assert.ok(logs.every((message) => !message.includes("already covered")));
+    // #1372: the already-covered skip must leave a diagnosable trace carrying
+    // the kernel's verdict (previously silent; the behavioral guarantee that
+    // covered raw is never re-summarized is the HIDDEN_RAW check above).
+    assert.ok(logs.some((message) => message.includes("preview rejected") && message.includes("already covered")), logs.join("\n"));
 });
 
 test("preflight keeps hard-protected tools excluded after unusable normal ranges", async () => {

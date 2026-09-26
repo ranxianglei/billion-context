@@ -5,7 +5,12 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, _resetRegisterForTest, _setSpawnForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest } from "../src/agent/dsh-native.ts";
+import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, _resetRegisterForTest, _setSpawnForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _noteRoutedForTest, _resetRoutedForTest } from "../src/agent/dsh-native.ts";
+
+// #1365: legacy dead-attach suites must not pay the 5s routed-evidence grace
+// default (waitFor below caps at 5s — a full grace would race it). Pinned-path
+// tests override per-test.
+process.env.BILI_ATTACH_EVIDENCE_GRACE_MS = "30";
 
 import { dshNativeInstalled, isNpmInstallForm, pluginInstall, pluginRemove, pluginStatusAll, selfPackageRoot } from "../src/plugin-install.ts";
 import { DSH_PATCH_BEGIN, DSH_PATCH_END, dshBundleInstalled, dshProfileDirs, planDshSpawn, stripDshManagedPatch, stripLegacyManagedBlock, _setDshRunnersForTest, type DshPlan } from "../src/dsh-channel.ts";
@@ -331,7 +336,7 @@ test("dshProfileDirs: skips node_modules, errors when profiles root is absent", 
 
 type MockTool = { name: string; description?: string; inputSchema: unknown };
 
-function startMockProxy(toolCalls: Array<{ conversationId: string; tool: string; args: unknown }>, statusResponder?: (url: string) => unknown | undefined): Promise<{ origin: string; close: () => void }> {
+function mockBiliHandler(toolCalls: Array<{ conversationId: string; tool: string; args: unknown }>, statusResponder?: (url: string) => unknown | undefined): (req: http.IncomingMessage, res: http.ServerResponse) => void {
     const manifestTools: MockTool[] = [
         {
             name: "compress",
@@ -339,7 +344,7 @@ function startMockProxy(toolCalls: Array<{ conversationId: string; tool: string;
             inputSchema: { type: "object", properties: { summary: { type: "string" }, range: { type: "string" } }, required: ["summary"] },
         },
     ];
-    const server = http.createServer((req, res) => {
+    return (req, res) => {
         const url = req.url ?? "";
         if (url === "/__bili/plugin/manifest") {
             res.writeHead(200, { "content-type": "application/json" });
@@ -370,13 +375,27 @@ function startMockProxy(toolCalls: Array<{ conversationId: string; tool: string;
         }
         res.writeHead(404);
         res.end("{}");
-    });
+    };
+}
+
+function startMockProxy(toolCalls: Array<{ conversationId: string; tool: string; args: unknown }>, statusResponder?: (url: string) => unknown | undefined): Promise<{ origin: string; close: () => void }> {
+    const server = http.createServer(mockBiliHandler(toolCalls, statusResponder));
     return new Promise((resolve) => {
         server.listen(0, "127.0.0.1", () => {
             const addr = server.address() as { port: number };
             resolve({ origin: `http://127.0.0.1:${addr.port}`, close: () => server.close() });
         });
     });
+}
+
+/** #1365: a loopback port with nothing listening — connection refused until
+ *  the caller binds it, modelling a transiently unreachable attach target. */
+async function reserveLoopbackPort(): Promise<number> {
+    const probe = http.createServer();
+    await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", () => resolve()));
+    const port = (probe.address() as { port: number }).port;
+    await new Promise<void>((resolve) => probe.close(() => resolve()));
+    return port;
 }
 
 type RegisteredTool = {
@@ -1098,6 +1117,189 @@ test("#1130 apply() attach mode: runtime death of the shared proxy re-probes and
         fallback.close();
 
         fs.rmSync(home, { recursive: true, force: true });
+        _resetRegisterForTest(undefined);
+    }
+});
+
+// — #1365: pinned model channel — never spawn over a statically-routed target —
+
+const R1365_UPSTREAM = "https://api.deepseek.com/v1/chat/completions";
+
+test("#1365 apply() attach mode: routed evidence pins the channel — a transiently dead target is waited on, never replaced by a spawn", async () => {
+    const toolCalls: Array<{ conversationId: string; tool: string; args: unknown }> = [];
+    const port = await reserveLoopbackPort();
+    const origin = `http://127.0.0.1:${port}`;
+    const server = http.createServer(mockBiliHandler(toolCalls));
+    let spawnCalls = 0;
+    _setSpawnForTest(async () => {
+        spawnCalls += 1;
+        return "http://127.0.0.1:2";
+    });
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1365a-"));
+    let upTimer: NodeJS.Timeout | undefined;
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: origin }, async () => {
+            _resetRegisterForTest(origin);
+            const ctx = mockCtx();
+            apply(ctx);
+            // the settings overlay baked this origin into the provider baseURL —
+            // routed model traffic proves the channel is pinned to it
+            _noteRoutedForTest(`${origin}/bili/${R1365_UPSTREAM}`);
+            const up = new Promise<void>((resolve) => {
+                upTimer = setTimeout(() => server.listen(port, "127.0.0.1", () => resolve()), 120);
+            });
+            await waitFor(() => ctx.registeredTools.length === 1, "attach-after-recovery tool registration");
+            clearTimeout(upTimer);
+            await up;
+            assert.equal(spawnCalls, 0, "no second instance may be spawned over a pinned channel");
+            assert.equal(process.env.BILLION_CONTEXT_PROXY, origin, "the user's target stays frozen");
+            const out = await ctx.registeredTools[0].execute({ summary: "s" }, { agent: { session: { id: "s1365a" } } });
+            assert.equal(out, "compressed 42 tokens");
+            assert.deepEqual(toolCalls, [{ conversationId: "s1365a", tool: "compress", args: { summary: "s" } }]);
+        });
+    } finally {
+        clearTimeout(upTimer);
+        server.close();
+        _setSpawnForTest(undefined);
+        fs.rmSync(home, { recursive: true, force: true });
+        _resetRoutedForTest();
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("#1365 apply() attach mode: routed evidence + persistently dead target — refuses to spawn, keeps the env, self-heals when the target returns", async () => {
+    const toolCalls: Array<{ conversationId: string; tool: string; args: unknown }> = [];
+    const port = await reserveLoopbackPort();
+    const origin = `http://127.0.0.1:${port}`;
+    const server = http.createServer(mockBiliHandler(toolCalls));
+    let spawnCalls = 0;
+    _setSpawnForTest(async () => {
+        spawnCalls += 1;
+        return "http://127.0.0.1:2";
+    });
+    const errors: string[] = [];
+    const origErr = console.error;
+    console.error = (...args: unknown[]) => {
+        errors.push(args.map(String).join(" "));
+    };
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1365b-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: origin, BILI_ATTACH_HEALTH_DEADLINE_MS: "150" }, async () => {
+            _resetRegisterForTest(origin);
+            const ctx = mockCtx();
+            apply(ctx);
+            _noteRoutedForTest(`${origin}/bili/${R1365_UPSTREAM}`);
+            const t0 = Date.now();
+            while (!errors.some((l) => l.includes("refusing to spawn a second instance"))) {
+                if (Date.now() - t0 > 5000) throw new Error("timed out waiting for the loud refusal");
+                await new Promise((r) => setTimeout(r, 10));
+            }
+            assert.equal(spawnCalls, 0);
+            assert.equal(process.env.BILLION_CONTEXT_PROXY, origin, "the pinned target env must survive");
+            assert.equal(ctx.registeredTools.length, 0);
+            // the external manager restarts the proxy → the next model request re-probes and self-heals
+            await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", () => resolve()));
+            const headersFor = _stateHeadersForTest();
+            assert.ok(headersFor !== undefined, "headersFor installed");
+            headersFor("https://api.anthropic.com/v1/messages");
+            await waitFor(() => ctx.registeredTools.length === 1, "self-healed tool registration");
+            const out = await ctx.registeredTools[0].execute({ summary: "s" }, { agent: { session: { id: "s1365b" } } });
+            assert.equal(out, "compressed 42 tokens");
+            assert.deepEqual(toolCalls, [{ conversationId: "s1365b", tool: "compress", args: { summary: "s" } }]);
+            assert.equal(spawnCalls, 0, "self-heal re-attaches — it never spawns");
+        });
+    } finally {
+        console.error = origErr;
+        server.close();
+        _setSpawnForTest(undefined);
+        fs.rmSync(home, { recursive: true, force: true });
+        _resetRoutedForTest();
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("#1365 apply() attach mode: late routed evidence rebinds the bili tools to where the models actually go", async () => {
+    const aCalls: Array<{ conversationId: string; tool: string; args: unknown }> = [];
+    const bCalls: Array<{ conversationId: string; tool: string; args: unknown }> = [];
+    const a = await startMockProxy(aCalls, () => ({ panel: "PANEL-A" }));
+    const b = await startMockProxy(bCalls, () => ({ panel: "PANEL-B" }));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1365c-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: a.origin }, async () => {
+            _resetRegisterForTest(a.origin);
+            const ctx = mockCtx();
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "initial attach tool registration");
+            const before = await ctx.registeredCommands[0].handler();
+            assert.ok(before.text.includes("PANEL-A"), "status reads go to the attached origin first");
+            // another launcher's overlay won the race: models are baked against B
+            _noteRoutedForTest(`${b.origin}/bili/${R1365_UPSTREAM}`);
+            const t0 = Date.now();
+            for (;;) {
+                const st = await ctx.registeredCommands[0].handler();
+                if (st.text.includes("PANEL-B")) break;
+                if (Date.now() - t0 > 4000) throw new Error("timed out waiting for the tool-channel rebind");
+                await new Promise((r) => setTimeout(r, 10));
+            }
+            const out = await ctx.registeredTools[0].execute({ summary: "s" }, { agent: { session: { id: "s1365c" } } });
+            assert.equal(out, "compressed 42 tokens");
+            assert.deepEqual(bCalls, [{ conversationId: "s1365c", tool: "compress", args: { summary: "s" } }]);
+            assert.deepEqual(aCalls, []);
+        });
+    } finally {
+        a.close();
+        b.close();
+        fs.rmSync(home, { recursive: true, force: true });
+        _resetRoutedForTest();
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("#1365 apply() attach mode: runtime death with routed evidence — waits the target back, never migrates", async () => {
+    const toolCalls: Array<{ conversationId: string; tool: string; args: unknown }> = [];
+    const port = await reserveLoopbackPort();
+    const origin = `http://127.0.0.1:${port}`;
+    const server = http.createServer(mockBiliHandler(toolCalls));
+    await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", () => resolve()));
+    let spawnCalls = 0;
+    _setSpawnForTest(async () => {
+        spawnCalls += 1;
+        return "http://127.0.0.1:2";
+    });
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1365d-"));
+    let upTimer: NodeJS.Timeout | undefined;
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: origin }, async () => {
+            _resetRegisterForTest(origin);
+            const ctx = mockCtx();
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "attach tool registration");
+            const respawn = _stateRespawnForTest();
+            assert.ok(respawn !== undefined, "attach mode armed state.respawn");
+            // the external manager restarts the proxy: hard down, then back on the same port
+            server.closeAllConnections();
+            await new Promise<void>((resolve) => server.close(() => resolve()));
+            _noteRoutedForTest(`${origin}/bili/${R1365_UPSTREAM}`);
+            const recoveredPromise = respawn();
+            const up = new Promise<void>((resolve) => {
+                upTimer = setTimeout(() => server.listen(port, "127.0.0.1", () => resolve()), 100);
+            });
+            const recovered = await recoveredPromise;
+            clearTimeout(upTimer);
+            await up;
+            assert.equal(recovered, origin, "recovery lands back on the pinned origin");
+            assert.equal(spawnCalls, 0);
+            assert.equal(process.env.BILLION_CONTEXT_PROXY, origin);
+            const out = await ctx.registeredTools[0].execute({ summary: "s" }, { agent: { session: { id: "s1365d" } } });
+            assert.equal(out, "compressed 42 tokens");
+            assert.deepEqual(toolCalls, [{ conversationId: "s1365d", tool: "compress", args: { summary: "s" } }]);
+        });
+    } finally {
+        clearTimeout(upTimer);
+        server.close();
+        _setSpawnForTest(undefined);
+        fs.rmSync(home, { recursive: true, force: true });
+        _resetRoutedForTest();
         _resetRegisterForTest(undefined);
     }
 });

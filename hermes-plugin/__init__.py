@@ -4,8 +4,8 @@ Installed by ``bili plugin install hermes`` — a plain ``hermes`` session then 
 billion-context client with no launcher, no env vars and no fixed port:
 
 * spawns its own bili proxy on an ephemeral port (or attaches to a healthy one) and routes
-  model traffic through it via ``HTTPS_PROXY`` + ``HERMES_CA_BUNDLE`` — the same wire path
-  the ``bili hermes`` launcher uses (CONNECT + certificate MITM);
+  model traffic through it via ``HTTPS_PROXY`` + ``SSL_CERT_FILE`` (combined CA bundle) —
+  the same wire path the ``bili hermes`` launcher uses (CONNECT + certificate MITM);
 * registers the proxy's ACP tools (compress / decompress / acp_status) as native Hermes tools;
 * stamps plugin-mode headers on every LLM request once the tools are ready — round 1 rides
   wire mode so strict backends see a clean head;
@@ -526,9 +526,17 @@ def apply_env(origin: str) -> None:
     the same pair `bili hermes` sets for the launched process."""
     os.environ["HTTPS_PROXY"] = origin
     os.environ["https_proxy"] = origin
-    ca = data_dir() / "ca" / "root-ca.pem"
-    if ca.is_file():
-        os.environ["HERMES_CA_BUNDLE"] = str(ca)
+    ca_dir = data_dir() / "ca"
+    root = ca_dir / "root-ca.pem"
+    if root.is_file():
+        os.environ["HERMES_CA_BUNDLE"] = str(root)
+    combined = ca_dir / "combined-ca.pem"
+    if combined.is_file():
+        # Current hermes' main client ignores HERMES_CA_BUNDLE (agent/ssl_verify.py: platform
+        # store + per-provider ssl_ca_cert); ambient trust rides SSL_CERT_FILE — OpenSSL
+        # REPLACE semantics, so it must be the COMBINED bundle (MITM root + public roots) to
+        # keep blind-tunnelled hosts validating (#1375).
+        os.environ["SSL_CERT_FILE"] = str(combined)
     _state["env_applied"] = True
 
 

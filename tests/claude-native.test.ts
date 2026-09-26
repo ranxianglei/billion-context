@@ -24,7 +24,7 @@ import {
     stripClaudeManagedBlock,
 } from "../src/plugin-install.ts";
 import { CLAUDE_NATIVE_DEFAULT_PORT, clearClaudeNativePort, resolveClaudeNativePort, resolveNativeAttachExternal, saveClaudeNativePort } from "../src/config.ts";
-import { chooseWatchdogParentPid, isClaudeHostArgv, isTransientShArgv, planClaudeNativeBootstrap, readPsProcInfo, readWinProcInfo, resolveClaudeHostPid } from "../src/claude-native-bootstrap.ts";
+import { chooseWatchdogParentPid, isClaudeHostArgv, isTransientShArgv, planClaudeNativeBootstrap, readPsProcInfo, readWinProcInfo, resolveClaudeHostPid, splitWindowsCommandLine } from "../src/claude-native-bootstrap.ts";
 
 // #1248: the live tests below spawn real proxies/processes and observe real
 // /proc, ps output and network ports. On loaded shared machines (multi-agent
@@ -78,15 +78,32 @@ test("applyClaudeManagedBlock: never clobbers foreign keys", () => {
     assert.ok(notes.some((n) => n.includes("foreign value") || n.includes("left untouched")));
 });
 
-test("applyClaudeManagedBlock: preserves user SessionStart entries", () => {
+test("applyClaudeManagedBlock: preserves user SessionStart entries, refreshes ours", () => {
     const userEntry = { matcher: "startup", hooks: [{ type: "command", command: "echo hi" }] };
     const first = applyClaudeManagedBlock({ hooks: { SessionStart: [userEntry] } }, { baseUrl: baseUrlForPort(48787), hookCommand: HOOK_COMMAND });
     const entries = (first.data.hooks as Record<string, unknown[]>).SessionStart;
     assert.equal(entries.length, 2);
     assert.deepEqual(entries[0], userEntry);
     const again = applyClaudeManagedBlock(first.data, { baseUrl: baseUrlForPort(48787), hookCommand: "/moved/dist/claude-native-bootstrap.js" });
-    assert.equal((again.data.hooks as Record<string, unknown[]>).SessionStart.length, 2, "old-path entry still counts as ours");
-    assert.equal(again.notes.length, 0);
+    const after = (again.data.hooks as Record<string, unknown[]>).SessionStart;
+    assert.equal(after.length, 2, "old-path entry still counts as ours — no duplicate appended");
+    assert.deepEqual(after[0], userEntry, "user entry untouched");
+    assert.deepEqual((after[1] as { hooks: Array<{ command: string }> }).hooks, [{ type: "command", command: "/moved/dist/claude-native-bootstrap.js" }]);
+    assert.equal(again.notes.length, 1);
+});
+
+test("applyClaudeManagedBlock: rewrites a stale hook command in place (#1376)", () => {
+    // 0.1.153 on Windows wrote a backslash path plus JSON.stringify quotes;
+    // PowerShell mangles that, so the proxy never starts and every session
+    // hangs with nothing in the log. Reinstalling after the fix has to repair
+    // the settings file the old release left behind.
+    const stale = { hooks: [{ type: "command", command: 'D:\\Dev\\node\\node.exe "D:\\bili\\dist\\claude-native-bootstrap.js"' }] };
+    const current = "D:/Dev/node/node.exe D:/bili/dist/claude-native-bootstrap.js";
+    const { data, notes } = applyClaudeManagedBlock({ hooks: { SessionStart: [stale] } }, { baseUrl: baseUrlForPort(48787), hookCommand: current });
+    const entries = (data.hooks as Record<string, unknown[]>).SessionStart;
+    assert.equal(entries.length, 1);
+    assert.deepEqual((entries[0] as { hooks: Array<{ command: string }> }).hooks, [{ type: "command", command: current }]);
+    assert.ok(notes.some((n) => n.includes("refreshed")));
 });
 
 test("stripClaudeManagedBlock: round-trip removes ours, keeps user keys", () => {
@@ -396,6 +413,45 @@ test("readWinProcInfo: parses '<ppid>\\t<commandline>', degrades to null", () =>
     assert.equal(readWinProcInfo(300, fakePs1("")), null);
     assert.equal(readWinProcInfo(300, fakePs1("Get-CimInstance : object not found\n")), null);
     assert.equal(readWinProcInfo(300, fakePs1(null)), null);
+});
+
+// #1388: Win32_Process quotes CommandLines whose paths contain spaces; a
+// naive whitespace split shreds the host path and the watchdog match fails.
+test("readWinProcInfo: quoted host path with spaces survives as one token (#1388)", () => {
+    const fakePs1 = (out: string | null) => (_cmd: string, _args: string[]): string | null => out;
+    // Reporter-verified shape: "C:\Program Files\...\opencode.exe" --flag hello world
+    assert.deepEqual(
+        readWinProcInfo(300, fakePs1('300\t"C:\\Program Files\\Apps\\opencode\\opencode.exe" --flag hello world\r\n')),
+        { argv: ["C:\\Program Files\\Apps\\opencode\\opencode.exe", "--flag", "hello", "world"], ppid: 300 },
+    );
+    // Quotes around a space-free path (what #1381's stripQuotes handled at the
+    // matching side) must parse identically.
+    assert.deepEqual(
+        readWinProcInfo(300, fakePs1('300\t"C:\\n.exe" C:\\x\\claude.exe\r\n')),
+        { argv: ["C:\\n.exe", "C:\\x\\claude.exe"], ppid: 300 },
+    );
+});
+
+// CommandLineToArgvW semantics: grouping quotes + the 2n/2n+1 backslash rule.
+test("splitWindowsCommandLine: quotes group, backslashes escape (#1388)", () => {
+    // Backslash rules: literal before a space/end-of-line; 2n-before-quote
+    // collapses to n and the quote toggles grouping; 2n+1-before-quote
+    // collapses to n plus a literal quote. String.raw keeps the counted
+    // characters visible.
+    assert.deepEqual(splitWindowsCommandLine(String.raw`a\\ b`), [String.raw`a\\`, "b"]);
+    assert.deepEqual(splitWindowsCommandLine(String.raw`a\" b`), ['a"', "b"]);
+    assert.deepEqual(splitWindowsCommandLine(String.raw`a\\\\`), [String.raw`a\\\\`]);
+    // Empty quoted segment is a real token ("" arg).
+    assert.deepEqual(splitWindowsCommandLine('"" x'), ["", "x"]);
+    // Tokens are unquoted; inner spaces survive inside quotes.
+    assert.deepEqual(splitWindowsCommandLine('"two words" x'), ["two words", "x"]);
+    // Conservation: re-joining with quotes around space-bearing tokens
+    // reproduces the original shell meaning (no token lost or invented).
+    const line = '"C:\\Program Files\\o\\o.exe" --flag "two words"';
+    const argv = splitWindowsCommandLine(line);
+    assert.equal(argv.length, 3);
+    assert.equal(argv[0], "C:\\Program Files\\o\\o.exe");
+    assert.equal(argv[2], "two words");
 });
 
 test("resolveClaudeHostPid: full walk over a ps-backed table", () => {

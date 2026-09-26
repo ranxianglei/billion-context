@@ -5,6 +5,8 @@
 // source of truth), (3) forwards tool executes, (4) reads status. Same
 // package as the proxy ⇒ same version ⇒ no kernel-skew bug class.
 
+import { envMillis } from "./native-bootstrap.js";
+
 export type ManifestTool = {
     name: string;
     description?: string;
@@ -14,6 +16,8 @@ export type ManifestTool = {
 const MANIFEST_TIMEOUT_MS = 5000;
 const TOOL_TIMEOUT_MS = 60000;
 const STATUS_TIMEOUT_MS = 5000;
+const ATTACH_HEALTH_DEADLINE_MS = 15000;
+const ATTACH_HEALTH_POLL_MS = 250;
 
 /** Detect the proxy from a provider baseUrl's `/bili/` zero-config prefix.
  *  The real prefix embeds the full upstream URL (`/bili/https://…`), so the
@@ -51,6 +55,47 @@ export function proxyBaseFromEnv(): string | undefined {
 export function detectProxyBase(baseUrl: string | undefined): string | undefined {
     if (process.env.BILLION_CONTEXT_PLUGIN === "0") return undefined;
     return proxyBaseFromUrl(baseUrl) ?? proxyBaseFromEnv();
+}
+
+// #1403: the launcher exports the proxy's MITM whitelist here so the extension
+// can tell which destinations the proxy will actually decrypt. Without it the
+// extension cannot distinguish "proxy will see this request" from "blind
+// tunnel — the field I inject reaches the upstream verbatim".
+export function mitmHostsFromEnv(env: NodeJS.ProcessEnv = process.env): Set<string> {
+    const out = new Set<string>();
+    for (const raw of env.BILI_MITM_HOSTS?.split(",") ?? []) {
+        const host = raw.trim().toLowerCase();
+        if (host.length > 0) out.add(host);
+    }
+    return out;
+}
+
+/** True iff requests to baseUrl will be SEEN by the bili proxy (and thus its
+ *  stamped prompt_cache_key consumed + stripped): a /bili/-wrapped URL, the
+ *  BILLION_CONTEXT_PROXY origin itself, or a host on the exported MITM
+ *  whitelist. Anything else rides a blind tunnel (or no proxy at all), where
+ *  the stamp is pure noise that strict-schema upstreams reject (#1403). */
+export function destinationRoutedThroughProxy(baseUrl: string | undefined): boolean {
+    if (!baseUrl) return false;
+    const viaBiliPath = proxyBaseFromUrl(baseUrl) !== undefined;
+    if (viaBiliPath) return true;
+    let origin: string | undefined;
+    let host: string;
+    try {
+        const url = new URL(baseUrl);
+        if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+        origin = `${url.protocol}//${url.host}`;
+        host = url.hostname.toLowerCase();
+    } catch {
+        return false;
+    }
+    if (origin === proxyBaseFromEnv()) return true;
+    const mitmHosts = mitmHostsFromEnv();
+    if (mitmHosts.size === 0) return false;
+    for (const d of mitmHosts) {
+        if (host === d || host.endsWith(`.${d}`)) return true;
+    }
+    return false;
 }
 
 async function fetchJson(url: string, init: RequestInit | undefined, timeoutMs: number, externalSignal?: AbortSignal): Promise<{ ok: boolean; status: number; json: unknown }> {
@@ -112,6 +157,23 @@ export async function reportCompactionBoundary(proxyBase: string, conversationId
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ conversationId }),
     }, COMPACT_TIMEOUT_MS);
+}
+
+/** Identity register (#162/#1333/#1362): tell the proxy which conversation
+ *  this host session is (identity: true), optionally declaring the
+ *  conversation it was derived from (parentConversationId). The proxy binds
+ *  any request carrying that id into plugin mode and records a read-only
+ *  parent link for derived sessions (decompress/search_context fall back to
+ *  the parent chain — no state is copied). Throws on non-ok so callers can
+ *  retry with their own throttle. */
+export async function postIdentityRegister(proxyBase: string, conversationId: string, agent: string, parentConversationId?: string): Promise<void> {
+    const res = await fetch(`${proxyBase}/__bili/plugin/register`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ conversationId, agent, identity: true, ...(parentConversationId ? { parentConversationId } : {}) }),
+        signal: AbortSignal.timeout(COMPACT_TIMEOUT_MS),
+    });
+    if (!res.ok) throw new Error(`register HTTP ${res.status}`);
 }
 
 export type RuntimeInfoReport = {
@@ -193,6 +255,23 @@ export async function fetchProxyVersion(proxyBase: string): Promise<string | und
     if (!ok || !json || typeof json !== "object") return undefined;
     const version = (json as { version?: unknown }).version;
     return typeof version === "string" && version.length > 0 ? version : undefined;
+}
+
+/** #1365: poll the attach liveness probe until it answers or the deadline
+ *  passes. Returns the origin when it is (or comes back) healthy, undefined
+ *  on timeout — callers must fail LOUDLY then, never spawn a replacement the
+ *  pinned model channel cannot follow. BILI_ATTACH_HEALTH_DEADLINE_MS keeps
+ *  slow lifeline restarts from tripping a hard-coded bound; unset = default. */
+export async function waitForProxyVersion(proxyBase: string): Promise<string | undefined> {
+    const limit = envMillis(process.env, "BILI_ATTACH_HEALTH_DEADLINE_MS", ATTACH_HEALTH_DEADLINE_MS);
+    const startedAt = Date.now();
+    for (;;) {
+        const version = await fetchProxyVersion(proxyBase).catch(() => undefined);
+        if (version !== undefined) return proxyBase;
+        const elapsed = Date.now() - startedAt;
+        if (elapsed >= limit) return undefined;
+        await new Promise((r) => setTimeout(r, Math.min(ATTACH_HEALTH_POLL_MS, limit - elapsed)));
+    }
 }
 
 // Model-facing body for /acp status renders: the visible panel goes to the synthetic message's

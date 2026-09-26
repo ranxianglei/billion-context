@@ -21,8 +21,8 @@
 //   hermes   ~/.hermes/plugins/billion-context/{plugin.yaml,__init__.py,bili.json}
 //            (#958: Python plugin — hermes's CLI agent plugin API is Python-only;
 //            it self-spawns/attaches a proxy and routes traffic via HTTPS_PROXY +
-//            HERMES_CA_BUNDLE, the same wire path as `bili hermes`; enablement is
-//            delegated to `hermes plugins enable`)
+//            SSL_CERT_FILE (combined CA bundle), the same wire path as `bili hermes`;
+//            enablement is delegated to `hermes plugins enable`)
 //   zcode    ~/.zcode/cli/config.json  hooks.enabled + SessionStart hook +
 //            mcp.servers.bili (stdio MCP); provider-store routing happens
 //            per-session, see src/zcode/ (no URL frozen at install time)
@@ -44,6 +44,40 @@ import { fetchRegistryVersion } from "./update.js";
 import { restoreKimiBackup, unrouteKimi } from "./kimi/native.js";
 import { inspectZcodeRouting, resolveZcodeDataDir } from "./zcode/json-edit.js";
 import { restoreZcodeBackup, unrouteZcode } from "./zcode/native.js";
+
+/** Build a SessionStart hook command line that parses in every shell the
+ *  supported agents run hooks through. Two Windows traps, both measured on
+ *  Claude Code 2.1.282:
+ *
+ *  1. A backslash path is escape-eaten by POSIX shells — `D:\Dev\node\node.exe`
+ *     becomes `D:Devnodenode.exe`, so the hook never starts the proxy while
+ *     base_url already points at the fixed port (the session hangs instead of
+ *     failing loudly). Forward slashes are accepted everywhere we emit for.
+ *
+ *  2. Quoting the COMMAND token is not portable:
+ *
+ *         form                     bash   PowerShell        cmd
+ *         bare token                ok       ok             ok
+ *         "quoted" first token      ok     PARSE ERR *      ok
+ *         & "quoted" first token   ERR       ok            ERR
+ *
+ *     *PowerShell reads a leading quoted token as a STRING EXPRESSION: with an
+ *     argument after it the whole command dies at parse time, and alone it
+ *     exits 0 having run nothing — a silent no-op, worse than an error.
+ *
+ *     No spelling covers a spaced command path in all three, so the only
+ *     question is which shell to keep working. Claude Code runs hooks through
+ *     PowerShell on Windows (probe-verified: a cmd-only builtin writes nothing,
+ *     a PowerShell-only one writes its file), so `&` is what keeps the real
+ *     path alive. cmd never sees a spaced command here — the kimi hook resolves
+ *     a bare `node` through PATH, so it is never quoted. Exported for tests. */
+export function portableHookCommand(exe: string, args: string[] = []): string {
+    const fwd = (p: string): string => p.replaceAll("\\", "/");
+    const quoteArg = (p: string): string => (/\s/.test(p) ? `"${p}"` : p);
+    const head = fwd(exe);
+    const tail = args.map((a) => quoteArg(fwd(a)));
+    return /\s/.test(head) ? [`& "${head}"`, ...tail].join(" ") : [head, ...tail].join(" ");
+}
 
 /** #403: never freeze a dead or unverifiable origin into a client's
  *  persistent config — the MCP shell would dial it forever. An explicit
@@ -502,14 +536,43 @@ export function applyClaudeManagedBlock(settings: Record<string, unknown>, opts:
 
     const hooks = (data.hooks !== null && typeof data.hooks === "object" && !Array.isArray(data.hooks) ? data.hooks : {}) as Record<string, unknown>;
     const sessionStart = Array.isArray(hooks.SessionStart) ? hooks.SessionStart : [];
-    const carriesOurs = sessionStart.some(isOursSessionStartEntry);
-    if (!carriesOurs) {
+    if (!sessionStart.some(isOursSessionStartEntry)) {
         sessionStart.push({ hooks: [{ type: "command", command: opts.hookCommand }] });
         hooks.SessionStart = sessionStart;
         data.hooks = hooks;
         notes.push("hooks.SessionStart += bili proxy bootstrap");
+    } else if (refreshOurHookCommands(sessionStart, opts.hookCommand)) {
+        data.hooks = hooks;
+        notes.push("hooks.SessionStart refreshed to the current hook command");
     }
     return { data, notes };
+}
+
+/** A hook command naming our bootstrap script. Match on the script name
+ *  rather than the whole string: the emitted form changes across releases. */
+function isOurHookCommand(command: unknown): command is string {
+    return typeof command === "string" && /claude-native-bootstrap\.(?:js|mjs|ts)["']?$/.test(command);
+}
+
+/** Rewrite every hook command we own to `command`, in place; true if any
+ *  changed. The entry above is appended only when no bili entry is present,
+ *  so without this a settings file written by an older release keeps its old
+ *  command forever — and a command a client shell cannot run hangs every
+ *  session with no log to say why. */
+function refreshOurHookCommands(sessionStart: unknown[], command: string): boolean {
+    let changed = false;
+    for (const entry of sessionStart) {
+        if (!isOursSessionStartEntry(entry)) continue;
+        for (const h of (entry as { hooks: unknown[] }).hooks) {
+            const hook = h as { command?: unknown };
+            const cur = hook.command;
+            if (isOurHookCommand(cur) && cur !== command) {
+                hook.command = command;
+                changed = true;
+            }
+        }
+    }
+    return changed;
 }
 
 /** A SessionStart entry we wrote: any hook command naming our bootstrap
@@ -517,9 +580,7 @@ export function applyClaudeManagedBlock(settings: Record<string, unknown>, opts:
 export function isOursSessionStartEntry(entry: unknown): boolean {
     const hooks = (entry !== null && typeof entry === "object" && !Array.isArray(entry) ? (entry as { hooks?: unknown }).hooks : undefined);
     if (!Array.isArray(hooks)) return false;
-    return hooks.some(
-        (h) => h !== null && typeof h === "object" && typeof (h as { command?: unknown }).command === "string" && /claude-native-bootstrap\.(?:js|mjs|ts)["']?$/.test((h as { command: string }).command),
-    );
+    return hooks.some((h) => h !== null && typeof h === "object" && isOurHookCommand((h as { command?: unknown }).command));
 }
 
 /** Pure strip of the managed block (remove path) — returns the cleaned copy
@@ -618,9 +679,10 @@ function claudeInstall(): string {
     saveClaudeNativePort(nativePort);
     const file = claudeSettingsFile();
     const settings = readJson(file);
+    const hookCommand = portableHookCommand(process.execPath, [bootstrapJs]);
     const { data, notes } = applyClaudeManagedBlock(settings, {
         baseUrl: claudeNativeBaseUrl(),
-        hookCommand: `${process.execPath} ${JSON.stringify(bootstrapJs)}`,
+        hookCommand,
     });
     writeJson(file, data);
 
@@ -1407,7 +1469,7 @@ function kimiPluginManifest(root: string): Record<string, unknown> {
         version: selfVersion(),
         description: "billion-context: ACP context-compression proxy (native mode)",
         mcpServers: { bili: { command: "node", args: [path.join(root, "dist", "kimi", "native-mcp.js")], cwd: "./" } },
-        hooks: [{ event: "SessionStart", command: `node ${path.join(root, "dist", "kimi", "bootstrap-hook.js")}`, timeout: 30 }],
+        hooks: [{ event: "SessionStart", command: portableHookCommand("node", [path.join(root, "dist", "kimi", "bootstrap-hook.js")]), timeout: 30 }],
     };
 }
 

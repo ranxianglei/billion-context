@@ -252,6 +252,20 @@ export function hasCompressSettings(s: CompressSettings): boolean {
 // (validateConfig does not flag unknown keys).
 export type ResolvedKernelConfig = Config & { preserveRecentTools?: string[] };
 
+// Single source of truth for raw->resolved absorb: applyCompressSettings and the
+// plugin-lane base stamp (#1359) both go through this or they drift apart.
+export function resolveAbsorbSettings(s: CompressSettings["absorb"]): AbsorbConfig | undefined {
+    if (s === undefined) return undefined;
+    const d = DEFAULT_ABSORB_CONFIG;
+    return {
+        enabled: s.enabled === true,
+        toolName: s.toolName ?? d.toolName,
+        minToolTokens: s.minToolTokens ?? d.minToolTokens,
+        contextThresholdPct: s.contextThresholdPct !== undefined ? parsePercent(s.contextThresholdPct) : d.contextThresholdPct,
+        excludeTools: s.excludeTools ?? [...d.excludeTools],
+    };
+}
+
 export function applyCompressSettings(base: Config, limit: number, s: CompressSettings): ResolvedKernelConfig {
     const nudge = { ...base.nudge };
     const truncate = { ...base.truncate };
@@ -267,17 +281,7 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
     }
     const tiers = { ...base.tiers };
     if (s.tiers !== undefined) tiers.enabled = s.tiers;
-    let absorb: AbsorbConfig | undefined;
-    if (s.absorb !== undefined) {
-        const d = DEFAULT_ABSORB_CONFIG;
-        absorb = {
-            enabled: s.absorb.enabled === true,
-            toolName: s.absorb.toolName ?? d.toolName,
-            minToolTokens: s.absorb.minToolTokens ?? d.minToolTokens,
-            contextThresholdPct: s.absorb.contextThresholdPct !== undefined ? parsePercent(s.absorb.contextThresholdPct) : d.contextThresholdPct,
-            excludeTools: s.absorb.excludeTools ?? [...d.excludeTools],
-        };
-    }
+    const absorb = resolveAbsorbSettings(s.absorb);
     // #1207 owner decision: CCR is opt-in on every lane — no default-on
     // else-branch; an unset `s.ccr` leaves `base.ccr` untouched (off).
     let ccr: CcrConfig | undefined;

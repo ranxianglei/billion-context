@@ -70,6 +70,14 @@ export const WIRE_RULES: readonly WireRule[] = [
         provenance:
             "Gemini API reference (function declaration naming: letters/digits/underscore); kernel deliberate combinator-free policy on this wire (acp-kernel compress-tools.d.ts)",
     },
+    {
+        id: "WC-007",
+        wire: "anthropic",
+        summary:
+            "no top-level prompt_cache_key — not part of the Anthropic Messages API; strict-schema upstreams reject unknown fields ('Extra inputs are not permitted'). bili's omp plugin stamps it as the session id (#268), so the proxy strips it on EVERY forward path (processed + verbatim).",
+        provenance:
+            "bili #1403 production 400 (opencode zen https://opencode.ai/zen/v1/messages: 'prompt_cache_key: Extra inputs are not permitted', 2026-09-26); Anthropic Messages API reference (no such field)",
+    },
 ];
 
 const ANTHROPIC_TOOL_NAME_RE = /^[a-zA-Z0-9_-]{1,128}$/;
@@ -81,10 +89,12 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
     return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-/** WC-001..WC-003 on an Anthropic /v1/messages body. Returns violation strings. */
+/** WC-001..WC-003, WC-007 on an Anthropic /v1/messages body. Returns violation strings. */
 export function validateAnthropicBody(body: unknown): string[] {
     const out: string[] = [];
     if (!isPlainObject(body)) return out;
+    if ("prompt_cache_key" in body)
+        out.push("WC-007 top-level prompt_cache_key is not part of the Anthropic Messages API (#1403)");
     if (!Array.isArray(body.tools)) return out;
     body.tools.forEach((t, i) => {
         if (!isPlainObject(t)) {
