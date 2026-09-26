@@ -81,6 +81,7 @@ async function forwardedTurn2Length(sessionId: string, extraHeaders: Record<stri
         log: false,
         debug: false,
         passthrough: false,
+        chainContentDetection: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);

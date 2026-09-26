@@ -71,6 +71,7 @@ async function startHarness(captured: Captured[], onUpstreamRequest: (bodyText: 
         log: true,
         debug: false,
         passthrough: false,
+        chainContentDetection: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
     };

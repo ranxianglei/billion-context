@@ -23,8 +23,9 @@ import {
 } from "../src/chain-checkpoint.ts";
 
 // #1395 step 2: chain-checkpoint recognition (parser, per-wire carrier
-// contract, JCS digest, shadow verdicts). Synthetic fixtures first; the three
-// integration tests prove ZERO forwarding behavior change through a real proxy.
+// contract, JCS digest, verdicts). Synthetic fixtures first; the three
+// integration tests pin the #1421 enforcement semantics through a real proxy:
+// valid/recent-mismatch forward byte-identical, plain requests leave stamped.
 
 const L = "\x3c";
 const R = "\x3e";
@@ -131,7 +132,7 @@ test("carrier contract: strict whole-content match in the trailing user run only
 
     const gOk = extractChainCarriers({ contents: [{ role: "user", parts: [{ text: tag() }] }] }, "google");
     assert.equal(gOk.candidates.length, 1);
-    assert.equal(extractChainCarriers({ contents: [{ role: "user", parts: [{ text: tag() }, { text: "x" }] }] }, "google").candidates.length, 0, "two-part google content is never a carrier");
+    assert.equal(extractChainCarriers({ contents: [{ role: "user", parts: [{ text: tag() }, { text: "x" }] }] }, "google").candidates.length, 1, "#1421 any-part rule: a plain-text part equal to the tag is a carrier wherever it sits");
     assert.equal(extractChainCarriers({ contents: [{ role: "user", parts: [{ text: tag(), thoughtSignature: "s" }] }] }, "google").candidates.length, 0, "extra part field disqualifies");
     assert.equal(extractChainCarriers(null, "openai").candidates.length, 0);
     assert.equal(extractChainCarriers({ model: "m" }, "openai").candidates.length, 0);
@@ -350,7 +351,7 @@ const BASE_BODY = {
     ],
 };
 
-test("#1395 step 2 T1: valid checkpoint → shadow info log only; request still fully processed (no passthrough)", async () => {
+test("#1395 step 2 / #1421 step 3 T1: valid checkpoint → [chain] info log + byte-identical verbatim forward (pipeline skipped)", async () => {
     await withRig(async ({ port, logs, captured }) => {
         const fields = { v: 1, processor: "bili-upstream-test", issuedAt: Date.now(), requestId: "req-step2-valid" };
         const sentJson = JSON.stringify(insertCheckpointCarrier(BASE_BODY, "openai", renderChainCheckpoint({ ...fields, digest: computeCheckpointDigest(BASE_BODY, "openai", fields)! }))!);
@@ -361,18 +362,19 @@ test("#1395 step 2 T1: valid checkpoint → shadow info log only; request still 
         });
         assert.equal(resp.status, 200);
         await resp.text();
-        const shadows = logs.filter((l) => l.msg.includes("[chain-shadow]"));
-        assert.equal(shadows.length, 1, `expected exactly one [chain-shadow] log, got ${shadows.length}: ${JSON.stringify(shadows)}`);
-        assert.equal(shadows[0]!.level, "info");
-        assert.ok(shadows[0]!.msg.includes("verdict=valid"), shadows[0]!.msg);
-        assert.ok(shadows[0]!.msg.includes("request-id=req-step2-valid"), shadows[0]!.msg);
+        const chainLogs = logs.filter((l) => l.msg.includes("[chain]"));
+        assert.equal(chainLogs.length, 1, `expected exactly one [chain] log, got ${chainLogs.length}: ${JSON.stringify(chainLogs)}`);
+        assert.equal(chainLogs[0]!.level, "info");
+        assert.ok(chainLogs[0]!.msg.includes("verdict=valid"), chainLogs[0]!.msg);
+        assert.ok(chainLogs[0]!.msg.includes("request-id=req-step2-valid"), chainLogs[0]!.msg);
+        assert.ok(chainLogs[0]!.msg.includes("forwarding verbatim"), chainLogs[0]!.msg);
         assert.equal(captured.length, 1, "request reaches the LLM exactly once");
-        assert.notEqual(captured[0]!.body, sentJson, "step 2 must NOT pass through verbatim (zero forwarding change)");
-        assert.ok(captured[0]!.body.includes('"compress"'), "request must be fully processed (compress tool injected)");
+        assert.equal(captured[0]!.body, sentJson, "#1421 first-processor-wins: byte-identical forward, pipeline skipped");
+        assert.ok(!captured[0]!.body.includes('"compress"'), "nothing injected on a skipped request");
     });
 });
 
-test("#1395 step 2 T2: well-formed fresh checkpoint with wrong digest → recent-mismatch warn; still processed", async () => {
+test("#1395 step 2 / #1421 step 3 T2: well-formed fresh checkpoint with wrong digest → recent-mismatch warn; forwarded byte-identical (interop default)", async () => {
     await withRig(async ({ port, logs, captured }) => {
         const fields = { v: 1, processor: "bili-other", issuedAt: Date.now(), requestId: "req-step2-mismatch" };
         const sentJson = JSON.stringify(insertCheckpointCarrier(BASE_BODY, "openai", renderChainCheckpoint({ ...fields, digest: "sha256:" + "cd".repeat(32) }))!);
@@ -383,17 +385,17 @@ test("#1395 step 2 T2: well-formed fresh checkpoint with wrong digest → recent
         });
         assert.equal(resp.status, 200);
         await resp.text();
-        const shadows = logs.filter((l) => l.msg.includes("[chain-shadow]"));
-        assert.equal(shadows.length, 1, `expected exactly one [chain-shadow] log, got ${shadows.length}: ${JSON.stringify(shadows)}`);
-        assert.equal(shadows[0]!.level, "warn");
-        assert.ok(shadows[0]!.msg.includes("verdict=recent-mismatch"), shadows[0]!.msg);
+        const chainLogs = logs.filter((l) => l.msg.includes("[chain]"));
+        assert.equal(chainLogs.length, 1, `expected exactly one [chain] log, got ${chainLogs.length}: ${JSON.stringify(chainLogs)}`);
+        assert.equal(chainLogs[0]!.level, "warn");
+        assert.ok(chainLogs[0]!.msg.includes("verdict=recent-mismatch"), chainLogs[0]!.msg);
+        assert.ok(chainLogs[0]!.msg.includes("forwarding verbatim"), chainLogs[0]!.msg);
         assert.equal(captured.length, 1);
-        assert.notEqual(captured[0]!.body, sentJson, "no forwarding behavior change in step 2");
-        assert.ok(captured[0]!.body.includes('"compress"'));
+        assert.equal(captured[0]!.body, sentJson, "interop default: forward untouched, never reject");
     });
 });
 
-test("#1395 step 2 T3: plain request → no [chain-shadow] log at all", async () => {
+test("#1395 step 2 / #1421 step 3 T3: plain request → no [chain] log; processed AND stamped on egress", async () => {
     await withRig(async ({ port, logs, captured }) => {
         const sentJson = JSON.stringify(BASE_BODY);
         const resp = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
@@ -403,8 +405,10 @@ test("#1395 step 2 T3: plain request → no [chain-shadow] log at all", async ()
         });
         assert.equal(resp.status, 200);
         await resp.text();
-        assert.equal(logs.filter((l) => l.msg.includes("[chain-shadow]")).length, 0, "no checkpoint signal, no shadow log");
+        assert.equal(logs.filter((l) => l.msg.includes("[chain]")).length, 0, "no inbound checkpoint signal, no [chain] log");
         assert.equal(captured.length, 1);
         assert.ok(captured[0]!.body.includes('"compress"'));
+        assert.ok(captured[0]!.body.includes(L + "bili-chain "), "#1421: every processed outbound leaves its own self-verifying stamp");
+        assert.equal(evaluateChain(JSON.parse(captured[0]!.body), "openai").verdict, "valid");
     });
 });
