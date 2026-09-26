@@ -571,7 +571,7 @@ export function executeSearchContext(
         steering = buildSteering(scored.filter((s) => returned.has(s.block)), state, plan.session);
     }
     const note = foreignSessionId
-        ? `\n\n[Note: session ${foreignSessionId} is a historical session — its compressed blocks live in a separate memory namespace — decompress acts on the current session only. For bulk content use bili export ${foreignSessionId} [--full].]`
+        ? `\n\n[Read-only search of historical session ${foreignSessionId}. Block ids are per-session namespaces — decompress acts on the current session only. For bulk content use bili export ${foreignSessionId} [--full].]`
         : "";
     return `Found ${blocks.length} block(s) for "${query}"${scope}:\n\n${lines.join("\n\n")}${steering}${note}`;
 }
