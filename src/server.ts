@@ -1992,6 +1992,9 @@ async function handle(
             const armedForGuard = typeof session.stats.overflowArmTokens === "number" && session.stats.overflowArmTokens > 0 ? session.stats.overflowArmTokens : 0;
             const guard = sideRequestGuard(parsed, protocol, reqConfig.modelContextLimit, imageBillingFor(opts, route?.rewrittenUrl ?? upstreamOrigin), headroomCap, armedForGuard);
             if (guard.blocked) {
+                const bypassReason = auxiliarySide
+                    ? "auxiliary side requests (no tools, diverging from the session's anchor view) bypass compression by design (#1309)"
+                    : `side requests (max_tokens<=${SIDE_REQUEST_MAX_TOKENS}) bypass compression by design (#388)`;
                 log("warn", `[${session.id}] side request (~${guard.estimate} tokens) ≥ effective window ${guard.limit} (model=${reqModel ?? "?"}) — NOT forwarded: guaranteed upstream 400 (side requests bypass preflight by design, #388)`);
                 if (!res.headersSent && !res.writableEnded && !res.destroyed) {
                     res.writeHead(413, { "content-type": "application/json" });
@@ -1999,7 +2002,7 @@ async function handle(
                         error: {
                             type: "server_error",
                             code: "side_request_payload_too_large",
-                            message: `side request payload ~${guard.estimate} tokens reaches the effective context window ${guard.limit} (model=${reqModel ?? "unknown"}); NOT forwarded — side requests (max_tokens<=${SIDE_REQUEST_MAX_TOKENS}) bypass compression by design (#388). Shrink the conversation or raise the model's context window.`,
+                            message: `side request payload ~${guard.estimate} tokens reaches the effective context window ${guard.limit} (model=${reqModel ?? "unknown"}); NOT forwarded — ${bypassReason}. Shrink the conversation or raise the model's context window.`,
                             retryable: false,
                         },
                     }));
