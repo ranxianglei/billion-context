@@ -45,7 +45,7 @@ import {
     subagentNamespace,
 } from "acp-kernel/wire";
 import { responsesToCoreWithToolImages as responsesToCore, patchResponsesInputWithToolImages as patchResponsesInput } from "./responses-tool-output.js";
-import { getSession, hasProcessedState, listSessions, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive, detectUnannouncedHistoryRewrite, markCompactionBoundary, ensureCanonicalId, storeEffectiveConfig } from "./session.js";
+import { getSession, hasProcessedState, listSessions, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive, detectUnannouncedHistoryRewrite, markCompactionBoundary, ensureCanonicalId, storeEffectiveConfig, foldCoverage, REWRITE_MIN_INCOMING_TOTAL } from "./session.js";
 import { detectStaleInstall } from "./update.js";
 import { PACKAGE_NAME, VERSION } from "./version.js";
 import {
@@ -2754,12 +2754,21 @@ async function prepareAnthropic(
         // stamped per-request — strip `ccr` from the loop config when disarmed
         // (plugin mode / no tool channel) so placeholders never hit the wire.
         const loopConfig = ccrLoopConfig(session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
+        // #1195: pre-turn snapshot of the fold's covered ids — syncBlocks inside
+        // processTurn may deactivate fully-drifted blocks, erasing them.
+        const foldCoveredBefore = session.stats.pendingFoldUsage === true
+            ? new Set(session.state.blocks.flatMap((b) => (b.active ? b.effectiveMessageIds : [])))
+            : null;
         const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only", contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
         // The fold from last turn's compress has now materialized in state —
         // future usage reports are post-fold reality, drop the credit.
         session.stats.compressCreditTokens = 0;
+        if (foldCoveredBefore !== null && msgs.length >= REWRITE_MIN_INCOMING_TOTAL) {
+            const gap = foldCoverage(foldCoveredBefore, msgs.map((m) => m.id));
+            if (gap) log("warn", `[${sessionId}] [acp-drift] fold coverage mismatch: ${gap.matched}/${gap.expected} covered message id(s) present in resent history — ${gap.expected - gap.matched} covered id(s) missing from resent history — mutation (content edit invalidates content-hash refs, fold silently lost) or client-side deletion/truncation (benign, message no longer on the wire); observability complement to the #1328 overflow rescue (#1195)`);
+        }
         storeEffectiveAbsorb(session, loopConfig);
         storeEffectiveRules(session, config);
         turn.messages = applyAbsorbView(turn.messages, session.state, loopConfig, tokenCount);
@@ -2950,12 +2959,21 @@ async function prepareOpenai(
         const absorbActive = absorbBlock?.enabled === true && shouldInject;
         const rulesActive = rulesEnabled(config) && shouldInject;
         const loopConfig = ccrLoopConfig(session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
+        // #1195: pre-turn snapshot of the fold's covered ids — syncBlocks inside
+        // processTurn may deactivate fully-drifted blocks, erasing them.
+        const foldCoveredBefore = session.stats.pendingFoldUsage === true
+            ? new Set(session.state.blocks.flatMap((b) => (b.active ? b.effectiveMessageIds : [])))
+            : null;
         const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only", contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
         // The fold from last turn's compress has now materialized in state —
         // future usage reports are post-fold reality, drop the credit.
         session.stats.compressCreditTokens = 0;
+        if (foldCoveredBefore !== null && !isTitleGen && msgs.length >= REWRITE_MIN_INCOMING_TOTAL) {
+            const gap = foldCoverage(foldCoveredBefore, msgs.map((m) => m.id));
+            if (gap) log("warn", `[${sessionId}] [acp-drift] fold coverage mismatch: ${gap.matched}/${gap.expected} covered message id(s) present in resent history — ${gap.expected - gap.matched} covered id(s) missing from resent history — mutation (content edit invalidates content-hash refs, fold silently lost) or client-side deletion/truncation (benign, message no longer on the wire); observability complement to the #1328 overflow rescue (#1195)`);
+        }
         storeEffectiveAbsorb(session, loopConfig);
         storeEffectiveRules(session, config);
         turn.messages = applyAbsorbView(turn.messages, session.state, loopConfig, tokenCount);
@@ -3178,12 +3196,21 @@ async function prepareGoogle(
         // config stripping — only tool availability matters.
         const rulesActive = rulesEnabled(config) && shouldInject;
         const loopConfig = ccrLoopConfig(session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
+        // #1195: pre-turn snapshot of the fold's covered ids — syncBlocks inside
+        // processTurn may deactivate fully-drifted blocks, erasing them.
+        const foldCoveredBefore = session.stats.pendingFoldUsage === true
+            ? new Set(session.state.blocks.flatMap((b) => (b.active ? b.effectiveMessageIds : [])))
+            : null;
         const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: "text-only", contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
         // The fold from last turn's compress has materialized in state — future
         // usage reports are post-fold reality, drop the credit.
         session.stats.compressCreditTokens = 0;
+        if (foldCoveredBefore !== null && !isTitleGen && msgs.length >= REWRITE_MIN_INCOMING_TOTAL) {
+            const gap = foldCoverage(foldCoveredBefore, msgs.map((m) => m.id));
+            if (gap) log("warn", `[${sessionId}] [acp-drift] fold coverage mismatch: ${gap.matched}/${gap.expected} covered message id(s) present in resent history — ${gap.expected - gap.matched} covered id(s) missing from resent history — mutation (content edit invalidates content-hash refs, fold silently lost) or client-side deletion/truncation (benign, message no longer on the wire); observability complement to the #1328 overflow rescue (#1195)`);
+        }
         storeEffectiveAbsorb(session, loopConfig);
         storeEffectiveRules(session, config);
         turn.messages = applyAbsorbView(turn.messages, session.state, loopConfig, tokenCount);
@@ -3415,12 +3442,21 @@ async function prepareResponses(
         const absorbActive = absorbBlock?.enabled === true && shouldInject && !isCompactionTrigger && !responsesTextProtocol;
         const rulesActive = rulesEnabled(config) && shouldInject && !isCompactionTrigger && !responsesTextProtocol;
         const loopConfig = ccrLoopConfig(session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
+        // #1195: pre-turn snapshot of the fold's covered ids — syncBlocks inside
+        // processTurn may deactivate fully-drifted blocks, erasing them.
+        const foldCoveredBefore = session.stats.pendingFoldUsage === true
+            ? new Set(session.state.blocks.flatMap((b) => (b.active ? b.effectiveMessageIds : [])))
+            : null;
         const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags, contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
         // The fold from last turn's compress has now materialized in state —
         // future usage reports are post-fold reality, drop the credit.
         session.stats.compressCreditTokens = 0;
+        if (foldCoveredBefore !== null && !isCompactionTrigger && msgs.length >= REWRITE_MIN_INCOMING_TOTAL) {
+            const gap = foldCoverage(foldCoveredBefore, msgs.map((m) => m.id));
+            if (gap) log("warn", `[${sessionId}] [acp-drift] fold coverage mismatch: ${gap.matched}/${gap.expected} covered message id(s) present in resent history — ${gap.expected - gap.matched} covered id(s) missing from resent history — mutation (content edit invalidates content-hash refs, fold silently lost) or client-side deletion/truncation (benign, message no longer on the wire); observability complement to the #1328 overflow rescue (#1195)`);
+        }
         storeEffectiveAbsorb(session, loopConfig);
         storeEffectiveRules(session, config);
         turn.messages = applyAbsorbView(turn.messages, session.state, loopConfig, tokenCount);
