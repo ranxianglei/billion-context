@@ -115,3 +115,73 @@ test("priceProfile stamp: provider-level priceProfile stamps session.metadata; a
         await upstream.close();
     }
 });
+
+test("priceProfile stamp: registry pricing is the default when no level configures one; user config wins wholesale (#1279 follow-up)", async () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({}, {
+        "somehost/claude-reg": { input: 2, output: 8, cache_read: 0.2 },
+    });
+    _resetPluginStateForTest();
+    _resetSessionsForTest();
+
+    const upstream = await anthropicUpstream();
+    const proxy = await startServer(optsFor(upstream.port, false));
+    await once(proxy, "listening");
+    const port = (proxy.address() as { port: number }).port;
+
+    // The fake upstream is an unknown relay (127.0.0.1), so the lookup runs
+    // its cross-host suffix scan and finds "somehost/claude-reg".
+    const post = (model: string, sessionId: string): Promise<Response> =>
+        fetch(`http://127.0.0.1:${port}/bili/http://127.0.0.1:${upstream.port}/v1/messages`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-api-key": "test", "x-acp-session": sessionId },
+            body: JSON.stringify({ model, max_tokens: 1024, messages: [{ role: "user", content: "hello" }] }),
+        });
+    try {
+        const beforeA = new Set(listSessions().map((s) => s.id));
+        const ra = await post("claude-reg", "pp-registry-a");
+        assert.equal(ra.status, 200, "listed-model request served");
+        const sa = listSessions().find((s) => !beforeA.has(s.id));
+        assert.ok(sa, "session created for the listed model");
+        assert.deepEqual(
+            sa.metadata.cachePriceProfile,
+            { w: 2, r: 0.2, q: 8 },
+            "unconfigured session stamped with the registry's absolute $/Mtok profile",
+        );
+
+        const beforeB = new Set(listSessions().map((s) => s.id));
+        const rb = await post("claude-noreg", "pp-registry-b");
+        assert.equal(rb.status, 200, "unlisted-model request served");
+        const sb = listSessions().find((s) => !beforeB.has(s.id));
+        assert.ok(sb, "session created for the unlisted model");
+        assert.equal(
+            sb.metadata.cachePriceProfile,
+            undefined,
+            "unresolvable model leaves no stamp (kernel relative defaults apply downstream)",
+        );
+
+        // User config at any level wins wholesale — no field mixing with the registry row.
+        const proxyCfg = await startServer(optsFor(upstream.port, true));
+        await once(proxyCfg, "listening");
+        const cfgPort = (proxyCfg.address() as { port: number }).port;
+        const beforeC = new Set(listSessions().map((s) => s.id));
+        const rc = await fetch(`http://127.0.0.1:${cfgPort}/bili/http://127.0.0.1:${upstream.port}/v1/messages`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-api-key": "test", "x-acp-session": "pp-registry-c" },
+            body: JSON.stringify({ model: "claude-reg", max_tokens: 1024, messages: [{ role: "user", content: "hello" }] }),
+        });
+        assert.equal(rc.status, 200, "user-config lane served");
+        const sc = listSessions().find((s) => !beforeC.has(s.id));
+        assert.ok(sc, "session created for the user-config lane");
+        assert.deepEqual(
+            sc.metadata.cachePriceProfile,
+            { q: 1.5 },
+            "route-level priceProfile overrides the registry listing wholesale",
+        );
+
+        await new Promise<void>((r) => proxyCfg.close(() => r()));
+    } finally {
+        await new Promise<void>((r) => proxy.close(() => r()));
+        await upstream.close();
+    }
+});
