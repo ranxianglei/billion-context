@@ -27,7 +27,8 @@ export function renderPage(origin: string, version: string): string {
 <div class="grid cols-4">
 <div class="stat"><div class="k" data-i18n="ov.total_sessions">${zh("ov.total_sessions")}</div><div class="v" id="st-sessions">—</div><div class="s" id="st-sessions-sub"></div></div>
 <div class="stat"><div class="k" data-i18n="ov.total_requests">${zh("ov.total_requests")}</div><div class="v" id="st-reqs">—</div></div>
-<div class="stat good"><div class="k" data-i18n="ov.tokens_saved">${zh("ov.tokens_saved")}</div><div class="v" id="st-saved">—</div><div class="s" data-i18n="common.tokens">${zh("common.tokens")}</div></div>
+<div class="stat good"><div class="k" data-i18n="ov.gross_saved">${zh("ov.gross_saved")}</div><div class="v" id="st-gross">—</div><div class="s" id="st-gross-sub" data-i18n="common.none">${zh("common.none")}</div></div>
+<div class="stat good"><div class="k" data-i18n="ov.net_saved">${zh("ov.net_saved")}</div><div class="v" id="st-netsaved">—</div><div class="s" id="st-net-sub"></div></div>
 <div class="stat"><div class="k" data-i18n="ov.global_hitpct">${zh("ov.global_hitpct")}</div><div class="v" id="st-hitpct">—</div></div>
 <div class="stat"><div class="k" data-i18n="ov.input_tokens">${zh("ov.input_tokens")}</div><div class="v" id="st-input">—</div></div>
 <div class="stat"><div class="k" data-i18n="ov.cached_tokens">${zh("ov.cached_tokens")}</div><div class="v" id="st-cached">—</div></div>
@@ -57,30 +58,45 @@ export function renderPage(origin: string, version: string): string {
 <section id="session-detail-view" hidden></section>
 </section>
 <section id="page-config" class="page" hidden>
-<div class="page-head"><div><h1 data-i18n="cfg.title">${zh("cfg.title")}</h1><div class="sub" data-i18n="cfg.sub">${zh("cfg.sub")}</div></div><span class="badge disk" data-i18n="cfg.readonly">${zh("cfg.readonly")}</span></div>
+<div class="page-head"><div><h1 data-i18n="cfg.title">${zh("cfg.title")}</h1><div class="sub" data-i18n="cfg.sub">${zh("cfg.sub")}</div></div></div>
 <div id="cfg-parse-error" class="banner err" hidden></div>
 <div class="card"><div class="card-h"><span data-i18n="cfg.file">${zh("cfg.file")}</span></div><div class="card-b"><div class="copy-row"><pre class="codebox" id="cfg-file"></pre><button class="btn sm copy-btn" id="copy-cfg-file" data-copy=""><span data-i18n="common.copy">${zh("common.copy")}</span></button></div></div></div>
 <div class="grid cols-2" style="margin-top:16px">
-<div class="card"><div class="card-h"><span data-i18n="cfg.providers">${zh("cfg.providers")}</span></div><div class="card-b" id="providers-body"></div></div>
+<div class="card"><div class="card-h"><span data-i18n="cfg.providers">${zh("cfg.providers")}</span></div><div class="card-b">
+<p class="dim small" style="margin:0 0 8px" data-i18n="cfg.providers_edit_hint">${zh("cfg.providers_edit_hint")}</p>
+<textarea id="providers-json" class="editor mono" spellcheck="false"></textarea>
+<div style="margin-top:10px"><button id="save-providers" class="btn"><span data-i18n="cfg.save">${zh("cfg.save")}</span></button></div>
+</div></div>
 <div class="card"><div class="card-h"><span data-i18n="cfg.upstream_net">${zh("cfg.upstream_net")}</span></div><div class="card-b">
-<dl class="kv">
-<div class="k" data-i18n="cfg.up_mode">${zh("cfg.up_mode")}</div><div class="v" id="up-mode">—</div>
-<div class="k" data-i18n="cfg.up_proxy">${zh("cfg.up_proxy")}</div><div class="v mono" id="up-proxy">—</div>
+<div class="modes">
+<label><input type="radio" name="proxy-mode" value="auto" checked><span data-i18n="cfg.up_auto">${zh("cfg.up_auto")}</span></label>
+<label><input type="radio" name="proxy-mode" value="manual"><span data-i18n="cfg.up_manual">${zh("cfg.up_manual")}</span></label>
+<label><input type="radio" name="proxy-mode" value="direct"><span data-i18n="cfg.up_direct">${zh("cfg.up_direct")}</span></label>
+</div>
+<input id="proxy-url" class="field-input mono" type="text" placeholder="http://127.0.0.1:7897" spellcheck="false">
+<dl class="kv" style="margin-top:12px">
 <div class="k" data-i18n="cfg.state">${zh("cfg.state")}</div><div class="v" id="up-state">—</div>
 </dl>
-<div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap"><button id="test-upstream" class="btn" data-i18n="cfg.test_btn">${zh("cfg.test_btn")}</button><span class="dim small" data-i18n="cfg.test_hint">${zh("cfg.test_hint")}</span></div>
+<div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap"><button id="save-upstream" class="btn"><span data-i18n="cfg.save">${zh("cfg.save")}</span></button><button id="test-upstream" class="btn"><span data-i18n="cfg.test_btn">${zh("cfg.test_btn")}</span></button><span class="dim small" data-i18n="cfg.test_hint">${zh("cfg.test_hint")}</span></div>
 </div></div>
 </div>
 <div class="grid cols-2" style="margin-top:16px">
-<div class="card"><div class="card-h"><span data-i18n="cfg.compress">${zh("cfg.compress")}</span></div><div class="card-b"><p class="dim small" style="margin:0 0 8px" data-i18n="cfg.compress_desc">${zh("cfg.compress_desc")}</p><pre class="codebox" id="compress-json"></pre></div></div>
-<div class="card"><div class="card-h"><span data-i18n="cfg.passthrough">${zh("cfg.passthrough")}</span></div><div class="card-b"><div id="pt-state" class="badge disk">—</div></div></div>
+<div class="card"><div class="card-h"><span data-i18n="cfg.compress">${zh("cfg.compress")}</span></div><div class="card-b"><p class="dim small" style="margin:0 0 8px" data-i18n="cfg.compress_desc">${zh("cfg.compress_desc")}</p><textarea id="compress-json" class="editor mono" spellcheck="false"></textarea>
+<div style="margin-top:10px"><button id="save-compress" class="btn"><span data-i18n="cfg.save">${zh("cfg.save")}</span></button></div>
+</div></div>
+<div class="card"><div class="card-h"><span data-i18n="cfg.passthrough">${zh("cfg.passthrough")}</span></div><div class="card-b"><div class="pt-row"><span id="pt-state" class="badge disk">—</span><span id="pt-source" class="dim small"></span></div><div style="margin-top:10px"><button id="clear-passthrough" class="btn sm" hidden><span data-i18n="cfg.pt_clear">${zh("cfg.pt_clear")}</span></button></div></div></div>
 </div>
 </section>
 <section id="page-connect" class="page" hidden>
 <div class="page-head"><div><h1 data-i18n="con.title">${zh("con.title")}</h1><div class="sub" data-i18n="con.sub">${zh("con.sub")}</div></div></div>
-<div class="card"><div class="card-h"><span data-i18n="con.origin">${zh("con.origin")}</span></div><div class="card-b"><div class="copy-row"><pre class="codebox">${o}</pre><button class="btn sm copy-btn" data-copy="${o}"><span data-i18n="common.copy">${zh("common.copy")}</span></button></div></div></div>
+<div class="section-label" data-i18n="con.method_launcher">${zh("con.method_launcher")}</div>
+<p class="small dim" data-i18n="con.method_launcher_hint">${zh("con.method_launcher_hint")}</p>
+<div class="card"><div class="card-b"><div class="chips">
+<span class="chip mono">bili pi</span><span class="chip mono">bili codex</span><span class="chip mono">bili claude</span><span class="chip mono">bili omp</span><span class="chip mono">bili opencode</span><span class="chip mono">bili hermes</span><span class="chip mono">bili dsh</span><span class="chip mono">bili codebuddy</span><span class="chip mono">bili qoder</span><span class="chip mono">bili trae</span><span class="chip mono">bili jcode</span><span class="chip mono">bili kimi</span><span class="chip mono">bili gemini</span><span class="chip mono">bili iflow</span><span class="chip mono">bili qwen</span><span class="chip mono">bili mcode</span><span class="chip mono">bili aider</span><span class="chip mono">bili copilot</span><span class="chip mono">bili amp</span><span class="chip mono">bili goose</span>
+</div><p class="small dim" style="margin:10px 0 0"><span data-i18n="con.launcher_help_pre">${zh("con.launcher_help_pre")}</span> <span class="mono">bili --help</span></p></div></div>
 <div class="section-label" data-i18n="con.method_a">${zh("con.method_a")}</div>
 <p class="small dim"><span data-i18n="con.method_a_hint">${zh("con.method_a_hint")}</span> <span class="mono">${o}/bili/</span></p>
+<div class="card"><div class="card-h"><span data-i18n="con.origin">${zh("con.origin")}</span></div><div class="card-b"><div class="copy-row"><pre class="codebox">${o}</pre><button class="btn sm copy-btn" data-copy="${o}"><span data-i18n="common.copy">${zh("common.copy")}</span></button></div></div></div>
 <div class="grid cols-2">
 <div class="card"><div class="card-h"><span data-i18n="card.opencode">${zh("card.opencode")}</span></div><div class="card-b">
 <dl class="kv">
@@ -110,13 +126,12 @@ export function renderPage(origin: string, version: string): string {
 </dl>
 <div class="copy-row" style="margin-top:10px"><pre class="codebox">export ANTHROPIC_BASE_URL=${o}/bili/https://api.anthropic.com</pre><button class="btn sm copy-btn" data-copy="export ANTHROPIC_BASE_URL=${o}/bili/https://api.anthropic.com"><span data-i18n="common.copy">${zh("common.copy")}</span></button></div>
 </div></div>
-<div class="card"><div class="card-h"><span data-i18n="card.pi">${zh("card.pi")}</span><span class="badge warn" data-i18n="badge.not_recommended">${zh("badge.not_recommended")}</span></div><div class="card-b">
+<div class="card"><div class="card-h"><span data-i18n="card.pi">${zh("card.pi")}</span></div><div class="card-b">
 <dl class="kv">
 <div class="k" data-i18n="dt.config_file">${zh("dt.config_file")}</div><div class="v mono">~/.pi/agent/models.json</div>
 <div class="k" data-i18n="dt.setting">${zh("dt.setting")}</div><div class="v mono">baseUrl</div>
 </dl>
 <div class="copy-row" style="margin-top:10px"><pre class="codebox">${o}/bili/https://api.anthropic.com</pre><button class="btn sm copy-btn" data-copy="${o}/bili/https://api.anthropic.com"><span data-i18n="common.copy">${zh("common.copy")}</span></button></div>
-<p class="small dim" style="margin-top:10px" data-i18n="pi.hint">${zh("pi.hint")}</p>
 </div></div>
 <div class="card"><div class="card-h"><span data-i18n="card.other">${zh("card.other")}</span></div><div class="card-b">
 <p class="small" style="margin:0 0 6px"><span data-i18n="other.rule">${zh("other.rule")}</span> <span class="mono">${o}/bili/</span></p>

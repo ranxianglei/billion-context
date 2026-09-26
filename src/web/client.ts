@@ -30,8 +30,8 @@ export const WEB_CLIENT = `(function () {
         setTimeout(() => el.remove(), 2600);
     }
     function busy(btn, on) {
-        if (on) { btn.dataset.label = btn.textContent; btn.classList.add("busy"); btn.disabled = true; }
-        else { btn.classList.remove("busy"); btn.disabled = false; if (btn.dataset.label !== undefined) btn.textContent = btn.dataset.label; }
+        if (on) { btn.dataset.label = btn.innerHTML; btn.classList.add("busy"); btn.disabled = true; }
+        else { btn.classList.remove("busy"); btn.disabled = false; if (btn.dataset.label !== undefined) btn.innerHTML = btn.dataset.label; }
     }
     async function json(url, opts) {
         const res = await fetch(url, opts);
@@ -39,6 +39,18 @@ export const WEB_CLIENT = `(function () {
         try { body = await res.json(); } catch (e) {}
         if (!res.ok) throw new Error(body && body.error ? String(body.error) : "HTTP " + res.status);
         return body;
+    }
+    async function putCfg(btn, payload) {
+        busy(btn, true);
+        try {
+            await json("/__bili/config", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
+            toast(t("cfg.saved"), "ok");
+            loadConfig();
+        } catch (e) {
+            toast(e.message, "err");
+        } finally {
+            busy(btn, false);
+        }
     }
     function fmtW(n) {
         if (n === null || n === undefined || isNaN(n)) return t("common.none");
@@ -68,9 +80,21 @@ export const WEB_CLIENT = `(function () {
         if (s < 86400) return Math.floor(s / 3600) + "h";
         return Math.floor(s / 86400) + "d";
     }
+    function fmtDT(ms) {
+        const d = new Date(ms || 0);
+        const p = (v) => String(v).padStart(2, "0");
+        return p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " + p(d.getHours()) + ":" + p(d.getMinutes());
+    }
+
     function hostOf(u) {
         if (!u) return "";
         try { return new URL(u).host; } catch (e) { return u; }
+    }
+    // #1426: sessions recorded before wire-path tagging have protocol "unknown" — show them as
+    // "unmarked (legacy)" instead of a bare question mark.
+    function protoBadge(p) {
+        if (!p || p === "unknown") return '<span class="dim small">' + escapeHtml(t("protocol.unmarked")) + "</span>";
+        return '<span class="badge proto">' + escapeHtml(p) + "</span>";
     }
     function hydrate() {
         document.documentElement.lang = locale;
@@ -86,18 +110,24 @@ export const WEB_CLIENT = `(function () {
     let sessionsCache = [];
 
     function sessionTitleCell(s) {
-        const name = s.title || s.label || s.id.slice(0, 12) + "…";
-        return '<span class="row-title">' + escapeHtml(name) + "</span>"
-            + ' <span class="badge ' + (s.live ? "live" : "disk") + '">' + (s.live ? t("common.live") : t("common.disk")) + "</span>"
-            + (s.restored ? ' <span class="dim small">' + t("common.restored") + "</span>" : "");
+        // #1426: title falls back to an "untitled" placeholder and the FULL session id is always
+        // shown underneath so rows stay identifiable. Disk-restored pool entries read as history,
+        // not live.
+        const named = Boolean(s.title || s.label || s.firstBlockHint);
+        const name = s.title || s.label || s.firstBlockHint || t("ses.no_title");
+        const live = s.live && !s.restored;
+        return '<span class="row-title' + (named ? "" : " faint") + '">' + escapeHtml(name) + "</span>"
+            + ' <span class="badge ' + (live ? "live" : "disk") + '">' + (live ? t("common.live") : t("common.disk")) + "</span>"
+            + (s.restored ? ' <span class="dim small">' + t("common.restored") + "</span>" : "")
+            + '<span class="row-id">' + escapeHtml(s.id) + "</span>";
     }
     function sessionRow(s, compact) {
         const tr = document.createElement("tr");
         tr.title = s.id;
         if (compact) {
-            tr.innerHTML = "<td>" + sessionTitleCell(s) + '</td><td><span class="badge proto">' + escapeHtml(s.protocol || "?") + '</span></td><td class="num">' + fmtW(s.contextTokens) + '</td><td class="num good-num">' + fmtW(s.tokensSaved) + '</td><td class="dim">' + timeAgo(s.lastSeen) + "</td>";
+            tr.innerHTML = "<td>" + sessionTitleCell(s) + '</td><td>' + protoBadge(s.protocol) + '</td><td class="num">' + fmtW(s.contextTokens) + '</td><td class="num good-num">' + fmtW(s.tokensSaved) + '</td><td class="dim">' + timeAgo(s.lastSeen) + "</td>";
         } else {
-            tr.innerHTML = "<td>" + sessionTitleCell(s) + '</td><td><span class="badge proto">' + escapeHtml(s.protocol || "?") + '</span></td><td class="mono dim small">' + escapeHtml(hostOf(s.upstreamOrigin)) + '</td><td class="num">' + fmtW(s.requests) + '</td><td class="num">' + fmtW(s.contextTokens) + '</td><td class="num good-num">' + fmtW(s.tokensSaved) + '</td><td class="num">' + (s.cacheHitPct == null ? t("common.none") : s.cacheHitPct.toFixed(1) + "%") + '</td><td class="num">' + (s.blocks || 0) + '</td><td class="dim">' + timeAgo(s.lastSeen) + "</td>";
+            tr.innerHTML = "<td>" + sessionTitleCell(s) + '</td><td>' + protoBadge(s.protocol) + '</td><td class="mono dim small">' + escapeHtml(hostOf(s.upstreamOrigin)) + '</td><td class="num">' + fmtW(s.requests) + '</td><td class="num">' + fmtW(s.contextTokens) + '</td><td class="num good-num">' + fmtW(s.tokensSaved) + '</td><td class="num">' + (s.cacheHitPct == null ? t("common.none") : s.cacheHitPct.toFixed(1) + "%") + '</td><td class="num">' + (s.blocks || 0) + '</td><td class="dim">' + timeAgo(s.lastSeen) + "</td>";
         }
         tr.addEventListener("click", () => { location.hash = "#/session/" + encodeURIComponent(s.id); });
         return tr;
@@ -107,21 +137,29 @@ export const WEB_CLIENT = `(function () {
         try {
             const d = await json("/__bili/overview");
             const o = d.overview || {};
-            $("st-sessions").textContent = String(o.sessions || 0);
-            $("st-sessions-sub").textContent = (o.live || 0) + " " + t("ov.live_now");
-            $("st-reqs").textContent = fmtW(o.requests || 0);
-            $("st-saved").textContent = fmtW(o.tokensSaved || 0);
+            // #1426: total splits live vs historical (disk-restored pool entries are history);
+            // counters without usage samples render "—" instead of a misleading 0; the saved
+            // counter labels how much comes from pre-tagging local estimates (no cache ledger).
+            const total = o.sessions || 0;
+            const liveN = o.live || 0;
+            $("st-sessions").textContent = String(total);
+            $("st-sessions-sub").textContent = liveN + " " + t("ov.live_now") + " · " + Math.max(0, total - liveN) + " " + t("ov.hist");
+            $("st-reqs").textContent = o.requests ? fmtW(o.requests) : t("common.none");
+            $("st-gross").textContent = o.grossSavedTotal ? fmtW(o.grossSavedTotal) : t("common.none");
+            $("st-gross-sub").textContent = (o.savedEstimated || 0) > 0 ? t("ov.saved_from_legacy", { n: fmtW(o.savedEstimated) }) : t("common.tokens");
+            $("st-netsaved").textContent = o.hasFoldData ? ((o.netSavedTotal || 0) < 0 ? "-" : "") + fmtW(Math.abs(o.netSavedTotal || 0)) : t("common.none");
+            $("st-net-sub").textContent = o.hasFoldData ? t("ov.sub_repay", { r: fmtW(o.repayTotal || 0), s: fmtW(o.summaryCostTotal || 0) }) : "";
             $("st-hitpct").textContent = o.hitPct == null ? t("common.none") : o.hitPct.toFixed(1) + "%";
-            $("st-input").textContent = fmtW(o.inputTokens || 0);
-            $("st-cached").textContent = fmtW(o.cachedTokens || 0);
-            $("st-output").textContent = fmtW(o.outputTokens || 0);
+            $("st-input").textContent = o.inputTokens ? fmtW(o.inputTokens) : t("common.none");
+            $("st-cached").textContent = o.cachedTokens ? fmtW(o.cachedTokens) : t("common.none");
+            $("st-output").textContent = o.outputTokens ? fmtW(o.outputTokens) : t("common.none");
             const pb = $("protocol-body");
             pb.innerHTML = "";
             const rows = (o.byProtocol || []).slice().sort((a, b) => b.sessions - a.sessions || b.requests - a.requests);
             if (!rows.length) pb.innerHTML = '<tr><td colspan="5" class="dim">' + t("common.empty") + "</td></tr>";
             rows.forEach((r) => {
                 const tr = document.createElement("tr");
-                tr.innerHTML = '<td class="mono">' + escapeHtml(r.protocol || "?") + '</td><td class="num">' + r.sessions + '</td><td class="num">' + fmtW(r.requests) + '</td><td class="num">' + fmtW(r.inputTokens) + '</td><td class="num">' + fmtW(r.cachedTokens) + "</td>";
+                tr.innerHTML = '<td>' + protoBadge(r.protocol) + '</td><td class="num">' + r.sessions + '</td><td class="num">' + (r.requests ? fmtW(r.requests) : t("common.none")) + '</td><td class="num">' + (r.inputTokens ? fmtW(r.inputTokens) : t("common.none")) + '</td><td class="num">' + (r.cachedTokens ? fmtW(r.cachedTokens) : t("common.none")) + "</td>";
                 pb.appendChild(tr);
             });
             $("sys-version").textContent = d.version || "?";
@@ -230,6 +268,7 @@ export const WEB_CLIENT = `(function () {
         if (maxY <= 0) maxY = 1;
         const x = (i) => PL + (lines.length === 1 ? iw / 2 : (i / (lines.length - 1)) * iw);
         const y = (v) => PT + ih - (Math.max(0, v) / maxY) * ih;
+        const dt = (ms) => fmtDT(ms);
         let grid = "", ticks = "";
         for (let g = 0; g <= 4; g++) {
             const v = (maxY / 4) * g;
@@ -249,7 +288,8 @@ export const WEB_CLIENT = `(function () {
             let idx = -1;
             for (let i = 0; i < lines.length; i++) { if ((lines[i].at || 0) >= (f.at || 0)) { idx = i; break; } }
             if (idx < 0) idx = lines.length - 1;
-            foldMarks += '<line x1="' + x(idx).toFixed(1) + '" y1="' + PT + '" x2="' + x(idx).toFixed(1) + '" y2="' + (PT + ih) + '" stroke="#cf222e" stroke-width="1.2" stroke-dasharray="3 3"/>';
+            foldMarks += '<line x1="' + x(idx).toFixed(1) + '" y1="' + PT + '" x2="' + x(idx).toFixed(1) + '" y2="' + (PT + ih) + '" stroke="#cf222e" stroke-width="1.2" stroke-dasharray="3 3"><title>'
+                + (f.seq != null ? "#折叠 " + f.seq + " · " : "") + dt(f.at) + " · " + fmtW(f.S) + "</title></line>";
         });
         let ceiling = "";
         if (win && win > 0) {
@@ -258,19 +298,23 @@ export const WEB_CLIENT = `(function () {
                 + '<text x="' + (W - PR) + '" y="' + Math.max(10, yy - 4).toFixed(1) + '" text-anchor="end" font-size="10" fill="#cf222e">' + t("det.legend_window") + " " + fmtW(win) + "</text>";
         }
         const xt = [0, Math.floor((lines.length - 1) / 2), lines.length - 1]
-            .map((i) => '<text x="' + x(i).toFixed(1) + '" y="' + (H - 8) + '" text-anchor="middle" font-size="10" fill="var(--text-muted)">' + lines[i].seq + "</text>").join("");
+            .map((i) => '<text x="' + x(i).toFixed(1) + '" y="' + (H - 20) + '" text-anchor="middle" font-size="10" fill="var(--text-muted)">' + lines[i].seq + "</text>").join("");
+        const xtTime =
+            (lines[0] && lines[0].at ? '<text x="' + PL + '" y="' + (H - 8) + '" text-anchor="start" font-size="9.5" fill="var(--text-faint)">' + dt(lines[0].at) + "</text>" : "")
+            + (lines.length > 1 && lines[lines.length - 1].at ? '<text x="' + (W - PR) + '" y="' + (H - 8) + '" text-anchor="end" font-size="9.5" fill="var(--text-faint)">' + dt(lines[lines.length - 1].at) + "</text>" : "");
         return '<svg viewBox="0 0 ' + W + " " + H + '" class="chart-svg" role="img">' + grid
             + '<path d="' + area + '" fill="var(--accent)" opacity="0.18"/>'
             + '<path d="' + stroke.trim() + '" fill="none" stroke="var(--accent)" stroke-width="1.8"/>'
-            + foldMarks + ceiling + ticks + xt + "</svg>";
+            + foldMarks + ceiling + ticks + xt + xtTime + "</svg>";
     }
     function legendItem(style, label, dashed) {
         if (dashed) return '<span><span class="dot" style="background:none;border-top:2px dashed #cf222e;height:0;border-radius:0;width:14px"></span>' + label + "</span>";
         return '<span><span class="dot" style="' + style + '"></span>' + label + "</span>";
     }
     function detailBadges(d) {
-        let html = '<span class="badge ' + (d.live ? "live" : "disk") + '">' + (d.live ? t("common.live") : t("common.disk")) + "</span>";
-        if (d.protocol) html += ' <span class="badge proto">' + escapeHtml(d.protocol) + "</span>";
+        const live = d.live && !d.restored;
+        let html = '<span class="badge ' + (live ? "live" : "disk") + '">' + (live ? t("common.live") : t("common.disk")) + "</span>";
+        if (d.protocol) html += " " + protoBadge(d.protocol);
         if (d.restored) html += ' <span class="dim small">' + t("common.restored") + "</span>";
         return html;
     }
@@ -287,11 +331,11 @@ export const WEB_CLIENT = `(function () {
         parts.push("</dl></div></div>");
         parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.usage") + '</span></div><div class="card-b">');
         parts.push('<div class="grid cols-4">');
-        mini(parts, t("common.requests"), fmtW(d.requests || 0));
-        mini(parts, t("ov.input_tokens"), fmtW(d.inputTokens || 0));
-        mini(parts, t("ov.cached_tokens"), fmtW(d.cachedTokens || 0));
-        mini(parts, t("ov.output_tokens"), fmtW(d.outputTokens || 0));
-        mini(parts, t("ov.tokens_saved"), fmtW(d.tokensSaved || 0), true);
+        mini(parts, t("common.requests"), d.requests ? fmtW(d.requests) : null);
+        mini(parts, t("ov.input_tokens"), d.inputTokens ? fmtW(d.inputTokens) : null);
+        mini(parts, t("ov.cached_tokens"), d.cachedTokens ? fmtW(d.cachedTokens) : null);
+        mini(parts, t("ov.output_tokens"), d.outputTokens ? fmtW(d.outputTokens) : null);
+        mini(parts, t("ov.tokens_saved"), d.tokensSaved ? fmtW(d.tokensSaved) : null, true);
         mini(parts, t("det.last_input"), (d.lastInputTokens || 0) > 0 ? fmtW(d.lastInputTokens) : null);
         parts.push("</div>");
         if (d.contextWindow && d.contextWindow > 0) {
@@ -334,9 +378,9 @@ export const WEB_CLIENT = `(function () {
         parts.push('<div class="section-label" style="margin-top:14px">' + t("det.folds") + "</div>");
         if (!folds.length) parts.push('<div class="dim small">' + t("det.folds_empty") + "</div>");
         else {
-            parts.push('<table class="data"><thead><tr><th>#</th><th>' + t("det.fold_s") + '</th><th>' + t("det.fold_sigma") + '</th><th>' + t("det.fold_h") + '</th><th>' + t("det.fold_t") + "</th></tr></thead><tbody>");
+            parts.push('<table class="data"><thead><tr><th>#</th><th>' + t("det.fold_time") + '</th><th>' + t("det.fold_s") + '</th><th>' + t("det.fold_sigma") + '</th><th>' + t("det.fold_h") + '</th><th>' + t("det.fold_t") + "</th></tr></thead><tbody>");
             folds.forEach((f, i) => {
-                parts.push('<tr><td class="num">' + (f.seq != null ? f.seq : i + 1) + '</td><td class="num">' + fmtW(f.S) + '</td><td class="num">' + fmtW(f.sigma) + '</td><td class="num">' + (f.hPct == null ? t("common.none") : f.hPct.toFixed(1) + "%") + '</td><td class="num">' + fmtW(f.T) + "</td></tr>");
+                parts.push('<tr><td class="num">' + (f.seq != null ? f.seq : i + 1) + '</td><td class="num">' + (f.at ? fmtDT(f.at) : t("common.none")) + '</td><td class="num">' + fmtW(f.S) + '</td><td class="num">' + fmtW(f.sigma) + '</td><td class="num">' + (f.hPct == null ? t("common.none") : f.hPct.toFixed(1) + "%") + '</td><td class="num">' + fmtW(f.T) + "</td></tr>");
             });
             parts.push("</tbody></table>");
         }
@@ -345,10 +389,14 @@ export const WEB_CLIENT = `(function () {
         parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.blocks_title") + '</span><span class="hint">' + t("det.blocks_count", { n: blocks.length }) + '</span></div><div class="card-b blocks-list">');
         if (!blocks.length) parts.push('<div class="dim small" style="padding:8px 0">' + t("det.blocks_empty") + "</div>");
         blocks.forEach((b) => {
-            parts.push('<details class="block-item"><summary><span class="bid">' + escapeHtml(b.blockId) + '</span><span class="topic">' + escapeHtml(b.topic || b.blockId) + '</span><span class="meta">T' + String(b.tier) + " · " + fmtW(b.compressedTokens) + " · " + timeAgo(b.createdAt) + '</span></summary><div class="body">' + escapeHtml(b.summary) + "</div></details>");
+            // #1426: expose the compressed conversation span (mNNNNN refs) when the kernel tagged it
+            const refRange = b.startRef ? (b.endRef && b.endRef !== b.startRef ? b.startRef + "–" + b.endRef : b.startRef) : null;
+            parts.push('<details class="block-item"><summary><span class="bid">' + escapeHtml(b.blockId) + '</span><span class="topic">' + escapeHtml(b.topic || b.blockId) + '</span><span class="meta">T' + String(b.tier) + " · " + fmtW(b.compressedTokens) + " · " + timeAgo(b.createdAt) + (refRange ? " · " + escapeHtml(refRange) : "") + '</span></summary><div class="body">' + escapeHtml(b.summary) + "</div></details>");
         });
         parts.push("</div></div>");
         parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.handoff") + '</span><span class="hint">' + t("det.handoff_hint") + '</span></div><div class="card-b">');
+        // #1426: copy / download actions over the rendered handoff document
+        parts.push('<div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap"><button id="handoff-copy-md" class="btn sm">' + t("det.handoff_copy_md") + '</button><button id="handoff-dl" class="btn sm">' + t("det.handoff_download") + "</button></div>");
         if (d.handoffTruncated) parts.push('<div class="banner warn show" style="margin:0 0 10px">' + t("det.handoff_truncated") + "</div>");
         if (d.handoffHtml) parts.push('<div class="handoff">' + d.handoffHtml + "</div>");
         else parts.push('<div class="dim small">' + t("common.empty") + "</div>");
@@ -368,6 +416,42 @@ export const WEB_CLIENT = `(function () {
             return;
         }
         host.innerHTML = buildDetailHtml(d);
+        bindHandoffActions(d);
+    }
+    function bindHandoffActions(d) {
+        const copyBtn = $("handoff-copy-md");
+        const dlBtn = $("handoff-dl");
+        if (!d.handoffMd) {
+            if (copyBtn) copyBtn.hidden = true;
+            if (dlBtn) dlBtn.hidden = true;
+            return;
+        }
+        const md = d.handoffMd;
+        if (copyBtn) copyBtn.addEventListener("click", () => {
+            const done = () => { copyBtn.textContent = t("common.copied"); setTimeout(() => { copyBtn.textContent = t("det.handoff_copy_md"); }, 1200); };
+            const fallback = () => {
+                const ta = document.createElement("textarea");
+                ta.value = md;
+                ta.style.position = "fixed";
+                ta.style.opacity = "0";
+                document.body.appendChild(ta);
+                ta.select();
+                try { document.execCommand("copy"); done(); } catch (e) { toast(t("toast.failed", { msg: e.message }), "err"); }
+                ta.remove();
+            };
+            if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(md).then(done, fallback);
+            else fallback();
+        });
+        if (dlBtn) dlBtn.addEventListener("click", () => {
+            const url = URL.createObjectURL(new Blob([md], { type: "text/markdown;charset=utf-8" }));
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = "billion-context-handoff-" + String(d.id).replace(/[^A-Za-z0-9._-]/g, "_") + ".md";
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 4000);
+        });
     }
 
     async function loadConfig() {
@@ -386,41 +470,30 @@ export const WEB_CLIENT = `(function () {
                 errBox.classList.remove("show");
                 errBox.textContent = "";
             }
-            const pb = $("providers-body");
-            pb.innerHTML = "";
-            const providers = cfg.providers && typeof cfg.providers === "object" ? cfg.providers : {};
-            const keys = Object.keys(providers);
-            if (!keys.length) pb.innerHTML = '<div class="dim small">' + t("cfg.providers_empty") + "</div>";
-            keys.forEach((k) => {
-                const r = providers[k] || {};
-                let html = '<div class="route-block"><div class="route-key">' + escapeHtml(k) + "</div>";
-                if (r.compressProtocol === "marker") html += ' <span class="badge proto">' + t("cfg.route_marker") + "</span>";
-                html += '<dl class="kv">';
-                html += '<div class="k">' + t("cfg.route_models") + "</div>";
-                const models = r.models && typeof r.models === "object" ? r.models : null;
-                if (models && Object.keys(models).length) {
-                    html += '<table class="mini"><tr><th>model</th><th class="num">context</th><th class="num">output</th></tr>';
-                    Object.keys(models).forEach((mn) => {
-                        const me = models[mn] || {};
-                        html += '<tr><td class="mono">' + escapeHtml(mn) + '</td><td class="num">' + (me.context ? fmtW(me.context) : t("common.none")) + '</td><td class="num">' + (me.output ? fmtW(me.output) : t("common.none")) + "</td></tr>";
-                    });
-                    html += "</table>";
-                } else {
-                    html += '<div class="v dim small">' + t("cfg.route_no_models") + "</div>";
-                }
-                html += '<div class="k">' + t("cfg.route_proxy") + '</div><div class="v mono">' + (r.proxy ? escapeHtml(r.proxy) : t("cfg.route_direct")) + "</div>";
-                if (r.compress) html += '<div class="k">' + t("cfg.route_compress") + '</div><pre class="codebox small-pre">' + escapeHtml(JSON.stringify(r.compress, null, 2)) + "</pre>";
-                html += "</dl></div>";
-                pb.insertAdjacentHTML("beforeend", html);
-            });
-            $("compress-json").textContent = cfg.compress && Object.keys(cfg.compress).length ? JSON.stringify(cfg.compress, null, 2) : t("cfg.compress_empty");
+            // #1426: provider routes go back to being editable — the read-only rendering was a
+            // regression from the web UI rewrite; the API already accepted PUT {providers}
+            const providers = cfg.providers && typeof cfg.providers === "object" && !Array.isArray(cfg.providers) ? cfg.providers : {};
+            $("providers-json").value = JSON.stringify(providers, null, 2);
+            const broken = Boolean(cfg.parseError);
+            ["providers-json", "compress-json"].forEach((id) => { const el = $(id); if (el) el.disabled = broken; });
+            ["save-providers", "save-compress", "save-upstream"].forEach((id) => { const el = $(id); if (el) el.disabled = broken; });
+            const compressObj = cfg.compress && typeof cfg.compress === "object" && !Array.isArray(cfg.compress) ? cfg.compress : {};
+            $("compress-json").value = Object.keys(compressObj).length ? JSON.stringify(compressObj, null, 2) : "";
             const ptState = $("pt-state");
-            if (cfg.passthrough && cfg.passthrough.enabled) {
+            const ptSource = $("pt-source");
+            const clearPt = $("clear-passthrough");
+            const pt = cfg.passthrough;
+            // #1426: passthrough shows where it came from; env-driven cannot be cleared from here
+            if (pt && pt.enabled) {
                 ptState.className = "badge ok";
                 ptState.textContent = t("cfg.pt_on");
+                ptSource.textContent = pt.source === "env" ? t("sys.pt_env") : t("sys.pt_file");
+                clearPt.hidden = pt.source !== "env";
             } else {
                 ptState.className = "badge disk";
                 ptState.textContent = t("cfg.pt_off");
+                ptSource.textContent = "";
+                clearPt.hidden = true;
             }
             loadUpstream(cfg);
         } catch (e) {
@@ -430,9 +503,11 @@ export const WEB_CLIENT = `(function () {
     async function loadUpstream(cfg) {
         let up = null;
         try { up = await json("/__bili/upstream"); } catch (e) {}
+        // #1426: mode/proxy are editable form fields again, not read-only labels
         const mode = (up && up.mode) || cfg.upstreamProxyMode || "auto";
-        $("up-mode").textContent = mode === "manual" ? t("cfg.up_manual") : mode === "direct" ? t("cfg.up_direct") : t("cfg.up_auto");
-        $("up-proxy").textContent = (up && up.proxy) || cfg.upstreamProxy || t("common.none");
+        document.querySelectorAll('input[name="proxy-mode"]').forEach((el) => { el.checked = el.value === mode; });
+        const pu = $("proxy-url");
+        if (pu) pu.value = ((up && up.proxy) || cfg.upstreamProxy || "").replace(new RegExp("/+$"), "");
         const st = $("up-state");
         if (up && up.connected === true) { st.className = "badge ok"; st.textContent = "ok · " + (up.checkedAt ? timeAgo(up.checkedAt) : ""); }
         else if (up && up.connected === false) { st.className = "badge warn"; st.textContent = up.error ? String(up.error) : "error"; }
@@ -479,10 +554,12 @@ export const WEB_CLIENT = `(function () {
             busy(testBtn, true);
             try {
                 const r = await json("/__bili/upstream/test", { method: "POST" });
-                toast(t("toast.connect_ok", { status: r.status }), "ok");
+                // #1426: an HTTP >= 400 answer still proves the network path works — auth is the
+                // client's job, so report reachability instead of a flat failure
                 const st = $("up-state");
-                st.className = "badge ok";
+                st.className = r.status >= 400 ? "badge warn" : "badge ok";
                 st.textContent = "HTTP " + r.status;
+                toast(r.status >= 400 ? t("toast.upstream_reachable", { status: r.status }) : t("toast.connect_ok", { status: r.status }), "ok");
             } catch (e) {
                 toast(t("toast.failed", { msg: e.message }), "err");
                 const st = $("up-state");
@@ -490,6 +567,47 @@ export const WEB_CLIENT = `(function () {
                 st.textContent = e.message;
             } finally {
                 busy(testBtn, false);
+            }
+        });
+        // #1426: restore the config editors lost in the web UI rewrite (PUT endpoints were already in place)
+        const su = $("save-upstream");
+        if (su) su.addEventListener("click", async () => {
+            const modeEl = document.querySelector('input[name="proxy-mode"]:checked');
+            const mode = modeEl ? modeEl.value : "auto";
+            const pu = $("proxy-url");
+            const val = pu ? pu.value.trim() : "";
+            await putCfg(su, { upstreamProxyMode: mode, upstreamProxy: val || null });
+        });
+        const sp = $("save-providers");
+        if (sp) sp.addEventListener("click", async () => {
+            const el = $("providers-json");
+            const raw = el ? el.value.trim() : "";
+            if (!raw) { await putCfg(sp, { providers: {} }); return; }
+            let parsed;
+            try { parsed = JSON.parse(raw); } catch (e) { toast(t("cfg.invalid_json"), "err"); return; }
+            if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) { toast(t("cfg.invalid_json"), "err"); return; }
+            await putCfg(sp, { providers: parsed });
+        });
+        const sc = $("save-compress");
+        if (sc) sc.addEventListener("click", async () => {
+            const el = $("compress-json");
+            const raw = el ? el.value.trim() : "";
+            if (!raw) { await putCfg(sc, { compress: null }); return; }
+            let parsed;
+            try { parsed = JSON.parse(raw); } catch (e) { toast(t("cfg.invalid_json"), "err"); return; }
+            await putCfg(sc, { compress: parsed });
+        });
+        const cp = $("clear-passthrough");
+        if (cp) cp.addEventListener("click", async () => {
+            busy(cp, true);
+            try {
+                await json("/__bili/config", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ passthrough: null }) });
+                toast(t("toast.passthrough_cleared"), "ok");
+                loadConfig();
+            } catch (e) {
+                toast(e.message, "err");
+            } finally {
+                busy(cp, false);
             }
         });
         document.addEventListener("click", (ev) => {

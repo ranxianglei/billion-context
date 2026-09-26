@@ -127,7 +127,7 @@ table.data { width: 100%; border-collapse: collapse; font-size: 13px; }
 table.data th {
     text-align: left; padding: 9px 12px; font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.04em;
     color: var(--text-muted); border-bottom: 1px solid var(--border); background: var(--bg-muted);
-    position: sticky; top: 52px; z-index: 2;
+    white-space: nowrap;
 }
 table.data td { padding: 9px 12px; border-bottom: 1px solid var(--border-soft); vertical-align: middle; }
 table.data tr:last-child td { border-bottom: none; }
@@ -252,4 +252,15 @@ tr[title] { cursor: pointer; }
 .bar-fill.warn { background: #d29922; }
 .bar-fill.danger { background: #cf222e; }
 pre.small-pre { max-height: 220px; overflow: auto; }
+.modes { display: flex; gap: 18px; flex-wrap: wrap; margin-bottom: 10px; }
+.modes label { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-muted); cursor: pointer; user-select: none; }
+.field-input { width: 100%; border: 1px solid var(--border); background: var(--bg-muted); color: var(--text); border-radius: 8px; padding: 7px 10px; font-size: 13px; outline: none; }
+.field-input:focus { border-color: var(--accent); }
+.editor { width: 100%; min-height: 240px; resize: vertical; border: 1px solid var(--border); background: var(--bg-muted); color: var(--text); border-radius: 8px; padding: 10px 12px; font-family: var(--mono); font-size: 12px; line-height: 1.55; tab-size: 2; white-space: pre; overflow: auto; outline: none; }
+.editor:focus { border-color: var(--accent); }
+.editor:disabled { opacity: 0.6; cursor: not-allowed; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.chip { border: 1px solid var(--border); background: var(--bg-muted); border-radius: 999px; padding: 4px 12px; font-size: 12px; color: var(--text-muted); }
+.row-id { display: block; margin-top: 3px; font-family: var(--mono); font-size: 11px; color: var(--text-faint); max-width: 400px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pt-row { display: flex; align-items: center; gap: 10px; }
 `;

@@ -259,10 +259,10 @@ test("#154: PUT /__bili/config with compress hot-applies the global compress blo
     const base = `http://127.0.0.1:${port}`;
     try {
         const ui = await (await fetch(`${base}/__bili/`)).text();
-        // #1420 read-only phase: compress config renders as a read-only codebox, edit controls removed
+        // #1426: config editors restored — provider routes & global compress settings are editable textareas
         assert.match(ui, /compress-json/);
-        assert.doesNotMatch(ui, /<textarea/);
-        assert.doesNotMatch(ui, /save-compress|save-providers/);
+        assert.match(ui, /<textarea/);
+        assert.match(ui, /save-compress|save-providers/);
 
         const before = await (await fetch(`${base}/__bili/config`)).json() as { compress: unknown };
         assert.equal(before.compress, null);

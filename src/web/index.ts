@@ -1,7 +1,5 @@
-import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { renderPage } from "./page.js";
+import { VERSION } from "../version.js";
 
 export {
     handleConfigGet,
@@ -12,16 +10,9 @@ export {
 
 export { buildOverview, buildSessionList, buildSessionDetail } from "./sessions-data.js";
 
-function version(): string {
-    try {
-        const here = fileURLToPath(import.meta.url);
-        const packagePath = join(dirname(here), "..", "..", "package.json");
-        return (JSON.parse(readFileSync(packagePath, "utf8")) as { version?: string }).version ?? "dev";
-    } catch {
-        return "dev";
-    }
-}
-
 export function renderUI(origin: string): string {
-    return renderPage(origin, version());
+    // #1426 fix: reuse the bundle-safe VERSION from src/version.ts — resolving
+    // package.json relative to import.meta.url broke once tsup bundles this
+    // module into dist/index.js (two levels up from dist/ misses the repo).
+    return renderPage(origin, VERSION);
 }
