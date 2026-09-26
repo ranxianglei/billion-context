@@ -442,16 +442,14 @@
 #### `priceProfile`
 
 - **类型：** `object`（`{ w?, r?, q? }`，均为非负数）
-- **默认值：** *（未设置 —— 未设置的字段各自回落到 `w: 1`、`r: 0.1`、`q: 4`，内置的 Anthropic 比例近似；整键缺省时报告输出与 #1279 之前逐字节一致）*
+- **默认值：** *（未设置 —— 报告改用请求模型在 models.dev 的价格行计价（绝对 $/Mtok）；只有注册表解析不到的模型才回落到内核内置相对比例 `{ w: 1, r: 0.1, q: 4 }`）*
 - **状态：** ACTIVE
-- **说明：** 会话缓存报告（`acp_cache` 工具 / `/acp-cache` 命令 / `GET /__bili/cache-report`，#800/#1279）中**压缩经济学判定**所用的价格档。每个 fold 的损益字段（`oneTimeCostUnits`、`perTurnSavingUnits`、`breakevenTurns`、`paidBack`）以输入 token 当量为单位，采用**相对输入 token 单价（p_in = 1）归一化的乘数**：
-  - `w` = cacheWrite 价格 ÷ input 价格（写穿透附加费；供应商按正常 input 价计费 cache 写入时为 `1`）
-  - `r` = cacheRead 价格 ÷ input 价格（缓存命中折扣因子）
-  - `q` = output 价格 ÷ input 价格
-  同一 fold 在不同供应商的价格体系下会给出不同的回本点与 PAID BACK 判定——例如默认档下 DeepSeek 类上游（output 倍数低）的回本点被高估约 2.7×（#1279）。子字段与其他 CompressSettings 字段一样按“深层覆盖”三级合并（provider 层设 `q`、model 层精调单个字段均可）。最近一次请求生效的值会被戳记到会话上，因此所有报告出口都用该会话最近一轮所适用的价格档计价——无需请求级上下文管道。**纯报表面**：价格档绝不影响压缩触发、频率或任何 wire 行为。示例：
+- **说明：** 会话缓存报告（`acp_cache` 工具 / `/acp-cache` 命令 / `GET /__bili/cache-report`，#800/#1279）中**压缩经济学判定**所用的价格档。每个 fold 的损益字段（`oneTimeCostUnits`、`perTurnSavingUnits`、`breakevenTurns`、`paidBack`）由三个基于输入 token 单位的乘数计算得出：`w`（cache 写入成本）、`r`（cache 读取成本）、`q`（output 成本）。两种单位约定并存，且都会原样打印在报告头部（`FOLD ECONOMICS (N folds @ w=.. r=.. q=..)`）：
+  - **用户配置**采用**相对输入价归一化（p_in = 1）的比例**：`w` = cacheWrite ÷ input，`r` = cacheRead ÷ input，`q` = output ÷ input。子字段与其他 CompressSettings 字段一样按“深层覆盖”三级合并（provider 层设 `q`、model 层精调单个字段均可）；部分配置中未设置的字段回落到内核比例 `w: 1`、`r: 0.1`、`q: 4`。
+  - **注册表默认**（任何层级都未设置该键时）：由请求模型在 models.dev 的价格行推导——**绝对 $/Mtok**，`w = cost.input`，`r = cost.cache_read ?? 0.1 × input`，`q = cost.output ?? 1.5 × input`（缺这些字段的行用惯例回落值）。直连供应商流量取该 host 自己的挂牌行；未知中转站取跨 host 第一个匹配行（挂牌冲突时一次性告警）。可达时实时注册表优先，随包快照为离线兜底（#282）。
+  用户配置整体胜出——任何层级设置了 profile 都不会与注册表行逐字段混用。最近一次请求生效的值会被戳记到会话上，因此所有报告出口都用该会话最近一轮所适用的价格档计价。**纯报表面**：价格档绝不影响压缩触发、频率或任何 wire 行为。用户配置示例（覆盖注册表行，例如中转站有自定义加成时）：
   ```jsonc
-  // Anthropic ≈ 默认档：缓存读取便宜（~0.1×）、output 倍数 ~4× → 直接省略该键
-  // DeepSeek-V3 ≈ output 倍数低 —— 默认档把它的回本点高估了约 2.7×
+  // DeepSeek-V3 ≈ output 倍数低
   { "providers": { "https://api.deepseek.com": { "compress": { "priceProfile": { "w": 1, "r": 0.1, "q": 1.5 } } } } }
   // OpenAI GPT-4o/o 系列：缓存读取五折、写入平价、output 4×
   { "providers": { "https://api.openai.com": { "compress": { "priceProfile": { "w": 1, "r": 0.5, "q": 4 } } } } }

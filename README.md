@@ -884,9 +884,11 @@ API: `bili plugin install claude` writes a model-mediated
 MCP tool and pastes the report back verbatim. codex/kimi/hermes expose no
 user-typable command seam — ask the model to call its `acp_cache` tool directly.
 Per-fold P&L verdicts are priced by the optional `compress.priceProfile`
-(normalized multipliers over the input-token unit; default = built-in
-Anthropic-ratio approximation) — set it per provider for non-Anthropic upstreams
-so breakeven/PAID BACK reflect their actual economics (CONFIGURATION.md, #1279).
+(normalized multipliers over the input-token unit); when no level sets it, the
+request model's models.dev price row applies in absolute $/Mtok (kernel ratio
+defaults only for unresolvable models) — breakeven/PAID BACK therefore reflect
+your upstream's actual economics out of the box; override per provider for
+relays with custom markup (CONFIGURATION.md, #1279).
 
 The same seam carries `/acp-rule` (#1251) — the human entry point to the
 persistent-rules feature (identical output to the `acp_rule` tool): pi/omp

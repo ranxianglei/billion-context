@@ -10,7 +10,7 @@ import type { CompressSettings, ProxyOptions } from "./config.js";
 import { loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
 import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol } from "./config.js";
-import { contextFromRegistry, loadRegistry, peekRegistryContext, peekRegistryOutputLimit } from "./registry.js";
+import { contextFromRegistry, loadRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "./registry.js";
 import { codexAlignedWindow } from "./codex-models.js";
 import { fetchWithTimeout, MAX_REQUEST_BYTES, upstreamTimeoutMs } from "./fetch-util.js";
 import { formatUpstreamError, getUpstreamConnectionStatus, recordUpstreamConnection, resolveProxy, resolveProxyDecision, proxyDispatcher, type UpstreamProxyDecision } from "./upstream-proxy.js";
@@ -2162,9 +2162,18 @@ async function handle(
                     // profile on the session so request-context-free report faces
                     // (acp_cache / /acp-cache / __bili/cache-report) price folds
                     // with the profile that governed this turn; unset clears it
-                    // (latest-wins, like activePack). Report-only — no trigger impact.
+                    // (latest-wins, like activePack). User config at any level wins
+                    // wholesale; when no level configures one, fall back to the
+                    // model's models.dev price (absolute $/Mtok) so out-of-box
+                    // reports read in real money instead of Anthropic-ratio
+                    // guesses. Report-only — no trigger impact.
                     if (cs.priceProfile !== undefined && Object.keys(cs.priceProfile).length > 0) session.metadata.cachePriceProfile = cs.priceProfile;
-                    else delete session.metadata.cachePriceProfile;
+                    else {
+                        const priceHost = (() => { try { return new URL(route?.rewrittenUrl ?? upstreamOrigin).host; } catch { return undefined; } })();
+                        const registryProfile = peekRegistryPriceProfile(requestModel, priceHost);
+                        if (registryProfile !== undefined) session.metadata.cachePriceProfile = registryProfile;
+                        else delete session.metadata.cachePriceProfile;
+                    }
                     const visibilityMarkers = cs.visibilityMarkers ?? true;
                     const reasoningCfg = cs.reasoning;
                     const keepRecent = cs.stripImagesKeepRecent ?? DEFAULT_STRIP_IMAGES_KEEP_RECENT;
