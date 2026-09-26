@@ -17,7 +17,7 @@ import { assignRefs, createCore, createInitialState, defaultConfig, emptyRefMap 
 import type { Session } from "../src/session.ts";
 import { applyRanges, type RewriteCtx } from "../src/stream.ts";
 import { parseCompressInput } from "../src/compress-tool.ts";
-import { buildVisibilityMarker } from "../src/compress-loop.ts";
+import { buildVisibilityMarker } from "../src/loop/core.ts";
 import { stripAcpStatusMarkers } from "../src/acp-panel.ts";
 
 const SUMMARY = "summary ".repeat(20);

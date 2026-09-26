@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createCore, createInitialState, defaultConfig, type CompressionState } from "acp-kernel";
 import { anthropicToCore, type AnthropicRequestBody } from "acp-kernel/wire";
 import type { Session } from "../src/session.ts";
-import { buildVisibilityMarker } from "../src/compress-loop.ts";
+import { buildVisibilityMarker } from "../src/loop/core.ts";
 import { executeSearchContext } from "../src/decompress-shared.ts";
 
 function makeSession(): Session {

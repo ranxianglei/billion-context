@@ -3,58 +3,16 @@ import {
     type Config,
     type CoreMessage,
 } from "acp-kernel";
-import { handleAcpStatus } from "./acp-status.js";
-import { handleAcpCache } from "./cache-ledger.js";
 import { lastCompressSuffix, withSessionLock, type Session } from "./session.js";
-import { parseCompressInput, PROXY_TOOL_NAMES, MUTATING_PROXY_TOOLS, COMPRESS_TOOL_NAME, ACP_TEXT_OPEN, ACP_TEXT_CLOSE } from "./compress-tool.js";
+import { extractResponsesTextTriggers, PROXY_TOOL_NAMES, MUTATING_PROXY_TOOLS } from "./compress-tool.js";
 import { log as loggerLog } from "./logger.js";
-import { applyRanges } from "./stream.js";
-import { executeSearchContextTarget, resolveDecompress } from "./decompress-shared.js";
-import { ccrEnabled, drainPendingRetrievals, executeRetrieve, retrieveToolName } from "./store.js";
-import { buildVisibilityMarker } from "./compress-loop.js";
+import { drainPendingRetrievals } from "./store.js";
+import { executeProxyTool, buildVisibilityMarker } from "./loop/core.js";
 import { hoistTrappedToolItems, type ToolPairItem } from "./tool-pair-order.js";
 import { MAX_LOOP_ROUNDS } from "./loop/index.js";
 import { stripResponsesText } from "./loop/tag-echo-filter.js";
 import { fetchWithRetry, UpstreamHttpError } from "./fetch-util.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
-
-/** Extract  triggers from assistant text.
- *  Returns the cleaned text (trigger removed) and synthesized function-call
- *  accumulators so the existing compress loop can execute them like real tool
- *  calls and loop again with the result. */
-function extractTextTriggers(text: string): { clean: string; calls: FunctionCallAccumulator[] } {
-    const calls: FunctionCallAccumulator[] = [];
-    let clean = "";
-    let i = 0;
-    let n = 0;
-    while (i < text.length) {
-        const open = text.indexOf(ACP_TEXT_OPEN, i);
-        if (open === -1) {
-            clean += text.slice(i);
-            break;
-        }
-        clean += text.slice(i, open);
-        const after = open + ACP_TEXT_OPEN.length;
-        const close = text.indexOf(ACP_TEXT_CLOSE, after);
-        if (close === -1) {
-            // malformed/incomplete trigger — pass through as plain text
-            clean += text.slice(open);
-            break;
-        }
-        const payload = text.slice(after, close).trim();
-        if (payload) {
-            const stamp = `${Date.now()}_${n++}`;
-            calls.push({
-                itemId: `fc_text_${stamp}`,
-                callId: `call_text_${stamp}`,
-                name: COMPRESS_TOOL_NAME,
-                arguments: payload,
-            });
-        }
-        i = close + ACP_TEXT_CLOSE.length;
-    }
-    return { clean, calls };
-}
 
 interface CompressLoopResponsesCtx {
     core: CompressionCore;
@@ -83,32 +41,6 @@ interface FunctionCallAccumulator {
     callId: string;
     name: string;
     arguments: string;
-}
-
-function executeProxyTool(
-    toolName: string,
-    args: Record<string, unknown>,
-    ctx: CompressLoopResponsesCtx,
-): string {
-    if (toolName === "compress") {
-        return applyRanges(parseCompressInput(args), ctx);
-    }
-    if (toolName === "decompress") {
-        return resolveDecompress(args, ctx);
-    }
-    if (toolName === "search_context") {
-        return executeSearchContextTarget(args, ctx.core, ctx.session.id, ctx.session.state);
-    }
-    if (toolName === "acp_status") {
-        return handleAcpStatus(args, ctx);
-    }
-    if (toolName === "acp_cache") {
-        return handleAcpCache(ctx.session, args);
-    }
-    if (ccrEnabled(ctx.session) && toolName === retrieveToolName(ctx.session)) {
-        return executeRetrieve(args, ctx.session);
-    }
-    return `[Unknown proxy tool: ${toolName}]`;
 }
 
 function responsesJsonOutput(response: Record<string, unknown>): {
@@ -165,7 +97,7 @@ function surfaceReadonlyJson(
         }
         let result: string;
         try {
-            result = executeProxyTool(call.name, args, ctx);
+            result = executeProxyTool(call.name, args, ctx, call.callId);
             ctx.log(`[acp-proxy: responses JSON ${call.name} (read-only) → ${result.slice(0, 120).replace(/\n/g, " ")}]`);
         } catch (e) {
             result = `\u274c [ACP] ${call.name} FAILED: ${String(e)}`;
@@ -198,8 +130,8 @@ export async function compressLoopResponsesJson(
     for (let loopCount = 1; loopCount <= MAX_LOOP_ROUNDS; loopCount++) {
         current = stripResponsesText(current);
         const output = responsesJsonOutput(current);
-        const extracted = extractTextTriggers(output.text);
-        const allCalls = [...output.calls, ...extracted.calls].filter((call) => call.name.length > 0);
+        const extracted = extractResponsesTextTriggers(output.text);
+        const allCalls = [...output.calls, ...extracted.calls.map((c): FunctionCallAccumulator => ({ itemId: `fc_${c.callId}`, callId: c.callId, name: c.name, arguments: c.arguments }))].filter((call) => call.name.length > 0);
         const proxyCalls = allCalls.filter((call) => PROXY_TOOL_NAMES.has(call.name));
         const realCalls = allCalls.filter((call) => !PROXY_TOOL_NAMES.has(call.name));
         const mutatingProxy = proxyCalls.filter((call) => MUTATING_PROXY_TOOLS.has(call.name));
@@ -221,7 +153,7 @@ export async function compressLoopResponsesJson(
             } catch (error) {
                 loggerLog("warn", `[acp-compress-args] ${call.name} JSON.parse failed: ${String(error)}`);
             }
-            const result = await withSessionLock(ctx.session, () => executeProxyTool(call.name, args, ctx));
+            const result = await withSessionLock(ctx.session, () => executeProxyTool(call.name, args, ctx, call.callId));
             ctx.log(`[acp-proxy: responses JSON ${call.name} → ${result.slice(0, 120).replace(/\n/g, " ")}]`);
             if (ctx.visibilityMarkers !== false) inputItems.push({ type: "message", role: "developer", content: buildVisibilityMarker(call.name, result) });
         }

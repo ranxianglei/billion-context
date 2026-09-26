@@ -36,6 +36,14 @@ import {
     ACP_TOOLS_OPENAI,
     ACP_TOOLS_RESPONSES,
     ACP_READONLY_TOOLS_RESPONSES,
+    ACP_TEXT_OPEN,
+    ACP_TEXT_CLOSE,
+    ACP_STATUS_OPEN,
+    ACP_STATUS_CLOSE,
+    ACP_SEARCH_OPEN,
+    ACP_SEARCH_CLOSE,
+    ACP_DECOMPRESS_OPEN,
+    ACP_DECOMPRESS_CLOSE,
 } from "acp-kernel";
 import { log as loggerLog } from "./logger.js";
 import { maxShrinkPerCompress } from "./fetch-util.js";
@@ -247,6 +255,43 @@ export function parseCompressInput(input: unknown, callId?: string) {
         loggerLog("warn", `[acp-compress-input] rejected: kind=${parsed.diagnostics.kind} invalidItems=${parsed.diagnostics.invalidItems}${parsed.diagnostics.keys ? ` keys=[${parsed.diagnostics.keys.join(",")}]` : ""}${parsed.diagnostics.length !== undefined ? ` len=${parsed.diagnostics.length}` : ""}${parsed.diagnostics.invalidReasons && parsed.diagnostics.invalidReasons.length > 0 ? ` reasons=[${parsed.diagnostics.invalidReasons.join(" | ")}]` : ""}`);
     }
     return { ranges: parsed.ranges, diagnostics: parsed.diagnostics };
+}
+
+// #1439: shared by the streaming Responses adapter AND the non-streaming JSON
+// loop so both recognize the same triggers — a private copy in one path drifted.
+export interface ResponsesTextTriggerCall {
+    name: string;
+    callId: string;
+    arguments: string;
+}
+export function extractResponsesTextTriggers(
+    text: string,
+): { clean: string; calls: ResponsesTextTriggerCall[] } {
+    const calls: ResponsesTextTriggerCall[] = [];
+    let clean = text;
+    let hadTrigger = false;
+    const triggers = [
+        { name: "compress", open: ACP_TEXT_OPEN, close: ACP_TEXT_CLOSE, requirePayload: true },
+        { name: "acp_status", open: ACP_STATUS_OPEN, close: ACP_STATUS_CLOSE, requirePayload: false },
+        { name: "search_context", open: ACP_SEARCH_OPEN, close: ACP_SEARCH_CLOSE, requirePayload: true },
+        { name: "decompress", open: ACP_DECOMPRESS_OPEN, close: ACP_DECOMPRESS_CLOSE, requirePayload: true },
+    ];
+    for (const t of triggers) {
+        let start = clean.indexOf(t.open);
+        while (start >= 0) {
+            const end = clean.indexOf(t.close, start + t.open.length);
+            if (end < 0) break;
+            hadTrigger = true;
+            const payload = clean.slice(start + t.open.length, end).trim();
+            if (payload.length > 0 || !t.requirePayload) {
+                const stamp = `${Date.now()}-${calls.length}`;
+                calls.push({ name: t.name, callId: `call_text_${stamp}`, arguments: payload.length > 0 ? payload : "{}" });
+            }
+            clean = clean.slice(0, start) + clean.slice(end + t.close.length);
+            start = clean.indexOf(t.open);
+        }
+    }
+    return { clean: hadTrigger ? clean : text, calls };
 }
 
 // #189 staged-compression / prefix-survival guidance, appended to the nudge

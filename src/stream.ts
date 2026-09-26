@@ -24,7 +24,7 @@ export type RewriteCtx = {
 };
 
 // Dispatch all four ACP proxy tools to the same logic the OpenAI/Responses
-// path uses (compress-loop.ts executeProxyTool). compress mutates context
+// path uses (loop/core.ts executeProxyTool). compress mutates context
 // (handled by applyRanges); the other three are read-only queries whose result
 // becomes a text block replacing the intercepted tool_use.
 function executeAnthropicProxyTool(toolName: string, args: Record<string, unknown>, ctx: RewriteCtx): string {
