@@ -3,7 +3,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { loadClientConfig, resolvePiHome, resolveCodebuddyHome, resolveQoderHome, resolveTraeHome, resolveZcodeHome, zcodePersonalConfigFiles, nonEmpty, QODER_DEFAULT_MODEL_HOSTS, TRAE_DEFAULT_MODEL_HOSTS, AIDER_DEFAULT_MODEL_HOSTS, OPENCODE_DEFAULT_MODEL_HOSTS, type ClientConfig } from "./client-config.js";
+import { loadClientConfig, resolvePiHome, resolveOmpHome, resolveCodebuddyHome, resolveQoderHome, resolveTraeHome, resolveZcodeHome, zcodePersonalConfigFiles, opencodeConfigFiles, nonEmpty, QODER_DEFAULT_MODEL_HOSTS, TRAE_DEFAULT_MODEL_HOSTS, AIDER_DEFAULT_MODEL_HOSTS, OPENCODE_DEFAULT_MODEL_HOSTS, type ClientConfig } from "./client-config.js";
 
 const TTL_MS = 2000;
 
@@ -42,6 +42,14 @@ export function extractHttpsHosts(config: ClientConfig): string[] {
     }
     if (config.zcode) {
         for (const prov of Object.values(config.zcode.providers)) push(prov.baseURL);
+    }
+    // opencode/omp ride cert-MITM via HTTPS_PROXY; custom providers declared in
+    // their configs (options.baseURL / baseUrl) blind-tunnel without this (#1411).
+    for (const prov of Object.values(config.opencode?.providers ?? {})) {
+        if (typeof prov.baseURL === "string") push(prov.baseURL);
+    }
+    for (const prov of Object.values(config.omp?.providers ?? {})) {
+        if (typeof prov.baseUrl === "string") push(prov.baseUrl);
     }
     if (config.codebuddy) {
         push(config.codebuddy.codebuddyBaseUrl);
@@ -96,6 +104,10 @@ function configFilePaths(env: NodeJS.ProcessEnv): string[] {
         path.join(process.cwd(), ".codebuddy", "models.json"),
         path.join(resolveQoderHome(env), "settings.json"),
         path.join(resolveTraeHome(env), "traecli.yaml"),
+        // Must mirror exactly what loadClientConfig reads for the fields
+        // extractHttpsHosts consumes, or edits go stale in the mtime cache (#1411).
+        ...opencodeConfigFiles(env),
+        path.join(resolveOmpHome(env), "models.yml"),
     ];
 }
 

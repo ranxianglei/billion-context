@@ -1219,6 +1219,18 @@ export function resolveOpencodeConfigFile(env: NodeJS.ProcessEnv): string {
     return path.join(dir, "opencode.jsonc");
 }
 
+// The complete set of files whose contents feed config.opencode (exactly what
+// readOpencodeConfigRoot reads): the three global candidates + an explicit
+// OPENCODE_CONFIG when set. The discovery mtime cache must watch this same set
+// or edits go stale (#1411).
+export function opencodeConfigFiles(env: NodeJS.ProcessEnv): string[] {
+    const xdg = nonEmpty(env.XDG_CONFIG_HOME) ? env.XDG_CONFIG_HOME : path.join(os.homedir(), ".config");
+    const dir = path.join(xdg, "opencode");
+    const files = OPENCODE_CONFIG_FILES.map((f) => path.join(dir, f));
+    if (nonEmpty(env.OPENCODE_CONFIG)) files.push(env.OPENCODE_CONFIG);
+    return files;
+}
+
 // opencode accepts JSONC (comments, trailing commas) in every config file; a strict
 // JSON.parse silently yields "no config" for .jsonc users.
 export function parseConfigText(text: string): Record<string, unknown> | undefined {
