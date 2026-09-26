@@ -320,12 +320,14 @@ test("#1408: assignment survives a restart (disk round-trip)", async () => {
         assert.ok(file, "session file written");
         const envelope = JSON.parse(readFileSync(file, "utf8"));
         assert.equal(envelope.payload.meta.packCanary, "lean", "assignment persisted on disk");
+        assert.equal(envelope.payload.meta.activePack, "lean", "audit stamp persisted on disk");
         // Simulated restart: a fresh store loading the same directory sees the stamp.
         const reloader = new SessionStore({ dir, enabled: true, debounceMs: 0 });
         const reloadedMap = await reloader.loadAll();
         const reloaded = reloadedMap.get(eligible[0]);
         assert.ok(reloaded, "reloaded session");
         assert.equal(reloaded.meta.packCanary, "lean", "reloaded session keeps its assignment");
+        assert.equal(reloaded.meta.activePack, "lean", "reloaded session keeps the audit stamp");
     } finally {
         await h.close();
         rmSync(dir, { recursive: true, force: true });
