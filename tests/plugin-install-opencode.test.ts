@@ -6,14 +6,20 @@ import path from "node:path";
 import {
     applyOpencodePluginEntry,
     isNpmInstallForm,
+    isOpencodeNpmEntry,
     OPENCODE_NPM_ENTRY,
+    opencodeNpmEntry,
     pluginInstall,
     pluginRemove,
     pluginStatusAll,
+    pluginUpdate,
+    repinOpencodeEntryTo,
     selfPackageRoot,
 } from "../src/plugin-install.ts";
 
 const NPM_ROOT = "/usr/local/lib/node_modules/billion-context";
+const V = "0.1.135";
+const PIN = `billion-context@${V}`;
 
 function tempDir(prefix: string): string {
     return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -35,31 +41,58 @@ test("isNpmInstallForm: npm/pnpm/yarn roots are npm form, checkouts are not", ()
     assert.equal(isNpmInstallForm("/srv/node_modules"), false);
 });
 
-test("applyOpencodePluginEntry: npm form writes the bare package name only", () => {
-    const args = entryArgs(NPM_ROOT, tempDir("bili-oc-npm-"));
-    const notes = applyOpencodePluginEntry(args);
-    assert.deepEqual(args.data.plugin, [OPENCODE_NPM_ENTRY]);
-    assert.deepEqual(notes, [`plugin -> ${OPENCODE_NPM_ENTRY}`]);
-    assert.equal(fs.existsSync(args.shimDir), false);
+test("opencodeNpmEntry/isOpencodeNpmEntry: pinned spec for a semver, bare fallback, both recognized (#1108)", () => {
+    assert.equal(opencodeNpmEntry("0.1.135"), PIN);
+    assert.equal(opencodeNpmEntry("0.1.135-beta.1"), `billion-context@0.1.135-beta.1`);
+    assert.equal(opencodeNpmEntry(""), OPENCODE_NPM_ENTRY, "unknown version falls back to the bare name (still loadable)");
+    assert.equal(opencodeNpmEntry("0.0.0"), OPENCODE_NPM_ENTRY, "placeholder version falls back too");
+    assert.equal(isOpencodeNpmEntry(PIN), true);
+    assert.equal(isOpencodeNpmEntry(OPENCODE_NPM_ENTRY), true, "legacy bare entries are still ours");
+    assert.equal(isOpencodeNpmEntry("billion-context-plugin"), false, "different package");
+    assert.equal(isOpencodeNpmEntry("@scope/billion-context"), false, "scoped lookalike");
 });
 
-test("applyOpencodePluginEntry: npm form migrates a legacy dev shim to the bare name and deletes the dir", () => {
+test("applyOpencodePluginEntry: npm form writes a version-pinned entry, not the bare name (#1108)", () => {
+    const args = entryArgs(NPM_ROOT, tempDir("bili-oc-npm-"));
+    const notes = applyOpencodePluginEntry({ ...args, version: V });
+    assert.deepEqual(args.data.plugin, [PIN]);
+    assert.deepEqual(notes, [`plugin -> ${PIN}`]);
+    assert.equal(fs.existsSync(args.shimDir), false);
+    // No version resolvable → bare fallback, still a valid entry.
+    const bare = entryArgs(NPM_ROOT, tempDir("bili-oc-npm-bare-"));
+    assert.deepEqual(applyOpencodePluginEntry(bare), [`plugin -> ${OPENCODE_NPM_ENTRY}`]);
+    assert.deepEqual(bare.data.plugin, [OPENCODE_NPM_ENTRY]);
+});
+
+test("applyOpencodePluginEntry: npm form re-pins a stale pin and migrates a legacy bare entry (#1108)", () => {
+    const args = entryArgs(NPM_ROOT, tempDir("bili-oc-repin-"));
+    args.data.plugin = ["other-pkg", "billion-context@0.1.100"];
+    const notes = applyOpencodePluginEntry({ ...args, version: V });
+    assert.deepEqual(args.data.plugin, ["other-pkg", PIN]);
+    assert.equal(notes[0], `plugin -> ${PIN} (replaced billion-context@0.1.100)`);
+    const legacy = entryArgs(NPM_ROOT, tempDir("bili-oc-legacy-"));
+    legacy.data.plugin = [OPENCODE_NPM_ENTRY];
+    assert.equal(applyOpencodePluginEntry({ ...legacy, version: V })[0], `plugin -> ${PIN} (replaced ${OPENCODE_NPM_ENTRY})`);
+    assert.deepEqual(legacy.data.plugin, [PIN]);
+});
+
+test("applyOpencodePluginEntry: npm form migrates a legacy dev shim to the pinned entry and deletes the dir", () => {
     const base = tempDir("bili-oc-migrate-");
     const args = entryArgs(NPM_ROOT, base);
     fs.mkdirSync(args.shimDir, { recursive: true });
     fs.writeFileSync(path.join(args.shimDir, "index.js"), 'export { default } from "/opt/old/dist/agent/opencode-native.js";\n');
     args.data.plugin = ["other-pkg", args.shimDir];
-    const notes = applyOpencodePluginEntry(args);
-    assert.deepEqual(args.data.plugin, ["other-pkg", OPENCODE_NPM_ENTRY]);
-    assert.equal(notes[0], `plugin -> ${OPENCODE_NPM_ENTRY} (replaced ${args.shimDir})`);
+    const notes = applyOpencodePluginEntry({ ...args, version: V });
+    assert.deepEqual(args.data.plugin, ["other-pkg", PIN]);
+    assert.equal(notes[0], `plugin -> ${PIN} (replaced ${args.shimDir})`);
     assert.equal(fs.existsSync(args.shimDir), false);
 });
 
-test("applyOpencodePluginEntry: npm form is idempotent", () => {
+test("applyOpencodePluginEntry: npm form is idempotent at the same pin", () => {
     const args = entryArgs(NPM_ROOT, tempDir("bili-oc-idem-"));
-    args.data.plugin = [OPENCODE_NPM_ENTRY];
-    assert.deepEqual(applyOpencodePluginEntry(args), ["plugin present"]);
-    assert.deepEqual(args.data.plugin, [OPENCODE_NPM_ENTRY]);
+    args.data.plugin = [PIN];
+    assert.deepEqual(applyOpencodePluginEntry({ ...args, version: V }), ["plugin present"]);
+    assert.deepEqual(args.data.plugin, [PIN]);
 });
 
 test("applyOpencodePluginEntry: dev form writes a local shim and warns it is not portable", () => {
@@ -85,18 +118,18 @@ test("applyOpencodePluginEntry: non-string plugin entries are preserved verbatim
     const args = entryArgs(NPM_ROOT, tempDir("bili-oc-nonstr-"));
     const objs = [{ package: "@org/x" }, { package: "y", options: { z: 1 } }];
     args.data.plugin = [42, null, ...objs, "other-pkg"];
-    const notes = applyOpencodePluginEntry(args);
-    assert.deepEqual(args.data.plugin, [42, null, ...objs, "other-pkg", OPENCODE_NPM_ENTRY]);
-    assert.deepEqual(notes, [`plugin -> ${OPENCODE_NPM_ENTRY}`]);
+    const notes = applyOpencodePluginEntry({ ...args, version: V });
+    assert.deepEqual(args.data.plugin, [42, null, ...objs, "other-pkg", PIN]);
+    assert.deepEqual(notes, [`plugin -> ${PIN}`]);
 });
 
 test("applyOpencodePluginEntry: idempotent run with foreign objects leaves the key untouched (#1002)", () => {
     const args = entryArgs(NPM_ROOT, tempDir("bili-oc-idem-obj-"));
     const objs = [{ package: "@org/x" }];
-    args.data.plugin = [...objs, OPENCODE_NPM_ENTRY];
+    args.data.plugin = [...objs, PIN];
     const touched = new Set<string>();
     const before = args.data.plugin;
-    assert.deepEqual(applyOpencodePluginEntry({ ...args, touched }), ["plugin present"]);
+    assert.deepEqual(applyOpencodePluginEntry({ ...args, touched, version: V }), ["plugin present"]);
     assert.equal(touched.size, 0, "no key touched — no rewrite");
     assert.equal(args.data.plugin, before, "same array reference, untouched");
 });
@@ -104,14 +137,14 @@ test("applyOpencodePluginEntry: idempotent run with foreign objects leaves the k
 test("applyOpencodePluginEntry: map-form plugins keep foreign options and stay a map (#1002)", () => {
     const args = entryArgs(NPM_ROOT, tempDir("bili-oc-map-"));
     args.data.plugins = { "@org/x": { options: { z: 1 } }, "plain-y": true };
-    applyOpencodePluginEntry({ ...args, key: "plugins" });
-    assert.deepEqual(args.data.plugins, { "@org/x": { options: { z: 1 } }, "plain-y": true, [OPENCODE_NPM_ENTRY]: true });
+    applyOpencodePluginEntry({ ...args, key: "plugins", version: V });
+    assert.deepEqual(args.data.plugins, { "@org/x": { options: { z: 1 } }, "plain-y": true, [PIN]: true });
     assert.ok(!Array.isArray(args.data.plugins), "map form preserved");
 });
 
 type OcCfg = { plugin?: unknown; compaction?: { auto?: boolean } & Record<string, unknown>; mcp?: unknown };
 
-test("pluginInstall/remove/status opencode end-to-end (dev form under tsx)", (t) => {
+test("pluginInstall/remove/status opencode end-to-end (dev form under tsx)", async (t) => {
     const prevXdg = process.env.XDG_CONFIG_HOME;
     const prevState = process.env.XDG_STATE_HOME;
     const prevOpen = process.env.OPENCODE_CONFIG;
@@ -171,6 +204,70 @@ test("pluginInstall/remove/status opencode end-to-end (dev form under tsx)", (t)
     assert.equal(ocStatus(), "not installed");
 
     assert.match(pluginRemove("opencode"), /not installed/);
+});
+
+test("repinOpencodeEntryTo: stale pin re-pinned in place, foreign entries and position preserved (#1108)", (t) => {
+    const prevXdg = process.env.XDG_CONFIG_HOME;
+    const xdg = tempDir("bili-oc-xdg-");
+    process.env.XDG_CONFIG_HOME = xdg;
+    t.after(() => {
+        if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+        else process.env.XDG_CONFIG_HOME = prevXdg;
+    });
+    fs.mkdirSync(path.join(xdg, "opencode"), { recursive: true });
+    const file = path.join(xdg, "opencode", "opencode.json");
+    const readCfg = (): OcCfg => JSON.parse(fs.readFileSync(file, "utf8")) as OcCfg;
+    const cfg: OcCfg = { plugin: ["other-pkg", "billion-context@0.1.100", "billion-context@0.1.101"], compaction: { auto: false } };
+    fs.writeFileSync(file, JSON.stringify(cfg, null, 2));
+    const note = repinOpencodeEntryTo("0.1.135", NPM_ROOT);
+    assert.equal(note, "re-pinned billion-context@0.1.100 -> billion-context@0.1.135 (opencode loads it at next boot; bili never touches its package copy, #991)");
+    const after = readCfg();
+    assert.deepEqual(after.plugin, ["other-pkg", PIN]);
+    assert.deepEqual(after.compaction, cfg.compaction, "unrelated keys untouched");
+});
+
+test("repinOpencodeEntryTo: legacy bare entry pinned, map form and unknown version handled", (t) => {
+    const prevXdg = process.env.XDG_CONFIG_HOME;
+    const xdg = tempDir("bili-oc-xdg-");
+    process.env.XDG_CONFIG_HOME = xdg;
+    t.after(() => {
+        if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+        else process.env.XDG_CONFIG_HOME = prevXdg;
+    });
+    fs.mkdirSync(path.join(xdg, "opencode"), { recursive: true });
+    const file = path.join(xdg, "opencode", "opencode.json");
+    const readCfg = (): OcCfg => JSON.parse(fs.readFileSync(file, "utf8")) as OcCfg;
+    fs.writeFileSync(file, JSON.stringify({ plugin: [OPENCODE_NPM_ENTRY] }, null, 2));
+    assert.match(repinOpencodeEntryTo("0.1.135", NPM_ROOT)!, /re-pinned billion-context -> billion-context@0\.1\.135/);
+    assert.deepEqual(readCfg().plugin, [PIN]);
+    fs.writeFileSync(file, JSON.stringify({ plugins: { "@org/x": { options: { z: 1 } }, "billion-context@0.1.100": true } }, null, 2));
+    assert.match(repinOpencodeEntryTo("0.1.135", NPM_ROOT)!, /re-pinned/);
+    assert.deepEqual((readCfg() as Record<string, unknown>).plugins, { "@org/x": { options: { z: 1 } }, [PIN]: true });
+    assert.equal(repinOpencodeEntryTo("0.1.135", NPM_ROOT), undefined, "already current");
+    assert.equal(repinOpencodeEntryTo("", NPM_ROOT), undefined, "unknown version — no pin to write");
+    assert.equal(repinOpencodeEntryTo("0.1.135", selfPackageRoot()), undefined, "dev checkout lane is the shim form — nothing to re-pin");
+});
+
+test("pluginUpdate opencode lane: re-pins a stale entry to the resolved latest, then confirms", async (t) => {
+    const prevXdg = process.env.XDG_CONFIG_HOME;
+    const xdg = tempDir("bili-oc-xdg-");
+    process.env.XDG_CONFIG_HOME = xdg;
+    t.after(() => {
+        if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+        else process.env.XDG_CONFIG_HOME = prevXdg;
+    });
+    fs.mkdirSync(path.join(xdg, "opencode"), { recursive: true });
+    const file = path.join(xdg, "opencode", "opencode.json");
+    const readCfg = (): OcCfg => JSON.parse(fs.readFileSync(file, "utf8")) as OcCfg;
+    fs.writeFileSync(file, JSON.stringify({ plugin: ["billion-context@0.0.1"] }, null, 2));
+    let resolved = "9.9.9";
+    const lines = await pluginUpdate(["opencode"], { packageName: "billion-context", resolveVersion: async () => resolved });
+    // under tsx bili runs from the repo (dev form) -> repin refuses; the lane reports the stale pin
+    assert.match(lines.join("\n"), /pinned to billion-context@0\.0\.1 while the newest is billion-context@9\.9\.9/);
+    assert.deepEqual(readCfg().plugin, ["billion-context@0.0.1"], "dev-form bili must not rewrite the entry");
+    resolved = "0.0.1";
+    const cur = await pluginUpdate(["opencode"], { packageName: "billion-context", resolveVersion: async () => resolved });
+    assert.match(cur.join("\n"), /pinned at the newest version/);
 });
 
 const MCP_PINNED = { type: "local", command: ["/usr/bin/node", "/opt/old/dist/mcp.js"], environment: { BILI_MCP_PROXY: "http://127.0.0.1:18787" }, enabled: true };

@@ -166,16 +166,67 @@ test("hermetic registry e2e", { skip: skipReason }, async (t) => {
         assert.ok(fs.existsSync(path.join(installDir, "dist", "agent", "opencode-native.js")), "installed tree keeps the agent entrypoint");
     });
 
-    await t.test("post-update `plugin install opencode` keeps a valid entry (master semantics)", async () => {
+    await t.test("post-update `plugin install opencode` writes the pinned entry and leaves a correct one untouched (#1108)", async () => {
         const res = runBili(installDir, ["plugin", "install", "opencode"], { ...envBase, BILI_UPDATE_REGISTRY: reg.url, BILI_CLIENT_BIN: ocBin });
         assert.equal(res.code, 0, `plugin install failed:\n${res.stdout}\n${res.stderr}`);
         const cfg = JSON.parse(fs.readFileSync(opencodeCfgPath(work), "utf8")) as Record<string, unknown>;
-        // Master semantics: npm-form install writes the bare package name and
-        // an already-correct entry is left untouched (idempotent).
-        // TODO(#1143): once the pinned-entry change lands, replace these with
-        // entry === `billion-context@${NEW_VERSION}` (the re-pin assertion).
-        assert.deepEqual(cfg.plugins, ["billion-context"]);
+        // #1108/#1143: the entry is an exact version so every boot resolves
+        // from local cache — a bare spec re-resolves @latest at boot, the
+        // restart-loop trigger. Installing again at the same version must be
+        // idempotent (no duplicate, no churn).
+        assert.deepEqual(cfg.plugins, [`billion-context@${NEW_VERSION}`]);
         assert.deepEqual(cfg.compaction, { auto: false });
-        assert.match(res.stdout, /plugin present/);
+        assert.match(res.stdout, new RegExp(`plugin -> ${escapeRe(`billion-context@${NEW_VERSION}`)} \\(replaced billion-context\\)`));
+        // Idempotent: re-running install at the same version neither
+        // duplicates nor churns the entry.
+        const again = runBili(installDir, ["plugin", "install", "opencode"], { ...envBase, BILI_UPDATE_REGISTRY: reg.url, BILI_CLIENT_BIN: ocBin });
+        assert.equal(again.code, 0, `second plugin install failed:\n${again.stdout}\n${again.stderr}`);
+        const cfg2 = JSON.parse(fs.readFileSync(opencodeCfgPath(work), "utf8")) as Record<string, unknown>;
+        assert.deepEqual(cfg2.plugins, [`billion-context@${NEW_VERSION}`]);
+    });
+
+    await t.test("opencode-managed old copy self-updates by re-pinning its entry — not by writing itself (#1108)", async () => {
+        // A copy living inside opencode's own tree (#991: never written in
+        // place) self-updates through the update check's refusal branch:
+        // detect the newer registry version and re-pin the config entry so
+        // opencode's manager fetches it at next boot.
+        const managedDir = path.join(envBase.XDG_DATA_HOME!, "opencode", "plugin", PKG.name);
+        fs.mkdirSync(managedDir, { recursive: true });
+        await tar.x({ file: oldTgz, cwd: managedDir, strip: 1 });
+        assert.equal(await readPkgVersion(managedDir), OLD_VERSION);
+
+        const cfgFile = opencodeCfgPath(work);
+        fs.writeFileSync(cfgFile, `${JSON.stringify({ plugins: [`billion-context@${OLD_VERSION}`] }, null, 2)}\n`);
+
+        const res = runBili(managedDir, ["update"], { ...envBase, BILI_UPDATE_REGISTRY: reg.url });
+        assert.equal(res.code, 0, `managed-copy update failed:\n${res.stderr}`);
+        assert.match(res.stderr, /install dir is managed by opencode/, "must refuse in-place self-update");
+        assert.equal(await readPkgVersion(managedDir), OLD_VERSION, "the opencode-owned copy must NOT be written");
+        const cfg = JSON.parse(fs.readFileSync(cfgFile, "utf8")) as Record<string, unknown>;
+        assert.deepEqual(cfg.plugins, [`billion-context@${NEW_VERSION}`], "entry re-pinned to the newest registry version");
+    });
+
+    await t.test("the pinned entry resolves offline from local cache — zero registry round-trips (#1108)", async () => {
+        // Boot-locality is the actual #1108 mechanism: resolving an EXACT
+        // spec touches the registry once, and every later resolution of the
+        // same spec is served from npm's local tarball cache. Prime the cache
+        // (online), then prove a second resolution succeeds with --offline
+        // (cache-only: npm errors rather than fetches) and yields byte-identical
+        // tarball bytes.
+        const packs = path.join(work, "boot-packs");
+        fs.mkdirSync(path.join(packs, "online"), { recursive: true });
+        fs.mkdirSync(path.join(packs, "offline"), { recursive: true });
+        await reg.npm(["pack", `billion-context@${NEW_VERSION}`, "--pack-destination", path.join(packs, "online")]);
+        const served = fs.readdirSync(path.join(packs, "online")).filter((f) => f.endsWith(".tgz"));
+        assert.equal(served.length, 1, "online pack fetched exactly one tarball");
+
+        await reg.npm(["pack", "--offline", `billion-context@${NEW_VERSION}`, "--pack-destination", path.join(packs, "offline")]);
+        const cached = fs.readdirSync(path.join(packs, "offline")).filter((f) => f.endsWith(".tgz"));
+        assert.equal(cached.length, 1, "--offline (cache-only) must resolve the exact pinned spec");
+        assert.equal(
+            fs.readFileSync(path.join(packs, "online", served[0]!)).toString("base64"),
+            fs.readFileSync(path.join(packs, "offline", cached[0]!)).toString("base64"),
+            "cached tarball must be byte-identical to the registry's",
+        );
     });
 });
