@@ -28,48 +28,110 @@
 
 ### Module Map
 
+Grouped by functional cluster; deliberately NOT exhaustive (`ls src/` is the
+source of truth). Entries carry issue provenance where a module exists because
+of a specific fix. No line/file counts here — they rot.
+
 ```
 billion-context/
 ├── src/
 │   ├── index.ts                  # Entry: runs cli.ts main()
 │   ├── cli.ts                    # CLI dispatcher: start/update/export/test/plugin + client launchers
-│   ├── server.ts                 # HTTP proxy server, request pipeline
+│   ├── server.ts                 # HTTP proxy core: routing, /__bili/ admin endpoints, per-protocol prepare/inject, forward + streaming
+│   ├── server/                   # Support modules carved out of server.ts (budget, headers, stream-io, side-request, context-window, observability, chain-artifacts)
 │   ├── config.ts                 # Config loading (file + env + CLI flags)
 │   ├── logger.ts                 # Tee logger: file (~/.local/state/) + stderr
+│   ├── log-mask.ts               # Log-safety masking: credentials/endpoints out of logs (#255)
 │   ├── paths.ts                  # XDG paths (config/cache/state dirs)
+│   ├── instance.ts               # Instance registry (#394/#403/#417) + entry-script content identity (#1225)
+│   ├── version.ts                # Proxy's own version read from package.json at runtime
 │   ├── session.ts                # Session model + in-memory store
 │   ├── session-id.ts             # Session ID generation
+│   ├── prefix-affinity.ts        # Anonymous prefix-affinity session resolution (#309)
+│   ├── affinity-persist.ts       # On-disk persistence of affinity bindings
+│   ├── fork-adoption.ts          # Fork block-adoption: copy parent's folded blocks into forked sessions (#629)
 │   ├── persist.ts                # On-disk session persistence (kernel StateStore)
+│   ├── persist-eperm.ts          # Actionable EPERM alerts on StateStore write failures (#362)
+│   ├── encrypt.ts                # Encrypted StateStore codec (cipher + zstd)
+│   ├── store.ts                  # Content store: stored placeholders + retrieve
+│   ├── session-gc.ts             # Stale on-disk session cleanup
+│   ├── export.ts                 # `bili export`: session handoff rendering (kernel renderHandoff)
 │   ├── update.ts                 # Auto-update: checks npm, auto-installs latest
-│   ├── launcher.ts               # `bili <client>` launchers (pi/codex/claude/omp/opencode/hermes/dsh/codebuddy/qoder/trae/jcode/kimi)
-│   ├── client-config.ts          # READ-only discovery of each client's upstream config
+│   ├── restart.ts                # Opt-in self-restart once a newer build is on disk (#811)
+│   ├── doctor.ts                 # `bili doctor`: audits install lanes + registered proxy processes (#1235)
+│   ├── launcher.ts               # `bili <client>` launchers (per-client cert-MITM env + arg shaping)
+│   ├── client-config.ts          # READ-only discovery of each client's upstream config (hand-rolled TOML/YAML scanners)
+│   ├── discover.ts               # MITM domain auto-discovery from discovered client configs
 │   ├── mitm.ts / ca.ts           # Cert-MITM proxying + lazily generated root CA
+│   ├── tunnel-guard.ts           # Tunnel admission for the /bili/<absolute-url> branch (#409)
 │   ├── mcp.ts                    # Plugin-in-launcher MCP shell (spawn-time injection)
-│   ├── plugin.ts / plugin-install.ts # Cooperative plugin protocol + `bili plugin install`
+│   ├── plugin.ts / plugin-install.ts # Cooperative plugin protocol + `bili plugin install` lanes
+│   ├── dsh-channel.ts            # dsh install lane via dsh's own pnpm forwarder (#966)
+│   ├── claude-native-bootstrap.ts # claude SessionStart-hook bootstrap (#964)
 │   ├── registry.ts               # models.dev context-window registry (snapshot-first)
 │   ├── registry-snapshot.json    # Bundled full models.dev snapshot (offline floor)
+│   ├── codex-models.ts / codex-models-snapshot.json # Codex bundled model table (slim snapshot)
 │   ├── upstream-proxy.ts         # undici ProxyAgent routing (https_proxy for registry fetch)
-│   ├── stream.ts                 # SSE stream utilities + tag patching
-│   ├── stream-openai.ts          # OpenAI-format stream processing
-│   ├── stream-responses.ts       # Responses-API stream processing
-│   ├── stream-error.ts           # Stream error handling
-│   ├── sse-util.ts               # SSE parsing helpers
+│   ├── wire-body.ts              # Single choke point for post-hoc mutation of assembled request bodies
+│   ├── wire-drop-warn.ts         # Warn when a wire codec round-trip drops content parts (#1205)
+│   ├── content-encoding.ts       # Request-body decompression (gzip/br/zstd) + size limit
+│   ├── compat-roles.ts           # Per-route role-compat mapping to roles the upstream accepts
+│   ├── system-anchor.ts          # Sticky head-system anchor for upstream prefix caching (#1085)
+│   ├── tool-pair-order.ts        # call/output adjacency enforcement for strict Responses backends (#766)
+│   ├── stream-terminal.ts        # Terminal-state observer for native-compaction streams (#321)
+│   ├── exit-matrix.ts            # Wire-exit × concern compile-time completeness registry (#588)
+│   ├── upstream-fail.ts          # Upstream transport failure taxonomy (#1263)
+│   ├── error-dump.ts             # Request/response body dumps for field diagnosis
+│   ├── preflight.ts              # Preflight compression machine: hold / fail-fast / compress-if-needed
 │   ├── loop/                     # Unified compress loop (wire-agnostic core)
 │   │   ├── core.ts               #   protocol-neutral event model + tool adjudication
 │   │   ├── adapter-anthropic.ts  #   Anthropic wire adapter (buffer-to-finish tool calls)
 │   │   ├── adapter-openai.ts     #   OpenAI chat adapter (buffer-to-finish, raw passthrough)
-│   │   └── adapter-responses.ts  #   Responses API adapter
-│   ├── compress-loop.ts          # Compress loop (OpenAI chat format)
-│   ├── compress-loop-responses.ts # Compress loop (Responses API format)
+│   │   ├── adapter-google.ts     #   Google wire adapter
+│   │   ├── adapter-responses.ts  #   Responses API adapter
+│   │   └── tag-echo-filter.ts    #   streaming-safe stripper for model-emitted render tags (#206)
+│   ├── compress-loop.ts          # Legacy shared helpers (buildVisibilityMarker; home move tracked in #1439)
+│   ├── compress-loop-responses.ts # Legacy JSON-path Responses loop (drift vs unified loop tracked in #1439)
 │   ├── compress-settings.ts      # Three-level compress config merge
 │   ├── compress-tool.ts          # compress tool parsing (kernel parseCompressArgs)
 │   ├── decompress-shared.ts      # Shared decompress logic
 │   ├── orphan-gc.ts              # Orphaned block cleanup
-│   ├── agent/                    # Thin agent-side plugins (pi/omp/opencode; opencode-acp-command.ts = shared /acp hooks V1+V2, opencode-native.ts = self-spawn native, V1 `.server()` + V2 `setup`)
-│   ├── web/                      # Web UI (config + context windows)
+│   ├── absorb.ts                 # Absorb tool (opt-in host registration; config-driven adjudication)
+│   ├── rules-feature.ts          # Rules feature (add/list/clear + prompt building)
+│   ├── acp-status.ts             # acp_status tool: status report + range formatting
+│   ├── acp-panel.ts              # ACP panel stripping for proxy mode (#359)
+│   ├── acp-cache-diff.ts         # Offline prefix-diff attribution over ACP_DUMP_BODY dumps (#1266)
+│   ├── cache-ledger.ts           # Prefix-cache economics ledger + fold reports
+│   ├── cache-warn.ts             # Prompt-cache collapse warning (#499)
+│   ├── conflict-watch.ts         # Per-session compression-conflict ledger (#1206)
+│   ├── thirdparty-scan.ts        # Third-party compression plugin detection (#1206)
+│   ├── fake-completion.ts        # Fake completion synthesis for small-model tool-call echoes (#371)
+│   ├── degenerate-turn.ts        # Degenerate terminal-turn detection (#673)
+│   ├── degenerate-retry.ts       # Retry path around degenerate turns
+│   ├── reasoning-drop.ts         # Drop oversized reasoning from closed-round compress calls (#651)
+│   ├── reasoning-guard.ts        # Guard vs gpt-5.x/6.x "lattice" reasoning truncation (#739)
+│   ├── output-steering.ts        # Output steering decisions
+│   ├── strict-echo.ts            # Strict-echo reasoning upstreams (DeepSeek) handling (#684)
+│   ├── image-compress.ts         # Image routing/compression (image_full tool path)
+│   ├── image-note.ts             # Image sidecar notes so summaries see image-bearing messages (#781)
+│   ├── image-tokens.ts           # Image token estimation for fit decisions (#488)
+│   ├── responses-tool-output.ts  # Responses-API tool-output shaping (image parts)
+│   ├── codex-compact.ts          # Codex native-compaction detection + fc_bili_ compact ids
+│   ├── chain-checkpoint.ts       # First-processor-wins idempotent interop checkpoint (#1357/#1395)
+│   ├── stream.ts                 # SSE stream utilities + tag patching
+│   ├── stream-openai.ts          # OpenAI-format stream processing
+│   ├── stream-google.ts          # Google-format stream processing
+│   ├── stream-responses.ts       # Responses-API stream processing
+│   ├── stream-error.ts           # Stream error handling
+│   ├── sse-util.ts               # SSE parsing helpers
+│   ├── agent/                    # Agent-side plugins & native lanes (pi/omp/opencode V1+V2, dsh; shared bootstrap/intercept helpers)
+│   ├── kimi/                     # Kimi Code native integration (bootstrap hook, native MCP, toml-edit)
+│   ├── zcode/                    # ZCode native integration (bootstrap hook, native MCP, json-edit)
+│   ├── web/                      # Web UI (api/page/client/i18n/styles)
 │   ├── fetch-util.ts             # HTTP fetch with timeout
 │   └── util.ts                   # Misc utilities
-├── tests/                        # 66 test files
+├── scripts/                      # Maintenance scripts (snapshot/golden refresh, dist checks)
+├── tests/                        # node --test suites; e2e/ = real-client + hermetic-registry (env-gated, skipped by default)
 ├── tsup.config.ts
 └── package.json
 ```
