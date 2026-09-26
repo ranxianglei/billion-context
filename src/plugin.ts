@@ -1702,6 +1702,135 @@ export async function pipePluginChatWithStrip(
     }
 }
 
+// #1295: plugin-mode passthrough for the commandcode CLI wire (bare JSONL).
+// The agent owns compression (its compress tool call rides its own re-sent
+// history), so the proxy only strips model-emitted render tags from the two
+// prose fields and sniffs usage; every other byte passes through untouched.
+export async function pipePluginJsonlWithStrip(
+    stream: ReadableStream<Uint8Array>,
+    res: ServerResponse,
+    session?: Session,
+    log?: (s: string) => void,
+): Promise<void> {
+    const reader = stream.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buf = "";
+    const filter = composeStreamFilters(
+        createTagEchoFilter((snippet) => {
+            loggerLog("warn", `[tag-echo] stripped model-emitted render tag (commandcode plugin mode): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+            log?.(`[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+        }),
+        createMarkerLineFilter(),
+    );
+    let sawTerminal = false;
+    let visibleTextChars = 0;
+    let finalFinishReason: string | undefined;
+    const acc: UsageSample = {};
+    const settleUsage = () => {
+        if (session && (acc.inputTokens !== undefined || acc.outputTokens !== undefined || acc.cachedTokens !== undefined || acc.creationTokens !== undefined)) {
+            applyUsageSample(session, acc, "openai");
+            markDirty(session);
+        }
+    };
+    const maybeWarnDegenerate = () => {
+        if (!sawTerminal || res.destroyed || res.writableEnded) return;
+        const st = filter.stats();
+        const msg = degenerateTurnWarning({
+            reason: finalFinishReason,
+            terminalReason: "stop",
+            toolCalls: 0,
+            text: { inputChars: st.inputChars, outputChars: visibleTextChars, dropped: st.dropped },
+            sawThinking: false,
+            wire: "plugin-passthrough-commandcode",
+        });
+        if (msg) {
+            loggerLog("warn", msg);
+            log?.(msg);
+        }
+    };
+    try {
+        while (true) {
+            let done: boolean;
+            let value: Uint8Array | undefined;
+            try {
+                ({ done, value } = await reader.read());
+            } catch (e) {
+                settleUsage();
+                if (res.destroyed || res.writableEnded) return;
+                loggerLog("warn", `[plugin] upstream stream read failed (commandcode): ${String(e instanceof Error ? e.message : e)} — emitting in-band truncation signal`);
+                emitUpstreamTruncation(res, "commandcode", finalFinishReason !== undefined, log);
+                return;
+            }
+            if (done) break;
+            buf += decoder.decode(value, { stream: true });
+            let idx: number;
+            while ((idx = buf.indexOf("\n")) >= 0) {
+                const line = buf.slice(0, idx);
+                buf = buf.slice(idx + 1);
+                if (line.trim().length === 0) continue;
+                let ev: Record<string, unknown>;
+                try {
+                    ev = JSON.parse(line) as Record<string, unknown>;
+                } catch {
+                    if (!res.write(Buffer.from(line + "\n", "utf8"))) await awaitDrain(res);
+                    continue;
+                }
+                const type = ev["type"];
+                let outLine = line;
+                if ((type === "text-delta" || type === "reasoning-delta") && typeof ev["text"] === "string") {
+                    const clean = filter.push(ev["text"] as string);
+                    if (type === "text-delta") visibleTextChars += clean.length;
+                    if (clean !== ev["text"]) outLine = JSON.stringify({ ...ev, text: clean });
+                } else if (type === "finish") {
+                    sawTerminal = true;
+                    if (typeof ev["finishReason"] === "string") finalFinishReason = ev["finishReason"] as string;
+                    const tu = ev["totalUsage"];
+                    if (tu !== null && typeof tu === "object" && !Array.isArray(tu)) {
+                        const t = tu as Record<string, unknown>;
+                        if (typeof t["inputTokens"] === "number") acc.inputTokens = t["inputTokens"] as number;
+                        if (typeof t["outputTokens"] === "number") acc.outputTokens = t["outputTokens"] as number;
+                        const details = t["inputTokenDetails"];
+                        if (details !== null && typeof details === "object" && typeof (details as Record<string, unknown>)["cacheReadTokens"] === "number") {
+                            acc.cachedTokens = (details as Record<string, unknown>)["cacheReadTokens"] as number;
+                        }
+                    }
+                } else if (type === "error") {
+                    sawTerminal = true;
+                }
+                // Flush any held tag tail into this line's prose field before a
+                // terminal frame so partial prose is never silently lost.
+                const tail = filter.flush();
+                if (tail.length > 0 && type !== "text-delta" && type !== "reasoning-delta" && !res.destroyed && !res.writableEnded) {
+                    const tailLine = JSON.stringify({ type: "text-delta", text: tail });
+                    if (!res.write(Buffer.from(tailLine + "\n", "utf8"))) await awaitDrain(res);
+                }
+                if (!res.write(Buffer.from(outLine + "\n", "utf8"))) await awaitDrain(res);
+            }
+        }
+        const rest = filter.flush();
+        if (rest.length > 0 && !res.destroyed && !res.writableEnded) {
+            if (!res.write(Buffer.from(JSON.stringify({ type: "text-delta", text: rest }) + "\n", "utf8"))) await awaitDrain(res);
+        }
+        if (buf.trim().length > 0 && !res.destroyed && !res.writableEnded) {
+            if (!res.write(Buffer.from(buf + "\n", "utf8"))) await awaitDrain(res);
+        }
+        settleUsage();
+        maybeWarnDegenerate();
+    } catch (e) {
+        settleUsage();
+        if (res.destroyed || res.writableEnded) {
+            log?.("client aborted mid-stream");
+            return;
+        }
+        loggerLog("warn", `[plugin] upstream stream read failed (commandcode): ${String(e instanceof Error ? e.message : e)} — emitting in-band truncation signal`);
+        emitUpstreamTruncation(res, "commandcode", finalFinishReason !== undefined, log);
+        return;
+    } finally {
+        reader.releaseLock();
+        res.end();
+    }
+}
+
 function hadTextOtherThanTextFields(choices: unknown): boolean {
     if (!Array.isArray(choices)) return true;
     for (const c of choices) {

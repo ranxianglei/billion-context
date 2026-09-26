@@ -225,6 +225,25 @@
 
 ---
 
+## 模型端点声明（Model Endpoint Patterns）
+
+`modelEndpointPatterns` 用于声明非标路径上的模型端点 —— 路径形状不属于任何内置 wire family 的 URL（例如 `https://api.commandcode.ai/alpha/generate`）。未声明时这类请求逐字节 relay、零压缩（#1290）；声明后两个 gate 对它们达成一致：客户端 fetch patch 认领该请求，代理将其分类到声明的 wire family。
+
+- **类型：** `{ "match": string, "wire": "anthropic" | "openai" | "responses" | "google" | "commandcode" }` 数组
+- **默认值：** `[]`（仅内置路径表）
+- **状态：** ACTIVE
+- **说明：** 每个条目是一个绝对 URL 前缀加要按哪种 wire family 处理。最长匹配前缀优先；匹配要求同 origin 且落在 path 段边界上（`…/alpha/generate` 匹配自身及子路径，不匹配 `…/alpha/generate2`，也绝不匹配其他 origin）。同一份配置同时喂给代理侧协议分类器和所有 native entry 的客户端 fetch 认领逻辑，原先两张硬编码表从此不可能再漂移（#1295）。基于 body 的消歧仍然生效（#1284）：已声明端点若 body 看起来不是模型对话则原样 relay；不可转换的 `commandcode` body（非流式 CLI 对话等）同样原样 relay（见 WIRE-CONTRACTS.md）。四个标准 family 只改变分类判定，管线本身不变。`commandcode` 是 commandcode CLI wire：嵌套 envelope 包着一个 openai-completions 形状的对话，响应为裸 JSONL 事件流；流式请求走 OpenAI 族循环压缩（proxy 与 plugin 两种模式都支持），非流式降级为原样 relay。声明在进程启动时读取 —— 修改后需重启 bili（以及需要由 fetch patch 认领该端点的 native client）才能生效。条目格式错误会在启动时大声报错，而不是被静默丢弃。
+
+  ```jsonc
+  {
+    "modelEndpointPatterns": [
+      { "match": "https://api.commandcode.ai/alpha/generate", "wire": "commandcode" }
+    ]
+  }
+  ```
+
+---
+
 ## 压缩调优
 
 压缩行为由 `compress` 块控制，它可以出现在三个层级。它们按**逐字段、最深层胜出**的方式合并：在更深层设置的字段会覆盖上层同名字段，但更深层*未设置*的字段**永远不会**清除上层已设置的值。换言之，子级按字段覆盖父级 —— 它绝不是整体替换对象。

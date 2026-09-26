@@ -227,6 +227,25 @@ A shallow key (`https://open.bigmodel.cn`) matches every path on that host. A de
 
 ---
 
+## Model Endpoint Patterns
+
+`modelEndpointPatterns` declares model endpoints on non-standard paths — URLs whose path shape matches none of the built-in wire families (e.g. `https://api.commandcode.ai/alpha/generate`). Without a declaration such requests are relayed byte-for-byte with zero compression (#1290); with one, both gates agree on them: the client-side fetch patch claims the request and the proxy classifies it into the declared wire family.
+
+- **Type:** array of `{ "match": string, "wire": "anthropic" | "openai" | "responses" | "google" | "commandcode" }`
+- **Default:** `[]` (built-in path tables only)
+- **Status:** ACTIVE
+- **Description:** Each entry is an absolute URL prefix plus the wire family to treat it as. Longest matching prefix wins; matching requires the same origin and a path-segment boundary (`…/alpha/generate` matches itself and subpaths, but not `…/alpha/generate2`, and never another origin). One config source feeds both the proxy's protocol classifier and the client-side fetch claim in every native entry, so the two formerly hardcoded tables can no longer drift apart (#1295). The body-based disambiguation still applies (#1284): a declared endpoint whose body does not look like a model conversation is relayed verbatim, as are `commandcode` bodies that are not convertible streaming CLI conversations (WIRE-CONTRACTS.md). The four standard families only change classification — their pipelines run unchanged. `commandcode` is the commandcode CLI wire: a nested envelope around an openai-completions-shaped conversation with a bare JSONL event-stream response; streaming requests compress through the OpenAI-family loop (both proxy and plugin modes), non-streaming ones are demoted to verbatim relay. Declarations are read at process start — restart bili (and any native client whose fetch patch must claim the endpoint) to apply changes. A malformed entry fails startup loudly instead of being dropped silently.
+
+  ```jsonc
+  {
+    "modelEndpointPatterns": [
+      { "match": "https://api.commandcode.ai/alpha/generate", "wire": "commandcode" }
+    ]
+  }
+  ```
+
+---
+
 ## Compression Tuning
 
 Compression behaviour is controlled by the `compress` block, which can appear at three levels. They merge **per-field, deepest wins**: a field set at a deeper level overrides the same field higher up, but an *unset* field at a deeper level never clears a value set higher up. In other words, the child covers the parent field-by-field — it never replaces the whole object.
