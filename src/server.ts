@@ -762,8 +762,6 @@ function imageBillingFor(opts: ProxyOptions, upstreamUrl: string | undefined): R
     return resolveImageBilling(configured, upstreamUrl);
 }
 
-
-
 // #924: one-time-per-model log for the output-budget fallback (request carries
 // no budget → configured/registry max output) — same pattern as windowSourceLogged.
 const headroomFallbackLogged = new Set<string>();
@@ -5386,8 +5384,6 @@ function deriveTitle(messages: CoreMessage[]): string | undefined {
     return undefined;
 }
 
-
-
 // #1206: orphan reaping was silent — blocks deactivated because their source
 // messages vanished from client history are the strongest runtime signal that
 // something outside bili (client auto-compaction or another compression plugin)
@@ -5398,9 +5394,6 @@ function reapOrphansLogged(session: Session, msgs: CoreMessage[], log: (level: s
     log("warn", `[${sessionId}] orphan-gc deactivated ${reaped.length} block(s) whose source messages left the client history (${reaped.join(", ")}) — the client or another compression plugin deleted summarized content; those summaries can no longer be decompressed (#1206)`);
     recordConflict(session, "orphan-reap", `${reaped.length} block(s) deactivated: ${reaped.join(", ")}`);
 }
-
-
-
 
 function formatBytes(n: number): string {
     if (n < 1024) return `${n}B`;
