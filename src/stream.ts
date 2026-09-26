@@ -224,20 +224,28 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean): string {
         return "";
     }
     if (!nudge) return "";
-    // Same gates as handleAcpStatus: viability floor + the submit gate's raw
-    // char count — never advertise a range the kernel would reject (#847).
-    const minChars = ctx.config.compress.minCompressRange;
-    const remaining = viableRanges(nudge.compressibleRanges)
-        .filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars);
-    if (remaining.length > 0) {
-        return `\n\nCurrent compressible ranges (use these refs exactly as listed):\n${formatRanges(remaining, [])}`;
+    // Everything below runs AFTER the fold has mutated state and stats were
+    // netted — an exception here must not flip an already-successful
+    // compress into a FAILED receipt (the outer catch would lie about state
+    // that has in fact changed). Same containment as the processTurn block.
+    try {
+        // Same gates as handleAcpStatus: viability floor + the submit gate's raw
+        // char count — never advertise a range the kernel would reject (#847).
+        const minChars = ctx.config.compress.minCompressRange;
+        const remaining = viableRanges(nudge.compressibleRanges)
+            .filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars);
+        if (remaining.length > 0) {
+            return `\n\nCurrent compressible ranges (use these refs exactly as listed):\n${formatRanges(remaining, [])}`;
+        }
+        // A tier-distillation nudge means block-boundary compress calls (bN..bM)
+        // are still actionable — a stop signal there would contradict the tier
+        // trigger. Partial failures stay silent too: the model still owes the
+        // errors an answer before any "you are done" verdict (pi #521 gate).
+        if (!cleanSuccess || nudge.tier !== null) return "";
+        return `\n\n${NO_RANGES_REMAIN_TEXT}`;
+    } catch {
+        return "";
     }
-    // A tier-distillation nudge means block-boundary compress calls (bN..bM)
-    // are still actionable — a stop signal there would contradict the tier
-    // trigger. Partial failures stay silent too: the model still owes the
-    // errors an answer before any "you are done" verdict (pi #521 gate).
-    if (!cleanSuccess || nudge.tier !== null) return "";
-    return `\n\n${NO_RANGES_REMAIN_TEXT}`;
 }
 
 export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: RewriteCtx): string {

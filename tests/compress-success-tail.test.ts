@@ -137,3 +137,22 @@ test("#1387: partial failure (some ranges rejected) keeps the old silent tail", 
     assert.ok(!out.includes(NO_RANGES_REMAIN_TEXT), "stop signal suppressed on partial failure:\n" + out);
     assert.ok(!out.includes(RANGES_HEADER), "no ranges advertised on partial failure:\n" + out);
 });
+
+test("#1387: sub-minCompressRange remainder is not advertised — stop signal instead (#847 gate)", () => {
+    // After folding the big head, exactly one raw range survives but its raw
+    // char count (1200) is below minCompressRange (5000): the kernel submit
+    // gate (#847) would reject it, so the receipt must NOT list it. The honest
+    // verdict is the stop signal (nothing actionable remains), never a
+    // phantom range the model would burn a rejected call on.
+    const msgs = [
+        ...Array.from({ length: 4 }, (_, i) => textMsg(`raw_${i + 1}`, i % 2 === 0 ? "user" : "assistant", "x".repeat(5000))),
+        textMsg("raw_5", "user", "y".repeat(1200)),
+    ];
+    const ctx = withRefs(makeCtx(msgs, { preserveRecentMessages: 0, preserveRecentTokens: 0 }));
+    ctx.config.compress.minCompressRange = 5000;
+    ctx.session.stats.lastInputTokens = 100000;
+    const out = runApply(ctx, { content: [{ startId: "m00001", endId: "m00004", summary: "TAIL-TEST-SUMMARY-PAYLOAD-LONG-ENOUGH-FOR-THE-KERNEL-MIN-LENGTH-CHECK" }] });
+    assert.ok(out.startsWith("[Compressed"), `expected success, got: ${out.slice(0, 120)}`);
+    assert.ok(!out.includes(RANGES_HEADER), `sub-gate range must not be advertised:\n${out}`);
+    assert.ok(out.includes(NO_RANGES_REMAIN_TEXT), `expected stop signal:\n${out}`);
+});
