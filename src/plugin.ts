@@ -645,7 +645,7 @@ export function resolveConversation(conversationId: string): { session: Session 
 function disabledOptionalToolNote(tool: string, session: Session, config: Config): string | undefined {
     const absorbName = effectiveAbsorbConfig(session, config)?.toolName ?? ABSORB_TOOL_NAME;
     if (tool === absorbName) return `${tool} is not enabled on this bili proxy (compress.absorb.enabled is not true) — nothing was absorbed.`;
-    if (tool === RULE_TOOL_NAME) return `${tool} is not enabled on this bili proxy (compress.rules.enabled is not true) — nothing was recorded.`;
+    if (tool === RULE_TOOL_NAME) return `${tool} is explicitly disabled on this bili proxy (compress.rules: false) — nothing was recorded.`;
     if (!ccrEnabled(session) && tool === retrieveToolName(session)) return `${tool} is not enabled on this bili proxy (compress.ccr.enabled is not true) — nothing was retrieved.`;
     return undefined;
 }

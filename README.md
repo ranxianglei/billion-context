@@ -892,8 +892,8 @@ pi/omp register it natively with the tool's full operation set — bare
 `/acp-rule clear` wipes all recorded rules (`clear <text>` records instead of
 wiping — a typo must not destroy every rule). The wrapped transcript message
 is stripped from model context by content signature like the cache report —
-recorded rules reach the model every turn via the system-prompt injection
-anyway.
+the recorded rules themselves ride the hard-protected acp_rule call+result
+pairs, which every compression fold keeps verbatim.
 
 ### Legacy opencode-acp sessions (#920)
 

@@ -120,7 +120,7 @@ test("#1204 google wire + rules explicitly disabled: plugin tool acp_rule stays 
         await sendGoogleTurn(h, conv);
         const { status, body } = await callRuleTool(h, conv);
         assert.equal(status, 200, `acp_rule must stay gated (got ${status}: ${JSON.stringify(body)})`);
-        assert.match(body.result ?? "", /is not enabled on this bili proxy \(compress\.rules\.enabled is not true\)/);
+        assert.match(body.result ?? "", /is explicitly disabled on this bili proxy \(compress\.rules: false\)/);
     } finally {
         await h.close();
     }

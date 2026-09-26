@@ -45,7 +45,7 @@ describe("#1192: known-but-disabled opt-in tools get an explanation, not a hard 
         const r = await call("acp_rule", { rule: "verify driver unload+reload" });
         assert.equal(r.status, 200);
         assert.equal(r.json.ok, true);
-        assert.match(String(r.json.result), /acp_rule is not enabled on this bili proxy \(compress\.rules\.enabled is not true\)/);
+        assert.match(String(r.json.result), /acp_rule is explicitly disabled on this bili proxy \(compress\.rules: false\)/);
         assert.match(String(r.json.result), /nothing was recorded/);
     });
 

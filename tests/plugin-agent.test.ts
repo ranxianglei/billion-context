@@ -1245,7 +1245,7 @@ test("/acp-rule falls back to raw-text notify when the host has no sendMessage (
 });
 
 test("/acp-rule warns with an enablement hint when the proxy reports the feature disabled (#1251)", async () => {
-    const proxy = await startRuleProxy("acp_rule is not enabled on this bili proxy (compress.rules.enabled is not true) — nothing was recorded.");
+    const proxy = await startRuleProxy("acp_rule is explicitly disabled on this bili proxy (compress.rules: false) — nothing was recorded.");
     try {
         const sent: Array<{ customType: string }> = [];
         const notes: Array<{ msg: string; type?: string }> = [];

@@ -626,8 +626,8 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                     // #1192 note channel (disabledOptionalToolNote): the feature is off in
                     // this session's effective config — surface the enablement hint instead
                     // of echoing the model-facing note into the transcript.
-                    if (text.startsWith("acp_rule is not enabled")) {
-                        notify("bili: acp_rule is not enabled on this bili proxy — set compress.rules.enabled: true in your bili config", "warning");
+                    if (text.startsWith("acp_rule is explicitly disabled")) {
+                        notify("bili: acp_rule is explicitly disabled on this bili proxy — compress.rules is set to false; remove it or set compress.rules.enabled: true to re-enable", "warning");
                         return;
                     }
                     // Persistent transcript output (TUI + web hosts like pi-web). The proxy strips
