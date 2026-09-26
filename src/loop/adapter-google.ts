@@ -1,7 +1,7 @@
 import type { CoreMessage } from "acp-kernel";
 import { coreToGoogle } from "acp-kernel/wire";
 import type { GooglePart } from "acp-kernel/wire";
-import { buildVisibilityMarker } from "../compress-loop.js";
+import { buildVisibilityMarker } from "./core.js";
 import { composeStreamFilters, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";

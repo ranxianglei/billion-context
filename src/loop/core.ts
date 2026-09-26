@@ -19,7 +19,6 @@ import { ccrEnabled, drainPendingRetrievals, executeRetrieve, retrieveToolName }
 import { IMAGE_FULL_TOOL_NAME, executeImageFull, imageCompressionEnabled, imageUsageSuffix } from "../image-compress.js";
 import { applyRanges } from "../stream.js";
 import { executeSearchContextTarget, resolveDecompress } from "../decompress-shared.js";
-import { buildVisibilityMarker } from "../compress-loop.js";
 import { fetchWithRetry, UpstreamHttpError } from "../fetch-util.js";
 import { proxyDispatcher } from "../upstream-proxy.js";
 import { warnCacheCollapse } from "../cache-warn.js";
@@ -31,6 +30,30 @@ import { promptInputTotal, type WireProtocol } from "../util.js";
 import { DEGENERATE_RETRY_NUDGE } from "../degenerate-retry.js";
 
 export const MAX_LOOP_ROUNDS = 10;
+
+export function buildVisibilityMarker(toolName: string, result: string): string {
+    const lines = result.split("\n").map((l) => l.trim()).filter((l) => l.length > 0);
+    const failed = lines.some((l) =>
+        l.includes("FAILED")
+        || l.includes("not found")
+        || l.includes("is required")
+    );
+    const icons: Record<string, string> = {
+        compress: "📦",
+        decompress: "📤",
+        search_context: "🔍",
+        acp_status: "📊",
+        absorb: "🫧",
+    };
+    const icon = failed ? "❌" : (icons[toolName] ?? "📦");
+
+    if (toolName === "acp_status") {
+        return `\n${icon} [ACP] acp_status result:\n${result.trim()}\n`;
+    }
+
+    const inner = (lines[0] ?? "").replace(/^\[/, "").replace(/\]$/, "").trim();
+    return `\n${icon} [ACP] ${inner}\n`;
+}
 
 // #413 follow-up: when the stream dies AFTER visible text has already been
 // forwarded (final-report shape — heavy reasoning, then the answer starts,
