@@ -6,7 +6,7 @@ export { isCodexClient };
 /** One entry of codex's bundled model table (slim form — see
  *  scripts/update-codex-models-snapshot.mjs). Mirrors the window fields of
  *  codex-rs `protocol/src/openai_models.rs` ModelInfo that drive its budget. */
-export interface CodexModelEntry {
+interface CodexModelEntry {
     slug: string;
     contextWindow?: number;
     maxContextWindow?: number;

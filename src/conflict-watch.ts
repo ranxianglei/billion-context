@@ -6,9 +6,9 @@
 
 import { markDirty, type Session } from "./session.js";
 
-export type ConflictKind = "third-party-plugin" | "unannounced-rewrite" | "orphan-reap" | "native-compaction";
+type ConflictKind = "third-party-plugin" | "unannounced-rewrite" | "orphan-reap" | "native-compaction";
 
-export interface ConflictEvent {
+interface ConflictEvent {
     at: number;
     kind: ConflictKind;
     detail: string;
@@ -50,7 +50,7 @@ export function formatConflictSection(events: ConflictEvent[]): string[] {
     return lines;
 }
 
-export interface ConflictSummary {
+interface ConflictSummary {
     sessions: number;
     events: number;
     kinds: Partial<Record<ConflictKind, number>>;

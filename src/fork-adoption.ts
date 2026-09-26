@@ -59,7 +59,7 @@ import type { WireProtocol } from "./util.js";
  *  correctness risk). */
 const SUPPORTED: ReadonlySet<WireProtocol> = new Set<WireProtocol>(["openai", "anthropic"]);
 
-export interface ForkAdoptionPlan {
+interface ForkAdoptionPlan {
     /** Blocks to seed (active adoptables + their tier children, inactive). */
     blocks: CompressionBlock[];
     /** blockIds in `blocks` (for blockContents lookup). */
@@ -94,12 +94,6 @@ function incomingCoreMessages(protocol: WireProtocol, parsed: unknown): CoreMess
     return anthropicToCore(clone as Parameters<typeof anthropicToCore>[0]).msgs;
 }
 
-/** Core message ids of the incoming request (see incomingCoreMessages). */
-export function incomingCoreIds(protocol: WireProtocol, parsed: unknown): Set<string> | null {
-    const msgs = incomingCoreMessages(protocol, parsed);
-    return msgs ? new Set(msgs.map((m) => m.id)) : null;
-}
-
 /** Refs cited by placeholder-shaped incoming messages (#1341). Such a
  *  message's own bytes differ from the original's, so its raw id maps to no
  *  parent ref — the citation embedded in the placeholder is the only link
@@ -119,7 +113,7 @@ function citedPlaceholderRefs(msgs: CoreMessage[]): string[] {
 
 /** Decide which of the parent's blocks survive into the fork. Pure: reads
  *  the parent, returns a plan, mutates nothing. */
-export function planForkAdoption(parent: Session, incomingIds: Set<string>): ForkAdoptionPlan {
+function planForkAdoption(parent: Session, incomingIds: Set<string>): ForkAdoptionPlan {
     const byId = new Map<string, CompressionBlock>();
     for (const b of parent.state.blocks) byId.set(b.blockId, b);
 
@@ -188,7 +182,7 @@ export function planForkAdoption(parent: Session, incomingIds: Set<string>): For
 
 /** Seed a fresh fork session from the plan. Copy-on-fork: every value is a
  *  clone; the parent session is never touched. */
-export function applyForkAdoption(session: Session, plan: ForkAdoptionPlan, parent: Session): void {
+function applyForkAdoption(session: Session, plan: ForkAdoptionPlan, parent: Session): void {
     for (const b of plan.blocks) {
         session.state.blocks.push(b);
         const content = parent.blockContents.get(b.blockId);

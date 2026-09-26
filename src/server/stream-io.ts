@@ -41,7 +41,7 @@ export function bufferToStream(buf: Buffer): ReadableStream<Uint8Array> {
 
 /** Minimal writable surface {@link awaitDrain} needs — satisfied by
  *  http.ServerResponse and by test recording sinks alike. */
-export interface DrainableResponse {
+interface DrainableResponse {
     destroyed?: boolean;
     writableEnded?: boolean;
     once(event: string, cb: () => void): unknown;

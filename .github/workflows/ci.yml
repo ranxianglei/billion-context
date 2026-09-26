@@ -58,3 +58,16 @@ jobs:
             exit 1
           fi
           echo "✓ version field untouched on non-release branch ($BRANCH)"
+
+  # #1440 P6: mechanical defense against export bloat — fails when a non-entry
+  # source file exports a symbol nobody references outside its own file
+  # (DEAD = definition line only; INTERNAL_ONLY = own file only). Zero-dep:
+  # plain node, no install step.
+  unused-exports:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node scripts/check-unused-exports.mjs

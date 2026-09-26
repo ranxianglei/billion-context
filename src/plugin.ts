@@ -51,25 +51,25 @@ const PROXY_VERSION = (() => {
 //      args}, under the session lock, against the same executeProxyTool the
 //      wire-mode compress loop uses.
 
-export const PLUGIN_AGENT_HEADER = "x-bili-plugin";
-export const PLUGIN_CONVERSATION_HEADER = "x-bili-plugin-conversation";
+const PLUGIN_AGENT_HEADER = "x-bili-plugin";
+const PLUGIN_CONVERSATION_HEADER = "x-bili-plugin-conversation";
 /** #920: legacy-lane marker. Set by the absorbed opencode-acp wrapper for
  *  sessions that still run through the legacy DCP machinery — the proxy
  *  forwards such requests VERBATIM (no wire injection, no session binding,
  *  no compress loop): the legacy extension owns compression for them. */
-export const PLUGIN_BYPASS_HEADER = "x-bili-plugin-bypass";
-export const PLUGIN_CONTEXT_WINDOW_HEADER = "x-bili-plugin-context-window";
-export const PLUGIN_MAX_OUTPUT_HEADER = "x-bili-plugin-max-output";
-export const PLUGIN_MODEL_HEADER = "x-bili-plugin-model";
+const PLUGIN_BYPASS_HEADER = "x-bili-plugin-bypass";
+const PLUGIN_CONTEXT_WINDOW_HEADER = "x-bili-plugin-context-window";
+const PLUGIN_MAX_OUTPUT_HEADER = "x-bili-plugin-max-output";
+const PLUGIN_MODEL_HEADER = "x-bili-plugin-model";
 /** #1102/#1106: stamped "1" by plugins whose host mints one conversation id per
  *  persona (opencode: subagents get their own child session ids). Since the
  *  instructions fingerprint became an allowlist (#1106 — exempt is the
  *  default for every non-codex/non-claude signal), this declaration is
  *  vestigial: hosts keep stamping it for protocol compatibility with older
  *  proxies, but current proxies key verbatim regardless. */
-export const PLUGIN_INSTRUCTIONS_MUTABLE_HEADER = "x-bili-plugin-instructions-mutable";
+const PLUGIN_INSTRUCTIONS_MUTABLE_HEADER = "x-bili-plugin-instructions-mutable";
 
-export const PLUGIN_PROTOCOL_VERSION = 1;
+const PLUGIN_PROTOCOL_VERSION = 1;
 
 const VERSION = (() => {
     try {
@@ -96,15 +96,11 @@ export function pluginConversationHeader(headers: Record<string, string | string
     return headerValue(headers, PLUGIN_CONVERSATION_HEADER);
 }
 
-export function pluginBypassHeader(headers: Record<string, string | string[] | undefined>): string | undefined {
-    return headerValue(headers, PLUGIN_BYPASS_HEADER);
-}
-
 /** The plugin reports its agent's own model context window (what the agent
  *  configured, e.g. a pinned/overridden contextWindow). It replaces the
  *  native-window source (built-in table / models.dev registry) in the config
  *  cascade — operator tuning (compress.modelContextLimit) still outranks it. */
-export function pluginContextWindowHeader(headers: Record<string, string | string[] | undefined>): number | undefined {
+function pluginContextWindowHeader(headers: Record<string, string | string[] | undefined>): number | undefined {
     const raw = headerValue(headers, PLUGIN_CONTEXT_WINDOW_HEADER);
     if (raw === undefined) return undefined;
     const n = Number.parseInt(raw, 10);
@@ -300,7 +296,7 @@ export function rememberPluginMessages(sessionId: string, processed: CoreMessage
 // (server.ts binding step): that session becomes plugin-mode (native tools,
 // wire injection suppressed) and the conversation id becomes its tool-API key
 // — no x-bili-plugin headers required.
-export type PendingPluginRegister = { conversationId: string; agent: string; ts: number; parentConversationId?: string };
+type PendingPluginRegister = { conversationId: string; agent: string; ts: number; parentConversationId?: string };
 
 /** Runtime-info protocol entry (#955): what the client's OWN config says it
  *  will run — reported at plugin bootstrap and on model switch, before (and
@@ -308,7 +304,7 @@ export type PendingPluginRegister = { conversationId: string; agent: string; ts:
  *  directly under the per-request header report; entries carry their model
  *  id and the table is only consulted when that id matches the request's
  *  model (a stale post-switch entry must never size a different model). */
-export type PluginRuntimeInfo = {
+type PluginRuntimeInfo = {
     agent: string;
     model: string;
     contextWindow?: number;
@@ -676,7 +672,7 @@ export function recordChainVerdict(sessionId: string, kind: string, protocol: st
     }
     return first;
 }
-export function chainVerdictFor(conversationId: string): ChainVerdict | undefined {
+function chainVerdictFor(conversationId: string): ChainVerdict | undefined {
     return chainVerdicts.get(conversationId);
 }
 export function _resetChainVerdictsForTest(): void {

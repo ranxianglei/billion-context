@@ -62,12 +62,6 @@ export function defaultLogFile(): string {
     return path.join(stateDir(), "bili.log");
 }
 
-/** Origin of the most recently started proxy (best-effort discovery file for
- *  host-spawned MCP shells that have no env passthrough: opencode/claude/codex). */
-export function proxyOriginFile(): string {
-    return path.join(stateDir(), "proxy-origin");
-}
-
 /** Body-dump dir (ACP_DUMP_BODY / BILI_DUMP_4XX): ACP_DUMP_DIR override first,
  *  else the XDG state dir so dumps co-locate with bili.log on every platform. */
 export function dumpsDir(): string {

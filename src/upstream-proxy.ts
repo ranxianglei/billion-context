@@ -8,7 +8,7 @@ import { maskHostInText, maskUrlForLog } from "./log-mask.js";
 import { upstreamTimeoutMs } from "./fetch-util.js";
 import { classifyUpstreamFailure, UPSTREAM_FAIL_HINTS } from "./upstream-fail.js";
 
-export type ParsedHttpProxy = {
+type ParsedHttpProxy = {
     url: string;
     host: string;
     port: number;
@@ -36,7 +36,7 @@ export type UpstreamProxyDecision = {
     autoConfigUrl?: string;
 };
 
-export type WindowsSystemProxy = {
+type WindowsSystemProxy = {
     enabled: boolean;
     http?: string;
     https?: string;
@@ -44,7 +44,7 @@ export type WindowsSystemProxy = {
     autoConfigUrl?: string;
 };
 
-export type UpstreamConnectionStatus = {
+type UpstreamConnectionStatus = {
     url?: string;
     proxy?: string;
     connected?: boolean;
@@ -79,7 +79,7 @@ function proxyAuthorization(url: URL): string | undefined {
     return `Basic ${Buffer.from(`${username}:${password}`).toString("base64")}`;
 }
 
-export function redactProxyUrl(value: string | undefined): string | undefined {
+function redactProxyUrl(value: string | undefined): string | undefined {
     if (!value) return undefined;
     try {
         const url = new URL(value);
@@ -225,7 +225,7 @@ function registryValue(output: string, name: string): string | undefined {
     return output.match(new RegExp(`^\\s*${escaped}\\s+REG_\\w+\\s+(.+)$`, "mi"))?.[1]?.trim();
 }
 
-export function readWindowsSystemProxy(): WindowsSystemProxy {
+function readWindowsSystemProxy(): WindowsSystemProxy {
     if (process.platform !== "win32") return { enabled: false };
     const now = Date.now();
     if (windowsProxyCache && now - windowsProxyCache.at < 5000) return windowsProxyCache.value;
@@ -473,16 +473,6 @@ export function connectThroughProxy(host: string, port: number, proxyUrl: string
             socket.on("data", onData);
         });
     });
-}
-
-export async function connectTlsThroughProxy(
-    host: string,
-    port: number,
-    proxyUrl: string | undefined,
-    servername?: string,
-): Promise<tls.TLSSocket> {
-    const socket = await connectThroughProxy(host, port, proxyUrl);
-    return tls.connect({ socket, servername: servername ?? host });
 }
 
 function errorChain(error: unknown): Array<Record<string, unknown>> {

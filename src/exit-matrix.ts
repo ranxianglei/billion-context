@@ -23,15 +23,15 @@ export const WIRE_EXITS = [
     "plugin-json",
 ] as const;
 
-export type WireExitId = (typeof WIRE_EXITS)[number];
+type WireExitId = (typeof WIRE_EXITS)[number];
 
-export interface ExitCell {
+interface ExitCell {
     readonly implementer: readonly unknown[];
     readonly contract: string;
     readonly coveredBy: readonly string[];
 }
 
-export const ERROR_DELIVERY: Record<WireExitId, ExitCell> = {
+const ERROR_DELIVERY: Record<WireExitId, ExitCell> = {
     "proxy-openai-sse": {
         implementer: [emitStreamError, emitPreflightError, startServer],
         contract: "mid-stream upstream failure → inline `error` delta + finish + [DONE]; late (early-committed) preflight failure → top-level error object + [DONE] in-band",
@@ -69,7 +69,7 @@ export const ERROR_DELIVERY: Record<WireExitId, ExitCell> = {
     },
 };
 
-export const ABORT_PROPAGATION: Record<WireExitId, ExitCell> = {
+const ABORT_PROPAGATION: Record<WireExitId, ExitCell> = {
     "proxy-openai-sse": {
         implementer: [startServer],
         contract: "client disconnects mid-stream → the in-flight upstream request is destroyed (no orphaned summarization/forward), session lock released",
@@ -107,7 +107,7 @@ export const ABORT_PROPAGATION: Record<WireExitId, ExitCell> = {
     },
 };
 
-export const HOST_USAGE_PASSTHROUGH: Record<WireExitId, ExitCell> = {
+const HOST_USAGE_PASSTHROUGH: Record<WireExitId, ExitCell> = {
     "proxy-openai-sse": {
         implementer: [startServer],
         contract: "provider-measured (post-fold) usage credited to the internal ledger and forwarded to the host verbatim — no baseline backfill (#660)",

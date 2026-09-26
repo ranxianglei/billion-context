@@ -9,7 +9,7 @@
  * replaced by a length hint.
  */
 
-export const PRIVATE_HOST = "<private-host>";
+const PRIVATE_HOST = "<private-host>";
 
 /** Well-known public LLM API host suffixes safe to log verbatim. Suffix
  *  matching covers subdomains (api.openai.com,

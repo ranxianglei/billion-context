@@ -22,7 +22,7 @@ import {
     type ZcodeWrappedEntry,
 } from "./json-edit.js";
 
-export type ZcodeNativePlan =
+type ZcodeNativePlan =
     | { readonly mode: "off" }
     | { readonly mode: "attach"; readonly attachOrigin: string }
     | { readonly mode: "spawn" };
@@ -113,7 +113,7 @@ export interface ZcodeRouteApplied {
     readonly wrapped: ZcodeWrappedEntry[];
 }
 
-export interface RouteZcodeOptions {
+interface RouteZcodeOptions {
     readonly origin: string;
     readonly env?: NodeJS.ProcessEnv;
     readonly dataDir?: string;
@@ -253,7 +253,7 @@ export function unrouteZcode(opts: { env?: NodeJS.ProcessEnv; dataDir?: string; 
     }
 }
 
-export interface RestoreZcodeBackupResult {
+interface RestoreZcodeBackupResult {
     readonly restored: boolean;
 }
 
@@ -291,7 +291,7 @@ export type BootstrapMode =
         readonly routed: ZcodeRouteApplied | undefined;
     };
 
-export interface BootstrapZcodeOptions {
+interface BootstrapZcodeOptions {
     readonly env?: NodeJS.ProcessEnv;
     readonly dataDir?: string;
     readonly log?: (msg: string) => void;

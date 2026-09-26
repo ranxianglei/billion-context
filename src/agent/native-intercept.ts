@@ -359,7 +359,7 @@ export async function probeHealth(origin: string): Promise<boolean> {
  *  healthy hit skips the steady-state loopback RTT; a dead hit avoids re-paying
  *  the full HEALTH_TIMEOUT_MS on every request across the death+cooldown window.
  *  Stale entries for other origins are evicted on insert, keeping the map bounded. */
-export function withProbeTtl(probe: (origin: string) => Promise<boolean>, ttlMs: number): (origin: string) => Promise<boolean> {
+function withProbeTtl(probe: (origin: string) => Promise<boolean>, ttlMs: number): (origin: string) => Promise<boolean> {
     const cache = new Map<string, { ok: boolean; at: number }>();
     return (origin) => {
         const now = Date.now();

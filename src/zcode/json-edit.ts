@@ -18,8 +18,8 @@ export interface ZcodeWrappedEntry {
     readonly upstream: string;
 }
 
-export const ZCODE_PLUGIN_HEADER = "x-bili-plugin";
-export const ZCODE_AGENT_VALUE = "zcode";
+const ZCODE_PLUGIN_HEADER = "x-bili-plugin";
+const ZCODE_AGENT_VALUE = "zcode";
 export const ZCODE_BIGMODEL_ANTHROPIC_UPSTREAM = "https://open.bigmodel.cn/api/anthropic";
 
 const ZCODE_LEGACY_PLAN_IDS: readonly string[] = [

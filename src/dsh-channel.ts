@@ -168,8 +168,8 @@ export function isDshProfileCopy(installDir: string, env: NodeJS.ProcessEnv = pr
 // — driving `dsh plugin …` ————————————————————————————————————————————————
 
 export type DshPlan = { command: string; args: string[]; windowsVerbatimArguments?: boolean };
-export type DshSyncRun = (plan: DshPlan) => { stdout: string; stderr: string };
-export type DshAsyncRun = (plan: DshPlan) => Promise<{ stdout: string; stderr: string }>;
+type DshSyncRun = (plan: DshPlan) => { stdout: string; stderr: string };
+type DshAsyncRun = (plan: DshPlan) => Promise<{ stdout: string; stderr: string }>;
 
 let testRunners: { sync?: DshSyncRun; async?: DshAsyncRun } | undefined;
 
@@ -270,7 +270,7 @@ export function runDshPlugin(args: string[], env: NodeJS.ProcessEnv = process.en
 /** Async variant for the auto-update path: must never block the proxy event
  *  loop (pnpm resolution can take seconds — a synchronous spawn here would
  *  freeze active SSE streams mid-update). */
-export async function runDshPluginAsync(args: string[], env: NodeJS.ProcessEnv = process.env): Promise<void> {
+async function runDshPluginAsync(args: string[], env: NodeJS.ProcessEnv = process.env): Promise<void> {
     const plan = planDshSpawn(dshCommand(env), args);
     const run = testRunners?.async ?? defaultAsyncRun;
     try {

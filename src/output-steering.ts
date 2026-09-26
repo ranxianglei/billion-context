@@ -405,7 +405,7 @@ function detectProtocolFromBody(obj: Record<string, unknown>): WireProtocol | nu
     return null;
 }
 
-export interface SteeringResult {
+interface SteeringResult {
     body: string;
     changed: boolean;
     labels: string[];
@@ -431,7 +431,7 @@ export function applyOutputSteering(body: string, protocol: WireProtocol | null,
 
 /** Object-level variant shared by the forward boundary and the compress-retry
  *  re-send paths. Mutates `parsed` in place; returns the applied labels. */
-export interface ApplySteeringOptions {
+interface ApplySteeringOptions {
     /** Skip the verbosity directive while keeping effort routing. Reserved for
      *  summarize-shaped requests should they ever route through here: the L2/L3
      *  directive ("never restate code, file contents, diffs, or tool output …")

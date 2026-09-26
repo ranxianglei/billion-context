@@ -10,9 +10,9 @@ import { isPidAlive, listInstances, procMainScript } from "./instance.js";
 import { PLUGIN_AGENTS, UPDATE_CHANNEL, inspectLanePresence, type PluginAgent } from "./plugin-install.js";
 import { findInstallDir, fetchRegistryVersion, hostManagedInstall, isGitWorkingTree, isVersionNewer, lastUpdateCheckTime, normalizeUpdateTag, staleInstallStatus } from "./update.js";
 
-export type LaneVerdict = "ok" | "stale" | "frozen" | "broken" | "absent";
+type LaneVerdict = "ok" | "stale" | "frozen" | "broken" | "absent";
 
-export interface DoctorGlobalInfo {
+interface DoctorGlobalInfo {
     installDir?: string;
     form: "npm" | "checkout" | "host-managed" | "unknown";
     owner?: string;
@@ -58,7 +58,7 @@ export interface DoctorReport {
     processes: DoctorProcess[];
 }
 
-export interface DoctorOpts {
+interface DoctorOpts {
     packageName: string;
     runningVersion: string;
     resolveProxy?: (url: string) => string | undefined;

@@ -674,7 +674,7 @@ const REWRITE_MAX_KNOWN_RATIO = 0.5;
 // (stale map entries linger until session end); a false positive is fatal.
 export const REWRITE_MIN_INCOMING_TOTAL = 10;
 
-export interface RewriteDetection {
+interface RewriteDetection {
     detected: boolean;
     knownBefore: number;
     incomingTotal: number;
@@ -709,7 +709,7 @@ export function detectUnannouncedHistoryRewrite(
  *  compress result already reported them as saved. Returns how many of the
  *  covered ids are present in the resent history, or null when coverage is
  *  complete (or nothing was covered). */
-export interface FoldCoverage {
+interface FoldCoverage {
     expected: number;
     matched: number;
 }

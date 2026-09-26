@@ -912,7 +912,7 @@ function pluginEntries(data: Record<string, unknown>, key: string): string[] {
 // config.json -> opencode.json -> opencode.jsonc, later wins), else create
 // opencode.json. Never spawn a second file next to an existing config — that
 // splits one logical config across files (#927).
-export function opencodeTargetFile(): string {
+function opencodeTargetFile(): string {
     const raw = process.env.OPENCODE_CONFIG?.trim();
     if (raw && raw.length > 0) return raw;
     const xdg = process.env.XDG_CONFIG_HOME?.trim();
@@ -1410,7 +1410,7 @@ interface KimiInstalledRecord {
 /** installed.json is machine-managed (kimi's own store writes it too) but is
  *  not user-authored prose — a corrupt registry is surfaced loudly instead of
  *  being silently re-created (§7.3). */
-export function readKimiInstalledRegistry(file: string): { version: number; plugins: KimiInstalledRecord[] } {
+function readKimiInstalledRegistry(file: string): { version: number; plugins: KimiInstalledRecord[] } {
     let text: string;
     try {
         text = fs.readFileSync(file, "utf8");
@@ -1434,7 +1434,7 @@ function writeJsonAtomic(file: string, data: unknown): void {
  *  with the bundled-node fallback) requires the v2 engine. A missing binary or
  *  an old one throws with launcher-mode guidance rather than writing a dead
  *  manifest. */
-export function detectKimiVersion(env: NodeJS.ProcessEnv = process.env): string {
+function detectKimiVersion(env: NodeJS.ProcessEnv = process.env): string {
     const candidates: Array<{ cmd: string; viaShell: boolean }> = process.platform === "win32"
         ? [{ cmd: "kimi --version", viaShell: true }]
         : [{ cmd: "kimi", viaShell: false }, { cmd: path.join(resolveKimiHome(env), "bin", "kimi"), viaShell: false }];
@@ -1627,13 +1627,13 @@ function zcodeArgsMatch(args: unknown, re: RegExp): boolean {
     return Array.isArray(args) && args.some((a) => typeof a === "string" && re.test(a));
 }
 
-export function isOursZcodeHookEntry(entry: unknown): boolean {
+function isOursZcodeHookEntry(entry: unknown): boolean {
     const hooks = zcodeAsPlain(entry)?.hooks;
     if (!Array.isArray(hooks)) return false;
     return hooks.some((h) => zcodeArgsMatch(zcodeAsPlain(h)?.args, ZCODE_HOOK_ENTRY_RE));
 }
 
-export function isOursZcodeMcpServer(server: unknown): boolean {
+function isOursZcodeMcpServer(server: unknown): boolean {
     const s = zcodeAsPlain(server);
     return !!s && s.type === "stdio" && zcodeArgsMatch(s.args, ZCODE_MCP_ENTRY_RE);
 }
@@ -1642,7 +1642,7 @@ export function isOursZcodeMcpServer(server: unknown): boolean {
  *  parsed doc: enables hooks, upserts our SessionStart entry, and owns ONLY
  *  mcp.servers.bili when it already points at our dist — a user's own "bili"
  *  server throws instead of being clobbered (§7.3). */
-export function applyZcodeManagedConfig(doc: Record<string, unknown>, opts: { hookEntry: string; mcpEntry: string }): { data: Record<string, unknown>; notes: string[] } {
+function applyZcodeManagedConfig(doc: Record<string, unknown>, opts: { hookEntry: string; mcpEntry: string }): { data: Record<string, unknown>; notes: string[] } {
     const data = structuredClone(doc);
     const notes: string[] = [];
     const hooks = zcodeAsPlain(data.hooks) ?? {};
@@ -1669,7 +1669,7 @@ export function applyZcodeManagedConfig(doc: Record<string, unknown>, opts: { ho
     return { data, notes };
 }
 
-export function stripZcodeManagedConfig(doc: Record<string, unknown>): { data: Record<string, unknown>; removed: string[] } {
+function stripZcodeManagedConfig(doc: Record<string, unknown>): { data: Record<string, unknown>; removed: string[] } {
     const data = structuredClone(doc);
     const removed: string[] = [];
     const hooks = zcodeAsPlain(data.hooks);
@@ -1763,7 +1763,7 @@ function zcodeStatus(): string {
  *  resolvable. Read-only. Multi-face probes degrade to partial info on
  *  malformed config; single-source probes (pi/opencode/zcode) propagate the
  *  parse error so doctor reports a broken probe instead of a false "absent". */
-export interface LanePresence {
+interface LanePresence {
     installed: boolean;
     pointers: string[];
     targets: string[];
@@ -2070,7 +2070,7 @@ export const UPDATE_CHANNEL: Record<PluginAgent, string> = {
     zcode: "the global bili install (hook/MCP point at its dist)",
 };
 
-export interface PluginUpdateOpts {
+interface PluginUpdateOpts {
     packageName: string;
     resolveProxy?: (url: string) => string | undefined;
     updateTag?: string;

@@ -37,16 +37,6 @@ export function hashId(s: string): string {
     return createHash("sha256").update(s, "utf8").digest("hex").slice(0, 16);
 }
 
-/** Parse JSON without throwing; returns {} for empty/invalid input. Used to
- *  tolerate malformed tool-call arguments and debug payloads. */
-export function safeJsonParse(s: string): unknown {
-    try {
-        return s ? JSON.parse(s) : {};
-    } catch {
-        return {};
-    }
-}
-
 /** True if a socket remote address is loopback. Covers the IPv4 127.0.0.0/8
  *  block and IPv6 ::1, including the IPv4-mapped ::ffff:127.x.x.x form Node
  *  reports for dual-stack sockets. Shared by the admin-endpoint gate
@@ -265,7 +255,7 @@ export function inspectContextOverflow(status: number, bodyText: string): Contex
  *  still fits at the 95% emergency threshold — while bounding the budget loss.
  *  A reply longer than the reservation overflows once; the overflow self-heal
  *  (armed emergency) recovers it on the next turn. */
-export const DEFAULT_OUTPUT_HEADROOM_MAX_PCT = 0.25;
+const DEFAULT_OUTPUT_HEADROOM_MAX_PCT = 0.25;
 
 /** Resolve the user's `outputHeadroomMaxPct` (ratio or "N%" string) to a
  *  numeric cap, falling back to DEFAULT_OUTPUT_HEADROOM_MAX_PCT when unset.

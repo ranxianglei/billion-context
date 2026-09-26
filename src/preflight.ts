@@ -57,7 +57,7 @@ export const MAX_SUMMARY_CALLS_PER_PREFLIGHT = 16;
 // incident class behind #868 (a 1.39x-window payload); it is a fixed depth,
 // not scaled to the overshoot — scaling it is a separate design question.
 
-export type PreflightProtocol = "anthropic" | "openai" | "responses" | "google";
+type PreflightProtocol = "anthropic" | "openai" | "responses" | "google";
 
 export interface PreflightDeps {
     core: CompressionCore;
@@ -88,9 +88,9 @@ export interface PreflightDeps {
     unknownBaseline?: boolean;
 }
 
-export type PreflightFailureKind = "upstream" | "exhausted" | "aborted";
+type PreflightFailureKind = "upstream" | "exhausted" | "aborted";
 
-export interface PreflightFailure {
+interface PreflightFailure {
     kind: PreflightFailureKind;
     /** A temporary transport failure, not evidence that this context cannot be compressed. */
     retryable?: boolean;

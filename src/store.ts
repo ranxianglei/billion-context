@@ -208,7 +208,7 @@ function bufferDropNote(session: Session, refs: string[], reason: string): void 
 /** Queue a hit for later delivery: add the ephemeral injection carrier plus a
  *  durable ledger entry (deduped by ref — a ref is never reused, kernel
  *  contract). Returns nothing; the ack is produced by executeRetrieve. */
-export function queueRetrieval(session: Session, r: Omit<PendingRetrieval, "queuedAt">): void {
+function queueRetrieval(session: Session, r: Omit<PendingRetrieval, "queuedAt">): void {
     const carrier = session.pendingRetrievals ?? (session.pendingRetrievals = []);
     if (carrier.some((p) => p.ref === r.ref)) return;
     carrier.push({ ...r, queuedAt: Date.now(), ccr: true });

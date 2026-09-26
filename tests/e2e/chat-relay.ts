@@ -27,13 +27,13 @@ type ChatMessage = {
     tool_call_id?: string;
 };
 
-export type ChatRelayOptions = {
+type ChatRelayOptions = {
     upstream: string;
     host?: string;
     port?: number;
 };
 
-export type ChatRelay = {
+type ChatRelay = {
     server: http.Server;
     port: number;
     close(): Promise<void>;
