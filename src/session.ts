@@ -170,6 +170,14 @@ export type Session = {
         imageFullRestores?: number;
         /** #1179 CCR v2: range-level decompress restores served (ephemeral channel). */
         rangeRestores: number;
+        /** #1336: whole-block decompress restores served. Optional — absent in
+         *  pre-#1336 records. */
+        wholeBlockRestores?: number;
+        /** #1336: of those, how many had a cheaper precise path available at
+         *  restore time (the block carried covered refs AND CCR was armed, so
+         *  a range-restore / targeted retrieve would have sufficed). The
+         *  ratio is the retrieve-quality proxy for plan-aware retrieval. */
+        wholeBlockRestoresPreciseAvailable?: number;
     };
     /** Free-form escape hatch for future fields not yet promoted to typed
      *  members. Persisted as-is (must be JSON-serializable). Use sparingly —
@@ -212,8 +220,13 @@ export type Session = {
     *  full-state rebase). In-memory only here; buildRecord omits it. */
     contentStore?: MessageContentStore;
     /** In-memory only (NOT persisted): content-store.json is rewritten only
-    *  while this is set (adopt grew entries / reset cleared the store). */
+     *  while this is set (adopt grew entries / reset cleared the store). */
     contentStoreDirty?: boolean;
+    /** #1336 in-memory only (NOT persisted — buildRecord omits it): acp_retrieve
+     *  hit count per ref, used by plan-aware search steering to flag refs the
+     *  model keeps re-fetching. Bounded by trimRetrieveCounts; lost on restart
+     *  (advisory signal only). */
+    retrieveCountsByRef?: Map<string, number>;
     /** In-memory only (NOT persisted): full-text retrieval injections queued by
      *  executeRetrieve, delivered on a later plugin-lane upstream request
      *  (request-only, same channel as nudges). Durable bookkeeping for each

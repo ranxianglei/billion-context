@@ -97,7 +97,7 @@ function executeProxyTool(
         return resolveDecompress(args, ctx);
     }
     if (toolName === "search_context") {
-        return executeSearchContextTarget(args, ctx.core, ctx.session.id, ctx.session.state);
+        return executeSearchContextTarget(args, ctx.core, ctx.session.id, ctx.session.state, ctx);
     }
     if (toolName === "acp_status") {
         return handleAcpStatus(args, ctx);

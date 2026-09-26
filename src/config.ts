@@ -285,6 +285,21 @@ export type CompressSettings = {
          *  default 96). */
         maxHeadChars?: number;
     };
+    /** [#1336] Planning-aware retrieval: when `planAware` is true,
+     *  search_context re-ranks its candidate blocks against the session's
+     *  current todo/task state (the latest protectedLatestTools snapshot in
+     *  context plus the most recent user turn) and appends a short steering
+     *  section to the result. Pure host-side policy — the kernel's lexical
+     *  candidate surface, the content store, folding and injection mechanics
+     *  are all reused unchanged. Disabled or no plan state in context ⇒
+     *  byte-identical output to the plain lexical ranking. Off by default;
+     *  measure before enabling in shared configs. Merged sub-field-wise across
+     *  the three levels like `absorb`/`ccr`. See src/decompress-shared.ts. */
+    search?: {
+        /** Enable plan-aware re-ranking + steering for search_context.
+         *  Absent/false = off (byte-identical output). */
+        planAware?: boolean;
+    };
     /** [#1095] Image pre-compression (kernel `Config.imageCompression`,
      *  acp-kernel >= 0.0.84). When `enabled`, screenshot-like images in tool
      *  results are downscaled ONCE at arrival before entering the wire
@@ -1307,6 +1322,22 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
                 }
             }
             if (ok) out.ccr = cleaned;
+        }
+    }
+    if ("search" in obj && obj.search !== undefined) {
+        const c = obj.search;
+        if (!c || typeof c !== "object" || Array.isArray(c)) {
+            ok = false;
+        } else {
+            const co = c as Record<string, unknown>;
+            const cleaned: NonNullable<CompressSettings["search"]> = {};
+            for (const key of ["planAware"] as const) {
+                if (!(key in co)) continue;
+                const v = co[key];
+                if (typeof v !== "boolean") { ok = false; continue; }
+                cleaned.planAware = v;
+            }
+            if (ok) out.search = cleaned;
         }
     }
     if ("imageCompression" in obj && obj.imageCompression !== undefined) {

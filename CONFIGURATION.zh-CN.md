@@ -388,6 +388,14 @@
   **插件通道治理（#1345）：**插件模式下整个 `ccr` 块跟随**基础**配置——仅当基础层级显式 `enabled: true` 时武装，并以基础的 `toolName` 与阈值执行；因为插件清单（宿主声明 retrieve 能力的唯一出口）只从基础配置构建。provider/model 层级的 `ccr.*` 覆盖因此只对代理模式会话生效（代理按请求在合并块下自行声明并分发）。每个发生分歧的覆盖都会在配置加载时记录一条 `[acp-config] ccr override ignored in plugin sessions: …` 警告，指明层级、字段以及插件会话实际使用的值。
   存储以单个信封文件（`.content-store.json`）持久化在会话 JSON 旁边，设置 `BILI_ENCRYPTION_KEY` 时使用与会话文件相同的静态加密编解码器；条目按内容哈希去重，按会话懒加载。只有 `tool` 结果*内部的内容*缩小——与 assistant `tool_calls` 的配对不受影响。范围门控：**全车道默认关闭（#1207 决策）— 任意层级显式 `compress.ccr.enabled: true` 方可启用**：代理模式开启即武装；anthropic + openai wire 上的插件模式需全局显式开启（插件清单才会声明 `acp_retrieve`，#1271）；responses marker/文本协议路由、`ACP_NO_INJECT_TOOL`、以及插件模式下的 responses/google wire 没有经过验证的请求内往返通道来执行 retrieve，因此存储在这些场景下自动解除武装，而不是丢失内容。v2 起（#1179），折叠同样无损：compress 折叠落定时，被覆盖的原文会持久化进存储（首次写入优先，跳过 reasoning），因此 `acp_retrieve("mNNNNN")` 对已折叠内容同样有效；`decompress` 接受可选的 `startId`/`endId` 消息 ref，只恢复块内的一个区间（临时注入，与 retrieve 同一通道）；`search_context` 命中条目携带覆盖的 ref 区间（`[m00044–m00097 · N msgs]`）；`acp_status` 列出块→ref 关联（`BLOCK SPANS`），并在 STORE 行单独计数 `range-restored`。设计定案（#1282）：**永不设上限、永不逐出**——信封随持有的唯一原文数量增长，与会话同生命周期；足迹在 `acp_status` 中可见。按会话统计（已存字节、当前线上节省字节、retrieve 率）在 `acp_status` 中展示；每次 retrieve 记录一条 `[ccr] retrieve …` 日志。
 
+#### `search`
+
+- **类型：** `object`（`{ planAware? }`）
+- **默认值：** *（关闭 —— 未设置即解析为 `planAware: false`；输出与纯词法搜索逐字节一致）*
+- **状态：** ACTIVE（CCR v3 规划感知检索，#1336 —— 默认关闭、实测后再启用；代理模式 + 插件模式）
+- **说明：** 面向 `search_context` 的可选**规划感知检索**（issue #1336）。启用后，当查询命中的块数超过 `limit` 时，候选块会按当前**规划状态**重排：规划状态从上下文内的消息视图提取——每个规划工具的**最后一次** tool-call（内置模式 `TodoWrite`、`todowrite`、`todo_list`、`update_plan`、`TaskCreate`、`TaskUpdate`，外加全部 `compress.protectedLatestTools` 模式——与内核快照保护的 latest-wins 语义相同）以及最近一条用户消息。候选块的 topic/summary 与该状态的词项做加权重叠打分：得分 >0 的块排前，同分保持原词法顺序。仅在此条件下发生两件事：返回子集可能不同于纯词法截断；结果末尾追加 `[plan-aware]` 引导段——(a) `top fetch targets:` 列出得分最高的返回块所覆盖的 ref 区间，(b) 对本会话内已 retrieve ≥2 次的覆盖 ref 给出提示，建议改用一次性 `decompress({blockId, startId, endId})` 区间恢复代替反复 `acp_retrieve`。标志关闭、上下文中无规划状态、或命中池本就在 `limit` 之内时，输出与功能引入前逐字节一致。重排只动候选顺序——不改存储/折叠/注入机制、不新增持久化、跨会话搜索（`conversation_id`）保持只读词法。每次重排记一条 `[acp-search-plan] …` 日志（含逐块得分）。配套统计：整块 decompress 计入 `acp_status` 的 `RETRIEVAL QUALITY` 行（总数 + 其中有多少次存在更便宜的精确路径可用——即该块带 ref 区间且 CCR 已武装），便于启用前后度量 retrieve 与 decompress 的取舍。子字段（按字段最深层级胜出，与其他 CompressSettings 字段一致）：
+  - `planAware: boolean` — 总开关；非 `true` 一律保持功能完全关闭。
+
 #### `imageCompression`
 
 - **类型：** `object`（`{ enabled?, minTokens?, maxDimension?, quality?, format? }`）

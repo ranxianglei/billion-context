@@ -65,6 +65,7 @@ import { applyAbsorbView, absorbEnabled, absorbToolName, storeEffectiveAbsorb } 
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, ccrPluginWireOk, commitRetrievals, contentStoreOf, dropRetrievals, executeRetrieve, flushRetrievalNotes, pruneExpiredRetrievals, reconcileReloadedRetrievals, retrieveToolName, snapshotPendingRetrievals, storeEffectiveCcr, type CcrSettings } from "./store.js";
 import { applyImageCompressionPass, imageCompressionEnabled, imageFullTrailingNote, storeEffectiveImageCompression, type ImageCompressionSettings } from "./image-compress.js";
 import { rulesEnabled, storeEffectiveRules } from "./rules-feature.js";
+import { storeEffectiveSearchPlanAware } from "./decompress-shared.js";
 import { rewriteJsonResponse, type RewriteCtx } from "./stream.js";
 import { applyRanges } from "./stream.js";
 import { buildSessionCacheReport } from "./cache-ledger.js";
@@ -1328,6 +1329,10 @@ async function handle(
     // every view / injection / execution site reads one value.
     let resolvedCcrCfg: CcrSettings | undefined;
     let resolvedImageCompressionCfg: ImageCompressionSettings | undefined;
+    // [#1336] host-only plan-aware search flag for this request scope (three-
+    // level merge); stamped onto the session below like the other per-request
+    // policies. Off unless compress.search.planAware=true at some level.
+    let resolvedSearchPlanAware = false;
     let reqModelId: string | undefined;
     if (parsed && typeof parsed === "object") {
         // Gemini's model lives in the request path, every other wire carries it
@@ -1437,6 +1442,7 @@ async function handle(
             // some config level, after local verification.
             resolvedCcrCfg = compressCfg.ccr;
         resolvedImageCompressionCfg = compressCfg.imageCompression;
+            resolvedSearchPlanAware = compressCfg.search?.planAware === true;
             reqPrompts = resolveCompressPrompts(compressCfg);
             const surfaceRes = resolveCompressSurfaceDetailed(compressCfg);
             reqSurface = surfaceRes.surface;
@@ -1960,6 +1966,10 @@ async function handle(
         // round-trip needs a tool channel on this wire; without one the model
         // could request originals it never gets back (silent-loss trap).
         storeEffectiveImageCompression(session, opts.compress.injectTool && !pluginMode && storeChannelOk && resolvedImageCompressionCfg?.enabled === true ? resolvedImageCompressionCfg : undefined);
+        // [#1336] no channel gating: search_context is already available on
+        // whichever mode served this session and the re-rank is pure output-
+        // side policy on its result — both proxy and plugin lanes apply it.
+        storeEffectiveSearchPlanAware(session, resolvedSearchPlanAware);
         // #546: restore a client-shrunk output budget BEFORE the side gate so a
         // tool-carrying main request re-enters the pipeline at full budget (see
         // restoreOutputBudget for the starvation mechanism).
