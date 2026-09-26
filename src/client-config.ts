@@ -89,6 +89,13 @@ export interface OpencodeConfig {
     providers: Record<string, OpencodeProvider>;
 }
 
+/** opencode's built-in "zen" gateway (`opencode auth login`): the baseURL
+ *  (`https://opencode.ai/zen/v1/messages`) comes from the models.dev catalog,
+ *  not from any local config file, so discovery cannot see it — seed it like
+ *  the other stock model gateways so `bili omp` / `bili opencode` cert-MITM
+ *  zen traffic instead of blind-tunneling it (#1405). */
+export const OPENCODE_DEFAULT_MODEL_HOSTS = ["opencode.ai"];
+
 export interface HermesProvider {
     api?: string;
 }
@@ -1212,6 +1219,21 @@ export function resolveOpencodeConfigFile(env: NodeJS.ProcessEnv): string {
     return path.join(dir, "opencode.jsonc");
 }
 
+// The complete set of files whose contents feed config.opencode (exactly what
+// readOpencodeConfigRoot reads): the three global candidates + an explicit
+// OPENCODE_CONFIG when set. The discovery mtime cache must watch this same set
+// or edits go stale (#1411).
+/** Candidate opencode config paths for the discovery mtime cache. Order is
+ *  irrelevant (watch/mtime only); readOpencodeConfigRoot reads config.json
+ *  first by preference — no need to keep the two orders in lockstep. */
+export function opencodeConfigFiles(env: NodeJS.ProcessEnv): string[] {
+    const xdg = nonEmpty(env.XDG_CONFIG_HOME) ? env.XDG_CONFIG_HOME : path.join(os.homedir(), ".config");
+    const dir = path.join(xdg, "opencode");
+    const files = OPENCODE_CONFIG_FILES.map((f) => path.join(dir, f));
+    if (nonEmpty(env.OPENCODE_CONFIG)) files.push(env.OPENCODE_CONFIG);
+    return files;
+}
+
 // opencode accepts JSONC (comments, trailing commas) in every config file; a strict
 // JSON.parse silently yields "no config" for .jsonc users.
 export function parseConfigText(text: string): Record<string, unknown> | undefined {
@@ -1538,7 +1560,10 @@ export const AIDER_DEFAULT_MODEL_HOSTS = [
  *  default_config_files entries over earlier ones; aider lists them
  *  cwd → git root → home): home > git root > cwd. Only top-level scalar
  *  values are parsed; anything else is ignored. */
-export function readAiderConfUrls(cwd: string, env: NodeJS.ProcessEnv = process.env): string[] {
+// The .aider.conf.yml candidates feeding config.aider.baseUrls (home > git
+// root > cwd, aider's own resolution order). Exported so the discovery mtime
+// cache watches the same set (#1411).
+export function aiderConfFiles(cwd: string, env: NodeJS.ProcessEnv = process.env): string[] {
     const home = nonEmpty(env.HOME) ? env.HOME! : os.homedir();
     const candidates = [path.join(home, ".aider.conf.yml")];
     let dir = cwd;
@@ -1552,7 +1577,11 @@ export function readAiderConfUrls(cwd: string, env: NodeJS.ProcessEnv = process.
         dir = parent;
     }
     candidates.push(path.join(cwd, ".aider.conf.yml"));
-    for (const file of candidates) {
+    return [...new Set(candidates)];
+}
+
+export function readAiderConfUrls(cwd: string, env: NodeJS.ProcessEnv = process.env): string[] {
+    for (const file of aiderConfFiles(cwd, env)) {
         let text: string;
         try {
             text = fs.readFileSync(file, "utf8");

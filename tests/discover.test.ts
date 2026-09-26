@@ -17,6 +17,7 @@ import {
     zcodeDataRoot,
     zcodeStoreFileFor,
     QODER_DEFAULT_MODEL_HOSTS,
+    OPENCODE_DEFAULT_MODEL_HOSTS,
     type ClientConfig,
 } from "../src/client-config.ts";
 
@@ -310,6 +311,40 @@ test("extractHttpsHosts: aider → default hosts when undeclared; declared https
     );
 });
 
+test("extractHttpsHosts: opencode provider baseURL + omp provider baseUrl discovered, coexist with other lanes (#1411)", () => {
+    const hosts = extractHttpsHosts({
+        opencode: {
+            providers: {
+                myrelay: { baseURL: "https://custom.example.com/v1" },
+                plain: { baseURL: "http://insecure.example.com" },
+            },
+        },
+        omp: { providers: { relay2: { baseUrl: "https://OMP.RELAY.example.com/v1" } } },
+        claude: { anthropicBaseUrl: "https://relay.example.com" },
+    });
+    assert.ok(hosts.includes("custom.example.com"), `opencode custom host present: ${hosts.join(",")}`);
+    assert.ok(hosts.includes("omp.relay.example.com"), `omp custom host present (lowercased): ${hosts.join(",")}`);
+    assert.ok(hosts.includes("relay.example.com"), `coexists with other lanes: ${hosts.join(",")}`);
+    assert.ok(!hosts.includes("insecure.example.com"), `http dropped: ${hosts.join(",")}`);
+});
+
+test("extractHttpsHosts: partial opencode/omp configs are safe — seed present once #1405 lands (#1411)", () => {
+    assert.deepEqual(extractHttpsHosts({ opencode: {} }), OPENCODE_DEFAULT_MODEL_HOSTS);
+    assert.deepEqual(extractHttpsHosts({ omp: {} }), OPENCODE_DEFAULT_MODEL_HOSTS);
+});
+
+test("extractHttpsHosts: opencode/omp → zen gateway default host, coexists with other lanes (#1405)", () => {
+    assert.deepEqual(extractHttpsHosts({ opencode: {} }), OPENCODE_DEFAULT_MODEL_HOSTS);
+    assert.deepEqual(extractHttpsHosts({ omp: {} }), OPENCODE_DEFAULT_MODEL_HOSTS);
+    assert.deepEqual(extractHttpsHosts({ opencode: {}, omp: {} }), OPENCODE_DEFAULT_MODEL_HOSTS);
+    const mixed = extractHttpsHosts({
+        opencode: { providers: { custom: { baseURL: "https://custom.example.com/v1" } } },
+        claude: { anthropicBaseUrl: "https://relay.example.com" },
+    });
+    assert.ok(mixed.includes("opencode.ai"), `zen host present: ${mixed.join(",")}`);
+    assert.ok(mixed.includes("relay.example.com"), `coexists with other lanes: ${mixed.join(",")}`);
+});
+
 async function withTempHome<T>(fn: (home: string, env: NodeJS.ProcessEnv) => Promise<T>): Promise<T> {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-disc-"));
     const savedHome = process.env.HOME;
@@ -322,7 +357,9 @@ async function withTempHome<T>(fn: (home: string, env: NodeJS.ProcessEnv) => Pro
             ZCODE_DATA_BASE_DIR: path.join(tmp, ".zcode"),
             PI_CODING_AGENT_DIR: path.join(tmp, ".pi", "agent"),
             CODEBUDDY_CONFIG_DIR: path.join(tmp, ".codebuddy"),
+            XDG_CONFIG_HOME: path.join(tmp, ".config"),
         };
+        delete env.OPENCODE_CONFIG;
         return await fn(tmp, env);
     } finally {
         process.env.HOME = savedHome;
@@ -351,6 +388,15 @@ test("discoverMitmDomains: returns union of https hosts from client configs", as
         const domains = discoverMitmDomains(env);
         assert.ok(domains.includes("open.bigmodel.cn"), `zcode host present: ${domains.join(",")}`);
         assert.ok(domains.includes("api.openai.com"), `codex host present: ${domains.join(",")}`);
+        return Promise.resolve();
+    });
+});
+
+test("discoverMitmDomains: seeds opencode zen gateway host even with no client configs (#1405)", async () => {
+    await withTempHome((_home, env) => {
+        _resetDiscoveryCacheForTest();
+        const domains = discoverMitmDomains(env);
+        assert.ok(domains.includes("opencode.ai"), `zen gateway host present: ${domains.join(",")}`);
         return Promise.resolve();
     });
 });
@@ -436,5 +482,96 @@ test("discoverMitmDomains: discovers hosts from provider_config.json (new person
 
         const after = discoverMitmDomains(env);
         assert.ok(after.includes("newp.example.com"), `present after provider_config.json appears: ${after.join(",")}`);
+    });
+});
+
+test("discoverMitmDomains: discovers opencode custom provider host from opencode.json, coexists with other lanes (#1411)", async () => {
+    await withTempHome((home, env) => {
+        const ocDir = path.join(home, ".config", "opencode");
+        fs.mkdirSync(ocDir, { recursive: true });
+        fs.writeFileSync(
+            path.join(ocDir, "opencode.json"),
+            JSON.stringify({
+                provider: { myrelay: { npm: "@ai-sdk/openai-compatible", options: { baseURL: "https://custom.example.com/v1" } } },
+            }),
+        );
+        writeZcodeConfig(home, ["https://zlane.example.com/anthropic"]);
+        _resetDiscoveryCacheForTest();
+        const domains = discoverMitmDomains(env);
+        assert.ok(domains.includes("custom.example.com"), `opencode custom provider host present: ${domains.join(",")}`);
+        assert.ok(domains.includes("zlane.example.com"), `coexists with other lanes: ${domains.join(",")}`);
+        return Promise.resolve();
+    });
+});
+
+test("discoverMitmDomains: discovers omp provider baseUrl from models.yml (#1411)", async () => {
+    await withTempHome((home, env) => {
+        fs.mkdirSync(path.join(home, ".pi", "agent"), { recursive: true });
+        fs.writeFileSync(
+            path.join(home, ".pi", "agent", "models.yml"),
+            "providers:\n  myrelay:\n    baseUrl: https://omp.example.com/v1\n",
+        );
+        _resetDiscoveryCacheForTest();
+        const domains = discoverMitmDomains(env);
+        assert.ok(domains.includes("omp.example.com"), `omp provider host present: ${domains.join(",")}`);
+        return Promise.resolve();
+    });
+});
+
+test("discoverMitmDomains: OPENCODE_CONFIG file's provider host discovered (#1411)", async () => {
+    await withTempHome((home, env) => {
+        const custom = path.join(home, "my-opencode-config.jsonc");
+        fs.writeFileSync(custom, '{ "provider": { "relay": { "options": { "baseURL": "https://explicit.example.com/v1" } } } }');
+        env.OPENCODE_CONFIG = custom;
+        _resetDiscoveryCacheForTest();
+        const domains = discoverMitmDomains(env);
+        assert.ok(domains.includes("explicit.example.com"), `OPENCODE_CONFIG host present: ${domains.join(",")}`);
+        return Promise.resolve();
+    });
+});
+
+test("discoverMitmDomains: opencode.json edit invalidates cache after TTL (#1411)", async () => {
+    await withTempHome(async (home, env) => {
+        const ocDir = path.join(home, ".config", "opencode");
+        fs.mkdirSync(ocDir, { recursive: true });
+        const cfgPath = path.join(ocDir, "opencode.json");
+        const write = (url: string): void => {
+            fs.writeFileSync(cfgPath, JSON.stringify({ provider: { r: { options: { baseURL: url } } } }));
+        };
+        write("https://v1.example.com");
+        const baseMtime = Math.floor(fs.statSync(cfgPath).mtimeMs / 1000);
+        _resetDiscoveryCacheForTest();
+        const first = discoverMitmDomains(env);
+        assert.ok(first.includes("v1.example.com"));
+
+        write("https://v2.example.com");
+        fs.utimesSync(cfgPath, baseMtime + 60, baseMtime + 60);
+        const withinTtl = discoverMitmDomains(env);
+        assert.strictEqual(withinTtl, first, "within TTL: still cached");
+
+        await new Promise<void>((r) => setTimeout(r, 2100));
+
+        const after = discoverMitmDomains(env);
+        assert.ok(after.includes("v2.example.com"), `v2 present after rescan: ${after.join(",")}`);
+        assert.ok(!after.includes("v1.example.com"), `v1 gone: ${after.join(",")}`);
+    });
+});
+
+test("discoverMitmDomains: .aider.conf.yml edit invalidates cache after TTL (#1411)", async () => {
+    await withTempHome(async (home, env) => {
+        const confPath = path.join(home, ".aider.conf.yml");
+        fs.writeFileSync(confPath, "openai-api-base: https://av1.example.com/v1\n");
+        const baseMtime = Math.floor(fs.statSync(confPath).mtimeMs / 1000);
+        _resetDiscoveryCacheForTest();
+        const first = discoverMitmDomains(env);
+        assert.ok(first.includes("av1.example.com"));
+
+        fs.writeFileSync(confPath, "openai-api-base: https://av2.example.com/v1\n");
+        fs.utimesSync(confPath, baseMtime + 60, baseMtime + 60);
+        await new Promise<void>((r) => setTimeout(r, 2100));
+
+        const after = discoverMitmDomains(env);
+        assert.ok(after.includes("av2.example.com"), `av2 present after rescan: ${after.join(",")}`);
+        assert.ok(!after.includes("av1.example.com"), `av1 gone: ${after.join(",")}`);
     });
 });
