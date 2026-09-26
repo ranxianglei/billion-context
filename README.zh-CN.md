@@ -90,7 +90,7 @@ QQ群:
 
 可选的第五个工具 `absorb`(`compress.absorb.enabled: true` —— 见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md))对**各个工具结果即时压缩**:大结果(构建、日志、grep)被附带强制吸收指令,模型将各自蒸馏为紧凑摘要,原配对从下一轮起从线上隐藏 —— 使折叠轮之间的中间会话压力更低(#605)。
 
-可选的第六个工具 `acp_rule`(`compress.rules: true` —— 见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md))记录**持久化的原则级提醒**:模型记录的简短规则(用户强调的教训、要求记住的行为、撞到的大坑)受硬性保护不被压缩——调用及结果在每次折叠中都保留在上下文中——省略参数则列出已记录规则;传入 `delete`(规则 id,如 `"rule3"`)删除单条规则,传入 `clear: true` 清空全部规则([ranxianglei/billion-context-pi#433](https://github.com/ranxianglei/billion-context-pi/issues/433))。
+第六个工具 `acp_rule`(默认关闭;设 `compress.rules: true` 显式开启 —— 见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)。开启后模型对会话规则有全权、可未经提示自主调用,#1399)记录**持久化的原则级提醒**:模型记录的简短规则(用户强调的教训、要求记住的行为、撞到的大坑)受硬性保护不被压缩——调用及结果在每次折叠中都保留在上下文中——省略参数则列出已记录规则;传入 `delete`(规则 id,如 `"rule3"`)删除单条规则,传入 `clear: true` 清空全部规则([ranxianglei/billion-context-pi#433](https://github.com/ranxianglei/billion-context-pi/issues/433))。
 
 第七个工具 `acp_retrieve`(全车道默认关闭、显式开启 —— 任意层级设 `compress.ccr.enabled: true` 方可启用,建议先本地验证;插件车道需全局显式 `true` 才会在 manifest 广播工具,#1271/#1273;见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md))支撑**内容寻址消息存储**(内置 CCR,#1097/#1179):超大工具结果**在到达时改为 ID 引用,而非强制蒸馏**——线上保留字节稳定的占位符,原文进入按会话的内容存储信封(按内容哈希去重),模型通过一次廉价工具调用按需取回。v2 让折叠同样无损:折叠落定时被覆盖的原文会存入存储,`decompress` 可按区间恢复(`startId`/`endId` ref)而无需整块展开,`search_context` 命中条目携带覆盖的 `mNNNNN` ref,让你精确取回所需内容。默认无损:未执行的 retrieve 只花一次调用;而被 absorb 蒸馏掉的细节则永久丢失。仅代理模式、仅原生工具线(marker/文本协议没有执行 retrieve 的通道,存储在这些场景下自动解除武装,而不是静默丢失内容)。
 
@@ -387,7 +387,7 @@ HTTPS 走证书 MITM,HTTP 走临时 `opencode.json` 副本(`/bili/` 改写;JSONC
 
 `/acp` 面板在所有模式下都绑定当前会话,`acp_status` 工具是其宿主内等价手段。在命令编辑器支持新增条目的宿主(2.0.x 稳定版,`editor.add`)上,V2 插件额外注册 `/acp` 斜杠命令 —— 以合成非模型消息渲染,面板优先(与 `acp_status` 工具一致);旧形状上该注册保持惰性。注意 `opencode run` 模式完全不派发斜杠命令(它们会透传给模型)—— 请用 TUI。
 
-同一接缝还承载 `/acp-rule`(#1251)—— 持久指令功能的人侧入口(输出与 `acp_rule` 工具一致):pi/omp 原生注册 —— 裸 `/acp-rule` 逐字列出全部已记录指令,`/acp-rule <文本>` 直接记录一条(等价于模型调用)。包裹后的 transcript 消息按内容签名从模型上下文剥离(与缓存报告同机制)—— 已记录的指令本来就每轮经 system prompt 注入。delete/clear 子命令随 #1178 落地;其他 lane 见后续工作。
+同一接缝还承载 `/acp-rule`(#1251/#1399)—— 持久指令功能的人侧入口(输出与 `acp_rule` 工具一致):pi/omp 原生注册,操作集与工具完全一致 —— 裸 `/acp-rule` 逐字列出全部已记录指令,`/acp-rule <文本>` 直接记录一条(等价于模型调用),`/acp-rule remove <id>` 删除一条,裸 `/acp-rule clear` 清空全部(`clear <文本>` 是记录而非清空——一个手误不该毁掉所有规则)。包裹后的 transcript 消息按内容签名从模型上下文剥离(与缓存报告同机制)—— 已记录的指令本来就每轮经 system prompt 注入。
 
 ### 旧 opencode-acp 会话(#920)
 

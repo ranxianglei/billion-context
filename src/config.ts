@@ -315,10 +315,12 @@ export type CompressSettings = {
      *  plugin manifest): passing a short `rule` records a principle-level
      *  reminder that is hard-protected from compression and stays in context
      *  for the life of the session; omitting the argument lists recorded
-     *  rules for human review. The feature deliberately adds NO system-prompt
-     *  content (all guidance rides in the tool description). Maps to kernel
-     *  `Config.rules = { enabled }`. Off unless explicitly enabled at some
-     *  level. Deepest-wins like every other scalar field. */
+     *  rules for human review. `delete` removes one rule by id, `clear: true`
+     *  removes all (#1399: the model has full rights over session rules and
+     *  may call any of these unprompted). The feature deliberately adds NO
+     *  system-prompt content (all guidance rides in the tool description).
+     *  Maps to kernel `Config.rules = { enabled }`. Off unless explicitly
+     *  enabled at some level. Deepest-wins like every other scalar field. */
     rules?: boolean;
 
     /** Opt-in removal of historical image payloads, executed by the kernel's

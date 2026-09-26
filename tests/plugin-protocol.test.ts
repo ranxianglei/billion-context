@@ -229,9 +229,9 @@ test("plugin manifest serves the exact wire tool schemas, headers and version", 
         assert.equal(manifest.ok, true);
         assert.equal(manifest.protocolVersion, 1);
         assert.ok(/^\d+\.\d+\.\d+/.test(manifest.version), `version looks wrong: ${manifest.version}`);
-        // #1192: absorb/acp_rule are opt-in and only advertised when enabled —
-        // hosts register manifest tools verbatim, so a disabled tool must not be
-        // listed (the default config enables neither). acp_cache stays in the base toolset.
+        // #1192: every extra tool (absorb, acp_rule) is opt-in and only advertised
+        // when enabled — hosts register manifest tools verbatim, so a disabled
+        // tool must not be listed. acp_cache stays in the base toolset.
         assert.deepEqual([...manifest.toolNames].sort(), ["acp_cache", "acp_status", "compress", "decompress", "search_context"]);
         const names = manifest.tools.anthropic!.map((t) => String(t.name)).sort();
         assert.deepEqual(names, ["acp_cache", "acp_status", "compress", "decompress", "search_context"]);

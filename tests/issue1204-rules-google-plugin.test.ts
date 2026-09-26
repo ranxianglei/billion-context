@@ -113,8 +113,8 @@ test("#1204 google wire + provider-level rules: plugin tool acp_rule is accepted
     }
 });
 
-test("#1204 google wire + rules off: plugin tool acp_rule stays gated", async () => {
-    const h = await startHarness();
+test("#1204 google wire + rules explicitly disabled: plugin tool acp_rule stays gated", async () => {
+    const h = await startHarness({ rules: false });
     try {
         const conv = "issue1204-rules-off";
         await sendGoogleTurn(h, conv);
