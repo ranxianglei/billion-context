@@ -120,7 +120,7 @@ test("#749 anthropic wire: acp_rule injected alongside ACP tools when rules enab
     }
 });
 
-test("#1399 anthropic wire: acp_rule injected by default (rules unset)", async () => {
+test("#1399 anthropic wire: acp_rule NOT injected when unset (opt-in)", async () => {
     const up = await startUpstream();
     const proxy = await startProxy(up.port);
     await once(proxy, "listening");
@@ -132,7 +132,7 @@ test("#1399 anthropic wire: acp_rule injected by default (rules unset)", async (
         const tools = up.bodies()[0].tools as Array<{ name?: unknown }>;
         const names = tools.map((t) => t.name);
         assert.ok(names.includes("compress"), "ACP tools still injected");
-        assert.ok(names.includes("acp_rule"), `acp_rule present by default since #1399 (got: ${names.join(", ")})`);
+        assert.ok(!names.includes("acp_rule"), `acp_rule absent while unset — opt-in (got: ${names.join(", ")})`);
     } finally {
         proxy.close();
         await once(proxy, "close");

@@ -49,11 +49,11 @@ describe("#1192: known-but-disabled opt-in tools get an explanation, not a hard 
         assert.match(String(r.json.result), /nothing was recorded/);
     });
 
-    it("acp_rule with rules unset → executes by default (#1399)", async () => {
-        const r = await call("acp_rule", { rule: "default-on rule" });
+    it("acp_rule with rules unset → ok:true explanation (opt-in, same as explicit false)", async () => {
+        const r = await call("acp_rule", { rule: "should not record" });
         assert.equal(r.status, 200);
         assert.equal(r.json.ok, true);
-        assert.match(String(r.json.result), /^Recorded rule\d+: default-on rule$/);
+        assert.match(String(r.json.result), /acp_rule is not enabled on this bili proxy \(compress\.rules\.enabled is not true\)/);
     });
 
     it("absorb disabled → ok:true explanation", async () => {

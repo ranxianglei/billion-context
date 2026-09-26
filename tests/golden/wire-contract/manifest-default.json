@@ -8,8 +8,7 @@
     "decompress",
     "search_context",
     "acp_status",
-    "acp_cache",
-    "acp_rule"
+    "acp_cache"
   ],
   "tools": {
     "anthropic": [
@@ -195,31 +194,6 @@
                 "full"
               ],
               "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and line item."
-            },
-            "conversation_id": {
-              "type": "string",
-              "description": "Your bili conversation id (the value from the 'your bili conversation id' line in the proxy notes). Pass it on every call when your host shares one MCP process across several concurrent conversations; omit it when the host bound the session itself."
-            }
-          }
-        }
-      },
-      {
-        "name": "acp_rule",
-        "description": "Record a short, principle-level reminder so it survives context compression — the call and its result are protected and stay in context. Record when: the user calls out or repeatedly emphasizes a lesson; the user asks you to remember or follow a behavior; you personally hit a major pitfall worth remembering long-term. Keep each rule to one short line. Omit the rule argument to list recorded rules. To remove a recorded rule pass delete with its id (e.g. \"rule3\"); to remove every recorded rule pass clear: true. delete and clear are mutually exclusive with each other and with rule — use one operation per call.",
-        "input_schema": {
-          "type": "object",
-          "properties": {
-            "rule": {
-              "type": "string",
-              "description": "Short principle-level reminder to record. Omit to list recorded rules."
-            },
-            "delete": {
-              "type": "string",
-              "description": "Id of a recorded rule to remove (e.g. \"rule3\"). Mutually exclusive with rule and clear."
-            },
-            "clear": {
-              "type": "boolean",
-              "description": "Remove every recorded rule at once. Mutually exclusive with rule and delete."
             },
             "conversation_id": {
               "type": "string",
@@ -434,34 +408,6 @@
             }
           }
         }
-      },
-      {
-        "type": "function",
-        "function": {
-          "name": "acp_rule",
-          "description": "Record a short, principle-level reminder so it survives context compression — the call and its result are protected and stay in context. Record when: the user calls out or repeatedly emphasizes a lesson; the user asks you to remember or follow a behavior; you personally hit a major pitfall worth remembering long-term. Keep each rule to one short line. Omit the rule argument to list recorded rules. To remove a recorded rule pass delete with its id (e.g. \"rule3\"); to remove every recorded rule pass clear: true. delete and clear are mutually exclusive with each other and with rule — use one operation per call.",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "rule": {
-                "type": "string",
-                "description": "Short principle-level reminder to record. Omit to list recorded rules."
-              },
-              "delete": {
-                "type": "string",
-                "description": "Id of a recorded rule to remove (e.g. \"rule3\"). Mutually exclusive with rule and clear."
-              },
-              "clear": {
-                "type": "boolean",
-                "description": "Remove every recorded rule at once. Mutually exclusive with rule and delete."
-              },
-              "conversation_id": {
-                "type": "string",
-                "description": "Your bili conversation id (the value from the 'your bili conversation id' line in the proxy notes). Pass it on every call when your host shares one MCP process across several concurrent conversations; omit it when the host bound the session itself."
-              }
-            }
-          }
-        }
       }
     ],
     "responses": [
@@ -652,32 +598,6 @@
                 "full"
               ],
               "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and line item."
-            },
-            "conversation_id": {
-              "type": "string",
-              "description": "Your bili conversation id (the value from the 'your bili conversation id' line in the proxy notes). Pass it on every call when your host shares one MCP process across several concurrent conversations; omit it when the host bound the session itself."
-            }
-          }
-        }
-      },
-      {
-        "type": "function",
-        "name": "acp_rule",
-        "description": "Record a short, principle-level reminder so it survives context compression — the call and its result are protected and stay in context. Record when: the user calls out or repeatedly emphasizes a lesson; the user asks you to remember or follow a behavior; you personally hit a major pitfall worth remembering long-term. Keep each rule to one short line. Omit the rule argument to list recorded rules. To remove a recorded rule pass delete with its id (e.g. \"rule3\"); to remove every recorded rule pass clear: true. delete and clear are mutually exclusive with each other and with rule — use one operation per call.",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "rule": {
-              "type": "string",
-              "description": "Short principle-level reminder to record. Omit to list recorded rules."
-            },
-            "delete": {
-              "type": "string",
-              "description": "Id of a recorded rule to remove (e.g. \"rule3\"). Mutually exclusive with rule and clear."
-            },
-            "clear": {
-              "type": "boolean",
-              "description": "Remove every recorded rule at once. Mutually exclusive with rule and delete."
             },
             "conversation_id": {
               "type": "string",

@@ -90,7 +90,7 @@ QQ群:
 
 可选的第五个工具 `absorb`(`compress.absorb.enabled: true` —— 见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md))对**各个工具结果即时压缩**:大结果(构建、日志、grep)被附带强制吸收指令,模型将各自蒸馏为紧凑摘要,原配对从下一轮起从线上隐藏 —— 使折叠轮之间的中间会话压力更低(#605)。
 
-第六个工具 `acp_rule`(#1399 起默认开启;设 `compress.rules: false` 可恢复旧的可选开启行为 —— 见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md))记录**持久化的原则级提醒**:模型记录的简短规则(用户强调的教训、要求记住的行为、撞到的大坑)受硬性保护不被压缩——调用及结果在每次折叠中都保留在上下文中——省略参数则列出已记录规则;传入 `delete`(规则 id,如 `"rule3"`)删除单条规则,传入 `clear: true` 清空全部规则([ranxianglei/billion-context-pi#433](https://github.com/ranxianglei/billion-context-pi/issues/433))。
+第六个工具 `acp_rule`(默认关闭;设 `compress.rules: true` 显式开启 —— 见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)。开启后模型对会话规则有全权、可未经提示自主调用,#1399)记录**持久化的原则级提醒**:模型记录的简短规则(用户强调的教训、要求记住的行为、撞到的大坑)受硬性保护不被压缩——调用及结果在每次折叠中都保留在上下文中——省略参数则列出已记录规则;传入 `delete`(规则 id,如 `"rule3"`)删除单条规则,传入 `clear: true` 清空全部规则([ranxianglei/billion-context-pi#433](https://github.com/ranxianglei/billion-context-pi/issues/433))。
 
 第七个工具 `acp_retrieve`(全车道默认关闭、显式开启 —— 任意层级设 `compress.ccr.enabled: true` 方可启用,建议先本地验证;插件车道需全局显式 `true` 才会在 manifest 广播工具,#1271/#1273;见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md))支撑**内容寻址消息存储**(内置 CCR,#1097/#1179):超大工具结果**在到达时改为 ID 引用,而非强制蒸馏**——线上保留字节稳定的占位符,原文进入按会话的内容存储信封(按内容哈希去重),模型通过一次廉价工具调用按需取回。v2 让折叠同样无损:折叠落定时被覆盖的原文会存入存储,`decompress` 可按区间恢复(`startId`/`endId` ref)而无需整块展开,`search_context` 命中条目携带覆盖的 `mNNNNN` ref,让你精确取回所需内容。默认无损:未执行的 retrieve 只花一次调用;而被 absorb 蒸馏掉的细节则永久丢失。仅代理模式、仅原生工具线(marker/文本协议没有执行 retrieve 的通道,存储在这些场景下自动解除武装,而不是静默丢失内容)。
 

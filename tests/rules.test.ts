@@ -36,16 +36,16 @@ function makeRuleCtx(config?: Partial<Config>): { session: Session; ctx: RuleExe
     return { session, ctx: { config: cfg, session, log: () => {} } };
 }
 
-test("rulesEnabled defaults on (#1399); explicit false disables", () => {
-    assert.equal(rulesEnabled(defaultConfig(200000)), true);
+test("rulesEnabled is opt-in; explicit true enables, explicit false is a loud off", () => {
+    assert.equal(rulesEnabled(defaultConfig(200000)), false);
     assert.equal(rulesEnabled({ ...defaultConfig(200000), rules: { enabled: false } }), false);
     assert.equal(rulesEnabled({ ...defaultConfig(200000), rules: { enabled: true } }), true);
 });
 
-test("isProxyToolFor: acp_rule on by default, off when explicitly disabled (#1399)", () => {
+test("isProxyToolFor: acp_rule opt-in — on only when enabled (#1399)", () => {
     const base = defaultConfig(200000);
     assert.equal(isProxyToolFor("compress", undefined, base), true);
-    assert.equal(isProxyToolFor(RULE_TOOL_NAME, undefined, base), true);
+    assert.equal(isProxyToolFor(RULE_TOOL_NAME, undefined, base), false, "unset → not a proxy tool");
 
     const off: Config = { ...base, rules: { enabled: false } };
     assert.equal(isProxyToolFor(RULE_TOOL_NAME, undefined, off), false);
@@ -53,8 +53,8 @@ test("isProxyToolFor: acp_rule on by default, off when explicitly disabled (#139
     const session = makeSession();
     storeEffectiveRules(session, off);
     // Plugin tool API reads the per-session stored block even when the
-    // fallback (base kernel config) has the feature on by default.
-    assert.equal(isProxyToolFor(RULE_TOOL_NAME, session, base), false);
+    // fallback (base kernel config) has the feature enabled.
+    assert.equal(isProxyToolFor(RULE_TOOL_NAME, session, { ...base, rules: { enabled: true } }), false);
     storeEffectiveRules(session, { ...base, rules: { enabled: true } });
     assert.equal(isProxyToolFor(RULE_TOOL_NAME, session, off), true);
 });
@@ -71,13 +71,14 @@ test("effectiveRulesConfig: session metadata wins over fallback; absent stored b
     assert.equal(effectiveRulesConfig(undefined, defaultConfig(200000)), undefined);
 });
 
-test("effectiveRulesEnabled: unset → on (#1399); explicit false wins from either layer", () => {
+test("effectiveRulesEnabled: opt-in — unset → off; explicit true enables from either layer", () => {
     const base = defaultConfig(200000);
-    assert.equal(effectiveRulesEnabled(undefined, base), true);
+    assert.equal(effectiveRulesEnabled(undefined, base), false, "unset → off (opt-in)");
+    assert.equal(effectiveRulesEnabled(undefined, { ...base, rules: { enabled: true } }), true);
     assert.equal(effectiveRulesEnabled(undefined, { ...base, rules: { enabled: false } }), false);
     const session = makeSession();
     storeEffectiveRules(session, base);
-    assert.equal(effectiveRulesEnabled(session, { ...base, rules: { enabled: false } }), false, "stored-unset block falls through to the disabled fallback");
+    assert.equal(effectiveRulesEnabled(session, { ...base, rules: { enabled: true } }), true, "stored-unset block falls through to the enabled fallback");
     storeEffectiveRules(session, { ...base, rules: { enabled: false } });
     assert.equal(effectiveRulesEnabled(session, { ...base, rules: { enabled: true } }), false, "stored false beats fallback true");
     storeEffectiveRules(session, { ...base, rules: { enabled: true } });
@@ -195,10 +196,9 @@ test("applyCompressSettings: maps settings rules onto kernel RuleFeatureConfig",
     assert.equal(absent.rules, undefined, "absent settings leave the base rules block untouched");
 });
 
-// #1192/#1399: hosts register manifest tools verbatim, so an explicitly
-// disabled acp_rule must not be advertised at all — but since #1399 the
-// default (unset) config advertises it on all three wires.
-test("handlePluginManifest: acp_rule advertised by default, hidden when explicitly disabled", () => {
+// #1192: hosts register manifest tools verbatim, so acp_rule must never be
+// advertised while not enabled — including the unset (default-off) config.
+test("handlePluginManifest: acp_rule advertised only when enabled", () => {
     let body = "";
     const res = { writeHead: () => {}, end: (b: string) => { body = b; } } as unknown as Parameters<typeof handlePluginManifest>[0];
     const data = (): {
@@ -208,7 +208,12 @@ test("handlePluginManifest: acp_rule advertised by default, hidden when explicit
 
     handlePluginManifest(res, defaultConfig(200_000));
     let d = data();
-    assert.ok(d.toolNames.includes(RULE_TOOL_NAME), "on by default (#1399) → advertised");
+    assert.ok(!d.toolNames.includes(RULE_TOOL_NAME), "unset (default-off) → not advertised");
+    assert.ok(!d.tools.anthropic.some((t) => t.name === RULE_TOOL_NAME));
+
+    handlePluginManifest(res, { ...defaultConfig(200_000), rules: { enabled: true } });
+    d = data();
+    assert.ok(d.toolNames.includes(RULE_TOOL_NAME), "enabled → advertised");
     assert.ok(d.tools.anthropic.some((t) => t.name === RULE_TOOL_NAME), "anthropic schema present");
     assert.ok(d.tools.openai.some((t) => t.function?.name === RULE_TOOL_NAME));
     assert.ok(d.tools.responses.some((t) => t.name === RULE_TOOL_NAME));

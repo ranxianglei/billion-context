@@ -50,7 +50,7 @@ Fetch once at plugin startup.
 }
 ```
 
-Register the tools natively with your agent, in whichever wire format your agent speaks — register exactly what `toolNames` lists. `absorb` appears only when the proxy's config enables it; `acp_rule` is advertised by default since #1399 (an explicit `compress.rules: false` hides it again). Calling a tool that is known but disabled answers `200` with an explanatory `result` instead of an error (#1192). If `protocolVersion` is higher than you know, still register the tools — extra fields in schemas are ignored by agents.
+Register the tools natively with your agent, in whichever wire format your agent speaks — register exactly what `toolNames` lists. `absorb` appears only when the proxy's config enables it; `acp_rule` is advertised only when the proxy's config enables it (`compress.rules: true`, opt-in). Calling a tool that is known but disabled answers `200` with an explanatory `result` instead of an error (#1192). If `protocolVersion` is higher than you know, still register the tools — extra fields in schemas are ignored by agents.
 
 ### 2. Request headers
 
