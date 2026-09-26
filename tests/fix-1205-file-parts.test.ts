@@ -5,7 +5,7 @@ process.env.NODE_ENV = "test";
 
 import { REMOTE_IMAGE_TOKENS, imageTokensInParsedBody, imageTokensInRawBody } from "../src/image-tokens.ts";
 import { droppedOpenaiParts } from "../src/wire-drop-warn.ts";
-import { _resetWireDropWarningsForTest, warnDroppedOpenaiParts } from "../src/server.ts";
+import { _resetWireDropWarningsForTest, warnDroppedOpenaiParts } from "../src/server/prepare-openai.ts";
 import { openaiToCore, coreToOpenai } from "acp-kernel/wire";
 
 // Issue #1205: the openai wire codec silently dropped every user content part

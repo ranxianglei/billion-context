@@ -1,6 +1,9 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { isStrictReasoningEcho, normalizeStrictEchoReasoning, warnReasoningPairs, warnAnthropicThinkingPairs, warnResponsesReasoningPairs } from "../src/server.js";
+import { isStrictReasoningEcho, normalizeStrictEchoReasoning } from "../src/server.js";
+import { warnAnthropicThinkingPairs } from "../src/server/prepare-anthropic.ts";
+import { warnReasoningPairs } from "../src/server/prepare-openai.ts";
+import { warnResponsesReasoningPairs } from "../src/server/prepare-responses.ts";
 import { modelIdOf, normalizeStrictEchoBody } from "../src/strict-echo.js";
 import type { Session } from "../src/session.js";
 import type { OpenAIMessage } from "acp-kernel/wire";
