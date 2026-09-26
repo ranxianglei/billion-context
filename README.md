@@ -1150,36 +1150,62 @@ want the mapping permanently.
 ## How sessions work
 
 The proxy needs a stable per-conversation identifier to isolate compression
-state across concurrent users/accounts. It derives one from four dimensions
-(see `src/session-id.ts`): **protocol × upstream origin × API key ×
-conversation**. The first three prevent cross-account / cross-provider
-bleeding; the conversation dimension comes from whatever the client sends.
+state across concurrent users/accounts. It uses **the conversation value the
+client itself provides, verbatim** (`src/session-id.ts`) — no hashing and no
+protocol/upstream/API-key dimensions. Those dimensions were mutable mid-
+conversation (credentials rotate, users switch relays, the wire protocol can
+change), so keying on them orphaned state exactly when the user kept talking
+(#280, #286). The id is used only inside the proxy (state store, persistence,
+UI label); it is never sent upstream.
 
-Clients differ in what they send:
+Where the value comes from, first hit wins: the plugin's
+`x-bili-plugin-conversation` (honored only alongside the `x-bili-plugin`
+marker header), then per-client headers (`x-claude-code-session-id`,
+`x-grok-session-id`/`x-grok-conv-id`, `x-mavis-session-id`), then generic
+headers (`x-session-affinity`, `x-acp-session`, `x-session-id`,
+`x-opencode-session`, `session-id`/`session_id`), then body fields:
+`session_id` / `metadata.session_id` on the Responses wire, and
+`prompt_cache_key` promoted over the content-fingerprint fallback on the
+Responses/OpenAI/Anthropic wires.
 
-| Client | Sends conversation id? | Source | Safety |
-|---|---|---|---|
-| **Codex** (0.147+) | ✅ yes | `body.session_id` (per-conversation UUID) | ✅ safe |
-| **OpenCode** | ✅ yes | `x-session-affinity` header (`ses_…`) | ✅ safe |
-| **pi** | ❌ **no** | nothing | ⚠️ **collision risk** |
+| Client | Sends conversation id? | Source |
+|---|---|---|
+| **Codex** | ✅ yes | `body.session_id` / turn-metadata thread id |
+| **OpenCode** | ✅ yes | `x-session-affinity` / `x-opencode-session` header (`ses_…`) |
+| **Claude Code** | ✅ yes | `x-claude-code-session-id` header |
+| **omp** (via plugin) | ✅ yes | `prompt_cache_key` promoted over any fingerprint (#268) |
+| **pi** (bare) | ❌ no | nothing → anonymous prefix affinity below |
 
-When the client sends an explicit id, the proxy uses it directly. When it
-does not (pi), the proxy falls back to hashing the first user message — so
-two conversations that start with the same opener collapse onto the same
-session. This does **not** corrupt data (per-message refs use a separate
-content fingerprint that stays stable), but it can skew nudge/compression
-timing and occasionally over-eagerly reap a block. It is self-healing: the
-worst case is reduced compression efficiency, never data loss.
+**Header-less clients (pi-like): anonymous prefix affinity.** When a client
+sends no conversation signal at all, the proxy resolves the session from the
+replayed history itself (`src/prefix-affinity.ts`, #309): an incoming request
+reattaches to a stored session only when its history reproduces that
+session's message chain byte-exactly from position 0; otherwise it gets its
+own deterministic `pfa-…` session. Consequences for the failure modes this
+section used to warn about (#1262):
 
-For upstream sticky-routing, when the client sends no session header the
-proxy synthesizes one (`x-session-id: ses_<hash>`) so cache pools / load
-balancers still get a stable key.
+- A **resumed** conversation reattaches to its own session — including after
+  a proxy restart (#499).
+- A **new task with an identical opener does NOT inherit** another
+  conversation's blocks or protected zone: it mints a fresh session, and once
+  its history diverges it is fully separate (fork lineage is recorded for
+  debugging).
+- A request with no usable signal at all is rejected with an explicit 400
+  instead of silently colliding with something else's state.
 
-**Recommendation:** Codex and OpenCode are safe to run many concurrent
-conversations through the proxy. pi is fine for a single agent, but is **not
-recommended** for many concurrent conversations because of the collision
-risk — until pi grows its own session-id signal. For pi multi-agent use,
-pass an explicit `x-acp-session` header per conversation to avoid collisions.
+Design record and threat model: [SESSION-IDENTITY.md](SESSION-IDENTITY.md).
+
+For upstream sticky-routing, the proxy forwards only identity values the
+client already supplied (e.g. a body `session_id` is forwarded upstream as
+`x-session-id`); it never synthesizes one itself.
+
+**Recommendation:** clients that send an explicit id are safe to run many
+concurrent conversations through the proxy. For header-less multi-agent use,
+prefer the client plugin (the omp/pi plugins stamp a stable id per
+conversation); otherwise pass an explicit `x-acp-session` header per
+conversation. Even without either, prefix affinity keeps distinct tasks apart
+— the cost of a diverged fork is one raw resend plus a compression-ladder
+restart.
 
 ### Derived (child) sessions inherit the parent's compressed context (#1333, #1362)
 

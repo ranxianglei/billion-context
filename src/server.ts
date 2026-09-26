@@ -1688,14 +1688,17 @@ async function handle(
             }
         }
         // Two separate uses of the conversation signal:
-        //  - `affinity`: header value forwarded upstream for sticky-routing /
-        //    cache pools. Synthesized as ses_<conversation> when the client
-        //    sent none (pi), so upstream still gets a stable key.
+        //  - `affinity`: a client-supplied identity value forwarded upstream
+        //    as x-session-id for sticky-routing / cache pools. Proxy-generated
+        //    identities (content fingerprints, pfa-* prefix-affinity ids) stay
+        //    internal: affinityToken() returns undefined for them, so a
+        //    header-less client (pi) adds no upstream identity (#286).
         //  - `label`: human-readable display in the web UI / stats. We store
         //    ONLY the client's own value (opencode x-session-affinity, codex
-        //    body.session_id) — never the synthetic one — so a user can tell
-        //    at a glance which client owns a session. pi sends nothing, so its
-        //    label stays empty (shown as "—" in the UI).
+        //    body.session_id), so a user can tell at a glance which client
+        //    owns a session. Pi sends nothing: prefix-affinity-resolved
+        //    sessions get the "prefix-affinity" label, others stay empty
+        //    (shown as "—" in the UI).
         const bodyIdentity = responsesIdentity ?? openaiIdentity ?? anthropicIdentity ?? googleIdentity;
         const affinity = affinityToken(bodyIdentity ?? {
             value: clientConv ?? conversation,

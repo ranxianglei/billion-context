@@ -528,21 +528,29 @@ Windows 下会自动发现常见 Clash/Mihomo 静态系统代理;Web UI 会显�
 
 ## 会话机制
 
-代理需要一个稳定的、按会话标识的 ID,以便在多个用户/账号并发时隔离压缩状态。它从四个维度推导一个(见 `src/session-id.ts`):**协议 × 上游 origin × API key × 会话**。前三个防止跨账号 / 跨 provider 串数据;会话维度来自客户端发送的内容。
+代理需要一个稳定的、按会话标识的 ID,以便在多个用户/账号并发时隔离压缩状态。它**原样使用客户端自己提供的会话值**(见 `src/session-id.ts`)——不做哈希,也不含协议 / 上游 origin / API key 维度。这些维度在会话中途都可能变化(凭证轮换、用户切换 relay、wire 协议变化),拿它们做 key 会在用户继续对话时恰好把状态弄丢(#280、#286)。该 id 只在代理内部使用(状态存储、持久化、UI 标签),绝不上送。
 
-不同客户端发送的东西不同:
+取值来源(按顺序取第一个命中的):插件的 `x-bili-plugin-conversation`(仅当同时带 `x-bili-plugin` 标记 header)、客户端专属 header(`x-claude-code-session-id`、`x-grok-session-id`/`x-grok-conv-id`、`x-mavis-session-id`)、通用 header(`x-session-affinity`、`x-acp-session`、`x-session-id`、`x-opencode-session`、`session-id`/`session_id`)、或 body 字段:Responses wire 的 `session_id`/`metadata.session_id`,以及 Responses/OpenAI/Anthropic wire 上提升替代内容指纹回退的 `prompt_cache_key`。
 
-| 客户端 | 发会话 id 吗? | 来源 | 安全性 |
-|---|---|---|---|
-| **Codex**(0.147+) | ✅ 发 | `body.session_id`(按会话 UUID) | ✅ 安全 |
-| **OpenCode** | ✅ 发 | `x-session-affinity` header(`ses_…`) | ✅ 安全 |
-| **pi** | ❌ **不发** | 无 | ⚠️ **有碰撞风险** |
+| 客户端 | 发会话 id 吗? | 来源 |
+|---|---|---|
+| **Codex** | ✅ 发 | `body.session_id` / turn-metadata thread id |
+| **OpenCode** | ✅ 发 | `x-session-affinity` / `x-opencode-session` header(`ses_…`) |
+| **Claude Code** | ✅ 发 | `x-claude-code-session-id` header |
+| **omp**(经插件)| ✅ 发 | `prompt_cache_key` 提升为稳定身份(#268)|
+| **pi**(裸跑)| ❌ 不发 | 无 → 见下方匿名前缀亲和 |
 
-客户端发显式 id 时,代理直接用它。不发时(pi),代理回退到对首条用户消息做哈希 —— 于是两个开头相同的会话会塌缩到同一个 session。这**不会损坏数据**(每条消息的 ref 用独立的内容指纹,保持稳定),但会让 nudge/压缩时机跑偏,偶尔过早回收某个 block。它是自愈的:最坏情况是压缩效率降低,绝不丢数据。
+**无 header 客户端(pi 类):匿名前缀亲和。** 当客户端完全不发任何会话信号时,代理从重放的历史本身解析会话(`src/prefix-affinity.ts`,#309):只有当请求历史从第 0 条开始逐字节复现某已存会话的消息链时,才重新挂回该会话;否则获得一个确定性的新 `pfa-…` 会话。对本节过去警告过的失效模式(#1262)的后果:
 
-用于上游粘性路由时,客户端不发会话 header 时代理会合成一个(`x-session-id: ses_<hash>`),让缓存池 / 负载均衡器仍能拿到稳定 key。
+- **恢复(resume)** 的对话会重新挂回自己的会话 —— 包括代理重启之后(#499)。
+- **开头相同的新任务不会继承**另一个会话的 block 或受保护区:它拿到全新会话,历史一旦分叉就彻底独立(分叉血缘会被记录以便调试)。
+- 完全没有任何可用信号时,请求会被显式 400 拒绝,而不是静默与他人状态碰撞。
 
-**建议:** Codex 和 OpenCode 可以安全地通过代理并发跑很多会话。pi 单个 agent 没问题,但因碰撞风险**不建议**并发多会话 —— 直到 pi 自己长出 session-id 信号。pi 多 agent 场景下,每个会话发一个显式 `x-acp-session` header 来避免碰撞。
+设计记录与威胁模型:[SESSION-IDENTITY.md](SESSION-IDENTITY.md)。
+
+上游粘性路由方面,代理只转发客户端本来就提供的身份值(例如 body 里的 `session_id` 会以 `x-session-id` 上送),绝不自行合成一个。
+
+**建议:** 发显式 id 的客户端可以安全地通过代理并发跑很多会话。无 header 的多 agent 场景,优先装客户端插件(omp/pi 插件会为每个会话盖一个稳定 id);否则每个会话显式传一个 `x-acp-session` header。两者都没有时,前缀亲和也能把不同任务分开 —— 分叉的代价只是一次原始重发加压缩阶梯重启。
 
 ### 派生(子)会话继承父会话的压缩上下文(#1333、#1362)
 
