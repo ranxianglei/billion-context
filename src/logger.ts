@@ -223,14 +223,24 @@ export const log: Logger = (level, msg) => {
     }
 };
 
-/** Flush + close the log file. Call on shutdown. */
-export function closeLogger(): void {
-    if (stream) {
-        try { stream.end(); } catch { /* best-effort */ }
-    }
+/** Flush + close the log file. Call on shutdown; resolves once every buffered
+ *  line has drained to disk, so awaiting it proves the durable record is complete. */
+export function closeLogger(): Promise<void> {
+    const s = stream;
     stream = undefined;
     streamFd = undefined;
     bytesWritten = 0;
+    if (!s) return Promise.resolve();
+    return new Promise((resolve) => {
+        let done = false;
+        const finish = (): void => {
+            if (done) return;
+            done = true;
+            resolve();
+        };
+        s.once("error", finish);
+        try { s.end(finish); } catch { finish(); }
+    });
 }
 
 export function getLogPath(): string | undefined {

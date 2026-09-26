@@ -548,17 +548,24 @@ test("claudeSettingsFile: CLAUDE_CONFIG_DIR replaces the whole .claude dir", () 
 });
 
 test("resolveClaudeCli: bare names resolve via where.exe on Windows, untouched elsewhere", () => {
-    if (process.platform === "win32") {
-        // 'where' always exists on Windows PATH; the resolution must return
-        // an absolute path to a real executable file.
-        const resolved = resolveClaudeCli("where");
-        assert.match(resolved, /where\.exe$/i);
-    } else {
-        // Paths, names with extensions, and everything on posix pass through.
+    // Paths and names with extensions pass through untouched, every platform.
+    assert.equal(resolveClaudeCli("/usr/local/bin/claude"), "/usr/local/bin/claude");
+    assert.equal(resolveClaudeCli("C:\\x\\claude.cmd"), "C:\\x\\claude.cmd");
+    if (process.platform !== "win32") {
+        // Bare names pass through off-Windows (no PATHEXT problem there).
         assert.equal(resolveClaudeCli("claude"), "claude");
-        assert.equal(resolveClaudeCli("C:\\x\\claude.cmd"), "C:\\x\\claude.cmd");
-        assert.equal(resolveClaudeCli("/usr/local/bin/claude"), "/usr/local/bin/claude");
     }
+    // #1445: drive the resolution against fixture resolver output instead of
+    // spawning the real where.exe — a real spawn finishing inside the 5s
+    // timeout is scheduler luck on loaded shared runners (flaked CI twice).
+    const where = (stdout: string | null) => () => ({ stdout });
+    assert.equal(
+        resolveClaudeCli("claude", where("C:\\tools\\nodejs\\claude.cmd\r\nC:\\other\\claude.exe\n")),
+        "C:\\tools\\nodejs\\claude.cmd",
+    );
+    assert.equal(resolveClaudeCli("claude", where("\r\n   \n")), "claude");
+    assert.equal(resolveClaudeCli("claude", where(null)), "claude");
+    assert.equal(resolveClaudeCli("claude", () => { throw new Error("where.exe ETIMEDOUT"); }), "claude");
 });
 
 test("installer round-trip: managed block + MCP face, then removal restores", () => {

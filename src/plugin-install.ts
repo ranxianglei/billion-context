@@ -647,16 +647,23 @@ function runClaudeCli(claude: string, args: string[]): void {
  *  never consults PATHEXT, so a bare `claude` (→ claude.cmd / claude.exe)
  *  would ENOENT before runClaudeCli ever sees the .cmd. Uses where.exe; on
  *  failure or non-Windows the input is returned untouched (the original
- *  ENOENT error stays truthful). */
-export function resolveClaudeCli(claude: string): string {
-    if (process.platform !== "win32" || /[\\/]/.test(claude) || /\.[a-z]+$/i.test(claude)) return claude;
+ *  ENOENT error stays truthful). The resolver is injectable so tests never
+ *  depend on a real where.exe spawn finishing in time (#1445). */
+export function resolveClaudeCli(claude: string, where?: (name: string) => { stdout: string | null }): string {
+    if (/[\\/]/.test(claude) || /\.[a-z]+$/i.test(claude)) return claude;
+    const run = where ?? (process.platform === "win32" ? defaultWhereRunner : undefined);
+    if (!run) return claude;
     try {
-        const r = spawnSync("where.exe", [claude], { stdio: ["ignore", "pipe", "ignore"], timeout: 5000, encoding: "utf8", windowsHide: true });
-        const first = (r.stdout ?? "").split(/\r?\n/).find((l) => l.trim().length > 0)?.trim();
+        const first = (run(claude).stdout ?? "").split(/\r?\n/).find((l) => l.trim().length > 0)?.trim();
         return first && first.length > 0 ? first : claude;
     } catch {
         return claude;
     }
+}
+
+function defaultWhereRunner(name: string): { stdout: string | null } {
+    const r = spawnSync("where.exe", [name], { stdio: ["ignore", "pipe", "ignore"], timeout: 5000, encoding: "utf8", windowsHide: true });
+    return { stdout: r.stdout ?? null };
 }
 
 function claudeInstall(): string {
