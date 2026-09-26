@@ -893,6 +893,25 @@ export function resolveMitmDomains(env: NodeJS.ProcessEnv): string[] {
     ]);
 }
 
+/** #1392: opted-in non-http(s) baseUrl providers — config file
+ *  `plugin.nonHttpProviders` (keys whose value is strictly `true`) ∪
+ *  BILI_NON_HTTP_PROVIDERS, deduped. Exported so launchers can mirror the list
+ *  to the client env (BILI_NON_HTTP_PROVIDERS) exactly like resolveMitmDomains. */
+export function resolveNonHttpProviders(env: NodeJS.ProcessEnv = process.env): string[] {
+    const out = new Set<string>();
+    const fileObj = loadConfigFile().plugin?.nonHttpProviders;
+    if (fileObj && typeof fileObj === "object" && !Array.isArray(fileObj)) {
+        for (const [id, v] of Object.entries(fileObj)) {
+            const key = id.trim();
+            if (key.length > 0 && v === true) out.add(key);
+        }
+    }
+    for (const id of splitCsv(env.BILI_NON_HTTP_PROVIDERS)) {
+        out.add(id);
+    }
+    return [...out];
+}
+
 /** Shape of the optional JSON config file. All fields optional — the file is a
  *  pure override layer; anything unset falls through to defaults. */
 type FileConfig = {
@@ -927,6 +946,12 @@ type FileConfig = {
     compress?: CompressSettings & { injectTool?: boolean; injectNudge?: boolean };
     promptCache?: { routing?: string };
     mitm?: { enabled?: boolean; domains?: string[] };
+    /** #1392: opt-in allowlist of non-http(s) baseUrl providers whose traffic MAY ride
+     *  bili (e.g. pi-claude-bridge's opaque "claude-bridge" scheme). A provider id is
+     *  opted in iff its value is strictly `true`. Only widens the compaction-ownership
+     *  candidate set — carriage evidence (carriedSids / status probe) still decides, so
+     *  unrouted traffic never cancels and #1382 cannot recur for a new provider class. */
+    plugin?: { nonHttpProviders?: Record<string, unknown> };
     /** Set `false` to log real (non-public) target hosts instead of the
      *  `<private-host>` placeholder (#897; env BILI_LOG_MASK_HOSTS=0 wins). */
     maskHosts?: boolean;

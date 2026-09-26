@@ -16,6 +16,7 @@ import {
     unregisterInstance,
     type ProxyInstanceFile as InstanceFile,
 } from "../src/instance.ts";
+import { resolveNonHttpProviders } from "../src/config.js";
 import {
     LAUNCHER_DEFAULT_HOST,
     isLaunchClient,
@@ -2228,6 +2229,30 @@ test("buildPiEnv: empty-key/empty-upstream entries skipped", () => {
         { key: "b", realUpstream: "" },
     ]);
     assert.equal(env.BILI_PROVIDER_REWRITES, undefined);
+});
+
+test("buildPiEnv: exports BILI_NON_HTTP_PROVIDERS only when non-http providers are listed (#1392)", () => {
+    const env = buildPiEnv("http://127.0.0.1:8787", "/tmp/ca.pem", { PATH: "/usr/bin" }, [], [], [], ["claude-bridge"]);
+    assert.equal(env.BILI_NON_HTTP_PROVIDERS, "claude-bridge");
+    const bare = buildPiEnv("http://127.0.0.1:8787", "/tmp/ca.pem", { PATH: "/usr/bin" });
+    assert.equal(bare.BILI_NON_HTTP_PROVIDERS, undefined);
+});
+
+test("resolveNonHttpProviders: strict-true file keys ∪ env list, deduped (#1392)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-nhp-"));
+    const cfgFile = path.join(dir, "billion-context.json");
+    fs.writeFileSync(cfgFile, JSON.stringify({ plugin: { nonHttpProviders: { "claude-bridge": true, off: false, wrongType: "yes" } } }), "utf8");
+    const prevCfg = process.env.BILI_CONFIG_FILE;
+    process.env.BILI_CONFIG_FILE = cfgFile;
+    try {
+        // Only strictly-true keys opt in: off:false and wrongType:"yes" are ignored.
+        assert.deepEqual(resolveNonHttpProviders({}), ["claude-bridge"]);
+        // Env ∪ file, deduped: claude-bridge (both sources) + z (env-only).
+        assert.deepEqual(resolveNonHttpProviders({ BILI_NON_HTTP_PROVIDERS: "claude-bridge,z" }), ["claude-bridge", "z"]);
+    } finally {
+        if (prevCfg === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = prevCfg;
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
 });
 
 test("stripInheritedProxy: removes generic proxy redirector vars, keeps the rest", () => {
