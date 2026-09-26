@@ -192,6 +192,24 @@ test("inspectLanePresence: corrupt single-source config is a probe failure, not 
     }
 });
 
+test("inspectLanePresence opencode: version-pinned npm entry is detected, not false-absent (#1417 audit)", () => {
+    const base = mkdtempSync(path.join(tmpdir(), "bc-doctor-pinned-"));
+    try {
+        const ocDir = path.join(base, "opencode");
+        mkdirSync(ocDir, { recursive: true });
+        const cfg = path.join(ocDir, "opencode.json");
+        writeFileSync(cfg, JSON.stringify({ plugin: ["billion-context@0.1.156"] }));
+        withEnv({ OPENCODE_CONFIG: cfg }, () => {
+            const p = inspectLanePresence("opencode");
+            assert.equal(p.installed, true);
+            assert.equal(p.form, "npm");
+            assert.deepEqual(p.pointers, ["billion-context@0.1.156"]);
+        });
+    } finally {
+        rmSync(base, { recursive: true, force: true });
+    }
+});
+
 test("runDoctor: corrupt lane config surfaces as a broken probe row, not absent", async () => {
     const base = mkdtempSync(path.join(tmpdir(), "bc-doctor-corrupt-run-"));
     const ocCfg = path.join(base, "opencode.json");

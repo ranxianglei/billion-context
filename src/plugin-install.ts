@@ -1989,12 +1989,12 @@ export function inspectLanePresence(agent: PluginAgent): LanePresence {
         const file = opencodeTargetFile();
         const { data } = loadOpencodeConfig(file);
         const dir = opencodePluginDir(file);
-        const listed = PLUGIN_KEYS.flatMap((k) => pluginEntries(data, k)).filter((p) => p === OPENCODE_NPM_ENTRY || p === dir);
+        const listed = PLUGIN_KEYS.flatMap((k) => pluginEntries(data, k)).filter((p) => isOpencodeNpmEntry(p) || p === dir);
         const hasMcp = isPlainMcpObject(data.mcp) && "bili" in data.mcp;
         if (listed.length === 0 && !hasMcp) return laneAbsent();
         const out: LanePresence = { installed: true, pointers: [...listed], targets: [], form: "none" };
         if (hasMcp) out.pointers.push("mcp.bili");
-        if (listed.includes(OPENCODE_NPM_ENTRY)) {
+        if (listed.some((p) => isOpencodeNpmEntry(p))) {
             out.form = "npm";
         } else if (listed.includes(dir)) {
             out.form = "local-path";
