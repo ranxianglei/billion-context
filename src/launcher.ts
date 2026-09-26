@@ -837,30 +837,19 @@ export function buildPiEnv(
     };
 }
 
-export function buildCodexEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-    return { ...baseEnv, HTTPS_PROXY: origin, SSL_CERT_FILE: caPath, BILLION_CONTEXT_PROXY: origin };
-}
-
-export function buildTraeEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-    // #655: trae is a Go binary like codex — the CA rides SSL_CERT_FILE (the
-    // combined bundle, since it replaces Go's system trust store).
-    return { ...baseEnv, HTTPS_PROXY: origin, SSL_CERT_FILE: caPath, BILLION_CONTEXT_PROXY: origin };
-}
-
-export function buildJcodeEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-    // jcode is Rust reqwest: CA rides SSL_CERT_FILE (combined bundle).
-    // NO_PROXY keeps loopback legs (local model endpoints, MCP) direct.
-    return {
-        ...baseEnv,
-        HTTPS_PROXY: origin,
-        SSL_CERT_FILE: caPath,
-        BILLION_CONTEXT_PROXY: origin,
-        NO_PROXY: "localhost,127.0.0.1,::1",
-        no_proxy: "localhost,127.0.0.1,::1",
-    };
-}
-
-export function buildAiderEnv(origin: string, caBundle: string, baseEnv: NodeJS.ProcessEnv, routeHttp: boolean): NodeJS.ProcessEnv {
+// #1440 P3: one cert-MITM env contract, per-client deltas in a table. The core
+// keys (proxy origin + CA + marker) are identical for every client; presets only
+// add stack-specific extras. Adding a client = one table row + one wrapper below.
+const CLIENT_ENV_PRESETS = {
+    // Go binaries ride the CA through SSL_CERT_FILE (the combined bundle, since
+    // it replaces Go's system trust store): codex, trae (#655), copilot & amp (#1049).
+    codex: { noProxy: false, requestsCaBundle: false },
+    trae: { noProxy: false, requestsCaBundle: false },
+    copilot: { noProxy: false, requestsCaBundle: false },
+    amp: { noProxy: false, requestsCaBundle: false },
+    // jcode is Rust reqwest: same core contract; NO_PROXY keeps loopback legs
+    // (local model endpoints, MCP) direct.
+    jcode: { noProxy: true, requestsCaBundle: false },
     // #1048: aider's Python stack trusts the CA through two different readers
     // — httpx (litellm's HTTP layer) honors SSL_CERT_FILE with REPLACE
     // semantics (hence the combined bundle carrying system roots so
@@ -868,27 +857,50 @@ export function buildAiderEnv(origin: string, caBundle: string, baseEnv: NodeJS.
     // REQUESTS_CA_BUNDLE. HTTP_PROXY is only set when a plaintext-http
     // upstream actually routes through it (absolute-form forward-proxy).
     // NO_PROXY keeps loopback legs (local ollama/vllm servers) direct.
+    aider: { noProxy: true, requestsCaBundle: true },
+} as const;
+
+function buildClientEnv(
+    client: keyof typeof CLIENT_ENV_PRESETS,
+    origin: string,
+    caPath: string,
+    baseEnv: NodeJS.ProcessEnv,
+    routeHttp = false,
+): NodeJS.ProcessEnv {
+    const p = CLIENT_ENV_PRESETS[client];
     return {
         ...baseEnv,
         HTTPS_PROXY: origin,
         ...(routeHttp ? { HTTP_PROXY: origin } : {}),
-        SSL_CERT_FILE: caBundle,
-        REQUESTS_CA_BUNDLE: caBundle,
+        SSL_CERT_FILE: caPath,
+        ...(p.requestsCaBundle ? { REQUESTS_CA_BUNDLE: caPath } : {}),
         BILLION_CONTEXT_PROXY: origin,
-        NO_PROXY: "localhost,127.0.0.1,::1",
-        no_proxy: "localhost,127.0.0.1,::1",
+        ...(p.noProxy ? { NO_PROXY: "localhost,127.0.0.1,::1", no_proxy: "localhost,127.0.0.1,::1" } : {}),
     };
 }
 
+export function buildCodexEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    return buildClientEnv("codex", origin, caPath, baseEnv);
+}
+
+export function buildTraeEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    return buildClientEnv("trae", origin, caPath, baseEnv);
+}
+
+export function buildJcodeEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    return buildClientEnv("jcode", origin, caPath, baseEnv);
+}
+
+export function buildAiderEnv(origin: string, caBundle: string, baseEnv: NodeJS.ProcessEnv, routeHttp: boolean): NodeJS.ProcessEnv {
+    return buildClientEnv("aider", origin, caBundle, baseEnv, routeHttp);
+}
+
 export function buildCopilotEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-    // #1049: copilot is a Go binary like codex/trae — the CA rides SSL_CERT_FILE
-    // (the combined bundle, since it replaces Go's system trust store).
-    return { ...baseEnv, HTTPS_PROXY: origin, SSL_CERT_FILE: caPath, BILLION_CONTEXT_PROXY: origin };
+    return buildClientEnv("copilot", origin, caPath, baseEnv);
 }
 
 export function buildAmpEnv(origin: string, caPath: string, baseEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-    // #1049: amp is a Go binary like copilot — same cert-MITM contract.
-    return { ...baseEnv, HTTPS_PROXY: origin, SSL_CERT_FILE: caPath, BILLION_CONTEXT_PROXY: origin };
+    return buildClientEnv("amp", origin, caPath, baseEnv);
 }
 
 export function buildCodexArgs(
