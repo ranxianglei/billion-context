@@ -283,13 +283,43 @@ export const WEB_CLIENT = `(function () {
             stroke += (i === 0 ? "M" : "L") + x(i).toFixed(1) + "," + y(l.input || 0).toFixed(1) + " ";
         });
         area += " L" + x(lines.length - 1).toFixed(1) + "," + (PT + ih).toFixed(1) + " L" + x(0).toFixed(1) + "," + (PT + ih).toFixed(1) + " Z";
+        // Cache-gap causes: color each sample's un-cached band (input − cached)
+        // by its most likely cause so gaps on the chart explain themselves.
+        // Heuristics use only fields every ledger era carries (at/input/cached + fold times).
+        const GAP_MS = 600_000;
+        const CAUSE_COLOR = { cold: "#6e7681", comp: "#bf8700", ttl: "#cf222e" };
+        const CAUSE_KEY = { cold: "det.cause_cold", comp: "det.cause_comp", ttl: "det.cause_ttl" };
+        const causes = lines.map((l, i) => {
+            if (i === 0 && !(l.cached || 0)) return "cold";
+            const p = lines[i - 1];
+            const missed = (l.input || 0) - (l.cached || 0);
+            const growth = Math.max(0, (l.input || 0) - (p.input || 0));
+            if ((folds || []).some((f) => (f.at || 0) >= (p.at || 0) && (f.at || 0) <= (l.at || 0)) && missed > growth) return "comp";
+            if ((l.at || 0) - (p.at || 0) > GAP_MS && missed > growth * 3 + 2048) return "ttl";
+            return "new";
+        });
+        let bands = "", hovers = "";
+        const swSeg = lines.length === 1 ? iw : iw / (lines.length - 1);
+        lines.forEach((l, i) => {
+            const c = causes[i];
+            const yIn = y(l.input || 0), yCa = y(l.cached || 0);
+            const x0 = Math.max(PL, x(i) - swSeg / 2), x1 = Math.min(W - PR, x(i) + swSeg / 2);
+            if (c !== "new" && yCa - yIn >= 1.5) {
+                bands += '<rect x="' + x0.toFixed(1) + '" y="' + yIn.toFixed(1) + '" width="' + Math.max(1, x1 - x0).toFixed(1) + '" height="' + Math.max(0, yCa - yIn).toFixed(1) + '" fill="' + CAUSE_COLOR[c] + '" opacity="0.3" rx="1"/>';
+            }
+            const hitPctLine = (l.input || 0) > 0 ? ((l.cached || 0) / l.input * 100).toFixed(1) + "%" : t("common.none");
+            hovers += '<rect x="' + x0.toFixed(1) + '" y="' + PT + '" width="' + Math.max(1, x1 - x0).toFixed(1) + '" height="' + ih + '" fill="transparent"><title>'
+                + (l.seq != null ? "#" + l.seq + " · " : "") + dt(l.at)
+                + "\\nin " + fmtW(l.input || 0) + " · cached " + fmtW(l.cached || 0) + " · missed " + fmtW((l.input || 0) - (l.cached || 0)) + " · hit " + hitPctLine
+                + (c === "new" ? "" : "\\n" + t(CAUSE_KEY[c])) + "</title></rect>";
+        });
         let foldMarks = "";
         (folds || []).forEach((f) => {
             let idx = -1;
             for (let i = 0; i < lines.length; i++) { if ((lines[i].at || 0) >= (f.at || 0)) { idx = i; break; } }
             if (idx < 0) idx = lines.length - 1;
             foldMarks += '<line x1="' + x(idx).toFixed(1) + '" y1="' + PT + '" x2="' + x(idx).toFixed(1) + '" y2="' + (PT + ih) + '" stroke="#cf222e" stroke-width="1.2" stroke-dasharray="3 3"><title>'
-                + (f.seq != null ? "#折叠 " + f.seq + " · " : "") + dt(f.at) + " · " + fmtW(f.S) + "</title></line>";
+                + (f.seq != null ? t("det.fold_short") + " " + f.seq + " · " : "") + dt(f.at) + " · " + fmtW(f.S) + "</title></line>";
         });
         let ceiling = "";
         if (win && win > 0) {
@@ -304,6 +334,8 @@ export const WEB_CLIENT = `(function () {
             + (lines.length > 1 && lines[lines.length - 1].at ? '<text x="' + (W - PR) + '" y="' + (H - 8) + '" text-anchor="end" font-size="9.5" fill="var(--text-faint)">' + dt(lines[lines.length - 1].at) + "</text>" : "");
         return '<svg viewBox="0 0 ' + W + " " + H + '" class="chart-svg" role="img">' + grid
             + '<path d="' + area + '" fill="var(--accent)" opacity="0.18"/>'
+            + bands
+            + hovers
             + '<path d="' + stroke.trim() + '" fill="none" stroke="var(--accent)" stroke-width="1.8"/>'
             + foldMarks + ceiling + ticks + xt + xtTime + "</svg>";
     }
@@ -360,6 +392,9 @@ export const WEB_CLIENT = `(function () {
             parts.push(legendItem("background:var(--accent);opacity:.4", t("det.legend_cached"), false));
             parts.push(legendItem("#cf222e", t("det.legend_fold"), true));
             parts.push(legendItem("#cf222e", t("det.legend_window"), true));
+            parts.push(legendItem("#bf8700", t("det.cause_comp")));
+            parts.push(legendItem("#cf222e", t("det.cause_ttl")));
+            parts.push(legendItem("#6e7681", t("det.cause_cold")));
             parts.push("</div>");
             if ((ledger.linesOmitted || 0) > 0) parts.push('<div class="dim small" style="margin-top:6px">' + t("det.omitted", { n: ledger.linesOmitted }) + "</div>");
         }
