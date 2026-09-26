@@ -341,3 +341,19 @@ test("parseCompressSettings: parses reasoningGuard sub-fields and rejects malfor
     assert.equal(parseCompressSettings({ reasoningGuard: { base: "518" } }), undefined);
     assert.equal(parseCompressSettings({ reasoningGuard: [] }), undefined);
 });
+
+// — #1425: proxy-lane CCR default-on arming gate (unit pin of resolveCcrArming) —
+
+test("resolveCcrArming: #1425 proxy-lane default-on semantics", async () => {
+    const { resolveCcrArming } = await import("../src/compress-settings.ts");
+    // unset → armed with the explicit default-on block
+    assert.deepEqual(resolveCcrArming(undefined), { enabled: true });
+    // explicit false at any merge level → disarmed (undefined = no arming stamp)
+    assert.equal(resolveCcrArming({ enabled: false }), undefined);
+    assert.equal(resolveCcrArming({ enabled: false, minToolTokens: 50 }), undefined);
+    // explicit true passes through untouched
+    assert.deepEqual(resolveCcrArming({ enabled: true, minToolTokens: 50 }), { enabled: true, minToolTokens: 50 });
+    // partial block (no enabled) → armed, other fields preserved (store.effectiveCcr
+    // requires an explicit boolean; a partial block must not be silently dropped)
+    assert.deepEqual(resolveCcrArming({ minToolTokens: 100 }), { minToolTokens: 100, enabled: true });
+});

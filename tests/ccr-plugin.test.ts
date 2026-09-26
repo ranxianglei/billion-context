@@ -96,7 +96,7 @@ function okJson(): string {
     });
 }
 
-async function startRig(mode?: "route-scoped" | "name-divergent" | "enabled-divergent"): Promise<Rig> {
+async function startRig(mode?: "route-scoped" | "name-divergent" | "enabled-divergent" | "global-off" | "model-off"): Promise<Rig> {
     const forwards: string[] = [];
     const upstream = http.createServer((req, res) => {
         let b = "";
@@ -126,6 +126,10 @@ async function startRig(mode?: "route-scoped" | "name-divergent" | "enabled-dive
             ? { [`http://127.0.0.1:${upstreamPort}`]: { compress: { ccr: { toolName: "retrieve_original" } } } }
             : mode === "enabled-divergent"
                 ? { [`http://127.0.0.1:${upstreamPort}`]: { compress: { ccr: { enabled: false } } } }
+                : mode === "model-off"
+                // #1425 three-level merge: deepest defined `enabled` wins — a
+                // model-level false disarms even under a global true.
+                ? { [`http://127.0.0.1:${upstreamPort}`]: { models: { [MODEL]: { compress: { ccr: { enabled: false } } } } } }
                 : { [`http://127.0.0.1:${upstreamPort}`]: {} };
     const proxy = await startServer({
         port: 0,
@@ -138,6 +142,10 @@ async function startRig(mode?: "route-scoped" | "name-divergent" | "enabled-dive
         kernelConfig: { ...defaultConfig(200_000), ccr: { ...DEFAULT_CCR_CONFIG, enabled: true } },
         compress: mode === "route-scoped"
             ? { injectTool: true, injectNudge: false }
+            : mode === "global-off"
+            // #1425: global explicit false disarms the proxy lane despite the
+            // production base stamp being default-on.
+            ? { injectTool: true, injectNudge: false, ccr: { enabled: false } }
             : { injectTool: true, injectNudge: false, ccr: { enabled: true, minToolTokens: 50 } },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
@@ -434,5 +442,47 @@ test("#1345 load-time diagnostic: one warn per divergent field at config load", 
         setLogCapture(null);
         if (prevCfg === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = prevCfg;
         rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+// — #1425 wire-level pins: the OTHER two disarm levels (global / model) —
+// M2 gap from the #1428 review: route-level false was pinned (enabled-divergent
+// above), but global- and model-level false had no direct wire assertion — the
+// default-on decision's headline is "unless explicitly disabled" at ANY level.
+test("e2e #1425 global-level ccr.enabled=false disarms the proxy lane (wire-level)", async () => {
+    const rig = await startRig("global-off");
+    try {
+        const res = await fetch(`http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/chat/completions`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "ccr-e2e-global-off" },
+            body: JSON.stringify({ model: MODEL, max_tokens: 64_000, messages: BASE_MSGS() }),
+        });
+        assert.equal(res.status, 200, `proxy lane returned ${res.status}: ${await res.text()}`);
+        assert.equal(rig.forwards.length, 1, "one outbound forward");
+        const f = rig.forwards[0]!;
+        assert.ok(f.includes(BIG_TEXT), "global explicit false → oversized tool result rides verbatim");
+        assert.ok(!f.includes("[acp-stored"), "no placeholder under global explicit false");
+        assert.ok(!/"acp_retrieve"/.test(f), "acp_retrieve schema must NOT be injected under global explicit false");
+    } finally {
+        await closeRig(rig);
+    }
+});
+
+test("e2e #1425 model-level ccr.enabled=false wins over global true (deepest-defined)", async () => {
+    const rig = await startRig("model-off");
+    try {
+        const res = await fetch(`http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/chat/completions`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "ccr-e2e-model-off" },
+            body: JSON.stringify({ model: MODEL, max_tokens: 64_000, messages: BASE_MSGS() }),
+        });
+        assert.equal(res.status, 200, `proxy lane returned ${res.status}: ${await res.text()}`);
+        assert.equal(rig.forwards.length, 1, "one outbound forward");
+        const f = rig.forwards[0]!;
+        assert.ok(f.includes(BIG_TEXT), "model-level false disarms despite the global true (deepest wins)");
+        assert.ok(!f.includes("[acp-stored"), "no placeholder under model-level false");
+        assert.ok(!/"acp_retrieve"/.test(f), "acp_retrieve schema must NOT be injected under model-level false");
+    } finally {
+        await closeRig(rig);
     }
 });
