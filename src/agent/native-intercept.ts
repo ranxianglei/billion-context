@@ -85,7 +85,24 @@ export interface NativeInterceptState {
     onUnroutedModelUrl?: (url: string) => void;
 }
 
-const INTERCEPT_FLAG = "__biliNativeFetchIntercept";
+/** Ownership marker for bili's own chain links (#1410). Every function
+ *  makeChain produces carries this symbol as an OWN property, so a write-back
+ *  of our own (possibly stale) link to globalThis.fetch is recognized as ours
+ *  — never counted as a third-party evict spending re-arm budget. */
+const CHAIN_MARKER = Symbol.for("billion-context.native-fetch-chain");
+
+function markOwnChain(fn: typeof globalThis.fetch): void {
+    Object.defineProperty(fn, CHAIN_MARKER, { value: true, configurable: true, writable: true, enumerable: false });
+}
+
+function isOwnChain(v: unknown): boolean {
+    return typeof v === "function" && Object.prototype.hasOwnProperty.call(v, CHAIN_MARKER);
+}
+
+// #1410: same-process installs share one identity — Symbol.for keeps the
+// double-load check working across duplicate copies of this module (a plain
+// Symbol would let a second copy re-install on top of the first).
+const INTERCEPT_FLAG = Symbol.for("billion-context.native-fetch-intercept");
 
 /** #1158 escape hatch: `BILI_RECLAIM_FETCH_PATCH=0` keeps the classic direct
  *  install — a third-party re-arm (dsh-http-proxy refresh) then wins and
@@ -102,6 +119,46 @@ function shouldReclaimFetchPatch(): boolean {
  *  guarded accessor, so _resetForTest can restore a plain writable data
  *  property. Undefined before the first install in a process. */
 let preInstallDesc: PropertyDescriptor | undefined;
+
+/** The accessor descriptor we defined on globalThis.fetch — identity-compared
+ *  by _resetForTest before restoring preInstallDesc, so a third party's legal
+ *  delete/redefine in between (#1410) is never clobbered. */
+let installedDesc: PropertyDescriptor | undefined;
+
+/** #1410 re-anchor ledger: every fetch this process has ever observed at the
+ *  top slot, ordered oldest→newest. The oldest entry is the module-load
+ *  anchor — whatever fetch existed BEFORE any plugin ran, i.e. the host's
+ *  native fetch. When the adopted downstream dies underneath us (its owner
+ *  tore its wrapper down behind our back — scope end nulling its closure
+ *  locals) we re-anchor to the OLDEST still-live entry instead of the
+ *  newest: the newest may itself be someone else's transient scope wrapper
+ *  (adopting it would just repeat the failure one teardown later), while the
+ *  oldest has already survived every prior teardown in this process. */
+let moduleAnchor: typeof globalThis.fetch | undefined = typeof globalThis.fetch === "function" ? globalThis.fetch : undefined;
+let observedFetches: Array<typeof globalThis.fetch> = moduleAnchor !== undefined ? [moduleAnchor] : [];
+const knownDeadFetches = new Set<typeof globalThis.fetch>();
+let warnedReanchor = false;
+
+/** #1410: the dead-closure signature. A wrapper whose owner nulled its
+ *  closure locals dies exactly like this ("baseFetch is not a function").
+ *  Network failures NEVER match: undici throws "fetch failed", provider SDKs
+ *  throw their own messages — only the missing-closure shape does. */
+function isDeadClosureError(err: unknown): boolean {
+    return err instanceof TypeError && /is not a function$/.test(err.message);
+}
+
+function noteFetch(f: unknown): void {
+    if (typeof f !== "function") return;
+    const fn = f as typeof globalThis.fetch;
+    if (!observedFetches.includes(fn)) observedFetches.push(fn);
+}
+
+/** Mark `dead` (just proven torn down) and return the oldest observed fetch
+ *  still believed live, or undefined when nothing is left. */
+function nextLiveAnchor(dead: typeof globalThis.fetch): typeof globalThis.fetch | undefined {
+    knownDeadFetches.add(dead);
+    return observedFetches.find((f) => !knownDeadFetches.has(f));
+}
 
 // Model-API endpoint suffixes across the wires bili proxies: Anthropic
 // `/v1/messages`, OpenAI chat `/v1/chat/completions` (and legacy
@@ -392,9 +449,10 @@ export function replaceRequestTarget(e: { request?: unknown }, target: string): 
 /** Install the global fetch patch. Idempotent: a second call is a no-op
  *  (returns false) so double-loading the entry cannot double-wrap. */
 export function installNativeFetchIntercept(state: NativeInterceptState): boolean {
-    const g = globalThis as Record<string, unknown>;
+    const g = globalThis as Record<PropertyKey, unknown>;
     if (g[INTERCEPT_FLAG] === true) return false;
     const orig = globalThis.fetch;
+    noteFetch(orig);
     // Shared across every re-armed chain link (a re-arm replaces the chain
     // top but must not forget what this process already learned).
     let warned = false;
@@ -405,10 +463,30 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
     const replacedOrigins = new Set<string>();
 
     const makeChain = (downstream: typeof globalThis.fetch) => {
+        // #1410: the downstream reference is MUTABLE. send() swaps it when
+        // proof arrives that the current one was torn down underneath us
+        // (dead-closure error) and retries on the oldest still-live fetch.
+        let ds = downstream;
+        const send = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+            let cur = ds;
+            for (;;) {
+                try {
+                    return await cur(input, init);
+                } catch (err) {
+                    const next = isDeadClosureError(err) ? nextLiveAnchor(cur) : undefined;
+                    if (next === undefined) throw err;
+                    if (!warnedReanchor) {
+                        warnedReanchor = true;
+                        console.warn("[bili-native] adopted downstream fetch was torn down by its owner (#1410) — re-anchored the chain onto the oldest live fetch");
+                    }
+                    ds = next;
+                    cur = next;
+                }
+            }
+        };
         const patched = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
-        const orig = downstream;
         const url = fetchUrlOf(input);
-        if (url === undefined) return orig(input, init);
+        if (url === undefined) return send(input, init);
         // #1268: hold the request until the host's ACP tool registration has
         // finished its first attempt, so headersFor can stamp it into plugin
         // mode. Steady state costs nothing (gate already resolved). A timeout
@@ -464,7 +542,7 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
             if (unattributed) {
                 const stamped = withHeaders(input, init, { [BILI_PASSTHROUGH_HEADER]: "1" });
                 state.onDispatch?.(url, "direct");
-                return orig(stamped.input, stamped.init);
+                return send(stamped.input, stamped.init);
             }
             // #1365: attributed routed traffic pins this process's model channel
             // to the baked origin — record it BEFORE the gate (noteRoutedOrigin).
@@ -486,7 +564,7 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
             const stamped = withHeaders(target === url ? input : makeTarget(target), init, routedExtra);
             try {
                 state.onDispatch?.(target, target === url ? "self" : "retry");
-                return await orig(stamped.input, stamped.init);
+                return await send(stamped.input, stamped.init);
             } catch (err) {
                 // The overlay bakes a specific proxy origin into these URLs;
                 // that proxy can die mid-session when its owning launcher
@@ -496,8 +574,10 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                 // to a direct send of the embedded upstream instead of
                 // failing the request forever. Recovery re-attempts on every
                 // subsequent failure — only this path can reroute the
-                // overlay-baked URLs.
-                if (!(err instanceof TypeError)) throw err;
+                // overlay-baked URLs. A dead-closure error (#1410) is NOT a
+                // proxy death — send() already exhausted every live anchor;
+                // respawning would churn a healthy proxy for the wrong fault.
+                if (!(err instanceof TypeError) || isDeadClosureError(err)) throw err;
                 const deadOrigin = new URL(target).origin;
                 const again = await recover(deadOrigin);
                 if (again !== undefined && again !== deadOrigin) {
@@ -505,7 +585,7 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                     const retried = `${again}${u.pathname}${u.search}`;
                     const restamped = withHeaders(makeTarget(retried), init, routedExtra);
                     state.onDispatch?.(retried, "retry");
-                    return await orig(restamped.input, restamped.init);
+                    return await send(restamped.input, restamped.init);
                 }
                 state.onGiveUp?.();
                 if (!warned) {
@@ -513,12 +593,12 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                     console.error(`bili-native: no live proxy — model requests go direct (uncompressed): ${routedTarget}`);
                 }
                 state.onDispatch?.(routedTarget, "direct");
-                return orig(makeTarget(routedTarget), init);
+                return send(makeTarget(routedTarget), init);
             }
         }
         if (!isModelApiUrl(url)) {
             if (!isBiliControlUrl(url)) state.onUnroutedModelUrl?.(url);
-            return orig(input, init);
+            return send(input, init);
         }
         // #1117: URL shape alone cannot claim a request — every model call in
         // the process hits the same endpoints. When the host supplies an
@@ -526,7 +606,7 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
         // sends direct (never touches a bili proxy).
         if (state.takeoverGate !== undefined && !state.takeoverGate(url)) {
             state.onDispatch?.(url, "direct");
-            return orig(input, init);
+            return send(input, init);
         }
 
         const origin = await readyOrigin(state);
@@ -538,7 +618,7 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                 console.error(`bili-native: proxy not ready — model request goes direct (uncompressed): ${url}`);
             }
             state.onDispatch?.(url, "direct");
-            return orig(input, init);
+            return send(input, init);
         }
         // Attach mode rewrites exactly like spawn mode (#809 semantics —
         // opencode's attach probe+rewrite; the V1 fetch patch relies on it to
@@ -549,27 +629,29 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
         // MITM envs entirely (an http loopback target is never proxied).
         if (url.startsWith(`${origin}/`)) {
             state.onDispatch?.(url, "self");
-            return orig(input, init);
+            return send(input, init);
         }
         await waitToolsGate();
         const first = makeTarget(`${origin}/bili/${url}`);
         state.onDispatch?.(`${origin}/bili/${url}`, "rewrite");
         try {
             const stamped = withHeaders(first, init, state.headersFor?.(url));
-            return await orig(stamped.input, stamped.init);
+            return await send(stamped.input, stamped.init);
         } catch (err) {
             // The proxy can die mid-session (its parent watchdog fires when
             // the FIRST owner exits while later sessions still ride it —
             // spawned, or shared-attached via another launcher, #1130). A
             // network-level failure (undici throws TypeError) triggers one
-            // recovery + one retry.
-            if (err instanceof TypeError) {
+            // recovery + one retry. A dead-closure error (#1410) is NOT a
+            // proxy death — send() already exhausted every live anchor; let
+            // it propagate instead of churning a healthy proxy.
+            if (err instanceof TypeError && !isDeadClosureError(err)) {
                 const again = await recover(origin);
                 if (again !== undefined) {
                     const retried = makeTarget(`${again}/bili/${url}`);
                     state.onDispatch?.(`${again}/bili/${url}`, "retry");
                     const stamped = withHeaders(retried, init, state.headersFor?.(url));
-                    return await orig(stamped.input, stamped.init);
+                    return await send(stamped.input, stamped.init);
                 }
                 // No replacement available — this session runs direct for its
                 // lifetime. Degrade exactly like a bootstrap failure: actually
@@ -581,13 +663,15 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                     console.error(`bili-native: proxy respawn failed — model requests go direct (uncompressed): ${url}`);
                 }
                 state.onDispatch?.(url, "direct");
-                return orig(input, init);
+                return send(input, init);
             }
             throw err;
         }
     };
 
-        return patched as typeof globalThis.fetch;
+        const chain = patched as typeof globalThis.fetch;
+        markOwnChain(chain);
+        return chain;
     };
 
     // #1158 self-heal re-arm: dsh-http-proxy (0.1.3) re-applies by writing its
@@ -603,12 +687,16 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
     let top = makeChain(orig);
     if (guard && shouldReclaimFetchPatch()) {
         preInstallDesc = desc;
-        Object.defineProperty(globalThis, "fetch", {
+        const accessor: PropertyDescriptor = {
             configurable: true,
             enumerable: desc?.enumerable ?? true,
             get: () => top,
             set: (v: unknown) => {
                 if (typeof v !== "function" || v === top) return;
+                // #1410: our own (possibly stale) chain link written back —
+                // recognize it by marker and ignore, never spend re-arm
+                // budget on ourselves.
+                if (isOwnChain(v)) return;
                 // Visibility (#1158): an evict attempt used to be silent —
                 // log it so "un-routed by a third party" is diagnosable even
                 // when the heal itself is not wanted/limited away.
@@ -622,9 +710,12 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
                     return;
                 }
                 rearmCount += 1;
+                noteFetch(v);
                 top = makeChain(v as typeof globalThis.fetch);
             },
-        });
+        };
+        installedDesc = accessor;
+        Object.defineProperty(globalThis, "fetch", accessor);
     } else {
         // Non-configurable host property or reclaim disabled
         // (BILI_RECLAIM_FETCH_PATCH=0): keep the classic direct install
@@ -636,13 +727,28 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
 }
 
 /** Test-only: drop the patch guard so a suite can install again. The
- *  caller owns restoring globalThis.fetch. */
-export function _resetForTest(): void {
-    const g = globalThis as Record<string, unknown>;
+ *  caller owns restoring globalThis.fetch. `opts.anchor` overrides the
+ *  module-load anchor (#1410) for suites that simulate a foreign scope. */
+export function _resetForTest(opts: { anchor?: typeof globalThis.fetch } = {}): void {
+    const g = globalThis as Record<PropertyKey, unknown>;
     delete g[INTERCEPT_FLAG];
+    if (opts.anchor !== undefined) moduleAnchor = opts.anchor;
+    observedFetches = moduleAnchor !== undefined ? [moduleAnchor] : [];
+    knownDeadFetches.clear();
+    warnedReanchor = false;
     if (preInstallDesc !== undefined) {
         const d = preInstallDesc;
         preInstallDesc = undefined;
-        Object.defineProperty(globalThis, "fetch", { ...d, configurable: true });
+        // #1410: restore ONLY while the property is still ours — it is
+        // configurable, so a third party may legally have deleted/redefined
+        // it meanwhile; restoring blindly would clobber their install. The
+        // comparison must be on the accessor FUNCTIONS, not the descriptor
+        // object: on the global object V8 rebuilds the descriptor wrapper
+        // around every set, so object identity is never stable.
+        const cur = Object.getOwnPropertyDescriptor(globalThis, "fetch");
+        if (cur !== undefined && installedDesc !== undefined && cur.get === installedDesc.get && cur.set === installedDesc.set) {
+            Object.defineProperty(globalThis, "fetch", { ...d, configurable: true });
+        }
+        installedDesc = undefined;
     }
 }
