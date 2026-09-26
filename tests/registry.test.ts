@@ -14,6 +14,15 @@ test("providerFromHost boundary-safe: unrelated hosts do not match", () => {
     assert.equal(providerFromHost("evil-minimax.chat"), undefined);
 });
 
+test("dashscope coding-plan host maps to the alibaba catalog provider (#1434)", () => {
+    assert.equal(providerFromHost("coding.dashscope.aliyuncs.com"), "alibaba");
+    assert.equal(providerFromHost("evil-coding.dashscope.aliyuncs.com"), undefined);
+});
+
+test("comfly relay host is deliberately unmapped so it takes the relay scan (#1434)", () => {
+    assert.equal(providerFromHost("ai.comfly.org"), undefined);
+});
+
 test("peekRegistryContext returns undefined with a cold cache (never fetches)", () => {
     _resetForTest();
     assert.equal(peekRegistryContext("MiniMax-M2.1", "api.minimax.chat"), undefined);
@@ -175,4 +184,12 @@ test("a genuinely listed prefixed id outranks the bare-basename fallback (#736)"
 test("bundled snapshot resolves the #736 vLLM name offline", () => {
     const ctx = bundledSnapshotLookup("qwen/qwen3.8-27b");
     assert.ok(typeof ctx === "number" && ctx >= 200_000, `snapshot should resolve qwen/qwen3.8-27b via alibaba/qwen3.8-27b (got ${ctx})`);
+});
+
+test("dashscope/comfly hosts reach listed Qwen windows from the bundled snapshot (#1434)", () => {
+    // Before #1434 both hosts mapped to provider ids absent from the catalog
+    // ("dashscope", "comfly"): known-provider candidates missed and the relay
+    // scan was skipped, so alibaba/qwen3-coder-plus was unreachable for them.
+    assert.equal(bundledSnapshotLookup("qwen3-coder-plus", "coding.dashscope.aliyuncs.com"), 1_048_576);
+    assert.equal(bundledSnapshotLookup("qwen3-coder-plus", "ai.comfly.org"), 1_048_576);
 });

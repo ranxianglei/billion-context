@@ -200,11 +200,16 @@ const HOST_TO_PROVIDER: Record<string, string> = {
     "api.openai.com": "openai",
     "open.bigmodel.cn": "zhipuai",
     "open.bigmodel.com": "zhipuai",
-    "coding.dashscope.aliyuncs.com": "dashscope",
+    // DashScope first-party coding-plan endpoint: models.dev lists every
+    // Qwen model under `alibaba/` — no dashscope/coding-plan provider id
+    // exists in the catalog, so point at the real one (#1434).
+    "coding.dashscope.aliyuncs.com": "alibaba",
     "api.deepseek.com": "deepseek",
     "api.moonshot.cn": "moonshot",
     "generativelanguage.googleapis.com": "google",
-    "ai.comfly.org": "comfly",
+    // ai.comfly.org deliberately absent: a relay with no models.dev provider
+    // id — absent hosts take the cross-provider suffix scan (#736), which
+    // strictly beats a known-provider miss (#1434).
     "api.minimax.chat": "minimax",
     "api.minimaxi.com": "minimax",
     "api.minimax.io": "minimax",
