@@ -17,7 +17,8 @@ import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 // #1403 wire invariant: the omp plugin stamps prompt_cache_key into the body
 // as its session id (#268); that field is NOT part of the Anthropic Messages
 // API, so EVERY anthropic forward path must ship it stripped — side requests
-// (#388), chain verdicts (#1086), passthrough marks (#1117/#920), the
+// (#388), chain advisories (#1086/#1357: advisory processing since #1357, the
+// rebuild never forwards stamped fields), passthrough marks (#1117/#920), the
 // non-conversation relay (#1284), global/route passthrough (#661). The fake
 // upstream below enforces zen's strict schema: top-level prompt_cache_key ⇒
 // the exact production 400.
@@ -177,7 +178,7 @@ test("#1403 T1: side request (max_tokens<=200) verbatim forward strips stamped p
     }
 });
 
-test("#1403 T2: chain-verdict raw forward (foreign ACP artifacts, no local state) strips stamped prompt_cache_key", async () => {
+test("#1403/#1357 T2: advisory processing of foreign ACP artifacts strips stamped prompt_cache_key", async () => {
     const dir = mkdtempSync(path.join(tmpdir(), "bili-pck-chain-"));
     const store = new SessionStore({ dir, debounceMs: 5, enabled: true });
     _setStoreForTest(store);
@@ -197,15 +198,18 @@ test("#1403 T2: chain-verdict raw forward (foreign ACP artifacts, no local state
             const out = await post(pport, `/bili/http://127.0.0.1:${uport}/v1/messages`, anthropicBody(sid, 1024, `keep ${tag}`), { "x-acp-session": sid });
             assert.equal(out.status, 200, `strict upstream must never see prompt_cache_key; got ${out.status}: ${out.body.slice(0, 200)}`);
             assert.equal(captured.length, 1);
-            assert.ok(!captured[0]!.body.includes("prompt_cache_key"), "chain-verdict forward must strip the stamped field");
-            // Compare the PARSED message text, not raw JSON bytes: quotes inside
-            // the tag are escaped on the wire, and a kernel re-render (wrong path)
-            // would renumber the ref — only the verbatim chain forward keeps it.
+            assert.ok(!captured[0]!.body.includes("prompt_cache_key"), "advisory processing must still strip the stamped field");
+            // #1357: historical ACP content is advisory — the request is PROCESSED
+            // (kernel re-render adds its own tag header), not verbatim-forwarded.
+            // Compare the PARSED message text: the user's literal tag must survive
+            // byte-intact inside the rebuilt body.
             const sentText = (JSON.parse(captured[0]!.body) as { messages: { content: { type: string; text: string }[] }[] }).messages[0]!.content[0]!.text;
-            assert.equal(sentText, `keep ${tag}`, "the rest of the body must arrive untouched");
+            assert.notEqual(sentText, `keep ${tag}`, "#1357: foreign ACP literal is advisory — processed, not verbatim chain forward");
+            assert.ok(sentText.includes(`keep ${tag}`), "user text and literal tag survive processing intact");
             const warns = logs.filter((l) => l.level === "warn" && l.msg.includes("[chain]") && l.msg.includes(sid));
-            assert.equal(warns.length, 1, "expected exactly one [chain] verdict warn for the foreign session");
-            assert.equal(peekSession(sid), undefined, "chain passthrough must not create local state");
+            assert.equal(warns.length, 1, "expected exactly one [chain] advisory warn for the foreign session");
+            assert.ok(warns[0]!.msg.includes("#1357"), "warn cites the #1357 advisory downgrade");
+            assert.notEqual(peekSession(sid), undefined, "advisory processing establishes local session state (#1357)");
         });
     } finally {
         setLogCapture(null);

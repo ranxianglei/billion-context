@@ -1665,13 +1665,14 @@ async function handle(
             }
         }
         const sessionId = anonAffinity ? anonAffinity.sessionId : conversation;
-        // #1086: content-fallback chain verdict, now that identity is known.
+        // #1086/#1357: content-fallback chain observation, now that identity is known.
         // Artifacts + processed local state ⇒ self-produced: process normally.
-        // Artifacts + NO local state ⇒ an upstream bili already compressed
-        // this payload and its headers were stripped: forward verbatim and
-        // create no session state (same contract as the hop-marker path).
-        // Returning before getSession also skips note()/register consumption,
-        // so a foreign session leaves no trace in this instance.
+        // Artifacts + NO local state ⇒ ADVISORY observation (#1357 Phase 1): the
+        // content may be user-authored (AGENTS.md examples, docs, pastes), so it
+        // no longer forces byte-identical passthrough — record one observation for
+        // /acp diagnostics and fall through to processTurn so this session
+        // establishes its own ownership state. Decisive verbatim passthrough
+        // stays reserved for the x-bili-hop header (above).
         if (artifactSeed) {
             const artifactKind = detectAcpArtifacts(bodyBuffer, parsed);
             // #1197: a cooperative plugin announces itself with x-bili-plugin —
@@ -1686,20 +1687,27 @@ async function handle(
             // incident) says: process.
             const pluginAnnounced = pluginAgentHeader(req.headers) !== undefined;
             if (artifactKind !== null && !pluginAnnounced && !hasProcessedState(sessionId, { protocol })) {
-                // #1218: record the verdict under the session id AND the
-                // client's own conversation value when they differ — /acp
-                // status probes arrive keyed by the client's value (the same
-                // key space resolveConversation uses), and the session-bound
-                // id alone would be invisible to the client.
+                // #1357 Phase 1: historical ACP content is ADVISORY, never
+                // decisive. It can be user-authored (AGENTS.md / docs / CCR
+                // lossless originals / pastes), so judging it a foreign chain
+                // and forwarding verbatim here permanently locked FRESH sessions
+                // into passthrough — the decision returned before any session was
+                // created, so no ownership state ever existed to clear the next
+                // request. Record the observation for /acp diagnostics and fall
+                // through to processTurn so this session establishes ownership.
+                // Decisive passthrough stays reserved for the authenticated
+                // x-bili-hop header (above + at the passthrough tail). Trade-off:
+                // a bili→bili relay that STRIPS x-bili-hop now double-processes
+                // until signed request-bound chain proof ships (#1357 Phase 2/3).
+                // #1218: recorded under the session id AND the client's own
+                // conversation value when they differ (same key space /acp
+                // status probes use) so the observation is visible to the client.
                 const firstVerdict = recordChainVerdict(sessionId, artifactKind, protocol);
                 if (clientConv !== undefined && clientConv !== sessionId) recordChainVerdict(clientConv, artifactKind, protocol);
                 if (firstVerdict) {
-                    log("warn", `[chain] inbound ${protocol} request carries ACP compression artifacts (${artifactKind}) but neither ${BILI_HOP_HEADER} nor local compression state for session ${sessionId} — likely a bili→bili chain whose headers were stripped. Passing through without processing; if this is your own client, disable the content fallback with chainContentDetection=false (env BILI_CHAIN_CONTENT=0).`);
+                    log("warn", `[chain] inbound ${protocol} request carries ACP compression artifacts (${artifactKind}) but neither ${BILI_HOP_HEADER} nor local compression state for session ${sessionId}. Historical ACP content is advisory-only — continuing to processTurn so this session establishes ownership (#1357); a header-stripping bili→bili relay may now double-process until signed chain proof lands.`);
                 }
-                await forward(req, res, opts, scrubAnthropicPck(protocol, bodyBuffer, log), null, core, config, log, route, instanceId, undefined);
-                return;
-            }
-            if (artifactKind !== null) {
+            } else if (artifactKind !== null) {
                 log("debug", `[chain] ACP artifacts (${artifactKind}) belong to this instance's own session ${sessionId} — self-produced, processing normally (#1086)`);
             }
         }
@@ -2637,9 +2645,9 @@ function effectiveTokenCount(session: Session, msgs: CoreMessage[], inboundImage
 // #1403: top-level prompt_cache_key is NOT part of the Anthropic Messages API.
 // It is the omp plugin's session id stamped for the proxy's identity chain
 // (#268); the fully-processed path strips it (prepareAnthropic), but every
-// VERBATIM forward branch (side-request passthrough #388, chain verdict #1086,
-// bypass/passthrough marks, route/global passthrough #661, decode-fail
-// fallback) used to ship the raw buffer through — strict-schema upstreams
+// VERBATIM forward branch (side-request passthrough #388, hop-marker chain
+// passthrough, bypass/passthrough marks, route/global passthrough #661,
+// decode-fail fallback) used to ship the raw buffer through — strict-schema upstreams
 // (opencode zen: "prompt_cache_key: Extra inputs are not permitted") 400'd
 // the request. Strip on those branches too. A body WITHOUT the field passes
 // back byte-identical, so #661's fingerprinting contract is untouched in the

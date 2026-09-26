@@ -24,8 +24,9 @@ import { artifactSeedHit, detectAcpArtifacts } from "../src/server/chain-artifac
 //      artifacts; historical tool calls are; real tags are; placeholders aren't).
 //   2. self-state exemption — artifacts + local processed state ⇒ processed.
 //   3. fresh plugin-mode session (declarations only) ⇒ processed, no warn.
-//   4. foreign artifacts without local state ⇒ byte-identical passthrough,
-//      exactly one warn per session, no session record created.
+//   4. #1357 Phase 1: foreign artifacts without local state are ADVISORY —
+//      processed normally so the session owns itself; one advisory warn, and
+//      only x-bili-hop remains decisive verbatim passthrough.
 //   5. escape valve chainContentDetection=false disables the fallback.
 //   6. liveness guard — a plain-client chat-wire session still compresses
 //      as it grows (the #1086 failure mode was silent non-compression).
@@ -153,6 +154,19 @@ function makeUpstream(captured: Captured[]): http.Server {
     });
 }
 
+function makeJsonUpstream(captured: Captured[], respond: () => unknown): http.Server {
+    return http.createServer((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on("data", (c: Buffer) => chunks.push(c));
+        req.on("end", () => {
+            const body = Buffer.concat(chunks).toString("utf8");
+            captured.push({ url: req.url ?? "", headers: req.headers, body });
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify(respond()));
+        });
+    });
+}
+
 type LogRec = { level: string; msg: string };
 const chainWarns = (logs: LogRec[], sessionId?: string): LogRec[] =>
     logs.filter((l) => l.level === "warn" && l.msg.includes("[chain]") && (!sessionId || l.msg.includes(sessionId)));
@@ -256,7 +270,7 @@ test("#1086 T2: fresh plugin-mode session (declarations only) is processed, not 
     }
 });
 
-test("#1086 T3: foreign artifacts without local state pass through byte-identical, one warn, no state", async () => {
+test("#1086/#1357 T3: foreign artifacts without local state are ADVISORY — processed, owned, one warn", async () => {
     // #1100: "no local state ⇒ foreign" holds only when persistence proves ownership
     // across a restart, so T3 runs an ENABLED store over an empty temp dir (truly
     // foreign). Disabled-store variant is ambiguous (own session after restart) → T6.
@@ -286,12 +300,13 @@ test("#1086 T3: foreign artifacts without local state pass through byte-identica
             await resp.text();
         }
         assert.equal(captured.length, 2);
-        assert.equal(captured[0]!.body, raw, "foreign payload must reach the LLM byte-identical (no kernel processing)");
-        assert.equal(captured[1]!.body, raw);
+        assert.notEqual(captured[0]!.body, raw, "historical ACP content is advisory — processed, not passed through verbatim (#1357)");
+        assert.notEqual(captured[1]!.body, raw, "second request also processed (no permanent passthrough)");
         const warns = chainWarns(logs, "foreign-1");
-        assert.equal(warns.length, 1, `exactly one warn per session (got ${warns.length}: ${JSON.stringify(warns)})`);
-        assert.ok(warns[0]!.msg.includes("chainContentDetection=false"), "warning must point at the escape valve");
-        assert.equal(peekSession("foreign-1"), undefined, "foreign sessions must leave no trace in this instance");
+        assert.equal(warns.length, 1, `exactly one advisory warn per session (got ${warns.length}: ${JSON.stringify(warns)})`);
+        assert.ok(warns[0]!.msg.includes("#1357"), "warn cites the #1357 advisory downgrade");
+        assert.ok(warns[0]!.msg.includes("advisory"), "warn states historical ACP content is advisory-only");
+        assert.ok(peekSession("foreign-1") !== undefined, "the advisory session establishes local ownership (no longer left trace-less)");
     } finally {
         setLogCapture(null);
         proxy.closeAllConnections?.();
@@ -303,11 +318,12 @@ test("#1086 T3: foreign artifacts without local state pass through byte-identica
     }
 });
 
-test("#1218: /acp explains chain passthrough instead of the armed-idle notice", async () => {
-    // Same shape as T3: a session whose requests are judged an external chain
-    // is passed through with NO local state. /acp (plugin status) must surface
-    // WHY there is no session — the user sees "PASSED THROUGH" with the escape
-    // valve, not "no model request yet" (#1218 repro).
+test("#1218/#1357: a content-detected conversation owns a real session; /acp shows real activity", async () => {
+    // #1357 Phase 1: body-artifact detection is advisory-only, so a conversation
+    // whose history carries ACP-shaped content is PROCESSED and owns its own state.
+    // Pre-#1357 symptom (#1218): such requests passed through with NO session, so
+    // /acp showed a misleading armed-idle "no model request yet". Now /acp reflects
+    // the real session — requests served, panel built; never armed-idle or passthrough.
     const dir = mkdtempSync(join(tmpdir(), "bili-chain-1218-"));
     const store = new SessionStore({ dir, debounceMs: 5, enabled: true });
     _setStoreForTest(store);
@@ -328,19 +344,16 @@ test("#1218: /acp explains chain passthrough instead of the armed-idle notice", 
         });
         assert.equal(resp.status, 200);
         await resp.text();
-        assert.equal(peekSession("chain-exp-1"), undefined, "passthrough leaves no session");
+        assert.ok(peekSession("chain-exp-1") !== undefined, "advisory content establishes a real local session (#1357)");
         const probe = await fetch(`http://127.0.0.1:${(proxy.address() as { port: number }).port}/__bili/plugin/status?conversationId=chain-exp-1`);
         const probeBody = await probe.text();
         assert.equal(probe.status, 200, `status probe failed: ${probeBody.slice(0, 200)}`);
-        const status = JSON.parse(probeBody) as { ok: boolean; conversationId: string; phase: string; chain: { at: number; kind: string; protocol: string }; panel: string };
+        const status = JSON.parse(probeBody) as { ok: boolean; conversationId: string; phase?: string; requests?: number; panel?: string };
         assert.equal(status.ok, true);
         assert.equal(status.conversationId, "chain-exp-1");
-        assert.equal(status.phase, "chain-passthrough");
-        assert.equal(typeof status.chain.kind, "string");
-        assert.ok(status.chain.kind.length > 0, "verdict carries the evidence kind");
-        assert.equal(status.chain.protocol, "openai");
-        assert.ok(status.panel.includes("PASSED THROUGH UNPROCESSED"), `panel explains the passthrough (got: ${status.panel.slice(0, 120)}…)`);
-        assert.ok(status.panel.includes("chainContentDetection=false"), "panel points at the escape valve");
+        assert.notEqual(status.phase, "chain-passthrough", "content is advisory, not a decisive chain verdict");
+        assert.ok((status.requests ?? 0) >= 1, `/acp reflects the served request (got requests=${status.requests})`);
+        assert.equal(typeof status.panel, "string", "/acp renders a real session panel, not the armed-idle notice");
         // A conversation with NO verdict keeps the pre-#1218 answer shape —
         // the new branch must not hijack unrelated probes.
         const clean = await fetch(`http://127.0.0.1:${(proxy.address() as { port: number }).port}/__bili/plugin/status?conversationId=never-seen`);
@@ -679,7 +692,7 @@ test("#1101 T8: warn-set FIFO evicts the oldest session once past the cap", asyn
         });
         assert.equal(resp.status, 200);
         await resp.text();
-        assert.equal(captured[0]!.body, raw, "foreign payload still passes through byte-identical");
+        assert.notEqual(captured[0]!.body, raw, "#1357: foreign historical content is advisory — processed, not byte-identical");
         assert.ok(warnSet.has("fifo-evict"), "newly warned session must be tracked");
         assert.ok(!warnSet.has("pad-0"), "oldest entry must be FIFO-evicted once past the cap");
         assert.ok(warnSet.has("pad-1"), "only the single oldest entry is evicted per add");
@@ -854,12 +867,12 @@ test("#1197 T11: plugin-announced request with history artifacts is processed, n
     }
 });
 
-// Review of #1213: T3 pins the #1086 fallback for the TOOL-HISTORY family at
-// server level, but nothing pinned it for the TAGS family — the exact family
-// this PR re-scopes. A non-cooperative client whose HISTORY carries real
-// render tags must still be judged a chain when this instance holds no state
-// for it: byte-identical passthrough, one warn, no session record.
-test("#1197 T12: foreign client with tags in HISTORY passes through byte-identical, one warn, no state", async () => {
+// #1357 Phase 1 regression (TAGS family, primary fixture): ACP tag literals in
+// ordinary HISTORY are advisory-only. The literal below mirrors the AGENTS.md
+// example VERBATIM and appears BOTH inlined AND inside a fenced code block — the
+// exact real-world trigger. Pre-#1357 this forced byte-identical passthrough
+// forever; now it is processed normally, the session owns itself, one advisory warn.
+test("#1357 T12: ACP tag literals in history are advisory — processed, owned, one warn (not passthrough)", async () => {
     const dir = mkdtempSync(join(tmpdir(), "bili-chain-t12-"));
     const store = new SessionStore({ dir, debounceMs: 5, enabled: true });
     _setStoreForTest(store);
@@ -875,15 +888,25 @@ test("#1197 T12: foreign client with tags in HISTORY passes through byte-identic
     const proxy = await startServer(makeOpts(`http://127.0.0.1:${(upstream.address() as { port: number }).port}`));
     await listen(proxy);
     try {
-        // Proxy-mode chain shape: the re-voiced acp_summary lands as a user
-        // message whose content carries the render tags.
-        const realTag = "\x3cacp tokens=\"1.2K\" type=\"text\"\x3em00042\x3c/acp\x3e";
+        const acpExample = "\x3cacp tokens=\"2\" type=\"text\"\x3em00001\x3c/acp\x3e";
+        const userText = [
+            "Here is how compression tags look:",
+            "",
+            acpExample,
+            "",
+            "And inside a code fence:",
+            "```",
+            acpExample,
+            "```",
+            "",
+            "Please continue from here.",
+        ].join("\n");
         const raw = JSON.stringify({
             model: MODEL,
             stream: false,
             messages: [
                 { role: "system", content: "You are a test assistant." },
-                { role: "user", content: `earlier context folded ${realTag} continue` },
+                { role: "user", content: userText },
             ],
         });
         for (let i = 0; i < 2; i++) {
@@ -896,12 +919,117 @@ test("#1197 T12: foreign client with tags in HISTORY passes through byte-identic
             await resp.text();
         }
         assert.equal(captured.length, 2);
-        assert.equal(captured[0]!.body, raw, "foreign payload with history tags must reach the LLM byte-identical (no kernel processing)");
-        assert.equal(captured[1]!.body, raw);
+        assert.notEqual(captured[0]!.body, raw, "ACP literals in history are advisory — processed, not passed through verbatim (#1357)");
+        assert.notEqual(captured[1]!.body, raw, "second request also processed (no permanent passthrough)");
         const warns = chainWarns(logs, "foreign-tags-1");
-        assert.equal(warns.length, 1, `exactly one warn per session (got ${warns.length}: ${JSON.stringify(warns)})`);
-        assert.ok(warns[0]!.msg.includes("chainContentDetection=false"), "warning must point at the escape valve");
-        assert.equal(peekSession("foreign-tags-1"), undefined, "foreign sessions must leave no trace in this instance");
+        assert.equal(warns.length, 1, `exactly one advisory warn per session (got ${warns.length}: ${JSON.stringify(warns)})`);
+        assert.ok(warns[0]!.msg.includes("#1357"), "warn cites the #1357 advisory downgrade");
+        assert.ok(warns[0]!.msg.includes("advisory"), "inline + fenced ACP examples are advisory-only, not decisive");
+        assert.ok(peekSession("foreign-tags-1") !== undefined, "the session establishes local ownership instead of leaving no trace");
+    } finally {
+        setLogCapture(null);
+        proxy.closeAllConnections?.();
+        await close(proxy);
+        upstream.closeAllConnections?.();
+        await close(upstream);
+        store.cancelAll();
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("#1357 T13: Responses wire — ACP tag literal in history is advisory, processed, owned", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bili-chain-resp-"));
+    const store = new SessionStore({ dir, debounceMs: 5, enabled: true });
+    _setStoreForTest(store);
+    _resetSessionsForTest();
+    _resetChainWarningsForTest();
+    setRegistryForTest({});
+    const logs: LogRec[] = [];
+    setLogCapture((level, msg) => logs.push({ level, msg }));
+    const captured: Captured[] = [];
+    const upstream = makeJsonUpstream(captured, () => ({
+        id: "resp-test", status: "completed",
+        output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "ok" }] }],
+        usage: { input_tokens: 10, output_tokens: 5 },
+    }));
+    upstream.listen(0, "127.0.0.1");
+    await listen(upstream);
+    const proxy = await startServer(makeOpts(`http://127.0.0.1:${(upstream.address() as { port: number }).port}`));
+    await listen(proxy);
+    try {
+        const acpExample = "\x3cacp tokens=\"2\" type=\"text\"\x3em00001\x3c/acp\x3e";
+        const raw = JSON.stringify({
+            model: MODEL,
+            stream: false,
+            input: [
+                { type: "message", role: "user", content: [{ type: "input_text", text: `earlier folded ${acpExample}\ncontinue please` }] },
+            ],
+        });
+        const resp = await fetch(`http://127.0.0.1:${(proxy.address() as { port: number }).port}/v1/responses`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "resp-advisory-1" },
+            body: raw,
+        });
+        assert.equal(resp.status, 200);
+        await resp.text();
+        assert.equal(captured.length, 1);
+        assert.notEqual(captured[0]!.body, raw, "Responses ACP literal is advisory — processed, not passed through verbatim (#1357)");
+        const warns = chainWarns(logs, "resp-advisory-1");
+        assert.equal(warns.length, 1, `exactly one advisory warn (got ${warns.length})`);
+        assert.ok(warns[0]!.msg.includes("#1357"), "warn cites #1357");
+        assert.ok(peekSession("resp-advisory-1") !== undefined, "Responses session establishes local ownership");
+    } finally {
+        setLogCapture(null);
+        proxy.closeAllConnections?.();
+        await close(proxy);
+        upstream.closeAllConnections?.();
+        await close(upstream);
+        store.cancelAll();
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("#1357 T14: Anthropic wire — ACP tag literal in history is advisory, processed, owned", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "bili-chain-anth-"));
+    const store = new SessionStore({ dir, debounceMs: 5, enabled: true });
+    _setStoreForTest(store);
+    _resetSessionsForTest();
+    _resetChainWarningsForTest();
+    setRegistryForTest({});
+    const logs: LogRec[] = [];
+    setLogCapture((level, msg) => logs.push({ level, msg }));
+    const captured: Captured[] = [];
+    const upstream = makeJsonUpstream(captured, () => ({
+        id: "msg-test", type: "message", role: "assistant", model: MODEL,
+        content: [{ type: "text", text: "ok" }], stop_reason: "end_turn",
+        usage: { input_tokens: 10, output_tokens: 5 },
+    }));
+    upstream.listen(0, "127.0.0.1");
+    await listen(upstream);
+    const proxy = await startServer(makeOpts(`http://127.0.0.1:${(upstream.address() as { port: number }).port}`));
+    await listen(proxy);
+    try {
+        const acpExample = "\x3cacp tokens=\"2\" type=\"text\"\x3em00001\x3c/acp\x3e";
+        const raw = JSON.stringify({
+            model: MODEL,
+            max_tokens: 1024,
+            messages: [
+                { role: "user", content: [{ type: "text", text: `earlier folded ${acpExample}\ncontinue please` }] },
+            ],
+        });
+        const resp = await fetch(`http://127.0.0.1:${(proxy.address() as { port: number }).port}/v1/messages`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": "anthropic-advisory-1" },
+            body: raw,
+        });
+        assert.equal(resp.status, 200);
+        await resp.text();
+        assert.equal(captured.length, 1);
+        assert.notEqual(captured[0]!.body, raw, "Anthropic ACP literal is advisory — processed, not passed through verbatim (#1357)");
+        const warns = chainWarns(logs, "anthropic-advisory-1");
+        assert.equal(warns.length, 1, `exactly one advisory warn (got ${warns.length})`);
+        assert.ok(warns[0]!.msg.includes("#1357"), "warn cites #1357");
+        assert.ok(peekSession("anthropic-advisory-1") !== undefined, "Anthropic session establishes local ownership");
     } finally {
         setLogCapture(null);
         proxy.closeAllConnections?.();
