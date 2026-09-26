@@ -26,7 +26,7 @@ import { listSessions } from "../src/session.ts";
 // Scenario:
 //   1. Request 1 on claude-big (400k window), upstream reports
 //      input_tokens=300000 → session.lastInputTokens = 300000.
-//   2. Request 2 on claude-small (10k window) with a ~13k-token
+//   2. Request 2 on claude-small (12k window) with a ~13k-token
 //      conversation: the payload itself overflows → preflight fires: the
 //      oldest compressible ranges are summarized (non-streaming JSON calls
 //      to the upstream) and folded into blocks; the rebuilt payload (recent
@@ -101,7 +101,7 @@ test("e2e: model switch to a smaller window → preflight compresses before forw
         port: 0,
         host: "127.0.0.1",
         upstream: "http://127.0.0.1",
-        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-big": { context: 400_000 }, "claude-small": { context: 10_600 } } } },
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-big": { context: 400_000 }, "claude-small": { context: 12_000 } } } },
         modelContextLimit: 400_000,
         kernelConfig: defaultConfig(400_000),
         // CCR is opt-in on every lane (#1207 owner decision): off unless a
@@ -296,7 +296,7 @@ test("e2e: fresh session (lastInputTokens=0) whose raw history overflows the win
         port: 0,
         host: "127.0.0.1",
         upstream: "http://127.0.0.1",
-        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-small": { context: 10_600 } } } },
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-small": { context: 12_000 } } } },
         modelContextLimit: 400_000,
         kernelConfig: defaultConfig(400_000),
         // CCR is opt-in on every lane (#1207 owner decision): off unless a
@@ -320,7 +320,7 @@ test("e2e: fresh session (lastInputTokens=0) whose raw history overflows the win
         // No prior request: the session is brand new (lastInputTokens = 0),
         // e.g. after a model switch rotated the session id and the client
         // resends its full raw history. The ~13k-token history overflows the
-        // 10k window on the very first request — preflight must still fire
+        // 12k window on the very first request — preflight must still fire
         // (payload-size trigger, not lastInputTokens).
         const r = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
             method: "POST",
