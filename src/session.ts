@@ -79,6 +79,12 @@ export type Session = {
          *  forensics can tell which surface served the session without config
          *  archaeology. */
         activePack?: string;
+        /** Sticky prompt-pack canary assignment (#1408): "lean" | "default".
+         *  Set exactly once — on the first request where compress.promptPack
+         *  is unset at every level — by deterministic session-id hash against
+         *  BILI_PROMPT_PACK_CANARY_PCT, then never re-evaluated: the choice
+         *  survives restarts and knob changes for the session's whole life. */
+        packCanary?: "lean" | "default";
     };
     /** Cumulative usage stats, summed across all requests. Each sample =
      *  one upstream usage report. Persisted; survives restart. */
