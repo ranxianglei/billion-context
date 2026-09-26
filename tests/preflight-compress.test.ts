@@ -106,12 +106,10 @@ test("e2e: model switch to a smaller window → preflight compresses before forw
         kernelConfig: defaultConfig(400_000),
         // CCR is opt-in on every lane (#1207 owner decision): off unless a
         // config level sets enabled=true, so the acp_retrieve tool schema does
-        // not load here. acp_rule is pinned off too since #1399 made it
-        // default-on — its schema shifts this exact-budget fold boundary. If
-        // the boundary shifts again, someone re-enabled a default — treat that
-        // as a regression tripwire. CCR-on / rules-on interplay with the
-        // cascade is covered by e2e-compress-cascade.test.ts / the rules suites.
-        compress: { injectTool: true, injectNudge: true, rules: false },
+        // not load here. If this exact-budget boundary shifts again, someone
+        // re-enabled a default — treat that as a regression tripwire. CCR-on
+        // interplay with the cascade is covered by e2e-compress-cascade.test.ts.
+        compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,
@@ -303,12 +301,10 @@ test("e2e: fresh session (lastInputTokens=0) whose raw history overflows the win
         kernelConfig: defaultConfig(400_000),
         // CCR is opt-in on every lane (#1207 owner decision): off unless a
         // config level sets enabled=true, so the acp_retrieve tool schema does
-        // not load here. acp_rule is pinned off too since #1399 made it
-        // default-on — its schema shifts this exact-budget fold boundary. If
-        // the boundary shifts again, someone re-enabled a default — treat that
-        // as a regression tripwire. CCR-on / rules-on interplay with the
-        // cascade is covered by e2e-compress-cascade.test.ts / the rules suites.
-        compress: { injectTool: true, injectNudge: true, rules: false },
+        // not load here. If this exact-budget boundary shifts again, someone
+        // re-enabled a default — treat that as a regression tripwire. CCR-on
+        // interplay with the cascade is covered by e2e-compress-cascade.test.ts.
+        compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,
