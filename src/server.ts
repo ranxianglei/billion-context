@@ -4,7 +4,7 @@ import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { createCore, type CompressionCore, type CompressionState, type Config, type AbsorbConfig, type CoreMessage, type NudgeDecision, type Prompts, type PackSurface, type ToolPrompts, applyAcpToolOverrides, defaultPrompts, defaultCountTokens, estimateTokensFast, renderNudgeText, deactivateBlock, viableRanges, resolveOutputSteeringConfig } from "acp-kernel";
-import { DEFAULT_STRIP_IMAGES_KEEP_RECENT, applyCompressSettings, resolveAbsorbSettings, resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig } from "./compress-settings.js";
+import { DEFAULT_STRIP_IMAGES_KEEP_RECENT, applyCompressSettings, resolveAbsorbSettings, resolveCcrArming, resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig } from "./compress-settings.js";
 import { dropCompressReasoning, type CompressReasoningConfig } from "./reasoning-drop.js";
 import type { CompressSettings, ProxyOptions } from "./config.js";
 import { loadOptions, loadRoutes } from "./config.js";
@@ -987,7 +987,12 @@ async function handle(
         // (DEFAULT_CCR_CONFIG et al. inside applyCompressSettings); per-request/route overrides
         // are still enforced at execution time, so the manifest stays conservative as #1192
         // requires. Do not "simplify" this back to `config`.
-        return handlePluginManifest(res, applyCompressSettings(config, opts.modelContextLimit, opts.compress));
+        // [#1425/#1273] The stamped base now carries default-on ccr for the PROXY lane, but
+        // plugin-lane advertisement must stay a deliberate GLOBAL act: strip ccr from the
+        // manifest view unless the operator set compress.ccr.enabled=true globally (the
+        // stamp site below arms plugin sessions on exactly that condition).
+        const manifestConfig = applyCompressSettings(config, opts.modelContextLimit, opts.compress);
+        return handlePluginManifest(res, opts.compress.ccr?.enabled === true ? manifestConfig : { ...manifestConfig, ccr: undefined });
     }
     if (req.method === "GET" && req.url?.startsWith("/__bili/plugin/status")) {
         const query = req.url.slice(req.url.indexOf("?") + 1);
@@ -1430,12 +1435,14 @@ async function handle(
                 windowShrinkReason = "operator";
             }
             const compressCfg = resolveCompress(opts.routes, embeddedUrl, model, opts.compress);
-            // [#1207 owner decision] CCR is opt-in on every lane: the raw
-            // three-level merge IS the arming decision — no `ccr` key at any
-            // level leaves resolvedCcrCfg undefined and the session never
-            // arms. Turn it on only by setting compress.ccr.enabled=true at
-            // some config level, after local verification.
-            resolvedCcrCfg = compressCfg.ccr;
+            // [#1425 owner decision, supersedes #1207 for the PROXY lane] CCR is
+            // ON by default there: the raw three-level merge still IS the arming
+            // decision, but an absent/unset `ccr` now resolves to armed
+            // (kernel-default block) instead of disarmed; only an explicit
+            // compress.ccr.enabled=false at some level disarms. Plugin-mode
+            // arming is decided separately at the stamp site below (#1273:
+            // explicit global enable required).
+            resolvedCcrCfg = resolveCcrArming(compressCfg.ccr);
         resolvedImageCompressionCfg = compressCfg.imageCompression;
             reqPrompts = resolveCompressPrompts(compressCfg);
             const surfaceRes = resolveCompressSurfaceDetailed(compressCfg);
@@ -1940,21 +1947,24 @@ async function handle(
         // leave placeholders unretrievable.
         const storeChannelOk = protocol !== "responses" ||
             (!process.env.ACP_NO_INJECT_TOOL && !FORCE_TEXT_PROTOCOL && resolveCompressProtocol(opts.routes, upstreamOrigin) !== "marker");
-        // [#1345/#1273] Plugin mode: the static manifest (handlePluginManifest
-        // sees opts.compress.ccr, never the route/model-scoped merge) is the ONLY
-        // declaration of the retrieve surface, so the executed policy must be the
-        // base block verbatim — arm iff base enabled=true, whole block
-        // (toolName + thresholds) from base. Any provider/model ccr.* override
-        // splits declared from dispatched: toolName renames the session gate away
-        // from the registered name (calls 400 as unknown), enabled=false disarms
-        // a session whose manifest advertises (stored content unreachable,
+        // [#1345/#1273, #1425 owner decision] Plugin mode keeps the #1273
+        // contract: the static manifest is the ONLY declaration of the retrieve
+        // surface, and advertising it must stay a deliberate GLOBAL act — arm
+        // iff the global block explicitly says enabled=true, whole block
+        // (toolName + thresholds) verbatim. #1425's default-on applies to the
+        // PROXY lane only (resolvedCcrCfg below); a plugin session with no
+        // explicit global enable stays disarmed even though the stamped base
+        // carries default-on ccr. Any provider/model ccr.* override splits
+        // declared from dispatched: toolName renames the session gate away from
+        // the registered name (calls 400 as unknown), enabled=false disarms a
+        // session whose manifest advertises (stored content unreachable,
         // placeholders dangling). Provider/model ccr.* overrides are therefore
         // proxy-lane-only (the proxy declares+dispatches per request under the
-        // merged block, per-route renames intact); findCcrPluginDivergences warns
-        // at config load about every divergent level/field.
+        // merged block, per-route renames intact); findCcrPluginDivergences
+        // warns at config load about every divergent level/field.
         const pluginCcrStamp = pluginMode
             ? (ccrPluginWireOk(protocol) && opts.compress.ccr?.enabled === true ? opts.compress.ccr : undefined)
-            : (resolvedCcrCfg?.enabled === true ? resolvedCcrCfg : undefined);
+            : resolvedCcrCfg;
         storeEffectiveCcr(session, opts.compress.injectTool && storeChannelOk ? pluginCcrStamp : undefined);
         // [#1095] same channel/plugin-mode gating as CCR: image_full's restore
         // round-trip needs a tool channel on this wire; without one the model

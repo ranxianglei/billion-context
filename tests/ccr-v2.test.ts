@@ -376,7 +376,7 @@ test("e2e CCR v2 streaming: range restore rides the re-request with pair integri
     }
 });
 
-test("e2e CCR v2 opt-in: no ccr config at any level leaves the session unarmed — range restore refuses (#1207 owner decision)", async () => {
+test("e2e CCR v2 default-on: no ccr config at any level arms the session — range restore works (#1425 supersedes #1207)", async () => {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const captured: string[] = [];
@@ -387,17 +387,16 @@ test("e2e CCR v2 opt-in: no ccr config at any level leaves the session unarmed �
         const msgs = Array.from({ length: 20 }, (_, i) => ({ role: i % 2 === 0 ? "user" : "assistant", content: `Historical detail ${i}. ${"y".repeat(2000)}` }));
         const res = await fetch(url, {
             method: "POST",
-            headers: { "content-type": "application/json", "x-acp-session": "ccr-v2-e2e-opt-in", "anthropic-version": "2023-06-01" },
+            headers: { "content-type": "application/json", "x-acp-session": "ccr-v2-e2e-default-on", "anthropic-version": "2023-06-01" },
             body: JSON.stringify({ model: "claude-test", max_tokens: 1000, stream: true, system: [{ type: "text", text: "SYS ANCHOR", cache_control: { type: "ephemeral" } }], messages: msgs }),
         });
         const sse = await res.text();
         assert.ok(res.ok, `client turn failed: HTTP ${res.status}: ${sse}`);
         assert.equal(captured.length, 3, "initial request + one re-request per executed tool");
-        // [#1207 owner decision] CCR is opt-in on every lane: with no ccr key
-        // at any level the session never arms, so the range restore ack is the
-        // "requires CCR" refusal instead of restored content.
-        assert.ok(!/restored 3 item\(s\)/.test(captured[2]!), "no restore without explicit opt-in");
-        assert.match(captured[2]!, /requires CCR/, "range restore refused: session unarmed by default");
+        // [#1425 owner decision] supersedes the #1207 opt-in rule: no ccr key at
+        // any level leaves the session armed with the base defaults, so the fold
+        // stores the covered originals and the range restore delivers them.
+        assert.match(captured[2]!, /restored 3 item\(s\)/, "range restore works without any ccr config");
     } finally {
         await closeAll();
     }
