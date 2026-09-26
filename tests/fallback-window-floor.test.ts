@@ -61,6 +61,7 @@ test("e2e: fallback-derived window is floored at 100k after output-headroom rese
         log: false,
         debug: false,
         passthrough: false,
+        chainContentDetection: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
@@ -158,6 +159,7 @@ test("e2e: per-route context declaration is operator-owned and never floored", a
         log: false,
         debug: false,
         passthrough: false,
+        chainContentDetection: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);

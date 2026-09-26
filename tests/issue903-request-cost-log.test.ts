@@ -75,6 +75,7 @@ test("e2e: per-request cost line reports msg count, inbound wire size and local 
         log: true,
         debug: false,
         passthrough: false,
+        chainContentDetection: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);

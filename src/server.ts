@@ -103,7 +103,7 @@ import { maybeAdoptForkBlocks } from "./fork-adoption.js";
 import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "./affinity-persist.js";
 import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRuntimeInfoFor, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream, getBlindTunnelStats } from "./mitm.js";
-import { evaluateChain } from "./chain-checkpoint.js";
+import { evaluateChain, extractChainCarriers, stampOutbound } from "./chain-checkpoint.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "./util.js";
 
@@ -1240,19 +1240,48 @@ async function handle(
         if (Array.isArray(p.input)) return p.input.length;
         return null;
     })();
-    // #1395 step 2 (shadow): chain-checkpoint recognition — log the verdict
-    // only, ZERO forwarding behavior change (enforcement lands in step 3).
+    // #1395 step 3 (#1421): chain-checkpoint ENFORCEMENT — first-processor-
+    // wins. A verifiable checkpoint means an upstream bili already ran the
+    // pipeline on this exact body: forward it verbatim (pipeline skipped)
+    // instead of re-running kernel/injection. Only trusted verdicts skip;
+    // stale-unmatched carriers are stripped and processed normally (this
+    // instance becomes the processor and re-stamps on egress in forward()).
     // Gated like the legacy artifact fallback (chainContentDetection) and
     // skipped when x-bili-hop is present (that path already decides).
+    let chainSkip = false;
     if (protocol && hopMarker === undefined && opts.chainContentDetection !== false && parsed !== null && typeof parsed === "object") {
         try {
             const chainCtx = evaluateChain(parsed, protocol);
             if (chainCtx.verdict !== "none") {
                 const sel = chainCtx.selected;
-                log(chainCtx.verdict === "valid" ? "info" : "warn", `[chain-shadow] inbound ${protocol} request carries ${chainCtx.candidates.length} chain checkpoint(s) — verdict=${chainCtx.verdict}${sel ? ` (v=${sel.v} processor=${sel.processor} issued-at=${sel.issuedAt} request-id=${sel.requestId})` : ""}${chainCtx.malformed > 0 ? ` malformed=${chainCtx.malformed}` : ""}; shadow mode: no forwarding decision made (#1395 step 3 enforces)`);
+                const selTxt = sel ? ` (v=${sel.v} processor=${sel.processor} issued-at=${sel.issuedAt} request-id=${sel.requestId})` : "";
+                const malTxt = chainCtx.malformed > 0 ? ` malformed=${chainCtx.malformed}` : "";
+                const head = `[chain] inbound ${protocol} request carries ${chainCtx.candidates.length} chain checkpoint(s) — verdict=${chainCtx.verdict}${selTxt}${malTxt}`;
+                switch (chainCtx.verdict) {
+                    case "valid":
+                        chainSkip = true;
+                        log("info", `${head}; first-processor-wins: forwarding verbatim, pipeline skipped (#1421)`);
+                        break;
+                    case "recent-mismatch":
+                        chainSkip = true;
+                        log("warn", `${head}; interop: forwarding verbatim + warn (well-formed fresh checkpoint, no digest match — body may have drifted since stamp) (#1421)`);
+                        break;
+                    case "stale":
+                        if (chainCtx.selectedMatched) {
+                            chainSkip = true;
+                            log("warn", `${head}; digest match but out-of-window/future timestamp — forwarding verbatim + warn (replay or clock skew) (#1421)`);
+                        } else {
+                            parsed = extractChainCarriers(parsed, protocol).stripped;
+                            log("info", `${head}; no digest match — stripping stale checkpoint(s), processing normally (#1421)`);
+                        }
+                        break;
+                    case "invalid":
+                        log("warn", `${head}; never trusted — processing normally (#1421)`);
+                        break;
+                }
             }
         } catch (err) {
-            log("debug", `[chain-shadow] evaluation failed (${String(err)}); ignoring`);
+            log("debug", `[chain] evaluation failed (${String(err)}); ignoring`);
         }
     }
     // #806: a parseable body missing the conversation field used to crash the
@@ -1458,8 +1487,9 @@ async function handle(
     }
     // #300: `hopMarker !== undefined` means an upstream bili already processed
     // this request — skip the whole pipeline (prepared stays null) so the
-    // passthrough path below forwards it verbatim.
-    if (!opts.passthrough && !routePassthrough && hopMarker === undefined && protocol && parsed && typeof parsed === "object") {
+    // passthrough path below forwards it verbatim. #1421: `chainSkip` is the
+    // content-level twin of the same decision (verifiable checkpoint present).
+    if (!opts.passthrough && !routePassthrough && !chainSkip && hopMarker === undefined && protocol && parsed && typeof parsed === "object") {
         const sessionHeader = headerValue(req, opts.sessionHeader);
         // Plugin mode (issue #1, "内外呼应"): a cooperative agent-side plugin
         // announces itself with x-bili-plugin. The proxy then treats the
@@ -1697,15 +1727,16 @@ async function handle(
                 // through to processTurn so this session establishes ownership.
                 // Decisive passthrough stays reserved for the authenticated
                 // x-bili-hop header (above + at the passthrough tail). Trade-off:
-                // a bili→bili relay that STRIPS x-bili-hop now double-processes
-                // until signed request-bound chain proof ships (#1357 Phase 2/3).
+                // a bili→bili relay that STRIPS x-bili-hop double-processes until
+                // both sides ship the request checkpoint (#1421) — once stamped,
+                // the content-level gate above catches it regardless of headers.
                 // #1218: recorded under the session id AND the client's own
                 // conversation value when they differ (same key space /acp
                 // status probes use) so the observation is visible to the client.
                 const firstVerdict = recordChainVerdict(sessionId, artifactKind, protocol);
                 if (clientConv !== undefined && clientConv !== sessionId) recordChainVerdict(clientConv, artifactKind, protocol);
                 if (firstVerdict) {
-                    log("warn", `[chain] inbound ${protocol} request carries ACP compression artifacts (${artifactKind}) but neither ${BILI_HOP_HEADER} nor local compression state for session ${sessionId}. Historical ACP content is advisory-only — continuing to processTurn so this session establishes ownership (#1357); a header-stripping bili→bili relay may now double-process until signed chain proof lands.`);
+                    log("warn", `[chain] inbound ${protocol} request carries ACP compression artifacts (${artifactKind}) but neither ${BILI_HOP_HEADER} nor local compression state for session ${sessionId}. Historical ACP content is advisory-only — continuing to processTurn so this session establishes ownership (#1357); a header-stripping bili→bili relay may now double-process until both sides ship the request checkpoint (#1421).`);
                 }
             } else if (artifactKind !== null) {
                 log("debug", `[chain] ACP artifacts (${artifactKind}) belong to this instance's own session ${sessionId} — self-produced, processing normally (#1086)`);
@@ -4565,6 +4596,22 @@ async function forward(
                 wireBody = applied.body;
                 log("info", `[${prepared?.session.id ?? "passthrough"}] [output-steering] applied (${applied.labels.join(", ")})`);
             }
+        }
+    }
+    // #1421: outbound chain checkpoint — every request THIS instance actually
+    // processed leaves with a request-level stamp, so a downstream bili applies
+    // first-processor-wins even when x-bili-hop was stripped in transit. Lands
+    // AFTER compat roles + output steering: the digest must cover the exact
+    // bytes forwarded. Best-effort — a stamp failure never breaks the forward.
+    // Passthrough/side/forge/classifier forwards carry no stamp: only a real
+    // kernel pass (processedMessages non-empty — side/classifier Prepareds are
+    // empty) claims processing, per the first-processor-wins contract.
+    if (prepared && !prepared.sidePassthrough && prepared.processedMessages.length > 0 && typeof wireBody === "string" && opts.chainContentDetection !== false) {
+        try {
+            const stamped = stampOutbound(JSON.parse(wireBody), prepared.protocol, instanceId);
+            if (stamped !== null) wireBody = JSON.stringify(stamped);
+        } catch (err) {
+            log("debug", `[${prepared.session.id}] [chain] outbound stamping failed (${String(err)}); forwarding unstamped`);
         }
     }
     // #552: wire transform shared by ALL re-send paths (compress-retry loops

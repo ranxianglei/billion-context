@@ -147,6 +147,7 @@ async function startProxy(upstream: http.Server, { compatJson, bareWire }: Start
         log: false,
         debug: false,
         passthrough: false,
+        chainContentDetection: false,
         passthroughSource: null,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
