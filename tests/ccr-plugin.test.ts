@@ -20,7 +20,7 @@ import path from "node:path";
 process.env.NODE_ENV = "test";
 process.env.BILI_PERSIST = "0";
 
-import { defaultConfig } from "acp-kernel";
+import { DEFAULT_CCR_CONFIG, defaultConfig } from "acp-kernel";
 import { startServer, type ProxyOptions } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
@@ -113,11 +113,13 @@ async function startRig(mode?: "route-scoped" | "name-divergent" | "enabled-dive
 
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
-    // "route-scoped": CCR enabled ONLY under the route block — the base config
-    // stays off, so the plugin manifest never advertises acp_retrieve (#1273
-    // review regression rig). "name-divergent"/"enabled-divergent" (#1345):
-    // base CCR on + a route-level override of a DIFFERENT field — the exact
-    // config that used to split the advertised surface from the executed one.
+    // "route-scoped": NO global ccr block, enabled ONLY under the route —
+    // plugin arming needs an explicit global enable (#1273), so the stamped
+    // production base (#1425) stays inert there while the proxy lane arms per
+    // request from the route merge (#1273 review regression rig).
+    // "name-divergent"/"enabled-divergent" (#1345): base CCR on + a route-level
+    // override of a DIFFERENT field — the exact config that used to split the
+    // advertised surface from the executed one.
     const routes = mode === "route-scoped"
         ? { [`http://127.0.0.1:${upstreamPort}`]: { compress: { ccr: { enabled: true, minToolTokens: 50 } } } }
         : mode === "name-divergent"
@@ -131,7 +133,9 @@ async function startRig(mode?: "route-scoped" | "name-divergent" | "enabled-dive
         upstream: "http://127.0.0.1",
         routes,
         modelContextLimit: 200_000,
-        kernelConfig: defaultConfig(200_000),
+        // #1425: loadOptions stamps the production base with the default-on
+        // ccr block; mirror it so manifest/arming consistency holds as in prod.
+        kernelConfig: { ...defaultConfig(200_000), ccr: { ...DEFAULT_CCR_CONFIG, enabled: true } },
         compress: mode === "route-scoped"
             ? { injectTool: true, injectNudge: false }
             : { injectTool: true, injectNudge: false, ccr: { enabled: true, minToolTokens: 50 } },
@@ -225,11 +229,11 @@ test("e2e plugin lane: CCR arms, stores+placeholderes, and acp_retrieve rides fu
     }
 });
 
-// [review #1273] Route-scoped CCR (base config off) must NOT arm the plugin
-// lane: the manifest reads only the base config (server.ts:969 builds it from
-// opts.compress.ccr), so arming from the route merge would emit placeholders
-// advertising an acp_retrieve the host never registered — silent loss. The
-// proxy lane keeps working: it injects the tool itself, per-request.
+// [review #1273 / #1425] Route-scoped CCR (NO global block) must NOT arm the
+// plugin lane: plugin arming needs an explicit global enable (#1273 — the
+// manifest may advertise acp_retrieve only as a deliberate global act), and
+// #1425's default-on applies to the proxy lane alone, which arms per request
+// from the route merge.
 test("e2e route-scoped CCR: plugin lane stays verbatim, proxy lane arms", async () => {
     const rig = await startRig("route-scoped");
     try {
@@ -240,7 +244,7 @@ test("e2e route-scoped CCR: plugin lane stays verbatim, proxy lane arms", async 
         const f1 = rig.forwards[0]!;
         assert.ok(f1.includes(BIG_TEXT), "plugin lane forwards the oversized result verbatim when CCR is route-scoped only");
         assert.ok(!f1.includes("[acp-stored"), "no stored placeholder on the plugin wire");
-        assert.equal(listSessions().filter((s) => ccrEnabled(s)).length, 0, "no session arms CCR from a route-scoped-only config on the plugin lane");
+        assert.equal(listSessions().filter((s) => ccrEnabled(s)).length, 0, "no session arms CCR from a route-scoped-only config on the plugin lane (#1273)");
 
         // Proxy lane (no plugin header, fresh conversation id): the
         // route-level merge arms CCR and the proxy injects acp_retrieve.
@@ -373,8 +377,9 @@ test("e2e #1345 enabled divergence: plugin lane stays ARMED (base governs), prox
 const DIV_URL = "https://api.example.com/v1";
 
 test("#1345 findCcrPluginDivergences: per-field report, silent when base disabled", () => {
-    // Base disabled → no plugin session can arm → nothing diverges (#1273
-    // route-scoped-only enablement is intended proxy-lane-only, no warning).
+    // Base not explicitly enabled (absent OR false) → no plugin session can
+    // arm (#1273; #1425's default-on is proxy-lane-only) → nothing diverges,
+    // no warning (route-scoped-only enablement is proxy-lane-only by design).
     assert.deepEqual(findCcrPluginDivergences({ [DIV_URL]: { compress: { ccr: { enabled: true, toolName: "x" } } } }), []);
     assert.deepEqual(findCcrPluginDivergences({ [DIV_URL]: { compress: { ccr: { enabled: true } } } }, { ccr: { enabled: false } }), []);
 

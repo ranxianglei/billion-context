@@ -232,14 +232,16 @@ export function hasCompressSettings(s: CompressSettings): boolean {
   *    stays off unless some level enables it.
   *  - `rules` → `rules = { enabled }` (kernel RuleFeatureConfig; limits stay
   *    at kernel defaults). Absent `s.rules` leaves `base.rules` untouched.
-  *  - `ccr` → `ccr` (kernel CcrConfig, acp-kernel >= 0.0.84; the kernel runs
-  *    the ccr-store node inside processTurn between prune and absorb).
-  *    Unset fields inherit DEFAULT_CCR_CONFIG. CCR is opt-in on every lane
-  *    (#1207 owner decision): absent `s.ccr` leaves `base.ccr` untouched —
-  *    the feature stays off until some level sets `enabled: true` and it has
-  *    been verified locally. Host arming (server.ts) further gates it behind
-  *    the retrieve tool channel, so plugin mode / no-channel wires stay
-  *    inert regardless.
+   *  - `ccr` → `ccr` (kernel CcrConfig, acp-kernel >= 0.0.84; the kernel runs
+   *    the ccr-store node inside processTurn between prune and absorb).
+   *    Unset fields inherit DEFAULT_CCR_CONFIG. The merged block resolves
+   *    enabled with `?? true` (#1425 owner decision, supersedes the #1207
+   *    opt-in for the PROXY lane): absent `s.ccr` leaves `base.ccr` untouched
+   *    — base carries the default-on block, so only an explicit
+   *    `enabled: false` at some level disarms proxy sessions. Plugin-mode
+   *    arming is decided separately at the server.ts stamp site (#1273:
+   *    explicit global enable required); host arming further gates everything
+   *    behind the retrieve tool channel, so no-channel wires stay inert.
    *  - `imageCompression` → `imageCompression` (kernel ImageCompressionConfig,
    *    acp-kernel >= 0.0.84; #1095 pre-compression of image blocks). Unset
    *    fields inherit DEFAULT_IMAGE_COMPRESSION_CONFIG. Absent
@@ -266,6 +268,19 @@ export function resolveAbsorbSettings(s: CompressSettings["absorb"]): AbsorbConf
     };
 }
 
+// #1425 owner decision (supersedes the #1207 opt-in for the PROXY lane): CCR is
+// ON by default there — only an EXPLICIT `ccr.enabled: false` at some level
+// disarms. Plugin-mode arming does NOT go through this resolver (#1273: the
+// stamp site requires an explicit global enable). The returned block always
+// carries an explicit boolean `enabled`: store.effectiveCcr requires one, so a
+// partial block (e.g. only `minToolTokens`) must not be silently dropped by
+// that validator.
+export function resolveCcrArming(s: CompressSettings["ccr"]): NonNullable<CompressSettings["ccr"]> | undefined {
+    if (s?.enabled === false) return undefined;
+    if (s === undefined) return { enabled: true };
+    return s.enabled ? s : { ...s, enabled: true };
+}
+
 export function applyCompressSettings(base: Config, limit: number, s: CompressSettings): ResolvedKernelConfig {
     const nudge = { ...base.nudge };
     const truncate = { ...base.truncate };
@@ -282,13 +297,15 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
     const tiers = { ...base.tiers };
     if (s.tiers !== undefined) tiers.enabled = s.tiers;
     const absorb = resolveAbsorbSettings(s.absorb);
-    // #1207 owner decision: CCR is opt-in on every lane — no default-on
-    // else-branch; an unset `s.ccr` leaves `base.ccr` untouched (off).
+    // #1425 owner decision (supersedes #1207): CCR is ON by default — an unset
+    // `s.ccr` inherits `base.ccr` (the default-on block stamped in config.ts);
+    // a present block resolves `enabled` with `?? true`, so only an explicit
+    // false disarms.
     let ccr: CcrConfig | undefined;
     if (s.ccr !== undefined) {
         const d = DEFAULT_CCR_CONFIG;
         ccr = {
-            enabled: s.ccr.enabled === true,
+            enabled: s.ccr.enabled ?? true,
             toolName: s.ccr.toolName ?? d.toolName,
             minToolTokens: s.ccr.minToolTokens ?? d.minToolTokens,
             excludeTools: s.ccr.excludeTools ?? [...d.excludeTools],
@@ -344,9 +361,10 @@ function parsePercent(v: number | string): number {
  *  context window (the caller handles the async registry lookup), this merges
  *  global → provider → model compress settings and applies them onto `base`,
  *  returning the tuned Config (or `base` unchanged when nothing is configured
- *  and the limit is unchanged — CCR is opt-in, so an unset `ccr` never forces
- *  a fresh config). This is the exact function the proxy calls for every
- *  request, extracted so the three-level cascade is testable end-to-end
+ *  and the limit is unchanged — base carries the default-on ccr block (#1425),
+ *  so the shortcut stays correct). This is the exact function the proxy calls
+ *  for every request, extracted so the three-level cascade is testable
+ *  end-to-end
  *  without spinning up the HTTP server. */
 export function resolveRequestConfig(
     base: Config,

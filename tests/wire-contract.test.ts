@@ -324,13 +324,16 @@ const LANES: Lane[] = [
     },
 ];
 
-// #1399: acp_rule is part of the default injected surface on every wire, so
-// it joins the base expectation here (opt-in lanes below no longer add it).
+// #1399/#1425: acp_rule (rules default-on) and acp_retrieve (ccr default-on)
+// are part of the zero-config injected surface on every proxy-mode wire, so
+// they join the base expectation here (the store channel works on all four
+// wires when the compress protocol is not marker; opt-in lanes below no
+// longer add either).
 const BASE_EXPECTED: Record<Wire, string[]> = {
-    anthropic: BILI_ACP_TOOLS_ANTHROPIC.map((t) => t.name),
-    "openai-chat": BILI_ACP_TOOLS_OPENAI.map((t) => t.function.name),
-    responses: BILI_ACP_TOOLS_RESPONSES.map((t) => t.name),
-    google: BILI_ACP_TOOLS_GOOGLE.map((t) => t.name),
+    anthropic: [...BILI_ACP_TOOLS_ANTHROPIC.map((t) => t.name), "acp_retrieve"],
+    "openai-chat": [...BILI_ACP_TOOLS_OPENAI.map((t) => t.function.name), "acp_retrieve"],
+    responses: [...BILI_ACP_TOOLS_RESPONSES.map((t) => t.name), "acp_retrieve"],
+    google: [...BILI_ACP_TOOLS_GOOGLE.map((t) => t.name), "acp_retrieve"],
 };
 
 function extractForwardedNames(wire: Wire, body: unknown): string[] {
@@ -353,9 +356,10 @@ interface Rig {
     close(): Promise<void>;
 }
 
-// Opt-in features arm through bili's CompressSettings namespace (`opts.compress`),
-// resolved per request by resolveCompress + applyCompressSettings — not through
-// the raw kernelConfig (server.ts stamps effectiveCcr from compressCfg.ccr only).
+// Features arm through bili's CompressSettings namespace (`opts.compress`),
+// resolved per request by resolveCompress + applyCompressSettings; CCR is on
+// by default (#1425) and loadOptions stamps the base with the default-on ccr
+// block, so the rig mirrors the production zero-config base.
 async function startRig(fakeUrl: string, model: string, compressOverrides: Record<string, unknown>): Promise<Rig> {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -365,7 +369,7 @@ async function startRig(fakeUrl: string, model: string, compressOverrides: Recor
         upstream: fakeUrl,
         routes: { [fakeUrl]: { models: { [model]: { context: 100_000 } } } },
         modelContextLimit: 100_000,
-        kernelConfig: defaultConfig(100_000),
+        kernelConfig: { ...defaultConfig(100_000), ccr: { ...K.DEFAULT_CCR_CONFIG, enabled: true } },
         compress: { injectTool: true, injectNudge: true, ...compressOverrides },
         promptCache: { routing: "auto" },
         log: false,
@@ -416,12 +420,14 @@ for (const lane of LANES) {
     });
 }
 
-test("wire-contract D: opt-in lane (absorb+rules+ccr) forwards the extended surface legally", async () => {
+test("wire-contract D: opt-in lane (absorb+rules) forwards the extended surface legally", async () => {
     const lane = LANES[0];
     const fake = await startFakeUpstream(lane.wire);
     let rig: Rig | undefined;
     try {
-        rig = await startRig(fake.url, lane.model, { absorb: { enabled: true }, rules: true, ccr: { enabled: true } });
+        // #1425: ccr rides along from the default-on base; absorb and rules
+        // are the opt-ins exercised here (rules stay default-off).
+        rig = await startRig(fake.url, lane.model, { absorb: { enabled: true }, rules: true });
         const res = await fetch(`${rig.proxyUrl}${lane.path}`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-api-key": "test", "x-acp-session": "wc-anth-optin" },
@@ -431,8 +437,11 @@ test("wire-contract D: opt-in lane (absorb+rules+ccr) forwards the extended surf
         await res.text();
         assert.equal(fake.violations.length, 0, `opt-in fake violations:\n${fake.violations.join("\n")}`);
         const fwdNames = extractForwardedNames(lane.wire, fake.requests[0].body);
-        const expected = [...BASE_EXPECTED[lane.wire], ...lane.clientToolNames, "acp_rule", "absorb", "acp_retrieve"].sort();
-        assert.deepEqual(fwdNames.sort(), expected, "opt-in lane forwards base + acp_rule (rules:true) + absorb/acp_retrieve + client tools");
+        // #1425: acp_retrieve rides in BASE_EXPECTED (ccr proxy-lane
+        // default-on); acp_rule comes from this lane's explicit `rules: true`
+        // (rules stay default-off, #1399); absorb is the other opt-in.
+        const expected = [...BASE_EXPECTED[lane.wire], ...lane.clientToolNames, "absorb", "acp_rule"].sort();
+        assert.deepEqual(fwdNames.sort(), expected, "opt-in lane forwards base (+ default-on acp_retrieve) + absorb + acp_rule + client tools");
         const fwdTools = (fake.requests[0].body as ToolShape).tools;
         const compress = (Array.isArray(fwdTools) ? fwdTools : []).find((t) => (t as ToolShape).name === "compress") as ToolShape;
         assert.ok(compress, "opt-in forwarded body carries compress");

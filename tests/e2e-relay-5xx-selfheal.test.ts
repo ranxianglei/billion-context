@@ -156,7 +156,9 @@ async function startProxy(upstreamPort: number, saves?: string[]): Promise<{ pro
         routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "claude-relay": { context: WINDOW } } } },
         modelContextLimit: WINDOW,
         kernelConfig: defaultConfig(WINDOW),
-        compress: { injectTool: true, injectNudge: true },
+        // #1425 made CCR default-on; pin it OFF — this test pins #604's window
+        // arithmetic and the extra retrieve-tool bytes would eat the margin.
+        compress: { injectTool: true, injectNudge: true, ccr: { enabled: false } },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,

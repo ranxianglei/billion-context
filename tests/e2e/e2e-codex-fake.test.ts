@@ -202,7 +202,9 @@ function turn(ctx: Ctx, prompt: string): Promise<{ code: number; last: string }>
 test("overflow: compression really happens in codex; bulk folded, sentinels retained", { skip: overflowSkipReason }, async (t) => {
 	// Window calibration for the #829-corrected estimate (input[] developer/
 	// system items now count): clean-env turn-1 estimate ≈15.3k, overhead-only
-	// floor ≈14k (pinned codex 0.147.0, hermetic cwd). 18k clears both — no
+	// floor ≈14k (pinned codex 0.147.0, hermetic cwd). #1425's default-on
+	// acp_retrieve adds ~0.2k of honest wire overhead (re-verified green).
+	// 18k clears both — no
 	// warmup fail-fast 502, preflight still engages early. 10k/12k were
 	// calibrated on the old under-counting estimate or reported tokens and
 	// 502 on the warmup turn once the system prompt counts. The 600-line

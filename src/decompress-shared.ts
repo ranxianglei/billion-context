@@ -223,7 +223,7 @@ function resolveDecompressRange(args: Record<string, unknown>, ctx: ProxyToolCtx
         if (typeof ctx.session.metadata.pluginAgent === "string") {
             return "[decompress FAILED: range restore (startId/endId) is proxy-mode only — plugin mode owns its folds natively]";
         }
-        return "[decompress FAILED: range restore (startId/endId) requires CCR — enable compress.ccr.enabled]";
+        return "[decompress FAILED: range restore (startId/endId) requires CCR — it is on by default (#1425), so check compress.ccr.enabled=false or the retrieve tool channel]";
     }
     const sb = parseBoundary(startRaw);
     const eb = parseBoundary(endRaw);

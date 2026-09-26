@@ -707,7 +707,9 @@ const CCR_FIELDS = ["enabled", "toolName", "minToolTokens", "excludeTools", "max
 /** Pure: list every provider/model ccr field that would be ignored in plugin
  *  sessions (base config governs there). Empty when base ccr is not enabled —
  *  no plugin session can arm then, so nothing diverges (#1273 keeps
- *  route-scoped-only enablement proxy-mode-only by design). */
+ *  route-scoped-only enablement proxy-mode-only by design; #1425's default-on
+ *  applies to the proxy lane only, so an ABSENT global still means no plugin
+ *  arming and still means silence here). */
 export function findCcrPluginDivergences(routes: ProviderRoutes, globalCompress?: CompressSettings): CcrOverrideDivergence[] {
     const base = globalCompress?.ccr;
     if (base?.enabled !== true) return [];
@@ -844,7 +846,14 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         proxySource,
         proxyFallback,
         modelContextLimit,
-        kernelConfig: defaultConfig(modelContextLimit),
+        // #1425 owner decision (supersedes #1207 for the PROXY lane): CCR is ON
+        // by default there — stamp the default-on block onto the base so every
+        // resolution path (including resolveRequestConfig's no-config early
+        // return) arms proxy sessions unless a level sets ccr.enabled:false.
+        // The PLUGIN lane is NOT armed by this stamp: its arming and manifest
+        // advertisement require an explicit global compress.ccr.enabled=true
+        // (#1273, enforced at the server.ts stamp site + manifest call site).
+        kernelConfig: { ...defaultConfig(modelContextLimit), ccr: { ...DEFAULT_CCR_CONFIG, enabled: true } },
         compress: {
             ...(fileConfig.compress ?? {}),
             injectTool: (env.ACP_COMPRESS_TOOL ?? (fileConfig.compress?.injectTool === false ? "0" : "1")) !== "0",
