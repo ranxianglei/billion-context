@@ -1557,7 +1557,10 @@ export const AIDER_DEFAULT_MODEL_HOSTS = [
  *  default_config_files entries over earlier ones; aider lists them
  *  cwd → git root → home): home > git root > cwd. Only top-level scalar
  *  values are parsed; anything else is ignored. */
-export function readAiderConfUrls(cwd: string, env: NodeJS.ProcessEnv = process.env): string[] {
+// The .aider.conf.yml candidates feeding config.aider.baseUrls (home > git
+// root > cwd, aider's own resolution order). Exported so the discovery mtime
+// cache watches the same set (#1411).
+export function aiderConfFiles(cwd: string, env: NodeJS.ProcessEnv = process.env): string[] {
     const home = nonEmpty(env.HOME) ? env.HOME! : os.homedir();
     const candidates = [path.join(home, ".aider.conf.yml")];
     let dir = cwd;
@@ -1571,7 +1574,11 @@ export function readAiderConfUrls(cwd: string, env: NodeJS.ProcessEnv = process.
         dir = parent;
     }
     candidates.push(path.join(cwd, ".aider.conf.yml"));
-    for (const file of candidates) {
+    return [...new Set(candidates)];
+}
+
+export function readAiderConfUrls(cwd: string, env: NodeJS.ProcessEnv = process.env): string[] {
+    for (const file of aiderConfFiles(cwd, env)) {
         let text: string;
         try {
             text = fs.readFileSync(file, "utf8");

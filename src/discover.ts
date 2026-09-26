@@ -3,7 +3,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { loadClientConfig, resolvePiHome, resolveOmpHome, resolveCodebuddyHome, resolveQoderHome, resolveTraeHome, resolveZcodeHome, zcodePersonalConfigFiles, opencodeConfigFiles, nonEmpty, QODER_DEFAULT_MODEL_HOSTS, TRAE_DEFAULT_MODEL_HOSTS, AIDER_DEFAULT_MODEL_HOSTS, OPENCODE_DEFAULT_MODEL_HOSTS, type ClientConfig } from "./client-config.js";
+import { loadClientConfig, resolvePiHome, resolveOmpHome, resolveCodebuddyHome, resolveQoderHome, resolveTraeHome, resolveZcodeHome, zcodePersonalConfigFiles, opencodeConfigFiles, aiderConfFiles, nonEmpty, QODER_DEFAULT_MODEL_HOSTS, TRAE_DEFAULT_MODEL_HOSTS, AIDER_DEFAULT_MODEL_HOSTS, OPENCODE_DEFAULT_MODEL_HOSTS, type ClientConfig } from "./client-config.js";
 
 const TTL_MS = 2000;
 
@@ -108,6 +108,7 @@ function configFilePaths(env: NodeJS.ProcessEnv): string[] {
         // extractHttpsHosts consumes, or edits go stale in the mtime cache (#1411).
         ...opencodeConfigFiles(env),
         path.join(resolveOmpHome(env), "models.yml"),
+        ...aiderConfFiles(process.cwd(), env),
     ];
 }
 

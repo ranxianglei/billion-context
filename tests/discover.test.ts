@@ -555,3 +555,22 @@ test("discoverMitmDomains: opencode.json edit invalidates cache after TTL (#1411
         assert.ok(!after.includes("v1.example.com"), `v1 gone: ${after.join(",")}`);
     });
 });
+
+test("discoverMitmDomains: .aider.conf.yml edit invalidates cache after TTL (#1411)", async () => {
+    await withTempHome(async (home, env) => {
+        const confPath = path.join(home, ".aider.conf.yml");
+        fs.writeFileSync(confPath, "openai-api-base: https://av1.example.com/v1\n");
+        const baseMtime = Math.floor(fs.statSync(confPath).mtimeMs / 1000);
+        _resetDiscoveryCacheForTest();
+        const first = discoverMitmDomains(env);
+        assert.ok(first.includes("av1.example.com"));
+
+        fs.writeFileSync(confPath, "openai-api-base: https://av2.example.com/v1\n");
+        fs.utimesSync(confPath, baseMtime + 60, baseMtime + 60);
+        await new Promise<void>((r) => setTimeout(r, 2100));
+
+        const after = discoverMitmDomains(env);
+        assert.ok(after.includes("av2.example.com"), `av2 present after rescan: ${after.join(",")}`);
+        assert.ok(!after.includes("av1.example.com"), `av1 gone: ${after.join(",")}`);
+    });
+});
