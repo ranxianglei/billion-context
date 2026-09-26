@@ -116,7 +116,7 @@ import { applyOutputSteering, applyOutputSteeringJson } from "./output-steering.
 import { bodyDumpEnabled, getUnrecognizedPathStats, isModelDiscoveryPath, logDumpFailure, logUnrecognizedPath } from "./server/observability.js";
 import { BILI_HOP_HEADER, anthropicBetaContextWindow, capRegistryWindowByStandard, expandedContextSuffixWindow, LAUNCHER_MODEL_WINDOWS, LAUNCHER_MODEL_MAX_OUTPUTS, launcherContextWindow, launcherMaxOutput, parseLauncherModelWindows, windowSourceLogged } from "./server/context-window.js";
 import { buildForwardHeaders, connectionNamedHeaders, NO_IDENTITY_MESSAGE, RESPONSE_ONLY_STRIP_HEADERS, safeSessionId, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
-import { isSideRequest, outputBudgetField, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard } from "./server/side-request.js";
+import { extractWireTexts, isAuxiliaryRequest, isSideRequest, outputBudgetField, recordAnchorView, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard } from "./server/side-request.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead, projectThinkingMass } from "./server/budget.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./server/stream-io.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./server/chain-artifacts.js";
@@ -1975,7 +1975,8 @@ async function handle(
         // the #460 render-tag strip pipes still run (response hygiene), while
         // preflight / fake-completion retry / the loop / usage sniffing are all
         // skipped. processedMessages stays empty so the loop can never engage.
-        if (!countTokens && !responsesCompact && protocol !== null && isSideRequest(parsed)) {
+        const auxiliarySide = !countTokens && !responsesCompact && protocol !== null && isAuxiliaryRequest(protocol, parsed, session);
+        if (!countTokens && !responsesCompact && protocol !== null && (isSideRequest(parsed) || auxiliarySide)) {
             // #554: the passthrough below skips EVERY input-side guard by design
             // (#388) — a full-history side request over the window is a
             // guaranteed upstream 400 (and title-gen/probe clients re-issue it,
@@ -1991,6 +1992,9 @@ async function handle(
             const armedForGuard = typeof session.stats.overflowArmTokens === "number" && session.stats.overflowArmTokens > 0 ? session.stats.overflowArmTokens : 0;
             const guard = sideRequestGuard(parsed, protocol, reqConfig.modelContextLimit, imageBillingFor(opts, route?.rewrittenUrl ?? upstreamOrigin), headroomCap, armedForGuard);
             if (guard.blocked) {
+                const bypassReason = auxiliarySide
+                    ? "auxiliary side requests (no tools, diverging from the session's anchor view) bypass compression by design (#1309)"
+                    : `side requests (max_tokens<=${SIDE_REQUEST_MAX_TOKENS}) bypass compression by design (#388)`;
                 log("warn", `[${session.id}] side request (~${guard.estimate} tokens) ≥ effective window ${guard.limit} (model=${reqModel ?? "?"}) — NOT forwarded: guaranteed upstream 400 (side requests bypass preflight by design, #388)`);
                 if (!res.headersSent && !res.writableEnded && !res.destroyed) {
                     res.writeHead(413, { "content-type": "application/json" });
@@ -1998,7 +2002,7 @@ async function handle(
                         error: {
                             type: "server_error",
                             code: "side_request_payload_too_large",
-                            message: `side request payload ~${guard.estimate} tokens reaches the effective context window ${guard.limit} (model=${reqModel ?? "unknown"}); NOT forwarded — side requests (max_tokens<=${SIDE_REQUEST_MAX_TOKENS}) bypass compression by design (#388). Shrink the conversation or raise the model's context window.`,
+                            message: `side request payload ~${guard.estimate} tokens reaches the effective context window ${guard.limit} (model=${reqModel ?? "unknown"}); NOT forwarded — ${bypassReason}. Shrink the conversation or raise the model's context window.`,
                             retryable: false,
                         },
                     }));
@@ -2006,7 +2010,9 @@ async function handle(
                 logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0);
                 return;
             }
-            log("info", `[${session.id}] side request (max_tokens<=${SIDE_REQUEST_MAX_TOKENS}) → passthrough + tag strip only, kernel state untouched`);
+            log("info", auxiliarySide
+                ? `[${session.id}] auxiliary request (${inboundMsgs} msg(s), no tools, diverges from anchor view) → passthrough + tag strip only, kernel state untouched (#1309)`
+                : `[${session.id}] side request (max_tokens<=${SIDE_REQUEST_MAX_TOKENS}) → passthrough + tag strip only, kernel state untouched`);
             const sideBody = scrubAnthropicPck(protocol, bodyBuffer, log);
             const sidePrepared: Prepared = {
                 body: sideBody,
@@ -2021,6 +2027,13 @@ async function handle(
             logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, bodyBuffer);
             await forward(req, res, opts, sideBody, sidePrepared, core, reqConfig, log, route, instanceId, affinity);
             return;
+        }
+        // #1309: this request runs the full pipeline — its texts feed the
+        // session's affinity anchor (recordAnchorView applies the min-view
+        // qualification; tiny views never bootstrap or shrink it).
+        if (!countTokens && !responsesCompact && protocol !== null) {
+            const auxTexts = extractWireTexts(protocol, parsed);
+            if (auxTexts && auxTexts.length > 0) recordAnchorView(session, auxTexts);
         }
         // #987: the window is NEVER learned from traffic — no self-heal read
         // here. Only the one-shot emergency shrink (armed on the overflow
