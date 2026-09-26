@@ -117,6 +117,8 @@ interface PersistedSession {
         imageFullCalls?: number;
         imageFullRestores?: number;
         rangeRestores?: number;
+        wholeBlockRestores?: number;
+        wholeBlockRestoresPreciseAvailable?: number;
     };
     /** Free-form escape hatch (v2+). */
     metadata?: Record<string, unknown>;
@@ -741,6 +743,11 @@ function buildSession(parsed: PersistedSession): Session {
             imageFullCalls: stats.imageFullCalls ?? 0,
             imageFullRestores: stats.imageFullRestores ?? 0,
             rangeRestores: stats.rangeRestores ?? 0,
+            // #1336: retrieval-quality counters (whole-block restores vs cheaper
+            // precise path available) — round-trip so the long-run ratio in
+            // acp_status survives restarts instead of silently resetting.
+            wholeBlockRestores: stats.wholeBlockRestores ?? 0,
+            wholeBlockRestoresPreciseAvailable: stats.wholeBlockRestoresPreciseAvailable ?? 0,
         },
         metadata: parsed.metadata ?? {},
         state: mergeState(parsed.state),
