@@ -18,6 +18,18 @@ import type { WireProtocol } from "./util.js";
 // final message literally is a well-formed tag binding its own digest, open
 // mode treats that as an explicit self-opt-out — accepted by design.
 //
+// ⚠ STEP-3 DESIGN GAP (filed as the role-alternation carrier question):
+// `insertCheckpointCarrier` appends a NEW trailing user message. On the
+// anthropic and google wires that can violate role alternation — Anthropic
+// 400s consecutive user-role messages, and the proxy itself merges trailing
+// user turns for Gemini (src/server.ts, "Gemini is strict about role
+// alternation"). Since the common request shape ends on a user turn, step 3
+// must NOT stamp with the append shape as-is on those two wires: either
+// merge the tag as an extra trailing text part (and relax the extractor to
+// accept last-part-whole-tag) or scope stamping to openai/responses wires.
+// This step-2 PR freezes the RECOGNITION contract; the stamp shape on
+// alternation-strict wires is an open design decision, not settled here.
+//
 // Verdict semantics (shadow mode logs only; step 3 maps them to behavior):
 //   valid            ≥1 known-version candidate whose digest matches and is fresh
 //   recent-mismatch  no digest match, but a well-formed FRESH checkpoint (a
@@ -53,6 +65,11 @@ export interface ChainCheckpointContext {
     candidates: ChainCheckpoint[];
     malformed: number;
     selected?: ChainCheckpoint;
+    /** Whether `selected`'s digest matched the stripped body. The `stale`
+     * verdict alone cannot distinguish match-stale (step 3: forward + warn)
+     * from no-match-stale (step 3: strip + process) — carry the bit so
+     * enforcement never has to re-derive the digest. */
+    selectedMatched?: boolean;
     verdict: ChainVerdict;
 }
 
@@ -347,12 +364,12 @@ export function evaluateChain(parsed: unknown, wire: WireProtocol, opts: ChainEv
     // outranks any fresher mismatched candidate (never trust a newer forged
     // timestamp over a verified digest).
     const matchedFresh = pickLatest(usable.filter((c) => c.match && c.time === "fresh"));
-    if (matchedFresh) return { candidates, malformed, selected: matchedFresh.cp, verdict: "valid" };
+    if (matchedFresh) return { candidates, malformed, selected: matchedFresh.cp, selectedMatched: true, verdict: "valid" };
     const matchedOther = pickLatest(usable.filter((c) => c.match));
-    if (matchedOther) return { candidates, malformed, selected: matchedOther.cp, verdict: "stale" };
+    if (matchedOther) return { candidates, malformed, selected: matchedOther.cp, selectedMatched: true, verdict: "stale" };
     const nomatchFresh = pickLatest(usable.filter((c) => !c.match && c.time === "fresh"));
-    if (nomatchFresh) return { candidates, malformed, selected: nomatchFresh.cp, verdict: "recent-mismatch" };
+    if (nomatchFresh) return { candidates, malformed, selected: nomatchFresh.cp, selectedMatched: false, verdict: "recent-mismatch" };
     const nomatchStale = pickLatest(usable.filter((c) => !c.match && c.time === "stale"));
-    if (nomatchStale) return { candidates, malformed, selected: nomatchStale.cp, verdict: "stale" };
+    if (nomatchStale) return { candidates, malformed, selected: nomatchStale.cp, selectedMatched: false, verdict: "stale" };
     return { candidates, malformed, verdict: "invalid" };
 }
