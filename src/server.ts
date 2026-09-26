@@ -103,6 +103,7 @@ import { maybeAdoptForkBlocks } from "./fork-adoption.js";
 import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "./affinity-persist.js";
 import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRuntimeInfoFor, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream, getBlindTunnelStats } from "./mitm.js";
+import { evaluateChain } from "./chain-checkpoint.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "./util.js";
 
@@ -1239,6 +1240,21 @@ async function handle(
         if (Array.isArray(p.input)) return p.input.length;
         return null;
     })();
+    // #1395 step 2 (shadow): chain-checkpoint recognition — log the verdict
+    // only, ZERO forwarding behavior change (enforcement lands in step 3).
+    // Gated like the legacy artifact fallback (chainContentDetection) and
+    // skipped when x-bili-hop is present (that path already decides).
+    if (protocol && hopMarker === undefined && opts.chainContentDetection !== false && parsed !== null && typeof parsed === "object") {
+        try {
+            const chainCtx = evaluateChain(parsed, protocol);
+            if (chainCtx.verdict !== "none") {
+                const sel = chainCtx.selected;
+                log(chainCtx.verdict === "valid" ? "info" : "warn", `[chain-shadow] inbound ${protocol} request carries ${chainCtx.candidates.length} chain checkpoint(s) — verdict=${chainCtx.verdict}${sel ? ` (v=${sel.v} processor=${sel.processor} issued-at=${sel.issuedAt} request-id=${sel.requestId})` : ""}${chainCtx.malformed > 0 ? ` malformed=${chainCtx.malformed}` : ""}; shadow mode: no forwarding decision made (#1395 step 3 enforces)`);
+            }
+        } catch (err) {
+            log("debug", `[chain-shadow] evaluation failed (${String(err)}); ignoring`);
+        }
+    }
     // #806: a parseable body missing the conversation field used to crash the
     // kernel's conversation-signal fingerprint (body.messages.find on undefined —
     // top-level arrays included) and surface as an opaque 502; #806 answered that
