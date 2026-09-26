@@ -2767,7 +2767,7 @@ async function prepareAnthropic(
         session.stats.compressCreditTokens = 0;
         if (foldCoveredBefore !== null && msgs.length >= REWRITE_MIN_INCOMING_TOTAL) {
             const gap = foldCoverage(foldCoveredBefore, msgs.map((m) => m.id));
-            if (gap) log("warn", `[${sessionId}] [acp-drift] fold coverage mismatch: ${gap.matched}/${gap.expected} covered message id(s) present in resent history — ${gap.expected - gap.matched} message(s) from the just-compressed range did not fold out of the wire (client-side content mutation invalidates content-hash refs; #1195)`);
+            if (gap) log("warn", `[${sessionId}] [acp-drift] fold coverage mismatch: ${gap.matched}/${gap.expected} covered message id(s) present in resent history — ${gap.expected - gap.matched} covered id(s) missing from resent history — mutation (content edit invalidates content-hash refs, fold silently lost) or client-side deletion/truncation (benign, message no longer on the wire); observability complement to the #1328 overflow rescue (#1195)`);
         }
         storeEffectiveAbsorb(session, loopConfig);
         storeEffectiveRules(session, config);
@@ -2972,7 +2972,7 @@ async function prepareOpenai(
         session.stats.compressCreditTokens = 0;
         if (foldCoveredBefore !== null && !isTitleGen && msgs.length >= REWRITE_MIN_INCOMING_TOTAL) {
             const gap = foldCoverage(foldCoveredBefore, msgs.map((m) => m.id));
-            if (gap) log("warn", `[${sessionId}] [acp-drift] fold coverage mismatch: ${gap.matched}/${gap.expected} covered message id(s) present in resent history — ${gap.expected - gap.matched} message(s) from the just-compressed range did not fold out of the wire (client-side content mutation invalidates content-hash refs; #1195)`);
+            if (gap) log("warn", `[${sessionId}] [acp-drift] fold coverage mismatch: ${gap.matched}/${gap.expected} covered message id(s) present in resent history — ${gap.expected - gap.matched} covered id(s) missing from resent history — mutation (content edit invalidates content-hash refs, fold silently lost) or client-side deletion/truncation (benign, message no longer on the wire); observability complement to the #1328 overflow rescue (#1195)`);
         }
         storeEffectiveAbsorb(session, loopConfig);
         storeEffectiveRules(session, config);
@@ -3209,7 +3209,7 @@ async function prepareGoogle(
         session.stats.compressCreditTokens = 0;
         if (foldCoveredBefore !== null && !isTitleGen && msgs.length >= REWRITE_MIN_INCOMING_TOTAL) {
             const gap = foldCoverage(foldCoveredBefore, msgs.map((m) => m.id));
-            if (gap) log("warn", `[${sessionId}] [acp-drift] fold coverage mismatch: ${gap.matched}/${gap.expected} covered message id(s) present in resent history — ${gap.expected - gap.matched} message(s) from the just-compressed range did not fold out of the wire (client-side content mutation invalidates content-hash refs; #1195)`);
+            if (gap) log("warn", `[${sessionId}] [acp-drift] fold coverage mismatch: ${gap.matched}/${gap.expected} covered message id(s) present in resent history — ${gap.expected - gap.matched} covered id(s) missing from resent history — mutation (content edit invalidates content-hash refs, fold silently lost) or client-side deletion/truncation (benign, message no longer on the wire); observability complement to the #1328 overflow rescue (#1195)`);
         }
         storeEffectiveAbsorb(session, loopConfig);
         storeEffectiveRules(session, config);
@@ -3455,7 +3455,7 @@ async function prepareResponses(
         session.stats.compressCreditTokens = 0;
         if (foldCoveredBefore !== null && !isCompactionTrigger && msgs.length >= REWRITE_MIN_INCOMING_TOTAL) {
             const gap = foldCoverage(foldCoveredBefore, msgs.map((m) => m.id));
-            if (gap) log("warn", `[${sessionId}] [acp-drift] fold coverage mismatch: ${gap.matched}/${gap.expected} covered message id(s) present in resent history — ${gap.expected - gap.matched} message(s) from the just-compressed range did not fold out of the wire (client-side content mutation invalidates content-hash refs; #1195)`);
+            if (gap) log("warn", `[${sessionId}] [acp-drift] fold coverage mismatch: ${gap.matched}/${gap.expected} covered message id(s) present in resent history — ${gap.expected - gap.matched} covered id(s) missing from resent history — mutation (content edit invalidates content-hash refs, fold silently lost) or client-side deletion/truncation (benign, message no longer on the wire); observability complement to the #1328 overflow rescue (#1195)`);
         }
         storeEffectiveAbsorb(session, loopConfig);
         storeEffectiveRules(session, config);
