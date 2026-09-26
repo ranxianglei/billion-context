@@ -1,9 +1,11 @@
 // #1192: dsh registered the manifest's tools verbatim, so it called acp_rule
-// even though compress.rules was never enabled — every call died with a hard
+// even though compress.rules was disabled — every call died with a hard
 // 400 "unknown tool". The manifest side (only advertise enabled opt-in tools)
 // is covered by the plugin-protocol / rules / absorb suites; this pins the
 // execution side: a known-but-disabled opt-in tool answers with a model-facing
-// explanation (ok:true), while a genuinely unknown tool still 400s.
+// explanation (ok:true), while a genuinely unknown tool still 400s. Since
+// #1399 the feature is on by default, so "disabled" here means an explicit
+// `compress.rules: false`.
 import assert from "node:assert/strict";
 import http from "node:http";
 import { beforeEach, describe, it } from "node:test";
@@ -38,12 +40,20 @@ describe("#1192: known-but-disabled opt-in tools get an explanation, not a hard 
         return { status: out.status(), json: JSON.parse(out.body()) as Record<string, unknown> };
     }
 
-    it("acp_rule with rules disabled → ok:true explanation instead of 400", async () => {
+    it("acp_rule with rules explicitly disabled → ok:true explanation instead of 400", async () => {
+        deps.config = { ...deps.config, rules: { enabled: false } };
         const r = await call("acp_rule", { rule: "verify driver unload+reload" });
         assert.equal(r.status, 200);
         assert.equal(r.json.ok, true);
         assert.match(String(r.json.result), /acp_rule is not enabled on this bili proxy \(compress\.rules\.enabled is not true\)/);
         assert.match(String(r.json.result), /nothing was recorded/);
+    });
+
+    it("acp_rule with rules unset → executes by default (#1399)", async () => {
+        const r = await call("acp_rule", { rule: "default-on rule" });
+        assert.equal(r.status, 200);
+        assert.equal(r.json.ok, true);
+        assert.match(String(r.json.result), /^Recorded rule\d+: default-on rule$/);
     });
 
     it("absorb disabled → ok:true explanation", async () => {

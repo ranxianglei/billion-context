@@ -245,7 +245,10 @@ test("wire-contract C: default manifest serves only legal base tools", () => {
     assertManifestLegal(m, "default");
     const anthNames = new Set(m.tools.anthropic.map((t) => t.name));
     for (const n of BILI_ACP_TOOLS_ANTHROPIC.map((t) => t.name)) assert.ok(anthNames.has(n), `default manifest: base tool ${n} present`);
-    for (const optIn of ["absorb", "acp_rule", "acp_retrieve"]) assert.ok(!anthNames.has(optIn), `default manifest: ${optIn} absent when disabled (#1192)`);
+    for (const optIn of ["absorb", "acp_retrieve"]) assert.ok(!anthNames.has(optIn), `default manifest: ${optIn} absent when disabled (#1192)`);
+    assert.ok(anthNames.has("acp_rule"), "default manifest: acp_rule advertised — on by default since #1399");
+    const offM = captureManifest({ ...defaultConfig(100_000), rules: { enabled: false } });
+    assert.ok(!new Set(offM.tools.anthropic.map((t) => t.name)).has("acp_rule"), "disabled manifest: acp_rule absent (#1192)");
     assertCompressFormsKept(m.tools.anthropic.find((t) => t.name === "compress") as ToolShape, "manifest-default");
 });
 
@@ -319,11 +322,13 @@ const LANES: Lane[] = [
     },
 ];
 
+// #1399: acp_rule is part of the default injected surface on every wire, so
+// it joins the base expectation here (opt-in lanes below no longer add it).
 const BASE_EXPECTED: Record<Wire, string[]> = {
-    anthropic: BILI_ACP_TOOLS_ANTHROPIC.map((t) => t.name),
-    "openai-chat": BILI_ACP_TOOLS_OPENAI.map((t) => t.function.name),
-    responses: BILI_ACP_TOOLS_RESPONSES.map((t) => t.name),
-    google: BILI_ACP_TOOLS_GOOGLE.map((t) => t.name),
+    anthropic: [...BILI_ACP_TOOLS_ANTHROPIC.map((t) => t.name), "acp_rule"],
+    "openai-chat": [...BILI_ACP_TOOLS_OPENAI.map((t) => t.function.name), "acp_rule"],
+    responses: [...BILI_ACP_TOOLS_RESPONSES.map((t) => t.name), "acp_rule"],
+    google: [...BILI_ACP_TOOLS_GOOGLE.map((t) => t.name), "acp_rule"],
 };
 
 function extractForwardedNames(wire: Wire, body: unknown): string[] {
@@ -424,8 +429,8 @@ test("wire-contract D: opt-in lane (absorb+rules+ccr) forwards the extended surf
         await res.text();
         assert.equal(fake.violations.length, 0, `opt-in fake violations:\n${fake.violations.join("\n")}`);
         const fwdNames = extractForwardedNames(lane.wire, fake.requests[0].body);
-        const expected = [...BASE_EXPECTED[lane.wire], ...lane.clientToolNames, "absorb", "acp_rule", "acp_retrieve"].sort();
-        assert.deepEqual(fwdNames.sort(), expected, "opt-in lane forwards base + absorb/acp_rule/acp_retrieve + client tools");
+        const expected = [...BASE_EXPECTED[lane.wire], ...lane.clientToolNames, "absorb", "acp_retrieve"].sort();
+        assert.deepEqual(fwdNames.sort(), expected, "opt-in lane forwards base (incl. default-on acp_rule, #1399) + absorb/acp_retrieve + client tools");
         const fwdTools = (fake.requests[0].body as ToolShape).tools;
         const compress = (Array.isArray(fwdTools) ? fwdTools : []).find((t) => (t as ToolShape).name === "compress") as ToolShape;
         assert.ok(compress, "opt-in forwarded body carries compress");

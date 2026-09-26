@@ -568,13 +568,15 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                     notify(text, "info");
                 },
             });
-            // #1251: human entry point for the persistent-rules feature — the model side
-            // already has the acp_rule tool; this command shows humans the identical list
-            // (both paths hit executeRule on the proxy) and lets a human record a rule
-            // directly by passing text. Launcher mode and native mode both load this
-            // factory (see pi-native.ts), so one registration covers both.
+            // #1251/#1399: human entry point for the persistent-rules feature — the model
+            // side already has the acp_rule tool; this command shows humans the identical
+            // list (both paths hit executeRule on the proxy) and gives humans the full
+            // operation set: record by passing text, remove one via `remove <id>`, wipe
+            // all via bare `clear` (extra words after clear are recorded, never wiped —
+            // a typo must not destroy every rule). Launcher mode and native mode both
+            // load this factory (see pi-native.ts), so one registration covers both.
             pi.registerCommand("acp-rule", {
-                description: "Persistent rules for this session (same list as the acp_rule tool). Usage: /acp-rule [text to record]",
+                description: "Persistent rules for this session (same ops as the acp_rule tool). Usage: /acp-rule [text to record] | /acp-rule remove <id> | /acp-rule clear",
                 handler: async (args, ctx) => {
                     const notify = (message: string, type?: string): void => {
                         try {
@@ -589,8 +591,22 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                         return;
                     }
                     const conversationId = sessionIdOf(ctx) ?? "unknown";
-                    const ruleText = (args ?? "").trim();
-                    const toolArgs = ruleText.length > 0 ? { rule: ruleText } : {};
+                    const raw = (args ?? "").trim();
+                    let toolArgs: Record<string, unknown>;
+                    if (raw === "") {
+                        toolArgs = {};
+                    } else if (raw === "clear") {
+                        toolArgs = { clear: true };
+                    } else if (raw === "remove" || raw.startsWith("remove ")) {
+                        const id = raw.slice("remove".length).trim();
+                        if (id === "") {
+                            notify("Usage: /acp-rule remove <rule-id> — bare /acp-rule lists the recorded ids", "warning");
+                            return;
+                        }
+                        toolArgs = { delete: id };
+                    } else {
+                        toolArgs = { rule: raw };
+                    }
                     let text: string;
                     try {
                         text = await forwardTool(proxyBase, conversationId, "acp_rule", toolArgs);

@@ -118,10 +118,11 @@ test("Codex official transport preserves OAuth headers, decodes bodies, and reba
         assert.equal(forwarded.instructions, undefined);
         assert.deepEqual(forwarded.additional_tools, requestBody.additional_tools);
         // CCR explicitly enabled in this test's compress config (#1207
-        // opt-in), so acp_retrieve joins the injected tool set.
+        // opt-in), so acp_retrieve joins the injected tool set; acp_rule is
+        // in the default surface since #1399.
         assert.deepEqual(
             forwarded.tools.map((t: { name: string }) => t.name),
-            ["shell", "compress", "decompress", "search_context", "acp_status", "acp_cache", "acp_retrieve"],
+            ["shell", "compress", "decompress", "search_context", "acp_status", "acp_cache", "acp_rule", "acp_retrieve"],
         );
 
         const session = listSessions().find((candidate) => candidate.meta.label === sessionId);

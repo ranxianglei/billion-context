@@ -1265,6 +1265,89 @@ test("/acp-rule warns with an enablement hint when the proxy reports the feature
     }
 });
 
+test("/acp-rule forwards `remove <id>` as { delete } to acp_rule (#1399)", async () => {
+    const proxy = await startRuleProxy("Removed rule1: always run tests first");
+    try {
+        const sent: Array<{ customType: string; content: string }> = [];
+        const pi = { ...makeFakePi(), sendMessage: (m: { customType: string; content: string }) => sent.push(m) };
+        createBiliPlugin()(pi as never);
+        const cmd = pi.commands.get("acp-rule")!;
+        const ctx = {
+            sessionManager: { getSessionId: () => "sess-rules-remove" },
+            model: { baseUrl: `${proxy.origin}/bili/https://api.example.com/v1` },
+            ui: { notify: (_msg: string) => {} },
+        };
+        await cmd.handler("remove rule1", ctx);
+        assert.deepEqual(proxy.calls, [{ conversationId: "sess-rules-remove", tool: "acp_rule", args: { delete: "rule1" } }], "`remove <id>` forwarded as { delete }");
+        assert.equal(sent[0]!.customType, "bili-acp-rule");
+        assert.equal(sent[0]!.content, wrapRuleReport("Removed rule1: always run tests first"));
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("/acp-rule forwards bare `clear` as { clear: true } to acp_rule (#1399)", async () => {
+    const proxy = await startRuleProxy("Cleared 2 rule(s).");
+    try {
+        const sent: Array<{ customType: string; content: string }> = [];
+        const pi = { ...makeFakePi(), sendMessage: (m: { customType: string; content: string }) => sent.push(m) };
+        createBiliPlugin()(pi as never);
+        const cmd = pi.commands.get("acp-rule")!;
+        const ctx = {
+            sessionManager: { getSessionId: () => "sess-rules-clear" },
+            model: { baseUrl: `${proxy.origin}/bili/https://api.example.com/v1` },
+            ui: { notify: (_msg: string) => {} },
+        };
+        await cmd.handler("clear", ctx);
+        assert.deepEqual(proxy.calls, [{ conversationId: "sess-rules-clear", tool: "acp_rule", args: { clear: true } }], "bare clear forwarded as { clear: true }");
+        assert.equal(sent[0]!.content, wrapRuleReport("Cleared 2 rule(s)."));
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("/acp-rule bare `remove` warns with usage instead of forwarding (#1399)", async () => {
+    const proxy = await startRuleProxy("No rules recorded.");
+    try {
+        const notes: Array<{ msg: string; type?: string }> = [];
+        const pi = makeFakePi();
+        createBiliPlugin()(pi as never);
+        const cmd = pi.commands.get("acp-rule")!;
+        const ctx = {
+            sessionManager: { getSessionId: () => "sess-rules-remove-usage" },
+            model: { baseUrl: `${proxy.origin}/bili/https://api.example.com/v1` },
+            ui: { notify: (msg: string, type?: string) => notes.push({ msg, type }) },
+        };
+        await cmd.handler("remove", ctx);
+        assert.equal(proxy.calls.length, 0, "nothing forwarded for a missing id");
+        assert.equal(notes.length, 1);
+        assert.equal(notes[0]!.type, "warning");
+        assert.match(notes[0]!.msg, /Usage: \/acp-rule remove <rule-id>/);
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("/acp-rule `clear <text>` records the text instead of wiping (#1399)", async () => {
+    const proxy = await startRuleProxy("Recorded rule3: clear all caches before deploys");
+    try {
+        const sent: Array<{ customType: string }> = [];
+        const pi = { ...makeFakePi(), sendMessage: (m: { customType: string }) => sent.push(m) };
+        createBiliPlugin()(pi as never);
+        const cmd = pi.commands.get("acp-rule")!;
+        const ctx = {
+            sessionManager: { getSessionId: () => "sess-rules-clear-words" },
+            model: { baseUrl: `${proxy.origin}/bili/https://api.example.com/v1` },
+            ui: { notify: (_msg: string) => {} },
+        };
+        await cmd.handler("clear all caches before deploys", ctx);
+        assert.deepEqual(proxy.calls, [{ conversationId: "sess-rules-clear-words", tool: "acp_rule", args: { rule: "clear all caches before deploys" } }], "extra words after clear are recorded, never wiped");
+        assert.equal(sent.length, 1);
+    } finally {
+        await proxy.close();
+    }
+});
+
 test("omp entry reports x-bili-plugin: omp without env vars", async () => {
     const proxy = await startFakeProxy();
     try {

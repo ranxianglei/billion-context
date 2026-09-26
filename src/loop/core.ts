@@ -14,7 +14,7 @@ import {
     RULE_TOOL_NAME,
 } from "../compress-tool.js";
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "../absorb.js";
-import { effectiveRulesConfig, executeRule } from "../rules-feature.js";
+import { effectiveRulesEnabled, executeRule } from "../rules-feature.js";
 import { ccrEnabled, drainPendingRetrievals, executeRetrieve, retrieveToolName } from "../store.js";
 import { IMAGE_FULL_TOOL_NAME, executeImageFull, imageCompressionEnabled, imageUsageSuffix } from "../image-compress.js";
 import { applyRanges } from "../stream.js";
@@ -184,7 +184,7 @@ export function executeProxyTool(
     if (absorb?.enabled === true && toolName === (absorb.toolName ?? ABSORB_TOOL_NAME)) {
         return executeAbsorb(args, callId, absorb, ctx);
     }
-    if (effectiveRulesConfig(ctx.session, ctx.config)?.enabled === true && toolName === RULE_TOOL_NAME) {
+    if (effectiveRulesEnabled(ctx.session, ctx.config) && toolName === RULE_TOOL_NAME) {
         return executeRule(args, ctx);
     }
     if (ccrEnabled(ctx.session) && toolName === retrieveToolName(ctx.session)) {

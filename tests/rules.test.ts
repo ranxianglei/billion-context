@@ -17,6 +17,7 @@ import { executeProxyTool, type LoopCtx } from "../src/loop/core.ts";
 import { handlePluginManifest } from "../src/plugin.ts";
 import {
     effectiveRulesConfig,
+    effectiveRulesEnabled,
     executeRule,
     rulesEnabled,
     storeEffectiveRules,
@@ -35,25 +36,27 @@ function makeRuleCtx(config?: Partial<Config>): { session: Session; ctx: RuleExe
     return { session, ctx: { config: cfg, session, log: () => {} } };
 }
 
-test("rulesEnabled respects config", () => {
-    assert.equal(rulesEnabled(defaultConfig(200000)), false);
+test("rulesEnabled defaults on (#1399); explicit false disables", () => {
+    assert.equal(rulesEnabled(defaultConfig(200000)), true);
     assert.equal(rulesEnabled({ ...defaultConfig(200000), rules: { enabled: false } }), false);
     assert.equal(rulesEnabled({ ...defaultConfig(200000), rules: { enabled: true } }), true);
 });
 
-test("isProxyToolFor: acp_rule only when effectively enabled", () => {
+test("isProxyToolFor: acp_rule on by default, off when explicitly disabled (#1399)", () => {
     const base = defaultConfig(200000);
     assert.equal(isProxyToolFor("compress", undefined, base), true);
-    assert.equal(isProxyToolFor(RULE_TOOL_NAME, undefined, base), false);
+    assert.equal(isProxyToolFor(RULE_TOOL_NAME, undefined, base), true);
 
-    const on: Config = { ...base, rules: { enabled: true } };
-    assert.equal(isProxyToolFor(RULE_TOOL_NAME, undefined, on), true);
+    const off: Config = { ...base, rules: { enabled: false } };
+    assert.equal(isProxyToolFor(RULE_TOOL_NAME, undefined, off), false);
 
     const session = makeSession();
-    storeEffectiveRules(session, on);
+    storeEffectiveRules(session, off);
     // Plugin tool API reads the per-session stored block even when the
-    // fallback (base kernel config) has the feature off.
-    assert.equal(isProxyToolFor(RULE_TOOL_NAME, session, base), true);
+    // fallback (base kernel config) has the feature on by default.
+    assert.equal(isProxyToolFor(RULE_TOOL_NAME, session, base), false);
+    storeEffectiveRules(session, { ...base, rules: { enabled: true } });
+    assert.equal(isProxyToolFor(RULE_TOOL_NAME, session, off), true);
 });
 
 test("effectiveRulesConfig: session metadata wins over fallback; absent stored block falls through", () => {
@@ -66,6 +69,19 @@ test("effectiveRulesConfig: session metadata wins over fallback; absent stored b
     storeEffectiveRules(session, defaultConfig(200000));
     assert.deepEqual(effectiveRulesConfig(session, { ...defaultConfig(200000), rules: on }), on);
     assert.equal(effectiveRulesConfig(undefined, defaultConfig(200000)), undefined);
+});
+
+test("effectiveRulesEnabled: unset → on (#1399); explicit false wins from either layer", () => {
+    const base = defaultConfig(200000);
+    assert.equal(effectiveRulesEnabled(undefined, base), true);
+    assert.equal(effectiveRulesEnabled(undefined, { ...base, rules: { enabled: false } }), false);
+    const session = makeSession();
+    storeEffectiveRules(session, base);
+    assert.equal(effectiveRulesEnabled(session, { ...base, rules: { enabled: false } }), false, "stored-unset block falls through to the disabled fallback");
+    storeEffectiveRules(session, { ...base, rules: { enabled: false } });
+    assert.equal(effectiveRulesEnabled(session, { ...base, rules: { enabled: true } }), false, "stored false beats fallback true");
+    storeEffectiveRules(session, { ...base, rules: { enabled: true } });
+    assert.equal(effectiveRulesEnabled(session, base), true, "stored true beats absent fallback");
 });
 
 test("executeRule: add records with trim, omitting rule lists", () => {
@@ -153,7 +169,7 @@ test("executeProxyTool: routes acp_rule through executeRule when enabled, unknow
     assert.equal(executeProxyTool(RULE_TOOL_NAME, { delete: "rule1" }, loopCtx), "Removed rule1: via loop");
 
     const offSession = makeSession();
-    const offCtx: LoopCtx = { core: createCore(), config: defaultConfig(200000), messages: [], session: offSession, log: () => {} };
+    const offCtx: LoopCtx = { core: createCore(), config: { ...defaultConfig(200000), rules: { enabled: false } }, messages: [], session: offSession, log: () => {} };
     assert.equal(executeProxyTool(RULE_TOOL_NAME, {}, offCtx), `[Unknown proxy tool: ${RULE_TOOL_NAME}]`);
 });
 
@@ -179,9 +195,10 @@ test("applyCompressSettings: maps settings rules onto kernel RuleFeatureConfig",
     assert.equal(absent.rules, undefined, "absent settings leave the base rules block untouched");
 });
 
-// #1192: hosts register manifest tools verbatim, so a disabled acp_rule must
-// not be advertised at all — only a rules-enabled config may list it.
-test("handlePluginManifest: acp_rule advertised on all three wires only when rules enabled", () => {
+// #1192/#1399: hosts register manifest tools verbatim, so an explicitly
+// disabled acp_rule must not be advertised at all — but since #1399 the
+// default (unset) config advertises it on all three wires.
+test("handlePluginManifest: acp_rule advertised by default, hidden when explicitly disabled", () => {
     let body = "";
     const res = { writeHead: () => {}, end: (b: string) => { body = b; } } as unknown as Parameters<typeof handlePluginManifest>[0];
     const data = (): {
@@ -191,17 +208,17 @@ test("handlePluginManifest: acp_rule advertised on all three wires only when rul
 
     handlePluginManifest(res, defaultConfig(200_000));
     let d = data();
-    assert.ok(!d.toolNames.includes(RULE_TOOL_NAME), "disabled by default → not advertised");
-    assert.ok(!d.tools.anthropic.some((t) => t.name === RULE_TOOL_NAME));
-    assert.ok(!d.tools.openai.some((t) => t.function?.name === RULE_TOOL_NAME));
-    assert.ok(!d.tools.responses.some((t) => t.name === RULE_TOOL_NAME));
-
-    handlePluginManifest(res, { ...defaultConfig(200_000), rules: { enabled: true } });
-    d = data();
-    assert.ok(d.toolNames.includes(RULE_TOOL_NAME));
+    assert.ok(d.toolNames.includes(RULE_TOOL_NAME), "on by default (#1399) → advertised");
     assert.ok(d.tools.anthropic.some((t) => t.name === RULE_TOOL_NAME), "anthropic schema present");
     assert.ok(d.tools.openai.some((t) => t.function?.name === RULE_TOOL_NAME));
     assert.ok(d.tools.responses.some((t) => t.name === RULE_TOOL_NAME));
+
+    handlePluginManifest(res, { ...defaultConfig(200_000), rules: { enabled: false } });
+    d = data();
+    assert.ok(!d.toolNames.includes(RULE_TOOL_NAME), "explicitly disabled → not advertised");
+    assert.ok(!d.tools.anthropic.some((t) => t.name === RULE_TOOL_NAME));
+    assert.ok(!d.tools.openai.some((t) => t.function?.name === RULE_TOOL_NAME));
+    assert.ok(!d.tools.responses.some((t) => t.name === RULE_TOOL_NAME));
 });
 
 test("persist round-trip: recorded rules survive save/load", () => {

@@ -317,8 +317,9 @@ export type CompressSettings = {
      *  for the life of the session; omitting the argument lists recorded
      *  rules for human review. The feature deliberately adds NO system-prompt
      *  content (all guidance rides in the tool description). Maps to kernel
-     *  `Config.rules = { enabled }`. Off unless explicitly enabled at some
-     *  level. Deepest-wins like every other scalar field. */
+     *  `Config.rules = { enabled }`. On by default since #1399 — an explicit
+     *  `false` at any level disables it. Deepest-wins like every other scalar
+     *  field. */
     rules?: boolean;
 
     /** Opt-in removal of historical image payloads, executed by the kernel's

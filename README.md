@@ -90,7 +90,7 @@ The proxy injects four context-management tools (`compress`, `decompress`, `sear
 
 An opt-in fifth tool, `absorb` (`compress.absorb.enabled: true` — see [CONFIGURATION.md](CONFIGURATION.md)), compresses **individual tool results the moment they arrive**: large results (builds, logs, greps) get a forced absorb instruction, the model distills each into a compact summary, and the original pair is hidden from the wire from the next turn on — keeping mid-session pressure lower between fold rounds (#605).
 
-An opt-in sixth tool, `acp_rule` (`compress.rules: true` — see [CONFIGURATION.md](CONFIGURATION.md)), records **persistent principle-level reminders**: a short rule recorded by the model (user-emphasized lessons, behaviors to remember, major pitfalls hit) is hard-protected from compression — the call and its result stay in context across every fold — and omitting the argument lists the recorded rules; passing `delete` with a rule id (e.g. `"rule3"`) removes one rule and `clear: true` removes all of them ([ranxianglei/billion-context-pi#433](https://github.com/ranxianglei/billion-context-pi/issues/433)).
+The sixth tool, `acp_rule` (on by default since #1399; set `compress.rules: false` to restore the previous opt-in behavior — see [CONFIGURATION.md](CONFIGURATION.md)), records **persistent principle-level reminders**: a short rule recorded by the model (user-emphasized lessons, behaviors to remember, major pitfalls hit) is hard-protected from compression — the call and its result stay in context across every fold — and omitting the argument lists the recorded rules; passing `delete` with a rule id (e.g. `"rule3"`) removes one rule and `clear: true` removes all of them ([ranxianglei/billion-context-pi#433](https://github.com/ranxianglei/billion-context-pi/issues/433)).
 
 The seventh tool, `acp_retrieve` (opt-in on every lane — set `compress.ccr.enabled: true` at any level, after local verification; plugin lanes require the explicit global `true` so the manifest advertises the tool, #1271/#1273 — see [CONFIGURATION.md](CONFIGURATION.md)), backs the **content-addressed message store** (built-in CCR, #1097/#1179): oversized tool results are **ID-referenced at arrival instead of force-distilled** — the wire keeps a byte-stable placeholder and the original goes into a per-session content-store envelope (hash-deduped), retrievable on demand via one cheap tool call. V2 makes folds lossless too: covered originals are stored when a fold lands, `decompress` restores ranges (`startId`/`endId` refs) instead of whole blocks, and `search_context` hits carry the covered `mNNNNN` refs so you can fetch exactly what you need. Lossless by default: a retrieve not made costs nothing but the call; a detail distilled away by absorb is gone for good. Scope: proxy mode, plus plugin lanes on the anthropic + openai wires when explicitly enabled (`acp_retrieve` is advertised in the plugin manifest then, #1271); responses marker/text routes and google in plugin mode stay disarmed because no request-only round-trip channel exists there (silent loss, #1097).
 
@@ -884,14 +884,16 @@ API: `bili plugin install claude` writes a model-mediated
 MCP tool and pastes the report back verbatim. codex/kimi/hermes expose no
 user-typable command seam — ask the model to call its `acp_cache` tool directly.
 
-The same seam carries `/acp-rule` (#1251) — the human entry point to the
-persistent-rules feature (identical output to the `acp_rule` tool): pi/omp
-register it natively — bare `/acp-rule` lists every recorded rule, and
-`/acp-rule <text>` records one directly (as if the model had called it). The
-wrapped transcript message is stripped from model context by content signature
-like the cache report — recorded rules reach the model every turn via the
-system-prompt injection anyway. delete/clear subcommands land with #1178;
-other lanes get it in follow-up work.
+The same seam carries `/acp-rule` (#1251/#1399) — the human entry point to
+the persistent-rules feature (identical output to the `acp_rule` tool):
+pi/omp register it natively with the tool's full operation set — bare
+`/acp-rule` lists every recorded rule, `/acp-rule <text>` records one directly
+(as if the model had called it), `/acp-rule remove <id>` deletes one, and bare
+`/acp-rule clear` wipes all recorded rules (`clear <text>` records instead of
+wiping — a typo must not destroy every rule). The wrapped transcript message
+is stripped from model context by content signature like the cache report —
+recorded rules reach the model every turn via the system-prompt injection
+anyway.
 
 ### Legacy opencode-acp sessions (#920)
 
