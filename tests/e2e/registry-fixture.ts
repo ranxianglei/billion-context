@@ -8,7 +8,7 @@ import net from "node:net";
 import fs from "node:fs";
 import path from "node:path";
 
-export interface RegistryFixture {
+interface RegistryFixture {
     /** Base URL, e.g. http://127.0.0.1:43210 */
     url: string;
     port: number;

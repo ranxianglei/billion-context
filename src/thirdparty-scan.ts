@@ -30,7 +30,7 @@ import { isLegacyBcpEntry } from "./agent/native-bootstrap.js";
 import { isCodexClient } from "./codex-compact.js";
 import { dshProfileDirs } from "./dsh-channel.js";
 
-export type ScanClient = "opencode" | "pi" | "omp" | "kimi" | "hermes" | "dsh" | "claude";
+type ScanClient = "opencode" | "pi" | "omp" | "kimi" | "hermes" | "dsh" | "claude";
 
 export interface ThirdPartyFinding {
     client: ScanClient;
@@ -40,7 +40,7 @@ export interface ThirdPartyFinding {
     knownId?: string;
 }
 
-export interface ScanResult {
+interface ScanResult {
     client: string;
     findings: ThirdPartyFinding[];
     sourcesScanned: number;
@@ -54,7 +54,7 @@ export function isDesignAbsorbed(finding: ThirdPartyFinding, pluginAgent: string
     return finding.client === "opencode" && finding.knownId === "opencode-acp" && pluginAgent === "opencode";
 }
 
-export const SCAN_CACHE_TTL_MS = 5 * 60 * 1000;
+const SCAN_CACHE_TTL_MS = 5 * 60 * 1000;
 
 // Full-word tokens only: \bcontext\b deliberately does NOT match "context7"
 // (a docs plugin), while hyphenated names ("context-compressor") do match.

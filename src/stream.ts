@@ -191,7 +191,7 @@ function currentRefsSnapshot(ctx: RewriteCtx): string {
 // #1294 P1: one-line integrity fingerprint per created/updated block — exact
 // char length plus head/tail excerpts (newlines flattened to spaces) so the
 // model can verify its summary was stored intact without decompressing.
-export function summaryFingerprintLine(blockId: string, summary: string): string {
+function summaryFingerprintLine(blockId: string, summary: string): string {
     const head = summary.slice(0, 30).replace(/\r?\n/g, " ");
     const tail = summary.slice(-100).replace(/\r?\n/g, " ");
     return ` · ${blockId} summary ${summary.length}ch · head "${head}" … tail "${tail}"`;

@@ -36,7 +36,7 @@ export function canonicalize(value: unknown): string {
     return `${JSON.stringify(value, null, 2)}\n`;
 }
 
-export interface GoldenSpec {
+interface GoldenSpec {
     readonly name: string;
     readonly layer: string;
     build(): unknown;

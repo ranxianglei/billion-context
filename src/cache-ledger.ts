@@ -42,7 +42,7 @@ interface LedgerLine {
     foldSeq: number | null;
 }
 
-export interface CacheLedger {
+interface CacheLedger {
     v: 1;
     lastBlockId: number;
     consumedFoldSeq: number;
@@ -86,7 +86,7 @@ function prefixTokensBeforeRef(session: Session, ref: string): number {
     return n;
 }
 
-export function getCacheLedger(session: Session): CacheLedger {
+function getCacheLedger(session: Session): CacheLedger {
     const meta = session.metadata ?? (session.metadata = {});
     const existing = meta[LEDGER_KEY] as CacheLedger | undefined;
     if (existing && existing.v === 1) return existing;

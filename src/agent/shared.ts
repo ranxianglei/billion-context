@@ -61,7 +61,7 @@ export function detectProxyBase(baseUrl: string | undefined): string | undefined
 // can tell which destinations the proxy will actually decrypt. Without it the
 // extension cannot distinguish "proxy will see this request" from "blind
 // tunnel — the field I inject reaches the upstream verbatim".
-export function mitmHostsFromEnv(env: NodeJS.ProcessEnv = process.env): Set<string> {
+function mitmHostsFromEnv(env: NodeJS.ProcessEnv = process.env): Set<string> {
     const out = new Set<string>();
     for (const raw of env.BILI_MITM_HOSTS?.split(",") ?? []) {
         const host = raw.trim().toLowerCase();

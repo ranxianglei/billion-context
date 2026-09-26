@@ -12,7 +12,7 @@
  *  neither imports the other just for this (they already form an import
  *  edge upstream-proxy → fetch-util; adding the reverse would be a cycle). */
 
-export type UpstreamFailureKind =
+type UpstreamFailureKind =
     /** Downstream client disconnected (external abort fired). Nothing bili
      *  did or can retry — the request is dead by definition. */
     | "client-abort"
@@ -34,7 +34,7 @@ export type UpstreamFailureKind =
     | "tls"
     | "unknown";
 
-export interface UpstreamFailCtx {
+interface UpstreamFailCtx {
     /** A proxy dispatcher is in the path — changes reset/refused attribution. */
     viaProxy?: boolean;
     /** True when the caller's EXTERNAL abort signal (client disconnect) has

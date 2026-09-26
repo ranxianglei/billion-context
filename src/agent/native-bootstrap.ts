@@ -127,7 +127,7 @@ export function singleFlight(fn: () => Promise<string | undefined>): () => Promi
 // a native entry register no waiter — awaitNativeProxyOrigin() resolves
 // undefined immediately and the session rides wire mode as before.
 
-export interface NativeOriginWaiter {
+interface NativeOriginWaiter {
     wait: () => Promise<string | undefined>;
 }
 

@@ -28,8 +28,8 @@ import type { WireProtocol } from "./util.js";
 //   invalid          malformed-looking tag(s) in carrier slots, future-dated
 //                    beyond skew only, or unknown version only → never trusted
 //   none             no checkpoint signal at all
-export const CHAIN_TAG = "bili-chain";
-export const SUPPORTED_CHECKPOINT_VERSION = 1;
+const CHAIN_TAG = "bili-chain";
+const SUPPORTED_CHECKPOINT_VERSION = 1;
 export const DEFAULT_MAX_FUTURE_SKEW_MS = 2 * 60 * 1000;
 export const DEFAULT_RECENT_CHECKPOINT_WINDOW_MS = 10 * 60 * 1000;
 // Generous parser ceiling: the generator emits ≤~200 chars (design target
@@ -49,7 +49,7 @@ export interface ChainCheckpoint {
 
 export type ChainVerdict = "none" | "valid" | "recent-mismatch" | "stale" | "invalid";
 
-export interface ChainCheckpointContext {
+interface ChainCheckpointContext {
     candidates: ChainCheckpoint[];
     malformed: number;
     selected?: ChainCheckpoint;
@@ -179,7 +179,7 @@ function trailingUserSlotsGoogle(body: Record<string, unknown>): CarrierSlot[] {
     return slots.reverse();
 }
 
-export interface ChainExtraction {
+interface ChainExtraction {
     candidates: ChainCheckpoint[];
     malformed: number;
     stripped: unknown;
@@ -307,7 +307,7 @@ export function computeCheckpointDigest(parsed: unknown, wire: WireProtocol, fie
     return sha256Of(jcsStringify(stripped));
 }
 
-export interface ChainEvaluationOptions {
+interface ChainEvaluationOptions {
     nowMs?: number;
     maxFutureSkewMs?: number;
     recentWindowMs?: number;

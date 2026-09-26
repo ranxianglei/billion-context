@@ -188,7 +188,7 @@ export function preferPromptCacheKeyIdentity<T extends ConversationIdentity>(
  * thread_id → undefined: the caller falls through to the legacy chain
  * unchanged.
  */
-export type CodexTurnIdentity = {
+type CodexTurnIdentity = {
     value: string;
     threadSource: string;
 };

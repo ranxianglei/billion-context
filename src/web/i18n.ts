@@ -1,4 +1,4 @@
-export type Locale = "zh-CN" | "en";
+type Locale = "zh-CN" | "en";
 
 export const LOCALES: readonly Locale[] = ["zh-CN", "en"];
 

@@ -7,7 +7,7 @@ export const CODEX_COMPACT_SENTINEL = "bili:acp:";
 
 const CODEX_UA_PREFIXES = ["codex_cli_rs/", "codex_exec/", "codex desktop/"];
 
-export type CodexCompactMode = "intercept" | "pass";
+type CodexCompactMode = "intercept" | "pass";
 
 // Read per-request (not cached at startup) so a running proxy can flip the
 // kill-switch without a restart.
@@ -59,7 +59,7 @@ export function stripBiliCompactionItems<T>(input: T[]): T[] {
 }
 
 // The summary text a forged blob carries (sentinel-prefixed plaintext).
-export function extractBiliSummary(item: unknown): string | undefined {
+function extractBiliSummary(item: unknown): string | undefined {
     const it = item as { encrypted_content?: unknown } | null;
     if (!it || typeof it.encrypted_content !== "string") return undefined;
     if (!it.encrypted_content.startsWith(CODEX_COMPACT_SENTINEL)) return undefined;

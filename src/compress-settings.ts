@@ -140,7 +140,7 @@ export function resolveCompressPrompts(s: CompressSettings): Prompts {
 
 let warnedUnknownPack = new Set<string>();
 
-export interface SurfaceResolution {
+interface SurfaceResolution {
     surface: PackSurface;
     /** Effective pack name — "default" when unset/invalid/unresolvable
      *  (the surface that actually serves requests). Feeds status-report
@@ -250,7 +250,7 @@ export function hasCompressSettings(s: CompressSettings): boolean {
 // built and typed here regardless of the installed kernel's Config so both
 // release windows compile identically. Older kernels ignore the extra key
 // (validateConfig does not flag unknown keys).
-export type ResolvedKernelConfig = Config & { preserveRecentTools?: string[] };
+type ResolvedKernelConfig = Config & { preserveRecentTools?: string[] };
 
 // Single source of truth for raw->resolved absorb: applyCompressSettings and the
 // plugin-lane base stamp (#1359) both go through this or they drift apart.

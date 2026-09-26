@@ -34,7 +34,7 @@ import { networkInterfaces } from "node:os";
 
 export const BILI_TUNNEL_HEADER = "x-bili-tunnel";
 
-export type IpClass = "loopback" | "linkLocal" | "private" | "public";
+type IpClass = "loopback" | "linkLocal" | "private" | "public";
 
 /** Parse a v4 quad or v6 literal (incl. ::ffff: mapped); null for names. */
 export function parseIpLiteral(s: string): string | null {
@@ -85,7 +85,7 @@ export function classifyIp(ip: string): IpClass {
 
 export type ResolveHost = (host: string) => Promise<string[]>;
 
-export const dnsResolveHost: ResolveHost = async (host) => {
+const dnsResolveHost: ResolveHost = async (host) => {
     const res = await lookup(host, { all: true, family: 0 });
     return res.map((r) => r.address);
 };
@@ -108,7 +108,7 @@ export function localMachineIps(): Set<string> {
     return localAddrCache.ips;
 }
 
-export interface TunnelCheckContext {
+interface TunnelCheckContext {
     /** Port this proxy is actually serving on (server.address()). */
     selfPort: number | undefined;
     clientLoopback: boolean;
@@ -117,7 +117,7 @@ export interface TunnelCheckContext {
     localIps?: () => Set<string>;
 }
 
-export type TunnelVerdict = { ok: true } | { ok: false; code: "self" | "linkLocal" | "privateRemote" | "unresolvable"; message: string };
+type TunnelVerdict = { ok: true } | { ok: false; code: "self" | "linkLocal" | "privateRemote" | "unresolvable"; message: string };
 
 function allowlistHit(host: string, port: number, allowlist: string[]): boolean {
     const h = host.toLowerCase();

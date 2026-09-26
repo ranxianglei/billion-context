@@ -400,7 +400,7 @@ export function executeSearchContext(
 // #841: resolve a requested session id to its compression state without
 // touching it — resident memory first (verbatim id or canonical alias), then
 // the persisted store. Never creates, reloads or marks anything dirty.
-export function resolveForeignSessionState(id: string): CompressionState | null {
+function resolveForeignSessionState(id: string): CompressionState | null {
     const resident = peekSession(id) ?? findSessionByCanonicalId(id);
     if (resident) return resident.state;
     return getStore().loadStateForSearch(id);

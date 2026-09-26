@@ -9,7 +9,7 @@ import { appendTrailingUserText } from "./wire-body.js";
 // proxy detects this shape (tool-call structure present + no real tool block)
 // and retries once with a corrective hint, bounded per turn and per session.
 
-export const FAKE_COMPLETION_HINT =
+const FAKE_COMPLETION_HINT =
     "[billion-context] Your last reply described a tool call as plain text instead of invoking it, so no tool actually ran. " +
     "To act, invoke the tool through the proper tool-calling mechanism (emit a tool_use / tool_calls / function_call block). " +
     "Do not write tool-call markup as text in your reply.";

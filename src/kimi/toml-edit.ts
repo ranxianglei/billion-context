@@ -7,10 +7,10 @@
 export const KIMI_PROVIDER = "bili";
 export const KIMI_ALIAS = "bili-kimi";
 export const KIMI_MANAGED_BEGIN = "# bili begin (managed by billion-context — `bili plugin install kimi`)";
-export const KIMI_MANAGED_END = "# bili end";
-export const KIMI_PREV_MODEL_KEY = "# bili prev-default-model";
-export const KIMI_DEFAULT_UPSTREAM = "https://api.kimi.com/coding/v1";
-export const KIMI_CODE_PROVIDER = "managed:kimi-code";
+const KIMI_MANAGED_END = "# bili end";
+const KIMI_PREV_MODEL_KEY = "# bili prev-default-model";
+const KIMI_DEFAULT_UPSTREAM = "https://api.kimi.com/coding/v1";
+const KIMI_CODE_PROVIDER = "managed:kimi-code";
 
 interface LineDoc {
     lines: string[];
@@ -112,7 +112,7 @@ export function extractBiliUpstream(baseUrl: string): string | undefined {
  *  base_url key and the next table header — the resolver owns their meaning
  *  (an `api_key` line, an `api_key_env` line, or `api_key = ""` + an
  *  `[providers.bili.oauth]` sub-table copied from the active provider). */
-export function renderKimiManagedBlock(state: KimiRouteState, prevDefaultModel: string): string {
+function renderKimiManagedBlock(state: KimiRouteState, prevDefaultModel: string): string {
     const out: string[] = [];
     out.push(KIMI_MANAGED_BEGIN);
     out.push(`# Routes ${KIMI_ALIAS} through the local bili proxy. Managed by `);
@@ -236,7 +236,7 @@ export function unrouteKimiConfig(text: string): string {
     return closeDoc(doc);
 }
 
-export type KimiRouteResolution =
+type KimiRouteResolution =
     | {
         readonly ok: true;
         readonly upstream: string;

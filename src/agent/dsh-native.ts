@@ -705,12 +705,6 @@ export function _stateTakeoverGateForTest(): ((url: string) => boolean) | undefi
     return state.takeoverGate;
 }
 
-/** Test hook (#1268): expose the armed toolsReady gate so a suite can prove
- *  it resolves on the first registration attempt (success or failure). */
-export function _stateToolsReadyForTest(): Promise<unknown> | undefined {
-    return state.toolsReady;
-}
-
 /** Test hook: expose the armed runtime-recovery seam — the interceptor's
  *  death branch drives exactly this call (the fetch patch itself is covered
  *  in native-intercept.test.ts; under NODE_TEST_CONTEXT it is not installed). */

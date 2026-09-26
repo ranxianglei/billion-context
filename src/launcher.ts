@@ -143,7 +143,7 @@ import { conflictScanEnabled, isDesignAbsorbed, scanClientPlugins } from "./thir
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
 export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "jcode", "kimi", "gemini", "iflow", "qwen", "mcode", "aider", "copilot", "amp", "goose", "pi-test"] as const;
 export type ClientName = (typeof LAUNCH_CLIENTS)[number];
-export type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "mcode" | "aider" | "copilot" | "amp" | "goose";
+type BaseClientName = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "mcode" | "aider" | "copilot" | "amp" | "goose";
 
 const HEALTH_PATH = "/__bili/health";
 const HEALTH_POLL_INTERVAL_MS = 200;
@@ -169,7 +169,7 @@ export type SpawnFn = (
     options: { detached?: boolean; stdio?: StdioOptions; env?: NodeJS.ProcessEnv; shell?: boolean; windowsVerbatimArguments?: boolean; windowsHide?: boolean },
 ) => SpawnChild;
 
-export interface LaunchOptions {
+interface LaunchOptions {
     host: string;
     port: number;
     passthrough: boolean;
@@ -203,7 +203,7 @@ export interface LaunchOptions {
     lane?: string;
 }
 
-export interface ProxyHandle {
+interface ProxyHandle {
     origin: string;
     port: number;
     child?: SpawnChild;
@@ -217,7 +217,7 @@ export interface ProxyHandle {
     refusedWatcher?: boolean;
 }
 
-export interface LauncherDeps {
+interface LauncherDeps {
     fetchImpl?: (url: string) => Promise<{ ok: boolean }>;
     fetchHealthInfo?: (origin: string) => Promise<HealthInfo | undefined>;
     /** #1335: resolves the attach-gate escape hatch. Default reads env
@@ -1804,7 +1804,7 @@ export function piPluginInstalled(piHome: string): boolean {
  *  fallback — that leaves pi with no plugin at all: no /acp, no provider
  *  rewrites, and the traffic silently bypasses the proxy (#1318). Same
  *  discipline ompPluginLoadedFrom already applies to omp config entries. */
-export function piEntryLoadable(entry: string): boolean {
+function piEntryLoadable(entry: string): boolean {
     return entry.startsWith("npm:") || fs.existsSync(entry);
 }
 
@@ -1919,7 +1919,7 @@ export function prepareDshHome(
     return overlay;
 }
 
-export interface GooseOverlay {
+interface GooseOverlay {
     root: string;
     realConfigDir: string;
     patchedFiles: Set<string>;
@@ -2409,7 +2409,7 @@ async function probeHealth(
     }
 }
 
-export interface HealthInfo {
+interface HealthInfo {
     ok: boolean;
     instanceId?: string;
     /** #1330: watchdog state from /__bili/health. Absent on pre-#1330 builds —
@@ -2523,7 +2523,7 @@ async function probeLiveInstances(
  *  watchdog field (pre-#1330 build) is unverifiable and refused by default:
  *  those are exactly the stale manually-started daemons behind #1322, and
  *  riding them pins every session to possibly-old code that outlives it. */
-export function attachGateAllows(health: HealthInfo, attachExternal: boolean): boolean {
+function attachGateAllows(health: HealthInfo, attachExternal: boolean): boolean {
     if (attachExternal) return true;
     return health.watchdog?.armed === true;
 }
@@ -2626,7 +2626,7 @@ export function findFreePort(preferred: number, host = LAUNCHER_DEFAULT_HOST): P
     });
 }
 
-export function pickEphemeralPort(host = LAUNCHER_DEFAULT_HOST): Promise<number> {
+function pickEphemeralPort(host = LAUNCHER_DEFAULT_HOST): Promise<number> {
     return new Promise((resolve, reject) => {
         const srv = net.createServer();
         srv.once("error", reject);
@@ -3049,7 +3049,7 @@ export function runClient(
 
 const PATH_EXTS = process.platform === "win32" ? [".cmd", ".bat", ".exe", ""] : [""];
 
-export function resolveOnPath(name: string, env: NodeJS.ProcessEnv): string | undefined {
+function resolveOnPath(name: string, env: NodeJS.ProcessEnv): string | undefined {
     const p = env.PATH;
     if (!p) return undefined;
     for (const dir of p.split(path.delimiter)) {
@@ -3130,7 +3130,7 @@ export function resolveClientCommand(
     return { command: resolved ?? client, prefixArgs: [] };
 }
 
-export interface RunLaunchParams {
+interface RunLaunchParams {
     client: ClientName;
     clientArgs: string[];
     mitmDomains?: string[];
@@ -3733,7 +3733,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     process.exit(code ?? 0);
 }
 
-export interface RunTestPiParams {
+interface RunTestPiParams {
     overrides: Record<string, string | undefined>;
     mitmDomains?: string[];
 }

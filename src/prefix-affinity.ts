@@ -108,7 +108,7 @@ interface ChainEntry {
  *  restarts so an anonymous replay reattaches its session instead of
  *  forking a fresh one with zero compression state (the #351 failure mode:
  *  a 458K-token history resent raw because the affinity was in-memory). */
-export interface AffinitySnapshotEntry {
+interface AffinitySnapshotEntry {
     sessionId: string;
     depth: number;
     tailHash: string;

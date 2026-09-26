@@ -44,7 +44,7 @@ export function storeEffectiveImageCompression(session: Session, imageCompressio
 }
 
 /** Read back the policy stamped by {@link storeEffectiveImageCompression}. */
-export function effectiveImageCompression(session: Session | undefined): ImageCompressionSettings | undefined {
+function effectiveImageCompression(session: Session | undefined): ImageCompressionSettings | undefined {
     const meta = session?.metadata[EFFECTIVE_IMAGE_COMPRESSION_KEY];
     if (meta && typeof meta === "object" && typeof (meta as ImageCompressionSettings).enabled === "boolean") {
         return meta as ImageCompressionSettings;

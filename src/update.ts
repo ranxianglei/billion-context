@@ -228,7 +228,7 @@ export async function isGitWorkingTree(dir: string): Promise<boolean> {
     }
 }
 
-export interface HostManagedInstall {
+interface HostManagedInstall {
     /** Who owns and updates this copy: "pnpm", "pi", "opencode", "dsh". */
     owner: string;
     /** User-facing instruction for updating this copy through its owner. */
@@ -976,10 +976,3 @@ export function startAutoUpdate(opts: UpdateOptions): void {
     timer.unref?.();
 }
 
-/** Stop the periodic check loop (for tests / clean shutdown). */
-export function stopAutoUpdate(): void {
-    if (timer) {
-        clearInterval(timer);
-        timer = undefined;
-    }
-}

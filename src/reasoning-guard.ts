@@ -56,7 +56,7 @@ interface ResolvedGuard {
 
 type Usage = Record<string, unknown>;
 
-export function resolveGuardConfig(cfg: ReasoningGuardConfig | undefined): ResolvedGuard {
+function resolveGuardConfig(cfg: ReasoningGuardConfig | undefined): ResolvedGuard {
     const c = cfg ?? {};
     return {
         maxContinue: numOr(c.maxContinue, 3),
@@ -212,7 +212,7 @@ export function nextRoundBody(baseBody: Record<string, unknown>, inputItems: unk
     return body;
 }
 
-export interface GuardParams {
+interface GuardParams {
     firstResponse: Response;
     clearFirstTimer: () => void;
     upstreamUrl: string;

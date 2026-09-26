@@ -48,7 +48,7 @@ export function _resetCertRejectionWarningForTest(): void {
 const blindTunnelCounts = new Map<string, number>();
 const warnedBlindTunnels = new Set<string>();
 
-export interface BlindTunnelStats {
+interface BlindTunnelStats {
     total: number;
     hosts: Record<string, number>;
 }

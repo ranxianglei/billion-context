@@ -151,7 +151,7 @@ function refreshWindows(ctx: V2PluginContext, state: V2State): void {
     })();
 }
 
-export interface OpencodeV2SetupOptions {
+interface OpencodeV2SetupOptions {
     /** Native mode only: called for EVERY outgoing provider request before
      *  stamping. Owns proxy discovery and URL rewriting to the self-spawned
      *  proxy (idempotent on already-routed URLs) and sets state.proxyBase

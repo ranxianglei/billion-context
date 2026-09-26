@@ -248,7 +248,7 @@ export function replayMaxAttempts(): number {
 
 /** Base backoff delay in ms; overridable via BILI_REPLAY_RETRY_BASE_MS
  *  (0 disables the delay). Read on each call so tests can tune it live. */
-export function replayBaseDelayMs(): number {
+function replayBaseDelayMs(): number {
     const raw = Number(process.env.BILI_REPLAY_RETRY_BASE_MS);
     return Number.isFinite(raw) && raw >= 0 ? raw : 1500;
 }
@@ -285,7 +285,7 @@ export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
     });
 }
 
-export interface ReplayRetryInfo {
+interface ReplayRetryInfo {
     attempt: number;
     status: number;
     detail: string;
