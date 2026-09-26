@@ -24,21 +24,31 @@ jobs:
 
             - run: npm run build
 
-            - name: Publish to npm with PR tag
+            - name: Publish to npm with rolling pr tag
               # Repository secrets (NPM_TOKEN) are not available to workflows
               # triggered by fork PRs — publishing would fail with ENEEDAUTH (#670).
               if: github.event.pull_request.head.repo.full_name == github.repository
+              id: publish
               run: |
                   PR_NUMBER="${{ github.event.pull_request.number }}"
                   RUN_NUMBER="${{ github.run_number }}"
-                  # opencode-style temp version: 0.0.0 base never collides with
-                  # real releases, sorts below every release, and can never be
-                  # resolved by a semver range — pr-* builds are tag-addressed only.
-                  PR_VERSION="0.0.0-pr.${PR_NUMBER}.${RUN_NUMBER}"
+                  RUN_ATTEMPT="${{ github.run_attempt }}"
+                  # Monotonic temp version (#1385): the 0.0.<run_number> base never
+                  # collides with real releases (which stay >= 0.1.0, enforced by the
+                  # release drift guards), sorts below every release, and the -pr
+                  # prerelease suffix keeps it unresolvable by any semver range —
+                  # builds are addressed by their full version string. run_number is
+                  # repo-wide unique and monotonic (gaps OK); -a<attempt> makes a
+                  # rerun of one run publish a fresh version instead of E409.
+                  PR_VERSION="0.0.${RUN_NUMBER}-pr.${PR_NUMBER}.${GITHUB_SHA:0:7}"
+                  if [ "$RUN_ATTEMPT" != "1" ]; then
+                      PR_VERSION="${PR_VERSION}-a${RUN_ATTEMPT}"
+                  fi
 
-                  echo "Publishing version $PR_VERSION with tag pr-${PR_NUMBER}"
+                  echo "Publishing version $PR_VERSION with rolling tag pr"
                   npm version "$PR_VERSION" --no-git-tag-version
-                  npm publish --tag "pr-${PR_NUMBER}" --access public --ignore-scripts
+                  npm publish --tag pr --access public --ignore-scripts
+                  echo "version=${PR_VERSION}" >> "$GITHUB_OUTPUT"
               env:
                   NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
@@ -62,6 +72,8 @@ jobs:
 
             - name: Summarize install instructions and comment on same-repository PR
               uses: actions/github-script@v7
+              env:
+                  PUBLISHED_VERSION: ${{ steps.publish.outputs.version }}
               with:
                   script: |
                       const prNumber = context.payload.pull_request.number;
@@ -69,6 +81,8 @@ jobs:
                       const branch = context.payload.pull_request.head.ref;
                       const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
                       const isFork = context.payload.pull_request.head.repo.full_name !== context.payload.repository.full_name;
+                      const publishedVersion = process.env.PUBLISHED_VERSION || '';
+                      const showNpmOption = !isFork && publishedVersion !== '';
 
                       const body = [
                           '## 📦 Built Package Artifact',
@@ -76,18 +90,19 @@ jobs:
                           `**Branch:** \`${branch}\` (${sha})`,
                           '',
                           ...(isFork ? [
-                              '> Fork PR: the npm PR-tag publish is skipped (repository secrets are not shared with fork workflows).',
+                              '> Fork PR: the npm publish is skipped (repository secrets are not shared with fork workflows).',
                               '',
-                          ] : [
-                          '### Option A — Install from npm PR tag (recommended)',
+                          ] : []),
+                          ...(showNpmOption ? [
+                          '### Option A — Install this exact build (recommended)',
                           '',
                           '```bash',
-                          'npm install -g billion-context@pr-' + prNumber,
+                          'npm install -g billion-context@' + publishedVersion,
                           '```',
                           '',
-                          'Each push to this PR publishes a new version under the `pr-' + prNumber + '` npm tag.',
+                          'This exact version is immutable and reproducible. The rolling `pr` tag tracks the newest test build across all PRs.',
                           '',
-                          ]),
+                          ] : []),
                           ...(isFork ? ['### Install from artifact'] : ['### Option B — Download artifact']),
                           '',
                           `1. Download the artifact from the [Actions run](${runUrl})`,
