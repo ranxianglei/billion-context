@@ -25,7 +25,7 @@ JSON 对象，不是 SSE）。
 | WC-1 | `finish` 与 `error` 事件本身就是流终止符。没有 `[DONE]` sentinel、没有 SSE framing、终止事件之后没有任何字节。 | loop 恰好发出一个终止帧（`finish` 或 `error`）后停止。只有当流在终止事件送达**之前**中断时，`emitUpstreamTruncation` 才合成一行 `upstream_stream_truncated` error；已送达则什么都不写（`finished=true`）。 |
 | WC-2 | rewrap 绝不允许在转发中途丢内容。 | codec 不认识的角色（例如 compat-roles 改写目标）降级为 `user` 文本消息，而不是丢弃。 |
 | WC-3 | 上游可能发出 bili 不认识的行/事件（未来改版风险）。 | 不可解码的行、未知事件类型、畸形事件都逐字节透传 —— 且仅在第一轮（bili 自己的注入内容之前），避免把上游内容与注入混淆。绝不丢弃、绝不改写。 |
-| WC-4 | tool-call `arguments` 是用户意图（#1039 不变量），必须语义保真地往返。 | unwrap：`arguments` 字符串 → JSON parse → `input` 对象（畸形 → `{}`）。rewrap：`input` 对象 → `JSON.stringify` → `arguments`。bili 自己的代理工具（`compress`、`decompress`、`search_context`、`acp_status`、`bili_*`）在 proxy 模式下是临时的 —— 服务端执行，绝不转发给客户端；真实 tool call 从上游原始事件行逐字回放。 |
+| WC-4 | tool-call `arguments` 是用户意图（#1039 不变量），必须语义保真地往返。 | unwrap：`input` 对象 → `JSON.stringify` → `arguments`（非对象 `input` 拒绝整个 body → verbatim relay）。rewrap：`arguments` 字符串 → JSON parse → `input` 对象（畸形 → `{}`）。bili 自己的代理工具（`compress`、`decompress`、`search_context`、`acp_status`、`bili_*`）在 proxy 模式下是临时的 —— 服务端执行，绝不转发给客户端；真实 tool call 从上游原始事件行逐字回放。 |
 | WC-5 | 该 wire 没有 visibility marker 的专用通道。 | 注入的 marker 作为 prose 搭载在 `text-delta` 里。host TUI 是否将其隐形渲染属于 host 侧策略（renderTags），不是 wire 关注点。 |
 | WC-6 | v1 仅限流式：provider 硬编码 `params.stream: true`，裸 JSONL 响应 codec 以此为前提。 | unwrap 要求 `params.stream === true`；否则不可转换 → 原始字节原样 relay + 一次性告警。 |
 
