@@ -679,8 +679,8 @@ Full command surface (`bili --help` prints an abridged version). Precedence ever
 | `bili pi-test [opts --] [args]` | Like `bili pi`, but adds `--no-extensions` (clean-room test — the proxy owns compression) |
 | `bili codex [opts --] [args]` | Proxy + **codex** |
 | `bili claude [opts --] [args]` | Proxy + **claude** (Claude Code CLI) |
-| `bili omp [opts --] [args]` | Proxy + **omp** (pi-based) |
-| `bili opencode [opts --] [args]` | Proxy + **opencode** |
+| `bili omp [opts --] [args]` | Proxy + **omp** (pi-based) — opencode zen models ride the default `opencode.ai` MITM whitelist (#1405) |
+| `bili opencode [opts --] [args]` | Proxy + **opencode** — built-in zen gateway (`opencode.ai`) cert-MITM'd by default (#1405) |
 | `bili hermes [opts --] [args]` | Proxy + **hermes-agent** (`/bili/` rewrite) |
 | `bili dsh [opts --] [args]` | Proxy + **deepseek-harness** (non-loopback upstreams via proxy envs, loopback via `/bili/` rewrite — #535; args like `--profile web "task"` pass through) |
 | `bili codebuddy [opts --] [args]` | Proxy + **codebuddy** (Tencent CodeBuddy Code CLI) — `CODEBUDDY_BASE_URL` `/bili/` rewrite, OpenAI chat-completions wire; budget via `CODEBUDDY_AUTO_COMPACT_WINDOW` (#640) |
@@ -797,7 +797,7 @@ Supported MITM clients:
 
 > **ZCode native mode (#1145):** ZCode is the only client in this list that also has a **native plugin mode** — `bili plugin install zcode` routes model traffic through the provider store (`~/.zcode/v2/config.json`, or `provider_config.json` on v3.14+) and needs no GUI proxy/CA setup at all. Native mode does not touch the MITM surface: if you run both, keep the GUI proxy settings (and the `"mitm://zcode.z.ai": { "passthrough": true }` route, #661) for login traffic. Full mechanics: README's *ZCode* section.
 
-MITM is scoped to a **whitelist** of model hosts (`open.bigmodel.cn`, `api.anthropic.com`, `api.openai.com`, `chatgpt.com`). All other HTTPS hosts are blind-tunnelled — billion-context never decrypts non-model traffic.
+MITM is scoped to a **whitelist** of model hosts (`open.bigmodel.cn`, `api.anthropic.com`, `api.openai.com`, `chatgpt.com`), plus per-lane stock-gateway defaults that discovery auto-seeds where a lane's config exists (e.g. `opencode.ai` — opencode's built-in zen gateway from `opencode auth login`, #1405). All other HTTPS hosts are blind-tunnelled — billion-context never decrypts non-model traffic.
 
 > **CONNECT-only clients (`http.proxy`):** many IDE-class clients (CodeBuddy, Cursor, Windsurf, …) expose no model base-URL setting — they route all traffic through an HTTP proxy via `CONNECT`. Such a client is only decrypted when its model host is whitelisted above (or discovered/auto-whitelisted by a launcher); otherwise its tunnels are **blind**: no error, but also **no compression**, because billion-context never sees the cleartext. This misconfiguration is surfaced explicitly (#897): the first blind tunnel per host logs a one-time `BLIND TUNNEL WARNING` with the fix steps; `GET /__bili/health` and `/__bili/stats` report `blindTunnels` (count + exact target hosts, loopback-only); and `acp_status` gains an `UNDECRYPTED TRAFFIC (instance-level)` section while such tunnels exist. Fix: add the client's model domain to `"mitm".domains` (or `BILI_MITM_DOMAINS`), restart, and trust the root CA per the steps below. Note proxy logs mask non-public target hosts by default (`<private-host>`, #255) — set `BILI_LOG_MASK_HOSTS=0` to see them verbatim in your local log.
 

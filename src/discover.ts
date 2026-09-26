@@ -3,7 +3,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { loadClientConfig, resolvePiHome, resolveCodebuddyHome, resolveQoderHome, resolveTraeHome, resolveZcodeHome, zcodePersonalConfigFiles, nonEmpty, QODER_DEFAULT_MODEL_HOSTS, TRAE_DEFAULT_MODEL_HOSTS, AIDER_DEFAULT_MODEL_HOSTS, type ClientConfig } from "./client-config.js";
+import { loadClientConfig, resolvePiHome, resolveCodebuddyHome, resolveQoderHome, resolveTraeHome, resolveZcodeHome, zcodePersonalConfigFiles, nonEmpty, QODER_DEFAULT_MODEL_HOSTS, TRAE_DEFAULT_MODEL_HOSTS, AIDER_DEFAULT_MODEL_HOSTS, OPENCODE_DEFAULT_MODEL_HOSTS, type ClientConfig } from "./client-config.js";
 
 const TTL_MS = 2000;
 
@@ -68,6 +68,14 @@ export function extractHttpsHosts(config: ClientConfig): string[] {
         } else {
             for (const h of AIDER_DEFAULT_MODEL_HOSTS) push(`https://${h}`);
         }
+    }
+    if (config.opencode || config.omp) {
+        // #1405: opencode's built-in zen gateway has no config file to
+        // discover (auth-login users get their baseURL from the models.dev
+        // catalog). Seeded for both pi-family lanes — omp runs zen models too
+        // — and coexists with explicit provider base URLs (a user can mix
+        // custom providers with zen models in one setup).
+        for (const h of OPENCODE_DEFAULT_MODEL_HOSTS) push(`https://${h}`);
     }
     return out;
 }

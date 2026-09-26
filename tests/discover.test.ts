@@ -17,6 +17,7 @@ import {
     zcodeDataRoot,
     zcodeStoreFileFor,
     QODER_DEFAULT_MODEL_HOSTS,
+    OPENCODE_DEFAULT_MODEL_HOSTS,
     type ClientConfig,
 } from "../src/client-config.ts";
 
@@ -310,6 +311,18 @@ test("extractHttpsHosts: aider → default hosts when undeclared; declared https
     );
 });
 
+test("extractHttpsHosts: opencode/omp → zen gateway default host, coexists with other lanes (#1405)", () => {
+    assert.deepEqual(extractHttpsHosts({ opencode: {} }), OPENCODE_DEFAULT_MODEL_HOSTS);
+    assert.deepEqual(extractHttpsHosts({ omp: {} }), OPENCODE_DEFAULT_MODEL_HOSTS);
+    assert.deepEqual(extractHttpsHosts({ opencode: {}, omp: {} }), OPENCODE_DEFAULT_MODEL_HOSTS);
+    const mixed = extractHttpsHosts({
+        opencode: { providers: { custom: { baseURL: "https://custom.example.com/v1" } } },
+        claude: { anthropicBaseUrl: "https://relay.example.com" },
+    });
+    assert.ok(mixed.includes("opencode.ai"), `zen host present: ${mixed.join(",")}`);
+    assert.ok(mixed.includes("relay.example.com"), `coexists with other lanes: ${mixed.join(",")}`);
+});
+
 async function withTempHome<T>(fn: (home: string, env: NodeJS.ProcessEnv) => Promise<T>): Promise<T> {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "bili-disc-"));
     const savedHome = process.env.HOME;
@@ -351,6 +364,15 @@ test("discoverMitmDomains: returns union of https hosts from client configs", as
         const domains = discoverMitmDomains(env);
         assert.ok(domains.includes("open.bigmodel.cn"), `zcode host present: ${domains.join(",")}`);
         assert.ok(domains.includes("api.openai.com"), `codex host present: ${domains.join(",")}`);
+        return Promise.resolve();
+    });
+});
+
+test("discoverMitmDomains: seeds opencode zen gateway host even with no client configs (#1405)", async () => {
+    await withTempHome((_home, env) => {
+        _resetDiscoveryCacheForTest();
+        const domains = discoverMitmDomains(env);
+        assert.ok(domains.includes("opencode.ai"), `zen gateway host present: ${domains.join(",")}`);
         return Promise.resolve();
     });
 });

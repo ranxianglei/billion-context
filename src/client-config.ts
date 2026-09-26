@@ -89,6 +89,13 @@ export interface OpencodeConfig {
     providers: Record<string, OpencodeProvider>;
 }
 
+/** opencode's built-in "zen" gateway (`opencode auth login`): the baseURL
+ *  (`https://opencode.ai/zen/v1/messages`) comes from the models.dev catalog,
+ *  not from any local config file, so discovery cannot see it — seed it like
+ *  the other stock model gateways so `bili omp` / `bili opencode` cert-MITM
+ *  zen traffic instead of blind-tunneling it (#1405). */
+export const OPENCODE_DEFAULT_MODEL_HOSTS = ["opencode.ai"];
+
 export interface HermesProvider {
     api?: string;
 }
