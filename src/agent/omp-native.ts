@@ -20,7 +20,8 @@
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
 import { createBiliPlugin } from "./pi.js";
 import { markNativeHost, nativeBootstrapGate, nativeProxyScriptPath, singleFlight } from "./native-bootstrap.js";
-import { installNativeFetchIntercept, type NativeInterceptState } from "./native-intercept.js";
+import { installNativeFetchIntercept, setDeclaredModelEndpoints, type NativeInterceptState } from "./native-intercept.js";
+import { loadDeclaredModelEndpoints } from "../model-endpoints.js";
 
 /** Decides whether the native bootstrap should run in this process. */
 export function shouldBootstrapNativeOmp(env: NodeJS.ProcessEnv): boolean {
@@ -66,6 +67,9 @@ if (process.env.NODE_TEST_CONTEXT === undefined && nativeActive) {
         delete process.env.BILLION_CONTEXT_PROXY;
     };
     state.ready = start();
+    // #1295: declared custom-wire endpoints — same config source as the proxy;
+    // takes effect on the next host start (config is read once at arm time).
+    void loadDeclaredModelEndpoints().then(setDeclaredModelEndpoints);
     installNativeFetchIntercept(state);
 }
 

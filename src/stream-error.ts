@@ -19,12 +19,15 @@ import type http from "node:http";
  *  - google:    an in-stream `{"error":{code,message,status}}` frame — Gemini's
  *               own error channel, which its SDK throws on; the stream then
  *               ends (there is no separate terminal byte to synthesize).
+ *  - commandcode: a bare-JSONL `{"type":"error",error,message}` line — the
+ *               CLI wire's own error event, which dsh's handleCliEvent turns
+ *               into a thrown LlmError; the stream then ends.
  *
  * Best-effort: if writing the error itself throws (client already gone), we
  * still attempt res.end(). Never throws.
  */
 
-type Protocol = "anthropic" | "openai" | "responses" | "google";
+type Protocol = "anthropic" | "openai" | "responses" | "google" | "commandcode";
 
 function safeWrite(res: http.ServerResponse, chunk: string): void {
     try {
@@ -61,6 +64,8 @@ export function emitStreamError(res: http.ServerResponse, protocol: Protocol, me
             // Gemini's error object is `{code: number, message, status}` — a
             // numeric code + gRPC-style status, no free-form `type`.
             safeWrite(res, `data: ${JSON.stringify({ error: { code: 500, message: visible, status: "INTERNAL" } })}\n\n`);
+        } else if (protocol === "commandcode") {
+            safeWrite(res, `${JSON.stringify({ type: "error", error: "acp_proxy_error", message: visible })}\n`);
         } else {
             // anthropic
             safeWrite(res, `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", delta: { type: "text_delta", text: visible } })}\n\n`);
@@ -122,6 +127,10 @@ export function emitUpstreamTruncation(res: http.ServerResponse, protocol: Proto
             // object would read as a second answer. Only the mid-flight cut
             // needs the error frame (503/UNAVAILABLE — an upstream-cut stream).
             if (!finished) safeWrite(res, `data: ${JSON.stringify({ error: { code: 503, message, status: "UNAVAILABLE" } })}\n\n`);
+        } else if (protocol === "commandcode") {
+            // The finish event IS this wire's terminator: when delivered there
+            // is nothing to synthesize; only a mid-flight cut gets an error line.
+            if (!finished) safeWrite(res, `${JSON.stringify({ type: "error", error: "upstream_stream_truncated", message })}\n`);
         } else {
             if (finished) {
                 safeWrite(res, `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`);
@@ -151,6 +160,9 @@ export function emitUpstreamTruncation(res: http.ServerResponse, protocol: Proto
  *  - google:    an `{"error":{code,message,status}}` frame; the retryability
  *               survives as the numeric-code/status pair (503 UNAVAILABLE vs
  *               500 INTERNAL), Gemini having no free-form `type` field.
+ *  - commandcode: a bare-JSONL error line; the CLI wire has no
+ *               stream-level retryability channel (its HTTP layer owns
+ *               retries), so only code+message survive.
  * Never throws.
  */
 export function emitPreflightError(res: http.ServerResponse, protocol: Protocol, error: { message: string; retryable: boolean }, log?: (msg: string) => void): void {
@@ -163,6 +175,8 @@ export function emitPreflightError(res: http.ServerResponse, protocol: Protocol,
             safeWrite(res, `event: error\ndata: ${JSON.stringify({ type: "error", code: err.code, message: err.message })}\n\n`);
         } else if (protocol === "google") {
             safeWrite(res, `data: ${JSON.stringify({ error: { code: error.retryable ? 503 : 500, message: error.message, status: error.retryable ? "UNAVAILABLE" : "INTERNAL" } })}\n\n`);
+        } else if (protocol === "commandcode") {
+            safeWrite(res, `${JSON.stringify({ type: "error", error: err.code, message: err.message })}\n`);
         } else {
             safeWrite(res, `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "server_error", code: err.code, message: err.message } })}\n\n`);
         }

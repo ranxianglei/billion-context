@@ -19,7 +19,8 @@
 import { LAUNCHER_DEFAULT_HOST, ensureProxyRunning } from "../launcher.js";
 import { createAcpCommandHooks } from "./opencode-acp-command.js";
 import { nativeProxyScriptPath, singleFlight } from "./native-bootstrap.js";
-import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, replaceRequestTarget, routedBiliModelUrl, type NativeInterceptState } from "./native-intercept.js";
+import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, replaceRequestTarget, routedBiliModelUrl, setDeclaredModelEndpoints, type NativeInterceptState } from "./native-intercept.js";
+import { loadDeclaredModelEndpoints } from "../model-endpoints.js";
 import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2State } from "./opencode-v2.js";
 import { fetchProxyVersion } from "./shared.js";
 
@@ -89,6 +90,10 @@ const intercept: NativeInterceptState | undefined = proxyBase === "" ? undefined
         delete process.env.BILLION_CONTEXT_PROXY;
     },
 };
+
+// #1295: declared custom-wire endpoints — same config source as the proxy;
+// takes effect on the next host start (config is read once at load time).
+if (intercept !== undefined) void loadDeclaredModelEndpoints().then(setDeclaredModelEndpoints);
 
 /** Re-probe the attached origin first: a transient blip must not migrate the
  *  session to a fresh proxy — restore the same origin when it is back. Only a

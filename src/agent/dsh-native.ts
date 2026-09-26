@@ -37,7 +37,8 @@ import path from "node:path";
 import { defaultLogFile } from "../paths.js";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
-import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, type NativeInterceptState } from "./native-intercept.js";
+import { getDeclaredModelEndpoints, installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, setDeclaredModelEndpoints, type NativeInterceptState } from "./native-intercept.js";
+import { matchModelEndpoint, loadDeclaredModelEndpoints } from "../model-endpoints.js";
 import { fetchManifest, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
 
 export const name = "bili-native";
@@ -502,6 +503,11 @@ export function apply(ctx: PluginContext): void {
     const plan = planNativeDsh(process.env);
     if (plan.mode === "off") return;
 
+    // #1295: declared custom-wire endpoints — the SAME config source the proxy
+    // classifier reads. Loaded best-effort into this host process; a config
+    // change takes effect on the next host start.
+    void loadDeclaredModelEndpoints().then(setDeclaredModelEndpoints);
+
     if (plan.mode === "attach") {
         const attachOrigin = plan.attachOrigin;
         state.attach = true;
@@ -562,6 +568,12 @@ export function apply(ctx: PluginContext): void {
     // exactly how the reported zero-traffic case stayed invisible.
     const gateRefusals = new Map<string, { state: string; count: number }>();
     state.takeoverGate = (url) => {
+        // #1295: an operator-declared endpoint is explicitly "this URL IS my
+        // model API" — declaration outranks heuristic attribution (a provider
+        // plugin's LLM call may run outside dsh's ALS initiator scope). The
+        // proxy-side body disambiguation still guards against same-path
+        // non-conversation payloads being misrouted.
+        if (matchModelEndpoint(getDeclaredModelEndpoints(), url) !== undefined) return true;
         const attr = attributionOf(ctx);
         if (attr.state === "ok") return true;
         let key: string;
@@ -610,7 +622,7 @@ export function apply(ctx: PluginContext): void {
         if (unroutedEndpoints.has(key)) return;
         if (unroutedEndpoints.size >= 256) return;
         unroutedEndpoints.add(key);
-        const line = `bili-native-dsh: request sent DIRECT (uncompressed) — ${key} is not a recognized model endpoint, so bili did not route it through the proxy. bili only compresses known protocol paths (/chat/completions, /v1/messages, /responses, …); a custom-wire endpoint needs its own support.`;
+        const line = `bili-native-dsh: request sent DIRECT (uncompressed) — ${key} is not a recognized model endpoint, so bili did not route it through the proxy. bili only compresses known protocol paths (/chat/completions, /v1/messages, /responses, …) or endpoints declared via modelEndpointPatterns in the global config.`;
         console.error(line);
         persistClientEvent(line);
     };
