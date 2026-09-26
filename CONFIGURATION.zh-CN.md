@@ -654,7 +654,7 @@
 | `bili codex [opts --] [args]` | 代理 + **codex** |
 | `bili claude [opts --] [args]` | 代理 + **claude**（Claude Code CLI） |
 | `bili omp [opts --] [args]` | 代理 + **omp**（pi 内核）—— opencode zen 模型走默认 `opencode.ai` MITM 白名单（#1405） |
-| `bili opencode [opts --] [args]` | 代理 + **opencode** —— 内置 zen 网关（`opencode.ai`）默认证书 MITM（#1405） |
+| `bili opencode [opts --] [args]` | 代理 + **opencode** —— 内置 zen 网关（`opencode.ai`）默认证书 MITM（#1405）；`~/.config/opencode/opencode.json` / `~/.omp/omp.json` 中 `providers[].baseURL` 声明的主机自动加入 MITM 白名单（#1411），`~/.aider.conf.yml` / `~/.config/opencode/.aider.conf.yml` 同受监听 |
 | `bili hermes [opts --] [args]` | 代理 + **hermes-agent**（`/bili/` 重写） |
 | `bili dsh [opts --] [args]` | 代理 + **deepseek-harness**（`/bili/` 重写；`--profile web "task"` 等参数原样透传） |
 | `bili codebuddy [opts --] [args]` | 代理 + **codebuddy**（Tencent CodeBuddy Code CLI）—— `CODEBUDDY_BASE_URL` `/bili/` 重写,OpenAI chat-completions wire;预算对齐走 `CODEBUDDY_AUTO_COMPACT_WINDOW`(#640) |

@@ -1223,6 +1223,9 @@ export function resolveOpencodeConfigFile(env: NodeJS.ProcessEnv): string {
 // readOpencodeConfigRoot reads): the three global candidates + an explicit
 // OPENCODE_CONFIG when set. The discovery mtime cache must watch this same set
 // or edits go stale (#1411).
+/** Candidate opencode config paths for the discovery mtime cache. Order is
+ *  irrelevant (watch/mtime only); readOpencodeConfigRoot reads config.json
+ *  first by preference — no need to keep the two orders in lockstep. */
 export function opencodeConfigFiles(env: NodeJS.ProcessEnv): string[] {
     const xdg = nonEmpty(env.XDG_CONFIG_HOME) ? env.XDG_CONFIG_HOME : path.join(os.homedir(), ".config");
     const dir = path.join(xdg, "opencode");

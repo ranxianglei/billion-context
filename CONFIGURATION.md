@@ -680,7 +680,7 @@ Full command surface (`bili --help` prints an abridged version). Precedence ever
 | `bili codex [opts --] [args]` | Proxy + **codex** |
 | `bili claude [opts --] [args]` | Proxy + **claude** (Claude Code CLI) |
 | `bili omp [opts --] [args]` | Proxy + **omp** (pi-based) — opencode zen models ride the default `opencode.ai` MITM whitelist (#1405) |
-| `bili opencode [opts --] [args]` | Proxy + **opencode** — built-in zen gateway (`opencode.ai`) cert-MITM'd by default (#1405) |
+| `bili opencode [opts --] [args]` | Proxy + **opencode** — built-in zen gateway (`opencode.ai`) cert-MITM'd by default (#1405); hosts declared in `~/.config/opencode/opencode.json` / `~/.omp/omp.json` `providers[].baseURL` join the MITM whitelist automatically (#1411), and `~/.aider.conf.yml` / `~/.config/opencode/.aider.conf.yml` are watched for the same purpose |
 | `bili hermes [opts --] [args]` | Proxy + **hermes-agent** (`/bili/` rewrite) |
 | `bili dsh [opts --] [args]` | Proxy + **deepseek-harness** (non-loopback upstreams via proxy envs, loopback via `/bili/` rewrite — #535; args like `--profile web "task"` pass through) |
 | `bili codebuddy [opts --] [args]` | Proxy + **codebuddy** (Tencent CodeBuddy Code CLI) — `CODEBUDDY_BASE_URL` `/bili/` rewrite, OpenAI chat-completions wire; budget via `CODEBUDDY_AUTO_COMPACT_WINDOW` (#640) |
