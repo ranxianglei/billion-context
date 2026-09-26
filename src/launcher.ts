@@ -3148,6 +3148,40 @@ function parsePort(raw: string | undefined): number {
     return port;
 }
 
+// #757/#1050: shared cert-MITM contract for clients that honor standard proxy
+// envs for all outbound traffic EXCEPT an unconditional loopback NO_PROXY
+// bypass (verified: Kimi Code v0.42.0 binary; MiniMax Code 0.4.12
+// packages/tui/src/cli/network-proxy.ts). Non-loopback https rides CONNECT +
+// cert MITM with the COMBINED bundle on BOTH SSL_CERT_FILE (OpenSSL
+// replace-semantics readers) and NODE_EXTRA_CA_CERTS (Node append-semantics
+// readers; Windows' official Node ignores SSL_CERT_FILE, #710); non-loopback
+// plain-http rides absolute-form forward-proxy requests. Loopback endpoints
+// are inventoried only — no rewrite channel exists without editing the user's
+// config file. `where`/`ownerPhrase`/`rewriteNote` keep each client's warning
+// wording byte-exact.
+function applyLoopbackBypassMitmEnv(opts: { routes: DiscoveredRoutes; origin: string; where: string; ownerPhrase: string; rewriteNote?: string }): NodeJS.ProcessEnv {
+    const { routes, origin, where, ownerPhrase, rewriteNote } = opts;
+    const usesProxyEnv = routes.httpsDomains.length > 0 || routes.httpEnvRoutes.length > 0;
+    const env = usesProxyEnv ? stripInheritedProxy(process.env) : { ...process.env };
+    if (usesProxyEnv) {
+        const caBundle = resolveCombinedCaPath(process.env);
+        env.HTTPS_PROXY = origin;
+        env.SSL_CERT_FILE = caBundle;
+        env.NODE_EXTRA_CA_CERTS = caBundle;
+        if (routes.httpEnvRoutes.length > 0) env.HTTP_PROXY = origin;
+    }
+    if (routes.httpRewrites.length > 0) {
+        console.error(
+            `bili: ${routes.httpRewrites.length} loopback endpoint(s) in ${where}${rewriteNote ?? ""} bypass ${ownerPhrase} unconditional loopback NO_PROXY rule and will NOT go through the proxy — prefix their base_url with ${origin}/bili/ manually to compress them.`,
+        );
+    } else if (!usesProxyEnv) {
+        console.error(
+            `bili: no routable providers found in ${where} — traffic will NOT go through the proxy (configure a provider first).`,
+        );
+    }
+    return env;
+}
+
 export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}): Promise<void> {
     const host = params.overrides.ACP_HOST?.trim() || LAUNCHER_DEFAULT_HOST;
     const port = parsePort(params.overrides.ACP_PORT ?? process.env.ACP_PORT);
@@ -3443,24 +3477,12 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // config.toml. No budget env: kimi's native auto-compaction fires at
         // W − reserved_context_size (~95% of window), which ACP compression
         // (~55% once windows align via BILI_LAUNCHER_MODEL_WINDOWS) precedes.
-        const usesProxyEnv = routes.httpsDomains.length > 0 || routes.httpEnvRoutes.length > 0;
-        env = usesProxyEnv ? stripInheritedProxy(process.env) : { ...process.env };
-        if (usesProxyEnv) {
-            const caBundle = resolveCombinedCaPath(process.env);
-            env.HTTPS_PROXY = origin;
-            env.SSL_CERT_FILE = caBundle;
-            env.NODE_EXTRA_CA_CERTS = caBundle;
-            if (routes.httpEnvRoutes.length > 0) env.HTTP_PROXY = origin;
-        }
-        if (routes.httpRewrites.length > 0) {
-            console.error(
-                `bili: ${routes.httpRewrites.length} loopback endpoint(s) in ${resolveKimiHome(process.env)}/config.toml bypass Kimi Code's unconditional loopback NO_PROXY rule and will NOT go through the proxy — prefix their base_url with ${origin}/bili/ manually to compress them.`,
-            );
-        } else if (!usesProxyEnv) {
-            console.error(
-                `bili: no routable providers found in ${resolveKimiHome(process.env)}/config.toml — traffic will NOT go through the proxy (configure a provider first).`,
-            );
-        }
+        env = applyLoopbackBypassMitmEnv({
+            routes,
+            origin,
+            where: `${resolveKimiHome(process.env)}/config.toml`,
+            ownerPhrase: "Kimi Code's",
+        });
     } else if (base === "mcode") {
         // #1050: cert-MITM like kimi — MiniMax Code honors standard proxy envs
         // for all outbound traffic EXCEPT an unconditional loopback NO_PROXY
