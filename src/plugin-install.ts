@@ -40,7 +40,7 @@ import { resolveDshHome, resolveHermesHome, resolveKimiHome, resolvePiHome } fro
 import { clearClaudeNativePort, resolveClaudeNativePort, saveClaudeNativePort } from "./config.js";
 import { isPidAlive, isProxyInstanceFile, readProxyInstanceFile } from "./instance.js";
 import { DSH_PACKAGE, dshBundleInstalled, dshHasLegacyManagedBlock, dshProfileDependsOnBili, dshProfileDepSpec, dshProfileDirs, isRegistryDepSpec, planDshSpawn, refreshDshProfileBundles, runDshPlugin, stripLegacyManagedBlock } from "./dsh-channel.js";
-import { fetchRegistryVersion } from "./update.js";
+import { fetchRegistryVersion, opencodeCacheHome } from "./update.js";
 import { restoreKimiBackup, unrouteKimi } from "./kimi/native.js";
 import { inspectZcodeRouting, resolveZcodeDataDir } from "./zcode/json-edit.js";
 import { restoreZcodeBackup, unrouteZcode } from "./zcode/native.js";
@@ -2063,7 +2063,7 @@ export const UPDATE_CHANNEL: Record<PluginAgent, string> = {
     omp: "the global bili install (entry points at it)",
     claude: "the global bili install (hook/MCP point at it)",
     codex: "the global bili install (the mcp launcher shells out to it)",
-    opencode: "opencode's own plugin manager (opencode owns the copy)",
+    opencode: "manual — remove <XDG_CACHE_HOME>/opencode/packages/billion-context@* and restart opencode (it reinstalls latest; opencode never auto-updates installed plugins, #1234)",
     dsh: "the global bili self-update (profile bundles track it)",
     kimi: "the global bili install (plugin points at its dist)",
     hermes: "the global bili install (sidecar points at its dist); `bili plugin update hermes` re-copies the plugin",
@@ -2126,7 +2126,8 @@ async function updateLane(agent: PluginAgent, opts: PluginUpdateOpts, log: (leve
         const { data } = loadOpencodeConfig(file);
         const dir = opencodePluginDir(file);
         if (PLUGIN_KEYS.some((k) => pluginEntries(data, k).some((p) => p === OPENCODE_NPM_ENTRY))) {
-            return ["opencode: the plugin copy is opencode-managed — upgrade/reload it via opencode's plugin manager; bili never overwrites it (#991)"];
+            const pkgGlobs = path.join(opencodeCacheHome(), "packages", "billion-context@*");
+            return [`opencode: the plugin copy is opencode-managed and opencode never auto-updates it — to upgrade remove ${pkgGlobs} and restart opencode (it reinstalls latest on next startup); bili never overwrites it (#991, #1234)`];
         }
         if (PLUGIN_KEYS.some((k) => pluginEntries(data, k).some((p) => p === dir))) {
             return ["opencode: plugin points at this checkout — rebuild the checkout (`npm run build`) to pick up changes"];

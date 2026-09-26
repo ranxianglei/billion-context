@@ -42,6 +42,14 @@ test("hostManagedInstall: host agent homes own their trees", () => {
         const ocDir = path.join(base, "xdg", "opencode", "node_modules", "billion-context");
         assert.equal(hostManagedInstall(ocDir, { XDG_DATA_HOME: path.join(base, "xdg") })?.owner, "opencode");
 
+        // #1234: opencode 1.x actually places npm-form plugins under the XDG
+        // *cache* home — the layout the old guard missed, letting copies
+        // there self-update in place (#991 violation).
+        const ocCacheDir = path.join(base, "xdg-cache", "opencode", "packages", "billion-context@latest", "node_modules", "billion-context");
+        const ocCacheHit = hostManagedInstall(ocCacheDir, { XDG_CACHE_HOME: path.join(base, "xdg-cache") });
+        assert.equal(ocCacheHit?.owner, "opencode");
+        assert.match(ocCacheHit!.channel, /restart opencode/);
+
         const dshDir = path.join(base, "dsh-root", "plugins", "billion-context");
         assert.equal(hostManagedInstall(dshDir, { DSH_HOME: path.join(base, "dsh-root") })?.owner, "dsh");
 
@@ -141,6 +149,23 @@ test("installViaTarball: refuses a pi-owned install dir", { timeout: 30_000 }, a
     } finally {
         delete process.env.XDG_CACHE_HOME;
         delete process.env.PI_HOME;
+        fx.cleanup();
+    }
+});
+
+test("installViaTarball: refuses an opencode package-cache install dir (#1234)", { timeout: 30_000 }, async () => {
+    // The real-world layout: <XDG_CACHE_HOME>/opencode/packages/<spec>/node_modules/<name>.
+    // Before #1234 this escaped the guard and bili self-updated it in place.
+    const fx = makeFixture(path.join(".cache", "opencode", "packages", "billion-context@latest", "node_modules", "billion-context"));
+    process.env.XDG_CACHE_HOME = path.join(fx.root, ".cache");
+    try {
+        const { tgz, integrity } = makeTarball(fx.root, "2.0.0");
+        const r = await withTarballFetch(tgz, () => installViaTarball("2.0.0", "https://registry.test/x.tgz", fx.installDir, integrity));
+        assert.equal(r.ok, false);
+        assert.match(r.error ?? "", /opencode/);
+        assert.equal(JSON.parse(readFileSync(path.join(fx.installDir, "package.json"), "utf-8")).version, "1.2.3", "opencode copy untouched");
+    } finally {
+        delete process.env.XDG_CACHE_HOME;
         fx.cleanup();
     }
 });
