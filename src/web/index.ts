@@ -10,6 +10,8 @@ export {
     readUpstreamSettings,
 } from "./api.js";
 
+export { buildOverview, buildSessionList, buildSessionDetail } from "./sessions-data.js";
+
 function version(): string {
     try {
         const here = fileURLToPath(import.meta.url);

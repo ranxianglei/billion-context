@@ -12,25 +12,132 @@ function escapeHtml(value: string): string {
 }
 
 export function renderPage(origin: string, version: string): string {
+    const o = escapeHtml(origin);
     const caPath = rootCaPath();
     const caPathEsc = escapeHtml(caPath);
     const caReady = existsSync(caPath);
     return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>billion-context</title><style>${WEB_STYLES}</style></head><body>
-<div class="app"><aside class="sidebar"><div class="brand"><div class="brand-title">billion<span>-context</span></div><div class="version">v${version}</div></div><a class="fork-ribbon" href="https://github.com/ranxianglei/billion-context" target="_blank" rel="noopener">★ Fork me on GitHub</a><nav class="nav"><button class="active" data-page="overview" data-i18n="nav.overview">${zh("nav.overview")}</button><button data-page="routing" data-i18n="nav.routing">${zh("nav.routing")}</button><button data-page="upstream" data-i18n="nav.upstream">${zh("nav.upstream")}</button><button data-page="sessions" data-i18n="nav.sessions">${zh("nav.sessions")}</button><button data-page="settings" data-i18n="nav.settings">${zh("nav.settings")}</button></nav><button id="language-toggle" class="language-toggle">English</button></aside>
-<main class="main"><section id="page-overview" class="page active"><h1 data-i18n="nav.overview">${zh("nav.overview")}</h1><p class="lead" data-i18n="overview.lead">${zh("overview.lead")}</p><div id="passthrough-banner" class="notice" hidden>⚠️ <strong data-i18n="pt.on">${zh("pt.on")}</strong><span data-i18n="pt.desc">${zh("pt.desc")}</span><span id="passthrough-source" class="mono"></span><span data-i18n="pt.tail">${zh("pt.tail")}</span> <button id="clear-passthrough" class="btn" data-i18n="pt.restore">${zh("pt.restore")}</button></div><div id="stale-banner" class="notice" hidden>⚠️ <strong data-i18n="stale.on">${zh("stale.on")}</strong><span data-i18n="stale.run">${zh("stale.run")}</span><span id="stale-running" class="mono"></span><span data-i18n="stale.disk">${zh("stale.disk")}</span><span id="stale-disk" class="mono"></span><span data-i18n="stale.restart">${zh("stale.restart")}</span><span id="stale-mode"></span><span data-i18n="stale.close">${zh("stale.close")}</span></div><div id="conflicts-banner" class="notice" hidden>⚠️ <strong data-i18n="conflict.on">${zh("conflict.on")}</strong><span data-i18n="conflict.desc">${zh("conflict.desc")}</span><span id="conflicts-summary" class="mono"></span></div><div class="grid"><div class="card"><h2 data-i18n="overview.service">${zh("overview.service")}</h2><p class="mono">${origin}</p></div><div class="card"><h2 data-i18n="client.title">${zh("client.title")}</h2><p class="status" data-i18n="overview.client_hint">${zh("overview.client_hint")}</p></div></div></section>
-<section id="page-routing" class="page"><h1 data-i18n="client.title">${zh("client.title")}</h1><p class="lead"><span data-i18n="routing.lead_a">${zh("routing.lead_a")}</span><span class="mono">/bili/</span><span data-i18n="routing.lead_b">${zh("routing.lead_b")}</span></p>
-<h2 class="section-title" data-i18n="routing.a_title">${zh("routing.a_title")}</h2>
-<p class="hint"><span data-i18n="routing.a_hint_a">${zh("routing.a_hint_a")}</span><span class="mono">${origin}/bili/</span><span data-i18n="routing.a_hint_b">${zh("routing.a_hint_b")}</span></p>
-<div class="card"><div class="card-head"><h2>OpenCode</h2><button class="btn small copy-btn" data-copy="${origin}/bili/https://open.bigmodel.cn/api/coding/paas/v4" data-i18n="copy">${zh("copy")}</button></div><dl class="kv"><dt data-i18n="dt.config_file">${zh("dt.config_file")}</dt><dd class="mono">~/.config/opencode/opencode.json</dd><dt>baseURL</dt><dd class="mono">${origin}/bili/https://open.bigmodel.cn/api/coding/paas/v4</dd></dl></div>
-<div class="card"><div class="card-head"><h2 data-i18n="card.codex_key">${zh("card.codex_key")}</h2><button class="btn small copy-btn" data-copy="${origin}/bili/https://api.openai.com/v1" data-i18n="copy">${zh("copy")}</button></div><dl class="kv"><dt data-i18n="dt.config_file">${zh("dt.config_file")}</dt><dd class="mono">~/.codex/config.toml</dd><dt>base_url</dt><dd class="mono">${origin}/bili/https://api.openai.com/v1</dd></dl></div>
-<div class="card"><div class="card-head"><h2 data-i18n="card.codex_login">${zh("card.codex_login")}</h2><button class="btn small copy-btn" data-copy="openai_base_url = &quot;${origin}/bili/https://chatgpt.com/backend-api/codex&quot;" data-i18n="copy.config">${zh("copy.config")}</button></div><dl class="kv"><dt data-i18n="dt.config_file">${zh("dt.config_file")}</dt><dd class="mono">~/.codex/config.toml</dd><dt data-i18n="dt.config">${zh("dt.config")}</dt><dd class="mono">openai_base_url = "${origin}/bili/https://chatgpt.com/backend-api/codex"</dd><dt data-i18n="dt.auth">${zh("dt.auth")}</dt><dd><span class="mono">codex login</span><span data-i18n="routing.codex_auth_note">${zh("routing.codex_auth_note")}</span></dd><dt data-i18n="dt.notes">${zh("dt.notes")}</dt><dd><span data-i18n="routing.codex_note_a">${zh("routing.codex_note_a")}</span><span class="mono">model_provider</span><span data-i18n="routing.codex_note_b">${zh("routing.codex_note_b")}</span><span class="mono">model_provider = "openai"</span><span data-i18n="routing.codex_note_c">${zh("routing.codex_note_c")}</span><span class="mono">NO_PROXY=localhost,127.0.0.1</span><span data-i18n="routing.codex_note_d">${zh("routing.codex_note_d")}</span><span class="mono">localhost</span><span data-i18n="routing.codex_note_e">${zh("routing.codex_note_e")}</span></dd></dl></div>
-<div class="card"><div class="card-head"><h2 data-i18n="card.claude_key">${zh("card.claude_key")}</h2><button class="btn small copy-btn" data-copy="${origin}/bili/https://api.anthropic.com" data-i18n="copy">${zh("copy")}</button></div><dl class="kv"><dt data-i18n="dt.env">${zh("dt.env")}</dt><dd class="mono">ANTHROPIC_BASE_URL=${origin}/bili/https://api.anthropic.com</dd></dl></div>
-<div class="card"><div class="card-head"><h2>Pi</h2><span class="badge" data-i18n="badge.not_recommended">${zh("badge.not_recommended")}</span><button class="btn small copy-btn" data-copy="${origin}/bili/https://api.anthropic.com" data-i18n="copy">${zh("copy")}</button></div><dl class="kv"><dt data-i18n="dt.config_file">${zh("dt.config_file")}</dt><dd class="mono">~/.pi/agent/models.json</dd><dt>baseUrl</dt><dd class="mono">${origin}/bili/https://api.anthropic.com</dd></dl><p class="hint" data-i18n="pi.hint">${zh("pi.hint")}</p></div>
-<div class="card"><div class="card-head"><h2 data-i18n="other.title">${zh("other.title")}</h2><button class="btn small copy-btn" data-copy="${origin}/bili/" data-i18n="copy">${zh("copy")}</button></div><dl class="kv"><dt data-i18n="dt.rule">${zh("dt.rule")}</dt><dd><span data-i18n="other.rule">${zh("other.rule")}</span><span class="mono">${origin}/bili/</span></dd><dt data-i18n="dt.example">${zh("dt.example")}</dt><dd class="mono">${origin}/bili/https://api.openai.com/v1</dd></dl></div>
-<h2 class="section-title" data-i18n="routing.b_title">${zh("routing.b_title")}</h2>
-<p class="hint" data-i18n="routing.b_hint">${zh("routing.b_hint")}</p>
-<div class="card"><div class="card-head"><h2 data-i18n="zcode.title">${zh("zcode.title")}</h2><span class="badge">MITM</span><button class="btn small copy-btn" data-copy="${caPathEsc}" data-i18n="copy.ca">${zh("copy.ca")}</button></div><dl class="kv"><dt data-i18n="dt.method">${zh("dt.method")}</dt><dd data-i18n="zcode.method">${zh("zcode.method")}</dd><dt data-i18n="dt.setting">${zh("dt.setting")}</dt><dd>Settings → Network → HTTP Proxy = <span class="mono">${origin}</span></dd><dt data-i18n="dt.ca_cert">${zh("dt.ca_cert")}</dt><dd class="mono">${caPathEsc}${caReady ? "" : `<span data-i18n="ca.not_ready">${zh("ca.not_ready")}</span>`}</dd></dl><p class="hint"><span data-i18n="zcode.hint_a">${zh("zcode.hint_a")}</span><span class="mono">~</span><span data-i18n="zcode.hint_b">${zh("zcode.hint_b")}</span><span class="mono">~/…</span><span data-i18n="zcode.hint_c">${zh("zcode.hint_c")}</span></p></div></section>
-<section id="page-upstream" class="page"><h1 data-i18n="upstream.title">${zh("upstream.title")}</h1><p class="lead" data-i18n="upstream.lead">${zh("upstream.lead")}</p><div class="card"><div class="card-head"><h2 data-i18n="upstream.global">${zh("upstream.global")}</h2></div><div class="modes"><label><input type="radio" name="proxy-mode" value="direct" checked><span data-i18n="upstream.mode.direct">${zh("upstream.mode.direct")}</span></label><label><input type="radio" name="proxy-mode" value="manual"><span data-i18n="upstream.mode.manual">${zh("upstream.mode.manual")}</span></label><label><input type="radio" name="proxy-mode" value="auto"><span data-i18n="upstream.mode.auto">${zh("upstream.mode.auto")}</span></label></div><div class="field"><label>HTTP / HTTPS Proxy</label><input id="proxy-url" class="mono" placeholder="http://127.0.0.1:7897"></div><dl class="kv"><dt data-i18n="upstream.source">${zh("upstream.source")}</dt><dd id="upstream-source" data-i18n="upstream.direct">${zh("upstream.direct")}</dd><dt data-i18n="upstream.effective">${zh("upstream.effective")}</dt><dd id="upstream-effective" class="mono">direct</dd><dt data-i18n="upstream.pac">${zh("upstream.pac")}</dt><dd id="upstream-pac" class="mono">—</dd><dt data-i18n="upstream.state">${zh("upstream.state")}</dt><dd id="upstream-state" class="status" data-i18n="upstream.untested">${zh("upstream.untested")}</dd></dl><div class="actions"><button id="save-upstream" class="btn primary" data-i18n="upstream.save">${zh("upstream.save")}</button><button id="test-upstream" class="btn" data-i18n="upstream.test">${zh("upstream.test")}</button></div></div><div class="card"><div class="card-head"><h2 data-i18n="upstream.overrides_title">${zh("upstream.overrides_title")}</h2></div><p class="status" data-i18n="upstream.overrides_desc">${zh("upstream.overrides_desc")}</p><div id="upstream-overrides" class="status" data-i18n="upstream.loading">${zh("upstream.loading")}</div><div class="actions"><button id="save-overrides" class="btn primary" data-i18n="upstream.save_overrides">${zh("upstream.save_overrides")}</button></div></div></section>
-<section id="page-sessions" class="page"><div class="card-head"><div><h1 data-i18n="nav.sessions">${zh("nav.sessions")}</h1><p class="lead" data-i18n="sessions.lead">${zh("sessions.lead")}</p></div><button id="refresh-sessions" class="btn" data-i18n="sessions.refresh">${zh("sessions.refresh")}</button></div><div class="card"><table><thead><tr><th data-i18n="th.title">${zh("th.title")}</th><th data-i18n="th.protocol">${zh("th.protocol")}</th><th data-i18n="th.label">${zh("th.label")}</th><th data-i18n="th.requests">${zh("th.requests")}</th><th data-i18n="th.context">${zh("th.context")}</th><th data-i18n="th.window" data-i18n-title="th.window_tip" title="${zh("th.window_tip")}">${zh("th.window")}</th><th data-i18n="th.last_seen">${zh("th.last_seen")}</th></tr></thead><tbody id="sessions-body"></tbody></table></div></section>
-<section id="page-settings" class="page"><h1 data-i18n="settings.title">${zh("settings.title")}</h1><p class="lead" data-i18n="settings.lead">${zh("settings.lead")}</p><div class="card"><div class="field"><label>providers JSON</label><textarea id="providers-json">{}</textarea></div><div class="actions"><button id="save-providers" class="btn primary" data-i18n="settings.save_apply">${zh("settings.save_apply")}</button></div></div><div class="card"><div class="card-head"><h2 data-i18n="settings.compress_title">${zh("settings.compress_title")}</h2></div><p class="status" data-i18n="settings.compress_desc">${zh("settings.compress_desc")}</p><div class="field"><label>compress JSON</label><textarea id="compress-json" placeholder='{"modelContextLimit": 200000}'></textarea></div><div class="actions"><button id="save-compress" class="btn primary" data-i18n="upstream.save">${zh("upstream.save")}</button></div></div></section></main></div><div id="toast" class="toast"></div><script>${WEB_CLIENT}</script></body></html>`;
+<header class="topbar"><div class="brand"><span class="logo">∞</span>billion-context<span class="ver">v${version}</span></div><nav class="nav"><a href="#/overview" data-nav="overview" class="active" data-i18n="nav.overview">${zh("nav.overview")}</a><a href="#/sessions" data-nav="sessions" data-i18n="nav.sessions">${zh("nav.sessions")}</a><a href="#/config" data-nav="config" data-i18n="nav.config">${zh("nav.config")}</a><a href="#/connect" data-nav="connect" data-i18n="nav.connect">${zh("nav.connect")}</a></nav><div class="actions"><a class="fork-link" href="https://github.com/ranxianglei/billion-context" target="_blank" rel="noopener" data-i18n="fork.label">${zh("fork.label")}</a><button id="language-toggle" class="lang-btn">English</button></div></header>
+<div id="passthrough-banner" class="banner warn" hidden></div>
+<div id="stale-banner" class="banner warn" hidden></div>
+<div id="conflicts-banner" class="banner warn" hidden></div>
+<main>
+<section id="page-overview" class="page">
+<div class="page-head"><div><h1 data-i18n="ov.title">${zh("ov.title")}</h1><div class="sub" data-i18n="ov.sub">${zh("ov.sub")}</div></div></div>
+<div class="grid cols-4">
+<div class="stat"><div class="k" data-i18n="ov.total_sessions">${zh("ov.total_sessions")}</div><div class="v" id="st-sessions">—</div><div class="s" id="st-sessions-sub"></div></div>
+<div class="stat"><div class="k" data-i18n="ov.total_requests">${zh("ov.total_requests")}</div><div class="v" id="st-reqs">—</div></div>
+<div class="stat good"><div class="k" data-i18n="ov.tokens_saved">${zh("ov.tokens_saved")}</div><div class="v" id="st-saved">—</div><div class="s" data-i18n="common.tokens">${zh("common.tokens")}</div></div>
+<div class="stat"><div class="k" data-i18n="ov.global_hitpct">${zh("ov.global_hitpct")}</div><div class="v" id="st-hitpct">—</div></div>
+<div class="stat"><div class="k" data-i18n="ov.input_tokens">${zh("ov.input_tokens")}</div><div class="v" id="st-input">—</div></div>
+<div class="stat"><div class="k" data-i18n="ov.cached_tokens">${zh("ov.cached_tokens")}</div><div class="v" id="st-cached">—</div></div>
+<div class="stat"><div class="k" data-i18n="ov.output_tokens">${zh("ov.output_tokens")}</div><div class="v" id="st-output">—</div></div>
+</div>
+<div class="grid cols-2" style="margin-top:16px">
+<div class="card"><div class="card-h"><span data-i18n="ov.by_protocol">${zh("ov.by_protocol")}</span></div><div class="card-b flush"><table class="data"><thead><tr><th data-i18n="common.protocol">${zh("common.protocol")}</th><th class="num" data-i18n="common.sessions">${zh("common.sessions")}</th><th class="num" data-i18n="ses.th_reqs">${zh("ses.th_reqs")}</th><th class="num" data-i18n="ov.input_tokens">${zh("ov.input_tokens")}</th><th class="num" data-i18n="ov.cached_tokens">${zh("ov.cached_tokens")}</th></tr></thead><tbody id="protocol-body"></tbody></table></div></div>
+<div class="card"><div class="card-h"><span data-i18n="sys.title">${zh("sys.title")}</span></div><div class="card-b"><dl class="kv">
+<div class="k" data-i18n="sys.version">${zh("sys.version")}</div><div class="v mono" id="sys-version"></div>
+<div class="k" data-i18n="sys.disk_version">${zh("sys.disk_version")}</div><div class="v mono" id="sys-disk-version"></div>
+<div class="k" data-i18n="sys.inflight">${zh("sys.inflight")}</div><div class="v mono" id="sys-inflight">0</div>
+<div class="k" data-i18n="sys.blind_tunnels">${zh("sys.blind_tunnels")}</div><div class="v mono" id="sys-blind">0</div>
+</dl></div></div>
+</div>
+<div class="card" style="margin-top:16px"><div class="card-h"><span data-i18n="ov.recent">${zh("ov.recent")}</span><a class="btn sm" href="#/sessions" data-i18n="ov.view_all">${zh("ov.view_all")}</a></div><div class="card-b flush"><table class="data"><thead><tr>
+<th data-i18n="ses.th_title">${zh("ses.th_title")}</th><th data-i18n="ses.th_proto">${zh("ses.th_proto")}</th><th class="num" data-i18n="ses.th_ctx">${zh("ses.th_ctx")}</th><th class="num" data-i18n="ses.th_saved">${zh("ses.th_saved")}</th><th data-i18n="ses.th_seen">${zh("ses.th_seen")}</th>
+</tr></thead><tbody id="recent-body"></tbody></table></div></div>
+</section>
+<section id="page-sessions" class="page" hidden>
+<div id="sessions-list-view">
+<div class="page-head"><div><h1 data-i18n="ses.title">${zh("ses.title")}</h1><div class="sub" data-i18n="ses.sub">${zh("ses.sub")}</div></div>
+<div style="display:flex;gap:10px;align-items:center"><input id="ses-search" type="search" class="search" placeholder="${zh("ses.search_ph")}" data-i18n-ph="ses.search_ph"><span id="ses-count" class="dim small"></span></div></div>
+<div class="card"><div class="card-b flush"><table class="data"><thead><tr>
+<th data-i18n="ses.th_title">${zh("ses.th_title")}</th><th data-i18n="ses.th_proto">${zh("ses.th_proto")}</th><th data-i18n="ses.th_upstream">${zh("ses.th_upstream")}</th><th class="num" data-i18n="ses.th_reqs">${zh("ses.th_reqs")}</th><th class="num" data-i18n="ses.th_ctx">${zh("ses.th_ctx")}</th><th class="num" data-i18n="ses.th_saved">${zh("ses.th_saved")}</th><th class="num" data-i18n="ses.th_hit">${zh("ses.th_hit")}</th><th class="num" data-i18n="ses.th_blocks">${zh("ses.th_blocks")}</th><th data-i18n="ses.th_seen">${zh("ses.th_seen")}</th>
+</tr></thead><tbody id="sessions-body"></tbody></table></div></div>
+</div>
+<section id="session-detail-view" hidden></section>
+</section>
+<section id="page-config" class="page" hidden>
+<div class="page-head"><div><h1 data-i18n="cfg.title">${zh("cfg.title")}</h1><div class="sub" data-i18n="cfg.sub">${zh("cfg.sub")}</div></div><span class="badge disk" data-i18n="cfg.readonly">${zh("cfg.readonly")}</span></div>
+<div id="cfg-parse-error" class="banner err" hidden></div>
+<div class="card"><div class="card-h"><span data-i18n="cfg.file">${zh("cfg.file")}</span></div><div class="card-b"><div class="copy-row"><pre class="codebox" id="cfg-file"></pre><button class="btn sm copy-btn" id="copy-cfg-file" data-copy=""><span data-i18n="common.copy">${zh("common.copy")}</span></button></div></div></div>
+<div class="grid cols-2" style="margin-top:16px">
+<div class="card"><div class="card-h"><span data-i18n="cfg.providers">${zh("cfg.providers")}</span></div><div class="card-b" id="providers-body"></div></div>
+<div class="card"><div class="card-h"><span data-i18n="cfg.upstream_net">${zh("cfg.upstream_net")}</span></div><div class="card-b">
+<dl class="kv">
+<div class="k" data-i18n="cfg.up_mode">${zh("cfg.up_mode")}</div><div class="v" id="up-mode">—</div>
+<div class="k" data-i18n="cfg.up_proxy">${zh("cfg.up_proxy")}</div><div class="v mono" id="up-proxy">—</div>
+<div class="k" data-i18n="cfg.state">${zh("cfg.state")}</div><div class="v" id="up-state">—</div>
+</dl>
+<div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap"><button id="test-upstream" class="btn" data-i18n="cfg.test_btn">${zh("cfg.test_btn")}</button><span class="dim small" data-i18n="cfg.test_hint">${zh("cfg.test_hint")}</span></div>
+</div></div>
+</div>
+<div class="grid cols-2" style="margin-top:16px">
+<div class="card"><div class="card-h"><span data-i18n="cfg.compress">${zh("cfg.compress")}</span></div><div class="card-b"><p class="dim small" style="margin:0 0 8px" data-i18n="cfg.compress_desc">${zh("cfg.compress_desc")}</p><pre class="codebox" id="compress-json"></pre></div></div>
+<div class="card"><div class="card-h"><span data-i18n="cfg.passthrough">${zh("cfg.passthrough")}</span></div><div class="card-b"><div id="pt-state" class="badge disk">—</div></div></div>
+</div>
+</section>
+<section id="page-connect" class="page" hidden>
+<div class="page-head"><div><h1 data-i18n="con.title">${zh("con.title")}</h1><div class="sub" data-i18n="con.sub">${zh("con.sub")}</div></div></div>
+<div class="card"><div class="card-h"><span data-i18n="con.origin">${zh("con.origin")}</span></div><div class="card-b"><div class="copy-row"><pre class="codebox">${o}</pre><button class="btn sm copy-btn" data-copy="${o}"><span data-i18n="common.copy">${zh("common.copy")}</span></button></div></div></div>
+<div class="section-label" data-i18n="con.method_a">${zh("con.method_a")}</div>
+<p class="small dim"><span data-i18n="con.method_a_hint">${zh("con.method_a_hint")}</span> <span class="mono">${o}/bili/</span></p>
+<div class="grid cols-2">
+<div class="card"><div class="card-h"><span data-i18n="card.opencode">${zh("card.opencode")}</span></div><div class="card-b">
+<dl class="kv">
+<div class="k" data-i18n="dt.config_file">${zh("dt.config_file")}</div><div class="v mono">~/.config/opencode/opencode.json</div>
+<div class="k" data-i18n="dt.setting">${zh("dt.setting")}</div><div class="v mono">baseURL</div>
+</dl>
+<div class="copy-row" style="margin-top:10px"><pre class="codebox">${o}/bili/https://open.bigmodel.cn/api/coding/paas/v4</pre><button class="btn sm copy-btn" data-copy="${o}/bili/https://open.bigmodel.cn/api/coding/paas/v4"><span data-i18n="common.copy">${zh("common.copy")}</span></button></div>
+</div></div>
+<div class="card"><div class="card-h"><span data-i18n="card.codex_key">${zh("card.codex_key")}</span></div><div class="card-b">
+<dl class="kv">
+<div class="k" data-i18n="dt.config_file">${zh("dt.config_file")}</div><div class="v mono">~/.codex/config.toml</div>
+<div class="k" data-i18n="dt.setting">${zh("dt.setting")}</div><div class="v mono">base_url</div>
+</dl>
+<div class="copy-row" style="margin-top:10px"><pre class="codebox">${o}/bili/https://api.openai.com/v1</pre><button class="btn sm copy-btn" data-copy="${o}/bili/https://api.openai.com/v1"><span data-i18n="common.copy">${zh("common.copy")}</span></button></div>
+</div></div>
+<div class="card"><div class="card-h"><span data-i18n="card.codex_login">${zh("card.codex_login")}</span><span class="dim small" data-i18n="routing.codex_auth_note">${zh("routing.codex_auth_note")}</span></div><div class="card-b">
+<dl class="kv">
+<div class="k" data-i18n="dt.setting">${zh("dt.setting")}</div><div class="v mono">openai_base_url</div>
+<div class="k" data-i18n="dt.auth">${zh("dt.auth")}</div><div class="v">codex login</div>
+</dl>
+<div class="copy-row" style="margin-top:10px"><pre class="codebox">${o}/bili/https://chatgpt.com/backend-api/codex</pre><button class="btn sm copy-btn" data-copy="${o}/bili/https://chatgpt.com/backend-api/codex"><span data-i18n="common.copy">${zh("common.copy")}</span></button></div>
+<p class="small dim" style="margin-top:10px"><span data-i18n="routing.codex_note_a">${zh("routing.codex_note_a")}</span> <span class="mono">model_provider</span> <span data-i18n="routing.codex_note_b">${zh("routing.codex_note_b")}</span> <span class="mono">model_provider = "openai"</span> <span data-i18n="routing.codex_note_c">${zh("routing.codex_note_c")}</span> <span class="mono">NO_PROXY=localhost,127.0.0.1</span> <span data-i18n="routing.codex_note_d">${zh("routing.codex_note_d")}</span> <span class="mono">localhost</span> <span data-i18n="routing.codex_note_e">${zh("routing.codex_note_e")}</span></p>
+</div></div>
+<div class="card"><div class="card-h"><span data-i18n="card.claude_key">${zh("card.claude_key")}</span></div><div class="card-b">
+<dl class="kv">
+<div class="k" data-i18n="dt.env">${zh("dt.env")}</div><div class="v mono">ANTHROPIC_BASE_URL</div>
+</dl>
+<div class="copy-row" style="margin-top:10px"><pre class="codebox">export ANTHROPIC_BASE_URL=${o}/bili/https://api.anthropic.com</pre><button class="btn sm copy-btn" data-copy="export ANTHROPIC_BASE_URL=${o}/bili/https://api.anthropic.com"><span data-i18n="common.copy">${zh("common.copy")}</span></button></div>
+</div></div>
+<div class="card"><div class="card-h"><span data-i18n="card.pi">${zh("card.pi")}</span><span class="badge warn" data-i18n="badge.not_recommended">${zh("badge.not_recommended")}</span></div><div class="card-b">
+<dl class="kv">
+<div class="k" data-i18n="dt.config_file">${zh("dt.config_file")}</div><div class="v mono">~/.pi/agent/models.json</div>
+<div class="k" data-i18n="dt.setting">${zh("dt.setting")}</div><div class="v mono">baseUrl</div>
+</dl>
+<div class="copy-row" style="margin-top:10px"><pre class="codebox">${o}/bili/https://api.anthropic.com</pre><button class="btn sm copy-btn" data-copy="${o}/bili/https://api.anthropic.com"><span data-i18n="common.copy">${zh("common.copy")}</span></button></div>
+<p class="small dim" style="margin-top:10px" data-i18n="pi.hint">${zh("pi.hint")}</p>
+</div></div>
+<div class="card"><div class="card-h"><span data-i18n="card.other">${zh("card.other")}</span></div><div class="card-b">
+<p class="small" style="margin:0 0 6px"><span data-i18n="other.rule">${zh("other.rule")}</span> <span class="mono">${o}/bili/</span></p>
+<p class="small dim" style="margin:0 0 8px"><span data-i18n="dt.example">${zh("dt.example")}</span> <span class="mono">https://api.openai.com/v1 → ${o}/bili/https://api.openai.com/v1</span></p>
+<div class="copy-row"><pre class="codebox">${o}/bili/</pre><button class="btn sm copy-btn" data-copy="${o}/bili/"><span data-i18n="common.copy">${zh("common.copy")}</span></button></div>
+</div></div>
+</div>
+<div class="section-label" data-i18n="con.method_b">${zh("con.method_b")}</div>
+<p class="small dim" data-i18n="con.method_b_hint">${zh("con.method_b_hint")}</p>
+<div class="card"><div class="card-h"><span data-i18n="zcode.title">${zh("zcode.title")}</span><span class="hint" data-i18n="zcode.method">${zh("zcode.method")}</span></div><div class="card-b">
+<dl class="kv">
+<div class="k" data-i18n="dt.setting">${zh("dt.setting")}</div><div class="v mono">Settings → Network → HTTP Proxy</div>
+<div class="k" data-i18n="dt.ca_cert">${zh("dt.ca_cert")}</div><div class="v mono">${caPathEsc}${caReady ? "" : `<span class="dim" data-i18n="ca.not_ready">${zh("ca.not_ready")}</span>`}</div>
+</dl>
+<div class="copy-row" style="margin-top:10px"><pre class="codebox">${o}</pre><button class="btn sm copy-btn" data-copy="${o}"><span data-i18n="common.copy">${zh("common.copy")}</span></button></div>
+<div class="copy-row" style="margin-top:8px"><pre class="codebox">${caPathEsc}</pre><button class="btn sm copy-btn" data-copy="${caPath}"><span data-i18n="copy.ca">${zh("copy.ca")}</span></button></div>
+<p class="small dim" style="margin-top:10px"><span data-i18n="zcode.hint_a">${zh("zcode.hint_a")}</span> <span class="mono">~</span> <span data-i18n="zcode.hint_b">${zh("zcode.hint_b")}</span> <span class="mono">~/...</span> <span data-i18n="zcode.hint_c">${zh("zcode.hint_c")}</span></p>
+</div></div>
+</section>
+</main>
+<div id="toast-host" class="toast-host"></div>
+<script>${WEB_CLIENT}</script>
+</body></html>`;
 }
