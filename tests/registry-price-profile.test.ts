@@ -25,8 +25,24 @@ test("peekRegistryPriceProfile fills partial rows with kernel conventions", () =
         "host-c/model-bare-input": { input: 6 },
     });
     assert.deepEqual(peekRegistryPriceProfile("model-no-cache-read"), { w: 2, r: 0.2, q: 8 });
-    assert.deepEqual(peekRegistryPriceProfile("model-no-output"), { w: 4, r: 0.4, q: 6 });
-    assert.deepEqual(peekRegistryPriceProfile("model-bare-input"), { w: 6, r: 0.6, q: 9 });
+    assert.deepEqual(peekRegistryPriceProfile("model-no-output"), { w: 4, r: 0.4, q: 16 });
+    assert.deepEqual(peekRegistryPriceProfile("model-bare-input"), { w: 6, r: 0.6, q: 24 });
+});
+
+test("peekRegistryPriceProfile prices w from cache_write when the provider charges a write premium", () => {
+    _resetForTest();
+    _setForTest({}, {
+        // Kernel contract: (w−r)·T prices the cache-WRITE re-upload — Anthropic
+        // carries cache_write ≈ 1.25× input; dropping it understates fold cost.
+        "anthropic/claude-sonnet-4-5": { input: 3, cache_write: 3.75, cache_read: 0.3, output: 15 },
+        // No premium → w falls back to input.
+        "host-x/model-no-write-premium": { input: 3, cache_read: 0.3, output: 15 },
+        // Unusable cache_write (zero/negative/non-finite) → input, never garbage.
+        "host-y/model-broken-write": { input: 3, cache_write: 0, cache_read: 0.3, output: 15 },
+    });
+    assert.deepEqual(peekRegistryPriceProfile("claude-sonnet-4-5"), { w: 3.75, r: 0.3, q: 15 });
+    assert.deepEqual(peekRegistryPriceProfile("model-no-write-premium"), { w: 3, r: 0.3, q: 15 });
+    assert.deepEqual(peekRegistryPriceProfile("model-broken-write"), { w: 3, r: 0.3, q: 15 });
 });
 
 test("peekRegistryPriceProfile rejects rows without a usable input price", () => {

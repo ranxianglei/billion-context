@@ -21,7 +21,7 @@ type RegistryShape = Record<string, ModelEntry>;
 // providers.<host>.models.<id>.cost ($/Mtok). Only rows with a usable input
 // price are stored — without an input anchor there is nothing to normalize
 // against, and half-inventing a profile would misprice every fold.
-type CostRow = { input: number; output?: number; cache_read?: number };
+type CostRow = { input: number; output?: number; cache_read?: number; cache_write?: number };
 type CostsShape = Record<string, CostRow>;
 type LoadedRegistry = { reg: RegistryShape; costs: CostsShape | null };
 
@@ -202,7 +202,12 @@ export async function loadRegistry(): Promise<RegistryShape | null> {
         if (disk) {
             cache = disk.reg;
             costCache = disk.costs;
-            return cache;
+            // A legacy flat disk cache (pre-costs release) carries no price
+            // rows: serving it wholesale would silently blank stamps for the
+            // whole 24h TTL even though the bundled snapshot has prices. Fall
+            // through to a fresh fetch instead (offline keeps it as net via
+            // pickFallback, matching the pre-costs status quo).
+            if (disk.costs !== null) return cache;
         }
     }
     if (loading) return loading;
@@ -327,7 +332,8 @@ export function peekRegistryOutputLimit(model: string, host?: string): number | 
 /** #1279 follow-up: synchronous cache-only PRICE lookup for the cache-
  *  economics report. Same residency rules as peekRegistryContext (pre-warmed
  *  bundled floor, upgraded by loadRegistry, never fetches). Returns ABSOLUTE
- *  $/Mtok values (w=input, r=cache-read, q=output), not relative ratios —
+ *  $/Mtok values (w=cache-write — input when the provider charges no write
+ *  premium —, r=cache-read, q=output), not relative ratios —
  *  out-of-box reports read in real money; kernel-side conventions fill
  *  partial rows (r = 0.1×input, q = 1.5×input). Rows without a usable input
  *  price yield undefined: a profile anchored on nothing would misprice every
@@ -386,10 +392,13 @@ export function peekRegistryPriceProfile(model: string | undefined, host?: strin
 
 function priceProfileFromRow(row: CostRow | undefined): PriceProfile | undefined {
     if (!row) return undefined;
-    const w = row.input;
+    // Kernel contract (cache-report): w prices the cache-WRITE re-upload of
+    // the fold — (w−r)·T. Providers charging a write premium (Anthropic-style
+    // 1.25×) carry cache_write; everyone else reuses the input price.
+    const w = typeof row.cache_write === "number" && Number.isFinite(row.cache_write) && row.cache_write > 0 ? row.cache_write : row.input;
     if (typeof w !== "number" || !Number.isFinite(w) || w <= 0) return undefined;
     const r = typeof row.cache_read === "number" && Number.isFinite(row.cache_read) && row.cache_read >= 0 ? row.cache_read : 0.1 * w;
-    const q = typeof row.output === "number" && Number.isFinite(row.output) && row.output >= 0 ? row.output : 1.5 * w;
+    const q = typeof row.output === "number" && Number.isFinite(row.output) && row.output >= 0 ? row.output : 4 * w;
     // Derived multipliers carry binary float noise (0.1 * 6 = 0.6000000000000001);
     // the profile is printed verbatim in the report header, so normalize it away.
     const norm = (x: number): number => Math.round(x * 1e10) / 1e10;

@@ -161,25 +161,30 @@ test("priceProfile stamp: registry pricing is the default when no level configur
         );
 
         // User config at any level wins wholesale — no field mixing with the registry row.
-        const proxyCfg = await startServer(optsFor(upstream.port, true));
-        await once(proxyCfg, "listening");
-        const cfgPort = (proxyCfg.address() as { port: number }).port;
-        const beforeC = new Set(listSessions().map((s) => s.id));
-        const rc = await fetch(`http://127.0.0.1:${cfgPort}/bili/http://127.0.0.1:${upstream.port}/v1/messages`, {
-            method: "POST",
-            headers: { "content-type": "application/json", "x-api-key": "test", "x-acp-session": "pp-registry-c" },
-            body: JSON.stringify({ model: "claude-reg", max_tokens: 1024, messages: [{ role: "user", content: "hello" }] }),
-        });
-        assert.equal(rc.status, 200, "user-config lane served");
-        const sc = listSessions().find((s) => !beforeC.has(s.id));
-        assert.ok(sc, "session created for the user-config lane");
-        assert.deepEqual(
-            sc.metadata.cachePriceProfile,
-            { q: 1.5 },
-            "route-level priceProfile overrides the registry listing wholesale",
-        );
-
-        await new Promise<void>((r) => proxyCfg.close(() => r()));
+        // proxyCfg is closed in finally: an assertion throw mid-lane must not
+        // leak the second server and hang the runner on drain.
+        let proxyCfg: Awaited<ReturnType<typeof startServer>> | null = null;
+        try {
+            proxyCfg = await startServer(optsFor(upstream.port, true));
+            await once(proxyCfg, "listening");
+            const cfgPort = (proxyCfg.address() as { port: number }).port;
+            const beforeC = new Set(listSessions().map((s) => s.id));
+            const rc = await fetch(`http://127.0.0.1:${cfgPort}/bili/http://127.0.0.1:${upstream.port}/v1/messages`, {
+                method: "POST",
+                headers: { "content-type": "application/json", "x-api-key": "test", "x-acp-session": "pp-registry-c" },
+                body: JSON.stringify({ model: "claude-reg", max_tokens: 1024, messages: [{ role: "user", content: "hello" }] }),
+            });
+            assert.equal(rc.status, 200, "user-config lane served");
+            const sc = listSessions().find((s) => !beforeC.has(s.id));
+            assert.ok(sc, "session created for the user-config lane");
+            assert.deepEqual(
+                sc.metadata.cachePriceProfile,
+                { q: 1.5 },
+                "route-level priceProfile overrides the registry listing wholesale",
+            );
+        } finally {
+            if (proxyCfg) await new Promise<void>((r) => proxyCfg!.close(() => r()));
+        }
     } finally {
         await new Promise<void>((r) => proxy.close(() => r()));
         await upstream.close();
