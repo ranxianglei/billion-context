@@ -1,4 +1,4 @@
-import { collectBlockContent, defaultCountTokens, storeCoveredOriginals, type CompressionCore, type Config, type CoreMessage, type CompressionState } from "acp-kernel";
+import { collectBlockContent, defaultCountTokens, formatRanges, storeCoveredOriginals, viableRanges, type CompressionCore, type Config, type CoreMessage, type CompressionState, type NudgeDecision } from "acp-kernel";
 import { handleAcpStatus } from "./acp-status.js";
 import { handleAcpCache, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
 import { type Session, cacheBlockContent, markDirty } from "./session.js";
@@ -194,6 +194,49 @@ export function summaryFingerprintLine(blockId: string, summary: string): string
     return ` · ${blockId} summary ${summary.length}ch · head "${head}" … tail "${tail}"`;
 }
 
+// #1387 (pi-side #420/#521 alignment): post-compress continuation contract.
+// Silence after success is not a stop signal — models extrapolate ghost endIds
+// past the session tail and burn a round on kernel rejection. Wording is
+// verbatim pi-side so both hosts speak the same contract.
+const NO_RANGES_REMAIN_TEXT = "No compressible ranges remain — the context is already at its minimum; continue the task without compressing.";
+
+function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean): string {
+    // Same source as handleAcpStatus (#389): recompute the nudge from live
+    // state instead of trusting any prepare-time snapshot — a successful
+    // compress mutates state mid-turn, so stale snapshots list already-folded
+    // refs as compressible. processTurn is pure (nodes return new objects);
+    // the returned state is deliberately NOT adopted.
+    let nudge: NudgeDecision | undefined;
+    try {
+        const turn = ctx.core.processTurn({
+            messages: ctx.messages,
+            state: ctx.session.state,
+            config: ccrEnabled(ctx.session) ? ctx.config : { ...ctx.config, ccr: undefined },
+            tokenCount: ctx.session.stats.lastInputTokens,
+            renderTags: "none",
+            contentStore: contentStoreOf(ctx.session),
+        });
+        nudge = turn.nudge;
+    } catch {
+        return "";
+    }
+    if (!nudge) return "";
+    // Same gates as handleAcpStatus: viability floor + the submit gate's raw
+    // char count — never advertise a range the kernel would reject (#847).
+    const minChars = ctx.config.compress.minCompressRange;
+    const remaining = viableRanges(nudge.compressibleRanges)
+        .filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars);
+    if (remaining.length > 0) {
+        return `\n\nCurrent compressible ranges (use these refs exactly as listed):\n${formatRanges(remaining, [])}`;
+    }
+    // A tier-distillation nudge means block-boundary compress calls (bN..bM)
+    // are still actionable — a stop signal there would contradict the tier
+    // trigger. Partial failures stay silent too: the model still owes the
+    // errors an answer before any "you are done" verdict (pi #521 gate).
+    if (!cleanSuccess || nudge.tier !== null) return "";
+    return `\n\n${NO_RANGES_REMAIN_TEXT}`;
+}
+
 export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: RewriteCtx): string {
     const { ranges, diagnostics } = parsed;
     if (ranges.length === 0) {
@@ -348,7 +391,6 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         if (maxShrink !== undefined && shrinkRatio > maxShrink) {
             msg += ` [Staged-compress: this rewrite shrank context ${Math.round(shrinkRatio * 100)}%, above your ${Math.round(maxShrink * 100)}% per-compress target — the shape that trips provider risk-control (3007). Next time compress a SMALLER, TAIL-biased range (the most recent large content) and keep the stable prefix intact.]`;
         }
-        ctx.log(`[acp-proxy: ${msg}]`);
         // The fold materializes only at the NEXT request's processTurn; the
         // post-compress re-request re-sends the unfolded history (prefix-cache
         // friendly), so usage reports until then over-report. Net the savings
@@ -357,6 +399,10 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // re-firing on the stale pre-compress number (#252 double-inject).
         ctx.session.stats.compressCreditTokens = (ctx.session.stats.compressCreditTokens ?? 0) + r.tokensCompressed;
         ctx.session.stats.lastInputTokens = Math.max(0, ctx.session.stats.lastInputTokens - r.tokensCompressed);
+        // #1387: post-compress snapshot / stop signal ride on the netted
+        // (post-compress) token count, matching what the next turn sees.
+        msg += postCompressTail(ctx, r.errors.length === 0);
+        ctx.log(`[acp-proxy: ${msg}]`);
         return msg;
     } catch (err) {
         ctx.log(`[acp-proxy: compress failed: ${String(err)}]`);
