@@ -1,3 +1,4 @@
+import type http from "node:http";
 import { createHash } from "node:crypto";
 
 // #920: stamped per request by the opencode thin plugin for LEGACY
@@ -368,4 +369,12 @@ export function hardenOpenaiAssistantContent<T extends { role: string }>(message
  */
 export function shouldReserveOutputHeadroom(protocol: string | undefined): boolean {
     return protocol !== "anthropic";
+}
+
+export function headerValue(req: http.IncomingMessage, name: string): string | undefined {
+    const lower = name.toLowerCase();
+    for (const [k, v] of Object.entries(req.headers)) {
+        if (k.toLowerCase() === lower) return Array.isArray(v) ? v[0] : v;
+    }
+    return undefined;
 }
