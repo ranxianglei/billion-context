@@ -94,7 +94,15 @@ test("#1294 P1: long two-section summary yields an exact fingerprint line", () =
     const head = s.slice(0, 30).replace(/\r?\n/g, " ");
     const tailText = s.slice(-100).replace(/\r?\n/g, " ");
     assert.ok(out.includes(`\n · b1 summary ${s.length}ch · head "${head}" … tail "${tailText}"`), out);
-    assert.equal(out.split("\n").length, 2, "one header line + one fingerprint line (embedded newline flattened inside)");
+    // #1387: the continuation tail may follow the fingerprint line — pin the
+    // whole receipt shape so no other content can sneak in. Here the tiny
+    // recent-tail messages fall under the viability floor, so the drained
+    // clean success carries exactly the stop signal.
+    assert.deepEqual(
+        out.split("\n").slice(2),
+        ["", "No compressible ranges remain — the context is already at its minimum; continue the task without compressing."],
+        "header + fingerprint + #1387 stop tail only",
+    );
 });
 
 test("#1294 P1: short summary (< 30 chars) — head equals tail equals the whole summary", () => {
