@@ -6,7 +6,7 @@ import bundledSnapshot from "../src/registry-snapshot.json" with { type: "json" 
 // #1279 follow-up: registry-derived default price profiles. The lookup is
 // cache-only and sync (same residency contract as peekRegistryContext); unit
 // here is ABSOLUTE $/Mtok, partial rows fall back to kernel conventions
-// (r = 0.1×input, q = 1.5×input), and rows without a usable input price
+// (r = 0.1×w, q = 4×w — kernel default ratios), and rows without a usable input price
 // never yield a profile.
 
 test("peekRegistryPriceProfile maps a full cost row to absolute $/Mtok", () => {

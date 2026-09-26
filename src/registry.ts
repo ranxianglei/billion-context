@@ -335,7 +335,7 @@ export function peekRegistryOutputLimit(model: string, host?: string): number | 
  *  $/Mtok values (w=cache-write — input when the provider charges no write
  *  premium —, r=cache-read, q=output), not relative ratios —
  *  out-of-box reports read in real money; kernel-side conventions fill
- *  partial rows (r = 0.1×input, q = 1.5×input). Rows without a usable input
+ *  partial rows (r = 0.1×w, q = 4×w — kernel default ratios). Rows without a usable input
  *  price yield undefined: a profile anchored on nothing would misprice every
  *  fold. Name resolution mirrors registryLookup (#736 roots/variants);
  *  known-provider hosts resolve their own listing first, unknown relays take
