@@ -357,14 +357,27 @@ export type CompressSettings = {
      *  across the three levels like `absorb`/`reasoning`; off unless enabled at some
      *  level. See src/reasoning-guard.ts. */
     reasoningGuard?: ReasoningGuardConfig;
-     /** [#1093] Output-side compression levers — verbosity steering (a conciseness
-      *  directive appended to the system-prompt tail) and effort routing (clamp an
-      *  already-sent effort field down on mechanical continuation turns). Resolved
-      *  through this same three-level cascade; sub-fields are validated by the
-      *  kernel's resolveOutputSteeringConfig at resolution time (an out-of-range value
-      *  falls back to its default with a warning rather than rejecting the whole block).
-      *  Off unless enabled at some level. See src/output-steering.ts. */
+    /** [#1093] Output-side compression levers — verbosity steering (a conciseness
+     *  directive appended to the system-prompt tail) and effort routing (clamp an
+     *  already-sent effort field down on mechanical continuation turns). Resolved
+     *  through this same three-level cascade; sub-fields are validated by the
+     *  kernel's resolveOutputSteeringConfig at resolution time (an out-of-range value
+     *  falls back to its default with a warning rather than rejecting the whole block).
+     *  Off unless enabled at some level. See src/output-steering.ts. */
     outputSteering?: Partial<OutputSteeringConfig>;
+    /** [#1279] Price profile for the session cache-economics report
+     *  (`acp_cache` / `/acp-cache` / `GET /__bili/cache-report`). Normalized
+     *  multipliers over the input-token unit (p_in = 1): `w` = cacheWrite/input,
+     *  `r` = cacheRead/input, `q` = output/input — e.g. Anthropic ≈ {w:1, r:0.1,
+     *  q:4}, DeepSeek-V3 ≈ {w:1, r:0.1, q:1.5}. Drives ONLY the per-fold
+     *  one-time-cost / breakeven-turns / paid-back verdicts in the report — it
+     *  never affects compression triggers, cadence, or any wire behavior. Each
+     *  unset field falls back to the kernel default (w=1, r=0.1, q=4); a fully
+     *  unset profile yields byte-identical reports to pre-#1279 behavior. The
+     *  last request's effective value is stamped onto the session and used by
+     *  every report face. Merged sub-field-wise across the three levels like
+     *  `absorb`. */
+    priceProfile?: { w?: number; r?: number; q?: number };
 };
 export type PromptCacheRouting = "auto" | "enabled" | "disabled";
 export type UpstreamProxyMode = "auto" | "manual" | "direct";
@@ -1390,6 +1403,22 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
             // Shape-guard only: sub-field validation is the kernel resolver's job at
             // resolution time, so one out-of-range value can't nuke the whole block.
             out.outputSteering = os as Partial<OutputSteeringConfig>;
+        }
+    }
+    if ("priceProfile" in obj && obj.priceProfile !== undefined) {
+        const pp = obj.priceProfile;
+        if (!pp || typeof pp !== "object" || Array.isArray(pp)) {
+            ok = false;
+        } else {
+            const ppo = pp as Record<string, unknown>;
+            const cleaned: NonNullable<CompressSettings["priceProfile"]> = {};
+            for (const key of ["w", "r", "q"] as const) {
+                if (!(key in ppo)) continue;
+                const v = ppo[key];
+                if (typeof v !== "number" || !Number.isFinite(v) || v < 0) { ok = false; continue; }
+                cleaned[key] = v;
+            }
+            if (ok) out.priceProfile = cleaned;
         }
     }
     if (!ok) return undefined;

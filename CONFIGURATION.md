@@ -432,12 +432,31 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
   - `markerText: string` — nudge text appended as a commentary message each continued round (default `"Continue thinking..."`).
   - `base: number` / `offset: number` — the lattice signature `tokens == base*n + offset` (defaults `518` / `-2`). Override if another model family truncates on a different lattice.
   - `debugLog: boolean` — verbose per-round logging (default `false`).
+   ```jsonc
+   // enable globally
+   { "compress": { "reasoningGuard": { "enabled": true } } }
+    // tune per provider (placement scopes it to that provider's traffic)
+    { "providers": { "https://your-relay.example": { "compress": { "reasoningGuard": { "enabled": true, "maxContinue": 2 } } } } }
+   ```
+
+#### `priceProfile`
+
+- **Type:** `object` (`{ w?, r?, q? }`, all non-negative numbers)
+- **Default:** *(unset — reports then price folds from the request model's models.dev price row in absolute $/Mtok; only models the registry cannot resolve fall back to the kernel's built-in relative ratios `{ w: 1, r: 0.1, q: 4 }`)*
+- **Status:** ACTIVE
+- **Description:** Price profile for the **cache-economics verdicts** in the session cache report (`acp_cache` tool / `/acp-cache` command / `GET /__bili/cache-report`, #800/#1279). The per-fold P&L fields (`oneTimeCostUnits`, `perTurnSavingUnits`, `breakevenTurns`, `paidBack`) are computed from three multipliers over the input-token unit: `w` (cache-write cost), `r` (cache-read cost), `q` (output cost). Two unit conventions coexist, both printed verbatim in the report header (`FOLD ECONOMICS (N folds @ w=.. r=.. q=..)`):
+  - **User config** uses **ratios normalized to the input price (p_in = 1)**: `w` = cacheWrite ÷ input, `r` = cacheRead ÷ input, `q` = output ÷ input. Sub-fields merge deepest-wins across the three levels like every other CompressSettings field (set `q` at provider level, refine one field at model level); fields left unset within a partial profile fall back to the kernel ratios `w: 1`, `r: 0.1`, `q: 4`.
+  - **Registry default** (no level sets the key): derived from the request model's models.dev price row — **absolute $/Mtok**, `w = cost.input`, `r = cost.cache_read ?? 0.1 × input`, `q = cost.output ?? 1.5 × input` (convention fallbacks for rows without those fields). Direct-to-provider traffic gets that host's own listing; unknown relays get the first matching listing across hosts (with a one-time warning when listings conflict). Live registry wins when reachable, bundled snapshot is the offline floor (#282).
+  User config wins wholesale — a profile set at any level is never mixed field-by-field with the registry row. The last request's effective value is stamped onto the session, so every report face prices folds with the profile that governed that session's most recent turn. **Report-only**: the profile never affects compression triggers, cadence, or any wire behavior. User-config examples (override the registry row, e.g. for relays with custom markup):
   ```jsonc
-  // enable globally
-  { "compress": { "reasoningGuard": { "enabled": true } } }
-   // tune per provider (placement scopes it to that provider's traffic)
-   { "providers": { "https://your-relay.example": { "compress": { "reasoningGuard": { "enabled": true, "maxContinue": 2 } } } } }
+  // DeepSeek-V3 ≈ low output multiple
+  { "providers": { "https://api.deepseek.com": { "compress": { "priceProfile": { "w": 1, "r": 0.1, "q": 1.5 } } } } }
+  // OpenAI GPT-4o/o-series: 50% cached-read discount, flat writes, 4× output
+  { "providers": { "https://api.openai.com": { "compress": { "priceProfile": { "w": 1, "r": 0.5, "q": 4 } } } } }
+  // Self-hosted / free tier: everything costs zero tokens of your budget
+  { "compress": { "priceProfile": { "w": 0, "r": 0, "q": 0 } } }
   ```
+  Use list prices relative to the same model's normal input price; relays with custom markup should use their effective rates.
 
 #### `outputSteering`
 

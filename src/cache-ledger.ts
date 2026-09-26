@@ -7,6 +7,7 @@ import {
     type CacheTotals,
     type CompressionBlock,
     type FoldEvent,
+    type PriceProfile,
 } from "acp-kernel";
 import { log as loggerLog } from "./logger.js";
 import type { Session } from "./session.js";
@@ -220,8 +221,29 @@ export function recordCacheSample(session: Session, s: { at: number; input: numb
     agg.tr += dec.ttlRepay;
 }
 
+/** [#1279] Price profile stamped by the last request (server.ts runPrepare).
+ *  Metadata is persisted user-editable JSON, so re-validate on read: only
+ *  finite non-negative numbers survive — a corrupt stamp degrades to the
+ *  kernel defaults instead of poisoning the report. */
+function stampedPriceProfile(session: Session): PriceProfile | undefined {
+    const v = session.metadata?.cachePriceProfile;
+    if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
+    const o = v as Record<string, unknown>;
+    const out: PriceProfile = {};
+    for (const key of ["w", "r", "q"] as const) {
+        const n = o[key];
+        if (typeof n === "number" && Number.isFinite(n) && n >= 0) out[key] = n;
+    }
+    return Object.keys(out).length > 0 ? out : undefined;
+}
+
 export function buildSessionCacheReport(session: Session): CacheReport {
     const led = getCacheLedger(session);
+    // Effective profile = stamped value over kernel defaults (w=1, r=0.1, q=4),
+    // mirroring the per-field fallback inside computeFoldEconomics. Unstamped
+    // sessions keep the pre-#1279 Anthropic-ratio output byte-for-byte.
+    const price = stampedPriceProfile(session);
+    const effective: Required<PriceProfile> = { w: price?.w ?? 1, r: price?.r ?? 0.1, q: price?.q ?? 4 };
     const a = led.agg;
     const totals: CacheTotals = {
         requests: a.requests,
@@ -247,11 +269,11 @@ export function buildSessionCacheReport(session: Session): CacheReport {
             T: f.T,
             requestsAfter: f.requestsAfter,
             turnsToNextFold: f.k,
-        }),
+        }, effective),
     );
     return {
         generatedAt: Date.now(),
-        profile: { w: 1.0, r: 0.1, q: 4.0 },
+        profile: effective,
         totals,
         economics: summarizeFoldEconomics(folds),
         folds,
