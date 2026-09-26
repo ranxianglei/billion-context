@@ -94,6 +94,7 @@ test("wire-contract ledger: every rule has a live enforcement clause", () => {
             { model: "m", max_tokens: 1, messages: [], prompt_cache_key: "sess" },
         ],
         "openai-chat": [
+            { model: "gemini-synthetic", tools: [{ type: "function", function: { name: "compress", parameters: { type: "object", properties: { content: { type: ["array", "string"] } } } } }] },
             { tools: [{ type: "function", function: { name: "x".repeat(65), parameters: { type: "object", properties: {} } } }] },
             { tools: [{ type: "function", function: { name: "ok", parameters: { anyOf: [] } } }] },
         ],
