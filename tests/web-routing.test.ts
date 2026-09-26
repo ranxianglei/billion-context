@@ -259,8 +259,10 @@ test("#154: PUT /__bili/config with compress hot-applies the global compress blo
     const base = `http://127.0.0.1:${port}`;
     try {
         const ui = await (await fetch(`${base}/__bili/`)).text();
+        // #1426: config editors restored — provider routes & global compress settings are editable textareas
         assert.match(ui, /compress-json/);
-        assert.match(ui, /save-compress/);
+        assert.match(ui, /<textarea/);
+        assert.match(ui, /save-compress|save-providers/);
 
         const before = await (await fetch(`${base}/__bili/config`)).json() as { compress: unknown };
         assert.equal(before.compress, null);
@@ -300,10 +302,10 @@ test("#154: PUT /__bili/config with compress hot-applies the global compress blo
 
 // Regression: the file's compress block may carry the global injection
 // toggles (injectTool / injectNudge — FileConfig.compress, honored by
-// loadOptions via `=== false`). GET returns the raw file block, so the web
-// UI's compress textarea shows them, and an unchanged save must round-trip
-// them: dropping them silently flips injectTool:false back to the enabled
-// default on the next loadOptions().
+// loadOptions via `=== false`). GET returns the raw file block and the web
+// UI displays it verbatim (read-only), so a PUT of the displayed value must
+// round-trip unchanged: dropping fields would silently flip injectTool:false
+// back to the enabled default on the next loadOptions().
 test("compress round-trip preserves injectTool/injectNudge injection toggles", async () => {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
@@ -338,8 +340,8 @@ test("compress round-trip preserves injectTool/injectNudge injection toggles", a
     if (!proxy.listening) await once(proxy, "listening");
     const base = `http://127.0.0.1:${port}`;
     try {
-        // UI flow: GET shows the file block (incl. the toggles); "save" sends
-        // the textarea content back unchanged.
+        // UI flow: GET shows the file block (incl. the toggles); echoing the
+        // displayed value back via PUT must leave the file unchanged.
         const before = await (await fetch(`${base}/__bili/config`)).json() as { compress: Record<string, unknown> };
         assert.deepEqual(before.compress, toggles);
         const put = await fetch(`${base}/__bili/config`, {

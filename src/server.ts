@@ -71,7 +71,7 @@ import { buildSessionCacheReport } from "./cache-ledger.js";
 import { preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateRawBodyTokens, type PreflightResult } from "./preflight.js";
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
 import { imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, type ResolvedImageBilling } from "./image-tokens.js";
-import { renderUI, handleConfigGet, handleConfigPut } from "./web/index.js";
+import { renderUI, handleConfigGet, handleConfigPut, buildOverview, buildSessionList, buildSessionDetail } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
 import { conflictScanEnabled, isDesignAbsorbed, scanClientPlugins, sniffScanClient } from "./thirdparty-scan.js";
 import { recordConflict, summarizeConflicts } from "./conflict-watch.js";
@@ -875,6 +875,9 @@ async function handle(
     if (req.method === "GET" && req.url === "/__bili/stats") return sendStats(res);
     if (req.method === "GET" && req.url?.startsWith("/__bili/cache-report")) return sendCacheReport(res, req.url);
     if (req.method === "GET" && req.url === "/__bili/status") return sendStatus(res, opts);
+    if (req.method === "GET" && req.url === "/__bili/overview") return sendOverview(res, opts);
+    if (req.method === "GET" && req.url === "/__bili/sessions") return sendWebSessions(res);
+    if (req.method === "GET" && req.url?.startsWith("/__bili/sessions/") && req.url.endsWith("/detail")) return sendWebSessionDetail(res, req.url);
     if (req.method === "GET" && req.url === "/") {
         // Browser visits root → redirect to the web UI. curl / health probes
         // (Accept: */* or no Accept) still get the JSON health check so
@@ -5666,6 +5669,54 @@ async function sendStatus(res: http.ServerResponse, opts: ProxyOptions): Promise
     }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ version: VERSION, diskVersion, stale, autoRestartOnUpdate: opts.autoRestartOnUpdate, inFlight: totalInFlight(), conflicts: summarizeConflicts(listSessions()) }, null, 2));
+}
+
+async function sendOverview(res: http.ServerResponse, opts: ProxyOptions): Promise<void> {
+    let diskVersion: string | undefined;
+    let stale = false;
+    try {
+        ({ diskVersion, stale } = await detectStaleInstall(PACKAGE_NAME, VERSION));
+    } catch {
+        // fs hiccup: report running state only, never fail the overview endpoint
+    }
+    const overview = await buildOverview();
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+        overview,
+        version: VERSION,
+        diskVersion,
+        stale,
+        autoRestartOnUpdate: opts.autoRestartOnUpdate,
+        inFlight: totalInFlight(),
+        blindTunnels: getBlindTunnelStats(),
+        conflicts: summarizeConflicts(listSessions()),
+        passthrough: { enabled: !!opts.passthrough, source: opts.passthroughSource },
+    }, null, 2));
+}
+
+async function sendWebSessions(res: http.ServerResponse): Promise<void> {
+    const sessions = await buildSessionList();
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ sessions }, null, 2));
+}
+
+async function sendWebSessionDetail(res: http.ServerResponse, url: string): Promise<void> {
+    const prefix = "/__bili/sessions/";
+    const suffix = "/detail";
+    let id = "";
+    try {
+        id = decodeURIComponent(url.slice(prefix.length, -suffix.length));
+    } catch {
+        // malformed percent-encoding → treat as unknown session (404 below)
+    }
+    const detail = await buildSessionDetail(id);
+    if (!detail) {
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: `unknown session: ${id}` }));
+        return;
+    }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(detail, null, 2));
 }
 
 function headerValue(req: http.IncomingMessage, name: string): string | undefined {
