@@ -1,0 +1,4 @@
+# Byte-exact golden snapshots must check out as LF on every platform (#1305).
+# Without this, Git-for-Windows' default autocrlf=true converts them to CRLF at
+# checkout and the byte-equal golden gates fail on every Windows CI run.
+tests/golden/wire-contract/*.json text eol=lf

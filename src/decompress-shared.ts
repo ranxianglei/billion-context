@@ -1,5 +1,6 @@
 import {
     collectBlockContent,
+    markBlockRestoredInline,
     parseBoundary,
     retrieveByRef,
     retrievedMessageId,
@@ -8,6 +9,7 @@ import {
     type CompressionState,
     type Config,
     type CoreMessage,
+    type InlineRestoreResult,
 } from "acp-kernel";
 import { mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -64,9 +66,12 @@ export type ProxyToolCtx = {
 /** Resolve a decompress request to a result string, honoring the `full` flag
  *  and the cross-round original-content cache on the session.
  *
- *  STATELESS RETRIEVAL: decompress is copy-paste — it changes no state. The
- *  block stays active, the forwarded view keeps folding, the cache is kept
- *  (repeat decompresses are free), and there is no expand/re-fold cycle.
+ *  STATELESS RETRIEVAL: decompress is copy-paste — the block stays active, the
+ *  forwarded view keeps folding, the cache is kept (repeat decompresses are
+ *  free), and there is no expand/re-fold cycle. The one exception is the
+ *  inline whole-block path, which additionally flags the block restoredInline
+ *  so a later compress may refold it in place (#1294 P2 / kernel K2) — a
+ *  sidecar flag only; ids and refs never move.
  *
  *  - If the block has cached originals (captured at compress time), use the
  *    cached `one` or `full` view per the flag. This is the cross-round-safe
@@ -84,7 +89,7 @@ export function resolveDecompress(
     }
     const blockId = rawBlockId.trim();
     const block = ctx.core.decompress(blockId, ctx.session.state);
-    if (!block) return `[Block ${blockId} not found]`;
+    if (!block) return resolveDerivedDecompress(args, ctx, blockId);
     const archived = preCompactionArchiveOf(ctx.session);
     if (archived[blockId] !== undefined) {
         return `[decompress FAILED: block ${blockId} is a pre-compaction archive — its content was in the history BEFORE the client's native compaction and is no longer reachable (replaced by the client's compaction summary). decompress is unavailable for archived blocks.]`;
@@ -126,7 +131,39 @@ export function resolveDecompress(
             return `${header}\n[Failed to write to ${outPath}: ${String(e)}]\n${safePrefix(body, 4000)}...`;
         }
     }
-    return `${header}\n${body}`;
+    // #398/#403 + #1294 P2 wiring (dedup of #1316 × #1298): a successful INLINE
+    // whole-block restore hands the block's re-summarization material back to
+    // the model via this tool result, and the client keeps tool results in its
+    // re-sent history — flag restoredInline so a later compress refolds the
+    // block in place (kernel K2) instead of bouncing off "already
+    // compressed". The toFile path above returns BEFORE this point and stays
+    // byte-identical to pre-refold behavior (no flag, no hint — the material
+    // lives in a temp file, not the conversation). Range restores
+    // (startId/endId) return partial content and never reach here; inactive
+    // blocks can never refold.
+    if (!block.active) return `${header}\n${body}`;
+    // The kernel result is idempotent — a repeat restore recomputes the same
+    // span, so the hint stays byte-identical across repeats (old contract:
+    // repeat decompress returns identical content). Only the FIRST restore
+    // pays the state write + persist.
+    const marked = markBlockRestoredInline(ctx.session.state, blockId);
+    if (block.restoredInline !== true) {
+        ctx.session.state = marked.state;
+        markDirty(ctx.session);
+        ctx.log(`[acp-decompress-inline] ${blockId}: flagged restoredInline${marked.result?.restoredStartRef ? ` (${marked.result.restoredStartRef}–${marked.result.restoredEndRef})` : ""}`);
+    }
+    return `${header}\n${body}\n\n${refoldHint(blockId, marked.result)}`;
+}
+
+// #1294 P2: close the loop on an inline restore — kernel K2 updates the
+// inline-restored block IN PLACE when re-compressed (same id, replaced
+// summary) instead of rejecting "already compressed". Degrades to a generic
+// hint when the kernel could not derive exact refs (e.g. multi-segment span).
+function refoldHint(blockId: string, result: InlineRestoreResult | null): string {
+    if (result !== null && result.restoredStartRef && result.restoredEndRef) {
+        return `Re-fold: call compress("${result.restoredStartRef}–${result.restoredEndRef}", <fresh summary>) → updates block ${blockId} in place (same id, new summary).`;
+    }
+    return `Re-fold: call compress over the restored messages with a fresh summary → updates block ${blockId} in place (same id, new summary).`;
 }
 
 type CoveredRefs = { raws: Array<{ raw: string; num: number }>; text: string };
@@ -256,8 +293,8 @@ function resolveDecompressRange(args: Record<string, unknown>, ctx: ProxyToolCtx
     // is deterministic, so dedupe on it — retries re-ack without queueing a
     // duplicate full-text message or inflating rangeRestores.
     const injId = retrievedMessageId(`range_${block.blockId}_${startRaw}-${endRaw}`);
-    if (!ctx.session.pendingRetrievals.some((p) => p.id === injId)) {
-        ctx.session.pendingRetrievals.push({ id: injId, role: "system", contentType: "text", text: injText });
+    if (!ctx.session.pendingRetrievals.some((p) => p.ref === injId)) {
+        ctx.session.pendingRetrievals.push({ ref: injId, tokens: 0, chars: body.length, queuedAt: Date.now(), ccr: false, injection: { id: injId, role: "system", contentType: "text", text: injText } });
         ctx.session.stats.rangeRestores = (ctx.session.stats.rangeRestores ?? 0) + 1;
     }
     markDirty(ctx.session);
@@ -281,6 +318,54 @@ function safePrefix(text: string, n: number): string {
  *  blocks at all" (searching is pointless until compress runs — an explicit
  *  message stops premature-search retry loops, #714) from "blocks exist but none
  *  matched". */
+// #1333: read-only fallback for explicitly derived sessions (pi RLM child:
+// the plugin reported its parent at register and the server recorded the
+// link in metadata.derivedFromSessionId). Local miss → walk the parent chain
+// (depth cap 8, cycle-guarded), resident-or-disk. Ancestor state is never
+// mutated: no restoredInline flag, no cache write, no markDirty.
+const DERIVED_CHAIN_MAX_DEPTH = 8;
+
+export function derivedAncestorSessions(session: Session): Session[] {
+    const out: Session[] = [];
+    const seen = new Set<string>([session.id]);
+    let cursor: Session = session;
+    while (out.length < DERIVED_CHAIN_MAX_DEPTH) {
+        const nextId: unknown = cursor.metadata.derivedFromSessionId;
+        if (typeof nextId !== "string" || nextId.length === 0 || seen.has(nextId)) break;
+        seen.add(nextId);
+        const next: Session | undefined = peekSession(nextId) ?? getStore().loadSync(nextId) ?? undefined;
+        if (!next) break;
+        out.push(next);
+        cursor = next;
+    }
+    return out;
+}
+
+function resolveDerivedDecompress(
+    args: Record<string, unknown>,
+    ctx: ProxyToolCtx,
+    blockId: string,
+): string {
+    for (const anc of derivedAncestorSessions(ctx.session)) {
+        const block = ctx.core.decompress(blockId, anc.state);
+        if (!block) continue;
+        if (preCompactionArchiveOf(anc)[blockId] !== undefined) {
+            return `[decompress FAILED: block ${blockId} is a pre-compaction archive in derived session ${anc.id} — its content was replaced by the client's compaction summary and is no longer reachable.]`;
+        }
+        if (typeof args.startId === "string" || typeof args.endId === "string") {
+            return `[decompress FAILED: range restore (startId/endId) of derived-parent blocks is not supported — decompress "${blockId}" without range args (#1333)]`;
+        }
+        const full = args.full === true;
+        const cached = anc.blockContents.get(blockId);
+        const view = cached ? (full ? cached.full : (cached.one ?? cached.full)) : undefined;
+        const body = view?.text || block.summary;
+        const count = view?.count ?? 0;
+        const header = `[Block ${blockId} content — ${count} item(s)${full ? ", full" : ""} · read-only from derived session ${anc.id} (#1333)]`;
+        return `${header}\n${body}`;
+    }
+    return `[Block ${blockId} not found]`;
+}
+
 export function executeSearchContext(
     args: Record<string, unknown>,
     core: CompressionCore,
@@ -330,7 +415,22 @@ export function executeSearchContextTarget(
     const requested = typeof args.conversation_id === "string" ? args.conversation_id.trim() : "";
     // #1125: honor the param description's "Defaults to the current conversation" —
     // the literal "current" (any case) resolves to this session, not the foreign lookup.
-    if (!requested || requested === sessionId || requested.toLowerCase() === "current") return executeSearchContext(args, core, state);
+    if (!requested || requested === sessionId || requested.toLowerCase() === "current") {
+        const local = executeSearchContext(args, core, state);
+        // #1333: a derived session (pi RLM child) has no blocks of its own —
+        // fall back to the recorded parent chain (read-only) instead of a
+        // bare "nothing to search".
+        if (local.startsWith("[No compressed blocks exist yet") || local.startsWith('[No blocks matched "')) {
+            const self2 = peekSession(sessionId);
+            if (self2) {
+                for (const anc of derivedAncestorSessions(self2)) {
+                    if (!core.search(String(args.query ?? ""), anc.state).length) continue;
+                    return executeSearchContext(args, core, anc.state, anc.id);
+                }
+            }
+        }
+        return local;
+    }
     // A self-reference under an alias form (canonical pfa-* id) keeps plain
     // current-session semantics — no "historical session" framing.
     const self = peekSession(requested) ?? findSessionByCanonicalId(requested);

@@ -481,3 +481,152 @@ describe("legacy session state file (#920)", () => {
         assert.deepEqual(cfg.permission, { deny: ["x"] });
     });
 });
+
+import http from "node:http";
+import { once } from "node:events";
+
+describe("derived-session inheritance report (#1362)", () => {
+    type Register = { conversationId?: string; agent?: string; identity?: boolean; parentConversationId?: string };
+
+    async function startProxy(failFirst = 0): Promise<{ origin: string; registers: Register[]; close(): Promise<void> }> {
+        const registers: Register[] = [];
+        let failuresLeft = failFirst;
+        const server = http.createServer((req, res) => {
+            if (req.url === "/__bili/plugin/register" && req.method === "POST") {
+                let body = "";
+                req.on("data", (c) => (body += c));
+                req.on("end", () => {
+                    registers.push(JSON.parse(body));
+                    if (failuresLeft > 0) {
+                        failuresLeft -= 1;
+                        res.writeHead(500);
+                        res.end("{}");
+                    } else {
+                        res.writeHead(200, { "content-type": "application/json" });
+                        res.end(JSON.stringify({ ok: true }));
+                    }
+                });
+            } else {
+                res.writeHead(404);
+                res.end("{}");
+            }
+        });
+        server.listen(0, "127.0.0.1");
+        await once(server, "listening");
+        const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+        return { origin, registers, close: () => new Promise<void>((r) => server.close(() => r())) };
+    }
+
+    async function waitFor(label: string, pred: () => boolean, timeoutMs = 5000): Promise<void> {
+        const deadline = Date.now() + timeoutMs;
+        while (!pred() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+        assert.ok(pred(), `timeout waiting for ${label}`);
+    }
+
+    function v1Deps(extra: Record<string, unknown> = {}) {
+        return { z: fakeZ, forward: async () => "", ...extra };
+    }
+
+    it("reports a child's parentID once through the identity register channel", async () => {
+        const proxy = await startProxy();
+        try {
+            let gets = 0;
+            const client = { session: { get: async () => { gets += 1; return { data: { id: "ses_child", parentID: "ses_parent" } }; } } };
+            const hooks = createV1ServerHooks(() => proxy.origin, { client }, v1Deps());
+            const headers: Record<string, string> = {};
+            await hooks["chat.headers"]?.({ sessionID: "ses_child" }, { headers });
+            assert.equal(headers["x-bili-plugin-conversation"], "ses_child");
+            await waitFor("register", () => proxy.registers.length >= 1);
+            assert.deepEqual(proxy.registers[0], { conversationId: "ses_child", agent: "opencode", identity: true, parentConversationId: "ses_parent" });
+            await hooks["chat.headers"]?.({ sessionID: "ses_child" }, { headers: {} });
+            await new Promise((r) => setTimeout(r, 50));
+            assert.equal(proxy.registers.length, 1, "no repeat register");
+            assert.equal(gets, 1, "SDK lookup cached per session");
+        } finally {
+            await proxy.close();
+        }
+    });
+
+    it("root sessions (no parentID) send nothing extra", async () => {
+        const proxy = await startProxy();
+        try {
+            const client = { session: { get: async () => ({ data: { id: "ses_root" } }) } };
+            const hooks = createV1ServerHooks(() => proxy.origin, { client }, v1Deps());
+            await hooks["chat.headers"]?.({ sessionID: "ses_root" }, { headers: {} });
+            await hooks["chat.headers"]?.({ sessionID: "ses_root" }, { headers: {} });
+            await new Promise((r) => setTimeout(r, 80));
+            assert.deepEqual(proxy.registers, []);
+        } finally {
+            await proxy.close();
+        }
+    });
+
+    it("self-parent and absent SDK seam are inert", async () => {
+        const proxy = await startProxy();
+        try {
+            const selfParent = createV1ServerHooks(() => proxy.origin, { client: { session: { get: async () => ({ data: { id: "ses_self", parentID: "ses_self" } }) } } }, v1Deps());
+            await selfParent["chat.headers"]?.({ sessionID: "ses_self" }, { headers: {} });
+            await new Promise((r) => setTimeout(r, 80));
+            assert.deepEqual(proxy.registers, []);
+            const bare = createV1ServerHooks(() => proxy.origin, {}, v1Deps());
+            await bare["chat.headers"]?.({ sessionID: "ses_bare" }, { headers: {} });
+            await new Promise((r) => setTimeout(r, 80));
+            assert.deepEqual(proxy.registers, []);
+        } finally {
+            await proxy.close();
+        }
+    });
+
+    it("a failed register retries after the cooldown window", async () => {
+        const proxy = await startProxy(1);
+        try {
+            const client = { session: { get: async () => ({ data: { id: "ses_c", parentID: "ses_p" } }) } };
+            const hooks = createV1ServerHooks(() => proxy.origin, { client }, v1Deps({ derivedRetryMs: 60 }));
+            await hooks["chat.headers"]?.({ sessionID: "ses_c" }, { headers: {} });
+            await waitFor("failed register attempt", () => proxy.registers.length >= 1);
+            await hooks["chat.headers"]?.({ sessionID: "ses_c" }, { headers: {} });
+            assert.equal(proxy.registers.length, 1, "throttled during cooldown");
+            await new Promise((r) => setTimeout(r, 100));
+            await hooks["chat.headers"]?.({ sessionID: "ses_c" }, { headers: {} });
+            await waitFor("retry register", () => proxy.registers.length >= 2);
+            assert.deepEqual(proxy.registers[1], { conversationId: "ses_c", agent: "opencode", identity: true, parentConversationId: "ses_p" });
+        } finally {
+            await proxy.close();
+        }
+    });
+
+    it("an SDK failure backs off, then recovers on a later request", async () => {
+        const proxy = await startProxy();
+        try {
+            let failNext = true;
+            const client = { session: { get: async () => { const fail = failNext; failNext = false; if (fail) throw new Error("sdk down"); return { data: { id: "ses_s", parentID: "ses_sp" } }; } } };
+            const hooks = createV1ServerHooks(() => proxy.origin, { client }, v1Deps({ derivedRetryMs: 60 }));
+            await hooks["chat.headers"]?.({ sessionID: "ses_s" }, { headers: {} });
+            await new Promise((r) => setTimeout(r, 30));
+            assert.deepEqual(proxy.registers, [], "no register while the SDK is down");
+            await new Promise((r) => setTimeout(r, 60));
+            await hooks["chat.headers"]?.({ sessionID: "ses_s" }, { headers: {} });
+            await waitFor("recovered register", () => proxy.registers.length >= 1);
+            assert.equal(proxy.registers[0]?.parentConversationId, "ses_sp");
+        } finally {
+            await proxy.close();
+        }
+    });
+
+    it("legacy sessions never trigger derivation reporting", async () => {
+        const proxy = await startProxy();
+        try {
+            let gets = 0;
+            const client = { session: { get: async () => { gets += 1; return { data: { parentID: "ses_p" } }; } } };
+            const hooks = createV1ServerHooks(() => proxy.origin, { client }, v1Deps({ isLegacy: () => true }));
+            const headers: Record<string, string> = {};
+            await hooks["chat.headers"]?.({ sessionID: "ses_legacy" }, { headers });
+            assert.equal(headers["x-bili-plugin-bypass"], "1");
+            await new Promise((r) => setTimeout(r, 50));
+            assert.equal(gets, 0, "session.get never consulted for legacy traffic");
+            assert.deepEqual(proxy.registers, []);
+        } finally {
+            await proxy.close();
+        }
+    });
+});

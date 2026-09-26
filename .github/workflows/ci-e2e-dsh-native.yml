@@ -1,0 +1,55 @@
+name: e2e-native-dsh
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-native-dsh-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e-native-dsh:
+    name: real dsh headless profile lane vs deterministic fake upstream (zero tokens)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # Pinned like pi-stable in ci-e2e-native.yml (#1246): dsh's profile/
+      # bundle API surface must not drift under this suite. Bump deliberately
+      # after re-running the suite locally on the new version.
+      - name: Install dsh CLI
+        run: npm i -g @deepseek-ai/dsh@0.1.5-rc.3
+
+      - name: Print dsh version
+        run: dsh --version
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Run real-dsh native-lane compression E2E
+        env:
+          E2E_DSH_BIN: dsh
+        run: ACP_TEST_E2E_DSH_NATIVE=1 node --import tsx --test tests/e2e/e2e-native-dsh.test.ts
+
+      - name: Collect E2E artifacts
+        if: failure()
+        run: |
+          mkdir -p tmp/e2e-artifacts
+          for d in tmp/e2e-native-dsh-*; do [ -d "$d" ] && cp -r "$d" tmp/e2e-artifacts/ || true; done
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: e2e-native-dsh-artifacts
+          path: tmp/e2e-artifacts
+          if-no-files-found: ignore

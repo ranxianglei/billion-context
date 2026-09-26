@@ -191,3 +191,63 @@ asserts the four user-facing guarantees of #1239:
 `.github/workflows/ci-e2e-native.yml` runs the suite on every PR and on
 `workflow_dispatch` with pi pinned (`pi-stable@0.83.6`), same discipline as
 the codex pin (#815).
+
+---
+
+## Native-lane suite (`e2e-native-opencode.test.ts`) — real `opencode` plugin-native vs deterministic fake
+
+`ACP_TEST_E2E_OC_NATIVE=1` gates the suite (`npm test` stays free). It drives
+the **real `opencode` CLI** in headless `run` mode with bili's native plugin
+(`dist/agent/opencode-native.js` — the self-spawn lane; V1 `.server()` on 1.x,
+V2 `setup` on 2.x; `E2E_OC_BIN` picks the binary) through the **same
+deterministic fake** (`fake-upstream-chat.mjs`, zero tokens), asserting the
+same four #1239 guarantees on the opencode surface:
+
+1. **interception + plugin-mode claim** — every upstream request (including
+   the title side-channel call) carries `x-bili-plugin: opencode` +
+   `x-bili-plugin-conversation: ses_…`;
+2. **session binding + status reachable** — `/__bili/plugin/status` answers
+   `{ok:true}` for the bound conversation while the proxy is alive (the `/acp`
+   slash command itself is TUI-only — `run` dispatches no commands);
+3. **the model can call `acp_status`** — host-side registration (zod interop
+   on V1, tool-transform on V2) with the kernel status report re-sent in
+   history;
+4. **the model can call `compress` and compression actually happens** — the
+   scripted call cites run-one filler's real ref tag, the result reports the
+   fold, the follow-up request carries the plugin-mode carrier (tool call +
+   result pair in history), the proxy logs the plugin-channel execution, and
+   (after a graceful proxy stop) the persisted session carries ≥1 block.
+
+### Mechanics (opencode-specific deltas vs the pi lane)
+
+- Config is `$XDG_CONFIG_HOME/opencode/opencode.json` under hermetic XDG +
+  HOME: a custom openai-compatible `fake` provider pointing at the fake plus
+  the plugin entry — a bare dist path on 1.x, a wrapper directory (`index.js`
+  re-export) on 2.x.
+- v2 `run` rides a managed `serve --service` process on a channel-derived
+  FIXED port; the suite pins `service.json` to a unique free port per context
+  (collision-proof) and kills the recorded service pid in teardown.
+- Both versions fire a side-channel title-generation request sharing the
+  scripted queue key; the fake recognizes it (“You are a title generator” /
+  “Generate a title…”) and answers inertly without touching queues.
+- The compress target is harvested deterministically: the oracle records
+  `lastUserRef` (the ACP tag prefix of the last user message), so the fold
+  run cites run one's filler ref directly instead of guessing among example
+  tags embedded in kernel prompt text. Two plain intermediate runs first push
+  the filler outside the kernel's protected zone (last 5 messages + most
+  recent user message).
+- Between runs the suite waits (bounded) for the parent-watched proxy to
+  exit, so no run races a mid-shutdown attach.
+- Spawn cwd outside the repo tree (#815 — opencode walks up for AGENTS.md,
+  and this repo's AGENTS.md carries literal `<acp>` examples) and hermetic
+  `TMPDIR` (bun-based binaries scratch there; host `/tmp` can be read-only).
+- `E2E_CHECK=1` runs a zero-cost preflight (binary version, built
+  `dist/agent/opencode-native.js`, fake `/v1/models` probe). `E2E_OC_BIN` /
+  `E2E_TMO` override the binary and per-run timeout.
+
+### CI
+
+`.github/workflows/ci-e2e-native-opencode.yml` runs the suite on every PR and
+on `workflow_dispatch` with `@opencode/cli@2.0.3` pinned (V2 lane), same
+discipline as the pi/codex pins (#815). The V1 lane (1.x) is exercised by the
+same suite via `E2E_OC_BIN`.

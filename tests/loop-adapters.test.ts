@@ -268,6 +268,93 @@ test("anthropic adapter (#299): stitched terminal after proxy-tool re-request ca
     }
 });
 
+// #1310: the stitched stream's CLIENT-VISIBLE bytes must carry usage in
+// exactly ONE frame — the synthetic terminal. Pre-fix, round-1's raw
+// message_start (pre-fold usage) was forwarded verbatim alongside the
+// post-fold terminal; Claude Code merged input from the terminal with
+// cache_read from the start (94720 + 166610 = 262k > 200k) and refused every
+// further turn locally ("Prompt is too long", session permanently locked).
+test("anthropic adapter (#1310): forwarded message_start is usage-neutral — the terminal is the sole usage authority", async () => {
+    const round1 = [
+        `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_1", usage: { input_tokens: 4, cache_read_input_tokens: 166610, cache_creation_input_tokens: 618 } } })}\n\n`,
+        `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_s", name: "acp_status", input: {} } })}\n\n`,
+        `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: "{}" } })}\n\n`,
+        `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`,
+        `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 1 } })}\n\n`,
+        `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+    ].join("");
+    const round2 = [
+        `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_2", usage: { input_tokens: 94720, cache_read_input_tokens: 93000, cache_creation_input_tokens: 120 } } })}\n\n`,
+        `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}\n\n`,
+        `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "done" } })}\n\n`,
+        `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`,
+        `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 3 } })}\n\n`,
+        `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+    ].join("");
+    let fetchCalls = 0;
+    const orig = globalThis.fetch;
+    globalThis.fetch = (async () => { fetchCalls++; return new Response(round2, { status: 200 }); }) as typeof fetch;
+    try {
+        const ctx = { ...makeCtx("anthropic-1310-stitched"), protocol: "anthropic" };
+        const out = await drain(
+            new Response(round1, { status: 200 }).body!,
+            ctx,
+            createAnthropicAdapter({ model: "claude" }),
+            { model: "claude", messages: [], stream: true, max_tokens: 10 },
+        );
+        assert.equal(fetchCalls, 1, "re-request after proxy tool");
+        const frames = out.split("\n").filter((l) => l.startsWith("data: ")).map((l) => JSON.parse(l.slice(6)) as Record<string, unknown>);
+        const start = frames.find((f) => f.type === "message_start");
+        assert.ok(start, "start frame forwarded");
+        const startUsage = ((start!.message as Record<string, unknown>).usage ?? {}) as Record<string, unknown>;
+        assert.equal(startUsage.input_tokens, 0, "#1310: forwarded start carries NO stale pre-fold usage");
+        assert.equal(startUsage.cache_read_input_tokens, undefined, "#1310: no stale cache_read for a host to merge");
+        const usageFrames = frames.filter((f) => (f.usage ?? undefined) !== undefined && Object.keys(f.usage as Record<string, unknown>).length > 0);
+        assert.equal(usageFrames.length, 1, "the synthetic terminal is the ONLY usage-bearing frame");
+        const terminalUsage = usageFrames[0]!.usage as Record<string, unknown>;
+        assert.equal(terminalUsage.input_tokens, 94720, "terminal: final round input");
+        assert.equal(terminalUsage.cache_read_input_tokens, 93000, "terminal: final round cache_read");
+        assert.equal(terminalUsage.cache_creation_input_tokens, 120, "terminal: cache_creation rides the sole authority frame");
+        assert.equal(terminalUsage.output_tokens, 3, "terminal: output");
+        const maxHostTotal = 94720 + 93000 + 120;
+        assert.ok(maxHostTotal < 200000, "every merge rule (sum/max/start) now reconstructs a sub-window context");
+        assert.equal(ctx.session.stats.lastInputTokens, 187840, "internal ledger unchanged: real final-round total (input+cache_read+creation), not the zeroed start");
+    } finally {
+        globalThis.fetch = orig;
+    }
+});
+
+// #1310 companion: a NON-stitched turn keeps its final usage identical — the
+// zeroed start loses nothing because the terminal already carried the same
+// numbers the start frame had.
+test("anthropic adapter (#1310): non-stitched turn — zeroed start, identical final usage via terminal", async () => {
+    const single = [
+        `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_1", usage: { input_tokens: 4, cache_read_input_tokens: 165132, cache_creation_input_tokens: 618 } } })}\n\n`,
+        `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}\n\n`,
+        `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } })}\n\n`,
+        `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`,
+        `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 3 } })}\n\n`,
+        `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+    ].join("");
+    const ctx = { ...makeCtx("anthropic-1310-single"), protocol: "anthropic" };
+    const out = await drain(
+        new Response(single, { status: 200 }).body!,
+        ctx,
+        createAnthropicAdapter({ model: "claude" }),
+        { model: "claude", messages: [], stream: true, max_tokens: 10 },
+    );
+    const frames = out.split("\n").filter((l) => l.startsWith("data: ")).map((l) => JSON.parse(l.slice(6)) as Record<string, unknown>);
+    const start = frames.find((f) => f.type === "message_start");
+    const startUsage = ((start!.message as Record<string, unknown>).usage ?? {}) as Record<string, unknown>;
+    assert.equal(startUsage.input_tokens, 0, "start neutral here too (one consistent rule)");
+    const usageFrames = frames.filter((f) => (f.usage ?? undefined) !== undefined && Object.keys(f.usage as Record<string, unknown>).length > 0);
+    assert.equal(usageFrames.length, 1, "single usage-bearing frame");
+    const terminalUsage = usageFrames[0]!.usage as Record<string, unknown>;
+    assert.equal(terminalUsage.input_tokens, 4, "terminal carries the numbers the start frame had");
+    assert.equal(terminalUsage.cache_read_input_tokens, 165132);
+    assert.equal(terminalUsage.cache_creation_input_tokens, 618);
+});
+
 test("anthropic adapter: acp_status-only round → marker + re-request, no crash", async () => {
     const round1 = [
         `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_1", usage: { input_tokens: 3 } } })}\n\n`,

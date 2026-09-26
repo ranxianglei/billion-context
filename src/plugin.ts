@@ -1,18 +1,18 @@
-import { type CompressionCore, type Config, type CoreMessage, type NudgeDecision, defaultCountTokens } from "acp-kernel";
+import { type CompressionCore, type Config, type CoreMessage, type NudgeDecision, countMessageTokens } from "acp-kernel";
 import { buildStatusPanel } from "acp-kernel/panel";
 import { fileURLToPath } from "node:url";
 import type { ServerResponse } from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { acquireInFlight, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, withSessionLock, type Session } from "./session.js";
-import { ABSORB_TOOL, ABSORB_TOOL_NAME, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES, PROXY_TOOL_NAMES, RETRIEVE_TOOL_NAME, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_CONVERSATION_ID_PARAM, SEARCH_CONTEXT_TOOL_NAME, retrieveToolsFor } from "./compress-tool.js";
+import { ABSORB_TOOL_NAME, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES, PROXY_TOOL_NAMES, RETRIEVE_TOOL_NAME, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_CONVERSATION_ID_PARAM, SEARCH_CONTEXT_TOOL_NAME, absorbToolsFor, retrieveToolsFor } from "./compress-tool.js";
 import { absorbEnabled, effectiveAbsorbConfig, isProxyToolFor } from "./absorb.js";
 import { effectiveRulesConfig, rulesEnabled } from "./rules-feature.js";
 import { executeProxyTool } from "./loop/core.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
-import { composeStreamFilters, containsMarkerLineText, containsRenderTagText, createMarkerLineFilter, createTagEchoFilter, mayStartMarkerLine, mayStartRenderTag, stripAcpTags, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
+import { composeStreamFilters, containsMarkerLineText, containsRenderTagText, containsToolCallXmlFragment, createMarkerLineFilter, createTagEchoFilter, mayStartMarkerLine, mayStartRenderTag, stripAcpTags, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
-import { ccrEnabled, contentStoreOf, retrieveToolName } from "./store.js";
+import { ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "./store.js";
 import { imageUsageSuffix } from "./image-compress.js";
 import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
 import { degenerateTurnWarning } from "./degenerate-turn.js";
@@ -263,6 +263,28 @@ export function recordPluginSession(conversationId: string, sessionId: string): 
  *  sees the exact refs the model was shown (mirrors the wire-mode loop, which
  *  runs executeProxyTool against prepared.processedMessages). */
 export function rememberPluginMessages(sessionId: string, processed: CoreMessage[], original: CoreMessage[], nudge?: NudgeDecision): void {
+    // #1307: auxiliary requests (auto-review / classifier prompts) bound to the
+    // same session key can carry a normal output budget and any message count,
+    // so both the ≤200 heuristic and size-based guards are proxies that a new
+    // host shape walks through. The causal signal is IDENTITY: a main turn
+    // RESENDS the conversation, so it always carries messages the previous
+    // snapshot already holds (content-hash ids are stable); an auxiliary
+    // prompt shares NOTHING with it by construction. A zero-overlap view that
+    // is also smaller than the snapshot is therefore not a continuation —
+    // refuse to evict (the tool API anchors compress ranges from this
+    // snapshot; losing it dangles every long-session ref). Known cost: a
+    // genuine restart on the same session id keeps the stale snapshot for one
+    // round; the next resending turn self-heals. Fresh sessions and larger or
+    // overlapping views always write.
+    const incoming = processed.length > 0 ? processed : original;
+    const previous = remembered.get(sessionId);
+    if (previous) {
+        const previousView = previous.processed.length > 0 ? previous.processed : previous.original;
+        if (previousView.length > incoming.length) {
+            const knownIds = new Set(previousView.map((m) => m.id));
+            if (!incoming.some((m) => knownIds.has(m.id))) return;
+        }
+    }
     const staleSessionIds = new Set(
         [...remembered.keys()].filter((id) => id === sessionId || !peekSession(id)),
     );
@@ -278,7 +300,7 @@ export function rememberPluginMessages(sessionId: string, processed: CoreMessage
 // (server.ts binding step): that session becomes plugin-mode (native tools,
 // wire injection suppressed) and the conversation id becomes its tool-API key
 // — no x-bili-plugin headers required.
-export type PendingPluginRegister = { conversationId: string; agent: string; ts: number };
+export type PendingPluginRegister = { conversationId: string; agent: string; ts: number; parentConversationId?: string };
 
 /** Runtime-info protocol entry (#955): what the client's OWN config says it
  *  will run — reported at plugin bootstrap and on model switch, before (and
@@ -365,7 +387,7 @@ const pendingRegisters: PendingPluginRegister[] = [];
  *  false` (headless codex spawn) means requests carry no matching id — bind
  *  the next NEW session instead. Splitting the two keeps a foreign session
  *  from eating an identity registration it can never claim. */
-export function queuePluginRegister(conversationId: string, agent: string, identity: boolean): void {
+export function queuePluginRegister(conversationId: string, agent: string, identity: boolean, parentConversationId?: string): void {
     if (!identity) {
         for (let i = 0; i < pendingRegisters.length; i++) {
             if (pendingRegisters[i]!.conversationId === conversationId) {
@@ -373,10 +395,10 @@ export function queuePluginRegister(conversationId: string, agent: string, ident
                 break;
             }
         }
-        pendingRegisters.push({ conversationId, agent, ts: Date.now() });
+        pendingRegisters.push({ conversationId, agent, ts: Date.now(), ...(parentConversationId ? { parentConversationId } : {}) });
         while (pendingRegisters.length > MAX_PENDING_REGISTERS) pendingRegisters.shift();
     } else {
-        registeredIds.set(conversationId, agent);
+        registeredIds.set(conversationId, { agent, ...(parentConversationId ? { parentConversationId } : {}) });
         while (registeredIds.size > MAX_PENDING_REGISTERS) {
             const oldest = registeredIds.keys().next().value;
             if (oldest !== undefined) registeredIds.delete(oldest);
@@ -402,16 +424,16 @@ export function takePendingPluginRegister(): PendingPluginRegister | undefined {
     }
     return pendingRegisters.shift();
 }
-const registeredIds = new Map<string, string>();
+const registeredIds = new Map<string, { agent: string; parentConversationId?: string }>();
 
 /** Identity-driven binding (#162): hosts whose model requests carry the SAME
  *  id the MCP shell registered (claude code: every request has
  *  x-claude-code-session-id === CLAUDE_CODE_SESSION_ID === the registered
  *  conversation id) bind the moment any of their requests shows up — no
  *  ordering race with the shell's initialize. */
-export function consumePluginRegisterFor(conversationId: string): string | undefined {
-    const agent = registeredIds.get(conversationId);
-    if (agent !== undefined) {
+export function consumePluginRegisterFor(conversationId: string): { agent: string; parentConversationId?: string } | undefined {
+    const entry = registeredIds.get(conversationId);
+    if (entry !== undefined) {
         // The registration describes the CONVERSATION, not a one-shot token:
         // switching models/upstreams mid-conversation resolves to a NEW
         // session (session key = protocol|upstream|apiKey|conversation) that
@@ -419,13 +441,13 @@ export function consumePluginRegisterFor(conversationId: string): string | undef
         // drop back to wire mode on every switch. Keep the entry and refresh
         // LRU order so the size cap evicts least-recently-active conversations.
         registeredIds.delete(conversationId);
-        registeredIds.set(conversationId, agent);
+        registeredIds.set(conversationId, entry);
     }
-    return agent;
+    return entry;
 }
 
 export function handlePluginRegister(payload: string, res: import("node:http").ServerResponse): void {
-    let parsed: { conversationId?: unknown; agent?: unknown; identity?: unknown };
+    let parsed: { conversationId?: unknown; agent?: unknown; identity?: unknown; parentConversationId?: unknown };
     try {
         parsed = JSON.parse(payload) as { conversationId?: unknown; agent?: unknown; identity?: unknown };
     } catch {
@@ -440,7 +462,11 @@ export function handlePluginRegister(payload: string, res: import("node:http").S
         return;
     }
     const agent = typeof parsed.agent === "string" && parsed.agent.trim() ? parsed.agent.trim() : "launcher";
-    queuePluginRegister(conversationId, agent, parsed.identity === true);
+    // [#1333] optional declared derivation (pi RLM child): the parent
+    // conversation the proxy should seed this conversation from.
+    let parentConversationId = typeof parsed.parentConversationId === "string" ? parsed.parentConversationId.trim() : "";
+    if (parentConversationId === conversationId) parentConversationId = "";
+    queuePluginRegister(conversationId, agent, parsed.identity === true, parentConversationId || undefined);
     res.end(JSON.stringify({ ok: true, conversationId, agent }));
 }
 
@@ -538,7 +564,11 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
     // per-request provider/model overrides may still differ (conservative: the
     // manifest never advertises what the base config disables) and per-session
     // enablement stays enforced at execution (isProxyToolFor / executeProxyTool).
+    // #1359: the advertised name is the base-config toolName, matching the
+    // plugin-lane gate (which adjudicates the same base block).
     const absorbOn = absorbEnabled(config);
+    const absorbName = config.absorb?.toolName ?? ABSORB_TOOL_NAME;
+    const absorbTools = absorbOn ? absorbToolsFor(absorbName) : undefined;
     const rulesOn = rulesEnabled(config);
     // [#1271] acp_retrieve is advertised only while the base config enables CCR (same
     // #1192 conservative rule as absorb/acp_rule). The proxy wires it on the anthropic/
@@ -553,11 +583,11 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
         protocolVersion: PLUGIN_PROTOCOL_VERSION,
         proxy: "billion-context",
         version: VERSION,
-        toolNames: [...PROXY_TOOL_NAMES, ...(absorbOn ? [ABSORB_TOOL_NAME] : []), ...(rulesOn ? [RULE_TOOL_NAME] : []), ...(ccrOn ? [ccrName] : [])],
+        toolNames: [...PROXY_TOOL_NAMES, ...(absorbTools ? [absorbName] : []), ...(rulesOn ? [RULE_TOOL_NAME] : []), ...(ccrOn ? [ccrName] : [])],
         tools: {
-            anthropic: withSearchContextConversationDescription([...BILI_ACP_TOOLS_ANTHROPIC, ...(absorbOn ? [ABSORB_TOOL] : []), ...(rulesOn ? [RULE_TOOL] : []), ...(ccrTools ? [ccrTools.anthropic] : [])].map(withConversationIdParam)),
-            openai: withSearchContextConversationDescription([...BILI_ACP_TOOLS_OPENAI, ...(absorbOn ? [ABSORB_TOOL_OPENAI] : []), ...(rulesOn ? [RULE_TOOL_OPENAI] : []), ...(ccrTools ? [ccrTools.openai] : [])].map(withConversationIdParam)),
-            responses: withSearchContextConversationDescription([...BILI_ACP_TOOLS_RESPONSES, ...(absorbOn ? [ABSORB_TOOL_RESPONSES] : []), ...(rulesOn ? [RULE_TOOL_RESPONSES] : [])].map(withConversationIdParam)),
+            anthropic: withSearchContextConversationDescription([...BILI_ACP_TOOLS_ANTHROPIC, ...(absorbTools ? [absorbTools.anthropic] : []), ...(rulesOn ? [RULE_TOOL] : []), ...(ccrTools ? [ccrTools.anthropic] : [])].map(withConversationIdParam)),
+            openai: withSearchContextConversationDescription([...BILI_ACP_TOOLS_OPENAI, ...(absorbTools ? [absorbTools.openai] : []), ...(rulesOn ? [RULE_TOOL_OPENAI] : []), ...(ccrTools ? [ccrTools.openai] : [])].map(withConversationIdParam)),
+            responses: withSearchContextConversationDescription([...BILI_ACP_TOOLS_RESPONSES, ...(absorbTools ? [absorbTools.responses] : []), ...(rulesOn ? [RULE_TOOL_RESPONSES] : [])].map(withConversationIdParam)),
         },
         headers: { agent: PLUGIN_AGENT_HEADER, conversation: PLUGIN_CONVERSATION_HEADER, contextWindow: PLUGIN_CONTEXT_WINDOW_HEADER, maxOutput: PLUGIN_MAX_OUTPUT_HEADER, model: PLUGIN_MODEL_HEADER, instructionsMutable: PLUGIN_INSTRUCTIONS_MUTABLE_HEADER },
         toolEndpoint: "/__bili/plugin/tool",
@@ -598,7 +628,7 @@ function conversationIdForSession(sessionId: string): string | undefined {
  *  back from the wire notes). Paths 2/3 record the resolved mapping so later
  *  calls hit path 1 directly. Read-only w.r.t. creation: an unknown id finds
  *  nothing and creates nothing. */
-function resolveConversation(conversationId: string): { session: Session | undefined; entry?: ConversationEntry } {
+export function resolveConversation(conversationId: string): { session: Session | undefined; entry?: ConversationEntry } {
     const entry = conversations.get(conversationId);
     let session = entry ? peekSession(entry.sessionId) : undefined;
     if (!session) {
@@ -734,7 +764,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
             nudge = deps.core.processTurn({
                 messages,
                 state: session.state,
-                config: ccrEnabled(session) ? pluginCfg : { ...pluginCfg, ccr: undefined },
+                config: ccrLoopConfig(session, pluginCfg),
                 tokenCount: session.stats.lastInputTokens,
                 renderTags: "none",
                 contentStore: contentStoreOf(session),
@@ -761,8 +791,10 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
             state: session.state,
             nudge,
             modelContextLimit,
+            // #1320: countMessageTokens includes host-projected thinking mass
+            // (signature-only blocks) on the same scale as the breakdown rows.
             unprunedTokens: mem && mem.original.length > 0
-                ? mem.original.reduce((sum, m) => sum + defaultCountTokens(m.text ?? ""), 0) + systemPromptTokens
+                ? mem.original.reduce((sum, m) => sum + countMessageTokens(m), 0) + systemPromptTokens
                 : undefined,
         });
     } catch {
@@ -1156,6 +1188,9 @@ export async function pipePluginChatWithStrip(
     let sawToolUse = false;
     let sawThinking = false;
     let visibleTextChars = 0;
+    /** Post-filter prose of every attempt, for the once-per-request #361
+     *  tool-call-XML warn at stream end (#1368): warn only, never stripped. */
+    let proseAcc = "";
     /** Of that text, the chars released from a held markup span (the
      *  unclosed-tag case): markup the filter declined to swallow. A turn whose
      *  only visible output is this is as dead to the host as an empty one. */
@@ -1266,6 +1301,7 @@ export async function pipePluginChatWithStrip(
             const tail = s.filter.flush();
             if (tail.length > 0) {
                 out += syntheticTail(s, tail);
+                proseAcc += tail;
                 if (s.field === "content" || s.field === "text") {
                     visibleTextChars += tail.length;
                     releasedMarkupChars += tail.length;
@@ -1315,9 +1351,22 @@ export async function pipePluginChatWithStrip(
             log?.(msg);
         }
     };
+    // #1368: parity with the proxy pipe's #361 detector (src/server.ts) — model
+    // prose carrying tool-call-shaped XML (a call drafted as literal text) is
+    // logged once per request for attribution. Warn only: stripping is
+    // forbidden, a shape-based match cannot tell an echo from legitimate prose
+    // discussing such markup (#295/#361). Off the per-frame hot path by design.
+    const maybeWarnProtocolFragment = () => {
+        if (proseAcc.length === 0 || !containsToolCallXmlFragment(proseAcc)) return;
+        const who = session ? `[${session.id}] ` : "";
+        const msg = `[tag-echo] ${who}plugin passthrough: response text contains tool-call XML fragment (possible tag echo; not stripped)`;
+        loggerLog("warn", msg);
+        log?.(msg);
+    };
     const pushField = (field: string, index: number, text: string): [string, boolean] => {
         const s = filterFor(field, index);
         const clean = s.filter.push(text);
+        if (clean.length > 0) proseAcc += clean;
         return [clean, clean !== text];
     };
     const processOpenai = (ev: Record<string, unknown>, rawEvent: string): string => {
@@ -1348,7 +1397,10 @@ export async function pipePluginChatWithStrip(
                 hadText = true;
                 if (field !== "content" && v.length > 0) sawThinking = true;
                 if (!mayStartRenderTag(v) && !mayStartMarkerLine(v) && !anyPending()) {
-                    if (v.length > 0) keptText = true;
+                    if (v.length > 0) {
+                        keptText = true;
+                        proseAcc += v;
+                    }
                     if (field === "content") visibleTextChars += v.length;
                     continue;
                 }
@@ -1410,6 +1462,7 @@ export async function pipePluginChatWithStrip(
         const raw = d[field] as string;
         if (field === "thinking" && raw.length > 0) sawThinking = true;
         if (!mayStartRenderTag(raw) && !mayStartMarkerLine(raw) && !anyPending()) {
+            if (raw.length > 0) proseAcc += raw;
             if (field === "text" && raw.length > 0) visibleTextChars += raw.length;
             return rawEvent + "\n\n";
         }
@@ -1477,7 +1530,10 @@ export async function pipePluginChatWithStrip(
                 // shares held-back state.
                 const field = p["thought"] === true ? "thinking" : "text";
                 if (!mayStartRenderTag(raw) && !mayStartMarkerLine(raw) && !anyPending()) {
-                    if (raw.length > 0) keptText = true;
+                    if (raw.length > 0) {
+                        keptText = true;
+                        proseAcc += raw;
+                    }
                     if (field === "text") visibleTextChars += raw.length;
                     continue;
                 }
@@ -1612,6 +1668,7 @@ export async function pipePluginChatWithStrip(
         // stream completes, and those must already see this usage.
         settleUsage();
         maybeWarnDegenerate();
+        maybeWarnProtocolFragment();
         if (truncated) {
             emitUpstreamTruncation(res, protocol, finalFinishReason !== undefined, log);
             return;
@@ -1746,6 +1803,9 @@ export async function pipePluginResponsesWithStrip(
     let inRetry = false;
     /** Text the client actually assembled from this attempt's deltas. */
     let visibleTextChars = 0;
+    /** Post-filter prose for the once-per-request #361 tool-call-XML warn at
+     *  stream end (#1368): warn only, never stripped. */
+    let proseAcc = "";
     /** Done-family events held for the attempt in flight. */
     let heldEvents: string[] = [];
     /** Text those held events would hand the client, post-strip. */
@@ -1789,6 +1849,15 @@ export async function pipePluginResponsesWithStrip(
             log?.(msg);
         }
     };
+    // #1368: once-per-request #361 detector for the Responses pipe — see the
+    // chat-pipe twin above for the warn-only rationale (#295/#361).
+    const maybeWarnProtocolFragment = () => {
+        if (proseAcc.length === 0 || !containsToolCallXmlFragment(proseAcc)) return;
+        const who = session ? `[${session.id}] ` : "";
+        const msg = `[tag-echo] ${who}plugin passthrough: response text contains tool-call XML fragment (possible tag echo; not stripped)`;
+        loggerLog("warn", msg);
+        log?.(msg);
+    };
     let lastDeltaMeta: { item_id?: unknown; output_index?: unknown } | null = null;
     const flushTail = (after: string) => {
         const tail = tagFilter.flush();
@@ -1802,7 +1871,7 @@ export async function pipePluginResponsesWithStrip(
     /** Visible (post-strip) text a done-family event carries — what the client
      *  would assemble from it. It decides the turn's degeneracy together with
      *  the deltas already forwarded. */
-    const responsesEventTextLength = (ev: Record<string, unknown>): number => {
+    const responsesEventText = (ev: Record<string, unknown>): string => {
         let text = typeof ev["text"] === "string" ? (ev["text"] as string) : "";
         const part = ev["part"];
         if (part && typeof part === "object" && typeof (part as Record<string, unknown>)["text"] === "string") {
@@ -1817,7 +1886,7 @@ export async function pipePluginResponsesWithStrip(
                 }
             }
         }
-        return text.length;
+        return text;
     };
     /** Whether a serialized event must be rebuilt rather than forwarded: the
      *  retry's ids are rewritten in the parsed event, and a processor with
@@ -2003,6 +2072,7 @@ export async function pipePluginResponsesWithStrip(
                         const hadEcho = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr);
                         if (hadEcho) sawStrippedEcho = true;
                         const evOut = hadEcho ? stripResponsesText(ev) : ev;
+                        proseAcc += responsesEventText(evOut);
                         const out = hadEcho ? rebuildEvent(rawEvent, evOut) : rawEvent + "\n\n";
                         await write(flushArgTails() + flushTail(out));
                         continue;
@@ -2018,7 +2088,9 @@ export async function pipePluginResponsesWithStrip(
                         let rebuild = hadEchoText || retryRewritePending();
                         if (rebuild) evOut = stripResponsesText(ev);
                         rewriteRetryIds(evOut);
-                        heldVisibleChars += responsesEventTextLength(evOut);
+                        const doneText = responsesEventText(evOut);
+                        heldVisibleChars += doneText.length;
+                        proseAcc += doneText;
                         heldEvents.push(rebuild ? rebuildEvent(rawEvent, evOut) : rawEvent + "\n\n");
                         continue;
                     }
@@ -2076,6 +2148,7 @@ export async function pipePluginResponsesWithStrip(
                             continue;
                         }
                         if (!retryRewritePending() && !mayStartRenderTag(delta) && !mayStartMarkerLine(delta) && !tagFilter.pending()) {
+                            proseAcc += delta;
                             await write(rawEvent + "\n\n");
                             continue;
                         }
@@ -2090,6 +2163,7 @@ export async function pipePluginResponsesWithStrip(
                             continue;
                         }
                         visibleTextChars += clean.length;
+                        proseAcc += clean;
                         if (clean === delta && !retryRewritePending()) {
                             await write(rawEvent + "\n\n");
                             continue;
@@ -2110,12 +2184,14 @@ export async function pipePluginResponsesWithStrip(
                             continue;
                         }
                         if (!mayStartRenderTag(v) && !argAnyPending() && !tagFilter.pending()) {
+                            proseAcc += v;
                             await write(rawEvent + "\n\n");
                             continue;
                         }
                         const s = argStreamFor(type, argField, ev);
                         const clean = s.filter.push(v);
                         if (clean.length === 0) continue;
+                        proseAcc += clean;
                         if (clean === v) {
                             await write(flushArgTails() + rawEvent + "\n\n");
                             continue;
@@ -2135,6 +2211,7 @@ export async function pipePluginResponsesWithStrip(
             if (rest.length > 0) await write(rest);
         }
         maybeWarnDegenerate();
+        maybeWarnProtocolFragment();
         settleUsage();
         // #721: same as the chat-pipe twin — never close bare on a missing
         // done-family event. Responses has no separate finish-reason concept
@@ -2319,4 +2396,8 @@ export function _resetPluginStateForTest(): void {
     registeredIds.clear();
     pluginRuntimeTable.clear();
     warnedNoModelRequests.clear();
+}
+
+export function _rememberedForTest(): Map<string, RememberedMessages> {
+    return remembered;
 }

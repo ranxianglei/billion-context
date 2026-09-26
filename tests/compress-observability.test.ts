@@ -120,6 +120,41 @@ test("#349: empty compress args → actionable no-valid-ranges message (missing-
     assert.ok(!out.includes("Check your startId/endId parameters"), "old misleading hint removed");
 });
 
+test("#1366: truly-empty call gets the targeted no-re-issue receipt (no loop bait)", () => {
+    const ctx = makeCompressibleCtx();
+    const out = runApply(ctx, {});
+    assert.ok(out.startsWith("[Compression FAILED"), `expected failure, got: ${out}`);
+    assert.ok(out.includes("carried no content at all"), out);
+    assert.ok(out.includes("kind=missing-content"), out);
+    assert.ok(out.includes("Do NOT re-issue an empty call"), out);
+    assert.ok(!out.includes("Re-issue the compress call with a valid content array"), "old loop-bait tail gone: " + out);
+    assert.ok(out.includes("non-empty 'content' array") && out.includes("{startId, endId, summary}"), "#349 steering kept");
+});
+
+test("#1366: empty-string arguments get the same targeted receipt (kind=empty-input)", () => {
+    const ctx = makeCompressibleCtx();
+    const out = runApply(ctx, "");
+    assert.ok(out.includes("carried no content at all"), out);
+    assert.ok(out.includes("kind=empty-input"), out);
+    assert.ok(!out.includes("Re-issue the compress call with a valid content array"), out);
+});
+
+test("#1366: empty calls are still recorded by the #847 repeat-failure guard", () => {
+    const ctx = makeCompressibleCtx();
+    runApply(ctx, {});
+    const keys = ctx.session.metadata["compressFailKeys"] as unknown[];
+    assert.equal(keys.length, 1, "failure recorded");
+    assert.match(String(keys[0]), /^parse:missing-content:0:/, String(keys));
+});
+
+test("#1366/#362: shape drift ({ranges: …}) keeps the format lecture — re-issue IS right there", () => {
+    const ctx = makeCompressibleCtx();
+    const out = runApply(ctx, { ranges: [{ startId: "m00001", endId: "m00002", summary: "s" }] });
+    assert.ok(out.includes("kind=missing-content"), out);
+    assert.ok(out.includes("Re-issue the compress call with a valid content array"), "lecture retained: " + out);
+    assert.ok(!out.includes("carried no content at all"), "not mislabeled as empty: " + out);
+});
+
 test("#189: staged-compress steering note appended when shrink exceeds the configured max", () => {
     const prev = process.env.BILI_MAX_SHRINK_PER_COMPRESS;
     process.env.BILI_MAX_SHRINK_PER_COMPRESS = "0.05";

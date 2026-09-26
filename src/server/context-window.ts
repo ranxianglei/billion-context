@@ -1,3 +1,6 @@
+import { tierGatedStandardWindow } from "../config.js";
+import { log as loggerLog } from "../logger.js";
+
 // #300: bili→bili chain marker. When a bili instance forwards a request it has
 // processed upstream, it stamps this header with its own instance id. A bili
 // instance that RECEIVES a request already carrying it knows an upstream bili
@@ -94,4 +97,43 @@ export function anthropicBetaContextWindow(headers: Record<string, string | stri
         if (best === undefined || w > best) best = w;
     }
     return best;
+}
+
+// #1321: an [Nm]-suffixed model name (e.g. "claude-opus-5-5[1m]") is the
+// client's own declaration that THIS request runs on the expanded tier — the
+// same evidence class as the context-Nm beta header, carried in the model id
+// instead of a header. Resolved like the header: N × 1,000,000 clamped to
+// MAX_ANTHROPIC_BETA_WINDOW (#1064 #12).
+export function expandedContextSuffixWindow(model: string | undefined): number | undefined {
+    if (!model) return undefined;
+    const m = /\[(\d+)m\]$/i.exec(model.trim());
+    if (!m) return undefined;
+    const n = Number.parseInt(m[1], 10);
+    if (!Number.isFinite(n) || n <= 0) return undefined;
+    return Math.min(n * 1_000_000, MAX_ANTHROPIC_BETA_WINDOW);
+}
+
+// #1321: models.dev advertises the MAX window a tier-gated model id can serve;
+// without per-request tier evidence (context-Nm beta header / [Nm] suffix) the
+// client's plan serves the STANDARD window, and budgeting against the
+// advertised max pushes every percentage threshold beyond the client's own
+// wall (#1310 item 2). Cap registry-derived windows at the built-in standard
+// window for those families. Operator sources (per-model config, launcher
+// windows, plugin report, runtime-info) are exempt — they are deployment-
+// specific truth, never registry guesses. One info line per model so the cap
+// is visible in the log instead of silently re-sizing thresholds.
+const registryWindowCappedLogged = new Set<string>();
+export function capRegistryWindowByStandard(
+    model: string,
+    registryWindow: number | undefined,
+    hasTierEvidence: boolean,
+): number | undefined {
+    if (registryWindow === undefined || hasTierEvidence) return registryWindow;
+    const std = tierGatedStandardWindow(model);
+    if (std === undefined || registryWindow <= std) return registryWindow;
+    if (!registryWindowCappedLogged.has(model)) {
+        registryWindowCappedLogged.add(model);
+        loggerLog("info", `[window] registry advertises ${registryWindow} for ${model} but the request carries no tier evidence (context-Nm beta header / [Nm] suffix) — capping at the built-in standard ${std} (#1321)`);
+    }
+    return std;
 }

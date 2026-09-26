@@ -87,6 +87,38 @@ function remapIndexInEvent(eventStr: string, newIndex: number): Buffer {
     return Buffer.from(rebuilt.join("\n") + "\n\n", "utf8");
 }
 
+/** #1310: zero the usage object of a forwarded `message_start`. The real
+ *  values are captured into the round ledger BEFORE this runs — only the
+ *  client-visible bytes change. On a stitched multi-round stream (in-stream
+ *  compress → re-request) the start frame's pre-fold usage is stale the moment
+ *  round 2 begins, and no host merge rule (start-preference / sum / max) can
+ *  un-see it: Claude Code kept the start's cache_read next to the terminal's
+ *  post-fold input (262k > 200k → "Prompt is too long", session locked).
+ *  Neutralizing the start makes the synthetic terminal the SOLE usage
+ *  authority on the wire; a zeroed usage object stays schema-valid. */
+function neutralizeStartUsage(eventStr: string): Buffer {
+    const lines = eventStr.split("\n");
+    const rebuilt: string[] = [];
+    for (const l of lines) {
+        if (l.startsWith("data:")) {
+            const jsonStr = l.slice(5).replace(/^ /, "");
+            try {
+                const obj = JSON.parse(jsonStr) as Record<string, unknown>;
+                if (typeof obj === "object" && obj !== null && obj.type === "message_start") {
+                    const msg = obj.message as Record<string, unknown> | undefined;
+                    if (msg && typeof msg === "object") {
+                        msg.usage = { input_tokens: 0, output_tokens: 0 };
+                        rebuilt.push(`data: ${JSON.stringify(obj)}`);
+                        continue;
+                    }
+                }
+            } catch { /* fall through to verbatim */ }
+        }
+        rebuilt.push(l);
+    }
+    return Buffer.from(rebuilt.join("\n") + "\n\n", "utf8");
+}
+
 function rewriteTextDeltaEvent(eventStr: string, newIndex: number, newText: string): Buffer {
     const lines = eventStr.split("\n");
     const rebuilt: string[] = [];
@@ -179,12 +211,14 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
         outputTokens: number,
         inputTokens: number,
         cachedTokens: number,
+        creationTokens?: number,
     ): Buffer => {
         const usage: Record<string, unknown> = {
             input_tokens: inputTokens,
             output_tokens: outputTokens,
             cache_read_input_tokens: cachedTokens,
         };
+        if (typeof creationTokens === "number") usage.cache_creation_input_tokens = creationTokens;
         const extra: Record<string, unknown> = {};
         if (messageId) extra.id = messageId;
         if (model) extra.model = model;
@@ -258,10 +292,17 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                     if (typeof u.cache_read_input_tokens === "number") roundCached = u.cache_read_input_tokens;
                     if (typeof u.cache_creation_input_tokens === "number") roundCreation = u.cache_creation_input_tokens;
                     if (round === 1) {
-                        // The raw message_start (with the provider's measured
-                        // usage) reaches the host verbatim — no rewriting.
+                        // #1310: forward the start frame usage-NEUTRAL. The real
+                        // values were captured above; on a stitched stream the
+                        // pre-fold start usage is stale the moment the compress
+                        // re-request begins, and a host merging frames (Claude
+                        // Code: input from the terminal + cache_read from the
+                        // start) reconstructs a too-long context and locks the
+                        // session. The synthetic terminal stays the sole usage
+                        // authority — for non-stitched turns it carries the same
+                        // numbers the start frame had.
                         messageStartForwarded = true;
-                        yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
+                        yield { kind: "meta", chunk: neutralizeStartUsage(eventStr), firstRoundOnly: true } as ParsedStreamEvent;
                     }
                 } else if (type === "ping") {
                     yield { kind: "meta", chunk: rawBuf } as ParsedStreamEvent;
@@ -453,6 +494,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                 opts?.usage?.outputTokens ?? 0,
                 opts?.usage?.inputTokens ?? 0,
                 opts?.usage?.cachedTokens ?? 0,
+                opts?.usage?.creationTokens,
             );
         },
 

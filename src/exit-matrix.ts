@@ -115,7 +115,7 @@ export const HOST_USAGE_PASSTHROUGH: Record<WireExitId, ExitCell> = {
     },
     "proxy-anthropic-sse": {
         implementer: [startServer],
-        contract: "message_start/message_delta usage frames credited, forwarded verbatim",
+        contract: "usage credited from every frame; message_start token counters neutralized on the wire (stale after an in-stream compress re-request — #1310); synthetic terminal is the sole authoritative usage frame (#660)",
         coveredBy: ["tests/host-usage-postfold.test.ts"],
     },
     "proxy-responses-sse": {

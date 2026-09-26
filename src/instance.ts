@@ -255,7 +255,7 @@ export function isPidAlive(pid: number): boolean {
     }
 }
 
-interface RegistryEntry {
+export interface RegistryEntry {
     instanceId: string;
     pid: number;
     port: number;
@@ -373,6 +373,27 @@ function readAllRegistryEntries(): RegistryEntry[] {
         }
     }
     return out;
+}
+
+/** Includes dead markers on purpose (#1235) — doctor must surface zombies; do not add liveness filtering here. */
+export function listInstances(): RegistryEntry[] {
+    return readAllRegistryEntries();
+}
+
+/** Main script path from /proc/<pid>/cmdline (Linux); undefined on other platforms or when unreadable (#1235). */
+export function procMainScript(pid: number): string | undefined {
+    if (process.platform !== "linux") return undefined;
+    let raw: string;
+    try {
+        raw = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8");
+    } catch {
+        return undefined;
+    }
+    for (const arg of raw.split("\0")) {
+        if (!arg || arg.startsWith("-")) continue;
+        if (arg.includes("/") && (arg.endsWith(".js") || arg.endsWith(".mjs") || arg.endsWith(".cjs"))) return arg;
+    }
+    return undefined;
 }
 
 function reapDeadMarkers(ours: string): void {

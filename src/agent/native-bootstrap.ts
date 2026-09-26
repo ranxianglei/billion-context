@@ -59,6 +59,16 @@ export function nativeAttachOrigin(env: NodeJS.ProcessEnv): string | undefined {
     return url.replace(/\/+$/, "");
 }
 
+/** Millisecond env-var knob (#1365): a finite positive number wins, anything
+ *  else (unset, blank, garbage, non-positive) falls back to the default so a
+ *  bad value can never produce a zero/negative timeout. */
+export function envMillis(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
+    const raw = env[name];
+    if (raw === undefined) return fallback;
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+
 /** Coexistence marker (#820): tells standalone in-process bili extensions
  *  (billion-context-pi / opencode-acp) that a host-native entry owns THIS
  *  process so they back off instead of double-compressing. Set synchronously
@@ -72,6 +82,25 @@ export function markNativeHost(env: NodeJS.ProcessEnv, host: string): void {
     if (env.BILLION_CONTEXT_NATIVE === undefined || env.BILLION_CONTEXT_NATIVE.length === 0) {
         env.BILLION_CONTEXT_NATIVE = host;
     }
+}
+
+/** True when a pi/opencode packages[] entry loads the LEGACY standalone
+ *  billion-context-pi extension (#939): npm spec (bare or versioned), or any
+ *  path whose segments contain billion-context-pi (node_modules install, git
+ *  spec or checkout path). That extension compresses IN-PROCESS, and versions
+ *  without the BILLION_CONTEXT_NATIVE stand-down (billion-context-pi#461,
+ *  unreleased at 0.1.71) cannot see the proxy their entry spawns — their
+ *  BILLION_CONTEXT_PROXY check runs at factory time, before our async
+ *  bootstrap writes it, and the fetch-layer rewrite keeps the baseUrl clean.
+ *  Co-resident = every request compressed twice, silently. Shared between the
+ *  pi host entry's co-residence net and the #1206 third-party scan because
+ *  importing pi-native.ts from a non-pi process would run its bootstrap gate. */
+export function isLegacyBcpEntry(entry: string): boolean {
+    const e = entry.trim();
+    const bare = e.replace(/^npm:/, "");
+    return bare === "billion-context-pi"
+        || /^billion-context-pi@/.test(bare)
+        || /(^|[/\\])billion-context-pi([/\\]|$)/.test(e);
 }
 
 /** Concurrent callers share one in-flight bootstrap — a burst of failures

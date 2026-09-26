@@ -6,6 +6,7 @@ import type { ProviderRoutes } from "./config.js";
 import { log as loggerLog } from "./logger.js";
 import { maskHostInText, maskUrlForLog } from "./log-mask.js";
 import { upstreamTimeoutMs } from "./fetch-util.js";
+import { classifyUpstreamFailure, UPSTREAM_FAIL_HINTS } from "./upstream-fail.js";
 
 export type ParsedHttpProxy = {
     url: string;
@@ -314,25 +315,52 @@ export function resolveProxy(
     return resolveProxyDecision(routes, globalProxy, upstreamUrl, fallback).proxy;
 }
 
+/** Keep-alive reuse ceiling for PROXIED dispatchers (#1263): common proxies
+ *  recycle idle tunnels on a 60s-ish cadence; undici honors server
+ *  Keep-Alive hints up to its 600s max, so a reused-just-recycled socket is
+ *  the classic "first request after idle dies with ECONNRESET" pattern.
+ *  Capping our reuse window BELOW the common recycle cadence trades a few
+ *  reconnects for that failure mode. Default 55s; env-tunable; 0 = uncapped
+ *  (undici defaults). Read per call so tests tune it live. */
+export const PROXY_KEEPALIVE_MAX_MS = 55_000;
+
+export function proxyKeepAliveMaxMs(): number {
+    const raw = Number(process.env.BILI_PROXY_KEEPALIVE_MAX_MS);
+    return Number.isFinite(raw) && raw < 0 ? PROXY_KEEPALIVE_MAX_MS : raw === 0 ? 0 : Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : PROXY_KEEPALIVE_MAX_MS;
+}
+
 /** Proxy dispatchers carry the same timeout policy as direct ones (#551):
  *  headersTimeout/bodyTimeout on the ProxyAgent cover every origin pool it
  *  creates (undici spreads its options into the internal Agent), while the
  *  explicit factory/clientFactory set them on hops undici builds with a bare
- *  `{ connect }` option bag (proxy-side CONNECT client, HTTP/1 proxy wrapper). */
+ *  `{ connect }` option bag (proxy-side CONNECT client, HTTP/1 proxy wrapper).
+ *  Proxied pools additionally cap keep-alive reuse (#1263) — see
+ *  PROXY_KEEPALIVE_MAX_MS. */
 export function proxyDispatcher(proxyUrl: string | undefined, timeoutMs?: number): object | undefined {
     if (!proxyUrl) return undefined;
     const t = timeoutMs ?? upstreamTimeoutMs();
-    const key = `${proxyUrl}\u0000${t}`;
+    const ka = proxyKeepAliveMaxMs();
+    const key = `${proxyUrl}\u0000${t}\u0000${ka}`;
     let agent = dispatcherCache.get(key);
     if (!agent) {
-        const withTimeouts = (options: object): object => ({ ...options, headersTimeout: t, bodyTimeout: t });
-        agent = new ProxyAgent({
+        const withTimeouts = (options: object): object => {
+            const capped: Record<string, unknown> = { ...options, headersTimeout: t, bodyTimeout: t };
+            if (ka > 0) {
+                capped.keepAliveTimeout = Math.min(typeof capped.keepAliveTimeout === "number" ? capped.keepAliveTimeout : ka, ka);
+                capped.keepAliveMaxTimeout = ka;
+            }
+            return capped;
+        };
+        const base = {
             uri: proxyUrl,
             headersTimeout: t,
             bodyTimeout: t,
-            factory: (origin, options) => new Pool(origin, withTimeouts(options)),
-            clientFactory: (origin, options) => new Pool(origin, withTimeouts(options)),
-        });
+            factory: (origin: URL, options: object) => new Pool(origin, withTimeouts(options) as ConstructorParameters<typeof Pool>[1]),
+            clientFactory: (origin: URL, options: object) => new Pool(origin, withTimeouts(options) as ConstructorParameters<typeof Pool>[1]),
+        };
+        agent = ka > 0
+            ? new ProxyAgent({ ...base, keepAliveTimeout: ka, keepAliveMaxTimeout: ka })
+            : new ProxyAgent(base);
         dispatcherCache.set(key, agent);
     }
     return agent;
@@ -481,8 +509,9 @@ function errorChain(error: unknown): Array<Record<string, unknown>> {
 
 export function formatUpstreamError(error: unknown, url: string, proxyUrl?: string): string {
     const chain = errorChain(error);
+    const kind = classifyUpstreamFailure(error, { viaProxy: proxyUrl !== undefined });
     const fields = ["code", "errno", "syscall", "address", "port"];
-    const parts: string[] = [];
+    const parts: string[] = [`kind=${kind}`];
     // Error text from undici/OS layers embeds the endpoint identity
     // ("connect ECONNREFUSED 10.0.0.5:8443", "getaddrinfo ENOTFOUND
     // relay.internal") — swap in the placeholder when the upstream is a
@@ -501,6 +530,7 @@ export function formatUpstreamError(error: unknown, url: string, proxyUrl?: stri
     if (messages.length > 0) parts.push(`message=${messages.join(" <- ")}`);
     parts.push(`url=${maskUrlForLog(url)}`);
     parts.push(`proxy=${redactProxyUrl(proxyUrl) ?? "direct"}`);
+    parts.push(`hint=${UPSTREAM_FAIL_HINTS[kind]}`);
     return parts.join(" ");
 }
 

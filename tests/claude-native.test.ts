@@ -23,8 +23,8 @@ import {
     resolveClaudeCli,
     stripClaudeManagedBlock,
 } from "../src/plugin-install.ts";
-import { CLAUDE_NATIVE_DEFAULT_PORT, clearClaudeNativePort, resolveClaudeNativePort, saveClaudeNativePort } from "../src/config.ts";
-import { chooseWatchdogParentPid, isClaudeHostArgv, isTransientShArgv, planClaudeNativeBootstrap, readPsProcInfo, readWinProcInfo, resolveClaudeHostPid } from "../src/claude-native-bootstrap.ts";
+import { CLAUDE_NATIVE_DEFAULT_PORT, clearClaudeNativePort, resolveClaudeNativePort, resolveNativeAttachExternal, saveClaudeNativePort } from "../src/config.ts";
+import { chooseWatchdogParentPid, isClaudeHostArgv, isTransientShArgv, planClaudeNativeBootstrap, readPsProcInfo, readWinProcInfo, resolveClaudeHostPid, splitWindowsCommandLine } from "../src/claude-native-bootstrap.ts";
 
 // #1248: the live tests below spawn real proxies/processes and observe real
 // /proc, ps output and network ports. On loaded shared machines (multi-agent
@@ -78,15 +78,32 @@ test("applyClaudeManagedBlock: never clobbers foreign keys", () => {
     assert.ok(notes.some((n) => n.includes("foreign value") || n.includes("left untouched")));
 });
 
-test("applyClaudeManagedBlock: preserves user SessionStart entries", () => {
+test("applyClaudeManagedBlock: preserves user SessionStart entries, refreshes ours", () => {
     const userEntry = { matcher: "startup", hooks: [{ type: "command", command: "echo hi" }] };
     const first = applyClaudeManagedBlock({ hooks: { SessionStart: [userEntry] } }, { baseUrl: baseUrlForPort(48787), hookCommand: HOOK_COMMAND });
     const entries = (first.data.hooks as Record<string, unknown[]>).SessionStart;
     assert.equal(entries.length, 2);
     assert.deepEqual(entries[0], userEntry);
     const again = applyClaudeManagedBlock(first.data, { baseUrl: baseUrlForPort(48787), hookCommand: "/moved/dist/claude-native-bootstrap.js" });
-    assert.equal((again.data.hooks as Record<string, unknown[]>).SessionStart.length, 2, "old-path entry still counts as ours");
-    assert.equal(again.notes.length, 0);
+    const after = (again.data.hooks as Record<string, unknown[]>).SessionStart;
+    assert.equal(after.length, 2, "old-path entry still counts as ours — no duplicate appended");
+    assert.deepEqual(after[0], userEntry, "user entry untouched");
+    assert.deepEqual((after[1] as { hooks: Array<{ command: string }> }).hooks, [{ type: "command", command: "/moved/dist/claude-native-bootstrap.js" }]);
+    assert.equal(again.notes.length, 1);
+});
+
+test("applyClaudeManagedBlock: rewrites a stale hook command in place (#1376)", () => {
+    // 0.1.153 on Windows wrote a backslash path plus JSON.stringify quotes;
+    // PowerShell mangles that, so the proxy never starts and every session
+    // hangs with nothing in the log. Reinstalling after the fix has to repair
+    // the settings file the old release left behind.
+    const stale = { hooks: [{ type: "command", command: 'D:\\Dev\\node\\node.exe "D:\\bili\\dist\\claude-native-bootstrap.js"' }] };
+    const current = "D:/Dev/node/node.exe D:/bili/dist/claude-native-bootstrap.js";
+    const { data, notes } = applyClaudeManagedBlock({ hooks: { SessionStart: [stale] } }, { baseUrl: baseUrlForPort(48787), hookCommand: current });
+    const entries = (data.hooks as Record<string, unknown[]>).SessionStart;
+    assert.equal(entries.length, 1);
+    assert.deepEqual((entries[0] as { hooks: Array<{ command: string }> }).hooks, [{ type: "command", command: current }]);
+    assert.ok(notes.some((n) => n.includes("refreshed")));
 });
 
 test("stripClaudeManagedBlock: round-trip removes ours, keeps user keys", () => {
@@ -146,6 +163,56 @@ test("resolveClaudeNativePort: env > default; rejects junk", () => {
     assert.equal(resolveClaudeNativePort({ BILI_CLAUDE_NATIVE_PORT: "49999" }), 49999);
     assert.equal(resolveClaudeNativePort({ BILI_CLAUDE_NATIVE_PORT: "0" }), CLAUDE_NATIVE_DEFAULT_PORT);
     assert.equal(resolveClaudeNativePort({ BILI_CLAUDE_NATIVE_PORT: "not-a-number" }), CLAUDE_NATIVE_DEFAULT_PORT);
+});
+
+// #1335: the attach-gate escape hatch — env BILI_NATIVE_ATTACH_EXTERNAL wins
+// over the config file's native.attachExternal; the file value must be exactly
+// true (garbage leaves the gate closed); default false.
+test("resolveNativeAttachExternal: env parsing (1/true open, 0/false close, junk falls through)", () => {
+    const prev = process.env.XDG_CONFIG_HOME;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-attachext-"));
+    process.env.XDG_CONFIG_HOME = dir;
+    try {
+        assert.equal(resolveNativeAttachExternal({}), false, "no env, no file → gate closed");
+        assert.equal(resolveNativeAttachExternal({ BILI_NATIVE_ATTACH_EXTERNAL: "" }), false, "blank env falls through to file");
+        assert.equal(resolveNativeAttachExternal({ BILI_NATIVE_ATTACH_EXTERNAL: "1" }), true);
+        assert.equal(resolveNativeAttachExternal({ BILI_NATIVE_ATTACH_EXTERNAL: "true" }), true);
+        assert.equal(resolveNativeAttachExternal({ BILI_NATIVE_ATTACH_EXTERNAL: " TRUE " }), true, "case-insensitive and trimmed");
+        assert.equal(resolveNativeAttachExternal({ BILI_NATIVE_ATTACH_EXTERNAL: "0" }), false);
+        assert.equal(resolveNativeAttachExternal({ BILI_NATIVE_ATTACH_EXTERNAL: "false" }), false);
+        assert.equal(resolveNativeAttachExternal({ BILI_NATIVE_ATTACH_EXTERNAL: "yes" }), false, "junk env is not a truthy answer");
+    } finally {
+        if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
+        else process.env.XDG_CONFIG_HOME = prev;
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("resolveNativeAttachExternal: file native.attachExternal requires exact true; env still wins", () => {
+    const prev = process.env.XDG_CONFIG_HOME;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-attachext-"));
+    const cfgDir = path.join(dir, "billion-context");
+    fs.mkdirSync(cfgDir, { recursive: true });
+    const cfgFile = path.join(cfgDir, "billion-context.json");
+    process.env.XDG_CONFIG_HOME = dir;
+    try {
+        fs.writeFileSync(cfgFile, JSON.stringify({ native: { attachExternal: true } }));
+        assert.equal(resolveNativeAttachExternal({}), true, "file opens the gate");
+        assert.equal(resolveNativeAttachExternal({ BILI_NATIVE_ATTACH_EXTERNAL: "0" }), false, "env 0 overrides a permissive file");
+
+        fs.writeFileSync(cfgFile, JSON.stringify({ native: { attachExternal: "true" } }));
+        assert.equal(resolveNativeAttachExternal({}), false, "string 'true' in the file is not a boolean true");
+
+        fs.writeFileSync(cfgFile, "{ not json");
+        assert.equal(resolveNativeAttachExternal({}), false, "malformed file degrades to gate-closed, never throws");
+
+        fs.rmSync(cfgFile);
+        assert.equal(resolveNativeAttachExternal({}), false, "absent file → default false");
+    } finally {
+        if (prev === undefined) delete process.env.XDG_CONFIG_HOME;
+        else process.env.XDG_CONFIG_HOME = prev;
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
 });
 
 // — hook planner ————————————————————————————————————————————
@@ -346,6 +413,45 @@ test("readWinProcInfo: parses '<ppid>\\t<commandline>', degrades to null", () =>
     assert.equal(readWinProcInfo(300, fakePs1("")), null);
     assert.equal(readWinProcInfo(300, fakePs1("Get-CimInstance : object not found\n")), null);
     assert.equal(readWinProcInfo(300, fakePs1(null)), null);
+});
+
+// #1388: Win32_Process quotes CommandLines whose paths contain spaces; a
+// naive whitespace split shreds the host path and the watchdog match fails.
+test("readWinProcInfo: quoted host path with spaces survives as one token (#1388)", () => {
+    const fakePs1 = (out: string | null) => (_cmd: string, _args: string[]): string | null => out;
+    // Reporter-verified shape: "C:\Program Files\...\opencode.exe" --flag hello world
+    assert.deepEqual(
+        readWinProcInfo(300, fakePs1('300\t"C:\\Program Files\\Apps\\opencode\\opencode.exe" --flag hello world\r\n')),
+        { argv: ["C:\\Program Files\\Apps\\opencode\\opencode.exe", "--flag", "hello", "world"], ppid: 300 },
+    );
+    // Quotes around a space-free path (what #1381's stripQuotes handled at the
+    // matching side) must parse identically.
+    assert.deepEqual(
+        readWinProcInfo(300, fakePs1('300\t"C:\\n.exe" C:\\x\\claude.exe\r\n')),
+        { argv: ["C:\\n.exe", "C:\\x\\claude.exe"], ppid: 300 },
+    );
+});
+
+// CommandLineToArgvW semantics: grouping quotes + the 2n/2n+1 backslash rule.
+test("splitWindowsCommandLine: quotes group, backslashes escape (#1388)", () => {
+    // Backslash rules: literal before a space/end-of-line; 2n-before-quote
+    // collapses to n and the quote toggles grouping; 2n+1-before-quote
+    // collapses to n plus a literal quote. String.raw keeps the counted
+    // characters visible.
+    assert.deepEqual(splitWindowsCommandLine(String.raw`a\\ b`), [String.raw`a\\`, "b"]);
+    assert.deepEqual(splitWindowsCommandLine(String.raw`a\" b`), ['a"', "b"]);
+    assert.deepEqual(splitWindowsCommandLine(String.raw`a\\\\`), [String.raw`a\\\\`]);
+    // Empty quoted segment is a real token ("" arg).
+    assert.deepEqual(splitWindowsCommandLine('"" x'), ["", "x"]);
+    // Tokens are unquoted; inner spaces survive inside quotes.
+    assert.deepEqual(splitWindowsCommandLine('"two words" x'), ["two words", "x"]);
+    // Conservation: re-joining with quotes around space-bearing tokens
+    // reproduces the original shell meaning (no token lost or invented).
+    const line = '"C:\\Program Files\\o\\o.exe" --flag "two words"';
+    const argv = splitWindowsCommandLine(line);
+    assert.equal(argv.length, 3);
+    assert.equal(argv[0], "C:\\Program Files\\o\\o.exe");
+    assert.equal(argv[2], "two words");
 });
 
 test("resolveClaudeHostPid: full walk over a ps-backed table", () => {
@@ -1051,6 +1157,12 @@ test("watcher route: shared proxies take watcher registrations, daemons refuse (
         const ok = await post({ pid: keeperPid });
         assert.equal(ok.status, 200, "live pid accepted");
         assert.match(JSON.stringify(await ok.json()), /"ok":true/, "ok:true body");
+        // #1322: health must expose the lifecycle state so callers can tell a
+        // session-owned proxy from a daemon before they commit to it.
+        const armedHealth = (await (await fetch(`${origin}/__bili/health`)).json()) as { watchdog?: { armed?: boolean; parentPid?: number; watchers?: number[] } };
+        assert.equal(armedHealth.watchdog?.armed, true, "armed proxy reports armed");
+        assert.equal(armedHealth.watchdog?.parentPid, keeperPid, "spawning owner reported");
+        assert.deepEqual(armedHealth.watchdog?.watchers, [keeperPid], "owner seeded the set");
 
         // Grace: keeper1 dies, and BEFORE the idle grace expires a new owner
         // registers (the live race: spawner exits right after a second session
@@ -1076,11 +1188,107 @@ test("watcher route: shared proxies take watcher registrations, daemons refuse (
         assert.equal((await post({ pid: process.pid })).status, 409, "daemon refuses watchers");
         await new Promise((r) => setTimeout(r, 5000));
         assert.ok(await canConnect(port), "daemon stays up — no watchdog got armed");
+        // #1322: the refusal must be visible through health — this is the field
+        // that lets an attaching session notice the lifecycle contract is void.
+        const daemonHealth = (await (await fetch(`${origin}/__bili/health`)).json()) as { watchdog?: { armed?: boolean; parentPid?: number; watchers?: number[] } };
+        assert.equal(daemonHealth.watchdog?.armed, false, "unarmed proxy reports unarmed");
+        assert.equal(daemonHealth.watchdog?.parentPid, undefined, "no owner pid");
+        assert.deepEqual(daemonHealth.watchdog?.watchers, [], "refused registration joined nothing");
     } finally {
         if (keeperPid > 1) killPid(keeperPid);
         if (keeper2Pid > 1) killPid(keeper2Pid);
         if (armed > 1) killPid(armed);
         if (daemon > 1) killPid(daemon);
+        await rmHome(home);
+    }
+});
+
+// #1322 end-to-end: the reported failure shape — a manually started daemon
+// squats on the stable port BEFORE any session begins, so every claude
+// session attaches to it and its registration is refused (409). Old code
+// swallowed that silently: the "lives and dies with the session" contract was
+// void with zero signal. Now the hook must WARN loudly on stderr while
+// staying non-destructive (the daemon keeps serving; its fate is the
+// operator's). Linux-only like the other hook e2es (fake claude walks /proc).
+test("hook e2e: unarmed squatter on the pinned port is refused loudly, not silently attached (#1322/#1335)", { timeout: 180_000, skip: LIVE_E2E ? process.platform !== "linux" : liveSkip }, async () => {
+    const distCli = path.resolve(import.meta.dirname, "..", "dist", "index.js");
+    const distScript = path.resolve(import.meta.dirname, "..", "dist", "claude-native-bootstrap.js");
+    ensureDistBuilt(distCli);
+    ensureDistBuilt(distScript);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-claude-squatter-"));
+    const xdg = { home, config: path.join(home, "cfg"), state: path.join(home, "state"), cache: path.join(home, "cache"), data: path.join(home, "data") };
+    fs.mkdirSync(path.join(home, "tmp"), { recursive: true });
+    const port = await freePort();
+    const baseEnv = {
+        PATH: process.env.PATH ?? "/usr/bin:/bin",
+        HOME: xdg.home,
+        XDG_CONFIG_HOME: xdg.config,
+        XDG_STATE_HOME: xdg.state,
+        XDG_CACHE_HOME: xdg.cache,
+        XDG_DATA_HOME: xdg.data,
+        NO_COLOR: "1",
+    };
+    const squatter = spawnProxy(distCli, port, baseEnv);
+    let claudePid = 0;
+    try {
+        assert.ok(await waitForPort(port, 60_000), "squatter daemon up on the stable port");
+        // Fake claude reproducing the live SessionStart shape: node-shebang
+        // binary (npm install form: argv [node, <path>/claude]), launches the
+        // hook through /bin/sh -c, captures hook stderr to a file, then
+        // OUTLIVES the hook like a real interactive session. Dynamic import
+        // (not require/import statements): an extensionless file's module
+        // system follows the NEAREST package.json, which differs per machine
+        // (real /tmp → CJS; sandboxed tmpdirs inside a checkout → ESM).
+        const binDir = path.join(home, "bin");
+        fs.mkdirSync(binDir, { recursive: true });
+        const claudeBin = path.join(binDir, "claude");
+        const errFile = path.join(home, "hook-stderr.txt");
+        const doneFile = path.join(home, "hook-done");
+        fs.writeFileSync(
+            claudeBin,
+            '#!/usr/bin/env node\n' +
+                'import("node:child_process").then(async ({ spawn }) => {\n' +
+                '  const fs = await import("node:fs");\n' +
+                '  const sh = spawn("/bin/sh", ["-c", process.env.HOOK_CMD], {\n' +
+                '    env: process.env,\n' +
+                '    stdio: ["ignore", fs.openSync(process.env.HOOK_ERRFILE, "w"), fs.openSync(process.env.HOOK_ERRFILE, "a")]\n' +
+                '  });\n' +
+                '  sh.on("exit", () => { try { fs.writeFileSync(process.env.HOOK_DONE, String(Date.now())); } catch {} });\n' +
+                '});\n' +
+                'setInterval(() => {}, 60000);\n',
+            { mode: 0o755 },
+        );
+        claudePid = spawn(claudeBin, [], {
+            env: { ...baseEnv, BILI_CLAUDE_NATIVE_PORT: String(port), HOOK_CMD: `"${process.execPath}" "${distScript}"`, HOOK_ERRFILE: errFile, HOOK_DONE: doneFile },
+            detached: true,
+            stdio: "ignore",
+        }).pid ?? 0;
+        assert.ok(claudePid > 1, "fake claude spawned");
+        const t0 = Date.now();
+        while (!fs.existsSync(doneFile) && Date.now() - t0 < 60_000) await new Promise((r) => setTimeout(r, 250));
+        assert.ok(fs.existsSync(doneFile), "hook completed");
+        const stderr = fs.readFileSync(errFile, "utf8");
+        // #1335 gate: the hook must REFUSE the lifecycle-less listener and say
+        // so — the old warn-but-attach behavior is what let #1322 happen.
+        assert.match(stderr, /refusing to attach/, "hook refused the squatting daemon");
+        assert.match(stderr, /NO session-lifecycle watchdog/s, "#1322: refusal surfaced instead of silently voiding the contract");
+        assert.match(stderr, /\(#1322\/#1335\)/, "warning cites the issues for operators");
+        assert.match(stderr, /native\.attachExternal=true/, "escape hatch surfaced");
+        // strictPort launch cannot self-host (the squatter owns the port), so
+        // bring-up fails fast with an actionable kill/attach-anyway hint.
+        assert.match(stderr, /bring-up failed.*lifecycle-less/s, "pinned-port fast-fail explains itself");
+        assert.match(stderr, /Kill that process \(kill \d+\)/, "actionable kill hint");
+        // Non-destructive: killing the session must NOT take the daemon down.
+        killPid(claudePid);
+        claudePid = 0;
+        await new Promise((r) => setTimeout(r, 15_000));
+        assert.ok(await canConnect(port), "daemon survives session end — operator decides its fate");
+        const h = (await (await fetch(`http://127.0.0.1:${port}/__bili/health`)).json()) as { watchdog?: { armed?: boolean; watchers?: number[] } };
+        assert.equal(h.watchdog?.armed, false, "health explains why the warning fired");
+        assert.deepEqual(h.watchdog?.watchers, []);
+    } finally {
+        if (claudePid > 1) killPid(claudePid);
+        if (squatter > 1) killPid(squatter);
         await rmHome(home);
     }
 });

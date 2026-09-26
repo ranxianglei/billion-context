@@ -1,0 +1,622 @@
+{
+  "ok": true,
+  "protocolVersion": 1,
+  "proxy": "billion-context",
+  "version": "<VERSION>",
+  "toolNames": [
+    "compress",
+    "decompress",
+    "search_context",
+    "acp_status",
+    "acp_cache"
+  ],
+  "tools": {
+    "anthropic": [
+      {
+        "name": "compress",
+        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. Line form (preferred): content = one STRING per range — first line 'm00150–m00220 optional topic', remaining lines the markdown summary written verbatim (no JSON structure, no escaping). Also accepted: object entries {startId,endId,summary,topic?} in the content array, content as a single string (bare line form or JSON-encoded array), and a flat single-range call {startId,endId,summary,topic?} without content. Use when content is genuinely consumed. REQUIRED — compress without content or flat range fields is invalid.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "topic": {
+              "type": "string",
+              "description": "Optional short title for the compressed range"
+            },
+            "content": {
+              "type": [
+                "array",
+                "string"
+              ],
+              "description": "One or more ranges to compress into separate summary blocks. Array form (preferred): one entry per range — line form (one STRING per range: first line 'm00150–m00220 optional topic', remaining lines the markdown summary verbatim) or object form {startId,endId,summary,topic?}. String form also accepted: bare line-form text, or a JSON-encoded array of ranges (some gateways stringify arrays). REQUIRED unless the flat single-range form is used.",
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "description": "Line form: first line 'm00150–m00220 optional topic', remaining lines the summary markdown, verbatim (no JSON escaping)"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "topic": {
+                        "type": "string"
+                      },
+                      "startId": {
+                        "type": "string",
+                        "description": "mNNNNN ref at the start of the range"
+                      },
+                      "endId": {
+                        "type": "string",
+                        "description": "mNNNNN ref at the end of the range"
+                      },
+                      "startRef": {
+                        "type": "string",
+                        "description": "Alternate spelling of startId"
+                      },
+                      "endRef": {
+                        "type": "string",
+                        "description": "Alternate spelling of endId"
+                      },
+                      "summary": {
+                        "type": "string",
+                        "description": "Self-contained summary replacing the range"
+                      }
+                    },
+                    "anyOf": [
+                      {
+                        "required": [
+                          "startId",
+                          "endId",
+                          "summary"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "startRef",
+                          "endRef",
+                          "summary"
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            "startId": {
+              "type": "string",
+              "description": "Flat single-range form (no content): mNNNNN ref at the start of the range"
+            },
+            "endId": {
+              "type": "string",
+              "description": "Flat single-range form (no content): mNNNNN ref at the end of the range"
+            },
+            "startRef": {
+              "type": "string",
+              "description": "Flat single-range form: alternate spelling of startId"
+            },
+            "endRef": {
+              "type": "string",
+              "description": "Flat single-range form: alternate spelling of endId"
+            },
+            "summary": {
+              "type": "string",
+              "description": "Flat single-range form (no content): self-contained summary replacing the range"
+            },
+            "conversation_id": {
+              "type": "string",
+              "description": "Your bili conversation id (the value from the 'your bili conversation id' line in the proxy notes). Pass it on every call when your host shares one MCP process across several concurrent conversations; omit it when the host bound the session itself."
+            }
+          }
+        }
+      },
+      {
+        "name": "decompress",
+        "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "blockId": {
+              "type": "string",
+              "description": "Block ID to decompress (e.g. b5)"
+            },
+            "toFile": {
+              "type": "string",
+              "description": "Optional: write content to file instead of context"
+            },
+            "full": {
+              "type": "boolean",
+              "description": "Restore all the way to original messages"
+            },
+            "startId": {
+              "type": "string",
+              "description": "Optional mNNNNN message ref, inclusive lower bound of a sub-range of this block. With endId, restores only that span instead of the whole block (requires CCR: compress.ccr.enabled)."
+            },
+            "endId": {
+              "type": "string",
+              "description": "Optional mNNNNN message ref, inclusive upper bound. Used together with startId."
+            },
+            "conversation_id": {
+              "type": "string",
+              "description": "Your bili conversation id (the value from the 'your bili conversation id' line in the proxy notes). Pass it on every call when your host shares one MCP process across several concurrent conversations; omit it when the host bound the session itself."
+            }
+          },
+          "required": [
+            "blockId"
+          ]
+        }
+      },
+      {
+        "name": "search_context",
+        "description": "Search through compressed block summaries by keyword. Use BEFORE decompressing to find the right block.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "Search query"
+            },
+            "limit": {
+              "type": "number",
+              "description": "Max results (default 5)"
+            },
+            "conversation_id": {
+              "type": "string",
+              "description": "Target bili conversation id. Defaults to the current conversation. May reference another historical pfa-* session for read-only search."
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      },
+      {
+        "name": "acp_status",
+        "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "conversation_id": {
+              "type": "string",
+              "description": "Your bili conversation id (the value from the 'your bili conversation id' line in the proxy notes). Pass it on every call when your host shares one MCP process across several concurrent conversations; omit it when the host bound the session itself."
+            }
+          }
+        }
+      },
+      {
+        "name": "acp_cache",
+        "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and line item. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "detail": {
+              "type": "string",
+              "enum": [
+                "summary",
+                "full"
+              ],
+              "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and line item."
+            },
+            "conversation_id": {
+              "type": "string",
+              "description": "Your bili conversation id (the value from the 'your bili conversation id' line in the proxy notes). Pass it on every call when your host shares one MCP process across several concurrent conversations; omit it when the host bound the session itself."
+            }
+          }
+        }
+      }
+    ],
+    "openai": [
+      {
+        "type": "function",
+        "function": {
+          "name": "compress",
+          "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. Line form (preferred): content = one STRING per range — first line 'm00150–m00220 optional topic', remaining lines the markdown summary written verbatim (no JSON structure, no escaping). Also accepted: object entries {startId,endId,summary,topic?} in the content array, content as a single string (bare line form or JSON-encoded array), and a flat single-range call {startId,endId,summary,topic?} without content. Use when content is genuinely consumed. REQUIRED — compress without content or flat range fields is invalid.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "topic": {
+                "type": "string",
+                "description": "Optional short title for the compressed range"
+              },
+              "content": {
+                "type": [
+                  "array",
+                  "string"
+                ],
+                "description": "One or more ranges to compress into separate summary blocks. Array form (preferred): one entry per range — line form (one STRING per range: first line 'm00150–m00220 optional topic', remaining lines the markdown summary verbatim) or object form {startId,endId,summary,topic?}. String form also accepted: bare line-form text, or a JSON-encoded array of ranges (some gateways stringify arrays). REQUIRED unless the flat single-range form is used.",
+                "items": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "description": "Line form: first line 'm00150–m00220 optional topic', remaining lines the summary markdown, verbatim (no JSON escaping)"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "topic": {
+                          "type": "string"
+                        },
+                        "startId": {
+                          "type": "string",
+                          "description": "mNNNNN ref at the start of the range"
+                        },
+                        "endId": {
+                          "type": "string",
+                          "description": "mNNNNN ref at the end of the range"
+                        },
+                        "startRef": {
+                          "type": "string",
+                          "description": "Alternate spelling of startId"
+                        },
+                        "endRef": {
+                          "type": "string",
+                          "description": "Alternate spelling of endId"
+                        },
+                        "summary": {
+                          "type": "string",
+                          "description": "Self-contained summary replacing the range"
+                        }
+                      },
+                      "anyOf": [
+                        {
+                          "required": [
+                            "startId",
+                            "endId",
+                            "summary"
+                          ]
+                        },
+                        {
+                          "required": [
+                            "startRef",
+                            "endRef",
+                            "summary"
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              },
+              "startId": {
+                "type": "string",
+                "description": "Flat single-range form (no content): mNNNNN ref at the start of the range"
+              },
+              "endId": {
+                "type": "string",
+                "description": "Flat single-range form (no content): mNNNNN ref at the end of the range"
+              },
+              "startRef": {
+                "type": "string",
+                "description": "Flat single-range form: alternate spelling of startId"
+              },
+              "endRef": {
+                "type": "string",
+                "description": "Flat single-range form: alternate spelling of endId"
+              },
+              "summary": {
+                "type": "string",
+                "description": "Flat single-range form (no content): self-contained summary replacing the range"
+              },
+              "conversation_id": {
+                "type": "string",
+                "description": "Your bili conversation id (the value from the 'your bili conversation id' line in the proxy notes). Pass it on every call when your host shares one MCP process across several concurrent conversations; omit it when the host bound the session itself."
+              }
+            }
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "decompress",
+          "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "blockId": {
+                "type": "string",
+                "description": "Block ID to decompress (e.g. b5)"
+              },
+              "toFile": {
+                "type": "string",
+                "description": "Optional: write content to file instead of context"
+              },
+              "full": {
+                "type": "boolean",
+                "description": "Restore all the way to original messages"
+              },
+              "startId": {
+                "type": "string",
+                "description": "Optional mNNNNN message ref, inclusive lower bound of a sub-range of this block. With endId, restores only that span instead of the whole block (requires CCR: compress.ccr.enabled)."
+              },
+              "endId": {
+                "type": "string",
+                "description": "Optional mNNNNN message ref, inclusive upper bound. Used together with startId."
+              },
+              "conversation_id": {
+                "type": "string",
+                "description": "Your bili conversation id (the value from the 'your bili conversation id' line in the proxy notes). Pass it on every call when your host shares one MCP process across several concurrent conversations; omit it when the host bound the session itself."
+              }
+            },
+            "required": [
+              "blockId"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "search_context",
+          "description": "Search through compressed block summaries by keyword. Use BEFORE decompressing to find the right block.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string",
+                "description": "Search query"
+              },
+              "limit": {
+                "type": "number",
+                "description": "Max results (default 5)"
+              },
+              "conversation_id": {
+                "type": "string",
+                "description": "Target bili conversation id. Defaults to the current conversation. May reference another historical pfa-* session for read-only search."
+              }
+            },
+            "required": [
+              "query"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "acp_status",
+          "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "conversation_id": {
+                "type": "string",
+                "description": "Your bili conversation id (the value from the 'your bili conversation id' line in the proxy notes). Pass it on every call when your host shares one MCP process across several concurrent conversations; omit it when the host bound the session itself."
+              }
+            }
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "acp_cache",
+          "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and line item. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "detail": {
+                "type": "string",
+                "enum": [
+                  "summary",
+                  "full"
+                ],
+                "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and line item."
+              },
+              "conversation_id": {
+                "type": "string",
+                "description": "Your bili conversation id (the value from the 'your bili conversation id' line in the proxy notes). Pass it on every call when your host shares one MCP process across several concurrent conversations; omit it when the host bound the session itself."
+              }
+            }
+          }
+        }
+      }
+    ],
+    "responses": [
+      {
+        "type": "function",
+        "name": "compress",
+        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. Line form (preferred): content = one STRING per range — first line 'm00150–m00220 optional topic', remaining lines the markdown summary written verbatim (no JSON structure, no escaping). Also accepted: object entries {startId,endId,summary,topic?} in the content array, content as a single string (bare line form or JSON-encoded array), and a flat single-range call {startId,endId,summary,topic?} without content. Use when content is genuinely consumed. REQUIRED — compress without content or flat range fields is invalid.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "topic": {
+              "type": "string",
+              "description": "Optional short title for the compressed range"
+            },
+            "content": {
+              "type": [
+                "array",
+                "string"
+              ],
+              "description": "One or more ranges to compress into separate summary blocks. Array form (preferred): one entry per range — line form (one STRING per range: first line 'm00150–m00220 optional topic', remaining lines the markdown summary verbatim) or object form {startId,endId,summary,topic?}. String form also accepted: bare line-form text, or a JSON-encoded array of ranges (some gateways stringify arrays). REQUIRED unless the flat single-range form is used.",
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "description": "Line form: first line 'm00150–m00220 optional topic', remaining lines the summary markdown, verbatim (no JSON escaping)"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "topic": {
+                        "type": "string"
+                      },
+                      "startId": {
+                        "type": "string",
+                        "description": "mNNNNN ref at the start of the range"
+                      },
+                      "endId": {
+                        "type": "string",
+                        "description": "mNNNNN ref at the end of the range"
+                      },
+                      "startRef": {
+                        "type": "string",
+                        "description": "Alternate spelling of startId"
+                      },
+                      "endRef": {
+                        "type": "string",
+                        "description": "Alternate spelling of endId"
+                      },
+                      "summary": {
+                        "type": "string",
+                        "description": "Self-contained summary replacing the range"
+                      }
+                    },
+                    "anyOf": [
+                      {
+                        "required": [
+                          "startId",
+                          "endId",
+                          "summary"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "startRef",
+                          "endRef",
+                          "summary"
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            "startId": {
+              "type": "string",
+              "description": "Flat single-range form (no content): mNNNNN ref at the start of the range"
+            },
+            "endId": {
+              "type": "string",
+              "description": "Flat single-range form (no content): mNNNNN ref at the end of the range"
+            },
+            "startRef": {
+              "type": "string",
+              "description": "Flat single-range form: alternate spelling of startId"
+            },
+            "endRef": {
+              "type": "string",
+              "description": "Flat single-range form: alternate spelling of endId"
+            },
+            "summary": {
+              "type": "string",
+              "description": "Flat single-range form (no content): self-contained summary replacing the range"
+            },
+            "conversation_id": {
+              "type": "string",
+              "description": "Your bili conversation id (the value from the 'your bili conversation id' line in the proxy notes). Pass it on every call when your host shares one MCP process across several concurrent conversations; omit it when the host bound the session itself."
+            }
+          }
+        }
+      },
+      {
+        "type": "function",
+        "name": "decompress",
+        "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "blockId": {
+              "type": "string",
+              "description": "Block ID to decompress (e.g. b5)"
+            },
+            "toFile": {
+              "type": "string",
+              "description": "Optional: write content to file instead of context"
+            },
+            "full": {
+              "type": "boolean",
+              "description": "Restore all the way to original messages"
+            },
+            "startId": {
+              "type": "string",
+              "description": "Optional mNNNNN message ref, inclusive lower bound of a sub-range of this block. With endId, restores only that span instead of the whole block (requires CCR: compress.ccr.enabled)."
+            },
+            "endId": {
+              "type": "string",
+              "description": "Optional mNNNNN message ref, inclusive upper bound. Used together with startId."
+            },
+            "conversation_id": {
+              "type": "string",
+              "description": "Your bili conversation id (the value from the 'your bili conversation id' line in the proxy notes). Pass it on every call when your host shares one MCP process across several concurrent conversations; omit it when the host bound the session itself."
+            }
+          },
+          "required": [
+            "blockId"
+          ]
+        }
+      },
+      {
+        "type": "function",
+        "name": "search_context",
+        "description": "Search through compressed block summaries by keyword. Use BEFORE decompressing to find the right block.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "Search query"
+            },
+            "limit": {
+              "type": "number",
+              "description": "Max results (default 5)"
+            },
+            "conversation_id": {
+              "type": "string",
+              "description": "Target bili conversation id. Defaults to the current conversation. May reference another historical pfa-* session for read-only search."
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      },
+      {
+        "type": "function",
+        "name": "acp_status",
+        "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "conversation_id": {
+              "type": "string",
+              "description": "Your bili conversation id (the value from the 'your bili conversation id' line in the proxy notes). Pass it on every call when your host shares one MCP process across several concurrent conversations; omit it when the host bound the session itself."
+            }
+          }
+        }
+      },
+      {
+        "type": "function",
+        "name": "acp_cache",
+        "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and line item. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "detail": {
+              "type": "string",
+              "enum": [
+                "summary",
+                "full"
+              ],
+              "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and line item."
+            },
+            "conversation_id": {
+              "type": "string",
+              "description": "Your bili conversation id (the value from the 'your bili conversation id' line in the proxy notes). Pass it on every call when your host shares one MCP process across several concurrent conversations; omit it when the host bound the session itself."
+            }
+          }
+        }
+      }
+    ]
+  },
+  "headers": {
+    "agent": "x-bili-plugin",
+    "conversation": "x-bili-plugin-conversation",
+    "contextWindow": "x-bili-plugin-context-window",
+    "maxOutput": "x-bili-plugin-max-output",
+    "model": "x-bili-plugin-model",
+    "instructionsMutable": "x-bili-plugin-instructions-mutable"
+  },
+  "toolEndpoint": "/__bili/plugin/tool",
+  "statusEndpoint": "/__bili/plugin/status",
+  "runtimeInfoEndpoint": "/__bili/plugin/runtime-info"
+}

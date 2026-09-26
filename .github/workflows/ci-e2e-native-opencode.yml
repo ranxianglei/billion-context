@@ -1,0 +1,56 @@
+name: e2e-native-opencode
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-native-opencode-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e-native-opencode:
+    name: real opencode native lane vs deterministic fake upstream (zero tokens)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # Pinned like pi/codex (#815): opencode's plugin/config API surface must
+      # not drift under this suite. Bump deliberately after re-running the
+      # suite locally on the new version. 2.0.3 = V2 `setup` lane, verified
+      # end-to-end (the same suite drives 1.x via E2E_OC_BIN).
+      - name: Install opencode CLI
+        run: npm i -g @opencode/cli@2.0.3
+
+      - name: Print opencode version
+        run: opencode --version
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Run real-opencode native-lane compression E2E
+        env:
+          E2E_OC_BIN: opencode
+        run: ACP_TEST_E2E_OC_NATIVE=1 node --import tsx --test tests/e2e/e2e-native-opencode.test.ts
+
+      - name: Collect E2E artifacts
+        if: failure()
+        run: |
+          mkdir -p tmp/e2e-artifacts
+          for d in tmp/e2e-native-opencode-*; do [ -d "$d" ] && cp -r "$d" tmp/e2e-artifacts/ || true; done
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: e2e-native-opencode-artifacts
+          path: tmp/e2e-artifacts
+          if-no-files-found: ignore

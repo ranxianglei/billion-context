@@ -33,6 +33,9 @@ export interface OpencodeClient {
             path: { id: string };
             body: { noReply: boolean; parts: OpencodePromptPart[] };
         }) => Promise<unknown>;
+        // #1362: SDK session.get — child sessions declare their parent via
+        // data.parentID (opencode mints a fresh id per persona/subagent).
+        get?: (args: { path: { id: string } }) => Promise<{ data?: { id?: unknown; parentID?: unknown } } | undefined>;
     };
 }
 

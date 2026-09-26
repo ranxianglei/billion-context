@@ -3,10 +3,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
-import { createCore, type CompressionCore, type CompressionState, type Config, type CoreMessage, type NudgeDecision, type Prompts, type PackSurface, type ToolPrompts, applyAcpToolOverrides, defaultPrompts, defaultCountTokens, estimateTokensFast, renderNudgeText, deactivateBlock, viableRanges, resolveOutputSteeringConfig } from "acp-kernel";
-import { DEFAULT_STRIP_IMAGES_KEEP_RECENT, applyCompressSettings, resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig } from "./compress-settings.js";
+import { createCore, type CompressionCore, type CompressionState, type Config, type AbsorbConfig, type CoreMessage, type NudgeDecision, type Prompts, type PackSurface, type ToolPrompts, applyAcpToolOverrides, defaultPrompts, defaultCountTokens, estimateTokensFast, renderNudgeText, deactivateBlock, viableRanges, resolveOutputSteeringConfig } from "acp-kernel";
+import { DEFAULT_STRIP_IMAGES_KEEP_RECENT, applyCompressSettings, resolveAbsorbSettings, resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig } from "./compress-settings.js";
 import { dropCompressReasoning, type CompressReasoningConfig } from "./reasoning-drop.js";
-import type { ProxyOptions } from "./config.js";
+import type { CompressSettings, ProxyOptions } from "./config.js";
 import { loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
 import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol } from "./config.js";
@@ -45,7 +45,7 @@ import {
     subagentNamespace,
 } from "acp-kernel/wire";
 import { responsesToCoreWithToolImages as responsesToCore, patchResponsesInputWithToolImages as patchResponsesInput } from "./responses-tool-output.js";
-import { getSession, hasProcessedState, listSessions, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive, detectUnannouncedHistoryRewrite, markCompactionBoundary, ensureCanonicalId, storeEffectiveConfig } from "./session.js";
+import { getSession, hasProcessedState, listSessions, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive, detectUnannouncedHistoryRewrite, markCompactionBoundary, ensureCanonicalId, storeEffectiveConfig } from "./session.js";
 import { detectStaleInstall } from "./update.js";
 import { PACKAGE_NAME, VERSION } from "./version.js";
 import {
@@ -60,9 +60,9 @@ import {
     type GoogleSystemInstruction,
     type GoogleTool,
 } from "acp-kernel/wire";
-import { ABSORB_TOOL, ABSORB_TOOL_GOOGLE, ABSORB_TOOL_OPENAI, ABSORB_TOOL_RESPONSES, COMPRESS_TOOL, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, IMAGE_FULL_TOOL, IMAGE_FULL_TOOL_GOOGLE, IMAGE_FULL_TOOL_OPENAI, IMAGE_FULL_TOOL_RESPONSES, RULE_TOOL, RULE_TOOL_GOOGLE, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, retrieveToolsFor, buildAbsorbSystemPrompt, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withConversationIdNote, withMarkerIntegrityNote, withStagedCompressGuidance, withSummaryBudgetNote } from "./compress-tool.js";
+import { ABSORB_TOOL_NAME, COMPRESS_TOOL, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_GOOGLE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, IMAGE_FULL_TOOL, IMAGE_FULL_TOOL_GOOGLE, IMAGE_FULL_TOOL_OPENAI, IMAGE_FULL_TOOL_RESPONSES, RULE_TOOL, RULE_TOOL_GOOGLE, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, absorbToolsFor, retrieveToolsFor, buildAbsorbSystemPrompt, buildCompressSystemPrompt, buildCompressHybridSystemPrompt, withConversationIdNote, withMarkerIntegrityNote, withStagedCompressGuidance, withSummaryBudgetNote } from "./compress-tool.js";
 import { applyAbsorbView, absorbEnabled, absorbToolName, storeEffectiveAbsorb } from "./absorb.js";
-import { adoptContentStore, ccrEnabled, ccrPluginWireOk, contentStoreOf, drainPendingRetrievals, executeRetrieve, retrieveToolName, storeEffectiveCcr, type CcrSettings } from "./store.js";
+import { adoptContentStore, ccrEnabled, ccrLoopConfig, ccrPluginWireOk, commitRetrievals, contentStoreOf, dropRetrievals, executeRetrieve, flushRetrievalNotes, pruneExpiredRetrievals, reconcileReloadedRetrievals, retrieveToolName, snapshotPendingRetrievals, storeEffectiveCcr, type CcrSettings } from "./store.js";
 import { applyImageCompressionPass, imageCompressionEnabled, imageFullTrailingNote, storeEffectiveImageCompression, type ImageCompressionSettings } from "./image-compress.js";
 import { rulesEnabled, storeEffectiveRules } from "./rules-feature.js";
 import { rewriteJsonResponse, type RewriteCtx } from "./stream.js";
@@ -73,6 +73,8 @@ import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
 import { imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, type ResolvedImageBilling } from "./image-tokens.js";
 import { renderUI, handleConfigGet, handleConfigPut } from "./web/index.js";
 import { reapOrphanBlocks } from "./orphan-gc.js";
+import { conflictScanEnabled, isDesignAbsorbed, scanClientPlugins, sniffScanClient } from "./thirdparty-scan.js";
+import { recordConflict, summarizeConflicts } from "./conflict-watch.js";
 import { getStore } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError } from "./logger.js";
 import { configFile, defaultLogFile, dumpsDir, stateDir } from "./paths.js";
@@ -99,10 +101,10 @@ import { affinityToken, claudeSubagentAgentId, claudeSubagentSplit, clientConver
 import { prefixAffinity, type AnonymousAffinity } from "./prefix-affinity.js";
 import { maybeAdoptForkBlocks } from "./fork-adoption.js";
 import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "./affinity-persist.js";
-import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRuntimeInfoFor, recordChainVerdict, recordPluginSession, rememberPluginMessages, takePendingPluginRegister } from "./plugin.js";
+import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRuntimeInfoFor, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream, getBlindTunnelStats } from "./mitm.js";
 import type { BiliMessage } from "acp-kernel/wire";
-import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageOutputTotal, usageTotals, type WireProtocol } from "./util.js";
+import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "./util.js";
 
 import { BILI_TUNNEL_HEADER, checkTunnelDestination, classifyIp, localMachineIps, normalizeIpLiteral, parseIpLiteral, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
 import { dumpRejectedBody } from "./error-dump.js";
@@ -111,10 +113,10 @@ import { decodeRequestBody, DecompressedTooLargeError } from "./content-encoding
 import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSystemPlacementError, resolveCompatRoles, type CompatRoles } from "./compat-roles.js";
 import { applyOutputSteering, applyOutputSteeringJson } from "./output-steering.js";
 import { bodyDumpEnabled, getUnrecognizedPathStats, isModelDiscoveryPath, logDumpFailure, logUnrecognizedPath } from "./server/observability.js";
-import { BILI_HOP_HEADER, anthropicBetaContextWindow, LAUNCHER_MODEL_WINDOWS, LAUNCHER_MODEL_MAX_OUTPUTS, launcherContextWindow, launcherMaxOutput, parseLauncherModelWindows, windowSourceLogged } from "./server/context-window.js";
+import { BILI_HOP_HEADER, anthropicBetaContextWindow, capRegistryWindowByStandard, expandedContextSuffixWindow, LAUNCHER_MODEL_WINDOWS, LAUNCHER_MODEL_MAX_OUTPUTS, launcherContextWindow, launcherMaxOutput, parseLauncherModelWindows, windowSourceLogged } from "./server/context-window.js";
 import { buildForwardHeaders, connectionNamedHeaders, NO_IDENTITY_MESSAGE, RESPONSE_ONLY_STRIP_HEADERS, safeSessionId, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
 import { isSideRequest, outputBudgetField, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard } from "./server/side-request.js";
-import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead } from "./server/budget.js";
+import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead, projectThinkingMass } from "./server/budget.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./server/stream-io.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./server/chain-artifacts.js";
 import { droppedOpenaiParts } from "./wire-drop-warn.js";
@@ -348,6 +350,7 @@ export function googleModelFromPath(urlPath: string): string | undefined {
         return m[1];
     }
 }
+
 
 export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     // Configure the tee logger (file + stderr) BEFORE any logging so the very
@@ -730,6 +733,11 @@ type Prepared = {
      *  as trailing user messages so compress-loop rounds see the same
      *  updated-instructions context the main request did. */
     systemNotes?: string[];
+    /** [#1343] Plugin-lane retrievals snapshotted onto THIS request's body.
+     *  Carried so forward() commits them on upstream success or drops them
+     *  (logged + corrective note) on failure — the ack is already out, so the
+     *  full text must never vanish silently. */
+    attachedRetrievals?: PendingRetrieval[];
     nudge?: NudgeDecision;
     /** Render strategy the prepare used for processTurn ("none" for codex
      *  compaction triggers / ACP_RENDER_NONE). The #422 fold-refresh hook in
@@ -882,7 +890,10 @@ async function handle(
     }
     if (req.method === "GET" && req.url === "/__bili/health") {
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: true, upstream: opts.upstream, instanceId, pid: process.pid, startedAt: instanceStartedAt, blindTunnels: getBlindTunnelStats() }));
+        // #1322: watchdog state is part of the health contract — attachers and
+        // operators can see whether this proxy dies with its sessions (armed)
+        // or outlives them all (daemon squatting a stable port).
+        res.end(JSON.stringify({ ok: true, upstream: opts.upstream, instanceId, pid: process.pid, startedAt: instanceStartedAt, blindTunnels: getBlindTunnelStats(), watchdog: { armed: initialWatcherPid !== null, parentPid: initialWatcherPid ?? undefined, watchers: [...proxyWatchers] } }));
         return;
     }
     // Web config UI (served as HTML, separate from the JSON health check above).
@@ -1166,7 +1177,7 @@ async function handle(
     // forward as the #920 bypass.
     if (passthroughMark) {
         log("debug", `passthrough: ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")} — unattributed in-process caller (#1117), relaying verbatim`);
-        await forward(req, res, opts, bodyBuffer, null, core, config, log, route, instanceId, undefined);
+        await forward(req, res, opts, scrubAnthropicPck(protocol, bodyBuffer, log), null, core, config, log, route, instanceId, undefined);
         return;
     }
     // #300: bili→bili chain detection. If the inbound request already carries
@@ -1202,7 +1213,7 @@ async function handle(
     // here would double-manage it. Raw forward, zero state touched.
     if (headerValue(req, BILI_PLUGIN_BYPASS_HEADER) === "1") {
         log("debug", `bypass: ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")} — raw passthrough (legacy in-process compression)`);
-        await forward(req, res, opts, bodyBuffer, null, core, config, log, route, instanceId, undefined);
+        await forward(req, res, opts, scrubAnthropicPck(protocol, bodyBuffer, log), null, core, config, log, route, instanceId, undefined);
         return;
     }
     const countTokens = isCountTokensRequest(req.method ?? "GET", urlPath, bodyBuffer.length > 0);
@@ -1252,7 +1263,7 @@ async function handle(
                 }
                 log("warn", `[${protocol}] body has no "messages" array — not a model conversation; relaying verbatim to ${maskUrlsInText(upstreamOrigin)} instead of rejecting (#1284) — ${req.method ?? "?"} ${maskUrlForLog(req.url ?? "")}`);
             }
-            await forward(req, res, opts, bodyBuffer, null, core, config, log, route, instanceId, undefined);
+            await forward(req, res, opts, scrubAnthropicPck(protocol, bodyBuffer, log), null, core, config, log, route, instanceId, undefined);
             return;
         }
     }
@@ -1267,17 +1278,6 @@ async function handle(
         const hasPrev = p.previous_response_id !== undefined;
         const inLen = Array.isArray(p.input) ? p.input.length : 0;
         log("info", `[debug] INCOMING previous_response_id=${hasPrev ? String(p.previous_response_id).slice(0, 16) : "absent"} input_items=${inLen} instructions=${p.instructions !== undefined ? "present" : "absent"}`);
-    }
-    if (bodyDumpEnabled() && parsed && typeof parsed === "object") {
-        try {
-            const rawDir = process.env.ACP_RAW_DUMP_DIR || path.join(stateDir(), "raw");
-            try { fs.mkdirSync(rawDir, { recursive: true }); } catch { /* best-effort */ }
-            const hdrs = maskHeadersForLog(
-                Object.fromEntries(Object.entries(req.headers).map(([k, v]) => [k, Array.isArray(v) ? v.join(",") : String(v)])),
-            );
-            const hdrText = Object.entries(hdrs).map(([k, v]) => `${k}: ${v}`).join("\n");
-            fs.writeFileSync(path.join(rawDir, `${Date.now()}-INCOMING.txt`), `${req.method} ${maskUrlsInText(req.url ?? "")}\n${hdrText}\n\n${bodyBuffer.toString("utf8")}`);
-        } catch (err) { logDumpFailure("INCOMING dump", err); }
     }
     // Per-request context limit + compression tuning: look up body.model against
     // the per-route model declaration first, then the built-in table / registry.
@@ -1320,11 +1320,13 @@ async function handle(
         reqModelId = typeof model === "string" ? model : undefined;
         if (model) {
             const embeddedUrl = route?.rewrittenUrl;
-            // Native-window resolution order: (0) the client's `anthropic-beta`
-            // larger-context negotiation (context-1m-… → 1,000,000) — the most
-            // direct per-request evidence of the window the upstream will serve,
-            // so it outranks every static source (the model table / registry
-            // list the STANDARD window, e.g. 200K for claude); (1) a cooperative
+            // Native-window resolution order: (0) per-request TIER EVIDENCE
+            // that this request runs on an expanded tier — (a) the client's
+            // `anthropic-beta` larger-context negotiation (context-1m-… →
+            // 1,000,000) or (b) an [Nm]-suffixed model name (claude-opus-5-5[1m]
+            // → 1M) — the most direct evidence of the window the upstream will
+            // serve, so it outranks every static source (the model table /
+            // registry list the STANDARD window, e.g. 200K for claude); (1) a cooperative
             // plugin's report (the agent's own config — most authoritative, gated
             // on the x-bili-plugin marker so a plain client cannot rewrite the
             // nudge denominator by name); (1b) the launcher's per-model
@@ -1339,11 +1341,17 @@ async function handle(
             // auto-fetched registry (#344); (3) a WARM models.dev registry
             // cache (daily refresh — outranks the static table whenever
             // already resident; peek never fetches, cold start skips to (4)
-            // without blocking); (4) the built-in CONTEXT_LIMIT_TABLE
+            // without blocking) — for TIER-GATED families (claude-) a registry
+            // value above the built-in standard window is capped back to the
+            // standard when rank 0 saw no tier evidence (#1321: models.dev
+            // advertises the max tier, plain plans serve the standard one);
+            // (4) the built-in CONTEXT_LIMIT_TABLE
             // fallback. Operator tuning via compress.modelContextLimit still
             // outranks everything inside resolveRequestConfig.
             const host = (() => { try { return embeddedUrl ? new URL(embeddedUrl).host : undefined; } catch { return undefined; } })();
             const betaWindow = anthropicBetaContextWindow(req.headers);
+            const suffixWindow = expandedContextSuffixWindow(model);
+            const hasTierEvidence = betaWindow !== undefined || suffixWindow !== undefined;
             const pluginWindow = pluginHeadersMatchModel(req.headers, model) ? pluginReportedContextWindow(req.headers) : undefined;
             // Runtime-table fallback for the window (#955): only when this
             // request's plugin sent no window header AND the agent's latest
@@ -1354,8 +1362,9 @@ async function handle(
             const launcherWindow = launcherContextWindow(model);
             const configuredWindow = resolveConfiguredContextLimit(opts.routes, embeddedUrl, model);
             const operatorWindowTuned = resolveCompress(opts.routes, embeddedUrl, model, opts.compress).modelContextLimit !== undefined;
-            const peekWindow = peekRegistryContext(model, host);
+            const peekWindow = capRegistryWindowByStandard(model, peekRegistryContext(model, host), hasTierEvidence);
             let native = betaWindow
+                ?? suffixWindow
                 ?? pluginWindow
                 ?? runtimeWindow
                 ?? launcherWindow
@@ -1365,16 +1374,16 @@ async function handle(
             // Fallback = no authoritative source AND the operator did not
             // explicitly tune the window via compress.modelContextLimit (an
             // explicit tuning is owned by the operator — never floored). The
-            // beta window is authoritative (the client's own runtime
-            // negotiation), so it also clears the fallback flag.
-            nativeFromFallback = !betaWindow && !pluginWindow && !runtimeWindow && !launcherWindow && !peekWindow && !configuredWindow && !operatorWindowTuned;
+            // beta/suffix windows are authoritative (the client's own runtime
+            // negotiation), so they also clear the fallback flag.
+            nativeFromFallback = !betaWindow && !suffixWindow && !pluginWindow && !runtimeWindow && !launcherWindow && !peekWindow && !configuredWindow && !operatorWindowTuned;
             if (!native) {
-                native = await contextFromRegistry(model, host);
+                native = capRegistryWindowByStandard(model, await contextFromRegistry(model, host), hasTierEvidence);
                 if (native) nativeFromFallback = false;
             }
             reqConfig = resolveRequestConfig(config, opts.routes, embeddedUrl, model, native, opts.compress);
             {
-                const wsSource = betaWindow ? "anthropic-beta" : pluginWindow ? "plugin" : runtimeWindow ? "runtime-info" : launcherWindow ? "launcher" : configuredWindow ? "configured" : peekWindow ? "registry-peek" : native ? "table-or-registry" : "default";
+                const wsSource = betaWindow ? "anthropic-beta" : suffixWindow ? "model-suffix" : pluginWindow ? "plugin" : runtimeWindow ? "runtime-info" : launcherWindow ? "launcher" : configuredWindow ? "configured" : peekWindow ? "registry-peek" : native ? "table-or-registry" : "default";
                 wsSourceForLog = wsSource;
                 if (!windowSourceLogged.has(model)) {
                     windowSourceLogged.add(model);
@@ -1671,7 +1680,7 @@ async function handle(
                 if (firstVerdict) {
                     log("warn", `[chain] inbound ${protocol} request carries ACP compression artifacts (${artifactKind}) but neither ${BILI_HOP_HEADER} nor local compression state for session ${sessionId} — likely a bili→bili chain whose headers were stripped. Passing through without processing; if this is your own client, disable the content fallback with chainContentDetection=false (env BILI_CHAIN_CONTENT=0).`);
                 }
-                await forward(req, res, opts, bodyBuffer, null, core, config, log, route, instanceId, undefined);
+                await forward(req, res, opts, scrubAnthropicPck(protocol, bodyBuffer, log), null, core, config, log, route, instanceId, undefined);
                 return;
             }
             if (artifactKind !== null) {
@@ -1749,11 +1758,13 @@ async function handle(
         // CLAUDE_CODE_SESSION_ID the MCP shell registered, so binding is
         // race-free. Fall back to the headless pending queue (codex spawn)
         // for the first request that creates a new session.
+        let derivedParent: string | undefined;
         if (!pluginAgent && !anonAffinity) {
             const identityAgent = consumePluginRegisterFor(clientConv ?? conversation);
             if (identityAgent) {
-                pluginAgent = identityAgent;
+                pluginAgent = identityAgent.agent;
                 pluginConversation = clientConv ?? conversation;
+                derivedParent = identityAgent.parentConversationId;
             }
         }
         if (!pluginAgent && session.stats.requests === 0 && codexTurnIdentity(req.headers) === undefined && claudeSub === undefined) {
@@ -1766,10 +1777,25 @@ async function handle(
             if (pending) {
                 pluginAgent = pending.agent;
                 pluginConversation = pending.conversationId;
+                derivedParent = pending.parentConversationId;
             }
         }
         if (!pluginAgent && typeof session.metadata.pluginAgent === "string") pluginAgent = session.metadata.pluginAgent;
         if (pluginAgent && !pluginConversation) pluginConversation = conversation;
+        // [#1333] Real pi plugin traffic arrives pre-stamped: `x-bili-plugin`
+        // + `x-bili-plugin-conversation` (set by the extension, pi.ts:127)
+        // set pluginAgent/pluginConversation from headers above, so the
+        // identity branch never runs for it. The identity register (which
+        // carries the derived child's parentConversationId) is keyed by that
+        // same conversation id and has already landed — the extension awaits
+        // the register POST inside registerTools before the first stamped
+        // request is sent (#1214) — so consult it here too. Link-only: on
+        // non-derived conversations parentConversationId is absent and this
+        // is a no-op.
+        if (derivedParent === undefined && pluginAgent !== undefined && pluginConversation !== undefined && !anonAffinity) {
+            const stamped = consumePluginRegisterFor(pluginConversation);
+            if (stamped?.parentConversationId !== undefined) derivedParent = stamped.parentConversationId;
+        }
         if (pluginAgent) {
             if (session.metadata.pluginAgent !== pluginAgent) session.metadata.pluginAgent = pluginAgent;
             // #970: for a split subagent session, record it under its split
@@ -1781,6 +1807,62 @@ async function handle(
             // stays reachable via its verbatim split id and its canonical
             // pfa-* (printed in wire notes).
             recordPluginSession(claudeSub !== undefined ? conversation : (pluginConversation ?? conversation), session.id);
+        }
+        // #1206: first request of this session — identify the client and scan
+        // its plugin registry for a co-resident THIRD-PARTY compression plugin
+        // (two compressors on one conversation double-compress and corrupt
+        // refs). Best-effort: any failure is logged once, never disturbs the
+        // request path. Findings land in the session conflict ledger so they
+        // stay visible in acp_status / web UI / stats for the whole session.
+        if (session.stats.requests === 0 && conflictScanEnabled(process.env)) {
+            try {
+                const client = pluginAgent ?? sniffScanClient(req.headers);
+                if (client !== undefined) {
+                    const res = scanClientPlugins(client, { env: process.env, cwd: process.cwd() });
+                    for (const f of res.findings) {
+                        if (isDesignAbsorbed(f, pluginAgent)) continue;
+                        const risk = f.match === "known"
+                            ? "it is bili's sibling compressor — two compressors on one conversation will double-compress and corrupt message refs"
+                            : "its name matches compression keywords — IF it also compresses context, the two compressors will double-compress and corrupt message refs";
+                        recordConflict(session, "third-party-plugin", `${f.client}: ${f.entry} (${f.source})${f.match === "keyword" ? " [suspected]" : ""}`);
+                        log("warn", `[conflict] co-resident compression plugin detected on ${f.client}: ${f.entry} (${f.source}) — ${risk} (#1206). Remove or disable the other plugin, or route this client exclusively through bili.`);
+                    }
+                }
+            } catch (err) {
+                log("warn", `[conflict] third-party plugin scan failed: ${String(err)} (#1206)`);
+            }
+        }
+        // [#1333] explicitly derived conversations (pi RLM child, omp fork,
+        // opencode subagent: the plugin reported its parent at register)
+        // record the parent link once — normally on the child's first request,
+        // but the register POST can land AFTER it (the extension flips
+        // tools-ready before the register completes), so late requests of the
+        // same session may record it (#1362). No state is copied — acp-kernel's
+        // syncBlocks deactivates blocks whose source messages are absent from
+        // the child's wire, so seeding blocks into an empty-history child never
+        // sticks. Instead decompress/search_context fall back to the linked
+        // parent chain at read time (src/decompress-shared.ts, depth cap 8).
+        // Late binding is harmless (the link copies nothing at link time), so
+        // the gate is idempotence, not first-request.
+        if (derivedParent !== undefined && session.metadata.derivedFromSessionId === undefined) {
+            try {
+                const parentSession = resolveConversation(derivedParent)?.session;
+                if (parentSession) {
+                    session.metadata.derivedFrom = derivedParent;
+                    session.metadata.derivedFromSessionId = parentSession.id;
+                    markDirty(session);
+                    log("info", `[${session.id}] [derived] linked to parent session ${parentSession.id} (conversation ${derivedParent}) — decompress/search_context fall back to it read-only (#1333)`);
+                } else if (session.metadata.derivedLinkMissLogged !== true) {
+                    // The relaxed gate retries resolution on EVERY request until the link
+                    // lands — cap the miss signal at one line per session per proxy
+                    // process (in-memory flag: a restart re-warns once, which is useful).
+                    session.metadata.derivedLinkMissLogged = true;
+                    log("warn", `[${session.id}] [derived] parent conversation ${derivedParent} is unknown to this proxy — no inheritance; continuing fresh (#1333)`);
+                }
+            } catch (err) {
+                if (session.metadata.derivedLinkMissLogged !== true) session.metadata.derivedLinkMissLogged = true;
+                log("warn", `[${session.id}] [derived] parent link from ${derivedParent} failed (${String(err)}); continuing fresh (#1333)`);
+            }
         }
         // Responses, OpenAI-chat AND Anthropic-wire clients that send their
         // own session id as `prompt_cache_key` (omp) get that conversation
@@ -1831,16 +1913,22 @@ async function handle(
         // leave placeholders unretrievable.
         const storeChannelOk = protocol !== "responses" ||
             (!process.env.ACP_NO_INJECT_TOOL && !FORCE_TEXT_PROTOCOL && resolveCompressProtocol(opts.routes, upstreamOrigin) !== "marker");
-        // [review #1273] The plugin arm MUST gate on the BASE config because that
-        // is the only source the manifest reads (handlePluginManifest sees
-        // opts.compress.ccr, never the route/model-scoped merge). Route-scoped
-        // enablement without a base-level enabled flag would otherwise arm the
-        // store and emit placeholders while the manifest never advertised
-        // acp_retrieve — the model would see "→ acp_retrieve(...)" with no
-        // retrieval channel (silent loss). Route-scoped-only enablement stays
-        // proxy-mode-only (the proxy injects the tool itself, per-request).
-        const pluginCcrOk = !pluginMode || (ccrPluginWireOk(protocol) && opts.compress.ccr?.enabled === true);
-        storeEffectiveCcr(session, opts.compress.injectTool && pluginCcrOk && storeChannelOk && resolvedCcrCfg?.enabled === true ? resolvedCcrCfg : undefined);
+        // [#1345/#1273] Plugin mode: the static manifest (handlePluginManifest
+        // sees opts.compress.ccr, never the route/model-scoped merge) is the ONLY
+        // declaration of the retrieve surface, so the executed policy must be the
+        // base block verbatim — arm iff base enabled=true, whole block
+        // (toolName + thresholds) from base. Any provider/model ccr.* override
+        // splits declared from dispatched: toolName renames the session gate away
+        // from the registered name (calls 400 as unknown), enabled=false disarms
+        // a session whose manifest advertises (stored content unreachable,
+        // placeholders dangling). Provider/model ccr.* overrides are therefore
+        // proxy-lane-only (the proxy declares+dispatches per request under the
+        // merged block, per-route renames intact); findCcrPluginDivergences warns
+        // at config load about every divergent level/field.
+        const pluginCcrStamp = pluginMode
+            ? (ccrPluginWireOk(protocol) && opts.compress.ccr?.enabled === true ? opts.compress.ccr : undefined)
+            : (resolvedCcrCfg?.enabled === true ? resolvedCcrCfg : undefined);
+        storeEffectiveCcr(session, opts.compress.injectTool && storeChannelOk ? pluginCcrStamp : undefined);
         // [#1095] same channel/plugin-mode gating as CCR: image_full's restore
         // round-trip needs a tool channel on this wire; without one the model
         // could request originals it never gets back (silent-loss trap).
@@ -1892,8 +1980,9 @@ async function handle(
                 return;
             }
             log("info", `[${session.id}] side request (max_tokens<=${SIDE_REQUEST_MAX_TOKENS}) → passthrough + tag strip only, kernel state untouched`);
+            const sideBody = scrubAnthropicPck(protocol, bodyBuffer, log);
             const sidePrepared: Prepared = {
-                body: bodyBuffer,
+                body: sideBody,
                 session,
                 processedMessages: [],
                 originalMessages: [],
@@ -1903,7 +1992,7 @@ async function handle(
                 sidePassthrough: true,
             };
             logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, bodyBuffer);
-            await forward(req, res, opts, bodyBuffer, sidePrepared, core, reqConfig, log, route, instanceId, affinity);
+            await forward(req, res, opts, sideBody, sidePrepared, core, reqConfig, log, route, instanceId, affinity);
             return;
         }
         // #987: the window is NEVER learned from traffic — no self-heal read
@@ -2036,9 +2125,18 @@ async function handle(
             // session id (Claude Code subagents) behind one slow upstream stream.
             // forward() re-acquires the lock around its own discrete mutation
             // sections; do not re-wrap the whole forward in this lock.
-            const pendingForward = await withSessionLock(
-                session,
-                async (): Promise<{ body: string | Buffer; prepared: Prepared | null } | null> => {
+            // #1195: prepare + preflight run as a REUSABLE closure so an upstream
+            // overflow can re-run the stage mid-request (see the overflowRefold
+            // wiring below): the caller re-enters it under the session lock with
+            // the window the upstream STATED, forcing the fold the declared
+            // window could never trigger. respondFailFast=false (the overflow
+            // retry path) suppresses the fail-fast response — forward() answers
+            // with the original upstream 400 instead, preserving today's
+            // client-visible contract when the payload cannot be rescued.
+            const runPreparedPipeline = async (
+                respondFailFast: boolean,
+                overflowWindow?: number,
+            ): Promise<{ body: string | Buffer; prepared: Prepared | null } | null> => {
                 const runPrepare = async (): Promise<Prepared> => {
                     const cs = resolveCompress(opts.routes, route?.rewrittenUrl, requestModel, opts.compress);
                     const visibilityMarkers = cs.visibilityMarkers ?? true;
@@ -2116,7 +2214,7 @@ async function handle(
                         res,
                         opts,
                         core,
-                        reqConfig,
+                        overflowWindow !== undefined ? { ...reqConfig, modelContextLimit: overflowWindow } : reqConfig,
                         nativeWindow,
                         requestModel,
                         resolvedNativeWindow,
@@ -2131,7 +2229,7 @@ async function handle(
                         // #301: the payload still overflows the window and
                         // preflight could not fix it — answer with a
                         // structured error instead of forwarding.
-                        if (outcome.respond && !res.destroyed) {
+                        if (respondFailFast && outcome.respond && !res.destroyed) {
                             if (res.headersSent) {
                                 // #568: the hold already committed 200 early — the status
                                 // can no longer change, so deliver the same error in-band
@@ -2174,12 +2272,53 @@ async function handle(
                     }
                     prepared = outcome;
                 }
+                // #1266: capture the CLIENT's raw incoming wire AFTER session
+                // binding so the filename carries the session id — INCOMING↔REQ
+                // dumps pair by id for `bili acp-cache diff`. Moved from the
+                // pre-prepare site where no session was bound yet. Requests
+                // rejected before prepare lose their INCOMING dump — fine, they
+                // never reach upstream and produce no REQ dump either.
+                // Bypass/passthrough requests DO reach upstream (their REQ dump
+                // lands under sid "unknown") but no longer get an INCOMING dump;
+                // acceptable because in those modes the proxy rewrites nothing,
+                // so the incoming side adds no attribution signal.
+                if (bodyDumpEnabled() && parsed && typeof parsed === "object") {
+                    try {
+                        const rawDir = process.env.ACP_RAW_DUMP_DIR || path.join(stateDir(), "raw");
+                        try { fs.mkdirSync(rawDir, { recursive: true }); } catch { /* best-effort */ }
+                        const hdrs = maskHeadersForLog(
+                            Object.fromEntries(Object.entries(req.headers).map(([k, v]) => [k, Array.isArray(v) ? v.join(",") : String(v)])),
+                        );
+                        const hdrText = Object.entries(hdrs).map(([k, v]) => `${k}: ${v}`).join("\n");
+                        fs.writeFileSync(path.join(rawDir, `${Date.now()}-${safeSessionId(session.id)}-INCOMING.txt`), `${req.method} ${maskUrlsInText(req.url ?? "")}\n${hdrText}\n\n${bodyBuffer.toString("utf8")}`);
+                    } catch (err) { logDumpFailure("INCOMING dump", err); }
+                }
                 logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, prepared!.body);
                 return { body: prepared!.body, prepared: prepared! };
-            });
+            };
+            const pendingForward = await withSessionLock(session, () => runPreparedPipeline(true));
             if (pendingForward) {
                 forwarded = true;
-                await forward(req, res, opts, pendingForward.body, pendingForward.prepared, core, reqConfig, log, route, instanceId, affinity);
+                // #1195: wire clients (omp/pi on the plain proxy path) treat an
+                // upstream overflow 400 as fatal and end the session — the armed
+                // emergency shrink then never gets its "next turn". When forward()
+                // sees a context overflow it calls this hook: re-run prepare+
+                // preflight under the lock with the window the upstream STATED
+                // (per-call limit override — nothing is learned, #987 keeps
+                // governing), folding the payload below the REAL window and
+                // re-sending it within this same request. An unchanged body
+                // (nothing foldable) returns null and forward() passes the
+                // original 400 through verbatim.
+                const overflowRefold = pendingForward.prepared
+                    ? async (realWindow: number | undefined): Promise<string | Buffer | null> => {
+                          const next = await withSessionLock(session, () => runPreparedPipeline(false, realWindow));
+                          if (!next || String(next.body) === String(pendingForward.body)) return null;
+                          pendingForward.body = next.body;
+                          pendingForward.prepared = next.prepared;
+                          return next.body;
+                      }
+                    : undefined;
+                await forward(req, res, opts, pendingForward.body, pendingForward.prepared, core, reqConfig, log, route, instanceId, affinity, overflowRefold);
                 // Remember for ALL modes (not just plugin): wire clients (dsh,
                 // hermes, unplug'd pi) read the same panel via /__bili/plugin/status
                 // and need the nudge/breakdown sections too; locked so a racing
@@ -2197,7 +2336,7 @@ async function handle(
         if (protocol === null && !opts.passthrough && !routePassthrough && !isModelDiscoveryPath(urlPath)) {
             logUnrecognizedPath(log, req.url ?? "");
         }
-        await forward(req, res, opts, bodyBuffer, null, core, reqConfig, log, route, instanceId, undefined);
+        await forward(req, res, opts, scrubAnthropicPck(protocol, bodyBuffer, log), null, core, reqConfig, log, route, instanceId, undefined);
     }
 }
 
@@ -2264,25 +2403,46 @@ export function warnReasoningPairs(
     }
 }
 
-/** [#684] Anthropic-wire twin of the openai sentinel: with extended thinking
- *  + tool use, a preserved tool_use message whose thinking block was folded
- *  away is rejected by the API. */
+/** [#684] Anthropic-wire twin of the openai sentinel, narrowed by [#1327]:
+ *  warn only when bili itself lost thinking — a tool_use block that rode an
+ *  inbound assistant message WITH a thinking block now rides an outbound
+ *  assistant message with none. Outbound-only asymmetry (some tool_use turns
+ *  think, others don't) is ordinary Claude Code traffic: turns without
+ *  extended thinking never carry a block, and #651's dropCompressReasoning
+ *  creates the same shape by design — the old heuristic warned on every
+ *  healthy multi-turn session. Turns match by stable tool_use id (the kernel
+ *  codec round-trips it verbatim); benign asymmetry stays fully silent. */
 export function warnAnthropicThinkingPairs(
-    wireMessages: unknown[],
+    inboundMessages: unknown[],
+    outboundMessages: unknown[],
     log: (level: string, msg: string) => void,
     sessionId: string,
 ): void {
-    let withThinking = 0;
-    let split = 0;
-    for (const m of wireMessages) {
-        const msg = m as { role?: string; content?: Array<{ type?: string }> };
+    const thinkingIds = new Set<string>();
+    for (const m of inboundMessages) {
+        const msg = m as { role?: string; content?: Array<{ type?: string; id?: string }> };
         if (msg?.role !== "assistant" || !Array.isArray(msg.content)) continue;
-        const hasThinking = msg.content.some((b) => b?.type === "thinking");
-        if (hasThinking) withThinking++;
-        else if (msg.content.some((b) => b?.type === "tool_use")) split++;
+        if (!msg.content.some((b) => b?.type === "thinking")) continue;
+        for (const b of msg.content) {
+            if (b?.type === "tool_use" && typeof b.id === "string") thinkingIds.add(b.id);
+        }
     }
-    if (withThinking > 0 && split > 0) {
-        log("warn", `[${sessionId}] thinking-pair-violated: ${split} assistant tool_use message(s) lack a thinking block while ${withThinking} carry one — extended-thinking tool use requires preserved thinking (#684)`);
+    if (thinkingIds.size === 0) return;
+    let lost = 0;
+    const lostIds: string[] = [];
+    for (const m of outboundMessages) {
+        const msg = m as { role?: string; content?: Array<{ type?: string; id?: string }> };
+        if (msg?.role !== "assistant" || !Array.isArray(msg.content)) continue;
+        if (msg.content.some((b) => b?.type === "thinking")) continue;
+        for (const b of msg.content) {
+            if (b?.type === "tool_use" && typeof b.id === "string" && thinkingIds.has(b.id)) {
+                lost++;
+                lostIds.push(b.id);
+            }
+        }
+    }
+    if (lost > 0) {
+        log("warn", `[${sessionId}] thinking-pair-violated: ${lost} tool_use block(s) lost their inbound thinking block in the outbound rebuild (${[...new Set(lostIds)].slice(0, 3).join(", ")}) — a stripped signature pair is rejected by the API (#684)`);
     }
 }
 
@@ -2455,6 +2615,32 @@ function effectiveTokenCount(session: Session, msgs: CoreMessage[], inboundImage
     return Math.min(est, raw);
 }
 
+// #1403: top-level prompt_cache_key is NOT part of the Anthropic Messages API.
+// It is the omp plugin's session id stamped for the proxy's identity chain
+// (#268); the fully-processed path strips it (prepareAnthropic), but every
+// VERBATIM forward branch (side-request passthrough #388, chain verdict #1086,
+// bypass/passthrough marks, route/global passthrough #661, decode-fail
+// fallback) used to ship the raw buffer through — strict-schema upstreams
+// (opencode zen: "prompt_cache_key: Extra inputs are not permitted") 400'd
+// the request. Strip on those branches too. A body WITHOUT the field passes
+// back byte-identical, so #661's fingerprinting contract is untouched in the
+// normal case.
+function scrubAnthropicPck(protocol: WireProtocol | null, bodyBuffer: Buffer, log: (level: string, msg: string) => void): Buffer {
+    if (protocol !== "anthropic" || bodyBuffer.length === 0) return bodyBuffer;
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(bodyBuffer.toString("utf8"));
+    } catch {
+        return bodyBuffer;
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return bodyBuffer;
+    const p = parsed as Record<string, unknown>;
+    if (!Object.prototype.hasOwnProperty.call(p, "prompt_cache_key")) return bodyBuffer;
+    delete p.prompt_cache_key;
+    log("debug", `stripped prompt_cache_key from verbatim anthropic forward (#1403)`);
+    return Buffer.from(JSON.stringify(p), "utf8");
+}
+
 async function prepareAnthropic(
     parsed: AnthropicRequestBody,
     req: http.IncomingMessage,
@@ -2482,6 +2668,7 @@ async function prepareAnthropic(
     }
 
     let processedMessages: CoreMessage[] = [];
+    let attachedRetrievals: PendingRetrieval[] = [];
     let originalMessages: CoreMessage[] = [];
     let nudge: NudgeDecision | undefined;
     let rebuiltMessages = parsed.messages;
@@ -2520,6 +2707,18 @@ async function prepareAnthropic(
     try {
         const { msgs, cacheControls } = anthropicToCore(parsed);
         originalMessages = msgs;
+        // #1320: signature-only thinking blocks bill restored thinking tokens upstream
+        // but project as empty text locally — attribute the provider-vs-local residual
+        // to them so every meter sees the billed context (metering-only, wire untouched).
+        const inboundImageTokens = imageTokensInParsedBody("anthropic", parsed, imageBillingFor(opts, upstreamOrigin));
+        projectThinkingMass(msgs, {
+            providerInputTokens: session.stats.lastInputTokens,
+            measured: session.stats.lastInputTokensSource === "usage",
+            systemText: extractSystem(parsed.system),
+            tools: parsed.tools,
+            imageTokens: inboundImageTokens,
+            storedOverhead: typeof session.metadata.systemPromptTokens === "number" ? session.metadata.systemPromptTokens : undefined,
+        });
         // #1001: pre-turn snapshot — processTurn below assigns fresh refs to every
         // previously-unknown id, which would make rewrite detection read 1.0.
         const knownRefsBefore = new Set(Object.keys(session.state.messageRefs.byRaw));
@@ -2536,14 +2735,16 @@ async function prepareAnthropic(
         // zero-baseline forks replay their FULL raw history with no measurement,
         // so feeding 0 blinds the nudge (usage 0%, growth ref 0) and no
         // compression trigger fires until overflow. See effectiveTokenCount.
-        const tokenCount = effectiveTokenCount(session, msgs, imageTokensInParsedBody("anthropic", parsed, imageBillingFor(opts, upstreamOrigin)));
+        const tokenCount = effectiveTokenCount(session, msgs, inboundImageTokens);
         const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
         // Absorb markers are injected by the kernel's processTurn from
         // config.absorb. With no channel to call the tool (injection off),
         // strip absorb from the loop config so the REQUIRED instruction never
         // reaches the wire. Hiding recorded absorptions is unaffected
         // (applyAbsorbView hides regardless of enablement).
-        const absorbActive = absorbEnabled(config) && opts.compress.injectTool;
+        const absorbBlock = effectiveAbsorbBlock(pluginMode, config, opts.compress.absorb);
+        const absorbTools = absorbToolsFor(absorbBlock?.toolName ?? ABSORB_TOOL_NAME);
+        const absorbActive = absorbBlock?.enabled === true && opts.compress.injectTool;
         // acp_rule has no processTurn side effect (no markers/instructions are
         // ever injected into messages), so unlike absorb it needs no loop-
         // config stripping — only tool availability matters.
@@ -2552,7 +2753,7 @@ async function prepareAnthropic(
         // BEFORE absorb (ID-reference wins over distill); armed policy is
         // stamped per-request — strip `ccr` from the loop config when disarmed
         // (plugin mode / no tool channel) so placeholders never hit the wire.
-        const loopConfig = { ...(absorbActive ? config : { ...config, absorb: undefined }), ...(ccrEnabled(session) ? {} : { ccr: undefined }) };
+        const loopConfig = ccrLoopConfig(session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
         const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only", contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
@@ -2583,20 +2784,24 @@ async function prepareAnthropic(
             const rewrite = detectUnannouncedHistoryRewrite(session, knownRefsBefore, msgs.map((m) => m.id));
             if (rewrite.detected) {
                 log("warn", `[${sessionId}] unannounced client history rewrite detected (${rewrite.knownIncoming}/${rewrite.incomingTotal} incoming message(s) carry pre-turn refs of ${rewrite.knownBefore} known) — marking compaction boundary (#1001)`);
+                recordConflict(session, "unannounced-rewrite", `${rewrite.knownIncoming}/${rewrite.incomingTotal} incoming message(s) carry pre-turn refs of ${rewrite.knownBefore} known`);
                 markCompactionBoundary(session);
             }
         }
         applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
-        reapOrphanBlocks(session, msgs, deactivateBlock);
+        reapOrphansLogged(session, msgs, log, sessionId);
         // [#1095] downscale screenshot-like images ONCE at arrival (kernel routing
         // decision + recipe; originals cached for the image_full restore channel).
         // Deterministic encode ⇒ re-runs are byte-stable for the prefix cache.
         await applyImageCompressionPass(session, processedMessages as BiliMessage[], { config, billing: imageBillingFor(opts, upstreamOrigin), log });
-        // [#1271] plugin mode: acp_retrieve ran via the tool API; ride the full original
-        // back on this forward as a request-only trailing message (ephemeral, never persisted).
+        // [#1271/#1343] plugin mode: acp_retrieve already acked via the tool API; snapshot
+        // the queued full text onto THIS forward (stays in the queue until commit/drop, so an
+        // upstream failure drops-and-logs it instead of vanishing it).
         if (pluginMode && ccrEnabled(session)) {
-            const retrInj = drainPendingRetrievals(session);
-            if (retrInj.length > 0) processedMessages = [...processedMessages, ...retrInj];
+            reconcileReloadedRetrievals(session);
+            pruneExpiredRetrievals(session);
+            attachedRetrievals = snapshotPendingRetrievals(session);
+            if (attachedRetrievals.length > 0) processedMessages = [...processedMessages, ...attachedRetrievals.map((i) => i.injection)];
         }
         rebuiltMessages = coreToAnthropic(processedMessages as BiliMessage[], cacheControls);
         if (sysNotes.length > 0) {
@@ -2605,7 +2810,7 @@ async function prepareAnthropic(
 
         systemOut = injectSystem(parsed, opts, prompts, loopConfig, ensureCanonicalId(session), surface, visibilityMarkers);
         if (injectTools) {
-            toolsOut = injectTool(parsed.tools, [...(absorbActive ? [ABSORB_TOOL] : []), ...(rulesActive ? [RULE_TOOL] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).anthropic] : []), ...(imageCompressionEnabled(session) ? [IMAGE_FULL_TOOL] : [])], surface?.toolPrompts);
+            toolsOut = injectTool(parsed.tools, [...(absorbActive ? [absorbTools.anthropic] : []), ...(rulesActive ? [RULE_TOOL] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).anthropic] : []), ...(imageCompressionEnabled(session) ? [IMAGE_FULL_TOOL] : [])], surface?.toolPrompts);
         }
         // Nudge as a separate trailing user message (cache-friendly): the
         // system block stays byte-stable so the prefix cache survives.
@@ -2627,8 +2832,13 @@ async function prepareAnthropic(
         // (see prepareAnthropic for why not system).
         const imgNote = imageFullTrailingNote(session);
         if (imgNote) rebuiltMessages = [...rebuiltMessages, { role: "user", content: imgNote }];
+        // [#1343] surface any earlier undelivered retrieve as an ephemeral trailing
+        // user note (kept last so it never reorders cached messages).
+        const retrNote = flushRetrievalNotes(session);
+        if (retrNote) rebuiltMessages = [...rebuiltMessages, { role: "user", content: retrNote }];
     } catch (err) {
         log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
+        if (attachedRetrievals.length > 0) dropRetrievals(session, attachedRetrievals.map((i) => i.ref), "prepare failed; forwarded unprocessed");
         processedMessages = [];
     }
     // #532: measure the outbound system+tools overhead for the status panel's
@@ -2639,7 +2849,7 @@ async function prepareAnthropic(
     markDirty(session);
 
     const rebuilt: AnthropicRequestBody = { ...parsed, messages: rebuiltMessages, system: systemOut, tools: toolsOut };
-    warnAnthropicThinkingPairs(rebuiltMessages, log, sessionId);
+    warnAnthropicThinkingPairs(parsed.messages, rebuiltMessages, log, sessionId);
     // prompt_cache_key is the omp plugin's session id stamped for the proxy's
     // identity chain (#268), not part of the Anthropic Messages API — strip it
     // so the real upstream never sees a field it doesn't know.
@@ -2654,7 +2864,7 @@ async function prepareAnthropic(
     session.stats.localInputEstimate = estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages)
         + countSystemAndToolsTokens(extractSystem(systemOut), toolsOut)
         + imageTokensInParsedBody("anthropic", rebuilt, imageBillingFor(opts, upstreamOrigin));
-    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, anthropicSystem: parsed.system, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, processedMessages, originalMessages, anthropicSystem: parsed.system, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" } as Prepared;
 }
 
 async function prepareOpenai(
@@ -2682,6 +2892,7 @@ async function prepareOpenai(
     const stripReasoning = (msgs: BiliMessage[]): BiliMessage[] => withReasoningDrop(msgs, reasoning, log, sessionId, isStrictReasoningEcho(session, upstreamOrigin, modelIdOf(parsed)));
     let openaiOutboundSystem: string | undefined;
     let processedMessages: CoreMessage[] = [];
+    let attachedRetrievals: PendingRetrieval[] = [];
     let originalMessages: CoreMessage[] = [];
     let nudge: NudgeDecision | undefined;
     let rebuiltMessages = parsed.messages;
@@ -2734,9 +2945,11 @@ async function prepareOpenai(
         // Absorb markers ride in the kernel's processTurn output (gated by
         // config.absorb). Title-gen requests skip ALL injection for
         // prefix-cache stability, so strip absorb from the loop config there.
-        const absorbActive = absorbEnabled(config) && shouldInject;
+        const absorbBlock = effectiveAbsorbBlock(pluginMode, config, opts.compress.absorb);
+        const absorbTools = absorbToolsFor(absorbBlock?.toolName ?? ABSORB_TOOL_NAME);
+        const absorbActive = absorbBlock?.enabled === true && shouldInject;
         const rulesActive = rulesEnabled(config) && shouldInject;
-        const loopConfig = { ...(absorbActive ? config : { ...config, absorb: undefined }), ...(ccrEnabled(session) ? {} : { ccr: undefined }) };
+        const loopConfig = ccrLoopConfig(session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
         const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only", contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
@@ -2767,19 +2980,23 @@ async function prepareOpenai(
             const rewrite = detectUnannouncedHistoryRewrite(session, knownRefsBefore, msgs.map((m) => m.id));
             if (rewrite.detected) {
                 log("warn", `[${sessionId}] unannounced client history rewrite detected (${rewrite.knownIncoming}/${rewrite.incomingTotal} incoming message(s) carry pre-turn refs of ${rewrite.knownBefore} known) — marking compaction boundary (#1001)`);
+                recordConflict(session, "unannounced-rewrite", `${rewrite.knownIncoming}/${rewrite.incomingTotal} incoming message(s) carry pre-turn refs of ${rewrite.knownBefore} known`);
                 markCompactionBoundary(session);
             }
         }
         applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
-        reapOrphanBlocks(session, msgs, deactivateBlock);
+        reapOrphansLogged(session, msgs, log, sessionId);
         // [#1095] arrival-time image downscale (see prepareAnthropic) — one
         // deterministic encode per fingerprint; byte-stable re-runs.
         await applyImageCompressionPass(session, processedMessages as BiliMessage[], { config, billing: imageBillingFor(opts, billingUpstream ?? upstreamOrigin), log });
-        // [#1271] plugin mode: acp_retrieve ran via the tool API; ride the full original
-        // back on this forward as a request-only trailing message (ephemeral, never persisted).
+        // [#1271/#1343] plugin mode: acp_retrieve already acked via the tool API; snapshot
+        // the queued full text onto THIS forward (stays in the queue until commit/drop, so an
+        // upstream failure drops-and-logs it instead of vanishing it).
         if (pluginMode && ccrEnabled(session)) {
-            const retrInj = drainPendingRetrievals(session);
-            if (retrInj.length > 0) processedMessages = [...processedMessages, ...retrInj];
+            reconcileReloadedRetrievals(session);
+            pruneExpiredRetrievals(session);
+            attachedRetrievals = snapshotPendingRetrievals(session);
+            if (attachedRetrievals.length > 0) processedMessages = [...processedMessages, ...attachedRetrievals.map((i) => i.injection)];
         }
         rebuiltMessages = systemToUser(hardenOpenaiAssistantContent(coreToOpenai(processedMessages as BiliMessage[])));
 
@@ -2792,7 +3009,7 @@ async function prepareOpenai(
         const sysParts: string[] = [];
         if (openaiSystemText) sysParts.push(openaiSystemText);
         if (shouldInject) sysParts.push(withConversationIdNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections)), visibilityMarkers), ensureCanonicalId(session)));
-        if (absorbActive) sysParts.push(buildAbsorbSystemPrompt(absorbToolName(config)));
+        if (absorbActive) sysParts.push(buildAbsorbSystemPrompt(absorbToolName(loopConfig)));
         rebuiltMessages = injectOpenaiSystem(rebuiltMessages, sysParts);
         if (sysNotes.length > 0) {
             rebuiltMessages = [...rebuiltMessages, ...sysNotes.map((text) => ({ role: "user" as const, content: text }))];
@@ -2803,7 +3020,7 @@ async function prepareOpenai(
         // avoids double-counting it.
         openaiOutboundSystem = sysParts.join("\n\n");
         if (injectTools) {
-            toolsOut = injectOpenaiTool(parsed.tools, [...(absorbActive ? [ABSORB_TOOL_OPENAI] : []), ...(rulesActive ? [RULE_TOOL_OPENAI] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).openai] : []), ...(imageCompressionEnabled(session) ? [IMAGE_FULL_TOOL_OPENAI] : [])], surface?.toolPrompts);
+            toolsOut = injectOpenaiTool(parsed.tools, [...(absorbActive ? [absorbTools.openai] : []), ...(rulesActive ? [RULE_TOOL_OPENAI] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).openai] : []), ...(imageCompressionEnabled(session) ? [IMAGE_FULL_TOOL_OPENAI] : [])], surface?.toolPrompts);
         }
         // Nudge as a separate trailing user message (cache-friendly). Injected
         // in BOTH modes (#451): plugin agents supply the ACP tools but have no
@@ -2824,8 +3041,13 @@ async function prepareOpenai(
         // (same pattern as prepareAnthropic/Google/Responses).
         const imgNote = imageFullTrailingNote(session);
         if (imgNote) rebuiltMessages = [...rebuiltMessages, { role: "user", content: imgNote }];
+        // [#1343] surface any earlier undelivered retrieve as an ephemeral trailing
+        // user note (kept last so it never reorders cached messages).
+        const retrNote = flushRetrievalNotes(session);
+        if (retrNote) rebuiltMessages = [...rebuiltMessages, { role: "user", content: retrNote }];
     } catch (err) {
         log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
+        if (attachedRetrievals.length > 0) dropRetrievals(session, attachedRetrievals.map((i) => i.ref), "prepare failed; forwarded unprocessed");
         processedMessages = [];
     }
 
@@ -2868,7 +3090,7 @@ async function prepareOpenai(
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only" } as Prepared;
 }
 
 /** Append the ephemeral nudge to a Gemini `contents` array. Gemini is
@@ -2948,12 +3170,14 @@ async function prepareGoogle(
         originalMessages = msgs;
         const tokenCount = effectiveTokenCount(session, msgs, imageTokensInParsedBody("google", parsed, imageBillingFor(opts, upstreamOrigin)));
         const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
-        const absorbActive = absorbEnabled(config) && shouldInject;
+        const absorbBlock = effectiveAbsorbBlock(pluginMode, config, opts.compress.absorb);
+        const absorbTools = absorbToolsFor(absorbBlock?.toolName ?? ABSORB_TOOL_NAME);
+        const absorbActive = absorbBlock?.enabled === true && shouldInject;
         // acp_rule has no processTurn side effect (no markers/instructions are
         // ever injected into messages), so unlike absorb it needs no loop-
         // config stripping — only tool availability matters.
         const rulesActive = rulesEnabled(config) && shouldInject;
-        const loopConfig = { ...(absorbActive ? config : { ...config, absorb: undefined }), ...(ccrEnabled(session) ? {} : { ccr: undefined }) };
+        const loopConfig = ccrLoopConfig(session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
         const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags: "text-only", contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
@@ -2977,7 +3201,7 @@ async function prepareGoogle(
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, model, willInjectNudge));
         processedMessages = stripKernelSummaries(turn.messages, turn.state);
         applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
-        reapOrphanBlocks(session, msgs, deactivateBlock);
+        reapOrphansLogged(session, msgs, log, sessionId);
         // [#1095] arrival-time image downscale (see prepareAnthropic).
         await applyImageCompressionPass(session, processedMessages as BiliMessage[], { config, billing: imageBillingFor(opts, upstreamOrigin), log });
         rebuiltContents = coreToGoogle(processedMessages as BiliMessage[]);
@@ -2989,7 +3213,7 @@ async function prepareGoogle(
         const sysParts: string[] = [];
         if (googleClientSystem) sysParts.push(googleClientSystem);
         if (shouldInject) sysParts.push(withMarkerIntegrityNote(buildCompressSystemPrompt(prompts, surface?.promptSections), visibilityMarkers));
-        if (absorbActive) sysParts.push(buildAbsorbSystemPrompt(absorbToolName(config)));
+        if (absorbActive) sysParts.push(buildAbsorbSystemPrompt(absorbToolName(loopConfig)));
         googleOutboundSystem = sysParts.join("\n\n");
         // Untouched when nothing was added beyond the client's own text: the
         // original `systemInstruction` object then rides through byte-identical
@@ -2997,7 +3221,7 @@ async function prepareGoogle(
         const extraSystemParts = sysParts.slice(googleClientSystem ? 1 : 0);
         systemInstruction = extraSystemParts.length > 0 ? { parts: sysParts.map((text) => ({ text })) } : parsed.systemInstruction;
         if (injectTools) {
-            toolsOut = injectGoogleTool(parsed.tools, [...(absorbActive ? [ABSORB_TOOL_GOOGLE] : []), ...(rulesActive ? [RULE_TOOL_GOOGLE] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).google] : []), ...(imageCompressionEnabled(session) ? [IMAGE_FULL_TOOL_GOOGLE] : [])], surface?.toolPrompts);
+            toolsOut = injectGoogleTool(parsed.tools, [...(absorbActive ? [absorbTools.google] : []), ...(rulesActive ? [RULE_TOOL_GOOGLE] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).google] : []), ...(imageCompressionEnabled(session) ? [IMAGE_FULL_TOOL_GOOGLE] : [])], surface?.toolPrompts);
         }
         if (sysNotes.length > 0) {
             rebuiltContents = appendGoogleNudge(rebuiltContents, sysNotes.join("\n\n---\n\n"));
@@ -3046,7 +3270,7 @@ export function prepareGoogleCountTokens(
         const { msgs } = googleToCore(parsed);
         // Read-only preview: the store rides in so placeholder substitution is
         // counted, but nothing is adopted (state is discarded here too).
-        const turn = core.processTurn({ messages: msgs, state: session.state, config: ccrEnabled(session) ? config : { ...config, ccr: undefined }, tokenCount: session.stats.lastInputTokens, renderTags: "text-only", contentStore: contentStoreOf(session) });
+        const turn = core.processTurn({ messages: msgs, state: session.state, config: ccrLoopConfig(session, config), tokenCount: session.stats.lastInputTokens, renderTags: "text-only", contentStore: contentStoreOf(session) });
         const stripped = stripKernelSummaries(turn.messages, turn.state);
         const rebuilt: GoogleRequestBody = { ...parsed, contents: coreToGoogle(stripped as BiliMessage[]) };
         log("info", `[${sessionId}] countTokens pruned: ${msgs.length} → ${stripped.length} msgs`);
@@ -3186,9 +3410,11 @@ async function prepareResponses(
         // Absorb markers ride in the kernel's processTurn output (gated by
         // config.absorb). The marker/text protocol has no native tool channel,
         // so strip absorb from the loop config there (both modes).
-        const absorbActive = absorbEnabled(config) && shouldInject && !isCompactionTrigger && !responsesTextProtocol;
+        const absorbBlock = effectiveAbsorbBlock(pluginMode, config, opts.compress.absorb);
+        const absorbTools = absorbToolsFor(absorbBlock?.toolName ?? ABSORB_TOOL_NAME);
+        const absorbActive = absorbBlock?.enabled === true && shouldInject && !isCompactionTrigger && !responsesTextProtocol;
         const rulesActive = rulesEnabled(config) && shouldInject && !isCompactionTrigger && !responsesTextProtocol;
-        const loopConfig = { ...(absorbActive ? config : { ...config, absorb: undefined }), ...(ccrEnabled(session) ? {} : { ccr: undefined }) };
+        const loopConfig = ccrLoopConfig(session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
         const turn = core.processTurn({ messages: msgs, state: session.state, config: loopConfig, tokenCount, renderTags, contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
@@ -3212,7 +3438,7 @@ async function prepareResponses(
         const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !isCompactionTrigger && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
         processedMessages = repairResponsesAssistantOrdering(stripReasoning(stripKernelSummaries(turn.messages, turn.state)), originalMessages);
-        reapOrphanBlocks(session, msgs, deactivateBlock);
+        reapOrphansLogged(session, msgs, log, sessionId);
         // [#1095] arrival-time image downscale (see prepareAnthropic).
         await applyImageCompressionPass(session, processedMessages as BiliMessage[], { config, billing: imageBillingFor(opts, billingUpstream ?? upstreamOrigin), log });
         rebuiltInput = patchResponsesInput(projection, processedMessages);
@@ -3229,12 +3455,12 @@ async function prepareResponses(
         if (shouldInject && !isCompactionTrigger && !process.env.ACP_NO_COMPRESS_PROMPT) {
             const prompt = withConversationIdNote(withMarkerIntegrityNote(withSummaryBudgetNote(responsesTextProtocol ? buildCompressHybridSystemPrompt(prompts, surface?.promptSections) : buildCompressSystemPrompt(prompts, surface?.promptSections)), visibilityMarkers), ensureCanonicalId(session));
             const devParts = [...projection.systemParts, ...forgedSummaries, prompt];
-            if (absorbActive) devParts.push(buildAbsorbSystemPrompt(absorbToolName(config)));
+            if (absorbActive) devParts.push(buildAbsorbSystemPrompt(absorbToolName(loopConfig)));
             const devContent = devParts.join("\n\n---\n\n");
             responsesDevContent = devContent;
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent);
             if (!process.env.ACP_NO_INJECT_TOOL && injectTools) {
-                const respExtra = [...(absorbActive ? [ABSORB_TOOL_RESPONSES] : []), ...(rulesActive ? [RULE_TOOL_RESPONSES] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).responses] : []), ...(imageCompressionEnabled(session) ? [IMAGE_FULL_TOOL_RESPONSES] : [])];
+                const respExtra = [...(absorbActive ? [absorbTools.responses] : []), ...(rulesActive ? [RULE_TOOL_RESPONSES] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).responses] : []), ...(imageCompressionEnabled(session) ? [IMAGE_FULL_TOOL_RESPONSES] : [])];
                 toolsOut = responsesTextProtocol
                     ? injectResponsesTool(parsed.tools, BILI_ACP_READONLY_TOOLS_RESPONSES, surface?.toolPrompts)
                     : injectResponsesTool(parsed.tools, respExtra.length > 0 ? [...BILI_ACP_TOOLS_RESPONSES, ...respExtra] : BILI_ACP_TOOLS_RESPONSES, surface?.toolPrompts);
@@ -3424,7 +3650,7 @@ export function prepareCountTokens(
     try {
         const { msgs, cacheControls } = anthropicToCore(parsed);
         // Read-only preview: same policy as the google twin above.
-        const turn = core.processTurn({ messages: msgs, state: session.state, config: ccrEnabled(session) ? config : { ...config, ccr: undefined }, tokenCount: session.stats.lastInputTokens, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only", contentStore: contentStoreOf(session) });
+        const turn = core.processTurn({ messages: msgs, state: session.state, config: ccrLoopConfig(session, config), tokenCount: session.stats.lastInputTokens, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only", contentStore: contentStoreOf(session) });
         const stripped = stripKernelSummaries(turn.messages as BiliMessage[], turn.state);
         const rebuiltMessages = coreToAnthropic(stripped, cacheControls);
         log("info", `[${sessionId}] count_tokens pruned: ${msgs.length} → ${stripped.length} msgs`);
@@ -3505,7 +3731,7 @@ function prepareResponsesCompact(
         // The forged handoff is one-shot with no tool channel: strip absorb so
         // no [ACP absorb] instruction bakes into the forged history, and run
         // the absorb view so absorbed pairs stay hidden in it (wire parity).
-        const compactConfig = { ...config, absorb: undefined, ...(ccrEnabled(session) ? {} : { ccr: undefined }) };
+        const compactConfig = ccrLoopConfig(session, { ...config, absorb: undefined });
         const turn = core.processTurn({ messages: projection.msgs, state: session.state, config: compactConfig, tokenCount: session.stats.lastInputTokens, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only", contentStore: contentStoreOf(session) });
         session.state = turn.state;
         adoptContentStore(session, turn.contentStore);
@@ -3591,6 +3817,14 @@ function isAutoModeClassifier(parsed: AnthropicRequestBody): boolean {
     const stops = parsed.stop_sequences;
     if (!Array.isArray(stops)) return false;
     return stops.some((s) => typeof s === "string" && AUTO_MODE_CLASSIFIER_STOPS.has(s));
+}
+
+// #1359: which absorb block governs a session, by lane. Proxy lane keeps the
+// per-request merged block (provider/model overrides apply); plugin lane uses
+// the base block so the manifest's advertised name and the gate's adjudicated
+// name always agree — provider/model absorb.* overrides are proxy-lane-only.
+function effectiveAbsorbBlock(pluginMode: boolean, config: Config, baseAbsorb?: CompressSettings["absorb"]): AbsorbConfig | undefined {
+    return pluginMode ? resolveAbsorbSettings(baseAbsorb) : config.absorb;
 }
 
 function injectSystem(
@@ -4196,6 +4430,7 @@ async function forward(
     route: ReturnType<typeof resolveUpstream>,
     instanceId: string,
     affinity?: string,
+    overflowRefold?: (realWindow: number | undefined) => Promise<string | Buffer | null>,
 ): Promise<void> {
     // E2: a codex native-compaction request intercepted in prepare() carries a
     // forged success response — serve it without contacting upstream.
@@ -4396,6 +4631,9 @@ async function forward(
         // #604: a network-level failure (socket reset, timeout abort) also never
         // reports usage — arm the emergency shrink like the 5xx branch below.
         if (prepared && req.method !== "GET" && req.method !== "HEAD") armFailureShrink(prepared, log, "network failure");
+        // [#1343] no response means the attached full text never reached the model —
+        // drop-and-log it (a corrective note surfaces on the next qualifying request).
+        if (prepared && prepared.attachedRetrievals && prepared.attachedRetrievals.length > 0) dropRetrievals(prepared.session, prepared.attachedRetrievals.map((i) => i.ref), "upstream network failure");
         throw new Error(`upstream request failed: ${formatUpstreamError(error, upstreamUrl, proxyUrl)}`, { cause: error });
     }
     // #552 learn-on-failure: a converting upstream that rejects a role (codex
@@ -4487,7 +4725,150 @@ async function forward(
             }
         }
     }
+    // #987/#1195: arm the one-shot emergency shrink (declared window unchanged,
+    // nothing persisted/learned) — extracted so the same-request overflow retry
+    // below and the !ok passthrough share it exactly once per request.
+    let overflowArmed = false;
+    const armOverflowShrink = (info: ContextOverflowInfo): void => {
+        if (overflowArmed || !info.isOverflow) return;
+        overflowArmed = true;
+        const s = prepared!.session;
+        let reqModel: string | undefined;
+        let rawBody: string | undefined;
+        try {
+            rawBody = typeof prepared!.body === "string" ? prepared!.body : prepared!.body.toString("utf8");
+            const parsedBody = JSON.parse(rawBody) as Record<string, unknown>;
+            reqModel = typeof parsedBody.model === "string" ? parsedBody.model : undefined;
+        } catch {
+            reqModel = undefined;
+        }
+        if (info.window) {
+            // Arm the emergency shrink at EXACTLY the stated window: the
+            // upstream just proved a turn cannot succeed above it, so the
+            // next turn's kernel emergency nudge + tool-result truncate
+            // must fire. #857: a number the upstream itself stated is
+            // usage-grade provenance (not a content estimate); a real
+            // usage report on the next successful turn overwrites it.
+            s.stats.lastInputTokens = info.window;
+            s.stats.lastInputTokensSource = "usage";
+            // #1110: record the arm SEPARATELY so the side-request guard
+            // can read it without ever touching the nudge baseline.
+            s.stats.overflowArmTokens = info.window;
+            log("warn", `[${s.id}] upstream context overflow (model=${reqModel ?? "unknown"}) — window ${info.window} stated upstream; armed emergency shrink, declared window unchanged (#987)`);
+        } else {
+            // No window number stated — nothing to learn (and #987
+            // removed the learner anyway), but the rejection itself is
+            // evidence at the size actually sent: arm at
+            // min(declared, payload estimate). A payload BELOW the
+            // declared window being rejected means the declaration is
+            // wrong (or the upstream is flaky) — arming at the payload's
+            // own size never over-triggers, while a payload OVER the
+            // declared window arms at the declaration — which is what
+            // the #496 image-relay forward-once gate needs to break the
+            // #488 400 loop after exactly one rejected forward.
+            const declared = typeof s.metadata.effectiveContextLimit === "number" ? s.metadata.effectiveContextLimit : 0;
+            let est = 0;
+            try {
+                est = estimateTokensFast(rawBody ?? "");
+            } catch { est = 0; }
+            const arm = Math.max(0, Math.min(declared, Number.isFinite(est) ? est : declared));
+            if (arm > 0) {
+                s.stats.lastInputTokens = arm;
+                s.stats.lastInputTokensSource = "usage";
+                s.stats.overflowArmTokens = arm; // #1110: guard reads this, not the baseline
+            }
+            log("warn", `[${s.id}] upstream context overflow (window not parseable, model=${reqModel ?? "unknown"}) — armed emergency shrink at ~${arm} tokens (min of declared ${declared} and payload estimate), nothing learned (#987): ${info.message}`);
+        }
+        // The armed emergency (lastInputTokens) lives in memory only
+        // until scheduled — the error path returns before forward()'s
+        // trailing markDirty, so schedule the save HERE or the arm is
+        // lost on restart.
+        markDirty(s);
+    };
+    // #1195: a context overflow used to arm the shrink and pass the 400 through
+    // verbatim, expecting the NEXT turn to fold — but wire clients treat the
+    // error as fatal and end the session, so the armed rescue never runs and the
+    // session locks. With a refold hook: arm, let the caller re-run prepare+
+    // preflight against the window the upstream STATED (per-call override, no
+    // learning), and re-send the folded body ONCE within this same request. An
+    // unchanged body (nothing foldable), a null refold, or a transport failure
+    // falls back to today's verbatim passthrough below.
+    if (
+        overflowRefold &&
+        prepared?.session &&
+        (upstreamResult.response.status === 400 || upstreamResult.response.status === 413) &&
+        upstreamResult.response.body &&
+        res.writable &&
+        !res.writableEnded &&
+        !res.destroyed
+    ) {
+        let overflowText: string | null = null;
+        try {
+            overflowText = (await readStreamToBuffer(upstreamResult.response.body)).toString("utf8");
+        } catch {
+            overflowText = null;
+        }
+        if (overflowText !== null) {
+            // Rebuild the consumed body (same shape as the role ladder above)
+            // so the error path below reads the same bytes verbatim.
+            upstreamResult = {
+                response: new Response(overflowText, {
+                    status: upstreamResult.response.status,
+                    statusText: upstreamResult.response.statusText,
+                    headers: new Headers(upstreamResult.response.headers),
+                }),
+                clearTimer: upstreamResult.clearTimer,
+                stopIdleTimer: upstreamResult.stopIdleTimer,
+            };
+            const overflowInfo = inspectContextOverflow(upstreamResult.response.status, overflowText);
+            if (overflowInfo.isOverflow) {
+                armOverflowShrink(overflowInfo);
+                const refolded = await overflowRefold(overflowInfo.window).catch(() => null);
+                if (refolded) {
+                    try {
+                        const retried = await fetchWithTimeout(upstreamUrl, { ...init, body: refolded }, undefined, clientAbort.signal);
+                        if (retried.response.ok) {
+                            upstreamResult.clearTimer();
+                            upstreamResult = retried;
+                            log("info", `[${prepared.session.id}] context overflow — refolded and re-sent within the same request, upstream accepted (#1195)`);
+                        } else {
+                            let retryErrText: string | null = null;
+                            if (retried.response.body) {
+                                try {
+                                    retryErrText = (await readStreamToBuffer(retried.response.body)).toString("utf8");
+                                } catch {
+                                    retryErrText = null;
+                                }
+                            }
+                            // Answer with the retry's own verdict, not the stale first 400.
+                            upstreamResult.clearTimer();
+                            upstreamResult = {
+                                response: new Response(retryErrText ?? "", {
+                                    status: retried.response.status,
+                                    statusText: retried.response.statusText,
+                                    headers: new Headers(retried.response.headers),
+                                }),
+                                clearTimer: retried.clearTimer,
+                                stopIdleTimer: retried.stopIdleTimer,
+                            };
+                            log("warn", `[${prepared.session.id}] context overflow — refold retry still rejected (HTTP ${retried.response.status}); passing the retry response through (#1195)`);
+                        }
+                    } catch {
+                        // transport failure — the buffered original 400 answers below
+                    }
+                }
+            }
+        }
+    }
     const { response: upstream, clearTimer: clearUpstreamTimer } = upstreamResult;
+    // [#1343] delivery decided: the attached full text rode THIS request's body, so settle
+    // its lifecycle here — delivered on a 2xx, dropped-and-logged otherwise. The ack is
+    // already out to the agent, so a failure must be observable + correctable, not silent.
+    if (prepared && prepared.attachedRetrievals && prepared.attachedRetrievals.length > 0) {
+        const aRefs = prepared.attachedRetrievals.map((i) => i.ref);
+        if (upstream.ok) commitRetrievals(prepared.session, aRefs);
+        else dropRetrievals(prepared.session, aRefs, `upstream HTTP ${upstream.status}`);
+    }
     const respHeaders: Record<string, string> = {};
     const respConnNamed = connectionNamedHeaders(upstream.headers.get("connection") ?? undefined);
     upstream.headers.forEach((v, k) => {
@@ -4526,7 +4907,9 @@ async function forward(
         // when the configured window is wrong (e.g. the 200k fallback for an
         // unknown model on a relay) an upstream 400 is the only reliable signal
         // that the real window is smaller. Learn the window, arm an emergency
-        // shrink for the next turn, then pass the error through verbatim.
+        // shrink for the next turn, then pass the error through verbatim. When
+        // the #1195 same-request refold above already ran, this is the
+        // passthrough of last resort (retry rejected / nothing foldable).
         let errBody: Buffer | null = null;
         if (upstream.body) {
             try {
@@ -4539,63 +4922,7 @@ async function forward(
             const s = prepared.session;
             const info = inspectContextOverflow(upstream.status, errBody.toString("utf8"));
             if (info.isOverflow) {
-                // #987: no window learning — the context window is a deployment
-                // property, owned by declarations (config / registry /
-                // runtime-info), never adjusted from session traffic. An overflow
-                // still arms the one-shot emergency shrink so the NEXT turn
-                // compresses below the failing size, but nothing is persisted
-                // and the declared window keeps governing.
-                let reqModel: string | undefined;
-                let rawBody: string | undefined;
-                try {
-                    rawBody = typeof prepared.body === "string" ? prepared.body : prepared.body.toString("utf8");
-                    const parsedBody = JSON.parse(rawBody) as Record<string, unknown>;
-                    reqModel = typeof parsedBody.model === "string" ? parsedBody.model : undefined;
-                } catch {
-                    reqModel = undefined;
-                }
-                if (info.window) {
-                    // Arm the emergency shrink at EXACTLY the stated window: the
-                    // upstream just proved a turn cannot succeed above it, so the
-                    // next turn's kernel emergency nudge + tool-result truncate
-                    // must fire. #857: a number the upstream itself stated is
-                    // usage-grade provenance (not a content estimate); a real
-                    // usage report on the next successful turn overwrites it.
-                    s.stats.lastInputTokens = info.window;
-                    s.stats.lastInputTokensSource = "usage";
-                    // #1110: record the arm SEPARATELY so the side-request guard
-                    // can read it without ever touching the nudge baseline.
-                    s.stats.overflowArmTokens = info.window;
-                    log("warn", `[${s.id}] upstream context overflow (model=${reqModel ?? "unknown"}) — window ${info.window} stated upstream; armed emergency shrink, declared window unchanged (#987)`);
-                } else {
-                    // No window number stated — nothing to learn (and #987
-                    // removed the learner anyway), but the rejection itself is
-                    // evidence at the size actually sent: arm at
-                    // min(declared, payload estimate). A payload BELOW the
-                    // declared window being rejected means the declaration is
-                    // wrong (or the upstream is flaky) — arming at the payload's
-                    // own size never over-triggers, while a payload OVER the
-                    // declared window arms at the declaration — which is what
-                    // the #496 image-relay forward-once gate needs to break the
-                    // #488 400 loop after exactly one rejected forward.
-                    const declared = typeof s.metadata.effectiveContextLimit === "number" ? s.metadata.effectiveContextLimit : 0;
-                    let est = 0;
-                    try {
-                        est = estimateTokensFast(rawBody ?? "");
-                    } catch { est = 0; }
-                    const arm = Math.max(0, Math.min(declared, Number.isFinite(est) ? est : declared));
-                    if (arm > 0) {
-                        s.stats.lastInputTokens = arm;
-                        s.stats.lastInputTokensSource = "usage";
-                        s.stats.overflowArmTokens = arm; // #1110: guard reads this, not the baseline
-                    }
-                    log("warn", `[${s.id}] upstream context overflow (window not parseable, model=${reqModel ?? "unknown"}) — armed emergency shrink at ~${arm} tokens (min of declared ${declared} and payload estimate), nothing learned (#987): ${info.message}`);
-                }
-                // The armed emergency (lastInputTokens) lives in memory only
-                // until scheduled — the error path returns before forward()'s
-                // trailing markDirty, so schedule the save HERE or the arm is
-                // lost on restart.
-                markDirty(s);
+                armOverflowShrink(info);
             }
             // #762: learn strict-echo on the MAIN request path too. The loop-only
             // learner (src/loop/core.ts) never sees client-originated 400s, so a
@@ -4946,8 +5273,9 @@ async function forward(
             // Same absorb gate as prepare*: the section only exists where the
             // tool is callable, keeping loop re-requests byte-consistent with
             // the first request (prefix-cache anchor).
-            const absorbActive = absorbEnabled(config) && opts.compress.injectTool && !textProtocol;
-            const loopConfig = { ...(absorbActive ? config : { ...config, absorb: undefined }), ...(ccrEnabled(prepared.session) ? {} : { ccr: undefined }) };
+            const absorbBlock = effectiveAbsorbBlock(prepared.pluginMode === true, config, opts.compress.absorb);
+            const absorbActive = absorbBlock?.enabled === true && opts.compress.injectTool && !textProtocol;
+            const loopConfig = ccrLoopConfig(prepared.session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
             const absorbSection = absorbActive
                 ? `\n\n---\n\n${buildAbsorbSystemPrompt(absorbToolName(loopConfig))}`
                 : "";
@@ -5193,9 +5521,10 @@ function handleConfigReload(opts: ProxyOptions, res: http.ServerResponse, log: (
     // (which read opts.routes) pick up the new entries without needing reassignment.
     for (const k of Object.keys(opts.routes)) delete opts.routes[k];
     Object.assign(opts.routes, fresh);
-    opts.compress = loadOptions().compress;
-    opts.compat = loadOptions().compat;
-    opts.imageBilling = loadOptions().imageBilling;
+    const reloaded = loadOptions();
+    opts.compress = reloaded.compress;
+    opts.compat = reloaded.compat;
+    opts.imageBilling = reloaded.imageBilling;
     // Release cached ProxyAgents so agents for proxy URLs that were
     // removed/changed don't leak for the process lifetime. The next request
     // re-creates the needed agent lazily via proxyDispatcher().
@@ -5224,8 +5553,20 @@ function sendCacheReport(res: http.ServerResponse, url: string): void {
     res.end(JSON.stringify({ reports: sessions.map((s) => ({ id: s.id, report: buildSessionCacheReport(s) })) }, null, 2));
 }
 
+// #1206: orphan reaping was silent — blocks deactivated because their source
+// messages vanished from client history are the strongest runtime signal that
+// something outside bili (client auto-compaction or another compression plugin)
+// rewrote the conversation. Log it and record it in the session ledger.
+function reapOrphansLogged(session: Session, msgs: CoreMessage[], log: (level: string, msg: string) => void, sessionId: string): void {
+    const { reaped } = reapOrphanBlocks(session, msgs, deactivateBlock);
+    if (reaped.length === 0) return;
+    log("warn", `[${sessionId}] orphan-gc deactivated ${reaped.length} block(s) whose source messages left the client history (${reaped.join(", ")}) — the client or another compression plugin deleted summarized content; those summaries can no longer be decompressed (#1206)`);
+    recordConflict(session, "orphan-reap", `${reaped.length} block(s) deactivated: ${reaped.join(", ")}`);
+}
+
 function sendStats(res: http.ServerResponse): void {
-    const sessions = listSessions().map((s) => ({
+    const all = listSessions();
+    const sessions = all.map((s) => ({
         id: s.id,
         protocol: s.meta.protocol,
         upstream: s.meta.upstreamOrigin,
@@ -5246,7 +5587,7 @@ function sendStats(res: http.ServerResponse): void {
         restored: s.restored === true,
     }));
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ sessions, blindTunnels: getBlindTunnelStats(), unrecognizedPaths: getUnrecognizedPathStats() }, null, 2));
+    res.end(JSON.stringify({ sessions, blindTunnels: getBlindTunnelStats(), unrecognizedPaths: getUnrecognizedPathStats(), conflicts: summarizeConflicts(all) }, null, 2));
 }
 
 /** Stale-install state for the web UI badge (#811): whether the on-disk
@@ -5261,7 +5602,7 @@ async function sendStatus(res: http.ServerResponse, opts: ProxyOptions): Promise
         // fs hiccup: report running state only, never fail the status endpoint
     }
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ version: VERSION, diskVersion, stale, autoRestartOnUpdate: opts.autoRestartOnUpdate, inFlight: totalInFlight() }, null, 2));
+    res.end(JSON.stringify({ version: VERSION, diskVersion, stale, autoRestartOnUpdate: opts.autoRestartOnUpdate, inFlight: totalInFlight(), conflicts: summarizeConflicts(listSessions()) }, null, 2));
 }
 
 function headerValue(req: http.IncomingMessage, name: string): string | undefined {
@@ -5330,6 +5671,6 @@ function logMsg(opts: ProxyOptions, level: string, msg: string): void {
 }
 
 export { getUnrecognizedPathStats, logDumpFailure, logUnrecognizedPath } from "./server/observability.js";
-export { BILI_HOP_HEADER, parseLauncherModelWindows, anthropicBetaContextWindow } from "./server/context-window.js";
+export { BILI_HOP_HEADER, parseLauncherModelWindows, anthropicBetaContextWindow, capRegistryWindowByStandard, expandedContextSuffixWindow } from "./server/context-window.js";
 export { isSideRequest, outputBudgetField, restoreOutputBudget, sideRequestGuard, type OutputBudgetField } from "./server/side-request.js";
-export { countSystemAndToolsTokens, estimateInputTokens, estimateWireOverhead, clampOutputBudget, emergencyNudge } from "./server/budget.js";
+export { countSystemAndToolsTokens, estimateInputTokens, estimateWireOverhead, clampOutputBudget, emergencyNudge, projectThinkingMass, type ThinkingMassInput } from "./server/budget.js";

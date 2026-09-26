@@ -1,4 +1,5 @@
 import { Agent } from "undici";
+import { classifyUpstreamFailure, isFailFastUpstreamKind } from "./upstream-fail.js";
 
 /** HTTP robustness helpers for the proxy.
 
@@ -295,8 +296,12 @@ export interface ReplayRetryInfo {
 /** fetchWithTimeout with bounded retry on transient upstream HTTP failures.
  *  For acp-loop replay requests, where provider risk-control may briefly
  *  reject a request whose context was just rewritten (#189). Network-level
- *  failures (timeout, connection reset) propagate unchanged — NOT retried
- *  here, to avoid stacking the 12-min timeout across attempts. */
+ *  failures are classified (#1263): fail-fast connect-phase resets/refusals
+ *  (proxy-reset / upstream-reset / connect-refused — the attempt died BEFORE
+ *  any response byte, so a replay cannot double-deliver and cost only
+ *  milliseconds) get the same bounded retry; timeout/abort kinds still
+ *  propagate unchanged — NOT retried, to avoid stacking the 12-min idle
+ *  budget across attempts. */
 export async function fetchWithRetry(
     url: string,
     opts: FetchOptions,
@@ -306,7 +311,19 @@ export async function fetchWithRetry(
 ): Promise<{ response: Response; clearTimer: () => void }> {
     const maxAttempts = replayMaxAttempts();
     for (let attempt = 1; ; attempt++) {
-        const result = await fetchWithTimeout(url, opts, timeoutMs, externalSignal);
+        let result: Awaited<ReturnType<typeof fetchWithTimeout>>;
+        try {
+            result = await fetchWithTimeout(url, opts, timeoutMs, externalSignal);
+        } catch (error) {
+            const kind = classifyUpstreamFailure(error, { viaProxy: opts.dispatcher !== undefined, externalAborted: externalSignal?.aborted === true });
+            if (!isFailFastUpstreamKind(kind)) throw error;
+            const lastAttempt = attempt >= maxAttempts;
+            if (lastAttempt) throw error;
+            const delayMs = replayBackoffMs(attempt);
+            onRetry?.({ attempt, status: 0, detail: `${kind} (pre-response network failure): ${error instanceof Error ? error.message : String(error)}`, delayMs, maxAttempts });
+            await sleep(delayMs, externalSignal);
+            continue;
+        }
         if (result.response.ok) return result;
         const errText = await result.response.text().catch(() => "upstream error");
         result.clearTimer();

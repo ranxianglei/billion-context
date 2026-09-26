@@ -99,7 +99,7 @@ function proxyBaseOptions(upstreamPort: number, window: number): ProxyOptions {
     } as ProxyOptions;
 }
 
-test("e2e #987 T1: a stated-window overflow arms the emergency shrink but learns nothing — the declared window keeps governing", async () => {
+test("e2e #987/#1195 T1: a stated-window overflow arms the one-shot shrink, learns nothing, and (#1195) the turn is rescued in-request", async () => {
     let streamingCall = 0;
     let summaryCalls = 0;
     const bodies: string[] = [];
@@ -146,28 +146,32 @@ test("e2e #987 T1: a stated-window overflow arms the emergency shrink but learns
         const body = JSON.stringify({ model: "claude-test", max_tokens: 1024, stream: true, messages: bigConversation() });
         const headers = { "content-type": "application/json", "x-acp-session": "t1-sess" };
 
-        // r1: the 400 (stating 128000) passes through verbatim and arms the
-        // one-shot emergency shrink — but persists NO learned window.
+        // r1: the upstream 400 stating 128000 no longer reaches the client —
+        // #1195: the arm fires, prepare+preflight re-run against the STATED
+        // window (per-call override, nothing learned), the folded body is
+        // re-sent within the same request, and the retry's 200 answers.
         const r1 = await fetch(url, { method: "POST", headers, body });
-        assert.equal(r1.status, 400);
-        const r1text = await r1.text();
-        assert.ok(r1text.includes("prompt is too long"), "error body passes through verbatim");
+        assert.equal(r1.status, 200, "#1195: refolded and re-sent within the same request");
+        assert.equal(r1.headers.get("content-type"), "text/event-stream", "the retry's SSE is what the client sees");
+        await r1.text();
         const s = listSessions().find((x) => x.id === "t1-sess");
         assert.ok(s, "session exists");
         assert.equal(s!.metadata.confirmedContextLimits, undefined, "#987: nothing learned");
         assert.equal(s!.metadata.confirmedContextLimit, undefined, "#987: no legacy scalar either");
-        assert.equal(s!.stats.lastInputTokens, 128000, "emergency shrink armed at the stated window");
+        assert.equal(s!.stats.lastInputTokens, 5000, "the retry's own usage report already replaced the armed baseline");
         assert.equal(s!.stats.lastInputTokensSource, "usage", "a window the upstream stated is usage-grade (#857)");
+        assert.equal(s!.stats.overflowArmTokens, undefined, "#1129: the retry's usage report retired the one-shot arm — the emergency is over");
 
         // r2: same payload, declared window (400k) governs — the payload is
-        // IN-window, so no preflight fold: forwarded verbatim, upstream 200.
+        // IN-window, so no further fold: forwarded verbatim, upstream 200.
         const r2 = await fetch(url, { method: "POST", headers, body });
         assert.equal(r2.status, 200);
         await r2.text();
-        assert.equal(summaryCalls, 0, "in-window payload under the declared window — no fold");
+        assert.equal(summaryCalls, 1, "exactly the one fold from r1's rescue — r2 itself does not fold");
         const lastForward = bodies[bodies.length - 1];
-        assert.ok(lastForward.includes("MARKER_1_") && lastForward.includes("MARKER_11_"), "history forwarded verbatim");
-        assert.ok(!lastForward.includes(SUMMARY_TEXT), "no fold");
+        assert.ok(lastForward.includes(SUMMARY_TEXT), "the fold is sticky — r2 forwards the compacted view, not the resent full history");
+        assert.ok(lastForward.includes("MARKER_11_"), "the recent tail is preserved verbatim");
+        assert.ok(!lastForward.includes("MARKER_1_"), "the already-folded early range stays folded");
         const s2 = listSessions().find((x) => x.id === "t1-sess");
         assert.equal(s2?.stats.lastInputTokens, 5000, "the successful turn's usage report overwrote the armed value");
         assert.equal(s2?.metadata.confirmedContextLimits, undefined, "still nothing learned after recovery");

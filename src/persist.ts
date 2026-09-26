@@ -107,6 +107,8 @@ interface PersistedSession {
         retrieveCalls?: number;
         retrieveHits?: number;
         retrieveMisses?: number;
+        retrieveDropped?: number;
+        retrieveDelivered?: number;
         storedBytes?: number;
         storeBytesSaved?: number;
         imageShrunkCount?: number;
@@ -729,6 +731,8 @@ function buildSession(parsed: PersistedSession): Session {
             retrieveCalls: stats.retrieveCalls ?? 0,
             retrieveHits: stats.retrieveHits ?? 0,
             retrieveMisses: stats.retrieveMisses ?? 0,
+            retrieveDropped: stats.retrieveDropped ?? 0,
+            retrieveDelivered: stats.retrieveDelivered ?? 0,
             storedBytes: stats.storedBytes ?? 0,
             storeBytesSaved: stats.storeBytesSaved ?? 0,
             imageShrunkCount: stats.imageShrunkCount ?? 0,
@@ -748,6 +752,10 @@ function buildSession(parsed: PersistedSession): Session {
         // session been used since boot" read the restored flag.
         lastSeen: parsed.savedAt ?? Date.now(),
         restored: true,
+        // #1343: arm the reload reconcile for the first request of THIS
+        // process — getSession() clears `restored` before prepare runs, so
+        // the reconcile needs its own one-shot marker to fire exactly once.
+        ccrReconcilePending: true,
         blockContents,
         lastMessages: Array.isArray(parsed.messages) ? parsed.messages : undefined,
         lastMessagesFolded: parsed.messagesFolded === true,

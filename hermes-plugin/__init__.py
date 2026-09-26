@@ -4,8 +4,8 @@ Installed by ``bili plugin install hermes`` — a plain ``hermes`` session then 
 billion-context client with no launcher, no env vars and no fixed port:
 
 * spawns its own bili proxy on an ephemeral port (or attaches to a healthy one) and routes
-  model traffic through it via ``HTTPS_PROXY`` + ``HERMES_CA_BUNDLE`` — the same wire path
-  the ``bili hermes`` launcher uses (CONNECT + certificate MITM);
+  model traffic through it via ``HTTPS_PROXY`` + ``SSL_CERT_FILE`` (combined CA bundle) —
+  the same wire path the ``bili hermes`` launcher uses (CONNECT + certificate MITM);
 * registers the proxy's ACP tools (compress / decompress / acp_status) as native Hermes tools;
 * stamps plugin-mode headers on every LLM request once the tools are ready — round 1 rides
   wire mode so strict backends see a clean head;
@@ -42,6 +42,7 @@ AGENT_NAME = "hermes"
 PLUGIN_ID = "billion-context"
 OPT_OUT_ENV = "BILI_NATIVE_HERMES"
 ATTACH_ENV = "BILLION_CONTEXT_ATTACH"
+ATTACH_EXTERNAL_ENV = "BILI_NATIVE_ATTACH_EXTERNAL"
 MANIFEST_TIMEOUT_S = 5.0
 TOOL_TIMEOUT_S = 60.0
 RUNTIME_INFO_TIMEOUT_S = 5.0
@@ -53,7 +54,8 @@ MAX_TRACKED_SESSIONS = 256
 _PROXY_ENV_KEYS = ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")
 
 # mode values: "attach" | "spawn"; child: Popen of the spawned proxy;
-# max_output: OrderedDict[session_id -> int(max_tokens)]; runtime_info_sent: (model, max_output) pairs.
+# max_output: OrderedDict[session_id -> int(max_tokens)]; runtime_info_sent: (model, max_output) pairs;
+# refused: origins refused by the #1338 attach gate (log dedup per process).
 _state: Dict[str, Any] = {
     "origin": None,
     "mode": None,
@@ -62,6 +64,7 @@ _state: Dict[str, Any] = {
     "env_applied": False,
     "max_output": OrderedDict(),
     "runtime_info_sent": set(),
+    "refused": set(),
 }
 
 
@@ -73,6 +76,7 @@ def _reset_for_test() -> None:
     _state["env_applied"] = False
     _state["max_output"].clear()
     _state["runtime_info_sent"].clear()
+    _state["refused"].clear()
 
 
 # — paths ---------------------------------------------------------------------
@@ -176,6 +180,44 @@ def probe_proxy(origin: str) -> bool:
     return isinstance(manifest, dict) and bool(manifest.get("version"))
 
 
+def config_file_path() -> Path:
+    """Same file src/paths.ts configFile() reads: BILI_CONFIG_FILE override, else
+    XDG config dir /billion-context/billion-context.json."""
+    env = os.environ.get("BILI_CONFIG_FILE", "").strip()
+    if env:
+        return Path(env).expanduser()
+    raw = os.environ.get("XDG_CONFIG_HOME", "").strip()
+    base = Path(raw).expanduser() if raw else Path.home() / ".config"
+    return base / "billion-context" / "billion-context.json"
+
+
+def resolve_attach_external() -> bool:
+    """#1335/#1338 escape hatch: env BILI_NATIVE_ATTACH_EXTERNAL > bili config
+    native.attachExternal > False — mirrors resolveNativeAttachExternal (src/config.ts)."""
+    val = (os.environ.get(ATTACH_EXTERNAL_ENV) or "").strip().lower()
+    if val in ("1", "true"):
+        return True
+    if val in ("0", "false"):
+        return False
+    try:
+        data = json.loads(config_file_path().read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    native = data.get("native") if isinstance(data, dict) else None
+    return isinstance(native, dict) and native.get("attachExternal") is True
+
+
+def watchdog_armed(origin: str) -> Optional[bool]:
+    """#1330 watchdog state from /__bili/health; None = field absent (older build)."""
+    health = http_get_json(origin.rstrip("/") + "/__bili/health", HEALTH_PROBE_TIMEOUT_S)
+    if not isinstance(health, dict):
+        return None
+    wd = health.get("watchdog")
+    if isinstance(wd, dict) and isinstance(wd.get("armed"), bool):
+        return wd["armed"]
+    return None
+
+
 def register_watcher(origin: str) -> None:
     """Register this host pid as a watchdog owner of a shared proxy (#1199). The spawner's
     BILI_PARENT_PID watches only the FIRST session's process; without this, the shared proxy
@@ -250,9 +292,30 @@ def discover_instance() -> Optional[str]:
         return None
     if inst["pid"] is not None and not pid_alive(inst["pid"]):
         return None
-    if probe_proxy(inst["origin"]):
-        return inst["origin"]
-    return None
+    if not probe_proxy(inst["origin"]):
+        return None
+    # #1338: the Python twin of #1335's attach gate (src/launcher.ts
+    # pickAttachable). Discovery must not ride a lifecycle-less listener —
+    # unarmed (or unverifiable: older build, field absent) => refuse and fall
+    # through to a session-owned spawn. Explicit BILLION_CONTEXT_ATTACH stays
+    # exempt: user-directed, like the TS lanes' explicit-attach paths.
+    if not resolve_attach_external():
+        armed = watchdog_armed(inst["origin"])
+        if armed is not True:
+            if inst["origin"] not in _state["refused"]:
+                _state["refused"].add(inst["origin"])
+                logger.warning(
+                    "billion-context: refusing to attach to %s — it reports %s (#1322/#1335). "
+                    "Starting a session-owned proxy instead; set native.attachExternal=true "
+                    "or %s=1 to attach anyway.",
+                    inst["origin"],
+                    "NO session-lifecycle watchdog (started without BILI_PARENT_PID, e.g. manual `bili start`)"
+                    if armed is False
+                    else "no watchdog state (older bili build) — its lifecycle is unverifiable",
+                    ATTACH_EXTERNAL_ENV,
+                )
+            return None
+    return inst["origin"]
 
 
 # — cross-process startup coordination (mirrors ensureProxyRunning, #707) ------
@@ -463,9 +526,17 @@ def apply_env(origin: str) -> None:
     the same pair `bili hermes` sets for the launched process."""
     os.environ["HTTPS_PROXY"] = origin
     os.environ["https_proxy"] = origin
-    ca = data_dir() / "ca" / "root-ca.pem"
-    if ca.is_file():
-        os.environ["HERMES_CA_BUNDLE"] = str(ca)
+    ca_dir = data_dir() / "ca"
+    root = ca_dir / "root-ca.pem"
+    if root.is_file():
+        os.environ["HERMES_CA_BUNDLE"] = str(root)
+    combined = ca_dir / "combined-ca.pem"
+    if combined.is_file():
+        # Current hermes' main client ignores HERMES_CA_BUNDLE (agent/ssl_verify.py: platform
+        # store + per-provider ssl_ca_cert); ambient trust rides SSL_CERT_FILE — OpenSSL
+        # REPLACE semantics, so it must be the COMBINED bundle (MITM root + public roots) to
+        # keep blind-tunnelled hosts validating (#1375).
+        os.environ["SSL_CERT_FILE"] = str(combined)
     _state["env_applied"] = True
 
 

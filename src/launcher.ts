@@ -58,7 +58,8 @@ function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
 import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, loadClientConfig, collectModelWindows, collectModelMaxOutputs, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, QWEN_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer, readMcodeConfig, resolveMcodeInstallDir, MCODE_DEFAULT_MODEL_HOSTS, type McodeConfig, discoverAiderArgUrls, AIDER_DEFAULT_MODEL_HOSTS, COPILOT_DEFAULT_MODEL_HOSTS, AMP_DEFAULT_MODEL_HOSTS, resolveGooseDirs, readGooseConfig, type GooseConfig, type GooseDirs } from "./client-config.js";
-import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, type ProviderRoutes } from "./config.js";
+import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, resolveNativeAttachExternal, resolveMitmDomains, type ProviderRoutes } from "./config.js";
+import { discoverMitmDomains } from "./discover.js";
 import { contextFromRegistry } from "./registry.js";
 
 export {
@@ -137,6 +138,7 @@ export {
     type GooseConfig,
     type GooseDirs,
 } from "./client-config.js";
+import { conflictScanEnabled, isDesignAbsorbed, scanClientPlugins } from "./thirdparty-scan.js";
 
 export const LAUNCHER_DEFAULT_HOST = "127.0.0.1";
 export const LAUNCH_CLIENTS = ["pi", "codex", "claude", "omp", "opencode", "hermes", "dsh", "codebuddy", "qoder", "trae", "jcode", "kimi", "gemini", "iflow", "qwen", "mcode", "aider", "copilot", "amp", "goose", "pi-test"] as const;
@@ -207,11 +209,20 @@ export interface ProxyHandle {
     child?: SpawnChild;
     logPath?: string;
     attached?: boolean;
+    /** #1322: attach succeeded but the proxy REFUSED the session-watcher
+     *  registration (409 — it has no session-lifecycle watchdog, i.e. it was
+     *  started without BILI_PARENT_PID, e.g. manually on a stable port). The
+     *  proxy will outlive every session and ignore config edits until killed;
+     *  host-native bootstraps must surface this instead of staying silent. */
+    refusedWatcher?: boolean;
 }
 
 export interface LauncherDeps {
     fetchImpl?: (url: string) => Promise<{ ok: boolean }>;
-    fetchHealthInfo?: (origin: string) => Promise<{ ok: boolean; instanceId?: string } | undefined>;
+    fetchHealthInfo?: (origin: string) => Promise<HealthInfo | undefined>;
+    /** #1335: resolves the attach-gate escape hatch. Default reads env
+     *  BILI_NATIVE_ATTACH_EXTERNAL > config `native.attachExternal` > false. */
+    resolveAttachExternal?: () => boolean;
     readInstanceFile?: () => ProxyInstanceFile | { origin: string } | undefined;
     spawnImpl?: SpawnFn;
     now?: () => number;
@@ -227,9 +238,10 @@ export interface LauncherDeps {
     /** #1190: watcher registration for ATTACHED shared proxies — tells the
      *  proxy's parent-gone watchdog which owner pid to track, so the proxy
      *  dies only after the LAST owner exits (#7/#1183). Default POSTs to
-     *  <origin>/__bili/watcher; 409 (daemon proxy) is silent, any failure
-     *  warns and degrades to the single-owner watchdog behavior. */
-    registerWatcher?: (origin: string, pid: number) => Promise<void>;
+     *  <origin>/__bili/watcher; 409 (daemon proxy) is refused-and-silent at
+     *  THIS layer but flags the handle (#1322), any other failure warns and
+     *  degrades to the single-owner watchdog behavior. */
+    registerWatcher?: (origin: string, pid: number) => Promise<WatcherRegistration>;
     /** #1292: simulated OS for spawn planning and platform-gated arg
      *  construction — tests drive win32 paths from a POSIX host. Defaults
      *  to process.platform. */
@@ -793,6 +805,7 @@ export function buildPiEnv(
     baseEnv: NodeJS.ProcessEnv,
     httpRewrites: HttpRewrite[] = [],
     httpsRewrites: HttpRewrite[] = [],
+    mitmHosts: string[] = [],
 ): NodeJS.ProcessEnv {
     // #535: provider URL rewrites ride env, not a generated models.json —
     // the bili extension (agent/pi.js) consumes this manifest at load and
@@ -816,6 +829,11 @@ export function buildPiEnv(
         NODE_EXTRA_CA_CERTS: caPath,
         BILLION_CONTEXT_PROXY: origin,
         ...(Object.keys(manifest).length > 0 ? { BILI_PROVIDER_REWRITES: JSON.stringify(manifest) } : {}),
+        // #1403: the extension stamps prompt_cache_key only for destinations on
+        // this list (or /bili/-wrapped URLs) — exactly the hosts the proxy will
+        // MITM-decrypt and strip it from. Blind-tunnel destinations must NOT be
+        // stamped or strict-schema upstreams 400 the foreign field.
+        ...(mitmHosts.length > 0 ? { BILI_MITM_HOSTS: mitmHosts.join(",") } : {}),
     };
 }
 
@@ -1767,16 +1785,27 @@ function mergeOverlayEntry(src: string, dst: string, excludedNames?: ReadonlySet
 /** True when the real pi settings.json already loads a bili plugin entry —
  *  in that case the launcher must NOT add `-e dist/agent/pi.js` on top (pi
  *  keeps both loaded and same-name tools/commands clash). */
-function piPluginInstalled(piHome: string): boolean {
+export function piPluginInstalled(piHome: string): boolean {
     const root = selfPackageRoot();
     if (!root) return false;
     try {
         const parsed = JSON.parse(fs.readFileSync(path.join(piHome, "settings.json"), "utf8")) as { packages?: unknown };
         const list = Array.isArray(parsed.packages) ? parsed.packages.map(String) : [];
-        return list.some((p) => isBiliPiEntry(p, root));
+        return list.some((p) => isBiliPiEntry(p, root) && piEntryLoadable(p));
     } catch {
         return false;
     }
+}
+
+/** A settings packages entry only counts as installed when pi can actually
+ *  load it: npm: entries are pi-managed, absolute entries must exist on disk.
+ *  A dead path that merely LOOKS like ours (hand-edited settings, moved
+ *  install, another machine's path) must not suppress the launcher's -e
+ *  fallback — that leaves pi with no plugin at all: no /acp, no provider
+ *  rewrites, and the traffic silently bypasses the proxy (#1318). Same
+ *  discipline ompPluginLoadedFrom already applies to omp config entries. */
+export function piEntryLoadable(entry: string): boolean {
+    return entry.startsWith("npm:") || fs.existsSync(entry);
 }
 
 function writeOverlayFileAtomic(overlay: string, fileName: string, contents: string): void {
@@ -2380,28 +2409,40 @@ async function probeHealth(
     }
 }
 
-interface HealthInfo {
+export interface HealthInfo {
     ok: boolean;
     instanceId?: string;
+    /** #1330: watchdog state from /__bili/health. Absent on pre-#1330 builds —
+     *  unverifiable lifecycle, which the #1335 attach gate treats as unarmed. */
+    watchdog?: { armed: boolean };
 }
 
 async function fetchHealthInfoDefault(origin: string): Promise<HealthInfo | undefined> {
     try {
         const res = await fetch(healthUrl(origin), { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
         if (!res.ok) return undefined;
-        const data = (await res.json()) as { ok?: boolean; instanceId?: string };
-        return { ok: Boolean(data.ok), instanceId: typeof data.instanceId === "string" ? data.instanceId : undefined };
+        const data = (await res.json()) as { ok?: boolean; instanceId?: string; watchdog?: unknown };
+        const info: HealthInfo = { ok: Boolean(data.ok), instanceId: typeof data.instanceId === "string" ? data.instanceId : undefined };
+        if (data.watchdog && typeof data.watchdog === "object" && typeof (data.watchdog as { armed?: unknown }).armed === "boolean") {
+            info.watchdog = { armed: (data.watchdog as { armed: boolean }).armed };
+        }
+        return info;
     } catch {
         return undefined;
     }
 }
 
+/** Outcome of a session-watcher registration attempt (#1190). */
+export type WatcherRegistration = "ok" | "refused" | "failed";
+
 /** #1190: an ATTACHED shared proxy belongs to whoever SPAWNED it — its
  *  parent-gone watchdog tracks THAT owner's pid, so without registration the
  *  first owner's exit kills every attached session (#7/#1183). Registering our
  *  own owner makes the proxy die only after the LAST owner exits. Never throws:
- *  a failed registration degrades to the pre-fix single-owner behavior. */
-async function registerWatcherDefault(origin: string, pid: number): Promise<void> {
+ *  a failed registration degrades to the pre-fix single-owner behavior.
+ *  #1322: returns the outcome so callers can surface a refusal — attaching to
+ *  a daemon proxy means the "dies with the session" contract is void. */
+export async function registerWatcherDefault(origin: string, pid: number): Promise<WatcherRegistration> {
     try {
         const res = await fetch(`${origin}/__bili/watcher`, {
             method: "POST",
@@ -2409,10 +2450,17 @@ async function registerWatcherDefault(origin: string, pid: number): Promise<void
             body: JSON.stringify({ pid }),
             signal: AbortSignal.timeout(2_000),
         });
-        // 409 = daemon proxy (watchdog unarmed) — nothing to register there.
-        if (!res.ok && res.status !== 409) console.error(`bili: watcher registration returned HTTP ${res.status} — the shared proxy may exit when its first owner does`);
+        // 409 = daemon proxy (watchdog unarmed) — nothing to register there;
+        // silence stays at this layer, the handle carries the flag instead.
+        if (!res.ok) {
+            if (res.status === 409) return "refused";
+            console.error(`bili: watcher registration returned HTTP ${res.status} — the shared proxy may exit when its first owner does`);
+            return "failed";
+        }
+        return "ok";
     } catch (err) {
         console.error(`bili: watcher registration failed — the shared proxy may exit when its first owner does (${err instanceof Error ? err.message : String(err)})`);
+        return "failed";
     }
 }
 
@@ -2452,21 +2500,39 @@ function instanceCompatible(inst: ProxyInstanceFile, opts: LaunchOptions, codeFi
 async function probeLiveInstances(
     readInstance: () => ProxyInstanceFile | { origin: string } | undefined,
     fetchHealthInfo: (origin: string) => Promise<HealthInfo | undefined>,
-): Promise<ProxyInstanceFile[]> {
+): Promise<Array<{ inst: ProxyInstanceFile; health: HealthInfo }>> {
     const seen = new Map<string, ProxyInstanceFile>();
     const inst = readInstance();
     if (isProxyInstanceFile(inst)) seen.set(inst.instanceId || inst.origin, inst);
     for (const live of discoverLiveInstances()) seen.set(live.instanceId || live.origin, live);
     const checked = await Promise.all(
-        [...seen.values()].map(async (c): Promise<ProxyInstanceFile | undefined> => {
+        [...seen.values()].map(async (c): Promise<{ inst: ProxyInstanceFile; health: HealthInfo } | undefined> => {
             if (!isPidAlive(c.pid)) return undefined;
             const health = await fetchHealthInfo(c.origin);
             if (!health || !health.ok) return undefined;
             if (health.instanceId !== undefined && health.instanceId !== c.instanceId) return undefined;
-            return c;
+            return { inst: c, health };
         }),
     );
-    return checked.filter((c): c is ProxyInstanceFile => c !== undefined);
+    return checked.filter((c): c is { inst: ProxyInstanceFile; health: HealthInfo } => c !== undefined);
+}
+
+/** #1335: the attach gate — a listener may be attached to only when its
+ *  health reports an ARMED session-lifecycle watchdog, or the user explicitly
+ *  opted in via native.attachExternal / BILI_NATIVE_ATTACH_EXTERNAL. A missing
+ *  watchdog field (pre-#1330 build) is unverifiable and refused by default:
+ *  those are exactly the stale manually-started daemons behind #1322, and
+ *  riding them pins every session to possibly-old code that outlives it. */
+export function attachGateAllows(health: HealthInfo, attachExternal: boolean): boolean {
+    if (attachExternal) return true;
+    return health.watchdog?.armed === true;
+}
+
+function gateRefusalMessage(inst: ProxyInstanceFile, health: HealthInfo): string {
+    const reason = health.watchdog && health.watchdog.armed === false
+        ? "it reports NO session-lifecycle watchdog (started without BILI_PARENT_PID, e.g. manual `bili start`)"
+        : "it does not report watchdog state (older bili build) — its lifecycle is unverifiable";
+    return `bili: refusing to attach to ${inst.origin} (pid ${inst.pid}) — ${reason}. It would outlive this session and ignore config edits until killed (#1322/#1335). Starting a session-owned proxy instead; set native.attachExternal=true or BILI_NATIVE_ATTACH_EXTERNAL=1 to attach anyway.`;
 }
 
 /** #1232: choose the attach target among healthy candidates. Must be
@@ -2475,21 +2541,32 @@ async function probeLiveInstances(
  *  concurrent same-lane launches must converge on the lane's own instance,
  *  not a general-purpose daemon either could use — newest within class. */
 function pickAttachable(
-    candidates: ProxyInstanceFile[],
+    candidates: Array<{ inst: ProxyInstanceFile; health: HealthInfo }>,
     opts: LaunchOptions,
-    codeFingerprint?: string,
+    codeFingerprint: string | undefined,
+    attachExternal: boolean,
+    refusedLog: Set<string>,
 ): ProxyInstanceFile | undefined {
     let best: ProxyInstanceFile | undefined;
     let bestClass = 2;
     let bestStartedAt = Number.NEGATIVE_INFINITY;
     for (const c of candidates) {
-        if (!instanceCompatible(c, opts, codeFingerprint)) continue;
-        if (opts.strictPort && c.port !== opts.port) continue;
-        const cls = opts.lane !== undefined && c.lane === opts.lane ? 0 : 1;
-        if (cls < bestClass || (cls === bestClass && c.startedAt > bestStartedAt)) {
-            best = c;
+        if (!instanceCompatible(c.inst, opts, codeFingerprint)) continue;
+        if (opts.strictPort && c.inst.port !== opts.port) continue;
+        // #1335: lifecycle gate — an unarmed (or unverifiable) listener is
+        // never an attach target by default; log the refusal once per origin.
+        if (!attachGateAllows(c.health, attachExternal)) {
+            if (!refusedLog.has(c.inst.origin)) {
+                refusedLog.add(c.inst.origin);
+                console.error(gateRefusalMessage(c.inst, c.health));
+            }
+            continue;
+        }
+        const cls = opts.lane !== undefined && c.inst.lane === opts.lane ? 0 : 1;
+        if (cls < bestClass || (cls === bestClass && c.inst.startedAt > bestStartedAt)) {
+            best = c.inst;
             bestClass = cls;
-            bestStartedAt = c.startedAt;
+            bestStartedAt = c.inst.startedAt;
         }
     }
     return best;
@@ -2507,11 +2584,13 @@ async function waitForStarterInstance(
     now: () => number,
     sleepImpl: (ms: number) => Promise<void>,
     opts: LaunchOptions,
-    codeFingerprint?: string,
+    codeFingerprint: string | undefined,
+    attachExternal: boolean,
+    refusedLog: Set<string>,
 ): Promise<ProxyInstanceFile | undefined> {
     const deadline = now() + SPAWN_WAIT_MS;
     const probe = async (): Promise<ProxyInstanceFile | undefined> =>
-        pickAttachable(await probeLiveInstances(readInstance, fetchHealthInfo), opts, codeFingerprint);
+        pickAttachable(await probeLiveInstances(readInstance, fetchHealthInfo), opts, codeFingerprint, attachExternal, refusedLog);
     let inst: ProxyInstanceFile | undefined;
     while (now() < deadline) {
         await sleepImpl(HEALTH_POLL_INTERVAL_MS);
@@ -2652,6 +2731,14 @@ export async function ensureProxyRunning(
     const now = deps.now ?? Date.now;
     const sleepImpl = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
     const registerWatcher = deps.registerWatcher ?? registerWatcherDefault;
+    // #1335: attach-gate escape hatch, resolved once per bring-up (env > file >
+    // false). One knob for every lane — explicit user-directed attaches (kimi/dsh
+    // BILLION_CONTEXT_ATTACH / preset BILLION_CONTEXT_PROXY) never pass through
+    // this discovery path at all, so they are exempt by construction.
+    const attachExternal = (deps.resolveAttachExternal ?? resolveNativeAttachExternal)();
+    // Refusal log dedup: pickAttachable runs again on every starter-poll tick,
+    // so each refused origin is announced exactly once per bring-up.
+    const refusedLog = new Set<string>();
     // Same expression as the spawn path's BILI_PARENT_PID: one owner-pid
     // semantic for spawned AND attached proxies (#1190).
     const watchPid = opts.parentPid ?? process.pid;
@@ -2662,8 +2749,14 @@ export async function ensureProxyRunning(
     // window.
     const attachTo = async (inst: ProxyInstanceFile): Promise<ProxyHandle> => {
         console.error(`bili: attaching to running proxy at ${inst.origin} (pid ${inst.pid})`);
-        await registerWatcher(inst.origin, watchPid);
-        return { origin: inst.origin, port: inst.port, attached: true };
+        const reg = await registerWatcher(inst.origin, watchPid);
+        // #1322: a refusal means the shared proxy has NO session-lifecycle
+        // watchdog (started without BILI_PARENT_PID, e.g. manually on a stable
+        // port) — it will outlive every session; host-native bootstraps must
+        // say so instead of silently serving a voided lifecycle contract.
+        const handle: ProxyHandle = { origin: inst.origin, port: inst.port, attached: true };
+        if (reg === "refused") handle.refusedWatcher = true;
+        return handle;
     };
     const script = deps.scriptPath ?? process.argv[1];
     const codeFingerprint = entryScriptFingerprint(script);
@@ -2675,12 +2768,27 @@ export async function ensureProxyRunning(
     // candidates come from every live registry entry, not only the last
     // writer of the single proxy-origin file (that pointer can belong to
     // another client's per-lane proxy).
-    const existing = pickAttachable(await probeLiveInstances(readInstance, fetchHealthInfo), opts, codeFingerprint);
+    const probed = await probeLiveInstances(readInstance, fetchHealthInfo);
+    const existing = pickAttachable(probed, opts, codeFingerprint, attachExternal, refusedLog);
     if (existing) {
         // strictPort (#964) is enforced inside pickAttachable: the client
         // dials a STATIC url — attaching to a healthy proxy on a DIFFERENT
         // port would strand every request.
         return attachTo(existing);
+    }
+    if (!attachExternal && opts.strictPort) {
+        // #1335: the only compatible listener is an unarmed one squatting OUR
+        // pinned port — self-managed fallback is impossible here (we cannot
+        // bind that port either). Fail fast with an actionable error instead
+        // of burning SPAWN_WAIT_MS into a confusing EADDRINUSE.
+        const squatter = probed.find((c) => c.inst.port === opts.port && instanceCompatible(c.inst, opts, codeFingerprint));
+        if (squatter) {
+            throw new Error(
+                `bili: port ${opts.port} is held by a lifecycle-less bili proxy at ${squatter.inst.origin} (pid ${squatter.inst.pid}) — ` +
+                    `the #1335 attach gate refuses it by default and this launch pins the port, so no session-owned proxy can bind it either. ` +
+                    `Kill that process (kill ${squatter.inst.pid}) or set native.attachExternal=true / BILI_NATIVE_ATTACH_EXTERNAL=1 to attach to it anyway.`,
+            );
+        }
     }
 
     // #707: cross-process startup window — another launcher may be mid-bring-up
@@ -2690,7 +2798,7 @@ export async function ensureProxyRunning(
     // (singleFlight, #706); this is the cross-process half.
     const waitForOtherStarter = async (): Promise<ProxyHandle | undefined> => {
         console.error("bili: another bili launch is bringing up a proxy — waiting for it instead of spawning a second");
-        const waited = await waitForStarterInstance(readInstance, fetchHealthInfo, now, sleepImpl, opts, codeFingerprint);
+        const waited = await waitForStarterInstance(readInstance, fetchHealthInfo, now, sleepImpl, opts, codeFingerprint, attachExternal, refusedLog);
         if (waited) {
             return attachTo(waited);
         }
@@ -3052,6 +3160,26 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     // routes from an old overlay's rewritten models.json/models.yml.
     const discoveryEnv =
         base === "pi" || base === "omp" ? { ...process.env, PI_CODING_AGENT_DIR: undefined } : process.env;
+    // #1206: surface co-resident third-party compression plugins BEFORE the
+    // first message — two compressors on one conversation double-compress and
+    // corrupt message refs, so warn at launch time, not after damage.
+    if (conflictScanEnabled(process.env)) {
+        try {
+            const scan = scanClientPlugins(base, { env: discoveryEnv, cwd: process.cwd() });
+            for (const f of scan.findings) {
+                if (isDesignAbsorbed(f, base)) {
+                    console.error(`bili: note: opencode-acp present (${f.entry}, ${f.source}) — kept by design for legacy-session absorption (#920); new sessions route through bili only.`);
+                    continue;
+                }
+                const risk = f.match === "known"
+                    ? "It is bili's sibling compressor — two compressors on one conversation will double-compress and corrupt message refs."
+                    : "Its name matches compression keywords — IF it also compresses context, the two compressors will double-compress and corrupt message refs.";
+                console.error(`bili: WARNING: co-resident compression plugin on ${base}: ${f.entry} (${f.source}). ${risk} (#1206) — disable the other plugin, or don't route this client through bili.`);
+            }
+        } catch {
+            // The scan is diagnostic only — never block client startup on it.
+        }
+    }
     const config = loadClientConfig(discoveryEnv, process.cwd());
     let routes = discoverRoutes(base, config);
     if (base === "aider") {
@@ -3101,6 +3229,19 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     // used to resolve the budget-alignment window, #321).
     const biliRoutes = loadRoutes(process.env);
     const domains = dedupeInOrder([...routes.httpsDomains, ...(params.mitmDomains ?? [])]);
+    // #1403: mirror the proxy's EXACT MITM whitelist (built-in defaults ∪
+    // config-file/BILI_MITM_DOMAINS tier as the spawned child will see it ∪
+    // launcher-discovered domains ∪ dynamic client-config discovery) so the
+    // pi/omp extension stamps prompt_cache_key only for destinations the proxy
+    // will decrypt and strip it from. Blind-tunnel destinations get no stamp —
+    // strict-schema upstreams 400 the foreign top-level field otherwise.
+    const childMitmEnv: NodeJS.ProcessEnv =
+        domains.length > 0
+            ? { BILI_MITM_DOMAINS: domains.join(",") }
+            : { BILI_MITM_DOMAINS: process.env.BILI_MITM_DOMAINS };
+    const extMitmHosts = base === "pi" || base === "omp"
+        ? dedupeInOrder([...DEFAULT_MITM_DOMAINS, ...resolveMitmDomains(childMitmEnv), ...domains, ...discoverMitmDomains(discoveryEnv)])
+        : [];
     const handle = await ensureProxyRunning({ host, port, passthrough, debug, lane: base, mitmDomains: domains, modelWindows: collectModelWindows(config, base), modelMaxOutputs: collectModelMaxOutputs(config, base) }, deps);
     console.error(
         `bili: started proxy at ${handle.origin} (MITM domains: ${domains.length ? domains.join(", ") : "defaults"})` +
@@ -3154,7 +3295,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // at extension load from the env manifest (registerProvider; see
         // buildPiEnv), and the old settings.json compaction-off generation is
         // replaced by the extension's session_before_compact cancel.
-        env = buildPiEnv(origin, ca, stripInheritedProxy(process.env), routes.httpRewrites, routes.httpsRewrites);
+        env = buildPiEnv(origin, ca, stripInheritedProxy(process.env), routes.httpRewrites, routes.httpsRewrites, extMitmHosts);
         // #535: never let a stale inherited overlay redirect (from a legacy
         // launch or a shell exported inside one) leak into the child — pi
         // always runs on its REAL home now.
@@ -3178,7 +3319,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // (the native summarizer would destroy the ACP-tagged context); manual
         // /compact stays user-owned and its surviving summary is archived by
         // the proxy on session_compact. https upstreams ride cert-MITM like pi.
-        env = buildPiEnv(origin, ca, stripInheritedProxy(process.env), routes.httpRewrites);
+        env = buildPiEnv(origin, ca, stripInheritedProxy(process.env), routes.httpRewrites, [], extMitmHosts);
         delete env.PI_CODING_AGENT_DIR;
         const ompExt = selfDistFile("agent/omp.js");
         if (ompExt && fs.existsSync(ompExt) && !ompPluginLoadedFrom(ompRealHome)) {
@@ -3209,14 +3350,20 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // runs on its REAL home — including a user-set HERMES_HOME (discovery
         // resolved the same path, so the MITM whitelist matches). Its httpx
         // stack resolves ONE proxy env var (HTTPS_PROXY first) for both
-        // schemes and trusts custom CAs via HERMES_CA_BUNDLE: https upstreams
-        // ride CONNECT + cert MITM, plain-http upstreams ride absolute-form
-        // forward-proxy requests the server understands. Sessions bind by
-        // persisted content-prefix affinity when no identity carrier is
-        // present (anonymous requests are accepted, #286).
+        // schemes: https upstreams ride CONNECT + cert MITM, plain-http
+        // upstreams ride absolute-form forward-proxy requests the server
+        // understands. CA trust (#1375): current hermes resolves the main
+        // client via agent/ssl_verify.py — platform store + per-provider
+        // ssl_ca_cert, ambient trust only through SSL_CERT_FILE (OpenSSL
+        // replace semantics → the COMBINED bundle keeps blind-tunnelled hosts
+        // validating against public roots, #152). HERMES_CA_BUNDLE stays set
+        // for older builds and hermes' auth flows, which still read it.
+        // Sessions bind by persisted content-prefix affinity when no identity
+        // carrier is present (anonymous requests are accepted, #286).
         env = stripInheritedProxy(process.env);
         env.HTTPS_PROXY = origin;
         env.HERMES_CA_BUNDLE = ca;
+        env.SSL_CERT_FILE = resolveCombinedCaPath(process.env);
         if (routes.httpRewrites.length === 0 && routes.httpsDomains.length === 0) {
             console.error(
                 "bili: no hermes providers found in ~/.hermes/config.yaml — traffic will NOT go through the proxy (configure a provider first).",

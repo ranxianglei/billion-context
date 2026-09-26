@@ -15,7 +15,7 @@ import {
 } from "acp-kernel";
 import { parseCompressSettings } from "../src/config.ts";
 import { applyCompressSettings, mergeCompress } from "../src/compress-settings.ts";
-import { adoptContentStore, drainPendingRetrievals, executeRetrieve, retrieveToolName, storeEffectiveCcr, contentStoreOf } from "../src/store.ts";
+import { adoptContentStore, drainPendingRetrievals, executeRetrieve, retrieveToolName, storeEffectiveCcr, contentStoreOf, snapshotPendingRetrievals, commitRetrievals, dropRetrievals, pruneExpiredRetrievals, reconcileReloadedRetrievals, flushRetrievalNotes } from "../src/store.ts";
 import { RETRIEVE_TOOL_NAME } from "../src/compress-tool.ts";
 import { getSession } from "../src/session.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
@@ -209,6 +209,111 @@ test("envelope round-trip: dirty flag gates the write; reload restores the store
         _setStoreForTest(new SessionStore({ enabled: false }));
         rmSync(PERSIST_TMP, { recursive: true, force: true });
     }
+});
+
+// [#1343] Delivery-lifecycle coverage: every ack→loss path is observable
+// (counter + corrective note), never silent. Sessions are in-memory
+// (BILI_PERSIST=0); the durable ledger lives in session.metadata.
+function seedCCR() {
+    const session = getSession(`t-win-${Math.random().toString(36).slice(2)}`);
+    storeEffectiveCcr(session, { enabled: true, toolName: "lookup", minToolTokens: 50 });
+    adoptContentStore(session, turnWith(ccrConfig()).contentStore);
+    const ref = Object.keys(session.contentStore!.byRef)[0]!;
+    return { session, ref };
+}
+
+test("#1343 W1 restart: reload reconciles acked-but-undelivered ledger entries (counted + correctable)", () => {
+    const { session, ref } = seedCCR();
+    executeRetrieve({ ref }, session);
+    assert.equal(session.stats.retrieveHits, 1);
+    session.pendingRetrievals = []; // process restart: carrier resets, durable ledger survives
+    // Production ordering: persist's load arms ccrReconcilePending, then
+    // getSession() clears `restored` BEFORE prepare runs the reconcile — so
+    // the flag must fire even with restored === false (#1343 review).
+    session.ccrReconcilePending = true;
+    session.restored = false;
+    reconcileReloadedRetrievals(session);
+    assert.equal(session.ccrReconcilePending, false, "one-shot: consumed by the first reconcile");
+    assert.equal(session.pendingRetrievals.length, 0);
+    assert.deepEqual(session.metadata.ccrUndelivered, [], "ledger cleared after reconciliation");
+    assert.equal(session.stats.retrieveDropped, 1, "loss counted, not silent");
+    const note = flushRetrievalNotes(session);
+    assert.ok(note && note.includes(ref), `corrective names the lost ref: ${note}`);
+    assert.equal(flushRetrievalNotes(session), null, "note consumed once");
+});
+
+test("#1343 W1b restart: a re-retrieved ref with a live carrier is left for normal delivery", () => {
+    const { session, ref } = seedCCR();
+    executeRetrieve({ ref }, session);
+    session.ccrReconcilePending = true;
+    session.restored = false;
+    reconcileReloadedRetrievals(session);
+    assert.equal(session.pendingRetrievals.length, 1, "live carrier survives reconcile");
+    assert.equal(session.stats.retrieveDropped, 0, "nothing lost while a carrier exists");
+});
+
+test("#1343 W2 post-drain failure: snapshot keeps items until drop; failure is dropped-and-logged (never vanishes)", () => {
+    const { session, ref } = seedCCR();
+    executeRetrieve({ ref }, session);
+    const attached = snapshotPendingRetrievals(session);
+    assert.equal(attached.length, 1);
+    assert.equal(session.pendingRetrievals.length, 1, "snapshot does not remove");
+    dropRetrievals(session, attached.map((i) => i.ref), "upstream network failure");
+    assert.equal(session.pendingRetrievals.length, 0);
+    assert.deepEqual(session.metadata.ccrUndelivered, []);
+    assert.equal(session.stats.retrieveDropped, 1);
+    assert.ok((flushRetrievalNotes(session) ?? "").includes(ref));
+    dropRetrievals(session, [ref], "upstream network failure");
+    assert.equal(session.stats.retrieveDropped, 1, "idempotent: no double-count");
+});
+
+test("#1343 W3 disarm: pending deliveries terminate observably; no stale flush after re-arm", () => {
+    const { session, ref } = seedCCR();
+    executeRetrieve({ ref }, session);
+    assert.equal(session.pendingRetrievals.length, 1);
+    storeEffectiveCcr(session, undefined);
+    assert.equal(session.pendingRetrievals.length, 0, "carrier terminated");
+    assert.deepEqual(session.metadata.ccrUndelivered, []);
+    assert.equal(session.stats.retrieveDropped, 1);
+    assert.ok((flushRetrievalNotes(session) ?? "").includes("disarmed"));
+    storeEffectiveCcr(session, { enabled: true, toolName: "lookup", minToolTokens: 50 });
+    assert.equal(snapshotPendingRetrievals(session).length, 0, "no stale injection after re-arm (#1273)");
+});
+
+test("#1343 W4 TTL: an old queued retrieval expires loudly; range-restore riders are exempt", () => {
+    const { session, ref } = seedCCR();
+    executeRetrieve({ ref }, session);
+    session.pendingRetrievals[0]!.queuedAt = Date.now() - 11 * 60 * 1000;
+    session.pendingRetrievals.push({ ref: "range_b0_1-2", tokens: 0, chars: 10, queuedAt: Date.now() - 99 * 60 * 1000, ccr: false, injection: { id: "acp_range_x", role: "system", contentType: "text", text: "restored" } });
+    pruneExpiredRetrievals(session);
+    assert.equal(session.pendingRetrievals.length, 1, "only the expired CCR item dropped");
+    assert.equal(session.pendingRetrievals[0]!.ref, "range_b0_1-2", "restore rider survives TTL");
+    assert.equal(session.stats.retrieveDropped, 1, "only CCR counted");
+    const note = flushRetrievalNotes(session);
+    assert.ok(note && note.includes(ref));
+    assert.ok(!note!.includes("range_b0"), "exempt restore rider produces no note");
+});
+
+test("#1343 two-riders: commit counts only CCR; range-restore riders are removed but uncounted", () => {
+    const { session, ref } = seedCCR();
+    executeRetrieve({ ref }, session);
+    session.pendingRetrievals.push({ ref: "range_b0_3-4", tokens: 0, chars: 5, queuedAt: Date.now(), ccr: false, injection: { id: "acp_range_y", role: "system", contentType: "text", text: "restored" } });
+    commitRetrievals(session, [ref, "range_b0_3-4"]);
+    assert.equal(session.stats.retrieveDelivered, 1, "restore rider not counted as a delivery");
+    assert.equal(session.pendingRetrievals.length, 0, "both carriers removed at outcome");
+});
+
+test("#1343 proxy lane: drain commits the hit (delivered) and preserves ack/injection pair integrity", () => {
+    const { session, ref } = seedCCR();
+    const ack = executeRetrieve({ ref }, session);
+    assert.match(ack, new RegExp(`retrieved ${ref}: [\\d,]+ tok`));
+    const injections = drainPendingRetrievals(session);
+    assert.equal(injections.length, 1);
+    assert.equal(injections[0]!.id, `acp_retrieved_${ref}`);
+    assert.ok(injections[0]!.text.includes(BIG_TEXT.slice(0, 80)));
+    assert.equal(session.stats.retrieveDelivered, 1, "proxy drain commits as delivered");
+    assert.equal(session.stats.retrieveDropped, 0);
+    assert.equal(drainPendingRetrievals(session).length, 0);
 });
 
 function findEnvelope(root: string): string | null {

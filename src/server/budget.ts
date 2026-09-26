@@ -1,5 +1,5 @@
 import { defaultCountTokens, type CoreMessage, type NudgeDecision } from "acp-kernel";
-import { googleSystemText, type GoogleRequestBody } from "acp-kernel/wire";
+import { googleSystemText, type BiliMessage, type GoogleRequestBody } from "acp-kernel/wire";
 import { estimateCoreMessages } from "../preflight.js";
 import { readOutputBudget, writeOutputBudget, type OutputBudgetField } from "./side-request.js";
 
@@ -36,6 +36,75 @@ export function countSystemAndToolsTokens(systemText: string | undefined, tools:
 export function estimateInputTokens(processedMessages: CoreMessage[], systemText: string | undefined, tools: unknown, lastInputTokens: number): number {
     const est = estimateCoreMessages(processedMessages) + countSystemAndToolsTokens(systemText, tools);
     return Math.max(lastInputTokens > 0 ? lastInputTokens : 0, est);
+}
+
+// #1320: Claude Code round-trips extended-thinking blocks as SIGNATURE-ONLY
+// entries ({type:"thinking", signature} with no visible text). The provider
+// restores and bills the underlying thinking tokens server-side, so its
+// usage.input_tokens is correct — but locally the blocks convert to empty-text
+// reasoning messages and every per-message meter (nudge compressible mass,
+// block compressedTokens receipts, context breakdown) understates billed
+// context by the entire thinking share: savings receipts report "~17k saved"
+// when ~41k left the billing, and the growth nudge stays idle because the
+// compressible mass never crosses the 50K threshold.
+//
+// Fix at the decision point, not a payload mask: attribute the unexplained
+// residual between the provider-measured input total and the local estimate of
+// everything else we can see (visible message text + system/tools overhead +
+// images) to the signature-only reasoning messages, weighted by signature
+// length, via the kernel's host-projected CoreMessage.thinkingTokens seam —
+// countMessageTokens counts it at every metering site, so nudge mass,
+// receipts, tags, and gauges all pick it up without further changes. Metering-
+// only by construction: the wire bytes are untouched (coreToAnthropic already
+// round-trips the signature faithfully), and no attribution happens unless a
+// real usage report AND at least one signed thinking block exist, so sessions
+// without hidden thinking are byte-for-byte unaffected.
+export interface ThinkingMassInput {
+    /** Provider-measured previous-turn input total (session.stats.lastInputTokens). */
+    providerInputTokens: number;
+    /** True only for "usage"-provenance totals. Local estimates already exclude
+     *  thinking by construction; projecting onto them would double-count. */
+    measured: boolean;
+    systemText: string | undefined;
+    tools: unknown;
+    imageTokens: number;
+    /** Previous turn's outbound system+tools overhead as measured at prepare
+     *  time (session.metadata.systemPromptTokens) — preferred over recounting
+     *  the inbound body because it captures the proxy-injected ACP content that
+     *  was actually billed last turn. Ignored when not a positive finite number. */
+    storedOverhead?: number;
+}
+
+/** Project the hidden thinking mass onto signature-only reasoning messages.
+ *  Returns the total tokens projected (0 = nothing to do). Deterministic for a
+ *  given (messages, inputs) pair; the shares sum exactly to the gap (floors go
+ *  to earlier targets, remainder to the last one). */
+export function projectThinkingMass(msgs: BiliMessage[], input: ThinkingMassInput): number {
+    if (!input.measured || !(input.providerInputTokens > 0)) return 0;
+    const targets: Array<{ msg: BiliMessage; sig: number }> = [];
+    for (const m of msgs) {
+        if (m.contentType !== "reasoning") continue;
+        if (typeof m.thinkingSignature !== "string" || m.thinkingSignature.length === 0) continue;
+        // Visible thinking text is already counted in the local estimate; only
+        // signature-only blocks hide mass the estimator cannot see.
+        if (typeof m.text === "string" && m.text.trim().length > 0) continue;
+        targets.push({ msg: m, sig: m.thinkingSignature.length });
+    }
+    if (targets.length === 0) return 0;
+    const overhead = typeof input.storedOverhead === "number" && Number.isFinite(input.storedOverhead) && input.storedOverhead > 0
+        ? input.storedOverhead
+        : countSystemAndToolsTokens(input.systemText, input.tools);
+    const gap = Math.max(0, input.providerInputTokens - estimateCoreMessages(msgs) - overhead - Math.max(0, input.imageTokens));
+    if (gap <= 0) return 0;
+    const totalSig = targets.reduce((s, t) => s + t.sig, 0);
+    let assigned = 0;
+    for (let i = 0; i < targets.length; i++) {
+        const t = targets[i]!;
+        const share = i === targets.length - 1 ? gap - assigned : Math.floor((gap * t.sig) / totalSig);
+        t.msg.thinkingTokens = share;
+        assigned += share;
+    }
+    return gap;
 }
 
 /** #470: tokens the wire payload carries OUTSIDE the message array —

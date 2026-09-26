@@ -124,7 +124,7 @@ export type ParsedStreamEvent =
 
 export interface EmitCompletionOpts {
     finishReason?: string;
-    usage?: { inputTokens?: number; outputTokens?: number; cachedTokens?: number };
+    usage?: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number };
 }
 
 export interface ToolCallEmit {
@@ -594,6 +594,8 @@ export async function* runCompressLoop(
                     try {
                         parsedArgs = call.arguments.length > 0 ? JSON.parse(call.arguments) : {};
                     } catch {
+                        // #1306: an empty/truncated arguments string is wire-loss-shaped, bad JSON is model-shaped — log the shape so the two are separable in logs.
+                        ctx.log(`[acp-loop] proxy tool ${call.name}: arguments not parseable JSON (len=${call.arguments.length}${call.arguments.length > 0 ? `, head=${call.arguments.slice(0, 200)}` : ""}) — executing with {}`);
                         parsedArgs = {};
                     }
                     const result = await withSessionLock(ctx.session, () => executeProxyTool(call.name, parsedArgs, ctx, call.callId));

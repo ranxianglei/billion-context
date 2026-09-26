@@ -48,6 +48,10 @@ test("findRoute: shallow host key matches all paths on the host", () => {
 // takes the side-request passthrough instead of the kernel round-trip.
 const ANTHROPIC_BODY = '{\n  "prompt_cache_key": "keep-me-please",\n  "model": "claude-test",\n  "max_tokens": 4096,\n  "messages": [\n    {\n      "role": "user",\n      "content": [\n        { "type": "text", "text": "hi there" }\n      ]\n    }\n  ]\n}';
 
+const ANTHROPIC_BODY_NO_PCK = '{\n  "model": "claude-test",\n  "max_tokens": 4096,\n  "messages": [\n    {\n      "role": "user",\n      "content": [\n        { "type": "text", "text": "hi there" }\n      ]\n    }\n  ]\n}';
+
+const ANTHROPIC_MESSAGES = [{ role: "user", content: [{ type: "text", text: "hi there" }] }];
+
 const ANTHROPIC_RESPONSE = JSON.stringify({
     id: "msg_test_1",
     type: "message",
@@ -91,7 +95,7 @@ function makeOpts(routes: Record<string, { passthrough?: boolean }>, upstream: s
     };
 }
 
-async function postMessages(proxyPort: number, upstreamHost: string, sessionId: string): Promise<{ status: number; body: string }> {
+async function postMessages(proxyPort: number, upstreamHost: string, sessionId: string, bodyStr: string = ANTHROPIC_BODY): Promise<{ status: number; body: string }> {
     return await new Promise((resolve, reject) => {
         const req = http.request(
             {
@@ -103,7 +107,7 @@ async function postMessages(proxyPort: number, upstreamHost: string, sessionId: 
                     "content-type": "application/json",
                     host: upstreamHost,
                     "x-acp-session": sessionId,
-                    "content-length": String(Buffer.byteLength(ANTHROPIC_BODY)),
+                    "content-length": String(Buffer.byteLength(bodyStr)),
                 },
             },
             (res) => {
@@ -113,12 +117,12 @@ async function postMessages(proxyPort: number, upstreamHost: string, sessionId: 
             },
         );
         req.on("error", reject);
-        req.write(ANTHROPIC_BODY);
+        req.write(bodyStr);
         req.end();
     });
 }
 
-test("route passthrough: body forwarded byte-for-byte, response piped verbatim, kernel bypassed", async () => {
+test("route passthrough: body forwarded verbatim (bili's prompt_cache_key stripped, #1403), response piped verbatim, kernel bypassed", async () => {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
 
@@ -140,8 +144,40 @@ test("route passthrough: body forwarded byte-for-byte, response piped verbatim, 
     try {
         const out = await postMessages(proxyPort, upstreamHost, "route-passthrough-test");
         assert.equal(out.status, 200, `client must see the upstream 200; got ${out.status}: ${out.body}`);
-        assert.equal(capture.body, ANTHROPIC_BODY, "upstream must receive the EXACT client bytes (no re-serialization, field order + whitespace intact)");
-        assert.ok(capture.body.includes("prompt_cache_key"), "prompt_cache_key must survive (kernel rebuild deletes it)");
+        const sent = JSON.parse(capture.body) as Record<string, unknown>;
+        assert.ok(!("prompt_cache_key" in sent), "bili's own prompt_cache_key must be stripped from verbatim anthropic forwards (#1403)");
+        assert.deepEqual(sent, JSON.parse(ANTHROPIC_BODY_NO_PCK), "every other field must survive intact (only the pck removal, no re-shaping)");
+        assert.ok(!capture.body.includes("\x3cacp "), "no ACP render tags may be injected");
+        assert.equal(out.body, ANTHROPIC_RESPONSE, "response must be piped verbatim to the client");
+    } finally {
+        await close(proxy);
+        await close(upstream);
+    }
+});
+
+test("route passthrough: body WITHOUT prompt_cache_key stays byte-for-byte (#661)", async () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+
+    const capture = { url: "", body: "" };
+    const upstream = makeUpstream(capture, (res) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(ANTHROPIC_RESPONSE);
+    });
+    upstream.listen(0, "127.0.0.1");
+    await listen(upstream);
+    const upstreamPort = (upstream.address() as { port: number }).port;
+    const upstreamHost = `127.0.0.1:${upstreamPort}`;
+
+    const opts = makeOpts({ [`http://${upstreamHost}`]: { passthrough: true } }, `https://${upstreamHost}`);
+    const proxy = await startServer(opts);
+    await listen(proxy);
+    const proxyPort = (proxy.address() as { port: number }).port;
+
+    try {
+        const out = await postMessages(proxyPort, upstreamHost, "route-passthrough-nopck", ANTHROPIC_BODY_NO_PCK);
+        assert.equal(out.status, 200, `client must see the upstream 200; got ${out.status}: ${out.body}`);
+        assert.equal(capture.body, ANTHROPIC_BODY_NO_PCK, "nothing to strip ⇒ EXACT client bytes, no re-serialization (#661)");
         assert.ok(!capture.body.includes("\x3cacp "), "no ACP render tags may be injected");
         assert.equal(out.body, ANTHROPIC_RESPONSE, "response must be piped verbatim to the client");
     } finally {
@@ -210,7 +246,9 @@ test("route passthrough: global passthrough=false still compresses OTHER routes"
         const outNormal = await postMessages(proxyPort, normalHost, "route-passthrough-mixed-2");
         assert.equal(outBypass.status, 200);
         assert.equal(outNormal.status, 200);
-        assert.equal(bypassCapture.body, ANTHROPIC_BODY, "bypassed route: byte-identical");
+        const bypassSent = JSON.parse(bypassCapture.body) as Record<string, unknown>;
+        assert.ok(!("prompt_cache_key" in bypassSent), "bypassed route: bili's prompt_cache_key stripped (#1403)");
+        assert.deepEqual(bypassSent, JSON.parse(ANTHROPIC_BODY_NO_PCK), "bypassed route: every other field intact");
         assert.notEqual(normalCapture.body, ANTHROPIC_BODY, "non-bypassed route: kernel round-trip still active");
         assert.ok(!bypassCapture.body.includes("\x3cacp "), "bypassed route: no tags");
         assert.ok(normalCapture.body.includes("\x3cacp "), "non-bypassed route: tags injected");

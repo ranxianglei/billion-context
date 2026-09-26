@@ -12,6 +12,8 @@
  */
 import {
     parseCompressArgs,
+    ABSORB_TOOL,
+    ABSORB_TOOL_GOOGLE,
     ABSORB_TOOL_OPENAI,
     DECOMPRESS_TOOL,
     DECOMPRESS_TOOL_GOOGLE,
@@ -167,6 +169,19 @@ export const ABSORB_TOOL_RESPONSES = {
     description: ABSORB_TOOL_OPENAI.function.description,
     parameters: ABSORB_TOOL_OPENAI.function.parameters,
 };
+
+// #1359: absorb wire shapes parameterized by name so registration (manifest +
+// per-request injection) follows the resolved `absorb.toolName` in BOTH lanes —
+// a renamed tool must be advertised, injected, and adjudicated under one name.
+// At the default name this is byte-identical to the static consts above.
+export function absorbToolsFor(name: string) {
+    return {
+        anthropic: { name, description: ABSORB_TOOL.description, input_schema: ABSORB_TOOL.input_schema },
+        openai: { type: "function" as const, function: { name, description: ABSORB_TOOL_OPENAI.function.description, parameters: ABSORB_TOOL_OPENAI.function.parameters } },
+        responses: { type: "function" as const, name, description: ABSORB_TOOL_OPENAI.function.description, parameters: ABSORB_TOOL_OPENAI.function.parameters },
+        google: { name, description: ABSORB_TOOL_GOOGLE.description, parameters: ABSORB_TOOL_GOOGLE.parameters },
+    };
+}
 
 // The reconciled kernel (acp-kernel#332) ships RULE_TOOL_NAME + the rule state
 // helpers but no wire tool objects. Synthesize all four wire shapes here so

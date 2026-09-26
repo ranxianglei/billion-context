@@ -63,14 +63,14 @@ test("resolveDecompress: full:true returns all original messages", () => {
     assert.match(fullOut, /full/);
 });
 
-test("resolveDecompress: stateless — cache kept, block stays active, repeat is idempotent", () => {
+test("resolveDecompress: cache kept, block stays active, repeat is idempotent (inline restore marks restoredInline)", () => {
     const { ctx, session } = compressARange();
     const blockId = [...session.state.blocks].slice(-1)[0]?.blockId!;
     assert.ok(session.blockContents.has(blockId), "cache populated at compress time");
     const out1 = resolveDecompress({ blockId }, ctx);
-    assert.ok(session.blockContents.has(blockId), "cache retained after decompress (stateless retrieval)");
+    assert.ok(session.blockContents.has(blockId), "cache retained after decompress");
     const block = session.state.blocks.find((b) => b.blockId === blockId);
-    assert.equal(block?.active, true, "block NOT deactivated — decompress changes no state");
+    assert.equal(block?.active, true, "block NOT deactivated — the only state change on the inline path is the restoredInline flag (see tests/refold-wiring.test.ts)");
     const out2 = resolveDecompress({ blockId }, ctx);
     assert.equal(out1, out2, "repeat decompress returns identical content");
 });

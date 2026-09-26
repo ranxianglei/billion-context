@@ -21,8 +21,8 @@
 //   hermes   ~/.hermes/plugins/billion-context/{plugin.yaml,__init__.py,bili.json}
 //            (#958: Python plugin — hermes's CLI agent plugin API is Python-only;
 //            it self-spawns/attaches a proxy and routes traffic via HTTPS_PROXY +
-//            HERMES_CA_BUNDLE, the same wire path as `bili hermes`; enablement is
-//            delegated to `hermes plugins enable`)
+//            SSL_CERT_FILE (combined CA bundle), the same wire path as `bili hermes`;
+//            enablement is delegated to `hermes plugins enable`)
 //   zcode    ~/.zcode/cli/config.json  hooks.enabled + SessionStart hook +
 //            mcp.servers.bili (stdio MCP); provider-store routing happens
 //            per-session, see src/zcode/ (no URL frozen at install time)
@@ -39,11 +39,45 @@ import { applyEdits, modify as jsoncModify, parse as jsoncParse, type ParseError
 import { resolveDshHome, resolveHermesHome, resolveKimiHome, resolvePiHome } from "./client-config.js";
 import { clearClaudeNativePort, resolveClaudeNativePort, saveClaudeNativePort } from "./config.js";
 import { isPidAlive, isProxyInstanceFile, readProxyInstanceFile } from "./instance.js";
-import { DSH_PACKAGE, dshBundleInstalled, dshHasLegacyManagedBlock, dshProfileDependsOnBili, dshProfileDirs, planDshSpawn, refreshDshProfileBundles, runDshPlugin, stripLegacyManagedBlock } from "./dsh-channel.js";
+import { DSH_PACKAGE, dshBundleInstalled, dshHasLegacyManagedBlock, dshProfileDependsOnBili, dshProfileDepSpec, dshProfileDirs, isRegistryDepSpec, planDshSpawn, refreshDshProfileBundles, runDshPlugin, stripLegacyManagedBlock } from "./dsh-channel.js";
 import { fetchRegistryVersion } from "./update.js";
 import { restoreKimiBackup, unrouteKimi } from "./kimi/native.js";
 import { inspectZcodeRouting, resolveZcodeDataDir } from "./zcode/json-edit.js";
 import { restoreZcodeBackup, unrouteZcode } from "./zcode/native.js";
+
+/** Build a SessionStart hook command line that parses in every shell the
+ *  supported agents run hooks through. Two Windows traps, both measured on
+ *  Claude Code 2.1.282:
+ *
+ *  1. A backslash path is escape-eaten by POSIX shells — `D:\Dev\node\node.exe`
+ *     becomes `D:Devnodenode.exe`, so the hook never starts the proxy while
+ *     base_url already points at the fixed port (the session hangs instead of
+ *     failing loudly). Forward slashes are accepted everywhere we emit for.
+ *
+ *  2. Quoting the COMMAND token is not portable:
+ *
+ *         form                     bash   PowerShell        cmd
+ *         bare token                ok       ok             ok
+ *         "quoted" first token      ok     PARSE ERR *      ok
+ *         & "quoted" first token   ERR       ok            ERR
+ *
+ *     *PowerShell reads a leading quoted token as a STRING EXPRESSION: with an
+ *     argument after it the whole command dies at parse time, and alone it
+ *     exits 0 having run nothing — a silent no-op, worse than an error.
+ *
+ *     No spelling covers a spaced command path in all three, so the only
+ *     question is which shell to keep working. Claude Code runs hooks through
+ *     PowerShell on Windows (probe-verified: a cmd-only builtin writes nothing,
+ *     a PowerShell-only one writes its file), so `&` is what keeps the real
+ *     path alive. cmd never sees a spaced command here — the kimi hook resolves
+ *     a bare `node` through PATH, so it is never quoted. Exported for tests. */
+export function portableHookCommand(exe: string, args: string[] = []): string {
+    const fwd = (p: string): string => p.replaceAll("\\", "/");
+    const quoteArg = (p: string): string => (/\s/.test(p) ? `"${p}"` : p);
+    const head = fwd(exe);
+    const tail = args.map((a) => quoteArg(fwd(a)));
+    return /\s/.test(head) ? [`& "${head}"`, ...tail].join(" ") : [head, ...tail].join(" ");
+}
 
 /** #403: never freeze a dead or unverifiable origin into a client's
  *  persistent config — the MCP shell would dial it forever. An explicit
@@ -502,14 +536,43 @@ export function applyClaudeManagedBlock(settings: Record<string, unknown>, opts:
 
     const hooks = (data.hooks !== null && typeof data.hooks === "object" && !Array.isArray(data.hooks) ? data.hooks : {}) as Record<string, unknown>;
     const sessionStart = Array.isArray(hooks.SessionStart) ? hooks.SessionStart : [];
-    const carriesOurs = sessionStart.some(isOursSessionStartEntry);
-    if (!carriesOurs) {
+    if (!sessionStart.some(isOursSessionStartEntry)) {
         sessionStart.push({ hooks: [{ type: "command", command: opts.hookCommand }] });
         hooks.SessionStart = sessionStart;
         data.hooks = hooks;
         notes.push("hooks.SessionStart += bili proxy bootstrap");
+    } else if (refreshOurHookCommands(sessionStart, opts.hookCommand)) {
+        data.hooks = hooks;
+        notes.push("hooks.SessionStart refreshed to the current hook command");
     }
     return { data, notes };
+}
+
+/** A hook command naming our bootstrap script. Match on the script name
+ *  rather than the whole string: the emitted form changes across releases. */
+function isOurHookCommand(command: unknown): command is string {
+    return typeof command === "string" && /claude-native-bootstrap\.(?:js|mjs|ts)["']?$/.test(command);
+}
+
+/** Rewrite every hook command we own to `command`, in place; true if any
+ *  changed. The entry above is appended only when no bili entry is present,
+ *  so without this a settings file written by an older release keeps its old
+ *  command forever — and a command a client shell cannot run hangs every
+ *  session with no log to say why. */
+function refreshOurHookCommands(sessionStart: unknown[], command: string): boolean {
+    let changed = false;
+    for (const entry of sessionStart) {
+        if (!isOursSessionStartEntry(entry)) continue;
+        for (const h of (entry as { hooks: unknown[] }).hooks) {
+            const hook = h as { command?: unknown };
+            const cur = hook.command;
+            if (isOurHookCommand(cur) && cur !== command) {
+                hook.command = command;
+                changed = true;
+            }
+        }
+    }
+    return changed;
 }
 
 /** A SessionStart entry we wrote: any hook command naming our bootstrap
@@ -517,9 +580,7 @@ export function applyClaudeManagedBlock(settings: Record<string, unknown>, opts:
 export function isOursSessionStartEntry(entry: unknown): boolean {
     const hooks = (entry !== null && typeof entry === "object" && !Array.isArray(entry) ? (entry as { hooks?: unknown }).hooks : undefined);
     if (!Array.isArray(hooks)) return false;
-    return hooks.some(
-        (h) => h !== null && typeof h === "object" && typeof (h as { command?: unknown }).command === "string" && /claude-native-bootstrap\.(?:js|mjs|ts)["']?$/.test((h as { command: string }).command),
-    );
+    return hooks.some((h) => h !== null && typeof h === "object" && isOurHookCommand((h as { command?: unknown }).command));
 }
 
 /** Pure strip of the managed block (remove path) — returns the cleaned copy
@@ -618,9 +679,10 @@ function claudeInstall(): string {
     saveClaudeNativePort(nativePort);
     const file = claudeSettingsFile();
     const settings = readJson(file);
+    const hookCommand = portableHookCommand(process.execPath, [bootstrapJs]);
     const { data, notes } = applyClaudeManagedBlock(settings, {
         baseUrl: claudeNativeBaseUrl(),
-        hookCommand: `${process.execPath} ${JSON.stringify(bootstrapJs)}`,
+        hookCommand,
     });
     writeJson(file, data);
 
@@ -1407,7 +1469,7 @@ function kimiPluginManifest(root: string): Record<string, unknown> {
         version: selfVersion(),
         description: "billion-context: ACP context-compression proxy (native mode)",
         mcpServers: { bili: { command: "node", args: [path.join(root, "dist", "kimi", "native-mcp.js")], cwd: "./" } },
-        hooks: [{ event: "SessionStart", command: `node ${path.join(root, "dist", "kimi", "bootstrap-hook.js")}`, timeout: 30 }],
+        hooks: [{ event: "SessionStart", command: portableHookCommand("node", [path.join(root, "dist", "kimi", "bootstrap-hook.js")]), timeout: 30 }],
     };
 }
 
@@ -1694,6 +1756,270 @@ function zcodeStatus(): string {
     return status;
 }
 
+// — doctor (#1235) —————————————————————————————————————————————————————
+
+/** Structured per-lane presence for `bili doctor`: what the lane's entries
+ *  point at, which on-disk copy it loads, and the copy's version when
+ *  resolvable. Read-only. Multi-face probes degrade to partial info on
+ *  malformed config; single-source probes (pi/opencode/zcode) propagate the
+ *  parse error so doctor reports a broken probe instead of a false "absent". */
+export interface LanePresence {
+    installed: boolean;
+    pointers: string[];
+    targets: string[];
+    form: "npm" | "local-path" | "managed-block" | "none";
+    copyVersion?: string;
+    profiles?: Array<{ name: string; spec?: string; pinned: boolean; bundleInstalled: boolean; copyVersion?: string }>;
+}
+
+function laneAbsent(): LanePresence {
+    return { installed: false, pointers: [], targets: [], form: "none" };
+}
+
+function pkgVersionAt(rootDir: string): string | undefined {
+    try {
+        const v = (JSON.parse(fs.readFileSync(path.join(rootDir, "package.json"), "utf8")) as { version?: unknown }).version;
+        return typeof v === "string" ? v : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+/** Package root three levels above a <root>/dist/<sub>/<file>.js entry. */
+function rootFromDistFile(file: string): string {
+    return path.dirname(path.dirname(path.dirname(file)));
+}
+
+export function inspectLanePresence(agent: PluginAgent): LanePresence {
+    if (agent === "pi") {
+        const root = selfPackageRoot();
+        const packages = readJson(piSettingsFile()).packages;
+        const list = Array.isArray(packages) ? (packages as unknown[]).map(String) : [];
+        const entries = list.filter((p) => isBiliPiEntry(p, root) || p === piEntryFor(root));
+        if (entries.length === 0) return laneAbsent();
+        if (entries.includes(PI_NPM_ENTRY)) {
+            const store = path.join(resolvePiHome(process.env), "agent", "npm", "node_modules", PI_NPM_ENTRY.slice("npm:".length));
+            return {
+                installed: true,
+                pointers: entries,
+                targets: fs.existsSync(store) ? [store] : [],
+                form: "npm",
+                copyVersion: pkgVersionAt(store),
+            };
+        }
+        const abs = entries.find((p) => path.isAbsolute(p));
+        return {
+            installed: true,
+            pointers: entries,
+            targets: abs !== undefined ? [abs] : [],
+            form: "local-path",
+            copyVersion: abs !== undefined ? pkgVersionAt(abs) : undefined,
+        };
+    }
+    if (agent === "omp") {
+        let text: string;
+        try {
+            text = fs.readFileSync(ompConfigFile(), "utf8");
+        } catch {
+            return laneAbsent();
+        }
+        const lines = text.split("\n");
+        const values = ompExtensionItemLines(text).map((i) => ompEntryValue(lines[i]!)).filter((v) => OMP_ENTRY_RE.test(v));
+        if (values.length === 0) return laneAbsent();
+        const targets = values.filter((v) => path.isAbsolute(v));
+        const first = targets[0];
+        return {
+            installed: true,
+            pointers: values,
+            targets,
+            form: "local-path",
+            copyVersion: first !== undefined ? pkgVersionAt(rootFromDistFile(first)) : undefined,
+        };
+    }
+    if (agent === "claude") {
+        const out = laneAbsent();
+        try {
+            const data = readJson(claudeSettingsFile());
+            const baseUrl = (data.env as Record<string, unknown> | undefined)?.ANTHROPIC_BASE_URL;
+            if (typeof baseUrl === "string" && isBiliClaudeBaseUrl(baseUrl)) {
+                out.installed = true;
+                out.pointers.push(`env.ANTHROPIC_BASE_URL=${baseUrl}`);
+            }
+        } catch {}
+        try {
+            const mcpData = readJson(claudeMcpJson()) as { mcpServers?: Record<string, unknown> };
+            const bili = mcpData.mcpServers?.bili;
+            if (bili !== null && typeof bili === "object" && !Array.isArray(bili)) {
+                const s = bili as Record<string, unknown>;
+                out.installed = true;
+                const args = Array.isArray(s.args) ? (s.args as unknown[]).map(String) : [];
+                out.pointers.push([s.command, ...args].filter((x) => typeof x === "string" && x.length > 0).join(" "));
+                const script = args[0];
+                if (script !== undefined && path.isAbsolute(script)) {
+                    out.targets.push(script);
+                    out.copyVersion = out.copyVersion ?? pkgVersionAt(rootFromDistFile(script));
+                }
+            }
+        } catch {}
+        if (out.installed) out.form = "managed-block";
+        return out;
+    }
+    if (agent === "codex") {
+        let text: string;
+        try {
+            text = fs.readFileSync(codexToml(), "utf8");
+        } catch {
+            return laneAbsent();
+        }
+        if (!/^\[mcp_servers\.bili\]\s*$/m.test(text)) return laneAbsent();
+        const start = text.indexOf("[mcp_servers.bili]");
+        const rest = text.slice(start);
+        const nextSection = /^\[[^\]\n]+\]/m.exec(rest.slice(1));
+        const block = nextSection !== null ? rest.slice(0, 1 + nextSection.index) : rest;
+        const unquote = (raw: string): string => {
+            try {
+                const parsed: unknown = JSON.parse(raw);
+                return typeof parsed === "string" ? parsed : raw.replace(/^["']|["']$/g, "");
+            } catch {
+                return raw.replace(/^["']|["']$/g, "");
+            }
+        };
+        const cmdMatch = /^command\s*=\s*(.+?)\s*$/m.exec(block);
+        const command = cmdMatch?.[1] ? unquote(cmdMatch[1]) : "";
+        const argsMatch = /^args\s*=\s*\[(.*)\]\s*$/m.exec(block);
+        let args: string[] = [];
+        if (argsMatch?.[1]) {
+            try {
+                args = (JSON.parse(`[${argsMatch[1]}]`) as unknown[]).filter((x): x is string => typeof x === "string");
+            } catch {
+                args = [...argsMatch[1].matchAll(/["']([^"']*)["']/g)].map((m) => m[1]!);
+            }
+        }
+        const targets = args.filter((a) => path.isAbsolute(a) && /\.js$/.test(a));
+        const first = targets[0];
+        return {
+            installed: true,
+            pointers: [`[mcp_servers.bili] command=${command || "?"} args=[${args.join(", ")}]`],
+            targets,
+            form: "managed-block",
+            copyVersion: first !== undefined ? pkgVersionAt(rootFromDistFile(first)) : undefined,
+        };
+    }
+    if (agent === "opencode") {
+        const file = opencodeTargetFile();
+        const { data } = loadOpencodeConfig(file);
+        const dir = opencodePluginDir(file);
+        const listed = PLUGIN_KEYS.flatMap((k) => pluginEntries(data, k)).filter((p) => p === OPENCODE_NPM_ENTRY || p === dir);
+        const hasMcp = isPlainMcpObject(data.mcp) && "bili" in data.mcp;
+        if (listed.length === 0 && !hasMcp) return laneAbsent();
+        const out: LanePresence = { installed: true, pointers: [...listed], targets: [], form: "none" };
+        if (hasMcp) out.pointers.push("mcp.bili");
+        if (listed.includes(OPENCODE_NPM_ENTRY)) {
+            out.form = "npm";
+        } else if (listed.includes(dir)) {
+            out.form = "local-path";
+            out.targets.push(path.join(dir, "index.js"));
+            out.copyVersion = pkgVersionAt(dir);
+        }
+        return out;
+    }
+    if (agent === "dsh") {
+        let dirs: string[];
+        try {
+            dirs = dshProfileDirs();
+        } catch {
+            return laneAbsent();
+        }
+        const profiles = dirs.flatMap((dir) => {
+            const spec = dshProfileDepSpec(dir);
+            const bundled = dshBundleInstalled(dir);
+            if (spec === undefined && !bundled) return [];
+            return [{
+                name: path.basename(dir),
+                spec,
+                pinned: spec !== undefined && !isRegistryDepSpec(spec),
+                bundleInstalled: bundled,
+                copyVersion: bundled ? pkgVersionAt(path.join(dir, "node_modules", DSH_PACKAGE)) : undefined,
+            }];
+        });
+        if (profiles.length === 0) return laneAbsent();
+        return {
+            installed: true,
+            pointers: profiles.map((p) => `${p.name}: ${p.spec ?? "(no dep)"}`),
+            targets: [],
+            form: profiles.some((p) => p.pinned) ? "local-path" : "npm",
+            profiles,
+        };
+    }
+    if (agent === "kimi") {
+        const manifestFile = path.join(kimiManagedDir(), "kimi.plugin.json");
+        const manifestOk = fs.existsSync(manifestFile);
+        let registered = false;
+        try {
+            registered = readKimiInstalledRegistry(kimiRegistryFile()).plugins.some((p) => p.id === KIMI_PLUGIN_ID);
+        } catch {}
+        if (!manifestOk && !registered) return laneAbsent();
+        const out: LanePresence = { installed: manifestOk && registered, pointers: [], targets: [], form: "local-path" };
+        if (!out.installed) out.pointers.push(manifestOk ? "manifest present but registry record missing" : "registry record present but manifest missing");
+        try {
+            const man = JSON.parse(fs.readFileSync(manifestFile, "utf8")) as Record<string, unknown>;
+            if (typeof man.version === "string") out.copyVersion = man.version;
+            const mcpArgs = zcodeAsPlain(zcodeAsPlain(man.mcpServers)?.bili)?.args;
+            for (const a of Array.isArray(mcpArgs) ? (mcpArgs as unknown[]).map(String) : []) {
+                if (path.isAbsolute(a)) out.targets.push(a);
+            }
+            const hookCmd = Array.isArray(man.hooks)
+                ? (man.hooks as unknown[]).map((h) => zcodeAsPlain(h)?.command).find((c): c is string => typeof c === "string")
+                : undefined;
+            if (hookCmd !== undefined) {
+                const script = hookCmd.trim().split(/\s+/).pop();
+                if (script !== undefined && path.isAbsolute(script)) out.targets.push(script);
+            }
+        } catch {}
+        return out;
+    }
+    if (agent === "hermes") {
+        const dir = hermesPluginDir();
+        if (!fs.existsSync(path.join(dir, "__init__.py"))) return laneAbsent();
+        const out: LanePresence = { installed: true, pointers: [dir], targets: [], form: "local-path" };
+        try {
+            const sidecar = JSON.parse(fs.readFileSync(path.join(dir, "bili.json"), "utf8")) as HermesSidecar;
+            if (typeof sidecar.proxyScript === "string" && sidecar.proxyScript.length > 0) out.targets.push(sidecar.proxyScript);
+        } catch {}
+        try {
+            const yaml = fs.readFileSync(path.join(dir, "plugin.yaml"), "utf8");
+            const m = /^version:\s*["']?([^"'\r\n]+?)["']?\s*$/m.exec(yaml);
+            if (m?.[1]) out.copyVersion = m[1];
+        } catch {}
+        return out;
+    }
+    // zcode
+    const doc = readJson(zcodeUserConfigFile());
+    const sessionStart = zcodeAsPlain(zcodeAsPlain(doc.hooks)?.events)?.SessionStart;
+    const hasHook = Array.isArray(sessionStart) && (sessionStart as unknown[]).some(isOursZcodeHookEntry);
+    const mcpBili = zcodeAsPlain(zcodeAsPlain(doc.mcp)?.servers)?.bili;
+    const hasMcp = isOursZcodeMcpServer(mcpBili);
+    if (!hasHook && !hasMcp) return laneAbsent();
+    const out: LanePresence = { installed: hasHook && hasMcp, pointers: [], targets: [], form: "managed-block" };
+    if (!out.installed) out.pointers.push(hasHook ? "hook present, MCP face missing" : "MCP face present, hook missing");
+    const collectArgs = (args: unknown): void => {
+        for (const a of Array.isArray(args) ? (args as unknown[]).map(String) : []) {
+            if (path.isAbsolute(a) && /\.(js|ts)$/.test(a)) out.targets.push(a);
+        }
+    };
+    if (Array.isArray(sessionStart)) {
+        for (const e of sessionStart as unknown[]) {
+            if (!isOursZcodeHookEntry(e)) continue;
+            const hooks = zcodeAsPlain(e)?.hooks;
+            if (Array.isArray(hooks)) for (const h of hooks as unknown[]) collectArgs(zcodeAsPlain(h)?.args);
+        }
+    }
+    if (hasMcp) collectArgs(zcodeAsPlain(mcpBili)?.args);
+    const first = out.targets[0];
+    if (first !== undefined) out.copyVersion = pkgVersionAt(rootFromDistFile(first));
+    return out;
+}
+
 export function isPluginAgent(value: string): value is PluginAgent {
     return (PLUGIN_AGENTS as readonly string[]).includes(value);
 }
@@ -1732,7 +2058,7 @@ export function pluginStatusAll(): Array<{ agent: string; status: string; channe
 // their host; dsh profile bundles track the global version; reference lanes
 // (omp/claude/codex/kimi/hermes/zcode) follow the global bili install itself —
 // hermes additionally re-copies its Python files via `bili plugin update hermes`.
-const UPDATE_CHANNEL: Record<PluginAgent, string> = {
+export const UPDATE_CHANNEL: Record<PluginAgent, string> = {
     pi: "pi update (pi owns the npm:billion-context copy)",
     omp: "the global bili install (entry points at it)",
     claude: "the global bili install (hook/MCP point at it)",

@@ -81,14 +81,71 @@ describe("#684 exit sentinels", () => {
         assert.equal(c.lines.length, 0);
     });
 
-    it("anthropic wire: tool_use without thinking warns", () => {
+    it("anthropic wire: tool_use that lost its inbound thinking warns", () => {
         const c = collector();
-        warnAnthropicThinkingPairs([
-            { role: "assistant", content: [{ type: "thinking", thinking: "t" }] },
-            { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "n", input: {} }] },
-        ], c.log, "s1");
+        const inbound = [
+            { role: "user", content: "u" },
+            { role: "assistant", content: [{ type: "thinking", thinking: "t" }, { type: "tool_use", id: "tu1", name: "n", input: {} }] },
+            { role: "user", content: [{ type: "tool_result", tool_use_id: "tu1", content: "r" }] },
+        ];
+        const outbound = [
+            { role: "user", content: "u" },
+            { role: "assistant", content: [{ type: "tool_use", id: "tu1", name: "n", input: {} }] },
+            { role: "user", content: [{ type: "tool_result", tool_use_id: "tu1", content: "r" }] },
+        ];
+        warnAnthropicThinkingPairs(inbound, outbound, c.log, "s1");
         assert.equal(c.lines.length, 1);
         assert.match(c.lines[0]!, /thinking-pair-violated/);
+    });
+
+    it("#1327 anthropic wire: pre-existing asymmetry (turns that never thought) stays silent", () => {
+        const c = collector();
+        const msgs = [
+            { role: "assistant", content: [{ type: "thinking", thinking: "t" }, { type: "tool_use", id: "tu1", name: "n", input: {} }] },
+            { role: "assistant", content: [{ type: "tool_use", id: "tu2", name: "n", input: {} }] },
+        ];
+        warnAnthropicThinkingPairs(msgs, msgs, c.log, "s1");
+        assert.equal(c.lines.length, 0);
+    });
+
+    it("#1327 anthropic wire: non-thinking session stays silent", () => {
+        const c = collector();
+        const msgs = [
+            { role: "assistant", content: [{ type: "tool_use", id: "tu1", name: "n", input: {} }] },
+            { role: "assistant", content: [{ type: "tool_use", id: "tu2", name: "n", input: {} }] },
+        ];
+        warnAnthropicThinkingPairs(msgs, msgs, c.log, "s1");
+        assert.equal(c.lines.length, 0);
+    });
+
+    it("#1327 anthropic wire: counts only blocks bili actually lost, not pre-existing gaps", () => {
+        const c = collector();
+        const inbound = [
+            { role: "assistant", content: [{ type: "thinking", thinking: "t" }, { type: "tool_use", id: "tu1", name: "n", input: {} }] },
+            { role: "assistant", content: [{ type: "tool_use", id: "tu2", name: "n", input: {} }] },
+        ];
+        const outbound = [
+            { role: "assistant", content: [{ type: "tool_use", id: "tu1", name: "n", input: {} }] },
+            { role: "assistant", content: [{ type: "tool_use", id: "tu2", name: "n", input: {} }] },
+        ];
+        warnAnthropicThinkingPairs(inbound, outbound, c.log, "s1");
+        assert.equal(c.lines.length, 1);
+        assert.match(c.lines[0]!, /thinking-pair-violated: 1 tool_use block/);
+        assert.match(c.lines[0]!, /tu1/);
+        assert.doesNotMatch(c.lines[0]!, /tu2/);
+    });
+
+    it("#1327 anthropic wire: fully folded turn (no preserved tool_use) stays silent", () => {
+        const c = collector();
+        const inbound = [
+            { role: "assistant", content: [{ type: "thinking", thinking: "t" }, { type: "tool_use", id: "tu1", name: "n", input: {} }] },
+            { role: "assistant", content: [{ type: "text", text: "later" }] },
+        ];
+        const outbound = [
+            { role: "assistant", content: [{ type: "text", text: "later" }] },
+        ];
+        warnAnthropicThinkingPairs(inbound, outbound, c.log, "s1");
+        assert.equal(c.lines.length, 0);
     });
 
     it("responses wire: function_call without preceding reasoning warns", () => {

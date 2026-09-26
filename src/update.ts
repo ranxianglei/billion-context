@@ -188,6 +188,12 @@ async function writeLastCheck(ts: number): Promise<void> {
     }
 }
 
+/** Last completed registry-check time (epoch ms) for diagnostics (#1235); undefined when never checked. */
+export async function lastUpdateCheckTime(): Promise<number | undefined> {
+    const ts = await readLastCheck();
+    return ts > 0 ? ts : undefined;
+}
+
 /**
  * Walk up from this module's location until we find the directory whose
  * package.json `name` matches `packageName`. This is the install directory.

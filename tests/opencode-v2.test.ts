@@ -675,3 +675,178 @@ test("fetchManifest openai format maps parameters to inputSchema", async () => {
         await new Promise<void>((resolve) => server.close(() => resolve()));
     }
 });
+
+import { createOpencodeV2Setup } from "../src/agent/opencode-v2.ts";
+
+function startRegisterProxy(failFirst = 0): Promise<{ origin: string; registers: Array<{ conversationId?: string; agent?: string; identity?: boolean; parentConversationId?: string }>; close: () => Promise<void> }> {
+    const registers: Array<{ conversationId?: string; agent?: string; identity?: boolean; parentConversationId?: string }> = [];
+    let failuresLeft = failFirst;
+    const server = http.createServer((req, res) => {
+        if ((req.url ?? "") === "/__bili/plugin/register" && req.method === "POST") {
+            let body = "";
+            req.on("data", (c) => (body += c));
+            req.on("end", () => {
+                registers.push(JSON.parse(body));
+                if (failuresLeft > 0) {
+                    failuresLeft--;
+                    res.writeHead(500);
+                    res.end("{}");
+                } else {
+                    res.writeHead(200, { "content-type": "application/json" });
+                    res.end(JSON.stringify({ ok: true }));
+                }
+            });
+            return;
+        }
+        res.writeHead(404);
+        res.end("{}");
+    });
+    server.listen(0, "127.0.0.1");
+    return new Promise((resolve) => {
+        server.once("listening", () => {
+            const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+            resolve({ origin, registers, close: () => new Promise<void>((r) => server.close(() => r())) });
+        });
+    });
+}
+
+test("#1362: V2 child session links its parent via session.created + first request", async () => {
+    const reg = await startRegisterProxy();
+    const fake = makeFakeCtx();
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: reg.origin, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            const cleanup = await createOpencodeV2Setup({})(fake.ctx as never);
+            try {
+                fake.pushEvent({ type: "session.created", data: { sessionID: "ses_c", parentID: "ses_p" } });
+                await new Promise((r) => setTimeout(r, 20));
+                const r1 = await fake.fireModelRequest({ sessionID: "ses_c", baseURL: "http://upstream.example/v1" });
+                assert.equal(r1.headers["x-bili-plugin-conversation"], "ses_c");
+                await until(() => reg.registers.length >= 1);
+                assert.deepEqual(reg.registers[0], { conversationId: "ses_c", agent: "opencode", identity: true, parentConversationId: "ses_p" });
+                await fake.fireModelRequest({ sessionID: "ses_c", baseURL: "http://upstream.example/v1" });
+                await new Promise((r) => setTimeout(r, 50));
+                assert.equal(reg.registers.length, 1, "derived sid registered exactly once");
+            } finally {
+                cleanup();
+            }
+        });
+    } finally {
+        await reg.close();
+    }
+});
+
+test("#1362: V2 root sessions (no parentID) send no register", async () => {
+    const reg = await startRegisterProxy();
+    const fake = makeFakeCtx();
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: reg.origin, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            const cleanup = await createOpencodeV2Setup({})(fake.ctx as never);
+            try {
+                fake.pushEvent({ type: "session.created", data: { sessionID: "ses_root" } });
+                await new Promise((r) => setTimeout(r, 20));
+                await fake.fireModelRequest({ sessionID: "ses_root", baseURL: "http://upstream.example/v1" });
+                await fake.fireModelRequest({ sessionID: "ses_root", baseURL: "http://upstream.example/v1" });
+                await new Promise((r) => setTimeout(r, 80));
+                assert.deepEqual(reg.registers, []);
+            } finally {
+                cleanup();
+            }
+        });
+    } finally {
+        await reg.close();
+    }
+});
+
+test("#1362: V2 self-parent is filtered at ingest", async () => {
+    const reg = await startRegisterProxy();
+    const fake = makeFakeCtx();
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: reg.origin, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            const cleanup = await createOpencodeV2Setup({})(fake.ctx as never);
+            try {
+                fake.pushEvent({ type: "session.created", data: { sessionID: "ses_s", parentID: "ses_s" } });
+                await new Promise((r) => setTimeout(r, 20));
+                await fake.fireModelRequest({ sessionID: "ses_s", baseURL: "http://upstream.example/v1" });
+                await fake.fireModelRequest({ sessionID: "ses_s", baseURL: "http://upstream.example/v1" });
+                await new Promise((r) => setTimeout(r, 80));
+                assert.deepEqual(reg.registers, []);
+            } finally {
+                cleanup();
+            }
+        });
+    } finally {
+        await reg.close();
+    }
+});
+
+test("#1362: V2 parent announced after the child's first request links late", async () => {
+    const reg = await startRegisterProxy();
+    const fake = makeFakeCtx();
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: reg.origin, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            const cleanup = await createOpencodeV2Setup({})(fake.ctx as never);
+            try {
+                await fake.fireModelRequest({ sessionID: "ses_l", baseURL: "http://upstream.example/v1" });
+                await new Promise((r) => setTimeout(r, 50));
+                assert.deepEqual(reg.registers, [], "no parent known yet");
+                fake.pushEvent({ type: "session.created", data: { sessionID: "ses_l", parentID: "ses_lp" } });
+                await new Promise((r) => setTimeout(r, 20));
+                await fake.fireModelRequest({ sessionID: "ses_l", baseURL: "http://upstream.example/v1" });
+                await until(() => reg.registers.length >= 1);
+                assert.deepEqual(reg.registers[0], { conversationId: "ses_l", agent: "opencode", identity: true, parentConversationId: "ses_lp" });
+            } finally {
+                cleanup();
+            }
+        });
+    } finally {
+        await reg.close();
+    }
+});
+
+test("#1362: failed V2 derive register retries after the cooldown window", async () => {
+    const reg = await startRegisterProxy(1);
+    const fake = makeFakeCtx();
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: reg.origin, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            const cleanup = await createOpencodeV2Setup({ derivedRetryMs: 60 })(fake.ctx as never);
+            try {
+                fake.pushEvent({ type: "session.created", data: { sessionID: "ses_f", parentID: "ses_fp" } });
+                await new Promise((r) => setTimeout(r, 20));
+                await fake.fireModelRequest({ sessionID: "ses_f", baseURL: "http://upstream.example/v1" });
+                await until(() => reg.registers.length >= 1);
+                await fake.fireModelRequest({ sessionID: "ses_f", baseURL: "http://upstream.example/v1" });
+                assert.equal(reg.registers.length, 1, "throttled during cooldown");
+                await new Promise((r) => setTimeout(r, 100));
+                await fake.fireModelRequest({ sessionID: "ses_f", baseURL: "http://upstream.example/v1" });
+                await until(() => reg.registers.length >= 2);
+                assert.deepEqual(reg.registers[1], { conversationId: "ses_f", agent: "opencode", identity: true, parentConversationId: "ses_fp" });
+            } finally {
+                cleanup();
+            }
+        });
+    } finally {
+        await reg.close();
+    }
+});
+
+test("#1362: V2 kill switch suppresses derivation reporting too", async () => {
+    const reg = await startRegisterProxy();
+    const fake = makeFakeCtx();
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: reg.origin, BILLION_CONTEXT_PLUGIN: "0" }, async () => {
+            const cleanup = await createOpencodeV2Setup({})(fake.ctx as never);
+            try {
+                fake.pushEvent({ type: "session.created", data: { sessionID: "ses_k", parentID: "ses_kp" } });
+                await new Promise((r) => setTimeout(r, 20));
+                const r1 = await fake.fireModelRequest({ sessionID: "ses_k", baseURL: "http://upstream.example/v1" });
+                assert.equal(r1.headers["x-bili-plugin-conversation"], undefined, "no stamping under kill switch");
+                await new Promise((r) => setTimeout(r, 80));
+                assert.deepEqual(reg.registers, []);
+            } finally {
+                cleanup();
+            }
+        });
+    } finally {
+        await reg.close();
+    }
+});

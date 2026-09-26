@@ -5,12 +5,14 @@
 // minimal structural declarations — the bundled artifact imports NOTHING
 // from the host at runtime (the host duck-types us in).
 
+import fs from "node:fs";
+import path from "node:path";
 import { wrapCacheReport, wrapRuleReport } from "../acp-panel.js";
 import { awaitNativeProxyOrigin } from "./native-bootstrap.js";
-import { detectProxyBase, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, type ManifestTool } from "./shared.js";
+import { detectProxyBase, destinationRoutedThroughProxy, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, type ManifestTool } from "./shared.js";
 
 type Ctx = {
-    sessionManager?: { getSessionId?: () => string } | undefined;
+    sessionManager?: { getSessionId?: () => string; getHeader?: () => unknown } | undefined;
     model?: { contextWindow?: number; baseUrl?: string; provider?: string; id?: string; [key: string]: unknown } | undefined;
     cwd?: string;
 };
@@ -74,6 +76,49 @@ function sessionIdOf(ctx: Ctx): string | undefined {
     }
 }
 
+/** [#1333/#1362] Session files declare derivation in their header: the header
+ *  of a spawned/forked child carries parentSession. The value has TWO shapes
+ *  across hosts — pi RLM inline spawns write the PATH of the parent session
+ *  file, while omp fork() writes the PARENT'S BARE SESSION ID directly. The
+ *  parent's conversation id is that file's own header id for paths (one bounded
+ *  read — 64KB covers any header these hosts write; headers are the first JSONL
+ *  line), and the bare value itself when it is an id. The path-vs-id split
+ *  mirrors omp's own gc-cli discriminator: only an absolute path or a *.jsonl
+ *  suffix is treated as a file reference; anything else is an id (fail-safe —
+ *  an ambiguous alias resolves to nothing rather than guessing). Returns
+ *  undefined for root sessions, unreadable parents, or hosts without getHeader
+ *  — derivation reporting is strictly best-effort and never blocks registration. */
+export function parentConversationIdOf(ctx: Ctx): string | undefined {
+    try {
+        const header = ctx.sessionManager?.getHeader?.() as { parentSession?: unknown } | null | undefined;
+        const ref = typeof header?.parentSession === "string" ? header.parentSession.trim() : "";
+        if (!ref) return undefined;
+        // omp fork records the parent session id verbatim; pi records a path.
+        const isFileRef = path.isAbsolute(ref) || ref.endsWith(".jsonl");
+        if (!isFileRef) return ref;
+        const fd = fs.openSync(ref, "r");
+        try {
+            const buf = Buffer.alloc(64 * 1024);
+            const n = fs.readSync(fd, buf, 0, buf.length, 0);
+            for (const line of buf.subarray(0, n).toString("utf8").split("\n")) {
+                const text = line.trim();
+                if (!text) continue;
+                try {
+                    const obj = JSON.parse(text) as { type?: unknown; id?: unknown };
+                    if (obj?.type === "session" && typeof obj.id === "string" && obj.id) return obj.id;
+                } catch {
+                    // not JSON — keep scanning
+                }
+            }
+        } finally {
+            fs.closeSync(fd);
+        }
+    } catch {
+        // unreadable parent or missing getHeader — no derivation to report
+    }
+    return undefined;
+}
+
 // omp's chat-completions payloads carry NO conversation signal (no
 // prompt_cache_key / session / user, and no session header — verified by dump),
 // so the proxy's openai identity falls to a content fingerprint that never
@@ -90,8 +135,17 @@ function sessionIdOf(ctx: Ctx): string | undefined {
 // from the body pck there as well and strips the field before forwarding to
 // the real Anthropic. pi is untouched (it stamps x-bili-plugin-conversation in
 // before_provider_headers, which outranks the body field).
+// #1403: stamp ONLY when the destination will actually be seen by the proxy —
+// the pck's sole consumer is the proxy itself (identity bind + strip-before-
+// forward). A destination the proxy blind-tunnels never sees the field, so the
+// stamp rides verbatim into the upstream body, where strict-schema upstreams
+// (opencode zen's anthropic endpoint: "prompt_cache_key: Extra inputs are not
+// permitted") 400 the whole request. Unrouted destinations degrade to the
+// proxy's anonymous prefix-affinity sessions (#309): compression still works,
+// /acp lookup by session id does not — acceptable vs a guaranteed 400.
 function stampPromptCacheKey(event: unknown, ctx: Ctx, agent: string): Record<string, unknown> | undefined {
     if (agent !== "omp") return undefined;
+    if (!destinationRoutedThroughProxy(ctx.model?.baseUrl)) return undefined;
     const payload = (event as { payload?: unknown } | undefined)?.payload;
     if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return undefined;
     const p = payload as Record<string, unknown>;
@@ -187,21 +241,7 @@ function noProxyWarning(agent: string): string {
 
 const RETRY_INTERVAL_MS = 10000;
 
-type RegisterState = { sid?: string; toolsFor?: string; toolsReady?: boolean; pending?: Promise<void>; retryAt?: number; identityAt?: string; retryIntervalMs: number; manifestPrime?: { base: string; tools: Promise<ManifestTool[] | undefined> } };
-
-// omp never emits before_provider_headers, so the x-bili-plugin marker cannot
-// be stamped per request. Register the conversation id once (after tools are
-// ready): the proxy binds any request carrying that id into plugin mode —
-// same launcher path claude/codex use (#162).
-async function postIdentityRegister(proxyBase: string, conversationId: string, agent: string): Promise<void> {
-    const res = await fetch(`${proxyBase}/__bili/plugin/register`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ conversationId, agent, identity: true }),
-        signal: AbortSignal.timeout(5000),
-    });
-    if (!res.ok) throw new Error(`register HTTP ${res.status}`);
-}
+type RegisterState = { sid?: string; toolsFor?: string; toolsReady?: boolean; pending?: Promise<void>; retryAt?: number; identityAt?: string; carriedSids?: Set<string>; retryIntervalMs: number; manifestPrime?: { base: string; tools: Promise<ManifestTool[] | undefined> } };
 
 async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, agent: string): Promise<void> {
     const proxyBase = proxyBaseForCtx(ctx);
@@ -242,9 +282,20 @@ async function registerTools(pi: ExtensionAPI, ctx: Ctx, state: RegisterState, a
             }
             state.toolsReady = true;
             state.retryAt = undefined;
-            if (agent === "omp" && sid !== "" && state.identityAt !== sid) {
+            // #1333/#1362: a child session (pi RLM inline spawn, omp fork or
+            // newSession with a parentSession header) reports its parent
+            // conversation so the proxy can record a read-only inheritance
+            // link (decompress/search_context fall back to the parent chain —
+            // no state is copied). Plain pi sessions never identity-register:
+            // their plugin-mode binding rides the x-bili-plugin-conversation
+            // header stamped per request below, so the extra register only
+            // fires when derivation is actually declared. omp ALWAYS registers
+            // (its wire carries no other conversation signal), so it reports
+            // the parent whenever the header declares one.
+            const parent = agent === "pi" || agent === "omp" ? parentConversationIdOf(ctx) : undefined;
+            if ((agent === "omp" || (agent === "pi" && parent !== undefined)) && sid !== "" && state.identityAt !== sid) {
                 try {
-                    await postIdentityRegister(proxyBase, sid, agent);
+                    await postIdentityRegister(proxyBase, sid, agent, parent);
                     state.identityAt = sid;
                 } catch (err) {
                     // Leave state.sid UNSET so the next per-request event
@@ -328,13 +379,52 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
         // load-time check would leave the cancel disarmed for the whole
         // session. Plain pi/omp with the plugin installed but NO reachable
         // proxy (incl. a failed bootstrap) stays fully native.
+        // #1382: a proxy EXISTING is not enough — the evidence must be that
+        // THIS conversation's traffic reaches it. Native mode sets
+        // BILLION_CONTEXT_PROXY for the whole process, but extension-provided
+        // models like pi-claude-bridge run their own child processes (the
+        // model's baseUrl is literally "claude-bridge") and call upstream
+        // directly: the fetch intercept never sees those requests, so the
+        // proxy never carried the conversation. Cancelling there killed ALL
+        // compaction — the bridge disables Claude Code's own auto-compact and
+        // takes over Pi's in its own session_before_compact handler, which
+        // never runs once an earlier handler returned cancel. Accepted
+        // evidence, in order: (1) local — we stamped
+        // x-bili-plugin-conversation for this session id (tools registered
+        // AND a request routed through the proxy), or omp's identity register
+        // succeeded; (2) remote — the proxy confirms it carries the
+        // conversation id (/__bili/plugin/status ok). A non-http(s) baseUrl
+        // vetoes outright: such providers' traffic cannot reach the proxy by
+        // construction. Hosts exposing no stable session id keep the
+        // historical cancel (the proxy may carry them under a derived
+        // content-hash identity, where avoiding double compression still
+        // wins). Probe failure (proxy down/hung) means NO evidence → defer to
+        // native compaction: a surviving native pass is safe (#395), a wrong
+        // cancel overflows the session. The handlers are async on purpose —
+        // pi's runner awaits session_before_compact handlers (verified in
+        // pi-coding-agent dist) before consulting .cancel/.compaction.
+        const ownsCompaction = async (ctx: Ctx | undefined): Promise<boolean> => {
+            const proxyBase = proxyBaseForCtx(ctx);
+            if (proxyBase === undefined) return false;
+            const baseUrl = ctx?.model?.baseUrl;
+            if (typeof baseUrl === "string" && baseUrl.length > 0 && !/^https?:\/\//i.test(baseUrl)) return false;
+            const sid = ctx === undefined ? undefined : sessionIdOf(ctx);
+            if (sid === undefined || sid.length === 0) return true;
+            if (agent === "pi" ? state.carriedSids?.has(sid) === true : state.identityAt === sid) return true;
+            try {
+                return (await fetchStatus(proxyBase, sid)) !== undefined;
+            } catch (err) {
+                console.error(`bili-plugin(${agent}): compaction ownership probe failed (${err instanceof Error ? err.message : String(err)}) — leaving native compaction enabled`);
+                return false;
+            }
+        };
         if (agent === "pi" || agent === "omp") {
             if (agent === "pi") {
-                pi.on("session_before_compact", (event, ctx) => {
-                    if (proxyBaseForCtx(ctx) === undefined) return undefined;
+                pi.on("session_before_compact", async (event, ctx) => {
                     const reason = (event as unknown as { reason?: unknown }).reason;
-                    if (reason === "threshold" || reason === "overflow") return { cancel: true };
-                    return undefined;
+                    if (reason !== "threshold" && reason !== "overflow") return undefined;
+                    if (!(await ownsCompaction(ctx))) return undefined;
+                    return { cancel: true };
                 });
             } else {
                 let autoPending = false;
@@ -344,9 +434,9 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 pi.on("auto_compaction_end", () => {
                     autoPending = false;
                 });
-                pi.on("session_before_compact", (event, ctx) => {
-                    if (proxyBaseForCtx(ctx) === undefined) return undefined;
+                pi.on("session_before_compact", async (event, ctx) => {
                     if (!autoPending) return undefined;
+                    if (!(await ownsCompaction(ctx))) return undefined;
                     autoPending = false;
                     return { cancel: true };
                 });
@@ -574,6 +664,10 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 if (state.toolsReady === true) {
                     const sid = sessionIdOf(ctx);
                     if (sid !== undefined) headers["x-bili-plugin-conversation"] = sid;
+                    if (sid !== undefined && sid.length > 0) {
+                        state.carriedSids ??= new Set();
+                        state.carriedSids.add(sid);
+                    }
                     headers["x-bili-plugin"] = agent;
                     const window = ctx.model?.contextWindow;
                     if (typeof window === "number" && Number.isFinite(window) && window > 0) {

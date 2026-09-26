@@ -1,10 +1,11 @@
-// Deterministic fake chat-completions upstream for the native-pi E2E (#1239):
-// drives REAL `pi` through bili's native extension so interception, plugin-mode
-// stamping, ACP tool registration and compression ACTUALLY happen in-process,
-// no real model/network. The prompt of the FIRST user message scripts the
-// conversation: every "请调用<tool>" marker becomes one queued tool round
-// ("请调用<tool> {json}" pins the arguments); when the queue is exhausted the
-// model answers plain text "收到#done". `compress` with no explicit args is
+// Deterministic fake chat-completions upstream for the native-client E2E lanes
+// (#1239): drives a REAL host client (`pi`, `opencode`) through bili's native
+// extension so interception, plugin-mode stamping, ACP tool registration and
+// compression ACTUALLY happen in-process, no real model/network. The prompt of
+// the FIRST user message scripts the conversation: every "请调用<tool>" marker
+// becomes one queued tool round ("请调用<tool> {json}" pins the arguments —
+// braces may nest); when the queue is exhausted the model answers plain text
+// "收到#done". `compress` with no explicit args is
 // special-cased: the fake cites REAL refs harvested from the request's ACP tags
 // so the kernel has a foldable range. Every /chat/completions request is
 // appended to FAKE_REQLOG (JSONL) as the assertion oracle.
@@ -63,14 +64,34 @@ function toolResultsOf(messages) {
     return out;
 }
 
+// Balanced-brace JSON pinned after a directive name (braces may nest, e.g.
+// compress's {"content":[{"startId":...}]}). Returns the matched slice or null.
+function extractBalanced(text, openIdx) {
+    let depth = 0;
+    for (let i = openIdx; i < text.length; i++) {
+        if (text[i] === "{") depth++;
+        else if (text[i] === "}") {
+            depth--;
+            if (depth === 0) return text.slice(openIdx, i + 1);
+        }
+    }
+    return null;
+}
+
 function parseDirectives(text) {
     const out = [];
-    const re = /请调用([a-z0-9_]+)(\s*\{[^{}]*\})?/g;
+    const re = /请调用([a-z0-9_]+)/g;
     let m;
     while ((m = re.exec(text))) {
         let args = {};
-        if (m[2]) {
-            try { args = JSON.parse(m[2]); } catch { args = {}; }
+        let i = m.index + m[0].length;
+        while (i < text.length && /\s/.test(text[i])) i++;
+        if (text[i] === "{") {
+            const json = extractBalanced(text, i);
+            if (json) {
+                try { args = JSON.parse(json); } catch { args = {}; }
+                re.lastIndex = i + json.length;
+            }
         }
         out.push({ tool: m[1], args });
     }
@@ -91,12 +112,33 @@ function answerFor(convKey, firstUserText, body) {
     // Directives are parsed from the LAST user message: a `pi -p --continue`
     // follow-up run re-sends the whole history, and its fresh prompt must
     // own the queue — not the filler-heavy first message of run one.
+    // Hosts that keep the scripted prompt in an EARLY user message and append
+    // host-injected user-role context after it (dsh headless: the task, then
+    // workspace-reminder + runtime-snapshot user messages, #1268) fall back to
+    // the FIRST user message when the last one carries no markers — pi's
+    // prompt always owns the last slot, so pi-lane behavior is unchanged.
     const messages = body.messages ?? [];
     const users = messages.filter((x) => x?.role === "user");
+    // opencode fires a side-channel title-generation call (v1: separate
+    // "Generate a title..." user message; v2: "You are a title generator"
+    // system prompt) whose LAST user message is the real prompt — scripting
+    // through it desyncs the queue before the main loop runs. Answer it
+    // inertly, never touching queues. Contents carry ACP render-tag prefixes
+    // (\x3cacp … \x3c/acp\x3e spans injected by the proxy), stripped before matching.
+    const stripAcps = (s) => s.replace(/\x3cacp\b[^>]*\x3e[\s\S]*?\x3c\/acp\x3e/g, "");
+    const isTitleCall =
+        messages.some((m) => m?.role === "system" && /title generator/i.test(stripAcps(flatContent(m.content)))) ||
+        users.some((u) => /^generate a title\b/i.test(stripAcps(flatContent(u.content)).trim()));
+    if (isTitleCall) return { content: "e2e-title", queueIdx: -1 };
     const lastUserText = users.length > 0 ? flatContent(users[users.length - 1].content) : firstUserText;
-    const queueKey = `${convKey}|${lastUserText.slice(0, 64)}`;
+    let sourceText = lastUserText;
+    if (parseDirectives(lastUserText).length === 0 && users.length > 1) {
+        const firstText = flatContent(users[0].content);
+        if (firstText !== lastUserText && parseDirectives(firstText).length > 0) sourceText = firstText;
+    }
+    const queueKey = `${convKey}|${sourceText.slice(0, 64)}`;
     if (!convs.has(queueKey)) {
-        convs.set(queueKey, { directives: parseDirectives(lastUserText), idx: 0 });
+        convs.set(queueKey, { directives: parseDirectives(sourceText), idx: 0 });
     }
     const conv = convs.get(queueKey);
     const i = conv.idx++;
@@ -131,6 +173,13 @@ const server = http.createServer((req, res) => {
                 const messages = parsed.messages ?? [];
                 const users = messages.filter((x) => x?.role === "user");
                 const firstUserText = users.length > 0 ? flatContent(users[0].content) : "";
+                // ACP tag prefix of the LAST user message: lets suites cite the
+                // exact ref of a known message (e.g. run-one's filler) without
+                // guessing among example tags embedded in kernel prompt text.
+                const lastUserMsg = users.length > 0 ? users[users.length - 1] : null;
+                const lastUserRefMatch = lastUserMsg
+                    ? flatContent(lastUserMsg.content).match(/\x3cacp\s+[^>]*?\x3e(m\d{5})\x3c\/acp\x3e/)
+                    : null;
                 const convKey = req.headers["x-bili-plugin-conversation"] ?? "anon";
                 const reply = answerFor(convKey, firstUserText, parsed);
                 try {
@@ -141,6 +190,8 @@ const server = http.createServer((req, res) => {
                         model: parsed.model,
                         plugin: req.headers["x-bili-plugin"] ?? null,
                         conv: req.headers["x-bili-plugin-conversation"] ?? null,
+                        ctxwin: req.headers["x-bili-plugin-context-window"] ?? null,
+                        maxout: req.headers["x-bili-plugin-max-output"] ?? null,
                         tools: (parsed.tools ?? []).map((t) => t?.function?.name ?? t?.name),
                         nmsg: messages.length,
                         roles: messages.map((x) => x?.role).join(","),
@@ -152,6 +203,7 @@ const server = http.createServer((req, res) => {
                         toolName: reply.toolName ?? null,
                         toolArgs: reply.toolArgs ?? null,
                         lastUser: firstUserText.slice(0, 120),
+                        lastUserRef: lastUserRefMatch ? lastUserRefMatch[1] : null,
                     }) + "\n");
                 } catch { /* noop */ }
                 if (parsed.stream) {

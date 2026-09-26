@@ -21,7 +21,7 @@ import os from "node:os";
 import path from "node:path";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
 import { createBiliPlugin } from "./pi.js";
-import { markNativeHost, nativeBootstrapGate, nativeProxyScriptPath, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
+import { isLegacyBcpEntry, markNativeHost, nativeBootstrapGate, nativeProxyScriptPath, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
 import { fetchStatus } from "./shared.js";
 
@@ -34,20 +34,7 @@ export function shouldBootstrapNative(env: NodeJS.ProcessEnv): boolean {
     return nativeBootstrapGate(env, "BILI_NATIVE_PI");
 }
 
-// A settings.json packages entry that loads the LEGACY standalone
-// billion-context-pi extension (any install form: npm spec, node_modules
-// path, git spec or checkout path — mirrors the legacy branch of isPiEntry
-// in plugin-install.ts). That extension compresses IN-PROCESS, and versions
-// without the BILLION_CONTEXT_NATIVE stand-down (billion-context-pi#461,
-// unreleased at 0.1.71) cannot see the proxy this entry spawns — its
-// BILLION_CONTEXT_PROXY check runs at factory time, before our async
-// bootstrap writes it, and the fetch-layer rewrite keeps the baseUrl clean.
-// Co-resident = every request compressed twice, silently.
-export function isLegacyBcpEntry(entry: string): boolean {
-    return /^npm:billion-context-pi(@|$)/.test(entry)
-        || /(^|[/\\])node_modules[/\\]billion-context-pi([\\/\\]|$)/.test(entry)
-        || /(^|[/\\])billion-context-pi$/.test(entry);
-}
+export { isLegacyBcpEntry };
 
 /** packages[] entries in one pi settings.json that load billion-context-pi. */
 export function legacyBcpEntriesIn(file: string): string[] {

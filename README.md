@@ -1,11 +1,43 @@
 # billion-context
 
-[English](./README.md) | [中文](./README.zh-CN.md)
+<p align="center"><a href="./README.md">English</a> | <a href="./README.zh-CN.md">中文</a></p>
+
+<p align="center"><strong>Context-compression plugin</strong> — <em>billion-context is all you need.</em></p>
+
+<p align="center"><sub>small context windows (100K is enough) · <em>5× fewer tokens</em> · month-long single sessions (billions of tokens) · high compression quality</sub></p>
 
 <p align="center">
-<strong>Universal context-compression proxy</strong> for AI coding agents
-<br />
-Any agent that can set a base URL — <em>zero per-agent adapter code</em>.
+<a href="https://www.npmjs.com/package/billion-context"><img src="https://img.shields.io/npm/v/billion-context.svg?style=flat-square" alt="npm"></a>
+<a href="https://github.com/ranxianglei/billion-context/blob/master/LICENSE"><img src="https://img.shields.io/npm/l/billion-context.svg?style=flat-square" alt="license"></a>
+<a href="https://github.com/ranxianglei/billion-context"><img src="https://img.shields.io/badge/GitHub-ranxianglei%2Fbillion--context-181717?style=flat-square&logo=github" alt="GitHub"></a>
+</p>
+
+<p align="center">
+<code>npm install -g billion-context</code>
+</p>
+
+<p align="center">
+<a href="https://claude.com/product/claude-code" title="Claude Code"><img src="https://cdn.simpleicons.org/claude/D97757" height="26" alt="Claude Code"></a>&nbsp;
+<a href="https://github.com/openai/codex" title="Codex"><picture><source media="(prefers-color-scheme: dark)" srcset="https://api.iconify.design/simple-icons/openai.svg?color=white"><img src="https://api.iconify.design/simple-icons/openai.svg" height="26" alt="Codex"></picture></a>&nbsp;
+<a href="https://opencode.ai" title="OpenCode"><picture><source media="(prefers-color-scheme: dark)" srcset="https://cdn.simpleicons.org/opencode/FFFFFF"><img src="https://cdn.simpleicons.org/opencode/000000" height="26" alt="OpenCode"></picture></a>&nbsp;
+<a href="https://pi.dev" title="pi"><picture><source media="(prefers-color-scheme: dark)" srcset="https://cdn.simpleicons.org/pi/FFFFFF"><img src="https://cdn.simpleicons.org/pi/000000" height="26" alt="pi"></picture></a>&nbsp;
+<a href="https://github.com/google-gemini/gemini-cli" title="Gemini CLI"><img src="https://cdn.simpleicons.org/googlegemini/8E75B2" height="26" alt="Gemini CLI"></a>&nbsp;
+<a href="https://www.kimi.com" title="Kimi"><picture><source media="(prefers-color-scheme: dark)" srcset="https://cdn.simpleicons.org/kimi/FFFFFF"><img src="https://cdn.simpleicons.org/kimi/000000" height="26" alt="Kimi"></picture></a>&nbsp;
+<a href="https://github.com/QwenLM/qwen-code" title="Qwen Code"><img src="https://cdn.simpleicons.org/qwen/6950EF" height="26" alt="Qwen Code"></a>&nbsp;
+<a href="https://github.com/github/copilot-cli" title="GitHub Copilot CLI"><picture><source media="(prefers-color-scheme: dark)" srcset="https://cdn.simpleicons.org/githubcopilot/FFFFFF"><img src="https://cdn.simpleicons.org/githubcopilot/000000" height="26" alt="GitHub Copilot CLI"></picture></a>&nbsp;
+<a href="https://www.trae.ai" title="TRAE"><img src="https://cdn.simpleicons.org/trae/32F08C" height="26" alt="TRAE"></a>&nbsp;
+<a href="https://www.codebuddy.cn" title="CodeBuddy"><img src="https://cdn.simpleicons.org/codebuddy/6C4DFF" height="26" alt="CodeBuddy"></a>&nbsp;
+<a href="https://qoder.com" title="Qoder"><img src="https://icons.duckduckgo.com/ip3/qoder.com.ico" height="26" alt="Qoder"></a>&nbsp;
+<a href="https://iflow.cn" title="iFlow CLI"><img src="https://img.alicdn.com/imgextra/i4/O1CN01yBfg3x1iNi4YggwIt_!!6000000004401-2-tps-72-72.png" height="26" alt="iFlow CLI"></a>&nbsp;
+<a href="https://www.minimax.io" title="MiniMax Code (mcode)"><img src="https://cdn.simpleicons.org/minimax/E73562" height="26" alt="MiniMax Code"></a>&nbsp;
+<a href="https://www.deepseek.com" title="deepseek-harness (dsh)"><img src="https://cdn.simpleicons.org/deepseek/5786FE" height="26" alt="deepseek-harness"></a>&nbsp;
+<a href="https://ampcode.com" title="Amp"><img src="https://icons.duckduckgo.com/ip3/ampcode.com.ico" height="26" alt="Amp"></a>&nbsp;
+<a href="https://aider.chat" title="aider"><img src="https://raw.githubusercontent.com/Aider-AI/aider/main/aider/website/assets/icons/favicon-32x32.png" height="26" alt="aider"></a>&nbsp;
+<a href="https://github.com/aaif-goose/goose" title="goose"><picture><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/aaif-goose/goose/main/documentation/static/img/logo_dark.png"><img src="https://raw.githubusercontent.com/aaif-goose/goose/main/documentation/static/img/logo_light.png" height="26" alt="goose"></picture></a>&nbsp;
+<a href="https://github.com/NousResearch/hermes-agent" title="hermes"><img src="https://raw.githubusercontent.com/NousResearch/hermes-agent/main/apps/bootstrap-installer/src-tauri/icons/128x128.png" height="26" alt="hermes"></a>&nbsp;
+<a href="https://z.ai" title="zcode (Z.ai)"><img src="https://z-cdn.chatglm.cn/z-ai/static/logo.svg" height="26" alt="zcode"></a>&nbsp;
+<a href="https://omp.sh" title="omp (oh-my-pi, Stencil Labs)"><img src="https://omp.sh/favicon.svg" height="26" alt="omp"></a>&nbsp;
+<a href="https://github.com/1jehuang/jcode" title="jcode"><img src="https://github.com/1jehuang.png" height="26" alt="jcode"></a>
 </p>
 
 ---
@@ -25,18 +57,6 @@ QQ Group:
 > 📝 **The paper itself is open-sourced under the MIT License as part of the codebase (`paper/`). It is a living document — anyone may edit it; improvements are welcome via pull request.**
 
 A production-scale longitudinal study: 4.5 months, three hosts, 174,327 model calls, 18.76B cumulative input tokens (~24.7B across all hosts), zero window violations on 204,800-token models, marathon sessions of 8,584–12,049 calls.
-
----
-
-<p align="center">
-<a href="https://www.npmjs.com/package/billion-context"><img src="https://img.shields.io/npm/v/billion-context.svg?style=flat-square" alt="npm"></a>
-<a href="https://github.com/ranxianglei/billion-context/blob/master/LICENSE"><img src="https://img.shields.io/npm/l/billion-context.svg?style=flat-square" alt="license"></a>
-<a href="https://github.com/ranxianglei/billion-context"><img src="https://img.shields.io/badge/GitHub-ranxianglei%2Fbillion--context-181717?style=flat-square&logo=github" alt="GitHub"></a>
-</p>
-
-<p align="center">
-<code>npm install -g billion-context</code>
-</p>
 
 ---
 
@@ -76,7 +96,7 @@ The seventh tool, `acp_retrieve` (opt-in on every lane — set `compress.ccr.ena
 
 An opt-in tool, `image_full` (`compress.imageCompression.enabled: true` — see [CONFIGURATION.md](CONFIGURATION.md)), backs **image pre-compression** (#1095): screenshot-like images in tool results are downscaled once at arrival — the kernel decides routing and recipe, the host encodes via optional `sharp` — cutting billed pixels before they enter the wire (providers bill by pixel area; halving dimensions cuts billed tokens ~4×). Non-screenshot images pass through byte-identical. Lossy by nature: when the model can't read details it calls `image_full` with the message's ref to restore the original resolution for the rest of the session — no proxy-side storage needed, since the client's own history still carries the original bytes (it never saw the shrunk form). Default off.
 
-A sibling protection knob, `compress.protectedLatestTools` (see [CONFIGURATION.md](CONFIGURATION.md)), keeps the **latest** snapshot of a cumulative tool (a client's todo/task list, e.g. `["todo_list", "TodoWrite"]`) un-compressible while older instances fold normally — so the agent never loses its live task list to a fold (#639). Its full-history counterpart `compress.protectedTools` hard-excludes **every** instance of a tool — for independent-content results no later result supersedes (e.g. opencode/pi `skill` loads); protecting all instances of a chatty or cumulative-snapshot tool grows context without bound (#639), so keep it to low-frequency, high-value tools.
+A sibling protection knob, `compress.protectedLatestTools` (see [CONFIGURATION.md](CONFIGURATION.md)), keeps the **latest** snapshot of a cumulative tool (a client's todo/task list, e.g. `["todo_list", "TodoWrite"]`) un-compressible while older instances fold normally — so the agent never loses its live task list to a fold (#639). Its full-history counterpart `compress.protectedTools` hard-excludes **every** instance of a tool — for independent-content results no later result supersedes (e.g. opencode/pi `skill` loads); protecting all instances of a chatty or cumulative-snapshot tool grows context without bound (#639), so keep it to low-frequency, high-value tools. The inverse-direction knob `compress.neverPreserveRecentTools` (see [CONFIGURATION.md](CONFIGURATION.md), `acp-kernel` >= 0.0.92) removes tools from the soft-protected recent zone so their results fold immediately — by default only `decompress`/`search_context`/`read`/`bash` are exempt from recency; removing just `read` from that list is the recommended remedy for the batch-read fold→re-read death loop (#1198/#1277). Its positive-facing mirror `compress.preserveRecentTools` (see [CONFIGURATION.md](CONFIGURATION.md), `acp-kernel` >= 0.0.93) is the preferred one-entry form of that remedy — `{ "compress": { "preserveRecentTools": ["read"] } }` subtracts `read` from the effective exclusion list without restating or freezing the built-in default.
 
 ### Two compression modes — who executes `compress`
 
@@ -268,7 +288,8 @@ is the one command that drives every lane through its own owner and prints
 the per-lane update path (`bili plugin list` shows the same per-lane channel).
 
 At load the plugin **spawns its own proxy** (attaches to a healthy running
-one if present; a parent-pid watchdog tears it down when the client exits),
+one only when it passes the attach gate below; a parent-pid watchdog tears
+it down when the client exits),
 rewrites model traffic to `<proxy>/bili/<upstream-url>`, registers
 `compress` / `decompress` / `acp_status` as native client tools (plugin
 mode), and reports the client's **own model config** to the proxy so
@@ -278,25 +299,59 @@ Opt-out envs: `BILI_NATIVE_PI=0`, `BILI_NATIVE_OMP=0`,
 `BILI_NATIVE_HERMES=0`, `BILI_NATIVE_ZCODE=0`. Full
 mechanics: [TECHNICAL-NOTES.md](TECHNICAL-NOTES.md).
 
-Reuse is identity-based (#1225): an existing proxy is attached only when it
-runs the **same code** (sha256 of the entry script, recorded in the
-instance file) and its **lane is compatible** — each launcher declares its
-client's lane, two *different declared* lanes never share, and an instance
-without a lane (manual `bili start`) stays shareable by every client.
+Reuse is identity-based (#1225) **and lifecycle-gated (#1335)**: an existing
+proxy is attached only when it runs the **same code** (sha256 of the entry
+script, recorded in the instance file), its **lane is compatible** — each
+launcher declares its client's lane, two *different declared* lanes never
+share — **and it owns a session lifecycle**: its health endpoint reports an
+armed parent-pid watchdog (`watchdog.armed == true`), i.e. it was spawned by
+a launcher with a parent pid and dies when the last attached session dies.
+An instance without a declared lane is wildcard-compatible on the lane axis,
+but that alone no longer makes it attachable (see the gate below).
 Instances written before #1225 carry no code fingerprint and are therefore
 never attached: a rebuilt or updated install always starts a fresh proxy on
 the next launch, so fixes take effect immediately instead of silently
 serving stale code.
 
+**The attach gate (#1335).** A native hook attaches to whatever answers on
+the port, so the three listener kinds get different treatment (TS lanes and
+the hermes Python plugin's discovery path alike, #1338):
+
+| Listener | Lifecycle owner | Attach? |
+|---|---|---|
+| Its own session-spawned proxy | armed from birth | ✅ yes |
+| Another session's armed proxy (shared, watcher set #1186) | watcher set | ✅ yes — sharing stays the design |
+| Manually started `bili start` daemon | **none** — refuses watchers, never dies with sessions, often an older build | ❌ not by default |
+
+The hook probes the candidate's `/__bili/health` for `watchdog.armed` before
+attaching. Armed → attach + register a watcher (current behavior, README
+lifecycle contract holds). Unarmed — or a pre-#1330 build that reports no
+`watchdog` field at all (unverifiable, treated as unarmed) → **do not
+attach**; the hook spawns its own session-owned proxy (ephemeral port, armed
+from birth, dies with the last session). This also fixes version skew: every
+session now runs the **currently installed** bili instead of whatever a
+stale resident daemon happens to carry. The trade-off is one extra short-lived
+proxy process per session when no armed proxy exists (session state is shared
+on disk, so compression continuity is unaffected); the multi-instance warning
+(#394) becomes correspondingly more common. **Escape hatch:** deliberately
+run a resident daemon for your hooks to ride on → set
+`native.attachExternal: true` in the config file or
+`BILI_NATIVE_ATTACH_EXTERNAL=1`. That restores attaching to any compatible
+listener regardless of watchdog state — you then own the daemon's lifetime
+and version yourself. Explicit user-directed attaches (`BILLION_CONTEXT_ATTACH`
+/ preset `BILLION_CONTEXT_PROXY` for kimi/dsh) bypass discovery entirely and
+are exempt by construction.
+
 Attach discovery is lane-aware across **all** live instances (#1232): the
 launcher probes every live entry in the instance registry, not just the
 single instance file (last-writer-wins — under concurrent multi-client use
-it can point at another client's proxy). Among compatible candidates the
-newest instance with the launcher's own declared lane wins; an instance
-without a lane (manual `bili start`) remains shareable by every client.
-The `another bili instance is running` warning (#394) is lane-aware too: it
-fires for same-lane or lane-less coexistence, but stays silent between two
-*different* declared lanes, whose session files are disjoint.
+it can point at another client's proxy), and applies the gate above to every
+candidate. Among compatible candidates the newest instance with the launcher's
+own declared lane wins; an instance without a lane is wildcard-compatible on
+the lane axis (still subject to the gate). The `another bili instance is
+running` warning (#394) is lane-aware too: it fires for same-lane or lane-less
+coexistence, but stays silent between two *different* declared lanes, whose
+session files are disjoint.
 
 **Runtime-info protocol (#955).** A native plugin reads the model config
 the client itself will use and pushes it to the proxy (per-request headers
@@ -369,7 +424,7 @@ bili codex                            # launch codex through the proxy
 bili claude                           # launch claude through the proxy
 bili omp                              # pi-style, file-free (#535): env + extension registerProvider + compaction cancel, real ~/.omp untouched
 bili opencode                         # OpenCode (1.x & 2.x): full guide in the [OpenCode](#opencode) section below
-bili hermes                           # file-free (#535): hermes proxy env (HTTPS_PROXY + HERMES_CA_BUNDLE) — https via CONNECT MITM, http via absolute-form forward proxy; real ~/.hermes untouched
+bili hermes                           # file-free (#535): hermes proxy env (HTTPS_PROXY + combined CA bundle via SSL_CERT_FILE) — https via CONNECT MITM, http via absolute-form forward proxy; real ~/.hermes untouched
 bili dsh                              # deepseek-harness: full native plugin injected via --patch (#941) — compress/decompress/acp_status registered as real dsh tools, requests stamped with the dsh session id (plugin mode), /acp + /acp-cache session-bound; non-loopback upstreams ride proxy envs (https MITM, http absolute-form), loopback keeps the overlay DSH_HOME (~/.dsh-bili) rewrite (#535), built-in deepseek route via DEEPSEEK_BASE_URL; dsh native auto-compaction disabled (compaction-basic auto:false)
 bili codebuddy                        # Tencent CodeBuddy Code CLI: CODEBUDDY_BASE_URL /bili/ rewrite (OpenAI chat completions wire), budget aligned via CODEBUDDY_AUTO_COMPACT_WINDOW; real ~/.codebuddy untouched
 bili qoder                            # qoder: model endpoint is hardcoded https (no /bili/ rewrite possible) — cert-MITM via HTTPS_PROXY + NODE_EXTRA_CA_CERTS, default model hosts whitelisted (#653)
@@ -572,8 +627,9 @@ pure-stdlib Python module shipped inside the npm package:
   hermes exits; concurrent starts arbitrate through the same starting-marker
   protocol the launcher uses). Only once the proxy is verified healthy does it
   point hermes' httpx stack at it via `HTTPS_PROXY` / `https_proxy` +
-  `HERMES_CA_BUNDLE` (bili's root CA) — `~/.hermes/config.yaml` is never
-  touched. Provider https hosts are read from hermes' config and whitelisted
+  `SSL_CERT_FILE` (bili's combined CA bundle — current hermes resolves ambient
+  trust there; `HERMES_CA_BUNDLE` stays set for older builds) —
+  `~/.hermes/config.yaml` is never touched. Provider https hosts are read from hermes' config and whitelisted
   for MITM; everything else blind-tunnels exactly like launcher mode. If no
   proxy can be made healthy, the plugin stands down silently and traffic goes
   direct (no compression, no dead port).
@@ -1124,6 +1180,35 @@ conversations through the proxy. pi is fine for a single agent, but is **not
 recommended** for many concurrent conversations because of the collision
 risk — until pi grows its own session-id signal. For pi multi-agent use,
 pass an explicit `x-acp-session` header per conversation to avoid collisions.
+
+### Derived (child) sessions inherit the parent's compressed context (#1333, #1362)
+
+When an agent spawns a child session — a subagent or fork that starts from an
+empty history instead of resending the parent's conversation — that child
+could not previously `decompress` or `search_context` content that was folded
+away in the parent. Each lane now reports the lineage at birth: its identity
+registration carries the parent's conversation id (`parentConversationId`),
+and the proxy records a read-only link (`derivedFrom`) on the child session.
+From then on:
+
+- `decompress` / `search_context` fall back along the parent chain for
+  content the child never saw itself (resident or on-disk parents,
+  cycle-guarded, depth cap 8);
+- nothing is copied into the child's state and the parent is never modified —
+  fallback hits are read-only, so a child can never clobber what the parent
+  still owns;
+- if the parent is unknown to the proxy when the link is recorded, the child
+  simply starts fresh.
+
+| Lane | Parent signal |
+|---|---|
+| **pi** RLM inline spawn | `parentSession` in the session header (path to the parent session file, resolved to its session id) |
+| **omp** fork / newSession | `parentSession` in the session header (bare session id or file path — both accepted) |
+| **OpenCode V1** (native plugin) | SDK session info `parentID` (resolved once per session, cached) |
+| **OpenCode V2** (native plugin) | `session.created` event `data.parentID` |
+
+claude/codex/dsh need nothing here: they share one session id across
+subagents or have no child-session concept at all.
 
 ### Windows: exclude the sessions dir from antivirus (#362)
 

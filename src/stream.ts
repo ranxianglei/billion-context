@@ -93,7 +93,10 @@ export function compressibleSpanHint(state: Pick<CompressionState, "messageRefs"
         const span = actives.length >= 2 ? ` (e.g. startId ${actives[0]}, endId ${actives[actives.length - 1]})` : "";
         return ` No raw refs are directly compressible right now — compress a run of ACTIVE blocks instead${span}: fold their summaries into one higher-tier block. acp_status lists the current active blocks.`;
     }
-    const covered = boundary > 0 ? ` (everything up to ${fmt(boundary)} is already inside active blocks)` : "";
+    // #1366: blocks need not be contiguous — a gap below the highest block end
+    // (e.g. m05027–m05052 between two blocks) is still compressible raw space, so
+    // claiming "everything up to N is inside blocks" misleads models into skipping it.
+    const covered = boundary > 0 ? ` (refs up to ${fmt(boundary)} are largely inside active blocks; isolated free gaps may still exist below it)` : "";
     return ` Live compressible refs: ${fmt(boundary + 1)}–${fmt(highest)}${covered}. Retry NOW in this same turn with startId/endId inside that span.`;
 }
 
@@ -185,6 +188,15 @@ function currentRefsSnapshot(ctx: RewriteCtx): string {
     return ` [Current context: ${ctx.messages.length} visible message(s), refs ${loId}–${hiId}, ${activeBlocks} active block(s). Refs restart at m00001 after a session-generation change — request only refs inside this span, or call acp_status for exact compressible ranges.]`;
 }
 
+// #1294 P1: one-line integrity fingerprint per created/updated block — exact
+// char length plus head/tail excerpts (newlines flattened to spaces) so the
+// model can verify its summary was stored intact without decompressing.
+export function summaryFingerprintLine(blockId: string, summary: string): string {
+    const head = summary.slice(0, 30).replace(/\r?\n/g, " ");
+    const tail = summary.slice(-100).replace(/\r?\n/g, " ");
+    return ` · ${blockId} summary ${summary.length}ch · head "${head}" … tail "${tail}"`;
+}
+
 export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: RewriteCtx): string {
     const { ranges, diagnostics } = parsed;
     if (ranges.length === 0) {
@@ -199,11 +211,26 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // list stays logged above).
         const reasons = rawReasons.slice(0, 3).map((r) => (r.length > 160 ? r.slice(0, 160) + "..." : r));
         const why = reasons.length > 0 ? ` Rejected entries: ${reasons.join(" | ")}.` : "";
+        // #1366: a call with NO content at all ({} / "" args — an "empty companion"
+        // compress() emitted alongside the real one) must never be told to
+        // "re-issue": a structurally empty call fails identically every time, so
+        // that advice loops until the #847 guard trips. The #362 shape-drift case
+        // ({ranges: …} instead of {content: …}) stays on the format lecture below:
+        // there, fixing the key CAN succeed, so re-issue IS the right advice.
+        const isEmptyCall =
+            rawReasons.length === 0 &&
+            (diagnostics.kind === "empty-input" ||
+                (diagnostics.kind === "missing-content" && !(diagnostics.keys ?? []).includes("ranges")));
         const guard = recordCompressFailure(
             ctx.session,
             `parse:${diagnostics.kind}:${diagnostics.invalidItems}:${rawReasons.slice(0, 3).join("|")}`,
-            "Fix the argument shape against the format below instead of re-issuing the same malformed call.",
+            isEmptyCall
+                ? "An empty call fails identically on every retry — drop it instead of re-issuing."
+                : "Fix the argument shape against the format below instead of re-issuing the same malformed call.",
         );
+        if (isEmptyCall) {
+            return `[Compression FAILED: the call carried no content at all (kind=${diagnostics.kind}) — an empty compress() compresses nothing and can never succeed. Do NOT re-issue an empty call; if you meant to compress, put the non-empty 'content' array (elements {startId, endId, summary}) in that SAME single call.${guard}]`;
+        }
         return `[Compression FAILED: no valid ranges parsed (kind=${diagnostics.kind}, dropped=${diagnostics.invalidItems}).${why} compress requires a non-empty 'content' array where each element is EITHER an object {startId, endId, summary} OR one line-form string whose first line is 'mNNNNN–mNNNNN optional topic' with the summary markdown on the following lines (a separate summary-only element right after a bare header line is also accepted). startId/endId are mNNNNN message refs from the conversation (call acp_status to see current refs).${compressibleSpanHint(ctx.session.state)} Re-issue the compress call with a valid content array.${guard}]`;
     }
     // #847: detect reversed refs as SUBMITTED, before #1001 normalization
@@ -227,6 +254,7 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             config: ctx.config,
         });
         const beforeIds = new Set(ctx.session.state.blocks.map((b) => b.blockId));
+        const beforeSummaries = new Map(ctx.session.state.blocks.map((b) => [b.blockId, b.summary] as const));
         ctx.session.state = res.state;
         // Cache original content for newly-created blocks. At compress time the
         // source messages are still in ctx.messages (this round's view, before
@@ -323,6 +351,13 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
 
         const warn = r.warnings.length > 0 ? ` ${r.warnings.join("; ")}` : "";
         let msg = `[Compressed ${detail} → ${r.blocksCreated} block(s), ~${r.tokensCompressed} tokens saved.${warn}]`;
+        // #1294 P1: append a fingerprint line per created/updated block —
+        // kernel refolds update an existing block's summary in place (same id),
+        // so "updated" means any pre-existing block whose summary changed.
+        for (const b of res.state.blocks) {
+            const prev = beforeSummaries.get(b.blockId);
+            if (prev === undefined || prev !== b.summary) msg += `\n${summaryFingerprintLine(b.blockId, b.summary)}`;
+        }
         // #189 staged compression (gated): a rewrite above the configured max
         // shrink is the shape that trips provider risk-control; steer the model
         // toward smaller, tail-biased ranges so the prefix (m00001..foldPoint)

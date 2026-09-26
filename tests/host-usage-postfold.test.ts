@@ -151,7 +151,7 @@ test("#660: openai adapter — terminal usage chunk reaches the host untouched o
     assert.ok(!meta.includes('"prompt_tokens":90'), meta);
 });
 
-test("#660: anthropic adapter — first-round message_start reaches the host untouched", async () => {
+test("#660/#1310: anthropic adapter — first-round message_start forwards usage-NEUTRAL (terminal is the authority)", async () => {
     const adapter = createAnthropicAdapter({ model: "m" });
     const stream = streamOf([
         `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_1", type: "message", role: "assistant", content: [], usage: { input_tokens: 60000, output_tokens: 1 } } })}\n\n`,
@@ -161,7 +161,15 @@ test("#660: anthropic adapter — first-round message_start reaches the host unt
     for await (const ev of adapter.parseStream(stream, 1)) {
         if (ev.kind === "meta") meta += ev.chunk.toString("utf8");
     }
-    assert.ok(meta.includes('"input_tokens":60000'), `message_start usage must reach the host unmodified: ${meta}`);
+    // #1310: a stitched (compress re-request) turn cannot un-send the start's
+    // pre-fold usage, and a host merging frames (Claude Code: input from the
+    // terminal + cache_read from the start → 262k > 200k → "Prompt is too
+    // long") locks the session. The start therefore forwards usage-neutral;
+    // the loop's synthetic terminal carries the authoritative numbers (same
+    // values the start had for a non-stitched turn — pinned in
+    // loop-adapters.test.ts #1310).
+    assert.ok(meta.includes('"input_tokens":0'), `message_start usage must be neutral on the wire: ${meta}`);
+    assert.ok(!meta.includes('"input_tokens":60000'), `stale pre-fold usage must not reach the host: ${meta}`);
 });
 
 before(_resetPluginStateForTest);
@@ -785,9 +793,12 @@ async function withZCodeHarness(fn: (h: { proxy: http.Server; upstream: http.Ser
 }
 
 function zcodeInputTokensOf(raw: string): number {
-    const m = raw.match(/"input_tokens":(\d+)/);
-    assert.ok(m, `message_start usage missing: ${raw.slice(0, 400)}`);
-    return Number(m[1]);
+    // #1310: usage authority is the FINAL usage-bearing frame (the synthetic
+    // terminal on stitched turns), per Anthropic's cumulative-usage contract —
+    // the forwarded message_start is deliberately usage-neutral.
+    const matches = [...raw.matchAll(/"input_tokens":(\d+)/g)].map((m) => Number(m[1]));
+    assert.ok(matches.length > 0, `no usage frame in response: ${raw.slice(0, 400)}`);
+    return matches[matches.length - 1]!;
 }
 
 async function setupZCodeCompressedSession(h: { bodies: string[]; url: string }): Promise<number> {

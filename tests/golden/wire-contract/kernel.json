@@ -1,0 +1,1461 @@
+{
+  "arrays": {
+    "ACP_TOOLS_ANTHROPIC": [
+      {
+        "name": "compress",
+        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. Line form (preferred): content = one STRING per range — first line 'm00150–m00220 optional topic', remaining lines the markdown summary written verbatim (no JSON structure, no escaping). Also accepted: object entries {startId,endId,summary,topic?} in the content array, content as a single string (bare line form or JSON-encoded array), and a flat single-range call {startId,endId,summary,topic?} without content. Use when content is genuinely consumed. REQUIRED — compress without content or flat range fields is invalid.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "topic": {
+              "type": "string",
+              "description": "Optional short title for the compressed range"
+            },
+            "content": {
+              "type": [
+                "array",
+                "string"
+              ],
+              "description": "One or more ranges to compress into separate summary blocks. Array form (preferred): one entry per range — line form (one STRING per range: first line 'm00150–m00220 optional topic', remaining lines the markdown summary verbatim) or object form {startId,endId,summary,topic?}. String form also accepted: bare line-form text, or a JSON-encoded array of ranges (some gateways stringify arrays). REQUIRED unless the flat single-range form is used.",
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "description": "Line form: first line 'm00150–m00220 optional topic', remaining lines the summary markdown, verbatim (no JSON escaping)"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "topic": {
+                        "type": "string"
+                      },
+                      "startId": {
+                        "type": "string",
+                        "description": "mNNNNN ref at the start of the range"
+                      },
+                      "endId": {
+                        "type": "string",
+                        "description": "mNNNNN ref at the end of the range"
+                      },
+                      "startRef": {
+                        "type": "string",
+                        "description": "Alternate spelling of startId"
+                      },
+                      "endRef": {
+                        "type": "string",
+                        "description": "Alternate spelling of endId"
+                      },
+                      "summary": {
+                        "type": "string",
+                        "description": "Self-contained summary replacing the range"
+                      }
+                    },
+                    "anyOf": [
+                      {
+                        "required": [
+                          "startId",
+                          "endId",
+                          "summary"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "startRef",
+                          "endRef",
+                          "summary"
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            "startId": {
+              "type": "string",
+              "description": "Flat single-range form (no content): mNNNNN ref at the start of the range"
+            },
+            "endId": {
+              "type": "string",
+              "description": "Flat single-range form (no content): mNNNNN ref at the end of the range"
+            },
+            "startRef": {
+              "type": "string",
+              "description": "Flat single-range form: alternate spelling of startId"
+            },
+            "endRef": {
+              "type": "string",
+              "description": "Flat single-range form: alternate spelling of endId"
+            },
+            "summary": {
+              "type": "string",
+              "description": "Flat single-range form (no content): self-contained summary replacing the range"
+            }
+          }
+        }
+      },
+      {
+        "name": "decompress",
+        "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "blockId": {
+              "type": "string",
+              "description": "Block ID to decompress (e.g. b5)"
+            },
+            "toFile": {
+              "type": "string",
+              "description": "Optional: write content to file instead of context"
+            },
+            "full": {
+              "type": "boolean",
+              "description": "Restore all the way to original messages"
+            }
+          },
+          "required": [
+            "blockId"
+          ]
+        }
+      },
+      {
+        "name": "search_context",
+        "description": "Search through compressed block summaries by keyword. Use BEFORE decompressing to find the right block.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "Search query"
+            },
+            "limit": {
+              "type": "number",
+              "description": "Max results (default 5)"
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      },
+      {
+        "name": "acp_status",
+        "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next.",
+        "input_schema": {
+          "type": "object",
+          "properties": {}
+        }
+      },
+      {
+        "name": "acp_cache",
+        "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and line item. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
+        "input_schema": {
+          "type": "object",
+          "properties": {
+            "detail": {
+              "type": "string",
+              "enum": [
+                "summary",
+                "full"
+              ],
+              "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and line item."
+            }
+          }
+        }
+      }
+    ],
+    "ACP_TOOLS_OPENAI": [
+      {
+        "type": "function",
+        "function": {
+          "name": "compress",
+          "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. Line form (preferred): content = one STRING per range — first line 'm00150–m00220 optional topic', remaining lines the markdown summary written verbatim (no JSON structure, no escaping). Also accepted: object entries {startId,endId,summary,topic?} in the content array, content as a single string (bare line form or JSON-encoded array), and a flat single-range call {startId,endId,summary,topic?} without content. Use when content is genuinely consumed. REQUIRED — compress without content or flat range fields is invalid.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "topic": {
+                "type": "string",
+                "description": "Optional short title for the compressed range"
+              },
+              "content": {
+                "type": [
+                  "array",
+                  "string"
+                ],
+                "description": "One or more ranges to compress into separate summary blocks. Array form (preferred): one entry per range — line form (one STRING per range: first line 'm00150–m00220 optional topic', remaining lines the markdown summary verbatim) or object form {startId,endId,summary,topic?}. String form also accepted: bare line-form text, or a JSON-encoded array of ranges (some gateways stringify arrays). REQUIRED unless the flat single-range form is used.",
+                "items": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "description": "Line form: first line 'm00150–m00220 optional topic', remaining lines the summary markdown, verbatim (no JSON escaping)"
+                    },
+                    {
+                      "type": "object",
+                      "properties": {
+                        "topic": {
+                          "type": "string"
+                        },
+                        "startId": {
+                          "type": "string",
+                          "description": "mNNNNN ref at the start of the range"
+                        },
+                        "endId": {
+                          "type": "string",
+                          "description": "mNNNNN ref at the end of the range"
+                        },
+                        "startRef": {
+                          "type": "string",
+                          "description": "Alternate spelling of startId"
+                        },
+                        "endRef": {
+                          "type": "string",
+                          "description": "Alternate spelling of endId"
+                        },
+                        "summary": {
+                          "type": "string",
+                          "description": "Self-contained summary replacing the range"
+                        }
+                      },
+                      "anyOf": [
+                        {
+                          "required": [
+                            "startId",
+                            "endId",
+                            "summary"
+                          ]
+                        },
+                        {
+                          "required": [
+                            "startRef",
+                            "endRef",
+                            "summary"
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              },
+              "startId": {
+                "type": "string",
+                "description": "Flat single-range form (no content): mNNNNN ref at the start of the range"
+              },
+              "endId": {
+                "type": "string",
+                "description": "Flat single-range form (no content): mNNNNN ref at the end of the range"
+              },
+              "startRef": {
+                "type": "string",
+                "description": "Flat single-range form: alternate spelling of startId"
+              },
+              "endRef": {
+                "type": "string",
+                "description": "Flat single-range form: alternate spelling of endId"
+              },
+              "summary": {
+                "type": "string",
+                "description": "Flat single-range form (no content): self-contained summary replacing the range"
+              }
+            }
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "decompress",
+          "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "blockId": {
+                "type": "string",
+                "description": "Block ID to decompress (e.g. b5)"
+              },
+              "toFile": {
+                "type": "string",
+                "description": "Optional: write content to file instead of context"
+              },
+              "full": {
+                "type": "boolean",
+                "description": "Restore all the way to original messages"
+              }
+            },
+            "required": [
+              "blockId"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "search_context",
+          "description": "Search through compressed block summaries by keyword. Use BEFORE decompressing to find the right block.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string",
+                "description": "Search query"
+              },
+              "limit": {
+                "type": "number",
+                "description": "Max results (default 5)"
+              }
+            },
+            "required": [
+              "query"
+            ]
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "acp_status",
+          "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next.",
+          "parameters": {
+            "type": "object",
+            "properties": {}
+          }
+        }
+      },
+      {
+        "type": "function",
+        "function": {
+          "name": "acp_cache",
+          "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and line item. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "detail": {
+                "type": "string",
+                "enum": [
+                  "summary",
+                  "full"
+                ],
+                "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and line item."
+              }
+            }
+          }
+        }
+      }
+    ],
+    "ACP_TOOLS_RESPONSES": [
+      {
+        "type": "function",
+        "name": "compress",
+        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. Line form (preferred): content = one STRING per range — first line 'm00150–m00220 optional topic', remaining lines the markdown summary written verbatim (no JSON structure, no escaping). Also accepted: object entries {startId,endId,summary,topic?} in the content array, content as a single string (bare line form or JSON-encoded array), and a flat single-range call {startId,endId,summary,topic?} without content. Use when content is genuinely consumed. REQUIRED — compress without content or flat range fields is invalid.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "topic": {
+              "type": "string",
+              "description": "Optional short title for the compressed range"
+            },
+            "content": {
+              "type": [
+                "array",
+                "string"
+              ],
+              "description": "One or more ranges to compress into separate summary blocks. Array form (preferred): one entry per range — line form (one STRING per range: first line 'm00150–m00220 optional topic', remaining lines the markdown summary verbatim) or object form {startId,endId,summary,topic?}. String form also accepted: bare line-form text, or a JSON-encoded array of ranges (some gateways stringify arrays). REQUIRED unless the flat single-range form is used.",
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "description": "Line form: first line 'm00150–m00220 optional topic', remaining lines the summary markdown, verbatim (no JSON escaping)"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "topic": {
+                        "type": "string"
+                      },
+                      "startId": {
+                        "type": "string",
+                        "description": "mNNNNN ref at the start of the range"
+                      },
+                      "endId": {
+                        "type": "string",
+                        "description": "mNNNNN ref at the end of the range"
+                      },
+                      "startRef": {
+                        "type": "string",
+                        "description": "Alternate spelling of startId"
+                      },
+                      "endRef": {
+                        "type": "string",
+                        "description": "Alternate spelling of endId"
+                      },
+                      "summary": {
+                        "type": "string",
+                        "description": "Self-contained summary replacing the range"
+                      }
+                    },
+                    "anyOf": [
+                      {
+                        "required": [
+                          "startId",
+                          "endId",
+                          "summary"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "startRef",
+                          "endRef",
+                          "summary"
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            "startId": {
+              "type": "string",
+              "description": "Flat single-range form (no content): mNNNNN ref at the start of the range"
+            },
+            "endId": {
+              "type": "string",
+              "description": "Flat single-range form (no content): mNNNNN ref at the end of the range"
+            },
+            "startRef": {
+              "type": "string",
+              "description": "Flat single-range form: alternate spelling of startId"
+            },
+            "endRef": {
+              "type": "string",
+              "description": "Flat single-range form: alternate spelling of endId"
+            },
+            "summary": {
+              "type": "string",
+              "description": "Flat single-range form (no content): self-contained summary replacing the range"
+            }
+          }
+        }
+      },
+      {
+        "type": "function",
+        "name": "decompress",
+        "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "blockId": {
+              "type": "string",
+              "description": "Block ID to decompress (e.g. b5)"
+            },
+            "toFile": {
+              "type": "string",
+              "description": "Optional: write content to file instead of context"
+            },
+            "full": {
+              "type": "boolean",
+              "description": "Restore all the way to original messages"
+            }
+          },
+          "required": [
+            "blockId"
+          ]
+        }
+      },
+      {
+        "type": "function",
+        "name": "search_context",
+        "description": "Search through compressed block summaries by keyword. Use BEFORE decompressing to find the right block.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "Search query"
+            },
+            "limit": {
+              "type": "number",
+              "description": "Max results (default 5)"
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      },
+      {
+        "type": "function",
+        "name": "acp_status",
+        "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next.",
+        "parameters": {
+          "type": "object",
+          "properties": {}
+        }
+      },
+      {
+        "type": "function",
+        "name": "acp_cache",
+        "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and line item. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "detail": {
+              "type": "string",
+              "enum": [
+                "summary",
+                "full"
+              ],
+              "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and line item."
+            }
+          }
+        }
+      }
+    ],
+    "ACP_READONLY_TOOLS_RESPONSES": [
+      {
+        "type": "function",
+        "name": "decompress",
+        "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "blockId": {
+              "type": "string",
+              "description": "Block ID to decompress (e.g. b5)"
+            },
+            "toFile": {
+              "type": "string",
+              "description": "Optional: write content to file instead of context"
+            },
+            "full": {
+              "type": "boolean",
+              "description": "Restore all the way to original messages"
+            }
+          },
+          "required": [
+            "blockId"
+          ]
+        }
+      },
+      {
+        "type": "function",
+        "name": "search_context",
+        "description": "Search through compressed block summaries by keyword. Use BEFORE decompressing to find the right block.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "Search query"
+            },
+            "limit": {
+              "type": "number",
+              "description": "Max results (default 5)"
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      },
+      {
+        "type": "function",
+        "name": "acp_status",
+        "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next.",
+        "parameters": {
+          "type": "object",
+          "properties": {}
+        }
+      },
+      {
+        "type": "function",
+        "name": "acp_cache",
+        "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and line item. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "detail": {
+              "type": "string",
+              "enum": [
+                "summary",
+                "full"
+              ],
+              "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and line item."
+            }
+          }
+        }
+      }
+    ],
+    "ACP_TOOLS_GOOGLE": [
+      {
+        "name": "compress",
+        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. Line form (preferred): content = one STRING per range — first line 'm00150–m00220 optional topic', remaining lines the markdown summary written verbatim (no JSON structure, no escaping). Also accepted: object entries {startId,endId,summary,topic?} in the content array, content as a single string (bare line form or JSON-encoded array), and a flat single-range call {startId,endId,summary,topic?} without content. Use when content is genuinely consumed. REQUIRED — compress without content or flat range fields is invalid.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "topic": {
+              "type": "string",
+              "description": "Optional short title for the compressed range"
+            },
+            "content": {
+              "type": "array",
+              "description": "One or more ranges to compress into separate summary blocks. Object form: {startId,endId,summary,topic?}. A JSON-encoded string of that array is also accepted; in the line form the summary begins with its own first line 'm00150–m00220 optional topic', the rest being the summary markdown verbatim. REQUIRED — compress without content is invalid.",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "topic": {
+                    "type": "string"
+                  },
+                  "startId": {
+                    "type": "string",
+                    "description": "mNNNNN ref at the start of the range"
+                  },
+                  "endId": {
+                    "type": "string",
+                    "description": "mNNNNN ref at the end of the range"
+                  },
+                  "summary": {
+                    "type": "string",
+                    "description": "Self-contained summary replacing the range"
+                  }
+                },
+                "required": [
+                  "startId",
+                  "endId",
+                  "summary"
+                ]
+              }
+            }
+          },
+          "required": [
+            "content"
+          ]
+        }
+      },
+      {
+        "name": "decompress",
+        "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "blockId": {
+              "type": "string",
+              "description": "Block ID to decompress (e.g. b5)"
+            },
+            "toFile": {
+              "type": "string",
+              "description": "Optional: write content to file instead of context"
+            },
+            "full": {
+              "type": "boolean",
+              "description": "Restore all the way to original messages"
+            }
+          },
+          "required": [
+            "blockId"
+          ]
+        }
+      },
+      {
+        "name": "search_context",
+        "description": "Search through compressed block summaries by keyword. Use BEFORE decompressing to find the right block.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "Search query"
+            },
+            "limit": {
+              "type": "number",
+              "description": "Max results (default 5)"
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      },
+      {
+        "name": "acp_status",
+        "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next.",
+        "parameters": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    ]
+  },
+  "individual": {
+    "COMPRESS_TOOL": {
+      "name": "compress",
+      "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. Line form (preferred): content = one STRING per range — first line 'm00150–m00220 optional topic', remaining lines the markdown summary written verbatim (no JSON structure, no escaping). Also accepted: object entries {startId,endId,summary,topic?} in the content array, content as a single string (bare line form or JSON-encoded array), and a flat single-range call {startId,endId,summary,topic?} without content. Use when content is genuinely consumed. REQUIRED — compress without content or flat range fields is invalid.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "topic": {
+            "type": "string",
+            "description": "Optional short title for the compressed range"
+          },
+          "content": {
+            "type": [
+              "array",
+              "string"
+            ],
+            "description": "One or more ranges to compress into separate summary blocks. Array form (preferred): one entry per range — line form (one STRING per range: first line 'm00150–m00220 optional topic', remaining lines the markdown summary verbatim) or object form {startId,endId,summary,topic?}. String form also accepted: bare line-form text, or a JSON-encoded array of ranges (some gateways stringify arrays). REQUIRED unless the flat single-range form is used.",
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "description": "Line form: first line 'm00150–m00220 optional topic', remaining lines the summary markdown, verbatim (no JSON escaping)"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "topic": {
+                      "type": "string"
+                    },
+                    "startId": {
+                      "type": "string",
+                      "description": "mNNNNN ref at the start of the range"
+                    },
+                    "endId": {
+                      "type": "string",
+                      "description": "mNNNNN ref at the end of the range"
+                    },
+                    "startRef": {
+                      "type": "string",
+                      "description": "Alternate spelling of startId"
+                    },
+                    "endRef": {
+                      "type": "string",
+                      "description": "Alternate spelling of endId"
+                    },
+                    "summary": {
+                      "type": "string",
+                      "description": "Self-contained summary replacing the range"
+                    }
+                  },
+                  "anyOf": [
+                    {
+                      "required": [
+                        "startId",
+                        "endId",
+                        "summary"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "startRef",
+                        "endRef",
+                        "summary"
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          },
+          "startId": {
+            "type": "string",
+            "description": "Flat single-range form (no content): mNNNNN ref at the start of the range"
+          },
+          "endId": {
+            "type": "string",
+            "description": "Flat single-range form (no content): mNNNNN ref at the end of the range"
+          },
+          "startRef": {
+            "type": "string",
+            "description": "Flat single-range form: alternate spelling of startId"
+          },
+          "endRef": {
+            "type": "string",
+            "description": "Flat single-range form: alternate spelling of endId"
+          },
+          "summary": {
+            "type": "string",
+            "description": "Flat single-range form (no content): self-contained summary replacing the range"
+          }
+        }
+      }
+    },
+    "COMPRESS_TOOL_OPENAI": {
+      "type": "function",
+      "function": {
+        "name": "compress",
+        "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. Line form (preferred): content = one STRING per range — first line 'm00150–m00220 optional topic', remaining lines the markdown summary written verbatim (no JSON structure, no escaping). Also accepted: object entries {startId,endId,summary,topic?} in the content array, content as a single string (bare line form or JSON-encoded array), and a flat single-range call {startId,endId,summary,topic?} without content. Use when content is genuinely consumed. REQUIRED — compress without content or flat range fields is invalid.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "topic": {
+              "type": "string",
+              "description": "Optional short title for the compressed range"
+            },
+            "content": {
+              "type": [
+                "array",
+                "string"
+              ],
+              "description": "One or more ranges to compress into separate summary blocks. Array form (preferred): one entry per range — line form (one STRING per range: first line 'm00150–m00220 optional topic', remaining lines the markdown summary verbatim) or object form {startId,endId,summary,topic?}. String form also accepted: bare line-form text, or a JSON-encoded array of ranges (some gateways stringify arrays). REQUIRED unless the flat single-range form is used.",
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "description": "Line form: first line 'm00150–m00220 optional topic', remaining lines the summary markdown, verbatim (no JSON escaping)"
+                  },
+                  {
+                    "type": "object",
+                    "properties": {
+                      "topic": {
+                        "type": "string"
+                      },
+                      "startId": {
+                        "type": "string",
+                        "description": "mNNNNN ref at the start of the range"
+                      },
+                      "endId": {
+                        "type": "string",
+                        "description": "mNNNNN ref at the end of the range"
+                      },
+                      "startRef": {
+                        "type": "string",
+                        "description": "Alternate spelling of startId"
+                      },
+                      "endRef": {
+                        "type": "string",
+                        "description": "Alternate spelling of endId"
+                      },
+                      "summary": {
+                        "type": "string",
+                        "description": "Self-contained summary replacing the range"
+                      }
+                    },
+                    "anyOf": [
+                      {
+                        "required": [
+                          "startId",
+                          "endId",
+                          "summary"
+                        ]
+                      },
+                      {
+                        "required": [
+                          "startRef",
+                          "endRef",
+                          "summary"
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            },
+            "startId": {
+              "type": "string",
+              "description": "Flat single-range form (no content): mNNNNN ref at the start of the range"
+            },
+            "endId": {
+              "type": "string",
+              "description": "Flat single-range form (no content): mNNNNN ref at the end of the range"
+            },
+            "startRef": {
+              "type": "string",
+              "description": "Flat single-range form: alternate spelling of startId"
+            },
+            "endRef": {
+              "type": "string",
+              "description": "Flat single-range form: alternate spelling of endId"
+            },
+            "summary": {
+              "type": "string",
+              "description": "Flat single-range form (no content): self-contained summary replacing the range"
+            }
+          }
+        }
+      }
+    },
+    "COMPRESS_TOOL_RESPONSES": {
+      "type": "function",
+      "name": "compress",
+      "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. Line form (preferred): content = one STRING per range — first line 'm00150–m00220 optional topic', remaining lines the markdown summary written verbatim (no JSON structure, no escaping). Also accepted: object entries {startId,endId,summary,topic?} in the content array, content as a single string (bare line form or JSON-encoded array), and a flat single-range call {startId,endId,summary,topic?} without content. Use when content is genuinely consumed. REQUIRED — compress without content or flat range fields is invalid.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "topic": {
+            "type": "string",
+            "description": "Optional short title for the compressed range"
+          },
+          "content": {
+            "type": [
+              "array",
+              "string"
+            ],
+            "description": "One or more ranges to compress into separate summary blocks. Array form (preferred): one entry per range — line form (one STRING per range: first line 'm00150–m00220 optional topic', remaining lines the markdown summary verbatim) or object form {startId,endId,summary,topic?}. String form also accepted: bare line-form text, or a JSON-encoded array of ranges (some gateways stringify arrays). REQUIRED unless the flat single-range form is used.",
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "description": "Line form: first line 'm00150–m00220 optional topic', remaining lines the summary markdown, verbatim (no JSON escaping)"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "topic": {
+                      "type": "string"
+                    },
+                    "startId": {
+                      "type": "string",
+                      "description": "mNNNNN ref at the start of the range"
+                    },
+                    "endId": {
+                      "type": "string",
+                      "description": "mNNNNN ref at the end of the range"
+                    },
+                    "startRef": {
+                      "type": "string",
+                      "description": "Alternate spelling of startId"
+                    },
+                    "endRef": {
+                      "type": "string",
+                      "description": "Alternate spelling of endId"
+                    },
+                    "summary": {
+                      "type": "string",
+                      "description": "Self-contained summary replacing the range"
+                    }
+                  },
+                  "anyOf": [
+                    {
+                      "required": [
+                        "startId",
+                        "endId",
+                        "summary"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "startRef",
+                        "endRef",
+                        "summary"
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+          },
+          "startId": {
+            "type": "string",
+            "description": "Flat single-range form (no content): mNNNNN ref at the start of the range"
+          },
+          "endId": {
+            "type": "string",
+            "description": "Flat single-range form (no content): mNNNNN ref at the end of the range"
+          },
+          "startRef": {
+            "type": "string",
+            "description": "Flat single-range form: alternate spelling of startId"
+          },
+          "endRef": {
+            "type": "string",
+            "description": "Flat single-range form: alternate spelling of endId"
+          },
+          "summary": {
+            "type": "string",
+            "description": "Flat single-range form (no content): self-contained summary replacing the range"
+          }
+        }
+      }
+    },
+    "COMPRESS_TOOL_GOOGLE": {
+      "name": "compress",
+      "description": "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. Line form (preferred): content = one STRING per range — first line 'm00150–m00220 optional topic', remaining lines the markdown summary written verbatim (no JSON structure, no escaping). Also accepted: object entries {startId,endId,summary,topic?} in the content array, content as a single string (bare line form or JSON-encoded array), and a flat single-range call {startId,endId,summary,topic?} without content. Use when content is genuinely consumed. REQUIRED — compress without content or flat range fields is invalid.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "topic": {
+            "type": "string",
+            "description": "Optional short title for the compressed range"
+          },
+          "content": {
+            "type": "array",
+            "description": "One or more ranges to compress into separate summary blocks. Object form: {startId,endId,summary,topic?}. A JSON-encoded string of that array is also accepted; in the line form the summary begins with its own first line 'm00150–m00220 optional topic', the rest being the summary markdown verbatim. REQUIRED — compress without content is invalid.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "topic": {
+                  "type": "string"
+                },
+                "startId": {
+                  "type": "string",
+                  "description": "mNNNNN ref at the start of the range"
+                },
+                "endId": {
+                  "type": "string",
+                  "description": "mNNNNN ref at the end of the range"
+                },
+                "summary": {
+                  "type": "string",
+                  "description": "Self-contained summary replacing the range"
+                }
+              },
+              "required": [
+                "startId",
+                "endId",
+                "summary"
+              ]
+            }
+          }
+        },
+        "required": [
+          "content"
+        ]
+      }
+    },
+    "DECOMPRESS_TOOL": {
+      "name": "decompress",
+      "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "blockId": {
+            "type": "string",
+            "description": "Block ID to decompress (e.g. b5)"
+          },
+          "toFile": {
+            "type": "string",
+            "description": "Optional: write content to file instead of context"
+          },
+          "full": {
+            "type": "boolean",
+            "description": "Restore all the way to original messages"
+          }
+        },
+        "required": [
+          "blockId"
+        ]
+      }
+    },
+    "DECOMPRESS_TOOL_OPENAI": {
+      "type": "function",
+      "function": {
+        "name": "decompress",
+        "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "blockId": {
+              "type": "string",
+              "description": "Block ID to decompress (e.g. b5)"
+            },
+            "toFile": {
+              "type": "string",
+              "description": "Optional: write content to file instead of context"
+            },
+            "full": {
+              "type": "boolean",
+              "description": "Restore all the way to original messages"
+            }
+          },
+          "required": [
+            "blockId"
+          ]
+        }
+      }
+    },
+    "DECOMPRESS_TOOL_RESPONSES": {
+      "type": "function",
+      "name": "decompress",
+      "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "blockId": {
+            "type": "string",
+            "description": "Block ID to decompress (e.g. b5)"
+          },
+          "toFile": {
+            "type": "string",
+            "description": "Optional: write content to file instead of context"
+          },
+          "full": {
+            "type": "boolean",
+            "description": "Restore all the way to original messages"
+          }
+        },
+        "required": [
+          "blockId"
+        ]
+      }
+    },
+    "DECOMPRESS_TOOL_GOOGLE": {
+      "name": "decompress",
+      "description": "Restores previously compressed content. Use when you need exact details lost in compression. By default restores one tier up. Use full:true for all the way to original messages. Use toFile to write to file instead of inflating context.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "blockId": {
+            "type": "string",
+            "description": "Block ID to decompress (e.g. b5)"
+          },
+          "toFile": {
+            "type": "string",
+            "description": "Optional: write content to file instead of context"
+          },
+          "full": {
+            "type": "boolean",
+            "description": "Restore all the way to original messages"
+          }
+        },
+        "required": [
+          "blockId"
+        ]
+      }
+    },
+    "SEARCH_CONTEXT_TOOL": {
+      "name": "search_context",
+      "description": "Search through compressed block summaries by keyword. Use BEFORE decompressing to find the right block.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Search query"
+          },
+          "limit": {
+            "type": "number",
+            "description": "Max results (default 5)"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    },
+    "SEARCH_CONTEXT_TOOL_OPENAI": {
+      "type": "function",
+      "function": {
+        "name": "search_context",
+        "description": "Search through compressed block summaries by keyword. Use BEFORE decompressing to find the right block.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {
+              "type": "string",
+              "description": "Search query"
+            },
+            "limit": {
+              "type": "number",
+              "description": "Max results (default 5)"
+            }
+          },
+          "required": [
+            "query"
+          ]
+        }
+      }
+    },
+    "SEARCH_CONTEXT_TOOL_RESPONSES": {
+      "type": "function",
+      "name": "search_context",
+      "description": "Search through compressed block summaries by keyword. Use BEFORE decompressing to find the right block.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Search query"
+          },
+          "limit": {
+            "type": "number",
+            "description": "Max results (default 5)"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    },
+    "SEARCH_CONTEXT_TOOL_GOOGLE": {
+      "name": "search_context",
+      "description": "Search through compressed block summaries by keyword. Use BEFORE decompressing to find the right block.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Search query"
+          },
+          "limit": {
+            "type": "number",
+            "description": "Max results (default 5)"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    },
+    "ACP_STATUS_TOOL": {
+      "name": "acp_status",
+      "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next.",
+      "input_schema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    "ACP_STATUS_TOOL_OPENAI": {
+      "type": "function",
+      "function": {
+        "name": "acp_status",
+        "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next.",
+        "parameters": {
+          "type": "object",
+          "properties": {}
+        }
+      }
+    },
+    "ACP_STATUS_TOOL_RESPONSES": {
+      "type": "function",
+      "name": "acp_status",
+      "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next.",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    "ACP_STATUS_TOOL_GOOGLE": {
+      "name": "acp_status",
+      "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next.",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    "ACP_CACHE_TOOL": {
+      "name": "acp_cache",
+      "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and line item. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "detail": {
+            "type": "string",
+            "enum": [
+              "summary",
+              "full"
+            ],
+            "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and line item."
+          }
+        }
+      }
+    },
+    "ACP_CACHE_TOOL_OPENAI": {
+      "type": "function",
+      "function": {
+        "name": "acp_cache",
+        "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and line item. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "detail": {
+              "type": "string",
+              "enum": [
+                "summary",
+                "full"
+              ],
+              "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and line item."
+            }
+          }
+        }
+      }
+    },
+    "ACP_CACHE_TOOL_RESPONSES": {
+      "type": "function",
+      "name": "acp_cache",
+      "description": "Prompt-cache reconciliation: grand ledger (total input/cached/output, overall hit rate) with every request's miss split into new content / compression re-pay / upstream-ttl-or-client-rewrite (unattributed stable-prefix misses), plus per-fold economics (breakeven turns vs measured cadence). Defaults to a compact summary (totals + verdicts + anomalies only); pass detail=\"full\" for every fold and line item. Read-only. Call when asked about cache hits, cache invalidation, or what compression costs.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "detail": {
+            "type": "string",
+            "enum": [
+              "summary",
+              "full"
+            ],
+            "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and line item."
+          }
+        }
+      }
+    }
+  },
+  "optional": {
+    "ABSORB_TOOL": {
+      "name": "absorb",
+      "description": "Distill a tool result into a compact summary you write. REQUIRED immediately after a tool result ends with an [ACP absorb] instruction: pass its ref and the distilled essentials (outcome, key values, paths:lines, errors, decisions). The original output is then removed from context; your summary is the durable record.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "ref": {
+            "type": "string",
+            "description": "mNNNNN ref of the tool result to absorb (from the [ACP absorb] instruction)"
+          },
+          "summary": {
+            "type": "string",
+            "description": "Distilled essentials of the tool result — this replaces the original output in context"
+          }
+        },
+        "required": [
+          "ref",
+          "summary"
+        ]
+      }
+    },
+    "ABSORB_TOOL_OPENAI": {
+      "type": "function",
+      "function": {
+        "name": "absorb",
+        "description": "Distill a tool result into a compact summary you write. REQUIRED immediately after a tool result ends with an [ACP absorb] instruction: pass its ref and the distilled essentials (outcome, key values, paths:lines, errors, decisions). The original output is then removed from context; your summary is the durable record.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "ref": {
+              "type": "string",
+              "description": "mNNNNN ref of the tool result to absorb (from the [ACP absorb] instruction)"
+            },
+            "summary": {
+              "type": "string",
+              "description": "Distilled essentials of the tool result — this replaces the original output in context"
+            }
+          },
+          "required": [
+            "ref",
+            "summary"
+          ]
+        }
+      }
+    },
+    "ABSORB_TOOL_GOOGLE": {
+      "name": "absorb",
+      "description": "Distill a tool result into a compact summary you write. REQUIRED immediately after a tool result ends with an [ACP absorb] instruction: pass its ref and the distilled essentials (outcome, key values, paths:lines, errors, decisions). The original output is then removed from context; your summary is the durable record.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "ref": {
+            "type": "string",
+            "description": "mNNNNN ref of the tool result to absorb (from the [ACP absorb] instruction)"
+          },
+          "summary": {
+            "type": "string",
+            "description": "Distilled essentials of the tool result — this replaces the original output in context"
+          }
+        },
+        "required": [
+          "ref",
+          "summary"
+        ]
+      }
+    },
+    "IMAGE_FULL_TOOL": {
+      "name": "image_full",
+      "description": "Restore original-resolution images for a previously downscaled message. Call when you cannot read details (text, colors, alignment) in a reduced image: pass the message ref (\"mNNNNN\") from the [Downscaled screenshots] note. Full resolution applies for the rest of this session.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "ref": {
+            "type": "string",
+            "description": "mNNNNN ref of the message whose image(s) should be restored to full resolution"
+          }
+        },
+        "required": [
+          "ref"
+        ]
+      }
+    },
+    "IMAGE_FULL_TOOL_OPENAI": {
+      "type": "function",
+      "function": {
+        "name": "image_full",
+        "description": "Restore original-resolution images for a previously downscaled message. Call when you cannot read details (text, colors, alignment) in a reduced image: pass the message ref (\"mNNNNN\") from the [Downscaled screenshots] note. Full resolution applies for the rest of this session.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "ref": {
+              "type": "string",
+              "description": "mNNNNN ref of the message whose image(s) should be restored to full resolution"
+            }
+          },
+          "required": [
+            "ref"
+          ]
+        }
+      }
+    },
+    "IMAGE_FULL_TOOL_RESPONSES": {
+      "type": "function",
+      "name": "image_full",
+      "description": "Restore original-resolution images for a previously downscaled message. Call when you cannot read details (text, colors, alignment) in a reduced image: pass the message ref (\"mNNNNN\") from the [Downscaled screenshots] note. Full resolution applies for the rest of this session.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "ref": {
+            "type": "string",
+            "description": "mNNNNN ref of the message whose image(s) should be restored to full resolution"
+          }
+        },
+        "required": [
+          "ref"
+        ]
+      }
+    },
+    "RETRIEVE_TOOL": {
+      "name": "acp_retrieve",
+      "description": "Retrieve the full original text of a stored tool result. REQUIRED when you need details from a placeholder that starts with 📦 [acp-stored #mNNNNN: pass its ref. Returns the exact original text; the placeholder stays in context. Unknown refs return not-found.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "ref": {
+            "type": "string",
+            "description": "mNNNNN ref shown in the 📦 [acp-stored placeholder"
+          }
+        },
+        "required": [
+          "ref"
+        ]
+      }
+    },
+    "RETRIEVE_TOOL_OPENAI": {
+      "type": "function",
+      "function": {
+        "name": "acp_retrieve",
+        "description": "Retrieve the full original text of a stored tool result. REQUIRED when you need details from a placeholder that starts with 📦 [acp-stored #mNNNNN: pass its ref. Returns the exact original text; the placeholder stays in context. Unknown refs return not-found.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "ref": {
+              "type": "string",
+              "description": "mNNNNN ref shown in the 📦 [acp-stored placeholder"
+            }
+          },
+          "required": [
+            "ref"
+          ]
+        }
+      }
+    },
+    "RETRIEVE_TOOL_RESPONSES": {
+      "type": "function",
+      "name": "acp_retrieve",
+      "description": "Retrieve the full original text of a stored tool result. REQUIRED when you need details from a placeholder that starts with 📦 [acp-stored #mNNNNN: pass its ref. Returns the exact original text; the placeholder stays in context. Unknown refs return not-found.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "ref": {
+            "type": "string",
+            "description": "mNNNNN ref shown in the 📦 [acp-stored placeholder"
+          }
+        },
+        "required": [
+          "ref"
+        ]
+      }
+    }
+  }
+}

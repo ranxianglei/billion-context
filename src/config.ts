@@ -1,4 +1,4 @@
-import { defaultConfig, type Config, type Prompts } from "acp-kernel";
+import { defaultConfig, DEFAULT_CCR_CONFIG, type Config, type Prompts } from "acp-kernel";
 import { readFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { configFile } from "./paths.js";
@@ -173,6 +173,40 @@ export type CompressSettings = {
      *  Default: none — opt in per client/agent, since tool names are
      *  client-specific. */
     protectedTools?: string[];
+    /** Tool-name patterns EXCLUDED from the soft-protected recent zone —
+     *  matching tool results inside the recent zone become compressible
+     *  immediately instead of aging out first (kernel
+     *  `neverPreserveRecentTools`, acp-kernel >= 0.0.92). The kernel default
+     *  is `["decompress", "search_context", "read", "bash"]`: read/bash are
+     *  the largest reclaimable mass, so fresh results SHOULD re-enter the
+     *  foldable pool right away. Removing a pattern (recommended: only
+     *  `read`, → `["decompress", "search_context", "bash"]`) keeps freshly
+     *  read files inside the recent zone so batch-read workflows stop hitting
+     *  the fold→re-read death loop (#1198/#1277) — the results age out of the
+     *  zone by position later instead of being pinned forever (unlike
+     *  `protectedLatestTools`). Keep `decompress`/`search_context` excluded:
+     *  re-including them pins just-restored blocks in the recent zone where
+     *  they become unreclaimable — a different disease (#1277 owner note).
+     *  ⚠ Empty array `[]` is VALID and excludes nothing (max-protection
+     *  escape hatch); unlike `protectedTools`/`protectedLatestTools` an empty
+     *  array is not rejected. Unset → kernel built-in default list. Patterns
+     *  match like kernel tool patterns (exact name or `*` glob). Deepest
+     *  level wins (global → provider → model), whole-array replace. */
+    neverPreserveRecentTools?: string[];
+    /** Tool-name patterns REMOVED from the effective recent-zone exclusion
+     *  list — the positive-facing knob: "protect these tools in the recent
+     *  zone" without restating the built-in list (kernel
+     *  `preserveRecentTools`, acp-kernel >= 0.0.93). Effective exclusion =
+     *  `(neverPreserveRecentTools ?? kernel built-in) minus
+     *  preserveRecentTools`, so the #1198/#1277 batch-read fold→re-read
+     *  remedy is a one-entry `[
+     *  "read"]` that keeps following built-in list evolution — no hand-copied
+     *  list to go stale. Composable with an explicit `neverPreserveRecentTools`
+     *  (subtraction applies to it too). Unset/empty = no subtraction — NOT
+     *  the protect-everything hatch (that is `neverPreserveRecentTools: []`).
+     *  Patterns match like kernel tool patterns (exact name or `*` glob).
+     *  Deepest level wins (global → provider → model), whole-array replace. */
+    preserveRecentTools?: string[];
     /** Emit 📦/❌ ACP visibility markers after proxy tool executions
      *  (compress / decompress / search_context / acp_status) — both the marker
      *  line streamed to the client and the marker message re-injected into
@@ -363,15 +397,44 @@ const CONTEXT_LIMIT_TABLE: Array<{ match: RegExp; limit: number }> = [
     { match: /^llama-/i, limit: 200_000 },
 ];
 
-export function lookupContextLimit(model: string | undefined): number | undefined {
-    if (!model) return undefined;
-    // Relay/vLLM deployments serve models under "prefix/name" ids that miss
-    // every ^-anchored pattern ("meta-llama/Llama-4" vs /^llama-/i). Try the
-    // bare basename too; the full name keeps precedence (#736).
+// Relay/vLLM deployments serve models under "prefix/name" ids that miss
+// every ^-anchored pattern ("meta-llama/Llama-4" vs /^llama-/i). Try the bare
+// basename too; the full name keeps precedence (#736).
+function modelRoots(model: string): string[] {
     const roots = [model];
     const slash = model.lastIndexOf("/");
     if (slash > 0 && slash < model.length - 1) roots.push(model.slice(slash + 1));
-    for (const root of roots) {
+    return roots;
+}
+
+export function lookupContextLimit(model: string | undefined): number | undefined {
+    if (!model) return undefined;
+    for (const root of modelRoots(model)) {
+        for (const entry of CONTEXT_LIMIT_TABLE) {
+            if (entry.match.test(root)) return entry.limit;
+        }
+    }
+    return undefined;
+}
+
+// #1321: model families where ONE id serves multiple context tiers and the
+// larger tier requires explicit per-request negotiation — Anthropic's
+// context-Nm beta header or an [Nm]-suffixed model name. models.dev
+// advertises the MAX tier, but a plain plan serves the standard window until
+// that negotiation happens; budgeting against the advertised max pushes every
+// percentage threshold beyond the client's own wall (#1310 item 2 → #1321).
+// The proxy caps registry-derived windows at the built-in standard window for
+// these families when no tier evidence is present. Every other family keeps
+// fresher-source-wins (#344/#852): a stale-low table entry must never pin a
+// grown registry window.
+const TIER_GATED_FAMILIES: Array<{ match: RegExp }> = [
+    { match: /^claude-/i },
+];
+
+export function tierGatedStandardWindow(model: string | undefined): number | undefined {
+    if (!model) return undefined;
+    for (const root of modelRoots(model)) {
+        if (!TIER_GATED_FAMILIES.some((fam) => fam.match.test(root))) continue;
         for (const entry of CONTEXT_LIMIT_TABLE) {
             if (entry.match.test(root)) return entry.limit;
         }
@@ -583,6 +646,103 @@ export function passthroughState(env: NodeJS.ProcessEnv): { enabled: boolean; so
     return { enabled: filePassthrough, source: filePassthrough ? "file" : null };
 }
 
+// #1359: provider/model absorb.* overrides apply only to the proxy lane (plugin
+// lane follows the base block). Warn once per load so the divergence isn't silent.
+const ABSORB_DIVERGENCE_FIELDS = ["enabled", "toolName", "minToolTokens", "contextThresholdPct", "excludeTools"] as const;
+const seenAbsorbDivergenceWarnings = new Set<string>();
+
+function normAbsorbValue(field: string, v: unknown): unknown {
+    if (field === "contextThresholdPct" && typeof v === "string") {
+        const m = v.match(/^(-?\d+(?:\.\d+)?)\s*%$/);
+        if (m) return Number(m[1]) / 100;
+    }
+    return v;
+}
+
+export function findAbsorbPluginDivergences(routes: ProviderRoutes, baseAbsorb?: CompressSettings["absorb"]): string[] {
+    const out: string[] = [];
+    const check = (scope: string, level?: CompressSettings["absorb"]) => {
+        if (!level) return;
+        for (const field of ABSORB_DIVERGENCE_FIELDS) {
+            if (level[field] === undefined) continue;
+            if (JSON.stringify(normAbsorbValue(field, level[field])) !== JSON.stringify(normAbsorbValue(field, baseAbsorb?.[field]))) {
+                out.push(`${scope}.absorb.${field}=${JSON.stringify(level[field])} (base=${JSON.stringify(baseAbsorb?.[field])})`);
+            }
+        }
+    };
+    for (const [url, route] of Object.entries(routes)) {
+        check(url, route.compress?.absorb);
+        for (const [model, entry] of Object.entries(route.models ?? {})) check(`${url}/${model}`, entry.compress?.absorb);
+    }
+    return out;
+}
+
+function warnAbsorbPluginDivergences(routes: ProviderRoutes, baseAbsorb?: CompressSettings["absorb"]): void {
+    const divs = findAbsorbPluginDivergences(routes, baseAbsorb);
+    if (divs.length === 0) return;
+    const sig = divs.join("\u0000");
+    if (seenAbsorbDivergenceWarnings.has(sig)) return;
+    seenAbsorbDivergenceWarnings.add(sig);
+    loggerLog("warn", `[acp-config] provider/model absorb override diverges from base [${divs.join("; ")}] — plugin-mode sessions follow the base value, proxy-mode sessions honor the override (#1359)`);
+}
+
+
+/** [#1345] A provider/model-level `ccr` field that diverges from what plugin
+ *  sessions actually execute. In plugin mode the static manifest is the ONLY
+ *  declaration of the retrieve surface, so the whole ccr block follows the base
+ *  config; such overrides only take effect on proxy-mode sessions. */
+export interface CcrOverrideDivergence {
+    /** Where the override lives, e.g. "provider https://api.x.com" or "provider https://api.x.com model gpt-4". */
+    level: string;
+    field: "enabled" | "toolName" | "minToolTokens" | "excludeTools" | "maxHeadChars";
+    value: unknown;
+    effective: unknown;
+}
+
+const CCR_FIELDS = ["enabled", "toolName", "minToolTokens", "excludeTools", "maxHeadChars"] as const;
+
+/** Pure: list every provider/model ccr field that would be ignored in plugin
+ *  sessions (base config governs there). Empty when base ccr is not enabled —
+ *  no plugin session can arm then, so nothing diverges (#1273 keeps
+ *  route-scoped-only enablement proxy-mode-only by design). */
+export function findCcrPluginDivergences(routes: ProviderRoutes, globalCompress?: CompressSettings): CcrOverrideDivergence[] {
+    const base = globalCompress?.ccr;
+    if (base?.enabled !== true) return [];
+    const out: CcrOverrideDivergence[] = [];
+    const report = (level: string, ccr?: CompressSettings["ccr"]): void => {
+        if (!ccr) return;
+        for (const f of CCR_FIELDS) {
+            if (!(f in ccr)) continue;
+            const value = ccr[f];
+            const effective = base[f] ?? DEFAULT_CCR_CONFIG[f];
+            const differs = Array.isArray(value) && Array.isArray(effective)
+                ? JSON.stringify(value) !== JSON.stringify(effective)
+                : value !== effective;
+            if (differs) out.push({ level, field: f, value, effective });
+        }
+    };
+    for (const [url, route] of Object.entries(routes)) {
+        report(`provider ${url}`, route.compress?.ccr);
+        for (const [model, entry] of Object.entries(route.models ?? {})) {
+            report(`provider ${url} model ${model}`, entry.compress?.ccr);
+        }
+    }
+    return out;
+}
+
+function formatCcrValue(v: unknown): string {
+    return typeof v === "string" ? `"${v}"` : JSON.stringify(v);
+}
+
+/** Log every #1345 divergence once per config load (called from loadOptions;
+ *  hot-reload funnels through it too — see handleConfigReload). */
+function warnCcrPluginDivergences(routes: ProviderRoutes, globalCompress?: CompressSettings): void {
+    for (const dv of findCcrPluginDivergences(routes, globalCompress)) {
+        loggerLog("warn", `[acp-config] ccr override ignored in plugin sessions: ${dv.level} ccr.${dv.field}=${formatCcrValue(dv.value)} — plugin sessions use ${formatCcrValue(dv.effective)} (base config governs the plugin manifest surface, #1345); proxy-mode sessions honor the override`);
+    }
+
+}
+
 export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions {
     // --- Source 1: JSON config file (~/.config/billion-context/billion-context.json) ---
     // The canonical, user-editable config. Loaded first so env vars below can
@@ -598,6 +758,8 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
     const host = rawHost === "localhost" ? "127.0.0.1" : rawHost;
     const upstream = (env.ACP_UPSTREAM ?? fileConfig.upstream ?? "https://api.anthropic.com").replace(/\/$/, "");
     const routes = loadRoutes(env);
+    warnAbsorbPluginDivergences(routes, fileConfig.compress?.absorb);
+    warnCcrPluginDivergences(routes, fileConfig.compress);
     const passthrough = passthroughState(env);
     const modelContextLimit = parseInt(env.ACP_MODEL_CONTEXT_LIMIT ?? `${fileConfig.modelContextLimit ?? 200000}`, 10);
     const biliProxy = nonEmpty(env.BILI_UPSTREAM_PROXY);
@@ -717,6 +879,17 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
     };
 }
 
+/** The resolved mitm.domains tier exactly as loadOptions computes it (config
+ *  file ∪ BILI_MITM_DOMAINS, deduped). Exported so launchers can mirror the
+ *  precise whitelist their proxy child will use when deciding MITM vs blind
+ *  tunnel (#1403) — pass the env the CHILD will see, not process.env. */
+export function resolveMitmDomains(env: NodeJS.ProcessEnv): string[] {
+    return dedupeDomains([
+        ...(loadConfigFile().mitm?.domains ?? []),
+        ...splitCsv(env.BILI_MITM_DOMAINS),
+    ]);
+}
+
 /** Shape of the optional JSON config file. All fields optional — the file is a
  *  pure override layer; anything unset falls through to defaults. */
 type FileConfig = {
@@ -784,6 +957,13 @@ type FileConfig = {
      *  brings a proxy up on. Default CLAUDE_NATIVE_DEFAULT_PORT; env
      *  BILI_CLAUDE_NATIVE_PORT wins over both. */
     claude?: { nativePort?: number };
+    /** Native-hook attach policy (#1335): set `true` to let native hooks
+     *  attach to lifecycle-less listeners (a manually started `bili start`
+     *  daemon — no session-lifecycle watchdog, outlives every session, often
+     *  an older code version). Default false: hooks self-manage and spawn
+     *  their own armed session proxy instead (#1322). Env
+     *  BILI_NATIVE_ATTACH_EXTERNAL=1/0 wins over the file. */
+    native?: { attachExternal?: boolean };
 };
 
 function nonEmpty(value: string | undefined): string | undefined {
@@ -833,6 +1013,18 @@ export function resolveClaudeNativePort(env: NodeJS.ProcessEnv = process.env): n
     const fromFile = loadConfigFile().claude?.nativePort;
     if (typeof fromFile === "number" && Number.isInteger(fromFile) && fromFile > 0 && fromFile < 65536) return fromFile;
     return CLAUDE_NATIVE_DEFAULT_PORT;
+}
+
+/** #1335: the native-hook attach-gate escape hatch. True when the user
+ *  deliberately runs lifecycle-less resident daemons for native hooks to ride:
+ *  env BILI_NATIVE_ATTACH_EXTERNAL (1/true vs 0/false) wins over the file's
+ *  `native.attachExternal`, which must be exactly `true` (any other value —
+ *  including garbage — leaves the gate closed). Default false. */
+export function resolveNativeAttachExternal(env: NodeJS.ProcessEnv = process.env): boolean {
+    const fromEnv = (env.BILI_NATIVE_ATTACH_EXTERNAL ?? "").trim().toLowerCase();
+    if (fromEnv === "1" || fromEnv === "true") return true;
+    if (fromEnv === "0" || fromEnv === "false") return false;
+    return loadConfigFile().native?.attachExternal === true;
 }
 
 /** Persist the claude-native port the installer baked into settings.json
@@ -1013,6 +1205,22 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
         const v = obj[key];
         if (!Array.isArray(v) || v.length === 0 || v.some((x) => typeof x !== "string" || x.trim().length === 0)) ok = false;
         else (out as Record<string, unknown>)[key] = (v as string[]).map((x) => x.trim());
+    }
+    // neverPreserveRecentTools keeps the kernel semantics that an explicit
+    // empty array is meaningful (excludes nothing — the #1198/#1277 escape
+    // hatch), so unlike the two protectedTools knobs an empty array passes.
+    if ("neverPreserveRecentTools" in obj && obj.neverPreserveRecentTools !== undefined) {
+        const v = obj.neverPreserveRecentTools;
+        if (!Array.isArray(v) || v.some((x) => typeof x !== "string" || x.trim().length === 0)) ok = false;
+        else out.neverPreserveRecentTools = (v as string[]).map((x) => x.trim());
+    }
+    // preserveRecentTools is a pure no-op when empty, so — like the
+    // protectedTools knobs — an empty array is rejected (a bare [] here is
+    // almost certainly a typo for neverPreserveRecentTools: []).
+    if ("preserveRecentTools" in obj && obj.preserveRecentTools !== undefined) {
+        const v = obj.preserveRecentTools;
+        if (!Array.isArray(v) || v.length === 0 || v.some((x) => typeof x !== "string" || x.trim().length === 0)) ok = false;
+        else out.preserveRecentTools = (v as string[]).map((x) => x.trim());
     }
     if ("stripImages" in obj) {
         if (typeof obj.stripImages !== "boolean") ok = false;

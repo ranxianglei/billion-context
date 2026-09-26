@@ -55,6 +55,9 @@ test("#1026: hint names the raw span past the highest ACTIVE block boundary", ()
     const hint = compressibleSpanHint(ctx.session.state);
     assert.ok(hint.includes("m00021–m00080"), `span past boundary: ${hint}`);
     assert.ok(hint.includes("inside active blocks"), `explains the covered prefix: ${hint}`);
+    // #1366: the covered-prefix claim must stay hedged — blocks need not be contiguous,
+    // and a flat "everything up to N" misled a model into skipping a live gap.
+    assert.ok(hint.includes("isolated free gaps may still exist"), `gap hedge present: ${hint}`);
 });
 
 test("#1026: INACTIVE blocks (decompressed) do not hold the boundary", () => {

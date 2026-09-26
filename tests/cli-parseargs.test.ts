@@ -33,3 +33,30 @@ test("parseArgs: -F composes with other bili flags before the client (#346)", ()
     assert.equal(r.overrides.BILI_UPSTREAM_PROXY, "http://127.0.0.1:7897");
     assert.deepEqual(r.clientArgs, []);
 });
+
+test("parseArgs: acp-cache diff takes dump-dir and its flags (#1266)", () => {
+    const r = parseArgs(["acp-cache", "diff", "/some/dir", "--json", "--log", "/x/log", "--session", "abc"]);
+    assert.equal(r.command, "acp-cache");
+    assert.equal(r.acpCacheDir, "/some/dir");
+    assert.equal(r.jsonOutput, true);
+    assert.equal(r.acpCacheLog, "/x/log");
+    assert.equal(r.acpCacheSession, "abc");
+});
+
+test("parseArgs: acp-cache diff --no-log (#1266)", () => {
+    const r = parseArgs(["acp-cache", "diff", "/some/dir", "--no-log"]);
+    assert.equal(r.command, "acp-cache");
+    assert.equal(r.acpCacheDir, "/some/dir");
+    assert.equal(r.acpCacheNoLog, true);
+});
+
+// #1235: `bili doctor` is a first-class command; --json selects the
+// machine-readable report.
+test("parseArgs: doctor is a command and --json sets doctorJson (#1235)", () => {
+    const r = parseArgs(["doctor"]);
+    assert.equal(r.command, "doctor");
+    assert.equal(r.doctorJson, false);
+    const j = parseArgs(["--json", "doctor"]);
+    assert.equal(j.command, "doctor");
+    assert.equal(j.doctorJson, true);
+});

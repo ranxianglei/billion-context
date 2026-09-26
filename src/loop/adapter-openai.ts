@@ -248,8 +248,32 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
             // So: buffer EVERYTHING, decide once at finish.
             const rawToolChunks: { json: string; parsed: Record<string, unknown> }[] = [];
             let sawRealToolCall = false;
+            // #1306: pure accumulation of one frame's tool_call fragments. Runs
+            // BEFORE the finish_reason settle so arguments sharing a chunk with
+            // finish_reason reach the settle (a settle-first order flushed the
+            // call with truncated args, cleared pending, and re-buffered the
+            // fragment as a nameless orphan the [DONE] settle dropped).
+            const absorbToolCallDeltas = (tcs: Array<Record<string, unknown>>): void => {
+                for (const tc of tcs) {
+                    const idx = typeof tc.index === "number" ? tc.index : 0;
+                    const fn = tc.function as Record<string, unknown> | undefined;
+                    const name = typeof fn?.name === "string" ? fn.name : "";
+                    const id = typeof tc.id === "string" ? tc.id : "";
+                    const rawArgs = fn?.arguments;
+                    const args = typeof rawArgs === "string" ? rawArgs : (rawArgs !== null && typeof rawArgs === "object" ? JSON.stringify(rawArgs) : "");
+                    let buf = pending.get(idx);
+                    if (!buf) {
+                        buf = { index: idx, id, name, arguments: args };
+                        pending.set(idx, buf);
+                    } else {
+                        if (id) buf.id = id;
+                        buf.name += name;
+                        buf.arguments += args;
+                    }
+                }
+            };
             const flushPendingAsStructured = function* (): Generator<ParsedStreamEvent> {
-                for (const [, tc] of pending) {
+                for (const [idx, tc] of pending) {
                     if (tc.name.length > 0 || tc.id.length > 0) {
                         toolCallsEmitted++;
                         // #1039 invariant: arguments are user intent, verbatim — see tag-echo-filter.ts header.
@@ -259,6 +283,8 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                             callId: tc.id,
                             arguments: tc.arguments,
                         } as ParsedStreamEvent;
+                    } else if (tc.arguments.length > 0) {
+                        loggerLog("warn", `[acp-openai] dropping orphan tool_call buffer idx=${idx} argsLen=${tc.arguments.length} (#1306)`);
                     }
                 }
                 pending.clear();
@@ -383,6 +409,8 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                 }
                 const delta = choice.delta as Record<string, unknown> | undefined;
                 const finishReason = typeof choice.finish_reason === "string" ? choice.finish_reason : undefined;
+                const frameToolCalls = delta?.tool_calls as Array<Record<string, unknown>> | undefined;
+                if (frameToolCalls) absorbToolCallDeltas(frameToolCalls);
 
                 if (finishReason) {
                     yield* flushFilter();
@@ -424,26 +452,8 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                     yield { kind: "reasoning", delta: delta.reasoning_content, raw: finishReason ? stripFinishReasonChunk(rawBuf) : rawBuf } as ParsedStreamEvent;
                 }
 
-                if (delta.tool_calls) {
-                    const tcs = delta.tool_calls as Array<Record<string, unknown>>;
+                if (frameToolCalls) {
                     rawToolChunks.push({ json: jsonStr, parsed });
-                    for (const tc of tcs) {
-                        const idx = typeof tc.index === "number" ? tc.index : 0;
-                        const fn = tc.function as Record<string, unknown> | undefined;
-                        const name = typeof fn?.name === "string" ? fn.name : "";
-                        const id = typeof tc.id === "string" ? tc.id : "";
-                        const rawArgs = fn?.arguments;
-                        const args = typeof rawArgs === "string" ? rawArgs : (rawArgs !== null && typeof rawArgs === "object" ? JSON.stringify(rawArgs) : "");
-                        let buf = pending.get(idx);
-                        if (!buf) {
-                            buf = { index: idx, id, name, arguments: args };
-                            pending.set(idx, buf);
-                        } else {
-                            if (id) buf.id = id;
-                            buf.name += name;
-                            buf.arguments += args;
-                        }
-                    }
                     if (typeof delta.content === "string" && delta.content.length > 0) {
                         const clean = tagFilter.push(delta.content);
                         if (clean.length > 0) {

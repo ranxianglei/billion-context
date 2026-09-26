@@ -41,7 +41,7 @@
 // available on all observed surfaces.
 
 import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../compress-tool.js";
-import { fetchProxyVersion, fetchStatus, forwardTool, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary, reportRuntimeInfoOnChange } from "./shared.js";
+import { fetchProxyVersion, fetchStatus, forwardTool, postIdentityRegister, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary, reportRuntimeInfoOnChange } from "./shared.js";
 
 // OpenCode V2 TUI renders a synthetic message as a visible Notice row only when its display text fits the
 // timeline cap (~1KB): longer text renders nothing (#880). Panels go to description verbatim under the cap.
@@ -157,6 +157,8 @@ export interface OpencodeV2SetupOptions {
      *  proxy (idempotent on already-routed URLs) and sets state.proxyBase
      *  when traffic is routed. Absent in launcher mode (no routing). */
     route?: (e: V2HttpRequestEvent, state: V2State) => void | Promise<void>;
+    /** #1362: cooldown between failed derived-session register attempts (tests inject). */
+    derivedRetryMs?: number;
 }
 
 export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ctx: V2PluginContext) => Promise<() => void> {
@@ -164,6 +166,35 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
         const ac = new AbortController();
         const state: V2State = {};
         const registrations: V2Registration[] = [];
+
+        // #1362: derived-session inheritance for the V2 lane (same register
+        // channel as pi/omp/V1, #1333). Parents are learned from
+        // session.created events (wire shape probed on @opencode/cli 2.0.3:
+        // data.sessionID + optional data.parentID); each derived sid is then
+        // identity-registered once by its first stamped request. Fire-and-forget
+        // with per-sid cooldown after failure; root sessions never report.
+        const derivedParent = new Map<string, string>();
+        const derivedReported = new Map<string, "pending" | "done">();
+        const derivedRetryAt = new Map<string, number>();
+        const derivedRetryMs = options.derivedRetryMs ?? 10000;
+        const reportDerived = (sid: string): void => {
+            const base = state.proxyBase;
+            if (!base || !sid || derivedReported.has(sid)) return;
+            const retryAt = derivedRetryAt.get(sid);
+            if (retryAt !== undefined && Date.now() < retryAt) return;
+            const parent = derivedParent.get(sid);
+            if (parent === undefined) return;
+            derivedReported.set(sid, "pending");
+            void postIdentityRegister(base, sid, "opencode", parent).then(
+                () => {
+                    derivedReported.set(sid, "done");
+                },
+                () => {
+                    derivedReported.delete(sid);
+                    derivedRetryAt.set(sid, Date.now() + derivedRetryMs);
+                },
+            );
+        };
 
         const stampHeaders = (e: V2HttpRequestEvent): void => {
             const headers = e.request?.headers;
@@ -185,6 +216,7 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                 headers.set("x-bili-plugin-model", model.id);
                 reportRuntimeInfoOnChange(state.proxyBase, { agent: "opencode", model: model.id, contextWindow: window, maxOutput: output, source: "client-config" });
             }
+            reportDerived(sid);
         };
 
         const httpRequestHook = async (e: V2HttpRequestEvent): Promise<void> => {
@@ -370,6 +402,17 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
             void (async () => {
                 try {
                     for await (const evt of subscription) {
+                        // #1362: child sessions announce their parent here
+                        // (@opencode/cli 2.0.3 wire shape: data.sessionID +
+                        // optional data.parentID); reportDerived registers the
+                        // link on the child's first stamped request.
+                        if (evt?.type === "session.created") {
+                            const data = evt.data;
+                            const sid = data && typeof data.sessionID === "string" ? data.sessionID : "";
+                            const parent = data && typeof data.parentID === "string" ? data.parentID : "";
+                            if (sid && parent && parent !== sid) derivedParent.set(sid, parent);
+                            continue;
+                        }
                         if (evt?.type !== "session.compaction.ended" || pluginDisabled()) continue;
                         const data = evt.data;
                         const cid = data && typeof data.sessionID === "string" ? data.sessionID : "";

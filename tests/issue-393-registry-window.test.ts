@@ -30,6 +30,12 @@ import { setLogCapture } from "../src/logger.ts";
 //      1M in the snapshot, claude-opus-5-thinking resolved to 200K);
 //   4. the overflow self-heal only lowered the window, never raised it
 //      (this learner was later removed wholesale in #987).
+// #1321 later refined the claude expectation: WITHOUT tier evidence (context-Nm
+// beta header / [Nm] suffix) the registry-advertised max is capped at the
+// built-in 200K standard window — see issue1321-tier-window-cap.test.ts. The
+// hostless-lookup coverage below therefore rides a non-tier-gated model
+// (openai/gpt-5.4, registry 1,050,000 vs the 400K table row), which only the
+// registry can produce.
 
 const ONE_M = 1_000_000;
 
@@ -119,14 +125,40 @@ test("#393: bundledSnapshotLookup resolves the -thinking variant to the base mod
 
 // --- Fix 1 + 3 (integration): --upstream mode (host=undefined) resolves the registry ---
 
-test("#393: --upstream mode (no /bili/ prefix) resolves claude-opus-5(-thinking) to 1M", async () => {
+test("#393: --upstream mode (no /bili/ prefix) still runs the models.dev lookup", async () => {
     setRegistryForTest(bundledRegistryForTestsOnly()!);
     const rig = await startRig();
     try {
         // No /bili/ prefix and no MITM -> route=undefined -> host=undefined.
-        // The registry lookup must still run (Fix 1) and normalize the variant (Fix 3).
+        // The registry lookup must still run (Fix 1): openai/gpt-5.4 sits at
+        // 1,050,000 in the snapshot vs the 400K built-in row — only the
+        // registry can produce it (non-tier-gated family, so #1321's tier cap
+        // leaves it alone).
+        const sid = "upstream-gpt";
+        const r = await fetch(`http://127.0.0.1:${rig.proxyPort}/v1/messages`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": sid, "x-bili-plugin": "test-agent" },
+            body: body("gpt-5.4"),
+        });
+        assert.equal(r.status, 200);
+        await r.text();
+        const sess = listSessions().find((s) => s.id === sid);
+        assert.equal(sess?.metadata.effectiveContextLimit, 1_050_000, "gpt-5.4 -> registry 1,050,000 in --upstream mode");
+    } finally {
+        await closeRig(rig);
+    }
+});
+
+test("#1321: --upstream mode caps tier-gated claude at the standard window without tier evidence", async () => {
+    setRegistryForTest(bundledRegistryForTestsOnly()!);
+    const rig = await startRig();
+    try {
+        // claude-opus-5 is 1M in the snapshot, but a plain request carries no
+        // tier evidence (context-Nm beta header / [Nm] suffix) — the client's
+        // plan serves the standard 200K, so the advertised max is capped
+        // (#1321). Variant normalization (Fix 3) still applies before the cap.
         for (const model of ["claude-opus-5", "claude-opus-5-thinking"]) {
-            const sid = `upstream-${model}`;
+            const sid = `tier-${model}`;
             const r = await fetch(`http://127.0.0.1:${rig.proxyPort}/v1/messages`, {
                 method: "POST",
                 headers: { "content-type": "application/json", "x-acp-session": sid, "x-bili-plugin": "test-agent" },
@@ -135,8 +167,19 @@ test("#393: --upstream mode (no /bili/ prefix) resolves claude-opus-5(-thinking)
             assert.equal(r.status, 200);
             await r.text();
             const sess = listSessions().find((s) => s.id === sid);
-            assert.equal(sess?.metadata.effectiveContextLimit, ONE_M, `${model} -> 1M in --upstream mode`);
+            assert.equal(sess?.metadata.effectiveContextLimit, 200_000, `${model} -> standard 200K without tier evidence`);
         }
+        // Same request WITH the beta header → the negotiated 1M stands.
+        const sid = "tier-beta";
+        const r = await fetch(`http://127.0.0.1:${rig.proxyPort}/v1/messages`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-acp-session": sid, "x-bili-plugin": "test-agent", "anthropic-beta": "context-1m-2025-08-07" },
+            body: body("claude-opus-5"),
+        });
+        assert.equal(r.status, 200);
+        await r.text();
+        const sess = listSessions().find((s) => s.id === sid);
+        assert.equal(sess?.metadata.effectiveContextLimit, ONE_M, "beta header -> negotiated 1M honored");
     } finally {
         await closeRig(rig);
     }
@@ -148,15 +191,19 @@ test("#393: wire mode (no x-bili-plugin) also records effectiveContextLimit", as
     setRegistryForTest(bundledRegistryForTestsOnly()!);
     const rig = await startRig();
     try {
+        // gpt-5.4 resolves to a registry-derived value (1,050,000), not the
+        // table's 400K — so this assertion still proves the recorded number is
+        // the FULLY resolved window rather than a hardcoded/table fallback
+        // (the original Fix 2 bug), independent of #1321's claude cap.
         const r = await fetch(`http://127.0.0.1:${rig.proxyPort}/v1/messages`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-acp-session": "wire-sess" },
-            body: body("claude-opus-5"),
+            body: body("gpt-5.4"),
         });
         assert.equal(r.status, 200);
         await r.text();
         const sess = listSessions().find((s) => s.id === "wire-sess");
-        assert.equal(sess?.metadata.effectiveContextLimit, ONE_M, "wire-mode session records the resolved window");
+        assert.equal(sess?.metadata.effectiveContextLimit, 1_050_000, "wire-mode session records the resolved window");
     } finally {
         await closeRig(rig);
     }
