@@ -2690,12 +2690,18 @@ function proxyStartArgs(opts: LaunchOptions): string[] {
  *  Node CLI, process.execPath is correct; inside a host process (the opencode
  *  or pi native binary) it is the HOST executable — spawning it with a .js
  *  argv passes the script to the wrong program. A live Node always wins, then
- *  an explicit BILLION_CONTEXT_NODE override, then a PATH search. */
+ *  an explicit BILLION_CONTEXT_NODE override, then a PATH search, then #1429:
+ *  well-known install locations a GUI/Electron host's minimal PATH (launchd on
+ *  macOS, the Windows GUI session) omits, then — as a last resort under an
+ *  Electron host — the host's own binary run as Node via ELECTRON_RUN_AS_NODE=1
+ *  (the runAsNode fuse, on by default in standard builds; ensureProxyRunning
+ *  forces that var into the child env). */
 export function resolveNodeRuntime(
     execPath: string = process.execPath,
     env: NodeJS.ProcessEnv = process.env,
     platform: NodeJS.Platform = process.platform,
     existsImpl: (p: string) => boolean = fs.existsSync,
+    electronVersion: string | undefined = typeof process.versions.electron === "string" ? process.versions.electron : undefined,
 ): string {
     const base = path.basename(execPath).toLowerCase();
     if (base === "node" || base === "node.exe") return execPath;
@@ -2706,7 +2712,27 @@ export function resolveNodeRuntime(
     // path.join, or the candidates no longer match what existsImpl expects.
     const sep = platform === "win32" ? ";" : ":";
     const names = platform === "win32" ? ["node.exe"] : ["node"];
-    for (const dir of (env.PATH ?? "").split(sep)) {
+    // #1429: after PATH, probe install locations a GUI/Electron host's minimal
+    // PATH (launchd on macOS / the Windows GUI session) omits. A real node
+    // found here still wins over the Electron-binary-as-node fallback below.
+    const home = platform === "win32" ? env.USERPROFILE ?? "" : env.HOME ?? "";
+    const voltaHome = platform === "win32"
+        ? env.VOLTA_HOME ?? (home ? home + "/Tools/volta" : "")
+        : home ? home + "/.volta" : "";
+    const extraDirs = platform === "win32"
+        ? [
+            "C:/Program Files/nodejs",
+            env.LOCALAPPDATA ? env.LOCALAPPDATA + "/Programs/nodejs" : "",
+            voltaHome ? voltaHome + "/bin" : "",
+          ]
+        : [
+            "/usr/local/bin",
+            "/opt/homebrew/bin",
+            "/opt/local/bin",
+            voltaHome ? voltaHome + "/bin" : "",
+            home ? home + "/.local/bin" : "",
+          ];
+    for (const dir of [...(env.PATH ?? "").split(sep), ...extraDirs]) {
         if (!dir) continue;
         for (const name of names) {
             // separator-preserving concatenation: never normalize — win32
@@ -2717,6 +2743,11 @@ export function resolveNodeRuntime(
             if (existsImpl(candidate)) return candidate;
         }
     }
+    // #1429: last resort inside an Electron host — its own binary runs as plain
+    // Node when ELECTRON_RUN_AS_NODE=1 is honored. Only reached when NO real
+    // node exists anywhere above; ensureProxyRunning forces that var so the
+    // child actually runs Node instead of relaunching the desktop app.
+    if (electronVersion && electronVersion.length > 0) return execPath;
     throw new Error("bili: cannot find a Node runtime to spawn the proxy (this process is not Node) — set BILLION_CONTEXT_NODE");
 }
 
@@ -2877,6 +2908,10 @@ export async function ensureProxyRunning(
                     env: {
                         ...stripInheritedProxy(process.env),
                         ...captureInheritedProxyEnv(process.env),
+                        // #1429: inside an Electron host the resolved runtime may be this
+                        // same binary run as Node — force it so the child runs Node instead
+                        // of relaunching the desktop app. Harmless to a real node (ignored).
+                        ...(process.versions.electron ? { ELECTRON_RUN_AS_NODE: "1" } : {}),
                         BILI_LAUNCH_TOKEN: launchToken,
                         BILI_PARENT_PID: String(opts.parentPid ?? process.pid),
                         ...(opts.lane ? { BILI_LAUNCHER_LANE: opts.lane } : {}),
