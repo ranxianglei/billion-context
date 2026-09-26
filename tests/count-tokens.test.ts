@@ -2,7 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createCore, createInitialState, defaultConfig, coveredMessageIds } from "acp-kernel";
 import type { Session } from "../src/session.ts";
-import { prepareCountTokens, isCountTokensRequest } from "../src/server.ts";
+import { isCountTokensRequest } from "../src/server.ts";
+import { prepareCountTokens } from "../src/server/prepare-anthropic.ts";
 import { anthropicToCore, type AnthropicRequestBody } from "acp-kernel/wire";
 
 function makeSession(): Session {

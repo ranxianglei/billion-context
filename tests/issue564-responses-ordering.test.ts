@@ -6,7 +6,9 @@ import { responsesToCore, coreToResponses, type ResponsesProjection, type BiliMe
 import type { Session } from "../src/session.ts";
 import { runCompressLoop, createResponsesAdapter } from "../src/loop/index.ts";
 import { buildCompressSystemPrompt } from "../src/compress-tool.ts";
-import { stripKernelSummaries, repairResponsesAssistantOrdering } from "../src/server.ts";
+import { startServer } from "../src/server.ts";
+import { stripKernelSummaries } from "../src/server/prepare-shared.ts";
+import { repairResponsesAssistantOrdering } from "../src/server/prepare-responses.ts";
 
 // #564 regression: after a successful compress, upstream must still receive a
 // valid Responses assistant history. Within one assistant run the order is
