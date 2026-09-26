@@ -3256,6 +3256,56 @@ test("resolveNodeRuntime: throws with the actionable message when nothing resolv
     );
 });
 
+test("resolveNodeRuntime: GUI/Electron host finds node in a well-known dir its PATH omits (#1429)", () => {
+    const exists = (p: string): boolean => p === "/usr/local/bin/node";
+    assert.equal(
+        resolveNodeRuntime(
+            "/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness",
+            { PATH: "/usr/bin:/bin:/usr/sbin:/sbin" },
+            "linux",
+            exists,
+            "33.0.0",
+        ),
+        "/usr/local/bin/node",
+    );
+});
+
+test("resolveNodeRuntime: Electron host with no Node anywhere falls back to its own binary (#1429)", () => {
+    assert.equal(
+        resolveNodeRuntime(
+            "/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness",
+            { PATH: "/usr/bin:/bin:/usr/sbin:/sbin" },
+            "linux",
+            () => false,
+            "33.0.0",
+        ),
+        "/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness",
+    );
+});
+
+test("resolveNodeRuntime: a real node on PATH beats the Electron fallback (#1429)", () => {
+    const exists = (p: string): boolean => p === "/opt/host/bin/node";
+    assert.equal(
+        resolveNodeRuntime("/Applications/App.app/Contents/MacOS/App", { PATH: "/opt/host/bin" }, "linux", exists, "33.0.0"),
+        "/opt/host/bin/node",
+    );
+});
+
+test("resolveNodeRuntime: win32 GUI host finds node in Program Files not on PATH (#1429)", () => {
+    const winExists = (p: string): boolean => p === "C:/Program Files/nodejs/node.exe";
+    assert.equal(
+        resolveNodeRuntime("C:/app/desktop.exe", { PATH: "C:/Windows/System32" }, "win32", winExists, "33.0.0"),
+        "C:/Program Files/nodejs/node.exe",
+    );
+});
+
+test("resolveNodeRuntime: non-Electron host still throws when no Node resolves (#1429)", () => {
+    assert.throws(
+        () => resolveNodeRuntime("/usr/bin/opencode", { PATH: "/nonexistent" }, "linux", () => false, undefined),
+        /BILLION_CONTEXT_NODE/,
+    );
+});
+
 test("ensureProxyRunning: spawns the resolved Node runtime, not blind process.execPath (#819)", async () => {
     let spawnedCmd: string | null = null;
     const spawnImpl: SpawnFn = (cmd) => {
