@@ -106,6 +106,7 @@ import { setupMitm, readMitmUpstream, getBlindTunnelStats } from "./mitm.js";
 import { evaluateChain } from "./chain-checkpoint.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "./util.js";
+import { matchModelEndpoint } from "./model-endpoints.js";
 
 import { BILI_TUNNEL_HEADER, checkTunnelDestination, classifyIp, localMachineIps, normalizeIpLiteral, parseIpLiteral, tunnelAllowlistFromEnv } from "./tunnel-guard.js";
 import { dumpRejectedBody } from "./error-dump.js";
@@ -1088,6 +1089,10 @@ async function handle(
     let route: ReturnType<typeof resolveUpstream>;
     let upstreamOrigin: string;
     let protocol: WireProtocol | null;
+    /** #1295: wire family of a declared custom endpoint (currently only
+     *  "commandcode"). Undefined for built-in families; drives the envelope
+     *  unwrap/rewrap + JSONL codec selection further down the pipeline. */
+    let wireFamily: "commandcode" | null = null;
     /** Gemini's model, resolved from the request path (its body never carries
      *  one). Undefined for every other protocol. */
     let googleModel: string | undefined;
@@ -1124,19 +1129,38 @@ async function handle(
             }
         }
         upstreamOrigin = route ? route.upstream : /^https?:\/\//i.test(url) ? new URL(url).origin : opts.upstream;
-        protocol =
-            route?.explicitProtocol
-            ?? (req.method === "POST" && bodyBuffer.length > 0
-                ? urlPath.endsWith("/chat/completions") || urlPath.endsWith("/llm_raw_chat")
-                    ? "openai"
-                    : urlPath.endsWith("/v1/messages") || urlPath.endsWith("/messages")
-                      ? "anthropic"
-                      : urlPath.endsWith("/responses") || responsesCompact
-                        ? "responses"
-                        : googlePathKind(urlPath) !== null
-                          ? "google"
-                          : null
-                : null);
+        // #1295: declared endpoints are checked BEFORE the built-in path tables —
+        // one config source (src/model-endpoints.ts) feeds both this classifier
+        // and the client-side fetch claim, so the two gates can no longer drift.
+        // The target URL mirrors buildForwardTarget's derivation exactly.
+        const declaredTarget = (route ? route.rewrittenUrl : /^https?:\/\//i.test(url) ? url : `${opts.upstream}${urlPath}`)
+            .replace(/^mitm:\/\//, "https://");
+        const declared = matchModelEndpoint(opts.modelEndpoints, declaredTarget);
+        if (req.method !== "POST" || bodyBuffer.length === 0) {
+            protocol = null;
+        } else if (route?.explicitProtocol !== undefined) {
+            protocol = route.explicitProtocol;
+        } else if (declared !== undefined) {
+            if (declared.wire === "commandcode") {
+                // openai-completions request shape inside a nested CLI envelope:
+                // the internal protocol stays "openai" so kernel/loop pipelines
+                // run unchanged — wireFamily selects the envelope + JSONL codecs.
+                wireFamily = "commandcode";
+                protocol = "openai";
+            } else {
+                protocol = declared.wire;
+            }
+        } else {
+            protocol = urlPath.endsWith("/chat/completions") || urlPath.endsWith("/llm_raw_chat")
+                ? "openai"
+                : urlPath.endsWith("/v1/messages") || urlPath.endsWith("/messages")
+                  ? "anthropic"
+                  : urlPath.endsWith("/responses") || responsesCompact
+                    ? "responses"
+                    : googlePathKind(urlPath) !== null
+                      ? "google"
+                      : null;
+        }
         // Gemini carries the model in the PATH, not the body — resolve it here so
         // the window/config block below and every later model-keyed decision see
         // it on a request whose body has no `model` field (#google).
