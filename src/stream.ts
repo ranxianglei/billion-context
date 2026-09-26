@@ -41,7 +41,7 @@ function executeAnthropicProxyTool(toolName: string, args: Record<string, unknow
         return injections.length > 0 ? injections.reduce((acc, inj) => `${acc}\n\n${inj.text}`, ack) : ack;
     }
     if (toolName === "search_context") {
-        return executeSearchContextTarget(args, ctx.core, ctx.session.id, ctx.session.state);
+        return executeSearchContextTarget(args, ctx.core, ctx.session.id, ctx.session.state, ctx);
     }
     if (toolName === "acp_status") {
         return handleAcpStatus(args, ctx);

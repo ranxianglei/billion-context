@@ -163,6 +163,7 @@ export function executeRetrieve(args: Record<string, unknown>, session: Session)
     // but the full text only reaches the model on a later upstream request.
     // The ledger tracks it until delivered or dropped (never silently lost).
     queueRetrieval(session, { ref, tokens: result.entry.tokens, chars: result.entry.chars, injection: result.injection });
+    recordRetrieveHit(session, ref);
     loggerLog("info", `[ccr] retrieve ${ref} (${result.entry.tokens} tok, ${result.entry.chars} chars)`);
     return result.ackText;
 }
@@ -314,4 +315,20 @@ export function drainPendingRetrievals(session: Session): CoreMessage[] {
     session.pendingRetrievals = [];
     commitRetrievals(session, items.map((i) => i.ref));
     return items.map((i) => i.injection);
+}
+
+// #1336: per-ref hit counts feed plan-aware search steering (repeat-retrieve
+// hint). In-memory only, bounded — an unbounded map would grow with every
+// distinct ref across a long session. Map insertion order gives FIFO trim.
+const RETRIEVE_COUNT_CAP = 512;
+
+export function recordRetrieveHit(session: Session, ref: string): void {
+    const counts = session.retrieveCountsByRef ?? new Map<string, number>();
+    counts.set(ref, (counts.get(ref) ?? 0) + 1);
+    while (counts.size > RETRIEVE_COUNT_CAP) {
+        const oldest = counts.keys().next().value;
+        if (oldest === undefined) break;
+        counts.delete(oldest);
+    }
+    session.retrieveCountsByRef = counts;
 }

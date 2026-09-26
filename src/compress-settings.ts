@@ -60,6 +60,7 @@ export function mergeCompress(
     // provider-level excludeTools.
     const absorbLevels = [global?.absorb, provider?.absorb, model?.absorb].filter(Boolean) as NonNullable<CompressSettings["absorb"]>[];
     const ccrLevels = [global?.ccr, provider?.ccr, model?.ccr].filter(Boolean) as NonNullable<CompressSettings["ccr"]>[];
+    const searchLevels = [global?.search, provider?.search, model?.search].filter(Boolean) as NonNullable<CompressSettings["search"]>[];
     const imageCompressionLevels = [global?.imageCompression, provider?.imageCompression, model?.imageCompression].filter(Boolean) as NonNullable<CompressSettings["imageCompression"]>[];
     const reasoningLevels = [global?.reasoning, provider?.reasoning, model?.reasoning].filter(Boolean) as NonNullable<CompressSettings["reasoning"]>[];
     const reasoningGuardLevels = [global?.reasoningGuard, provider?.reasoningGuard, model?.reasoningGuard].filter(Boolean) as NonNullable<CompressSettings["reasoningGuard"]>[];
@@ -82,6 +83,7 @@ export function mergeCompress(
         acknowledgePromptsRisk: pick("acknowledgePromptsRisk"),
         absorb: absorbLevels.length > 0 ? Object.assign({}, ...absorbLevels) : undefined,
         ccr: ccrLevels.length > 0 ? Object.assign({}, ...ccrLevels) : undefined,
+        search: searchLevels.length > 0 ? Object.assign({}, ...searchLevels) : undefined,
         imageCompression: imageCompressionLevels.length > 0 ? Object.assign({}, ...imageCompressionLevels) : undefined,
         rules: pick("rules"),
 
