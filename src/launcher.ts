@@ -3494,25 +3494,14 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // editing the user's config.yaml. No budget env: mcode's built-in
         // auto-compaction fires on input-token footprint, which ACP compression
         // precedes once windows align via BILI_LAUNCHER_MODEL_WINDOWS.
-        const usesProxyEnv = routes.httpsDomains.length > 0 || routes.httpEnvRoutes.length > 0;
-        env = usesProxyEnv ? stripInheritedProxy(process.env) : { ...process.env };
-        if (usesProxyEnv) {
-            const caBundle = resolveCombinedCaPath(process.env);
-            env.HTTPS_PROXY = origin;
-            env.SSL_CERT_FILE = caBundle;
-            env.NODE_EXTRA_CA_CERTS = caBundle;
-            if (routes.httpEnvRoutes.length > 0) env.HTTP_PROXY = origin;
-        }
         const mcodeConfigPath = `${process.env.MINIMAX_DATA_DIR?.trim() || process.env.MAVIS_DATA_DIR?.trim() || path.join(os.homedir(), ".minimax")}/config.yaml`;
-        if (routes.httpRewrites.length > 0) {
-            console.error(
-                `bili: ${routes.httpRewrites.length} loopback endpoint(s) in your MiniMax Code ${mcodeConfigPath} (profile variants ~/.minimax-<profile>/config.yaml count too) bypass its unconditional loopback NO_PROXY rule and will NOT go through the proxy — prefix their base_url with ${origin}/bili/ manually to compress them.`,
-            );
-        } else if (!usesProxyEnv) {
-            console.error(
-                `bili: no routable providers found in your MiniMax Code ${mcodeConfigPath} — traffic will NOT go through the proxy (configure a provider first).`,
-            );
-        }
+        env = applyLoopbackBypassMitmEnv({
+            routes,
+            origin,
+            where: `your MiniMax Code ${mcodeConfigPath}`,
+            ownerPhrase: "its",
+            rewriteNote: " (profile variants ~/.minimax-<profile>/config.yaml count too)",
+        });
     } else if (base === "qoder") {
         // #653: cert-MITM only — the model endpoint scheme is hardcoded https
         // (no base-URL override env), so /bili/ rewrites cannot reach it.
