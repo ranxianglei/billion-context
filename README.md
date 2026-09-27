@@ -1202,6 +1202,8 @@ section used to warn about (#1262):
   instead of silently colliding with something else's state.
 
 Design record and threat model: [SESSION-IDENTITY.md](SESSION-IDENTITY.md).
+Message-granularity identity — why message ids are content hashes, not
+ingress-assigned ids (#1496): [MESSAGE-IDENTITY.md](MESSAGE-IDENTITY.md).
 
 For upstream sticky-routing, the proxy forwards only identity values the
 client already supplied (e.g. a body `session_id` is forwarded upstream as
