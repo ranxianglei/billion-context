@@ -90,6 +90,25 @@ test("findPackageRoot: corrupt running root refuses a foreign named ancestor ins
     }
 });
 
+test("findPackageRoot: nameless package.json is not a package boundary (walk continues past it)", async () => {
+    const base = mkdtempSync(path.join(tmpdir(), "bc-installdir-"));
+    try {
+        // Contrast to the foreign-named refusal above: a package.json WITHOUT
+        // a name field (opencode cache-lane wrappers are exactly this shape)
+        // carries no package identity, so the walk must continue past it —
+        // adoption of a genuine same-name ancestor above is unchanged from
+        // pre-#1628 behavior and must not be tightened into a refusal.
+        const outerBc = path.join(base, PKG);
+        writePkg(outerBc, { name: PKG, version: "9.9.9" });
+        const nameless = path.join(outerBc, "sub");
+        writePkg(nameless, { dependencies: { [PKG]: "0.1.129" } });
+        mkdirSync(path.join(nameless, "dist"), { recursive: true });
+        assert.equal(await findPackageRoot(path.join(nameless, "dist"), PKG), outerBc);
+    } finally {
+        rmSync(base, { recursive: true, force: true });
+    }
+});
+
 test("findInstallDir: resolves this running copy's own root", async () => {
     const dir = await findInstallDir(PKG);
     assert.ok(dir, "expected the running module to resolve its own package root");
