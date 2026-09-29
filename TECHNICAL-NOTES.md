@@ -15,6 +15,10 @@ the client's **own model config** to the proxy (runtime-info protocol,
 #955) so compression budgets use the real window instead of a registry
 guess. Opt-out envs: `BILI_NATIVE_PI=0`, `BILI_NATIVE_OMP=0`, `BILI_NATIVE_OPENCODE=0`, `BILI_NATIVE_DSH=0`, `BILI_NATIVE_KIMI=0`, `BILI_NATIVE_HERMES=0`, `BILI_NATIVE_ZCODE=0`.
 
+## DSH output-budget handoff
+
+DSH OpenAI requests may send `x-bili-output-budget: <requested>:<raw-clamped>`. The proxy accepts positive safe integers only when the second value matches the body's budget and the first is no smaller; a reported model output ceiling bounds restoration. It restores the request's ceiling before preparation, then applies the existing rebuilt-input output clamp. Equal values preserve explicit small ceilings without high-water restoration. Requests from other agents or mismatched models do not use this handoff. The header is removed before forwarding; direct requests retain their raw-input budget. This changes neither stored session data nor compression settings.
+
 ## Proxy reuse and the attach gate (#1225, #1335, #1232)
 
 A native hook may attach to an already-running proxy instead of spawning its own — only when it passes the lifecycle gate below. Reuse is identity-based (#1225): an existing proxy is attached only when it runs the **same code** (sha256 of the entry script, recorded in the instance file), its **lane is compatible** — each launcher declares its client's lane, two *different declared* lanes never share, and an instance without a declared lane is wildcard-compatible on that axis — **and it owns a session lifecycle**: its health endpoint reports an armed parent-pid watchdog (`watchdog.armed == true`), i.e. it was spawned by a launcher with a parent pid and dies when the last attached session dies. Instances written before #1225 carry no code fingerprint and are therefore never attached: a rebuilt or updated install always starts a fresh proxy on the next launch, so fixes take effect immediately instead of silently serving stale code.

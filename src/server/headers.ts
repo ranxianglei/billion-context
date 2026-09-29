@@ -26,6 +26,7 @@ export const UPSTREAM_HOP_HEADERS = new Set([
     // #1117: bili-internal passthrough marker (native fetch patch → proxy);
     // never meaningful to a real upstream.
     "x-bili-passthrough",
+    "x-bili-output-budget",
     "te",
     "trailer",
     "upgrade",

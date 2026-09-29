@@ -67,18 +67,34 @@ export function writeOutputBudget(parsed: Record<string, unknown>, field: Output
  *  loop can never rescue the session. The proxy's compressed view still fits
  *  the window, so remember the healthy budget per session (last non-starved
  *  value wins) and restore it on tool-carrying main requests whose budget has
- *  starved. Mutates `parsed` in place BEFORE prepare() serializes it. */
+ *  starved. A DSH handoff carries requested:raw-clamped safe integers; its
+ *  matching budget replaces the heuristic, including explicit small caps.
+ *  Mutates `parsed` before prepare() and its rebuilt-input output clamp. */
 export function restoreOutputBudget(
     parsed: unknown,
     session: { id: string; metadata: Record<string, unknown> },
     log: (level: string, msg: string) => void,
     configuredOutputLimit?: number,
+    handoff?: string,
+    outputCeiling?: number,
 ): void {
     const field = outputBudgetField(parsed);
     if (!field) return;
     const p = parsed as Record<string, unknown>;
     const value = readOutputBudget(p, field);
     if (value === undefined) return;
+    const match = handoff?.match(/^([1-9]\d*):([1-9]\d*)$/);
+    if (match) {
+        const requested = Number(match[1]);
+        const clamped = Number(match[2]);
+        if (Number.isSafeInteger(requested) && Number.isSafeInteger(clamped)
+            && clamped === value && requested >= clamped
+            && (outputCeiling === undefined || requested <= outputCeiling)) {
+            writeOutputBudget(p, field, requested);
+            if (requested !== value) log("info", `[${session.id}] output budget handed off ${value} -> ${requested}; sizing against rebuilt input`);
+            return;
+        }
+    }
     if (value > SIDE_REQUEST_MAX_TOKENS) {
         session.metadata.outputBudgetHighWater = value;
         return;

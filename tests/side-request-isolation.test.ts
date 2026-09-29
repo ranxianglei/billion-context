@@ -239,6 +239,7 @@ interface Rig {
     sideScript: string | null;
     /** Last request body received by the upstream (for wire assertions). */
     lastBody: Record<string, unknown> | null;
+    lastHeaders?: http.IncomingHttpHeaders;
     /** Total requests received by the upstream (hit-count assertions). */
     upstreamHits: number;
     /** When set, side requests get this status + JSON body instead of okSse. */
@@ -262,6 +263,7 @@ async function startRig(opts?: { modelContextLimit?: number; compressModelContex
             let parsed: { max_tokens?: number } = {};
             try { parsed = JSON.parse(raw); } catch { /* keep {} */ }
             rig.lastBody = parsed as Record<string, unknown>;
+            rig.lastHeaders = req.headers;
             rig.upstreamHits++;
             // Side requests (tiny max_tokens) report a TINY context; main requests
             // report a large one. The proxy must NOT capture the side request's
@@ -311,6 +313,47 @@ async function closeRig(rig: Rig): Promise<void> {
     rig.upstream.close();
     await once(rig.upstream, "close");
 }
+
+test("e2e: DSH output budget handoff is consumed, bounded after rebuilding, and never forwarded", async () => {
+    for (const window of [1000000, 50000]) {
+        const rig = await startRig({ compressModelContextLimit: window });
+        try {
+            const model = "deepseek/deepseek-v4.1-flash";
+            const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/chat/completions`;
+            const headers = {
+                "content-type": "application/json", "x-acp-session": "budget-handoff",
+                "x-bili-plugin": "dsh", "x-bili-plugin-model": model,
+                "x-bili-plugin-max-output": "131072", "x-bili-plugin-context-window": String(window),
+                "x-bili-output-budget": "131072:1024",
+            };
+            const body = { model, max_tokens: 1024, stream: true, messages: [{ role: "user", content: "hello" }] };
+            const r = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
+            assert.equal(r.status, 200);
+            await r.text();
+            const forwarded = rig.lastBody?.max_tokens;
+            assert.ok(typeof forwarded === "number");
+            if (window === 1000000) assert.equal(forwarded, 131072);
+            else assert.ok(forwarded > 1024 && forwarded < window, "post-rebuild clamp still protects a smaller window");
+            assert.equal(rig.lastHeaders?.["x-bili-output-budget"], undefined);
+            const explicit = await fetch(url, {
+                method: "POST", headers: { ...headers, "x-bili-output-budget": "128:128" },
+                body: JSON.stringify({ ...body, max_tokens: 128, tools: [{ type: "function", function: { name: "test", parameters: { type: "object", properties: {} } } }] }),
+            });
+            await explicit.text();
+            assert.equal(rig.lastBody?.max_tokens, 128, "explicit user cap wins over a prior 131072 ceiling");
+            for (const unrelated of [
+                { ...headers, "x-bili-plugin": "pi" },
+                { ...headers, "x-bili-plugin-model": "another-model" },
+            ]) {
+                const ignored = await fetch(url, { method: "POST", headers: unrelated, body: JSON.stringify(body) });
+                await ignored.text();
+                assert.equal(rig.lastBody?.max_tokens, 1024, "another agent or model cannot restore this budget");
+            }
+        } finally {
+            await closeRig(rig);
+        }
+    }
+});
 
 test("e2e: side request response still gets render-tag stripping (#460 contract)", async () => {
     const LT = "\x3c";
