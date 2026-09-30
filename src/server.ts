@@ -5077,8 +5077,19 @@ async function preflightCompressIfNeeded(
     // hatch on pixel-billing upstreams). With evidence present we trust the
     // estimate and fall through to fold / fail-fast below.
     const noOverflowEvidence = session.stats.lastInputTokens < limit || session.stats.lastInputTokensSource !== "usage";
-    if (imageTokens > 0 && payloadEstimate >= limit && textEstimate < limit && noOverflowEvidence) {
-        log("warn", `[${session.id}] image-dominated payload (~${textEstimate} text + ~${imageTokens} image tokens) exceeds window ${limit} by estimate only, no upstream overflow evidence — forwarding once so the upstream arbitrates billing (#496)`);
+    // #1800: images are the sole over-window component and we hold no overflow
+    // evidence → the base64/4 (or pixels-fallback) image cost clears the window on
+    // ESTIMATE alone while the real bill is far smaller, so we let the upstream
+    // arbitrate billing instead of fail-fast'ing. But do NOT unconditionally
+    // short-circuit here: that permanently disabled auto-compression — preflight
+    // never ran while the inflated estimate sat over-window, so a growing text
+    // payload was folded 0× for the whole session (#1800). Only take the immediate
+    // forward when there is literally NOTHING compressible; otherwise remember the
+    // arbitration and let preflightCompress fold the text portion first, re-applying
+    // this same forward-instead-of-fail-fast decision after compression (below).
+    const imageArbitration = imageTokens > 0 && payloadEstimate >= limit && textEstimate < limit && noOverflowEvidence;
+    if (imageArbitration && (prepared.nudge?.compressibleRanges ?? []).length === 0) {
+        log("warn", `[${session.id}] image-dominated payload (~${textEstimate} text + ~${imageTokens} image tokens) exceeds window ${limit} by estimate only, nothing compressible, no upstream overflow evidence — forwarding for the upstream to arbitrate billing (#496/#1800)`);
         return prepared;
     }
     // #301: forwarding as-is is safe ONLY when the payload's own estimate
@@ -5224,12 +5235,14 @@ async function preflightCompressIfNeeded(
     // would look "fitting" on its text estimate alone. Unknown-baseline
     // sessions keep the loop's own upper-bound judgment (result.fitsWindow,
     // #553) — the optimistic re-estimate is exactly what that regime distrusts.
+    let outbound: Prepared = prepared;
     if (result.compressedRanges > 0) {
         log("info", `[${session.id}] preflight compressed ${result.compressedRanges} range(s), ~${result.savedTokens} tokens saved (${tokenCount} → ${session.stats.lastInputTokens}) in ${Date.now() - started}ms; rebuilding payload`);
         const rebuilt = await runPrepare();
         // runPrepare re-incremented stats.requests; the rebuild is internal
         // to this single client request.
         session.stats.requests -= 1;
+        outbound = rebuilt;
         // Same measurement the fit gate below uses — the view that actually
         // goes out (processedMessages empty ⇒ kernel transform failure ⇒ the
         // raw body rides; mirror outboundPayloadBreakdown's fallback).
@@ -5249,13 +5262,25 @@ async function preflightCompressIfNeeded(
         log("warn", `[${session.id}] preflight made no progress but the payload fits; forwarding as-is`);
         return prepared;
     }
-    // The payload still overflows the window: fail fast with a diagnostic
-    // error instead of forwarding a guaranteed-400 payload (#301).
     const f = result.failure;
     if (f?.kind === "aborted") {
         log("warn", `[${session.id}] preflight aborted (${f.detail}); not forwarding`);
         return { failFast: true, status: 0, message: f.detail, retryable: false, respond: false };
     }
+    // #1800: still over-window after compression, but the residual excess is carried
+    // ENTIRELY by the image estimate (text+overhead fits on its own) and we hold no
+    // upstream overflow evidence. Forward for the upstream to arbitrate billing
+    // instead of fail-fasting a payload whose real bill likely fits (#496). The text
+    // portion was already folded above when foldable; we do NOT re-loop.
+    if (imageArbitration) {
+        const outText = estimateCoreMessages(outbound.processedMessages);
+        if (outText + overheadEstimate < limit && outText + overheadEstimate + imageTokens >= limit) {
+            log("info", `[${session.id}] preflight folded ${result.compressedRanges} range(s) but images alone (~${imageTokens} tokens) keep the estimate over window ${limit} with no upstream overflow evidence — forwarding for the upstream to arbitrate billing (#496/#1800)`);
+            return outbound;
+        }
+    }
+    // The payload still overflows the window: fail fast with a diagnostic
+    // error instead of forwarding a guaranteed-400 payload (#301).
     const status = f?.kind === "upstream" && f.status === 429 ? 503 : 502;
     const retryable = f?.retryable === true || (f?.kind === "upstream" && f.status !== undefined && (f.status === 429 || f.status >= 500));
     const ff = failFast(status, f?.detail ?? "the payload still exceeds the window after preflight compression", retryable, result.compressedRanges > 0 ? session.stats.lastInputTokens : undefined, result.rangesRemaining);
