@@ -335,7 +335,7 @@ function chainOpenIndex(s: string): number {
  *  frozen parser after unescaping), or null. Malformed/unterminated openings
  *  are NOT spans here: they stay in place for the streaming tail logic, where
  *  under-budget truncations are released as prose (content preservation). */
-export function nextChainSpan(s: string): { start: number; end: number } | null {
+function nextChainSpan(s: string): { start: number; end: number } | null {
     const i = chainOpenIndex(s);
     if (i < 0) return null;
     const rest = s.slice(i);
@@ -349,7 +349,7 @@ export function nextChainSpan(s: string): { start: number; end: number } | null 
  *  where the text starts with either internal-artifact header — everything
  *  from the cut to the END of the text field is the block (streaming flush
  *  discards the remainder; whole-text slicing mirrors it). */
-export function headBlockCut(s: string): number {
+function headBlockCut(s: string): number {
     if (s.startsWith(CODEX_FORGED_HANDOFF_HEADER) || s.startsWith(FORGED_SUMMARY_HEADER)) return 0;
     let nl = s.indexOf("\n");
     while (nl >= 0) {

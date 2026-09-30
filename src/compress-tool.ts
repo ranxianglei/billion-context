@@ -329,7 +329,7 @@ export function parseCompressInput(input: unknown, callId?: string) {
 
 // #1439: shared by the streaming Responses adapter AND the non-streaming JSON
 // loop so both recognize the same triggers — a private copy in one path drifted.
-export interface ResponsesTextTriggerCall {
+interface ResponsesTextTriggerCall {
     name: string;
     callId: string;
     arguments: string;

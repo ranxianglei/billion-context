@@ -566,14 +566,7 @@ function canonicalIdOf(session: Session): string {
  *  Called where the id is surfaced to the model (wire notes) so the exact value
  *  shown is the one persisted and routable. Anonymous sessions are a no-op
  *  (canonical id already equals session.id). */
-export function ensureCanonicalId(session: Session): string {
-    const id = canonicalIdOf(session);
-    if (!session.id.startsWith("pfa-") && session.metadata.canonicalId !== id) {
-        session.metadata.canonicalId = id;
-        markDirty(session);
-    }
-    return id;
-}
+
 
 /** Read-only reverse lookup: the resident session whose canonical id matches.
  *  Scans the in-memory pool (≤ MAX_SESSIONS); always consistent with the live

@@ -1229,7 +1229,7 @@ function parseImageBilling(value: unknown): ImageBillingMode | undefined {
     return value === "auto" || value === "pixels" || value === "bytes" ? value : undefined;
 }
 
-export function parseStreamErrorShape(value: unknown): "protocol" | "completion" {
+function parseStreamErrorShape(value: unknown): "protocol" | "completion" {
     return value === "completion" ? "completion" : "protocol";
 }
 

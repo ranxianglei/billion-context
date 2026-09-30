@@ -10,7 +10,7 @@ import { log } from "../logger.js";
  *  live always wins per id. Disk files decode via the same store as bili
  *  export (encryption/zstd); unreadable files skip silently, as in export. */
 
-export interface WebSessionSummary {
+interface WebSessionSummary {
     id: string;
     title?: string;
     label?: string;
@@ -67,7 +67,7 @@ export interface WebSessionSummary {
     summaryCost?: number;
 }
 
-export interface WebOverview {
+interface WebOverview {
     sessions: number;
     live: number;
     requests: number;
@@ -104,7 +104,7 @@ export interface WebOverview {
     recent: WebSessionSummary[];
 }
 
-export interface WebSessionDetail extends WebSessionSummary {
+interface WebSessionDetail extends WebSessionSummary {
     lastInputTokens: number;
     compressCreditTokens: number;
     retrieveCalls: number;

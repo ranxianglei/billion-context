@@ -555,7 +555,7 @@ function buildSteering(
     return parts.length > 0 ? `\n\n[plan-aware] ${parts.join("\n")}` : "";
 }
 
-export type SearchPlanOpts = {
+type SearchPlanOpts = {
     messages: CoreMessage[];
     session: Session;
     log: (msg: string) => void;

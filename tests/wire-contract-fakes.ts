@@ -111,7 +111,7 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
 }
 
 /** WC-001..WC-003, WC-007, WC-010 on an Anthropic /v1/messages body. Returns violation strings. */
-export function validateAnthropicBody(body: unknown): string[] {
+function validateAnthropicBody(body: unknown): string[] {
     const out: string[] = [];
     if (!isPlainObject(body)) return out;
     if ("prompt_cache_key" in body)

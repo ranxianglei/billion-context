@@ -344,7 +344,7 @@ function newStoreRulesForAll(root: Record<string, unknown>, policy: ZcodeRoutePo
     return { routed, skipped };
 }
 
-export interface ZcodeApplyOutcome {
+interface ZcodeApplyOutcome {
     readonly text: string;
     readonly wrapped: ZcodeWrappedEntry[];
     readonly skipped: readonly { id: string; reason: string }[];

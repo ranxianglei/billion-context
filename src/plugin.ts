@@ -70,7 +70,7 @@ const PLUGIN_MODEL_HEADER = "x-bili-plugin-model";
  *  default for every non-codex/non-claude signal), this declaration is
  *  vestigial: hosts keep stamping it for protocol compatibility with older
  *  proxies, but current proxies key verbatim regardless. */
-export const PLUGIN_INSTRUCTIONS_MUTABLE_HEADER = "x-bili-plugin-instructions-mutable";
+const PLUGIN_INSTRUCTIONS_MUTABLE_HEADER = "x-bili-plugin-instructions-mutable";
 /** #1699: the host's per-request persona/agent id (opencode v2 stamps its own
  *  taxonomy — "title", "build", "plan", ...). Carries INTENT the request body
  *  cannot express: opencode v2 title-gen requests carry NO max_tokens (options
@@ -79,7 +79,7 @@ export const PLUGIN_INSTRUCTIONS_MUTABLE_HEADER = "x-bili-plugin-instructions-mu
  *  compress prompt + tool injected into the title model. The proxy acts only on
  *  known side-request agents (side-request.ts SIDE_REQUEST_AGENTS); main-persona
  *  ids are inert telemetry. */
-export const PLUGIN_REQUEST_AGENT_HEADER = "x-bili-plugin-agent";
+const PLUGIN_REQUEST_AGENT_HEADER = "x-bili-plugin-agent";
 
 const PLUGIN_PROTOCOL_VERSION = 1;
 
@@ -87,7 +87,7 @@ const PLUGIN_PROTOCOL_VERSION = 1;
  *  synthetic callId, which the client can never echo back — its own re-sent
  *  compress pair is the summary carrier for such blocks, so the kernel's
  *  in-place acp_summary anchor is redundant and must be stripped (#1567). */
-export const PLUGIN_FOLD_CALLID_PREFIX = "plugin_";
+const PLUGIN_FOLD_CALLID_PREFIX = "plugin_";
 export function isPluginFoldCallId(callId: string | undefined): boolean {
     return typeof callId === "string" && callId.startsWith(PLUGIN_FOLD_CALLID_PREFIX);
 }
@@ -340,7 +340,7 @@ type PendingPluginRegister = { conversationId: string; agent: string; ts: number
  *  many sessions (main + subagents) that share the agent name but report
  *  different windows, and a single per-agent slot let the last reporter
  *  clobber everyone else's entry. */
-export type PluginRuntimeInfo = {
+type PluginRuntimeInfo = {
     agent: string;
     model: string;
     contextWindow?: number;

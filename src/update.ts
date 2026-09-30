@@ -1006,7 +1006,7 @@ export async function detectStaleInstall(
 /** Fetch one published version's registry doc (#1481): tarball URL plus
  *  integrity/shasum for verification. Returns undefined when the version does
  *  not exist or the fetch fails — callers treat that as "do nothing". */
-export async function fetchVersionDoc(
+async function fetchVersionDoc(
     opts: Pick<UpdateOptions, "resolveProxy">,
     packageName: string,
     version: string,

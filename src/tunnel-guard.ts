@@ -102,7 +102,7 @@ export type ResolveHost = (host: string) => Promise<string[]>;
 // missing from @types/node's LookupOptions — race instead of casting. The
 // losing lookup stays handled (Promise.race subscribes to both sides), so a
 // late OS-resolver failure cannot surface as an unhandled rejection.
-export const dnsResolveHost: ResolveHost = async (host) => {
+const dnsResolveHost: ResolveHost = async (host) => {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
         const res = await Promise.race([
@@ -147,7 +147,7 @@ interface TunnelCheckContext {
     resolveBackoffMs?: number;
 }
 
-export type TunnelVerdict = { ok: true } | { ok: false; code: "self" | "linkLocal" | "privateRemote" | "unresolvable" | "invalid"; message: string };
+type TunnelVerdict = { ok: true } | { ok: false; code: "self" | "linkLocal" | "privateRemote" | "unresolvable" | "invalid"; message: string };
 
 function allowlistHit(host: string, port: number, allowlist: string[]): boolean {
     const h = host.toLowerCase();

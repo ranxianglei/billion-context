@@ -537,7 +537,7 @@ function stampedPriceProfile(session: Session): PriceProfile | undefined {
     return Object.keys(out).length > 0 ? out : undefined;
 }
 
-export interface ModelSwitchEvent {
+interface ModelSwitchEvent {
     seq: number;
     at: number;
     from: string | null;
@@ -549,13 +549,13 @@ export interface ModelSwitchEvent {
     attributed: number;
 }
 
-export interface ModelSwitchStats {
+interface ModelSwitchStats {
     count: number;
     missedTokens: number;
     events: ModelSwitchEvent[];
 }
 
-export interface InvalidationTokenBreakdown {
+interface InvalidationTokenBreakdown {
     model: number;
     wire: number;
     upstream: number;
@@ -565,7 +565,7 @@ export interface InvalidationTokenBreakdown {
     remaining: number;
 }
 
-export interface BiliCacheReport extends CacheReport {
+interface BiliCacheReport extends CacheReport {
     modelSwitches: ModelSwitchStats;
     wireSwitches: ModelSwitchStats;
     upstreamSwitches: ModelSwitchStats;

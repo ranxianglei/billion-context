@@ -219,7 +219,7 @@ function trailingUserHitsGoogle(body: Record<string, unknown>): CarrierHit[] {
     return out.reverse();
 }
 
-export interface ChainExtraction {
+interface ChainExtraction {
     candidates: ChainCheckpoint[];
     malformed: number;
     /** The body with every recognized carrier removed — whole-slot for
