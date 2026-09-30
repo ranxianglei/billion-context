@@ -7,10 +7,10 @@ import path from "node:path";
 import { defaultLogFile } from "./paths.js";
 import { safeSessionId } from "./server/headers.js";
 
-export type PairCategory = "pure-append" | "mid-stream-rewrite" | "prefix-stable-miss";
-export type Attribution = "proxy" | "client" | "both" | "unknown";
+type PairCategory = "pure-append" | "mid-stream-rewrite" | "prefix-stable-miss";
+type Attribution = "proxy" | "client" | "both" | "unknown";
 
-export interface DivergenceDetail {
+interface DivergenceDetail {
     offset: number;
     messageIndex: number | null;
     roleType: string | null;
@@ -18,7 +18,7 @@ export interface DivergenceDetail {
     after: string;
 }
 
-export interface UsagePair {
+interface UsagePair {
     inputA: number;
     cachedB: number;
     inputB: number;
@@ -26,7 +26,7 @@ export interface UsagePair {
     hitPctB: number | null;
 }
 
-export interface AppendInfo {
+interface AppendInfo {
     // strict: B's bytes start with A's bytes verbatim.
     // json-tail: every shared message element is byte-identical; the only
     //   divergence sits at/after the last shared element (array closer +
@@ -38,7 +38,7 @@ export interface AppendInfo {
     countB: number;
 }
 
-export interface PairReport {
+interface PairReport {
     index: number;
     tsA: number;
     tsB: number;
@@ -59,7 +59,7 @@ export interface PairReport {
     notes: string[];
 }
 
-export interface SessionReport {
+interface SessionReport {
     sid: string;
     requests: number;
     unpairedIncoming: number;
@@ -67,7 +67,7 @@ export interface SessionReport {
     pairs: PairReport[];
 }
 
-export interface DiffReport {
+interface DiffReport {
     dir: string;
     logSource: string | null;
     usageSamples: number;
@@ -96,7 +96,7 @@ const INC_NEW_RE = /^(\d+)-([a-zA-Z0-9._-]+)-INCOMING\.txt$/;
 const INC_LEGACY_RE = /^(\d+)-INCOMING\.txt$/;
 const REQ_RE = /^(\d+)-([a-zA-Z0-9._-]+)-REQ\.txt$/;
 
-export function collectDumps(root: string): DumpMeta[] {
+function collectDumps(root: string): DumpMeta[] {
     const dirs: string[] = [root];
     for (const sub of ["raw", "dumps"]) {
         const p = path.join(root, sub);
@@ -280,7 +280,7 @@ function locateMessage(items: unknown[], spans: Array<[number, number]>, offset:
 // SHARED element to be byte-identical and the first divergence to sit at/after
 // the last shared element (glue-only gaps tolerated). Anything else is a
 // genuine mid-stream rewrite.
-export interface WireRel {
+interface WireRel {
     rel: "append" | "diverge";
     byteOffset: number;
     extra: number;
@@ -460,7 +460,7 @@ function classifyPair(index: number, tsA: number, tsB: number, aOut: DumpContent
     };
 }
 
-export interface DiffOptions {
+interface DiffOptions {
     logFile?: string;
     noLog?: boolean;
     session?: string;

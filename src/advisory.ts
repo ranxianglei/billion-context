@@ -48,7 +48,7 @@ export type AdvisoryEntry = {
     publishedAt?: string;
 };
 
-export type AdvisoryState = {
+type AdvisoryState = {
     /** Set while an entry matches the local version (whether or not the
      *  forced install has succeeded yet). */
     active?: AdvisoryEntry & { currentVersion: string };
@@ -174,7 +174,7 @@ async function writeLastCheck(ts: number): Promise<void> {
     }
 }
 
-export type AdvisoryWatcherOptions = {
+type AdvisoryWatcherOptions = {
     packageName: string;
     /** Fallback version (running process); the disk version wins when
      *  readable — same rule as the self-updater. */
@@ -293,7 +293,7 @@ export function startAdvisoryWatcher(opts: AdvisoryWatcherOptions): void {
 }
 
 /** Stop the periodic check loop (for tests / clean shutdown). */
-export function stopAdvisoryWatcher(): void {
+function stopAdvisoryWatcher(): void {
     if (timer) {
         clearInterval(timer);
         timer = undefined;

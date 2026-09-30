@@ -331,7 +331,7 @@ export function isPidAlive(pid: number): boolean {
     }
 }
 
-export interface RegistryEntry {
+interface RegistryEntry {
     instanceId: string;
     pid: number;
     port: number;

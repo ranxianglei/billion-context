@@ -98,7 +98,7 @@ function inflateZstd(body: Buffer): Buffer {
     return Buffer.concat(chunks);
 }
 
-export interface StorageCodecOptions {
+interface StorageCodecOptions {
     /** AES-256-GCM key (#708). Without one, BILIENC1 files cannot be read —
      *  they surface as an actionable corrupt-file error instead of garbage. */
     key?: Buffer | null;

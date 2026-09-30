@@ -40,7 +40,7 @@ export type UpstreamFailureKind =
     | "tls"
     | "unknown";
 
-export interface UpstreamFailCtx {
+interface UpstreamFailCtx {
     /** A proxy dispatcher is in the path — changes reset/refused attribution. */
     viaProxy?: boolean;
     /** True when the caller's EXTERNAL abort signal (client disconnect) has

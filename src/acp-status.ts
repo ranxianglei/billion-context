@@ -15,7 +15,7 @@ import { coveredRefSpan } from "./decompress-shared.js";
 import { preCompactionArchiveOf, type Session } from "./session.js";
 import { VERSION } from "./version.js";
 
-export interface AcpStatusCtx {
+interface AcpStatusCtx {
     core: CompressionCore;
     config: Config;
     messages: CoreMessage[];

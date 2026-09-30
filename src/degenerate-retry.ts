@@ -25,7 +25,7 @@ export function injectContinuationNudge(protocol: WireProtocol, body: string | B
     return appendTrailingUserText(protocol, body, DEGENERATE_RETRY_NUDGE);
 }
 
-export interface ContinuationRetryOpts {
+interface ContinuationRetryOpts {
     protocol: WireProtocol;
     /** The body that was forwarded upstream (the agent's own, in plugin mode). */
     body: string | Buffer;

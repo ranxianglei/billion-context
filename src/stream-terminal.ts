@@ -4,7 +4,7 @@
 // never happened discards valid blocks (#249). "unknown" is the safe default
 // (no rebase; the next request self-heals via kernel message-id deactivation).
 
-export type TerminalState = "completed" | "failed" | "unknown";
+type TerminalState = "completed" | "failed" | "unknown";
 
 const SUCCEEDED = "response.completed";
 const FAILED_EVENTS = new Set(["response.failed", "response.incomplete"]);

@@ -403,7 +403,7 @@ export type CompressSettings = {
      *  `absorb`. */
     priceProfile?: { w?: number; r?: number; q?: number };
 };
-export type PromptCacheRouting = "auto" | "enabled" | "disabled";
+type PromptCacheRouting = "auto" | "enabled" | "disabled";
 export type UpstreamProxyMode = "auto" | "manual" | "direct";
 
 /** Built-in context window for common model families, keyed by a lowercase
@@ -768,7 +768,7 @@ function warnAbsorbPluginDivergences(routes: ProviderRoutes, baseAbsorb?: Compre
  *  sessions actually execute. In plugin mode the static manifest is the ONLY
  *  declaration of the retrieve surface, so the whole ccr block follows the base
  *  config; such overrides only take effect on proxy-mode sessions. */
-export interface CcrOverrideDivergence {
+interface CcrOverrideDivergence {
     /** Where the override lives, e.g. "provider https://api.x.com" or "provider https://api.x.com model gpt-4". */
     level: string;
     field: "enabled" | "toolName" | "minToolTokens" | "excludeTools" | "maxHeadChars";
@@ -1225,11 +1225,11 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
     return undefined;
 }
 
-export function parseImageBilling(value: unknown): ImageBillingMode | undefined {
+function parseImageBilling(value: unknown): ImageBillingMode | undefined {
     return value === "auto" || value === "pixels" || value === "bytes" ? value : undefined;
 }
 
-export function parseStreamErrorShape(value: unknown): "protocol" | "completion" {
+function parseStreamErrorShape(value: unknown): "protocol" | "completion" {
     return value === "completion" ? "completion" : "protocol";
 }
 

@@ -29,7 +29,7 @@ export interface UpstreamAlert {
  *  - upstream-timeout: fired AFTER connect (headers/body idle budget) — the
  *    request may have reached the upstream, so "cannot reach" would be a lie;
  *  - unknown: unclassified — better silent than a misleading red banner. */
-export const ALERT_KINDS: ReadonlySet<UpstreamFailureKind> = new Set([
+const ALERT_KINDS: ReadonlySet<UpstreamFailureKind> = new Set([
     "connect-timeout",
     "connect-refused",
     "proxy-reset",

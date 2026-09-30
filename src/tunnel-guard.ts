@@ -47,7 +47,7 @@ const RESOLVE_TIMEOUT_MS = 2000;
 
 export const BILI_TUNNEL_HEADER = "x-bili-tunnel";
 
-export type IpClass = "loopback" | "linkLocal" | "private" | "public";
+type IpClass = "loopback" | "linkLocal" | "private" | "public";
 
 /** Parse a v4 quad or v6 literal (incl. ::ffff: mapped); null for names. */
 export function parseIpLiteral(s: string): string | null {
@@ -102,7 +102,7 @@ export type ResolveHost = (host: string) => Promise<string[]>;
 // missing from @types/node's LookupOptions — race instead of casting. The
 // losing lookup stays handled (Promise.race subscribes to both sides), so a
 // late OS-resolver failure cannot surface as an unhandled rejection.
-export const dnsResolveHost: ResolveHost = async (host) => {
+const dnsResolveHost: ResolveHost = async (host) => {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
         const res = await Promise.race([
@@ -136,7 +136,7 @@ export function localMachineIps(): Set<string> {
     return localAddrCache.ips;
 }
 
-export interface TunnelCheckContext {
+interface TunnelCheckContext {
     /** Port this proxy is actually serving on (server.address()). */
     selfPort: number | undefined;
     clientLoopback: boolean;
@@ -147,7 +147,7 @@ export interface TunnelCheckContext {
     resolveBackoffMs?: number;
 }
 
-export type TunnelVerdict = { ok: true } | { ok: false; code: "self" | "linkLocal" | "privateRemote" | "unresolvable" | "invalid"; message: string };
+type TunnelVerdict = { ok: true } | { ok: false; code: "self" | "linkLocal" | "privateRemote" | "unresolvable" | "invalid"; message: string };
 
 function allowlistHit(host: string, port: number, allowlist: string[]): boolean {
     const h = host.toLowerCase();

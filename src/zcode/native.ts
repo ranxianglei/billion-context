@@ -30,7 +30,7 @@ import {
 const SIGNING_BLOCK_MESSAGE =
     'zcode v3.14+ client signing (#1621) rejects the http://127.0.0.1 /bili/ origin at model creation ("Client signing handshake requires HTTPS.") — skipping native routing; provider store left untouched. For compression on this build use the GUI cert-MITM setup (Settings → Network: HTTP proxy + root CA path).';
 
-export type ZcodeNativePlan =
+type ZcodeNativePlan =
     | { readonly mode: "off" }
     | { readonly mode: "attach"; readonly attachOrigin: string }
     | { readonly mode: "spawn" };
@@ -115,7 +115,7 @@ async function withConfigLock<T>(dataDir: string, fn: () => T): Promise<T> {
     }
 }
 
-export interface ZcodeRouteApplied {
+interface ZcodeRouteApplied {
     readonly origin: string;
     readonly port: number;
     readonly kind: ZcodeStoreKind;
@@ -124,7 +124,7 @@ export interface ZcodeRouteApplied {
     readonly wrapped: ZcodeWrappedEntry[];
 }
 
-export interface RouteZcodeOptions {
+interface RouteZcodeOptions {
     readonly origin: string;
     readonly env?: NodeJS.ProcessEnv;
     readonly dataDir?: string;
@@ -291,7 +291,7 @@ export function unrouteZcode(opts: { env?: NodeJS.ProcessEnv; dataDir?: string; 
     }
 }
 
-export interface RestoreZcodeBackupResult {
+interface RestoreZcodeBackupResult {
     readonly restored: boolean;
 }
 
@@ -329,7 +329,7 @@ export type BootstrapMode =
         readonly routed: ZcodeRouteApplied | undefined;
     };
 
-export interface BootstrapZcodeOptions {
+interface BootstrapZcodeOptions {
     readonly env?: NodeJS.ProcessEnv;
     readonly dataDir?: string;
     readonly log?: (msg: string) => void;
@@ -408,7 +408,7 @@ async function defaultEnsureProxy(): Promise<{ origin: string; attached: boolean
 // repairs a dead pointer left by ANYONE (including hard-killed processes whose
 // JS exit handlers never run).
 
-export type StoreDriftOutcome =
+type StoreDriftOutcome =
     | "unmanaged"
     | "self"
     | "foreign-live"
@@ -416,7 +416,7 @@ export type StoreDriftOutcome =
     | "repointed-replacement"
     | "reverted-direct";
 
-export interface StoreDriftOptions {
+interface StoreDriftOptions {
     readonly selfOrigin: string;
     readonly env?: NodeJS.ProcessEnv;
     readonly dataDir?: string;
@@ -472,9 +472,9 @@ export async function repairSharedStoreDrift(opts: StoreDriftOptions): Promise<S
     return "reverted-direct";
 }
 
-export type ExitHandoffOutcome = "not-ours" | "handed-off" | "reverted-direct";
+type ExitHandoffOutcome = "not-ours" | "handed-off" | "reverted-direct";
 
-export interface ExitHandoffOptions {
+interface ExitHandoffOptions {
     readonly ownOrigin: string;
     readonly env?: NodeJS.ProcessEnv;
     readonly dataDir?: string;

@@ -216,7 +216,7 @@ type UndeliveredEntry = { ref: string; tokens: number; chars: number };
 // same-session requests can't clobber each other's commits. Pre-#1457
 // persisted notes carry no id — readers normalize them to "" so they ride
 // the same path and clear on the first confirmed delivery.
-export type DropNote = { id: string; refs: string[]; reason: string; createdAt: number };
+type DropNote = { id: string; refs: string[]; reason: string; createdAt: number };
 const MAX_DROP_NOTES = 64;
 const DEFAULT_RETRIEVAL_TTL_MS = 10 * 60 * 1000;
 

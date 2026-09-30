@@ -15,7 +15,7 @@ function isObj(v: unknown): v is Record<string, unknown> {
     return typeof v === "object" && v !== null;
 }
 
-export interface DroppedOpenaiPartsReport {
+interface DroppedOpenaiPartsReport {
     count: number;
     types: string[];
     firstIndex: number;

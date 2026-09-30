@@ -17,7 +17,7 @@ export interface ClaudeSettings {
     autoCompactWindow?: number;
 }
 
-export interface ModelWindow {
+interface ModelWindow {
     id: string;
     contextWindow: number;
     /** Configured max output for the model (#971), when the client's own
@@ -104,7 +104,7 @@ export interface HermesConfig {
     providers: Record<string, HermesProvider>;
 }
 
-export interface DshConfig {
+interface DshConfig {
     baseUrls: string[];
 }
 
@@ -164,20 +164,20 @@ export interface KimiConfig {
     defaultModel?: string;
 }
 
-export interface GeminiConfig {
+interface GeminiConfig {
     /** The user's pre-existing `GOOGLE_GEMINI_BASE_URL` env — when set,
      *  gemini-cli already routes model traffic to this relay, so the launcher
      *  wraps IT via /bili/ instead of the stock Google endpoint. */
     baseUrl?: string;
 }
 
-export interface IflowConfig {
+interface IflowConfig {
     /** The user's pre-existing iFlow base-URL env (`IFLOW_BASE_URL` /
      *  `IFLOW_baseUrl`) — relay-wrap semantics, same as GeminiConfig.baseUrl. */
     baseUrl?: string;
 }
 
-export interface McodeProvider {
+interface McodeProvider {
     baseUrl?: string;
 }
 
@@ -313,7 +313,7 @@ export function nonEmpty(s: unknown): s is string {
     return typeof s === "string" && s.trim().length > 0;
 }
 
-export function readJsonObject(filePath: string): Record<string, unknown> | null {
+function readJsonObject(filePath: string): Record<string, unknown> | null {
     try {
         const txt = fs.readFileSync(filePath, "utf8");
         const parsed: unknown = JSON.parse(txt);
@@ -1351,7 +1351,7 @@ export function readOpencodeConfig(file: string): OpencodeConfig {
     return parseOpencodeProviders(readConfigFileRoot(file));
 }
 
-export interface OpencodeProjectProviderView {
+interface OpencodeProjectProviderView {
     baseURL?: string;
     file: string;
 }
@@ -1489,7 +1489,7 @@ export function zcodePersonalConfigFiles(zcodeHome: string, env: NodeJS.ProcessE
     return [...new Set([zcodeStoreFileFor(env, "new"), path.join(zcodeHome, "v2", "provider_config.json")])];
 }
 
-export function zcodeLegacyConfigFiles(zcodeHome: string, env: NodeJS.ProcessEnv): string[] {
+function zcodeLegacyConfigFiles(zcodeHome: string, env: NodeJS.ProcessEnv): string[] {
     return [...new Set([zcodeStoreFileFor(env, "legacy"), path.join(zcodeHome, "v2", "config.json")])];
 }
 
@@ -1653,7 +1653,7 @@ export function readAiderConfig(env: NodeJS.ProcessEnv = process.env, cwd: strin
  *  launched client's own declarations are authoritative (#436: launching
  *  `bili omp` with omp's models.yml declaring 131072 must not be overridden by
  *  another client's larger declaration for the same model id). */
-export type ModelWindowScope = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "mcode" | "aider" | "copilot" | "amp" | "goose";
+type ModelWindowScope = "claude" | "codex" | "pi" | "omp" | "opencode" | "hermes" | "dsh" | "codebuddy" | "qoder" | "trae" | "jcode" | "kimi" | "gemini" | "iflow" | "qwen" | "mcode" | "aider" | "copilot" | "amp" | "goose";
 
 /** Collect per-model context windows from client configs the launcher can
  *  read (pi models.json, omp models.yml, opencode opencode.json, codex

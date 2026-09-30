@@ -17,7 +17,7 @@ import {
     type KimiRouteState,
 } from "./toml-edit.js";
 
-export type KimiNativePlan =
+type KimiNativePlan =
     | { readonly mode: "off" }
     | { readonly mode: "attach"; readonly attachOrigin: string }
     | { readonly mode: "spawn" };
@@ -109,7 +109,7 @@ export interface KimiRouteApplied {
     readonly authSource: string;
 }
 
-export interface RouteKimiOptions {
+interface RouteKimiOptions {
     readonly origin: string;
     readonly env?: NodeJS.ProcessEnv;
     readonly kimiHome?: string;
@@ -221,7 +221,7 @@ export function unrouteKimi(opts: { env?: NodeJS.ProcessEnv; kimiHome?: string; 
     }
 }
 
-export interface RestoreKimiBackupResult {
+interface RestoreKimiBackupResult {
     readonly restored: boolean;
 }
 
@@ -256,7 +256,7 @@ export type BootstrapMode =
         readonly routed: KimiRouteApplied | undefined;
     };
 
-export interface BootstrapKimiOptions {
+interface BootstrapKimiOptions {
     readonly env?: NodeJS.ProcessEnv;
     readonly kimiHome?: string;
     readonly log?: (msg: string) => void;

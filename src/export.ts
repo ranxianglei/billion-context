@@ -4,13 +4,13 @@ import { matchSession as matchSessionKernel, renderHandoff as renderHandoffKerne
 import type { Session } from "./session.js";
 import { SessionStore } from "./persist.js";
 
-export interface ExportOptions {
+interface ExportOptions {
     dir?: string;
     output?: string;
     full?: boolean;
 }
 
-export interface SessionSummary {
+interface SessionSummary {
     id: string;
     title?: string;
     label?: string;

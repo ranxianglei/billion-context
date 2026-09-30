@@ -9,7 +9,7 @@ import type { TagEchoFilterStats } from "./loop/tag-echo-filter.js";
 // rare and equally confusing to an agentic client, so it warns too. Callers
 // gate on their wire's own state (reason seen, tool calls emitted, thinking
 // presence) and feed the filter's lifetime text accounting.
-export interface TurnOutcome {
+interface TurnOutcome {
     /** Wire-native reason observed (stop_reason / finish_reason / status), if any. */
     reason: string | undefined;
     /** The wire's normal-completion reason ("end_turn" / "stop" / "completed"). */

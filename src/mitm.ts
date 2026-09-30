@@ -55,7 +55,7 @@ export function liveBlindTunnels(): number {
     return blindTunnelLive;
 }
 
-export interface BlindTunnelStats {
+interface BlindTunnelStats {
     total: number;
     hosts: Record<string, number>;
 }

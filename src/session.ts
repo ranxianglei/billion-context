@@ -566,14 +566,7 @@ function canonicalIdOf(session: Session): string {
  *  Called where the id is surfaced to the model (wire notes) so the exact value
  *  shown is the one persisted and routable. Anonymous sessions are a no-op
  *  (canonical id already equals session.id). */
-export function ensureCanonicalId(session: Session): string {
-    const id = canonicalIdOf(session);
-    if (!session.id.startsWith("pfa-") && session.metadata.canonicalId !== id) {
-        session.metadata.canonicalId = id;
-        markDirty(session);
-    }
-    return id;
-}
+
 
 /** Read-only reverse lookup: the resident session whose canonical id matches.
  *  Scans the in-memory pool (≤ MAX_SESSIONS); always consistent with the live
@@ -770,7 +763,7 @@ const REWRITE_MAX_KNOWN_RATIO = 0.5;
 // (stale map entries linger until session end); a false positive is fatal.
 export const REWRITE_MIN_INCOMING_TOTAL = 10;
 
-export interface RewriteDetection {
+interface RewriteDetection {
     detected: boolean;
     knownBefore: number;
     incomingTotal: number;
@@ -805,7 +798,7 @@ export function detectUnannouncedHistoryRewrite(
  *  compress result already reported them as saved. Returns how many of the
  *  covered ids are present in the resent history, or null when coverage is
  *  complete (or nothing was covered). */
-export interface FoldCoverage {
+interface FoldCoverage {
     expected: number;
     matched: number;
 }

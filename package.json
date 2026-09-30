@@ -18,6 +18,7 @@
     "registry:snapshot": "node scripts/update-registry-snapshot.mjs",
     "codex-models:snapshot": "node scripts/update-codex-models-snapshot.mjs",
     "typecheck": "tsc --noEmit --project tsconfig.build.json",
+    "check:unused-exports": "node scripts/check-unused-exports.mjs",
     "test": "node --import tsx --test tests/*.test.ts",
     "start": "node dist/index.js",
     "test:e2e": "node --import tsx --test tests/e2e/e2e-codex.test.ts",
