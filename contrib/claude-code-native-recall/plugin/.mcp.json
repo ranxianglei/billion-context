@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "recall": {
-      "command": "python",
+      "command": "python3",
       "args": [
         "-X",
         "utf8",

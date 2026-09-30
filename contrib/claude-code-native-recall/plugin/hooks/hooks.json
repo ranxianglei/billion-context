@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" nudge",
+            "command": "python3 -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" nudge",
             "timeout": 10
           }
         ]
@@ -18,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" nudge",
+            "command": "python3 -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" nudge",
             "timeout": 10
           }
         ]
@@ -29,7 +29,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" precompact",
+            "command": "python3 -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" precompact",
             "timeout": 60
           }
         ]
@@ -41,47 +41,47 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" restore 0",
+            "command": "python3 -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" restore 0",
             "timeout": 30
           },
           {
             "type": "command",
-            "command": "python -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" restore 1",
+            "command": "python3 -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" restore 1",
             "timeout": 30
           },
           {
             "type": "command",
-            "command": "python -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" restore 2",
+            "command": "python3 -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" restore 2",
             "timeout": 30
           },
           {
             "type": "command",
-            "command": "python -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" restore 3",
+            "command": "python3 -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" restore 3",
             "timeout": 30
           },
           {
             "type": "command",
-            "command": "python -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" restore 4",
+            "command": "python3 -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" restore 4",
             "timeout": 30
           },
           {
             "type": "command",
-            "command": "python -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" restore 5",
+            "command": "python3 -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" restore 5",
             "timeout": 30
           },
           {
             "type": "command",
-            "command": "python -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" restore 6",
+            "command": "python3 -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" restore 6",
             "timeout": 30
           },
           {
             "type": "command",
-            "command": "python -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" restore 7",
+            "command": "python3 -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" restore 7",
             "timeout": 30
           },
           {
             "type": "command",
-            "command": "python -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" restore 8",
+            "command": "python3 -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" restore 8",
             "timeout": 30
           }
         ]
