@@ -563,10 +563,14 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 
 #### `visibilityMarkers`
 
-- **Type:** `boolean`
-- **Default:** `true`
+- **Type:** `boolean | "stream" | "model-only" | "off"` (legacy booleans accepted: `true` ≡ `"stream"`, `false` ≡ `"off"`)
+- **Default:** `true` (≡ `"stream"`)
 - **Status:** ACTIVE
-- **Description:** Controls the 📦/❌ ACP visibility markers emitted after the proxy executes a proxy tool call (`compress` / `decompress` / `search_context` / `acp_status`). When on, each execution appends a marker line to the response stream and/or re-injects a marker message into that round's rebuilt history so the model can see what happened on later turns. Set `false` to suppress both artifacts — for deployments where models imitate or narrate around the markers (outputting their own confirmation lines or commentary; see issue #862). The tool executions themselves are unaffected: calls still run, and paired tool-call/tool-result messages are still recorded as usual; only the marker line/message is omitted. Since #913, `false` also drops the #862 silence clause from the marker-integrity note appended to nudges and the injected compress prompt — an invisible deployment has no marker for the model to imitate or narrate around, so the clause is pure noise there. The #717 anti-forgery segment stays unconditional in every configuration. Same three-level merge as every other field. The #717 anti-forgery stripping of model-emitted fake markers is independent of this flag and stays active.
+- **Description:** Controls the 📦/❌ ACP visibility markers emitted after the proxy executes a proxy tool call (`compress` / `decompress` / `search_context` / `acp_status`). Three delivery modes (#1701):
+  - `"stream"` (default; legacy `true`): each execution appends a marker line to the response stream AND re-injects a marker message into that round's rebuilt history so the model can see what happened on later turns. Byte-identical to the pre-#1701 behavior.
+  - `"model-only"`: model-side injection stays on, but the client stream carries zero receipt bytes — the receipts live only between the proxy and the model. Exception: a terminal compression failure (retry exhaustion at the loop limit) still surfaces to the client as exactly one visible ❌ line, so a failed compression never vanishes without trace. Intermediate failures and retry corrections stay silent.
+  - `"off"` (legacy `false`): both artifacts suppressed — for deployments where models imitate or narrate around the markers (outputting their own confirmation lines or commentary; see issue #862).
+  The tool executions themselves are unaffected in every mode: calls still run, and paired tool-call/tool-result messages are still recorded as usual; only the marker line/message is omitted. The #913 silence clause in the marker-integrity note follows *model* visibility: it is kept for `"stream"` and `"model-only"` (the model can still see receipts to imitate) and dropped only for `"off"`. The #717 anti-forgery segment stays unconditional in every configuration. Same three-level merge as every other field. The #717 anti-forgery stripping of model-emitted fake markers is independent of this flag and stays active. Scope note: `"model-only"` takes effect in lanes where the proxy controls the response stream (all proxy lanes); the plugin lane (host-embedded agents) keeps its current behavior until verified separately.
 
 ### Injection toggles (global only)
 

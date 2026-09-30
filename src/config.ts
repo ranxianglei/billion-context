@@ -217,11 +217,24 @@ export type CompressSettings = {
      *  Deepest level wins (global → provider → model), whole-array replace. */
     preserveRecentTools?: string[];
     /** Emit 📦/❌ ACP visibility markers after proxy tool executions
-     *  (compress / decompress / search_context / acp_status) — both the marker
-     *  line streamed to the client and the marker message re-injected into
-     *  rebuilt history. `false` suppresses them entirely, for deployments where
-     *  models imitate or narrate around the markers (#862). Default `true`. */
-    visibilityMarkers?: boolean;
+     *  (compress / decompress / search_context / acp_status). Tri-state since
+     *  #1701; legacy booleans still accepted (`true` ≡ `"stream"`,
+     *  `false` ≡ `"off"`):
+     *  - `"stream"` (default): dual delivery — the marker line is streamed to
+     *    the client AND marker messages are re-injected into the model-side
+     *    rebuilt history.
+     *  - `"model-only"`: model-side injection stays on (paired/orphan carriers
+     *    plus the #862 silence clause — the model still sees receipts, so it
+     *    still has something to imitate) but NOTHING is emitted to the client
+     *    stream; clients never persist or echo receipts. A terminal
+     *    compression failure (retry exhaustion) still surfaces as one visible
+     *    ❌ line.
+     *  - `"off"`: both sides suppressed, for deployments where models imitate
+     *    or narrate around the markers (#862).
+     *  Tool executions themselves are unaffected in every mode: paired
+     *  tool-call/tool-result messages are always recorded. Same three-level
+     *  merge as every other field. */
+    visibilityMarkers?: boolean | "stream" | "model-only" | "off";
     /** Override the kernel's compression prompt text (compressPhilosophy /
      *  howToCompressRules / tier2DistillRules / tier3CondenseRules). All four
      *  fields are LOAD-BEARING: the kernel rules were tuned in production and
@@ -1302,8 +1315,10 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
         else out.stripImages = obj.stripImages;
     }
     if ("visibilityMarkers" in obj) {
-        if (typeof obj.visibilityMarkers !== "boolean") ok = false;
-        else out.visibilityMarkers = obj.visibilityMarkers;
+        const vm = obj.visibilityMarkers;
+        if (typeof vm === "boolean") out.visibilityMarkers = vm;
+        else if (vm === "stream" || vm === "model-only" || vm === "off") out.visibilityMarkers = vm;
+        else ok = false;
     }
     if ("rules" in obj) {
         if (typeof obj.rules !== "boolean") ok = false;

@@ -6,7 +6,7 @@ import tls from "node:tls";
 import { createHash, randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { createCore, type CompressionCore, type CompressionState, type Config, type AbsorbConfig, type CoreMessage, type NudgeDecision, type Prompts, type PackSurface, type ToolPrompts, applyAcpToolOverrides, defaultPrompts, defaultCountTokens, renderNudgeText, deactivateBlock, viableRanges, resolveOutputSteeringConfig } from "acp-kernel";
-import { DEFAULT_STRIP_IMAGES_KEEP_RECENT, applyCompressSettings, resolveAbsorbSettings, resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig } from "./compress-settings.js";
+import { DEFAULT_STRIP_IMAGES_KEEP_RECENT, applyCompressSettings, resolveAbsorbSettings, resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig, resolveVisibilityMode, type VisibilityMode } from "./compress-settings.js";
 import { dropCompressReasoning, type CompressReasoningConfig } from "./reasoning-drop.js";
 import type { CompressSettings, ProxyOptions } from "./config.js";
 import { loadOptions, loadRoutes } from "./config.js";
@@ -2579,7 +2579,7 @@ async function handle(
                         if (registryProfile !== undefined) session.metadata.cachePriceProfile = registryProfile;
                         else delete session.metadata.cachePriceProfile;
                     }
-                    const visibilityMarkers = cs.visibilityMarkers ?? true;
+                    const visibilityMode = resolveVisibilityMode(cs.visibilityMarkers);
                     const reasoningCfg = cs.reasoning;
                     const keepRecent = cs.stripImagesKeepRecent ?? DEFAULT_STRIP_IMAGES_KEEP_RECENT;
                     const stripped = cs.stripImages
@@ -2598,19 +2598,19 @@ async function handle(
                         // Both the model and the stream flag live in the URL path
                         // for this wire (the body carries neither), so they are
                         // derived here instead of read off `work`.
-                        return await prepareGoogle(work as GoogleRequestBody, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, nativeWindow, googleModel, googlePathKind(urlPath) === "stream-generate", visibilityMarkers, upstreamOrigin);
+                        return await prepareGoogle(work as GoogleRequestBody, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, nativeWindow, googleModel, googlePathKind(urlPath) === "stream-generate", visibilityMode, upstreamOrigin);
                     }
                     return protocol === "anthropic"
-                        ? await prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg, visibilityMarkers)
+                        ? await prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg, visibilityMode)
                         : protocol === "openai"
-                          ? await prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl)
+                          ? await prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMode, route?.rewrittenUrl)
                           : responsesCompact
                             // #618 review nit: when no bili compaction item is present,
                             // prepareResponsesCompact falls back to the raw bodyBuffer — forward
                             // the re-serialized post-strip work instead so dropped images don't
                             // ride along. Unchanged bodies keep the original buffer byte-identical.
                             ? prepareResponsesCompact(stripped.removed > 0 ? Buffer.from(JSON.stringify(work)) : bodyBuffer, work as ResponsesRequestBody, session, req, core, reqConfig, log)
-                            : await prepareResponses(work as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl);
+                            : await prepareResponses(work as ResponsesRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, responsesIdentity!, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMode, route?.rewrittenUrl);
                 };
                 // #332: codex's native remote-compaction request (trigger form)
                 // is dispatched BEFORE prepare/preflight. When it is not
@@ -3192,7 +3192,7 @@ async function prepareAnthropic(
     pluginMode: boolean,
     upstreamOrigin: string,
     reasoning: CompressReasoningConfig | undefined,
-    visibilityMarkers: boolean,
+    visibilityMode: VisibilityMode,
 ): Promise<Prepared> {
     const sessionId = session.id;
     const stream = parsed.stream === true;
@@ -3369,7 +3369,7 @@ async function prepareAnthropic(
             rebuiltMessages = [...rebuiltMessages, ...sysNotes.map((text) => ({ role: "user" as const, content: text }))];
         }
 
-        systemOut = injectSystem(parsed, opts, prompts, loopConfig, ensureCanonicalId(session), surface, visibilityMarkers);
+        systemOut = injectSystem(parsed, opts, prompts, loopConfig, ensureCanonicalId(session), surface, visibilityMode);
         // #1637: stamp the steady body's system. NOTE: parsed.system stays the
         // #1085 frozen CLIENT head (injectSystem's in-place view) — the round-2
         // adapter consumes that frozen head and stamps its own rebuild, so NO
@@ -3390,7 +3390,7 @@ async function prepareAnthropic(
             try {
                 const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections);
                 if (rendered.text) {
-                    rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withStagedCompressGuidance(rendered.text)), visibilityMarkers) }];
+                    rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withStagedCompressGuidance(rendered.text)), visibilityMode !== "off") }];
                 }
             } catch {
             }
@@ -3454,7 +3454,7 @@ async function prepareOpenai(
     upstreamOrigin: string,
     nativeWindow: number,
     reasoning: CompressReasoningConfig | undefined,
-    visibilityMarkers: boolean,
+    visibilityMode: VisibilityMode,
     billingUpstream?: string,
 ): Promise<Prepared> {
     const sessionId = session.id;
@@ -3596,7 +3596,7 @@ async function prepareOpenai(
         // would invalidate the cache every turn.
         const sysParts: string[] = [];
         if (openaiSystemText) sysParts.push(openaiSystemText);
-        if (shouldInject) sysParts.push(withConversationIdNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections)), visibilityMarkers), ensureCanonicalId(session)));
+        if (shouldInject) sysParts.push(withConversationIdNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections)), visibilityMode !== "off"), ensureCanonicalId(session)));
         if (absorbActive) sysParts.push(buildAbsorbSystemPrompt(absorbToolName(loopConfig)));
         rebuiltMessages = injectOpenaiSystem(rebuiltMessages, sysParts);
         if (sysNotes.length > 0) {
@@ -3620,7 +3620,7 @@ async function prepareOpenai(
             try {
                 const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections);
                 if (rendered.text) {
-                    rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withStagedCompressGuidance(rendered.text)), visibilityMarkers) }];
+                    rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withStagedCompressGuidance(rendered.text)), visibilityMode !== "off") }];
                 }
             } catch {
             }
@@ -3727,7 +3727,7 @@ async function prepareGoogle(
     nativeWindow: number,
     model: string | undefined,
     stream: boolean,
-    visibilityMarkers: boolean,
+    visibilityMode: VisibilityMode,
     upstreamOrigin: string,
 ): Promise<Prepared> {
     const sessionId = session.id;
@@ -3825,7 +3825,7 @@ async function prepareGoogle(
         // constants, so the system anchor stays identical across normal turns
         // and round-2 re-requests — skipping them here would fork the prefix
         // at every fold and collapse the upstream cache hit.
-        if (shouldInject) sysParts.push(withConversationIdNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections)), visibilityMarkers), ensureCanonicalId(session)));
+        if (shouldInject) sysParts.push(withConversationIdNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections)), visibilityMode !== "off"), ensureCanonicalId(session)));
         if (absorbActive) sysParts.push(buildAbsorbSystemPrompt(absorbToolName(loopConfig)));
         googleOutboundSystem = sysParts.join("\n\n");
         // Untouched when nothing was added beyond the client's own text: the
@@ -3843,7 +3843,7 @@ async function prepareGoogle(
             try {
                 const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections);
                 if (rendered.text) {
-                    rebuiltContents = appendGoogleNudge(rebuiltContents, withMarkerIntegrityNote(withStagedCompressGuidance(rendered.text), visibilityMarkers));
+                    rebuiltContents = appendGoogleNudge(rebuiltContents, withMarkerIntegrityNote(withStagedCompressGuidance(rendered.text), visibilityMode !== "off"));
                 }
             } catch {
             }
@@ -3925,7 +3925,7 @@ async function prepareResponses(
     upstreamOrigin: string,
     nativeWindow: number,
     reasoning: CompressReasoningConfig | undefined,
-    visibilityMarkers: boolean,
+    visibilityMode: VisibilityMode,
     billingUpstream?: string,
 ): Promise<Prepared> {
     const sessionId = session.id;
@@ -4114,7 +4114,7 @@ async function prepareResponses(
             ? []
             : (session.metadata.codexForgedSummaries as string[] | undefined) ?? [];
         if (shouldInject && !isCompactionTrigger && !process.env.ACP_NO_COMPRESS_PROMPT) {
-            const prompt = withConversationIdNote(withMarkerIntegrityNote(withSummaryBudgetNote(responsesTextProtocol ? buildCompressHybridSystemPrompt(prompts, surface?.promptSections) : buildCompressSystemPrompt(prompts, surface?.promptSections)), visibilityMarkers), ensureCanonicalId(session));
+            const prompt = withConversationIdNote(withMarkerIntegrityNote(withSummaryBudgetNote(responsesTextProtocol ? buildCompressHybridSystemPrompt(prompts, surface?.promptSections) : buildCompressSystemPrompt(prompts, surface?.promptSections)), visibilityMode !== "off"), ensureCanonicalId(session));
             const devParts = [...projection.systemParts, ...forgedSummaries, prompt];
             if (absorbActive) devParts.push(buildAbsorbSystemPrompt(absorbToolName(loopConfig)));
             const devContent = devParts.join("\n\n---\n\n");
@@ -4159,7 +4159,7 @@ async function prepareResponses(
                     const inputItems: ResponseInputItem[] = typeof rebuiltInput === "string"
                         ? [{ type: "message", role: "user", content: rebuiltInput }]
                         : rebuiltInput;
-                    inputItems.push({ type: "message", role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withStagedCompressGuidance(rendered.text)), visibilityMarkers) });
+                    inputItems.push({ type: "message", role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withStagedCompressGuidance(rendered.text)), visibilityMode !== "off") });
                     rebuiltInput = inputItems;
                     log("debug", `[${sessionId}] [inject] ephemeral nudge appended as trailing user turn (${rendered.text.length} chars)`);
                 }
@@ -4507,7 +4507,7 @@ function injectSystem(
     config: Config,
     noteId: string,
     surface?: PackSurface,
-    visibilityMarkers = true,
+    visibilityMode: VisibilityMode = "stream",
 ): string | AnthropicRequestBody["system"] {
     // ONLY the static compress prompt goes into the system block — it is the
     // prefix-cache anchor and must stay byte-stable across turns. The nudge
@@ -4515,7 +4515,7 @@ function injectSystem(
     // the caller (prepareAnthropic), never merged into system.
     const baseText = extractSystem(parsed.system);
     const parts: string[] = [];
-    if (opts.compress.injectTool) parts.push(withConversationIdNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections)), visibilityMarkers), noteId));
+    if (opts.compress.injectTool) parts.push(withConversationIdNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections)), visibilityMode !== "off"), noteId));
     if (opts.compress.injectTool && absorbEnabled(config)) parts.push(buildAbsorbSystemPrompt(absorbToolName(config)));
     if (parts.length === 0) return parsed.system;
     const full = baseText ? `${baseText}\n\n---\n\n${parts.join("\n\n")}` : parts.join("\n\n");
@@ -6164,8 +6164,8 @@ async function forward(
             const absorbSection = absorbActive
                 ? `\n\n${buildAbsorbSystemPrompt(absorbToolName(loopConfig))}`
                 : "";
-            const visibilityMarkers = resolveCompress(opts.routes, route?.rewrittenUrl, (parsedReq as { model?: string }).model, opts.compress).visibilityMarkers ?? true;
-            const systemPrompt = withConversationIdNote(withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections)), visibilityMarkers), ensureCanonicalId(prepared.session)) + absorbSection;
+            const visibilityMode = resolveVisibilityMode(resolveCompress(opts.routes, route?.rewrittenUrl, (parsedReq as { model?: string }).model, opts.compress).visibilityMarkers);
+            const systemPrompt = withConversationIdNote(withMarkerIntegrityNote(withSummaryBudgetNote(textProtocol ? buildCompressHybridSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections) : buildCompressSystemPrompt(prepared.prompts ?? defaultPrompts, prepared.surface?.promptSections)), visibilityMode !== "off"), ensureCanonicalId(prepared.session)) + absorbSection;
             const adapter = pickAdapter(prepared.protocol, parsedReq, textProtocol, prepared.responsesProjection, prepared.anthropicSystem, prepared.openaiSystemText, absorbActive ? absorbToolName(loopConfig) : undefined, prepared.google, prepared.systemNotes, opts.streamErrorShape, prepared.anthropicCacheMarks);
             const refreshFolded = async (current: CoreMessage[]): Promise<CoreMessage[]> => {
                 return withSessionLock(prepared.session, async () => {
@@ -6232,7 +6232,7 @@ async function forward(
             const loopDumpDir = opts.dumpSse;
             const loop = runCompressLoop(
                 streamToRead,
-                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, upstreamOrigin: targetOrigin, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, visibilityMarkers, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined },
+                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, upstreamOrigin: targetOrigin, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, visibilityMode, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined },
                 parsedReq,
                 { url: upstreamUrl, headers: reqHeaders, wireTransform },
                 adapter,
@@ -6282,10 +6282,10 @@ async function forward(
                 if (prepared.protocol === "responses" && prepared.responsesTextProtocol) {
                     const requestBody = JSON.parse(typeof body === "string" ? body : body.toString("utf8")) as Record<string, unknown>;
                     const requestHeaders = buildForwardHeaders(headers);
-                    const visibilityMarkers = resolveCompress(opts.routes, route?.rewrittenUrl, (requestBody as { model?: string }).model, opts.compress).visibilityMarkers ?? true;
+                    const visibilityMode = resolveVisibilityMode(resolveCompress(opts.routes, route?.rewrittenUrl, (requestBody as { model?: string }).model, opts.compress).visibilityMarkers);
                     json = await compressLoopResponsesJson(
                         json,
-                        { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, textProtocol: true, visibilityMarkers },
+                        { core, config, messages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, textProtocol: true, visibilityMode },
                         requestBody,
                         { url: upstreamUrl, headers: requestHeaders, wireTransform },
                     );
