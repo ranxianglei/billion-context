@@ -57,6 +57,7 @@ test("Codex official transport preserves OAuth headers, decodes bodies, and reba
         log: false,
         debug: false,
         passthrough: false,
+        chainContentDetection: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
     };

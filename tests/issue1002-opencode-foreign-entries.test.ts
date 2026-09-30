@@ -9,6 +9,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { pluginInstall, pluginRemove, pickPluginKey, detectOpencodeMajor } from "../src/plugin-install.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 async function withEnv(vars: Record<string, string | undefined>, fn: () => Promise<void>): Promise<void> {
     const saved = new Map<string, string | undefined>();
@@ -65,7 +66,7 @@ test("install and remove preserve foreign object entries in the plugins array (#
             // "plugin present" re-run: byte-identical file
             const bytes = fs.readFileSync(file, "utf8");
             const again = pluginInstall("opencode");
-            assert.match(again, /plugin present/);
+            assert.match(again, new RegExp(`${ocKey} present`));
             assert.equal(fs.readFileSync(file, "utf8"), bytes, "present re-run leaves the file byte-identical");
 
             // remove: only ours goes, the key SURVIVES with all foreign entries
@@ -74,7 +75,7 @@ test("install and remove preserve foreign object entries in the plugins array (#
             assert.deepEqual(end[ocKey], [OBJ_A, "foreign-str", OBJ_B], "foreign entries survive remove");
         });
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -94,7 +95,7 @@ test("remove deletes the key only when NOTHING raw remains, not when only string
             assert.deepEqual(end[ocKey], [OBJ_A], "key kept: one raw entry remains");
         });
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -118,7 +119,7 @@ test("map-form plugins survive install and remove with their options (#1002)", a
             assert.deepEqual(end[ocKey], { "@org/x": { options: { z: 1 } }, "plain-y": true }, "map survives with options");
         });
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -140,6 +141,6 @@ test(".bili-bak reflects the state before the LATEST write, not the first ever (
             assert.equal(fs.readFileSync(`${file}.bili-bak`, "utf8"), userEdited, "backup refreshed to latest pre-write state");
         });
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });

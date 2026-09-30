@@ -20,13 +20,62 @@
  *     without it the event rethrows as uncaughtException, the top-level handler
  *     logs it through this very writer, and the feedback loop spams the log
  *     file until rotation wipes the forensic window (#1233).
+ *
+ * Line format: `<iso-ts> [level][ [sess=<session-id>]] [v=<version>] <msg>`
+ * — one prefix per PHYSICAL line (multi-line payloads repeat ts+level+tags on
+ * every row, which is what makes line-wise grep / time-window queries honest).
+ * The [sess=...] token is request-scoped via AsyncLocalStorage — see
+ * enterSessionContext() below; the [v=...] token is process-wide (the running
+ * build's version), so any single line from a multi-instance shared log file
+ * self-identifies its writer even when different versions coexist.
+ *
+ * Before hitting file/stderr every line passes redactSecretsInText() (#1718)
+ * — a final scrub for credential-shaped tokens in free-form text (upstream
+ * error bodies echoing API keys), complementing per-call-site structural
+ * masking in log-mask.ts. The programmatic capture hook receives the raw
+ * message: it is an in-process test/diagnostic seam, not a log surface.
  */
 import { createWriteStream, fstatSync, mkdirSync, statSync, renameSync, unlinkSync, type WriteStream } from "node:fs";
 import path from "node:path";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { VERSION } from "./version.js";
+import { maskIpsInText, redactSecretsInText } from "./log-mask.js";
 
 const MAX_BYTES = 10 * 1024 * 1024; // 10 MB → rotate
 
 export type Logger = (level: string, msg: string) => void;
+
+// ── Request-scoped session attribution ─────────────────────────────────────
+// enterSessionContext() is called once per inbound model request, at the point
+// where identity resolves (server.ts main pipeline funnel). Because it rides
+// AsyncLocalStorage, EVERY log() call in that request's async chain — adapters,
+// kernel, persistence, plugin hooks — is tagged without touching a single
+// call site. The web log view (/__bili/logs) and plain grep rely on the stable
+// [sess=<id>] / [v=<ver>] tokens in the line head.
+const sessionCtx = new AsyncLocalStorage<string>();
+
+const SESSION_TAG_MAX = 160;
+
+/** Keep only [A-Za-z0-9._:-], collapse every other run (whitespace, brackets,
+ *  control chars) to a single underscore, cap length — the tag must never break
+ *  the `[sess=...]` token grammar that filters match against. */
+function sanitizeSessionTag(id: string): string | undefined {
+    const s = id.replace(/[^A-Za-z0-9._:-]+/g, "_").slice(0, SESSION_TAG_MAX);
+    return s.length > 0 ? s : undefined;
+}
+
+/** Bind the current request flow to a session id for log tagging. No-op when
+ *  the id is empty or sanitizes away. Idempotent within one flow. */
+export function enterSessionContext(sessionId: string | undefined | null): void {
+    if (!sessionId) return;
+    const tag = sanitizeSessionTag(sessionId);
+    if (tag) sessionCtx.enterWith(tag);
+}
+
+/** Active session tag of the current async flow (diagnostics/tests). */
+export function currentSessionContext(): string | undefined {
+    return sessionCtx.getStore();
+}
 
 let stream: WriteStream | undefined;
 let streamFd: number | undefined;
@@ -186,8 +235,16 @@ export const log: Logger = (level, msg) => {
             // best-effort: a broken test/probe sink must never crash logging
         }
     }
+    const safe = maskIpsInText(redactSecretsInText(msg));
     const ts = new Date().toISOString();
-    const line = `${ts} [${level}] ${msg}\n`;
+    const sess = sessionCtx.getStore();
+    const head = `${ts} [${level}]${sess ? ` [sess=${sess}]` : ""} [v=${VERSION}]`;
+    // One prefix per PHYSICAL line (see header doc): multi-line payloads keep
+    // timestamp + session + version attribution line by line. Fast path skips
+    // the split for the common single-line message.
+    const line = safe.indexOf("\n") < 0
+        ? `${head} ${safe}\n`
+        : safe.split("\n").map((p) => `${head} ${p}`).join("\n") + "\n";
     // stderr (foreground terminal / shell redirect). MUST NOT throw and must
     // never re-enter its own error path: a sync failure (Windows) or the async
     // 'error' event (Linux, module-init listener above) both flip us to
@@ -223,14 +280,24 @@ export const log: Logger = (level, msg) => {
     }
 };
 
-/** Flush + close the log file. Call on shutdown. */
-export function closeLogger(): void {
-    if (stream) {
-        try { stream.end(); } catch { /* best-effort */ }
-    }
+/** Flush + close the log file. Call on shutdown; resolves once every buffered
+ *  line has drained to disk, so awaiting it proves the durable record is complete. */
+export function closeLogger(): Promise<void> {
+    const s = stream;
     stream = undefined;
     streamFd = undefined;
     bytesWritten = 0;
+    if (!s) return Promise.resolve();
+    return new Promise((resolve) => {
+        let done = false;
+        const finish = (): void => {
+            if (done) return;
+            done = true;
+            resolve();
+        };
+        s.once("error", finish);
+        try { s.end(finish); } catch { finish(); }
+    });
 }
 
 export function getLogPath(): string | undefined {

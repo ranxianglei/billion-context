@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { StateStore, flatFileNameFor, type PersistedEnvelope, type StateStoreCodec } from "acp-kernel/persist";
 import { sessionsDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
+import { VERSION } from "./version.js";
 import { createStorageCodec, parseEncryptionKey } from "./encrypt.js";
 import { PersistEpermAlert } from "./persist-eperm.js";
 import { createInitialState, defaultCountTokens, prune, type CompressionState, type CoreMessage, type MessageContentStore } from "acp-kernel";
@@ -90,6 +91,7 @@ interface PersistedSession {
         upstreamOrigin?: string;
         label?: string;
         title?: string;
+        activePack?: string;
     };
     /** Cumulative usage stats (v2+). Absent on v1 files; read via the flat
      *  fallbacks below. */
@@ -117,6 +119,8 @@ interface PersistedSession {
         imageFullCalls?: number;
         imageFullRestores?: number;
         rangeRestores?: number;
+        wholeBlockRestores?: number;
+        wholeBlockRestoresPreciseAvailable?: number;
     };
     /** Free-form escape hatch (v2+). */
     metadata?: Record<string, unknown>;
@@ -642,11 +646,12 @@ export class SessionStore {
         return this.store.flushSync(session.id, this.guardedBuild(session));
     }
 
-    /** Flush all dirty sessions with a pending debounce timer. Called on
-     *  SIGTERM/SIGINT for graceful shutdown. The kernel store flushes its own
-     *  pending set (builders read the live Session objects at write time, so
-     *  no session list is needed) and drains in-flight write chains. */
-    async flushAll(_sessions: Iterable<Session>): Promise<void> {
+    /** Flush all dirty content stores, then pending session writes. Called on
+     *  SIGTERM/SIGINT for graceful shutdown. Content stores live outside the
+     *  kernel StateStore, so retry them from the resident session list before
+     *  the kernel drains its pending writes and in-flight chains. */
+    async flushAll(sessions: Iterable<Session> = []): Promise<void> {
+        for (const session of sessions) this.saveContentStore(session);
         await this.store.flushAll();
     }
 
@@ -671,7 +676,10 @@ function buildRecord(session: Session): PersistedSession {
         stats: { ...session.stats },
         messages: snapshot,
         messagesFolded: snapshot ? true : undefined,
-        metadata: { ...session.metadata },
+        // Per-session provenance: record the bili build that wrote this file so the
+        // web UI can show which version last touched the session; pre-stamp files
+        // load without the key and render an honest dash.
+        metadata: { ...session.metadata, biliVersion: VERSION },
         state: session.state,
         blockContents: Object.fromEntries(session.blockContents),
         createdAt: session.createdAt,
@@ -707,6 +715,8 @@ function buildSession(parsed: PersistedSession): Session {
             upstreamOrigin: meta.upstreamOrigin ?? parsed.upstreamOrigin,
             label: meta.label ?? parsed.label,
             title: meta.title,
+            // #1724: buildRecord persists activePack via spread but this reader dropped it
+            activePack: typeof meta.activePack === "string" ? meta.activePack : undefined,
         },
         stats: {
             requests: stats.requests ?? parsed.requests ?? 0,
@@ -741,6 +751,11 @@ function buildSession(parsed: PersistedSession): Session {
             imageFullCalls: stats.imageFullCalls ?? 0,
             imageFullRestores: stats.imageFullRestores ?? 0,
             rangeRestores: stats.rangeRestores ?? 0,
+            // #1336: retrieval-quality counters (whole-block restores vs cheaper
+            // precise path available) — round-trip so the long-run ratio in
+            // acp_status survives restarts instead of silently resetting.
+            wholeBlockRestores: stats.wholeBlockRestores ?? 0,
+            wholeBlockRestoresPreciseAvailable: stats.wholeBlockRestoresPreciseAvailable ?? 0,
         },
         metadata: parsed.metadata ?? {},
         state: mergeState(parsed.state),

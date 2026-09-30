@@ -52,9 +52,12 @@ test("isCodexClient: UA prefix detection (Node lowercases header keys)", () => {
     assert.equal(isCodexClient({ "user-agent": ["other", "codex_cli_rs/0.1.0"] }), false, "array UA first is not codex");
 });
 
-test("isCodexClient: lenient 'codex' substring fallback for unknown client variants (#645)", () => {
-    assert.equal(isCodexClient({ "user-agent": "codex_new_variant/9.9.9" }), true, "unknown prefix still contains codex");
-    assert.equal(isCodexClient({ "user-agent": "Mozilla/5.0 (codex-embed)" }), true, "codex mentioned mid-UA");
+test("isCodexClient: lenient token-level 'codex' fallback for unknown client variants (#645, narrowed to token prefix #1641)", () => {
+    assert.equal(isCodexClient({ "user-agent": "codex_new_variant/9.9.9" }), true, "unknown variant: component starting with codex");
+    assert.equal(isCodexClient({ "user-agent": "relay/1.0 codex_cli_rs/0.21.0" }), true, "known variant behind a relay component still detected via token fallback");
+    assert.equal(isCodexClient({ "user-agent": "Mozilla/5.0 (codex-embed)" }), false, "parenthesized mention mid-UA is NOT codex (#1641)");
+    assert.equal(isCodexClient({ "user-agent": "my-ide/2.0 vendor/codex-wrapper/1.0" }), false, "mid-path substring hit is NOT codex (#1641)");
+    assert.equal(isCodexClient({ "user-agent": "x-codex/1.0" }), false, "component containing codex after another prefix is NOT codex (#1641)");
     assert.equal(isCodexClient({ "user-agent": "Codex_CLI_RS/0.53.0" }), true, "known prefix matches case-insensitively (#1169)");
     assert.equal(isCodexClient({ "user-agent": "node-fetch/3.1" }), false, "no codex at all");
     assert.equal(isCodexClient({ "user-agent": "CodeXchange/1.0" }), false, "mixed-case 'codex'-shaped UA is NOT codex: fallback stays case-sensitive (#1106)");

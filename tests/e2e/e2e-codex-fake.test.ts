@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
+import { assertPortDead } from "../port-race.js";
 
 const CODEX_BIN = process.env.E2E_CODEX_BIN ?? "codex";
 const DIST = process.env.E2E_BILI_DIST ?? path.resolve(import.meta.dirname, "../../dist/index.js");
@@ -107,6 +108,7 @@ async function startCtx(contextWindow: number): Promise<Ctx> {
 	};
 	for (const d of [ctx.codexHome, ctx.xdg.config, ctx.xdg.cache, ctx.xdg.state]) fs.mkdirSync(d, { recursive: true });
 
+	await assertPortDead(ctx.fakePort); // #1689: prove still free right before the child binds it
 	const fake = spawn(process.execPath, [FAKE_UPSTREAM], {
 		env: { ...process.env, FAKE_PORT: String(ctx.fakePort), FAKE_HOST: "127.0.0.1", FAKE_REQLOG: ctx.reqLog, FAKE_MODEL: MODEL },
 		stdio: ["ignore", "pipe", "pipe"],
@@ -127,6 +129,7 @@ async function startCtx(contextWindow: number): Promise<Ctx> {
 		"",
 	].join("\n"));
 
+	await assertPortDead(ctx.port); // #1689: prove still free right before the child binds it
 	const logPath = path.join(work, "bili.log");
 	const proxy = spawn(process.execPath, [DIST, "start", "--port", String(ctx.port), "--no-auto-update"], {
 		env: {

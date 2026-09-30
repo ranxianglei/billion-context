@@ -47,6 +47,13 @@ export function _resetCertRejectionWarningForTest(): void {
 // failure mode is visible instead of silent.
 const blindTunnelCounts = new Map<string, number>();
 const warnedBlindTunnels = new Set<string>();
+// #1452: blind tunnels currently OPEN — liveConns breakdown for the [exposure]
+// telemetry line; tunnels are the one long-lived socket family outside the
+// http server's own lifecycle ledger.
+let blindTunnelLive = 0;
+export function liveBlindTunnels(): number {
+    return blindTunnelLive;
+}
 
 interface BlindTunnelStats {
     total: number;
@@ -76,6 +83,7 @@ export function getBlindTunnelStats(): BlindTunnelStats {
 export function _resetBlindTunnelStatsForTest(): void {
     blindTunnelCounts.clear();
     warnedBlindTunnels.clear();
+    blindTunnelLive = 0;
 }
 
 /** Max ms to wait for a MITM client to finish the TLS handshake after we
@@ -204,6 +212,13 @@ function tunnelThrough(
         clearTimeout(connectTimer);
         clientSocket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
         if (head.length > 0) upstream.write(head);
+        blindTunnelLive++;
+        let tunnelLive = true;
+        const dropTunnelCount = () => {
+            if (tunnelLive) { tunnelLive = false; blindTunnelLive--; }
+        };
+        upstream.once("close", dropTunnelCount);
+        clientSocket.once("close", dropTunnelCount);
         upstream.pipe(clientSocket);
         clientSocket.pipe(upstream);
         log(`tunnel ${maskHostForLog(host)}:${port} established (blind TCP, not decrypted)`);

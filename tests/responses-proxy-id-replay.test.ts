@@ -52,21 +52,44 @@ test("native ids, references, non-assistant items and incomplete messages remain
     }
 });
 
-test("existing 64-character boundary and long-id healing stay unchanged", () => {
-    const input = [
+test("provider-issued over-64 ids stay byte-identical across item types (#1474)", () => {
+    const longId = "x".repeat(80);
+    const input: unknown[] = [
+        { type: "message", role: "assistant", id: longId, content: "answer" },
+        { type: "message", role: "user", id: longId, content: "question" },
+        { type: "reasoning", id: `rs_${"a".repeat(100)}`, encrypted_content: "opaque", summary: [] },
+        { type: "function_call", id: `fc_${"b".repeat(100)}`, call_id: `call_${"c".repeat(80)}`, name: "tool", arguments: "{}" },
+        { type: "custom_tool_call", id: `ctc_${"d".repeat(100)}`, call_id: "call_2", name: "tool", input: "text" },
+        { type: "item_reference", id: `item_${"e".repeat(100)}` },
+        { type: "compaction", id: `comp_${"f".repeat(100)}`, encrypted_content: "opaque" },
+    ];
+    const expected = structuredClone(input);
+    sanitizeResponsesInputIds(input);
+    assert.deepEqual(input, expected, "ids bili does not own reach the upstream byte-identical");
+});
+
+test("over-64 id healing stays scoped to the msg-proxy namespace (#242/#1474)", () => {
+    const poisoned = `msg-proxy-2-${"x".repeat(60)}`;
+    const input: Record<string, unknown>[] = [
         { type: "message", role: "assistant", id: "x".repeat(64), content: "answer" },
         { type: "message", role: "assistant", id: "x".repeat(65), content: "answer" },
         { type: "function_call", id: "x".repeat(65), call_id: "y".repeat(80) },
+        { type: "message", role: "user", id: poisoned, content: [] },
     ];
     sanitizeResponsesInputIds(input);
-    assert.equal(input[0].id, "x".repeat(64));
-    assert.match(input[1].id, /^msg-fix-/);
-    assert.ok(input[1].id.length <= 64);
-    assert.equal(input[2].id, input[1].id);
+    assert.equal(input[0].id, "x".repeat(64), "64-char boundary preserved");
+    assert.equal(input[1].id, "x".repeat(65), "over-64 ids outside Bili's namespace are untouched");
+    assert.equal(input[2].id, "x".repeat(65));
     assert.equal(input[2].call_id, "y".repeat(80));
+    const healed = String(input[3].id);
+    assert.match(healed, /^msg-fix-/);
+    assert.ok(healed.length <= 64);
     const expected = structuredClone(input);
     sanitizeResponsesInputIds(input);
-    assert.deepEqual(input, expected);
+    assert.deepEqual(input, expected, "cleanup is idempotent");
+    const again: Record<string, unknown>[] = [{ type: "message", role: "user", id: poisoned, content: [] }];
+    sanitizeResponsesInputIds(again);
+    assert.equal(String(again[0].id), healed, "rewrite is deterministic per source id");
 });
 
 test("emitText lifecycle keeps its local id while the next full-message replay omits it", () => {

@@ -9,8 +9,13 @@ import {
     type Config as KernelConfig,
     type CoreMessage,
     type MessageContentStore,
+    type RetrievalExport,
 } from "acp-kernel";
+import { randomUUID } from "node:crypto";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { log as loggerLog } from "./logger.js";
+import { stateDir } from "./paths.js";
 import { getStore } from "./persist.js";
 import type { CompressSettings } from "./config.js";
 import type { PendingRetrieval, Session } from "./session.js";
@@ -139,10 +144,12 @@ export function cloneStoreForRefs(store: MessageContentStore, refs: Iterable<str
 }
 
 /** Execute a retrieve-tool call against the kernel store: resolve the ref,
- *  count hit/miss, and queue the full-text injection for the re-request path
- *  (request-only, same channel as nudges — never persisted, structurally
- *  excluded from refs). Returns the deterministic ack that rides as the tool
- *  result on every wire. A hallucinated ref costs one tool call by design. */
+ *  count hit/miss, and return the framed original IN THE TOOL RESULT ITSELF
+ *  (GHSA jc6g v2: untrusted data rides back at the trust tier it came from,
+ *  never as a host-synthesized system message). Originals at or above the
+ *  inline threshold are exported to <stateDir>/retrieve/<ref>.txt and the
+ *  tool result carries a file pointer the model reads with its file tool.
+ *  A hallucinated ref costs one tool call by design. */
 export function executeRetrieve(args: Record<string, unknown>, session: Session): string {
     session.stats.retrieveCalls = (session.stats.retrieveCalls ?? 0) + 1;
     const rawRef = args.ref;
@@ -151,20 +158,46 @@ export function executeRetrieve(args: Record<string, unknown>, session: Session)
         session.stats.retrieveMisses = (session.stats.retrieveMisses ?? 0) + 1;
         return `[${retrieveToolName(session)} FAILED: ref (an mNNNNN id) is required]`;
     }
-    const result = applyRetrieve({ store: contentStoreOf(session), ref });
+    const result = applyRetrieve({ store: contentStoreOf(session), ref, exportDir: retrievalExportDir() });
     if (!result.ok) {
         session.stats.retrieveMisses = (session.stats.retrieveMisses ?? 0) + 1;
         loggerLog("info", `[ccr] retrieve ${ref}: miss (${result.reason})`);
-        return result.ackText;
+        return result.toolResultText;
     }
     session.stats.retrieveHits = (session.stats.retrieveHits ?? 0) + 1;
     session.state = noteRetrieval(session.state);
-    // [#1343] Queue with durable bookkeeping: the ack above is committed NOW,
-    // but the full text only reaches the model on a later upstream request.
-    // The ledger tracks it until delivered or dropped (never silently lost).
-    queueRetrieval(session, { ref, tokens: result.entry.tokens, chars: result.entry.chars, injection: result.injection });
-    loggerLog("info", `[ccr] retrieve ${ref} (${result.entry.tokens} tok, ${result.entry.chars} chars)`);
-    return result.ackText;
+    recordRetrieveHit(session, ref);
+    if (result.export !== undefined && !writeRetrievalExport(result.export)) {
+        // The pointer names a file we could not write — degrade to a bounded
+        // head preview instead of handing the model a dead path.
+        return `[${retrieveToolName(session)} FAILED: could not write ${result.export.path} — head preview follows]\n${result.entry.head}`;
+    }
+    // Delivery is the tool result itself (the #1343 queued-injection
+    // lifecycle is retired for CCR): the hit is delivered the moment this
+    // returns, so it counts as delivered now — nothing left to queue.
+    session.stats.retrieveDelivered = (session.stats.retrieveDelivered ?? 0) + 1;
+    loggerLog("info", `[ccr] retrieve ${ref} (${result.entry.tokens} tok, ${result.entry.chars} chars${result.export ? `, exported ${result.export.path}` : ""})`);
+    return result.toolResultText;
+}
+
+/** Host side of the kernel RetrievalExport effect: exports land under
+ *  <stateDir>/retrieve/<ref>.txt with 0600 (folded conversation content is
+ *  not world-readable on multi-user hosts), parents created on demand.
+ *  Content-addressed by ref, so a repeated retrieve rewrites identical
+ *  bytes (idempotent; the kernel already deduped by content). */
+function retrievalExportDir(): string {
+    return join(stateDir(), "retrieve");
+}
+
+function writeRetrievalExport(exported: RetrievalExport): boolean {
+    try {
+        mkdirSync(dirname(exported.path), { recursive: true });
+        writeFileSync(exported.path, exported.text, { encoding: "utf8", mode: 0o600 });
+        return true;
+    } catch (e) {
+        loggerLog("warn", `[ccr] retrieve export write failed (${exported.path}): ${String(e)}`);
+        return false;
+    }
 }
 
 // [#1343] Delivery lifecycle for queued retrievals. The ack is committed the
@@ -176,7 +209,15 @@ export function executeRetrieve(args: Record<string, unknown>, session: Session)
 // to disk unchanged); the injection payloads stay in-memory only.
 
 type UndeliveredEntry = { ref: string; tokens: number; chars: number };
-type DropNote = { refs: string[]; reason: string };
+// [#1457] A corrective note carries a stable id assigned ONCE at creation:
+// notes are snapshotted onto outgoing requests without being consumed, and
+// committed by id only after upstream confirms delivery (2xx). The id
+// round-trips in session.metadata, so it survives restarts, and concurrent
+// same-session requests can't clobber each other's commits. Pre-#1457
+// persisted notes carry no id — readers normalize them to "" so they ride
+// the same path and clear on the first confirmed delivery.
+export type DropNote = { id: string; refs: string[]; reason: string; createdAt: number };
+const MAX_DROP_NOTES = 64;
 const DEFAULT_RETRIEVAL_TTL_MS = 10 * 60 * 1000;
 
 function readLedger(session: Session): UndeliveredEntry[] {
@@ -201,21 +242,14 @@ function retrievalTtlMs(): number {
 function bufferDropNote(session: Session, refs: string[], reason: string): void {
     const existing = session.metadata.ccrDropNotes;
     const arr = Array.isArray(existing) ? (existing as DropNote[]) : [];
-    arr.push({ refs, reason });
-    session.metadata.ccrDropNotes = arr;
-}
-
-/** Queue a hit for later delivery: add the ephemeral injection carrier plus a
- *  durable ledger entry (deduped by ref — a ref is never reused, kernel
- *  contract). Returns nothing; the ack is produced by executeRetrieve. */
-function queueRetrieval(session: Session, r: Omit<PendingRetrieval, "queuedAt">): void {
-    const carrier = session.pendingRetrievals ?? (session.pendingRetrievals = []);
-    if (carrier.some((p) => p.ref === r.ref)) return;
-    carrier.push({ ...r, queuedAt: Date.now(), ccr: true });
-    let ledger = readLedger(session);
-    if (!ledger.some((e) => e.ref === r.ref)) {
-        session.metadata.ccrUndelivered = [...ledger, { ref: r.ref, tokens: r.tokens, chars: r.chars }];
+    arr.push({ id: randomUUID(), refs, reason, createdAt: Date.now() });
+    // Bounded: undelivered notes are rare (one per loss event); the cap only
+    // guards a pathological never-delivered loop from growing metadata forever.
+    while (arr.length > MAX_DROP_NOTES) {
+        const evicted = arr.shift();
+        loggerLog("warn", `[ccr] corrective note buffer full (${MAX_DROP_NOTES}) — evicting oldest (${evicted?.refs.join(", ") ?? "?"}: ${evicted?.reason ?? "?"})`);
     }
+    session.metadata.ccrDropNotes = arr;
 }
 
 /** Snapshot the currently-queued items WITHOUT removing them. Plugin-lane
@@ -292,16 +326,40 @@ export function reconcileReloadedRetrievals(session: Session): void {
     if (lost.length > 0) dropRetrievals(session, lost, "proxy restarted before delivery");
 }
 
-/** Consolidate buffered drop notes into ONE model-facing correction and clear
- *  them. Returns null when nothing is pending. Rides as an ephemeral trailing
- *  user message (same channel as nudges). */
-export function flushRetrievalNotes(session: Session): string | null {
+/** [#1457] Non-destructive snapshot of buffered drop notes: reading them must
+ *  not consume them — consumption happens ONLY when upstream confirms delivery
+ *  of the request that carried them (commitRetrievalNotes). Returns [] when
+ *  nothing is pending. Legacy entries without an id normalize to "". */
+export function snapshotRetrievalNotes(session: Session): DropNote[] {
     const v = session.metadata.ccrDropNotes;
-    if (!Array.isArray(v) || v.length === 0) return null;
-    const notes = v as DropNote[];
-    delete session.metadata.ccrDropNotes;
+    if (!Array.isArray(v) || v.length === 0) return [];
+    return (v as DropNote[]).map((n) => ({ ...n, id: typeof n.id === "string" ? n.id : "" }));
+}
+
+/** Render buffered drop notes into ONE model-facing correction (pure — does
+ *  not consume them). Returns null when nothing is pending. Rides as an
+ *  ephemeral trailing user message (same channel as nudges). */
+export function renderRetrievalNotes(notes: DropNote[]): string | null {
+    if (notes.length === 0) return null;
     const lines = notes.map((n) => `${n.refs.join(", ")}: ${n.reason}`).join("; ");
     return `[billion-context] Earlier acp_retrieve result(s) were NOT delivered, so their acks are stale and you do NOT have that content: ${lines}. Re-issue acp_retrieve for any ref above to fetch it.`;
+}
+
+/** Confirmed upstream success for the request that carried these notes: remove
+ *  exactly the given ids (idempotent — a note created after the snapshot is
+ *  untouched, a double-commit is a no-op). Notes that were never attached stay
+ *  pending for the next request. */
+export function commitRetrievalNotes(session: Session, ids: Iterable<string>): void {
+    const requested = [...new Set(ids)];
+    if (requested.length === 0) return;
+    const v = session.metadata.ccrDropNotes;
+    if (!Array.isArray(v) || v.length === 0) return;
+    const reqSet = new Set(requested);
+    const remaining = (v as DropNote[]).filter((n) => !reqSet.has(typeof n.id === "string" ? n.id : ""));
+    if (remaining.length === v.length) return;
+    if (remaining.length === 0) delete session.metadata.ccrDropNotes;
+    else session.metadata.ccrDropNotes = remaining;
+    loggerLog("info", `[ccr] ${v.length - remaining.length} corrective note(s) confirmed delivered`);
 }
 
 /** Proxy-mode drain: ack + injection are composed within ONE response flow (no
@@ -314,4 +372,20 @@ export function drainPendingRetrievals(session: Session): CoreMessage[] {
     session.pendingRetrievals = [];
     commitRetrievals(session, items.map((i) => i.ref));
     return items.map((i) => i.injection);
+}
+
+// #1336: per-ref hit counts feed plan-aware search steering (repeat-retrieve
+// hint). In-memory only, bounded — an unbounded map would grow with every
+// distinct ref across a long session. Map insertion order gives FIFO trim.
+const RETRIEVE_COUNT_CAP = 512;
+
+export function recordRetrieveHit(session: Session, ref: string): void {
+    const counts = session.retrieveCountsByRef ?? new Map<string, number>();
+    counts.set(ref, (counts.get(ref) ?? 0) + 1);
+    while (counts.size > RETRIEVE_COUNT_CAP) {
+        const oldest = counts.keys().next().value;
+        if (oldest === undefined) break;
+        counts.delete(oldest);
+    }
+    session.retrieveCountsByRef = counts;
 }

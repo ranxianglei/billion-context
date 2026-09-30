@@ -6,9 +6,20 @@ The FULL registry is committed to the repo and bundled into dist at build
 models.dev is unreachable (and no upstream proxy is configured) still has
 the entire dataset — every field models.dev ships (name, description,
 family, reasoning, tool_call, modalities, limits, benchmarks, …), not just
-context windows. Today only limit.context is consumed; future features
-(pricing, provider metadata, modality checks) get the offline floor for
-free.
+context windows. limit.context and per-model pricing (cost rows) are
+consumed today; everything else rides along for future features.
+
+Source endpoint: https://models.dev/catalog.json — NOT models.json.
+models.json carries NO pricing fields at all (verified 0 cost keys across
+all 427 models); the per-model $/Mtok cost rows (input/output/cache_read/…)
+live nested under providers.<host>.models.<id>.cost in catalog.json, whose
+top-level `models` object is identical to models.json (verified entry-for-
+entry), so windows data is unchanged while the offline floor gains prices
+(#1279 follow-up). The snapshot stores both: `models` (flat, as before) and
+`costs` flattened to "<host>/<model-id>" keys, keeping host-specific
+pricing distinct (the same model listed by several hosts at different
+prices). Only rows with a usable numeric input price are stored — without
+an input anchor there is nothing to normalize against.
 
 Run manually or before a release:
     npm run registry:snapshot
@@ -21,7 +32,7 @@ import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const REGISTRY_URL = "https://models.dev/models.json";
+const REGISTRY_URL = "https://models.dev/catalog.json";
 const OUT_FILE = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "registry-snapshot.json");
 const proxyUrl = process.env.https_proxy || process.env.HTTPS_PROXY || process.env.http_proxy || process.env.HTTP_PROXY;
 
@@ -51,16 +62,37 @@ async function fetchFull() {
     return full;
 }
 
-let full;
+let catalog;
 try {
-    full = await fetchFull();
+    catalog = await fetchFull();
 } catch (e) {
     console.error(`could not fetch ${REGISTRY_URL}: ${e.message}`);
     console.error(`keeping the existing ${path.basename(OUT_FILE)} untouched`);
     process.exit(1);
 }
 
-const slim = { fetchedAt: new Date().toISOString(), count: Object.keys(full).length, models: full };
+if (!catalog || typeof catalog !== "object" || !catalog.models || typeof catalog.models !== "object" || Array.isArray(catalog.models)) {
+    console.error(`unexpected catalog.json shape (missing top-level "models") — refusing to overwrite the snapshot`);
+    process.exit(1);
+}
+
+function flattenCosts(providers) {
+    const costs = {};
+    if (!providers || typeof providers !== "object" || Array.isArray(providers)) return costs;
+    for (const [pid, p] of Object.entries(providers)) {
+        const models = p && typeof p === "object" ? p.models : null;
+        if (!models || typeof models !== "object" || Array.isArray(models)) continue;
+        for (const [mid, m] of Object.entries(models)) {
+            const c = m && typeof m === "object" ? m.cost : null;
+            if (!c || typeof c !== "object" || Array.isArray(c)) continue;
+            if (typeof c.input !== "number" || !Number.isFinite(c.input) || c.input <= 0) continue;
+            costs[`${pid}/${mid}`] = c;
+        }
+    }
+    return costs;
+}
+
+const slim = { fetchedAt: new Date().toISOString(), count: Object.keys(catalog.models).length, models: catalog.models, costs: flattenCosts(catalog.providers) };
 const body = JSON.stringify(slim) + "\n";
 await writeFile(OUT_FILE, body, "utf8");
-console.log(`wrote ${OUT_FILE} (${slim.count} models, FULL registry, ${(body.length / 1024).toFixed(1)} KB)`);
+console.log(`wrote ${OUT_FILE} (${slim.count} models, ${Object.keys(slim.costs).length} cost rows, ${(body.length / 1024).toFixed(1)} KB)`);

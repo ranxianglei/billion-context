@@ -125,7 +125,9 @@ test("#847: repeated identical failing spec escalates; success clears the streak
 
 test("#847: preflight reports honest exhaustion when every listed range is sub-gate, without calling upstream", async () => {
     const session = getSession(`issue847-preflight-${randomUUID()}`);
+    // #1492: only usage-grade baselines floor the walk against a measured payload.
     session.stats.lastInputTokens = 6000;
+    session.stats.lastInputTokensSource = "usage";
     const messages: CoreMessage[] = [
         textMsg("p_1", "user", "u".repeat(100)),
         textMsg("p_2", "assistant", "a".repeat(1500)),

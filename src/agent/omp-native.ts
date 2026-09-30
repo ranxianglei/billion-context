@@ -19,8 +19,8 @@
 
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
 import { createBiliPlugin } from "./pi.js";
-import { markNativeHost, nativeBootstrapGate, nativeProxyScriptPath, singleFlight } from "./native-bootstrap.js";
-import { installNativeFetchIntercept, type NativeInterceptState } from "./native-intercept.js";
+import { markNativeHost, nativeBootstrapGate, nativeProxyScriptPath, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
+import { installNativeFetchIntercept, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
 
 /** Decides whether the native bootstrap should run in this process. */
 export function shouldBootstrapNativeOmp(env: NodeJS.ProcessEnv): boolean {
@@ -57,6 +57,11 @@ if (nativeActive) markNativeHost(process.env, "omp");
 if (process.env.NODE_TEST_CONTEXT === undefined && nativeActive) {
     const start = singleFlight(bootstrap);
     state.respawn = start;
+    // #1531: pi-native's #1243 pattern — before_provider_request reads the
+    // proxy base from BILLION_CONTEXT_PROXY, which bootstrap() writes
+    // asynchronously. Publish the ready promise so the awaited runtime-info
+    // report can wait on the writer instead of racing it.
+    setNativeOriginWaiter({ wait: () => readyOrigin(state) });
     state.onGiveUp = () => {
         // We wrote BILLION_CONTEXT_PROXY at successful bootstrap. If the proxy
         // dies mid-session and the respawn fails, traffic goes direct — clear

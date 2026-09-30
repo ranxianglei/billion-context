@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { resolveZonePortBase } from "./config.js";
 import { stateDir } from "./paths.js";
 
 /** Instance registry (#394/#403/#417): the proxy-origin file is upgraded from
@@ -87,6 +88,81 @@ export function readProxyInstanceFile(file?: string): ProxyInstanceFile | { orig
 
 export function instanceFilePath(): string {
     return path.join(stateDir(), "proxy-origin");
+}
+
+export function portZoneFilePath(): string {
+    return path.join(stateDir(), "port-zone.json");
+}
+
+/** #1660: the sticky per-lane port inside the self-managed zone. The +1
+ *  ladder can drift a lane off its base (EADDRINUSE at 18787 → 18788 → …);
+ *  once a lane runs at a drifted port, every later launch must TRY that
+ *  port first — the lane's persistent wrappers and managed URLs point at
+ *  it. Tolerates a missing/garbage file (undefined → base). */
+export function readZonePort(lane: string, file: string = portZoneFilePath()): number | undefined {
+    let raw: string;
+    try {
+        raw = fs.readFileSync(file, "utf8");
+    } catch {
+        return undefined;
+    }
+    try {
+        const parsed = JSON.parse(raw) as { lanes?: Record<string, unknown> };
+        const v = parsed?.lanes?.[lane];
+        if (typeof v === "number" && Number.isInteger(v) && v > 0 && v < 65536) return v;
+        return undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+/** #1660: record a lane's settled zone port (the spawn path writes the port
+ * the child ACTUALLY bound — preferred or laddered). Best-effort RMW via the
+ * same atomic tmp+rename as every registry marker; never throws. */
+export function writeZonePort(lane: string, port: number, file: string = portZoneFilePath()): void {
+    if (!Number.isInteger(port) || port <= 0 || port >= 65536) return;
+    let cur: { lanes?: Record<string, number> } = {};
+    try {
+        const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as { lanes?: Record<string, number> };
+        if (parsed !== null && typeof parsed === "object" && parsed.lanes !== null && typeof parsed.lanes === "object") cur = parsed;
+    } catch {}
+    atomicWriteJson({ lanes: { ...(cur.lanes ?? {}), [lane]: port } }, file);
+}
+
+/** #1660: the port a lane'd launch should TRY to bind — the lane's sticky
+ *  record (a past ladder drift this lane still points at), else the zone
+ *  base (BILI_ZONE_PORT override). Explicit user overrides
+ *  (BILI_CLAUDE_NATIVE_PORT / BILI_ZCODE_PORT) are resolved separately by
+ *  the lanes and imply strict-port launches. */
+export function lanePreferredPort(lane: string, env: NodeJS.ProcessEnv = process.env, file: string = portZoneFilePath()): number {
+    return readZonePort(lane, file) ?? resolveZonePortBase(env);
+}
+
+/** #1723: identify the EADDRINUSE holder BEFORE laddering (#1660 follow-up).
+ *  Upgrade-restart overlap: the new build's child tries the lane's sticky
+ *  port while the OLD build's instance is still draining (its host is
+ *  exiting; the flush frees the port within seconds). The correct response
+ *  is to wait for the release and rebind the SAME port — not to drift +1
+ *  into the monotonic ratchet. Returns the live registry entry holding
+ *  `port` on `lane` when it runs DIFFERENT code than us (a predecessor being
+ *  replaced; missing fingerprints from pre-#1232 markers count as
+ *  "different build"). Never returns: no holder, a different/undeclared
+ *  lane (a manual `bili start` daemon can serve any client — waiting on it
+ *  would stall a launch behind a peer that may never leave), or a live peer
+ *  running OUR build (genuine contention — waiting cannot help). */
+export function findSameLanePredecessor(
+    entries: RegistryEntry[],
+    port: number,
+    lane: string | undefined,
+    ownFingerprint: string | undefined,
+): RegistryEntry | undefined {
+    if (!lane || !ownFingerprint) return undefined;
+    for (const e of entries) {
+        if (e.port !== port || e.lane !== lane) continue;
+        if (!isPidAlive(e.pid)) continue;
+        if (e.codeFingerprint !== ownFingerprint) return e;
+    }
+    return undefined;
 }
 
 /** #1225: content identity of a bili entry script (sha256 of its bytes).

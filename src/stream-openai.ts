@@ -2,7 +2,7 @@ import type { CompressionCore, Config, CoreMessage } from "acp-kernel";
 import type { Session } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput } from "./compress-tool.js";
 import { applyRanges, type RewriteCtx } from "./stream.js";
-import { containsMarkerLineText, containsRenderTagText, stripAcpTags } from "./loop/tag-echo-filter.js";
+import { containsBiliInternalText, containsMarkerLineText, containsRenderTagText, stripAcpTags } from "./loop/tag-echo-filter.js";
 
 export function rewriteOpenaiJsonResponse(body: unknown, ctx: RewriteCtx): unknown {
     if (!body || typeof body !== "object") return body;
@@ -28,9 +28,21 @@ export function rewriteOpenaiJsonResponse(body: unknown, ctx: RewriteCtx): unkno
                 keepToolCalls.push(tc);
             }
         }
+        // #1501 option C: a tool_call whose name never arrived is undeliverable
+        // (#1484 class). Non-compress calls are forwarded verbatim on this lane,
+        // so warn once per response instead of altering bytes. Runs before the
+        // !converted early return: nameless real calls pass through in both cases.
+        const namelessToolCallIdx: number[] = [];
+        for (let i = 0; i < toolCalls.length; i++) {
+            const nm = (toolCalls[i] ?? {})?.function?.name;
+            if (typeof nm !== "string" || nm.length === 0) namelessToolCallIdx.push(i);
+        }
+        if (namelessToolCallIdx.length > 0) {
+            ctx.log(`[warn: nameless tool call] non-stream openai response carries ${namelessToolCallIdx.length} nameless tool_call(s) at index ${namelessToolCallIdx.join(",")} — forwarded verbatim (#1501 observe-only)`);
+        }
     }
-    if (existingText && (containsRenderTagText(existingText) || containsMarkerLineText(existingText))) {
-        ctx.log(`[warn: tag echo] non-stream openai output contains ACP echo (render tags/markers), stripped: ${existingText.slice(0, 120).replace(/\n/g, " ")}`);
+    if (existingText && (containsRenderTagText(existingText) || containsMarkerLineText(existingText) || containsBiliInternalText(existingText))) {
+        ctx.log(`[warn: tag echo] non-stream openai output contains ACP echo (render tags/markers/internal artifacts), stripped: ${existingText.slice(0, 120).replace(/\n/g, " ")}`);
         existingText = stripAcpTags(existingText);
         msg.content = existingText;
     }

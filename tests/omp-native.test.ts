@@ -7,6 +7,7 @@ import { pathToFileURL } from "node:url";
 import factory, { shouldBootstrapNativeOmp } from "../src/agent/omp-native.ts";
 import { nativeProxyScriptPath } from "../src/agent/native-bootstrap.ts";
 import { pluginInstall, pluginRemove, pluginStatusAll, selfPackageRoot, ompPluginLoadedFrom } from "../src/plugin-install.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 // #957 coexistence: markNativeHost must be set synchronously during module
 // evaluation so any in-process bili extension backs off in THIS process.
@@ -55,7 +56,7 @@ function withOmpHome(fn: () => void | Promise<void>): Promise<void> {
     return Promise.resolve(fn()).finally(() => {
         if (prev === undefined) delete process.env.PI_CODING_AGENT_DIR;
         else process.env.PI_CODING_AGENT_DIR = prev;
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     });
 }
 

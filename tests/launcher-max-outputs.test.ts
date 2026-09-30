@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { rmrf } from "./tmp-rm.ts";
 
 process.env.NODE_ENV = "test";
 
@@ -53,7 +54,7 @@ test("readPiConfig: models[].maxTokens completes the entry (#971)", () => {
             { id: "qwen-no-out", contextWindow: 131072 },
         ]);
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 

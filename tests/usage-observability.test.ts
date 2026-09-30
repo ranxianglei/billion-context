@@ -6,6 +6,7 @@ import type { Session } from "../src/session.ts";
 import { applyRanges, type RewriteCtx } from "../src/stream.ts";
 import { parseCompressInput } from "../src/compress-tool.ts";
 import { applyUsageSample } from "../src/plugin.ts";
+import { buildSessionCacheReport } from "../src/cache-ledger.ts";
 import { setLogCapture } from "../src/logger.ts";
 
 type Ctx = Omit<RewriteCtx, "log"> & { log: (m: string) => void; logs: string[] };
@@ -103,11 +104,55 @@ test("#695: subsequent usage lines carry no fold marker", () => {
     assert.ok(!line[1].includes("fold=new"), `no stale marker: ${line[1]}`);
 });
 
-test("#695: missing cached field logs n/a without a hit percentage", () => {
+test("#695: missing cached field logs no-cache-report without a hit percentage", () => {
     const session = makeSession();
     const { lines } = captureLogs(() => applyUsageSample(session, { inputTokens: 50000, outputTokens: 100 }, "openai"));
     const line = lines.find((l) => l.includes("[acp-usage]"));
     assert.ok(line, `logged: ${lines}`);
-    assert.ok(line!.includes("cached=n/a"), `n/a present: ${line}`);
+    assert.ok(line!.includes("(no cache report)"), `marker present: ${line}`);
     assert.ok(!line!.includes("cache hit"), `no hit pct when cached unknown: ${line}`);
+});
+
+test("#1536: plugin pipe quarantines missing cached tokens instead of booking a 0% miss", () => {
+    const session = makeSession();
+    session.id = "q-plugin-" + process.pid;
+    captureLogs(() => {
+        applyUsageSample(session, { inputTokens: 100000, cachedTokens: 90000, outputTokens: 10 }, "openai", "https://a.example");
+        for (let i = 0; i < 3; i++) {
+            applyUsageSample(session, { inputTokens: 100000, outputTokens: 10 }, "openai", "https://a.example");
+        }
+    });
+    const r = buildSessionCacheReport(session);
+    assert.equal(r.unmeasured.samples, 3, "unmeasured samples counted");
+    assert.equal(r.unmeasured.inputTokens, 300000, "unmeasured input excluded from closure");
+    assert.equal(r.totals.input, 100000, "closure totals cover the measurable subset only");
+    assert.equal(r.totals.cached, 90000);
+    assert.equal(r.totals.residual, 0, "kernel identity still closes exactly");
+    assert.equal(r.totals.balanced, true);
+});
+
+test("#1536: non-reporting provider never trips the collapse watch via the plugin pipe", () => {
+    const session = makeSession();
+    session.id = "collapse-suppress-" + process.pid;
+    const { lines } = captureLogs(() => {
+        applyUsageSample(session, { inputTokens: 100000, cachedTokens: 95000, outputTokens: 10 }, "openai");
+        for (let i = 0; i < 6; i++) {
+            applyUsageSample(session, { inputTokens: 100000, outputTokens: 10 }, "openai");
+        }
+    });
+    assert.ok(!lines.some((l) => l.includes("prompt-cache collapse")), `no false-positive collapse warning: ${lines}`);
+});
+
+test("#1536: plugin-pipe usage carries wire/upstream identity into the invalidation buckets", () => {
+    const session = makeSession();
+    session.id = "wire-up-plugin-" + process.pid;
+    captureLogs(() => {
+        applyUsageSample(session, { inputTokens: 100000, cachedTokens: 90000, outputTokens: 10 }, "anthropic", "https://a.example");
+        applyUsageSample(session, { inputTokens: 100000, cachedTokens: 0, outputTokens: 10 }, "openai", "https://a.example");
+        applyUsageSample(session, { inputTokens: 100000, cachedTokens: 0, outputTokens: 10 }, "openai", "https://b.example");
+    });
+    const r = buildSessionCacheReport(session);
+    assert.equal(r.wireSwitches.count, 1, `wire switch flagged: ${JSON.stringify(r.wireSwitches)}`);
+    assert.equal(r.upstreamSwitches.count, 1, `upstream switch flagged: ${JSON.stringify(r.upstreamSwitches)}`);
+    assert.equal(r.modelSwitches.count, 0, "model bucket untouched without lastModel");
 });

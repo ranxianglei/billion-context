@@ -9,9 +9,11 @@ import {
     isRegistryDepSpec,
     planDshSpawn,
     refreshDshProfileBundles,
+    runDshPlugin,
     _setDshRunnersForTest,
     type DshPlan,
 } from "../src/dsh-channel.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 // — planDshSpawn (#679 spawn rules) ---------------------------------
 
@@ -52,7 +54,7 @@ test("dshProfileDepSpec / dshProfileDependsOnBili read the manifest dependency",
         assert.equal(dshProfileDepSpec(dir), "^0.1.120");
         assert.equal(dshProfileDependsOnBili(dir), true);
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -104,7 +106,7 @@ test("refreshDshProfileBundles: registry-pinned profiles get the exact new versi
         assert.ok(logs.some((l) => l.includes("dsh profile d") && l.includes("leaving it alone")));
     } finally {
         _setDshRunnersForTest(undefined);
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -119,11 +121,32 @@ test("refreshDshProfileBundles: one profile's failure does not stop the rest and
         _setDshRunnersForTest({ async: recordingAsyncRunner(calls, new Set(["a"])) });
         await assert.doesNotReject(refreshDshProfileBundles("0.1.121", (l, m) => logs.push(`${l}: ${m}`), { ...process.env, DSH_HOME: home }));
         assert.deepEqual(calls, ["plugin --profile b add billion-context@0.1.121"]);
-        assert.ok(logs.some((l) => l.startsWith("warn") && l.includes("dsh profile a") && l.includes("failed")));
+        const failLog = logs.find((l) => l.startsWith("warn") && l.includes("dsh profile a"));
+        assert.ok(failLog, "expected a warn log for the failed profile");
+        // #1675: error text renders the executed argv — no duplicated "plugin" token
+        assert.ok(failLog.endsWith(`dsh plugin --profile a add billion-context@0.1.121 failed: boom`), failLog);
+        assert.ok(!failLog.includes("plugin plugin"), failLog);
         assert.ok(logs.some((l) => l.includes("refreshed 1 dsh profile bundle(s) to 0.1.121")));
     } finally {
         _setDshRunnersForTest(undefined);
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
+    }
+});
+
+test("runDshPlugin: failure message renders the executed argv, no duplicated 'plugin' (#1675)", () => {
+    try {
+        _setDshRunnersForTest({ sync: () => { throw Object.assign(new Error("exit 1"), { status: 1, stderr: "pnpm not found on PATH" }); } });
+        assert.throws(
+            () => runDshPlugin(["plugin", "--profile", "web", "add", "billion-context@0.1.171"]),
+            (err: unknown) => {
+                const msg = (err as Error).message;
+                assert.equal(msg, "dsh plugin --profile web add billion-context@0.1.171 failed: pnpm not found on PATH");
+                assert.ok(!msg.includes("plugin plugin"), msg);
+                return true;
+            },
+        );
+    } finally {
+        _setDshRunnersForTest(undefined);
     }
 });
 
@@ -138,6 +161,6 @@ test("refreshDshProfileBundles: no profiles root or no bili deps → silent no-o
         await refreshDshProfileBundles("0.1.121", log, { ...process.env, DSH_HOME: home });
         assert.equal(logs.length, 0);
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });

@@ -4,22 +4,25 @@ import { fileURLToPath } from "node:url";
 import type { ServerResponse } from "node:http";
 import fs from "node:fs";
 import path from "node:path";
-import { acquireInFlight, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, withSessionLock, type Session } from "./session.js";
-import { ABSORB_TOOL_NAME, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES, PROXY_TOOL_NAMES, RETRIEVE_TOOL_NAME, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_CONVERSATION_ID_PARAM, SEARCH_CONTEXT_TOOL_NAME, absorbToolsFor, retrieveToolsFor } from "./compress-tool.js";
+import { acquireInFlight, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, withSessionLock, type Session } from "./session.js";
+import { clientConversationHeader } from "./session-id.js";
+import { ABSORB_TOOL_NAME, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, PROXY_TOOL_NAMES, RETRIEVE_TOOL_NAME, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_TOOL_NAME, absorbToolsFor, retrieveToolsFor } from "./compress-tool.js";
 import { absorbEnabled, effectiveAbsorbConfig, isProxyToolFor } from "./absorb.js";
 import { effectiveRulesEnabled, rulesEnabled } from "./rules-feature.js";
 import { executeProxyTool } from "./loop/core.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
-import { composeStreamFilters, containsMarkerLineText, containsRenderTagText, containsToolCallXmlFragment, createMarkerLineFilter, createTagEchoFilter, mayStartMarkerLine, mayStartRenderTag, stripAcpTags, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
+import { composeStreamFilters, containsBiliInternalText, containsMarkerLineText, containsRenderTagText, containsToolCallXmlFragment, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter, mayStartBiliInternal, mayStartMarkerLine, mayStartRenderTag, stripAcpTags, stripAnthropicText, stripOpenaiChatText, stripResponsesText, type TagEchoFilter } from "./loop/tag-echo-filter.js";
 import { log as loggerLog } from "./logger.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "./store.js";
 import { imageUsageSuffix } from "./image-compress.js";
 import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
 import { degenerateTurnWarning } from "./degenerate-turn.js";
+import { PANEL_BOX_FOOTER } from "./acp-panel.js";
 import { warnCacheCollapse } from "./cache-warn.js";
-import { recordCacheSample } from "./cache-ledger.js";
+import { settleUsageReport } from "./cache-ledger.js";
 import { promptInputTotal, type WireProtocol } from "./util.js";
 import { stateDir } from "./paths.js";
+import { lookupToolWitness, recordToolWitness } from "./tool-ring.js";
 import { awaitDrain } from "./server/stream-io.js";
 
 // The proxy's own version, read from package.json at runtime (works in both dev
@@ -67,9 +70,27 @@ const PLUGIN_MODEL_HEADER = "x-bili-plugin-model";
  *  default for every non-codex/non-claude signal), this declaration is
  *  vestigial: hosts keep stamping it for protocol compatibility with older
  *  proxies, but current proxies key verbatim regardless. */
-const PLUGIN_INSTRUCTIONS_MUTABLE_HEADER = "x-bili-plugin-instructions-mutable";
+export const PLUGIN_INSTRUCTIONS_MUTABLE_HEADER = "x-bili-plugin-instructions-mutable";
+/** #1699: the host's per-request persona/agent id (opencode v2 stamps its own
+ *  taxonomy — "title", "build", "plan", ...). Carries INTENT the request body
+ *  cannot express: opencode v2 title-gen requests carry NO max_tokens (options
+ *  {} for kind==="title"), so the output-budget side-request heuristic (#388)
+ *  can never see them — they were misclassified as main turns and got the full
+ *  compress prompt + tool injected into the title model. The proxy acts only on
+ *  known side-request agents (side-request.ts SIDE_REQUEST_AGENTS); main-persona
+ *  ids are inert telemetry. */
+export const PLUGIN_REQUEST_AGENT_HEADER = "x-bili-plugin-agent";
 
 const PLUGIN_PROTOCOL_VERSION = 1;
+
+/** #1567: folds executed through POST /__bili/plugin/tool are minted this
+ *  synthetic callId, which the client can never echo back — its own re-sent
+ *  compress pair is the summary carrier for such blocks, so the kernel's
+ *  in-place acp_summary anchor is redundant and must be stripped (#1567). */
+export const PLUGIN_FOLD_CALLID_PREFIX = "plugin_";
+export function isPluginFoldCallId(callId: string | undefined): boolean {
+    return typeof callId === "string" && callId.startsWith(PLUGIN_FOLD_CALLID_PREFIX);
+}
 
 const VERSION = (() => {
     try {
@@ -136,6 +157,14 @@ export function pluginReportedModel(headers: Record<string, string | string[] | 
     return raw !== undefined && /^\S{1,256}$/.test(raw) ? raw : undefined;
 }
 
+/** #1699: per-request persona id, honored ONLY from an announced plugin (same
+ *  gate as window/model): a plain client must not be able to declare a side
+ *  request by name to dodge compression. A real plugin stamps both headers. */
+export function pluginRequestAgentHeader(headers: Record<string, string | string[] | undefined>): string | undefined {
+    if (pluginAgentHeader(headers) === undefined) return undefined;
+    return headerValue(headers, PLUGIN_REQUEST_AGENT_HEADER);
+}
+
 /** #956 hardening: per-request plugin window/max-output headers describe the
  *  model the plugin CONFIGURED — when the request body carries a different
  *  model (mid-switch race, or a provider-model composite like
@@ -165,6 +194,9 @@ const remembered = new Map<string, RememberedMessages>();
 // resume — warn once per conversation instead of on every rejected tool call.
 const warnedNoModelRequests = new Set<string>();
 const WARNED_NO_MODEL_REQUESTS_CAP = 4096;
+/** #1685 freshness window for single-active arbitration — same scale as the
+ *  tool-witness TTL in tool-ring.ts. */
+const WITNESS_TTL_MS_PLUGIN = 10 * 60 * 1000;
 
 // The conversationId → session mapping is in-memory. Persist it so a resumed
 // or restarted proxy can still resolve /acp + tool calls to the (persisted)
@@ -302,29 +334,41 @@ type PendingPluginRegister = { conversationId: string; agent: string; ts: number
  *  will run — reported at plugin bootstrap and on model switch, before (and
  *  independent of) any model request. Ranked in the native-window chain
  *  directly under the per-request header report; entries carry their model
- *  id and the table is only consulted when that id matches the request's
- *  model (a stale post-switch entry must never size a different model). */
-type PluginRuntimeInfo = {
+ *  id and are only usable when that id matches the request's model (a stale
+ *  post-switch entry must never size a different model). Entries carrying a
+ *  conversationId are keyed by it (#1531), not by agent — one process runs
+ *  many sessions (main + subagents) that share the agent name but report
+ *  different windows, and a single per-agent slot let the last reporter
+ *  clobber everyone else's entry. */
+export type PluginRuntimeInfo = {
     agent: string;
     model: string;
     contextWindow?: number;
     maxOutput?: number;
     baseURL?: string;
+    conversationId?: string;
     source: string;
     ts: number;
 };
 
 const pluginRuntimeTable = new Map<string, PluginRuntimeInfo>();
+const pluginRuntimeByConversation = new Map<string, PluginRuntimeInfo>();
 const MAX_PLUGIN_RUNTIME_ENTRIES = 32;
 
-export function recordPluginRuntimeInfo(entry: PluginRuntimeInfo): void {
-    pluginRuntimeTable.delete(entry.agent);
-    pluginRuntimeTable.set(entry.agent, entry);
-    while (pluginRuntimeTable.size > MAX_PLUGIN_RUNTIME_ENTRIES) {
-        const oldest = pluginRuntimeTable.keys().next().value;
+function evictOldestRuntimeEntries(map: Map<string, PluginRuntimeInfo>): void {
+    while (map.size > MAX_PLUGIN_RUNTIME_ENTRIES) {
+        const oldest = map.keys().next().value;
         if (oldest === undefined) break;
-        pluginRuntimeTable.delete(oldest);
+        map.delete(oldest);
     }
+}
+
+export function recordPluginRuntimeInfo(entry: PluginRuntimeInfo): void {
+    const conv = entry.conversationId !== undefined && entry.conversationId.length > 0 ? entry.conversationId : undefined;
+    const table = conv !== undefined ? pluginRuntimeByConversation : pluginRuntimeTable;
+    table.delete(conv ?? entry.agent);
+    table.set(conv ?? entry.agent, entry);
+    evictOldestRuntimeEntries(table);
 }
 
 /** Latest runtime-info for an agent, usable for `model` only (undefined =
@@ -334,6 +378,31 @@ export function pluginRuntimeInfoFor(agent: string | undefined, model: string | 
     const entry = pluginRuntimeTable.get(agent);
     if (entry === undefined || entry.model !== model) return undefined;
     return entry;
+}
+
+/** Latest runtime-info registered under a conversation id, usable for
+ *  `model` only (#1531). */
+export function pluginRuntimeInfoForConversation(conversationId: string | undefined, model: string | undefined): PluginRuntimeInfo | undefined {
+    if (conversationId === undefined || model === undefined) return undefined;
+    const entry = pluginRuntimeByConversation.get(conversationId);
+    if (entry === undefined || entry.model !== model) return undefined;
+    return entry;
+}
+
+/** The narrow conversation signal a header-less runtime-info lookup can
+ *  match on (#1531): client conversation header → custom session header →
+ *  body prompt_cache_key. Mirrors the identity chain's precedence at exactly
+ *  the points where a reported conversationId could have been minted (omp
+ *  stamps prompt_cache_key with its session uuid, #957/#1230); any divergence
+ *  from the full binding identity degrades to a miss — legacy behavior —
+ *  never a wrong hit. */
+export function runtimeConversationId(headers: Record<string, string | string[] | undefined>, parsed: unknown, sessionHeaderName?: string): string | undefined {
+    const fromClient = clientConversationHeader(headers);
+    if (fromClient !== undefined && fromClient.length > 0) return fromClient;
+    const custom = sessionHeaderName !== undefined ? headerValue(headers, sessionHeaderName) : undefined;
+    if (custom !== undefined) return custom;
+    const pck = typeof parsed === "object" && parsed !== null ? (parsed as { prompt_cache_key?: unknown }).prompt_cache_key : undefined;
+    return typeof pck === "string" && pck.trim().length > 0 ? pck.trim() : undefined;
 }
 
 /** Accept the bootstrap/model-switch report. Body:
@@ -350,7 +419,7 @@ export function handlePluginRuntimeInfo(payload: string, res: import("node:http"
         res.end(JSON.stringify({ ok: false, error: "invalid JSON" }));
         return;
     }
-    const body = parsed as { agent?: unknown; model?: unknown; contextWindow?: unknown; maxOutput?: unknown; baseURL?: unknown; source?: unknown };
+    const body = parsed as { agent?: unknown; model?: unknown; contextWindow?: unknown; maxOutput?: unknown; baseURL?: unknown; conversationId?: unknown; source?: unknown };
     const str = (v: unknown, max: number) => (typeof v === "string" && v.length > 0 && v.length <= max ? v : undefined);
     const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.floor(v) : undefined);
     const agent = str(body.agent, 64);
@@ -360,12 +429,14 @@ export function handlePluginRuntimeInfo(payload: string, res: import("node:http"
         res.end(JSON.stringify({ ok: false, error: "agent and model are required" }));
         return;
     }
+    const conversationId = str(body.conversationId, 256);
     recordPluginRuntimeInfo({
         agent,
         model,
         contextWindow: num(body.contextWindow),
         maxOutput: num(body.maxOutput),
         baseURL: str(body.baseURL, 2048),
+        ...(conversationId !== undefined ? { conversationId } : {}),
         source: str(body.source, 64) ?? "client-config",
         ts: Date.now(),
     });
@@ -499,58 +570,11 @@ export function handlePluginCompact(payload: string, res: import("node:http").Se
     res.end(JSON.stringify({ ok: true, conversationId }));
 }
 
-// #760: per-call conversation_id for MCP tools. Hosts that share ONE shim
-// process across several concurrent conversations have no env/meta session
-// channel, so the model supplies the target conversation per call (the proxy
-// prints its own session id in the wire notes). The param is added to CLONED
-// schemas only — wire-mode injection serves the kernel constants directly and
-// those models are routed by request identity, not arguments.
-const CONVERSATION_ID_PARAM = {
-    type: "string" as const,
-    description:
-        "Your bili conversation id (the value from the 'your bili conversation id' line in the proxy notes). " +
-        "Pass it on every call when your host shares one MCP process across several concurrent conversations; " +
-        "omit it when the host bound the session itself.",
-};
-
-function withConversationIdParam(tool: unknown): unknown {
-    const copy = structuredClone(tool);
-    if (!copy || typeof copy !== "object") return copy;
-    const t = copy as Record<string, unknown>;
-    const add = (schema: unknown): void => {
-        if (!schema || typeof schema !== "object") return;
-        const s = schema as { properties?: Record<string, unknown> };
-        s.properties = { ...(s.properties ?? {}), conversation_id: CONVERSATION_ID_PARAM };
-    };
-    if (t.input_schema !== undefined) add(t.input_schema);
-    else {
-        const fn = t.function;
-        if (fn && typeof fn === "object") add((fn as { parameters?: unknown }).parameters);
-        else add(t.parameters);
-    }
-    return copy;
-}
-
-// #841: search_context's conversation_id doubles as a cross-session read-only
-// search target — widen that one entry's param description beyond the shared
-// routing text (same wording the wire-mode BILI_ constants serve).
-function withSearchContextConversationDescription(tools: unknown[]): unknown[] {
-    return tools.map((tool) => {
-        const t = tool as Record<string, unknown> | null | undefined;
-        if (!t || typeof t !== "object") return tool;
-        const fn = t.function as { name?: unknown } | undefined;
-        const name = typeof t.name === "string" ? t.name : (fn && typeof fn.name === "string" ? fn.name : undefined);
-        if (name !== SEARCH_CONTEXT_TOOL_NAME) return tool;
-        const copy = structuredClone(t) as Record<string, unknown>;
-        const cfn = copy.function as { parameters?: unknown } | undefined;
-        const schema = (copy.input_schema ?? cfn?.parameters ?? copy.parameters) as { properties?: Record<string, unknown> } | undefined;
-        const props = schema?.properties;
-        const param = props?.conversation_id;
-        if (!props || !param || typeof param !== "object") return tool;
-        props.conversation_id = { ...(param as Record<string, unknown>), ...SEARCH_CONTEXT_CONVERSATION_ID_PARAM };
-        return copy;
-    });
-}
+// #1685: the conversation_id tool parameter is GONE from the manifest — the
+// model must never see or echo a conversation id (zero-injection identity:
+// the proxy routes by outbound tool_use witness / body id / single-active
+// arbitration; see tool-ring.ts). Wire-mode injection serves the kernel
+// constants directly, which never carried the param.
 
 export function handlePluginManifest(res: import("node:http").ServerResponse, config: Config): void {
     // #1192: hosts register whatever the manifest serves verbatim (pi/omp/dsh/
@@ -573,6 +597,18 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
     const ccrOn = config.ccr?.enabled === true;
     const ccrName = config.ccr?.toolName ?? RETRIEVE_TOOL_NAME;
     const ccrTools = ccrOn ? retrieveToolsFor(ccrName) : undefined;
+    // #1712: decompress's startId/endId (range restore) executes only on CCR-armed
+    // sessions, so the manifest advertises them only when the base config enables
+    // CCR (#1345 plugin policy = base block verbatim) — same conservative #1192
+    // rule as acp_retrieve above. CCR-off manifests serve the no-range variants so
+    // a registered agent never sees range fields execution would refuse.
+    const acpAnthropic = ccrOn ? BILI_ACP_TOOLS_ANTHROPIC : BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE;
+    const acpOpenai = ccrOn ? BILI_ACP_TOOLS_OPENAI : BILI_ACP_TOOLS_OPENAI_NO_RANGE;
+    // Responses wire: plugin mode structurally disarms CCR there (#1271 —
+    // PLUGIN_CCR_WIRES excludes it), so range restore can never execute for a
+    // registered agent on that wire — always the no-range variant, mirroring
+    // how ccrTools above is never spread into the responses array.
+    const acpResponses = BILI_ACP_TOOLS_RESPONSES_NO_RANGE;
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
         ok: true,
@@ -581,9 +617,9 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
         version: VERSION,
         toolNames: [...PROXY_TOOL_NAMES, ...(absorbTools ? [absorbName] : []), ...(rulesOn ? [RULE_TOOL_NAME] : []), ...(ccrOn ? [ccrName] : [])],
         tools: {
-            anthropic: withSearchContextConversationDescription([...BILI_ACP_TOOLS_ANTHROPIC, ...(absorbTools ? [absorbTools.anthropic] : []), ...(rulesOn ? [RULE_TOOL] : []), ...(ccrTools ? [ccrTools.anthropic] : [])].map(withConversationIdParam)),
-            openai: withSearchContextConversationDescription([...BILI_ACP_TOOLS_OPENAI, ...(absorbTools ? [absorbTools.openai] : []), ...(rulesOn ? [RULE_TOOL_OPENAI] : []), ...(ccrTools ? [ccrTools.openai] : [])].map(withConversationIdParam)),
-            responses: withSearchContextConversationDescription([...BILI_ACP_TOOLS_RESPONSES, ...(absorbTools ? [absorbTools.responses] : []), ...(rulesOn ? [RULE_TOOL_RESPONSES] : [])].map(withConversationIdParam)),
+            anthropic: [...acpAnthropic, ...(absorbTools ? [absorbTools.anthropic] : []), ...(rulesOn ? [RULE_TOOL] : []), ...(ccrTools ? [ccrTools.anthropic] : [])],
+            openai: [...acpOpenai, ...(absorbTools ? [absorbTools.openai] : []), ...(rulesOn ? [RULE_TOOL_OPENAI] : []), ...(ccrTools ? [ccrTools.openai] : [])],
+            responses: [...acpResponses, ...(absorbTools ? [absorbTools.responses] : []), ...(rulesOn ? [RULE_TOOL_RESPONSES] : [])],
         },
         headers: { agent: PLUGIN_AGENT_HEADER, conversation: PLUGIN_CONVERSATION_HEADER, contextWindow: PLUGIN_CONTEXT_WINDOW_HEADER, maxOutput: PLUGIN_MAX_OUTPUT_HEADER, model: PLUGIN_MODEL_HEADER, instructionsMutable: PLUGIN_INSTRUCTIONS_MUTABLE_HEADER },
         toolEndpoint: "/__bili/plugin/tool",
@@ -596,6 +632,9 @@ export type PluginToolDeps = {
     core: CompressionCore;
     config: Config;
     log: (level: string, msg: string) => void;
+    // Browser-reachable origin of THIS proxy (http://host:port) for the human-facing
+    // Web UI deep links inside panels/reports; absent in test harnesses/embeds.
+    webOrigin?: string;
 };
 
 /** Reverse-lookup the conversation id bound to a session id. #656: the
@@ -692,6 +731,14 @@ function chainAdvisoryPanel(v: ChainVerdict): string {
     return `ℹ️ billion-context: this conversation carried ACP-shaped content (evidence: ${v.kind}, protocol ${v.protocol}) with no prior local compression state. Historical ACP content is advisory-only (#1357) — it was NOT treated as a foreign bili chain, so the request was processed normally and this conversation owns its own compression session. Last observation: ${new Date(v.at).toISOString()}. See the [chain] warn in the bili log.`;
 }
 
+/** Browser deep link into the built-in Web UI session detail page; undefined when no
+ *  usable origin was provided (tests/embeds) or the id is empty. */
+function webSessionUrl(origin: string | undefined, sessionId: string): string | undefined {
+    const o = typeof origin === "string" ? origin.trim().replace(/\/+$/, "") : "";
+    if (o.length === 0 || sessionId.length === 0) return undefined;
+    return `${o}/__bili/#/session/${encodeURIComponent(sessionId)}`;
+}
+
 export function handlePluginStatus(conversationId: string, res: import("node:http").ServerResponse, deps: PluginToolDeps, fallbackLatest = false): void {
     const { session: resolvedSession, entry } = resolveConversation(conversationId);
     let session = resolvedSession;
@@ -730,7 +777,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         // agent-keyed runtime table so /acp works pre-first-request. Clients
         // without a stable conversation id before their first request probe
         // with their agent name (dsh's fetchStatusLatest sends "dsh").
-        const pre = pluginRuntimeTable.get(conversationId);
+        const pre = pluginRuntimeTable.get(conversationId) ?? pluginRuntimeByConversation.get(conversationId);
         if (pre !== undefined) {
             res.writeHead(200, { "content-type": "application/json" });
             res.end(JSON.stringify({ ok: true, conversationId, phase: "pre-first-request", model: pre.model, contextLimit: pre.contextWindow ?? null, runtimeInfo: pre, panel: null }));
@@ -798,6 +845,14 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     } catch {
         panel = undefined;
     }
+    // Human-only deep link. Deliberately inserted BEFORE the footer line: the LLM-context
+    // stripper (src/acp-panel.ts) anchors this box on its top border AND its
+    // "Tag visibility" footer — anything appended after the footer would break the whole
+    // message match and ship the panel into the model context.
+    const webUrl = webSessionUrl(deps.webOrigin, session.id);
+    if (panel !== undefined && webUrl !== undefined) {
+        panel = panel.replace(PANEL_BOX_FOOTER, `\nWeb UI: ${webUrl}\n${PANEL_BOX_FOOTER}`);
+    }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
         ok: true,
@@ -807,7 +862,9 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         pluginAgent: session.metadata.pluginAgent ?? null,
         model: session.metadata.lastModel ?? null,
         windowSource: session.metadata.lastWindowSource ?? null,
-        runtimeInfo: pluginRuntimeInfoFor(typeof session.metadata.pluginAgent === "string" ? session.metadata.pluginAgent : undefined, typeof session.metadata.lastModel === "string" ? session.metadata.lastModel : undefined) ?? null,
+        runtimeInfo: pluginRuntimeInfoFor(typeof session.metadata.pluginAgent === "string" ? session.metadata.pluginAgent : undefined, typeof session.metadata.lastModel === "string" ? session.metadata.lastModel : undefined)
+            ?? pluginRuntimeInfoForConversation(conversationIdForSession(session.id), typeof session.metadata.lastModel === "string" ? session.metadata.lastModel : undefined)
+            ?? null,
         contextLimit: typeof limit === "number" ? limit : null,
         contextTokens: session.stats.lastInputTokens,
         inputTokens: session.stats.inputTokens,
@@ -816,6 +873,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         requests: session.stats.requests,
         blocks: session.state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active })),
         panel,
+        webUrl: webUrl ?? null,
         lastSeen: session.lastSeen,
     }));
 }
@@ -835,12 +893,61 @@ export async function handlePluginTool(
     }
     const conversationId = typeof parsed.conversationId === "string" ? parsed.conversationId.trim() : "";
     const tool = typeof parsed.tool === "string" ? parsed.tool : "";
-    if (!conversationId) {
+    // #1685 zero-injection routing ladder for id-less tool POSTs:
+    //   1. outbound witness — this proxy streamed the very tool_use being
+    //      answered; a unique hit names the session (the free-text summary is
+    //      a unique anchor). Wins over a body id when they disagree.
+    //   2. body conversationId — extensions (pi/opencode/dsh) and legacy
+    //      per-call values still carry it; unchanged behavior.
+    //   3. single-active arbitration — one fresh conversation on the proxy.
+    //   4. anything else is a loud 400 (never a silent guess).
+    const bodyArgs = parsed.args && typeof parsed.args === "object" ? parsed.args as Record<string, unknown> : {};
+    const witnessIds = tool ? lookupToolWitness(tool, bodyArgs) : new Set<string>();
+    let session: Session | undefined;
+    let entry: ConversationEntry | undefined;
+    let routedBy: "witness" | "body" | "arb" = "body";
+    if (witnessIds.size === 1) {
+        const [wit] = [...witnessIds];
+        session = peekSession(wit);
+        if (session) {
+            const cid = conversationIdForSession(session.id);
+            entry = cid ? conversations.get(cid) : undefined;
+            routedBy = "witness";
+            if (conversationId && conversationId !== cid && conversationId !== session.id) {
+                deps.log("info", `[plugin] tool "${tool}" routed by outbound witness to session ${session.id}${cid ? ` (conversation ${cid})` : ""}; body conversationId "${conversationId}" differs and was ignored (#1685)`);
+            }
+        }
+    } else if (witnessIds.size > 1 && !conversationId) {
         res.writeHead(400, { "content-type": "application/json" });
-        res.end(JSON.stringify({ ok: false, error: `conversationId is required (send the same value as the ${PLUGIN_CONVERSATION_HEADER} header)` }));
+        res.end(JSON.stringify({ ok: false, error: `cannot route tool "${tool}": its (name, arguments) was witnessed in ${witnessIds.size} sessions and the request carries no conversationId — refuse to guess. Re-send with a conversationId, or bind the MCP shim (CLAUDE_CODE_SESSION_ID / BILI_CONVERSATION_ID).` }));
         return;
     }
-    const { session, entry } = resolveConversation(conversationId);
+    if (!session && !conversationId) {
+        const now = Date.now();
+        let fresh = 0;
+        let bestCid: string | undefined;
+        let bestSeen = -Infinity;
+        for (const [cid, e] of conversations) {
+            if (now - e.lastSeen > WITNESS_TTL_MS_PLUGIN) continue;
+            fresh++;
+            if (e.lastSeen > bestSeen) {
+                bestSeen = e.lastSeen;
+                bestCid = cid;
+            }
+        }
+        if (bestCid && fresh === 1) {
+            entry = conversations.get(bestCid);
+            session = entry ? peekSession(entry.sessionId) : undefined;
+            if (session) routedBy = "arb";
+        } else {
+            res.writeHead(400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, error: `cannot route tool "${tool}": no conversationId, no outbound witness match, and ${fresh} conversation${fresh === 1 ? "" : "s"} active on this proxy — refuse to guess. Send a model message first, or bind the MCP shim (CLAUDE_CODE_SESSION_ID / BILI_CONVERSATION_ID).` }));
+            return;
+        }
+    }
+    if (!session) {
+        ({ session, entry } = resolveConversation(conversationId));
+    }
     // #760: the verbatim-id fallback above can resolve a session with NO map
     // entry (first call), so only the session itself gates execution.
     if (!session) {
@@ -899,11 +1006,12 @@ export async function handlePluginTool(
     }
     if (entry) entry.lastSeen = Date.now();
     const args = parsed.args && typeof parsed.args === "object" ? { ...(parsed.args as Record<string, unknown>) } : {};
-    // #760: the MCP manifest advertises an optional conversation_id argument
-    // for per-call routing; routing itself uses the body-level conversationId
-    // field, so strip it before kernel arg parsing sees it.
+    // #760 legacy strip, kept for compat: the manifest no longer advertises a
+    // conversation_id argument (#1685), but a model trained on the old schema
+    // may still echo one — strip it before kernel arg parsing sees it (the
+    // witness hash in tool-ring.ts strips the same key).
     delete args.conversation_id;
-    const callId = `plugin_${Date.now().toString(36)}`;
+    const callId = `${PLUGIN_FOLD_CALLID_PREFIX}${Date.now().toString(36)}`;
     acquireInFlight(session);
     let result: string;
     try {
@@ -941,9 +1049,18 @@ export async function handlePluginTool(
         session.metadata.pluginAgent = "mcp";
     }
     markDirty(session);
-    deps.log("info", `[${session.id}] [plugin] tool ${tool} executed via plugin (${result.length} chars)`);
+    deps.log("info", `[${session.id}] [plugin] tool ${tool} executed via plugin (routed by ${routedBy}, #1685) (${result.length} chars)`);
+    // Same deep link on the /acp-cache display surfaces: clients wrap this text in
+    // [acp-cache]/[/acp-cache] markers and strip it from model context by marker
+    // (src/acp-panel.ts). The MCP acp_cache path shares this endpoint — one extra line
+    // is harmless context and lets the model tell the user the link, too.
+    let sentResult = result;
+    if (tool === "acp_cache") {
+        const wu = webSessionUrl(deps.webOrigin, session.id);
+        if (wu !== undefined) sentResult = `Web UI: ${wu}\n\n${result}`;
+    }
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ ok: true, tool, conversationId, result }));
+    res.end(JSON.stringify({ ok: true, tool, conversationId, result: sentResult }));
 }
 
 // creationTokens = Anthropic cache-write segment (cache_creation_input_tokens):
@@ -1033,7 +1150,7 @@ function usageFromSseEvent(obj: Record<string, unknown>): UsageSample | undefine
     return undefined;
 }
 
-export function applyUsageSample(session: Session, sample: UsageSample, protocol?: WireProtocol): void {
+export function applyUsageSample(session: Session, sample: UsageSample, protocol?: WireProtocol, upstreamOrigin?: string): void {
     // inputTokens is protocol-native: Anthropic reports it NEW-only (cached
     // separate); OpenAI/Responses report the TOTAL (cached already included).
     // promptInputTotal adds back every segment not part of inputTokens —
@@ -1048,26 +1165,21 @@ export function applyUsageSample(session: Session, sample: UsageSample, protocol
     if (sample.inputTokens !== undefined && total <= 0) {
         loggerLog("warn", `[${session.id}] [plugin] skipped zero-total usage sample (placeholder/echo) — keeping lastInputTokens=${session.stats.lastInputTokens}`);
     }
-    if (sample.cachedTokens !== undefined && total > 0) {
-        session.stats.cachedTokens += sample.cachedTokens;
-        session.stats.cacheSamples += 1;
-    }
     if (sample.inputTokens !== undefined && total > 0) {
-        session.stats.inputTokens += total;
-        // Net out pending compress savings (see stream.ts applyRanges): plugin
-        // compress tool results shrink the next request, not this report.
-        session.stats.lastInputTokens = Math.max(0, total - (session.stats.compressCreditTokens ?? 0));
-        session.stats.lastInputTokensSource = "usage";
-        // #1110: a real usage report retires the one-shot overflow arm.
-        delete session.stats.overflowArmTokens;
-        warnCacheCollapse(session, total, sample.cachedTokens ?? 0);
+        // #1536: normalize undefined (provider reports no cache tokens) to null
+        // so the ledger quarantines the sample instead of booking its whole
+        // billed prefix as an unexplained ttlRepay residual (which reads as a
+        // 0% hit rate) — mirrors recordUsage in loop/core.ts. A non-reporting
+        // provider must also never feed the collapse watch.
+        const reportedCached: number | null = typeof sample.cachedTokens === "number" ? sample.cachedTokens : null;
+        if (reportedCached !== null) warnCacheCollapse(session, total, reportedCached);
         // #695: per-request parity with the wire path's [acp-usage] — without
         // this, post-fold cache cliffs cannot be attributed from logs.
-        const hit = sample.cachedTokens === undefined ? undefined : Math.round((100 * (sample.cachedTokens ?? 0)) / total);
+        const hit = reportedCached === null ? undefined : Math.round((100 * reportedCached) / total);
         const foldNew = session.stats.pendingFoldUsage === true;
         if (foldNew) session.stats.pendingFoldUsage = false;
-        loggerLog("info", `[${session.id}] [plugin] [acp-usage] input=${total} cached=${sample.cachedTokens ?? "n/a"}${hit === undefined ? "" : ` (cache hit ${hit}%)`}${foldNew ? " fold=new" : ""}${imageUsageSuffix(session)}`);
-        recordCacheSample(session, { at: Date.now(), input: total, cached: sample.cachedTokens ?? 0, output: sample.outputTokens });
+        loggerLog("info", `[${session.id}] [plugin] [acp-usage] input=${total} ${reportedCached === null ? "(no cache report)" : `cached=${reportedCached} (cache hit ${hit}%)`}${foldNew ? " fold=new" : ""}${imageUsageSuffix(session)}`);
+        settleUsageReport(session, { total, reportedCached, output: sample.outputTokens, protocol, upstream: upstreamOrigin });
     }
     if (sample.outputTokens !== undefined) session.stats.outputTokens += sample.outputTokens;
 }
@@ -1120,6 +1232,7 @@ export async function pipePluginChatWithStrip(
     session?: Session,
     log?: (msg: string) => void,
     refetch?: () => Promise<ReadableStream<Uint8Array> | null>,
+    upstreamOrigin?: string,
 ): Promise<void> {
     let reader = stream.getReader();
     let decoder = new TextDecoder("utf-8");
@@ -1137,6 +1250,11 @@ export async function pipePluginChatWithStrip(
         loggerLog("warn", `[marker-echo] stripped model-emitted ACP confirmation marker (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
         log?.(`[marker-echo] stripped model-emitted ACP confirmation marker from plugin passthrough text`);
     };
+    const onBiliDrop = (snippet: string) => {
+        sawStrippedEcho = true;
+        loggerLog("warn", `[bili-artifact] stripped model-emitted internal artifact (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+        log?.(`[bili-artifact] stripped model-emitted internal artifact from plugin passthrough text`);
+    };
     // One state machine per (field, block/choice index) — interleaved choices
     // or content blocks must not share partial-tag state. Tool-call arguments
     // never flow through a stream (#1039): they are forwarded verbatim.
@@ -1150,7 +1268,7 @@ export async function pipePluginChatWithStrip(
         const key = `${field}:${index}`;
         let s = streams.get(key);
         if (!s) {
-            s = { filter: composeStreamFilters(createTagEchoFilter(onTagDrop), createMarkerLineFilter(onMarkerDrop)), field, index };
+            s = { filter: composeStreamFilters(composeStreamFilters(createTagEchoFilter(onTagDrop), createMarkerLineFilter(onMarkerDrop)), createBiliArtifactFilter(onBiliDrop)), field, index };
             streams.set(key, s);
         }
         return s;
@@ -1197,6 +1315,24 @@ export async function pipePluginChatWithStrip(
      *  the text that survives such a frame is the tag's own interior. */
     let droppedTagInFrame = false;
     let finalFinishReason: string | undefined;
+    // #1501 option C: tool-call observations on this verbatim lane, keyed per
+    // protocol (openai: choice:toolIndex, anthropic: block:N, google:
+    // candidate/part). Bytes are forwarded untouched (#1039); the tracker only
+    // settles a once-per-response warn when upstream emits a call whose name
+    // never arrives (#1484 class), so the observed rate can settle the
+    // drop-vs-keep policy without touching fidelity.
+    // #1501 option C — now also the #1685 witness feed: `args` accumulates the
+    // full argument JSON (observe-only; bytes are still forwarded verbatim per
+    // #1039) so settleWitnesses can ring-record each complete tool call for
+    // id-less MCP routing.
+    const seenToolCalls = new Map<string, { label: string; id: string; name: string; argsLen: number; frags: number; args: string }>();
+    const settleWitnesses = () => {
+        if (!session) return;
+        for (const tc of seenToolCalls.values()) {
+            if (tc.name.length === 0) continue;
+            recordToolWitness(session.id, tc.name, tc.args);
+        }
+    };
     // Degenerate-turn retry (#732/#821 for this pipe). The first attempt's
     // terminal event is dropped when the retry takes over, so the client sees
     // one turn: its framing stays open, and the retry's content blocks are
@@ -1222,7 +1358,8 @@ export async function pipePluginChatWithStrip(
             // model that produced nothing and the session reads as idle while it is
             // dead, so the client gets an error the host would never surface (#870).
             log?.("[plugin] degenerate terminal turn again after the retry; emitting an in-band error (#870)");
-            emitStreamError(res, protocol, "the turn degenerated again after the continuation nudge");
+            // #870 deliberately chose a COMPLETED turn carrying the error text (visible to the host); keep the legacy shape here regardless of the global streamErrorShape default.
+            emitStreamError(res, protocol, "the turn degenerated again after the continuation nudge", undefined, "completion");
             return true;
         }
         // A turn the model left genuinely bare — no thought, no stripped echo,
@@ -1308,6 +1445,15 @@ export async function pipePluginChatWithStrip(
         }
         return out;
     };
+    // #1546: resolve ONE (field, index) stream's held tail without touching the
+    // others. A terminal frame folds its own fields' tails into their deltas so
+    // the finish marker lands after every byte of that field — flushing them as
+    // separate synthetic chunks ahead of the frame would reorder a tail that was
+    // held from THIS frame's own text (e.g. "hello <a" → "<a" before "hello ").
+    const flushFieldTail = (field: string, index: number): string => {
+        const s = streams.get(`${field}:${index}`);
+        return s ? s.filter.flush() : "";
+    };
     const write = (s: string) => {
         if (res.destroyed || res.writableEnded) return;
         if (!res.write(Buffer.from(s, "utf8"))) {
@@ -1319,10 +1465,15 @@ export async function pipePluginChatWithStrip(
     // before any prose, and dropping it froze lastInputTokens at the previous
     // turn's value, corrupting every later nudge decision.
     const settleUsage = () => {
-        if (session && (acc.inputTokens !== undefined || acc.outputTokens !== undefined || acc.cachedTokens !== undefined || acc.creationTokens !== undefined)) {
-            applyUsageSample(session, acc, protocol);
+        if (!session) return;
+        if (acc.inputTokens !== undefined || acc.outputTokens !== undefined || acc.cachedTokens !== undefined || acc.creationTokens !== undefined) {
+            applyUsageSample(session, acc, protocol, upstreamOrigin);
             markDirty(session);
         }
+        // #1595: clean completion but no input usage sample — name it (the
+        // cut-stream paths below have sawTerminal=false, so they stay
+        // distinguishable from transport failures).
+        if (sawTerminal && acc.inputTokens === undefined) diagnoseSuccessWithoutUsage(session, `plugin-passthrough-${protocol}`);
     };
     // #498: whether a terminal event ([DONE] / message_stop) was seen. A
     // stream that ends without one was cut mid-flight.
@@ -1361,6 +1512,19 @@ export async function pipePluginChatWithStrip(
         loggerLog("warn", msg);
         log?.(msg);
     };
+    // #1501 option C: once-per-response visibility into nameless tool calls on
+    // this verbatim lane (#1484 class). Bytes stay untouched (#1039); the warn
+    // exists so the observed rate settles the drop-vs-keep policy without
+    // touching fidelity — light, not surgery (BLIND TUNNEL WARNING pattern #897).
+    const maybeWarnNamelessToolCalls = () => {
+        const nameless = [...seenToolCalls.values()].filter((tc) => tc.name.length === 0);
+        if (nameless.length === 0) return;
+        const who = session ? `[${session.id}] ` : "";
+        const parts = nameless.map((tc) => `${tc.label}${tc.id ? ` id=${tc.id}` : ""} argsLen=${tc.argsLen} frags=${tc.frags}`).join(" | ");
+        const msg = `[plugin] ${who}nameless tool call(s) forwarded verbatim (${protocol}, ${nameless.length}): ${parts} (#1501 observe-only)`;
+        loggerLog("warn", msg);
+        log?.(msg);
+    };
     const pushField = (field: string, index: number, text: string): [string, boolean] => {
         const s = filterFor(field, index);
         const clean = s.filter.push(text);
@@ -1379,22 +1543,57 @@ export async function pipePluginChatWithStrip(
         let droppedText = false;
         let keptText = false;
         let hadText = false;
+        // #1546: a frame carrying a non-null finish_reason is terminal — its held
+        // tails must be drained before it reaches the client, never after.
+        let isTerminal = false;
         for (let ci = 0; ci < choices.length; ci++) {
             const ch = choices[ci] as Record<string, unknown> | null;
-            if (ch && typeof ch["finish_reason"] === "string") finalFinishReason = ch["finish_reason"] as string;
+            if (ch && typeof ch["finish_reason"] === "string") {
+                finalFinishReason = ch["finish_reason"] as string;
+                isTerminal = true;
+            }
             const d = ch?.["delta"];
             if (!d || typeof d !== "object") continue;
             const dd = d as Record<string, unknown>;
-            if (dd["tool_calls"] !== undefined) sawToolUse = true;
+            if (dd["tool_calls"] !== undefined) {
+                sawToolUse = true;
+                // #1501 observe-only: accumulate fragments per tool-call index;
+                // the stream-end settle warns when a name never arrives (#1484).
+                if (Array.isArray(dd["tool_calls"])) {
+                    for (let ti = 0; ti < dd["tool_calls"].length; ti++) {
+                        const tcf = dd["tool_calls"][ti];
+                        if (!tcf || typeof tcf !== "object") continue;
+                        const t = tcf as Record<string, unknown>;
+                        const tIdx = typeof t["index"] === "number" ? t["index"] : ti;
+                        const key = `${ci}:${tIdx}`;
+                        const accTc = seenToolCalls.get(key) ?? { label: `idx=${tIdx}`, id: "", name: "", argsLen: 0, frags: 0, args: "" };
+                        if (typeof t["id"] === "string" && t["id"]) accTc.id = t["id"];
+                        const fn = t["function"];
+                        if (fn && typeof fn === "object") {
+                            const f = fn as Record<string, unknown>;
+                            if (typeof f["name"] === "string") accTc.name += f["name"];
+                            if (typeof f["arguments"] === "string") {
+                                accTc.argsLen += f["arguments"].length;
+                                accTc.args += f["arguments"];
+                            }
+                        }
+                        accTc.frags++;
+                        seenToolCalls.set(key, accTc);
+                    }
+                }
+            }
             // #1039 invariant: tool_calls fragments in this delta are user
             // intent and pass through untouched — only the text fields below
             // are ever stripped (see tag-echo-filter.ts header).
             for (const field of ["content", "reasoning_content", "reasoning"]) {
                 const v = dd[field];
                 if (typeof v !== "string") continue;
-                hadText = true;
+                // #1546: an empty-string field carries no text — treating it as
+                // text blocked the no-text flush path and let a terminal frame
+                // leap ahead of a held tail.
+                if (v.length > 0) hadText = true;
                 if (field !== "content" && v.length > 0) sawThinking = true;
-                if (!mayStartRenderTag(v) && !mayStartMarkerLine(v) && !anyPending()) {
+                if (!mayStartRenderTag(v) && !mayStartMarkerLine(v) && !mayStartBiliInternal(v) && !anyPending()) {
                     if (v.length > 0) {
                         keptText = true;
                         proseAcc += v;
@@ -1403,16 +1602,33 @@ export async function pipePluginChatWithStrip(
                     continue;
                 }
                 const index = typeof ch?.["index"] === "number" ? ch["index"] : ci;
-                const [clean, changed] = pushField(field, index, v);
+                const [released, pushedChanged] = pushField(field, index, v);
+                let clean = released;
+                let changed = pushedChanged;
+                if (isTerminal) {
+                    // Fold this field's held tail into its own delta so the finish
+                    // marker lands after every byte of the field (#1546).
+                    const tail = flushFieldTail(field, index);
+                    if (tail.length > 0) {
+                        clean = released + tail;
+                        changed = true;
+                        proseAcc += tail;
+                    }
+                }
                 if (clean.length === 0) droppedText = true;
                 else {
                     keptText = true;
                     if (field === "content") {
                         visibleTextChars += clean.length;
+                        // The folded tail is released markup (an unclosed-tag
+                        // interior), counted like flushTails so degenerate-turn
+                        // detection is unchanged (#1546).
+                        const tailLen = clean.length - released.length;
+                        if (tailLen > 0) releasedMarkupChars += tailLen;
                         // What a dropped tag leaves behind is its own interior: the
                         // host finds no tool call in it and stalls the turn.
                         if (droppedTagInFrame) {
-                            releasedMarkupChars += clean.length;
+                            releasedMarkupChars += released.length;
                             droppedTagInFrame = false;
                         }
                     }
@@ -1425,6 +1641,11 @@ export async function pipePluginChatWithStrip(
                 }
             }
         }
+        // #1546: a terminal frame must reach the client only after every held
+        // tail is drained. Tails of fields THIS frame carried were folded into
+        // their deltas above; drain whatever remains (other fields/choices) as
+        // synthetic chunks ahead of the frame so nothing lands after finish.
+        const drain = isTerminal && anyPending() ? flushTails() : "";
         if (rebuilt) {
             // Delta carried no visible text after stripping: drop the whole
             // chunk instead of forwarding an empty content delta. Only when
@@ -1433,8 +1654,9 @@ export async function pipePluginChatWithStrip(
             if (droppedText && !keptText && !hadTextOtherThanTextFields(rebuilt["choices"])) {
                 return "";
             }
-            return rebuildEvent(rawEvent, rebuilt);
+            return drain + rebuildEvent(rawEvent, rebuilt);
         }
+        if (drain.length > 0) return drain + rawEvent + "\n\n";
         if (!hadText && anyPending()) return flushTails() + rawEvent + "\n\n";
         return rawEvent + "\n\n";
     };
@@ -1442,8 +1664,19 @@ export async function pipePluginChatWithStrip(
         if (ev["type"] === "content_block_start") {
             const cb = ev["content_block"] as Record<string, unknown> | undefined;
             const bt = cb && typeof cb === "object" ? cb["type"] : undefined;
-            if (bt === "tool_use") sawToolUse = true;
-            else if (bt === "thinking" || bt === "redacted_thinking") sawThinking = true;
+            if (bt === "tool_use") {
+                sawToolUse = true;
+                // The start block carries the full name, so absence is final (#1501).
+                const blockIndex = typeof ev["index"] === "number" ? ev["index"] : 0;
+                seenToolCalls.set(`block:${blockIndex}`, {
+                    label: `block=${blockIndex}`,
+                    id: cb && typeof cb["id"] === "string" ? cb["id"] : "",
+                    name: cb && typeof cb["name"] === "string" ? cb["name"] : "",
+                    argsLen: 0,
+                    frags: 1,
+                    args: "",
+                });
+            } else if (bt === "thinking" || bt === "redacted_thinking") sawThinking = true;
             return anyPending() ? flushTails() + rawEvent + "\n\n" : rawEvent + "\n\n";
         }
         if (ev["type"] !== "content_block_delta") {
@@ -1453,13 +1686,20 @@ export async function pipePluginChatWithStrip(
         const index = typeof ev["index"] === "number" ? ev["index"] : 0;
         // input_json_delta (tool-call arguments) is deliberately unmanaged:
         // #1039 — argument bytes are user intent, forwarded verbatim.
+        if (d?.["type"] === "input_json_delta") {
+            const accTc = seenToolCalls.get(`block:${index}`);
+            if (accTc && typeof d["partial_json"] === "string") {
+                accTc.argsLen += d["partial_json"].length;
+                accTc.args += d["partial_json"];
+            }
+        }
         const field = d?.["type"] === "thinking_delta" ? "thinking" : d?.["type"] === "text_delta" ? "text" : null;
         if (field === null || typeof d?.[field] !== "string") {
             return rawEvent + "\n\n";
         }
         const raw = d[field] as string;
         if (field === "thinking" && raw.length > 0) sawThinking = true;
-        if (!mayStartRenderTag(raw) && !mayStartMarkerLine(raw) && !anyPending()) {
+        if (!mayStartRenderTag(raw) && !mayStartMarkerLine(raw) && !mayStartBiliInternal(raw) && !anyPending()) {
             if (raw.length > 0) proseAcc += raw;
             if (field === "text" && raw.length > 0) visibleTextChars += raw.length;
             return rawEvent + "\n\n";
@@ -1499,6 +1739,9 @@ export async function pipePluginChatWithStrip(
         let droppedText = false;
         let keptText = false;
         let hadText = false;
+        // #1546: a chunk carrying finishReason is terminal — its held tails must
+        // be drained before it reaches the client, never after.
+        let isTerminal = false;
         for (let ci = 0; ci < candidates.length; ci++) {
             const cand = candidates[ci] as Record<string, unknown> | null;
             if (!cand || typeof cand !== "object") continue;
@@ -1509,6 +1752,7 @@ export async function pipePluginChatWithStrip(
                 finalFinishReason = cand["finishReason"] as string;
                 sawTerminal = true;
                 lastChunkMeta = { ...lastChunkMeta, finishReason: finalFinishReason };
+                isTerminal = true;
             }
             const content = cand["content"];
             if (!content || typeof content !== "object") continue;
@@ -1518,16 +1762,31 @@ export async function pipePluginChatWithStrip(
             for (let pi = 0; pi < parts.length; pi++) {
                 const p = parts[pi] as Record<string, unknown> | null;
                 if (!p || typeof p !== "object") continue;
-                if (p["functionCall"] !== undefined) sawToolUse = true;
+                if (p["functionCall"] !== undefined) {
+                    sawToolUse = true;
+                    // Gemini delivers functionCall whole in one part, so a missing
+                    // name is final here (#1501). Observe-only — bytes untouched.
+                    const fcObj = p["functionCall"] && typeof p["functionCall"] === "object" ? p["functionCall"] as Record<string, unknown> : undefined;
+                    const fcArgs = fcObj && fcObj["args"] !== null && typeof fcObj["args"] === "object" ? JSON.stringify(fcObj["args"]) : "";
+                    seenToolCalls.set(`cand:${ci}/part:${pi}`, {
+                        label: `candidate=${ci}/part=${pi}`,
+                        id: "",
+                        name: fcObj && typeof fcObj["name"] === "string" ? fcObj["name"] : "",
+                        argsLen: fcArgs.length,
+                        frags: 1,
+                        args: fcArgs,
+                    });
+                }
                 if (p["thought"] === true) sawThinking = true;
                 const raw = p["text"];
                 if (typeof raw !== "string") continue;
-                hadText = true;
+                // #1546: an empty-string part carries no text — see processOpenai.
+                if (raw.length > 0) hadText = true;
                 // A reasoning part streams through the same machine under its own
                 // field, so an interleaved thought/text pair in one frame never
                 // shares held-back state.
                 const field = p["thought"] === true ? "thinking" : "text";
-                if (!mayStartRenderTag(raw) && !mayStartMarkerLine(raw) && !anyPending()) {
+                if (!mayStartRenderTag(raw) && !mayStartMarkerLine(raw) && !mayStartBiliInternal(raw) && !anyPending()) {
                     if (raw.length > 0) {
                         keptText = true;
                         proseAcc += raw;
@@ -1535,11 +1794,29 @@ export async function pipePluginChatWithStrip(
                     if (field === "text") visibleTextChars += raw.length;
                     continue;
                 }
-                const [clean, changed] = pushField(field, index, raw);
+                const [released, pushedChanged] = pushField(field, index, raw);
+                let clean = released;
+                let changed = pushedChanged;
+                if (isTerminal) {
+                    // Fold this part's held tail into its own text so the
+                    // finishReason lands after every byte of the part (#1546).
+                    const tail = flushFieldTail(field, index);
+                    if (tail.length > 0) {
+                        clean = released + tail;
+                        changed = true;
+                        proseAcc += tail;
+                    }
+                }
                 if (clean.length === 0) droppedText = true;
                 else {
                     keptText = true;
-                    if (field === "text") visibleTextChars += clean.length;
+                    if (field === "text") {
+                        visibleTextChars += clean.length;
+                        // Counted like flushTails so degenerate-turn detection is
+                        // unchanged (#1546).
+                        const tailLen = clean.length - released.length;
+                        if (tailLen > 0) releasedMarkupChars += tailLen;
+                    }
                 }
                 if (changed) {
                     // Deep enough clone of the frame's candidates that the
@@ -1565,6 +1842,9 @@ export async function pipePluginChatWithStrip(
                 }
             }
         }
+        // #1546: drain held tails ahead of the terminal (finishReason) chunk so
+        // nothing lands after it — parts THIS chunk carried were folded above.
+        const drain = isTerminal && anyPending() ? flushTails() : "";
         if (rebuilt) {
             // Text carried was entirely stripped away: drop the whole chunk
             // instead of forwarding an empty text part — but only when EVERY
@@ -1572,8 +1852,9 @@ export async function pipePluginChatWithStrip(
             // finishReason / functionCall / usageMetadata sibling must survive,
             // the chat processor's #463 rule).
             if (droppedText && !keptText && !googleFrameHasNonText(rebuilt)) return "";
-            return rebuildEvent(rawEvent, rebuilt);
+            return drain + rebuildEvent(rawEvent, rebuilt);
         }
+        if (drain.length > 0) return drain + rawEvent + "\n\n";
         if (!hadText && anyPending()) return flushTails() + rawEvent + "\n\n";
         return rawEvent + "\n\n";
     };
@@ -1667,12 +1948,16 @@ export async function pipePluginChatWithStrip(
         settleUsage();
         maybeWarnDegenerate();
         maybeWarnProtocolFragment();
+        maybeWarnNamelessToolCalls();
+        settleWitnesses();
         if (truncated) {
             emitUpstreamTruncation(res, protocol, finalFinishReason !== undefined, log);
             return;
         }
     } catch (e) {
         settleUsage();
+        maybeWarnNamelessToolCalls();
+        settleWitnesses();
         if (res.destroyed || res.writableEnded) {
             log?.("client aborted mid-stream");
             return;
@@ -1767,6 +2052,7 @@ export async function pipePluginResponsesWithStrip(
     session?: Session,
     log?: (msg: string) => void,
     refetch?: () => Promise<ReadableStream<Uint8Array> | null>,
+    upstreamOrigin?: string,
 ): Promise<void> {
     let reader = stream.getReader();
     let decoder = new TextDecoder("utf-8");
@@ -1776,15 +2062,33 @@ export async function pipePluginResponsesWithStrip(
         loggerLog("warn", `[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
         log?.(`[tag-echo] stripped model-emitted render tag from plugin passthrough text`);
     };
+    const onBiliDrop = (snippet: string) => {
+        loggerLog("warn", `[bili-artifact] stripped model-emitted internal artifact (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+        log?.(`[bili-artifact] stripped model-emitted internal artifact from plugin passthrough text`);
+    };
     const tagFilter = composeStreamFilters(
-        createTagEchoFilter(onTagDrop),
-        createMarkerLineFilter((snippet) => {
-            loggerLog("warn", `[marker-echo] stripped model-emitted ACP confirmation marker (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
-            log?.(`[marker-echo] stripped model-emitted ACP confirmation marker from plugin passthrough text`);
-        }),
+        composeStreamFilters(
+            createTagEchoFilter(onTagDrop),
+            createMarkerLineFilter((snippet) => {
+                loggerLog("warn", `[marker-echo] stripped model-emitted ACP confirmation marker (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                log?.(`[marker-echo] stripped model-emitted ACP confirmation marker from plugin passthrough text`);
+            }),
+        ),
+        createBiliArtifactFilter(onBiliDrop),
     );
     // #673: turn-level observability for degenerate terminal turns.
     let sawFunctionCall = false;
+    // #1685 witness feed: function_call items carry their name at
+    // output_item.added and their FULL argument string at
+    // function_call_arguments.done; both are accumulate-then-record at settle.
+    const witnessedCalls = new Map<string, { name: string; args: string; named: boolean }>();
+    const settleWitnesses = () => {
+        if (!session) return;
+        for (const wc of witnessedCalls.values()) {
+            if (!wc.named || wc.name.length === 0) continue;
+            recordToolWitness(session.id, wc.name, wc.args);
+        }
+    };
     let sawReasoning = false;
     /** The model emitted markup the filter stripped (or would strip): proof the
      *  turn produced output, even when none survived to be visible. */
@@ -1823,10 +2127,13 @@ export async function pipePluginResponsesWithStrip(
     // #411: keep the usage sniffed before an abort (see
     // pipePluginChatWithStrip).
     const settleUsage = () => {
-        if (session && (acc.inputTokens !== undefined || acc.outputTokens !== undefined || acc.cachedTokens !== undefined)) {
-            applyUsageSample(session, acc, "responses");
+        if (!session) return;
+        if (acc.inputTokens !== undefined || acc.outputTokens !== undefined || acc.cachedTokens !== undefined) {
+            applyUsageSample(session, acc, "responses", upstreamOrigin);
             markDirty(session);
         }
+        // #1595: same as the chat-pipe twin — sawTerminal gates out cuts.
+        if (sawTerminal && acc.inputTokens === undefined) diagnoseSuccessWithoutUsage(session, "plugin-passthrough-responses");
     };
     // #498: whether a terminal event (done-family / [DONE]) was seen. A
     // stream that ends without one was cut mid-flight.
@@ -1991,7 +2298,7 @@ export async function pipePluginResponsesWithStrip(
             for (const k of ["item_id", "output_index", "summary_index"]) {
                 if (ev[k] !== undefined) meta[k] = ev[k];
             }
-            s = { filter: createTagEchoFilter(onTagDrop), type, field, meta };
+            s = { filter: composeStreamFilters(createTagEchoFilter(onTagDrop), createBiliArtifactFilter(onBiliDrop)), type, field, meta };
             argStreams.set(key, s);
         }
         return s;
@@ -2042,6 +2349,16 @@ export async function pipePluginResponsesWithStrip(
                             const item = ev["item"] as Record<string, unknown> | undefined;
                             const it = item?.["type"];
                             if (it === "function_call" || it === "custom_tool_call") sawFunctionCall = true;
+                            if (it === "function_call") {
+                                const key = typeof item?.["id"] === "string" && item["id"] ? item["id"] as string : `oi:${typeof ev["output_index"] === "number" ? ev["output_index"] as number : 0}`;
+                                const wc = witnessedCalls.get(key) ?? { name: "", args: "", named: false };
+                                if (typeof item?.["name"] === "string" && item["name"].length > 0) {
+                                    wc.name = item["name"];
+                                    wc.named = true;
+                                }
+                                if (typeof item?.["arguments"] === "string" && item["arguments"].length > 0) wc.args = item["arguments"];
+                                witnessedCalls.set(key, wc);
+                            }
                         }
                         const resp = ev["response"] as Record<string, unknown> | undefined;
                         if (resp && typeof resp["status"] === "string") responseStatus = resp["status"] as string;
@@ -2060,6 +2377,10 @@ export async function pipePluginResponsesWithStrip(
                     // function_call_arguments.done carries tool arguments, not
                     // visible text: forwarded verbatim (#1039).
                     if (type === "response.function_call_arguments.done") {
+                        const itemId = typeof ev["item_id"] === "string" && ev["item_id"] ? ev["item_id"] : `oi:${typeof ev["output_index"] === "number" ? ev["output_index"] as number : 0}`;
+                        const wc = witnessedCalls.get(itemId) ?? { name: "", args: "", named: false };
+                        if (typeof ev["arguments"] === "string") wc.args = ev["arguments"];
+                        witnessedCalls.set(itemId, wc);
                         await write(flushArgTails() + rawEvent + "\n\n");
                         continue;
                     }
@@ -2067,7 +2388,7 @@ export async function pipePluginResponsesWithStrip(
                     // The done is not visible text to the degenerate-turn retry below, so it
                     // is stripped and released directly.
                     if (type === "response.reasoning_summary_part.done") {
-                        const hadEcho = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr);
+                        const hadEcho = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr) || containsBiliInternalText(jsonStr);
                         if (hadEcho) sawStrippedEcho = true;
                         const evOut = hadEcho ? stripResponsesText(ev) : ev;
                         proseAcc += responsesEventText(evOut);
@@ -2080,7 +2401,7 @@ export async function pipePluginResponsesWithStrip(
                         // retryEmptyTurn): releasing it earlier would hand the
                         // client the echo's own text exactly when the retry is
                         // about to replace it.
-                        const hadEchoText = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr);
+                        const hadEchoText = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr) || containsBiliInternalText(jsonStr);
                         if (hadEchoText) sawStrippedEcho = true;
                         let evOut = ev;
                         let rebuild = hadEchoText || retryRewritePending();
@@ -2130,7 +2451,7 @@ export async function pipePluginResponsesWithStrip(
                         heldVisibleChars = 0;
                         // The completion frame itself closes the turn: strip it if it
                         // carries echoed text, rewrite retry ids onto the first attempt's.
-                        const hadEchoText = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr);
+                        const hadEchoText = containsRenderTagText(jsonStr) || containsMarkerLineText(jsonStr) || containsBiliInternalText(jsonStr);
                         if (hadEchoText) sawStrippedEcho = true;
                         let evOut = ev;
                         let rebuild = hadEchoText || retryRewritePending();
@@ -2145,7 +2466,7 @@ export async function pipePluginResponsesWithStrip(
                             await write(rawEvent + "\n\n");
                             continue;
                         }
-                        if (!retryRewritePending() && !mayStartRenderTag(delta) && !mayStartMarkerLine(delta) && !tagFilter.pending()) {
+                        if (!retryRewritePending() && !mayStartRenderTag(delta) && !mayStartMarkerLine(delta) && !mayStartBiliInternal(delta) && !tagFilter.pending()) {
                             proseAcc += delta;
                             await write(rawEvent + "\n\n");
                             continue;
@@ -2181,7 +2502,7 @@ export async function pipePluginResponsesWithStrip(
                             await write(rawEvent + "\n\n");
                             continue;
                         }
-                        if (!mayStartRenderTag(v) && !argAnyPending() && !tagFilter.pending()) {
+                        if (!mayStartRenderTag(v) && !mayStartBiliInternal(v) && !argAnyPending() && !tagFilter.pending()) {
                             proseAcc += v;
                             await write(rawEvent + "\n\n");
                             continue;
@@ -2211,6 +2532,7 @@ export async function pipePluginResponsesWithStrip(
         maybeWarnDegenerate();
         maybeWarnProtocolFragment();
         settleUsage();
+        settleWitnesses();
         // #721: same as the chat-pipe twin — never close bare on a missing
         // done-family event. Responses has no separate finish-reason concept
         // (terminal events carry the status), so this is always the error shape.
@@ -2220,6 +2542,7 @@ export async function pipePluginResponsesWithStrip(
         }
     } catch (e) {
         settleUsage();
+        settleWitnesses();
         if (res.destroyed || res.writableEnded) {
             log?.("client aborted mid-stream");
             return;
@@ -2311,6 +2634,7 @@ export async function pipePluginJson(
     res: import("node:http").ServerResponse,
     session?: Session,
     protocol?: WireProtocol,
+    upstreamOrigin?: string,
 ): Promise<void> {
     // Also serves proxy-mode JSON responses that skipped compress injection
     // (#460 residual) — pass no session there so usage accounting stays off.
@@ -2337,6 +2661,7 @@ export async function pipePluginJson(
     try {
         json = JSON.parse(text) as Record<string, unknown>;
         const usage = json["usage"] as Record<string, unknown> | undefined;
+        let sawInputSample = false;
         if (session && usage) {
             const input = num(usage["prompt_tokens"]) ?? num(usage["input_tokens"]);
             if (input !== undefined) {
@@ -2352,8 +2677,9 @@ export async function pipePluginJson(
                     outputTokens: num(usage["completion_tokens"]) ?? num(usage["output_tokens"]),
                     cachedTokens: cached,
                     creationTokens: creation,
-                }, protocol);
+                }, protocol, upstreamOrigin);
                 markDirty(session);
+                sawInputSample = true;
             }
         }
         // Gemini reports its usage in a top-level `usageMetadata` instead of
@@ -2363,12 +2689,19 @@ export async function pipePluginJson(
         if (session && !usage) {
             const sample = googleUsageSample(json);
             if (sample && sample.inputTokens !== undefined) {
-                applyUsageSample(session, sample, protocol);
+                applyUsageSample(session, sample, protocol, upstreamOrigin);
                 markDirty(session);
+                sawInputSample = true;
             }
         }
+        // #1595: parsed success body carrying no input usage report — name it.
+        if (session && !sawInputSample) diagnoseSuccessWithoutUsage(session, "plugin-json");
+        // #1685: a non-streaming plugin response still carries the model's
+        // complete tool calls — same witness feed as the SSE pipes, from the
+        // one full-body parse this path already does. Observe-only (#1039).
+        if (session) recordJsonToolWitnesses(session.id, json, protocol);
     } catch { /* non-JSON body — forward verbatim */ }
-        if (json && (containsRenderTagText(text) || containsMarkerLineText(text))) {
+        if (json && (containsRenderTagText(text) || containsMarkerLineText(text) || containsBiliInternalText(text))) {
         // #206 parity for the non-streaming plugin path: the compress loop's
         // JSON branch strips render tags from every round; a verbatim plugin
         // JSON response would re-feed the model's tag echoes. Strips mutate in
@@ -2387,12 +2720,84 @@ export async function pipePluginJson(
     res.end(text);
 }
 
+/** #1685 witness feed for non-streaming plugin responses: pull every complete
+ *  tool call out of the parsed body, per wire protocol, and ring-record it.
+ *  Names/arguments here are final (no streaming fragments). */
+function recordJsonToolWitnesses(sessionId: string, json: Record<string, unknown>, protocol: WireProtocol | undefined): void {
+    try {
+        if (protocol === "anthropic") {
+            const content = json["content"];
+            if (!Array.isArray(content)) return;
+            for (const block of content) {
+                if (!block || typeof block !== "object") continue;
+                const b = block as Record<string, unknown>;
+                if (b["type"] !== "tool_use") continue;
+                if (typeof b["name"] !== "string" || b["name"].length === 0) continue;
+                recordToolWitness(sessionId, b["name"], b["input"] !== null && b["input"] !== undefined ? b["input"] as Record<string, unknown> : "");
+            }
+            return;
+        }
+        if (protocol === "responses") {
+            const output = json["output"];
+            if (!Array.isArray(output)) return;
+            for (const item of output) {
+                if (!item || typeof item !== "object") continue;
+                const o = item as Record<string, unknown>;
+                if (o["type"] !== "function_call") continue;
+                if (typeof o["name"] !== "string" || o["name"].length === 0) continue;
+                recordToolWitness(sessionId, o["name"], typeof o["arguments"] === "string" ? o["arguments"] : "");
+            }
+            return;
+        }
+        if (protocol === "google") {
+            const candidates = json["candidates"];
+            if (!Array.isArray(candidates)) return;
+            for (const cand of candidates) {
+                if (!cand || typeof cand !== "object") continue;
+                const content = (cand as Record<string, unknown>)["content"];
+                if (!content || typeof content !== "object") continue;
+                const parts = (content as Record<string, unknown>)["parts"];
+                if (!Array.isArray(parts)) continue;
+                for (const p of parts) {
+                    if (!p || typeof p !== "object") continue;
+                    const fc = (p as Record<string, unknown>)["functionCall"];
+                    if (!fc || typeof fc !== "object") continue;
+                    const f = fc as Record<string, unknown>;
+                    if (typeof f["name"] !== "string" || f["name"].length === 0) continue;
+                    recordToolWitness(sessionId, f["name"], f["args"] !== null && f["args"] !== undefined ? f["args"] as Record<string, unknown> : "");
+                }
+            }
+            return;
+        }
+        const choices = json["choices"];
+        if (!Array.isArray(choices)) return;
+        for (const choice of choices) {
+            if (!choice || typeof choice !== "object") continue;
+            const message = (choice as Record<string, unknown>)["message"];
+            if (!message || typeof message !== "object") continue;
+            const toolCalls = (message as Record<string, unknown>)["tool_calls"];
+            if (!Array.isArray(toolCalls)) continue;
+            for (const tc of toolCalls) {
+                if (!tc || typeof tc !== "object") continue;
+                const fn = (tc as Record<string, unknown>)["function"];
+                if (!fn || typeof fn !== "object") continue;
+                const f = fn as Record<string, unknown>;
+                if (typeof f["name"] !== "string" || f["name"].length === 0) continue;
+                recordToolWitness(sessionId, f["name"], typeof f["arguments"] === "string" ? f["arguments"] : "");
+            }
+        }
+    } catch {
+        /* observe-only: a malformed body must not break forwarding */
+    }
+}
+
 export function _resetPluginStateForTest(): void {
     conversations.clear();
     remembered.clear();
     pendingRegisters.length = 0;
     registeredIds.clear();
     pluginRuntimeTable.clear();
+    pluginRuntimeByConversation.clear();
     warnedNoModelRequests.clear();
 }
 

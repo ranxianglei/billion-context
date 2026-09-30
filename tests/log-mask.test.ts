@@ -11,7 +11,7 @@ import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { setLogCapture } from "../src/logger.ts";
+import { closeLogger, configureLogger, log as loggerLog, setLogCapture } from "../src/logger.ts";
 import { formatUpstreamError } from "../src/upstream-proxy.ts";
 import {
     isMaskHostsEnabled,
@@ -21,10 +21,14 @@ import {
     maskHostForLog,
     maskHostInText,
     maskHostPortForLog,
+    maskIpsInText,
     maskUrlForLog,
     maskUrlsInText,
+    redactSecretsInText,
     setMaskHostsEnabled,
 } from "../src/log-mask.ts";
+import { assertPortDead } from "./port-race.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 /** #255 Part B: logs (bili.log + launcher tmp log) must carry no sensitive
  *  info — credential header values are masked, and non-public API endpoints
@@ -262,7 +266,7 @@ test("proxy debug logs: no credentials, no non-public host in ANY log line (#255
         else process.env.ACP_DUMP_REQ = prev.dumpReq;
         await close(proxy!);
         await close(upstream);
-        fs.rmSync(tmpRoot, { recursive: true, force: true });
+        rmrf(tmpRoot);
     }
 });
 
@@ -314,7 +318,7 @@ test("proxy error log: connection failure to non-public upstream leaks nothing (
         if (prev.xdgState === undefined) delete process.env.XDG_STATE_HOME;
         else process.env.XDG_STATE_HOME = prev.xdgState;
         await close(proxy!);
-        fs.rmSync(tmpRoot, { recursive: true, force: true });
+        rmrf(tmpRoot);
     }
 });
 
@@ -357,6 +361,9 @@ test("mitm CONNECT tunnel failure: err.message host scrubbed from log (#255)", a
         proxy = await startServer(opts);
         await once(proxy, "listening");
         const proxyPort = (proxy.address() as { port: number }).port;
+        // #1689: prove the freed port is actually dead right before the tunnel
+        // attempt — a squatter would turn the expected refusal into a 200.
+        await assertPortDead(deadPort);
         const sock = net.connect(proxyPort, "127.0.0.1");
         let buf = "";
         await new Promise<void>((resolve, reject) => {
@@ -378,7 +385,7 @@ test("mitm CONNECT tunnel failure: err.message host scrubbed from log (#255)", a
         if (prev.dataHome === undefined) delete process.env.XDG_DATA_HOME;
         else process.env.XDG_DATA_HOME = prev.dataHome;
         await close(proxy!);
-        fs.rmSync(tmpRoot, { recursive: true, force: true });
+        rmrf(tmpRoot);
     }
 });
 
@@ -438,6 +445,83 @@ test("ws upgrade rejection: host header scrubbed from log (#255)", async () => {
         if (prev.xdgState === undefined) delete process.env.XDG_STATE_HOME;
         else process.env.XDG_STATE_HOME = prev.xdgState;
         await close(proxy!);
+        rmrf(tmpRoot);
+    }
+});
+
+test("redactSecretsInText: scrubs credential-shaped tokens from free-form text (#1718)", () => {
+    assert.equal(
+        redactSecretsInText("Authorization: Bearer sk-ant-api03-abc123xyz"),
+        "Authorization: Bearer <masked 22 chars>",
+    );
+    assert.equal(
+        redactSecretsInText("proxy auth failed: Basic dXNlcm5hbWU6cGFzc3dvcmQ="),
+        "proxy auth failed: Basic <masked 24 chars>",
+    );
+    assert.equal(redactSecretsInText("invalid api key sk-proj-AbCdEfGhIjKlMn12"), "invalid api key <masked key>");
+    assert.equal(redactSecretsInText("xai-abcdefghijklmnop rejected"), "<masked key> rejected");
+    assert.equal(
+        redactSecretsInText('{"error":{"message":"bad credentials","api_key":"sk-secret-value-12"}}'),
+        '{"error":{"message":"bad credentials","api_key":"<masked key>"}}',
+    );
+    assert.equal(redactSecretsInText("GET /v1?api_key=abcd1234efgh5678"), "GET /v1?api_key=<masked 16 chars>");
+    assert.equal(
+        redactSecretsInText("token: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.dozjgNryP4J3jVmNHl0w5N"),
+        "token: <masked jwt>",
+    );
+    const negatives = [
+        "task-abcdefghi",
+        "prompt_tokens=1234 completion_tokens=5678",
+        "the token was expired yesterday",
+        "tokens: 1234",
+        "token=abc",
+        "x-request-id=req-abcdefghij",
+        "",
+    ];
+    for (const s of negatives) assert.equal(redactSecretsInText(s), s, `must stay verbatim: ${s}`);
+});
+
+test("maskIpsInText: non-loopback IP literals scrubbed from free-form text (#1718)", () => {
+    assert.equal(maskIpsInText("connect ETIMEDOUT 203.0.113.5:8443"), "connect ETIMEDOUT <private-host>:8443");
+    assert.equal(maskIpsInText("upstream refused 192.168.1.50:443 after 3 retries"), "upstream refused <private-host>:443 after 3 retries");
+    assert.equal(maskIpsInText("peer 2001:db8:0:0:0:0:2:1 seen"), "peer <private-host> seen");
+    assert.equal(maskIpsInText("connect ECONNREFUSED [2001:db8::1]:8443"), "connect ECONNREFUSED [<private-host>]:8443");
+    const negatives = [
+        "local proxy http://127.0.0.1:8787 ok",
+        "loopback ::1 and [::1]:8080 stay",
+        "bind 0.0.0.0:8787",
+        "build 10.0.19045.3209 unchanged",
+        "time 12:34:56 unchanged",
+        "mac aa:bb:cc:dd:ee:ff unchanged",
+        "999.1.1.1 bad octet unchanged",
+        "",
+    ];
+    for (const s of negatives) assert.equal(maskIpsInText(s), s, `must stay verbatim: ${s}`);
+    setMaskHostsEnabled(false);
+    try {
+        assert.equal(maskIpsInText("203.0.113.5:8443"), "203.0.113.5:8443", "BILI_LOG_MASK_HOSTS=0 opt-out must keep real IPs");
+    } finally {
+        setMaskHostsEnabled(true);
+    }
+});
+
+test("logger sink: file lines scrubbed, capture hook stays raw (#1718)", async () => {
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bili-log-sink-"));
+    const file = path.join(tmpRoot, "sink.log");
+    const captured: string[] = [];
+    setLogCapture((_level, msg) => captured.push(msg));
+    try {
+        configureLogger(file);
+        const secret = "sk-test-leak-1234567890";
+        loggerLog("warn", `upstream 401 body: {"error":{"code":"invalid_api_key","api_key":"${secret}"}}`);
+        await closeLogger();
+        const onDisk = fs.readFileSync(file, "utf8");
+        assert.ok(!onDisk.includes(secret), `secret leaked into log file:\n${onDisk}`);
+        assert.ok(onDisk.includes("<masked"), onDisk);
+        assert.ok(captured[0]?.includes(secret), "capture hook must receive the raw message (in-process seam)");
+    } finally {
+        configureLogger(undefined);
+        setLogCapture(null);
         fs.rmSync(tmpRoot, { recursive: true, force: true });
     }
 });

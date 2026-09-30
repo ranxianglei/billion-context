@@ -1,6 +1,6 @@
 {
   "name": "billion-context",
-  "version": "0.1.158",
+  "version": "0.1.175",
   "description": "A context-compression plugin — small context windows (a 100K context is enough), 5x fewer tokens, month-long single sessions (billions of tokens), and compression quality — for all agents: pi, OpenCode, Codex, Claude Code, and more. billion-context is all you need.",
   "type": "module",
   "main": "dist/index.js",
@@ -55,10 +55,12 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@types/node-forge": "^1.3.14",
-    "acp-kernel": "0.0.95",
+    "@types/semver": "^7.7.1",
+    "acp-kernel": "0.0.99",
     "fzstd": "0.1.1",
     "jsonc-parser": "^3.3.1",
     "node-forge": "^1.4.0",
+    "semver": "7.8.5",
     "tar": "^7.5.22",
     "tsup": "^8.0.0",
     "tsx": "^4.0.0",

@@ -266,7 +266,7 @@ test("abort x proxy-json: client abort while the JSON is buffering destroys the 
     }
 });
 
-test("error-delivery x proxy-openai-sse: upstream 429 AFTER the early 200 commit arrives in-band as an error delta + [DONE]", async () => {
+test("error-delivery x proxy-openai-sse: upstream 429 AFTER the early 200 commit arrives in-band as a top-level error frame + [DONE]", async () => {
     const up = await startUpstream("slow-summary-fwd-429");
     const proxy = await startProxy(up.port);
     await once(proxy, "listening");
@@ -292,9 +292,12 @@ test("error-delivery x proxy-openai-sse: upstream 429 AFTER the early 200 commit
         assert.ok(r.tHeaderMs < SLOW_MS, `headers committed before the slow preflight finished (${r.tHeaderMs}ms)`);
         assert.ok(r.body.includes(": bili-preflight"), "keep-alive comment present");
         // Post-commit upstream failure goes through emitStreamError: openai
-        // shape = inline error delta + finish_reason + [DONE].
-        assert.ok(r.body.includes("upstream HTTP 429"), `in-band error delta carries the upstream status body=${r.body.slice(-600)}`);
-        assert.ok(r.body.includes('"finish_reason"'), "delta finishes the choice");
+        // shape = top-level error frame + [DONE]. #1455: the legacy
+        // error-delta + finish_reason looked like a successful completion and
+        // silenced client retry — it is now opt-out only.
+        assert.ok(r.body.includes("upstream HTTP 429"), `in-band error frame carries the upstream status body=${r.body.slice(-600)}`);
+        assert.ok(r.body.includes('"code":"stream_error"'), "error frame carries the stream_error code");
+        assert.ok(!r.body.includes('"finish_reason"'), "no fabricated completion after the failure");
         assert.ok(r.body.includes("data: [DONE]"), "stream terminates with [DONE]");
         assert.ok(!r.body.includes('"choices":[{"index":0,"message"'), "no fabricated model content after the failure");
     } finally {

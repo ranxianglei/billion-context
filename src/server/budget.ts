@@ -32,10 +32,15 @@ export function countSystemAndToolsTokens(systemText: string | undefined, tools:
 /** Conservative outbound-input estimate: the larger of the upstream-reported
  *  previous-turn input (real tokenizer count, already includes system+tools) and
  *  a fresh count of the rebuilt conversation text + system + tool definitions
- *  (needed on turn 1 / right after a shrink, when lastInputTokens lags). */
-export function estimateInputTokens(processedMessages: CoreMessage[], systemText: string | undefined, tools: unknown, lastInputTokens: number): number {
+ *  (needed on turn 1 / right after a shrink, when lastInputTokens lags).
+ *  #1492: the reported baseline floors only when it is usage-grade — an
+ *  estimate-grade baseline (raw-view poison from a transform-failure fallback
+ *  arm) would mask the payload's own est through the max() and silently skip
+ *  the #453 clamp (fail-open) while the poison persists. */
+export function estimateInputTokens(processedMessages: CoreMessage[], systemText: string | undefined, tools: unknown, lastInputTokens: number, lastInputTokensSource?: string): number {
     const est = estimateCoreMessages(processedMessages) + countSystemAndToolsTokens(systemText, tools);
-    return Math.max(lastInputTokens > 0 ? lastInputTokens : 0, est);
+    const baseline = lastInputTokens > 0 && lastInputTokensSource === "usage" ? lastInputTokens : 0;
+    return Math.max(baseline, est);
 }
 
 // #1320: Claude Code round-trips extended-thinking blocks as SIGNATURE-ONLY
@@ -193,7 +198,7 @@ export function emergencyNudge(nudge: NudgeDecision | null | undefined, escalati
 export function clampOutgoingOutput(
     rebuilt: Record<string, unknown>,
     field: OutputBudgetField,
-    ctx: { systemText: string; tools: unknown; processedMessages: CoreMessage[]; lastInputTokens: number; nativeWindow: number; imageTokens: number },
+    ctx: { systemText: string; tools: unknown; processedMessages: CoreMessage[]; lastInputTokens: number; lastInputTokensSource?: string; nativeWindow: number; imageTokens: number },
     sessionId: string,
     log: (level: string, msg: string) => void,
 ): void {
@@ -201,7 +206,7 @@ export function clampOutgoingOutput(
     if (typeof raw !== "number") return;
     // #488: images ride along in the rebuilt body but are invisible to the text model —
     // without them the cap is too generous and input+output can still overflow.
-    const inputEstimate = estimateInputTokens(ctx.processedMessages, ctx.systemText, ctx.tools, ctx.lastInputTokens) + ctx.imageTokens;
+    const inputEstimate = estimateInputTokens(ctx.processedMessages, ctx.systemText, ctx.tools, ctx.lastInputTokens, ctx.lastInputTokensSource) + ctx.imageTokens;
     const capped = clampOutputBudget(raw, inputEstimate, ctx.nativeWindow);
     if (capped !== undefined) {
         writeOutputBudget(rebuilt, field, capped);

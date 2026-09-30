@@ -11,6 +11,7 @@ import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { setLogCapture } from "../src/logger.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 // #762 e2e: a client-originated (main-path) 400 whose body mentions
 // reasoning_content must (a) be persisted when BILI_DUMP_4XX=1, (b) learn
@@ -71,6 +72,7 @@ async function startHarness(captured: Captured[], onUpstreamRequest: (bodyText: 
         log: true,
         debug: false,
         passthrough: false,
+        chainContentDetection: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
     };
@@ -166,7 +168,7 @@ test("#762: main-path 400 learns strict-echo, next request is normalized, reject
         delete process.env.BILI_DUMP_4XX;
         delete process.env.ACP_DUMP_DIR;
         setLogCapture(null);
-        fs.rmSync(dumpDir, { recursive: true, force: true });
+        rmrf(dumpDir);
     }
 });
 
@@ -192,6 +194,6 @@ test("#762: dump stays off by default even on 4xx", async () => {
     } finally {
         delete process.env.ACP_DUMP_DIR;
         setLogCapture(null);
-        fs.rmSync(dumpDir, { recursive: true, force: true });
+        rmrf(dumpDir);
     }
 });

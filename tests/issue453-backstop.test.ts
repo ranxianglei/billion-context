@@ -40,7 +40,13 @@ test("clampOutputBudget: no-op when input alone nearly fills the window (preflig
 });
 
 test("estimateInputTokens: prefers the real previous-turn count when it lags high", () => {
-    assert.equal(estimateInputTokens([], "", [], 50_000), 50_000);
+    assert.equal(estimateInputTokens([], "", [], 50_000, "usage"), 50_000);
+    // #1492: estimate-grade and unknown-provenance baselines must never floor
+    // the estimate — raw-view poison from a transform-failure fallback arm would
+    // otherwise mask the payload's own estimate through the max().
+    const est = estimateInputTokens([], "", [], 0, "usage");
+    assert.equal(estimateInputTokens([], "", [], 50_000, "estimate"), est);
+    assert.equal(estimateInputTokens([], "", [], 50_000), est);
 });
 
 test("estimateInputTokens: counts system + tools on turn 1 (lastInputTokens=0)", () => {

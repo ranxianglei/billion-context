@@ -11,6 +11,7 @@ import { isMitmHost, readMitmUpstream, MITM_UPSTREAM_KEY, setupMitm, noteMitmTls
 import { ensureRootCA, rootCaPath, getSecureContext, mintHostCert, _resetForTest } from "../src/ca.js";
 import { _resetDiscoveryCacheForTest } from "../src/discover.js";
 import { setMaskHostsEnabled } from "../src/log-mask.js";
+import { rmrf } from "./tmp-rm.ts";
 
 // isMitmHost now calls discoverMitmDomains(), which reads real client config
 // files. Isolate discovery to an empty temp HOME so the isMitmHost assertions
@@ -37,7 +38,7 @@ test.after(() => {
     }
     _resetDiscoveryCacheForTest();
     if (_discoveryTmpHome) {
-        try { fs.rmSync(_discoveryTmpHome, { recursive: true, force: true }); } catch { /* best-effort */ }
+        try { rmrf(_discoveryTmpHome); } catch { /* best-effort */ }
     }
 });
 
@@ -58,7 +59,7 @@ async function withTmpCa<T>(fn: () => Promise<T> | T): Promise<T> {
         if (prev === undefined) delete process.env.XDG_DATA_HOME;
         else process.env.XDG_DATA_HOME = prev;
         _resetForTest();
-        try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* best-effort */ }
+        try { rmrf(tmp); } catch { /* best-effort */ }
     }
 }
 

@@ -8,6 +8,7 @@ import { setLogCapture } from "../src/logger.ts";
 import { dirname, join, relative, sep } from "node:path";
 import type { Session, BlockContent } from "../src/session.ts";
 import { createInitialState } from "acp-kernel";
+import { rmrf } from "./tmp-rm.ts";
 
 // These tests inspect raw on-disk session files directly (bypassing the store
 // codec), so pin the plain-JSON format: #1080 made BILIZSTD1 the default.
@@ -49,7 +50,7 @@ function withTempStore<T>(name: string, fn: (store: SessionStore, dir: string) =
             await fn(store, dir);
         } finally {
             store.cancelAll();
-            rmSync(dir, { recursive: true, force: true });
+            rmrf(dir);
         }
     }) as unknown as Promise<T>;
 }
@@ -193,7 +194,7 @@ await withTempStore("disabled store writes nothing", async () => {
         store.flushSync(s);
         assert.equal(readdirSync(dir).length, 0, "nothing written when disabled");
     } finally {
-        rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -202,7 +203,7 @@ await withTempStore("flushSync returns true on success, false on failure", async
     assert.equal(store.flushSync(s), true, "returns true on success");
     // Make the directory a file to force write failure.
     const { rmSync, writeFileSync: wf } = await import("node:fs");
-    rmSync(dir, { recursive: true, force: true });
+    rmrf(dir);
     wf(dir, "block", "utf8"); // dir path is now a file → mkdir/write fails
     assert.equal(store.flushSync(makeSession("flush-bool-2")), false, "returns false on write failure");
 });
@@ -454,7 +455,7 @@ await withTempStore("migration leaves anonymous pfa sessions untouched (#499)", 
 
 test("SessionStore routes write failures through the EPERM detector (no false alert on non-lock error)", async () => {
     const dir = mkdtempSync(join(tmpdir(), "bili-eperm-wire-"));
-    rmSync(dir, { recursive: true, force: true });
+    rmrf(dir);
     writeFileSync(dir, "block", "utf8");
     const store = new SessionStore({ dir, debounceMs: 5, enabled: true });
     const captured: { level: string; msg: string }[] = [];

@@ -59,17 +59,31 @@ test("anthropic round-2 streaming: deltas carry raw + block start/stop forwarded
     assert.ok(hasStop, "content_block_stop forwarded in round 2 (closes the text block)");
 });
 
-test("anthropic round-2 message_start is NOT re-emitted (one message_start per response)", async () => {
+// #1455: suppression is keyed on ACTUAL forwarding state, not the round number —
+// a truncated round's blind retry re-parses at the SAME round, so a round-keyed
+// guard would emit a second response identity. The real invariant: at most ONE
+// message_start per adapter (per logical response), regardless of how many
+// upstream streams it parsed.
+const ROUND1_STREAM = sse([
+    `event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg_r1", usage: { input_tokens: 9 } } })}`,
+    `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}`,
+    `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Hi" } })}`,
+    `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}`,
+    `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 3 } })}`,
+    `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}`,
+]);
+
+test("anthropic message_start is emitted at most once per adapter — across rounds AND across re-parsed streams", async () => {
     const adapter = createAnthropicAdapter({ model: "claude-1" });
-    const events: ParsedEvent[] = [];
-    for await (const ev of adapter.parseStream(toStream(ROUND2_STREAM), 2) as AsyncIterable<ParsedEvent>) {
-        events.push(ev);
+    const allMeta: string[] = [];
+    for await (const ev of adapter.parseStream(toStream(ROUND1_STREAM), 1) as AsyncIterable<ParsedEvent>) {
+        if (ev.kind === "meta") allMeta.push(ev.chunk?.toString("utf8") ?? "");
     }
-    const metaChunks = events.filter((e) => e.kind === "meta").map((e) => e.chunk?.toString("utf8") ?? "");
-    assert.ok(
-        !metaChunks.some((c) => c.includes("message_start")),
-        "round 2 skips message_start (already sent in round 1); re-emitting would start a second message",
-    );
+    for await (const ev of adapter.parseStream(toStream(ROUND2_STREAM), 2) as AsyncIterable<ParsedEvent>) {
+        if (ev.kind === "meta") allMeta.push(ev.chunk?.toString("utf8") ?? "");
+    }
+    const starts = allMeta.filter((c) => c.includes("message_start")).length;
+    assert.equal(starts, 1, "exactly one message_start across both parses — the second parse (next round or truncation retry) must not emit a second response identity");
 });
 
 const ROUND2_THINKING = sse([

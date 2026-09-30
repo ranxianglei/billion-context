@@ -11,6 +11,7 @@ import {
     type SpawnChild,
     type SpawnFn,
 } from "../src/launcher.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 // #679: on Windows the launcher spawned with shell:true and unquoted args, so
 // cmd.exe re-split the line on whitespace — a space in the resolved client or
@@ -193,7 +194,7 @@ test("#679 real win32: spaced .cmd shim receives its spaced args intact", { skip
         assert.ok(seen.includes(argPath), `shim saw "${seen}" — spaced arg must survive intact`);
         assert.ok(seen.includes("-e"), "flag survives too");
     } finally {
-        fs.rmSync(root, { recursive: true, force: true });
+        rmrf(root);
     }
 });
 
@@ -215,6 +216,6 @@ test("#679 real win32: spaced .exe spawns directly with spaced argv", { skip: pr
         assert.equal(argv[0], process.execPath);
         assert.equal(argv[1], marker, "spaced+quoted arg must round-trip intact");
     } finally {
-        fs.rmSync(root, { recursive: true, force: true });
+        rmrf(root);
     }
 });

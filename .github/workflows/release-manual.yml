@@ -61,6 +61,13 @@ jobs:
             echo "::error::$NPM_V is already published; pick a newer version"
             exit 1
           fi
+          TARGET_V="${{ steps.version.outputs.version }}"
+          case "$TARGET_V" in
+            0.0.*)
+              echo "::error::target version $TARGET_V is below 0.1.0 — official releases must always sort above the 0.0.x PR-build line (#1385)"
+              exit 1
+              ;;
+          esac
 
       - name: Bump version
         run: |

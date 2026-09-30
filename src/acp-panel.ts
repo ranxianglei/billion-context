@@ -25,7 +25,7 @@ import { MARKER_LINE, stripMarkerLines } from "./loop/tag-echo-filter.js";
 
 const PANEL_BOX_TOP = "\u256d";
 const PANEL_BOX_TITLE = "ACP Context Analysis";
-const PANEL_BOX_FOOTER = "Tag visibility: tags injected to LLM only (deep copy), not persisted in session, not shown in terminal.";
+export const PANEL_BOX_FOOTER = "Tag visibility: tags injected to LLM only (deep copy), not persisted in session, not shown in terminal.";
 const PANEL_FALLBACK_HEADER = "\u{1f4ca} ACP status";
 
 export const CACHE_REPORT_OPEN = "[acp-cache]";

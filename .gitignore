@@ -5,3 +5,4 @@ dist/
 *.tgz
 .bili-coop-build-stamp
 tmp/
+tests/.pp-stamp-state-*/

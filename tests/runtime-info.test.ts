@@ -22,10 +22,13 @@ import {
     pluginReportedMaxOutput,
     pluginReportedModel,
     pluginRuntimeInfoFor,
+    pluginRuntimeInfoForConversation,
     recordPluginRuntimeInfo,
+    runtimeConversationId,
 } from "../src/plugin.ts";
 import { extractV1Outputs } from "../src/agent/opencode-native.ts";
 import { reportRuntimeInfoOnChange } from "../src/agent/shared.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 function mockRes(): { res: http.ServerResponse; body(): string } {
     let body = "";
@@ -100,6 +103,54 @@ describe("runtime-info endpoint handler (#955)", () => {
         assert.equal(pluginRuntimeInfoFor("a0", "m"), undefined);
         assert.notEqual(pluginRuntimeInfoFor("a39", "m"), undefined);
     });
+
+    it("#1531: a conversation-scoped report is invisible to the per-agent lookup", () => {
+        recordPluginRuntimeInfo({ agent: "omp", model: "astra", contextWindow: 262144, maxOutput: 32768, conversationId: "sid-a", source: "client-config", ts: 1 });
+        assert.equal(pluginRuntimeInfoFor("omp", "astra"), undefined, "agent slot must stay empty");
+        const hit = pluginRuntimeInfoForConversation("sid-a", "astra");
+        assert.equal(hit?.contextWindow, 262144);
+        assert.equal(hit?.maxOutput, 32768);
+    });
+
+    it("#1531: conversation-scoped lookup is model-gated like the per-agent one", () => {
+        recordPluginRuntimeInfo({ agent: "omp", model: "astra", contextWindow: 262144, conversationId: "sid-a", source: "client-config", ts: 1 });
+        assert.equal(pluginRuntimeInfoForConversation("sid-a", "gemini"), undefined);
+        assert.equal(pluginRuntimeInfoForConversation(undefined, "astra"), undefined);
+    });
+
+    it("#1531: sibling sessions do not clobber each other's conversation entries", () => {
+        recordPluginRuntimeInfo({ agent: "omp", model: "astra", contextWindow: 262144, maxOutput: 32768, conversationId: "sid-a", source: "client-config", ts: 1 });
+        recordPluginRuntimeInfo({ agent: "omp", model: "gemini", contextWindow: 1048576, maxOutput: 65536, conversationId: "sid-b", source: "client-config", ts: 2 });
+        assert.equal(pluginRuntimeInfoForConversation("sid-a", "astra")?.contextWindow, 262144, "A survives B's report");
+        assert.equal(pluginRuntimeInfoForConversation("sid-b", "gemini")?.contextWindow, 1048576);
+    });
+
+    it("#1531: conversation-scoped table evicts its own oldest past the cap", () => {
+        for (let i = 0; i < 40; i++) {
+            recordPluginRuntimeInfo({ agent: "omp", model: `m-${i}`, conversationId: `sid-${i}`, source: "t", ts: i });
+        }
+        assert.equal(pluginRuntimeInfoForConversation("sid-0", "m-0"), undefined);
+        assert.notEqual(pluginRuntimeInfoForConversation("sid-39", "m-39"), undefined);
+    });
+
+    it("#1531: the endpoint stores body.conversationId when present", () => {
+        const ok = mockRes();
+        handlePluginRuntimeInfo(JSON.stringify({ agent: "omp", model: "astra", contextWindow: 262144, conversationId: "sid-x" }), ok.res);
+        assert.ok(JSON.parse(ok.body()).ok);
+        assert.equal(pluginRuntimeInfoForConversation("sid-x", "astra")?.contextWindow, 262144);
+        assert.equal(pluginRuntimeInfoFor("omp", "astra"), undefined);
+    });
+
+    it("#1531: runtimeConversationId precedence — conversation header > custom session header > body prompt_cache_key > miss", () => {
+        assert.equal(runtimeConversationId({ "x-session-id": "h-conv" }, { prompt_cache_key: "pck" }), "h-conv");
+        assert.equal(runtimeConversationId({}, { prompt_cache_key: "pck" }), "pck");
+        assert.equal(runtimeConversationId({}, { prompt_cache_key: 5 }), undefined);
+        assert.equal(runtimeConversationId({}, {}), undefined);
+        assert.equal(runtimeConversationId({}, null), undefined);
+        assert.equal(runtimeConversationId({ "x-my-sess": "custom" }, {}, "x-my-sess"), "custom");
+        // x-bili-plugin-conversation alone (no marker) is not honored — same rule as binding
+        assert.equal(runtimeConversationId({ "x-bili-plugin-conversation": "c" }, {}), undefined);
+    });
 });
 
 describe("extractV1Outputs (#955)", () => {
@@ -151,6 +202,48 @@ describe("reportRuntimeInfoOnChange (#955)", () => {
             return new Response(JSON.stringify({ ok: true }), { status: 200 });
         }) as typeof fetch;
         reportRuntimeInfoOnChange("http://proxy", { agent: "pi", model: "m1" });
+        await new Promise((r) => setTimeout(r, 10));
+        assert.equal(posts.length, 1);
+    });
+
+    it("#1531: re-reports when a reported field changes under the same (agent, conversation)", async () => {
+        reportRuntimeInfoOnChange("http://proxy", { agent: "omp", model: "astra", contextWindow: 1048576, conversationId: "sid-a" });
+        await new Promise((r) => setTimeout(r, 10));
+        assert.equal(posts.length, 1);
+
+        // same model id, window changed → fingerprint differs → re-POST
+        reportRuntimeInfoOnChange("http://proxy", { agent: "omp", model: "astra", contextWindow: 258400, conversationId: "sid-a" });
+        await new Promise((r) => setTimeout(r, 10));
+        assert.equal(posts.length, 2);
+        assert.equal((posts[1]?.body as { contextWindow?: number }).contextWindow, 258400);
+    });
+
+    it("#1531: sibling conversations with identical configs each report once", async () => {
+        reportRuntimeInfoOnChange("http://proxy", { agent: "omp", model: "astra", contextWindow: 258400, conversationId: "sid-c1" });
+        reportRuntimeInfoOnChange("http://proxy", { agent: "omp", model: "astra", contextWindow: 258400, conversationId: "sid-c2" });
+        await new Promise((r) => setTimeout(r, 10));
+        assert.equal(posts.length, 2);
+        const convs = posts.map((p) => (p.body as { conversationId?: string }).conversationId).sort();
+        assert.deepEqual(convs, ["sid-c1", "sid-c2"]);
+
+        // interleaving back to the first conversation with unchanged fields stays quiet
+        reportRuntimeInfoOnChange("http://proxy", { agent: "omp", model: "astra", contextWindow: 258400, conversationId: "sid-c1" });
+        await new Promise((r) => setTimeout(r, 10));
+        assert.equal(posts.length, 2);
+    });
+
+    it("#1531: a proxy-origin change re-reports (origin is part of the fingerprint)", async () => {
+        reportRuntimeInfoOnChange("http://proxy", { agent: "omp", model: "astra", conversationId: "sid-o" });
+        await new Promise((r) => setTimeout(r, 10));
+        reportRuntimeInfoOnChange("http://proxy2", { agent: "omp", model: "astra", conversationId: "sid-o" });
+        await new Promise((r) => setTimeout(r, 10));
+        assert.equal(posts.length, 2);
+        assert.equal(posts[1]?.url, "http://proxy2/__bili/plugin/runtime-info");
+    });
+
+    it("#1531: legacy agent-scoped reports (no conversationId) still dedupe per agent", async () => {
+        reportRuntimeInfoOnChange("http://proxy", { agent: "dsh", model: "m1" });
+        reportRuntimeInfoOnChange("http://proxy", { agent: "dsh", model: "m1" });
         await new Promise((r) => setTimeout(r, 10));
         assert.equal(posts.length, 1);
     });
@@ -210,7 +303,7 @@ async function startHarness(): Promise<Harness> {
             await Promise.allSettled([once(proxy, "close"), once(upstream, "close")]);
             if (prevStateHome === undefined) delete process.env.XDG_STATE_HOME;
             else process.env.XDG_STATE_HOME = prevStateHome;
-            fs.rmSync(stateHome, { recursive: true, force: true });
+            rmrf(stateHome);
         },
     };
 }
@@ -276,6 +369,112 @@ describe("runtime-info in the native-window chain (#955, e2e)", () => {
         assert.equal(resp.status, 200);
         const status = await (await fetch(`http://127.0.0.1:${h!.proxyPort}/__bili/plugin/status?conversationId=conv-ri-3`)).json() as { windowSource: string | null };
         assert.notEqual(status.windowSource, "runtime-info");
+    });
+
+    // #1531: header-less agents (omp native) resolve their conversation-scoped
+    // report through the prompt_cache_key identity — no x-bili-plugin header is
+    // ever sent on model requests by this lane.
+    it("#1531: a header-less request adopts its own conversation-scoped report via prompt_cache_key", async () => {
+        const register = await fetch(`http://127.0.0.1:${h!.proxyPort}/__bili/plugin/register`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ conversationId: "sid-omp-1", agent: "omp", identity: true }),
+        });
+        assert.equal(register.status, 200);
+        const report = await fetch(`http://127.0.0.1:${h!.proxyPort}/__bili/plugin/runtime-info`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ agent: "omp", model: "test-model", contextWindow: 262144, maxOutput: 32768, conversationId: "sid-omp-1", source: "client-config" }),
+        });
+        assert.equal(report.status, 200);
+
+        const resp = await fetch(`http://127.0.0.1:${h!.proxyPort}/bili/http://127.0.0.1:${h!.upstreamPort}/v1/chat/completions`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ model: "test-model", stream: false, prompt_cache_key: "sid-omp-1", messages: [{ role: "user", content: "hello" }] }),
+        });
+        assert.equal(resp.status, 200);
+
+        const status = await (await fetch(`http://127.0.0.1:${h!.proxyPort}/__bili/plugin/status?conversationId=sid-omp-1`)).json() as { pluginAgent: string | null; model: string | null; windowSource: string | null; contextLimit: number | null; runtimeInfo: { contextWindow?: number } | null };
+        assert.equal(status.pluginAgent, "omp");
+        assert.equal(status.model, "test-model");
+        assert.equal(status.windowSource, "runtime-info");
+        // 262144 − min(32768, headroom cap × 262144) = 262144 − 32768
+        assert.equal(status.contextLimit, 229376);
+        assert.equal(status.runtimeInfo?.contextWindow, 262144);
+    });
+
+    it("#1531: sibling sessions no longer clobber each other's windows", async () => {
+        const postReport = (model: string, window: number, maxOut: number, sid: string) =>
+            fetch(`http://127.0.0.1:${h!.proxyPort}/__bili/plugin/runtime-info`, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ agent: "omp", model, contextWindow: window, maxOutput: maxOut, conversationId: sid, source: "client-config" }),
+            });
+        const ask = async (model: string, sid: string): Promise<{ windowSource: string | null; contextLimit: number | null }> => {
+            const resp = await fetch(`http://127.0.0.1:${h!.proxyPort}/bili/http://127.0.0.1:${h!.upstreamPort}/v1/chat/completions`, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ model, stream: false, prompt_cache_key: sid, messages: [{ role: "user", content: "hello" }] }),
+            });
+            assert.equal(resp.status, 200);
+            return (await fetch(`http://127.0.0.1:${h!.proxyPort}/__bili/plugin/status?conversationId=${sid}`)).json() as { windowSource: string | null; contextLimit: number | null };
+        };
+
+        await postReport("astra", 262144, 32768, "sid-a");
+        const a1 = await ask("astra", "sid-a");
+        assert.equal(a1.windowSource, "runtime-info");
+        assert.equal(a1.contextLimit, 229376);
+
+        await postReport("gemini", 1048576, 65536, "sid-b");
+        const b1 = await ask("gemini", "sid-b");
+        assert.equal(b1.windowSource, "runtime-info");
+        assert.equal(b1.contextLimit, 983040);
+
+        // old code: B's report clobbered the single omp slot → A regressed to
+        // registry-peek here. Conversation-scoped storage keeps A intact.
+        const a2 = await ask("astra", "sid-a");
+        assert.equal(a2.windowSource, "runtime-info");
+        assert.equal(a2.contextLimit, 229376);
+    });
+
+    it("#1531: a per-agent header still wins exclusively over a conversation entry", async () => {
+        await fetch(`http://127.0.0.1:${h!.proxyPort}/__bili/plugin/runtime-info`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ agent: "omp", model: "test-model", contextWindow: 100000, maxOutput: 10000, source: "client-config" }),
+        });
+        await fetch(`http://127.0.0.1:${h!.proxyPort}/__bili/plugin/runtime-info`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ agent: "omp", model: "test-model", contextWindow: 262144, maxOutput: 32768, conversationId: "sid-h", source: "client-config" }),
+        });
+        const resp = await fetch(`http://127.0.0.1:${h!.proxyPort}/bili/http://127.0.0.1:${h!.upstreamPort}/v1/chat/completions`, {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-bili-plugin": "omp", "x-bili-plugin-conversation": "sid-h" },
+            body: JSON.stringify({ model: "test-model", stream: false, prompt_cache_key: "sid-h", messages: [{ role: "user", content: "hello" }] }),
+        });
+        assert.equal(resp.status, 200);
+        const status = await (await fetch(`http://127.0.0.1:${h!.proxyPort}/__bili/plugin/status?conversationId=sid-h`)).json() as { windowSource: string | null; contextLimit: number | null };
+        assert.equal(status.windowSource, "runtime-info");
+        // 100000 − min(10000, cap × 100000) = 90000 — the AGENT-SLOT entry, not the conv entry's 229376
+        assert.equal(status.contextLimit, 90000);
+    });
+
+    it("#1531: no conversation signal + no header still misses (plain clients unchanged)", async () => {
+        await fetch(`http://127.0.0.1:${h!.proxyPort}/__bili/plugin/runtime-info`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ agent: "omp", model: "test-model", contextWindow: 262144, maxOutput: 32768, conversationId: "sid-orphan", source: "client-config" }),
+        });
+        const resp = await fetch(`http://127.0.0.1:${h!.proxyPort}/bili/http://127.0.0.1:${h!.upstreamPort}/v1/chat/completions`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ model: "test-model", stream: false, messages: [{ role: "user", content: "hello" }] }),
+        });
+        assert.equal(resp.status, 200);
+        const status = await (await fetch(`http://127.0.0.1:${h!.proxyPort}/__bili/plugin/status?conversationId=sid-orphan`)).json().catch(() => null) as { windowSource: string | null } | null;
+        if (status !== null) assert.notEqual(status.windowSource, "runtime-info");
     });
 });
 

@@ -246,11 +246,11 @@ test("plugin manifest serves the exact wire tool schemas, headers and version", 
                 return t.name === "search_context" || (fn !== null && typeof fn === "object" && fn.name === "search_context");
             });
         const anthropicProps = ((searchEntry("anthropic")?.input_schema ?? {}) as { properties?: Record<string, unknown> }).properties;
-        assert.match(String(anthropicProps?.conversation_id?.description), /historical pfa-\*/);
+        assert.equal(anthropicProps?.conversation_id, undefined, "#1685: no conversation_id advertised (anthropic)");
         const openaiProps = (((searchEntry("openai")?.function ?? {}) as { parameters?: { properties?: Record<string, unknown> } }).parameters?.properties);
-        assert.match(String(openaiProps?.conversation_id?.description), /historical pfa-\*/);
+        assert.equal(openaiProps?.conversation_id, undefined, "#1685: no conversation_id advertised (openai)");
         const responsesProps = ((searchEntry("responses")?.parameters ?? {}) as { properties?: Record<string, unknown> }).properties;
-        assert.match(String(responsesProps?.conversation_id?.description), /historical pfa-\*/);
+        assert.equal(responsesProps?.conversation_id, undefined, "#1685: no conversation_id advertised (responses)");
         assert.equal(manifest.headers.agent, "x-bili-plugin");
         assert.equal(manifest.headers.conversation, "x-bili-plugin-conversation");
         assert.equal(manifest.toolEndpoint, "/__bili/plugin/tool");
@@ -417,6 +417,17 @@ test("plugin tool API executes compress under the session lock; next request fol
         assert.ok(folded.includes("toolu_c_1"), `newest orphaned compress tool_use stays visible (KEEP_LAST_ORPHANED=2): ${folded.slice(0, 400)}`);
         assert.ok(foldedRaw.messages.length < 12, `history must shrink after folding: got ${foldedRaw.messages.length}`);
         assert.ok(!folded.includes("turn-1-marker answer"), "compressed range content must be folded away");
+        // #1567: in plugin mode the client's own re-sent compress pair
+        // (toolu_c_1 above) IS the summary carrier — the kernel's in-place
+        // acp_summary anchor must be stripped, not coexist with it. Pre-fix,
+        // stripKernelSummaries keyed on toolCallId === block.compressCallId,
+        // which is unsatisfiable for plugin folds (synthetic plugin_<ts> id
+        // the client can never echo), so the anchor rode every post-fold body
+        // and the summary appeared twice per turn.
+        assert.ok(
+            !folded.includes("[Compressed conversation section] \u2014 plugin-e2e-topic"),
+            "in-place acp_summary carrier must be stripped in plugin mode (#1567)",
+        );
 
         // The summary text deliberately does NOT ride in the wire body
         // (stripKernelSummaries drops acp_summary_* messages — same as wire

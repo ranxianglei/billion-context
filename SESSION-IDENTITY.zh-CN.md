@@ -115,6 +115,23 @@
 3. **环境(Environment)**——系统提示词/工具/模型不进身份(见原则)。环境变化
    改变的是未来轮次,不是历史摘要的真值。
 
+## 派生(子)会话:出生时携带血统(#1333, #1362)
+
+当 agent 派生子会话——从空历史起步、而不是重发父会话对话的 subagent 或 fork——此前它无法 `decompress` / `search_context` 父会话里已被折叠的内容。现在每条 lane 在出生时报告血统:身份注册携带父会话 id(`parentConversationId`),代理在子会话上记录一条只读链接(`derivedFrom`)。此后:
+
+- `decompress` / `search_context` 对子会话自身从未见过的内容沿父链回退(父会话驻留内存或落盘均可,带环保护,深度上限 8);
+- 不向子会话状态复制任何东西,父会话也绝不被修改——回退命中是只读的,子会话不可能覆盖父会话仍拥有的内容;
+- 若记录链接时代理不认识该父会话,子会话就只是从零开始。
+
+| Lane | 父信号 |
+|---|---|
+| **pi** RLM inline spawn | 会话头里的 `parentSession`(父会话文件路径,解析为其会话 id) |
+| **omp** fork / newSession | 会话头里的 `parentSession`(裸会话 id 或文件路径——两者都接受) |
+| **OpenCode V1**(原生插件) | SDK session info 的 `parentID`(每会话解析一次并缓存) |
+| **OpenCode V2**(原生插件) | `session.created` 事件的 `data.parentID` |
+
+claude/codex/dsh 在这里不需要任何信号:它们的 subagent 共享同一个会话 id,或根本没有子会话概念。
+
 ## 未来方向
 
 持久的修复是**客户端侧身份信号**:由客户端自身提供的稳定 per-conversation

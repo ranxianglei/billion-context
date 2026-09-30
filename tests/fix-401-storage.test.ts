@@ -2,12 +2,13 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
 import fsShared from "node:fs";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createInitialState } from "acp-kernel";
 import { SessionStore } from "../src/persist.ts";
 import type { Session } from "../src/session.ts";
 import { setLogCapture } from "../src/logger.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 // These tests inspect raw on-disk session files directly (bypassing the store
 // codec), so pin the plain-JSON format: #1080 made BILIZSTD1 the default.
@@ -45,7 +46,7 @@ function withDir<T>(name: string, fn: (dir: string) => Promise<T> | T): Promise<
         try {
             await fn(dir);
         } finally {
-            rmSync(dir, { recursive: true, force: true });
+            rmrf(dir);
         }
     });
 }

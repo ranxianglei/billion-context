@@ -220,7 +220,7 @@ function formatDshError(err: unknown, args: readonly string[]): Error {
     }
     const stderr = typeof e.stderr === "string" ? e.stderr.trim() : e.stderr instanceof Buffer ? e.stderr.toString("utf8").trim() : "";
     const detail = stderr || (typeof e.message === "string" && e.message.length > 0 ? e.message : `exit ${e.status ?? "?"}`);
-    return new Error(`dsh plugin ${args.join(" ")} failed: ${detail}`);
+    return new Error(`dsh ${args.join(" ")} failed: ${detail}`);
 }
 
 // spawnSync (not execFileSync): its options accept windowsVerbatimArguments,
@@ -254,7 +254,7 @@ async function defaultAsyncRun(plan: DshPlan): Promise<{ stdout: string; stderr:
     return { stdout, stderr };
 }
 
-/** Run `dsh plugin <args…>` synchronously (CLI context — blocking is fine).
+/** Run `dsh <args…>` synchronously (CLI context — blocking is fine).
  *  Throws with actionable context when the dsh CLI is missing or exits
  *  non-zero (dsh forwards pnpm's stderr, e.g. "pnpm not found on PATH"). */
 export function runDshPlugin(args: string[], env: NodeJS.ProcessEnv = process.env): void {

@@ -7,11 +7,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import * as tar from "tar";
 import { hostManagedInstall, installViaTarball } from "../src/update.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 function integrityField(buf: Buffer, alg = "sha512"): string {
     return `${alg}-${crypto.createHash(alg).update(buf).digest("base64")}`;
@@ -28,7 +29,7 @@ test("hostManagedInstall: pnpm virtual-store paths are pnpm-owned", () => {
         assert.equal(hostManagedInstall(pnpmGlobal)?.owner, "pnpm");
         assert.match(hostManagedInstall(dshBundle)!.channel, /dsh profiles refresh/);
     } finally {
-        rmSync(base, { recursive: true, force: true });
+        rmrf(base);
     }
 });
 
@@ -55,7 +56,7 @@ test("hostManagedInstall: host agent homes own their trees", () => {
         const ompOwner = hostManagedInstall(ompDir, { PI_CODING_AGENT_DIR: path.join(base, "omp-root") })?.owner;
         assert.ok(ompOwner === "pi" || ompOwner === "omp", `unexpected owner ${ompOwner}`);
     } finally {
-        rmSync(base, { recursive: true, force: true });
+        rmrf(base);
     }
 });
 
@@ -68,7 +69,7 @@ test("hostManagedInstall: bili-owned dirs (npm global layout, scratch) stay upda
         // the same XDG-ish tree root.
         assert.equal(hostManagedInstall(path.join(base, "home", ".local", "lib", "node_modules", "billion-context"), { HOME: path.join(base, "home") }), undefined);
     } finally {
-        rmSync(base, { recursive: true, force: true });
+        rmrf(base);
     }
 });
 
@@ -90,7 +91,7 @@ function makeFixture(relInstall: string): Fixture {
         JSON.stringify({ name: "billion-context", version: "1.2.3", type: "module", main: "dist/index.js", bin: { bili: "./dist/index.js" } }),
     );
     writeFileSync(path.join(installDir, "dist", "index.js"), "export const loaded = '1.2.3';\n");
-    return { root, installDir, cacheDir, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+    return { root, installDir, cacheDir, cleanup: () => rmrf(root) };
 }
 
 function makeTarball(root: string, version: string): { tgz: Buffer; integrity: string } {

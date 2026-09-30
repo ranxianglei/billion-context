@@ -7,6 +7,7 @@ import { createRequire } from "node:module";
 import net from "node:net";
 import fs from "node:fs";
 import path from "node:path";
+import { assertPortDead } from "../port-race.js";
 
 interface RegistryFixture {
     /** Base URL, e.g. http://127.0.0.1:43210 */
@@ -69,6 +70,7 @@ export async function startRegistry(root: string): Promise<RegistryFixture> {
         ].join("\n"),
     );
 
+    await assertPortDead(port); // #1689: prove still free right before verdaccio binds it
     const req = createRequire(import.meta.url);
     const bin = path.join(path.dirname(req.resolve("verdaccio/package.json")), "bin", "verdaccio");
     const child = spawn(process.execPath, [bin, "--config", cfg], { stdio: ["ignore", "pipe", "pipe"] });

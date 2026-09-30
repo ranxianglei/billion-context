@@ -34,17 +34,17 @@ interface ExitCell {
 const ERROR_DELIVERY: Record<WireExitId, ExitCell> = {
     "proxy-openai-sse": {
         implementer: [emitStreamError, emitPreflightError, startServer],
-        contract: "mid-stream upstream failure → inline `error` delta + finish + [DONE]; late (early-committed) preflight failure → top-level error object + [DONE] in-band",
+        contract: "mid-stream upstream failure → top-level `error` frame + [DONE] (default #1455; legacy inline error delta + finish via compat.streamErrorShape=completion); late (early-committed) preflight failure → top-level error object + [DONE] in-band",
         coveredBy: ["tests/proxy-stream-error.test.ts", "tests/wire-exit-matrix.test.ts", "tests/wire-exit-gap-cells.test.ts"],
     },
     "proxy-anthropic-sse": {
         implementer: [emitStreamError, emitPreflightError, startServer],
-        contract: "mid-stream failure → content_block_delta error + message_stop; late preflight failure → event: error payload in-band",
+        contract: "mid-stream failure → event: error, no terminal success frame (default #1455; legacy content_block_delta error + message_stop via compat.streamErrorShape=completion); late preflight failure → event: error payload in-band",
         coveredBy: ["tests/proxy-stream-error.test.ts", "tests/preflight-hold.test.ts", "tests/wire-exit-gap-cells.test.ts"],
     },
     "proxy-responses-sse": {
         implementer: [emitStreamError, emitPreflightError, startServer],
-        contract: "mid-stream failure → full item lifecycle (added → delta → done) + response.failed; late preflight failure → event: error in-band",
+        contract: "mid-stream failure → event: error (default #1455; legacy full item lifecycle via compat.streamErrorShape=completion); late preflight failure → event: error in-band",
         coveredBy: ["tests/proxy-stream-error.test.ts", "tests/preflight-hold.test.ts", "tests/wire-exit-gap-cells.test.ts"],
     },
     "proxy-json": {

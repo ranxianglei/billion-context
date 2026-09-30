@@ -1,18 +1,17 @@
 import type { CoreMessage } from "acp-kernel";
 import { injectResponsesDeveloperMessage, type ResponseInputItem, type ResponsesProjection } from "acp-kernel/wire";
 import { coreToResponsesWithToolImages as coreToResponses, patchResponsesInputWithToolImages as patchResponsesInput } from "../responses-tool-output.js";
-import { buildVisibilityMarker } from "../compress-loop.js";
+import { buildVisibilityMarker } from "./core.js";
 import { hoistTrappedToolItems } from "../tool-pair-order.js";
 import { hashId } from "../util.js";
-import { composeStreamFilters, createMarkerLineFilter, createTagEchoFilter, stripResponsesText, containsMarkerLineText, containsRenderTagText, ACP_NAME_ALT } from "./tag-echo-filter.js";
+import { composeStreamFilters, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter, stripResponsesText, containsBiliInternalText, containsMarkerLineText, containsRenderTagText, ACP_NAME_ALT } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
-import { ACP_TEXT_OPEN, ACP_TEXT_CLOSE, ACP_STATUS_OPEN, ACP_STATUS_CLOSE, ACP_SEARCH_OPEN, ACP_SEARCH_CLOSE, ACP_DECOMPRESS_OPEN, ACP_DECOMPRESS_CLOSE, COMPRESS_TOOL_NAME, PROXY_TOOL_NAMES } from "../compress-tool.js";
+import { extractResponsesTextTriggers, PROXY_TOOL_NAMES } from "../compress-tool.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import type {
     CompressLoopAdapter,
     EmitCompletionOpts,
-    ExtractedTextTriggers,
     ParsedStreamEvent,
     ToolCallEmit,
 } from "./core.js";
@@ -29,9 +28,13 @@ interface FunctionCallBuffer {
 const RESPONSES_ITEM_ID_MAX = 64;
 
 /**
- * Heal client rollouts already poisoned with over-long ids (they 400 every
- * request otherwise). Rewrites in place, deterministically, so repeated
- * requests keep referencing the same replacement id (#242).
+ * Heal client rollouts already poisoned with over-long Bili-generated ids
+ * (they 400 every request otherwise). Only the msg-proxy-* namespace bili
+ * owns is rewritten — in place and deterministically, so repeated requests
+ * keep referencing the same replacement id (#242). Provider-issued opaque
+ * ids (reasoning rs_*, function_call fc_*, ...) validate against their
+ * owner's shape rules and carry replay correspondence, so they must reach
+ * the upstream byte-identical (#1474).
  */
 export function normalizeResponsesMessageItems(input: unknown): number {
     if (!Array.isArray(input)) return 0;
@@ -64,7 +67,8 @@ export function sanitizeResponsesInputIds(input: unknown): void {
             delete rec.id;
             continue;
         }
-        if (typeof rec?.id === "string" && rec.id.length > RESPONSES_ITEM_ID_MAX) {
+        if (typeof rec?.id === "string" && rec.id.startsWith("msg-proxy-")
+            && rec.id.length > RESPONSES_ITEM_ID_MAX) {
             rec.id = `msg-fix-${hashId(rec.id)}`;
         }
     }
@@ -314,16 +318,32 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
 
         async *parseStream(upstream, round) {
             const pending = new Map<string, FunctionCallBuffer>();
+            // #1501 option C: nameless function_call items fall into raw replay
+            // below — their bytes reach the client untouched (#1039). Track them
+            // so the round-end settle can emit one diag warn (#1484 class); the
+            // observed rate settles the drop-vs-keep policy without surgery.
+            const namelessFc = new Map<string, { callId: string; argsLen: number; frags: number }>();
+            const settleNamelessDiag = function* (): Generator<ParsedStreamEvent> {
+                if (namelessFc.size === 0) return;
+                const parts = [...namelessFc.entries()].map(([itemId, fc]) => `item=${itemId || "-"}${fc.callId ? ` id=${fc.callId}` : ""} argsLen=${fc.argsLen} frags=${fc.frags}`);
+                yield { kind: "diag", level: "warn", message: `[acp-responses] round ${round}: ${parts.length} nameless function_call(s) forwarded verbatim: ${parts.join(" | ")} (#1501 observe-only)` } as ParsedStreamEvent;
+                namelessFc.clear();
+            };
             const remapped = new Map<string, MappedItem>();
             // #206: render-tag echo filter — deltas stream through the filter;
             // full-text events (.done / output_item.done / completed response)
             // are stripped wholesale via stripResponsesText.
             const tagFilter = composeStreamFilters(
-                createTagEchoFilter((snippet) => {
-                    loggerLog("warn", `[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
-                }),
-                createMarkerLineFilter((snippet) => {
-                    loggerLog("warn", `[marker-echo] stripped model-emitted ACP confirmation marker: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                composeStreamFilters(
+                    createTagEchoFilter((snippet) => {
+                        loggerLog("warn", `[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                    }),
+                    createMarkerLineFilter((snippet) => {
+                        loggerLog("warn", `[marker-echo] stripped model-emitted ACP confirmation marker: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                    }),
+                ),
+                createBiliArtifactFilter((snippet) => {
+                    loggerLog("warn", `[bili-artifact] stripped model-emitted internal artifact: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
                 }),
             );
             let lastTextRef: { itemId: string; outputIndex: number } | null = null;
@@ -391,6 +411,9 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                                 arguments: "",
                             });
                         } else {
+                            if (fcName.length === 0) {
+                                namelessFc.set(typeof item.id === "string" ? item.id : "", { callId: typeof item.call_id === "string" ? item.call_id : "", argsLen: 0, frags: 1 });
+                            }
                             yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
                         }
                     } else if (item?.type === "custom_tool_call") {
@@ -412,7 +435,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                     if (mapped) {
                         yield { kind: "meta", chunk: rewriteRefEvent(type, stripResponsesText(obj), mapped), firstRoundOnly: false } as ParsedStreamEvent;
                     } else if (!suppressTextLifecycle) {
-                        const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr)) ? rebuildResponsesEvent(type, stripResponsesText(obj)) : rawBuf;
+                        const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr) || containsBiliInternalText(eventStr)) ? rebuildResponsesEvent(type, stripResponsesText(obj)) : rawBuf;
                         yield { kind: "meta", chunk, firstRoundOnly: true } as ParsedStreamEvent;
                     }
                 } else if (type === "response.output_text.delta") {
@@ -439,13 +462,21 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                     const delta = typeof obj.delta === "string" ? obj.delta : "";
                     const fc = pending.get(itemId);
                     if (fc) fc.arguments += delta;
-                    else yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
+                    else {
+                        const nf = namelessFc.get(itemId);
+                        if (nf) { nf.argsLen += delta.length; nf.frags++; }
+                        yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
+                    }
                 } else if (type === "response.function_call_arguments.done") {
                     const itemId = typeof obj.item_id === "string" ? obj.item_id : "";
                     const args = typeof obj.arguments === "string" ? obj.arguments : "";
                     const fc = pending.get(itemId);
                     if (fc && args) fc.arguments = args;
-                    else yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
+                    else {
+                        const nf = namelessFc.get(itemId);
+                        if (nf && args) { nf.argsLen = args.length; nf.frags++; }
+                        yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
+                    }
                 } else if (type === "response.output_item.done") {
                     const item = obj.item as Record<string, unknown> | undefined;
                     if (item?.type === "function_call") {
@@ -463,6 +494,13 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                                 arguments: fc.arguments,
                             } as ParsedStreamEvent;
                         } else {
+                            if (typeof item.name !== "string" || item.name.length === 0) {
+                                const nf = namelessFc.get(itemId) ?? { callId: "", argsLen: 0, frags: 0 };
+                                nf.callId = typeof item.call_id === "string" ? item.call_id : nf.callId;
+                                if (typeof item.arguments === "string") nf.argsLen = item.arguments.length;
+                                nf.frags++;
+                                namelessFc.set(itemId, nf);
+                            }
                             yield { kind: "meta", chunk: rawBuf, firstRoundOnly: false } as ParsedStreamEvent;
                             toolCallsEmitted++;
                             yield {
@@ -482,7 +520,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                             remapped.delete(origId);
                             yield { kind: "meta", chunk: rewriteItemEvent(type, stripResponsesText(obj), mapped), firstRoundOnly: false } as ParsedStreamEvent;
                         } else if (!suppressTextLifecycle) {
-                            const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr)) ? rebuildResponsesEvent(type, stripResponsesText(obj)) : rawBuf;
+                            const chunk = (containsRenderTagText(eventStr) || containsMarkerLineText(eventStr) || containsBiliInternalText(eventStr)) ? rebuildResponsesEvent(type, stripResponsesText(obj)) : rawBuf;
                             yield { kind: "meta", chunk, firstRoundOnly: true } as ParsedStreamEvent;
                         }
                     } else if (item?.type !== "message" || !suppressTextLifecycle) {
@@ -490,6 +528,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                     }
                 } else if (type === "response.completed") {
                     yield* flushFilter();
+                    yield* settleNamelessDiag();
                     responseObj = stripResponsesText((obj.response as Record<string, unknown>) ?? null);
                     terminalKind = "completed";
                     terminalRaw = null;
@@ -507,11 +546,13 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                     yield { kind: "done", finishReason: "completed", thinking: sawReasoning } as ParsedStreamEvent;
                 } else if (type === "response.incomplete") {
                     yield* flushFilter();
+                    yield* settleNamelessDiag();
                     terminalKind = "incomplete";
                     terminalRaw = rawBuf;
                     yield { kind: "done", finishReason: "incomplete" } as ParsedStreamEvent;
                 } else if (type === "response.failed" || type === "response.error") {
                     yield* flushFilter();
+                    yield* settleNamelessDiag();
                     terminalKind = "failed";
                     terminalRaw = rawBuf;
                     yield { kind: "done", finishReason: "failed" } as ParsedStreamEvent;
@@ -520,6 +561,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
                 }
             }
             if (!terminalKind) {
+                yield* settleNamelessDiag();
                 yield { kind: "done", finishReason: "failed", truncated: true } as ParsedStreamEvent;
             }
         },
@@ -600,35 +642,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
         },
 
         extractTextTriggers(text) {
-            const calls: ToolCallEmit[] = [];
-            let clean = text;
-            let hadTrigger = false;
-            const triggers = [
-                { name: "compress", open: ACP_TEXT_OPEN, close: ACP_TEXT_CLOSE, requirePayload: true },
-                { name: "acp_status", open: ACP_STATUS_OPEN, close: ACP_STATUS_CLOSE, requirePayload: false },
-                { name: "search_context", open: ACP_SEARCH_OPEN, close: ACP_SEARCH_CLOSE, requirePayload: true },
-                { name: "decompress", open: ACP_DECOMPRESS_OPEN, close: ACP_DECOMPRESS_CLOSE, requirePayload: true },
-            ];
-            for (const t of triggers) {
-                let start = clean.indexOf(t.open);
-                while (start >= 0) {
-                    const end = clean.indexOf(t.close, start + t.open.length);
-                    if (end < 0) break;
-                    hadTrigger = true;
-                    const payload = clean.slice(start + t.open.length, end).trim();
-                    if (payload.length > 0 || !t.requirePayload) {
-                        const stamp = `${Date.now()}-${calls.length}`;
-                        calls.push({
-                            name: t.name,
-                            callId: `call_text_${stamp}`,
-                            arguments: payload.length > 0 ? payload : "{}",
-                        });
-                    }
-                    clean = clean.slice(0, start) + clean.slice(end + t.close.length);
-                    start = clean.indexOf(t.open);
-                }
-            }
-            return { clean: hadTrigger ? clean : text, calls } as ExtractedTextTriggers;
+            return extractResponsesTextTriggers(text);
         },
     };
 }

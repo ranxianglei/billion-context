@@ -14,13 +14,16 @@ import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
 import { ACP_TOOLS_ANTHROPIC } from "../src/compress-tool.ts";
 
-// #760: per-call conversation_id for MCP tools. Hosts that share ONE shim
-// process across several concurrent conversations (kimi web et al.) have no
-// env/meta session channel, so the model supplies the target conversation per
-// tool call. Covered here: manifest schema, the proxy's injected id note,
-// first-call routing (peekSession fallback), unknown-id rejection, sticky
-// plugin-mode flip via successful-tool evidence, and the shim's
-// per-call routing / arg stripping / adoption guard.
+// #760→#1685: per-call conversation_id for MCP tools. Hosts that share ONE
+// shim process across several concurrent conversations (kimi web et al.) have
+// no env/meta session channel. Since #1685 (zero-injection) the manifest no
+// longer advertises a conversation_id parameter and the proxy injects NO
+// model-visible id anywhere; the per-call override path survives purely as
+// legacy compat for models trained on the old schema. Covered here: manifest
+// schema (id-free), zero id in the wire system part, first-call routing
+// (peekSession fallback), unknown-id rejection, sticky plugin-mode flip via
+// successful-tool evidence, and the shim's per-call routing / arg stripping /
+// adoption guard / id-less forwarding (proxy-side routing, #1685).
 
 function listen(server: http.Server): Promise<void> {
     if (server.listening) return Promise.resolve();
@@ -165,7 +168,7 @@ function canonicalOf(sessionId: string): string {
     return `pfa-${createHash("sha256").update(`legacy:${sessionId}`).digest("hex").slice(0, 16)}`;
 }
 
-test("plugin manifest advertises an optional conversation_id in all three tool formats", async () => {
+test("plugin manifest advertises NO conversation_id in any tool format (#1685 zero-injection)", async () => {
     const rig = await startRig();
     try {
         const res = await fetch(rig.proxyUrl("/__bili/plugin/manifest"));
@@ -178,28 +181,26 @@ test("plugin manifest advertises an optional conversation_id in all three tool f
             for (const t of tools) {
                 const schema = schemaOf(t);
                 assert.ok(schema?.properties, `${format}/${(t as { name?: string }).name}: has properties`);
-                assert.equal((schema!.properties!.conversation_id as { type?: string } | undefined)?.type, "string", `${format}: conversation_id advertised as optional string`);
+                assert.equal((schema!.properties as Record<string, unknown>).conversation_id, undefined, `${format}/${(t as { name?: string }).name}: conversation_id NOT advertised (#1685)`);
                 assert.ok(!(schema!.required ?? []).includes("conversation_id"), `${format}: conversation_id not required`);
             }
         }
-        // Wire-mode injection serves the kernel constants directly — the
-        // manifest extension must not leak into them.
+        // The served shapes must stay byte-identical to the kernel constants —
+        // the zero-injection policy means nothing is added on top.
         assert.doesNotMatch(JSON.stringify(ACP_TOOLS_ANTHROPIC), /conversation_id/, "kernel constants unmutated");
     } finally {
         await rig.closeAll();
     }
 });
 
-test("wire mode: proxy prints its own conversation id in the static system part, byte-stable across turns", async () => {
+test("wire mode: NO conversation id anywhere in the system part (#1685), byte-stable across turns", async () => {
     const rig = await startRig();
     try {
         await postModel(rig, "conv-760-a");
         await postModel(rig, "conv-760-a");
         await waitFor(() => rig.upstreamBodies.length >= 2, "two upstream bodies");
         const sys0 = sysText(rig.upstreamBodies[0]);
-        const canon = canonicalOf("conv-760-a");
-        assert.match(sys0, new RegExp(`\\[Your bili conversation id: ${canon}\\.`), "id note carries the derived canonical pfa-* id");
-        assert.doesNotMatch(sys0, /\[Your bili conversation id: conv-760-a\./, "note no longer leaks the raw client session id");
+        assert.doesNotMatch(sys0, /Your bili conversation id/, "zero-injection: no model-visible conversation id");
         assert.equal(sysText(rig.upstreamBodies[1]), sys0, "system bytes stable across turns (prefix-cache anchor)");
     } finally {
         await rig.closeAll();
@@ -242,11 +243,11 @@ test("canonical pfa-* id (derived, not the client's own) routes to the right ses
         await postModel(rig, "conv-canonical");
         await waitFor(() => rig.upstreamBodies.length >= 1, "one upstream body");
         const sys0 = sysText(rig.upstreamBodies[0]);
-        const canon = canonicalOf("conv-canonical");
-        assert.match(sys0, new RegExp(`\\[Your bili conversation id: ${canon}\\.`), "note carries the derived canonical id");
+        assert.doesNotMatch(sys0, /Your bili conversation id/, "zero-injection: no model-visible id (#1685)");
 
-        // Route by the CANONICAL id — the value the model actually echoes back.
-        const rCanon = await toolCall(rig, canon);
+        // Route by the CANONICAL id — a legacy model echo (or a host that
+        // captured the id before #1685) still routes via the reverse lookup.
+        const rCanon = await toolCall(rig, canonicalOf("conv-canonical"));
         assert.equal(rCanon.status, 200, `canonical-id routing succeeded: ${JSON.stringify(rCanon.data)}`);
         assert.equal(rCanon.data.ok, true);
         assert.match(rCanon.data.result ?? "", /CONTEXT BREAKDOWN/);
@@ -333,12 +334,11 @@ test("shared shim, no env/meta id: per-call ids route two sessions independently
         await waitFor(() => h.lines.length >= 2, "initialize + tools/list responses");
         const tools = byId(h.lines, 2) as { result?: { tools?: { inputSchema?: { properties?: Record<string, unknown> } }[] } };
         for (const t of tools.result?.tools ?? []) {
-            assert.equal((t.inputSchema?.properties?.conversation_id as { type?: string } | undefined)?.type, "string", `shim exposes conversation_id on ${t.inputSchema ? "tool" : "unknown"}`);
+            assert.equal(t.inputSchema?.properties?.conversation_id, undefined, `shim does NOT expose conversation_id (#1685): ${JSON.stringify(t.inputSchema?.properties ?? {})}`);
         }
 
-        // Session A exists; first per-call tool call routes immediately via
-        // the canonical reverse lookup — the model copies the pfa-* id the
-        // proxy printed in A's note, not the raw client id.
+        // Session A exists; a per-call id (legacy model echo of the pre-#1685
+        // schema) still routes immediately via the canonical reverse lookup.
         await postModel(rig, "conv-mcp-a");
         h.send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "acp_status", arguments: { conversation_id: canonicalOf("conv-mcp-a") } } });
         await waitFor(() => h.lines.some((l) => (JSON.parse(l) as { id?: number }).id === 3), "per-call acp_status(A)");
@@ -363,17 +363,16 @@ test("shared shim, no env/meta id: per-call ids route two sessions independently
         assert.equal(callB.result?.isError, false, `per-call call routed to B${callB.result?.isError ? ": " + (callB.result?.content?.[0]?.text ?? "") : ""}`);
 
         await waitFor(() => rig.upstreamBodies.length >= 5, "five upstream bodies");
-        const canonA = canonicalOf("conv-mcp-a");
-        const canonB = canonicalOf("conv-mcp-b");
-        // A's first request: wire mode — ephemeral compress tool injected, id note present.
+        // A's first request: wire mode — ephemeral compress tool injected, zero id bytes.
         assert.ok(toolNames(rig.upstreamBodies[0]).includes("compress"), "wire request carries the ephemeral compress tool");
-        assert.match(sysText(rig.upstreamBodies[0]), new RegExp(`\\[Your bili conversation id: ${canonA}\\.`));
+        assert.doesNotMatch(sysText(rig.upstreamBodies[0]), /Your bili conversation id/, "no id in wire mode (#1685)");
         // A's second request arrives AFTER the tool call landed:
-        // pure plugin mode — no ephemeral tools, id note still flows.
+        // pure plugin mode — no ephemeral tools, still zero id bytes.
         assert.ok(!toolNames(rig.upstreamBodies[2]).includes("compress"), "post-tool-call request drops the ephemeral compress tool");
-        assert.match(sysText(rig.upstreamBodies[2]), new RegExp(`\\[Your bili conversation id: ${canonA}\\.`), "id note flows in plugin mode too");
-        // B's requests carry B's id, not A's — no cross-talk.
-        assert.match(sysText(rig.upstreamBodies[3]), new RegExp(`\\[Your bili conversation id: ${canonB}\\.`));
+        assert.doesNotMatch(sysText(rig.upstreamBodies[2]), /Your bili conversation id/, "no id in plugin mode either (#1685)");
+        // B's requests never carry A's id — no cross-talk (trivially true now,
+        // but pins the zero-injection invariant per session).
+        assert.doesNotMatch(sysText(rig.upstreamBodies[3]), /Your bili conversation id/);
 
         // Sticky plugin-mode flip, and the untouched sibling stays wire mode.
         const stA = await statusOf(rig, "conv-mcp-a");
@@ -436,10 +435,16 @@ test("shim: per-call id strips the forwarded arg, routes on the body field, neve
         h.send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "0" } } });
         h.send({ jsonrpc: "2.0", method: "notifications/initialized" });
         // No default binding → no register on initialize.
+        // #1685: an id-less call no longer hard-fails in the shim — it is
+        // FORWARDED and the proxy routes it (witness / arbitration); here the
+        // mock answers any id-less tool POST with success.
         h.send({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "acp_status", arguments: {} } });
-        await waitFor(() => h.lines.some((l) => (JSON.parse(l) as { id?: number }).id === 2), "no-id error");
-        const noId = byId(h.lines, 2) as { error?: { message?: string } };
-        assert.match(noId.error?.message ?? "", /conversation_id argument/, "no-id error hints at the per-call parameter");
+        await waitFor(() => h.lines.some((l) => (JSON.parse(l) as { id?: number }).id === 2), "id-less call");
+        const noId = byId(h.lines, 2) as { result?: { content?: { text?: string }[]; isError?: boolean } };
+        assert.equal(noId.result?.isError, false, "id-less call forwarded to the proxy (#1685)");
+        assert.equal(noId.result?.content?.[0]?.text, "fine");
+        const idlessPost = posts.find((p) => p.url.startsWith("/__bili/plugin/tool"));
+        assert.equal(idlessPost?.body.conversationId, undefined, "id-less POST carries no conversationId key");
 
         h.send({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "acp_status", arguments: { conversation_id: "X", extra: 1 } } });
         await waitFor(() => h.lines.some((l) => (JSON.parse(l) as { id?: number }).id === 3), "per-call X");
@@ -451,7 +456,7 @@ test("shim: per-call id strips the forwarded arg, routes on the body field, neve
         // from successful-tool evidence inside the call, not from a registration
         // a raw-client-id request would never consume.
         assert.equal(posts.filter((p) => p.url.startsWith("/__bili/plugin/register")).length, 0, "no lazy registration issued for a per-call id");
-        const toolPost = posts.find((p) => p.url.startsWith("/__bili/plugin/tool"));
+        const toolPost = posts.find((p) => p.url.startsWith("/__bili/plugin/tool") && p.body.conversationId === "X");
         assert.equal(toolPost?.body.conversationId, "X", "routes on the body-level field");
         assert.deepEqual(toolPost?.body.args, { extra: 1 }, "conversation_id stripped from the forwarded args");
 

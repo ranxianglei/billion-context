@@ -194,3 +194,44 @@ test("#1294 P2: large bodies spill to a temp file and carry NO re-fold hint", ()
     assert.match(out, /written to:\s*\S+/, out.slice(0, 200));
     assert.doesNotMatch(out, /Re-fold:/, "toFile path stays byte-identical to before");
 });
+
+test("#1718: receipt keeps the full fingerprint, the LOG line carries length only", () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    const ctx = makeCtx();
+    seedTurn(ctx, [
+        ["user", "A historical exchange covering setup steps."],
+        ["assistant", "x".repeat(3000)],
+    ]);
+    const summary = "LEAKY-HEAD-/srv/secret/task-state branch feature/x pass 3 of 5" + "p".repeat(60);
+    const out = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary }] }), ctx);
+    const s = storedSummary(ctx.session.state, "b1");
+    const head = s.slice(0, 30).replace(/\r?\n/g, " ");
+    assert.ok(out.includes(`head "${head}"`), "model-facing receipt still verifies content (#1294)");
+    const logLine = ctx.logs.find((l) => l.startsWith("[acp-proxy: [Compressed")) ?? "";
+    assert.ok(logLine, ctx.logs.join("\n"));
+    assert.ok(logLine.includes(`\n · b1 summary ${s.length}ch`), logLine);
+    assert.doesNotMatch(logLine, /head "|… tail "/, "no excerpt markers in the log copy");
+    assert.ok(!logLine.includes("/srv/secret"), "conversation-derived fragment must not reach the log");
+});
+
+test("#1718: first msg ids logged per-process salted — raw ids absent, joins stable within a run", () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    const turns: Array<[string, string]> = [
+        ["user", "A historical exchange covering setup steps."],
+        ["assistant", "x".repeat(3000)],
+    ];
+    const spec = { content: [{ startId: "m00001", endId: "m00002", summary: "Folded history." }] };
+    const ctx = makeCtx();
+    seedTurn(ctx, turns);
+    applyRanges(parseCompressInput(spec), ctx);
+    const line = ctx.logs.find((l) => l.startsWith("[acp-proxy: first msg ids: ")) ?? "";
+    assert.ok(line, ctx.logs.join("\n"));
+    assert.match(line, /x_[0-9a-f]{10}\(\d+c\)/, line);
+    for (let i = 0; i < ctx.messages.length; i++) assert.ok(!line.includes(`raw${i}`), `raw${i} leaked: ${line}`);
+    const firstSalted = /^.*?(x_[0-9a-f]{10})/.exec(line)![1];
+    const ctx2 = makeCtx();
+    seedTurn(ctx2, turns);
+    applyRanges(parseCompressInput(spec), ctx2);
+    const line2 = ctx2.logs.find((l) => l.startsWith("[acp-proxy: first msg ids: "))!;
+    assert.equal(/^.*?(x_[0-9a-f]{10})/.exec(line2)![1], firstSalted, "same process salt → same token for the same raw id (within-run joins survive)");
+});

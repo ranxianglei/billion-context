@@ -11,14 +11,17 @@ import type http from "node:http";
  * leaving the client with a truncated stream and no finish event. The request
  * handler wraps each loop in try/catch and calls this on failure.
  *
- * Format per protocol:
- *  - openai:    a `choices[].delta` with the error text, then a `finish_reason:
- *               "stop"` chunk, then `data: [DONE]`.
- *  - anthropic: a `content_block_delta` text_delta, then `message_stop`.
- *  - responses: `response.output_text.delta`, then `response.completed`.
+ * Format per protocol (#1455 default = protocol-native failure frames, same
+ * shapes as emitPreflightError/emitUpstreamTruncation):
+ *  - openai:    top-level `error` in a data frame, then `[DONE]`.
+ *  - anthropic: `event: error` (the SDK's standard API-error channel).
+ *  - responses: `event: error` (Responses SSE spec).
  *  - google:    an in-stream `{"error":{code,message,status}}` frame — Gemini's
  *               own error channel, which its SDK throws on; the stream then
  *               ends (there is no separate terminal byte to synthesize).
+ * compat.streamErrorShape="completion" restores the legacy shapes (failure text
+ * delivered inside a synthesized successful completion), for hosts whose SDK
+ * cannot surface an in-band error event.
  *
  * Best-effort: if writing the error itself throws (client already gone), we
  * still attempt res.end(). Never throws.
@@ -34,39 +37,66 @@ function safeWrite(res: http.ServerResponse, chunk: string): void {
     }
 }
 
-export function emitStreamError(res: http.ServerResponse, protocol: Protocol, message: string, log?: (msg: string) => void): void {
-    const visible = `\n\u274c [ACP] stream error: ${message}`;
+// #1455: protocol-native failure frames — same shapes as emitPreflightError
+// (#568) / emitUpstreamTruncation (#721). A mid-stream failure must reach the
+// client on the error channel, never as a synthesized successful completion
+// (that silences client retry logic — see the loop adapters' emitError).
+function nativeErrorChunk(protocol: Protocol, message: string): string {
+    if (protocol === "openai") {
+        return `data: ${JSON.stringify({ error: { type: "server_error", code: "stream_error", message } })}\n\ndata: [DONE]\n\n`;
+    }
+    if (protocol === "responses") {
+        return `event: error\ndata: ${JSON.stringify({ type: "error", code: "stream_error", message })}\n\n`;
+    }
+    if (protocol === "google") {
+        // Gemini's error object is `{code: number, message, status}` — a
+        // numeric code + gRPC-style status, no free-form `type`.
+        return `data: ${JSON.stringify({ error: { code: 500, message, status: "INTERNAL" } })}\n\n`;
+    }
+    return `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "server_error", code: "stream_error", message } })}\n\n`;
+}
+
+// Legacy shapes (#1455 opt-out via compat.streamErrorShape="completion"): the
+// failure text delivered INSIDE a successful completion. Kept for hosts whose
+// SDK cannot surface an in-band error event.
+function legacyCompletionChunk(protocol: Protocol, visible: string): string {
+    if (protocol === "openai") {
+        return `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: visible }, finish_reason: null }] })}\n\n` +
+            `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n` +
+            `data: [DONE]\n\n`;
+    }
+    if (protocol === "responses") {
+        // Responses requires a full item lifecycle: output_item.added →
+        // content_part.added → output_text.delta → …done → item.done →
+        // completed. A bare delta (the old shape) is orphan + malformed
+        // (no item_id) and crashes strict clients (codex/gpt-5-codex).
+        const itemId = "msg_acp_error";
+        const oi = 0;
+        const errorItem = { type: "message", id: itemId, role: "assistant", content: [{ type: "output_text", text: visible }] };
+        return `event: response.output_item.added\ndata: ${JSON.stringify({ type: "response.output_item.added", output_index: oi, item: { type: "message", id: itemId, role: "assistant", content: [] } })}\n\n` +
+            `event: response.content_part.added\ndata: ${JSON.stringify({ type: "response.content_part.added", item_id: itemId, output_index: oi, part: { type: "output_text", text: "" } })}\n\n` +
+            `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", item_id: itemId, output_index: oi, delta: visible })}\n\n` +
+            `event: response.output_text.done\ndata: ${JSON.stringify({ type: "response.output_text.done", item_id: itemId, output_index: oi, text: visible })}\n\n` +
+            `event: response.content_part.done\ndata: ${JSON.stringify({ type: "response.content_part.done", item_id: itemId, output_index: oi, part: { type: "output_text", text: visible } })}\n\n` +
+            `event: response.output_item.done\ndata: ${JSON.stringify({ type: "response.output_item.done", output_index: oi, item: errorItem })}\n\n` +
+            `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { status: "completed", output: [errorItem] } })}\n\n`;
+    }
+    if (protocol === "google") {
+        return `data: ${JSON.stringify({ error: { code: 500, message: visible, status: "INTERNAL" } })}\n\n`;
+    }
+    return `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", delta: { type: "text_delta", text: visible } })}\n\n` +
+        `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" } })}\n\n` +
+        `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`;
+}
+
+export function emitStreamError(res: http.ServerResponse, protocol: Protocol, message: string, log?: (msg: string) => void, errorShape: "protocol" | "completion" = "protocol"): void {
+    const visible = `\n\u274C [ACP] stream error: ${message}`;
     log?.(`[acp-proxy: stream aborted mid-response: ${message}]`);
+    const chunk = errorShape === "protocol"
+        ? nativeErrorChunk(protocol, `[acp-proxy: ${message}]`)
+        : legacyCompletionChunk(protocol, visible);
     try {
-        if (protocol === "openai") {
-            safeWrite(res, `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: visible }, finish_reason: null }] })}\n\n`);
-            safeWrite(res, `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
-            safeWrite(res, "data: [DONE]\n\n");
-        } else if (protocol === "responses") {
-            // Responses requires a full item lifecycle: output_item.added →
-            // content_part.added → output_text.delta → …done → item.done →
-            // completed. A bare delta (the old shape) is orphan + malformed
-            // (no item_id) and crashes strict clients (codex/gpt-5-codex).
-            const itemId = "msg_acp_error";
-            const oi = 0;
-            const errorItem = { type: "message", id: itemId, role: "assistant", content: [{ type: "output_text", text: visible }] };
-            safeWrite(res, `event: response.output_item.added\ndata: ${JSON.stringify({ type: "response.output_item.added", output_index: oi, item: { type: "message", id: itemId, role: "assistant", content: [] } })}\n\n`);
-            safeWrite(res, `event: response.content_part.added\ndata: ${JSON.stringify({ type: "response.content_part.added", item_id: itemId, output_index: oi, part: { type: "output_text", text: "" } })}\n\n`);
-            safeWrite(res, `event: response.output_text.delta\ndata: ${JSON.stringify({ type: "response.output_text.delta", item_id: itemId, output_index: oi, delta: visible })}\n\n`);
-            safeWrite(res, `event: response.output_text.done\ndata: ${JSON.stringify({ type: "response.output_text.done", item_id: itemId, output_index: oi, text: visible })}\n\n`);
-            safeWrite(res, `event: response.content_part.done\ndata: ${JSON.stringify({ type: "response.content_part.done", item_id: itemId, output_index: oi, part: { type: "output_text", text: visible } })}\n\n`);
-            safeWrite(res, `event: response.output_item.done\ndata: ${JSON.stringify({ type: "response.output_item.done", output_index: oi, item: errorItem })}\n\n`);
-            safeWrite(res, `event: response.completed\ndata: ${JSON.stringify({ type: "response.completed", response: { status: "completed", output: [errorItem] } })}\n\n`);
-        } else if (protocol === "google") {
-            // Gemini's error object is `{code: number, message, status}` — a
-            // numeric code + gRPC-style status, no free-form `type`.
-            safeWrite(res, `data: ${JSON.stringify({ error: { code: 500, message: visible, status: "INTERNAL" } })}\n\n`);
-        } else {
-            // anthropic
-            safeWrite(res, `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", delta: { type: "text_delta", text: visible } })}\n\n`);
-            safeWrite(res, `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" } })}\n\n`);
-            safeWrite(res, `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`);
-        }
+        safeWrite(res, chunk);
     } catch {
         /* best-effort */
     } finally {

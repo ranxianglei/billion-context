@@ -7,7 +7,7 @@
 // fork unchanged.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readdirSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -34,6 +34,7 @@ import { getStore, SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { applyRanges } from "../src/stream.ts";
 import { parseCompressInput } from "../src/compress-tool.ts";
 import { maybeAdoptForkBlocks } from "../src/fork-adoption.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 process.env.BILI_PERSIST = "0";
 
@@ -168,12 +169,13 @@ test("fork of armed parent resolves adopted covered refs via acp_retrieve (#1341
 
     const cstore = contentStoreOf(child);
     assert.ok(cstore.byRef["m00003"], "covered ref adopted into child store");
-    // AC1: hit with the true original text.
+    // AC1: hit with the true original text (GHSA jc6g v2: the tool result
+    // itself carries the framed original — nothing queues).
     const ack = executeRetrieve({ ref: "m00003" }, child);
-    assert.match(ack, /retrieved m00003/);
-    const inj = drainPendingRetrievals(child)[0];
-    assert.ok(inj.text?.includes(BIG_A.slice(0, 200)), "injection carries the true original");
-    assert.ok(!inj.text?.includes(STORED_PLACEHOLDER_MARKER));
+    assert.match(ack, /acp-retrieved #m00003/);
+    assert.ok(ack.includes(BIG_A.slice(0, 200)), "the tool result carries the true original");
+    assert.ok(!ack.includes(STORED_PLACEHOLDER_MARKER));
+    assert.equal(drainPendingRetrievals(child).length, 0, "v2 delivers inline — nothing queued");
     // Ref-filtered: the edited message's ref (m00008) is NOT carried — the
     // child will self-heal its own m00008 on its next turn.
     assert.equal(cstore.byRef["m00008"], undefined);
@@ -248,8 +250,8 @@ test("refs cited by placeholder-shaped incoming messages are adopted too (#1341)
     // messageRefs; the store index is deliberately independent of it.
     assert.equal(child.state.messageRefs.byRef["m00007"], undefined);
     const ack = executeRetrieve({ ref: "m00007" }, child);
-    assert.match(ack, /retrieved m00007/);
-    assert.ok(drainPendingRetrievals(child)[0].text?.includes(BIG_B.slice(0, 200)));
+    assert.match(ack, /acp-retrieved #m00007/);
+    assert.ok(ack.includes(BIG_B.slice(0, 200)), "adopted original rides in the tool result (v2)");
 
     // The child's own next request + fold must not clobber the adopted entry
     // (append-only, first write wins) — even though the child's own m00007 is
@@ -273,8 +275,9 @@ test("refs cited by placeholder-shaped incoming messages are adopted too (#1341)
     );
     assert.ok([...child.state.blocks].some((b) => b.active && b.blockId !== armed.blockId), "child's own fold created a second block");
     assert.equal(contentStoreOf(child).byRef["m00007"].hash, cstore.byRef["m00007"].hash, "adopted entry survives the child's own fold");
-    assert.match(executeRetrieve({ ref: "m00007" }, child), /retrieved m00007/);
-    assert.ok(drainPendingRetrievals(child)[0].text?.includes(BIG_B.slice(0, 200)));
+    const reAck = executeRetrieve({ ref: "m00007" }, child);
+    assert.match(reAck, /acp-retrieved #m00007/);
+    assert.ok(reAck.includes(BIG_B.slice(0, 200)), "still retrievable in the tool result after the fold");
 });
 
 test("child persists its own companion and survives a proxy restart (#1341)", () => {
@@ -307,11 +310,12 @@ test("child persists its own companion and survives a proxy restart (#1341)", ()
         assert.equal(dropSessionForGc(child.id), true, "evict from memory (restart)");
         const reloaded = getSession(child.id, META);
         assert.equal(reloaded.state.blocks.length, 1);
-        assert.match(executeRetrieve({ ref: "m00003" }, reloaded), /retrieved m00003/);
-        assert.ok(drainPendingRetrievals(reloaded)[0].text?.includes(BIG_A.slice(0, 200)), "true original after reload");
+        const ack = executeRetrieve({ ref: "m00003" }, reloaded);
+        assert.match(ack, /acp-retrieved #m00003/);
+        assert.ok(ack.includes(BIG_A.slice(0, 200)), "true original after reload (v2 tool result)");
     } finally {
         _setStoreForTest(new SessionStore({ enabled: false }));
-        rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 

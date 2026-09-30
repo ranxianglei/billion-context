@@ -131,6 +131,30 @@ function assertAnthropicStreamSchema(s: string): void {
     assert.equal(events[events.length - 1].type, "message_stop", "last event is message_stop");
 }
 
+// #1455: failure streams must terminate on the protocol-native error channel —
+// NO completion frame may appear instead of (or after) it. A synthesized
+// end_turn is exactly what made the incident's client treat the dead turn as a
+// normal finish and never spend a retry attempt.
+function assertAnthropicErrorStream(s: string): void {
+    const events = parseSse(s);
+    assert.ok(events.length > 0, "stream non-empty");
+    const open = new Map<number, string>();
+    for (const e of events) {
+        if (e.type === "content_block_start") {
+            const cb = (e.data.content_block ?? {}) as Record<string, unknown>;
+            open.set(e.data.index as number, String(cb.type));
+        } else if (e.type === "content_block_stop") {
+            assert.ok(open.has(e.data.index as number), `content_block_stop for never-started block ${e.data.index}`);
+            open.delete(e.data.index as number);
+        } else if (e.type === "message_delta" || e.type === "message_stop") {
+            assert.fail(`failure stream must not carry a completion frame (got ${e.type})`);
+        }
+    }
+    assert.equal(open.size, 0, `all blocks closed before the error event (still open: ${[...open.entries()].map(([i, t]) => `${i}:${t}`).join(", ")})`);
+    assert.equal(events[events.length - 1].type, "error", "last event is the protocol-native error");
+    assert.equal((events[events.length - 1].data.error as Record<string, unknown>).code, "upstream_error");
+}
+
 test("#413 T1: 0-event EOF → retried once; failed retry → well-formed error stream, single log line", async () => {
     process.env.BILI_REPLAY_RETRY_MAX = "1";
     const captured: { level: string; msg: string }[] = [];
@@ -141,7 +165,7 @@ test("#413 T1: 0-event EOF → retried once; failed retry → well-formed error 
     try {
         const out = await drain(new Response("", { status: 200 }).body!, ctx);
         assert.equal(mock.calls(), 1, "zero-side-effect truncation retried exactly once");
-        assertAnthropicStreamSchema(out);
+        assertAnthropicErrorStream(out);
         assert.ok(out.includes("upstream stream truncated"), "truncation surfaced to client");
         const truncCaptured = captured.filter((l) => l.msg.includes("upstream stream truncated"));
         assert.equal(truncCaptured.length, 1, `truncation logged exactly once (got ${truncCaptured.length}): ${JSON.stringify(truncCaptured)}`);
@@ -176,7 +200,7 @@ test("#413 T3: truncation with open thinking block → block closed, no retry (c
     try {
         const out = await drain(new Response(round1, { status: 200 }).body!, ctx);
         assert.equal(mock.calls(), 0, "no retry when content already reached the client");
-        assertAnthropicStreamSchema(out);
+        assertAnthropicErrorStream(out);
         assert.ok(out.includes("upstream stream truncated"), "truncation surfaced to client");
     } finally {
         mock.restore();
@@ -190,7 +214,7 @@ test("#413 T4: truncation with open text block → block closed before error blo
     try {
         const out = await drain(new Response(round1, { status: 200 }).body!, ctx);
         assert.equal(mock.calls(), 0, "no retry when content already reached the client");
-        assertAnthropicStreamSchema(out);
+        assertAnthropicErrorStream(out);
         assert.ok(out.includes("partial"), "already-forwarded text preserved");
         assert.ok(out.includes("upstream stream truncated"), "truncation surfaced to client");
     } finally {
@@ -204,7 +228,7 @@ test("#413 T5: retry itself truncated → no second retry (one per request)", as
     try {
         const out = await drain(new Response("", { status: 200 }).body!, ctx);
         assert.equal(mock.calls(), 1, "exactly one retry per request");
-        assertAnthropicStreamSchema(out);
+        assertAnthropicErrorStream(out);
         assert.ok(out.includes("upstream stream truncated"), "truncation surfaced after exhausted retry");
     } finally {
         mock.restore();

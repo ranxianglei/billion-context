@@ -341,3 +341,33 @@ test("parseCompressSettings: parses reasoningGuard sub-fields and rejects malfor
     assert.equal(parseCompressSettings({ reasoningGuard: { base: "518" } }), undefined);
     assert.equal(parseCompressSettings({ reasoningGuard: [] }), undefined);
 });
+
+test("mergeCompress: priceProfile merges sub-field-wise deepest-wins (#1279)", () => {
+    const merged = mergeCompress(
+        { priceProfile: { w: 1, r: 0.1, q: 4 } },
+        { priceProfile: { q: 1.5 } },
+        { priceProfile: { r: 0.2 } },
+    );
+    assert.deepEqual(merged.priceProfile, { w: 1, r: 0.2, q: 1.5 });
+    assert.deepEqual(
+        mergeCompress({ priceProfile: { w: 1 } }, { priceProfile: { r: 0.1 } }, undefined).priceProfile,
+        { w: 1, r: 0.1 },
+    );
+});
+
+test("mergeCompress: priceProfile absent at all levels stays undefined", () => {
+    assert.equal(mergeCompress({ nudgeGrowthTokens: 50000 }, { tiers: false }, undefined).priceProfile, undefined);
+});
+
+test("parseCompressSettings: parses priceProfile sub-fields and rejects malformed (#1279)", () => {
+    assert.deepEqual(parseCompressSettings({ priceProfile: { w: 1, r: 0.1, q: 1.5 } })?.priceProfile, { w: 1, r: 0.1, q: 1.5 });
+    assert.deepEqual(parseCompressSettings({ priceProfile: { q: 0 } })?.priceProfile, { q: 0 });
+    assert.equal(parseCompressSettings({})?.priceProfile, undefined);
+    assert.equal(parseCompressSettings({ nudgeGrowthTokens: 50000, priceProfile: { w: 2 } })?.nudgeGrowthTokens, 50000);
+    assert.equal(parseCompressSettings({ priceProfile: "anthropic" }), undefined);
+    assert.equal(parseCompressSettings({ priceProfile: [] }), undefined);
+    assert.equal(parseCompressSettings({ priceProfile: { w: -1 } }), undefined);
+    assert.equal(parseCompressSettings({ priceProfile: { r: "cheap" } }), undefined);
+    assert.equal(parseCompressSettings({ priceProfile: { q: Number.NaN } }), undefined);
+    assert.deepEqual(parseCompressSettings({ priceProfile: { x: 3 } })?.priceProfile, {});
+});

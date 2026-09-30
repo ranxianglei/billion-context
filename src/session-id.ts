@@ -111,11 +111,12 @@ export function instructionsFingerprintApplies(headers: Record<string, string | 
     const turnMeta = headers["x-codex-turn-metadata"];
     if (typeof turnMeta === "string" && turnMeta.trim().length > 0) return true;
     // One definition of "codex traffic" process-wide (every other codex path in
-    // server.ts uses isCodexClient, #645). Its lenient substring fallback stays
-    // CASE-SENSITIVE precisely because a case-insensitive match would pull
-    // non-codex relays with "Codex"-shaped UAs back into the fingerprint and
-    // re-fork them mid-conversation (#1106); only known codex prefixes (incl.
-    // Codex Desktop, #1169) match case-insensitively.
+    // server.ts uses isCodexClient, #645). Its lenient fallback — a UA
+    // component starting with lowercase "codex" (#1641) — stays CASE-SENSITIVE
+    // precisely because a case-insensitive match would pull non-codex relays
+    // with "Codex"-shaped UAs back into the fingerprint and re-fork them
+    // mid-conversation (#1106); only known codex prefixes (incl. Codex
+    // Desktop, #1169) match case-insensitively.
     if (isCodexClient(headers)) return true;
     return conversationHeaderSource(headers)?.name === "x-claude-code-session-id";
 }

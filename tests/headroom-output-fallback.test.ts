@@ -99,6 +99,7 @@ async function turn2MessageCount(s: Scenario): Promise<number> {
         log: false,
         debug: false,
         passthrough: false,
+        chainContentDetection: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);

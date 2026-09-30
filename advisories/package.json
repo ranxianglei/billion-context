@@ -1,0 +1,15 @@
+{
+    "name": "billion-context-advisories",
+    "version": "0.0.0",
+    "description": "Critical-defect advisories for billion-context (#1481). Machine-readable blocklist consumed by the bili advisory watcher; published by CI from this repo's advisories/ directory.",
+    "private": false,
+    "publishConfig": {
+        "access": "public",
+        "registry": "https://registry.npmjs.org"
+    },
+    "billionContextAdvisories": {
+        "schema": 1,
+        "updated": "2026-09-27",
+        "advisories": []
+    }
+}

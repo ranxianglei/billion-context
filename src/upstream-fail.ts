@@ -12,13 +12,19 @@
  *  neither imports the other just for this (they already form an import
  *  edge upstream-proxy → fetch-util; adding the reverse would be a cycle). */
 
-type UpstreamFailureKind =
+export type UpstreamFailureKind =
     /** Downstream client disconnected (external abort fired). Nothing bili
      *  did or can retry — the request is dead by definition. */
     | "client-abort"
-    /** Idle-budget / connect-time expiry: our own watchdog aborted, or the
-     *  OS/undici reported a timeout. NOT retried — the budget already waited. */
+    /** Idle-budget / read-phase timeout expiry: our own watchdog aborted, or
+     *  OS/undici reported a headers/body timeout. NOT retried — the budget
+     *  already waited and the request may have reached the upstream. */
     | "upstream-timeout"
+    /** Connect-phase timeout (undici UND_ERR_CONNECT_TIMEOUT): the TCP
+     *  handshake never completed, so nothing reached the upstream and each
+     *  attempt costs at most one connect timeout — replayed within the retry
+     *  budget (#1453). */
+    | "connect-timeout"
     /** Connect-phase reset THROUGH a proxy: socket died before the response
      *  started, and a proxy sits in the path — prime suspect is the proxy
      *  recycling the tunnel (idle recycle, payload cap, node churn). */
@@ -66,7 +72,8 @@ export function classifyUpstreamFailure(error: unknown, ctx: UpstreamFailCtx = {
             if (name === "AbortError") return "upstream-timeout";
             continue;
         }
-        if (code === "ETIMEDOUT" || code === "UND_ERR_HEADERS_TIMEOUT" || code === "UND_ERR_BODY_TIMEOUT" || code === "UND_ERR_CONNECT_TIMEOUT") return "upstream-timeout";
+        if (code === "UND_ERR_CONNECT_TIMEOUT") return "connect-timeout";
+        if (code === "ETIMEDOUT" || code === "UND_ERR_HEADERS_TIMEOUT" || code === "UND_ERR_BODY_TIMEOUT") return "upstream-timeout";
         if (code === "ECONNRESET" || code === "EPIPE" || code === "ECONNABORTED" || code === "UND_ERR_SOCKET") return ctx.viaProxy ? "proxy-reset" : "upstream-reset";
         if (code === "ECONNREFUSED") return "connect-refused";
         if (code === "ENOTFOUND" || code === "EAI_AGAIN") return "dns";
@@ -76,22 +83,24 @@ export function classifyUpstreamFailure(error: unknown, ctx: UpstreamFailCtx = {
 }
 
 /** Fail-fast kinds: the attempt died BEFORE any response byte existed, so a
- *  replay cannot double-deliver anything and the failure cost milliseconds —
- *  the opposite of the timeout/abort family, where the budget already waited
- *  and retrying would stack wait times (#1263 handshake-resilience scope). */
+ *  replay cannot double-deliver anything. Per-attempt cost stays bounded —
+ *  milliseconds for resets/refusals/DNS, at most one connect timeout for
+ *  connect-timeout — so retrying never stacks the 12-min idle budget across
+ *  attempts the way a headers/body timeout would (#1263, #1453). */
 export function isFailFastUpstreamKind(kind: UpstreamFailureKind): boolean {
-    return kind === "proxy-reset" || kind === "upstream-reset" || kind === "connect-refused";
+    return kind === "proxy-reset" || kind === "upstream-reset" || kind === "connect-refused" || kind === "connect-timeout" || kind === "dns";
 }
 
 /** One-line remediation hint per kind — used by logs and the docs so the
  *  taxonomy and the checklist never drift apart. */
 export const UPSTREAM_FAIL_HINTS: Record<UpstreamFailureKind, string> = {
     "client-abort": "downstream client disconnected — no bili-side action",
-    "upstream-timeout": "idle budget expired or connect timed out — check upstream health; not retried by design",
+    "upstream-timeout": "idle budget expired (headers/body) — check upstream health; not retried by design",
+    "connect-timeout": "TCP handshake never completed — upstream/proxy unreachable or blackholed; a bounded transparent replay may be attempted (BILI_REPLAY_RETRY_MAX)",
     "proxy-reset": "proxy dropped the connection before the response — check proxy idle-recycle/payload limits (BILI_PROXY_KEEPALIVE_MAX_MS can shorten our reuse window); a bounded transparent replay may be attempted (BILI_REPLAY_RETRY_MAX)",
     "upstream-reset": "upstream/network reset before the response — check upstream and local network; a bounded transparent replay may be attempted (BILI_REPLAY_RETRY_MAX)",
     "connect-refused": "TCP refused (proxy when configured, else upstream) — endpoint down or wrong port",
-    dns: "name resolution failed — DNS server or hostname typo",
+    dns: "name resolution failed — DNS server or hostname typo; a bounded transparent replay may be attempted (BILI_REPLAY_RETRY_MAX)",
     tls: "TLS/certificate failure at CONNECT or upstream handshake — CA/proxy MITM config",
     unknown: "unclassified transport failure — report with full error chain",
 };

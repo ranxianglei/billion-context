@@ -60,10 +60,12 @@ export function mergeCompress(
     // provider-level excludeTools.
     const absorbLevels = [global?.absorb, provider?.absorb, model?.absorb].filter(Boolean) as NonNullable<CompressSettings["absorb"]>[];
     const ccrLevels = [global?.ccr, provider?.ccr, model?.ccr].filter(Boolean) as NonNullable<CompressSettings["ccr"]>[];
+    const searchLevels = [global?.search, provider?.search, model?.search].filter(Boolean) as NonNullable<CompressSettings["search"]>[];
     const imageCompressionLevels = [global?.imageCompression, provider?.imageCompression, model?.imageCompression].filter(Boolean) as NonNullable<CompressSettings["imageCompression"]>[];
     const reasoningLevels = [global?.reasoning, provider?.reasoning, model?.reasoning].filter(Boolean) as NonNullable<CompressSettings["reasoning"]>[];
     const reasoningGuardLevels = [global?.reasoningGuard, provider?.reasoningGuard, model?.reasoningGuard].filter(Boolean) as NonNullable<CompressSettings["reasoningGuard"]>[];
     const outputSteeringLevels = [global?.outputSteering, provider?.outputSteering, model?.outputSteering].filter(Boolean) as NonNullable<CompressSettings["outputSteering"]>[];
+    const priceProfileLevels = [global?.priceProfile, provider?.priceProfile, model?.priceProfile].filter(Boolean) as NonNullable<CompressSettings["priceProfile"]>[];
     return {
         modelContextLimit: pick("modelContextLimit"),
         outputHeadroomMaxPct: pick("outputHeadroomMaxPct"),
@@ -82,6 +84,7 @@ export function mergeCompress(
         acknowledgePromptsRisk: pick("acknowledgePromptsRisk"),
         absorb: absorbLevels.length > 0 ? Object.assign({}, ...absorbLevels) : undefined,
         ccr: ccrLevels.length > 0 ? Object.assign({}, ...ccrLevels) : undefined,
+        search: searchLevels.length > 0 ? Object.assign({}, ...searchLevels) : undefined,
         imageCompression: imageCompressionLevels.length > 0 ? Object.assign({}, ...imageCompressionLevels) : undefined,
         rules: pick("rules"),
 
@@ -94,6 +97,7 @@ stripImages: pick("stripImages"),
         reasoning: reasoningLevels.length > 0 ? Object.assign({}, ...reasoningLevels) : undefined,
         reasoningGuard: reasoningGuardLevels.length > 0 ? Object.assign({}, ...reasoningGuardLevels) : undefined,
         outputSteering: outputSteeringLevels.length > 0 ? Object.assign({}, ...outputSteeringLevels) : undefined,
+        priceProfile: priceProfileLevels.length > 0 ? Object.assign({}, ...priceProfileLevels) : undefined,
         promptPack: pick("promptPack"),
     };
 }
@@ -287,7 +291,11 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
     let ccr: CcrConfig | undefined;
     if (s.ccr !== undefined) {
         const d = DEFAULT_CCR_CONFIG;
+        // Spread the kernel defaults first so new kernel-side keys (e.g.
+        // retrieveInlineTokens, GHSA jc6g v2) carry through without a bili-side
+        // edit every time the kernel grows one.
         ccr = {
+            ...d,
             enabled: s.ccr.enabled === true,
             toolName: s.ccr.toolName ?? d.toolName,
             minToolTokens: s.ccr.minToolTokens ?? d.minToolTokens,

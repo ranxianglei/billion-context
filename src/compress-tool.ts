@@ -36,6 +36,14 @@ import {
     ACP_TOOLS_OPENAI,
     ACP_TOOLS_RESPONSES,
     ACP_READONLY_TOOLS_RESPONSES,
+    ACP_TEXT_OPEN,
+    ACP_TEXT_CLOSE,
+    ACP_STATUS_OPEN,
+    ACP_STATUS_CLOSE,
+    ACP_SEARCH_OPEN,
+    ACP_SEARCH_CLOSE,
+    ACP_DECOMPRESS_OPEN,
+    ACP_DECOMPRESS_CLOSE,
 } from "acp-kernel";
 import { log as loggerLog } from "./logger.js";
 import { maxShrinkPerCompress } from "./fetch-util.js";
@@ -87,25 +95,18 @@ export {
 export type { ParsedRange, AbsorbConfig } from "acp-kernel";
 export { ACP_TOOL_NAMES as PROXY_TOOL_NAMES, ACP_MUTATING_TOOLS as MUTATING_PROXY_TOOLS, ACP_READONLY_TOOLS as READONLY_PROXY_TOOLS } from "acp-kernel";
 
-// #841: host-side conversation_id extension of search_context. Kernel constants
-// are shared and never mutated; ALL wire-mode injection points must use these
-// BILI_ arrays or the served schema drifts between wire mode and plugin mode
-// (the plugin manifest reuses SEARCH_CONTEXT_CONVERSATION_ID_PARAM below).
-export const SEARCH_CONTEXT_CONVERSATION_ID_PARAM = {
-    type: "string",
-    description: "Target bili conversation id. Defaults to the current conversation. May reference another historical pfa-* session for read-only search.",
-};
-
+// #1685 zero-injection identity: search_context's host-side
+// conversation_id extension (#841/#760) is REMOVED — the model never sees a
+// conversation id anymore, so it cannot cite one. Cross-session search keeps
+// working for hosts that pass a target id out-of-band; the schema the model
+// sees is the kernel constant, verbatim. The BILI_ copies stay as the
+// served-shape anchor the wire-contract golden test pins.
 type JsonSchemaObject = { type: string; properties?: Record<string, unknown>; required?: string[] };
-
-function withConversationId(schema: JsonSchemaObject): JsonSchemaObject {
-    return { ...schema, properties: { ...schema.properties, conversation_id: SEARCH_CONTEXT_CONVERSATION_ID_PARAM } };
-}
 
 export const BILI_SEARCH_CONTEXT_TOOL = {
     name: SEARCH_CONTEXT_TOOL.name,
     description: SEARCH_CONTEXT_TOOL.description,
-    input_schema: withConversationId(SEARCH_CONTEXT_TOOL.input_schema),
+    input_schema: SEARCH_CONTEXT_TOOL.input_schema as JsonSchemaObject,
 };
 
 export const BILI_SEARCH_CONTEXT_TOOL_OPENAI = {
@@ -113,7 +114,7 @@ export const BILI_SEARCH_CONTEXT_TOOL_OPENAI = {
     function: {
         name: SEARCH_CONTEXT_TOOL_OPENAI.function.name,
         description: SEARCH_CONTEXT_TOOL_OPENAI.function.description,
-        parameters: withConversationId(SEARCH_CONTEXT_TOOL_OPENAI.function.parameters),
+        parameters: SEARCH_CONTEXT_TOOL_OPENAI.function.parameters as JsonSchemaObject,
     },
 };
 
@@ -121,28 +122,32 @@ export const BILI_SEARCH_CONTEXT_TOOL_RESPONSES = {
     type: "function" as const,
     name: SEARCH_CONTEXT_TOOL_RESPONSES.name,
     description: SEARCH_CONTEXT_TOOL_RESPONSES.description,
-    parameters: withConversationId(SEARCH_CONTEXT_TOOL_RESPONSES.parameters),
+    parameters: SEARCH_CONTEXT_TOOL_RESPONSES.parameters as JsonSchemaObject,
 };
 
 export const BILI_SEARCH_CONTEXT_TOOL_GOOGLE = {
     name: SEARCH_CONTEXT_TOOL_GOOGLE.name,
     description: SEARCH_CONTEXT_TOOL_GOOGLE.description,
-    parameters: withConversationId(SEARCH_CONTEXT_TOOL_GOOGLE.parameters),
+    parameters: SEARCH_CONTEXT_TOOL_GOOGLE.parameters as JsonSchemaObject,
 };
 
 // #1179 CCR v2: host-side range-restore extension of decompress. Optional
 // startId/endId (mNNNNN refs) restore only the block's messages inside that
-// span instead of the whole block. Served unconditionally on every wire + the
-// plugin manifest (one definition, no drift — same rule as conversation_id
-// above); execution is gated on CCR being armed for the session
-// (resolveDecompressRange fails explicitly when it is not).
+// span instead of the whole block. Execution is gated on CCR being armed for
+// the session (resolveDecompressRange fails explicitly when it is not), so
+// the params are advertised ONLY where they can work (#1712): proxy-lane wire
+// injection serves the *_NO_RANGE variant while the session is unarmed, and
+// the plugin manifest serves them only when the base config enables CCR
+// (plugin policy is the base block verbatim, #1345) — same conservative rule
+// as acp_retrieve/absorb/rule in handlePluginManifest (#1192/#1271). Blank or
+// whitespace values are treated as omitted at execution (whole-block restore).
 const DECOMPRESS_RANGE_PARAM_START = {
     type: "string",
-    description: "Optional mNNNNN message ref, inclusive lower bound of a sub-range of this block. With endId, restores only that span instead of the whole block (requires CCR: compress.ccr.enabled).",
+    description: "Optional mNNNNN message ref, inclusive lower bound of a sub-range of this block. With endId, restores only that span instead of the whole block (requires CCR: compress.ccr.enabled). Omit both to restore the whole block; empty values count as omitted.",
 };
 const DECOMPRESS_RANGE_PARAM_END = {
     type: "string",
-    description: "Optional mNNNNN message ref, inclusive upper bound. Used together with startId.",
+    description: "Optional mNNNNN message ref, inclusive upper bound. Used together with startId; omit both to restore the whole block.",
 };
 
 function withRangeParams(schema: JsonSchemaObject): JsonSchemaObject {
@@ -158,6 +163,15 @@ export const BILI_ACP_TOOLS_ANTHROPIC = ACP_TOOLS_ANTHROPIC.map((t) => (t.name =
 export const BILI_ACP_TOOLS_OPENAI = ACP_TOOLS_OPENAI.map((t) => (t.function.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_OPENAI : t.function.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_TOOL_OPENAI : t));
 export const BILI_ACP_TOOLS_RESPONSES = ACP_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_TOOL_RESPONSES : t));
 export const BILI_ACP_TOOLS_GOOGLE = ACP_TOOLS_GOOGLE.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_GOOGLE : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_TOOL_GOOGLE : t));
+
+// #1712: no-range variants — identical except decompress lacks startId/endId.
+// Served where range restore cannot be armed so the advertised schema never
+// offers what execution will refuse (see the #1179 note above).
+export const BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE = ACP_TOOLS_ANTHROPIC.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL : t));
+export const BILI_ACP_TOOLS_OPENAI_NO_RANGE = ACP_TOOLS_OPENAI.map((t) => (t.function.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_OPENAI : t));
+export const BILI_ACP_TOOLS_RESPONSES_NO_RANGE = ACP_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t));
+export const BILI_ACP_TOOLS_GOOGLE_NO_RANGE = ACP_TOOLS_GOOGLE.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_GOOGLE : t));
+export const BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE = ACP_READONLY_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t));
 export const BILI_ACP_READONLY_TOOLS_RESPONSES = ACP_READONLY_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_TOOL_RESPONSES : t));
 
 // The kernel ships no Responses-format absorb const (the four ACP tools have
@@ -238,15 +252,116 @@ export const IMAGE_FULL_TOOL_GOOGLE = {
     parameters: IMAGE_FULL_TOOL_OPENAI.function.parameters,
 };
 
+// #1494: models drift off the advertised {content: [...]} schema when they
+// retry a single range: `content` becomes the single entry OBJECT instead of a
+// one-element array (kernel hard-rejects it: kind=content-not-array,
+// dropped=0), the whole argument becomes a bare entry array (kind=not-object),
+// or the same shapes arrive string-encoded through a chat wire. The kernel's
+// salvage ladder already tolerates this drift at the TOP level (a bare
+// {startId,…} without content is accepted as one range) but hard-rejects it
+// INSIDE content — an asymmetric wall that turns one shape slip into a full
+// call failure plus a wasted retry round. Normalize those shapes back to
+// canonical {content:[…]} before the kernel sees them; everything else passes
+// through untouched.
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+    return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function looksLikeRangeEntry(o: Record<string, unknown>): boolean {
+    const hasStart = typeof o["startId"] === "string" || typeof o["startRef"] === "string" || typeof o["messageId"] === "string";
+    const hasEnd = typeof o["endId"] === "string" || typeof o["endRef"] === "string" || typeof o["messageId"] === "string";
+    return hasStart && hasEnd && typeof o["summary"] === "string";
+}
+
+function decodeCompressObject(raw: string): Record<string, unknown> | undefined {
+    let s = raw.trim();
+    if (s.startsWith("```")) {
+        const nl = s.indexOf("\n");
+        if (nl === -1) return undefined;
+        const body = s.slice(nl + 1);
+        const end = body.lastIndexOf("```");
+        s = (end > 0 ? body.slice(0, end) : body).trim();
+    }
+    let v: unknown;
+    try { v = JSON.parse(s); } catch { return undefined; }
+    if (typeof v === "string") {
+        try { v = JSON.parse(v); } catch { return undefined; }
+    }
+    return isPlainObject(v) ? v : undefined;
+}
+
+export function normalizeCompressInput(input: unknown): unknown {
+    if (Array.isArray(input)) return { content: input };
+    if (isPlainObject(input)) {
+        const c = input["content"];
+        if (isPlainObject(c)) return { ...input, content: [c] };
+        return input;
+    }
+    if (typeof input === "string") {
+        const obj = decodeCompressObject(input);
+        if (!obj) return input;
+        const c = obj["content"];
+        if (isPlainObject(c)) return { ...obj, content: [c] };
+        if (looksLikeRangeEntry(obj)) return { content: [obj] };
+        return input;
+    }
+    return input;
+}
+
 export function parseCompressInput(input: unknown, callId?: string) {
-    const parsed = parseCompressArgs(input, { callId });
+    const parsed = parseCompressArgs(normalizeCompressInput(input), { callId });
     if (parsed.diagnostics.quoteSalvage === true) {
         loggerLog("warn", `[acp-compress-input] quote-salvage: recovered ${parsed.ranges.length} range(s) after single->double quote normalization (kind=${parsed.diagnostics.kind})`);
     }
     if (!parsed.diagnostics.ok && parsed.diagnostics.kind !== "ok") {
         loggerLog("warn", `[acp-compress-input] rejected: kind=${parsed.diagnostics.kind} invalidItems=${parsed.diagnostics.invalidItems}${parsed.diagnostics.keys ? ` keys=[${parsed.diagnostics.keys.join(",")}]` : ""}${parsed.diagnostics.length !== undefined ? ` len=${parsed.diagnostics.length}` : ""}${parsed.diagnostics.invalidReasons && parsed.diagnostics.invalidReasons.length > 0 ? ` reasons=[${parsed.diagnostics.invalidReasons.join(" | ")}]` : ""}`);
+    } else if (parsed.diagnostics.invalidItems > 0 || parsed.diagnostics.kind === "truncated") {
+        // #1494: partial drop — at least one range survived, so the old
+        // condition above never fired and the rejection was invisible on both
+        // the server log and the model-facing receipt. #1495: kind="truncated"
+        // (gateway-stringified + cut content array) salvages the complete
+        // leading entries and reports the same way — often with invalidItems=0,
+        // so it needs the explicit kind arm.
+        loggerLog("warn", `[acp-compress-input] partial: ${parsed.ranges.length} range(s) applied, ${parsed.diagnostics.invalidItems} rejected (kind=${parsed.diagnostics.kind}) reasons=[${(parsed.diagnostics.invalidReasons ?? []).join(" | ")}]`);
     }
     return { ranges: parsed.ranges, diagnostics: parsed.diagnostics };
+}
+
+// #1439: shared by the streaming Responses adapter AND the non-streaming JSON
+// loop so both recognize the same triggers — a private copy in one path drifted.
+export interface ResponsesTextTriggerCall {
+    name: string;
+    callId: string;
+    arguments: string;
+}
+export function extractResponsesTextTriggers(
+    text: string,
+): { clean: string; calls: ResponsesTextTriggerCall[] } {
+    const calls: ResponsesTextTriggerCall[] = [];
+    let clean = text;
+    let hadTrigger = false;
+    const triggers = [
+        { name: "compress", open: ACP_TEXT_OPEN, close: ACP_TEXT_CLOSE, requirePayload: true },
+        { name: "acp_status", open: ACP_STATUS_OPEN, close: ACP_STATUS_CLOSE, requirePayload: false },
+        { name: "search_context", open: ACP_SEARCH_OPEN, close: ACP_SEARCH_CLOSE, requirePayload: true },
+        { name: "decompress", open: ACP_DECOMPRESS_OPEN, close: ACP_DECOMPRESS_CLOSE, requirePayload: true },
+    ];
+    for (const t of triggers) {
+        let start = clean.indexOf(t.open);
+        while (start >= 0) {
+            const end = clean.indexOf(t.close, start + t.open.length);
+            if (end < 0) break;
+            hadTrigger = true;
+            const payload = clean.slice(start + t.open.length, end).trim();
+            if (payload.length > 0 || !t.requirePayload) {
+                const stamp = `${Date.now()}-${calls.length}`;
+                calls.push({ name: t.name, callId: `call_text_${stamp}`, arguments: payload.length > 0 ? payload : "{}" });
+            }
+            clean = clean.slice(0, start) + clean.slice(end + t.close.length);
+            start = clean.indexOf(t.open);
+        }
+    }
+    return { clean: hadTrigger ? clean : text, calls };
 }
 
 // #189 staged-compression / prefix-survival guidance, appended to the nudge
@@ -290,16 +405,6 @@ const MARKER_SILENCE_CLAUSE =
  *  clause is dropped. */
 export function withMarkerIntegrityNote(text: string, visibilityMarkers = true): string {
     return text + MARKER_INTEGRITY_NOTE + (visibilityMarkers ? MARKER_SILENCE_CLAUSE : "");
-}
-
-// #760: per-call conversation_id for MCP tools. Hosts that share ONE MCP shim
-// process across several concurrent conversations (kimi web et al.) have no
-// env/meta session channel, so the proxy prints its own resolved session id
-// and the model echoes it back as the conversation_id argument of every
-// mcp__bili__ call. Session-stable, so it rides the static system-prompt part
-// (prefix-cache safe) next to MARKER_INTEGRITY_NOTE, in BOTH modes.
-export function withConversationIdNote(text: string, conversationId: string): string {
-    return text + `\n\n[Your bili conversation id: ${conversationId}. When calling the bili compression tools, pass this value as the conversation_id argument so a shared MCP process can route the call to THIS session.]`;
 }
 
 // #888 per-summary length budget. acp-kernel rejects a compress call atomically

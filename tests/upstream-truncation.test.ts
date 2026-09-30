@@ -101,7 +101,10 @@ test("issue #221 follow-up: truncated final round surfaces a visible error inste
     assert.ok(out.includes("本周总结"), "partial conclusion text should still reach the client");
     assert.ok(out.includes("[acp-proxy: upstream stream truncated"), "truncation must be visible, not a silent end_turn");
     assert.ok(out.includes("round 1"), "error should identify the round");
-    assert.match(out, /stop_reason.*end_turn/, "client stream should still terminate cleanly");
+    // #1455: the failure rides the protocol-native error channel — a synthesized
+    // end_turn made clients treat the dead turn as a normal finish.
+    assert.match(out, /^event: error$/m, "failure terminates on the error channel");
+    assert.doesNotMatch(out, /stop_reason/, "no synthesized success terminal");
 });
 
 test("control: normally completed round still ends without any error marker", async () => {

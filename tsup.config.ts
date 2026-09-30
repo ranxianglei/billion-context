@@ -29,7 +29,7 @@ export default defineConfig({
     // noExternal, esbuild keeps `import ... from "acp-kernel"` in dist, and
     // npm then installs acp-kernel as a runtime dep — breaking the
     // "dist/index.js is self-contained" contract (AGENTS.md §2.1).
-    noExternal: ["acp-kernel", "fzstd", "node-forge", "tar", "undici", "jsonc-parser"],
+    noExternal: ["acp-kernel", "fzstd", "node-forge", "semver", "tar", "undici", "jsonc-parser"],
     // sharp is an OPTIONAL runtime dependency (native module): it must stay
     // EXTERNAL so dist keeps a real lazy `import("sharp")` that Node resolves
     // at runtime from node_modules — missing ⇒ clean pass-through, and the

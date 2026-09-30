@@ -50,7 +50,15 @@ jobs:
       - name: Read version
         if: steps.check.outputs.is_release == 'true'
         id: version
-        run: echo "version=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+        run: |
+          V="$(node -p "require('./package.json').version")"
+          case "$V" in
+            0.0.*)
+              echo "::error::package.json version $V is below 0.1.0 — official releases must always sort above the 0.0.x PR-build line (#1385)"
+              exit 1
+              ;;
+          esac
+          echo "version=$V" >> $GITHUB_OUTPUT
 
       - name: Check if prerelease
         if: steps.check.outputs.is_release == 'true'

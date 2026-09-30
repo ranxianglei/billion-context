@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { responsesToCore, coreToResponses, patchResponsesInput, injectResponsesDeveloperMessage } from "acp-kernel/wire";
 import { compressLoopResponsesJson } from "../src/compress-loop-responses.ts";
-import type { Config, CoreMessage } from "acp-kernel";
+import type { ApplyCompressionInput, ApplyCompressionResult, CompressionCore, Config, CoreMessage } from "acp-kernel";
 import { createCore, createInitialState } from "acp-kernel";
 import type { Session } from "../src/session.ts";
 import { getSession } from "../src/session.ts";
@@ -213,6 +213,68 @@ test("compressLoopResponsesJson: real tool + read-only acp_status surfaces marke
         const joined = JSON.stringify(outputs);
         assert.ok(joined.includes("📊"), "acp_status marker surfaced even when a real tool accompanies it (regression: JSON used to drop it)");
         assert.ok(joined.includes('"shell"'), "the real tool call is preserved in output so the client can execute it");
+    } finally {
+        globalThis.fetch = previousFetch;
+    }
+});
+
+test("compressLoopResponsesJson: text-trigger compress + real tool call EXECUTES the compress and relays without re-request (#1459 stream/JSON parity)", async () => {
+    // Mixed round: assistant message carries a compress text trigger AND a
+    // real (client-owned) function_call. Streaming (loop/core.ts) executes
+    // proxy tools before its `realCalls === 0` gate — the compress runs, a
+    // marker is emitted, and the response is relayed WITHOUT re-requesting.
+    // Pre-fix the JSON loop's early-return gate stripped the trigger from the
+    // text but never executed the compression (probe: 0 upstream fetches, no
+    // marker) — the compression the model asked for silently evaporated.
+    let applyCalls = 0;
+    const baseCore = createCore();
+    const applyCompression = (input: ApplyCompressionInput): ApplyCompressionResult => {
+        applyCalls += 1;
+        return { state: input.state, result: { blocksCreated: 0, tokensCompressed: 0, errors: [], warnings: [] } };
+    };
+    const core: CompressionCore = { ...baseCore, applyCompression };
+    let fetchCalls = 0;
+    const previousFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+        fetchCalls += 1;
+        return new Response(JSON.stringify({ id: "resp_never", status: "completed", output: [] }), {
+            status: 200, headers: { "content-type": "application/json" },
+        });
+    }) as typeof fetch;
+    try {
+        const initial = {
+            id: "resp_mixed_json",
+            status: "completed",
+            output: [
+                {
+                    type: "message",
+                    role: "assistant",
+                    content: [{ type: "output_text", text: 'compressing old context \x3cacp_compress\x3e{"content":[{"startId":"m1","endId":"m2","summary":"old"}]}\x3c/acp_compress\x3e' }],
+                },
+                { type: "function_call", id: "fc_shell", call_id: "call_shell", name: "shell", arguments: '{"cmd":"ls"}' },
+            ],
+        };
+        const out = await compressLoopResponsesJson(initial, { ...makeCtx(() => {}), core, config: { modelContextLimit: 200000, compress: { minCompressRange: 0 } } as Config, textProtocol: true }, {
+            model: "gpt-4o",
+            input: [{ type: "message", role: "user", content: "go" }],
+        }, { url: "https://unused.example/responses", headers: { "content-type": "application/json" } });
+        assert.equal(applyCalls, 1, "text-trigger compress MUST execute even though a real tool call accompanies it (#1459)");
+        assert.equal(fetchCalls, 0, "mixed round must NOT re-request (parity with streaming: real calls are relayed, not replayed)");
+        const outputs = out.output as Array<Record<string, unknown>>;
+        const shell = outputs.find((i) => i.type === "function_call") as Record<string, unknown> | undefined;
+        assert.ok(shell && shell.name === "shell", "the real tool call is preserved in output so the client can execute it");
+        const messageTexts = outputs
+            .filter((i) => i.type === "message")
+            .flatMap((i) => (i.content as Array<Record<string, unknown>>).map((p) => String(p.text ?? "")));
+        const markerTexts = messageTexts.filter((t) => t.includes("[ACP]"));
+        // Icon-agnostic: with this minimal session the kernel cannot create a
+        // real block, so the surfaced outcome is a FAILED marker — the point
+        // is that SOME marker is relayed, not that the compression succeeded.
+        assert.equal(markerTexts.length, 1, "exactly one visibility marker item surfaced (no silent drop)");
+        assert.match(markerTexts[0]!, /compress/i, "marker reports the compress outcome");
+        const bodyText = messageTexts.join("");
+        assert.ok(!bodyText.includes("acp_compress"), "trigger stripped from the relayed text");
+        assert.ok(bodyText.includes("compressing old context"), "surrounding prose preserved");
     } finally {
         globalThis.fetch = previousFetch;
     }

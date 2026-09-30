@@ -259,10 +259,10 @@ async function handleMessage(msg: {
             const args = { ...rawArgs };
             if (!keepForSearch) delete args.conversation_id;
             const routeOverride = keepForSearch ? undefined : perCall || undefined;
-            if (!routeOverride && !conversationId) {
-                sendError(id, ERR_TOOL, "no conversation id (pass the conversation_id argument — see the 'your bili conversation id' line in the proxy notes — or set BILI_CONVERSATION_ID or connect via Claude Code MCP session meta)");
-                return;
-            }
+            // #1685: with no binding and no per-call id, forward anyway — the
+            // proxy routes the id-less POST itself (outbound tool_use witness,
+            // else single-active arbitration) and answers a loud 400 when it
+            // genuinely cannot tell. The shim no longer hard-fails here.
             try {
                 const text = await forwardTool(tool, args, TOOL_TIMEOUT_MS, routeOverride);
                 sendResult(id, { content: [{ type: "text", text }], isError: false });

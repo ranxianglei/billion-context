@@ -7,9 +7,12 @@ process.env.NODE_ENV = "test";
 
 import biliOpencodePlugin from "../src/agent/opencode.ts";
 import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../src/compress-tool.ts";
-import { fetchManifest } from "../src/agent/shared.ts";
+import { fetchManifest, fitNoticeDescription } from "../src/agent/shared.ts";
 
 const EXPECTED_TOOLS = [...ACP_TOOLS_OPENAI.map((t) => t.function.name), ABSORB_TOOL_OPENAI.function.name];
+
+const LONG_PANEL = Array.from({ length: 30 }, (_, i) => `panel line ${String(i + 1).padStart(2, "0")}: ${"x".repeat(38)}`).join("\n");
+const LONG_REPORT = Array.from({ length: 200 }, (_, i) => `report line ${String(i + 1).padStart(3, "0")}: ${"y".repeat(38)}`).join("\n");
 
 function startFakeProxyV2(): Promise<{ origin: string; toolCalls: Array<{ conversationId?: string; tool?: string; args?: unknown }>; compacts: string[]; close: () => Promise<void> }> {
     const toolCalls: Array<{ conversationId?: string; tool?: string; args?: unknown }> = [];
@@ -26,7 +29,8 @@ function startFakeProxyV2(): Promise<{ origin: string; toolCalls: Array<{ conver
                 if (data.tool === "acp_status") {
                     res.end(JSON.stringify({ ok: true, result: "STATUS-RESULT" }));
                 } else if (data.tool === "acp_cache") {
-                    res.end(JSON.stringify({ ok: true, result: data.conversationId === "ses_cache_long" ? "L".repeat(9000) : "CACHE-REPORT-OK" }));
+                    const body = data.conversationId === "ses_cache_long" ? LONG_REPORT : "CACHE-REPORT-OK";
+                    res.end(JSON.stringify({ ok: true, result: `Web UI: http://127.0.0.1:9/__bili/#/session/${data.conversationId}\n\n${body}` }));
                 } else {
                     res.end(JSON.stringify({ ok: false, error: `boom-${data.tool}` }));
                 }
@@ -51,8 +55,13 @@ function startFakeProxyV2(): Promise<{ origin: string; toolCalls: Array<{ conver
                 return;
             }
             res.writeHead(200, { "content-type": "application/json" });
-            const panel = (req.url ?? "").includes("ses_acp_long") ? "X".repeat(1500) : "ACP-PANEL-OK";
-            res.end(JSON.stringify({ ok: true, panel }));
+            const sid = (req.url ?? "").match(/conversationId=([^&]+)/)?.[1] ?? "";
+            // ses_acp_noweb simulates an older proxy (no webUrl field) for the fallback path.
+            const webUrl = sid && sid !== "ses_acp_noweb" ? `http://127.0.0.1:9/__bili/#/session/${sid}` : null;
+            const panel = sid === "ses_acp_long" || sid === "ses_acp_noweb"
+                ? (webUrl !== null ? `${LONG_PANEL}\nWeb UI: ${webUrl}` : LONG_PANEL)
+                : "ACP-PANEL-OK";
+            res.end(JSON.stringify({ ok: true, panel, webUrl }));
             return;
         }
         if ((req.url ?? "") === "/__bili/plugin/manifest") {
@@ -427,7 +436,7 @@ test("v2 setup: first /acp before any model request shows the idle notice (proxy
 });
 
 
-test("v2 setup: /acp truncates long panels to the TUI notice cap", async () => {
+test("v2 setup: /acp long panels lead with the Web UI link and keep whole leading lines (#1602)", async () => {
     const proxy = await startFakeProxyV2();
     const fake = makeFakeCtx();
     try {
@@ -438,9 +447,63 @@ test("v2 setup: /acp truncates long panels to the TUI notice cap", async () => {
                 await acp.execute({ sessionID: "ses_acp_long" });
                 await until(() => fake.syntheticCalls.length === 1);
                 const desc = fake.syntheticCalls[0].description ?? "";
-                assert.ok(desc.length > 0 && desc.length <= 1024);
-                assert.match(desc, /\[panel truncated\]$/);
+                assert.ok(desc.length > 0 && desc.length <= 1024, `notice fits the TUI cap (${desc.length})`);
+                const webLine = "Web UI: http://127.0.0.1:9/__bili/#/session/ses_acp_long";
+                assert.ok(desc.startsWith(`${webLine}\n`), "Web UI deep link is the first line");
+                assert.equal(desc.match(/^Web UI: .+$/gm)!.length, 1, "link appears exactly once (deduped out of the panel body)");
+                const markerIdx = desc.indexOf("\n\n[panel truncated] ");
+                assert.ok(markerIdx > 0, "truncation marker present");
+                const lines = LONG_PANEL.split("\n");
+                const keptLines = desc.slice(0, markerIdx).split("\n");
+                assert.ok(keptLines.length >= 2 && keptLines.length - 1 < lines.length, "keeps a proper subset of leading panel lines after the link");
+                for (let i = 1; i < keptLines.length; i++) assert.equal(keptLines[i], lines[i - 1], `kept panel line ${i - 1} is verbatim`);
+                const m = desc.match(/\[panel truncated\] (\d+) more lines?$/);
+                assert.ok(m, "marker carries the dropped count");
+                assert.equal(Number(m![1]), lines.length - (keptLines.length - 1), "dropped count is exact");
                 assert.match(fake.syntheticCalls[0].text, /not an instruction/);
+            } finally {
+                cleanup();
+            }
+        });
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("v2 setup: /acp short panels render verbatim (#1602)", async () => {
+    const proxy = await startFakeProxyV2();
+    const fake = makeFakeCtx();
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: proxy.origin, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
+            try {
+                const acp = fake.addedCommands.find((c) => c.name === "acp")!;
+                await acp.execute({ sessionID: "ses_acp_1" });
+                await until(() => fake.syntheticCalls.length === 1);
+                assert.equal(fake.syntheticCalls[0].description, "ACP-PANEL-OK");
+            } finally {
+                cleanup();
+            }
+        });
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("v2 setup: /acp without a webUrl (older proxy) truncates plainly and still renders (#1602)", async () => {
+    const proxy = await startFakeProxyV2();
+    const fake = makeFakeCtx();
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: proxy.origin, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
+            try {
+                const acp = fake.addedCommands.find((c) => c.name === "acp")!;
+                await acp.execute({ sessionID: "ses_acp_noweb" });
+                await until(() => fake.syntheticCalls.length === 1);
+                const desc = fake.syntheticCalls[0].description ?? "";
+                assert.ok(desc.length > 0 && desc.length <= 1024, `notice fits the TUI cap (${desc.length})`);
+                assert.ok(!/^Web UI: /m.test(desc), "no fabricated link when the proxy sent none");
+                assert.match(desc, /\[panel truncated\] \d+ more lines$/);
             } finally {
                 cleanup();
             }
@@ -516,7 +579,7 @@ test("v2 setup: /acp-cache registered and renders the cache report via synthetic
     }
 });
 
-test("v2 /acp-cache: full flag maps to detail=full; long reports truncate at the report cap (#1146)", async () => {
+test("v2 /acp-cache: full flag maps to detail=full; long reports keep the leading link + whole lines (#1146, #1602)", async () => {
     const proxy = await startFakeProxyV2();
     const fake = makeFakeCtx();
     try {
@@ -532,8 +595,18 @@ test("v2 /acp-cache: full flag maps to detail=full; long reports truncate at the
                 await cache.execute({ sessionID: "ses_cache_long" });
                 await until(() => fake.syntheticCalls.length === 2);
                 const desc = fake.syntheticCalls[1].description ?? "";
-                assert.ok(desc.length <= 8192, `report cap holds (${desc.length})`);
-                assert.match(desc, /\[report truncated\]$/);
+                assert.ok(desc.length > 0 && desc.length <= 8192, `report cap holds (${desc.length})`);
+                const webLine = "Web UI: http://127.0.0.1:9/__bili/#/session/ses_cache_long";
+                assert.ok(desc.startsWith(`${webLine}\n`), "the report's leading Web UI link survives truncation");
+                const markerIdx = desc.indexOf("\n\n[report truncated] ");
+                assert.ok(markerIdx > 0, "truncation marker present");
+                const lines = `${webLine}\n\n${LONG_REPORT}`.split("\n");
+                const keptLines = desc.slice(0, markerIdx).split("\n");
+                assert.ok(keptLines.length >= 2 && keptLines.length < lines.length, "keeps a proper subset of leading lines");
+                keptLines.forEach((l, i) => assert.equal(l, lines[i], `kept line ${i} is verbatim`));
+                const m = desc.match(/\[report truncated\] (\d+) more lines?$/);
+                assert.ok(m, "marker carries the dropped count");
+                assert.equal(Number(m![1]), lines.length - keptLines.length, "dropped count is exact");
             } finally {
                 cleanup();
             }
@@ -849,4 +922,35 @@ test("#1362: V2 kill switch suppresses derivation reporting too", async () => {
     } finally {
         await reg.close();
     }
+});
+
+test("fitNoticeDescription: under-cap verbatim; overflow keeps whole lines, hoists the Web UI link, never exceeds max (#1602)", () => {
+    assert.equal(fitNoticeDescription("short panel", 1024, "panel"), "short panel");
+    assert.equal(fitNoticeDescription("short panel", 1024, "panel", "http://x"), "short panel", "under-cap text is untouched even with a webUrl");
+
+    const single = "z".repeat(3000);
+    const outSingle = fitNoticeDescription(single, 1024, "panel");
+    assert.ok(outSingle.length <= 1024, `single-line result fits (${outSingle.length})`);
+    assert.ok(outSingle.startsWith("zzzz"), "single-line overflow keeps a leading character slice");
+    assert.match(outSingle, /\n\n\[panel truncated\]$/);
+
+    const multi = Array.from({ length: 50 }, (_, i) => `line-${i}-${"q".repeat(20)}`).join("\n");
+    for (const max of [500, 1024, 8192]) {
+        const out = fitNoticeDescription(multi, max, "report");
+        assert.ok(out.length <= max, `multi-line result fits max=${max} (${out.length})`);
+        if (out.length === multi.length) continue;
+        const idx = out.indexOf("\n\n[report truncated] ");
+        assert.ok(idx > 0, `truncation marker present (max=${max})`);
+        out.slice(0, idx).split("\n").forEach((l, i) => assert.equal(l, multi.split("\n")[i], `kept line ${i} verbatim (max=${max})`));
+        const m = out.match(/\[report truncated\] (\d+) more lines?$/)!;
+        assert.equal(Number(m[1]), 50 - out.slice(0, idx).split("\n").length, `dropped count exact (max=${max})`);
+    }
+
+    // Hoist + dedup: a panel that already embeds a `Web UI:` line gets exactly one link, on line one.
+    const embedded = `${multi}\nWeb UI: http://old.example/#/session/s1`;
+    const hoisted = fitNoticeDescription(embedded, 500, "panel", "http://new.example/#/session/s1");
+    assert.ok(hoisted.startsWith("Web UI: http://new.example/#/session/s1\n"), "the provided webUrl leads the description");
+    assert.equal(hoisted.match(/^Web UI: .+$/gm)!.length, 1, "embedded link deduped, single occurrence");
+    assert.ok(!hoisted.includes("http://old.example"), "stale embedded link removed");
+    assert.ok(hoisted.length <= 500, `hoisted result fits (${hoisted.length})`);
 });

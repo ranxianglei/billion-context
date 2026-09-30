@@ -140,6 +140,35 @@ construction:
    principle above). A changed environment changes future turns, not the truth
    of past summaries.
 
+## Derived (child) sessions: lineage at birth (#1333, #1362)
+
+When an agent spawns a child session — a subagent or fork that starts from an
+empty history instead of resending the parent's conversation — that child
+could not previously `decompress` or `search_context` content that was folded
+away in the parent. Each lane now reports the lineage at birth: its identity
+registration carries the parent's conversation id (`parentConversationId`),
+and the proxy records a read-only link (`derivedFrom`) on the child session.
+From then on:
+
+- `decompress` / `search_context` fall back along the parent chain for
+  content the child never saw itself (resident or on-disk parents,
+  cycle-guarded, depth cap 8);
+- nothing is copied into the child's state and the parent is never modified —
+  fallback hits are read-only, so a child can never clobber what the parent
+  still owns;
+- if the parent is unknown to the proxy when the link is recorded, the child
+  simply starts fresh.
+
+| Lane | Parent signal |
+|---|---|
+| **pi** RLM inline spawn | `parentSession` in the session header (path to the parent session file, resolved to its session id) |
+| **omp** fork / newSession | `parentSession` in the session header (bare session id or file path — both accepted) |
+| **OpenCode V1** (native plugin) | SDK session info `parentID` (resolved once per session, cached) |
+| **OpenCode V2** (native plugin) | `session.created` event `data.parentID` |
+
+claude/codex/dsh need nothing here: they share one session id across
+subagents or have no child-session concept at all.
+
 ## Future direction
 
 The durable fix is a **client-side identity signal**: a stable

@@ -24,6 +24,7 @@ import { loadConversations, recordPluginSession, flushConversations } from "../s
 import { unpackDeadProxyUrlsInFile, liveProxyPorts, prepareDshHome } from "../src/launcher.ts";
 import { pluginInstall } from "../src/plugin-install.ts";
 import { setLogCapture } from "../src/logger.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 function tmpStateDir(): { dir: string; restore: () => void } {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-inst-state-"));
@@ -337,7 +338,7 @@ test("unpackDeadProxyUrlsInFile: dead-origin wraps unpacked, live-origin wraps k
         assert.match(out, /baseUrl: http:\/\/127\.0\.0\.1:9001\/bili\/https:\/\/keep\.example\.com\/v1/, "live-origin wrap kept");
     } finally {
         st.restore();
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -356,15 +357,15 @@ test("dsh overlay: nested generated settings.yaml is never promoted into the rea
         const real = fs.readFileSync(path.join(home, "settings.yaml"), "utf8");
         assert.ok(!real.includes("poisoned"), "real settings.yaml clean");
     } finally {
-        if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
-        fs.rmSync(home, { recursive: true, force: true });
+        if (tmp) rmrf(tmp);
+        rmrf(home);
         try {
-            fs.rmSync(overlay, { recursive: true, force: true });
+            rmrf(overlay);
         } catch {}
     }
 });
 
-test("plugin install: refuses to freeze a dead or missing proxy origin (#403)", () => {
+test("plugin install: codex block bakes no origin — nothing to freeze when the proxy is dead or missing (#403/#1660)", () => {
     const st = tmpStateDir();
     const prevCodex = process.env.CODEX_HOME;
     const prevEnv = process.env.BILI_MCP_PROXY;
@@ -372,20 +373,30 @@ test("plugin install: refuses to freeze a dead or missing proxy origin (#403)", 
     process.env.CODEX_HOME = home;
     delete process.env.BILI_MCP_PROXY;
     try {
-        assert.throws(() => pluginInstall("codex"), /no bili proxy origin found/);
-        atomicWriteInstanceFile(sampleInstance({ pid: deadPid() }));
-        assert.throws(() => pluginInstall("codex"), /is not running/);
-
-        atomicWriteInstanceFile(sampleInstance());
+        // #403 refused to bake a dead origin into the block. #1660 removes the
+        // baked origin entirely — the MCP shell discovers the live proxy at
+        // startup (env > instance file > 8787), so install succeeds even with
+        // no proxy running and freezes nothing.
         const msg = pluginInstall("codex");
         assert.match(msg, /codex:/);
-        const toml = fs.readFileSync(path.join(home, "config.toml"), "utf8");
-        assert.match(toml, /BILI_MCP_PROXY = "http:\/\/127\.0\.0\.1:8787"/);
+        let toml = fs.readFileSync(path.join(home, "config.toml"), "utf8");
+        assert.doesNotMatch(toml, /BILI_MCP_PROXY/);
+
+        atomicWriteInstanceFile(sampleInstance({ pid: deadPid() }));
+        pluginInstall("codex");
+        toml = fs.readFileSync(path.join(home, "config.toml"), "utf8");
+        assert.doesNotMatch(toml, /BILI_MCP_PROXY/);
+
+        atomicWriteInstanceFile(sampleInstance());
+        pluginInstall("codex");
+        toml = fs.readFileSync(path.join(home, "config.toml"), "utf8");
+        assert.doesNotMatch(toml, /BILI_MCP_PROXY/);
+        assert.match(toml, /bili/);
     } finally {
         if (prevCodex === undefined) delete process.env.CODEX_HOME;
         else process.env.CODEX_HOME = prevCodex;
         if (prevEnv !== undefined) process.env.BILI_MCP_PROXY = prevEnv;
         st.restore();
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });

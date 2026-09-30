@@ -1,7 +1,7 @@
 import type { CoreMessage } from "acp-kernel";
 import { coreToOpenai, injectOpenaiSystem } from "acp-kernel/wire";
-import { buildVisibilityMarker } from "../compress-loop.js";
-import { composeStreamFilters, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
+import { buildVisibilityMarker } from "./core.js";
+import { composeStreamFilters, createBiliArtifactFilter, createMarkerLineFilter, createTagEchoFilter } from "./tag-echo-filter.js";
 import { degenerateTurnWarning } from "../degenerate-turn.js";
 import { log as loggerLog } from "../logger.js";
 import { hardenOpenaiAssistantContent, systemToUser } from "../util.js";
@@ -56,6 +56,9 @@ interface ToolCallBuffer {
     id: string;
     name: string;
     arguments: string;
+    frags: number;
+    /** Set on first fragment: did THAT fragment carry the (first part of) the name? */
+    nameInFirst?: boolean;
 }
 
 async function* iterSseChunks(stream: ReadableStream<Uint8Array>): AsyncGenerator<string> {
@@ -127,7 +130,7 @@ function openaiCachedTokens(u: Record<string, unknown>): number | undefined {
     return undefined;
 }
 
-export function createOpenaiAdapter(requestBody: Record<string, unknown>, clientSystem?: string, absorbName?: string, notes?: string[]): CompressLoopAdapter {
+export function createOpenaiAdapter(requestBody: Record<string, unknown>, clientSystem?: string, absorbName?: string, notes?: string[], errorShape: "protocol" | "completion" = "protocol"): CompressLoopAdapter {
     const model = (requestBody.model as string) ?? "unknown";
     let responseId = `chatcmpl-proxy-${Date.now()}`;
     let toolIndex = 0;
@@ -210,16 +213,21 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
             return { ...body, messages: withNotes };
         },
 
-        async *parseStream(upstream, _round) {
+        async *parseStream(upstream, round) {
             const pending = new Map<number, ToolCallBuffer>();
             // #206: strip model-imitated render tags from content deltas; the
             // filter may hold back a short tail, flushed at finish/[DONE].
             const tagFilter = composeStreamFilters(
-                createTagEchoFilter((snippet) => {
-                    loggerLog("warn", `[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
-                }),
-                createMarkerLineFilter((snippet) => {
-                    loggerLog("warn", `[marker-echo] stripped model-emitted ACP confirmation marker: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                composeStreamFilters(
+                    createTagEchoFilter((snippet) => {
+                        loggerLog("warn", `[tag-echo] stripped model-emitted render tag: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                    }),
+                    createMarkerLineFilter((snippet) => {
+                        loggerLog("warn", `[marker-echo] stripped model-emitted ACP confirmation marker: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
+                    }),
+                ),
+                createBiliArtifactFilter((snippet) => {
+                    loggerLog("warn", `[bili-artifact] stripped model-emitted internal artifact: ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
                 }),
             );
             const flushFilter = function* (): Generator<ParsedStreamEvent> {
@@ -263,12 +271,13 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                     const args = typeof rawArgs === "string" ? rawArgs : (rawArgs !== null && typeof rawArgs === "object" ? JSON.stringify(rawArgs) : "");
                     let buf = pending.get(idx);
                     if (!buf) {
-                        buf = { index: idx, id, name, arguments: args };
+                        buf = { index: idx, id, name, arguments: args, frags: 1, nameInFirst: name.length > 0 };
                         pending.set(idx, buf);
                     } else {
                         if (id) buf.id = id;
                         buf.name += name;
                         buf.arguments += args;
+                        buf.frags += 1;
                     }
                 }
             };
@@ -294,6 +303,7 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
             // passthrough-flagged structured events so the loop counts them;
             // proxy calls → structured events (server-side execution).
             const settleToolCalls = function* (): Generator<ParsedStreamEvent> {
+                if (pending.size === 0) return;
                 const realIndexes = new Set<number>();
                 for (const [idx, tc] of pending) {
                     // absorb joins PROXY_TOOL_SET dynamically: its name is configurable per session,
@@ -301,6 +311,25 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                     if (tc.name.length > 0 && !PROXY_TOOL_SET.has(tc.name) && tc.name !== absorbName) realIndexes.add(idx);
                 }
                 sawRealToolCall = realIndexes.size > 0;
+                // #1484: per-call frame summary at the transform boundary so an
+                // upstream-vs-proxy bisection is possible when a client reports a
+                // malformed tool frame. Warn when any settled call has no accumulated
+                // name — exactly the shape clients reject at assembly.
+                {
+                    const parts: string[] = [];
+                    let anyNameless = false;
+                    for (const idx of [...pending.keys()].sort((a, b) => a - b)) {
+                        const tc = pending.get(idx)!;
+                        if (tc.name.length === 0) anyNameless = true;
+                        const disp = realIndexes.has(idx) ? "replayed" : tc.name.length === 0 ? "nameless" : "proxy";
+                        parts.push(`idx=${idx} name=${tc.name.length > 0 ? JSON.stringify(tc.name) : "<none>"}${tc.id ? ` id=${tc.id}` : ""} argsLen=${tc.arguments.length} frags=${tc.frags}${tc.nameInFirst === false ? " name-split" : ""} → ${disp}`);
+                    }
+                    yield {
+                        kind: "diag",
+                        level: anyNameless ? "warn" : "info",
+                        message: `[acp-openai] round ${round} tool-frame settle (${parts.length}): ${parts.join(" | ")}`,
+                    } as ParsedStreamEvent;
+                }
                 if (!sawRealToolCall) {
                     yield* flushPendingAsStructured();
                     return;
@@ -511,9 +540,21 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
         },
 
         emitError(message) {
+            // #1455: present the failure AS a failure (see the anthropic twin). The
+            // legacy shape — error text + finish_reason "stop" + [DONE] — read as a
+            // normal completion to clients and suppressed their retry logic. The
+            // default now rides the top-level `error` frame bili's own parser already
+            // recognizes (same shape #721's truncation path emits); compat.
+            // streamErrorShape="completion" restores the legacy shape.
+            if (errorShape === "completion") {
+                return Buffer.concat([
+                    buildContent(`\n[acp-proxy: ${message}]\n`),
+                    buildFinish("stop", null),
+                    Buffer.from("data: [DONE]\n\n", "utf8"),
+                ]);
+            }
             return Buffer.concat([
-                buildContent(`\n[acp-proxy: ${message}]\n`),
-                buildFinish("stop", null),
+                Buffer.from(`data: ${JSON.stringify({ error: { type: "server_error", code: "upstream_error", message: `[acp-proxy: ${message}]` } })}\n\n`, "utf8"),
                 Buffer.from("data: [DONE]\n\n", "utf8"),
             ]);
         },

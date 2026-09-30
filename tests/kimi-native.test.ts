@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { defaultConfig } from "acp-kernel";
@@ -30,6 +30,7 @@ import {
     unrouteKimi,
 } from "../src/kimi/native.ts";
 import { portableHookCommand, pluginInstall, pluginRemove, pluginStatusAll } from "../src/plugin-install.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 // #963: kimi native mode (plugin + per-session bootstrap). The config.toml
 // surgery is the user-facing safety surface (§7.3: never clobber, fail loud),
@@ -236,7 +237,7 @@ function fakeKimiHome(version: string | null): FakeHome {
             process.env.PATH = prevPath;
             if (prevHome === undefined) delete process.env.KIMI_CODE_HOME;
             else process.env.KIMI_CODE_HOME = prevHome;
-            rmSync(home, { recursive: true, force: true });
+            rmrf(home);
         },
     };
 }
@@ -382,7 +383,7 @@ test("bootstrapKimiNative routes config.toml through a live proxy, stamps, repor
         else process.env.BILI_CONFIG_FILE = prevCfgFile;
         proxy.closeAllConnections?.();
         await new Promise<void>((resolve, reject) => proxy.close((err) => (err ? reject(err) : resolve())));
-        rmSync(root, { recursive: true, force: true });
+        rmrf(root);
     }
 });
 
@@ -402,7 +403,7 @@ test("BILI_NATIVE_KIMI=0 leaves everything untouched (#963)", async () => {
         assert.equal(spawned, false);
         assert.equal(readFileSync(cfgPath, "utf8"), SAMPLE_CONFIG);
     } finally {
-        rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -417,6 +418,6 @@ test("bootstrapKimiNative attach waits for health and fails closed on a dead tar
         );
         assert.equal(readFileSync(cfgPath, "utf8"), SAMPLE_CONFIG);
     } finally {
-        rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });

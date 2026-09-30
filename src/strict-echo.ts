@@ -1,5 +1,5 @@
 import type { Session } from "./session.js";
-import type { OpenAIMessage } from "acp-kernel/wire";
+import type { OpenAIMessage, ResponseInputItem } from "acp-kernel/wire";
 import type { Logger } from "./logger.js";
 
 /** [#684] Strict-echo reasoning upstreams: DeepSeek documents that
@@ -53,18 +53,80 @@ export function normalizeStrictEchoReasoning(
     return patched > 0 ? out : messages;
 }
 
-/** [#762] Body-level twin for outbound paths that build the body WITHOUT going
- *  through prepareOpenai (the compress-loop re-request, src/loop/core.ts): the
- *  main-path repair in prepareOpenai never sees those bodies. Returns the same
- *  body object when disabled, when there is no messages array, or when nothing
- *  needed patching. */
+/** [#1479] Responses-wire twin of [#762]: a strict-echo gateway rejects an
+ *  assistant RUN (maximal consecutive stretch of reasoning / assistant message
+ *  / function_call / custom_tool_call items) that carries a tool call but no
+ *  reasoning item. Fold + kernel round-trip leave exactly that shape (the turn's
+ *  echo dies inside its fold range while a sibling call survives), and no
+ *  Responses equivalent of normalizeStrictEchoReasoning existed — the #762
+ *  repair only ever ran on chat-completions messages. Insert one blank reasoning
+ *  item at the start of each orphaned run; blank is what DeepSeek thinking mode
+ *  accepts (hermes-agent PR #15527). Gated on at least one reasoning item
+ *  existing anywhere in the input so non-thinking sessions are never touched.
+ *  Returns the input array unchanged when disabled or nothing needed patching. */
+export function normalizeStrictEchoResponsesInput(
+    input: ResponseInputItem[],
+    enabled: boolean,
+    log: Logger,
+    sessionId: string,
+): ResponseInputItem[] {
+    if (!enabled) return input;
+    let hasReasoning = false;
+    for (const it of input) {
+        if ((it as { type?: unknown })?.type === "reasoning") { hasReasoning = true; break; }
+    }
+    if (!hasReasoning) return input;
+    const insertAt = new Set<number>();
+    let runStart = -1;
+    let runCalls = 0;
+    let runReasoning = 0;
+    const closeRun = (): void => {
+        if (runStart >= 0 && runCalls > 0 && runReasoning === 0) insertAt.add(runStart);
+        runStart = -1;
+        runCalls = 0;
+        runReasoning = 0;
+    };
+    for (let i = 0; i < input.length; i++) {
+        const it = input[i] as { type?: unknown; role?: unknown } | undefined;
+        const t = typeof it?.type === "string" ? it.type : undefined;
+        // a call's output belongs to the same assistant turn as the call
+        const inRun = t === "reasoning" || t === "function_call" || t === "custom_tool_call" || t === "function_call_output" || t === "custom_tool_call_output" || (t === "message" && it?.role === "assistant");
+        if (!inRun) { closeRun(); continue; }
+        if (runStart < 0) runStart = i;
+        if (t === "function_call" || t === "custom_tool_call") runCalls++;
+        else if (t === "reasoning") runReasoning++;
+    }
+    closeRun();
+    if (insertAt.size === 0) return input;
+    const out: ResponseInputItem[] = [];
+    for (let i = 0; i < input.length; i++) {
+        if (insertAt.has(i)) out.push({ type: "reasoning", summary: [{ type: "summary_text", text: "" }] });
+        out.push(input[i]!);
+    }
+    log("info", `[${sessionId}] strict-echo-responses: injected ${insertAt.size} blank reasoning item(s) before tool-call run(s) missing their echo (#1479)`);
+    return out;
+}
+
+/** [#762,#1479] Body-level twin for outbound paths that build the body WITHOUT
+ *  going through prepareOpenai/prepareResponses (the compress-loop re-request,
+ *  src/loop/core.ts): the main-path repairs never see those bodies. Handles BOTH
+ *  wire shapes — chat-completions `messages[]` and Responses `input[]`. Returns
+ *  the same body object when disabled or when nothing needed patching. */
 export function normalizeStrictEchoBody(
     body: Record<string, unknown>,
     enabled: boolean,
     log: Logger,
     sessionId: string,
 ): Record<string, unknown> {
-    if (!enabled || !Array.isArray(body.messages)) return body;
-    const patched = normalizeStrictEchoReasoning(body.messages as OpenAIMessage[], true, log, sessionId);
-    return patched === body.messages ? body : { ...body, messages: patched };
+    if (!enabled) return body;
+    let out = body;
+    if (Array.isArray(body.messages)) {
+        const patched = normalizeStrictEchoReasoning(body.messages as OpenAIMessage[], true, log, sessionId);
+        if (patched !== body.messages) out = { ...out, messages: patched };
+    }
+    if (Array.isArray(body.input)) {
+        const patched = normalizeStrictEchoResponsesInput(body.input as ResponseInputItem[], true, log, sessionId);
+        if (patched !== body.input) out = { ...out, input: patched };
+    }
+    return out;
 }

@@ -117,13 +117,13 @@ test("plugin chat passthrough drops a chunk whose delta stripped to empty", asyn
     const session = makeSession();
     const events = [
         chatChunk({ content: "real answer" }),
-        chatChunk({ content: `${TAG_OPEN}m1${TAG_CLOSE}${TAG_OPEN}m2${TAG_CLOSE}` }),
+        chatChunk({ content: `${TAG_OPEN}m00123${TAG_CLOSE}${TAG_OPEN}m00124${TAG_CLOSE}` }),
         chatChunk({ content: "more" }),
         DONE,
     ];
     await pipePluginChatWithStrip(streamOf(events), res, "openai", session);
     const text = out.join("");
-    assert.ok(!text.includes("m1") && !text.includes("m2"), "echo-only chunk stripped");
+    assert.ok(!text.includes("m00123") && !text.includes("m00124"), "echo-only chunk stripped");
     const dataLines = text.split("\n").filter((l) => l.startsWith("data:")).filter((l) => !l.includes("[DONE]"));
     assert.equal(dataLines.length, 2, "echo-only chunk dropped; 'real answer' and 'more' forwarded");
     for (const l of dataLines) {
@@ -150,12 +150,12 @@ test("plugin chat passthrough still drops a chunk where every managed field is a
     const res = makeRes(out);
     const session = makeSession();
     const events = [
-        chatChunk({ content: `${TAG_OPEN}m1${TAG_CLOSE}`, reasoning_content: `${TAG_OPEN}m2${TAG_CLOSE}` }),
+        chatChunk({ content: `${TAG_OPEN}m00123${TAG_CLOSE}`, reasoning_content: `${TAG_OPEN}m00124${TAG_CLOSE}` }),
         DONE,
     ];
     await pipePluginChatWithStrip(streamOf(events), res, "openai", session);
     const text = out.join("");
-    assert.ok(!text.includes("m1") && !text.includes("m2"), "echoes stripped");
+    assert.ok(!text.includes("m00123") && !text.includes("m00124"), "echoes stripped");
     const dataLines = text.split("\n").filter((l) => l.startsWith("data:")).filter((l) => !l.includes("[DONE]"));
     assert.equal(dataLines.length, 0, "all-echo chunk dropped");
 });

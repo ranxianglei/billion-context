@@ -173,7 +173,10 @@ test("issue #221: degraded retry also rejected → error surfaced (visible failu
         );
         assert.equal(fetchCalls, 2, "one full attempt + one degraded attempt, then give up");
         assert.ok(out.includes("upstream error 400"), "error is visible to the client");
-        assert.ok(/"stop_reason":"end_turn"/.test(out), "stream still terminates cleanly");
+        // #1455: the exhausted-failure exit rides the protocol-native error
+        // channel; the round-1 real terminal above it stays intact.
+        assert.match(out, /^event: error$/m, "failure terminates on the error channel");
+        assert.match(out, /"code":"upstream_error"/, "error frame carries the upstream_error code");
     } finally {
         globalThis.fetch = orig;
     }

@@ -1,12 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { SessionStore } from "../src/persist.ts";
 import { Session, cacheBlockContent, snapshotMessages } from "../src/session.ts";
 import { renderHandoff } from "../src/export.ts";
 import { createInitialState, defaultCountTokens } from "acp-kernel";
+import { rmrf } from "./tmp-rm.ts";
 
 // readRecord() inspects raw on-disk session files directly (bypassing the
 // store codec), so pin the plain-JSON format: #1080 made BILIZSTD1 the default.
@@ -92,7 +93,7 @@ test("#401 persisted messages are a folded snapshot: covered originals dropped, 
             assert.ok(!msgs.some((m) => m.text?.includes("OLD-ORIGINAL-two")), "covered original text leaked");
             assert.ok(msgs.some((m) => m.text?.includes("TAIL-QUESTION")), "tail dropped");
         } finally {
-            rmSync(dir, { recursive: true, force: true });
+            rmrf(dir);
         }
     });
 });
@@ -121,7 +122,7 @@ test("#401 budget truncation keeps the newest whole messages and at least one su
             const total = msgs.reduce((acc, m) => acc + defaultCountTokens(m.text ?? ""), 0);
             assert.ok(total <= defaultCountTokens(`newest ${filler}`) + 1, `kept total ${total} exceeds the single-newest bound`);
         } finally {
-            rmSync(dir, { recursive: true, force: true });
+            rmrf(dir);
         }
     });
 });
@@ -150,7 +151,7 @@ test("#401 BILI_PERSIST_TAIL_TOKENS=0 disables message persistence entirely (v2-
             assert.match(md, /SUMMARY-MARKER/);
             assert.doesNotMatch(md, /hello/);
         } finally {
-            rmSync(dir, { recursive: true, force: true });
+            rmrf(dir);
         }
     });
 });
@@ -186,7 +187,7 @@ test("#401 restore + export: folded snapshot renders as-is (--full recovers orig
             assert.match(full, /OLD-ORIGINAL-two/, "--full must recover folded originals via blockContents");
             assert.match(full, /Original messages \(2\)/);
         } finally {
-            rmSync(dir, { recursive: true, force: true });
+            rmrf(dir);
         }
     });
 });

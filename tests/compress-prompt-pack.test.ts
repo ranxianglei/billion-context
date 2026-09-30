@@ -1,10 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { defaultPrompts, buildCompressSystemPrompt, ACP_TOOLS_OPENAI, applyAcpToolOverrides } from "acp-kernel";
 import { mergeCompress, resolveCompressSurface, resolveCompressSurfaceDetailed } from "../src/compress-settings.js";
+import { rmrf } from "./tmp-rm.ts";
 
 test("promptPack merges deepest-wins like every other field", () => {
     const merged = mergeCompress(
@@ -29,7 +30,7 @@ test("resolveCompressSurface: builtin lean resolves from the kernel registry", (
     const surface = resolveCompressSurface({ promptPack: "lean" });
     assert.equal(
         surface.toolPrompts?.compress?.description,
-        "Replace consumed conversation ranges with self-contained summaries using mNNNNN or bN refs.",
+        "Replace consumed conversation ranges with self-contained summaries using mNNNNN or bN refs; batch multiple ranges into ONE call (a single string may hold every range).",
     );
     assert.equal(surface.prompts, undefined);
     const tools = applyAcpToolOverrides(ACP_TOOLS_OPENAI, surface.toolPrompts);
@@ -53,7 +54,7 @@ test("resolveCompressSurface: file packs load from project dir, shadowing builti
         assert.equal(surface.toolPrompts?.acp_status?.description, "project lean");
         assert.equal(surface.toolPrompts?.compress?.description, undefined);
     } finally {
-        rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -72,7 +73,7 @@ test("resolveCompressSurface: nudge/prompt section overrides flow into the kerne
         assert.ok(prompt.includes("QUIET-TAGS"));
         assert.ok(!prompt.includes("COMPRESSION SUMMARIES IN CONTEXT"));
     } finally {
-        rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -83,7 +84,7 @@ test("resolveCompressSurfaceDetailed: pack identity travels with the surface", (
     const lean = resolveCompressSurfaceDetailed({ promptPack: "lean" });
     assert.equal(lean.packName, "lean");
     assert.equal(typeof lean.packVersion, "string");
-    assert.equal(lean.surface.toolPrompts?.compress?.description, "Replace consumed conversation ranges with self-contained summaries using mNNNNN or bN refs.");
+    assert.equal(lean.surface.toolPrompts?.compress?.description, "Replace consumed conversation ranges with self-contained summaries using mNNNNN or bN refs; batch multiple ranges into ONE call (a single string may hold every range).");
 });
 
 test("resolveCompressSurfaceDetailed: file pack reports the requested name and its version", () => {
@@ -97,6 +98,6 @@ test("resolveCompressSurfaceDetailed: file pack reports the requested name and i
         assert.equal(res.packName, "versioned");
         assert.equal(res.packVersion, "9.9.9");
     } finally {
-        rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });

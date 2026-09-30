@@ -13,6 +13,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync, spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
+import { rmrf } from "./tmp-rm.ts";
 
 const root = path.resolve(import.meta.dirname, "..");
 
@@ -44,7 +45,7 @@ test("import-only host: awaiting import of the entry runs no CLI", () => {
         assert.match(r.stdout, /HOST-IMPORT-OK/);
         assert.doesNotMatch(r.stdout + r.stderr, /bili:|port 8787|unknown command/);
     } finally {
-        fs.rmSync(box, { recursive: true, force: true });
+        rmrf(box);
     }
 });
 
@@ -60,7 +61,7 @@ test("import-only host under tsx: src entry equally inert", () => {
         assert.equal(r.code, 0, `stderr: ${r.stderr}`);
         assert.match(r.stdout, /HOST-IMPORT-OK/);
     } finally {
-        fs.rmSync(box, { recursive: true, force: true });
+        rmrf(box);
     }
 });
 

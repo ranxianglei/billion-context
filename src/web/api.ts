@@ -87,6 +87,7 @@ export async function handleConfigGet(res: ServerResponse): Promise<void> {
         upstreamProxyMode: upstream.mode,
         compress: config.compress ?? null,
         passthrough: passthroughState(process.env),
+        ...(existsSync(configFile()) ? { raw: readFileSync(configFile(), "utf8") } : {}),
         ...(parseError ? { parseError } : {}),
     }, null, 2));
 }
@@ -112,7 +113,47 @@ export async function handleConfigPut(
     const hasMode = Object.prototype.hasOwnProperty.call(body, "upstreamProxyMode");
     const hasCompress = Object.prototype.hasOwnProperty.call(body, "compress");
     const hasPassthrough = Object.prototype.hasOwnProperty.call(body, "passthrough");
-    if (!hasProviders && !hasProxy && !hasMode && !hasCompress && !hasPassthrough) return sendError(res, 400, "expected providers, upstream proxy, compress, or passthrough settings");
+    const hasFile = Object.prototype.hasOwnProperty.call(body, "file");
+    if (!hasProviders && !hasProxy && !hasMode && !hasCompress && !hasPassthrough && !hasFile) return sendError(res, 400, "expected providers, upstream proxy, compress, passthrough settings, or the full config file");
+    // Raw whole-file save (web config card): validate the known fields exactly like the
+    // structured payload, then replace the ENTIRE config — preserving unknown keys such
+    // as promptPack/ccr that per-field PUTs cannot touch.
+    if (hasFile) {
+        if (typeof body.file !== "string") return sendError(res, 400, "file must be a string (raw config JSON text)");
+        let next: ConfigShape;
+        try {
+            const p = JSON.parse(body.file);
+            if (!p || typeof p !== "object" || Array.isArray(p)) throw new Error("top level must be a JSON object");
+            next = p as ConfigShape;
+        } catch (error) {
+            return sendError(res, 400, `file is not valid JSON: ${String(error)}`);
+        }
+        if (next.providers !== undefined) {
+            if (typeof next.providers !== "object" || Array.isArray(next.providers)) return sendError(res, 400, "providers must be an object");
+            for (const [url, value] of Object.entries(next.providers as Record<string, unknown>)) {
+                const route = parseRouteEntry(value);
+                if (!url || !route) return sendError(res, 400, `invalid provider entry: ${url || "(empty)"}`);
+                try { validateHttpProxy(route.proxy, biliPort); } catch (error) { return sendError(res, 400, `invalid provider proxy for ${url}: ${String(error)}`); }
+            }
+        }
+        if (next.upstreamProxy !== undefined) {
+            if (next.upstreamProxy !== null && typeof next.upstreamProxy !== "string") return sendError(res, 400, "upstreamProxy must be a string or null");
+            try { validateHttpProxy(typeof next.upstreamProxy === "string" ? next.upstreamProxy.trim() || undefined : undefined, biliPort); } catch (error) { return sendError(res, 400, String(error)); }
+        }
+        if (next.upstreamProxyMode !== undefined && (typeof next.upstreamProxyMode !== "string" || !["auto", "manual", "direct"].includes(next.upstreamProxyMode))) return sendError(res, 400, "upstreamProxyMode must be auto, manual, or direct");
+        if (next.compress !== undefined && next.compress !== null && parseCompressSettings(next.compress) === undefined) return sendError(res, 400, "invalid compress settings");
+        if (next.passthrough !== undefined && next.passthrough !== null && typeof next.passthrough !== "boolean") return sendError(res, 400, "passthrough must be a boolean or null");
+        if (next.passthrough === true && passthroughState(process.env).source === "env") return sendError(res, 409, "passthrough is forced by the ACP_PASSTHROUGH environment variable (or --passthrough flag); unset it and restart to change here");
+        try {
+            atomicWriteConfig(next);
+            onChanged?.();
+        } catch (error) {
+            return sendError(res, 500, `failed to apply config: ${String(error)}`);
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, applied: ["config file"] }, null, 2));
+        return;
+    }
 
     const routes: Record<string, ProviderRoute> = {};
     if (hasProviders) {

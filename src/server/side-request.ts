@@ -11,9 +11,18 @@ import { type ResolvedImageBilling } from "../image-tokens.js";
 // output budget from their raw (uncompressed) history shrink max_tokens to
 // <=200 on long sessions; that must never demote the request to a side pass
 // (title-gen requests never carry tools).
+// #1699: explicit host intent outranks the budget heuristic. opencode v2 sends
+// title-gen WITHOUT max_tokens (options {} for kind==="title"), so the budget
+// path below can never see it; the host stamps its persona id
+// (x-bili-plugin-agent) and a known side-request agent is a side req by
+// definition regardless of budget.
 export const SIDE_REQUEST_MAX_TOKENS = 200;
-export function isSideRequest(parsed: unknown): boolean {
+// Persona ids whose requests are side requests by intent (#1699). Main personas
+// (build/plan/general/...) are deliberately absent — they are real turns.
+export const SIDE_REQUEST_AGENTS: ReadonlySet<string> = new Set(["title"]);
+export function isSideRequest(parsed: unknown, requestAgent?: string): boolean {
     if (!parsed || typeof parsed !== "object") return false;
+    if (requestAgent !== undefined && SIDE_REQUEST_AGENTS.has(requestAgent)) return true;
     const p = parsed as Record<string, unknown>;
     if (Array.isArray(p.tools) && p.tools.length > 0) return false;
     const field = outputBudgetField(parsed);
@@ -72,6 +81,7 @@ export function restoreOutputBudget(
     parsed: unknown,
     session: { id: string; metadata: Record<string, unknown> },
     log: (level: string, msg: string) => void,
+    configuredOutputLimit?: number,
 ): void {
     const field = outputBudgetField(parsed);
     if (!field) return;
@@ -83,10 +93,26 @@ export function restoreOutputBudget(
         return;
     }
     if (!Array.isArray(p.tools) || p.tools.length === 0) return;
-    const highWater = session.metadata.outputBudgetHighWater;
-    if (typeof highWater === "number" && highWater > SIDE_REQUEST_MAX_TOKENS) {
-        writeOutputBudget(p, field, highWater);
-        log("info", `[${session.id}] output budget restored ${value} -> ${highWater} (#546: client shrank it from its raw-history estimate)`);
+    const highWaterRaw = session.metadata.outputBudgetHighWater;
+    const highWater = typeof highWaterRaw === "number" && highWaterRaw > SIDE_REQUEST_MAX_TOKENS ? highWaterRaw : undefined;
+    // #1665: the remembered water mark can itself be pathologically low — a
+    // client that sizes its budget from RAW history decays through small
+    // positive values (…, 680, 234) before starving at <=200, so "last
+    // non-starved wins" ends holding a death rattle; a session first opened
+    // into bili with an already-oversized history never seeds anything at all.
+    // Floor the restore target at the operator-declared model output limit
+    // (ModelEntry.output, #924 surface) so a broken client cannot pin the
+    // session at a few hundred tokens forever. The #453 clamp downstream
+    // still bounds the result by real window headroom.
+    let target = highWater;
+    const floor = typeof configuredOutputLimit === "number" && configuredOutputLimit > SIDE_REQUEST_MAX_TOKENS ? configuredOutputLimit : undefined;
+    if (floor !== undefined && (target === undefined || floor > target)) target = floor;
+    if (typeof target === "number") {
+        writeOutputBudget(p, field, target);
+        const note = target === floor && floor !== undefined
+            ? (highWater === undefined ? "; no healthy high-water yet — using configured output limit (#1665)" : `; high-water ${highWater} below configured output limit — floored (#1665)`)
+            : "";
+        log("info", `[${session.id}] output budget restored ${value} -> ${target} (#546: client shrank it from its raw-history estimate${note})`);
     }
 }
 

@@ -362,3 +362,130 @@ test("openai loop: same-frame compress args execute, not missing-content (#1306)
         globalThis.fetch = originalFetch;
     }
 });
+
+// 11. #1484: every settle emits a per-call frame summary so an
+//      upstream-vs-proxy bisection is possible when a client reports a
+//      malformed tool frame. Well-formed real tool → info level.
+test("openai adapter: tool-frame settle emits a per-call summary (#1484)", async () => {
+    const stream = mockStream(
+        sseChunk({ role: "assistant" }),
+        sseChunk({ tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "get_weather", arguments: "" } }] }),
+        sseChunk({ tool_calls: [{ index: 0, function: { arguments: '{"city":"SF"}' } }] }, "tool_calls"),
+    );
+    const events = await collect(stream);
+    const diags = events.filter((e) => e.kind === "diag");
+    assert.equal(diags.length, 1, "exactly one settle summary");
+    const d = diags[0];
+    assert.ok(d?.kind === "diag");
+    assert.equal(d.level, "info");
+    assert.match(d.message, /\[acp-openai\] round 1 tool-frame settle \(1\)/);
+    assert.match(d.message, /idx=0 name="get_weather" id=call_1 argsLen=13 frags=2 → replayed/);
+});
+
+// 12. #1484: a tool call whose function.name never arrived settles as
+//      nameless — the summary flags it at warn level instead of staying
+//      silent; structured bookkeeping keeps the accumulated state so
+//      core.ts can adjudicate (and log) the drop.
+test("openai adapter: nameless tool_call settles with a warn-level summary (#1484)", async () => {
+    const stream = mockStream(
+        sseChunk({ role: "assistant" }),
+        sseChunk({ tool_calls: [{ index: 0, id: "call_x", type: "function", function: { arguments: '{"a":' } }] }),
+        sseChunk({ tool_calls: [{ index: 0, function: { arguments: "1}" } }] }, "tool_calls"),
+    );
+    const events = await collect(stream);
+    const diag = events.find((e) => e.kind === "diag");
+    assert.ok(diag?.kind === "diag", "settle summary present");
+    assert.equal(diag.level, "warn");
+    assert.match(diag.message, /idx=0 name=<none> id=call_x argsLen=7 frags=2 name-split → nameless/);
+    const tc = events.find((e) => e.kind === "tool_call");
+    assert.ok(tc?.kind === "tool_call", "structured bookkeeping unchanged");
+    assert.equal(tc.name, "");
+    assert.equal(tc.callId, "call_x");
+});
+
+// 13. REGRESSION (#1484): upstream emitted a tool call whose function.name
+//     never arrived. Pre-fix, core.ts mis-adjudicated it as a real
+//     client-bound call and synthesized a frame carrying function.name:"" —
+//     the AI SDK rejected it (AI_InvalidResponseDataError) and the whole
+//     turn died. Now: dropped loudly; the rest of the turn survives intact.
+test("openai loop: nameless upstream tool call is dropped, not forwarded (#1484)", async () => {
+    const ctx = makeLoopCtx();
+    const logs: string[] = [];
+    ctx.log = (m) => logs.push(m);
+    const round1 = mockStream(
+        sseChunk({ role: "assistant" }),
+        sseChunk({ content: "thinking out loud" }),
+        sseChunk({ tool_calls: [{ index: 0, id: "call_x", type: "function", function: { arguments: '{"a":' } }] }),
+        sseChunk({ tool_calls: [{ index: 0, function: { arguments: "1}" } }] }, "tool_calls"),
+    );
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => new Response(`data: [DONE]\n\n`, { status: 200 })) as typeof fetch;
+    try {
+        const chunks: Buffer[] = [];
+        for await (const chunk of runCompressLoop(
+            round1,
+            ctx,
+            { model: "gpt", stream: true },
+            { url: "http://mock", headers: {} },
+            createOpenaiAdapter({ model: "gpt" }),
+            buildCompressSystemPrompt(),
+        )) chunks.push(chunk);
+        const output = Buffer.concat(chunks).toString("utf8");
+        assert.doesNotMatch(output, /"tool_calls":\[/, "no client-bound tool_call frame for the nameless call");
+        assert.doesNotMatch(output, /"name":""/);
+        assert.match(output, /thinking out loud/, "prose of the same turn survives");
+        assert.ok(logs.some((l) => l.includes("dropping nameless tool call")), "the drop is logged");
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
+// 14. #1484 side effect: a nameless sibling used to count as a "real"
+//     client-bound call, which blocked the continuation re-request after a
+//     proxy compress executed (reRequest requires realCalls === 0). The
+//     dropped call must not take the re-request down with it.
+test("openai loop: nameless sibling cannot block the compress re-request (#1484)", async () => {
+    const ctx = makeLoopCtx();
+    ctx.messages = Array.from({ length: 12 }, (_, i): CoreMessage => ({
+        id: `a${i + 1}`,
+        role: i % 2 === 0 ? "user" : "assistant",
+        contentType: "text",
+        text: `msg-${i + 1}-` + "x".repeat(6000),
+    }));
+    ctx.session.state.messageRefs = assignRefs(ctx.messages, { existing: emptyRefMap(), nextIndex: 0 }).map;
+
+    const round1 = mockStream(
+        sseChunk({ role: "assistant" }),
+        sseChunk({ tool_calls: [{ index: 0, id: "call_c", type: "function", function: { name: "compress", arguments: "" } }] }),
+        sseChunk({ tool_calls: [{ index: 1, id: "call_x", type: "function", function: { arguments: '{"a":1}' } }] }),
+        sseChunk(
+            { tool_calls: [{ index: 0, function: { arguments: JSON.stringify({ content: [{ startId: "m00001", endId: "m00006", summary: "Preserve every decision, file path and exact value in this range for the regression test." }] }) } }] },
+            "tool_calls",
+        ),
+    );
+    const originalFetch = globalThis.fetch;
+    let refetches = 0;
+    globalThis.fetch = (async () => {
+        refetches++;
+        return new Response(
+            `data: ${JSON.stringify({ id: "c2", object: "chat.completion.chunk", created: 1, model: "gpt", choices: [{ index: 0, delta: { content: "ok" }, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`,
+            { status: 200 },
+        );
+    }) as typeof fetch;
+    try {
+        const chunks: Buffer[] = [];
+        for await (const chunk of runCompressLoop(
+            round1,
+            ctx,
+            { model: "gpt", stream: true },
+            { url: "http://mock", headers: {} },
+            createOpenaiAdapter({ model: "gpt" }),
+            buildCompressSystemPrompt(),
+        )) chunks.push(chunk);
+        const output = Buffer.concat(chunks).toString("utf8");
+        assert.match(output, /Compressed m00001/, "compress executed despite the nameless sibling");
+        assert.equal(refetches, 1, "re-request proceeds despite the nameless sibling");
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});

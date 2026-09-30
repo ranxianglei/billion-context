@@ -3,10 +3,11 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { AddressInfo } from "node:net";
+import { rmrf } from "./tmp-rm.ts";
 
 /** #1322 counterpart of watchdog-health.test.ts: a proxy started WITHOUT
  *  BILI_PARENT_PID is a daemon — its health must say `armed:false` and it must
@@ -99,6 +100,6 @@ test("health exposes an unarmed watchdog on a daemon proxy; registration stays r
         proxy.closeAllConnections?.();
         await new Promise<void>((r) => proxy.close(() => r()));
         try { keeper.kill("SIGKILL"); } catch {}
-        await rmSync(root, { recursive: true, force: true });
+        await rmrf(root);
     }
 });

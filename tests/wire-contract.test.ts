@@ -92,6 +92,11 @@ test("wire-contract ledger: every rule has a live enforcement clause", () => {
             { tools: [{ name: "t", input_schema: { properties: {} } }] },
             { tools: [{ name: "bad name!", input_schema: { type: "object", properties: {} } }] },
             { model: "m", max_tokens: 1, messages: [], prompt_cache_key: "sess" },
+            {
+                system: [{ type: "text", text: "s", cache_control: { type: "ephemeral" } }],
+                tools: [{ name: "t", input_schema: { type: "object", properties: {} }, cache_control: { type: "ephemeral" } }],
+                messages: [1, 2, 3].map((i) => ({ role: "user", content: [{ type: "text", text: `x${i}`, cache_control: { type: "ephemeral" } }] })),
+            },
         ],
         "openai-chat": [
             { model: "gemini-synthetic", tools: [{ type: "function", function: { name: "compress", parameters: { type: "object", properties: { content: { type: ["array", "string"] } } } } }] },
@@ -102,6 +107,7 @@ test("wire-contract ledger: every rule has a live enforcement clause", () => {
             { tools: [{ type: "function", name: "bad name", parameters: { type: "object", properties: {} } }] },
             { tools: [{ type: "function", name: "ok", parameters: { type: "array" } }] },
             { tools: [{ type: "function", name: "ok", parameters: { type: "object", properties: {}, anyOf: [] } }] },
+            { tools: [], input: [{ type: "function_call", id: "fc-1", call_id: "c1", name: "f", arguments: "{}" }] },
         ],
         google: [
             { tools: [{ functionDeclarations: [{ name: "bad-name", parameters: { type: "object", properties: {} } }] }] },

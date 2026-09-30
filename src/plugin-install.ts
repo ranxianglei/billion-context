@@ -37,8 +37,8 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { applyEdits, modify as jsoncModify, parse as jsoncParse, type ParseError } from "jsonc-parser";
 import { resolveDshHome, resolveHermesHome, resolveKimiHome, resolvePiHome } from "./client-config.js";
-import { clearClaudeNativePort, resolveClaudeNativePort, saveClaudeNativePort } from "./config.js";
-import { isPidAlive, isProxyInstanceFile, readProxyInstanceFile } from "./instance.js";
+import { resolveClaudeNativePort } from "./config.js";
+import { lanePreferredPort } from "./instance.js";
 import { DSH_PACKAGE, dshBundleInstalled, dshHasLegacyManagedBlock, dshProfileDependsOnBili, dshProfileDepSpec, dshProfileDirs, isRegistryDepSpec, planDshSpawn, refreshDshProfileBundles, runDshPlugin, stripLegacyManagedBlock } from "./dsh-channel.js";
 import { fetchRegistryVersion } from "./update.js";
 import { restoreKimiBackup, unrouteKimi } from "./kimi/native.js";
@@ -77,23 +77,6 @@ export function portableHookCommand(exe: string, args: string[] = []): string {
     const head = fwd(exe);
     const tail = args.map((a) => quoteArg(fwd(a)));
     return /\s/.test(head) ? [`& "${head}"`, ...tail].join(" ") : [head, ...tail].join(" ");
-}
-
-/** #403: never freeze a dead or unverifiable origin into a client's
- *  persistent config — the MCP shell would dial it forever. An explicit
- *  BILI_MCP_PROXY env wins (the user said so); otherwise a recorded
- *  instance must be pid-alive. */
-function proxyOriginForInstall(): string {
-    const fromEnv = process.env.BILI_MCP_PROXY?.trim();
-    if (fromEnv && fromEnv.length > 0) return fromEnv;
-    const inst = readProxyInstanceFile();
-    if (inst === undefined) {
-        throw new Error("no bili proxy origin found — start bili first (\`bili start\` or \`bili <client>\`), then retry, or set BILI_MCP_PROXY explicitly");
-    }
-    if (isProxyInstanceFile(inst) && !isPidAlive(inst.pid)) {
-        throw new Error(`the recorded bili proxy (pid ${inst.pid}, ${inst.origin}) is not running — start bili and retry so a dead origin is not frozen into the client config`);
-    }
-    return inst.origin;
 }
 
 export const PLUGIN_AGENTS = ["pi", "omp", "claude", "codex", "opencode", "dsh", "kimi", "hermes", "zcode"] as const;
@@ -499,11 +482,51 @@ export function isBiliClaudeBaseUrl(value: unknown): boolean {
 }
 
 export function claudeNativeBaseUrl(env: NodeJS.ProcessEnv = process.env): string {
-    const origin = `http://127.0.0.1:${resolveClaudeNativePort(env)}`;
+    const origin = `http://127.0.0.1:${resolveClaudeNativePort(env) ?? lanePreferredPort("claude", env)}`;
+    return claudeNativeBaseUrlForOrigin(origin, undefined, env);
+}
+
+/** #1660: the wrapped base URL for an arbitrary live origin — the
+ *  SessionStart hook's drift-repair path (the managed block must follow the
+ *  lane's zone-drifted port). `upstream`, when given, overrides the default
+ *  resolution (BILI_CLAUDE_UPSTREAM > https://api.anthropic.com) — pass the
+ *  UNWRAPPED value of the current settings URL to preserve a relay an
+ *  earlier install baked in. */
+export function claudeNativeBaseUrlForOrigin(origin: string, upstream: string | undefined, env: NodeJS.ProcessEnv = process.env): string {
     const relay = env.BILI_CLAUDE_UPSTREAM?.trim();
-    const upstream = (relay && relay.length > 0 ? relay : "https://api.anthropic.com").replace(/\/+$/, "");
-    const prefix = origin + "/bili/";
-    return upstream.startsWith(prefix) ? upstream : prefix + upstream;
+    const base = (upstream !== undefined && upstream.length > 0
+        ? upstream
+        : relay && relay.length > 0
+          ? relay
+          : "https://api.anthropic.com").replace(/\/+$/, "");
+    const prefix = origin.replace(/\/+$/, "") + "/bili/";
+    return base.startsWith(prefix) ? base : prefix + base;
+}
+
+/** The inverse of the wrap: strip a bili wrapper (any loopback port) from a
+ *  base URL. Returns undefined for anything not written by us. */
+export function unwrapBiliBaseUrl(value: string): string | undefined {
+    const m = /^http:\/\/127\.0\.0\.1:\d{1,5}\/bili\/(https?:\/\/.+)$/.exec(value);
+    return m ? m[1] : undefined;
+}
+
+/** #1660: SessionStart drift-repair — repin the managed block's
+ *  ANTHROPIC_BASE_URL to `origin` (the lane's live zone port, which the +1
+ *  ladder may have drifted off the last install's baked port). The wrapped
+ *  upstream is PRESERVED from the current value unless BILI_CLAUDE_UPSTREAM
+ *  overrides it; a foreign ANTHROPIC_BASE_URL is never touched (same rule as
+ *  install). Also upserts the SessionStart hook, keeping a stale command
+ *  fresh across upgrades. Returns the change notes for the hook's log;
+ *  never throws, and writes only when the file actually changes. */
+export function repinClaudeManagedBaseUrl(origin: string, env: NodeJS.ProcessEnv = process.env): string[] {
+    const file = claudeSettingsFile(env);
+    const settings = readJson(file);
+    const cur = (settings.env as Record<string, unknown> | undefined)?.ANTHROPIC_BASE_URL;
+    const baseUrl = claudeNativeBaseUrlForOrigin(origin, typeof cur === "string" ? unwrapBiliBaseUrl(cur) : undefined, env);
+    const hookCommand = portableHookCommand(process.execPath, [path.join(selfPackageRoot(), "dist", "claude-native-bootstrap.js")]);
+    const { data, notes } = applyClaudeManagedBlock(settings, { baseUrl, hookCommand });
+    if (JSON.stringify(data) !== JSON.stringify(settings)) writeJson(file, data);
+    return notes;
 }
 
 /** Pure merge of the #964 managed block into parsed settings (install path).
@@ -647,16 +670,23 @@ function runClaudeCli(claude: string, args: string[]): void {
  *  never consults PATHEXT, so a bare `claude` (→ claude.cmd / claude.exe)
  *  would ENOENT before runClaudeCli ever sees the .cmd. Uses where.exe; on
  *  failure or non-Windows the input is returned untouched (the original
- *  ENOENT error stays truthful). */
-export function resolveClaudeCli(claude: string): string {
-    if (process.platform !== "win32" || /[\\/]/.test(claude) || /\.[a-z]+$/i.test(claude)) return claude;
+ *  ENOENT error stays truthful). The resolver is injectable so tests never
+ *  depend on a real where.exe spawn finishing in time (#1445). */
+export function resolveClaudeCli(claude: string, where?: (name: string) => { stdout: string | null }): string {
+    if (/[\\/]/.test(claude) || /\.[a-z]+$/i.test(claude)) return claude;
+    const run = where ?? (process.platform === "win32" ? defaultWhereRunner : undefined);
+    if (!run) return claude;
     try {
-        const r = spawnSync("where.exe", [claude], { stdio: ["ignore", "pipe", "ignore"], timeout: 5000, encoding: "utf8", windowsHide: true });
-        const first = (r.stdout ?? "").split(/\r?\n/).find((l) => l.trim().length > 0)?.trim();
+        const first = (run(claude).stdout ?? "").split(/\r?\n/).find((l) => l.trim().length > 0)?.trim();
         return first && first.length > 0 ? first : claude;
     } catch {
         return claude;
     }
+}
+
+function defaultWhereRunner(name: string): { stdout: string | null } {
+    const r = spawnSync("where.exe", [name], { stdio: ["ignore", "pipe", "ignore"], timeout: 5000, encoding: "utf8", windowsHide: true });
+    return { stdout: r.stdout ?? null };
 }
 
 function claudeInstall(): string {
@@ -670,13 +700,14 @@ function claudeInstall(): string {
     requireDistFile(bootstrapJs);
 
     // Managed block first: the static URL + bootstrap hook + compaction off.
-    // #964: persist the resolved port into the bili config too — the
-    // SessionStart hook does NOT inherit claude's settings.env, so without a
-    // persisted copy an env-driven port (BILI_CLAUDE_NATIVE_PORT=48790)
-    // would live only in settings.json while the hook resolves the default
-    // and brings the proxy up on the WRONG port.
-    const nativePort = resolveClaudeNativePort();
-    saveClaudeNativePort(nativePort);
+    // #964/#1660: the baked URL uses the explicit override
+    // (BILI_CLAUDE_NATIVE_PORT / claude.nativePort) when set — which also
+    // makes every later hook launch strict-port — else the current zone
+    // preference (sticky record > 18787 base). An explicit env-driven port
+    // can no longer desync from the hook: both resolve through
+    // resolveClaudeNativePort(), and the SessionStart hook's repin pass
+    // rewrites the baked URL to the live origin anyway (#1660).
+    const nativePort = resolveClaudeNativePort() ?? lanePreferredPort("claude");
     const file = claudeSettingsFile();
     const settings = readJson(file);
     const hookCommand = portableHookCommand(process.execPath, [bootstrapJs]);
@@ -717,7 +748,6 @@ function claudeInstall(): string {
 
 function claudeRemove(): string {
     const parts: string[] = [];
-    clearClaudeNativePort();
     const file = claudeSettingsFile();
     const settings = readJson(file);
     const { data, removed } = stripClaudeManagedBlock(settings);
@@ -802,7 +832,11 @@ function codexToml(): string {
 }
 
 function codexBlock(): string {
-    return `\n[mcp_servers.bili]\ncommand = ${JSON.stringify(process.execPath)}\nargs = [${JSON.stringify(path.join(selfPackageRoot(), "dist", "mcp.js"))}]\nenv = { BILI_MCP_PROXY = ${JSON.stringify(proxyOriginForInstall())} }\n`;
+    // #1660: no baked origin — the MCP shell discovers the live proxy at
+    // startup (env > live instance file > 8787 user-zone default), so the
+    // block never goes stale when the proxy's port drifts or the machine
+    // reboots. BILI_MCP_PROXY in the user's environment still wins.
+    return `\n[mcp_servers.bili]\ncommand = ${JSON.stringify(process.execPath)}\nargs = [${JSON.stringify(path.join(selfPackageRoot(), "dist", "mcp.js"))}]\n`;
 }
 
 function malformedCodexArgs(block: string): boolean {
@@ -1104,7 +1138,7 @@ export function applyOpencodePluginEntry(args: { data: Record<string, unknown>; 
     }
     // Exactly our one entry, already the right form — nothing to migrate:
     // leave the key (and the file) untouched.
-    if (replaced.length === 1 && replaced[0] === entry) return ["plugin present"];
+    if (replaced.length === 1 && replaced[0] === entry) return [`${key} present`];
     if (Array.isArray(raw)) {
         data[key] = [...raw.filter((x) => !isOurs(x)), entry];
     } else if (raw !== null && typeof raw === "object") {

@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { dumpRejectedBody } from "../src/error-dump.js";
 import { setLogCapture } from "../src/logger.js";
+import { rmrf } from "./tmp-rm.ts";
 
 // #762: failure-triggered dump of the exact forwarded body on upstream 4xx.
 
@@ -31,7 +32,7 @@ after(() => {
     restoreDumpEnv();
     if (savedDir === undefined) delete process.env.ACP_DUMP_DIR;
     else process.env.ACP_DUMP_DIR = savedDir;
-    fs.rmSync(dir, { recursive: true, force: true });
+    rmrf(dir);
 });
 
 function errFiles(): string[] {

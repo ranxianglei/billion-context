@@ -6,6 +6,7 @@ import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
 import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, _resetRegisterForTest, _setSpawnForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _noteRoutedForTest, _resetRoutedForTest } from "../src/agent/dsh-native.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 // #1365: legacy dead-attach suites must not pay the 5s routed-evidence grace
 // default (waitFor below caps at 5s — a full grace would race it). Pinned-path
@@ -63,7 +64,7 @@ test("stripLegacyManagedBlock: restores the placeholder when nothing meaningful 
         assert.equal(fs.readFileSync(path.join(dir, "cordis.patch.yml"), "utf8"), `${HEADER}[]\n`);
         assert.equal(stripLegacyManagedBlock(dir), false);
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -80,7 +81,7 @@ test("stripLegacyManagedBlock: preserves user entries; leaves non-managed files 
         assert.equal(stripLegacyManagedBlock(dir), false);
         assert.equal(fs.readFileSync(path.join(dir, "cordis.patch.yml"), "utf8"), `${HEADER}[]\n`);
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -95,7 +96,7 @@ test("stripLegacyManagedBlock: preserves user comments when nothing meaningful r
         assert.ok(out.includes("[]"));
         assert.ok(!out.includes(DSH_PATCH_BEGIN));
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -194,7 +195,7 @@ test("dsh install drives the dsh plugin channel per profile, no managed blocks w
         });
     } finally {
         _setDshRunnersForTest(undefined);
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -229,7 +230,7 @@ test("dsh remove uninstalls through the same channel and migrates legacy blocks"
         });
     } finally {
         _setDshRunnersForTest(undefined);
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -245,7 +246,7 @@ test("dsh install surfaces channel failures with context", async () => {
         });
     } finally {
         _setDshRunnersForTest(undefined);
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -272,7 +273,7 @@ test("dsh status: bundle / mixed / legacy / absent", async () => {
             assert.match(st(), /legacy managed block — rerun 'bili plugin install dsh' to migrate/);
         });
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -296,7 +297,7 @@ test("dshNativeInstalled: true iff any profile has the bundle or a legacy manage
             assert.equal(dshNativeInstalled(), false);
         });
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -312,7 +313,7 @@ test("dshBundleInstalled: true iff the profile manifest lists billion-context as
         fs.writeFileSync(path.join(home, "web", "package.json"), JSON.stringify({ dsh: { profile: { bundles: ["billion-context"] } } }));
         assert.equal(dshBundleInstalled(path.join(home, "web")), true);
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -328,7 +329,7 @@ test("dshProfileDirs: skips node_modules, errors when profiles root is absent", 
             assert.ok(dirs[0].endsWith("headless"));
         });
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -418,7 +419,10 @@ async function waitFor(cond: () => boolean, what: string): Promise<void> {
 
 function mockCtx() {
     const tools: RegisteredTool[] = [];
-    const commands: Array<{ name: string; handler: () => Promise<{ kind: string; text: string }> }> = [];
+    // #1677: handlers may receive the host-passed invocation (carrying the invoking
+    // agent's session id); tests call them with or without it to cover both paths.
+    type CmdInvocation = { agent?: { session?: { id?: unknown } } };
+    const commands: Array<{ name: string; handler: (invocation?: CmdInvocation) => Promise<{ kind: string; text: string }> }> = [];
     let initiator: { session?: { id?: unknown } } | undefined = undefined;
     // #955 runtime-info sources: tests can attach llm/agentDefaultModel and
     // replay them through the same dynamic ctx.inject path production uses.
@@ -426,7 +430,7 @@ function mockCtx() {
     let agentDefaultModel: { currentSelection?: () => { provider?: string; model?: string } | undefined } | undefined = undefined;
     return {
         tools: { register: (t: RegisteredTool) => tools.push(t) },
-        commands: { register: (c: { name: string; handler: () => Promise<{ kind: string; text: string }> }) => commands.push(c) },
+        commands: { register: (c: { name: string; handler: (invocation?: { agent?: { session?: { id?: unknown } } }) => Promise<{ kind: string; text: string }> }) => commands.push(c) },
         agents: { currentInitiator: () => initiator },
         setInitiator: (i: { session?: { id?: unknown } } | undefined) => (initiator = i),
         registeredTools: tools,
@@ -501,7 +505,7 @@ test("apply() attach mode: registers manifest tools verbatim, gates headers, for
         });
     } finally {
         proxy.close();
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
         _resetRegisterForTest(undefined);
     }
 });
@@ -531,6 +535,134 @@ test("apply() /acp-cache (#1146): forwards acp_cache bound to the initiator sess
                 const latest = await cacheCmd.handler();
                 assert.equal(latest.kind, "success");
                 assert.deepEqual(calls, [{ conversationId: "conv-latest", tool: "acp_cache", args: {} }]);
+            } finally {
+                cap.close();
+                _resetRegisterForTest(undefined);
+            }
+        });
+    } finally {
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+    }
+});
+
+// #1677: the command executor hands the invoking agent to the handler via the
+// invocation; the command path carries NO AsyncLocalStorage attribution, so the
+// old code always fell back to fetchStatusLatest and showed ANOTHER session's panel.
+test("apply() /acp (#1677): resolves the invoking agent's session id from the host-passed invocation, not latest", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1677-acp-"));
+    const statusUrls: string[] = [];
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined }, async () => {
+            const cap = await startMockProxy([], (url) => {
+                statusUrls.push(url);
+                if (url.includes("conversationId=session-inv")) return { ok: true, conversationId: "session-inv", panel: "PANEL-SPECIFIC" };
+                if (url.includes("fallback=latest")) return { ok: true, conversationId: "conv-latest", panel: "PANEL-LATEST" };
+                return undefined;
+            });
+            try {
+                _resetRegisterForTest(cap.origin);
+                process.env.BILLION_CONTEXT_PROXY = cap.origin;
+                const ctx = mockCtx();
+                apply(ctx);
+                const acpCmd = ctx.registeredCommands.find((c) => c.name === "acp");
+                assert.ok(acpCmd, "acp registered");
+
+                // NO initiator set — only the invocation carries the session id
+                const out = await acpCmd.handler({ agent: { session: { id: "session-inv" } } });
+                assert.equal(out.kind, "success");
+                assert.ok(out.text.includes("PANEL-SPECIFIC"), `expected the invoking session's panel, got: ${out.text}`);
+                assert.ok(!out.text.includes("PANEL-LATEST"), "must not fall back to the latest session");
+                assert.ok(!out.text.includes("not known to the proxy"), "a resolvable session must not be annotated");
+                assert.ok(statusUrls.some((u) => u.includes("conversationId=session-inv")), "status was queried for the invoking session");
+                assert.ok(!statusUrls.some((u) => u.includes("fallback=latest")), "no latest-fallback query for a resolvable session");
+            } finally {
+                cap.close();
+                _resetRegisterForTest(undefined);
+            }
+        });
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("apply() /acp-cache (#1677): binds acp_cache to the invoking agent's session id from the invocation", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1677-cache-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined }, async () => {
+            const calls: Array<{ conversationId: string; tool: string; args: unknown }> = [];
+            const cap = await startMockProxy(calls, (url) =>
+                url.includes("fallback=latest") ? { ok: true, conversationId: "conv-latest", panel: "PANEL-OK" } : undefined);
+            try {
+                _resetRegisterForTest(cap.origin);
+                process.env.BILLION_CONTEXT_PROXY = cap.origin;
+                const ctx = mockCtx();
+                apply(ctx);
+                const cacheCmd = ctx.registeredCommands.find((c) => c.name === "acp-cache");
+                assert.ok(cacheCmd, "acp-cache registered");
+
+                // NO initiator set — only the invocation carries the session id
+                const out = await cacheCmd.handler({ agent: { session: { id: "session-inv" } } });
+                assert.equal(out.kind, "success");
+                assert.deepEqual(calls, [{ conversationId: "session-inv", tool: "acp_cache", args: {} }]);
+                assert.ok(!out.text.includes("not known to the proxy"), "a resolvable session must not be annotated");
+            } finally {
+                cap.close();
+                _resetRegisterForTest(undefined);
+            }
+        });
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("apply() /acp (#1677): invocation wins over ALS attribution; unresolvable sessions are annotated, never silent", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1677-prio-"));
+    const statusUrls: string[] = [];
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined }, async () => {
+            const cap = await startMockProxy([], (url) => {
+                statusUrls.push(url);
+                if (url.includes("conversationId=session-inv")) return { ok: true, conversationId: "session-inv", panel: "PANEL-INVOKE" };
+                if (url.includes("conversationId=session-init")) return { ok: true, conversationId: "session-init", panel: "PANEL-INIT" };
+                if (url.includes("fallback=latest")) return { ok: true, conversationId: "conv-latest", panel: "PANEL-LATEST" };
+                return undefined;
+            });
+            try {
+                _resetRegisterForTest(cap.origin);
+                process.env.BILLION_CONTEXT_PROXY = cap.origin;
+                const ctx = mockCtx();
+                apply(ctx);
+                const acpCmd = ctx.registeredCommands.find((c) => c.name === "acp");
+                assert.ok(acpCmd, "acp registered");
+
+                // (a) both present → the invocation's session wins over ALS attribution
+                ctx.setInitiator({ session: { id: "session-init" } });
+                statusUrls.length = 0;
+                const win = await acpCmd.handler({ agent: { session: { id: "session-inv" } } });
+                assert.equal(win.kind, "success");
+                assert.ok(win.text.includes("PANEL-INVOKE"), "invocation session must take priority over ALS attribution");
+                assert.ok(statusUrls.some((u) => u.includes("conversationId=session-inv")));
+                assert.ok(!statusUrls.some((u) => u.includes("conversationId=session-init")), "ALS session must not be queried when an invocation is present");
+
+                // (b) requested session unknown to the proxy → falls back to latest AND names both sessions
+                ctx.setInitiator(undefined);
+                statusUrls.length = 0;
+                const ghost = await acpCmd.handler({ agent: { session: { id: "session-ghost" } } });
+                assert.equal(ghost.kind, "success");
+                assert.ok(ghost.text.includes("PANEL-LATEST"), "unknown session falls back to the latest-active panel");
+                assert.ok(ghost.text.includes("session-ghost") && ghost.text.includes("conv-latest"), "the fallback note names the requested and the shown session");
+                assert.ok(ghost.text.includes("not known to the proxy"), "unknown-session fallback is explicitly flagged");
+                assert.ok(statusUrls.some((u) => u.includes("fallback=latest")), "unknown session triggers the latest-fallback query");
+
+                // (c) no session at all (no invocation, no ALS) → latest fallback, flagged as unidentified
+                statusUrls.length = 0;
+                const none = await acpCmd.handler();
+                assert.equal(none.kind, "success");
+                assert.ok(none.text.includes("PANEL-LATEST"));
+                assert.ok(none.text.includes("could not identify the current session"), "no-session fallback is explicitly flagged");
             } finally {
                 cap.close();
                 _resetRegisterForTest(undefined);
@@ -567,7 +699,7 @@ test("apply() /acp-cache (#1146): unreachable proxy reports an error", async () 
             }
         });
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
         _resetRegisterForTest(undefined);
     }
 });
@@ -605,7 +737,7 @@ test("apply() inactive-context registration failure is silent and terminal (dsh 
     } finally {
         console.error = origErr;
         proxy.close();
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
         _resetRegisterForTest(undefined);
     }
 });
@@ -621,7 +753,7 @@ test("apply() is a no-op under the kill switches", async () => {
             assert.equal(ctx.registeredCommands.length, 0);
         });
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -660,7 +792,7 @@ test("apply() runtime-info (#955): model services stamp model/window/max-output 
         });
     } finally {
         proxy.close();
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
         _resetRegisterForTest(undefined);
     }
 });
@@ -706,7 +838,7 @@ test("apply() runtime-info (#956): a mid-resolve model switch discards the stale
         });
     } finally {
         proxy.close();
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
         _resetRegisterForTest(undefined);
     }
 });
@@ -741,7 +873,7 @@ test("apply() /acp pre-first-request (#955): renders the runtime-table entry bef
         });
     } finally {
         proxy.close();
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
         _resetRegisterForTest(undefined);
     }
 });
@@ -785,7 +917,7 @@ test("#983 apply() attach mode: a dead preset falls back to a spawned proxy and 
         _setSpawnForTest(undefined);
         live.close();
         forward.close();
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
         _resetRegisterForTest(undefined);
     }
 });
@@ -810,7 +942,7 @@ test("#983 apply() attach mode: a healthy preset attaches without any spawn", as
     } finally {
         _setSpawnForTest(undefined);
         proxy.close();
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
         _resetRegisterForTest(undefined);
     }
 });
@@ -845,7 +977,7 @@ test("#983 maybeRetry self-heals a base-less register after a failed respawn", a
     } finally {
         _setSpawnForTest(undefined);
         forward.close();
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
         _resetRegisterForTest(undefined);
     }
 });
@@ -875,8 +1007,8 @@ test("#1117 apply() installs takeoverGate keyed on currentInitiator attribution"
         });
     } finally {
         proxy.close();
-        fs.rmSync(stateHome, { recursive: true, force: true });
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(stateHome);
+        rmrf(home);
         _resetRegisterForTest(undefined);
     }
 });
@@ -923,8 +1055,8 @@ test("#1158 apply() gate refusal logs each endpoint once per process with attrib
         });
     } finally {
         proxy.close();
-        fs.rmSync(stateHome, { recursive: true, force: true });
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(stateHome);
+        rmrf(home);
         _resetRegisterForTest(undefined);
     }
 });
@@ -985,15 +1117,15 @@ test("#1158 L2 gate three-state: thrown attribution is a distinct state; counts 
                 // the durable copy carries the same lines into bili.log, [dsh-client]-marked
                 const logFile = path.join(stateHome, "billion-context", "bili.log");
                 const content = fs.readFileSync(logFile, "utf8");
-                assert.match(content, /\[warn\] \[dsh-client\] bili-native-dsh: model request sent DIRECT \(uncompressed\) — takeover gate refused https:\/\/api\.gate-l2\.test\/v1\/chat\/completions: currentInitiator\(\) threw \(agent initiator scope is disposed\) — agent scope disposed\/closing mid-request\? — refusals so far: 5 \(state none→threw\)$/m);
+                assert.match(content, /\[warn\] \[v=[^\]]+\] \[dsh-client\] bili-native-dsh: model request sent DIRECT \(uncompressed\) — takeover gate refused https:\/\/api\.gate-l2\.test\/v1\/chat\/completions: currentInitiator\(\) threw \(agent initiator scope is disposed\) — agent scope disposed\/closing mid-request\? — refusals so far: 5 \(state none→threw\)$/m);
             } finally {
                 console.error = origErr;
             }
         });
     } finally {
         proxy.close();
-        fs.rmSync(stateHome, { recursive: true, force: true });
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(stateHome);
+        rmrf(home);
         _resetRegisterForTest(undefined);
     }
 });
@@ -1024,13 +1156,13 @@ test("#1158 apply() persists bootstrap failures to bili.log (GUI stderr is invis
             // to GUI hosts, which is exactly how #1158 stayed silent.
             const logFile = path.join(stateHome, "billion-context", "bili.log");
             const content = fs.readFileSync(logFile, "utf8");
-            assert.match(content, /^\d{4}-\d{2}-\d{2}T[\d:.]+Z \[warn\] \[dsh-client\] attach target http:\/\/127\.0\.0\.1:1 is not healthy — falling back to a spawned proxy$/m);
+            assert.match(content, /^\d{4}-\d{2}-\d{2}T[\d:.]+Z \[warn\] \[v=[^\]]+\] \[dsh-client\] attach target http:\/\/127\.0\.0\.1:1 is not healthy — falling back to a spawned proxy$/m);
         });
     } finally {
         console.error = origErr;
         _setSpawnForTest(undefined);
-        fs.rmSync(home, { recursive: true, force: true });
-        fs.rmSync(stateHome, { recursive: true, force: true });
+        rmrf(home);
+        rmrf(stateHome);
         _resetRegisterForTest(undefined);
     }
 });
@@ -1042,7 +1174,7 @@ test("#1158 persistClientEvent: standard line shape into bili.log; broken fs nev
             persistClientEvent("boom-marker-xyz");
             const logFile = path.join(stateHome, "billion-context", "bili.log");
             const content = fs.readFileSync(logFile, "utf8");
-            assert.match(content, /^\d{4}-\d{2}-\d{2}T[\d:.]+Z \[warn\] \[dsh-client\] boom-marker-xyz$/m);
+            assert.match(content, /^\d{4}-\d{2}-\d{2}T[\d:.]+Z \[warn\] \[v=[^\]]+\] \[dsh-client\] boom-marker-xyz$/m);
         });
         // Broken target (state root under a regular file): must swallow, never throw.
         const blocker = path.join(os.tmpdir(), `bili-dsh-1158d-blocker-${Date.now()}`);
@@ -1056,7 +1188,7 @@ test("#1158 persistClientEvent: standard line shape into bili.log; broken fs nev
             fs.rmSync(blocker, { force: true });
         }
     } finally {
-        fs.rmSync(stateHome, { recursive: true, force: true });
+        rmrf(stateHome);
     }
 });
 
@@ -1116,7 +1248,7 @@ test("#1130 apply() attach mode: runtime death of the shared proxy re-probes and
         _setSpawnForTest(undefined);
         fallback.close();
 
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
         _resetRegisterForTest(undefined);
     }
 });
@@ -1161,7 +1293,7 @@ test("#1365 apply() attach mode: routed evidence pins the channel — a transien
         clearTimeout(upTimer);
         server.close();
         _setSpawnForTest(undefined);
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
         _resetRoutedForTest();
         _resetRegisterForTest(undefined);
     }
@@ -1212,7 +1344,7 @@ test("#1365 apply() attach mode: routed evidence + persistently dead target — 
         console.error = origErr;
         server.close();
         _setSpawnForTest(undefined);
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
         _resetRoutedForTest();
         _resetRegisterForTest(undefined);
     }
@@ -1249,7 +1381,7 @@ test("#1365 apply() attach mode: late routed evidence rebinds the bili tools to 
     } finally {
         a.close();
         b.close();
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
         _resetRoutedForTest();
         _resetRegisterForTest(undefined);
     }
@@ -1298,7 +1430,7 @@ test("#1365 apply() attach mode: runtime death with routed evidence — waits th
         clearTimeout(upTimer);
         server.close();
         _setSpawnForTest(undefined);
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
         _resetRoutedForTest();
         _resetRegisterForTest(undefined);
     }

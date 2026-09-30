@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { defaultConfig } from "acp-kernel";
@@ -10,6 +10,7 @@ import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 /** #115: DNS rebinding defense on /__bili/ management endpoints. An attacker
  *  who resolves evil.com → 127.0.0.1 can make a browser request arrive at the
@@ -95,7 +96,73 @@ test("admin endpoints: DNS-rebinding Host is rejected with and without Origin (#
         process.env.BILI_CONFIG_FILE = prevConfig;
         proxy.closeAllConnections?.();
         await close(proxy);
-        try { rmSync(root, { recursive: true, force: true }); } catch { /* best-effort */ }
+        try { rmrf(root); } catch { /* best-effort */ }
+    }
+});
+
+test("admin endpoints accept an SSH-forwarded local port that differs from the listen port (#1537)", async () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    const root = path.join(tmpdir(), `bili-admin-forward-${process.pid}-${Date.now()}`);
+    mkdirSync(root, { recursive: true });
+    const biliConfig = path.join(root, "billion-context.json");
+    writeFileSync(biliConfig, '{"providers":{}}\n', "utf8");
+    const prevConfig = process.env.BILI_CONFIG_FILE;
+    process.env.BILI_CONFIG_FILE = biliConfig;
+
+    // ssh -L <local>:127.0.0.1:<listen>: the browser sees <local>, the proxy
+    // listens on <listen>. The connection still arrives from loopback, so the
+    // admin gate must accept the mismatched local port while keeping the
+    // DNS-rebinding defense (attacker domain names stay rejected).
+    const opts: ProxyOptions = {
+        port: 0,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1:1",
+        routes: {},
+        proxy: "",
+        proxyMode: "direct",
+        proxySource: "direct",
+        modelContextLimit: 400_000,
+        kernelConfig: defaultConfig(400_000),
+        compress: { injectTool: true, injectNudge: true },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        mitm: { enabled: false, domains: [] },
+    };
+    const proxy = await startServer(opts);
+    if (!proxy.listening) await once(proxy, "listening");
+    const listenPort = (proxy.address() as { port: number }).port;
+    const localPort = listenPort + 1; // the ssh -L local side, deliberately != listenPort
+    try {
+        // Forwarded web UI: Host/Origin carry the LOCAL port, not the listen port.
+        const ui = await request(listenPort, { host: `localhost:${localPort}`, origin: `http://localhost:${localPort}` });
+        assert.equal(ui.status, 200, "SSH-forwarded localhost:<localPort> must be accepted");
+        const ipUi = await request(listenPort, { host: `127.0.0.1:${localPort}`, origin: `http://127.0.0.1:${localPort}` });
+        assert.equal(ipUi.status, 200, "SSH-forwarded 127.0.0.1:<localPort> must be accepted");
+        // Forwarded curl-style (no Origin): trusted loopback host, any port.
+        const curlFwd = await request(listenPort, { host: `localhost:${localPort}` });
+        assert.equal(curlFwd.status, 200, "no-Origin request on a trusted loopback host must be accepted");
+        // The exact listen port still works (backward compat).
+        const direct = await request(listenPort, { host: `localhost:${listenPort}`, origin: `http://localhost:${listenPort}` });
+        assert.equal(direct.status, 200, "same-port access unchanged");
+        // Rebinding defense intact: attacker domain names are rejected even on
+        // a trusted port, with or without an Origin header.
+        const rebindingFwd = await request(listenPort, { host: `evil.com:${localPort}`, origin: `http://evil.com:${localPort}` });
+        assert.equal(rebindingFwd.status, 403, "rebound attacker domain must still be rejected (forwarded port)");
+        const rebindingDirect = await request(listenPort, { host: `evil.com:${listenPort}` });
+        assert.equal(rebindingDirect.status, 403, "rebound attacker domain must still be rejected (no Origin)");
+        // Cross-site Origin on a trusted loopback host is still rejected.
+        const crossSite = await request(listenPort, { host: `localhost:${localPort}`, origin: "http://evil.com:8080" });
+        assert.equal(crossSite.status, 403, "cross-site Origin on a trusted host must be rejected");
+    } finally {
+        process.env.BILI_CONFIG_FILE = prevConfig;
+        proxy.closeAllConnections?.();
+        await close(proxy);
+        try { rmrf(root); } catch { /* best-effort */ }
     }
 });
 
@@ -145,7 +212,7 @@ test("admin endpoints work with port: 0 (dynamic port assignment)", async () => 
         process.env.BILI_CONFIG_FILE = prevConfig;
         proxy.closeAllConnections?.();
         await close(proxy);
-        try { rmSync(root, { recursive: true, force: true }); } catch { /* best-effort */ }
+        try { rmrf(root); } catch { /* best-effort */ }
     }
 });
 
@@ -201,6 +268,6 @@ test("unknown /__bili/ path → 404 locally, not forwarded to upstream (#346)", 
         process.env.BILI_CONFIG_FILE = prevConfig;
         proxy.closeAllConnections?.();
         await close(proxy);
-        try { rmSync(root, { recursive: true, force: true }); } catch { /* best-effort */ }
+        try { rmrf(root); } catch { /* best-effort */ }
     }
 });

@@ -1,12 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import * as tar from "tar";
 import { installViaTarball, egressDispatcher, type UpdateOptions } from "../src/update.ts";
 import { proxyDispatcher } from "../src/upstream-proxy.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 function integrityField(buf: Buffer, alg = "sha512"): string {
     return `${alg}-${crypto.createHash(alg).update(buf).digest("base64")}`;
@@ -112,7 +113,7 @@ test("installViaTarball: tarball fetch receives the egress dispatcher when provi
         assert.equal(captures[0].init.dispatcher, marker);
     } finally {
         delete process.env.XDG_CACHE_HOME;
-        rmSync(fx.root, { recursive: true, force: true });
+        rmrf(fx.root);
     }
 });
 
@@ -130,6 +131,6 @@ test("installViaTarball: no dispatcher on the fetch when none provided", { timeo
         assert.ok(!("dispatcher" in captures[0].init), "direct fetch must not carry a dispatcher");
     } finally {
         delete process.env.XDG_CACHE_HOME;
-        rmSync(fx.root, { recursive: true, force: true });
+        rmrf(fx.root);
     }
 });

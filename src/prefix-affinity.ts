@@ -50,11 +50,15 @@ import { createHash } from "node:crypto";
 const MIN_CANONICAL_BYTES = 24;
 
 /** Upper bound on tracked chains (LRU-evicted, global — content is the
- *  only key, so there are no per-credential buckets). */
-const MAX_TRACKED_SESSIONS = 256;
-
-/** Chains unused for this long stop matching (sessions may outlive tracking). */
-const TTL_MS = 7 * 24 * 60 * 60 * 1000;
+/** Upper bound on tracked chains (LRU-evicted, global — content is the
+ *  only key, so there are no per-credential buckets). Chains are PERMANENT
+ *  (#1724): the product promise is month- to year-level single sessions, so
+ *  validity never expires with time — a chain leaves the table only under
+ *  capacity pressure (least-recently-used first). 1024 × ≤128 hashes ≈ 8MB
+ *  worst case; typical chains are far shallower. Still exported so the
+ *  persistence layer (#499 P1a / #1724) can enforce the same bound on the
+ *  on-disk snapshot it writes back. */
+export const MAX_TRACKED_SESSIONS = 1024;
 
 /** Leading-run length used to attribute a NEW anonymous session's birth to a
  *  truncated replay of a tracked chain (#1115: lineage attribution ONLY —
@@ -62,7 +66,7 @@ const TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const TRUNCATION_LINEAGE_WINDOW = 8;
 
 /** Per tracked chain, store at most this many per-item hashes (the trailing
- *  ones). Bounds memory (256 chains × 128 × 64B ≈ 2MB) and keeps lineage
+ *  ones). Bounds memory (1024 chains × 128 × 64B ≈ 8MB) and keeps lineage
  *  lookups (fork-LCP + truncated-run, both ≤ 8 items) comfortably available.
  *  Chains deeper than this lose their head, so fork-lineage LCP detection
  *  degrades to "unknown" rather than guessing. */
@@ -71,6 +75,12 @@ const MAX_STORED_ITEMS = 128;
 /** Minimum shared prefix (items) to record a "forked" lineage on a new
  *  session. UI/debug only — never used for matching. */
 const MIN_FORK_PREFIX = 3;
+
+/** #1486: minimum parent-chain depth (messages) before a byte-exact full-
+ *  prefix match counts as resume evidence. A progressive sha256 chain of
+ *  eight or more identical messages cannot coincide by accident (templated
+ *  openings share far less); shorter chains are too common to trust. */
+const MIN_RESUME_PREFIX = 8;
 
 export interface AnonymousAffinity {
     /** Stable session id: "pfa-" + short hash of (tail, depth). */
@@ -102,18 +112,24 @@ interface ChainEntry {
     /** Per-item hashes (position-independent sha256 of each canonical
      *  message), trailing, capped at MAX_STORED_ITEMS. */
     itemHashes: string[];
+    /** #1486: true when the chain belongs to an IDENTIFIED session
+     *  (client-provided id). Anonymous resolution must never adopt these —
+     *  the anonymous world keeps its own pfa-* ids (#309) even when a client
+     *  later replays the same transcript anonymously. */
+    identified: boolean;
 }
 
 /** On-disk snapshot entry (#499 P1a): the tracked chains persisted across
  *  restarts so an anonymous replay reattaches its session instead of
  *  forking a fresh one with zero compression state (the #351 failure mode:
  *  a 458K-token history resent raw because the affinity was in-memory). */
-interface AffinitySnapshotEntry {
+export interface AffinitySnapshotEntry {
     sessionId: string;
     depth: number;
     tailHash: string;
     itemHashes: string[];
     lastSeen: number;
+    identified?: boolean;
 }
 
 /** Deterministic JSON with recursively sorted object keys, so two replays
@@ -225,11 +241,11 @@ export class PrefixAffinityResolver {
         const incItemHashes = perItemHashes(messages);
         const storedItemHashes = incItemHashes.slice(-MAX_STORED_ITEMS);
         const tracked = this.trackedChains;
-        this.expire(tracked);
 
         // 1. Full-depth prefix match (the original radix-style resolution).
         let best: ChainEntry | undefined;
         for (const entry of tracked.values()) {
+            if (entry.identified) continue;
             if (entry.depth > incomingDepth) continue;
             if (hashes[entry.depth - 1] !== entry.tailHash) continue;
             if (!best || entry.depth > best.depth || (entry.depth === best.depth && entry.lastSeen > best.lastSeen)) best = entry;
@@ -295,16 +311,73 @@ export class PrefixAffinityResolver {
     }
 
     /** Record the chain of a session (on creation and after every anonymous
-     *  request — the incoming history is the truth, appends extend it). */
-    note(sessionId: string, depth: number, tailHash: string, itemHashes: string[]): void {
+     *  request — the incoming history is the truth, appends extend it).
+     *  `identified` marks client-provided-id chains (#1486); see ChainEntry. */
+    note(sessionId: string, depth: number, tailHash: string, itemHashes: string[], identified = false): void {
         const tracked = this.trackedChains;
         tracked.delete(sessionId);
-        tracked.set(sessionId, { sessionId, depth, tailHash, itemHashes, lastSeen: Date.now() });
+        tracked.set(sessionId, { sessionId, depth, tailHash, itemHashes, lastSeen: Date.now(), identified });
         while (tracked.size > MAX_TRACKED_SESSIONS) {
             const oldest = [...tracked.values()].sort((a, b) => a.lastSeen - b.lastSeen)[0];
             if (!oldest) break;
             tracked.delete(oldest.sessionId);
         }
+    }
+
+    /** #1486: current tracking entry for a session id, without
+     *  touching lastSeen. Lets the identified-session tracker apply the
+     *  append-only discipline (#1075 side requests reuse a session id with
+     *  fewer messages) before overwriting. */
+    peekChain(sessionId: string): ChainEntry | undefined {
+        return this.trackedChains.get(sessionId);
+    }
+
+    /** #1486: fingerprint an incoming message list without resolving it —
+     *  the building block for tracking identified sessions and for
+     *  resume-fork detection. Null when the request is degenerate (below
+     *  MIN_CANONICAL_BYTES, no user message). */
+    chainFingerprint(messages: unknown[]): { depth: number; tailHash: string; itemHashes: string[] } | null {
+        const msgs = normalizeAffinityMessages(messages);
+        if (!hasUserMessage(msgs)) return null;
+        const hashes = chainHashes(msgs);
+        if (hashes.length === 0) return null;
+        return {
+            depth: msgs.length,
+            tailHash: hashes[hashes.length - 1]!,
+            itemHashes: perItemHashes(msgs).slice(-MAX_STORED_ITEMS),
+        };
+    }
+
+    /** #1486: resume-fork detection for identified clients. Clients such as
+     *  Claude Code fork a fresh client-provided session id on --resume while
+     *  replaying the FULL transcript. Returns the tracked session whose ENTIRE
+     *  stored chain is a byte-exact head-anchored prefix of the incoming
+     *  history: the progressive hash at index depth-1 must equal the stored
+     *  tailHash. That check stays valid beyond MAX_STORED_ITEMS because the
+     *  progressive hash covers the whole prefix (unlike the capped per-item
+     *  window used for lineage lookups). The candidate must be STRICTLY
+     *  deeper than the parent: a real resume adds at least one new message,
+     *  while an equal-depth byte-exact replay under a DIFFERENT id is a
+     *  duplicate conversation, not a resume — linking it would adopt foreign
+     *  blocks and trip the derived-parent restrictions (#1486). The parent
+     *  chain must be >= MIN_RESUME_PREFIX deep. Deepest match wins; ties go
+     *  to the most recently seen. */
+    findResumeParent(messages: unknown[], selfSessionId: string): { sessionId: string; sharedDepth: number } | null {
+        const msgs = normalizeAffinityMessages(messages);
+        if (!hasUserMessage(msgs)) return null;
+        const hashes = chainHashes(msgs);
+        if (hashes.length < MIN_RESUME_PREFIX) return null;
+        let best: { sessionId: string; sharedDepth: number; lastSeen: number } | null = null;
+        for (const [id, entry] of this.trackedChains) {
+            if (id === selfSessionId) continue;
+            if (entry.depth < MIN_RESUME_PREFIX) continue;
+            if (msgs.length <= entry.depth) continue;
+            if (hashes[entry.depth - 1] !== entry.tailHash) continue;
+            if (!best || entry.depth > best.sharedDepth || (entry.depth === best.sharedDepth && entry.lastSeen > best.lastSeen)) {
+                best = { sessionId: id, sharedDepth: entry.depth, lastSeen: entry.lastSeen };
+            }
+        }
+        return best ? { sessionId: best.sessionId, sharedDepth: best.sharedDepth } : null;
     }
 
     /** Drop tracking for a removed session. */
@@ -324,29 +397,30 @@ export class PrefixAffinityResolver {
             tailHash: e.tailHash,
             itemHashes: e.itemHashes,
             lastSeen: e.lastSeen,
+            identified: e.identified,
         }));
     }
 
-    /** Load chains persisted by a previous process. Entries older than the
-     *  TTL are dropped (they would not match anyway). Returns the count
-     *  actually imported. Defensive: a corrupt/hand-edited file must never
-     *  crash the proxy — malformed entries are skipped. */
+    /** Load chains persisted by a previous process. Chains are permanent
+     *  (#1724): an entry months old still reattaches its session. Returns
+     *  the count actually imported. Defensive: a corrupt/hand-edited file
+     *  must never crash the proxy — malformed entries are skipped. */
     importSnapshot(entries: unknown): number {
         if (!Array.isArray(entries)) return 0;
-        const now = Date.now();
         let imported = 0;
         for (const raw of entries) {
             if (!raw || typeof raw !== "object") continue;
             const e = raw as Record<string, unknown>;
             if (typeof e.sessionId !== "string" || typeof e.depth !== "number" || typeof e.tailHash !== "string") continue;
             if (!Array.isArray(e.itemHashes) || e.itemHashes.some((h) => typeof h !== "string")) continue;
-            if (typeof e.lastSeen !== "number" || now - e.lastSeen > TTL_MS) continue;
+            if (typeof e.lastSeen !== "number") continue;
             const entry: ChainEntry = {
                 sessionId: e.sessionId,
                 depth: e.depth,
                 tailHash: e.tailHash,
                 itemHashes: (e.itemHashes as string[]).slice(-MAX_STORED_ITEMS),
                 lastSeen: e.lastSeen,
+                identified: e.identified === true,
             };
             this.trackedChains.delete(entry.sessionId);
             this.trackedChains.set(entry.sessionId, entry);
@@ -358,14 +432,6 @@ export class PrefixAffinityResolver {
             this.trackedChains.delete(oldest.sessionId);
         }
         return imported;
-    }
-
-    private expire(tracked: Map<string, ChainEntry>): void {
-        if (tracked.size === 0) return;
-        const now = Date.now();
-        for (const [id, entry] of tracked) {
-            if (now - entry.lastSeen > TTL_MS) tracked.delete(id);
-        }
     }
 }
 

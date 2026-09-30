@@ -10,6 +10,7 @@ import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 /** #276 (Part B of #255): body dumps (dumps/req-*.json, raw/*-REQ.txt,
  *  raw/*-RES.txt, raw/*-INCOMING.txt) write the full plaintext request body and
@@ -122,7 +123,7 @@ test("body dumps are OFF by default even with --debug (#276)", async () => {
     } finally {
         restoreEnv(prev);
         if (h) { await close(h.proxy); await close(h.upstream); }
-        fs.rmSync(tmpRoot, { recursive: true, force: true });
+        rmrf(tmpRoot);
     }
 });
 
@@ -155,7 +156,7 @@ test("ACP_DUMP_BODY=1: dumps written, no credentials, no non-public host (#276)"
     } finally {
         restoreEnv(prev);
         if (h) { await close(h.proxy); await close(h.upstream); }
-        fs.rmSync(tmpRoot, { recursive: true, force: true });
+        rmrf(tmpRoot);
     }
 });
 
@@ -176,6 +177,6 @@ test("ACP_DUMP_BODY=1 works without --debug (dumps decoupled from verbose loggin
     } finally {
         restoreEnv(prev);
         if (h) { await close(h.proxy); await close(h.upstream); }
-        fs.rmSync(tmpRoot, { recursive: true, force: true });
+        rmrf(tmpRoot);
     }
 });

@@ -95,6 +95,15 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         const dropped = st.retrieveDropped ?? 0;
         extra.push(`STORE (CCR) — ${storeCount} item(s) · ${fmtBytes(st.storedBytes ?? 0)} stored · ${fmtBytes(st.storeBytesSaved ?? 0)} saved on wire · retrieved ${hits}/${calls}${calls > 0 ? ` (${rate}%)` : ""}${delivered > 0 ? ` · delivered ${delivered}` : ""}${dropped > 0 ? ` · dropped ${dropped}` : ""}${rangeRestores > 0 ? ` · range-restored ${rangeRestores}` : ""}`);
     }
+    // #1336: retrieve-quality proxy — whole-block restores where a cheaper
+    // precise path existed at restore time. Independent of CCR arming (the
+    // whole-block restore path works with or without the content store).
+    const wbRestores = ctx.session.stats.wholeBlockRestores ?? 0;
+    if (wbRestores > 0) {
+        const precise = ctx.session.stats.wholeBlockRestoresPreciseAvailable ?? 0;
+        extra.push("");
+        extra.push(`RETRIEVAL QUALITY — whole-block restores: ${wbRestores} total${precise > 0 ? `, ${precise} had a cheaper precise path available (${Math.round((precise / wbRestores) * 100)}%)` : ""}`);
+    }
     // #1179 CCR v2: block → covered message-ref linkage, so the model can
     // target acp_retrieve / range decompress at individual messages. Gated on
     // arming (#1207 review): with CCR off those refs are unretrievable, so

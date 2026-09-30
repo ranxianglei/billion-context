@@ -58,7 +58,10 @@ function toolResultsOf(messages) {
     const out = [];
     for (const msg of messages) {
         if (msg?.role === "tool") {
-            out.push({ name: names.get(msg.tool_call_id) ?? "?", content: String(flatContent(msg.content)).slice(0, 160) });
+            // 400 (not 160): the compress receipt carries its subagent-session
+            // note AFTER the fingerprint line (~185 chars total) — 160 would
+            // cut exactly that assertion surface off (e2e-subagent-sessions).
+            out.push({ name: names.get(msg.tool_call_id) ?? "?", content: String(flatContent(msg.content)).slice(0, 400) });
         }
     }
     return out;
@@ -108,6 +111,14 @@ function compressArgs(refs) {
     return { content: [{ startId: start, endId: start, summary: "e2e fold: scripted compress round over the run-one filler message" }] };
 }
 
+// A chain-checkpoint carrier (<bili-chain ... /> #1421 step 3) rides as a
+// standalone trailing USER message on the openai wire. It is transport
+// metadata, not conversation: "last user message" semantics below (the
+// scripted directive queue source and the lastUserRef oracle) must skip it,
+// or the carrier masks the real prompt and the scripted compress never fires.
+const isChainCarrierMsg = (m) =>
+    m?.role === "user" && /^\s*\x3cbili-chain\s[\s\S]*\/\x3e\s*$/.test(String(flatContent(m.content)));
+
 function answerFor(convKey, firstUserText, body) {
     // Directives are parsed from the LAST user message: a `pi -p --continue`
     // follow-up run re-sends the whole history, and its fresh prompt must
@@ -118,7 +129,7 @@ function answerFor(convKey, firstUserText, body) {
     // the FIRST user message when the last one carries no markers — pi's
     // prompt always owns the last slot, so pi-lane behavior is unchanged.
     const messages = body.messages ?? [];
-    const users = messages.filter((x) => x?.role === "user");
+    const users = messages.filter((x) => x?.role === "user" && !isChainCarrierMsg(x));
     // opencode fires a side-channel title-generation call (v1: separate
     // "Generate a title..." user message; v2: "You are a title generator"
     // system prompt) whose LAST user message is the real prompt — scripting
@@ -129,7 +140,7 @@ function answerFor(convKey, firstUserText, body) {
     const isTitleCall =
         messages.some((m) => m?.role === "system" && /title generator/i.test(stripAcps(flatContent(m.content)))) ||
         users.some((u) => /^generate a title\b/i.test(stripAcps(flatContent(u.content)).trim()));
-    if (isTitleCall) return { content: "e2e-title", queueIdx: -1 };
+    if (isTitleCall) return { content: "e2e-title", queueIdx: -1, title: true };
     const lastUserText = users.length > 0 ? flatContent(users[users.length - 1].content) : firstUserText;
     let sourceText = lastUserText;
     if (parseDirectives(lastUserText).length === 0 && users.length > 1) {
@@ -171,7 +182,7 @@ const server = http.createServer((req, res) => {
                 try { parsed = JSON.parse(raw || "{}"); } catch { /* noop */ }
                 if (process.env.FAKE_DUMP) { try { fs.appendFileSync(process.env.FAKE_DUMP, raw + "\n"); } catch { /* noop */ } }
                 const messages = parsed.messages ?? [];
-                const users = messages.filter((x) => x?.role === "user");
+                const users = messages.filter((x) => x?.role === "user" && !isChainCarrierMsg(x));
                 const firstUserText = users.length > 0 ? flatContent(users[0].content) : "";
                 // ACP tag prefix of the LAST user message: lets suites cite the
                 // exact ref of a known message (e.g. run-one's filler) without
@@ -203,7 +214,16 @@ const server = http.createServer((req, res) => {
                         toolName: reply.toolName ?? null,
                         toolArgs: reply.toolArgs ?? null,
                         lastUser: firstUserText.slice(0, 120),
+                        // head of the TRUE last user message (lastUser above
+                        // is the first user message's head — historical
+                        // field name): lets follow-up runs be identified by
+                        // their own prompt once the filler dominates the head.
+                        lastUserHead: (lastUserMsg ? flatContent(lastUserMsg.content) : "").slice(0, 120),
                         lastUserRef: lastUserRefMatch ? lastUserRefMatch[1] : null,
+                        // #1699: title side-channel marker — after the fix these
+                        // rows route VERBATIM (no ref tags, no injected tools),
+                        // so suites must not mistake them for main turns.
+                        title: reply.title === true,
                     }) + "\n");
                 } catch { /* noop */ }
                 if (parsed.stream) {

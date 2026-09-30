@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import { classifyUpstreamFailure, isFailFastUpstreamKind, UPSTREAM_FAIL_HINTS } from "../src/upstream-fail.ts";
-import { _resetFetchUtilForTest, fetchWithRetry } from "../src/fetch-util.ts";
+import { REPLAY_MAX_ATTEMPTS, _resetFetchUtilForTest, fetchWithRetry } from "../src/fetch-util.ts";
 import { formatUpstreamError } from "../src/upstream-proxy.ts";
 import { proxyKeepAliveMaxMs, PROXY_KEEPALIVE_MAX_MS } from "../src/upstream-proxy.ts";
 
@@ -40,18 +40,24 @@ test("classify: taxonomy covers the three headline kinds from #1263 plus the res
     assert.equal(classifyUpstreamFailure(refused), "connect-refused");
     assert.equal(classifyUpstreamFailure(netError("ETIMEDOUT", "connect ETIMEDOUT"), {}), "upstream-timeout");
     assert.equal(classifyUpstreamFailure(netError("UND_ERR_HEADERS_TIMEOUT", "headers timeout")), "upstream-timeout");
+    // #1453: undici's connect-phase timeout is its own kind — the handshake
+    // never completed, so it must not ride on the non-retried timeout family
+    assert.equal(classifyUpstreamFailure(netError("UND_ERR_CONNECT_TIMEOUT", "Connect Timeout Error")), "connect-timeout");
+    const wrappedConnectTimeout = new TypeError("fetch failed", { cause: netError("UND_ERR_CONNECT_TIMEOUT", "connect timed out") });
+    assert.equal(classifyUpstreamFailure(wrappedConnectTimeout, { viaProxy: true }), "connect-timeout");
+    assert.equal(classifyUpstreamFailure(netError("EAI_AGAIN", "getaddrinfo EAI_AGAIN relay")), "dns");
     assert.equal(classifyUpstreamFailure(netError("ENOTFOUND", "getaddrinfo ENOTFOUND relay")), "dns");
     assert.equal(classifyUpstreamFailure(netError("EPROTO", "protocol error")), "tls");
     assert.equal(classifyUpstreamFailure(new Error("weird")), "unknown");
     assert.equal(classifyUpstreamFailure(undefined), "unknown");
 });
 
-test("classify: fail-fast set is exactly the pre-response replay-safe kinds", () => {
+test("classify: fail-fast set is exactly the pre-response replay-safe kinds (#1453 broadens to connect-timeout + dns)", () => {
     assert.deepEqual(
-        (["proxy-reset", "upstream-reset", "connect-refused"] as const).filter((k) => isFailFastUpstreamKind(k)).length,
-        3,
+        (["proxy-reset", "upstream-reset", "connect-refused", "connect-timeout", "dns"] as const).filter((k) => isFailFastUpstreamKind(k)).length,
+        5,
     );
-    for (const kind of ["client-abort", "upstream-timeout", "dns", "tls", "unknown"] as const) {
+    for (const kind of ["client-abort", "upstream-timeout", "tls", "unknown"] as const) {
         assert.equal(isFailFastUpstreamKind(kind), false, `${kind} must not be retried`);
     }
     for (const kind of Object.keys(UPSTREAM_FAIL_HINTS)) {
@@ -176,6 +182,34 @@ test("fetchWithRetry: external abort is never replayed", async () => {
         assert.equal(retries.length, 0, "client-abort must not be retried");
     } finally {
         await close(upstream);
+    }
+});
+
+test("fetchWithRetry: connect-phase timeout and DNS failures are replayed within the budget (#1453)", async () => {
+    _resetFetchUtilForTest();
+    const prevBase = process.env.BILI_REPLAY_RETRY_BASE_MS;
+    process.env.BILI_REPLAY_RETRY_BASE_MS = "0";
+    const origFetch = globalThis.fetch;
+    try {
+        for (const [code, label] of [["UND_ERR_CONNECT_TIMEOUT", "connect-timeout"], ["ENOTFOUND", "dns"]] as const) {
+            let attempts = 0;
+            const retries: Array<{ status: number; detail: string }> = [];
+            globalThis.fetch = (async () => {
+                attempts++;
+                throw new TypeError("fetch failed", { cause: netError(code, code === "ENOTFOUND" ? "getaddrinfo ENOTFOUND host.invalid" : "Connect Timeout Error") });
+            }) as typeof fetch;
+            await assert.rejects(
+                fetchWithRetry("http://127.0.0.1:1/unused", { method: "POST", body: "{}" }, 5000, undefined, (info) => retries.push({ status: info.status, detail: info.detail })),
+            );
+            assert.equal(attempts, REPLAY_MAX_ATTEMPTS, `${code}: full replay budget consumed`);
+            assert.equal(retries.length, REPLAY_MAX_ATTEMPTS - 1, `${code}: one backoff between each attempt`);
+            assert.equal(retries[0]?.status, 0, `${code}: pre-response retry carries no HTTP status`);
+            assert.match(retries[0]!.detail, new RegExp(`^${label} \\(pre-response network failure\\)`));
+        }
+    } finally {
+        globalThis.fetch = origFetch;
+        if (prevBase === undefined) delete process.env.BILI_REPLAY_RETRY_BASE_MS;
+        else process.env.BILI_REPLAY_RETRY_BASE_MS = prevBase;
     }
 });
 

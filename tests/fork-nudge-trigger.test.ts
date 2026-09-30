@@ -130,6 +130,7 @@ async function runCase(opts: { anonymous: boolean }): Promise<{
         log: false,
         debug: false,
         passthrough: false,
+        chainContentDetection: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);
@@ -262,6 +263,7 @@ async function runImageCase(): Promise<Array<{ stream: boolean; body: string }>>
         log: false,
         debug: false,
         passthrough: false,
+        chainContentDetection: false,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
     } as ProxyOptions);

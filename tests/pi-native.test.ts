@@ -73,7 +73,7 @@ test("ensureProxyRunning: deps.scriptPath overrides process.argv[1] for the spaw
     };
     await ensureProxyRunning(
         { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
-        { fetchImpl: async () => ({ ok: true }), spawnImpl, readInstanceFile: () => undefined, scriptPath: "/opt/pkg/dist/index.js" },
+        { fetchImpl: async () => ({ ok: true }), fetchHealthInfo: async () => ({ ok: true, pid: 42431 }), spawnImpl, readInstanceFile: () => undefined, scriptPath: "/opt/pkg/dist/index.js" },
     );
     assert.equal(spawnScriptArg, "/opt/pkg/dist/index.js");
 });

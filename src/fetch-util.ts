@@ -26,7 +26,14 @@ export function _liveUpstreamTimersForTest(): number {
 /** Idle-timeout budget for upstream requests; overridable via
  *  BILI_UPSTREAM_TIMEOUT_MS (milliseconds). Read on each call so tests can
  *  tune it live. Local-model deployments with very large contexts can need
- *  prefills longer than the 12-minute default before their first token. */
+ *  prefills longer than the 12-minute default before their first token.
+ *
+ *  This budget is the SOLE silence bound by design: there is deliberately no
+ *  finer-grained mid-stream stall detector. A #1452-era opt-in guard
+ *  (BILI_STREAM_STALL_MS) was retired in #1706/#1714 — local-model
+ *  deployments legitimately go silent for minutes mid-stream (thinking
+ *  phases, long prefills), so any finite sub-budget false-positived healthy
+ *  turns into truncations. Do not re-add a shorter timer here. */
 export function upstreamTimeoutMs(): number {
     const raw = Number(process.env.BILI_UPSTREAM_TIMEOUT_MS);
     return Number.isInteger(raw) && raw > 0 ? raw : UPSTREAM_TIMEOUT_MS;
@@ -296,12 +303,12 @@ interface ReplayRetryInfo {
 /** fetchWithTimeout with bounded retry on transient upstream HTTP failures.
  *  For acp-loop replay requests, where provider risk-control may briefly
  *  reject a request whose context was just rewritten (#189). Network-level
- *  failures are classified (#1263): fail-fast connect-phase resets/refusals
- *  (proxy-reset / upstream-reset / connect-refused — the attempt died BEFORE
- *  any response byte, so a replay cannot double-deliver and cost only
- *  milliseconds) get the same bounded retry; timeout/abort kinds still
- *  propagate unchanged — NOT retried, to avoid stacking the 12-min idle
- *  budget across attempts. */
+ *  failures are classified (#1263, #1453): fail-fast pre-response kinds
+ *  (proxy-reset / upstream-reset / connect-refused / connect-timeout / dns —
+ *  the attempt died BEFORE any response byte, so a replay cannot double-
+ *  deliver and each attempt costs at most one connect timeout) get the same
+ *  bounded retry; headers/body timeouts and aborts still propagate unchanged
+ *  — NOT retried, to avoid stacking the 12-min idle budget across attempts. */
 export async function fetchWithRetry(
     url: string,
     opts: FetchOptions,
@@ -335,5 +342,40 @@ export async function fetchWithRetry(
             continue;
         }
         throw new UpstreamHttpError(result.response.status, errText, attempt);
+    }
+}
+
+/** fetchWithTimeout with a bounded retry on FAIL-FAST transport failures only
+ *  (#1688): the main model-request path was single-attempt, so one millisecond
+ *  DNS/reset/refused blip killed the whole round while acp-loop/preflight
+ *  already replayed. Unlike fetchWithRetry this retries ONLY pre-response
+ *  network deaths (isFailFastUpstreamKind — nothing reached the upstream, so a
+ *  replay cannot double-deliver) under the same BILI_REPLAY_RETRY_MAX /
+ *  BILI_REPLAY_RETRY_BASE_MS budget and backoff; it NEVER touches HTTP-level
+ *  verdicts — any response (ok, 4xx, 5xx alike) is returned to the caller
+ *  untouched, because the main path passes upstream error bodies through
+ *  verbatim and must not convert them into proxy-side errors (fetchWithRetry
+ *  would throw UpstreamHttpError). Returns the full fetchWithTimeout shape
+ *  (incl. stopIdleTimer) so callers keep their timer bookkeeping unchanged. */
+export async function fetchWithTransportRetry(
+    url: string,
+    opts: FetchOptions,
+    timeoutMs?: number | undefined,
+    externalSignal?: AbortSignal,
+    onRetry?: (info: ReplayRetryInfo) => void,
+): Promise<Awaited<ReturnType<typeof fetchWithTimeout>>> {
+    const maxAttempts = replayMaxAttempts();
+    for (let attempt = 1; ; attempt++) {
+        try {
+            return await fetchWithTimeout(url, opts, timeoutMs, externalSignal);
+        } catch (error) {
+            const kind = classifyUpstreamFailure(error, { viaProxy: opts.dispatcher !== undefined, externalAborted: externalSignal?.aborted === true });
+            if (!isFailFastUpstreamKind(kind)) throw error;
+            const lastAttempt = attempt >= maxAttempts;
+            if (lastAttempt) throw error;
+            const delayMs = replayBackoffMs(attempt);
+            onRetry?.({ attempt, status: 0, detail: `${kind} (pre-response network failure): ${error instanceof Error ? error.message : String(error)}`, delayMs, maxAttempts });
+            await sleep(delayMs, externalSignal);
+        }
     }
 }

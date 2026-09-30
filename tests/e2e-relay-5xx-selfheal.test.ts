@@ -4,6 +4,10 @@ import { once } from "node:events";
 import test from "node:test";
 
 process.env.NODE_ENV = "test";
+// #1688: these scenarios assert the single-attempt network-failure shape (first
+// socket drop → immediate 502 → arm); pin the legacy no-retry budget so the
+// first drop still surfaces as 502 instead of being transparently replayed.
+process.env.BILI_REPLAY_RETRY_MAX = "1";
 
 import { defaultConfig } from "acp-kernel";
 import { startServer, type ProxyOptions } from "../src/server.ts";

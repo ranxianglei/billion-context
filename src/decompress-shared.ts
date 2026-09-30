@@ -1,6 +1,7 @@
 import {
     collectBlockContent,
     markBlockRestoredInline,
+    matchToolPattern,
     parseBoundary,
     retrieveByRef,
     retrievedMessageId,
@@ -12,11 +13,12 @@ import {
     type InlineRestoreResult,
 } from "acp-kernel";
 import { mkdirSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve as resolvePath } from "node:path";
 import { tmpdir } from "node:os";
 import { markDirty, preCompactionArchiveOf, peekSession, findSessionByCanonicalId, type Session } from "./session.js";
 import { getStore } from "./persist.js";
 import { ccrEnabled, contentStoreOf } from "./store.js";
+import { safePrefix } from "./text-safe.js";
 
 /** Bounded retention for large-decompress temp files. Each decompress with
  *  body > 10000 writes one file under tmpdir(); the reaper unlinks oldest past
@@ -63,6 +65,33 @@ export type ProxyToolCtx = {
     log: (msg: string) => void;
 };
 
+/** #1691: honor the documented `toFile` argument. A non-empty string writes the
+ *  restore to the caller's path regardless of body size (never inflates context;
+ *  relative paths resolve against the proxy cwd). An explicit destination is an
+ *  intentional artifact, so it is deliberately NOT pushed into trackedTempFiles —
+ *  the reaper/beforeExit cleanup must never remove a file asked for by name.
+ *  Returns the "written to" pointer text on success (degraded partial on write
+ *  failure), or null when toFile was omitted so the caller uses its default. */
+function toFilePointer(args: Record<string, unknown>, ctx: ProxyToolCtx, header: string, body: string): string | null {
+    const raw = args.toFile;
+    if (raw === undefined || raw === null) return null;
+    if (typeof raw !== "string") {
+        ctx.log(`[acp-decompress] toFile must be a string (got ${typeof raw}) — using default output`);
+        return null;
+    }
+    const target = raw.trim();
+    if (target === "") return null;
+    const resolved = resolvePath(target);
+    try {
+        mkdirSync(dirname(resolved), { recursive: true });
+        writeFileSync(resolved, body, { encoding: "utf8", mode: 0o600 });
+        return `${header}\nContent (${body.length} chars) written to: ${resolved}\nUse the read tool to access it.`;
+    } catch (e) {
+        ctx.log(`[acp-decompress] toFile write failed: ${resolved} — ${String(e)}`);
+        return `${header}\n[Failed to write to ${resolved}: ${String(e)}]\n${safePrefix(body, 4000)}...`;
+    }
+}
+
 /** Resolve a decompress request to a result string, honoring the `full` flag
  *  and the cross-round original-content cache on the session.
  *
@@ -79,6 +108,14 @@ export type ProxyToolCtx = {
  *  - Otherwise fall back to collectBlockContent against the unfolded view
  *    (ctx.compressMessages ?? ctx.messages); if that yields nothing, return
  *    the block summary. */
+/** A decompress call asks for a range restore only when at least one range
+ *  field carries a non-blank value (#1712). */
+function hasRangeArgs(args: Record<string, unknown>): boolean {
+    const start = typeof args.startId === "string" ? args.startId.trim() : "";
+    const end = typeof args.endId === "string" ? args.endId.trim() : "";
+    return start !== "" || end !== "";
+}
+
 export function resolveDecompress(
     args: Record<string, unknown>,
     ctx: ProxyToolCtx,
@@ -94,7 +131,10 @@ export function resolveDecompress(
     if (archived[blockId] !== undefined) {
         return `[decompress FAILED: block ${blockId} is a pre-compaction archive — its content was in the history BEFORE the client's native compaction and is no longer reachable (replaced by the client's compaction summary). decompress is unavailable for archived blocks.]`;
     }
-    if (typeof args.startId === "string" || typeof args.endId === "string") {
+    // #1712: blank/whitespace range fields mean "unspecified" — hosts and models
+    // emit "" for optional fields, and treating that as a range request produced
+    // an unsatisfiable retry loop (fill in a real range → refused in plugin mode).
+    if (hasRangeArgs(args)) {
         return resolveDecompressRange(args, ctx, block);
     }
 
@@ -116,8 +156,18 @@ export function resolveDecompress(
         body = collected.text || block.summary;
         count = collected.count;
     }
+    // #1336: retrieve-quality proxy — a whole-block restore where a precise
+    // path existed (per-message coverage recorded AND CCR armed ⇒ range-restore
+    // or targeted acp_retrieve would have sufficed) is the failure shape plan-
+    // aware search steering exists to prevent.
+    ctx.session.stats.wholeBlockRestores = (ctx.session.stats.wholeBlockRestores ?? 0) + 1;
+    if (coveredRefSpan(ctx.session.state, block) !== null && ccrEnabled(ctx.session)) {
+        ctx.session.stats.wholeBlockRestoresPreciseAvailable = (ctx.session.stats.wholeBlockRestoresPreciseAvailable ?? 0) + 1;
+    }
 
     const header = `[Block ${blockId} content — ${count} item(s)${full ? ", full" : ""}]`;
+    const toFileOut = toFilePointer(args, ctx, header, body);
+    if (toFileOut !== null) return toFileOut;
     const safeBlockId = blockId.replace(/[^a-zA-Z0-9_-]/g, "-");
     const outPath = body.length > 10000 ? join(tmpdir(), `acp-decompress-${safeBlockId}-${Date.now()}.txt`) : null;
     if (outPath) {
@@ -214,14 +264,16 @@ export function coveredRefSpan(state: CompressionState, block: CompressionBlock)
 function resolveDecompressRange(args: Record<string, unknown>, ctx: ProxyToolCtx, block: CompressionBlock): string {
     const startRaw = typeof args.startId === "string" ? args.startId.trim() : "";
     const endRaw = typeof args.endId === "string" ? args.endId.trim() : "";
-    if (!startRaw || !endRaw) return "[decompress FAILED: startId and endId must be given together]";
+    if (!startRaw || !endRaw) return "[decompress FAILED: startId and endId must be given together — pass both mNNNNN refs, or omit both to restore the whole block]";
     if (!ccrEnabled(ctx.session)) {
-        // [#1207 review F3] Plugin mode structurally never arms CCR (the agent
-        // owns its folds; bili never executes them) — the generic "enable
-        // compress.ccr.enabled" advice is unsatisfiable there and would send
-        // the model chasing a config that cannot help.
+        // Range restore needs the CCR content store; a CCR-off session has none.
+        // In plugin mode the model cannot enable CCR itself (it lives in the
+        // proxy's base config — plugin policy is the base block verbatim,
+        // #1345), so pointing it at the setting sends it chasing a config it
+        // cannot change (#1207 review F3). Give it the working call instead:
+        // whole-block restore with just blockId (#1712).
         if (typeof ctx.session.metadata.pluginAgent === "string") {
-            return "[decompress FAILED: range restore (startId/endId) is proxy-mode only — plugin mode owns its folds natively]";
+            return `[decompress FAILED: range restore (startId/endId) requires CCR, which this plugin-mode session does not have — omit startId/endId and restore the whole block: {"blockId":"${block.blockId}"}]`;
         }
         return "[decompress FAILED: range restore (startId/endId) requires CCR — enable compress.ccr.enabled]";
     }
@@ -271,7 +323,10 @@ function resolveDecompressRange(args: Record<string, unknown>, ctx: ProxyToolCtx
     const header = `[Block ${block.blockId} content — ${startRaw}–${endRaw} — ${parts.length} item(s)]`;
     let injText: string;
     const body = parts.join("\n\n");
-    if (body.length > 10000) {
+    const toFileOut = toFilePointer(args, ctx, header, body);
+    if (toFileOut !== null) {
+        injText = toFileOut;
+    } else if (body.length > 10000) {
         const safeBlockId = block.blockId.replace(/[^a-zA-Z0-9_-]/g, "-");
         // [#1207 review F4] Span in the filename (two spans of one block in the
         // same millisecond must not clobber each other) and 0600 (folded
@@ -294,7 +349,7 @@ function resolveDecompressRange(args: Record<string, unknown>, ctx: ProxyToolCtx
     // duplicate full-text message or inflating rangeRestores.
     const injId = retrievedMessageId(`range_${block.blockId}_${startRaw}-${endRaw}`);
     if (!ctx.session.pendingRetrievals.some((p) => p.ref === injId)) {
-        ctx.session.pendingRetrievals.push({ ref: injId, tokens: 0, chars: body.length, queuedAt: Date.now(), ccr: false, injection: { id: injId, role: "system", contentType: "text", text: injText } });
+        ctx.session.pendingRetrievals.push({ ref: injId, tokens: 0, chars: body.length, queuedAt: Date.now(), ccr: false, injection: { id: injId, role: "user", contentType: "text", text: injText } });
         ctx.session.stats.rangeRestores = (ctx.session.stats.rangeRestores ?? 0) + 1;
     }
     markDirty(ctx.session);
@@ -302,17 +357,7 @@ function resolveDecompressRange(args: Record<string, unknown>, ctx: ProxyToolCtx
     return `[decompress ${block.blockId} ${startRaw}–${endRaw}: restored ${parts.length} item(s) — full content follows]`;
 }
 
-// Back off a cut that lands between the two halves of a surrogate pair, so the
-// truncated prefix never ends on a lone high surrogate (#816: strict-UTF-8
-// gateways 500 deterministically on re-encoded request bodies).
-function safePrefix(text: string, n: number): string {
-    let cut = Math.min(n, text.length);
-    if (cut > 0 && cut < text.length) {
-        const c = text.charCodeAt(cut - 1);
-        if (c >= 0xD800 && c <= 0xDBFF) cut -= 1;
-    }
-    return text.slice(0, cut);
-}
+
 
 /** Shared search_context execution for all wire paths. Distinguishes "no active
  *  blocks at all" (searching is pointless until compress runs — an explicit
@@ -341,6 +386,66 @@ export function derivedAncestorSessions(session: Session): Session[] {
     return out;
 }
 
+// ===================== #1336 planning-aware retrieval =====================
+// Policy layer over the kernel's lexical candidate surface: when enabled, the
+// full candidate pool is re-ranked against the session's current todo/task
+// state (latest protectedLatestTools snapshot in context + most recent user
+// turn) and a short steering section is appended. No store/fold/injection
+// mechanics are touched. Absent plan state or disabled ⇒ byte-identical
+// output (the stable sort degrades to the kernel's lexical order).
+
+const EFFECTIVE_SEARCH_PLAN_KEY = "searchPlanAware";
+
+/** Stamp the last-resolved plan-aware flag onto the session (per-request,
+ *  latest wins — same pattern as storeEffectiveCcr/storeEffectiveConfig). */
+export function storeEffectiveSearchPlanAware(session: Session, on: boolean): void {
+    session.metadata[EFFECTIVE_SEARCH_PLAN_KEY] = on;
+}
+
+export function effectiveSearchPlanAware(session: Session | undefined): boolean {
+    return session?.metadata[EFFECTIVE_SEARCH_PLAN_KEY] === true;
+}
+
+// Conservative built-ins for common agent task tools; user-configured
+// protectedLatestTools patterns are added on top at search time.
+const PLANNING_TOOL_PATTERNS = ["TodoWrite", "todowrite", "todo_list", "update_plan", "TaskCreate", "TaskUpdate"];
+// Bounded scan window + per-snapshot char cap: stale todo state must not
+// dominate ranking (risk mitigation from the issue).
+const PLAN_WINDOW_MESSAGES = 40;
+const PLAN_TEXT_CHAR_CAP = 4000;
+// A ref retrieved this many times earns a range-restore hint in steering.
+const REPEAT_RETRIEVE_HINT_THRESHOLD = 2;
+
+const PLAN_STOPWORDS = new Set([
+    "the", "and", "for", "with", "this", "that", "from", "have", "has", "had",
+    "was", "were", "are", "will", "would", "should", "could", "can", "may",
+    "into", "onto", "over", "under", "about", "after", "before", "between",
+    "each", "all", "any", "some", "not", "but", "then", "than", "when",
+    "while", "where", "which", "who", "what", "how", "why", "because",
+    "being", "done", "todo", "todos", "task", "tasks", "status", "pending",
+    "in_progress", "completed", "cancelled", "progress", "update", "updates",
+    "step", "steps", "item", "items", "list", "plan",
+]);
+
+type PlanTerms = Map<string, number>;
+
+function planTokenize(text: string): string[] {
+    const out: string[] = [];
+    // Rendered ref-tag markup () is proxy metadata, not plan content.
+    const clean = text.replace(/\x3cacp\b[\s\S]*?\x3c\/acp\x3e/g, " ");
+    const re = /[a-z0-9]+|[\u4e00-\u9fff]/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(clean.toLowerCase())) !== null) {
+        const t = m[0];
+        const cjk = /[\u4e00-\u9fff]/.test(t);
+        // Latin tokens need >= 3 chars to carry signal; CJK single chars count.
+        if (!cjk && t.length < 3) continue;
+        if (!cjk && PLAN_STOPWORDS.has(t)) continue;
+        out.push(t);
+    }
+    return out;
+}
+
 function resolveDerivedDecompress(
     args: Record<string, unknown>,
     ctx: ProxyToolCtx,
@@ -352,7 +457,7 @@ function resolveDerivedDecompress(
         if (preCompactionArchiveOf(anc)[blockId] !== undefined) {
             return `[decompress FAILED: block ${blockId} is a pre-compaction archive in derived session ${anc.id} — its content was replaced by the client's compaction summary and is no longer reachable.]`;
         }
-        if (typeof args.startId === "string" || typeof args.endId === "string") {
+        if (hasRangeArgs(args)) {
             return `[decompress FAILED: range restore (startId/endId) of derived-parent blocks is not supported — decompress "${blockId}" without range args (#1333)]`;
         }
         const full = args.full === true;
@@ -366,17 +471,122 @@ function resolveDerivedDecompress(
     return `[Block ${blockId} not found]`;
 }
 
+/** Extract the current plan state from the in-context message view: the LAST
+ *  tool call matching each planning pattern (mirrors the kernel's
+ *  collectLatestProtected latest-wins semantics) plus the most recent user
+ *  turn. Returns null when nothing usable is in context. */
+export function extractPlanState(messages: CoreMessage[], extraPatterns?: string[]): { terms: PlanTerms } | null {
+    const patterns = [...new Set([...PLANNING_TOOL_PATTERNS, ...(extraPatterns ?? [])])];
+    const start = Math.max(0, messages.length - PLAN_WINDOW_MESSAGES);
+    const latestByPattern = new Map<string, CoreMessage>();
+    let lastUserText: string | undefined;
+    for (let i = start; i < messages.length; i++) {
+        const msg = messages[i];
+        if (msg.contentType === "tool-call" && msg.toolName) {
+            for (const p of patterns) {
+                if (matchToolPattern(msg.toolName, p)) { latestByPattern.set(p, msg); break; }
+            }
+        } else if (msg.role === "user" && msg.contentType === "text" && msg.text) {
+            lastUserText = msg.text;
+        }
+    }
+    const sources: Array<{ text: string; weight: number }> = [];
+    for (const msg of latestByPattern.values()) if (msg.text) sources.push({ text: msg.text, weight: 2 });
+    if (lastUserText) sources.push({ text: lastUserText, weight: 1 });
+    if (sources.length === 0) return null;
+    const terms: PlanTerms = new Map();
+    for (const { text, weight } of sources) {
+        const capped = text.length > PLAN_TEXT_CHAR_CAP ? text.slice(0, PLAN_TEXT_CHAR_CAP) : text;
+        for (const tok of planTokenize(capped)) {
+            terms.set(tok, (terms.get(tok) ?? 0) + weight);
+        }
+    }
+    return terms.size > 0 ? { terms } : null;
+}
+
+function planBlockScore(topic: string | undefined, summary: string, terms: PlanTerms): number {
+    const hay = `${topic ?? ""}\n${summary}`.toLowerCase();
+    let score = 0;
+    for (const [term, w] of terms) {
+        if (!hay.includes(term)) continue;
+        let count = 0;
+        let idx = hay.indexOf(term);
+        while (idx !== -1) {
+            count++;
+            idx = hay.indexOf(term, idx + term.length);
+        }
+        score += w * count;
+    }
+    return score;
+}
+
+function buildSteering(
+    scored: Array<{ block: CompressionBlock; score: number }>,
+    state: CompressionState,
+    session: Session,
+): string {
+    const parts: string[] = [];
+    const boosted = scored.filter((s) => s.score > 0).slice(0, 3);
+    if (boosted.length > 0) {
+        parts.push(`top fetch targets: ${boosted.map((s) => {
+            const span = coveredRefSpan(state, s.block);
+            return span ? `${s.block.blockId} [${span.text} · ${span.count} msgs]` : s.block.blockId;
+        }).join(", ")}`);
+    }
+    const counts = session.retrieveCountsByRef;
+    if (counts && counts.size > 0) {
+        const seen = new Set<string>();
+        const hints: string[] = [];
+        outer: for (const s of scored.slice(0, 5)) {
+            const cov = coveredMessages(state, s.block);
+            if (!cov) continue;
+            for (const { num } of cov.raws) {
+                const ref = `m${String(num).padStart(5, "0")}`;
+                const n = counts.get(ref);
+                if ((n ?? 0) >= REPEAT_RETRIEVE_HINT_THRESHOLD && !seen.has(ref)) {
+                    seen.add(ref);
+                    hints.push(`${ref} retrieved ${n} times this session — decompress({blockId:"${s.block.blockId}",startId:"${ref}",endId:"${ref}"}) may be cheaper than repeat acp_retrieve`);
+                    if (hints.length >= 2) break outer;
+                }
+            }
+        }
+        if (hints.length > 0) parts.push(hints.join("; "));
+    }
+    return parts.length > 0 ? `\n\n[plan-aware] ${parts.join("\n")}` : "";
+}
+
+export type SearchPlanOpts = {
+    messages: CoreMessage[];
+    session: Session;
+    log: (msg: string) => void;
+    protectedPatterns?: string[];
+};
+
 export function executeSearchContext(
     args: Record<string, unknown>,
     core: CompressionCore,
     state: CompressionState,
     foreignSessionId?: string,
+    plan?: SearchPlanOpts,
 ): string {
     const query = typeof args.query === "string" ? args.query : "";
     if (query.length === 0) return "[search_context FAILED: query is required]";
     const scope = foreignSessionId ? ` in session ${foreignSessionId}` : "";
     const limit = typeof args.limit === "number" && args.limit > 0 ? Math.floor(args.limit) : 5;
-    const blocks = core.search(query, state).slice(0, limit);
+    const pool = core.search(query, state);
+    let ranked = pool;
+    let scored: Array<{ block: CompressionBlock; score: number }> | null = null;
+    if (plan && !foreignSessionId && pool.length > limit) {
+        const planState = extractPlanState(plan.messages, plan.protectedPatterns);
+        if (planState) {
+            const withScores = pool.map((b, i) => ({ b, i, score: planBlockScore(b.topic, b.summary, planState.terms) }));
+            withScores.sort((x, y) => y.score - x.score || x.i - y.i);
+            ranked = withScores.map((s) => s.b);
+            scored = withScores.map((s) => ({ block: s.b, score: s.score }));
+            plan.log(`[acp-search-plan] "${query}": ${withScores.filter((s) => s.score > 0).length}/${pool.length} candidates plan-relevant → ${scored.slice(0, limit).map((s) => `${s.block.blockId}:${s.score}`).join(", ")}`);
+        }
+    }
+    const blocks = ranked.slice(0, limit);
     if (blocks.length === 0) {
         if (!state.blocks.some((b) => b.active)) return `[No compressed blocks exist yet${scope} — nothing to search.]`;
         return `[No blocks matched "${query}"${scope}]`;
@@ -391,10 +601,15 @@ export function executeSearchContext(
         const spanNote = span ? ` [${span.text} · ${span.count} msgs]` : "";
         return `${b.blockId} (T${b.tier}) "${topic}"${spanNote}\n  ${preview}`;
     });
+    let steering = "";
+    if (scored && plan && !foreignSessionId && blocks.length > 0) {
+        const returned = new Set(blocks);
+        steering = buildSteering(scored.filter((s) => returned.has(s.block)), state, plan.session);
+    }
     const note = foreignSessionId
         ? `\n\n[Read-only search of historical session ${foreignSessionId}. Block ids are per-session namespaces — decompress acts on the current session only. For bulk content use bili export ${foreignSessionId} [--full].]`
         : "";
-    return `Found ${blocks.length} block(s) for "${query}"${scope}:\n\n${lines.join("\n\n")}${note}`;
+    return `Found ${blocks.length} block(s) for "${query}"${scope}:\n\n${lines.join("\n\n")}${steering}${note}`;
 }
 
 // #841: resolve a requested session id to its compression state without
@@ -411,12 +626,18 @@ export function executeSearchContextTarget(
     core: CompressionCore,
     sessionId: string,
     state: CompressionState,
+    ctx?: { messages: CoreMessage[]; config: Config; session: Session; log: (msg: string) => void },
 ): string {
     const requested = typeof args.conversation_id === "string" ? args.conversation_id.trim() : "";
+    // #1336: plan-aware re-ranking applies to OWN-session searches only —
+    // foreign lookups stay read-only lexical (no other session's plan state).
+    const plan: SearchPlanOpts | undefined = ctx && effectiveSearchPlanAware(ctx.session)
+        ? { messages: ctx.messages, session: ctx.session, log: ctx.log, protectedPatterns: ctx.config.protectedLatestTools }
+        : undefined;
     // #1125: honor the param description's "Defaults to the current conversation" —
     // the literal "current" (any case) resolves to this session, not the foreign lookup.
     if (!requested || requested === sessionId || requested.toLowerCase() === "current") {
-        const local = executeSearchContext(args, core, state);
+        const local = executeSearchContext(args, core, state, undefined, plan);
         // #1333: a derived session (pi RLM child) has no blocks of its own —
         // fall back to the recorded parent chain (read-only) instead of a
         // bare "nothing to search".
@@ -434,7 +655,7 @@ export function executeSearchContextTarget(
     // A self-reference under an alias form (canonical pfa-* id) keeps plain
     // current-session semantics — no "historical session" framing.
     const self = peekSession(requested) ?? findSessionByCanonicalId(requested);
-    if (self?.id === sessionId) return executeSearchContext(args, core, state);
+    if (self?.id === sessionId) return executeSearchContext(args, core, state, undefined, plan);
     const foreign = resolveForeignSessionState(requested);
     if (!foreign) return `[search_context FAILED: unknown session "${requested}"]`;
     return executeSearchContext(args, core, foreign, requested);

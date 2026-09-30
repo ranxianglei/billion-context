@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadOptions, parseUpstreamProxyMode } from "../src/config.ts";
@@ -13,6 +13,7 @@ import {
     _resetSessionsForTest,
     _sessionsSizeForTest,
 } from "../src/session.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 const HTTPS_UPSTREAM = "https://upstream.example/v1/messages";
 
@@ -163,7 +164,7 @@ test("getSession: evict-then-revisit reload enforces MAX_SESSIONS (#1064)", () =
         assert.equal(_sessionsSizeForTest(), 1, "reload must evict first — pool stays at MAX");
     } finally {
         _resetSessionsForTest();
-        rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 

@@ -35,6 +35,7 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { defaultLogFile } from "../paths.js";
+import { VERSION } from "../version.js";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, type NativeInterceptState } from "./native-intercept.js";
@@ -46,6 +47,21 @@ export const inject = ["tools", "commands", "agents"];
 const RETRY_INTERVAL_MS = 10000;
 
 type AgentLike = { session?: { id?: unknown } | undefined };
+// #1677: DSH's command executor hands the invoking agent to the handler via the
+// invocation object ({ commandId, agent, rawInput, attachments, signal }) — but it
+// does NOT establish the AsyncLocalStorage boundary that currentInitiator() reads,
+// so command-path attribution through ALS is always empty and /acp silently fell
+// back to another (most-recently-active) session's panel. The invocation is the
+// authoritative "who ran this command" source. Every field is optional because older
+// dsh builds may omit them and the handlers must degrade gracefully (see
+// invocationSidOf's fallback chain).
+type CommandInvocation = {
+    commandId?: unknown;
+    agent?: AgentLike | undefined;
+    rawInput?: unknown;
+    attachments?: unknown;
+    signal?: AbortSignal | undefined;
+};
 type ToolExec = { agent?: AgentLike | undefined; signal?: AbortSignal };
 
 type ToolDefinition = {
@@ -60,7 +76,7 @@ type CommandOutcome = { kind: "success" | "error"; text: string };
 
 type PluginContext = {
     tools: { register: (definition: ToolDefinition) => unknown };
-    commands: { register: (command: { name: string; description: string; handler: () => Promise<CommandOutcome> }) => unknown };
+    commands: { register: (command: { name: string; description: string; handler: (invocation?: CommandInvocation) => Promise<CommandOutcome> }) => unknown };
     agents: { currentInitiator?: () => AgentLike | undefined };
     // Runtime-info sources (#955), resolved via dynamic ctx.inject when the
     // host exposes them (both are core dsh services; optional so older dsh
@@ -187,7 +203,9 @@ export function persistClientEvent(msg: string): void {
     try {
         const file = defaultLogFile();
         mkdirSync(path.dirname(file), { recursive: true });
-        appendFileSync(file, `${new Date().toISOString()} [warn] [dsh-client] ${msg}\n`);
+        // Same line grammar as logger.ts: [v=<build>] so a shared log written
+        // by mixed-version hosts self-identifies every physical line.
+        appendFileSync(file, `${new Date().toISOString()} [warn] [v=${VERSION}] [dsh-client] ${msg}\n`);
     } catch {
         // best-effort: logging must never break the host
     }
@@ -405,7 +423,23 @@ function sessionIdOf(ctx: PluginContext): string | undefined {
     return attr.state === "ok" ? attr.sid : undefined;
 }
 
-async function statusOutcome(ctx: PluginContext): Promise<CommandOutcome> {
+// #1677: session id of the command's invoking agent (host-passed invocation); malformed
+// shapes yield undefined so callers fall through to ALS attribution then latest, never throw.
+function invocationSidOf(invocation: CommandInvocation | undefined): string | undefined {
+    const sid = invocation?.agent?.session?.id;
+    return typeof sid === "string" && sid.length > 0 ? sid : undefined;
+}
+
+// Banner for the /acp + /acp-cache latest-fallback: names the session actually shown so
+// foreign data is never silently presented as the caller's own (#1677).
+function latestSessionNote(status: Record<string, unknown>, requestedSid: string | undefined): string {
+    const resolved = typeof status.conversationId === "string" && status.conversationId.length > 0 ? status.conversationId : "the most recently active session";
+    return requestedSid !== undefined
+        ? `⚠️ bili: session ${requestedSid} is not known to the proxy — showing ${resolved} instead.`
+        : `⚠️ bili: could not identify the current session — showing ${resolved} instead.`;
+}
+
+async function statusOutcome(ctx: PluginContext, invocation?: CommandInvocation): Promise<CommandOutcome> {
     const base = register.base;
     if (!base) {
         return {
@@ -414,11 +448,23 @@ async function statusOutcome(ctx: PluginContext): Promise<CommandOutcome> {
         };
     }
     maybeRetry(ctx);
-    const sid = sessionIdOf(ctx);
-    const status = (sid !== undefined ? await fetchStatus(base, sid) : undefined) ?? (await fetchStatusLatest(base));
+    // #1677: the command executor hands us the invoking session via the invocation —
+    // DSH never establishes the AsyncLocalStorage boundary on the command path, so
+    // currentInitiator() is always empty here and relying on it made /acp silently
+    // show ANOTHER (most-recently-active) session's panel. Prefer the invocation's
+    // agent session id; fall back to ALS attribution, then the latest-session fallback.
+    const sid = invocationSidOf(invocation) ?? sessionIdOf(ctx);
+    let fellBackToLatest = false;
+    let status: Record<string, unknown> | undefined = sid !== undefined ? await fetchStatus(base, sid) : undefined;
+    if (status === undefined) {
+        fellBackToLatest = true;
+        status = await fetchStatusLatest(base);
+    }
     const panel = status?.panel;
     if (status && typeof panel === "string" && panel.length > 0) {
-        return { kind: "success", text: panel };
+        // A panel reached through the latest-fallback belongs to some OTHER session —
+        // say so instead of presenting foreign data as the caller's own (#1677).
+        return { kind: "success", text: fellBackToLatest ? `${latestSessionNote(status, sid)}\n\n${panel}` : panel };
     }
     // #955: pre-first-request view — the proxy answers from the runtime-info
     // table this plugin populated at bootstrap, so /acp shows the client's
@@ -453,7 +499,7 @@ async function statusOutcome(ctx: PluginContext): Promise<CommandOutcome> {
  *  through the status endpoint's latest-active fallback. The host's command
  *  API passes no arguments, so this lane always shows the default
  *  (summary-ledger) report — no `full`. */
-async function cacheOutcome(ctx: PluginContext): Promise<CommandOutcome> {
+async function cacheOutcome(ctx: PluginContext, invocation?: CommandInvocation): Promise<CommandOutcome> {
     const base = register.base;
     if (!base) {
         return {
@@ -462,12 +508,19 @@ async function cacheOutcome(ctx: PluginContext): Promise<CommandOutcome> {
         };
     }
     maybeRetry(ctx);
-    const sid = sessionIdOf(ctx);
+    // #1677: same session-resolution fix as /acp — the command path carries no ALS
+    // attribution, so prefer the invocation's agent session id over currentInitiator().
+    const sid = invocationSidOf(invocation) ?? sessionIdOf(ctx);
     let target = sid;
+    let fallbackNote: string | undefined;
     if (target === undefined) {
         try {
             const status = await fetchStatusLatest(base);
-            target = typeof status?.conversationId === "string" && status.conversationId.length > 0 ? status.conversationId : undefined;
+            const cid = typeof status?.conversationId === "string" && status.conversationId.length > 0 ? status.conversationId : undefined;
+            if (cid !== undefined) {
+                target = cid;
+                fallbackNote = latestSessionNote(status ?? {}, sid);
+            }
         } catch {
             target = undefined;
         }
@@ -488,7 +541,8 @@ async function cacheOutcome(ctx: PluginContext): Promise<CommandOutcome> {
         };
     }
     try {
-        return { kind: "success", text: await forwardTool(base, target, "acp_cache", {}) };
+        const report = await forwardTool(base, target, "acp_cache", {});
+        return { kind: "success", text: fallbackNote !== undefined ? `${fallbackNote}\n\n${report}` : report };
     } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         if (msg.includes("no model request has arrived")) {
@@ -668,15 +722,17 @@ export function apply(ctx: PluginContext): void {
         refreshModelInfo(register.base ?? state.origin);
     }
 
+    // #1677: forward the host-passed invocation — it carries the invoking agent's
+    // session id, which the command path cannot recover from currentInitiator().
     ctx.commands.register({
         name: "acp",
         description: "Show bili context-compression status",
-        handler: () => statusOutcome(ctx),
+        handler: (invocation) => statusOutcome(ctx, invocation),
     });
     ctx.commands.register({
         name: "acp-cache",
         description: "Prompt-cache reconciliation (same report as the acp_cache tool)",
-        handler: () => cacheOutcome(ctx),
+        handler: (invocation) => cacheOutcome(ctx, invocation),
     });
 
     // node:test drives apply() directly with a mock ctx — never patch

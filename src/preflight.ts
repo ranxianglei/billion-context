@@ -869,7 +869,14 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         // Floor on the session's measured input baseline: the upstream's
         // input_tokens also covers the system prompt + tool definitions, which
         // are not in turn.messages, so the direct estimate can undershoot.
-        currentTokens = Math.max(deps.session.stats.lastInputTokens, estimateCoreMessages(turn.messages) + (deps.imageFloor ?? 0) + (deps.wireOverhead ?? 0));
+        // #1492: an estimate-sourced baseline may floor only while the payload
+        // is unmeasured (empty input → transform failed, outbound IS raw); a
+        // stale one from an earlier unfolded turn would pin currentTokens at
+        // millions and burn rounds folding ranges the window never needed.
+        const baselineFloor = messages.length > 0
+            ? (deps.session.stats.lastInputTokensSource === "usage" ? deps.session.stats.lastInputTokens : 0)
+            : deps.session.stats.lastInputTokens;
+        currentTokens = Math.max(baselineFloor, estimateCoreMessages(turn.messages) + (deps.imageFloor ?? 0) + (deps.wireOverhead ?? 0));
         if (!baselineKnown) {
             // #558-merge: the upper-bound regime also carries the image/wire
             // floors — they are real billed costs the fold can never remove

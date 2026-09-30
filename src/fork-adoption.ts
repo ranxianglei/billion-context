@@ -51,6 +51,17 @@ import type { WireProtocol } from "./util.js";
  * fresh session's FIRST request (stats.requests === 0), before prepare*'s
  * processTurn assigns refs; afterwards the fork resolves via a normal prefix
  * match and never re-adopts.
+ *
+ * #1486 extends the same machinery to identified clients whose RESUME forks
+ * a new session id (Claude Code --resume replays the full transcript under a
+ * fresh UUID): maybeAdoptResume inherits ALL ref assignments whose raw ids
+ * appear in the resumed transcript (seedAllRefs — the model's stale citations
+ * span the whole history, not just folded blocks) plus, when the operator
+ * enables it, the fully-present blocks. Refs are content-addressed (raw ids
+ * are SHA-256 of message identity), so an inherited ref always denotes the
+ * exact bytes the model saw: a stale citation resolves to its original
+ * instead of mis-hitting a renumbered message, and fresh messages number
+ * above the parent's ref space (kernel cursor semantics).
  */
 
 /** Protocols whose prepare* pipeline this module mirrors for the id pass.
@@ -112,18 +123,31 @@ function citedPlaceholderRefs(msgs: CoreMessage[]): string[] {
 }
 
 /** Decide which of the parent's blocks survive into the fork. Pure: reads
- *  the parent, returns a plan, mutates nothing. */
-function planForkAdoption(parent: Session, incomingIds: Set<string>): ForkAdoptionPlan {
+ *  the parent, returns a plan, mutates nothing.
+ *  opts.seedAllRefs (#1486): seed EVERY ref whose raw id is present in the
+ *  incoming request, not just the ones covered by adopted blocks — a resumed
+ *  client cites refs across its whole history (its own earlier text), so the
+ *  block-covered subset is far too small. Defaults false (existing callers
+ *  keep their behavior).
+ *  opts.includeBlocks: set false to plan refs only (no block adoption). */
+export function planForkAdoption(
+    parent: Session,
+    incomingIds: Set<string>,
+    opts?: { seedAllRefs?: boolean; includeBlocks?: boolean },
+): ForkAdoptionPlan {
+    const includeBlocks = opts?.includeBlocks ?? true;
     const byId = new Map<string, CompressionBlock>();
     for (const b of parent.state.blocks) byId.set(b.blockId, b);
 
     const active: CompressionBlock[] = [];
     let straddled = 0;
-    for (const b of parent.state.blocks) {
-        if (!b.active) continue;
-        if (b.effectiveMessageIds.length === 0) continue;
-        if (b.effectiveMessageIds.every((id) => incomingIds.has(id))) active.push(b);
-        else straddled++;
+    if (includeBlocks) {
+        for (const b of parent.state.blocks) {
+            if (!b.active) continue;
+            if (b.effectiveMessageIds.length === 0) continue;
+            if (b.effectiveMessageIds.every((id) => incomingIds.has(id))) active.push(b);
+            else straddled++;
+        }
     }
 
     // Closure over directBlockIds: a tier block's children ride along as the
@@ -145,6 +169,11 @@ function planForkAdoption(parent: Session, incomingIds: Set<string>): ForkAdopti
         if (!b) continue;
         blocks.push(structuredClone(b));
         for (const mid of b.effectiveMessageIds) rawIds.add(mid);
+    }
+    if (opts?.seedAllRefs) {
+        for (const id of incomingIds) {
+            if (parent.state.messageRefs.byRaw[id]) rawIds.add(id);
+        }
     }
 
     const byRaw: Record<string, string> = {};
@@ -246,5 +275,49 @@ export function maybeAdoptForkBlocks(args: {
         adoptContentStore(session, storeSlice);
         const n = Object.keys(storeSlice.byRef).length;
         log("info", `[fork-adoption] session ${session.id} adopted ${n} CCR content-store entr${n === 1 ? "y" : "ies"} for the covered/cited refs from parent ${parentId} (#1341)`);
+    }
+}
+
+/** #1486: copy-on-resume for an identified client whose resume forked a new
+ *  session id (Claude Code --resume). The parent is resolved by the caller
+ *  (memory first, then disk) via prefix-affinity's byte-exact full-history
+ *  match. Inherits every ref assignment whose raw id is present in the
+ *  resumed transcript plus, when blocksEnabled, the fully-present blocks —
+ *  same copy-on-fork guarantees as #629: clones only, parent untouched, runs
+ *  once on the fresh session's first request. */
+export function maybeAdoptResume(args: {
+    session: Session;
+    parent: Session;
+    sharedDepth: number;
+    protocol: WireProtocol;
+    parsed: unknown;
+    upstreamOrigin: string;
+    blocksEnabled: boolean;
+    log: (level: string, msg: string) => void;
+}): void {
+    const { session, parent, sharedDepth, protocol, parsed, upstreamOrigin, blocksEnabled, log } = args;
+    const incomingMsgs = incomingCoreMessages(protocol, parsed);
+    if (!incomingMsgs) {
+        log("info", `[resume-inheritance] ${session.id}: resumed ${parent.id} (${sharedDepth} shared msgs) but ${protocol} has no adoption support in v1; lineage recorded, refs/blocks not inherited (#1486)`);
+        return;
+    }
+    const ids = new Set(incomingMsgs.map((m) => m.id));
+    const plan = planForkAdoption(parent, ids, { seedAllRefs: true, includeBlocks: blocksEnabled });
+    const seededRefs = Object.keys(plan.refs.byRaw).length;
+    if (seededRefs === 0 && plan.adoptedActive === 0) {
+        log("info", `[resume-inheritance] ${session.id}: resume of ${parent.id} had nothing to inherit (no overlapping refs${blocksEnabled ? " or fully-present blocks" : ""}); starting fresh (#1486)`);
+        return;
+    }
+    applyForkAdoption(session, plan, parent);
+    log(
+        "info",
+        `[resume-inheritance] ${session.id} resumed ${parent.id}: inherited ${seededRefs} ref(s) up to ${plan.maxRef || "n/a"}${plan.adoptedActive > 0 ? `, ${plan.adoptedActive} block(s) (~${plan.adoptedTokens} tokens)` : ""}; stale citations now resolve to their original messages (#1486)`,
+    );
+    const wanted = new Set([...Object.keys(plan.refs.byRef), ...citedPlaceholderRefs(incomingMsgs)]);
+    const storeSlice = cloneStoreForRefs(contentStoreOf(parent), wanted);
+    if (storeSlice) {
+        adoptContentStore(session, storeSlice);
+        const n = Object.keys(storeSlice.byRef).length;
+        log("info", `[resume-inheritance] ${session.id} adopted ${n} CCR content-store entr${n === 1 ? "y" : "ies"} for the inherited/cited refs from parent ${parent.id} (#1341/#1486)`);
     }
 }

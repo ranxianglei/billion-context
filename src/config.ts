@@ -4,6 +4,7 @@ import { dirname } from "node:path";
 import { configFile } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { validateHttpProxy, type ProxyFallbackOptions } from "./upstream-proxy.js";
+import { maskUrlForLog } from "./log-mask.js";
 import { resolveOutputHeadroomCap } from "./util.js";
 
 import { parseCompatRoles } from "./compat-roles.js";
@@ -60,6 +61,14 @@ export type ProviderRoute = {
      *  verbatim, no session state. For upstreams whose anti-cheat fingerprints
      *  the request body (e.g. ZCode 405/3012). */
     passthrough?: boolean;
+    /** Client-side routing exemption (#1622): this upstream never gets pointed
+     *  through bili at all. Store-rewriting native lanes (zcode today) skip
+     *  matching entries instead of wrapping them, so traffic flows
+     *  client→upstream untouched — unlike `passthrough`, which still
+     *  terminates at the proxy. Matched by the same longest-URL-prefix rule
+     *  as every other provider field, so it is generic across lanes (an MITM
+     *  lane could honor it by skipping interception for the domain). */
+    direct?: boolean;
     /** Per-provider image billing mode (#767): "bytes" = ceil(base64/4)
      *  (conservative, matches byte-counting relays); "pixels" = dimension-
      *  based tile estimate (matches first-party pixel-tile upstreams);
@@ -285,6 +294,21 @@ export type CompressSettings = {
          *  default 96). */
         maxHeadChars?: number;
     };
+    /** [#1336] Planning-aware retrieval: when `planAware` is true,
+     *  search_context re-ranks its candidate blocks against the session's
+     *  current todo/task state (the latest protectedLatestTools snapshot in
+     *  context plus the most recent user turn) and appends a short steering
+     *  section to the result. Pure host-side policy — the kernel's lexical
+     *  candidate surface, the content store, folding and injection mechanics
+     *  are all reused unchanged. Disabled or no plan state in context ⇒
+     *  byte-identical output to the plain lexical ranking. Off by default;
+     *  measure before enabling in shared configs. Merged sub-field-wise across
+     *  the three levels like `absorb`/`ccr`. See src/decompress-shared.ts. */
+    search?: {
+        /** Enable plan-aware re-ranking + steering for search_context.
+         *  Absent/false = off (byte-identical output). */
+        planAware?: boolean;
+    };
     /** [#1095] Image pre-compression (kernel `Config.imageCompression`,
      *  acp-kernel >= 0.0.84). When `enabled`, screenshot-like images in tool
      *  results are downscaled ONCE at arrival before entering the wire
@@ -357,14 +381,27 @@ export type CompressSettings = {
      *  across the three levels like `absorb`/`reasoning`; off unless enabled at some
      *  level. See src/reasoning-guard.ts. */
     reasoningGuard?: ReasoningGuardConfig;
-     /** [#1093] Output-side compression levers — verbosity steering (a conciseness
-      *  directive appended to the system-prompt tail) and effort routing (clamp an
-      *  already-sent effort field down on mechanical continuation turns). Resolved
-      *  through this same three-level cascade; sub-fields are validated by the
-      *  kernel's resolveOutputSteeringConfig at resolution time (an out-of-range value
-      *  falls back to its default with a warning rather than rejecting the whole block).
-      *  Off unless enabled at some level. See src/output-steering.ts. */
+    /** [#1093] Output-side compression levers — verbosity steering (a conciseness
+     *  directive appended to the system-prompt tail) and effort routing (clamp an
+     *  already-sent effort field down on mechanical continuation turns). Resolved
+     *  through this same three-level cascade; sub-fields are validated by the
+     *  kernel's resolveOutputSteeringConfig at resolution time (an out-of-range value
+     *  falls back to its default with a warning rather than rejecting the whole block).
+     *  Off unless enabled at some level. See src/output-steering.ts. */
     outputSteering?: Partial<OutputSteeringConfig>;
+    /** [#1279] Price profile for the session cache-economics report
+     *  (`acp_cache` / `/acp-cache` / `GET /__bili/cache-report`). Normalized
+     *  multipliers over the input-token unit (p_in = 1): `w` = cacheWrite/input,
+     *  `r` = cacheRead/input, `q` = output/input — e.g. Anthropic ≈ {w:1, r:0.1,
+     *  q:4}, DeepSeek-V3 ≈ {w:1, r:0.1, q:1.5}. Drives ONLY the per-fold
+     *  one-time-cost / breakeven-turns / paid-back verdicts in the report — it
+     *  never affects compression triggers, cadence, or any wire behavior. Each
+     *  unset field falls back to the kernel default (w=1, r=0.1, q=4); a fully
+     *  unset profile yields byte-identical reports to pre-#1279 behavior. The
+     *  last request's effective value is stamped onto the session and used by
+     *  every report face. Merged sub-field-wise across the three levels like
+     *  `absorb`. */
+    priceProfile?: { w?: number; r?: number; q?: number };
 };
 type PromptCacheRouting = "auto" | "enabled" | "disabled";
 export type UpstreamProxyMode = "auto" | "manual" | "direct";
@@ -553,6 +590,12 @@ export type ProxyOptions = {
      *  forwarded body for upstreams without the developer role (#552). Empty =
      *  byte-for-byte transparent. */
     compat: { roles: Record<string, string> };
+    /** #1455: how upstream stream failures are presented to the client on the
+     *  anthropic/openai wire — "protocol" (default) = protocol-native error
+     *  frames; "completion" = legacy synthesized-completion shape for hosts
+     *  whose SDK cannot surface in-band errors. Env BILI_STREAM_ERROR_SHAPE
+     *  wins over the file's compat.streamErrorShape. */
+    streamErrorShape: "protocol" | "completion";
     /** Global-level image billing mode (#767); per-provider route entries
      *  override it, env BILI_IMAGE_BILLING overrides both. undefined = auto. */
     imageBilling?: ImageBillingMode;
@@ -571,6 +614,12 @@ export type ProxyOptions = {
     autoRestartOnUpdate: boolean;
     /** Dist-tag channel the auto-updater follows (default "latest"). */
     updateTag: string;
+    /** Critical-defect advisory watcher (#1481): runs INDEPENDENTLY of
+     *  autoUpdate and force-installs the owner-recommended version when the
+     *  local version falls inside an affected range. Default ON. */
+    advisoryCheck: boolean;
+    /** Override for the advisory document URL (env BILI_ADVISORY_URL wins). */
+    advisoryUrl?: string;
     logFile?: string;
     /** MITM transparent-proxy mode. When enabled, an HTTP CONNECT handler is
      *  attached so clients that only know how to set HTTP_PROXY (ZCode with a
@@ -592,15 +641,40 @@ export type ProxyOptions = {
      *  fully-present compression blocks instead of restarting at zero.
      *  Enable with `forkAdoption: true` or env BILI_FORK_ADOPTION=1. */
     forkAdoption?: boolean;
-    /** Content detection of the bili→bili chain awareness: when an inbound
-     *  request carries ACP artifacts (render tags / ACP tool-call history)
-     *  but no x-bili-hop header and no local compression state for the
-     *  session, record one advisory observation and process normally (#1086,
-     *  advisory-only since #1357) — never verbatim passthrough.
-     *  Default ON; escape valve via env BILI_CHAIN_CONTENT=0 or
-     *  `chainContentDetection: false` in the config file (env wins). The
+    /** Resume-fork inheritance (#1486, default ON). Identified clients that
+     *  resume a conversation under a NEW client-provided session id (Claude
+     *  Code --resume forks a fresh UUID while replaying the full transcript)
+     *  would otherwise start at zero compression state and renumber refs from
+     *  m00001, so the model's stale citations mis-hit renumbered messages.
+     *  The proxy detects the resume by byte-exact full-history match against
+     *  tracked chains and inherits the parent's ref assignments, its
+     *  fully-present compression blocks (when forkAdoption is on), and the
+     *  derivedFrom lineage. Disable with `resumeInheritance: false` or env
+     *  BILI_RESUME_INHERITANCE=0. */
+    resumeInheritance?: boolean;
+    /** Body-content detection of the bili→bili chain awareness: when an inbound
+     *  request carries ACP artifacts / a `<bili-chain …/>` checkpoint in the
+     *  BODY but no x-bili-hop header, record an advisory observation and/or apply
+     *  first-processor-wins passthrough (#1086/#1421). OFF by default (#1683
+     *  follow-up): scanning the body can false-positive on CCR/file-introduced
+     *  text and model-echoed tags, so by default ONLY the x-bili-hop header drives
+     *  chain recognition. Re-enable via env BILI_CHAIN_CONTENT=1 or
+     *  `chainContentDetection: true` in the config file (env wins). The
      *  x-bili-hop signal is unaffected by this switch. */
     chainContentDetection?: boolean;
+    /** Egress emission of the model-visible `<bili-chain …/>` checkpoint
+     *  carrier (#1683): when set, every request THIS instance processes leaves
+     *  with a digest-bearing stamp so a downstream bili applies first-processor-
+     *  wins even if x-bili-hop was stripped in transit (#1421). The carrier
+     *  lands in a slot the terminal MODEL also reads (trailing user message on
+     *  openai/responses; trailing text part on anthropic/google), so models
+     *  treat it as phantom user input and burn tokens commenting on it — hence
+     *  OFF by default. Enable it for the narrow multi-bili + hop-header-
+     *  stripped-middlebox case via env BILI_CHAIN_STAMP=1 or
+     *  `chainEgressStamp: true` in the config file (env wins). Independent of
+     *  chainContentDetection (inbound body-detection is also default OFF); the
+     *  x-bili-hop passthrough is unaffected either way. */
+    chainEgressStamp?: boolean;
     /** #1085: freeze the client's head-system text into a per-session sticky
      *  anchor and append detected changes to the conversation as trailing
      *  notes, keeping the forwarded prefix byte-stable for the provider's
@@ -854,6 +928,7 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
             routing: parsePromptCacheRouting(env.ACP_PROMPT_CACHE_ROUTING ?? fileConfig.promptCache?.routing),
         },
         compat: { roles: parseCompatRoles(fileConfig.compat?.roles) ?? {} },
+        streamErrorShape: parseStreamErrorShape(env.BILI_STREAM_ERROR_SHAPE ?? fileConfig.compat?.streamErrorShape),
         imageBilling: parseImageBilling(fileConfig.imageBilling),
         sessionHeader: env.ACP_SESSION_HEADER ?? fileConfig.sessionHeader ?? "x-acp-session",
         log: env.ACP_LOG !== "0" && fileConfig.log !== false,
@@ -866,6 +941,10 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         // liveness, so it requires an explicit opt-in (#811).
         autoRestartOnUpdate: (env.ACP_AUTO_RESTART_ON_UPDATE ?? (fileConfig.autoRestartOnUpdate === true ? "1" : "0")) !== "0",
         updateTag: (env.ACP_UPDATE_TAG ?? fileConfig.updateTag ?? "latest").trim() || "latest",
+        // Default ON: unlike autoRestartOnUpdate, this never touches process
+        // liveness — it only installs files and warns (#1481).
+        advisoryCheck: (env.BILI_ADVISORY_CHECK ?? (fileConfig.advisoryCheck === false ? "0" : "1")) !== "0",
+        advisoryUrl: env.BILI_ADVISORY_URL || fileConfig.advisoryUrl || undefined,
         logFile: env.ACP_LOG_FILE !== undefined ? (env.ACP_LOG_FILE || undefined) : fileConfig.logFile,
         mitm: {
             enabled: (env.BILI_MITM ?? (fileConfig.mitm?.enabled === false ? "0" : "1")) !== "0",
@@ -877,7 +956,9 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         maskHosts: (env.BILI_LOG_MASK_HOSTS ?? (fileConfig.maskHosts === false ? "0" : "1")) !== "0",
         subagentSplit: (env.BILI_SUBAGENT_SPLIT ?? (fileConfig.subagentSplit === false ? "0" : "1")) !== "0",
         forkAdoption: (env.BILI_FORK_ADOPTION ?? (fileConfig.forkAdoption === true ? "1" : "0")) !== "0",
-        chainContentDetection: (env.BILI_CHAIN_CONTENT ?? (fileConfig.chainContentDetection === false ? "0" : "1")) !== "0",
+        resumeInheritance: (env.BILI_RESUME_INHERITANCE ?? (fileConfig.resumeInheritance === false ? "0" : "1")) !== "0",
+        chainContentDetection: (env.BILI_CHAIN_CONTENT ?? (fileConfig.chainContentDetection === true ? "1" : "0")) !== "0",
+        chainEgressStamp: (env.BILI_CHAIN_STAMP ?? (fileConfig.chainEgressStamp === true ? "1" : "0")) !== "0",
         stableSystemAnchor: (env.BILI_STABLE_SYSTEM_ANCHOR ?? (fileConfig.stableSystemAnchor === true ? "1" : "0")) !== "0",
     };
 }
@@ -917,6 +998,11 @@ type FileConfig = {
     autoRestartOnUpdate?: boolean;
     /** Dist-tag channel the auto-updater follows (default "latest"). */
     updateTag?: string;
+    /** Set `false` to disable the critical-defect advisory watcher (#1481);
+     *  env BILI_ADVISORY_CHECK wins when set. */
+    advisoryCheck?: boolean;
+    /** Override for the advisory document URL (env BILI_ADVISORY_URL wins). */
+    advisoryUrl?: string;
     upstreamProxy?: string;
     upstreamProxyMode?: string;
     logFile?: string;
@@ -940,26 +1026,39 @@ type FileConfig = {
      *  zero compression state. Default false; env BILI_FORK_ADOPTION=1/0
      *  wins over the file. */
     forkAdoption?: boolean;
-    /** Set `false` to disable the ACP-artifact content detection of the
-     *  bili→bili chain awareness (#1086, advisory-only since #1357);
-     *  x-bili-hop stays active either way.
-     *  Env BILI_CHAIN_CONTENT=0 wins over the file. */
+    /** Set `false` to disable resume-fork inheritance (#1486, default ON;
+     *  env BILI_RESUME_INHERITANCE=0 wins over the file). */
+    resumeInheritance?: boolean;
+    /** Set `true` to enable body-content detection of the bili→bili chain
+     *  awareness (#1086/#1421); OFF by default — by default only x-bili-hop drives
+     *  chain recognition, since body scanning can false-positive on CCR/file-
+     *  introduced text and model-echoed tags (#1683). Env BILI_CHAIN_CONTENT=1
+     *  wins over the file. */
     chainContentDetection?: boolean;
+    /** Set `true` to enable egress emission of the model-visible
+     *  `<bili-chain …/>` checkpoint carrier (#1683, default OFF; env
+     *  BILI_CHAIN_STAMP=1 wins over the file). Independent of
+     *  chainContentDetection. */
+    chainEgressStamp?: boolean;
     /** Set `true` to enable the sticky head-system anchor (#1085, default
      *  OFF; env BILI_STABLE_SYSTEM_ANCHOR wins). */
     stableSystemAnchor?: boolean;
     /** Global wire-compat block. `roles` maps message roles to the role name
      *  upstreams accept (e.g. `{"developer":"system"}`) — applied to the
-     *  final forwarded body for openai/responses requests (#552). */
-    compat?: { roles?: Record<string, string> };
+     *  final forwarded body for openai/responses requests (#552).
+     *  `streamErrorShape` (#1455): "protocol" (default) presents upstream
+     *  stream failures as protocol-native error frames; "completion" restores
+     *  the legacy shape that delivered the failure text inside a synthesized
+     *  successful completion. Env BILI_STREAM_ERROR_SHAPE wins over the file. */
+    compat?: { roles?: Record<string, string>; streamErrorShape?: string };
     /** Global image billing mode (#767): "auto" | "pixels" | "bytes".
      *  Per-provider `imageBilling` overrides it; env BILI_IMAGE_BILLING wins
      *  over both. See ProviderRoute.imageBilling. */
     imageBilling?: string;
-    /** Claude-native install tuning (#964): the loopback port the managed
-     *  settings block pins ANTHROPIC_BASE_URL at and the SessionStart hook
-     *  brings a proxy up on. Default CLAUDE_NATIVE_DEFAULT_PORT; env
-     *  BILI_CLAUDE_NATIVE_PORT wins over both. */
+    /** Claude-native port override (#964/#1660): an explicit port for the
+     *  claude lane — strict-port semantics (EADDRINUSE fails loud). Undefined
+     *  (the default) means the lane's sticky zone port (ZONE_PORT_BASE base).
+     *  Env BILI_CLAUDE_NATIVE_PORT wins over the file. */
     claude?: { nativePort?: number };
     /** Native-hook attach policy (#1335): set `true` to let native hooks
      *  attach to lifecycle-less listeners (a manually started `bili start`
@@ -1003,20 +1102,57 @@ function loadConfigFile(): FileConfig {
     return {};
 }
 
-/** Default loopback port for the claude native install (#964): the value the
- *  installer bakes into ~/.claude/settings.json's env.ANTHROPIC_BASE_URL and
- *  the SessionStart hook brings a proxy up on. Documented as reserved. */
-export const CLAUDE_NATIVE_DEFAULT_PORT = 48787;
+/** #1660: the self-managed zone port base. Every launcher-spawned lane
+ *  binds here by default instead of an OS-assigned ephemeral port: a stable
+ *  origin survives instance death, and the proxy child's EADDRINUSE ladder
+ *  (+1 per attempt) resolves collisions deterministically with a sticky
+ *  record (instance.ts port-zone.json). 18787 sits below the Linux ephemeral
+ *  range (32768–60999) so the ladder never lands on OS-assigned ports; 8787
+ *  stays reserved as the USER zone (manual `bili start`). Env BILI_ZONE_PORT
+ *  overrides the base for the whole zone. */
+export const ZONE_PORT_BASE = 18787;
 
-/** The claude-native loopback port, one resolution for installer, hook, and
- *  launcher: env BILI_CLAUDE_NATIVE_PORT > config `claude.nativePort` >
- *  CLAUDE_NATIVE_DEFAULT_PORT. */
-export function resolveClaudeNativePort(env: NodeJS.ProcessEnv = process.env): number {
+export function resolveZonePortBase(env: NodeJS.ProcessEnv = process.env): number {
+    const fromEnv = Number.parseInt(env.BILI_ZONE_PORT ?? "", 10);
+    if (Number.isInteger(fromEnv) && fromEnv > 0 && fromEnv < 65536) return fromEnv;
+    return ZONE_PORT_BASE;
+}
+
+/** #1660: an explicit user override of the claude lane's port: env
+ *  BILI_CLAUDE_NATIVE_PORT > config `claude.nativePort` > undefined. A
+ *  DEFINED value means a strict-port launch (an EADDRINUSE at bind fails
+ *  loud, #964); undefined means the lane's sticky zone port
+ *  (instance.ts lanePreferredPort) with the +1 ladder absorbing collisions.
+ *  The installer no longer persists this — zone drift is repaired by the
+ *  SessionStart hook rewriting the managed block to the live origin every
+ *  session. */
+export function resolveClaudeNativePort(env: NodeJS.ProcessEnv = process.env): number | undefined {
     const fromEnv = Number.parseInt(env.BILI_CLAUDE_NATIVE_PORT ?? "", 10);
     if (Number.isInteger(fromEnv) && fromEnv > 0 && fromEnv < 65536) return fromEnv;
     const fromFile = loadConfigFile().claude?.nativePort;
     if (typeof fromFile === "number" && Number.isInteger(fromFile) && fromFile > 0 && fromFile < 65536) return fromFile;
-    return CLAUDE_NATIVE_DEFAULT_PORT;
+    return undefined;
+}
+
+/** #1660: explicit override of the zcode lane's port (env only — the store
+ *  is re-derived at every bootstrap, nothing is baked at install time).
+ *  Defined means a strict-port launch; undefined means the lane's sticky
+ *  zone port. Legacy wrappers pinned to the old 48789 default are migrated
+ *  by the bootstrap's origin-drift repair (routeZcodeConfig rewrites the
+ *  store to the live origin). */
+export function resolveZcodeNativePort(env: NodeJS.ProcessEnv = process.env): number | undefined {
+    const fromEnv = Number.parseInt(env.BILI_ZCODE_PORT ?? "", 10);
+    if (Number.isInteger(fromEnv) && fromEnv > 0 && fromEnv < 65536) return fromEnv;
+    return undefined;
+}
+
+/** Client-side routing exemptions (#1622): providers whose route declares
+ *  `direct: true` are never pointed through bili by store-rewriting native
+ *  lanes. Returns the normalized URL keys (the same key space findRoute
+ *  matches against). */
+export function zcodeDirectPrefixes(env: NodeJS.ProcessEnv = process.env): string[] {
+    const routes = loadRoutes(env);
+    return Object.entries(routes).filter(([, r]) => r.direct === true).map(([k]) => k);
 }
 
 /** #1335: the native-hook attach-gate escape hatch. True when the user
@@ -1031,76 +1167,6 @@ export function resolveNativeAttachExternal(env: NodeJS.ProcessEnv = process.env
     return loadConfigFile().native?.attachExternal === true;
 }
 
-/** Persist the claude-native port the installer baked into settings.json
- *  (#964). Without this, an install driven by BILI_CLAUDE_NATIVE_PORT writes
- *  that port into ~/.claude/settings.json but the SessionStart hook (which
- *  does NOT inherit claude's settings.env) later resolves the default —
- *  hooking the wrong port while claude dials the baked one. `claude plugin
- *  install` calls this; `claude plugin remove` calls clearClaudeNativePort. */
-/** #964: read-modify-write safety for user config files — refuse to write
- *  over a file that exists but is NOT valid JSON: loadConfigFile() degrades
- *  malformed input to {}, so an unguarded RMW would replace the user's
- *  corrupt-but-repairable config with a minimal one (silent clobber).
- *  Absent / empty / valid files are all safe to write. */
-function configFileRmwSafe(): boolean {
-    const p = configFile();
-    let raw: string;
-    try {
-        raw = readFileSync(p, "utf8");
-    } catch {
-        return true;
-    }
-    if (!raw.trim()) return true;
-    try {
-        JSON.parse(raw.replace(/^\uFEFF/, ""));
-        return true;
-    } catch {
-        return false;
-    }
-}
-
-export function saveClaudeNativePort(port: number): void {
-    const p = configFile();
-    if (!configFileRmwSafe()) {
-        loggerLog("warn", `[acp-config] refusing to persist claude.nativePort=${port} — ${p} is not valid JSON; repair it first`);
-        return;
-    }
-    const cur = loadConfigFile() as { claude?: { nativePort?: number } } & Record<string, unknown>;
-    const next: { claude?: { nativePort?: number } } & Record<string, unknown> = { ...cur };
-    next.claude = { ...(cur.claude ?? {}), nativePort: port };
-    try {
-        mkdirSync(dirname(p), { recursive: true });
-        writeFileSync(p, JSON.stringify(next, null, 2) + "\n", "utf8");
-    } catch (err) {
-        loggerLog("warn", `[acp-config] could not persist claude.nativePort=${port} at ${p} — ${err instanceof Error ? err.message : String(err)}`);
-    }
-}
-
-/** Drop the persisted claude-native port (plugin remove) so a fresh default
- *  install resolves the default port again. Never throws. */
-export function clearClaudeNativePort(): void {
-    const p = configFile();
-    if (!configFileRmwSafe()) {
-        loggerLog("warn", `[acp-config] refusing to clear claude.nativePort — ${p} is not valid JSON; repair it first`);
-        return;
-    }
-    const cur = loadConfigFile() as { claude?: { nativePort?: number } } & Record<string, unknown>;
-    if (cur.claude?.nativePort === undefined) return;
-    const next: Record<string, unknown> = { ...cur };
-    if (Object.keys(cur.claude).length > 1) {
-        const claude = { ...cur.claude } as Record<string, unknown>;
-        delete claude.nativePort;
-        next.claude = claude;
-    } else {
-        delete next.claude;
-    }
-    try {
-        mkdirSync(dirname(p), { recursive: true });
-        writeFileSync(p, JSON.stringify(next, null, 2) + "\n", "utf8");
-    } catch (err) {
-        loggerLog("warn", `[acp-config] could not clear claude.nativePort at ${p} — ${err instanceof Error ? err.message : String(err)}`);
-    }
-}
 
 /** Template written on first run so the user has a file to edit instead
  *  of having to invent the path/schema. Left empty on purpose: the proxy
@@ -1141,7 +1207,7 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
     // is the KEY in the providers map (identical to the /bili/<url> string),
     // so it is NOT repeated inside the value.
     if (v && typeof v === "object" && !Array.isArray(v)) {
-        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; compress?: CompressSettings; compat?: { roles?: unknown }; passthrough?: boolean; imageBilling?: unknown };
+        const obj = v as { models?: Record<string, ModelEntry>; proxy?: string; compressProtocol?: string; compress?: CompressSettings; compat?: { roles?: unknown }; passthrough?: boolean; direct?: boolean; imageBilling?: unknown };
         const route: ProviderRoute = { models: obj.models };
         if (typeof obj.proxy === "string") route.proxy = obj.proxy;
         if (obj.compressProtocol === "marker" || obj.compressProtocol === "tools") route.compressProtocol = obj.compressProtocol;
@@ -1149,6 +1215,7 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
         const compatRoles = parseCompatRoles(obj.compat?.roles);
         if (compatRoles) route.compat = { roles: compatRoles };
         if (typeof obj.passthrough === "boolean") route.passthrough = obj.passthrough;
+        if (typeof obj.direct === "boolean") route.direct = obj.direct;
         const imageBilling = parseImageBilling(obj.imageBilling);
         if (imageBilling) route.imageBilling = imageBilling;
         return route;
@@ -1160,6 +1227,10 @@ export function parseRouteEntry(v: unknown): ProviderRoute | undefined {
 
 function parseImageBilling(value: unknown): ImageBillingMode | undefined {
     return value === "auto" || value === "pixels" || value === "bytes" ? value : undefined;
+}
+
+export function parseStreamErrorShape(value: unknown): "protocol" | "completion" {
+    return value === "completion" ? "completion" : "protocol";
 }
 
 export function parsePromptCacheRouting(value: string | undefined): PromptCacheRouting {
@@ -1309,6 +1380,22 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
             if (ok) out.ccr = cleaned;
         }
     }
+    if ("search" in obj && obj.search !== undefined) {
+        const c = obj.search;
+        if (!c || typeof c !== "object" || Array.isArray(c)) {
+            ok = false;
+        } else {
+            const co = c as Record<string, unknown>;
+            const cleaned: NonNullable<CompressSettings["search"]> = {};
+            for (const key of ["planAware"] as const) {
+                if (!(key in co)) continue;
+                const v = co[key];
+                if (typeof v !== "boolean") { ok = false; continue; }
+                cleaned.planAware = v;
+            }
+            if (ok) out.search = cleaned;
+        }
+    }
     if ("imageCompression" in obj && obj.imageCompression !== undefined) {
         const c = obj.imageCompression;
         if (!c || typeof c !== "object" || Array.isArray(c)) {
@@ -1392,14 +1479,31 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
             out.outputSteering = os as Partial<OutputSteeringConfig>;
         }
     }
+    if ("priceProfile" in obj && obj.priceProfile !== undefined) {
+        const pp = obj.priceProfile;
+        if (!pp || typeof pp !== "object" || Array.isArray(pp)) {
+            ok = false;
+        } else {
+            const ppo = pp as Record<string, unknown>;
+            const cleaned: NonNullable<CompressSettings["priceProfile"]> = {};
+            for (const key of ["w", "r", "q"] as const) {
+                if (!(key in ppo)) continue;
+                const v = ppo[key];
+                if (typeof v !== "number" || !Number.isFinite(v) || v < 0) { ok = false; continue; }
+                cleaned[key] = v;
+            }
+            if (ok) out.priceProfile = cleaned;
+        }
+    }
     if (!ok) return undefined;
     return out;
 }
 
 function rejectLegacyRoute(key: string, value: unknown): void {
     if (typeof value !== "string") return;
+    const masked = maskUrlForLog(value);
     throw new Error(
-        `[acp-config] legacy provider route \"${key}\": \"${value}\" is no longer valid; ` +
-        `use the upstream URL as the key, for example { \"${value.replace(/\/+$/, "")}\": {} }`,
+        `[acp-config] legacy provider route \"${key}\": \"${masked}\" is no longer valid; ` +
+        `use the upstream URL as the key, for example { \"${masked.replace(/\/+$/, "")}\": {} }`,
     );
 }

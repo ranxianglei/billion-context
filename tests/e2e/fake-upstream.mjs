@@ -30,9 +30,17 @@ function flatContent(c) {
 function allInputText(input) {
 	return (input || []).map((it) => flatContent(it.content)).join("\n");
 }
+// A chain-checkpoint carrier (<bili-chain ... /> #1421 step 3) rides as a
+// standalone trailing user item on the responses wire, right before any
+// trailing compaction_trigger. It is transport metadata, not conversation:
+// "last user text" below must skip it so the scripted ack oracle keeps
+// reading the real prompt.
+const isChainCarrierItem = (it) =>
+    it?.role === "user" && /^\s*\x3cbili-chain\s[\s\S]*\/\x3e\s*$/.test(String(flatContent(it.content)));
+
 function lastUserText(input) {
 	return (input || [])
-		.filter((it) => it.role === "user")
+		.filter((it) => it.role === "user" && !isChainCarrierItem(it))
 		.map((it) => flatContent(it.content))
 		.join("\n");
 }

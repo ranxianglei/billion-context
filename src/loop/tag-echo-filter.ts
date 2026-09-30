@@ -1,3 +1,6 @@
+import { parseChainCheckpoint, TAG_OPEN } from "../chain-checkpoint.js";
+import { CODEX_FORGED_HANDOFF_HEADER, FORGED_SUMMARY_HEADER } from "../codex-compact.js";
+
 // Streaming-safe stripper for model-emitted literal ACP render tags (#206).
 // Compressed history is rendered to the model as render tags; models sometimes
 // imitate them in visible output ("tag echo"), the client replays the echoed
@@ -17,10 +20,18 @@
 // including mixed correct-open + typo'd-close), so <name> matches a bounded
 // mutation set instead of the exact spelling: the three core letters in any
 // order, plus at most ONE extra letter drawn from that set or an inserted i.
-// Every match still requires the name to be followed by \s or > (attrs or
-// close), so real words that merely contain the letters (acpi/acpi.h includes,
-// caption, app, uppercase ACPI) never match; a false positive costs at most
-// the same bounded caps as before (swallow ≤ SWALLOW_CAP, hold ≤ HOLD_LIMIT/TAG_OPEN_CAP).
+// #1731: and the set folds case — models drift casing too, and uppercase
+// echoes (\x3cACP …\x3e, \x3c/ACP\x3e) leaked verbatim because every name pattern was a
+// lowercase literal. The folding is baked into the alternation itself as
+// per-letter character classes rather than an `i` flag, so the .source-based
+// reconstructions below (stripAcpTags, flush) stay behavior-identical: a
+// flag would be silently dropped at every rebuild site. Every match still
+// requires the name to be followed by \s or > (attrs or close), so real
+// words that merely contain the letters (acpi/acpi.h includes, caption, app)
+// never match; an angle-bracketed bare token like \x3cACPI\x3e is indistinguishable
+// from a casing-drifted tag and is stripped, same trade as its lowercase form.
+// A false positive costs at most the same bounded caps as before
+// (swallow ≤ SWALLOW_CAP, hold ≤ HOLD_LIMIT/TAG_OPEN_CAP).
 //
 // ─── INVARIANT (#1039): tool-call arguments are user intent ─────────────────
 // Anything the host will EXECUTE or PERSIST — tool-call arguments in every
@@ -38,29 +49,48 @@
 // (content/reasoning_content/reasoning/thinking/text/summary fields).
 function buildAcplikeName(): string {
     const cores = ["acp", "apc", "cap", "cpa", "pac", "pca"];
-    const names = new Set<string>(cores);
+    const ci = (ch: string) => `[${ch}${ch.toUpperCase()}]`;
+    const fourLetter = new Set<string>();
+    const threeLetter = new Set<string>();
     for (const c of cores) {
-        for (const ch of ["a", "c", "p", "i"]) {
-            for (let pos = 0; pos <= c.length; pos++) names.add(c.slice(0, pos) + ch + c.slice(pos));
+        threeLetter.add(ci(c.charAt(0)) + ci(c.charAt(1)) + ci(c.charAt(2)));
+        for (let pos = 0; pos <= c.length; pos++) {
+            fourLetter.add(
+                c.slice(0, pos).split("").map(ci).join("") + "[aAcCpPiI]" + c.slice(pos).split("").map(ci).join(""),
+            );
         }
     }
-    return [...names].sort((a, b) => b.length - a.length).join("|");
+    return [...fourLetter, ...threeLetter].join("|");
 }
 
-/** Longest-first alternation of every tolerated render-tag name (#673). */
+/** Longest-first alternation of every tolerated render-tag name (#673), case-folded via letter classes (#1731). */
 export const ACP_NAME_ALT = `(?:${buildAcplikeName()})`;
 const NAME = ACP_NAME_ALT;
 
-// Opening-tag attrs are bounded: a render tag opening is short (tokens + type,
-// \x3c 50 chars). An unbounded \x3c<name> …\x3e match would swallow a long prose span
-// that merely starts with a tag head and contains a \x3e somewhere later.
-const PAIRED = new RegExp("\x3c" + NAME + "\\s[^<>]{0,256}>([^<>]{0,64})\x3c\\/" + NAME + ">");
-const LONE_OPEN = new RegExp("\x3c" + NAME + "(?:\\s[^<>]{0,256})?>");
+// Opening-tag attrs carry NO length cap (#1731): [^<>] cannot cross an angle
+// bracket, so these matchers stay linear for arbitrarily long attr runs, and
+// a cap silently defined a bypass — a longer run escaped every open-tag
+// matcher while the loose close still went, leaving orphan markup on the wire.
+// Prose safety lives elsewhere: a terminated open is decided by the body's
+// shape (#1720), an unterminated one by the definite-tail budget (TAG_OPEN_CAP)
+// and the #644 release rules. Close-side tails keep their {0,32} bound — that
+// one is load-bearing (#644: an unbounded close-side tail ate real content
+// after a malformed close).
+// A render tag wraps exactly one bare ref: the kernel emits <acp tokens="…"
+// type="…">mNNNNN</acp> and nothing else between the tags (#1720). Content that
+// is not a ref is prose wearing tags — the tags go, the content stays. No g
+// flag: createTagEchoFilter drives it with exec() on a sliding buffer. It is
+// flag-free by construction — case folding lives inside ACP_NAME_ALT's letter
+// classes (#1731) — so every .source reconstruction below preserves behavior
+// verbatim; an `i` flag would be silently dropped at each rebuild site.
+const PAIRED = new RegExp("\x3c" + NAME + "\\s[^<>]*>(\\s*m\\d{4,}\\s*)\x3c\\/" + NAME + ">");
+const REF_LIKE = /^\s*m\d{4,}\s*$/;
+const LONE_OPEN = new RegExp("\x3c" + NAME + "(?:\\s[^<>]*)?>");
 const LONE_CLOSE = new RegExp("\x3c\\/" + NAME + "(?=[\\s>])[^<>]{0,32}>");
 // A suffix of the buffer that could still grow into a render tag: either an
 // unterminated \x3c<name> … opening (attrs so far, no \x3e yet) or a short
 // ambiguous prefix like \x3c, \x3ca, \x3c/ac, \x3cacip, …
-const PARTIAL_TAIL = new RegExp("(\x3c" + NAME + "\\s[^<>]*|\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?|\x3c\\/?[acip]*)$");
+const PARTIAL_TAIL = new RegExp("(\x3c" + NAME + "\\s[^<>]*|\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?|\x3c\\/?[aAcCpPiI]*)$");
 // An unterminated render-tag opening at the end of a string: \x3c<name> plus
 // attrs, no \x3e — a truncated imitation, never prose (triggers use \x3cacp_).
 const TRUNC_OPEN = new RegExp("\x3c" + NAME + "\\s[^<>]*$");
@@ -77,7 +107,7 @@ const TRUNC_CLOSE = new RegExp("\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?$");
 // shape: a render-tag name, whitespace, then an attribute list bounded by the
 // next `<`. A properly terminated opening never matches: its attribute list
 // ends at a `>`, and no `<` can be reached from there within the class.
-const BROKEN_ATTRS = new RegExp("\x3c" + NAME + "\\s[^<>]{0,512}(?=\x3c)");
+const BROKEN_ATTRS = new RegExp("\x3c" + NAME + "\\s[^<>]*(?=\x3c)");
 const DEFINITE_TAIL = new RegExp("^\x3c" + NAME + "\\s|^\x3c\\/" + NAME);
 const OPEN_WITH_ATTRS = new RegExp("^\x3c" + NAME + "\\s");
 const CLOSE_HEAD = "\x3c/";
@@ -99,14 +129,18 @@ const IMITATION_SWALLOW_CAP = 4096;
  *  tag in s, or -1. #673: the close name may be a typo variant; termination
  *  still requires the strict \x3e right after the name — malformed closes are
  *  LONE_CLOSE's job, not the swallow terminator's. */
-function looseCloseEnd(s: string): number {
+function looseCloseSpan(s: string): { start: number; end: number } | null {
     let idx = s.indexOf(CLOSE_HEAD);
     while (idx >= 0) {
         const m = CLOSE_NAME_ANCHORED.exec(s.slice(idx + 2));
-        if (m && s[idx + 2 + m[0].length] === ">") return idx + 2 + m[0].length + 1;
+        if (m && s[idx + 2 + m[0].length] === ">") return { start: idx, end: idx + 2 + m[0].length + 1 };
         idx = s.indexOf(CLOSE_HEAD, idx + 1);
     }
-    return -1;
+    return null;
+}
+function looseCloseEnd(s: string): number {
+    const span = looseCloseSpan(s);
+    return span === null ? -1 : span.end;
 }
 
 /** The span of one wrapped-turn imitation in `s`: where it starts, and the span
@@ -205,13 +239,14 @@ export function stripAcpTags(text: string): string {
         if (wrapped === null) break;
         out = out.slice(0, wrapped.start) + out.slice(wrapped.end);
     }
-    return out
+    out = out
         .replace(new RegExp(PAIRED.source, "g"), "")
         .replace(new RegExp(LONE_OPEN.source, "g"), "")
         .replace(new RegExp(LONE_CLOSE.source, "g"), "")
         .replace(new RegExp(TRUNC_OPEN.source), "")
         .replace(new RegExp(TRUNC_CLOSE.source), "")
         .replace(MARKER_LINE, "");
+    return stripBiliArtifacts(out);
 }
 
 // Raw-wire pre-check for forged confirmation markers (#717): the literal
@@ -253,6 +288,228 @@ export function containsToolCallXmlFragment(s: string): boolean {
     return TOOL_CALL_XML.test(s);
 }
 
+// ─── #1634: bili-owned internal artifacts echoed by the model ───────────────
+// The proxy injects three artifact families into model-visible payloads: the
+// outbound checkpoint carrier (\x3cbili-chain \u2026/\x3e stamped onto forwarded requests),
+// the forged-compaction handoff user message, and captured summary blocks (the
+// latter two carry fixed header lines). Under sustained context pressure
+// models were observed restating these verbatim as their answer to the user's
+// turn, and the echoes persist turn over turn because they ride client
+// history — the render-tag/marker strippers above know none of these shapes.
+// Real carriers never traverse the model-output path (the proxy writes them
+// itself), so any occurrence in model output is model-generated by definition:
+// strip it, breaking the self-reinforcing loop. Recognition keys off the SAME
+// constants the injectors use (single source of truth): chain spans validate
+// through the frozen checkpoint parser, headers match literally at line start
+// (a mid-line mention such as "the [Compressed conversation section] covers…"
+// is prose and passes through).
+const CHAIN_OPEN_ESCAPED = "\\u003c" + TAG_OPEN.slice(1);
+const CHAIN_TERMINATORS = ['"/\x3e', "/\\u003e", "\\u002f\\u003e"];
+// A real carrier runs \u2264~200 chars (parser ceiling 512); a longer
+// unterminated opening is fabricated, not truncated-in-transit.
+const CHAIN_TAIL_CAP = 640;
+
+function unescapeBili(s: string): string {
+    return s.replace(/\\u003c/g, "\x3c").replace(/\\u003e/g, "\x3e").replace(/\\u002f/g, "/");
+}
+
+/** Exclusive end index of the first chain-tag terminator in rest, or -1. */
+function chainTerminatorEnd(rest: string): number {
+    let best = -1;
+    for (const t of CHAIN_TERMINATORS) {
+        const i = rest.indexOf(t);
+        if (i >= 0 && (best < 0 || i < best)) best = i + t.length;
+    }
+    return best;
+}
+
+/** Index of the first chain-tag opening (literal or \u003c-escaped form), or -1. */
+function chainOpenIndex(s: string): number {
+    const i = s.indexOf(TAG_OPEN);
+    const ie = s.indexOf(CHAIN_OPEN_ESCAPED);
+    if (ie >= 0 && (i < 0 || ie < i)) return ie;
+    return i;
+}
+
+/** Span of the next WELL-FORMED checkpoint carrier in s (validated by the
+ *  frozen parser after unescaping), or null. Malformed/unterminated openings
+ *  are NOT spans here: they stay in place for the streaming tail logic, where
+ *  under-budget truncations are released as prose (content preservation). */
+export function nextChainSpan(s: string): { start: number; end: number } | null {
+    const i = chainOpenIndex(s);
+    if (i < 0) return null;
+    const rest = s.slice(i);
+    const end = chainTerminatorEnd(rest);
+    if (end <= 0) return null;
+    if (parseChainCheckpoint(unescapeBili(rest.slice(0, end))) === null) return null;
+    return { start: i, end: i + end };
+}
+
+/** Cut point of a header-led block: position 0 or immediately after a newline
+ *  where the text starts with either internal-artifact header — everything
+ *  from the cut to the END of the text field is the block (streaming flush
+ *  discards the remainder; whole-text slicing mirrors it). */
+export function headBlockCut(s: string): number {
+    if (s.startsWith(CODEX_FORGED_HANDOFF_HEADER) || s.startsWith(FORGED_SUMMARY_HEADER)) return 0;
+    let nl = s.indexOf("\n");
+    while (nl >= 0) {
+        const p = nl + 1;
+        if (s.startsWith(CODEX_FORGED_HANDOFF_HEADER, p) || s.startsWith(FORGED_SUMMARY_HEADER, p)) return p;
+        nl = s.indexOf("\n", nl + 1);
+    }
+    return -1;
+}
+
+export function stripBiliArtifacts(text: string): string {
+    let out = text;
+    for (;;) {
+        const span = nextChainSpan(out);
+        if (span === null) break;
+        out = out.slice(0, span.start) + out.slice(span.end);
+    }
+    const cut = headBlockCut(out);
+    return cut >= 0 ? out.slice(0, cut) : out;
+}
+
+// Raw-wire pre-check (SSE event or JSON body): does it carry anything the
+// bili-artifact stripper would act on? Literal and \u003c-escaped chain opens
+// plus the two header lines (plain ASCII, survive JSON escaping unscathed).
+export function containsBiliInternalText(s: string): boolean {
+    return s.includes(TAG_OPEN)
+        || s.includes(CHAIN_OPEN_ESCAPED)
+        || s.includes(CODEX_FORGED_HANDOFF_HEADER)
+        || s.includes(FORGED_SUMMARY_HEADER);
+}
+
+function reEscape(s: string): string {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function prefixAlts(s: string, minLen: number): string[] {
+    const out: string[] = [];
+    for (let k = minLen; k < s.length; k++) out.push(reEscape(s.slice(0, k)));
+    return out;
+}
+
+// Streaming tail probes: a buffer cut mid-opening ends in the opening's
+// leading chars, so the held tail is any prefix of either open form (plus the
+// complete forms); a last line that is still a prefix of a header is held
+// from its first char — a lone line-start "[" must survive chunk boundaries
+// because both headers begin with it and the decision splits on the second
+// char (broad-hold/strict-decide, same trade as MARKER_HEAD_PREFIX).
+const CHAIN_PARTIAL_TAIL = new RegExp("(" + [...new Set([
+    ...prefixAlts(TAG_OPEN, 1),
+    reEscape(TAG_OPEN),
+    ...prefixAlts(CHAIN_OPEN_ESCAPED, 1),
+    reEscape(CHAIN_OPEN_ESCAPED),
+])].join("|") + ")$");
+const HEAD_PREFIX_TAIL = new RegExp("(?:^|\n)(" + [...new Set([
+    ...prefixAlts(CODEX_FORGED_HANDOFF_HEADER, 1),
+    ...prefixAlts(FORGED_SUMMARY_HEADER, 1),
+])].join("|") + ")$");
+
+/** Fast-path gate for the streaming pipes: could this chunk contain a bili
+ *  internal artifact, or leave one undecidable across the chunk boundary?
+ *  Coarse by design — a false positive costs one no-op filter pass, but
+ *  skipping a chunk that carries or starts an artifact forwards it raw. */
+export function mayStartBiliInternal(s: string): boolean {
+    return containsBiliInternalText(s) || CHAIN_PARTIAL_TAIL.test(s) || HEAD_PREFIX_TAIL.test(s);
+}
+
+function tailHoldLen(s: string): number {
+    const m = CHAIN_PARTIAL_TAIL.exec(s);
+    const h = HEAD_PREFIX_TAIL.exec(s);
+    return Math.max(m ? m[0].length : 0, h ? h[0].length : 0);
+}
+
+export function createBiliArtifactFilter(onDrop?: (snippet: string) => void): TagEchoFilter {
+    let buf = "";
+    let swallowing = false;
+    let droppedAny = false;
+    let notified = false;
+    let inputChars = 0;
+    let outputChars = 0;
+    const drop = (snippet: string) => {
+        droppedAny = true;
+        if (onDrop && !notified) {
+            notified = true;
+            onDrop(snippet);
+        }
+    };
+    const process = (input: string): string => {
+        inputChars += input.length;
+        if (swallowing) return "";
+        buf += input;
+        let out = "";
+        let openHeld = false;
+        for (;;) {
+            const cut = headBlockCut(buf);
+            if (cut >= 0) {
+                out += buf.slice(0, cut);
+                drop(buf.slice(cut));
+                swallowing = true;
+                buf = "";
+                break;
+            }
+            const span = nextChainSpan(buf);
+            if (span !== null) {
+                out += buf.slice(0, span.start);
+                drop(buf.slice(span.start, span.end));
+                buf = buf.slice(span.end);
+                continue;
+            }
+            const oi = chainOpenIndex(buf);
+            if (oi >= 0) {
+                out += buf.slice(0, oi);
+                const tail = buf.slice(oi);
+                if (tail.length > CHAIN_TAIL_CAP) {
+                    // Over cap without a terminator: not a real carrier (those
+                    // are bounded far below the cap) — release as prose, never
+                    // drop (#1039 content preservation, cf. #644).
+                    out += tail;
+                    buf = "";
+                } else {
+                    buf = tail;
+                    openHeld = true;
+                }
+                break;
+            }
+            break;
+        }
+        if (!swallowing && buf.length > 0 && !openHeld) {
+            const hold = tailHoldLen(buf);
+            if (hold > 0) {
+                out += buf.slice(0, buf.length - hold);
+                buf = buf.slice(buf.length - hold);
+            } else {
+                out += buf;
+                buf = "";
+            }
+        }
+        outputChars += out.length;
+        return out;
+    };
+    return {
+        push: process,
+        flush(): string {
+            let out = "";
+            if (swallowing) {
+                if (buf.length > 0) drop(buf);
+                buf = "";
+                swallowing = false;
+            } else if (buf.length > 0) {
+                out = buf;
+                buf = "";
+            }
+            outputChars += out.length;
+            return out;
+        },
+        dropped: () => droppedAny,
+        pending: () => buf.length > 0 || swallowing,
+        stats: () => ({ inputChars, outputChars, dropped: droppedAny }),
+    };
+}
+
 export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEchoFilter {
     let held = "";
     let swallowUntilClose = false;
@@ -282,12 +539,22 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
         for (;;) {
             if (swallowUntilClose) {
                 const combined = swallowed + buf;
-                const end = looseCloseEnd(combined);
-                if (end >= 0) {
-                    drop(combined.slice(0, end));
+                const span = looseCloseSpan(combined);
+                if (span !== null) {
+                    // Only a ref-shaped body is tag content (#1720): a prose
+                    // body between paired tags is released and just the close
+                    // goes. An attested imitation (swallowReleases=false)
+                    // discards whatever the body is.
+                    const inner = combined.slice(0, span.start);
+                    if (REF_LIKE.test(inner) || !swallowReleases) {
+                        drop(combined.slice(0, span.end));
+                    } else {
+                        out += inner;
+                        drop(combined.slice(span.start, span.end));
+                    }
                     swallowed = "";
                     swallowUntilClose = false;
-                    buf = combined.slice(end);
+                    buf = combined.slice(span.end);
                     continue;
                 }
                 if (combined.length > swallowLimit) {

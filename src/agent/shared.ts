@@ -182,6 +182,10 @@ export type RuntimeInfoReport = {
     contextWindow?: number;
     maxOutput?: number;
     baseURL?: string;
+    /** The conversation this report belongs to (#1531): lets the proxy keep
+     *  one session's entry isolated from sibling sessions in the same process
+     *  (main + subagents share the agent name but run different models). */
+    conversationId?: string;
     source?: string;
 };
 
@@ -198,20 +202,33 @@ export async function reportRuntimeInfo(proxyBase: string, info: RuntimeInfoRepo
     if (!ok) throw new Error(`runtime-info report failed (${status})`);
 }
 
-// Per-agent last report (model id): a stamp fires at most one POST per model
-// switch, not per request. Failed reports roll back so the next stamp retries.
+// Per-(agent, conversation) fingerprint of the last successfully reported
+// config: at most one POST per distinct config, not per request. #1531: the
+// old key was the bare model id, so a changed contextWindow/maxOutput/baseURL
+// was never re-reported, and sibling sessions sharing an agent name masked
+// each other. Keying by agent+conversation keeps interleaved sessions quiet
+// while any field change (including a proxy-origin switch) re-reports.
 const lastRuntimeReport = new Map<string, string>();
 
-/** Stamp-time runtime-info report (#955): no-op unless the agent's reported
- *  model changed (or this is the first stamp after proxy attach/spawn).
- *  Soft-fail — an unreachable proxy keeps wire mode exactly as before. */
-export function reportRuntimeInfoOnChange(proxyBase: string | undefined, info: RuntimeInfoReport): void {
+function runtimeReportFingerprint(proxyBase: string, info: RuntimeInfoReport): string {
+    return [proxyBase, info.agent, info.conversationId ?? "", info.model, String(info.contextWindow ?? ""), String(info.maxOutput ?? ""), info.baseURL ?? ""].join("\u0000");
+}
+
+/** Stamp-time runtime-info report (#955): no-op unless the reported config
+ *  changed since the last successful stamp (or this is the first stamp after
+ *  proxy attach/spawn). Soft-fail — an unreachable proxy keeps wire mode
+ *  exactly as before; a failed report rolls back so the next stamp retries. */
+export async function reportRuntimeInfoOnChange(proxyBase: string | undefined, info: RuntimeInfoReport): Promise<void> {
     if (proxyBase === undefined || proxyBase.length === 0) return;
-    if (lastRuntimeReport.get(info.agent) === info.model) return;
-    lastRuntimeReport.set(info.agent, info.model);
-    void reportRuntimeInfo(proxyBase, info).catch(() => {
-        lastRuntimeReport.delete(info.agent);
-    });
+    const key = `${info.agent}\u0000${info.conversationId ?? ""}`;
+    const fingerprint = runtimeReportFingerprint(proxyBase, info);
+    if (lastRuntimeReport.get(key) === fingerprint) return;
+    lastRuntimeReport.set(key, fingerprint);
+    try {
+        await reportRuntimeInfo(proxyBase, info);
+    } catch {
+        lastRuntimeReport.delete(key);
+    }
 }
 
 export async function forwardTool(proxyBase: string, conversationId: string, tool: string, args: unknown, signal?: AbortSignal): Promise<string> {
@@ -287,4 +304,43 @@ export function armedIdleNotice(version: string): string {
 /** Fallback when the version probe also fails — a warning, not an info notice. */
 export function noSessionWarning(): string {
     return "bili: no ACP session yet (send a model request first, then run /acp)";
+}
+
+// The OpenCode V2 TUI renders a synthetic message as a visible Notice row only while its display
+// text fits the timeline cap (~1KB); longer rows render nothing (#880). bili cannot change the
+// host cap, so overflow is handled at render time (#1602): the Web UI deep link is hoisted to
+// line one so it always survives truncation (the full panel stays reachable through the Web UI),
+// and leading WHOLE lines are kept within a budget that reserves room for the marker.
+
+/** Fit report/panel text into a V2 synthetic notice description: verbatim under the hard cap;
+ *  over it, hoist `webUrl` (the status endpoint's deep link; for cache reports the proxy already
+ *  leads the result with it) to line one, keep leading whole lines (no mid-line cuts), and append
+ *  a truncation marker sized so the total never exceeds `max`. */
+export function fitNoticeDescription(text: string, max: number, kind: "panel" | "report", webUrl?: string): string {
+    if (text.length <= max) return text;
+    const lines = text.split("\n");
+    if (webUrl !== undefined && webUrl.length > 0) {
+        const body = lines.filter((l) => !/^Web UI: \S/.test(l));
+        lines.length = 0;
+        lines.push(`Web UI: ${webUrl}`, ...body);
+    }
+    if (lines.length === 1) {
+        const marker = `\n\n[${kind} truncated]`;
+        return lines[0].slice(0, Math.max(0, max - marker.length)) + marker;
+    }
+    // Budget against the widest-plausible marker (max dropped-count digits) so the real one
+    // can only be shorter — the result is guaranteed ≤ max without a second pass.
+    const probeMarker = `\n\n[${kind} truncated] ${lines.length} more lines`;
+    const budget = max - probeMarker.length;
+    const kept: string[] = [];
+    let acc = 0;
+    for (const line of lines) {
+        const next = acc + (kept.length > 0 ? 1 : 0) + line.length;
+        if (next > budget && kept.length > 0) break;
+        kept.push(line);
+        acc = next;
+    }
+    const dropped = lines.length - kept.length;
+    const desc = kept.join("\n") + `\n\n[${kind} truncated] ${dropped} more line${dropped === 1 ? "" : "s"}`;
+    return desc.length <= max ? desc : desc.slice(0, max);
 }

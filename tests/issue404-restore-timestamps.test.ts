@@ -2,13 +2,14 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createCore, createInitialState, defaultConfig } from "acp-kernel";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _resetSessionsForTest, getSession, initSessions, peekSession, type Session } from "../src/session.ts";
 import { handlePluginStatus } from "../src/plugin.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 /**
  * #404: a restart must not fabricate activity.
@@ -115,7 +116,7 @@ await test("boot restore: lastSeen=savedAt, restored flag, freshness-keyed trunc
         assert.ok(res2.body.includes("since boot"), "explicit no-post-boot-activity error instead of a readdir-order guess");
     } finally {
         store.cancelAll();
-        rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
         _resetSessionsForTest(64);
     }
 });
@@ -135,7 +136,7 @@ await test("writeNow → loadAll round-trip keeps savedAt as lastSeen (#404)", a
         assert.equal(loaded.restored, true);
     } finally {
         store.cancelAll();
-        rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -153,7 +154,7 @@ await test("memory-miss reload counts as real activity: restored cleared, lastSe
         assert.notEqual(s.restored, true, "and clears the restored flag — fallback=latest may resolve it");
     } finally {
         store.cancelAll();
-        rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
         _resetSessionsForTest(64);
     }
 });
