@@ -22,7 +22,8 @@ import path from "node:path";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
 import { createBiliPlugin } from "./pi.js";
 import { isLegacyBcpEntry, markNativeHost, nativeBootstrapGate, nativeProxyScriptPath, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
-import { installNativeFetchIntercept, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
+import { installNativeFetchIntercept, readyOrigin, setDeclaredModelEndpoints, type NativeInterceptState } from "./native-intercept.js";
+import { loadDeclaredModelEndpoints } from "../model-endpoints.js";
 import { fetchStatus } from "./shared.js";
 
 // Shared plumbing lives in native-bootstrap.ts (side-effect-free — importing
@@ -116,6 +117,9 @@ if (process.env.NODE_TEST_CONTEXT === undefined && nativeActive) {
         delete process.env.BILLION_CONTEXT_PROXY;
     };
     state.ready = start();
+    // #1295: declared custom-wire endpoints — same config source as the proxy;
+    // takes effect on the next host start (config is read once at arm time).
+    void loadDeclaredModelEndpoints().then(setDeclaredModelEndpoints);
     installNativeFetchIntercept(state);
 }
 

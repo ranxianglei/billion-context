@@ -19,6 +19,9 @@ import type http from "node:http";
  *  - google:    an in-stream `{"error":{code,message,status}}` frame — Gemini's
  *               own error channel, which its SDK throws on; the stream then
  *               ends (there is no separate terminal byte to synthesize).
+ *  - commandcode: a bare-JSONL `{"type":"error",error,message}` line — the
+ *               CLI wire's own error event, which dsh's handleCliEvent turns
+ *               into a thrown LlmError; the stream then ends.
  * compat.streamErrorShape="completion" restores the legacy shapes (failure text
  * delivered inside a synthesized successful completion), for hosts whose SDK
  * cannot surface an in-band error event.
@@ -27,7 +30,7 @@ import type http from "node:http";
  * still attempt res.end(). Never throws.
  */
 
-type Protocol = "anthropic" | "openai" | "responses" | "google";
+type Protocol = "anthropic" | "openai" | "responses" | "google" | "commandcode";
 
 function safeWrite(res: http.ServerResponse, chunk: string): void {
     try {
@@ -52,6 +55,10 @@ function nativeErrorChunk(protocol: Protocol, message: string): string {
         // Gemini's error object is `{code: number, message, status}` — a
         // numeric code + gRPC-style status, no free-form `type`.
         return `data: ${JSON.stringify({ error: { code: 500, message, status: "INTERNAL" } })}\n\n`;
+    }
+    if (protocol === "commandcode") {
+        // #1295: bare-JSONL error line — the CLI wire's own error event.
+        return `${JSON.stringify({ type: "error", error: "acp_proxy_error", message })}\n`;
     }
     return `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "server_error", code: "stream_error", message } })}\n\n`;
 }
@@ -83,6 +90,10 @@ function legacyCompletionChunk(protocol: Protocol, visible: string): string {
     }
     if (protocol === "google") {
         return `data: ${JSON.stringify({ error: { code: 500, message: visible, status: "INTERNAL" } })}\n\n`;
+    }
+    if (protocol === "commandcode") {
+        // #1295: the CLI wire has no "completion" disguise — always the native error line.
+        return `${JSON.stringify({ type: "error", error: "acp_proxy_error", message: visible })}\n`;
     }
     return `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", delta: { type: "text_delta", text: visible } })}\n\n` +
         `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" } })}\n\n` +
@@ -152,6 +163,10 @@ export function emitUpstreamTruncation(res: http.ServerResponse, protocol: Proto
             // object would read as a second answer. Only the mid-flight cut
             // needs the error frame (503/UNAVAILABLE — an upstream-cut stream).
             if (!finished) safeWrite(res, `data: ${JSON.stringify({ error: { code: 503, message, status: "UNAVAILABLE" } })}\n\n`);
+        } else if (protocol === "commandcode") {
+            // The finish event IS this wire's terminator: when delivered there
+            // is nothing to synthesize; only a mid-flight cut gets an error line.
+            if (!finished) safeWrite(res, `${JSON.stringify({ type: "error", error: "upstream_stream_truncated", message })}\n`);
         } else {
             if (finished) {
                 safeWrite(res, `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`);
@@ -181,6 +196,9 @@ export function emitUpstreamTruncation(res: http.ServerResponse, protocol: Proto
  *  - google:    an `{"error":{code,message,status}}` frame; the retryability
  *               survives as the numeric-code/status pair (503 UNAVAILABLE vs
  *               500 INTERNAL), Gemini having no free-form `type` field.
+ *  - commandcode: a bare-JSONL error line; the CLI wire has no
+ *               stream-level retryability channel (its HTTP layer owns
+ *               retries), so only code+message survive.
  * Never throws.
  */
 export function emitPreflightError(res: http.ServerResponse, protocol: Protocol, error: { message: string; retryable: boolean }, log?: (msg: string) => void): void {
@@ -193,6 +211,8 @@ export function emitPreflightError(res: http.ServerResponse, protocol: Protocol,
             safeWrite(res, `event: error\ndata: ${JSON.stringify({ type: "error", code: err.code, message: err.message })}\n\n`);
         } else if (protocol === "google") {
             safeWrite(res, `data: ${JSON.stringify({ error: { code: error.retryable ? 503 : 500, message: error.message, status: error.retryable ? "UNAVAILABLE" : "INTERNAL" } })}\n\n`);
+        } else if (protocol === "commandcode") {
+            safeWrite(res, `${JSON.stringify({ type: "error", error: err.code, message: err.message })}\n`);
         } else {
             safeWrite(res, `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "server_error", code: err.code, message: err.message } })}\n\n`);
         }
