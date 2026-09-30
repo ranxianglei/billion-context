@@ -32,6 +32,10 @@ export const MAX_PREFLIGHT_ROUNDS = 16;
 const CHUNK_FRACTION = 0.6;
 const MIN_CHUNK_TOKENS = 2000;
 const MIN_SUMMARY_CHARS = 50;
+// #1775: gap between joined chunk summaries ("\n\n") — subtracted when
+// spreading maxSummaryLength across chunks so the assembled candidate fits the
+// cap when every chunk lands exactly on its per-chunk budget.
+const SUMMARY_JOIN_GAP = 2;
 // #853: thinking-on-by-default models spend the shared output budget on
 // reasoning_content before any answer text (observed ~9.5k reasoning tokens on
 // deepseek-flash, whose real output ceiling is 384k) — the old 8192 cap
@@ -265,6 +269,24 @@ export function splitSummaryContent(content: string, budget: number, countTokens
         offset = low;
     }
     return chunks;
+}
+
+// #1775: rescue for an assembled summary that exceeds maxSummaryLength but is
+// still shorter than the folded content — truncating to the cap nets savings,
+// so keep the summary instead of discarding the whole range (the halving retry
+// cannot help: on tool-dense spans summary length does not scale with input
+// size, so every half fails identically). Cuts at a line boundary with a
+// marker, only if the result still passes the kernel's minSummaryLength gate;
+// null when the cap cannot carry a usable result (caller keeps the discard).
+function truncateSummaryToLimit(text: string, maxChars: number, minChars: number): string | null {
+    if (text.length <= maxChars) return text;
+    const marker = "\n[truncated]";
+    const room = maxChars - marker.length;
+    if (room < minChars) return null;
+    let cut = text.lastIndexOf("\n", room);
+    if (cut < minChars) cut = room;
+    const out = `${text.slice(0, cut)}${marker}`;
+    return out.length <= maxChars && out.trim().length >= minChars ? out : null;
 }
 
 // minUnits: never close a chunk below this many countText units while more
@@ -684,10 +706,18 @@ function emptyCompletionDetail(json: Record<string, unknown>): string | null {
     return parts.length > 0 ? ` (${parts.join(", ")})` : "";
 }
 
-async function summarizeRange(deps: PreflightDeps, content: string, startRef: string, endRef: string): Promise<SummaryOutcome> {
+async function summarizeRange(deps: PreflightDeps, content: string, startRef: string, endRef: string, lengthBudget?: number): Promise<SummaryOutcome> {
+    // #1775: the cap used to be enforced only after the fact — an over-cap
+    // assembly was discarded wholesale (the #1775 incident). Tell the model the
+    // character budget up front so the first attempt already fits. Below
+    // MIN_SUMMARY_CHARS the instruction would be counterproductive (the kernel
+    // minimum-summary gate rejects such output anyway), so omit it.
     const system =
         buildCompressSystemPrompt(deps.prompts, deps.surface?.promptSections) +
-        `\n\nTASK: The conversation segment below (messages ${startRef}–${endRef}) must be compressed because the session context exceeds the current model's window. Write a tier-1 compression summary of the segment following every rule above. Output ONLY the summary text — no preamble, no closing remarks, no tool calls.`;
+        `\n\nTASK: The conversation segment below (messages ${startRef}–${endRef}) must be compressed because the session context exceeds the current model's window. Write a tier-1 compression summary of the segment following every rule above. Output ONLY the summary text — no preamble, no closing remarks, no tool calls.` +
+        (lengthBudget !== undefined && lengthBudget >= MIN_SUMMARY_CHARS
+            ? `\n\nLENGTH BUDGET: Your ENTIRE response must be AT MOST ${lengthBudget} characters total — longer output is rejected by the pipeline. Be dense: compact bullets, no filler or repetition.`
+            : "");
     // #626: the session remembers upstreams that require stream:true, so the
     // extra 400 round-trip is paid at most once per session (persisted with
     // the session metadata). #663: likewise, per URL+model, upstreams that
@@ -1108,13 +1138,19 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 try {
                     const parts: string[] = [];
                     const chunks = splitSummaryContent(content, budget, countText);
+                    // #1775: spread maxSummaryLength across the chunks (minus the exact
+                    // "\n\n" join gaps) so each summarization call carries a per-chunk
+                    // character ceiling — previously nothing bounded the model's output,
+                    // and one verbose chunk made the whole assembly unusable.
+                    const maxSummary = activeConfig.compress.maxSummaryLength;
+                    const perChunkBudget = maxSummary > 0 ? Math.floor((maxSummary - (chunks.length - 1) * SUMMARY_JOIN_GAP) / chunks.length) : undefined;
                     for (const chunk of chunks) {
                         if (summaryCalls >= MAX_SUMMARY_CALLS_PER_PREFLIGHT) {
                             budgetHit = true;
                             break;
                         }
                         summaryCalls += 1;
-                        let part = await summarizeRange(deps, chunk, startRef, endRef);
+                        let part = await summarizeRange(deps, chunk, startRef, endRef, perChunkBudget);
                         let transientTries = 0;
                         while (
                             "unusable" in part && part.transient &&
@@ -1129,7 +1165,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                             deps.log("warn", `[preflight] transient empty summary on ${startRef}:${endRef} (${part.unusable.slice(0, 160)}); retrying same span in ${delayMs}ms (${transientTries}/${TRANSIENT_EMPTY_SUMMARY_RETRIES})`);
                             await sleep(delayMs, deps.signal);
                             summaryCalls += 1;
-                            part = await summarizeRange(deps, chunk, startRef, endRef);
+                            part = await summarizeRange(deps, chunk, startRef, endRef, perChunkBudget);
                         }
                         if ("unusable" in part) {
                             outcome = part;
@@ -1141,25 +1177,39 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                         const candidate = parts.join("\n\n");
                         // #861: a summary the kernel would reject on length wastes the apply
                         // attempt and its failure log — route it through the same
-                        // halving/skip path as any unusable output.
-                        if (activeConfig.compress.maxSummaryLength <= 0 || candidate.length <= activeConfig.compress.maxSummaryLength) {
-                            // #1819: net-shrink monotonicity (NET_SHRINK_TOLERANCE) — same
-                            // units as the post-fold accounting below: token regime takes
-                            // the kernel's credit for this span, char regime the raw-char
-                            // mass of the folded messages. A regurgitated summary that
-                            // exceeds its range routes through the halving/skip path like
-                            // any other unusable output instead of inflating the payload.
-                            const spanUnits = baselineKnown
-                                ? planned.compressedTokens
-                                : messages.filter((message) => planned.effectiveMessageIds.includes(message.id)).reduce((total, message) => total + (message.text ?? "").length, 0);
-                            const candidateUnits = countText(candidate);
-                            if (candidateUnits <= spanUnits * NET_SHRINK_TOLERANCE) {
+                        // halving/skip path as any unusable output. #1775: except when
+                        // truncating to the cap still nets savings (the candidate is
+                        // shorter than the folded content) — then rescue the summary
+                        // instead of discarding the whole range. #1819: every accepted
+                        // candidate — rescued or not — must additionally satisfy net-shrink
+                        // monotonicity (NET_SHRINK_TOLERANCE) — same units as the post-fold
+                        // accounting below: token regime takes the kernel's credit for this
+                        // span, char regime the raw-char mass of the folded messages. A
+                        // regurgitated summary that exceeds its range routes through the
+                        // halving/skip path like any other unusable output instead of
+                        // inflating the payload.
+                        const spanUnits = baselineKnown
+                            ? planned.compressedTokens
+                            : messages.filter((message) => planned.effectiveMessageIds.includes(message.id)).reduce((total, message) => total + (message.text ?? "").length, 0);
+                        const shrinkOk = (text: string): boolean => countText(text) <= spanUnits * NET_SHRINK_TOLERANCE;
+                        if (maxSummary <= 0 || candidate.length <= maxSummary) {
+                            if (shrinkOk(candidate)) {
                                 summary = candidate;
                             } else {
-                                outcome = { unusable: `assembled summary (~${candidateUnits} units) does not shrink its range (~${spanUnits} units) — suspected regurgitation` };
+                                outcome = { unusable: `assembled summary (~${countText(candidate)} units) does not shrink its range (~${spanUnits} units) — suspected regurgitation` };
+                            }
+                        } else if (candidate.length < content.length) {
+                            const rescued = truncateSummaryToLimit(candidate, maxSummary, activeConfig.compress.minSummaryLength);
+                            if (rescued !== null && shrinkOk(rescued)) {
+                                deps.log("warn", `[preflight] range ${skipKey}: assembled summary ${candidate.length} chars exceeded maxSummaryLength (${maxSummary}); truncated to ${rescued.length} chars`);
+                                summary = rescued;
+                            } else if (rescued !== null) {
+                                outcome = { unusable: `assembled summary (~${countText(rescued)} units after truncation) does not shrink its range (~${spanUnits} units) — suspected regurgitation` };
+                            } else {
+                                outcome = { unusable: `assembled summary (${candidate.length} chars) exceeds maxSummaryLength (${maxSummary}) and cannot be truncated to a usable length` };
                             }
                         } else {
-                            outcome = { unusable: `assembled summary (${candidate.length} chars) exceeds maxSummaryLength (${activeConfig.compress.maxSummaryLength})` };
+                            outcome = { unusable: `assembled summary (${candidate.length} chars) exceeds maxSummaryLength (${maxSummary}) and is not shorter than the folded content (${content.length} chars)` };
                         }
                     }
                 } catch (err) {
