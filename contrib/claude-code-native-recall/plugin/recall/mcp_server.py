@@ -176,7 +176,7 @@ def handle(req):
     method, params = req.get('method'), req.get('params') or {}
     if method == 'initialize':
         return {'protocolVersion': params.get('protocolVersion', '2024-11-05'), 'capabilities': {'tools': {}},
-                'serverInfo': {'name': 'recall', 'version': '0.2.0'}}
+                'serverInfo': {'name': 'recall', 'version': '0.2.1'}}
     if method == 'tools/list':
         return {'tools': TOOLS}
     if method == 'tools/call':
