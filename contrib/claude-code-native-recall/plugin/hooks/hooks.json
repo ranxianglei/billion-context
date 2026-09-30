@@ -1,0 +1,91 @@
+{
+  "description": "billion-claude-recall: nudge, compaction gate, post-compaction restore",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" nudge",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" nudge",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" precompact",
+            "timeout": 60
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" restore 0",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "python -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" restore 1",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "python -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" restore 2",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "python -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" restore 3",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "python -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" restore 4",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "python -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" restore 5",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "python -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" restore 6",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "python -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" restore 7",
+            "timeout": 30
+          },
+          {
+            "type": "command",
+            "command": "python -X utf8 \"${CLAUDE_PLUGIN_ROOT}/recall/hook.py\" restore 8",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
