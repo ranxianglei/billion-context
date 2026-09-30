@@ -1,5 +1,6 @@
 """v2 behaviour: summaries, pressure layers, digests, rules, todos, status, absorb (ported from acp-kernel)."""
 import json
+import os
 import pathlib
 import re
 import unittest
@@ -135,7 +136,9 @@ class V2Test(RecallTest):
         tmp = self.root / 'archive' / 'tmp'
         tmp.mkdir(parents=True)
         for i in range(55):
-            (tmp / f'old{i:02}.md').write_text('x', encoding='utf-8')
+            p = tmp / f'old{i:02}.md'
+            p.write_text('x', encoding='utf-8')
+            os.utime(p, (1_700_000_000 + i, 1_700_000_000 + i))  # distinct mtimes: eviction order must not depend on fs granularity
         small, large = self.mcp([('recall_get', {'turn': 2, 'to_turn': 3}),
                                  ('recall_get', {'turn': 6, 'to_turn': 8})])
         self.assertIn('内容 2 标识符 KEY2', small)
