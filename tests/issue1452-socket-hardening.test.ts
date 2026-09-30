@@ -11,7 +11,7 @@ import { startServer } from "../src/server.ts";
 import { loadRoutes, type ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { streamStallMs, _liveUpstreamTimersForTest } from "../src/fetch-util.ts";
+import { streamStallMs, configureStreamStallMs, STREAM_STALL_MIN_MS, _liveUpstreamTimersForTest } from "../src/fetch-util.ts";
 import { setLogCapture } from "../src/logger.ts";
 import { rmrf } from "./tmp-rm.ts";
 
@@ -25,7 +25,7 @@ interface Harness {
     cleanup: () => void;
 }
 
-async function startProxy(upstream: http.Server | net.Server, debug: boolean): Promise<Harness> {
+async function startProxy(upstream: http.Server | net.Server, debug: boolean, stallMs?: number): Promise<Harness> {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const root = path.join(tmpdir(), `bili-issue1452-${process.pid}-${Date.now()}`);
@@ -57,6 +57,7 @@ async function startProxy(upstream: http.Server | net.Server, debug: boolean): P
         passthroughSource: null,
         autoUpdate: false,
         mitm: { enabled: false, domains: [] },
+        ...(stallMs === undefined ? {} : { streamStallMs: stallMs }),
     };
     const proxy = await startServer(opts);
     if (!proxy.listening) await once(proxy, "listening");
@@ -85,20 +86,29 @@ function withEnv(name: string, value: string | undefined): () => void {
     };
 }
 
-test("streamStallMs: env parsing — off by default, strict positive integers only (#1452)", () => {
-    const restore = withEnv("BILI_STREAM_STALL_MS", undefined);
+test("streamStallMs: config resolution — off by default, sub-5s values clamp up (#1452/#1714)", () => {
     try {
+        configureStreamStallMs(undefined);
         assert.equal(streamStallMs(), 0);
-        process.env.BILI_STREAM_STALL_MS = "400";
-        assert.equal(streamStallMs(), 400);
-        process.env.BILI_STREAM_STALL_MS = "0";
+        configureStreamStallMs(0);
         assert.equal(streamStallMs(), 0);
-        process.env.BILI_STREAM_STALL_MS = "-5";
+        configureStreamStallMs(-5);
         assert.equal(streamStallMs(), 0);
-        process.env.BILI_STREAM_STALL_MS = "garbage";
+        configureStreamStallMs(Number.NaN);
         assert.equal(streamStallMs(), 0);
+        // #1706 regression: a stale `export BILI_STREAM_STALL_MS=400` truncated
+        // every thinking turn — sub-second budgets must never take effect.
+        configureStreamStallMs(400);
+        assert.equal(STREAM_STALL_MIN_MS, 5000);
+        assert.equal(streamStallMs(), 5000);
+        configureStreamStallMs(4999);
+        assert.equal(streamStallMs(), 5000);
+        configureStreamStallMs(5000);
+        assert.equal(streamStallMs(), 5000);
+        configureStreamStallMs(30_000);
+        assert.equal(streamStallMs(), 30_000);
     } finally {
-        restore();
+        configureStreamStallMs(undefined);
     }
 });
 
@@ -347,13 +357,14 @@ test("stall guard: silent mid-stream upstream ends in in-band error + FIN, not a
         res.write('data: {"choices":[{"delta":{"content":"chunk-1"}}]}\n\n');
     });
     await new Promise<void>((r) => upstream.listen(0, "127.0.0.1", () => r()));
-    const restoreStall = withEnv("BILI_STREAM_STALL_MS", "400");
     const restoreIdle = withEnv("BILI_UPSTREAM_TIMEOUT_MS", "60000");
     const captured: { level: string; msg: string }[] = [];
     setLogCapture((level, msg) => captured.push({ level, msg }));
     let harness: Harness | null = null;
     try {
-        harness = await startProxy(upstream, false);
+        // Config value 400 exercises the #1714 clamp end-to-end: the effective
+        // budget below is the 5s floor, not the configured 400ms (#1706).
+        harness = await startProxy(upstream, false, 400);
         const ac = new AbortController();
         const guard = setTimeout(() => ac.abort(), 15_000);
         guard.unref?.();
@@ -372,11 +383,10 @@ test("stall guard: silent mid-stream upstream ends in in-band error + FIN, not a
         // cause (the stall-guard abort) is pinned via the server-side warn line.
         assert.ok(body.includes("upstream_stream_truncated"), `expected in-band truncation frame, got: ${body.slice(0, 300)}`);
         assert.ok(body.includes("data: [DONE]"), "stream must terminate with the protocol terminal event");
-        const warn = captured.find((c) => c.level === "warn" && c.msg.includes("upstream stalled: no bytes for 400ms"));
+        const warn = captured.find((c) => c.level === "warn" && c.msg.includes("upstream stalled: no bytes for 5000ms"));
         assert.ok(warn, `expected stall-guard attribution in server logs, got: ${captured.map((c) => c.msg).join(" | ").slice(0, 400)}`);
         assert.ok(elapsed < 10_000, `stall guard took too long to fire (${elapsed}ms)`);
     } finally {
-        restoreStall();
         restoreIdle();
         setLogCapture(null);
         if (harness) { await harness.stop(); harness.cleanup(); }
@@ -387,14 +397,15 @@ test("stall guard: silent mid-stream upstream ends in in-band error + FIN, not a
 });
 
 test("stall guard: healthy stream longer than the budget survives — re-arm per byte (#1452)", async () => {
-    // 12 chunks at 250ms = ~3000ms total > 2000ms budget: a total-time deadline
-    // would cut this stream at 2000ms, per-byte re-arm must not. The budget is
-    // set 8x the 250ms cadence so a single inter-byte gap would have to slip by
-    // ~1.75s beyond its nominal fire time to masquerade as a stall — far past
-    // the timer jitter a loaded CI runner (parallel suite + concurrent build)
-    // actually produces. The old 750ms budget (3x) tripped under exactly that
-    // load (#1697): one starved setInterval tick stretched a single gap past it.
-    const intervalMs = 250;
+    // 12 chunks at 500ms = ~6000ms total > 5000ms budget (the #1714 floor): a
+    // total-time deadline would cut this stream at 5000ms, per-byte re-arm must
+    // not. The budget is set 2x the 500ms cadence so a single inter-byte gap
+    // would have to slip by ~4.5s beyond its nominal fire time to masquerade as
+    // a stall — far past the timer jitter a loaded CI runner (parallel suite +
+    // concurrent build) actually produces. The old 750ms budget (3x) tripped
+    // under exactly that load (#1697): one starved setInterval tick stretched a
+    // single gap past it.
+    const intervalMs = 500;
     const totalChunks = 12;
     const upstream = http.createServer((_req, res) => {
         res.writeHead(200, { "content-type": "text/event-stream", "connection": "close" });
@@ -412,11 +423,10 @@ test("stall guard: healthy stream longer than the budget survives — re-arm per
         _req.on("close", () => clearInterval(t));
     });
     await new Promise<void>((r) => upstream.listen(0, "127.0.0.1", () => r()));
-    const restoreStall = withEnv("BILI_STREAM_STALL_MS", "2000");
     const restoreIdle = withEnv("BILI_UPSTREAM_TIMEOUT_MS", "60000");
     let harness: Harness | null = null;
     try {
-        harness = await startProxy(upstream, false);
+        harness = await startProxy(upstream, false, 5000);
         const ac = new AbortController();
         const guard = setTimeout(() => ac.abort(), 15_000);
         guard.unref?.();
@@ -431,7 +441,6 @@ test("stall guard: healthy stream longer than the budget survives — re-arm per
         assert.ok(body.includes("[DONE]"), `healthy stream must complete with the terminal event: ${body.slice(0, 300)}`);
         assert.ok(!body.includes("upstream_stream_truncated"), `healthy stream must not trip the stall guard: ${body.slice(0, 300)}`);
     } finally {
-        restoreStall();
         restoreIdle();
         if (harness) { await harness.stop(); harness.cleanup(); }
         upstream.closeAllConnections?.();
@@ -447,7 +456,6 @@ test("stall guard: default-off — silence after first byte does NOT cut the str
         res.write('data: {"choices":[{"delta":{"content":"chunk-1"}}]}\n\n');
     });
     await new Promise<void>((r) => upstream.listen(0, "127.0.0.1", () => r()));
-    const restoreStall = withEnv("BILI_STREAM_STALL_MS", undefined);
     const restoreIdle = withEnv("BILI_UPSTREAM_TIMEOUT_MS", "60000");
     let harness: Harness | null = null;
     try {
@@ -468,7 +476,6 @@ test("stall guard: default-off — silence after first byte does NOT cut the str
         assert.ok(!soFar.includes("[DONE]"), `default-off must not terminate a still-open stream: ${soFar.slice(0, 300)}`);
         req.destroy();
     } finally {
-        restoreStall();
         restoreIdle();
         if (harness) { await harness.stop(); harness.cleanup(); }
         upstream.closeAllConnections?.();

@@ -14,7 +14,7 @@ import { resetProxyCache } from "./upstream-proxy.js";
 import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol } from "./config.js";
 import { contextFromRegistry, loadRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "./registry.js";
 import { codexAlignedWindow } from "./codex-models.js";
-import { fetchWithTimeout, MAX_REQUEST_BYTES, upstreamTimeoutMs } from "./fetch-util.js";
+import { fetchWithTimeout, MAX_REQUEST_BYTES, configureStreamStallMs, streamStallMs, upstreamTimeoutMs } from "./fetch-util.js";
 import { formatUpstreamError, getUpstreamConnectionStatus, recordUpstreamConnection, resolveProxy, resolveProxyDecision, proxyDispatcher, type UpstreamProxyDecision } from "./upstream-proxy.js";
 import { clearUpstreamAlertsForHost, getUpstreamAlerts, recordUpstreamAlert } from "./upstream-alerts.js";
 import { maskHeaderForLog, maskHeadersForLog, maskHostPortForLog, setMaskHostsEnabled, maskUrlForLog, maskUrlsInText } from "./log-mask.js";
@@ -369,6 +369,12 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     const core = createCore();
     const config: Config = opts.kernelConfig;
     const log = (level: string, msg: string) => logMsg(opts, level, msg);
+    // #1714 P1: wire the streaming stall guard from config.json (the env
+    // input BILI_STREAM_STALL_MS is retired). Surface it when armed so the
+    // knob is visible in the boot log instead of latent (#1706).
+    configureStreamStallMs(opts.streamStallMs);
+    const effectiveStreamStall = streamStallMs();
+    if (effectiveStreamStall > 0) log("info", `[stream] stall guard armed: ${effectiveStreamStall}ms of body silence after first byte (config.json streamStallMs)`);
     // #300: per-server identity stamped into the x-bili-hop marker on outbound
     // forwards. Per-server (not module-level) so two servers in one process
     // (tests) are distinct instances; a restart changing the id is harmless
@@ -1138,6 +1144,8 @@ async function handle(
             opts.auxProxyFallback = fresh.auxProxyFallback;
             opts.compress = fresh.compress;
             opts.compat = fresh.compat;
+            opts.streamStallMs = fresh.streamStallMs;
+            configureStreamStallMs(fresh.streamStallMs);
             resetProxyCache();
             for (const k of Object.keys(opts.routes)) delete opts.routes[k];
             Object.assign(opts.routes, loadRoutes());

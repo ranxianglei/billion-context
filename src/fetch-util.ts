@@ -36,10 +36,28 @@ export function upstreamTimeoutMs(): number {
  *  body byte arrives, re-armed on every subsequent byte. Catches a wedged
  *  mid-stream upstream (a stream that goes silent forever) long before the
  *  12-minute TTFB/idle budget, WITHOUT touching the prefill/TTFB budget that
- *  #551 deliberately kept long. 0 = off (default; zero behavior change). */
+ *  #551 deliberately kept long. 0 = off (default; zero behavior change).
+ *
+ *  Configured from config.json `streamStallMs` via configureStreamStallMs —
+ *  the env input BILI_STREAM_STALL_MS was retired in #1714 P1 because a stale
+ *  shell export silently rewrote runtime behavior (#1706: a leftover
+ *  `export BILI_STREAM_STALL_MS=400` truncated every thinking turn). Positive
+ *  values below STREAM_STALL_MIN_MS clamp UP to the floor: sub-second budgets
+ *  misfire on normal thinking-phase silence, so a small value is always a
+ *  mistake, never an intent. */
+export const STREAM_STALL_MIN_MS = 5000;
+
+let configuredStreamStallMs: number | undefined;
+
+export function configureStreamStallMs(ms: number | undefined): void {
+    configuredStreamStallMs = ms;
+}
+
 export function streamStallMs(): number {
-    const raw = Number(process.env.BILI_STREAM_STALL_MS);
-    return Number.isInteger(raw) && raw > 0 ? raw : 0;
+    if (typeof configuredStreamStallMs !== "number" || !Number.isFinite(configuredStreamStallMs)) return 0;
+    const raw = Math.floor(configuredStreamStallMs);
+    if (raw <= 0) return 0;
+    return raw < STREAM_STALL_MIN_MS ? STREAM_STALL_MIN_MS : raw;
 }
 
 // Direct (non-proxied) requests go through Node's hidden global agent, whose

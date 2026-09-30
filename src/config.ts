@@ -681,6 +681,13 @@ export type ProxyOptions = {
      *  session. Default OFF; enable with env BILI_STABLE_SYSTEM_ANCHOR=1 or
      *  `stableSystemAnchor: true` in the config file (env wins). */
     stableSystemAnchor?: boolean;
+    /** Streaming-phase stall guard (#1452), milliseconds: armed after the
+     *  first upstream body byte, re-armed per byte; aborts a mid-stream
+     *  silence longer than this. Unset/0 = off (default). Values below 5000
+     *  clamp up to 5000 at resolution time (sub-second budgets misfire on
+     *  thinking-phase silence, #1706). File-only since #1714 P1 — the env
+     *  input BILI_STREAM_STALL_MS is retired. */
+    streamStallMs?: number;
 };
 
 /** Re-read ONLY the routes from the current config sources, returning a fresh
@@ -959,6 +966,9 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         chainContentDetection: (env.BILI_CHAIN_CONTENT ?? (fileConfig.chainContentDetection === true ? "1" : "0")) !== "0",
         chainEgressStamp: (env.BILI_CHAIN_STAMP ?? (fileConfig.chainEgressStamp === true ? "1" : "0")) !== "0",
         stableSystemAnchor: (env.BILI_STABLE_SYSTEM_ANCHOR ?? (fileConfig.stableSystemAnchor === true ? "1" : "0")) !== "0",
+        // #1714 P1: file-only (the env input is retired); non-numeric values
+        // fall back to off rather than aborting startup on a stray field.
+        streamStallMs: typeof fileConfig.streamStallMs === "number" && Number.isFinite(fileConfig.streamStallMs) ? fileConfig.streamStallMs : undefined,
     };
 }
 
@@ -1042,6 +1052,12 @@ type FileConfig = {
     /** Set `true` to enable the sticky head-system anchor (#1085, default
      *  OFF; env BILI_STABLE_SYSTEM_ANCHOR wins). */
     stableSystemAnchor?: boolean;
+    /** Streaming-phase stall guard (#1452), milliseconds. Opt-in: unset or
+     *  0 = off. Positive values below 5000 clamp up to 5000 (#1706: a stale
+     *  env export of 400 truncated thinking turns — sub-second budgets are
+     *  never an intent). Replaces the retired env BILI_STREAM_STALL_MS
+     *  (#1714 P1). */
+    streamStallMs?: number;
     /** Global wire-compat block. `roles` maps message roles to the role name
      *  upstreams accept (e.g. `{"developer":"system"}`) — applied to the
      *  final forwarded body for openai/responses requests (#552).

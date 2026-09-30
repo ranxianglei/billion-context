@@ -155,6 +155,13 @@
 - **状态：** ACTIVE
 - **说明：** 预检尺寸门与输出钳制对内联（base64）图片的计费方式（#488/#496/#767）。`"bytes"` 按 `base64 长度 / 4` 计 token —— 保守，且对字节计费 relay 正确。`"pixels"` 只解析图片头（PNG/JPEG/WebP/GIF/BMP）、不解码完整图像，按第一方像素 tile 计费（OpenAI high-detail 模型：512px tile、短边放大到 768px、长边封顶 2048px → 每图 765–2805 token；无法解析的格式回退为固定 16384）。远程（`https://`）图片在两种模式下都固定计 4096。按 provider 的 `providers.<url>.imageBilling` 优先于本全局项，而 `BILI_IMAGE_BILLING` 环境变量优先于两者（实时读取，无需重启）。
 
+### `streamStallMs`
+
+- **类型：** `number`（毫秒）
+- **默认值：** 未设置 = 关闭
+- **状态：** ACTIVE（可选启用）
+- **说明：** 可选的流式阶段停滞守卫（#1452）：正数值 = 首个字节到达**之后**、相邻 body chunk 之间允许的最大静默毫秒数。超时后中止上游请求，客户端收到标准的带内截断信号（`upstream_stream_truncated` 错误帧 + `[DONE]`）随后干净 FIN——与上游中途 FIN 的线上结果相同，只是发现得更早。原因记录在服务端日志（`upstream stalled: no bytes for Nms …`）。低于 5000 的值会被提升到 5000：亚秒级预算会在正常的思考阶段静默误触发（#1706 —— 一条残留的 `export BILI_STREAM_STALL_MS=400` 曾把每一轮 thinking 都截断，下限机制落地前）。自 #1714 P1 起仅走配置文件：旧的环境变量 `BILI_STREAM_STALL_MS` 已退役、不再读取（shell 里的残留 export 被忽略）。支持经 `PUT /__bili/config` 热加载。分工：`BILI_UPSTREAM_TIMEOUT_MS` 是粗粒度常开的传输预算（12 分钟）；此开关是面向不能挂在死流上的交互式客户端的细粒度守卫。
+
 ---
 
 ## Providers
@@ -696,7 +703,7 @@
 | `ACP_PROVIDERS` | 指向外部 `providers.json` 的路径（旧版 / 共享文件）。 |
 | `BILI_REPLAY_RETRY_BASE_MS` | acp-loop 回放重试的基础退避延迟（毫秒）：上游瞬时拒绝后重试（默认 `1500`；设 `0` 关闭延迟）。见 #189。 |
 | `BILI_REPLAY_RETRY_MAX` | acp-loop 回放重试的总次数（默认 `3`；设 `1` 彻底关闭重试 —— 旧版 fail-fast 行为）。见 #189。 |
-| `BILI_STREAM_STALL_MS` | 可选的流式阶段停滞守卫（#1452）：正整数 = 首个字节到达**之后**、相邻 body chunk 之间允许的最大静默毫秒数。超时后中止上游请求，客户端收到标准的带内截断信号（`upstream_stream_truncated` 错误帧 + `[DONE]`）随后干净 FIN——与上游中途 FIN 的线上结果相同，只是发现得更早。原因记录在服务端日志（`upstream stalled: no bytes for Nms …`）。默认 `0`（关闭）：短暂上游停滞继续被容忍，仅受完整的 `BILI_UPSTREAM_TIMEOUT_MS` 预算约束。分工：`BILI_UPSTREAM_TIMEOUT_MS` 是粗粒度常开的传输预算（12 分钟）；此开关是面向不能挂在死流上的交互式客户端的细粒度守卫。 |
+| ~~`BILI_STREAM_STALL_MS`~~ | **#1714 P1 已退役。** 现仅走配置文件：改用 config.json 的 [`streamStallMs`](#streamstallms)。退役原因：env 层下任何正整数都原样生效、无下限无告警 —— 一条残留的 shell export（`400`）把每轮 thinking 都截断（#1706），且审计 config.json 时根本看不到它。现存残留 export 暂被静默忽略；退役名单的一次性启动告警将在 #1714 P4 落地。 |
 | `BILI_KEEP_ALIVE_TIMEOUT_MS` | 客户端侧套接字的 keep-alive 超时（毫秒，默认 `5000`，与 Node 隐式默认一致；#1452）。空闲客户端连接由 Node 内建回收器以干净 FIN 回收；此开关把原先隐式的值显式化并可配置，回收在连接生命周期台账（debug 日志）中分类为 `reason=idle-timeout`。非数字或非正值回退到 `5000`。 |
 | `BILI_EXPOSURE_LOG_INTERVAL_MS` | 长驻暴露遥测行 `[exposure] uptime=… liveConns=… tcpHandles=… handles=… sessions=… blindTunnels=… inFlight=…` 的周期（毫秒，默认 `3600000` 即每小时；#1452）。`0` 关闭。目的是让套接字句柄泄漏与僵尸连接在长期运行日志中现形，而不是靠事后取证。 |
 | `BILI_CLIENT_ERROR_BACKSTOP_MS` | clientError 排空路径的终局兜底（毫秒）（#1529，#1452 第 1 项后续）：排空 bail（300ms）对连接调用 `end()` 后，若对端始终不发 FIN，该套接字否则会在我方无限期半开滞留——keep-alive 回收器以已完成响应为键，且 Node 默认不开 SO_KEEPALIVE。bail 后静默超过此值时，代理改为销毁该套接字，在连接生命周期台账中分类为 `reason=clienterror-backstop` 并带独立的 warn 标记。对 #1452 的 RST 签名安全：整个窗口内套接字一直处于 `resume()` 排空状态，销毁时不携带未读残留字节。默认 `30000`；`0` 恢复「持有直到对端死亡」的旧行为。非数字或负值回退到 `30000`。 |
