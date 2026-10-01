@@ -52,6 +52,40 @@ function rebuildToolImages(message: CoreMessage): ResponseInputItem | undefined 
     return { ...raw, call_id: message.toolCallId ?? raw.call_id, output };
 }
 
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function foldConfigurationFields(base: Record<string, unknown>, overlay: Record<string, unknown>): Record<string, unknown> {
+    const out: Record<string, unknown> = { ...base };
+    for (const [key, value] of Object.entries(overlay)) {
+        if (isPlainRecord(out[key]) && isPlainRecord(value)) out[key] = foldConfigurationFields(out[key], value);
+        else out[key] = value;
+    }
+    return out;
+}
+
+// #1733 — upstream rejects consecutive configuration_update items (HTTP 400
+// unsupported_value). History compression prunes the messages that separated
+// them (untracked layout slots survive verbatim) and hoistTrappedToolItems can
+// batch them together too. Fold each adjacent run into one item with
+// sequential-assignment semantics: later updates win at the leaf, distinct
+// fields from both survive. No-op (byte-stable) when nothing is adjacent.
+export function mergeAdjacentConfigurationUpdates(items: readonly ResponseInputItem[]): ResponseInputItem[] {
+    const out: ResponseInputItem[] = [];
+    for (const item of items) {
+        const prev = out[out.length - 1];
+        if (item.type === "configuration_update" && prev !== undefined && prev.type === "configuration_update") {
+            const base: Record<string, unknown> = {};
+            for (const [key, value] of Object.entries(prev)) base[key] = value;
+            out[out.length - 1] = foldConfigurationFields(base, item) as ResponseInputItem;
+        } else {
+            out.push(item);
+        }
+    }
+    return out;
+}
+
 export function patchResponsesInputWithToolImages(projection: ResponsesProjection, messages: CoreMessage[]): string | ResponseInputItem[] {
     const input = patchResponsesInput(projection, messages);
     if (typeof input === "string") return input;
@@ -63,7 +97,7 @@ export function patchResponsesInputWithToolImages(projection: ResponsesProjectio
         byOriginal.set((message as BiliMessage).rawResponsesItem, rebuilt);
         byCall.set(`${rebuilt.type}:${message.toolCallId ?? ""}`, rebuilt);
     }
-    return input.map((item) => byOriginal.get(item) ?? byCall.get(`${item.type}:${item.call_id ?? ""}`) ?? item);
+    return mergeAdjacentConfigurationUpdates(input.map((item) => byOriginal.get(item) ?? byCall.get(`${item.type}:${item.call_id ?? ""}`) ?? item));
 }
 
 export function coreToResponsesWithToolImages(messages: CoreMessage[], customToolCallIds: Set<string> = new Set()): ResponseInputItem[] {

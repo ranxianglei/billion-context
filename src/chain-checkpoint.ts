@@ -62,7 +62,7 @@ export const DEFAULT_RECENT_CHECKPOINT_WINDOW_MS = 10 * 60 * 1000;
 // ≤~120 with short ids); the cap only bounds malformed-tag scanning cost.
 const MAX_CHECKPOINT_CHARS = 512;
 
-const TAG_OPEN = "\x3cbili-chain ";
+export const TAG_OPEN = "\x3cbili-chain ";
 const TAG_CLOSE = "/\x3e";
 
 export interface ChainCheckpoint {

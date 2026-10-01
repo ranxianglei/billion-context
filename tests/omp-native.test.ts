@@ -4,9 +4,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import factory, { shouldBootstrapNativeOmp } from "../src/agent/omp-native.ts";
-import { nativeProxyScriptPath } from "../src/agent/native-bootstrap.ts";
+import factory, { ompTrafficRidesBili, shouldBootstrapNativeOmp } from "../src/agent/omp-native.ts";
+import { applyOmpFirstEventTimeout, nativeProxyScriptPath, ompFirstEventTimeoutValue, OMP_FIRST_EVENT_TIMEOUT_DEFAULT_MS, OMP_FIRST_EVENT_TIMEOUT_ENV } from "../src/agent/native-bootstrap.ts";
 import { pluginInstall, pluginRemove, pluginStatusAll, selfPackageRoot, ompPluginLoadedFrom } from "../src/plugin-install.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 // #957 coexistence: markNativeHost must be set synchronously during module
 // evaluation so any in-process bili extension backs off in THIS process.
@@ -28,6 +29,34 @@ test("shouldBootstrapNativeOmp: false when a bili launch already owns a proxy", 
     assert.equal(shouldBootstrapNativeOmp({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:36485" }), false);
     assert.equal(shouldBootstrapNativeOmp({ BILLION_CONTEXT_PROXY: "  " }), true);
     assert.equal(shouldBootstrapNativeOmp({ BILI_PROVIDER_REWRITES: '{"vllm":"http://127.0.0.1:1/bili/http://x"}' }), false);
+});
+
+test("ompTrafficRidesBili: true for self-bootstrap, launcher proxy, /bili/ rewrites", () => {
+    assert.equal(ompTrafficRidesBili({}), true, "bare host: gate passes, self-bootstrap will own the proxy");
+    assert.equal(ompTrafficRidesBili({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:8787" }), true, "launcher/MITM launch");
+    assert.equal(ompTrafficRidesBili({ BILI_PROVIDER_REWRITES: '{"vllm":"http://127.0.0.1:1/bili/http://x"}' }), true, "/bili/-rewrite launch");
+    assert.equal(ompTrafficRidesBili({ BILI_NATIVE_OMP: "0", BILLION_CONTEXT_PROXY: "  " }), false, "opted out + blank proxy — traffic goes direct");
+    assert.equal(ompTrafficRidesBili({ BILI_NATIVE_OMP: "0" }), false, "opted out — traffic goes direct");
+    assert.equal(ompTrafficRidesBili({ BILI_NATIVE_OMP: "0", BILLION_CONTEXT_PROXY: "http://127.0.0.1:8787" }), true, "launcher wins over the native opt-out");
+});
+
+test("#1774 first-event timeout value: default when unset, user-pinned values (incl. 0) win", () => {
+    assert.equal(OMP_FIRST_EVENT_TIMEOUT_DEFAULT_MS, 1_800_000);
+    assert.equal(ompFirstEventTimeoutValue({}), "1800000");
+    assert.equal(ompFirstEventTimeoutValue({ [OMP_FIRST_EVENT_TIMEOUT_ENV]: "60000" }), undefined);
+    assert.equal(ompFirstEventTimeoutValue({ [OMP_FIRST_EVENT_TIMEOUT_ENV]: "0" }), undefined, "explicit disable sentinel respected");
+    assert.equal(ompFirstEventTimeoutValue({ [OMP_FIRST_EVENT_TIMEOUT_ENV]: "   " }), "1800000", "blank counts as unset");
+});
+
+test("#1774 applyOmpFirstEventTimeout: stamps only when unpinned, idempotent on stamped env", () => {
+    const clean: NodeJS.ProcessEnv = {};
+    applyOmpFirstEventTimeout(clean);
+    assert.equal(clean[OMP_FIRST_EVENT_TIMEOUT_ENV], "1800000");
+    applyOmpFirstEventTimeout(clean);
+    assert.equal(clean[OMP_FIRST_EVENT_TIMEOUT_ENV], "1800000");
+    const pinned: NodeJS.ProcessEnv = { [OMP_FIRST_EVENT_TIMEOUT_ENV]: "45000" };
+    applyOmpFirstEventTimeout(pinned);
+    assert.equal(pinned[OMP_FIRST_EVENT_TIMEOUT_ENV], "45000");
 });
 
 test("nativeProxyScriptPath: dist/agent/omp-native.js resolves to the package bin", () => {
@@ -55,7 +84,7 @@ function withOmpHome(fn: () => void | Promise<void>): Promise<void> {
     return Promise.resolve(fn()).finally(() => {
         if (prev === undefined) delete process.env.PI_CODING_AGENT_DIR;
         else process.env.PI_CODING_AGENT_DIR = prev;
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     });
 }
 

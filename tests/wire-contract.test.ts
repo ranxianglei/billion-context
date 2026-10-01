@@ -56,6 +56,12 @@ import { WIRE_RULES, VALIDATORS, startFakeUpstream, type Wire } from "./wire-con
 
 type ToolShape = Record<string, unknown>;
 
+test("WC-012 validates compaction IDs without changing function-call ID rules", () => {
+    assert.deepEqual(VALIDATORS.responses({ input: [{ type: "compaction", id: "cmp_real", encrypted_content: "opaque" }] }), []);
+    assert.deepEqual(VALIDATORS.responses({ input: [{ type: "function_call", id: "fc_real" }] }), []);
+    assert.match(VALIDATORS.responses({ input: [{ type: "compaction", id: "fc_bili_local" }] })[0], /WC-012/);
+});
+
 function syntheticBody(wire: Wire, tool: unknown): Record<string, unknown> {
     if (wire === "google") return { tools: [{ functionDeclarations: [tool] }] };
     return { tools: [tool] };
@@ -92,6 +98,11 @@ test("wire-contract ledger: every rule has a live enforcement clause", () => {
             { tools: [{ name: "t", input_schema: { properties: {} } }] },
             { tools: [{ name: "bad name!", input_schema: { type: "object", properties: {} } }] },
             { model: "m", max_tokens: 1, messages: [], prompt_cache_key: "sess" },
+            {
+                system: [{ type: "text", text: "s", cache_control: { type: "ephemeral" } }],
+                tools: [{ name: "t", input_schema: { type: "object", properties: {} }, cache_control: { type: "ephemeral" } }],
+                messages: [1, 2, 3].map((i) => ({ role: "user", content: [{ type: "text", text: `x${i}`, cache_control: { type: "ephemeral" } }] })),
+            },
         ],
         "openai-chat": [
             { model: "gemini-synthetic", tools: [{ type: "function", function: { name: "compress", parameters: { type: "object", properties: { content: { type: ["array", "string"] } } } } }] },
@@ -99,10 +110,12 @@ test("wire-contract ledger: every rule has a live enforcement clause", () => {
             { tools: [{ type: "function", function: { name: "ok", parameters: { anyOf: [] } } }] },
         ],
         responses: [
+            { input: [{ type: "compaction", id: "fc_bili_local", encrypted_content: "bili:acp:summary" }] },
             { tools: [{ type: "function", name: "bad name", parameters: { type: "object", properties: {} } }] },
             { tools: [{ type: "function", name: "ok", parameters: { type: "array" } }] },
             { tools: [{ type: "function", name: "ok", parameters: { type: "object", properties: {}, anyOf: [] } }] },
             { tools: [], input: [{ type: "function_call", id: "fc-1", call_id: "c1", name: "f", arguments: "{}" }] },
+            { input: [{ type: "configuration_update", reasoning: { effort: "medium" } }, { type: "configuration_update", reasoning: { effort: "high" } }] },
         ],
         google: [
             { tools: [{ functionDeclarations: [{ name: "bad-name", parameters: { type: "object", properties: {} } }] }] },

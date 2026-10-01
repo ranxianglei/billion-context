@@ -70,6 +70,18 @@ export function mitmHostsFromEnv(env: NodeJS.ProcessEnv = process.env): Set<stri
     return out;
 }
 
+/** #1392: opted-in non-http(s) baseUrl providers (BILI_NON_HTTP_PROVIDERS, set by
+ *  buildPiEnv or native-mode users). Provider ids are case-sensitive identifiers —
+ *  unlike the hostnames in mitmHostsFromEnv above, these are NOT lowercased. */
+export function nonHttpProvidersFromEnv(env: NodeJS.ProcessEnv = process.env): Set<string> {
+    const out = new Set<string>();
+    for (const raw of env.BILI_NON_HTTP_PROVIDERS?.split(",") ?? []) {
+        const id = raw.trim();
+        if (id.length > 0) out.add(id);
+    }
+    return out;
+}
+
 /** True iff requests to baseUrl will be SEEN by the bili proxy (and thus its
  *  stamped prompt_cache_key consumed + stripped): a /bili/-wrapped URL, the
  *  BILLION_CONTEXT_PROXY origin itself, or a host on the exported MITM
@@ -321,4 +333,43 @@ export function armedIdleNotice(version: string): string {
 /** Fallback when the version probe also fails — a warning, not an info notice. */
 export function noSessionWarning(): string {
     return "bili: no ACP session yet (send a model request first, then run /acp)";
+}
+
+// The OpenCode V2 TUI renders a synthetic message as a visible Notice row only while its display
+// text fits the timeline cap (~1KB); longer rows render nothing (#880). bili cannot change the
+// host cap, so overflow is handled at render time (#1602): the Web UI deep link is hoisted to
+// line one so it always survives truncation (the full panel stays reachable through the Web UI),
+// and leading WHOLE lines are kept within a budget that reserves room for the marker.
+
+/** Fit report/panel text into a V2 synthetic notice description: verbatim under the hard cap;
+ *  over it, hoist `webUrl` (the status endpoint's deep link; for cache reports the proxy already
+ *  leads the result with it) to line one, keep leading whole lines (no mid-line cuts), and append
+ *  a truncation marker sized so the total never exceeds `max`. */
+export function fitNoticeDescription(text: string, max: number, kind: "panel" | "report", webUrl?: string): string {
+    if (text.length <= max) return text;
+    const lines = text.split("\n");
+    if (webUrl !== undefined && webUrl.length > 0) {
+        const body = lines.filter((l) => !/^Web UI: \S/.test(l));
+        lines.length = 0;
+        lines.push(`Web UI: ${webUrl}`, ...body);
+    }
+    if (lines.length === 1) {
+        const marker = `\n\n[${kind} truncated]`;
+        return lines[0].slice(0, Math.max(0, max - marker.length)) + marker;
+    }
+    // Budget against the widest-plausible marker (max dropped-count digits) so the real one
+    // can only be shorter — the result is guaranteed ≤ max without a second pass.
+    const probeMarker = `\n\n[${kind} truncated] ${lines.length} more lines`;
+    const budget = max - probeMarker.length;
+    const kept: string[] = [];
+    let acc = 0;
+    for (const line of lines) {
+        const next = acc + (kept.length > 0 ? 1 : 0) + line.length;
+        if (next > budget && kept.length > 0) break;
+        kept.push(line);
+        acc = next;
+    }
+    const dropped = lines.length - kept.length;
+    const desc = kept.join("\n") + `\n\n[${kind} truncated] ${dropped} more line${dropped === 1 ? "" : "s"}`;
+    return desc.length <= max ? desc : desc.slice(0, max);
 }

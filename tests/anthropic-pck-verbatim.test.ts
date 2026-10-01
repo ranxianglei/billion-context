@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -13,6 +13,7 @@ import { peekSession, _resetSessionsForTest } from "../src/session.ts";
 import { setLogCapture } from "../src/logger.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 // #1403 wire invariant: the omp plugin stamps prompt_cache_key into the body
 // as its session id (#268); that field is NOT part of the Anthropic Messages
@@ -214,7 +215,7 @@ test("#1403/#1357 T2: advisory processing of foreign ACP artifacts strips stampe
     } finally {
         setLogCapture(null);
         store.cancelAll();
-        rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
         upstream.closeAllConnections?.();
         await close(upstream);
     }

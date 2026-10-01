@@ -1,11 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { SessionStore } from "../src/persist.ts";
 import type { Session } from "../src/session.ts";
 import { createInitialState } from "acp-kernel";
+import { rmrf } from "./tmp-rm.ts";
 
 function makeSession(id: string): Session {
     return {
@@ -35,7 +36,7 @@ function withTempStore(name: string, fn: (store: SessionStore, dir: string, warn
             await fn(store, dir, warnings);
         } finally {
             store.cancelAll();
-            rmSync(dir, { recursive: true, force: true });
+            rmrf(dir);
         }
     }) as unknown as Promise<void>;
 }

@@ -9,6 +9,7 @@ import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { setLogCapture } from "../src/logger.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 // #1027: DeepSeek models behind a non-deepseek gateway never trip the
 // host-only static strict-echo check, so every fresh session re-paid the
@@ -137,6 +138,6 @@ test("#1027: gateway-hosted deepseek model gets proactive strict-echo repair, no
         await close(proxy);
         await close(upstream);
         setLogCapture(null);
-        fs.rmSync(stateDir, { recursive: true, force: true });
+        rmrf(stateDir);
     }
 });

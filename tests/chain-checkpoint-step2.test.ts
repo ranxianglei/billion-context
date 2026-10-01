@@ -272,7 +272,7 @@ function close(server: http.Server): Promise<void> {
 
 const MODEL = "gpt-test";
 
-function makeOpts(port: number, upstream: string): ProxyOptions {
+function makeOpts(port: number, upstream: string, overrides?: Partial<ProxyOptions>): ProxyOptions {
     return {
         port,
         host: "127.0.0.1",
@@ -289,6 +289,7 @@ function makeOpts(port: number, upstream: string): ProxyOptions {
         autoUpdate: false,
         logFile: "off",
         mitm: { enabled: false, domains: [] },
+        ...overrides,
     };
 }
 
@@ -319,7 +320,7 @@ interface Rig {
     captured: Captured[];
 }
 
-async function withRig(fn: (rig: Rig) => Promise<void>): Promise<void> {
+async function withRig(fn: (rig: Rig) => Promise<void>, overrides?: Partial<ProxyOptions>): Promise<void> {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const logs: { level: string; msg: string }[] = [];
@@ -329,7 +330,7 @@ async function withRig(fn: (rig: Rig) => Promise<void>): Promise<void> {
     upstream.listen(0, "127.0.0.1");
     await listen(upstream);
     const llmUrl = `http://127.0.0.1:${(upstream.address() as { port: number }).port}`;
-    const srv = await startServer(makeOpts(0, llmUrl));
+    const srv = await startServer(makeOpts(0, llmUrl, overrides));
     await listen(srv);
     try {
         await fn({ port: (srv.address() as { port: number }).port, logs, captured });
@@ -395,7 +396,7 @@ test("#1395 step 2 / #1421 step 3 T2: well-formed fresh checkpoint with wrong di
     });
 });
 
-test("#1395 step 2 / #1421 step 3 T3: plain request → no [chain] log; processed AND stamped on egress", async () => {
+test("#1395 step 2 / #1421 step 3 T3: plain request → no [chain] log; processed AND stamped on egress (egress stamping enabled)", async () => {
     await withRig(async ({ port, logs, captured }) => {
         const sentJson = JSON.stringify(BASE_BODY);
         const resp = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
@@ -408,7 +409,7 @@ test("#1395 step 2 / #1421 step 3 T3: plain request → no [chain] log; processe
         assert.equal(logs.filter((l) => l.msg.includes("[chain]")).length, 0, "no inbound checkpoint signal, no [chain] log");
         assert.equal(captured.length, 1);
         assert.ok(captured[0]!.body.includes('"compress"'));
-        assert.ok(captured[0]!.body.includes(L + "bili-chain "), "#1421: every processed outbound leaves its own self-verifying stamp");
+        assert.ok(captured[0]!.body.includes(L + "bili-chain "), "#1421: a processed outbound carries a self-verifying stamp when egress stamping is enabled (#1683: off by default)");
         assert.equal(evaluateChain(JSON.parse(captured[0]!.body), "openai").verdict, "valid");
-    });
+    }, { chainEgressStamp: true });
 });

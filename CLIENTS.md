@@ -42,6 +42,18 @@ Two lanes, same plugin (#941):
   `billion-context/dsh`, the profile resolved a pre-bundle copy from a stale
   package-metadata cache (#953) — re-add pinned: `dsh plugin --profile
   <name> add billion-context@latest`.
+- **Desktop app (Electron host):** the same plugin also runs inside the
+  deepseek-harness **desktop** app, installed through its in-app plugin
+  manager. There the bootstrap spawns its proxy from within the app process,
+  whose `process.execPath` is the Electron binary, not Node, and whose GUI
+  PATH omits normal install locations — `resolveNodeRuntime` (#819/#1429)
+  probes well-known locations first (`/opt/homebrew/bin`, `/usr/local/bin`,
+  Volta, …) and falls back to the app's own binary run as plain Node
+  (`ELECTRON_RUN_AS_NODE=1`, forced into the child env), so compression works
+  with zero configuration even without a standalone Node on PATH; set
+  `BILLION_CONTEXT_NODE` to force a specific Node (it beats both). Before
+  #1429 this path threw before spawning and every session silently degraded
+  to direct send (uncompressed), visible only in bili.log.
 - **Auto-update keeps profiles in lockstep:** the refresh has two triggers —
   after a global self-update, AND from the **profile copy's own proxy** when
   its periodic check sees a newer registry version (so dsh plugin-market
@@ -68,6 +80,14 @@ Two lanes, same plugin (#941):
    settings overlay rewrites those providers' `baseURL`s to `/bili/` URLs, so
    the traffic reaches the proxy regardless of which fetch the transport uses
    or what the attribution state is.
+ - **Web-profile caveat (#1772):** when a profile's bundles include
+   `@deepseek-ai/dsh-web-app`, the running `compaction-basic` instance lives
+   inside an agent preset (`preset-standard.config.plugins`) that no patch
+   layer can reach by id — dsh's patch engine indexes only top-level rows and
+   true group children — so the bundled `auto: false` lands on web-app's
+   already-disabled host-plane row and the preset instance keeps
+   auto-compaction ON. The plugin logs a one-time `[dsh-client]` warning at
+   boot in such profiles; ACP compression is unaffected.
 
 Under a `bili dsh` launch the plugin ATTACHES to the launcher's proxy (no
 second spawn). Raw upstream URLs rewrite to `<proxy>/bili/<url>` like
@@ -75,7 +95,8 @@ spawn mode (a loopback proxy target is never proxied, so the MITM envs are
 simply bypassed); already-routed `/bili/`-prefixed requests pass through
 untouched except for header stamping. Known limitation: manual
 `/compact` has no dsh-side event hook, so its boundary is left to the
-kernel's natural ingest diff (auto-compaction is off, so this is rare).
+kernel's natural ingest diff (auto-compaction is off in non-web profiles, so
+this is rare; see the #1772 caveat above for web profiles).
 
 ## Kimi Code (Moonshot)
 
@@ -196,16 +217,16 @@ two small node scripts that do the work around the client:
   direct process; at startup it attaches to a healthy proxy
   (`BILLION_CONTEXT_PROXY`) or spawns its own on an ephemeral port, then
   rewrites the active provider store with idempotent JSON surgery under a
-  mkdir lockfile: the bigmodel coding-plan provider entries' `baseURL` becomes
-  `http://127.0.0.1:<port>/bili/<upstream>` (the builtin default upstream is
-  `https://open.bigmodel.cn/api/anthropic`; any custom baseURL you set is
+  mkdir lockfile: each routable provider entry's `baseURL` becomes
+  `http://127.0.0.1:<port>/bili/<upstream>` (any custom baseURL you set is
   preserved verbatim behind the wrapper). Both store generations are handled:
   legacy `~/.zcode/v2/config.json` (`provider.<id>.options.baseURL`) and the
   v3.14+ personal store `~/.zcode/v2/provider_config.json`
   (`config.providerConfigRules.providerRules[].config.api.baseUrl`) — when
-  both exist, the new store wins. The original file is snapshotted to
-  `<file>.bili-bak` once per user edit (the snapshot always reflects your last
-  real state, never bili's own writes); every other key is preserved
+  both exist, the new store wins (see Routing scope for which entries on it
+  route and which are skipped). The original file is
+  snapshotted to `<file>.bili-bak` once per user edit (the snapshot always
+  reflects your last real state, never bili's own writes); every other key is
   byte-for-byte. Legacy-generation clients load provider config at startup —
   restart ZCode once after installing; newer builds pick up routing changes
   mid-session (~1 s polling). The `SessionStart` hook runs the same bootstrap
@@ -216,21 +237,101 @@ two small node scripts that do the work around the client:
   against the live proxy manifest, the routed entries gain
   `headers["x-bili-plugin"] = "zcode"` — until then traffic rides wire mode.
   Tool calls bind via the per-call `conversation_id` argument (#760).
+- **Routing scope (#1622):** native mode wraps **every** provider entry with
+  a usable http(s) `baseURL` — the same "all providers ride compression"
+  semantics as the in-process natives (pi/dsh) — not just the bigmodel
+  coding-plan accounts. Entries that cannot be wrapped are skipped with a
+  logged reason instead of silently dropped:
+  - **client-signing accounts (#1621):** on v3.14+ personal stores the
+    coding-plan accounts stay direct (see Known limitations); every other
+    provider still routes.
+  - **loopback targets (#809):** an http loopback `baseURL` (localhost /
+    127.x.x.x / ::1) is never re-proxied — wrapping it would stack bili onto
+    itself or onto your own local relay.
+  - **`direct` exemptions:** a provider route declaring `"direct": true` in
+    the `providers` table (keyed by upstream URL — see CONFIGURATION.md)
+    stays direct; the same exemption any lane can honor.
+  The lane launches its proxy in the self-managed port zone (#1660): zone
+  base `18787`, a per-lane sticky record so a past +1-ladder drift is
+  followed automatically, collisions resolved by the child's +1 ladder,
+  and the shared store rewritten to the live origin on drift — wrappers
+  survive session restarts even without handoff. `BILI_ZCODE_PORT` pins an
+  exact port instead (strict-port: a squatter is refused loudly, no hop).
+  `BILI_ZCODE_ROUTE`
+  (`plans`/`none`) is a compat escape hatch, and `BILI_ZCODE_SIGNING_FIXED=1`
+  flips the #1621 skips off once a ZCode build ships the signing fix.
 - **Watchdog & lifecycle:** the MCP child probes the proxy every 30 s. In
   attach mode it waits forever (it never touches a user-owned proxy); in spawn
   mode a dead proxy is respawned and the routing rewritten to the new origin.
   If recovery fails, the managed rewrite is removed so traffic degrades back
-  to direct upstream rather than hitting a dead port. When a session ends,
-  ZCode kills the MCP child and the parent-pid watchdog tears down the spawned
-  proxy. Concurrent sessions share the first-spawned proxy; when it goes away
-  the remaining sessions respawn and re-route automatically.
+   to direct upstream rather than hitting a dead port. When a session ends,
+   ZCode kills the MCP child and the parent-pid watchdog tears down the spawned
+   proxy; before the MCP child exits (SIGTERM/SIGINT/normal exit) it hands off
+   under the lock — if the shared provider store still points at its own proxy,
+   it re-points at another live compatible instance, or removes the managed
+   rewrite back to direct when none exists (#1623), so a dead instance never
+   leaves a dead port in the shared config. The watchdog also checks the shared
+   store on every tick: if a dead port from another instance is left behind
+   (hard-kill cases where the handoff never ran — e.g. Windows' TerminateProcess
+   skips JS handlers), it takes over the repair (live instance preferred,
+   otherwise revert to direct); it only acts while the store points at a dead
+   port and never steals routing away from a live instance. Concurrent sessions
+   share the first-spawned proxy; when it goes away the remaining sessions
+   respawn and re-route automatically. Boundary: ZCode caches the provider
+   baseURL per session, so the repairs above only take effect on FRESH reads
+   (new sessions/queries) — an in-flight session keeps retrying its cached old
+   port until it re-reads. To avoid this structurally, pin `BILLION_CONTEXT_PROXY`
+   at a resident proxy (`bili start`) and let every session attach to it
+   (attach mode never touches a user-owned proxy).
 - **Known limitations:** ZCode's anti-fraud fingerprinting (#661) applies to
   MITM-rebuilt bodies on `zcode.z.ai` login traffic — native mode does not
   touch that surface (model traffic flows through the provider store, not the
   GUI proxy); if you also run the GUI-proxy/MITM setup, keep the
-  `"mitm://zcode.z.ai": { "passthrough": true }` route. Inert when
+  `"mitm://zcode.z.ai": { "passthrough": true }` route. On v3.14+ builds,
+  ClientRequestSigningV4 for coding-plan accounts rejects non-HTTPS origins at
+  model creation and derives its handshake path from origin alone (dropping
+  any /bili/ prefix), so a /bili/-wrapped baseURL fails with "Client signing
+  handshake requires HTTPS." (#1621). The conflict is hardcoded on the ZCode
+  side, so native mode detects the v3.14+ store generation and skips the
+  rewrite entirely — it logs the reason and leaves traffic direct; use the GUI
+  cert-MITM setup for compression on these accounts until ZCode ships a signing
+  fix; once it does, set `BILI_ZCODE_SIGNING_FIXED=1` and they route again. Under the default
+  `route:"all"` only those accounts are skipped — every other provider on the
+  store keeps routing; the whole-store degrade (routing entirely off) now
+  only applies under `route:"plans"`, where the plan accounts ARE the signing
+  accounts. Pre-3.14 legacy-store clients are unaffected. Inert when
   `BILLION_CONTEXT_PROXY` is set (attach mode owns the proxy) or
   `BILI_PROVIDER_REWRITES` is defined. Opt-out: `BILI_NATIVE_ZCODE=0`.
+
+## Codex (OpenAI Codex CLI)
+
+Codex is the one client a plugin install cannot make self-sufficient. The seam
+matrix explains why: claude has a `SessionStart` hook + managed settings block,
+zcode has a provider store whose `baseURL` can be rewritten — codex has neither.
+Its model traffic routes via environment variables only (`HTTPS_PROXY` /
+`SSL_CERT_FILE` — this is how `bili codex` works); the default
+ChatGPT-login provider has no config-file routing seam, and a managed
+`model_providers` block would force `env_key` API-key auth and **drop the
+subscription login**. An MCP server cannot inject env into its parent process,
+so the plugin can never route codex's own traffic. Three postures:
+
+| Posture | What you get |
+|---|---|
+| `bili codex` (launcher) | Full zero-config: a self-managed lane proxy (#1660 zone, sticky port) + cert-MITM env injected into codex — tools *and* compression |
+| `bili plugin install codex` + a running bili + self-exported `HTTPS_PROXY` | Tools + compression for power users who manage their own env |
+| `bili plugin install codex` alone | The four tools appear in codex but no conversation is proxied, so there is nothing for them to act on; `tools/list` fails with -32003 (`bili proxy unreachable … — start bili or set BILI_MCP_PROXY`) when nothing is reachable |
+
+The install writes a single `[mcp_servers.bili]` block into `~/.codex/config.toml`
+(command = node, args = dist/mcp.js). #1660 removed the install-time origin bake
+(#403: a baked URL went stale after drift/reboot and left the tools pointing at
+a dead port); the shell resolves the proxy at session start — env
+`BILI_MCP_PROXY` > the live-instance record (any lane's proxy, or a
+`bili start` daemon) > the 8787 user-zone default — so a drifted or rebooted
+proxy never strands a dead URL, and the shell simply attaches to whatever is
+alive. Session binding is headless: the launcher passes
+`BILI_CONVERSATION_ID` at spawn time, and the plugin shell binds the next NEW
+session otherwise; per-call `conversation_id` overrides work as everywhere
+(#760).
 
 ## Gemini family (Gemini CLI / iFlow CLI / Qwen Code)
 
@@ -284,7 +385,7 @@ bili only compresses requests whose path matches a known wire protocol (`/chat/c
 
 That outcome is now loud instead of silent (#1290):
 
-- the client-side fetch hook logs each distinct unrouted endpoint once per process (`…is not a recognized model endpoint, so bili did not route it through the proxy…`);
+- the client-side fetch hook logs each distinct unrouted **POST** endpoint once per process (`…is not a recognized model endpoint, so bili did not route it through the proxy…`); non-POST traffic — npm registries, catalog JSONs, git refs — is silent by design (#1657: a GET cannot carry a prompt);
 - `unrecognizedPaths` (per-path counts) in `curl -s http://localhost:8787/__bili/stats` (loopback-only);
 - an `UNRECOGNIZED PATHS (instance-level)` section in `acp_status` output while such requests exist.
 

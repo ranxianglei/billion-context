@@ -108,6 +108,8 @@ export const WEB_CLIENT = `(function () {
     const PAGES = ["overview", "sessions", "config", "connect", "logs"];
     let current = "overview";
     let sessionsCache = [];
+    // #1682: last overview alert payload — lets a dismiss re-render without refetching.
+    let latestAlerts = [];
 
     function sessionTitleCell(s) {
         // #1426: title falls back to an "untitled" placeholder and the FULL session id is always
@@ -145,6 +147,14 @@ export const WEB_CLIENT = `(function () {
         });
         return '<td class="num"><span class="hitc" title="' + escapeHtml(t("ses.drop_ph")) + '">(' + parts.join("/") + ")</span></td>";
     }
+    // MODEL SWITCHES column (#1535): mid-session model changes re-bill the stable prefix;
+    // shows count · dropped tokens, honest dash when none.
+    function switchTd(s) {
+        if (!s.modelSwitches) return '<td class="num dim">' + t("common.none") + "</td>";
+        const tip = escapeHtml(t("ses.th_switches_tip"));
+        if (!s.switchMissedTokens) return '<td class="num" title="' + tip + '">' + s.modelSwitches + "</td>";
+        return '<td class="num" title="' + tip + '">' + s.modelSwitches + " · " + fmtW(s.switchMissedTokens) + "</td>";
+    }
 
     function sessionRow(s, compact) {
         const tr = document.createElement("tr");
@@ -152,7 +162,7 @@ export const WEB_CLIENT = `(function () {
         if (compact) {
             tr.innerHTML = "<td>" + sessionTitleCell(s) + '</td><td>' + protoBadge(s.protocol) + '</span></td><td class="num">' + fmtW(s.contextTokens) + '</td>' + savedTd(s) + '<td class="dim">' + timeAgo(s.lastSeen) + "</td>";
         } else {
-            tr.innerHTML = "<td>" + sessionTitleCell(s) + '</td><td>' + (s.clientHint ? '<span class="mono small">' + escapeHtml(s.clientHint) + "</span>" : '<span class="dim">' + t("common.none") + "</span>") + '</td><td>' + protoBadge(s.protocol) + '</td><td><span class="mono dim small clip w-up">' + escapeHtml(hostOf(s.upstreamOrigin)) + '</td><td class="num">' + (s.requests ? s.requests : t("common.none")) + '</td><td class="num">' + fmtW(s.contextTokens) + '</td><td class="num">' + (s.inputTokens ? fmtW(s.inputTokens) : '<span class="dim">' + t("common.none") + "</span>") + "</td>" + savedTd(s) + hitTd(s) + '<td class="num">' + (s.foldCount || 0) + '</td><td class="num">' + (s.blocks || 0) + '</td><td class="dim">' + timeAgo(s.lastSeen) + "</td>";
+            tr.innerHTML = "<td>" + sessionTitleCell(s) + '</td><td>' + (s.clientHint ? '<span class="mono small">' + escapeHtml(s.clientHint) + "</span>" : '<span class="dim">' + t("common.none") + "</span>") + '</td><td>' + protoBadge(s.protocol) + '</td><td><span class="mono dim small clip w-up">' + escapeHtml(hostOf(s.upstreamOrigin)) + '</td><td class="num">' + (s.requests ? s.requests : t("common.none")) + '</td><td class="num">' + fmtW(s.contextTokens) + '</td><td class="num">' + (s.inputTokens ? fmtW(s.inputTokens) : '<span class="dim">' + t("common.none") + "</span>") + "</td>" + savedTd(s) + hitTd(s) + switchTd(s) + '<td class="num">' + (s.foldCount || 0) + '</td><td class="num">' + (s.blocks || 0) + '</td><td class="dim">' + timeAgo(s.lastSeen) + "</td>";
         }
         let navTimer = null;
         tr.addEventListener("click", (ev) => {
@@ -167,7 +177,7 @@ export const WEB_CLIENT = `(function () {
         return tr;
     }
 
-    async function loadOverview() {
+    async function loadOverview(silent) {
         try {
             const d = await json("/__bili/overview");
             const o = d.overview || {};
@@ -211,11 +221,11 @@ export const WEB_CLIENT = `(function () {
             const rb = $("recent-body");
             rb.innerHTML = "";
             const recent = (o.recent || []).slice(0, 8);
-            if (!recent.length) rb.innerHTML = '<tr><td colspan="12" class="dim">' + t("common.empty") + "</td></tr>";
+            if (!recent.length) rb.innerHTML = '<tr><td colspan="13" class="dim">' + t("common.empty") + "</td></tr>";
             recent.forEach((s) => rb.appendChild(sessionRow(s, false)));
             renderBanners(d);
         } catch (e) {
-            toast(t("toast.failed", { msg: e.message }), "err");
+            if (!silent) toast(t("toast.failed", { msg: e.message }), "err");
         }
     }
     function renderBanners(d) {
@@ -266,6 +276,72 @@ export const WEB_CLIENT = `(function () {
                 ab.innerHTML = "";
             }
         }
+        // #1682: global upstream-connection alert banner — visible on every view,
+        // one row per active alert (no stacking), dismiss per alert instance.
+        latestAlerts = Array.isArray(d.alerts) ? d.alerts : [];
+        renderAlertBanner();
+    }
+    function readDismissedAlerts() {
+        try {
+            const v = JSON.parse(localStorage.getItem("bili-alert-dismissed") || "[]");
+            return new Set(Array.isArray(v) ? v : []);
+        } catch (e) { return new Set(); }
+    }
+    // Static per-kind references: the #1024 i18n lint requires every catalog
+    // key to be referenced literally in this file, with no dead keys.
+    function alertHint(kind) {
+        switch (kind) {
+            case "connect-timeout": return t("alert.hint.connect_timeout");
+            case "connect-refused": return t("alert.hint.connect_refused");
+            case "proxy-reset": return t("alert.hint.proxy_reset");
+            case "upstream-reset": return t("alert.hint.upstream_reset");
+            case "dns": return t("alert.hint.dns");
+            case "tls": return t("alert.hint.tls");
+            default: return t("alert.hint.unknown");
+        }
+    }
+    function alertKey(a) { return a.kind + "|" + a.host + "|" + a.firstSeen; }
+    function dismissAlert(key) {
+        const s = readDismissedAlerts();
+        s.add(key);
+        const arr = [...s];
+        while (arr.length > 64) arr.shift();
+        try { localStorage.setItem("bili-alert-dismissed", JSON.stringify(arr)); } catch (e) {}
+    }
+    function renderAlertBanner() {
+        const el = $("alerts-banner");
+        if (!el) return;
+        const dismissed = readDismissedAlerts();
+        const vis = latestAlerts.filter((a) => a && a.kind && a.host && !dismissed.has(alertKey(a)));
+        if (!vis.length) {
+            el.hidden = true;
+            el.classList.remove("show");
+            el.innerHTML = "";
+            return;
+        }
+        el.hidden = false;
+        el.classList.add("show");
+        el.innerHTML = "";
+        const head = document.createElement("div");
+        head.className = "banner-title";
+        head.textContent = "⚠️ " + t("alert.title");
+        el.appendChild(head);
+        vis.forEach((a) => {
+            const row = document.createElement("div");
+            row.className = "alert-row";
+            const msg = document.createElement("span");
+            msg.textContent = t("alert.item", { host: a.host, kind: a.kind, count: a.count, first: fmtDT(a.firstSeen), hint: alertHint(a.kind) });
+            const btn = document.createElement("button");
+            btn.className = "btn sm alert-dismiss";
+            btn.textContent = t("alert.dismiss");
+            btn.addEventListener("click", () => {
+                dismissAlert(alertKey(a));
+                renderAlertBanner();
+            });
+            row.appendChild(msg);
+            row.appendChild(btn);
+            el.appendChild(row);
+        });
     }
 
     async function loadSessions(detailId) {
@@ -308,7 +384,7 @@ export const WEB_CLIENT = `(function () {
         const tb = $("sessions-body");
         tb.innerHTML = "";
         if (!rows.length) {
-            tb.innerHTML = '<tr><td colspan="12"><div class="empty"><div class="big">🗂</div>' + t("ses.empty") + "<br>" + t("ses.empty_hint") + "</div></td></tr>";
+            tb.innerHTML = '<tr><td colspan="13"><div class="empty"><div class="big">🗂</div>' + t("ses.empty") + "<br>" + t("ses.empty_hint") + "</div></td></tr>";
             return;
         }
         rows.forEach((s) => tb.appendChild(sessionRow(s, false)));
@@ -321,7 +397,7 @@ export const WEB_CLIENT = `(function () {
     function kv(parts, label, value, mono) {
         parts.push('<div class="k">' + label + '</div><div class="v' + (mono ? " mono" : "") + '">' + (value == null || value === "" ? t("common.none") : escapeHtml(String(value))) + "</div>");
     }
-    function trajectorySvg(lines, folds, win, baseIn) {
+    function trajectorySvg(lines, folds, win, baseIn, seamEvents) {
         lines = (lines || []).filter((l) => Boolean(l));
         if (!lines.length) return "";
         const W = 960, H = 260, PL = 56, PR = 16, PT = 14, PB = 26;
@@ -395,6 +471,23 @@ export const WEB_CLIENT = `(function () {
             foldMarks += '<line x1="' + bk.fx.toFixed(1) + '" y1="' + PT + '" x2="' + bk.fx.toFixed(1) + '" y2="' + (PT + ih) + '" stroke="#cf222e" stroke-width="1.2" stroke-dasharray="3 3"><title>'
                 + t("det.fold_short") + (n > 1 ? " ×" + n : "") + (seqs ? " " + seqs + (bk.items.length > 5 ? "…" : "") + " · " : " ") + dt(bk.items[0].at) + " · " + fmtW(bk.items.reduce((a, m) => a + (m.S || 0), 0)) + "</title></line>";
         });
+        // #1609: cache-seam suspects (#1606) get SOLID red marks at the first sample at/after
+        // the divergence time — folds stay dashed, so both read in the same visual language.
+        let seamMarks = "";
+        (seamEvents || []).forEach((ev) => {
+            if (!ev || !(ev.at > 0)) return;
+            let idx = -1;
+            for (let i = 0; i < lines.length; i++) { if ((lines[i].at || 0) >= ev.at) { idx = i; break; } }
+            if (idx < 0) idx = lines.length - 1;
+            const fx = x(idx);
+            const hit = typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) : "?";
+            const lcp = fmtB(ev.lcpBytes || 0);
+            const msg = ev.msgIndex != null ? ev.msgIndex : "?";
+            const prev = ev.prevMsgs != null ? ev.prevMsgs : "?";
+            const cur = ev.curMsgs != null ? ev.curMsgs : "?";
+            seamMarks += '<line x1="' + fx.toFixed(1) + '" y1="' + PT + '" x2="' + fx.toFixed(1) + '" y2="' + (PT + ih) + '" stroke="#cf222e" stroke-width="1.8"><title>'
+                + t("det.seam_mark_tip", { seq: ev.seq != null ? ev.seq : "?", at: dt(ev.at), hit, lcp, msg, prev, cur }) + "</title></line>";
+        });
         let ceiling = "";
         if (win && win > 0) {
             const yy = y(win);
@@ -426,7 +519,7 @@ export const WEB_CLIENT = `(function () {
             + bands
             + hovers
             + '<path d="' + stroke.trim() + '" fill="none" stroke="var(--accent)" stroke-width="1.8"/>'
-            + foldMarks + ceiling + baseline + ticks + xt + xtTime + "</svg>";
+            + foldMarks + seamMarks + ceiling + baseline + ticks + xt + xtTime + "</svg>";
     }
     function legendItem(style, label, dashed) {
         if (dashed) return '<span><span class="dot" style="background:none;border-top:2px dashed #cf222e;height:0;border-radius:0;width:14px"></span>' + label + "</span>";
@@ -591,6 +684,7 @@ export const WEB_CLIENT = `(function () {
         kv(parts, t("common.protocol"), d.protocol || null, true);
         kv(parts, t("det.client_hint"), d.clientHint || null, true);
         kv(parts, t("common.upstream"), hostOf(d.upstreamOrigin) || null, true);
+        kv(parts, t("det.version"), d.biliVersion || null, true);
         kv(parts, t("det.active_pack"), d.activePack || null, true);
         parts.push('<div class="k">' + t("det.log") + '</div><div class="v"><a href="#/logs?q=' + encodeURIComponent(d.id) + '">' + t("det.log_view") + "</a></div>");
         parts.push("</dl></div></div>");
@@ -601,7 +695,25 @@ export const WEB_CLIENT = `(function () {
         mini(parts, t("ov.cached_tokens"), d.cachedTokens ? fmtW(d.cachedTokens) : null);
         const mt = d.ledger && d.ledger.totals;
         const missArgs = mt && mt.input > 0 ? { n: fmtW(mt.newContent || 0), c: fmtW(mt.compRepay || 0), x: fmtW(mt.ttlRepay || 0), pn: (((mt.newContent || 0) / mt.input) * 100).toFixed(1), pc: (((mt.compRepay || 0) / mt.input) * 100).toFixed(1), px: (((mt.ttlRepay || 0) / mt.input) * 100).toFixed(1) } : null;
-        mini(parts, t("det.hit_pct"), d.cacheHitPct == null ? null : d.cacheHitPct.toFixed(1) + "%", false, missArgs ? t("det.miss_sub", { x: missArgs.px, c: missArgs.pc, n: missArgs.pn }) : "", missArgs ? t("det.miss_split_line", missArgs) : "");
+        // #1609/#1606: surface the attribution buckets (seam / provider-side / rewound /
+        // abort-correlated) in the headline hit-rate subline — nonzero-only, same colors
+        // as the 归因·未解释残差 card lower on this page.
+        const lsRaw = d.ledger && typeof d.ledger.seam === "object" ? d.ledger.seam : null;
+        let hitSub = "";
+        if (missArgs) hitSub += t("det.miss_sub", { x: missArgs.px, c: missArgs.pc, n: missArgs.pn });
+        const attrChips = [];
+        if (lsRaw) {
+            const seamSm = Number(lsRaw.missed) || 0, seamSn = Number(lsRaw.suspects) || 0;
+            if (seamSm > 0 || seamSn > 0) attrChips.push('<span style="color:#cf222e" title="' + escapeHtml(t("det.attr_seam_tip")) + '">' + escapeHtml(t("det.attr_seam")) + " " + fmtW(seamSm) + (seamSn > 0 ? " ×" + seamSn : "") + "</span>");
+            const provM = (lsRaw.providerSide && Number(lsRaw.providerSide.missed)) || 0, provN = (lsRaw.providerSide && Number(lsRaw.providerSide.count)) || 0;
+            if (provM > 0 || provN > 0) attrChips.push('<span style="color:#bf8700" title="' + escapeHtml(t("det.attr_provider_tip")) + '">' + escapeHtml(t("det.attr_provider")) + " " + fmtW(provM) + (provN > 0 ? " ×" + provN : "") + "</span>");
+            const rewM = (lsRaw.rewinds && Number(lsRaw.rewinds.missed)) || 0, rewN = (lsRaw.rewinds && Number(lsRaw.rewinds.count)) || 0;
+            if (rewM > 0 || rewN > 0) attrChips.push('<span style="color:#57606a" title="' + escapeHtml(t("det.attr_rewind_tip")) + '">' + escapeHtml(t("det.attr_rewind")) + " " + fmtW(rewM) + (rewN > 0 ? " ×" + rewN : "") + "</span>");
+            const abN = Number(lsRaw.abortCorrelated) || 0;
+            if (abN > 0) attrChips.push('<span style="color:#d4a72c" title="' + escapeHtml(t("det.attr_abort_tip")) + '">' + escapeHtml(t("det.attr_abort")) + " ×" + abN + "</span>");
+        }
+        if (attrChips.length) hitSub += (hitSub ? " · " : "") + attrChips.join(" · ");
+        mini(parts, t("det.hit_pct"), d.cacheHitPct == null ? null : d.cacheHitPct.toFixed(1) + "%", false, hitSub, missArgs ? t("det.miss_split_line", missArgs) : "");
         mini(parts, t("ov.output_tokens"), d.outputTokens ? fmtW(d.outputTokens) : null);
         const dSavedV = d.netSaved != null ? d.netSaved : d.tokensSaved;
         mini(parts, t("ov.tokens_saved"), dSavedV ? fmtW(dSavedV) : null, dSavedV > 0);
@@ -619,15 +731,29 @@ export const WEB_CLIENT = `(function () {
         parts.push("</div></div>");
         const ledger = d.ledger || {};
         const lines = ledger.lines || [];
+        // #1609: cache-miss attribution (#1606). Defensive reads — servers predating #1606
+        // carry no ledger.seam at all, and an all-zero shape must render nothing.
+        const seamRaw = ledger.seam && typeof ledger.seam === "object" ? ledger.seam : null;
+        const seam = seamRaw ? {
+            suspects: Number(seamRaw.suspects) || 0,
+            missed: Number(seamRaw.missed) || 0,
+            events: Array.isArray(seamRaw.events) ? seamRaw.events.filter((e) => e && e.at > 0) : [],
+            providerSide: { count: (seamRaw.providerSide && Number(seamRaw.providerSide.count)) || 0, missed: (seamRaw.providerSide && Number(seamRaw.providerSide.missed)) || 0 },
+            rewinds: { count: (seamRaw.rewinds && Number(seamRaw.rewinds.count)) || 0, missed: (seamRaw.rewinds && Number(seamRaw.rewinds.missed)) || 0 },
+            abortCorrelated: Number(seamRaw.abortCorrelated) || 0,
+        } : null;
+        const seamActive = !!(seam && (seam.suspects > 0 || seam.missed > 0 || seam.events.length > 0 || seam.providerSide.count > 0 || seam.rewinds.count > 0 || seam.abortCorrelated > 0));
         parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.trajectory") + '</span><span class="hint">' + t("det.trajectory_sub") + '</span></div><div class="card-b">');
         if (!lines.length) {
             parts.push('<div class="chart-empty">' + t("det.trajectory_empty") + "</div>");
         } else {
-            parts.push('<div class="chart-wrap">' + trajectorySvg(lines, ledger.folds || [], d.contextWindow, d.systemPromptTokens || 0) + "</div>");
+            parts.push('<div class="chart-wrap">' + trajectorySvg(lines, ledger.folds || [], d.contextWindow, d.systemPromptTokens || 0, seamActive ? seam.events : []) + "</div>");
             parts.push('<div class="chart-legend">');
             parts.push(legendItem("background:var(--accent)", t("det.legend_input")));
             parts.push(legendItem("background:var(--accent);opacity:.4", t("det.legend_cached"), false));
             parts.push(legendItem("#cf222e", t("det.legend_fold"), true));
+            if (seamActive && seam.events.length > 0)
+                parts.push(legendItem("background:#cf222e", t("det.legend_seam")));
             parts.push(legendItem("#cf222e", t("det.legend_window"), true));
             // Swatches carry real backgrounds (a bare hex in style= renders nothing):
             parts.push(legendItem("background:#bf8700", t("det.cause_comp")));
@@ -638,6 +764,15 @@ export const WEB_CLIENT = `(function () {
             if ((ledger.linesOmitted || 0) > 0) parts.push('<div class="dim small" style="margin-top:6px">' + t("det.omitted", { n: ledger.linesOmitted }) + "</div>");
         }
         parts.push("</div></div>");
+        if (seamActive && seam.events.length > 0) {
+            const evHead = '<tr><th class="num">#</th><th>' + t("det.fold_time") + '</th><th class="num">' + t("det.seam_col_hit") + '</th><th class="num">' + t("det.seam_col_input") + '</th><th>' + t("det.seam_col_div") + "</th></tr>";
+            parts.push('<details open class="seam-ev"><summary title="' + escapeHtml(t("det.seam_events_tip")) + '"><b>' + t("det.seam_events", { n: seam.events.length }) + "</b></summary>"
+                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data"><thead>' + evHead + "</thead><tbody>");
+            seam.events.forEach((ev) => {
+                parts.push('<tr><td class="num">' + ev.seq + '</td><td class="num">' + (ev.at ? fmtDT(ev.at) : t("common.none")) + '</td><td class="num">' + (typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) + "%" : t("common.none")) + '</td><td class="num">' + fmtW(ev.input || 0) + '</td><td class="mono small">' + fmtB(ev.lcpBytes || 0) + " @ " + t("det.seam_msg", { i: ev.msgIndex != null ? ev.msgIndex : "?", prev: ev.prevMsgs != null ? ev.prevMsgs : "?", cur: ev.curMsgs != null ? ev.curMsgs : "?" }) + "</td></tr>");
+            });
+            parts.push("</tbody></table></div></details>");
+        }
         const tot = ledger.totals;
         parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.cache_econ") + "</span>" + (tot ? (tot.balanced ? ' <span class="badge ok">' + t("det.ce_balanced") + "</span>" : ' <span class="badge warn">' + t("det.ce_unbalanced") + "</span>") : "") + '</div><div class="card-b">' + (d.ledger ? '<div style="display:flex;gap:8px;justify-content:flex-end;margin-bottom:10px"><button id="cacherpt-copy" class="btn sm">' + t("common.copy") + '</button><button id="cacherpt-dl" class="btn sm">' + t("det.report_dl") + "</button></div>" : ""));
         if (tot) {
@@ -647,6 +782,19 @@ export const WEB_CLIENT = `(function () {
             mini(parts, t("det.ce_ttl"), fmtW(tot.ttlRepay || 0));
             mini(parts, t("det.ce_residual"), fmtW(tot.residual || 0));
             parts.push("</div>");
+        }
+        if (seamActive) {
+            parts.push('<div class="section-label" style="margin-top:14px">' + t("det.attr_title") + "</div>"
+                + '<div class="grid cols-4">'
+                + '<div class="mini"><div class="k" style="color:#cf222e" title="' + escapeHtml(t("det.attr_seam_tip")) + '">' + escapeHtml(t("det.attr_seam")) + '</div><div class="v mono" style="color:#cf222e">' + fmtW(seam.missed) + (seam.suspects > 0 ? ' <span class="dim small">×</span>' + seam.suspects : "") + "</div>"
+                // Per-event attribution inside the seam mini: which samples the aggregate points at.
+                + (seam.events.length ? '<div class="dim small mono attr-sub" style="margin-top:4px;line-height:1.6">' + seam.events.slice(0, 6).map((ev) => "#" + ev.seq + " " + (ev.at ? fmtDT(ev.at) : "") + (typeof ev.hitPct === "number" ? " " + ev.hitPct.toFixed(1) + "%" : "") + " ≥" + fmtB(ev.lcpBytes || 0) + " @m" + (ev.msgIndex != null ? ev.msgIndex : "?") + (ev.prevMsgs != null && ev.curMsgs != null ? " (" + ev.prevMsgs + "→" + ev.curMsgs + ")" : "") + "<br>").join("") + (seam.events.length > 6 ? "+" + (seam.events.length - 6) + " …<br>" : "") + "</div>" : "")
+                + "</div>"
+                + '<div class="mini"><div class="k" style="color:#bf8700" title="' + escapeHtml(t("det.attr_provider_tip")) + '">' + escapeHtml(t("det.attr_provider")) + '</div><div class="v mono" style="color:#bf8700">' + fmtW(seam.providerSide.missed) + (seam.providerSide.count > 0 ? ' <span class="dim small">×</span>' + seam.providerSide.count : "") + "</div></div>"
+                + '<div class="mini"><div class="k" style="color:#57606a" title="' + escapeHtml(t("det.attr_rewind_tip")) + '">' + escapeHtml(t("det.attr_rewind")) + '</div><div class="v mono" style="color:#57606a">' + fmtW(seam.rewinds.missed) + (seam.rewinds.count > 0 ? ' <span class="dim small">×</span>' + seam.rewinds.count : "") + "</div></div>"
+                + '<div class="mini"><div class="k" style="color:#d4a72c" title="' + escapeHtml(t("det.attr_abort_tip")) + '">' + escapeHtml(t("det.attr_abort")) + '</div><div class="v mono" style="color:#d4a72c">' + String(seam.abortCorrelated) + "</div></div>"
+                + "</div>"
+                + '<div class="dim small" style="margin-top:6px">' + t("det.attr_note") + "</div>");
         }
         const folds = ledger.folds || [];
         parts.push('<div class="section-label" style="margin-top:14px">' + t("det.folds") + "</div>");
@@ -928,8 +1076,9 @@ export const WEB_CLIENT = `(function () {
                 }
                 fe.value = val;
             }
+            hydrateQuickConfig();
             const broken = Boolean(cfg.parseError);
-            ["cfg-file-edit", "save-file", "save-upstream"].forEach((id) => { const el = $(id); if (el) el.disabled = broken; });
+            ["cfg-file-edit", "save-file", "save-upstream", "save-quick"].forEach((id) => { const el = $(id); if (el) el.disabled = broken; });
             const ptState = $("pt-state");
             const ptSource = $("pt-source");
             const clearPt = $("clear-passthrough");
@@ -951,6 +1100,244 @@ export const WEB_CLIENT = `(function () {
             toast(t("toast.failed", { msg: e.message }), "err");
         }
     }
+    function hydrateQuickConfig() {
+        const box = $("quick-fields");
+        if (!box) return;
+        box.innerHTML = "";
+        const fe = $("cfg-file-edit");
+        let draft = {};
+        try { draft = JSON.parse(fe && fe.value ? fe.value : "{}"); if (!draft || typeof draft !== "object" || Array.isArray(draft)) draft = {}; } catch (e) { return; }
+        function compressOf(d) { return (d.compress && typeof d.compress === "object" && !Array.isArray(d.compress)) ? d.compress : null; }
+        const NUDGE_DEFAULT = 50000, NUDGE_STEP = 5000, NUDGE_LOW = 20000, NUDGE_HIGH = 100000;
+        const PRM_KERNEL_DEFAULT = 5;
+        const brokenNote = document.createElement("div");
+        brokenNote.style.cssText = "min-height:16px;font-size:12px;color:#cf222e";
+        box.appendChild(brokenNote);
+        const qCtrls = [];
+        function quickBroken(on) {
+            brokenNote.textContent = on ? t("cfg.q_parse_err") : "";
+            qCtrls.forEach((el) => { el.disabled = !!on; });
+        }
+        function freshDraft() {
+            try {
+                const p = JSON.parse(fe && fe.value ? fe.value : "{}");
+                if (!p || typeof p !== "object" || Array.isArray(p)) return {};
+                return p;
+            } catch (e) { quickBroken(true); return null; }
+        }
+        function syncAll() {
+            const cp = compressOf(draft);
+            dbg.inp.checked = draft.debug === true;
+            ptRow.inp.checked = draft.passthrough === true;
+            const pv = (cp && typeof cp.promptPack === "string") ? cp.promptPack : "default";
+            while (packSel.options.length > 0) packSel.removeChild(packSel.lastChild);
+            ["default", "lean"].forEach((name) => {
+                const o = document.createElement("option");
+                o.value = name;
+                o.textContent = name;
+                packSel.appendChild(o);
+            });
+            if (pv !== "default" && pv !== "lean") {
+                const o = document.createElement("option");
+                o.value = pv;
+                o.textContent = pv + " *";
+                packSel.appendChild(o);
+            }
+            packSel.value = pv;
+            updatePackNote();
+            nudge.value = String(cp && typeof cp.nudgeGrowthTokens === "number" ? cp.nudgeGrowthTokens : NUDGE_DEFAULT);
+            updateNudgeNote();
+            prm.value = String(cp && typeof cp.preserveRecentMessages === "number" ? cp.preserveRecentMessages : PRM_KERNEL_DEFAULT);
+            ptInp.value = Array.isArray(draft.protectedTools) ? draft.protectedTools.join(", ") : "";
+            const nv = (cp && Array.isArray(cp.neverPreserveRecentTools)) ? cp.neverPreserveRecentTools : null;
+            neInp.value = nv ? nv.filter((x) => typeof x === "string").join(", ") : "";
+            const m = (draft.mitm && typeof draft.mitm === "object" && !Array.isArray(draft.mitm)) ? draft.mitm : null;
+            mitmInp.value = (m && Array.isArray(m.domains)) ? m.domains.filter((x) => typeof x === "string").join(", ") : "";
+        }
+        function commit(mutate) {
+            const fresh = freshDraft();
+            if (fresh === null) return;
+            draft = fresh;
+            mutate(draft);
+            if (fe) fe.value = JSON.stringify(draft, null, 2);
+            quickBroken(false);
+            syncAll();
+        }
+        function row(id, label) {
+            const w = document.createElement("div");
+            w.style.cssText = "display:flex;gap:12px;align-items:center;flex-wrap:wrap";
+            const lab = document.createElement("label");
+            lab.style.cssText = "flex:0 1 auto;max-width:520px";
+            const ctl = document.createElement("div");
+            ctl.style.flex = "0 0 auto";
+            const inp = document.createElement("input");
+            inp.type = "checkbox";
+            inp.id = id;
+            lab.appendChild(inp);
+            lab.append(document.createTextNode(" \u2009" + label));
+            w.appendChild(lab);
+            w.appendChild(ctl);
+            box.appendChild(w);
+            return { inp, ctl };
+        }
+        function textRow(id, label, placeholder) {
+            const w = document.createElement("div");
+            w.style.cssText = "display:flex;gap:12px;align-items:center;flex-wrap:wrap";
+            const lab = document.createElement("label");
+            lab.htmlFor = id;
+            lab.style.cssText = "flex:0 1 auto;max-width:520px";
+            lab.textContent = label;
+            const inp = document.createElement("input");
+            inp.type = "text";
+            inp.id = id;
+            inp.className = "field-input mono";
+            inp.style.flex = "1 1 320px";
+            inp.spellcheck = false;
+            if (placeholder) inp.placeholder = placeholder;
+            w.appendChild(lab);
+            w.appendChild(inp);
+            box.appendChild(w);
+            return inp;
+        }
+        const dbg = row("quick-debug", t("cfg.q_debug"));
+        qCtrls.push(dbg.inp);
+        dbg.inp.addEventListener("change", () => commit((d) => { if (dbg.inp.checked) d.debug = true; else delete d.debug; }));
+        const ptRow = row("quick-pt", t("cfg.q_passthrough"));
+        qCtrls.push(ptRow.inp);
+        ptRow.inp.addEventListener("change", () => commit((d) => { if (ptRow.inp.checked) d.passthrough = true; else delete d.passthrough; }));
+        void ptRow.ctl;
+        const packSel = document.createElement("select");
+        packSel.className = "field-input mono";
+        qCtrls.push(packSel);
+        const pw = document.createElement("div");
+        pw.style.cssText = "display:flex;gap:12px;align-items:center;flex-wrap:wrap";
+        const plab = document.createElement("label");
+        plab.htmlFor = "quick-pack";
+        plab.style.cssText = "flex:0 1 auto;max-width:520px";
+        plab.textContent = t("cfg.q_pack");
+        pw.appendChild(plab);
+        pw.appendChild(packSel);
+        box.appendChild(pw);
+        const packNote = document.createElement("div");
+        packNote.style.cssText = "margin:-6px 0 4px;font-size:12px;color:#57606a";
+        function updatePackNote() {
+            if (packSel.value === "lean") packNote.textContent = t("cfg.q_pack_lean_desc");
+            else if (packSel.value === "default") packNote.textContent = t("cfg.q_pack_default_desc");
+            else packNote.textContent = t("cfg.q_pack_custom");
+        }
+        box.appendChild(packNote);
+        packSel.addEventListener("change", () => commit((d) => {
+            if (!compressOf(d)) d.compress = {};
+            if (packSel.value === "default") delete d.compress.promptPack; else d.compress.promptPack = packSel.value;
+        }));
+        const nudge = document.createElement("input");
+        nudge.type = "number";
+        nudge.id = "quick-nudge";
+        nudge.className = "field-input mono";
+        nudge.style.width = "140px";
+        nudge.min = "1";
+        nudge.step = "1000";
+        nudge.spellcheck = false;
+        qCtrls.push(nudge);
+        const nnote = document.createElement("div");
+        nnote.style.cssText = "min-height:18px;font-size:12px;margin-top:2px";
+        function updateNudgeNote() {
+            const v = parseInt(nudge.value, 10);
+            nnote.textContent = "";
+            nnote.style.color = "";
+            if (!isNaN(v)) {
+                if (v < NUDGE_LOW) { nnote.textContent = t("cfg.q_nudge_low"); nnote.style.color = "#cf222e"; }
+                else if (v > NUDGE_HIGH) { nnote.textContent = t("cfg.q_nudge_high"); nnote.style.color = "#bf8700"; }
+            }
+        }
+        function syncNudge() {
+            updateNudgeNote();
+            commit((d) => {
+                if (!compressOf(d)) d.compress = {};
+                const v = parseInt(nudge.value, 10);
+                if (!isNaN(v) && v > 0 && v !== NUDGE_DEFAULT) d.compress.nudgeGrowthTokens = v; else delete d.compress.nudgeGrowthTokens;
+            });
+        }
+        function nudgeBtn(label, delta) {
+            const b = document.createElement("button");
+            b.type = "button";
+            b.className = "btn sm";
+            b.textContent = label;
+            b.title = t("cfg.q_nudge_step");
+            b.addEventListener("click", () => { const cur = parseInt(nudge.value, 10); const base = isNaN(cur) ? NUDGE_DEFAULT : cur; nudge.value = String(Math.max(1, base + delta)); syncNudge(); });
+            return b;
+        }
+        const nrow = document.createElement("div");
+        nrow.style.cssText = "display:flex;gap:12px;align-items:center;flex-wrap:wrap";
+        const nlab = document.createElement("label");
+        nlab.htmlFor = "quick-nudge";
+        nlab.style.cssText = "flex:0 1 auto;max-width:520px";
+        nlab.textContent = t("cfg.q_nudge");
+        const ng = document.createElement("div");
+        ng.style.cssText = "display:flex;gap:6px;align-items:center";
+        ng.appendChild(nudgeBtn("\u2212", -NUDGE_STEP));
+        ng.appendChild(nudge);
+        ng.appendChild(nudgeBtn("+", NUDGE_STEP));
+        nrow.appendChild(nlab);
+        nrow.appendChild(ng);
+        const nwrap = document.createElement("div");
+        nwrap.style.cssText = "display:flex;flex-direction:column;gap:4px";
+        nwrap.appendChild(nrow);
+        nwrap.appendChild(nnote);
+        box.appendChild(nwrap);
+        nudge.addEventListener("change", syncNudge);
+        const ptInp = textRow("quick-ptools", t("cfg.q_ptools"), t("cfg.q_ptools_ph"));
+        qCtrls.push(ptInp);
+        const ptWarn = document.createElement("div");
+        ptWarn.style.cssText = "font-size:12px;color:#57606a";
+        ptWarn.textContent = t("cfg.q_ptools_warn");
+        ptInp.parentElement.appendChild(ptWarn);
+        ptInp.addEventListener("change", () => commit((d) => {
+            const list = ptInp.value.split(",").map((s) => s.trim()).filter(Boolean);
+            if (list.length === 0) delete d.protectedTools; else d.protectedTools = list;
+        }));
+        const prm = textRow("quick-prm", t("cfg.q_prm"), t("cfg.q_prm_ph"));
+        prm.type = "number";
+        prm.min = "1";
+        prm.style.flex = "0 0 140px";
+        qCtrls.push(prm);
+        prm.addEventListener("change", () => commit((d) => {
+            if (!compressOf(d)) d.compress = {};
+            const v = parseInt(prm.value, 10);
+            if (!isNaN(v) && v > 0 && v !== PRM_KERNEL_DEFAULT) d.compress.preserveRecentMessages = v;
+            else { delete d.compress.preserveRecentMessages; prm.value = String(PRM_KERNEL_DEFAULT); }
+        }));
+        const NEVER_DEFAULT = ["decompress", "search_context", "read", "bash"];
+        const neInp = textRow("quick-never", t("cfg.q_never"), t("cfg.q_never_ph"));
+        qCtrls.push(neInp);
+        const neNote = document.createElement("div");
+        neNote.style.cssText = "font-size:12px;color:#57606a";
+        neNote.textContent = t("cfg.q_never_note");
+        neInp.parentElement.appendChild(neNote);
+        neInp.addEventListener("change", () => commit((d) => {
+            const list = neInp.value.split(",").map((s) => s.trim()).filter(Boolean);
+            const sameAsDefault = list.length === NEVER_DEFAULT.length && NEVER_DEFAULT.every((x) => list.indexOf(x) >= 0);
+            if (!compressOf(d)) d.compress = {};
+            if (list.length === 0 || sameAsDefault) delete d.compress.neverPreserveRecentTools; else d.compress.neverPreserveRecentTools = list;
+        }));
+        const mitmInp = textRow("quick-mitm", t("cfg.q_mitm"), t("cfg.q_mitm_ph"));
+        qCtrls.push(mitmInp);
+        mitmInp.addEventListener("change", () => commit((d) => {
+            const domains = mitmInp.value.split(",").map((s) => s.trim()).filter(Boolean);
+            if (domains.length === 0) { delete d.mitm; return; }
+            if (!d.mitm || typeof d.mitm !== "object" || Array.isArray(d.mitm)) d.mitm = {};
+            d.mitm.domains = domains;
+        }));
+        const moreA = document.createElement("a");
+        moreA.href = t("cfg.q_more_url");
+        moreA.target = "_blank";
+        moreA.rel = "noopener";
+        moreA.style.cssText = "font-size:12px;color:#0969da";
+        moreA.textContent = t("cfg.q_more");
+        box.appendChild(moreA);
+        if (fe) fe.addEventListener("input", () => { quickBroken(freshDraft() === null); });
+        syncAll();
+    }
     async function loadUpstream(cfg) {
         let up = null;
         try { up = await json("/__bili/upstream"); } catch (e) {}
@@ -971,16 +1358,36 @@ export const WEB_CLIENT = `(function () {
         const el = $("log-search");
         if (el && el.value !== q) el.value = q;
     }
+    function logViewExtras() {
+        // Context expansion vs time window (window wins — it implies context).
+        const winChk = $("log-win");
+        const ctxChk = $("log-ctx");
+        if (winChk && winChk.checked) return "&win=120";
+        if (ctxChk && ctxChk.checked) return "&ctx=3";
+        return "";
+    }
     async function loadLogs() {
         const qEl = $("log-search");
         if (!qEl || !$("log-body")) return;
         const q = (qEl.value || "").trim();
         try {
-            const d = await json("/__bili/logs?q=" + encodeURIComponent(q) + "&lines=" + ((($("log-lines")) ? $("log-lines").value : "500")));
+            const linesSel = $("log-lines");
+            const d = await json("/__bili/logs?q=" + encodeURIComponent(q) + "&lines=" + (linesSel ? linesSel.value : "500") + logViewExtras());
             $("log-path").textContent = d.path || t("logs.empty");
             $("copy-log-path").dataset.copy = d.path || "";
-            $("log-count").textContent = d.total > 0 ? t("logs.count", { n: (d.lines || []).length, total: d.total }) : "";
-            $("log-body").textContent = d.lines && d.lines.length ? d.lines.join("\\n") : t("logs.empty");
+            $("log-count").textContent = d.total > 0
+                ? t("logs.count", { n: (d.lines || []).length, total: d.total }) + ((typeof d.omitted === "number" && d.omitted > 0) ? t("logs.omitted", { o: d.omitted }) : "")
+                : "";
+            const bodyEl = $("log-body");
+            const rows = d.lines || [];
+            if (!rows.length) {
+                bodyEl.textContent = t("logs.empty");
+            } else if (Array.isArray(d.isMatch)) {
+                // Filtered view: highlight hits, dim context/time-window rows.
+                bodyEl.innerHTML = rows.map(function (l, i) { return '<div class="' + (d.isMatch[i] ? "lm-hit" : "lm-ctx") + '">' + escapeHtml(l) + "</div>"; }).join("");
+            } else {
+                bodyEl.textContent = rows.join("\\n");
+            }
         } catch (e) { /* the log endpoint is best-effort; stay quiet */ }
     }
 
@@ -1041,7 +1448,7 @@ export const WEB_CLIENT = `(function () {
             busy(ldl, true);
             try {
                 const q = ($("log-search").value || "").trim();
-                const r = await fetch("/__bili/logs?raw=1&q=" + encodeURIComponent(q) + "&lines=2000");
+                const r = await fetch("/__bili/logs?raw=1&q=" + encodeURIComponent(q) + "&lines=2000" + logViewExtras());
                 const blob = await r.blob();
                 const a = document.createElement("a");
                 a.href = URL.createObjectURL(blob);
@@ -1054,6 +1461,27 @@ export const WEB_CLIENT = `(function () {
                 toast(t("toast.failed", { msg: e.message }), "err");
             } finally {
                 busy(ldl, false);
+            }
+        });
+        const ldlAll = $("log-dl-all");
+        if (ldlAll) ldlAll.addEventListener("click", async () => {
+            busy(ldlAll, true);
+            try {
+                // Full unfiltered log (rotated .old + current) regardless of the
+                // search box — the honest "download everything" path.
+                const r = await fetch("/__bili/logs?raw=1&all=1");
+                const blob = await r.blob();
+                const a = document.createElement("a");
+                a.href = URL.createObjectURL(blob);
+                a.download = "billion-context-full-log.txt";
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+            } catch (e) {
+                toast(t("toast.failed", { msg: e.message }), "err");
+            } finally {
+                busy(ldlAll, false);
             }
         });
         const testBtn = $("test-upstream");
@@ -1084,6 +1512,17 @@ export const WEB_CLIENT = `(function () {
             const pu = $("proxy-url");
             const val = pu ? pu.value.trim() : "";
             await putCfg(su, { upstreamProxyMode: mode, upstreamProxy: val || null });
+        });
+        // #1748: quick-config controls edit the same in-memory draft as the raw JSON
+        // editor; every change re-serializes into #cfg-file-edit, one Save writes once.
+        const sq = $("save-quick");
+        if (sq) sq.addEventListener("click", async () => {
+            const el = $("cfg-file-edit");
+            const raw = el ? el.value : "";
+            let parsed;
+            try { parsed = JSON.parse(raw || "{}"); } catch (e) { toast(t("cfg.invalid_json"), "err"); return; }
+            if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) { toast(t("cfg.invalid_json"), "err"); return; }
+            await putCfg(sq, { file: raw });
         });
         // #1426: single raw config-file editor — the server validates every known field
         const sf = $("save-file");
@@ -1141,8 +1580,11 @@ export const WEB_CLIENT = `(function () {
     route();
     setInterval(() => {
         if (document.hidden) return;
+        // #1682: keep the global alert banner fresh on every view — silent, so a
+        // restarting server cannot spam toasts from background views.
         if (current === "overview") loadOverview();
-        else if (current === "sessions" && $("session-detail-view").hidden) refreshSessions(false);
+        else loadOverview(true);
+        if (current === "sessions" && $("session-detail-view").hidden) refreshSessions(false);
         else if (current === "logs") loadLogs();
     }, 5000);
 })();`;

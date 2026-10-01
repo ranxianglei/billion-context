@@ -49,6 +49,7 @@ import os from "node:os";
 import path from "node:path";
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
+import { assertPortDead } from "../port-race.js";
 
 const DSH_BIN = process.env.E2E_DSH_BIN ?? "dsh";
 const REPO_ROOT = path.resolve(import.meta.dirname, "../..");
@@ -248,6 +249,7 @@ async function startCtx(): Promise<Ctx> {
   ])
     fs.mkdirSync(d, { recursive: true });
 
+  await assertPortDead(ctx.fakePort); // #1689: prove still free right before the child binds it
   const fake = spawn(process.execPath, [FAKE_UPSTREAM], {
     env: {
       PATH: process.env.PATH ?? "",

@@ -121,7 +121,9 @@ test("CCR v2 range decompress: restores only the span via ephemeral injection", 
     assert.equal(injs.length, 1, "one ephemeral injection queued");
     const inj = injs[0]!;
     assert.equal(inj.id, `acp_retrieved_range_${f.blockId}_m00002-m00004`);
-    assert.equal(inj.role, "system");
+    // GHSA jc6g class fix: the decompress rider is conversation content, not
+    // operator speech — it rides as user, never system.
+    assert.equal(inj.role, "user");
     assert.equal(inj.contentType, "text");
     assert.ok(inj.text!.startsWith(`[Block ${f.blockId} content \u2014 m00002\u2013m00004 \u2014 3 item(s)]`));
     assert.match(inj.text!, /Historical detail 1\./);

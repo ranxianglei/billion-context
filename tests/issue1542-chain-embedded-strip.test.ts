@@ -152,7 +152,7 @@ function close(server: http.Server): Promise<void> {
 
 const MODEL = "gpt-test";
 
-function makeOpts(port: number, upstream: string): ProxyOptions {
+function makeOpts(port: number, upstream: string, overrides?: Partial<ProxyOptions>): ProxyOptions {
     return {
         port,
         host: "127.0.0.1",
@@ -169,6 +169,7 @@ function makeOpts(port: number, upstream: string): ProxyOptions {
         autoUpdate: false,
         logFile: "off",
         mitm: { enabled: false, domains: [] },
+        ...overrides,
     };
 }
 
@@ -193,7 +194,7 @@ function makeUpstream(captured: Captured[]): http.Server {
     });
 }
 
-async function runPollutedRequest(pluginMode: boolean): Promise<{ atLlm: Captured; logs: { level: string; msg: string }[] }> {
+async function runPollutedRequest(pluginMode: boolean, overrides?: Partial<ProxyOptions>): Promise<{ atLlm: Captured; logs: { level: string; msg: string }[] }> {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const logs: { level: string; msg: string }[] = [];
@@ -205,7 +206,7 @@ async function runPollutedRequest(pluginMode: boolean): Promise<{ atLlm: Capture
     await listen(upstream);
     const llmUrl = `http://127.0.0.1:${(upstream.address() as { port: number }).port}`;
 
-    const srv = await startServer(makeOpts(0, llmUrl));
+    const srv = await startServer(makeOpts(0, llmUrl, overrides));
     await listen(srv);
     const port = (srv.address() as { port: number }).port;
 
@@ -250,9 +251,23 @@ async function runPollutedRequest(pluginMode: boolean): Promise<{ atLlm: Capture
     }
 }
 
+// #1683 made egress stamping opt-in (default OFF), so a polluted body now leaves
+// the LLM with ZERO <bili-chain> markers by default (stale carriers stripped, no
+// fresh one added); with chainEgressStamp:true it is re-stamped with exactly one
+// fresh trailing carrier. Both outcomes are pinned below (deliberate behavior change).
 for (const pluginMode of [true, false]) {
-    test(`#1542 server: polluted ${pluginMode ? "plugin-mode" : "proxy-mode"} body reaches LLM with only the fresh stamp`, async () => {
+    const modeLabel = pluginMode ? "plugin-mode" : "proxy-mode";
+    test(`#1542 server: polluted ${modeLabel} body reaches LLM with NO carrier by default (#1683)`, async () => {
         const { atLlm, logs } = await runPollutedRequest(pluginMode);
+        const out = JSON.parse(atLlm.body) as { messages: { role: string; content: string }[] };
+        const stamped = out.messages.filter((m) => typeof m.content === "string" && m.content.includes("<bili-chain"));
+        assert.equal(stamped.length, 0, `no carrier may reach the LLM by default, got ${stamped.length}: ${atLlm.body.slice(0, 400)}`);
+        assert.ok(!atLlm.body.includes(DIGEST_A), "old carrier A must not reach the LLM");
+        assert.ok(!atLlm.body.includes(DIGEST_B), "old carrier B must not reach the LLM");
+        assert.ok(logs.some((l) => l.msg.includes("embedded chain checkpoint")), "strip must be logged");
+    });
+    test(`#1542 server: polluted ${modeLabel} body reaches LLM with only the fresh stamp (egress stamping enabled)`, async () => {
+        const { atLlm, logs } = await runPollutedRequest(pluginMode, { chainEgressStamp: true });
         const out = JSON.parse(atLlm.body) as { messages: { role: string; content: string }[] };
         const stamped = out.messages.filter((m) => typeof m.content === "string" && m.content.includes("<bili-chain"));
         assert.equal(stamped.length, 1, `exactly one (fresh) carrier may reach the LLM, got ${stamped.length}: ${atLlm.body.slice(0, 400)}`);

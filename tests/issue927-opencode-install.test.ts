@@ -10,6 +10,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { pluginInstall, pluginRemove, pluginStatusAll, pickPluginKey, detectOpencodeMajor } from "../src/plugin-install.ts";
 import { parse as jsoncParse, type ParseError } from "jsonc-parser";
+import { rmrf } from "./tmp-rm.ts";
 
 function readJsonc(file: string): Record<string, unknown> {
     const errors: ParseError[] = [];
@@ -89,7 +90,7 @@ test("detectOpencodeMajor: honors BILI_CLIENT_BIN, fails soft to 1 (#927)", asyn
             assert.equal(detectOpencodeMajor(), 1);
         });
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -148,7 +149,7 @@ test("install targets existing opencode.jsonc, preserves comments, keeps compact
             assert.equal(pluginStatusAll().find((r) => r.agent === "opencode")?.status, "not installed");
         });
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -176,7 +177,7 @@ test("fresh config dir: creates plain opencode.json, remove restores pre-install
             assert.equal(after.compaction, undefined);
         });
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -199,7 +200,7 @@ test("only config.json present: installer edits it, does not spawn opencode.json
             assert.equal(fs.existsSync(path.join(cfgDir, "opencode.jsonc")), false);
         });
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -221,7 +222,7 @@ test("jsonc + json both present: jsonc wins, sibling json stays byte-identical (
             assert.equal(fs.readFileSync(jsonFile, "utf8"), siblingBytes, "sibling opencode.json untouched");
         });
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -239,7 +240,7 @@ test("broken target config: refuses to overwrite, writes nothing (#927)", async 
             assert.equal(fs.existsSync(path.join(cfgDir, "plugins/billion-context/index.js")), false);
         });
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -260,6 +261,6 @@ test("status/remove recognize our entry under either key spelling (#927)", async
             assert.equal(pluginStatusAll().find((r) => r.agent === "opencode")?.status, "not installed");
         });
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });

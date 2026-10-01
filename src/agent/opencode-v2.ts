@@ -29,6 +29,14 @@
 //   file accordingly (src/launcher.ts opencodeMajorVersion). End-to-end
 //   verified on 2.0.3: true plugin mode, native tools via the plugin tool
 //   endpoint, zero wire-level injection.
+// - @opencode/cli 2.0.18 (probed live during #1569 triage): Context exposes
+//   model/provider domains and NO ctx.catalog key at all — the
+//   catalog.model.list seam below is dead on every stable build, which is why
+//   x-bili-plugin-context-window never got stamped and the proxy silently
+//   fell back to registry windows (#1569). The live seam is ctx.model.list()
+//   → { location, data: ModelInfo[] } with ModelInfo.limit = { context,
+//   output } sourced from opencode.json's provider model config; the old
+//   catalog seam is kept as a hedge for builds that expose it.
 // - npm dev builds 2026-09-13 / 2026-09-14 (probed live during #754 review):
 //   first loads plugins via V1 server() only; second exposes setup() but has
 //   no ctx.session / ctx.tool at all. Adjacent dev builds disagree with each
@@ -41,11 +49,12 @@
 // available on all observed surfaces.
 
 import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../compress-tool.js";
-import { fetchProxyVersion, fetchStatus, forwardTool, postIdentityRegister, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary, reportRuntimeInfoOnChange } from "./shared.js";
+import { fetchProxyVersion, fetchStatus, fitNoticeDescription, forwardTool, postIdentityRegister, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary, reportRuntimeInfoOnChange, V2_SYNTHETIC_TEXT } from "./shared.js";
 
 // OpenCode V2 TUI renders a synthetic message as a visible Notice row only when its display text fits the
-// timeline cap (~1KB): longer text renders nothing (#880). Panels go to description verbatim under the cap.
-import { V2_SYNTHETIC_TEXT } from "./shared.js";
+// timeline cap (~1KB): longer text renders nothing (#880). Under the cap, panels go to description verbatim;
+// over it, fitNoticeDescription hoists the Web UI deep link to line one and keeps whole leading lines (#1602) —
+// the full panel stays reachable through that link.
 const V2_SYNTHETIC_VISIBLE_MAX = 1024;
 // /acp-cache renders a report the user explicitly asked to read — unlike the
 // status panel whose leading lines carry the essence, its tail (LINE ITEMS)
@@ -60,6 +69,7 @@ interface V2Headers {
 
 export interface V2HttpRequestEvent {
     sessionID?: unknown;
+    agent?: unknown;
     model?: { providerID?: unknown; id?: unknown };
     request?: { url?: unknown; headers?: V2Headers | null };
 }
@@ -105,7 +115,18 @@ export interface V2PluginContext {
         transform?: (cb: (editor: V2CommandEditor) => void) => void | Promise<V2Registration | undefined>;
     };
     event?: { subscribe?: (opts?: { signal?: AbortSignal }) => AsyncIterable<{ type?: unknown; data?: Record<string, unknown> }> | undefined };
-    catalog?: { model?: { list?: () => Promise<{ data?: V2CatalogModelEntry[] }> | undefined } | undefined };
+    /** v2.0.x stable (probed @opencode/cli 2.0.18): ModelApi.list() →
+     *  { location, data: ModelInfo[] } with limit = { context, output }.
+     *  These builds expose NO ctx.catalog at all (#1569). */
+    model?: { list?: () => Promise<{ data?: V2CatalogModelEntry[] }> | undefined };
+    catalog?: {
+        model?: { list?: () => Promise<{ data?: V2CatalogModelEntry[] }> | undefined };
+        /** Newer dev builds: provider records carrying per-model maps (a Map,
+         *  or a plain object once serialized across an RPC boundary). */
+        provider?: {
+            list?: () => Array<{ provider?: { id?: unknown }; models?: Map<string, V2CatalogModelEntry> | Record<string, V2CatalogModelEntry> }> | undefined;
+        };
+    };
 }
 
 const WINDOW_REFRESH_MS = 60000;
@@ -124,31 +145,97 @@ export interface V2State {
     windows?: Map<string, number>;
     outputs?: Map<string, number>;
     windowsAt?: number;
+    windowsWarned?: boolean;
 }
 
 function refreshWindows(ctx: V2PluginContext, state: V2State): void {
     const now = Date.now();
     if (state.windows && state.windowsAt !== undefined && now - state.windowsAt < WINDOW_REFRESH_MS) return;
     state.windowsAt = now;
-    void (async () => {
-        try {
-            const res = await ctx.catalog?.model?.list?.();
-            const map = new Map<string, number>();
-            const outMap = new Map<string, number>();
-            for (const m of res?.data ?? []) {
-                const pid = typeof m.providerID === "string" ? m.providerID : "";
-                const id = typeof m.id === "string" ? m.id : "";
-                const c = m.limit?.context;
-                if (pid && id && typeof c === "number" && Number.isFinite(c) && c > 0) map.set(`${pid}/${id}`, Math.floor(c));
-                const o = m.limit?.output;
-                if (pid && id && typeof o === "number" && Number.isFinite(o) && o > 0) outMap.set(`${pid}/${id}`, Math.floor(o));
-            }
-            if (map.size > 0) state.windows = map;
-            if (outMap.size > 0) state.outputs = outMap;
-        } catch {
-            // catalog unavailable — window header simply goes unstamped
+    // #1569: each seam commits INDEPENDENTLY into one shared map pair, one
+    // .then hop from its own settle — the same microtask profile as the
+    // original single-await implementation (which the v2 test suite proves
+    // stamps by round 2). A shared Promise.all settlement point costs extra
+    // hops the client's next request outruns under Node's microtask FIFO,
+    // leaving the header unstamped on exactly the round that matters.
+    const map = new Map<string, number>();
+    const outMap = new Map<string, number>();
+    let pending = 0;
+    const harvest = (pid: unknown, id: unknown, m: V2CatalogModelEntry | undefined): void => {
+        const p = typeof pid === "string" ? pid : "";
+        const i = typeof id === "string" ? id : "";
+        const c = m?.limit?.context;
+        if (p && i && typeof c === "number" && Number.isFinite(c) && c > 0) map.set(`${p}/${i}`, Math.floor(c));
+        const o = m?.limit?.output;
+        if (p && i && typeof o === "number" && Number.isFinite(o) && o > 0) outMap.set(`${p}/${i}`, Math.floor(o));
+    };
+    const commit = (): void => {
+        if (map.size > 0) state.windows = map;
+        if (outMap.size > 0) state.outputs = outMap;
+        // #1569: degradation must not be silent — without a usable limit the
+        // x-bili-plugin-context-window header goes unstamped and the proxy
+        // sizes against registry/configured windows instead of the host's own
+        // opencode.json config. Say so once per plugin instance (skipped while
+        // an earlier harvest still supplies a window).
+        if (--pending === 0 && map.size === 0 && !state.windows && !state.windowsWarned) {
+            state.windowsWarned = true;
+            console.warn("[bili-opencode] no usable model context limits found (tried ctx.model.list + ctx.catalog seams) — x-bili-plugin-context-window goes unstamped and the bili proxy falls back to registry/configured windows; opencode.json limit.context is NOT reaching the proxy");
         }
-    })();
+    };
+    const safeModelList = (fn?: () => Promise<{ data?: V2CatalogModelEntry[] }> | undefined): Promise<{ data?: V2CatalogModelEntry[] }> => {
+        try {
+            const p = fn ? fn() : undefined;
+            return (p ?? Promise.resolve({})).catch(() => ({}));
+        } catch {
+            return Promise.resolve({});
+        }
+    };
+    const safeProviderList = (): Promise<Array<{ provider?: { id?: unknown }; models?: Map<string, V2CatalogModelEntry> | Record<string, V2CatalogModelEntry> }>> => {
+        type Records = Array<{ provider?: { id?: unknown }; models?: Map<string, V2CatalogModelEntry> | Record<string, V2CatalogModelEntry> }>;
+        try {
+            const raw = ctx.catalog?.provider?.list?.();
+            const norm = (v: unknown): Records => (Array.isArray(v) ? v as Records : []);
+            const p = raw != null && typeof (raw as { then?: unknown }).then === "function"
+                ? Promise.resolve(raw).then(norm)
+                : Promise.resolve(norm(raw));
+            return p.catch(() => []);
+        } catch {
+            return Promise.resolve([]);
+        }
+    };
+    // Seam 1 — v2.0.x stable (probed @opencode/cli 2.0.18): ctx.model.list().
+    // These builds have no ctx.catalog at all, so seam 2 alone left the window
+    // header unstamped on every stable release (#1569).
+    // Seam 2 — hedge for builds/tests exposing catalog.model.list().
+    pending += 2;
+    void safeModelList(ctx.model?.list).then((res) => {
+        try {
+            for (const m of res.data ?? []) harvest(m.providerID, m.id, m);
+        } catch { /* malformed entries */ }
+        commit();
+    });
+    void safeModelList(ctx.catalog?.model?.list).then((res) => {
+        try {
+            for (const m of res.data ?? []) harvest(m.providerID, m.id, m);
+        } catch { /* malformed entries */ }
+        commit();
+    });
+    // Seam 3 — newer dev builds: catalog.provider.list() records. Declared
+    // synchronous, but a thenable is normalized too (builds differ).
+    pending += 1;
+    void safeProviderList().then((records) => {
+        try {
+            for (const r of records) {
+                const models = r?.models;
+                if (models instanceof Map) {
+                    for (const [mid, m] of models) harvest(typeof m.providerID === "string" ? m.providerID : r?.provider?.id, typeof m.id === "string" ? m.id : mid, m);
+                } else if (models && typeof models === "object") {
+                    for (const [mid, m] of Object.entries(models)) harvest(typeof m.providerID === "string" ? m.providerID : r?.provider?.id, typeof m.id === "string" ? m.id : mid, m);
+                }
+            }
+        } catch { /* malformed records */ }
+        commit();
+    });
 }
 
 export interface OpencodeV2SetupOptions {
@@ -206,6 +293,12 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
             // instruction drift (AGENTS.md reconcile) must not fork the
             // compression session.
             headers.set("x-bili-plugin-instructions-mutable", "1");
+            // #1699: forward the host's per-request persona so the proxy can classify
+            // side requests by intent — opencode v2 title-gen carries no max_tokens, so
+            // the budget heuristic alone can never see it. Stamped for every non-empty
+            // id; the proxy acts only on known side-request agents (main ids are inert).
+            const agentId = typeof e.agent === "string" ? e.agent.trim() : "";
+            if (agentId.length > 0) headers.set("x-bili-plugin-agent", agentId);
             const model = e.model;
             if (model && typeof model.providerID === "string" && typeof model.id === "string") {
                 const key = `${model.providerID}/${model.id}`;
@@ -294,6 +387,7 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                             return;
                         }
                         let text: string;
+                        let webUrl: string | undefined;
                         if (pluginDisabled()) {
                             text = "bili: disabled (BILLION_CONTEXT_PLUGIN=0)";
                         } else {
@@ -305,6 +399,7 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                                     const status = await fetchStatus(base, sid);
                                     if (status && typeof status.panel === "string" && status.panel.length > 0) {
                                         text = status.panel;
+                                        webUrl = typeof status.webUrl === "string" && status.webUrl.length > 0 ? status.webUrl : undefined;
                                     } else if (status && status.ok === false) {
                                         let version: string | undefined;
                                         try {
@@ -337,11 +432,10 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                         try {
                             // resume:false — OpenCode V2 defaults to delivery "steer" + execution.wake(), which would
                             // start a model turn on every /acp invocation with no user input (spurious empty turns).
-                            // Short panels become the visible description verbatim; long ones keep their leading
-                            // lines plus a marker so the model-facing body never repeats the whole panel.
-                            const description = text.length > V2_SYNTHETIC_VISIBLE_MAX
-                                ? text.slice(0, V2_SYNTHETIC_VISIBLE_MAX - 20) + "\n\n[panel truncated]"
-                                : text;
+                            // Short panels become the visible description verbatim; long ones lead with the Web UI
+                            // deep link (full panel stays reachable there) and keep their leading whole lines, so
+                            // the model-facing body never repeats the whole panel (#1602).
+                            const description = fitNoticeDescription(text, V2_SYNTHETIC_VISIBLE_MAX, "panel", webUrl);
                             await ctx.session?.synthetic?.({ sessionID: sid, text: V2_SYNTHETIC_TEXT, description, resume: false });
                         } catch (err) {
                             console.error(`[bili-opencode] /acp render failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -382,9 +476,7 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                             }
                         }
                         try {
-                            const description = text.length > V2_CACHE_REPORT_VISIBLE_MAX
-                                ? text.slice(0, V2_CACHE_REPORT_VISIBLE_MAX - 20) + "\n\n[report truncated]"
-                                : text;
+                            const description = fitNoticeDescription(text, V2_CACHE_REPORT_VISIBLE_MAX, "report");
                             await ctx.session?.synthetic?.({ sessionID: sid, text: V2_SYNTHETIC_TEXT, description, resume: false });
                         } catch (err) {
                             console.error(`[bili-opencode] /acp-cache render failed: ${err instanceof Error ? err.message : String(err)}`);

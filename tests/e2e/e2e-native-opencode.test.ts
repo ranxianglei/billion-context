@@ -39,6 +39,7 @@ import os from "node:os";
 import path from "node:path";
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
+import { assertPortDead } from "../port-race.js";
 
 const OC_BIN = process.env.E2E_OC_BIN ?? "opencode";
 const REPO_ROOT = path.resolve(import.meta.dirname, "../..");
@@ -118,6 +119,7 @@ type OracleEntry = {
   toolName: string | null;
   lastUser: string;
   lastUserRef: string | null;
+  title?: boolean;
 };
 
 function readOracle(reqLog: string): OracleEntry[] {
@@ -162,6 +164,7 @@ type Ctx = {
   xdg: { config: string; cache: string; state: string; data: string };
   svcPort: number;
   fakePort: number;
+  svcProbed: boolean;
   fakePid?: number;
   reqLog: string;
 };
@@ -210,6 +213,7 @@ async function startCtx(): Promise<Ctx> {
     },
     svcPort: await freePort(),
     fakePort: await freePort(),
+    svcProbed: false,
     reqLog: path.join(work, "fake-chat-requests.jsonl"),
   };
   for (const d of [
@@ -286,6 +290,7 @@ async function startCtx(): Promise<Ctx> {
     JSON.stringify({ compress: { preserveRecentTokens: 0 } }, null, 2),
   );
 
+  await assertPortDead(ctx.fakePort); // #1689: prove still free right before the child binds it
   const fake = spawn(process.execPath, [FAKE_UPSTREAM], {
     env: {
       ...process.env,
@@ -391,11 +396,17 @@ function teardown(ctx: Ctx): void {
   }
 }
 
-function ocRun(
+async function ocRun(
   ctx: Ctx,
   prompt: string,
   opts: { session?: string } = {},
 ): Promise<{ code: number; stdout: string; stderr: string }> {
+  if (!ctx.svcProbed) {
+    // #1689: only before the first run — afterwards the managed service
+    // legitimately holds svcPort, so re-probing would always throw.
+    ctx.svcProbed = true;
+    await assertPortDead(ctx.svcPort);
+  }
   const args = ["run", "-m", "fake/fake-model", "--dangerously-skip-permissions"];
   if (opts.session) args.push("-s", opts.session);
   args.push(prompt);
@@ -612,13 +623,35 @@ if (checkOnly) {
       const rows1 = readOracle(ctx.reqLog);
       const conv = rows1.find((o) => o.conv)?.conv ?? null;
       assert.ok(conv !== null && /^ses_/.test(conv), "run one must establish a session");
-      const fillerRow = rows1.find((o) => o.lastUser.includes("filler line 0"));
+      // #1699: skip the v2 title side-channel row — it re-sends the same
+      // filler text to the title model, and after intent-based routing it
+      // arrives VERBATIM (no ref tags, no tools); whichever of the two lands
+      // first in the reqLog is a race, so filter on the title marker.
+      const fillerRow = rows1.find((o) => o.lastUser.includes("filler line 0") && !o.title);
       assert.ok(fillerRow, "filler prompt must reach the upstream (oracle)");
       const targetRef = fillerRow.lastUserRef;
       assert.ok(
         targetRef !== null && /^m\d{5}$/.test(targetRef),
         `filler message must carry its ACP ref tag, got ${targetRef} (row: ${JSON.stringify(fillerRow).slice(0, 200)})`,
       );
+      // #1699 pin: any title rows present must be verbatim side-channel
+      // traffic — no kernel ref tags and no injected ACP tools — while the
+      // main turn above carries its ref. v1 title calls carry neither the
+      // v2 agent header nor max_tokens, so they were never side-classified
+      // (pre-existing v1 behavior, unchanged by this PR); gate on v2.
+      if ((info.major ?? 0) >= 2) {
+        for (const t of rows1.filter((o) => o.title)) {
+        assert.equal(
+          t.lastUserRef,
+          null,
+          `title side-channel must route verbatim (no ref tags), got ${t.lastUserRef}`,
+        );
+        assert.ok(
+          !t.tools.includes("compress"),
+          `title side-channel must not receive injected tools, got ${JSON.stringify(t.tools)}`,
+        );
+        }
+      }
 
       await awaitProxyExit(ctx);
 

@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import * as tar from "tar";
@@ -18,6 +18,7 @@ import {
 } from "../src/advisory.ts";
 import { checkForUpdate, _resetAdvisoryRefusalWarnsForTest } from "../src/update.ts";
 import { setLogCapture } from "../src/logger.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 function integrityField(buf: Buffer, alg = "sha512"): string {
     return `${alg}-${crypto.createHash(alg).update(buf).digest("base64")}`;
@@ -172,7 +173,7 @@ test("runAdvisoryCheck: forces the target version onto an affected install", { t
     } finally {
         delete process.env.XDG_CACHE_HOME;
         _resetAdvisoryWatcherForTest();
-        rmSync(fx.root, { recursive: true, force: true });
+        rmrf(fx.root);
     }
 });
 
@@ -200,7 +201,7 @@ test("runAdvisoryCheck: rollback semantics — target OLDER than the current ver
     } finally {
         delete process.env.XDG_CACHE_HOME;
         _resetAdvisoryWatcherForTest();
-        rmSync(fx.root, { recursive: true, force: true });
+        rmrf(fx.root);
     }
 });
 
@@ -221,7 +222,7 @@ test("runAdvisoryCheck: refuses a source checkout, stays active with the reason"
     } finally {
         delete process.env.XDG_CACHE_HOME;
         _resetAdvisoryWatcherForTest();
-        rmSync(fx.root, { recursive: true, force: true });
+        rmrf(fx.root);
     }
 });
 
@@ -248,7 +249,7 @@ test("runAdvisoryCheck: misconfigured advisory (target == current) fails loudly,
         delete process.env.XDG_CACHE_HOME;
         _resetAdvisoryWatcherForTest();
         _resetAdvisoryRefusalWarnsForTest();
-        rmSync(fx.root, { recursive: true, force: true });
+        rmrf(fx.root);
     }
 });
 
@@ -284,7 +285,7 @@ test("runAdvisoryCheck: unresolvable target (owner typo) — install untouched, 
         delete process.env.XDG_CACHE_HOME;
         _resetAdvisoryWatcherForTest();
         _resetAdvisoryRefusalWarnsForTest();
-        rmSync(fx.root, { recursive: true, force: true });
+        rmrf(fx.root);
     }
 });
 
@@ -317,7 +318,7 @@ test("runAdvisoryCheck: refuses host-managed (pnpm store) installs in place, war
         delete process.env.XDG_CACHE_HOME;
         _resetAdvisoryWatcherForTest();
         _resetAdvisoryRefusalWarnsForTest();
-        rmSync(fx.root, { recursive: true, force: true });
+        rmrf(fx.root);
     }
 });
 
@@ -336,7 +337,7 @@ test("runAdvisoryCheck: unreachable source fails open (warn, never throw)", asyn
     } finally {
         delete process.env.XDG_CACHE_HOME;
         _resetAdvisoryWatcherForTest();
-        rmSync(fx.root, { recursive: true, force: true });
+        rmrf(fx.root);
     }
 });
 
@@ -353,7 +354,7 @@ test("runAdvisoryCheck: malformed document is ignored, not fatal", async () => {
     } finally {
         delete process.env.XDG_CACHE_HOME;
         _resetAdvisoryWatcherForTest();
-        rmSync(fx.root, { recursive: true, force: true });
+        rmrf(fx.root);
     }
 });
 
@@ -376,7 +377,7 @@ test("runAdvisoryCheck: unthrottled second run skips (cadence respected)", async
     } finally {
         delete process.env.XDG_CACHE_HOME;
         _resetAdvisoryWatcherForTest();
-        rmSync(fx.root, { recursive: true, force: true });
+        rmrf(fx.root);
     }
 });
 
@@ -405,6 +406,6 @@ test("checkForUpdate: defers to an active advisory instead of fighting it", asyn
     } finally {
         delete process.env.XDG_CACHE_HOME;
         _resetAdvisoryWatcherForTest();
-        rmSync(fx.root, { recursive: true, force: true });
+        rmrf(fx.root);
     }
 });

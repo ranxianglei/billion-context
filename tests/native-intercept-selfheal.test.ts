@@ -249,3 +249,99 @@ test("#1158 escape hatch: BILI_RECLAIM_FETCH_PATCH=0 keeps the classic direct in
         delete process.env.BILI_RECLAIM_FETCH_PATCH;
     }
 });
+
+// #1662: dsh-codex-subscription's full churn shape — the plugin reads the
+// CURRENT top (bili's chain), wraps it, writes it back, and repeats per
+// operation. bili re-adopts each wrapper as downstream, so the chain
+// accumulates one (wrapper, bili-link) pair per wrap:
+// C_n → w_n → C_{n-1} → w_{n-1} → … . Pre-fix, every request walked the
+// entire accumulated chain (each stacked link re-running the full dispatch),
+// so stack depth grew with session lifetime until dsh web died with
+// "RangeError: Maximum call stack size exceeded". The re-entry termination
+// must keep request depth constant no matter how many wraps happened.
+
+test("#1662: thousands of foreign re-wraps of the current top cannot grow request depth", async () => {
+    const nativeSink: string[] = [];
+    const nativeFetch = fakeFetch(nativeSink);
+    const saved = globalThis.fetch;
+    const { _resetForTest } = await import("../src/agent/native-intercept.js");
+    _resetForTest({ anchor: nativeFetch });
+    globalThis.fetch = nativeFetch;
+    try {
+        const state: NativeInterceptState = { origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001") };
+        assert.equal(installNativeFetchIntercept(state), true);
+        // 16000 sits well past the measured overflow threshold (~4-8K cycles
+        // depending on Node/platform stack limits); the fixed code's cost is
+        // O(1) per request regardless of history length.
+        for (let i = 0; i < 16000; i++) {
+            const base = globalThis.fetch;
+            const wrapped = (async (input: RequestInfo | URL, init?: RequestInit) => base(input, init)) as typeof fetch;
+            globalThis.fetch = wrapped;
+        }
+        const res = await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST" });
+        assert.equal(res.status, 200);
+        await globalThis.fetch("https://registry.npmjs.org/billion-context");
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+    assert.deepEqual(nativeSink, [
+        "http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages",
+        "https://registry.npmjs.org/billion-context",
+    ]);
+});
+
+test("#1662: concurrent top-level requests are both fully dispatched (no false re-entry)", async () => {
+    const nativeSink: string[] = [];
+    const nativeFetch = fakeFetch(nativeSink);
+    const saved = globalThis.fetch;
+    const { _resetForTest } = await import("../src/agent/native-intercept.js");
+    _resetForTest({ anchor: nativeFetch });
+    globalThis.fetch = nativeFetch;
+    try {
+        const state: NativeInterceptState = { origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001") };
+        assert.equal(installNativeFetchIntercept(state), true);
+        const [a, b] = await Promise.all([
+            globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST" }),
+            globalThis.fetch("http://127.0.0.1:8199/v1/chat/completions"),
+        ]);
+        assert.equal(a.status, 200);
+        assert.equal(b.status, 200);
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+    assert.deepEqual(nativeSink, [
+        "http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages",
+        "http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/chat/completions",
+    ]);
+});
+
+test("#1662: a steady-state foreign wrapper wrapping bili's chain stays in the chain (its hook still runs)", async () => {
+    const nativeSink: string[] = [];
+    const seenByWrapper: string[] = [];
+    const nativeFetch = fakeFetch(nativeSink);
+    const saved = globalThis.fetch;
+    const { _resetForTest } = await import("../src/agent/native-intercept.js");
+    _resetForTest({ anchor: nativeFetch });
+    globalThis.fetch = nativeFetch;
+    try {
+        const state: NativeInterceptState = { origin: "http://127.0.0.1:40001", ready: Promise.resolve("http://127.0.0.1:40001") };
+        assert.equal(installNativeFetchIntercept(state), true);
+        const base = globalThis.fetch;
+        const wrapped = (async (input: RequestInfo | URL, init?: RequestInit) => {
+            seenByWrapper.push(typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url);
+            return base(input, init);
+        }) as typeof fetch;
+        globalThis.fetch = wrapped;
+        const res = await globalThis.fetch("http://127.0.0.1:8199/v1/messages", { method: "POST" });
+        assert.equal(res.status, 200);
+    } finally {
+        globalThis.fetch = saved;
+        _resetForTest();
+    }
+    // The wrapper ran exactly once, saw the REWRITTEN url (it sits below the
+    // top link), and the request reached the native fetch exactly once.
+    assert.deepEqual(seenByWrapper, ["http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages"]);
+    assert.deepEqual(nativeSink, ["http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages"]);
+});

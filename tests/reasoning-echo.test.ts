@@ -1,8 +1,10 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { isStrictReasoningEcho, normalizeStrictEchoReasoning, warnReasoningPairs, warnAnthropicThinkingPairs, warnResponsesReasoningPairs } from "../src/server.js";
+import { isStrictReasoningEcho, normalizeStrictEchoReasoning, warnReasoningPairs, warnAnthropicThinkingPairs, warnResponsesReasoningPairs, withReasoningDrop } from "../src/server.js";
 import { modelIdOf, normalizeStrictEchoBody, normalizeStrictEchoResponsesInput } from "../src/strict-echo.js";
+import { dropCompressReasoning } from "../src/reasoning-drop.js";
 import type { Session } from "../src/session.js";
+import { anthropicToCore, coreToAnthropic, type AnthropicMessage, type BiliMessage } from "acp-kernel/wire";
 import type { OpenAIMessage } from "acp-kernel/wire";
 import { createInitialState } from "acp-kernel";
 
@@ -472,5 +474,64 @@ describe("#762 strict-echo body normalization (loop re-request path)", () => {
         const c = collector();
         assert.equal(normalizeStrictEchoBody(body, true, c.log, "s1"), body);
         assert.equal(c.lines.length, 0);
+    });
+});
+
+describe("#1658 anthropic signed-thinking gate (#651 drop vs #684 pair invariant)", () => {
+    const SIGNED = (text = "x".repeat(3000), id = "r"): BiliMessage => ({ id, role: "assistant", contentType: "reasoning", text, thinkingSignature: "sig_test_123" });
+    const CALL = (toolName = "compress", toolCallId = "t1"): BiliMessage => ({ id: "c", role: "assistant", contentType: "tool-call", toolName, toolCallId, text: "{}" });
+    const RESULT = (toolCallId = "t1"): BiliMessage => ({ id: "res", role: "user", contentType: "tool-result", toolName: "compress", toolCallId, text: "ok" });
+    const USER = (text = "next"): BiliMessage => ({ id: "u", role: "user", contentType: "text", text });
+
+    it("signed thinking in view disables the #651 drop even without strictEcho", () => {
+        const msgs = [SIGNED(), CALL(), RESULT(), USER()];
+        const c = collector();
+        assert.equal(withReasoningDrop(msgs, undefined, c.log, "s1", false), msgs);
+        assert.equal(c.lines.length, 0);
+    });
+
+    it("unsigned reasoning still drops (non-thinking claude sessions keep #651)", () => {
+        const msgs = [{ id: "r", role: "assistant", contentType: "reasoning", text: "x".repeat(3000) }, CALL(), RESULT(), USER()];
+        const c = collector();
+        const out = withReasoningDrop(msgs, undefined, c.log, "s1", false);
+        assert.equal(out.length, 3);
+        assert.ok(!out.some((m) => m.contentType === "reasoning"));
+        assert.equal(c.lines.length, 1);
+    });
+
+    it("empty-string signature does not arm the gate", () => {
+        const msgs = [{ id: "r", role: "assistant", contentType: "reasoning", text: "x".repeat(3000), thinkingSignature: "" }, CALL(), RESULT(), USER()];
+        const c = collector();
+        const out = withReasoningDrop(msgs, undefined, c.log, "s1", false);
+        assert.equal(out.length, 3);
+        assert.ok(!out.some((m) => m.contentType === "reasoning"));
+    });
+
+    const reproInbound: AnthropicMessage[] = [
+        { role: "user", content: "q" },
+        { role: "assistant", content: [{ type: "thinking", thinking: "x".repeat(3000), signature: "sig_test_123" }, { type: "tool_use", id: "tu1", name: "compress", input: {} }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "tu1", content: "ok" }] },
+        { role: "user", content: "next" },
+    ];
+
+    it("regression: reported repro shape no longer trips the sentinel", () => {
+        const { msgs } = anthropicToCore({ model: "claude-opus-4-5", messages: reproInbound });
+        assert.ok(msgs.some((m) => m.contentType === "reasoning" && m.thinkingSignature === "sig_test_123"));
+        const c = collector();
+        const dropped = withReasoningDrop(msgs, undefined, c.log, "s1", false);
+        assert.equal(dropped, msgs);
+        const outbound = coreToAnthropic(dropped);
+        warnAnthropicThinkingPairs(reproInbound, outbound, c.log, "s1");
+        assert.equal(c.lines.length, 0);
+    });
+
+    it("negative control: dropping the run by hand still trips the sentinel (test has teeth)", () => {
+        const { msgs } = anthropicToCore({ model: "claude-opus-4-5", messages: reproInbound });
+        const manualDrop = dropCompressReasoning(msgs);
+        assert.ok(manualDrop.length < msgs.length);
+        const c = collector();
+        warnAnthropicThinkingPairs(reproInbound, coreToAnthropic(manualDrop), c.log, "s1");
+        assert.equal(c.lines.length, 1);
+        assert.match(c.lines[0]!, /thinking-pair-violated/);
     });
 });

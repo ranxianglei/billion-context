@@ -16,6 +16,7 @@ import { fetchWithTimeout, isTransientUpstreamError, replayMaxAttempts, replayBa
 import { proxyDispatcher } from "./upstream-proxy.js";
 import { lastCompressSuffix, type Session } from "./session.js";
 import { peekRegistryOutputLimit } from "./registry.js";
+import { safePrefix } from "./text-safe.js";
 
 // #247: proactive pre-forward compression. When the session's real context
 // (previous turn's upstream input_tokens) exceeds the current model's window
@@ -43,6 +44,20 @@ const MAX_SUMMARY_OUTPUT_TOKENS = 32768;
 // #574: bound on upstream summarization calls per invocation — the multi-range
 // walk can otherwise spend a call per viable range in a block-dense history.
 export const MAX_SUMMARY_CALLS_PER_PREFLIGHT = 16;
+// #1767: bounded same-span retries for TRANSIENT empty summaries — HTTP 200
+// with no text (finish_reason=content_filter, truncated streams, empty bodies).
+// Distinct from the #726 halving cascade, which assumes the empty answer is
+// size-driven: a single-message span cannot be halved, so without these
+// retries the span's only draw against a flaky summarizer kills the whole
+// preflight (one content_filter blip bricked an entire turn; the identical
+// payload summarized fine ~90s later on the user's manual retry). Retries
+// count against MAX_SUMMARY_CALLS_PER_PREFLIGHT like any other call.
+const TRANSIENT_EMPTY_SUMMARY_RETRIES = 2;
+// Per-protection-regime cap on wasted transient retries so a SYSTEMIC
+// (persistent) empty-summary failure degrades to today's behavior after a
+// few extra calls instead of burning the full budget on doomed draws.
+// Reset alongside summaryCalls when soft protection is relaxed (#575-merge).
+const TRANSIENT_EMPTY_RETRY_BUDGET = 4;
 
 // #869 review: coverage bound of the two depth budgets above. One round folds
 // ONE range and each fold removes at most CHUNK_FRACTION x window tokens (the
@@ -105,7 +120,7 @@ export interface PreflightFailure {
 // unusable branch carries a diagnosis of what the body actually contained so
 // it is logged and surfaced in the fail-fast message instead of the generic
 // "summary too short".
-type SummaryOutcome = { summary: string } | { unusable: string };
+type SummaryOutcome = { summary: string } | { unusable: string; transient?: boolean };
 
 export interface PreflightResult {
     compressedRanges: number;
@@ -213,7 +228,7 @@ function spanUnitsOf(messages: CoreMessage[], startIdx: number, endIdx: number, 
 // Message-level splitChunks cannot shrink a span dominated by one huge
 // message (e.g. a megabyte tool result); split its rendered content into
 // token-budgeted slices so every summarization call stays inside the window.
-function splitSummaryContent(content: string, budget: number, countTokens: (text: string) => number): string[] {
+export function splitSummaryContent(content: string, budget: number, countTokens: (text: string) => number): string[] {
     const chunks: string[] = [];
     let offset = 0;
     while (offset < content.length) {
@@ -223,6 +238,13 @@ function splitSummaryContent(content: string, budget: number, countTokens: (text
             const mid = Math.ceil((low + high) / 2);
             if (countTokens(content.slice(offset, mid)) <= budget) low = mid;
             else high = mid - 1;
+        }
+        // #1615 family: a budget boundary landing between the two halves of an
+        // astral char would strand a lone surrogate at this chunk's end (and the
+        // next chunk's start) — strict upstreams reject such summarization bodies.
+        if (low - offset > 1 && low < content.length) {
+            const c = content.charCodeAt(low - 1);
+            if (c >= 0xd800 && c <= 0xdbff) low -= 1;
         }
         chunks.push(content.slice(offset, low));
         offset = low;
@@ -567,6 +589,18 @@ function extractStreamError(o: Record<string, unknown>): string | null {
     return null;
 }
 
+// #1767: classify a diagnosis from diagnoseEmptySummary. Only explicit SIZE
+// signals mean "the span is too big" (halving is the recovery — #726); every
+// other empty shape (content_filter, empty body, truncated stream, in-stream
+// error) is a blip of the summarizer or its gateway and is worth one bounded
+// re-draw of the SAME span. A single-message span cannot be halved, so
+// without this split a flaky summarizer kills the whole preflight. The
+// diagnosis strings are test-pinned, so matching them keeps the classifier in
+// lockstep with what the operator sees.
+export function emptySummaryIsSizeDriven(diagnosis: string): boolean {
+    return /context_length_exceeded|too long|finish_reason=length\b|stop_reason=max_tokens\b/i.test(diagnosis);
+}
+
 export function diagnoseEmptySummary(text: string, json?: unknown): string {
     if (json && typeof json === "object") {
         const err = extractStreamError(json as Record<string, unknown>);
@@ -768,7 +802,7 @@ async function requestSummary(deps: PreflightDeps, system: string, content: stri
     if (summary.length < MIN_SUMMARY_CHARS) {
         const diagnosis = diagnoseEmptySummary(text, json);
         deps.log("warn", `[preflight] summary too short (${summary.length} chars): ${diagnosis}`);
-        return { unusable: diagnosis };
+        return { unusable: diagnosis, transient: !emptySummaryIsSizeDriven(diagnosis) };
     }
     return { summary };
 }
@@ -837,11 +871,12 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     // can legitimately diverge; recording where+why makes the divergence diffable.
     const skipReasons: string[] = [];
     const noteSkip = (reason: string): void => {
-        if (skipReasons.length < 8 && !skipReasons.includes(reason)) skipReasons.push(reason.slice(0, 200));
+        if (skipReasons.length < 8 && !skipReasons.includes(reason)) skipReasons.push(safePrefix(reason, 200));
     };
     let subMinNoted = false;
     let summaryCalls = 0;
     let budgetHit = false;
+    let transientRetryBudget = TRANSIENT_EMPTY_RETRY_BUDGET;
     let rangesTried = 0;
     let rangesRemaining = 0;
     for (let round = 0; round < MAX_PREFLIGHT_ROUNDS; round++) {
@@ -921,6 +956,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 // reintroduce the #330 unrecoverable stall.
                 summaryCalls = 0;
                 budgetHit = false;
+                transientRetryBudget = TRANSIENT_EMPTY_RETRY_BUDGET;
                 deps.log("warn", "[preflight] no compressible ranges outside the protected recent zone; relaxing soft protection (preserveRecentMessages/Tokens -> 0) and retrying");
                 continue;
             }
@@ -1002,7 +1038,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                     // #1372: the kernel verdict used to be discarded here — this is where
                     // "no range could be compressed" died silently (minCompressRange gate,
                     // unknown/consumed refs, fully protected span, dummy summary length).
-                    const verdict = [...preview.result.errors, ...preview.result.warnings].join("; ").slice(0, 300)
+                    const verdict = safePrefix([...preview.result.errors, ...preview.result.warnings].join("; "), 300)
                         || "the kernel created no block and reported no error";
                     deps.log("warn", `[preflight] preview rejected range ${skipKey}: ${verdict}`);
                     noteSkip(`${skipKey}: preview rejected — ${verdict}`);
@@ -1063,7 +1099,23 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                             break;
                         }
                         summaryCalls += 1;
-                        const part = await summarizeRange(deps, chunk, startRef, endRef);
+                        let part = await summarizeRange(deps, chunk, startRef, endRef);
+                        let transientTries = 0;
+                        while (
+                            "unusable" in part && part.transient &&
+                            transientTries < TRANSIENT_EMPTY_SUMMARY_RETRIES &&
+                            transientRetryBudget > 0 &&
+                            summaryCalls < MAX_SUMMARY_CALLS_PER_PREFLIGHT &&
+                            !deps.signal?.aborted
+                        ) {
+                            transientTries += 1;
+                            transientRetryBudget -= 1;
+                            const delayMs = replayBackoffMs(transientTries);
+                            deps.log("warn", `[preflight] transient empty summary on ${startRef}:${endRef} (${part.unusable.slice(0, 160)}); retrying same span in ${delayMs}ms (${transientTries}/${TRANSIENT_EMPTY_SUMMARY_RETRIES})`);
+                            await sleep(delayMs, deps.signal);
+                            summaryCalls += 1;
+                            part = await summarizeRange(deps, chunk, startRef, endRef);
+                        }
                         if ("unusable" in part) {
                             outcome = part;
                             break;
@@ -1131,7 +1183,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 const applied = applyRanges(parseCompressInput({ content: [{ startId: startRef, endId: endRef, summary, topic: "preflight overflow compress" }] }), ctx);
                 if (applied.startsWith("[Compression FAILED")) {
                     deps.log("warn", `[preflight] ${applied}`);
-                    noteSkip(`${skipKey}: apply failed — ${applied.replace(/^\[Compression FAILED[:\s]*/, "").slice(0, 200)}`);
+                    noteSkip(`${skipKey}: apply failed — ${safePrefix(applied.replace(/^\[Compression FAILED[:\s]*/, ""), 200)}`);
                     skipSet.add(skipKey);
                     break;
                 }
@@ -1156,6 +1208,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 relaxed = true;
                 summaryCalls = 0;
                 budgetHit = false;
+                transientRetryBudget = TRANSIENT_EMPTY_RETRY_BUDGET;
                 deps.log("warn", "[preflight] no usable ranges outside the protected recent zone; relaxing soft protection (preserveRecentMessages/Tokens -> 0) and retrying");
                 continue;
             }
@@ -1169,7 +1222,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         // #1372: carry the actual per-range skip reasons too — the old hardcoded
         // parenthetical claimed causes that often had not happened (e.g. "below
         // minCompressRange" for a range that died before any summary call).
-        const unusableNote = lastUnusableDetail ? ` Last unusable summary: ${lastUnusableDetail.slice(0, 300)}.` : "";
+        const unusableNote = lastUnusableDetail ? ` Last unusable summary: ${safePrefix(lastUnusableDetail, 300)}.` : "";
         const skipNote = skipReasons.length > 0 ? ` Skipped: ${skipReasons.slice(0, 3).join(" | ")}.` : "";
         if (budgetHit) {
             failure = { kind: "exhausted", detail: `the preflight summarization budget (${MAX_SUMMARY_CALLS_PER_PREFLIGHT} calls per protection regime) was exhausted before the payload fit the window${unusableNote}${skipNote}` };

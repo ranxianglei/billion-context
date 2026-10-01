@@ -1,10 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { defaultPrompts, buildCompressSystemPrompt, ACP_TOOLS_OPENAI, applyAcpToolOverrides } from "acp-kernel";
 import { mergeCompress, resolveCompressSurface, resolveCompressSurfaceDetailed } from "../src/compress-settings.js";
+import { rmrf } from "./tmp-rm.ts";
 
 test("promptPack merges deepest-wins like every other field", () => {
     const merged = mergeCompress(
@@ -53,7 +54,7 @@ test("resolveCompressSurface: file packs load from project dir, shadowing builti
         assert.equal(surface.toolPrompts?.acp_status?.description, "project lean");
         assert.equal(surface.toolPrompts?.compress?.description, undefined);
     } finally {
-        rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -72,7 +73,7 @@ test("resolveCompressSurface: nudge/prompt section overrides flow into the kerne
         assert.ok(prompt.includes("QUIET-TAGS"));
         assert.ok(!prompt.includes("COMPRESSION SUMMARIES IN CONTEXT"));
     } finally {
-        rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -97,6 +98,6 @@ test("resolveCompressSurfaceDetailed: file pack reports the requested name and i
         assert.equal(res.packName, "versioned");
         assert.equal(res.packVersion, "9.9.9");
     } finally {
-        rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });

@@ -30,7 +30,20 @@ import { networkInterfaces } from "node:os";
  * check and the connect remains theoretically possible and accepted — the
  * `x-bili-tunnel` marker + management-plane rejection below is the second
  * layer that still holds when it happens.
+ *
+ * #1686: the admission lookup is bounded-retried (3 attempts, short backoff,
+ * per-attempt timeout) because a transiently unreachable DNS server must not
+ * be indistinguishable from a genuinely dead name — and the caller answers a
+ * resolution failure with 5xx (transport-class), never 403 (permission-class),
+ * so clients keep their retry logic alive while the resolver recovers.
  */
+
+// #1686: admission-resolution budget. Per-attempt timeout because a dead OS
+// resolver can otherwise hang getaddrinfo for tens of seconds (Windows);
+// worst-case total admission delay ≈ 3 × RESOLVE_TIMEOUT_MS + 2 × backoff.
+const RESOLVE_MAX_ATTEMPTS = 3;
+const RESOLVE_BACKOFF_MS = 250;
+const RESOLVE_TIMEOUT_MS = 2000;
 
 export const BILI_TUNNEL_HEADER = "x-bili-tunnel";
 
@@ -85,9 +98,24 @@ export function classifyIp(ip: string): IpClass {
 
 export type ResolveHost = (host: string) => Promise<string[]>;
 
+// The native lookup({timeout}) option exists at runtime (Node ≥ 15.3) but is
+// missing from @types/node's LookupOptions — race instead of casting. The
+// losing lookup stays handled (Promise.race subscribes to both sides), so a
+// late OS-resolver failure cannot surface as an unhandled rejection.
 export const dnsResolveHost: ResolveHost = async (host) => {
-    const res = await lookup(host, { all: true, family: 0 });
-    return res.map((r) => r.address);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+        const res = await Promise.race([
+            lookup(host, { all: true, family: 0 }),
+            new Promise<never>((_, reject) => {
+                timer = setTimeout(() => reject(Object.assign(new Error("ETIMEDOUT"), { code: "ETIMEDOUT" })), RESOLVE_TIMEOUT_MS);
+                timer.unref?.();
+            }),
+        ]);
+        return res.map((r) => r.address);
+    } finally {
+        if (timer) clearTimeout(timer);
+    }
 };
 
 let localAddrCache: { at: number; ips: Set<string> } | undefined;
@@ -115,9 +143,11 @@ export interface TunnelCheckContext {
     allowlist: string[];
     resolveHost?: ResolveHost;
     localIps?: () => Set<string>;
+    /** Backoff between admission-resolution retries (default RESOLVE_BACKOFF_MS). */
+    resolveBackoffMs?: number;
 }
 
-export type TunnelVerdict = { ok: true } | { ok: false; code: "self" | "linkLocal" | "privateRemote" | "unresolvable"; message: string };
+export type TunnelVerdict = { ok: true } | { ok: false; code: "self" | "linkLocal" | "privateRemote" | "unresolvable" | "invalid"; message: string };
 
 function allowlistHit(host: string, port: number, allowlist: string[]): boolean {
     const h = host.toLowerCase();
@@ -130,7 +160,7 @@ export async function checkTunnelDestination(origin: string, ctx: TunnelCheckCon
     try {
         u = new URL(origin);
     } catch {
-        return { ok: false, code: "unresolvable", message: `invalid tunnel destination ${origin}` };
+        return { ok: false, code: "invalid", message: `invalid tunnel destination ${origin}` };
     }
     const host = u.hostname.replace(/^\[|\]$/g, "").toLowerCase();
     const port = u.port ? Number(u.port) : u.protocol === "https:" ? 443 : 80;
@@ -139,11 +169,23 @@ export async function checkTunnelDestination(origin: string, ctx: TunnelCheckCon
     if (literal) {
         ips = [normalizeIpLiteral(literal)];
     } else {
-        try {
-            ips = await (ctx.resolveHost ?? dnsResolveHost)(host);
-        } catch {
-            return { ok: false, code: "unresolvable", message: `cannot resolve tunnel destination ${host}` };
+        // #1686: bounded retry — a transiently unreachable DNS server must not
+        // masquerade as a dead name. Only throws are retried; an empty answer
+        // is definitive (the resolver said so).
+        const resolve = ctx.resolveHost ?? dnsResolveHost;
+        const backoff = ctx.resolveBackoffMs ?? RESOLVE_BACKOFF_MS;
+        let resolved: string[] | undefined;
+        for (let attempt = 1; attempt <= RESOLVE_MAX_ATTEMPTS; attempt++) {
+            try {
+                resolved = await resolve(host);
+                break;
+            } catch {
+                if (attempt === RESOLVE_MAX_ATTEMPTS) break;
+                await new Promise<void>((r) => setTimeout(r, backoff));
+            }
         }
+        if (resolved === undefined) return { ok: false, code: "unresolvable", message: `cannot resolve tunnel destination ${host}` };
+        ips = resolved;
         if (ips.length === 0) return { ok: false, code: "unresolvable", message: `no addresses for tunnel destination ${host}` };
     }
     // Layer 1: the proxy itself — the /__bili/ management plane must never be

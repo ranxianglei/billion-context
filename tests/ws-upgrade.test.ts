@@ -13,6 +13,7 @@ import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { _resetForTest as resetCaForTest } from "../src/ca.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 /** #2 (codex WS stall): Codex prefers Responses-over-WebSocket when the
  *  provider advertises supports_websockets and only switches to HTTP POST
@@ -166,7 +167,7 @@ test("ws upgrade: answered with 426 + close on an MITM-decrypted TLS connection 
         else process.env.XDG_DATA_HOME = prevDataHome;
         resetCaForTest();
         try {
-            fs.rmSync(tmp, { recursive: true, force: true });
+            rmrf(tmp);
         } catch {
             /* best-effort */
         }

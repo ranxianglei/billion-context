@@ -39,6 +39,10 @@ function fmtTime(at: number): string {
     return new Date(at).toISOString().replace("T", " ").slice(0, 19) + "Z";
 }
 
+function isSuspectedEvent(e: ConflictEvent): boolean {
+    return e.kind === "third-party-plugin" && e.detail.endsWith("[suspected]");
+}
+
 export function formatConflictSection(events: ConflictEvent[]): string[] {
     const lines: string[] = [];
     lines.push(`COMPRESSION CONFLICTS — ${events.length} event(s) in this session. Two compressors on one conversation (bili + a third-party compression plugin or client native compaction) double-compress and corrupt message refs:`);
@@ -46,7 +50,16 @@ export function formatConflictSection(events: ConflictEvent[]): string[] {
         lines.push(`  [${fmtTime(e.at)}] ${e.kind} — ${e.detail}`);
     }
     if (events.length > 10) lines.push(`  … ${events.length - 10} earlier event(s); full list: GET /__bili/stats → conflicts`);
-    lines.push("Keep exactly ONE compressor per conversation: remove/disable the other plugin (or its native auto-compaction), then start a fresh session.");
+    // #1736: the [suspected] tier is a name-only guess, not observed evidence —
+    // say so, and don't command removal when nothing confirmed was found.
+    const suspectedCount = events.filter(isSuspectedEvent).length;
+    if (suspectedCount > 0) {
+        lines.push("  [suspected] = name-only keyword match — verify the plugin actually compresses before acting; a context dashboard/viewer/tool is NOT a compressor.");
+    }
+    const allSuspected = suspectedCount > 0 && suspectedCount === events.length;
+    lines.push(allSuspected
+        ? "Every event above is [suspected]: confirm each named plugin really compresses before removing anything — do not drop a read-only tool on the strength of its name."
+        : "Keep exactly ONE compressor per conversation: remove/disable the other plugin (or its native auto-compaction), then start a fresh session.");
     return lines;
 }
 

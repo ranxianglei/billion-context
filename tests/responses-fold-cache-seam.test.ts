@@ -25,6 +25,7 @@ import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 type Item = Record<string, unknown>;
 
@@ -221,6 +222,6 @@ test("#1548: post-fold re-request keeps the in-place summary; next-turn prefix s
     } finally {
         await closeServer(proxy);
         await closeServer(upstream);
-        fs.rmSync(tmp, { recursive: true, force: true });
+        rmrf(tmp);
     }
 });

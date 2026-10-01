@@ -11,6 +11,7 @@ import os from "node:os";
 import path from "node:path";
 import type { Logger } from "../src/logger.ts";
 import type { DshPlan } from "../src/dsh-channel.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 // LOCK_FILE is frozen at update.ts module load — redirect the cache tree
 // BEFORE importing it (same discipline as auto-restart.test.ts).
@@ -22,7 +23,7 @@ const { isDshProfileCopy, _setDshRunnersForTest } = await import("../src/dsh-cha
 
 after(() => {
     delete process.env.XDG_CACHE_HOME;
-    fs.rmSync(root, { recursive: true, force: true });
+    rmrf(root);
 });
 
 // — isDshProfileCopy classification ————————————————————————————————————
@@ -45,7 +46,7 @@ test("isDshProfileCopy: dsh profile layouts yes, everything else no", () => {
         // dsh home WITHOUT the profiles segment is not a profile copy
         assert.equal(isDshProfileCopy(path.join(dshHome, "plugins", "billion-context"), { DSH_HOME: dshHome }), false);
     } finally {
-        fs.rmSync(base, { recursive: true, force: true });
+        rmrf(base);
     }
 });
 
@@ -61,7 +62,7 @@ test("isDshProfileCopy: follows symlinked copies into the profiles tree", () => 
         fs.symlinkSync(real, link, "dir");
         assert.equal(isDshProfileCopy(link, { DSH_HOME: dshHome }), true);
     } finally {
-        fs.rmSync(base, { recursive: true, force: true });
+        rmrf(base);
     }
 });
 
@@ -98,7 +99,7 @@ function makeFixture(version: string): Fixture {
         dshHome,
         installDir,
         env: { ...process.env, DSH_HOME: dshHome },
-        cleanup: () => fs.rmSync(base, { recursive: true, force: true }),
+        cleanup: () => rmrf(base),
     };
 }
 
@@ -206,7 +207,7 @@ test("refreshDshProfileCopy: non-dsh install dir returns before any registry fet
         assert.deepEqual(calls, []);
     } finally {
         _setDshRunnersForTest(undefined);
-        fs.rmSync(base, { recursive: true, force: true });
+        rmrf(base);
     }
 });
 

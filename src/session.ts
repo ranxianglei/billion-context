@@ -1,5 +1,6 @@
-import { createInitialState, resetImageFullState, type CompressionState, type Config, type CoreMessage, type MessageContentStore } from "acp-kernel";
+import { createInitialState, defaultConfig, resetImageFullState, type CompressionState, type Config, type CoreMessage, type MessageContentStore } from "acp-kernel";
 import { createHash } from "node:crypto";
+import { log as loggerLog } from "./logger.js";
 import { getStore } from "./persist.js";
 import type { WireProtocol } from "./util.js";
 
@@ -142,6 +143,19 @@ export type Session = {
          *  Cleared by resetSessionCompression (native-compaction boundary).
          *  Persisted (survives restart like the rest of stats). */
         localInputEstimate?: number;
+        /** #1569: last netted input value written by a REAL upstream usage
+         *  report (the arming paths never touch it — they only pose as
+         *  usage-grade for lastInputTokens). While > 0, effectiveTokenCount
+         *  sizes nudges on the calibrated CJK-aware estimate of the CURRENT
+         *  view instead of the char-count upper bound: the anchor's own
+         *  billing proves the optimistic rate holds for this session's
+         *  content class, while the upper bound over-counts code/JSON-heavy
+         *  payloads ~3.5× and lit spurious nudge bands during estimate-grade
+         *  turns. Never-reporting upstreams keep the fail-closed upper-bound
+         *  behavior (#553/#728) — their anchor stays absent. Dropped with the
+         *  other baseline stats at native-compaction boundaries. Absent on
+         *  legacy session files → legacy path. */
+        lastUsageGradeTokens?: number;
         /** #1097 content store: total acp_retrieve calls issued this session. */
         retrieveCalls: number;
         /** #1097: acp_retrieve calls that resolved to stored content. */
@@ -227,11 +241,12 @@ export type Session = {
      *  model keeps re-fetching. Bounded by trimRetrieveCounts; lost on restart
      *  (advisory signal only). */
     retrieveCountsByRef?: Map<string, number>;
-    /** In-memory only (NOT persisted): full-text retrieval injections queued by
-     *  executeRetrieve, delivered on a later plugin-lane upstream request
-     *  (request-only, same channel as nudges). Durable bookkeeping for each
-     *  item lives in metadata.ccrUndelivered so an acked-but-undelivered
-     *  retrieve can be detected and reported across restarts (#1343). */
+    /** In-memory only (NOT persisted): request-only injections riding the
+     *  nudge channel. Since the GHSA jc6g v2 rework, acp_retrieve delivers its
+     *  full text in the tool result itself — this carrier now only serves
+     *  non-CCR riders (#1207 range restore, ccr:false). Legacy sessions from
+     *  before the rework may still carry ccr:true entries; the reconcile/
+     *  commit/drop machinery below handles them (they are never re-created). */
     pendingRetrievals: PendingRetrieval[];
     /** #1095 in-memory only (NOT persisted): deterministic encode cache keyed
      *  by sha256 of the ORIGINAL base64 → encoded payload. Identical inputs
@@ -291,6 +306,71 @@ export function effectiveConfig(session: Session | undefined, fallback: Config):
     const stored = session?.metadata["effectiveConfig"];
     if (stored && typeof stored === "object") return { ...fallback, ...(stored as Partial<Config>) };
     return fallback;
+}
+
+/** Mirror of acp-kernel's resolveAdaptiveGrowth (not exported by the kernel):
+ *  min(growthCap, max(growthFloor, round(modelContextLimit × growthRatio))).
+ *  The per-request config stamped by storeEffectiveConfig is the same object
+ *  the kernel decided with this turn, so the margin matches the kernel's own
+ *  cadence exactly — including owner-flattened compress.nudgeGrowthTokens. */
+function nudgeGrowthInterval(config?: Config): number {
+    const c = config ?? defaultConfig(1);
+    return Math.min(c.nudge.growthCap, Math.max(c.nudge.growthFloor, Math.round(c.modelContextLimit * c.nudge.growthRatio)));
+}
+
+/** #1595: retire a stale-high kernel nudge reference when a REAL usage-grade
+ *  sample lands far below it.
+ *
+ * The kernel's own downward re-anchor (nudgeNode) compares the incoming token
+ * count against the BASELINE only, but its growth decision prefers
+ * lastNudgeShownTokens whenever that is non-zero. When an estimate-grade
+ * reading (armFailureShrink window feeding effectiveTokenCount's #1492
+ * fall-through) pins lastNudgeShownTokens at a phantom-high level and real
+ * usage then settles within one interval of the low baseline, the kernel never
+ * self-resets and every later growth calculation runs against the phantom —
+ * permanently negative, blocking the tier cadence until context regrows past
+ * the phantom level or a compression resets the references.
+ *
+ * Called from every usage-grade settle site (plugin SSE pipes via
+ * applyUsageSample, proxy streaming loops via recordUsage, non-streaming JSON)
+ * AFTER lastInputTokens has been written from the real report. Fires only for
+ * drops of more than one full growth interval below the current reference
+ * (lastNudgeShownTokens, else baseline) — estimates never trigger it. On fire
+ * it mirrors the kernel's drift-reset trio: baseline := real value,
+ * lastNudgeShownTokens := 0, lastShownByTier := {} — so the next prepare
+ * measures growth from reality with a full interval of cadence headroom. */
+export function reanchorNudgeOnUsageDrop(session: Session): void {
+    // Partial-session literals (test fixtures, pre-kernel shapes) may lack
+    // state/stats fields entirely — no-op rather than crash.
+    const nudge = session.state?.nudge;
+    const value = session.stats.lastInputTokens;
+    if (!nudge || typeof value !== "number" || value <= 0) return;
+    const ref = nudge.lastNudgeShownTokens > 0 ? nudge.lastNudgeShownTokens : nudge.lastPerMessageNudgeTokens;
+    if (ref <= 0) return;
+    const stored = session.metadata?.["effectiveConfig"];
+    const margin = nudgeGrowthInterval(stored && typeof stored === "object" ? (stored as Config) : undefined);
+    if (!(value < ref - margin)) return;
+    nudge.lastPerMessageNudgeTokens = value;
+    nudge.lastNudgeShownTokens = 0;
+    nudge.lastShownByTier = {};
+    markDirty(session);
+    loggerLog("info", `[${session.id}] nudge reference re-anchored ${ref} -> ${value} after usage-grade drop (margin ${margin}) — stale high reference retired (#1595)`);
+}
+
+/** #1595: name the third no-usage shape — an upstream SUCCESS that completes
+ *  without reporting input usage. Transport failures and upstream 5xx already
+ *  log their own armFailureShrink arms; this one used to be silent, so a
+ *  session could sit on stale values with nothing in the log explaining why.
+ *  Callers gate the preconditions (clean terminal / parsed body + no input
+ *  sample accumulated); this handles the once-per-session throttle. */
+export function diagnoseSuccessWithoutUsage(session: Session, wire: string): void {
+    // Partial-session literals (test fixtures) may lack the metadata bag —
+    // nothing to throttle against, so skip rather than crash.
+    if (!session.metadata) return;
+    if (session.metadata["warnedNoUsage"]) return;
+    session.metadata["warnedNoUsage"] = true;
+    markDirty(session);
+    loggerLog("warn", `[${session.id}] [${wire}] upstream success without usage report — keeping lastInputTokens=${session.stats.lastInputTokens} (source=${session.stats.lastInputTokensSource ?? "none"}); nudge decisions ride local estimates until a usage-grade sample lands (#1595)`);
 }
 
 const sessions = new Map<string, Session>();
@@ -562,6 +642,9 @@ export function resetSessionCompression(session: Session): void {
     // (measured against the pre-compaction wire) would read high and blind
     // the nudge fallback early; let the next prepare* re-measure.
     session.stats.localInputEstimate = 0;
+    // #1569: pre-compaction billing evidence describes a payload lineage that
+    // no longer exists — fall back to legacy sizing until a fresh report lands.
+    delete session.stats.lastUsageGradeTokens;
     session.stats.contextTokens = 0;
     session.metadata.nativeCompactionAt = Date.now();
     markDirty(session);

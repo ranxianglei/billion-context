@@ -89,6 +89,9 @@ body {
 .banner.warn { background: var(--amber-soft); border-color: var(--amber); color: var(--amber); }
 .banner.err { background: var(--red-soft); border-color: var(--red); color: var(--red); }
 .banner.info { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+.banner .banner-title { font-weight: 600; margin-bottom: 6px; }
+.banner .alert-row { display: flex; align-items: center; gap: 10px; padding: 3px 0; }
+.banner .alert-row > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 
 main { max-width: 1200px; margin: 0 auto; padding: 20px; }
 .page-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
@@ -298,6 +301,10 @@ pre.small-pre { max-height: 220px; overflow: auto; }
 .tool-cid { font-family: var(--mono); font-size: 10.5px; color: var(--text-faint); }
 pre.tool-args, pre.tool-out { margin: 6px 0 0; padding: 8px; background: var(--bg-muted); border-radius: 6px; font-size: 11.5px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; max-height: 240px; overflow: auto; }
 .fold-scroll { max-height: 400px; overflow: auto; border: 1px solid var(--border-soft); border-radius: 8px; padding: 2px 8px 8px; }
+.seam-ev { border: 1px solid var(--border-soft); border-radius: var(--radius); background: var(--bg-elev); box-shadow: var(--shadow); overflow: hidden; }
+.seam-ev summary { list-style: none; cursor: pointer; padding: 12px 16px; font-size: 13.5px; font-weight: 650; display: flex; align-items: baseline; gap: 8px; }
+.seam-ev summary::-webkit-details-marker { display: none; }
+.seam-ev[open] summary { border-bottom: 1px solid var(--border-soft); }
 .qmark { display: inline-flex; align-items: center; justify-content: center; width: 15px; height: 15px; margin-left: 5px; border-radius: 50%; background: var(--bg-muted); color: var(--text-faint); font-size: 10px; line-height: 1; cursor: pointer; user-select: none; vertical-align: -2px; flex: none; }
 .qmark:hover { color: var(--accent); }
 .qtip { position: fixed; z-index: 60; max-width: 380px; background: var(--bg-elev); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 6px 20px rgba(0, 0, 0, 0.15); padding: 10px 12px; font-size: 12.5px; line-height: 1.55; color: var(--text-muted); }
@@ -322,4 +329,7 @@ pre.tool-args, pre.tool-out { margin: 6px 0 0; padding: 8px; background: var(--b
 .twide .w-up { max-width: 112px; }
 .twide .badge { white-space: normal; }
 .logbox { font-family: var(--mono); font-size: 11.5px; line-height: 1.5; padding: 12px 14px; max-height: 72vh; overflow: auto; white-space: pre-wrap; word-break: break-word; background: var(--bg-muted); border-radius: 0 0 8px 8px; margin: 0; color: var(--text); }
+/* Log view rows (filtered mode): actual hits vs context / time-window lines. */
+.lm-ctx { opacity: 0.55; }
+.lm-hit { background: rgba(94, 164, 255, 0.14); border-radius: 3px; }
 `;

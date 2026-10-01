@@ -10,6 +10,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { PLUGIN_AGENTS, pluginInstall, pluginRemove, pluginStatusAll, pluginUpdate, selfPackageRoot } from "../src/plugin-install.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 const ROOT = selfPackageRoot();
 const HERMES_SRC_DIR = path.join(ROOT, "hermes-plugin");
@@ -25,7 +26,7 @@ function track(dir: string): string {
     return dir;
 }
 after(() => {
-    for (const dir of tmpDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+    for (const dir of tmpDirs.splice(0)) rmrf(dir);
 });
 
 function fakeHermesBin(binDir: string, logFile: string, failing: boolean): void {
@@ -130,7 +131,11 @@ describe("installer lane (bili plugin install hermes)", () => {
         const restore = setHermesEnv(home, emptyBin);
         try {
             const msg = pluginInstall("hermes");
-            assert.match(msg, /the hermes CLI was not found on PATH — enable it manually: hermes plugins enable billion-context/);
+            // The exact head differs by platform: a POSIX ENOENT prints "the
+            // hermes CLI was not found on PATH …", while a Windows shell probe
+            // fails with a localized cmd error and prints "enabling via the
+            // hermes CLI failed (…) …". Both end in the same manual instruction.
+            assert.match(msg, /enable it manually: hermes plugins enable billion-context/);
             assert.equal(hermesStatus(), "installed");
         } finally {
             restore();

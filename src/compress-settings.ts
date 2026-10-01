@@ -291,7 +291,11 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
     let ccr: CcrConfig | undefined;
     if (s.ccr !== undefined) {
         const d = DEFAULT_CCR_CONFIG;
+        // Spread the kernel defaults first so new kernel-side keys (e.g.
+        // retrieveInlineTokens, GHSA jc6g v2) carry through without a bili-side
+        // edit every time the kernel grows one.
         ccr = {
+            ...d,
             enabled: s.ccr.enabled === true,
             toolName: s.ccr.toolName ?? d.toolName,
             minToolTokens: s.ccr.minToolTokens ?? d.minToolTokens,

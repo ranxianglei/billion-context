@@ -9,6 +9,7 @@ import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { setLogCapture } from "../src/logger.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 // #762 residual class, loop side: the compress-loop re-request is built by
 // adapter.buildRequest from the kernel view, NOT through prepareOpenai, so the
@@ -161,6 +162,6 @@ test("#762: loop re-request carries the blank strict-echo repair", async () => {
         await close(proxy);
         await close(upstream);
         setLogCapture(null);
-        fs.rmSync(stateDir, { recursive: true, force: true });
+        rmrf(stateDir);
     }
 });

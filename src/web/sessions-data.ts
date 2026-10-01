@@ -52,6 +52,10 @@ export interface WebSessionSummary {
     missDropNew?: number;
     missDropComp?: number;
     missDropTtl?: number;
+    /** Mid-session model switches seen between consecutive ledger usage samples (#1535). */
+    modelSwitches?: number;
+    /** Σ stable-prefix tokens re-billed right after a model switch (#1535). */
+    switchMissedTokens?: number;
     /** Σ (S−σ)×requestsAfter across ledger folds — input tokens not billed thanks to
      *  compression (acp-kernel EconomicsSummary.grossSaved semantics). */
     grossSaved?: number;
@@ -111,6 +115,8 @@ export interface WebSessionDetail extends WebSessionSummary {
     activePack?: string;
     /** Which client produced this session (plugin agent name or header/UA hint). */
     clientHint?: string;
+    /** bili build that last persisted this session file (absent on pre-stamp files). */
+    biliVersion?: string;
     /** Measured system-prompt size in tokens — the not-compressible baseline drawn
      *  under the trajectory chart. */
     systemPromptTokens?: number;
@@ -185,7 +191,7 @@ function summaryOf(s: Session, live: boolean): WebSessionSummary {
     // Per-field MAX (the sources overlap, never sum). Read-only on purpose:
     // getCacheLedger() would bootstrap/mutate session.metadata instead.
     const led = s.metadata["cacheLedger"] as {
-        agg?: { requests?: number; input?: number; cached?: number; output?: number; nc?: number; cr?: number; tr?: number };
+        agg?: { requests?: number; input?: number; cached?: number; output?: number; nc?: number; cr?: number; tr?: number; switches?: number; switchMissed?: number };
         folds?: Array<{ S?: number; sigma?: number; T?: number; requestsAfter?: number }>;
     } | undefined;
     const agg = led;
@@ -250,6 +256,9 @@ function summaryOf(s: Session, live: boolean): WebSessionSummary {
                   missDropComp: Math.round(((agg.agg.cr ?? 0) / agg.agg.input) * 1000) / 10,
                   missDropTtl: Math.round(((agg.agg.tr ?? 0) / agg.agg.input) * 1000) / 10,
               }
+            : {}),
+        ...(typeof agg?.agg?.switches === "number" && agg.agg.switches > 0
+            ? { modelSwitches: agg.agg.switches, switchMissedTokens: agg?.agg?.switchMissed ?? 0 }
             : {}),
         ...(clientHint ? { clientHint } : {}),
     };
@@ -419,6 +428,7 @@ export async function buildSessionDetail(id: string): Promise<WebSessionDetail |
         storeBytesSaved: session.stats.storeBytesSaved,
         ...(session.meta.activePack ? { activePack: session.meta.activePack } : {}),
         ...(clientHint ? { clientHint } : {}),
+        ...(typeof session.metadata["biliVersion"] === "string" ? { biliVersion: session.metadata["biliVersion"] as string } : {}),
         ...(sysPrompt > 0 ? { systemPromptTokens: sysPrompt } : {}),
         ledger: buildSessionCacheReport(session),
         handoffMd,

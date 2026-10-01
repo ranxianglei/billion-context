@@ -194,3 +194,113 @@ test("#1294 P2: large bodies spill to a temp file and carry NO re-fold hint", ()
     assert.match(out, /written to:\s*\S+/, out.slice(0, 200));
     assert.doesNotMatch(out, /Re-fold:/, "toFile path stays byte-identical to before");
 });
+
+test("#1718: receipt keeps the full fingerprint, the LOG line carries length only", () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    const ctx = makeCtx();
+    seedTurn(ctx, [
+        ["user", "A historical exchange covering setup steps."],
+        ["assistant", "x".repeat(3000)],
+    ]);
+    const summary = "LEAKY-HEAD-/srv/secret/task-state branch feature/x pass 3 of 5" + "p".repeat(60);
+    const out = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary }] }), ctx);
+    const s = storedSummary(ctx.session.state, "b1");
+    const head = s.slice(0, 30).replace(/\r?\n/g, " ");
+    assert.ok(out.includes(`head "${head}"`), "model-facing receipt still verifies content (#1294)");
+    const logLine = ctx.logs.find((l) => l.startsWith("[acp-proxy: [Compressed")) ?? "";
+    assert.ok(logLine, ctx.logs.join("\n"));
+    assert.ok(logLine.includes(`\n · b1 summary ${s.length}ch`), logLine);
+    assert.doesNotMatch(logLine, /head "|… tail "/, "no excerpt markers in the log copy");
+    assert.ok(!logLine.includes("/srv/secret"), "conversation-derived fragment must not reach the log");
+});
+
+test("#1718: first msg ids logged per-process salted — raw ids absent, joins stable within a run", () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    const turns: Array<[string, string]> = [
+        ["user", "A historical exchange covering setup steps."],
+        ["assistant", "x".repeat(3000)],
+    ];
+    const spec = { content: [{ startId: "m00001", endId: "m00002", summary: "Folded history." }] };
+    const ctx = makeCtx();
+    seedTurn(ctx, turns);
+    applyRanges(parseCompressInput(spec), ctx);
+    const line = ctx.logs.find((l) => l.startsWith("[acp-proxy: first msg ids: ")) ?? "";
+    assert.ok(line, ctx.logs.join("\n"));
+    assert.match(line, /x_[0-9a-f]{10}\(\d+c\)/, line);
+    for (let i = 0; i < ctx.messages.length; i++) assert.ok(!line.includes(`raw${i}`), `raw${i} leaked: ${line}`);
+    const firstSalted = /^.*?(x_[0-9a-f]{10})/.exec(line)![1];
+    const ctx2 = makeCtx();
+    seedTurn(ctx2, turns);
+    applyRanges(parseCompressInput(spec), ctx2);
+    const line2 = ctx2.logs.find((l) => l.startsWith("[acp-proxy: first msg ids: "))!;
+    assert.equal(/^.*?(x_[0-9a-f]{10})/.exec(line2)![1], firstSalted, "same process salt → same token for the same raw id (within-run joins survive)");
+});
+
+/** True when the string contains a surrogate half with no matching partner —
+ *  exactly what JSON.stringify turns into a bare \uXXXX escape that strict
+ *  upstreams reject for the whole body (#816/#1615). */
+function hasUnpairedSurrogate(s: string): boolean {
+    for (let i = 0; i < s.length; i++) {
+        const c = s.charCodeAt(i);
+        if (c >= 0xD800 && c <= 0xDBFF) {
+            const n = s.charCodeAt(i + 1);
+            if (!(n >= 0xDC00 && n <= 0xDFFF)) return true;
+            i++;
+        } else if (c >= 0xDC00 && c <= 0xDFFF) {
+            return true;
+        }
+    }
+    return false;
+}
+
+test("#1615: head cut straddling a surrogate pair drops the high half, receipt stays pair-clean", () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    const ctx = makeCtx();
+    seedTurn(ctx, [["user", "hello there"], ["assistant", "x".repeat(500)]]);
+    // 29 ASCII + one astral char (2 units, 29-30) + 5 ASCII = 36 units: the
+    // old slice(0, 30) ended exactly on the high surrogate.
+    const s = "x".repeat(29) + "\u{1F4E5}" + "y".repeat(5);
+    const out = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: s }] }), ctx);
+    assert.ok(out.includes(`\n · b1 summary 36ch · head "${"x".repeat(29)}" … tail "${s}"`), out);
+    assert.ok(!hasUnpairedSurrogate(out), `receipt carries a lone surrogate: ${out}`);
+});
+
+test("#1615: tail cut straddling a surrogate pair drops the low half, receipt stays pair-clean", () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    const ctx = makeCtx();
+    seedTurn(ctx, [["user", "hello there"], ["assistant", "x".repeat(500)]]);
+    // astral char at units 0-1 + 99 ASCII = 101 units: the old slice(-100)
+    // started exactly on the low surrogate.
+    const s = "\u{1F4E5}" + "x".repeat(99);
+    const out = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: s }] }), ctx);
+    assert.ok(out.includes(`\n · b1 summary 101ch · head "${"\u{1F4E5}"}${"x".repeat(28)}" … tail "${"x".repeat(99)}"`), out);
+    assert.ok(!hasUnpairedSurrogate(out), `receipt carries a lone surrogate: ${out}`);
+});
+
+test("#1615: pairs fully inside the head/tail windows are preserved verbatim (no over-clamping)", () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    const ctx = makeCtx();
+    seedTurn(ctx, [["user", "hello there"], ["assistant", "x".repeat(500)]]);
+    const E = "\u{1F4E5}";
+    // 27a + E + 60b + E + 30c = 121 units: first E sits at units 27-28 (inside
+    // the 30-unit head), second at units 89-90 (inside the last-100 tail).
+    const s = "a".repeat(27) + E + "b".repeat(60) + E + "c".repeat(30);
+    const out = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: s }] }), ctx);
+    assert.ok(out.includes(`head "${"a".repeat(27)}${E}b"`), out);
+    assert.ok(out.includes(`tail "${"a".repeat(6)}${E}${"b".repeat(60)}${E}${"c".repeat(30)}"`), out);
+    assert.ok(!hasUnpairedSurrogate(out), `receipt carries a lone surrogate: ${out}`);
+});
+
+test("#1615: lone surrogates already present in the input summary are scrubbed to U+FFFD", () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    const ctx = makeCtx();
+    seedTurn(ctx, [["user", "hello there"], ["assistant", "x".repeat(500)]]);
+    // A model can emit unpaired halves via JSON \uXXXX escapes; they survive
+    // JSON.parse into the stored summary. One lands inside the head window
+    // (unit 28), one inside the tail window (unit 89); neither sits on a cut.
+    const s = "x".repeat(28) + "\ud83d" + "m".repeat(60) + "\udc00" + "w".repeat(11);
+    const out = applyRanges(parseCompressInput({ content: [{ startId: "m00001", endId: "m00002", summary: s }] }), ctx);
+    assert.ok(out.includes(`head "${"x".repeat(28)}\uFFFDm"`), out);
+    assert.ok(out.includes(`tail "${"x".repeat(27)}\uFFFD${"m".repeat(60)}\uFFFD${"w".repeat(11)}"`), out);
+    assert.ok(!hasUnpairedSurrogate(out), `receipt carries a lone surrogate: ${out}`);
+});

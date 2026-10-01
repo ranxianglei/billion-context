@@ -23,23 +23,45 @@ export function _liveUpstreamTimersForTest(): number {
     return liveUpstreamTimers.size;
 }
 
+// Test seam (#1770): stretch the idle timer's WALL-CLOCK delay without
+// changing the logical budget. Asserting "a healthy stream longer than the
+// budget survives" against real-timer scheduling is nondeterministic under
+// host load — the fake upstream's pacing tick and the expired idle timer share
+// one event loop, and under CPU starvation the timers phase can fire the
+// abort before the next chunk is READ (it sits unread in the socket buffer),
+// cutting a healthy stream no matter how wide the nominal margin. null =
+// production behavior (inert by default).
+let idleTimerDelayOverrideMs: number | null = null;
+export function _setIdleTimerDelayForTest(ms: number | null): void {
+    idleTimerDelayOverrideMs = ms;
+}
+
+// Test seam (#1770): how many times rearm() has re-armed the idle timer since
+// the last reset — a deterministic observation of the re-arm-per-chunk wiring
+// that wall-clock assertions cannot pin reliably under load.
+let idleRearmCount = 0;
+export function _idleRearmCountForTest(): number {
+    return idleRearmCount;
+}
+export function _resetIdleTimerSeamsForTest(): void {
+    idleTimerDelayOverrideMs = null;
+    idleRearmCount = 0;
+}
+
 /** Idle-timeout budget for upstream requests; overridable via
  *  BILI_UPSTREAM_TIMEOUT_MS (milliseconds). Read on each call so tests can
  *  tune it live. Local-model deployments with very large contexts can need
- *  prefills longer than the 12-minute default before their first token. */
+ *  prefills longer than the 12-minute default before their first token.
+ *
+ *  This budget is the SOLE silence bound by design: there is deliberately no
+ *  finer-grained mid-stream stall detector. A #1452-era opt-in guard
+ *  (BILI_STREAM_STALL_MS) was retired in #1706/#1714 — local-model
+ *  deployments legitimately go silent for minutes mid-stream (thinking
+ *  phases, long prefills), so any finite sub-budget false-positived healthy
+ *  turns into truncations. Do not re-add a shorter timer here. */
 export function upstreamTimeoutMs(): number {
     const raw = Number(process.env.BILI_UPSTREAM_TIMEOUT_MS);
     return Number.isInteger(raw) && raw > 0 ? raw : UPSTREAM_TIMEOUT_MS;
-}
-
-/** Streaming-phase stall budget (#1452): armed only AFTER the first upstream
- *  body byte arrives, re-armed on every subsequent byte. Catches a wedged
- *  mid-stream upstream (a stream that goes silent forever) long before the
- *  12-minute TTFB/idle budget, WITHOUT touching the prefill/TTFB budget that
- *  #551 deliberately kept long. 0 = off (default; zero behavior change). */
-export function streamStallMs(): number {
-    const raw = Number(process.env.BILI_STREAM_STALL_MS);
-    return Number.isInteger(raw) && raw > 0 ? raw : 0;
 }
 
 // Direct (non-proxied) requests go through Node's hidden global agent, whose
@@ -106,7 +128,7 @@ export async function fetchWithTimeout(
         const t = setTimeout(() => {
             liveUpstreamTimers.delete(t);
             controller.abort();
-        }, effective);
+        }, idleTimerDelayOverrideMs ?? effective);
         liveUpstreamTimers.add(t);
         return t;
     };
@@ -119,26 +141,8 @@ export async function fetchWithTimeout(
         if (cleared) return;
         clearTimeout(timer);
         liveUpstreamTimers.delete(timer);
+        idleRearmCount += 1;
         timer = armTimer();
-    };
-    const stallBudget = streamStallMs();
-    let stallTimer: ReturnType<typeof setTimeout> | null = null;
-    const clearStallTimer = () => {
-        if (stallTimer === null) return;
-        clearTimeout(stallTimer);
-        liveUpstreamTimers.delete(stallTimer);
-        stallTimer = null;
-    };
-    const armStallTimer = () => {
-        if (stallBudget <= 0 || cleared) return;
-        clearStallTimer();
-        const t = setTimeout(() => {
-            liveUpstreamTimers.delete(t);
-            if (stallTimer === t) stallTimer = null;
-            controller.abort(new DOMException(`upstream stalled: no bytes for ${stallBudget}ms after first byte (#1452 stall guard)`, "AbortError"));
-        }, stallBudget);
-        stallTimer = t;
-        liveUpstreamTimers.add(t);
     };
     let onExternalAbort: (() => void) | null = null;
     if (externalSignal) {
@@ -155,7 +159,6 @@ export async function fetchWithTimeout(
         cleared = true;
         clearTimeout(timer);
         liveUpstreamTimers.delete(timer);
-        clearStallTimer();
     };
     const cleanup = () => {
         stopIdleTimer();
@@ -165,7 +168,11 @@ export async function fetchWithTimeout(
         const finalOpts: Omit<RequestInit, "dispatcher"> & { dispatcher?: object } = {
             ...opts,
             signal: controller.signal,
-            dispatcher: opts.dispatcher ?? directDispatcher(effective),
+            // #1770 seam: when the test stretches the watchdog delay, stretch
+            // the matching transport caps too — #551 requires the undici
+            // headers/body timeouts to track the watchdog, or the transport
+            // fires first and cuts the stream itself.
+            dispatcher: opts.dispatcher ?? directDispatcher(idleTimerDelayOverrideMs ?? effective),
             // Forward-proxy correctness: never silently follow a redirect.
             // undici's default (follow) downgrades POST→GET and drops the body
             // on 301/302/303, so a redirecting upstream (CDN/WAF) turns a valid
@@ -183,14 +190,7 @@ export async function fetchWithTimeout(
         if (raw.body) {
             // Wrap the body so each chunk re-arms the timer (idle timeout); carry
             // status/headers onto a fresh Response so callers see an identical shape.
-            const onChunk = () => {
-                rearm();
-                // First body byte flips the watchdog into streaming mode; every
-                // byte re-arms both budgets. Never armed pre-first-byte, so
-                // TTFB/prefill stays under the long idle budget only (#551).
-                armStallTimer();
-            };
-            const wrapped = armIdleBody(raw.body, onChunk);
+            const wrapped = armIdleBody(raw.body, rearm);
             return {
                 response: new Response(wrapped, {
                     status: raw.status,
@@ -372,5 +372,40 @@ export async function fetchWithRetry(
             continue;
         }
         throw new UpstreamHttpError(result.response.status, errText, attempt);
+    }
+}
+
+/** fetchWithTimeout with a bounded retry on FAIL-FAST transport failures only
+ *  (#1688): the main model-request path was single-attempt, so one millisecond
+ *  DNS/reset/refused blip killed the whole round while acp-loop/preflight
+ *  already replayed. Unlike fetchWithRetry this retries ONLY pre-response
+ *  network deaths (isFailFastUpstreamKind — nothing reached the upstream, so a
+ *  replay cannot double-deliver) under the same BILI_REPLAY_RETRY_MAX /
+ *  BILI_REPLAY_RETRY_BASE_MS budget and backoff; it NEVER touches HTTP-level
+ *  verdicts — any response (ok, 4xx, 5xx alike) is returned to the caller
+ *  untouched, because the main path passes upstream error bodies through
+ *  verbatim and must not convert them into proxy-side errors (fetchWithRetry
+ *  would throw UpstreamHttpError). Returns the full fetchWithTimeout shape
+ *  (incl. stopIdleTimer) so callers keep their timer bookkeeping unchanged. */
+export async function fetchWithTransportRetry(
+    url: string,
+    opts: FetchOptions,
+    timeoutMs?: number | undefined,
+    externalSignal?: AbortSignal,
+    onRetry?: (info: ReplayRetryInfo) => void,
+): Promise<Awaited<ReturnType<typeof fetchWithTimeout>>> {
+    const maxAttempts = replayMaxAttempts();
+    for (let attempt = 1; ; attempt++) {
+        try {
+            return await fetchWithTimeout(url, opts, timeoutMs, externalSignal);
+        } catch (error) {
+            const kind = classifyUpstreamFailure(error, { viaProxy: opts.dispatcher !== undefined, externalAborted: externalSignal?.aborted === true });
+            if (!isFailFastUpstreamKind(kind)) throw error;
+            const lastAttempt = attempt >= maxAttempts;
+            if (lastAttempt) throw error;
+            const delayMs = replayBackoffMs(attempt);
+            onRetry?.({ attempt, status: 0, detail: `${kind} (pre-response network failure): ${error instanceof Error ? error.message : String(error)}`, delayMs, maxAttempts });
+            await sleep(delayMs, externalSignal);
+        }
     }
 }

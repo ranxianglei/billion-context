@@ -350,7 +350,7 @@ test("#1421 E3: stale-unmatched → stripped, processed normally, re-stamped on 
         assert.equal(outCtx.verdict, "valid", "outbound carries this instance's fresh self-verifying stamp");
         assert.notEqual(outCtx.selected?.processor, "old-bili");
         assert.equal(extractChainCarriers(outParsed, "openai").candidates.length, 1, "stale carrier stripped, not stacked");
-    });
+    }, { chainEgressStamp: true });
 });
 
 test("#1421 E4: plain request → processed AND outbound carries a self-verifying stamp", async () => {
@@ -371,7 +371,7 @@ test("#1421 E4: plain request → processed AND outbound carries a self-verifyin
         const outCtx = evaluateChain(outParsed, "openai");
         assert.equal(outCtx.verdict, "valid", "self-verifying stamp");
         assert.equal(outCtx.selected?.digest, computeRequestDigest(outParsed, "openai"));
-    });
+    }, { chainEgressStamp: true });
 });
 
 test("#1421 E5: kill switch disables both enforcement and outbound stamping", async () => {
@@ -438,5 +438,5 @@ test("#1421 E6: google wire — plain request leaves a MERGED stamp (one user co
         assert.equal(captured.length, 2);
         assert.equal(captured[1]!.body, sent2, "byte-identical verbatim forward");
         assert.ok(logs.some((l) => l.level === "info" && l.msg.includes("verdict=valid")));
-    });
+    }, { chainEgressStamp: true });
 });

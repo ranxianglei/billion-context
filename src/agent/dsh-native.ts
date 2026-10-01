@@ -35,6 +35,7 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { defaultLogFile } from "../paths.js";
+import { VERSION } from "../version.js";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, type NativeInterceptState } from "./native-intercept.js";
@@ -46,6 +47,21 @@ export const inject = ["tools", "commands", "agents"];
 const RETRY_INTERVAL_MS = 10000;
 
 type AgentLike = { session?: { id?: unknown } | undefined };
+// #1677: DSH's command executor hands the invoking agent to the handler via the
+// invocation object ({ commandId, agent, rawInput, attachments, signal }) — but it
+// does NOT establish the AsyncLocalStorage boundary that currentInitiator() reads,
+// so command-path attribution through ALS is always empty and /acp silently fell
+// back to another (most-recently-active) session's panel. The invocation is the
+// authoritative "who ran this command" source. Every field is optional because older
+// dsh builds may omit them and the handlers must degrade gracefully (see
+// invocationSidOf's fallback chain).
+type CommandInvocation = {
+    commandId?: unknown;
+    agent?: AgentLike | undefined;
+    rawInput?: unknown;
+    attachments?: unknown;
+    signal?: AbortSignal | undefined;
+};
 type ToolExec = { agent?: AgentLike | undefined; signal?: AbortSignal };
 
 type ToolDefinition = {
@@ -60,14 +76,36 @@ type CommandOutcome = { kind: "success" | "error"; text: string };
 
 type PluginContext = {
     tools: { register: (definition: ToolDefinition) => unknown };
-    commands: { register: (command: { name: string; description: string; handler: () => Promise<CommandOutcome> }) => unknown };
+    commands: { register: (command: { name: string; description: string; handler: (invocation?: CommandInvocation) => Promise<CommandOutcome> }) => unknown };
     agents: { currentInitiator?: () => AgentLike | undefined };
     // Runtime-info sources (#955), resolved via dynamic ctx.inject when the
     // host exposes them (both are core dsh services; optional so older dsh
     // builds or stripped hosts keep the plugin alive without model info).
     llm?: { resolveModelInfo?: (provider: string, model: string, signal?: AbortSignal) => Promise<{ context?: { contextWindow?: number }; defaultMaxTokens?: number } | undefined> };
     agentDefaultModel?: { currentSelection?: () => { provider?: string; model?: string } | undefined };
+    // #1772: boot-provided profile diagnostics ({startedBundles, ...}) — lets
+    // the plugin warn when the active profile runs its compaction inside an
+    // agent preset where the bundle patch cannot reach it.
+    profileContext?: { startedBundles?: readonly string[] | undefined };
     inject?: (deps: readonly string[], callback: (sub: PluginContext) => void) => unknown;
+    // #1809: lifecycle disposal for registrations made inside an injected
+    // callback (cordis Context.effect); optional so non-cordis hosts skip it.
+    effect?: (fn: () => void | (() => void), label?: string) => void;
+    // #1590: host event bus (web-profile hosts only) — webserver/index-inject
+    // gathers per-startup rows for the web index; we push the __BILI__ global
+    // the dsh-native-client.js settings entry reads.
+    on?: (event: string, listener: (table: Array<{ kind: string; name?: string; value?: unknown }>) => void) => void;
+    // #1809: browser HTTP carrier (web/desktop profiles only) — hosts the live
+    // /bili/origin route the settings entry polls. Optional like llm/
+    // profileContext above: TUI/headless profiles lack it.
+    webServer?: {
+        // returns the disposer (cordis WebServer.register contract)
+        register: (route: {
+            kind: "exact" | "prefix";
+            path: string;
+            handler: (req: unknown, res: { writeHead: (status: number, headers?: Record<string, string>) => void; end: (body?: string) => void }) => void | Promise<void>;
+        }) => (() => void) | undefined;
+    };
 };
 
 /** Decides whether the native bootstrap should run in this process. */
@@ -99,6 +137,18 @@ const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(
 type RegisterState = { base: string | undefined; toolsReady: boolean; dead: boolean; retryAt: number; pending: Promise<void> | undefined };
 
 const register: RegisterState = { base: undefined, toolsReady: false, dead: false, retryAt: 0, pending: undefined };
+
+// #1772: once-per-process — the web-profile compaction caveat is logged a
+// single time even though apply() may run again after context re-arming.
+let webProfileWarned = false;
+
+/** #1590/#1809: origin of the proxy as currently reachable — register.base
+ *  once bound (attach synchronously, spawn after bootstrap), else the preset
+ *  env origin. Shared by the index-inject row and the live /bili/origin route. */
+function currentOrigin(): string | undefined {
+    const envOrigin = process.env.BILLION_CONTEXT_PROXY?.trim();
+    return register.base ?? (envOrigin !== undefined && envOrigin.length > 0 ? envOrigin : undefined);
+}
 
 // Runtime-info cache (#955): the host's current model selection plus what
 // ctx.llm resolved for it (contextWindow / defaultMaxTokens). Written by an
@@ -187,7 +237,9 @@ export function persistClientEvent(msg: string): void {
     try {
         const file = defaultLogFile();
         mkdirSync(path.dirname(file), { recursive: true });
-        appendFileSync(file, `${new Date().toISOString()} [warn] [dsh-client] ${msg}\n`);
+        // Same line grammar as logger.ts: [v=<build>] so a shared log written
+        // by mixed-version hosts self-identifies every physical line.
+        appendFileSync(file, `${new Date().toISOString()} [warn] [v=${VERSION}] [dsh-client] ${msg}\n`);
     } catch {
         // best-effort: logging must never break the host
     }
@@ -268,8 +320,11 @@ async function verifyAttachAndRecover(attachOrigin: string): Promise<string | un
         }
         persistClientEvent(`attach target ${pinned} unreachable within the health deadline — NOT spawning a second instance (model channel is pinned to it); re-checks continue`);
         console.error(`bili-native-dsh: attach target ${pinned} is down and this process's model channel is pinned to it — refusing to spawn a second instance (bili tools would 404 against the other one). Start your proxy at ${pinned} or unset BILLION_CONTEXT_PROXY; bili keeps re-checking and self-heals when it comes back.`);
-        register.base = undefined;
-        register.toolsReady = false;
+        if (landingOwnsRegister(attachOrigin)) {
+            register.base = undefined;
+            register.toolsReady = false;
+            register.retryAt = 0;
+        }
         return undefined;
     }
     persistClientEvent(`attach target ${attachOrigin} is not healthy — falling back to a spawned proxy`);
@@ -278,7 +333,7 @@ async function verifyAttachAndRecover(attachOrigin: string): Promise<string | un
     // plans; an explicit BILLION_CONTEXT_ATTACH never touches the preset.
     delete process.env.BILLION_CONTEXT_PROXY;
     state.attach = false;
-    state.origin = undefined;
+    if (state.origin === attachOrigin) state.origin = undefined;
     markNativeHost(process.env, "dsh");
     const start = singleFlight(_spawnForTest ?? bootstrap);
     state.respawn = start;
@@ -289,12 +344,20 @@ async function verifyAttachAndRecover(attachOrigin: string): Promise<string | un
     };
     const landed = start().then((origin) => {
         if (origin === undefined) {
-            register.base = undefined;
-            register.toolsReady = false;
+            if (landingOwnsRegister(attachOrigin)) {
+                register.base = undefined;
+                register.toolsReady = false;
+                // A back-off armed against the stale base must die with it:
+                // the unfreeze is a one-shot transition to a fresh base-less
+                // world and must not inherit the old base's 10s wall (#1783).
+                register.retryAt = 0;
+            }
             return undefined;
         }
-        register.base = origin;
-        state.origin = origin;
+        if (landingOwnsRegister(attachOrigin)) {
+            register.base = origin;
+            state.origin = origin;
+        }
         return origin;
     });
     state.ready = landed;
@@ -326,6 +389,17 @@ function toolDefinition(tool: ManifestTool): ToolDefinition {
     };
 }
 
+/** Stale-landing guard (windows-22 CI #1783): async chains armed by
+ *  verifyAttachAndRecover resolve long after they started (probe + evidence
+ *  grace + spawn). While they were in flight, maybeRetry may have already
+ *  self-healed the register onto a NEW origin — a late landing must never
+ *  clobber that. A landing may only write the register while it still owns
+ *  it: base is undefined (nothing better established) or still the stale
+ *  origin this chain set out to replace. */
+function landingOwnsRegister(staleOrigin: string | undefined): boolean {
+    return register.base === undefined || register.base === staleOrigin;
+}
+
 async function registerTools(ctx: PluginContext): Promise<void> {
     if (register.pending !== undefined) return register.pending;
     const base = register.base;
@@ -344,7 +418,12 @@ async function registerTools(ctx: PluginContext): Promise<void> {
                 register.dead = true;
                 return;
             }
-            register.retryAt = Date.now() + RETRY_INTERVAL_MS;
+            // Scope the back-off to the base that actually failed: if the
+            // register moved on while this manifest fetch was in flight (the
+            // apply chain unfroze a dead preset, maybeRetry healed elsewhere),
+            // an armed retryAt would gate the NEXT base's first heal behind a
+            // 10s wall — exactly the windows-22 CI deadlock (#1783).
+            if (register.base === base) register.retryAt = Date.now() + RETRY_INTERVAL_MS;
             console.error(`bili-native-dsh: manifest registration failed (${errMessage(err)}) — retrying; requests stay in wire mode until it succeeds`);
         })
         .finally(() => {
@@ -405,7 +484,23 @@ function sessionIdOf(ctx: PluginContext): string | undefined {
     return attr.state === "ok" ? attr.sid : undefined;
 }
 
-async function statusOutcome(ctx: PluginContext): Promise<CommandOutcome> {
+// #1677: session id of the command's invoking agent (host-passed invocation); malformed
+// shapes yield undefined so callers fall through to ALS attribution then latest, never throw.
+function invocationSidOf(invocation: CommandInvocation | undefined): string | undefined {
+    const sid = invocation?.agent?.session?.id;
+    return typeof sid === "string" && sid.length > 0 ? sid : undefined;
+}
+
+// Banner for the /acp + /acp-cache latest-fallback: names the session actually shown so
+// foreign data is never silently presented as the caller's own (#1677).
+function latestSessionNote(status: Record<string, unknown>, requestedSid: string | undefined): string {
+    const resolved = typeof status.conversationId === "string" && status.conversationId.length > 0 ? status.conversationId : "the most recently active session";
+    return requestedSid !== undefined
+        ? `⚠️ bili: session ${requestedSid} is not known to the proxy — showing ${resolved} instead.`
+        : `⚠️ bili: could not identify the current session — showing ${resolved} instead.`;
+}
+
+async function statusOutcome(ctx: PluginContext, invocation?: CommandInvocation): Promise<CommandOutcome> {
     const base = register.base;
     if (!base) {
         return {
@@ -414,11 +509,23 @@ async function statusOutcome(ctx: PluginContext): Promise<CommandOutcome> {
         };
     }
     maybeRetry(ctx);
-    const sid = sessionIdOf(ctx);
-    const status = (sid !== undefined ? await fetchStatus(base, sid) : undefined) ?? (await fetchStatusLatest(base));
+    // #1677: the command executor hands us the invoking session via the invocation —
+    // DSH never establishes the AsyncLocalStorage boundary on the command path, so
+    // currentInitiator() is always empty here and relying on it made /acp silently
+    // show ANOTHER (most-recently-active) session's panel. Prefer the invocation's
+    // agent session id; fall back to ALS attribution, then the latest-session fallback.
+    const sid = invocationSidOf(invocation) ?? sessionIdOf(ctx);
+    let fellBackToLatest = false;
+    let status: Record<string, unknown> | undefined = sid !== undefined ? await fetchStatus(base, sid) : undefined;
+    if (status === undefined) {
+        fellBackToLatest = true;
+        status = await fetchStatusLatest(base);
+    }
     const panel = status?.panel;
     if (status && typeof panel === "string" && panel.length > 0) {
-        return { kind: "success", text: panel };
+        // A panel reached through the latest-fallback belongs to some OTHER session —
+        // say so instead of presenting foreign data as the caller's own (#1677).
+        return { kind: "success", text: fellBackToLatest ? `${latestSessionNote(status, sid)}\n\n${panel}` : panel };
     }
     // #955: pre-first-request view — the proxy answers from the runtime-info
     // table this plugin populated at bootstrap, so /acp shows the client's
@@ -453,7 +560,7 @@ async function statusOutcome(ctx: PluginContext): Promise<CommandOutcome> {
  *  through the status endpoint's latest-active fallback. The host's command
  *  API passes no arguments, so this lane always shows the default
  *  (summary-ledger) report — no `full`. */
-async function cacheOutcome(ctx: PluginContext): Promise<CommandOutcome> {
+async function cacheOutcome(ctx: PluginContext, invocation?: CommandInvocation): Promise<CommandOutcome> {
     const base = register.base;
     if (!base) {
         return {
@@ -462,12 +569,19 @@ async function cacheOutcome(ctx: PluginContext): Promise<CommandOutcome> {
         };
     }
     maybeRetry(ctx);
-    const sid = sessionIdOf(ctx);
+    // #1677: same session-resolution fix as /acp — the command path carries no ALS
+    // attribution, so prefer the invocation's agent session id over currentInitiator().
+    const sid = invocationSidOf(invocation) ?? sessionIdOf(ctx);
     let target = sid;
+    let fallbackNote: string | undefined;
     if (target === undefined) {
         try {
             const status = await fetchStatusLatest(base);
-            target = typeof status?.conversationId === "string" && status.conversationId.length > 0 ? status.conversationId : undefined;
+            const cid = typeof status?.conversationId === "string" && status.conversationId.length > 0 ? status.conversationId : undefined;
+            if (cid !== undefined) {
+                target = cid;
+                fallbackNote = latestSessionNote(status ?? {}, sid);
+            }
         } catch {
             target = undefined;
         }
@@ -488,7 +602,8 @@ async function cacheOutcome(ctx: PluginContext): Promise<CommandOutcome> {
         };
     }
     try {
-        return { kind: "success", text: await forwardTool(base, target, "acp_cache", {}) };
+        const report = await forwardTool(base, target, "acp_cache", {});
+        return { kind: "success", text: fallbackNote !== undefined ? `${fallbackNote}\n\n${report}` : report };
     } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         if (msg.includes("no model request has arrived")) {
@@ -501,6 +616,49 @@ async function cacheOutcome(ctx: PluginContext): Promise<CommandOutcome> {
 export function apply(ctx: PluginContext): void {
     const plan = planNativeDsh(process.env);
     if (plan.mode === "off") return;
+
+    // #1590: the dsh web-profile settings panel shows a "bili设置" entry
+    // (dsh-native-client.js) that opens this proxy's Web UI. The origin is
+    // only published while known — attach mode binds register.base
+    // synchronously below; spawn mode binds it after bootstrap, so at
+    // startup-time index collection that entry degrades to a hint instead of
+    // a stale link.
+    ctx.on?.("webserver/index-inject", (table) => {
+        const origin = currentOrigin();
+        if (origin !== undefined) table.push({ kind: "global", name: "__BILI__", value: { origin } });
+    });
+
+    // #1809: the row above is a snapshot taken at index render — spawn mode
+    // binds register.base only AFTER bootstrap, so an already-loaded page (a
+    // web tab opened at launch) never sees the origin, and desktop is worse:
+    // its boot payload is captured once per app launch, leaving the settings
+    // entry degraded for the whole session even after the proxy is up. Serve
+    // the origin live on a named route instead; the client half polls it
+    // while unresolved. Missing webServer (TUI/headless profiles) keeps the
+    // snapshot row as the only source.
+    const originRoute = {
+        kind: "exact" as const,
+        path: "/bili/origin",
+        handler: (_req: unknown, res: { writeHead: (status: number, headers?: Record<string, string>) => void; end: (body?: string) => void }): void => {
+            const body = JSON.stringify({ origin: currentOrigin() ?? null });
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(body);
+        },
+    };
+    if (typeof ctx.inject === "function") {
+        // Cordis inject: fires once the service is available, re-runs on
+        // change; the effect disposes the prior registration on each re-run
+        // (same lifecycle as dsh's own bundle route). Profiles without a
+        // webserver never fire the callback — the snapshot row alone stands.
+        ctx.inject(["webServer"], (sub) => {
+            const ws = sub.webServer;
+            if (ws === undefined) return;
+            if (typeof sub.effect === "function") sub.effect(() => ws.register(originRoute), "bili: /bili/origin route");
+            else ws.register(originRoute);
+        });
+    } else if (ctx.webServer !== undefined) {
+        ctx.webServer.register(originRoute);
+    }
 
     if (plan.mode === "attach") {
         const attachOrigin = plan.attachOrigin;
@@ -668,15 +826,42 @@ export function apply(ctx: PluginContext): void {
         refreshModelInfo(register.base ?? state.origin);
     }
 
+    // #1772: in profiles bundling @deepseek-ai/dsh-web-app the RUNNING
+    // compaction-basic instance sits inside an agent preset (preset-standard's
+    // config.plugins), which no patch layer can reach by id — the bundled
+    // `auto: false` lands on web-app's already-disabled host-plane row and the
+    // preset instance keeps auto-compaction ON. Surface it once through the
+    // durable channel (GUI hosts swallow stderr); ACP compression is unaffected.
+    if (!webProfileWarned) {
+        let bundles: readonly string[] | undefined;
+        try {
+            if (typeof ctx.inject === "function") {
+                ctx.inject(["profileContext"], (sub) => {
+                    bundles = sub.profileContext?.startedBundles;
+                });
+            } else {
+                bundles = ctx.profileContext?.startedBundles;
+            }
+        } catch {
+            // older dsh builds without the service: diagnostic only
+        }
+        if (bundles !== undefined && bundles.includes("@deepseek-ai/dsh-web-app")) {
+            webProfileWarned = true;
+            persistClientEvent("profile bundles include @deepseek-ai/dsh-web-app — its agent presets run their own compaction-basic where the bundle patch cannot set auto:false (#1772); dsh native auto-compaction stays enabled in this profile (ACP compression unaffected)");
+        }
+    }
+
+    // #1677: forward the host-passed invocation — it carries the invoking agent's
+    // session id, which the command path cannot recover from currentInitiator().
     ctx.commands.register({
         name: "acp",
         description: "Show bili context-compression status",
-        handler: () => statusOutcome(ctx),
+        handler: (invocation) => statusOutcome(ctx, invocation),
     });
     ctx.commands.register({
         name: "acp-cache",
         description: "Prompt-cache reconciliation (same report as the acp_cache tool)",
-        handler: () => cacheOutcome(ctx),
+        handler: (invocation) => cacheOutcome(ctx, invocation),
     });
 
     // node:test drives apply() directly with a mock ctx — never patch
@@ -728,4 +913,9 @@ export function _noteRoutedForTest(url: string): void {
 export function _resetRoutedForTest(): void {
     state.routedOrigin = undefined;
     state.onRoutedOriginObserved = undefined;
+}
+
+/** Test hook (#1772): reset the once-per-process web-profile warning flag. */
+export function _resetWebProfileWarningForTest(): void {
+    webProfileWarned = false;
 }

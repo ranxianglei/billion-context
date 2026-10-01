@@ -5,9 +5,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { findRelativeImportRefs, checkDistImportAnnotations } from "../scripts/check-dist-import-annotations.mjs";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { rmrf } from "./tmp-rm.ts";
 
 test("findRelativeImportRefs catches JSDoc-style and real relative calls", () => {
     const bad = [
@@ -43,6 +44,6 @@ test("checkDistImportAnnotations walks dist recursively and reports per file", (
         assert.ok(violations[0].file.endsWith(path.join("agent", "opencode-native.js")));
         assert.equal(violations[0].refs.length, 1);
     } finally {
-        rmSync(root, { recursive: true, force: true });
+        rmrf(root);
     }
 });

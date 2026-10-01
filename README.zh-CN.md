@@ -113,6 +113,7 @@ QQ群:
 | **hermes** | `bili plugin install hermes`(自拉起原生,Python 插件 #958)或 `bili hermes`(证书 MITM) |
 | **zcode**(Z.ai / bigmodel coding plan) | `bili plugin install zcode`(自拉起原生,#1145)或 GUI「设置 → 网络」证书 MITM 或 `/bili/` 前缀 —— 细节见 [CLIENTS.zh-CN.md](CLIENTS.zh-CN.md) |
 | **claude** | `bili claude`(启动器)或 `bili plugin install claude`(原生姿态,#964 —— 受管 settings 块 + 会话自管代理;见下方"注意") |
+| **codex** | `bili codex`(启动器 —— 全功能零配置姿势)或 `bili plugin install codex`(MCP shell 工具面配套:**先起 bili 再玩** —— shell 不拉代理,也路由不了 codex 本体流量)—— 细节见 [CLIENTS.zh-CN.md](CLIENTS.zh-CN.md#codexopenai-codex-cli) |
 | **jcode** | [`billion-context`](https://github.com/ranxianglei/billion-context),`bili jcode`(cert-MITM)或 `/bili/` 前缀 —— 无原生模式(编译型 Rust 二进制、无插件接缝,[#962](https://github.com/ranxianglei/billion-context/issues/962)) |
 | **gemini**(Gemini CLI) | `bili gemini`(启动器,`GOOGLE_GEMINI_BASE_URL` `/bili/` 改写)或 `/bili/` 前缀 —— 仅启动器(无环内工具注入接缝,#1043) |
 | **iflow**（iFlow CLI） | `bili iflow`（启动器，`IFLOW_BASE_URL` `/bili/` 改写）或 `/bili/` 前缀 |
@@ -145,7 +146,7 @@ npm install -g billion-context
 
 三种方式背后的机制细节(插件生命周期、runtime-info 协议、注入优先级)见 [TECHNICAL-NOTES.zh-CN.md](TECHNICAL-NOTES.zh-CN.md)。
 
-
+端口,一句话(#1660):`bili start`(手工)拥有 `8787`;lane 替你拉起的一切(原生 hook、启动器 lane)住在独立的自管端口区,从 `18787` 起 —— 碰撞 +1 跳口、每个 lane 记住自己的漂移,零配置安装永不抢端口,刻意常驻的 `bili start` 守护进程则默认被附着。升级重启时若旧版本还在该 lane 端口上排水,会最多等 5 秒让它释放并复用同一端口,而不是漂移(#1723);只有真正被占用的端口才 +1 跳口 —— 且这种跳口现在会大声打 warn。
 
 ### 方式 1 —— 原生插件(native,`bili plugin install pi` / `omp` / `opencode` / `dsh` / `kimi` / `hermes` / `zcode`)
 
@@ -173,11 +174,11 @@ pi / omp / kimi / claude 没有客户端侧通道 —— 它们的配置条目�
 
 - 原生模式与独立进程内扩展(`billion-context-pi`、`opencode-acp`)**互斥** —— 安装器负责换条目并把原配置快照(`.bili-bak`)。
 - OpenCode 旧会话、V1/V2 插件形态与全部注意事项:[OpenCode](CLIENTS.zh-CN.md#opencode)。
-- `kimi` 仅在自举时上报 runtime-info(静态头无法承载逐请求窗口/模型值),子代理会话按每次调用的 `conversation_id` 绑定。
+- `kimi` 仅在自举时上报 runtime-info(静态头无法承载逐请求窗口/模型值);子代理工具调用由代理的出站 tool_use 见证环路由(#1685)——模型看不到任何会话 id。
 - `hermes` 的原生插件是 Python:健康检查通过后用环境变量把 hermes 的 httpx 栈指向代理,并经 `llm_request` 中间件打逐请求头。
-- `claude` 有**原生姿态**(#964):受管 settings 块 + `SessionStart` hook + 稳定端口的 MCP shell;`BILI_NATIVE_CLAUDE=0` 退出(passthrough)。机制:[TECHNICAL-NOTES.zh-CN.md](TECHNICAL-NOTES.zh-CN.md)。
+- `claude` 有**原生姿态**(#964):受管 settings 块 + `SessionStart` hook + MCP shell;hook 骑自管端口区(#1660),每会话把受管 URL 重钉到存活 origin,端口漂移自愈。`BILI_NATIVE_CLAUDE=0` 退出(passthrough)。机制:[TECHNICAL-NOTES.zh-CN.md](TECHNICAL-NOTES.zh-CN.md)。
 - `zcode` 有**原生姿态**(#1145):受管 `~/.zcode/cli/config.json` 块 + 每会话 provider `baseURL` 改写。完整机制:[CLIENTS.zh-CN.md](CLIENTS.zh-CN.md)。
-- `codex` / `omp` 也有配套安装(MCP shell 与轻量扩展),但需要一个在跑的代理 —— 不属于原生模式。
+- `omp` 是自拉起原生插件;`codex` 性质不同 —— 它是 MCP shell 工具面配套:codex 的模型流量只能经 env 路由(默认 ChatGPT-登录 provider 没有可改写的配置缝 —— managed `model_providers` 块会强制 API-key 认证、废掉订阅登录),而 MCP 子进程无法向父进程注入 env,所以插件安装既不拉代理、也永远路由不了 codex 本体流量。`bili plugin install codex` 在 `~/.codex/config.toml` 写入 `[mcp_servers.bili]`(command = node,args = dist/mcp.js)注册四个 ACP 工具,会话启动时解析代理:env `BILI_MCP_PROXY` > 活实例登记(任一 lane 的代理或 `bili start` 守护)> 8787 用户区默认(#1660 去掉了安装时烘焙 origin,#403)—— 全不可达则 `tools/list` 报 -32003。结论:**先起 bili**(`bili start` 或任一客户端的 lane 代理),想要压缩再自行导出 HTTPS_PROXY;零配置全功能用 `bili codex`。机制:[CLIENTS.zh-CN.md](CLIENTS.zh-CN.md#codexopenai-codex-cli)。
 - `jcode`、`aider` 无原生模式(无插件/MCP/工具注入接缝:#962、#1048)—— 用 `bili jcode` / `bili aider`。
 - `copilot`、`amp`、`goose` 仅启动器模式(#1049);goose 无法 cert-MITM(rustls 不信任任何 CA 文件),改走纯 HTTP base-URL 重定向。
 
@@ -192,7 +193,7 @@ bili claude                           # 拉起 claude
 bili omp                              # pi 同款,file-free(#535):环境变量 + 扩展 registerProvider + 压缩取消,真实 ~/.omp 不动
 bili opencode                         # OpenCode(1.x 与 2.x):完整指南见下文 [OpenCode](CLIENTS.zh-CN.md#opencode) 一节
 bili hermes                           # file-free(#535):hermes 代理环境变量(HTTPS_PROXY + SSL_CERT_FILE 组合 CA bundle)—— https 走 CONNECT MITM,http 走绝对形式转发;真实 ~/.hermes 不动
-bili dsh                              # deepseek-harness:经 --patch 注入完整原生插件(#941) —— 真实 dsh 工具、会话绑定 /acp(plugin 模式);非回环上游走代理 env,回环保留 overlay DSH_HOME 改写(#535);dsh 自动压缩关
+bili dsh                              # deepseek-harness:经 --patch 注入完整原生插件(#941) —— 真实 dsh 工具、会话绑定 /acp(plugin 模式);非回环上游走代理 env,回环保留 overlay DSH_HOME 改写(#535);dsh 自动压缩关(web profile 除外——preset 内实例无法经 patch 触及,#1772)
 bili codebuddy                        # Tencent CodeBuddy Code CLI:CODEBUDDY_BASE_URL /bili/ 重写(OpenAI chat completions wire),预算对齐走 CODEBUDDY_AUTO_COMPACT_WINDOW;真实 ~/.codebuddy 不动
 bili qoder                            # qoder:模型端点硬编码 https(无法 /bili/ 改写)—— 证书 MITM(HTTPS_PROXY + NODE_EXTRA_CA_CERTS),默认模型主机已加白名单(#653)
 bili trae                             # Trae CLI(字节跳动,闭源 Go 二进制,无 base-URL 覆盖)—— 证书 MITM(HTTPS_PROXY + SSL_CERT_FILE),模型主机取 TRAE_CLI_API_HOST 或默认企业网关(#655)

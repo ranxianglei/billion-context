@@ -10,6 +10,7 @@ import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import * as tar from "tar";
 import { startRegistry } from "./registry-fixture.js";
+import { rmrf } from "../tmp-rm.ts";
 
 const run = process.env.ACP_TEST_REGISTRY === "1";
 const skipReason = !run ? "set ACP_TEST_REGISTRY=1 (hermetic local-registry e2e; loopback only)" : undefined;
@@ -123,7 +124,7 @@ test("hermetic registry e2e", { skip: skipReason }, async (t) => {
     const workRoot = path.join(process.cwd(), "tmp");
     fs.mkdirSync(workRoot, { recursive: true });
     const work = fs.mkdtempSync(path.join(workRoot, "e2e-registry-"));
-    t.after(() => fs.rmSync(work, { recursive: true, force: true }));
+    t.after(() => rmrf(work));
 
     const reg = await startRegistry(path.join(work, "registry"));
     t.after(() => reg.stop());
@@ -176,6 +177,6 @@ test("hermetic registry e2e", { skip: skipReason }, async (t) => {
         // entry === `billion-context@${NEW_VERSION}` (the re-pin assertion).
         assert.deepEqual(cfg.plugins, ["billion-context"]);
         assert.deepEqual(cfg.compaction, { auto: false });
-        assert.match(res.stdout, /plugin present/);
+        assert.match(res.stdout, /plugins present/);
     });
 });

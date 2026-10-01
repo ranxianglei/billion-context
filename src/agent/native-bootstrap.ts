@@ -69,6 +69,34 @@ export function envMillis(env: NodeJS.ProcessEnv, name: string, fallback: number
     return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
 }
 
+/** #1774: OMP's SSE watchdog aborts the turn when no PARSED model event arrives
+ *  within PI_OPENAI_STREAM_FIRST_EVENT_TIMEOUT_MS (default 300s). A bili preflight
+ *  over a large context holds the response for minutes before the first SSE event,
+ *  and the `: bili-preflight` keep-alive comments (#568) are filtered by OMP's SSE
+ *  parser before the iterator, so they cannot reset that timer. When bili owns the
+ *  process's model traffic we therefore export a wider first-event budget; the
+ *  post-first-event idle timeout stays at OMP's default. The cap stays finite so a
+ *  genuinely stuck preflight still fails in bounded time instead of hanging. */
+export const OMP_FIRST_EVENT_TIMEOUT_ENV = "PI_OPENAI_STREAM_FIRST_EVENT_TIMEOUT_MS";
+export const OMP_FIRST_EVENT_TIMEOUT_DEFAULT_MS = 1_800_000;
+
+/** The value bili exports for OMP's first-event watchdog: the default above, or
+ *  undefined when the user pinned their own value (blank counts as unset — same
+ *  convention as nativeBootstrapGate). Explicit values are never clobbered,
+ *  including "0" (OMP's disable sentinel). */
+export function ompFirstEventTimeoutValue(env: NodeJS.ProcessEnv): string | undefined {
+    const raw = env[OMP_FIRST_EVENT_TIMEOUT_ENV];
+    if (raw !== undefined && raw.trim().length > 0) return undefined;
+    return String(OMP_FIRST_EVENT_TIMEOUT_DEFAULT_MS);
+}
+
+/** Stamp the first-event watchdog value onto env when (and only when) the user
+ *  has not pinned one. No-op otherwise. */
+export function applyOmpFirstEventTimeout(env: NodeJS.ProcessEnv): void {
+    const value = ompFirstEventTimeoutValue(env);
+    if (value !== undefined) env[OMP_FIRST_EVENT_TIMEOUT_ENV] = value;
+}
+
 /** Coexistence marker (#820): tells standalone in-process bili extensions
  *  (billion-context-pi / opencode-acp) that a host-native entry owns THIS
  *  process so they back off instead of double-compressing. Set synchronously

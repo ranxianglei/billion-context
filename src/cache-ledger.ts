@@ -11,7 +11,7 @@ import {
     type PriceProfile,
 } from "acp-kernel";
 import { log as loggerLog } from "./logger.js";
-import type { Session } from "./session.js";
+import { reanchorNudgeOnUsageDrop, type Session } from "./session.js";
 
 // Render window for handleAcpCache's detail:"full" text view (#1489). The
 // ledger itself is unbounded — this only bounds how many lines the text
@@ -54,6 +54,13 @@ interface LedgerLine {
     proto?: string;
     /** #1536: LLM endpoint origin of this request — part of the target identity. */
     up?: string;
+    /** #1592-family seam detector: 1 iff this sample's unexplained residual
+     *  tripped the mid-history-break suspicion (no fold/switch/restart
+     *  attribution AND a large ttlRepay). Sparse: omitted unless set. */
+    seam?: 1;
+    /** #1592 follow-up: 1 iff this sample settled within 30s of a client
+     *  mid-stream abort in the same session (abort/retry churn correlation). */
+    abortedNear?: 1;
     /** #1535: 1 iff `model` differs from the previous sample's KNOWN model
      *  (unknown sides never flag); marks the re-billed stable prefix on the
      *  first request after a model switch. Sparse: omitted unless set. */
@@ -95,7 +102,28 @@ export interface CacheLedger {
         attributedMissed: number;
         unknownSamples: number;
         unknownInput: number;
+        seamSuspects: number;
+        seamMissed: number;
+        /** #1592 follow-up: misses whose current body was byte-stable vs the
+         *  previous request — the upstream simply did not serve its cache
+         *  (TTL expiry / eviction / relay node rotation). Not a rebuild seam. */
+        providerSideMisses: number;
+        providerSideMissed: number;
+        /** #1592 follow-up: misses right after the client rewound history
+         *  (revert/trim — fewer message elements than the previous request).
+         *  Sanctioned client intent; recorded so the one-time re-bill is
+         *  attributed instead of landing in the unexplained residual. */
+        rewinds: number;
+        rewindMissed: number;
+        /** #1592 follow-up: samples settled within 30s of a client abort —
+         *  abort/retry churn correlates with prefix misses (the retried
+         *  request carries a rewritten tail). Correlation, not causation. */
+        abortCorrelated: number;
     };
+    /** #1592-family: bounded forensic log of suspected mid-history cache-seam
+     *  breaks (consecutive outbound bodies diverged with no structural
+     *  attribution). Purely diagnostic — never part of the closure math. */
+    seamEvents?: SeamEvent[];
     /** #1536: BOOT_ID of the process that recorded the last line — a mismatch on
      *  the next sample marks a proxy-restart boundary (#499). Absent pre-#1536. */
     lastBoot?: string;
@@ -126,6 +154,114 @@ function prefixTokensBeforeRef(session: Session, ref: string): number {
     return n;
 }
 
+/** #1592-family seam forensics: where two consecutive outbound bodies first
+ *  diverged, for samples whose miss has no structural attribution. */
+export interface SeamEvent {
+    seq: number;
+    at: number;
+    input: number;
+    hitPct: number;
+    /** Byte offset of the first differing byte (a LOWER bound — bodies are
+     *  capped at SEAM_BODY_CAP for storage, so huge prefixes report the cap). */
+    lcpBytes: number;
+    /** Index of the first message element whose serialized form differs. */
+    msgIndex: number;
+    prevMsgs: number;
+    curMsgs: number;
+}
+
+const SEAM_BODY_CAP = 512 * 1024;
+const SEAM_EVENTS_CAP = 8;
+const seamLastSent = new WeakMap<Session, string>();
+const seamLastSettled = new WeakMap<Session, string>();
+const lastClientAbort = new WeakMap<Session, number>();
+
+/** #1592 follow-up: stamp the wall-clock time of a client mid-stream abort
+ *  (wired at both forward abort chokepoints). The next settle in the same
+ *  session reads it to mark abort-correlated samples. */
+export function noteClientAbort(session: Session): void {
+    lastClientAbort.set(session, Date.now());
+}
+
+/** Record the body of the upstream round that is about to be sent. Called at
+ *  the single send chokepoints (loop fetchUpstream, non-streaming forward);
+ *  the next settleUsageReport pairs it with the usage report it produced. */
+export function noteForwardedBody(session: Session, body: string): void {
+    seamLastSent.set(session, body.length > SEAM_BODY_CAP ? body.slice(0, SEAM_BODY_CAP) : body);
+}
+
+function seamLcp(a: string, b: string): { lcpBytes: number; msgIndex: number; prevMsgs: number; curMsgs: number } {
+    let lcp = 0;
+    const n = Math.min(a.length, b.length);
+    while (lcp < n && a.charCodeAt(lcp) === b.charCodeAt(lcp)) lcp++;
+    const msgsOf = (s: string): unknown[] => {
+        try {
+            const arr = (JSON.parse(s) as { messages?: unknown }).messages;
+            return Array.isArray(arr) ? arr : [];
+        } catch {
+            return [];
+        }
+    };
+    const ma = msgsOf(a);
+    const mb = msgsOf(b);
+    let i = 0;
+    const eq = (x: unknown, y: unknown): boolean => JSON.stringify(x) === JSON.stringify(y);
+    while (i < Math.min(ma.length, mb.length) && eq(ma[i], mb[i])) i++;
+    return { lcpBytes: lcp, msgIndex: i, prevMsgs: ma.length, curMsgs: mb.length };
+}
+
+function detectSeam(session: Session, led: CacheLedger): void {
+    const line = led.lines[led.lines.length - 1];
+    if (!line || line.unk === 1 || line.missed <= 0) return;
+    // Abort correlation is counted for EVERY missed sample, independent of
+    // structural attribution — abort/retry churn is orthogonal evidence.
+    const abortAt = lastClientAbort.get(session);
+    if (abortAt !== undefined && Math.abs(line.at - abortAt) < 30_000) {
+        line.abortedNear = 1;
+        led.agg.abortCorrelated += 1;
+    }
+    // Structural attributions already explain the miss — not a seam candidate.
+    if (line.sw === 1 || line.pw === 1 || line.uw === 1 || line.rs === 1 || line.foldSeq !== null) return;
+    // Substantive unexplained residual only: a big ttlRepay slice of a big bill.
+    if (!(line.tr > 8192 && line.tr > 0.3 * line.input)) return;
+    const agg = led.agg;
+    const cur = seamLastSent.get(session);
+    const prev = seamLastSettled.get(session);
+    if (cur !== undefined && prev !== undefined) {
+        const f = seamLcp(prev, cur);
+        if (f.curMsgs < f.prevMsgs) {
+            // Client reverted/trimmed history: the miss is the sanctioned
+            // one-time re-bill of the retained prefix (or the gap's TTL).
+            agg.rewinds += 1;
+            agg.rewindMissed += line.tr;
+            return;
+        }
+        if (f.lcpBytes >= cur.length) {
+            // Wire was byte-stable against the previous request — the
+            // upstream simply did not serve its cache. Provider-side.
+            agg.providerSideMisses += 1;
+            agg.providerSideMissed += line.tr;
+            return;
+        }
+    }
+    agg.seamSuspects += 1;
+    agg.seamMissed += line.tr;
+    line.seam = 1;
+    if (cur !== undefined && prev !== undefined && led.seamEvents !== undefined && led.seamEvents.length >= SEAM_EVENTS_CAP) {
+        led.seamEvents.shift();
+    }
+    if (cur !== undefined && prev !== undefined) {
+        const f = seamLcp(prev, cur);
+        const ev: SeamEvent = { seq: line.seq, at: line.at, input: line.input, hitPct: line.hitPct, ...f };
+        (led.seamEvents ?? (led.seamEvents = [])).push(ev);
+        if (agg.seamSuspects === 1) {
+            loggerLog("warn", `[${session.id}] [cache-seam] suspected mid-history prefix break: hit ${line.hitPct}% (input=${line.input}, unexplained=${Math.round(line.tr)} tok, no fold/switch/restart attribution); first divergence at byte ${ev.lcpBytes}, message[${ev.msgIndex}] of ${ev.prevMsgs}→${ev.curMsgs} — see /acp-cache for the seam section`);
+        }
+    } else if (agg.seamSuspects === 1) {
+        loggerLog("warn", `[${session.id}] [cache-seam] suspected mid-history prefix break: hit ${line.hitPct}% (input=${line.input}, unexplained=${Math.round(line.tr)} tok, no fold/switch/restart attribution); outbound body pair unavailable (lane without body capture) — aggregate flag only`);
+    }
+}
+
 export function getCacheLedger(session: Session): CacheLedger {
     const meta = session.metadata ?? (session.metadata = {});
     const existing = meta[LEDGER_KEY] as CacheLedger | undefined;
@@ -137,6 +273,8 @@ export function getCacheLedger(session: Session): CacheLedger {
             "switches", "switchMissed", "wireSwitches", "wireSwitchMissed",
             "upstreamSwitches", "upstreamSwitchMissed", "restartDrops",
             "restartDropMissed", "attributedMissed", "unknownSamples", "unknownInput",
+            "seamSuspects", "seamMissed",
+            "providerSideMisses", "providerSideMissed", "rewinds", "rewindMissed", "abortCorrelated",
         ] as const) {
             if (typeof g[key] !== "number") g[key] = 0;
         }
@@ -153,7 +291,7 @@ export function getCacheLedger(session: Session): CacheLedger {
         foldSeqCounter: 0,
         folds: [],
         lines: [],
-        agg: { requests: 0, input: 0, cached: 0, output: 0, nc: 0, cr: 0, tr: 0, switches: 0, switchMissed: 0, wireSwitches: 0, wireSwitchMissed: 0, upstreamSwitches: 0, upstreamSwitchMissed: 0, restartDrops: 0, restartDropMissed: 0, attributedMissed: 0, unknownSamples: 0, unknownInput: 0 },
+        agg: { requests: 0, input: 0, cached: 0, output: 0, nc: 0, cr: 0, tr: 0, switches: 0, switchMissed: 0, wireSwitches: 0, wireSwitchMissed: 0, upstreamSwitches: 0, upstreamSwitchMissed: 0, restartDrops: 0, restartDropMissed: 0, attributedMissed: 0, unknownSamples: 0, unknownInput: 0, seamSuspects: 0, seamMissed: 0, providerSideMisses: 0, providerSideMissed: 0, rewinds: 0, rewindMissed: 0, abortCorrelated: 0 },
     };
     meta[LEDGER_KEY] = led;
     return led;
@@ -357,15 +495,30 @@ export function settleUsageReport(
         // re-sends the unfolded history, so its usage report over-reports the
         // context the NEXT request will actually carry (see stream.ts applyRanges).
         session.stats.lastInputTokens = Math.max(0, s.total - (session.stats.compressCreditTokens ?? 0));
+        // #1569: calibration anchor for estimate-grade turns — written ONLY by
+        // real upstream usage reports (all three response shapes funnel here),
+        // never by estimate-grade samples or arming paths; dropped at native-
+        // compaction boundaries via resetSessionCompression (session.ts).
+        session.stats.lastUsageGradeTokens = session.stats.lastInputTokens;
         session.stats.lastInputTokensSource = "usage";
         // #1110: a real usage report retires the one-shot overflow arm.
         delete session.stats.overflowArmTokens;
+        // #1595: a real report landing far below a stale-high nudge reference
+        // retires that reference too (one call covers all three lanes).
+        reanchorNudgeOnUsageDrop(session);
     }
     if (s.reportedCached !== null && s.total > 0) {
         session.stats.cachedTokens += s.reportedCached;
         session.stats.cacheSamples += 1;
     }
     recordCacheSample(session, { at: Date.now(), input: s.total, cached: s.reportedCached, output: s.output, protocol: s.protocol, upstream: s.upstream });
+    // #1592-family seam forensics: pair this settle with the body that was
+    // actually sent (noteForwardedBody), then keep it as the next pair's
+    // baseline. Lanes without body capture still get the aggregate flag.
+    detectSeam(session, getCacheLedger(session));
+    const seamBody = seamLastSent.get(session);
+    if (seamBody !== undefined) seamLastSettled.set(session, seamBody);
+    seamLastSent.delete(session);
 }
 
 /** [#1279] Price profile stamped by the last request (server.ts runPrepare).
@@ -419,6 +572,7 @@ export interface BiliCacheReport extends CacheReport {
     restartDrops: ModelSwitchStats;
     unmeasured: { samples: number; inputTokens: number };
     invalidation: InvalidationTokenBreakdown;
+    seam: { suspects: number; missed: number; events: SeamEvent[]; providerSide: { count: number; missed: number }; rewinds: { count: number; missed: number }; abortCorrelated: number };
 }
 
 export function buildSessionCacheReport(session: Session): BiliCacheReport {
@@ -515,6 +669,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
         restartDrops: { count: a.restartDrops, missedTokens: a.restartDropMissed, events: restartEvents },
         unmeasured: { samples: a.unknownSamples, inputTokens: a.unknownInput },
         invalidation,
+        seam: { suspects: a.seamSuspects, missed: a.seamMissed, events: led.seamEvents ?? [], providerSide: { count: a.providerSideMisses, missed: a.providerSideMissed }, rewinds: { count: a.rewinds, missed: a.rewindMissed }, abortCorrelated: a.abortCorrelated },
     };
 }
 
@@ -542,9 +697,9 @@ export function handleAcpCache(session: Session, args?: Record<string, unknown>)
                 session.id,
                 { detail },
             );
-            return capped + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + "\n\n" + formatInvalidation(report);
+            return capped + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + "\n\n" + formatInvalidation(report) + (formatSeam(report) ? "\n\n" + formatSeam(report) : "");
         }
-        return formatCacheReport(report, session.id, { detail }) + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + "\n\n" + formatInvalidation(report);
+        return formatCacheReport(report, session.id, { detail }) + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + "\n\n" + formatInvalidation(report) + (formatSeam(report) ? "\n\n" + formatSeam(report) : "");
     } catch (err) {
         loggerLog("warn", `[${session.id}] [acp_cache] report failed: ${String(err)}`);
         return `[acp_cache FAILED: ${String(err)}]`;
@@ -579,6 +734,34 @@ function formatModelSwitches(sw: ModelSwitchStats, detail: "summary" | "full"): 
         out.push(`  … ${sw.events.length - shown.length} earlier switch(es) omitted (detail:"full" lists all)`);
     }
     return out.join("\n");
+}
+
+function formatSeam(r: BiliCacheReport): string {
+    const out: string[] = [];
+    if (r.seam.suspects > 0) {
+        out.push("⚠ CACHE SEAM (suspected mid-history prefix breaks)");
+        out.push(`  ${r.seam.suspects} sample(s) · ${fmtTok(r.seam.missed)} tok re-billed with no fold/switch/restart attribution`);
+        for (const e of r.seam.events) {
+            out.push(`    #${e.seq} ${fmtTime(e.at)} hit ${e.hitPct.toFixed(1)}% · input ${fmtTok(e.input)} · divergence ≥${fmtTok(e.lcpBytes)}B at message[${e.msgIndex}] of ${e.prevMsgs}→${e.curMsgs}`);
+        }
+        if (r.seam.events.length === 0) {
+            out.push("    (no body-pair forensics on this lane — aggregate flag only; report the session + log if this persists)");
+        }
+        out.push("  if reproducible: /acp-cache detail:\"full\" + bili.log around the timestamps above (likely a #1548-family round-2/steady render seam)");
+    }
+    if (r.seam.rewinds.count > 0) {
+        out.push("↩ HISTORY REWOUND (client revert/trim)");
+        out.push(`  ${r.seam.rewinds.count} sample(s) · ${fmtTok(r.seam.rewinds.missed)} tok re-billed once for the retained prefix — sanctioned client intent, not a rebuild seam`);
+    }
+    if (r.seam.providerSide.count > 0) {
+        out.push("▲ PROVIDER-SIDE MISS (wire was byte-stable)");
+        out.push(`  ${r.seam.providerSide.count} sample(s) · ${fmtTok(r.seam.providerSide.missed)} tok — the outbound body matched the previous request's prefix; the upstream did not serve its cache (TTL expiry / eviction / relay node rotation). Not a bili rebuild seam.`);
+    }
+    if (r.seam.abortCorrelated > 0) {
+        out.push("⏻ ABORT-CORRELATED");
+        out.push(`  ${r.seam.abortCorrelated} missed sample(s) within 30s of a client mid-stream abort — abort/retry churn rewrites the resent tail; correlation, not causation (see bili.log 'client aborted mid-stream')`);
+    }
+    return out.length > 0 ? out.join("\n") : "";
 }
 
 function formatInvalidation(r: BiliCacheReport): string {

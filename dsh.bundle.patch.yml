@@ -4,7 +4,7 @@
 # the loader resolves `name` from the profile's node_modules.
 - insert:
     - id: bili-native
-      name: billion-context/dsh
+      name: billion-context
 - id: compaction-basic
   config:
     auto: false

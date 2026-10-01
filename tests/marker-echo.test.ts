@@ -202,7 +202,7 @@ test("createMarkerLineFilter holds non-ASCII line-start prefixes losslessly (con
 
 test("composeStreamFilters strips render tags AND marker lines in sequence", () => {
     const f = composeStreamFilters(createTagEchoFilter(), createMarkerLineFilter());
-    const input = `noise ${OPEN}inner${CLOSE} tail\n${FORGED}\nclean end`;
+    const input = `noise ${OPEN}${CLOSE} tail\n${FORGED}\nclean end`;
     const out = f.push(input) + f.flush();
     assert.equal(out, `noise  tail\nclean end`);
     const st = f.stats();

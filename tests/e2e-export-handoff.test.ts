@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { defaultConfig } from "acp-kernel";
@@ -11,6 +11,7 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { exportSession, listSessions } from "../src/export.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import type { ProxyOptions } from "../src/config.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 // E2E for `bili export` (#151): drives the REAL proxy (startServer) against a
 // mock upstream that plays the model's side of the compress protocol — it reads
@@ -191,6 +192,6 @@ test("e2e export: real proxy compresses via real tool call, block persists, bili
         await close(upstream);
         // #1208: drain in-flight persist writes before deleting the store dir (#1194 pattern).
         await store.flushAll([]);
-        rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });

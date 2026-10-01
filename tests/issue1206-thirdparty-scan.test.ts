@@ -70,7 +70,7 @@ test("opencode scan: known conflict + keyword entries, self/context7 skipped", (
     const root = tmp("bili-1206-oc-");
     const cwd = tmp("bili-1206-oc-cwd-");
     writeFile(path.join(root, ".config", "opencode", "opencode.json"), JSON.stringify({
-        plugin: ["opencode-acp@stable", "@scope/context-compressor", "billion-context", "context7", { name: "memory-compactor" }],
+        plugin: ["opencode-acp@stable", "@scope/context-compressor", "billion-context", "context7", "context-dashboard", { name: "memory-compactor" }],
     }));
     writeFile(path.join(cwd, ".opencode", "opencode.json"), JSON.stringify({ plugin: ["compact-helper"] }));
     const res = scanClientPlugins("opencode", { env: hermeticEnv(root), cwd });
@@ -81,6 +81,7 @@ test("opencode scan: known conflict + keyword entries, self/context7 skipped", (
     assert.ok(names.includes("compact-helper"), "project-layer entry must be scanned");
     assert.ok(!names.includes("billion-context"), "bili itself must be skipped");
     assert.ok(!names.some((n) => n === "context7"), "context7 must NOT be keyword-matched");
+    assert.ok(!names.some((n) => n === "context-dashboard"), "bare-'context' read-only tool must NOT be flagged (#1736)");
     const known = res.findings.find((f) => f.entry === "opencode-acp@stable");
     assert.equal(known?.match, "known");
     assert.equal(known?.knownId, "opencode-acp");
@@ -144,13 +145,14 @@ test("pi scan: legacy bcp entry is known-conflict, keyword entries flagged, bili
     const cwd = tmp("bili-1206-pi-cwd-");
     const home = resolvePiHome(hermeticEnv(root));
     writeFile(path.join(home, "settings.json"), JSON.stringify({
-        packages: ["npm:billion-context-pi", "npm:context-forge", "/u/node_modules/billion-context/dist/agent/pi.js"],
+        packages: ["npm:billion-context-pi", "npm:context-compactor", "npm:context-forge", "/u/node_modules/billion-context/dist/agent/pi.js"],
     }));
     const res = scanClientPlugins("pi", { env: hermeticEnv(root), cwd });
     const bcp = res.findings.find((f) => f.entry === "npm:billion-context-pi");
     assert.equal(bcp?.match, "known");
     assert.equal(bcp?.knownId, "billion-context-pi");
-    assert.ok(res.findings.some((f) => f.entry === "npm:context-forge" && f.match === "keyword"));
+    assert.ok(res.findings.some((f) => f.entry === "npm:context-compactor" && f.match === "keyword"), "action-token name still flagged");
+    assert.ok(!res.findings.some((f) => f.entry === "npm:context-forge"), "bare-'context' tool must NOT be flagged (#1736)");
     assert.ok(!res.findings.some((f) => f.entry.includes("dist/agent/pi.js")), "bili's own extension path must be skipped");
 });
 
@@ -162,14 +164,14 @@ test("omp scan: extensions block parsed, bili entry skipped, keyword flagged", (
         "model: m",
         "extensions:",
         "  - /u/node_modules/billion-context/dist/agent/omp-native.js",
+        "  - npm:context-compactor",
         "  - npm:context-forger",
         "providers:",
-        "  p1: {}",
-        "",
+        "  default: openai",
     ].join("\n"));
     const res = scanClientPlugins("omp", { env: hermeticEnv(root), cwd: root });
-    assert.equal(res.findings.length, 1);
-    assert.equal(res.findings[0]?.entry, "npm:context-forger");
+    assert.equal(res.findings.length, 1, "action-token kept, bare-'context' dropped (#1736)");
+    assert.equal(res.findings[0]?.entry, "npm:context-compactor");
     assert.equal(res.findings[0]?.match, "keyword");
 });
 
@@ -182,12 +184,13 @@ test("kimi scan: installed.json ids scanned, billion-context skipped", () => {
         version: 1,
         plugins: [
             { id: "billion-context", root: "./managed/billion-context", source: "local-path", enabled: true },
+            { id: "context-compactor", root: "./managed/context-compactor", source: "local-path", enabled: true },
             { id: "context-keeper", root: "./managed/context-keeper", source: "local-path", enabled: true },
         ],
     }));
     const res = scanClientPlugins("kimi", { env, cwd: root });
-    assert.equal(res.findings.length, 1);
-    assert.equal(res.findings[0]?.entry, "context-keeper");
+    assert.equal(res.findings.length, 1, "action-token kept, bare-'context' dropped (#1736)");
+    assert.equal(res.findings[0]?.entry, "context-compactor");
 });
 
 test("hermes scan: plugin dirs matched by dir name only, bili skipped", () => {
@@ -197,12 +200,13 @@ test("hermes scan: plugin dirs matched by dir name only, bili skipped", () => {
     const pluginsDir = path.join(resolveHermesHome(env), "plugins");
     fs.mkdirSync(path.join(pluginsDir, "billion-context"), { recursive: true });
     fs.mkdirSync(path.join(pluginsDir, "weather"), { recursive: true });
-    writeFile(path.join(pluginsDir, "context-keeper", "plugin.yaml"), "name: context-keeper\n");
-    // Keyword-rich manifest under a NON-matching dir name must not trigger —
-    // full-text matching false-positives on plain descriptions.
+    writeFile(path.join(pluginsDir, "context-compactor", "plugin.yaml"), "name: context-compactor\n");
+    // bare-'context' read-only tool: dropped by the tightened keyword set (#1736)
+    fs.mkdirSync(path.join(pluginsDir, "context-viewer"), { recursive: true });
+    // A keyword-rich manifest that must NOT match — hermes matches dir names only.
     writeFile(path.join(pluginsDir, "forecast-tools", "plugin.yaml"), "description: summarizes context for weather forecasts\n");
     const res = scanClientPlugins("hermes", { env, cwd: root });
-    assert.deepEqual(res.findings.map((f) => f.entry), ["context-keeper"]);
+    assert.deepEqual(res.findings.map((f) => f.entry), ["context-compactor"]);
 });
 
 test("#920: opencode-acp is design-absorbed only under bili's own opencode mode", () => {
@@ -214,15 +218,24 @@ test("#920: opencode-acp is design-absorbed only under bili's own opencode mode"
     assert.equal(isDesignAbsorbed(suspected, "opencode"), false, "keyword tier is never absorbed");
 });
 
-test("dsh scan: profile package.json deps scanned, billion-context skipped", () => {
+test("dsh scan: profile deps scanned; bare-'context' dashboard dropped, action-token compressors kept (#1736)", () => {
     clearScanCache();
     const root = tmp("bili-1206-dsh-");
     const env: NodeJS.ProcessEnv = { ...hermeticEnv(root), DSH_HOME: path.join(root, "dsh") };
     writeFile(path.join(root, "dsh", "profiles", "main", "package.json"), JSON.stringify({
-        dependencies: { "billion-context": "^0.1.0", "context-keeper": "^1.0.0" },
+        dependencies: {
+            "billion-context": "^0.1.0",
+            "dsh-context": "^0.2.0",
+            "@deepseek-ai/dsh-compaction-basic": "0.2.0-rc.2",
+            "dsh-context-compressor": "^1.0.0",
+        },
     }));
     const res = scanClientPlugins("dsh", { env, cwd: root });
-    assert.deepEqual(res.findings.map((f) => f.entry), ["context-keeper"]);
+    const names = res.findings.map((f) => f.entry);
+    assert.ok(!names.includes("dsh-context"), "read-only Context Dashboard must NOT be flagged (#1736)");
+    assert.ok(!names.includes("billion-context"), "bili itself must be skipped");
+    assert.ok(names.includes("@deepseek-ai/dsh-compaction-basic"), "'compaction' carries the compact action token");
+    assert.ok(names.includes("dsh-context-compressor"), "'compressor' carries the compress action token");
 });
 
 test("dsh scan: missing profiles root yields empty result without throwing", () => {
@@ -290,6 +303,22 @@ test("formatConflictSection lists last 10 events with guidance", () => {
     assert.ok(!lines.some((l) => l.includes("reaped 0 ")), "only the last 10 events are listed");
     assert.ok(lines.some((l) => l.includes("/__bili/stats")), "overflow pointer present");
     assert.ok(lines.some((l) => l.toLowerCase().includes("one compressor")), "guidance footer present");
+});
+
+test("formatConflictSection marks [suspected] as name-only and softens the footer when nothing confirmed (#1736)", () => {
+    const s = makeSession();
+    recordConflict(s, "third-party-plugin", "dsh: dsh-context (profile/package.json) [suspected]");
+    const lines = formatConflictSection(conflictEventsOf(s));
+    assert.ok(lines.some((l) => l.includes("[suspected] = name-only")), "explains the suspected marker");
+    assert.ok(lines.some((l) => l.includes("do not drop a read-only tool")), "all-suspected footer warns against blind removal");
+    assert.ok(!lines.some((l) => l.toLowerCase().includes("one compressor")), "no confirmed events -> no hard remove/disable command");
+
+    const s2 = makeSession();
+    recordConflict(s2, "third-party-plugin", "opencode: opencode-acp (global config)");
+    recordConflict(s2, "orphan-reap", "1 block(s) deactivated: b1");
+    const lines2 = formatConflictSection(conflictEventsOf(s2));
+    assert.ok(lines2.some((l) => l.toLowerCase().includes("one compressor")), "confirmed events keep the strong footer");
+    assert.ok(!lines2.some((l) => l.includes("[suspected] = name-only")), "no note when nothing is suspected");
 });
 
 test("summarizeConflicts aggregates across sessions", () => {

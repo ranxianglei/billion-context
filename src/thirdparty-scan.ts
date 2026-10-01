@@ -9,7 +9,7 @@
 // registry (best-effort, read-only, cached) for:
 //   1. known conflicting entries (bili's siblings, when not absorbed by design);
 //   2. suspected compression plugins by name keyword (compress*/compact*/acp/
-//      summar*/context) — flagged for user confirmation, never auto-fixed.
+//      summar*) — flagged for user confirmation, never auto-fixed.
 // Callers: launcher pre-launch warning, proxy first-request-per-session
 // (recorded into the session conflict ledger), acp_status / web UI surfacing.
 // Every fs access is individually guarded — a scan must NEVER fail a request
@@ -56,9 +56,14 @@ export function isDesignAbsorbed(finding: ThirdPartyFinding, pluginAgent: string
 
 export const SCAN_CACHE_TTL_MS = 5 * 60 * 1000;
 
-// Full-word tokens only: \bcontext\b deliberately does NOT match "context7"
-// (a docs plugin), while hyphenated names ("context-compressor") do match.
-const KEYWORD_RE = /\b(compress\w*|compact\w*|acp|summar\w*|context)\b/i;
+// Compression-ACTION tokens only. Bare "context" is deliberately EXCLUDED
+// (#1736): it names the domain (context management), not the act of
+// compressing — read-only tools like "dsh-context" (Context Dashboard) or
+// "context-viewer"/"context-memory" share the domain without compressing and
+// flooded the suspected tier with false positives. A real compressor carries
+// an action token (compress*/compact*/summar*) or the ecosystem marker "acp".
+// \b keeps embedded words ("context7", a docs plugin) from matching.
+const KEYWORD_RE = /\b(compress\w*|compact\w*|acp|summar\w*)\b/i;
 
 const cache = new Map<string, { at: number; result: ScanResult }>();
 

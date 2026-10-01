@@ -1,6 +1,6 @@
 import { test, before } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import http from "node:http";
@@ -15,6 +15,7 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 // Some tests inspect raw on-disk session files directly (bypassing the store
 // codec), so pin the plain-JSON format: #1080 made BILIZSTD1 the default.
@@ -90,7 +91,7 @@ async function withTempStore(name: string, fn: (dir: string, store: SessionStore
         await fn(dir, store);
     } finally {
         store.cancelAll();
-        rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 }
 

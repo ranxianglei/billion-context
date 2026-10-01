@@ -9,10 +9,11 @@
 // call + result in its own persisted history on every later request (pi
 // semantics: pairs stay at their chronological position forever). The proxy
 // therefore re-injects the in-place acp_summary carrier from block state on
-// every request; today it is NOT stripped against the client's pair because
-// the plugin endpoint's `plugin_<ts>` callId can never match the client's
-// tool_use id (#1567). This suite pins ACTUAL behavior byte-for-byte and
-// carries the intended-strip assertion skip-gated until #1567 lands.
+// every request. Since the #1567 fix the carrier is STRIPPED per-block, but
+// self-verified: only while that exact fold's compress pair actually rides
+// the (post-prepare) inbound history. A pair pruned client-side or hidden by
+// the kernel (KEEP_LAST_ORPHANED) keeps the anchor, so an active fold never
+// has zero carriers. This suite pins that behavior byte-for-byte.
 //
 // Invariants pinned per wire (bodies = consecutive upstream-bound request
 // payloads of one session, compared as flat unit lists — text blocks and
@@ -25,15 +26,19 @@
 //       /__bili/plugin/tool fold):
 //        P2a the pre-fold span is replaced by exactly the expected carrier
 //            units and nothing else moves or mutates (exact reconstruction);
-//        P2b the in-place carrier COEXISTS with the re-sent pair on every
-//            post-fold turn (actual behavior, #1567) — occurrence counts
-//            pinned: exactly 3 on EVERY post-fold turn (in-place carrier +
-//            the fold spec echoed in the re-sent tool_call args + the tail
-//            quote inside the persistently re-sent tool result);
-//        P2c INTENDED behavior (skip-gated on #1567): the carrier is absent
-//            whenever the client's pair rides inbound;
-//   P3 multi-fold: two folds in one session; every carrier survives all
-//       later turns byte-identical; both pairs stay visible (≤ KEEP_LAST_ORPHANED);
+//        P2b the in-place carrier is stripped from every post-fold turn
+//            while the client's pair rides inbound — occurrence counts
+//            pinned: exactly 2 summary-text hits per post-fold turn (the
+//            fold spec echoed in the re-sent tool_call args + the tail
+//            quote inside the persistently re-sent tool result) and ZERO
+//            carrier markers (#1567 fix);
+//        P2c fail-safe (#1567 hardening): the anchor re-carries the summary
+//            whenever the pair does NOT ride inbound — the client stops
+//            re-sending it, or the kernel hid it (KEEP_LAST_ORPHANED) —
+//            pinned by the two hardening subtests at the bottom of this file;
+//   P3 multi-fold: two folds in one session; both pairs stay visible
+//       (≤ KEEP_LAST_ORPHANED) and the pair-quote counts stay constant across
+//       all later turns;
 //   P4 no transient acp_loop_* artifact leaks into any forwarded body
 //      (plugin mode has none by construction — pin it);
 //   P5 marker/tag hygiene: every content text unit carries exactly one
@@ -62,6 +67,7 @@ import { startServer, type ProxyOptions } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 const LT = "\x3c";
 const GT = "\x3e";
@@ -287,7 +293,7 @@ function assertFoldTransition(prev: Unit[], next: Unit[], cover: string[], inser
     let tailLen = 0;
     for (const u of next) if ((u.k === "tu" || u.k === "tr") && !prevKeys.has(keyOf(u))) tailLen++;
     const insLen = spanLen + (next.length - prev.length - tailLen);
-    assert.ok(insLen >= 1, `${label}: computed insertion length ${insLen} < 1`);
+    assert.ok(insLen >= 0, `${label}: computed insertion length ${insLen} < 0`); // 0 = span fully consumed (#1567 strips the anchor)
     const ins = next.slice(i0, i0 + insLen);
     assert.deepEqual(ins.map(keyOf), insert, `${label}: inserted units ${JSON.stringify(ins.map(keyOf))} != expected ${JSON.stringify(insert)}`);
     const rebuilt = [...prev.slice(0, i0), ...ins, ...prev.slice(i1 + 1), ...next.slice(next.length - tailLen)];
@@ -415,7 +421,7 @@ const adapters: Record<Wire, { model: string; path: string; buildBody: (items: C
     },
 };
 
-interface Step { send: CItem[]; fold?: FoldSpec; pairId?: string }
+interface Step { send: CItem[]; fold?: FoldSpec; pairId?: string; dropPair?: string }
 
 async function driveWire(wire: Wire, steps: Step[]): Promise<Canon[]> {
     const adapter = adapters[wire];
@@ -472,6 +478,13 @@ async function driveWire(wire: Wire, steps: Step[]): Promise<Canon[]> {
                 assert.ok(!j.result?.includes("[Compression FAILED"), `[${wire}] compression failed: ${j.result?.slice(0, 200)}`);
                 hist.push({ pair: { args: step.fold, result: j.result!, id: step.pairId ?? `${wire}_cmp` } });
             }
+            // #1567 hardening scenario: a contract-violating (or pruning)
+            // client stops re-sending an older compress pair
+            if (step.dropPair) {
+                const idx = hist.findIndex((it) => "pair" in it && it.pair.id === step.dropPair);
+                if (idx < 0) assert.fail(`[${wire}] dropPair ${step.dropPair}: pair not in history`);
+                hist.splice(idx, 1);
+            }
             const resp = await fetch(base, {
                 method: "POST",
                 headers: { "content-type": "application/json", "x-bili-plugin": "pi-plugin/0.0.1", "x-bili-plugin-conversation": conv },
@@ -490,7 +503,7 @@ async function driveWire(wire: Wire, steps: Step[]): Promise<Canon[]> {
         await once(upstream, "close");
         if (prevXdg === undefined) delete process.env.XDG_STATE_HOME;
         else process.env.XDG_STATE_HOME = prevXdg;
-        fs.rmSync(stateDir, { recursive: true, force: true });
+        rmrf(stateDir);
     }
     return captured.map((raw) => canon(raw, wire));
 }
@@ -528,20 +541,22 @@ for (const wire of ["anthropic", "openai", "responses", "google"] as Wire[]) {
 
         assertPrefix(cans[0]!.core, cans[1]!.core, L(1), ["q3", "a3"]);
         assertPrefix(cans[1]!.core, cans[2]!.core, L(2), ["q4", "a4"]);
-        assertFoldTransition(cans[2]!.core, cans[3]!.core, ["q1", "a1"], ["SA", "q1"], L(3));
+        assertFoldTransition(cans[2]!.core, cans[3]!.core, ["q1", "a1"], ["q1"], L(3)); // head boundary survives; anchor stripped (#1567)
         assertPrefix(cans[3]!.core, cans[4]!.core, L(4), ["q5", "a5"]);
-        assertFoldTransition(cans[4]!.core, cans[5]!.core, ["q2", "a2", "q3"], ["SB"], L(5));
+        assertFoldTransition(cans[4]!.core, cans[5]!.core, ["q2", "a2", "q3"], [], L(5)); // anchor stripped (#1567)
         assertPrefix(cans[5]!.core, cans[6]!.core, L(6), ["q7", "a7"]);
         assertPrefix(cans[6]!.core, cans[7]!.core, L(7), ["q8", "a8"]);
 
         for (let i = 3; i < cans.length; i++) {
             const raw = cans[i]!.raw;
-            const expMarker = i < 5 ? 1 : 2;
-            const expA = i < 3 ? 0 : 3;
-            const expB = i < 5 ? 0 : 3;
-            assert.equal(countOcc(raw, SUM_MARKER), expMarker, `${L(i)}: expected ${expMarker} summary carrier(s) (got ${countOcc(raw, SUM_MARKER)})`);
-            assert.equal(countOcc(raw, SUM_A), expA, `${L(i)}: SUM_A occurrences ${countOcc(raw, SUM_A)} != ${expA} (coexistence pin, #1567)`);
-            assert.equal(countOcc(raw, SUM_B), expB, `${L(i)}: SUM_B occurrences ${countOcc(raw, SUM_B)} != ${expB} (coexistence pin, #1567)`);
+            // #1567 (fixed): the in-place carrier is stripped per-block while
+            // the client's re-sent pair rides inbound — only the two pair
+            // quotes (tool_call args + tool result) keep the summary text.
+            const expA = 2;
+            const expB = i < 5 ? 0 : 2;
+            assert.equal(countOcc(raw, SUM_MARKER), 0, `${L(i)}: in-place carrier must be stripped while the client's pair rides inbound (got ${countOcc(raw, SUM_MARKER)})`);
+            assert.equal(countOcc(raw, SUM_A), expA, `${L(i)}: SUM_A occurrences ${countOcc(raw, SUM_A)} != ${expA} (pair quotes only, #1567)`);
+            assert.equal(countOcc(raw, SUM_B), expB, `${L(i)}: SUM_B occurrences ${countOcc(raw, SUM_B)} != ${expB} (pair quotes only, #1567)`);
             // google part-shapes carry no call id; pin pair presence through
             // the fold topic embedded in the re-sent functionCall args
             const pairA = wire === "google" ? "CFP-TOPIC-A" : "\"cfp_a\"";
@@ -550,13 +565,6 @@ for (const wire of ["anthropic", "openai", "responses", "google"] as Wire[]) {
             if (i >= 5) assert.ok(raw.includes(pairB), `${L(i)}: pairB lost from re-sent history`);
         }
 
-        const stripFixed = process.env.BILI_PLUGIN_STRIP_FIXED === "1";
-        const stripTest = stripFixed ? test : test.skip;
-        stripTest(`cache-friendly plugin matrix: ${wire} — intended carrier strip (#1567)`, () => {
-            for (const i of [3, 4, 5, 6, 7]) {
-                assert.equal(countOcc(cans[i]!.raw, SUM_MARKER), 0, `${L(i)}: in-place carrier must be stripped while the client's pair rides inbound`);
-            }
-        });
     }, { timeout: 120_000 });
 }
 
@@ -585,7 +593,7 @@ test("cache-friendly plugin matrix: anthropic swallow/back-to-back geometries", 
 
     assertPrefix(cans[0]!.core, cans[1]!.core, L(1), ["q3", "a3"]);
     assertPrefix(cans[1]!.core, cans[2]!.core, L(2), ["q4", "a4"]);
-    assertFoldTransition(cans[2]!.core, cans[3]!.core, ["q1", "a1"], ["SA", "q1"], L(3));
+    assertFoldTransition(cans[2]!.core, cans[3]!.core, ["q1", "a1"], ["q1"], L(3)); // head boundary survives; anchor stripped (#1567)
     assertPrefix(cans[3]!.core, cans[4]!.core, L(4), ["q5", "a5"]);
 
     const wide = FOLD_WIDE.summary;
@@ -596,8 +604,7 @@ test("cache-friendly plugin matrix: anthropic swallow/back-to-back geometries", 
         // the re-sent geo_a tool result until that pair is pruned at t7
         const expA = i === 5 ? 2 : 0;
         assert.equal(countOcc(raw, SUM_A), expA, `${L(i)}: SUM_A occurrences ${countOcc(raw, SUM_A)} != ${expA}`);
-        const expMarker = i === 5 ? 1 : 2;
-        assert.equal(countOcc(raw, SUM_MARKER), expMarker, `${L(i)}: expected ${expMarker} carrier(s) (got ${countOcc(raw, SUM_MARKER)})`);
+        assert.equal(countOcc(raw, SUM_MARKER), 0, `${L(i)}: carriers must be stripped while their pairs ride inbound (got ${countOcc(raw, SUM_MARKER)})`);
         assert.ok(!raw.includes("q2-marker"), `${L(i)}: swallowed content q2 must stay hidden`);
         assert.ok(!raw.includes("a2-marker"), `${L(i)}: swallowed content a2 must stay hidden`);
     }
@@ -609,19 +616,115 @@ test("cache-friendly plugin matrix: anthropic swallow/back-to-back geometries", 
         assert.ok(found > cursor, `cfp-geo t6: unit ${JSON.stringify(keyOf(u))} lost or reordered by the wide fold`);
         cursor = found;
     }
-    assert.equal(countOcc(cans[5]!.raw, wide), 3, `${L(5)}: wide fold turn occurrences (carrier + quotes)`);
-    assert.equal(countOcc(cans[6]!.raw, gamma), 3, `${L(6)}: gamma fold turn occurrences (carrier + quotes)`);
-    assert.equal(countOcc(cans[7]!.raw, wide), 3, `${L(7)}: wide carrier + resent quotes must survive`);
-    assert.equal(countOcc(cans[7]!.raw, gamma), 3, `${L(7)}: gamma carrier + resent quotes must survive`);
+    assert.equal(countOcc(cans[5]!.raw, wide), 2, `${L(5)}: wide fold turn occurrences (pair quotes; anchor stripped)`);
+    assert.equal(countOcc(cans[6]!.raw, gamma), 2, `${L(6)}: gamma fold turn occurrences (pair quotes; anchor stripped)`);
+    assert.equal(countOcc(cans[7]!.raw, wide), 2, `${L(7)}: resent wide quotes must survive`);
+    assert.equal(countOcc(cans[7]!.raw, gamma), 2, `${L(7)}: resent gamma quotes must survive`);
     for (const i of [6, 7]) {
         const raw = cans[i]!.raw;
         assert.ok(raw.includes("\"geo_wide\"") && raw.includes("\"geo_e\""), `${L(i)}: latest two pairs must stay visible`);
         assert.ok(!raw.includes("\"geo_a\""), `${L(i)}: oldest pair must be pruned (KEEP_LAST_ORPHANED=2)`);
     }
+    // #1567 (fixed): no text unit carries the wide summary anymore (stripped
+    // anchor); the quotes ride structured tool units, not text
     const wideT6 = cans[6]!.core.filter((u) => u.k === "text" && u.x.includes(wide));
     const wideT7 = cans[7]!.core.filter((u) => u.k === "text" && u.x.includes(wide));
-    assert.equal(wideT7.length, 1);
-    assert.equal(wideT6.length, 1);
-    assert.ok(eqUnit(wideT6[0]!, wideT7[0]!), `${L(7)}: wide carrier bytes drifted`);
+    assert.equal(wideT6.length, 0, `${L(6)}: wide carrier must be stripped while the geo_wide pair rides inbound`);
+    assert.equal(wideT7.length, 0, `${L(7)}: wide carrier must be stripped while the geo_wide pair rides inbound`);
     assertPrefix(cans[6]!.core, cans[7]!.core, L(7), ["q8", "a8"]);
+}, { timeout: 120_000 });
+
+// #1567 hardening scenario A: a contract-violating (or pruning) client stops
+// re-sending an older compress pair. While pairA rides, its anchor is
+// stripped (P2b); the moment the pair vanishes the anchor MUST re-carry the
+// summary (zero-carrier fail-safe) and the body must stay append-stable on
+// later turns (no flapping).
+test(`cache-friendly plugin matrix: anthropic — client drops re-sent pair → anchor re-carries (#1567 hardening)`, async () => {
+    const steps: Step[] = [
+        { send: [T(1), A(1), T(2), A(2)] },
+        { send: [T(3), A(3)] },
+        { send: [T(4), A(4)] },
+        { send: [], fold: FOLD_A, pairId: "cfp_a" },
+        { send: [T(5), A(5)] },
+        { send: [], fold: FOLD_B, pairId: "cfp_b" },
+        { send: [T(7), A(7)], dropPair: "cfp_a" },
+        { send: [T(8), A(8)] },
+    ];
+    const cans = await driveWire("anthropic", steps);
+    assert.equal(cans.length, 8, "expected 8 outbound bodies");
+    const L = (i: number) => `cfp-drop t${i + 1}`;
+    for (let i = 0; i < cans.length; i++) {
+        assertSlotsTail(cans[i]!, L(i));
+        assert.equal(countOcc(cans[i]!.raw, "acp_loop_"), 0, `${L(i)}: acp_loop_ artifact leaked`);
+    }
+    assertTagPolicy(cans, "cfp-drop");
+    // t4..t6: both pairs ride → both anchors stripped
+    for (const i of [3, 4, 5]) {
+        const raw = cans[i]!.raw;
+        assert.equal(countOcc(raw, SUM_MARKER), 0, `${L(i)}: carrier must be stripped while pair rides`);
+        assert.ok(raw.includes('"cfp_a"'), `${L(i)}: pairA still re-sent here`);
+    }
+    assert.ok(cans[5]!.raw.includes('"cfp_b"'), `${L(5)}: pairB rides`);
+    // t7/t8: pairA gone → anchor A is the ONLY carrier again
+    for (const i of [6, 7]) {
+        const raw = cans[i]!.raw;
+        assert.ok(!raw.includes('"cfp_a"'), `${L(i)}: client no longer re-sends pairA`);
+        assert.equal(countOcc(raw, SUM_MARKER), 1, `${L(i)}: anchor A must re-carry (exactly one carrier)`);
+        assert.equal(countOcc(raw, SUM_A), 1, `${L(i)}: SUM_A = carrier only (pair quotes gone with the pair)`);
+        assert.equal(countOcc(raw, SUM_B), 2, `${L(i)}: SUM_B quotes only, anchor B still stripped (pairB rides)`);
+        assert.ok(raw.includes('"cfp_b"'), `${L(i)}: pairB rides`);
+    }
+    assert.ok(cans[6]!.raw.includes("q7-marker"), `${L(6)}: new turn visible`);
+    // once re-carried, the body stays append-stable (no flapping)
+    assertPrefix(cans[6]!.core, cans[7]!.core, L(7), ["q8", "a8"]);
+}, { timeout: 120_000 });
+
+// #1567 hardening scenario B: three concurrent ACTIVE folds. The kernel hides
+// consumed compress pairs beyond the newest KEEP_LAST_ORPHANED=2, so the
+// oldest pair leaves the wire while its block is still active — the strip
+// guard must see it gone and KEEP that anchor (kernel-side fail-safe).
+test(`cache-friendly plugin matrix: anthropic — 3rd fold prunes oldest pair → oldest anchor kept (#1567 hardening)`, async () => {
+    const SUM_P1 = "Prune-safe fold one summary covering m00001..m00002";
+    const SUM_P2 = "Prune-safe fold two summary covering m00003..m00004";
+    const SUM_P3 = "Prune-safe fold three summary covering m00005..m00006";
+    const F1: FoldSpec = { startId: "m00001", endId: "m00002", topic: "CFP-TOPIC-P1", summary: SUM_P1 };
+    const F2: FoldSpec = { startId: "m00003", endId: "m00004", topic: "CFP-TOPIC-P2", summary: SUM_P2 };
+    const F3: FoldSpec = { startId: "m00005", endId: "m00006", topic: "CFP-TOPIC-P3", summary: SUM_P3 };
+    const steps: Step[] = [
+        { send: [T(1), A(1), T(2), A(2), T(3), A(3), T(4), A(4)] },
+        { send: [T(5), A(5), T(6), A(6)] }, // keep fold ranges outside the protected zone (last 5 messages)
+        { send: [], fold: F1, pairId: "fs1" },
+        { send: [], fold: F2, pairId: "fs2" },
+        { send: [], fold: F3, pairId: "fs3" },
+        { send: [T(7), A(7)] },
+        { send: [T(8), A(8)] },
+    ];
+    const cans = await driveWire("anthropic", steps);
+    assert.equal(cans.length, 7, "expected 7 outbound bodies");
+    const L = (i: number) => `cfp-prune t${i + 1}`;
+    for (let i = 0; i < cans.length; i++) {
+        assertSlotsTail(cans[i]!, L(i));
+        assert.equal(countOcc(cans[i]!.raw, "acp_loop_"), 0, `${L(i)}: acp_loop_ artifact leaked`);
+    }
+    assertTagPolicy(cans, "cfp-prune");
+    // t3/t4: pairs ride (≤ 2) → anchors stripped. From t5 on, three pairs
+    // coexist and the kernel hides the oldest (KEEP_LAST_ORPHANED=2) — the
+    // guard sees it gone and keeps that anchor (kernel-side fail-safe)
+    for (const i of [2, 3]) {
+        assert.equal(countOcc(cans[i]!.raw, SUM_MARKER), 0, `${L(i)}: anchors stripped while pairs ride`);
+    }
+    assert.ok(cans[3]!.raw.includes('"fs1"') && cans[3]!.raw.includes('"fs2"'), `${L(3)}: both pairs visible`);
+    // t5..t7: fs1 hidden by KEEP_LAST_ORPHANED → anchor F1 re-carries;
+    // F2/F3 anchors stay stripped while their pairs ride
+    for (const i of [4, 5, 6]) {
+        const raw = cans[i]!.raw;
+        assert.ok(!raw.includes('"fs1"'), `${L(i)}: oldest pair pruned (KEEP_LAST_ORPHANED=2)`);
+        assert.ok(raw.includes('"fs2"') && raw.includes('"fs3"'), `${L(i)}: newest two pairs stay visible`);
+        assert.equal(countOcc(raw, SUM_MARKER), 1, `${L(i)}: exactly one carrier (F1 anchor re-carried)`);
+        assert.equal(countOcc(raw, SUM_P1), 1, `${L(i)}: SUM_P1 = carrier only (its pair quotes pruned with the pair)`);
+        assert.equal(countOcc(raw, SUM_P2), 2, `${L(i)}: SUM_P2 quotes only`);
+        assert.equal(countOcc(raw, SUM_P3), 2, `${L(i)}: SUM_P3 quotes only`);
+    }
+    // once the oldest anchor re-carries, later turns are append-stable
+    assertPrefix(cans[5]!.core, cans[6]!.core, L(6), ["q8", "a8"]);
 }, { timeout: 120_000 });

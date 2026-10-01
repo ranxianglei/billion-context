@@ -9,6 +9,7 @@ import {
     closeLogger,
     setLogCapture,
 } from "../src/logger.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 /** Poll until the file exists with a stable non-zero size (open completed,
  *  line flushed). #1208: a missing file reads like the initial sentinel, so
@@ -57,7 +58,7 @@ test("external rename: subsequent lines land in the new file, .old frozen", asyn
         assert.equal(fs.statSync(file + ".old").size, oldSize, ".old must not grow after rotation");
     } finally {
         closeLogger();
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -76,7 +77,7 @@ test("reopen failure: degrades to stderr-only with one [warn], no crash", async 
 
         // Clobber the path: remove the dir, then put a regular file where the
         // dir was, so mkdirSync(dirname) throws ENOTDIR on every reopen.
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
         fs.writeFileSync(dir, "blocker");
 
         log("info", "after-clobber"); // must not throw
@@ -89,7 +90,7 @@ test("reopen failure: degrades to stderr-only with one [warn], no crash", async 
     } finally {
         setLogCapture(null);
         closeLogger();
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -121,6 +122,6 @@ test("internal 10MB rotation: post-rotation line lands in the fresh file", async
                 resolve();
             }
         });
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });

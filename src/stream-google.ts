@@ -5,7 +5,7 @@ import { isProxyToolFor } from "./absorb.js";
 import { executeProxyTool } from "./loop/core.js";
 import { drainPendingRetrievals } from "./store.js";
 import type { RewriteCtx } from "./stream.js";
-import { containsMarkerLineText, containsRenderTagText, stripAcpTags } from "./loop/tag-echo-filter.js";
+import { containsBiliInternalText, containsMarkerLineText, containsRenderTagText, stripAcpTags } from "./loop/tag-echo-filter.js";
 
 export function rewriteGoogleJsonResponse(body: unknown, ctx: RewriteCtx): unknown {
     if (!body || typeof body !== "object") return body;
@@ -30,8 +30,8 @@ export function rewriteGoogleJsonResponse(body: unknown, ctx: RewriteCtx): unkno
             continue;
         }
         if (fc) sawReal = true;
-        if (typeof part.text === "string" && (containsRenderTagText(part.text) || containsMarkerLineText(part.text))) {
-            ctx.log(`[warn: tag echo] non-stream google output contains ACP echo (render tags/markers), stripped: ${part.text.slice(0, 120).replace(/\n/g, " ")}`);
+        if (typeof part.text === "string" && (containsRenderTagText(part.text) || containsMarkerLineText(part.text) || containsBiliInternalText(part.text))) {
+            ctx.log(`[warn: tag echo] non-stream google output contains ACP echo (render tags/markers/internal artifacts), stripped: ${part.text.slice(0, 120).replace(/\n/g, " ")}`);
             part.text = stripAcpTags(part.text);
         }
         keptParts.push(part);

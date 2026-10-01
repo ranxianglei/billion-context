@@ -312,6 +312,35 @@ non-interactive — it either serves the token or fails, so if `git push`
 worked, the token extraction works. Never print the token; keep it in the
 variable only. Merging the PR stays human-only (see above).
 
+### External Contributors' PRs — Review, Don't Take Over
+
+For PRs authored by external (non-maintainer) contributors, the Agent's job
+is **review + verification only**. Never push to their branch, never
+rebase-and-replace their PR with an Agent-owned PR, and never suggest
+closing it — if any of that seems needed, explain the situation and let the
+owner decide. A first-time contributor's authorship and PR credit are part
+of the deliverable. (Lesson: #1765, 2026-10-01 — the Agent opened a
+replacement PR for a still-mergeable first contribution and had to walk it
+back.)
+
+Two mechanics to check before assuming a contributor's PR is broken:
+
+- **A deleted head branch does NOT kill an open PR.** GitHub freezes the PR
+  head at `refs/pull/N/head`; recreating the branch does not re-attach it,
+  but the frozen head can still be `MERGEABLE` with green checks. Check
+  `mergeable`/`mergeStateStatus` first.
+- **`BEHIND` is not a blocker.** The PR does not need to contain the latest
+  master; the merge button (or an owner's merge commit) handles it.
+
+### Supplements After a Merge — Follow-up PR, Never the Merged PR
+
+When something is missing or wrong AFTER a PR was merged, the supplement
+goes into a **small follow-up PR whose body references the original PR
+number** — never pushed into, rebased onto, or appended to the merged PR.
+Keep the original contribution history intact (its commits, its diff, its
+author). Verify first that a supplement is actually needed: a review that
+replays the same commit on newer master is verification, not content.
+
 ### Issue Work — Required Deliverables
 
 When an Agent picks up an issue, these deliverables are MANDATORY:
@@ -478,12 +507,20 @@ latest; type a full semver for minor/major/prerelease bumps. The workflow:
      summary). The fallback PR body carries a generated changelog (`git log`
      since the last release tag); the same notes appear in the job summary as
      a paste-ready block for opening the PR manually. Merging that PR publishes
-     via the standard flow; red is reserved for real failures (guard trips,
-     gate failures, or a failed branch push). `ci.yml` also runs on pushes to
-      release branches, so the required checks go green on the auto-PR's head
-      sha even when the pull_request-triggered runs sit in `action_required`
-      waiting for manual approval (bot-authored PRs can be gated this way) —
-      the auto-PR is immediately mergeable (#772).
+      via the standard flow; red is reserved for real failures (guard trips,
+      gate failures, or a failed branch push). GitHub suppresses push-event
+      delivery for ref updates made with GITHUB_TOKEN, so the push trigger
+      never fires on the fallback branch; instead the run explicitly
+      dispatches `ci.yml` on that branch (`POST …/actions/workflows/ci.yml/dispatches`,
+      ref = branch; requires the `workflow_dispatch` trigger that `ci.yml`
+      declares for exactly this purpose). Those check runs land on the same
+      head sha — once green, required checks pass and the auto-PR is mergeable
+      without approving its `action_required` pull_request runs (bot-authored
+      PRs are gated there) (#772, #1744). If the dispatch fails (transient API
+      error), the fallback PR stays gated until someone approves those runs
+      manually. (Push-triggered CI on release branches still works for
+      branches pushed with a real account token — e.g. agent-driven
+      standard-flow release branches.)
 5. Publishes to npm (`latest`, or `dev` for prerelease), tags `v{VERSION}`,
    and creates the GitHub Release with notes generated from `git log` since
    the last tag.

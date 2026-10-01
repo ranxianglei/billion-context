@@ -9,6 +9,7 @@ import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { setLogCapture } from "../src/logger.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 // #1479: the #762 strict-echo repair was chat-completions-only — normalizeStrictEchoBody
 // no-opped on Responses bodies (input[]) and prepareResponses never normalized, so a
@@ -214,6 +215,6 @@ test("#1479: responses-wire main path and loop re-request carry the blank strict
         await close(proxy);
         await close(upstream);
         setLogCapture(null);
-        fs.rmSync(stateDir, { recursive: true, force: true });
+        rmrf(stateDir);
     }
 });
