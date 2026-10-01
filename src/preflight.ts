@@ -58,6 +58,12 @@ const TRANSIENT_EMPTY_SUMMARY_RETRIES = 2;
 // few extra calls instead of burning the full budget on doomed draws.
 // Reset alongside summaryCalls when soft protection is relaxed (#575-merge).
 const TRANSIENT_EMPTY_RETRY_BUDGET = 4;
+// #1841: slack on the futility verdicts below. Range token estimates carry
+// ±~20% error on mixed CJK/Latin/code, and a fold's summary re-enters the
+// payload, so realizable saving is strictly below span mass. Fail CLOSED:
+// skip a doomed round only when the shortfall survives this slack — when
+// unsure, walk exactly as before.
+const FUTILITY_SLACK = 1.2;
 
 // #869 review: coverage bound of the two depth budgets above. One round folds
 // ONE range and each fold removes at most CHUNK_FRACTION x window tokens (the
@@ -939,6 +945,71 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             noteSkip(`all ${viable.length} viable range(s) below minCompressRange (${minChars} chars)`);
         }
         rangesRemaining = ranges.length;
+        if (baselineKnown && ranges.length > 0) {
+            // #1841: round-level futility gate. A fold removes its span's mass
+            // at best (its summary re-enters the payload), so the sum of all
+            // foldable range masses bounds this round's possible saving. When
+            // even that cannot close the gap to the window, no combination of
+            // folds can fit the payload — walking would only burn summarization
+            // calls minutes at a time (incident 08cc0df7: ~9 calls over 5 min,
+            // net −5.5%). Skip with zero calls and an honest detail instead.
+            // The deficit is measured on payloadEstimate (the floorless wire
+            // estimate the caller's forward decision itself uses, #470/#1492),
+            // NOT on currentTokens: the usage-based floor also covers system
+            // prompt + tool definitions that folding cannot remove, so a
+            // floor-pinned deficit would declare futility while folding would
+            // still bring the forwarded payload under the window.
+            // Only RESOLVABLE ranges can ever fold: a range whose refs are
+            // absent from the current state dies in the walk before any summary
+            // call, contributing zero saving. And a pool that is entirely dead
+            // (potential === 0) must still be walked — it spends no calls and
+            // its per-range skip notes are the only record of WHY each
+            // candidate died (#1372 brain-split shape); gating it would mask
+            // that diagnosis behind a window-mis-size verdict.
+            const { refToIdx: gateRefs } = refMaps(messages, deps.session.state);
+            const resolvableMass = (rs: Array<{ startRef: string; endRef: string; tokens: number }>): number => rs.reduce((sum, r) => {
+                const si = gateRefs.get(r.startRef);
+                const ei = gateRefs.get(r.endRef);
+                return si !== undefined && ei !== undefined && si <= ei ? sum + r.tokens : sum;
+            }, 0);
+            let potential = resolvableMass(ranges);
+            const deficit = result.payloadEstimate - limit;
+            if (potential > 0 && deficit > 0 && potential * FUTILITY_SLACK < deficit) {
+                if (!relaxed) {
+                    // The soft-protected recent zone is not in `ranges` yet; #330
+                    // makes it foldable on relax. Probe the relaxed view (CPU-only,
+                    // mirrors the preview convention — kernel entry points return
+                    // new state without mutating the input) before declaring
+                    // futility, or a false positive here regresses the #330 path.
+                    const probe = deps.core.processTurn({
+                        messages,
+                        state: deps.session.state,
+                        config: noEmergencyTruncate(ccrLoopConfig(deps.session, relaxedConfig(deps.config))),
+                        tokenCount: currentTokens,
+                        renderTags: "text-only",
+                        contentStore: contentStoreOf(deps.session),
+                    });
+                    const relaxedRanges = viableRanges(probe.nudge?.compressibleRanges ?? []).filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars);
+                    const relaxedPotential = resolvableMass(relaxedRanges);
+                    if (relaxedPotential * FUTILITY_SLACK >= deficit) {
+                        activeConfig = relaxedConfig(deps.config);
+                        relaxed = true;
+                        target = limit;
+                        summaryCalls = 0;
+                        budgetHit = false;
+                        transientRetryBudget = TRANSIENT_EMPTY_RETRY_BUDGET;
+                        deps.log("warn", `[preflight] foldable mass outside the protected recent zone (~${potential} tok) cannot close the ${deficit}-tok gap; relaxing soft protection up front and retrying (#1841)`);
+                        continue;
+                    }
+                    // The relaxed pool is the superset: quote it as the true bound.
+                    potential = relaxedPotential;
+                }
+                const zoneNote = relaxed ? ", including the relaxed recent zone" : "";
+                failure = { kind: "exhausted", detail: `futile round: the maximum possible saving from all foldable content (~${potential} tokens${zoneNote}) is below the required reduction (~${deficit} tokens) — no combination of folds can bring the payload under the target. Raise the model context window or restart the session.` };
+                deps.log("warn", `[preflight] skipping futile round: max possible saving ~${potential} tok < required ~${deficit} tok${zoneNote}; zero summarization calls spent (#1841)`);
+                break;
+            }
+        }
         if (ranges.length === 0) {
             // #330: nothing foldable outside the soft-protected recent zone.
             // Relax the soft zone (oldest-first within it) and retry — the hard
@@ -967,7 +1038,14 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         }
         const ordered = [...ranges].sort((a, b) => refNum(a.startRef) - refNum(b.startRef));
         let appliedThisRound = 0;
-        for (const range of ordered) {
+        // #1841: set when the mid-walk futility check stops the walk before
+        // every range was tried; the round-end site turns it into a failure
+        // unless the #330 relax path is still available.
+        let futileBail = false;
+        let bailRemaining = 0;
+        let bailDeficit = 0;
+        for (let oi = 0; oi < ordered.length; oi++) {
+            const range = ordered[oi];
             if (currentTokens < target) break;
             if (deps.signal?.aborted) {
                 failure = ABORTED_FAILURE;
@@ -977,6 +1055,34 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             const skipKey = `${range.startRef}:${range.endRef}`;
             if (skipSet.has(skipKey)) continue;
             const { refToIdx } = refMaps(messages, deps.session.state);
+            if (baselineKnown) {
+                // #1841: mid-walk futility bail. Ranges already consumed,
+                // skipped, or unresolvable cannot yield saving; when the live
+                // untried rest of the walk cannot close the gap either, stop
+                // before spending more summarization calls on ranges that
+                // cannot change the outcome. Same payloadEstimate-based deficit
+                // as the pre-walk gate (floor-pinned currentTokens would
+                // overstate what folding can still influence). remaining === 0
+                // means every rest-of-walk candidate is structurally dead —
+                // walking it is call-free and its notes are the diagnosis
+                // (#1372), so bail only when some live mass remains.
+                let remaining = 0;
+                for (let j = oi; j < ordered.length; j++) {
+                    const rj = ordered[j];
+                    if (skipSet.has(`${rj.startRef}:${rj.endRef}`)) continue;
+                    const si = refToIdx.get(rj.startRef);
+                    const ei = refToIdx.get(rj.endRef);
+                    if (si !== undefined && ei !== undefined && si <= ei) remaining += rj.tokens;
+                }
+                const deficit = result.payloadEstimate - limit;
+                if (remaining > 0 && deficit > 0 && remaining * FUTILITY_SLACK < deficit) {
+                    futileBail = true;
+                    bailRemaining = remaining;
+                    bailDeficit = deficit;
+                    deps.log("warn", `[preflight] remaining foldable mass (~${remaining} tok) cannot close the ~${deficit}-tok gap; stopping further summarization calls (#1841)`);
+                    break;
+                }
+            }
             const startIdx = refToIdx.get(range.startRef);
             const endIdx = refToIdx.get(range.endRef);
             if (startIdx === undefined || endIdx === undefined || startIdx > endIdx) {
@@ -1203,6 +1309,18 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             if (failure || budgetHit) break;
         }
         if (appliedThisRound === 0) {
+            // #1841: the mid-walk futility bail becomes a failure here unless the
+            // #330 relax path below is still available (!relaxed AND the payload
+            // overflows the window) — in that case fall through to it; the next
+            // round re-judges on the relaxed view.
+            if (futileBail && !budgetHit && (relaxed || result.payloadEstimate < limit)) {
+                const zoneNote = relaxed ? ", including the relaxed recent zone" : "";
+                // #1372 contract: per-range skip notes are the diagnosis of WHY
+                // candidates died — carry them into the bail verdict too.
+                const skipNote = skipReasons.length > 0 ? ` Skipped: ${skipReasons.slice(0, 3).join(" | ")}.` : "";
+                failure = { kind: "exhausted", detail: `futile round: after the folds so far, the remaining foldable content (~${bailRemaining} tokens${zoneNote}) cannot close the ~${bailDeficit}-token gap to the target even if every remaining range folded successfully.${skipNote} Raise the model context window or restart the session.` };
+                break;
+            }
             if (!failure && !budgetHit && !relaxed && (baselineKnown ? result.payloadEstimate : finalUpper) >= limit) {
                 activeConfig = relaxedConfig(deps.config);
                 relaxed = true;
