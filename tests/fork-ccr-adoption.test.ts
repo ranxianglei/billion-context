@@ -11,6 +11,7 @@ import { mkdtempSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
+    buildStoredPlaceholder,
     createContentStore,
     createCore,
     defaultConfig,
@@ -98,7 +99,7 @@ function armParent(body: Body, fold: { startId: string; endId: string }, ccr: bo
     return { parent, core, config, blockId: block.blockId, turnMsgs: turn.messages };
 }
 
-function forkChild(a: Armed, forkBody: Body): Session {
+function forkChild(a: Armed, forkBody: Body, log?: (level: string, msg: string) => void): Session {
     const child = getSession(sid("child"), META);
     maybeAdoptForkBlocks({
         session: child,
@@ -107,7 +108,7 @@ function forkChild(a: Armed, forkBody: Body): Session {
         parsed: forkBody,
         upstreamOrigin: META.upstreamOrigin,
         enabled: true,
-        log: () => {},
+        log: log ?? (() => {}),
     });
     return child;
 }
@@ -278,6 +279,189 @@ test("refs cited by placeholder-shaped incoming messages are adopted too (#1341)
     const reAck = executeRetrieve({ ref: "m00007" }, child);
     assert.match(reAck, /acp-retrieved #m00007/);
     assert.ok(reAck.includes(BIG_B.slice(0, 200)), "still retrievable in the tool result after the fold");
+});
+
+test("decision fixture (#1458): parent-only ref cited by a placeholder IS copied + retrievable (Option A semantics)", () => {
+    // #1458 (the issue's m00099 fixture at real ref numbering): the cited ref
+    // is NOT covered by any adopted block, NOT in the child's ref space, and
+    // its raw message is absent from the child's shared history — yet it is
+    // copied and retrievable. Pins the DECIDED Option-A semantics: a fork is
+    // the same lineage/principal as the parent store, so a valid-looking
+    // citation grants access to the named entry; volume is capped separately
+    // (see the cap tests below).
+    const PARENT_ONLY = "PARENT BRANCH ONLY CONTENT ".repeat(200);
+    const body: Body = {
+        model: "test-model",
+        messages: [
+            { role: "user", content: "setup question" },      // m00001
+            ...toolPair("call_a", "build ok"),                 // m00002, m00003
+            { role: "assistant", content: "answer A" },        // m00004
+            { role: "user", content: "follow-up" },            // m00005
+            { role: "assistant", content: "plan: run tests" }, // m00006
+            { role: "user", content: "go ahead" },             // m00007
+            ...toolPair("call_p", PARENT_ONLY),                // m00008, m00009 (parent-only branch)
+            { role: "assistant", content: "parent finished" }, // m00010
+        ],
+    };
+    const armed = armParent(body, { startId: "m00001", endId: "m00007" }, true);
+    const pstore = contentStoreOf(armed.parent);
+    // Fold-time storing covers the whole span; m00009 was stored at arrival.
+    assert.deepEqual(Object.keys(pstore.byRef).sort(), ["m00001", "m00002", "m00003", "m00004", "m00005", "m00006", "m00007", "m00009"]);
+    assert.equal(pstore.byHash[pstore.byRef["m00009"]!.hash], PARENT_ONLY);
+    const parentBefore = JSON.stringify(armed.parent.contentStore);
+
+    // The parent's own view carries the arrival-time placeholder for m00009.
+    const ph = armed.turnMsgs.find((m) => String(m.text ?? "").includes(STORED_PLACEHOLDER_MARKER));
+    assert.ok(ph, "parent view holds an arrival-time placeholder");
+    const placeholderText = String(ph.text);
+    assert.match(placeholderText, /#m00009/);
+
+    // Fork: shared prefix verbatim + a regenerate branch whose tool result is
+    // that placeholder. The raw PARENT_ONLY bytes are nowhere in the fork.
+    const forkBody: Body = {
+        model: "test-model",
+        messages: [
+            ...body.messages.slice(0, 7),
+            { role: "user", content: "regenerate: different approach" },
+            { role: "assistant", content: "taking a cleaner path" },
+            { role: "user", content: "yes go" },
+            ...toolPair("call_fork", placeholderText),
+            { role: "assistant", content: "continuing" },
+            { role: "user", content: "did it work?" },
+            { role: "assistant", content: "yes, fixed" },
+        ],
+    };
+    const adopted: string[] = [];
+    const child = forkChild(armed, forkBody, (level, msg) => { if (level === "info") adopted.push(msg); });
+
+    assert.equal(child.state.blocks.length, 1);
+    assert.ok(child.state.blocks[0].active);
+    assert.equal(child.state.blocks[0].blockId, armed.blockId);
+
+    const cstore = contentStoreOf(child);
+    // Option A (#1458, decided): the parent-only ref, not covered by any
+    // adopted block, is copied because a placeholder in the incoming names it
+    // — nothing else links it into the child.
+    assert.ok(cstore.byRef["m00009"], "parent-only cited ref copied (Option A semantics, #1458)");
+    assert.equal(cstore.byHash[cstore.byRef["m00009"]!.hash], PARENT_ONLY, "true original, exact bytes");
+    // ...but it is NOT part of the child's ref space: no incoming message
+    // carries that raw id, so messageRefs stays empty of it.
+    assert.equal(child.state.messageRefs.byRef["m00009"], undefined);
+    // Retrieve honors the citation (store lookup, ref-space independent).
+    const retrievedText = executeRetrieve({ ref: "m00009" }, child) as string;
+    assert.match(retrievedText, /acp-retrieved #m00009/);
+    assert.ok(typeof retrievedText === "string" && retrievedText.includes(PARENT_ONLY.slice(0, 200)), "tool result carries the true original (v2)");
+    // Covered refs ride along too (the union, not the citation alone).
+    assert.ok(cstore.byRef["m00003"]);
+    assert.equal(cstore.byHash[cstore.byRef["m00003"]!.hash], "build ok");
+    // Independence: mutating the child's adopted entry leaves the parent intact.
+    assert.notEqual(cstore, armed.parent.contentStore);
+    cstore.byRef["m00009"].head = "MUTATED";
+    assert.notEqual(armed.parent.contentStore!.byRef["m00009"].head, "MUTATED");
+    assert.equal(JSON.stringify(armed.parent.contentStore), parentBefore);
+    // #1458 observability: the adoption log splits covered vs cited-only.
+    const line = adopted.find((m) => m.includes("CCR content-store entr"));
+    assert.ok(line, "adoption log line present");
+    assert.match(line!, /7 covered by adopted blocks, 1 cited-only \(m00009\)/);
+});
+
+test("cited-only copies are capped by count (#1458 Option A hygiene)", () => {
+    const body: Body = {
+        model: "test-model",
+        messages: [
+            { role: "user", content: "setup question" },
+            ...toolPair("call_a", "build ok"),
+            { role: "assistant", content: "answer A" },
+            { role: "user", content: "follow-up" },
+            ...toolPair("call_b", BIG_B),
+            { role: "user", content: "next task" },
+            { role: "assistant", content: "plan: run tests" },
+            { role: "user", content: "go ahead" },
+        ],
+    };
+    const armed = armParent(body, { startId: "m00001", endId: "m00004" }, true);
+    // Fabricate a citation run beyond the count cap (128): 130 stored
+    // parent-only entries named m01001..m01130.
+    const pstore = contentStoreOf(armed.parent);
+    for (let i = 1; i <= 130; i++) {
+        const ref = `m${String(1000 + i).padStart(5, "0")}`;
+        const text = `fabricated stored output ${i} ` + "x".repeat(200);
+        pstore.byHash[`fab-${i}`] = text;
+        pstore.byRef[ref] = { hash: `fab-${i}`, rawId: `raw-${i}`, kind: "shell output", tokens: 60, chars: text.length, head: `fabricated ${i}` };
+    }
+    const msgs: Body["messages"] = [...body.messages.slice(0, 5)];
+    for (let i = 1; i <= 130; i++) {
+        const ref = `m${String(1000 + i).padStart(5, "0")}`;
+        msgs.push({ role: "user", content: buildStoredPlaceholder({ ref, kind: "shell output", tokens: 60, head: `fabricated ${i}`, retrieveToolName: "acp_retrieve" }) });
+    }
+    const forkBody: Body = { model: "test-model", messages: msgs };
+    const warns: string[] = [];
+    const child = forkChild(armed, forkBody, (level, msg) => { if (level === "warn") warns.push(msg); });
+
+    const cstore = contentStoreOf(child);
+    // First 128 citations in order are honored; the last two are dropped.
+    for (let i = 1; i <= 128; i++) {
+        const ref = `m${String(1000 + i).padStart(5, "0")}`;
+        assert.ok(cstore.byRef[ref], `${ref} copied`);
+    }
+    for (const ref of ["m01129", "m01130"]) {
+        assert.equal(cstore.byRef[ref], undefined, `${ref} beyond the count cap`);
+        assert.match(executeRetrieve({ ref }, child), /not found/, `honest miss for ${ref}`);
+    }
+    // Covered refs are never capped (m00007 is neither covered nor cited here
+    // and must NOT ride along — the union seed, not the whole store).
+    assert.ok(cstore.byRef["m00003"]);
+    assert.equal(cstore.byRef["m00007"], undefined);
+    // The skip is logged loudly with the offending refs.
+    assert.equal(warns.length, 1);
+    assert.match(warns[0], /2 cited-only ref\(s\) beyond the copy cap \(128 refs \/ 4194304 bytes\), not copied: m01129, m01130/);
+});
+
+test("cited-only copies are capped by total bytes (#1458 Option A hygiene)", () => {
+    const body: Body = {
+        model: "test-model",
+        messages: [
+            { role: "user", content: "setup question" },
+            ...toolPair("call_a", "build ok"),
+            { role: "assistant", content: "answer A" },
+            { role: "user", content: "follow-up" },
+            ...toolPair("call_b", BIG_B),
+            { role: "user", content: "next task" },
+            { role: "assistant", content: "plan: run tests" },
+            { role: "user", content: "go ahead" },
+        ],
+    };
+    const armed = armParent(body, { startId: "m00001", endId: "m00004" }, true);
+    // Three parent-only entries: 2.5 MiB + 2.5 MiB + 1 KiB against a 4 MiB
+    // budget — the second overflows and is skipped without stopping the scan.
+    const pstore = contentStoreOf(armed.parent);
+    const big = "y".repeat(Math.floor(2.5 * 1024 * 1024));
+    const small = "z".repeat(1024);
+    pstore.byHash["big-1"] = big;
+    pstore.byRef["m02001"] = { hash: "big-1", rawId: "raw-b1", kind: "shell output", tokens: 600_000, chars: big.length, head: "big one" };
+    pstore.byHash["big-2"] = big;
+    pstore.byRef["m02002"] = { hash: "big-2", rawId: "raw-b2", kind: "shell output", tokens: 600_000, chars: big.length, head: "big two" };
+    pstore.byHash["small-3"] = small;
+    pstore.byRef["m02003"] = { hash: "small-3", rawId: "raw-s3", kind: "shell output", tokens: 30, chars: small.length, head: "small three" };
+    const ph = (ref: string, head: string) => ({ role: "user" as const, content: buildStoredPlaceholder({ ref, kind: "shell output", tokens: 100, head, retrieveToolName: "acp_retrieve" }) });
+    const forkBody: Body = {
+        model: "test-model",
+        messages: [
+            ...body.messages.slice(0, 5),
+            ph("m02001", "big one"),
+            ph("m02002", "big two"),
+            ph("m02003", "small three"),
+        ],
+    };
+    const warns: string[] = [];
+    const child = forkChild(armed, forkBody, (level, msg) => { if (level === "warn") warns.push(msg); });
+
+    const cstore = contentStoreOf(child);
+    assert.ok(cstore.byRef["m02001"], "first entry fits the byte budget");
+    assert.equal(cstore.byRef["m02002"], undefined, "second entry overflows the budget");
+    assert.ok(cstore.byRef["m02003"], "scan continues past an overflowed entry");
+    assert.equal(warns.length, 1);
+    assert.match(warns[0], /1 cited-only ref\(s\) beyond the copy cap .* not copied: m02002/);
 });
 
 test("child persists its own companion and survives a proxy restart (#1341)", () => {

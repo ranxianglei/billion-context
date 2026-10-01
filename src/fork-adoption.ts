@@ -70,6 +70,16 @@ import type { WireProtocol } from "./util.js";
  *  correctness risk). */
 const SUPPORTED: ReadonlySet<WireProtocol> = new Set<WireProtocol>(["openai", "anthropic"]);
 
+// #1458 (Option A, owner decision): a fork is a same-lineage convenience, not
+// an isolation boundary — prefix affinity identifies it byte-exactly, so the
+// only party able to cite a parent ref owns the parent store too. Citations
+// are therefore HONORED (a valid-looking placeholder grants access to the
+// named entry); only their volume is capped so a fabricated or stale citation
+// run cannot drag unbounded parent content into the child. Covered refs
+// (adopted-block provenance) are never capped.
+const MAX_CITED_ONLY_REFS = 128;
+const MAX_CITED_ONLY_BYTES = 4 * 1024 * 1024;
+
 export interface ForkAdoptionPlan {
     /** Blocks to seed (active adoptables + their tier children, inactive). */
     blocks: CompressionBlock[];
@@ -115,7 +125,9 @@ export function incomingCoreIds(protocol: WireProtocol, parsed: unknown): Set<st
  *  message's own bytes differ from the original's, so its raw id maps to no
  *  parent ref — the citation embedded in the placeholder is the only link
  *  back to the stored original, and arrival-time storing skips placeholder
- *  text by design, so nothing else can restore it. */
+ *  text by design, so nothing else can restore it. Honor scope per #1458
+ *  (Option A): same lineage as the parent store, so citations grant access
+ *  to the named entries (volume-capped where they are collected). */
 function citedPlaceholderRefs(msgs: CoreMessage[]): string[] {
     const refs: string[] = [];
     for (const m of msgs) {
@@ -275,12 +287,35 @@ export function maybeAdoptForkBlocks(args: {
     // #1341: carry the originals behind the refs the fork now advertises as
     // retrievable — covered messages of the adopted blocks ∪ refs cited by
     // placeholder-shaped incoming messages (their originals left the view).
-    const wanted = new Set([...Object.keys(plan.refs.byRef), ...citedPlaceholderRefs(incomingMsgs)]);
-    const storeSlice = cloneStoreForRefs(contentStoreOf(parent), wanted);
+    // #1458 (Option A): citations are honored but volume-capped; covered refs
+    // ride on block provenance and are never capped. Skips are logged loudly.
+    const coveredRefs = new Set(Object.keys(plan.refs.byRef));
+    const pstore = contentStoreOf(parent);
+    const citedChosen: string[] = [];
+    let citedBytes = 0;
+    const citedSkipped: string[] = [];
+    for (const ref of new Set(citedPlaceholderRefs(incomingMsgs))) {
+        if (coveredRefs.has(ref)) continue;
+        const entry = pstore.byRef[ref];
+        if (!entry) continue;
+        const bytes = Buffer.byteLength(pstore.byHash[entry.hash] ?? "", "utf8");
+        if (citedChosen.length >= MAX_CITED_ONLY_REFS || citedBytes + bytes > MAX_CITED_ONLY_BYTES) {
+            citedSkipped.push(ref);
+            continue;
+        }
+        citedChosen.push(ref);
+        citedBytes += bytes;
+    }
+    if (citedSkipped.length > 0) {
+        log("warn", `[fork-adoption] fork of ${parentId}: ${citedSkipped.length} cited-only ref(s) beyond the copy cap (${MAX_CITED_ONLY_REFS} refs / ${MAX_CITED_ONLY_BYTES} bytes), not copied: ${citedSkipped.slice(0, 8).join(", ")}${citedSkipped.length > 8 ? ` (+${citedSkipped.length - 8} more)` : ""} (#1458)`);
+    }
+    const storeSlice = cloneStoreForRefs(pstore, [...coveredRefs, ...citedChosen]);
     if (storeSlice) {
         adoptContentStore(session, storeSlice);
-        const n = Object.keys(storeSlice.byRef).length;
-        log("info", `[fork-adoption] session ${session.id} adopted ${n} CCR content-store entr${n === 1 ? "y" : "ies"} for the covered/cited refs from parent ${parentId} (#1341)`);
+        const keys = Object.keys(storeSlice.byRef);
+        const coveredIn = keys.filter((r) => coveredRefs.has(r)).length;
+        const citedIn = keys.filter((r) => !coveredRefs.has(r));
+        log("info", `[fork-adoption] session ${session.id} adopted ${keys.length} CCR content-store entr${keys.length === 1 ? "y" : "ies"} from parent ${parentId}: ${coveredIn} covered by adopted blocks${citedIn.length > 0 ? `, ${citedIn.length} cited-only (${citedIn.join(", ")})` : ""} (#1341/#1458)`);
     }
 }
 
