@@ -130,9 +130,15 @@ free (the `npm test` glob doesn't cover `tests/e2e/` anyway).
   registry for …`, `new version found: … downloading…`, `installed … → ….
   Restart to finish.`) plus the on-disk `package.json` flip, leftover
   staging/backup dirs, and lock release.
-- **Deferred scenarios.** Zero-registry-round-trip resolution (#1108) and the
-  `#1149` tag-cleanup regression are next up on this infra; the pinned-entry
-  re-pin assertion lands with PR #1143 (marked in the test as `TODO(#1143)`).
+- **Pinned-entry scenarios (#1108).** The revived PR #1143 assertions run here:
+  post-update `plugin install opencode` migrates a legacy bare entry to an
+  exact version pin (idempotent at the same version); an opencode-managed old
+  copy self-updates by re-pinning its entry through the update check's refusal
+  branch — never writing itself (#991); and an exact pinned spec resolves
+  offline from npm's local cache byte-identical (`npm pack --offline`) — the
+  boot-locality mechanism that removes the restart-loop trigger.
+- **Deferred scenarios.** The `#1149` tag-cleanup regression is next up on
+  this infra.
 
 ## CI
 
