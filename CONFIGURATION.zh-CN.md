@@ -582,6 +582,17 @@
   { "providers": { "https://your-relay.example": { "compress": { "outputSteering": { "enabled": true, "verbosityLevel": 3 } } } } }
   ```
 
+#### `nudgeLowEffort`
+
+- **类型：** `boolean`
+- **默认值：** `false`
+- **状态：** EXPERIMENTAL（可选开启）
+- **说明：** 削减模型在"写压缩摘要"那一轮烧掉的 *思考* token。思考型模型恰好在这一轮会花掉一大笔 reasoning 预算（issue #853 实测约 9.5k reasoning token），且按输出计费、流式即产生费用。开启后，每个压缩 nudge 回合的**第一个**响应会把其已存在的 effort 字段钳制到 wire 下限——复用 `outputSteering` 的"只降不升"下限（Anthropic `thinking.budget_tokens` 下限 1024、Gemini `generationConfig.thinkingConfig.thinkingBudget` 下限 128、OpenAI `reasoning_effort` → `low`、Responses `reasoning.effort` → `low`）。**一次性**：下一个请求即恢复正常 effort；模型若延后、连续多轮重复收到同一 nudge 不会重复钳制，但之后新的 nudge 回合会再次钳制。只降不升——绝不注入客户端未发送的 effort 字段、绝不抬高取值，也不可能击穿 prompt 缓存（effort 是消息前缀之外的请求参数）。与 `outputSteering.enabled` 相互独立（输出侧压缩关闭时同样生效）。四条 wire 均适用；v1 仅全局层。代价：降低思考可能削弱模型判断"是否要延后压缩"（"现在在干活，稍后再说"）的能力，请关注每次命中钳制时打印的 `[nudge-low-effort]` 日志行。默认关闭——不开启则行为逐字节不变。见 issue #1640。
+  ```jsonc
+  // 全局开启
+  { "compress": { "nudgeLowEffort": true } }
+  ```
+
 #### `stripImages`
 
 - **类型：** `boolean`
@@ -694,6 +705,7 @@
 | `maxContextLimit` | provider（第 2 层） | `"70%"` |
 | `emergencyThresholdPercent` | 模型（第 3 层） | `"90%"` |
 | `nudgeGrowthTokens` | 全局（第 1 层） | `50000` |
+| `nudgeLowEffort` | 全局（第 1 层） | `false` |
 | `preserveRecentMessages` | provider（第 2 层） | `8` |
 | `modelContextLimit` | 模型（第 3 层） | `180000` |
 | `tiers` | 全局（第 1 层） | `true` |

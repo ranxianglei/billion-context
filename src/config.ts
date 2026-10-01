@@ -132,6 +132,15 @@ export type CompressSettings = {
      *  adaptive band to a fixed step (sets both `nudge.growthFloor` and
      *  `nudge.growthCap`). */
     nudgeGrowthTokens?: number;
+    /** #1640 PR#1: on the FIRST turn of a compression-nudge episode, clamp the
+     *  request's thinking/effort parameter down to the wire floor for that one
+     *  request (restore on the next). Targets the summary-writing turn — the
+     *  model thinks less while folding — without touching the prefix cache
+     *  (effort is a request param, not message bytes). Clamp-only + floor-
+     *  preserving (reuses the output-steering lowering); default OFF and
+     *  honored at the GLOBAL compress level in v1 (per-provider/model scoping
+     *  is a planned follow-up). */
+    nudgeLowEffort?: boolean;
     /** Trailing messages never offered for compression
      *  (kernel `preserveRecentMessages`). */
     preserveRecentMessages?: number;
@@ -1445,6 +1454,10 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     if ("rules" in obj) {
         if (typeof obj.rules !== "boolean") ok = false;
         else out.rules = obj.rules;
+    }
+    if ("nudgeLowEffort" in obj) {
+        if (typeof obj.nudgeLowEffort !== "boolean") ok = false;
+        else out.nudgeLowEffort = obj.nudgeLowEffort;
     }
     // Injection toggles are file-level fields (FileConfig.compress) honored by
     // loadOptions via `=== false`; the web UI shows them from the raw file

@@ -457,3 +457,24 @@ export function applyOutputSteeringJson(parsed: Record<string, unknown>, protoco
     }
     return labels;
 }
+
+// #1640 PR#1: one-shot thinking/effort clamp for the FIRST turn of a
+// compression-nudge episode. Reuses the same clamp-only, wire-floor-preserving
+// lowering as effort routing (never injects a field the client omitted, never
+// drops below the provider minimum budget) but is driven by bili's own fresh-
+// nudge signal rather than the kernel's mechanical-turn classifier, so it works
+// regardless of `outputSteering.enabled`. String-based so it lands on the final
+// wire body like every other forward-boundary lever; byte-identical when there
+// is nothing to lower (effort absent or already at/below floor).
+export function applyNudgeEffortClamp(body: string, protocol: WireProtocol | null): { body: string; changed: boolean } {
+    if (!protocol) return { body, changed: false };
+    let obj: unknown;
+    try { obj = JSON.parse(body); } catch { return { body, changed: false }; }
+    if (!obj || typeof obj !== "object" || Array.isArray(obj)) return { body, changed: false };
+    const changed = lowerEffort(obj as Record<string, unknown>, protocol);
+    return { body: changed ? JSON.stringify(obj) : body, changed };
+}
+
+export function nudgeLowEffortDecision(injected: boolean, prevInjected: boolean, enabled: boolean): { clamp: boolean; nextPrev: boolean } {
+    return { clamp: enabled && injected && !prevInjected, nextPrev: injected };
+}

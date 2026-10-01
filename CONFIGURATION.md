@@ -582,6 +582,17 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
   { "providers": { "https://your-relay.example": { "compress": { "outputSteering": { "enabled": true, "verbosityLevel": 3 } } } } }
   ```
 
+#### `nudgeLowEffort`
+
+- **Type:** `boolean`
+- **Default:** `false`
+- **Status:** EXPERIMENTAL (opt-in)
+- **Description:** Cut the *thinking* tokens burned on the turn where the model writes a compression summary. Thinking models routinely spend a large reasoning budget on exactly that turn (~9.5k reasoning tokens observed, issue #853), billed as output the instant it streams. When enabled, the **first** response of each compression-nudge episode gets its already-present effort field clamped toward the wire minimum — reusing `outputSteering`'s clamp-only floors (Anthropic `thinking.budget_tokens` floor 1024, Gemini `generationConfig.thinkingConfig.thinkingBudget` floor 128, OpenAI `reasoning_effort` → `low`, Responses `reasoning.effort` → `low`). It is **one-shot**: the next request restores normal effort; a nudge the model defers and re-receives on consecutive turns does not re-clamp, but a later new nudge episode clamps again. Clamp-only — never injects an effort field the client did not send, never raises a value, and cannot bust the prompt cache (effort is a request parameter outside the message prefix). Independent of `outputSteering.enabled` (applies even when output steering is off). Applies to all four wires; global-level in v1. Trade-off: lower thinking can reduce the model's judgment about *whether* to defer compression ("working now, later"), so watch the `[nudge-low-effort]` log line emitted whenever the clamp lands. Off by default — behavior is byte-for-byte unchanged unless you opt in. See issue #1640.
+  ```jsonc
+  // enable globally
+  { "compress": { "nudgeLowEffort": true } }
+  ```
+
 #### `stripImages`
 
 - **Type:** `boolean`
@@ -694,6 +705,7 @@ For a request to `https://api.anthropic.com/v1/messages` with model `claude-sonn
 | `maxContextLimit` | provider (level 2) | `"70%"` |
 | `emergencyThresholdPercent` | model (level 3) | `"90%"` |
 | `nudgeGrowthTokens` | global (level 1) | `50000` |
+| `nudgeLowEffort` | global (level 1) | `false` |
 | `preserveRecentMessages` | provider (level 2) | `8` |
 | `modelContextLimit` | model (level 3) | `180000` |
 | `tiers` | global (level 1) | `true` |
