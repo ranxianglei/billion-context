@@ -163,7 +163,7 @@ export async function checkTunnelDestination(origin: string, ctx: TunnelCheckCon
         return { ok: false, code: "invalid", message: `invalid tunnel destination ${origin}` };
     }
     const host = u.hostname.replace(/^\[|\]$/g, "").toLowerCase();
-    const port = u.port ? Number(u.port) : u.protocol === "https:" ? 443 : 80;
+    const port = u.port ? Number(u.port) : u.protocol === "https:" || u.protocol === "wss:" ? 443 : 80;
     let ips: string[];
     const literal = parseIpLiteral(host);
     if (literal) {

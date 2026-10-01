@@ -201,6 +201,20 @@ test("checkTunnelDestination: default ports by scheme", async () => {
     const httpsNoPort = await checkTunnelDestination("https://169.254.169.254/", { selfPort: 8787, clientLoopback: true, allowlist: [], localIps });
     assert.equal(httpsNoPort.ok, false);
     assert.equal(httpsNoPort.code, "linkLocal", "scheme-default 443 still classified");
+    // #1472 review: wss connects on 443, so a portless wss:// destination must
+    // be admitted as 443 — otherwise allowlist host:443 entries and the self
+    // layer (when the proxy listens on 443) are evaluated against port 80.
+    const wssSelf = await checkTunnelDestination("wss://127.0.0.1", { selfPort: 443, clientLoopback: false, allowlist: [], localIps });
+    assert.equal(wssSelf.ok, false);
+    assert.equal(wssSelf.code, "self", "portless wss on the serving port is self");
+    const wssAllow = await checkTunnelDestination("wss://lanrelay.example", {
+        selfPort: 8787,
+        clientLoopback: false,
+        allowlist: ["lanrelay.example:443"],
+        localIps,
+        resolveHost: stubResolve({ "lanrelay.example": ["10.0.0.9"] }),
+    });
+    assert.equal(wssAllow.ok, true, "host:443 allowlist entry matches a portless wss destination");
 });
 
 test("tunnelAllowlistFromEnv: comma parsing, case normalization, blanks dropped", () => {

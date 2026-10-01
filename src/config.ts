@@ -627,6 +627,17 @@ export type ProxyOptions = {
      *  hosts are TLS-terminated locally and fed back into the same request
      *  pipeline; all other hosts are blind-tunnelled. */
     mitm: { enabled: boolean; domains: string[] };
+    /** Opt-in transparent WebSocket relay (#1467, default OFF). When enabled,
+     *  WS upgrades addressed to the proxy are replayed at the real upstream
+     *  and piped as opaque byte streams on 101 — frames are never parsed, so
+     *  these sessions get NO compression. Enable with `ws.passthrough: true`
+     *  in the config file or env BILI_WS_PASSTHROUGH=1 (env wins). */
+    wsPassthrough?: boolean;
+    /** Where `wsPassthrough` came from: "env" (BILI_WS_PASSTHROUGH), "file"
+     *  (config `ws.passthrough: true`), or null (default off — every upgrade
+     *  answers the Codex fast-fallback 426, #2). Drives the boot warning and
+     *  the web panel's source display. */
+    wsPassthroughSource?: "env" | "file" | null;
     /** Mask non-public target hosts in proxy logs (#255, default on when
      *  omitted). Opt out for local debugging with env BILI_LOG_MASK_HOSTS=0
      *  or `maskHosts: false` (#897); credential masking stays on either way. */
@@ -1065,6 +1076,10 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
                 ...splitCsv(env.BILI_MITM_DOMAINS),
             ]),
         },
+        // Default OFF (#1467): the 426 answer to every upgrade is the Codex
+        // fast-fallback contract (#2); transparent relay requires explicit opt-in.
+        wsPassthrough: (env.BILI_WS_PASSTHROUGH ?? (fileConfig.ws?.passthrough === true ? "1" : "0")) !== "0",
+        wsPassthroughSource: env.BILI_WS_PASSTHROUGH !== undefined ? "env" : fileConfig.ws?.passthrough === true ? "file" : null,
         maskHosts: (env.BILI_LOG_MASK_HOSTS ?? (fileConfig.maskHosts === false ? "0" : "1")) !== "0",
         subagentSplit: (env.BILI_SUBAGENT_SPLIT ?? (fileConfig.subagentSplit === false ? "0" : "1")) !== "0",
         forkAdoption: (env.BILI_FORK_ADOPTION ?? (fileConfig.forkAdoption === true ? "1" : "0")) !== "0",
@@ -1150,6 +1165,13 @@ type FileConfig = {
     compress?: CompressSettings & { injectTool?: boolean; injectNudge?: boolean };
     promptCache?: { routing?: string };
     mitm?: { enabled?: boolean; domains?: string[] };
+    /** Opt-in transparent WebSocket relay (#1467): set `passthrough: true` to
+     *  accept WS upgrades addressed to the proxy and relay them to the real
+     *  upstream as opaque byte pipes — NO compression for those connections
+     *  (frames are never parsed). Default false: every upgrade answers 426
+     *  (Codex fast-fallback, #2). Env BILI_WS_PASSTHROUGH=1/0 wins over the
+     *  file. */
+    ws?: { passthrough?: boolean };
     /** Set `false` to log real (non-public) target hosts instead of the
      *  `<private-host>` placeholder (#897; env BILI_LOG_MASK_HOSTS=0 wins). */
     maskHosts?: boolean;

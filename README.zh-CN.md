@@ -286,6 +286,19 @@ bili --no-auto-update        # 本次启动禁用自动更新
 - `/bili/<绝对URL>` 目的地准入(#409):代理自身与 link-local/metadata 地址一律拒绝;loopback/私网目的地对本地客户端放行(自托管上游)、对远程客户端拒绝,除非列入 `BILI_TUNNEL_ALLOWED_HOSTS`(`host` 或 `host:port`,逗号分隔)。一个例外(#1073):**本地**客户端经**loopback IP 字面量**目的地转发管理路径(`/__bili/*`、`/__acp/*`)时不带标记放行;远程 peer 与主机名目的地无条件保留内部隧道标记,管理路径即使经 NAT hairpin 也无法穿过隧道。指向本实例自身管理端点的绝对形式请求会在本地直接应答、而不是经隧道转发(正向代理式健康探测能拿到真实响应)。
 - **没有任何鉴权**:只应在可信局域网或防火墙内使用。`/__bili/` 管理端点仍仅限本机访问。启动时的 `[security]` 警告会提醒上述事项。
 
+### WebSocket 流量（可选开启）
+
+压缩管线只处理 HTTP 请求/响应 + SSE。WebSocket 升级默认立即回答
+`426 Upgrade Required` —— 这个干净的快速回退正是 Codex 等 WS 优先客户端依赖的
+行为(#2)。对只有 WS 通道的上游(如 OpenAI Realtime API),可以**可选开启透明直通**:
+配置文件里写 `"ws": {"passthrough": true}`(或 `BILI_WS_PASSTHROUGH=1`)。届时指向
+`/bili/wss://…`、绝对形式 `wss(s)://…`、或 MITM 解密连接的升级请求会被当作
+**不透明字节管道**转发到真实上游 —— **帧永不解析,这些会话不做任何压缩**(启动时
+醒目警告 + Web UI 横幅)。直连目标与 `/bili/` 隧道走同一套 #409 准入检查;非
+`101` 的上游应答原样转发,连接/握手失败回答 `502`。针对特定 WS 协议的协议感知
+压缩是刻意延后的后续工作(#1467 Phase 2)。详见
+[CONFIGURATION.md → `ws`](CONFIGURATION.md#ws)。
+
 
 ### 调试
 

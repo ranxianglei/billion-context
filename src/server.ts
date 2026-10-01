@@ -113,6 +113,7 @@ import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } f
 import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, isPluginFoldCallId, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "./plugin.js";
 import { setupMitm, readMitmUpstream, getBlindTunnelStats, liveBlindTunnels } from "./mitm.js";
 import { evaluateChain, extractChainCarriers, stampOutbound, stripEmbeddedChainCarriers } from "./chain-checkpoint.js";
+import { handleWsUpgrade } from "./ws-passthrough.js";
 import type { BiliMessage } from "acp-kernel/wire";
 import { BILI_PASSTHROUGH_HEADER, BILI_PLUGIN_BYPASS_HEADER, hardenOpenaiAssistantContent, isLoopbackAddress, inspectContextOverflow, reserveOutputHeadroom, resolveOutputHeadroomCap, shouldReserveOutputHeadroom, systemToUser, usageOutputTotal, usageTotals, type ContextOverflowInfo, type WireProtocol } from "./util.js";
 import { safePrefix, safeSuffix } from "./text-safe.js";
@@ -448,12 +449,16 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             }
         }
     });
-    // Bili does not support WebSocket. An explicit 'upgrade' listener is
-    // required: without one Node's behavior is version-dependent (some
-    // versions destroy the socket with no response), delaying clients with
-    // built-in fast-fallback (e.g. Codex) that need a clean 426 to switch to
-    // HTTP POST immediately.
-    server.on("upgrade", (req, socket) => {
+    // Bili does not support WebSocket by default. An explicit 'upgrade'
+    // listener is required: without one Node's behavior is version-dependent
+    // (some versions destroy the socket with no response), delaying clients
+    // with built-in fast-fallback (e.g. Codex) that need a clean 426 to
+    // switch to HTTP POST immediately. #1467: when ws.passthrough is opted
+    // in, routable upgrades are relayed to the real upstream as opaque byte
+    // pipes (NO compression — frames are never parsed); every other case
+    // still gets this exact 426, byte-for-byte unchanged.
+    const rejectUpgrade426 = (req: http.IncomingMessage): void => {
+        const socket = req.socket;
         log("info", `[ws] rejected ${req.method} ${maskUrlsInText(req.url ?? "")} host=${req.headers.host ? maskHostPortForLog(req.headers.host) : "?"} with 426`);
         socket.on("error", () => {}); // client may vanish mid-write; don't let ECONNRESET crash the process
         const body = JSON.stringify({ error: "WebSocket upgrades are not supported; use HTTP POST" });
@@ -465,6 +470,23 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 "\r\n" +
                 body,
         );
+    };
+    server.on("upgrade", (req, _socket, head) => {
+        if (!opts.wsPassthrough) {
+            rejectUpgrade426(req);
+            return;
+        }
+        void handleWsUpgrade(req, req.socket, {
+            selfPort: req.socket.localPort ?? undefined,
+            clientLoopback: isLoopbackAddress(req.socket.remoteAddress),
+            allowlist: tunnelAllowlist,
+            routes: opts.routes,
+            proxy: opts.proxy,
+            proxyFallback: opts.proxyFallback,
+            log,
+        }, head).then((handled) => {
+            if (!handled) rejectUpgrade426(req);
+        });
     });
     // #1452: explicit keep-alive idle budget. Node's implicit default is
     // 5000ms; the default here matches it exactly (zero behavior change), but
@@ -730,8 +752,19 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 ` — zero-config: prefix any baseURL with http://${displayHost}:${actualPort}/bili/` +
                 (nOverrides ? ` — context overrides for ${nOverrides} upstream URL(s)` : "")
                 + (opts.mitm.enabled ? ` — MITM proxy on (whitelist)${opts.mitm.domains.length ? ` +${opts.mitm.domains.join(",")}` : ""}` : "")
-                + (opts.passthrough ? " — PASSTHROUGH (compression OFF)" : ""),
+                + (opts.passthrough ? " — PASSTHROUGH (compression OFF)" : "")
+                + (opts.wsPassthrough ? " — WS PASSTHROUGH (WS sessions uncompressed)" : ""),
         );
+        if (opts.wsPassthrough) {
+            log(
+                "warn",
+                `[ws] WebSocket passthrough is ON — upgraded connections are relayed to the upstream as opaque byte pipes and get NO compression ` +
+                    `(source: ${opts.wsPassthroughSource === "env" ? "BILI_WS_PASSTHROUGH env var" : `config file ${configFile()}`}). ` +
+                    (opts.wsPassthroughSource === "env"
+                        ? "Unset BILI_WS_PASSTHROUGH and restart to restore the default 426 fast-fallback."
+                        : 'Remove "ws": {"passthrough": true} from the config file or set BILI_WS_PASSTHROUGH=0, then restart.'),
+            );
+        }
         if (opts.passthrough) {
             log(
                 "warn",
@@ -752,6 +785,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         }
         const envKnobs: string[] = [];
         if (process.env.ACP_PASSTHROUGH !== undefined) envKnobs.push(`ACP_PASSTHROUGH=${process.env.ACP_PASSTHROUGH}`);
+        if (process.env.BILI_WS_PASSTHROUGH !== undefined) envKnobs.push(`BILI_WS_PASSTHROUGH=${process.env.BILI_WS_PASSTHROUGH}`);
         if (process.env.ACP_MODEL_CONTEXT_LIMIT !== undefined) envKnobs.push(`ACP_MODEL_CONTEXT_LIMIT=${process.env.ACP_MODEL_CONTEXT_LIMIT}`);
         if (process.env.ACP_COMPRESS_TOOL !== undefined) envKnobs.push(`ACP_COMPRESS_TOOL=${process.env.ACP_COMPRESS_TOOL}`);
         if (process.env.ACP_COMPRESS_NUDGE !== undefined) envKnobs.push(`ACP_COMPRESS_NUDGE=${process.env.ACP_COMPRESS_NUDGE}`);

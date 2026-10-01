@@ -367,6 +367,23 @@ By default the proxy binds `127.0.0.1` and only accepts loopback connections. To
 - `/bili/<absolute-url>` destination admission (#409): the proxy itself and link-local/metadata addresses are always denied; loopback/private destinations are allowed for local clients (self-hosted upstreams) and denied for remote clients unless listed in `BILI_TUNNEL_ALLOWED_HOSTS` (`host` or `host:port`, comma-separated). One exception (#1073): a **local** client relaying a management path (`/__bili/*`, `/__acp/*`) to a **loopback IP-literal** destination is forwarded unmarked; remote peers and hostname destinations keep the internal tunnel marker unconditionally, and management paths stay unreachable through the tunnel even via NAT hairpin. An absolute-form request addressed to the instance's own endpoint on a management path is served locally instead of tunneled (a forward-proxy-style health probe gets a real answer).
 - There is **no authentication**: only do this on a trusted LAN or behind a firewall. The `/__bili/` management endpoints remain loopback-only. A startup `[security]` warning reminds you of the above.
 
+### WebSocket traffic (opt-in)
+
+The compression pipeline speaks HTTP request/response + SSE only. WebSocket
+upgrades answer `426 Upgrade Required` immediately by default — that clean
+fast-fallback is what WS-first clients like Codex rely on (#2). For WS-only
+upstreams (e.g. OpenAI Realtime API) you can opt in to a **transparent
+passthrough**: `"ws": {"passthrough": true}` in the config file (or
+`BILI_WS_PASSTHROUGH=1`). Upgrades addressed to `/bili/wss://…`, absolute-form
+`wss(s)://…`, or MITM-terminated connections are then relayed to the real
+upstream as an **opaque byte pipe — frames are never parsed, so these sessions
+get NO compression** (loud startup warning + web-UI banner). Direct-connection
+destinations pass the same #409 admission checks as the `/bili/` tunnel;
+non-`101` upstream answers are forwarded verbatim and connect/handshake
+failures answer `502`. Protocol-aware compression of specific WS protocols is a
+deliberately deferred follow-up (#1467 Phase 2). Details:
+[CONFIGURATION.md → `ws`](CONFIGURATION.md#ws).
+
 ### Debugging
 
 `bili --debug` (or env `ACP_DEBUG=1`, or `"debug": true` in config — flag > env > config) logs every `processTurn` (tag counts, token usage), the nudge decision (growth/usage/pendingT1/shouldInject), client headers, and SSE rewrites.
