@@ -6,6 +6,7 @@ import tls from "node:tls";
 import test from "node:test";
 import { combinedCaPath, collectSystemCaPems, ensureRootCA, rootCaPath } from "../src/ca.js";
 import { resolveCombinedCaPath } from "../src/launcher.js";
+import { rmrf } from "./tmp-rm.ts";
 
 let _tmpHome: string | undefined;
 const savedEnv: Record<string, string | undefined> = {};
@@ -29,7 +30,7 @@ test.after(() => {
         else process.env[k] = v;
     }
     if (_tmpHome) {
-        try { fs.rmSync(_tmpHome, { recursive: true, force: true }); } catch { }
+        try { rmrf(_tmpHome); } catch { }
     }
 });
 
@@ -61,7 +62,7 @@ test("#152: collectSystemCaPems honors SSL_CERT_FILE user bundle first", () => {
         assert.equal(pems.length, 1, "user bundle is picked as the system source");
         assert.ok(pems[0].includes("BEGIN CERTIFICATE"));
     } finally {
-        try { fs.rmSync(userBundle, { recursive: true, force: true }); } catch { }
+        try { rmrf(userBundle); } catch { }
     }
 });
 

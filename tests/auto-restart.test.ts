@@ -2,11 +2,12 @@ import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import path from "node:path";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import type { Logger } from "../src/logger.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 const root = mkdtempSync(path.join(tmpdir(), "bc-auto-restart-"));
 process.env.XDG_CACHE_HOME = path.join(root, "cache");
@@ -22,7 +23,7 @@ after(() => {
     delete process.env.XDG_CONFIG_HOME;
     delete process.env.XDG_DATA_HOME;
     delete process.env.XDG_STATE_HOME;
-    rmSync(root, { recursive: true, force: true });
+    rmrf(root);
 });
 
 function makeLog(): { log: Logger; entries: string[] } {
@@ -240,6 +241,37 @@ test("performSelfRestart: handover succeeds at zero in-flight", { timeout: 30_00
         assert.equal(await requestOk(port), true, "replacement now owns the port");
         assert.ok(await readLastRestart());
         assert.match(entries.join("\n"), /handing over v1\.0\.0 -> v1\.0\.1/s);
+    } finally {
+        record.child?.kill();
+        server.closeAllConnections?.();
+        await new Promise<void>((r) => server.close(() => r()));
+    }
+});
+
+test("performSelfRestart: durable state flush runs before the replacement spawns (#1724)", { timeout: 30_000 }, async () => {
+    const { server, port } = await startServer();
+    const { log } = makeLog();
+    const record: SpawnRecord = {};
+    const events: string[] = [];
+    let finished = 0;
+    const innerSpawn = makeSpawn(makeReadyStub("stub-order.mjs"), port, record);
+    try {
+        const result = await performSelfRestart({
+            server, host: "127.0.0.1", port,
+            installDir: makeInstall("1.0.1"),
+            runningVersion: "1.0.0", diskVersion: "1.0.1",
+            log, inFlightProvider: () => 0,
+            preSpawnFlush: () => { events.push("pre-flush"); },
+            spawnImpl: (execPath, args, options) => { events.push("spawn"); return innerSpawn(execPath, args, options); },
+            settleMs: 500, readyTimeoutMs: 5000,
+            finish: () => { finished++; },
+        });
+        assert.equal(result.ok, true, JSON.stringify(result));
+        // Before #1724 the only flush happened in `finish`, AFTER the child had
+        // already booted and hydrated a stale snapshot. The durable-state flush
+        // must now strictly precede the spawn.
+        assert.deepEqual(events, ["pre-flush", "spawn"], "durable state must be flushed before the replacement is spawned (#1724)");
+        assert.equal(finished, 1, "finish seam called exactly once");
     } finally {
         record.child?.kill();
         server.closeAllConnections?.();

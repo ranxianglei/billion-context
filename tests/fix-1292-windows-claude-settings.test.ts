@@ -10,6 +10,7 @@ import {
     type SpawnChild,
     type SpawnFn,
 } from "../src/launcher.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 // #1292: Windows npm installs resolve claude to claude.cmd; the launcher's
 // inline --settings JSON then crossed cmd.exe /d /s /c + the batch shim, whose
@@ -138,7 +139,7 @@ test("#1292 runLaunch claude simulated win32: --settings crosses the .cmd shim b
     try {
         await runLaunch(
             { client: "claude", clientArgs: [], overrides: {} },
-            { fetchImpl: async () => ({ ok: true }), spawnImpl, sleep: () => Promise.resolve(), platform: "win32" },
+            { fetchImpl: async () => ({ ok: true }), fetchHealthInfo: async () => ({ ok: true, pid: 42422 }), spawnImpl, sleep: () => Promise.resolve(), platform: "win32" },
         );
         assert.equal(seen.length, 1, "exactly one client spawn through comspec");
         const cap = seen[0];
@@ -165,7 +166,7 @@ test("#1292 runLaunch claude simulated win32: --settings crosses the .cmd shim b
         else process.env.BILI_LAUNCHER_PLUGIN = prevPlugin;
         if (prevXdgState === undefined) delete process.env.XDG_STATE_HOME;
         else process.env.XDG_STATE_HOME = prevXdgState;
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -207,7 +208,7 @@ test("#1292 runLaunch claude posix: --settings stays inline JSON, no temp file c
     try {
         await runLaunch(
             { client: "claude", clientArgs: [], overrides: {} },
-            { fetchImpl: async () => ({ ok: true }), spawnImpl, sleep: () => Promise.resolve(), platform: "linux" },
+            { fetchImpl: async () => ({ ok: true }), fetchHealthInfo: async () => ({ ok: true, pid: 42422 }), spawnImpl, sleep: () => Promise.resolve(), platform: "linux" },
         );
         assert.equal(seen.length, 1, "exactly one direct client spawn");
         const { args, env } = seen[0];
@@ -227,7 +228,7 @@ test("#1292 runLaunch claude posix: --settings stays inline JSON, no temp file c
         else process.env.BILI_LAUNCHER_PLUGIN = prevPlugin;
         if (prevXdgState === undefined) delete process.env.XDG_STATE_HOME;
         else process.env.XDG_STATE_HOME = prevXdgState;
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -251,6 +252,6 @@ test("#1292 real win32: settings file path survives the actual cmd.exe + batch s
             fs.rmSync(r.tmpFile, { force: true });
         }
     } finally {
-        fs.rmSync(root, { recursive: true, force: true });
+        rmrf(root);
     }
 });

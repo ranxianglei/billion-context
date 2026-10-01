@@ -129,10 +129,6 @@
             "summary": {
               "type": "string",
               "description": "Flat single-range form (no content): self-contained summary replacing the range"
-            },
-            "conversation_id": {
-              "type": "string",
-              "description": "Your bili conversation id (the value from the 'your bili conversation id' line in the proxy notes). Pass it on every call when your host shares one MCP process across several concurrent conversations; omit it when the host bound the session itself."
             }
           }
         }
@@ -157,15 +153,11 @@
             },
             "startId": {
               "type": "string",
-              "description": "Optional mNNNNN message ref, inclusive lower bound of a sub-range of this block. With endId, restores only that span instead of the whole block (requires CCR: compress.ccr.enabled)."
+              "description": "Optional mNNNNN message ref, inclusive lower bound of a sub-range of this block. With endId, restores only that span instead of the whole block (requires CCR: compress.ccr.enabled). Omit both to restore the whole block; empty values count as omitted."
             },
             "endId": {
               "type": "string",
-              "description": "Optional mNNNNN message ref, inclusive upper bound. Used together with startId."
-            },
-            "conversation_id": {
-              "type": "string",
-              "description": "Your bili conversation id (the value from the 'your bili conversation id' line in the proxy notes). Pass it on every call when your host shares one MCP process across several concurrent conversations; omit it when the host bound the session itself."
+              "description": "Optional mNNNNN message ref, inclusive upper bound. Used together with startId; omit both to restore the whole block."
             }
           },
           "required": [
@@ -186,10 +178,6 @@
             "limit": {
               "type": "number",
               "description": "Max results (default 5)"
-            },
-            "conversation_id": {
-              "type": "string",
-              "description": "Target bili conversation id. Defaults to the current conversation. May reference another historical pfa-* session for read-only search."
             }
           },
           "required": [
@@ -202,12 +190,7 @@
         "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next.",
         "input_schema": {
           "type": "object",
-          "properties": {
-            "conversation_id": {
-              "type": "string",
-              "description": "Your bili conversation id (the value from the 'your bili conversation id' line in the proxy notes). Pass it on every call when your host shares one MCP process across several concurrent conversations; omit it when the host bound the session itself."
-            }
-          }
+          "properties": {}
         }
       },
       {
@@ -223,10 +206,6 @@
                 "full"
               ],
               "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and line item."
-            },
-            "conversation_id": {
-              "type": "string",
-              "description": "Your bili conversation id (the value from the 'your bili conversation id' line in the proxy notes). Pass it on every call when your host shares one MCP process across several concurrent conversations; omit it when the host bound the session itself."
             }
           }
         }
@@ -244,10 +223,6 @@
             "summary": {
               "type": "string",
               "description": "Distilled essentials of the tool result — this replaces the original output in context"
-            },
-            "conversation_id": {
-              "type": "string",
-              "description": "Your bili conversation id (the value from the 'your bili conversation id' line in the proxy notes). Pass it on every call when your host shares one MCP process across several concurrent conversations; omit it when the host bound the session itself."
             }
           },
           "required": [
@@ -273,10 +248,6 @@
             "clear": {
               "type": "boolean",
               "description": "Remove every recorded rule at once. Mutually exclusive with rule and delete."
-            },
-            "conversation_id": {
-              "type": "string",
-              "description": "Your bili conversation id (the value from the 'your bili conversation id' line in the proxy notes). Pass it on every call when your host shares one MCP process across several concurrent conversations; omit it when the host bound the session itself."
             }
           }
         }
@@ -290,10 +261,6 @@
             "ref": {
               "type": "string",
               "description": "The stored message id to retrieve (an mNNNNN ref from an [acp-stored] placeholder)."
-            },
-            "conversation_id": {
-              "type": "string",
-              "description": "Your bili conversation id (the value from the 'your bili conversation id' line in the proxy notes). Pass it on every call when your host shares one MCP process across several concurrent conversations; omit it when the host bound the session itself."
             }
           },
           "required": [
@@ -419,10 +386,6 @@
               "summary": {
                 "type": "string",
                 "description": "Flat single-range form (no content): self-contained summary replacing the range"
-              },
-              "conversation_id": {
-                "type": "string",
-                "description": "Your bili conversation id (the value from the 'your bili conversation id' line in the proxy notes). Pass it on every call when your host shares one MCP process across several concurrent conversations; omit it when the host bound the session itself."
               }
             }
           }
@@ -450,15 +413,11 @@
               },
               "startId": {
                 "type": "string",
-                "description": "Optional mNNNNN message ref, inclusive lower bound of a sub-range of this block. With endId, restores only that span instead of the whole block (requires CCR: compress.ccr.enabled)."
+                "description": "Optional mNNNNN message ref, inclusive lower bound of a sub-range of this block. With endId, restores only that span instead of the whole block (requires CCR: compress.ccr.enabled). Omit both to restore the whole block; empty values count as omitted."
               },
               "endId": {
                 "type": "string",
-                "description": "Optional mNNNNN message ref, inclusive upper bound. Used together with startId."
-              },
-              "conversation_id": {
-                "type": "string",
-                "description": "Your bili conversation id (the value from the 'your bili conversation id' line in the proxy notes). Pass it on every call when your host shares one MCP process across several concurrent conversations; omit it when the host bound the session itself."
+                "description": "Optional mNNNNN message ref, inclusive upper bound. Used together with startId; omit both to restore the whole block."
               }
             },
             "required": [
@@ -482,10 +441,6 @@
               "limit": {
                 "type": "number",
                 "description": "Max results (default 5)"
-              },
-              "conversation_id": {
-                "type": "string",
-                "description": "Target bili conversation id. Defaults to the current conversation. May reference another historical pfa-* session for read-only search."
               }
             },
             "required": [
@@ -501,12 +456,7 @@
           "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next.",
           "parameters": {
             "type": "object",
-            "properties": {
-              "conversation_id": {
-                "type": "string",
-                "description": "Your bili conversation id (the value from the 'your bili conversation id' line in the proxy notes). Pass it on every call when your host shares one MCP process across several concurrent conversations; omit it when the host bound the session itself."
-              }
-            }
+            "properties": {}
           }
         }
       },
@@ -525,10 +475,6 @@
                   "full"
                 ],
                 "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and line item."
-              },
-              "conversation_id": {
-                "type": "string",
-                "description": "Your bili conversation id (the value from the 'your bili conversation id' line in the proxy notes). Pass it on every call when your host shares one MCP process across several concurrent conversations; omit it when the host bound the session itself."
               }
             }
           }
@@ -549,10 +495,6 @@
               "summary": {
                 "type": "string",
                 "description": "Distilled essentials of the tool result — this replaces the original output in context"
-              },
-              "conversation_id": {
-                "type": "string",
-                "description": "Your bili conversation id (the value from the 'your bili conversation id' line in the proxy notes). Pass it on every call when your host shares one MCP process across several concurrent conversations; omit it when the host bound the session itself."
               }
             },
             "required": [
@@ -581,10 +523,6 @@
               "clear": {
                 "type": "boolean",
                 "description": "Remove every recorded rule at once. Mutually exclusive with rule and delete."
-              },
-              "conversation_id": {
-                "type": "string",
-                "description": "Your bili conversation id (the value from the 'your bili conversation id' line in the proxy notes). Pass it on every call when your host shares one MCP process across several concurrent conversations; omit it when the host bound the session itself."
               }
             }
           }
@@ -601,10 +539,6 @@
               "ref": {
                 "type": "string",
                 "description": "The stored message id to retrieve (an mNNNNN ref from an [acp-stored] placeholder)."
-              },
-              "conversation_id": {
-                "type": "string",
-                "description": "Your bili conversation id (the value from the 'your bili conversation id' line in the proxy notes). Pass it on every call when your host shares one MCP process across several concurrent conversations; omit it when the host bound the session itself."
               }
             },
             "required": [
@@ -730,10 +664,6 @@
             "summary": {
               "type": "string",
               "description": "Flat single-range form (no content): self-contained summary replacing the range"
-            },
-            "conversation_id": {
-              "type": "string",
-              "description": "Your bili conversation id (the value from the 'your bili conversation id' line in the proxy notes). Pass it on every call when your host shares one MCP process across several concurrent conversations; omit it when the host bound the session itself."
             }
           }
         }
@@ -756,18 +686,6 @@
             "full": {
               "type": "boolean",
               "description": "Restore all the way to original messages"
-            },
-            "startId": {
-              "type": "string",
-              "description": "Optional mNNNNN message ref, inclusive lower bound of a sub-range of this block. With endId, restores only that span instead of the whole block (requires CCR: compress.ccr.enabled)."
-            },
-            "endId": {
-              "type": "string",
-              "description": "Optional mNNNNN message ref, inclusive upper bound. Used together with startId."
-            },
-            "conversation_id": {
-              "type": "string",
-              "description": "Your bili conversation id (the value from the 'your bili conversation id' line in the proxy notes). Pass it on every call when your host shares one MCP process across several concurrent conversations; omit it when the host bound the session itself."
             }
           },
           "required": [
@@ -789,10 +707,6 @@
             "limit": {
               "type": "number",
               "description": "Max results (default 5)"
-            },
-            "conversation_id": {
-              "type": "string",
-              "description": "Target bili conversation id. Defaults to the current conversation. May reference another historical pfa-* session for read-only search."
             }
           },
           "required": [
@@ -806,12 +720,7 @@
         "description": "Show context usage and compressible ranges. No args = overview. Use to find what to compress next.",
         "parameters": {
           "type": "object",
-          "properties": {
-            "conversation_id": {
-              "type": "string",
-              "description": "Your bili conversation id (the value from the 'your bili conversation id' line in the proxy notes). Pass it on every call when your host shares one MCP process across several concurrent conversations; omit it when the host bound the session itself."
-            }
-          }
+          "properties": {}
         }
       },
       {
@@ -828,10 +737,6 @@
                 "full"
               ],
               "description": "\"summary\" (default): totals, verdicts, notable folds, anomalous requests only. \"full\": every retained fold and line item."
-            },
-            "conversation_id": {
-              "type": "string",
-              "description": "Your bili conversation id (the value from the 'your bili conversation id' line in the proxy notes). Pass it on every call when your host shares one MCP process across several concurrent conversations; omit it when the host bound the session itself."
             }
           }
         }
@@ -850,10 +755,6 @@
             "summary": {
               "type": "string",
               "description": "Distilled essentials of the tool result — this replaces the original output in context"
-            },
-            "conversation_id": {
-              "type": "string",
-              "description": "Your bili conversation id (the value from the 'your bili conversation id' line in the proxy notes). Pass it on every call when your host shares one MCP process across several concurrent conversations; omit it when the host bound the session itself."
             }
           },
           "required": [
@@ -880,10 +781,6 @@
             "clear": {
               "type": "boolean",
               "description": "Remove every recorded rule at once. Mutually exclusive with rule and delete."
-            },
-            "conversation_id": {
-              "type": "string",
-              "description": "Your bili conversation id (the value from the 'your bili conversation id' line in the proxy notes). Pass it on every call when your host shares one MCP process across several concurrent conversations; omit it when the host bound the session itself."
             }
           }
         }

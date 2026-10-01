@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -13,6 +13,7 @@ import {
     zcodeStoreCandidates,
     ZCODE_BIGMODEL_ANTHROPIC_UPSTREAM,
 } from "../src/zcode/json-edit.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 import type { ZcodeRoutePolicy } from "../src/zcode/json-edit.ts";
 
@@ -59,7 +60,7 @@ test("detectZcodeStore honors an explicit personal-file override outside the v2 
         const env = { ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: alt };
         assert.deepEqual(detectZcodeStore(dir, env), { kind: "new", file: alt });
     } finally {
-        rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -82,7 +83,7 @@ test("detectZcodeStore prefers a valid new store and falls back to legacy", () =
         writeFileSync(fresh, JSON.stringify({ schemaVersion: 1, config: {} }) + "\n");
         assert.deepEqual(detectZcodeStore(dir), { kind: "new", file: fresh });
     } finally {
-        rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -275,6 +276,6 @@ test("inspectZcodeRouting reports the routed entries per store kind", () => {
         assert.deepEqual(fresh?.wrapped, [{ id: "account:bigmodel-individual-coding-plan", upstream: UPSTREAM }]);
         assert.equal(readFileSync(zcodeStoreCandidates(dir, "new")[0], "utf8").includes("schemaVersion"), true);
     } finally {
-        rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });

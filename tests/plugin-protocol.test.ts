@@ -246,11 +246,11 @@ test("plugin manifest serves the exact wire tool schemas, headers and version", 
                 return t.name === "search_context" || (fn !== null && typeof fn === "object" && fn.name === "search_context");
             });
         const anthropicProps = ((searchEntry("anthropic")?.input_schema ?? {}) as { properties?: Record<string, unknown> }).properties;
-        assert.match(String(anthropicProps?.conversation_id?.description), /historical pfa-\*/);
+        assert.equal(anthropicProps?.conversation_id, undefined, "#1685: no conversation_id advertised (anthropic)");
         const openaiProps = (((searchEntry("openai")?.function ?? {}) as { parameters?: { properties?: Record<string, unknown> } }).parameters?.properties);
-        assert.match(String(openaiProps?.conversation_id?.description), /historical pfa-\*/);
+        assert.equal(openaiProps?.conversation_id, undefined, "#1685: no conversation_id advertised (openai)");
         const responsesProps = ((searchEntry("responses")?.parameters ?? {}) as { properties?: Record<string, unknown> }).properties;
-        assert.match(String(responsesProps?.conversation_id?.description), /historical pfa-\*/);
+        assert.equal(responsesProps?.conversation_id, undefined, "#1685: no conversation_id advertised (responses)");
         assert.equal(manifest.headers.agent, "x-bili-plugin");
         assert.equal(manifest.headers.conversation, "x-bili-plugin-conversation");
         assert.equal(manifest.toolEndpoint, "/__bili/plugin/tool");

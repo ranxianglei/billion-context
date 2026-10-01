@@ -1,6 +1,6 @@
 import type { CoreMessage } from "acp-kernel";
 import { injectResponsesDeveloperMessage, type ResponseInputItem, type ResponsesProjection } from "acp-kernel/wire";
-import { coreToResponsesWithToolImages as coreToResponses, patchResponsesInputWithToolImages as patchResponsesInput } from "../responses-tool-output.js";
+import { coreToResponsesWithToolImages as coreToResponses, patchResponsesInputWithToolImages as patchResponsesInput, mergeAdjacentConfigurationUpdates } from "../responses-tool-output.js";
 import { buildVisibilityMarker } from "./core.js";
 import { hoistTrappedToolItems } from "../tool-pair-order.js";
 import { hashId } from "../util.js";
@@ -302,7 +302,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
             } else {
                 inputItems = coreToResponses(coreMessages, customToolCallIds);
             }
-            inputItems = hoistTrappedToolItems(inputItems);
+            inputItems = mergeAdjacentConfigurationUpdates(hoistTrappedToolItems(inputItems));
             const devParts = projection && projection.systemParts.length > 0
                 ? [...projection.systemParts, systemPrompt]
                 : [systemPrompt];

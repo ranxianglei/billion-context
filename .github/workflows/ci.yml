@@ -2,13 +2,23 @@ name: CI
 
 on:
   push:
-    # Release branches also run CI on push: bot-authored auto-PRs can sit in
-    # `action_required` (manual approval gate), but check runs from the push
-    # event satisfy required-status-checks on the same sha → the auto-PR is
-    # mergeable without approving the PR-triggered runs (#772).
+    # Release branches also run CI on push: ref updates made with a real
+    # account token (agent/human-driven release branches) deliver the push
+    # event, and those check runs satisfy required-status-checks on the head
+    # sha even when the PR's own runs sit in `action_required` (bot-authored
+    # PRs are gated there) (#772). Note: pushes made with GITHUB_TOKEN from
+    # within Actions deliver NO push events — for those, the one-click
+    # workflow compensates via workflow_dispatch below.
     branches: [master, "*_release-v*"]
   pull_request:
     branches: [master]
+  # One-click release fallback: GitHub suppresses push-event delivery for
+  # ref updates made with GITHUB_TOKEN, so the push trigger above never fires
+  # on one-click fallback branches (#1744). release-manual.yml compensates by
+  # explicitly dispatching this workflow on the fallback branch; the check
+  # runs land on the same head sha and make the auto-PR mergeable once green
+  # (#772, #1744).
+  workflow_dispatch: {}
 
 jobs:
   test:

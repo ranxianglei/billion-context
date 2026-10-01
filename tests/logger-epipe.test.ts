@@ -5,7 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { isStreamWriteError } from "../src/logger.ts";
+import { isStreamWriteError, isBenignSocketRaceError } from "../src/logger.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "..");
@@ -20,6 +21,60 @@ test("isStreamWriteError classifies write-family stream codes only", () => {
     assert.equal(isStreamWriteError("EPIPE"), false);
     assert.equal(isStreamWriteError(null), false);
     assert.equal(isStreamWriteError(undefined), false);
+});
+
+// #1574: the keep-alive/idle-cleanup race reaches an already-closed socket and
+// Node throws from inside Writable.destroy. Triage proved the signature
+// benign (no live resource touched), so the handler demotes exactly this
+// shape to debug level. The classifier must match on BOTH the exact message
+// AND core-frame provenance — anything else stays an error.
+test("isBenignSocketRaceError matches the #1574 signature and nothing else", () => {
+    const msg = "Cannot read properties of undefined (reading '_writableState')";
+
+    const mk = (ctor: typeof Error, m: string, stack?: string): unknown => {
+        const e = new ctor(m);
+        if (stack !== undefined) e.stack = stack;
+        return e;
+    };
+
+    const timeoutStack = [
+        msg,
+        "    at Writable.destroy (node:internal/streams/writable:1115:29)",
+        "    at socketOnTimeout (node:_http_server:826:26)",
+        "    at TCP.onTimeout (node:net:455:8)",
+    ].join("\n");
+    const endStack = [
+        msg,
+        "    at Writable.destroy (node:internal/streams/writable:1115:29)",
+        "    at socketOnEnd (node:_http_server:851:20)",
+    ].join("\n");
+    const idleStack = [
+        msg,
+        "    at Writable.destroy (node:internal/streams/writable:1115:29)",
+        "    at Server.closeIdleConnections (node:_http_server:638:30)",
+    ].join("\n");
+
+    assert.equal(isBenignSocketRaceError(mk(TypeError, msg, timeoutStack)), true, "socketOnTimeout variant");
+    assert.equal(isBenignSocketRaceError(mk(TypeError, msg, endStack)), true, "socketOnEnd variant");
+    assert.equal(isBenignSocketRaceError(mk(TypeError, msg, idleStack)), true, "closeIdleConnections variant");
+
+    assert.equal(
+        isBenignSocketRaceError(mk(TypeError, msg, `${msg}\n    at Object.teardown (app/lib/pool.js:42:11)`)),
+        false,
+        "same message from userland (no core frame) stays an error",
+    );
+    assert.equal(
+        isBenignSocketRaceError(
+            mk(TypeError, "Cannot read properties of undefined (reading '_readableState')", timeoutStack.replace("_writableState", "_readableState")),
+        ),
+        false,
+        "'_readableState' variant is not the #1574 signature",
+    );
+    assert.equal(isBenignSocketRaceError(mk(Error, msg, timeoutStack)), false, "non-TypeError stays an error");
+    assert.equal(isBenignSocketRaceError(mk(TypeError, msg, "")), false, "empty stack (no provenance) stays an error");
+    assert.equal(isBenignSocketRaceError(null), false);
+    assert.equal(isBenignSocketRaceError(undefined), false);
+    assert.equal(isBenignSocketRaceError(msg), false);
 });
 
 // #1233: on Linux stderr over a pipe is an async stream — EPIPE arrives as an
@@ -92,7 +147,7 @@ test("closed stderr pipe: no uncaughtException storm, file-only logging, one war
     const warns = lines.filter((l) => l.includes("[warn]"));
 
     try { child.kill(); } catch { /* already exited */ }
-    fs.rmSync(dir, { recursive: true, force: true });
+    rmrf(dir);
 
     assert.equal(code, 0, `child must exit cleanly, got ${code}; stderr: ${earlyErr.slice(0, 500)}`);
     assert.match(out, /FIRED 0/, "the uncaughtException handler must never fire");

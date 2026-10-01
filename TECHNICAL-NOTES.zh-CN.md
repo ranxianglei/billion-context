@@ -6,19 +6,29 @@ README 三种使用方式背后的机制级说明。README 里每种方式只保
 
 插件加载时**自拉起自己的代理**(已有健康实例则直接复用 —— 父进程 pid 看门狗在客户端退出时收掉它),把模型流量改写到 `<proxy>/bili/<上游URL>`,把 `compress` / `decompress` / `acp_status` 注册为客户端原生工具(plugin 模式),并把 `/acp` 面板绑定到当前会话。插件还会把客户端**自己的模型配置**上报给代理(runtime-info 协议,#955),压缩预算用真实窗口而不是注册表猜测。退出开关:`BILI_NATIVE_PI=0`、`BILI_NATIVE_OMP=0`、`BILI_NATIVE_OPENCODE=0`、`BILI_NATIVE_DSH=0`、`BILI_NATIVE_KIMI=0`、`BILI_NATIVE_HERMES=0`、`BILI_NATIVE_ZCODE=0`。
 
-## 代理复用与附着门禁(#1225、#1335、#1232)
+## 代理复用与附着门禁(#1225、#1335、#1232、#1660)
 
-原生 hook 可以附着到已在运行的代理而不自己拉起 —— 仅当通过下面的生命周期门禁。复用基于身份(#1225):只有当既有代理运行的是**同一份代码**(入口脚本 sha256,记录在实例文件里)、**lane 兼容**(每个启动器声明其客户端 lane,两个*不同声明的* lane 永不共享;未声明 lane 的实例在该轴上通配)、**且拥有会话生命周期**(健康端点报告 armed 父进程 pid 看门狗 `watchdog.armed == true`,即由带父 pid 的启动器拉起、随最后一个附着会话消亡)时才附着。#1225 之前写入的实例没有代码指纹,因此永不附着:重建或更新后的安装下次启动总会拉起新代理,修复立即生效而不是静默服务旧代码。
+原生 hook 可以附着到已在运行的代理而不自己拉起 —— 仅当通过下面的生命周期门禁。复用基于身份(#1225):只有当既有代理运行的是**同一份代码**(入口脚本 sha256,记录在实例文件里)、**lane 兼容**(每个启动器声明其客户端 lane,两个*不同声明的* lane 永不共享;未声明 lane 的实例是手工拉起的用户主权区守护进程,在该轴上通配)、**且通过生命周期门禁**(见下:armed 父进程 pid 看门狗 `watchdog.armed == true`,即由带父 pid 的启动器拉起、随最后一个附着会话消亡;**或**属用户主权区实例 —— 无 lane、无 launch token —— 按定义豁免,#1660)时才附着。#1225 之前写入的实例没有代码指纹,因此永不附着:重建或更新后的安装下次启动总会拉起新代理,修复立即生效而不是静默服务旧代码。
 
 | 监听者 | 附着? | 原因 |
 |---|---|---|
 | 本会话拉起的代理 | ✅ | 出生即 armed |
 | 其他会话的 armed 共享代理(watcher 集,#1186) | ✅ | 共享本就是设计 |
-| 手工 `bili start` 常驻守护进程 | ❌ 默认不附着 | 无生命周期属主(拒绝 watcher 注册、不随会话退出、常是旧版本代码 —— #1322 的成因) |
+| 手工 `bili start` 常驻守护进程(用户主权区,#1660) | ✅ 默认附着 | **用户主权区**实例(无 lane、无 launch token):用户刻意维护 —— 其寿命与版本由你自己负责;仅当 `BILI_NATIVE_ATTACH_EXTERNAL=0/false` 显式关门时才拒绝 |
+| 未武装的 **lane 型**代理(崩溃会话孤儿;pre-#1330 不可验证) | ❌ 大声拒绝 | 生命周期漂移症状(#1335):搭乘等于静默复用无人管理的代理 |
 
-hook 附着前先探测候选者 `/__bili/health` 里的 `watchdog.armed`:armed → 附着并注册 watcher(现状不变);unarmed、或 pre-#1330 构建根本不报 `watchdog` 字段(不可验证,按 unarmed 处理)→ **不附着**,本会话自拉起一个临时代理(临时端口、出生即 armed、随最后一个会话消亡,#1186 watcher 语义)。顺带修掉版本偏斜:每个会话跑的都是**当前安装的** bili,而不是陈旧守护进程携带的旧代码。代价:无 armed 代理时每会话多一个短命代理进程(会话状态在磁盘上共享,压缩连续性不受影响);多实例告警(#394)相应变多。**逃生舱:** 刻意用常驻守护进程承载原生 hook → 配置文件设 `"native": { "attachExternal": true }` 或 `BILI_NATIVE_ATTACH_EXTERNAL=1`,恢复对任何 code/lane 兼容监听者的附着(守护进程的寿命与版本由你自己负责)。kimi/dsh 的显式用户指定附着(`BILLION_CONTEXT_ATTACH` / 预置 `BILLION_CONTEXT_PROXY`)完全不经过发现路径,构造上豁免。
+hook 附着前先探测候选者的 `/__bili/health`:armed → 附着并注册 watcher(现状不变);**用户主权区**候选无论看门狗状态默认附着(#1660)—— 用户刻意维护该守护进程;未武装的 **lane 型**候选(崩溃会话孤儿,或 pre-#1330 构建根本不报 `watchdog` 字段 —— 不可验证,按 unarmed 处理)被**大声拒绝**,本会话在自管端口区自拉起代理(基准口 `18787` 或该 lane 粘性漂移记录;出生即 armed、随最后一个会话消亡,#1186 watcher 语义)。版本偏斜仍被修住:代码指纹检查先行,重建/更新后的安装即使经用户主权区豁免也永不搭乘陈旧守护进程。代价:无可附着实例时每会话多一个短命代理进程(会话状态在磁盘上共享,压缩连续性不受影响);多实例告警(#394)相应变多。**逃生舱:** 配置文件 `"native": { "attachExternal": true }` 或 `BILI_NATIVE_ATTACH_EXTERNAL=1` 把附着扩展到 *lane 型*监听者(无论看门狗状态,含 pre-#1330 构建)—— 那些守护进程的寿命与版本由你自己负责;`0`/`false` 对所有人关门,包括用户主权区守护进程,强制各 lane 自拉新代理。kimi/dsh 的显式用户指定附着(`BILLION_CONTEXT_ATTACH` / 预置 `BILLION_CONTEXT_PROXY`)完全不经过发现路径,构造上豁免。
 
-附着发现在**所有**存活实例间是 lane 感知的(#1232):启动器探测实例注册表里的每一条存活记录,而不只是单个实例文件(last-writer-wins —— 并发多客户端下它可能指向别的客户端的代理),并对每个候选应用上面的门禁。兼容候选中,lane 与启动器自身声明一致的最新实例胜出;未声明 lane 的实例在 lane 轴上通配(仍受门禁约束)。`another bili instance is running` 告警(#394)也是 lane 感知的:同 lane 或无 lane 共存时触发,两个*不同声明* lane 之间保持沉默(它们的会话文件互不相交)。
+附着发现在**所有**存活实例间是 lane 感知的(#1232):启动器探测实例注册表里的每一条存活记录,而不只是单个实例文件(last-writer-wins —— 并发多客户端下它可能指向别的客户端的代理),并对每个候选应用上面的门禁。兼容候选中,lane 与启动器自身声明一致的最新实例胜出;未声明 lane 的实例(用户主权区守护进程)在 lane 轴上通配,且门禁默认豁免(#1660)。`another bili instance is running` 告警(#394)也是 lane 感知的:同 lane 或无 lane 共存时触发,两个*不同声明* lane 之间保持沉默(它们的会话文件互不相交)。
+
+## 共享 state 目录与多实例安全边界(#394、#1724)
+
+同一台 host 上的每个 bili 实例读写的是**同一组** per-host 存储:XDG data 目录(`~/.local/share/billion-context/` —— 会话记录、CCR content-store、prefix-affinity)加 state 目录(`~/.local/state/billion-context/` —— 日志、实例注册表)。控制面是 lane 感知的(#1232:附着发现与 #394 共存告警都尊重已声明 lane),但**数据面没有分区** —— 既无按会话的属主,也无按 lane 的磁盘隔离。由此带来两个后果:
+
+- **跨实例会话可见。** 每个实例的 Web UI(`__bili/sessions` list / detail / logs)都会重新扫描整个共享存储,因此任何经回环可达的实例都能枚举并读取*任意*会话 —— 原始报文、content-store 载荷、压缩块 —— 无论它由该 host 上哪个其他实例/lane 创建。
+- **重启 drain 竞态。** 重启时新进程在旧进程完成 flush 之前就 hydrate 了存储,last-writer-wins 可能丢掉旧进程的最终写入:tail 更新丢失,以及 provider 前缀缓存击穿(出站 body 与 provider 已缓存的前缀分叉)。#1724 的缓解措施:#405 快照计数器守卫(拒绝陈旧会话写入)、prefix-affinity union-on-write 守卫(#1737:一个实例的 flush 永不覆盖兄弟 chain)、自重启顺序修复(#1742:durable state 在替换进程 spawn 之前落盘)。host 驱动的重启(dsh 等,#991)仍依赖这些数据层守卫,因为其 kill/spawn 顺序不受 bili 控制。
+
+**安全边界:** 共享 state 面目前**仅**由管理端点的回环门禁(非回环源地址被拒绝)+ 用户 home 树下这些目录的文件系统权限保护(两个目录都在 $HOME 下)—— 没有按会话的鉴权。对**单用户 host** 这已足够。对**多用户 host** 则不够:任何能触达代理回环端口的本地账户都能读取所有用户的所有会话。这类 host 必须给这组 per-host 存储分区(按用户/按 lane 子目录)—— 即 #1724 指出的根因修复(direction #1),目前仍作为架构决策开放;Web UI scoping(#1724 direction #4)能减少跨实例浏览,但不改变这一边界。
 
 ## Runtime-info 协议(#955)
 
@@ -37,7 +47,7 @@ launcher 环境变量这档覆盖纯代理客户端(无进程内插件):`bili <c
 
 ## Claude 原生姿态(#964)
 
-Claude Code 没有进程内扩展点,所以 `bili plugin install claude` 往 `~/.claude/settings.json` 写一个受管块(env `ANTHROPIC_BASE_URL=http://127.0.0.1:48787/bili/<upstream>`、`DISABLE_AUTO_COMPACT=1`、`SessionStart` hook),外加同样指向该稳定端口的用户级 MCP shell。hook 在首个模型请求前触发:附着到端口上健康的代理,或拉起一个 pid 看门狗追踪 claude 本身的代理 —— 代理随会话生灭。端口覆盖:`BILI_CLAUDE_NATIVE_PORT` > config `claude.nativePort` > 48787;上游覆盖:`BILI_CLAUDE_UPSTREAM`(或既有 `claude.anthropicBaseUrl`)。`BILI_NATIVE_CLAUDE=0` 退出 —— hook 改为拉起同端口的 **passthrough** 代理(原样转发、关闭压缩)。块是纯 JSON merge/strip:外部键从不触碰,`bili plugin remove claude` 精确还原。装有原生块的机器上 `bili claude` 仍可用 —— 它用自身临时代理覆盖静态 URL,hook 保持休眠。
+Claude Code 没有进程内扩展点,所以 `bili plugin install claude` 往 `~/.claude/settings.json` 写一个受管块(env `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>/bili/<upstream>`、`DISABLE_AUTO_COMPACT=1`、`SessionStart` hook),外加同样的用户级 MCP shell。hook 在首个模型请求前触发,端口解析与所有 lane 一致(#1660):显式钉死(`BILI_CLAUDE_NATIVE_PORT` > config `claude.nativePort`)→ 该确切端口**严格端口**启动(占用者被大声拒绝,#964 保留);否则骑自管区 —— 该 lane 粘性记录优先,否则基准口 `18787` —— 非严格,子进程 EADDRINUSE +1 阶梯解决碰撞,落定端口粘性记录。阶梯有一个例外(#1723):lane 端口的持有者是**不同构建**的同 lane 实例(升级重启重叠——旧版本还在排水)时,子进程等它释放(最多 5 秒)后复用*同一*端口,而不是漂移;持有者永不退出则等待预算耗尽,照旧走 +1 阶梯。代理就绪后 hook 每会话把受管 `ANTHROPIC_BASE_URL` 重钉到存活 origin(`repinClaudeManagedBaseUrl`),跳口后下次启动自愈,烘进 URL 永不与运行中代理失步。上游覆盖:`BILI_CLAUDE_UPSTREAM`(或既有 `claude.anthropicBaseUrl`)。install 不再持久化 `claude.nativePort`。`BILI_NATIVE_CLAUDE=0` 退出 —— hook 改为在同一解析端口上拉起 **passthrough** 代理(原样转发、关闭压缩)。块是纯 JSON merge/strip:外部键从不触碰,`bili plugin remove claude` 精确还原。装有原生块的机器上 `bili claude` 仍可用 —— 它用自身代理覆盖静态 URL,hook 保持休眠。
 
 ## 注入优先级 —— 能不写文件就不写(#535)
 

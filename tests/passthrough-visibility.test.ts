@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { defaultConfig } from "acp-kernel";
@@ -10,18 +10,10 @@ import { startServer } from "../src/server.ts";
 import { passthroughState, type ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 function close(server: http.Server): Promise<void> {
     return new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
-}
-
-async function freePort(): Promise<number> {
-    const server = http.createServer();
-    server.listen(0, "127.0.0.1");
-    await once(server, "listening");
-    const port = (server.address() as { port: number }).port;
-    await close(server);
-    return port;
 }
 
 test("passthroughState resolves env over file over default", () => {
@@ -47,7 +39,7 @@ test("passthroughState resolves env over file over default", () => {
     } finally {
         if (previousEnv === undefined) delete process.env.ACP_PASSTHROUGH; else process.env.ACP_PASSTHROUGH = previousEnv;
         if (previous === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = previous;
-        rmSync(root, { recursive: true, force: true });
+        rmrf(root);
     }
 });
 
@@ -62,9 +54,8 @@ test("web config exposes and toggles passthrough (#405)", async () => {
     const previous = { config: process.env.BILI_CONFIG_FILE, env: process.env.ACP_PASSTHROUGH };
     process.env.BILI_CONFIG_FILE = biliConfig;
     delete process.env.ACP_PASSTHROUGH;
-    const port = await freePort();
     const opts: ProxyOptions = {
-        port,
+        port: 0,
         host: "127.0.0.1",
         upstream: "http://127.0.0.1:1",
         routes: {},
@@ -85,6 +76,7 @@ test("web config exposes and toggles passthrough (#405)", async () => {
     };
     const proxy = await startServer(opts);
     if (!proxy.listening) await once(proxy, "listening");
+    const port = (proxy.address() as { port: number }).port;
     const base = `http://127.0.0.1:${port}`;
     const getConfig = async (): Promise<{ passthrough: { enabled: boolean; source: string | null } }> =>
         await (await fetch(`${base}/__bili/config`)).json() as { passthrough: { enabled: boolean; source: string | null } };
@@ -137,6 +129,6 @@ test("web config exposes and toggles passthrough (#405)", async () => {
         await close(proxy);
         if (previous.env === undefined) delete process.env.ACP_PASSTHROUGH; else process.env.ACP_PASSTHROUGH = previous.env;
         if (previous.config === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = previous.config;
-        rmSync(root, { recursive: true, force: true });
+        rmrf(root);
     }
 });

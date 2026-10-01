@@ -4,15 +4,12 @@ import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { configFile } from "../paths.js";
 import {
-    loadRoutes,
-    normalizeUrlKey,
     parseCompressSettings,
     parseRouteEntry,
     parseUpstreamProxyMode,
     passthroughState,
+    rejectLegacyRoute,
     safeReadJson,
-    type ProviderRoute,
-    type ProviderRoutes,
     type UpstreamProxyMode,
 } from "../config.js";
 import { log } from "../logger.js";
@@ -40,8 +37,14 @@ function configParseError(): string | null {
     return `config file is not valid JSON: ${configFile()}`;
 }
 
-export function readProviders(): ProviderRoutes {
-    return loadRoutes();
+/** Raw inline `providers` block exactly as written in the config file. The
+ *  Web UI edits it verbatim (JSON textarea round-trip), so this must NOT be
+ *  the parsed/merged route table: parsing would drop named-entry identity
+ *  fields (`bind`, `compactionOptIn`) and merging would leak external
+ *  ACP_PROVIDERS entries that a save cannot persist (#1469). */
+export function readProviders(): Record<string, unknown> {
+    const providers = readConfig().providers;
+    return providers && typeof providers === "object" && !Array.isArray(providers) ? providers : {};
 }
 
 export function readUpstreamSettings(): { mode: UpstreamProxyMode; proxy?: string } {
@@ -155,18 +158,26 @@ export async function handleConfigPut(
         return;
     }
 
-    const routes: Record<string, ProviderRoute> = {};
+    let rawProviders: Record<string, unknown> | undefined;
     if (hasProviders) {
         if (!body.providers || typeof body.providers !== "object" || Array.isArray(body.providers)) {
             return sendError(res, 400, "providers must be an object");
         }
+        // Validate-only: the RAW entry is what gets written back, so identity
+        // fields outside the routing schema (`bind`, `compactionOptIn`) survive
+        // the save round-trip (#1469). The runtime table is rebuilt from these
+        // values by loadRoutes at startup / hot-reload.
+        rawProviders = {};
         for (const [url, value] of Object.entries(body.providers as Record<string, unknown>)) {
+            try { rejectLegacyRoute(url, value); } catch (error) {
+                return sendError(res, 400, String(error));
+            }
             const route = parseRouteEntry(value);
             if (!url || !route) return sendError(res, 400, `invalid provider entry: ${url || "(empty)"}`);
             try { validateHttpProxy(route.proxy, biliPort); } catch (error) {
                 return sendError(res, 400, `invalid provider proxy for ${url}: ${String(error)}`);
             }
-            routes[normalizeUrlKey(url)] = route;
+            rawProviders[url] = value;
         }
     }
 
@@ -211,7 +222,7 @@ export async function handleConfigPut(
     }
 
     const config = readConfig();
-    if (hasProviders) config.providers = routes;
+    if (hasProviders) config.providers = rawProviders;
     if (hasProxy) {
         if (proxy) config.upstreamProxy = proxy;
         else delete config.upstreamProxy;
@@ -232,13 +243,13 @@ export async function handleConfigPut(
         return sendError(res, 500, `failed to apply config: ${String(error)}`);
     }
     const changed: string[] = [];
-    if (hasProviders) changed.push(`${Object.keys(routes).length} routes`);
+    if (hasProviders) changed.push(`${Object.keys(rawProviders ?? {}).length} routes`);
     if (hasProxy || hasMode) changed.push("network");
     if (hasCompress) changed.push("compress");
     if (hasPassthrough) changed.push("passthrough");
     log("info", `[acp-web] configuration updated (${changed.join(", ") || "none"})`);
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ ok: true, providers: hasProviders ? Object.keys(routes).length : undefined }));
+    res.end(JSON.stringify({ ok: true, providers: hasProviders && rawProviders ? Object.keys(rawProviders).length : undefined }));
 }
 
 function sendError(res: ServerResponse, status: number, message: string): void {

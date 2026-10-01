@@ -10,6 +10,7 @@ import {
     type V1Config,
     type V1ProviderOptions,
 } from "../src/agent/opencode-native.js";
+import { rmrf } from "./tmp-rm.ts";
 
 // Minimal structural stand-in for the host's zod module: only the builders
 // jsonSchemaToZodShape touches. Real zod (4.1.8) is exercised implicitly by
@@ -464,7 +465,7 @@ describe("legacy session state file (#920)", () => {
             assert.equal(isLegacyAcpSession("../../etc"), false);
         } finally {
             delete process.env.XDG_DATA_HOME;
-            fs.rmSync(home, { recursive: true, force: true });
+            rmrf(home);
         }
     });
 

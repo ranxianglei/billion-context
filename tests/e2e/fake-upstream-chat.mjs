@@ -58,7 +58,10 @@ function toolResultsOf(messages) {
     const out = [];
     for (const msg of messages) {
         if (msg?.role === "tool") {
-            out.push({ name: names.get(msg.tool_call_id) ?? "?", content: String(flatContent(msg.content)).slice(0, 160) });
+            // 400 (not 160): the compress receipt carries its subagent-session
+            // note AFTER the fingerprint line (~185 chars total) — 160 would
+            // cut exactly that assertion surface off (e2e-subagent-sessions).
+            out.push({ name: names.get(msg.tool_call_id) ?? "?", content: String(flatContent(msg.content)).slice(0, 400) });
         }
     }
     return out;
@@ -137,7 +140,7 @@ function answerFor(convKey, firstUserText, body) {
     const isTitleCall =
         messages.some((m) => m?.role === "system" && /title generator/i.test(stripAcps(flatContent(m.content)))) ||
         users.some((u) => /^generate a title\b/i.test(stripAcps(flatContent(u.content)).trim()));
-    if (isTitleCall) return { content: "e2e-title", queueIdx: -1 };
+    if (isTitleCall) return { content: "e2e-title", queueIdx: -1, title: true };
     const lastUserText = users.length > 0 ? flatContent(users[users.length - 1].content) : firstUserText;
     let sourceText = lastUserText;
     if (parseDirectives(lastUserText).length === 0 && users.length > 1) {
@@ -211,7 +214,16 @@ const server = http.createServer((req, res) => {
                         toolName: reply.toolName ?? null,
                         toolArgs: reply.toolArgs ?? null,
                         lastUser: firstUserText.slice(0, 120),
+                        // head of the TRUE last user message (lastUser above
+                        // is the first user message's head — historical
+                        // field name): lets follow-up runs be identified by
+                        // their own prompt once the filler dominates the head.
+                        lastUserHead: (lastUserMsg ? flatContent(lastUserMsg.content) : "").slice(0, 120),
                         lastUserRef: lastUserRefMatch ? lastUserRefMatch[1] : null,
+                        // #1699: title side-channel marker — after the fix these
+                        // rows route VERBATIM (no ref tags, no injected tools),
+                        // so suites must not mistake them for main turns.
+                        title: reply.title === true,
                     }) + "\n");
                 } catch { /* noop */ }
                 if (parsed.stream) {

@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { defaultConfig } from "acp-kernel";
@@ -11,6 +11,7 @@ import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { classifyIp, checkTunnelDestination, tunnelAllowlistFromEnv, parseIpLiteral, normalizeIpLiteral, type ResolveHost } from "../src/tunnel-guard.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 /** #409: the /bili/<absolute-url> tunnel must not reach the proxy's own
  *  management plane, link-local metadata, or (for remote clients) any
@@ -152,6 +153,50 @@ test("checkTunnelDestination: public destinations pass for any client; unresolva
     assert.equal(dead.code, "unresolvable");
 });
 
+test("checkTunnelDestination: transient resolution failure rides out on bounded retry (#1686)", async () => {
+    let calls = 0;
+    const flaky: ResolveHost = async () => {
+        calls++;
+        if (calls < 3) throw Object.assign(new Error("EAI_AGAIN"), { code: "EAI_AGAIN" });
+        return ["93.184.216.34"];
+    };
+    const v = await checkTunnelDestination("https://api.example.com/v1", {
+        selfPort: 8787,
+        clientLoopback: true,
+        allowlist: [],
+        localIps,
+        resolveHost: flaky,
+        resolveBackoffMs: 1,
+    });
+    assert.equal(v.ok, true, "a blip shorter than the retry window must not deny");
+    assert.equal(calls, 3, "retried until the resolver answered");
+});
+
+test("checkTunnelDestination: persistent resolution failure stays unresolvable with bounded attempts (#1686)", async () => {
+    let calls = 0;
+    const dead: ResolveHost = async () => {
+        calls++;
+        throw Object.assign(new Error("ENOTFOUND"), { code: "ENOTFOUND" });
+    };
+    const v = await checkTunnelDestination("https://no-such-host.invalid/v1", {
+        selfPort: 8787,
+        clientLoopback: true,
+        allowlist: [],
+        localIps,
+        resolveHost: dead,
+        resolveBackoffMs: 1,
+    });
+    assert.equal(v.ok, false);
+    assert.equal(v.code, "unresolvable");
+    assert.equal(calls, 3, "bounded attempt count — no open-ended retries");
+});
+
+test("checkTunnelDestination: malformed origin is 'invalid', distinct from DNS failure (#1686)", async () => {
+    const v = await checkTunnelDestination("not a url", { selfPort: 8787, clientLoopback: true, allowlist: [], localIps });
+    assert.equal(v.ok, false);
+    assert.equal(v.code, "invalid");
+});
+
 test("checkTunnelDestination: default ports by scheme", async () => {
     const httpsNoPort = await checkTunnelDestination("https://169.254.169.254/", { selfPort: 8787, clientLoopback: true, allowlist: [], localIps });
     assert.equal(httpsNoPort.ok, false);
@@ -230,7 +275,7 @@ test("integration: tunnel cannot reach the proxy's own management plane (#409 Po
         process.env.BILI_CONFIG_FILE = prevConfig;
         proxy.closeAllConnections?.();
         await close(proxy);
-        try { rmSync(root, { recursive: true, force: true }); } catch { /* best-effort */ }
+        try { rmrf(root); } catch { /* best-effort */ }
     }
 });
 
@@ -291,6 +336,52 @@ test("integration: metadata destination never contacted (403 before any socket);
         await close(proxy);
         echo.closeAllConnections?.();
         await close(echo);
-        try { rmSync(root, { recursive: true, force: true }); } catch { /* best-effort */ }
+        try { rmrf(root); } catch { /* best-effort */ }
+    }
+});
+
+test("integration: unresolvable /bili/ destination answers 502 transport-class, not 403 (#1686)", async () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({});
+    const root = path.join(tmpdir(), `bili-tunnel-dns-${process.pid}-${Date.now()}`);
+    mkdirSync(root, { recursive: true });
+    const biliConfig = path.join(root, "billion-context.json");
+    writeFileSync(biliConfig, '{"providers":{}}\n', "utf8");
+    const prevConfig = process.env.BILI_CONFIG_FILE;
+    process.env.BILI_CONFIG_FILE = biliConfig;
+    const opts: ProxyOptions = {
+        port: 0,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1:1",
+        routes: {},
+        proxy: "",
+        proxyMode: "direct",
+        proxySource: "direct",
+        modelContextLimit: 400_000,
+        kernelConfig: defaultConfig(400_000),
+        compress: { injectTool: true, injectNudge: true },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        mitm: { enabled: false, domains: [] },
+    };
+    const proxy = await startServer(opts);
+    if (!proxy.listening) await once(proxy, "listening");
+    const selfPort = (proxy.address() as { port: number }).port;
+    try {
+        // RFC2606 reserved TLD: NXDOMAIN from a healthy resolver, EAI_AGAIN with
+        // a dead one — either way the lookup throws and the verdict is
+        // 'unresolvable', so the assertion holds in both network states.
+        const r = await get(selfPort, "/bili/http://no-such-host.invalid/v1/chat/completions");
+        assert.equal(r.status, 502, `resolution failure must be transport-class (got ${r.status}: ${r.body})`);
+        assert.match(r.body, /"detail":"unresolvable"/);
+    } finally {
+        process.env.BILI_CONFIG_FILE = prevConfig;
+        proxy.closeAllConnections?.();
+        await close(proxy);
+        try { rmrf(root); } catch { /* best-effort */ }
     }
 });

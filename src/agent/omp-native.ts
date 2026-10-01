@@ -19,12 +19,22 @@
 
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
 import { createBiliPlugin } from "./pi.js";
-import { markNativeHost, nativeBootstrapGate, nativeProxyScriptPath, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
+import { applyOmpFirstEventTimeout, markNativeHost, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
 
 /** Decides whether the native bootstrap should run in this process. */
 export function shouldBootstrapNativeOmp(env: NodeJS.ProcessEnv): boolean {
     return nativeBootstrapGate(env, "BILI_NATIVE_OMP");
+}
+
+/** #1774: true when this OMP process routes model traffic through a bili proxy —
+ *  self-bootstrap (gate passed), launcher/MITM launch (BILLION_CONTEXT_PROXY), or
+ *  /bili/-rewrite launch (BILI_PROVIDER_REWRITES). Only then can a long preflight
+ *  outrun OMP's 300s first-parsed-event watchdog. */
+export function ompTrafficRidesBili(env: NodeJS.ProcessEnv): boolean {
+    return nativeBootstrapGate(env, "BILI_NATIVE_OMP")
+        || proxyEnvOrigin(env) !== undefined
+        || env.BILI_PROVIDER_REWRITES !== undefined;
 }
 
 function errMessage(err: unknown): string {
@@ -51,6 +61,13 @@ async function bootstrap(): Promise<string | undefined> {
 
 const nativeActive = shouldBootstrapNativeOmp(process.env);
 if (nativeActive) markNativeHost(process.env, "omp");
+// #1774: widen OMP's first-parsed-event watchdog before any stream can start — a
+// preflight over a large context holds the response for minutes while OMP only
+// sees keep-alive comments, and its default 300s timer would abort mid-compression.
+// Sync at module eval so it lands before the first request; user-pinned values win.
+if (process.env.NODE_TEST_CONTEXT === undefined && ompTrafficRidesBili(process.env)) {
+    applyOmpFirstEventTimeout(process.env);
+}
 
 // node:test imports this module for shouldBootstrapNativeOmp — never
 // bootstrap a real proxy from inside a test run.

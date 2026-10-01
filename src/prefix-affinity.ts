@@ -50,11 +50,15 @@ import { createHash } from "node:crypto";
 const MIN_CANONICAL_BYTES = 24;
 
 /** Upper bound on tracked chains (LRU-evicted, global — content is the
- *  only key, so there are no per-credential buckets). */
-const MAX_TRACKED_SESSIONS = 256;
-
-/** Chains unused for this long stop matching (sessions may outlive tracking). */
-const TTL_MS = 7 * 24 * 60 * 60 * 1000;
+/** Upper bound on tracked chains (LRU-evicted, global — content is the
+ *  only key, so there are no per-credential buckets). Chains are PERMANENT
+ *  (#1724): the product promise is month- to year-level single sessions, so
+ *  validity never expires with time — a chain leaves the table only under
+ *  capacity pressure (least-recently-used first). 1024 × ≤128 hashes ≈ 8MB
+ *  worst case; typical chains are far shallower. Still exported so the
+ *  persistence layer (#499 P1a / #1724) can enforce the same bound on the
+ *  on-disk snapshot it writes back. */
+export const MAX_TRACKED_SESSIONS = 1024;
 
 /** Leading-run length used to attribute a NEW anonymous session's birth to a
  *  truncated replay of a tracked chain (#1115: lineage attribution ONLY —
@@ -62,7 +66,7 @@ const TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const TRUNCATION_LINEAGE_WINDOW = 8;
 
 /** Per tracked chain, store at most this many per-item hashes (the trailing
- *  ones). Bounds memory (256 chains × 128 × 64B ≈ 2MB) and keeps lineage
+ *  ones). Bounds memory (1024 chains × 128 × 64B ≈ 8MB) and keeps lineage
  *  lookups (fork-LCP + truncated-run, both ≤ 8 items) comfortably available.
  *  Chains deeper than this lose their head, so fork-lineage LCP detection
  *  degrades to "unknown" rather than guessing. */
@@ -237,7 +241,6 @@ export class PrefixAffinityResolver {
         const incItemHashes = perItemHashes(messages);
         const storedItemHashes = incItemHashes.slice(-MAX_STORED_ITEMS);
         const tracked = this.trackedChains;
-        this.expire(tracked);
 
         // 1. Full-depth prefix match (the original radix-style resolution).
         let best: ChainEntry | undefined;
@@ -321,15 +324,12 @@ export class PrefixAffinityResolver {
         }
     }
 
-    /** #1486: current tracking entry for a session id (TTL-aware), without
+    /** #1486: current tracking entry for a session id, without
      *  touching lastSeen. Lets the identified-session tracker apply the
      *  append-only discipline (#1075 side requests reuse a session id with
      *  fewer messages) before overwriting. */
     peekChain(sessionId: string): ChainEntry | undefined {
-        const entry = this.trackedChains.get(sessionId);
-        if (!entry) return undefined;
-        if (Date.now() - entry.lastSeen > TTL_MS) return undefined;
-        return entry;
+        return this.trackedChains.get(sessionId);
     }
 
     /** #1486: fingerprint an incoming message list without resolving it —
@@ -367,7 +367,6 @@ export class PrefixAffinityResolver {
         if (!hasUserMessage(msgs)) return null;
         const hashes = chainHashes(msgs);
         if (hashes.length < MIN_RESUME_PREFIX) return null;
-        this.expire(this.trackedChains);
         let best: { sessionId: string; sharedDepth: number; lastSeen: number } | null = null;
         for (const [id, entry] of this.trackedChains) {
             if (id === selfSessionId) continue;
@@ -402,20 +401,19 @@ export class PrefixAffinityResolver {
         }));
     }
 
-    /** Load chains persisted by a previous process. Entries older than the
-     *  TTL are dropped (they would not match anyway). Returns the count
-     *  actually imported. Defensive: a corrupt/hand-edited file must never
-     *  crash the proxy — malformed entries are skipped. */
+    /** Load chains persisted by a previous process. Chains are permanent
+     *  (#1724): an entry months old still reattaches its session. Returns
+     *  the count actually imported. Defensive: a corrupt/hand-edited file
+     *  must never crash the proxy — malformed entries are skipped. */
     importSnapshot(entries: unknown): number {
         if (!Array.isArray(entries)) return 0;
-        const now = Date.now();
         let imported = 0;
         for (const raw of entries) {
             if (!raw || typeof raw !== "object") continue;
             const e = raw as Record<string, unknown>;
             if (typeof e.sessionId !== "string" || typeof e.depth !== "number" || typeof e.tailHash !== "string") continue;
             if (!Array.isArray(e.itemHashes) || e.itemHashes.some((h) => typeof h !== "string")) continue;
-            if (typeof e.lastSeen !== "number" || now - e.lastSeen > TTL_MS) continue;
+            if (typeof e.lastSeen !== "number") continue;
             const entry: ChainEntry = {
                 sessionId: e.sessionId,
                 depth: e.depth,
@@ -434,14 +432,6 @@ export class PrefixAffinityResolver {
             this.trackedChains.delete(oldest.sessionId);
         }
         return imported;
-    }
-
-    private expire(tracked: Map<string, ChainEntry>): void {
-        if (tracked.size === 0) return;
-        const now = Date.now();
-        for (const [id, entry] of tracked) {
-            if (now - entry.lastSeen > TTL_MS) tracked.delete(id);
-        }
     }
 }
 

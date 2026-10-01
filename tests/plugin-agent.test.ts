@@ -6,10 +6,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { rmrf } from "./tmp-rm.ts";
 
 process.env.NODE_ENV = "test";
 
-import { proxyBaseFromUrl, proxyBaseFromEnv, detectProxyBase, fetchManifest, forwardTool, fetchStatus } from "../src/agent/shared.ts";
+import { proxyBaseFromUrl, proxyBaseFromEnv, detectProxyBase, fetchManifest, forwardTool, fetchStatus, destinationRoutedThroughProxy } from "../src/agent/shared.ts";
 import { wrapCacheReport, wrapRuleReport } from "../src/acp-panel.ts";
 import biliPlugin, { createBiliPlugin } from "../src/agent/pi.ts";
 import ompPlugin from "../src/agent/omp.ts";
@@ -481,6 +482,71 @@ test("#1382: compaction cancel requires evidence the proxy carries this conversa
         });
     } finally {
         await identityProxy.close();
+    }
+});
+
+test("#1392: non-http(s) provider rides bili only when opted in AND carried", async () => {
+    // #1383's stopgap vetoed ALL non-http(s) baseUrls (e.g. pi-claude-bridge's literal
+    // "claude-bridge"), so a proxy's mere existence could never claim compaction for
+    // traffic that bypasses it. #1392 narrows that veto: an explicitly opted-in provider
+    // (BILI_NON_HTTP_PROVIDERS) falls through to the SAME carriage-evidence gate. Opt-in
+    // widens the candidate set only — unrouted traffic still never cancels (#1382 invariant).
+    const bridgeCtx = {
+        sessionManager: { getSessionId: () => "sess-optin" },
+        model: { contextWindow: 1000000, baseUrl: "claude-bridge", provider: "claude-bridge" },
+        cwd: "/tmp",
+    };
+    const unknownProxy = await startFakeProxy({ statusOk: false });
+    const knownProxy = await startFakeProxy({ statusOk: true });
+    try {
+        // (A) Unopted-in: byte-for-byte the #1382/stopgap behavior — even though the proxy
+        // confirms carriage here, no opt-in means the non-http(s) veto still holds.
+        await withEnv({ BILLION_CONTEXT_PROXY: knownProxy.origin, BILI_NON_HTTP_PROVIDERS: undefined }, async () => {
+            const pi = makeFakePi();
+            createBiliPlugin("pi")(pi as never);
+            const handler = pi.events.get("session_before_compact")!;
+            assert.equal(await handler({ reason: "threshold" }, bridgeCtx), undefined, "non-opted-in non-http(s) provider stays vetoed even when the proxy confirms carriage");
+        });
+
+        // (B) Opted-in but UNROUTED: the veto lifts, yet there is no carriage evidence (no
+        // local stamp + proxy reports unknown) → still no cancel. This IS the safety property.
+        await withEnv({ BILLION_CONTEXT_PROXY: unknownProxy.origin, BILI_NON_HTTP_PROVIDERS: "claude-bridge" }, async () => {
+            const pi = makeFakePi();
+            createBiliPlugin("pi")(pi as never);
+            const handler = pi.events.get("session_before_compact")!;
+            assert.equal(await handler({ reason: "threshold" }, bridgeCtx), undefined, "opted-in but unrouted → no carriage evidence → native compaction proceeds");
+        });
+
+        // (C) Opted-in AND routed: the proxy confirms it carries this conversation → the
+        // cancel now correctly fires (the whole point of the opt-in).
+        await withEnv({ BILLION_CONTEXT_PROXY: knownProxy.origin, BILI_NON_HTTP_PROVIDERS: "claude-bridge" }, async () => {
+            const pi = makeFakePi();
+            createBiliPlugin("pi")(pi as never);
+            const handler = pi.events.get("session_before_compact")!;
+            assert.deepEqual(await handler({ reason: "threshold" }, bridgeCtx), { cancel: true }, "opted-in + proxy confirms carriage → compaction ownership claimed");
+        });
+
+        // (D) Mismatched allowlist id: opting in a DIFFERENT provider does not lift the veto
+        // for this one — ids match exactly, so a typo cannot accidentally opt a provider in.
+        await withEnv({ BILLION_CONTEXT_PROXY: knownProxy.origin, BILI_NON_HTTP_PROVIDERS: "some-other-provider" }, async () => {
+            const pi = makeFakePi();
+            createBiliPlugin("pi")(pi as never);
+            const handler = pi.events.get("session_before_compact")!;
+            assert.equal(await handler({ reason: "threshold" }, bridgeCtx), undefined, "allowlist naming a different provider does not opt this one in");
+        });
+
+        // (E) [#1392 Phase A guard] Opt-in widens ONLY the compaction-ownership candidate
+        // set — it must never widen wire-side routing: a non-http baseUrl stays outside
+        // destinationRoutedThroughProxy (no /bili/ rewrites, no stamped cache keys, no MITM
+        // candidacy), whatever BILI_NON_HTTP_PROVIDERS says. Guards Phase B against
+        // accidentally wiring the flag into stamp eligibility.
+        await withEnv({ BILLION_CONTEXT_PROXY: knownProxy.origin, BILI_NON_HTTP_PROVIDERS: "claude-bridge" }, async () => {
+            assert.equal(destinationRoutedThroughProxy("claude-bridge"), false, "opt-in must not route a non-http baseUrl through the proxy wire surface");
+            assert.equal(destinationRoutedThroughProxy("claude-bridge://x"), false, "opaque scheme never parses as routable");
+        });
+    } finally {
+        await unknownProxy.close();
+        await knownProxy.close();
     }
 });
 
@@ -1519,12 +1585,16 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
         assert.match(pluginInstall("codex"), /installed/);
         const toml = fs.readFileSync(path.join(home, "config.toml"), "utf8");
         assert.match(toml, /\[mcp_servers\.bili\]\ncommand = /);
-        assert.match(toml, /BILI_MCP_PROXY = "http:\/\/127\.0\.0\.1:8787"/);
+        // #1660: no baked origin — the MCP shell discovers the live proxy at
+        // startup (env > instance file > 8787), so the block cannot go stale.
+        assert.doesNotMatch(toml, /BILI_MCP_PROXY/);
         fs.writeFileSync(path.join(home, "config.toml"), toml + "\n[mcp_servers.other]\ncommand = \"x\"\n");
         assert.match(pluginInstall("codex"), /already installed/);
-        fs.writeFileSync(path.join(home, "config.toml"), fs.readFileSync(path.join(home, "config.toml"), "utf8").replace("8787", "9999"));
+        // a user-tampered command (their own node path) is not canonical →
+        // refreshed back to the current canonical block
+        fs.writeFileSync(path.join(home, "config.toml"), fs.readFileSync(path.join(home, "config.toml"), "utf8").replace(JSON.stringify(process.execPath), JSON.stringify("/tampered/node")));
         assert.match(pluginInstall("codex"), /refreshed/);
-        assert.match(fs.readFileSync(path.join(home, "config.toml"), "utf8"), /BILI_MCP_PROXY = "http:\/\/127\.0\.0\.1:8787"/);
+        assert.doesNotMatch(fs.readFileSync(path.join(home, "config.toml"), "utf8"), /tampered/);
         assert.match(pluginRemove("codex"), /removed/);
         const tomlAfter = fs.readFileSync(path.join(home, "config.toml"), "utf8");
         assert.doesNotMatch(tomlAfter, /mcp_servers\.bili/);
@@ -1541,8 +1611,8 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
         assert.match(tomlEdge, /\[mcp_servers\.other\]\ncommand = "x"\n/);
 
         // #638: a malformed block (args as string - legal TOML, invalid codex
-        // schema) with a matching origin must NOT short-circuit to "already
-        // installed"; reinstall must self-heal it to the canonical block.
+        // schema). Legacy blocks carried a baked env origin — the heal must
+        // drop it, not preserve it (#1660).
         const selfRoot = path.dirname(path.dirname(path.resolve("src/plugin-install.ts")));
         const malformed = `[mcp_servers.other]\ncommand = "x"\n[mcp_servers.bili]\ncommand = "node"\nargs = '[\"${path.join(selfRoot, "dist", "mcp.js")}\"]'\nenv = { BILI_MCP_PROXY = "http://127.0.0.1:8787" }\n`;
         fs.writeFileSync(path.join(home, "config.toml"), malformed);
@@ -1551,6 +1621,7 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
         const tomlHealed = fs.readFileSync(path.join(home, "config.toml"), "utf8");
         assert.match(tomlHealed, /args = \[/);
         assert.doesNotMatch(tomlHealed, /args = '\[/);
+        assert.doesNotMatch(tomlHealed, /BILI_MCP_PROXY/, "legacy baked origin dropped on heal (#1660)");
         assert.match(tomlHealed, /\[mcp_servers\.other\]\ncommand = "x"\n/);
         // A now-canonical block stays "already installed" on rerun.
         assert.match(pluginInstall("codex"), /already installed/);
@@ -1603,7 +1674,7 @@ test("plugin install/remove roundtrips for pi/omp/codex/opencode under a fake HO
         assert.equal(rows.length, 9);
         assert.deepEqual(PLUGIN_AGENTS, ["pi", "omp", "claude", "codex", "opencode", "dsh", "kimi", "hermes", "zcode"]);
     });
-    fs.rmSync(home, { recursive: true, force: true });
+    rmrf(home);
 });
 
 test("plugin install opencode without a live proxy: MCP shell skipped, native plugin still installed (#820)", async () => {
@@ -1629,7 +1700,7 @@ test("plugin install opencode without a live proxy: MCP shell skipped, native pl
             assert.equal(after.compaction, undefined);
         });
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -1679,7 +1750,7 @@ test("plugin install opencode replaces legacy opencode-acp entries — array and
             assert.equal(msg.includes("other-plugin"), false);
         });
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -1705,7 +1776,7 @@ test("plugin install/remove/status survive a non-object mcp in opencode.json (#8
             assert.equal(pluginStatusAll().find((r) => r.agent === "opencode")?.status, "not installed");
         });
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -1778,7 +1849,7 @@ test("omp plugin: scoped matching, existence check, overlay redirect (issue #392
     } finally {
         if (createdOmpDist) fs.rmSync(ompDistFile, { force: true });
     }
-    fs.rmSync(home, { recursive: true, force: true });
+    rmrf(home);
 });
 
 test("resolveProxyOrigin discovers the running proxy via the state file", async () => {
@@ -1794,7 +1865,7 @@ test("resolveProxyOrigin discovers the running proxy via the state file", async 
     await withEnv({ XDG_STATE_HOME: state, BILI_MCP_PROXY: "http://10.0.0.5:9000" }, () => {
         assert.equal(resolveProxyOrigin(), "http://10.0.0.5:9000");
     });
-    fs.rmSync(state, { recursive: true, force: true });
+    rmrf(state);
 });
 
 test("plugin install refuses to touch broken or non-object configs", async () => {
@@ -1817,7 +1888,7 @@ test("plugin install refuses to touch broken or non-object configs", async () =>
         fs.writeFileSync(path.join(ocDir, "opencode.json"), "nope{");
         assert.throws(() => pluginInstall("opencode"), /not valid JSON/);
     });
-    fs.rmSync(home, { recursive: true, force: true });
+    rmrf(home);
 });
 
 // #836 (found in #809 N4): a non-object `mcp` (e.g. bare string) made
@@ -1852,7 +1923,7 @@ test("plugin opencode survives a non-object mcp (issue #836 / #809 N4)", async (
         assert.deepEqual(data[ocKey], [path.join(ocDir, "plugins", "billion-context")]);
         assert.deepEqual(data.compaction, { auto: false });
     });
-    fs.rmSync(home, { recursive: true, force: true });
+    rmrf(home);
 });
 
 // #839 (found while reviewing #837): same bug class as #836 on the claude side
@@ -1872,7 +1943,7 @@ test("plugin claude survives a non-object mcpServers (issue #839)", async () => 
         assert.equal(pluginStatusAll().find((r) => r.agent === "claude")!.status, "not installed");
         assert.equal(fs.readFileSync(cFile, "utf8"), malformed);
     });
-    fs.rmSync(home, { recursive: true, force: true });
+    rmrf(home);
 });
 
 test("plugin list survives a broken host config (per-row error, no crash)", async () => {
@@ -1890,7 +1961,7 @@ test("plugin list survives a broken host config (per-row error, no crash)", asyn
         const pi = rows.find((r) => r.agent === "pi")!;
         assert.equal(pi.status, "not installed");
     });
-    fs.rmSync(home, { recursive: true, force: true });
+    rmrf(home);
 });
 
 test("mcp forwardTool times out against a hanging proxy", async () => {

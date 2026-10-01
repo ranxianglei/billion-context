@@ -70,6 +70,18 @@ export function mitmHostsFromEnv(env: NodeJS.ProcessEnv = process.env): Set<stri
     return out;
 }
 
+/** #1392: opted-in non-http(s) baseUrl providers (BILI_NON_HTTP_PROVIDERS, set by
+ *  buildPiEnv or native-mode users). Provider ids are case-sensitive identifiers —
+ *  unlike the hostnames in mitmHostsFromEnv above, these are NOT lowercased. */
+export function nonHttpProvidersFromEnv(env: NodeJS.ProcessEnv = process.env): Set<string> {
+    const out = new Set<string>();
+    for (const raw of env.BILI_NON_HTTP_PROVIDERS?.split(",") ?? []) {
+        const id = raw.trim();
+        if (id.length > 0) out.add(id);
+    }
+    return out;
+}
+
 /** True iff requests to baseUrl will be SEEN by the bili proxy (and thus its
  *  stamped prompt_cache_key consumed + stripped): a /bili/-wrapped URL, the
  *  BILLION_CONTEXT_PROXY origin itself, or a host on the exported MITM

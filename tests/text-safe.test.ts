@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { safePrefix, safeSuffix, scrubLoneSurrogates } from "../src/text-safe.js";
-import { summaryFingerprintLine } from "../src/stream.js";
+import { saltedMsgIdForLog, summaryFingerprintLine, summaryFingerprintLogLine } from "../src/stream.js";
 
 const EMOJI = "\u{1F4E5}"; // D83D DCE5
 const loneSurrogateRe = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
@@ -74,6 +74,29 @@ test("fingerprint: emoji fully inside a window is preserved verbatim", () => {
     const line = summaryFingerprintLine("b4", summary);
     assert.ok(line.includes(EMOJI), "intact pair survives the excerpt");
     assertNoLoneSurrogate(line, "intact pair");
+});
+
+test("#1718: log fingerprint line carries length only — never head/tail excerpts", () => {
+    const summary = "TASK AS OF /home/dev/proj/src/foo.ts branch feature/x — pass 3 of 5";
+    const line = summaryFingerprintLogLine("b9", summary);
+    assert.equal(line, ` \u00b7 b9 summary ${summary.length}ch`);
+    assert.ok(!line.includes("/home/dev"), "no path fragment");
+    assert.ok(!line.includes("feature/x"), "no task-state fragment");
+    assert.ok(!line.includes("head "), "no excerpt markers at all");
+});
+
+test("#1718: saltedMsgIdForLog is deterministic, input-free, and salt-sensitive", () => {
+    const id = "h_deadbeefcafe0123";
+    const a = saltedMsgIdForLog(id);
+    assert.match(a, /^x_[0-9a-f]{10}$/, `shape: ${a}`);
+    assert.equal(a, saltedMsgIdForLog(id), "stable within one process");
+    assert.notEqual(a, saltedMsgIdForLog("h_deadbeefcafe0124"), "different input → different output");
+    assert.ok(!a.includes("deadbeef") && !a.includes(id), "no raw-id substring leaks through");
+    assert.notEqual(
+        saltedMsgIdForLog(id, "salt-A"),
+        saltedMsgIdForLog(id, "salt-B"),
+        "different process salts break cross-run correlation",
+    );
 });
 
 // #816 → #828 → #1615: every recurrence was NEW hand-sliced text. Ratchet:

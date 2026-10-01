@@ -8,7 +8,9 @@ import { extractResponsesTextTriggers, PROXY_TOOL_NAMES, MUTATING_PROXY_TOOLS } 
 import { log as loggerLog } from "./logger.js";
 import { drainPendingRetrievals } from "./store.js";
 import { executeProxyTool, buildVisibilityMarker } from "./loop/core.js";
-import { hoistTrappedToolItems, type ToolPairItem } from "./tool-pair-order.js";
+import { hoistTrappedToolItems } from "./tool-pair-order.js";
+import { mergeAdjacentConfigurationUpdates } from "./responses-tool-output.js";
+import { type ResponseInputItem } from "acp-kernel/wire";
 import { MAX_LOOP_ROUNDS } from "./loop/index.js";
 import { stripResponsesText } from "./loop/tag-echo-filter.js";
 import { fetchWithRetry, UpstreamHttpError } from "./fetch-util.js";
@@ -160,7 +162,7 @@ export async function compressLoopResponsesJson(
             }
             return current;
         }
-        const inputItems = Array.isArray(requestBody.input) ? [...(requestBody.input as unknown[])] : [];
+        const inputItems: ResponseInputItem[] = Array.isArray(requestBody.input) ? [...requestBody.input] : [];
         if (extracted.clean.trim()) {
             inputItems.push({ type: "message", role: "assistant", content: [{ type: "output_text", text: extracted.clean }] });
         }
@@ -183,7 +185,7 @@ export async function compressLoopResponsesJson(
         for (const injection of drainPendingRetrievals(ctx.session)) {
             inputItems.push({ type: "message", role: "developer", content: [{ type: "output_text", text: injection.text }] });
         }
-        requestBody.input = hoistTrappedToolItems(inputItems as ToolPairItem[]);
+        requestBody.input = mergeAdjacentConfigurationUpdates(hoistTrappedToolItems(inputItems));
         const result = await fetchWithRetry(requestOptions.url, {
             method: "POST",
             headers: requestOptions.headers,

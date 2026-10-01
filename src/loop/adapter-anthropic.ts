@@ -207,12 +207,25 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             "utf8",
         );
 
+    // #1766: unmodeled keys on upstream terminal frames must ride the synthetic
+    // completion below (see EmitCompletionOpts.terminalExtra), not vanish.
+    const MESSAGE_DELTA_KNOWN_KEYS = new Set(["type", "delta", "usage", "request_id"]);
+    const MESSAGE_STOP_KNOWN_KEYS = new Set(["type", "request_id"]);
+    const terminalExtrasOf = (data: Record<string, unknown>, known: ReadonlySet<string>): Record<string, unknown> | undefined => {
+        const out: Record<string, unknown> = {};
+        for (const [key, value] of Object.entries(data)) {
+            if (!known.has(key)) out[key] = value;
+        }
+        return Object.keys(out).length > 0 ? out : undefined;
+    };
+
     const buildTerminal = (
         stopReason: string,
         outputTokens: number,
         inputTokens: number,
         cachedTokens: number,
         creationTokens?: number,
+        extras?: Record<string, unknown>,
     ): Buffer => {
         const usage: Record<string, unknown> = {
             input_tokens: inputTokens,
@@ -225,7 +238,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
         if (model) extra.model = model;
         return Buffer.from(
             `event: message_delta\n` +
-            `data: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage, ...extra })}\n\n` +
+            `data: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage, ...extras, ...extra })}\n\n` +
             `event: message_stop\n` +
             `data: ${JSON.stringify({ type: "message_stop" })}\n\n`,
             "utf8",
@@ -458,6 +471,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                     }
                     const d = (data.delta ?? {}) as Record<string, unknown>;
                     if (typeof d.stop_reason === "string") stopReason = d.stop_reason;
+                    const deltaExtras = terminalExtrasOf(data, MESSAGE_DELTA_KNOWN_KEYS);
                     if (!usageYielded) {
                         usageYielded = true;
                         yield {
@@ -469,7 +483,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                         } as ParsedStreamEvent;
                     }
                     maybeWarnDegenerate(stopReason);
-                    yield { kind: "done", finishReason: stopReason, thinking: sawThinking } as ParsedStreamEvent;
+                    yield { kind: "done", finishReason: stopReason, thinking: sawThinking, ...(deltaExtras ? { terminalExtra: deltaExtras } : {}) } as ParsedStreamEvent;
                 } else if (type === "message_stop") {
                     if (lastTextIndex !== null) {
                         const tail = tagFilter.flush();
@@ -478,6 +492,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                         }
                         lastTextIndex = null;
                     }
+                    const stopExtras = terminalExtrasOf(data, MESSAGE_STOP_KNOWN_KEYS);
                     if (!usageYielded) {
                         usageYielded = true;
                         yield {
@@ -489,7 +504,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                         } as ParsedStreamEvent;
                     }
                     maybeWarnDegenerate(stopReason);
-                    yield { kind: "done", finishReason: stopReason ?? "end_turn", thinking: sawThinking } as ParsedStreamEvent;
+                    yield { kind: "done", finishReason: stopReason ?? "end_turn", thinking: sawThinking, ...(stopExtras ? { terminalExtra: stopExtras } : {}) } as ParsedStreamEvent;
                 } else if (round === 1) {
                     yield { kind: "meta", chunk: rawBuf, firstRoundOnly: true } as ParsedStreamEvent;
                 }
@@ -529,6 +544,7 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
                 opts?.usage?.inputTokens ?? 0,
                 opts?.usage?.cachedTokens ?? 0,
                 opts?.usage?.creationTokens,
+                opts?.terminalExtra,
             );
         },
 

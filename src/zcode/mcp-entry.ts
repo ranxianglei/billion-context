@@ -54,8 +54,14 @@ function startWatchdog(
                     if (attached) {
                         log(`attached proxy ${state.origin} unhealthy — waiting for it to recover`);
                     } else {
+                        // #1660: same zone semantics as
+                        // zcode/native.ts defaultEnsureProxy — explicit
+                        // BILI_ZCODE_PORT is strict; otherwise port 0 lets the
+                        // launcher resolve the zone preference AND settle the
+                        // actually-bound port sticky (#1660).
+                        const explicit = resolveZcodeNativePort();
                         const handle = await ensureProxyRunning(
-                            { host: LAUNCHER_DEFAULT_HOST, port: resolveZcodeNativePort(), passthrough: false, debug: false, lane: "zcode" },
+                            { host: LAUNCHER_DEFAULT_HOST, port: explicit ?? 0, passthrough: false, debug: false, strictPort: explicit !== undefined, lane: "zcode" },
                             { scriptPath: nativeProxyScriptPath() },
                         );
                         if (handle.origin !== state.origin) {

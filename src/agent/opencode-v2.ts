@@ -69,6 +69,7 @@ interface V2Headers {
 
 export interface V2HttpRequestEvent {
     sessionID?: unknown;
+    agent?: unknown;
     model?: { providerID?: unknown; id?: unknown };
     request?: { url?: unknown; headers?: V2Headers | null };
 }
@@ -292,6 +293,12 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
             // instruction drift (AGENTS.md reconcile) must not fork the
             // compression session.
             headers.set("x-bili-plugin-instructions-mutable", "1");
+            // #1699: forward the host's per-request persona so the proxy can classify
+            // side requests by intent — opencode v2 title-gen carries no max_tokens, so
+            // the budget heuristic alone can never see it. Stamped for every non-empty
+            // id; the proxy acts only on known side-request agents (main ids are inert).
+            const agentId = typeof e.agent === "string" ? e.agent.trim() : "";
+            if (agentId.length > 0) headers.set("x-bili-plugin-agent", agentId);
             const model = e.model;
             if (model && typeof model.providerID === "string" && typeof model.id === "string") {
                 const key = `${model.providerID}/${model.id}`;

@@ -32,6 +32,7 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import { execFileSync, spawn, type StdioOptions } from "node:child_process";
 import { DEFAULT_MITM_DOMAINS } from "./mitm.js";
@@ -42,13 +43,16 @@ import {
     entryScriptFingerprint,
     isPidAlive,
     isProxyInstanceFile,
+    lanePreferredPort,
     readProxyInstanceFile,
     readStartingMarker,
     removeStartingMarker,
+    writeZonePort,
     type ProxyInstanceFile,
     type ProxyStartingMarker,
 } from "./instance.js";
 import { selfPackageRoot, isBiliPiEntry, ompPluginLoadedFrom, dshNativeInstalled, claudeNativeInstalled } from "./plugin-install.js";
+import { applyOmpFirstEventTimeout } from "./agent/native-bootstrap.js";
 import { log as teeLog } from "./logger.js";
 
 /** Absolute path of a file inside our dist/, resolved via the package root
@@ -59,7 +63,7 @@ function selfDistFile(name: string): string {
     return path.join(selfPackageRoot(), "dist", name);
 }
 import { nonEmpty, resolvePiHome, resolveOmpHome, resolveDshHome, resolveCodexHome, loadClientConfig, collectModelWindows, collectModelMaxOutputs, type ClientConfig, type CodexConfig, resolveOpencodeConfigFile, readOpencodeConfigRoot, opencodePluginBaseDir, type OpencodeConfig, type OpencodeProvider, type HermesConfig, type HermesProvider, qoderIsCnSite, QODER_DEFAULT_MODEL_HOSTS, resolveTraeHome, readTraeConfig, TRAE_DEFAULT_MODEL_HOSTS, JCODE_DEFAULT_MODEL_HOSTS, type TraeConfig, resolveKimiHome, readKimiConfig, parseKimiToml, KIMI_DEFAULT_MODEL_HOSTS, QWEN_DEFAULT_MODEL_HOSTS, type KimiConfig, type KimiProvider, readOpencodeProjectLayer, type OpencodeProjectLayer, readMcodeConfig, resolveMcodeInstallDir, MCODE_DEFAULT_MODEL_HOSTS, type McodeConfig, discoverAiderArgUrls, AIDER_DEFAULT_MODEL_HOSTS, COPILOT_DEFAULT_MODEL_HOSTS, AMP_DEFAULT_MODEL_HOSTS, resolveGooseDirs, readGooseConfig, type GooseConfig, type GooseDirs } from "./client-config.js";
-import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, resolveNativeAttachExternal, resolveMitmDomains, type ProviderRoutes } from "./config.js";
+import { loadRoutes, resolveConfiguredContextLimit, lookupContextLimit, resolveNativeAttachExternal, resolveMitmDomains, resolveNonHttpProviders, type ProviderRoutes } from "./config.js";
 import { discoverMitmDomains } from "./discover.js";
 import { contextFromRegistry } from "./registry.js";
 
@@ -252,6 +256,13 @@ export interface LauncherDeps {
      *  construction — tests drive win32 paths from a POSIX host. Defaults
      *  to process.platform. */
     platform?: NodeJS.Platform;
+    /** #1660: zone-port seam for tests. The preferred port a lane'd launch
+     *  tries before the proxy child's +1 ladder (default: the lane's sticky
+     *  record > zone base, instance.ts), and the sticky-settle write
+     *  (default: stateDir()/port-zone.json). Tests inject pure sinks so a
+     *  lane'd fake launch never touches the developer's real zone record. */
+    zonePreferredPort?: (lane: string) => number;
+    writeZonePort?: (lane: string, port: number) => void;
 }
 
 export function isLaunchClient(value: string): value is ClientName {
@@ -812,6 +823,7 @@ export function buildPiEnv(
     httpRewrites: HttpRewrite[] = [],
     httpsRewrites: HttpRewrite[] = [],
     mitmHosts: string[] = [],
+    nonHttpProviders: string[] = [],
 ): NodeJS.ProcessEnv {
     // #535: provider URL rewrites ride env, not a generated models.json —
     // the bili extension (agent/pi.js) consumes this manifest at load and
@@ -840,6 +852,8 @@ export function buildPiEnv(
         // MITM-decrypt and strip it from. Blind-tunnel destinations must NOT be
         // stamped or strict-schema upstreams 400 the foreign field.
         ...(mitmHosts.length > 0 ? { BILI_MITM_HOSTS: mitmHosts.join(",") } : {}),
+        // #1392: the extension's ownsCompaction reads this to narrow its non-http(s) veto.
+        ...(nonHttpProviders.length > 0 ? { BILI_NON_HTTP_PROVIDERS: nonHttpProviders.join(",") } : {}),
     };
 }
 
@@ -1288,55 +1302,48 @@ export function buildClaudeSettingsArg(platform: NodeJS.Platform, override: stri
     return { clientArgs: ["--settings", tmpFile], tmpFile };
 }
 
-/** Codex: -c inline overrides for the bili MCP server only.
- *
- *  `conversationId` is a per-spawn UUID injected as BILI_CONVERSATION_ID:
- *  codex passes no session id to MCP children (verified codex-cli 0.147.0),
- *  so the MCP shell uses this to self-register headlessly; the first model
- *  request that creates a NEW session consumes the registration and binds
- *  the conversation (MITM route — in direct-URL mode the model traffic does
- *  not reach the proxy and the binding cannot happen, see the direct-mode
- *  warning). Without it every native tool call fails with "no conversation
- *  id". */
-export function buildCodexMcpArgs(origin: string, conversationId: string): string[] {
-    const script = selfDistFile("mcp.js");
-    return [
-        "-c",
-        `mcp_servers.bili.command=${JSON.stringify(process.execPath)}`,
-        "-c",
-        `mcp_servers.bili.args=${JSON.stringify([script])}`,
-        "-c",
-        `mcp_servers.bili.env.BILI_MCP_PROXY=${JSON.stringify(origin)}`,
-        "-c",
-        `mcp_servers.bili.env.BILI_CONVERSATION_ID=${JSON.stringify(conversationId)}`,
-    ];
-}
-
-/** #681: how the bili MCP server reaches the spawned codex. On POSIX the
- *  inline `-c mcp_servers.bili.*` values are safe (no shell re-parses argv),
- *  so buildCodexMcpArgs stands. On Windows every codex launch rides a .cmd
- *  shim through cmd.exe, and a `-c` value embedding an absolute path carries
- *  both quotes and spaces — cmd.exe strips the TOML-required quotes (it has no
- *  literal-quote escape), leaving malformed TOML. There the definition is
- *  delivered via a file instead: a persistent <CODEX_HOME>-bili overlay whose
- *  merged config.toml holds [mcp_servers.bili], pointed at by CODEX_HOME.
- *  When the overlay cannot be built the injection degrades to nothing (wire
- *  mode still compresses server-side) with a warning. */
+/** #681/#1802: how the bili MCP server reaches the spawned codex, and why
+ *  EVERY launch that needs the overlay points CODEX_HOME at it on every
+ *  platform. Windows launches codex through a .cmd shim via cmd.exe, where a
+ *  `-c mcp_servers.bili.*` value embedding an absolute path carries both
+ *  quotes and spaces — cmd.exe strips the TOML-required quotes (it has no
+ *  literal-quote escape), leaving malformed TOML. So the server definition is
+ *  delivered via a file: a persistent <CODEX_HOME>-bili overlay whose merged
+ *  config.toml holds [mcp_servers.bili]. POSIX could still take inline `-c`
+ *  args (no shell re-parses argv), but since #1802 the overlay doubles as the
+ *  carrier of a generated .env pinning the launcher's routing (see
+ *  renderCodexDotEnv) — one mechanism on all platforms beats two.
+ *  `conversationId` is a per-spawn UUID for BILI_CONVERSATION_ID: codex passes
+ *  no session id to MCP children (verified codex-cli 0.147.0), so the MCP
+ *  shell self-registers headlessly with it; the first model request creating a
+ *  NEW session consumes the registration and binds the conversation (MITM
+ *  route — in direct-URL mode the model traffic does not reach the proxy and
+ *  the binding cannot happen). When the overlay cannot be built the injection
+ *  degrades to nothing (wire mode still compresses server-side) with a
+ *  warning. */
 export function prepareCodexMcpInjection(opts: {
-    platform: NodeJS.Platform;
     codexHome: string;
     origin: string;
-    conversationId: string;
+    caPath: string;
+    conversationId?: string;
+    manageRouting: boolean;
 }): { clientArgs: string[]; envPatch: Record<string, string>; warning?: string } {
-    if (opts.platform !== "win32") {
-        return { clientArgs: buildCodexMcpArgs(opts.origin, opts.conversationId), envPatch: {} };
-    }
-    const overlay = prepareCodexHome(opts.codexHome, opts.origin, opts.conversationId);
+    const overlay = prepareCodexHome({
+        codexHome: opts.codexHome,
+        origin: opts.origin,
+        caPath: opts.caPath,
+        conversationId: opts.conversationId,
+        manageRouting: opts.manageRouting,
+    });
     if (!overlay) {
+        const losses = [
+            opts.conversationId !== undefined ? "launching without native bili MCP tools" : null,
+            opts.manageRouting ? "the user's $CODEX_HOME/.env may override the injected proxy/CA" : null,
+        ].filter((s): s is string => s !== null);
         return {
             clientArgs: [],
             envPatch: {},
-            warning: "could not prepare the codex MCP overlay (<CODEX_HOME>-bili) — launching without native bili MCP tools; wire-injected compression is still active.",
+            warning: `could not prepare the codex overlay (<CODEX_HOME>-bili) — ${losses.join("; ")}; wire-injected compression is still active.`,
         };
     }
     return { clientArgs: [], envPatch: { CODEX_HOME: overlay } };
@@ -1814,10 +1821,10 @@ export function piEntryLoadable(entry: string): boolean {
     return entry.startsWith("npm:") || fs.existsSync(entry);
 }
 
-function writeOverlayFileAtomic(overlay: string, fileName: string, contents: string): void {
+function writeOverlayFileAtomic(overlay: string, fileName: string, contents: string, mode?: number): void {
     const draft = path.join(overlay, `.${fileName}.${process.pid}.tmp`);
     try {
-        fs.writeFileSync(draft, contents);
+        fs.writeFileSync(draft, contents, { mode });
         fs.renameSync(draft, path.join(overlay, fileName));
     } catch {
         try {
@@ -2126,21 +2133,137 @@ function mergeCodexBiliBlock(text: string, origin: string, conversationId: strin
     return base + (base.endsWith("\n") || base.length === 0 ? "" : "\n") + block;
 }
 
-/** #681: persistent <CODEX_HOME>-bili overlay carrying the bili MCP server in
- *  config.toml instead of inline `-c` args (which cmd.exe cannot transmit when
- *  they embed a spaced/quoted Windows path). Every real-home entry except
- *  config.toml is shared (auth.json, sessions, model settings survive); the
- *  generated config.toml is the real contents plus [mcp_servers.bili]. Returns
- *  the overlay dir to point CODEX_HOME at, or undefined when it cannot be
- *  built (caller then skips native MCP injection). */
-export function prepareCodexHome(codexHome: string, origin: string, conversationId: string): string | undefined {
-    let txt = "";
-    try {
-        txt = fs.readFileSync(path.join(codexHome, "config.toml"), "utf8");
-    } catch {}
+/** #1802: keys whose values must reflect THIS launch's routing when codex
+ *  reads $CODEX_HOME/.env — its load_dotenv() calls set_var() UNCONDITIONALLY
+ *  for every non-CODEX_-prefixed key on top of the launcher's spawn env, so a
+ *  user .env pointing at e.g. a socks5h proxy silently re-routes the client
+ *  off bili after spawn (and codex's custom-CA rustls HTTP stack cannot speak
+ *  SOCKS at all). Matched case-insensitively; a replaced line keeps the user's
+ *  original key spelling. */
+const CODEX_DOTENV_MANAGED = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "SSL_CERT_FILE", "BILLION_CONTEXT_PROXY"] as const;
+
+/** Pure renderer for the generated overlay .env (#1802): every user line is
+ *  preserved verbatim (comments, order, quoting) except managed-key lines,
+ *  which are rewritten to this launch's values; absent managed keys are
+ *  appended. Values stay unquoted while they match dotenv-safe characters,
+ *  otherwise JSON.stringify'd into a quoted basic string. */
+export function renderCodexDotEnv(userText: string | undefined, values: { origin: string; caPath: string }): string {
+    const formatted = (value: string): string => (/^[A-Za-z0-9:._/,\-]+$/.test(value) ? value : JSON.stringify(value));
+    const managed: Record<string, string> = {
+        HTTP_PROXY: values.origin,
+        HTTPS_PROXY: values.origin,
+        ALL_PROXY: values.origin,
+        NO_PROXY: "localhost,127.0.0.1,::1",
+        SSL_CERT_FILE: values.caPath.split("\\").join("/"),
+        BILLION_CONTEXT_PROXY: values.origin,
+    };
+    const lines = (userText ?? "").split(/\r?\n/);
+    if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+    const out: string[] = [];
+    const seen = new Set<string>();
+    for (const line of lines) {
+        const m = /^[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)[ \t]*=/.exec(line);
+        if (m !== null && m[1] !== undefined && (CODEX_DOTENV_MANAGED as readonly string[]).includes(m[1].toUpperCase())) {
+            out.push(`${m[1]}=${formatted(managed[m[1].toUpperCase()])}`);
+            seen.add(m[1].toUpperCase());
+            continue;
+        }
+        out.push(line);
+    }
+    for (const key of CODEX_DOTENV_MANAGED) {
+        if (!seen.has(key)) out.push(`${key}=${formatted(managed[key])}`);
+    }
+    return `${out.join("\n")}\n`;
+}
+
+/** #681/#1802: persistent <CODEX_HOME>-bili overlay. Carries (a) the bili MCP
+ *  server in a merged config.toml when a per-spawn conversationId is given
+ *  (inline `-c` args cannot survive cmd.exe on Windows), and (b) whenever the
+ *  launcher injected proxy routing (manageRouting), a generated .env pinning
+ *  exactly that routing, so the user's own $CODEX_HOME/.env can no longer
+ *  override it after spawn (#1802). Every other real-home entry is shared
+ *  (auth.json, sessions, model settings survive); generated files are
+ *  rewritten each launch and never linked back nor merged into the real home.
+ *  The overlay's .env is refresh-protected on EVERY launch, so a stale
+ *  generated copy can never merge back into the real home even when a later
+ *  launch does not manage it (#1802 review).
+ *  Returns the overlay dir to point CODEX_HOME at, or undefined when it cannot
+ *  be built (caller degrades: wire-injected compression still works, native
+ *  MCP tools / the .env protection do not). */
+export function prepareCodexHome(opts: {
+    codexHome: string;
+    origin: string;
+    caPath: string;
+    conversationId?: string;
+    manageRouting: boolean;
+}): string | undefined {
+    const { codexHome, origin, caPath, conversationId, manageRouting } = opts;
+    let userEnvText: string | undefined;
+    let manageDotEnv = manageRouting;
+    if (manageRouting) {
+        try {
+            userEnvText = fs.readFileSync(path.join(codexHome, ".env"), "utf8");
+        } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+                // Present but unreadable: a substitute .env would drop the
+                // user's own variables (often secrets) from the effective env
+                // — keep the legacy shared link and warn instead.
+                console.error(`bili: ${path.join(codexHome, ".env")} is not readable — keeping the shared .env, so the injected proxy/CA may be overridden by it.`);
+                manageDotEnv = false;
+            }
+        }
+    }
+    // ".env" is ALWAYS refresh-protected, even on launches that do not
+    // generate it: a previous routed launch may have left an owned copy in the
+    // overlay, and letting refresh treat that as user data would merge it back
+    // into the real home (#1802 review).
+    const generatedFiles: string[] = [".env"];
+    if (conversationId !== undefined) generatedFiles.push("config.toml");
     const overlay = `${codexHome}-bili`;
-    if (!refreshOverlayHome(codexHome, overlay, "config.toml")) return undefined;
-    writeOverlayFileAtomic(overlay, "config.toml", mergeCodexBiliBlock(txt, origin, conversationId));
+    if (!refreshOverlayHome(codexHome, overlay, generatedFiles)) return undefined;
+    if (manageDotEnv) {
+        try {
+            const st = fs.lstatSync(path.join(overlay, ".env"));
+            // Pre-#1802 overlays share .env with the real home (symlink, or a
+            // write-through hardlink where symlinks are unavailable): unlink
+            // before writing so the generated file stops touching the real one.
+            if (st.isSymbolicLink() || isWriteThroughHardlink(path.join(overlay, ".env"), path.join(codexHome, ".env"), st)) {
+                fs.unlinkSync(path.join(overlay, ".env"));
+            }
+        } catch {}
+        writeOverlayFileAtomic(overlay, ".env", renderCodexDotEnv(userEnvText, { origin, caPath }), 0o600);
+    } else {
+        // Non-generating launch: .env must end up SHARED with the real home
+        // (or absent) — drop any owned residue and re-link from the real one.
+        const envPath = path.join(overlay, ".env");
+        const realEnvPath = path.join(codexHome, ".env");
+        let needsLink = false;
+        try {
+            const st = fs.lstatSync(envPath);
+            const shared = st.isSymbolicLink()
+                ? fs.readlinkSync(envPath) === realEnvPath
+                : isWriteThroughHardlink(envPath, realEnvPath, st);
+            if (!shared) {
+                fs.unlinkSync(envPath);
+                needsLink = true;
+            }
+        } catch {
+            needsLink = true;
+        }
+        if (needsLink) {
+            try {
+                fs.lstatSync(realEnvPath);
+                linkOverlayEntry(codexHome, overlay, ".env");
+            } catch {}
+        }
+    }
+    if (conversationId !== undefined) {
+        let txt = "";
+        try {
+            txt = fs.readFileSync(path.join(codexHome, "config.toml"), "utf8");
+        } catch {}
+        writeOverlayFileAtomic(overlay, "config.toml", mergeCodexBiliBlock(txt, origin, conversationId));
+    }
     return overlay;
 }
 
@@ -2154,8 +2277,78 @@ export function prepareCodexHome(codexHome: string, origin: string, conversation
  *  plugin is injected even when the user has no custom providers (pure
  *  built-in deepseek route). Returns the patch file path (undefined when it
  *  could not be written — dsh then just boots without the plugin). */
-export function writeDshAcpPatch(dshHome: string): string | undefined {
-    const pluginUrl = pathToFileURL(selfDistFile("agent/dsh-native.js")).href;
+const DSH_BARE_ENTRY = "billion-context";
+
+/** #1590: shim package making the bare `billion-context` root resolvable from the two
+ *  anchors dsh uses at runtime, without touching dsh's own tree:
+ *  - the ESM host import is anchored at the active PROFILE dir, whose walk-up
+ *    reaches <DSH_HOME>/node_modules (every profile lives under DSH_HOME);
+ *  - the client scanner's CJS resolve anchors inside dsh's install tree and
+ *    only reaches a global npm prefix through NODE_PATH, which the launcher
+ *    seeds with the same dir. The shim is a minimal package.json carrying the
+ *  `dsh.client` declaration the scanner reads plus two SYMLINKS into bili's
+ *  live dist — an auto-update that moves dist self-heals on the next launch.
+ *  Returns false when nothing was written (existing shims stay untouched). */
+export function writeDshClientShimFiles(shimDir: string, hostBundle: string, clientBundle: string, version: string): boolean {
+    try {
+        if (!fs.existsSync(hostBundle) || !fs.existsSync(clientBundle)) return false;
+        fs.rmSync(shimDir, { recursive: true, force: true });
+        fs.mkdirSync(shimDir, { recursive: true });
+        fs.writeFileSync(
+            path.join(shimDir, "package.json"),
+            `${JSON.stringify({
+                name: "billion-context",
+                version,
+                type: "module",
+                exports: { ".": "./index.js", "./dsh": "./index.js", "./dsh/package.json": "./package.json", "./client": "./bundle.js" },
+                dsh: { client: { platform: "web" } },
+            })}\n`,
+        );
+        fs.symlinkSync(hostBundle, path.join(shimDir, "index.js"));
+        fs.symlinkSync(clientBundle, path.join(shimDir, "bundle.js"));
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+/** #1590: place the shim under a DSH_HOME variant (base home and/or the
+ *  launcher's overlay copy — overlay/profiles is a symlink back to the base
+ *  profiles, so both walk-up interpretations are covered). No-op when bili's
+ *  own dist bundles are missing (e.g. tests running before a build). */
+export function writeDshClientShim(dshHome: string): boolean {
+    const hostBundle = selfDistFile("agent/dsh-native.js");
+    const clientBundle = selfDistFile("agent/dsh-native-client.js");
+    let version = "0.0.0";
+    try {
+        version = JSON.parse(fs.readFileSync(path.join(selfPackageRoot(), "package.json"), "utf8")).version ?? version;
+    } catch {}
+    return writeDshClientShimFiles(path.join(dshHome, "node_modules", "billion-context"), hostBundle, clientBundle, version);
+}
+
+/** #1590: entry name for the launcher's --patch overlay. The BARE package
+ *  specifier "billion-context" (package root — never a subpath: dsh's client
+ *  scanner drops subpath entry names in exactPackageSpecifier) lets dsh load
+ *  the host half AND its client scanner attach the browser half (the "bili设置"
+ *  settings entry) — but only when the package root import lands on the dsh
+ *  host module, i.e. when the shim above (whose "." export points at
+ *  dsh-native) sits in this DSH_HOME's walk-up chain. Probed by resolving the
+ *  root specifier and checking the resolved file IS the host half: a stale or
+ *  foreign install (root "." pointing elsewhere, e.g. the CLI entry) or a
+ *  broken shim (dangling symlink) degrades to the legacy file URL (host half
+ *  only) instead of failing dsh boot or importing the wrong module. */
+export function dshPluginEntry(dshHome: string): string {
+    try {
+        const entry = createRequire(path.join(dshHome, "probe.cjs")).resolve(DSH_BARE_ENTRY);
+        const real = fs.realpathSync(entry);
+        if (!fs.existsSync(real) || !real.endsWith(path.join("agent", "dsh-native.js"))) throw new Error("root import does not resolve to the dsh host half");
+        return DSH_BARE_ENTRY;
+    } catch {}
+    return pathToFileURL(selfDistFile("agent/dsh-native.js")).href;
+}
+
+export function writeDshAcpPatch(dshHome: string, entryName?: string): string | undefined {
+    const pluginUrl = entryName ?? pathToFileURL(selfDistFile("agent/dsh-native.js")).href;
     const dir = `${dshHome}-bili`;
     try {
         fs.mkdirSync(dir, { recursive: true });
@@ -2418,19 +2611,29 @@ async function probeHealth(
 export interface HealthInfo {
     ok: boolean;
     instanceId?: string;
+    /** Responder's OS pid from /__bili/health. #1753: the spawn-wait
+     *  fallback uses this to verify the healthy responder on the preferred
+     *  port is the child WE spawned (and not a foreign proxy squatting it). */
+    pid?: number;
     /** #1330: watchdog state from /__bili/health. Absent on pre-#1330 builds —
-     *  unverifiable lifecycle, which the #1335 attach gate treats as unarmed. */
-    watchdog?: { armed: boolean };
+     *  unverifiable lifecycle, which the #1335 attach gate treats as unarmed.
+     *  #1753 (shutdown side): `watchers` is the live watcher-pid set — the
+     *  launcher consults it at client exit so a spawned-but-SHARED instance
+     *  is spared for its remaining owners instead of group-killed. */
+    watchdog?: { armed: boolean; watchers?: number[] };
 }
 
 async function fetchHealthInfoDefault(origin: string): Promise<HealthInfo | undefined> {
     try {
         const res = await fetch(healthUrl(origin), { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
         if (!res.ok) return undefined;
-        const data = (await res.json()) as { ok?: boolean; instanceId?: string; watchdog?: unknown };
+        const data = (await res.json()) as { ok?: boolean; instanceId?: string; pid?: unknown; watchdog?: unknown };
         const info: HealthInfo = { ok: Boolean(data.ok), instanceId: typeof data.instanceId === "string" ? data.instanceId : undefined };
+        if (typeof data.pid === "number") info.pid = data.pid;
         if (data.watchdog && typeof data.watchdog === "object" && typeof (data.watchdog as { armed?: unknown }).armed === "boolean") {
-            info.watchdog = { armed: (data.watchdog as { armed: boolean }).armed };
+            const wd = data.watchdog as { armed: boolean; watchers?: unknown };
+            const watchers = Array.isArray(wd.watchers) ? wd.watchers.filter((w): w is number => typeof w === "number") : undefined;
+            info.watchdog = { armed: wd.armed, watchers };
         }
         return info;
     } catch {
@@ -2538,6 +2741,16 @@ export function attachGateAllows(health: HealthInfo, attachExternal: boolean): b
     return health.watchdog?.armed === true;
 }
 
+/** #1660: the user-sovereignty zone marker — neither a declared lane nor a
+ *  launcher launch token exists only for a manually started `bili start`
+ *  daemon. By definition the user maintains it (they typed the command; it
+ *  has no session lifecycle BY DESIGN, not by drift), so lanes may attach to
+ *  it despite the unarmed watchdog — code-fingerprint and config-shape
+ *  compatibility still apply, and an older build stays incompatible. */
+function isUserZoneInstance(inst: ProxyInstanceFile): boolean {
+    return inst.lane === undefined && inst.launchToken === undefined;
+}
+
 function gateRefusalMessage(inst: ProxyInstanceFile, health: HealthInfo): string {
     const reason = health.watchdog && health.watchdog.armed === false
         ? "it reports NO session-lifecycle watchdog (started without BILI_PARENT_PID, e.g. manual `bili start`)"
@@ -2567,7 +2780,9 @@ function pickAttachable(
         if (opts.strictPort && c.inst.port !== opts.port) { diag?.(`native-attach: skip ${c.inst.origin} (pid ${c.inst.pid}): port mismatch`); continue; }
         // #1335: lifecycle gate — an unarmed (or unverifiable) listener is
         // never an attach target by default; log the refusal once per origin.
-        if (!attachGateAllows(c.health, attachExternal)) {
+        // #1660: a user-zone instance (manual `bili start`) is exempt — the
+        // missing watchdog is the user's deliberate posture, not drift.
+        if (!attachGateAllows(c.health, attachExternal) && !isUserZoneInstance(c.inst)) {
             if (!refusedLog.has(c.inst.origin)) {
                 refusedLog.add(c.inst.origin);
                 console.error(gateRefusalMessage(c.inst, c.health));
@@ -2886,11 +3101,23 @@ export async function ensureProxyRunning(
     // itself and retries on EADDRINUSE, reporting the real origin through
     // the instance file via this launchToken.
     const launchToken = randomUUID();
-    // #446: with no explicit --port the launcher binds an OS-assigned
-    // ephemeral port — its private proxy never squats on 8787, so clients
-    // pointed there only ever reach an explicitly-started `bili start`.
-    // The child's EADDRINUSE retry covers the pick/spawn race.
-    const port = opts.port > 0 ? opts.port : await pickEphemeralPort(opts.host);
+    // #1660: a lane'd launch with no explicit port binds the SELF-MANAGED
+    // ZONE — the lane's sticky port (a past ladder drift it still points at)
+    // else the zone base — instead of an OS-assigned ephemeral. An undeclared
+    // lane (manual `bili start`, the user zone on 8787) keeps the ephemeral
+    // default. The child's EADDRINUSE +1 ladder covers the pick/spawn race
+    // AND a squatted preferred port (zero-config resolution: the lane lands
+    // on base+1 and records it sticky; #1660).
+    const zoneLane = opts.lane !== undefined && opts.port <= 0 ? opts.lane : undefined;
+    const preferredPort = deps?.zonePreferredPort ?? lanePreferredPort;
+    const port = opts.port > 0
+        ? opts.port
+        : zoneLane !== undefined
+          ? preferredPort(zoneLane)
+          : await pickEphemeralPort(opts.host);
+    const settleZonePort = (settled: number): void => {
+        if (zoneLane !== undefined) (deps?.writeZonePort ?? writeZonePort)(zoneLane, settled);
+    };
     if (!script) throw new Error("bili: cannot resolve launcher script path");
     const logPath = path.join(os.tmpdir(), `bili-proxy-${port}.log`);
     const logFd = fs.openSync(logPath, "a");
@@ -2975,6 +3202,9 @@ export async function ensureProxyRunning(
         // emits 'error', not 'exit'. Unhandled, it becomes an uncaughtException
         // that kills the host process; capture it so we fail fast with the cause.
         let childError: unknown;
+        // #1753: announce a healthy-but-foreign responder on the preferred port
+        // at most once — silence would hide exactly the misroute this fix closes.
+        let squatterAnnounced = false;
         child.on?.("exit", (...rest: unknown[]) => {
             childExit = {
                 code: typeof rest[0] === "number" ? rest[0] : null,
@@ -2992,6 +3222,10 @@ export async function ensureProxyRunning(
             const inst = readInstance();
             if (isProxyInstanceFile(inst) && inst.launchToken === launchToken) {
                 if (await probeHealth(inst.origin, fetchImpl)) {
+                    // #1660: settle the lane's sticky record on the port the
+                    // child actually bound (preferred or laddered) so every
+                    // later launch of this lane tries it first.
+                    settleZonePort(inst.port);
                     return { origin: inst.origin, port: inst.port, child, logPath };
                 }
                 continue;
@@ -3001,9 +3235,27 @@ export async function ensureProxyRunning(
             // origin when NO record vouches for it — a LIVE record's owner owns
             // the discovery surface and our child is retry-binding elsewhere.
             // A stale record (dead pid / legacy plain) cannot vouch for anything.
+            // #1753: "healthy on the preferred port" alone is NOT proof the
+            // responder is our child — a foreign proxy can be squatting exactly
+            // that port (which is WHY our child laddered away). Verify the
+            // responder's pid matches the spawned child before exporting its
+            // origin to the client; otherwise keep waiting for the launchToken
+            // handshake instead of pinning the client to an instance the attach
+            // gate (#1225) itself would have rejected.
             const stale = !isProxyInstanceFile(inst) || !isPidAlive(inst.pid);
-            if (stale && (await probeHealth(proxyOrigin(opts.host, port), fetchImpl))) {
-                return { origin: proxyOrigin(opts.host, port), port, child, logPath };
+            if (stale) {
+                const preferredOrigin = proxyOrigin(opts.host, port);
+                const info = await fetchHealthInfo(preferredOrigin);
+                if (info?.ok && child.pid !== undefined && info.pid === child.pid) {
+                    settleZonePort(port);
+                    return { origin: preferredOrigin, port, child, logPath };
+                }
+                if (info?.ok && !squatterAnnounced) {
+                    squatterAnnounced = true;
+                    console.error(
+                        `bili: port ${port} answers health${info.pid !== undefined ? ` (pid ${info.pid})` : ""} but is not the proxy this launcher spawned (child pid ${child.pid ?? "?"}) — waiting for the spawned instance to report its real origin`,
+                    );
+                }
             }
         }
         if (childError !== undefined) {
@@ -3042,6 +3294,46 @@ export function stopProxy(handle: ProxyHandle): void {
     try {
         child.kill?.();
     } catch {}
+}
+
+/** #1753 (shutdown side): the wrapper's exit path used to kill the instance
+ *  it spawned unconditionally — taking down every ATTACHED session riding
+ *  that shared instance (live incident: exiting one `bili pi` killed the
+ *  proxy another live `bili pi` was watching; the client burned its 3
+ *  retries and died until some later wrapper re-spawned an instance on the
+ *  same port). The server's watcher-set watchdog (#7) already implements
+ *  the correct "die when the LAST owner exits" semantics; this guard defers
+ *  to it: if /__bili/health still lists watchers other than ourselves, the
+ *  instance is spared and the server retires it after its last watcher
+ *  leaves (WATCHER_IDLE_GRACE_MS). Health-parse failures degrade to the old
+ *  behavior (kill), which is safe: nothing else claims the instance. */
+export async function stopProxyGuarded(
+    handle: ProxyHandle,
+    fetchHealthInfo: (origin: string) => Promise<HealthInfo | undefined>,
+): Promise<void> {
+    if (handle.attached) return;
+    const child = handle.child;
+    if (!child || child.pid === undefined) return;
+    if (process.platform === "win32") {
+        // #414: POSIX-only kill path; win32 relies on the server-side
+        // parent-gone watchdog, which already honors the watcher set.
+        return;
+    }
+    let info: HealthInfo | undefined;
+    try {
+        info = await fetchHealthInfo(handle.origin);
+    } catch {
+        info = undefined;
+    }
+    const watchers = info?.ok ? (info.watchdog?.watchers ?? []) : [];
+    const others = watchers.filter((w) => w !== process.pid);
+    if (others.length > 0) {
+        console.error(
+            `bili: sparing the shared proxy at ${handle.origin} — ${others.length} other watcher${others.length === 1 ? "" : "s"} still attached; it will retire when the last one exits`,
+        );
+        return;
+    }
+    stopProxy(handle);
 }
 
 /** #679: quote one token for cmd.exe's line parser. Only whitespace-bearing
@@ -3307,6 +3599,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
     const extMitmHosts = base === "pi" || base === "omp"
         ? dedupeInOrder([...DEFAULT_MITM_DOMAINS, ...resolveMitmDomains(childMitmEnv), ...domains, ...discoverMitmDomains(discoveryEnv)])
         : [];
+    const extNonHttpProviders = base === "pi" || base === "omp" ? resolveNonHttpProviders(process.env) : [];
     const handle = await ensureProxyRunning({ host, port, passthrough, debug, lane: base, mitmDomains: domains, modelWindows: collectModelWindows(config, base), modelMaxOutputs: collectModelMaxOutputs(config, base) }, deps);
     console.error(
         `bili: started proxy at ${handle.origin} (MITM domains: ${domains.length ? domains.join(", ") : "defaults"})` +
@@ -3360,7 +3653,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // at extension load from the env manifest (registerProvider; see
         // buildPiEnv), and the old settings.json compaction-off generation is
         // replaced by the extension's session_before_compact cancel.
-        env = buildPiEnv(origin, ca, stripInheritedProxy(process.env), routes.httpRewrites, routes.httpsRewrites, extMitmHosts);
+        env = buildPiEnv(origin, ca, stripInheritedProxy(process.env), routes.httpRewrites, routes.httpsRewrites, extMitmHosts, extNonHttpProviders);
         // #535: never let a stale inherited overlay redirect (from a legacy
         // launch or a shell exported inside one) leak into the child — pi
         // always runs on its REAL home now.
@@ -3384,8 +3677,12 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // (the native summarizer would destroy the ACP-tagged context); manual
         // /compact stays user-owned and its surviving summary is archived by
         // the proxy on session_compact. https upstreams ride cert-MITM like pi.
-        env = buildPiEnv(origin, ca, stripInheritedProxy(process.env), routes.httpRewrites, [], extMitmHosts);
+        env = buildPiEnv(origin, ca, stripInheritedProxy(process.env), routes.httpRewrites, [], extMitmHosts, extNonHttpProviders);
         delete env.PI_CODING_AGENT_DIR;
+        // #1774: the child always rides bili's proxy here, so a long preflight can
+        // hold the first SSE event well past OMP's default 300s first-parsed-event
+        // watchdog — export a wider first-event budget unless the user pinned one.
+        applyOmpFirstEventTimeout(env);
         const ompExt = selfDistFile("agent/omp.js");
         if (ompExt && fs.existsSync(ompExt) && !ompPluginLoadedFrom(ompRealHome)) {
             clientArgs = ["-e", ompExt, ...clientArgs];
@@ -3493,7 +3790,21 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // settings rewrite above) unless a persistent `bili plugin install dsh`
         // already provides it — a second `id: bili-native` insert would trip
         // cordis' duplicate-entry-id check and hard-fail dsh boot.
-        const dshAcpPatch = dshNativeInstalled() ? undefined : writeDshAcpPatch(dshHomeDir);
+        // #1590: seed the resolvable shim under BOTH DSH_HOME variants (the
+        // overlay's profiles symlink back to the base home, so ESM walk-up
+        // from the real profile path lands there) and point the client
+        // scanner's CJS resolution at the base one through NODE_PATH —
+        // together they let dsh attach our browser half (the settings entry)
+        // alongside the host plugin in every lane.
+        writeDshClientShim(dshHomeDir);
+        if (dshOverlayHome !== undefined) writeDshClientShim(dshOverlayHome);
+        const dshNm = path.join(dshHomeDir, "node_modules");
+        const prevNodePath = env.NODE_PATH;
+        env.NODE_PATH = prevNodePath !== undefined && prevNodePath.length > 0 ? `${dshNm}${path.delimiter}${prevNodePath}` : dshNm;
+        let dshAcpPatch: string | undefined;
+        if (!dshNativeInstalled()) {
+            dshAcpPatch = writeDshAcpPatch(dshHomeDir, dshPluginEntry(dshOverlayHome ?? dshHomeDir));
+        }
         if (dshAcpPatch) clientArgs = dshArgsWithPatch(clientArgs, dshAcpPatch);
     } else if (base === "kimi") {
         // #757: cert-MITM like hermes/dsh — Kimi Code honors standard proxy
@@ -3680,10 +3991,11 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         // Per-spawn conversation id for the MCP shell's headless
         // self-registration (codex provides no session id of its own).
         const codexConversationId = injectMcp ? randomUUID() : undefined;
+        const codexCaPath = resolveCombinedCaPath(process.env);
         if (directUrl) {
             env = { ...process.env, BILLION_CONTEXT_PROXY: origin };
         } else {
-            env = buildCodexEnv(origin, resolveCombinedCaPath(process.env), stripInheritedProxy(process.env));
+            env = buildCodexEnv(origin, codexCaPath, stripInheritedProxy(process.env));
             clientArgs = buildCodexArgs(origin, routes.httpRewrites, routes.httpsRewrites, clientArgs);
             const budgetArgs = await resolveCodexBudgetArgs({
                 model: config.codex?.model,
@@ -3697,12 +4009,17 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
                 console.error(`bili: codex budget aligned — ${budgetArgs.slice(2).join(", ")} (model: ${config.codex?.model})`);
             }
         }
-        if (injectMcp && codexConversationId) {
+        // #1802: every routed launch points CODEX_HOME at the overlay so the
+        // generated .env pins this launch's proxy/CA against the user's own
+        // $CODEX_HOME/.env (load_dotenv overrides spawn env after start);
+        // direct-URL launches only need it to carry the MCP server block.
+        if (!directUrl || (injectMcp && codexConversationId !== undefined)) {
             const inj = prepareCodexMcpInjection({
-                platform: deps.platform ?? process.platform,
                 codexHome: resolveCodexHome(process.env),
                 origin,
+                caPath: codexCaPath,
                 conversationId: codexConversationId,
+                manageRouting: !directUrl,
             });
             if (inj.clientArgs.length > 0) clientArgs = [...inj.clientArgs, ...clientArgs];
             Object.assign(env, inj.envPatch);
@@ -3778,7 +4095,7 @@ export async function runLaunch(params: RunLaunchParams, deps: LauncherDeps = {}
         console.error(`bili: failed to launch ${params.client}: ${err instanceof Error ? err.message : String(err)}`);
         code = 1;
     } finally {
-        stopProxy(handle);
+        await stopProxyGuarded(handle, deps.fetchHealthInfo ?? fetchHealthInfoDefault);
         if (gooseOverlay) {
             try {
                 finalizeGooseHome(gooseOverlay);
@@ -3847,7 +4164,7 @@ export async function runTestPi(params: RunTestPiParams, deps: LauncherDeps = {}
         console.error(`bili: pi test failed: ${err instanceof Error ? err.message : String(err)}`);
         code = 1;
     } finally {
-        stopProxy(handle);
+        await stopProxyGuarded(handle, deps.fetchHealthInfo ?? fetchHealthInfoDefault);
     }
     process.exit(code ?? 0);
 }

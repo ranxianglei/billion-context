@@ -6,6 +6,8 @@ import test from "node:test";
 process.env.NODE_ENV = "test";
 // Fail fast on 4xx retries so the stream-learn path exercises immediately.
 process.env.BILI_REPLAY_RETRY_MAX = "1";
+// Zero backoff so #1767's transient-retry legs (truncation is now retried) run instantly.
+process.env.BILI_REPLAY_RETRY_BASE_MS = "0";
 // Short dead-end cooldown so the expiry leg of the #726 test stays fast.
 process.env.BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS = "400";
 
@@ -450,7 +452,9 @@ test("#780 truncated summary stream is unusable: diagnosis names truncation, bou
             `fail-fast message must carry the truncation diagnosis, got: ${j.error?.message}`,
         );
         const summaries = calls.filter((c) => c.summary);
-        assert.ok(summaries.length >= 2 && summaries.length <= 9, `summary calls must be bounded, got ${summaries.length}: ${JSON.stringify(summaries)}`);
+        // #1767: truncation is now transient-classified, so each span gets up to
+        // two extra same-span draws; the ceiling is 2 protection regimes x 16.
+        assert.ok(summaries.length >= 2 && summaries.length <= 32, `summary calls must be bounded, got ${summaries.length}: ${JSON.stringify(summaries)}`);
         assert.ok(!calls.some((c) => !c.summary), "nothing may be forwarded on failure");
 
         const sess = listSessions().find((s) => s.id.includes("s780-trunc"));

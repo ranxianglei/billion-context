@@ -161,11 +161,11 @@ test("prefix-affinity: mid-conversation system items remain identity data (#1148
 
 test("prefix-affinity: LRU cap bounds tracked sessions", () => {
     const r = new PrefixAffinityResolver();
-    for (let i = 0; i < 262; i++) {
+    for (let i = 0; i < 1030; i++) {
         const a = r.resolve([user(`unique conversation number ${i} with filler content`)]);
         r.note(a!.sessionId, a!.incomingDepth, a!.tailHash, a!.itemHashes);
     }
-    assert.equal(r.trackedSessionIds().length, 256);
+    assert.equal(r.trackedSessionIds().length, 1024);
 });
 
 test("prefix-affinity: stableStringify sorts keys recursively", () => {

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { SessionStore } from "../src/persist.ts";
@@ -8,6 +8,7 @@ import { Session, cacheBlockContent } from "../src/session.ts";
 import { exportSession, listSessions } from "../src/export.ts";
 import { parseArgs } from "../src/cli.ts";
 import { createInitialState } from "acp-kernel";
+import { rmrf } from "./tmp-rm.ts";
 
 function makeSession(id: string, title: string, label: string | undefined): Session {
     return {
@@ -69,7 +70,7 @@ test("bili export lists sessions and renders a handoff doc with summaries and or
 
         await assert.rejects(() => exportSession("nope", { dir }), /no session matches/);
     } finally {
-        rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 

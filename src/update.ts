@@ -30,7 +30,7 @@ import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { cacheDir } from "./paths.js";
 import { log as loggerLog, type Logger } from "./logger.js";
-import { refreshDshProfileBundles, isDshProfileCopy } from "./dsh-channel.js";
+import { refreshDshProfileBundles, isDshProfileCopy, dshProfileDirs, dshProfileDependsOnBili, dshProfileDepSpec, isRegistryDepSpec, DSH_PACKAGE } from "./dsh-channel.js";
 import { resolveDshHome, resolveKimiHome, resolveOmpHome, resolvePiHome } from "./client-config.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import type { FetchOptions } from "./fetch-util.js";
@@ -511,6 +511,10 @@ export type UpdateOptions = {
     /** Dist-tag channel to follow (default "latest"), e.g. "dev", "stable".
      *  Publishing a PR (pr-N tag) never pulls a user on another channel. */
     updateTag?: string;
+    /** Explicit install dir override (programmatic callers / test seam) —
+     *  skips findInstallDir's walk-up. Same shape as runAdvisoryCheck's
+     *  option. */
+    installDir?: string;
     /** #1481: returns true while the advisory watcher holds an active
      *  critical-bug advisory. The normal loop defers to it (its target version
      *  wins over "follow latest"), otherwise the two loops would fight over
@@ -620,6 +624,67 @@ export async function refreshDshProfileCopy(
     }
 }
 
+/** Registry-pinned dsh profile copies whose installed version is older
+ *  than the global one ("name@version" per entry). Dev pins (link:/file:)
+ *  and declared-but-not-installed mounts are out of scope: neither
+ *  participates in the mixed-copy crash. */
+async function staleDshProfileCopies(globalVersion: string, env: NodeJS.ProcessEnv): Promise<string[]> {
+    let dirs: string[];
+    try {
+        dirs = dshProfileDirs(env);
+    } catch {
+        return []; // dsh has never run on this machine
+    }
+    const out: string[] = [];
+    for (const dir of dirs) {
+        if (!dshProfileDependsOnBili(dir)) continue;
+        const spec = dshProfileDepSpec(dir);
+        if (spec !== undefined && !isRegistryDepSpec(spec)) continue;
+        const version = await readDiskVersion(path.join(dir, "node_modules", DSH_PACKAGE));
+        if (version && isVersionNewer(globalVersion, version)) out.push(`${path.basename(dir)}@${version}`);
+    }
+    return out;
+}
+
+/** #1803: dsh's CLI reads the bili bundle yml from the GLOBAL install but
+ *  resolves the entry module from each profile's own node_modules. A profile
+ *  copy left behind the global version — manual `npm i -g`, or a post-update
+ *  refresh that failed and never retried — makes the bare-name entry resolve
+ *  to the old package's CLI root (a module with zero exports), so dsh
+ *  hard-crashes at boot ("invalid plugin …") and the crash also blocks the
+ *  profile copy's own #1196 self-heal. Drive convergence from the global
+ *  install's periodic check: detect registry-pinned profile copies older
+ *  than the global disk version and refresh them through dsh's own plugin
+ *  channel under the shared update lock — so a failed refresh retries every
+ *  cycle instead of only on the next install event. Silent and spawn-free
+ *  while everything is in step. */
+export async function convergeDshProfileBundles(
+    installDir: string | undefined,
+    globalVersion: string | undefined,
+    env: NodeJS.ProcessEnv = process.env,
+    log: Logger = loggerLog,
+): Promise<void> {
+    if (!installDir || !globalVersion) return;
+    let stale: string[];
+    try {
+        stale = await staleDshProfileCopies(globalVersion, env);
+    } catch {
+        return; // profile scanning must never break the update loop
+    }
+    if (stale.length === 0) return;
+    log("info", `[update] dsh profile bundle(s) behind the global copy (${stale.join(", ")} < ${globalVersion}) — converging via dsh's plugin channel (#1803)`);
+    const lock = await tryAcquireLock();
+    if (!lock) {
+        log("info", `[update] another process is updating, will check next cycle`);
+        return;
+    }
+    try {
+        await refreshDshProfileBundles(globalVersion, log, env);
+    } finally {
+        await lock.release();
+    }
+}
+
 /** Run a single check (throttled unless `force`). Safe to call frequently. */
 export async function checkForUpdate(opts: UpdateOptions, force = false): Promise<void> {
     if (!opts.autoUpdate && !force) return;
@@ -660,7 +725,7 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         // clone (node dist/index.js start). An in-place tarball copy would
         // silently rewrite tracked files (the version pin, READMEs), so refuse
         // to self-update here instead of proceeding.
-        const installDir = await findInstallDir(opts.packageName);
+        const installDir = opts.installDir ?? await findInstallDir(opts.packageName);
         if (installDir && await isGitWorkingTree(installDir)) {
             loggerLog("info", `[update] running from a source checkout (${installDir}) \u2014 skipping auto-update (use npm install -g ${opts.packageName})`);
             return;
@@ -720,6 +785,10 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
             if (diskVersion && staleInstallStatus(diskVersion, opts.currentVersion) === "restart") {
                 notifyStaleInstall(opts, diskVersion);
             }
+            // #1803: converge dsh profile copies left behind this global
+            // version — dsh reads the yml from here but the entry module from
+            // each profile, so a stale copy hard-crashes dsh at boot.
+            await convergeDshProfileBundles(installDir, diskVersion, process.env);
             return;
         }
 

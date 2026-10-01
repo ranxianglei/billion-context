@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
+import { assertPortDead } from "../port-race.js";
 
 const run = process.env.ACP_TEST_E2E === "1";
 const skipReason = !run ? "set ACP_TEST_E2E=1 (real codex + real upstream; costs tokens)" : undefined;
@@ -74,7 +75,10 @@ function writeCodexConfig(ctx: Ctx): void {
     ].join("\n"));
 }
 
-function startProxy(ctx: Ctx, env: Record<string, string> = {}): Promise<void> {
+async function startProxy(ctx: Ctx, env: Record<string, string> = {}): Promise<void> {
+    // #1689: the child binds ctx.port itself — prove the pre-picked port is
+    // still free right before spawn (also waits out our own SIGTERM'd proxy).
+    await assertPortDead(ctx.port);
     return new Promise((resolve, reject) => {
         const logPath = path.join(WORK, `bili-${Date.now()}.log`);
         const child = spawn(process.execPath, [DIST, "start", "--port", String(ctx.port), "--no-auto-update"], {

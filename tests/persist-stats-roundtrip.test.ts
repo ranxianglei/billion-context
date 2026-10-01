@@ -1,11 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { join } from "node:path";
 import { createInitialState } from "acp-kernel";
 import { SessionStore } from "../src/persist.ts";
 import type { Session } from "../src/session.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 function makeSession(id: string): Session {
     return {
@@ -45,6 +46,6 @@ test("stats retrieval-quality counters survive a reload round-trip", async () =>
         assert.equal(back.stats.rangeRestores, 2, "control counter still round-trips");
         await reloaded.flushAll([]);
     } finally {
-        rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });

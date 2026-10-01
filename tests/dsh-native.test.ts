@@ -5,11 +5,14 @@ import os from "node:os";
 import path from "node:path";
 import http from "node:http";
 import { pathToFileURL } from "node:url";
-import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, _resetRegisterForTest, _setSpawnForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _noteRoutedForTest, _resetRoutedForTest } from "../src/agent/dsh-native.ts";
+import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, _resetRegisterForTest, _setSpawnForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest } from "../src/agent/dsh-native.ts";
+import { rmrf } from "./tmp-rm.ts";
 
-// #1365: legacy dead-attach suites must not pay the 5s routed-evidence grace
-// default (waitFor below caps at 5s — a full grace would race it). Pinned-path
-// tests override per-test.
+// #1365: legacy dead-attach suites see no routed traffic, so without this pin
+// each would sit out the FULL routed-evidence grace window (default 5s,
+// native-intercept observeRoutedOrigin) before the spawn fallback — keep the
+// grace tiny so the POLL_DEADLINE_MS cap dominates timing. Pinned-path tests
+// override per-test.
 process.env.BILI_ATTACH_EVIDENCE_GRACE_MS = "30";
 
 import { dshNativeInstalled, isNpmInstallForm, pluginInstall, pluginRemove, pluginStatusAll, selfPackageRoot } from "../src/plugin-install.ts";
@@ -63,7 +66,7 @@ test("stripLegacyManagedBlock: restores the placeholder when nothing meaningful 
         assert.equal(fs.readFileSync(path.join(dir, "cordis.patch.yml"), "utf8"), `${HEADER}[]\n`);
         assert.equal(stripLegacyManagedBlock(dir), false);
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -80,7 +83,7 @@ test("stripLegacyManagedBlock: preserves user entries; leaves non-managed files 
         assert.equal(stripLegacyManagedBlock(dir), false);
         assert.equal(fs.readFileSync(path.join(dir, "cordis.patch.yml"), "utf8"), `${HEADER}[]\n`);
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -95,7 +98,7 @@ test("stripLegacyManagedBlock: preserves user comments when nothing meaningful r
         assert.ok(out.includes("[]"));
         assert.ok(!out.includes(DSH_PATCH_BEGIN));
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -194,7 +197,7 @@ test("dsh install drives the dsh plugin channel per profile, no managed blocks w
         });
     } finally {
         _setDshRunnersForTest(undefined);
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -229,7 +232,7 @@ test("dsh remove uninstalls through the same channel and migrates legacy blocks"
         });
     } finally {
         _setDshRunnersForTest(undefined);
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -245,7 +248,7 @@ test("dsh install surfaces channel failures with context", async () => {
         });
     } finally {
         _setDshRunnersForTest(undefined);
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -272,7 +275,7 @@ test("dsh status: bundle / mixed / legacy / absent", async () => {
             assert.match(st(), /legacy managed block — rerun 'bili plugin install dsh' to migrate/);
         });
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -296,7 +299,7 @@ test("dshNativeInstalled: true iff any profile has the bundle or a legacy manage
             assert.equal(dshNativeInstalled(), false);
         });
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -312,7 +315,7 @@ test("dshBundleInstalled: true iff the profile manifest lists billion-context as
         fs.writeFileSync(path.join(home, "web", "package.json"), JSON.stringify({ dsh: { profile: { bundles: ["billion-context"] } } }));
         assert.equal(dshBundleInstalled(path.join(home, "web")), true);
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -328,7 +331,7 @@ test("dshProfileDirs: skips node_modules, errors when profiles root is absent", 
             assert.ok(dirs[0].endsWith("headless"));
         });
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -406,10 +409,13 @@ type RegisteredTool = {
     execute: (args: Record<string, unknown>, exec: { agent?: { session?: { id?: unknown } }; signal?: AbortSignal }) => Promise<unknown>;
 };
 
-/** Poll until cond() holds (10ms ticks, 5s cap) — a fixed sleep races on
- *  slow CI runners (windows loopback fetch can outlast 50ms). */
+// #1785: poll budget raised 5s→15s so a loaded dev host clears a loopback round-trip (fast CI is sub-second).
+const POLL_DEADLINE_MS = 15000;
+
+/** Poll until cond() holds (10ms ticks, POLL_DEADLINE_MS cap) — a fixed sleep
+ *  races on slow runners (a loopback fetch can outlast tens of ms). */
 async function waitFor(cond: () => boolean, what: string): Promise<void> {
-    const deadline = Date.now() + 5000;
+    const deadline = Date.now() + POLL_DEADLINE_MS;
     while (!cond()) {
         if (Date.now() > deadline) throw new Error(`timeout waiting for ${what}`);
         await new Promise((r) => setTimeout(r, 10));
@@ -418,15 +424,20 @@ async function waitFor(cond: () => boolean, what: string): Promise<void> {
 
 function mockCtx() {
     const tools: RegisteredTool[] = [];
-    const commands: Array<{ name: string; handler: () => Promise<{ kind: string; text: string }> }> = [];
+    // #1677: handlers may receive the host-passed invocation (carrying the invoking
+    // agent's session id); tests call them with or without it to cover both paths.
+    type CmdInvocation = { agent?: { session?: { id?: unknown } } };
+    const commands: Array<{ name: string; handler: (invocation?: CmdInvocation) => Promise<{ kind: string; text: string }> }> = [];
     let initiator: { session?: { id?: unknown } } | undefined = undefined;
     // #955 runtime-info sources: tests can attach llm/agentDefaultModel and
     // replay them through the same dynamic ctx.inject path production uses.
     let llm: { resolveModelInfo?: (provider: string, model: string) => Promise<{ context?: { contextWindow?: number }; defaultMaxTokens?: number } | undefined> } | undefined = undefined;
     let agentDefaultModel: { currentSelection?: () => { provider?: string; model?: string } | undefined } | undefined = undefined;
+    // #1772 profile diagnostics: replayed through the same dynamic inject path.
+    let profileContext: { startedBundles?: readonly string[] } | undefined = undefined;
     return {
         tools: { register: (t: RegisteredTool) => tools.push(t) },
-        commands: { register: (c: { name: string; handler: () => Promise<{ kind: string; text: string }> }) => commands.push(c) },
+        commands: { register: (c: { name: string; handler: (invocation?: { agent?: { session?: { id?: unknown } } }) => Promise<{ kind: string; text: string }> }) => commands.push(c) },
         agents: { currentInitiator: () => initiator },
         setInitiator: (i: { session?: { id?: unknown } } | undefined) => (initiator = i),
         registeredTools: tools,
@@ -435,11 +446,15 @@ function mockCtx() {
             if (deps.includes("llm") && deps.includes("agentDefaultModel") && llm !== undefined && agentDefaultModel !== undefined) {
                 callback({ llm, agentDefaultModel });
             }
+            if (deps.includes("profileContext") && profileContext !== undefined) {
+                callback({ profileContext });
+            }
         },
         setModelServices: (l: typeof llm, a: typeof agentDefaultModel) => {
             llm = l;
             agentDefaultModel = a;
         },
+        setProfileContext: (pc: { startedBundles?: readonly string[] } | undefined) => (profileContext = pc),
     };
 }
 
@@ -501,7 +516,7 @@ test("apply() attach mode: registers manifest tools verbatim, gates headers, for
         });
     } finally {
         proxy.close();
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
         _resetRegisterForTest(undefined);
     }
 });
@@ -531,6 +546,142 @@ test("apply() /acp-cache (#1146): forwards acp_cache bound to the initiator sess
                 const latest = await cacheCmd.handler();
                 assert.equal(latest.kind, "success");
                 assert.deepEqual(calls, [{ conversationId: "conv-latest", tool: "acp_cache", args: {} }]);
+                // #1791: settle the attach chain while the mock is still open
+                await _stateToolsReadyForTest();
+            } finally {
+                cap.close();
+                _resetRegisterForTest(undefined);
+            }
+        });
+    } finally {
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+    }
+});
+
+// #1677: the command executor hands the invoking agent to the handler via the
+// invocation; the command path carries NO AsyncLocalStorage attribution, so the
+// old code always fell back to fetchStatusLatest and showed ANOTHER session's panel.
+test("apply() /acp (#1677): resolves the invoking agent's session id from the host-passed invocation, not latest", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1677-acp-"));
+    const statusUrls: string[] = [];
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined }, async () => {
+            const cap = await startMockProxy([], (url) => {
+                statusUrls.push(url);
+                if (url.includes("conversationId=session-inv")) return { ok: true, conversationId: "session-inv", panel: "PANEL-SPECIFIC" };
+                if (url.includes("fallback=latest")) return { ok: true, conversationId: "conv-latest", panel: "PANEL-LATEST" };
+                return undefined;
+            });
+            try {
+                _resetRegisterForTest(cap.origin);
+                process.env.BILLION_CONTEXT_PROXY = cap.origin;
+                const ctx = mockCtx();
+                apply(ctx);
+                const acpCmd = ctx.registeredCommands.find((c) => c.name === "acp");
+                assert.ok(acpCmd, "acp registered");
+
+                // NO initiator set — only the invocation carries the session id
+                const out = await acpCmd.handler({ agent: { session: { id: "session-inv" } } });
+                assert.equal(out.kind, "success");
+                assert.ok(out.text.includes("PANEL-SPECIFIC"), `expected the invoking session's panel, got: ${out.text}`);
+                assert.ok(!out.text.includes("PANEL-LATEST"), "must not fall back to the latest session");
+                assert.ok(!out.text.includes("not known to the proxy"), "a resolvable session must not be annotated");
+                assert.ok(statusUrls.some((u) => u.includes("conversationId=session-inv")), "status was queried for the invoking session");
+                assert.ok(!statusUrls.some((u) => u.includes("fallback=latest")), "no latest-fallback query for a resolvable session");
+                // #1791: settle the attach chain while the mock is still open
+                await _stateToolsReadyForTest();
+            } finally {
+                cap.close();
+                _resetRegisterForTest(undefined);
+            }
+        });
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("apply() /acp-cache (#1677): binds acp_cache to the invoking agent's session id from the invocation", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1677-cache-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined }, async () => {
+            const calls: Array<{ conversationId: string; tool: string; args: unknown }> = [];
+            const cap = await startMockProxy(calls, (url) =>
+                url.includes("fallback=latest") ? { ok: true, conversationId: "conv-latest", panel: "PANEL-OK" } : undefined);
+            try {
+                _resetRegisterForTest(cap.origin);
+                process.env.BILLION_CONTEXT_PROXY = cap.origin;
+                const ctx = mockCtx();
+                apply(ctx);
+                const cacheCmd = ctx.registeredCommands.find((c) => c.name === "acp-cache");
+                assert.ok(cacheCmd, "acp-cache registered");
+
+                // NO initiator set — only the invocation carries the session id
+                const out = await cacheCmd.handler({ agent: { session: { id: "session-inv" } } });
+                assert.equal(out.kind, "success");
+                assert.deepEqual(calls, [{ conversationId: "session-inv", tool: "acp_cache", args: {} }]);
+                assert.ok(!out.text.includes("not known to the proxy"), "a resolvable session must not be annotated");
+                // #1791: settle the attach chain while the mock is still open
+                await _stateToolsReadyForTest();
+            } finally {
+                cap.close();
+                _resetRegisterForTest(undefined);
+            }
+        });
+    } finally {
+        fs.rmSync(home, { recursive: true, force: true });
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("apply() /acp (#1677): invocation wins over ALS attribution; unresolvable sessions are annotated, never silent", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1677-prio-"));
+    const statusUrls: string[] = [];
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined }, async () => {
+            const cap = await startMockProxy([], (url) => {
+                statusUrls.push(url);
+                if (url.includes("conversationId=session-inv")) return { ok: true, conversationId: "session-inv", panel: "PANEL-INVOKE" };
+                if (url.includes("conversationId=session-init")) return { ok: true, conversationId: "session-init", panel: "PANEL-INIT" };
+                if (url.includes("fallback=latest")) return { ok: true, conversationId: "conv-latest", panel: "PANEL-LATEST" };
+                return undefined;
+            });
+            try {
+                _resetRegisterForTest(cap.origin);
+                process.env.BILLION_CONTEXT_PROXY = cap.origin;
+                const ctx = mockCtx();
+                apply(ctx);
+                const acpCmd = ctx.registeredCommands.find((c) => c.name === "acp");
+                assert.ok(acpCmd, "acp registered");
+
+                // (a) both present → the invocation's session wins over ALS attribution
+                ctx.setInitiator({ session: { id: "session-init" } });
+                statusUrls.length = 0;
+                const win = await acpCmd.handler({ agent: { session: { id: "session-inv" } } });
+                assert.equal(win.kind, "success");
+                assert.ok(win.text.includes("PANEL-INVOKE"), "invocation session must take priority over ALS attribution");
+                assert.ok(statusUrls.some((u) => u.includes("conversationId=session-inv")));
+                assert.ok(!statusUrls.some((u) => u.includes("conversationId=session-init")), "ALS session must not be queried when an invocation is present");
+
+                // (b) requested session unknown to the proxy → falls back to latest AND names both sessions
+                ctx.setInitiator(undefined);
+                statusUrls.length = 0;
+                const ghost = await acpCmd.handler({ agent: { session: { id: "session-ghost" } } });
+                assert.equal(ghost.kind, "success");
+                assert.ok(ghost.text.includes("PANEL-LATEST"), "unknown session falls back to the latest-active panel");
+                assert.ok(ghost.text.includes("session-ghost") && ghost.text.includes("conv-latest"), "the fallback note names the requested and the shown session");
+                assert.ok(ghost.text.includes("not known to the proxy"), "unknown-session fallback is explicitly flagged");
+                assert.ok(statusUrls.some((u) => u.includes("fallback=latest")), "unknown session triggers the latest-fallback query");
+
+                // (c) no session at all (no invocation, no ALS) → latest fallback, flagged as unidentified
+                statusUrls.length = 0;
+                const none = await acpCmd.handler();
+                assert.equal(none.kind, "success");
+                assert.ok(none.text.includes("PANEL-LATEST"));
+                assert.ok(none.text.includes("could not identify the current session"), "no-session fallback is explicitly flagged");
+                // #1791: settle the attach chain while the mock is still open
+                await _stateToolsReadyForTest();
             } finally {
                 cap.close();
                 _resetRegisterForTest(undefined);
@@ -567,7 +718,7 @@ test("apply() /acp-cache (#1146): unreachable proxy reports an error", async () 
             }
         });
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
         _resetRegisterForTest(undefined);
     }
 });
@@ -605,7 +756,7 @@ test("apply() inactive-context registration failure is silent and terminal (dsh 
     } finally {
         console.error = origErr;
         proxy.close();
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
         _resetRegisterForTest(undefined);
     }
 });
@@ -621,7 +772,75 @@ test("apply() is a no-op under the kill switches", async () => {
             assert.equal(ctx.registeredCommands.length, 0);
         });
     } finally {
+        rmrf(home);
+    }
+});
+
+test("#1772 apply(): web-profile compaction caveat warns once in the durable log", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-webwarn-"));
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-webwarn-state-"));
+    const logFile = path.join(stateHome, "billion-context", "bili.log");
+    const warnLines = (): string[] => fs.existsSync(logFile)
+        ? fs.readFileSync(logFile, "utf8").split("\n").filter((l) => l.includes("[dsh-client]") && l.includes("@deepseek-ai/dsh-web-app"))
+        : [];
+    const webBundles = ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "billion-context"];
+    // #1791: hermetic fallback seam — a deferred probe must never reach a real
+    // bootstrap child process after teardown; undefined keeps it base-less.
+    _setSpawnForTest(async () => undefined);
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome, BILI_PROVIDER_REWRITES: undefined, BILI_NATIVE_DSH: undefined, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            _resetWebProfileWarningForTest();
+            const ctx = mockCtx();
+            ctx.setProfileContext({ startedBundles: webBundles });
+            apply(ctx);
+            assert.equal(warnLines().length, 1);
+            assert.match(warnLines()[0], /#1772/);
+            // #1791: settle each apply's attach chain while the mock is still
+            // open — a deferred probe settling against a closed mock runs the
+            // spawn fallback mid-way through a LATER test and clobbers the
+            // shared register/state (#1117 pollution class, reds in #956/#983).
+            await _stateToolsReadyForTest();
+
+            // once-per-process: a later apply with the same profile adds nothing
+            const again = mockCtx();
+            again.setProfileContext({ startedBundles: webBundles });
+            _resetRegisterForTest(proxy.origin);
+            apply(again);
+            assert.equal(warnLines().length, 1);
+            await _stateToolsReadyForTest();
+
+            // non-web profile → no warning
+            fs.rmSync(logFile, { force: true });
+            _resetRegisterForTest(proxy.origin);
+            _resetWebProfileWarningForTest();
+            const plain = mockCtx();
+            plain.setProfileContext({ startedBundles: ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-headless", "billion-context"] });
+            apply(plain);
+            assert.equal(warnLines().length, 0);
+            await _stateToolsReadyForTest();
+
+            // host shape without inject but with a direct profileContext field
+            _resetWebProfileWarningForTest();
+            const bare: Parameters<typeof apply>[0] = {
+                tools: { register: () => undefined },
+                commands: { register: () => undefined },
+                agents: {},
+                profileContext: { startedBundles: ["@deepseek-ai/dsh-web-app"] },
+            };
+            _resetRegisterForTest(proxy.origin);
+            apply(bare);
+            assert.equal(warnLines().length, 1);
+            await _stateToolsReadyForTest();
+        });
+    } finally {
+        _setSpawnForTest(undefined);
+        proxy.close();
         fs.rmSync(home, { recursive: true, force: true });
+        fs.rmSync(stateHome, { recursive: true, force: true });
+        _resetRegisterForTest(undefined);
+        _resetWebProfileWarningForTest();
     }
 });
 
@@ -660,7 +879,7 @@ test("apply() runtime-info (#955): model services stamp model/window/max-output 
         });
     } finally {
         proxy.close();
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
         _resetRegisterForTest(undefined);
     }
 });
@@ -706,7 +925,48 @@ test("apply() runtime-info (#956): a mid-resolve model switch discards the stale
         });
     } finally {
         proxy.close();
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("apply() runtime-info (#1812): a failed window resolve retries after the cooldown instead of latching headerless", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-retry-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, BILI_MODEL_INFO_RETRY_MS: "1" }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            // boot race: the first two resolves fail (catalog still loading);
+            // pre-#1812 the failure-shaped cache latched and the process never
+            // sent x-bili-plugin-context-window again
+            let attempts = 0;
+            ctx.setModelServices(
+                {
+                    resolveModelInfo: async () => {
+                        attempts += 1;
+                        if (attempts <= 2) throw new Error("catalog not ready");
+                        return { context: { contextWindow: 262144 }, defaultMaxTokens: 32768 };
+                    },
+                },
+                { currentSelection: () => ({ provider: "deepseek", model: "qwen-ri" }) },
+            );
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration (retry)");
+            ctx.setInitiator({ session: { id: "session-retry" } });
+            const stamp = () => _stateHeadersForTest()?.("http://example.test/v1/chat/completions");
+            // the failed resolve cached {provider, model}: model id still stamped, window absent
+            await waitFor(() => stamp()?.["x-bili-plugin-model"] === "qwen-ri", "failure-shaped cache stamped the model id");
+            assert.equal(stamp()?.["x-bili-plugin-context-window"], undefined);
+            // each further request drives headersFor → refreshModelInfo; the
+            // cooldown (1ms here) expires and a retry commits the window
+            await waitFor(() => stamp()?.["x-bili-plugin-context-window"] === "262144", "retry after cooldown recovered the window header");
+            assert.equal(stamp()?.["x-bili-plugin-max-output"], "32768");
+            assert.ok(attempts >= 3, `the resolver was retried past its failures (attempts=${attempts})`);
+        });
+    } finally {
+        proxy.close();
+        rmrf(home);
         _resetRegisterForTest(undefined);
     }
 });
@@ -738,10 +998,12 @@ test("apply() /acp pre-first-request (#955): renders the runtime-table entry bef
             assert.match(out.text, /window=262144/);
             assert.match(out.text, /maxOut=32768/);
             assert.match(out.text, /client-config/);
+            // #1791: settle the attach chain while the mock is still open
+            await _stateToolsReadyForTest();
         });
     } finally {
         proxy.close();
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
         _resetRegisterForTest(undefined);
     }
 });
@@ -785,7 +1047,7 @@ test("#983 apply() attach mode: a dead preset falls back to a spawned proxy and 
         _setSpawnForTest(undefined);
         live.close();
         forward.close();
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
         _resetRegisterForTest(undefined);
     }
 });
@@ -810,7 +1072,7 @@ test("#983 apply() attach mode: a healthy preset attaches without any spawn", as
     } finally {
         _setSpawnForTest(undefined);
         proxy.close();
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
         _resetRegisterForTest(undefined);
     }
 });
@@ -819,7 +1081,11 @@ test("#983 maybeRetry self-heals a base-less register after a failed respawn", a
     const calls: Array<{ conversationId: string; tool: string; args: unknown }> = [];
     const forward = await startMockProxy(calls);
     const answers: Array<string | undefined> = [undefined, forward.origin];
-    _setSpawnForTest(async () => answers.shift());
+    let spawnCalls = 0;
+    _setSpawnForTest(async () => {
+        spawnCalls += 1;
+        return answers.shift();
+    });
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-983c-"));
     try {
         await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: "http://127.0.0.1:1" }, async () => {
@@ -827,7 +1093,9 @@ test("#983 maybeRetry self-heals a base-less register after a failed respawn", a
             const ctx = mockCtx();
             apply(ctx);
             // first spawn attempt fails → fallback leaves the register base-less
-            await new Promise((r) => setTimeout(r, 50));
+            // (#1791: settle-based — once the stub call is observable the base-less
+            // state has drained; a fixed sleep raced under load)
+            await waitFor(() => spawnCalls >= 1, "initial failed respawn settled");
             const headersFor = _stateHeadersForTest();
             assert.ok(headersFor !== undefined, "headersFor installed");
             // a later model request drives maybeRetry → respawn (2nd answer) → tools recover
@@ -845,7 +1113,100 @@ test("#983 maybeRetry self-heals a base-less register after a failed respawn", a
     } finally {
         _setSpawnForTest(undefined);
         forward.close();
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+    }
+});
+
+// #1783: repro of the windows-22 CI deadlock — when the dead-preset probe is
+// slow (windows loopback), headersFor#1 fires while register.base still holds
+// the stale preset: registerTools burns a manifest fetch on it, and the apply
+// chain's late landing (evidence grace + spawn) used to clobber the healed
+// register and/or poison retryAt for a full 10s back-off. The landing guard +
+// per-base back-off must keep the self-heal alive under any interleaving.
+test("#983 slow preset probe: a late landing never clobbers the self-healed register (#1783)", async () => {
+    const calls: Array<{ conversationId: string; tool: string; args: unknown }> = [];
+    const forward = await startMockProxy(calls);
+    const answers: Array<string | undefined> = [undefined, forward.origin];
+    _setSpawnForTest(async () => answers.shift());
+    const realFetch = globalThis.fetch;
+    // Emulate the windows runner: loopback fetches to the dead port-1 preset
+    // take ~60ms instead of refusing instantly. node --test runs each file in
+    // its own process, so a scoped globalThis.fetch swap is safe here.
+    globalThis.fetch = ((input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+        const u = typeof input === "string" ? input : String(input);
+        if (u.includes("127.0.0.1:1")) {
+            return new Promise<Response>((res, rej) => {
+                setTimeout(() => { void realFetch(input, init).then(res, rej); }, 60);
+            });
+        }
+        return realFetch(input, init);
+    }) as typeof fetch;
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1783-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: "http://127.0.0.1:1" }, async () => {
+            _resetRegisterForTest("http://127.0.0.1:1");
+            const ctx = mockCtx();
+            apply(ctx);
+            await new Promise((r) => setTimeout(r, 50));
+            const headersFor = _stateHeadersForTest();
+            headersFor!("https://api.anthropic.com/v1/messages");
+            // Self-heal is request-driven in production: each poll below is a
+            // "later model request" calling headersFor -> maybeRetry until the
+            // unfrozen base-less register heals via the spawn seam.
+            await waitFor(() => {
+                headersFor!("https://api.anthropic.com/v1/messages");
+                return ctx.registeredTools.length === 1;
+            }, "self-healed tool registration");
+            const out = await ctx.registeredTools[0].execute({ summary: "s" }, { agent: { session: { id: "s1783" } } });
+            assert.equal(out, "compressed 42 tokens");
+            ctx.setInitiator({ session: { id: "s1783" } });
+            await waitFor(() => headersFor!("https://api.anthropic.com/v1/messages") !== undefined, "plugin headers stamped");
+        });
+    } finally {
+        globalThis.fetch = realFetch;
+        _setSpawnForTest(undefined);
+        forward.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+    }
+});
+
+// #1783 second interleaving: the spawn seam itself is slow (windows process
+// spawn), so registerTools fails against the stale preset and arms the 10s
+// back-off BEFORE the landing's unfreeze wipe. The wipe must clear that
+// back-off together with the stale base, or the first heal after unfreeze is
+// still gated behind the wall.
+test("#983 late spawn landing clears the back-off armed against the stale preset (#1783)", async () => {
+    const calls: Array<{ conversationId: string; tool: string; args: unknown }> = [];
+    const forward = await startMockProxy(calls);
+    const answers: Array<string | undefined> = [undefined, forward.origin];
+    _setSpawnForTest(async () => {
+        const answer = answers.shift();
+        await new Promise((r) => setTimeout(r, 120));
+        return answer;
+    });
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1783b-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: "http://127.0.0.1:1" }, async () => {
+            _resetRegisterForTest("http://127.0.0.1:1");
+            const ctx = mockCtx();
+            apply(ctx);
+            await new Promise((r) => setTimeout(r, 30));
+            const headersFor = _stateHeadersForTest();
+            await waitFor(() => {
+                headersFor!("https://api.anthropic.com/v1/messages");
+                return ctx.registeredTools.length === 1;
+            }, "self-healed tool registration");
+            const out = await ctx.registeredTools[0].execute({ summary: "s" }, { agent: { session: { id: "s1783b" } } });
+            assert.equal(out, "compressed 42 tokens");
+            ctx.setInitiator({ session: { id: "s1783b" } });
+            await waitFor(() => headersFor!("https://api.anthropic.com/v1/messages") !== undefined, "plugin headers stamped");
+        });
+    } finally {
+        _setSpawnForTest(undefined);
+        forward.close();
+        rmrf(home);
         _resetRegisterForTest(undefined);
     }
 });
@@ -875,8 +1236,8 @@ test("#1117 apply() installs takeoverGate keyed on currentInitiator attribution"
         });
     } finally {
         proxy.close();
-        fs.rmSync(stateHome, { recursive: true, force: true });
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(stateHome);
+        rmrf(home);
         _resetRegisterForTest(undefined);
     }
 });
@@ -923,8 +1284,8 @@ test("#1158 apply() gate refusal logs each endpoint once per process with attrib
         });
     } finally {
         proxy.close();
-        fs.rmSync(stateHome, { recursive: true, force: true });
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(stateHome);
+        rmrf(home);
         _resetRegisterForTest(undefined);
     }
 });
@@ -992,8 +1353,8 @@ test("#1158 L2 gate three-state: thrown attribution is a distinct state; counts 
         });
     } finally {
         proxy.close();
-        fs.rmSync(stateHome, { recursive: true, force: true });
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(stateHome);
+        rmrf(home);
         _resetRegisterForTest(undefined);
     }
 });
@@ -1029,8 +1390,8 @@ test("#1158 apply() persists bootstrap failures to bili.log (GUI stderr is invis
     } finally {
         console.error = origErr;
         _setSpawnForTest(undefined);
-        fs.rmSync(home, { recursive: true, force: true });
-        fs.rmSync(stateHome, { recursive: true, force: true });
+        rmrf(home);
+        rmrf(stateHome);
         _resetRegisterForTest(undefined);
     }
 });
@@ -1056,7 +1417,7 @@ test("#1158 persistClientEvent: standard line shape into bili.log; broken fs nev
             fs.rmSync(blocker, { force: true });
         }
     } finally {
-        fs.rmSync(stateHome, { recursive: true, force: true });
+        rmrf(stateHome);
     }
 });
 
@@ -1116,7 +1477,7 @@ test("#1130 apply() attach mode: runtime death of the shared proxy re-probes and
         _setSpawnForTest(undefined);
         fallback.close();
 
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
         _resetRegisterForTest(undefined);
     }
 });
@@ -1161,7 +1522,7 @@ test("#1365 apply() attach mode: routed evidence pins the channel — a transien
         clearTimeout(upTimer);
         server.close();
         _setSpawnForTest(undefined);
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
         _resetRoutedForTest();
         _resetRegisterForTest(undefined);
     }
@@ -1191,7 +1552,7 @@ test("#1365 apply() attach mode: routed evidence + persistently dead target — 
             _noteRoutedForTest(`${origin}/bili/${R1365_UPSTREAM}`);
             const t0 = Date.now();
             while (!errors.some((l) => l.includes("refusing to spawn a second instance"))) {
-                if (Date.now() - t0 > 5000) throw new Error("timed out waiting for the loud refusal");
+                if (Date.now() - t0 > POLL_DEADLINE_MS) throw new Error("timed out waiting for the loud refusal");
                 await new Promise((r) => setTimeout(r, 10));
             }
             assert.equal(spawnCalls, 0);
@@ -1212,7 +1573,7 @@ test("#1365 apply() attach mode: routed evidence + persistently dead target — 
         console.error = origErr;
         server.close();
         _setSpawnForTest(undefined);
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
         _resetRoutedForTest();
         _resetRegisterForTest(undefined);
     }
@@ -1238,7 +1599,7 @@ test("#1365 apply() attach mode: late routed evidence rebinds the bili tools to 
             for (;;) {
                 const st = await ctx.registeredCommands[0].handler();
                 if (st.text.includes("PANEL-B")) break;
-                if (Date.now() - t0 > 4000) throw new Error("timed out waiting for the tool-channel rebind");
+                if (Date.now() - t0 > POLL_DEADLINE_MS) throw new Error("timed out waiting for the tool-channel rebind");
                 await new Promise((r) => setTimeout(r, 10));
             }
             const out = await ctx.registeredTools[0].execute({ summary: "s" }, { agent: { session: { id: "s1365c" } } });
@@ -1249,7 +1610,7 @@ test("#1365 apply() attach mode: late routed evidence rebinds the bili tools to 
     } finally {
         a.close();
         b.close();
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
         _resetRoutedForTest();
         _resetRegisterForTest(undefined);
     }
@@ -1298,7 +1659,7 @@ test("#1365 apply() attach mode: runtime death with routed evidence — waits th
         clearTimeout(upTimer);
         server.close();
         _setSpawnForTest(undefined);
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
         _resetRoutedForTest();
         _resetRegisterForTest(undefined);
     }

@@ -15,19 +15,59 @@ the client's **own model config** to the proxy (runtime-info protocol,
 #955) so compression budgets use the real window instead of a registry
 guess. Opt-out envs: `BILI_NATIVE_PI=0`, `BILI_NATIVE_OMP=0`, `BILI_NATIVE_OPENCODE=0`, `BILI_NATIVE_DSH=0`, `BILI_NATIVE_KIMI=0`, `BILI_NATIVE_HERMES=0`, `BILI_NATIVE_ZCODE=0`.
 
-## Proxy reuse and the attach gate (#1225, #1335, #1232)
+## Proxy reuse and the attach gate (#1225, #1335, #1232, #1660)
 
-A native hook may attach to an already-running proxy instead of spawning its own — only when it passes the lifecycle gate below. Reuse is identity-based (#1225): an existing proxy is attached only when it runs the **same code** (sha256 of the entry script, recorded in the instance file), its **lane is compatible** — each launcher declares its client's lane, two *different declared* lanes never share, and an instance without a declared lane is wildcard-compatible on that axis — **and it owns a session lifecycle**: its health endpoint reports an armed parent-pid watchdog (`watchdog.armed == true`), i.e. it was spawned by a launcher with a parent pid and dies when the last attached session dies. Instances written before #1225 carry no code fingerprint and are therefore never attached: a rebuilt or updated install always starts a fresh proxy on the next launch, so fixes take effect immediately instead of silently serving stale code.
+A native hook may attach to an already-running proxy instead of spawning its own — only when it passes the lifecycle gate below. Reuse is identity-based (#1225): an existing proxy is attached only when it runs the **same code** (sha256 of the entry script, recorded in the instance file), its **lane is compatible** — each launcher declares its client's lane, two *different declared* lanes never share, and an instance without a declared lane is a manually started user-zone daemon, wildcard-compatible on that axis — **and it passes the lifecycle gate** (§below): an armed parent-pid watchdog (`watchdog.armed == true`), i.e. it was spawned by a launcher with a parent pid and dies when the last attached session dies, **or** it is a user-zone instance (no lane, no launch token), which is exempt by definition (#1660). Instances written before #1225 carry no code fingerprint and are therefore never attached: a rebuilt or updated install always starts a fresh proxy on the next launch, so fixes take effect immediately instead of silently serving stale code.
 
 | Listener | Attaches? | Why |
 |---|---|---|
 | Proxy spawned by this session | ✅ | armed at birth |
 | Another session's armed shared proxy (watcher set, #1186) | ✅ | sharing is by design |
-| Manually started `bili start` daemon | ❌ by default | no lifecycle owner (refuses watcher registration, never dies with sessions, often runs an older build — the cause of #1322) |
+| Manually started `bili start` daemon (user zone, #1660) | ✅ by default | **user-zone** instance (no lane, no launch token): deliberately maintained by the user — you own its lifetime and version; refused only when `BILI_NATIVE_ATTACH_EXTERNAL=0/false` explicitly closes the gate |
+| Unarmed **lane'd** proxy (crashed-session orphan; pre-#1330 unverifiable) | ❌ loudly refused | lifecycle-drift symptom (#1335): riding it would silently reuse a proxy no live session owns |
 
-The hook probes each candidate's `/__bili/health` for `watchdog.armed` before attaching: armed → attach and register a watcher (unchanged); unarmed, or a pre-#1330 build that reports no `watchdog` field at all (unverifiable, treated as unarmed) → do **not** attach; the session spawns its own ephemeral proxy (ephemeral port, armed at birth, dies with the last session, #1186 watcher semantics). This also fixes version skew: every session runs the **currently installed** bili instead of stale daemon code. Cost: one extra short-lived proxy process per session when no armed proxy exists (session state is shared on disk, so compression continuity is unaffected); the multi-instance warning (#394) becomes correspondingly more common. **Escape hatch:** deliberately run a resident daemon for your hooks to ride on → set `native.attachExternal: true` in the config file or `BILI_NATIVE_ATTACH_EXTERNAL=1`. That restores attaching to any compatible listener regardless of watchdog state — you then own the daemon's lifetime and version yourself. Explicit user-directed attaches (`BILLION_CONTEXT_ATTACH` / preset `BILLION_CONTEXT_PROXY` for kimi/dsh) bypass discovery entirely and are exempt by construction.
+The hook probes each candidate's `/__bili/health` before attaching: armed → attach and register a watcher (unchanged); a **user-zone** candidate attaches by default regardless of watchdog state (#1660) — the user deliberately maintains that daemon; an unarmed **lane'd** candidate (a crashed session's orphan, or a pre-#1330 build that reports no `watchdog` field at all — unverifiable, treated as unarmed) is refused **loudly**, and the session spawns its own proxy in the self-managed port zone (base `18787`, or the lane's sticky drift record; armed at birth, dies with the last session, #1186 watcher semantics). Version skew stays fixed: the code-fingerprint check runs first, so a rebuilt or updated install never rides a stale daemon even through the user-zone exemption. Cost: one extra short-lived proxy process per session when nothing attachable exists (session state is shared on disk, so compression continuity is unaffected); the multi-instance warning (#394) becomes correspondingly more common. **Escape hatch:** `native.attachExternal: true` in the config file or `BILI_NATIVE_ATTACH_EXTERNAL=1` extends attaching to *lane'd* listeners regardless of watchdog state (including pre-#1330 builds) — you then own those daemons' lifetimes and versions; `0`/`false` closes the gate for everyone, including user-zone daemons, forcing fresh zone spawns. Explicit user-directed attaches (`BILLION_CONTEXT_ATTACH` / preset `BILLION_CONTEXT_PROXY` for kimi/dsh) bypass discovery entirely and are exempt by construction.
 
-Attach discovery is lane-aware across **all** live instances (#1232): the launcher probes every live entry in the instance registry, not just the single instance file (last-writer-wins — under concurrent multi-client use it can point at another client's proxy), and applies the gate above to every candidate. Among compatible candidates the newest instance with the launcher's own declared lane wins; an instance without a lane is wildcard-compatible on the lane axis (still subject to the gate). The `another bili instance is running` warning (#394) is lane-aware too: it fires for same-lane or lane-less coexistence, but stays silent between two *different* declared lanes, whose session files are disjoint.
+Attach discovery is lane-aware across **all** live instances (#1232): the launcher probes every live entry in the instance registry, not just the single instance file (last-writer-wins — under concurrent multi-client use it can point at another client's proxy), and applies the gate above to every candidate. Among compatible candidates the newest instance with the launcher's own declared lane wins; an instance without a lane (a user-zone daemon) is wildcard-compatible on the lane axis and gate-exempt by default (#1660). The `another bili instance is running` warning (#394) is lane-aware too: it fires for same-lane or lane-less coexistence, but stays silent between two *different* declared lanes, whose session files are disjoint.
+
+## Shared state dir and multi-instance security boundary (#394, #1724)
+
+Every bili instance on a host reads and writes the **same** per-host
+storage: the XDG data dir (`~/.local/share/billion-context/` — session
+records, CCR content-store, prefix-affinity) plus the state dir
+(`~/.local/state/billion-context/` — log, instance registry). The control
+plane is lane-aware (#1232:
+attach discovery and the #394 coexistence warning both respect declared
+lanes), but the **data plane is not partitioned** — there is no per-session
+owner and no per-lane isolation on disk. Two consequences follow:
+
+- **Cross-instance session visibility.** Each instance's Web UI
+  (`__bili/sessions` list / detail / logs) re-scans the whole shared store, so
+  any instance reachable over loopback can enumerate and read *any* session —
+  raw messages, content-store payloads, compressed blocks — created by any
+  other instance/lane on that host.
+- **Restart drain race.** On a restart the new process hydrates the store
+  before the old one finishes flushing, so last-writer-wins can drop the old
+  process's final writes: lost tail updates and a provider prefix-cache bust
+   (the outbound body diverges from what the provider had cached). The #1724
+   mitigations: the #405 snapshot-counter guard (rejects stale session writes),
+   the prefix-affinity union-on-write guard (#1737: one instance's flush never
+   clobbers a sibling chain), and the self-restart ordering fix (#1742: durable
+   state is flushed to disk before the replacement spawns). Host-driven restarts
+  (dsh et al., #991) still rely on these data-layer guards, since their
+  kill/spawn order is not bili-controlled.
+
+**Security posture:** the shared-state surface is protected *only* by the admin
+endpoint's loopback gate (non-loopback source addresses are refused) plus
+filesystem permissions on the user's home tree (both dirs live under $HOME) —
+there is no per-session authorization. For a **single-user host** that is
+sufficient. On a **multi-user host** it is not: any local account able to reach
+the proxy's loopback port can read every session of every user. Such hosts must
+partition their per-host storage (per-user/per-lane subdirectories) — the root
+fix named in #1724
+(direction #1), still open as an architecture decision; Web UI scoping
+(#1724 direction #4) reduces cross-instance browsing but does not change this
+boundary.
 
 ## Runtime-info protocol (#955)
 
@@ -79,21 +119,32 @@ takes over once traffic lands.
 
 Claude Code has no in-process extension point, so `bili plugin install
 claude` writes a managed block into `~/.claude/settings.json` (env
-`ANTHROPIC_BASE_URL=http://127.0.0.1:48787/bili/<upstream>`,
+`ANTHROPIC_BASE_URL=http://127.0.0.1:<port>/bili/<upstream>`,
 `DISABLE_AUTO_COMPACT=1`, and a `SessionStart` hook) plus the same
-user-scope MCP shell as before, now pinned to that stable port. The hook
-(fired before claude's first model request) attaches to a healthy proxy on
-the port or spawns one whose pid watchdog tracks claude itself, so the
-proxy lives and dies with the session. Port override:
-`BILI_CLAUDE_NATIVE_PORT` > config `claude.nativePort` > 48787; upstream
-override: `BILI_CLAUDE_UPSTREAM` (or the existing `claude.anthropicBaseUrl`
-config). Opt out with `BILI_NATIVE_CLAUDE=0` — the hook then brings up a
-**passthrough** proxy on the same port (verbatim forward, compression off)
-so claude keeps working. The block is pure JSON merge/strip: foreign keys
-are never touched, `bili plugin remove claude` restores exactly. `bili
-claude` still works on a machine with the native block installed — it
-overrides the static URL with its own ephemeral proxy and the hook stays
-dormant.
+user-scope MCP shell as before. The hook (fired before claude's first model
+request) resolves its port like every lane (#1660): an explicit pin
+(`BILI_CLAUDE_NATIVE_PORT` > config `claude.nativePort`) launches
+**strict-port** on that exact port (a squatter is refused loudly, #964
+preserved); otherwise it rides the self-managed zone — the lane's sticky
+record else base `18787` — non-strict, with the child's EADDRINUSE +1
+ladder resolving collisions and the settled port recorded sticky. One
+exception to the ladder (#1723): when the holder of the lane's port is a
+same-lane instance running a **different build** (the upgrade-restart
+overlap — the old version still draining), the child waits for it to release
+(up to 5s) and rebinds the *same* port instead of drifting; a holder that
+never leaves exhausts the wait and gets the plain ladder as before. After the
+proxy is up the hook re-pins the managed `ANTHROPIC_BASE_URL` to the live
+origin each session (`repinClaudeManagedBaseUrl`), so a hopped port
+self-heals on the next launch and the baked URL never stays desynced from
+the running proxy. Upstream override: `BILI_CLAUDE_UPSTREAM` (or the
+existing `claude.anthropicBaseUrl` config). Install no longer persists
+`claude.nativePort`. Opt out with `BILI_NATIVE_CLAUDE=0` — the hook then
+brings up a **passthrough** proxy on the same resolved port (verbatim
+forward, compression off) so claude keeps working. The block is pure JSON
+merge/strip: foreign keys are never touched, `bili plugin remove claude`
+restores exactly. `bili claude` still works on a machine with the native
+block installed — it overrides the static URL with its own proxy and the
+hook stays dormant.
 
 ## Injection priority — no files unless unavoidable (#535)
 

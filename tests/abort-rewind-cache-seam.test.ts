@@ -34,6 +34,7 @@ import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 type Item = Record<string, unknown>;
 
@@ -44,6 +45,10 @@ const FILLER = (seed: number, kb: number): string => {
 };
 
 const INSTRUCTIONS = ["You are a coding agent operating in a sandbox.", "Follow repo conventions.", "Run tests before finishing."].join("\n") + "\n\n" + FILLER(999, 1);
+
+// Intentional-stall window for abort-phase turns only (#1651). Completion-path turns must NOT
+// get a per-read deadline: a fixed 250 ms there misclassified slow-but-completing streams as aborted.
+const STALL_DETECT_MS = 250;
 
 function sseBlock(type: string, data: Record<string, unknown>): string {
     return `event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`;
@@ -172,7 +177,7 @@ test("abort/rewind cycles keep the outbound prefix item-stable (#1613 suspects A
             }
         };
 
-        const send = async (): Promise<"ok" | "aborted"> => {
+        const send = async (stallDetectMs?: number): Promise<"ok" | "aborted"> => {
             const body = {
                 model: "gpt-test",
                 stream: true,
@@ -181,13 +186,15 @@ test("abort/rewind cycles keep the outbound prefix item-stable (#1613 suspects A
                 input: [...history],
             };
             const ac = new AbortController();
-            const timer = setTimeout(() => ac.abort(), 400);
+            const timer = setTimeout(() => ac.abort(), 30_000);
             try {
                 const res = await fetch(url, { method: "POST", headers, body: JSON.stringify(body), signal: ac.signal });
                 const reader = res.body!.getReader();
                 // consume until the upstream stalls (abort scenario) or stream ends
                 for (;;) {
-                    const r = await Promise.race([reader.read(), new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 250))]);
+                    const r = stallDetectMs !== undefined
+                        ? await Promise.race([reader.read(), new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), stallDetectMs))])
+                        : await reader.read();
                     if (r === "timeout") { ac.abort(); return "aborted"; }
                     if (r.done) return "ok";
                 }
@@ -212,7 +219,7 @@ test("abort/rewind cycles keep the outbound prefix item-stable (#1613 suspects A
         history.push({ type: "message", role: "user", content: `Turn 6: please analyze module 6. ` + FILLER(6, 3) });
         phase.push("abort t=6");
         abortNext = true;
-        const ab1 = await send();
+        const ab1 = await send(STALL_DETECT_MS);
         assert.equal(ab1, "aborted", "phase2 request should be aborted mid-stream");
         // client rewind: drop the aborted user msg entirely and retry with a fresh phrasing (opencode drops the whole aborted turn)
         history.pop();
@@ -234,7 +241,7 @@ test("abort/rewind cycles keep the outbound prefix item-stable (#1613 suspects A
         history.push({ type: "message", role: "user", content: `Turn 8: please analyze module 8. ` + FILLER(8, 3) });
         phase.push("abort t=8");
         abortNext = true;
-        assert.equal(await send(), "aborted", "phase4 request should be aborted mid-stream");
+        assert.equal(await send(STALL_DETECT_MS), "aborted", "phase4 request should be aborted mid-stream");
         // this time the client KEEPS the user msg and only re-sends the same history (retry without change)
         phase.push("retry t=8 (unchanged)");
         assert.equal(await send(), "ok", "phase4 retry should complete");
@@ -288,6 +295,6 @@ test("abort/rewind cycles keep the outbound prefix item-stable (#1613 suspects A
     } finally {
         await closeServer(proxy);
         await closeServer(upstream);
-        try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* ignore */ }
+        try { rmrf(tmp); } catch { /* ignore */ }
     }
 });

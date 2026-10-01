@@ -11,7 +11,7 @@ import { startServer, type ProxyOptions } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
-import { buildClaudePluginEnv, buildCodexMcpArgs, buildMcpConfig, isPrivateUpstreamHost, launcherDirectUrl, launcherInjectMcp } from "../src/launcher.ts";
+import { buildClaudePluginEnv, buildMcpConfig, isPrivateUpstreamHost, launcherDirectUrl, launcherInjectMcp } from "../src/launcher.ts";
 
 // Launcher mode (#162): hosts that cannot attach per-request headers
 // (claude/codex spawned by `bili claude` / `bili codex`) bind into plugin mode
@@ -270,25 +270,6 @@ test("launcher injection builders: direct-URL env, MCP config JSON, codex -c arg
     assert.equal(mcp.mcpServers.bili.command, process.execPath);
     assert.match(mcp.mcpServers.bili.args[0]!, /mcp\.js$/);
     assert.equal(mcp.mcpServers.bili.env.BILI_MCP_PROXY, "http://127.0.0.1:8787");
-
-    const codexConvId = "11111111-2222-4333-8444-555555555555";
-    const args = buildCodexMcpArgs("http://127.0.0.1:8787", codexConvId);
-    assert.deepEqual(args[0], "-c");
-    assert.match(args[1]!, /^mcp_servers\.bili\.command=/);
-    assert.match(args[3]!, /^mcp_servers\.bili\.args=/);
-    assert.match(args[5]!, /^mcp_servers\.bili\.env\.BILI_MCP_PROXY=/);
-    // codex-cli parses these -c values as TOML: args MUST be a TOML array,
-    // not a JSON-encoded string — a double-encoded value makes codex refuse
-    // to start ("invalid type: string ..., expected a sequence").
-    const argsValue = args[3]!.slice("mcp_servers.bili.args=".length);
-    assert.match(argsValue, /^\[.*\]$/, "args is a TOML array, not a stringified array");
-    const parsedArgs = JSON.parse(argsValue) as unknown[];
-    assert.ok(Array.isArray(parsedArgs) && parsedArgs.length === 1, "exactly one argument");
-    assert.ok(String(parsedArgs[0]).endsWith("mcp.js"), "argument is the mcp script path");
-    // codex passes no session id to MCP children, so the launcher injects a
-    // per-spawn conversation id for the shell's headless self-registration.
-    assert.match(args[7]!, /^mcp_servers\.bili\.env\.BILI_CONVERSATION_ID=/);
-    assert.equal(args[7]!.slice("mcp_servers.bili.env.BILI_CONVERSATION_ID=".length), JSON.stringify(codexConvId));
 });
 
 test("mcp stdio shell: manifest → tools/list → tools/call forwards to the plugin tool endpoint", async () => {

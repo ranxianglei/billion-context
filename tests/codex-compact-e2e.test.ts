@@ -23,6 +23,34 @@ import { buildTriggerForgeBody } from "../src/codex-compact.ts";
 const CODEX_UA = "codex_cli_rs/0.1.0 (linux x86_64)";
 const SESSION = "trig-sess";
 
+test("Responses side requests normalize local compaction handoffs before forwarding", async () => {
+    await withHarness({ firstTurnTokens: 100, strictCompactionIds: true }, async (h) => {
+        const real = { type: "compaction", id: "cmp_upstream", encrypted_content: "opaque-upstream-blob" };
+        const r = await fetch(h.url, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+                model: "gpt-resp", stream: true, max_output_tokens: 100,
+                input: [
+                    { type: "compaction", id: "fc_bili_local", encrypted_content: "bili:acp:summary retained" },
+                    real,
+                    { type: "message", role: "user", content: "Create a title" },
+                ],
+            }),
+        });
+        const text = await r.text();
+        assert.equal(r.status, 200, text);
+        assert.equal(h.bodies.length, 1);
+        const sent = JSON.parse(h.bodies[0]);
+        assert.equal(sent.input[0].type, "message");
+        assert.match(sent.input[0].content[0].text, /summary retained/);
+        assert.deepEqual(sent.input[1], real);
+        assert.equal(sent.max_output_tokens, 100);
+        assert.equal(sent.tools, undefined);
+        assert.ok(!h.bodies[0].includes("fc_bili_local"));
+    });
+});
+
 function sse(type: string, data: unknown): string {
     return `event: ${type}\ndata: ${JSON.stringify(data)}\n\n`;
 }

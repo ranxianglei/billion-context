@@ -19,6 +19,7 @@ import { derivedAncestorSessions, executeSearchContextTarget, resolveDecompress,
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 /**
  * #1333: pi RLM inline spawns create DERIVED sessions — the child's pi
@@ -91,7 +92,7 @@ test("parentConversationIdOf resolves the parent id from the child's parentSessi
         assert.equal(parentConversationIdOf({ sessionManager: { getSessionId: () => "root", getHeader: () => ({ type: "session", id: "root", parentSession: path.join(dir, "missing.jsonl") }) } } as never), undefined);
         assert.equal(parentConversationIdOf({} as never), undefined);
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 

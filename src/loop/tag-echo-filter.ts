@@ -20,10 +20,18 @@ import { CODEX_FORGED_HANDOFF_HEADER, FORGED_SUMMARY_HEADER } from "../codex-com
 // including mixed correct-open + typo'd-close), so <name> matches a bounded
 // mutation set instead of the exact spelling: the three core letters in any
 // order, plus at most ONE extra letter drawn from that set or an inserted i.
-// Every match still requires the name to be followed by \s or > (attrs or
-// close), so real words that merely contain the letters (acpi/acpi.h includes,
-// caption, app, uppercase ACPI) never match; a false positive costs at most
-// the same bounded caps as before (swallow ≤ SWALLOW_CAP, hold ≤ HOLD_LIMIT/TAG_OPEN_CAP).
+// #1731: and the set folds case — models drift casing too, and uppercase
+// echoes (\x3cACP …\x3e, \x3c/ACP\x3e) leaked verbatim because every name pattern was a
+// lowercase literal. The folding is baked into the alternation itself as
+// per-letter character classes rather than an `i` flag, so the .source-based
+// reconstructions below (stripAcpTags, flush) stay behavior-identical: a
+// flag would be silently dropped at every rebuild site. Every match still
+// requires the name to be followed by \s or > (attrs or close), so real
+// words that merely contain the letters (acpi/acpi.h includes, caption, app)
+// never match; an angle-bracketed bare token like \x3cACPI\x3e is indistinguishable
+// from a casing-drifted tag and is stripped, same trade as its lowercase form.
+// A false positive costs at most the same bounded caps as before
+// (swallow ≤ SWALLOW_CAP, hold ≤ HOLD_LIMIT/TAG_OPEN_CAP).
 //
 // ─── INVARIANT (#1039): tool-call arguments are user intent ─────────────────
 // Anything the host will EXECUTE or PERSIST — tool-call arguments in every
@@ -41,29 +49,48 @@ import { CODEX_FORGED_HANDOFF_HEADER, FORGED_SUMMARY_HEADER } from "../codex-com
 // (content/reasoning_content/reasoning/thinking/text/summary fields).
 function buildAcplikeName(): string {
     const cores = ["acp", "apc", "cap", "cpa", "pac", "pca"];
-    const names = new Set<string>(cores);
+    const ci = (ch: string) => `[${ch}${ch.toUpperCase()}]`;
+    const fourLetter = new Set<string>();
+    const threeLetter = new Set<string>();
     for (const c of cores) {
-        for (const ch of ["a", "c", "p", "i"]) {
-            for (let pos = 0; pos <= c.length; pos++) names.add(c.slice(0, pos) + ch + c.slice(pos));
+        threeLetter.add(ci(c.charAt(0)) + ci(c.charAt(1)) + ci(c.charAt(2)));
+        for (let pos = 0; pos <= c.length; pos++) {
+            fourLetter.add(
+                c.slice(0, pos).split("").map(ci).join("") + "[aAcCpPiI]" + c.slice(pos).split("").map(ci).join(""),
+            );
         }
     }
-    return [...names].sort((a, b) => b.length - a.length).join("|");
+    return [...fourLetter, ...threeLetter].join("|");
 }
 
-/** Longest-first alternation of every tolerated render-tag name (#673). */
+/** Longest-first alternation of every tolerated render-tag name (#673), case-folded via letter classes (#1731). */
 export const ACP_NAME_ALT = `(?:${buildAcplikeName()})`;
 const NAME = ACP_NAME_ALT;
 
-// Opening-tag attrs are bounded: a render tag opening is short (tokens + type,
-// \x3c 50 chars). An unbounded \x3c<name> …\x3e match would swallow a long prose span
-// that merely starts with a tag head and contains a \x3e somewhere later.
-const PAIRED = new RegExp("\x3c" + NAME + "\\s[^<>]{0,256}>([^<>]{0,64})\x3c\\/" + NAME + ">");
-const LONE_OPEN = new RegExp("\x3c" + NAME + "(?:\\s[^<>]{0,256})?>");
+// Opening-tag attrs carry NO length cap (#1731): [^<>] cannot cross an angle
+// bracket, so these matchers stay linear for arbitrarily long attr runs, and
+// a cap silently defined a bypass — a longer run escaped every open-tag
+// matcher while the loose close still went, leaving orphan markup on the wire.
+// Prose safety lives elsewhere: a terminated open is decided by the body's
+// shape (#1720), an unterminated one by the definite-tail budget (TAG_OPEN_CAP)
+// and the #644 release rules. Close-side tails keep their {0,32} bound — that
+// one is load-bearing (#644: an unbounded close-side tail ate real content
+// after a malformed close).
+// A render tag wraps exactly one bare ref: the kernel emits <acp tokens="…"
+// type="…">mNNNNN</acp> and nothing else between the tags (#1720). Content that
+// is not a ref is prose wearing tags — the tags go, the content stays. No g
+// flag: createTagEchoFilter drives it with exec() on a sliding buffer. It is
+// flag-free by construction — case folding lives inside ACP_NAME_ALT's letter
+// classes (#1731) — so every .source reconstruction below preserves behavior
+// verbatim; an `i` flag would be silently dropped at each rebuild site.
+const PAIRED = new RegExp("\x3c" + NAME + "\\s[^<>]*>(\\s*m\\d{4,}\\s*)\x3c\\/" + NAME + ">");
+const REF_LIKE = /^\s*m\d{4,}\s*$/;
+const LONE_OPEN = new RegExp("\x3c" + NAME + "(?:\\s[^<>]*)?>");
 const LONE_CLOSE = new RegExp("\x3c\\/" + NAME + "(?=[\\s>])[^<>]{0,32}>");
 // A suffix of the buffer that could still grow into a render tag: either an
 // unterminated \x3c<name> … opening (attrs so far, no \x3e yet) or a short
 // ambiguous prefix like \x3c, \x3ca, \x3c/ac, \x3cacip, …
-const PARTIAL_TAIL = new RegExp("(\x3c" + NAME + "\\s[^<>]*|\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?|\x3c\\/?[acip]*)$");
+const PARTIAL_TAIL = new RegExp("(\x3c" + NAME + "\\s[^<>]*|\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?|\x3c\\/?[aAcCpPiI]*)$");
 // An unterminated render-tag opening at the end of a string: \x3c<name> plus
 // attrs, no \x3e — a truncated imitation, never prose (triggers use \x3cacp_).
 const TRUNC_OPEN = new RegExp("\x3c" + NAME + "\\s[^<>]*$");
@@ -80,7 +107,7 @@ const TRUNC_CLOSE = new RegExp("\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?$");
 // shape: a render-tag name, whitespace, then an attribute list bounded by the
 // next `<`. A properly terminated opening never matches: its attribute list
 // ends at a `>`, and no `<` can be reached from there within the class.
-const BROKEN_ATTRS = new RegExp("\x3c" + NAME + "\\s[^<>]{0,512}(?=\x3c)");
+const BROKEN_ATTRS = new RegExp("\x3c" + NAME + "\\s[^<>]*(?=\x3c)");
 const DEFINITE_TAIL = new RegExp("^\x3c" + NAME + "\\s|^\x3c\\/" + NAME);
 const OPEN_WITH_ATTRS = new RegExp("^\x3c" + NAME + "\\s");
 const CLOSE_HEAD = "\x3c/";
@@ -102,14 +129,18 @@ const IMITATION_SWALLOW_CAP = 4096;
  *  tag in s, or -1. #673: the close name may be a typo variant; termination
  *  still requires the strict \x3e right after the name — malformed closes are
  *  LONE_CLOSE's job, not the swallow terminator's. */
-function looseCloseEnd(s: string): number {
+function looseCloseSpan(s: string): { start: number; end: number } | null {
     let idx = s.indexOf(CLOSE_HEAD);
     while (idx >= 0) {
         const m = CLOSE_NAME_ANCHORED.exec(s.slice(idx + 2));
-        if (m && s[idx + 2 + m[0].length] === ">") return idx + 2 + m[0].length + 1;
+        if (m && s[idx + 2 + m[0].length] === ">") return { start: idx, end: idx + 2 + m[0].length + 1 };
         idx = s.indexOf(CLOSE_HEAD, idx + 1);
     }
-    return -1;
+    return null;
+}
+function looseCloseEnd(s: string): number {
+    const span = looseCloseSpan(s);
+    return span === null ? -1 : span.end;
 }
 
 /** The span of one wrapped-turn imitation in `s`: where it starts, and the span
@@ -385,6 +416,16 @@ export function mayStartBiliInternal(s: string): boolean {
     return containsBiliInternalText(s) || CHAIN_PARTIAL_TAIL.test(s) || HEAD_PREFIX_TAIL.test(s);
 }
 
+// #1760: classify a tail the streaming filters RELEASED at stream end. A
+// released tail is content preservation — the filters never drop an undecidable
+// prefix — but a tail still shaped like orphan markup (partial render tag,
+// literal marker line, truncated internal-artifact open/header) is dead to the
+// host like an empty turn, so degenerate-turn detection counts it as residue;
+// plain prose (CJK leads included) is visible output, not residue.
+export function isOrphanMarkupText(s: string): boolean {
+    return mayStartRenderTag(s) || containsMarkerLineText(s) || mayStartBiliInternal(s);
+}
+
 function tailHoldLen(s: string): number {
     const m = CHAIN_PARTIAL_TAIL.exec(s);
     const h = HEAD_PREFIX_TAIL.exec(s);
@@ -508,12 +549,22 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
         for (;;) {
             if (swallowUntilClose) {
                 const combined = swallowed + buf;
-                const end = looseCloseEnd(combined);
-                if (end >= 0) {
-                    drop(combined.slice(0, end));
+                const span = looseCloseSpan(combined);
+                if (span !== null) {
+                    // Only a ref-shaped body is tag content (#1720): a prose
+                    // body between paired tags is released and just the close
+                    // goes. An attested imitation (swallowReleases=false)
+                    // discards whatever the body is.
+                    const inner = combined.slice(0, span.start);
+                    if (REF_LIKE.test(inner) || !swallowReleases) {
+                        drop(combined.slice(0, span.end));
+                    } else {
+                        out += inner;
+                        drop(combined.slice(span.start, span.end));
+                    }
                     swallowed = "";
                     swallowUntilClose = false;
-                    buf = combined.slice(end);
+                    buf = combined.slice(span.end);
                     continue;
                 }
                 if (combined.length > swallowLimit) {

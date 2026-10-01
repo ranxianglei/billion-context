@@ -11,6 +11,7 @@ import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { compareWires, parseUsageLog, renderJson, renderText, runDiff } from "../src/acp-cache-diff.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 // #1266: `bili acp-cache diff <dump-dir>` — synthetic dump pairs covering the
 // three classification shapes (pure-append / mid-stream-rewrite /
@@ -99,7 +100,7 @@ test("runDiff: healthy array-append pair classifies pure-append (json-tail), usa
         assert.equal(p.incomingAppend?.kind, "json-tail");
         assert.equal(p.usageAvailable, false);
         assert.ok(p.notes.some((n) => n.includes("[acp-usage]")), p.notes.join(";"));
-    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    } finally { rmrf(dir); }
 });
 
 test("runDiff: incoming append + outgoing mid-stream drift attributes proxy (#1249 shape)", () => {
@@ -119,7 +120,7 @@ test("runDiff: incoming append + outgoing mid-stream drift attributes proxy (#12
         assert.ok(p.divergence!.offset > 0);
         assert.ok(p.notes.some((n) => n.includes("#1249")), p.notes.join(";"));
         assert.ok(report.worst.some((w) => w.session === "ses_a" && w.pair.category === "mid-stream-rewrite"));
-    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    } finally { rmrf(dir); }
 });
 
 test("runDiff: client-side rewrite forwarded verbatim attributes client", () => {
@@ -134,7 +135,7 @@ test("runDiff: client-side rewrite forwarded verbatim attributes client", () => 
         assert.equal(p.category, "mid-stream-rewrite");
         assert.equal(p.attribution, "client");
         assert.equal(p.divergence?.messageIndex, 0);
-    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    } finally { rmrf(dir); }
 });
 
 test("runDiff: stable outgoing prefix + collapsed cached tokens classifies prefix-stable-miss", () => {
@@ -160,7 +161,7 @@ test("runDiff: stable outgoing prefix + collapsed cached tokens classifies prefi
         assert.equal(p.usage?.missedPrefix, 99000);
         assert.equal(p.usage?.hitPctB, 1);
         assert.ok(report.worst.some((w) => w.session === "ses_a" && w.pair.category === "prefix-stable-miss"));
-    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    } finally { rmrf(dir); }
 });
 
 test("runDiff: dense request cadence (<2s apart, compress-loop regime) still aligns usage — a later request must not steal its predecessor's response line", () => {
@@ -188,7 +189,7 @@ test("runDiff: dense request cadence (<2s apart, compress-loop regime) still ali
         assert.equal(p.category, "prefix-stable-miss");
         assert.equal(p.usage?.inputA, 100000);
         assert.equal(p.usage?.cachedB, 1000);
-    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    } finally { rmrf(dir); }
 });
 
 test("runDiff: healthy usage (cached ≈ previous input) stays pure-append", () => {
@@ -206,7 +207,7 @@ test("runDiff: healthy usage (cached ≈ previous input) stays pure-append", () 
         const p = report.sessions[0]!.pairs[0]!;
         assert.equal(p.category, "pure-append");
         assert.equal(p.usage?.missedPrefix, 500);
-    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    } finally { rmrf(dir); }
 });
 
 test("runDiff: legacy INCOMING filenames (no session id) attribute by timestamp proximity", () => {
@@ -223,7 +224,7 @@ test("runDiff: legacy INCOMING filenames (no session id) attribute by timestamp 
         const p = s!.pairs[0]!;
         assert.equal(p.incoming, "append");
         assert.ok(p.notes.some((n) => n.includes("legacy")), p.notes.join(";"));
-    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    } finally { rmrf(dir); }
 });
 
 test("runDiff: model change between requests is noted", () => {
@@ -237,7 +238,7 @@ test("runDiff: model change between requests is noted", () => {
         const p = report.sessions[0]!.pairs[0]!;
         assert.equal(p.category, "mid-stream-rewrite");
         assert.ok(p.notes.some((n) => n.includes("model changed gpt-x→gpt-y")), p.notes.join(";"));
-    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    } finally { rmrf(dir); }
 });
 
 test("runDiff: --session filters sessions; empty dir throws a guidance error", () => {
@@ -256,11 +257,11 @@ test("runDiff: --session filters sessions; empty dir throws a guidance error", (
         const filtered = runDiff(dir, { noLog: true, session: "ses_b" });
         assert.equal(filtered.sessions.length, 1);
         assert.equal(filtered.sessions[0]!.sid, "ses_b");
-    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    } finally { rmrf(dir); }
     const empty = tmpdir("acp-diff-empty-");
     try {
         assert.throws(() => runDiff(empty, { noLog: true }), /no ACP_DUMP_BODY dumps/);
-    } finally { fs.rmSync(empty, { recursive: true, force: true }); }
+    } finally { rmrf(empty); }
 });
 
 test("renderJson/renderText: machine output parses and text highlights worst offenders", () => {
@@ -285,7 +286,7 @@ test("renderJson/renderText: machine output parses and text highlights worst off
         assert.ok(text.includes("ses_bad #1"), text);
         assert.ok(text.includes("MID-STREAM-REWRITE(proxy)"), text);
         assert.ok(text.includes("PURE-APPEND"), text);
-    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    } finally { rmrf(dir); }
 });
 
 test("parseUsageLog: loop + plugin variants, sanitized sids, malformed lines skipped", () => {
@@ -304,7 +305,7 @@ test("parseUsageLog: loop + plugin variants, sanitized sids, malformed lines ski
             { ts: Date.parse("2026-09-24T14:32:06.000Z"), input: 200, cached: 180 },
         ]);
         assert.ok(!map.has("other"), "cached=n/a line must be skipped");
-    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    } finally { rmrf(dir); }
 });
 
 function baseOpts(): ProxyOptions {
@@ -369,6 +370,6 @@ test("server: INCOMING dump filename carries the bound session id (#1266)", asyn
         else process.env.ACP_DUMP_BODY = prev.body;
         if (proxy) await new Promise<void>((resolve, reject) => proxy!.close((e) => (e ? reject(e) : resolve())));
         if (upstream) await new Promise<void>((resolve, reject) => upstream!.close((e) => (e ? reject(e) : resolve())));
-        fs.rmSync(tmpRoot, { recursive: true, force: true });
+        rmrf(tmpRoot);
     }
 });

@@ -132,6 +132,21 @@ export function dshProfileDependsOnBili(profileDir: string): boolean {
     return dshProfileDepSpec(profileDir) !== undefined;
 }
 
+/** The version of the profile's installed billion-context copy, or undefined
+ *  when there is no readable copy yet (declared but never installed). #1803:
+ *  refresh skips profiles already sitting at the target version so a stale
+ *  sibling cannot cause in-step copies to re-spawn dsh every check cycle;
+ *  declared-but-missing mounts still refresh (install what the manifest
+ *  declares — #1196 live-update-path contract). */
+function installedProfileVersion(profileDir: string): string | undefined {
+    try {
+        const pkg = JSON.parse(fs.readFileSync(path.join(profileDir, "node_modules", DSH_PACKAGE, "package.json"), "utf-8")) as { version?: unknown };
+        return typeof pkg.version === "string" ? pkg.version : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
 /** Registry-form dep specs (^1.2.3, 1.2.3, >=1.0.0, dist-tags) carry no
  *  scheme; local pins (link:, file:, workspace:, git+, github:, https:) do.
  *  Refresh must never clobber a deliberate local pin. */
@@ -179,9 +194,44 @@ export function _setDshRunnersForTest(r: { sync?: DshSyncRun; async?: DshAsyncRu
     testRunners = r;
 }
 
-function dshCommand(env: NodeJS.ProcessEnv): string {
+/** #1732: resolve the dsh executable to spawn, in priority order:
+ *  1. BILI_DSH_BIN override — explicit user choice, used as-is;
+ *  2. PATH lookup (win32 honors PATHEXT ordering);
+ *  3. known install locations a GUI-launched process's minimal PATH omits —
+ *     same #1429 pattern as launcher.resolveNodeRuntime: a dsh profile
+ *     bundle's bili proxy runs inside the dsh desktop app's process tree,
+ *     whose PATH does not carry the npm/pnpm global bin dirs, so bare "dsh"
+ *     fails with "'dsh' is not recognized" and the #1196 owner-channel
+ *     refresh stayed dead on Windows;
+ *  4. bare "dsh" fallback — keeps today's behavior when nothing is found, so
+ *     the error path still fires with actionable context. */
+export function resolveDshBinary(
+    env: NodeJS.ProcessEnv = process.env,
+    platform: NodeJS.Platform = process.platform,
+    existsImpl: (p: string) => boolean = fs.existsSync,
+    execPath: string = process.execPath,
+): string {
     const override = env.BILI_DSH_BIN?.trim();
-    return override && override.length > 0 ? override : "dsh";
+    if (override && override.length > 0) return override;
+    const sep = platform === "win32" ? ";" : ":";
+    const extensions = platform === "win32"
+        ? (env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").map((e) => e.trim().toLowerCase()).filter((e) => e.length > 0)
+        : [""];
+    // join with "/" like resolveNodeRuntime — Windows accepts both separators
+    const nodeDir = path.dirname(execPath);
+    const home = platform === "win32" ? env.USERPROFILE ?? "" : env.HOME ?? "";
+    const extraDirs = platform === "win32"
+        ? [nodeDir, env.APPDATA ? env.APPDATA + "/npm" : "", env.LOCALAPPDATA ? env.LOCALAPPDATA + "/pnpm" : ""]
+        : [nodeDir, "/usr/local/bin", "/opt/homebrew/bin", "/opt/local/bin", home ? home + "/.local/bin" : ""];
+    for (const dir of [...(env.PATH ?? "").split(sep), ...extraDirs]) {
+        if (!dir) continue;
+        for (const ext of extensions) {
+            const name = ext === "" ? "dsh" : `dsh${ext}`;
+            const candidate = dir.endsWith("/") || dir.endsWith("\\") ? dir + name : dir + "/" + name;
+            if (existsImpl(candidate)) return candidate;
+        }
+    }
+    return "dsh";
 }
 
 /** #679: quote one token for cmd.exe's line parser (same rules as the
@@ -216,19 +266,64 @@ export function planDshSpawn(
 function formatDshError(err: unknown, args: readonly string[]): Error {
     const e = err as { code?: string | number; status?: number; stderr?: string | Buffer; message?: string };
     if (e.code === "ENOENT") {
-        return new Error("dsh CLI not found on PATH — install deepseek-harness first (or set BILI_DSH_BIN to its binary), then retry");
+        return new Error("dsh CLI not found (not on PATH, not in the known install locations probed) — install deepseek-harness, or set BILI_DSH_BIN to its executable path, then retry");
     }
-    const stderr = typeof e.stderr === "string" ? e.stderr.trim() : e.stderr instanceof Buffer ? e.stderr.toString("utf8").trim() : "";
+    const stderr =
+        typeof e.stderr === "string"
+            ? e.stderr.trim()
+            : e.stderr instanceof Buffer // #1732: raw bytes from encoding:"buffer" runners must go through decodeChildOutput, not a lossy utf8 stringify
+              ? decodeChildOutput(e.stderr).trim()
+              : "";
     const detail = stderr || (typeof e.message === "string" && e.message.length > 0 ? e.message : `exit ${e.status ?? "?"}`);
-    return new Error(`dsh plugin ${args.join(" ")} failed: ${detail}`);
+    return new Error(`dsh ${args.join(" ")} failed: ${detail}`);
+}
+
+/** #1732: decode subprocess output bytes. Windows console output from
+ *  cmd.exe/pnpm arrives in the system codepage (GBK/CP936 on Chinese
+ *  Windows) — strict UTF-8 rejects those bytes, so fall back to GBK before
+ *  accepting a lossy UTF-8 interpretation (the old `encoding: "utf8"` mode
+ *  turned the classic "'dsh' 不是内部或外部命令" failure into mojibake in the
+ *  log file). Pure ASCII and valid UTF-8 output decodes identically either way. */
+// #1732: GBK bytes whose lead is 0xC2–0xDF with trail 0x80–0xBF are ALSO
+// valid UTF-8, decoding "successfully" into Greek/Coptic/Cyrillic — strict
+// UTF-8 alone cannot tell them apart (GBK 系统 → "ϵς"). cmd.exe/pnpm output
+// never uses those scripts on purpose, so a run of them plus a GBK re-read
+// that yields CJK means we misread GBK as UTF-8. (Real Greek text whose GBK
+// re-read happens to produce CJK would flip this — vanishingly rare here.)
+const UTF8_GBK_TRAP = /[\u0370-\u052F]{2}/;
+const HAS_CJK = /[\u3400-\u9FFF\uF900-\uFAFF]/;
+
+export function decodeChildOutput(buf: Buffer | string | null | undefined): string {
+    if (buf == null) return "";
+    const raw = typeof buf === "string" ? Buffer.from(buf, "utf8") : buf;
+    if (raw.length === 0) return "";
+    try {
+        const utf8 = new TextDecoder("utf-8", { fatal: true }).decode(raw);
+        if (UTF8_GBK_TRAP.test(utf8)) {
+            try {
+                const gbk = new TextDecoder("gbk").decode(raw);
+                if (HAS_CJK.test(gbk)) return gbk;
+            } catch {
+                /* not GBK either — keep the UTF-8 reading */
+            }
+        }
+        return utf8;
+    } catch {
+        try {
+            return new TextDecoder("gbk").decode(raw);
+        } catch {
+            return raw.toString("utf8");
+        }
+    }
 }
 
 // spawnSync (not execFileSync): its options accept windowsVerbatimArguments,
 // which execFileSync's do not — and the #679 cmd.exe wrap needs it verbatim.
+// No encoding option: capture raw buffers and decode via decodeChildOutput
+// (#1732 — codepage-aware), so GBK stderr survives instead of mojibake.
 function defaultSyncRun(plan: DshPlan): { stdout: string; stderr: string } {
     const res = spawnSync(plan.command, plan.args, {
         timeout: DSH_EXEC_TIMEOUT_MS,
-        encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
         windowsVerbatimArguments: plan.windowsVerbatimArguments,
         windowsHide: true,
@@ -236,29 +331,33 @@ function defaultSyncRun(plan: DshPlan): { stdout: string; stderr: string } {
     if (res.error) throw res.error;
     if (res.status !== 0 && res.status !== null) {
         const err = new Error(`exit ${res.status}`);
-        Object.assign(err, { status: res.status, stderr: res.stderr ?? "" });
+        Object.assign(err, { status: res.status, stderr: decodeChildOutput(res.stderr) });
         throw err;
     }
-    return { stdout: res.stdout ?? "", stderr: res.stderr ?? "" };
+    return { stdout: decodeChildOutput(res.stdout), stderr: decodeChildOutput(res.stderr) };
 }
 
 const pExecFile = promisify(execFile);
 
 async function defaultAsyncRun(plan: DshPlan): Promise<{ stdout: string; stderr: string }> {
-    const { stdout, stderr } = await pExecFile(plan.command, plan.args, {
+    // encoding:"buffer" (#1732): execFile's default utf8 mode lossily
+    // stringifies GBK bytes BEFORE decodeChildOutput ever sees them — the
+    // "ϵς" mojibake observed on the async/auto-update refresh path. Capture
+    // raw buffers (thrown errors carry Buffer stderr too) and decode centrally.
+    const { stdout, stderr } = (await pExecFile(plan.command, plan.args, {
         timeout: DSH_EXEC_TIMEOUT_MS,
-        encoding: "utf8",
+        encoding: "buffer",
         windowsVerbatimArguments: plan.windowsVerbatimArguments,
         windowsHide: true,
-    });
-    return { stdout, stderr };
+    })) as { stdout: Buffer | string; stderr: Buffer | string };
+    return { stdout: decodeChildOutput(stdout), stderr: decodeChildOutput(stderr) };
 }
 
-/** Run `dsh plugin <args…>` synchronously (CLI context — blocking is fine).
+/** Run `dsh <args…>` synchronously (CLI context — blocking is fine).
  *  Throws with actionable context when the dsh CLI is missing or exits
  *  non-zero (dsh forwards pnpm's stderr, e.g. "pnpm not found on PATH"). */
 export function runDshPlugin(args: string[], env: NodeJS.ProcessEnv = process.env): void {
-    const plan = planDshSpawn(dshCommand(env), args);
+    const plan = planDshSpawn(resolveDshBinary(env), args);
     const run = testRunners?.sync ?? defaultSyncRun;
     try {
         run(plan);
@@ -271,7 +370,7 @@ export function runDshPlugin(args: string[], env: NodeJS.ProcessEnv = process.en
  *  loop (pnpm resolution can take seconds — a synchronous spawn here would
  *  freeze active SSE streams mid-update). */
 export async function runDshPluginAsync(args: string[], env: NodeJS.ProcessEnv = process.env): Promise<void> {
-    const plan = planDshSpawn(dshCommand(env), args);
+    const plan = planDshSpawn(resolveDshBinary(env), args);
     const run = testRunners?.async ?? defaultAsyncRun;
     try {
         await run(plan);
@@ -287,20 +386,23 @@ export async function runDshPluginAsync(args: string[], env: NodeJS.ProcessEnv =
  *  the proxy never drift apart again (#953). Best-effort by contract: never
  *  throws — a failed refresh degrades to the pre-fix behavior (stale profile
  *  copy until the next manual update), never to a broken update loop.
- *  Profiles pinned to a local source (link:/file:/git specs) are left alone. */
+ *  Profiles pinned to a local source (link:/file:/git specs) are left alone.
+ *  Returns the number of profiles actually refreshed (#1803: copies already
+ *  at the target version are skipped, so callers must not assume every
+ *  dependent profile re-ran). */
 export async function refreshDshProfileBundles(
     targetVersion: string,
     log: (level: "info" | "warn", msg: string) => void,
     env: NodeJS.ProcessEnv = process.env,
-): Promise<void> {
+): Promise<number> {
     let dirs: string[];
     try {
         dirs = dshProfileDirs(env);
     } catch {
-        return; // dsh has never run on this machine — nothing to keep in step
+        return 0; // dsh has never run on this machine — nothing to keep in step
     }
     const targets = dirs.filter((dir) => dshProfileDependsOnBili(dir));
-    if (targets.length === 0) return;
+    if (targets.length === 0) return 0;
     let refreshed = 0;
     for (const dir of targets) {
         const name = path.basename(dir);
@@ -309,14 +411,17 @@ export async function refreshDshProfileBundles(
             log("info", `[update] dsh profile ${name}: billion-context pinned to ${spec} (local source) — leaving it alone`);
             continue;
         }
+        if (installedProfileVersion(dir) === targetVersion) continue; // #1803: already in step
         try {
             await runDshPluginAsync(["plugin", "--profile", name, "add", `${DSH_PACKAGE}@${targetVersion}`], env);
             refreshed += 1;
         } catch (err) {
-            log("warn", `[update] dsh profile ${name}: bundle refresh to ${targetVersion} failed: ${err instanceof Error ? err.message : String(err)}`);
+            const detail = err instanceof Error ? err.message : String(err);
+            log("warn", `[update] dsh profile ${name}: bundle refresh to ${targetVersion} failed: ${detail} — manual fix: run \`dsh plugin --profile ${name} add billion-context@${targetVersion}\` from a shell where \`dsh\` resolves (or point BILI_DSH_BIN at dsh's executable)`);
         }
     }
     if (refreshed > 0) {
         log("info", `[update] refreshed ${refreshed} dsh profile bundle(s) to ${targetVersion} — restart dsh to load it`);
     }
+    return refreshed;
 }

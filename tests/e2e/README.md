@@ -251,3 +251,30 @@ same four #1239 guarantees on the opencode surface:
 on `workflow_dispatch` with `@opencode/cli@2.0.3` pinned (V2 lane), same
 discipline as the pi/codex pins (#815). The V1 lane (1.x) is exercised by the
 same suite via `E2E_OC_BIN`.
+
+## Release canary (`e2e-release-canary.test.ts`) — automated no-op self-update drill
+
+`ACP_TEST_CANARY=1` runs the #1811 release-receive drill: the BUILT tree is
+packed twice with identical content at versions N-1 and N (patch ≥ 2 required;
+prerelease/dev tags skip loudly), both published to the hermetic loopback
+registry. A live proxy boots from the N-1 install with
+`BILI_UPDATE_REGISTRY` pointed at the fixture (1s check interval) and must:
+
+- converge a stale dsh profile copy (N-2) via the up-to-date branch alone
+  (#1804 path, driven through a fake `BILI_DSH_BIN` shim that logs its calls),
+- flip its own disk in place when N is published ("installed N-1 → N.
+  Restart to finish.") while still serving traffic on the old in-memory code,
+- refresh (case-3) and then converge post-flip-stale profiles and go silent,
+- restart from the updated tree and pass the ACP smoke: model turn → plugin
+  `compress` fold → post-fold turn, plus a `plugin install opencode` entry.
+
+On failure the whole work dir (`tmp/e2e-canary-*`, incl. proxy output in
+`diagnostics.txt`) is kept for artifacts; on success it is cleaned.
+
+### CI
+
+`.github/workflows/ci-release-canary.yml` — fires ONLY on `release:
+published` (plus `workflow_dispatch` for backfilling any tag). Because
+release events read the workflow from the tag's tree, the lane takes effect
+from the first release AFTER this workflow lands; earlier tags can be
+drilled manually via dispatch.

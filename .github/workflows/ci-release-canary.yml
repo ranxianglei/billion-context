@@ -1,0 +1,73 @@
+name: release-canary
+
+# #1811: fully automated no-op self-update verification. Runs ONLY when a
+# release is published (release.yml publishes npm and creates the GitHub
+# Release) or on manual dispatch — never on ordinary pushes. The released
+# code is packed twice with identical content at versions N-1/N into a local
+# verdaccio; a live proxy boots on N-1, flips itself to N, converges dsh
+# profiles, and the updated tree must pass the ACP + fold smoke.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "tag or branch to canary (default: latest release tag, fallback master)"
+        required: false
+        default: ""
+
+concurrency:
+  group: release-canary-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  canary:
+    name: no-op self-update canary (local verdaccio; loopback only, zero secrets)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Resolve ref (release tag > input > latest release > master)
+        id: ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            ref="${{ github.event.release.tag_name }}"
+          elif [ -n "${{ github.event.inputs.ref }}" ]; then
+            ref="${{ github.event.inputs.ref }}"
+          else
+            ref="$(gh api "repos/${{ github.repository }}/releases/latest" --jq .tag_name 2>/dev/null || echo master)"
+          fi
+          echo "canary ref: ${ref}"
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.ref.outputs.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Run release canary
+        run: ACP_TEST_CANARY=1 node --import tsx --test tests/e2e/e2e-release-canary.test.ts
+
+      - name: Collect canary artifacts
+        if: failure()
+        run: |
+          mkdir -p tmp/e2e-artifacts
+          for d in tmp/e2e-canary-*; do [ -d "$d" ] && cp -r "$d" tmp/e2e-artifacts/ || true; done
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: release-canary-artifacts
+          path: tmp/e2e-artifacts
+          if-no-files-found: ignore

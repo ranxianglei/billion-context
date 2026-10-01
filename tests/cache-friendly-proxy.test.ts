@@ -38,6 +38,7 @@ import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 type Item = Record<string, unknown>;
 type Wire = "responses" | "chat" | "anthropic" | "google";
@@ -500,7 +501,7 @@ async function driveWire(wire: Wire, sessionId: string, model: string, ctx: numb
         await closeServer(upstream);
         if (prevXdg === undefined) delete process.env.XDG_STATE_HOME;
         else process.env.XDG_STATE_HOME = prevXdg;
-        fs.rmSync(tmp, { recursive: true, force: true });
+        rmrf(tmp);
     }
 }
 

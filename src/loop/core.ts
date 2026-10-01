@@ -176,7 +176,11 @@ export type ParsedStreamEvent =
     | { kind: "reasoning"; delta: string; raw?: Buffer; signature?: string; blockEnd?: boolean }
     | { kind: "tool_call"; name: string; callId: string; arguments: string; passthrough?: boolean; signature?: string }
     | { kind: "usage"; inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number }
-    | { kind: "done"; finishReason?: string; suppressCompletion?: boolean; truncated?: boolean; thinking?: boolean }
+    // #1766: keys on the upstream terminal frame that bili does not model
+    // (e.g. Anthropic's safeguard_results) — the loop replaces that frame with
+    // a synthetic completion, so anything not carried here vanishes from the
+    // client's view.
+    | { kind: "done"; finishReason?: string; suppressCompletion?: boolean; truncated?: boolean; thinking?: boolean; terminalExtra?: Record<string, unknown> }
     | { kind: "error"; message: string }
 | { kind: "diag"; level: "info" | "warn"; message: string }
     // #1455: stateless marks an inert keep-alive frame (anthropic ping) whose
@@ -189,6 +193,7 @@ export type ParsedStreamEvent =
 export interface EmitCompletionOpts {
     finishReason?: string;
     usage?: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number };
+    terminalExtra?: Record<string, unknown>;
 }
 
 export interface ToolCallEmit {
@@ -382,6 +387,11 @@ export async function* runCompressLoop(
     const withStrictEchoRepair = (body: Record<string, unknown>): Record<string, unknown> =>
         normalizeStrictEchoBody(body, isStrictReasoningEcho(ctx.session, strictEchoOrigin, modelIdOf(requestBody)), (level, msg) => loggerLog(level, `[acp-loop] ${msg}`), ctx.session.id ?? "unknown");
 
+    // #1766: accumulated across rounds — every upstream terminal frame is
+    // replaced by the final synthetic completion, so each round's unmodeled
+    // keys must survive into it (later rounds win on key collision).
+    let terminalExtra: Record<string, unknown> | undefined;
+
     try {
         for (let round = 1; round <= MAX_LOOP_ROUNDS; round++) {
             if (signal?.aborted) break;
@@ -478,6 +488,9 @@ export async function* runCompressLoop(
                         suppressCompletion = ev.suppressCompletion === true;
                         truncatedDone = ev.truncated === true;
                         sawThinking = ev.thinking === true;
+                        if (ev.terminalExtra && Object.keys(ev.terminalExtra).length > 0) {
+                            terminalExtra = { ...terminalExtra, ...ev.terminalExtra };
+                        }
                     } else if (ev.kind === "error") {
                         // A 200 SSE response can still carry a provider error.
                         // Preserve it as an error path; never let the absence of
@@ -594,7 +607,7 @@ export async function* runCompressLoop(
                     continuationRetried = true;
                     const tail = assistantText.length <= TRUNCATION_CONTINUATION_TAIL_CHARS
                         ? assistantText
-                        : `…${assistantText.slice(-TRUNCATION_CONTINUATION_TAIL_CHARS)}`;
+                        : `…${safeSuffix(assistantText, TRUNCATION_CONTINUATION_TAIL_CHARS)}`;
                     ctx.log(`[acp-loop] round ${round}: upstream truncated after ${assistantText.length} text chars reached the client; retrying once with continuation nudge`);
                     const nudge: CoreMessage = {
                         id: `acp_truncation_retry_r${round}`,
@@ -903,7 +916,7 @@ export async function* runCompressLoop(
                 // chunk + [DONE] verbatim (original id + order); re-emitting a
                 // regenerated completion would duplicate them.
                 if (!suppressCompletion) {
-                    yield adapter.emitCompletion({ finishReason, usage });
+                    yield adapter.emitCompletion({ finishReason, usage, terminalExtra });
                 }
                 return;
             }
@@ -913,7 +926,7 @@ export async function* runCompressLoop(
             if (round >= MAX_LOOP_ROUNDS) {
                 ctx.log(`[acp-loop] round ${round} hit MAX_LOOP_ROUNDS; completing gracefully`);
                 loggerLog("warn", `[acp-loop] loop limit (${MAX_LOOP_ROUNDS}) reached; completing gracefully`);
-                yield adapter.emitCompletion({ finishReason: "length", usage });
+                yield adapter.emitCompletion({ finishReason: "length", usage, terminalExtra });
                 return;
             }
 
@@ -928,7 +941,7 @@ export async function* runCompressLoop(
                 if (repeated) {
                     ctx.log(`[acp-loop] round ${round}: model re-submitted an already-failed compress with identical arguments; stopping after ${round} round(s) instead of ${MAX_LOOP_ROUNDS}`);
                     loggerLog("warn", `[acp-loop] repeated identical compress failure at round ${round}; breaking early (#156)`);
-                    yield adapter.emitCompletion({ finishReason: "length", usage });
+                    yield adapter.emitCompletion({ finishReason: "length", usage, terminalExtra });
                     return;
                 }
             }

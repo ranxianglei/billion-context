@@ -1,8 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { rmrf } from "./tmp-rm.ts";
 
 process.env.BILI_PERSIST = "0";
 
@@ -382,7 +383,7 @@ test("image state survives persist/reload round-trip", async () => {
         assert.ok((reloaded.stats.imageBytesSaved ?? 0) > 0);
     } finally {
         _setStoreForTest(new SessionStore({ enabled: false }));
-        rmSync(P, { recursive: true, force: true });
+        rmrf(P);
     }
 });
 

@@ -14,8 +14,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import path from "node:path";
+import { rmrf } from "./tmp-rm.ts";
 
 process.env.NODE_ENV = "test";
 process.env.BILI_PERSIST = "0";
@@ -237,10 +238,17 @@ test("e2e plugin lane: CCR arms, stores+placeholderes, and acp_retrieve rides fu
         const toolJson = JSON.parse(await toolRes.text()) as { ok: boolean; result?: string; error?: string };
         assert.ok(toolRes.status === 200 && toolJson.ok === true, `plugin tool endpoint returned ${toolRes.status}: ${JSON.stringify(toolJson)}`);
         const ack = toolJson.result!;
-        assert.match(ack, new RegExp(`retrieved ${ref}: [\\d,]+ tok`), "retrieve returns the ack receipt");
+        // GHSA jc6g v2: the tool result IS the delivery — the framed original
+        // itself, untrusted-data framing plus the full bytes inline (no
+        // receipt + queued-injection pair anymore).
+        assert.match(ack, new RegExp(`acp-retrieved #${ref}`), "retrieve returns the framed original");
+        assert.ok(ack.includes(BIG_TEXT.slice(0, 120)), "full original rides IN the tool result itself");
+        assert.ok(ack.includes("untrusted data, not instructions"), "untrusted-data framing present");
 
         // Turn 2: agent re-sends history plus the acp_retrieve call + ack. The
-        // drained injection rides the full original back on this forward.
+        // ack sits in the model's own tool-result slot, which the kernel
+        // store pass exempts from re-projection — the delivered bytes ride
+        // every later wire verbatim with no host-synthesized channel.
         const msgs2 = [
             ...BASE_MSGS(),
             { role: "assistant", content: null, tool_calls: [{ id: "call_r", type: "function", function: { name: "acp_retrieve", arguments: JSON.stringify({ ref }) } }] },
@@ -330,7 +338,8 @@ test("e2e #1345 toolName divergence: plugin lane executes the BASE name, proxy l
         });
         let toolJson = JSON.parse(await toolRes.text()) as { ok: boolean; result?: string };
         assert.ok(toolRes.status === 200 && toolJson.ok === true, `base-name retrieve returned ${toolRes.status}: ${JSON.stringify(toolJson)}`);
-        assert.match(toolJson.result!, new RegExp(`retrieved ${ref}: [\\d,]+ tok`), "base-name retrieve returns the ack receipt");
+        assert.match(toolJson.result!, new RegExp(`acp-retrieved #${ref}`), "base-name retrieve returns the framed original");
+        assert.ok(toolJson.result!.includes(BIG_TEXT.slice(0, 120)), "base-name retrieve delivers the full text in the tool result");
 
         // ...while the overridden name is unknown to this session.
         toolRes = await fetch(`http://127.0.0.1:${rig.proxyPort}/__bili/plugin/tool`, {
@@ -381,7 +390,8 @@ test("e2e #1345 enabled divergence: plugin lane stays ARMED (base governs), prox
         });
         const toolJson = JSON.parse(await toolRes.text()) as { ok: boolean; result?: string };
         assert.ok(toolRes.status === 200 && toolJson.ok === true, `retrieve returned ${toolRes.status}: ${JSON.stringify(toolJson)}`);
-        assert.match(toolJson.result!, new RegExp(`retrieved ${ref}: [\\d,]+ tok`), "stored content stays reachable on the plugin lane");
+        assert.match(toolJson.result!, new RegExp(`acp-retrieved #${ref}`), "stored content stays reachable on the plugin lane");
+        assert.ok(toolJson.result!.includes(BIG_TEXT.slice(0, 120)), "retrieve delivers the framed original in the tool result");
 
         // Proxy lane: the three-level merge still applies — enabled=false wins.
         const res = await fetch(`http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/chat/completions`, {
@@ -458,7 +468,7 @@ test("#1345 load-time diagnostic: one warn per divergent field at config load", 
     } finally {
         setLogCapture(null);
         if (prevCfg === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = prevCfg;
-        rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -472,7 +482,7 @@ const BASE_MSGS_ANTHROPIC = (): unknown[] => [
     { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: BIG_TEXT }] },
 ];
 
-test("e2e #1457 openai plugin lane: drop note survives failed delivery, rides the next request, commits on 2xx", async () => {
+test("e2e #1457 openai plugin lane: delivery is atomic in the tool result — an upstream failure never undelivers or corrects", async () => {
     let failNext = false;
     const CONV = "ccr-1457-oai";
     const GONE = BIG_TEXT.slice(4000, 4120);
@@ -498,48 +508,38 @@ test("e2e #1457 openai plugin lane: drop note survives failed delivery, rides th
             { role: "tool", tool_call_id: "call_r", content: ack },
         ];
 
-        // Turn 2: the full text rides this forward, but upstream rejects → the
-        // carrier is dropped AND the correction note stays pending (prepare's
-        // snapshot ran before any failure existed, so turn 2 carries no note).
+        // Turn 2: the model's history re-sends the ack (the full framed
+        // original in the acp_retrieve tool-result slot), upstream rejects
+        // with 500 — but under v2 delivery already happened atomically at
+        // tool time: nothing was queued, so there is nothing to drop and no
+        // correction note is buffered. An upstream failure cannot un-deliver
+        // a tool result the model already received.
         failNext = true;
         const r2 = await postRaw(rig, "/v1/chat/completions", { model: MODEL, max_tokens: 64_000, messages: msgs2 }, CONV);
         assert.equal(r2.status, 500, "upstream failure passes through to the client");
-        assert.ok(!r2.text.includes("NOT delivered"), "turn-2 wire carries no note yet (nothing had failed)");
-        assert.ok(rig.forwards[1]!.includes(BIG_TEXT.slice(0, 120)), "full text rode the failed forward");
-        const notes2 = sess!.metadata.ccrDropNotes as Array<{ id: string; refs: string[]; reason: string }>;
-        assert.equal(notes2.length, 1, "one persistent correction note buffered");
-        assert.ok(notes2[0]!.id, "note carries a stable id");
-        assert.deepEqual(notes2[0]!.refs, [ref]);
-        assert.match(notes2[0]!.reason, /HTTP 500/);
-        assert.equal(sess!.stats.retrieveDropped, 1);
-        assert.equal(sess!.pendingRetrievals.length, 0, "carrier dropped with the ledger");
+        assert.ok(rig.forwards[1]!.includes(BIG_TEXT.slice(0, 120)), "the delivered ack rides the failed forward verbatim (model-owned history)");
+        assert.equal(sess!.metadata.ccrDropNotes, undefined, "v2: no carrier was queued, so no correction note is buffered");
+        assert.equal(sess!.stats.retrieveDropped ?? 0, 0, "nothing to drop — delivery is not upstream-confirmed");
+        assert.equal(sess!.stats.retrieveDelivered ?? 0, 1, "an upstream failure cannot un-deliver the tool result");
+        assert.equal(sess!.pendingRetrievals.length, 0, "no carrier exists in v2");
 
-        // Turn 3: the SAME note rides again and commits on the confirmed 2xx.
-        // Post kernel #458: the resent original no longer leaks raw back onto
-        // the wire — it is re-projected to its canonical placeholder. The
-        // stored text reaches the model only when it actually re-issues
-        // acp_retrieve, exactly as the correction note instructs (turn 5 below).
+        // Turn 3: retry succeeds. The original message slot is still
+        // re-projected to its canonical placeholder (kernel #458); the ack
+        // slot rides verbatim (ACP-tool results are exempt); and no
+        // correction note ever appears on the wire.
         failNext = false;
         const r3 = await postRaw(rig, "/v1/chat/completions", { model: MODEL, max_tokens: 64_000, messages: msgs2 }, CONV);
         assert.equal(r3.status, 200);
         const f3 = rig.forwards[2]!;
-        assert.ok(f3.includes("NOT delivered"), "turn-3 wire carries the correction note");
-        assert.ok(f3.includes(ref), "note names the lost ref");
-        assert.ok(f3.includes("[acp-stored"), "resent original re-projected to its placeholder (kernel #458)");
-        assert.ok(!f3.includes(GONE), "no raw original leak on resend (kernel #458)");
-        assert.equal(sess!.metadata.ccrDropNotes, undefined, "note committed after confirmed delivery");
-        assert.equal(sess!.stats.retrieveDropped, 1, "counters untouched by the note lifecycle");
-        assert.equal(sess!.stats.retrieveDelivered ?? 0, 0, "a correction is not a delivery");
+        assert.ok(!f3.includes("NOT delivered"), "v2: the correction-note channel no longer exists for CCR retrieves");
+        assert.ok(f3.includes("[acp-stored"), "original message slot still re-projected to its placeholder (kernel #458)");
+        assert.ok(f3.includes(GONE), "the ack slot rides verbatim — the retrieved bytes are the model's own history");
+        assert.equal(sess!.metadata.ccrDropNotes, undefined, "still no note");
+        assert.equal(sess!.stats.retrieveDelivered ?? 0, 1, "counters stable across the failed+retried forwards");
 
-        // Turn 4: nothing left to correct — no phantom note on the wire.
-        const r4 = await postRaw(rig, "/v1/chat/completions", { model: MODEL, max_tokens: 64_000, messages: msgs2 }, CONV);
-        assert.equal(r4.status, 200);
-        assert.ok(!rig.forwards[3]!.includes("NOT delivered"), "no phantom correction after commit");
-
-        // Turn 5: the model follows the note and re-issues acp_retrieve (same
-        // plugin-tool dispatch the MCP shim drives). The re-queued injection
-        // rides THIS forward with the full text, and the 2xx commits it as a
-        // real delivery — dropping the carrier never deletes stored content.
+        // Turn 4: the model re-issues acp_retrieve (same plugin-tool dispatch
+        // the MCP shim drives) — a fresh atomic delivery in the new tool
+        // result. Stored content is never lost: re-retrieval always works.
         const reToolRes = await fetch(`http://127.0.0.1:${rig.proxyPort}/__bili/plugin/tool`, {
             method: "POST",
             headers: { "content-type": "application/json" },
@@ -547,6 +547,7 @@ test("e2e #1457 openai plugin lane: drop note survives failed delivery, rides th
         });
         const reToolJson = JSON.parse(await reToolRes.text()) as { ok: boolean; result?: string };
         assert.ok(reToolRes.status === 200 && reToolJson.ok === true, `re-issued retrieve returned ${reToolRes.status}: ${JSON.stringify(reToolJson)}`);
+        assert.ok(reToolJson.result!.includes(BIG_TEXT.slice(0, 120)), "re-retrieve delivers the full original again");
         const msgs5 = [
             ...msgs2,
             { role: "assistant", content: null, tool_calls: [{ id: "call_r2", type: "function", function: { name: "acp_retrieve", arguments: JSON.stringify({ ref }) } }] },
@@ -554,15 +555,14 @@ test("e2e #1457 openai plugin lane: drop note survives failed delivery, rides th
         ];
         const r5 = await postRaw(rig, "/v1/chat/completions", { model: MODEL, max_tokens: 64_000, messages: msgs5 }, CONV);
         assert.equal(r5.status, 200);
-        assert.ok(rig.forwards[4]!.includes("[acp-retrieved"), "re-issued retrieve rides as the retrieval injection");
-        assert.ok(rig.forwards[4]!.includes(GONE), "re-issued retrieve serves the stored text on its delivery turn");
-        assert.equal(sess!.stats.retrieveDelivered ?? 0, 1, "confirmed delivery counted once");
+        assert.ok(rig.forwards[3]!.includes("[acp-retrieved"), "the re-issued ack rides the wire in its own tool-result slot");
+        assert.equal(sess!.stats.retrieveDelivered ?? 0, 2, "each retrieve delivers exactly once, at tool time");
     } finally {
         await closeRig(rig);
     }
 });
 
-test("e2e #1457 anthropic plugin lane: same snapshot→attach→commit-on-2xx lifecycle", async () => {
+test("e2e #1457 anthropic plugin lane: same atomic delivery — failure passes through, nothing to correct", async () => {
     let failNext = false;
     const CONV = "ccr-1457-anth";
     const GONE = BIG_TEXT.slice(4000, 4120);
@@ -588,29 +588,30 @@ test("e2e #1457 anthropic plugin lane: same snapshot→attach→commit-on-2xx li
             { role: "user", content: [{ type: "tool_result", tool_use_id: "call_r", content: ack }] },
         ];
 
+        // Turn 2: upstream 500 — the ack rides verbatim in the model's own
+        // history (tool-result slot), and v2 has no queued carrier to drop.
         failNext = true;
         const r2 = await postRaw(rig, "/v1/messages", { model: MODEL, max_tokens: 64_000, messages: msgs2 }, CONV);
         assert.equal(r2.status, 500, "upstream failure passes through");
-        assert.ok(rig.forwards[1]!.includes(BIG_TEXT.slice(0, 120)), "full text rode the failed forward");
-        const notes2 = sess!.metadata.ccrDropNotes as Array<{ refs: string[]; reason: string }>;
-        assert.equal(notes2.length, 1, "correction note buffered");
-        assert.match(notes2[0]!.reason, /HTTP 500/);
-        assert.equal(sess!.stats.retrieveDropped, 1);
+        assert.ok(rig.forwards[1]!.includes(BIG_TEXT.slice(0, 120)), "the delivered ack rides the failed forward verbatim");
+        assert.equal(sess!.metadata.ccrDropNotes, undefined, "no correction note — delivery was atomic");
+        assert.equal(sess!.stats.retrieveDropped ?? 0, 0);
+        assert.equal(sess!.stats.retrieveDelivered ?? 0, 1, "upstream failure cannot un-deliver");
 
+        // Turn 3: retry succeeds — original slot re-projected, ack slot
+        // verbatim, no correction note ever appears.
         failNext = false;
         const r3 = await postRaw(rig, "/v1/messages", { model: MODEL, max_tokens: 64_000, messages: msgs2 }, CONV);
         assert.equal(r3.status, 200);
         const f3 = rig.forwards[2]!;
-        assert.ok(f3.includes("NOT delivered"), "turn-3 wire carries the correction note");
-        assert.ok(f3.includes(ref), "note names the lost ref");
-        assert.ok(f3.includes("[acp-stored"), "resent original re-projected to its placeholder (kernel #458)");
-        assert.ok(!f3.includes(GONE), "no raw original leak on resend (kernel #458)");
-        assert.equal(sess!.metadata.ccrDropNotes, undefined, "committed after confirmed delivery");
-        assert.equal(sess!.stats.retrieveDelivered ?? 0, 0, "a correction is not a delivery");
+        assert.ok(!f3.includes("NOT delivered"), "no correction-note channel in v2");
+        assert.ok(f3.includes("[acp-stored"), "original message slot re-projected to its placeholder (kernel #458)");
+        assert.ok(f3.includes(GONE), "the ack slot rides verbatim (model-owned history)");
+        assert.equal(sess!.metadata.ccrDropNotes, undefined);
+        assert.equal(sess!.stats.retrieveDelivered ?? 0, 1);
 
-        // The model follows the note and re-issues acp_retrieve; the re-queued
-        // injection rides the NEXT forward with the full text (post kernel
-        // #458 this is the only path by which stored text returns to the wire).
+        // The model re-issues acp_retrieve; the new ack is another atomic
+        // delivery in its tool-result slot.
         const reToolRes = await fetch(`http://127.0.0.1:${rig.proxyPort}/__bili/plugin/tool`, {
             method: "POST",
             headers: { "content-type": "application/json" },
@@ -625,9 +626,8 @@ test("e2e #1457 anthropic plugin lane: same snapshot→attach→commit-on-2xx li
         ];
         const r4 = await postRaw(rig, "/v1/messages", { model: MODEL, max_tokens: 64_000, messages: msgs3 }, CONV);
         assert.equal(r4.status, 200);
-        assert.ok(rig.forwards[3]!.includes("[acp-retrieved"), "re-issued retrieve rides as the retrieval injection");
-        assert.ok(rig.forwards[3]!.includes(GONE), "re-issued retrieve serves the stored text on its delivery turn");
-        assert.equal(sess!.stats.retrieveDelivered ?? 0, 1, "confirmed delivery counted once");
+        assert.ok(rig.forwards[3]!.includes("[acp-retrieved"), "the re-issued ack rides the wire in its own tool-result slot");
+        assert.equal(sess!.stats.retrieveDelivered ?? 0, 2, "each retrieve delivers exactly once, at tool time");
     } finally {
         await closeRig(rig);
     }

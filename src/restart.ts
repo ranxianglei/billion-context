@@ -32,6 +32,7 @@ import { cacheDir } from "./paths.js";
 import { closeLogger, type Logger } from "./logger.js";
 import { flushAllSessions, totalInFlight } from "./session.js";
 import { flushConversations } from "./plugin.js";
+import { flushPrefixAffinity } from "./affinity-persist.js";
 import { findInstallDir, isVersionNewer, verifyInstallLoadable } from "./update.js";
 
 const MARKER_FILE = path.join(cacheDir(), ".auto-restart");
@@ -144,6 +145,11 @@ export type SelfRestartDeps = {
     settleMs?: number;
     /** Readiness-window override in ms (tests). Defaults to READY_TIMEOUT_MS. */
     readyTimeoutMs?: number;
+    /** Durable-state flush run after the drain and before the replacement is
+     *  spawned, so the child hydrates the freshest snapshot instead of a stale
+     *  one (#1724). Defaults to conversations + sessions + prefix-affinity.
+     *  Injectable for tests. */
+    preSpawnFlush?: () => Promise<void> | void;
 };
 
 export type SelfRestartResult = { ok: boolean; error?: string; childPid?: number };
@@ -196,6 +202,19 @@ export async function performSelfRestart(deps: SelfRestartDeps): Promise<SelfRes
         log("warn", `[restart] aborted: ${countInFlight()} request(s) still in flight after ${settleMs / 1000}s — resuming service`);
         resumeListening(server, host, port, log);
         return { ok: false, error: "in-flight-remained" };
+    }
+
+    // #1724: persist durable state BEFORE spawning the replacement. The child
+    // hydrates the shared store as soon as it boots, so the old order (spawn,
+    // wait for readiness, then flush in finish) made it read a stale snapshot
+    // while our final flush went unread — the lost-update / prefix-cache-busting
+    // race. State is frozen here (listener closed, in-flight 0), so one flush
+    // captures everything, and the port is already released so this adds no
+    // handover delay.
+    try {
+        await (deps.preSpawnFlush ?? defaultPreSpawnFlush)();
+    } catch (e) {
+        log("warn", `[restart] pre-spawn state flush failed (${e instanceof Error ? e.message : String(e)}) — continuing; the replacement may hydrate a slightly stale snapshot`);
     }
 
     // Point of no return: past sanity check and drain. The marker throttles
@@ -261,8 +280,18 @@ function resumeListening(server: http.Server, host: string, port: number, log: L
     }
 }
 
+/** #1724: durable-state set captured before the replacement boots — mirrors
+ *  what the normal shutdown path persists (conversations + sessions +
+ *  prefix-affinity). */
+async function defaultPreSpawnFlush(): Promise<void> {
+    flushConversations();
+    await flushAllSessions();
+    flushPrefixAffinity();
+}
+
 function defaultFinish(): void {
     flushConversations();
+    flushPrefixAffinity();
     void flushAllSessions().finally(() => {
         closeLogger();
         process.exit(0);

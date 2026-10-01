@@ -241,11 +241,12 @@ export type Session = {
      *  model keeps re-fetching. Bounded by trimRetrieveCounts; lost on restart
      *  (advisory signal only). */
     retrieveCountsByRef?: Map<string, number>;
-    /** In-memory only (NOT persisted): full-text retrieval injections queued by
-     *  executeRetrieve, delivered on a later plugin-lane upstream request
-     *  (request-only, same channel as nudges). Durable bookkeeping for each
-     *  item lives in metadata.ccrUndelivered so an acked-but-undelivered
-     *  retrieve can be detected and reported across restarts (#1343). */
+    /** In-memory only (NOT persisted): request-only injections riding the
+     *  nudge channel. Since the GHSA jc6g v2 rework, acp_retrieve delivers its
+     *  full text in the tool result itself — this carrier now only serves
+     *  non-CCR riders (#1207 range restore, ccr:false). Legacy sessions from
+     *  before the rework may still carry ccr:true entries; the reconcile/
+     *  commit/drop machinery below handles them (they are never re-created). */
     pendingRetrievals: PendingRetrieval[];
     /** #1095 in-memory only (NOT persisted): deterministic encode cache keyed
      *  by sha256 of the ORIGINAL base64 → encoded payload. Identical inputs

@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { defaultConfig } from "acp-kernel";
@@ -10,6 +10,7 @@ import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 /** #115: DNS rebinding defense on /__bili/ management endpoints. An attacker
  *  who resolves evil.com → 127.0.0.1 can make a browser request arrive at the
@@ -95,7 +96,7 @@ test("admin endpoints: DNS-rebinding Host is rejected with and without Origin (#
         process.env.BILI_CONFIG_FILE = prevConfig;
         proxy.closeAllConnections?.();
         await close(proxy);
-        try { rmSync(root, { recursive: true, force: true }); } catch { /* best-effort */ }
+        try { rmrf(root); } catch { /* best-effort */ }
     }
 });
 
@@ -161,7 +162,7 @@ test("admin endpoints accept an SSH-forwarded local port that differs from the l
         process.env.BILI_CONFIG_FILE = prevConfig;
         proxy.closeAllConnections?.();
         await close(proxy);
-        try { rmSync(root, { recursive: true, force: true }); } catch { /* best-effort */ }
+        try { rmrf(root); } catch { /* best-effort */ }
     }
 });
 
@@ -211,7 +212,7 @@ test("admin endpoints work with port: 0 (dynamic port assignment)", async () => 
         process.env.BILI_CONFIG_FILE = prevConfig;
         proxy.closeAllConnections?.();
         await close(proxy);
-        try { rmSync(root, { recursive: true, force: true }); } catch { /* best-effort */ }
+        try { rmrf(root); } catch { /* best-effort */ }
     }
 });
 
@@ -267,6 +268,6 @@ test("unknown /__bili/ path → 404 locally, not forwarded to upstream (#346)", 
         process.env.BILI_CONFIG_FILE = prevConfig;
         proxy.closeAllConnections?.();
         await close(proxy);
-        try { rmSync(root, { recursive: true, force: true }); } catch { /* best-effort */ }
+        try { rmrf(root); } catch { /* best-effort */ }
     }
 });

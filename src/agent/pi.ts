@@ -10,7 +10,7 @@ import path from "node:path";
 import { wrapCacheReport, wrapRuleReport } from "../acp-panel.js";
 import { awaitNativeProxyOrigin } from "./native-bootstrap.js";
 import { isModelApiUrl, nativeInterceptInstalled } from "./native-intercept.js";
-import { detectProxyBase, destinationRoutedThroughProxy, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, type ManifestTool } from "./shared.js";
+import { detectProxyBase, destinationRoutedThroughProxy, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, nonHttpProvidersFromEnv, type ManifestTool } from "./shared.js";
 
 type Ctx = {
     sessionManager?: { getSessionId?: () => string; getHeader?: () => unknown } | undefined;
@@ -424,8 +424,9 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
         // AND a request routed through the proxy), or omp's identity register
         // succeeded; (2) remote — the proxy confirms it carries the
         // conversation id (/__bili/plugin/status ok). A non-http(s) baseUrl
-        // vetoes outright: such providers' traffic cannot reach the proxy by
-        // construction. Hosts exposing no stable session id keep the
+        // vetoes by default (opt-in via BILI_NON_HTTP_PROVIDERS below only
+        // widens the candidate set; carriage evidence still decides). Hosts
+        // exposing no stable session id keep the
         // historical cancel (the proxy may carry them under a derived
         // content-hash identity, where avoiding double compression still
         // wins). Probe failure (proxy down/hung) means NO evidence → defer to
@@ -437,7 +438,15 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
             const proxyBase = proxyBaseForCtx(ctx);
             if (proxyBase === undefined) return false;
             const baseUrl = ctx?.model?.baseUrl;
-            if (typeof baseUrl === "string" && baseUrl.length > 0 && !/^https?:\/\//i.test(baseUrl)) return false;
+            if (typeof baseUrl === "string" && baseUrl.length > 0 && !/^https?:\/\//i.test(baseUrl)) {
+                // #1392: an opaque-scheme baseUrl (e.g. pi-claude-bridge's "claude-bridge")
+                // vetoes compaction ownership UNLESS its provider is explicitly opted in via
+                // BILI_NON_HTTP_PROVIDERS. Opt-in only widens the candidate set — the carriage
+                // evidence below (carriedSids / status probe) still decides, so unrouted traffic
+                // never cancels and #1382 cannot recur for a newly-opted-in provider class.
+                const provider = ctx?.model?.provider;
+                if (!(typeof provider === "string" && provider.length > 0 && nonHttpProvidersFromEnv().has(provider))) return false;
+            }
             const sid = ctx === undefined ? undefined : sessionIdOf(ctx);
             if (sid === undefined || sid.length === 0) return true;
             if (agent === "pi" ? state.carriedSids?.has(sid) === true : state.identityAt === sid) return true;

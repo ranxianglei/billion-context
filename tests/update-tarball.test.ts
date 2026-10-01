@@ -1,11 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import * as tar from "tar";
 import { installViaTarball, declaredEntryRelPaths, isGitWorkingTree } from "../src/update.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 function integrityField(buf: Buffer, alg = "sha512"): string {
     return `${alg}-${crypto.createHash(alg).update(buf).digest("base64")}`;
@@ -102,7 +103,7 @@ test("installViaTarball: clean tarball installs and removes the backup", { timeo
         assert.equal(existsSync(path.join(fx.cacheDir, "billion-context", ".update-backup-2.0.0")), false, "backup must be removed on success");
     } finally {
         delete process.env.XDG_CACHE_HOME;
-        rmSync(fx.root, { recursive: true, force: true });
+        rmrf(fx.root);
     }
 });
 
@@ -125,7 +126,7 @@ test("installViaTarball: syntax-broken entry is rejected in staging, install unt
         assert.match(readFileSync(path.join(fx.installDir, "dist", "index.js"), "utf-8"), /1\.2\.3/);
     } finally {
         delete process.env.XDG_CACHE_HOME;
-        rmSync(fx.root, { recursive: true, force: true });
+        rmrf(fx.root);
     }
 });
 
@@ -144,7 +145,7 @@ test("installViaTarball: tarball missing its declared entry is rejected in stagi
         assert.equal(JSON.parse(readFileSync(path.join(fx.installDir, "package.json"), "utf-8")).version, "1.2.3");
     } finally {
         delete process.env.XDG_CACHE_HOME;
-        rmSync(fx.root, { recursive: true, force: true });
+        rmrf(fx.root);
     }
 });
 
@@ -164,7 +165,7 @@ test("isGitWorkingTree: .git dir (clone), .git file (worktree), absent", async (
         mkdirSync(plain, { recursive: true });
         assert.equal(await isGitWorkingTree(plain), false, "no .git entry");
     } finally {
-        rmSync(root, { recursive: true, force: true });
+        rmrf(root);
     }
 });
 
@@ -192,6 +193,6 @@ test("installViaTarball: refuses to overwrite a git working tree, install untouc
         assert.match(readFileSync(path.join(fx.installDir, "dist", "index.js"), "utf-8"), /1\.2\.3/);
     } finally {
         delete process.env.XDG_CACHE_HOME;
-        rmSync(fx.root, { recursive: true, force: true });
+        rmrf(fx.root);
     }
 });

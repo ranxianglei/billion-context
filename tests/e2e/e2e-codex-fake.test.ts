@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
+import { assertPortDead } from "../port-race.js";
 
 const CODEX_BIN = process.env.E2E_CODEX_BIN ?? "codex";
 const DIST = process.env.E2E_BILI_DIST ?? path.resolve(import.meta.dirname, "../../dist/index.js");
@@ -107,6 +108,7 @@ async function startCtx(contextWindow: number): Promise<Ctx> {
 	};
 	for (const d of [ctx.codexHome, ctx.xdg.config, ctx.xdg.cache, ctx.xdg.state]) fs.mkdirSync(d, { recursive: true });
 
+	await assertPortDead(ctx.fakePort); // #1689: prove still free right before the child binds it
 	const fake = spawn(process.execPath, [FAKE_UPSTREAM], {
 		env: { ...process.env, FAKE_PORT: String(ctx.fakePort), FAKE_HOST: "127.0.0.1", FAKE_REQLOG: ctx.reqLog, FAKE_MODEL: MODEL },
 		stdio: ["ignore", "pipe", "pipe"],
@@ -127,6 +129,7 @@ async function startCtx(contextWindow: number): Promise<Ctx> {
 		"",
 	].join("\n"));
 
+	await assertPortDead(ctx.port); // #1689: prove still free right before the child binds it
 	const logPath = path.join(work, "bili.log");
 	const proxy = spawn(process.execPath, [DIST, "start", "--port", String(ctx.port), "--no-auto-update"], {
 		env: {
@@ -255,4 +258,110 @@ test("under-window: no compression occurs (control)", { skip: skipReason }, asyn
 	const oracle = readOracle(ctx.reqLog);
 	assert.ok(oracle.length > 0, "fake upstream received no requests");
 	assert.ok(oracle.every((o) => !o.isSummary), "control turn must make no summarization calls");
+});
+
+test("#1802: a hostile user .env cannot reroute a bili-launched codex", { skip: skipReason, timeout: 300_000 }, async (t) => {
+	// The #1802 blind spot: nothing here runs through startCtx/turn (those
+	// pre-bake the proxy into base_url). This launch goes through the REAL
+	// launcher (`dist/index.js codex`) with a PLAIN base_url — routing must
+	// survive via the launcher's injected env — while the user's own
+	// $CODEX_HOME/.env tries to reroute everything to a dead socks5h proxy
+	// (codex's load_dotenv() set_var()s it over the spawn env pre-#1806, and
+	// its custom-CA rustls client cannot speak socks at all).
+	const work = fs.mkdtempSync(path.join(WORK_ROOT, "e2e-codex-env-"));
+	const codexCwd = fs.mkdtempSync(path.join(CWD_ROOT, "cwd-"));
+	const codexHome = path.join(work, "codex-home");
+	const xdg = {
+		config: path.join(work, "xdg-config"),
+		cache: path.join(work, "xdg-cache"),
+		state: path.join(work, "xdg-state"),
+	};
+	for (const d of [codexHome, xdg.config, xdg.cache, xdg.state]) fs.mkdirSync(d, { recursive: true });
+	const fakePort = await freePort();
+	const reqLog = path.join(work, "fake-requests.jsonl");
+	t.after(() => { for (const pid of [fake?.pid]) if (pid) { try { process.kill(pid, "SIGKILL"); } catch { /* gone */ } } });
+
+	await assertPortDead(fakePort);
+	const fake = spawn(process.execPath, [FAKE_UPSTREAM], {
+		env: { ...process.env, FAKE_PORT: String(fakePort), FAKE_HOST: "127.0.0.1", FAKE_REQLOG: reqLog, FAKE_MODEL: MODEL },
+		stdio: ["ignore", "ignore", "pipe"],
+	});
+	await waitFor(`http://127.0.0.1:${fakePort}/v1/models`, 15_000);
+
+	// PLAIN upstream base_url: no /bili/ pre-bake — only the launcher's
+	// HTTP(S)_PROXY injection (or, pre-fix, the hostile .env) decides routing.
+	fs.writeFileSync(path.join(codexHome, "config.toml"), [
+		`model = "${MODEL}"`,
+		'model_provider = "e2e"',
+		"",
+		"[model_providers.e2e]",
+		'name = "OpenAI"',
+		`base_url = "http://127.0.0.1:${fakePort}/v1"`,
+		'wire_api = "responses"',
+		'env_key = "E2E_UPSTREAM_KEY"',
+		"",
+	].join("\n"));
+	const hostileEnv = [
+		"HTTP_PROXY=socks5h://127.0.0.1:7890",
+		"https_proxy=socks5h://127.0.0.1:7890",
+		"ALL_PROXY=socks5h://127.0.0.1:7890",
+		"E2E_INNOCENT=keepme",
+		"",
+	].join("\n");
+	fs.writeFileSync(path.join(codexHome, ".env"), hostileEnv);
+
+	// Hermetic launcher env: strip this session's own bili/proxy vars so the
+	// launcher spawns its own lane proxy in the isolated XDG state instead of
+	// attaching to an outer one.
+	const childEnv: NodeJS.ProcessEnv = { ...process.env };
+	for (const k of [
+		"BILLION_CONTEXT_PROXY", "BILI_PROVIDER_REWRITES", "BILI_MITM_HOSTS", "BILI_MCP_PROXY",
+		"BILI_NATIVE_CLAUDE", "BILLION_CONTEXT_PLUGIN", "BILI_ZONE_PORT", "BILI_CLAUDE_NATIVE_PORT",
+		"BILI_UPSTREAM_PROXY", "ACP_PORT", "SSL_CERT_FILE",
+		"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+		"http_proxy", "https_proxy", "all_proxy", "no_proxy",
+	]) delete childEnv[k];
+	const launcherLog = path.join(work, "launcher.log");
+	const lastFile = path.join(work, "t1.last");
+	const child = spawn(process.execPath, [
+		DIST, "codex", "exec", "--skip-git-repo-check", "--output-last-message", lastFile, "请只回复: 收到",
+	], {
+		cwd: codexCwd,
+		env: {
+			...childEnv,
+			CODEX_HOME: codexHome,
+			XDG_CONFIG_HOME: xdg.config,
+			XDG_CACHE_HOME: xdg.cache,
+			XDG_STATE_HOME: xdg.state,
+			BILLION_CONTEXT_NO_AUTO_UPDATE: "1",
+			BILI_CLIENT_BIN: CODEX_BIN,
+			E2E_UPSTREAM_KEY: "fake",
+			RUST_LOG: "error",
+			...windowEnv(60_000),
+		},
+		stdio: ["ignore", "ignore", "pipe"],
+	});
+	child.stderr!.on("data", (c: Buffer) => { try { fs.appendFileSync(launcherLog, c); } catch { /* noop */ } });
+	const code = await new Promise<number>((resolve, reject) => {
+		const timer = setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* gone */ } reject(new Error("bili codex exec timed out")); }, TMO * 2);
+		child.on("exit", (c) => { clearTimeout(timer); resolve(c ?? -1); });
+	});
+	const launcherOut = fs.existsSync(launcherLog) ? fs.readFileSync(launcherLog, "utf8") : "";
+	assert.equal(code, 0, `bili codex exec must succeed despite the hostile .env (code=${code})\nlauncher stderr:\n${launcherOut}`);
+
+	const last = fs.existsSync(lastFile) ? fs.readFileSync(lastFile, "utf8").trim() : "";
+	assert.match(last, /收到/, `the fake upstream must have answered through bili (last="${last}")`);
+
+	const oracle = readOracle(reqLog);
+	assert.ok(oracle.length > 0, "fake upstream received no requests — routing was rerouted away from bili");
+
+	// The overlay .env pins this launch's routing and preserves the user's
+	// innocent variables; the real .env stays byte-identical.
+	const overlayEnvPath = path.join(`${codexHome}-bili`, ".env");
+	assert.ok(fs.existsSync(overlayEnvPath), "the overlay must own the generated .env (#1806)");
+	const overlayEnv = fs.readFileSync(overlayEnvPath, "utf8");
+	assert.match(overlayEnv, /^HTTP_PROXY=http:\/\/127\.0\.0\.1:\d+$/m, "HTTP_PROXY must be pinned to this launch's bili origin");
+	assert.ok(overlayEnv.includes("E2E_INNOCENT=keepme"), "the user's own variables must survive into the overlay .env");
+	assert.ok(!overlayEnv.includes("socks5h"), "no socks5h residue may remain in the overlay .env");
+	assert.equal(fs.readFileSync(path.join(codexHome, ".env"), "utf8"), hostileEnv, "the real home .env must never be modified");
 });

@@ -91,6 +91,7 @@ interface PersistedSession {
         upstreamOrigin?: string;
         label?: string;
         title?: string;
+        activePack?: string;
     };
     /** Cumulative usage stats (v2+). Absent on v1 files; read via the flat
      *  fallbacks below. */
@@ -714,6 +715,8 @@ function buildSession(parsed: PersistedSession): Session {
             upstreamOrigin: meta.upstreamOrigin ?? parsed.upstreamOrigin,
             label: meta.label ?? parsed.label,
             title: meta.title,
+            // #1724: buildRecord persists activePack via spread but this reader dropped it
+            activePack: typeof meta.activePack === "string" ? meta.activePack : undefined,
         },
         stats: {
             requests: stats.requests ?? parsed.requests ?? 0,

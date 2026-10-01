@@ -13,7 +13,7 @@ import {
     type InlineRestoreResult,
 } from "acp-kernel";
 import { mkdirSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve as resolvePath } from "node:path";
 import { tmpdir } from "node:os";
 import { markDirty, preCompactionArchiveOf, peekSession, findSessionByCanonicalId, type Session } from "./session.js";
 import { getStore } from "./persist.js";
@@ -65,6 +65,33 @@ export type ProxyToolCtx = {
     log: (msg: string) => void;
 };
 
+/** #1691: honor the documented `toFile` argument. A non-empty string writes the
+ *  restore to the caller's path regardless of body size (never inflates context;
+ *  relative paths resolve against the proxy cwd). An explicit destination is an
+ *  intentional artifact, so it is deliberately NOT pushed into trackedTempFiles —
+ *  the reaper/beforeExit cleanup must never remove a file asked for by name.
+ *  Returns the "written to" pointer text on success (degraded partial on write
+ *  failure), or null when toFile was omitted so the caller uses its default. */
+function toFilePointer(args: Record<string, unknown>, ctx: ProxyToolCtx, header: string, body: string): string | null {
+    const raw = args.toFile;
+    if (raw === undefined || raw === null) return null;
+    if (typeof raw !== "string") {
+        ctx.log(`[acp-decompress] toFile must be a string (got ${typeof raw}) — using default output`);
+        return null;
+    }
+    const target = raw.trim();
+    if (target === "") return null;
+    const resolved = resolvePath(target);
+    try {
+        mkdirSync(dirname(resolved), { recursive: true });
+        writeFileSync(resolved, body, { encoding: "utf8", mode: 0o600 });
+        return `${header}\nContent (${body.length} chars) written to: ${resolved}\nUse the read tool to access it.`;
+    } catch (e) {
+        ctx.log(`[acp-decompress] toFile write failed: ${resolved} — ${String(e)}`);
+        return `${header}\n[Failed to write to ${resolved}: ${String(e)}]\n${safePrefix(body, 4000)}...`;
+    }
+}
+
 /** Resolve a decompress request to a result string, honoring the `full` flag
  *  and the cross-round original-content cache on the session.
  *
@@ -81,6 +108,14 @@ export type ProxyToolCtx = {
  *  - Otherwise fall back to collectBlockContent against the unfolded view
  *    (ctx.compressMessages ?? ctx.messages); if that yields nothing, return
  *    the block summary. */
+/** A decompress call asks for a range restore only when at least one range
+ *  field carries a non-blank value (#1712). */
+function hasRangeArgs(args: Record<string, unknown>): boolean {
+    const start = typeof args.startId === "string" ? args.startId.trim() : "";
+    const end = typeof args.endId === "string" ? args.endId.trim() : "";
+    return start !== "" || end !== "";
+}
+
 export function resolveDecompress(
     args: Record<string, unknown>,
     ctx: ProxyToolCtx,
@@ -96,7 +131,10 @@ export function resolveDecompress(
     if (archived[blockId] !== undefined) {
         return `[decompress FAILED: block ${blockId} is a pre-compaction archive — its content was in the history BEFORE the client's native compaction and is no longer reachable (replaced by the client's compaction summary). decompress is unavailable for archived blocks.]`;
     }
-    if (typeof args.startId === "string" || typeof args.endId === "string") {
+    // #1712: blank/whitespace range fields mean "unspecified" — hosts and models
+    // emit "" for optional fields, and treating that as a range request produced
+    // an unsatisfiable retry loop (fill in a real range → refused in plugin mode).
+    if (hasRangeArgs(args)) {
         return resolveDecompressRange(args, ctx, block);
     }
 
@@ -128,6 +166,8 @@ export function resolveDecompress(
     }
 
     const header = `[Block ${blockId} content — ${count} item(s)${full ? ", full" : ""}]`;
+    const toFileOut = toFilePointer(args, ctx, header, body);
+    if (toFileOut !== null) return toFileOut;
     const safeBlockId = blockId.replace(/[^a-zA-Z0-9_-]/g, "-");
     const outPath = body.length > 10000 ? join(tmpdir(), `acp-decompress-${safeBlockId}-${Date.now()}.txt`) : null;
     if (outPath) {
@@ -224,14 +264,16 @@ export function coveredRefSpan(state: CompressionState, block: CompressionBlock)
 function resolveDecompressRange(args: Record<string, unknown>, ctx: ProxyToolCtx, block: CompressionBlock): string {
     const startRaw = typeof args.startId === "string" ? args.startId.trim() : "";
     const endRaw = typeof args.endId === "string" ? args.endId.trim() : "";
-    if (!startRaw || !endRaw) return "[decompress FAILED: startId and endId must be given together]";
+    if (!startRaw || !endRaw) return "[decompress FAILED: startId and endId must be given together — pass both mNNNNN refs, or omit both to restore the whole block]";
     if (!ccrEnabled(ctx.session)) {
-        // [#1207 review F3] Plugin mode structurally never arms CCR (the agent
-        // owns its folds; bili never executes them) — the generic "enable
-        // compress.ccr.enabled" advice is unsatisfiable there and would send
-        // the model chasing a config that cannot help.
+        // Range restore needs the CCR content store; a CCR-off session has none.
+        // In plugin mode the model cannot enable CCR itself (it lives in the
+        // proxy's base config — plugin policy is the base block verbatim,
+        // #1345), so pointing it at the setting sends it chasing a config it
+        // cannot change (#1207 review F3). Give it the working call instead:
+        // whole-block restore with just blockId (#1712).
         if (typeof ctx.session.metadata.pluginAgent === "string") {
-            return "[decompress FAILED: range restore (startId/endId) is proxy-mode only — plugin mode owns its folds natively]";
+            return `[decompress FAILED: range restore (startId/endId) requires CCR, which this plugin-mode session does not have — omit startId/endId and restore the whole block: {"blockId":"${block.blockId}"}]`;
         }
         return "[decompress FAILED: range restore (startId/endId) requires CCR — enable compress.ccr.enabled]";
     }
@@ -281,7 +323,10 @@ function resolveDecompressRange(args: Record<string, unknown>, ctx: ProxyToolCtx
     const header = `[Block ${block.blockId} content — ${startRaw}–${endRaw} — ${parts.length} item(s)]`;
     let injText: string;
     const body = parts.join("\n\n");
-    if (body.length > 10000) {
+    const toFileOut = toFilePointer(args, ctx, header, body);
+    if (toFileOut !== null) {
+        injText = toFileOut;
+    } else if (body.length > 10000) {
         const safeBlockId = block.blockId.replace(/[^a-zA-Z0-9_-]/g, "-");
         // [#1207 review F4] Span in the filename (two spans of one block in the
         // same millisecond must not clobber each other) and 0600 (folded
@@ -304,7 +349,7 @@ function resolveDecompressRange(args: Record<string, unknown>, ctx: ProxyToolCtx
     // duplicate full-text message or inflating rangeRestores.
     const injId = retrievedMessageId(`range_${block.blockId}_${startRaw}-${endRaw}`);
     if (!ctx.session.pendingRetrievals.some((p) => p.ref === injId)) {
-        ctx.session.pendingRetrievals.push({ ref: injId, tokens: 0, chars: body.length, queuedAt: Date.now(), ccr: false, injection: { id: injId, role: "system", contentType: "text", text: injText } });
+        ctx.session.pendingRetrievals.push({ ref: injId, tokens: 0, chars: body.length, queuedAt: Date.now(), ccr: false, injection: { id: injId, role: "user", contentType: "text", text: injText } });
         ctx.session.stats.rangeRestores = (ctx.session.stats.rangeRestores ?? 0) + 1;
     }
     markDirty(ctx.session);
@@ -412,7 +457,7 @@ function resolveDerivedDecompress(
         if (preCompactionArchiveOf(anc)[blockId] !== undefined) {
             return `[decompress FAILED: block ${blockId} is a pre-compaction archive in derived session ${anc.id} — its content was replaced by the client's compaction summary and is no longer reachable.]`;
         }
-        if (typeof args.startId === "string" || typeof args.endId === "string") {
+        if (hasRangeArgs(args)) {
             return `[decompress FAILED: range restore (startId/endId) of derived-parent blocks is not supported — decompress "${blockId}" without range args (#1333)]`;
         }
         const full = args.full === true;

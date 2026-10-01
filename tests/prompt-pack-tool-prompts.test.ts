@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { defaultConfig, ACP_TOOLS_OPENAI, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_RESPONSES } from "acp-kernel";
@@ -11,6 +11,7 @@ import { resolveCompressSurface } from "../src/compress-settings.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 // #747 regression: compress-prompt-pack.test.ts asserts applyAcpToolOverrides
 // directly against the kernel helper (false coverage of the server wiring);
@@ -200,6 +201,6 @@ test("#747-sibling: anthropic wire — pack promptSections reach the system bloc
         }
     } finally {
         process.chdir(prevCwd);
-        rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });

@@ -28,6 +28,7 @@ import {
 } from "../src/plugin.ts";
 import { extractV1Outputs } from "../src/agent/opencode-native.ts";
 import { reportRuntimeInfoOnChange } from "../src/agent/shared.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 function mockRes(): { res: http.ServerResponse; body(): string } {
     let body = "";
@@ -302,7 +303,7 @@ async function startHarness(): Promise<Harness> {
             await Promise.allSettled([once(proxy, "close"), once(upstream, "close")]);
             if (prevStateHome === undefined) delete process.env.XDG_STATE_HOME;
             else process.env.XDG_STATE_HOME = prevStateHome;
-            fs.rmSync(stateHome, { recursive: true, force: true });
+            rmrf(stateHome);
         },
     };
 }

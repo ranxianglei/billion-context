@@ -213,10 +213,10 @@ test("install: non-model-API URLs fire onUnroutedModelUrl so direct sends are vi
         onUnroutedModelUrl: (u) => { unrouted.push(u); },
     };
     const { sink } = await withPatch(state, async (fetch) => {
-        // A third-party plugin's custom wire (commandcode's Go plan) — not a
-        // recognized model endpoint, so it goes direct AND is reported.
-        await fetch("https://api.commandcode.example/alpha/generate");
-        await fetch("https://api.commandcode.example/alpha/generate");
+        // A third-party plugin's custom wire (commandcode's Go plan, POST) —
+        // not a recognized model endpoint, so it goes direct AND is reported.
+        await fetch("https://api.commandcode.example/alpha/generate", { method: "POST" });
+        await fetch("https://api.commandcode.example/alpha/generate", { method: "POST" });
         // A real model endpoint — routed, never reported as unrouted.
         await fetch("http://127.0.0.1:8199/v1/messages");
         // Bili's own control plane — direct by design, never reported either.
@@ -227,6 +227,36 @@ test("install: non-model-API URLs fire onUnroutedModelUrl so direct sends are vi
     assert.ok(sink.includes("http://127.0.0.1:40001/bili/http://127.0.0.1:8199/v1/messages"), "model endpoint routed");
     assert.equal(unrouted.length, 2, "hook fires per unrouted request (host dedups)");
     for (const u of unrouted) assert.ok(u.endsWith("/alpha/generate"), `unexpected unrouted: ${u}`);
+});
+
+test("install: only POST fires onUnroutedModelUrl — registry/catalog/git GETs stay silent (#1657)", async () => {
+    const unrouted: string[] = [];
+    const state: NativeInterceptState = {
+        origin: "http://127.0.0.1:40001",
+        ready: Promise.resolve("http://127.0.0.1:40001"),
+        onUnroutedModelUrl: (u) => { unrouted.push(u); },
+    };
+    const { sink } = await withPatch(state, async (fetch) => {
+        // dsh plugin-manager boot traffic (#1657 repro): npm registry / CDN
+        // catalog / git refs — all pass through direct and UNREPORTED.
+        await fetch("https://mirrors.cloud.tencent.com/npm/dshmarket/latest");
+        await fetch("https://cdn.jsdelivr.net/gh/duhu2000/dsh-mcp-connector-registry@main/catalog.json");
+        await fetch("https://github.com/142475/dsh-pocket.git/info/refs");
+        await fetch("https://api.github.com/repos/duhu2000/dsh-mcp-connector/releases/latest");
+        // Non-model custom wire via other methods — also unreported.
+        await fetch("https://api.commandcode.example/alpha/generate");
+        await fetch("https://api.commandcode.example/alpha/generate", { method: "HEAD" });
+        // The same custom wire as POST — the #1290 case, still reported.
+        // Lowercase init method and Request-object method both count.
+        await fetch("https://api.commandcode.example/alpha/generate", { method: "post" });
+        await fetch(new Request("https://api.commandcode.example/alpha/generate", { method: "POST" }));
+    });
+    assert.equal(sink.length, 8, "every request still passes through direct");
+    assert.deepEqual(
+        unrouted,
+        ["https://api.commandcode.example/alpha/generate", "https://api.commandcode.example/alpha/generate"],
+        "only POSTs fire the hook",
+    );
 });
 
 test("install: proxy-origin URLs are never re-proxied (self guard)", async () => {

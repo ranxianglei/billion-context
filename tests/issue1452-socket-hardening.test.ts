@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import net from "node:net";
 import { once } from "node:events";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { defaultConfig } from "acp-kernel";
@@ -11,20 +11,12 @@ import { startServer } from "../src/server.ts";
 import { loadRoutes, type ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { streamStallMs, _liveUpstreamTimersForTest } from "../src/fetch-util.ts";
+import { _liveUpstreamTimersForTest } from "../src/fetch-util.ts";
 import { setLogCapture } from "../src/logger.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 function close(server: http.Server | net.Server): Promise<void> {
     return new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
-}
-
-async function freePort(): Promise<number> {
-    const server = http.createServer();
-    server.listen(0, "127.0.0.1");
-    await once(server, "listening");
-    const port = (server.address() as { port: number }).port;
-    await close(server);
-    return port;
 }
 
 interface Harness {
@@ -43,9 +35,8 @@ async function startProxy(upstream: http.Server | net.Server, debug: boolean): P
     const previous = process.env.BILI_CONFIG_FILE;
     process.env.BILI_CONFIG_FILE = biliConfig;
     const upstreamPort = (upstream.address() as { port: number }).port;
-    const port = await freePort();
     const opts: ProxyOptions = {
-        port,
+        port: 0,
         host: "127.0.0.1",
         upstream: `http://127.0.0.1:${upstreamPort}`,
         routes: loadRoutes(),
@@ -69,12 +60,13 @@ async function startProxy(upstream: http.Server | net.Server, debug: boolean): P
     };
     const proxy = await startServer(opts);
     if (!proxy.listening) await once(proxy, "listening");
+    const port = (proxy.address() as { port: number }).port;
     return {
         port,
         stop: async () => { await close(proxy); },
         cleanup: () => {
             if (previous === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = previous;
-            rmSync(root, { recursive: true, force: true });
+            rmrf(root);
         },
     };
 }
@@ -82,7 +74,7 @@ async function startProxy(upstream: http.Server | net.Server, debug: boolean): P
 const CHAT_BODY = JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi" }] });
 // Streaming variant: without `stream: true` the request takes the non-loop
 // pipeThrough path (no compress loop, no in-band error emission) — real agent
-// traffic always streams, so the stall tests must too (#1452).
+// traffic always streams, so these stream-silence tests must too (#1452/#1706).
 const STREAM_BODY = JSON.stringify({ model: "m", stream: true, messages: [{ role: "user", content: "hi" }] });
 
 function withEnv(name: string, value: string | undefined): () => void {
@@ -92,23 +84,6 @@ function withEnv(name: string, value: string | undefined): () => void {
         if (prev === undefined) delete process.env[name]; else process.env[name] = prev;
     };
 }
-
-test("streamStallMs: env parsing — off by default, strict positive integers only (#1452)", () => {
-    const restore = withEnv("BILI_STREAM_STALL_MS", undefined);
-    try {
-        assert.equal(streamStallMs(), 0);
-        process.env.BILI_STREAM_STALL_MS = "400";
-        assert.equal(streamStallMs(), 400);
-        process.env.BILI_STREAM_STALL_MS = "0";
-        assert.equal(streamStallMs(), 0);
-        process.env.BILI_STREAM_STALL_MS = "-5";
-        assert.equal(streamStallMs(), 0);
-        process.env.BILI_STREAM_STALL_MS = "garbage";
-        assert.equal(streamStallMs(), 0);
-    } finally {
-        restore();
-    }
-});
 
 test("clientError: parse-fail flood is drained and closed with FIN, never destroy-RST (#1452)", async () => {
     // Upstream is irrelevant — the bytes die in bili's HTTP parser before any
@@ -345,10 +320,10 @@ test("exposure telemetry: periodic info line with liveConns breakdown (#1452)", 
     }
 });
 
-test("stall guard: silent mid-stream upstream ends in in-band error + FIN, not a hang (#1452)", async () => {
-    // First chunk then silence forever — the exact incident shape (reasoning
-    // stream that stops emitting). The stall guard must cut it long before
-    // the 12-minute idle budget.
+test("retired stall guard: stale export ignored + named at startup; idle budget bounds the silence (#1706/#1714)", async () => {
+    // First chunk then silence forever — the #1706 incident shape. The retired
+    // BILI_STREAM_STALL_MS=400 export must NOT cut this stream at ~400ms; only
+    // the 3s idle budget may, and the stale value must be named at startup.
     const upstream = http.createServer((_req, res) => {
         res.writeHead(200, { "content-type": "text/event-stream", "connection": "close" });
         res.flushHeaders();
@@ -356,12 +331,14 @@ test("stall guard: silent mid-stream upstream ends in in-band error + FIN, not a
     });
     await new Promise<void>((r) => upstream.listen(0, "127.0.0.1", () => r()));
     const restoreStall = withEnv("BILI_STREAM_STALL_MS", "400");
-    const restoreIdle = withEnv("BILI_UPSTREAM_TIMEOUT_MS", "60000");
+    const restoreIdle = withEnv("BILI_UPSTREAM_TIMEOUT_MS", "3000");
     const captured: { level: string; msg: string }[] = [];
     setLogCapture((level, msg) => captured.push({ level, msg }));
     let harness: Harness | null = null;
     try {
         harness = await startProxy(upstream, false);
+        const retireWarn = captured.find((c) => c.level === "warn" && c.msg.includes("BILI_STREAM_STALL_MS=400") && c.msg.includes("no longer read"));
+        assert.ok(retireWarn, `expected startup notice naming the stale export, got: ${captured.map((c) => c.msg).join(" | ").slice(0, 400)}`);
         const ac = new AbortController();
         const guard = setTimeout(() => ac.abort(), 15_000);
         guard.unref?.();
@@ -374,15 +351,13 @@ test("stall guard: silent mid-stream upstream ends in in-band error + FIN, not a
         });
         const body = await res.text();
         const elapsed = Date.now() - started;
-        assert.equal(res.status, 200, `headers were committed before the stall, got ${res.status}`);
-        // #721 converts upstream read failures into a stable in-band truncation
-        // frame (code upstream_stream_truncated) + terminal event; the exact
-        // cause (the stall-guard abort) is pinned via the server-side warn line.
+        assert.equal(res.status, 200, `headers were committed before the cut, got ${res.status}`);
         assert.ok(body.includes("upstream_stream_truncated"), `expected in-band truncation frame, got: ${body.slice(0, 300)}`);
         assert.ok(body.includes("data: [DONE]"), "stream must terminate with the protocol terminal event");
-        const warn = captured.find((c) => c.level === "warn" && c.msg.includes("upstream stalled: no bytes for 400ms"));
-        assert.ok(warn, `expected stall-guard attribution in server logs, got: ${captured.map((c) => c.msg).join(" | ").slice(0, 400)}`);
-        assert.ok(elapsed < 10_000, `stall guard took too long to fire (${elapsed}ms)`);
+        // >2s proves the stale 400ms export did not fire; <10s proves the 3s
+        // idle budget (or its 2x watchdog) still bounds a dead stream.
+        assert.ok(elapsed > 2000, `stale BILI_STREAM_STALL_MS appears to have cut the stream early (${elapsed}ms)`);
+        assert.ok(elapsed < 10_000, `idle budget took too long to fire (${elapsed}ms)`);
     } finally {
         restoreStall();
         restoreIdle();
@@ -390,69 +365,20 @@ test("stall guard: silent mid-stream upstream ends in in-band error + FIN, not a
         if (harness) { await harness.stop(); harness.cleanup(); }
         upstream.closeAllConnections?.();
         await close(upstream);
-        assert.equal(_liveUpstreamTimersForTest(), 0, "no upstream timers leaked after stall abort");
+        assert.equal(_liveUpstreamTimersForTest(), 0, "no upstream timers leaked after idle abort");
     }
 });
 
-test("stall guard: healthy stream longer than the budget survives — re-arm per byte (#1452)", async () => {
-    // 8 chunks at 250ms = ~2000ms total > 750ms budget. A total-time deadline
-    // would cut this stream; per-byte re-arm must not. Interval/budget margin
-    // is 3x so a loaded CI runner's timer jitter (windows runners spike)
-    // cannot masquerade as a stall.
-    const intervalMs = 250;
-    const totalChunks = 8;
-    const upstream = http.createServer((_req, res) => {
-        res.writeHead(200, { "content-type": "text/event-stream", "connection": "close" });
-        res.flushHeaders();
-        let sent = 0;
-        const t = setInterval(() => {
-            sent += 1;
-            res.write(`data: {"choices":[{"delta":{"content":"chunk-${sent}"}}]}\n\n`);
-            if (sent >= totalChunks) {
-                clearInterval(t);
-                res.write("data: [DONE]\n\n");
-                res.end();
-            }
-        }, intervalMs);
-        _req.on("close", () => clearInterval(t));
-    });
-    await new Promise<void>((r) => upstream.listen(0, "127.0.0.1", () => r()));
-    const restoreStall = withEnv("BILI_STREAM_STALL_MS", "750");
-    const restoreIdle = withEnv("BILI_UPSTREAM_TIMEOUT_MS", "60000");
-    let harness: Harness | null = null;
-    try {
-        harness = await startProxy(upstream, false);
-        const ac = new AbortController();
-        const guard = setTimeout(() => ac.abort(), 15_000);
-        guard.unref?.();
-        const res = await fetch(`http://127.0.0.1:${harness.port}/v1/chat/completions`, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: STREAM_BODY,
-            signal: ac.signal,
-        });
-        const body = await res.text();
-        for (let i = 1; i <= totalChunks; i++) assert.ok(body.includes(`chunk-${i}`), `missing chunk-${i}: ${body.slice(0, 300)}`);
-        assert.ok(body.includes("[DONE]"), `healthy stream must complete with the terminal event: ${body.slice(0, 300)}`);
-        assert.ok(!body.includes("stream error"), `healthy stream must not trip the stall guard: ${body.slice(0, 300)}`);
-    } finally {
-        restoreStall();
-        restoreIdle();
-        if (harness) { await harness.stop(); harness.cleanup(); }
-        upstream.closeAllConnections?.();
-        await close(upstream);
-        assert.equal(_liveUpstreamTimersForTest(), 0, "no upstream timers leaked after normal completion");
-    }
-});
-
-test("stall guard: default-off — silence after first byte does NOT cut the stream (#1452)", async () => {
+test("retired stall guard: mid-stream silence survives any short window even with the stale export set (#1706/#1714)", async () => {
     const upstream = http.createServer((_req, res) => {
         res.writeHead(200, { "content-type": "text/event-stream", "connection": "close" });
         res.flushHeaders();
         res.write('data: {"choices":[{"delta":{"content":"chunk-1"}}]}\n\n');
     });
     await new Promise<void>((r) => upstream.listen(0, "127.0.0.1", () => r()));
-    const restoreStall = withEnv("BILI_STREAM_STALL_MS", undefined);
+    // The stale-export shape from #1706: the retired var is set, and the
+    // stream still goes silent far past its old 400ms window — nothing may cut it.
+    const restoreStall = withEnv("BILI_STREAM_STALL_MS", "400");
     const restoreIdle = withEnv("BILI_UPSTREAM_TIMEOUT_MS", "60000");
     let harness: Harness | null = null;
     try {
@@ -466,11 +392,11 @@ test("stall guard: default-off — silence after first byte does NOT cut the str
             },
         );
         req.end(STREAM_BODY);
-        await new Promise((r) => setTimeout(r, 900));
+        await new Promise((r) => setTimeout(r, 2000));
         const soFar = seen.join("");
         assert.ok(soFar.length > 0, "first chunk should have flowed through");
-        assert.ok(!soFar.includes("stream error"), `default-off must not emit a stall error: ${soFar.slice(0, 300)}`);
-        assert.ok(!soFar.includes("[DONE]"), `default-off must not terminate a still-open stream: ${soFar.slice(0, 300)}`);
+        assert.ok(!soFar.includes("stream error"), `retired guard must not emit a truncation error: ${soFar.slice(0, 300)}`);
+        assert.ok(!soFar.includes("[DONE]"), `retired guard must not terminate a still-open stream: ${soFar.slice(0, 300)}`);
         req.destroy();
     } finally {
         restoreStall();

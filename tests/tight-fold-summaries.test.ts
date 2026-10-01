@@ -41,6 +41,7 @@ import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 type Item = Record<string, unknown>;
 
@@ -244,7 +245,7 @@ async function driveAnthropic(sessionId: string, trigger: ProbeTrigger, label: s
         await closeServer(upstream);
         if (prevXdg === undefined) delete process.env.XDG_STATE_HOME;
         else process.env.XDG_STATE_HOME = prevXdg;
-        fs.rmSync(tmp, { recursive: true, force: true });
+        rmrf(tmp);
     }
 }
 

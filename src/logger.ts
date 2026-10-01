@@ -28,11 +28,18 @@
  * enterSessionContext() below; the [v=...] token is process-wide (the running
  * build's version), so any single line from a multi-instance shared log file
  * self-identifies its writer even when different versions coexist.
+ *
+ * Before hitting file/stderr every line passes redactSecretsInText() (#1718)
+ * — a final scrub for credential-shaped tokens in free-form text (upstream
+ * error bodies echoing API keys), complementing per-call-site structural
+ * masking in log-mask.ts. The programmatic capture hook receives the raw
+ * message: it is an in-process test/diagnostic seam, not a log surface.
  */
 import { createWriteStream, fstatSync, mkdirSync, statSync, renameSync, unlinkSync, type WriteStream } from "node:fs";
 import path from "node:path";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { VERSION } from "./version.js";
+import { maskIpsInText, redactSecretsInText } from "./log-mask.js";
 
 const MAX_BYTES = 10 * 1024 * 1024; // 10 MB → rotate
 
@@ -88,6 +95,25 @@ export function isStreamWriteError(err: unknown): boolean {
     if (typeof err !== "object" || err === null) return false;
     const code = (err as { code?: unknown }).code;
     return typeof code === "string" && STREAM_WRITE_ERROR_CODES.has(code);
+}
+
+const BENIGN_SOCKET_RACE_MESSAGE = "Cannot read properties of undefined (reading '_writableState')";
+
+/** Socket-teardown race on an already-closed socket (#1574): a Node-internal
+ *  callback (socketOnTimeout / socketOnEnd / closeIdleConnections) reaches a
+ *  socket whose writable side was already torn down. #1574 triage proved this
+ *  signature unreachable via bili's own call paths or stock Node v22.23.2
+ *  dispatch (all cited frames pass bound receivers; states are never nulled;
+ *  every graceful close funnels through destroy(), which clears the keep-alive
+ *  timer), and empirically verified that end()/destroy() on a fully closed
+ *  socket are harmless no-ops — so an occurrence touches no live resource.
+ *  Matched exactly (message + core frame provenance) so nothing else can be
+ *  demoted by accident. */
+export function isBenignSocketRaceError(err: unknown): boolean {
+    if (!(err instanceof TypeError) || err.message !== BENIGN_SOCKET_RACE_MESSAGE) return false;
+    const stack = err.stack;
+    if (typeof stack !== "string") return false;
+    return stack.includes("node:_http_server") || stack.includes("node:internal/streams/writable");
 }
 
 /** Flip to file-only logging after stderr died. Idempotent; the [warn] goes
@@ -228,15 +254,16 @@ export const log: Logger = (level, msg) => {
             // best-effort: a broken test/probe sink must never crash logging
         }
     }
+    const safe = maskIpsInText(redactSecretsInText(msg));
     const ts = new Date().toISOString();
     const sess = sessionCtx.getStore();
     const head = `${ts} [${level}]${sess ? ` [sess=${sess}]` : ""} [v=${VERSION}]`;
     // One prefix per PHYSICAL line (see header doc): multi-line payloads keep
     // timestamp + session + version attribution line by line. Fast path skips
     // the split for the common single-line message.
-    const line = msg.indexOf("\n") < 0
-        ? `${head} ${msg}\n`
-        : msg.split("\n").map((p) => `${head} ${p}`).join("\n") + "\n";
+    const line = safe.indexOf("\n") < 0
+        ? `${head} ${safe}\n`
+        : safe.split("\n").map((p) => `${head} ${p}`).join("\n") + "\n";
     // stderr (foreground terminal / shell redirect). MUST NOT throw and must
     // never re-enter its own error path: a sync failure (Windows) or the async
     // 'error' event (Linux, module-init listener above) both flip us to

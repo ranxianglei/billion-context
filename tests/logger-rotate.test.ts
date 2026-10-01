@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { configureLogger, closeLogger, log } from "../src/logger.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 const MAX_BYTES = 10 * 1024 * 1024;
 
@@ -32,6 +33,6 @@ test("log rotation keeps at most one .old generation", () => {
         closeLogger();
     } finally {
         closeLogger();
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });

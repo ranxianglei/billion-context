@@ -2,13 +2,14 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
 import { createHash, randomBytes } from "node:crypto";
-import { mkdtempSync, rmSync, readFileSync, statSync } from "node:fs";
+import { mkdtempSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import * as zlib from "node:zlib";
 import { SessionStore } from "../src/persist.ts";
 import { createStorageCodec, ENCRYPT_MAGIC, ZSTD_MAGIC, _setZstdAvailableForTest } from "../src/encrypt.ts";
 import type { Session } from "../src/session.ts";
 import { createInitialState } from "acp-kernel";
+import { rmrf } from "./tmp-rm.ts";
 
 const KEY = randomBytes(32).toString("hex");
 
@@ -52,7 +53,7 @@ async function withTempDir(name: string, fn: (h: Harness) => Promise<void>): Pro
             delete process.env.BILI_ENCRYPTION_KEY;
             delete process.env.BILI_PERSIST_ZSTD;
             _setZstdAvailableForTest(null);
-            rmSync(dir, { recursive: true, force: true });
+            rmrf(dir);
         }
     });
 }

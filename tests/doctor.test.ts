@@ -4,15 +4,23 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { globalVerdict, laneVerdict, renderDoctorReport, runDoctor, type DoctorLane, type DoctorProcess, type DoctorReport } from "../src/doctor.ts";
 import { PLUGIN_AGENTS, inspectLanePresence } from "../src/plugin-install.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 function withEnv(vars: Record<string, string | undefined>, fn: () => void | Promise<void>): Promise<void> | void {
+    const effective: Record<string, string | undefined> = { ...vars };
+    // Windows os.homedir() resolves through USERPROFILE, not HOME — mirror the
+    // sandboxed HOME there or real-machine config (~/.dsh, ~/.zcode, …) leaks
+    // into tests that believe they are running in an empty home.
+    if (process.platform === "win32" && effective.HOME !== undefined && effective.USERPROFILE === undefined) {
+        effective.USERPROFILE = effective.HOME;
+    }
     const saved: Record<string, string | undefined> = {};
-    for (const [k, v] of Object.entries(vars)) {
+    for (const [k, v] of Object.entries(effective)) {
         saved[k] = process.env[k];
         if (v === undefined) delete process.env[k];
         else process.env[k] = v;
@@ -111,7 +119,7 @@ test("inspectLanePresence omp: dead entry is a broken lane, live entry resolves 
             assert.ok(live.targets.every((t) => existsSync(t)));
         });
     } finally {
-        rmSync(base, { recursive: true, force: true });
+        rmrf(base);
     }
 });
 
@@ -141,7 +149,7 @@ test("inspectLanePresence dsh: local pin flags a frozen dev lane, registry pin r
             assert.equal(laneVerdict({ installed: true, targetMissing: false, frozen: false, copyVersion: main?.copyVersion, registryVersion: "999.0.0" }), "stale");
         });
     } finally {
-        rmSync(base, { recursive: true, force: true });
+        rmrf(base);
     }
 });
 
@@ -164,7 +172,7 @@ test("inspectLanePresence hermes: baked plugin.yaml version is the freshness sig
             assert.equal(laneVerdict({ installed: true, targetMissing: false, frozen: false, copyVersion: p.copyVersion, registryVersion: "999.0.0" }), "stale");
         });
     } finally {
-        rmSync(base, { recursive: true, force: true });
+        rmrf(base);
     }
 });
 
@@ -188,7 +196,7 @@ test("inspectLanePresence: corrupt single-source config is a probe failure, not 
             });
         }
     } finally {
-        rmSync(base, { recursive: true, force: true });
+        rmrf(base);
     }
 });
 
@@ -225,7 +233,7 @@ test("runDoctor: corrupt lane config surfaces as a broken probe row, not absent"
             });
         });
     } finally {
-        rmSync(base, { recursive: true, force: true });
+        rmrf(base);
     }
 });
 
@@ -275,7 +283,7 @@ test("runDoctor: full report against a mocked registry, sandboxed homes", async 
             });
         });
     } finally {
-        rmSync(base, { recursive: true, force: true });
+        rmrf(base);
     }
 });
 
@@ -308,6 +316,6 @@ test("runDoctor: unreachable registry never produces a false-stale verdict", asy
             });
         });
     } finally {
-        rmSync(base, { recursive: true, force: true });
+        rmrf(base);
     }
 });

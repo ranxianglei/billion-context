@@ -11,10 +11,12 @@
 
 - **启动器:** `bili dsh` 经 `--patch` overlay(`~/.dsh-bili/.bili-acp.patch.yml`)注入完整原生插件 —— 每个 profile 启动即注册 bili 工具，模型请求盖 `x-bili-plugin` + dsh 会话 id(plugin 模式)，`/acp` 会话绑定。同一份 patch 同时禁用 dsh 原生自动压缩(`compaction-basic` → `auto: false`);手动 `/compact` 仍可用。
 - **Profile 安装(免启动器)——统一泳道(#966):** `bili plugin install dsh` 对每个已存在的 profile 执行 `dsh plugin --profile <name> add billion-context` —— pnpm 把包装进各 profile 自己的 `node_modules`,dsh 自动挂载包内 patch 层(`dsh.bundle.patch.yml`)。装哪个源取决于 bili 自身的安装形态(#925):npm 安装传注册表名,checkout/dev 构建传绝对路径(`link:` 依赖,本地改动实时生效)。旧版受管块(`# bili begin` / `# bili end`,#966 之前的安装所写)在安装与卸载时都会被剥离 —— 用户条目与注释保留,清空的文件还原占位 `[]`。先在每个 profile 里跑过一次 dsh 让目录存在。插件加载时自拉起代理(已有健康实例则附看，不重复拉;父进程 pid 看门狗)，经全局 fetch 补丁把模型流量改写为 `<proxy>/bili/<上游URL>`，原样注册清单工具，并按工具就绪门控 plugin 模式头(第一轮走 wire 模式)。退出开关:`BILI_NATIVE_DSH=0`。卸载:`bili plugin remove dsh` 或 `dsh plugin --profile <name> remove billion-context` —— 两者走同一通道。经注册表安装要求 npm 上已发布含 `dsh.bundle.patch.yml` 的版本。若 add 后 dsh 启动即报 `billion-context/dsh` 的 `ERR_MODULE_NOT_FOUND`,说明 profile 从陈旧的包元数据缓存里解析到了不含 bundle 子路径导出的旧版本(#953)——固定版本重装:`dsh plugin --profile <name> add billion-context@latest`。
+- **桌面应用(Electron 宿主):** 同一插件也运行在 deepseek-harness **desktop** 应用内(经其应用内插件管理器安装)。此时 bootstrap 在应用进程内拉起代理:该进程的 `process.execPath` 是 Electron 二进制而非 Node,GUI 的 PATH 又不含常规安装目录 —— `resolveNodeRuntime`(#819/#1429)先探测众所周知的安装位置(`/opt/homebrew/bin`、`/usr/local/bin`、Volta 等),再回退到以纯 Node 方式运行应用自身二进制(`ELECTRON_RUN_AS_NODE=1`,强制注入子进程 env),于是无需 PATH 里有独立 Node 也能零配置压缩;设 `BILLION_CONTEXT_NODE` 可强制指定某个 Node(优先于两者)。#1429 之前该路径在 spawn 前抛错,所有会话静默降级为直连(不压缩),只能从 bili.log 里发现。
 - **自动更新保持各 profile 同步:** 刷新有两个触发器 —— 全局自更新完成后,以及**profile 自己的代理**在周期检查里发现注册表有新版本时(全局 bili 从不运行也一样刷新,#1196 —— 插件市场安装的用户往往根本没有全局安装)。两种触发器都扫描 `~/.dsh/profiles/*/package.json`,把注册表钉住的 `billion-context` 依赖刷新到目标版本(全局触发器刷到新全局版本,自触发刷到注册表最新),统一经 dsh 自己的 `plugin add` 通道,绝不在位覆盖 —— 加载的插件与代理从此不再漂移(#953);钉在本地源的 profile 不动。刷新是尽力而为,失败下个周期重试,绝不会让代理或更新本身失败。
 - **已报告:Profile 安装下部分传输零代理流量(#1158,调查中):** dsh `llm-pi-ai` 层的部分传输服务会话**从未有任何模型请求到达代理**(日志无 `processTurn`,调用 bili 工具返回 404 "no model request has arrived"),而同宿主的其他 provider 正常。根因仍在用运行时证据定性 —— 候选:传输层 fetch 形态(SDK 注入 fetch / 非全局 dispatcher)或宿主侧归属缺口导致流量未被 takeover gate 认领。检测:此类情况会打一次性 `[plugin] NO MODEL REQUESTS seen for conversation …` 告警,dsh 插件还会把归属 gate 放行的每个端点各记一条日志(每进程一次)。期间可靠规避:改用 `bili dsh` 启动 —— 启动器的 settings overlay 会把那些 provider 的 `baseURL` 重写为 `/bili/` URL,无论传输层使用哪种 fetch、归属状态如何,流量都必然过代理。
+- **Web profile 说明(#1772):** 当 profile 的 bundles 含 `@deepseek-ai/dsh-web-app` 时,真正运行的 `compaction-basic` 实例位于 agent preset(`preset-standard.config.plugins`)内部 —— dsh 的 patch 引擎只按 id 索引顶层条目与真 group(`group: true` 且 config 为数组)的子项,preset 内的嵌套行任何 patch 层都够不到。于是 bundle 里的 `auto: false` 落在 web-app 已禁用的宿主平面行上,preset 实例保持自动压缩开启。此类 profile 启动时插件打一条一次性 `[dsh-client]` 告警;ACP 压缩不受影响。
 
-`bili dsh` 启动下插件**附看**(attach)启动器的代理(不二次拉起)。裸上游 URL 与 spawn 模式一样重写为 `<proxy>/bili/<url>`(回环代理目标永不被代理 env 拦截，等于直接绕开 MITM)；已经路由的 `/bili/` 前缀请求原样放行、只盖章。已知局限:手动 `/compact` 没有 dsh 侧事件钩子，其边界交给内核的自然 ingest diff(自动压缩已关，影响罕见)。
+`bili dsh` 启动下插件**附看**(attach)启动器的代理(不二次拉起)。裸上游 URL 与 spawn 模式一样重写为 `<proxy>/bili/<url>`(回环代理目标永不被代理 env 拦截，等于直接绕开 MITM)；已经路由的 `/bili/` 前缀请求原样放行、只盖章。已知局限:手动 `/compact` 没有 dsh 侧事件钩子，其边界交给内核的自然 ingest diff(非 web profile 下自动压缩已关，影响罕见;web profile 见上方 #1772 说明)。
 
 ## Kimi Code(Moonshot)
 
@@ -73,9 +75,21 @@ fork 继承同一面)。按设计保持 launcher-only。
   - **客户端签名账号(#1621):** v3.14+ personal store 上的 coding-plan 账号保持直连(见已知局限);其余 provider 照常路由。
   - **环回目标(#809):** http 环回 `baseURL`(localhost / 127.x.x.x / ::1)永不二次代理 —— 包装它会把 bili 叠在自己或你自己的本地中继上。
   - **`direct` 豁免:** `providers` 表(以上游 URL 为键,见 CONFIGURATION.zh-CN.md)里声明 `"direct": true` 的路由保持直连 —— 任何 lane 都能遵守的同一套豁免机制。
-  通道默认钉死端口(`48789`,`BILI_ZCODE_PORT` 覆盖),即使没有交接,包装也能跨会话重启存活。`BILI_ZCODE_ROUTE`(`plans`/`none`)是兼容逃生舱;`BILI_ZCODE_SIGNING_FIXED=1` 在 ZCode 发布签名修复后关掉 #1621 跳过。
+  通道把代理拉在自管端口区(#1660):基准口 `18787`,每 lane 粘性记录(自动跟随历史上的 +1 阶梯漂移),碰撞由子进程 +1 阶梯解决,漂移时共享 store 改写到存活 origin —— 即使没有交接,包装也能跨会话重启存活。`BILI_ZCODE_PORT` 钉死一个确切端口(严格模式:占用者被大声拒绝,不跳口)。`BILI_ZCODE_ROUTE`(`plans`/`none`)是兼容逃生舱;`BILI_ZCODE_SIGNING_FIXED=1` 在 ZCode 发布签名修复后关掉 #1621 跳过。
 - **看门狗与生命周期:** MCP 子进程每 30 s 探测一次代理。attach 模式下永远等待(绝不碰用户自己的代理);spawn 模式下代理死亡则重新拉起并把路由改写到新 origin。恢复失败时移除受管改写,让流量退回直连上游而不是打到死端口。会话结束时 ZCode 杀掉 MCP 子进程,父进程 pid 看门狗随之收掉拉起的代理;MCP 子进程退出前(SIGTERM/SIGINT/正常退出)在锁下交接:若共享 provider store 仍指向它自己的代理,优先改写到另一个存活兼容实例,没有则移除受管改写退回直连(#1623)——实例死后共享配置不留死端口。看门狗每个 tick 同时检查共享 store:若残留着其他实例的死端口(硬杀场景,上述交接没跑成——如 Windows TerminateProcess 跳过 JS handler),接管修复(优先改到存活实例,否则回退直连);只在 store 指向死端口时动手,绝不从存活实例手里抢路由。多个并发会话共享第一个拉起的代理;它消失后其余会话自动重新拉起并改路。边界:ZCode 按会话缓存 provider baseURL,上述修复只对「之后的新读取」(新会话/新查询)生效,在途会话仍会重试缓存的旧端口直到重读;要结构性规避,把 `BILLION_CONTEXT_PROXY` 钉到一个常驻代理(`bili start`)让所有会话 attach 上去(attach 模式绝不碰用户自己的代理)。
 - **已知局限:** ZCode 的反欺诈指纹(#661)作用于 `zcode.z.ai` 登录流量的 MITM 重建 body —— 原生模式不碰那个面(模型流量走 provider store,不走 GUI 代理);若你同时使用 GUI 代理/MITM 配置,请保留 `"mitm://zcode.z.ai": { "passthrough": true }` 路由。v3.14+ 构建上,coding-plan 账号的 ClientRequestSigningV4 在模型创建阶段拒绝非 HTTPS origin,且其握手路径只从 origin 派生(丢弃任何 /bili/ 前缀),因此 /bili/ 包装的 baseURL 会以 "Client signing handshake requires HTTPS." 失败(#1621)。该冲突硬编码在 ZCode 侧,原生模式把这些账号**逐条跳过** —— 记录原因、这些账号保持直连;在这些账号上请用 GUI 证书 MITM 配置获得压缩能力,直到 ZCode 发布签名修复,届时设 `BILI_ZCODE_SIGNING_FIXED=1` 即可恢复路由。默认 `route:"all"` 下只有这些账号被跳过 —— store 上其余 provider 继续路由;整体退场(路由全关)只在 `route:"plans"` 下发生,因为那里 plan 账号本身就是签名账号。pre-3.14 legacy-store 客户端不受影响。`BILLION_CONTEXT_PROXY` 已设置(attach 模式管着代理)或定义了 `BILI_PROVIDER_REWRITES` 时插件整体退场。退出开关:`BILI_NATIVE_ZCODE=0`。
+
+## Codex(OpenAI Codex CLI)
+
+Codex 是唯一一个插件安装无法自给自足的客户端。接缝矩阵可以解释:claude 有 SessionStart hook + 受管 settings 块,zcode 有可改写 `baseURL` 的 provider store —— codex 两者都没有。它的模型流量只能经环境变量路由(`HTTPS_PROXY` / `SSL_CERT_FILE` —— `bili codex` 正是这么做的);默认 ChatGPT-登录 provider 没有可改写的配置缝,managed `model_providers` 块会强制 `env_key` API-key 认证、**废掉订阅登录**;而 MCP 子进程无法向父进程注入 env,所以插件永远路由不了 codex 本体流量。三种姿势:
+
+| 姿势 | 你能得到什么 |
+|---|---|
+| `bili codex`(启动器) | 全功能零配置:自管 lane 代理(#1660 端口区,粘性口)+ 注入 codex 的证书 MITM env —— 工具与压缩兼得 |
+| `bili plugin install codex` + 在跑的 bili + 自行导出 `HTTPS_PROXY` | 自己管 env 的 power user:工具 + 压缩 |
+| 只装 `bili plugin install codex` | codex 里出现四个工具但没有对话被代理、无话可操作;全不可达时 `tools/list` 报 -32003(`bili proxy unreachable … — start bili or set BILI_MCP_PROXY`) |
+
+安装写入 `~/.codex/config.toml` 单个 `[mcp_servers.bili]` 块(command = node,args = dist/mcp.js)。#1660 去掉了安装时烘焙 origin(#403:烘焙的 URL 在漂移/重启后变成死端口,工具永远指向它);shell 在会话启动时解析代理 —— env `BILI_MCP_PROXY` > 活实例登记(任一 lane 的代理,或 `bili start` 守护)> 8787 用户区默认 —— 漂移或重启后绝不残留死 URL,shell 直接附着到活着的那个。会话绑定是 headless 的:启动器在 spawn 时传 `BILI_CONVERSATION_ID`,插件 shell 否则绑定下一个新会话;逐调用的 `conversation_id` 覆盖与其他客户端一致(#760)。
 
 ## 客户端用 `http.proxy`(CONNECT)接入但从不压缩
 
@@ -95,7 +109,7 @@ bili 只压缩路径匹配已知 wire 协议(`/chat/completions`、`/llm_raw_cha
 
 这个结果现在不再静默(#1290):
 
-- 客户端侧 fetch 钩子对每个不同的未路由端点每进程记一次日志(`…is not a recognized model endpoint, so bili did not route it through the proxy…`);
+- 客户端侧 fetch 钩子对每个不同的、以 **POST** 发出的未路由端点每进程记一次日志(`…is not a recognized model endpoint, so bili did not route it through the proxy…`);非 POST 流量——npm 注册表、目录 JSON、git refs——按设计保持静默(#1657:GET 不携带 prompt,不可能是模型流量);
 - `curl -s http://localhost:8787/__bili/stats` 输出 `unrecognizedPaths`(按路径计数,仅 loopback);
 - 存在此类请求时,`acp_status` 输出会多一节 `UNRECOGNIZED PATHS (instance-level)`。
 

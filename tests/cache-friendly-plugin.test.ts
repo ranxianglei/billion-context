@@ -67,6 +67,7 @@ import { startServer, type ProxyOptions } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 const LT = "\x3c";
 const GT = "\x3e";
@@ -502,7 +503,7 @@ async function driveWire(wire: Wire, steps: Step[]): Promise<Canon[]> {
         await once(upstream, "close");
         if (prevXdg === undefined) delete process.env.XDG_STATE_HOME;
         else process.env.XDG_STATE_HOME = prevXdg;
-        fs.rmSync(stateDir, { recursive: true, force: true });
+        rmrf(stateDir);
     }
     return captured.map((raw) => canon(raw, wire));
 }

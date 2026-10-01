@@ -1,6 +1,7 @@
 import { defineConfig } from "tsup";
 
-export default defineConfig({
+export default [
+defineConfig({
     entry: ["src/index.ts", "src/mcp.ts", "src/claude-native-bootstrap.ts", "src/agent/pi.ts", "src/agent/pi-native.ts", "src/agent/omp.ts", "src/agent/omp-native.ts", "src/agent/opencode.ts", "src/agent/opencode-native.ts", "src/agent/dsh-acp.ts", "src/agent/dsh-native.ts", "src/kimi/native-mcp.ts", "src/kimi/bootstrap-hook.ts", "src/zcode/mcp-entry.ts", "src/zcode/bootstrap-hook.ts"],
     format: ["esm"],
     target: "node20",
@@ -46,4 +47,33 @@ export default defineConfig({
         // built-ins ever reach this path — node-forge is otherwise bundled.
         js: "import { createRequire as __biliCreateRequire } from 'node:module';\nconst require = __biliCreateRequire(import.meta.url);",
     },
-});
+}),
+// #1590: dsh web-profile settings entry (dsh.client browser half). Built as a
+// classic script: CJS body wrapped in window.__ModuleLoader__.load({id,
+// factory}) — the banner/footer locals shadow module/exports so esbuild's CJS
+// output lands inside the factory closure, whose `require` parameter resolves
+// externals through dsh's module system (react stays external; nothing else
+// may be required). No clean here: this runs after the main config above.
+defineConfig({
+    entry: { "agent/dsh-native-client": "src/agent/dsh-native-client.ts" },
+    format: ["cjs"],
+    target: "es2020",
+    platform: "browser",
+    external: ["react"],
+    outDir: "dist",
+    clean: false,
+    splitting: false,
+    shims: false,
+    // Keep the .js name (not tsup's default .cjs): this is a browser classic
+    // script, not a node CJS artifact, and package.json points at it as-is.
+    outExtension: () => ({ js: ".js" }),
+    banner: {
+        // Trailing balance: `load({ id, factory: (require) => {` opens call +
+        // object + arrow-body, so the footer closes all three.
+        js: "window.__ModuleLoader__.load({ id: \"billion-context\", factory: (require) => {\nvar module = { exports: {} };\nvar exports = module.exports;\n",
+    },
+    footer: {
+        js: "\nreturn module.exports;\n}});",
+    },
+}),
+];

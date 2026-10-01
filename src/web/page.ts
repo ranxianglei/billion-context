@@ -22,6 +22,7 @@ export function renderPage(origin: string, version: string): string {
 <div id="stale-banner" class="banner warn" hidden></div>
 <div id="conflicts-banner" class="banner warn" hidden></div>
 <div id="advisory-banner" class="banner warn" hidden></div>
+<div id="alerts-banner" class="banner err" hidden></div>
 <main>
 <section id="page-overview" class="page">
 <div class="page-head"><div><h1 data-i18n="ov.title">${zh("ov.title")}</h1><div class="sub" data-i18n="ov.sub">${zh("ov.sub")}</div></div></div>
@@ -61,6 +62,11 @@ export function renderPage(origin: string, version: string): string {
 <section id="page-config" class="page" hidden>
 <div class="page-head"><div><h1 data-i18n="cfg.title">${zh("cfg.title")}</h1><div class="sub" data-i18n="cfg.sub">${zh("cfg.sub")}</div></div></div>
 <div id="cfg-parse-error" class="banner err" hidden></div>
+<div class="card"><div class="card-h"><span data-i18n="cfg.quick">${zh("cfg.quick")}</span></div><div class="card-b">
+<p class="dim small" style="margin:0 0 12px" data-i18n="cfg.quick_desc">${zh("cfg.quick_desc")}</p>
+<div id="quick-fields" style="display:flex;flex-direction:column;gap:12px"></div>
+<div style="margin-top:14px"><button id="save-quick" class="btn"><span data-i18n="cfg.save">${zh("cfg.save")}</span></button></div>
+</div></div>
 <div class="card"><div class="card-h"><span data-i18n="cfg.file">${zh("cfg.file")}</span></div><div class="card-b">
 <p class="dim small" style="margin:0 0 8px" data-i18n="cfg.file_desc">${zh("cfg.file_desc")}</p>
 <dl class="kv"><div class="k" data-i18n="dt.config_file">${zh("dt.config_file")}</div><div class="v" style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span id="cfg-path" class="mono dim small"></span><button id="copy-cfg-file" class="btn sm copy-btn" data-copy=""><span data-i18n="common.copy">${zh("common.copy")}</span></button></div></dl>

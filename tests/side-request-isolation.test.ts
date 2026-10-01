@@ -7,11 +7,12 @@ import { startServer, type ProxyOptions, isSideRequest, outputBudgetField, resto
 import { estimateRawBodyTokens } from "../src/preflight.ts";
 import { inspectContextOverflow } from "../src/util.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { getSession, _resetSessionsForTest } from "../src/session.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 // #388: side requests (title-gen / small utility calls) share the main session
 // key but must not touch kernel state. The proxy routes them as pure passthrough
@@ -35,6 +36,24 @@ test("isSideRequest: tiny output budget across protocol field names", () => {
     assert.equal(isSideRequest({ max_tokens: 100, tools: [{ name: "compress" }] }), false, "#546: tool-carrying request is a MAIN turn even with a starved budget");
     assert.equal(isSideRequest({ max_tokens: 100, tools: [] }), true, "empty tools array does not rescue a tiny budget");
     assert.equal(isSideRequest({ max_output_tokens: 16, tools: [{ type: "function", function: { name: "f" } }] }), false, "#546: responses wire, starved budget + tools → main");
+});
+
+test("isSideRequest: host-declared side-request agent outranks the token-budget heuristic (#1699)", () => {
+    // opencode v2 title-gen carries NO max_tokens (options {} for kind==="title"),
+    // so the budget path can never see it. Declaring the persona by intent fixes
+    // the misclassification without touching any request that omits max_tokens.
+    const noBudget = { messages: [{ role: "user", content: "Generate a short title." }] };
+    assert.equal(isSideRequest(noBudget, "title"), true, "#1699: no-budget title request is a side req by intent");
+    assert.equal(isSideRequest(noBudget), false, "same body WITHOUT the agent id stays non-side (no regression)");
+    // Intent outranks even the #546 tool-carrying main-turn guard (title-gen never
+    // carries tools; if it did, the host's explicit declaration wins).
+    assert.equal(isSideRequest({ max_tokens: 100, tools: [{ name: "compress" }] }, "title"), true, "#1699: intent beats the tools heuristic");
+    // A MAIN persona is never a side request — real turns keep compression.
+    assert.equal(isSideRequest({ max_tokens: 5000 }, "build"), false, "main persona with a normal budget is not a side req");
+    assert.equal(isSideRequest({}, "build"), false, "main persona without a budget is not a side req");
+    // An unknown persona id is inert — falls back to the token-budget heuristic.
+    assert.equal(isSideRequest({}, "unknown-persona"), false, "unknown persona does not grant side status");
+    assert.equal(isSideRequest({ max_tokens: 100 }, "unknown-persona"), true, "unknown persona still honors a tiny budget");
 });
 
 const noopLog = (): void => {};
@@ -311,6 +330,45 @@ async function closeRig(rig: Rig): Promise<void> {
     rig.upstream.close();
     await once(rig.upstream, "close");
 }
+
+test("e2e: opencode v2 title-gen is classified by intent, not token budget (#1699)", async () => {
+    const rig = await startRig();
+    try {
+        const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/chat/completions`;
+        const baseHeaders: Record<string, string> = {
+            "content-type": "application/json",
+            "x-acp-session": SESSION,
+            "x-bili-plugin": "opencode",
+            "x-bili-plugin-conversation": SESSION,
+        };
+        // The exact opencode v2 title-gen shape that triggered the bug: one short
+        // instruction, NO max_tokens (options {} for kind==="title").
+        const titleBody = { model: MODEL, stream: true, messages: [{ role: "user", content: "Generate a short title for this conversation." }] };
+
+        // Repro (pre-fix behavior): WITHOUT x-bili-plugin-agent the budget heuristic
+        // sees no max_tokens → defaults to 8192 → NOT a side request → treated as a
+        // main turn, so the compress philosophy prompt + render tags get injected.
+        const rControl = await fetch(url, { method: "POST", headers: baseHeaders, body: JSON.stringify(titleBody) });
+        assert.equal(rControl.status, 200);
+        await rControl.text();
+        const controlFwd = rig.lastBody as { messages?: unknown } | null;
+        assert.ok(controlFwd, "control: upstream received the request");
+        assert.notDeepEqual(controlFwd?.messages, titleBody.messages, "control: without the agent header the title request is misclassified as a main turn and its messages are rewritten");
+        assert.ok(JSON.stringify(controlFwd ?? {}).length > JSON.stringify(titleBody).length + 1000, "control: the compress philosophy prompt inflated the forwarded payload (the reported ~11KiB injection)");
+
+        // Fix: WITH x-bili-plugin-agent=title the request is a side request by
+        // intent and is forwarded VERBATIM — its messages arrive byte-identical,
+        // nothing injected, kernel state untouched.
+        const rFix = await fetch(url, { method: "POST", headers: { ...baseHeaders, "x-bili-plugin-agent": "title" }, body: JSON.stringify(titleBody) });
+        assert.equal(rFix.status, 200);
+        await rFix.text();
+        const fixFwd = rig.lastBody as { messages?: unknown } | null;
+        assert.ok(fixFwd, "fix: upstream received the request");
+        assert.deepEqual(fixFwd?.messages, titleBody.messages, "fix: title-gen messages forwarded verbatim (no compress prompt/render tags injected)");
+    } finally {
+        await closeRig(rig);
+    }
+});
 
 test("e2e: side request response still gets render-tag stripping (#460 contract)", async () => {
     const LT = "\x3c";
@@ -682,6 +740,6 @@ test("e2e: the overflow arm survives a restart round-trip; usage after reload re
         await closeRig(rig);
         store.cancelAll();
         store2?.cancelAll();
-        rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });

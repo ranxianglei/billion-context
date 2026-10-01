@@ -33,6 +33,8 @@ import { readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "./launcher.js";
 import { resolveClaudeNativePort } from "./config.js";
+import { lanePreferredPort } from "./instance.js";
+import { repinClaudeManagedBaseUrl } from "./plugin-install.js";
 import { nativeBootstrapGate, proxyEnvOrigin } from "./agent/native-bootstrap.js";
 
 /** dist/claude-native-bootstrap.js → sibling dist/index.js (the package
@@ -53,12 +55,19 @@ function log(msg: string): void {
  *   - "passthrough": opted out (BILI_NATIVE_CLAUDE=0 /
  *     BILLION_CONTEXT_PLUGIN=0) — serve the static URL verbatim-forward.
  *   - "start": bring up (or attach to) the compression proxy. */
-export function planClaudeNativeBootstrap(env: NodeJS.ProcessEnv): { action: "exit" | "passthrough" | "start"; port: number } {
-    const port = resolveClaudeNativePort(env);
-    if (proxyEnvOrigin(env) !== undefined) return { action: "exit", port };
-    if (env.BILLION_CONTEXT_PLUGIN === "0" || env.BILI_NATIVE_CLAUDE === "0") return { action: "passthrough", port };
-    if (!nativeBootstrapGate(env, "BILI_NATIVE_CLAUDE")) return { action: "exit", port };
-    return { action: "start", port };
+export function planClaudeNativeBootstrap(env: NodeJS.ProcessEnv): { action: "exit" | "passthrough" | "start"; port: number; strict: boolean } {
+    // #1660 zone semantics: an EXPLICIT override (BILI_CLAUDE_NATIVE_PORT /
+    // claude.nativePort) keeps strict-port behavior (#964 — refuse a squatter
+    // rather than serve through it); otherwise the claude lane's zone
+    // preference (sticky record > 18787 base), with the proxy child's
+    // EADDRINUSE +1 ladder resolving collisions zero-config.
+    const explicit = resolveClaudeNativePort(env);
+    const port = explicit ?? lanePreferredPort("claude", env);
+    const strict = explicit !== undefined;
+    if (proxyEnvOrigin(env) !== undefined) return { action: "exit", port, strict };
+    if (env.BILLION_CONTEXT_PLUGIN === "0" || env.BILI_NATIVE_CLAUDE === "0") return { action: "passthrough", port, strict };
+    if (!nativeBootstrapGate(env, "BILI_NATIVE_CLAUDE")) return { action: "exit", port, strict };
+    return { action: "start", port, strict };
 }
 
 // — claude host pid resolution ———————————————————————————————
@@ -309,14 +318,18 @@ async function run(): Promise<void> {
         // host itself; when the walk cannot find it, chooseWatchdogParentPid
         // degrades via the wrapper's parent instead of the wrapper.
         const watchPid = chooseWatchdogParentPid();
+        // #1660: an EXPLICIT pin stays exact + strict; otherwise pass port 0
+        // so the launcher resolves the zone preference and settles the
+        // actually-bound port sticky (a pre-resolved port > 0 would skip the
+        // zone wiring entirely and never write the sticky record).
         const handle = await ensureProxyRunning(
             {
                 host: LAUNCHER_DEFAULT_HOST,
-                port: plan.port,
+                port: plan.strict ? plan.port : 0,
                 passthrough: plan.action === "passthrough",
                 debug: false,
                 parentPid: watchPid,
-                strictPort: true,
+                strictPort: plan.strict,
                 lane: "claude",
             },
             { scriptPath: proxyScriptPath() },
@@ -325,6 +338,18 @@ async function run(): Promise<void> {
         // (every native client registers there; claude's earlier copy was
         // redundant once the chokepoint covered all callers).
         log(`proxy ${handle.attached ? "attached" : "started"} at ${handle.origin}${plan.action === "passthrough" ? " (passthrough — compression off)" : ""}`);
+        // #1660: the zone port can drift (+1 ladder on EADDRINUSE, sticky
+        // record). The managed block's baked ANTHROPIC_BASE_URL points at the
+        // LAST session's port — repin it to the origin we hold so the NEXT
+        // session dials correctly. The CURRENT session rides whatever base
+        // URL claude already loaded into its process env, so a failure here
+        // is non-fatal by construction; still, never let it kill the hook.
+        try {
+            const notes = repinClaudeManagedBaseUrl(handle.origin);
+            if (notes.length > 0) log(`managed settings repinned: ${notes.join("; ")}`);
+        } catch (err) {
+            log(`managed settings repin failed (non-fatal): ${err instanceof Error ? err.message : String(err)}`);
+        }
         if (handle.refusedWatcher) {
             // #1322: attach landed on a daemon proxy (no BILI_PARENT_PID) whose
             // watchdog refused our owner — the README's "lives and dies with the

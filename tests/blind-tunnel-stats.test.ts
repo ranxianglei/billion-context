@@ -11,6 +11,7 @@ import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { recordBlindTunnel, getBlindTunnelStats, _resetBlindTunnelStatsForTest } from "../src/mitm.ts";
+import { rmrf } from "./tmp-rm.ts";
 
 /** #897: /__bili/health and /__bili/stats must expose the blind-tunnel counter
  *  (loopback-only admin endpoints), so an operator can see which CONNECT
@@ -86,6 +87,6 @@ test("health + stats expose blindTunnels counts with real hosts (#897)", async (
         else process.env.XDG_STATE_HOME = prevXdg;
         if (prevData === undefined) delete process.env.XDG_DATA_HOME;
         else process.env.XDG_DATA_HOME = prevData;
-        fs.rmSync(tmpRoot, { recursive: true, force: true });
+        rmrf(tmpRoot);
     }
 });

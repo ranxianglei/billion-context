@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import type { PathLike } from "node:fs";
+import { rmrf } from "./tmp-rm.ts";
 type SymlinkKind = "dir" | "file" | "junction";
 import net from "node:net";
 import os from "node:os";
@@ -16,6 +17,7 @@ import {
     unregisterInstance,
     type ProxyInstanceFile as InstanceFile,
 } from "../src/instance.ts";
+import { resolveNonHttpProviders } from "../src/config.js";
 import {
     LAUNCHER_DEFAULT_HOST,
     findLiveAttachableInstance,
@@ -65,8 +67,10 @@ import {
     resolveDshHome,
     prepareDshHome,
     writeDshAcpPatch,
+    dshPluginEntry,
+    writeDshClientShimFiles,
+    writeDshClientShim,
     dshArgsWithPatch,
-    buildCodexMcpArgs,
     prepareCodexHome,
     prepareCodexMcpInjection,
     resolveCodexHome,
@@ -77,6 +81,7 @@ import {
     ensureProxyRunning,
     resolveNodeRuntime,
     stopProxy,
+    stopProxyGuarded,
     resolveLauncherWindow,
     resolveCodexBudgetArgs,
     resolveClaudeBudgetEnv,
@@ -438,6 +443,7 @@ test("runLaunch pi: native -e plugin injected only when not installed", async ()
         return makeFakeChild(42422);
     };
     const fetchImpl = async () => ({ ok: true });
+    const fetchHealthInfo = async () => ({ ok: true, pid: 42422 });
 
     // runLaunch ends with process.exit() — stub it or it kills the test
     // runner and every test registered after this one silently never runs.
@@ -451,7 +457,7 @@ test("runLaunch pi: native -e plugin injected only when not installed", async ()
     try {
         await runLaunch(
             { client: "pi", clientArgs: [], overrides: {} },
-            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+            { fetchImpl, fetchHealthInfo, spawnImpl, sleep: () => Promise.resolve() },
         );
         assert.equal(clientArgsSeen.length, 1);
         assert.deepEqual(clientArgsSeen[0].slice(0, 2), ["-e", distAgent]);
@@ -461,7 +467,7 @@ test("runLaunch pi: native -e plugin injected only when not installed", async ()
         clientArgsSeen.length = 0;
         await runLaunch(
             { client: "pi", clientArgs: [], overrides: {} },
-            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+            { fetchImpl, fetchHealthInfo, spawnImpl, sleep: () => Promise.resolve() },
         );
         assert.equal(clientArgsSeen.length, 1);
         assert.ok(!clientArgsSeen[0].includes("-e"));
@@ -473,7 +479,7 @@ test("runLaunch pi: native -e plugin injected only when not installed", async ()
         clientArgsSeen.length = 0;
         await runLaunch(
             { client: "pi", clientArgs: [], overrides: {} },
-            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+            { fetchImpl, fetchHealthInfo, spawnImpl, sleep: () => Promise.resolve() },
         );
         assert.equal(clientArgsSeen.length, 1);
         assert.deepEqual(clientArgsSeen[0].slice(0, 2), ["-e", distAgent]);
@@ -483,7 +489,7 @@ test("runLaunch pi: native -e plugin injected only when not installed", async ()
         clientArgsSeen.length = 0;
         await runLaunch(
             { client: "pi", clientArgs: [], overrides: {} },
-            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+            { fetchImpl, fetchHealthInfo, spawnImpl, sleep: () => Promise.resolve() },
         );
         assert.equal(clientArgsSeen.length, 1);
         assert.ok(!clientArgsSeen[0].includes("-e"));
@@ -498,7 +504,7 @@ test("runLaunch pi: native -e plugin injected only when not installed", async ()
         if (prevPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
         else process.env.PI_CODING_AGENT_DIR = prevPiDir;
         if (stubbed) fs.rmSync(distAgent, { force: true });
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -549,7 +555,7 @@ test("runLaunch pi #535: refuses launch when http rewrites needed and extension 
         // no dist file, no installed plugin entry → refuse, and refuse BEFORE
         // spawning anything (no proxy child, no client)
         await assert.rejects(
-            runLaunch({ client: "pi", clientArgs: [], overrides: {} }, { fetchImpl: async () => ({ ok: true }), spawnImpl, sleep: () => Promise.resolve() }),
+            runLaunch({ client: "pi", clientArgs: [], overrides: {} }, { fetchImpl: async () => ({ ok: true }), fetchHealthInfo: async () => ({ ok: true, pid: 42422 }), spawnImpl, sleep: () => Promise.resolve() }),
             /needs provider URL rewrites but the bili extension cannot load/,
         );
         assert.equal(clientArgsSeen.length, 0);
@@ -560,7 +566,7 @@ test("runLaunch pi #535: refuses launch when http rewrites needed and extension 
         fs.writeFileSync(path.join(piHome, "settings.json"), JSON.stringify({ packages: [root] }));
         await runLaunch(
             { client: "pi", clientArgs: [], overrides: {} },
-            { fetchImpl: async () => ({ ok: true }), spawnImpl, sleep: () => Promise.resolve() },
+            { fetchImpl: async () => ({ ok: true }), fetchHealthInfo: async () => ({ ok: true, pid: 42422 }), spawnImpl, sleep: () => Promise.resolve() },
         );
         assert.equal(clientArgsSeen.length, 1);
         assert.ok(!clientArgsSeen[0].includes("-e"), "installed entry loads the plugin — no -e double load");
@@ -576,7 +582,7 @@ test("runLaunch pi #535: refuses launch when http rewrites needed and extension 
         if (prevPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
         else process.env.PI_CODING_AGENT_DIR = prevPiDir;
         if (distExisted) fs.renameSync(distBackup, distAgent);
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -626,7 +632,7 @@ test("runLaunch omp #535: refuses launch when http rewrites needed and extension
         // no dist file, no installed config.yml entry → refuse BEFORE spawning
         // anything (no proxy child, no client)
         await assert.rejects(
-            runLaunch({ client: "omp", clientArgs: [], overrides: {} }, { fetchImpl: async () => ({ ok: true }), spawnImpl, sleep: () => Promise.resolve() }),
+            runLaunch({ client: "omp", clientArgs: [], overrides: {} }, { fetchImpl: async () => ({ ok: true }), fetchHealthInfo: async () => ({ ok: true, pid: 42422 }), spawnImpl, sleep: () => Promise.resolve() }),
             /omp needs provider URL rewrites but the bili extension cannot load/,
         );
         assert.equal(clientArgsSeen.length, 0);
@@ -639,7 +645,7 @@ test("runLaunch omp #535: refuses launch when http rewrites needed and extension
         fs.writeFileSync(path.join(ompHome, "config.yml"), `extensions:\n  - ${otherInstall}\n`);
         await runLaunch(
             { client: "omp", clientArgs: [], overrides: {} },
-            { fetchImpl: async () => ({ ok: true }), spawnImpl, sleep: () => Promise.resolve() },
+            { fetchImpl: async () => ({ ok: true }), fetchHealthInfo: async () => ({ ok: true, pid: 42422 }), spawnImpl, sleep: () => Promise.resolve() },
         );
         assert.equal(clientArgsSeen.length, 1);
         assert.ok(!clientArgsSeen[0].includes("-e"), "installed entry loads the plugin — no -e double load");
@@ -655,7 +661,7 @@ test("runLaunch omp #535: refuses launch when http rewrites needed and extension
         if (prevOmpDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
         else process.env.PI_CODING_AGENT_DIR = prevOmpDir;
         if (distExisted) fs.renameSync(distBackup, distAgent);
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -707,7 +713,7 @@ test("runLaunch hermes #535: proxy env routing, no HERMES_HOME overlay, real con
     try {
         await runLaunch(
             { client: "hermes", clientArgs: [], overrides: {} },
-            { fetchImpl: async () => ({ ok: true }), spawnImpl, sleep: () => Promise.resolve() },
+            { fetchImpl: async () => ({ ok: true }), fetchHealthInfo: async () => ({ ok: true, pid: 42422 }), spawnImpl, sleep: () => Promise.resolve() },
         );
         assert.deepEqual(exitCalls, [0]);
         assert.ok(childEnv, "client spawned");
@@ -732,7 +738,7 @@ test("runLaunch hermes #535: proxy env routing, no HERMES_HOME overlay, real con
         process.env.HOME = prevHome;
         if (prevUserProfile === undefined) delete process.env.USERPROFILE;
         else process.env.USERPROFILE = prevUserProfile;
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 test("runLaunch pi #535: refuses launch when ONLY https (hand-wrapped) rewrites needed and extension cannot load", async () => {
@@ -761,7 +767,7 @@ test("runLaunch pi #535: refuses launch when ONLY https (hand-wrapped) rewrites 
     const spawnImpl: SpawnFn = () => makeFakeChild(42422);
     try {
         await assert.rejects(
-            runLaunch({ client: "pi", clientArgs: [], overrides: {} }, { fetchImpl: async () => ({ ok: true }), spawnImpl, sleep: () => Promise.resolve() }),
+            runLaunch({ client: "pi", clientArgs: [], overrides: {} }, { fetchImpl: async () => ({ ok: true }), fetchHealthInfo: async () => ({ ok: true, pid: 42422 }), spawnImpl, sleep: () => Promise.resolve() }),
             /needs provider URL rewrites but the bili extension cannot load/,
         );
     } finally {
@@ -771,7 +777,7 @@ test("runLaunch pi #535: refuses launch when ONLY https (hand-wrapped) rewrites 
         if (prevPiDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
         else process.env.PI_CODING_AGENT_DIR = prevPiDir;
         if (distExisted) fs.renameSync(distBackup, distAgent);
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -817,6 +823,7 @@ test("runLaunch omp: native -e plugin injected only when no loadable config entr
         return makeFakeChild(42422);
     };
     const fetchImpl = async () => ({ ok: true });
+    const fetchHealthInfo = async () => ({ ok: true, pid: 42422 });
 
     const prevExit = process.exit;
     const exitCalls: number[] = [];
@@ -829,7 +836,7 @@ test("runLaunch omp: native -e plugin injected only when no loadable config entr
         // no config.yml at all → -e injected
         await runLaunch(
             { client: "omp", clientArgs: [], overrides: {} },
-            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+            { fetchImpl, fetchHealthInfo, spawnImpl, sleep: () => Promise.resolve() },
         );
         assert.equal(clientArgsSeen.length, 1);
         assert.deepEqual(clientArgsSeen[0].slice(0, 2), ["-e", distAgent]);
@@ -842,17 +849,17 @@ test("runLaunch omp: native -e plugin injected only when no loadable config entr
         clientArgsSeen.length = 0;
         await runLaunch(
             { client: "omp", clientArgs: [], overrides: {} },
-            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+            { fetchImpl, fetchHealthInfo, spawnImpl, sleep: () => Promise.resolve() },
         );
         assert.equal(clientArgsSeen.length, 1);
         assert.ok(!clientArgsSeen[0].includes("-e"));
 
         // stale entry (file gone) → omp would fail to load it; -e injected again
-        fs.rmSync(path.dirname(otherInstall), { recursive: true, force: true });
+        rmrf(path.dirname(otherInstall));
         clientArgsSeen.length = 0;
         await runLaunch(
             { client: "omp", clientArgs: [], overrides: {} },
-            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+            { fetchImpl, fetchHealthInfo, spawnImpl, sleep: () => Promise.resolve() },
         );
         assert.equal(clientArgsSeen.length, 1);
         assert.deepEqual(clientArgsSeen[0].slice(0, 2), ["-e", distAgent]);
@@ -867,7 +874,7 @@ test("runLaunch omp: native -e plugin injected only when no loadable config entr
         if (prevOmpDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
         else process.env.PI_CODING_AGENT_DIR = prevOmpDir;
         if (stubbed) fs.rmSync(distAgent, { force: true });
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -895,7 +902,7 @@ test("piPluginInstalled: dead bili-shaped entries do not count as installed (#13
         fs.writeFileSync(path.join(piHome, "settings.json"), JSON.stringify({ packages: [path.join(home, "some-other-pkg")] }));
         assert.equal(piPluginInstalled(piHome), false);
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -915,11 +922,122 @@ test("ompPluginLoadedFrom: only entries whose file exists count as loaded", () =
         fs.writeFileSync(path.join(ompHome, "config.yml"), "extensions:\n  - /some/other/plugin.js\n");
         assert.equal(ompPluginLoadedFrom(ompHome), false); // foreign plugin
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
+
+// #1753 (shutdown side): the wrapper's exit must not kill a shared instance.
+test("stopProxyGuarded: spares a spawned instance that other watchers still share (#1753)", async () => {
+    if (process.platform === "win32") return; // guard defers to the server-side watchdog on win32; POSIX decision tree pinned here
+    let killed = false;
+    const child = makeFakeChild(42470);
+    child.kill = () => { killed = true; return true; };
+    let healthCalls = 0;
+    await stopProxyGuarded({ origin: "http://127.0.0.1:18787", port: 18787, child }, async () => {
+        healthCalls++;
+        return { ok: true, watchdog: { armed: true, watchers: [process.pid, 42500] } };
+    });
+    assert.equal(healthCalls, 1, "guard consults /__bili/health exactly once");
+    assert.equal(killed, false, "instance with other live watchers must be spared");
+});
+
+test("stopProxyGuarded: kills when the wrapper is the last watcher (#1753)", async () => {
+    if (process.platform === "win32") return;
+    let killed = false;
+    const child = makeFakeChild(42471);
+    child.kill = () => { killed = true; return true; };
+    await stopProxyGuarded({ origin: "http://127.0.0.1:18787", port: 18787, child }, async () => ({
+        ok: true,
+        watchdog: { armed: true, watchers: [process.pid] },
+    }));
+    assert.equal(killed, true, "solo owner still owns the shutdown");
+});
+
+test("stopProxyGuarded: health parse failure degrades to the old kill behavior (#1753)", async () => {
+    if (process.platform === "win32") return;
+    let killed = false;
+    const child = makeFakeChild(42472);
+    child.kill = () => { killed = true; return true; };
+    await stopProxyGuarded({ origin: "http://127.0.0.1:18787", port: 18787, child }, async () => undefined);
+    assert.equal(killed, true, "unverifiable lifecycle → take it down, nothing else claims it");
+});
+
+test("stopProxyGuarded: unarmed watchdog without watchers still kills (#1753)", async () => {
+    if (process.platform === "win32") return;
+    let killed = false;
+    const child = makeFakeChild(42473);
+    child.kill = () => { killed = true; return true; };
+    await stopProxyGuarded({ origin: "http://127.0.0.1:18787", port: 18787, child }, async () => ({
+        ok: true,
+        watchdog: { armed: true },
+    }));
+    assert.equal(killed, true, "absent watchers list → nobody else to spare it for");
+});
+
+test("stopProxyGuarded: attached handles never consult or kill (#1753)", async () => {
+    let killed = false;
+    let healthCalls = 0;
+    const child = makeFakeChild(42474);
+    child.kill = () => { killed = true; return true; };
+    await stopProxyGuarded({ origin: "http://127.0.0.1:18787", port: 18787, attached: true, child }, async () => {
+        healthCalls++;
+        return { ok: true, watchdog: { armed: true, watchers: [process.pid, 42500] } };
+    });
+    assert.equal(healthCalls, 0);
+    assert.equal(killed, false);
+});
+
+test("runLaunch: client exit spares the shared proxy when other watchers remain (#1753)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-spare-"));
+    const fakeBin = path.join(home, process.platform === "win32" ? "fake-pi.exe" : "fake-pi");
+    fs.writeFileSync(fakeBin, "");
+    let proxyKilled = false;
+    const spawnImpl: SpawnFn = (cmd, _args, options) => {
+        if (cmd === fakeBin) {
+            const child = makeFakeChild(0);
+            const orig = child.on.bind(child);
+            (child as { on: SpawnChild["on"] }).on = (event, listener) => {
+                orig(event, listener);
+                if (event === "exit") setTimeout(() => listener(0, null), 0);
+                return child;
+            };
+            return child;
+        }
+        const child = makeFakeChild(42480);
+        child.kill = () => { proxyKilled = true; return true; };
+        return child;
+    };
+    const prevHome = process.env.HOME;
+    const prevBin = process.env.BILI_CLIENT_BIN;
+    const prevExit = process.exit;
+    process.env.HOME = home;
+    process.env.BILI_CLIENT_BIN = fakeBin;
+    process.exit = (() => undefined) as typeof process.exit;
+    try {
+        await runLaunch(
+            { client: "pi", clientArgs: [], overrides: {} },
+            {
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async () => ({ ok: true, pid: 42480, watchdog: { armed: true, watchers: [process.pid, 42500] } }),
+                spawnImpl,
+                sleep: () => Promise.resolve(),
+            },
+        );
+    } finally {
+        process.exit = prevExit;
+        process.env.HOME = prevHome;
+        if (prevBin === undefined) delete process.env.BILI_CLIENT_BIN;
+        else process.env.BILI_CLIENT_BIN = prevBin;
+        rmrf(home);
+    }
+    assert.equal(proxyKilled, false, "runLaunch exit must spare the instance other sessions are watching");
+});
+
+// #1753: spawn-wait fallback stubs identify as the most recently faked child.
+let lastFakeChildPid: number | undefined;
 function makeFakeChild(pid: number): SpawnChild {
+    lastFakeChildPid = pid;
     const handlers = new Map<string, ((...args: unknown[]) => void)[]>();
     return {
         pid,
@@ -944,7 +1062,7 @@ test("ensureProxyRunning: spawns a fresh proxy when no live instance is recorded
     const fetchImpl = async () => ({ ok: true });
     const handle = await ensureProxyRunning(
         { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
-        { fetchImpl, spawnImpl, readInstanceFile: () => undefined },
+        { fetchImpl, fetchHealthInfo: async () => ({ ok: true, pid: 0 }), spawnImpl, readInstanceFile: () => undefined },
     );
     assert.equal(spawnCalls, 1);
     assert.ok(handle.child);
@@ -954,6 +1072,7 @@ test("ensureProxyRunning: spawns a fresh proxy when no live instance is recorded
 
 test("ensureProxyRunning: spawns when not healthy, polls until healthy", async () => {
     let probes = 0;
+    let healthProbes = 0;
     const fetchImpl = async () => {
         probes++;
         return { ok: probes >= 2 };
@@ -965,7 +1084,7 @@ test("ensureProxyRunning: spawns when not healthy, polls until healthy", async (
     };
     const handle = await ensureProxyRunning(
         { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
-        { fetchImpl, spawnImpl, sleep: () => Promise.resolve(), readInstanceFile: () => undefined },
+        { fetchImpl, fetchHealthInfo: async () => ({ ok: ++healthProbes >= 2, pid: 42421 }), spawnImpl, sleep: () => Promise.resolve(), readInstanceFile: () => undefined },
     );
     assert.equal(handle.child?.pid, 42421);
     assert.ok(spawnedArgs !== null);
@@ -974,7 +1093,7 @@ test("ensureProxyRunning: spawns when not healthy, polls until healthy", async (
     const portIdx = spawnedArgs.indexOf("--port");
     assert.ok(portIdx >= 0, "spawn args include --port");
     assert.equal(spawnedArgs[portIdx + 1], String(handle.port));
-    assert.ok(probes >= 2);
+    assert.ok(healthProbes >= 2, "fallback polls health until the child answers");
 });
 
 test("ensureProxyRunning: throws when never healthy within deadline", async () => {
@@ -989,7 +1108,7 @@ test("ensureProxyRunning: throws when never healthy within deadline", async () =
     await assert.rejects(
         ensureProxyRunning(
             { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
-            { fetchImpl, spawnImpl, now, sleep, readInstanceFile: () => undefined },
+            { fetchImpl, fetchHealthInfo: async () => ({ ok: false }), spawnImpl, now, sleep, readInstanceFile: () => undefined },
         ),
         /did not become healthy/,
     );
@@ -1014,6 +1133,7 @@ test("ensureProxyRunning: registers a child 'error' handler so an async spawn fa
             {
                 spawnImpl: () => child,
                 fetchImpl: async () => ({ ok: false }),
+                fetchHealthInfo: async () => undefined,
                 readInstanceFile: () => undefined,
                 sleep: () => new Promise((r) => setTimeout(r, 0)),
             },
@@ -1102,6 +1222,7 @@ test("ensureProxyRunning: attach registers opts.parentPid when given, never on s
             registerWatcher,
             scriptPath: FP_SCRIPT,
             spawnImpl: () => { spawned = true; return makeFakeChild(42432); },
+            fetchHealthInfo: async () => ({ ok: true, pid: 42432 }),
             sleep: () => Promise.resolve(),
         },
     );
@@ -1169,7 +1290,7 @@ test("ensureProxyRunning: same lane attaches, different declared lanes spawn sep
         {
             spawnImpl,
             fetchImpl: async () => ({ ok: true }),
-            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1" }),
+            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1", pid: 42460 }),
             readInstanceFile: () => (reads++ === 0 ? recordedInstance({ lane: "pi" }) : undefined),
             sleep: () => Promise.resolve(),
             scriptPath: FP_SCRIPT,
@@ -1194,12 +1315,15 @@ test("ensureProxyRunning: armed daemon (no lane) stays shareable with any client
     assert.equal(handle.attached, true);
 });
 
-// #1335: the attach gate — an unarmed listener (a manually started `bili start`
-// daemon: no BILI_PARENT_PID, refuses watchers, never dies with its users) is
-// never attached by default; the hook spawns its own session-owned proxy so
-// every session runs the currently installed bili and the proxy dies with the
-// last session (#1186 semantics).
-test("ensureProxyRunning: unarmed listener is not attached by default — self-managed spawn (#1335)", async () => {
+// #1335: the attach gate — an unarmed listener is never attached by
+// default; the hook spawns its own session-owned proxy so every session runs
+// the currently installed bili and the proxy dies with the last session
+// (#1186 semantics). #1660 narrows the gate to LANE'D instances: a lane'd
+// proxy with a dead/unarmed watchdog is a lifecycle-drift symptom and is
+// refused; a USER-ZONE instance (manual `bili start`: no lane, no launch
+// token) is deliberately maintained by the user and IS attachable — see the
+// dedicated user-zone test below.
+test("ensureProxyRunning: unarmed LANE'D listener is not attached by default — self-managed spawn (#1335/#1660)", async () => {
     let spawnCalls = 0;
     let registered = 0;
     let childToken = "";
@@ -1215,7 +1339,7 @@ test("ensureProxyRunning: unarmed listener is not attached by default — self-m
             },
             fetchImpl: async () => ({ ok: true }),
             fetchHealthInfo: async () => ({ ok: true, instanceId: "daemon-1", watchdog: { armed: false } }),
-            readInstanceFile: () => (spawned ? recordedInstance({ launchToken: childToken }) : recordedInstance({ instanceId: "daemon-1" })),
+            readInstanceFile: () => (spawned ? recordedInstance({ launchToken: childToken }) : recordedInstance({ instanceId: "daemon-1", lane: "claude-native" })),
             registerWatcher: async () => {
                 registered++;
                 return "refused";
@@ -1224,13 +1348,100 @@ test("ensureProxyRunning: unarmed listener is not attached by default — self-m
             scriptPath: FP_SCRIPT,
         },
     );
-    assert.equal(spawnCalls, 1, "self-managed proxy spawned instead of attaching to the unarmed daemon");
+    assert.equal(spawnCalls, 1, "self-managed proxy spawned instead of attaching to the unarmed lane'd daemon");
     assert.ok(handle.child);
     assert.equal(handle.attached, undefined);
     assert.equal(registered, 0, "no watcher registration is attempted against the refused daemon");
 });
 
-test("ensureProxyRunning: unverifiable listener (no watchdog field, pre-#1330 build) is treated as unarmed (#1335)", async () => {
+test("ensureProxyRunning: unarmed USER-ZONE daemon (manual `bili start`) is attached by default (#1660)", async () => {
+    let spawnCalls = 0;
+    let registered = 0;
+    const handle = await ensureProxyRunning(
+        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false, lane: "pi" },
+        {
+            spawnImpl: () => {
+                spawnCalls++;
+                return makeFakeChild(42505);
+            },
+            fetchImpl: async () => ({ ok: true }),
+            fetchHealthInfo: async () => ({ ok: true, instanceId: "manual-1", watchdog: { armed: false } }),
+            readInstanceFile: () => recordedInstance({ instanceId: "manual-1" }),
+            registerWatcher: async () => {
+                registered++;
+                return "ok";
+            },
+            sleep: () => new Promise((r) => setTimeout(r, 0)),
+            scriptPath: FP_SCRIPT,
+        },
+    );
+    assert.equal(spawnCalls, 0, "the user-maintained daemon is reused, not doubled");
+    assert.equal(handle.attached, true);
+    assert.equal(registered, 1);
+});
+
+test("ensureProxyRunning: a lane'd launch with port 0 binds the zone preference and settles it sticky (#1660)", async () => {
+    let spawnedArgs: string[] | null = null;
+    const preferred: string[] = [];
+    const settled: Array<[string, number]> = [];
+    const spawnImpl: SpawnFn = (_cmd, args) => {
+        spawnedArgs = [...args];
+        return makeFakeChild(42441);
+    };
+    const handle = await ensureProxyRunning(
+        { host: "127.0.0.1", port: 0, passthrough: false, debug: false, lane: "zcode" },
+        {
+            fetchImpl: async () => ({ ok: true }),
+            spawnImpl,
+            fetchHealthInfo: async () => ({ ok: true, pid: 42441 }),
+            sleep: () => Promise.resolve(),
+            readInstanceFile: () => undefined,
+            zonePreferredPort: (lane) => {
+                preferred.push(lane);
+                return 18787;
+            },
+            writeZonePort: (lane, port) => {
+                settled.push([lane, port]);
+            },
+        },
+    );
+    assert.deepEqual(preferred, ["zcode"], "the lane's zone preference resolves the spawn port");
+    assert.ok(spawnedArgs !== null);
+    const portIdx = spawnedArgs.indexOf("--port");
+    assert.equal(spawnedArgs[portIdx + 1], "18787", "zone base is the spawn port, not an OS ephemeral");
+    assert.equal(handle.port, 18787);
+    assert.deepEqual(settled, [["zcode", 18787]], "the settled port is recorded sticky for later launches");
+});
+
+test("ensureProxyRunning: an unlane'd launch keeps the OS ephemeral default — no zone, no sticky (#1660)", async () => {
+    let spawnedArgs: string[] | null = null;
+    const settled: Array<[string, number]> = [];
+    const spawnImpl: SpawnFn = (_cmd, args) => {
+        spawnedArgs = [...args];
+        return makeFakeChild(42442);
+    };
+    const handle = await ensureProxyRunning(
+        { host: "127.0.0.1", port: 0, passthrough: false, debug: false },
+        {
+            fetchImpl: async () => ({ ok: true }),
+            fetchHealthInfo: async () => ({ ok: true, pid: 42442 }),
+            spawnImpl,
+            sleep: () => Promise.resolve(),
+            readInstanceFile: () => undefined,
+            writeZonePort: (lane, port) => {
+                settled.push([lane, port]);
+            },
+        },
+    );
+    assert.ok(spawnedArgs !== null);
+    const portIdx = spawnedArgs.indexOf("--port");
+    const childPort = Number(spawnedArgs[portIdx + 1]);
+    assert.ok(Number.isInteger(childPort) && childPort > 0, `ephemeral port assigned, got ${childPort}`);
+    assert.equal(handle.port, childPort);
+    assert.deepEqual(settled, [], "no sticky write without a lane");
+});
+
+test("ensureProxyRunning: unverifiable lane'd listener (no watchdog field, pre-#1330 build) is treated as unarmed (#1335)", async () => {
     let spawnCalls = 0;
     let childToken = "";
     let spawned = false;
@@ -1245,7 +1456,7 @@ test("ensureProxyRunning: unverifiable listener (no watchdog field, pre-#1330 bu
             },
             fetchImpl: async () => ({ ok: true }),
             fetchHealthInfo: async () => ({ ok: true, instanceId: "stale-daemon" }),
-            readInstanceFile: () => (spawned ? recordedInstance({ launchToken: childToken }) : recordedInstance({ instanceId: "stale-daemon" })),
+            readInstanceFile: () => (spawned ? recordedInstance({ launchToken: childToken }) : recordedInstance({ instanceId: "stale-daemon", lane: "zcode" })),
             sleep: () => new Promise((r) => setTimeout(r, 0)),
             scriptPath: FP_SCRIPT,
         },
@@ -1275,7 +1486,7 @@ test("ensureProxyRunning: attachExternal escape hatch restores attaching to an u
     assert.equal(handle.attached, true, "deliberate setups keep the old behavior via the opt-in");
 });
 
-test("ensureProxyRunning: strictPort launch fails fast when its pinned port is held by an unarmed proxy (#1335/#964)", async () => {
+test("ensureProxyRunning: strictPort launch fails fast when its pinned port is held by an unarmed LANE'D proxy (#1335/#964/#1660)", async () => {
     let spawnCalls = 0;
     await assert.rejects(
         ensureProxyRunning(
@@ -1287,7 +1498,7 @@ test("ensureProxyRunning: strictPort launch fails fast when its pinned port is h
                 },
                 fetchImpl: async () => ({ ok: true }),
                 fetchHealthInfo: async () => ({ ok: true, instanceId: "daemon-1", watchdog: { armed: false } }),
-                readInstanceFile: () => recordedInstance({ origin: "http://127.0.0.1:8799", port: 8799, instanceId: "daemon-1" }),
+                readInstanceFile: () => recordedInstance({ origin: "http://127.0.0.1:8799", port: 8799, instanceId: "daemon-1", lane: "claude-native" }),
                 sleep: () => Promise.resolve(),
                 scriptPath: FP_SCRIPT,
             },
@@ -1308,7 +1519,7 @@ test("ensureProxyRunning: stale code (fingerprint mismatch) is not attached — 
                 return makeFakeChild(42461);
             },
             fetchImpl: async () => ({ ok: true }),
-            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1" }),
+            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1", pid: 42461 }),
             readInstanceFile: () => (reads++ === 0 ? recordedInstance({ codeFingerprint: "stale-dist-hash" }) : undefined),
             sleep: () => Promise.resolve(),
             scriptPath: FP_SCRIPT,
@@ -1329,7 +1540,7 @@ test("ensureProxyRunning: pre-#1225 instance without codeFingerprint is never at
                 return makeFakeChild(42464);
             },
             fetchImpl: async () => ({ ok: true }),
-            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1" }),
+            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1", pid: 42464 }),
             readInstanceFile: () => (reads++ === 0 ? recordedInstance({ codeFingerprint: undefined }) : undefined),
             sleep: () => Promise.resolve(),
             scriptPath: FP_SCRIPT,
@@ -1467,7 +1678,8 @@ test("ensureProxyRunning: strictPort launcher refuses a different-port starter's
                     return makeFakeChild(42473);
                 },
                 fetchImpl: async () => ({ ok: true }),
-                fetchHealthInfo: async (origin) => (origin.endsWith("8807") ? { ok: true, instanceId: "inst-wait" } : undefined),
+                fetchHealthInfo: async (origin) =>
+                    origin.endsWith("8807") ? { ok: true, instanceId: "inst-wait" } : origin.endsWith("8808") ? { ok: true, pid: 42473 } : undefined,
                 // Before spawn: the starter's proxy is up on ANOTHER port. After
                 // spawn: a dead-owner record so the readback falls back to the
                 // preferred-origin health probe.
@@ -1507,6 +1719,7 @@ test("ensureProxyRunning: active starting marker of a different lane → spawns 
                     return makeFakeChild(42462);
                 },
                 fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async () => ({ ok: true, pid: 42462 }),
                 readInstanceFile: () => undefined,
                 sleep: () => {
                     sleeps++;
@@ -1536,7 +1749,7 @@ test("ensureProxyRunning: incompatible recorded instance (modelWindows) is not a
         {
             spawnImpl,
             fetchImpl: async () => ({ ok: true }),
-            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1" }),
+            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1", pid: 42434 }),
             readInstanceFile: () => (reads++ === 0 ? recordedInstance() : undefined),
             sleep: () => Promise.resolve(),
         },
@@ -1556,7 +1769,7 @@ test("ensureProxyRunning: dead recorded pid is ignored (no attach)", async () =>
         {
             spawnImpl,
             fetchImpl: async () => ({ ok: true }),
-            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1" }),
+            fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1", pid: 42435 }),
             readInstanceFile: () => recordedInstance({ pid: 99999999 }),
             sleep: () => Promise.resolve(),
         },
@@ -1601,6 +1814,7 @@ test("ensureProxyRunning: stale starting marker (dead owner) → removed, then s
                     return makeFakeChild(42451);
                 },
                 fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async () => ({ ok: true, pid: 42451 }),
                 readInstanceFile: () => undefined,
                 sleep: () => Promise.resolve(),
             },
@@ -1625,6 +1839,7 @@ test("ensureProxyRunning: expired starting marker (hung owner) → spawns (#707)
                     return makeFakeChild(42452);
                 },
                 fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async () => ({ ok: true, pid: 42452 }),
                 readInstanceFile: () => undefined,
                 sleep: () => Promise.resolve(),
             },
@@ -1651,6 +1866,7 @@ test("ensureProxyRunning: waiter bails early when the starter clears its marker 
                     return makeFakeChild(42453);
                 },
                 fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async () => ({ ok: true, pid: 42453 }),
                 readInstanceFile: () => undefined,
                 sleep: () => {
                     if (++sleeps === 1) removeStartingMarker();
@@ -1856,7 +2072,7 @@ test("ensureProxyRunning: port 0 (no explicit --port) spawns on an OS-assigned e
     };
     const handle = await ensureProxyRunning(
         { host: "127.0.0.1", port: 0, passthrough: false, debug: false },
-        { fetchImpl: async () => ({ ok: true }), spawnImpl, sleep: () => Promise.resolve(), readInstanceFile: () => undefined },
+        { fetchImpl: async () => ({ ok: true }), fetchHealthInfo: async () => ({ ok: true, pid: lastFakeChildPid }), spawnImpl, sleep: () => Promise.resolve(), readInstanceFile: () => undefined },
     );
     assert.ok(spawnedArgs !== null);
     const portIdx = spawnedArgs.indexOf("--port");
@@ -1875,7 +2091,7 @@ test("ensureProxyRunning: explicit port is honored verbatim (no ephemeral reassi
     };
     const handle = await ensureProxyRunning(
         { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
-        { fetchImpl: async () => ({ ok: true }), spawnImpl, sleep: () => Promise.resolve(), readInstanceFile: () => undefined },
+        { fetchImpl: async () => ({ ok: true }), fetchHealthInfo: async () => ({ ok: true, pid: lastFakeChildPid }), spawnImpl, sleep: () => Promise.resolve(), readInstanceFile: () => undefined },
     );
     assert.ok(spawnedArgs !== null);
     const portIdx = spawnedArgs.indexOf("--port");
@@ -2231,6 +2447,41 @@ test("buildPiEnv: empty-key/empty-upstream entries skipped", () => {
     assert.equal(env.BILI_PROVIDER_REWRITES, undefined);
 });
 
+test("buildPiEnv: exports BILI_NON_HTTP_PROVIDERS only when non-http providers are listed (#1392)", () => {
+    const env = buildPiEnv("http://127.0.0.1:8787", "/tmp/ca.pem", { PATH: "/usr/bin" }, [], [], [], ["claude-bridge"]);
+    assert.equal(env.BILI_NON_HTTP_PROVIDERS, "claude-bridge");
+    const bare = buildPiEnv("http://127.0.0.1:8787", "/tmp/ca.pem", { PATH: "/usr/bin" });
+    assert.equal(bare.BILI_NON_HTTP_PROVIDERS, undefined);
+});
+
+test("resolveNonHttpProviders: providers-table compactionOptIn ∪ env list, deduped (#1392)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-nhp-"));
+    const cfgFile = path.join(dir, "billion-context.json");
+    fs.writeFileSync(cfgFile, JSON.stringify({
+        providers: {
+            "claude-bridge": { compactionOptIn: true },
+            "off-provider": { compactionOptIn: false },
+            "wrong-type": { compactionOptIn: "yes" },
+            "no-field": {},
+            "https://api.anthropic.com": { compactionOptIn: true },
+        },
+    }), "utf8");
+    const prevCfg = process.env.BILI_CONFIG_FILE;
+    process.env.BILI_CONFIG_FILE = cfgFile;
+    try {
+        // Only strictly-true compactionOptIn opts a provider id in: false,
+        // "yes", and absent are ignored. URL-shaped entries with the field set
+        // also resolve (inert — the plugin consults the set only for non-http
+        // baseUrls) but keep deterministic order: config iteration order.
+        assert.deepEqual(resolveNonHttpProviders({}), ["claude-bridge", "https://api.anthropic.com"]);
+        // Env ∪ file, deduped: claude-bridge (both sources) + z (env-only).
+        assert.deepEqual(resolveNonHttpProviders({ BILI_NON_HTTP_PROVIDERS: "claude-bridge,z" }), ["claude-bridge", "https://api.anthropic.com", "z"]);
+    } finally {
+        if (prevCfg === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = prevCfg;
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
 test("stripInheritedProxy: removes generic proxy redirector vars, keeps the rest", () => {
     const cleaned = stripInheritedProxy({
         http_proxy: "http://corp:20172",
@@ -2290,7 +2541,7 @@ test("readOmpConfig: reads models.yml from omp home", () => {
         const cfg = readOmpConfig(home);
         assert.equal(cfg.providers.a.baseUrl, "http://x:1/v1");
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -2299,7 +2550,7 @@ test("readOmpConfig: missing models.yml → {}", () => {
     try {
         assert.deepEqual(readOmpConfig(home), { providers: {} });
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -2344,7 +2595,7 @@ test("readOpencodeConfig: reads provider baseURLs from opencode.json", () => {
         assert.equal(cfg.providers["noUrl"], undefined);
         assert.equal(readOpencodeConfig(path.join(dir, "missing.json")).providers["local"], undefined);
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -2384,7 +2635,7 @@ test("readOpencodeConfig: parses JSONC (comments + trailing commas)", () => {
         const cfg = readOpencodeConfig(cfgFile);
         assert.deepEqual(cfg.providers["local"], { baseURL: "http://127.0.0.1:18081/v1" });
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -2445,7 +2696,7 @@ test("readOpencodeConfigRoot: merges config.json → opencode.json → opencode.
 
         assert.equal(readOpencodeConfigRoot({ XDG_CONFIG_HOME: path.join(dir, "empty-xdg") }), undefined);
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -2478,22 +2729,22 @@ test("prepareOpencodeHttpRewrite: writes rewritten copy from a JSONC user config
         assert.equal(fs.readFileSync(cfgFile, "utf8"), original);
         // the caller's merged root must stay pristine (rewrite happens on a clone)
         assert.deepEqual(root, { plugin: ["opencode-acp@latest"], provider: { "zhipuai-lb": { options: { baseURL: "http://127.0.0.1:18081/v1" } } } });
-        fs.rmSync(path.dirname(tmpFile), { recursive: true, force: true });
+        rmrf(path.dirname(tmpFile));
         assert.equal(prepareOpencodeHttpRewrite(root, "http://127.0.0.1:8787", [], []), undefined);
         const withPlugin = prepareOpencodeHttpRewrite(root, "http://127.0.0.1:8787", [], [], "/opt/bili/dist/agent/opencode.js", false, { ...spawnEnv });
         assert.ok(withPlugin);
         const injected = JSON.parse(fs.readFileSync(withPlugin, "utf8"));
         assert.deepEqual(injected.plugin, ["/opt/bili/dist/agent/opencode.js"]);
         assert.equal(injected.provider["zhipuai-lb"].options.baseURL, "http://127.0.0.1:18081/v1");
-        fs.rmSync(path.dirname(withPlugin), { recursive: true, force: true });
+        rmrf(path.dirname(withPlugin));
         const missingCfg = prepareOpencodeHttpRewrite(undefined, "http://127.0.0.1:8787", [], [], "/opt/bili/dist/agent/opencode.js");
         assert.ok(missingCfg);
         const fromEmpty = JSON.parse(fs.readFileSync(missingCfg, "utf8"));
         assert.deepEqual(fromEmpty.plugin, ["/opt/bili/dist/agent/opencode.js"]);
         assert.deepEqual(fromEmpty.compaction, { auto: false });
-        fs.rmSync(path.dirname(missingCfg), { recursive: true, force: true });
+        rmrf(path.dirname(missingCfg));
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -2519,15 +2770,15 @@ test("prepareOpencodeHttpRewrite: strips opencode-acp entries in all spec forms 
         assert.deepEqual(out.plugins, []);
         // first stripped spec wins — the copy the host would have loaded first
         assert.equal(spawnEnv["BILI_OPENCODE_ACP_SPEC"], "opencode-acp@latest");
-        fs.rmSync(path.dirname(tmpFile), { recursive: true, force: true });
+        rmrf(path.dirname(tmpFile));
         // no acp entries → env untouched
         const env2: NodeJS.ProcessEnv = {};
         const plain = prepareOpencodeHttpRewrite({ plugin: ["other"], provider: {} }, "http://127.0.0.1:8787", [], [], "/opt/p.js", false, env2);
         assert.ok(plain);
         assert.equal(env2["BILI_OPENCODE_ACP_SPEC"], undefined);
-        fs.rmSync(path.dirname(plain), { recursive: true, force: true });
+        rmrf(path.dirname(plain));
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -2543,9 +2794,9 @@ test("prepareOpencodeHttpRewrite: pluginDirMode wraps the plugin in an index.js 
         const shim = fs.readFileSync(path.join(entry, "index.js"), "utf8");
         assert.match(shim, /export \{ default \} from "\/opt\/bili\/dist\/agent\/opencode\.js";/);
         assert.deepEqual(injected.compaction, { auto: false });
-        fs.rmSync(path.dirname(tmpFile), { recursive: true, force: true });
+        rmrf(path.dirname(tmpFile));
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -2585,9 +2836,9 @@ test("prepareOpencodeHttpRewrite: re-anchors relative local plugin specs against
         assert.equal(fs.readFileSync(path.join(cfgDir, "opencode.json"), "utf8"), original);
         assert.equal((root.plugin as unknown[])[0], "./ntfy.js");
         assert.equal(((root.plugins as Array<Record<string, unknown>>)[0] as Record<string, unknown>).package, "./ntfy");
-        fs.rmSync(path.dirname(tmpFile), { recursive: true, force: true });
+        rmrf(path.dirname(tmpFile));
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -2606,9 +2857,9 @@ test("prepareOpencodeHttpRewrite: OPENCODE_CONFIG dir wins as the relative-spec 
         assert.ok(tmpFile);
         const cloned = JSON.parse(fs.readFileSync(tmpFile, "utf8"));
         assert.deepEqual(cloned.plugins, [{ package: path.resolve(ocDir, "./local") }]);
-        fs.rmSync(path.dirname(tmpFile), { recursive: true, force: true });
+        rmrf(path.dirname(tmpFile));
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -2629,7 +2880,7 @@ test("opencodeMajorVersion: parses --version output, defaults to 1 on failure", 
         assert.equal(opencodeMajorVersion(mk("oc-v2.sh", "opencode v2.0.3")), 2);
         assert.equal(opencodeMajorVersion(mk("oc-v1.sh", "1.14.46")), 1);
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -2657,7 +2908,7 @@ test("resolveOpencodeConfigFile: OPENCODE_CONFIG wins; first existing file, .jso
         fs.writeFileSync(legacyFile, "{}");
         assert.equal(resolveOpencodeConfigFile(env), legacyFile);
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -2721,7 +2972,7 @@ test("readHermesConfig + resolveHermesHome", () => {
         const cfg = readHermesConfig(dir);
         assert.equal(cfg.providers.x?.api, "http://1.2.3.4:9/v1");
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -2776,7 +3027,7 @@ test("readDshConfig + resolveDshHome + parseDshSettingsYaml", () => {
         assert.deepEqual(parseDshSettingsYaml('x:\n  baseURL: \'"notaurl\"\'\n'), []);
         assert.deepEqual(parseDshSettingsYaml('x:\n  baseURL: "https://api.quoted.io/v1"\n'), ["https://api.quoted.io/v1"]);
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -2850,11 +3101,11 @@ test("prepareDshHome: rewrites baseURL lines, shares siblings, never touches the
         assert.equal(fs.readFileSync(path.join(dir, "settings.yaml"), "utf8"), original);
         assert.equal(fs.readFileSync(path.join(overlay, ".credentials.yaml"), "utf8"), "DEEPSEEK_API_KEY: sk-x");
         assert.ok(fs.lstatSync(path.join(overlay, "profiles")).isSymbolicLink());
-        fs.rmSync(overlay, { recursive: true, force: true });
+        rmrf(overlay);
 
         assert.equal(prepareDshHome(dir, "http://127.0.0.1:8787", []), undefined);
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -2872,9 +3123,9 @@ test("prepareDshHome: preserves CRLF line endings when rewriting", () => {
         assert.ok(txt.includes("\r\n"), "CRLF preserved");
         assert.ok(!/\r\n\r\n/.test(txt), "no doubled newlines");
         assert.ok(txt.includes("baseURL: http://127.0.0.1:8787/bili/http://127.0.0.1:8199/v1\r"));
-        fs.rmSync(overlay, { recursive: true, force: true });
+        rmrf(overlay);
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -2888,7 +3139,104 @@ test("writeDshAcpPatch: writes insert overlay with file:// plugin URL into <home
         assert.ok(txt.startsWith("- insert:\n"));
         assert.match(txt, /^ {4}- id: bili-native\n {6}name: file:\/\/.+dsh-native\.js$/m);
         assert.match(txt, /^- id: compaction-basic\n  config:\n    auto: false\n$/m);
+        rmrf(`${dir}-bili`);
+    } finally {
+        rmrf(dir);
+    }
+});
+
+test("writeDshAcpPatch: honors an explicit bare-specifier entry name (#1590)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-patch-"));
+    try {
+        const file = writeDshAcpPatch(dir, "billion-context");
+        assert.ok(file);
+        const txt = fs.readFileSync(file, "utf8");
+        assert.match(txt, /^ {4}- id: bili-native\n {6}name: billion-context$/m);
         fs.rmSync(`${dir}-bili`, { recursive: true, force: true });
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("writeDshClientShimFiles + dshPluginEntry: resolvable shim yields the bare entry, missing or broken shim falls back to the file URL (#1590)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-shim-"));
+    try {
+        // os.tmpdir() sits inside this repo: a differently-named package.json
+        // above the probe anchor stops Node's self-name resolution from
+        // "finding" billion-context in the checkout instead of the fixture.
+        fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "bili-launcher-fixture", version: "0.0.0" }));
+        const home = path.join(dir, ".dsh");
+        fs.mkdirSync(home);
+        const hostBundle = path.join(dir, "agent", "dsh-native.js");
+        const clientBundle = path.join(dir, "agent", "dsh-native-client.js");
+        fs.mkdirSync(path.dirname(hostBundle), { recursive: true });
+        fs.writeFileSync(hostBundle, "// host\n");
+        fs.writeFileSync(clientBundle, "// client\n");
+        const shimDir = path.join(home, "node_modules", "billion-context");
+
+        assert.equal(writeDshClientShimFiles(shimDir, hostBundle, clientBundle, "0.1.169"), true);
+        const shimPkg = JSON.parse(fs.readFileSync(path.join(shimDir, "package.json"), "utf8"));
+        assert.equal(shimPkg.name, "billion-context");
+        assert.deepEqual(shimPkg.exports, { ".": "./index.js", "./dsh": "./index.js", "./dsh/package.json": "./package.json", "./client": "./bundle.js" });
+        assert.equal(shimPkg.dsh.client.platform, "web");
+        // The bundles are SYMLINKS into bili's live dist — an auto-update that
+        // moves dist self-heals on the next launch without rewriting the shim.
+        assert.equal(fs.realpathSync(path.join(shimDir, "index.js")), fs.realpathSync(hostBundle));
+        assert.equal(fs.realpathSync(path.join(shimDir, "bundle.js")), fs.realpathSync(clientBundle));
+
+        // Resolvable from the home's walk-up chain, and the root import
+        // lands on the host module itself ⇒ the bare entry.
+        assert.equal(dshPluginEntry(home), "billion-context");
+
+        // A shim whose root "." export points elsewhere (e.g. a real install
+        // whose root is the CLI entry, not the dsh host half) must NOT claim
+        // the bare lane: importing the root would boot the CLI inside dsh.
+        // Built in a SEPARATE home: the CJS loader caches package.json reads
+        // per path per process, so mutating the first shim in place would be
+        // invisible to the next resolve.
+        const home2 = path.join(dir, ".dsh2");
+        fs.mkdirSync(home2);
+        const shimDir2 = path.join(home2, "node_modules", "billion-context");
+        assert.equal(writeDshClientShimFiles(shimDir2, hostBundle, clientBundle, "0.1.169"), true);
+        const pkg2 = path.join(shimDir2, "package.json");
+        fs.writeFileSync(pkg2, JSON.stringify({ ...JSON.parse(fs.readFileSync(pkg2, "utf8")), exports: { ".": "./other.js" } }));
+        fs.writeFileSync(path.join(shimDir2, "other.js"), "// not the host half\n");
+        assert.match(dshPluginEntry(home2), /^file:\/\/.+dsh-native\.js$/);
+
+        // A stale shim (resolved package.json but dangling index.js symlink)
+        // degrades to the legacy file URL instead of failing dsh boot.
+        fs.rmSync(path.join(shimDir, "index.js"));
+        assert.match(dshPluginEntry(home), /^file:\/\/.+dsh-native\.js$/);
+
+        // No shim at all: the same fallback.
+        fs.rmSync(shimDir, { recursive: true, force: true });
+        assert.match(dshPluginEntry(home), /^file:\/\/.+dsh-native\.js$/);
+
+        // Missing dist bundles: nothing written, existing content untouched.
+        const other = path.join(dir, "nm", "billion-context");
+        fs.mkdirSync(other, { recursive: true });
+        fs.writeFileSync(path.join(other, "keep.txt"), "x");
+        assert.equal(writeDshClientShimFiles(other, path.join(dir, "missing.js"), clientBundle, "0.0.0"), false);
+        assert.equal(fs.readFileSync(path.join(other, "keep.txt"), "utf8"), "x");
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("writeDshClientShim: stamps the real bili version into the shim package.json (#1590)", (t) => {
+    const root = selfPackageRoot();
+    if (!fs.existsSync(path.join(root, "dist", "agent", "dsh-native.js")) || !fs.existsSync(path.join(root, "dist", "agent", "dsh-native-client.js"))) {
+        t.skip("needs a built dist (npm run build first)");
+        return;
+    }
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-shimver-"));
+    try {
+        const home = path.join(dir, ".dsh");
+        fs.mkdirSync(home);
+        assert.equal(writeDshClientShim(home), true);
+        const shimPkg = JSON.parse(fs.readFileSync(path.join(home, "node_modules", "billion-context", "package.json"), "utf8"));
+        const repoPkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+        assert.equal(shimPkg.version, repoPkg.version);
     } finally {
         fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -2909,7 +3257,7 @@ test("prepareDshHome: returns undefined for unreadable settings even with rewrit
         const rewrites: HttpRewrite[] = [{ key: "dsh-1", realUpstream: "http://127.0.0.1:8199/v1" }];
         assert.equal(prepareDshHome(dir, "http://127.0.0.1:8787", rewrites), undefined);
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -2927,7 +3275,7 @@ test("prepareCodexHome: no real config → overlay holds only the bili MCP block
         fs.mkdirSync(path.join(dir, "sessions"));
         const authOriginal = fs.readFileSync(path.join(dir, "auth.json"), "utf8");
 
-        const overlay = prepareCodexHome(dir, origin, cid);
+        const overlay = prepareCodexHome({ codexHome: dir, origin, caPath: "/ca.pem", conversationId: cid, manageRouting: false });
         assert.ok(overlay);
         assert.equal(overlay, `${dir}-bili`);
         const txt = fs.readFileSync(path.join(overlay, "config.toml"), "utf8");
@@ -2942,9 +3290,9 @@ test("prepareCodexHome: no real config → overlay holds only the bili MCP block
         assert.ok(fs.lstatSync(path.join(overlay, "sessions")).isSymbolicLink());
         assert.equal(fs.readFileSync(path.join(dir, "auth.json"), "utf8"), authOriginal);
         assert.ok(!fs.existsSync(path.join(dir, "config.toml")));
-        fs.rmSync(overlay, { recursive: true, force: true });
+        rmrf(overlay);
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -2956,16 +3304,16 @@ test("prepareCodexHome: real config without bili → original preserved, block a
             ['model = "gpt-5"', "", '[model_providers.openai]', 'name = "OpenAI"', ''].join("\n"),
         );
         const original = fs.readFileSync(path.join(dir, "config.toml"), "utf8");
-        const overlay = prepareCodexHome(dir, "http://127.0.0.1:8787", "conv-2");
+        const overlay = prepareCodexHome({ codexHome: dir, origin: "http://127.0.0.1:8787", caPath: "/ca.pem", conversationId: "conv-2", manageRouting: false });
         assert.ok(overlay);
         const txt = fs.readFileSync(path.join(overlay, "config.toml"), "utf8");
         assert.ok(txt.includes('model = "gpt-5"'));
         assert.ok(txt.includes('[model_providers.openai]'));
         assert.equal((txt.match(/\[mcp_servers\.bili\]/g) ?? []).length, 1);
         assert.equal(fs.readFileSync(path.join(dir, "config.toml"), "utf8"), original);
-        fs.rmSync(overlay, { recursive: true, force: true });
+        rmrf(overlay);
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -2987,7 +3335,7 @@ test("prepareCodexHome: pre-existing [mcp_servers.bili] is replaced, never dupli
                 "",
             ].join("\n"),
         );
-        const overlay = prepareCodexHome(dir, "http://127.0.0.1:8787", "conv-3");
+        const overlay = prepareCodexHome({ codexHome: dir, origin: "http://127.0.0.1:8787", caPath: "/ca.pem", conversationId: "conv-3", manageRouting: false });
         assert.ok(overlay);
         const txt = fs.readFileSync(path.join(overlay, "config.toml"), "utf8");
         assert.equal((txt.match(/\[mcp_servers\.bili\]/g) ?? []).length, 1, "exactly one bili block");
@@ -2996,42 +3344,52 @@ test("prepareCodexHome: pre-existing [mcp_servers.bili] is replaced, never dupli
         assert.ok(txt.includes(`BILI_CONVERSATION_ID = ${JSON.stringify("conv-3")}`), "per-spawn conversation id added");
         assert.ok(txt.includes('model = "gpt-5"'), "unrelated top-level key kept");
         assert.ok(txt.includes('[other_table]') && txt.includes('keep = "me"'), "unrelated table kept");
-        fs.rmSync(overlay, { recursive: true, force: true });
+        rmrf(overlay);
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
-test("prepareCodexMcpInjection: POSIX keeps inline -c args, no CODEX_HOME redirect (#681)", () => {
-    const r = prepareCodexMcpInjection({
-        platform: "linux",
-        codexHome: "/nonexistent-codex-home",
-        origin: "http://127.0.0.1:8787",
-        conversationId: "conv-x",
-    });
-    assert.deepEqual(r.clientArgs, buildCodexMcpArgs("http://127.0.0.1:8787", "conv-x"));
-    assert.deepEqual(r.envPatch, {});
-    assert.equal(r.warning, undefined);
-});
-
-test("prepareCodexMcpInjection: win32 redirects CODEX_HOME to the overlay, drops inline args (#681)", () => {
+test("prepareCodexMcpInjection: redirects CODEX_HOME to the overlay on every platform, no inline -c args (#681/#1802)", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cx-home-"));
     try {
         fs.writeFileSync(path.join(dir, "auth.json"), "{}");
         const r = prepareCodexMcpInjection({
-            platform: "win32",
             codexHome: dir,
             origin: "http://127.0.0.1:8787",
+            caPath: "/ca.pem",
             conversationId: "conv-w",
+            manageRouting: false,
         });
-        assert.deepEqual(r.clientArgs, [], "no inline -c args on Windows");
+        assert.deepEqual(r.clientArgs, [], "no inline -c args anywhere");
         assert.equal(r.envPatch.CODEX_HOME, `${dir}-bili`);
         assert.ok(fs.existsSync(path.join(`${dir}-bili`, "config.toml")));
         const txt = fs.readFileSync(path.join(`${dir}-bili`, "config.toml"), "utf8");
         assert.equal((txt.match(/\[mcp_servers\.bili\]/g) ?? []).length, 1);
-        fs.rmSync(`${dir}-bili`, { recursive: true, force: true });
+        rmrf(`${dir}-bili`);
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
+    }
+});
+
+test("prepareCodexMcpInjection: routing-only launch (no MCP) still builds the overlay for .env protection (#1802)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cx-home-"));
+    try {
+        fs.writeFileSync(path.join(dir, ".env"), "HTTPS_PROXY=socks5h://127.0.0.1:7890\nOPENAI_API_KEY=sk-user\n");
+        const r = prepareCodexMcpInjection({
+            codexHome: dir,
+            origin: "http://127.0.0.1:8787",
+            caPath: "/ca.pem",
+            manageRouting: true,
+        });
+        assert.equal(r.warning, undefined);
+        assert.equal(r.envPatch.CODEX_HOME, `${dir}-bili`);
+        assert.ok(!fs.existsSync(path.join(`${dir}-bili`, "config.toml")) || fs.lstatSync(path.join(`${dir}-bili`, "config.toml")).isSymbolicLink(), "config.toml stays shared without a conversation id");
+        const envText = fs.readFileSync(path.join(`${dir}-bili`, ".env"), "utf8");
+        assert.ok(envText.includes("HTTPS_PROXY=http://127.0.0.1:8787"));
+        rmrf(`${dir}-bili`);
+    } finally {
+        rmrf(dir);
     }
 });
 
@@ -3055,7 +3413,28 @@ test("runLaunch dsh: non-loopback upstreams ride proxy envs, loopback keeps the 
     );
     fs.mkdirSync(path.join(dshHome, "profiles"));
     const original = fs.readFileSync(path.join(dshHome, "settings.yaml"), "utf8");
-    const fakeDsh = path.join(home, process.platform === "win32" ? "fake-dsh.exe" : "fake-dsh");
+    // A differently-named package.json above the probe anchor: os.tmpdir()
+    // can sit inside a billion-context checkout (as it does in this sandbox),
+    // and tsx's resolver checks the nearest enclosing package.json for a
+    // self-name match BEFORE walking node_modules — without the guard the
+    // probe would resolve against the checkout's own package.json instead of
+    // the fixture/shim below. It must sit on the overlay anchor's walk-up
+    // chain (home root), not merely beside it.
+    fs.writeFileSync(path.join(home, "package.json"), JSON.stringify({ name: "bili-dsh-launch-fixture", version: "0.0.0" }));
+    const dshTree = path.join(home, "dshhost");
+    fs.mkdirSync(path.join(dshTree, "bin"), { recursive: true });
+    fs.writeFileSync(path.join(dshTree, "package.json"), JSON.stringify({ name: "dsh-fake-host", version: "0.0.0" }));
+    // #1590: pre-seed the resolvable shim where runLaunch probes it (the
+    // overlay home — loopback rewrites are pending here, so the overlay
+    // exists). Keeps the bare-entry assertion deterministic on trees without
+    // a build: runLaunch's own writeDshClientShim only overwrites the fixture
+    // with real dist symlinks when bili's dist bundles exist.
+    const hostFixture = path.join(home, "host-bundle.js");
+    const clientFixture = path.join(home, "client-bundle.js");
+    fs.writeFileSync(hostFixture, "// host\n");
+    fs.writeFileSync(clientFixture, "// client\n");
+    assert.equal(writeDshClientShimFiles(path.join(`${dshHome}-bili`, "node_modules", "billion-context"), hostFixture, clientFixture, "0.1.169"), true);
+    const fakeDsh = path.join(dshTree, "bin", process.platform === "win32" ? "fake-dsh.exe" : "fake-dsh");
     fs.writeFileSync(fakeDsh, "");
     process.env.BILI_CLIENT_BIN = fakeDsh;
     process.env.DSH_HOME = dshHome;
@@ -3093,7 +3472,7 @@ test("runLaunch dsh: non-loopback upstreams ride proxy envs, loopback keeps the 
             { client: "dsh", clientArgs: ["--profile", "headless", "task"], overrides: {} },
             // hermetic: never attach to / handshake against a real proxy
             // whose instance file happens to live on this machine
-            { fetchImpl: async () => ({ ok: true }), spawnImpl, sleep: () => Promise.resolve(), readInstanceFile: () => undefined },
+            { fetchImpl: async () => ({ ok: true }), fetchHealthInfo: async () => ({ ok: true, pid: lastFakeChildPid }), spawnImpl, sleep: () => Promise.resolve(), readInstanceFile: () => undefined },
         );
         assert.equal(envSeen.length, 1);
         const seenEnv = envSeen[0];
@@ -3133,10 +3512,15 @@ test("runLaunch dsh: non-loopback upstreams ride proxy envs, loopback keeps the 
         assert.ok(fs.existsSync(patchFile));
         const patchTxt = fs.readFileSync(patchFile, "utf8");
         assert.ok(patchTxt.startsWith("- insert:\n"));
-        assert.ok(/- id: bili-native\n {6}name: file:\/\/\/.*dsh-native\.js\n/.test(patchTxt));
+        // #1590: the launcher seeds a resolvable shim under the DSH_HOME
+        // walk-up chain ⇒ bare specifier (lets dsh load the host half AND its
+        // client scanner attach the browser half), not the legacy file URL;
+        // NODE_PATH points the scanner's CJS resolution at the base home.
+        assert.ok(/- id: bili-native\n {6}name: billion-context\n/.test(patchTxt));
         assert.match(patchTxt, /^- id: compaction-basic\n  config:\n    auto: false\n$/m);
+        assert.ok(String(seenEnv.NODE_PATH ?? "").startsWith(path.join(dshHome, "node_modules")), `NODE_PATH seeds the scanner: ${seenEnv.NODE_PATH}`);
         assert.deepEqual(argsSeen[0], ["--patch", patchFile, "--profile", "headless", "task"]);
-        fs.rmSync(overlay, { recursive: true, force: true });
+        rmrf(overlay);
     } finally {
         process.exit = prevExit;
         if (prevBin === undefined) delete process.env.BILI_CLIENT_BIN;
@@ -3145,7 +3529,7 @@ test("runLaunch dsh: non-loopback upstreams ride proxy envs, loopback keeps the 
         else process.env.DSH_HOME = prevDshHome;
         if (prevNoProxy === undefined) delete process.env.NO_PROXY;
         else process.env.NO_PROXY = prevNoProxy;
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -3193,7 +3577,7 @@ test("runLaunch dsh: no loopback custom providers — no DSH_HOME overlay (#535 
     try {
         await runLaunch(
             { client: "dsh", clientArgs: [], overrides: {} },
-            { fetchImpl: async () => ({ ok: true }), spawnImpl, sleep: () => Promise.resolve(), readInstanceFile: () => undefined },
+            { fetchImpl: async () => ({ ok: true }), fetchHealthInfo: async () => ({ ok: true, pid: lastFakeChildPid }), spawnImpl, sleep: () => Promise.resolve(), readInstanceFile: () => undefined },
         );
         assert.equal(envSeen.length, 1);
         const seenEnv = envSeen[0];
@@ -3214,7 +3598,7 @@ test("runLaunch dsh: no loopback custom providers — no DSH_HOME overlay (#535 
         else process.env.BILI_CLIENT_BIN = prevBin;
         if (prevDshHome === undefined) delete process.env.DSH_HOME;
         else process.env.DSH_HOME = prevDshHome;
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -3315,7 +3699,7 @@ test("ensureProxyRunning: spawns the resolved Node runtime, not blind process.ex
     };
     await ensureProxyRunning(
         { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
-        { fetchImpl: async () => ({ ok: true }), spawnImpl, readInstanceFile: () => undefined, nodeRuntime: "/custom/node" },
+        { fetchImpl: async () => ({ ok: true }), fetchHealthInfo: async () => ({ ok: true, pid: 42425 }), spawnImpl, readInstanceFile: () => undefined, nodeRuntime: "/custom/node" },
     );
     assert.equal(spawnedCmd, "/custom/node");
 });
@@ -3382,7 +3766,7 @@ test("runLaunch omp: launcher hands per-model windows to the spawned proxy", asy
     try {
         await runLaunch(
             { client: "omp", clientArgs: [], overrides: {} },
-            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+            { fetchImpl, fetchHealthInfo: async () => ({ ok: true, pid: lastFakeChildPid }), spawnImpl, sleep: () => Promise.resolve() },
         );
         assert.deepEqual(exitCalls, [0]);
         assert.equal(proxyEnvs.length, 1, "proxy spawned once");
@@ -3400,7 +3784,7 @@ test("runLaunch omp: launcher hands per-model windows to the spawned proxy", asy
         else process.env.USERPROFILE = prevUserProfile;
         if (prevOmpDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
         else process.env.PI_CODING_AGENT_DIR = prevOmpDir;
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -3559,7 +3943,7 @@ test("readClaudeSettings: model from env block / top-level, autoCompactWindow fr
         cfg = readClaudeSettings(home, os.tmpdir(), {});
         assert.deepEqual(cfg, {});
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -3603,7 +3987,7 @@ test("runLaunch codex: budget args injected for MITM mode (built-in table window
     try {
         await runLaunch(
             { client: "codex", clientArgs: [], overrides: {} },
-            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+            { fetchImpl, fetchHealthInfo: async () => ({ ok: true, pid: lastFakeChildPid }), spawnImpl, sleep: () => Promise.resolve() },
         );
         assert.equal(clientArgsSeen.length, 1);
         const args = clientArgsSeen[0];
@@ -3619,7 +4003,7 @@ test("runLaunch codex: budget args injected for MITM mode (built-in table window
         clientArgsSeen.length = 0;
         await runLaunch(
             { client: "codex", clientArgs: [], overrides: {} },
-            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+            { fetchImpl, fetchHealthInfo: async () => ({ ok: true, pid: lastFakeChildPid }), spawnImpl, sleep: () => Promise.resolve() },
         );
         assert.equal(clientArgsSeen.length, 1);
         assert.ok(!clientArgsSeen[0].some((a) => a.startsWith("model_context_window=")), JSON.stringify(clientArgsSeen[0]));
@@ -3629,7 +4013,7 @@ test("runLaunch codex: budget args injected for MITM mode (built-in table window
         clientArgsSeen.length = 0;
         await runLaunch(
             { client: "codex", clientArgs: [], overrides: {} },
-            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+            { fetchImpl, fetchHealthInfo: async () => ({ ok: true, pid: lastFakeChildPid }), spawnImpl, sleep: () => Promise.resolve() },
         );
         assert.equal(clientArgsSeen.length, 1);
         assert.ok(!clientArgsSeen[0].some((a) => a.startsWith("model_context_window=")), JSON.stringify(clientArgsSeen[0]));
@@ -3644,7 +4028,7 @@ test("runLaunch codex: budget args injected for MITM mode (built-in table window
         else process.env.ANTHROPIC_MODEL = prevAnthropicModel;
         if (prevAutoCompact === undefined) delete process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW;
         else process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = prevAutoCompact;
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -3688,7 +4072,7 @@ test("runLaunch claude: CLAUDE_CODE_AUTO_COMPACT_WINDOW injected (built-in table
     try {
         await runLaunch(
             { client: "claude", clientArgs: [], overrides: {} },
-            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+            { fetchImpl, fetchHealthInfo: async () => ({ ok: true, pid: lastFakeChildPid }), spawnImpl, sleep: () => Promise.resolve() },
         );
         assert.equal(clientEnvs.length, 1);
         assert.equal(clientEnvs[0]?.CLAUDE_CODE_AUTO_COMPACT_WINDOW, "200000");
@@ -3698,7 +4082,7 @@ test("runLaunch claude: CLAUDE_CODE_AUTO_COMPACT_WINDOW injected (built-in table
         clientEnvs.length = 0;
         await runLaunch(
             { client: "claude", clientArgs: [], overrides: {} },
-            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+            { fetchImpl, fetchHealthInfo: async () => ({ ok: true, pid: lastFakeChildPid }), spawnImpl, sleep: () => Promise.resolve() },
         );
         assert.equal(clientEnvs.length, 1);
         assert.equal(clientEnvs[0]?.CLAUDE_CODE_AUTO_COMPACT_WINDOW, undefined);
@@ -3709,7 +4093,7 @@ test("runLaunch claude: CLAUDE_CODE_AUTO_COMPACT_WINDOW injected (built-in table
         clientEnvs.length = 0;
         await runLaunch(
             { client: "claude", clientArgs: [], overrides: {} },
-            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+            { fetchImpl, fetchHealthInfo: async () => ({ ok: true, pid: lastFakeChildPid }), spawnImpl, sleep: () => Promise.resolve() },
         );
         assert.equal(clientEnvs.length, 1);
         assert.equal(clientEnvs[0]?.CLAUDE_CODE_AUTO_COMPACT_WINDOW, "200000");
@@ -3724,7 +4108,7 @@ test("runLaunch claude: CLAUDE_CODE_AUTO_COMPACT_WINDOW injected (built-in table
         else process.env.ANTHROPIC_MODEL = prevAnthropicModel;
         if (prevAutoCompact === undefined) delete process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW;
         else process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = prevAutoCompact;
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -3797,7 +4181,7 @@ test("readCodebuddyConfig: settings env block / top-level model / autoCompactWin
         cfg = readCodebuddyConfig(cbDir, os.tmpdir(), {});
         assert.deepEqual(cfg, {});
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -3832,8 +4216,8 @@ test("readCodebuddyConfig: two-tier models.json, project level wins per model", 
             "https://project.example.com/v1/chat/completions",
         ]);
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
-        fs.rmSync(cwd, { recursive: true, force: true });
+        rmrf(home);
+        rmrf(cwd);
     }
 });
 
@@ -4013,7 +4397,7 @@ test("runLaunch codebuddy: CODEBUDDY_BASE_URL /bili/ rewrite + budget injected (
     try {
         await runLaunch(
             { client: "codebuddy", clientArgs: [], overrides: {} },
-            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+            { fetchImpl, fetchHealthInfo: async () => ({ ok: true, pid: lastFakeChildPid }), spawnImpl, sleep: () => Promise.resolve() },
         );
         assert.equal(clientEnvs.length, 1);
         assert.match(clientEnvs[0]?.CODEBUDDY_BASE_URL ?? "", /^http:\/\/127\.0\.0\.1:\d+\/bili\/https:\/\/tencent\.sso\.codebuddy\.cn\/v2$/);
@@ -4025,7 +4409,7 @@ test("runLaunch codebuddy: CODEBUDDY_BASE_URL /bili/ rewrite + budget injected (
         clientEnvs.length = 0;
         await runLaunch(
             { client: "codebuddy", clientArgs: [], overrides: {} },
-            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+            { fetchImpl, fetchHealthInfo: async () => ({ ok: true, pid: lastFakeChildPid }), spawnImpl, sleep: () => Promise.resolve() },
         );
         assert.equal(clientEnvs.length, 1);
         assert.equal(clientEnvs[0]?.CODEBUDDY_AUTO_COMPACT_WINDOW, undefined);
@@ -4043,7 +4427,7 @@ test("runLaunch codebuddy: CODEBUDDY_BASE_URL /bili/ rewrite + budget injected (
         else process.env.CODEBUDDY_AUTO_COMPACT_WINDOW = prevAutoCompact;
         if (prevConfigDir === undefined) delete process.env.CODEBUDDY_CONFIG_DIR;
         else process.env.CODEBUDDY_CONFIG_DIR = prevConfigDir;
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -4072,7 +4456,7 @@ test("qoderIsCnSite: on-disk config dirs only break the tie (no dirs → intl)",
         process.env.HOME = prevHome;
         if (prevUserProfile === undefined) delete process.env.USERPROFILE;
         else process.env.USERPROFILE = prevUserProfile;
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -4097,7 +4481,7 @@ test("resolveQoderHome: env override > CLI_HOME+dir name > site default", () => 
         process.env.HOME = prevHome;
         if (prevUserProfile === undefined) delete process.env.USERPROFILE;
         else process.env.USERPROFILE = prevUserProfile;
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -4129,7 +4513,7 @@ test("readQoderConfig: settings.json model (string + object) and model server ho
         process.env.HOME = prevHome;
         if (prevUserProfile === undefined) delete process.env.USERPROFILE;
         else process.env.USERPROFILE = prevUserProfile;
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -4198,7 +4582,7 @@ test("resolveClientCommand: qoder resolves `qoder`, falls back to `qodercli`", (
         fs.writeFileSync(path.join(dir, "qoder"), "");
         assert.deepEqual(resolveClientCommand("qoder", env), { command: path.join(dir, "qoder"), prefixArgs: [] });
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -4249,7 +4633,7 @@ test("runLaunch qoder: cert-MITM envs, transport forced, budget aligned, default
     try {
         await runLaunch(
             { client: "qoder", clientArgs: [], overrides: {} },
-            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+            { fetchImpl, fetchHealthInfo: async () => ({ ok: true, pid: lastFakeChildPid }), spawnImpl, sleep: () => Promise.resolve() },
         );
         assert.equal(clientEnvs.length, 1);
         const seenEnv = clientEnvs[0]!;
@@ -4281,7 +4665,7 @@ test("runLaunch qoder: cert-MITM envs, transport forced, budget aligned, default
         else process.env.QODER_MODEL_TRANSPORT = prevTransport;
         if (prevNoProxy === undefined) delete process.env.NO_PROXY;
         else process.env.NO_PROXY = prevNoProxy;
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -4298,7 +4682,7 @@ test("resolveTraeHome: TRAE_CONFIG_DIR override > ~/.trae", () => {
         process.env.HOME = prevHome;
         if (prevUserProfile === undefined) delete process.env.USERPROFILE;
         else process.env.USERPROFILE = prevUserProfile;
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -4383,8 +4767,8 @@ test("readAiderConfUrls: home > git root > cwd precedence, quoted values (#1048)
         fs.rmSync(gitConf);
         assert.deepEqual(readAiderConfUrls(work, confEnv), ["https://cwd.example.com/v1"]);
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
-        fs.rmSync(repo, { recursive: true, force: true });
+        rmrf(home);
+        rmrf(repo);
     }
 });
 
@@ -4462,7 +4846,7 @@ test("resolveClientCommand: aider resolves the `aider` bin generically (#1048)",
         fs.writeFileSync(path.join(dir, "aider"), "");
         assert.deepEqual(resolveClientCommand("aider", env), { command: path.join(dir, "aider"), prefixArgs: [] });
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -4542,7 +4926,7 @@ test("resolveGooseDirs: GOOSE_PATH_ROOT wins; XDG fallback scatters under Block 
             agentsDir: path.join("/x/data", "Block", "goose", ".agents"),
         });
     } finally {
-        fs.rmSync(root, { recursive: true, force: true });
+        rmrf(root);
     }
 });
 
@@ -4562,7 +4946,7 @@ test("readGooseConfig: active_provider + custom_providers base_urls; GOOSE_PROVI
         assert.equal(readGooseConfig(dirs, { GOOSE_PROVIDER: "override" }).activeProvider, "override");
         assert.deepEqual(readGooseConfig(resolveGooseDirs({ GOOSE_PATH_ROOT: "/nonexistent-bili-test" }), {}).customProviders, {});
     } finally {
-        fs.rmSync(root, { recursive: true, force: true });
+        rmrf(root);
     }
 });
 
@@ -4598,7 +4982,7 @@ test("prepareGooseHome/finalizeGooseHome: overlay layout, patched urls, merge-ba
         assert.ok(!fs.readFileSync(path.join(cfgDir, "custom_providers", "newprov.toml"), "utf8").includes(origin), "new file content verbatim");
         assert.equal(prepareGooseHome(env, origin, []), undefined, "no rewrites → no overlay");
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -4614,7 +4998,7 @@ test("resolveClientCommand: trae resolves `traecli`, falls back to `trae-cli` th
         fs.writeFileSync(path.join(dir, "traecli"), "");
         assert.deepEqual(resolveClientCommand("trae", env), { command: path.join(dir, "traecli"), prefixArgs: [] });
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        rmrf(dir);
     }
 });
 
@@ -4656,7 +5040,7 @@ test("runLaunch trae: cert-MITM envs (SSL_CERT_FILE combined bundle), no budget/
     try {
         await runLaunch(
             { client: "trae", clientArgs: [], overrides: {} },
-            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+            { fetchImpl, fetchHealthInfo: async () => ({ ok: true, pid: lastFakeChildPid }), spawnImpl, sleep: () => Promise.resolve() },
         );
         assert.equal(clientEnvs.length, 1);
         const seenEnv = clientEnvs[0]!;
@@ -4681,7 +5065,7 @@ test("runLaunch trae: cert-MITM envs (SSL_CERT_FILE combined bundle), no budget/
         else process.env.BILI_CLIENT_BIN = prevBin;
         if (prevNoProxy === undefined) delete process.env.NO_PROXY;
         else process.env.NO_PROXY = prevNoProxy;
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -4741,7 +5125,7 @@ async function captureLaunchedClientEnv(client: ClientName): Promise<NodeJS.Proc
     try {
         await runLaunch(
             { client, clientArgs: [], overrides: {} },
-            { fetchImpl: async () => ({ ok: true }), spawnImpl, sleep: () => Promise.resolve() },
+            { fetchImpl: async () => ({ ok: true }), fetchHealthInfo: async () => ({ ok: true, pid: 42424 }), spawnImpl, sleep: () => Promise.resolve() },
         );
     } finally {
         process.exit = prevExit;
@@ -4756,7 +5140,7 @@ async function captureLaunchedClientEnv(client: ClientName): Promise<NodeJS.Proc
         }
         if (prevMarker === undefined) delete process.env.BILI_TEST_MARKER;
         else process.env.BILI_TEST_MARKER = prevMarker;
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
     assert.equal(clientEnvs.length, 1, `${client} client spawned exactly once`);
     return clientEnvs[0]!;
@@ -4868,7 +5252,7 @@ async function runAiderLaunch(
     try {
         await runLaunch(
             { client: "aider", clientArgs, overrides: {} },
-            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+            { fetchImpl, fetchHealthInfo: async () => ({ ok: true, pid: lastFakeChildPid }), spawnImpl, sleep: () => Promise.resolve() },
         );
     } finally {
         process.exit = prevExit;
@@ -4885,7 +5269,7 @@ async function runAiderLaunch(
             if (v === undefined) delete process.env[k];
             else process.env[k] = v;
         }
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
     assert.ok(clientEnv, "aider client spawned");
     assert.ok(proxyEnv, "proxy child spawned");
@@ -5008,7 +5392,7 @@ test("readKimiConfig + resolveKimiHome: KIMI_CODE_HOME override, env channels, s
             { id: "m2", contextWindow: 262144 },
         ]);
     } finally {
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -5052,14 +5436,14 @@ test("resolveClientCommand: kimi resolves `kimi` on PATH, falls back to <home>/b
         assert.deepEqual(resolveClientCommand("kimi", env), { command: path.join(dir, "kimi"), prefixArgs: [] });
         const emptyDir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-kimi-empty-"));
         assert.deepEqual(resolveClientCommand("kimi", { PATH: emptyDir, KIMI_CODE_HOME: "/tmp/kh" }), { command: path.join("/tmp/kh", "bin", "kimi"), prefixArgs: [] });
-        fs.rmSync(emptyDir, { recursive: true, force: true });
+        rmrf(emptyDir);
     } finally {
         if (prevHome === undefined) delete process.env.HOME;
         else process.env.HOME = prevHome;
         if (prevUserProfile === undefined) delete process.env.USERPROFILE;
         else process.env.USERPROFILE = prevUserProfile;
-        fs.rmSync(dir, { recursive: true, force: true });
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(dir);
+        rmrf(home);
     }
 });
 
@@ -5106,7 +5490,7 @@ test("runLaunch kimi: cert-MITM envs (combined CA on SSL_CERT_FILE + NODE_EXTRA_
     try {
         await runLaunch(
             { client: "kimi", clientArgs: [], overrides: {} },
-            { fetchImpl, spawnImpl, sleep: () => Promise.resolve() },
+            { fetchImpl, fetchHealthInfo: async () => ({ ok: true, pid: lastFakeChildPid }), spawnImpl, sleep: () => Promise.resolve() },
         );
         assert.equal(clientEnvs.length, 1);
         const seenEnv = clientEnvs[0]!;
@@ -5132,7 +5516,7 @@ test("runLaunch kimi: cert-MITM envs (combined CA on SSL_CERT_FILE + NODE_EXTRA_
         else process.env.BILI_CLIENT_BIN = prevBin;
         if (prevNoProxy === undefined) delete process.env.NO_PROXY;
         else process.env.NO_PROXY = prevNoProxy;
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -5199,7 +5583,7 @@ test("readMcodeConfig: window merge keeps the known maxOutput when a larger cont
         else process.env.HOME = prevHome;
         if (prevUserProfile === undefined) delete process.env.USERPROFILE;
         else process.env.USERPROFILE = prevUserProfile;
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -5229,13 +5613,13 @@ test("readMcodeConfig + resolveMcodeInstallDir: union-scan ~/.minimax*/config.ya
         const overridden = readMcodeConfig({ MINIMAX_DATA_DIR: dataDir });
         assert.deepEqual(Object.keys(overridden.providers), ["minimax_api"]);
         assert.equal(overridden.providers["minimax_api"]?.baseUrl, "https://override.example.com/");
-        fs.rmSync(dataDir, { recursive: true, force: true });
+        rmrf(dataDir);
     } finally {
         if (prevHome === undefined) delete process.env.HOME;
         else process.env.HOME = prevHome;
         if (prevUserProfile === undefined) delete process.env.USERPROFILE;
         else process.env.USERPROFILE = prevUserProfile;
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -5277,14 +5661,14 @@ test("resolveClientCommand: mcode resolves `mcode` on PATH, falls back to <insta
         assert.deepEqual(resolveClientCommand("mcode", env), { command: path.join(dir, "mcode"), prefixArgs: [] });
         const emptyDir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-mcode-empty-"));
         assert.deepEqual(resolveClientCommand("mcode", { PATH: emptyDir, MCODE_INSTALL_DIR: "/tmp/md" }), { command: path.join("/tmp/md", "bin", "mcode"), prefixArgs: [] });
-        fs.rmSync(emptyDir, { recursive: true, force: true });
+        rmrf(emptyDir);
     } finally {
         if (prevHome === undefined) delete process.env.HOME;
         else process.env.HOME = prevHome;
         if (prevUserProfile === undefined) delete process.env.USERPROFILE;
         else process.env.USERPROFILE = prevUserProfile;
-        fs.rmSync(dir, { recursive: true, force: true });
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(dir);
+        rmrf(home);
     }
 });
 
@@ -5328,7 +5712,7 @@ test("runLaunch mcode: cert-MITM envs (combined CA on SSL_CERT_FILE + NODE_EXTRA
     const prevExit = process.exit;
     process.exit = (() => undefined) as typeof process.exit;
     try {
-        await runLaunch({ client: "mcode", clientArgs: [], overrides: {} }, { fetchImpl, spawnImpl, sleep: () => Promise.resolve() });
+        await runLaunch({ client: "mcode", clientArgs: [], overrides: {} }, { fetchImpl, fetchHealthInfo: async () => ({ ok: true, pid: lastFakeChildPid }), spawnImpl, sleep: () => Promise.resolve() });
         assert.equal(clientEnvs.length, 1);
         const seenEnv = clientEnvs[0]!;
         const origin = seenEnv.HTTPS_PROXY;
@@ -5353,7 +5737,7 @@ test("runLaunch mcode: cert-MITM envs (combined CA on SSL_CERT_FILE + NODE_EXTRA
         else process.env.BILI_CLIENT_BIN = prevBin;
         if (prevNoProxy === undefined) delete process.env.NO_PROXY;
         else process.env.NO_PROXY = prevNoProxy;
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -5396,7 +5780,7 @@ test("readOpencodeProjectLayer: git-bounded walk, nearest wins, .opencode dir, j
         const layer2 = readOpencodeProjectLayer(sibling);
         assert.deepEqual(Object.keys(layer2.providers).sort(), ["dotdir", "onlyRoot", "shared"]);
     } finally {
-        fs.rmSync(base, { recursive: true, force: true });
+        rmrf(base);
     }
 });
 
@@ -5419,7 +5803,7 @@ test("readOpencodeProjectLayer: outside a repo walks all ancestor levels", () =>
         assert.deepEqual(layer.providers["topP"], { baseURL: "http://127.0.0.1:6/top", file: path.join(top, "opencode.json") });
         assert.deepEqual(layer.providers["midP"], { baseURL: "http://127.0.0.1:7/mid", file: path.join(mid, "opencode.json") });
     } finally {
-        fs.rmSync(base, { recursive: true, force: true });
+        rmrf(base);
     }
 });
 
@@ -5431,7 +5815,7 @@ test("opencodeEffectiveCwd: honors --dir, defaults to process.cwd()", () => {
         assert.equal(opencodeEffectiveCwd(["--dir", abs]), abs);
         assert.equal(opencodeEffectiveCwd(["--dir=" + abs]), abs);
     } finally {
-        fs.rmSync(abs, { recursive: true, force: true });
+        rmrf(abs);
     }
     assert.equal(opencodeEffectiveCwd(["--dir", "rel/z"]), path.resolve("rel/z"));
 });
@@ -5539,7 +5923,7 @@ test("runLaunch goose: custom provider rides the regenerated GOOSE_PATH_ROOT ove
     try {
         await runLaunch(
             { client: "goose", clientArgs: [], overrides: {} },
-            { fetchImpl: async () => ({ ok: true }), spawnImpl, sleep: () => Promise.resolve() },
+            { fetchImpl: async () => ({ ok: true }), fetchHealthInfo: async () => ({ ok: true, pid: 42424 }), spawnImpl, sleep: () => Promise.resolve() },
         );
         assert.equal(clientEnvs.length, 1, "goose client spawned exactly once");
         const seenEnv = clientEnvs[0]!;
@@ -5572,7 +5956,7 @@ test("runLaunch goose: custom provider rides the regenerated GOOSE_PATH_ROOT ove
             if (v === undefined) delete process.env[k];
             else process.env[k] = v;
         }
-        fs.rmSync(home, { recursive: true, force: true });
+        rmrf(home);
     }
 });
 
@@ -5627,15 +6011,109 @@ test("attach diagnostics record a fingerprint-mismatch skip (#1623)", async () =
 
 test("attach diagnostics record a lifecycle-gate refusal (#1623)", async () => {
     const diag: string[] = [];
+    // #1660: an unarmed instance WITHOUT a lane is a user-zone manual start
+    // and attaches by default — the refusal path needs a lane'd one.
     const inst = await findLiveAttachableInstance(
         { host: "127.0.0.1", port: 0, passthrough: false, debug: false },
         {
             fetchHealthInfo: async () => ({ ok: true, instanceId: "inst-1" }),
-            readInstanceFile: () => recordedInstance(),
+            readInstanceFile: () => recordedInstance({ lane: "zcode" }),
             attachDiag: (m) => diag.push(m),
             scriptPath: FP_SCRIPT,
         },
     );
     assert.equal(inst, undefined);
     assert.ok(diag.some((m) => m.includes("refusing to attach")), `diag was: ${JSON.stringify(diag)}`);
+});
+
+// #1753: the spawn-wait fallback must verify the healthy responder on the
+// preferred port is the child WE spawned. A foreign proxy squats the preferred
+// port (that is exactly why our child laddered away); trusting "healthy" alone
+// exports the client to an instance the attach gate (#1225) would have rejected.
+test("ensureProxyRunning: a healthy squatter on the preferred port is not mistaken for the spawned child (#1753)", async () => {
+    const child = makeFakeChild(42451);
+    const spawned: string[] = [];
+    let childToken = "";
+    const spawnImpl: SpawnFn = (_cmd, args, options) => {
+        spawned.push(...args);
+        childToken = options.env?.BILI_LAUNCH_TOKEN ?? "";
+        return child;
+    };
+    let recorded = false;
+    const settled: Array<[string | undefined, number]> = [];
+    const handle = await ensureProxyRunning(
+        { host: "127.0.0.1", port: 18787, passthrough: false, debug: false },
+        {
+            // The preferred port answers health — but with a FOREIGN pid.
+            fetchImpl: async () => ({ ok: true }),
+            fetchHealthInfo: async (origin) => ({
+                ok: true,
+                pid: origin.endsWith(":18787") ? 875250 : 42451,
+            }),
+            spawnImpl,
+            sleep: () => {
+                return Promise.resolve();
+            },
+            // After the first squatter probe, the child's laddered record appears.
+            readInstanceFile: () =>
+                recorded
+                    ? recordedInstance({ origin: "http://127.0.0.1:18790", port: 18790, pid: 42451, launchToken: childToken })
+                    : undefined,
+            now: (() => {
+                let ticks = 0;
+                return () => {
+                    if (++ticks === 2) recorded = true;
+                    return ticks * 100;
+                };
+            })(),
+            writeZonePort: (lane, port) => {
+                settled.push([lane, port]);
+            },
+        },
+    );
+    assert.equal(handle.origin, "http://127.0.0.1:18790", "client is exported to the child's real (laddered) origin");
+    assert.equal(handle.port, 18790);
+    // Fixed-port launches never settle sticky themselves (#1660 settles lane'd
+    // ephemerals; the child side drifts the zone record on its own boot).
+    assert.deepEqual(settled, [], "the squatter's port is never settled sticky");
+});
+
+test("ensureProxyRunning: the fallback still accepts the preferred port when the responder IS the spawned child (#1753)", async () => {
+    // Legacy/broken-state-dir child that never writes an instance record but
+    // does answer health — and the health pid matches the spawned child.
+    const spawnImpl: SpawnFn = () => makeFakeChild(42452);
+    const handle = await ensureProxyRunning(
+        { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
+        {
+            fetchImpl: async () => ({ ok: true }),
+            fetchHealthInfo: async () => ({ ok: true, pid: 42452 }),
+            spawnImpl,
+            sleep: () => Promise.resolve(),
+            readInstanceFile: () => undefined,
+        },
+    );
+    assert.equal(handle.origin, `http://127.0.0.1:8787`);
+    assert.equal(handle.port, 8787);
+});
+
+test("ensureProxyRunning: a squatter without a matching child record ends in a loud failure, not a silent misroute (#1753)", async () => {
+    const spawnImpl: SpawnFn = () => makeFakeChild(42453);
+    let ticks = 0;
+    await assert.rejects(
+        ensureProxyRunning(
+            { host: "127.0.0.1", port: 8787, passthrough: false, debug: false },
+            {
+                fetchImpl: async () => ({ ok: true }),
+                fetchHealthInfo: async () => ({ ok: true, pid: 875250 }),
+                spawnImpl,
+                now: () => ticks * 1000,
+                sleep: () => {
+                    ticks += 10;
+                    return Promise.resolve();
+                },
+                readInstanceFile: () => undefined,
+            },
+        ),
+        /did not become healthy/,
+    );
 });
