@@ -48,7 +48,7 @@ import {
     subagentNamespace,
 } from "acp-kernel/wire";
 import { responsesToCoreWithToolImages as responsesToCore, patchResponsesInputWithToolImages as patchResponsesInput, mergeAdjacentConfigurationUpdates } from "./responses-tool-output.js";
-import { diagnoseSuccessWithoutUsage, getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive, detectUnannouncedHistoryRewrite, markCompactionBoundary, storeEffectiveConfig, foldCoverage, REWRITE_MIN_INCOMING_TOTAL } from "./session.js";
+import { diagnoseSuccessWithoutUsage, getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, withSessionLock, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive, detectUnannouncedHistoryRewrite, markCompactionBoundary, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, REWRITE_MIN_INCOMING_TOTAL } from "./session.js";
 import { detectStaleInstall } from "./update.js";
 import { getAdvisoryState, cannotResolveTarget } from "./advisory.js";
 import { PACKAGE_NAME, VERSION } from "./version.js";
@@ -2615,6 +2615,9 @@ async function handle(
                 overflowWindow?: number,
             ): Promise<{ body: string | Buffer; prepared: Prepared | null } | null> => {
                 const runPrepare = async (): Promise<Prepared> => {
+                    // #1820: this prepare consumes one unit of post-rebuild anchor
+                    // validity (the last one deletes it — see session.ts).
+                    tickPostRebuildAnchor(session);
                     const cs = resolveCompress(opts.routes, route?.rewrittenUrl, requestModel, opts.compress);
                     // #1279: stamp this request's effective cache-economics price
                     // profile on the session so request-context-free report faces
@@ -3178,6 +3181,17 @@ function effectiveTokenCount(session: Session, msgs: CoreMessage[], inboundImage
     // Fall through to the per-turn local measurements, which track the actual
     // outbound view (post-fold normally, raw when the transform failed).
     if (session.stats.lastInputTokens > 0 && session.stats.lastInputTokensSource === "usage") return session.stats.lastInputTokens;
+    // #1820: right after a preflight rebuild the usage-grade baseline above is
+    // momentarily absent (the rebuild request's own report hasn't landed yet,
+    // or the upstream never reports), and every branch below sizes on the
+    // INCOMING RAW history — the very mass the rebuild just folded away —
+    // inflating the meter ~3.4× (char-count upper bound) and firing a phantom
+    // EMERGENCY nudge into an already-at-window context. Decide against the
+    // rebuilt payload's measured size instead (same quantity the preflight fit
+    // gate checked); setPostRebuildAnchor bounds the lifetime so never-
+    // reporting upstreams fall back to legacy sizing rather than a frozen meter.
+    const anchored = postRebuildAnchorTokens(session);
+    if (anchored > 0) return anchored;
     const raw = estimateCoreMessagesUpper(msgs) + inboundImageTokens;
     if (session.metadata.anonymousPrefixAffinity) return raw;
     const est = session.stats.localInputEstimate ?? 0;
@@ -5216,9 +5230,18 @@ async function preflightCompressIfNeeded(
         // runPrepare re-incremented stats.requests; the rebuild is internal
         // to this single client request.
         session.stats.requests -= 1;
-        const fits = unknownBaseline
-            ? result.fitsWindow
-            : estimateCoreMessages(rebuilt.processedMessages) + overheadEstimate + imageTokens < limit;
+        // Same measurement the fit gate below uses — the view that actually
+        // goes out (processedMessages empty ⇒ kernel transform failure ⇒ the
+        // raw body rides; mirror outboundPayloadBreakdown's fallback).
+        const rebuiltMsgs = rebuilt.processedMessages.length > 0 ? rebuilt.processedMessages : rebuilt.originalMessages;
+        const rebuiltSize = estimateCoreMessages(rebuiltMsgs) + overheadEstimate + imageTokens;
+        const fits = unknownBaseline ? result.fitsWindow : rebuiltSize < limit;
+        // #1820: anchor the meter to the rebuilt payload's measured size — the
+        // rebuild request's own usage report (the only sample that can supersede
+        // this) hasn't landed yet, and the meter's fallback branches would size
+        // on the incoming raw history, firing a phantom EMERGENCY nudge into an
+        // already-at-window context. Lifetime is bounded (see session.ts).
+        setPostRebuildAnchor(session, rebuiltSize);
         if (fits) return rebuilt;
     } else if (unknownBaseline
         ? result.fitsWindow

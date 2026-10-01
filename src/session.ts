@@ -373,6 +373,52 @@ export function diagnoseSuccessWithoutUsage(session: Session, wire: string): voi
     loggerLog("warn", `[${session.id}] [${wire}] upstream success without usage report — keeping lastInputTokens=${session.stats.lastInputTokens} (source=${session.stats.lastInputTokensSource ?? "none"}); nudge decisions ride local estimates until a usage-grade sample lands (#1595)`);
 }
 
+// #1820: post-rebuild meter anchor. Right after a big preflight rebuild the
+// usage-grade baseline is momentarily absent (the rebuild request's own report
+// hasn't landed yet, or the upstream never reports one), so effectiveTokenCount
+// falls through to branches that size on the INCOMING RAW history — the very
+// mass the rebuild just folded away — inflating the meter ~3.4× (char-count
+// upper bound) and firing a phantom EMERGENCY nudge into an already-at-window
+// context. The rebuilt payload's measured size (the same quantity the preflight
+// fit gate checked) is stamped here and consumed by the meter for a bounded
+// number of prepares: a real usage-grade sample supersedes it immediately
+// (settleUsageReport clears it), and when no sample ever comes the counter
+// runs out and legacy sizing resumes instead of freezing the meter.
+const POST_REBUILD_ANCHOR_PREPARES = 3;
+
+export function setPostRebuildAnchor(session: Session, tokens: number): void {
+    if (!Number.isFinite(tokens) || tokens <= 0) return;
+    session.metadata["postRebuildAnchor"] = { tokens, remainingPrepares: POST_REBUILD_ANCHOR_PREPARES };
+    markDirty(session);
+}
+
+/** Metadata is persisted user-editable JSON — re-validate on read; a corrupt
+ *  stamp degrades to "no anchor" (legacy sizing) instead of poisoning the meter. */
+export function postRebuildAnchorTokens(session: Session | undefined): number {
+    const a = session?.metadata?.["postRebuildAnchor"];
+    if (!a || typeof a !== "object") return 0;
+    const t = (a as Record<string, unknown>).tokens;
+    return typeof t === "number" && Number.isFinite(t) && t > 0 ? t : 0;
+}
+
+/** One prepare consumed. The last one deletes the anchor so never-reporting
+ *  upstreams fall back to legacy per-turn sizing. */
+export function tickPostRebuildAnchor(session: Session): void {
+    const a = session.metadata?.["postRebuildAnchor"];
+    if (!a || typeof a !== "object") return;
+    const o = a as Record<string, unknown>;
+    const rem = typeof o.remainingPrepares === "number" ? o.remainingPrepares - 1 : 0;
+    if (rem <= 0) delete session.metadata["postRebuildAnchor"];
+    else o.remainingPrepares = rem;
+    markDirty(session);
+}
+
+export function clearPostRebuildAnchor(session: Session): void {
+    if (session.metadata?.["postRebuildAnchor"] === undefined) return;
+    delete session.metadata["postRebuildAnchor"];
+    markDirty(session);
+}
+
 const sessions = new Map<string, Session>();
 
 // `|| 256` only catches falsy (0/NaN); Math.max(1, ...) also rejects negatives.
@@ -645,6 +691,8 @@ export function resetSessionCompression(session: Session): void {
     // #1569: pre-compaction billing evidence describes a payload lineage that
     // no longer exists — fall back to legacy sizing until a fresh report lands.
     delete session.stats.lastUsageGradeTokens;
+    // #1820: same lineage argument — the anchored rebuilt payload is gone too.
+    delete session.metadata.postRebuildAnchor;
     session.stats.contextTokens = 0;
     session.metadata.nativeCompactionAt = Date.now();
     markDirty(session);
