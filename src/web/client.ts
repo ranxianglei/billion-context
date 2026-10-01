@@ -228,6 +228,23 @@ export const WEB_CLIENT = `(function () {
             if (!silent) toast(t("toast.failed", { msg: e.message }), "err");
         }
     }
+    // #1830: name the conflicting third-party plugin(s) from the conflict details
+    // already served per session; short form strips "(source)", keeps [suspected];
+    // deduped + weighted by session count, heaviest first. No new i18n/config/payload.
+    function conflictNames(c) {
+        const latest = Array.isArray(c.latest) ? c.latest : [];
+        const counts = {};
+        for (const e of latest) {
+            if (!e || e.kind !== "third-party-plugin" || typeof e.detail !== "string") continue;
+            const s = e.detail;
+            const open = s.indexOf(" (");
+            const close = open > -1 ? s.indexOf(")", open) : -1;
+            const name = (close > open ? s.slice(0, open) + s.slice(close + 1) : s).trim();
+            if (!name) continue;
+            counts[name] = (counts[name] || 0) + 1;
+        }
+        return Object.entries(counts).sort((a, b) => b[1] - a[1]);
+    }
     function renderBanners(d) {
         const stale = $("stale-banner");
         if (d.stale) {
@@ -256,7 +273,14 @@ export const WEB_CLIENT = `(function () {
                 cb.hidden = false;
                 cb.classList.add("show");
                 const kinds = Object.entries(c.kinds || {}).map((kv) => kv[0] + "×" + kv[1]).join(", ");
-                cb.innerHTML = '<strong>' + t("conflict.on") + "</strong> " + t("conflict.desc") + '<span class="mono"> (' + c.events + " event(s) in " + c.sessions + " session(s): " + kinds + ")</span>";
+                const names = conflictNames(c);
+                let tail = "";
+                if (names.length) {
+                    const shown = names.slice(0, 5);
+                    const extra = names.length - shown.length;
+                    tail = " — " + shown.map((kv) => escapeHtml(kv[0]) + (kv[1] > 1 ? "×" + kv[1] : "")).join(" · ") + (extra > 0 ? " +" + extra + " more" : "");
+                }
+                cb.innerHTML = '<strong>' + t("conflict.on") + "</strong> " + t("conflict.desc") + '<span class="mono"> (' + c.events + " event(s) in " + c.sessions + " session(s): " + kinds + tail + ")</span>";
             } else {
                 cb.hidden = true;
                 cb.classList.remove("show");
