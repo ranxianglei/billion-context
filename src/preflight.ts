@@ -44,6 +44,21 @@ const MAX_SUMMARY_OUTPUT_TOKENS = 32768;
 // #574: bound on upstream summarization calls per invocation — the multi-range
 // walk can otherwise spend a call per viable range in a block-dense history.
 export const MAX_SUMMARY_CALLS_PER_PREFLIGHT = 16;
+// #1819: net-shrink monotonicity tolerance for fold acceptance. A weak
+// summarizer can regurgitate a verbose re-narration that EXCEEDS its own
+// range: the flat maxSummaryLength cap bounds absolute size only, so such a
+// summary was accepted as a successful fold and the rebuild landed LARGER
+// than the preflight input (越压越大 — minutes of latency, re-firing rounds,
+// misleading "tokens saved" telemetry). The acceptance gate compares the
+// candidate's mass against the span's mass in the SAME units this loop's
+// post-fold accounting uses (token regime: the kernel's credit for the span;
+// char regime: raw-char mass), so a passing fold always nets a shrink under
+// that accounting. The slack covers O(1) tag/wrapper overhead and estimator
+// noise between the two sides; regurgitation (typically ≥2x) is rejected
+// decisively either way. Folds whose summary merely fails to shrink by more
+// than the slack are rejected too — they buy nothing but block-management
+// cost, and the halving path routes the budget to smaller material.
+export const NET_SHRINK_TOLERANCE = 1.05;
 // #1767: bounded same-span retries for TRANSIENT empty summaries — HTTP 200
 // with no text (finish_reason=content_filter, truncated streams, empty bodies).
 // Distinct from the #726 halving cascade, which assumes the empty answer is
@@ -1128,7 +1143,21 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                         // attempt and its failure log — route it through the same
                         // halving/skip path as any unusable output.
                         if (activeConfig.compress.maxSummaryLength <= 0 || candidate.length <= activeConfig.compress.maxSummaryLength) {
-                            summary = candidate;
+                            // #1819: net-shrink monotonicity (NET_SHRINK_TOLERANCE) — same
+                            // units as the post-fold accounting below: token regime takes
+                            // the kernel's credit for this span, char regime the raw-char
+                            // mass of the folded messages. A regurgitated summary that
+                            // exceeds its range routes through the halving/skip path like
+                            // any other unusable output instead of inflating the payload.
+                            const spanUnits = baselineKnown
+                                ? planned.compressedTokens
+                                : messages.filter((message) => planned.effectiveMessageIds.includes(message.id)).reduce((total, message) => total + (message.text ?? "").length, 0);
+                            const candidateUnits = countText(candidate);
+                            if (candidateUnits <= spanUnits * NET_SHRINK_TOLERANCE) {
+                                summary = candidate;
+                            } else {
+                                outcome = { unusable: `assembled summary (~${candidateUnits} units) does not shrink its range (~${spanUnits} units) — suspected regurgitation` };
+                            }
                         } else {
                             outcome = { unusable: `assembled summary (${candidate.length} chars) exceeds maxSummaryLength (${activeConfig.compress.maxSummaryLength})` };
                         }
