@@ -193,7 +193,7 @@ bili claude                           # 拉起 claude
 bili omp                              # pi 同款,file-free(#535):环境变量 + 扩展 registerProvider + 压缩取消,真实 ~/.omp 不动
 bili opencode                         # OpenCode(1.x 与 2.x):完整指南见下文 [OpenCode](CLIENTS.zh-CN.md#opencode) 一节
 bili hermes                           # file-free(#535):hermes 代理环境变量(HTTPS_PROXY + SSL_CERT_FILE 组合 CA bundle)—— https 走 CONNECT MITM,http 走绝对形式转发;真实 ~/.hermes 不动
-bili dsh                              # deepseek-harness:经 --patch 注入完整原生插件(#941) —— 真实 dsh 工具、会话绑定 /acp(plugin 模式);非回环上游走代理 env,回环保留 overlay DSH_HOME 改写(#535);dsh 自动压缩关(web profile 除外——preset 内实例无法经 patch 触及,#1772)
+bili dsh                              # deepseek-harness:经 --patch 注入完整原生插件(#941) —— 真实 dsh 工具、会话绑定 /acp(plugin 模式);非回环上游走代理 env,回环保留 overlay DSH_HOME 改写(#535);dsh 自动压缩关(web profile 换预设即可,#1772 配方见 CLIENTS.zh-CN.md)
 bili codebuddy                        # Tencent CodeBuddy Code CLI:CODEBUDDY_BASE_URL /bili/ 重写(OpenAI chat completions wire),预算对齐走 CODEBUDDY_AUTO_COMPACT_WINDOW;真实 ~/.codebuddy 不动
 bili qoder                            # qoder:模型端点硬编码 https(无法 /bili/ 改写)—— 证书 MITM(HTTPS_PROXY + NODE_EXTRA_CA_CERTS),默认模型主机已加白名单(#653)
 bili trae                             # Trae CLI(字节跳动,闭源 Go 二进制,无 base-URL 覆盖)—— 证书 MITM(HTTPS_PROXY + SSL_CERT_FILE),模型主机取 TRAE_CLI_API_HOST 或默认企业网关(#655)

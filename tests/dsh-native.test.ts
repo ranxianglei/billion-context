@@ -781,6 +781,8 @@ test("#1772 apply(): web-profile compaction caveat warns once in the durable log
             apply(ctx);
             assert.equal(warnLines().length, 1);
             assert.match(warnLines()[0], /#1772/);
+            // the warning points at the remedy, not a dead end
+            assert.match(warnLines()[0], /preset whose compaction-basic sets auto:false/);
 
             // once-per-process: a later apply with the same profile adds nothing
             const again = mockCtx();

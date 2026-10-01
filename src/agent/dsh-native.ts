@@ -767,7 +767,7 @@ export function apply(ctx: PluginContext): void {
         }
         if (bundles !== undefined && bundles.includes("@deepseek-ai/dsh-web-app")) {
             webProfileWarned = true;
-            persistClientEvent("profile bundles include @deepseek-ai/dsh-web-app — its agent presets run their own compaction-basic where the bundle patch cannot set auto:false (#1772); dsh native auto-compaction stays enabled in this profile (ACP compression unaffected)");
+            persistClientEvent("profile bundles include @deepseek-ai/dsh-web-app — its agent presets run their own compaction-basic where the bundle patch cannot set auto:false (#1772); dsh native auto-compaction stays on for this profile until you switch to a preset whose compaction-basic sets auto:false (recipe: CLIENTS.md, DeepSeek Harness section; ACP compression unaffected)");
         }
     }
 

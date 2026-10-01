@@ -88,6 +88,25 @@ Two lanes, same plugin (#941):
    already-disabled host-plane row and the preset instance keeps
    auto-compaction ON. The plugin logs a one-time `[dsh-client]` warning at
    boot in such profiles; ACP compression is unaffected.
+ - **Turning it off anyway (#1772 recipe):** dsh's preset roster carries a
+   user root (`$DSH_HOME/.agent-presets/`) that the Web UI's preset picker
+   already writes to — Settings → General → agent preset → *Duplicate* the
+   `standard` preset, then edit the copy's `agent.cordis.yml`: under the
+   `compaction` group give the `compaction-basic` row `config: { auto: false }`
+   (keeps manual `/compact` and the tool-result pruner), and select the copy
+   as the default. Same effect without the UI: copy the shipped preset
+   directory (`presets/standard/` inside the installed
+   `@deepseek-ai/dsh-agent-presets` package — both `preset.yml` and
+   `agent.cordis.yml`), apply the one-line edit, and set the default by
+   writing the settings document the picker uses (`agent-presets:` →
+   `default: <copy-id>`) or by picking the copy in the UI. Verified against
+   dsh 0.2.0-rc.2: the copy parses under the loader's own `entryListSchema`,
+   `compaction-basic` honors `auto: false` (it only registers automatic
+   compaction `if (this.config.auto)`), and preset rows resolve
+   `@deepseek-ai/*` packages from the installed harness. Caveats: a user
+   preset id must differ from shipped ids (the shipped root shadows
+   duplicates), the copy is a snapshot — re-apply the edit after dsh upgrades
+   its presets — and sessions created before the switch keep the old preset.
 
 Under a `bili dsh` launch the plugin ATTACHES to the launcher's proxy (no
 second spawn). Raw upstream URLs rewrite to `<proxy>/bili/<url>` like
