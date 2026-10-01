@@ -141,7 +141,7 @@ test("#574 regression: oldest range's summary unusable → preflight moves to th
     }
 });
 
-test("#574 truthful exhaustion: every range's summary unusable → 502 only after all ranges tried, no forward, no blocks", async () => {
+test("#574 truthful exhaustion: every range's summary unusable → honest 502 (full walk or provably-futile bail), no forward, no blocks", async () => {
     const { server: upstream, calls } = makeUpstream(() => false);
     upstream.listen(0, "127.0.0.1");
     await once(upstream, "listening");
@@ -161,10 +161,13 @@ test("#574 truthful exhaustion: every range's summary unusable → 502 only afte
         const json = JSON.parse(await r.text()) as { error?: { code?: string; retryable?: boolean; message?: string } };
         assert.equal(json.error?.code, "preflight_compress_failed");
         assert.equal(json.error?.retryable, false);
-        assert.match(json.error?.message ?? "", /no range could be compressed/i, `exhaustion names the multi-range attempt (got: ${json.error?.message})`);
+        // #1841: the verdict may now be the futility bail (provably cannot
+        // close the gap → stop early with a quantified detail) instead of the
+        // full walk-to-end exhaustion — both are honest, neither claims success.
+        assert.match(json.error?.message ?? "", /(futile round|no range could be compressed)/i, `exhaustion names the multi-range attempt (got: ${json.error?.message})`);
 
         const summaryCalls = calls.filter((c) => !c.stream);
-        assert.ok(summaryCalls.length >= 2, `every viable range was tried, not just the first (got ${summaryCalls.length}; legacy made exactly 1)`);
+        assert.ok(summaryCalls.length >= 2, `preflight moved past the bad oldest range before stopping (got ${summaryCalls.length}; legacy made exactly 1)`);
         assert.equal(calls.filter((c) => c.stream).length, 0, "the over-window payload was NOT forwarded");
 
         const s = listSessions()[0];
@@ -192,7 +195,13 @@ test("#574 budget cap: many unusable ranges → exactly MAX_SUMMARY_CALLS_PER_PR
         const r = await fetch(`http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/messages`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-acp-session": "multi-range-budget-sess" },
-            body: JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: conversation(48) }),
+            // #1841 sizing: 192 messages = 48 ranges × ~5K tokens each. Every
+            // failing range costs 2 summary calls (whole + minimum size), so the
+            // 16-call cap fires during the 8th failed range — while the
+            // mid-walk futility bail threshold only lands at the 10th. The cap
+            // therefore stays the binding bound and keeps its dedicated pin;
+            // smaller payloads now bail out as provably futile first.
+            body: JSON.stringify({ model: "claude-small", max_tokens: 1024, stream: true, messages: conversation(192) }),
         });
         assert.equal(r.status, 502, "still over-window after the budget → fail-fast 502");
         const json = JSON.parse(await r.text()) as { error?: { code?: string; retryable?: boolean; message?: string } };
