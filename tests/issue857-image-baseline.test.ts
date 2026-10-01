@@ -21,6 +21,9 @@ import { listSessions } from "../src/session.ts";
 //
 // Fix under test (still load-bearing after #987 removed the window learner):
 //   C1 preflight write-back persists text+overhead only (image floor excluded)
+//      — note: since the #1841 futility gate, a doomed image-over-window round
+//      is skipped BEFORE any fold, so C1's write-back (which only runs when a
+//      round folds ≥1 range) is no longer exercised by scenario C below.
 //   C2 stats.lastInputTokensSource tags every baseline raise ("usage"|"estimate")
 //   C4 #496 hatch: an untrusted (estimate-derived / legacy-unmarked) baseline
 //      is not overflow evidence — only usage-grounded evidence closes it
@@ -205,7 +208,7 @@ test("#857 B: genuine overflow evidence (learned limit == configured window) sti
     }
 });
 
-test("#857 C: usage-grounded over-window baseline — hatch stays closed AND the fold write-back cannot re-poison the baseline with the image floor", async () => {
+test("#857 C: usage-grounded over-window baseline — hatch stays closed AND the #1841 futility skip leaves the baseline untouched", async () => {
     const { server: upstream, port: uport, stats } = await startMockUpstream();
     // No route model entry: the window is a pure fallback, so the upward
     // self-heal (which requires nativeFromFallback) can confirm it.
@@ -225,17 +228,28 @@ test("#857 C: usage-grounded over-window baseline — hatch stays closed AND the
         s.stats.lastInputTokens = FAKE_CONFIRMED;
         s.stats.lastInputTokensSource = "usage";
 
-        // Filler history gives the kernel foldable ranges so the write-back
-        // path (C1) actually runs during the exhausted preflight.
+        // Filler history gives the kernel foldable candidates. Under the #1841
+        // futility gate this round is provably doomed BEFORE any walk — the
+        // image floor alone (~1.1M) exceeds the window (~999K) while the whole
+        // foldable pool (~4.4K of filler) cannot close the ~110K gap — so the
+        // round is skipped with zero summarization calls: exactly the waste
+        // #1841 removes (old code walked both ranges, burned the calls, and
+        // still failed here).
         const r2 = await fetch(url, { method: "POST", headers, body: body(FALLBACK_MODEL, "s857c", [...fillerHistory(16), ...imageInput()]) });
         assert.equal(r2.status, 502, "usage evidence keeps the hatch closed");
-        await r2.text();
+        const err2 = JSON.parse(await r2.text()) as { error?: { code?: string; message?: string } };
+        assert.equal(err2.error?.code, "preflight_compress_failed");
+        assert.match(err2.error?.message ?? "", /futile round/, `the skipped round names its futility verdict (got: ${err2.error?.message})`);
+        assert.match(err2.error?.message ?? "", /Images alone account for/, "the image remedy wording survives the futility verdict");
         assert.equal(stats.streamingForwards, 1);
-        assert.ok(stats.summaryCalls > 0, "ranges were folded (write-back path exercised)");
+        assert.equal(stats.summaryCalls, 0, "#1841: a provably futile round spends zero summarization calls");
 
+        // No fold ran, so nothing in the turn may touch the baseline: the armed
+        // usage value stays exactly where the test put it (far below the image
+        // floor — nothing to re-poison) with its grounded provenance intact.
         const after = sess("s857c");
-        assert.ok(after.stats.lastInputTokens < WINDOW + 100_000, `baseline not re-poisoned by the image floor (got ${after.stats.lastInputTokens})`);
-        assert.equal(after.stats.lastInputTokensSource, "usage", "grounded provenance preserved across the fold");
+        assert.equal(after.stats.lastInputTokens, FAKE_CONFIRMED, "skipped round leaves the baseline untouched");
+        assert.equal(after.stats.lastInputTokensSource, "usage", "grounded provenance preserved");
         assert.equal(confirmedOf("s857c"), undefined, "#987: no window is ever learned from session traffic");
     } finally {
         upstream.close();
