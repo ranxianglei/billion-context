@@ -478,6 +478,32 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         // #1718: log copy mirrors the receipt but swaps each fingerprint line
         // for its length-only form — summary excerpts must not reach bili.log.
         let logMsg = msg;
+        // #1819: honest output — r.tokensCompressed is the REMOVED mass; the new
+        // summaries re-enter the payload, so the line above can claim "saved"
+        // while the fold actually grew context (weak-model regurgitation on the
+        // model-driven path). Net per touched block: new blocks remove their
+        // compressedTokens and add their summary mass; refolds swap old summary
+        // mass for new. The base line stays intact — core.ts parses
+        // `~N tokens saved` out of it — so the correction appends after it.
+        let netDelta = 0;
+        let touchedBlocks = 0;
+        for (const b of res.state.blocks) {
+            const prev = beforeSummaries.get(b.blockId);
+            if (prev === undefined) {
+                touchedBlocks += 1;
+                netDelta += b.compressedTokens - defaultCountTokens(b.summary);
+            } else if (prev !== b.summary) {
+                touchedBlocks += 1;
+                netDelta += defaultCountTokens(prev) - defaultCountTokens(b.summary);
+            }
+        }
+        if (touchedBlocks > 0 && netDelta <= 0) {
+            const netNote = netDelta < 0
+                ? `[Net context change: +${-netDelta} tokens — the new summary is larger than what it replaced; this fold grew the context instead of shrinking it.]`
+                : `[No net shrink: the new summary costs about as much as what it replaced; this fold left the context size unchanged.]`;
+            msg += netNote;
+            logMsg += netNote;
+        }
         // #1494: a partial fold must not read as a clean success — surface the
         // parse-dropped entries (and log them server-side) so the model
         // re-issues the rejected range instead of believing it folded.

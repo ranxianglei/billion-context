@@ -45,7 +45,10 @@ async function runCoveredRange(protectLatest = false, pairBoundary = false, unkn
             res.setHeader("content-type", "application/json");
             // #726 made each range one atomic assembly, so a failed segment
             // discards the whole range — model that by failing every call
-            // whose content carries the large result.
+            // whose content carries the large result. #1775: for "over-limit"
+            // the server models a summarizer that ignores the length budget —
+            // every call returns the full 163-char SUMMARY, so the two-chunk
+            // large-result assembly (328 chars) exceeds the 200-char cap.
             res.end(JSON.stringify({ output_text: segmentFailure === "missing" && content.includes("LATEST_LARGE") ? "" : SUMMARY }));
         });
     });
@@ -98,13 +101,23 @@ test("unknown-baseline preflight relaxes protection using the conservative upper
 });
 
 
-for (const failure of ["missing", "over-limit"] as const) {
-    test(`preflight does not apply an incomplete segmented summary (${failure})`, async () => {
-        const { result, session } = await runCoveredRange(false, true, false, failure);
-        assert.equal(result.fitsWindow, false);
-        assert.ok(session.state.blocks.filter((block) => block.active).every((block) => !block.effectiveMessageIds.includes("large-result")), "the original tool result remains available when any summary part is missing or too long");
-    });
-}
+test("preflight does not apply a segmented summary with a missing part", async () => {
+    const { result, session } = await runCoveredRange(false, true, false, "missing");
+    assert.equal(result.fitsWindow, false);
+    assert.ok(session.state.blocks.filter((block) => block.active).every((block) => !block.effectiveMessageIds.includes("large-result")), "the original tool result remains available when a summary part is missing");
+});
+
+// #1775: an assembly that exceeds maxSummaryLength but is still shorter than the folded content is now
+// truncated to the cap (with a marker) and folded — the old behavior discarded the whole range after the
+// halving retries, which cannot help on tool-dense spans (summary length does not scale with input size).
+test("preflight rescues an over-limit segmented summary by truncating it to the cap", async () => {
+    const { result, session } = await runCoveredRange(false, true, false, "over-limit");
+    assert.equal(result.fitsWindow, true, JSON.stringify(result));
+    const folded = session.state.blocks.find((block) => block.active && block.effectiveMessageIds.includes("large-result"));
+    assert.ok(folded, "the tool result is folded with its truncated summary");
+    assert.ok(folded!.summary.length <= 200, `rescued summary stays within maxSummaryLength (got ${folded!.summary.length})`);
+    assert.ok(folded!.summary.endsWith("[truncated]"), folded!.summary);
+});
 
 for (const limit of [0, -1]) {
     test(`preflight accepts unlimited summary length (${limit})`, async () => {

@@ -11,7 +11,7 @@ import {
     type PriceProfile,
 } from "acp-kernel";
 import { log as loggerLog } from "./logger.js";
-import { reanchorNudgeOnUsageDrop, type Session } from "./session.js";
+import { clearPostRebuildAnchor, reanchorNudgeOnUsageDrop, type Session } from "./session.js";
 
 // Render window for handleAcpCache's detail:"full" text view (#1489). The
 // ledger itself is unbounded — this only bounds how many lines the text
@@ -501,6 +501,9 @@ export function settleUsageReport(
         // compaction boundaries via resetSessionCompression (session.ts).
         session.stats.lastUsageGradeTokens = session.stats.lastInputTokens;
         session.stats.lastInputTokensSource = "usage";
+        // #1820: a real usage-grade sample supersedes the post-rebuild meter
+        // anchor immediately — no need to wait out its prepare budget.
+        clearPostRebuildAnchor(session);
         // #1110: a real usage report retires the one-shot overflow arm.
         delete session.stats.overflowArmTokens;
         // #1595: a real report landing far below a stale-high nudge reference
