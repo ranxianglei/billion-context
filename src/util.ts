@@ -357,14 +357,17 @@ export function hardenOpenaiAssistantContent<T extends { role: string }>(message
 }
 
 /**
- * Whether the OUTPUT budget should be reserved from the context window at all.
- * Anthropic's Messages API enforces the input limit INDEPENDENTLY of
- * max_tokens (the output budget is separate — input up to the window works
- * with any max_tokens), so reserving it would shift the nudge/truncate bands
- * down by maxOutput on every session with no safety gain. The OpenAI-family
- * APIs count output against the window, so the reservation is only needed
- * there. Unknown/other protocols reserve (conservative — a missed reservation
- * at worst overflows once and the self-heal corrects it).
+ * Whether the OUTPUT budget should be reserved PROACTIVELY from the context
+ * window at all. Anthropic counts max_tokens against the window too (it 400s
+ * when input_tokens + max_tokens exceeds it — #1908), yet stays exempt here:
+ * its overflow is covered at forward time by the outgoing clamp
+ * (clampOutgoingOutput, #453/#1908), while reserving would additionally shift
+ * the nudge/truncate bands down by maxOutput on every anthropic session —
+ * whether that earlier compression cadence is worth it is an open product
+ * decision (#1908). The OpenAI-family APIs count output against the window and
+ * keep the proactive reservation. Unknown/other protocols reserve
+ * (conservative — a missed reservation at worst overflows once and the
+ * self-heal corrects it).
  */
 export function shouldReserveOutputHeadroom(protocol: string | undefined): boolean {
     return protocol !== "anthropic";

@@ -62,6 +62,21 @@ test("WC-012 validates compaction IDs without changing function-call ID rules", 
     assert.match(VALIDATORS.responses({ input: [{ type: "compaction", id: "fc_bili_local" }] })[0], /WC-012/);
 });
 
+test("WC-014: strict anthropic upstream rejects input+max_tokens overflow, accepts a fitting budget", async () => {
+    const fake = await startFakeUpstream("anthropic", { window: 200_000 });
+    try {
+        const base = { model: "claude-test", stream: false, messages: [{ role: "user", content: "x".repeat(640_000) }] };
+        const over = await fetch(`${fake.url}/v1/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...base, max_tokens: 60_000 }) });
+        assert.equal(over.status, 400);
+        assert.match(await over.text(), /WC-014/);
+        const fits = await fetch(`${fake.url}/v1/messages`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...base, max_tokens: 20_000 }) });
+        assert.equal(fits.status, 200);
+        assert.equal(fake.violations.filter((v) => v.startsWith("WC-014")).length, 1);
+    } finally {
+        await fake.close();
+    }
+});
+
 function syntheticBody(wire: Wire, tool: unknown): Record<string, unknown> {
     if (wire === "google") return { tools: [{ functionDeclarations: [tool] }] };
     return { tools: [tool] };
@@ -103,6 +118,8 @@ test("wire-contract ledger: every rule has a live enforcement clause", () => {
                 tools: [{ name: "t", input_schema: { type: "object", properties: {} }, cache_control: { type: "ephemeral" } }],
                 messages: [1, 2, 3].map((i) => ({ role: "user", content: [{ type: "text", text: `x${i}`, cache_control: { type: "ephemeral" } }] })),
             },
+            // WC-014: 640k chars ≈ 160k tokens; + 60k max_tokens overflows the 200k probe window.
+            { model: "m", max_tokens: 60_000, messages: [{ role: "user", content: "x".repeat(640_000) }] },
         ],
         "openai-chat": [
             { model: "gemini-synthetic", tools: [{ type: "function", function: { name: "compress", parameters: { type: "object", properties: { content: { type: ["array", "string"] } } } } }] },
@@ -123,9 +140,12 @@ test("wire-contract ledger: every rule has a live enforcement clause", () => {
             { tools: [{ functionDeclarations: [{ name: "ok", parameters: { anyOf: [] } }] }] },
         ],
     };
+    // Size-budget rules need model metadata: declare the anthropic window so
+    // WC-014's clause is live in these probes (other wires ignore the field).
+    const probeCtx: Partial<Record<Wire, { window?: number }>> = { anthropic: { window: 200_000 } };
     for (const rule of WIRE_RULES) {
         const enforced = probes[rule.wire].some((body) =>
-            VALIDATORS[rule.wire](body).some((v) => v.startsWith(rule.id)),
+            VALIDATORS[rule.wire](body, probeCtx[rule.wire]).some((v) => v.startsWith(rule.id)),
         );
         assert.ok(enforced, `rule ${rule.id} (${rule.summary}) has no live enforcement clause in the fakes`);
     }

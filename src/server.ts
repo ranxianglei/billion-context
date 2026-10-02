@@ -2539,10 +2539,12 @@ async function handle(
         // context+output overflow can't happen on a small window (e.g. 100k with a
         // large max_tokens — the most common "context blew up" cause; none of the
         // three layers reserved room for the output before this). Anthropic is
-        // exempt: its input limit is enforced independently of max_tokens
-        // (separate output budget), so reserving would shift every band down by
-        // maxOutput on every session for no safety gain — see
-        // shouldReserveOutputHeadroom. The request's own budget field is the exact
+        // exempt from this proactive reservation: it counts max_tokens against
+        // the window too (#1908), but its overflow is covered at forward time by
+        // the outgoing clamp in prepareAnthropic; reserving would additionally
+        // shift every band down by maxOutput on every anthropic session — an
+        // open product decision, see shouldReserveOutputHeadroom. The request's
+        // own budget field is the exact
         // output budget requested for THIS turn, so it is precise and per-request;
         // when the harness omits every budget field (#924 fallback below) the
         // model's declared max output stands in for it.
@@ -2720,7 +2722,7 @@ async function handle(
                         return await prepareGoogle(work as GoogleRequestBody, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, nativeWindow, googleModel, googlePathKind(urlPath) === "stream-generate", visibilityMarkers, upstreamOrigin);
                     }
                     return protocol === "anthropic"
-                        ? await prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg, visibilityMarkers)
+                        ? await prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers)
                         : protocol === "openai"
                           ? await prepareOpenai(work as OpenAIRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, nativeWindow, reasoningCfg, visibilityMarkers, route?.rewrittenUrl)
                           : responsesCompact
@@ -3338,6 +3340,7 @@ async function prepareAnthropic(
     session: Session,
     pluginMode: boolean,
     upstreamOrigin: string,
+    nativeWindow: number,
     reasoning: CompressReasoningConfig | undefined,
     visibilityMarkers: boolean,
 ): Promise<Prepared> {
@@ -3586,6 +3589,10 @@ async function prepareAnthropic(
     session.stats.localInputEstimate = estimateCoreMessagesUpper(processedMessages.length > 0 ? processedMessages : originalMessages)
         + countSystemAndToolsTokens(extractSystem(systemOut), toolsOut)
         + imageTokensInParsedBody("anthropic", rebuilt, imageBillingFor(opts, upstreamOrigin));
+    // #1908 mechanism 3: cap outgoing max_tokens so input + max_tokens <= window.
+    // Anthropic was the one wire missing this — its headroom reservation was skipped
+    // on the false premise that it enforces input independently of max_tokens (it does not).
+    clampOutgoingOutput(rebuilt as Record<string, unknown>, "max_tokens", { systemText: extractSystem(systemOut), tools: toolsOut, processedMessages, lastInputTokens: session.stats.lastInputTokens, lastInputTokensSource: session.stats.lastInputTokensSource, nativeWindow, imageTokens: imageTokensInParsedBody("anthropic", rebuilt, imageBillingFor(opts, upstreamOrigin)) }, sessionId, log);
     return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, anthropicSystem: parsed.system, anthropicCacheMarks, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, nudge, prompts, surface, renderTags: process.env.ACP_RENDER_NONE ? "none" : "text-only", dropReasoning: stripReasoning } as Prepared;
 }
 

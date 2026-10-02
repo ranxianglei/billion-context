@@ -11,10 +11,12 @@
 // learned) is documented alongside; AGENTS.md "Wire-constraint ledger" is the
 // institutional rule: the ledger only grows — every new upstream rejection or
 // documented constraint becomes an entry here + a validator clause inside the
-// fixing PR.
+// fixing PR. Size-budget rules that need the model's window (WC-014) activate
+// only when the harness declares it via startFakeUpstream({ window }).
 
 import http from "node:http";
 import { once } from "node:events";
+import { defaultCountTokens } from "acp-kernel";
 
 export type Wire = "anthropic" | "openai-chat" | "responses" | "google";
 
@@ -121,6 +123,14 @@ export const WIRE_RULES: readonly WireRule[] = [
         provenance:
             "bili #1757 per-field measurement against SenseNova's Responses gateway https://token.sensenova.cn/v1/responses (2026-09-30): every pi-ai outbound field 200 except reasoning.summary → 400 code InvalidParameter; OpenAI Responses API reference (reasoning.effort is the only documented subfield)",
     },
+    {
+        id: "WC-014",
+        wire: "anthropic",
+        summary:
+            "input tokens + max_tokens must fit the model's context window — Anthropic counts output against the window and 400s 'Prompt is too long' on overflow; bili caps outgoing max_tokens to window − input − margin (#453 clamp, wired into prepareAnthropic by #1908)",
+        provenance:
+            "bili #1908 production 400 (real Anthropic 'Prompt is too long': ~168K input + ~32K client max_tokens on a 200K window while bili's own readout said 84%); the old bili comments assumed Anthropic enforced its input limit independently of max_tokens — it does not",
+    },
 ];
 
 const ANTHROPIC_TOOL_NAME_RE = /^[a-zA-Z0-9_-]{1,128}$/;
@@ -132,8 +142,14 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
     return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-/** WC-001..WC-003, WC-007, WC-010 on an Anthropic /v1/messages body. Returns violation strings. */
-export function validateAnthropicBody(body: unknown): string[] {
+/** Per-harness context for size-budget rules that need model metadata. */
+export interface WireValidateCtx {
+    /** Model's context window in tokens; enables WC-014. */
+    window?: number;
+}
+
+/** WC-001..WC-003, WC-007, WC-010, WC-014 on an Anthropic /v1/messages body. Returns violation strings. */
+export function validateAnthropicBody(body: unknown, ctx?: WireValidateCtx): string[] {
     const out: string[] = [];
     if (!isPlainObject(body)) return out;
     if ("prompt_cache_key" in body)
@@ -152,6 +168,28 @@ export function validateAnthropicBody(body: unknown): string[] {
         }
     if (breakpoints > 4)
         out.push(`WC-010 ${breakpoints} cache_control breakpoints (system + tools + messages combined) — Anthropic allows at most 4`);
+    // WC-014 (#1908): runs before the tools early-return — the overflow check
+    // applies to bodies without tools too. Counting mirrors bili's own estimate
+    // (chars/4); the #453 clamp leaves >= min-margin slack, so a correctly
+    // clamped request cannot trip this.
+    if (ctx?.window !== undefined && typeof body.max_tokens === "number") {
+        let sysText = "";
+        if (typeof body.system === "string") sysText = body.system;
+        else if (Array.isArray(body.system))
+            sysText = body.system.map((b) => (isPlainObject(b) && typeof b.text === "string" ? b.text : "")).join("\n");
+        let msgText = "";
+        if (Array.isArray(body.messages))
+            for (const m of body.messages) {
+                if (!isPlainObject(m)) continue;
+                const c = m.content;
+                if (typeof c === "string") msgText += c;
+                else if (Array.isArray(c))
+                    for (const b of c) if (isPlainObject(b) && typeof b.text === "string") msgText += b.text;
+            }
+        const est = defaultCountTokens(sysText) + defaultCountTokens(msgText) + defaultCountTokens(JSON.stringify(body.tools ?? []));
+        if (est + body.max_tokens > ctx.window)
+            out.push(`WC-014 input~${est} + max_tokens ${body.max_tokens} exceeds window ${ctx.window} — Anthropic 400s 'Prompt is too long' (#1908)`);
+    }
     if (!Array.isArray(body.tools)) return out;
     body.tools.forEach((t, i) => {
         if (!isPlainObject(t)) {
@@ -315,7 +353,7 @@ export function validateGoogleBody(body: unknown): string[] {
     return out;
 }
 
-export const VALIDATORS: Record<Wire, (body: unknown) => string[]> = {
+export const VALIDATORS: Record<Wire, (body: unknown, ctx?: WireValidateCtx) => string[]> = {
     anthropic: validateAnthropicBody,
     "openai-chat": validateOpenAiChatBody,
     responses: validateResponsesBody,
@@ -424,7 +462,7 @@ const PATH_MATCHERS: Record<Wire, (url: string) => boolean> = {
 };
 
 /** Start a deterministic fake upstream for one wire protocol on a random loopback port. */
-export async function startFakeUpstream(wire: Wire, opts?: { replyText?: string }): Promise<FakeUpstream> {
+export async function startFakeUpstream(wire: Wire, opts?: { replyText?: string; window?: number }): Promise<FakeUpstream> {
     const replyText = opts?.replyText ?? "ok";
     const requests: CapturedRequest[] = [];
     const violations: string[] = [];
@@ -449,7 +487,7 @@ export async function startFakeUpstream(wire: Wire, opts?: { replyText?: string 
             try {
                 parsed = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
             } catch { /* non-JSON body: nothing to validate */ }
-            const found = validate(parsed);
+            const found = validate(parsed, { window: opts?.window });
             requests.push({ url: req.url ?? "", body: parsed });
             if (found.length > 0) {
                 violations.push(...found);

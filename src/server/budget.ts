@@ -5,10 +5,12 @@ import { readOutputBudget, writeOutputBudget, type OutputBudgetField } from "./s
 
 // #453 hard backstop: cap the forwarded output budget so input+output can never
 // exceed the window on request-rebuilding upstreams (vLLM rejects an oversized
-// total instead of clamping). Non-Anthropic only — Anthropic enforces its input
-// limit independently of max_tokens (see shouldReserveOutputHeadroom). The proxy
-// owns both sides of the sum, so capping output to (window - input - margin)
-// makes the overflow impossible even when the agent ignores the compress nudge.
+// total instead of clamping; Anthropic rejects when input_tokens + max_tokens
+// overflows the window — wired in there by #1908, which superseded the old
+// non-Anthropic-only scoping below). The proxy owns both sides of the sum, so
+// capping output to (window - input - margin) makes the overflow impossible
+// even when the agent ignores the compress nudge. (Anthropic stays exempt from
+// the PROACTIVE band reservation — see shouldReserveOutputHeadroom.)
 const OUTPUT_CLAMP_MARGIN_PCT = 0.05;
 const OUTPUT_CLAMP_MIN_MARGIN = 2048;
 const OUTPUT_CLAMP_FLOOR = 1024;
