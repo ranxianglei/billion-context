@@ -88,6 +88,13 @@ export interface NativeInterceptState {
      *  real failure lines. Called per request; hosts dedup once-per-process-
      *  per-endpoint like takeoverGate. Undefined hosts stay silent. */
     onUnroutedModelUrl?: (url: string) => void;
+    /** Body-signature guard (#1884): the signature covers the exact request
+     *  bytes (Huawei APIG `SDK-HMAC-SHA256` + `x-sdk-content-sha256`, AWS
+     *  SigV4 + `x-amz-content-sha256`), so routing such a request through a
+     *  rewriting proxy cannot work — the upstream answers 401
+     *  (`APIG.0301 … body hash mismatch`). Called per request; hosts dedup
+     *  once-per-process-per-endpoint like onUnroutedModelUrl. */
+    onSignedModelUrl?: (url: string, scheme: string) => void;
 }
 
 /** Ownership marker for bili's own chain links (#1410). Every function
@@ -208,6 +215,31 @@ export function isModelApiUrl(url: string): boolean {
     } catch {
         return false;
     }
+}
+
+/** Authorization schemes whose signature covers the request body. */
+const BODY_SIGNED_AUTH = /^(?:SDK-HMAC-SHA256|AWS4-HMAC-SHA256|HMAC-SHA256)\b/i;
+
+/** The request's body-signing scheme, or undefined when the body is not
+ *  signed. Huawei APIG (CodeArts and friends) signs the raw body hash and
+ *  ships it as `x-sdk-content-sha256`; AWS SigV4 ships `x-amz-content-sha256`. */
+export function bodySignedSchemeOf(input: string | URL | Request, init?: RequestInit): string | undefined {
+    let headers: Headers | undefined;
+    if (init?.headers !== undefined) headers = new Headers(init.headers);
+    else if (input !== null && typeof input === "object" && !(input instanceof URL)) {
+        try {
+            headers = new Headers((input as Request).headers);
+        } catch {
+            headers = undefined;
+        }
+    }
+    if (headers === undefined) return undefined;
+    const auth = (headers.get("authorization") ?? "").trim();
+    const match = BODY_SIGNED_AUTH.exec(auth);
+    if (match !== null) return match[0].toLowerCase();
+    if (headers.has("x-sdk-content-sha256")) return "x-sdk-content-sha256";
+    if (headers.has("x-amz-content-sha256")) return "x-amz-content-sha256";
+    return undefined;
 }
 
 /** True when the URL addresses bili's own control plane (`/__bili/*`,
@@ -644,6 +676,15 @@ export function installNativeFetchIntercept(state: NativeInterceptState): boolea
             // catalog JSONs, git refs and the rest of the host's tooling are
             // GET and would otherwise fire the hook once per boot per endpoint.
             if (!isBiliControlUrl(url) && fetchMethodOf(input, init) === "POST") state.onUnroutedModelUrl?.(url);
+            return send(input, init);
+        }
+        // #1884: a body-covering signature cannot survive a rewrite — routing
+        // these through the proxy makes the upstream reject every request with
+        // 401 (APIG.0301 body hash mismatch / SigV4 SignatureDoesNotMatch).
+        const signedScheme = bodySignedSchemeOf(input, init);
+        if (signedScheme !== undefined) {
+            state.onSignedModelUrl?.(url, signedScheme);
+            state.onDispatch?.(url, "direct");
             return send(input, init);
         }
         // #1117: URL shape alone cannot claim a request — every model call in

@@ -808,6 +808,23 @@ export function apply(ctx: PluginContext): void {
         persistClientEvent(line);
     };
 
+    const signedEndpoints = new Set<string>();
+    state.onSignedModelUrl = (rawUrl, scheme) => {
+        let key: string;
+        try {
+            const u = new URL(rawUrl);
+            key = `${u.origin}${u.pathname}`;
+        } catch {
+            key = rawUrl.split("?")[0];
+        }
+        if (signedEndpoints.has(key)) return;
+        if (signedEndpoints.size >= 256) return;
+        signedEndpoints.add(key);
+        const line = `bili-native-dsh: request sent DIRECT (uncompressed) — ${key} is signed over its body (${scheme}), so bili did not route it through the proxy: rewriting or compressing those bytes would invalidate the signature and the upstream answers 401.`;
+        console.error(line);
+        persistClientEvent(line);
+    };
+
     state.headersFor = (_url) => {
         maybeRetry(ctx);
         if (!register.toolsReady) return undefined;

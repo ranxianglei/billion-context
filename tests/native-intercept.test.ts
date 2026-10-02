@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, _resetForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
+import { bodySignedSchemeOf, installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, _resetForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
 
 test("isModelApiUrl: matches model-API endpoint shapes", () => {
     assert.equal(isModelApiUrl("http://127.0.0.1:8199/v1/messages"), true);
@@ -847,4 +847,71 @@ test("#1365 observeRoutedOrigin: pre-set evidence skips the window; expiry clean
         if (saved === undefined) delete process.env.BILI_ATTACH_EVIDENCE_GRACE_MS;
         else process.env.BILI_ATTACH_EVIDENCE_GRACE_MS = saved;
     }
+});
+
+test("#1884 bodySignedSchemeOf: detects body-covering signature schemes", () => {
+    assert.equal(
+        bodySignedSchemeOf("https://snap-access.cn-north-4.myhuaweicloud.com/api/v2/chat/completions", {
+            headers: { authorization: "SDK-HMAC-SHA256 Access=HSTAUVPW52NV6DCPTVSN, SignedHeaders=content-type;host;x-sdk-date, Signature=abc" },
+        }),
+        "sdk-hmac-sha256",
+    );
+    assert.equal(
+        bodySignedSchemeOf("https://example.com/v1/messages", { headers: { "x-sdk-content-sha256": "deadbeef" } }),
+        "x-sdk-content-sha256",
+    );
+    assert.equal(
+        bodySignedSchemeOf(new Request("https://example.com/v1/messages", { headers: { "x-amz-content-sha256": "UNSIGNED-PAYLOAD" } })),
+        "x-amz-content-sha256",
+    );
+    assert.equal(bodySignedSchemeOf("https://example.com/v1/messages", { headers: { authorization: "AWS4-HMAC-SHA256 Credential=AKIA/20261002/us-east-1/aws4_request" } }), "aws4-hmac-sha256");
+    assert.equal(bodySignedSchemeOf("https://example.com/v1/messages", { headers: { authorization: "Bearer sk-test" } }), undefined);
+    assert.equal(bodySignedSchemeOf("https://example.com/v1/messages"), undefined);
+});
+
+test("#1884 install: Huawei APIG body-signed model request is never rewritten", async () => {
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:40090", ready: Promise.resolve("http://127.0.0.1:40090") };
+    const seen: Array<{ url: string; scheme: string }> = [];
+    state.onSignedModelUrl = (url, scheme) => seen.push({ url, scheme });
+    const target = "https://snap-access.cn-north-4.myhuaweicloud.com/api/v2/chat/completions";
+    const { sink } = await withPatchRecording(state, async (fetch) => {
+        const res = await fetch(target, {
+            method: "POST",
+            headers: {
+                authorization: "SDK-HMAC-SHA256 Access=HSTAUVPW52NV6DCPTVSN, SignedHeaders=content-type;host;x-sdk-date, Signature=abc",
+                "x-sdk-content-sha256": "3d5a1b0c",
+            },
+            body: "{}",
+        });
+        assert.equal(res.status, 200);
+    });
+    assert.deepEqual(sink.map((call) => call.url), [target], "signed request must go direct, not /bili/-rewritten");
+    assert.deepEqual(seen, [{ url: target, scheme: "sdk-hmac-sha256" }]);
+});
+
+test("#1884 install: AWS SigV4 body-signed model request is never rewritten", async () => {
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:40091", ready: Promise.resolve("http://127.0.0.1:40091") };
+    const seen: string[] = [];
+    state.onSignedModelUrl = (_url, scheme) => seen.push(scheme);
+    const target = "https://bedrock-runtime.us-east-1.amazonaws.com/v1/messages";
+    const { sink } = await withPatchRecording(state, async (fetch) => {
+        await fetch(target, {
+            method: "POST",
+            headers: { authorization: "AWS4-HMAC-SHA256 Credential=AKIA/20261002/us-east-1/bedrock/aws4_request", "x-amz-content-sha256": "abc123" },
+            body: "{}",
+        });
+    });
+    assert.deepEqual(sink.map((call) => call.url), [target]);
+    assert.deepEqual(seen, ["aws4-hmac-sha256"]);
+});
+
+test("#1884 install: unsigned model requests still rewrite (guard is signature-scoped)", async () => {
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:40092", ready: Promise.resolve("http://127.0.0.1:40092") };
+    const seen: string[] = [];
+    state.onSignedModelUrl = (_url, scheme) => seen.push(scheme);
+    const { sink } = await withPatchRecording(state, async (fetch) => {
+        await fetch("http://127.0.0.1:8199/v1/messages", { method: "POST", headers: { authorization: "Bearer sk-test" }, body: "{}" });
+    });
+    assert.deepEqual(sink.map((call) => call.url), ["http://127.0.0.1:40092/bili/http://127.0.0.1:8199/v1/messages"]);
+    assert.deepEqual(seen, []);
 });
