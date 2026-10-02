@@ -12,6 +12,7 @@
  *   bili start --passthrough      forward without compression
  *   bili pi/codex/claude/omp [args]   start a proxy + launch a client via cert-MITM
  *   bili export [id] [--full]     export a persisted session as a handoff doc
+ *   bili handoff <id>             mint a rollover token for a persisted session (#1539)
  *   bili acp-cache diff <dir>     attribute cache breaks from ACP_DUMP_BODY dumps
  *   bili test pi                  non-polluting pi smoke test
  *   bili --version
@@ -34,6 +35,7 @@ import { runMcpStdio } from "./mcp.js";
 import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, pluginUpdate, type PluginAgent } from "./plugin-install.js";
 import { runLaunch, runTestPi, isLaunchClient, type ClientName } from "./launcher.js";
 import { exportSession } from "./export.js";
+import { handoffSession } from "./handoff.js";
 import { renderJson, renderText, runDiff } from "./acp-cache-diff.js";
 import { renderDoctorReport, runDoctor } from "./doctor.js";
 import { VERSION, PACKAGE_NAME } from "./version.js";
@@ -66,6 +68,9 @@ Usage:
   bili test pi                     non-polluting pi smoke test through the proxy
   bili export [session] [--full]   list sessions / export one as a Markdown handoff
                                     (--full includes original messages; --output FILE)
+  bili handoff <session>           list sessions / mint a rollover token for one (#1539);
+                                    paste the token into a NEW blank agent session to carry
+                                    over the ACP compression state (--output FILE)
   bili acp-cache diff <dir>        offline prefix-diff attribution over ACP_DUMP_BODY
                                    dumps: pairs adjacent requests per session and classifies
                                    each (pure-append / mid-stream-rewrite / prefix-stable-miss);
@@ -147,7 +152,7 @@ Docs: https://github.com/ranxianglei/billion-context
 `;
 
 type Parsed = {
-    command: "start" | "update" | "doctor" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp" | "plugin" | "acp-cache";
+    command: "start" | "update" | "doctor" | "help" | "version" | "launch" | "test" | "export" | "handoff" | "plugin-register" | "mcp" | "plugin" | "acp-cache";
     client?: ClientName;
     clientArgs: string[];
     mitmDomains: string[];
@@ -155,6 +160,8 @@ type Parsed = {
     exportSelector?: string;
     exportOutput?: string;
     exportFull?: boolean;
+    handoffSelector?: string;
+    handoffOutput?: string;
     registerConversationId?: string;
     pluginAction?: "install" | "remove" | "update" | "list";
     pluginAgent?: PluginAgent;
@@ -178,6 +185,8 @@ export function parseArgs(argv: string[]): Parsed {
     let registerConversationId: string | undefined;
     let exportOutput: string | undefined;
     let exportFull = false;
+    let handoffSelector: string | undefined;
+    let handoffOutput: string | undefined;
     let pluginAction: Parsed["pluginAction"];
     let pluginAgent: Parsed["pluginAgent"];
     let pluginWithMcp = false;
@@ -242,6 +251,7 @@ export function parseArgs(argv: string[]): Parsed {
                     process.exit(2);
                 }
                 exportOutput = val;
+                handoffOutput = val;
                 break;
             }
             case "--with-mcp":
@@ -324,6 +334,9 @@ export function parseArgs(argv: string[]): Parsed {
         } else if (cmd === "export") {
             command = "export";
             exportSelector = positional[1];
+        } else if (cmd === "handoff") {
+            command = "handoff";
+            handoffSelector = positional[1];
         } else if (cmd === "plugin-register") {
             command = "plugin-register";
             registerConversationId = positional[1];
@@ -377,11 +390,11 @@ export function parseArgs(argv: string[]): Parsed {
         }
     }
 
-    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, jsonOutput, doctorJson };
+    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, handoffSelector, handoffOutput, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, jsonOutput, doctorJson };
 }
 
 export async function main(): Promise<void> {
-    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, jsonOutput, doctorJson } = parseArgs(process.argv.slice(2));
+    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, handoffSelector, handoffOutput, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, jsonOutput, doctorJson } = parseArgs(process.argv.slice(2));
     if (command === "help") {
         process.stdout.write(HELP);
         return;
@@ -498,6 +511,16 @@ export async function main(): Promise<void> {
             process.stdout.write(text + "\n");
         } catch (error) {
             console.error(`bili export: ${error instanceof Error ? error.message : String(error)}`);
+            process.exit(1);
+        }
+        return;
+    }
+    if (command === "handoff") {
+        try {
+            const text = await handoffSession(handoffSelector, { output: handoffOutput });
+            process.stdout.write(text + "\n");
+        } catch (error) {
+            console.error(`bili handoff: ${error instanceof Error ? error.message : String(error)}`);
             process.exit(1);
         }
         return;
