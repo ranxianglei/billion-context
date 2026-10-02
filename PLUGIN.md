@@ -43,7 +43,10 @@ Fetch once at plugin startup.
     "agent": "x-bili-plugin",
     "conversation": "x-bili-plugin-conversation",
     "contextWindow": "x-bili-plugin-context-window",
-    "instructionsMutable": "x-bili-plugin-instructions-mutable"
+    "maxOutput": "x-bili-plugin-max-output",
+    "model": "x-bili-plugin-model",
+    "instructionsMutable": "x-bili-plugin-instructions-mutable",
+    "cwd": "x-bili-plugin-cwd"
   },
   "toolEndpoint": "/__bili/plugin/tool",
   "statusEndpoint": "/__bili/plugin/status"
@@ -60,6 +63,7 @@ On **every model request** the plugin sends:
 - `x-bili-plugin-conversation: <conversation-id>` — the agent's real conversation/session id, stable for the whole conversation.
 - `x-bili-plugin-context-window: <tokens>` (optional but recommended) — the model's context window as configured inside the agent (e.g. a pinned/overridden `contextWindow`). This becomes the authoritative "native" window for nudge decisions — it outranks the proxy's built-in table and the models.dev registry (most valuable for private relays and MITM mode), while operator tuning (`compress.modelContextLimit`) still outranks it.
 - `x-bili-plugin-instructions-mutable: 1` (optional; send only if true) — declares that your conversation ids are **persona-scoped**: one id per persona, and the request's system/instructions text may change mid-conversation without changing the persona (e.g. opencode re-renders AGENTS.md into `instructions` on every edit). The proxy now keys plugin conversation ids verbatim by default (#1106), so this flag is vestigial for current proxies — keep stamping it for compatibility with older proxy versions, which use it to stop mixing the instructions text into the compression-namespace fingerprint.
+- `x-bili-plugin-cwd: <path>` (optional) — the client's project directory (`process.cwd()` of the agent host). The proxy records it as session metadata for project-level rules file resolution (`<cwd>/rules.md`, #1406); per-request value wins over the register-payload seed, so a mid-session `/cd` is tracked. Ignored by older proxies.
 
 Effects on the proxy for that session:
 

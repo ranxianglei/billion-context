@@ -538,7 +538,7 @@ describe("derived-session inheritance report (#1362)", () => {
             await hooks["chat.headers"]?.({ sessionID: "ses_child" }, { headers });
             assert.equal(headers["x-bili-plugin-conversation"], "ses_child");
             await waitFor("register", () => proxy.registers.length >= 1);
-            assert.deepEqual(proxy.registers[0], { conversationId: "ses_child", agent: "opencode", identity: true, parentConversationId: "ses_parent" });
+            assert.deepEqual(proxy.registers[0], { conversationId: "ses_child", agent: "opencode", identity: true, parentConversationId: "ses_parent", cwd: process.cwd() });
             await hooks["chat.headers"]?.({ sessionID: "ses_child" }, { headers: {} });
             await new Promise((r) => setTimeout(r, 50));
             assert.equal(proxy.registers.length, 1, "no repeat register");
@@ -590,7 +590,7 @@ describe("derived-session inheritance report (#1362)", () => {
             await new Promise((r) => setTimeout(r, 100));
             await hooks["chat.headers"]?.({ sessionID: "ses_c" }, { headers: {} });
             await waitFor("retry register", () => proxy.registers.length >= 2);
-            assert.deepEqual(proxy.registers[1], { conversationId: "ses_c", agent: "opencode", identity: true, parentConversationId: "ses_p" });
+            assert.deepEqual(proxy.registers[1], { conversationId: "ses_c", agent: "opencode", identity: true, parentConversationId: "ses_p", cwd: process.cwd() });
         } finally {
             await proxy.close();
         }

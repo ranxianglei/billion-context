@@ -615,6 +615,7 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
             // request no bili proxy will ever see.
             if (base === undefined) return;
             output.headers["x-bili-plugin"] = "opencode";
+            output.headers["x-bili-plugin-cwd"] = process.cwd();
             output.headers["x-bili-plugin-conversation"] = input.sessionID;
             // #1102: opencode mints one session id per persona (task-tool
             // subagents get fresh child ids), so instruction drift (AGENTS.md

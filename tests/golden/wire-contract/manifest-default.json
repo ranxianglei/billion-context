@@ -605,7 +605,8 @@
     "contextWindow": "x-bili-plugin-context-window",
     "maxOutput": "x-bili-plugin-max-output",
     "model": "x-bili-plugin-model",
-    "instructionsMutable": "x-bili-plugin-instructions-mutable"
+    "instructionsMutable": "x-bili-plugin-instructions-mutable",
+    "cwd": "x-bili-plugin-cwd"
   },
   "toolEndpoint": "/__bili/plugin/tool",
   "statusEndpoint": "/__bili/plugin/status",

@@ -289,6 +289,7 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
             if (!headers || typeof headers.set !== "function" || !sid || !state.proxyBase) return;
             headers.set("x-bili-plugin-conversation", sid);
             headers.set("x-bili-plugin", "opencode");
+            headers.set("x-bili-plugin-cwd", process.cwd());
             // #1102: one session id per persona (subagents get child ids) —
             // instruction drift (AGENTS.md reconcile) must not fork the
             // compression session.

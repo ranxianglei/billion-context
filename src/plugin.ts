@@ -73,6 +73,13 @@ export const PLUGIN_MODEL_HEADER = "x-bili-plugin-model";
  *  vestigial: hosts keep stamping it for protocol compatibility with older
  *  proxies, but current proxies key verbatim regardless. */
 export const PLUGIN_INSTRUCTIONS_MUTABLE_HEADER = "x-bili-plugin-instructions-mutable";
+/** #1406: the client's project directory (the agent host's process.cwd()).
+ *  The proxy records it as session metadata for project-level rules file
+ *  resolution (<cwd>/rules.md, acp-kernel#446 follow-up). Protocol-internal
+ *  like the other runtime headers; launcher lanes that cannot stamp headers
+ *  ride the register payload instead. */
+export const PLUGIN_CWD_HEADER = "x-bili-plugin-cwd";
+export const MAX_CLIENT_CWD_LENGTH = 4096;
 /** #1699: the host's per-request persona/agent id (opencode v2 stamps its own
  *  taxonomy — "title", "build", "plan", ...). Carries INTENT the request body
  *  cannot express: opencode v2 title-gen requests carry NO max_tokens (options
@@ -152,6 +159,24 @@ export function pluginReportedMaxOutput(headers: Record<string, string | string[
     if (raw === undefined) return undefined;
     const n = Number.parseInt(raw, 10);
     return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+/** #1406: client project directory — validated at EVERY entry (header value
+ *  or register payload) so session metadata can never carry control
+ *  characters or unbounded strings. */
+export function sanitizeClientCwd(v: unknown): string | undefined {
+    if (typeof v !== "string") return undefined;
+    const t = v.trim();
+    if (t.length === 0 || t.length > MAX_CLIENT_CWD_LENGTH) return undefined;
+    if (t.includes("\n") || t.includes("\r")) return undefined;
+    return t;
+}
+
+/** #1406: per-request cwd report from a cooperative plugin. Same gate as the
+ *  other x-bili-plugin-* runtime headers: honored only when the request also
+ *  announces itself with x-bili-plugin. */
+export function pluginReportedCwd(headers: Record<string, string | string[] | undefined>): string | undefined {
+    return pluginAgentHeader(headers) !== undefined ? sanitizeClientCwd(headerValue(headers, PLUGIN_CWD_HEADER)) : undefined;
 }
 
 /** Current model id (runtime-info protocol #955). Informational + lets the
@@ -339,7 +364,7 @@ export function rememberPluginMessages(sessionId: string, processed: CoreMessage
 // (server.ts binding step): that session becomes plugin-mode (native tools,
 // wire injection suppressed) and the conversation id becomes its tool-API key
 // — no x-bili-plugin headers required.
-export type PendingPluginRegister = { conversationId: string; agent: string; ts: number; parentConversationId?: string };
+export type PendingPluginRegister = { conversationId: string; agent: string; ts: number; parentConversationId?: string; cwd?: string };
 
 /** Runtime-info protocol entry (#955): what the client's OWN config says it
  *  will run — reported at plugin bootstrap and on model switch, before (and
@@ -465,7 +490,7 @@ const pendingRegisters: PendingPluginRegister[] = [];
  *  false` (headless codex spawn) means requests carry no matching id — bind
  *  the next NEW session instead. Splitting the two keeps a foreign session
  *  from eating an identity registration it can never claim. */
-export function queuePluginRegister(conversationId: string, agent: string, identity: boolean, parentConversationId?: string): void {
+export function queuePluginRegister(conversationId: string, agent: string, identity: boolean, parentConversationId?: string, cwd?: string): void {
     if (!identity) {
         for (let i = 0; i < pendingRegisters.length; i++) {
             if (pendingRegisters[i]!.conversationId === conversationId) {
@@ -473,10 +498,10 @@ export function queuePluginRegister(conversationId: string, agent: string, ident
                 break;
             }
         }
-        pendingRegisters.push({ conversationId, agent, ts: Date.now(), ...(parentConversationId ? { parentConversationId } : {}) });
+        pendingRegisters.push({ conversationId, agent, ts: Date.now(), ...(parentConversationId ? { parentConversationId } : {}), ...(cwd ? { cwd } : {}) });
         while (pendingRegisters.length > MAX_PENDING_REGISTERS) pendingRegisters.shift();
     } else {
-        registeredIds.set(conversationId, { agent, ...(parentConversationId ? { parentConversationId } : {}) });
+        registeredIds.set(conversationId, { agent, ...(parentConversationId ? { parentConversationId } : {}), ...(cwd ? { cwd } : {}) });
         while (registeredIds.size > MAX_PENDING_REGISTERS) {
             const oldest = registeredIds.keys().next().value;
             if (oldest !== undefined) registeredIds.delete(oldest);
@@ -502,14 +527,14 @@ export function takePendingPluginRegister(): PendingPluginRegister | undefined {
     }
     return pendingRegisters.shift();
 }
-const registeredIds = new Map<string, { agent: string; parentConversationId?: string }>();
+const registeredIds = new Map<string, { agent: string; parentConversationId?: string; cwd?: string }>();
 
 /** Identity-driven binding (#162): hosts whose model requests carry the SAME
  *  id the MCP shell registered (claude code: every request has
  *  x-claude-code-session-id === CLAUDE_CODE_SESSION_ID === the registered
  *  conversation id) bind the moment any of their requests shows up — no
  *  ordering race with the shell's initialize. */
-export function consumePluginRegisterFor(conversationId: string): { agent: string; parentConversationId?: string } | undefined {
+export function consumePluginRegisterFor(conversationId: string): { agent: string; parentConversationId?: string; cwd?: string } | undefined {
     const entry = registeredIds.get(conversationId);
     if (entry !== undefined) {
         // The registration describes the CONVERSATION, not a one-shot token:
@@ -525,9 +550,9 @@ export function consumePluginRegisterFor(conversationId: string): { agent: strin
 }
 
 export function handlePluginRegister(payload: string, res: import("node:http").ServerResponse): void {
-    let parsed: { conversationId?: unknown; agent?: unknown; identity?: unknown; parentConversationId?: unknown };
+    let parsed: { conversationId?: unknown; agent?: unknown; identity?: unknown; parentConversationId?: unknown; cwd?: unknown };
     try {
-        parsed = JSON.parse(payload) as { conversationId?: unknown; agent?: unknown; identity?: unknown };
+        parsed = JSON.parse(payload) as { conversationId?: unknown; agent?: unknown; identity?: unknown; cwd?: unknown };
     } catch {
         res.writeHead(400, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: false, error: "invalid JSON body" }));
@@ -544,7 +569,10 @@ export function handlePluginRegister(payload: string, res: import("node:http").S
     // conversation the proxy should seed this conversation from.
     let parentConversationId = typeof parsed.parentConversationId === "string" ? parsed.parentConversationId.trim() : "";
     if (parentConversationId === conversationId) parentConversationId = "";
-    queuePluginRegister(conversationId, agent, parsed.identity === true, parentConversationId || undefined);
+    // #1406: optional client project directory (launcher lanes can't stamp
+    // headers); validated like every other external field.
+    const cwd = sanitizeClientCwd(parsed.cwd);
+    queuePluginRegister(conversationId, agent, parsed.identity === true, parentConversationId || undefined, cwd);
     res.end(JSON.stringify({ ok: true, conversationId, agent }));
 }
 
@@ -632,7 +660,7 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
             openai: [...acpOpenai, ...(absorbTools ? [absorbTools.openai] : []), ...(rulesOn ? [RULE_TOOL_OPENAI] : []), ...(ccrTools ? [ccrTools.openai] : [])],
             responses: [...acpResponses, ...(absorbTools ? [absorbTools.responses] : []), ...(rulesOn ? [RULE_TOOL_RESPONSES] : [])],
         },
-        headers: { agent: PLUGIN_AGENT_HEADER, conversation: PLUGIN_CONVERSATION_HEADER, contextWindow: PLUGIN_CONTEXT_WINDOW_HEADER, maxOutput: PLUGIN_MAX_OUTPUT_HEADER, model: PLUGIN_MODEL_HEADER, instructionsMutable: PLUGIN_INSTRUCTIONS_MUTABLE_HEADER },
+        headers: { agent: PLUGIN_AGENT_HEADER, conversation: PLUGIN_CONVERSATION_HEADER, contextWindow: PLUGIN_CONTEXT_WINDOW_HEADER, maxOutput: PLUGIN_MAX_OUTPUT_HEADER, model: PLUGIN_MODEL_HEADER, instructionsMutable: PLUGIN_INSTRUCTIONS_MUTABLE_HEADER, cwd: PLUGIN_CWD_HEADER },
         toolEndpoint: "/__bili/plugin/tool",
         statusEndpoint: "/__bili/plugin/status",
         runtimeInfoEndpoint: "/__bili/plugin/runtime-info",

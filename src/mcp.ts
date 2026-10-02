@@ -196,7 +196,7 @@ async function handleMessage(msg: {
                 const registerFetch = fetch(`${resolveProxyOrigin()}/__bili/plugin/register`, {
                     method: "POST",
                     headers: { "content-type": "application/json" },
-                    body: JSON.stringify({ conversationId, agent: "mcp", identity: IDENTITY_BINDING }),
+                    body: JSON.stringify({ conversationId, agent: "mcp", identity: IDENTITY_BINDING, cwd: process.cwd() }),
                     signal: AbortSignal.timeout(5000),
                 });
                 registeredConversations.add(conversationId); // issue-once: a repeated initialize must not re-register

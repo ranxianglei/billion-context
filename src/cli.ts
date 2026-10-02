@@ -412,7 +412,7 @@ export async function main(): Promise<void> {
             const res = await fetch(`${origin}/__bili/plugin/register`, {
                 method: "POST",
                 headers: { "content-type": "application/json" },
-                body: JSON.stringify({ conversationId, agent, identity: true }),
+                body: JSON.stringify({ conversationId, agent, identity: true, cwd: process.cwd() }),
                 signal: AbortSignal.timeout(5000),
             });
             const data = (await res.json()) as { ok?: boolean; error?: string };

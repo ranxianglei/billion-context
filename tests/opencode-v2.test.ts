@@ -795,7 +795,7 @@ test("#1362: V2 child session links its parent via session.created + first reque
                 const r1 = await fake.fireModelRequest({ sessionID: "ses_c", baseURL: "http://upstream.example/v1" });
                 assert.equal(r1.headers["x-bili-plugin-conversation"], "ses_c");
                 await until(() => reg.registers.length >= 1);
-                assert.deepEqual(reg.registers[0], { conversationId: "ses_c", agent: "opencode", identity: true, parentConversationId: "ses_p" });
+                assert.deepEqual(reg.registers[0], { conversationId: "ses_c", agent: "opencode", identity: true, parentConversationId: "ses_p", cwd: process.cwd() });
                 await fake.fireModelRequest({ sessionID: "ses_c", baseURL: "http://upstream.example/v1" });
                 await new Promise((r) => setTimeout(r, 50));
                 assert.equal(reg.registers.length, 1, "derived sid registered exactly once");
@@ -866,7 +866,7 @@ test("#1362: V2 parent announced after the child's first request links late", as
                 await new Promise((r) => setTimeout(r, 20));
                 await fake.fireModelRequest({ sessionID: "ses_l", baseURL: "http://upstream.example/v1" });
                 await until(() => reg.registers.length >= 1);
-                assert.deepEqual(reg.registers[0], { conversationId: "ses_l", agent: "opencode", identity: true, parentConversationId: "ses_lp" });
+                assert.deepEqual(reg.registers[0], { conversationId: "ses_l", agent: "opencode", identity: true, parentConversationId: "ses_lp", cwd: process.cwd() });
             } finally {
                 cleanup();
             }
@@ -892,7 +892,7 @@ test("#1362: failed V2 derive register retries after the cooldown window", async
                 await new Promise((r) => setTimeout(r, 100));
                 await fake.fireModelRequest({ sessionID: "ses_f", baseURL: "http://upstream.example/v1" });
                 await until(() => reg.registers.length >= 2);
-                assert.deepEqual(reg.registers[1], { conversationId: "ses_f", agent: "opencode", identity: true, parentConversationId: "ses_fp" });
+                assert.deepEqual(reg.registers[1], { conversationId: "ses_f", agent: "opencode", identity: true, parentConversationId: "ses_fp", cwd: process.cwd() });
             } finally {
                 cleanup();
             }

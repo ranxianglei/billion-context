@@ -814,7 +814,7 @@ export function apply(ctx: PluginContext): void {
         const sid = sessionIdOf(ctx);
         if (sid === undefined) return undefined;
         refreshModelInfo(register.base);
-        const headers: Record<string, string> = { "x-bili-plugin": "dsh", "x-bili-plugin-conversation": sid };
+        const headers: Record<string, string> = { "x-bili-plugin": "dsh", "x-bili-plugin-conversation": sid, "x-bili-plugin-cwd": process.cwd() };
         if (modelInfo.cached !== undefined) {
             headers["x-bili-plugin-model"] = modelInfo.cached.model;
             if (modelInfo.cached.contextWindow !== undefined) headers["x-bili-plugin-context-window"] = String(modelInfo.cached.contextWindow);

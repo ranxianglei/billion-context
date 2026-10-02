@@ -182,7 +182,7 @@ export async function postIdentityRegister(proxyBase: string, conversationId: st
     const res = await fetch(`${proxyBase}/__bili/plugin/register`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ conversationId, agent, identity: true, ...(parentConversationId ? { parentConversationId } : {}) }),
+        body: JSON.stringify({ conversationId, agent, identity: true, ...(parentConversationId ? { parentConversationId } : {}), cwd: process.cwd() }),
         signal: AbortSignal.timeout(COMPACT_TIMEOUT_MS),
     });
     if (!res.ok) throw new Error(`register HTTP ${res.status}`);
