@@ -77,6 +77,7 @@
     "README.md",
     "dist",
     "dsh.bundle.patch.yml",
+    "dsh-presets",
     "hermes-plugin"
   ],
   "pi": {

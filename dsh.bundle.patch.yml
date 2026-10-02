@@ -5,6 +5,23 @@
 - insert:
     - id: bili-native
       name: billion-context
-- id: compaction-basic
+# #1772: the shipped `standard` preset mounts `dsh-compaction-basic` with
+# auto-compaction ON, which double-compresses alongside bili's own pipeline.
+# The compaction row lives inside the preset's agent.cordis.yml — below the
+# patch engine's reach (patch rows only match boot-tree rows). The lever we
+# CAN turn from a bundle layer is the `agent-presets` row itself (inserted at
+# boot-tree top level by dsh-web-app): its config is replaced wholesale here
+# to (a) register the in-package `dsh-presets/` directory as an extra roster
+# root — trust: system, path resolved from the loader ctx `baseUrl` (profile
+# dir), win32 strips the leading slash — and (b) make `standard-bili-auto-off`
+# (a byte-copy of `standard` with compaction-basic `auto: false`) the default.
+# Shipped + user roots stay enabled (Config schema defaults), every native
+# preset remains selectable, and an explicit settings/UI choice still wins
+# over this row-config default. Drift is release-managed: the preset ships in
+# this package, so every bili upgrade refreshes it.
+- id: agent-presets
   config:
-    auto: false
+    default: standard-bili-auto-off
+    roots:
+      - path: !!js "(u => process.platform === 'win32' ? u.pathname.slice(1) : u.pathname)(new URL('node_modules/billion-context/dsh-presets/', baseUrl))"
+        trust: system

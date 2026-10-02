@@ -287,6 +287,13 @@ function wireProfile(ctx: Ctx): void {
     path.join(REPO_ROOT, "dsh.bundle.patch.yml"),
     path.join(pkgDir, "dsh.bundle.patch.yml"),
   );
+  // Published shape (#1772): the bundle patch registers the in-package preset
+  // root, so the profile copy must carry `dsh-presets/` like a registry install.
+  fs.cpSync(
+    path.join(REPO_ROOT, "dsh-presets"),
+    path.join(pkgDir, "dsh-presets"),
+    { recursive: true },
+  );
 
   const biliVersion = JSON.parse(
     fs.readFileSync(path.join(REPO_ROOT, "package.json"), "utf8"),
