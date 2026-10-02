@@ -157,6 +157,35 @@ test("refreshDshProfileCopy: stale registry-pinned profile refreshes via dsh's c
     }
 });
 
+test("refreshDshProfileCopy: a copy running FROM the desktop profile never drives dsh against it (#1575)", async () => {
+    const base = fs.mkdtempSync(path.join(root, "fx-desktop-"));
+    const dshHome = path.join(base, "dsh");
+    const desktopDir = path.join(dshHome, "profiles", "desktop");
+    const installDir = path.join(desktopDir, "node_modules", "billion-context");
+    const aDir = path.join(dshHome, "profiles", "a");
+    fs.mkdirSync(installDir, { recursive: true });
+    fs.mkdirSync(aDir, { recursive: true });
+    fs.writeFileSync(path.join(desktopDir, "package.json"), JSON.stringify({ private: true, dependencies: { "billion-context": "^0.1.139" } }));
+    fs.writeFileSync(path.join(aDir, "package.json"), JSON.stringify({ private: true, dependencies: { "billion-context": "^0.1.139" } }));
+    fs.writeFileSync(path.join(installDir, "package.json"), JSON.stringify({ name: "billion-context", version: "0.1.139" }));
+    const env = { ...process.env, DSH_HOME: dshHome };
+    const calls: string[] = [];
+    const { log, entries } = makeLog();
+    try {
+        _setDshRunnersForTest({ async: recordingAsyncRunner(calls) });
+        await withRegistry("0.1.140", async () => {
+            await refreshDshProfileCopy(installDir, OPTS, env, log);
+        });
+        // siblings still refresh through the channel; the desktop profile itself is out of channel reach
+        assert.deepEqual(calls, ["plugin --profile a add billion-context@0.1.140"]);
+        assert.ok(entries.some((l) => l.includes("dsh profile desktop") && l.includes("refuses --profile desktop")), entries.join("\n"));
+        assert.ok(!entries.some((l) => l.startsWith("warn")), entries.join("\n"));
+    } finally {
+        _setDshRunnersForTest(undefined);
+        rmrf(base);
+    }
+});
+
 test("refreshDshProfileCopy: up-to-date copy never spawns dsh", async () => {
     const fx = makeFixture("0.1.140");
     const calls: string[] = [];

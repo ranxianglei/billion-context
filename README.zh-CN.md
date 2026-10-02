@@ -156,7 +156,7 @@ npm install -g billion-context
 bili plugin install pi          # 在 pi 的 settings 里注册 billion-context 条目(bili 自身为 npm 安装时写 npm 条目)
 bili plugin install omp         # 在 omp 的 config.yml(~/.omp/agent/config.yml)注册 extensions 条目
 bili plugin install opencode    # 在 opencode 真实配置里注册插件 + 关闭原生自动压缩
-bili plugin install dsh         # 对每个已存在的 profile 执行 'dsh plugin --profile <name> add billion-context'
+bili plugin install dsh         # 对每个已存在的 CLI profile 执行 'dsh plugin --profile <name> add billion-context'(桌面应用独占的 `desktop` profile 在通道之外 —— 见 CLIENTS.md)
 bili plugin install kimi        # 写 $KIMI_CODE_HOME/plugins/managed/billion-context/kimi.plugin.json(+ installed.json 记录);每会话路由块在首次启动时落到 config.toml(需 Kimi Code >= 2.0.0)
 bili plugin install hermes      # 把 Python 插件拷进 ~/.hermes/plugins/billion-context/(+ 机器自管的 bili.json sidecar),并经 `hermes plugins enable billion-context` 启用
 bili plugin install zcode       # 写 hooks.enabled + SessionStart hook + mcp.servers.bili 到 ~/.zcode/cli/config.json;每会话路由块在首次启动时落到 bigmodel provider store

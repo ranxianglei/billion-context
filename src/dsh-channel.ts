@@ -21,6 +21,20 @@ export const DSH_PACKAGE = "billion-context";
 // profile by design), so every channel-side refresh path must skip it.
 export const DSH_DESKTOP_PROFILE = "desktop";
 
+// #1575 (owner decision 2026-10-01): the profile named `desktop` belongs to
+// the deepseek-harness Desktop app (Electron), and the dsh CLI refuses to
+// manage it — `--profile desktop` is rejected outright ("managed exclusively
+// by the Electron application"), so no channel-driven operation can ever
+// succeed against it. bili instead owns that copy IN PLACE: the proxy running
+// from it updates itself during its periodic check (junction-safe swap,
+// #1872). Every channel-driven path therefore SKIPS this profile — driving
+// the CLI against it would only log a doomed failure every cycle.
+export const DSH_DESKTOP_PROFILE = "desktop";
+
+export function isDshDesktopProfile(name: string): boolean {
+    return name === DSH_DESKTOP_PROFILE;
+}
+
 const DSH_EXEC_TIMEOUT_MS = 5 * 60 * 1000; // cold pnpm store + slow network
 
 /** Every profile dir under $DSH_HOME/profiles/*. dsh creates a profile dir
@@ -393,7 +407,9 @@ export async function runDshPluginAsync(args: string[], env: NodeJS.ProcessEnv =
  *  Profiles pinned to a local source (link:/file:/git specs) are left alone.
  *  Returns the number of profiles actually refreshed (#1803: copies already
  *  at the target version are skipped, so callers must not assume every
- *  dependent profile re-ran). */
+ *  dependent profile re-ran). The `desktop` profile is skipped entirely
+ *  (#1575): the dsh CLI channel is closed for it upstream, and its copy
+ *  updates itself in place instead (#1872). */
 export async function refreshDshProfileBundles(
     targetVersion: string,
     log: (level: "info" | "warn", msg: string) => void,
@@ -405,7 +421,11 @@ export async function refreshDshProfileBundles(
     } catch {
         return 0; // dsh has never run on this machine — nothing to keep in step
     }
-    const targets = dirs.filter((dir) => dshProfileDependsOnBili(dir));
+    const targets = dirs.filter((dir) => !isDshDesktopProfile(path.basename(dir)) && dshProfileDependsOnBili(dir));
+    const desktopDir = dirs.find((dir) => isDshDesktopProfile(path.basename(dir)));
+    if (desktopDir !== undefined && dshProfileDependsOnBili(desktopDir)) {
+        log("info", `[update] dsh profile ${DSH_DESKTOP_PROFILE}: not driven through the dsh channel — the CLI refuses --profile ${DSH_DESKTOP_PROFILE} upstream; the copy updates itself in place via its own periodic self-update check (#1575)`);
+    }
     if (targets.length === 0) return 0;
     let refreshed = 0;
     for (const dir of targets) {

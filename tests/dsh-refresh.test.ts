@@ -263,6 +263,42 @@ test("runDshPlugin: failure message renders the executed argv, no duplicated 'pl
     }
 });
 
+test("refreshDshProfileBundles: the desktop profile is never driven through the channel (#1575)", async () => {
+    const home = makeHome({
+        a: { dependencies: { "billion-context": "^0.1.119" } },
+        desktop: { dependencies: { "billion-context": "^0.1.119" } },
+    });
+    const calls: string[] = [];
+    const logs: string[] = [];
+    try {
+        _setDshRunnersForTest({ async: recordingAsyncRunner(calls) });
+        await refreshDshProfileBundles("0.1.121", (l, m) => logs.push(`${l}: ${m}`), { ...process.env, DSH_HOME: home });
+        assert.deepEqual(calls, ["plugin --profile a add billion-context@0.1.121"]);
+        assert.ok(logs.some((l) => l.includes("dsh profile desktop") && l.includes("refuses --profile desktop") && l.includes("updates itself in place")), logs.join("\n"));
+        assert.ok(logs.some((l) => l.includes("refreshed 1 dsh profile bundle(s) to 0.1.121")));
+    } finally {
+        _setDshRunnersForTest(undefined);
+        rmrf(home);
+    }
+});
+
+test("refreshDshProfileBundles: a desktop-only home spawns nothing and warns nothing (#1575)", async () => {
+    const home = makeHome({ desktop: { dependencies: { "billion-context": "^0.1.119" } } });
+    const calls: string[] = [];
+    const logs: string[] = [];
+    try {
+        _setDshRunnersForTest({ async: recordingAsyncRunner(calls) });
+        const refreshed = await refreshDshProfileBundles("0.1.121", (l, m) => logs.push(`${l}: ${m}`), { ...process.env, DSH_HOME: home });
+        assert.equal(refreshed, 0);
+        assert.deepEqual(calls, []);
+        assert.ok(!logs.some((l) => l.startsWith("warn")), logs.join("\n"));
+        assert.ok(logs.some((l) => l.includes("dsh profile desktop") && l.includes("refuses --profile desktop")), logs.join("\n"));
+    } finally {
+        _setDshRunnersForTest(undefined);
+        rmrf(home);
+    }
+});
+
 test("refreshDshProfileBundles: no profiles root or no bili deps → silent no-op", async () => {
     const logs: string[] = [];
     const log = (level: string, msg: string): void => logs.push(`${level}: ${msg}`);

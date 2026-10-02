@@ -81,7 +81,7 @@ billion-context/
 3. **Auto-update**: checks npm registry every 3 min (`CHECK_INTERVAL_MS = 3*60*1000`), first check per process ignores throttle
 4. **Tee logger**: all proxy logs go through `src/logger.ts` (file + stderr). Do NOT use `console.error` in server-side modules — use `loggerLog()`.
 5. **acp-kernel MUST be pinned to an exact version** (e.g. `"acp-kernel": "0.0.17"`, NEVER `"^0.0.17"`). Because acp-kernel is a build-time dependency that tsup bundles inline into `dist`, a caret range makes the resolved version drift if `package-lock.json` is regenerated or absent, breaking reproducible builds. When bumping acp-kernel: set the exact version in `package.json`, run `npm install` to refresh the lockfile, then rebuild. The `package-lock.json` is committed and kept in sync.
-6. **Single-writer plugin copies (#991)** — every bili presence has exactly one writer. Host-managed copies (pi's npm entry, opencode's plugin dir, dsh profile bundles in pnpm's store) are NEVER overwritten in place by bili: `src/update.ts` → `hostManagedInstall()` detects pnpm virtual-store (`.pnpm`) and host-home trees (pi/opencode/dsh/kimi/omp) and the self-updater skips them; `installViaTarball` refuses them structurally. Reference lanes (omp/claude/codex/kimi/hermes/zcode) point at the global install and update with it. `bili plugin update [agent]` drives each lane through its own owner. Mixing user commands is fine (they share channels); mixing writers is what the guard forbids.
+ 6. **Single-writer plugin copies (#991)** — every bili presence has exactly one writer. Host-managed copies (pi's npm entry, opencode's plugin dir, dsh profile bundles in pnpm's store) are NEVER overwritten in place by bili: `src/update.ts` → `hostManagedInstall()` detects pnpm virtual-store (`.pnpm`) and host-home trees (pi/opencode/dsh/kimi/omp) and the self-updater skips them; `installViaTarball` refuses them structurally. Reference lanes (omp/claude/codex/kimi/hermes/zcode) point at the global install and update with it. `bili plugin update [agent]` drives each lane through its own owner. Mixing user commands is fine (they share channels); mixing writers is what the guard forbids. Exception (#1575, owner decision 2026-10-01): the dsh `desktop` profile copy is the inverse case — the dsh CLI channel is closed for it upstream (`--profile desktop` refused), so bili OWNS that copy and self-updates it in place (junction-safe swap in `installViaTarball`, #1872); every channel-driven path (refresh/install/remove/updateLane) skips the profile rather than log a doomed attempt.
 7. **Two compression modes with different summary carriers** — `pluginMode` (the `x-bili-plugin` header / registered agent, e.g. `bili pi`) means the ACP-native agent OWNS compression: it executes `compress` locally, the call+result live in its own re-sent history, and the summary carrier on the wire is the **tool call** (the proxy suppresses tool + nudge injection; the agent's view never renders the kernel's `acp_summary`). Proxy mode (plain client, no header) means the proxy executes `compress` server-side: the tool call is ephemeral (never enters the client's history) and preflight blocks have none, so the summary carrier is the **`acp_summary` message**, which the kernel renders as role `system` but `systemToUser` (`src/util.ts`) re-voices as a **`user` message** (leaving it at its anchor) so strict backends (SGLang: exactly one system at index 0, #377) accept it and the head system message stays byte-stable for the prefix cache. The mode is decided per request and bound per session (`session.metadata.pluginAgent`, sticky, upgrade-only). See TECHNICAL-NOTES.md "Two compression modes".
 
 8. **Nudge cadence is flat 50K by design (kernel contract)** — acp-kernel pins the growth interval at 50000 for every window size (`nudge.growthFloor == nudge.growthCap == 50000`; the window-percentage scaling was deliberately removed — kernel #379/#380 settled "growth-driven, no usage/count proxy gates"). Do NOT re-scale the interval with the context window or re-introduce percentage gates; a 1M-window session folding every 50K of growth is intended lean-context behavior. bili exposes the user escape hatch as `compress.nudgeGrowthTokens` (flattens `growthFloor`+`growthCap` to a fixed step) — big-window users who want a lazier cadence set it explicitly. Gentle growth nudges are advisory by design; prompt wording is kernel-owned (`src/nudge-text.ts`).
@@ -102,11 +102,17 @@ against it, not ad hoc:
    - it IS the global install (npm `i -g`): self-updates in place;
    - it is a reference lane (omp/claude/codex/kimi/zcode/hermes entries): no
      copy at all, points at the global dist, follows it automatically;
-   - it lives in a host world (dsh profile bundle, opencode/pi tree): updated
-     through the HOST's channel — driven by a global self-update AND, when no
-     global ever runs (market-only users), by the copy's own periodic check
-     (`refreshDshProfileCopy`, #1196). Self-heal goes THROUGH the owner's
-     sanctioned channel, never around it.
+    - it lives in a host world (dsh profile bundle, opencode/pi tree): updated
+      through the HOST's channel — driven by a global self-update AND, when no
+      global ever runs (market-only users), by the copy's own periodic check
+      (`refreshDshProfileCopy`, #1196). Self-heal goes THROUGH the owner's
+      sanctioned channel, never around it. Exception (#1575): the dsh
+      `desktop` profile is owned EXCLUSIVELY by the deepseek-harness Desktop
+      app and its host channels are closed upstream (the CLI refuses
+      `--profile desktop`), so bili owns that copy IN PLACE — the process
+      running from it self-updates via the junction-safe swap (#1872) and
+      every channel-driven path skips the profile instead of logging doomed
+      attempts.
 3. **Terminal users get the one-copy experience via launchers** (`bili dsh`
    overlay mode loads the global dist, no persistent copy); market users get
    self-contained per-context copies. Both are first-class; the user picks by

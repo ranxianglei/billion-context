@@ -40,8 +40,12 @@ Two lanes, same plugin (#941):
   require a published release that carries `dsh.bundle.patch.yml`. If dsh
   fails to boot right after an add with `ERR_MODULE_NOT_FOUND` on
   `billion-context/dsh`, the profile resolved a pre-bundle copy from a stale
-  package-metadata cache (#953) — re-add pinned: `dsh plugin --profile
-  <name> add billion-context@latest`.
+   package-metadata cache (#953) — re-add pinned: `dsh plugin --profile
+   <name> add billion-context@latest`. The `desktop` profile is skipped by
+   install and remove alike (#1575): the dsh CLI refuses to manage it
+   upstream (`--profile desktop` is rejected — "managed exclusively by the
+   Electron application"), so no channel command can ever reach it; the copy
+   there updates itself in place instead (see below).
 - **Desktop app (Electron host):** the same plugin also runs inside the
   deepseek-harness **desktop** app, installed through its in-app plugin
   manager. There the bootstrap spawns its proxy from within the app process,
@@ -51,9 +55,20 @@ Two lanes, same plugin (#941):
   Volta, …) and falls back to the app's own binary run as plain Node
   (`ELECTRON_RUN_AS_NODE=1`, forced into the child env), so compression works
   with zero configuration even without a standalone Node on PATH; set
-  `BILLION_CONTEXT_NODE` to force a specific Node (it beats both). Before
-  #1429 this path threw before spawning and every session silently degraded
-  to direct send (uncompressed), visible only in bili.log.
+   `BILLION_CONTEXT_NODE` to force a specific Node (it beats both). Before
+   #1429 this path threw before spawning and every session silently degraded
+   to direct send (uncompressed), visible only in bili.log. **Updates for
+   this lane (#1575):** with the dsh CLI channel closed for the desktop
+   profile upstream and the in-app plugin manager left alone by bili, the
+   billion-context copy inside the desktop profile is owned by bili itself —
+   when the proxy running FROM it sees a newer registry version on its
+   periodic check, it swaps itself in place (junction-safe: the pnpm link is
+   displaced as a link, the verified package lands as a real directory, the
+   shared store stays byte-identical; #1872). Accepted residuals: a
+   second-writer race with the app's own plugin manager on the same files,
+   and the profile's `pnpm-lock.yaml` diverging from disk after a swap — a
+   later host-side pnpm operation could rebuild the layout and undo the
+   overwrite, which the next bili update heals back.
 - **Auto-update keeps profiles in lockstep:** the refresh has two triggers —
   after a global self-update, AND from the **profile copy's own proxy** when
   its periodic check sees a newer registry version (so dsh plugin-market
@@ -61,10 +76,13 @@ Two lanes, same plugin (#941):
   `~/.dsh/profiles/*/package.json` and bring any registry-pinned
   `billion-context` dependency to the target version (the new global version
   for the global trigger, registry-latest for the self trigger), always
-  through dsh's own `plugin add` channel — never an in-place copy — so the
-  loaded plugin and the proxy never drift apart again (#953); profiles
-  pinned to a local source are left alone. The refresh is best-effort,
-  retries next cycle on failure, and never fails the update or the proxy.
+   through dsh's own `plugin add` channel — never an in-place copy — so the
+   loaded plugin and the proxy never drift apart again (#953); profiles
+   pinned to a local source are left alone; the `desktop` profile is outside
+   the channel refresh entirely (#1575) — the dsh CLI refuses it upstream,
+   and its copy converges through its own in-place self-update instead. The
+   refresh is best-effort, retries next cycle on failure, and never fails
+   the update or the proxy.
  - **Reported: zero proxy traffic for some transports under profile install
    (#1158, under investigation):** sessions served by some of dsh's
    `llm-pi-ai`-layer transports show NO model request ever reaching the proxy

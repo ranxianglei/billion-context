@@ -169,7 +169,7 @@ no URL edits. Supported today for **pi**, **omp**, **opencode** (1.x and
 bili plugin install pi          # registers a "billion-context" entry in pi's settings (npm form when bili itself was npm-installed)
 bili plugin install omp         # registers an extensions entry in omp's config.yml (~/.omp/agent/config.yml)
 bili plugin install opencode    # registers the plugin in opencode's real config + disables native auto-compaction
-bili plugin install dsh         # runs 'dsh plugin --profile <name> add billion-context' for every existing profile
+bili plugin install dsh         # runs 'dsh plugin --profile <name> add billion-context' for each existing CLI profile (the Desktop-owned `desktop` profile is out of channel reach — see CLIENTS.md)
 bili plugin install kimi        # writes $KIMI_CODE_HOME/plugins/managed/billion-context/kimi.plugin.json (+ installed.json record); per-session routing block lands in config.toml on first start (Kimi Code >= 2.0.0)
 bili plugin install hermes      # copies the Python plugin into ~/.hermes/plugins/billion-context/ (+ machine-owned bili.json sidecar) and enables it via `hermes plugins enable billion-context`
 bili plugin install zcode       # writes hooks.enabled + a SessionStart hook + mcp.servers.bili into ~/.zcode/cli/config.json; per-session routing lands in the bigmodel provider store on first start
