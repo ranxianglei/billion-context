@@ -234,13 +234,16 @@ function droppedEntriesNote(diagnostics: CompressParseDiagnostics): string {
     // parser salvages only the complete leading entries (kind="truncated") and
     // the unterminated tail is lost without counting as invalidItems.
     if (diagnostics.kind === "truncated" && diagnostics.invalidItems <= 0) {
-        return `[The compress arguments arrived TRUNCATED — only the complete leading entries could be salvaged; any requested range not listed above was LOST, not compressed. Check acp_status for what is still compressible and re-issue the missing range(s).]`;
+        return `[The compress arguments arrived TRUNCATED — only the complete leading entries could be salvaged; any requested range not listed above was LOST, not compressed. Re-issue ALL missing ranges TOGETHER in ONE new call, as a single plain string — one block per range, each block starting with its 'mNNNNN–mNNNNN optional topic' header line followed by that range's summary (plain text survives lossy gateways best). Check acp_status for what is still compressible.]`;
     }
     if (diagnostics.invalidItems <= 0) return "";
     const reasons = (diagnostics.invalidReasons ?? []).slice(0, 3).map((r) => (r.length > 160 ? safePrefix(r, 160) + "..." : r));
     const why = reasons.length > 0 ? reasons.join(" | ") : `${diagnostics.invalidItems} entr(ies) failed validation (parse kind=${diagnostics.kind})`;
     const n = diagnostics.invalidItems;
-    return `[${n} of the submitted entr${n === 1 ? "y" : "ies"} ${n === 1 ? "was" : "were"} REJECTED and NOT compressed: ${why}. Re-issue the rejected range${n === 1 ? "" : "s"} in a new compress call.]`;
+    const reissue = n > 1
+        ? `Re-issue ALL rejected ranges TOGETHER in ONE new compress call — a single plain string works: one block per range, each starting with its 'mNNNNN–mNNNNN optional topic' header line.`
+        : `Re-issue the rejected range in a new compress call.`;
+    return `[${n} of the submitted entr${n === 1 ? "y" : "ies"} ${n === 1 ? "was" : "were"} REJECTED and NOT compressed: ${why}. ${reissue}]`;
 }
 
 // #1387 (pi-side #420/#521 alignment): post-compress continuation contract.
@@ -355,9 +358,9 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         }
         if (argCorruption) {
             const truncNote = diagnostics.kind === "truncated" ? " (looks truncated)" : "";
-            return `[Compression FAILED: the call's arguments (${argLen} chars) were not parseable JSON${truncNote} — the intended content was lost and nothing was compressed. Re-issue the compress call as well-formed JSON: a single object with a non-empty 'content' array of {startId, endId, summary} elements.${guard}]`;
+            return `[Compression FAILED: the call's arguments (${argLen} chars) were not parseable JSON${truncNote} — the intended content was lost and nothing was compressed. Re-issue the compress call as well-formed JSON: a single object with a non-empty 'content' array of {startId, endId, summary} elements — or sidestep the gateway with 'content' as ONE plain string (multiple ranges allowed: each block starts with its 'mNNNNN–mNNNNN optional topic' header line).${guard}]`;
         }
-        return `[Compression FAILED: no valid ranges parsed (kind=${diagnostics.kind}, dropped=${diagnostics.invalidItems}).${why} compress requires a non-empty 'content' array where each element is EITHER an object {startId, endId, summary} OR one line-form string whose first line is 'mNNNNN–mNNNNN optional topic' with the summary markdown on the following lines (a separate summary-only element right after a bare header line is also accepted). startId/endId are mNNNNN message refs from the conversation (call acp_status to see current refs).${compressibleSpanHint(ctx.session.state)} Re-issue the compress call with a valid content array.${guard}]`;
+        return `[Compression FAILED: no valid ranges parsed (kind=${diagnostics.kind}, dropped=${diagnostics.invalidItems}).${why} compress requires a non-empty 'content' array where each element is EITHER an object {startId, endId, summary} OR one line-form string whose first line is 'mNNNNN–mNNNNN optional topic' with the summary markdown on the following lines (a separate summary-only element right after a bare header line is also accepted); 'content' may also be ONE plain string carrying ALL ranges, each block starting with its 'mNNNNN–mNNNNN optional topic' header line. startId/endId are mNNNNN message refs from the conversation (call acp_status to see current refs).${compressibleSpanHint(ctx.session.state)} Re-issue ALL intended ranges in ONE compress call.${guard}]`;
     }
     // #847: detect reversed refs as SUBMITTED, before #1001 normalization
     // rewrites them (order matters — normalizeRangeOrder mutates in place).

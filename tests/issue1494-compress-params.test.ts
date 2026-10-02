@@ -121,6 +121,23 @@ test("#1494 A: a parse-dropped entry is surfaced in the SUCCESS receipt and logg
     assert.equal(ctx.session.state.blocks.filter((b) => b.active).length, 1);
 });
 
+test("#1494 A: multi-entry rejection teaches ONE-call batch re-issue (single plain string)", () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    const ctx = makeCtx();
+    seedTurn(ctx, [["user", "hello there"], ["assistant", "x".repeat(500)]], 2);
+    // #1495 追踪: 多条被拒时回执必须教模型合并补发 (单字符串多 range), 不再逐条重试.
+    const out = applyRanges(parseCompressInput({ content: [
+        { startId: "m00001", endId: "m00002", summary: "valid fold" },
+        { startId: "m00003" },
+        { summary: "no refs" },
+    ] }), ctx);
+    assert.ok(out.startsWith("[Compressed m00001–m00002 → 1 block(s)"), out.split("\n")[0]);
+    assert.ok(out.includes("2 of the submitted entries were REJECTED and NOT compressed"), out);
+    assert.ok(out.includes("Re-issue ALL rejected ranges TOGETHER in ONE new compress call"), out);
+    assert.ok(out.includes("single plain string"), out);
+    assert.ok(out.includes("header line"), out);
+});
+
 test("#1494 A: a parse-dropped entry is surfaced in the FAILED receipt too (0-blocks apply failure)", () => {
     _setStoreForTest(new SessionStore({ enabled: false }));
     const ctx = makeCtx();

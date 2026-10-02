@@ -86,6 +86,9 @@ test("#1495: truncated gateway-stringified array — salvage loss is named, lost
     assert.ok(out.startsWith("[Compressed"), `salvage success expected, got: ${out.slice(0, 160)}`);
     assert.ok(out.includes("arrived TRUNCATED"), `truncation loss must be named:\n${out}`);
     assert.ok(out.includes("was LOST, not compressed"), `salvage loss guidance:\n${out}`);
+    // #1495 追踪: 模型在有损网关下退回逐条调用 — 回执必须教它把补发合并回一次单字符串调用.
+    assert.ok(out.includes("Re-issue ALL missing ranges TOGETHER in ONE new call"), `batch re-issue teaching:\n${out}`);
+    assert.ok(out.includes("single plain string"), `single-string form teaching:\n${out}`);
     assert.ok(!out.includes("m00003–m00004"), "lost range must not appear in the applied detail:\n" + out);
     assert.ok(ctx.logs.some((l) => l.includes("compress PARTIAL") && l.includes("kind=truncated")), `server-side PARTIAL log for truncated salvage:\n${ctx.logs.join("\n")}`);
 });
