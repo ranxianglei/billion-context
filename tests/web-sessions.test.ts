@@ -618,6 +618,20 @@ withSessionsDir("#1937: corrupt and content-store files never block or poison th
     assert.equal(st.decodedTotal, 2, "junk + valid decoded; content-store excluded by name before any decode");
 });
 
+withSessionsDir("#1937 review: .tmp- mid-name (host label) stays indexed — kernel walkJsonFiles parity", async (dir) => {
+    const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
+    await store.writeNow(makeSession("host-tmp", { protocol: "openai", upstreamOrigin: "https://api.tmp-x.example/v1" }, { requests: 2, inputTokens: 10, contextTokens: 9 }));
+    const files = readdirSync(dir, { recursive: true }) as string[];
+    const f = files.find((x) => x.endsWith(".json") && !x.endsWith(".content-store.json"))!;
+    assert.ok(f.includes(".tmp-") && !f.startsWith(".tmp-"), "fixture name contains .tmp- mid-string only");
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+    const list = await buildSessionList();
+    assert.deepEqual(list.map((s) => s.id), ["host-tmp"], "kernel loads this file at boot, so the index must too");
+    const det = await buildSessionDetail("host-tmp");
+    assert.ok(det && det.id === "host-tmp", "detail resolves the same file instead of 404ing");
+});
+
 withSessionsDir("#1937: dir breakage serves stale snapshot; missing dir rejects loudly", async (dir) => {
     const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
     await store.writeNow(makeSession("seed-1", { protocol: "openai" }, { requests: 2, inputTokens: 10, contextTokens: 9 }));

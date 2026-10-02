@@ -203,7 +203,10 @@ async function walkSessionFiles(dir: string): Promise<Array<{ abs: string; mtime
                 continue;
             }
             if (!e.name.endsWith(".json")) continue;
-            if (e.name.includes(".tmp-") || e.name.endsWith(".content-store.json")) continue;
+            // startsWith, not includes: parity with kernel walkJsonFiles — canonical names may
+            // legitimately contain ".tmp-" mid-string (host labels keep dots); enc temps lack
+            // the .json suffix so the gate above drops them anyway (#1939 review).
+            if (e.name.startsWith(".tmp-") || e.name.endsWith(".content-store.json")) continue;
             if (!e.isFile()) continue;
             try {
                 const st = await stat(abs);
