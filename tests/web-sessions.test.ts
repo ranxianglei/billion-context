@@ -531,7 +531,8 @@ test("#1535: web UI stays aligned with the model-switch column", async () => {
         assert.match(swHtml!, /1 · 8\.0K/, "switch cell shows count · dropped tokens");
         assert.ok(swHtml!.includes('title="Mid-session model switches'), "switch cell carries the attribution tooltip");
         const plainHtml = rows.find((r) => r.includes("plain-1"));
-        assert.ok(plainHtml, "plain session shows no switch data");
+        assert.ok(plainHtml, "plain session row rendered");
+        assert.ok(!plainHtml!.includes("8.0K"), "plain session shows no switch data");
     } finally {
         if (prevConfig === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = prevConfig;
         if (prevSessions === undefined) delete process.env.BILI_SESSIONS_DIR; else process.env.BILI_SESSIONS_DIR = prevSessions;
