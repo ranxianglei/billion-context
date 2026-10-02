@@ -136,13 +136,14 @@ def get(args):
 def status(args):
     sid, entries = _live(args)
     ctx = tr.context_tokens(entries)
-    layer = ('emergency' if ctx >= tr.EMERGENCY else 'pressure' if ctx >= tr.PRESSURE
+    hard, pressure, emergency = tr.limits(entries)
+    layer = ('emergency' if ctx >= emergency else 'pressure' if ctx >= pressure
              else 'growth' if ctx >= tr.SOFT else 'below soft')
     recs = store.load_summaries(sid)
     need = store.digest_needed(sid)
     return '\n'.join([
         f'session_id={sid}',
-        pr.breakdown(ctx, tr.SOFT, tr.PRESSURE, tr.HARD) + f' — {layer}',
+        pr.breakdown(ctx, tr.SOFT, pressure, hard) + f' — {layer}' + (f' (model {tr.current_model(entries)})' if tr.current_model(entries) else ''),
         f'compact_ready 已调用（本次压缩周期内）: {"是" if tr.ready_since_boundary(entries) else "否"}',
         f'已压缩次数: {tr.compactions(entries)}，存档轮数: {len(tr.load_archive(sid))}',
         f'摘要: {len(store.active_summaries(recs))} 条生效 / {len(recs)} 条存档'
@@ -176,7 +177,7 @@ def handle(req):
     method, params = req.get('method'), req.get('params') or {}
     if method == 'initialize':
         return {'protocolVersion': params.get('protocolVersion', '2024-11-05'), 'capabilities': {'tools': {}},
-                'serverInfo': {'name': 'recall', 'version': '0.2.1'}}
+                'serverInfo': {'name': 'recall', 'version': '0.3.0'}}
     if method == 'tools/list':
         return {'tools': TOOLS}
     if method == 'tools/call':

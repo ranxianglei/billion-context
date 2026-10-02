@@ -2,10 +2,22 @@
 
 Claude Code 本地插件：可找回的上下文压缩。纯 hook + MCP，不改 URL、不经过网络代理。
 
-v0.2.0 复刻了 [billion-context](https://github.com/ranxianglei/billion-context) / [acp-kernel](https://github.com/ranxianglei/acp-kernel) v0.0.99（MIT）的压缩规则、提醒文本、分层摘要、规则与 absorb 提示；模型可见的文本逐字取自 acp-kernel，仅按本插件机制做了替换（见 `plugin/recall/prompts.py` 注释）。版权与许可见 `NOTICE`。
+## 安装
+需要 Python 3（只用标准库）。
+```
+claude plugin marketplace add zhou1736948757-cpu/billion-claude-recall
+claude plugin install billion-claude-recall@billion-claude-recall-marketplace
+```
+然后在 `~/.claude/settings.json` 里设 `"autoCompactWindow": 150000`（与 `RECALL_SOFT` 相同），开新会话生效。
+
+Windows：插件默认用 `python3` 启动；Windows 上的 `python3` 常常是应用商店占位程序或无法直接执行的脚本，MCP 服务会启动失败。请在 settings 的 `env` 里加 `"RECALL_PYTHON": "python"`（或 Python 可执行文件的完整路径）。hook 在 `python3` 不可用时会自动退回 `python`，MCP 服务没有这种退路。
+
+v0.2.0 起复刻了 [billion-context](https://github.com/ranxianglei/billion-context) / [acp-kernel](https://github.com/ranxianglei/acp-kernel) v0.0.99（MIT）的压缩规则、提醒文本、分层摘要、规则与 absorb 提示；模型可见的文本逐字取自 acp-kernel，仅按本插件机制做了替换（见 `plugin/recall/prompts.py` 注释）。版权与许可见 `NOTICE`。
 
 ## 工作方式
-- 上下文达到 150k 后，Claude Code 的自动压缩会尝试触发。PreCompact hook 会拦截，直到模型调用 `compact_ready`（必须是真实的工具调用，文本里出现工具名不算）才放行；达到 300k 时强制放行。手动 `/compact` 总是放行。
+- 上下文达到 150k 后，Claude Code 的自动压缩会尝试触发。PreCompact hook 会拦截，直到模型调用 `compact_ready`（必须是真实的工具调用，文本里出现工具名不算）才放行；达到强制线时强制放行。手动 `/compact` 总是放行。
+- 强制线按最新一轮主对话的模型取：模型名含 `haiku` 时为 180k（Haiku 只有 200K 窗口），其他模型为 300k。下文的 225k / 285k 是 300k 时的值，Haiku 下为 135k / 171k。
+- 如果记录里最近一次请求是"Prompt is too long"报错（模型窗口比强制线小，例如 200K 窗口的 Sonnet/Opus），下一次自动压缩直接放行，不会卡死。
 - 提醒分三层（UserPromptSubmit + PostToolUse）：
   - growth：150k 起每涨 50k 提醒一次，附完整的 HOW TO COMPRESS 规则；
   - pressure：225k（HARD 的 75%）起每次 hook 调用都提醒（OVER-LIMIT）；
@@ -47,7 +59,9 @@ v0.2.0 复刻了 [billion-context](https://github.com/ranxianglei/billion-contex
 
 ## 调参
 环境变量（可写进 `~/.claude/settings.json` 的 `env`）：
-- `RECALL_SOFT`、`RECALL_STEP`、`RECALL_HARD`，默认值依次是 150000、50000、300000。pressure 和 emergency 线分别取 HARD 的 75% 和 95%。
+- `RECALL_SOFT`、`RECALL_STEP`、`RECALL_HARD`，默认值依次是 150000、50000、300000。pressure 和 emergency 线分别取强制线的 75% 和 95%。`RECALL_HARD` 必须小于所用模型的窗口；200K 窗口的非 Haiku 模型请设为 180000 左右。
+- `RECALL_HARD_HAIKU`：Haiku 的强制线，默认 180000。
+- `RECALL_PYTHON`：启动 hook 和 MCP 服务的 Python 命令，默认 `python3`（Windows 见"安装"）。
 - `RECALL_HOME`：存档目录，默认 `~/.claude/recall`。
 - `RECALL_PROJECTS`：transcript 根目录，默认 `~/.claude/projects`，主要用于测试。
 
@@ -72,7 +86,7 @@ v0.2.0 复刻了 [billion-context](https://github.com/ranxianglei/billion-contex
 - `block`：拦截自动压缩。
 - `allow`：放行并存档。字段有：
   - `trigger`；
-  - `reason`（ready / hard / manual）；
+  - `reason`（ready / hard / overflow / manual）；
   - `turns`；
   - `summaries`（本次新存的摘要 id）；
   - `rules`（规则条数）；
@@ -81,6 +95,9 @@ v0.2.0 复刻了 [billion-context](https://github.com/ranxianglei/billion-contex
 - `error`：hook 异常，字段 `hook`、`trace`。
 
 无动作的检查不记录。
+
+## 存储与隐私
+存档（对话原文、摘要、规则、待办、日志）以明文保存在本机 `~/.claude/recall/`，不会上传，也不会自动清理；不需要时手动删除对应会话目录即可。
 
 ## 致谢
 本插件使用了 acp-kernel 与 billion-context 的提示词与设计：<https://github.com/ranxianglei/acp-kernel>、<https://github.com/ranxianglei/billion-context>。

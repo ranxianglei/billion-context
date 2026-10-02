@@ -7,8 +7,7 @@ import re
 SOFT = int(os.environ.get('RECALL_SOFT', 150_000))
 STEP = int(os.environ.get('RECALL_STEP', 50_000))
 HARD = int(os.environ.get('RECALL_HARD', 300_000))
-PRESSURE = HARD * 75 // 100  # remind on every hook call from here
-EMERGENCY = HARD * 95 // 100  # emergency text from here
+HARD_HAIKU = int(os.environ.get('RECALL_HARD_HAIKU', 180_000))  # Haiku's 200K window: HARD would never be reached
 ABSORB_MIN_TOKENS = 4_000  # acp-kernel absorb.minToolTokens
 KEEP_TURNS = 5
 BLOCK_CHARS = 9_500  # Claude Code inlines at most ~10k chars per hook output; more gets saved to a file.
@@ -46,15 +45,49 @@ def _main(entries):
     return (e for e in entries if not e.get('isSidechain'))
 
 
+def _api_error(e):
+    """Synthetic entry Claude Code writes when a request fails; its usage is all zeros and its model '<synthetic>'."""
+    return e.get('type') == 'assistant' and bool(e.get('isApiErrorMessage'))
+
+
 def context_tokens(entries):
     """Context size as of the last main-chain model reply (input + cache read + cache write)."""
     tokens = 0
     for e in _main(entries):
         msg = e.get('message')
-        if e.get('type') == 'assistant' and isinstance(msg, dict) and msg.get('usage'):
+        if e.get('type') == 'assistant' and not _api_error(e) and isinstance(msg, dict) and msg.get('usage'):
             u = msg['usage']
             tokens = u.get('input_tokens', 0) + u.get('cache_read_input_tokens', 0) + u.get('cache_creation_input_tokens', 0)
     return tokens
+
+
+def current_model(entries):
+    model = ''
+    for e in _main(entries):
+        msg = e.get('message')
+        if e.get('type') == 'assistant' and not _api_error(e) and isinstance(msg, dict) and msg.get('model'):
+            model = msg['model']
+    return model
+
+
+def limits(entries):
+    """(hard, pressure, emergency) for the model of the latest main-chain reply."""
+    hard = HARD_HAIKU if 'haiku' in current_model(entries).lower() else HARD
+    return hard, hard * 75 // 100, hard * 95 // 100
+
+
+def overflowed(entries):
+    """True if the latest main-chain reply since the last compaction is a 'Prompt is too long' API error.
+
+    The window was hit before the hard line (e.g. a 200K model under the default 300k), so compaction must pass.
+    """
+    last = None
+    for e in _main(entries):
+        if _is_boundary(e):
+            last = None
+        elif e.get('type') == 'assistant':
+            last = e
+    return last is not None and _api_error(last) and 'too long' in _text_of((last.get('message') or {}).get('content')).lower()
 
 
 def _is_boundary(e):
@@ -164,6 +197,18 @@ def turns(entries):
         t['user'] = t['text'].split('\n', 1)[0][len('【用户】'):][:200]
         t['files'] = list(dict.fromkeys(t['files']))
     return result
+
+
+def current_turn(entries, first, whole):
+    """Number of the current turn, given the first turn since the last compaction.
+
+    None when that cannot be known: entries are only a tail of the transcript (whole=False) and hold no boundary.
+    """
+    if not whole and not any(_is_boundary(e) for e in _main(entries)):
+        return None
+    ts = turns(entries)
+    n = sum(1 for t in ts if t['epoch'] == ts[-1]['epoch']) if ts else 0
+    return first + n - 1 if n else None
 
 
 def write_archive(session_id, transcript_path):

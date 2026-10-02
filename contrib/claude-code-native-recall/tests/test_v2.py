@@ -85,7 +85,15 @@ class V2Test(RecallTest):
         text = self.context(self.hook('nudge', hook_event_name='PostToolUse'))
         self.assertIn('当前上下文约 160k', text)
         self.assertIn('HOW TO COMPRESS', text)
-        self.assertIn('#1–current turn', text)
+        self.assertIn('#1–#2 (#2 is the current turn)', text)
+
+    def test_reminder_names_real_turn_numbers_after_a_compaction(self):
+        first = self.conversation(3, 160_000) + [ready('s', 160_000, 'r1')]
+        self.write(first)
+        self.hook('precompact', trigger='auto')  # archives turns #1–#3
+        self.write(first + [BOUNDARY, SUMMARY] + self.conversation(2, 230_000))
+        text = self.context(self.hook('nudge', hook_event_name='PostToolUse'))
+        self.assertIn('#4–#5 (#5 is the current turn)', text)
 
     # --- G1-3 prior digest ---
     def test_digest_requested_when_summaries_overflow_and_replaces_them(self):

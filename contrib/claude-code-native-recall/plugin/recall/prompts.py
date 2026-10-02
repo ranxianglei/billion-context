@@ -212,9 +212,10 @@ def breakdown(ctx, soft, pressure, hard):
     return f'Context: {fmt_k(ctx)} tokens (soft {fmt_k(soft)} · pressure {fmt_k(pressure)} · forced compaction {fmt_k(hard)})'
 
 
-def ranges(first_turn):
+def ranges(first_turn, last_turn=None):
     # Replaces formatRanges: there are no per-message refs, only the turns since the last compaction.
-    return f'Compressible turns (oldest first): #{first_turn}–current turn — one compact_ready summary covers all of them.'
+    span = f'#{first_turn}–#{last_turn} (#{last_turn} is the current turn)' if last_turn else f'#{first_turn}–current turn'
+    return f'Compressible turns (oldest first): {span} — one compact_ready summary covers all of them.'
 
 
 # Replaces BATCH_TIP: there is exactly one range per call.
@@ -224,22 +225,22 @@ READY_TIP = ('💡 compact_ready folds every turn since the previous compaction 
 HOW_TO_POINTER = 'HOW TO COMPRESS: follow the rules in the compact_ready tool description.'
 
 
-def growth_text(ctx, soft, pressure, hard, first_turn):
+def growth_text(ctx, soft, pressure, hard, first_turn, last_turn=None):
     return '\n'.join([EFFICIENCY_NOTE + '\n\n' + PHILOSOPHY, '', breakdown(ctx, soft, pressure, hard), '', HOW_TO,
-                      '', ranges(first_turn), '', READY_TIP])
+                      '', ranges(first_turn, last_turn), '', READY_TIP])
 
 
-def pressure_text(ctx, soft, pressure, hard, first_turn):
+def pressure_text(ctx, soft, pressure, hard, first_turn, last_turn=None):
     # billion's pressure band (usage >= 0.75) is labelled OVER-LIMIT. It fires on every hook call here, so the
     # full HOW TO COMPRESS text (already in the tool description) is replaced by a pointer to keep repeats small.
     return '\n'.join([f'[OVER-LIMIT] Call compact_ready at the next natural breakpoint; compaction is forced at {fmt_k(hard)}.',
-                      '', breakdown(ctx, soft, pressure, hard), '', HOW_TO_POINTER, '', ranges(first_turn)])
+                      '', breakdown(ctx, soft, pressure, hard), '', HOW_TO_POINTER, '', ranges(first_turn, last_turn)])
 
 
-def emergency_text(ctx, soft, pressure, hard, first_turn):
+def emergency_text(ctx, soft, pressure, hard, first_turn, last_turn=None):
     header = EMERGENCY_HEADER.replace('compress now', 'call compact_ready now')
     return '\n'.join([header + '\n\n' + PHILOSOPHY, '', breakdown(ctx, soft, pressure, hard), '', HOW_TO_POINTER,
-                      '', ranges(first_turn)])
+                      '', ranges(first_turn, last_turn)])
 
 
 def tier_guidance(tier, ids):

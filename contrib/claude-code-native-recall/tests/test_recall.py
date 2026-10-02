@@ -124,6 +124,36 @@ class RecallTest(unittest.TestCase):
         self.write(self.conversation(3, 300_000))
         self.assertEqual(self.hook('precompact', trigger='auto').returncode, 0)
 
+    def with_model(self, entries, model):
+        for e in entries:
+            if e['type'] == 'assistant':
+                e['message']['model'] = model
+        return entries
+
+    def test_haiku_hard_line_fits_its_200k_window(self):
+        self.write(self.with_model(self.conversation(3, 181_000), 'claude-haiku-4-5-20251001'))
+        self.assertEqual(self.hook('precompact', trigger='auto').returncode, 0)
+        self.assertEqual(self.events()[-1]['reason'], 'hard')
+        self.write(self.with_model(self.conversation(3, 181_000), 'claude-opus-5-5'))
+        self.assertEqual(self.hook('precompact', trigger='auto').returncode, 2, 'other models keep the 300k line')
+
+    def test_haiku_pressure_layer_scales_with_its_hard_line(self):
+        self.write(self.with_model(self.conversation(2, 140_000), 'claude-haiku-4-5-20251001'))
+        self.hook('nudge', hook_event_name='PostToolUse')
+        self.assertEqual(self.events()[-1]['layer'], 'pressure')
+
+    def test_prompt_too_long_error_lets_compaction_through(self):
+        err = {'type': 'assistant', 'isSidechain': False, 'isApiErrorMessage': True, 'error': 'invalid_request',
+               'message': {'role': 'assistant', 'model': '<synthetic>', 'content': [{'type': 'text', 'text': 'Prompt is too long'}],
+                           'usage': {'input_tokens': 0, 'cache_read_input_tokens': 0, 'cache_creation_input_tokens': 0}}}
+        convo = self.with_model(self.conversation(3, 199_000), 'claude-sonnet-5-5')
+        self.write(convo + [user('继续'), err])
+        self.assertEqual(self.hook('precompact', trigger='auto').returncode, 0)
+        last = self.events()[-1]
+        self.assertEqual((last['reason'], last['ctx']), ('overflow', 199_000), 'error entry must not zero the context size')
+        self.write(convo + [user('继续'), err, BOUNDARY, SUMMARY] + self.conversation(2, 160_000))
+        self.assertEqual(self.hook('precompact', trigger='auto').returncode, 2, 'an error before the last compaction is spent')
+
     def test_manual_compact_always_allowed(self):
         self.write(self.conversation(3, 120_000))
         self.assertEqual(self.hook('precompact', trigger='manual').returncode, 0)

@@ -33,11 +33,11 @@ GROWTH_ZH = ('[billion-claude-recall] 当前上下文约 {k}k tokens（软线 {s
              '如果正处在关键步骤中，继续工作，告一段落后再调用。')
 
 
-def reminder(sid, ctx, layer):
+def reminder(sid, ctx, layer, hard, pressure, entries, whole):
     first = len(tr.load_archive(sid)) + 1
-    args = (ctx, tr.SOFT, tr.PRESSURE, tr.HARD, first)
+    args = (ctx, tr.SOFT, pressure, hard, first, tr.current_turn(entries, first, whole))
     if layer == 'growth':
-        text = GROWTH_ZH.format(k=ctx // 1000, soft=tr.SOFT // 1000, hard=tr.HARD // 1000) + '\n\n' + pr.growth_text(*args)
+        text = GROWTH_ZH.format(k=ctx // 1000, soft=tr.SOFT // 1000, hard=hard // 1000) + '\n\n' + pr.growth_text(*args)
     else:
         text = (pr.emergency_text if layer == 'emergency' else pr.pressure_text)(*args)
     need = store.digest_needed(sid)
@@ -66,6 +66,7 @@ def nudge(data):
         return
     entries = list(tr.read_entries(data['transcript_path'], tr.TAIL_BYTES))
     ctx = tr.context_tokens(entries)
+    hard, pressure, emergency = tr.limits(entries)
     bucket = (ctx - tr.SOFT) // tr.STEP if ctx >= tr.SOFT else -1
     state_path = tr.session_dir(sid) / 'nudge.json'
     last = json.loads(state_path.read_text(encoding='utf-8'))['bucket'] if state_path.exists() else -1
@@ -74,16 +75,17 @@ def nudge(data):
         state_path.write_text(json.dumps({'bucket': bucket}), encoding='utf-8')
     layer = None
     if not tr.ready_since_boundary(entries):
-        if ctx >= tr.EMERGENCY:
+        if ctx >= emergency:
             layer = 'emergency'
-        elif ctx >= tr.PRESSURE:
+        elif ctx >= pressure:
             layer = 'pressure'
         elif bucket > last:
             layer = 'growth'
     parts = []
     if layer:
         log(sid, 'nudge', ctx=ctx, bucket=bucket, layer=layer)
-        parts.append(reminder(sid, ctx, layer))
+        parts.append(reminder(sid, ctx, layer, hard, pressure, entries,
+                              os.path.getsize(data['transcript_path']) <= tr.TAIL_BYTES))
     note = absorb(data, ctx)
     if note:
         parts.append(note)
@@ -94,16 +96,18 @@ def nudge(data):
 def precompact(data):
     entries = list(tr.read_entries(data['transcript_path'], tr.TAIL_BYTES))
     ctx = tr.context_tokens(entries)
-    if data.get('trigger') == 'auto' and ctx < tr.HARD and not tr.ready_since_boundary(entries):
+    hard = tr.limits(entries)[0]
+    overflow = tr.overflowed(entries)
+    if data.get('trigger') == 'auto' and ctx < hard and not overflow and not tr.ready_since_boundary(entries):
         log(data['session_id'], 'block', ctx=ctx)
-        sys.stderr.write(f'[billion-claude-recall] 上下文 {ctx // 1000}k，模型尚未调用 compact_ready，推迟压缩（{tr.HARD // 1000}k 强制）。')
+        sys.stderr.write(f'[billion-claude-recall] 上下文 {ctx // 1000}k，模型尚未调用 compact_ready，推迟压缩（{hard // 1000}k 强制）。')
         sys.exit(2)
     sid = data['session_id']
     tr.write_archive(sid, data['transcript_path'])
     full = list(tr.read_entries(data['transcript_path']))
     turns = tr.load_archive(sid)
     log(sid, 'allow', ctx=ctx, trigger=data.get('trigger'),
-        reason='manual' if data.get('trigger') != 'auto' else ('hard' if ctx >= tr.HARD else 'ready'),
+        reason='manual' if data.get('trigger') != 'auto' else ('hard' if ctx >= hard else 'overflow' if overflow else 'ready'),
         turns=len(turns), summaries=store.save_summary(sid, full, turns),
         rules=store.save_rules(sid, full), todos=store.save_todos(sid, full))
 
