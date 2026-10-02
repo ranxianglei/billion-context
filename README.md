@@ -302,7 +302,7 @@ a healthy session sits at **95–97%**. When you see less, the attribution tells
 you which of the usual suspects it was, in this order: ① upstream cache TTL
 expiry (shows up as stable-prefix misses — the top-spikes line names idle
 times), ② a model switch, ③ a bili bug (report it with the page attached),
-④ other/unknown. `/acp-cache [full]` lists every fold & line; same report over
+④ other/unknown. `/acp-cache [full]` lists every fold & line.
 Since #1535 the report ends with a `MODEL SWITCHES` section: a mid-session
 model change invalidates the provider's prefix cache, so the whole stable
 prefix is re-billed on the next request — each switch's unexplained residual
@@ -312,6 +312,16 @@ tokens are listed (`full` lists every event, the summary the last 8), and
 the web sessions table gains a matching model-switch column.
 HTTP: `GET /__bili/cache-report`; the raw per-request `[acp-usage]` lines still
 land in the log file for deep dives.
+
+**Pin one model per session.** Upstream prefix caches are namespaced per
+model, so a mid-session switch invalidates the whole cached prefix and the
+next request re-bills it in full (the `MODEL SWITCHES` section above charges
+exactly that residual to the switch). Another cost lever when running Claude
+models through an OpenAI-format relay (a translated `/v1/responses` lane):
+Anthropic caching uses explicit `cache_control` breakpoints that the relay
+must place — if your reports show cached tokens stuck near the system head
+while the input keeps growing, ask your relay operator whether multiple
+breakpoints (or automatic caching) can be enabled for that lane (#1613).
 
 **What does `/acp` show?** In clients with the native plugin (opencode, dsh),
 `/acp` renders the ACP status panel of the current conversation straight from
