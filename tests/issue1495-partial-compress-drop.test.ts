@@ -73,6 +73,8 @@ test("#1495: valid + invalid entry mix — success receipt names the rejected en
     assert.ok(out.startsWith("[Compressed"), `partial success expected, got: ${out.slice(0, 160)}`);
     assert.ok(out.includes("1 of the submitted entry was REJECTED and NOT compressed"), `dropped entry must be named:\n${out}`);
     assert.ok(out.includes("entry 1: missing range bounds"), `rejection reason inline:\n${out}`);
+    // #1523: recovery guidance must steer back to ONE batched call, not serial re-issues.
+    assert.ok(out.includes("in ONE new compress call, batched with everything else still pending — never one range per call."), `batched re-issue guidance:\n${out}`);
 });
 
 test("#1495: truncated gateway-stringified array — salvage loss is named, lost range not listed as applied", () => {
@@ -86,6 +88,12 @@ test("#1495: truncated gateway-stringified array — salvage loss is named, lost
     assert.ok(out.startsWith("[Compressed"), `salvage success expected, got: ${out.slice(0, 160)}`);
     assert.ok(out.includes("arrived TRUNCATED"), `truncation loss must be named:\n${out}`);
     assert.ok(out.includes("was LOST, not compressed"), `salvage loss guidance:\n${out}`);
+    // #1523: missing ranges go back in ONE batched call; if the gateway keeps cutting big
+    // JSON arrays, the whole batch rides on a single plain-string 'content' (line-form
+    // segments) — no array structure left for the gateway to corrupt.
+    assert.ok(out.includes("Re-issue the missing range(s) in ONE compress call, batched with everything else still pending — never one range per call."), `batched re-issue guidance:\n${out}`);
+    assert.ok(out.includes("single plain-string 'content' instead of an array"), `gateway-resilient shape hint:\n${out}`);
+    assert.ok(out.includes("segments separated by blank lines"), `line-form segment layout hint:\n${out}`);
     assert.ok(!out.includes("m00003–m00004"), "lost range must not appear in the applied detail:\n" + out);
     assert.ok(ctx.logs.some((l) => l.includes("compress PARTIAL") && l.includes("kind=truncated")), `server-side PARTIAL log for truncated salvage:\n${ctx.logs.join("\n")}`);
 });

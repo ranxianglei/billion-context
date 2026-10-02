@@ -229,18 +229,26 @@ export function saltedMsgIdForLog(id: string, salt: string = MSG_ID_LOG_SALT): s
 // survivors — a 3-entry call that silently loses one reads as a clean 2-block
 // success (the exact report in the issue; the kernel diagnostics carry the
 // per-entry reasons but nothing surfaced them when ≥1 range survived).
+// #1523: both recovery hints must steer BACK to one batched call — the v0.1.163
+// wording ("re-issue the missing range(s)" / "in a new compress call") read as
+// one-range-per-call after repeated partial failures, and models rationally
+// converged to serial calls (each compress = a full proxy round-trip). The
+// truncated variant additionally offers the gateway-resilient shape: one
+// plain-string 'content' carrying every range as line-form segments (kernel
+// splitLineEntries) — a single string field has no array structure for a lossy
+// gateway to cut (the only surviving shape in the #1495 session).
 function droppedEntriesNote(diagnostics: CompressParseDiagnostics): string {
     // #1495: a gateway-stringified content array can arrive CUT — the lenient
     // parser salvages only the complete leading entries (kind="truncated") and
     // the unterminated tail is lost without counting as invalidItems.
     if (diagnostics.kind === "truncated" && diagnostics.invalidItems <= 0) {
-        return `[The compress arguments arrived TRUNCATED — only the complete leading entries could be salvaged; any requested range not listed above was LOST, not compressed. Check acp_status for what is still compressible and re-issue the missing range(s).]`;
+        return `[The compress arguments arrived TRUNCATED — only the complete leading entries could be salvaged; any requested range not listed above was LOST, not compressed. Re-issue the missing range(s) in ONE compress call, batched with everything else still pending — never one range per call. If large JSON arrays keep getting cut by this gateway, carry the whole batch as a single plain-string 'content' instead of an array: each range as one segment, first line 'mNNNNN–mNNNNN optional topic', following lines its summary markdown, segments separated by blank lines — a plain string has no array for the gateway to cut.]`;
     }
     if (diagnostics.invalidItems <= 0) return "";
     const reasons = (diagnostics.invalidReasons ?? []).slice(0, 3).map((r) => (r.length > 160 ? safePrefix(r, 160) + "..." : r));
     const why = reasons.length > 0 ? reasons.join(" | ") : `${diagnostics.invalidItems} entr(ies) failed validation (parse kind=${diagnostics.kind})`;
     const n = diagnostics.invalidItems;
-    return `[${n} of the submitted entr${n === 1 ? "y" : "ies"} ${n === 1 ? "was" : "were"} REJECTED and NOT compressed: ${why}. Re-issue the rejected range${n === 1 ? "" : "s"} in a new compress call.]`;
+    return `[${n} of the submitted entr${n === 1 ? "y" : "ies"} ${n === 1 ? "was" : "were"} REJECTED and NOT compressed: ${why}. Re-issue the rejected range${n === 1 ? "" : "s"} in ONE new compress call, batched with everything else still pending — never one range per call.]`;
 }
 
 // #1387 (pi-side #420/#521 alignment): post-compress continuation contract.

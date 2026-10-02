@@ -116,7 +116,8 @@ test("#1494 A: a parse-dropped entry is surfaced in the SUCCESS receipt and logg
     assert.ok(out.startsWith("[Compressed m00001–m00002 → 1 block(s)"), out.split("\n")[0]);
     assert.ok(out.includes("1 of the submitted entry was REJECTED and NOT compressed"), out);
     assert.ok(out.includes("entry 1: missing range bounds"), out);
-    assert.ok(out.includes("Re-issue the rejected range in a new compress call"), out);
+    // #1523: the old "in a new compress call" anchor taught one-range-per-call; the receipt now steers to one batched call.
+    assert.ok(out.includes("Re-issue the rejected range in ONE new compress call, batched with everything else still pending — never one range per call."), out);
     assert.ok(ctx.logs.some((l) => l.includes("compress PARTIAL") && l.includes("rejected")), ctx.logs.join("\n"));
     assert.equal(ctx.session.state.blocks.filter((b) => b.active).length, 1);
 });
