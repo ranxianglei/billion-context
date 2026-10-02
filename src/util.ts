@@ -192,6 +192,14 @@ const CONTEXT_OVERFLOW_PATTERNS: RegExp[] = [
     /maximum context size/i,
     /longer than the model'?s context length/i,
     /exceeds the context window/i,
+    // #1812: vLLM chat-completions dialect: "prompt (N tokens) + max tokens (M)
+    // exceeds the context (W); requests are never truncated" — NO word "window"
+    // after "context", so the pattern above does not match it. Recognition
+    // only: the numbers in this dialect are deliberately NOT extracted (error
+    // text is the least reliable window source — #1812 review); the rescue
+    // runs against the configured/declared window and the guidance warn tells
+    // the operator how to declare the real one.
+    /exceeds the context\s*\(/i,
     /out of room in the model/i,
     /exceeded model token limit/i,
     /prompt is too long/i,
@@ -232,6 +240,10 @@ function parseOverflowWindow(text: string): number | undefined {
     // first parenthesized number is the rejected payload and must not be used.
     m = text.match(/maximum number of tokens allowed\s*\((\d[\d,]*)\)/i);
     if (m) return toTokenNumber(m[1]);
+    // #1812: the vLLM "exceeds the context (W)" number is intentionally NOT
+    // parsed — learning a window from upstream error text proved unstable
+    // (relay rewrites, dialect drift); the arm/rescue sizes against the
+    // configured window instead.
     m =
         text.match(/maximum context length is (\d[\d,]*)/i) ??
         text.match(/maximum context length of (\d[\d,]*)/i) ??

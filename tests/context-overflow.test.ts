@@ -53,6 +53,39 @@ test("sglang: 'input (N tokens) is longer than the model's context length (M tok
     assert.equal(info2.window, 262144);
 });
 
+test("vLLM: 'prompt (N tokens) + max tokens (M) exceeds the context (W)' → recognized as overflow; the stated numbers are deliberately NOT extracted (#1812)", () => {
+    // Captured verbatim from a real vLLM server behind a relay (#1812 log,
+    // model swift-1.5-iq3_xxs on a 131072-token server). No word "window" in
+    // the message — the pre-#1812 pattern list did not match it, so the error
+    // passed through verbatim and the client retried into a hard 400 loop.
+    // Recognition arms the rescue; the window stays the configured/declared
+    // one (error-text numbers were removed as a window source — review on
+    // #1812), and the operator is pointed at the config knobs instead.
+    const body = JSON.stringify({
+        error: { type: "invalid_request_error", message: "prompt (69886 tokens) + max tokens (65536) exceeds the context (131072); requests are never truncated" },
+    });
+    const info = inspectContextOverflow(400, body);
+    assert.equal(info.isOverflow, true);
+    assert.equal(info.window, undefined);
+    assert.equal("promptTokens" in info, false);
+});
+
+test("vLLM comma-grouped: recognition holds with thousands separators", () => {
+    const body = JSON.stringify({
+        error: { type: "invalid_request_error", message: "prompt (98,765 tokens) + max tokens (32,768) exceeds the context (131,072); requests are never truncated" },
+    });
+    const info = inspectContextOverflow(400, body);
+    assert.equal(info.isOverflow, true);
+    assert.equal(info.window, undefined);
+});
+
+test("sglang 'input (N tokens)' dialect still yields its window (#570-era behavior)", () => {
+    const message = "The input (400013 tokens) is longer than the model's context length (262144 tokens).";
+    const info = inspectContextOverflow(400, JSON.stringify({ object: "error", message }));
+    assert.equal(info.isOverflow, true);
+    assert.equal(info.window, 262144);
+});
+
 test("llama.cpp: 'exceed_context_size_error (N / M > W)' → overflow + window W (#570)", () => {
     // Captured shape from a real llama-server rejection. The window must be W
     // (the limit AFTER '>'), not N or M — learning either of those would
