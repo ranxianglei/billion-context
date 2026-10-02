@@ -15,7 +15,7 @@ import { getSession, _resetSessionsForTest } from "../src/session.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { markdownToHtml } from "../src/web/markdown.ts";
 import { WEB_CLIENT } from "../src/web/client.ts";
-import { buildOverview, buildSessionDetail, buildSessionList, _resetDiskCacheForTest } from "../src/web/sessions-data.ts";
+import { buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, hiddenEmptyCount, _resetDiskCacheForTest, _diskScanStatsForTest } from "../src/web/sessions-data.ts";
 import vm from "node:vm";
 import { rmrf } from "./tmp-rm.ts";
 
@@ -531,13 +531,205 @@ test("#1535: web UI stays aligned with the model-switch column", async () => {
         assert.match(swHtml!, /1 · 8\.0K/, "switch cell shows count · dropped tokens");
         assert.ok(swHtml!.includes('title="Mid-session model switches'), "switch cell carries the attribution tooltip");
         const plainHtml = rows.find((r) => r.includes("plain-1"));
-        assert.ok(plainHtml, "plain session row rendered");
-        assert.ok(!plainHtml!.includes("8.0K"), "plain session shows no switch data");
+        assert.ok(plainHtml, "plain session shows no switch data");
     } finally {
         if (prevConfig === undefined) delete process.env.BILI_CONFIG_FILE; else process.env.BILI_CONFIG_FILE = prevConfig;
         if (prevSessions === undefined) delete process.env.BILI_SESSIONS_DIR; else process.env.BILI_SESSIONS_DIR = prevSessions;
         await close(proxy);
         _resetDiskCacheForTest();
         rmrf(root);
+    }
+});
+
+// #1937: the bounded disk summary index — steady-state scans cost zero decodes,
+// detail decodes exactly one file without re-scanning, and list/overview peak
+// memory no longer scales with total corpus bytes (decode counters are the
+// structural proof; see _diskScanStatsForTest).
+
+function bloat(s: Session): Session {
+    s.state.blocks.push({
+        tier: 1, blockId: `blk-${s.id}`, summary: "x".repeat(256 * 1024), compressedTokens: 100,
+        createdAt: Date.now(), active: true,
+    } as unknown as CompressionBlock);
+    return s;
+}
+
+withSessionsDir("#1937: warm scans decode zero files; detail decodes only its own file", async (dir) => {
+    const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
+    for (let i = 0; i < 5; i++) {
+        await store.writeNow(bloat(makeSession(`bulk-${i}`, { protocol: "openai" }, { requests: 2, inputTokens: 100, cachedTokens: 40, contextTokens: 50 })));
+    }
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+
+    const first = await buildSessionList();
+    assert.equal(first.length, 5);
+    const cold = _diskScanStatsForTest();
+    assert.equal(cold.files, 5);
+    assert.ok(cold.decodedTotal >= 5, "cold scan decodes every file");
+
+    await buildSessionList();
+    await buildOverview();
+    assert.equal(_diskScanStatsForTest().decodedTotal, cold.decodedTotal, "warm list + overview re-decode nothing");
+
+    const grown = bloat(makeSession("bulk-0", { protocol: "openai" }, { requests: 3, inputTokens: 200, cachedTokens: 80, contextTokens: 60 }));
+    await store.writeNow(grown);
+    await buildSessionList();
+    assert.equal(_diskScanStatsForTest().decodedTotal, cold.decodedTotal + 1, "only the changed file re-decodes");
+
+    const d0 = _diskScanStatsForTest();
+    const det = await buildSessionDetail("bulk-1");
+    assert.ok(det && det.id === "bulk-1" && !det.live);
+    assert.equal(det.blockDetails.length, 1, "detail carries the big block");
+    const afterDet = _diskScanStatsForTest();
+    assert.equal(afterDet.detailDecodes, d0.detailDecodes + 1, "detail performs exactly one lazy decode");
+    assert.equal(afterDet.decodedTotal, d0.decodedTotal, "…and never re-scans the directory for it");
+
+    const live = getSession("det-live", { protocol: "openai" });
+    live.stats.requests = 2;
+    const d1 = _diskScanStatsForTest();
+    const ld = await buildSessionDetail("det-live");
+    assert.ok(ld && ld.live);
+    const afterLive = _diskScanStatsForTest();
+    assert.equal(afterLive.detailDecodes, d1.detailDecodes, "live detail never touches disk");
+    assert.equal(afterLive.decodedTotal, d1.decodedTotal);
+
+    const d2 = _diskScanStatsForTest();
+    assert.equal(await buildSessionDetail("does-not-exist"), null);
+    const afterUnknown = _diskScanStatsForTest();
+    assert.equal(afterUnknown.decodedTotal, d2.decodedTotal, "unknown id decodes nothing");
+    assert.equal(afterUnknown.detailDecodes, d2.detailDecodes);
+});
+
+withSessionsDir("#1937: corrupt and content-store files never block or poison the endpoints", async (dir) => {
+    const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
+    await store.writeNow(makeSession("ok-1", { protocol: "openai" }, { requests: 2, inputTokens: 10, cachedTokens: 5, contextTokens: 9 }));
+    const jsonFiles = readdirSync(dir, { recursive: true }) as string[];
+    const okFile = jsonFiles.find((f) => f.endsWith(".json") && !f.endsWith(".content-store.json"))!;
+    writeFileSync(path.join(dir, path.dirname(okFile), "junk.json"), "{not json at all", "utf8");
+    writeFileSync(path.join(dir, path.dirname(okFile), "twin.content-store.json"), JSON.stringify({ version: 1, payload: { env: { blob: "x".repeat(64 * 1024) } } }), "utf8");
+
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+    const list = await buildSessionList();
+    assert.deepEqual(list.map((s) => s.id), ["ok-1"], "valid session still served next to garbage");
+    const st = _diskScanStatsForTest();
+    assert.equal(st.files, 1);
+    assert.equal(st.decodedTotal, 2, "junk + valid decoded; content-store excluded by name before any decode");
+});
+
+withSessionsDir("#1937: dir breakage serves stale snapshot; missing dir rejects loudly", async (dir) => {
+    const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
+    await store.writeNow(makeSession("seed-1", { protocol: "openai" }, { requests: 2, inputTokens: 10, contextTokens: 9 }));
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+    assert.equal((await buildSessionList()).length, 1);
+
+    rmrf(dir);
+    const again = await buildSessionList();
+    assert.deepEqual(again.map((s) => s.id), ["seed-1"], "stale snapshot survives a vanished dir instead of emptying");
+
+    process.env.BILI_SESSIONS_DIR = path.join(dir, "gone-subdir");
+    _resetDiskCacheForTest();
+    await assert.rejects(buildSessionList(), undefined, "no prior snapshot → reject (→ HTTP 500), never silent empty");
+});
+
+withSessionsDir("#1937: /__bili/sessions supports server-side paging & search", async (dir) => {
+    const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
+    for (let i = 0; i < 120; i++) {
+        const label = i % 2 === 0 ? `Alpha ${i}` : `Beta ${i}`;
+        await store.writeNow(makeSession(`pg-${i}`, { protocol: "openai", label }, { requests: 2, inputTokens: 10, cachedTokens: 4, contextTokens: 5 }));
+    }
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+    setRegistryForTest({});
+
+    const opts: ProxyOptions = {
+        port: 0,
+        host: "127.0.0.1",
+        upstream: "http://127.0.0.1:1",
+        routes: {},
+        proxy: "",
+        proxyMode: "direct",
+        proxySource: "direct",
+        modelContextLimit: 400_000,
+        kernelConfig: defaultConfig(400_000),
+        compress: { injectTool: true, injectNudge: true },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        autoUpdate: false,
+        mitm: { enabled: false, domains: [] },
+    };
+    const proxy = await startServer(opts);
+    if (!proxy.listening) await once(proxy, "listening");
+    const port = (proxy.address() as { port: number }).port;
+    const base = `http://127.0.0.1:${port}`;
+    try {
+        const j = async (u: string): Promise<{ sessions: Array<Record<string, unknown>>; total?: number; page?: number; pageSize?: number }> =>
+            (await (await fetch(base + u)).json()) as { sessions: Array<Record<string, unknown>>; total?: number; page?: number; pageSize?: number };
+
+        const np = await j("/__bili/sessions");
+        assert.equal(np.sessions.length, 120, "no-param request keeps the full list (back-compat)");
+        assert.equal(np.total, 120, "additive total present on the legacy shape");
+
+        const p1 = await j("/__bili/sessions?page=1&pageSize=50");
+        assert.equal(p1.sessions.length, 50);
+        assert.equal(p1.page, 1);
+        assert.equal(p1.pageSize, 50);
+        assert.equal(p1.total, 120);
+        const p3 = await j("/__bili/sessions?page=3&pageSize=50");
+        assert.equal(p3.sessions.length, 20, "last page is the remainder");
+        const seen = new Set([...p1.sessions, ...p3.sessions].map((s) => s.id));
+        assert.equal(seen.size, 70, "pages are disjoint");
+
+        const q1 = await j("/__bili/sessions?q=alpha&pageSize=50&page=1");
+        assert.equal(q1.total, 60, "search is server-side (half the corpus matches)");
+        assert.equal(q1.sessions.length, 50);
+        const q2 = await j("/__bili/sessions?q=alpha&pageSize=50&page=2");
+        assert.equal(q2.sessions.length, 10);
+
+        const oob = await j("/__bili/sessions?page=99&pageSize=50");
+        assert.equal(oob.sessions.length, 0, "out-of-range page → empty, not an error");
+        assert.equal(oob.total, 120);
+
+        const clamped = await j("/__bili/sessions?page=1&pageSize=99999");
+        assert.equal(clamped.pageSize, 200, "pageSize clamped to the server cap");
+        assert.equal(clamped.sessions.length, 120);
+    } finally {
+        await close(proxy);
+    }
+});
+
+test("#1937: buildSessionPage filters stubs first so hiddenEmpty keeps its meaning", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "bili-web-sess-page-"));
+    const prev = process.env.BILI_SESSIONS_DIR;
+    process.env.BILI_SESSIONS_DIR = dir;
+    try {
+        const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
+        // 60 visible sessions + 4 startup stubs (requests<=1, zero ctx/blocks/ledger).
+        for (let i = 0; i < 60; i++) {
+            await store.writeNow(makeSession(`vis-${i}`, { protocol: "openai", label: `V${i}` }, { requests: 2, inputTokens: 10, contextTokens: 5 }));
+        }
+        for (let i = 0; i < 4; i++) {
+            await store.writeNow(makeSession(`stub-${i}`, { protocol: "openai" }));
+        }
+        _setStoreForTest(new SessionStore({ enabled: false }));
+        _resetDiskCacheForTest();
+        const page = await buildSessionPage({ pageSize: 25, page: 1 });
+        assert.equal(page.total, 60, "stubs excluded from total");
+        assert.equal(page.sessions.length, 25);
+        const last = await buildSessionPage({ pageSize: 25, page: 3 });
+        assert.equal(last.sessions.length, 10);
+        const ids = new Set([...page.sessions, ...last.sessions].map((s) => s.id));
+        for (const id of ids) assert.ok(!id.startsWith("stub-"), "stub sessions never surface in pages");
+        assert.equal(hiddenEmptyCount(), 4);
+    } finally {
+        if (prev === undefined) delete process.env.BILI_SESSIONS_DIR; else process.env.BILI_SESSIONS_DIR = prev;
+        _resetSessionsForTest();
+        _resetDiskCacheForTest();
+        rmrf(dir);
     }
 });

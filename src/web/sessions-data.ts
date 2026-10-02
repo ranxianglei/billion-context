@@ -1,14 +1,21 @@
 import { listSessions, type Session } from "../session.js";
-import { SessionStore } from "../persist.js";
+import { SessionStore, fileNameMatchesId, isValidRecord, relPathFor } from "../persist.js";
+import { flatFileNameFor } from "acp-kernel/persist";
 import { renderHandoff } from "../export.js";
 import { buildSessionCacheReport } from "../cache-ledger.js";
 import { markdownToHtml } from "./markdown.js";
 import { log } from "../logger.js";
+import { readdir, stat } from "node:fs/promises";
+import * as path from "node:path";
 
-/** #1420: read-only session browsing for the web UI. Merges the LIVE in-memory
- *  pool (bounded — evicted sessions are gone) with the full on-disk store;
- *  live always wins per id. Disk files decode via the same store as bili
- *  export (encryption/zstd); unreadable files skip silently, as in export. */
+/** #1420/#1937: read-only session browsing for the web UI. Merges the LIVE
+ *  in-memory pool (bounded — evicted sessions are gone) with the on-disk
+ *  corpus. #1937: the disk side is a BOUNDED SUMMARY INDEX — a directory walk
+ *  over metadata only, per-file summaries cached by (mtime,size), and
+ *  sequential decode of changed/new files whose parsed records are discarded
+ *  right after extraction. List/overview paths never construct or retain full
+ *  Session objects, so resident memory stays O(#sessions × ~1KB) regardless of
+ *  total corpus bytes; a single admin request's peak is one decoded file. */
 
 export interface WebSessionSummary {
     id: string;
@@ -142,12 +149,18 @@ export interface WebSessionDetail extends WebSessionSummary {
     }>;
 }
 
-/** Disk scan memoization: decoding every session file (zstd + optional GCM)
- *  is not free, so results are reused for DISK_TTL_MS. Single-flight so a
- *  burst of overview+sessions requests triggers one scan. The store itself
- *  is a module-level singleton (the kernel StateStore has no timer leaks —
- *  debounce timers only arm on writes, which never happen here). */
-const DISK_TTL_MS = 5_000;
+// ---------------------------------------------------------------------------
+// #1937 bounded disk summary index
+// ---------------------------------------------------------------------------
+
+type DiskEntry = {
+    abs: string;
+    mtimeMs: number;
+    size: number;
+    savedAt: number;
+    /** null = undecodable/corrupt or renamed file — skipped (logged), never fatal. */
+    summary: WebSessionSummary | null;
+};
 
 let diskStore: SessionStore | null = null;
 function getDiskStore(): SessionStore {
@@ -155,40 +168,233 @@ function getDiskStore(): SessionStore {
     return diskStore;
 }
 
-let diskMemo: { at: number; map: Map<string, Session> } | null = null;
-let diskScan: Promise<Map<string, Session>> | null = null;
+let byFile: Map<string, DiskEntry> | null = null;
+let byId: Map<string, string> | null = null;
+let scanInFlight: Promise<void> | null = null;
+let decodeCount = 0;
+let detailDecodes = 0;
 
-function loadDiskSessions(): Promise<Map<string, Session>> {
-    if (diskMemo && Date.now() - diskMemo.at < DISK_TTL_MS) return Promise.resolve(diskMemo.map);
-    if (!diskScan) {
-        const run = (async () => {
-            try {
-                const map = await getDiskStore().loadAll();
-                diskMemo = { at: Date.now(), map };
-                return map;
-            } catch (error) {
-                log("warn", `[acp-web] session disk scan failed: ${String(error)}`);
-                return diskMemo?.map ?? new Map<string, Session>();
-            }
-        })();
-        diskScan = run.finally(() => { diskScan = null; });
-    }
-    return diskScan;
+function yieldToGc(): Promise<void> {
+    return new Promise((resolve) => setImmediate(resolve));
 }
 
-/** Test hook: drop the memoized scan AND the store singleton (its dir was
- *  resolved at construction, so a changed BILI_SESSIONS_DIR needs a fresh one). */
+/** Recursive *.json walk under the sessions dir, stat-based (metadata only,
+ *  no decoding). Excludes dotfiles (.bili-migration-* markers), temp files
+ *  (.tmp-* kernel temps, *.tmp-enc-* codec temps) and CCR content-store
+ *  envelopes (*.content-store.json — payload bytes, not session records; they
+ *  would fail validation anyway and can be huge). A TOP-LEVEL failure (missing
+ *  dir / EACCES) throws so callers can distinguish "no data" from "unreadable";
+ *  subdirectory failures skip that subtree. */
+async function walkSessionFiles(dir: string): Promise<Array<{ abs: string; mtimeMs: number; size: number }>> {
+    await readdir(dir);
+    const out: Array<{ abs: string; mtimeMs: number; size: number }> = [];
+    async function rec(d: string): Promise<void> {
+        let entries;
+        try {
+            entries = await readdir(d, { withFileTypes: true });
+        } catch {
+            return;
+        }
+        for (const e of entries) {
+            if (e.name.startsWith(".")) continue;
+            const abs = path.join(d, e.name);
+            if (e.isDirectory()) {
+                await rec(abs);
+                continue;
+            }
+            if (!e.name.endsWith(".json")) continue;
+            if (e.name.includes(".tmp-") || e.name.endsWith(".content-store.json")) continue;
+            if (!e.isFile()) continue;
+            try {
+                const st = await stat(abs);
+                out.push({ abs, mtimeMs: st.mtimeMs, size: st.size });
+            } catch {
+                // vanished mid-walk
+            }
+        }
+    }
+    await rec(dir);
+    return out;
+}
+
+/** Absolute paths of files already covered by LIVE pool entries. Their disk
+ *  twins are overridden per-id by the live summaries anyway, so decoding them
+ *  during a scan is pure waste; skipping leaves NO cache entry, which means a
+ *  later evict (which rewrites the file) is picked up on the next refresh. */
+function liveCoveredPaths(dir: string): Set<string> {
+    const out = new Set<string>();
+    for (const s of listSessions()) {
+        for (const rel of [
+            relPathFor(s.id, s.meta.protocol, s.meta.upstreamOrigin),
+            relPathFor(s.id),
+            flatFileNameFor(s.id),
+        ]) {
+            out.add(path.join(dir, rel));
+        }
+    }
+    return out;
+}
+
+/** Single-flight index refresh. Steady-state cost is one stat per file; only
+ *  new/changed files (mtime OR size moved) are decoded, one at a time with a
+ *  GC checkpoint between files, and the parsed record is dropped immediately
+ *  after summary extraction. Top-level walk failure: serve the previous
+ *  snapshot when one exists, else propagate (→ HTTP 500, visible in UI). */
+async function refreshIndex(): Promise<void> {
+    if (scanInFlight) return scanInFlight;
+    const run = (async () => {
+        const store = getDiskStore();
+        const dir = store.dir;
+        const files = await walkSessionFiles(dir);
+        const prev = byFile ?? new Map<string, DiskEntry>();
+        const next = new Map<string, DiskEntry>();
+        const covered = liveCoveredPaths(dir);
+        for (const f of files) {
+            if (covered.has(f.abs)) continue;
+            const p = prev.get(f.abs);
+            if (p && p.mtimeMs === f.mtimeMs && p.size === f.size) {
+                next.set(f.abs, p);
+                continue;
+            }
+            decodeCount++;
+            const entry: DiskEntry = { abs: f.abs, mtimeMs: f.mtimeMs, size: f.size, savedAt: 0, summary: null };
+            const relName = path.relative(dir, f.abs);
+            const raw = await store.readRawFile(f.abs);
+            if (raw && typeof raw === "object") {
+                const r = raw as Record<string, unknown>;
+                const rec = r.payload && typeof r.payload === "object" ? r.payload : raw;
+                if (isValidRecord(rec)) {
+                    const meta = (rec.meta && typeof rec.meta === "object" ? rec.meta : {}) as Record<string, unknown>;
+                    const proto = typeof meta.protocol === "string" ? meta.protocol : typeof rec.protocol === "string" ? rec.protocol : undefined;
+                    const origin = typeof meta.upstreamOrigin === "string" ? meta.upstreamOrigin : typeof rec.upstreamOrigin === "string" ? rec.upstreamOrigin : undefined;
+                    if (fileNameMatchesId(path.basename(f.abs), rec.id, proto, origin)) {
+                        entry.savedAt = typeof rec.savedAt === "number" ? rec.savedAt : Date.now();
+                        entry.summary = summaryFromRecord(rec);
+                    } else {
+                        log("warn", `[acp-web] skipping ${relName}: filename does not match record id`);
+                    }
+                } else {
+                    log("warn", `[acp-web] skipping invalid session file ${relName}`);
+                }
+            } else {
+                log("warn", `[acp-web] skipping undecodable session file ${relName}`);
+            }
+            next.set(f.abs, entry);
+            await yieldToGc();
+        }
+        const nextById = new Map<string, string>();
+        for (const e of next.values()) {
+            if (!e.summary) continue;
+            const cur = nextById.get(e.summary.id);
+            if (cur === undefined) {
+                nextById.set(e.summary.id, e.abs);
+                continue;
+            }
+            const curE = next.get(cur)!;
+            if (e.savedAt > curE.savedAt || (e.savedAt === curE.savedAt && e.mtimeMs > curE.mtimeMs)) {
+                nextById.set(e.summary.id, e.abs);
+            }
+        }
+        byFile = next;
+        byId = nextById;
+    })();
+    scanInFlight = run.finally(() => { scanInFlight = null; });
+    try {
+        await scanInFlight;
+    } catch (error) {
+        if (!byFile) throw error;
+        log("warn", `[acp-web] sessions index refresh failed, serving last known index: ${String(error)}`);
+    }
+}
+
+function ensureIndex(): Promise<Map<string, DiskEntry>> {
+    return refreshIndex().then(() => byFile!);
+}
+
+/** Test hooks: reset the index (memo + store singleton — its dir was resolved
+ *  at construction, so a changed BILI_SESSIONS_DIR needs a fresh one) and read
+ *  decode accounting (decodedTotal = index-scan decodes, detailDecodes = lazy
+ *  single-file detail loads — together the structural proof that steady-state
+ *  scans cost zero decodes and a detail never re-scans, #1937). */
 export function _resetDiskCacheForTest(): void {
-    diskMemo = null;
-    diskScan = null;
+    byFile = null;
+    byId = null;
+    scanInFlight = null;
     diskStore = null;
+    decodeCount = 0;
+    detailDecodes = 0;
+    detailInFlight.clear();
+}
+
+export function _diskScanStatsForTest(): { files: number; decodedTotal: number; detailDecodes: number } {
+    let files = 0;
+    if (byFile) for (const e of byFile.values()) if (e.summary) files += 1;
+    return { files, decodedTotal: decodeCount, detailDecodes };
+}
+
+// ---------------------------------------------------------------------------
+// Summary extraction
+// ---------------------------------------------------------------------------
+
+/** The minimal shape summaryOf actually reads — satisfied by a live Session
+ *  AND by a persisted record normalizer, so list rows never need a full
+ *  Session construction (#1937). */
+interface SummarySource {
+    id: string;
+    meta: { protocol?: string; upstreamOrigin?: string; label?: string; title?: string };
+    stats: { requests: number; tokensSaved: number; inputTokens: number; cachedTokens: number; outputTokens: number; contextTokens: number };
+    metadata: Record<string, unknown>;
+    state: { blocks: Array<{ topic?: string; summary: string }> };
+    lastSeen: number;
+    restored?: boolean;
+}
+
+function num(v: unknown, fallback = 0): number {
+    return typeof v === "number" && Number.isFinite(v) ? v : fallback;
+}
+
+function str(v: unknown): string | undefined {
+    return typeof v === "string" && v.length > 0 ? v : undefined;
+}
+
+/** Normalizer mirroring buildSession's v1-flat → grouped fallback for exactly
+ *  the fields summaryOf consumes (no blockContents/messages/state merge —
+ *  those are the heavy parts this index deliberately avoids). */
+function summaryFromRecord(rec: unknown): WebSessionSummary {
+    const r = rec as Record<string, unknown>;
+    const meta = (r.meta && typeof r.meta === "object" ? r.meta : {}) as Record<string, unknown>;
+    const stats = (r.stats && typeof r.stats === "object" ? r.stats : {}) as Record<string, unknown>;
+    const state = (r.state && typeof r.state === "object" ? r.state : {}) as Record<string, unknown>;
+    const blocksRaw = Array.isArray(state.blocks) ? state.blocks : [];
+    const source: SummarySource = {
+        id: String(r.id),
+        meta: {
+            protocol: str(meta.protocol) ?? str(r.protocol),
+            upstreamOrigin: str(meta.upstreamOrigin) ?? str(r.upstreamOrigin),
+            label: str(meta.label) ?? str(r.label),
+            title: str(meta.title),
+        },
+        stats: {
+            requests: num(stats.requests, num(r.requests)),
+            tokensSaved: num(stats.tokensSaved, num(r.tokensSaved)),
+            inputTokens: num(stats.inputTokens, num(r.inputTokens)),
+            cachedTokens: num(stats.cachedTokens, num(r.cachedTokens)),
+            outputTokens: num(stats.outputTokens, num(r.outputTokens)),
+            contextTokens: Math.max(0, num(stats.contextTokens, num(r.contextTokens))),
+        },
+        metadata: (r.metadata && typeof r.metadata === "object" ? r.metadata : {}) as Record<string, unknown>,
+        state: { blocks: blocksRaw.filter((b) => !!b && typeof b === "object") as Array<{ topic?: string; summary: string }> },
+        lastSeen: typeof r.savedAt === "number" ? r.savedAt : Date.now(),
+        restored: true,
+    };
+    return summaryOf(source, false);
 }
 
 function hitPct(input: number, cached: number): number | null {
     return input > 0 ? Math.round((cached / input) * 100) : null;
 }
 
-function summaryOf(s: Session, live: boolean): WebSessionSummary {
+function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
     // Dual-source token counters: session.stats accumulates upstream-reported
     // usage; metadata.cacheLedger.agg accumulates the ACP/web ledger samples.
     // Per-field MAX (the sources overlap, never sum). Read-only on purpose:
@@ -262,7 +468,7 @@ function summaryOf(s: Session, live: boolean): WebSessionSummary {
               }
             : {}),
         ...(typeof agg?.agg?.switches === "number" && agg.agg.switches > 0
-            ? { modelSwitches: agg.agg.switches, switchMissedTokens: agg?.agg?.switchMissed ?? 0 }
+            ? { modelSwitches: agg?.agg.switches, switchMissedTokens: agg?.agg?.switchMissed ?? 0 }
             : {}),
         ...(clientHint ? { clientHint } : {}),
     };
@@ -280,25 +486,56 @@ function isEmptyStub(s: WebSessionSummary): boolean {
 let lastHiddenEmpty = 0;
 export function hiddenEmptyCount(): number { return lastHiddenEmpty; }
 
-async function allSummaries(): Promise<WebSessionSummary[]> {
-    const disk = await loadDiskSessions();
+async function mergedSummaries(): Promise<WebSessionSummary[]> {
+    const files = await ensureIndex();
     const out = new Map<string, WebSessionSummary>();
-    for (const [id, s] of disk) out.set(id, summaryOf(s, false));
+    for (const e of files.values()) if (e.summary) out.set(e.summary.id, e.summary);
     for (const s of listSessions()) out.set(s.id, summaryOf(s, true));
     return [...out.values()].sort((a, b) => b.lastSeen.localeCompare(a.lastSeen));
 }
 
 export async function buildSessionList(): Promise<WebSessionSummary[]> {
-    const all = await allSummaries();
+    const all = await mergedSummaries();
     const vis = all.filter((s) => !isEmptyStub(s));
     lastHiddenEmpty = all.length - vis.length;
     return vis;
 }
 
+export interface SessionPageQuery { q?: string; page?: number; pageSize: number }
+
+export interface SessionPageResult {
+    sessions: WebSessionSummary[];
+    total: number;
+    page: number;
+    pageSize: number;
+}
+
+/** #1937: server-side filtered + paged view over the SAME sorted summary set
+ *  as buildSessionList (stub filter first so hiddenEmpty keeps its meaning,
+ *  then the case-insensitive q match on title/label/id — mirroring what the
+ *  old client-side filter did). Read cost is O(index), independent of how
+ *  much history lies behind the requested page. */
+export async function buildSessionPage(query: SessionPageQuery): Promise<SessionPageResult> {
+    const all = await mergedSummaries();
+    const vis = all.filter((s) => !isEmptyStub(s));
+    lastHiddenEmpty = all.length - vis.length;
+    const q = (query.q ?? "").trim().toLowerCase();
+    const filtered = q
+        ? vis.filter((s) =>
+            (s.title ?? "").toLowerCase().includes(q) ||
+            (s.label ?? "").toLowerCase().includes(q) ||
+            s.id.toLowerCase().includes(q))
+        : vis;
+    const total = filtered.length;
+    const pageSize = Math.min(Math.max(1, Math.floor(query.pageSize)), 200);
+    const page = Math.max(1, Math.floor(query.page ?? 1));
+    return { sessions: filtered.slice((page - 1) * pageSize, page * pageSize), total, page, pageSize };
+}
+
 /** Aggregate stats across ALL known sessions (live + disk) — the "how many
  *  tokens total / saved" numbers for the overview dashboard. */
 export async function buildOverview(): Promise<WebOverview> {
-    const allAll = await allSummaries();
+    const allAll = await mergedSummaries();
     const all = allAll.filter((s) => !isEmptyStub(s));
     let requests = 0, input = 0, cached = 0, output = 0, saved = 0, savedEstimated = 0, blocks = 0, live = 0;
     let grossSavedTotal = 0, netSavedTotal = 0, repayTotal = 0, summaryCostTotal = 0, hasFoldData = false;
@@ -387,26 +624,48 @@ export async function buildOverview(): Promise<WebOverview> {
     };
 }
 
+// ---------------------------------------------------------------------------
+// Detail (lazy single-file load)
+// ---------------------------------------------------------------------------
+
+const detailInFlight = new Map<string, Promise<WebSessionDetail | null>>();
+
 /** Full detail for one session: stats + compression blocks + the per-request
  *  cache ledger (trajectory-chart source) + rendered handoff document.
  *  Returns null when the id is unknown (→ 404). Never creates sessions —
- *  lookups go through listSessions() + the disk map only. */
-export async function buildSessionDetail(id: string): Promise<WebSessionDetail | null> {
-    const live = listSessions().find((s) => s.id === id);
-    let session: Session | undefined = live;
-    if (!session) {
-        const disk = await loadDiskSessions();
-        session = disk.get(id);
-    }
-    if (!session) return null;
+ *  lookups go through listSessions() + ONE decoded disk file (#1937: the old
+ *  path scanned the entire directory for a single id). Concurrent requests
+ *  for the same id share one decode. */
+export function buildSessionDetail(id: string): Promise<WebSessionDetail | null> {
+    const existing = detailInFlight.get(id);
+    if (existing) return existing;
+    const run = (async (): Promise<WebSessionDetail | null> => {
+        const live = listSessions().find((s) => s.id === id);
+        let session: Session | undefined = live;
+        if (!session) {
+            const files = await ensureIndex();
+            const abs = byId?.get(id);
+            if (abs && files.has(abs)) {
+                detailDecodes++;
+                session = (await getDiskStore().loadSessionFromFile(abs, id)) ?? undefined;
+            }
+        }
+        if (!session) return null;
+        return renderDetail(session, !!live);
+    })();
+    const done = run.finally(() => detailInFlight.delete(id));
+    detailInFlight.set(id, done);
+    return done;
+}
 
+function renderDetail(session: Session, live: boolean): WebSessionDetail {
     // renderHandoff reads lastMessages (a bounded snapshot) — safe for disk
     // sessions; the v2 fallback path renders header + block summaries.
     let handoffMd = "";
     try {
         handoffMd = renderHandoff(session, false);
     } catch (error) {
-        log("warn", `[acp-web] handoff render failed for ${id}: ${String(error)}`);
+        log("warn", `[acp-web] handoff render failed for ${session.id}: ${String(error)}`);
     }
     let handoffTruncated = false;
     if (handoffMd.length > 1_500_000) {
@@ -422,7 +681,7 @@ export async function buildSessionDetail(id: string): Promise<WebSessionDetail |
     const sysPrompt = typeof session.metadata["systemPromptTokens"] === "number" ? session.metadata["systemPromptTokens"] : 0;
 
     return {
-        ...summaryOf(session, !!live),
+        ...summaryOf(session, live),
         lastInputTokens: session.stats.lastInputTokens,
         compressCreditTokens: session.stats.compressCreditTokens,
         retrieveCalls: session.stats.retrieveCalls,

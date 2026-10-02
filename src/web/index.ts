@@ -8,7 +8,7 @@ export {
     readUpstreamSettings,
 } from "./api.js";
 
-export { buildOverview, buildSessionList, buildSessionDetail, hiddenEmptyCount } from "./sessions-data.js";
+export { buildOverview, buildSessionList, buildSessionPage, buildSessionDetail, hiddenEmptyCount } from "./sessions-data.js";
 
 export function renderUI(origin: string): string {
     // #1426 fix: reuse the bundle-safe VERSION from src/version.ts — resolving

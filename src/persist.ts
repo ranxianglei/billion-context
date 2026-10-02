@@ -209,7 +209,7 @@ function hostLabel(upstreamOrigin?: string): string {
  *  loads — it will be rewritten with the right namespace on next persist.
  *  Deterministic from (id, protocol, upstreamOrigin), so loadAll can verify
  *  the filename matches the body and loadSync can reverse-lookup. */
-function relPathFor(id: string, protocol?: string, upstreamOrigin?: string): string {
+export function relPathFor(id: string, protocol?: string, upstreamOrigin?: string): string {
     const proto = protocol ?? "_unknown";
     const host = protocol ? hostLabel(upstreamOrigin) + "_" : "";
     return path.join(proto, `${host}${createHash("sha256").update(id, "utf8").digest("hex").slice(0, 24)}.json`);
@@ -225,12 +225,28 @@ function contentStoreRelPathFor(id: string, protocol?: string, upstreamOrigin?: 
     return base.slice(0, -".json".length) + ".content-store.json";
 }
 
+/** #1937: true when a walked FILENAME is the canonical (or legacy flat /
+ *  .fb fallback) name for record `id` — mirrors the kernel StateStore.loadAll
+ *  owner check so independent directory walkers agree with loadSync about
+ *  which files are addressable. Renamed files fail this check and stay
+ *  invisible, exactly as they do for boot/reload. */
+export function fileNameMatchesId(base: string, id: string, protocol?: string, upstreamOrigin?: string): boolean {
+    const relBase = path.basename(relPathFor(id, protocol, upstreamOrigin));
+    const flatBase = flatFileNameFor(id);
+    if (base === relBase || base === flatBase) return true;
+    if (base.endsWith(".fb.json")) {
+        const canonicalBase = `${base.slice(0, -".fb.json".length)}.json`;
+        return canonicalBase === relBase || canonicalBase === flatBase;
+    }
+    return false;
+}
+
 /** Session persistence policy over the kernel StateStore mechanism. The
  *  public API predates the extraction and is kept stable for session.ts /
  *  server.ts / export.ts. */
 export class SessionStore {
     readonly enabled: boolean;
-    private readonly dir: string;
+    private readonly sessionsDir: string;
     private readonly store: StateStore<PersistedSession>;
     private readonly log: Logger;
     private readonly staleWarnAt = new Map<string, number>();
@@ -239,7 +255,7 @@ export class SessionStore {
     constructor(opts?: { dir?: string; debounceMs?: number; enabled?: boolean; log?: Logger }) {
         const debounceMs = opts?.debounceMs ?? defaultDebounce();
         this.enabled = (opts?.enabled ?? true) && debounceMs >= 0;
-        this.dir = opts?.dir ?? defaultDir();
+        this.sessionsDir = opts?.dir ?? defaultDir();
         const baseLog = opts?.log ?? defaultLogger;
         this.log = baseLog;
         // #708/#1080: env-only storage policy (a key file next to the data
@@ -257,12 +273,12 @@ export class SessionStore {
             baseLog("info", "[persist] session-file compression enabled (zstd, BILIZSTD1)");
         }
         const epermAlert = new PersistEpermAlert({
-            dir: this.dir,
+            dir: this.sessionsDir,
             threshold: epermAlertThreshold(),
             repeatMs: epermAlertRepeatMs(),
         });
         this.store = new StateStore<PersistedSession>({
-            dir: this.dir,
+            dir: this.sessionsDir,
             version: PERSIST_VERSION,
             debounceMs: Math.max(0, debounceMs),
             enabled: this.enabled,
@@ -293,7 +309,7 @@ export class SessionStore {
         for (const rel of rels) {
             let buf: Buffer;
             try {
-                buf = readFileSync(path.join(this.dir, rel));
+                buf = readFileSync(path.join(this.sessionsDir, rel));
             } catch {
                 continue;
             }
@@ -323,7 +339,7 @@ export class SessionStore {
         if (!this.enabled || !session.contentStoreDirty) return;
         session.contentStoreDirty = false;
         const rel = contentStoreRelPathFor(session.id, session.meta.protocol, session.meta.upstreamOrigin);
-        const abs = path.join(this.dir, rel);
+        const abs = path.join(this.sessionsDir, rel);
         if (!session.contentStore || Object.keys(session.contentStore.byRef).length === 0) {
             rmSync(abs, { force: true });
             return;
@@ -391,7 +407,7 @@ export class SessionStore {
     private async sweepStaleTemps(): Promise<void> {
         let files: string[];
         try {
-            files = await walkJsonFiles(this.dir);
+            files = await walkJsonFiles(this.sessionsDir);
         } catch {
             return;
         }
@@ -422,7 +438,7 @@ export class SessionStore {
     }
 
     private markerPath(): string {
-        return path.join(this.dir, MIGRATION_MARKER);
+        return path.join(this.sessionsDir, MIGRATION_MARKER);
     }
 
     private async applyLegacyMigration(loaded: Map<string, PersistedEnvelope<PersistedSession>>): Promise<void> {
@@ -483,7 +499,7 @@ export class SessionStore {
             rekeyed++;
         }
         try {
-            mkdirSync(this.dir, { recursive: true });
+            mkdirSync(this.sessionsDir, { recursive: true });
             writeFileSync(this.markerPath(), String(Date.now()), "utf8");
         } catch {
             // Read-only dir — migration re-runs next boot (it is idempotent).
@@ -504,13 +520,13 @@ export class SessionStore {
             flatFileNameFor(id),
         ]);
         for (const rel of candidates) {
-            await rm(path.join(this.dir, rel), { force: true }).catch(() => {});
+            await rm(path.join(this.sessionsDir, rel), { force: true }).catch(() => {});
         }
         for (const rel of [
             contentStoreRelPathFor(id, session.meta.protocol, session.meta.upstreamOrigin),
             contentStoreRelPathFor(id),
         ]) {
-            await rm(path.join(this.dir, rel), { force: true }).catch(() => {});
+            await rm(path.join(this.sessionsDir, rel), { force: true }).catch(() => {});
         }
     }
 
@@ -553,6 +569,29 @@ export class SessionStore {
         const envelope = this.loadEnvelope(id);
         if (!envelope) return null;
         return mergeState(envelope.payload.state);
+    }
+
+    /** #1937: sessions directory this store resolves against (the web summary
+     *  index walks it; tests swap BILI_SESSIONS_DIR between runs, so the value
+     *  must come from THIS instance, not a fresh env read). */
+    get dir(): string {
+        return this.sessionsDir;
+    }
+
+    /** #1937: decode ONE session file by PATH into a full Session for the web
+     *  detail view (lazy single-file load — no full-directory scan). Returns
+     *  null when absent/undecodable/invalid, or when the body id does not
+     *  match `expectId` (renamed-file race; mirrors kernel loadSync's
+     *  envelope.id === id guard). Read-only: no #408 clamp-rewrite side
+     *  effect, like loadStateForSearch. */
+    async loadSessionFromFile(file: string, expectId?: string): Promise<Session | null> {
+        const parsed = await this.readRawFile(file);
+        if (!parsed || typeof parsed !== "object") return null;
+        const p = parsed as Record<string, unknown>;
+        const rec = p.payload && typeof p.payload === "object" ? p.payload : parsed;
+        if (!isValidRecord(rec)) return null;
+        if (expectId !== undefined && rec.id !== expectId) return null;
+        return buildSession(rec);
     }
 
     /** #1082 GC: read+decode a single session file by PATH (not session id),
@@ -783,7 +822,7 @@ function buildSession(parsed: PersistedSession): Session {
     };
 }
 
-function isValidRecord(parsed: unknown): parsed is PersistedSession {
+export function isValidRecord(parsed: unknown): parsed is PersistedSession {
     if (!parsed || typeof parsed !== "object") return false;
     const r = parsed as Partial<PersistedSession>;
     return typeof r.id === "string" && typeof r.state === "object" && r.state !== null && Array.isArray(r.state.blocks);
