@@ -915,3 +915,62 @@ test("#1884 install: unsigned model requests still rewrite (guard is signature-s
     assert.deepEqual(sink.map((call) => call.url), ["http://127.0.0.1:40092/bili/http://127.0.0.1:8199/v1/messages"]);
     assert.deepEqual(seen, []);
 });
+
+test("#1884 install: the guard runs before the takeover gate — gate is never consulted", async () => {
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:40093", ready: Promise.resolve("http://127.0.0.1:40093") };
+    let gateCalls = 0;
+    state.takeoverGate = () => {
+        gateCalls += 1;
+        return true;
+    };
+    const target = "https://snap-access.cn-north-4.myhuaweicloud.com/api/v2/chat/completions";
+    const { sink } = await withPatchRecording(state, async (fetch) => {
+        await fetch(target, { method: "POST", headers: { "x-sdk-content-sha256": "abc" }, body: "{}" });
+    });
+    assert.equal(gateCalls, 0, "signed request must short-circuit before attribution");
+    assert.deepEqual(sink.map((call) => call.url), [target]);
+});
+
+test("#1884 install: signature detection is case-insensitive and boundary-safe", async () => {
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:40094", ready: Promise.resolve("http://127.0.0.1:40094") };
+    const seen: string[] = [];
+    state.onSignedModelUrl = (_url, scheme) => seen.push(scheme);
+    const target = "http://127.0.0.1:8199/v1/messages";
+    const { sink } = await withPatchRecording(state, async (fetch) => {
+        await fetch(target, { method: "POST", headers: { authorization: "sdk-hmac-sha256 Access=AK, SignedHeaders=host, Signature=x" }, body: "{}" });
+        await fetch(target, { method: "POST", headers: { authorization: "HMAC-SHA2560 Access=AK" }, body: "{}" });
+    });
+    assert.deepEqual(seen, ["sdk-hmac-sha256"], "lowercase scheme detected; HMAC-SHA2560 is not a scheme (word-boundary)");
+    assert.deepEqual(
+        sink.map((call) => call.url),
+        [target, "http://127.0.0.1:40094/bili/http://127.0.0.1:8199/v1/messages"],
+        "only the signed request goes direct — HMAC-SHA2560 still rewrites",
+    );
+});
+
+test("#1884 install: Request-object input carries the signature check", async () => {
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:40095", ready: Promise.resolve("http://127.0.0.1:40095") };
+    const seen: string[] = [];
+    state.onSignedModelUrl = (_url, scheme) => seen.push(scheme);
+    const target = "http://127.0.0.1:8199/v1/chat/completions";
+    const { sink } = await withPatchRecording(state, async (fetch) => {
+        await fetch(new Request(target, { method: "POST", headers: { "x-amz-content-sha256": "deadbeef" }, body: "{}" }));
+    });
+    assert.deepEqual(sink.map((call) => call.url), [target]);
+    assert.deepEqual(seen, ["x-amz-content-sha256"]);
+});
+
+test("#1884 install: signed non-model URLs stay out of the signed-report path", async () => {
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:40096", ready: Promise.resolve("http://127.0.0.1:40096") };
+    const signed: string[] = [];
+    const unrouted: string[] = [];
+    state.onSignedModelUrl = (_url, scheme) => signed.push(scheme);
+    state.onUnroutedModelUrl = (url) => unrouted.push(url);
+    const target = "https://api.example.com/v1/organizations";
+    const { sink } = await withPatchRecording(state, async (fetch) => {
+        await fetch(target, { method: "POST", headers: { authorization: "AWS4-HMAC-SHA256 Credential=AKIA/20261002/us-east-1/aws4_request" }, body: "{}" });
+    });
+    assert.deepEqual(sink.map((call) => call.url), [target]);
+    assert.deepEqual(signed, [], "signature guard is scoped to model-API URLs (this one never was)");
+    assert.deepEqual(unrouted, [target], "it is reported as unrouted instead");
+});
