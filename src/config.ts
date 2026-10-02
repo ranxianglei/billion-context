@@ -226,6 +226,29 @@ export type CompressSettings = {
      *  Patterns match like kernel tool patterns (exact name or `*` glob).
      *  Deepest level wins (global → provider → model), whole-array replace. */
     preserveRecentTools?: string[];
+    /** [#1487] Tool-burst nudge hold: while the trailing history is dominated
+     *  by fresh tool results (a batch of reads/greps/globs in flight) AND
+     *  context usage is below the hold ceiling, GROWTH-based compression nudges
+     *  are held so the agent can finish its batch before its working content
+     *  gets folded (the fold→re-read loop, #1198/#1277). Pressure-band nudges
+     *  and the emergency nudge are never held — a context that runs out
+     *  mid-burst still compresses immediately. Default ON (#1487 owner
+     *  decision); `enabled: false` restores the legacy always-nudge behavior.
+     *  Merged sub-field-wise across the three levels like `absorb`. */
+    burstHold?: {
+        /** Default true. */
+        enabled?: boolean;
+        /** Minimum tool-result count in the window to count as a burst
+         *  (default 5). Positive integer. */
+        minToolResults?: number;
+        /** Trailing-history window size in messages (default 12). Positive
+         *  integer. */
+        lookbackMessages?: number;
+        /** Minimum share of the window that must be tool results, 0..1
+         *  (default 0.55 — steady assistant/tool alternation near 0.5 must not
+         *  trip, parallel batches at 0.8+ must trip). */
+        minToolShare?: number;
+    };
     /** Emit 📦/❌ ACP visibility markers after proxy tool executions
      *  (compress / decompress / search_context / acp_status) — both the marker
      *  line streamed to the client and the marker message re-injected into
@@ -1652,6 +1675,30 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
                 cleaned.planAware = v;
             }
             if (ok) out.search = cleaned;
+        }
+    }
+    if ("burstHold" in obj && obj.burstHold !== undefined) {
+        const b = obj.burstHold;
+        if (!b || typeof b !== "object" || Array.isArray(b)) {
+            ok = false;
+        } else {
+            const bo = b as Record<string, unknown>;
+            const cleaned: NonNullable<CompressSettings["burstHold"]> = {};
+            for (const key of ["enabled", "minToolResults", "lookbackMessages", "minToolShare"] as const) {
+                if (!(key in bo)) continue;
+                const v = bo[key];
+                if (key === "enabled") {
+                    if (typeof v !== "boolean") { ok = false; continue; }
+                    cleaned.enabled = v;
+                } else if (key === "minToolShare") {
+                    if (typeof v !== "number" || !Number.isFinite(v) || v <= 0 || v > 1) { ok = false; continue; }
+                    cleaned.minToolShare = v;
+                } else {
+                    if (typeof v !== "number" || !Number.isInteger(v) || v <= 0) { ok = false; continue; }
+                    cleaned[key] = v;
+                }
+            }
+            if (ok) out.burstHold = cleaned;
         }
     }
     if ("imageCompression" in obj && obj.imageCompression !== undefined) {

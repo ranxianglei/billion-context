@@ -131,6 +131,7 @@ import { buildForwardHeaders, connectionNamedHeaders, NO_IDENTITY_MESSAGE, RESPO
 import { isSideRequest, outputBudgetField, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard, stripLeakedBiliTools } from "./server/side-request.js";
 import { dshCompactionRefusal, isDshCompactionCall } from "./server/dsh-compaction-guard.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead, projectThinkingMass } from "./server/budget.js";
+import { detectToolBurst, holdGrowthNudge } from "./burst-hold.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./server/stream-io.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./server/chain-artifacts.js";
 import { droppedOpenaiParts } from "./wire-drop-warn.js";
@@ -3264,7 +3265,7 @@ function diagTagSummary(messages: CoreMessage[], sessionId: string, strategy: st
     return `[${sessionId}] processTurn: ${messages.length} msgs, renderTags=${strategy}, ${textTagged} text tagged, ${toolTagged} tool tagged (should be 0 with text-only)`;
 }
 
-function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; contextUsage: number; tier: number | null; breakdown?: Record<string, number> } | null }, sessionId: string, tokenCount: number, limit: number, model: string | undefined, willInject: boolean): string {
+function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; contextUsage: number; tier: number | null; breakdown?: Record<string, number> } | null }, sessionId: string, tokenCount: number, limit: number, model: string | undefined, willInject: boolean, heldInfo?: string): string {
     const n = turn.nudge;
     if (!n) return `[${sessionId}] nudge: unavailable`;
     const b = n.breakdown ?? {};
@@ -3279,9 +3280,9 @@ function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: string; cont
     // lies about delivery (#451, same class as #413).
     const inject = willInject
         ? (n.shouldInject ? `INJECT T${n.tier ?? "?"}` : `INJECT-ESC T${n.tier ?? "?"}`)
-        : (n.shouldInject ? `ARMED-SUPPRESSED T${n.tier ?? "?"}` : "idle");
+        : (n.shouldInject ? (heldInfo ? `HOLD T${n.tier ?? "?"}` : `ARMED-SUPPRESSED T${n.tier ?? "?"}`) : "idle");
     const modelTag = model ? ` model=${model}` : "";
-    return `[${sessionId}] nudge ${inject}: usage=${pct} (${tokenCount}/${limit}), growth=${growth}/${floor} (ref=${ref}, interval=${interval}), pendingT1=${pendingT1}/${interval}${modelTag}, reason="${n.reason.slice(0, 120)}"`;
+    return `[${sessionId}] nudge ${inject}: usage=${pct} (${tokenCount}/${limit}), growth=${growth}/${floor} (ref=${ref}, interval=${interval}), pendingT1=${pendingT1}/${interval}${modelTag}${heldInfo ? `, ${heldInfo}` : ""}, reason="${n.reason.slice(0, 120)}"`;
 }
 
 // Zero-baseline sessions are judged conservatively ONLY when they arrived
@@ -3549,8 +3550,10 @@ async function prepareAnthropic(
             if (t) session.meta.title = t;
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
-        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
-        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
+        const burst = detectToolBurst(msgs, opts.compress.burstHold);
+        const holdGrowth = !!turn.nudge && holdGrowthNudge(burst, turn.nudge.contextUsage, config.nudge.maxContextLimitPct);
+        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && ((turn.nudge.shouldInject && !holdGrowth) || emergencyNudge(turn.nudge));
+        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge, holdGrowth ? `burst-hold(${burst.toolResults}/${burst.windowSize},share=${burst.share.toFixed(2)})` : undefined));
         processedMessages = stripReasoning(stripKernelSummaries(turn.messages, turn.state));
         // #1001: a silent client history rewrite takes the same archive+prune path
         // as an announced /compact boundary — syncBlocks above has already
@@ -3786,8 +3789,10 @@ async function prepareOpenai(
             if (t) session.meta.title = t;
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
-        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
-        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
+        const burst = detectToolBurst(msgs, opts.compress.burstHold);
+        const holdGrowth = !!turn.nudge && holdGrowthNudge(burst, turn.nudge.contextUsage, config.nudge.maxContextLimitPct);
+        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && ((turn.nudge.shouldInject && !holdGrowth) || emergencyNudge(turn.nudge));
+        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge, holdGrowth ? `burst-hold(${burst.toolResults}/${burst.windowSize},share=${burst.share.toFixed(2)})` : undefined));
         processedMessages = stripReasoning(stripKernelSummaries(turn.messages, turn.state));
         // #1001: a silent client history rewrite takes the same archive+prune path
         // as an announced /compact boundary — syncBlocks above has already
@@ -4044,8 +4049,10 @@ async function prepareGoogle(
             if (t) session.meta.title = t;
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
-        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
-        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, model, willInjectNudge));
+        const burst = detectToolBurst(msgs, opts.compress.burstHold);
+        const holdGrowth = !!turn.nudge && holdGrowthNudge(burst, turn.nudge.contextUsage, config.nudge.maxContextLimitPct);
+        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && ((turn.nudge.shouldInject && !holdGrowth) || emergencyNudge(turn.nudge));
+        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, model, willInjectNudge, holdGrowth ? `burst-hold(${burst.toolResults}/${burst.windowSize},share=${burst.share.toFixed(2)})` : undefined));
         processedMessages = stripKernelSummaries(turn.messages, turn.state);
         applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
         reapOrphansLogged(session, msgs, log, sessionId);
@@ -4346,8 +4353,10 @@ async function prepareResponses(
             if (t) session.meta.title = t;
         }
         log("info", diagTagSummary(turn.messages, sessionId, "text-only"));
-        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !isCompactionTrigger && (turn.nudge.shouldInject || emergencyNudge(turn.nudge));
-        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge));
+        const burst = detectToolBurst(msgs, opts.compress.burstHold);
+        const holdGrowth = !!turn.nudge && holdGrowthNudge(burst, turn.nudge.contextUsage, config.nudge.maxContextLimitPct);
+        const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !isCompactionTrigger && ((turn.nudge.shouldInject && !holdGrowth) || emergencyNudge(turn.nudge));
+        log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge, holdGrowth ? `burst-hold(${burst.toolResults}/${burst.windowSize},share=${burst.share.toFixed(2)})` : undefined));
         processedMessages = repairResponsesAssistantOrdering(stripReasoning(stripKernelSummaries(turn.messages, turn.state)), originalMessages);
         reapOrphansLogged(session, msgs, log, sessionId);
         // [#1095] arrival-time image downscale (see prepareAnthropic).

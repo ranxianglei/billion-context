@@ -463,6 +463,18 @@
 - **状态：** ACTIVE
 - **说明：** `neverPreserveRecentTools` 的**正向配对旋钮**：从生效的最近区排除列表中**移除**的工具名模式。#1198/#1277 批量读文件「折叠→重读」死循环的解法由此变成一条配置 —— `{ "compress": { "preserveRecentTools": ["read"] } }` —— 既不用重述（也不用冻结一份很快过时的手抄）内置列表，还自动跟随内置列表演化。生效排除表 = `(neverPreserveRecentTools ?? 内置) 减 preserveRecentTools`；可与显式 `neverPreserveRecentTools` 组合（减法同样作用于显式列表）；通配后缀模式移除匹配项（`"bash*"` 移除 `bash`）。除非确实需要逐字替换语义，优先用本旋钮而不是改 never-list。**⚠ 空数组 `[]` 会被拒绝** —— 在这里是纯无操作，裸 `[]` 几乎必然是 `neverPreserveRecentTools: []`（最大保护逃生门）的笔误。与同族旋钮一样跨层级整体替换（最深层胜出）。
 
+#### `burstHold`
+
+- **类型：** `object`（`{ enabled?, minToolResults?, lookbackMessages?, minToolShare? }`）
+- **默认值：** `{ enabled: true, minToolResults: 5, lookbackMessages: 12, minToolShare: 0.55 }` —— **默认开启**（#1487）
+- **状态：** ACTIVE
+- **说明：** **工具批量调用期间的压缩提示暂缓（tool-burst nudge hold）。** 当客户端重发的历史尾部以大量新鲜工具结果为主 —— agent 正在批量执行 read/grep/glob/bash —— 且上下文用量仍低于暂缓上限时，**增长型**压缩提示被暂缓，让 agent 先把这一票干完再压，避免它正在使用的工作内容刚出现就被折掉。这是 #1198/#1277「折叠→重读」死循环（dsh discussion #5795 报告）的自动化对策：不必手动用最近区旋钮把新结果挡在折叠之外，提示自己等批量结束。暂缓每请求无状态、双压缩模式与所有 wire 路径一致生效；只暂缓**主动的增长型提示** —— 内核压力带强制提示（用量 ≥ `maxContextLimit`）与宿主紧急提示（用量 ≥ 70%）永远放行，因此批量中途上下文吃紧时立刻照常压缩。暂缓上限 = `min(0.7, 生效的 maxContextLimit)`。子字段（像 `absorb` 一样按子字段跨层级最深层胜出合并）：
+  - `enabled: boolean` —— 默认 `true`；设 `false` 恢复旧版「到点必提示」行为。
+  - `minToolResults: number` —— 窗口内工具结果达到该数量才算批量（默认 `5`），正整数。
+  - `lookbackMessages: number` —— 检查的历史尾部窗口大小（消息数，默认 `12`），正整数。
+  - `minToolShare: number` —— 窗口内工具结果占比下限（0..1]（默认 `0.55`）。校准目标：稳定的 assistant/工具交替节奏（~0.5）不触发，并行批量（~0.8+）必触发。
+- **示例：** `{ "compress": { "burstHold": { "enabled": false } } }` 完全关闭暂缓；`{ "compress": { "burstHold": { "minToolShare": 0.7 } } }` 收紧触发条件。
+
 #### `prompts`
 
 - **类型：** `object`（`{ compressPhilosophy?, howToCompressRules?, tier2DistillRules?, tier3CondenseRules? }`，均为字符串）
