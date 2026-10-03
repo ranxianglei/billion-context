@@ -123,7 +123,7 @@ import { BILI_TUNNEL_HEADER, checkTunnelDestination, classifyIp, localMachineIps
 import { dumpRejectedBody } from "./error-dump.js";
 
 import { decodeRequestBody, DecompressedTooLargeError } from "./content-encoding.js";
-import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSystemPlacementError, resolveCompatRoles, type CompatRoles } from "./compat-roles.js";
+import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSystemPlacementError, hasOffHeadSystem, resolveCompatRoles, type CompatRoles } from "./compat-roles.js";
 import { applyCompatDropFields, dropCompatFieldsJson, resolveCompatDropFields } from "./compat-drop.js";
 import { applyOutputSteering, applyOutputSteeringJson } from "./output-steering.js";
 import { bodyDumpEnabled, getUnrecognizedPathStats, isModelDiscoveryPath, logDumpFailure, logUnrecognizedPath } from "./server/observability.js";
@@ -6257,8 +6257,19 @@ async function forward(
                 clearTimer: upstreamResult.clearTimer,
                 stopIdleTimer: upstreamResult.stopIdleTimer,
             };
-            const rejection = detectRoleRejection(upstreamResult.response.status, roleErrText);
-            if (rejection && rejection.role !== "system") {
+            const namedRejection = detectRoleRejection(upstreamResult.response.status, roleErrText);
+            // #1996: placement-only rejections name no role (vLLM+Qwen
+            // chat_template: "System message must be at the beginning.") — enter
+            // the ladder when the error matches a placement marker AND the wire
+            // itself carries the offending shape, so a client-origin mid-history
+            // system item (plugin-mode #1638 verbatim pass-through) gets the same
+            // single-hop repair instead of a permanent 400 loop on every retry.
+            const rejection = namedRejection ??
+                (detectSystemPlacementError(upstreamResult.response.status, roleErrText) &&
+                    hasOffHeadSystem(wireBody, compatProtocol)
+                    ? { role: "system" }
+                    : null);
+            if (rejection && !(namedRejection && namedRejection.role === "system")) {
                 // Learn-on-failure ladder — primary hop (#552: offending role →
                 // "system") plus a SECOND-CHANCE hop (#583: → "user") fired only
                 // when the system hop 400'd with a #377-class system-PLACEMENT
@@ -6268,6 +6279,9 @@ async function forward(
                 // exactly once; the sequence is fixed (never a loop), hard-capped
                 // at original + 2 retries. Any other failure stops the ladder and
                 // the original 400 passes through verbatim.
+                // (#1996): placement-only errors that name no role enter here
+                // directly as { role: "system" } (see above) and skip the
+                // identity hop straight to the system→user placement fix.
                 const cp = compatProtocol;
                 const wb = wireBody;
                 const remember = (target: string, rewritten: number): void => {
@@ -6316,7 +6330,13 @@ async function forward(
                     r.clearTimer();
                     return errText !== null && detectSystemPlacementError(r.response.status, errText) ? "placement-400" : "other";
                 };
-                if ((await hop("system")) === "placement-400") await hop("user");
+                // #1996: an already-system offender needs no identity hop — go
+                // straight to the placement fix (system→user).
+                if (rejection.role === "system") {
+                    await hop("user");
+                } else if ((await hop("system")) === "placement-400") {
+                    await hop("user");
+                }
             }
         }
     }

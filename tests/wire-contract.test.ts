@@ -123,6 +123,7 @@ test("wire-contract ledger: every rule has a live enforcement clause", () => {
             { tools: [], input: [{ type: "function_call", id: "fc-1", call_id: "c1", name: "f", arguments: "{}" }] },
             { input: [{ type: "configuration_update", reasoning: { effort: "medium" } }, { type: "configuration_update", reasoning: { effort: "high" } }] },
             { model: "m", input: [], reasoning: { effort: "high", summary: "auto" } },
+            { input: [{ role: "user", content: "u" }, { role: "system", content: "s" }] },
         ],
         google: [
             { tools: [{ functionDeclarations: [{ name: "bad-name", parameters: { type: "object", properties: {} } }] }] },
