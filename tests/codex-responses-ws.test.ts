@@ -141,7 +141,7 @@ test("codex WS: prewarm probe plus full-replay turns ride the prefix lane throug
         assert.match(String(f.rows[0].headers["user-agent"]), /^codex_exec\//);
         // The real turn is a full replay the pipeline processed: bili's ACP
         // tools ride alongside codex's own (empty) tool list.
-        assert.ok(Array.isArray(f.rows[1].request.tools) && (f.rows[1].request.tools as Item[]).some(t => t.name === "acp_status" || t.name === "compress"), JSON.stringify(f.rows[1].request.tools?.map?.((t: Item) => t.name)));
+        assert.ok(Array.isArray(f.rows[1].request.tools) && (f.rows[1].request.tools as Item[]).some(t => t.name === "acp_status" || t.name === "compress"), JSON.stringify((f.rows[1].request.tools as Item[]).map(t => t.name)));
         assert.ok(JSON.stringify(f.rows[1].request.input).includes("codex-first-turn"));
         const session = peekSession(f.sid);
         assert.ok(session);
@@ -189,7 +189,7 @@ test("codex WS: folding covered history shrinks the replayed turn", { timeout: 3
         };
         await play("session purpose: codex prefix-lane ACP integration");
         await play("OLD-BULKY-SENTINEL " + "unique filler content ".repeat(1200));
-        const firstText = JSON.stringify(f.rows.at(-1)!.request.input.find(item => JSON.stringify(item).includes("OLD-BULKY-SENTINEL")));
+        const firstText = JSON.stringify((f.rows.at(-1)!.request.input as Item[]).find((item: Item) => JSON.stringify(item).includes("OLD-BULKY-SENTINEL")));
         const ref = firstText.match(/\x3cacp[^\x3e]*\x3e(m\d+)\x3c\/acp\x3e/)?.[1];
         assert.ok(ref, firstText.slice(-300));
         for (let i = 0; i < 4; i++) await play(`push ${i}`);
@@ -239,6 +239,6 @@ test("codex WS: non-streaming transport options are refused with a protocol erro
         f.peer.send(f.frame([user("nope")], { stream: false }));
         const error = await done;
         assert.equal(error.type, "error");
-        assert.equal(error.error.code, "invalid_request");
+        assert.equal((error.error as { code: string }).code, "invalid_request");
     } finally { await f.close(); }
 });
