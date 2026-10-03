@@ -9,6 +9,7 @@ import { createCore, type CompressionCore, type CompressionState, type Config, t
 import { DEFAULT_STRIP_IMAGES_KEEP_RECENT, applyCompressSettings, resolveAbsorbSettings, resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig } from "./compress-settings.js";
 import { dropCompressReasoning, type CompressReasoningConfig } from "./reasoning-drop.js";
 import type { CompressSettings, ProxyOptions, ResignSettings } from "./config.js";
+export type { ProxyOptions } from "./config.js";
 import { loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
 import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveResignSettings } from "./config.js";
