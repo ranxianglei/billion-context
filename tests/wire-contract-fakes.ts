@@ -127,6 +127,14 @@ export const WIRE_RULES: readonly WireRule[] = [
         provenance:
             "bili #1757 per-field measurement against SenseNova's Responses gateway https://token.sensenova.cn/v1/responses (2026-09-30): every pi-ai outbound field 200 except reasoning.summary → 400 code InvalidParameter; OpenAI Responses API reference (reasoning.effort is the only documented subfield)",
     },
+    {
+        id: "WC-014",
+        wire: "responses",
+        summary:
+            "strict Jinja-template backends (Qwen family served by vLLM/SGLang) reject any role:\"system\" message that is not the first chat-producing item — or any second system — raising \"System message must be at the beginning.\" from chat_template.jinja; bili never emits such items itself (front block/anchors ride as developer, nudges/separators as user, top-level instructions stripped), so offenders are client-origin mid-history system items forwarded verbatim by the plugin-mode position-preserving pass-through (#1638); repair = learn-on-failure placement entry (src/compat-roles.ts hasOffHeadSystem → single system→user rewrite hop, remembered per session)",
+        provenance:
+            "bili #1996 production 400 (vLLM /v1/responses serving a Qwen model: artifact:chat_template.jinja Jinja Exception \"System message must be at the beginning.\", code invalid_prompt, every post-compression request of two OMP plugin-mode sessions, 2026-10-03); vLLM Responses→chat passes role-bearing items verbatim (vllm/entrypoints/openai/responses/utils.py _construct_message_from_response_item)",
+    },
 ];
 
 const ANTHROPIC_TOOL_NAME_RE = /^[a-zA-Z0-9_-]{1,128}$/;
@@ -246,6 +254,35 @@ export function validateResponsesBody(body: unknown): string[] {
     // exists on bodies without tools.
     if (isPlainObject(body.reasoning) && "summary" in body.reasoning)
         out.push('WC-013 reasoning.summary is not part of the OpenAI Responses API — strict-schema upstreams 400 (json: unknown field "summary"); drop it via compat.dropFields (#1757)');
+    // WC-014 (#1996): runs before the tools early-return — strict Jinja
+    // templates raise on any system message that is not the first
+    // chat-producing item, or on a duplicate system. Mirrors
+    // src/compat-roles.ts hasOffHeadSystem eligibility exactly; a non-empty
+    // top-level instructions becomes a leading system upstream.
+    if (Array.isArray(body.input)) {
+        const wc14RoleProducing = new Set([
+            "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output", "reasoning",
+        ]);
+        const hasInstructions = typeof body.instructions === "string" && body.instructions.length > 0;
+        let systems = 0;
+        let firstSlotIdx = -1;
+        let firstSystemIdx = -1;
+        body.input.forEach((item, i) => {
+            if (!isPlainObject(item)) return;
+            const t = item.type;
+            const isMessage = t === undefined || t === "message";
+            if (!isMessage && !wc14RoleProducing.has(t as string)) return;
+            if (firstSlotIdx < 0) firstSlotIdx = i;
+            if (isMessage && item.role === "system") {
+                systems++;
+                if (firstSystemIdx < 0) firstSystemIdx = i;
+            }
+        });
+        if (systems > 1)
+            out.push(`WC-014 ${systems} system messages — strict Jinja templates: system messages must be at the beginning, exactly one (#1996)`);
+        else if (systems === 1 && (hasInstructions || firstSystemIdx !== firstSlotIdx))
+            out.push(`WC-014 input[${firstSystemIdx}]: system message must be at the beginning (strict Jinja templates reject off-head system roles, #1996)`);
+    }
     if (!Array.isArray(body.tools)) return out;
     body.tools.forEach((t, i) => {
         if (!isPlainObject(t)) return;
