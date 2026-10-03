@@ -318,12 +318,15 @@ export function reserveOutputHeadroom(window: number, maxOutput: number, capPct:
  * (#377). Keeping the summary mid-stream at its anchor (instead of hoisting it
  * to the head) also keeps the head system message — the prefix-cache anchor —
  * byte-stable across compress turns, so a new block does not invalidate the
- * whole-conversation prefix. In plugin/launcher mode the summary carrier is the
- * `compress` tool call (in the agent's own re-sent history), so the kernel's
- * acp_summary is stripped by stripKernelSummaries and this is a no-op there.
- * A summary is a stand-in for the folded history; re-voicing it as a user turn
- * is the accepted trade-off for SGLang compatibility + cache stability. No-op
- * (same array) when there is no system/developer message to convert.
+ * whole-conversation prefix. In plugin/launcher mode the summary carrier is
+ * usually the `compress` tool call in the agent's own re-sent history:
+ * stripKernelSummaries removes the kernel's acp_summary anchor when that pair
+ * rides inbound history, making this a no-op; when the pair does NOT ride
+ * (pruned or line-form echo) the anchor survives, and this re-voicing is what
+ * keeps strict backends legal then (#1999). A summary is a stand-in for the
+ * folded history; re-voicing it as a user turn is the accepted trade-off for
+ * SGLang compatibility + cache stability.
+ * No-op (same array) when there is no system/developer message to convert.
  */
 export function systemToUser<T extends { role: string }>(messages: T[]): T[] {
     let hasSys = false;
