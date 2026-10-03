@@ -186,13 +186,23 @@ no secrets, `npm ci` + `npm run build` + the gated suite.
 
 ---
 
-## Native-lane suite (`e2e-native-pi.test.ts`) — real `pi` package-native vs deterministic fake
+## Native-lane suite (`e2e-native-pi.test.ts`) — real `pi` package lane vs deterministic fake
 
 `ACP_TEST_E2E_NATIVE=1` gates the suite (`npm test` stays free). It drives the
-**real `pi` CLI** in package-native mode (the repo root installed as a pi
-package — the `bili plugin install pi` lane) through a **deterministic
-chat-completions fake upstream** (`fake-upstream-chat.mjs`, zero tokens), and
-asserts the four user-facing guarantees of #1239:
+**real `pi` CLI** in package mode (the repo root installed as a pi package —
+the `bili plugin install pi` lane) through a **deterministic chat-completions
+fake upstream** (`fake-upstream-chat.mjs`, zero tokens).
+
+Since #1988 the suite covers BOTH postures of the pi lane:
+
+- **default in-process lane** (`dist/agent/pi-inprocess.js`, no local server):
+  the non-server guarantees are asserted explicitly — every upstream request
+  is direct (no `x-bili-plugin` stamping, no conversation header, no instance
+  record under the hermetic state dir) — while `acp_status`/`compress` still
+  execute in-process, compression is real (≥1 block lands in a `.acp.json`
+  sidecar next to pi's session files), and `/acp` exits clean with no proxy;
+- **server-based lane behind `BILI_PI_INPROC=0`** (`dist/agent/pi-native.js`),
+  asserting the four user-facing guarantees of #1239:
 
 1. **interception + plugin-mode claim** — every upstream request carries
    `x-bili-plugin: pi` + `x-bili-plugin-conversation` (the #1243 one-shot
@@ -223,12 +233,17 @@ asserts the four user-facing guarantees of #1239:
   (`BILLION_CONTEXT_PROXY`, `BILI_*`, `ACP_*`, host pi overrides) **and
   `NODE_TEST_CONTEXT`** — pi-native deliberately stands down inside
   node:test, and the runner exports that variable into every spawned child.
+  The spawn env then re-adds `ACP_AUTO_UPDATE=0` so neither lane's updater
+  can reach the real npm registry from CI.
 - The spawn cwd is outside the repo (#815, same reason as codex).
-- Sessions persist lazily: the suite SIGTERMs the hermetic proxy
-  (`stopProxiesGracefully`) before asserting on-disk state; teardown then
-  SIGKILLs survivors (fake + instance-record pids).
+- In the server-based lane sessions persist lazily: the suite SIGTERMs the
+  hermetic proxy (`stopProxiesGracefully`) before asserting on-disk state;
+  teardown then SIGKILLs survivors (fake + instance-record pids). The
+  in-process lane persists synchronously via sidecars, so no graceful stop is
+  needed there.
 - `E2E_CHECK=1` runs a zero-cost preflight (pi binary version, built
-  `dist/agent/pi-native.js`, fake `/v1/models` probe). `E2E_PI_BIN` /
+  `dist/agent/pi-inprocess.js` + `dist/agent/pi-native.js`, fake
+  `/v1/models` probe). `E2E_PI_BIN` /
   `E2E_TMO` override the binary and per-run timeout.
 
 ### CI

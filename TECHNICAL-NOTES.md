@@ -182,8 +182,8 @@ The proxy runs in one of two modes, and **the mode decides who executes
 **Why the carriers differ.** In plugin mode the agent owns compression: the
 `compress` call + result live in the agent's own history and are re-sent every
 turn, so the summary rides on the tool call and the agent's view never renders
-the kernel's `acp_summary` fallback (`billion-context-pi` `src/messages.ts`
-skips `acp_summary_*`). In proxy mode the client is not ACP-native, so the
+the kernel's `acp_summary` fallback (the pi in-process entry's
+`src/agent/pi-inprocess/messages.ts` skips `acp_summary_*`). In proxy mode the client is not ACP-native, so the
 proxy executes `compress` server-side; the tool call never enters the client's
 history, and preflight blocks have no tool call at all — so the kernel's
 `acp_summary` message is the only carrier. The kernel renders it as role

@@ -105,7 +105,7 @@ QQ群:
 
 | 客户端 | 用这个 |
 |---|---|
-| **pi** | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili pi`(启动器)或 `bili plugin install pi`(原生);独立 [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi) 仍可用 |
+| **pi** | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili pi`(启动器)或 `npm:billion-context`(进程内扩展,无本地 server;模型流量直连上游)。`BILI_PI_INPROC=0` 回退到 server 版原生(自拉起代理);独立 [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi) 已弃用(#1988) |
 | **opencode**(1.x / 2.x) | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili opencode`(启动器)或 `bili plugin install opencode`(原生);独立 [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) 在 1.x 上仍可用 —— 完整指南:[OpenCode](CLIENTS.zh-CN.md#opencode) |
 | **omp** | [`billion-context`](https://github.com/ranxianglei/billion-context)，`bili omp`（内置插件）或 `bili plugin install omp`（自拉起原生插件，免启动器） |
 | **dsh** | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili dsh`(启动器,经 `--patch` 注入完整原生插件)或 `bili plugin install dsh` ≡ `dsh plugin --profile <name> add billion-context`(统一泳道)—— 细节见 [CLIENTS.zh-CN.md](CLIENTS.zh-CN.md) |
@@ -125,7 +125,7 @@ QQ群:
 | **goose**(Goose CLI) | `bili goose`(启动器)—— rustls 不信任任何 CA 文件,无法 cert-MITM:openai/anthropic 腿经 `OPENAI_HOST`/`ANTHROPIC_HOST`,自定义 provider 经重新生成的 `GOOSE_PATH_ROOT` overlay(#1049) |
 | **其余所有**（没有上下文 hook） | [`billion-context`](https://github.com/ranxianglei/billion-context) —— `bili <client>`（启动器，优先）或 `/bili/` 前缀 |
 
-**原生模式 vs 独立扩展。** 宿主原生插件(`bili plugin install …`)与独立进程内扩展(`billion-context-pi`、`opencode-acp`)**互斥** —— 两者同时生效意味着双重压缩。安装器负责切换:替换旧条目(裸名、`npm:` 别名、带版本号、路径形式都认,数组/对象两种形态都处理),原配置快照到 `.bili-bak`;**项目级**安装不会被碰 —— 需手动移除。作为手动安装的运行期安全网,原生入口在加载时同步设置 `BILLION_CONTEXT_NATIVE=<host>`,让独立扩展在动作时自动退出。pi 一侧该标记需要 `billion-context-pi` **0.1.72+**。
+**原生模式 vs 独立扩展。** 宿主原生插件(`bili plugin install …`)与独立进程内扩展(`billion-context-pi`、`opencode-acp`)**互斥** —— 两者同时生效意味着双重压缩。安装器负责切换:替换旧条目(裸名、`npm:` 别名、带版本号、路径形式都认,数组/对象两种形态都处理),原配置快照到 `.bili-bak`;**项目级**安装不会被碰 —— 需手动移除。作为手动安装的运行期安全网,原生入口在加载时同步设置 `BILLION_CONTEXT_NATIVE=<host>`,让独立扩展在动作时自动退出。对 pi 而言这基本已是历史:#1988 之后默认 pi 泳道就是 billion-context 自己的进程内入口(`dist/agent/pi-inprocess.js`,无 server),独立的 `billion-context-pi` 包已弃用、待下线 —— 它的状态文件(`.acp.json` sidecar)由新入口原样读取,≥ 0.1.72 的构建见到我们的标记会自动退出。更早的构建没有该标记,所以两个 pi 入口都会扫描全局 + 项目级 pi 配置,发现残留的旧 `billion-context-pi` 时大声告警 —— 若有一个残留,你看到的是告警而不是静默。
 
 
 ## 安装
@@ -172,7 +172,7 @@ pi / omp / kimi / claude 没有客户端侧通道 —— 它们的配置条目�
 
 注意:
 
-- 原生模式与独立进程内扩展(`billion-context-pi`、`opencode-acp`)**互斥** —— 安装器负责换条目并把原配置快照(`.bili-bak`)。
+- 对 pi,两种姿态在同一个包里、永远不会同时生效:进程内入口是默认(`npm:billion-context`),`BILI_PI_INPROC=0` 则委托给 server 版原生。独立进程内扩展(`opencode-acp`、旧 `billion-context-pi`)与当前生效的姿态互斥 —— 安装器负责换条目并把原配置快照(`.bili-bak`)。
 - OpenCode 旧会话、V1/V2 插件形态与全部注意事项:[OpenCode](CLIENTS.zh-CN.md#opencode)。
 - `kimi` 仅在自举时上报 runtime-info(静态头无法承载逐请求窗口/模型值);子代理工具调用由代理的出站 tool_use 见证环路由(#1685)——模型看不到任何会话 id。
 - `hermes` 的原生插件是 Python:健康检查通过后用环境变量把 hermes 的 httpx 栈指向代理,并经 `llm_request` 中间件打逐请求头。
@@ -361,7 +361,7 @@ bili --no-auto-update        # 本次启动禁用自动更新
 
 早期。协议处理和压缩已通过 mock 测试(500+ 项通过)。真实模型集成测试是下一里程碑。预期会有粗糙的地方。
 
-针对 pi / omp / opencode 的客户端插件随 `billion-context` 一起发布(`dist/agent/*.js`),用于协作代理路径。三者(`billion-context`、独立的 `billion-context-pi`、`opencode-acp`)如何取舍,见上文「该选哪个?」一节。
+针对 pi / omp / opencode 的客户端入口随 `billion-context` 一起发布(`dist/agent/*.js`):pi 同时拥有进程内引擎(默认,#1988)与 server 版原生(`BILI_PI_INPROC=0`),omp / opencode 走协作代理路径。`billion-context`、独立的 `opencode-acp` 与已弃用的 `billion-context-pi` 如何取舍,见上文「该选哪个?」一节。
 
 ## 额外署名要求（在 MIT 之上的一条附加条款）
 

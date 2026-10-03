@@ -69,7 +69,7 @@ bili 永不拥有用户数据:每个被启动的客户端都跑在**真实 home*
 | 代理注入的 `compress` 工具 | 无 —— agent 原生注册 4 个 ACP 工具 | 4 个上下文工具(启用时) |
 | 代理注入的 nudge | **有** —— agent 自己没有 nudge 通道,代理侧 nudge 就是主动压缩触发器(仅预检只在硬上限才触发;#451) | 有(启用时) |
 
-**为什么载体不同。** 插件模式下 agent 拥有压缩权:`compress` 调用 + 结果都在 agent 自己的历史里、每轮重发,所以摘要搭在工具调用上,agent 视图从不渲染内核的 `acp_summary` 兜底(`billion-context-pi` 的 `src/messages.ts` 跳过 `acp_summary_*`)。代理模式下客户端不是 ACP 原生的,由代理在服务端执行 `compress`;工具调用从不进入客户端历史,预检块则根本没有工具调用 —— 于是内核的 `acp_summary` 消息成为唯一载体。内核把它渲染为 role `system`,但严格的 OpenAI 兼容后端(SGLang)要求 index 0 处恰好一条 system 消息,所以 `systemToUser`(`src/util.ts`)把它改声为 `user` 消息,留在原锚点位置。这使头部 system 消息(前缀缓存锚点)在压缩轮之间保持字节稳定,新块不会使整段对话前缀失效。
+**为什么载体不同。** 插件模式下 agent 拥有压缩权:`compress` 调用 + 结果都在 agent 自己的历史里、每轮重发,所以摘要搭在工具调用上,agent 视图从不渲染内核的 `acp_summary` 兜底(`src/agent/pi-inprocess/messages.ts` 跳过 `acp_summary_*`)。代理模式下客户端不是 ACP 原生的,由代理在服务端执行 `compress`;工具调用从不进入客户端历史,预检块则根本没有工具调用 —— 于是内核的 `acp_summary` 消息成为唯一载体。内核把它渲染为 role `system`,但严格的 OpenAI 兼容后端(SGLang)要求 index 0 处恰好一条 system 消息,所以 `systemToUser`(`src/util.ts`)把它改声为 `user` 消息,留在原锚点位置。这使头部 system 消息(前缀缓存锚点)在压缩轮之间保持字节稳定,新块不会使整段对话前缀失效。
 
 **为什么是 `user`,而不是 `system` 或伪造的工具调用。** 流中间的 `system` 消息正是 SGLang 拒绝的东西(#377)。伪造一个 `compress` 工具调用是「更纯粹」的载体,但在代理模式下需要按 id 捏造 assistant `tool_calls` + user `tool_result` 对、在请求里声明该工具、还要处理没有真实调用的预检块 —— 远比改声一条独立笔记侵入得多。`user` 消息允许出现在对话任何位置,是同时满足 SGLang 单 system 规则与前缀缓存稳定的最小改动。接受的取舍:摘要是被折叠历史的替身,把它改声成 user 回合是一种模型能容忍的语义错位(它被明确标记为 `[Compressed conversation section]`)。
 

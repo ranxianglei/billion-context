@@ -5,6 +5,7 @@
 // bootstrap blocks.
 
 import path from "node:path";
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 /** dist/agent/<entry>.js → dist/index.js (the package bin). Resolved at
@@ -129,6 +130,23 @@ export function isLegacyBcpEntry(entry: string): boolean {
     return bare === "billion-context-pi"
         || /^billion-context-pi@/.test(bare)
         || /(^|[/\\])billion-context-pi([/\\]|$)/.test(e);
+}
+
+/** packages[] entries in one pi settings.json that load billion-context-pi. */
+export function legacyBcpEntriesIn(file: string): string[] {
+    let text: string;
+    try {
+        text = readFileSync(file, "utf8");
+    } catch {
+        return [];
+    }
+    try {
+        const parsed = JSON.parse(text) as { packages?: unknown };
+        if (!Array.isArray(parsed.packages)) return [];
+        return (parsed.packages as unknown[]).map(String).filter(isLegacyBcpEntry);
+    } catch {
+        return [];
+    }
 }
 
 /** Concurrent callers share one in-flight bootstrap — a burst of failures

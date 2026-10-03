@@ -9,7 +9,10 @@
     "./server": "./dist/agent/opencode-native.js",
     "./dsh": "./dist/agent/dsh-native.js",
     "./dsh/package.json": "./package.json",
-    "./client": "./dist/agent/dsh-native-client.js"
+    "./client": "./dist/agent/dsh-native-client.js",
+    "./pi": "./dist/agent/pi-inprocess.js",
+    "./contract": "./dist/agent/pi-inprocess-contract.js",
+    "./contract/schema": "./src/agent/pi-inprocess/schema/bcp-block-v1.json"
   },
   "bin": {
     "bili": "./dist/index.js",
@@ -55,6 +58,8 @@
     "zod": "4.1.8"
   },
   "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.83.0",
+    "@earendil-works/pi-tui": "0.83.0",
     "@types/node": "^22.0.0",
     "@types/node-forge": "^1.3.14",
     "@types/semver": "^7.7.1",
@@ -67,6 +72,7 @@
     "tar": "^7.5.22",
     "tsup": "^8.0.0",
     "tsx": "^4.0.0",
+    "typebox": "1.3.34",
     "typescript": "^5.5.0",
     "undici": "^7.29.0",
     "verdaccio": "^6.10.4",
@@ -80,12 +86,13 @@
     "README.md",
     "dist",
     "dsh.bundle.patch.yml",
-    "hermes-plugin"
+    "hermes-plugin",
+    "src/agent/pi-inprocess/schema"
   ],
   "pi": {
     "image": "https://raw.githubusercontent.com/ranxianglei/billion-context/master/docs/logo.png",
     "extensions": [
-      "./dist/agent/pi-native.js"
+      "./dist/agent/pi-inprocess.js"
     ]
   },
   "publishConfig": {

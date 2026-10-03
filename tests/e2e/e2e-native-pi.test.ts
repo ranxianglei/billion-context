@@ -1,20 +1,21 @@
-// E2E: REAL `pi` (native package lane) through bili's native extension (#1239).
+// E2E: REAL `pi` (package lane) through bili's pi entries (#1239, #1988).
 // Mirrors e2e-codex-fake.test.ts: a deterministic fake chat-completions upstream
-// scripts the model, so the whole native chain — proxy bootstrap, fetch
-// interception, x-bili-plugin stamping, ACP tool registration, plugin-tool
-// execution (acp_status / compress) and real compression — runs in-process
-// with zero tokens and no network. Gated by ACP_TEST_E2E_NATIVE=1 (needs
-// `npm run build` first — the pi package loads dist/agent/pi-native.js).
+// scripts the model, so every lane runs with zero tokens and no network.
+// Gated by ACP_TEST_E2E_NATIVE=1 (needs `npm run build` first — the pi package
+// loads whatever package.json pi.extensions declares).
 //
-// Assertions map 1:1 to #1239's acceptance list:
-//   1. traffic is intercepted + plugin-mode claimed (x-bili-plugin: pi)
-//   2. ACP tools are registered and callable by the model
-//   3. acp_status executes and returns the status report
-//   4. compress executes and PRODUCES compression (blocks + saved tokens)
-// plus the /acp slash command path (exit-clean + live status endpoint).
-// The first-request stamp race (#1243) is pinned by every stamp assertion:
-// a one-shot `pi -p` fires before_provider_headers exactly once, inside the
-// proxy bootstrap window.
+// Since #1988 the suite covers BOTH postures of the pi lane:
+//   - default IN-PROCESS lane (dist/agent/pi-inprocess.js): no local server;
+//     model traffic goes direct to the fake, so the non-server guarantees are
+//     asserted explicitly — no x-bili-plugin stamping, no instance record —
+//     while acp_status/compress still execute in-process and compression is
+//     real (blocks land in the .acp.json sidecar next to pi's session files);
+//   - server-based lane behind BILI_PI_INPROC=0 (dist/agent/pi-native.js),
+//     keeping #1239's original acceptance list: proxy bootstrap + fetch
+//     interception, x-bili-plugin stamping (the #1243 one-shot stamp race is
+//     pinned per request), ACP tool registration, plugin-tool execution
+//     (acp_status / compress), real compression, and the /acp command's live
+//     status endpoint.
 
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -28,6 +29,7 @@ import { assertPortDead } from "../port-race.js";
 const PI_BIN = process.env.E2E_PI_BIN ?? "pi";
 const REPO_ROOT = path.resolve(import.meta.dirname, "../..");
 const PI_NATIVE_ENTRY = path.join(REPO_ROOT, "dist/agent/pi-native.js");
+const PI_INPROC_ENTRY = path.join(REPO_ROOT, "dist/agent/pi-inprocess.js");
 const FAKE_UPSTREAM = path.join(import.meta.dirname, "fake-upstream-chat.mjs");
 const TMO = Number(process.env.E2E_TMO ?? 150_000);
 const WORK_ROOT = path.join(process.cwd(), "tmp");
@@ -52,7 +54,9 @@ function piAvailable(): boolean {
   }
 }
 function distBuilt(): boolean {
-  return fs.existsSync(PI_NATIVE_ENTRY);
+  // pi.extensions[0] is the in-process entry since #1988; the server-based
+  // entry stays the BILI_PI_INPROC=0 fallback the other tests exercise.
+  return fs.existsSync(PI_NATIVE_ENTRY) && fs.existsSync(PI_INPROC_ENTRY);
 }
 
 const run = process.env.ACP_TEST_E2E_NATIVE === "1";
@@ -64,7 +68,7 @@ const skipReason = !run
 const suiteSkipReason =
   skipReason ??
   (!distBuilt()
-    ? "dist/agent/pi-native.js missing — run `npm run build` first"
+    ? "dist/agent/pi-inprocess.js or pi-native.js missing — run `npm run build` first"
     : undefined);
 const checkOnly = process.env.E2E_CHECK === "1";
 
@@ -339,7 +343,7 @@ function teardown(ctx: Ctx): void {
 function piRun(
   ctx: Ctx,
   prompt: string,
-  opts: { resume?: boolean } = {},
+  opts: { resume?: boolean; serverBased?: boolean } = {},
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   const args = ["-p", "--model", "fake/fake-model"];
   if (opts.resume) args.push("--continue");
@@ -356,6 +360,11 @@ function piRun(
         XDG_CACHE_HOME: ctx.xdg.cache,
         XDG_STATE_HOME: ctx.xdg.state,
         XDG_DATA_HOME: ctx.xdg.data,
+        // Hermeticity: never let a spawned pi talk to the real npm registry
+        // (the in-process entry's session_start self-update check would
+        // otherwise resolve against it and could install into this checkout).
+        ACP_AUTO_UPDATE: "0",
+        ...(opts.serverBased ? { BILI_PI_INPROC: "0" } : {}),
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -443,7 +452,7 @@ test(
     assert.ok(piAvailable(), `pi binary "${PI_BIN}" must run --version`);
     assert.ok(
       distBuilt(),
-      `dist entry ${PI_NATIVE_ENTRY} missing — run \`npm run build\``,
+      `built pi entries (${PI_INPROC_ENTRY}, ${PI_NATIVE_ENTRY}) missing — run \`npm run build\``,
     );
     const ctx = await startCtx();
     t.after(() => teardown(ctx));
@@ -456,13 +465,15 @@ if (checkOnly) {
   // E2E_CHECK=1 stops after the zero-token preflight above.
 } else {
   test(
-    "native pi one-shot: intercepted, plugin-stamped, ACP tools registered, acp_status executes",
+    "server-based pi one-shot (BILI_PI_INPROC=0): intercepted, plugin-stamped, ACP tools registered, acp_status executes",
     { skip: suiteSkipReason },
     async (t) => {
       const ctx = await startCtx();
       t.after(() => teardown(ctx));
 
-      const r = await piRun(ctx, "请调用probe_tool;请调用acp_status");
+      const r = await piRun(ctx, "请调用probe_tool;请调用acp_status", {
+        serverBased: true,
+      });
       assert.equal(
         r.code,
         0,
@@ -528,7 +539,7 @@ if (checkOnly) {
   );
 
   test(
-    "native pi compress: model-invoked compress really folds context",
+    "server-based pi compress (BILI_PI_INPROC=0): model-invoked compress really folds context",
     { skip: suiteSkipReason },
     async (t) => {
       const ctx = await startCtx();
@@ -541,6 +552,7 @@ if (checkOnly) {
       const load = await piRun(
         ctx,
         `${filler(120)}\n${Array.from({ length: 4 }, () => "请调用probe_tool").join(";")}`,
+        { serverBased: true },
       );
       assert.equal(
         load.code,
@@ -551,7 +563,7 @@ if (checkOnly) {
       const fold = await piRun(
         ctx,
         "请调用probe_tool;请调用compress;请调用acp_status",
-        { resume: true },
+        { resume: true, serverBased: true },
       );
       assert.equal(
         fold.code,
@@ -623,13 +635,13 @@ if (checkOnly) {
   );
 
   test(
-    "/acp command: exits clean and the status endpoint it consumes is live",
+    "/acp command (server-based lane): exits clean and the status endpoint it consumes is live",
     { skip: suiteSkipReason },
     async (t) => {
       const ctx = await startCtx();
       t.after(() => teardown(ctx));
 
-      const r = await piRun(ctx, "/acp");
+      const r = await piRun(ctx, "/acp", { serverBased: true });
       assert.equal(
         r.code,
         0,
@@ -670,6 +682,142 @@ if (checkOnly) {
       assert.ok(
         typeof body.ok === "boolean",
         `status endpoint must answer JSON with an ok field (got ${res.status}: ${JSON.stringify(body).slice(0, 120)})`,
+      );
+    },
+  );
+
+  test(
+    "in-process pi default lane (#1988): no server spawned, direct traffic, real in-process compression",
+    { skip: suiteSkipReason },
+    async (t) => {
+      const ctx = await startCtx();
+      t.after(() => teardown(ctx));
+
+      // Same two-run choreography as the server-based fold test: run one loads
+      // bulky filler outside the kernel's protected zone, run two cites it.
+      const load = await piRun(
+        ctx,
+        `${filler(120)}\n${Array.from({ length: 4 }, () => "请调用probe_tool").join(";")}`,
+      );
+      assert.equal(
+        load.code,
+        0,
+        `load run failed (code=${load.code}); stderr:\n${load.stderr}`,
+      );
+
+      const fold = await piRun(
+        ctx,
+        "请调用probe_tool;请调用compress;请调用acp_status",
+        { resume: true },
+      );
+      assert.equal(
+        fold.code,
+        0,
+        `fold run failed (code=${fold.code}); stderr:\n${fold.stderr}`,
+      );
+
+      const oracle = readOracle(ctx.reqLog);
+      assert.ok(
+        oracle.length >= 3,
+        `expected >=3 upstream requests, got ${oracle.length}`,
+      );
+      // Non-server guarantees (#1988): model traffic went straight to the fake
+      // — no bili proxy sat in the path, so no plugin stamping and no instance
+      // record anywhere under the hermetic state dir.
+      for (const o of oracle) {
+        assert.equal(
+          o.plugin,
+          null,
+          `direct traffic must carry no x-bili-plugin stamp, got ${o.plugin} (nmsg=${o.nmsg})`,
+        );
+        assert.equal(
+          o.conv,
+          null,
+          "direct traffic must carry no conversation header",
+        );
+      }
+      const instancesDir = path.join(ctx.xdg.state, "billion-context", "instances");
+      const instanceFiles = fs.existsSync(instancesDir)
+        ? fs.readdirSync(instancesDir)
+        : [];
+      assert.equal(
+        instanceFiles.length,
+        0,
+        "in-process lane must not spawn a proxy instance",
+      );
+
+      const statusContent = oracle
+        .find((o) => o.toolResults.some((tr) => tr.name === "acp_status"))
+        ?.toolResults.find((tr) => tr.name === "acp_status")?.content ?? "";
+      assert.match(
+        statusContent,
+        /ACTIVE SURFACE[\s\S]*CONTEXT BREAKDOWN/,
+        `acp_status must execute in-process and return the status report, got: ${statusContent.slice(0, 200)}`,
+      );
+
+      const foldRows = oracle.filter((o) =>
+        o.toolResults.some((tr) => tr.name === "compress"),
+      );
+      assert.ok(
+        foldRows.length >= 1,
+        "compress must have been called and its result re-sent",
+      );
+      const compressResult =
+        foldRows[0]?.toolResults.find((tr) => tr.name === "compress")
+          ?.content ?? "";
+      assert.doesNotMatch(
+        compressResult,
+        /FAILED|Validation failed/,
+        `compress must succeed, got: ${compressResult.slice(0, 200)}`,
+      );
+      // The in-process receipt differs from the proxy/pluginMode receipt text;
+      // its canonical shape lives at src/agent/pi-inprocess/compress-tool.ts
+      // (the "0 blocks" degenerate clause can never match this).
+      assert.match(
+        compressResult,
+        /▣ ACP \| \S+ → \S+ tokens \(~\S+ reclaimed, blocks: b\d+=m\d+\)/,
+        `compress result must report the fold, got: ${compressResult.slice(0, 200)}`,
+      );
+
+      // Real compression evidence on disk: the in-process engine persists its
+      // state next to pi's session files (.acp.json sidecars).
+      const sidecars: string[] = [];
+      const walk = (dir: string): void => {
+        let entries: string[];
+        try {
+          entries = fs.readdirSync(dir);
+        } catch {
+          return;
+        }
+        for (const e of entries) {
+          const p = path.join(dir, e);
+          if (fs.statSync(p).isDirectory()) walk(p);
+          else if (e.endsWith(".acp.json")) sidecars.push(p);
+        }
+      };
+      walk(ctx.piAgentDir);
+      const foldedSidecars = sidecars
+        .map(
+          (f) =>
+            JSON.parse(fs.readFileSync(f, "utf8")) as { blocks?: unknown },
+        )
+        .filter((s) => Array.isArray(s.blocks) && s.blocks.length >= 1);
+      assert.ok(
+        foldedSidecars.length >= 1,
+        `at least one sidecar must carry compressed blocks (scanned ${sidecars.length} sidecar(s))`,
+      );
+
+      // The /acp command works without any proxy behind it.
+      const acp = await piRun(ctx, "/acp");
+      assert.equal(
+        acp.code,
+        0,
+        `/acp run failed (code=${acp.code}); stderr:\n${acp.stderr}`,
+      );
+      assert.doesNotMatch(
+        acp.stderr,
+        /bili-plugin\(|status fetch failed|no proxy/i,
+        `/acp must not error in-process; stderr:\n${acp.stderr}`,
       );
     },
   );
