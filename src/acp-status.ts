@@ -14,7 +14,6 @@ import { ccrEnabled, ccrLoopConfig, contentStoreOf } from "./store.js";
 import { coveredRefSpan } from "./decompress-shared.js";
 import { preCompactionArchiveOf, type Session } from "./session.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
-import { getUpdateVisibility } from "./update-notes.js";
 import { VERSION } from "./version.js";
 
 export interface AcpStatusCtx {
@@ -147,29 +146,6 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
         // — surface the active advisory here (instance-level, like #897).
         extra.push("");
         extra.push(`CRITICAL ADVISORY (instance-level): bili is auto-updating through the self-updater's safety chain — ${describeAdvisory(adv.active, adv.lastError)}. Live state: GET /__bili/status → advisory.`);
-    }
-    const upd = getUpdateVisibility(VERSION);
-    if (upd.visible) {
-        // #1870: the self-updater is a silent courier on native lanes — the
-        // "Restart to finish" log line never reaches pi/opencode/dsh users,
-        // so disk runs new while the process runs old. This is the surface
-        // agents actually poll: tell them a restart is actionable NOW, or
-        // that a recommended release exists when auto-update is off.
-        extra.push("");
-        const lines: string[] = [];
-        if (upd.pendingRestart) {
-            lines.push(`UPDATE READY (instance-level): ${upd.diskVersion} downloaded — restart this agent's proxy to finish (running ${upd.runningVersion}).`);
-        } else {
-            lines.push(`UPDATE AVAILABLE (instance-level): newer recommended release on the channel — running ${upd.runningVersion}.`);
-        }
-        for (const e of upd.span) {
-            lines.push(`  · ${e.version} [${e.tier}] ${e.summary}`);
-        }
-        if (!upd.pendingRestart) {
-            lines.push(`  Update with: npm install -g billion-context@${upd.span[upd.span.length - 1]?.version ?? "latest"}`);
-        }
-        lines.push("Live state: GET /__bili/status → update.");
-        extra.push(...lines);
     }
     const blind = getBlindTunnelStats();
     if (blind.total > 0) {

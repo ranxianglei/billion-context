@@ -1,10 +1,12 @@
 # billion-context-release-notes (companion payload, #1870)
 
-Tiered, model-written release notes consumed by the proxy's visibility
-watcher (`src/update-notes.ts`): acp_status and the `/acp` panel use them to
-tell users and agents "an update is ready — restart to finish" or "a
-recommended release exists", with a per-release summary and the user-side
-span (everything between the running version and the newest release).
+Tiered, model-written release notes. Since #1977 the proxy-side visibility
+watcher is gone — updates are silent by default and only critical
+advisories (`advisories/`, #1481) auto-surface — so this doc is now a
+release-process artifact: the dispatch-time release gate (release-manual.yml /
+release.yml, #1870) requires an entry for every stable release, and the tier +
+summary record what each release changed for the user. The companion package
+publish stays as the machine-readable carrier for any future consumer.
 
 Companion package mechanics mirror `advisories/` (#1481):
 

@@ -19,7 +19,6 @@ import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
 import { degenerateTurnWarning } from "./degenerate-turn.js";
 import { PANEL_BOX_FOOTER } from "./acp-panel.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
-import { describeUpdateReady, getUpdateVisibility } from "./update-notes.js";
 import { warnCacheCollapse } from "./cache-warn.js";
 import { settleUsageReport } from "./cache-ledger.js";
 import { promptInputTotal, type WireProtocol } from "./util.js";
@@ -866,13 +865,8 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     if (adv.active) {
         preFooter.push(`⚠️ CRITICAL ADVISORY: ${describeAdvisory(adv.active, adv.lastError)}`);
     }
-    const upd = getUpdateVisibility(VERSION);
-    if (upd.visible) {
-        // #1870: visibility for the silent courier — one line, same
-        // before-footer slot as the advisory (remote-doc text; the $-escape
-        // below already covers it).
-        preFooter.push(describeUpdateReady(upd));
-    }
+    // #1977: release-notes visibility is silent by default — the advisory
+    // above is the only auto-visible update channel left here.
     const webUrl = webSessionUrl(deps.webOrigin, session.id);
     if (webUrl !== undefined) {
         preFooter.push(`Web UI: ${webUrl}`);
