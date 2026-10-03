@@ -113,7 +113,17 @@ export function createNativeRoute(state: NativeInterceptState, deps: OpencodeNat
         if (url === undefined) return;
         // #1365: routed URLs are skipped by isModelApiUrl by design — record
         // the pinned model channel before that gate so attach recovery can see it.
-        if (routedBiliModelUrl(url) !== undefined) noteRoutedOrigin(state, url);
+        if (routedBiliModelUrl(url) !== undefined) {
+            noteRoutedOrigin(state, url);
+            // #1958: the request ALREADY rides a bili proxy — its origin is
+            // baked into the URL. Bind the hook's stamping base there (NOT the
+            // lifecycle state.origin, which may point elsewhere) so the
+            // generic V2 stamping below carries the plugin identity. No
+            // rewrite and no resolveLive: a pinned channel cannot follow a
+            // replacement instance (#1365/#1370).
+            s.proxyBase = new URL(url).origin;
+            return;
+        }
         if (!isModelApiUrl(url)) return;
 
         const target = await resolveLive();

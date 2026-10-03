@@ -91,11 +91,14 @@ test("route: non-model-API and already-routed URLs are left untouched", async ()
     const e1: V2HttpRequestEvent = { request: plain };
     await route(e1, s);
     assert.equal(e1.request, plain);
+    assert.equal(s.proxyBase, undefined);
     const routed = new Request(`${origin}/bili/${MODEL_URL}`);
     const e2: V2HttpRequestEvent = { request: routed };
     await route(e2, s);
-    assert.equal(e2.request, routed);
-    assert.equal(s.proxyBase, undefined);
+    assert.equal(e2.request, routed, "an already-routed URL is never rewritten again");
+    // #1958: the baked origin binds the hook so generic V2 stamping carries
+    // the plugin identity for pre-routed sessions.
+    assert.equal(s.proxyBase, origin);
 });
 
 test("route: waits for a pending bootstrap before routing", async () => {
