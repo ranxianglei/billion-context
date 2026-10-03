@@ -407,6 +407,8 @@ on `@opencode/cli` 2.0.3 (V1 lane: 1.14.46 and 1.18.31).
 | Native (no launcher) | `bili plugin install opencode` | self-spawning plugin in your real config; start `opencode` as usual |
 | Pure proxy (fallback) | baseURL `/bili/` prefix | no plugin — wire-level tool injection |
 
+These paths are **mutually exclusive** — each one owns routing of the same requests, so exactly one may be active per host instance. A hand-written `/bili/` provider baseURL is the pure-proxy path's marker; writing it while the native plugin is installed is a **conflicting configuration** (#1958): `bili plugin install opencode` refuses (exit code 1, listing every offending file/provider/baseURL plus the fix-it guide), and at runtime the native route warns once per session with the same guide. The supported exception is an explicit pin of the **same** origin — `BILLION_CONTEXT_PROXY` pointing at the proxy the URLs already ride — which stays silent.
+
 ### Launcher — `bili opencode`
 
 HTTPS rides cert-MITM, HTTP a temp `opencode.json` clone with `/bili/`
@@ -465,7 +467,9 @@ same native bili tools as launcher mode — no fixed port, no env var, no
 launcher. Opt-out: `BILI_NATIVE_OPENCODE=0`. If no proxy can be made
 healthy, requests go direct (uncompressed) with a one-time warning and
 recover automatically. Under a `bili opencode` launch this entry is skipped
-entirely (the launcher owns the proxy).
+entirely (the launcher owns the proxy). Installing over a config that already
+carries pre-routed `/bili/` provider baseURLs is refused — that config belongs
+to the pure-proxy path (see above).
 
 ### Pure proxy (no plugin)
 
@@ -487,6 +491,10 @@ Point the provider baseURL at the proxy like any other client:
 
 Note: 2.0 AI-SDK providers require an `apiKey` field even for local
 endpoints that never check it — set any non-empty value.
+
+This path means **no plugin**: if you also install the native plugin on top
+of these URLs, the install refuses and the runtime warns once per session —
+pick one path per provider (#1958).
 
 ### Status: `/acp` and `acp_status`
 

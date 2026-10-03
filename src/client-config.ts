@@ -1420,6 +1420,62 @@ export function readOpencodeProjectLayer(cwd: string): OpencodeProjectLayer {
     return { providers };
 }
 
+// #1958: provider baseURLs already carrying a /bili/ route prefix — the
+// plain-proxy posture conflicting with the native plugin (which routes model
+// requests itself). Install refuses on them; the runtime hook warns.
+export interface BiliPrefixedBaseURLEntry {
+    file: string;
+    provider: string;
+    baseURL: string;
+}
+
+export function isBiliRoutedBaseUrl(value: string): boolean {
+    try {
+        return new URL(value).pathname.startsWith("/bili/");
+    } catch {
+        return false;
+    }
+}
+
+/** #1958: every EFFECTIVE provider baseURL carrying a /bili/ route prefix
+ *  across opencode's real config surface. Globals merge in opencode's own
+ *  precedence order (config.json → opencode.json → opencode.jsonc, later
+ *  wins; an explicit OPENCODE_CONFIG layers on top), so a stale entry an
+ *  overriding file replaced never false-positives; the project layer (cwd up
+ *  to the git root) outranks globals per provider id exactly like opencode's
+ *  discovery. Each hit carries the declaring file for the actionable refusal
+ *  message. */
+export function findBiliPrefixedOpencodeBaseURLs(env: NodeJS.ProcessEnv, cwd: string): BiliPrefixedBaseURLEntry[] {
+    const hits: BiliPrefixedBaseURLEntry[] = [];
+    const xdg = nonEmpty(env.XDG_CONFIG_HOME) ? env.XDG_CONFIG_HOME : path.join(os.homedir(), ".config");
+    const dir = path.join(xdg, "opencode");
+    // Same load order as readOpencodeConfigRoot — under the deep merge the
+    // last declarer of a provider's options.baseURL owns the effective value.
+    const ordered = ["config.json", "opencode.json", "opencode.jsonc"].map((f) => path.join(dir, f));
+    if (nonEmpty(env.OPENCODE_CONFIG)) ordered.push(env.OPENCODE_CONFIG);
+    const effective: Record<string, { baseURL: string; file: string }> = {};
+    for (const file of ordered) {
+        const parsed = readConfigFileRoot(file);
+        if (parsed === undefined) continue;
+        const provRoot = parsed.provider;
+        if (!provRoot || typeof provRoot !== "object" || Array.isArray(provRoot)) continue;
+        for (const [name, value] of Object.entries(provRoot as Record<string, unknown>)) {
+            if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+            const opts = (value as Record<string, unknown>).options;
+            const rawBase = opts && typeof opts === "object" && !Array.isArray(opts) ? (opts as Record<string, unknown>).baseURL : undefined;
+            if (typeof rawBase === "string" && rawBase !== "") effective[name] = { baseURL: rawBase, file };
+        }
+    }
+    // Project layer outranks globals per provider id (nearest level wins).
+    for (const [name, view] of Object.entries(readOpencodeProjectLayer(cwd).providers)) {
+        if (view.baseURL !== undefined) effective[name] = { baseURL: view.baseURL, file: view.file };
+    }
+    for (const [provider, v] of Object.entries(effective)) {
+        if (isBiliRoutedBaseUrl(v.baseURL)) hits.push({ file: v.file, provider, baseURL: v.baseURL });
+    }
+    return hits.sort((a, b) => a.file.localeCompare(b.file) || a.provider.localeCompare(b.provider));
+}
+
 export function parseZcodeConfig(obj: unknown): ZcodeConfig {
     const result: ZcodeConfig = { providers: {} };
     if (!obj || typeof obj !== "object" || Array.isArray(obj)) return result;

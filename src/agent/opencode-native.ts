@@ -108,6 +108,8 @@ export type OpencodeNativeRouteDeps = LiveOriginResolverDeps;
 export function createNativeRoute(state: NativeInterceptState, deps: OpencodeNativeRouteDeps = {}): (e: V2HttpRequestEvent, s: V2State) => Promise<void> {
     const resolveLive = createLiveOriginResolver(state, deps);
     let warned = false;
+    // #1958: conflicting pre-routed config exposed once per (session, origin).
+    const conflictWarned = new Set<string>();
     return async (e, s) => {
         const url = typeof e.request?.url === "string" ? e.request.url : undefined;
         if (url === undefined) return;
@@ -115,13 +117,36 @@ export function createNativeRoute(state: NativeInterceptState, deps: OpencodeNat
         // the pinned model channel before that gate so attach recovery can see it.
         if (routedBiliModelUrl(url) !== undefined) {
             noteRoutedOrigin(state, url);
+            const baked = new URL(url).origin;
+            // #1958: an explicit pin of THIS origin (BILLION_CONTEXT_PROXY set
+            // to the same proxy) is the supported attach posture — silent.
+            // Anything else means the user hand-wrote the /bili/ prefix while
+            // the native plugin is active: two access paths claiming one
+            // request. Expose it with a fix-it guide, once per session+origin.
+            // Compared against the env, NOT state.origin: attach arming does
+            // not freeze state.origin synchronously, so early requests would
+            // false-warn against a benign pin.
+            const declaredRaw = process.env.BILLION_CONTEXT_PROXY;
+            let declared: string | undefined;
+            try {
+                declared = declaredRaw !== undefined && declaredRaw !== "" ? new URL(declaredRaw).origin : undefined;
+            } catch {
+                declared = undefined;
+            }
+            if (declared !== baked) {
+                const key = `${String(e.sessionID ?? "_")}\u0000${baked}`;
+                if (!conflictWarned.has(key)) {
+                    conflictWarned.add(key);
+                    console.error(`bili-native-opencode: conflicting configuration — model requests already carry a /bili/ prefix (origin ${baked}) while the native plugin is active. The plugin routes model requests itself; hand-written /bili/ prefixes belong to the no-plugin plain-proxy path. Pick ONE: (1) remove the /bili/ prefix from your opencode provider baseURL(s) so the plugin routes them, or (2) run \`bili plugin remove opencode\` and keep the pre-routed URLs. Until resolved, this session continues bound to ${baked}.`);
+                }
+            }
             // #1958: the request ALREADY rides a bili proxy — its origin is
             // baked into the URL. Bind the hook's stamping base there (NOT the
             // lifecycle state.origin, which may point elsewhere) so the
             // generic V2 stamping below carries the plugin identity. No
             // rewrite and no resolveLive: a pinned channel cannot follow a
             // replacement instance (#1365/#1370).
-            s.proxyBase = new URL(url).origin;
+            s.proxyBase = baked;
             return;
         }
         if (!isModelApiUrl(url)) return;

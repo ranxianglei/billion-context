@@ -959,6 +959,8 @@ Clients you configure with an **API key** (not a login) let you change the upstr
 "baseURL": "http://localhost:8787/bili/https://open.bigmodel.cn/api/coding/paas/v4"
 ```
 
+**OpenCode note.** This is the **no-plugin** path for OpenCode. Installing the native plugin over such a config is refused (`bili plugin install opencode` exits 1, listing every offending file/provider/baseURL); if the combo already exists, the runtime warns once per session with the same fix-it guide. The three mutually exclusive OpenCode access paths are documented in [CLIENTS.md](CLIENTS.md#opencode).
+
 **Codex (API key)** — edit `~/.codex/config.toml`, change the provider's `base_url`:
 
 ```toml

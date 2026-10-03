@@ -36,7 +36,7 @@ import crypto from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { applyEdits, modify as jsoncModify, parse as jsoncParse, type ParseError } from "jsonc-parser";
-import { resolveDshHome, resolveHermesHome, resolveKimiHome, resolvePiHome } from "./client-config.js";
+import { findBiliPrefixedOpencodeBaseURLs, resolveDshHome, resolveHermesHome, resolveKimiHome, resolvePiHome } from "./client-config.js";
 import { resolveClaudeNativePort } from "./config.js";
 import { lanePreferredPort } from "./instance.js";
 import { DSH_PACKAGE, dshBundleInstalled, dshHasLegacyManagedBlock, dshProfileDependsOnBili, dshProfileDepSpec, dshProfileDirs, isRegistryDepSpec, planDshSpawn, refreshDshProfileBundles, runDshPlugin, stripLegacyManagedBlock } from "./dsh-channel.js";
@@ -1196,6 +1196,24 @@ export function applyOpencodePluginEntry(args: { data: Record<string, unknown>; 
 
 function opencodeInstall(withMcp = false): string {
     const file = opencodeTargetFile();
+    // #1958: refuse to CREATE the conflicting configuration — pre-routed /bili/
+    // provider baseURLs are the no-plugin plain-proxy path; under the native
+    // plugin they split routing ownership. Scan the real effective config
+    // surface (globals + OPENCODE_CONFIG + cwd project layer), not just the
+    // target file. Nothing is written before this point, so it fails clean.
+    const prefixed = findBiliPrefixedOpencodeBaseURLs(process.env, process.cwd());
+    if (prefixed.length > 0) {
+        throw new Error(
+            [
+                "conflicting configuration — opencode config already carries pre-routed /bili/ provider baseURL(s):",
+                ...prefixed.map((h) => `  - ${h.file} -> provider "${h.provider}" baseURL ${JSON.stringify(h.baseURL)}`),
+                "The native plugin routes model requests itself; hand-written /bili/ prefixes belong to the no-plugin plain-proxy path and the two are mutually exclusive. Pick ONE, then re-run:",
+                "  1) remove the /bili/ prefix from those baseURLs so the plugin routes requests itself (recommended), or",
+                "  2) keep the pre-routed URLs and do not install the native plugin (plain proxy mode).",
+                "Nothing was written.",
+            ].join("\n"),
+        );
+    }
     const { original, data } = loadOpencodeConfig(file);
     const notes: string[] = [];
     const touched = new Set<string>();

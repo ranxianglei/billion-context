@@ -1456,6 +1456,10 @@ function hintEnv(home: string, piAgentDir: string): Record<string, string> {
     return {
         PI_CODING_AGENT_DIR: piAgentDir,
         CODEX_HOME: home,
+        // #1958: the install-time /bili/ scan reads the real effective config
+        // surface — pin XDG so the ambient global opencode config (which on a
+        // dev machine may itself carry pre-routed baseURLs) never leaks in.
+        XDG_CONFIG_HOME: path.join(home, ".config"),
         OPENCODE_CONFIG: path.join(home, ".config/opencode/opencode.json"),
         CLAUDE_CONFIG_DIR: home,
         CLAUDE: "/nonexistent/bili-claude-stub",
@@ -1681,7 +1685,8 @@ test("plugin install opencode without a live proxy: MCP shell skipped, native pl
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-oc-noproxy-"));
     const ocFile = path.join(home, ".config/opencode/opencode.json");
     try {
-        await withEnv({ OPENCODE_CONFIG: ocFile, BILI_MCP_PROXY: undefined, XDG_STATE_HOME: path.join(home, "state") }, async () => {
+        // #1958: pin XDG too — the install-time /bili/ scan reads the ambient global config surface.
+        await withEnv({ OPENCODE_CONFIG: ocFile, BILI_MCP_PROXY: undefined, XDG_STATE_HOME: path.join(home, "state"), XDG_CONFIG_HOME: path.join(home, ".config") }, async () => {
             const ocKey = pickPluginKey(detectOpencodeMajor());
             const msg = pluginInstall("opencode");
             assert.match(msg, /installed/);
@@ -1709,7 +1714,8 @@ test("plugin install opencode replaces legacy opencode-acp entries — array and
     const ocFile = path.join(home, ".config/opencode/opencode.json");
     fs.mkdirSync(path.dirname(ocFile), { recursive: true });
     try {
-        await withEnv({ OPENCODE_CONFIG: ocFile, BILI_MCP_PROXY: undefined, XDG_STATE_HOME: path.join(home, "state") }, async () => {
+        // #1958: pin XDG too — the install-time /bili/ scan reads the ambient global config surface.
+        await withEnv({ OPENCODE_CONFIG: ocFile, BILI_MCP_PROXY: undefined, XDG_STATE_HOME: path.join(home, "state"), XDG_CONFIG_HOME: path.join(home, ".config") }, async () => {
             const ocKey = pickPluginKey(detectOpencodeMajor());
             const otherKey = ocKey === "plugin" ? "plugins" : "plugin";
             const dir = path.join(home, ".config/opencode/plugins/billion-context");
@@ -1759,7 +1765,8 @@ test("plugin install/remove/status survive a non-object mcp in opencode.json (#8
     const ocFile = path.join(home, ".config/opencode/opencode.json");
     fs.mkdirSync(path.dirname(ocFile), { recursive: true });
     try {
-        await withEnv({ OPENCODE_CONFIG: ocFile, BILI_MCP_PROXY: undefined, XDG_STATE_HOME: path.join(home, "state") }, async () => {
+        // #1958: pin XDG too — the install-time /bili/ scan reads the ambient global config surface.
+        await withEnv({ OPENCODE_CONFIG: ocFile, BILI_MCP_PROXY: undefined, XDG_STATE_HOME: path.join(home, "state"), XDG_CONFIG_HOME: path.join(home, ".config") }, async () => {
             const ocKey = pickPluginKey(detectOpencodeMajor());
             fs.writeFileSync(ocFile, JSON.stringify({ mcp: "totally-broken-string" }));
             const msg = pluginInstall("opencode");
