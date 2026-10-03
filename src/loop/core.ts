@@ -167,6 +167,16 @@ export interface LoopCtx {
      *  host = upstream hostname, fp = `${billing}:${cap}` fingerprint. When
      *  present, each sent round captures its image facts alongside the body. */
     imageLearn?: { host: string; fp: string };
+    /** #1916: message count of THIS request's inbound body — input to the
+     *  baseline writer-authority gate (admitUsageSample). Undefined lanes fail
+     *  closed for shape-dependent admissions. */
+    incomingMsgCount?: number;
+    /** #1916: request-scoped marker — a round of THIS loop executed a
+     *  successful fold, so its post-round usage report may lower the session
+     *  baseline. Deliberately not session-scoped: a concurrent stream's settle
+     *  would consume/clear session-level fold flags mid-flight and let a
+     *  foreign sample ride a stolen explanation. */
+    postFold?: boolean;
 }
 
 export interface RequestOptions {
@@ -305,7 +315,9 @@ function recordUsage(
         `[acp-usage] round ${round} input=${total} ${reportedCached !== null ? `cached=${reportedCached} (cache hit ${hitPct}%)` : "(no cache report)"}${foldNew ? " fold=new" : ""}${total <= 0 ? " (zero-total: lastInputTokens kept)" : ""}${imageUsageSuffix(ctx.session)}`,
     );
     if (total > 0 || reportedCached !== null) {
-        settleUsageReport(ctx.session, { total, reportedCached, output: out, protocol: ctx.protocol, upstream: ctx.upstreamOrigin });
+        const postFold = ctx.postFold === true;
+        ctx.postFold = false;
+        settleUsageReport(ctx.session, { total, reportedCached, output: out, protocol: ctx.protocol, upstream: ctx.upstreamOrigin, incomingMsgCount: ctx.incomingMsgCount, postFold });
     }
 }
 
@@ -912,10 +924,9 @@ export async function* runCompressLoop(
                 // to the pre-compress view (previous behavior) if the host hook
                 // is absent or throws.
                 const absorbName = activeAbsorbToolName(ctx.session, ctx.config);
-                if (
-                    ctx.refreshFolded &&
-                    proxyResults.some((pr) => (pr.name === "compress" || pr.name === absorbName) && !pr.result.includes("FAILED"))
-                ) {
+                const foldedThisRound = proxyResults.some((pr) => (pr.name === "compress" || pr.name === absorbName) && !pr.result.includes("FAILED"));
+                if (foldedThisRound) ctx.postFold = true;
+                if (ctx.refreshFolded && foldedThisRound) {
                     try {
                         const refreshed = await ctx.refreshFolded(coreMessages);
                         if (refreshed.length > 0) {

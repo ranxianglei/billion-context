@@ -296,6 +296,9 @@ export type Session = {
      *  retry callbacks to correlate a transient upstream rejection with the
      *  rewrite that preceded it (#189). A fresh process has none. */
     lastCompress?: LastCompressInfo;
+    /** In-memory only (NOT persisted — buildRecord omits it): consecutive
+     *  quarantined usage samples awaiting the #1916 escape valve. */
+    foreignSampleStreak?: { count: number };
     /** Promise chain for per-session serialization. Two concurrent requests
      *  sharing a session id would interleave processTurn / stream-rewriter
      *  mutations on session.state, corrupting it. withSessionLock chains each
@@ -344,8 +347,10 @@ function nudgeGrowthInterval(config?: Config): number {
  * the phantom level or a compression resets the references.
  *
  * Called from every usage-grade settle site (plugin SSE pipes via
- * applyUsageSample, proxy streaming loops via recordUsage, non-streaming JSON)
- * AFTER lastInputTokens has been written from the real report. Fires only for
+ *  applyUsageSample, proxy streaming loops via recordUsage, non-streaming JSON)
+ *  AFTER lastInputTokens has been written from the real report. #1916: callers
+ *  run admitUsageSample FIRST — a quarantined foreign sample never reaches
+ *  this function (its settle returns before writing anything). Fires only for
  * drops of more than one full growth interval below the current reference
  * (lastNudgeShownTokens, else baseline) — estimates never trigger it. On fire
  * it mirrors the kernel's drift-reset trio: baseline := real value,
@@ -367,6 +372,118 @@ export function reanchorNudgeOnUsageDrop(session: Session): void {
     nudge.lastShownByTier = {};
     markDirty(session);
     loggerLog("info", `[${session.id}] nudge reference re-anchored ${ref} -> ${value} after usage-grade drop (margin ${margin}) — stale high reference retired (#1595)`);
+}
+
+const FOREIGN_STREAK_ADMIT = 3;
+
+/** #1916: writer authority for usage-grade samples settling onto an
+ *  established usage-grade baseline.
+ *
+ * One session id can carry more than one concurrent request stream — host-side
+ * auxiliary calls bound to the main conversation (DSH auto-review, #1307/
+ * #1309/#1314) are the production instance. Pre-fix, such a small stream's
+ * report settled far below the main stream's baseline and clobbered
+ * lastInputTokens, retired the nudge reference (#1595), and poisoned the cache
+ * ledger and every other baseline consumer (incident: 247994 -> 69419 within
+ * seconds of a main-stream abort).
+ *
+ * The gate only ARMS once the session has accumulated substantial history
+ * (>= REWRITE_MIN_KNOWN_REFS known refs — the same "substantial history"
+ * threshold the #1001 silent-rewrite detector uses). The clobber mechanism
+ * needs a resident main stream to displace; on a young session there is no
+ * main-stream baseline worth defending, and thin stateless clients (one
+ * message per turn, no shared ids) would otherwise be quarantined by their
+ * own legitimate low samples — stale-baseline rescue and learned-cost
+ * correction (e2e-image-billing) have no shape-gated path back in.
+ *
+ * A sample may move a usage-grade baseline DOWN beyond one growth interval
+ * only when the drop carries an explanation:
+ *   postFold   — THIS request executed a fold (in-loop compress/absorb or
+ *                preflight compression); its report is post-fold reality.
+ *                Request-scoped on purpose: a concurrent stream's settle would
+ *                clear session-level fold flags mid-flight and let a foreign
+ *                sample ride a stolen explanation back into the baseline.
+ *   boundary   — a history rewrite was detected (announced /compact echo,
+ *                #1001 silent rewrite) and its single-use explanation flag is
+ *                unconsumed. Consuming it also requires the request to be
+ *                shaped like the real conversation (>= REWRITE_MIN_INCOMING_
+ *                TOTAL msgs), so a foreign single-message stream settling
+ *                between detection and the legitimate consumer cannot steal it.
+ *   identity   — the sample's wire/upstream/model differs from the ledger's
+ *                last-known identity (#1536): a meter switch means the new
+ *                reading is not comparable to the old baseline at all, so it
+ *                is admitted unconditionally (the repo's own switch tracking
+ *                treats every pre-switch sample as unattributable anyway).
+ *   valve      — FOREIGN_STREAK_ADMIT consecutive quarantined samples from
+ *                requests shaped like the real conversation: a client
+ *                legitimately truncating its view produces exactly this
+ *                pattern. Unshaped (single-message / unknown-count) samples
+ *                neither advance nor break the run — they can never admit
+ *                through the valve and cannot pre-charge it either; any
+ *                admission (upward, explained or valved) resets the run.
+ * Everything else is quarantined: the caller returns before writing stats,
+ * the nudge reference, cached aggregates, ledger samples or seam pairing. The
+ * failure direction is sticky-HIGH until a legitimate sample regrows or
+ * explains the level — the damage prevented (a permanently low baseline
+ * distorting nudge timing, preflight floors and fold denominators) outweighs
+ * the cost (a delayed nudge), and upward / within-one-interval samples always
+ * pass, so the baseline self-heals on the next honest main-stream report.
+ * Non-usage-grade baselines (overflow-arm / estimate / absent) are never
+ * gated: real reports must keep superseding bili-owned local states (the
+ * #1110 arm-retirement lifecycle deadlocks otherwise). */
+export function admitUsageSample(
+    session: Session,
+    total: number,
+    incomingMsgCount?: number,
+    postFold?: boolean,
+    identityChanged?: boolean,
+): boolean {
+    const stats = session.stats;
+    const shapedLikeConversation = incomingMsgCount !== undefined && incomingMsgCount >= REWRITE_MIN_INCOMING_TOTAL;
+    const resetStreak = (): void => { delete session.foreignSampleStreak; };
+    if (stats.lastInputTokensSource !== "usage") {
+        resetStreak();
+        return true;
+    }
+    if (!(total > 0)) return true;
+    if (Object.keys(session.state.messageRefs.byRaw).length < REWRITE_MIN_KNOWN_REFS) {
+        resetStreak();
+        return true;
+    }
+    const baseline = stats.lastInputTokens;
+    const stored = session.metadata?.["effectiveConfig"];
+    const margin = nudgeGrowthInterval(stored && typeof stored === "object" ? (stored as Config) : undefined);
+    if (!(baseline > total + margin)) {
+        resetStreak();
+        return true;
+    }
+    if (identityChanged === true) {
+        resetStreak();
+        loggerLog("info", `[${session.id}] [acp-usage] meter-switch usage sample input=${total} admitted over baseline ${baseline} (wire/upstream/model changed, #1916)`);
+        return true;
+    }
+    if (postFold === true) {
+        resetStreak();
+        loggerLog("info", `[${session.id}] [acp-usage] post-fold usage sample input=${total} admitted over baseline ${baseline} (this request folded, #1916)`);
+        return true;
+    }
+    const boundary = session.metadata?.compactionBoundary;
+    if (boundary && typeof boundary === "object" && !("usageConsumedAt" in (boundary as Record<string, unknown>)) && shapedLikeConversation) {
+        session.metadata!.compactionBoundary = { ...(boundary as Record<string, unknown>), usageConsumedAt: Date.now() };
+        markDirty(session);
+        resetStreak();
+        loggerLog("info", `[${session.id}] [acp-usage] compaction-boundary usage sample input=${total} admitted over baseline ${baseline} (single-use explanation consumed, #1916)`);
+        return true;
+    }
+    const streak = (session.foreignSampleStreak?.count ?? 0) + (shapedLikeConversation ? 1 : 0);
+    if (shapedLikeConversation) session.foreignSampleStreak = { count: streak };
+    if (streak >= FOREIGN_STREAK_ADMIT && shapedLikeConversation) {
+        resetStreak();
+        loggerLog("warn", `[${session.id}] [acp-usage] ${streak} consecutive low usage samples from a ${incomingMsgCount}-message request — admitting input=${total} over baseline ${baseline} (escape valve, #1916)`);
+        return true;
+    }
+    loggerLog("warn", `[${session.id}] [acp-usage] quarantined foreign usage sample input=${total} (baseline ${baseline} source=usage, margin ${margin}, streak ${streak}) — baseline/nudge-ref/ledger untouched (#1916)`);
+    return false;
 }
 
 /** #1595: name the third no-usage shape — an upstream SUCCESS that completes

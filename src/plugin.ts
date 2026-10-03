@@ -1179,7 +1179,7 @@ function usageFromSseEvent(obj: Record<string, unknown>): UsageSample | undefine
     return undefined;
 }
 
-export function applyUsageSample(session: Session, sample: UsageSample, protocol?: WireProtocol, upstreamOrigin?: string): void {
+export function applyUsageSample(session: Session, sample: UsageSample, protocol?: WireProtocol, upstreamOrigin?: string, incomingMsgCount?: number, postFold?: boolean): void {
     // inputTokens is protocol-native: Anthropic reports it NEW-only (cached
     // separate); OpenAI/Responses report the TOTAL (cached already included).
     // promptInputTotal adds back every segment not part of inputTokens —
@@ -1208,7 +1208,7 @@ export function applyUsageSample(session: Session, sample: UsageSample, protocol
         const foldNew = session.stats.pendingFoldUsage === true;
         if (foldNew) session.stats.pendingFoldUsage = false;
         loggerLog("info", `[${session.id}] [plugin] [acp-usage] input=${total} ${reportedCached === null ? "(no cache report)" : `cached=${reportedCached} (cache hit ${hit}%)`}${foldNew ? " fold=new" : ""}${imageUsageSuffix(session)}`);
-        settleUsageReport(session, { total, reportedCached, output: sample.outputTokens, protocol, upstream: upstreamOrigin });
+        settleUsageReport(session, { total, reportedCached, output: sample.outputTokens, protocol, upstream: upstreamOrigin, incomingMsgCount, postFold });
     }
     if (sample.outputTokens !== undefined) session.stats.outputTokens += sample.outputTokens;
 }
@@ -1262,6 +1262,8 @@ export async function pipePluginChatWithStrip(
     log?: (msg: string) => void,
     refetch?: () => Promise<ReadableStream<Uint8Array> | null>,
     upstreamOrigin?: string,
+    incomingMsgCount?: number,
+    postFold?: boolean,
 ): Promise<void> {
     let reader = stream.getReader();
     let decoder = new TextDecoder("utf-8");
@@ -1499,7 +1501,7 @@ export async function pipePluginChatWithStrip(
     const settleUsage = () => {
         if (!session) return;
         if (acc.inputTokens !== undefined || acc.outputTokens !== undefined || acc.cachedTokens !== undefined || acc.creationTokens !== undefined) {
-            applyUsageSample(session, acc, protocol, upstreamOrigin);
+            applyUsageSample(session, acc, protocol, upstreamOrigin, incomingMsgCount, postFold);
             markDirty(session);
         }
         // #1595: clean completion but no input usage sample — name it (the
@@ -2086,6 +2088,8 @@ export async function pipePluginResponsesWithStrip(
     log?: (msg: string) => void,
     refetch?: () => Promise<ReadableStream<Uint8Array> | null>,
     upstreamOrigin?: string,
+    incomingMsgCount?: number,
+    postFold?: boolean,
 ): Promise<void> {
     let reader = stream.getReader();
     let decoder = new TextDecoder("utf-8");
@@ -2169,7 +2173,7 @@ export async function pipePluginResponsesWithStrip(
     const settleUsage = () => {
         if (!session) return;
         if (acc.inputTokens !== undefined || acc.outputTokens !== undefined || acc.cachedTokens !== undefined) {
-            applyUsageSample(session, acc, "responses", upstreamOrigin);
+            applyUsageSample(session, acc, "responses", upstreamOrigin, incomingMsgCount, postFold);
             markDirty(session);
         }
         // #1595: same as the chat-pipe twin — sawTerminal gates out cuts.
@@ -2679,6 +2683,8 @@ export async function pipePluginJson(
     session?: Session,
     protocol?: WireProtocol,
     upstreamOrigin?: string,
+    incomingMsgCount?: number,
+    postFold?: boolean,
 ): Promise<void> {
     // Also serves proxy-mode JSON responses that skipped compress injection
     // (#460 residual) — pass no session there so usage accounting stays off.
@@ -2721,7 +2727,7 @@ export async function pipePluginJson(
                     outputTokens: num(usage["completion_tokens"]) ?? num(usage["output_tokens"]),
                     cachedTokens: cached,
                     creationTokens: creation,
-                }, protocol, upstreamOrigin);
+                }, protocol, upstreamOrigin, incomingMsgCount, postFold);
                 markDirty(session);
                 sawInputSample = true;
             }
@@ -2733,7 +2739,7 @@ export async function pipePluginJson(
         if (session && !usage) {
             const sample = googleUsageSample(json);
             if (sample && sample.inputTokens !== undefined) {
-                applyUsageSample(session, sample, protocol, upstreamOrigin);
+                applyUsageSample(session, sample, protocol, upstreamOrigin, incomingMsgCount, postFold);
                 markDirty(session);
                 sawInputSample = true;
             }

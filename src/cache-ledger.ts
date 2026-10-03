@@ -11,7 +11,7 @@ import {
     type PriceProfile,
 } from "acp-kernel";
 import { log as loggerLog } from "./logger.js";
-import { markDirty, reanchorNudgeOnUsageDrop, type Session } from "./session.js";
+import { admitUsageSample, markDirty, reanchorNudgeOnUsageDrop, type Session } from "./session.js";
 
 // Render window for handleAcpCache's detail:"full" text view (#1489). The
 // ledger itself is unbounded — this only bounds how many lines the text
@@ -630,11 +630,27 @@ export function recordCacheSample(
  *  no cache tokens (recordCacheSample quarantines that sample). */
 export function settleUsageReport(
     session: Session,
-    s: { total: number; reportedCached: number | null; output?: number; protocol?: string; upstream?: string },
+    s: { total: number; reportedCached: number | null; output?: number; protocol?: string; upstream?: string; incomingMsgCount?: number; postFold?: boolean },
 ): void {
     // #793: a zero-total sample carries no information (gateway placeholder or
     // relay echo) — it must not clobber the last trusted lastInputTokens.
     if (s.total > 0) {
+        // #1916: writer authority — a sample may lower an established
+        // usage-grade baseline only with a shrink explanation (see
+        // admitUsageSample). Quarantine skips EVERYTHING below: stats, nudge
+        // re-anchor, cached aggregates, ledger sample, image learning and seam
+        // pairing — a foreign stream's report leaves no trace on this session.
+        // Lane-level outputTokens accumulation outside this function is
+        // intentionally unaffected (billed output stays counted).
+        const led = getCacheLedger(session);
+        const proto = typeof s.protocol === "string" && s.protocol !== "" ? s.protocol : undefined;
+        const up = typeof s.upstream === "string" && s.upstream !== "" ? s.upstream : undefined;
+        const model = typeof session.metadata?.lastModel === "string" && session.metadata.lastModel !== "" ? session.metadata.lastModel : undefined;
+        const identityChanged =
+            (proto !== undefined && led.lastKnownProto !== undefined && proto !== led.lastKnownProto) ||
+            (up !== undefined && led.lastKnownUp !== undefined && up !== led.lastKnownUp) ||
+            (model !== undefined && led.lastKnownModel !== undefined && model !== led.lastKnownModel);
+        if (!admitUsageSample(session, s.total, s.incomingMsgCount, s.postFold, identityChanged)) return;
         session.stats.inputTokens += s.total;
         // Net out this turn's compress credit: the post-compress re-request
         // re-sends the unfolded history, so its usage report over-reports the

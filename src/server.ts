@@ -999,6 +999,10 @@ type Prepared = {
      *  retry wrapper, the compress loop, and every usage-sniffing pipe; the
      *  #460 strip pipes in forward() run with session=undefined. */
     sidePassthrough?: boolean;
+    /** #1916: preflight compressed ranges for THIS request before rebuild —
+     *  the outbound payload is post-fold reality, so its usage report may
+     *  lower the session baseline (writer-authority explanation). */
+    preflightFolded?: boolean;
     /** Set when a codex native-compaction request was intercepted and a
      *  success response was forged locally (BILI_CODEX_COMPACT=intercept +
      *  gate passed). forward() serves `body` without contacting upstream. */
@@ -5566,6 +5570,7 @@ async function preflightCompressIfNeeded(
         // to this single client request.
         session.stats.requests -= 1;
         outbound = rebuilt;
+        outbound.preflightFolded = true;
         const fits = unknownBaseline
             ? result.fitsWindow
             : estimateCoreMessages(rebuilt.processedMessages) + overheadEstimate + imageTokens < limit;
@@ -6447,6 +6452,8 @@ async function forward(
                             label: prepared.session.id,
                         }),
                         targetOrigin,
+                        prepared.originalMessages.length,
+                        prepared.preflightFolded === true,
                     );
                 } else {
                     // #732/#821: the plugin pipe re-issues the agent's own body
@@ -6471,10 +6478,12 @@ async function forward(
                             label: prepared.session.id,
                         }),
                         targetOrigin,
+                        prepared.originalMessages.length,
+                        prepared.preflightFolded === true,
                     );
                 }
             } else {
-                await pipePluginJson(pluginBody, res, prepared.session, prepared.protocol, targetOrigin);
+                await pipePluginJson(pluginBody, res, prepared.session, prepared.protocol, targetOrigin, prepared.originalMessages.length, prepared.preflightFolded === true);
             }
         } finally {
             clearUpstreamTimer();
@@ -6761,7 +6770,7 @@ async function forward(
             const loopBillingUpstream = route?.rewrittenUrl ?? (/^https?:\/\//i.test(req.url ?? "") ? req.url ?? undefined : opts.upstream);
             const loop = runCompressLoop(
                 streamToRead,
-                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, upstreamOrigin: targetOrigin, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, visibilityMarkers, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined, imageLearn: { host: upstreamHost(loopBillingUpstream), fp: `${imageBillingFor(opts, loopBillingUpstream)}:${imageTokenCapFor(opts, loopBillingUpstream)}` } },
+                { core, config, messages: prepared.processedMessages.length > 0 ? prepared.processedMessages : prepared.originalMessages, compressMessages: prepared.originalMessages, session: prepared.session, log: ctx.log, proxyUrl, upstreamOrigin: targetOrigin, protocol: prepared.protocol, textProtocol, debug: opts.debug, refreshFolded, visibilityMarkers, dumpSse: loopDumpDir ? (name, stream) => dumpStreamToFile(stream, loopDumpDir, name) : undefined, imageLearn: { host: upstreamHost(loopBillingUpstream), fp: `${imageBillingFor(opts, loopBillingUpstream)}:${imageTokenCapFor(opts, loopBillingUpstream)}` }, incomingMsgCount: prepared.originalMessages.length, postFold: prepared.preflightFolded === true },
                 parsedReq,
                 { url: upstreamUrl, headers: reqHeaders, wireTransform, resign: applyResign },
                 adapter,
@@ -6849,7 +6858,7 @@ async function forward(
                     // prepare); the main chokepoint above already noted it, this
                     // keeps the pair byte-exact if that ever moves (#1891).
                     noteForwardedBody(prepared.session, typeof wireBody === "string" ? wireBody : wireBody.toString("utf8"));
-                    settleUsageReport(prepared.session, { total: billed, reportedCached, output: out, protocol: prepared.protocol, upstream: targetOrigin });
+                    settleUsageReport(prepared.session, { total: billed, reportedCached, output: out, protocol: prepared.protocol, upstream: targetOrigin, incomingMsgCount: prepared.originalMessages.length, postFold: prepared.preflightFolded === true });
                     if (reportedCached !== null) warnCacheCollapse(prepared.session, billed, reportedCached);
                     const hitPct = reportedCached !== null && billed > 0 ? Math.round((100 * reportedCached) / billed) : undefined;
                     loggerLog("info", `[${prepared.session.id}] [acp-usage] input=${billed} ${hitPct === undefined ? "(no cache report)" : `cached=${reportedCached} (cache hit ${hitPct}%)`}${billed <= 0 ? " (zero-total: lastInputTokens kept)" : ""}${imageUsageSuffix(prepared.session)}`);
