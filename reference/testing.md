@@ -119,3 +119,20 @@ Rules:
   unset) — these seams exist for this suite (#1153); keep them default-invariant.
 - The fixture MUST bring its own registry instance — never point it at an external
   (even internal) registry service.
+
+Three additional phases harden the #1628 failure class:
+
+- **Unwritable install dir** (posix only; skipped on windows) — chmods the install
+  root `0o555` and drives `bili update` through the real chain: assert the loud
+  failure line, the one-per-process `install location` diagnostic, zero disk flip,
+  and no leaked update lock.
+- **Real published baseline** (`BILI_E2E_REAL_BASELINE=<published version>`) — the
+  only phase that reads upstream: downloads ONE real published tarball, then proves
+  the LIVE old updater hops onto the locally built dist. This is the local form of
+  the no-op validation protocol (`reference/release.md`); it cannot replace a real
+  no-op release, but it catches "current dist can't be installed by an old updater"
+  per PR. CI resolves the baseline to `npm view billion-context version` before the
+  run; locally pass it explicitly.
+- **Cache-lane doctor** — lays out an opencode cache lane
+  (`npm/billion-context@latest/<ts>/node_modules/billion-context`) and asserts
+  `doctor --json` resolves the update target to the running copy, not a global root.

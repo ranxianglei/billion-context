@@ -36,6 +36,13 @@ jobs:
       - name: Build
         run: npm run build
 
+      # #1628: the real-baseline phase downloads ONE real published tarball
+      # (the live old updater is the object under test — a self-built fake
+      # cannot stand in for it). Resolved here so a pinned PR head stays
+      # byte-stable across the matrix.
+      - name: Resolve real published baseline (single upstream read)
+        run: echo "BILI_E2E_REAL_BASELINE=$(npm view billion-context version)" >> "$GITHUB_ENV"
+
       - name: Run hermetic registry E2E
         run: ACP_TEST_REGISTRY=1 node --import tsx --test tests/e2e/e2e-registry.test.ts tests/e2e/e2e-advisory-rollback.test.ts
 

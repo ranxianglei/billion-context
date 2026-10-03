@@ -15,6 +15,12 @@ import { rmrf } from "../tmp-rm.ts";
 
 const run = process.env.ACP_TEST_REGISTRY === "1";
 const skipReason = !run ? "set ACP_TEST_REGISTRY=1 (hermetic local-registry e2e; loopback only)" : undefined;
+const REAL_BASELINE = process.env.BILI_E2E_REAL_BASELINE;
+const realSkip = !run
+    ? skipReason
+    : !REAL_BASELINE
+      ? "set BILI_E2E_REAL_BASELINE=<published version> (downloads one real tarball from registry.npmjs.org — the only phase that leaves the sandbox)"
+      : undefined;
 
 const REPO_ROOT = path.resolve(import.meta.dirname, "..", "..");
 const DIST_ENTRY = path.join(REPO_ROOT, "dist", "index.js");
@@ -218,4 +224,101 @@ test("hermetic npm -g install e2e (real npm client, real global layout)", { skip
     assert.doesNotMatch(noop.stderr, /Restart to finish/, "no-op update must not claim an install happened");
     assert.equal(await readPkgVersion(installDir), NEW_VERSION);
     assert.equal(fs.statSync(pkgJson).mtimeMs, mtimeBefore, "no-op update must not touch the installed tree");
+});
+
+// #1628 verification hardening: three shapes the chain above never drove —
+// the unwritable-target failure class (the 12-day retry wall), the
+// LIVE-old-code hop (the no-op protocol's object, local form), and dist-level
+// resolution from the opencode cache-lane layout.
+
+test("unwritable install dir: real-chain failure is loud, self-explaining, and one line (#1628)", { skip: IS_WIN ? "chmod 0o555 does not deny directory writes on win32" : skipReason }, async (t) => {
+    assert.ok(fs.existsSync(DIST_ENTRY), "dist/index.js missing — run `npm run build` first");
+    const workRoot = path.join(process.cwd(), "tmp");
+    fs.mkdirSync(workRoot, { recursive: true });
+    const work = fs.mkdtempSync(path.join(workRoot, "e2e-unwritable-"));
+    const installRoot = () => path.join(work, "global", "node_modules", PKG.name);
+    t.after(() => {
+        try {
+            fs.chmodSync(installRoot(), 0o755);
+        } catch {
+            // tree may already be gone
+        }
+        rmrf(work);
+    });
+
+    const reg = await startRegistry(path.join(work, "registry"));
+    t.after(() => reg.stop());
+
+    const oldTgz = await makeFixtureTarball(work, OLD_VERSION);
+    await reg.publish(oldTgz);
+    await reg.publish(await makeFixtureTarball(work, NEW_VERSION));
+    const installDir = await extractInstall(work, oldTgz);
+
+    fs.chmodSync(installDir, 0o555);
+    const res = runBili(installDir, ["update"], { ...isolatedEnv(work), BILI_UPDATE_REGISTRY: reg.url });
+    assert.match(res.stderr, new RegExp(`\\[update\\] install failed: install dir not writable: ${escapeRe(installDir)}`));
+    assert.match(res.stderr, /Will retry next cycle/, "the every-cycle retry line stays unchanged");
+    const location = res.stderr.split("\n").filter((l) => l.includes("[update] install location:"));
+    assert.equal(location.length, 1, "the location diagnostic must fire exactly once per process (#1628)");
+    assert.match(location[0]!, new RegExp(`target=${escapeRe(installDir)}`));
+    assert.match(location[0]!, /running=/);
+    assert.match(location[0]!, /updates only the copy it runs from/);
+    assert.equal(await readPkgVersion(installDir), OLD_VERSION, "nothing may flip when the target is unwritable");
+    const lockHit = fs.readdirSync(work, { recursive: true }).find((p): p is string => typeof p === "string" && p.endsWith(".update-lock"));
+    assert.equal(lockHit, undefined, `update lock leaked after failure: ${lockHit}`);
+});
+
+test("real published baseline hops to the new dist: the LIVE old updater over the real chain (#1628 no-op validation, local form)", { skip: realSkip }, async (t) => {
+    assert.ok(fs.existsSync(DIST_ENTRY), "dist/index.js missing — run `npm run build` first");
+    assert.ok(REAL_BASELINE, "BILI_E2E_REAL_BASELINE must be set (the skip guard should have skipped)");
+    const workRoot = path.join(process.cwd(), "tmp");
+    fs.mkdirSync(workRoot, { recursive: true });
+    const work = fs.mkdtempSync(path.join(workRoot, "e2e-real-baseline-"));
+    t.after(() => rmrf(work));
+
+    const reg = await startRegistry(path.join(work, "registry"));
+    t.after(() => reg.stop());
+
+    // The one deliberate non-hermetic read: the baseline is the REAL published
+    // artifact. The no-op protocol validates the live old code doing the hop;
+    // a self-built baseline (faked low version of current dist) cannot stand
+    // in for it — that hole is exactly why this phase exists.
+    const dl = await fetch(`https://registry.npmjs.org/${PKG.name}/-/${PKG.name}-${REAL_BASELINE}.tgz`);
+    assert.ok(dl.ok, `could not download ${PKG.name}@${REAL_BASELINE}: HTTP ${dl.status}`);
+    const realTgz = path.join(work, `${PKG.name}-${REAL_BASELINE}.tgz`);
+    fs.writeFileSync(realTgz, Buffer.from(await dl.arrayBuffer()));
+
+    const realNew = bumpPatch(REAL_BASELINE);
+    await reg.publish(await makeFixtureTarball(work, realNew, { bare: true }));
+    const installDir = await extractInstall(work, realTgz);
+    assert.equal(await readPkgVersion(installDir), REAL_BASELINE);
+
+    const res = runBili(installDir, ["update"], { ...isolatedEnv(work), BILI_UPDATE_REGISTRY: reg.url });
+    assert.equal(res.code, 0, `bili update failed:\n${res.stderr}`);
+    assert.match(res.stderr, new RegExp(`installed ${escapeRe(REAL_BASELINE)} → ${escapeRe(realNew)}\\. Restart to finish\\.`));
+    assert.equal(await readPkgVersion(installDir), realNew, "the real published updater must flip its own tree to the local dist");
+});
+
+test("doctor from a simulated opencode cache lane resolves its own running copy (#1628 layout)", { skip: skipReason }, async (t) => {
+    assert.ok(fs.existsSync(DIST_ENTRY), "dist/index.js missing — run `npm run build` first");
+    const workRoot = path.join(process.cwd(), "tmp");
+    fs.mkdirSync(workRoot, { recursive: true });
+    const work = fs.mkdtempSync(path.join(workRoot, "e2e-lane-doctor-"));
+    t.after(() => rmrf(work));
+
+    const reg = await startRegistry(path.join(work, "registry"));
+    t.after(() => reg.stop());
+
+    const laneTs = path.join(work, "npm", `${PKG.name}@latest`, "1789577146915");
+    fs.mkdirSync(laneTs, { recursive: true });
+    fs.writeFileSync(path.join(laneTs, "package.json"), `${JSON.stringify({ dependencies: { [PKG.name]: OLD_VERSION } }, null, 2)}\n`);
+    const root = path.join(laneTs, "node_modules", PKG.name);
+    fs.mkdirSync(root, { recursive: true });
+    await tar.x({ file: await makeFixtureTarball(work, OLD_VERSION), cwd: root, strip: 1 });
+
+    const res = runBili(root, ["doctor", "--json"], { ...isolatedEnv(work), BILI_UPDATE_REGISTRY: reg.url });
+    assert.equal(res.code, 0, `doctor failed:\n${res.stdout}\n${res.stderr}`);
+    const report = JSON.parse(res.stdout) as { global: { installDir?: string; form?: string } };
+    assert.equal(report.global.installDir, fs.realpathSync(root), "doctor must resolve the update target to the RUNNING copy, not a global root (#1628)");
+    assert.equal(report.global.form, "npm");
 });

@@ -220,24 +220,96 @@ export async function lastUpdateCheckTime(): Promise<number | undefined> {
     return ts > 0 ? ts : undefined;
 }
 
-/**
- * Walk up from this module's location until we find the directory whose
- * package.json `name` matches `packageName`. This is the install directory.
- * Exported for the pre-re-exec gate (#811).
- */
-export async function findInstallDir(packageName: string): Promise<string | undefined> {
-    let dir = path.dirname(fileURLToPath(import.meta.url));
+/** #1628: pure walk-up form of the install-dir resolution. From `startDir`,
+ *  the nearest self-or-ancestor whose package.json `name` matches `packageName`.
+ *  Two invariants pin the resolution-error class (#580/#1628): there is NO
+ *  global/npm-root fallback — walking past the filesystem root without a match
+ *  yields undefined (loud failure beats silently targeting another install) —
+ *  and crossing into a DIFFERENT named package before matching means the
+ *  running copy's own root is missing/corrupt, so the foreign ancestor is
+ *  refused instead of adopted. Exported for tests. */
+export async function findPackageRoot(startDir: string, packageName: string): Promise<string | undefined> {
+    let dir = startDir;
     for (;;) {
         try {
             const pkg = JSON.parse(await readFile(path.join(dir, "package.json"), "utf-8"));
-            if (pkg.name === packageName) return dir;
+            const name = typeof pkg.name === "string" ? pkg.name : undefined;
+            if (name === packageName) return dir;
+            if (name !== undefined) return undefined;
         } catch {
-            // not a package.json or doesn't match — keep walking
+            // not a package.json — keep walking
         }
         const parent = path.dirname(dir);
         if (parent === dir) return undefined;
         dir = parent;
     }
+}
+
+/**
+ * Walk up from this module's location until we find the directory whose
+ * package.json `name` matches `packageName`. This is the install directory.
+ * The running module's own path is the single source of truth — the copy
+ * serving traffic is the copy that gets updated, and no global-prefix
+ * fallback exists by design (#1628). Exported for the pre-re-exec gate (#811).
+ */
+export async function findInstallDir(packageName: string): Promise<string | undefined> {
+    return findPackageRoot(path.dirname(fileURLToPath(import.meta.url)), packageName);
+}
+
+/** #1628: both sides of an install failure as one log fragment so the log
+ *  alone answers "which copy is this process?": the resolved update target
+ *  (plus its realpath when different — a symlink hop) and the running
+ *  module's real path. Returns space-joined key=value pairs like
+ *  `target=X real=Y running=Z`; `target=<unresolved>` when the walk found
+ *  nothing. Exported for tests. */
+export function describeInstallLocation(installDir: string | undefined, runningModule: string | undefined): string {
+    const parts: string[] = [];
+    if (installDir) {
+        parts.push(`target=${installDir}`);
+        try {
+            const real = realpathSync(installDir);
+            if (real !== installDir) parts.push(`real=${real}`);
+        } catch {
+            // vanished mid-flight — the literal path is already named
+        }
+    } else {
+        parts.push("target=<unresolved>");
+    }
+    if (runningModule) {
+        let real = runningModule;
+        try {
+            real = realpathSync(runningModule);
+        } catch {
+            // keep the literal path
+        }
+        parts.push(`running=${real}`);
+    }
+    return parts.join(" ");
+}
+
+let installLocationLogged = false;
+
+/** Test hook: re-arm the once-per-process install-location diagnostic. */
+export function _resetInstallLocationForTest(): void {
+    installLocationLogged = false;
+}
+
+/** #1628: on this process's FIRST install failure, name the resolved target
+ *  and the running module's real path. A persistent failure (e.g. a zombie of
+ *  a root-owned global install while the host loads a different lane) then
+ *  diagnoses itself from one log line — no filesystem archaeology (#1603
+ *  defect 2 took 12 days of identical lines to attribute). At most once per
+ *  process; the every-cycle retry line stays unchanged. */
+export function logInstallLocationOnce(installDir: string | undefined, packageName: string, log: Logger = loggerLog): void {
+    if (installLocationLogged) return;
+    installLocationLogged = true;
+    let running: string | undefined;
+    try {
+        running = fileURLToPath(import.meta.url);
+    } catch {
+        running = undefined;
+    }
+    log("warn", `[update] install location: ${describeInstallLocation(installDir, running)} — this process updates only the copy it runs from; if your host loads ${packageName} from a different location, that copy is not being updated here`);
 }
 
 /** True when `dir` is a git working tree: `.git` present as a directory
@@ -975,6 +1047,7 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
                 notifyStaleInstall(opts, latest);
             } else {
                 loggerLog("warn", `[update] install failed: ${result.error}. Will retry next cycle.`);
+                logInstallLocationOnce(installDir, opts.packageName, loggerLog);
             }
         } finally {
             await lock.release();
