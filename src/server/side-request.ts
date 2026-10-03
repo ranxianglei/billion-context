@@ -136,12 +136,16 @@ export function readOutputBudget(parsed: Record<string, unknown>, field: OutputB
 }
 
 export function writeOutputBudget(parsed: Record<string, unknown>, field: OutputBudgetField, value: number): void {
+    // #2011: output-budget fields are integer-typed on every wire protocol. Coerce at this
+    // sole writer so NO caller can emit a fractional token count — the clamp path already
+    // floors, but this also guards the restore path and any future caller at the type boundary.
+    const tokens = Number.isInteger(value) ? value : Math.floor(value);
     if (field !== "generationConfig.maxOutputTokens") {
-        parsed[field] = value;
+        parsed[field] = tokens;
         return;
     }
     const gen = parsed.generationConfig;
-    parsed.generationConfig = { ...(gen && typeof gen === "object" ? (gen as Record<string, unknown>) : {}), maxOutputTokens: value };
+    parsed.generationConfig = { ...(gen && typeof gen === "object" ? (gen as Record<string, unknown>) : {}), maxOutputTokens: tokens };
 }
 
 // #1840: one-shot "restore has no ceiling" warnings, keyed by MODEL (the fact
