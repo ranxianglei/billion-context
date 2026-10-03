@@ -264,24 +264,21 @@ test("unwritable install dir: real-chain failure is loud, self-explaining, and o
     assert.match(location[0]!, /running=/);
     assert.match(location[0]!, /updates only the copy it runs from/);
     assert.equal(await readPkgVersion(installDir), OLD_VERSION, "nothing may flip when the target is unwritable");
-    const lockHit = fs.readdirSync(work, { recursive: true }).find((p) => p.endsWith(".update-lock"));
+    const lockHit = fs.readdirSync(work, { recursive: true }).find((p): p is string => typeof p === "string" && p.endsWith(".update-lock"));
     assert.equal(lockHit, undefined, `update lock leaked after failure: ${lockHit}`);
 });
 
 test("real published baseline hops to the new dist: the LIVE old updater over the real chain (#1628 no-op validation, local form)", { skip: realSkip }, async (t) => {
     assert.ok(fs.existsSync(DIST_ENTRY), "dist/index.js missing — run `npm run build` first");
+    assert.ok(REAL_BASELINE, "BILI_E2E_REAL_BASELINE must be set (the skip guard should have skipped)");
     const workRoot = path.join(process.cwd(), "tmp");
     fs.mkdirSync(workRoot, { recursive: true });
     const work = fs.mkdtempSync(path.join(workRoot, "e2e-real-baseline-"));
     t.after(() => rmrf(work));
-
     const reg = await startRegistry(path.join(work, "registry"));
     t.after(() => reg.stop());
 
     // The one deliberate non-hermetic read: the baseline is the REAL published
-    // artifact. The no-op protocol validates the live old code doing the hop;
-    // a self-built baseline (faked low version of current dist) cannot stand
-    // in for it — that hole is exactly why this phase exists.
     const dl = await fetch(`https://registry.npmjs.org/${PKG.name}/-/${PKG.name}-${REAL_BASELINE}.tgz`);
     assert.ok(dl.ok, `could not download ${PKG.name}@${REAL_BASELINE}: HTTP ${dl.status}`);
     const realTgz = path.join(work, `${PKG.name}-${REAL_BASELINE}.tgz`);
