@@ -64,12 +64,20 @@ export const WEB_CLIENT = `(function () {
         if (on) { btn.dataset.label = btn.innerHTML; btn.classList.add("busy"); btn.disabled = true; }
         else { btn.classList.remove("busy"); btn.disabled = false; if (btn.dataset.label !== undefined) btn.innerHTML = btn.dataset.label; }
     }
+    // #1937: hard 20s cap — a wedged admin endpoint must fail visibly instead of
+    // stacking unbounded in-flight requests while the UI keeps polling.
     async function json(url, opts) {
-        const res = await fetch(url, opts);
-        let body = null;
-        try { body = await res.json(); } catch (e) {}
-        if (!res.ok) throw new Error(body && body.error ? String(body.error) : "HTTP " + res.status);
-        return body;
+        const ac = typeof AbortController !== "undefined" ? new AbortController() : null;
+        const timer = ac ? setTimeout(() => ac.abort(), 20000) : null;
+        try {
+            const res = await fetch(url, Object.assign({}, opts, ac ? { signal: ac.signal } : {}));
+            let body = null;
+            try { body = await res.json(); } catch (e) {}
+            if (!res.ok) throw new Error(body && body.error ? String(body.error) : "HTTP " + res.status);
+            return body;
+        } finally {
+            if (timer !== null) clearTimeout(timer);
+        }
     }
     async function putCfg(btn, payload) {
         busy(btn, true);
@@ -141,6 +149,39 @@ export const WEB_CLIENT = `(function () {
     let sessionsCache = [];
     // #1682: last overview alert payload — lets a dismiss re-render without refetching.
     let latestAlerts = [];
+    // #1937: server-side paging state for the session list (50 rows per page).
+    const SES_PAGE_SIZE = 50;
+    let sesPage = 1;
+    let sesTotal = 0;
+    // #1937: poll failure accounting — exponential backoff (5s → 10s → … cap 60s),
+    // one persistent error strip instead of toast spam, and an in-flight guard so
+    // slow responses never stack concurrent admin requests.
+    let pollFailures = 0;
+    let nextPollAt = 0;
+    let pollBusy = false;
+    let lastErrMsg = "";
+    function friendlyMsg(e) {
+        const m = String((e && e.message) || "");
+        if (/abort/i.test(m)) return t("data.timeout");
+        return m || t("data.generic");
+    }
+    function showDataError(msg) {
+        lastErrMsg = msg;
+        let el = $("bili-data-error");
+        if (!el) {
+            el = document.createElement("div");
+            el.id = "bili-data-error";
+            el.className = "banner err";
+            const host = document.querySelector ? (document.querySelector("main") || document.body) : document.body;
+            if (host && host.appendChild) host.prepend ? host.prepend(el) : host.appendChild(el);
+        }
+        el.textContent = t("data.error", { msg });
+        el.hidden = false;
+    }
+    function hideDataError() {
+        const el = $("bili-data-error");
+        if (el) { el.hidden = true; el.textContent = ""; }
+    }
 
     function sessionTitleCell(s) {
         // #1426: title falls back to an "untitled" placeholder and the FULL session id is always
@@ -255,8 +296,11 @@ export const WEB_CLIENT = `(function () {
             if (!recent.length) rb.innerHTML = '<tr><td colspan="13" class="dim">' + t("common.empty") + "</td></tr>";
             recent.forEach((s) => rb.appendChild(sessionRow(s, false)));
             renderBanners(d);
+            return true;
         } catch (e) {
-            if (!silent) toast(t("toast.failed", { msg: e.message }), "err");
+            lastErrMsg = friendlyMsg(e);
+            if (!silent) toast(t("toast.failed", { msg: lastErrMsg }), "err");
+            return false;
         }
     }
     function renderBanners(d) {
@@ -392,24 +436,57 @@ export const WEB_CLIENT = `(function () {
         await refreshSessions(true);
     }
     let hiddenEmptyN = 0;
+    // #1937: the list is server-side paged & filtered — page 1 replaces the
+    // cache, load-more appends the next page, search re-queries with ?q=.
     async function refreshSessions(showToast) {
         try {
-            const d = await json("/__bili/sessions");
+            const d = await json(sessionListUrl(1));
             sessionsCache = d.sessions || [];
+            sesTotal = typeof d.total === "number" ? d.total : sessionsCache.length;
+            sesPage = 1;
             hiddenEmptyN = d.hiddenEmpty || 0;
             renderSessionTable();
+            updateLoadMoreBtn();
+            return true;
         } catch (e) {
-            if (showToast) toast(t("toast.failed", { msg: e.message }), "err");
+            lastErrMsg = friendlyMsg(e);
+            if (showToast) toast(t("toast.failed", { msg: lastErrMsg }), "err");
+            return false;
         }
     }
-    function renderSessionTable() {
+    function sessionListUrl(page) {
         const input = $("ses-search");
-        const q = ((input && input.value) || "").toLowerCase();
-        const rows = sessionsCache.filter((s) => !q
-            || (s.title || "").toLowerCase().indexOf(q) >= 0
-            || (s.label || "").toLowerCase().indexOf(q) >= 0
-            || s.id.toLowerCase().indexOf(q) >= 0);
-        $("ses-count").textContent = t("ses.count", { count: rows.length });
+        const q = ((input && input.value) || "").trim();
+        return "/__bili/sessions?page=" + page + "&pageSize=" + SES_PAGE_SIZE + (q ? "&q=" + encodeURIComponent(q) : "");
+    }
+    async function loadMoreSessions() {
+        const btn = $("ses-loadmore");
+        if (btn) busy(btn, true);
+        try {
+            const next = sesPage + 1;
+            const d = await json(sessionListUrl(next));
+            sessionsCache = sessionsCache.concat(d.sessions || []);
+            sesTotal = typeof d.total === "number" ? d.total : sessionsCache.length;
+            sesPage = next;
+            renderSessionTable();
+            updateLoadMoreBtn();
+            return true;
+        } catch (e) {
+            lastErrMsg = friendlyMsg(e);
+            toast(t("toast.failed", { msg: lastErrMsg }), "err");
+            return false;
+        } finally {
+            if (btn) busy(btn, false);
+        }
+    }
+    function updateLoadMoreBtn() {
+        const btn = $("ses-loadmore");
+        if (!btn) return;
+        btn.hidden = !(sessionsCache.length < sesTotal);
+    }
+    function renderSessionTable() {
+        const rows = sessionsCache;
+        $("ses-count").textContent = t("ses.count", { count: sesTotal });
         const heEl = $("ses-empty-hint");
         if (heEl) {
             if (hiddenEmptyN > 0) { heEl.hidden = false; heEl.textContent = t("ses.empty_hidden", { n: hiddenEmptyN }); }
@@ -1406,7 +1483,7 @@ export const WEB_CLIENT = `(function () {
     }
     async function loadLogs() {
         const qEl = $("log-search");
-        if (!qEl || !$("log-body")) return;
+        if (!qEl || !$("log-body")) return true;
         const q = (qEl.value || "").trim();
         try {
             const linesSel = $("log-lines");
@@ -1426,7 +1503,8 @@ export const WEB_CLIENT = `(function () {
             } else {
                 bodyEl.textContent = rows.join("\\n");
             }
-        } catch (e) { /* the log endpoint is best-effort; stay quiet */ }
+            return true;
+        } catch (e) { /* the log endpoint is best-effort; stay quiet */ lastErrMsg = friendlyMsg(e); return false; }
     }
 
     function bindLauncherNotes() {
@@ -1474,8 +1552,16 @@ export const WEB_CLIENT = `(function () {
             try { localStorage.setItem("bili-language", locale); } catch (e) {}
             location.reload();
         });
+        // #1937: search is server-side (?q=) — debounced re-query, not a local filter.
         const search = $("ses-search");
-        if (search) search.addEventListener("input", renderSessionTable);
+        if (search) {
+            let sesTimer = null;
+            search.addEventListener("input", () => { clearTimeout(sesTimer); sesTimer = setTimeout(() => refreshSessions(false), 300); });
+        }
+        const sref = $("ses-refresh");
+        if (sref) sref.addEventListener("click", () => refreshSessions(true));
+        const lm = $("ses-loadmore");
+        if (lm) lm.addEventListener("click", loadMoreSessions);
         let logTimer = null;
         const lsearch = $("log-search");
         if (lsearch) lsearch.addEventListener("input", () => { clearTimeout(logTimer); logTimer = setTimeout(loadLogs, 400); });
@@ -1616,13 +1702,29 @@ export const WEB_CLIENT = `(function () {
     hydrate();
     initStaticHandlers();
     route();
-    setInterval(() => {
+    // #1937: failures back off exponentially (5s → 10s → … cap 60s) with a
+    // persistent error strip instead of silent toast-spam retries, and a slow
+    // wedged response can never stack onto an in-flight poll.
+    setInterval(async () => {
         if (document.hidden) return;
-        // #1682: keep the global alert banner fresh on every view — silent, so a
-        // restarting server cannot spam toasts from background views.
-        if (current === "overview") loadOverview();
-        else loadOverview(true);
-        if (current === "sessions" && $("session-detail-view").hidden) refreshSessions(false);
-        else if (current === "logs") loadLogs();
+        if (pollBusy) return;
+        if (pollFailures > 0 && Date.now() < nextPollAt) return;
+        pollBusy = true;
+        try {
+            // #1682: keep the global alert banner fresh on every view — silent, so a
+            // restarting server cannot spam toasts from background views.
+            let ok = current === "overview" ? await loadOverview() : await loadOverview(true);
+            // A paged-down or searched list must not be clobbered by the background refresh.
+            if (current === "sessions" && $("session-detail-view").hidden && sessionsCache.length <= SES_PAGE_SIZE) ok = (await refreshSessions(false)) && ok;
+            else if (current === "logs") ok = (await loadLogs()) && ok;
+            if (ok) { pollFailures = 0; nextPollAt = 0; hideDataError(); }
+            else {
+                pollFailures += 1;
+                nextPollAt = Date.now() + Math.min(5000 * Math.pow(2, pollFailures), 60000);
+                showDataError(lastErrMsg || t("data.generic"));
+            }
+        } finally {
+            pollBusy = false;
+        }
     }, 5000);
 })();`;
