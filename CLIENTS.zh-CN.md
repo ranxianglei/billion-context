@@ -197,3 +197,33 @@ OpenAI/ChatGPT 凭据。
 
 - 2.x 系列以 npm 包 `@opencode/cli` 发布,且插件 API 面在不同 build 间仍在变动(相邻 `dev` 通道构建暴露不同 `ctx` 形状)—— 上文钩子/工具细节是针对具体版本的观察,不是稳定契约。
 - 设计说明:V2 插件是薄协议客户端(不含 acp-kernel)—— 代理始终是唯一的压缩权威,消除 agent 与代理间的内核版本漂移;它不依赖插件 API 无法改上下文这一事实(该能力随 2.x build 变化)。
+
+## 压缩状态看板(#1920)
+
+每个客户端在哪里看实时压缩状态。所有界面打印的都是**同一条代理渲染的行** —— `GET /__bili/plugin/status` 现在携带结构化 `stats` 对象与预渲染的 `statusLine.{min,med}` —— 所以 pi、omp、claude 显示的数字完全一致;客户端只负责把代理渲染好的内容打出来。完整细节不变:`/acp` 面板、`acp_status` 工具、web 会话页(含缓存曲线)。
+
+| 客户端 | 界面 | 机制 |
+|---|---|---|
+| pi / omp | 常驻底部状态栏 | `ctx.ui.setStatus("billion-context", …)` —— 模型回合完成时(`turn_end` / `agent_end`)与压缩后刷新;会话切换时清除、代理尚无该会话(404)时也清除 |
+| Claude Code | 底部状态行 | `bili plugin install claude` 写入受管 `statusLine` 条目,执行 `<node> <root>/dist/index.js statusline`;claude 经 stdin 传入会话 id,命令打印 min 行 |
+| opencode V1/V2 | 按需 + web | 插件 API 没有持久状态栏接缝 —— `/acp` 命令、`acp_status` 工具、web 深链 |
+| dsh | 按需 + web | `/acp`、`acp_status` 工具、web UI |
+| codex / kimi / hermes / zcode | 按需 + web | MCP 工具(`acp_status` 等)、web UI |
+| gemini / iflow / qwen / mcode / aider / amp / copilot / goose / jcode / trae / codebuddy / qoder | 仅 web | 无进程内插件/MCP 接缝 —— web UI(`http://localhost:8787`)即看板 |
+
+单行格式(min 档,≤60 字符):
+
+    bili 11% 96k/869k · saved 1.7M · 35blk · cache 96%
+
+- **上下文占比 + 窗口** —— 最近一次发出的输入 token 对比模型上下文上限;上限未解析时退化为裸 token 数
+- **saved** —— 一旦出现折叠即取缓存台账净盈亏,否则为本地估计值(带 `~` 标记);可为负
+- **blk** —— 活跃摘要块数(med 档显示 活跃/总数)
+- **cache %** —— prompt-cache 命中率(dual-source MAX,与 web 会话表同一只读模式)
+
+med 档另加请求数与距下一次 nudge 增长步的进度(`… · 42req · nudge 12k/50k`)。各段在数据尚不存在时单独缺席 —— 该行永不渲染占位符。
+
+值得了解的机制:
+
+- **pi/omp** 使用带 key 的状态槽(`billion-context`)—— 不碰其他扩展的状态文本。没有 `ui.setStatus` 的宿主静默降级(订阅保持惰性)。刷新是 fire-and-forget,绝不阻塞回合;会话切换同步先清旧行,in-flight 刷新不会把它复活。
+- **Claude Code** 命令的 origin 解析顺序:显式 `--origin` / `BILI_MCP_PROXY` > `ANTHROPIC_BASE_URL`(解包启动器的 `/bili/` 形态;`BILLION_CONTEXT_PLUGIN=0` 抑制此推导)> claude lane 粘性 zone 端口 > 默认端口 8787。**永不**让 claude 失败:任何错误都打印空行并以 0 退出。安装器仅在 `statusLine` 缺失或属于 bili 时写入 —— 用户自己的 `statusLine` 原样保留(卸载也不动);`bili plugin remove claude` 只删 bili 写的条目。
+- **零新增配置字段(#1920)**:全部复用既有 `/__bili/plugin/status` 端点、pi 事件接缝与 claude 受管块机制。

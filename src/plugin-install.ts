@@ -527,9 +527,10 @@ export function repinClaudeManagedBaseUrl(origin: string, env: NodeJS.ProcessEnv
     const settings = readJson(file);
     const cur = (settings.env as Record<string, unknown> | undefined)?.ANTHROPIC_BASE_URL;
     const baseUrl = claudeNativeBaseUrlForOrigin(origin, typeof cur === "string" ? unwrapBiliBaseUrl(cur) : undefined, env);
-    // #1902: bare `node`, PATH-resolved by whichever client shell runs the hook.
+    // #1902: bare `node`, PATH-resolved by whichever client shell runs the hook/statusline.
     const hookCommand = portableHookCommand("node", [path.join(selfPackageRoot(), "dist", "claude-native-bootstrap.js")]);
-    const { data, notes } = applyClaudeManagedBlock(settings, { baseUrl, hookCommand });
+    const statusLineCommand = portableHookCommand("node", [path.join(selfPackageRoot(), "dist", "index.js"), "statusline"]);
+    const { data, notes } = applyClaudeManagedBlock(settings, { baseUrl, hookCommand, statusLineCommand });
     if (JSON.stringify(data) !== JSON.stringify(settings)) writeJson(file, data);
     return notes;
 }
@@ -538,7 +539,7 @@ export function repinClaudeManagedBaseUrl(origin: string, env: NodeJS.ProcessEnv
  *  Never clobbers user keys: a foreign ANTHROPIC_BASE_URL or a non-"1"
  *  DISABLE_AUTO_COMPACT is reported and skipped, not overwritten. Returns the
  *  mutated copy plus human notes. Exported for tests. */
-export function applyClaudeManagedBlock(settings: Record<string, unknown>, opts: { baseUrl: string; hookCommand: string }): { data: Record<string, unknown>; notes: string[] } {
+export function applyClaudeManagedBlock(settings: Record<string, unknown>, opts: { baseUrl: string; hookCommand: string; statusLineCommand?: string }): { data: Record<string, unknown>; notes: string[] } {
     const data = structuredClone(settings);
     const notes: string[] = [];
     const env = (data.env !== null && typeof data.env === "object" && !Array.isArray(data.env) ? data.env : {}) as Record<string, unknown>;
@@ -573,7 +574,36 @@ export function applyClaudeManagedBlock(settings: Record<string, unknown>, opts:
         data.hooks = hooks;
         notes.push("hooks.SessionStart refreshed to the current hook command");
     }
+
+    // #1920: bottom-bar compression dashboard — claude runs this command
+    // periodically and renders its stdout as the status line. Never clobber a
+    // foreign statusLine (same rule as ANTHROPIC_BASE_URL): report and skip.
+    if (opts.statusLineCommand !== undefined) {
+        const cur = data.statusLine;
+        if (cur === undefined || cur === null) {
+            data.statusLine = { type: "command", command: opts.statusLineCommand, padding: 0 };
+            notes.push("statusLine += bili compression dashboard");
+        } else if (isOurStatusLine(cur)) {
+            const ours = cur as Record<string, unknown>;
+            if (ours.command !== opts.statusLineCommand) {
+                ours.command = opts.statusLineCommand;
+                notes.push("statusLine refreshed to the current command");
+            }
+        } else {
+            notes.push("statusLine left untouched (foreign value present — remove it to enable the bili dashboard)");
+        }
+    }
     return { data, notes };
+}
+
+/** A statusLine config we wrote: a command entry whose command line invokes
+ *  `<path>/dist/index.js statusline` (path varies across installs/upgrades;
+ *  the script argument may be quoted when it contains spaces). The required
+ *  path separator keeps lookalikes (`myindex.js statusline`) foreign. */
+export function isOurStatusLine(value: unknown): boolean {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+    const v = value as { type?: unknown; command?: unknown };
+    return v.type === "command" && typeof v.command === "string" && /[\\/]index\.js["']?\s+statusline\b/.test(v.command);
 }
 
 /** A hook command naming our bootstrap script. Match on the script name
@@ -639,6 +669,11 @@ export function stripClaudeManagedBlock(settings: Record<string, unknown>): { da
             else delete hooks.SessionStart;
             if (Object.keys(hooks).length === 0) delete data.hooks;
         }
+    }
+    // #1920: drop only OUR statusLine — a foreign one is user config.
+    if (isOurStatusLine(data.statusLine)) {
+        delete data.statusLine;
+        removed.push("statusLine");
     }
     return { data, removed };
 }
@@ -745,11 +780,13 @@ function claudeInstall(): string {
     const nativePort = resolveClaudeNativePort() ?? lanePreferredPort("claude");
     const file = claudeSettingsFile();
     const settings = readJson(file);
-    // #1902: bare `node`, PATH-resolved by whichever client shell runs the hook.
+    // #1902: bare `node`, PATH-resolved by whichever client shell runs the hook/statusline.
     const hookCommand = portableHookCommand("node", [bootstrapJs]);
+    const statusLineCommand = portableHookCommand("node", [path.join(root, "dist", "index.js"), "statusline"]);
     const { data, notes } = applyClaudeManagedBlock(settings, {
         baseUrl: claudeNativeBaseUrl(),
         hookCommand,
+        statusLineCommand,
     });
     writeJson(file, data);
 

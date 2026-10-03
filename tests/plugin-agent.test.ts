@@ -62,6 +62,7 @@ type FakeProxy = {
     toolCalls: Array<{ conversationId: string; tool: string; args: unknown }>;
     registers: Array<{ conversationId: string; agent: string; identity: boolean; parentConversationId?: string }>;
     runtimeInfos: Array<Record<string, unknown>>;
+    statusHits: string[];
     close(): Promise<void>;
 };
 
@@ -69,6 +70,7 @@ async function startFakeProxy(opts: { failRegister?: number; statusOk?: boolean 
     const toolCalls: FakeProxy["toolCalls"] = [];
     const registers: FakeProxy["registers"] = [];
     const runtimeInfos: FakeProxy["runtimeInfos"] = [];
+    const statusHits: string[] = [];
     const server = http.createServer((req, res) => {
         const url = req.url ?? "";
         if (url === "/__bili/plugin/manifest") {
@@ -121,12 +123,13 @@ async function startFakeProxy(opts: { failRegister?: number; statusOk?: boolean 
             return;
         }
         if (url.startsWith("/__bili/plugin/status")) {
+            statusHits.push(new URL(url, "http://localhost").searchParams.get("conversationId") ?? "");
             if (opts.statusOk === false) {
                 res.writeHead(404, { "content-type": "application/json" });
                 res.end(JSON.stringify({ ok: false, error: "unknown plugin conversation" }));
             } else {
                 res.writeHead(200, { "content-type": "application/json" });
-                res.end(JSON.stringify({ ok: true, contextTokens: 1234 }));
+                res.end(JSON.stringify({ ok: true, contextTokens: 1234, statusLine: { min: "bili 1234", med: "bili 1234 · med" } }));
             }
             return;
         }
@@ -136,7 +139,7 @@ async function startFakeProxy(opts: { failRegister?: number; statusOk?: boolean 
     server.listen(0, "127.0.0.1");
     await once(server, "listening");
     const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
-    return { origin, toolCalls, registers, runtimeInfos, close: () => new Promise<void>((resolve) => server.close(() => resolve())) };
+    return { origin, toolCalls, registers, runtimeInfos, statusHits, close: () => new Promise<void>((resolve) => server.close(() => resolve())) };
 }
 
 test("shared manifest/tool/status against a fake proxy", async () => {
@@ -2439,5 +2442,68 @@ test("#957: omp reports runtime-info via before_provider_request (omp has no hea
         });
     } finally {
         await proxy.close();
+    }
+});
+
+test("#1920: footer shows the proxy-rendered min line, dedups repeats, clears on session_start", async () => {
+    const proxy = await startFakeProxy();
+    try {
+        const calls: Array<[string, string | undefined]> = [];
+        const ui = { setStatus: (key: string, text: string | undefined): void => calls.push([key, text]) };
+        const pi = makeFakePi();
+        createBiliPlugin("pi")(pi as never);
+        await pi.events.get("session_start")!({}, fakeCtx(proxy));
+        await waitForTools(pi, 2);
+        assert.ok(pi.events.has("turn_end"), "subscribes turn_end");
+        assert.ok(pi.events.has("agent_end"), "subscribes agent_end");
+
+        const ctx = { ...fakeCtx(proxy, "sess-footer"), ui };
+        await pi.events.get("turn_end")!({}, ctx);
+        const deadline = Date.now() + 15000;
+        while (calls.length < 1 && Date.now() < deadline) await sleep(25);
+        assert.deepEqual(calls[0], ["billion-context", "bili 1234"]);
+
+        // same session + same line: the second fetch completes but must not re-setStatus
+        await pi.events.get("agent_end")!({}, ctx);
+        while (proxy.statusHits.length < 2 && Date.now() < deadline) await sleep(25);
+        assert.equal(calls.length, 1, "duplicate line is not re-pushed");
+
+        // session_start (new sid) clears the stale line synchronously
+        await pi.events.get("session_start")!({}, { ...fakeCtx(proxy, "sess-new"), ui });
+        assert.equal(calls.length, 2);
+        assert.deepEqual(calls[1], ["billion-context", undefined]);
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("#1920: footer is inert-safe without ui and against proxies predating statusLine", async () => {
+    const pi = makeFakePi();
+    createBiliPlugin("pi")(pi as never);
+    await pi.events.get("turn_end")!({}, fakeCtx(undefined));
+    await flush();
+
+    const server = http.createServer((_req, res) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, contextTokens: 1 }));
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    try {
+        const origin = `http://127.0.0.1:${(server.address() as net.AddressInfo).port}`;
+        const calls: unknown[] = [];
+        const pi2 = makeFakePi();
+        createBiliPlugin("pi")(pi2 as never);
+        const ctx = {
+            sessionManager: { getSessionId: () => "sess-old-proxy" },
+            model: { contextWindow: 1000000, baseUrl: `${origin}/bili/https://api.example.com/v1` },
+            cwd: "/tmp",
+            ui: { setStatus: (...args: [string, string | undefined]): void => calls.push(args) },
+        };
+        await pi2.events.get("turn_end")!({}, ctx);
+        await sleep(300);
+        assert.equal(calls.length, 0, "old proxy without statusLine renders nothing");
+    } finally {
+        server.close();
     }
 });

@@ -20,6 +20,7 @@ import {
     claudeNativeBaseUrlForOrigin,
     unwrapBiliBaseUrl,
     isBiliClaudeBaseUrl,
+    isOurStatusLine,
     pluginInstall,
     pluginRemove,
     repinClaudeManagedBaseUrl,
@@ -109,6 +110,56 @@ test("applyClaudeManagedBlock: rewrites a stale hook command in place (#1376)", 
     assert.equal(entries.length, 1);
     assert.deepEqual((entries[0] as { hooks: Array<{ command: string }> }).hooks, [{ type: "command", command: current }]);
     assert.ok(notes.some((n) => n.includes("refreshed")));
+});
+
+const STATUSLINE_COMMAND = "/opt/bili/dist/index.js statusline";
+
+test("applyClaudeManagedBlock: writes the statusLine dashboard when requested (#1920)", () => {
+    const { data, notes } = applyClaudeManagedBlock({}, { baseUrl: baseUrlForPort(48787), hookCommand: HOOK_COMMAND, statusLineCommand: STATUSLINE_COMMAND });
+    assert.deepEqual(data.statusLine, { type: "command", command: STATUSLINE_COMMAND, padding: 0 });
+    assert.ok(notes.some((n) => n.includes("statusLine +=")));
+});
+
+test("applyClaudeManagedBlock: no statusLine key when not requested (existing callers unchanged)", () => {
+    const { data } = applyClaudeManagedBlock({}, { baseUrl: baseUrlForPort(48787), hookCommand: HOOK_COMMAND });
+    assert.equal("statusLine" in data, false);
+});
+
+test("applyClaudeManagedBlock: our stale statusLine refreshes in place; foreign stays untouched (#1920)", () => {
+    const first = applyClaudeManagedBlock({}, { baseUrl: baseUrlForPort(48787), hookCommand: HOOK_COMMAND, statusLineCommand: STATUSLINE_COMMAND });
+    const second = applyClaudeManagedBlock(first.data, { baseUrl: baseUrlForPort(48787), hookCommand: HOOK_COMMAND, statusLineCommand: STATUSLINE_COMMAND });
+    assert.deepEqual(second.data.statusLine, first.data.statusLine);
+    assert.equal(second.notes.length, 0, "idempotent — no note on a no-op apply");
+    const moved = applyClaudeManagedBlock(first.data, { baseUrl: baseUrlForPort(48787), hookCommand: HOOK_COMMAND, statusLineCommand: "/moved/dist/index.js statusline" });
+    assert.equal((moved.data.statusLine as { command?: string }).command, "/moved/dist/index.js statusline");
+    assert.ok(moved.notes.some((n) => n.includes("refreshed")));
+
+    const foreign = { type: "command", command: "my-status.sh" };
+    const kept = applyClaudeManagedBlock({ statusLine: foreign }, { baseUrl: baseUrlForPort(48787), hookCommand: HOOK_COMMAND, statusLineCommand: STATUSLINE_COMMAND });
+    assert.deepEqual(kept.data.statusLine, foreign, "never clobber user config");
+    assert.ok(kept.notes.some((n) => n.includes("foreign")));
+});
+
+test("stripClaudeManagedBlock: drops only our statusLine, keeps a foreign one (#1920)", () => {
+    const applied = applyClaudeManagedBlock({}, { baseUrl: baseUrlForPort(48787), hookCommand: HOOK_COMMAND, statusLineCommand: STATUSLINE_COMMAND });
+    const { data, removed } = stripClaudeManagedBlock(applied.data);
+    assert.equal("statusLine" in data, false);
+    assert.ok(removed.includes("statusLine"));
+    const foreign = { type: "command", command: "my-status.sh" };
+    const kept = stripClaudeManagedBlock({ statusLine: foreign });
+    assert.deepEqual(kept.data.statusLine, foreign);
+    assert.equal(kept.removed.length, 0);
+});
+
+test("isOurStatusLine: matches our command shape incl. quoted paths, rejects lookalikes", () => {
+    assert.equal(isOurStatusLine({ type: "command", command: "/opt/bili/dist/index.js statusline" }), true);
+    assert.equal(isOurStatusLine({ type: "command", command: "C:\\bili\\dist\\index.js statusline" }), true);
+    assert.equal(isOurStatusLine({ type: "command", command: 'node "C:\\b ili\\dist\\index.js" statusline' }), true);
+    assert.equal(isOurStatusLine({ type: "command", command: "myindex.js statusline" }), false);
+    assert.equal(isOurStatusLine({ type: "command", command: "/opt/bili/dist/index.js statuslineX" }), false);
+    assert.equal(isOurStatusLine({ type: "command", command: "/opt/bili/dist/other.js statusline" }), false);
+    assert.equal(isOurStatusLine("index.js statusline"), false);
+    assert.equal(isOurStatusLine(undefined), false);
 });
 
 test("stripClaudeManagedBlock: round-trip removes ours, keeps user keys", () => {

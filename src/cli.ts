@@ -35,6 +35,7 @@ import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatus
 import { runLaunch, runTestPi, isLaunchClient, type ClientName } from "./launcher.js";
 import { exportSession } from "./export.js";
 import { renderJson, renderText, runDiff } from "./acp-cache-diff.js";
+import { runStatusline } from "./statusline.js";
 import { renderDoctorReport, runDoctor } from "./doctor.js";
 import { VERSION, PACKAGE_NAME } from "./version.js";
 
@@ -89,6 +90,9 @@ Usage:
   bili mcp                         run the bili MCP server standalone (stdio)
   bili plugin-register <id>        pre-bind a conversation to the plugin mode
                                     (--origin URL, --agent name)
+  bili statusline                  print the compression dashboard line for the
+                                    claude session id on stdin (claude statusLine
+                                    backing command; --origin URL overrides)
   bili --version                   print version
   bili --help                      show this help
 
@@ -147,7 +151,7 @@ Docs: https://github.com/ranxianglei/billion-context
 `;
 
 type Parsed = {
-    command: "start" | "update" | "doctor" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp" | "plugin" | "acp-cache";
+    command: "start" | "update" | "doctor" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp" | "plugin" | "acp-cache" | "statusline";
     client?: ClientName;
     clientArgs: string[];
     mitmDomains: string[];
@@ -371,6 +375,8 @@ export function parseArgs(argv: string[]): Parsed {
                 console.error("bili acp-cache diff: dump-dir is required");
                 process.exit(2);
             }
+        } else if (cmd === "statusline") {
+            command = "statusline";
         } else {
             console.error(`bili: unknown command "${cmd}" (try "bili --help")`);
             process.exit(2);
@@ -388,6 +394,13 @@ export async function main(): Promise<void> {
     }
     if (command === "version") {
         process.stdout.write(VERSION + "\n");
+        return;
+    }
+    // #1920: claude statusLine command — must stay light (no logger/server init)
+    // and never fail the host: print the proxy-rendered line (or nothing).
+    if (command === "statusline") {
+        const line = await runStatusline({ origin: overrides.BILI_MCP_PROXY });
+        if (line.length > 0) process.stdout.write(line);
         return;
     }
     if (command === "acp-cache") {

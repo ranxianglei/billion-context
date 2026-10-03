@@ -602,3 +602,53 @@ returns `[Block … not found]`, new refs restart from m00001).
   on the plugin API being unable to mutate context (that capability varies
   by 2.x build).
 
+## Compression status dashboard (#1920)
+
+Where each client shows live compression state. Every surface prints ONE
+proxy-rendered line — `GET /__bili/plugin/status` now carries a structured
+`stats` object plus pre-rendered `statusLine.{min,med}` — so pi, omp and
+claude show identical numbers; clients only print what the proxy rendered.
+Full detail is unchanged: the `/acp` panel, the `acp_status` tool, and the
+web session page (with the cache curve).
+
+| Client | Surface | How it gets there |
+|---|---|---|
+| pi / omp | Persistent bottom status bar | `ctx.ui.setStatus("billion-context", …)` — refreshed when a model turn completes (`turn_end` / `agent_end`) and after compaction; cleared on session start and when the proxy has no session yet (404) |
+| Claude Code | Bottom status line | `bili plugin install claude` writes a managed `statusLine` entry running `<node> <root>/dist/index.js statusline`; claude feeds the session id on stdin, the command prints the min line |
+| opencode V1/V2 | On demand + web | The plugin API exposes no persistent status seam — `/acp` command, `acp_status` tool, web deep link |
+| dsh | On demand + web | `/acp`, `acp_status` tool, web UI |
+| codex / kimi / hermes / zcode | On demand + web | MCP tools (`acp_status`, …), web UI |
+| gemini / iflow / qwen / mcode / aider / amp / copilot / goose / jcode / trae / codebuddy / qoder | Web only | No in-process plugin/MCP seam — the web UI (`http://localhost:8787`) is the dashboard |
+
+The one-line format (min tier, ≈60 chars max):
+
+    bili 11% 96k/869k · saved 1.7M · 35blk · cache 96%
+
+- **context % + window** — last sent input tokens vs the model's context limit; degrades to the bare token count when no limit is resolved
+- **saved** — net P&L from the cache ledger once any fold exists, otherwise the local estimate marked with `~`; can be negative
+- **blk** — active summary blocks (the med tier shows active/total)
+- **cache %** — prompt-cache hit rate (dual-source max, same read-only pattern as the web sessions table)
+
+The med tier adds request count and nudge progress toward the next growth
+step (`… · 42req · nudge 12k/50k`). Segments drop out individually while
+their data does not exist yet — the line never renders placeholders.
+
+Mechanics worth knowing:
+
+- **pi/omp** use a keyed status slot (`billion-context`) — other extensions'
+  status text is untouched. Hosts without `ui.setStatus` degrade silently
+  (the subscriptions stay inert). Refreshes are fire-and-forget and never
+  block a turn; a session switch drops the old line synchronously before an
+  in-flight refresh can resurrect it.
+- **Claude Code**'s command resolves its origin as: explicit `--origin` /
+  `BILI_MCP_PROXY` > `ANTHROPIC_BASE_URL` (unwrapping the launcher's
+  `/bili/` form; `BILLION_CONTEXT_PLUGIN=0` suppresses this derivation) >
+  the claude lane's sticky zone port > default port 8787. It NEVER fails
+  claude: any error prints an empty line and exits 0. The installer writes
+  `statusLine` only when absent or bili-owned — a user's own `statusLine` is
+  left untouched (and survives uninstall); `bili plugin remove claude` drops
+  only the entry bili wrote.
+- **No new config fields (#1920):** everything rides the existing
+  `/__bili/plugin/status` endpoint, pi's event seam, and the claude
+  managed-block mechanics.
+

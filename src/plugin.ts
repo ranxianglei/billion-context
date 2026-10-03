@@ -25,6 +25,7 @@ import { settleUsageReport } from "./cache-ledger.js";
 import { promptInputTotal, type WireProtocol } from "./util.js";
 import { stateDir } from "./paths.js";
 import { lookupToolWitness, recordToolWitness } from "./tool-ring.js";
+import { buildStatusLineStats, renderStatusLine } from "./status-line.js";
 import { awaitDrain } from "./server/stream-io.js";
 
 // The proxy's own version, read from package.json at runtime (works in both dev
@@ -883,6 +884,11 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         // replace() pattern syntax ($&, $\`, $') and corrupt the box lines.
         panel = panel.replace(PANEL_BOX_FOOTER, `\n${preFooter.join("\n")}\n${PANEL_BOX_FOOTER}`.replace(/\$/g, "$$$$"));
     }
+    // #1920: status-line dashboards for client surfaces (pi/omp footer,
+    // claude statusLine). Rendered HERE so every client prints identical
+    // numbers; additive fields — pre-existing consumers are untouched.
+    const statusStats = buildStatusLineStats(session, nudge);
+    const statusLine = { min: renderStatusLine(statusStats, "min"), med: renderStatusLine(statusStats, "med") };
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
         ok: true,
@@ -902,6 +908,8 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         cachedTokens: session.stats.cachedTokens,
         requests: session.stats.requests,
         blocks: session.state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active })),
+        stats: statusStats,
+        statusLine,
         panel,
         webUrl: webUrl ?? null,
         lastSeen: session.lastSeen,

@@ -21,6 +21,9 @@ type Ctx = {
     // v0.99.1 packages/coding-agent/src/core/model-registry.ts).
     modelRegistry?: { find?: (provider: string, modelId: string) => { baseUrl?: unknown } | undefined } | undefined;
     cwd?: string;
+    // #1920: pi hosts mount ExtensionUIContext on every event ctx; setStatus
+    // is optional because older builds may lack it (inert-safe degradation).
+    ui?: { setStatus?: (key: string, text: string | undefined) => void } | undefined;
 };
 
 type TextBlock = { type: "text"; text: string };
@@ -41,7 +44,8 @@ type ToolDefinition = {
 type CommandCtx = {
     sessionManager?: { getSessionId?: () => string } | undefined;
     model?: { contextWindow?: number; baseUrl?: string } | undefined;
-    ui?: { notify?: (message: string, type?: string) => void } | undefined;
+    // Same host ExtensionUIContext as event ctxs (structural superset of Ctx.ui).
+    ui?: { notify?: (message: string, type?: string) => void; setStatus?: (key: string, text: string | undefined) => void } | undefined;
 };
 
 type ExtensionAPI = {
@@ -741,6 +745,66 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 },
             });
         }
+        // #1920: persistent compression dashboard in the host's bottom status
+        // bar. pi's ExtensionUIContext.setStatus(key, text) is a keyed slot —
+        // other extensions' status text is untouched; undefined clears ours.
+        // The line is rendered BY THE PROXY (/__bili/plugin/status →
+        // statusLine.min), so pi/omp/claude all show identical numbers.
+        // Refreshed when a model turn completes (turn_end / agent_end) and
+        // after native compaction; both events are inert-safe on hosts that
+        // never emit them. A 404 (no model request yet / proxy restarted)
+        // clears a stale line instead of keeping it.
+        const STATUS_KEY = "billion-context";
+        let footerSid: string | undefined;
+        let footerText: string | undefined;
+        // Bumped on every clear so an in-flight refresh cannot resurrect a
+        // stale line after a session switch landed mid-fetch.
+        let footerGen = 0;
+        const setFooter = (ctx: Ctx, text: string | undefined): void => {
+            try {
+                ctx.ui?.setStatus?.(STATUS_KEY, text);
+            } catch {
+                // host UI unavailable — best effort only
+            }
+        };
+        const clearFooter = (ctx: Ctx): void => {
+            footerGen++;
+            if (footerText === undefined) return;
+            footerSid = undefined;
+            footerText = undefined;
+            setFooter(ctx, undefined);
+        };
+        const refreshFooter = (ctx: Ctx): void => {
+            if (typeof ctx.ui?.setStatus !== "function") return;
+            const sid = sessionIdOf(ctx);
+            if (sid === undefined || sid.length === 0) return;
+            const gen = footerGen;
+            void (async () => {
+                let proxyBase = proxyBaseForCtx(ctx);
+                if (proxyBase === undefined) proxyBase = await awaitNativeProxyOrigin();
+                if (proxyBase === undefined || gen !== footerGen) return;
+                let status: Record<string, unknown> | undefined;
+                try {
+                    status = await fetchStatus(proxyBase, sid);
+                } catch {
+                    return;
+                }
+                if (gen !== footerGen) return;
+                if (status === undefined) {
+                    clearFooter(ctx);
+                    return;
+                }
+                const sl = status.statusLine as { min?: unknown } | undefined;
+                const line = typeof sl?.min === "string" && sl.min.length > 0 ? sl.min : undefined;
+                if (line === undefined) return;
+                if (line === footerText && footerSid === sid) return;
+                footerSid = sid;
+                footerText = line;
+                setFooter(ctx, line);
+            })().catch(() => {});
+        };
+        pi.on("turn_end", (_event, ctx) => refreshFooter(ctx));
+        pi.on("agent_end", (_event, ctx) => refreshFooter(ctx));
         pi.on("before_provider_headers", async (event, ctx) => {
             try {
                 // #1243: on the native lane the proxy origin lands via an async
@@ -858,6 +922,10 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
         });
         pi.on("session_start", (_event, ctx) => {
             state.sid = undefined;
+            // #1920: a new/rotated session must not flash the previous
+            // session's line — drop it synchronously (no async window here,
+            // so #1586's stale-ctx hazard does not apply).
+            clearFooter(ctx);
             // #1586 review: session_start captures its ctx for the whole
             // session — never suspend across it here. One-shot flows replace
             // the session inside async windows, so an awaited native-origin
@@ -883,6 +951,7 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                 body: JSON.stringify({ conversationId: sid }),
                 signal: AbortSignal.timeout(5000),
             }).catch(() => {});
+            refreshFooter(ctx);
         });
     };
 }
