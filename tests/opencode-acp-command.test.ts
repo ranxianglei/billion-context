@@ -146,3 +146,82 @@ test("execute.before ignores other commands without touching the proxy (#1146)",
         await proxy.close();
     }
 });
+
+// #1603: /acp must surface a stale install (on-disk newer than running code) so
+// a long-lived host user can act. Serves both status endpoints the hook reads.
+function startAcpProxy(opts: { panel?: string; ok?: boolean; status?: object | null }): Promise<{ origin: string; close(): Promise<void> }> {
+    const server = http.createServer((req, res) => {
+        const url = req.url ?? "";
+        if (url.startsWith("/__bili/plugin/status")) {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: opts.ok ?? true, panel: opts.panel ?? "" }));
+            return;
+        }
+        if (url.startsWith("/__bili/status")) {
+            if (opts.status === null) {
+                res.writeHead(500);
+                res.end("{}");
+                return;
+            }
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify(opts.status ?? { version: "1.0.0", diskVersion: "1.0.0", stale: false }));
+            return;
+        }
+        res.writeHead(404);
+        res.end("{}");
+    });
+    server.listen(0, "127.0.0.1");
+    return once(server, "listening").then(() => ({
+        origin: `http://127.0.0.1:${(server.address() as { port: number }).port}`,
+        close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+    }));
+}
+
+test("/acp appends a staleness notice when the on-disk install is newer (#1603)", async () => {
+    const proxy = await startAcpProxy({
+        panel: "ACP-PANEL",
+        status: { version: "1.0.0", diskVersion: "2.0.0", stale: true, autoRestartOnUpdate: false },
+    });
+    try {
+        const prompts: Rendered[] = [];
+        const hooks = createAcpCommandHooks(() => proxy.origin, makeCtx(prompts));
+        await assert.rejects(hooks["command.execute.before"]?.({ command: "acp", sessionID: "s" }), HANDLED);
+        assert.equal(prompts.length, 1);
+        assert.ok(prompts[0].text.includes("ACP-PANEL"), "panel is preserved");
+        assert.match(prompts[0].text, /is stale/);
+        assert.match(prompts[0].text, /v1\.0\.0/);
+        assert.match(prompts[0].text, /v2\.0\.0/);
+        assert.match(prompts[0].text, /restart the host/i);
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("/acp omits the notice when the running install matches disk (#1603)", async () => {
+    const proxy = await startAcpProxy({
+        panel: "ACP-PANEL",
+        status: { version: "2.0.0", diskVersion: "2.0.0", stale: false },
+    });
+    try {
+        const prompts: Rendered[] = [];
+        const hooks = createAcpCommandHooks(() => proxy.origin, makeCtx(prompts));
+        await assert.rejects(hooks["command.execute.before"]?.({ command: "acp", sessionID: "s" }), HANDLED);
+        assert.equal(prompts.length, 1);
+        assert.equal(prompts[0].text, "ACP-PANEL");
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("/acp still renders when the /__bili/status probe is unreachable (#1603)", async () => {
+    const proxy = await startAcpProxy({ panel: "ACP-PANEL", status: null });
+    try {
+        const prompts: Rendered[] = [];
+        const hooks = createAcpCommandHooks(() => proxy.origin, makeCtx(prompts));
+        await assert.rejects(hooks["command.execute.before"]?.({ command: "acp", sessionID: "s" }), HANDLED);
+        assert.equal(prompts.length, 1);
+        assert.equal(prompts[0].text, "ACP-PANEL");
+    } finally {
+        await proxy.close();
+    }
+});

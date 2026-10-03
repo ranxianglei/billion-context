@@ -116,6 +116,88 @@ function warnAdvisoryOnce(advisoryId: string, message: string): void {
     loggerLog("warn", message);
 }
 
+// #1603: bounded retry for persistent install failures. Pre-fix, a failing
+// install (unwritable dir, host-managed lane) re-downloaded and re-failed every
+// 3-min cycle for days (124× over 12 days in the field) with no backoff or
+// remediation. Keyed on (installDir, targetVersion): consecutive failures grow
+// an exponential cooldown during which the check skips the download silently;
+// a success or a different key resets it. Backoff (not hard self-disable) keeps
+// the path self-healing if the dir becomes writable later.
+const BACKOFF_THRESHOLD = 3;
+const BACKOFF_BASE_MS = 5 * 60 * 1000;
+const BACKOFF_CAP_MS = 6 * 60 * 60 * 1000;
+
+interface InstallBackoff {
+    key: string;
+    count: number;
+    nextRetryAt: number;
+}
+let installBackoff: InstallBackoff | undefined;
+const installBackoffRemediatedKeys = new Set<string>();
+
+export function _resetInstallBackoffForTest(): void {
+    installBackoff = undefined;
+    installBackoffRemediatedKeys.clear();
+}
+
+function backoffKey(installDir: string | undefined, version: string): string {
+    return `${installDir ?? "<unknown-install-dir>"}\u0000${version}`;
+}
+
+export function backoffMs(count: number): number {
+    const exp = Math.max(0, count - BACKOFF_THRESHOLD);
+    return Math.min(BACKOFF_CAP_MS, BACKOFF_BASE_MS * 2 ** exp);
+}
+
+function remediationHint(error: string): string {
+    if (/not writable/i.test(error)) {
+        return "the install dir is not writable by this user. Fix its ownership/permissions, point npm at a user-writable prefix and reinstall (npm install -g billion-context), or disable auto-update (config autoUpdate:false / env ACP_AUTO_UPDATE=0)";
+    }
+    if (/git working tree/i.test(error)) {
+        return "this copy runs from a source checkout. Install globally instead (npm install -g billion-context) so auto-update has a writable target";
+    }
+    if (/managed by/i.test(error)) {
+        return "this copy is managed by its host. Update it through the host's own channel rather than in place";
+    }
+    return "review the error above. Auto-update keeps retrying with an increasing delay";
+}
+
+// Names the literal-vs-real mismatch when the resolved install dir is a symlink
+// to somewhere else (#1603: the updater can target a path whose real location
+// differs, invisible without this). Empty when they match.
+function installDirNote(installDir: string | undefined): string {
+    if (!installDir) return "";
+    try {
+        const real = realpathSync(installDir);
+        return real === installDir ? "" : ` (target ${installDir} resolves via symlink to ${real})`;
+    } catch {
+        return "";
+    }
+}
+
+function recordInstallFailure(key: string, error: string, installDir: string | undefined): void {
+    const now = Date.now();
+    if (installBackoff?.key !== key) {
+        installBackoff = { key, count: 1, nextRetryAt: now };
+    } else {
+        installBackoff.count += 1;
+    }
+    const b = installBackoff;
+    const note = installDirNote(installDir);
+    if (b.count < BACKOFF_THRESHOLD) {
+        loggerLog("warn", `[update] install failed: ${error}${note}. Will retry next cycle.`);
+        return;
+    }
+    b.nextRetryAt = now + backoffMs(b.count);
+    const waitMin = Math.round(backoffMs(b.count) / 60_000);
+    if (!installBackoffRemediatedKeys.has(key)) {
+        installBackoffRemediatedKeys.add(key);
+        loggerLog("warn", `[update] install keeps failing (${b.count}\u00d7 in a row): ${error}${note}. ${remediationHint(error)}. Backing off \u2014 next attempt in ~${waitMin}m.`);
+        return;
+    }
+    loggerLog("warn", `[update] install failed: ${error}${note}. Still failing \u2014 next attempt in ~${waitMin}m.`);
+}
+
 // --- Version comparison (ported from opencode-acp lib/update.ts) ---
 // Proper semver including prerelease ordering: a prerelease is OLDER than its
 // release (0.1.46-pr.202.1 < 0.1.46), and prerelease parts compare
@@ -954,6 +1036,11 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
             return;
         }
 
+        const bkey = backoffKey(installDir, latest);
+        if (!force && installBackoff && installBackoff.key === bkey && Date.now() < installBackoff.nextRetryAt) {
+            return;
+        }
+
         loggerLog("info", `[update] new version found: ${currentVersion} \u2192 ${latest}, downloading\u2026`);
 
         // Acquire lock to prevent concurrent updates across processes.
@@ -965,6 +1052,8 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
         try {
             const result = await installViaTarball(latest, tarballUrl, installDir, integrity, shasum, egressDispatcher(opts, tarballUrl));
             if (result.ok) {
+                installBackoff = undefined;
+                installBackoffRemediatedKeys.clear();
                 loggerLog("info", `[update] installed ${currentVersion} \u2192 ${latest}. Restart to finish.`);
                 // #966: dsh profile copies load their own plugin+proxy from the
                 // profile's node_modules — without this they would keep running
@@ -974,7 +1063,7 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
                 await refreshDshDesktopCopy(latest, loggerLog, process.env, opts.resolveProxy);
                 notifyStaleInstall(opts, latest);
             } else {
-                loggerLog("warn", `[update] install failed: ${result.error}. Will retry next cycle.`);
+                recordInstallFailure(bkey, result.error ?? "unknown error", installDir);
             }
         } finally {
             await lock.release();

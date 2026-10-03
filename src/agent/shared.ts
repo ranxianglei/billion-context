@@ -286,6 +286,23 @@ export async function fetchProxyVersion(proxyBase: string): Promise<string | und
     return typeof version === "string" && version.length > 0 ? version : undefined;
 }
 
+/** #1603: one-line staleness warning for status UIs — the on-disk install is
+ *  newer than the running process, so a host restart is needed to activate the
+ *  new code. Soft-fail by design (same contract as fetchStatus): undefined when
+ *  not stale OR the proxy can't be reached — a failed probe must never break /acp. */
+export async function fetchStaleNotice(proxyBase: string): Promise<string | undefined> {
+    const { ok, json } = await fetchJson(`${proxyBase}/__bili/status`, undefined, STATUS_TIMEOUT_MS);
+    if (!ok || !json || typeof json !== "object") return undefined;
+    const s = json as { stale?: unknown; version?: unknown; diskVersion?: unknown; autoRestartOnUpdate?: unknown };
+    if (s.stale !== true) return undefined;
+    const running = typeof s.version === "string" ? s.version : "?";
+    const installed = typeof s.diskVersion === "string" ? s.diskVersion : "?";
+    const tail = s.autoRestartOnUpdate === true
+        ? " — auto-restart is enabled but did not fire this cycle; check the bili log"
+        : " — restart the host to activate (or enable --auto-restart-on-update)";
+    return `⚠️ billion-context is stale: running v${running} but v${installed} is installed${tail}.`;
+}
+
 /** #1365: poll the attach liveness probe until it answers or the deadline
  *  passes. Returns the origin when it is (or comes back) healthy, undefined
  *  on timeout — callers must fail LOUDLY then, never spawn a replacement the
