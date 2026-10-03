@@ -668,9 +668,9 @@ test("Responses WS: a title-persona side request rides the lane transport instea
         const events = await f.turn([user("title over the WS lane")], undefined, {}, titlePeer);
         const done = events.find(e => e.type === "response.completed");
         assert.ok(done, JSON.stringify(events));
-        const log = fs.readFileSync(f.logPath, "utf8");
-        assert.match(log, /side request \(agent=title\)/);
-        assert.doesNotMatch(log, /Unsupported request in Responses WebSocket transport/);
+        // Poll the log: on slow runners the side-request line can lag the
+        // completed frame (same race family the other sites fixed).
+        await readLogUntil(f.logPath, [/side request \(agent=title\)/], /Unsupported request in Responses WebSocket transport/);
     } finally {
         await f.close();
     }

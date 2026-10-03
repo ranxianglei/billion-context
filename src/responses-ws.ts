@@ -109,6 +109,13 @@ export class ResponsesWsHistory {
     clear(): void {
         this.checkpoint = undefined;
     }
+
+    /** #1926 observability: bytes retained by the live checkpoint. */
+    bytes(): number {
+        const checkpoint = this.checkpoint;
+        if (!checkpoint) return 0;
+        return Buffer.byteLength(JSON.stringify(checkpoint.request)) + Buffer.byteLength(JSON.stringify(checkpoint.output));
+    }
 }
 
 // The pipeline emits JSON bodies as strings (prepare* re-serialization) or
@@ -133,6 +140,11 @@ export class ResponsesWsUpstream {
     private resetHistory(reason: string): void {
         this.history.clear();
         this.log("debug", `upstream checkpoint reset reason=${reason}`);
+    }
+
+    /** #1926 observability: bytes retained by the upstream-leg checkpoint. */
+    retainedBytes(): number {
+        return this.history.bytes();
     }
 
     close(reason = "transport-close"): void {
@@ -391,6 +403,10 @@ class ResponsesWsSession implements WsBridgeSession {
     constructor(private readonly context: WsBridgeContext) {
         this.transport = new ResponsesWsUpstream(context.log);
         context.log("info", "Responses socket connected (ACP request pipeline)");
+    }
+
+    stats(): { retainedBytes: number; inFlight: boolean } {
+        return { retainedBytes: this.history.bytes() + this.transport.retainedBytes(), inFlight: this.busy };
     }
 
     onMessage(data: Buffer, binary: boolean): void {

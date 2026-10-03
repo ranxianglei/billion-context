@@ -84,6 +84,21 @@ Unknown protocols cannot be compressed (folding requires knowing where history
 lives in the wire format); they stay on the #1472 transparent passthrough lane
 and remain untouched by this bridge.
 
+## Idle-socket observability (#1926, option (c))
+
+Idle client peers each pin one live upstream connection plus both checkpoints,
+with no reclamation until the client closes (idle-close (a)/(b) awaits
+verified retry-full host recovery — see #1926). Until then the lane surfaces
+the retention:
+
+- `GET /__bili/stats` gains a `wsBridge` object: per live connection — codec,
+  connection id, `idleMs`, `retainedBytes` (client + upstream checkpoints),
+  `inFlight`.
+- A scan (default every 60s) logs one `warn` per idle episode per connection
+  once idle age crosses the threshold (default 30min;
+  `BILI_WS_IDLE_WARN_SECONDS` overrides, `0` disables), tagged `(#1926)` and
+  reset by client activity. Pure observability — nothing is closed.
+
 ## Verification
 
 Use random loopback ports and fake Responses WebSocket upstreams, with no real

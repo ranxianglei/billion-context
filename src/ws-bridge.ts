@@ -30,6 +30,12 @@ export interface WsBridgeSession {
     onClose(code: number): void;
     /** The server is shutting down; fail in-flight exchanges and drop upstream transports. */
     shutdown(reason: string): void;
+    /**
+     * Optional resource accounting for the #1926 observability surface
+     * (`/__bili/stats` + the idle-retention warn line). Implementations report
+     * the bytes their checkpoints retain and whether an exchange is in flight.
+     */
+    stats?(): { retainedBytes?: number; inFlight?: boolean };
 }
 
 export interface WsBridgeContext {
@@ -76,29 +82,82 @@ export interface WsBridgeCodec {
     createSession(context: WsBridgeContext): WsBridgeSession;
 }
 
+export interface WsBridgeStats {
+    connections: { codec: string; connection: number; idleMs: number; retainedBytes?: number; inFlight?: boolean }[];
+}
+
+export interface WsBridgeHandle {
+    /** The upgrade handler; wire into the http server's "upgrade" event. */
+    (req: http.IncomingMessage, socket: Duplex, head: Buffer): boolean;
+    /** #1926 observability: live connections, idle age, retained bytes. */
+    stats(): WsBridgeStats;
+}
+
+export interface WsBridgeOptions {
+    /** Clock injection for tests. */
+    now?: () => number;
+    /** Idle-scan cadence (ms); default 60_000. */
+    scanMs?: number;
+    /** Idle threshold (ms) before the retention warn line fires; default 30 min, 0 disables. */
+    idleWarnMs?: number;
+}
+
+interface BridgeEntry {
+    session: WsBridgeSession;
+    peer: WebSocket;
+    codec: string;
+    connection: number;
+    label: string;
+    lastActivityAt: number;
+    idleWarned: boolean;
+}
+
 export function installWebSocketBridge(
     server: http.Server,
     dispatch: (req: http.IncomingMessage, res: http.ServerResponse) => Promise<void>,
     log: (level: string, message: string) => void,
     codecs: readonly WsBridgeCodec[],
-): (req: http.IncomingMessage, socket: Duplex, head: Buffer) => boolean {
+    options: WsBridgeOptions = {},
+): WsBridgeHandle {
     const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_REQUEST_BYTES, perMessageDeflate: false });
-    const sessions = new Set<{ session: WsBridgeSession; peer: WebSocket }>();
+    const sessions = new Set<BridgeEntry>();
     let connectionId = 0;
+    const now = options.now ?? Date.now;
+    const scanMs = options.scanMs ?? 60_000;
+    const idleWarnSeconds = Number(process.env.BILI_WS_IDLE_WARN_SECONDS ?? 1800);
+    // Non-numeric or negative env values fall back to the 30-minute default instead of silently disabling the scan (sibling-knob convention, e.g. BILI_MODEL_INFO_RETRY_MS).
+    const idleWarnMs = options.idleWarnMs ?? (Number.isFinite(idleWarnSeconds) && idleWarnSeconds >= 0 ? idleWarnSeconds : 1800) * 1000;
+    // #1926: idle client peers pin one live upstream connection plus both
+    // checkpoints each, with no reclamation until the client closes. Until
+    // idle-close (a)/(b) is verified against the retry-full contract, surface
+    // the retention: one warn line per idle episode per connection (reset on
+    // activity), and per-connection stats via `stats()` below.
+    const scanner = idleWarnMs > 0 && scanMs > 0 ? setInterval(() => {
+        for (const entry of sessions) {
+            const idleMs = now() - entry.lastActivityAt;
+            if (entry.idleWarned || idleMs < idleWarnMs) continue;
+            entry.idleWarned = true;
+            const retained = entry.session.stats?.().retainedBytes;
+            log("warn", `${entry.label} idle ${Math.round(idleMs / 1000)}s: socket pins a live upstream connection and checkpoints${retained === undefined ? "" : ` (retained≈${retained} bytes)`} — no reclamation until client close (#1926)`);
+        }
+    }, scanMs) : undefined;
+    scanner?.unref();
     const close = server.close.bind(server);
     server.close = callback => {
         const live = [...sessions];
         sessions.clear(); // exactly-once: the 'close' event backstop below must not re-run
+        scanner?.close();
         for (const { session } of live) session.shutdown("server-close");
         for (const peer of wss.clients) peer.terminate();
         return close(callback);
     };
     server.on("close", () => {
+        scanner?.close();
         for (const { session } of sessions) session.shutdown("server-close");
         for (const peer of wss.clients) peer.terminate();
         wss.close();
     });
-    return (source, socket, head) => {
+    const upgrade = (source: http.IncomingMessage, socket: Duplex, head: Buffer): boolean => {
         const admitted = isLoopbackAddress(source.socket.remoteAddress);
         const claim = admitted ? codecs.flatMap(candidate => {
             const conversation = source.headers[candidate.conversationHeader ?? "x-bili-plugin-conversation"];
@@ -125,17 +184,22 @@ export function installWebSocketBridge(
             }
             if (socket.destroyed) return;
             wss.handleUpgrade(source, socket, head, peer => {
-                const label = `[${codec.name}] [conn=${++connectionId}] [session=${JSON.stringify(conversationId.slice(0, 128))}]`;
+                const connection = ++connectionId;
+                const label = `[${codec.name}] [conn=${connection}] [session=${JSON.stringify(conversationId.slice(0, 128))}]`;
                 const trace: WsBridgeLog = (level, message) => log(level, `${label} ${message}`);
                 const session = codec.createSession({ log: trace, peer, source, upstreamUrl: upstream, dispatch, codec });
-                const entry = { session, peer };
+                const entry: BridgeEntry = { session, peer, codec: codec.name, connection, label, lastActivityAt: now(), idleWarned: false };
                 sessions.add(entry);
                 peer.on("error", () => {});
                 peer.on("close", (code: number) => {
                     session.onClose(code);
                     sessions.delete(entry);
                 });
-                peer.on("message", (data: Buffer, binary: boolean) => session.onMessage(data, binary));
+                peer.on("message", (data: Buffer, binary: boolean) => {
+                    entry.lastActivityAt = now();
+                    entry.idleWarned = false;
+                    session.onMessage(data, binary);
+                });
             });
         })().catch(() => {
             log("warn", `[${codec.name}] upgrade failed`);
@@ -143,4 +207,11 @@ export function installWebSocketBridge(
         });
         return true;
     };
+    const stats = (): WsBridgeStats => ({
+        connections: [...sessions].map(entry => {
+            const entryStats = entry.session.stats?.();
+            return { codec: entry.codec, connection: entry.connection, idleMs: Math.max(0, now() - entry.lastActivityAt), retainedBytes: entryStats?.retainedBytes, inFlight: entryStats?.inFlight };
+        }),
+    });
+    return Object.assign(upgrade, { stats });
 }
