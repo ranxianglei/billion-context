@@ -440,8 +440,19 @@ function mockCtx() {
     // #1772 profile diagnostics: replayed through the same dynamic inject path.
     let profileContext: { startedBundles?: readonly string[] } | undefined = undefined;
     type HostCtx = Parameters<typeof apply>[0];
+    // #1945 host event bus: capture ctx.on subscriptions so tests can fire
+    // llm/adapters-updated the way dsh's commitRoutes dispatches it.
+    const eventListeners = new Map<string, Array<(table: Array<{ kind: string; name?: string; value?: unknown }>) => void>>();
     return {
         tools: { register: (t: RegisteredTool) => tools.push(t) },
+        on: (event: string, listener: (table: Array<{ kind: string; name?: string; value?: unknown }>) => void) => {
+            const list = eventListeners.get(event);
+            if (list === undefined) eventListeners.set(event, [listener]);
+            else list.push(listener);
+        },
+        fireEvent: (event: string): void => {
+            for (const listener of eventListeners.get(event) ?? []) listener([]);
+        },
         commands: { register: (c: { name: string; handler: (invocation?: { agent?: { session?: { id?: unknown } } }) => Promise<{ kind: string; text: string }> }) => commands.push(c) },
         agents: { currentInitiator: () => initiator },
         setInitiator: (i: { session?: { id?: unknown } } | undefined) => (initiator = i),
@@ -1018,6 +1029,55 @@ test("apply() runtime-info (#1942): binds resolveModelInfo to its service receiv
             await waitFor(() => stamp()?.["x-bili-plugin-context-window"] === "1000000", "bound resolve stamped the context-window header");
             assert.equal(stamp()?.["x-bili-plugin-model"], "space-bunny");
             assert.equal(stamp()?.["x-bili-plugin-max-output"], "32768");
+        });
+    } finally {
+        proxy.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("apply() runtime-info (#1945): an adapter-registration event clears the boot-race cooldown instead of waiting it out", async () => {
+    const proxy = await startMockProxy([]);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-adapters-"));
+    try {
+        // 60s cooldown: only the adapters-updated event can recover the window
+        // within this test's lifetime — the timer path alone would time out.
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, BILI_MODEL_INFO_RETRY_MS: "60000" }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            const ctx = mockCtx();
+            // boot race: the first resolve fails (adapter not registered yet)
+            let attempts = 0;
+            ctx.setModelServices(
+                {
+                    resolveModelInfo: async () => {
+                        attempts += 1;
+                        if (attempts === 1) throw new Error('no adapter registered for provider "deepseek"');
+                        return { context: { contextWindow: 262144 }, defaultMaxTokens: 32768 };
+                    },
+                },
+                { currentSelection: () => ({ provider: "deepseek", model: "qwen-ri" }) },
+            );
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration (adapters)");
+            ctx.setInitiator({ session: { id: "session-adapters" } });
+            const stamp = () => _stateHeadersForTest()?.("http://example.test/v1/chat/completions");
+            // failure-shaped cache latched: model id stamped, window absent,
+            // 60s cooldown armed
+            await waitFor(() => stamp()?.["x-bili-plugin-model"] === "qwen-ri", "failure-shaped cache stamped the model id");
+            assert.equal(stamp()?.["x-bili-plugin-context-window"], undefined);
+            assert.equal(attempts, 1);
+            // dsh registers the provider adapter → emits llm/adapters-updated
+            ctx.fireEvent("llm/adapters-updated");
+            // the NEXT request re-resolves immediately, no cooldown wait
+            await waitFor(() => stamp()?.["x-bili-plugin-context-window"] === "262144", "post-event re-resolve stamped the window header");
+            assert.equal(stamp()?.["x-bili-plugin-max-output"], "32768");
+            assert.equal(attempts, 2, "the event triggered exactly one re-resolve");
+            // a later event must not disturb the final (window-carrying) cache
+            ctx.fireEvent("llm/adapters-updated");
+            await new Promise((r) => setTimeout(r, 20));
+            assert.equal(attempts, 2, "a resolved cache is final — later events do not re-resolve");
+            assert.equal(stamp()?.["x-bili-plugin-context-window"], "262144");
         });
     } finally {
         proxy.close();

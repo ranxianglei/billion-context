@@ -93,9 +93,12 @@ export type PluginContext = {
     // #1809: lifecycle disposal for registrations made inside an injected
     // callback (cordis Context.effect); optional so non-cordis hosts skip it.
     effect?: (fn: () => void | (() => void), label?: string) => void;
-    // #1590: host event bus (web-profile hosts only) — webserver/index-inject
-    // gathers per-startup rows for the web index; we push the __BILI__ global
-    // the dsh-native-client.js settings entry reads.
+    // Host event bus. #1590: webserver/index-inject gathers per-startup rows
+    // for the web index (we push the __BILI__ global the dsh-native-client.js
+    // settings entry reads); #1945: llm/adapters-updated signals a provider
+    // adapter registration so a boot-order model-info miss retries now. The
+    // listener takes the event payload (index rows / none) — a zero-arg
+    // listener satisfies the signature.
     on?: (event: string, listener: (table: Array<{ kind: string; name?: string; value?: unknown }>) => void) => void;
     // #1809: browser HTTP carrier (web/desktop profiles only) — hosts the live
     // /bili/origin route the settings entry polls. Optional like llm/
@@ -670,6 +673,18 @@ export function apply(ctx: PluginContext): void {
         if (origin !== undefined) table.push({ kind: "global", name: "__BILI__", value: { origin } });
     });
 
+    // #1945: provider adapters register AFTER plugin activation, so the first
+    // refreshModelInfo can hit dsh's NO_ADAPTER and latch a failure-shaped
+    // cache; #1836's cooldown recovers it within ~30s but every request in
+    // that window ships header-less (proxy sizes against its fallback). dsh
+    // emits llm/adapters-updated on every adapter registration/disposal —
+    // drop the cooldown then so the NEXT headersFor re-resolves immediately.
+    // Best-effort: hosts without ctx.on or the event keep the cooldown path.
+    ctx.on?.("llm/adapters-updated", () => {
+        const cached = modelInfo.cached;
+        if (cached !== undefined && cached.contextWindow === undefined) modelInfo.retryAt = 0;
+    });
+
     // #1809: the row above is a snapshot taken at index render — spawn mode
     // binds register.base only AFTER bootstrap, so an already-loaded page (a
     // web tab opened at launch) never sees the origin, and desktop is worse:
@@ -1014,6 +1029,7 @@ export function _resetRegisterForTest(base: string | undefined): void {
     modelInfo.cached = undefined;
     modelInfo.services = undefined;
     modelInfo.refreshing = false;
+    modelInfo.retryAt = undefined;
 }
 
 /** Test hook (#1797): resolve once every in-flight attach/recovery chain has
