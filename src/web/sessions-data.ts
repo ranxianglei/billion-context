@@ -345,7 +345,7 @@ export function _diskScanStatsForTest(): { files: number; decodedTotal: number; 
 interface SummarySource {
     id: string;
     meta: { protocol?: string; upstreamOrigin?: string; label?: string; title?: string };
-    stats: { requests: number; tokensSaved: number; inputTokens: number; cachedTokens: number; outputTokens: number; contextTokens: number };
+    stats: { requests: number; tokensSaved: number; inputTokens: number; cachedTokens: number; outputTokens: number; contextTokens: number; contextTokensSource?: "usage" | "estimate" };
     metadata: Record<string, unknown>;
     state: { blocks: Array<{ topic?: string; summary: string }> };
     lastSeen: number;
@@ -384,6 +384,9 @@ function summaryFromRecord(rec: unknown): WebSessionSummary {
             cachedTokens: num(stats.cachedTokens, num(r.cachedTokens)),
             outputTokens: num(stats.outputTokens, num(r.outputTokens)),
             contextTokens: Math.max(0, num(stats.contextTokens, num(r.contextTokens))),
+            // #1839: mirror buildSession's narrowing (persist.ts) — grouped stats
+            // only, so list rows always agree with detail rows; legacy files lack it.
+            contextTokensSource: stats.contextTokensSource === "usage" || stats.contextTokensSource === "estimate" ? stats.contextTokensSource : undefined,
         },
         metadata: (r.metadata && typeof r.metadata === "object" ? r.metadata : {}) as Record<string, unknown>,
         state: { blocks: blocksRaw.filter((b) => !!b && typeof b === "object") as Array<{ topic?: string; summary: string }> },
