@@ -10,7 +10,7 @@ claude plugin install billion-claude-recall@billion-claude-recall-marketplace
 ```
 然后在 `~/.claude/settings.json` 里设 `"autoCompactWindow": 150000`（与 `RECALL_SOFT` 相同），开新会话生效。
 
-Windows：插件默认用 `python3` 启动；Windows 上的 `python3` 常常是应用商店占位程序或无法直接执行的脚本，MCP 服务会启动失败。请在 settings 的 `env` 里加 `"RECALL_PYTHON": "python"`（或 Python 可执行文件的完整路径）。hook 在 `python3` 不可用时会自动退回 `python`，MCP 服务没有这种退路。
+Windows：插件默认用 `python3` 启动；Windows 上的 `python3` 常常是应用商店占位程序或无法直接执行的脚本，MCP 服务会启动失败。请在 settings 的 `env` 里加 `"RECALL_PYTHON": "python"`（或 Python 可执行文件的完整路径）。hook 在 `python3` 不可用时会自动退回 `python`，MCP 服务没有这种退路。另外 hook 命令是 POSIX shell 语法：macOS/Linux 无需额外依赖，Windows 上需要 Git Bash（随 Git for Windows 安装），否则 Claude Code 会用 PowerShell 执行 hook、这些命令会失败（MCP 服务不经过 shell，不受影响）。
 
 v0.2.0 起复刻了 [billion-context](https://github.com/ranxianglei/billion-context) / [acp-kernel](https://github.com/ranxianglei/acp-kernel) v0.0.99（MIT）的压缩规则、提醒文本、分层摘要、规则与 absorb 提示；模型可见的文本逐字取自 acp-kernel，仅按本插件机制做了替换（见 `plugin/recall/prompts.py` 注释）。版权与许可见 `NOTICE`。
 
