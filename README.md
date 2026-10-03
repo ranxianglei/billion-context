@@ -103,7 +103,7 @@ Pick by your client:
 
 | Client | Use |
 |---|---|
-| **pi** | [`billion-context`](https://github.com/ranxianglei/billion-context) — `bili pi` (launcher) or `bili plugin install pi` (native); standalone [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi) remains usable |
+| **pi** | [`billion-context`](https://github.com/ranxianglei/billion-context) — `bili pi` (launcher) or `npm:billion-context` (in-process extension, no local server; model traffic goes direct to your upstream). `BILI_PI_INPROC=0` falls back to the server-based native (self-spawned proxy); standalone [`billion-context-pi`](https://github.com/ranxianglei/billion-context-pi) is deprecated (#1988) |
 | **opencode** (1.x / 2.x) | [`billion-context`](https://github.com/ranxianglei/billion-context) — `bili opencode` (launcher) or `bili plugin install opencode` (native); standalone [`opencode-acp`](https://github.com/ranxianglei/opencode-acp) remains usable on 1.x — full guide: [OpenCode](CLIENTS.md#opencode) |
 | **omp** | [`billion-context`](https://github.com/ranxianglei/billion-context) via `bili omp` (built-in plugin) or `bili plugin install omp` (self-spawning native plugin, no launcher) |
 | **dsh** | `bili dsh` (launcher — full native plugin via `--patch`) or `bili plugin install dsh` ≡ `dsh plugin --profile <name> add billion-context` (one unified lane) — details: [CLIENTS.md](CLIENTS.md) |
@@ -123,7 +123,7 @@ Pick by your client:
 | **goose** (Goose CLI) | `bili goose` (launcher) — rustls trusts no CA file, so no cert-MITM: openai/anthropic legs via `OPENAI_HOST`/`ANTHROPIC_HOST`, custom providers via a regenerated `GOOSE_PATH_ROOT` overlay (#1049) |
 | **everything else** (no context hook) | [`billion-context`](https://github.com/ranxianglei/billion-context) — `bili <client>` (launcher, preferred) or `/bili/` prefix |
 
-**Native mode vs standalone extensions.** The host-native plugins (`bili plugin install …`) and the standalone in-process extensions (`billion-context-pi`, `opencode-acp`) are **mutually exclusive** — both active means double compression. The installer makes the switch: it replaces the legacy entries (bare name, `npm:` alias, versioned, path form; array or object shape) and snapshots the original config to `.bili-bak` once; a **project-local** install is not touched — remove that one by hand. As a runtime safety net for manual installs, the native entries set `BILLION_CONTEXT_NATIVE=<host>` synchronously at load so a standalone extension can stand down at action time. On the pi side the marker needs `billion-context-pi` **0.1.72+**, and the pi-native entry scans both pi settings files once its proxy is up and warns loudly when it spots a co-resident legacy entry the installer never saw — that warning is the only visible signal while an old `billion-context-pi` silently double-compresses.
+**Native mode vs standalone extensions.** The host-native plugins (`bili plugin install …`) and the standalone in-process extensions (`opencode-acp`, legacy `billion-context-pi`) are **mutually exclusive** — both active means double compression. The installer makes the switch: it replaces the legacy entries (bare name, `npm:` alias, versioned, path form; array or object shape) and snapshots the original config to `.bili-bak` once; a **project-local** install is not touched — remove that one by hand. As a runtime safety net for manual installs, the native entries set `BILLION_CONTEXT_NATIVE=<host>` synchronously at load so a standalone extension can stand down at action time. For pi this is now mostly history: since #1988 the default pi lane IS billion-context's own in-process entry (`dist/agent/pi-inprocess.js`, no server), and the standalone `billion-context-pi` package is deprecated pending retirement — its state files (`.acp.json` sidecars) are read as-is by the new entry, and builds ≥ 0.1.72 stand down automatically on our marker. Older builds predate the marker, so BOTH pi entries scan the global + project pi settings files and warn loudly when they spot a co-resident legacy `billion-context-pi` — that warning, not silence, is what you get if one lingers.
 
 
 ## Install
@@ -199,7 +199,7 @@ install <client>` writes their config entries for you (kimi's declarative
 
 Notes:
 
-- Native mode is **mutually exclusive** with the standalone in-process extensions (`billion-context-pi`, `opencode-acp`) — the installer swaps the entries and snapshots the original config (`.bili-bak`).
+- For pi the two postures live in ONE package and are never both active: the in-process entry is the default (`npm:billion-context`), `BILI_PI_INPROC=0` delegates to the server-based native instead. Standalone in-process extensions (`opencode-acp`, legacy `billion-context-pi`) remain mutually exclusive with whichever posture is active — the installer swaps the entries and snapshots the original config (`.bili-bak`).
 - OpenCode legacy sessions, V1/V2 shapes and caveats: [OpenCode](CLIENTS.md#opencode).
 - `kimi` reports runtime-info at bootstrap only (static headers can't carry per-request window/model values); subagent tool calls are routed by the proxy's outbound tool-use witness ring (#1685) — no model-visible conversation id.
 - `hermes`'s native plugin is Python: it points hermes' httpx stack at the proxy via env vars after a health check and stamps per-request headers through an `llm_request` middleware.
@@ -450,7 +450,7 @@ Short-lived sessions leave small state files behind that are never resumed. Clea
 
 Early. Protocol handling and compression work against mock tests (500+ passing). Real-model integration testing is the next milestone. Expect rough edges.
 
-Client-side plugins for pi / omp / opencode ship inside `billion-context` (`dist/agent/*.js`) for the cooperative-proxy path. See the **"Which do I need?"** section above for how `billion-context`, the standalone `billion-context-pi`, and `opencode-acp` relate.
+Client-side entries for pi / omp / opencode ship inside `billion-context` (`dist/agent/*.js`): pi gets both the in-process engine (default, #1988) and the server-based native (`BILI_PI_INPROC=0`), while omp / opencode ride the cooperative-proxy path. See the **"Which do I need?"** section above for how `billion-context`, the standalone `opencode-acp`, and the deprecated `billion-context-pi` relate.
 
 ## Attribution requirement (one term on top of MIT)
 

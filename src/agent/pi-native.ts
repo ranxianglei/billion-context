@@ -25,7 +25,7 @@ import os from "node:os";
 import path from "node:path";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
 import { createBiliPlugin } from "./pi.js";
-import { isLegacyBcpEntry, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
+import { isLegacyBcpEntry, legacyBcpEntriesIn, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
 import { installNativeFetchIntercept, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
 import { fetchProxyVersion, fetchStatus, waitForProxyVersion } from "./shared.js";
 
@@ -56,24 +56,7 @@ export function planNativePi(env: NodeJS.ProcessEnv): { mode: "off" | "attach" |
     return { mode: "spawn" };
 }
 
-export { isLegacyBcpEntry };
-
-/** packages[] entries in one pi settings.json that load billion-context-pi. */
-export function legacyBcpEntriesIn(file: string): string[] {
-    let text: string;
-    try {
-        text = fs.readFileSync(file, "utf8");
-    } catch {
-        return [];
-    }
-    try {
-        const parsed = JSON.parse(text) as { packages?: unknown };
-        if (!Array.isArray(parsed.packages)) return [];
-        return (parsed.packages as unknown[]).map(String).filter(isLegacyBcpEntry);
-    } catch {
-        return [];
-    }
-}
+export { isLegacyBcpEntry, legacyBcpEntriesIn };
 
 // Co-residence net for manual installs (#939): `bili plugin install pi`
 // strips legacy entries from the GLOBAL settings, but a project-scope entry
@@ -185,13 +168,36 @@ export async function verifyAttachAndRecover(attachOrigin: string): Promise<stri
     return landed;
 }
 
-const plan = planNativePi(process.env);
+let _started = false;
+
+/** Run this module's bootstrap exactly once: decide the posture, arm the
+ *  shared intercept state, and install the fetch-layer rewrite outside test
+ *  runs. The standalone dist/agent/pi-native.js entry calls this at module
+ *  evaluation (below) — preserving the original load-time behavior including
+ *  the synchronous BILLION_CONTEXT_NATIVE stamp (#820/#824). The in-process
+ *  entry (dist/agent/pi-inprocess.js) reaches it only through its BILI_PI_INPROC=0
+ *  fallback, via dynamic import, so the default in-process mode never
+ *  evaluates this module at all. */
+export function startPiNative(): void {
+    if (_started) return;
+    _started = true;
+    const plan = planNativePi(process.env);
+    if (plan.mode === "off") return;
+    armNativePi(plan);
+    // node:test imports this module for shouldBootstrapNative/nativeProxyScriptPath —
+    // never patch globalThis.fetch or bootstrap a real proxy from inside a test run.
+    if (process.env.NODE_TEST_CONTEXT === undefined) {
+        installNativeFetchIntercept(state);
+    }
+}
+
+startPiNative();
 
 /** Wire the shared intercept state for the planned mode. Attach mode arms
  *  even under NODE_TEST_CONTEXT (it installs no global patches and spawns
  *  nothing while the target is healthy, so tests can drive it directly);
  *  spawn mode stays test-guarded because bootstrap forks a real proxy. */
-export function armNativePi(p: typeof plan): void {
+export function armNativePi(p: ReturnType<typeof planNativePi>): void {
     if (p.mode === "off") return;
     markNativeHost(process.env, "pi");
     if (p.mode === "attach") {
@@ -242,14 +248,6 @@ export function armNativePi(p: typeof plan): void {
     }
 }
 
-if (plan.mode !== "off") armNativePi(plan);
-
-// node:test imports this module for shouldBootstrapNative/nativeProxyScriptPath —
-// never patch globalThis.fetch or bootstrap a real proxy from inside a test run.
-if (process.env.NODE_TEST_CONTEXT === undefined && plan.mode !== "off") {
-    installNativeFetchIntercept(state);
-}
-
 /** Test hook: expose the armed runtime-recovery seam (mirrors opencode/dsh). */
 export function _stateRespawnForTest(): (() => Promise<string | undefined>) | undefined {
     return state.respawn;
@@ -274,6 +272,17 @@ export function _resetNativeStateForTest(): void {
     delete process.env.BILLION_CONTEXT_PROXY;
 }
 
-export default createBiliPlugin();
+const nativeExtension = createBiliPlugin();
+
+// Fallback bridge for the in-process entry (dist/agent/pi-inprocess.js under
+// BILI_PI_INPROC=0): the host passes its REAL ExtensionAPI, while
+// createBiliPlugin() is typed against pi.ts's structurally-narrower local copy
+// (predating the host package becoming a devDep). Runtime-safe: pi invokes the
+// default export below with this same object in production (#519), so every
+// member the local type names exists on the real one.
+export function nativePiExtension(api: import("@earendil-works/pi-coding-agent").ExtensionAPI): void {
+    nativeExtension(api as unknown as Parameters<typeof nativeExtension>[0]);
+}
+export default nativeExtension;
 
 export { fetchStatus } from "./pi.js";

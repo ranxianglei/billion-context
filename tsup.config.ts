@@ -2,7 +2,28 @@ import { defineConfig } from "tsup";
 
 export default [
 defineConfig({
-    entry: ["src/index.ts", "src/mcp.ts", "src/claude-native-bootstrap.ts", "src/agent/pi.ts", "src/agent/pi-native.ts", "src/agent/omp.ts", "src/agent/omp-native.ts", "src/agent/opencode.ts", "src/agent/opencode-native.ts", "src/agent/dsh-acp.ts", "src/agent/dsh-native.ts", "src/kimi/native-mcp.ts", "src/kimi/bootstrap-hook.ts", "src/zcode/mcp-entry.ts", "src/zcode/bootstrap-hook.ts"],
+    // Object form: most entries keep their src-relative name; the two pi-inprocess
+    // entries get explicit flat names (package.json pi.extensions / exports point
+    // at dist/agent/pi-inprocess.js and dist/agent/pi-inprocess-contract.js).
+    entry: {
+        index: "src/index.ts",
+        mcp: "src/mcp.ts",
+        "claude-native-bootstrap": "src/claude-native-bootstrap.ts",
+        "agent/pi": "src/agent/pi.ts",
+        "agent/pi-native": "src/agent/pi-native.ts",
+        "agent/pi-inprocess": "src/agent/pi-inprocess/index.ts",
+        "agent/pi-inprocess-contract": "src/agent/pi-inprocess/contract-entry.ts",
+        "agent/omp": "src/agent/omp.ts",
+        "agent/omp-native": "src/agent/omp-native.ts",
+        "agent/opencode": "src/agent/opencode.ts",
+        "agent/opencode-native": "src/agent/opencode-native.ts",
+        "agent/dsh-acp": "src/agent/dsh-acp.ts",
+        "agent/dsh-native": "src/agent/dsh-native.ts",
+        "kimi/native-mcp": "src/kimi/native-mcp.ts",
+        "kimi/bootstrap-hook": "src/kimi/bootstrap-hook.ts",
+        "zcode/mcp-entry": "src/zcode/mcp-entry.ts",
+        "zcode/bootstrap-hook": "src/zcode/bootstrap-hook.ts",
+    },
     format: ["esm"],
     target: "node20",
     platform: "node",
@@ -30,7 +51,10 @@ defineConfig({
     // noExternal, esbuild keeps `import ... from "acp-kernel"` in dist, and
     // npm then installs acp-kernel as a runtime dep — breaking the
     // "dist/index.js is self-contained" contract (AGENTS.md §2.1).
-    noExternal: ["acp-kernel", "fzstd", "node-forge", "semver", "tar", "undici", "jsonc-parser", "ws"],
+    // typebox is inlined (not a runtime dep): only the pi-inprocess tool-schema
+    // modules import it, and bundling keeps the published artifact self-contained
+    // exactly like acp-kernel — no resolution of pi's own node_modules needed.
+    noExternal: ["acp-kernel", "fzstd", "node-forge", "semver", "tar", "undici", "jsonc-parser", "ws", "typebox"],
     // sharp is an OPTIONAL runtime dependency (native module): it must stay
     // EXTERNAL so dist keeps a real lazy `import("sharp")` that Node resolves
     // at runtime from node_modules — missing ⇒ clean pass-through, and the
@@ -38,7 +62,12 @@ defineConfig({
     // range in optionalDependencies would otherwise bake that version into
     // dist and break reproducible builds). tsup does not auto-externalize
     // optionalDependencies, hence the explicit entry.
-    external: ["sharp"],
+    // The @earendil-works/* packages are PI HOST packages: the extension runs
+    // inside pi's process and imports them (types + Box/Text + CONFIG_DIR_NAME)
+    // from the host's own resolution, exactly as billion-context-pi did as a
+    // peer dep. Bundling them would create a second copy of pi internals with
+    // divergent type identity; they must stay real runtime imports.
+    external: ["sharp", "@earendil-works/pi-coding-agent", "@earendil-works/pi-tui"],
     banner: {
         // node-forge is a CommonJS dependency that calls require("crypto") etc.
         // inlined into our ESM output, esbuild's __require shim throws in an
