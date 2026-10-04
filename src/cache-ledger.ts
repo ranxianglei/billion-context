@@ -124,8 +124,10 @@ export interface CacheLedger {
         nbInput: number;
         seamSuspects: number;
         seamMissed: number;
-        /** #1592 follow-up: misses whose current body was byte-stable vs the
-         *  previous request — the upstream simply did not serve its cache
+        /** #1592 follow-up: misses with no client-side prefix break — the current
+         *  body is byte-stable vs the previous request, or the previous message
+         *  list comes back byte-identical as a prefix with only tail messages
+         *  appended. Either way the upstream simply did not serve its cache
          *  (TTL expiry / eviction / relay node rotation). Not a rebuild seam. */
         providerSideMisses: number;
         providerSideMissed: number;
@@ -337,6 +339,13 @@ function seamLcp(a: string, b: string): { lcpBytes: number; msgIndex: number; pr
     return { lcpBytes: lcp, msgIndex: i, prevMsgs: ma.length, curMsgs: mb.length };
 }
 
+/** Append-only turn shape: the previous message list survives byte-identical as a
+ *  prefix of the current one, so every difference is in the appended tail and no
+ *  prefix break exists. */
+function seamTailAppendOnly(f: { msgIndex: number; prevMsgs: number }): boolean {
+    return f.prevMsgs > 0 && f.msgIndex === f.prevMsgs;
+}
+
 function detectSeam(session: Session, led: CacheLedger): void {
     const line = led.lines[led.lines.length - 1];
     if (!line || line.unk === 1 || line.missed <= 0) return;
@@ -368,8 +377,15 @@ function detectSeam(session: Session, led: CacheLedger): void {
             agg.rewindMissed += line.tr;
             return;
         }
-        if (f.lcpBytes >= cur.length) {
-            // Wire was byte-stable against the previous request — the
+        // A body clipped at SEAM_BODY_CAP cannot prove anything about the bytes past
+        // its recorded end — two clipped bodies share their whole recorded prefix by
+        // construction, which would read as "byte-stable" (or as an append-only tail)
+        // even when a real divergence sits past the cap. Both arms need full evidence.
+        const bothUnderCap = prev.length < SEAM_BODY_CAP && cur.length < SEAM_BODY_CAP;
+        if (bothUnderCap && (f.lcpBytes >= cur.length || seamTailAppendOnly(f))) {
+            // The previous request's payload came back byte-identical (whole body,
+            // or its entire message list as a prefix with only tail messages
+            // appended) — nothing the client sent broke the prefix, so the
             // upstream simply did not serve its cache. Provider-side.
             agg.providerSideMisses += 1;
             agg.providerSideMissed += line.tr;
@@ -1023,8 +1039,8 @@ function formatSeam(r: BiliCacheReport): string {
         out.push(`  ${r.seam.rewinds.count} sample(s) · ${fmtTok(r.seam.rewinds.missed)} tok re-billed once for the retained prefix — sanctioned client intent, not a rebuild seam`);
     }
     if (r.seam.providerSide.count > 0) {
-        out.push("▲ PROVIDER-SIDE MISS (wire was byte-stable)");
-        out.push(`  ${r.seam.providerSide.count} sample(s) · ${fmtTok(r.seam.providerSide.missed)} tok — the outbound body matched the previous request's prefix; the upstream did not serve its cache (TTL expiry / eviction / relay node rotation). Not a bili rebuild seam.`);
+        out.push("▲ PROVIDER-SIDE MISS (no prefix break in the outbound body)");
+        out.push(`  ${r.seam.providerSide.count} sample(s) · ${fmtTok(r.seam.providerSide.missed)} tok — the previous request's entire message list came back byte-identical (whole body, or its prefix with only tail messages appended), so nothing the client sent broke the prefix; the upstream did not serve its cache (TTL expiry / eviction / relay node rotation). Not a bili rebuild seam.`);
     }
     if (r.seam.abortCorrelated > 0) {
         out.push("⏻ ABORT-CORRELATED");

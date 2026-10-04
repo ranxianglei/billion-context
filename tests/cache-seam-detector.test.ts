@@ -114,8 +114,11 @@ test("seam events are bounded (ring keeps the last 8)", () => {
     const s = makeSession();
     noteForwardedBody(s, body(["a"]));
     settle(s, T0, 100_000, 99_000);
+    // Each round rewrites the single element of a 1-message list: msgIndex (0)
+    // sits below prevMsgs (1), so every round is a real mid-history break and the
+    // ring — not the tail-append arm — is what bounds the events.
     for (let i = 0; i < 12; i++) {
-        noteForwardedBody(s, body(["a", `v${i}`]));
+        noteForwardedBody(s, body([`v${i}`]));
         settle(s, T0 + 1000 * (i + 2), 100_000, 20_000);
     }
     const led = getCacheLedger(s);
