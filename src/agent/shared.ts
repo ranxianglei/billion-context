@@ -157,6 +157,32 @@ export async function fetchManifest(proxyBase: string, format: "anthropic" | "op
     return tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.input_schema ?? { type: "object", properties: {} } }));
 }
 
+// #2048 display-only advisor: the TUI extension polls the loopback-gated
+// proxy for the interpreter render of the turn that just finished. Any
+// failure (proxy down, timeout, unexpected shape) reads as "no panel".
+const ADVISOR_POLL_TIMEOUT_MS = 5000;
+
+export type AdvisorPoll =
+    | { status: "none" }
+    | { status: "pending" }
+    | { status: "ready"; seq: number; lines: string[] };
+
+export async function fetchAdvisor(proxyBase: string, conversationId: string): Promise<AdvisorPoll | undefined> {
+    try {
+        const { ok, json } = await fetchJson(`${proxyBase}/__bili/advisor?session=${encodeURIComponent(conversationId)}`, undefined, ADVISOR_POLL_TIMEOUT_MS);
+        if (!ok || !json || typeof json !== "object") return undefined;
+        const data = json as { status?: unknown; seq?: unknown; lines?: unknown };
+        if (data.status === "none") return { status: "none" };
+        if (data.status === "pending") return { status: "pending" };
+        if (data.status === "ready" && typeof data.seq === "number" && Array.isArray(data.lines) && data.lines.every((l) => typeof l === "string")) {
+            return { status: "ready", seq: data.seq, lines: data.lines as string[] };
+        }
+        return undefined;
+    } catch {
+        return undefined;
+    }
+}
+
 const COMPACT_TIMEOUT_MS = 5000;
 
 /** Report a host-native compaction boundary to the proxy archive (#395):

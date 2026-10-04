@@ -360,6 +360,39 @@ Three more #2030 keys extend existing blocks: [`mitm.handshakeTimeoutMs`](#clien
 
 ---
 
+## Advisor (display-only plain-language rendering)
+
+Optional sidecar layer (#2048): while the main model works, each eligible assistant reply is **also** rendered by a second, cheap "interpreter" model into plain conversational language — purely for display. The original bytes stay 100% intact: streamed tokens, session files, `acp_summary`/nudge text, wire traffic, prefix cache, and the compression ledger are never touched; nothing is substituted.
+
+- **Default OFF.** Explicit opt-in only (`"enabled": true`); there is no env-var form.
+- **Fail-open:** an advisor error, timeout, or concurrency-cap hit means no panel and the main path is unaffected. Firing is strictly post-response; one call per eligible message; process-wide concurrency cap of 4.
+- **Accounting-excluded:** advisor calls are proxy-initiated side requests that bypass the ACP pipeline entirely — excluded from nudge growth, the cache ledger, and saved-tokens accounting.
+- **Display seams (v1):** pi/omp show a TUI widget `bili-advisor` above the editor (cleared at the next turn start); dsh-web can poll `GET /__bili/advisor?session=<id>` (loopback-gated). Other clients have no display-only seam in v1 — results are stored but not shown.
+
+| Field | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `advisor.enabled` | boolean | off | Master switch; must be exactly `true`. |
+| `advisor.model` | string | required when enabled | The interpreter model id, sent to the route's upstream. |
+| `advisor.route` | string | the session's own upstream | A providers-table key (URL prefix) naming a different upstream endpoint. bili is a transparent proxy — credentials ride client headers and the table carries none — so a separately routed call reuses the credentials bili has ALREADY observed in-process for that base; if none were ever seen, the panel is suppressed (fail-open). |
+| `advisor.locale` | string | `"auto"` | Translation locale. `"auto"` detects from the last user message (≥30% CJK ⇒ `zh-CN`, else `en`); any explicit BCP-47 tag overrides. |
+| `advisor.minChars` | integer ≥ 0 | `80` | Replies shorter than this (trimmed) are skipped — no render for trivial answers. |
+
+```jsonc
+{
+  "advisor": {
+    "enabled": true,
+    "model": "glm-4-flash",
+    "route": "https://api.example.com/cheap",   // optional — default: same upstream, model swapped
+    "locale": "zh-CN",                          // optional — default "auto"
+    "minChars": 80                              // optional
+  }
+}
+```
+
+Translator discipline: code fences, inline code, file paths, URLs, and shell commands pass through **byte-exact** (the #1039 "arguments are user intent" discipline applied to the translator's system prompt). Rendered lines are display material only — never persisted, never sent back to any model. Malformed sections fail loud at config load (never silently clobbered); unknown fields warn.
+
+---
+
 ## Providers
 
 The `providers` block maps **upstream URLs** to per-provider configuration. Each key is a URL prefix; each value can declare model context windows, a per-provider proxy, a compression protocol, a wire-protocol declaration, compression overrides, an image billing mode, a per-route passthrough, and a client-side direct exemption. Non-URL **named** keys are also allowed: they are routing-inert on their own, and become real lanes via [`bind`](#named-provider-entries-bind).

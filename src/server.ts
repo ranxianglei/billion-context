@@ -78,6 +78,7 @@ import { attachSubagentSessions } from "./subagent-sessions.js";
 import { buildSessionCacheReport, handleAcpCache, learnedImageReserve, noteClientAbort, noteForwardedBody, noteForwardedImageFacts, readModelSwitchStats, settleUsageReport } from "./cache-ledger.js";
 import { warnCacheCollapse } from "./cache-warn.js";
 import { preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateRawBodyTokens, type PreflightResult } from "./preflight.js";
+import { advisorEntryFor, createAssistantTextTapper, extractAssistantTextFromJson, fireAdvisor, lastUserText, recordUpstreamAuth, type AssistantTextTapper } from "./advisor.js";
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
 import { countImagesInParsedBody, countImagesInRawBody, imageTokensInRawBody, imageTokensInParsedBody, resolveImageBilling, upstreamHost, type ResolvedImageBilling } from "./image-tokens.js";
 import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, decodeApigCredential, inboundSignedScheme, resignApig, signedRefusal } from "./apig-resign.js";
@@ -1319,6 +1320,94 @@ export function resolveKnownOutputCeiling(
 // proxy still disappears promptly.
 const WATCHER_IDLE_GRACE_MS = 5_000;
 
+// #2048 display-only advisor (src/advisor.ts): a read-only second branch of a
+// finished response for the interpreter render. The client-bound bytes are
+// untouched (tee); the tap copy drains in parallel and never feeds back into
+// the wire, session state, or accounting. Returns pass-through when unarmed.
+function advisorSplit(
+    opts: ProxyOptions,
+    prepared: Prepared | null,
+    stream: ReadableStream<Uint8Array>,
+): { body: ReadableStream<Uint8Array>; sse: AssistantTextTapper | null; json: Promise<Buffer> | null } {
+    if (!prepared?.session || prepared.sidePassthrough || opts.advisor?.enabled !== true) return { body: stream, sse: null, json: null };
+    const [keep, copy] = stream.tee();
+    if (prepared.stream) {
+        const t = createAssistantTextTapper(prepared.protocol);
+        t.attach(copy);
+        return { body: keep, sse: t, json: null };
+    }
+    // Drain failures (upstream cut / client abort) must not become unhandled
+    // rejections — an empty buffer reads as "no renderable text" downstream.
+    const json = (async () => {
+        try {
+            const reader = copy.getReader();
+            const parts: Uint8Array[] = [];
+            let total = 0;
+            for (;;) {
+                const { value, done } = await reader.read();
+                if (done) break;
+                if (value) { parts.push(value); total += value.length; }
+            }
+            return total > 0 ? Buffer.concat(parts.map((p) => Buffer.from(p))) : Buffer.alloc(0);
+        } catch {
+            return Buffer.alloc(0);
+        }
+    })();
+    return { body: keep, sse: null, json };
+}
+
+function fireAdvisorFor(
+    opts: ProxyOptions,
+    prepared: Prepared,
+    assistantText: string,
+    upstreamUrl: string,
+    headers: Record<string, string>,
+    proxyUrl: string | undefined,
+    log: (level: string, msg: string) => void,
+): void {
+    const settings = opts.advisor;
+    if (!settings || !prepared.session) return;
+    void fireAdvisor({
+        sessionId: prepared.session.id,
+        protocol: prepared.protocol,
+        assistantText,
+        lastUserText: lastUserText(prepared.originalMessages),
+        settings,
+        routes: opts.routes,
+        mainUpstreamUrl: upstreamUrl,
+        mainHeaders: headers,
+        proxyUrl,
+        log,
+    }).catch(() => {});
+}
+
+async function advisorFlush(
+    split: ReturnType<typeof advisorSplit>,
+    opts: ProxyOptions,
+    prepared: Prepared,
+    upstreamUrl: string,
+    headers: Record<string, string>,
+    proxyUrl: string | undefined,
+    log: (level: string, msg: string) => void,
+): Promise<void> {
+    try {
+        let text: string;
+        if (split.sse) {
+            await split.sse.settle();
+            text = split.sse.text();
+        } else if (split.json) {
+            const buf = await split.json;
+            if (buf.length === 0) return;
+            text = extractAssistantTextFromJson(prepared.protocol, JSON.parse(buf.toString("utf8")));
+        } else {
+            return;
+        }
+        fireAdvisorFor(opts, prepared, text, upstreamUrl, headers, proxyUrl, log);
+    } catch {
+        // fail-open (#2048 invariant 3): the display sidecar never affects the main path
+    }
+}
+
 async function handle(
     req: http.IncomingMessage,
     res: http.ServerResponse,
@@ -1375,6 +1464,19 @@ async function handle(
     if (req.method === "GET" && req.url === "/__bili/status") return sendStatus(res, opts);
     if (req.method === "GET" && req.url === "/__bili/overview") return sendOverview(res, opts);
     if (req.method === "GET" && req.url === "/__bili/sessions") return sendWebSessions(res);
+    // #2048 display-only advisor results for the TUI extension poll (loopback-
+    // gated by isAdminPath above). Display data only — never model context.
+    if (req.method === "GET" && req.url?.startsWith("/__bili/advisor")) {
+        const sid = new URL(req.url, "http://localhost").searchParams.get("session");
+        if (!sid) {
+            res.writeHead(400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: "missing ?session= parameter" }));
+            return;
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify(advisorEntryFor(sid)));
+        return;
+    }
     if (req.method === "GET" && req.url?.startsWith("/__bili/logs")) return sendWebLogs(res, req);
     if (req.method === "GET" && req.url?.startsWith("/__bili/sessions/") && req.url.endsWith("/detail")) return sendWebSessionDetail(res, req.url);
     if (req.method === "GET" && req.url === "/") {
@@ -6311,6 +6413,11 @@ async function forward(
         prepared.session.stats.contextTokens = estimate;
         prepared.session.stats.contextTokensSource = "estimate";
         noteForwardedBody(prepared.session, sentBody);
+        // #2048: bili is a transparent proxy — credentials ride the client's
+        // headers. Capture the auth trio per upstream base so a separately
+        // routed advisor call can reuse what we have ALREADY seen (#2048 v1
+        // narrowing; the providers table carries no credential fields).
+        if (opts.advisor?.enabled === true) recordUpstreamAuth(upstreamUrl, headers);
     }
     let upstreamResult: Awaited<ReturnType<typeof fetchWithTimeout>>;
     try {
@@ -6791,6 +6898,9 @@ async function forward(
                 });
                 pluginBody = bufferToStream(resolvedBuf);
             }
+            // #2048 display-only advisor tap (read-only tee; client bytes untouched).
+            const advTap = advisorSplit(opts, prepared, pluginBody);
+            pluginBody = advTap.body;
             if (prepared.stream) {
                 if (prepared.protocol === "responses") {
                     // #732/#821 applies to this pipe too (#871): the agent's own
@@ -6842,6 +6952,9 @@ async function forward(
             } else {
                 await pipePluginJson(pluginBody, res, prepared.session, prepared.protocol, targetOrigin);
             }
+            // Strictly post-response (#2048 invariant 3): the reply is fully
+            // delivered to the client before the sidecar render may start.
+            if ((advTap.sse || advTap.json) && !res.destroyed) void advisorFlush(advTap, opts, prepared, upstreamUrl, headers, proxyUrl, log);
         } finally {
             clearUpstreamTimer();
         }
@@ -6962,9 +7075,11 @@ async function forward(
             // the main conversation (see pipePluginChatWithStrip docs).
             const p = prepared;
             const tagLog = (msg: string) => log("info", `[${p.session.id}] ${msg}`);
+            // #2048 display-only advisor tap (read-only tee; client bytes untouched).
+            const advTap = advisorSplit(opts, p, responseBody);
             if (p.protocol === "responses") {
                 await pipePluginResponsesWithStrip(
-                    responseBody,
+                    advTap.body,
                     res,
                     undefined,
                     tagLog,
@@ -6982,7 +7097,7 @@ async function forward(
                 );
             } else {
                 await pipePluginChatWithStrip(
-                    responseBody,
+                    advTap.body,
                     res,
                     p.protocol,
                     undefined,
@@ -7000,6 +7115,8 @@ async function forward(
                     }),
                 );
             }
+            // Strictly post-response (#2048 invariant 3).
+            if ((advTap.sse || advTap.json) && !res.destroyed) void advisorFlush(advTap, opts, p, upstreamUrl, headers, proxyUrl, log);
         } else if (
             prepared &&
             (upstream.headers.get("content-type") ?? "").includes("application/json")
@@ -7009,7 +7126,10 @@ async function forward(
             // so a non-injected JSON response must not hand the model's echoes
             // back untouched. Same pipe as plugin mode; no session, so usage
             // accounting stays off for the same reason as above.
-            await pipePluginJson(responseBody, res, undefined, prepared.protocol);
+            const advTap = advisorSplit(opts, prepared, responseBody);
+            await pipePluginJson(advTap.body, res, undefined, prepared.protocol);
+            // Strictly post-response (#2048 invariant 3).
+            if ((advTap.sse || advTap.json) && !res.destroyed) void advisorFlush(advTap, opts, prepared, upstreamUrl, headers, proxyUrl, log);
         } else {
             await pipeThrough(responseBody, res);
         }
@@ -7135,10 +7255,15 @@ async function forward(
                 clientAbort.signal,
             );
             let protocolFragmentWarned = false;
+            // #2048 display-only advisor tap (feed mode: accumulates exactly the
+            // bytes written to the client, post-rewrite).
+            let advisorTap: AssistantTextTapper | undefined;
+            if (opts.advisor?.enabled === true && !prepared.sidePassthrough) advisorTap = createAssistantTextTapper(prepared.protocol);
             for await (const chunk of loop) {
                 if (res.destroyed || res.writableEnded) break;
                 {
                     const s = chunk.toString("utf8");
+                    advisorTap?.feed(s);
                     if (s.includes("\x3cacp ") || s.includes("\x3c/acp")) {
                         log("warn", `[${prepared.session.id}] tag echo: ${prepared.protocol} response stream contains \x3cacp tag`);
                     } else if (!protocolFragmentWarned && containsToolCallXmlFragment(s)) {
@@ -7153,6 +7278,18 @@ async function forward(
                 if (res.destroyed || res.writableEnded) break;
             }
             res.end();
+            // #2048: strictly post-response; a client disconnect (res.destroyed)
+            // or an upstream error (the catch below) cancels the sidecar render.
+            if (advisorTap) {
+                advisorTap.end();
+                if (!res.destroyed) {
+                    const tap = advisorTap;
+                    void (async () => {
+                        await tap.settle();
+                        fireAdvisorFor(opts, prepared, tap.text(), upstreamUrl, headers, proxyUrl, log);
+                    })();
+                }
+            }
         } catch (e) {
             emitStreamError(res, prepared.protocol, (e as Error)?.message ?? String(e), (m) => log("error", `[${prepared.session.id}] ${m}`), opts.streamErrorShape);
         } finally {
@@ -7233,6 +7370,9 @@ async function forward(
                     await withSessionLock(prepared.session, () => rewriteJsonResponse(json, ctx));
                 }
                 res.end(JSON.stringify(json));
+                // #2048: strictly post-response; the body is already fully
+                // buffered here, so the tap reads the client-visible json.
+                if (!res.destroyed) fireAdvisorFor(opts, prepared, extractAssistantTextFromJson(prepared.protocol, json), upstreamUrl, headers, proxyUrl, log);
             } catch {
                 res.end(text);
             }

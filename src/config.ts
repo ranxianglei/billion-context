@@ -776,7 +776,33 @@ export type ProxyOptions = {
      *  session. Default OFF; enable with env BILI_STABLE_SYSTEM_ANCHOR=1 or
      *  `stableSystemAnchor: true` in the config file (env wins). */
     stableSystemAnchor?: boolean;
+    /** #2048 display-only advisor (interpreter model renders assistant replies
+     *  into plain language as a sidecar view). Absent when disabled/unset —
+     *  default OFF, explicit opt-in only. Parsed by parseAdvisorSettings. */
+    advisor?: AdvisorSettings;
 };
+
+/** #2048 display-only advisor settings — a second, cheap interpreter model
+ *  used PURELY for rendering assistant replies into plain conversational
+ *  language. Never touches persisted/executed bytes, wire traffic, prefix
+ *  cache, or compression state (src/advisor.ts invariants). */
+export interface AdvisorSettings {
+    enabled: true;
+    /** providers-table key (upstream URL prefix) naming the upstream that
+     *  carries the interpreter model. Absent = the session's own upstream
+     *  with only the model id swapped. A separate route can only be called
+     *  with credentials bili has already seen in-process for that base URL
+     *  (transparent-proxy design — the providers table carries no credential
+     *  fields); otherwise the render fails open (no panel). */
+    route?: string;
+    /** Interpreter model id (required when enabled). */
+    model: string;
+    /** "auto" = CJK heuristic over the last user message (zh-CN / en); any
+     *  other value is passed through as a BCP-47 tag to the translator. */
+    locale: string;
+    /** Skip replies shorter than this many chars (default 80). */
+    minChars: number;
+}
 
 /** The routing fields a provider entry can carry — exactly what
  *  {@link parseRouteEntry} consumes per route. When they sit on a non-URL key
@@ -1171,7 +1197,54 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         chainContentDetection: (env.BILI_CHAIN_CONTENT ?? (fileConfig.chainContentDetection === true ? "1" : "0")) !== "0",
         chainEgressStamp: (env.BILI_CHAIN_STAMP ?? (fileConfig.chainEgressStamp === true ? "1" : "0")) !== "0",
         stableSystemAnchor: (env.BILI_STABLE_SYSTEM_ANCHOR ?? (fileConfig.stableSystemAnchor === true ? "1" : "0")) !== "0",
+        // #2048: file-only section (no env override) — model routing +
+        // thresholds are per-deployment, exactly what env vars can't express.
+        advisor: parseAdvisorSettings(fileConfig.advisor),
     };
+}
+
+const ADVISOR_KNOWN_FIELDS = new Set(["enabled", "route", "model", "locale", "minChars"]);
+
+/** Parse the top-level `advisor` section (#2048). Returns undefined when the
+ *  section is absent or not enabled (default OFF); throws loud on malformed
+ *  input (never silently clobber user config, §7.3). */
+export function parseAdvisorSettings(value: unknown): AdvisorSettings | undefined {
+    if (value === undefined || value === null) return undefined;
+    if (typeof value !== "object" || Array.isArray(value)) {
+        throw new Error("[acp-config] advisor must be an object");
+    }
+    const obj = value as Record<string, unknown>;
+    const unknown = Object.keys(obj).filter((k) => !ADVISOR_KNOWN_FIELDS.has(k));
+    if (unknown.length > 0) {
+        loggerLog("warn", `[acp-config] advisor: unknown field(s) ignored: ${unknown.join(", ")}`);
+    }
+    if (obj.enabled !== true) return undefined;
+    const model = typeof obj.model === "string" ? obj.model.trim() : "";
+    if (model.length === 0) {
+        throw new Error("[acp-config] advisor.enabled requires advisor.model (the interpreter model id)");
+    }
+    let route: string | undefined;
+    if (obj.route !== undefined) {
+        if (typeof obj.route !== "string" || obj.route.trim().length === 0) {
+            throw new Error("[acp-config] advisor.route must be a non-empty string (a providers-table key / upstream URL prefix)");
+        }
+        route = obj.route.trim();
+    }
+    let locale = "auto";
+    if (obj.locale !== undefined) {
+        if (typeof obj.locale !== "string" || obj.locale.trim().length === 0) {
+            throw new Error("[acp-config] advisor.locale must be a non-empty string (\"auto\" or a BCP-47 tag)");
+        }
+        locale = obj.locale.trim();
+    }
+    let minChars = 80;
+    if (obj.minChars !== undefined) {
+        if (typeof obj.minChars !== "number" || !Number.isInteger(obj.minChars) || obj.minChars < 0) {
+            throw new Error("[acp-config] advisor.minChars must be a non-negative integer");
+        }
+        minChars = obj.minChars;
+    }
+    return { enabled: true, ...(route ? { route } : {}), model, locale, minChars };
 }
 
 /** The resolved mitm.domains tier exactly as loadOptions computes it (config
@@ -1409,6 +1482,9 @@ type FileConfig = {
     ccrRetrievalTtlMs?: number;
     /** Large-decompress temp-file cap (#2030) — was BILI_DECOMPRESS_TMP_CAP (default 50). */
     decompressTmpCap?: number;
+    /** #2048 display-only advisor (top-level `advisor` section). See
+     *  AdvisorSettings / parseAdvisorSettings. */
+    advisor?: unknown;
 };
 
 function nonEmpty(value: string | undefined): string | undefined {
@@ -1453,6 +1529,8 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
     // #2030 subsystem blocks:
     "network", "persist", "sessions", "update", "diagnostics",
     "fakeCompletion", "codexCompact", "ccrRetrievalTtlMs", "decompressTmpCap",
+    // #2048 display-only sidecar section:
+    "advisor",
 ]);
 
 // Every field parseCompressSettings accepts — hint source for misplaced keys:

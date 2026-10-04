@@ -10,7 +10,7 @@ import path from "node:path";
 import { wrapCacheReport, wrapRuleReport } from "../acp-panel.js";
 import { awaitNativeProxyOrigin } from "./native-bootstrap.js";
 import { isModelApiUrl, nativeInterceptInstalled } from "./native-intercept.js";
-import { detectProxyBase, destinationRoutedThroughProxy, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, nonHttpProvidersFromEnv, type ManifestTool } from "./shared.js";
+import { detectProxyBase, destinationRoutedThroughProxy, fetchAdvisor, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, nonHttpProvidersFromEnv, type ManifestTool } from "./shared.js";
 
 type Ctx = {
     sessionManager?: { getSessionId?: () => string; getHeader?: () => unknown; getBranch?: () => unknown } | undefined;
@@ -21,6 +21,13 @@ type Ctx = {
     // v0.99.1 packages/coding-agent/src/core/model-registry.ts).
     modelRegistry?: { find?: (provider: string, modelId: string) => { baseUrl?: unknown } | undefined } | undefined;
     cwd?: string;
+    // #2048 display-only advisor widget seam. Verified against pi-stable's
+    // dist/core/extensions/types.d.ts (ui.setWidget / hasUI / mode) and omp's
+    // bundled dist (turn_end + setWidget("autoresearch") in use); optional
+    // because older hosts lack them — the turn handlers guard and skip.
+    ui?: { setWidget?: (key: string, content: string[] | undefined, options?: { placement?: string }) => void } | undefined;
+    hasUI?: boolean;
+    mode?: string;
 };
 
 type TextBlock = { type: "text"; text: string };
@@ -41,7 +48,8 @@ type ToolDefinition = {
 type CommandCtx = {
     sessionManager?: { getSessionId?: () => string } | undefined;
     model?: { contextWindow?: number; baseUrl?: string } | undefined;
-    ui?: { notify?: (message: string, type?: string) => void } | undefined;
+    // ui is a superset of Ctx["ui"] so a CommandCtx stays Ctx-assignable (#2048).
+    ui?: { notify?: (message: string, type?: string) => void; setWidget?: (key: string, content: string[] | undefined, options?: { placement?: string }) => void } | undefined;
 };
 
 type ExtensionAPI = {
@@ -536,6 +544,44 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                     return { cancel: true };
                 });
             }
+            // #2048 display-only advisor: after each turn, poll the loopback
+            // proxy for the interpreter render of the reply that just streamed
+            // out and show it as a widget above the editor. Purely cosmetic:
+            // never persisted, never sent to any model, cleared at the next
+            // turn start, and every failure path silently no-ops (fail-open).
+            const ADVISOR_WIDGET_KEY = "bili-advisor";
+            const renderedSeq = new Map<string, number>();
+            const advisorUiOk = (ctx: Ctx | undefined): boolean =>
+                ctx !== undefined && ctx.hasUI === true && ctx.mode === "tui" && typeof ctx.ui?.setWidget === "function";
+            pi.on("turn_start", (_event, ctx) => {
+                if (!advisorUiOk(ctx)) return;
+                ctx.ui?.setWidget?.(ADVISOR_WIDGET_KEY, undefined);
+            });
+            pi.on("turn_end", (_event, ctx) => {
+                if (!advisorUiOk(ctx)) return;
+                const sid = sessionIdOf(ctx);
+                const base = proxyBaseForCtx(ctx);
+                if (sid === undefined || base === undefined) return;
+                const seen = renderedSeq.get(sid) ?? 0;
+                void (async () => {
+                    for (let i = 0; i < 20; i++) {
+                        const entry = await fetchAdvisor(base, sid);
+                        if (entry === undefined || entry.status === "none") return;
+                        if (entry.status === "ready") {
+                            if (entry.seq > seen && entry.lines.length > 0) {
+                                renderedSeq.set(sid, entry.seq);
+                                if (renderedSeq.size > 64) {
+                                    const first = renderedSeq.keys().next().value;
+                                    if (first !== undefined) renderedSeq.delete(first);
+                                }
+                                ctx.ui?.setWidget?.(ADVISOR_WIDGET_KEY, entry.lines);
+                            }
+                            return;
+                        }
+                        await new Promise((r) => setTimeout(r, 1000));
+                    }
+                })();
+            });
         }
         // #535 omp-only: omp resolves modelRoles.default into options.model
         // from the PRE-extension static catalog (main.ts: "scope is resolved
