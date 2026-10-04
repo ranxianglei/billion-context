@@ -2,7 +2,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { Config, CoreMessage } from "acp-kernel";
 import { createCore, createInitialState, assignRefs, emptyRefMap, defaultConfig } from "acp-kernel";
-import type { Session } from "../src/session.ts";
+import { _resetSessionsForTest, getSession, type Session } from "../src/session.ts";
+import { handlePluginStatus, rememberPluginMessages } from "../src/plugin.ts";
+import type { ServerResponse } from "node:http";
 import { handleAcpStatus } from "../src/acp-status.ts";
 import { applyRanges } from "../src/stream.ts";
 import { parseCompressInput, buildCompressSystemPrompt } from "../src/compress-tool.ts";
@@ -188,3 +190,81 @@ test("acp_status renders the ACTIVE SURFACE line from the session's pack stamp",
     assert.ok(line, "ACTIVE SURFACE line present once stamped");
     assert.ok(line!.startsWith("ACTIVE SURFACE: pack=lean | host=billion-context "), `host identity rendered (got: ${line})`);
 });
+
+const statusBaselines: Array<{
+    name: string;
+    source?: Session["stats"]["lastInputTokensSource"];
+    anchor?: number;
+    current?: number;
+    expected: number;
+}> = [
+    { name: "failure estimate with real anchor", source: "estimate", anchor: 60000, expected: 60000 },
+    { name: "legacy baseline with real anchor", anchor: 60000, expected: 60000 },
+    { name: "estimate without real anchor", source: "estimate", expected: 0 },
+    { name: "legacy baseline without real anchor", expected: 0 },
+    { name: "actual over-window usage", source: "usage", anchor: 60000, expected: 174000 },
+    { name: "credit-adjusted measured baseline", source: "usage", anchor: 60000, current: 30000, expected: 30000 },
+    { name: "bounded overflow rescue arm", source: "overflow-arm", anchor: 60000, current: 150000, expected: 150000 },
+];
+
+for (const { name, source, anchor, current = 174000, expected } of statusBaselines) {
+    test(`#2029: acp_status uses provenance for ${name}`, () => {
+        const ctx = makeCtx12();
+        ctx.config = defaultConfig(150000);
+        ctx.session.stats.lastInputTokens = current;
+        ctx.session.stats.lastInputTokensSource = source;
+        ctx.session.stats.lastUsageGradeTokens = anchor;
+        const before = JSON.stringify({ stats: ctx.session.stats, state: ctx.session.state });
+        const original = ctx.core;
+        const observed: number[] = [];
+        ctx.core = { ...original, processTurn(input) {
+            observed.push(input.tokenCount ?? 0);
+            return original.processTurn(input);
+        } };
+        const report = handleAcpStatus({}, ctx);
+        assert.deepEqual(observed, [expected]);
+        assert.ok(report.includes("Nudge:"));
+        if (expected === 60000 || expected === 0) assert.ok(!report.includes("usage 116%"), report);
+        assert.equal(JSON.stringify({ stats: ctx.session.stats, state: ctx.session.state }), before);
+    });
+
+    test(`#2029: plugin status nudge and panel use provenance for ${name}`, () => {
+        _resetSessionsForTest();
+        try {
+            const ctx = makeCtx12();
+            const session = getSession("status-provenance");
+            session.state = ctx.session.state;
+            session.metadata.effectiveContextLimit = 150000;
+            session.stats.lastInputTokens = current;
+            session.stats.lastInputTokensSource = source;
+            session.stats.lastUsageGradeTokens = anchor;
+            rememberPluginMessages(session.id, ctx.messages, ctx.messages);
+            const before = JSON.stringify({ stats: session.stats, state: session.state });
+            const observed: number[] = [];
+            const core = { ...ctx.core, processTurn(input: Parameters<typeof ctx.core.processTurn>[0]) {
+                observed.push(input.tokenCount ?? 0);
+                return ctx.core.processTurn(input);
+            } };
+            let status = 0;
+            let body = "";
+            const res = {
+                writeHead(code: number) { status = code; return res; },
+                end(chunk: string) { body = chunk; return res; },
+            };
+            handlePluginStatus(session.id, res as unknown as ServerResponse, {
+                core, config: defaultConfig(150000), log: () => {},
+            });
+            assert.equal(status, 200);
+            const result = JSON.parse(body) as { ok: boolean; panel?: string; contextTokens: number };
+            assert.equal(result.ok, true);
+            assert.equal(result.contextTokens, expected);
+            assert.deepEqual(observed, [expected]);
+            assert.ok(result.panel, "live panel is present");
+            if (expected > 0) assert.ok(result.panel.includes(`${Math.round(expected / 1000)}k`), result.panel);
+            if (expected !== 174000) assert.ok(!result.panel.includes("174k"), result.panel);
+            assert.equal(JSON.stringify({ stats: session.stats, state: session.state }), before);
+        } finally {
+            _resetSessionsForTest();
+        }
+    });
+}

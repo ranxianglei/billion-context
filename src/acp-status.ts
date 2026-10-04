@@ -24,12 +24,21 @@ export interface AcpStatusCtx {
     session: Session;
 }
 
+// Failure estimates are rescue arms, not measured context. Zero is unknown.
+export function statusInputBaseline(session: Session): number {
+    const stats = session.stats;
+    return stats.lastInputTokensSource === "usage" || stats.lastInputTokensSource === "overflow-arm"
+        ? stats.lastInputTokens
+        : stats.lastUsageGradeTokens ?? 0;
+}
+
 // The ranges/nudge section is recomputed from live session state on every
 // call instead of reading the prepare-time nudge snapshot: a successful
 // compress mutates state mid-turn without re-running prepare, so the snapshot
 // goes stale and lists already-compressed refs as compressible (#389).
 // processTurn is pure (nodes return new objects), so the returned state is
     // intentionally NOT adopted — this is a read-only recompute.
+
 function fmtBytes(n: number): string {
     if (n < 1024) return `${n}B`;
     if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)}KiB`;
@@ -60,7 +69,7 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
             messages: ctx.messages,
             state: ctx.session.state,
             config: ccrLoopConfig(ctx.session, ctx.config),
-            tokenCount: ctx.session.stats.lastInputTokens,
+            tokenCount: statusInputBaseline(ctx.session),
             renderTags: "none",
             contentStore: contentStoreOf(ctx.session),
         });

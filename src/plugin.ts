@@ -18,6 +18,7 @@ import { imageUsageSuffix } from "./image-compress.js";
 import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
 import { degenerateTurnWarning } from "./degenerate-turn.js";
 import { PANEL_BOX_FOOTER } from "./acp-panel.js";
+import { statusInputBaseline } from "./acp-status.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
 import { describeUpdateReady, getUpdateVisibility } from "./update-notes.js";
 import { warnCacheCollapse } from "./cache-warn.js";
@@ -797,6 +798,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         return;
     }
     if (entry) entry.lastSeen = Date.now();
+    const tokenCount = statusInputBaseline(session);
     const limit = session.metadata.effectiveContextLimit;
     const mem = remembered.get(session.id);
     const modelContextLimit = typeof limit === "number" && limit > 0 ? limit : 0;
@@ -819,7 +821,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
                 messages,
                 state: session.state,
                 config: ccrLoopConfig(session, pluginCfg),
-                tokenCount: session.stats.lastInputTokens,
+                tokenCount,
                 renderTags: "none",
                 contentStore: contentStoreOf(session),
             }).nudge;
@@ -840,7 +842,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         const systemPromptTokens = typeof sysTokRaw === "number" && Number.isFinite(sysTokRaw) && sysTokRaw > 0 ? sysTokRaw : 0;
         panel = buildStatusPanel({
             version: `billion-context@${PROXY_VERSION} · pack: ${session.meta.activePack ?? "default"}`,
-            tokenCount: session.stats.lastInputTokens,
+            tokenCount,
             systemPromptTokens,
             state: session.state,
             nudge,
@@ -896,7 +898,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
             ?? pluginRuntimeInfoForConversation(conversationIdForSession(session.id), typeof session.metadata.lastModel === "string" ? session.metadata.lastModel : undefined)
             ?? null,
         contextLimit: typeof limit === "number" ? limit : null,
-        contextTokens: session.stats.lastInputTokens,
+        contextTokens: tokenCount,
         inputTokens: session.stats.inputTokens,
         outputTokens: session.stats.outputTokens,
         cachedTokens: session.stats.cachedTokens,
