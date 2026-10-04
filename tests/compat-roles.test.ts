@@ -10,7 +10,7 @@ import { startServer } from "../src/server.ts";
 import { loadRoutes, type ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSystemPlacementError, parseCompatRoles, resolveCompatRoles } from "../src/compat-roles.ts";
+import { applyCompatRoles, applyCompatRolesJson, detectRoleRejection, detectSystemPlacementError, hasOffHeadSystem, parseCompatRoles, resolveCompatRoles } from "../src/compat-roles.ts";
 import { _liveUpstreamTimersForTest } from "../src/fetch-util.ts";
 import { rmrf } from "./tmp-rm.ts";
 
@@ -516,3 +516,43 @@ async function waitFor(probe: () => boolean, deadlineMs = 3000): Promise<void> {
         await new Promise((resolve) => setTimeout(resolve, 25));
     }
 }
+
+test("#1996: production vLLM+Qwen chat_template 400 names no role — #552 detector idle, placement detector fires", () => {
+    const prod = JSON.stringify({
+        error: {
+            code: "invalid_prompt",
+            message:
+                "artifact:chat_template.jinja: 106\n          {% endif %}\n        {{- raise_exception('System message must be at the beginning.') }}\nJinja Exception: System message must be at the beginning.",
+            param: "input",
+            type: "invalid_request_error",
+        },
+    });
+    assert.equal(detectRoleRejection(400, prod), null, "placement-only errors name no role — #552 detector must NOT fire");
+    assert.equal(detectSystemPlacementError(400, prod), true, "placement detector recognizes the production string");
+});
+
+test("hasOffHeadSystem: openai chat wire shapes", () => {
+    const p = (msgs: unknown[]) => JSON.stringify({ messages: msgs });
+    assert.equal(hasOffHeadSystem(p([{ role: "system", content: "s" }, { role: "user", content: "u" }]), "openai"), false, "single system at index 0 is legal");
+    assert.equal(hasOffHeadSystem(p([{ role: "user", content: "u" }, { role: "system", content: "s" }]), "openai"), true, "off-head system");
+    assert.equal(hasOffHeadSystem(p([{ role: "system", content: "s" }, { role: "user", content: "u" }, { role: "system", content: "s2" }]), "openai"), true, "duplicate system anywhere");
+    assert.equal(hasOffHeadSystem(p([{ role: "user", content: "u" }, { role: "assistant", content: "a" }]), "openai"), false, "no system at all");
+    assert.equal(hasOffHeadSystem(p([{ role: "developer", content: "d" }, { role: "user", content: "u" }]), "openai"), false, "off-head developer is not a system offender");
+});
+
+test("hasOffHeadSystem: responses wire shapes (#1996 offender = type-less mid-history system)", () => {
+    const p = (input: unknown[], extra: Record<string, unknown> = {}) => JSON.stringify({ input, ...extra });
+    assert.equal(
+        hasOffHeadSystem(p([{ role: "developer", content: "d" }, { role: "user", content: "u" }, { role: "system", content: "mid" }]), "responses"),
+        true, "type-less mid-history system (omp wire form)",
+    );
+    assert.equal(hasOffHeadSystem(p([{ role: "system", content: "s" }, { role: "user", content: "u" }]), "responses"), false, "single system at index 0");
+    assert.equal(hasOffHeadSystem(p([{ role: "user", content: "u" }], { instructions: "be nice" }), "responses"), false, "instructions alone creates no offender");
+    assert.equal(hasOffHeadSystem(p([{ role: "system", content: "s" }], { instructions: "be nice" }), "responses"), true, "instructions become a leading system upstream → input[0] system is off-head");
+    assert.equal(
+        hasOffHeadSystem(p([{ type: "function_call", name: "f", call_id: "c1", arguments: "{}" }, { role: "system", content: "s" }]), "responses"),
+        true, "system after a chat-producing tool item is off-head upstream",
+    );
+    assert.equal(hasOffHeadSystem(p([{ role: "developer", content: "d" }, { role: "user", content: "u" }]), "responses"), false, "off-head developer stays clean");
+    assert.equal(hasOffHeadSystem("{not json", "responses"), false, "unparseable body → no claim");
+});

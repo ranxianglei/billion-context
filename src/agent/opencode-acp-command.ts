@@ -9,7 +9,7 @@
 // module load and serves it verbatim.
 
 import { wrapCacheReport } from "../acp-panel.js";
-import { armedIdleNotice, fetchProxyVersion, forwardTool, noSessionWarning } from "./shared.js";
+import { armedIdleNotice, fetchProxyVersion, fetchStaleNotice, forwardTool, noSessionWarning } from "./shared.js";
 
 export interface OpencodeCommandConfig {
     template: string;
@@ -130,6 +130,8 @@ export function createAcpCommandHooks(getProxyBase: () => string | undefined, ct
                 } catch (err) {
                     text = `bili: /acp failed (${err instanceof Error ? err.message : String(err)})`;
                 }
+                const staleNotice = await fetchStaleNotice(proxyBase).catch(() => undefined);
+                if (staleNotice !== undefined) text += `\n\n${staleNotice}`;
             }
             await showAcpText(ctx, sid, text);
             throw new Error("__BILI_ACP_HANDLED__");
