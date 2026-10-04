@@ -205,7 +205,7 @@ test("#1366/#362: shape drift ({ranges: …}) keeps the format lecture — re-is
     const ctx = makeCompressibleCtx();
     const out = runApply(ctx, { ranges: [{ startId: "m00001", endId: "m00002", summary: "s" }] });
     assert.ok(out.includes("kind=missing-content"), out);
-    assert.ok(out.includes("Re-issue the compress call with a valid content array"), "lecture retained: " + out);
+    assert.ok(out.includes("Re-issue ALL intended ranges in ONE compress call"), "lecture retained: " + out);
     assert.ok(!out.includes("carried no content at all"), "not mislabeled as empty: " + out);
 });
 
