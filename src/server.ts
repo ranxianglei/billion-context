@@ -130,7 +130,12 @@ import { applyOutputSteering, applyOutputSteeringJson } from "./output-steering.
 import { bodyDumpEnabled, getUnrecognizedPathStats, isModelDiscoveryPath, logDumpFailure, logUnrecognizedPath } from "./server/observability.js";
 import { BILI_HOP_HEADER, anthropicBetaContextWindow, capRegistryWindowByStandard, expandedContextSuffixWindow, LAUNCHER_MODEL_WINDOWS, LAUNCHER_MODEL_MAX_OUTPUTS, launcherContextWindow, launcherMaxOutput, parseLauncherModelWindows, windowSourceLogged } from "./server/context-window.js";
 import { buildForwardHeaders, connectionNamedHeaders, NO_IDENTITY_MESSAGE, RESPONSE_ONLY_STRIP_HEADERS, safeSessionId, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
-import { installWebSocketBridge } from "./ws-bridge.js";
+import { installWebSocketBridge, type WsBridgeStats } from "./ws-bridge.js";
+
+// #1926 observability: the WS bridge handle's stats accessor, published once
+// the server installs the bridge so `GET /__bili/stats` can report live WS
+// connections, idle age, and retained checkpoint bytes per connection.
+let wsBridgeStats: (() => WsBridgeStats) | undefined;
 import { codexResponsesCodec, responsesCodec } from "./responses-ws.js";
 import { currentFetchTransport } from "./fetch-transport.js";
 import { isSideRequest, outputBudgetField, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard, stripLeakedBiliTools } from "./server/side-request.js";
@@ -468,9 +473,11 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
     };
     const server = http.createServer(dispatch);
     // Generic WebSocket bridge: protocol codecs claim upgrades here (#1467
-    // phase-2 shell); the Responses codec is the first (and currently only)
-    // entry. Unclaimed upgrades still fall through to the 426 contract below.
+    // phase-2 shell); the Responses codecs (opencode plugin lane + codex
+    // prefix lane) are the current entries. Unclaimed upgrades still fall
+    // through to the 426 contract below.
     const wsUpgrade = installWebSocketBridge(server, dispatch, log, [responsesCodec, codexResponsesCodec]);
+    wsBridgeStats = wsUpgrade.stats;
     // Unclaimed upgrades retain the immediate HTTP fallback contract.
     // An explicit 'upgrade' listener is
     // required: without one Node's behavior is version-dependent (some
@@ -7302,7 +7309,7 @@ function sendStats(res: http.ServerResponse): void {
         };
     });
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ sessions, blindTunnels: getBlindTunnelStats(), unrecognizedPaths: getUnrecognizedPathStats(), conflicts: summarizeConflicts(all) }, null, 2));
+    res.end(JSON.stringify({ sessions, blindTunnels: getBlindTunnelStats(), unrecognizedPaths: getUnrecognizedPathStats(), conflicts: summarizeConflicts(all), wsBridge: wsBridgeStats?.() ?? { connections: [] } }, null, 2));
 }
 
 /** Stale-install state for the web UI badge (#811): whether the on-disk

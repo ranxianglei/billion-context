@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import http from "node:http";
+import type { AddressInfo } from "node:net";
 import { once } from "node:events";
 import test from "node:test";
 
@@ -10,7 +11,6 @@ process.env.BILI_REPLAY_RETRY_MAX = "1";
 import { defaultConfig, type Config } from "acp-kernel";
 import { startServer, type ProxyOptions } from "../src/server.ts";
 import { type CompressSettings } from "../src/config.ts";
-import type { AddressInfo } from "node:net";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { getSession } from "../src/session.ts";
