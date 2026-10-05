@@ -153,7 +153,8 @@ export type CompressSettings = {
      *  SGLang/vLLM enforce). A reply longer than the reservation overflows
      *  once; the overflow self-heal recovers it next turn (#896). Negative or
      *  unparseable values reject the whole compress block. Anthropic wire is
-     *  exempt (its input limit is enforced independently of max_tokens). */
+     *  exempt from this reservation: its output overflow is covered at forward
+     *  time by the outgoing max_tokens clamp (#453/#1908). */
     outputHeadroomMaxPct?: number | string;
     /** Context usage percentage that triggers forced compression nudges
      *  (bypasses growth-gate + cadence). Accepts a ratio (0.75) or percent
