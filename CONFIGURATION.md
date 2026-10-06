@@ -1112,6 +1112,18 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Status:** ACTIVE
 - **Description:** The **positive-facing** counterpart of `neverPreserveRecentTools`: tool-name patterns **removed** from the effective recent-zone exclusion list. The #1198/#1277 batch-read fold→re-read remedy becomes a one-entry config — `{ "compress": { "preserveRecentTools": ["read"] } }` — that protects fresh read results without restating (or freezing a stale hand-copy of) the built-in list, and keeps following built-in evolution. Effective exclusion = `(neverPreserveRecentTools ?? built-in) minus preserveRecentTools`; composable with an explicit `neverPreserveRecentTools` (subtraction applies to the explicit list too); glob-suffix patterns subtract matching entries (`"bash*"` removes `bash`). Prefer this knob over editing the never-list unless you genuinely need verbatim-replace semantics. **⚠ Empty array `[]` is rejected** — it is a pure no-op here, so a bare `[]` is almost certainly a typo for `neverPreserveRecentTools: []` (the max-protection escape hatch). Whole-array replace at the deepest defined level, like the sibling knobs.
 
+#### `burstHold`
+
+- **Type:** `object` (`{ enabled?, minToolResults?, lookbackMessages?, minToolShare? }`)
+- **Default:** `{ enabled: true, minToolResults: 5, lookbackMessages: 12, minToolShare: 0.55 }` — **on by default** (#1487)
+- **Status:** ACTIVE
+- **Description:** **Tool-burst nudge hold.** While the tail of the resent history is dominated by fresh tool results — the agent mid-batch of reads/greps/globs/bash calls — AND context usage is still below the hold ceiling, GROWTH-based compression nudges are held so the agent can finish its batch before its working content gets folded. This is the automated counterpart of the #1198/#1277 fold→re-read death loop (reported in dsh discussion #5795): instead of manually keeping fresh results out of the fold via recent-zone knobs, the nudge simply waits for the batch to end. The hold is stateless per request, applies on every wire in both compression modes, and touches only PROACTIVE growth nudges — the kernel's pressure-band force-nudge (usage ≥ `maxContextLimit`) and the host emergency nudge (usage ≥ 70%) always fire, so a context that runs out mid-burst still compresses immediately. Hold ceiling = `min(0.7, effective maxContextLimit)`. Sub-fields (merged deepest-wins per sub-field like `absorb`):
+  - `enabled: boolean` — default `true`; set `false` to restore the legacy always-nudge behavior.
+  - `minToolResults: number` — minimum tool-result count inside the window to count as a burst (default `5`). Positive integer.
+  - `lookbackMessages: number` — trailing-history window size inspected, in messages (default `12`). Positive integer.
+  - `minToolShare: number` — minimum share of the window that must be tool results, 0..1 (default `0.55`) — calibrated so steady assistant/tool alternation (~0.5) never trips while parallel batches (~0.8+) always trip.
+- **Example:** `{ "compress": { "burstHold": { "enabled": false } } }` disables the hold entirely; `{ "compress": { "burstHold": { "minToolShare": 0.7 } } }` makes it stricter.
+
 #### `prompts`
 - **Default:** *(kernel defaults — see `acp-kernel` `defaultPrompts`)*
 - **Status:** ACTIVE

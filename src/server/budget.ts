@@ -18,7 +18,7 @@ const OUTPUT_CLAMP_FLOOR = 1024;
 // nudge each turn once usage reaches this — kept under the default 0.75
 // over-limit line so it fills the pre-limit silent climb seen in #453/#14. Pure
 // host-side: renderNudgeText does not depend on shouldInject.
-const EMERGENCY_NUDGE_ESCALATION_PCT = 0.7;
+export const EMERGENCY_NUDGE_ESCALATION_PCT = 0.7;
 
 /** chars/4 measure of the per-request overhead that lives OUTSIDE the kernel's
  *  fold space: the outbound system prompt (client text plus bili-injected parts)
