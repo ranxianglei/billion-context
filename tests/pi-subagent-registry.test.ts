@@ -238,19 +238,29 @@ test("#2185: symlinked entry path is canonicalized to its realpath target", () =
     }
 });
 
+type PiHandler = (event: unknown, ctx: unknown) => unknown;
 type FakePi = {
-    events: Map<string, (event: unknown, ctx: unknown) => unknown>;
-    on(event: string, handler: (event: unknown, ctx: unknown) => unknown): void;
+    // Real pi stores an ARRAY of handlers per event name and awaits each in
+    // registration order (pi-coding-agent runner.js emit():
+    // `for (const handler of handlers)`), so a second registration for the
+    // same event (the embedded subagents wiring, #2186) must APPEND, not
+    // replace — a Map-of-one silently shadows the factory's own handler (#2234).
+    events: Map<string, PiHandler[]>;
+    on(event: string, handler: PiHandler): void;
     registerTool(tool: unknown): void;
     registerCommand(name: string, options: unknown): void;
     registerProvider(name: string, config: { baseUrl: string }): void;
 };
 
 function makeFakePi(): FakePi {
-    const events = new Map<string, (event: unknown, ctx: unknown) => unknown>();
+    const events = new Map<string, PiHandler[]>();
     return {
         events,
-        on: (event, handler) => { events.set(event, handler); },
+        on: (event, handler) => {
+            const list = events.get(event);
+            if (list) list.push(handler);
+            else events.set(event, [handler]);
+        },
         registerTool: () => {},
         registerCommand: () => {},
         registerProvider: () => {},
@@ -268,15 +278,15 @@ test("#2185: factory wiring — session_start self-registers, session_shutdown d
     try {
         const pi = makeFakePi();
         createBiliPlugin("pi")(pi as never);
-        const start = pi.events.get("session_start");
-        const shutdown = pi.events.get("session_shutdown");
-        assert.ok(start && shutdown, "both handlers must be registered");
-        await start!({ type: "session_start", reason: "startup" }, { sessionManager: { getSessionId: () => sid } });
+        const start = pi.events.get("session_start") ?? [];
+        const shutdown = pi.events.get("session_shutdown") ?? [];
+        assert.ok(start.length > 0 && shutdown.length > 0, "both handlers must be registered");
+        for (const handler of start) await handler({ type: "session_start", reason: "startup" }, { sessionManager: { getSessionId: () => sid } });
         assert.ok(registry()?.bySession.has(sid), "entry present after session_start");
         const snap = registry()!.bySession.get(sid) as readonly Readonly<{ id: string; path: string }>[];
         assert.equal(snap[0].id, SUBAGENT_EXTENSION_ID);
         assert.ok(fs.existsSync(snap[0].path), "registered path resolves to a real file");
-        await shutdown!({ type: "session_shutdown", reason: "quit" }, undefined);
+        for (const handler of shutdown) await handler({ type: "session_shutdown", reason: "quit" }, undefined);
         assert.ok(!registry()?.bySession.has(sid), "entry gone after session_shutdown");
     } finally {
         cleanup(sid);
@@ -293,13 +303,13 @@ test("#2185: factory wiring — kill switch respected at session_start; omp neve
         process.env.BILLION_CONTEXT_PLUGIN = "0";
         const pi = makeFakePi();
         createBiliPlugin("pi")(pi as never);
-        await pi.events.get("session_start")!({ type: "session_start", reason: "startup" }, { sessionManager: { getSessionId: () => sid } });
+        for (const handler of pi.events.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" }, { sessionManager: { getSessionId: () => sid } });
         assert.ok(!registry()?.bySession.has(sid), "kill switch: no registration");
 
         delete process.env.BILLION_CONTEXT_PLUGIN;
         const ompPi = makeFakePi();
         createBiliPlugin("omp")(ompPi as never);
-        await ompPi.events.get("session_start")!({ type: "session_start", reason: "startup" }, { sessionManager: { getSessionId: () => sid } });
+        for (const handler of ompPi.events.get("session_start") ?? []) await handler({ type: "session_start", reason: "startup" }, { sessionManager: { getSessionId: () => sid } });
         assert.ok(!registry()?.bySession.has(sid), "omp lane must not touch the pi-subagents registry");
     } finally {
         cleanup(sid);
