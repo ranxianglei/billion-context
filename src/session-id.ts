@@ -165,6 +165,18 @@ export function dshPersonaFingerprintApplies(headers: Record<string, string | st
     return typeof agent === "string" && agent.trim() === "dsh";
 }
 
+/** #2241: whether a session bound to this plugin agent may carry a
+ *  proxy-invented `|sub:<fp>` persona fork (today: dsh only — the same
+ *  evidence-per-client allowlist as dshPersonaFingerprintApplies; future
+ *  lanes are added there WITH traffic evidence and mirrored here). Tool
+ *  routing must treat a host-stamped bare id as covering its forked children
+ *  ONLY for these lanes: other hosts reuse the `|sub:` key shape for
+ *  unrelated splits (Claude Code subagents, #970) where a bare-id tool call
+ *  must keep #2024 semantics untouched. */
+export function personaForkLaneApplies(agent: unknown): boolean {
+    return typeof agent === "string" && agent.trim() === "dsh";
+}
+
 /** Persona text for the openai chat wire: the concatenation of every
  *  system-role message's text (string content or text parts). Empty string
  *  when the request carries no system message — subagentNamespace treats
