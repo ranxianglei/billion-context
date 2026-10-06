@@ -99,7 +99,7 @@ import { ABSORB_INSTRUCTION_MARKER, containsToolCallXmlFragment } from "./loop/t
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoReasoning, normalizeStrictEchoResponsesInput } from "./strict-echo.js";
 export { isStrictReasoningEcho, normalizeStrictEchoReasoning, normalizeStrictEchoResponsesInput };
 import { isFakeCompletion, injectFakeCompletionHint, maxFakeCompletionRetries, fakeBufCap } from "./fake-completion.js";
-import { makeContinuationRefetch } from "./degenerate-retry.js";
+import { makeContinuationRefetch, degenerateRetrySummary } from "./degenerate-retry.js";
 import { reasoningGuardEngages, runReasoningGuard } from "./reasoning-guard.js";
 import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeResponsesMessageItems } from "./loop/adapter-responses.js";
 import { CODEX_COMPACT_HEALTH_RATIO, codexCompactMode, isCodexClient, hasCompactionTrigger, stripBiliCompactionItems, replaceBiliCompactionItems, codexCompactGate, codexCompactGatePre, buildTriggerForgeBody, mergeForgedSummaries } from "./codex-compact.js";
@@ -7905,7 +7905,7 @@ async function sendStatus(res: http.ServerResponse, opts: ProxyOptions): Promise
             loggerLog("warn", `split-session canary (#2170): conversation ${w.base} has live traffic under multiple session keys (design persona forks are excluded): ${w.sessions.map((s) => `${s.id} (requests=${s.requests})`).join("; ")}. For a non-persona host this is the #2165 failure shape (stolen anchor / never-compressing split) — investigate if unexpected.`);
         }
     }
-    res.end(JSON.stringify({ version: VERSION, diskVersion, stale, autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()) }, null, 2));
+    res.end(JSON.stringify({ version: VERSION, diskVersion, stale, autoRestartOnUpdate: opts.autoRestartOnUpdate, advisory: currentAdvisoryPayload(), inFlight: totalInFlight(), splitSessions: splitWarnings, conflicts: summarizeConflicts(listSessions()), degenerate: degenerateRetrySummary(listSessions()) }, null, 2));
 }
 
 // #2090 plan A — read-only view backing the web UI's "Signed upstreams" card:

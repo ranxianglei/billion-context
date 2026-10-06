@@ -478,3 +478,117 @@ test("plugin chat emits an in-band error when the retry degenerates too", async 
     // the error's.
     assert.equal((text.match(/\[DONE\]/g) ?? []).length, 2, "the error's terminal, then the retry's trailing terminator");
 });
+
+// #2176: chronic tag-echo escalation — a model that answers with markup only
+// gets a second, anti-echo nudge before the turn is given up on. The pipes
+// fire up to DEGENERATE_RETRY_MAX_ATTEMPTS re-issues; the second carries the
+// escalated nudge and session.stats counts every fire (and every exhaustion)
+// for /__bili/status.
+import { DEGENERATE_RETRY_NUDGE_ESCALATED, DEGENERATE_RETRY_MAX_ATTEMPTS, degenerateRetrySummary } from "../src/degenerate-retry.ts";
+
+test("#2176 chat: a second degenerate attempt escalates with the anti-echo nudge and can still recover", async () => {
+    const out: string[] = [];
+    const calls: boolean[] = [];
+    const refetch = (escalated?: boolean) => {
+        calls.push(escalated === true);
+        // First re-issue degenerates again; the escalated one delivers prose.
+        return Promise.resolve(calls.length === 1 ? streamOf([chatChunk({ role: "assistant" }), chatStop(), DONE]) : streamOf(proseTurn("recovered by the escalated nudge")));
+    };
+    const session = makeSession();
+    await pipePluginChatWithStrip(streamOf(echoOnlyTurn()), makeRes(out), "openai", session, undefined, refetch);
+    const text = out.join("");
+    assert.equal(calls.length, 2, "two re-issues fire before giving up");
+    assert.deepEqual(calls, [false, true], "the second re-issue is the escalated one");
+    assert.equal(textDeltas(text, "openai"), "recovered by the escalated nudge", "the escalated retry's prose reaches the client");
+    assert.ok(!text.includes("[ACP] stream error"), "a recovered turn carries no error");
+    assert.equal((text.match(/\[DONE\]/g) ?? []).length, 1, "one turn, one terminal");
+    assert.equal(session.stats.degenerateRetries, 2, "every fire is counted");
+    assert.equal(session.stats.degenerateExhausted, undefined, "no exhaustion when the escalation recovers");
+});
+
+test("#2176 chat: exhaustion after two degenerate re-issues emits the #870 error and counts the tail", async () => {
+    const out: string[] = [];
+    const logs: string[] = [];
+    setLogCapture((_level, msg) => logs.push(msg));
+    let calls = 0;
+    const refetch = () => {
+        calls += 1;
+        return Promise.resolve(streamOf([chatChunk({ role: "assistant" }), chatStop(), DONE]));
+    };
+    const session = makeSession();
+    try {
+        await pipePluginChatWithStrip(streamOf(echoOnlyTurn()), makeRes(out), "openai", session, (m) => logs.push(m), refetch);
+    } finally {
+        setLogCapture(null);
+    }
+    const text = out.join("");
+    assert.equal(calls, DEGENERATE_RETRY_MAX_ATTEMPTS, "the escalation is bounded");
+    assert.ok(text.includes("[ACP] stream error"), "the client is told instead of left with an empty turn");
+    assert.equal(session.stats.degenerateRetries, 2);
+    assert.equal(session.stats.degenerateExhausted, 1, "the unrecoverable turn is visible in the counters");
+    assert.ok(logs.some((l) => l.includes("continuation nudges")), "the exhaustion log names the escalation");
+});
+
+test("#2176 the escalated nudge rides the retry body as a trailing user turn", () => {
+    const body = JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi" }] });
+    const merged = JSON.parse(injectContinuationNudge("openai", body, true)!) as { messages: { role: string; content: string }[] };
+    assert.ok(merged.messages[0]!.content.includes("Do not output them"), "the escalated text names the behavior to stop");
+    assert.ok(merged.messages[0]!.content.includes(DEGENERATE_RETRY_NUDGE_ESCALATED.slice(0, 40)), "the escalated nudge is the payload");
+    const plain = JSON.parse(injectContinuationNudge("openai", body)!) as { messages: { content: string }[] };
+    assert.ok(!plain.messages[0]!.content.includes("Do not output them"), "the default nudge is unchanged");
+});
+
+test("#2176 responses: the escalated second re-issue recovers the turn too", async () => {
+    const out: string[] = [];
+    const calls: boolean[] = [];
+    const refetch = (escalated?: boolean) => {
+        calls.push(escalated === true);
+        return Promise.resolve(calls.length === 1
+            ? streamOf(responsesProseTurn("", "resp_2", "item_2"))
+            : streamOf(responsesProseTurn("recovered on the escalated nudge", "resp_3", "item_3")));
+    };
+    const session = makeSession();
+    await pipePluginResponsesWithStrip(streamOf(responsesEchoOnlyTurn()), makeRes(out), session, undefined, refetch);
+    const text = out.join("");
+    assert.equal(calls.length, 2, "the responses pipe escalates too");
+    assert.deepEqual(calls, [false, true]);
+    assert.equal(responsesDeltas(text), "recovered on the escalated nudge");
+    assert.equal((text.match(/"type":"response\.completed"/g) ?? []).length, 1, "one turn, one terminal");
+    assert.equal(session.stats.degenerateRetries, 2);
+    assert.equal(session.stats.degenerateExhausted, undefined);
+});
+
+test("#2176 degenerateRetrySummary aggregates the counters for /__bili/status", () => {
+    const a = makeSession();
+    a.stats.degenerateRetries = 3;
+    a.stats.degenerateExhausted = 1;
+    const b = makeSession();
+    b.stats.degenerateRetries = 1;
+    const summary = degenerateRetrySummary([a, b, makeSession(), {}]);
+    assert.deepEqual(summary, { sessions: 2, retries: 4, exhausted: 1 }, "untouched sessions are skipped, fires sum across sessions");
+});
+
+test("#2176 responses: exhaustion after two degenerate re-issues counts the tail and closes on its own completion", async () => {
+    const out: string[] = [];
+    const logs: string[] = [];
+    setLogCapture((_level, msg) => logs.push(msg));
+    const calls: boolean[] = [];
+    const refetch = (escalated?: boolean) => {
+        calls.push(escalated === true);
+        return Promise.resolve(streamOf(responsesEchoOnlyTurn()));
+    };
+    const session = makeSession();
+    try {
+        await pipePluginResponsesWithStrip(streamOf(responsesEchoOnlyTurn()), makeRes(out), session, (m) => logs.push(m), refetch);
+    } finally {
+        setLogCapture(null);
+    }
+    const text = out.join("");
+    assert.equal(calls.length, DEGENERATE_RETRY_MAX_ATTEMPTS, "the escalation is bounded");
+    assert.deepEqual(calls, [false, true], "the second re-issue is the escalated one");
+    assert.equal(responsesDeltas(text), "", "no prose survives a fully degenerate turn");
+    assert.equal((text.match(/"type":"response\.completed"/g) ?? []).length, 1, "one turn, one terminal — the retry's own completion");
+    assert.equal(session.stats.degenerateRetries, 2);
+    assert.equal(session.stats.degenerateExhausted, 1, "the unrecoverable turn is visible in the counters");
+    assert.ok(logs.some((l) => l.includes("continuation nudges")), "the exhaustion log names the escalation");
+});

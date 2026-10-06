@@ -225,6 +225,15 @@ export type Session = {
           *  Persisted so a restart doesn't re-arm the warmup delay; reset at
           *  native-compaction boundaries with the rest of the baseline stats. */
          calibrationRing?: { origin: string; model?: string; values: number[] };
+        /** #2176: degenerate-turn re-issues fired by the plugin pipes (the
+         *  empty-turn continuation nudge, now up to two per turn). Counted per
+         *  FIRE, not per turn, so the field is also the amplification gauge. */
+        degenerateRetries?: number;
+        /** #2176: turns where every re-issue still degenerated — the #870
+         *  in-band error (chat pipe) / the passed-through empty completion
+         *  (responses pipe). Nonzero means the escalation did not save the
+         *  turn; the tail is first-cause territory (injection format). */
+        degenerateExhausted?: number;
         /** #1933 F1: pending pairing input — local estimate of the LAST
          *  prepared outbound in BILLED caliber (estimateCoreMessages +
          *  system/tools overhead + image reserve, defaultCountTokens rate),

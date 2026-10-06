@@ -375,3 +375,35 @@ parse failures) forward as-is and log `[tag-echo] raw exit` so new leak shapes
 become visible without changing the wire. Pinned by
 `tests/unified-acp-invariants.test.ts` (eight tests, both lanes).
 
+
+## Degenerate-turn retry escalation — two nudges, then an honest failure (#2176)
+
+The empty-turn re-issue (`src/degenerate-retry.ts`, fired by both plugin
+pipes when a turn terminates with nothing client-visible — the chronic
+tag-echo shape) is bounded at `DEGENERATE_RETRY_MAX_ATTEMPTS = 2`:
+
+1. **First re-issue — the plain continuation nudge** (#732/#821 wording,
+   unchanged): "continue, take your next concrete action".
+2. **Second re-issue — the anti-echo escalation**: names the behavior to
+   stop (message-reference tags are stripped before anyone reads them) and
+   the output to produce instead (plain prose or a tool call). Mentioning
+   the tags is deliberate: the turn is already lost at that point, and the
+   instruction rides a one-shot trailing user message that is never
+   persisted nor replayed.
+
+After both re-issues degenerate, each pipe keeps its existing honest
+terminal: the chat pipe emits the #870 in-band error (a COMPLETED turn
+carrying the error text), the Responses pipe lets the retry's own
+completion close the turn. The compress-loop lane keeps its original
+one-shot bound — its degenerate rounds are tool-result rounds, not user
+turns, and were not part of the #2176 report.
+
+**Observability** (#2176): every fire increments
+`session.stats.degenerateRetries`, every unrecoverable turn increments
+`session.stats.degenerateExhausted` (both persisted, restart-stable), and
+`GET /__bili/status` exposes the aggregate as `degenerate: { sessions,
+retries, exhausted }`. The exhausted counter is gated behind the same
+visible-text predicates as the retry itself, so a recovered escalation is
+never miscounted. Nonzero `exhausted` is the signal that the escalation
+did not save the turn — the tail is first-cause territory (injection
+format), not retry-count territory.

@@ -22,6 +22,7 @@ import { ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "./s
 import { imageUsageSuffix } from "./image-compress.js";
 import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
 import { degenerateTurnWarning } from "./degenerate-turn.js";
+import { DEGENERATE_RETRY_MAX_ATTEMPTS } from "./degenerate-retry.js";
 import { PANEL_BOX_FOOTER } from "./acp-panel.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
 import { describeUpdateReady, getUpdateVisibility } from "./update-notes.js";
@@ -1709,10 +1710,11 @@ const ANTHROPIC_BLOCK_EVENT = /^content_block_(start|delta|stop)$/;
  *  tiny input_tokens would clobber lastInputTokens and break compression
  *  triggering for the main conversation.
  *
- *  `refetch` supplies the one-shot degenerate-turn retry (#732/#821): when the
- *  turn reaches its terminal with nothing visible — the tag-echo case, where
- *  the filter empties the only text block so the host aborts an empty turn —
- *  the pipe re-issues the request through it and splices the retry's content
+ *  `refetch` supplies the degenerate-turn retry (#732/#821, #2176 escalation):
+ *  when the turn reaches its terminal with nothing visible — the tag-echo
+ *  case, where the filter empties the only text block so the host aborts an
+ *  empty turn — the pipe re-issues the request through it (up to twice: a
+ *  plain nudge, then an anti-echo escalation) and splices the retry's content
  *  into the client stream the first attempt already opened. Omit it for the
  *  plain pass-through. */
 export async function pipePluginChatWithStrip(
@@ -1721,7 +1723,7 @@ export async function pipePluginChatWithStrip(
     protocol: WireProtocol,
     session?: Session,
     log?: (msg: string) => void,
-    refetch?: () => Promise<ReadableStream<Uint8Array> | null>,
+    refetch?: (escalated?: boolean) => Promise<ReadableStream<Uint8Array> | null>,
     upstreamOrigin?: string,
     // True when the outbound request carried the [ACP absorb] instruction:
     // the model may then answer with a tool call written as prose, and the
@@ -1849,19 +1851,19 @@ export async function pipePluginChatWithStrip(
     // terminal event is dropped when the retry takes over, so the client sees
     // one turn: its framing stays open, and the retry's content blocks are
     // shifted past the ones already streamed.
-    let degenerateRetried = false;
+    let degenerateRetries = 0;
     let truncationRetried = false;
     let forwardedAny = false;
     let inRetry = false;
     let retryIndexOffset = 0;
     let blocksForwarded = 0;
-    /** One-shot re-issue when a turn reaches its terminal with nothing visible:
-     *  the tag-echo case, where the filter empties the only text block and the
-     *  host aborts an empty completed turn. Returns true when the retry stream
-     *  took over, in which case the caller drops the terminal event of the
-     *  attempt it came from. Consults truncationRetried: a request whose stream
-     *  already spent its one re-issue on a zero-visible cut (#2171) cannot also
-     *  re-send on a degenerate completion — one re-issue per request, total. */
+    /** Degenerate-turn re-issues (#732/#821), #2176-escalated to at most
+     *  DEGENERATE_RETRY_MAX_ATTEMPTS: the first carries the plain continuation
+     *  nudge, a second carries the anti-echo escalation. Returns true when the
+     *  retry stream took over, in which case the caller drops the terminal
+     *  event of the attempt it came from. Consults truncationRetried: a request
+     *  whose stream already spent its re-issue on a zero-visible cut (#2171)
+     *  cannot also re-send on a degenerate completion. */
     const retryEmptyTurn = async (reason: string | undefined): Promise<boolean> => {
         if (refetch === undefined || truncationRetried) return false;
         // Markup released from a held span carries nothing the host can act on:
@@ -1869,13 +1871,15 @@ export async function pipePluginChatWithStrip(
         if (visibleTextChars > releasedMarkupChars || sawToolUse) return false;
         if (reason === undefined || !CLEAN_TURN_REASONS.has(reason)) return false;
         if (res.destroyed || res.writableEnded) return false;
-        if (degenerateRetried) {
-            // The retry degenerated too. An empty turn is indistinguishable from a
-            // model that produced nothing and the session reads as idle while it is
-            // dead, so the client gets an error the host would never surface (#870).
-            log?.("[plugin] degenerate terminal turn again after the retry; emitting an in-band error (#870)");
+        if (degenerateRetries >= DEGENERATE_RETRY_MAX_ATTEMPTS) {
+            // Every re-issue degenerated too. An empty turn is indistinguishable
+            // from a model that produced nothing and the session reads as idle
+            // while it is dead, so the client gets an error the host would never
+            // surface (#870).
+            log?.("[plugin] degenerate terminal turn again after the continuation nudges; emitting an in-band error (#870)");
+            if (session) session.stats.degenerateExhausted = (session.stats.degenerateExhausted ?? 0) + 1;
             // #870 deliberately chose a COMPLETED turn carrying the error text (visible to the host); keep the legacy shape here regardless of the global streamErrorShape default.
-            emitStreamError(res, protocol, "the turn degenerated again after the continuation nudge", undefined, "completion");
+            emitStreamError(res, protocol, "the turn degenerated again after the continuation nudges", undefined, "completion");
             return true;
         }
         // A turn the model left genuinely bare — no thought, no stripped echo,
@@ -1883,11 +1887,15 @@ export async function pipePluginChatWithStrip(
         // re-issuing it double-bills an empty completion (#732/#821 keep the
         // same boundary in the compress loop).
         if (!sawThinking && !sawStrippedEcho && releasedMarkupChars === 0) return false;
-        degenerateRetried = true;
-        log?.("[plugin] degenerate terminal turn (no usable output); retrying once with a continuation nudge (#732/#821)");
+        const escalated = degenerateRetries > 0;
+        degenerateRetries += 1;
+        if (session) session.stats.degenerateRetries = (session.stats.degenerateRetries ?? 0) + 1;
+        log?.(escalated
+            ? "[plugin] degenerate terminal turn again; escalating with the anti-echo nudge (#2176)"
+            : "[plugin] degenerate terminal turn (no usable output); retrying with a continuation nudge (#732/#821)");
         let next: ReadableStream<Uint8Array> | null = null;
         try {
-            next = await refetch();
+            next = await refetch(escalated);
         } catch (e) {
             log?.(`[plugin] degenerate-terminal retry failed (${e instanceof Error ? e.message : String(e)}); passing the empty turn through`);
             return false;
@@ -1929,7 +1937,7 @@ export async function pipePluginChatWithStrip(
      *  the #721 in-band error (partial content must not be regenerated). */
     const retryZeroByteCut = async (): Promise<boolean> => {
         if (refetch === undefined) return false;
-        if (degenerateRetried || truncationRetried) return false;
+        if (degenerateRetries > 0 || truncationRetried) return false;
         // Zero-visible predicate: no framing opened, no content block started,
         // no prose accumulated or held by the tag filter, no unparseable frame
         // forwarded verbatim, no partial SSE event left in the buffer.
@@ -2691,7 +2699,8 @@ function googleFrameHasNonText(ev: Record<string, unknown>): boolean {
  *  #732/#821 parity with pipePluginChatWithStrip: when the turn's completion
  *  reports a clean status with nothing visible — the echoed render tag was the
  *  only thing the model emitted, and the filter emptied it — the agent's own
- *  body is re-issued ONCE with a continuation nudge instead of leaving the host
+ *  body is re-issued with a continuation nudge (up to twice: plain, then the
+ *  #2176 anti-echo escalation) instead of leaving the host
  *  with an empty completed turn. The retry is reframed onto the ids the client
  *  already holds, so the client still sees one turn. */
 export async function pipePluginResponsesWithStrip(
@@ -2699,7 +2708,7 @@ export async function pipePluginResponsesWithStrip(
     res: ServerResponse,
     session?: Session,
     log?: (msg: string) => void,
-    refetch?: () => Promise<ReadableStream<Uint8Array> | null>,
+    refetch?: (escalated?: boolean) => Promise<ReadableStream<Uint8Array> | null>,
     upstreamOrigin?: string,
     // See pipePluginChatWithStrip: whole-field tool-call emission drop,
     // gated on the request carrying the [ACP absorb] instruction (m00885).
@@ -2758,7 +2767,7 @@ export async function pipePluginResponsesWithStrip(
     // output_item.added releases them early instead — clients require
     // done(itemN) before added(itemN+1) (#1061) — so by the terminal only the
     // last item's family can still be held.
-    let degenerateRetried = false;
+    let degenerateRetries = 0;
     let truncationRetried = false;
     let forwardedAny = false;
     let inRetry = false;
@@ -2794,7 +2803,7 @@ export async function pipePluginResponsesWithStrip(
      *  keeps the #721 in-band error. */
     const retryZeroByteCut = async (): Promise<boolean> => {
         if (refetch === undefined) return false;
-        if (degenerateRetried || truncationRetried) return false;
+        if (degenerateRetries > 0 || truncationRetried) return false;
         // Zero-visible predicate: no item framing held, no status observed, no
         // prose accumulated or held by the filters, no verbatim frame
         // forwarded, no partial SSE event left in the buffer.
@@ -2955,8 +2964,9 @@ export async function pipePluginResponsesWithStrip(
      *  Returns true when the retry stream took over, in which case the caller
      *  drops the held done-family events AND the completion it came from. */
     const retryEmptyTurn = async (status: string | undefined): Promise<boolean> => {
-        // truncationRetried: one re-issue per request, total — see the chat-pipe twin.
-        if (degenerateRetried || truncationRetried || refetch === undefined) return false;
+        // truncationRetried: see the chat-pipe twin — a zero-visible cut (#2171)
+        // spends the budget a degenerate completion cannot also spend.
+        if (refetch === undefined || truncationRetried) return false;
         if (visibleTextChars > 0 || heldVisibleChars > 0 || sawFunctionCall) return false;
         if (status !== "completed") return false;
         if (res.destroyed || res.writableEnded) return false;
@@ -2965,11 +2975,25 @@ export async function pipePluginResponsesWithStrip(
         // double-bills an empty completion (#732/#821 keep the same boundary in
         // the compress loop).
         if (!sawReasoning && !sawStrippedEcho) return false;
-        degenerateRetried = true;
-        log?.("[plugin] degenerate terminal turn (no visible output); retrying once with a continuation nudge (#732/#821)");
+        if (degenerateRetries >= DEGENERATE_RETRY_MAX_ATTEMPTS) {
+            // Both re-issues degenerated: unlike the chat pipe (#870 in-band
+            // error) this lane lets the retry's own completion close the turn;
+            // count the exhaustion so /__bili/status can see the tail (#2176).
+            // Checked AFTER the visible-text gates so a recovered escalation
+            // (this same guard runs at its terminal too) is not miscounted.
+            log?.("[plugin] degenerate terminal turn again after the continuation nudges (#2176)");
+            if (session) session.stats.degenerateExhausted = (session.stats.degenerateExhausted ?? 0) + 1;
+            return false;
+        }
+        const escalated = degenerateRetries > 0;
+        degenerateRetries += 1;
+        if (session) session.stats.degenerateRetries = (session.stats.degenerateRetries ?? 0) + 1;
+        log?.(escalated
+            ? "[plugin] degenerate terminal turn again; escalating with the anti-echo nudge (#2176)"
+            : "[plugin] degenerate terminal turn (no visible output); retrying with a continuation nudge (#732/#821)");
         let next: ReadableStream<Uint8Array> | null = null;
         try {
-            next = await refetch();
+            next = await refetch(escalated);
         } catch (e) {
             log?.(`[plugin] degenerate-terminal retry failed (${e instanceof Error ? e.message : String(e)}); passing the empty turn through`);
             return false;
