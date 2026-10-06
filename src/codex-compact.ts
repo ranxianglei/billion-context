@@ -42,6 +42,37 @@ export function isCodexClient(headers: Record<string, string | string[] | undefi
     return s.split(/\s+/).some((t) => t.startsWith("codex"));
 }
 
+export type CodexReasoningAccountingContext = {
+    codexClient: boolean;
+    upstreamIsChatGpt: boolean;
+    protocol: string | null | undefined;
+    processedMessageCount: number;
+    resetAfterSuccess?: boolean;
+    upstreamOk: boolean;
+};
+
+// Codex resets server_reasoning_included=false at the start of every regular
+// turn and, unless the response carries x-reasoning-included, adds a local
+// estimate of older encrypted reasoning on top of server-reported usage.
+// After bili folds a request, that local history is deliberately larger than
+// the post-fold request the server actually billed. Mark the official ChatGPT
+// Codex response as authoritative so Codex does not double-count pre-fold
+// reasoning and trigger an avoidable native compaction.
+//
+// Keep this deliberately narrow: third-party Responses providers may report
+// usage with different reasoning semantics, and native compact responses own
+// their own history-reset accounting.
+export function applyCodexReasoningIncludedHeader(
+    headers: Record<string, string>,
+    ctx: CodexReasoningAccountingContext,
+): boolean {
+    if (!ctx.codexClient || !ctx.upstreamIsChatGpt || !ctx.upstreamOk) return false;
+    if (ctx.protocol !== "responses" || ctx.processedMessageCount <= 0 || ctx.resetAfterSuccess === true) return false;
+    if (Object.keys(headers).some((key) => key.toLowerCase() === "x-reasoning-included")) return false;
+    headers["x-reasoning-included"] = "1";
+    return true;
+}
+
 export function hasCompactionTrigger(input: unknown): boolean {
     if (!Array.isArray(input)) return false;
     const last = input[input.length - 1] as { type?: unknown } | undefined;

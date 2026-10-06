@@ -103,7 +103,7 @@ import { isFakeCompletion, injectFakeCompletionHint, maxFakeCompletionRetries, f
 import { makeContinuationRefetch } from "./degenerate-retry.js";
 import { reasoningGuardEngages, runReasoningGuard } from "./reasoning-guard.js";
 import { sanitizeResponsesInputIds, dropWhitespaceResponsesMessages, normalizeResponsesMessageItems } from "./loop/adapter-responses.js";
-import { CODEX_COMPACT_HEALTH_RATIO, codexCompactMode, isCodexClient, hasCompactionTrigger, stripBiliCompactionItems, replaceBiliCompactionItems, codexCompactGate, codexCompactGatePre, buildTriggerForgeBody, mergeForgedSummaries } from "./codex-compact.js";
+import { CODEX_COMPACT_HEALTH_RATIO, codexCompactMode, isCodexClient, hasCompactionTrigger, stripBiliCompactionItems, replaceBiliCompactionItems, codexCompactGate, codexCompactGatePre, buildTriggerForgeBody, mergeForgedSummaries, applyCodexReasoningIncludedHeader } from "./codex-compact.js";
 import { stripAcpPanelMessages, stripAcpPanelResponsesInput, stripAcpStatusMarkers } from "./acp-panel.js";
 import { rewriteOpenaiJsonResponse } from "./stream-openai.js";
 import { rewriteGoogleJsonResponse } from "./stream-google.js";
@@ -6951,6 +6951,17 @@ async function forward(
         if (UPSTREAM_HOP_HEADERS.has(lower) || RESPONSE_ONLY_STRIP_HEADERS.has(lower) || respConnNamed.has(lower)) return;
         respHeaders[k] = v;
     });
+    const reasoningAccountingMarked = applyCodexReasoningIncludedHeader(respHeaders, {
+        codexClient: isCodexClient(req.headers),
+        upstreamIsChatGpt: isChatGptCodexUpstream(upstreamUrl),
+        protocol: prepared?.protocol,
+        processedMessageCount: prepared?.processedMessages.length ?? 0,
+        resetAfterSuccess: prepared?.resetAfterSuccess,
+        upstreamOk: upstream.ok,
+    });
+    if (reasoningAccountingMarked) {
+        log("debug", `[${prepared?.session.id ?? "unknown"}] codex reasoning accounting marked authoritative for post-fold ChatGPT response`);
+    }
     if (opts.debug) {
         const respLog: Record<string, string> = {};
         upstream.headers.forEach((v, k) => {
