@@ -446,8 +446,13 @@ test("streaming filter drops a definite open tail beyond the tag-open cap instea
 test("stripAcpTags drops arbitrary truncated open fragments, keeps ambiguous prefixes", () => {
     assert.equal(stripAcpTags(`text ${OPEN}type="text" tokens=`), "text ");
     assert.equal(stripAcpTags(`text ${OPEN}tok`), "text ");
-    assert.equal(stripAcpTags(`text ${LT}acp`), `text ${LT}acp`);
-    assert.equal(stripAcpTags(`text ${LT}/ac`), `text ${LT}/ac`);
+    // #1755: a bare ≥2-letter run at end of finished text is a truncated echo
+    // (names are 3-4 letters; the run can never still be growing here) — drop.
+    assert.equal(stripAcpTags(`text ${LT}acp`), "text ");
+    assert.equal(stripAcpTags(`text ${LT}/ac`), "text ");
+    // 1-letter heads stay releasable: real HTML may start with one.
+    assert.equal(stripAcpTags(`text ${LT}a`), `text ${LT}a`);
+    assert.equal(stripAcpTags(`text ${LT}/i`), `text ${LT}/i`);
 });
 
 test("stripAcpTags drops truncated close fragments (close side of #361)", () => {
@@ -462,7 +467,149 @@ test("streaming flush drops arbitrary truncated open fragments", () => {
     assert.equal(f.flush(), "");
     const g = createTagEchoFilter();
     assert.equal(g.push(`text ${LT}acp`), "text ");
-    assert.equal(g.flush(), `${LT}acp`);
+    // #1755: a bare ≥2-letter run at end of stream is a truncated echo — drop.
+    assert.equal(g.flush(), "");
+    const h = createTagEchoFilter();
+    assert.equal(h.push(`text ${LT}a`), "text ");
+    // 1-letter heads stay releasable: real HTML may start with one.
+    assert.equal(h.flush(), `${LT}a`);
+});
+
+// #1755: a bare 2-letter head (\x3cac, \x3c/ac) is neither a real tag (names
+// are 3-4 letters) nor prose — an echo truncated mid-name. It must be dropped
+// mid-stream, at flush, and in whole text alike; 1-letter heads stay
+// releasable because real HTML starts with them.
+test("stripAcpTags drops bare 2-letter echo fragments (#1755)", () => {
+    assert.equal(stripAcpTags(`${LT}ac`), "");
+    assert.equal(stripAcpTags(`${LT}ac>`), "");
+    assert.equal(stripAcpTags(`\n${LT}ac>\n`), "\n\n");
+    assert.equal(stripAcpTags(`${LT}/ac`), "");
+    assert.equal(stripAcpTags(`${LT}/ac>`), "");
+    assert.equal(stripAcpTags(`x ${LT}ac`), "x ");
+    // pure in-set run reaching end of finished text; a run broken by an
+    // out-of-set char mid-text (\x3cacid\x3e, \x3cacpid…) stays prose.
+    assert.equal(stripAcpTags(`x ${LT}acpip`), "x ");
+    assert.equal(stripAcpTags(`x ${LT}acpid`), `x ${LT}acpid`);
+});
+
+test("streaming filter drops bare 2-letter echo fragments char by char (#1755)", () => {
+    const cases: Array<[string, string]> = [
+        [`${LT}ac`, ""],
+        [`${LT}ac>`, ""],
+        [`\n${LT}ac>\n`, "\n\n"],
+        [`${LT}/ac`, ""],
+        [`${LT}/ac>`, ""],
+        [`x ${LT}ac`, "x "],
+        [`${LT}a`, `${LT}a`],
+        [`${LT}/i`, `${LT}/i`],
+    ];
+    for (const [input, expected] of cases) {
+        const f = createTagEchoFilter();
+        let visible = "";
+        for (let i = 0; i < input.length; i++) visible += f.push(input[i]);
+        visible += f.flush();
+        assert.equal(visible, expected, input);
+    }
+});
+
+test("streaming filter matches stripAcpTags for bare 2-letter fragments at every split (#1755)", () => {
+    for (const full of [`${LT}ac`, `${LT}ac>`, `\n${LT}ac>\n`, `${LT}/ac>`, `mid ${LT}ac> tail`, `${LT}acpip`, `x ${LT}acpid rest`]) {
+        const expected = stripAcpTags(full);
+        for (let split = 0; split <= full.length; split++) {
+            const f = createTagEchoFilter();
+            const out = f.push(full.slice(0, split)) + f.push(full.slice(split)) + f.flush();
+            assert.equal(out, expected, `split=${split} full=${JSON.stringify(full)}`);
+        }
+    }
+});
+
+test("held bare head stitches into a real tag when the name completes (#1755)", () => {
+    const f = createTagEchoFilter();
+    let visible = f.push(`x ${LT}ac`);
+    visible += f.push(`p tokens="1" type="text">m00001${CLOSE}`);
+    visible += f.flush();
+    assert.equal(visible, "x ");
+    assert.ok(f.dropped());
+});
+
+test("bare head at chunk boundary: closed form stripped, live prose released (#1755)", () => {
+    const f = createTagEchoFilter();
+    let v1 = f.push(`x ${LT}ac`);
+    v1 += f.push(`id>`);
+    v1 += f.flush();
+    assert.equal(v1, `x ${LT}acid>`);
+    const g = createTagEchoFilter();
+    let v2 = g.push(`x ${LT}ac`);
+    v2 += g.push(`>`);
+    v2 += g.flush();
+    assert.equal(v2, "x ");
+});
+
+// #1881's bare-open-swallow flush path releases its tail at EOF; without the
+// same bare-run rule there, \x3cname>prose \x3cac at EOF would leak the
+// trailing echo while whole text drops it (streaming ≢ stripAcpTags).
+test("bare-open-swallow flush applies the same bare-run rule as whole text (#1755/#1881)", () => {
+    for (const full of [`${LT}acp>see ${LT}ac`, `${LT}acp>x${LT}/acp>tail ${LT}/ac`]) {
+        const expected = stripAcpTags(full);
+        for (let split = 0; split <= full.length; split++) {
+            const f = createTagEchoFilter();
+            const out = f.push(full.slice(0, split)) + f.push(full.slice(split)) + f.flush();
+            assert.equal(out, expected, `split=${split} full=${JSON.stringify(full)}`);
+        }
+    }
+});
+
+// Owner review of PR #1759: a head whose next char merely breaks the letter
+// run is NOT proof of death — user-defined kebab elements (\x3cai-video\x3e)
+// start that way. Only the CLOSED 2-letter form is stripped mid-text.
+test("kebab elements starting with a 2-letter in-set pair survive (#1759 review)", () => {
+    const safe = [
+        `use the ${LT}ai-video> element here`,
+        `render ${LT}pi-chart> now`,
+        `${LT}ac-x attr="1">body${LT}/ac-x>`,
+    ];
+    for (const s of safe) {
+        assert.equal(stripAcpTags(s), s, s);
+        for (let split = 0; split <= s.length; split++) {
+            const f = createTagEchoFilter();
+            const out = f.push(s.slice(0, split)) + f.push(s.slice(split)) + f.flush();
+            assert.equal(out, s, `split=${split} full=${JSON.stringify(s)}`);
+        }
+    }
+});
+
+test("streaming filter drops a long bare in-set run past the tag-open cap (#1755)", () => {
+    let dropped = "";
+    const f = createTagEchoFilter((s) => { dropped = s; });
+    assert.equal(f.push(`${LT}` + "a".repeat(5000)), "");
+    assert.equal(dropped.length, 5001);
+    assert.ok(f.dropped());
+});
+
+test("bare 2-letter closed forms engage the streaming gates (#1755)", () => {
+    assert.equal(mayStartRenderTag(`${LT}ac>`), true);
+    assert.equal(containsRenderTagText(`${LT}ac>`), true);
+    assert.equal(containsRenderTagText(`\\u003c${"ac"}\\u003e`), true);
+    assert.equal(mayStartRenderTag("if n < 5"), false);
+    assert.equal(containsRenderTagText(`${LT}a href="x">link`), false);
+});
+
+test("prose guards hold for the bare 2-letter changes (#1755)", () => {
+    const safe = [
+        `${LT}a href="x">link${LT}/a>`,
+        `${LT}i>emph${LT}/i>`,
+        `${LT}acid>`,
+        `call the ${LT}api> endpoint`,
+        "if n < 5 then",
+    ];
+    for (const s of safe) {
+        assert.equal(stripAcpTags(s), s, s);
+        for (let split = 0; split <= s.length; split++) {
+            const f = createTagEchoFilter();
+            const out = f.push(s.slice(0, split)) + f.push(s.slice(split)) + f.flush();
+            assert.equal(out, s, `split=${split} full=${JSON.stringify(s)}`);
+        }
+    }
 });
 
 test("streaming filter drops truncated close fragments (close side of #361)", () => {

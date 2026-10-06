@@ -101,6 +101,24 @@ const TRUNC_OPEN = new RegExp("\x3c" + NAME + "\\s[^<>]*$");
 // plus truncated attrs — a truncated imitation close, never prose. Mirrors
 // TRUNC_OPEN on the close side.
 const TRUNC_CLOSE = new RegExp("\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?$");
+// #1755: a 2-letter "name" is not a render-tag name (names are 3-4 letters,
+// see buildAcplikeName), so a CLOSED bare 2-letter form (\x3cxx\x3e) can never
+// be a real tag — no 2-letter HTML tag exists among the set's pairs — and is
+// a tag echo truncated mid-name. Only the closed form is stripped: a head whose
+// next char merely breaks the letter run (\x3cai in \x3cai-video\x3e) is NOT
+// proof of death — user-defined kebab elements start that way, so such heads
+// stay in PARTIAL_TAIL's hold until the next push decides them and release as
+// prose when the run dies (owner review of PR #1759). An UNDECIDED head at
+// buffer end likewise stays held; a 1-letter head stays releasable too —
+// \x3ca\x3e/\x3ci\x3e/\x3cp\x3e are real HTML and a truncated one must survive
+// (#1039 content preservation).
+const BARE_ECHO = new RegExp("\x3c\\/?[aAcCpPiI]{2}>");
+// A bare letter run of ≥2 at the very end of finished text (\x3cac, \x3c/acp, …):
+// the name never got its attrs or close — a truncated echo, dropped at flush
+// / end of whole text. Mirrors TRUNC_OPEN/TRUNC_CLOSE, which require \s after
+// the name and so never see a bare run. 1-letter runs stay releasable (same
+// HTML trade as BARE_ECHO).
+const TRUNC_BARE = new RegExp("\x3c\\/?[aAcCpPiI]{2,}$");
 // The wrapped-turn imitation: the model opens a render tag and writes its
 // payload where the attributes are still open, so the attribute list runs into
 // a `<` instead of ending at its `>`. The recorded shape (architect session
@@ -111,7 +129,11 @@ const TRUNC_CLOSE = new RegExp("\x3c\\/" + NAME + "(?:\\s[^<>]{0,32})?$");
 // next `<`. A properly terminated opening never matches: its attribute list
 // ends at a `>`, and no `<` can be reached from there within the class.
 const BROKEN_ATTRS = new RegExp("\x3c" + NAME + "\\s[^<>]*(?=\x3c)");
-const DEFINITE_TAIL = new RegExp("^\x3c" + NAME + "\\s|^\x3c\\/" + NAME);
+// #1755 third alternative: a bare in-set letter run of ≥1 after \x3c or \x3c/
+// can never be prose while it keeps growing in-set, so it is definite (held on
+// the TAG_OPEN_CAP budget, dropped past it) instead of ambiguous. Runs die the
+// moment an out-of-set char arrives and release normally (\x3cacid\x3e, …).
+const DEFINITE_TAIL = new RegExp("^\x3c" + NAME + "\\s|^\x3c\\/" + NAME + "|^\x3c\\/?[aAcCpPiI]+$");
 const OPEN_WITH_ATTRS = new RegExp("^\x3c" + NAME + "\\s");
 const CLOSE_HEAD = "\x3c/";
 const CLOSE_NAME_ANCHORED = new RegExp("^" + NAME);
@@ -246,8 +268,10 @@ export function stripAcpTags(text: string): string {
         .replace(new RegExp(PAIRED.source, "g"), "")
         .replace(new RegExp(LONE_OPEN.source, "g"), "")
         .replace(new RegExp(LONE_CLOSE.source, "g"), "")
+        .replace(new RegExp(BARE_ECHO.source, "g"), "")
         .replace(new RegExp(TRUNC_OPEN.source), "")
         .replace(new RegExp(TRUNC_CLOSE.source), "")
+        .replace(TRUNC_BARE, "")
         .replace(MARKER_LINE, "");
     return stripBiliArtifacts(out);
 }
@@ -264,8 +288,11 @@ export function containsMarkerLineText(s: string): boolean {
 // Cheap pre-check on a raw wire string (SSE event or JSON body): does it
 // contain anything that looks like a render tag (literal or JSON-escaped
 // \u003c form)? Callers use this to skip re-serializing chunks that need
-// no stripping, preserving byte-identical passthrough.
-const RENDER_TAG_DETECT = new RegExp("\x3c\\/?" + NAME + "(?=[\\s>])|\\\\u003c\\/?" + NAME + "(?=[\\s>\\\\])");
+// no stripping, preserving byte-identical passthrough. #1755: the closed
+// 2-letter forms (\x3cac\x3e etc.) are included too — a chunk that IS such a
+// fragment used to bypass the streaming state machine entirely.
+const RENDER_TAG_DETECT = new RegExp("\x3c\\/?" + NAME + "(?=[\\s>])|\\\\u003c\\/?" + NAME + "(?=[\\s>\\\\])" +
+    "|\x3c\\/?[aAcCpPiI]{2}>|\\\\u003c\\/?[aAcCpPiI]{2}\\\\u003e");
 export function containsRenderTagText(s: string): boolean {
     return RENDER_TAG_DETECT.test(s);
 }
@@ -592,8 +619,12 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
             const p = PAIRED.exec(buf);
             const o = LONE_OPEN.exec(buf);
             const c = LONE_CLOSE.exec(buf);
+            // #1755: dead 2-letter heads (\x3cxx\x3e / decided \x3cxx) join the
+            // earliest-match race; they can never collide with a real-tag match
+            // at the same index (real names are 3-4 letters).
+            const b = BARE_ECHO.exec(buf);
             let m: RegExpExecArray | null = null;
-            for (const cand of [p, o, c]) {
+            for (const cand of [p, o, c, b]) {
                 if (cand && (m === null || cand.index < m.index)) m = cand;
             }
             // An opening whose attribute list never terminates (see
@@ -714,7 +745,16 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
                         drop(tc[0]);
                         result = rest.slice(0, tc.index);
                     } else {
-                        result = rest;
+                        // #1755: same bare-run rule as the non-swallow path —
+                        // without it, \x3cname>prose \x3cac at EOF would leak
+                        // the trailing echo while whole text drops it.
+                        const tb = TRUNC_BARE.exec(rest);
+                        if (tb) {
+                            drop(tb[0]);
+                            result = rest.slice(0, tb.index);
+                        } else {
+                            result = rest;
+                        }
                     }
                 }
             } else {
@@ -728,7 +768,17 @@ export function createTagEchoFilter(onDrop?: (snippet: string) => void): TagEcho
                         drop(tc[0]);
                         result = rest.slice(0, tc.index);
                     } else {
-                        result = rest;
+                        // #1755: a bare ≥2-letter run at end of stream (\x3cac,
+                        // \x3c/acp, …) never got its attrs or close — a
+                        // truncated echo, not prose. 1-letter runs fall through
+                        // and release (real HTML may start with one).
+                        const tb = TRUNC_BARE.exec(rest);
+                        if (tb) {
+                            drop(tb[0]);
+                            result = rest.slice(0, tb.index);
+                        } else {
+                            result = rest;
+                        }
                     }
                 }
             }

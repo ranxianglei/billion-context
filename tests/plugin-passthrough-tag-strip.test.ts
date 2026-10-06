@@ -191,8 +191,10 @@ test("plugin passthrough resolves held tail at stream end without a done-family 
     ];
     await pipePluginResponsesWithStrip(streamOf(events2), res2, session);
     const text2 = out2.join("");
-    assert.ok(text2.includes(`"delta":"prose "`), "clean prefix passes once the ambiguous head is held");
-    assert.ok(text2.includes(`"delta":"\x3cac"`), "ambiguous prefix flushed as its own delta at stream end, never lost");
+    assert.ok(text2.includes(`"delta":"prose "`), "clean prefix passes once the bare head is held");
+    // #1755: a bare ≥2-letter head at stream end is a truncated echo — it is
+    // dropped, not flushed to the client as its own delta.
+    assert.ok(!text2.includes(`\x3cac`), "bare 2-letter head dropped at stream end instead of leaked");
 });
 
 test("plugin passthrough rebuildEvent collapses multi-line data payloads into one line", async () => {
