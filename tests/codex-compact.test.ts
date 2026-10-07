@@ -8,6 +8,7 @@ import type { Session } from "../src/session.ts";
 import {
     codexCompactMode,
     isCodexClient,
+    applyCodexReasoningIncludedHeader,
     hasCompactionTrigger,
     isBiliCompactionItem,
     stripBiliCompactionItems,
@@ -65,6 +66,37 @@ test("isCodexClient: lenient token-level 'codex' fallback for unknown client var
 
 test("isCodexClient: Codex Desktop UA (initial-capital 'Codex') is detected (#1169)", () => {
     assert.equal(isCodexClient({ "user-agent": "Codex Desktop/0.155.0-alpha.9" }), true, "exact UA from #1169 via registered prefix");
+});
+
+test("applyCodexReasoningIncludedHeader: marks only ordinary post-fold ChatGPT Codex turns", () => {
+    const base = {
+        codexClient: true,
+        upstreamIsChatGpt: true,
+        protocol: "responses",
+        processedMessageCount: 3,
+        upstreamOk: true,
+    } as const;
+
+    const headers: Record<string, string> = { "content-type": "text/event-stream" };
+    assert.equal(applyCodexReasoningIncludedHeader(headers, base), true);
+    assert.equal(headers["x-reasoning-included"], "1");
+
+    const existing = { "X-Reasoning-Included": "true" };
+    assert.equal(applyCodexReasoningIncludedHeader(existing, base), false, "upstream value is preserved");
+    assert.equal(existing["X-Reasoning-Included"], "true");
+
+    for (const ctx of [
+        { ...base, codexClient: false },
+        { ...base, upstreamIsChatGpt: false },
+        { ...base, upstreamOk: false },
+        { ...base, protocol: "openai" },
+        { ...base, processedMessageCount: 0 },
+        { ...base, resetAfterSuccess: true },
+    ]) {
+        const candidate: Record<string, string> = {};
+        assert.equal(applyCodexReasoningIncludedHeader(candidate, ctx), false);
+        assert.equal(candidate["x-reasoning-included"], undefined);
+    }
 });
 
 test("hasCompactionTrigger: only a FINAL compaction_trigger counts", () => {
