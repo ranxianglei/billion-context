@@ -1098,6 +1098,27 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Status:** ACTIVE
 - **Description:** Token-growth step for soft compression nudges. A nudge fires roughly every time this many tokens become compressible. Lower values produce more frequent nudges. Maps to the kernel fields `nudge.growthFloor` and `nudge.growthCap` (it flattens the engine's adaptive band to this fixed step).
 
+#### `nudgeAdaptive`
+
+- **Type:** `boolean`
+- **Default:** *(unset — static behavior)*
+- **Status:** ACTIVE (opt-in)
+- **Description:** Throughput-adaptive nudge cadence (#1997). When `true`, the fixed `nudgeGrowthTokens` step is replaced by an adaptive step derived from the session's recent per-call input throughput: large per-call arrivals (bulk file/log reads) widen the step so folding does not interrupt the work, while small arrivals (quiet interactive turns) narrow it so context stays lean. The step is clamped to [`nudgeGrowthMin`, `nudgeGrowthMax`] and falls back to the clamped `nudgeGrowthTokens` seed until three samples exist. It deliberately references both growth magnitude *and* call count (a bounded window of recent requests), not wall-clock time or cache occupancy. Default unset/`false` → the static `nudgeGrowthTokens` behavior is byte-for-byte unchanged.
+
+#### `nudgeGrowthMin`
+
+- **Type:** `number`
+- **Default:** `10000`
+- **Status:** ACTIVE (only when `nudgeAdaptive` is enabled)
+- **Description:** Lower clamp (tokens) for the adaptive nudge step. Consulted only when `nudgeAdaptive` is enabled.
+
+#### `nudgeGrowthMax`
+
+- **Type:** `number`
+- **Default:** `200000`
+- **Status:** ACTIVE (only when `nudgeAdaptive` is enabled)
+- **Description:** Upper clamp (tokens) for the adaptive nudge step. Consulted only when `nudgeAdaptive` is enabled.
+
 #### `preserveRecentMessages`
 
 - **Type:** `number`

@@ -169,6 +169,22 @@ export type CompressSettings = {
      *  adaptive band to a fixed step (sets both `nudge.growthFloor` and
      *  `nudge.growthCap`). */
     nudgeGrowthTokens?: number;
+    /** #1997: master switch for throughput-adaptive nudge cadence. When true,
+     *  the fixed {@link nudgeGrowthTokens} step is replaced by an adaptive step
+     *  derived from the session's recent per-call input throughput — large
+     *  per-call arrivals widen it (fewer interruptions during bulk file/log
+     *  reads), small arrivals narrow it (leaner folds during quiet interactive
+     *  work). Clamped to [nudgeGrowthMin, nudgeGrowthMax]; until three samples
+     *  exist it falls back to the clamped {@link nudgeGrowthTokens} seed.
+     *  Default unset/false → the static {@link nudgeGrowthTokens} behavior is
+     *  byte-for-byte unchanged. */
+    nudgeAdaptive?: boolean;
+    /** #1997: lower clamp (tokens) for the adaptive nudge step. Consulted only
+     *  when {@link nudgeAdaptive} is enabled. Default 10000. */
+    nudgeGrowthMin?: number;
+    /** #1997: upper clamp (tokens) for the adaptive nudge step. Consulted only
+     *  when {@link nudgeAdaptive} is enabled. Default 200000. */
+    nudgeGrowthMax?: number;
     /** Trailing messages never offered for compression
      *  (kernel `preserveRecentMessages`). */
     preserveRecentMessages?: number;
@@ -1626,7 +1642,8 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
 // level down under "compress". Keep in sync with parseCompressSettings.
 const COMPRESS_SETTING_FIELDS = new Set([
     "modelContextLimit", "maxContextLimit", "emergencyThresholdPercent",
-    "nudgeGrowthTokens", "preserveRecentMessages", "preserveRecentTokens",
+    "nudgeGrowthTokens", "nudgeAdaptive", "nudgeGrowthMin", "nudgeGrowthMax",
+    "preserveRecentMessages", "preserveRecentTokens",
     "minCompressRange", "minCompressRangeChars", "stripImagesKeepRecent",
     "outputHeadroomMaxPct", "tiers", "protectedLatestTools", "protectedTools",
     "neverPreserveRecentTools", "preserveRecentTools", "stripImages",
@@ -2007,7 +2024,7 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
         if (!numberOrPercent(obj[key])) { ok = false; continue; }
         (out as Record<string, unknown>)[key] = typeof obj[key] === "string" ? (obj[key] as string).trim() : obj[key];
     }
-    for (const key of ["nudgeGrowthTokens", "preserveRecentMessages", "preserveRecentTokens", "minCompressRange", "minCompressRangeChars", "stripImagesKeepRecent"] as const) {
+    for (const key of ["nudgeGrowthTokens", "nudgeGrowthMin", "nudgeGrowthMax", "preserveRecentMessages", "preserveRecentTokens", "minCompressRange", "minCompressRangeChars", "stripImagesKeepRecent"] as const) {
         takeNumber(key);
     }
     if ("outputHeadroomMaxPct" in obj) {
@@ -2022,6 +2039,10 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     if ("tiers" in obj) {
         if (typeof obj.tiers !== "boolean") ok = false;
         else out.tiers = obj.tiers;
+    }
+    if ("nudgeAdaptive" in obj) {
+        if (typeof obj.nudgeAdaptive !== "boolean") ok = false;
+        else out.nudgeAdaptive = obj.nudgeAdaptive;
     }
     for (const key of ["protectedLatestTools", "protectedTools"] as const) {
         if (!(key in obj) || obj[key] === undefined) continue;

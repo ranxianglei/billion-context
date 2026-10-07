@@ -6,7 +6,8 @@ import tls from "node:tls";
 import { createHash, randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { createCore, type CompressionCore, type CompressionState, type Config, type AbsorbConfig, type CoreMessage, type NudgeDecision, type Prompts, type PackSurface, type ToolPrompts, applyAcpToolOverrides, defaultPrompts, defaultCountTokens, renderNudgeText, deactivateBlock, viableRanges, resolveOutputSteeringConfig } from "acp-kernel";
-import { DEFAULT_STRIP_IMAGES_KEEP_RECENT, applyCompressSettings, resolveAbsorbSettings, resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig } from "./compress-settings.js";
+import { DEFAULT_STRIP_IMAGES_KEEP_RECENT, applyAdaptiveNudgeStep, applyCompressSettings, resolveAbsorbSettings, resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig } from "./compress-settings.js";
+import { ADAPTIVE_WINDOW } from "./nudge-adaptive.js";
 import { dropCompressReasoning, type CompressReasoningConfig } from "./reasoning-drop.js";
 import type { CompressSettings, ProxyOptions, ResignSettings } from "./config.js";
 export type { ProxyOptions } from "./config.js";
@@ -1580,6 +1581,7 @@ async function handle(
     // absolute number, a "70%" string of the native window, or unset → native)
     // overrides the table.
     let reqConfig = config;
+    let adaptiveMerged: CompressSettings | undefined;
     // #736: the resolved NATIVE window (before the compress.modelContextLimit
     // override and the codex align) plus what shrank the effective window below
     // it — threaded into preflightCompressIfNeeded so a fail-fast can tell the
@@ -1688,6 +1690,7 @@ async function handle(
                 if (native) nativeFromFallback = false;
             }
             reqConfig = resolveRequestConfig(config, opts.routes, embeddedUrl, model, native, opts.compress);
+            adaptiveMerged = resolveCompress(opts.routes, embeddedUrl, model, opts.compress);
             {
                 const wsSource = betaWindow ? "anthropic-beta" : suffixWindow ? "model-suffix" : pluginWindow ? "plugin" : runtimeWindow ? "runtime-info" : launcherWindow ? "launcher" : configuredWindow ? "configured" : peekWindow ? "registry-peek" : native ? "table-or-registry" : "default";
                 wsSourceForLog = wsSource;
@@ -2202,6 +2205,25 @@ async function handle(
         if (parsed !== null && typeof parsed === "object") {
             session.metadata.rawInputTokens = estimateRawBodyTokens(parsed) + imageTokensInParsedBody(protocol, parsed, imageBillingFor(opts, upstreamOrigin), imageTokenCapFor(opts, upstreamOrigin));
         }
+        // #1997 throughput-adaptive nudge cadence: fold this request's raw
+        // payload size into a bounded per-session ring, then overlay the
+        // adaptive nudge band onto the resolved config (a no-op unless the
+        // operator opted in via compress.nudgeAdaptive).
+        if (parsed !== null && typeof parsed === "object") {
+            const sample = session.metadata.rawInputTokens;
+            if (typeof sample === "number" && Number.isFinite(sample) && sample > 0) {
+                const prev = Array.isArray(session.metadata.nudgeInputHistory) ? (session.metadata.nudgeInputHistory as number[]) : [];
+                const ring = prev.slice();
+                if (ring[ring.length - 1] !== sample) ring.push(sample);
+                while (ring.length > ADAPTIVE_WINDOW) ring.shift();
+                session.metadata.nudgeInputHistory = ring;
+            }
+        }
+        reqConfig = applyAdaptiveNudgeStep(
+            reqConfig,
+            Array.isArray(session.metadata.nudgeInputHistory) ? (session.metadata.nudgeInputHistory as number[]) : [],
+            adaptiveMerged ?? {},
+        );
         if (anonAffinity) {
             prefixAffinity.note(sessionId, anonAffinity.incomingDepth, anonAffinity.tailHash, anonAffinity.itemHashes, false, anonAffinity.sketches, anonAffinity.userFlags);
             scheduleAffinityPersist();

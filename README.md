@@ -353,9 +353,11 @@ connectivity test. Everything is also plain JSON for scripting
 
 **When does compression happen?** It is model-driven: the injected context
 tools are called by the model as context grows, gentle growth nudges
-(~50K-token steps by design, adjustable via `compress.nudgeGrowthTokens`)
-prompt it along the way, and preflight fires as a hard backstop when the input
-alone exceeds the window (#470). Watch it live with `/acp` or the web UI.
+(~50K-token steps by design, adjustable via `compress.nudgeGrowthTokens`, or
+fully throughput-adaptive via `compress.nudgeAdaptive` so the step widens on
+bulk file/log reads and narrows on quiet interactive turns) prompt it along the
+way, and preflight fires as a hard backstop when the input alone exceeds the
+window (#470). Watch it live with `/acp` or the web UI.
 
 **Why does the first compaction wait until ~200k?** Compaction does not
 trigger on absolute window position but on growth intervals: by default the

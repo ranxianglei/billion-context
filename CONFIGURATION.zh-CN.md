@@ -1101,6 +1101,27 @@
 - **状态：** ACTIVE
 - **说明：** 软压缩 nudge 的 token 增长步长。每当有这么多 token 变为可压缩时，大约就会触发一次 nudge。值越小，nudge 越频繁。映射到内核字段 `nudge.growthFloor` 和 `nudge.growthCap`（它将引擎的自适应区间扁平化为这个固定步长）。
 
+#### `nudgeAdaptive`
+
+- **类型：** `boolean`
+- **默认值：** *（未设置 —— 静态行为）*
+- **状态：** ACTIVE（需显式开启）
+- **说明：** 吞吐自适应的 nudge 节奏（#1997）。设为 `true` 时，固定的 `nudgeGrowthTokens` 步长会被一个根据会话近期「每次调用输入吞吐」推导出的自适应步长取代：单次到达量大（批量读文件/日志）时步长放宽，避免折叠打断工作；单次到达量小（安静的交互式轮次）时步长收窄，让上下文保持精简。步长被夹在 [`nudgeGrowthMin`, `nudgeGrowthMax`] 之间，在积累到三个样本之前回退到夹取后的 `nudgeGrowthTokens` 种子值。它刻意同时参考增长幅度*与*调用次数（一个有界的近期请求窗口），而非墙钟时间或缓存占用。默认未设置/`false` → 静态 `nudgeGrowthTokens` 行为逐字节保持不变。
+
+#### `nudgeGrowthMin`
+
+- **类型：** `number`
+- **默认值：** `10000`
+- **状态：** ACTIVE（仅当 `nudgeAdaptive` 启用时生效）
+- **说明：** 自适应 nudge 步长的下界（tokens）。仅当 `nudgeAdaptive` 启用时才会读取。
+
+#### `nudgeGrowthMax`
+
+- **类型：** `number`
+- **默认值：** `200000`
+- **状态：** ACTIVE（仅当 `nudgeAdaptive` 启用时生效）
+- **说明：** 自适应 nudge 步长的上界（tokens）。仅当 `nudgeAdaptive` 启用时才会读取。
+
 #### `preserveRecentMessages`
 
 - **类型：** `number`

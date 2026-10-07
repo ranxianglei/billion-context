@@ -1,6 +1,7 @@
 import { DEFAULT_ABSORB_CONFIG, DEFAULT_CCR_CONFIG, DEFAULT_IMAGE_COMPRESSION_CONFIG, defaultPrompts, resolvePrompts, createPackResolver, defaultPackSources, isValidPackName, type AbsorbConfig, type Config, type CcrConfig, type ImageCompressionConfig, type PackSurface, type Prompts } from "acp-kernel";
 import * as path from "node:path";
 import { findRoute, type CompressSettings, type ProviderRoutes } from "./config.js";
+import { ADAPTIVE_DEFAULT_BASE, ADAPTIVE_DEFAULT_MAX, ADAPTIVE_DEFAULT_MIN, computeAdaptiveStep } from "./nudge-adaptive.js";
 import { configDir } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 
@@ -74,6 +75,9 @@ export function mergeCompress(
         maxContextLimit: pick("maxContextLimit"),
         emergencyThresholdPercent: pick("emergencyThresholdPercent"),
         nudgeGrowthTokens: pick("nudgeGrowthTokens"),
+        nudgeAdaptive: pick("nudgeAdaptive"),
+        nudgeGrowthMin: pick("nudgeGrowthMin"),
+        nudgeGrowthMax: pick("nudgeGrowthMax"),
         preserveRecentMessages: pick("preserveRecentMessages"),
         preserveRecentTokens: pick("preserveRecentTokens"),
         minCompressRangeChars: rangeOf(model) ?? rangeOf(provider) ?? rangeOf(global),
@@ -341,6 +345,27 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
         ...(s.rules !== undefined ? { rules: { enabled: s.rules === true } } : {}),
     };
     return resolved;
+}
+
+/** #1997: overlay the throughput-adaptive nudge band onto an ALREADY-resolved
+ *  per-request config. Returns the input unchanged when adaptive is disabled
+ *  (callers may invoke it unconditionally at zero cost); otherwise recomputes
+ *  the effective step from the session's recent per-call input history and pins
+ *  it onto `nudge.growthFloor`/`growthCap`. Applied to the fully-resolved config
+ *  (post window-capping) so it never reverts an earlier window decision — only
+ *  the nudge band changes. */
+export function applyAdaptiveNudgeStep(
+    cfg: ResolvedKernelConfig,
+    history: readonly number[],
+    s: CompressSettings,
+): ResolvedKernelConfig {
+    if (s.nudgeAdaptive !== true) return cfg;
+    const step = computeAdaptiveStep(history, {
+        base: s.nudgeGrowthTokens ?? ADAPTIVE_DEFAULT_BASE,
+        min: s.nudgeGrowthMin ?? ADAPTIVE_DEFAULT_MIN,
+        max: s.nudgeGrowthMax ?? ADAPTIVE_DEFAULT_MAX,
+    });
+    return { ...cfg, nudge: { ...cfg.nudge, growthFloor: step, growthCap: step } };
 }
 
 function parsePercent(v: number | string): number {
