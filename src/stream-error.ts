@@ -37,6 +37,29 @@ function safeWrite(res: http.ServerResponse, chunk: string): void {
     }
 }
 
+// #2328 Q2/Q4: termination diagnostics on the in-band truncation error frame.
+// All optional; the frame gains a `diagnostics` object only when supplied, so
+// callers passing none stay byte-identical. Bili-generated error-frame fields,
+// never user intent / tool-call args — the #1039 wire-fidelity bound holds.
+export type TruncationClassification =
+    | "missing-terminal"
+    | "unrecognized-terminal"
+    | "incomplete-trailing-event"
+    | "terminal-seen";
+
+export interface UpstreamTruncationMeta {
+    classification?: TruncationClassification;
+    sawTerminal?: boolean;
+    chunksReceived?: number;
+    bytesReceived?: number;
+    unparsedFrames?: number;
+    residualBufferLen?: number;
+    lastEventTypes?: string[];
+    upstreamStatus?: number;
+    upstreamContentType?: string;
+    retryNote?: string;
+}
+
 // #1455: protocol-native failure frames — same shapes as emitPreflightError
 // (#568) / emitUpstreamTruncation (#721). A mid-stream failure must reach the
 // client on the error channel, never as a synthesized successful completion
@@ -131,32 +154,36 @@ export function emitStreamError(res: http.ServerResponse, protocol: Protocol, me
  *    only reachable case from a pipe that treats that chunk as terminal).
  * Never throws.
  */
-export function emitUpstreamTruncation(res: http.ServerResponse, protocol: Protocol, finished: boolean, log?: (msg: string) => void): void {
+export function emitUpstreamTruncation(res: http.ServerResponse, protocol: Protocol, finished: boolean, log?: (msg: string) => void, meta?: UpstreamTruncationMeta): void {
     const message = "upstream stream ended before a completion event; this turn may be incomplete";
     const action = finished
         ? protocol === "google" ? "finish reason already delivered, stream complete" : "finish reason seen, synthesizing missing terminal byte"
         : "emitting in-band error";
-    log?.(`[acp-proxy: upstream stream truncated (${protocol}) — ${action}]`);
+    const diag = meta && Object.keys(meta).length > 0 ? { diagnostics: meta } : {};
+    const diagLog = meta?.classification
+        ? ` class=${meta.classification} chunks=${meta.chunksReceived ?? "?"} bytes=${meta.bytesReceived ?? "?"} unparsed=${meta.unparsedFrames ?? "?"} residualBuf=${meta.residualBufferLen ?? "?"} sawTerminal=${meta.sawTerminal ?? "?"}`
+        : "";
+    log?.(`[acp-proxy: upstream stream truncated (${protocol}) — ${action}${diagLog}]`);
     try {
         if (protocol === "openai") {
             if (finished) {
                 safeWrite(res, "data: [DONE]\n\n");
             } else {
-                safeWrite(res, `data: ${JSON.stringify({ error: { type: "server_error", code: "upstream_stream_truncated", message } })}\n\ndata: [DONE]\n\n`);
+                safeWrite(res, `data: ${JSON.stringify({ error: { type: "server_error", code: "upstream_stream_truncated", message, ...diag } })}\n\ndata: [DONE]\n\n`);
             }
         } else if (protocol === "responses") {
-            safeWrite(res, `event: error\ndata: ${JSON.stringify({ type: "error", code: "upstream_stream_truncated", message })}\n\n`);
+            safeWrite(res, `event: error\ndata: ${JSON.stringify({ type: "error", code: "upstream_stream_truncated", message, ...diag })}\n\n`);
         } else if (protocol === "google") {
             // The finishReason chunk IS Gemini's stream terminator: when it was
             // delivered, the client is already done and an extra terminal
             // object would read as a second answer. Only the mid-flight cut
             // needs the error frame (503/UNAVAILABLE — an upstream-cut stream).
-            if (!finished) safeWrite(res, `data: ${JSON.stringify({ error: { code: 503, message, status: "UNAVAILABLE" } })}\n\n`);
+            if (!finished) safeWrite(res, `data: ${JSON.stringify({ error: { code: 503, message, status: "UNAVAILABLE", ...diag } })}\n\n`);
         } else {
             if (finished) {
                 safeWrite(res, `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`);
             } else {
-                safeWrite(res, `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "server_error", code: "upstream_stream_truncated", message } })}\n\n`);
+                safeWrite(res, `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "server_error", code: "upstream_stream_truncated", message, ...diag } })}\n\n`);
             }
         }
     } catch {

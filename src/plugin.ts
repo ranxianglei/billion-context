@@ -21,7 +21,7 @@ import { composeStreamFilters, containsBiliInternalText, containsEchoResidue, co
 import { log as loggerLog } from "./logger.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "./store.js";
 import { imageUsageSuffix } from "./image-compress.js";
-import { emitStreamError, emitUpstreamTruncation } from "./stream-error.js";
+import { emitStreamError, emitUpstreamTruncation, type TruncationClassification, type UpstreamTruncationMeta } from "./stream-error.js";
 import { degenerateTurnWarning, endsWithDraftClose } from "./degenerate-turn.js";
 import { PANEL_BOX_FOOTER } from "./acp-panel.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
@@ -1693,6 +1693,27 @@ const CLEAN_TURN_REASONS = new Set(["stop", "end_turn", "stop_sequence"]);
 
 const ANTHROPIC_BLOCK_EVENT = /^content_block_(start|delta|stop)$/;
 
+export interface PluginPipeDiag {
+    dumpSse?: (name: string, stream: ReadableStream<Uint8Array>) => void;
+    upstreamStatus?: number;
+    upstreamContentType?: string;
+}
+
+function teeForDump(stream: ReadableStream<Uint8Array>, diag: PluginPipeDiag, wire: "chat" | "responses", session?: Session): ReadableStream<Uint8Array> {
+    if (!diag.dumpSse) return stream;
+    const [parse, dump] = stream.tee();
+    const sid = (session?.id ?? "anon").replace(/[^A-Za-z0-9._-]/g, "_") || "anon";
+    void diag.dumpSse(`${Date.now()}-${sid}-plugin-${wire}-raw.sse`, dump);
+    return parse;
+}
+
+function classifyTruncation(sawTerminal: boolean, unparsedFrames: number, residualLen: number): TruncationClassification {
+    if (sawTerminal) return "terminal-seen";
+    if (unparsedFrames > 0) return "unrecognized-terminal";
+    if (residualLen > 0) return "incomplete-trailing-event";
+    return "missing-terminal";
+}
+
 /** Plugin-mode streaming passthrough for the OpenAI chat-completions and
  *  Anthropic wires: forward upstream events byte-identical (the agent's
  *  native tool loop must see the model's tool calls untouched) while (a)
@@ -1730,12 +1751,32 @@ export async function pipePluginChatWithStrip(
     // The shipped request text: an emission-shaped span the user asked to
     // output verbatim is echoed, not dropped (m00885).
     requestText?: string,
+    diag?: PluginPipeDiag,
 ): Promise<void> {
-    let reader = stream.getReader();
+    const source = diag?.dumpSse ? teeForDump(stream, diag, "chat", session) : stream;
+    let reader = source.getReader();
     let decoder = new TextDecoder("utf-8");
     let buf = "";
     const acc: UsageSample = {};
     let sawStrippedEcho = false;
+    let chunksReceived = 0;
+    let bytesReceived = 0;
+    let unparsedFrames = 0;
+    let retryFired = false;
+    const lastEventTypes: string[] = [];
+    const pushEventType = (t: string): void => { lastEventTypes.push(t); if (lastEventTypes.length > 8) lastEventTypes.shift(); };
+    const buildTruncationMeta = (sawTerm: boolean): UpstreamTruncationMeta => ({
+        classification: classifyTruncation(sawTerm, unparsedFrames, buf.length),
+        sawTerminal: sawTerm,
+        chunksReceived,
+        bytesReceived,
+        unparsedFrames,
+        residualBufferLen: buf.length,
+        lastEventTypes: [...lastEventTypes],
+        upstreamStatus: diag?.upstreamStatus,
+        upstreamContentType: diag?.upstreamContentType,
+        retryNote: retryFired ? "one-shot-retry-consumed-still-truncated" : refetch ? "retry-gate-not-met-or-exhausted" : "no-refetch-provided",
+    });
     const onTagDrop = (snippet: string) => {
         droppedTagInFrame = true;
         sawStrippedEcho = true;
@@ -2477,7 +2518,7 @@ export async function pipePluginChatWithStrip(
             if (done) {
                 // #2171: an EOF with nothing client-visible yet is safely
                 // re-issuable — try the one-shot retry before giving up.
-                if (!sawTerminal && !res.destroyed && !res.writableEnded && (await retryZeroByteCut())) continue;
+                if (!sawTerminal && !res.destroyed && !res.writableEnded && (await retryZeroByteCut())) { retryFired = true; continue; }
                 // #2323: a CRLF/lone-CR whose final byte arrived last is held back
                 // by the streaming normalizer; resolve it and re-drive the completed
                 // event through the same path below before deciding truncation.
@@ -2486,6 +2527,7 @@ export async function pipePluginChatWithStrip(
                 buf = "";
                 pendingFinal = resolved;
             } else {
+                if (value && value.length > 0) { chunksReceived += 1; bytesReceived += value.length; }
                 pendingFinal = value && value.length > 0 ? decoder.decode(value, { stream: true }) : null;
             }
             if (pendingFinal !== null) {
@@ -2500,14 +2542,18 @@ export async function pipePluginChatWithStrip(
                     if (!jsonStr) continue;
                     if (jsonStr === "[DONE]") {
                         sawTerminal = true;
+                        pushEventType("[DONE]");
                         await write(flushTails() + rawEvent + "\n\n");
                         continue;
                     }
                     let ev: Record<string, unknown>;
                     try {
                         ev = JSON.parse(jsonStr) as Record<string, unknown>;
+                        pushEventType(typeof ev["type"] === "string" ? ev["type"] : "chunk");
                     } catch {
                         // #2190: unparseable frames bypass every filter — audit them.
+                        unparsedFrames += 1;
+                        pushEventType("<unparseable>");
                         auditRawForward(rawEvent);
                         await write(rawEvent + "\n\n");
                         continue;
@@ -2550,7 +2596,7 @@ export async function pipePluginChatWithStrip(
                     // can carry content AND the finish reason, so its own text has to
                     // count before the turn may be called empty. The event's output is
                     // dropped only when the retry takes the turn over.
-                    if (turnTerminal !== undefined && (await retryEmptyTurn(turnTerminal))) continue;
+                    if (turnTerminal !== undefined && (await retryEmptyTurn(turnTerminal))) { retryFired = true; continue; }
                     if (out.length > 0) await write(offsetRetryIndices(out));
                 }
             }
@@ -2580,7 +2626,7 @@ export async function pipePluginChatWithStrip(
         maybeWarnNamelessToolCalls();
         settleWitnesses();
         if (truncated) {
-            emitUpstreamTruncation(res, protocol, finalFinishReason !== undefined, log);
+            emitUpstreamTruncation(res, protocol, finalFinishReason !== undefined, log, buildTruncationMeta(sawTerminal));
             return;
         }
     } catch (e) {
@@ -2604,7 +2650,7 @@ export async function pipePluginChatWithStrip(
             /* client half-gone; the emission below is best-effort too */
         }
         loggerLog("warn", `[plugin] upstream stream read failed (${protocol}): ${String(e instanceof Error ? e.message : e)} — emitting in-band truncation signal`);
-        emitUpstreamTruncation(res, protocol, finalFinishReason !== undefined, log);
+        emitUpstreamTruncation(res, protocol, finalFinishReason !== undefined, log, buildTruncationMeta(sawTerminal));
         return;
     } finally {
         reader.releaseLock();
@@ -2725,11 +2771,31 @@ export async function pipePluginResponsesWithStrip(
     absorbInstructed?: boolean,
     // m00885: echoed (user-requested verbatim) emission spans survive.
     requestText?: string,
+    diag?: PluginPipeDiag,
 ): Promise<void> {
-    let reader = stream.getReader();
+    const source = diag?.dumpSse ? teeForDump(stream, diag, "responses", session) : stream;
+    let reader = source.getReader();
     let decoder = new TextDecoder("utf-8");
     let buf = "";
     const acc: UsageSample = {};
+    let chunksReceived = 0;
+    let bytesReceived = 0;
+    let unparsedFrames = 0;
+    let retryFired = false;
+    const lastEventTypes: string[] = [];
+    const pushEventType = (t: string): void => { lastEventTypes.push(t); if (lastEventTypes.length > 8) lastEventTypes.shift(); };
+    const buildTruncationMeta = (sawTerm: boolean): UpstreamTruncationMeta => ({
+        classification: classifyTruncation(sawTerm, unparsedFrames, buf.length),
+        sawTerminal: sawTerm,
+        chunksReceived,
+        bytesReceived,
+        unparsedFrames,
+        residualBufferLen: buf.length,
+        lastEventTypes: [...lastEventTypes],
+        upstreamStatus: diag?.upstreamStatus,
+        upstreamContentType: diag?.upstreamContentType,
+        retryNote: retryFired ? "one-shot-retry-consumed-still-truncated" : refetch ? "retry-gate-not-met-or-exhausted" : "no-refetch-provided",
+    });
     const onTagDrop = (snippet: string) => {
         loggerLog("warn", `[tag-echo] stripped model-emitted render tag (plugin passthrough): ${snippet.slice(0, 80).replace(/\n/g, " ")}`);
         log?.(`[tag-echo] stripped model-emitted render tag from plugin passthrough text`);
@@ -3063,7 +3129,7 @@ export async function pipePluginResponsesWithStrip(
             if (done) {
                 // #2171: an EOF with nothing client-visible yet is safely
                 // re-issuable — try the one-shot retry before giving up.
-                if (!sawTerminal && !res.destroyed && !res.writableEnded && (await retryZeroByteCut())) continue;
+                if (!sawTerminal && !res.destroyed && !res.writableEnded && (await retryZeroByteCut())) { retryFired = true; continue; }
                 // #2323: a CRLF/lone-CR whose final byte arrived last is held back
                 // by the streaming normalizer; resolve it and re-drive the completed
                 // event through the same path below before deciding truncation.
@@ -3072,6 +3138,7 @@ export async function pipePluginResponsesWithStrip(
                 buf = "";
                 pendingFinal = resolved;
             } else {
+                if (value && value.length > 0) { chunksReceived += 1; bytesReceived += value.length; }
                 pendingFinal = value && value.length > 0 ? decoder.decode(value, { stream: true }) : null;
             }
             if (pendingFinal !== null) {
@@ -3084,15 +3151,21 @@ export async function pipePluginResponsesWithStrip(
                     if (dataLines.length === 0) continue;
                     const jsonStr = dataLines.map((l) => l.slice(5).replace(/^ /, "")).join("\n").trim();
                     if (!jsonStr || jsonStr === "[DONE]") {
-                        if (jsonStr === "[DONE]") sawTerminal = true;
+                        if (jsonStr === "[DONE]") {
+                            sawTerminal = true;
+                            pushEventType("[DONE]");
+                        }
                         await write(rawEvent + "\n\n");
                         continue;
                     }
                     let ev: Record<string, unknown>;
                     try {
                         ev = JSON.parse(jsonStr) as Record<string, unknown>;
+                        pushEventType(typeof ev["type"] === "string" ? ev["type"] : "event");
                     } catch {
                         // #2190: unparseable frames bypass every filter — audit them.
+                        unparsedFrames += 1;
+                        pushEventType("<unparseable>");
                         auditRawForward(rawEvent);
                         await write(rawEvent + "\n\n");
                         continue;
@@ -3193,6 +3266,7 @@ export async function pipePluginResponsesWithStrip(
                     if (type === "response.completed" || type === "response.failed" || type === "response.incomplete") {
                         sawTerminal = true;
                         if (await retryEmptyTurn(type === "response.completed" ? "completed" : undefined)) {
+                            retryFired = true;
                             // The retry took over: this attempt's held family and
                             // its own completion frame are dropped together. Arg
                             // streams are empty here by construction — a function
@@ -3305,7 +3379,7 @@ export async function pipePluginResponsesWithStrip(
         // done-family event. Responses has no separate finish-reason concept
         // (terminal events carry the status), so this is always the error shape.
         if (!sawTerminal && !res.destroyed && !res.writableEnded) {
-            emitUpstreamTruncation(res, "responses", false, log);
+            emitUpstreamTruncation(res, "responses", false, log, buildTruncationMeta(sawTerminal));
             return;
         }
     } catch (e) {
@@ -3326,7 +3400,7 @@ export async function pipePluginResponsesWithStrip(
             /* client half-gone; the emission below is best-effort too */
         }
         loggerLog("warn", `[plugin] upstream stream read failed (responses): ${String(e instanceof Error ? e.message : e)} — emitting in-band truncation signal`);
-        emitUpstreamTruncation(res, "responses", false, log);
+        emitUpstreamTruncation(res, "responses", false, log, buildTruncationMeta(sawTerminal));
         return;
     } finally {
         reader.releaseLock();

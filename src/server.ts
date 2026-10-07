@@ -120,7 +120,7 @@ import { maybeAdoptForkBlocks, maybeAdoptResume } from "./fork-adoption.js";
 import { publicForkInputMatches } from "./plugin.js";
 import { flushPrefixAffinity, hydratePrefixAffinity, scheduleAffinityPersist } from "./affinity-persist.js";
 import { setSimhashAdoptionEnabled } from "./prefix-affinity.js";
-import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginFork, handlePluginSnapshot, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, isPluginFoldCallId, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister } from "./plugin.js";
+import { consumePluginRegisterFor, flushConversations, handlePluginCompact, handlePluginManifest, handlePluginFork, handlePluginSnapshot, handlePluginRegister, handlePluginRuntimeInfo, handlePluginStatus, handlePluginTool, isPluginFoldCallId, loadConversations, pipePluginChatWithStrip, pipePluginJson, pipePluginResponsesWithStrip, pluginAgentHeader, pluginConversationHeader, pluginHeadersMatchModel, pluginReportedContextWindow, pluginReportedMaxOutput, pluginRequestAgentHeader, pluginRuntimeInfoFor, pluginRuntimeInfoForConversation, recordChainVerdict, recordPluginSession, rememberPluginMessages, resolveConversation, runtimeConversationId, takePendingPluginRegister, type PluginPipeDiag } from "./plugin.js";
 import { setupMitm, readMitmUpstream, getBlindTunnelStats, liveBlindTunnels, MITM_RAW_SOCKET_KEY } from "./mitm.js";
 import { evaluateChain, extractChainCarriers, stampOutbound, stripEmbeddedChainCarriers } from "./chain-checkpoint.js";
 import type { BiliMessage } from "acp-kernel/wire";
@@ -6961,6 +6961,15 @@ async function forward(
     // endpoint; the outer upstreamOrigin is the configured route target).
     let targetOrigin: string | undefined;
     try { targetOrigin = new URL(upstreamUrl).origin; } catch { targetOrigin = undefined; }
+    // #2328: termination observability for the SSE strip pipes below — raw-SSE
+    // capture reuses diagnostics.dumpSse (no new config surface); upstream status
+    // + content-type ride into the in-band truncation signal.
+    const sseDumpDir = opts.dumpSse;
+    const sseDiag: PluginPipeDiag = {
+        upstreamStatus: upstream.status,
+        upstreamContentType: upstream.headers.get("content-type") ?? undefined,
+        ...(sseDumpDir ? { dumpSse: (name: string, s: ReadableStream<Uint8Array>) => { void dumpStreamToFile(s, sseDumpDir, name); } } : {}),
+    };
     // Plugin mode: the agent's native loop owns the tool surface — pass the
     // response through VERBATIM (a model-emitted compress call must reach the
     // plugin untouched) while sniffing usage so lastInputTokens (the input to
@@ -7029,6 +7038,7 @@ async function forward(
                         targetOrigin,
                         absorbInstructed,
                         wireBodyText,
+                        sseDiag,
                     );
                 } else {
                     // #732/#821: the plugin pipe re-issues the agent's own body
@@ -7055,6 +7065,7 @@ async function forward(
                         targetOrigin,
                         absorbInstructed,
                         wireBodyText,
+                        sseDiag,
                     );
                 }
             } else {
@@ -7157,6 +7168,10 @@ async function forward(
                         log,
                         label: prepared.session.id,
                     }),
+                    undefined,
+                    undefined,
+                    undefined,
+                    sseDiag,
                 );
             } else {
                 await pipeThrough(toClient, res);
@@ -7197,6 +7212,10 @@ async function forward(
                         log,
                         label: p.session.id,
                     }),
+                    undefined,
+                    undefined,
+                    undefined,
+                    sseDiag,
                 );
             } else {
                 await pipePluginChatWithStrip(
@@ -7216,6 +7235,10 @@ async function forward(
                         log,
                         label: p.session.id,
                     }),
+                    undefined,
+                    undefined,
+                    undefined,
+                    sseDiag,
                 );
             }
         } else if (
