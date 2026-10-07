@@ -182,7 +182,7 @@ pi / omp / kimi / claude 没有客户端侧通道 —— 它们的配置条目�
 - OpenCode 旧会话、V1/V2 插件形态与全部注意事项:[OpenCode](CLIENTS.zh-CN.md#opencode)。
 - `kimi` 仅在自举时上报 runtime-info(静态头无法承载逐请求窗口/模型值);子代理工具调用由代理的出站 tool_use 见证环路由(#1685)——模型看不到任何会话 id。
 - `hermes` 的原生插件是 Python:健康检查通过后用环境变量把 hermes 的 httpx 栈指向代理,并经 `llm_request` 中间件打逐请求头。
-- `claude` 有**原生姿态**(#964):受管 settings 块 + `SessionStart` hook + MCP shell;hook 骑自管端口区(#1660),每会话把受管 URL 重钉到存活 origin,端口漂移自愈。`BILI_NATIVE_CLAUDE=0` 退出(passthrough)。机制:[TECHNICAL-NOTES.zh-CN.md](TECHNICAL-NOTES.zh-CN.md)。
+- `claude` 有**原生姿态**(#964):受管 settings 块 + `SessionStart` hook + MCP shell;hook 骑自管端口区(#1660),每会话把受管 URL 重钉到存活 origin,端口漂移自愈。#1821 起 MCP shell 还在会话内守护代理(30s × 3 次失败),代理死亡时自行重生,lane 内模型请求 ~90s 内恢复而无需新开会话(与 zcode 车道同语义)。`BILI_NATIVE_CLAUDE=0` 退出(passthrough)。机制:[TECHNICAL-NOTES.zh-CN.md](TECHNICAL-NOTES.zh-CN.md)。
 - `zcode` 有**原生姿态**(#1145):受管 `~/.zcode/cli/config.json` 块 + 每会话 provider `baseURL` 改写。完整机制:[CLIENTS.zh-CN.md](CLIENTS.zh-CN.md)。
 - `omp` 是自拉起原生插件;`codex` 性质不同 —— 它是 MCP shell 工具面配套:codex 的模型流量只能经 env 路由(默认 ChatGPT-登录 provider 没有可改写的配置缝 —— managed `model_providers` 块会强制 API-key 认证、废掉订阅登录),而 MCP 子进程无法向父进程注入 env,所以插件安装既不拉代理、也永远路由不了 codex 本体流量。`bili plugin install codex` 在 `~/.codex/config.toml` 写入 `[mcp_servers.bili]`(command = node,args = dist/mcp.js)注册四个 ACP 工具,会话启动时解析代理:env `BILI_MCP_PROXY` > 活实例登记(任一 lane 的代理或 `bili start` 守护)> 8787 用户区默认(#1660 去掉了安装时烘焙 origin,#403)—— 全不可达则 `tools/list` 报 -32003。结论:**先起 bili**(`bili start` 或任一客户端的 lane 代理),想要压缩再自行导出 HTTPS_PROXY;零配置全功能用 `bili codex`。机制:[CLIENTS.zh-CN.md](CLIENTS.zh-CN.md#codexopenai-codex-cli)。
 - `jcode`、`aider` 无原生模式(无插件/MCP/工具注入接缝:#962、#1048)—— 用 `bili jcode` / `bili aider`。

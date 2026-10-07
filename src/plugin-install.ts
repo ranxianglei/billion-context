@@ -534,6 +534,16 @@ export function repinClaudeManagedBaseUrl(origin: string, env: NodeJS.ProcessEnv
     return notes;
 }
 
+/** #1821: the live origin of the managed block — the port the last SessionStart
+ *  hook repinned, i.e. what a RUNNING claude session dials. Undefined when the
+ *  settings file holds no bili-managed ANTHROPIC_BASE_URL (foreign or absent). */
+export function readClaudeManagedBaseUrl(env: NodeJS.ProcessEnv = process.env): string | undefined {
+    const cur = (readJson(claudeSettingsFile(env)).env as Record<string, unknown> | undefined)?.ANTHROPIC_BASE_URL;
+    if (typeof cur !== "string" || !isBiliClaudeBaseUrl(cur)) return undefined;
+    const i = cur.indexOf("/bili/");
+    return i > 0 ? cur.slice(0, i) : undefined;
+}
+
 /** Pure merge of the #964 managed block into parsed settings (install path).
  *  Never clobbers user keys: a foreign ANTHROPIC_BASE_URL or a non-"1"
  *  DISABLE_AUTO_COMPACT is reported and skipped, not overwritten. Returns the
@@ -724,14 +734,43 @@ function defaultWhereRunner(name: string): { stdout: string | null } {
     return { stdout: r.stdout ?? null };
 }
 
+// #1821: what to do about an existing "bili" MCP registration when installing.
+// Ownership is content-based, exactly like every other managed block here:
+// only a node-run command whose script is our entry (basename match — dev
+// checkouts and pnpm stores rename the package dir) counts as ours; anything
+// else keeps the name and is never touched. An unreadable .claude.json falls
+// back to the legacy behavior (plain add; the CLI owns its own file errors).
+function claudeMcpFaceAction(entryJs: string, stableOrigin: string):
+    { kind: "current" } | { kind: "fresh" } | { kind: "replace"; reason: string } | { kind: "foreign" } {
+    let data: Record<string, unknown>;
+    try {
+        data = readJson(claudeMcpJson());
+    } catch {
+        return { kind: "fresh" };
+    }
+    const servers = typeof data.mcpServers === "object" && data.mcpServers !== null ? (data.mcpServers as Record<string, unknown>) : {};
+    const bili = servers.bili;
+    if (typeof bili !== "object" || bili === null) return { kind: "fresh" };
+    const entry = bili as { command?: unknown; args?: unknown; env?: unknown };
+    const isNodeCommand = typeof entry.command === "string" && /node(?:\.(?:exe|cmd))?$/i.test(path.basename(entry.command));
+    const args = Array.isArray(entry.args) ? entry.args.filter((a): a is string => typeof a === "string") : [];
+    const ours = isNodeCommand && args.some((a) => /dist[\\/]claude-mcp-entry\.(?:js|mjs)$/.test(a));
+    const legacy = isNodeCommand && args.some((a) => /dist[\\/]mcp\.(?:js|mjs)$/.test(a));
+    if (!ours && !legacy) return { kind: "foreign" };
+    if (!ours) return { kind: "replace", reason: "migrated from dist/mcp.js" };
+    const pin = typeof entry.env === "object" && entry.env !== null ? (entry.env as Record<string, unknown>).BILI_MCP_PROXY : undefined;
+    if (pin === stableOrigin && args.includes(entryJs)) return { kind: "current" };
+    return { kind: "replace", reason: "re-pinned" };
+}
+
 function claudeInstall(): string {
     if (process.env.BILI_NATIVE_CLAUDE === "0") {
         throw new Error("claude: install refused — BILI_NATIVE_CLAUDE=0 is set (clear it to install the native posture)");
     }
     const root = selfPackageRoot();
-    const mcpJs = path.join(root, "dist", "mcp.js");
+    const mcpEntryJs = path.join(root, "dist", "claude-mcp-entry.js");
     const bootstrapJs = path.join(root, "dist", "claude-native-bootstrap.js");
-    requireDistFile(mcpJs);
+    requireDistFile(mcpEntryJs);
     requireDistFile(bootstrapJs);
 
     // Managed block first: the static URL + bootstrap hook + compaction off.
@@ -753,13 +792,35 @@ function claudeInstall(): string {
     });
     writeJson(file, data);
 
-    // MCP face: same registration path as before, but pinned to the STABLE
-    // port the hook brings up — never proxyOriginForInstall() (an ephemeral
-    // launcher proxy would go stale in this static config).
+    // MCP face: pinned to the STABLE port the hook brings up — never
+    // proxyOriginForInstall() (an ephemeral launcher proxy would go stale in
+    // this static config). #1821: the entry now carries the mid-session
+    // watchdog that respawns the lane proxy when it dies; pre-watchdog
+    // installs registered plain dist/mcp.js and are swapped in place below so
+    // an upgrade lands the self-heal without a manual reinstall dance.
     const stableOrigin = `http://127.0.0.1:${nativePort}`;
     const claude = resolveClaudeCli(process.env.CLAUDE?.trim() || "claude");
+    const mcpAdd = ["mcp", "add", "bili", "--scope", "user", "-e", `BILI_MCP_PROXY=${stableOrigin}`, "--", process.execPath, mcpEntryJs];
+    let mcpNote: string;
     try {
-        runClaudeCli(claude, ["mcp", "add", "bili", "--scope", "user", "-e", `BILI_MCP_PROXY=${stableOrigin}`, "--", process.execPath, mcpJs]);
+        const action = claudeMcpFaceAction(mcpEntryJs, stableOrigin);
+        switch (action.kind) {
+            case "current":
+                mcpNote = `MCP face current (${claudeMcpJson()}, pinned ${stableOrigin})`;
+                break;
+            case "fresh":
+                runClaudeCli(claude, mcpAdd);
+                mcpNote = `MCP face -> ${claudeMcpJson()} (pinned ${stableOrigin})`;
+                break;
+            case "replace":
+                runClaudeCli(claude, ["mcp", "remove", "bili", "--scope", "user"]);
+                runClaudeCli(claude, mcpAdd);
+                mcpNote = `MCP face -> ${claudeMcpJson()} (pinned ${stableOrigin}, ${action.reason})`;
+                break;
+            case "foreign":
+                mcpNote = `MCP face left untouched (foreign bili server at ${claudeMcpJson()})`;
+                break;
+        }
     } catch (err) {
         const stderr = err instanceof Error && "stderr" in err ? String((err as { stderr?: Buffer | string }).stderr ?? "") : "";
         throw new Error(`claude: MCP registration failed (${stderr.trim() || (err instanceof Error ? err.message : String(err))}) — is the claude CLI on PATH? (the managed settings block at ${file} was written; rerun after fixing the CLI to complete the MCP face)`);
@@ -779,7 +840,7 @@ function claudeInstall(): string {
     } catch (err) {
         throw new Error(`claude: /acp-cache command write failed (${err instanceof Error ? err.message : String(err)}) — the managed settings block at ${file} and the MCP face were written; fix the permissions and rerun`);
     }
-    return `claude: managed block -> ${file} (${notes.join("; ")}); /acp-cache command -> ${cmdFile} (${cmdNote}); MCP face -> ${claudeMcpJson()} (pinned ${stableOrigin}) — restart claude to activate`;
+    return `claude: managed block -> ${file} (${notes.join("; ")}); /acp-cache command -> ${cmdFile} (${cmdNote}); ${mcpNote} — restart claude to activate`;
 }
 
 function claudeRemove(): string {
