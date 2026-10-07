@@ -1,0 +1,3 @@
+name: 标准模式(bili 托管压缩)
+description: 与「标准模式」完全一致的编码 Agent；仅关闭 dsh 原生自动压缩，由 bili 的上下文压缩接管，避免双重压缩。手动 /compact 与工具结果修剪保留。
+order: 1
