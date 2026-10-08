@@ -2695,7 +2695,7 @@ function computeContextBreakdown(
   return { system, tool, summaries, code, text, total, growth };
 }
 
-function cloneState(state: CompressionState): CompressionState {
+export function cloneState(state: CompressionState): CompressionState {
   return {
     blocks: state.blocks.map((block) => ({
       ...block,
@@ -2733,6 +2733,27 @@ function cloneState(state: CompressionState): CompressionState {
     // too — same contract as the sync clone (kernel/src/sync.ts); dropping it
     // re-arms the restamp on every applyCompression.
     refLedgerAligned: state.refLedgerAligned,
+    // #3939 ③②⑤/#3691/#3805: these latches must survive the fold clone — the
+    // post-fold reset below retires them ONLY when a fold actually lands
+    // (blocksCreated > 0). An all-no-op or rejected batch must return the
+    // input latches intact (the rollback contract: the returned state differs
+    // from input.state only in the #2362 dead-ref tombstones). Dropping them
+    // here would lose the latches on every non-folding applyCompression call:
+    // the truncation watermark re-evaluates (#3691 oscillation), migration
+    // tags re-stamp mid-history (#3805), transform output re-derives on
+    // still-cached carriers (#3939 ⑤).
+    emergencyTruncateLatch: state.emergencyTruncateLatch
+      ? state.emergencyTruncateLatch.map((e) => ({ ref: e.ref, text: e.text }))
+      : undefined,
+    renderDeferredRefs: state.renderDeferredRefs
+      ? [...state.renderDeferredRefs]
+      : undefined,
+    viewLatches: state.viewLatches
+      ? Object.fromEntries(
+          Object.entries(state.viewLatches).map(([k, v]) => [k, { ...v }]),
+        )
+      : undefined,
+    viewLatchConfigDigest: state.viewLatchConfigDigest,
     // #5608-C/#5608-B: the visibility mark and the honest-NULL arm ride the
     // fold clone with the same contract — losing either re-opens its window.
     // Conditional spread: legacy states carry neither key and must stay
