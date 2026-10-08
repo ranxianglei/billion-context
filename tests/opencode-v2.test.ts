@@ -756,6 +756,78 @@ test("fetchManifest openai format maps parameters to inputSchema", async () => {
     }
 });
 
+test("#2443: v2 registers manifest-advertised conditional tools as a delta beyond the static set", async () => {
+    const RETRIEVE_PARAMS = { type: "object", properties: { ref: { type: "string" } }, required: ["ref"] };
+    const RULE_PARAMS = { type: "object", properties: { rule: { type: "string" } } };
+    // Advertise exactly what the proxy manifest does: the full static core PLUS the
+    // two conditional tools (rule + ccr-retrieve). The statics must be filtered out;
+    // only the delta gets registered on top of the bundled base set.
+    const manifestOpenai = [
+        ...ACP_TOOLS_OPENAI.map((t) => ({ name: t.function.name, description: t.function.description, parameters: t.function.parameters })),
+        { name: ABSORB_TOOL_OPENAI.function.name, description: ABSORB_TOOL_OPENAI.function.description, parameters: ABSORB_TOOL_OPENAI.function.parameters },
+        { name: "acp_rule", description: "Manage rules", parameters: RULE_PARAMS },
+        { name: "acp_retrieve", description: "Retrieve stored content", parameters: RETRIEVE_PARAMS },
+    ];
+    const toolCalls: Array<{ conversationId?: string; tool?: string; args?: unknown; nativeCaller?: boolean }> = [];
+    const server = http.createServer((req, res) => {
+        const url = req.url ?? "";
+        if (url === "/__bili/plugin/manifest") {
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: true, protocolVersion: 1, version: "9.9.9-test", tools: { openai: manifestOpenai } }));
+            return;
+        }
+        if (url === "/__bili/plugin/tool" && req.method === "POST") {
+            let body = "";
+            req.on("data", (c) => (body += c));
+            req.on("end", () => {
+                const data = JSON.parse(body);
+                toolCalls.push(data);
+                res.writeHead(200, { "content-type": "application/json" });
+                res.end(JSON.stringify({ ok: true, result: `retrieved:${data.tool}` }));
+            });
+            return;
+        }
+        res.writeHead(404);
+        res.end("{}");
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    const fake = makeFakeCtx();
+    try {
+        await withEnv({ BILLION_CONTEXT_PROXY: origin, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
+            try {
+                assert.deepEqual([...fake.addedTools.map((t) => t.name)].sort(), [...EXPECTED_TOOLS].sort());
+                assert.equal(fake.addedTools.some((t) => t.name === "acp_retrieve"), false);
+
+                // First routed request discovers the proxy base → delta sync fires.
+                await fake.fireModelRequest({ sessionID: "ses_delta", baseURL: "http://upstream.example/v1", model: { providerID: "qwen", id: "m1" } });
+                await until(() => fake.addedTools.some((t) => t.name === "acp_retrieve"));
+
+                // Each conditional appears EXACTLY once; each static stays singular
+                // (the second transform call accumulates, never duplicates the base).
+                assert.equal(fake.addedTools.filter((t) => t.name === "acp_retrieve").length, 1);
+                assert.equal(fake.addedTools.filter((t) => t.name === "acp_rule").length, 1);
+                for (const name of EXPECTED_TOOLS) assert.equal(fake.addedTools.filter((t) => t.name === name).length, 1, `${name} must stay singular`);
+                assert.equal(fake.addedTools.length, EXPECTED_TOOLS.length + 2);
+
+                const retrieve = fake.addedTools.find((t) => t.name === "acp_retrieve")!;
+                assert.deepEqual(retrieve.input, RETRIEVE_PARAMS);
+                assert.deepEqual(retrieve.options, { codemode: false, permission: "allow" });
+
+                const out = await retrieve.execute({ ref: "m00001" }, { sessionID: "ses_delta" });
+                assert.equal(out.content, "retrieved:acp_retrieve");
+                assert.deepEqual(toolCalls.at(-1), { conversationId: "ses_delta", tool: "acp_retrieve", args: { ref: "m00001" }, nativeCaller: true });
+            } finally {
+                cleanup();
+            }
+        });
+    } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+});
+
 import { createOpencodeV2Setup } from "../src/agent/opencode-v2.ts";
 
 function startRegisterProxy(failFirst = 0): Promise<{ origin: string; registers: Array<{ conversationId?: string; agent?: string; identity?: boolean; parentConversationId?: string }>; close: () => Promise<void> }> {
