@@ -26,7 +26,7 @@ import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoReasoning } from "
 import { reconcileSystemAnchor } from "../system-anchor.js";
 import { stripAcpPanelMessages, stripAcpStatusMarkers } from "../acp-panel.js";
 import { stripEmbeddedChainCarriers } from "../chain-checkpoint.js";
-import { renderNone as knobRenderNone, traeCompactMode } from "../knobs.js";
+import { renderNone as knobRenderNone } from "../knobs.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge } from "./budget.js";
 import { stripTraeCodeNativeCompactInstruction } from "./traecode-compact.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
@@ -95,8 +95,9 @@ export async function prepareOpenai(
     // presents its own compression surface (injectTools), so the model sees one
     // philosophy; runs BEFORE openaiToCore so kernel state and every rebuilt
     // view carry the clean system. Evidence-permitlist match on the tracked
-    // sentence (src/server/traecode-compact.ts); kill-switch per-request.
-    if (injectTools && traeCompactMode() === "intercept") {
+    // sentence (src/server/traecode-compact.ts). No opt-out knob for now —
+    // behavior first, escape hatch only if users ask (dsh-guard rollout order).
+    if (injectTools) {
         const trae = stripTraeCodeNativeCompactInstruction(parsed.messages);
         if (trae.neutralized > 0 && session.metadata.traeCompactNeutralized !== true) {
             session.metadata.traeCompactNeutralized = true;

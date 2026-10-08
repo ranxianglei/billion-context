@@ -8,7 +8,6 @@ import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { TRAE_NATIVE_COMPACT_SENTENCE, neutralizeTraeNativeCompactInstruction, stripTraeCodeNativeCompactInstruction } from "../src/server/traecode-compact.js";
-import { traeCompactMode } from "../src/knobs.js";
 
 process.env.NODE_ENV = "test";
 
@@ -103,25 +102,6 @@ test("strip: non-array input → zero", () => {
     assert.deepEqual(stripTraeCodeNativeCompactInstruction({}), { neutralized: 0, shapeDrift: false });
 });
 
-test("knob: traeCompactMode default/env/case/garbage", () => {
-    const prev = process.env.BILI_TRAE_COMPACT;
-    try {
-        delete process.env.BILI_TRAE_COMPACT;
-        assert.equal(traeCompactMode(), "intercept", "default is intercept");
-        process.env.BILI_TRAE_COMPACT = "pass";
-        assert.equal(traeCompactMode(), "pass");
-        process.env.BILI_TRAE_COMPACT = "PASS";
-        assert.equal(traeCompactMode(), "pass", "case-insensitive");
-        process.env.BILI_TRAE_COMPACT = "  pass  ";
-        assert.equal(traeCompactMode(), "pass", "trimmed");
-        process.env.BILI_TRAE_COMPACT = "banana";
-        assert.equal(traeCompactMode(), "intercept", "unknown value stays on intercept");
-    } finally {
-        if (prev === undefined) delete process.env.BILI_TRAE_COMPACT;
-        else process.env.BILI_TRAE_COMPACT = prev;
-    }
-});
-
 function sseLine(obj: unknown): string {
     return `data: ${JSON.stringify(obj)}\n\n`;
 }
@@ -153,8 +133,7 @@ async function postChat(url: string, messages: Array<{ role: string; content: st
     await res.arrayBuffer();
 }
 
-test("e2e: TraeCode-shaped chat-completions request forwards ONE compression philosophy; kill-switch restores passthrough (#2411)", async () => {
-    delete process.env.BILI_TRAE_COMPACT;
+test("e2e: TraeCode-shaped chat-completions request forwards ONE compression philosophy (#2411)", async () => {
     _setStoreForTest(new SessionStore({ enabled: false }));
     setRegistryForTest({});
     const bodies: string[] = [];
@@ -187,8 +166,8 @@ test("e2e: TraeCode-shaped chat-completions request forwards ONE compression phi
     await once(proxy, "listening");
     const url = `http://127.0.0.1:${(proxy.address() as { port: number }).port}/bili/http://127.0.0.1:${upstreamPort}/v1/chat/completions`;
     try {
-        // intercept (default): the conflicting native instruction is gone, the
-        // acp tool surface is present, surrounding system bytes are intact
+        // the conflicting native instruction is gone, the acp tool surface is
+        // present, surrounding system bytes are intact
         await postChat(url, [
             { role: "system", content: TRAECODE_SYSTEM },
             { role: "user", content: "first question" },
@@ -215,25 +194,7 @@ test("e2e: TraeCode-shaped chat-completions request forwards ONE compression phi
         const sent2 = JSON.parse(bodies[1]) as { messages: Array<{ role: string; content: string }> };
         const sys2 = sent2.messages.find((m) => m.role === "system")?.content ?? "";
         assert.ok(!sys2.includes(TRAE_NATIVE_COMPACT_SENTENCE), "continuation request stripped too");
-
-        // kill-switch: per-request read, no restart — native instruction passes through verbatim
-        process.env.BILI_TRAE_COMPACT = "pass";
-        await postChat(url, [
-            { role: "system", content: TRAECODE_SYSTEM },
-            { role: "user", content: "first question" },
-            { role: "assistant", content: "first answer" },
-            { role: "user", content: "second question" },
-            { role: "assistant", content: "second answer" },
-            { role: "user", content: "third question" },
-            { role: "assistant", content: "third answer" },
-            { role: "user", content: "fourth question" },
-        ]);
-        const sent3 = JSON.parse(bodies[2]) as { messages: Array<{ role: string; content: string }> };
-        const sys3 = sent3.messages.find((m) => m.role === "system")?.content ?? "";
-        assert.ok(sys3.includes(TRAE_NATIVE_COMPACT_SENTENCE), "kill-switch off: native instruction untouched");
-        delete process.env.BILI_TRAE_COMPACT;
     } finally {
-        delete process.env.BILI_TRAE_COMPACT;
         proxy.close();
         await once(proxy, "close");
         upstream.close();

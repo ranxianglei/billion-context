@@ -189,7 +189,6 @@
 | `fakeCompletion.retries` | number | 0 (opt-in) | BILI_FAKE_COMPLETION_RETRIES | 被截断的末块完成可被重新请求的次数；0 禁用该重试环。 |
 | `fakeCompletion.bufCapBytes` | number | 16777216 | BILI_FAKE_BUF_CAP | 重试环累积流缓冲的大小上限。 |
 | `codexCompact` | "intercept" \| "pass" | "intercept" | BILI_CODEX_COMPACT | 在 bili 内处理 Codex /responses/compact（intercept，默认）还是转给上游（pass）。 |
-| `traeCompact` | "intercept" \| "pass" | "intercept" | BILI_TRAE_COMPACT | 将 TRAE Code 原生自动压缩指令从 system prompt 中中和，使模型只看到一套压缩哲学（intercept，默认），或原样透传宿主 prompt（pass）。 |
 | `ccrRetrievalTtlMs` | number | 600000 (0 disables retrieval) | BILI_CCR_RETRIEVAL_TTL_MS | CCR 回取指针的有效期，过期后原文不再可通过 acp_retrieve 取回。 |
 | `decompressTmpCap` | number | 50 | BILI_DECOMPRESS_TMP_CAP | 会话内临时展开内容的大小上限（按块计）。 |
 
@@ -804,9 +803,8 @@
   "fakeCompletion": { "retries": 0, "bufCapBytes": 16777216 },
 
   // 标量
-  "codexCompact": "intercept",            // 或 "pass"
-  "traeCompact": "intercept",             // 或 "pass" —— #2411 TraeCode 原生自动压缩指令
-  "ccrRetrievalTtlMs": 600000,            // 排队 acp_retrieve 的过期时限；0 禁用
+   "codexCompact": "intercept",            // 或 "pass"
+   "ccrRetrievalTtlMs": 600000,            // 排队 acp_retrieve 的过期时限；0 禁用
   "decompressTmpCap": 50                  // 并发 decompress 临时文件上限
 }
 ```
@@ -860,12 +858,12 @@
 - **状态：** ACTIVE
 - **说明：** 针对流中途被宿主掐断场景的 fake-completion 安全网（#371）—— **显式开启**，`retries: 0`（默认）即 #371 之前的透传行为。`bufCapBytes` 是缓冲响应的 OOM 护栏。对应 `BILI_FAKE_COMPLETION_RETRIES`、`BILI_FAKE_BUF_CAP`。
 
-### `codexCompact` / `traeCompact` / `ccrRetrievalTtlMs` / `decompressTmpCap`
+### `codexCompact` / `ccrRetrievalTtlMs` / `decompressTmpCap`
 
 - **类型：** `string` ("intercept" | "pass") / `string` ("intercept" | "pass") / `number` / `number`
 - **默认值：** `"intercept"` / `"intercept"` / `600000` / `50`
 - **状态：** ACTIVE
-- **说明：** 顶层标量。`codexCompact`：bili 是否拦截 codex 原生 compaction 请求并本地伪造 ACP 交接，还是放行到上游（对应 `BILI_CODEX_COMPACT`；按请求读取，两层任一改动都无需重启）。`traeCompact`：bili 在向 OpenAI Chat Completions 请求注入自身压缩面时，是否把 TRAE Code 原生自动压缩指令从 system prompt 中中和，使模型看到一套而不是两套互相排斥的「谁来压缩」叙事（对应 `BILI_TRAE_COMPACT`；按请求读取，两层任一改动都无需重启）。`ccrRetrievalTtlMs`：排队未送达的 `acp_retrieve` 注入的过期时限，过期大声丢弃（对应 `BILI_CCR_RETRIEVAL_TTL_MS`；`0` 禁用）。`decompressTmpCap`：并发 decompress 临时文件上限（对应 `BILI_DECOMPRESS_TMP_CAP`）。
+- **说明：** 顶层标量。`codexCompact`：bili 是否拦截 codex 原生 compaction 请求并本地伪造 ACP 交接，还是放行到上游（对应 `BILI_CODEX_COMPACT`；按请求读取，两层任一改动都无需重启）。`ccrRetrievalTtlMs`：排队未送达的 `acp_retrieve` 注入的过期时限，过期大声丢弃（对应 `BILI_CCR_RETRIEVAL_TTL_MS`；`0` 禁用）。`decompressTmpCap`：并发 decompress 临时文件上限（对应 `BILI_DECOMPRESS_TMP_CAP`）。
 
 另有三个 #2030 键扩展了既有块：[`mitm.handshakeTimeoutMs`](#客户端接入)（默认 `10000`，对应 `BILI_MITM_HANDSHAKE_TIMEOUT_MS`）、[`compat.noCacheControl`](#compat)、[`compat.keepResponseId`](#compat)。
 
@@ -1655,7 +1653,6 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_STREAM_ERROR_SHAPE` | `compat.streamErrorShape` | protocol |
 | `BILI_STREAM_KEEPALIVE_MS` | `network.streamKeepAliveMs` | 15000 (0 disables) |
 | `BILI_SUBAGENT_SPLIT` | `subagentSplit` | true |
-| `BILI_TRAE_COMPACT` | `traeCompact` | "intercept" |
 | `BILI_UPDATE_CHECK_INTERVAL_MS` | `update.checkIntervalMs` | 180000 |
 | `BILI_UPDATE_REGISTRY` | `update.registry` | "npmjs" (registry.npmjs.org) |
 | `BILI_UPSTREAM_PROXY` | `proxy` | unset (direct) |
@@ -1761,7 +1758,6 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_CLAUDE_UPSTREAM` | claude 直连模式：当 `ANTHROPIC_BASE_URL` 已指向某个 relay 时，用它指定你的 relay 端点（否则会被旁路）。 |
 | `BILI_CLAUDE_NATIVE_PORT` | 为 claude 原生通道 hook 拉起的代理钉死**确切端口**（#964/#1660）：严格端口语义——口上的占用者被大声拒绝而不是跳口——烘进受管 `ANTHROPIC_BASE_URL`。不设则 hook 骑自管区（`BILI_ZONE_PORT` 基准 + 每 lane 粘性），且每次会话把受管 URL 重钉到存活 origin，端口漂移自愈（#1660）。 |
 | `BILI_CODEX_COMPACT` | codex 原生压缩处理。默认 `intercept`：安全门通过时（transform 成功 + 稳态用量 < 窗口 90% + 至少一个活跃压缩块）拦截 codex 的压缩请求，在本地伪造向 ACP 状态的交接——trigger 形态伪造 2 帧 SSE，endpoint 形态伪造 `{output}`——且不接触上游。伪造的 ACP 摘要经历史承载交接消息注入（缺席时 developer 消息兜底），保证 codex 截断历史后压缩内容仍可见。设为 `pass` 可退出，把 codex 的压缩请求转发给上游（原生压缩兜底）。任一安全门失败则原样透传。codex 客户端判定（本项生效范围，同时用于窗口 clamp 与会话身份指纹）：User-Agent 须以已注册前缀开头（`codex_cli_rs/`、`codex_exec/`、`codex desktop/`——大小写不敏感，因 Codex Desktop 等变体首字母大写，#1169），或含某个以**小写** `codex` 开头的空白分隔组件（未知变体如 `codex_sdk_ts/…`，#645——#1641 起从裸子串收窄为 token 级前缀，UA 中仅在括号内/路径段提及 "codex" 的非 codex 客户端不再被误判；兜底有意保持大小写敏感，排除 "Codex"-形中继，#1106）。 |
-| `BILI_TRAE_COMPACT` | TRAE Code 原生自动压缩指令处理（#2411）。默认 `intercept`：每当 bili 向 OpenAI Chat Completions 请求（proxy 模式）注入自身压缩面时，从 system prompt 中移除被跟踪的原生指令行（"The system will automatically compress prior messages…"），使模型只看到一套——ACP 的——压缩哲学，而不是两套互相排斥的「谁来压缩」叙事。匹配遵循证据许可清单：仅精确匹配被跟踪的句子（经 #2411 dump 验证会话内与跨会话字节稳定；不用 UA/形状启发式，因为客户端真实 header 在到达 bili 前已终止于其 sidecar）。若未来版本改写该句，匹配落空、行为退化为修复前透传；句子存在但行形态漂移时**不**修改并每会话告警一次（届时从新 dump 刷新被跟踪常量即可）。设为 `pass` 退出，原样转发宿主 system prompt。按请求读取——两层任一改动都无需重启。 |
 
 ---
 
