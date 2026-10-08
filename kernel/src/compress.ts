@@ -2009,7 +2009,7 @@ function computeContextBreakdown(
   return { system, tool, summaries, code, text, total, growth };
 }
 
-function cloneState(state: CompressionState): CompressionState {
+export function cloneState(state: CompressionState): CompressionState {
   return {
     blocks: state.blocks.map((block) => ({
       ...block,

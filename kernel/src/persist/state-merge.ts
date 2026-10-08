@@ -27,5 +27,10 @@ export function mergeCompressionState(
     terminalStreak: parsed.terminalStreak,
     imageFullRestored: parsed.imageFullRestored ?? fresh.imageFullRestored,
     imageShrinks: parsed.imageShrinks ?? fresh.imageShrinks,
+    // #2388: this explicit list was missing these two optional fields, so a
+    // standalone acp-kernel consumer lost them on restart. Bare passthrough
+    // like terminalStreak above — neither is seeded by createInitialState.
+    hiddenOrphanRefs: parsed.hiddenOrphanRefs,
+    lastPassIds: parsed.lastPassIds,
   };
 }
