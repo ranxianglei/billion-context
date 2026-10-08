@@ -75,6 +75,7 @@ test("defaults: no env, no file", () => {
     assert.equal(knobs.ccrRetrievalTtlMs(), 10 * 60 * 1000);
     assert.equal(knobs.publicSnapshotCapBytes(), 104_857_600);
     assert.equal(knobs.codexCompactMode(), "intercept");
+    assert.equal(knobs.traeCompactMode(), "intercept");
     assert.equal(knobs.decompressTmpCap(), 50);
     assert.equal(knobs.bodyDumpEnabled(), false);
     assert.equal(knobs.dumpReqAllowed(), true);
@@ -111,6 +112,7 @@ test("file tier: every migrated block resolves from the config file", () => {
         fakeCompletion: { retries: 2, bufCapBytes: 1048576 },
         plugin: { snapshotCapBytes: 999 },
         codexCompact: "pass",
+        traeCompact: "pass",
         ccrRetrievalTtlMs: 300000,
         decompressTmpCap: 7,
         mitm: { handshakeTimeoutMs: 1234 },
@@ -147,6 +149,7 @@ test("file tier: every migrated block resolves from the config file", () => {
     assert.equal(knobs.updateCheckIntervalMs(), 2500);
     assert.equal(knobs.ccrRetrievalTtlMs(), 300000);
     assert.equal(knobs.codexCompactMode(), "pass");
+    assert.equal(knobs.traeCompactMode(), "pass");
     assert.equal(knobs.decompressTmpCap(), 7);
     assert.equal(knobs.bodyDumpEnabled(), true);
     assert.equal(knobs.dumpReqAllowed(), false);
@@ -272,6 +275,12 @@ test("historical parsing quirks survive migration", () => {
     // codex compact mode normalization
     withEnv({ BILI_CODEX_COMPACT: "PASS" }, () => {
         assert.equal(knobs.codexCompactMode(), "pass");
+    });
+    withEnv({ BILI_TRAE_COMPACT: "PASS" }, () => {
+        assert.equal(knobs.traeCompactMode(), "pass");
+    });
+    withEnv({ BILI_TRAE_COMPACT: "banana" }, () => {
+        assert.equal(knobs.traeCompactMode(), "intercept", "unknown value stays on intercept");
     });
     // dump4xx cap floor is 1 KiB
     withEnv({ BILI_DUMP_4XX: "1", BILI_DUMP_4XX_MAX_BYTES: "10" }, () => {
