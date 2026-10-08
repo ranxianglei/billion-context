@@ -304,7 +304,7 @@ export function codexCompactMode(): CodexCompactMode {
     return loadConfigFile().codexCompact === "pass" ? "pass" : "intercept";
 }
 
-export type TraeCompactMode = "intercept" | "pass";
+type TraeCompactMode = "intercept" | "pass";
 
 /** BILI_TRAE_COMPACT > traeCompact > "intercept" (#2411). Read per-request so the kill-switch flips without a restart. */
 export function traeCompactMode(): TraeCompactMode {

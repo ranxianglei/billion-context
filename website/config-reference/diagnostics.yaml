@@ -117,6 +117,17 @@ entries:
     desc_zh: "在 bili 内处理 Codex /responses/compact（intercept，默认）还是转给上游（pass）。"
     site_en: "<code>codexCompact</code> — intercept | pass (default intercept): handle Codex /responses/compact inside bili or forward upstream."
     site_zh: "<code>codexCompact</code> —— intercept | pass（默认 intercept）：在 bili 内处理 Codex /responses/compact，还是转给上游。"
+  - key: traeCompact
+    type: "\"intercept\" | \"pass\""
+    default: "\"intercept\""
+    env: BILI_TRAE_COMPACT
+    group: diagnostics
+    id: tt.tct
+    site_group: adv
+    desc_en: "Neutralize TRAE Code's native auto-compact instruction in the system prompt so the model sees one compression philosophy (intercept, default) or pass the host prompt through untouched (pass)."
+    desc_zh: "将 TRAE Code 原生自动压缩指令从 system prompt 中中和，使模型只看到一套压缩哲学（intercept，默认），或原样透传宿主 prompt（pass）。"
+    site_en: "<code>traeCompact</code> — intercept | pass (default intercept): neutralize TRAE Code's native auto-compact instruction so the model sees one compression philosophy, or pass the host prompt through."
+    site_zh: "<code>traeCompact</code> —— intercept | pass（默认 intercept）：中和 TRAE Code 原生自动压缩指令使模型只看到一套压缩哲学，或原样透传宿主 prompt。"
   - key: ccrRetrievalTtlMs
     type: number
     default: "600000 (0 disables retrieval)"

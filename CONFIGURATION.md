@@ -1656,6 +1656,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_STREAM_ERROR_SHAPE` | `compat.streamErrorShape` | protocol |
 | `BILI_STREAM_KEEPALIVE_MS` | `network.streamKeepAliveMs` | 15000 (0 disables) |
 | `BILI_SUBAGENT_SPLIT` | `subagentSplit` | true |
+| `BILI_TRAE_COMPACT` | `traeCompact` | "intercept" |
 | `BILI_UPDATE_CHECK_INTERVAL_MS` | `update.checkIntervalMs` | 180000 |
 | `BILI_UPDATE_REGISTRY` | `update.registry` | "npmjs" (registry.npmjs.org) |
 | `BILI_UPSTREAM_PROXY` | `proxy` | unset (direct) |

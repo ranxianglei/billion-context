@@ -39,7 +39,7 @@ export const TRAE_NATIVE_COMPACT_SENTENCE =
 
 const BULLET_PREFIX = /^\s*[-*+]\s+/;
 
-export interface TraeNeutralizeResult {
+interface TraeNeutralizeResult {
     text: string;
     removed: number;
     /** tracked sentence present but not alone on its bullet line — NOT modified */
