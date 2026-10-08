@@ -152,6 +152,12 @@ export function projectThinkingMass(msgs: BiliMessage[], input: ThinkingMassInpu
     return gap;
 }
 
+// #2391: overhead split by component so an overflow diagnostic names which dominates; sum = estimateWireOverhead.
+export interface WireOverheadBreakdown {
+    systemTokens: number;
+    toolTokens: number;
+}
+
 /** #470: tokens the wire payload carries OUTSIDE the message array —
  * system/instructions text and tool definitions (including the proxy-injected
  * ACP tools). estimateCoreMessages only counts messages, so without this term
@@ -159,6 +165,12 @@ export function projectThinkingMass(msgs: BiliMessage[], input: ThinkingMassInpu
  * manifests: text alone "fits" while the real billed input already overflows
  * the window. Same term estimateInputTokens applies to the output clamp (#467). */
 export function estimateWireOverhead(protocol: "anthropic" | "openai" | "responses" | "google", body: string | Buffer | Record<string, unknown>): number {
+    const b = wireOverheadBreakdown(protocol, body);
+    return b.systemTokens + b.toolTokens;
+}
+
+export function wireOverheadBreakdown(protocol: "anthropic" | "openai" | "responses" | "google", body: string | Buffer | Record<string, unknown>): WireOverheadBreakdown {
+    const ZERO: WireOverheadBreakdown = { systemTokens: 0, toolTokens: 0 };
     let parsed: Record<string, unknown>;
     if (typeof body === "object" && !Buffer.isBuffer(body)) {
         parsed = body;
@@ -166,7 +178,7 @@ export function estimateWireOverhead(protocol: "anthropic" | "openai" | "respons
         try {
             parsed = JSON.parse(typeof body === "string" ? body : body.toString("utf8")) as Record<string, unknown>;
         } catch {
-            return 0;
+            return ZERO;
         }
     }
     const sysRaw = protocol === "responses"
@@ -217,9 +229,9 @@ export function estimateWireOverhead(protocol: "anthropic" | "openai" | "respons
             .join("\n");
         if (hoisted) sysText = sysText ? `${sysText}\n${hoisted}` : hoisted;
     }
-    return defaultCountTokens(sysText)
-        + defaultCountTokens(JSON.stringify(protocol === "responses" ? modelVisibleTools(parsed.tools) : parsed.tools ?? []))
+    const toolTokens = defaultCountTokens(JSON.stringify(protocol === "responses" ? modelVisibleTools(parsed.tools) : parsed.tools ?? []))
         + (protocol === "responses" ? countLoadedToolTokens(parsed) : 0);
+    return { systemTokens: defaultCountTokens(sysText), toolTokens };
 }
 
 /** Output-budget cap so input+output <= window. Returns the clamped budget, or

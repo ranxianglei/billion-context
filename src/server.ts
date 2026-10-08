@@ -171,7 +171,7 @@ import { codexResponsesCodec, responsesCodec } from "./responses-ws.js";
 import { currentFetchTransport } from "./fetch-transport.js";
 import { demoteGate, hasLeakedBiliToolsOnly, isSideRequest, outputBudgetField, resolveSideLane, restoreOutputBudget, SIDE_REQUEST_MAX_TOKENS, sideRequestGuard, stripLeakedBiliTools } from "./server/side-request.js";
 import { DSH_COMPACTION_SHAPE_MSGS, dshCompactionRefusal, isDshCompactionCall } from "./server/dsh-compaction-guard.js";
-import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead, projectThinkingMass } from "./server/budget.js";
+import { clampOutgoingOutput, countSystemAndToolsTokens, emergencyNudge, estimateInputTokens, estimateWireOverhead, projectThinkingMass, wireOverheadBreakdown } from "./server/budget.js";
 import { awaitDrain, bufferToStream, dumpStreamToFile, pipeThrough, readStreamToBuffer } from "./server/stream-io.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./server/chain-artifacts.js";
 import { piSubagentChannelFallback } from "./server/pi-subagent-channel.js";
@@ -2588,6 +2588,27 @@ export async function preflightCompressIfNeeded(
         log("error", `[${session.id}] preflight fail-fast ${status} (retryable=${retryable}): ${message}`);
         return { failFast: true, status, message, retryable, respond: !res.writableEnded };
     };
+    // #2391: fixed system+tool-schema overhead lives OUTSIDE the fold space, so when it
+    // alone >= limit no folding can ever fit the payload (fit gate is `< limit`). Fail
+    // fast with an actionable breakdown instead of the doomed walk + #726 cooldown. Raw
+    // overhead (not k̂-deflated) decides window fit: k̂ is a BILLING scale learned from
+    // usage reports (#1933), not a token-count measure — the raw chars/4 text reading is
+    // the conservative one the no-progress fit gate below already trusts; the
+    // !payloadFitsWindow guard keeps a calibrated forward intact. Verbatim images stay
+    // OUT of the trigger deliberately: their byte-based estimate is unreliable
+    // (pixel-tile billing, #1800), so image-dominated floors keep the house
+    // walk/futility/arbitration paths (#1800/#1841/#857) instead of this verdict.
+    if (!payloadFitsWindow && overheadEstimate >= limit) {
+        const { systemTokens, toolTokens } = wireOverheadBreakdown(prepared.protocol, prepared.body);
+        const shortfall = Math.max(0, overheadEstimate - limit);
+        const detail =
+            `mandatory per-request overhead alone exceeds the budget: instruction/system text ~${Math.round(systemTokens)} tok + tool definitions ~${Math.round(toolTokens)} tok` +
+            ` = ~${Math.round(overheadEstimate)} tok total, a shortfall of ~${Math.round(shortfall)} tok over the effective budget ${limit}. ` +
+            `This overhead rides outside the foldable conversation history, so conversation compression CANNOT reduce it — no amount of folding will bring this payload under the window. ` +
+            `Recovery options: trim the client's instruction/skill content or tool catalog; use a model with a larger context window; or lower the output reservation (compress.outputHeadroomMaxPct) to give input more room.`;
+        log("error", `[${session.id}] mandatory overhead alone (~${Math.round(overheadEstimate)} tok: sys~${Math.round(systemTokens)} + tools~${Math.round(toolTokens)}) >= effective budget ${limit} — compression cannot reduce it (#2391); failing fast without a summarization walk`);
+        return failFast(502, detail, false);
+    }
     if ((prepared.nudge?.compressibleRanges ?? []).length === 0) {
         // Headroom or a stale baseline can trigger preflight on a fitting payload.
         // Anonymous sessions need the conservative upper bound to prove that fit.
@@ -4461,4 +4482,4 @@ function logMsg(opts: ProxyOptions, level: string, msg: string): void {
 export { getUnrecognizedPathStats, logDumpFailure, logUnrecognizedPath } from "./server/observability.js";
 export { BILI_HOP_HEADER, parseLauncherModelWindows, anthropicBetaContextWindow, capRegistryWindowByStandard, expandedContextSuffixWindow } from "./server/context-window.js";
 export { BILI_TOOL_NAMES, isSideRequest, outputBudgetField, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools, _resetNoOutputCeilingWarningsForTest, type OutputBudgetField } from "./server/side-request.js";
-export { countSystemAndToolsTokens, estimateInputTokens, estimateWireOverhead, clampOutputBudget, emergencyNudge, projectThinkingMass, type ThinkingMassInput } from "./server/budget.js";
+export { countSystemAndToolsTokens, estimateInputTokens, estimateWireOverhead, wireOverheadBreakdown, clampOutputBudget, emergencyNudge, projectThinkingMass, type ThinkingMassInput, type WireOverheadBreakdown } from "./server/budget.js";
