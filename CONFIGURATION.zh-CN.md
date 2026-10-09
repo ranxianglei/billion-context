@@ -1757,6 +1757,38 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 
 ---
 
+## 上游故障诊断（代理上游）
+
+每个上游传输失败都会被分类为一种 `kind=`，作为日志行（以及客户端/状态看到的 `error:` 字符串）的前缀，并附带修复提示（`hint=...`）。分类体系（#1263）：
+
+| kind | 含义 | bili 行为 |
+|------|------|-----------|
+| `client-abort` | 下游客户端断连 | 无（请求按定义已死） |
+| `upstream-timeout` | 空闲预算耗尽（headers/body）或请求看门狗中止 | **不重试** —— 绝不叠加等待预算 |
+| `connect-timeout` | TCP 握手未完成（端点不可达/被黑洞） | 透明重放，受 `BILI_REPLAY_RETRY_MAX` 约束 |
+| `proxy-reset` | 经代理的连接在响应前死亡（首要嫌疑：代理空闲回收 / 载荷上限 / 节点轮换） | 透明重放，受 `BILI_REPLAY_RETRY_MAX` 约束（默认共 3 次尝试） |
+| `upstream-reset` | 同上，直连（嫌疑在上游/本地网络） | 同上（受 `BILI_REPLAY_RETRY_MAX` 约束） |
+| `connect-refused` | TCP 被拒（配置了代理时指代理，否则指上游） | 同上（受 `BILI_REPLAY_RETRY_MAX` 约束） |
+| `dns` | 域名解析失败（DNS 服务器 / 主机名拼写错误） | 透明重放，受 `BILI_REPLAY_RETRY_MAX` 约束 |
+| `tls` / `unknown` | TLS/握手失败（CA/MITM）/ 未分类传输故障 | 不重试 |
+
+握手类韧性配合代理连接的 keep-alive 上限（`BILI_PROXY_KEEPALIVE_MAX_MS`，默认 55s），让 bili 不再向即将回收套接字的代理提供这些连接。
+
+长会话出现周期性连接故障时的**四步清单**（源自 #1249）：
+1. 在 `bili.log` 中 grep `kind=` —— `proxy-reset` 聚集指向外部代理；`upstream-timeout` 指向上游健康度。
+2. 将失败请求的时间戳与外部代理自身的访问日志对齐（同一主机时钟）——同一毫秒的回收条目即可结案。
+3. 确认是哪一跳：同一行里 `proxy=<url>` vs `proxy=direct`；对照代理文档的载荷上限检查转发请求的 `content-length`。
+4. 若代理是回收方，要么调高其空闲超时，要么保留 bili 的 55s 复用上限 + 一次重放安全网来吸收。
+
+**宿主侧重试分层（#2568 第 4 项）。** 当插件宿主跑在 bili 后面（如 `bili pi`）时，响应前的传输失败可能被两个互不可见彼此计数的独立层重试：
+
+1. 上述 bili 传输重放（≤ `BILI_REPLAY_RETRY_MAX` 次尝试，`BILI_REPLAY_RETRY_BASE_MS`×2ⁿ 退避），作用于 bili→上游 腿；
+2. 宿主自身的轮级重试预算，作用于 宿主→bili 腿（pi：`retry.maxRetries` 默认 3、基础延迟 2s 指数退避；当暴露出的错误文本命中其瞬态模式表时触发）。
+
+两层对连接类故障刻意重叠而非互相让位：bili 的快速本地重放在宿主重跑整条轮次管线之前吸收毫秒级抖动；而当 `BILI_REPLAY_RETRY_MAX=1`（快速失败）时宿主的层仍保护轮次。对完全死亡的上游，最坏情况 = 每个用户可见轮次 (宿主尝试数) × (bili 尝试数) 次连接 —— 默认参数下 4 × 3 = **12** 次，嵌套退避总时长约 30–35 s 后错误才浮现。两层的预算都是有限定值，最坏情形有界。
+
+排障时关联两份日志：bili 每次传输重放都记录 `[<session>] [acp-proxy] upstream <kind> (pre-response network failure): <error>; retrying in <ms>ms (attempt n/m)`（warn 级，`bili.log`）；pi 每次轮级重试发出 `auto_retry_start` / `auto_retry_end` 事件（交互式 TUI 中显示为状态行）。按 session id + 时间窗对齐——两层之间没有共享关联 id。
+
 ## CLI 参考
 
 完整命令面（`bili --help` 打印的是精简版）。优先级处处一致：**CLI 参数 > 环境变量 > 配置文件 > 内置默认值**。

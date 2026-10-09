@@ -1769,11 +1769,13 @@ Every upstream transport failure is classified into a `kind=` that leads its log
 | kind | meaning | bili behavior |
 |------|---------|---------------|
 | `client-abort` | downstream client disconnected | nothing (request dead by definition) |
-| `upstream-timeout` | idle budget expired or connect timed out | **not retried** — never stack wait budgets |
+| `upstream-timeout` | idle budget expired (headers/body) or request-watchdog abort | **not retried** — never stack wait budgets |
+| `connect-timeout` | TCP handshake never completed (endpoint unreachable/blackholed) | transparent replay, bounded by `BILI_REPLAY_RETRY_MAX` |
 | `proxy-reset` | connection died pre-response **through a proxy** (prime suspect: proxy idle-recycle / payload cap / node churn) | transparent replay, bounded by `BILI_REPLAY_RETRY_MAX` (default 3 total attempts) |
 | `upstream-reset` | same, direct connection (suspect upstream/local network) | same (bounded by `BILI_REPLAY_RETRY_MAX`) |
 | `connect-refused` | TCP refused (the proxy when configured, else upstream) | same (bounded by `BILI_REPLAY_RETRY_MAX`) |
-| `dns` / `tls` / `unknown` | resolution / handshake / unclassified | not retried |
+| `dns` | name resolution failed (DNS server / hostname typo) | transparent replay, bounded by `BILI_REPLAY_RETRY_MAX` |
+| `tls` / `unknown` | TLS/handshake failure (CA/MITM) / unclassified transport failure | not retried |
 
 Handshake-class resilience is paired with a keep-alive cap for proxied connections (`BILI_PROXY_KEEPALIVE_MAX_MS`, default 55s) so bili stops offering proxies sockets they are about to recycle.
 
@@ -1782,6 +1784,15 @@ Handshake-class resilience is paired with a keep-alive cap for proxied connectio
 2. Align timestamps of the failing requests with the external proxy's own access log (same host clock) — a recycle entry at the same millisecond closes the case.
 3. Confirm which hop: `proxy=<url>` vs `proxy=direct` in the same line; check request body size (`content-length` of the forwarded request) against the proxy's documented payload cap.
 4. If the proxy is the recycler, either raise its idle timeout or leave bili's 55s reuse cap + one-replay safety net to absorb it.
+
+**Host-side retry layering (#2568 item 4).** When a plugin host runs behind bili (e.g. `bili pi`), pre-response transport failures can be retried by TWO independent layers that cannot see each other's counters:
+
+1. bili's transport replay above (≤ `BILI_REPLAY_RETRY_MAX` attempts, `BILI_REPLAY_RETRY_BASE_MS`×2ⁿ backoff) on the bili→upstream leg;
+2. the host's own turn-level retry budget on the host→bili leg (pi: `retry.maxRetries`, default 3, base delay 2s exponential; fires when the surfaced error text matches its transient-pattern table).
+
+The layers deliberately overlap on connect-class failures rather than one yielding to the other: bili's fast local replay absorbs millisecond blips before the host re-runs its whole turn pipeline, and the host layer still protects turns when `BILI_REPLAY_RETRY_MAX=1` (fail-fast). Consequence for a fully dead upstream: worst case per user-visible turn = (host attempts) × (bili attempts) connections — with defaults 4 × 3 = **12**, with ≈30–35 s of nested backoff before the error surfaces. Both budgets are finite fixed counts, so the worst case stays bounded.
+
+Correlating the two logs while debugging: each bili transport replay logs `[<session>] [acp-proxy] upstream <kind> (pre-response network failure): <error>; retrying in <ms>ms (attempt n/m)` (warn level, `bili.log`); pi emits `auto_retry_start` / `auto_retry_end` events per turn retry (status lines in the interactive TUI). Match them by session id + timestamp window — there is no shared correlation id between the layers.
 
 ## CLI Reference
 
