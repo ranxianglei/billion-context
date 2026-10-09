@@ -409,7 +409,7 @@ export type Session = {
 type AnonymousPrefixAffinityStamp = {
     depth: number;
     tailHash: string;
-    via: "prefix" | "new";
+    via: "prefix" | "new" | "simhash";
     lineage?: { parents: string[]; reason: "truncated" | "forked"; sharedPrefix?: number };
 };
 
