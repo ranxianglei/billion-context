@@ -23,6 +23,8 @@ KEEP VERBATIM — never paraphrase or abbreviate these:
 - Open questions and unresolved TODOs — losing these changes what work appears to remain.
 - Message refs of key anchors (`m00420`, `m00510–m00520`) — they let you or a later reader jump back via decompress to the exact original.
 
+TIME SENSITIVITY — the line numbers and code snippets kept above are a SNAPSHOT as of this block's creation: files edited since have drifted from them. Treat them as re-find anchors, not current facts — before using any of them for edit/grep/verification, re-read the file and confirm its current content; never anchor an edit to a snippet you have not confirmed live.
+
 DROP — extract the signal, discard the vessel:
 - Verbose logs (build/test/`npm` output) once you have captured the error line or the result.
 - Duplicate file reads once the needed content is recorded.

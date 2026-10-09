@@ -13,6 +13,13 @@
  * Sidecar showed a multi-block merge (b22 ⊇ b13) dropping a still-open user pivot that
  * b13 had recorded, and the trust-guardrail wording deprioritized objectives living only
  * in summaries. Quotes stay historical; open-objective STATUS is current.
+ *
+ * 2026-10-09 amendment (billion-context#2522, migrated from billion-context-pi#592):
+ * write-side time-sensitivity clause added to the tier-1 rules (mirrored in the lean
+ * pack). Summaries' line numbers/code snippets are snapshots as of block creation and
+ * drift once files are edited — without the declaration they read as live facts, which
+ * drove a stale-oldText edit replay loop in a 2026-10-01 long session. Tier-2 already
+ * drops exact line numbers, so tier-1 is the only stale-anchor surface.
  */
 
 /** Opt-in language-preservation rule (#493): summaries must be written in the
@@ -48,6 +55,8 @@ KEEP VERBATIM — never paraphrase or abbreviate these:
 - Purpose behind each significant action — preserve not just what was done but why: the hypothesis behind each experiment, the question behind each exploration, the task goal behind each work action. Without purpose, the summary reads as disconnected technical steps with no through-line.
 - Open questions and unresolved TODOs — losing these changes what work appears to remain.
 - Message refs of key anchors (\`m00420\`, \`m00510–m00520\`) — they let you or a later reader jump back via decompress to the exact original.
+
+TIME SENSITIVITY — the line numbers and code snippets kept above are a SNAPSHOT as of this block's creation: files edited since have drifted from them. Treat them as re-find anchors, not current facts — before using any of them for edit/grep/verification, re-read the file and confirm its current content; never anchor an edit to a snippet you have not confirmed live.
 
 DROP — extract the signal, discard the vessel:
 - Verbose logs (build/test/\`npm\` output) once you have captured the error line or the result.

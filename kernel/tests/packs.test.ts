@@ -113,6 +113,7 @@ test("lean carries a condensed how-to-compress style contract in the pi slot", (
     "PRIORITY",
     "Do not mimic",
     "Open objectives",
+    "Time sensitivity", // #2522: fold-time snapshot declaration for line numbers/snippets
   ]) {
     assert.ok(howTo.includes(marker), `missing: ${marker}`);
   }
