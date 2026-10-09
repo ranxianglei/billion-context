@@ -20,6 +20,7 @@
 // through the decision, by design).
 
 import type { CompressibleRange } from "acp-kernel";
+import { unwrapDataEnvelope } from "./preflight.js";
 
 /** Output budget for the decision call. Matches the SIDE_REQUEST_MAX_TOKENS=200
  *  system (title-gen side requests use the same ceiling class). */
@@ -191,6 +192,7 @@ export function extractDecisionText(
     json: Record<string, unknown> | null,
 ): string {
     if (!json) return "";
+    json = unwrapDataEnvelope(json);
     const parts: string[] = [];
     if (protocol === "anthropic") {
         const content = json.content;

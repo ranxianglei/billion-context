@@ -1,7 +1,7 @@
 import type { SummaryCandidate, SummaryWork } from "./external-summary.js";
 import { defaultCountTokens } from "acp-kernel";
 import { fetchWithTimeout } from "./fetch-util.js";
-import { extractSummaryFromSse, extractSummaryText, summaryPayload, type PreflightProtocol } from "./preflight.js";
+import { extractSummaryFromSse, extractSummaryText, summaryPayload, unwrapDataEnvelope, type PreflightProtocol } from "./preflight.js";
 import { normalizeSseLineEndings } from "./sse-util.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 
@@ -44,7 +44,8 @@ function completed(protocol: PreflightProtocol, events: unknown[], streaming: bo
             if (reason === "end_turn" || reason === "stop_sequence") anthropicStopReason = true;
             if (streaming ? item.type === "message_stop" && anthropicStopReason : anthropicStopReason) terminal = true;
         } else if (protocol === "openai") {
-            const choice = Array.isArray(item.choices) ? record(item.choices[0]) : undefined;
+            const body = unwrapDataEnvelope(item);
+            const choice = Array.isArray(body.choices) ? record(body.choices[0]) : undefined;
             if (record(choice?.message)?.tool_calls || record(choice?.delta)?.tool_calls) return false;
             if (choice?.finish_reason) {
                 if (choice.finish_reason !== "stop") return false;
@@ -89,7 +90,7 @@ function parseSummary(protocol: PreflightProtocol, text: string): string {
     try { json = JSON.parse(text); } catch { json = undefined; }
     let summary: string;
     if (json && typeof json === "object") {
-        const events = Array.isArray(json) ? json : [json];
+        const events = Array.isArray(json) ? json : [unwrapDataEnvelope(json as Record<string, unknown>)];
         if (!completed(protocol, events, false)) throw new Error("External summary response did not complete");
         summary = extractSummaryText(protocol, json as Record<string, unknown>);
     } else {

@@ -581,6 +581,29 @@ function googleChunkText(chunk: Record<string, unknown>): string {
 //     (\n\n, CRLF-tolerant), else it may have been cut mid-frame
 // A rejected stream returns "" so requestSummary routes it into
 // diagnoseEmptySummary + the #726 halving/cooldown chain.
+// Some OpenAI-compatible relays wrap a successful chat-completion body in a
+// single `data` envelope ({ "data": { choices: [...] } }) instead of returning
+// top-level choices. A body like that parses as valid JSON but has no
+// `choices`/`content`/`output` at the top level, so every summary extractor
+// sees an empty summary and the request burns its whole retry budget on a
+// payload that actually succeeded. unwrapDataEnvelope removes exactly one such
+// shell before parsing: only when the outer object carries none of the known
+// body shapes, `data` is a plain object, and the outer object is not itself an
+// error. Everything else (double envelopes, {data:[...]} arrays, error
+// objects, standard bodies) passes through untouched.
+export function unwrapDataEnvelope(json: Record<string, unknown>): Record<string, unknown> {
+    if (Array.isArray(json) || typeof json !== "object" || json === null) return json;
+    if (json.error !== undefined) return json;
+    if ("choices" in json || "content" in json || "output" in json || "output_text" in json || "candidates" in json) return json;
+    const data = json.data;
+    if (!data || typeof data !== "object" || Array.isArray(data)) return json;
+    const inner = data as Record<string, unknown>;
+    if (inner.choices !== undefined || inner.content !== undefined || inner.output !== undefined || inner.output_text !== undefined || inner.candidates !== undefined) {
+        return inner;
+    }
+    return json;
+}
+
 export function extractSummaryFromSse(protocol: PreflightProtocol, text: string): string {
     const framed = /\r?\n\r?\n$/.test(text);
     let out = "";
@@ -612,7 +635,7 @@ export function extractSummaryFromSse(protocol: PreflightProtocol, text: string)
             badFrame = true;
             continue;
         }
-        const o = obj as Record<string, unknown>;
+        const o = unwrapDataEnvelope(obj as Record<string, unknown>);
         const type = typeof o.type === "string" ? o.type : eventType;
         if (type === "error" || type === "response.incomplete" || type === "response.failed" || type === "response.error" || (!type && o.error && typeof o.error === "object")) {
             invalid = true;
@@ -652,6 +675,7 @@ export function extractSummaryFromSse(protocol: PreflightProtocol, text: string)
 }
 
 export function extractSummaryText(protocol: PreflightProtocol, json: Record<string, unknown>): string {
+    json = unwrapDataEnvelope(json);
     if (protocol === "anthropic") {
         const content = json.content;
         if (!Array.isArray(content)) return "";
