@@ -203,6 +203,7 @@ qwen / mcode / aider / copilot / amp / goose      (full list: bili --help)</code
             <tr><td class="mono">rules</td><td class="mech">boolean</td><td data-i18n="ct.rules">Off by default: persistent model reminders delivered through an injected acp_rule tool, hard-protected from folds. pi/omp expose an /acp-rule command.</td></tr>
             <tr><td class="mono">injectTool</td><td class="mech">boolean</td><td data-i18n="ct.it">Register the acp_compress tool for clients (on by default; global level only).</td></tr>
             <tr><td class="mono">injectNudge</td><td class="mech">boolean</td><td data-i18n="ct.in">Send growth nudges as the window fills (on by default; global level only).</td></tr>
+            <tr><td class="mono">timeoutSeconds</td><td class="mech">number | null</td><td data-i18n="ct.cs">Hard timeout for the agent-side compress tool call: positive = abort after N seconds; 0/null = disable the cap; unset = fixed 60 s backstop. Global level only.</td></tr>
             <tr><td class="mono">reasoning</td><td class="mech">{ drop?, threshold? }</td><td data-i18n="ct.rz">{ drop?, threshold? } — drop finished-round reasoning runs longer than 2048 chars (drop: true by default); strict-reasoning upstreams need drop:false.</td></tr>
 <!-- /bili:gen -->
           </tbody>

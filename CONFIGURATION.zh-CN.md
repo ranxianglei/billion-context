@@ -221,6 +221,7 @@
 | `compress.rules` | boolean | false | — | 通过注入的 acp_rule 工具提供持久模型提醒——对折叠硬保护；pi/omp 提供 /acp-rule 命令。 |
 | `compress.injectTool` | boolean | true | ACP_COMPRESS_TOOL | 向客户端注册 acp_compress 工具（仅全局层级生效）。 |
 | `compress.injectNudge` | boolean | true | ACP_COMPRESS_NUDGE | 窗口填满过程中发送增长提醒（仅全局层级生效）。 |
+| `compress.timeoutSeconds` | number \| null | unset (built-in 60 s backstop) | — | compress 工具调用的客户端侧硬超时（#2524）：正数 = N 秒后中止；0/null = 关闭上限；未设置 = 固定 60 秒兜底（仅全局层级生效）。 |
 | `compress.reasoning` | { drop?, threshold? } | drop true · threshold 2048 | — | 丢弃超过 2048 字符的已结束轮次推理块（drop 默认 true）；严格推理上游需设 drop:false。 |
 | `compress.absorb` | object | opt-in (disabled) | — | 可选即时蒸馏：把大段工具结果蒸馏成短摘要，原文进内容库。 |
 | `compress.ccr` | object | enabled in proxy mode since v2 | — | 内容缓存与回取：大输出无损存到会话旁、替换为首段摘录+指针，模型用 acp_retrieve 取回原文；无上限、永不清除。 |
@@ -1424,9 +1425,9 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 - **状态：** ACTIVE
 - **说明：** 控制代理执行 proxy 工具调用（`compress` / `decompress` / `search_context` / `acp_status`）后输出的 📦/❌ ACP 可见标记。开启时，每次执行会在响应流中追加一行标记，并/或把标记消息重新注入该轮重建后的历史，让模型在后续回合看到发生了什么。设为 `false` 可完全抑制这两类产物 —— 适用于模型会模仿或围绕标记进行旁白的部署场景（自行输出确认行或中文旁白；见 issue #862）。工具执行本身不受影响：调用照常执行、成对的 tool-call/tool-result 消息照常记录，只是省略标记行/标记消息。与其他字段相同的三级合并。#717 对模型伪造标记的防伪造剥离逻辑独立于本开关，始终生效。
 
-### 注入开关（仅全局生效）
+### 仅全局生效的设置（注入开关 + compress 超时）
 
-这两个开关只在**全局**层级生效。在按 provider 或按模型的 `compress` 块中设置它们无效。
+以下设置只在**全局**层级生效。在按 provider 或按模型的 `compress` 块中设置它们无效。
 
 #### `injectTool`
 
@@ -1441,6 +1442,13 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 - **默认值：** `true`
 - **状态：** ACTIVE
 - **说明：** 当使用率越过阈值时注入自动压缩 nudge 消息。设为 `false`（或 `ACP_COMPRESS_NUDGE=0`）可禁用 nudge 注入。同时禁用 `injectTool` 和 `injectNudge` 在功能上类似 `passthrough`，区别在于代理仍会跟踪 token 使用量。
+
+#### `timeoutSeconds`
+
+- **类型：** `number` \| `null`
+- **默认值：** 未设置（应用内置 60s 兜底）
+- **状态：** ACTIVE
+- **说明：** agent 侧 `compress` 工具调用的可配置硬超时（#2524）。设为正数时，通过 agent 扩展（pi / omp / dsh / opencode 各通道）转发的 `compress` 执行将在 N 秒后被中止，并以错误形式报告给宿主（`timeout after …ms (compress.timeoutSeconds)`）；`0` 或 `null` 完全关闭硬上限（宿主自身的回合取消仍然有效）；未设置保持现状 —— 固定 60s 兜底。仅适用于 plugin 模式的宿主：proxy 模式的压缩在服务端执行、不受影响；provider HTTP 流式超时（`httpIdleTimeoutMs`）是独立的机制。每次调用时实时读取配置文件 —— 无需重启。
 
 ### 为什么第一次压缩要到 200k 才触发？
 

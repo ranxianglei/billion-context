@@ -221,6 +221,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.rules` | boolean | false | — | Persistent model reminders delivered through an injected acp_rule tool, hard-protected from folds; pi/omp expose an /acp-rule command. |
 | `compress.injectTool` | boolean | true | ACP_COMPRESS_TOOL | Register the acp_compress tool for clients (global level only). |
 | `compress.injectNudge` | boolean | true | ACP_COMPRESS_NUDGE | Send growth nudges as the window fills (global level only). |
+| `compress.timeoutSeconds` | number \| null | unset (built-in 60 s backstop) | — | Hard timeout for the agent-side compress tool call (#2524): positive = abort after N seconds; 0/null = disable the cap; unset = fixed 60 s backstop (global level only). |
 | `compress.reasoning` | { drop?, threshold? } | drop true · threshold 2048 | — | Drop finished-round reasoning runs longer than 2048 chars (drop: true by default); strict-reasoning upstreams need drop:false. |
 | `compress.absorb` | object | opt-in (disabled) | — | Opt-in instant distillation of large tool results into short abstracts; originals go to the content store. |
 | `compress.ccr` | object | enabled in proxy mode since v2 | — | Content cache & retrieve: large outputs stored losslessly beside the session, replaced by head excerpt + pointer fetched back via acp_retrieve; no cap or eviction. |
@@ -1419,9 +1420,9 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Status:** ACTIVE
 - **Description:** Controls the 📦/❌ ACP visibility markers emitted after the proxy executes a proxy tool call (`compress` / `decompress` / `search_context` / `acp_status`). When on, each execution appends a marker line to the response stream and/or re-injects a marker message into that round's rebuilt history so the model can see what happened on later turns. Set `false` to suppress both artifacts — for deployments where models imitate or narrate around the markers (outputting their own confirmation lines or commentary; see issue #862). The tool executions themselves are unaffected: calls still run, and paired tool-call/tool-result messages are still recorded as usual; only the marker line/message is omitted. Since #913, `false` also drops the #862 silence clause from the marker-integrity note appended to nudges and the injected compress prompt — an invisible deployment has no marker for the model to imitate or narrate around, so the clause is pure noise there. The #717 anti-forgery segment stays unconditional in every configuration. Same three-level merge as every other field. The #717 anti-forgery stripping of model-emitted fake markers is independent of this flag and stays active.
 
-### Injection toggles (global only)
+### Global-only settings (injection toggles + compress timeout)
 
-These two toggles are honoured only at the **global** level. Setting them inside a per-provider or per-model `compress` block has no effect.
+These settings are honoured only at the **global** level. Setting them inside a per-provider or per-model `compress` block has no effect.
 
 #### `injectTool`
 
@@ -1436,6 +1437,13 @@ These two toggles are honoured only at the **global** level. Setting them inside
 - **Default:** `true`
 - **Status:** ACTIVE
 - **Description:** Inject automatic compression-nudge messages when usage thresholds are crossed. Set `false` (or `ACP_COMPRESS_NUDGE=0`) to disable nudge injection. Disabling both `injectTool` and `injectNudge` is functionally similar to `passthrough`, except the proxy still tracks token usage.
+
+#### `timeoutSeconds`
+
+- **Type:** `number` \| `null`
+- **Default:** unset (built-in 60 s backstop applies)
+- **Status:** ACTIVE
+- **Description:** Configurable hard timeout for the agent-side `compress` tool call (#2524). When set to a positive number, a `compress` execution forwarded through an agent extension (pi / omp / dsh / opencode lanes) is aborted after N seconds and reported to the host as an error (`timeout after …ms (compress.timeoutSeconds)`); `0` or `null` disables the hard cap entirely (the host's own turn cancellation still works); unset keeps today's behavior — a fixed 60 s backstop. Applies to plugin-mode hosts only: proxy-mode compression runs server-side and is unaffected, and provider HTTP streaming timeouts (`httpIdleTimeoutMs`) are a separate mechanism. Read live from the config file on each call — no restart needed.
 
 ### Why the first compaction waits until 200k
 

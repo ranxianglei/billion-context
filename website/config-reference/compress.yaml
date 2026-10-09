@@ -255,6 +255,16 @@ entries:
     desc_zh: "窗口填满过程中发送增长提醒（仅全局层级生效）。"
     site_en: "Send growth nudges as the window fills (on by default; global level only)."
     site_zh: "窗口填满过程中发送增长提醒（默认开；仅全局层级生效）。"
+  - key: compress.timeoutSeconds
+    type: "number | null"
+    default: "unset (built-in 60 s backstop)"
+    group: compress
+    id: ct.cs
+    render: compress-row
+    desc_en: "Hard timeout for the agent-side compress tool call (#2524): positive = abort after N seconds; 0/null = disable the cap; unset = fixed 60 s backstop (global level only)."
+    desc_zh: "compress 工具调用的客户端侧硬超时（#2524）：正数 = N 秒后中止；0/null = 关闭上限；未设置 = 固定 60 秒兜底（仅全局层级生效）。"
+    site_en: "Hard timeout for the agent-side compress tool call: positive = abort after N seconds; 0/null = disable the cap; unset = fixed 60 s backstop. Global level only."
+    site_zh: "compress 工具调用的客户端侧硬超时：正数 = N 秒后中止；0/null = 关闭上限；未设置 = 固定 60 秒兜底。仅全局层级生效。"
   - key: compress.reasoning
     type: "{ drop?, threshold? }"
     default: "drop true · threshold 2048"
