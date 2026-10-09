@@ -94,6 +94,13 @@ export interface NudgeState {
    *  tiers. Using a record (not N named fields) so adding tier 4+ needs no
    *  schema change. */
   lastShownByTier: Record<number, number>;
+  /** Last tier that received a nudge slot (growth or pressure path). Unlike
+   *  lastShownByTier this is NOT cleared by a successful applyCompression: it
+   *  is the rotation memory that keeps an explicitly configured
+   *  tier2Trigger/tier3Trigger alternating with T1 instead of being starved by
+   *  a persistently high T1 pending (#509). Optional for pre-#509 persisted
+   *  states (absent = null = legacy T1-first). */
+  lastInjectedTier?: CompressionTier | null;
 }
 
 export interface CompressionStats {
@@ -311,11 +318,15 @@ export interface CompressionState {
 export interface TierConfig {
   enabled: boolean;
   /** Distill to tier 2 once the count of ACTIVE tier-1 blocks reaches this.
-   *  Default 5. Independent of raw-message pending: summaries are ~10:1
-   *  condensed, so a token-mass comparison against T1 pending would starve. */
+   *  Default 1000 (#379: block count is not a need signal, so the path
+   *  defaults OFF; lowering it explicitly opts back in, and a count-ready
+   *  tier then alternates slots with a ready T1 on the growth path instead
+   *  of being short-circuited behind it — #509). Independent of raw-message
+   *  pending: summaries are ~10:1 condensed, so a token-mass comparison
+   *  against T1 pending would starve. */
   tier2Trigger: number;
   /** Condense to tier 3 once the count of ACTIVE tier-2 blocks reaches this.
-   *  Default 10. */
+   *  Default 2000 (#379, see tier2Trigger). */
   tier3Trigger: number;
 }
 

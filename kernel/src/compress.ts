@@ -1114,6 +1114,9 @@ const nudgeNode: PipelineNode = {
           ...stamped.lastShownByTier,
           [nudge.tier]: ctx.tokenCount,
         };
+        // Rotation memory (#509): survives the compression-success reset so a
+        // compliant model draining raw ranges cannot restart every T1/T2 tie.
+        stamped.lastInjectedTier = nudge.tier;
       }
     }
 
@@ -1816,6 +1819,13 @@ function decideNudge(input: NudgeInput): NudgeDecision {
   // nudge.tierGrowthTokens.{t1,t2,t3} may pin each mass trigger independently;
   // each unset tier keeps its derived default (T1 = growth step, T2/T3 = the
   // shared multiplier threshold), so absent config decides byte-identically.
+  // On the growth path a count-ready tier is NEVER short-circuited behind a
+  // ready T1 (#509): slots alternate — T1 keeps first pick until it has gone
+  // (nudge.lastInjectedTier), then the count-ready tier with the oldest
+  // cadence stamp wins (never-shown = oldest; tie -> lower tier) — so an
+  // explicitly lowered trigger is heard in sessions whose raw pending stays
+  // high, and neither side starves even if the model keeps ignoring or
+  // complying with one of them.
   const tier2Threshold = Math.round(
     nudgeGrowthTokens * (config.nudge.tier2GrowthMultiplier ?? 1.5),
   );
@@ -1894,7 +1904,60 @@ function decideNudge(input: NudgeInput): NudgeDecision {
           : `${label} T${best} distill: max pending ${bestPending} (T1 effective ${t1Eff}, T2 ${t2Pen}, T3 ${t3Pen}), usage ${Math.round(usage * 100)}%`;
     }
   } else if (growthReady) {
-    if (t1Eff >= tierThresholds[1]) {
+    // Explicit count-triggered candidates (#509): reachable on the growth path
+    // REGARDLESS of t1Eff. The old T1-first short-circuit made an explicitly
+    // lowered tier2Trigger/tier3Trigger dead in any session whose raw
+    // compressible mass stayed >= nudgeGrowthTokens (billion-context-pi#628:
+    // 22 T1 blocks, t1Eff 100K-400K, zero T2 nudges across the session).
+    // Token-mass paths keep the legacy cascade below (implicit-vs-implicit,
+    // #379); with the default triggers (1000/2000) this pool stays empty ->
+    // byte-identical default behavior.
+    const countCandidates: CompressionTier[] = [];
+    if (config.tiers.enabled) {
+      if (t2CountReady) {
+        const lastShown = state.nudge.lastShownByTier[2] ?? 0;
+        if (lastShown === 0 || tokenCount - lastShown >= growthFloor) {
+          countCandidates.push(2);
+        }
+      }
+      if (t3CountReady) {
+        const lastShown = state.nudge.lastShownByTier[3] ?? 0;
+        if (lastShown === 0 || tokenCount - lastShown >= growthFloor) {
+          countCandidates.push(3);
+        }
+      }
+    }
+    if (countCandidates.length > 0) {
+      // Slot rotation (#509): T1 keeps first pick until it has gone
+      // (lastInjectedTier !== 1 — fresh state, or the previous slot was a
+      // distill); then the slot hands to a count-ready tier, oldest cadence
+      // stamp first (never-shown = oldest, tie -> lower tier), and back to T1
+      // the next cycle. lastInjectedTier survives the compression-success
+      // reset, so a model that keeps draining raw ranges cannot restart every
+      // tie at T1 (the billion-context-pi#628 shape).
+      const t1Ready = t1Eff >= tierThresholds[1];
+      let chosen: CompressionTier;
+      if (t1Ready && (state.nudge.lastInjectedTier ?? null) !== 1) {
+        chosen = 1;
+      } else {
+        chosen = countCandidates[0]!;
+        let chosenStamp = state.nudge.lastShownByTier[chosen] ?? 0;
+        for (let i = 1; i < countCandidates.length; i++) {
+          const stamp = state.nudge.lastShownByTier[countCandidates[i]!] ?? 0;
+          if (stamp < chosenStamp) {
+            chosenStamp = stamp;
+            chosen = countCandidates[i]!;
+          }
+        }
+      }
+      injectedTier = chosen;
+      injectedReason =
+        chosen === 1
+          ? `T1 effective ${t1Eff} >= ${tierThresholds[1]}, growth ${growthSinceReference}, usage ${Math.round(usage * 100)}%`
+          : chosen === 2
+            ? `T2 distill ready: ${t2Count} tier-1 blocks >= tier2Trigger ${config.tiers.tier2Trigger} (${t2Pen} tokens), usage ${Math.round(usage * 100)}%`
+            : `T3 condense ready: ${t3Count} tier-2 blocks >= tier3Trigger ${config.tiers.tier3Trigger} (${t3Pen} tokens), usage ${Math.round(usage * 100)}%`;
+    } else if (t1Eff >= tierThresholds[1]) {
       injectedTier = 1;
       injectedReason = `T1 effective ${t1Eff} >= ${tierThresholds[1]}, growth ${growthSinceReference}, usage ${Math.round(usage * 100)}%`;
     } else if (
