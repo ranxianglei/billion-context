@@ -999,6 +999,16 @@ export type UpdateOptions = {
      *  predicate fails open; a forced manual check still proceeds. Absent =
      *  no-op. */
     advisoryBlocksVersion?: (version: string) => boolean;
+    /** #2456: returns true while the advisory watcher is running but has not
+     *  yet completed its first feed consultation this process. Consulted on the
+     *  normal loop's post-restart path BEFORE it installs the registry latest:
+     *  a rollback-form advisory (#1588-A) leaves this disk clean while latest
+     *  stays affected, and the advisoryBlocksVersion gate below is blind until
+     *  the advisory's first check lands — deferring one cycle (cheaper than
+     *  installing a known-affected version and rolling it back) closes the
+     *  startup race. A forced manual check still proceeds. Absent = no-op (so
+     *  auto-update-only installs, where the watcher never runs, never defer). */
+    advisoryAwaitingFirstCheck?: () => boolean;
     /** Fired whenever this process detects the on-disk install is newer than
      *  the running code (#811): right after a successful in-place install and
      *  on every subsequent up-to-date check while the process stays stale.
@@ -1378,6 +1388,20 @@ export async function checkForUpdate(opts: UpdateOptions, force = false): Promis
             // come — drive the lockstep refresh through the host's own
             // channel from here.
             await refreshOwnerManagedCopies(installDir, opts, process.env, loggerLog);
+            return;
+        }
+
+        // #2456: this machine may be CLEAN (not itself affected) while the
+        // registry latest sits inside a rollback-form advisory's range, and the
+        // advisoryBlocksVersion gate below cannot see that range until the
+        // advisory's first check has landed. Installing latest before then pulls
+        // the machine back into the defect and the watcher rolls it back again
+        // (the post-restart ping-pong). Defer this cycle instead — a late update
+        // is cheaper than an affected-version round-trip. Non-forced path only;
+        // once the advisory's first check completes the predicate goes false and
+        // the normal loop resumes (or the gate above skips the affected candidate).
+        if (!force && opts.advisoryAwaitingFirstCheck?.()) {
+            loggerLog("info", "[update] deferring this cycle: the advisory's first check has not landed yet (#2456) \u2014 will follow latest next cycle once its state is known");
             return;
         }
 

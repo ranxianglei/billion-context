@@ -27,7 +27,7 @@ import { configFile as defaultConfigFile } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { createAutoRestartHandler } from "./restart.js";
 import { checkForUpdate, startAutoUpdate } from "./update.js";
-import { startAdvisoryWatcher, getAdvisoryState, advisoryDeferring, advisoryBlocksVersion } from "./advisory.js";
+import { startAdvisoryWatcher, getAdvisoryState, advisoryDeferring, advisoryBlocksVersion, advisoryAwaitingFirstCheck } from "./advisory.js";
 import { startReleaseNotesWatcher } from "./update-notes.js";
 import { resolveProxy } from "./upstream-proxy.js";
 import { runMcpStdio } from "./mcp.js";
@@ -605,6 +605,11 @@ export async function main(): Promise<void> {
             // never install a candidate that falls inside a freshly parsed
             // affected range (rollback-form advisories cover latest too).
             advisoryBlocksVersion,
+            // #2456: defer the post-restart follow-latest install until the
+            // advisory's first check has consulted its feed — otherwise the
+            // update loop's first check races it and installs an affected
+            // latest before the #1588-A candidate gate can see the range.
+            advisoryAwaitingFirstCheck,
             onStaleInstall: createAutoRestartHandler({
                 enabled: opts.autoRestartOnUpdate ?? false,
                 packageName: PACKAGE_NAME,

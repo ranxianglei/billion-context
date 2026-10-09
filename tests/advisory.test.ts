@@ -16,6 +16,8 @@ import {
     _resetAdvisoryWatcherForTest,
     advisoryDeferring,
     advisoryBlocksVersion,
+    advisoryAwaitingFirstCheck,
+    _setAdvisoryWatcherStartedForTest,
     cannotResolveTarget,
     type AdvisoryEntry,
 } from "../src/advisory.ts";
@@ -534,6 +536,112 @@ test("checkForUpdate: skips a candidate covered by a freshly parsed advisory ran
         }
         assert.equal(JSON.parse(readFileSync(path.join(fx.installDir, "package.json"), "utf-8")).version, "1.2.3", "install untouched");
         assert.ok(lines.some((l) => l.includes("skipping 1.2.9") && l.includes("#1588")), `must log the skip decision itself, got: ${JSON.stringify(lines)}`);
+    } finally {
+        delete process.env.XDG_CACHE_HOME;
+        _resetAdvisoryWatcherForTest();
+        rmrf(fx.root);
+    }
+});
+
+test("advisoryAwaitingFirstCheck: tracks the startup window (off -> open -> closed on first check)", async () => {
+    const fx = makeFixture();
+    process.env.XDG_CACHE_HOME = fx.cacheDir;
+    _resetAdvisoryWatcherForTest();
+    try {
+        assert.equal(advisoryAwaitingFirstCheck(), false, "watcher off -> never awaiting (auto-update-only installs never defer)");
+        _setAdvisoryWatcherStartedForTest(true);
+        assert.equal(advisoryAwaitingFirstCheck(), true, "watcher armed but its first feed check has not landed");
+        // A FAILED first check still closes the window (fail-open latch).
+        await withFetch([], async () => {
+            await runAdvisoryCheck({ packageName: "billion-context", currentVersion: "1.2.3", advisoryUrl: "https://registry.test/billion-context-advisories/latest", installDir: fx.installDir }, true);
+        });
+        assert.equal(advisoryAwaitingFirstCheck(), false, "first feed check landed (even failed) -> window closed");
+    } finally {
+        delete process.env.XDG_CACHE_HOME;
+        _resetAdvisoryWatcherForTest();
+        rmrf(fx.root);
+    }
+});
+
+test("checkForUpdate: defers the first cycle while the advisory's first check has not landed (#2456)", async () => {
+    const fx = makeFixture();
+    process.env.XDG_CACHE_HOME = fx.cacheDir;
+    _resetAdvisoryWatcherForTest();
+    await _resetUpdateThrottleForTest();
+    try {
+        const lines: string[] = [];
+        setLogCapture((_level, msg) => { lines.push(msg); });
+        try {
+            const calls = await withFetch(
+                [{ match: /\/billion-context\/latest$/, body: { version: "9.9.9", dist: { tarball: "https://registry.test/x.tgz", integrity: integrityField(Buffer.from("x")) } } }],
+                async () => {
+                    await checkForUpdate({ packageName: "billion-context", currentVersion: "1.2.3", autoUpdate: true, advisoryAwaitingFirstCheck: () => true, installDir: fx.installDir }, false);
+                },
+            );
+            assert.equal(calls, 0, "the deferral fires before any registry fetch");
+        } finally {
+            setLogCapture(null);
+        }
+        assert.equal(JSON.parse(readFileSync(path.join(fx.installDir, "package.json"), "utf-8")).version, "1.2.3", "install untouched by the deferred cycle");
+        assert.ok(lines.some((l) => l.includes("deferring this cycle") && l.includes("#2456")), `must log the deferral decision itself, got: ${JSON.stringify(lines)}`);
+    } finally {
+        delete process.env.XDG_CACHE_HOME;
+        _resetAdvisoryWatcherForTest();
+        rmrf(fx.root);
+    }
+});
+
+test("checkForUpdate: follows latest normally once the advisory's first check has landed (predicate false)", async () => {
+    const fx = makeFixture();
+    process.env.XDG_CACHE_HOME = fx.cacheDir;
+    _resetAdvisoryWatcherForTest();
+    await _resetUpdateThrottleForTest();
+    const { tgz, integrity } = fx.makeTarball({ "package.json": pkgJson("1.2.9"), "dist/index.js": "export const loaded = '1.2.9';\n" });
+    try {
+        const lines: string[] = [];
+        setLogCapture((_level, msg) => { lines.push(msg); });
+        try {
+            const calls = await withFetch(
+                [
+                    { match: /\/billion-context\/latest$/, body: { version: "1.2.9", dist: { tarball: "https://registry.test/pkg-1.2.9.tgz", integrity } } },
+                    { match: /pkg-1\.2\.9\.tgz/, body: tgz },
+                ],
+                async () => {
+                    await checkForUpdate({ packageName: "billion-context", currentVersion: "1.2.3", autoUpdate: true, advisoryAwaitingFirstCheck: () => false, advisoryBlocksVersion: (v) => v === "1.2.9", installDir: fx.installDir }, false);
+                },
+            );
+            assert.equal(calls, 1, "reached the registry packument — the deferral did not fire");
+        } finally {
+            setLogCapture(null);
+        }
+        assert.equal(JSON.parse(readFileSync(path.join(fx.installDir, "package.json"), "utf-8")).version, "1.2.3", "install untouched — blocked by the candidate gate, not deferred");
+        assert.ok(lines.some((l) => l.includes("skipping 1.2.9") && l.includes("#1588")), `gate skips the affected candidate, got: ${JSON.stringify(lines)}`);
+        assert.ok(!lines.some((l) => l.includes("deferring this cycle")), "no deferral line once the predicate is false");
+    } finally {
+        delete process.env.XDG_CACHE_HOME;
+        _resetAdvisoryWatcherForTest();
+        rmrf(fx.root);
+    }
+});
+
+test("checkForUpdate: a forced manual update bypasses the first-check deferral", async () => {
+    const fx = makeFixture();
+    process.env.XDG_CACHE_HOME = fx.cacheDir;
+    _resetAdvisoryWatcherForTest();
+    await _resetUpdateThrottleForTest();
+    const { tgz, integrity } = fx.makeTarball({ "package.json": pkgJson("1.2.9"), "dist/index.js": "export const loaded = '1.2.9';\n" });
+    try {
+        const calls = await withFetch(
+            [
+                { match: /\/billion-context\/latest$/, body: { version: "1.2.9", dist: { tarball: "https://registry.test/pkg-1.2.9.tgz", integrity } } },
+                { match: /pkg-1\.2\.9\.tgz/, body: tgz },
+            ],
+            async () => {
+                await checkForUpdate({ packageName: "billion-context", currentVersion: "1.2.3", autoUpdate: true, advisoryAwaitingFirstCheck: () => true, installDir: fx.installDir }, true);
+            },
+        );
+        assert.equal(calls, 2, "packument + tarball fetched — the forced path reached the install despite the pending first check");
+        assert.equal(JSON.parse(readFileSync(path.join(fx.installDir, "package.json"), "utf-8")).version, "1.2.9", "forced update installs despite the pending first check");
     } finally {
         delete process.env.XDG_CACHE_HOME;
         _resetAdvisoryWatcherForTest();
