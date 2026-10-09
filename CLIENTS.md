@@ -664,6 +664,39 @@ This failure mode is now loud instead of silent:
 
 To actually compress such a client: add its model domain to `"mitm".domains` in `billion-context.json` (e.g. `"mitm": { "domains": ["copilot.tencent.com"] }`) or via `BILI_MITM_DOMAINS`, restart bili, and make the client trust bili's root CA (`NODE_EXTRA_CA_CERTS=~/.local/share/billion-context/ca/root-ca.pem` for Node-based clients, or the client's own CA-path setting). The `/bili/` prefix trick does not apply here — there is no URL to change. Details: [CONFIGURATION.md → MITM](CONFIGURATION.md#mitm-transparent-proxy-login-clients).
 
+## Crush (charmbracelet)
+
+`bili crush` is cert-MITM, same family as `bili copilot` / `bili amp` (#1049): crush is a Go TUI whose `net/http` stack honors `HTTPS_PROXY`, so the launcher points it at the proxy through env vars only — **crush's own config files are never touched**.
+
+- **Env contract**: `HTTPS_PROXY=<proxy origin>` + `SSL_CERT_FILE=<combined CA bundle>` (this REPLACES Go's system trust store, so the bundle carries bili's root plus the system roots) + `BILLION_CONTEXT_PROXY=<origin>`. Inherited proxy vars are stripped first so a corporate proxy cannot detour the model traffic.
+- **Domain discovery**: the default whitelist is crush's most common provider gateways (`api.anthropic.com`, `api.openai.com`, `openrouter.ai`), MERGED with every custom provider's `base_url` declared in crush's config files — `$CRUSH_GLOBAL_CONFIG/crush.json`, `~/.config/crush/crush.json`, `$CRUSH_GLOBAL_DATA/crush.json`, `~/.local/share/crush/crush.json`, plus `.crush/crush.json` from cwd up to the git root (mirrors crush's own lookup order; read-only scan). Other relays ride `--mitm-domain`. Plain-http endpoints are out of scope for v1.
+- **No MCP injection**: v1 runs pure wire mode (the proxy injects the context tools on the wire); crush's MCP-injection path is not yet verified against a real build.
+- No budget env — the TUI manages its own context window.
+
+## Adopted clients: any client with a configurable model base URL (#2340)
+
+Any client whose model traffic can be pointed at a custom base URL is adoptable with zero code — two steps:
+
+1. Start the proxy: `bili start --port 8787` (or bare `bili`).
+2. Point the client's model base URL at the `/bili/` tunnel, embedding the original upstream in the path:
+
+   ```text
+   before:  https://api.openai.com/v1
+   after:   http://localhost:8787/bili/https://api.openai.com/v1
+   ```
+
+   For nonstandard endpoint paths use the protocol-segment form `http://localhost:8787/bili/<protocol>/https://<upstream>` (`<protocol>` ∈ `anthropic`/`openai`/`responses`/`google` — see below).
+
+| Client | Where the base URL lives | Notes |
+|---|---|---|
+| Cline / Roo Code / Kilo Code | "OpenAI Compatible" provider (or Anthropic direct) settings | same codebase family; VS Code extensions store settings in globalState/SecretStorage (SQLite + keychain), so this is manual — external injection is not possible |
+| Continue.dev | `~/.continue/config.yaml`, per-model `apiBase` | |
+| OpenHands | `llm.base_url` (LiteLLM family) | mostly docker deployments |
+| Void / Warp / Cursor single-model channel | custom OpenAI endpoint ("Override Base URL") | |
+| Zed | `api_compatible` custom provider (`api_url`) | spike done (#2340): honors `HTTPS_PROXY`/`NO_PROXY` from env, but TLS verifies against the **platform system store** (`rustls-platform-verifier`) — a cert-MITM launcher needs the bili CA installed into that store (one-time, elevated); no per-process CA env override |
+
+Crush gets the zero-config treatment instead: `bili crush` (above). Walled-garden clients whose traffic cannot be redirected by any setting (Cursor main flow `api2.cursor.sh`, Windsurf, Lingma, Comate, CodeGeeX, Cody, Devin) ride the generic `http.proxy` + `mitm.domains` path above; pure web products (Bolt.new / v0 / Lovable) have no local traffic to intercept at all.
+
 ## An unrecognized endpoint goes direct and nothing compresses (#1290)
 
 bili only compresses requests whose path matches a known wire protocol (`/chat/completions`, `/llm_raw_chat`, `/v1/messages`, `/responses`, …). A request to any other path — e.g. a third-party plugin's **custom wire** such as Command Code's Go plan posting to `/alpha/generate` — is relayed byte-for-byte and **never compressed**.

@@ -224,6 +224,39 @@ pi-subagents(pi.dev 上的包)为前台/后台子代理运行派生**子会话**
 
 要真正压缩这类客户端:把它的模型域名加进 `billion-context.json` 的 `"mitm".domains`(如 `"mitm": { "domains": ["copilot.tencent.com"] }`)或环境变量 `BILI_MITM_DOMAINS`,重启 bili,并让客户端信任 bili 的根 CA(Node 系客户端用 `NODE_EXTRA_CA_CERTS=~/.local/share/billion-context/ca/root-ca.pem`,有 CA 路径设置的用其设置)。`/bili/` 前缀方案在这里不适用——没有 URL 可改。详见 [CONFIGURATION.zh-CN.md → MITM](CONFIGURATION.zh-CN.md#mitm-透明代理登录订阅客户端)。
 
+## Crush(charmbracelet)
+
+`bili crush` 走证书 MITM,与 `bili copilot` / `bili amp`(#1049)同族:crush 是 Go TUI,其 `net/http` 栈原生吃 `HTTPS_PROXY`,所以启动器只通过环境变量把它指向代理——**crush 自己的配置文件从不被改动**。
+
+- **env 契约**:`HTTPS_PROXY=<代理 origin>` + `SSL_CERT_FILE=<合并 CA bundle>`(它是**替换** Go 的系统信任库,所以 bundle 里同时带 bili 根 CA 和系统根)+ `BILLION_CONTEXT_PROXY=<origin>`。先剥离继承来的代理变量,防止公司代理劫走模型流量。
+- **域名发现**:默认白名单是 crush 最常用的 provider 网关(`api.anthropic.com`、`api.openai.com`、`openrouter.ai`),再**并入**crush 配置文件中声明的所有自定义 provider `base_url`——`$CRUSH_GLOBAL_CONFIG/crush.json`、`~/.config/crush/crush.json`、`$CRUSH_GLOBAL_DATA/crush.json`、`~/.local/share/crush/crush.json`,外加从 cwd 向上到 git 根的 `.crush/crush.json`(镜像 crush 自己的查找顺序;只读扫描)。其余 relay 走 `--mitm-domain`;纯 http 端点 v1 不覆盖。
+- **不做 MCP 注入**:v1 纯 wire 模式(代理在 wire 上注入上下文工具);crush 的 MCP 注入路径尚未对真实构建验证。
+- 无预算 env——TUI 自己管理上下文窗口。
+
+## 已收养客户端:任何可配模型 base URL 的客户端(#2340)
+
+任何能把模型流量指到自定义 base URL 的客户端都能零代码收养——两步:
+
+1. 起代理:`bili start --port 8787`(或裸 `bili`)。
+2. 把客户端的模型 base URL 指到 `/bili/` 隧道,原上游地址嵌在路径里:
+
+   ```text
+   之前:  https://api.openai.com/v1
+   之后:  http://localhost:8787/bili/https://api.openai.com/v1
+   ```
+
+   端点路径非标准时用协议段形式 `http://localhost:8787/bili/<protocol>/https://<上游>`(`<protocol>` ∈ `anthropic`/`openai`/`responses`/`google`,见下文)。
+
+| 客户端 | base URL 在哪 | 备注 |
+|---|---|---|
+| Cline / Roo Code / Kilo Code | "OpenAI Compatible" provider(或 Anthropic 直连)设置 | 三者同源;VS Code 扩展把设置存在 globalState/SecretStorage(SQLite + 钥匙串),只能手填,外部注入不可行 |
+| Continue.dev | `~/.continue/config.yaml`,每模型 `apiBase` | |
+| OpenHands | `llm.base_url`(LiteLLM 系) | 多为 docker 部署 |
+| Void / Warp / Cursor 单模型通道 | 自定义 OpenAI 端点("Override Base URL") | |
+| Zed | `api_compatible` 自定义 provider(`api_url`) | spike 完成(#2340):尊重 env 的 `HTTPS_PROXY`/`NO_PROXY`,但 TLS 校验走**平台系统信任库**(`rustls-platform-verifier`)——cert-MITM 需要把 bili CA 装进系统库(一次性、需提权),没有按进程的 CA env 覆盖 |
+
+Crush 走零配置路线:`bili crush`(见上节)。流量无法被任何设置重定向的围墙档客户端(Cursor 主流量 `api2.cursor.sh`、Windsurf、Lingma 灵码、Comate、CodeGeeX、Cody、Devin)走上文的通用 `http.proxy` + `mitm.domains` 路径;纯 web 产品(Bolt.new / v0 / Lovable)本地根本没有流量可截。
+
 ## 未识别的端点直连、什么都不压缩(#1290)
 
 bili 只压缩路径匹配已知 wire 协议(`/chat/completions`、`/llm_raw_chat`、`/v1/messages`、`/responses`……)的请求。发往其它路径的请求——例如第三方插件的**自定义 wire**(Command Code 的 Go 套餐发 `POST /alpha/generate`)——会逐字节中继,**永不压缩**。目前没有任何配置口可以声明一种任意新 wire;那是一项独立功能,不是一个能打开的开关。
