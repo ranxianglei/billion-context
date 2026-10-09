@@ -1,8 +1,8 @@
 import type {
-  CcrConfig,
   Config,
   CompressionState,
   CoreMessage,
+  ResolvedCcrConfig,
 } from "./types.js";
 import { refForRaw, BLOCKED_REF } from "./refs.js";
 import { ACP_TOOL_NAMES } from "./compress-tools.js";
@@ -51,7 +51,7 @@ export const RETRIEVE_TOOL_NAME = "acp_retrieve";
  *  the pointer. Mirrors the arrival-time store threshold. */
 export const RETRIEVE_INLINE_TOKENS_DEFAULT = 4000;
 
-export const DEFAULT_CCR_CONFIG: CcrConfig = {
+export const DEFAULT_CCR_CONFIG: ResolvedCcrConfig = {
   enabled: false,
   toolName: RETRIEVE_TOOL_NAME,
   minToolTokens: 4000,
@@ -60,7 +60,7 @@ export const DEFAULT_CCR_CONFIG: CcrConfig = {
   retrieveInlineTokens: RETRIEVE_INLINE_TOKENS_DEFAULT,
 };
 
-export function resolveCcrConfig(config: Config): CcrConfig {
+export function resolveCcrConfig(config: Config): ResolvedCcrConfig {
   return { ...DEFAULT_CCR_CONFIG, ...config.ccr };
 }
 

@@ -63,10 +63,10 @@ import {
 import { collectProtectedToolCallIds, matchToolPattern } from "./protected.js";
 import { defaultCountTokens, type TokenCountFn } from "./tokenize.js";
 import type {
-  AbsorbConfig,
   Config,
   CoreMessage,
   CrushConfig,
+  ResolvedAbsorbConfig,
 } from "./types.js";
 
 export const DEFAULT_CRUSH_CONFIG: CrushConfig = {
@@ -1726,7 +1726,7 @@ function effectivePlugins(
 
 export interface EvaluateCrushInput {
   text: string;
-  absorb: AbsorbConfig;
+  absorb: ResolvedAbsorbConfig;
   crush: CrushConfig;
   /** Current context token count (context-pressure signal). */
   tokenCount: number;

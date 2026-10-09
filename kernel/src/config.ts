@@ -144,18 +144,23 @@ export function validateConfig(config: Config): string[] {
     errors.push("preserveRecentTools must be a string array");
   }
   if (config.absorb) {
-    if (config.absorb.enabled && !config.absorb.toolName) {
+    const absorb = config.absorb;
+    if (
+      absorb.enabled &&
+      absorb.toolName !== undefined &&
+      (typeof absorb.toolName !== "string" || absorb.toolName === "")
+    ) {
       errors.push("absorb.toolName must be a non-empty string when enabled");
     }
     if (
-      !Number.isFinite(config.absorb.minToolTokens) ||
-      config.absorb.minToolTokens < 0
+      absorb.minToolTokens !== undefined &&
+      (!Number.isFinite(absorb.minToolTokens) || absorb.minToolTokens < 0)
     ) {
       errors.push("absorb.minToolTokens must be >= 0");
     }
     if (
-      config.absorb.contextThresholdPct < 0 ||
-      config.absorb.contextThresholdPct > 1
+      absorb.contextThresholdPct !== undefined &&
+      (absorb.contextThresholdPct < 0 || absorb.contextThresholdPct > 1)
     ) {
       errors.push("absorb.contextThresholdPct must be in [0, 1]");
     }
@@ -234,18 +239,23 @@ export function validateConfig(config: Config): string[] {
     }
   }
   if (config.ccr) {
-    if (config.ccr.enabled && !config.ccr.toolName) {
+    const ccr = config.ccr;
+    if (
+      ccr.enabled &&
+      ccr.toolName !== undefined &&
+      (typeof ccr.toolName !== "string" || ccr.toolName === "")
+    ) {
       errors.push("ccr.toolName must be a non-empty string when enabled");
     }
     if (
-      !Number.isFinite(config.ccr.minToolTokens) ||
-      config.ccr.minToolTokens < 0
+      ccr.minToolTokens !== undefined &&
+      (!Number.isFinite(ccr.minToolTokens) || ccr.minToolTokens < 0)
     ) {
       errors.push("ccr.minToolTokens must be >= 0");
     }
     if (
-      !Number.isFinite(config.ccr.maxHeadChars) ||
-      config.ccr.maxHeadChars < 0
+      ccr.maxHeadChars !== undefined &&
+      (!Number.isFinite(ccr.maxHeadChars) || ccr.maxHeadChars < 0)
     ) {
       errors.push("ccr.maxHeadChars must be >= 0");
     }

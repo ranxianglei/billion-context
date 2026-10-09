@@ -128,15 +128,21 @@ export interface AbsorbRecord {
 
 export interface AbsorbConfig {
   enabled: boolean;
-  /** Model-facing absorb tool name (adapters may rename, e.g. acp_absorb). */
-  toolName: string;
-  /** Only tool results >= this many tokens get the forced absorb prompt. 0 = all. */
-  minToolTokens: number;
-  /** Only prompt when context usage >= this fraction of modelContextLimit. 0 = size gate alone. */
-  contextThresholdPct: number;
-  /** Tool-name patterns (glob suffix allowed) never absorbable, independent of protectedTools. */
-  excludeTools: string[];
+  /** Model-facing absorb tool name (adapters may rename, e.g. acp_absorb). Default "absorb". */
+  toolName?: string;
+  /** Only tool results >= this many tokens get the forced absorb prompt. 0 = all. Default 4000. */
+  minToolTokens?: number;
+  /** Only prompt when context usage >= this fraction of modelContextLimit. 0 = size gate alone. Default 0. */
+  contextThresholdPct?: number;
+  /** Tool-name patterns (glob suffix allowed) never absorbable, independent of protectedTools. Default []. */
+  excludeTools?: string[];
 }
+
+/** AbsorbConfig after every field has been resolved against
+ *  DEFAULT_ABSORB_CONFIG (see resolveAbsorbConfig): the shape consumers of a
+ *  resolved config receive. Partial AbsorbConfig values are legal input —
+ *  `enabled` is the activation switch, everything else inherits its default. */
+export type ResolvedAbsorbConfig = Required<AbsorbConfig>;
 
 /** Emitted when the session's irreducible floor (system prompt + block
  *  summaries + protected zones + small uncompressible tail) exceeds
@@ -230,20 +236,26 @@ export interface ImageShrinkRecord {
 
 export interface CcrConfig {
   enabled: boolean;
-  /** Model-facing retrieve tool name (adapters may rename, e.g. acp_retrieve). */
-  toolName: string;
-  /** Only tool results >= this many tokens are stored + replaced. 0 = all. */
-  minToolTokens: number;
-  /** Tool-name patterns (glob suffix allowed) never CCR-stored, independent of protectedTools. */
-  excludeTools: string[];
-  /** Max characters for the placeholder's head/command preview. */
-  maxHeadChars: number;
+  /** Model-facing retrieve tool name (adapters may rename, e.g. acp_retrieve). Default "acp_retrieve". */
+  toolName?: string;
+  /** Only tool results >= this many tokens are stored + replaced. 0 = all. Default 4000. */
+  minToolTokens?: number;
+  /** Tool-name patterns (glob suffix allowed) never CCR-stored, independent of protectedTools. Default []. */
+  excludeTools?: string[];
+  /** Max characters for the placeholder's head/command preview. Default 96. */
+  maxHeadChars?: number;
   /** Retrieved originals below this many tokens are inlined into the
    *  acp_retrieve tool result; at/above it they are exported to a file under
    *  the host-provided export dir (pointer rides the tool result). Default
    *  4000 (RETRIEVE_INLINE_TOKENS_DEFAULT). */
   retrieveInlineTokens?: number;
 }
+
+/** CcrConfig after every field has been resolved against DEFAULT_CCR_CONFIG
+ *  (see resolveCcrConfig): the shape consumers of a resolved config receive.
+ *  Partial CcrConfig values are legal input — `enabled` is the activation
+ *  switch, everything else inherits its default. */
+export type ResolvedCcrConfig = Required<CcrConfig>;
 
 export interface CompressionState {
   blocks: CompressionBlock[];
