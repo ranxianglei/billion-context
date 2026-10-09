@@ -364,4 +364,12 @@ pre.tool-args, pre.tool-out { margin: 6px 0 0; padding: 8px; background: var(--b
 }
 .embed main { max-width: none; padding: 4px 0 12px; }
 .embed .banner { margin: 8px 0 0; }
+
+/* #2448: the iframe viewport IS the host panel width (dsh settings, ~400–760px),
+   so reuse the ≤720px compact column set unconditionally in embed mode and drop
+   the standalone-page min-widths — otherwise the tables force a horizontal
+   scroll inside the frame (≤720px) or squish (720–940px). */
+.embed .twide table.data, .embed .tproc table.data { min-width: 0; }
+.embed table.data th:nth-child(n + 6), .embed table.data td:nth-child(n + 6) { display: none; }
+.embed table.data th, .embed table.data td { padding-left: 5px; padding-right: 5px; }
 `;

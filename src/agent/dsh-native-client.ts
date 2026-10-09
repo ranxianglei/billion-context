@@ -81,7 +81,7 @@ const PAGE_KEYS: Record<PageId, string> = {
     config: "tab_config",
     logs: "tab_logs",
 };
-const EMBED_HEIGHT_PX = 640;
+const EMBED_HEIGHT_CSS = "min(640px, 78vh)";
 
 const zh: Dict = {
     "nav": "bili设置",
@@ -214,7 +214,7 @@ export function apply(ctx: ClientContext): void {
                         style: {
                             display: "block",
                             width: "100%",
-                            height: EMBED_HEIGHT_PX,
+                            height: EMBED_HEIGHT_CSS,
                             border: "1px solid rgba(127,127,127,0.4)",
                             borderRadius: 8,
                             background: "transparent",
@@ -223,14 +223,15 @@ export function apply(ctx: ClientContext): void {
                 ),
             createElement(
                 "div",
-                { style: { display: "flex", alignItems: "center", gap: 10 } },
-                createElement("p", { style: { margin: 0, opacity: 0.7, fontSize: 13, lineHeight: 1.6, flex: 1 } }, t("hint")),
+                { style: { display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" } },
+                createElement("p", { style: { margin: 0, opacity: 0.7, fontSize: 13, lineHeight: 1.6, flex: "1 1 240px" } }, t("hint")),
                 origin === undefined
                     ? null
                     : createElement(
                         "button",
                         {
                             type: "button",
+                            title: `${origin}/__bili/`,
                             onClick: () => openExternal(`${origin}/__bili/`),
                             style: {
                                 cursor: "pointer",
@@ -242,10 +243,9 @@ export function apply(ctx: ClientContext): void {
                                 fontSize: 14,
                                 lineHeight: "22px",
                                 padding: "7px 16px",
-                                whiteSpace: "nowrap",
                             },
                         },
-                        `${t("open")}（${origin}）`,
+                        t("open"),
                     ),
             ),
         );

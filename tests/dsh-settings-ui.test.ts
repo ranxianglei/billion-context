@@ -448,6 +448,23 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
     (buttons[4].props!.onClick as () => void)();
     assert.deepEqual(opened, ["http://127.0.0.1:8787/__bili/"]);
 
+    // #2448: the frame height tracks the host viewport (capped at 640px), and
+    // the backup label drops the inline origin URL in favor of a hover tooltip
+    // so narrow panels don't get a full-URL label squeezing the row.
+    assert.equal((frameAfterTab.props?.style as Record<string, unknown>).height, "min(640px, 78vh)", "iframe height follows the host viewport");
+    const backup = buttons[4];
+    assert.equal(backup.props?.title, "http://127.0.0.1:8787/__bili/", "tooltip carries the exact URL the button opens");
+    const backupLabel: string[] = [];
+    collectText(backup, backupLabel);
+    assert.equal(backupLabel.join(""), "打开 Web UI", "label is the bare translation without the origin");
+    // The bottom row is a third root-level child after the h3 and the
+    // tab/frame column (see the panel layout in dsh-native-client.ts).
+    const bottomRow = treeAfterTab.children[2] as ElementNode;
+    assert.equal((bottomRow.props?.style as Record<string, unknown>).flexWrap, "wrap", "the hint/button row wraps on narrow panels");
+    const hint = findTag(treeAfterTab, "p");
+    assert.ok(hint !== undefined, "the bottom row still carries its hint paragraph");
+    assert.equal((hint.props!.style as Record<string, unknown>).flex, "1 1 240px", "the hint reserves width before the row wraps");
+
     // #2125: the bundle panel reuses the probe/frame/hint but drops the title
     // — the plugin detail page draws it.
     calls.length = 0;
@@ -458,11 +475,10 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
     const bframe = findTag(btree, "iframe");
     assert.ok(bframe !== undefined, "origin present renders the embedded iframe in the bundle panel");
     assert.equal(bframe.props?.src, "http://127.0.0.1:8787/__bili/?embed=1&lang=zh#/overview");
-    const btexts: string[] = [];
-    collectText(btree, btexts);
-    assert.ok(btexts.some((x) => x.includes("http://127.0.0.1:8787")), `bundle backup button label carries the origin: ${JSON.stringify(btexts)}`);
     const bButtons = collectButtons(btree);
     assert.equal(bButtons.length, 5, "the bundle panel offers the same tabs plus backup button");
+    // #2448: the origin moved from the label into the tooltip attribute.
+    assert.equal(bButtons[bButtons.length - 1].props?.title, "http://127.0.0.1:8787/__bili/", "bundle backup tooltip carries the origin (label no longer does)");
     opened.length = 0;
     (bButtons[bButtons.length - 1].props!.onClick as () => void)();
     assert.deepEqual(opened, ["http://127.0.0.1:8787/__bili/"]);
@@ -640,15 +656,14 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
         });
         m.resetHooks();
         const first = m.component() as ElementNode;
-        const firstTexts: string[] = [];
-        collectText(first, firstTexts);
-        assert.ok(firstTexts.some((x) => x.includes("http://127.0.0.1:8787")), "the snapshot paints immediately (first-paint hint)");
+        const firstBackup = collectButtons(first);
+        assert.equal(firstBackup[firstBackup.length - 1].props?.title, "http://127.0.0.1:8787/__bili/", "the snapshot paints immediately (first-paint backup target)");
         await tick();
         const second = m.component() as ElementNode;
-        const texts: string[] = [];
-        collectText(second, texts);
-        assert.ok(texts.some((x) => x.includes("http://127.0.0.1:18798")), `stale snapshot upgraded to the live origin: ${JSON.stringify(texts)}`);
-        assert.ok(!texts.some((x) => x.includes(":8787")), "the stale origin is gone from the label");
+        // #2448: origin tracking now asserts on the tooltip attribute — the label no longer renders it.
+        const titles = collectButtons(second).map((b) => String(b.props?.title ?? ""));
+        assert.ok(titles.includes("http://127.0.0.1:18798/__bili/"), "stale snapshot upgraded to the live origin");
+        assert.ok(!titles.some((x) => x.includes(":8787")), "the stale origin is gone from the backup target");
         const sframe = findTag(second, "iframe");
         assert.ok(sframe !== undefined, "the upgraded entry keeps its frame");
         assert.equal(sframe.props?.src, "http://127.0.0.1:18798/__bili/?embed=1&lang=zh#/overview", "the embedded frame follows the corrected live origin");
@@ -696,10 +711,10 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
         }
         await tick();
         const tree = m.component() as ElementNode;
-        const texts: string[] = [];
-        collectText(tree, texts);
-        assert.ok(texts.some((x) => x.includes("http://127.0.0.1:18800")), `mid-session re-bind follows the live origin: ${JSON.stringify(texts)}`);
-        assert.ok(!texts.some((x) => x.includes(":18798")), "the pre-re-bind origin is gone from the label");
+        // #2448: re-bind tracking now asserts on the tooltip attribute.
+        const titles = collectButtons(tree).map((b) => String(b.props?.title ?? ""));
+        assert.ok(titles.includes("http://127.0.0.1:18800/__bili/"), "mid-session re-bind follows the live origin");
+        assert.ok(!titles.some((x) => x.includes(":18798")), "the pre-re-bind origin is gone from the backup target");
         const rframe = findTag(tree, "iframe");
         assert.ok(rframe !== undefined, "the re-bound entry keeps its frame");
         assert.equal(rframe.props?.src, "http://127.0.0.1:18800/__bili/?embed=1&lang=zh#/overview", "the embedded frame follows the mid-session re-bind");

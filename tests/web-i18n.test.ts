@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { LOCALES, MESSAGES, translate } from "../src/web/i18n.ts";
 import { renderPage } from "../src/web/page.ts";
 import { WEB_CLIENT } from "../src/web/client.ts";
+import { WEB_STYLES } from "../src/web/styles.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const han = /\p{Script=Han}/u;
@@ -160,6 +161,13 @@ test("#2321: embed mode marks the body for chrome-less framing", () => {
     assert.ok(!plain.includes('<body class="embed">'), "default page keeps its full chrome");
     const embedded = renderPage("http://127.0.0.1:8787", "0.0.0-test", true);
     assert.ok(embedded.includes('<body class="embed">'), "embed flag marks the body");
+});
+
+test("#2448: embed mode reuses the compact column set and drops standalone-page min-widths", () => {
+    assert.ok(WEB_STYLES.includes(".embed .twide table.data, .embed .tproc table.data { min-width: 0; }"), "embed tables lose the standalone-page min-width");
+    assert.ok(WEB_STYLES.includes(".embed table.data th:nth-child(n + 6), .embed table.data td:nth-child(n + 6) { display: none; }"), "embed tables reuse the ≤720px compact column set");
+    assert.ok(WEB_STYLES.includes(".embed table.data th, .embed table.data td { padding-left: 5px; padding-right: 5px; }"), "embed cells tighten horizontal padding");
+    assert.match(WEB_STYLES, /@media \(max-width: 720px\) [\s\S]*?table\.data th:nth-child\(n \+ 6\)/, "the mobile media query still owns the standalone-page compact rule");
 });
 
 test("#1024: embedded client parses and persists the language choice", () => {
