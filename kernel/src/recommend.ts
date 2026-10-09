@@ -389,32 +389,33 @@ function mergeBatch(batch: CompressibleRange[]): CompressibleRange {
   return merged;
 }
 
-/** Effective size of a range in characters — the unit the apply-side
- *  minCompressRange gate uses. Falls back to the historical tokens*4
- *  estimate only for hand-built ranges that predate the `chars` field. */
+/** Character size of a range, used only to populate the informational
+ *  `chars` field on merged ranges. The minCompressRange gate itself reads
+ *  `tokens` (#511). Falls back to the historical tokens*4 estimate only for
+ *  hand-built ranges that predate the `chars` field. */
 function rangeChars(r: CompressibleRange): number {
   return r.chars ?? r.tokens * 4;
 }
 
-/** Merge adjacent ranges into batches that clear `minChars` of REAL text —
- *  the same accounting `applyCompression` uses — so a recommended range is
- *  never below the threshold the kernel would atomically reject. Batching by
- *  token estimates (tokens*4) instead broke whenever the host injected a
- *  tokenizer where tokens != chars/4 (CJK-aware estimators are ~1:1, so
- *  tokens*4 overestimated size ~4x and nudge recommended ranges the apply
- *  side then refused). Invariant: EVERY returned batch alone clears
- *  `minChars`. A sub-threshold tail is folded into the preceding batch
- *  (overshoot allowed); if no batch precedes it, nothing is emitted — the
- *  whole remainder is below the gate, so no selection of it can pass and
- *  offering it only yields guaranteed-rejected calls (billion-context #847). */
+/** Merge adjacent ranges into batches that clear `minTokens` of real content
+ *  — the same token accounting `applyCompression` uses — so a recommended
+ *  range is never below the threshold the kernel would atomically reject.
+ *  Counting tokens (not chars) keeps the gate language-neutral: a CJK-aware
+ *  estimator yields ~1 token/char while Latin is ~4 chars/token, so a char
+ *  threshold applied ~4 different effective floors per language (#511).
+ *  Invariant: EVERY returned batch alone clears `minTokens`. A sub-threshold
+ *  tail is folded into the preceding batch (overshoot allowed); if no batch
+ *  precedes it, nothing is emitted — the whole remainder is below the gate,
+ *  so no selection of it can pass and offering it only yields
+ *  guaranteed-rejected calls (billion-context #847). */
 export function mergeRangesToThreshold(
   ranges: CompressibleRange[],
-  minChars: number,
+  minTokens: number,
 ): CompressibleRange[] {
-  if (minChars <= 0 || ranges.length === 0) return ranges;
+  if (minTokens <= 0 || ranges.length === 0) return ranges;
   const result: CompressibleRange[] = [];
   let batch: CompressibleRange[] = [];
-  let batchChars = 0;
+  let batchTokens = 0;
   // Close the running batch at a boundary: emit it only when it alone clears
   // the gate. A sub-threshold segment bounded by a gap cannot be offered (it
   // fails the apply-side #847 gate) and must not be stretched across the gap
@@ -422,9 +423,9 @@ export function mergeRangesToThreshold(
   // content (#498).
   const closeBatch = () => {
     if (batch.length > 0) {
-      if (batchChars >= minChars) result.push(mergeBatch(batch));
+      if (batchTokens >= minTokens) result.push(mergeBatch(batch));
       batch = [];
-      batchChars = 0;
+      batchTokens = 0;
     }
   };
   for (const r of ranges) {
@@ -442,8 +443,8 @@ export function mergeRangesToThreshold(
       closeBatch();
     }
     batch.push(r);
-    batchChars += rangeChars(r);
-    if (batchChars >= minChars) closeBatch();
+    batchTokens += r.tokens;
+    if (batchTokens >= minTokens) closeBatch();
   }
   if (batch.length > 0 && result.length > 0) {
     const prev = result[result.length - 1]!;
@@ -453,7 +454,7 @@ export function mergeRangesToThreshold(
       batch[0]!.startIndex <= prev.endIndex + 1;
     if (contiguous) {
       result[result.length - 1] = mergeBatch([prev, ...batch]);
-    } else if (batchChars >= minChars) {
+    } else if (batchTokens >= minTokens) {
       result.push(mergeBatch(batch));
     }
   }

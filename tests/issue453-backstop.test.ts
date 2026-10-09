@@ -85,31 +85,31 @@ test("emergencyNudge: respects a custom escalation line and empty ranges", () =>
 // the raw list (all ranges below minCompressRange — reason "max compressible <
 // threshold" / "max pending < min benefit"). The override must NOT read
 // "list non-empty" as "worth advertising": with the loop config's
-// minCompressRange passed (default kernel value 5000), the escalation line may
+// minCompressRange passed (default kernel value 1250), the escalation line may
 // only fire when at least one offered range passes the submit gate compress
 // applies — same expression as postCompressTail / handleAcpStatus (#847).
 const subThreshold = [{ startRef: "a", endRef: "b", count: 1, tokens: 100, chars: 900, toolPct: 0, textPct: 0 }];
-const executable = [{ startRef: "a", endRef: "b", count: 1, tokens: 2000, chars: 9200, toolPct: 0, textPct: 0 }];
+const executable = [{ startRef: "a", endRef: "b", count: 1, tokens: 6000, chars: 24000, toolPct: 0, textPct: 0 }];
 
-// 9.2K chars is exactly the #2104 window shape ("m00057–m00069 9.2K"): above
-// VIABLE_RANGE_MIN_TOKENS (viable) but — if below minCompressRange — still
-// rejected by the submit gate.
+// 9.2K chars (~2.3K tokens) is exactly the #2104 window shape ("m00057–m00069
+// 9.2K"): above VIABLE_RANGE_MIN_TOKENS (viable) but — if below
+// minCompressRange — still rejected by the submit gate.
 test("emergencyNudge: #2104 — sub-threshold leftovers no longer trigger the override once the gate is passed", () => {
     assert.equal(emergencyNudge(mkNudge({ contextUsage: 0.75, compressibleRanges: subThreshold }), undefined, 5000), false, "every range below minCompressRange: compress would reject — no override");
     assert.equal(emergencyNudge(mkNudge({ contextUsage: 0.75, compressibleRanges: [...subThreshold, ...executable] }), undefined, 5000), true, "at least one executable range: override stays (#453 intent)");
     assert.equal(emergencyNudge(mkNudge({ contextUsage: 0.6, compressibleRanges: executable }), undefined, 5000), false, "below the escalation line: still no override");
 });
 
-test("emergencyNudge: gate falls back to tokens*4 for hand-built ranges without chars", () => {
-    // 1500 tokens * 4 = 6000 chars >= 5000: executable via the historical estimate.
-    const noChars = [{ startRef: "a", endRef: "b", count: 1, tokens: 1500, toolPct: 0, textPct: 0 }];
-    assert.equal(emergencyNudge(mkNudge({ contextUsage: 0.75, compressibleRanges: noChars }), undefined, 5000), true);
+test("emergencyNudge: gate reads tokens directly; informational chars is never consulted", () => {
+    // 1500 tokens < 5000: sub-gate regardless of any char count.
+    const subGate = [{ startRef: "a", endRef: "b", count: 1, tokens: 1500, toolPct: 0, textPct: 0 }];
+    assert.equal(emergencyNudge(mkNudge({ contextUsage: 0.75, compressibleRanges: subGate }), undefined, 5000), false);
     const tiny = [{ startRef: "a", endRef: "b", count: 1, tokens: 100, toolPct: 0, textPct: 0 }];
-    assert.equal(emergencyNudge(mkNudge({ contextUsage: 0.75, compressibleRanges: tiny }), undefined, 5000), false, "400 chars < 5000 via tokens*4 fallback");
-    // chars is authoritative when present: a range whose chars is below the
-    // gate must not pass on an inflated tokens*4 estimate.
-    const charsWins = [{ startRef: "a", endRef: "b", count: 1, tokens: 1500, chars: 900, toolPct: 0, textPct: 0 }];
-    assert.equal(emergencyNudge(mkNudge({ contextUsage: 0.75, compressibleRanges: charsWins }), undefined, 5000), false, "chars wins over tokens*4 when set");
+    assert.equal(emergencyNudge(mkNudge({ contextUsage: 0.75, compressibleRanges: tiny }), undefined, 5000), false, "100 tokens < 5000");
+    // chars is informational only: a range that clears the token gate passes
+    // even with a char count far below the legacy 4× estimate.
+    const tokensDecide = [{ startRef: "a", endRef: "b", count: 1, tokens: 6000, chars: 900, toolPct: 0, textPct: 0 }];
+    assert.equal(emergencyNudge(mkNudge({ contextUsage: 0.75, compressibleRanges: tokensDecide }), undefined, 5000), true, "tokens decide, chars ignored");
 });
 
 test("emergencyNudge: minCompressRange 0 (default) keeps the legacy any-non-empty-list semantics", () => {

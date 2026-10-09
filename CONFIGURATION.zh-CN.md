@@ -207,7 +207,7 @@
 | `compress.streamSummary` | boolean | false (unset) | — | 强制 preflight 摘要从首次尝试起就走流式（SSE）请求。适用于上游位于会掐断长非流式补全的网关之后（如 Cloudflare HTTP 524）：错误驱动的自学习只认 400 "stream required"，网关超时永远无法触发。 |
 | `compress.preserveRecentMessages` | number | kernel ≈5 | — | 最近的消息软保护、免于折叠。 |
 | `compress.preserveRecentTokens` | number | kernel ≈5000 | — | 最近的 token 软保护、免于折叠。 |
-| `compress.minCompressRangeChars` | number (deprecated alias: minCompressRange) | kernel ≈5000 | — | 可折叠片段的最小字符数；更短的永不折叠。 |
+| `compress.minCompressRange` | number (deprecated alias: minCompressRangeChars) | kernel ≈1250 | — | 可折叠片段的最小 token 数；更短的永不折叠。 |
 | `compress.reconcile` | "off" \| "warn" \| "repair" | "repair" | BILI_FOLD_RECONCILE | 客户端在轮次之间回退或改写历史时校准已折叠状态。 |
 | `compress.promptPack` | string (builtin: "default", "lean") | builtin "default" | — | 压缩提示词包，按 项目包 → 用户包 → 内置 解析；不受 acknowledgePromptsRisk 门控。 |
 | `compress.stripImagesKeepRecent` | number | 5 | — | 开启剥离图片时，最新 N 条消息内的图片保留（无折叠锚定时的回退窗口）。 |
@@ -265,7 +265,7 @@
 | `compress.priceProfile.q` | number | unset (registry) | — | 输出价相对输入价的比率。 |
 | `compress.reasoning.drop` | boolean | true | — | 丢弃超过阈值的已结束轮次推理块。 |
 | `compress.reasoning.threshold` | number | 2048 | — | 已结束推理块被丢弃的字符阈值。 |
-| `compress.minCompressRange` | number | same as minCompressRangeChars | — | minCompressRangeChars 的弃用别名（接受，映射到后者）。 _(已弃用)_ |
+| `compress.minCompressRangeChars` | number | same as minCompressRange | — | minCompressRange 的弃用别名（接受，映射到前者；旧按字符计的取值现按 token 解读）。 _(已弃用)_ |
 
 **路由表字段**
 
@@ -1200,18 +1200,18 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 - **状态：** ACTIVE
 - **说明：** 为最近消息保护预留的 token 预算。映射到内核字段 `preserveRecentTokens`。
 
-#### `minCompressRangeChars`
-
-- **类型：** `number`
-- **默认值：** *（内核默认值，通常为 `5000`）*
-- **状态：** ACTIVE
-- **说明：** 一个消息范围可被纳入压缩的最小长度，单位为**字符**（不是 token）；更小的范围会被跳过。英文/代码平均约 4 字符/token，CJK 约 1-2 字符/token，同一数值对英文的实际语义比 token 直觉宽松约 4 倍。映射到内核字段 `compress.minCompressRange`。
-
 #### `minCompressRange`
 
 - **类型：** `number`
-- **状态：** DEPRECATED（`minCompressRangeChars` 的弃用别名，向后兼容保留）
-- **说明：** `minCompressRangeChars` 的旧名，内核映射（`compress.minCompressRange`）与单位（字符）完全相同。同层两键并存时新名优先；跨层时更深层优先，与键名无关。
+- **默认值：** *（内核默认值，通常为 `1250`）*
+- **状态：** ACTIVE
+- **说明：** 一个消息范围可被纳入压缩的最小长度，单位为 **token**；更小的范围会被跳过。语言中立：CJK 约 1 字符/token，英文/代码约 4 字符/token，同一数值对任何文字编码相同的 token 预算。映射到内核字段 `compress.minCompressRange`。
+
+#### `minCompressRangeChars`
+
+- **类型：** `number`
+- **状态：** DEPRECATED（`minCompressRange` 的弃用别名，向后兼容保留）
+- **说明：** `minCompressRange` 的旧名，内核映射（`compress.minCompressRange`）相同。该键名下的历史取值曾按**字符**解读，现改按 **token** 解读：旧的 `5000` 现在要求约 5000 token（≈20000 拉丁字符）而非 5000 字符。同层两键并存时规范名优先；跨层时更深层优先，与键名无关。
 
 #### `tiers`
 

@@ -71,7 +71,7 @@ function textMsg(id: string, role: "user" | "assistant", text: string): CoreMess
     return { id, role, contentType: "text", text };
 }
 
-// Kernel default compress.minCompressRange is 5000 chars; ranges below that are
+// Kernel default compress.minCompressRange is 1250 tokens; ranges below that are
 // rejected with "content too small" and create NO block. Use big text so a real
 // active block is created.
 function bigText(n: number): string {

@@ -239,8 +239,8 @@ test("batch protection checks the aggregate range length instead of rejecting va
         const ctx = context(externalSummary);
         ctx.config.compress.minCompressRange = 1000;
         ctx.messages = [
-            { id: "first", role: "assistant", contentType: "text", text: "a".repeat(600) },
-            { id: "second", role: "assistant", contentType: "text", text: "b".repeat(600) },
+            { id: "first", role: "assistant", contentType: "text", text: "a".repeat(3000) },
+            { id: "second", role: "assistant", contentType: "text", text: "b".repeat(3000) },
             ctx.messages[1],
         ];
         ctx.session.state = ctx.core.processTurn({ messages: ctx.messages, state: ctx.session.state, config: ctx.config, tokenCount: 1000 }).state;

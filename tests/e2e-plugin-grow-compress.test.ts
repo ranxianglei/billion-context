@@ -261,7 +261,7 @@ test("plugin-lane grow-and-compress: MCP host loop folds via /__bili/plugin/tool
         kernelConfig: defaultConfig(1_000_000, {
             preserveRecentMessages: 3,
             preserveRecentTokens: 800,
-            compress: { minCompressRange: 1000, maxSummaryLength: 20000, minSummaryLength: 50 },
+            compress: { minCompressRange: 250, maxSummaryLength: 20000, minSummaryLength: 50 },
         }),
         compress: { injectTool: true, injectNudge: true },
         compat: { roles: {} },

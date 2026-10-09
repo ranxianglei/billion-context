@@ -1,6 +1,6 @@
 // #1124 (piece 1 of the #1121 split; root-cause factor 3 of #1112): when the
-// WHOLE visible conversation holds fewer chars than compress.minCompressRange,
-// NO range combination can succeed — the kernel sums range chars against the
+// WHOLE visible conversation holds fewer tokens than compress.minCompressRange,
+// NO range combination can succeed — the kernel sums range tokens against the
 // single threshold. The failure receipt must say so conclusively instead of
 // steering the model back into compress retries and acp_status/search_context
 // inspection loops. Receipt tests only — re-applied standalone per the owner's

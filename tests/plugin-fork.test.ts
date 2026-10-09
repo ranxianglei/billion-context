@@ -848,7 +848,7 @@ test("HTTP fork before absorb summary preserves the original pair on the first c
             { role: "assistant", content: [{ type: "tool_use", id: "build_1", name: "bash", input: { command: "npm test" } }] },
             { role: "user", content: [{ type: "tool_result", tool_use_id: "build_1", content: toolOutput }] },
             { role: "assistant", content: [{ type: "tool_use", id: "absorb_1", name: "acp_absorb", input: { ref: "m00006", summary: "Build succeeded with all original checks." } }] },
-            { role: "user", content: [{ type: "tool_result", tool_use_id: "absorb_1", content: "absorption recorded ".repeat(10) }] },
+            { role: "user", content: [{ type: "tool_result", tool_use_id: "absorb_1", content: "absorption recorded ".repeat(40) }] },
             { role: "assistant", content: "build complete" },
             { role: "user", content: "continue" },
         ];

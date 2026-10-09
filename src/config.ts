@@ -218,17 +218,20 @@ export type CompressSettings = {
     preserveRecentMessages?: number;
     /** Token budget reserved for recent messages (kernel `preserveRecentTokens`). */
     preserveRecentTokens?: number;
-    /** Minimum compressible range size, in CHARACTERS (not tokens); smaller
-     *  ranges are skipped. English/code averages ~4 chars per token, CJK
-     *  ~1-2 chars per token, so the same number is ~4× more permissive for
-     *  English text than a token-based reading. Maps to kernel
-     *  `compress.minCompressRange` (default 5000 chars). */
-    minCompressRangeChars?: number;
-    /** Deprecated alias of {@link minCompressRangeChars} kept for backward
-     *  compatibility. When both keys are set at the same level the new name
+    /** Minimum compressible range size, in TOKENS; smaller ranges are
+     *  skipped. Language-neutral: CJK counts ~1 char per token, English/code
+     *  ~4 chars per token, so one value encodes the same token budget for any
+     *  script. Maps to kernel `compress.minCompressRange` (default 1250
+     *  tokens — the old 5000-char default expressed in tokens). */
+    minCompressRange?: number;
+    /** Deprecated alias of {@link minCompressRange} kept for backward
+     *  compatibility. Values written under this name were historically
+     *  interpreted as CHARACTERS and are now reinterpreted as TOKENS: a legacy
+     *  `5000` now requires ~5000 tokens (≈20000 Latin chars) instead of 5000
+     *  chars. When both keys are set at the same level the canonical name
      *  wins; across levels the deeper level wins regardless of which name it
      *  uses. */
-    minCompressRange?: number;
+    minCompressRangeChars?: number;
     /** Enable multi-tier (T2/T3) distillation (kernel `tiers.enabled`). */
     tiers?: boolean;
     /** Tool-name patterns whose LATEST tool-call + paired result are never

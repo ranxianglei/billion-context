@@ -161,10 +161,10 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
                 extra.push(`PRESSURE NOTE: billed input sits at ${Math.round(nudge.contextUsage * 100)}% of the ${ctx.config.modelContextLimit}-token limit while max compressible mass is only ~${nudge.breakdown.maxPending} tokens — little left to fold. Repeated small folds rewrite the prefix (forfeiting cache hits) while reclaiming almost nothing; continue the task instead of folding again unless pressure climbs further.`);
             }
             // #847: only advertise ranges the submit gate accepts — the gate
-            // counts raw chars (minCompressRange), not tokens, so a range can
-            // be "viable" yet deterministically uncompressible.
-            const minChars = ctx.config.compress.minCompressRange;
-            const ranges = viableRanges(nudge.compressibleRanges).filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars);
+            // counts tokens (minCompressRange), so a range can be "viable"
+            // yet deterministically uncompressible.
+            const minTokens = ctx.config.compress.minCompressRange;
+            const ranges = viableRanges(nudge.compressibleRanges).filter((r) => minTokens <= 0 || r.tokens >= minTokens);
             const protectedRanges = nudge.protectedRanges ?? [];
             // #2451 review (v2): the table is ALWAYS reported. It is live by
             // construction — buildCompressibleRanges (kernel/src/recommend.ts)

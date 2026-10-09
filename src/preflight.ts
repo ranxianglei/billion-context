@@ -385,10 +385,11 @@ function truncateSummaryToLimit(text: string, maxChars: number, minChars: number
 }
 
 // minUnits: never close a chunk below this many countText units while more
-// messages remain — a chunk under config.compress.minCompressRange chars is
-// rejected by applyCompression, so such a chunk would waste a whole round.
-// (The char-count regime needs this because its budget can be far smaller
-// than minCompressRange on small windows.)
+// messages remain — a chunk under config.compress.minCompressRange tokens is
+// rejected by applyCompression, so such a chunk would waste a whole round. In
+// the char-count regime (#553) the caller passes the 4× worst-case conversion
+// of that token gate. (That regime needs this because its budget can be far
+// smaller than the gate on small windows.)
 function splitChunks(
     messages: CoreMessage[],
     startIdx: number,
@@ -1184,8 +1185,12 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     }
     const budget = Math.max(MIN_CHUNK_TOKENS, Math.floor(limit * CHUNK_FRACTION));
     // applyCompression rejects ranges below config.compress.minCompressRange
-    // chars, so never spend a summarization call on a chunk that can't apply.
-    const minChars = deps.config.compress.minCompressRange;
+    // tokens, so never spend a summarization call on a chunk that can't apply.
+    const minTokens = deps.config.compress.minCompressRange;
+    // Char-regime (#553 upper-bound) equivalent of the token gate: worst case is
+    // 4 chars per token (all-Latin), so a span this large always clears the
+    // kernel's token gate regardless of script mix.
+    const minGateChars = minTokens * 4;
     // The fit check runs on the real post-fold payload size, not on
     // stats.lastInputTokens: a session without a measured baseline
     // (lastInputTokens == 0 — fresh, or forked/reloaded after an ACP
@@ -1321,14 +1326,14 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         // rounds and misreports "N viable ranges tried"; with them gone the
         // empty-list path below can reach the #330 soft-zone relaxation.
         const viable = viableRanges(turn.nudge?.compressibleRanges ?? []);
-        const ranges = viable.filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars);
+        const ranges = viable.filter((r) => minTokens <= 0 || r.tokens >= minTokens);
         // #1372: the list-level minCompressRange filter used to drop sub-minimum
         // ranges silently — "no compressible ranges remain" gave no hint that
         // ranges existed but were all under the gate.
         if (ranges.length === 0 && viable.length > 0 && !subMinNoted) {
             subMinNoted = true;
-            deps.log("warn", `[preflight] ${viable.length} viable range(s) are below minCompressRange (${minChars} chars); none foldable`);
-            noteSkip(`all ${viable.length} viable range(s) below minCompressRange (${minChars} chars)`);
+            deps.log("warn", `[preflight] ${viable.length} viable range(s) are below minCompressRange (${minTokens} tokens); none foldable`);
+            noteSkip(`all ${viable.length} viable range(s) below minCompressRange (${minTokens} tokens)`);
         }
         rangesRemaining = ranges.length;
         if (baselineKnown && ranges.length > 0) {
@@ -1375,7 +1380,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                         renderTags: "text-only",
                         contentStore: contentStoreOf(deps.session),
                     });
-                    const relaxedRanges = viableRanges(probe.nudge?.compressibleRanges ?? []).filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars);
+                    const relaxedRanges = viableRanges(probe.nudge?.compressibleRanges ?? []).filter((r) => minTokens <= 0 || r.tokens >= minTokens);
                     const relaxedPotential = resolvableMass(relaxedRanges);
                     if (relaxedPotential * FUTILITY_SLACK >= deficit) {
                         activeConfig = relaxedConfig(deps.config);
@@ -1418,7 +1423,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 continue;
             }
             failure = { kind: "exhausted", detail: relaxed ? relaxedExhaustedDetail : subMinNoted
-                ? `no foldable compressible ranges remain: all ${viable.length} viable range(s) are below minCompressRange (${minChars} chars)`
+                ? `no foldable compressible ranges remain: all ${viable.length} viable range(s) are below minCompressRange (${minTokens} tokens)`
                 : "no compressible ranges remain in the conversation" };
             break;
         }
@@ -1492,7 +1497,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
             // prime suspect for an empty summary is a CHUNK_FRACTION-sized chunk
             // exceeding the upstream's real input cap, and halving recovers
             // exactly those cases. Bounded by the per-regime call budget below.
-            const spans: Array<[number, number]> = splitChunks(messages, startIdx, endIdx, budget, baselineKnown ? 0 : minChars, countText).slice().reverse();
+            const spans: Array<[number, number]> = splitChunks(messages, startIdx, endIdx, budget, baselineKnown ? 0 : minGateChars, countText).slice().reverse();
             while (spans.length > 0) {
                 if (decisionTokens < textTarget) break;
                 if (deps.signal?.aborted) {
@@ -1715,7 +1720,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                             // unsplittable spans fall through to the give-up below. The
                             // cascade is bounded by the per-invocation summary budget
                             // (summaryBudget, #1933) via the while-top budgetHit check.
-                            const floorUnits = baselineKnown ? 2 * MIN_CHUNK_TOKENS : 2 * minChars;
+                            const floorUnits = baselineKnown ? 2 * MIN_CHUNK_TOKENS : 2 * minGateChars;
                             if ((err.status === 400 || err.status === 413) && !transient
                                 && ce > cs && spanUnitsOf(messages, cs, ce, countText) >= floorUnits) {
                                 lastUnusableDetail = `HTTP ${err.status}: ${bodySnippet}`;
@@ -1749,7 +1754,7 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
                 if (summary === null) {
                     const unusableDetail = outcome && "unusable" in outcome ? outcome.unusable : "unknown";
                     if (outcome) lastUnusableDetail = unusableDetail;
-                    const floorUnits = baselineKnown ? 2 * MIN_CHUNK_TOKENS : 2 * minChars;
+                    const floorUnits = baselineKnown ? 2 * MIN_CHUNK_TOKENS : 2 * minGateChars;
                     if (ce > cs && spanUnitsOf(messages, cs, ce, countText) >= floorUnits) {
                         deps.log("warn", `[preflight] chunk ${startRef}:${endRef} produced no usable summary (${unusableDetail}); retrying with smaller chunks`);
                         const mid = Math.floor((cs + ce) / 2);

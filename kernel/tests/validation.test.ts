@@ -140,7 +140,7 @@ test("validation: range below minCompressRange is rejected", () => {
 
 test("validation: batch aggregate — many small ranges pass if total >= minCompressRange", () => {
   const core = createCore();
-  const chunk = "x".repeat(1200);
+  const chunk = "x".repeat(4800);
   const messages = [
     msg("a", chunk),
     msg("b", chunk),
@@ -159,7 +159,7 @@ test("validation: batch aggregate — many small ranges pass if total >= minComp
     },
   });
 
-  // 5 separate ranges, each 1200 chars — individually below 5000 but total 6000
+  // 5 separate ranges, each 1200 tokens (4800 chars) — individually below 5000 but total 6000 tokens
   const result = core.applyCompression({
     ranges: [
       { startRef: "m00001", endRef: "m00001", summary: validSummary },

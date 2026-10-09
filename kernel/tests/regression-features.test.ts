@@ -190,7 +190,7 @@ test("Bug 3: defaultConfig deep-merges nested config objects", () => {
   // minSummaryLength overridden
   assert.equal(config.compress.minSummaryLength, 100);
   // Other compress fields preserved (not undefined)
-  assert.equal(config.compress.minCompressRange, 5000);
+  assert.equal(config.compress.minCompressRange, 1250);
   assert.equal(config.compress.maxSummaryLength, 20000);
 });
 

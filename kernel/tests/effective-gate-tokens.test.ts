@@ -1,12 +1,12 @@
 /**
- * Regression: recommend/nudge gates and the apply-side minCompressRange gate
- * must use the SAME unit. The apply side counts raw characters
- * (`msg.text.length`); the recommend side used to approximate chars with
- * `tokens*4`, which only holds for the default chars/4 estimator. Hosts that
- * inject a CJK-aware tokenizer (≈1 token per char) made `tokens*4` a ~4x
- * overestimate, so nudge offered ranges the kernel then atomically rejected
- * with "Total compressible content too small" — the exact failure mode the
- * effective gate exists to prevent (see PR fixing #57/#70 regression).
+ * Regression (#511): the recommend/nudge gate and the apply-side
+ * minCompressRange gate must use the SAME unit — tokens. The apply side used
+ * to count raw characters (`msg.text.length`) while the rest of the kernel
+ * counts tokens; under a CJK-aware tokenizer (≈1 token/char) that made the
+ * gate ~4x stricter than for Latin text, so CJK sessions' compressible ranges
+ * were dropped wholesale ("Total compressible content too small") even at equal
+ * token mass. Both sides now count tokens via countMessageTokens, so the gate
+ * is language-neutral.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -61,48 +61,57 @@ function cjkMessages(charsPerMessage: number, count: number): CoreMessage[] {
   }));
 }
 
-test("mergeRangesToThreshold: batches by real chars, not tokens*4 (CJK tokenizer)", () => {
-  // Two hand-built ranges WITHOUT chars exercise the legacy fallback;
-  // ranges WITH chars exercise the real accounting.
-  const legacyA: CompressibleRange = {
+test("gate keys on tokens, not chars (language-neutral, #511)", () => {
+  // A Latin-style range carries ~4x more chars than tokens; the gate must key
+  // on tokens so its verdict matches a CJK range of equal token mass. Pre-fix
+  // the gate read chars, so the 4999-token Latin range below cleared 5000
+  // (19996 chars) while the equal-token CJK range did not (#511).
+  const latin: CompressibleRange = {
     startRef: "m00001",
-    endRef: "m00002",
-    count: 2,
-    tokens: 1250,
+    endRef: "m00010",
+    count: 5,
+    tokens: 4999,
+    chars: 19996,
     toolPct: 0,
     textPct: 100,
   };
-  const out = mergeRangesToThreshold([legacyA], 5000);
-  assert.equal(
-    out.length,
-    1,
-    "fallback tokens*4=5000 still clears the 5000 threshold",
-  );
-
-  // 3000 chars of CJK = 3000 tokens under a CJK tokenizer. tokens*4 = 12000
-  // used to "clear" 5000; real chars (3000) do not — tail stays sub-threshold
-  // and pendingByTier must not count it as effective.
   const cjk: CompressibleRange = {
     startRef: "m00001",
-    endRef: "m00006",
-    count: 6,
-    tokens: 3000,
-    chars: 3000,
+    endRef: "m00010",
+    count: 5,
+    tokens: 4999,
+    chars: 4999,
     toolPct: 0,
     textPct: 100,
   };
-  assert.equal(cjk.chars < 5000, true);
   assert.equal(
-    cjk.tokens * 4 >= 5000,
-    true,
-    "pre-fix this range looked effective",
+    mergeRangesToThreshold([latin], 5000).length,
+    0,
+    "4999 tokens < 5000 despite 19996 chars",
+  );
+  assert.equal(
+    mergeRangesToThreshold([cjk], 5000).length,
+    0,
+    "equal-token CJK dropped identically",
+  );
+  assert.equal(
+    mergeRangesToThreshold([{ ...latin, tokens: 5000, chars: 20000 }], 5000)
+      .length,
+    1,
+    "5000 tokens clears",
+  );
+  assert.equal(
+    mergeRangesToThreshold([{ ...cjk, tokens: 5000, chars: 5000 }], 5000)
+      .length,
+    1,
+    "equal-token CJK clears identically",
   );
 });
 
-test("nudge: CJK session below minCompressRange chars is NOT offered (apply would reject)", () => {
+test("nudge: CJK session below minCompressRange tokens is NOT offered (apply would reject)", () => {
   const core = createCore({ countTokens: cjkTokenizer });
   const config = buildConfig();
-  const messages = cjkMessages(500, 6); // 3000 chars total < 5000 min
+  const messages = cjkMessages(500, 6); // 3000 tokens total < 5000 min
   let state = createInitialState();
 
   state = core.processTurn({
@@ -117,7 +126,7 @@ test("nudge: CJK session below minCompressRange chars is NOT offered (apply woul
   assert.equal(
     turn.nudge.shouldInject,
     false,
-    "3000 chars < minCompressRange 5000 — nudge must not offer it",
+    "3000 tokens < minCompressRange 5000 — nudge must not offer it",
   );
   assert.match(
     turn.nudge.reason,
@@ -141,10 +150,10 @@ test("nudge: CJK session below minCompressRange chars is NOT offered (apply woul
   );
 });
 
-test("nudge: CJK session above minCompressRange chars IS offered (control)", () => {
+test("nudge: CJK session above minCompressRange tokens IS offered (control)", () => {
   const core = createCore({ countTokens: cjkTokenizer });
   const config = buildConfig();
-  const messages = cjkMessages(1000, 6); // 6000 chars total >= 5000 min
+  const messages = cjkMessages(1000, 6); // 6000 tokens total >= 5000 min
   let state = createInitialState();
 
   state = core.processTurn({
@@ -158,11 +167,11 @@ test("nudge: CJK session above minCompressRange chars IS offered (control)", () 
   assert.equal(
     turn.nudge.shouldInject,
     true,
-    "6000 chars >= 5000 — effective T1 pending exists",
+    "6000 tokens >= 5000 — effective T1 pending exists",
   );
   assert.match(turn.nudge.reason, /T1/);
 
-  // And the apply side accepts the same range — both gates agree on chars.
+  // And the apply side accepts the same range — both gates agree on tokens.
   const applied = core.applyCompression({
     ranges: [
       {
@@ -179,7 +188,7 @@ test("nudge: CJK session above minCompressRange chars IS offered (control)", () 
   assert.equal(
     applied.result.blocksCreated,
     1,
-    "apply accepts: 6000 real chars >= 5000",
+    "apply accepts: 6000 tokens >= 5000",
   );
   assert.deepEqual(applied.result.errors, []);
 });

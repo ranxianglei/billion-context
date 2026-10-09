@@ -521,7 +521,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
     }
 
     if (input.config.compress.minCompressRange > 0 && input.ranges.length > 0) {
-      let totalRangeChars = 0;
+      let totalRangeTokens = 0;
       let hasBlockBoundaryRange = false;
       let countedRanges = 0;
       for (const [spec, resolution] of classifications) {
@@ -533,13 +533,13 @@ export function createCore(ports: Ports = {}): CompressionCore {
         countedRanges++;
         for (const id of resolution.resolved.messageIds) {
           const msg = input.messages.find((m) => m.id === id);
-          totalRangeChars += msg?.text?.length ?? 0;
+          totalRangeTokens += msg ? countMessageTokens(msg, countTokens) : 0;
         }
       }
       if (
         !allRefold &&
         !hasBlockBoundaryRange &&
-        totalRangeChars < input.config.compress.minCompressRange
+        totalRangeTokens < input.config.compress.minCompressRange
       ) {
         const diagnostics = refGateDiagnostics(
           state,
@@ -595,7 +595,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
                 ? `Requested range(s) cannot be anchored (e.g. ${firstConsumed!.startRef}..${firstConsumed!.endRef}): refs ${danglingRefs.join(", ")} are known to this session but no longer back any visible or folded message — the client rewrote or dropped those messages (an edit reissues a new ref; host-native compaction or a bulk history rewrite drops them outright), and no active block covers them. These refs are now recorded as DEAD: no range that includes them can compress now or later, whatever the neighbors. Do not retry this range in any form — run acp_status and target only the live refs it reports. ${diagnostics}`
                 : `Requested range(s) already compressed (e.g. ${firstConsumed!.startRef}..${firstConsumed!.endRef}) — ${coverDetail}${refoldDetail}. Nothing new to compress in that window. ${diagnostics} Continue the task, or run acp_status and target one of the CURRENT compressible ranges it reports.${tierActionHint(input.config, state)}`
               : countedRanges > 0
-                ? `Total compressible content too small (${totalRangeChars} chars across ${countedRanges} range(s), min ${input.config.compress.minCompressRange}). Combine more messages into your range(s) to meet the threshold.${refoldSuffix(okBlockedReasons)}`
+                ? `Total compressible content too small (${totalRangeTokens} tokens across ${countedRanges} range(s), min ${input.config.compress.minCompressRange}). Combine more messages into your range(s) to meet the threshold.${refoldSuffix(okBlockedReasons)}`
                 : null;
         if (gateMessage === null) {
           // No range was counted (every spec failed classification, e.g.
@@ -1722,12 +1722,11 @@ function resolveMinPressureBenefit(
 }
 
 /** Compressible amount for each tier. T1 = EFFECTIVE merged-range tokens —
- *  only ranges whose real char count >= minCompressRange count (avoids
- *  inflation from fragmentation; matches the apply-side gate, which counts
- *  raw `msg.text.length`, so a nudge never offers a range the kernel would
- *  atomically reject — see CompressibleRange.chars); T2 = total summary
- *  tokens of all active tier-1 blocks; T3 = total summary tokens of all
- *  active tier-2 blocks. */
+ *  only ranges whose token count >= minCompressRange count (avoids inflation
+ *  from fragmentation; matches the apply-side gate, which counts tokens via
+ *  countMessageTokens, so a nudge never offers a range the kernel would
+ *  atomically reject); T2 = total summary tokens of all active tier-1 blocks;
+ *  T3 = total summary tokens of all active tier-2 blocks. */
 function pendingByTier(
   state: CompressionState,
   recommendation: Recommendation | undefined,
@@ -1741,7 +1740,7 @@ function pendingByTier(
   const merged = recommendation?.recommendedRanges ?? [];
   const effective =
     minCompressRange > 0
-      ? merged.filter((r) => (r.chars ?? r.tokens * 4) >= minCompressRange)
+      ? merged.filter((r) => r.tokens >= minCompressRange)
       : merged;
   out[1] = {
     pending: effective.reduce((s, r) => s + r.tokens, 0),
@@ -1866,7 +1865,7 @@ function decideNudge(input: NudgeInput): NudgeDecision {
   if (pressure) {
     // High pressure: pick the tier with the MAX pending so pressure can route
     // to distillation when that reclaims the most tokens. Gated on effective
-    // pending (real chars >= minCompressRange for T1) so we never offer ranges
+    // pending (real tokens >= minCompressRange for T1) so we never offer ranges
     // the kernel would atomically reject. emergency vs over-limit only
     // changes the reason label/voice; truncate.threshold remains the
     // independent last resort when there is genuinely nothing to compress.

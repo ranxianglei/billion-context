@@ -37,7 +37,7 @@ function okSse(inputTokens: number): string {
 }
 
 // ~30K tokens of compressible content so the kernel has a viable T1 range
-// (minCompressRange = 5000 chars) to offer if EMERGENCY fires. Without some
+// (minCompressRange = 1250 tokens) to offer if EMERGENCY fires. Without some
 // compressible content the kernel suppresses the nudge even when over limit.
 function bigConversation(): Array<{ role: string; content: string }> {
     const msgs: Array<{ role: string; content: string }> = [];

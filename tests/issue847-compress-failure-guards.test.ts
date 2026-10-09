@@ -46,7 +46,7 @@ function compressArgs(startId: string, endId: string) {
     return JSON.parse(JSON.stringify({ content: [{ startId, endId, summary: SUMMARY }] }));
 }
 
-test("#847: acp_status lists only ranges that pass the submit gate (chars >= minCompressRange)", () => {
+test("#847: acp_status lists only ranges that pass the submit gate (tokens >= minCompressRange)", () => {
     // Kernel coalescing (#1001 era, mergeRangesToThreshold) merges sub-gate
     // leftovers into the previous >= gate batch, so the only surviving
     // "viable but uncompressible" shape is a session whose ENTIRE compressible
@@ -61,8 +61,8 @@ test("#847: acp_status lists only ranges that pass the submit gate (chars >= min
         textMsg("raw_4", "assistant", "d".repeat(1100)),
     ];
     const subCtx = makeCtx(sub, defaultConfig(200000, { preserveRecentMessages: 0, preserveRecentTokens: 0 }));
-    assert.equal(subCtx.config.compress.minCompressRange, 5000, "fixture sanity: default gate is 5000 chars");
-    assert.equal(sub.map((m) => m.text?.length ?? 0).reduce((a, b) => a + b, 0), 4400, "fixture sanity: whole span is sub-gate");
+    assert.equal(subCtx.config.compress.minCompressRange, 1250, "fixture sanity: default gate is 1250 tokens");
+    assert.equal(sub.map((m) => m.text?.length ?? 0).reduce((a, b) => a + b, 0), 4400, "fixture sanity: whole span is 4400 chars = 1100 tokens < 1250-token gate");
     const subReport = handleAcpStatus({}, subCtx).text;
     assert.ok(!subReport.includes("Compressible ranges"), "all-sub-gate session must NOT advertise any range");
     assert.ok(!subReport.includes("m00001"), "sub-gate range must NOT be listed");
@@ -90,7 +90,7 @@ test("#847: reversed refs surface an explicit note on gate failure instead of si
     const ctx = makeCtx(msgs);
     const out = applyRanges(parseCompressInput(compressArgs("m00002", "m00001")), ctx).text;
     assert.ok(out.startsWith("[Compression FAILED:"), `gate rejection expected (got: ${out.slice(0, 100)})`);
-    assert.match(out, /Total compressible content too small \(1600 chars/, "normalized span was evaluated (kernel swapped bounds)");
+    assert.match(out, /Total compressible content too small \(400 tokens/, "normalized span was evaluated (kernel swapped bounds)");
     assert.match(out, /reversed/, "explicit reversal note present");
 });
 

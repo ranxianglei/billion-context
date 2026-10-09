@@ -370,7 +370,7 @@ export interface TruncateConfig {
 }
 
 export interface CompressValidationConfig {
-  /** Minimum total chars of original messages in a range to allow compression. 0 = disabled. Default 5000. */
+  /** Minimum total TOKENS of original messages in a range to allow compression (same token unit as the rest of the kernel — language-neutral). 0 = disabled. Default 1250. */
   minCompressRange: number;
   /** Maximum summary length (chars). Summary exceeding this is rejected unless summaryMaxChars override is used. 0 = disabled. Default 20000. */
   maxSummaryLength: number;
@@ -451,14 +451,13 @@ export interface CompressibleRange {
   endRef: string;
   count: number;
   tokens: number;
-  /** Range size in characters (sum of message text lengths). The apply-side
-   *  minCompressRange gate counts raw `msg.text.length`, so recommend-side
-   *  gates must use this field — NOT `tokens` — or the two sides disagree
-   *  whenever a host injects a tokenizer where tokens != chars/4 (e.g. a
-   *  CJK-aware estimator: 1 token per char, making `tokens*4` a ~4x
-   *  overestimate). Always set on ranges produced by buildCompressibleRanges
-   *  / mergeRangesToThreshold; hand-built ranges without it fall back to the
-   *  historical tokens*4 estimate for backwards compat. */
+  /** Range size in characters (sum of message text lengths) — informational /
+   *  display only. The minCompressRange gate counts TOKENS (`tokens`), not
+   *  chars, so both recommend- and apply-side gates read `tokens` and stay
+   *  language-neutral (#511). Always set on ranges produced by
+   *  buildCompressibleRanges / mergeRangesToThreshold; hand-built ranges
+   *  without it fall back to the historical tokens*4 estimate for backwards
+   *  compat. */
   chars?: number;
   toolPct: number;
   textPct: number;

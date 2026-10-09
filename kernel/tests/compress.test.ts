@@ -171,7 +171,7 @@ test("gate verdict carries the reversal note instead of hiding it", () => {
   assert.equal(result.result.errors.length, 1);
   assert.match(
     result.result.errors[0]!,
-    /too small \(3 chars across 1 range\(s\), min 5000\)/,
+    /too small \(3 tokens across 1 range\(s\), min 5000\)/,
   );
   assert.match(
     result.result.errors[0]!,
@@ -183,7 +183,7 @@ test("gate verdict carries the reversal note instead of hiding it", () => {
 test("successful compression of a reversed range reports the rewrite in notes", () => {
   const core = createCore();
   const state = createInitialState();
-  const big = "w".repeat(1000);
+  const big = "w".repeat(4000);
   const messages = [
     msg("a", big),
     msg("b", big),
@@ -251,7 +251,7 @@ test("mixed batch appends the reversal note to the too-small verdict", () => {
   assert.equal(result.result.errors.length, 1);
   assert.match(
     result.result.errors[0]!,
-    /too small \(4 chars across 2 range\(s\), min 5000\)/,
+    /too small \(4 tokens across 2 range\(s\), min 5000\)/,
   );
   assert.match(
     result.result.errors[0]!,
@@ -929,14 +929,14 @@ test("fresh small content without consumed ranges keeps the too-small message", 
   assert.equal(result.result.blocksCreated, 0);
   assert.match(
     result.result.errors[0]!,
-    /^Total compressible content too small \(\d+ chars across 1 range\(s\), min 5000\)/,
+    /^Total compressible content too small \(\d+ tokens across 1 range\(s\), min 5000\)/,
   );
 });
 
 test("consumed plus fresh content above threshold proceeds with a warning", () => {
   const core = createCore();
   const state = createInitialState();
-  const big = "z".repeat(6000);
+  const big = "z".repeat(24000);
   const messages = [
     msg("u", "the task"),
     msg("a", "alpha"),

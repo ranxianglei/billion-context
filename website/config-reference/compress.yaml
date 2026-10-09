@@ -112,16 +112,16 @@ entries:
     desc_zh: "最近的 token 软保护、免于折叠。"
     site_en: "Kernel default ≈5000: the most recent tokens stay soft-protected from folds."
     site_zh: "内核默认约 5000：最近的 token 软保护、免于折叠。"
-  - key: compress.minCompressRangeChars
-    type: "number (deprecated alias: minCompressRange)"
-    default: "kernel ≈5000"
+  - key: compress.minCompressRange
+    type: "number (deprecated alias: minCompressRangeChars)"
+    default: "kernel ≈1250"
     group: compress
     id: cw.mrc
     render: compress-row
-    desc_en: "Smallest foldable range, in characters; shorter ranges never fold."
-    desc_zh: "可折叠片段的最小字符数；更短的永不折叠。"
-    site_en: "Smallest foldable range, in characters (kernel default ≈5000) — shorter ranges never fold."
-    site_zh: "可折叠片段的最小字符数（内核默认约 5000），更短的永不折叠。"
+    desc_en: "Smallest foldable range, in tokens; shorter ranges never fold."
+    desc_zh: "可折叠片段的最小 token 数；更短的永不折叠。"
+    site_en: "Smallest foldable range, in tokens (kernel default ≈1250) — shorter ranges never fold."
+    site_zh: "可折叠片段的最小 token 数（内核默认约 1250），更短的永不折叠。"
   - key: compress.reconcile
     type: "\"off\" | \"warn\" | \"repair\""
     default: "\"repair\""
@@ -559,10 +559,10 @@ entries:
     group: compress
     desc_en: "Character threshold above which finished reasoning runs are dropped."
     desc_zh: "已结束推理块被丢弃的字符阈值。"
-  - key: compress.minCompressRange
+  - key: compress.minCompressRangeChars
     type: number
-    default: "same as minCompressRangeChars"
+    default: "same as minCompressRange"
     group: compress
     deprecated: true
-    desc_en: "Deprecated alias of minCompressRangeChars (accepted, mapped onto it)."
-    desc_zh: "minCompressRangeChars 的弃用别名（接受，映射到后者）。"
+    desc_en: "Deprecated alias of minCompressRange (accepted, mapped onto it; legacy char values are now read as tokens)."
+    desc_zh: "minCompressRange 的弃用别名（接受，映射到前者；旧按字符计的取值现按 token 解读）。"

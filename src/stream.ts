@@ -494,11 +494,11 @@ function spansOverlap(aStart: string, aEnd: string, bStart: string, bEnd: string
 }
 
 function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Array<{ startRef: string; endRef: string }>): string {
-    // Same gates as handleAcpStatus: viability floor + the submit gate's raw char
+    // Same gates as handleAcpStatus: viability floor + the submit gate's token
     // count — never advertise a range the kernel would reject (#847).
-    const minChars = ctx.config.compress.minCompressRange;
+    const minTokens = ctx.config.compress.minCompressRange;
     const submitGate = (r: CompressibleRangeItem): boolean =>
-        minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars;
+        minTokens <= 0 || r.tokens >= minTokens;
     let base: CompressibleRangeItem[];
     let tier: number | null;
     if (ctx.lastNudge) {
@@ -729,17 +729,17 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
             // anything, so only append it when active blocks exist.
             const spanHint = ctx.session.state.blocks.some((b) => b.active) ? compressibleSpanHint(ctx.session.state) : "";
             // #1112: when the ENTIRE visible context is under the minimum, no
-            // COMBINATION of ranges can succeed either (the kernel sums chars
+            // COMBINATION of ranges can succeed either (the kernel sums tokens
             // across ranges against one threshold) — the generic "combine more
             // messages" advice sent models into acp_status/search_context
             // retry loops on fresh sessions. Append a conclusive verdict to the
             // standard failure (keeping the kernel reason + #847 reversal note
             // intact, all on one line for the client marker) so the model stops
             // inspecting state and lets the original turn continue.
-            const minChars = ctx.config.compress.minCompressRange;
-            const totalChars = ctx.messages.reduce((n, m) => n + (m.text ?? "").length, 0);
-            const noViableAnywhere = minChars > 0 && totalChars < minChars
-                ? ` This conversation holds only ${totalChars} char(s) — below the ${minChars}-char minimum, so NO range can succeed yet; do not retry compress or call acp_status/search_context about it — continue answering the user's task.`
+            const minTokens = ctx.config.compress.minCompressRange;
+            const totalTokens = ctx.messages.reduce((n, m) => n + countMessageTokens(m), 0);
+            const noViableAnywhere = minTokens > 0 && totalTokens < minTokens
+                ? ` This conversation holds only ~${totalTokens} token(s) — below the ${minTokens}-token minimum, so NO range can succeed yet; do not retry compress or call acp_status/search_context about it — continue answering the user's task.`
                 : "";
             const dropped = droppedEntriesNote(diagnostics);
             const specKey = normalizedSpecKey(ranges);

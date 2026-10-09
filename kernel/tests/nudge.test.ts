@@ -994,14 +994,14 @@ test("arbitration: emergency argmax picks T3 when T3 > T2 > T1 effective", () =>
 test("arbitration: sub-threshold tail folds into preceding batch (pendingT1 spans full remainder)", () => {
   const core = createCore();
   // With minCompressRange > 0, mergeRangesToThreshold guarantees every emitted
-  // batch alone clears the gate (#309). 10 short msgs (800 chars / 200 tokens
-  // each) form 3 groups: [m0..m3]=3200c, [m4..m7]=3200c, [m8..m9]=1600c
-  // (raw sum 2000 tokens). Merge flushes [m0..m7]=6400c; the 1600c tail folds
-  // into it → ONE range m0..m9 (2000 tokens, 8000 chars) that clears 5000 on
-  // its own → pendingT1 = 2000 and nudge lists exactly that one range.
+  // batch alone clears the gate (#309). 10 short msgs (200 tokens each, raw
+  // sum 2000 tokens). Merge (token gate, min 1500) closes the leading portion
+  // once it reaches 1500; the sub-threshold tail folds into it → ONE range
+  // m0..m9 (2000 tokens) that clears 1500 on its own → pendingT1 = 2000 and
+  // nudge lists exactly that one range.
   const config = buildConfig({
     compress: {
-      minCompressRange: 5000,
+      minCompressRange: 1500,
       maxSummaryLength: 0,
       minSummaryLength: 0,
     },

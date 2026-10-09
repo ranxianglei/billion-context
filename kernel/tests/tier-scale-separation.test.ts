@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createCore } from "../src/compress.js";
+import { defaultConfig } from "../src/config.js";
 import { createInitialState } from "../src/state.js";
 import type { Config, CoreMessage, CompressionBlock } from "../src/types.js";
 
@@ -8,8 +9,8 @@ import type { Config, CoreMessage, CompressionBlock } from "../src/types.js";
 // LATE-session mechanism. With default cadence (growthFloor 50K) each tier-1
 // block represents ~50K of folded tokens, so:
 //
-//   T2 count trigger = 1000 tier-1 blocks  => >= 5M cumulative folded floor
-//                      (1000 x minCompressRange 5K), ~50M ≈ 亿-typical.
+//   T2 count trigger = 1000 tier-1 blocks  => >= 1.25M cumulative folded floor
+//                      (1000 x minCompressRange 1250 tok, #512), ~50M ≈ 亿-typical.
 //   T3 count trigger = 2000 tier-2 blocks  => each tier-2 block distills
 //                      >= 1.5x growthFloor (75K) of tier-1 mass, so
 //                      >= 150M ≈ 亿-level floor, 几十亿-typical.
@@ -174,11 +175,11 @@ test("scale contract: default triggers encode 亿/几十亿 cumulative folded ma
   const config = buildConfig();
   assert.equal(config.tiers.tier2Trigger, 1000);
   assert.equal(config.tiers.tier3Trigger, 2000);
-  const minFoldPerT1 = 5000; // compress.minCompressRange floor per tier-1 block at creation
+  const minFoldPerT1 = defaultConfig(100000).compress.minCompressRange; // floor per tier-1 block at creation (#512 token units)
   const typicalFoldPerT1 = 50_000; // default nudge growthFloor cadence
   assert.ok(
-    config.tiers.tier2Trigger * minFoldPerT1 >= 5_000_000,
-    "T2 count floor must be >= 5M cumulative folded tokens",
+    config.tiers.tier2Trigger * minFoldPerT1 >= 1_250_000,
+    "T2 count floor must be >= 1.25M cumulative folded tokens",
   );
   assert.ok(
     config.tiers.tier2Trigger * typicalFoldPerT1 >= 50_000_000,

@@ -250,7 +250,7 @@ export function clampOutputBudget(requested: number, inputEstimate: number, nati
 // nudge whose range list compress would atomically reject — the
 // nudge-vs-compress/acp_status contradiction of #2104, which fed a
 // compress-loop (4 rejected/burned calls in 9 steps). Gate the override on
-// the SAME submit gate compress applies — chars >= minCompressRange (#847,
+// the SAME submit gate compress applies — tokens >= minCompressRange (#847,
 // the postCompressTail/handleAcpStatus filter, mirroring the kernel's own
 // pendingByTier expression): the emergency line may only advertise ranges
 // that are executable. minCompressRange 0 (default) preserves the legacy
@@ -258,7 +258,7 @@ export function clampOutputBudget(requested: number, inputEstimate: number, nati
 export function emergencyNudge(nudge: NudgeDecision | null | undefined, escalationPct: number = EMERGENCY_NUDGE_ESCALATION_PCT, minCompressRange: number = 0): boolean {
     if (!nudge || nudge.shouldInject) return false;
     if (nudge.contextUsage < escalationPct) return false;
-    return nudge.compressibleRanges.some((r) => minCompressRange <= 0 || (r.chars ?? r.tokens * 4) >= minCompressRange);
+    return nudge.compressibleRanges.some((r) => minCompressRange <= 0 || r.tokens >= minCompressRange);
 }
 
 export function clampOutgoingOutput(

@@ -144,7 +144,7 @@ test("grow-and-compress keeps upstream context bounded while client history grow
         kernelConfig: defaultConfig(1_000_000, {
             preserveRecentMessages: 3,
             preserveRecentTokens: 800,
-            compress: { minCompressRange: 1000, maxSummaryLength: 20000, minSummaryLength: 50 },
+            compress: { minCompressRange: 250, maxSummaryLength: 20000, minSummaryLength: 50 },
         }),
         compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },

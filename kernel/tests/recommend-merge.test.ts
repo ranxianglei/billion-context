@@ -20,7 +20,7 @@ test("empty ranges → []", () => {
   assert.deepEqual(mergeRangesToThreshold([], 5000), []);
 });
 
-test("minChars <= 0 → ranges unchanged (disabled)", () => {
+test("minTokens <= 0 → ranges unchanged (disabled)", () => {
   const ranges = [
     makeRange({ tokens: 100, startRef: "m00001", endRef: "m00002" }),
     makeRange({ tokens: 200, startRef: "m00003", endRef: "m00004" }),
@@ -32,7 +32,7 @@ test("minChars <= 0 → ranges unchanged (disabled)", () => {
 test("single range already >= threshold → returned as one batch unchanged", () => {
   const ranges = [
     makeRange({
-      tokens: 1250,
+      tokens: 6000,
       count: 4,
       toolPct: 50,
       textPct: 50,
@@ -42,7 +42,7 @@ test("single range already >= threshold → returned as one batch unchanged", ()
   ];
   const out = mergeRangesToThreshold(ranges, 5000);
   assert.equal(out.length, 1);
-  assert.equal(out[0]!.tokens, 1250);
+  assert.equal(out[0]!.tokens, 6000);
   assert.equal(out[0]!.count, 4);
   assert.equal(out[0]!.startRef, "m00001");
   assert.equal(out[0]!.endRef, "m00010");
@@ -51,7 +51,7 @@ test("single range already >= threshold → returned as one batch unchanged", ()
 test("two small ranges whose sum >= threshold → ONE merged batch", () => {
   const ranges = [
     makeRange({
-      tokens: 600,
+      tokens: 3000,
       count: 2,
       toolPct: 100,
       textPct: 0,
@@ -59,7 +59,7 @@ test("two small ranges whose sum >= threshold → ONE merged batch", () => {
       endRef: "m00005",
     }),
     makeRange({
-      tokens: 700,
+      tokens: 2000,
       count: 3,
       toolPct: 0,
       textPct: 100,
@@ -70,24 +70,24 @@ test("two small ranges whose sum >= threshold → ONE merged batch", () => {
   const out = mergeRangesToThreshold(ranges, 5000);
   assert.equal(out.length, 1, "should merge into a single batch");
   assert.equal(out[0]!.count, 5);
-  assert.equal(out[0]!.tokens, 1300);
+  assert.equal(out[0]!.tokens, 5000);
   assert.equal(out[0]!.startRef, "m00001");
   assert.equal(out[0]!.endRef, "m00020", "endRef = second child endRef");
 });
 
 test("sub-threshold tail folds into preceding batch (overshoot allowed)", () => {
   // Regression (#309 / billion-context #847): the old trailing flush emitted
-  // the 200-char tail as its own batch, which nudge then listed as
+  // the below-gate tail as its own batch, which nudge then listed as
   // compressible even though the apply-side gate rejects it standalone.
   const ranges = [
     makeRange({
-      tokens: 600,
+      tokens: 3000,
       count: 1,
       startRef: "m00001",
       endRef: "m00003",
     }),
     makeRange({
-      tokens: 700,
+      tokens: 2000,
       count: 1,
       startRef: "m00004",
       endRef: "m00006",
@@ -101,26 +101,23 @@ test("sub-threshold tail folds into preceding batch (overshoot allowed)", () => 
   ];
   const out = mergeRangesToThreshold(ranges, 5000);
   assert.equal(out.length, 1, "tail folded into the preceding batch");
-  assert.equal(out[0]!.tokens, 1350, "batch + tail summed");
+  assert.equal(out[0]!.tokens, 5050, "batch + tail summed");
   assert.equal(out[0]!.count, 3);
   assert.equal(out[0]!.startRef, "m00001");
   assert.equal(out[0]!.endRef, "m00011", "span extended to the tail's endRef");
-  assert.ok(
-    (out[0]!.chars ?? out[0]!.tokens * 4) >= 5000,
-    "folded batch alone clears the gate",
-  );
+  assert.ok(out[0]!.tokens >= 5000, "folded batch alone clears the gate");
 });
 
 test("dangerous: true on a child propagates to merged batch", () => {
   const ranges = [
     makeRange({
-      tokens: 600,
+      tokens: 3000,
       count: 1,
       startRef: "m00001",
       endRef: "m00002",
     }),
     makeRange({
-      tokens: 700,
+      tokens: 2000,
       count: 1,
       startRef: "m00003",
       endRef: "m00004",
@@ -135,13 +132,13 @@ test("dangerous: true on a child propagates to merged batch", () => {
 test("no dangerous children → merged batch omits dangerous", () => {
   const ranges = [
     makeRange({
-      tokens: 600,
+      tokens: 3000,
       count: 1,
       startRef: "m00001",
       endRef: "m00002",
     }),
     makeRange({
-      tokens: 700,
+      tokens: 2000,
       count: 1,
       startRef: "m00003",
       endRef: "m00004",
@@ -155,7 +152,7 @@ test("no dangerous children → merged batch omits dangerous", () => {
 test("count-weighted toolPct: A(count2,tool100) + B(count3,tool0) → 40 / 60", () => {
   const ranges = [
     makeRange({
-      tokens: 600,
+      tokens: 3000,
       count: 2,
       toolPct: 100,
       textPct: 0,
@@ -163,7 +160,7 @@ test("count-weighted toolPct: A(count2,tool100) + B(count3,tool0) → 40 / 60", 
       endRef: "m00002",
     }),
     makeRange({
-      tokens: 700,
+      tokens: 2000,
       count: 3,
       toolPct: 0,
       textPct: 100,
@@ -180,13 +177,13 @@ test("count-weighted toolPct: A(count2,tool100) + B(count3,tool0) → 40 / 60", 
 test("merges across ref gaps (non-adjacent refs)", () => {
   const ranges = [
     makeRange({
-      tokens: 600,
+      tokens: 3000,
       count: 1,
       startRef: "m00001",
       endRef: "m00002",
     }),
     makeRange({
-      tokens: 700,
+      tokens: 2000,
       count: 1,
       startRef: "m00050",
       endRef: "m00060",
@@ -199,7 +196,7 @@ test("merges across ref gaps (non-adjacent refs)", () => {
 });
 
 test("all content below threshold → [] (nothing can clear the gate)", () => {
-  // Total = 3×400 = 1200 chars < 5000: no selection of this content can pass
+  // Total = 3×100 = 300 tokens < 5000: no selection of this content can pass
   // the apply-side gate, so offering a merged sub-threshold range would only
   // produce guaranteed-rejected calls (#309). Offer nothing instead.
   const ranges = [
@@ -211,24 +208,24 @@ test("all content below threshold → [] (nothing can clear the gate)", () => {
   assert.deepEqual(out, [], "sub-threshold remainder is not offered");
 });
 
-test("invariant: every emitted batch alone clears minChars", () => {
+test("invariant: every emitted batch alone clears minTokens", () => {
   // #309: nudge lists recommendedRanges verbatim; any entry below the gate's
-  // char floor is a guaranteed-rejected call. Check across shapes: clean
+  // token floor is a guaranteed-rejected call. Check across shapes: clean
   // flushes, a foldable tail, and real `chars` fields under a CJK-like
   // tokenizer where tokens ≈ chars.
   const cjk = (n: number): CompressibleRange =>
     makeRange({ tokens: n, chars: n, count: Math.max(1, Math.round(n / 50)) });
-  for (const [ranges, minChars] of [
+  for (const [ranges, minTokens] of [
     [[cjk(600), cjk(700), cjk(50)], 5000],
     [[cjk(3000), cjk(3000)], 5000],
     [[cjk(6000), cjk(2000), cjk(2000)], 5000],
     [[cjk(100), cjk(100)], 5000],
   ] as Array<[CompressibleRange[], number]>) {
-    const out = mergeRangesToThreshold(ranges, minChars);
+    const out = mergeRangesToThreshold(ranges, minTokens);
     for (const r of out) {
       assert.ok(
-        r.chars >= minChars,
-        `batch ${r.startRef}–${r.endRef} (${r.chars} chars) must clear ${minChars}`,
+        r.tokens >= minTokens,
+        `batch ${r.startRef}–${r.endRef} (${r.tokens} tokens) must clear ${minTokens}`,
       );
     }
   }
@@ -238,15 +235,15 @@ test("invariant: every emitted batch alone clears minChars", () => {
 // A physical gap between endIndex+1 and the next startIndex marks a block /
 // protected / pruned boundary that batching must never bridge (#498).
 function indexedRange(
-  chars: number,
+  tokens: number,
   startIdx: number,
   endIdx: number,
   startRef: string,
   endRef: string,
 ): CompressibleRange {
   return makeRange({
-    tokens: Math.round(chars / 4),
-    chars,
+    tokens,
+    chars: tokens * 4,
     count: endIdx - startIdx + 1,
     startRef,
     endRef,

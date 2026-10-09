@@ -23,7 +23,7 @@ export function defaultConfig(
     promotionThreshold: 5,
     truncate: { threshold: 0.95, terminalEscapeAfter: 3 },
     compress: {
-      minCompressRange: 5000,
+      minCompressRange: 1250,
       maxSummaryLength: 20000,
       minSummaryLength: 50,
     },

@@ -52,12 +52,13 @@ export function mergeCompress(
     // provider-level compressPhilosophy. The kernel's resolvePrompts then
     // fills any still-missing sub-fields from defaultPrompts.
     const promptLevels = [global?.prompts, provider?.prompts, model?.prompts].filter(Boolean) as Partial<Prompts>[];
-    // minCompressRangeChars is the canonical name; minCompressRange is a
-    // deprecated alias. Resolve the alias per LEVEL first (same level: new
-    // name wins), then deepest defined level wins — so a model-level old-name
-    // value still beats a global-level new-name value. The merged output
-    // always carries the canonical name only.
-    const rangeOf = (s?: CompressSettings): number | undefined => s?.minCompressRangeChars ?? s?.minCompressRange;
+    // minCompressRange is the canonical name (unit: tokens);
+    // minCompressRangeChars is a deprecated alias. Resolve the alias per LEVEL
+    // first (same level: canonical name wins), then deepest defined level
+    // wins — so a model-level old-name value still beats a global-level
+    // canonical value. The merged output always carries the canonical name
+    // only.
+    const rangeOf = (s?: CompressSettings): number | undefined => s?.minCompressRange ?? s?.minCompressRangeChars;
     // `absorb` is a second nested-object field, merged sub-field-wise exactly
     // like `prompts`: a model-level minToolTokens must not discard a
     // provider-level excludeTools.
@@ -83,7 +84,7 @@ export function mergeCompress(
         nudgeDecisionMaxTokens: pick("nudgeDecisionMaxTokens"),
         preserveRecentMessages: pick("preserveRecentMessages"),
         preserveRecentTokens: pick("preserveRecentTokens"),
-        minCompressRangeChars: rangeOf(model) ?? rangeOf(provider) ?? rangeOf(global),
+        minCompressRange: rangeOf(model) ?? rangeOf(provider) ?? rangeOf(global),
         tiers: pick("tiers"),
         protectedLatestTools: pick("protectedLatestTools"),
         protectedTools: pick("protectedTools"),
@@ -228,8 +229,8 @@ export function hasCompressSettings(s: CompressSettings): boolean {
   *    partially-set object still resolves fully. Absent leaves
   *    `base.nudge.tierGrowthTokens` untouched.
  *  - `preserveRecentMessages` / `preserveRecentTokens` → top-level Config.
-  *  - `minCompressRangeChars` (deprecated alias: `minCompressRange`) →
-  *    `compress.minCompressRange`. The unit is characters.
+  *  - `minCompressRange` (deprecated alias: `minCompressRangeChars`) →
+  *    `compress.minCompressRange`. The unit is tokens.
   *  - `tiers` → `tiers.enabled`.
   *  - `protectedLatestTools` → top-level Config (kernel hard-excludes the
   *    latest instance + paired result of matching tools from every compress
@@ -352,7 +353,7 @@ export function applyCompressSettings(base: Config, limit: number, s: CompressSe
         preserveRecentTokens: s.preserveRecentTokens ?? base.preserveRecentTokens,
         compress: {
             ...base.compress,
-            minCompressRange: s.minCompressRangeChars ?? s.minCompressRange ?? base.compress.minCompressRange,
+            minCompressRange: s.minCompressRange ?? s.minCompressRangeChars ?? base.compress.minCompressRange,
         },
         protectedLatestTools: s.protectedLatestTools ?? base.protectedLatestTools,
         protectedTools: s.protectedTools ?? base.protectedTools,

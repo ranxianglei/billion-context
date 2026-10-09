@@ -207,7 +207,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.streamSummary` | boolean | false (unset) | — | Force preflight summarization to run as a streaming (SSE) call from the first attempt. Needed when the upstream sits behind a gateway that times out long non-streaming completions (e.g. Cloudflare HTTP 524): the error-driven self-learn only sees 400 "stream required" rejections and never arms on gateway timeouts. |
 | `compress.preserveRecentMessages` | number | kernel ≈5 | — | The most recent messages stay soft-protected from folds. |
 | `compress.preserveRecentTokens` | number | kernel ≈5000 | — | The most recent tokens stay soft-protected from folds. |
-| `compress.minCompressRangeChars` | number (deprecated alias: minCompressRange) | kernel ≈5000 | — | Smallest foldable range, in characters; shorter ranges never fold. |
+| `compress.minCompressRange` | number (deprecated alias: minCompressRangeChars) | kernel ≈1250 | — | Smallest foldable range, in tokens; shorter ranges never fold. |
 | `compress.reconcile` | "off" \| "warn" \| "repair" | "repair" | BILI_FOLD_RECONCILE | Reconcile folded state when the client rewinds or rewrites history between turns. |
 | `compress.promptPack` | string (builtin: "default", "lean") | builtin "default" | — | Compression prompt pack, resolved project pack → user pack → builtin; not gated by acknowledgePromptsRisk. |
 | `compress.stripImagesKeepRecent` | number | 5 | — | With stripImages on, images inside the N newest messages are kept (fallback window when no fold anchors the boundary). |
@@ -265,7 +265,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.priceProfile.q` | number | unset (registry) | — | Output price ratio relative to the input price. |
 | `compress.reasoning.drop` | boolean | true | — | Drop finished-round reasoning runs longer than the threshold. |
 | `compress.reasoning.threshold` | number | 2048 | — | Character threshold above which finished reasoning runs are dropped. |
-| `compress.minCompressRange` | number | same as minCompressRangeChars | — | Deprecated alias of minCompressRangeChars (accepted, mapped onto it). _(deprecated)_ |
+| `compress.minCompressRangeChars` | number | same as minCompressRange | — | Deprecated alias of minCompressRange (accepted, mapped onto it; legacy char values are now read as tokens). _(deprecated)_ |
 
 **Provider route fields**
 
@@ -1197,18 +1197,18 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Status:** ACTIVE
 - **Description:** Token budget reserved for recent-message protection. Maps to the kernel field `preserveRecentTokens`.
 
-#### `minCompressRangeChars`
-
-- **Type:** `number`
-- **Default:** *(kernel default, typically `5000`)*
-- **Status:** ACTIVE
-- **Description:** Minimum range size, in **characters** (not tokens), for a message range to be eligible for compression; smaller ranges are skipped. English/code averages ~4 chars per token, CJK ~1-2, so the same number reads ~4× more permissive for English text than a token-based mental model. Maps to the kernel field `compress.minCompressRange`.
-
 #### `minCompressRange`
 
 - **Type:** `number`
-- **Status:** DEPRECATED (alias of `minCompressRangeChars`, kept for backward compatibility)
-- **Description:** Legacy name for `minCompressRangeChars` — same kernel mapping (`compress.minCompressRange`), same unit (characters). When both keys are set at the same level the canonical name wins; across levels the deeper level wins regardless of which name it uses.
+- **Default:** *(kernel default, typically `1250`)*
+- **Status:** ACTIVE
+- **Description:** Minimum range size, in **tokens**, for a message range to be eligible for compression; smaller ranges are skipped. Language-neutral: CJK counts ~1 char per token, English/code ~4, so one value encodes the same token budget for any script. Maps to the kernel field `compress.minCompressRange`.
+
+#### `minCompressRangeChars`
+
+- **Type:** `number`
+- **Status:** DEPRECATED (alias of `minCompressRange`, kept for backward compatibility)
+- **Description:** Legacy name for `minCompressRange` — same kernel mapping (`compress.minCompressRange`). Values written under this name were historically interpreted as **characters** and are now reinterpreted as **tokens**: a legacy `5000` now requires ~5000 tokens (≈20000 Latin chars) instead of 5000 chars. When both keys are set at the same level the canonical name wins; across levels the deeper level wins regardless of which name it uses.
 
 #### `tiers`
 
