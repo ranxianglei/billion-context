@@ -2,3 +2,4 @@
 # Without this, Git-for-Windows' default autocrlf=true converts them to CRLF at
 # checkout and the byte-equal golden gates fail on every Windows CI run.
 tests/golden/wire-contract/*.json text eol=lf
+tests/golden/web-trajectory/*.svg text eol=lf

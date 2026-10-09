@@ -610,6 +610,8 @@ export const WEB_CLIENT = `(function () {
         }
         detEl.hidden = true;
         listEl.hidden = false;
+        trajState = null;
+        trajRange = null;
         await refreshSessions(true);
     }
     let hiddenEmptyN = 0;
@@ -685,10 +687,13 @@ export const WEB_CLIENT = `(function () {
     function kv(parts, label, value, mono) {
         parts.push('<div class="k">' + label + '</div><div class="v' + (mono ? " mono" : "") + '">' + (value == null || value === "" ? t("common.none") : escapeHtml(String(value))) + "</div>");
     }
+    // #2489: chart geometry shared by the renderer and the brush interaction below.
+    const TRAJ_W = 960, TRAJ_H = 260, TRAJ_PL = 56, TRAJ_PR = 16, TRAJ_PT = 14, TRAJ_PB = 26;
+    const TRAJ_MIN_SAMPLES = 5;
     function trajectorySvg(lines, folds, win, baseIn, seamEvents) {
         lines = (lines || []).filter((l) => Boolean(l));
         if (!lines.length) return "";
-        const W = 960, H = 260, PL = 56, PR = 16, PT = 14, PB = 26;
+        const W = TRAJ_W, H = TRAJ_H, PL = TRAJ_PL, PR = TRAJ_PR, PT = TRAJ_PT, PB = TRAJ_PB;
         const iw = W - PL - PR, ih = H - PT - PB;
         let maxY = 0;
         lines.forEach((l) => { if ((l.input || 0) > maxY) maxY = l.input; });
@@ -813,6 +818,159 @@ export const WEB_CLIENT = `(function () {
         if (dashed) return '<span><span class="dot" style="background:none;border-top:2px dashed #cf222e;height:0;border-radius:0;width:14px"></span>' + label + "</span>";
         return '<span><span class="dot" style="' + style + '"></span>' + label + "</span>";
     }
+    // #1609: cache-miss attribution (#1606). Defensive reads — servers predating #1606
+    // carry no ledger.seam at all, and an all-zero shape must render nothing.
+    function detailSeam(ledger) {
+        const raw = ledger && ledger.seam && typeof ledger.seam === "object" ? ledger.seam : null;
+        if (!raw) return null;
+        return {
+            suspects: Number(raw.suspects) || 0,
+            missed: Number(raw.missed) || 0,
+            events: Array.isArray(raw.events) ? raw.events.filter((e) => e && e.at > 0) : [],
+            providerSide: { count: (raw.providerSide && Number(raw.providerSide.count)) || 0, missed: (raw.providerSide && Number(raw.providerSide.missed)) || 0 },
+            rewinds: { count: (raw.rewinds && Number(raw.rewinds.count)) || 0, missed: (raw.rewinds && Number(raw.rewinds.missed)) || 0 },
+            abortCorrelated: Number(raw.abortCorrelated) || 0,
+        };
+    }
+    function detailSeamActive(seam) {
+        return !!(seam && (seam.suspects > 0 || seam.missed > 0 || seam.events.length > 0 || seam.providerSide.count > 0 || seam.rewinds.count > 0 || seam.abortCorrelated > 0));
+    }
+    // #2489: zoom-to-selection over the context-trajectory chart. The data is already
+    // client-side, so zooming re-renders the SAME renderer over a filtered slice — no
+    // server round-trip, and an un-zoomed view stays byte-identical to the full render.
+    let trajState = null;   // { lines, folds, seams, win, baseIn } of the rendered detail
+    let trajRange = null;   // absolute [i0, i1] into trajState.lines, or null = full view
+    let trajDrag = null;    // in-flight brush gesture
+    function trajVisible() {
+        if (!trajState) return null;
+        const L = trajState.lines;
+        let a = 0, b = L.length - 1;
+        if (trajRange) {
+            a = Math.max(0, Math.min(L.length - 1, trajRange[0]));
+            b = Math.max(a, Math.min(L.length - 1, trajRange[1]));
+        }
+        const lines = L.slice(a, b + 1);
+        // Full view passes EVERY fold/seam through unfiltered: the renderer clamps
+        // out-of-sample-range marks to the nearest edge (the pre-#2489 behavior, which
+        // the byte-parity acceptance criterion pins). Time-filtering only applies to a
+        // ZOOMED window, where a foreign mark would land on the wrong sample.
+        if (!trajRange) return { lines, folds: trajState.folds || [], seams: trajState.seams || [], offset: a };
+        const t0 = lines[0] ? (lines[0].at || 0) : 0;
+        const t1 = lines.length ? (lines[lines.length - 1].at || 0) : 0;
+        return {
+            lines,
+            folds: (trajState.folds || []).filter((f) => (f.at || 0) >= t0 && (f.at || 0) <= t1),
+            seams: (trajState.seams || []).filter((e) => e && e.at > 0 && e.at >= t0 && e.at <= t1),
+            offset: a,
+        };
+    }
+    function trajRender() {
+        const wrap = $("traj-chart");
+        const v = trajVisible();
+        if (!wrap || !v) return;
+        wrap.innerHTML = v.lines.length ? trajectorySvg(v.lines, v.folds, trajState.win, trajState.baseIn, v.seams) : "";
+        trajUpdateStatus(v);
+    }
+    function trajUpdateStatus(v) {
+        const st = $("traj-status");
+        if (!st) return;
+        if (!trajRange || !v || !v.lines.length) { st.hidden = true; st.innerHTML = ""; return; }
+        const L = trajState.lines;
+        const a = v.offset, b = v.offset + v.lines.length - 1;
+        const sa = L[a].seq != null ? "#" + L[a].seq : "#" + (a + 1);
+        const sb = L[b].seq != null ? "#" + L[b].seq : "#" + (b + 1);
+        const times = v.lines.map((l) => l.at).filter(Boolean);
+        st.hidden = false;
+        st.innerHTML = '<span class="mono small">' + escapeHtml(t("det.traj_zoomed", { a: sa.slice(1), b: sb.slice(1), times: times.length ? fmtDT(times[0]) + " \u2192 " + fmtDT(times[times.length - 1]) : t("common.none") })) + "</span>"
+            + '<button id="traj-reset" class="btn sm" type="button">' + escapeHtml(t("det.traj_reset")) + "</button>";
+        const rb = $("traj-reset");
+        if (rb) rb.addEventListener("click", () => trajSetRange(null));
+    }
+    function trajSetRange(r) {
+        trajRange = r && r[1] > r[0] ? [r[0], r[1]] : null;
+        trajRender();
+    }
+    function trajIdxFromX(x, n) {
+        if (n <= 1) return 0;
+        const iw = TRAJ_W - TRAJ_PL - TRAJ_PR;
+        return Math.max(0, Math.min(n - 1, Math.round(((x - TRAJ_PL) / iw) * (n - 1))));
+    }
+    function trajLocalX(wrap, ev) {
+        const r = wrap.getBoundingClientRect ? wrap.getBoundingClientRect() : null;
+        if (!r || !(r.width > 0)) return null;
+        const x = (ev.clientX - r.left) * (TRAJ_W / r.width);
+        return Math.max(TRAJ_PL, Math.min(TRAJ_W - TRAJ_PR, x));
+    }
+    function trajOverlayShow(wrap, xa, xb) {
+        if (!trajDrag || !trajDrag.overlay) return;
+        const r = wrap.getBoundingClientRect ? wrap.getBoundingClientRect() : null;
+        if (!r || !(r.width > 0)) return;
+        const o = trajDrag.overlay;
+        o.style.left = (Math.min(xa, xb) * (r.width / TRAJ_W)).toFixed(1) + "px";
+        o.style.width = (Math.abs(xb - xa) * (r.width / TRAJ_W)).toFixed(1) + "px";
+        o.style.top = (TRAJ_PT * (r.height / TRAJ_H)).toFixed(1) + "px";
+        o.style.height = ((TRAJ_H - TRAJ_PT - TRAJ_PB) * (r.height / TRAJ_H)).toFixed(1) + "px";
+    }
+    function trajOnDown(ev) {
+        if (!trajState || ev.button !== 0) return;
+        const wrap = $("traj-chart");
+        const v = trajVisible();
+        if (!wrap || !v || v.lines.length < TRAJ_MIN_SAMPLES) return;
+        ev.preventDefault();
+        const x0 = trajLocalX(wrap, ev);
+        if (x0 == null) return;
+        const o = document.createElement("div");
+        o.className = "chart-brush";
+        wrap.appendChild(o);
+        trajDrag = { x0, cur: x0, n: v.lines.length, offset: v.offset, overlay: o };
+        trajOverlayShow(wrap, x0, x0);
+        document.addEventListener("mousemove", trajOnMove);
+        document.addEventListener("mouseup", trajOnUp);
+    }
+    function trajOnMove(ev) {
+        if (!trajDrag) return;
+        const x = trajLocalX($("traj-chart"), ev);
+        if (x == null) return;
+        trajDrag.cur = x;
+        trajOverlayShow($("traj-chart"), trajDrag.x0, x);
+    }
+    function trajOnUp(ev) {
+        document.removeEventListener("mousemove", trajOnMove);
+        document.removeEventListener("mouseup", trajOnUp);
+        if (!trajDrag) return;
+        const d0 = trajDrag;
+        trajDrag = null;
+        if (d0.overlay) d0.overlay.remove();
+        const x1 = trajLocalX($("traj-chart"), ev);
+        if (x1 == null) return;
+        const i0 = trajIdxFromX(Math.min(d0.x0, x1), d0.n);
+        const i1 = trajIdxFromX(Math.max(d0.x0, x1), d0.n);
+        if (i1 - i0 + 1 < TRAJ_MIN_SAMPLES) return;     // too narrow — treat as a click
+        if (i1 - i0 + 1 >= d0.n) return;                 // full-width drag — nothing to gain
+        trajSetRange([d0.offset + i0, d0.offset + i1]);
+    }
+    function bindTrajectoryBrush(d) {
+        trajState = null;
+        trajRange = null;
+        const ledger = d.ledger || {};
+        const lines = (ledger.lines || []).filter((l) => Boolean(l));
+        if (!lines.length) return;
+        const seam = detailSeam(ledger);
+        trajState = {
+            lines,
+            folds: ledger.folds || [],
+            seams: detailSeamActive(seam) && seam ? seam.events : [],
+            win: d.contextWindow || 0,
+            baseIn: d.systemPromptTokens || 0,
+        };
+        const wrap = $("traj-chart");
+        if (!wrap) return;
+        wrap.addEventListener("mousedown", trajOnDown);
+        wrap.addEventListener("dblclick", () => trajSetRange(null));
+        trajRender();
+    }
+    window.bili_trajSvg = trajectorySvg;
+    window.bili_trajZoom = { minSamples: TRAJ_MIN_SAMPLES, idxFromX: trajIdxFromX, visible: () => trajVisible(), range: () => trajRange };
     function blockTopic(b) {
         // #1426: untitled blocks fall back to the lead line of their summary
         if (b.topic && String(b.topic).trim()) return String(b.topic).trim();
@@ -1055,23 +1213,16 @@ export const WEB_CLIENT = `(function () {
         parts.push("</div></div>");
         const ledger = d.ledger || {};
         const lines = ledger.lines || [];
-        // #1609: cache-miss attribution (#1606). Defensive reads — servers predating #1606
-        // carry no ledger.seam at all, and an all-zero shape must render nothing.
-        const seamRaw = ledger.seam && typeof ledger.seam === "object" ? ledger.seam : null;
-        const seam = seamRaw ? {
-            suspects: Number(seamRaw.suspects) || 0,
-            missed: Number(seamRaw.missed) || 0,
-            events: Array.isArray(seamRaw.events) ? seamRaw.events.filter((e) => e && e.at > 0) : [],
-            providerSide: { count: (seamRaw.providerSide && Number(seamRaw.providerSide.count)) || 0, missed: (seamRaw.providerSide && Number(seamRaw.providerSide.missed)) || 0 },
-            rewinds: { count: (seamRaw.rewinds && Number(seamRaw.rewinds.count)) || 0, missed: (seamRaw.rewinds && Number(seamRaw.rewinds.missed)) || 0 },
-            abortCorrelated: Number(seamRaw.abortCorrelated) || 0,
-        } : null;
-        const seamActive = !!(seam && (seam.suspects > 0 || seam.missed > 0 || seam.events.length > 0 || seam.providerSide.count > 0 || seam.rewinds.count > 0 || seam.abortCorrelated > 0));
+        const seam = detailSeam(ledger);
+        const seamActive = detailSeamActive(seam);
         parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.trajectory") + '</span><span class="hint">' + t("det.trajectory_sub") + '</span></div><div class="card-b">');
         if (!lines.length) {
             parts.push('<div class="chart-empty">' + t("det.trajectory_empty") + "</div>");
         } else {
-            parts.push('<div class="chart-wrap">' + trajectorySvg(lines, ledger.folds || [], d.contextWindow, d.systemPromptTokens || 0, seamActive ? seam.events : []) + "</div>");
+            parts.push('<div class="chart-status" id="traj-status" hidden></div>');
+            // #2489: the wrap starts empty — bindTrajectoryBrush() → trajRender() fills it,
+            // so every chart state (full and zoomed) comes from the single render path.
+            parts.push('<div class="chart-wrap" id="traj-chart"></div>');
             parts.push('<div class="chart-legend">');
             parts.push(legendItem("background:var(--accent)", t("det.legend_input")));
             parts.push(legendItem("background:var(--accent);opacity:.4", t("det.legend_cached"), false));
@@ -1085,6 +1236,7 @@ export const WEB_CLIENT = `(function () {
             parts.push(legendItem("background:#6e7681", t("det.cause_cold")));
             if (d.systemPromptTokens || lines.length >= 20) parts.push(legendItem("border:1.5px solid #8b949e;background:#f2f5f7;", d.systemPromptTokens ? t("det.legend_base") : t("det.legend_base_est")));
             parts.push("</div>");
+            parts.push('<div class="dim small" style="margin-top:4px">' + t("det.traj_zoom_hint") + "</div>");
             if ((ledger.linesOmitted || 0) > 0) parts.push('<div class="dim small" style="margin-top:6px">' + t("det.omitted", { n: ledger.linesOmitted }) + "</div>");
         }
         parts.push("</div></div>");
@@ -1250,6 +1402,7 @@ export const WEB_CLIENT = `(function () {
             bindHandoffActions(d);
             bindBlocksActions(d);
             bindCacheReportActions(d);
+            bindTrajectoryBrush(d);
             const cc = $("session-conflicts-clear");
             if (cc) {
                 cc.addEventListener("click", async () => {
@@ -2158,6 +2311,8 @@ export const WEB_CLIENT = `(function () {
         else if (name === "logs") loadLogs();
     }
     window.addEventListener("hashchange", route);
+    // #2489: Esc resets a zoomed trajectory view from anywhere on the page.
+    document.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && trajRange) trajSetRange(null); });
 
     function initStaticHandlers() {
         const tog = $("language-toggle");

@@ -181,8 +181,12 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-fam
 .section-label { font-size: 12px; font-weight: 650; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; margin: 18px 0 8px; }
 .section-label:first-child { margin-top: 0; }
 
-.chart-wrap { width: 100%; overflow-x: auto; }
+.chart-wrap { width: 100%; overflow-x: auto; position: relative; }
 .chart-wrap svg { display: block; width: 100%; height: auto; }
+#traj-chart { cursor: crosshair; user-select: none; }
+.chart-status { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+.chart-status[hidden] { display: none; }
+.chart-brush { position: absolute; background: rgba(9, 105, 218, 0.15); border-left: 1px solid #0969da; border-right: 1px solid #0969da; pointer-events: none; }
 .chart-legend { display: flex; gap: 16px; font-size: 12px; color: var(--text-muted); margin-top: 8px; flex-wrap: wrap; }
 .chart-legend .dot { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
 
