@@ -36,6 +36,9 @@ export type Ctx = {
         getApiKeyForProvider?: (provider: string) => Promise<string | undefined> | undefined;
     } | undefined;
     cwd?: string;
+    // #2529: pi's project-trust decision; optional because older hosts lack it.
+    // Absent / non-true fails closed (project packs skipped) — see projectTrustedOf.
+    isProjectTrusted?: () => boolean | Promise<boolean>;
 };
 
 type TextBlock = { type: "text"; text: string };
@@ -93,6 +96,20 @@ type ExtensionAPI = {
 function agentName(override: string | undefined): string {
     if (override) return override;
     return process.env.BILLION_CONTEXT_PLUGIN_AGENT === "omp" ? "omp" : "pi";
+}
+
+// #2529: read pi's project-trust decision, failing closed. The trust signal is
+// the only gate for whether an untrusted repo's `.billion-context/packs` may be
+// injected into ACP prompts, so anything other than an explicit `true`
+// (missing method, throw, non-boolean) counts as UNTRUSTED.
+export async function projectTrustedOf(ctx: Ctx): Promise<boolean> {
+    const fn = ctx.isProjectTrusted;
+    if (typeof fn !== "function") return false;
+    try {
+        return (await fn.call(ctx)) === true;
+    } catch {
+        return false;
+    }
 }
 
 // pi 0.99+ virtual models (`pi.registerVirtualModel`, e.g. router/auto): the
@@ -961,6 +978,8 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                         state.carriedSids.add(sid);
                     }
                     headers["x-bili-plugin"] = agent;
+                    // #2529: trust signal for the proxy's project-pack gate — pi only (other lanes have no such header).
+                    if (agent === "pi") headers["x-bili-project-trusted"] = (await projectTrustedOf(ctx)) ? "1" : "0";
                     const window = ctx.model?.contextWindow;
                     if (typeof window === "number" && Number.isFinite(window) && window > 0) {
                         headers["x-bili-plugin-context-window"] = String(Math.floor(window));

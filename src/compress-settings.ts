@@ -1,4 +1,4 @@
-import { DEFAULT_ABSORB_CONFIG, DEFAULT_CCR_CONFIG, DEFAULT_IMAGE_COMPRESSION_CONFIG, defaultPrompts, resolvePrompts, createPackResolver, defaultPackSources, isValidPackName, type AbsorbConfig, type Config, type CcrConfig, type ImageCompressionConfig, type PackSurface, type Prompts } from "acp-kernel";
+import { DEFAULT_ABSORB_CONFIG, DEFAULT_CCR_CONFIG, DEFAULT_IMAGE_COMPRESSION_CONFIG, builtinSource, createDirPackSource, defaultPrompts, resolvePrompts, createPackResolver, defaultPackSources, isValidPackName, type AbsorbConfig, type Config, type CcrConfig, type ImageCompressionConfig, type PackSurface, type Prompts } from "acp-kernel";
 import * as path from "node:path";
 import { findRoute, type CompressSettings, type NamedProviderRecipe, type ProviderRoutes } from "./config.js";
 import { configDir } from "./paths.js";
@@ -175,23 +175,31 @@ interface SurfaceResolution {
  *  identity surface ({} — kernel defaults everywhere) with a one-time-per-name
  *  warning, so a typo never degrades the compression prompts. Directory
  *  layout is host policy; resolution/sanitization is the kernel's. */
+// #2529: pack precedence is project > user > builtin, so a same-named project
+// pack SHADOWS a user/builtin one — an untrusted repo planting
+// `.billion-context/packs/<config-name>.json` injects its surface text into the
+// ACP prompts. `includeProject === false` drops only the project source; the
+// default (undefined) keeps today's chain — only the pi lane passes false.
 export function resolveCompressSurfaceDetailed(
     s: CompressSettings,
     dirs?: { projectDir?: string; userDirs?: readonly string[] },
+    includeProject?: boolean,
 ): SurfaceResolution {
     const name = s.promptPack;
     if (typeof name !== "string" || name === "default" || !isValidPackName(name)) return { surface: {}, packName: "default" };
-    const resolver = createPackResolver(
-        defaultPackSources({
+    const userDirs = dirs?.userDirs ?? [path.join(configDir(), "packs")];
+    const sources = includeProject === false
+        ? [...userDirs.map((dir) => createDirPackSource("user", dir)), builtinSource]
+        : defaultPackSources({
             projectDir: dirs?.projectDir ?? path.join(process.cwd(), ".billion-context", "packs"),
-            userDirs: dirs?.userDirs ?? [path.join(configDir(), "packs")],
-        }),
-    );
+            userDirs,
+        });
+    const resolver = createPackResolver(sources);
     const pack = resolver.resolve(name);
     if (!pack) {
         if (!warnedUnknownPack.has(name)) {
             warnedUnknownPack.add(name);
-            loggerLog("warn", `[compress] promptPack "${name}" not found (project/user/builtin); using default surface`);
+            loggerLog("warn", `[compress] promptPack "${name}" not found (${includeProject === false ? "user/builtin" : "project/user/builtin"}); using default surface`);
         }
         return { surface: {}, packName: "default" };
     }
@@ -201,8 +209,19 @@ export function resolveCompressSurfaceDetailed(
 export function resolveCompressSurface(
     s: CompressSettings,
     dirs?: { projectDir?: string; userDirs?: readonly string[] },
+    includeProject?: boolean,
 ): PackSurface {
-    return resolveCompressSurfaceDetailed(s, dirs).surface;
+    return resolveCompressSurfaceDetailed(s, dirs, includeProject).surface;
+}
+
+// #2529: gate the PROJECT pack source per request. Only the plugin-mode pi lane
+// is gated — it stamps x-bili-project-trusted from ctx.isProjectTrusted(), so a
+// non-"1" value fails closed (project packs skipped). Other lanes, and pi in
+// wire/launcher mode where no such header exists, keep today's behavior; those
+// modes lack a trust channel to gate on (residual, see #2529).
+export function piProjectPacksAllowed(agent: string | undefined, trustedHeader: string | undefined): boolean {
+    if (agent !== "pi") return true;
+    return trustedHeader === "1";
 }
 
 /** True when a CompressSettings carries at least one configured field (i.e. it
