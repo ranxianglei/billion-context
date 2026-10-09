@@ -4,7 +4,7 @@ import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
-import { defaultPrompts, type CompressionCore, type Config, type PackSurface, type Prompts } from "acp-kernel";
+import { defaultPrompts, type CompressionCore, type Config, type CoreMessage, type PackSurface, type Prompts } from "acp-kernel";
 import { conversationSignalAnthropic, conversationSignalGoogle, conversationSignalOpenai, conversationIdentityResponses, conversationSignalResponses, stripHistoricalImages, type AnthropicRequestBody, type GoogleRequestBody, type OpenAIRequestBody, type ResponsesRequestBody } from "acp-kernel/wire";
 import { DEFAULT_STRIP_IMAGES_KEEP_RECENT, resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig } from "../compress-settings.js";
 import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveDeclaredProtocol, type ProxyOptions } from "../config.js";
@@ -14,7 +14,7 @@ import { codexAlignedWindow } from "../codex-models.js";
 import { MAX_REQUEST_BYTES } from "../fetch-util.js";
 import { hostIdForLog, maskHeadersForLog, maskUrlForLog, maskUrlsInText } from "../log-mask.js";
 import { buildIncomingImageIndex, foldAnchoredCutoff, pruneRetrieveImgExports } from "../image-restore.js";
-import { durableMessageGuards } from "../durable-message-guards.js";
+import { biliDurableMarkerGuard, durableMessageGuards } from "../durable-message-guards.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
 import { acquireInFlight, getSession, hasProcessedState, markDirty, peekSession, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
@@ -1732,14 +1732,19 @@ export async function handle(
         // display paths (/__bili/plugin/status Nudge line, plugin tool API)
         // render from the values the kernel actually used this turn.
         // #2419: per-lane durable-state message guard (KDD#9 evidence-permitlist).
-        // Stamp the CLONE-SAFE config first — a function inside
+        // #2555: composed with the lane-less \x3cbili-durable\x3e marker guard —
+        // injector-side self-declaration fires in EVERY session (proxy mode has
+        // no lane identity at all), the lane entry adds its evidence-permitted
+        // shapes on top. Stamp the CLONE-SAFE config first — a function inside
         // session.metadata.effectiveConfig would break fork-adoption structuredClone
         // and disk persistence — then attach it to this turn's reqConfig so
-        // processTurn protects the message now. effectiveConfig() re-resolves the
-        // guard from the lane id at read time, so /__bili/plugin/tool sees it too.
+        // processTurn protects the message now. effectiveConfig() re-resolves
+        // both guards at read time, so /__bili/plugin/tool sees them too.
         storeEffectiveConfig(session, reqConfig);
-        const durableGuard = pluginAgent ? durableMessageGuards[pluginAgent] : undefined;
-        if (durableGuard !== undefined) reqConfig = { ...reqConfig, isMessageProtected: durableGuard };
+        const laneGuard = pluginAgent ? durableMessageGuards[pluginAgent] : undefined;
+        const durableGuard: (msg: CoreMessage) => boolean =
+            laneGuard ? (msg) => laneGuard(msg) || biliDurableMarkerGuard(msg) : biliDurableMarkerGuard;
+        reqConfig = { ...reqConfig, isMessageProtected: durableGuard };
         // acquireInFlight must precede the lock so evictOldest() cannot flush
         // this session between getSession and lock acquisition (inFlight===0
         // window). Released in the outer finally after forward completes.
