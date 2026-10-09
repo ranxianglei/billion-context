@@ -149,8 +149,10 @@ test("biliDurableMarkerGuard: first-line anchor semantics", () => {
 
 /** Grow a conversation (optionally lane-less: no x-bili-plugin headers at
  *  all — the proxy-mode shape from #2446), execute a real compress through
- *  /__bili/plugin/tool, and return the next turn's upstream body. */
-async function runFoldScenario(opts: { agent?: string; conv: string; durableText: string }): Promise<{ postFoldBody: string; blockedRefs: number }> {
+ *  /__bili/plugin/tool, and return the next turn's upstream body. Optional
+ *  carriers are injected right after durableText so they sit INSIDE the fold
+ *  range — used to prove several protected shapes co-pin in one session. */
+async function runFoldScenario(opts: { agent?: string; conv: string; durableText: string; carriers?: string[] }): Promise<{ postFoldBody: string; blockedRefs: number }> {
     const rig = await startRig();
     try {
         const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/chat/completions`;
@@ -165,6 +167,7 @@ async function runFoldScenario(opts: { agent?: string; conv: string; durableText
         await (await post(msgs)).text();
         msgs.push({ role: "assistant", content: filler("A1") });
         msgs.push({ role: "user", content: opts.durableText });
+        for (const c of opts.carriers ?? []) msgs.push({ role: "user", content: c });
         await (await post(msgs)).text();
         msgs.push({ role: "assistant", content: filler("A2") });
         for (let i = 3; i <= 8; i++) {
@@ -173,7 +176,7 @@ async function runFoldScenario(opts: { agent?: string; conv: string; durableText
             msgs.push({ role: "assistant", content: filler(`A${i}`) });
         }
 
-        const blockedBefore = opts.agent ? 0 : Object.entries(getSession(opts.conv).state.messageRefs.byRaw).filter(([, ref]) => ref === "BLOCKED").length;
+        const blockedBefore = Object.entries(getSession(opts.conv).state.messageRefs.byRaw).filter(([, ref]) => ref === "BLOCKED").length;
 
         const refIds = parseRefIds(rig.bodies.at(-1)!);
         assert.ok(refIds.length >= 10, `expected >= 10 tagged messages, got ${refIds.length}`);
@@ -222,6 +225,25 @@ test("dsh lane: marker and legacy lane carriers stay co-protected (composition)"
     const { postFoldBody } = await runFoldScenario({ agent: "dsh", conv: "i2555-dsh", durableText: DURABLE_MSG });
     assert.ok(postFoldBody.includes("[Compressed conversation section]"), "the fold must have happened");
     assert.ok(postFoldBody.includes("bili-durable"), "the marker survives in the dsh lane too (lane OR marker)");
+    assert.ok(!postFoldBody.includes("F5-"), "folded filler is gone");
+});
+
+test("dsh lane: all four legacy carriers AND the marker co-pin in one session (full combination)", async () => {
+    const carriers = [
+        "\x3cavailable_skills\x3e\nskill: fake-skill-alpha",
+        "Instructions from: /workspace\nfake-workspace-rule-one",
+        "Current runtime context\nfake-runtime-line-one",
+        "\x3cmcp_catalog\x3e\nmcp server fake-mcp-omega",
+    ];
+    const { postFoldBody, blockedRefs } = await runFoldScenario({ agent: "dsh", conv: "i2555-dsh-all4", durableText: DURABLE_MSG, carriers });
+    assert.ok(postFoldBody.includes("[Compressed conversation section]"), "the fold must have happened");
+    assert.ok(postFoldBody.includes("bili-durable"), "the marker survives (lane OR marker)");
+    assert.ok(postFoldBody.includes("never force-push master"), "the marker payload survives");
+    assert.ok(postFoldBody.includes("fake-skill-alpha"), "legacy carrier 1 (available_skills catalog) survives");
+    assert.ok(postFoldBody.includes("fake-workspace-rule-one"), "legacy carrier 2 (Instructions from:) survives");
+    assert.ok(postFoldBody.includes("fake-runtime-line-one"), "legacy carrier 3 (Current runtime context) survives");
+    assert.ok(postFoldBody.includes("fake-mcp-omega"), "legacy carrier 4 (mcp_catalog) survives");
+    assert.ok(blockedRefs >= 5, "all five protected messages carry BLOCKED refs at assignment time");
     assert.ok(!postFoldBody.includes("F5-"), "folded filler is gone");
 });
 
