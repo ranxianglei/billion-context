@@ -386,6 +386,8 @@ pre.tool-args, pre.tool-out { margin: 6px 0 0; padding: 8px; background: var(--b
    collapses and rows render double-exposed. */
 .embed table.data colgroup col:nth-child(n + 6) { width: 0 !important; }
 .embed .twide table.data th, .embed .twide table.data td { padding-left: 5px; padding-right: 5px; }
-.embed main { max-width: none; padding: 4px 0 12px; }
+/* #2560: the framed face needs breathing room — cards/tables used to sit
+   flush against the iframe edge (zero horizontal padding). */
+.embed main { max-width: none; padding: 8px 10px 16px; }
 .embed .banner { margin: 8px 0 0; }
 `;

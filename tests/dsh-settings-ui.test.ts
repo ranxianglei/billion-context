@@ -903,6 +903,16 @@ test("#2448: embed face adapts the data tables to a narrow host panel (CSS pins)
     );
 });
 
+test("#2560: the embed face keeps breathing room inside the frame (CSS pins)", () => {
+    // Inside the dsh settings panel the iframe is the whole frame — zero
+    // horizontal padding left cards/tables flush against its edge (#2560).
+    const styles = fs.readFileSync(new URL("../src/web/styles.ts", import.meta.url), "utf8");
+    assert.ok(
+        styles.includes(".embed main { max-width: none; padding: 8px 10px 16px; }"),
+        "embed main carries horizontal breathing room (was padding: 4px 0 12px)",
+    );
+});
+
 test("#2473: the web face keeps its canvas coupled to the color scheme", () => {
     // The ?embed=1 face drops its opaque ground (--bg: transparent) to blend
     // into the host panel. If the document never declares color-scheme, its
