@@ -133,6 +133,8 @@ test("biliDurableMarkerGuard: first-line anchor semantics", () => {
     assert.equal(biliDurableMarkerGuard(msg("text", "\x3cbili-durable\x3e\nbare payload")), true, "unattributed marker pins");
     assert.equal(biliDurableMarkerGuard(msg("text", "\x3cbili-durable kind=\"x\" /\x3e\npayload")), true, "self-closing form pins");
     assert.equal(biliDurableMarkerGuard(msg("text", "\x3cbili-durable\x3e")), true, "marker-only message (no payload) pins — injector said so");
+    assert.equal(biliDurableMarkerGuard(msg("text", "\x3cbili-durable kind=\"x\"\x3e\r\npayload")), true, "CRLF line ending is a terminator, not content — pins");
+    assert.equal(biliDurableMarkerGuard(msg("text", "\x3cbili-durable\x3e\r\npayload")), true, "unattributed marker with CRLF ending pins");
     // Misses — the false-positive surface stays closed:
     assert.equal(biliDurableMarkerGuard(msg("text", "prose first\n\x3cbili-durable\x3e\nlater")), false, "marker NOT on the first line does not pin");
     assert.equal(biliDurableMarkerGuard(msg("text", "\x3csystem-reminder\x3e\n\x3cbili-durable\x3e\n\x3c/system-reminder\x3e")), false, "a wrapper around the marker does not pin — first-line anchor is what the injector controls");

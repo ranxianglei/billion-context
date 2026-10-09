@@ -134,10 +134,15 @@ export function dshRuntimeContextGuard(msg: CoreMessage): boolean {
  *  of a message" — an explicit-enough act that pinning is the defensible
  *  reading. Payload (if any) follows from the second line and is protected
  *  as part of the same message. kind is free text for diagnostics only; it
- *  is never parsed, so wording churn in it cannot disarm the guard. */
+ *  is never parsed, so wording churn in it cannot disarm the guard. A CRLF
+ *  line ending terminates the first line — the \r is terminator, not content,
+ *  so it is stripped before the end-of-line anchor; otherwise a CRLF-emitting
+ *  injector's marker would silently fail to pin (the exact failure class this
+ *  protocol exists to close). */
 export function biliDurableMarkerGuard(msg: CoreMessage): boolean {
     if (msg.contentType !== "text" || typeof msg.text !== "string" || msg.text.length === 0) return false;
-    const firstLine = msg.text.split("\n", 1)[0] ?? "";
+    let firstLine = msg.text.split("\n", 1)[0] ?? "";
+    if (firstLine.endsWith("\r")) firstLine = firstLine.slice(0, -1);
     if (!firstLine.startsWith("\x3cbili-durable")) return false;
     // Tag-name boundary: the next char after the marker name must close the
     // name (plain, self-closing, or attribute list) — \x3cbili-durable-ish\x3e is
