@@ -294,6 +294,10 @@ export class SessionStore {
     private readonly log: Logger;
     private readonly staleWarnAt = new Map<string, number>();
     private readonly codec?: StateStoreCodec;
+    /** #2674: monotonic per-process counter for unique content-store temp
+     *  names (pid + seq makes collisions across processes/rapid saves
+     *  unreachable). */
+    private tmpSeq = 0;
 
     constructor(opts?: { dir?: string; debounceMs?: number; enabled?: boolean; log?: Logger }) {
         const debounceMs = opts?.debounceMs ?? defaultDebounce();
@@ -384,7 +388,16 @@ export class SessionStore {
     /** #1097: persist the content-store envelope when dirty; an emptied store
      *  (rebase reset) deletes the file. Payload-first: runs BEFORE the session
      *  state write so a crash mid-save leaves at worst a retrieve miss, never
-     *  a placeholder whose original is gone. */
+     *  a placeholder whose original is gone.
+     *
+     *  Atomic (#2674): the envelope goes to a unique .tmp-* sibling in the SAME
+     *  directory (same volume ⇒ rename is atomic) and is renamed onto the
+     *  destination — mirroring the kernel StateStore.writeInner discipline. A
+     *  crash mid-write orphans the temp (swept at next boot, #2674) instead of
+     *  truncating the live envelope, which loadContentStore would treat as
+     *  "malformed, starting fresh" and silently drop every stored original. On
+     *  any failure the temp is unlinked and contentStoreDirty re-set so the next
+     *  save retries; the previous envelope stays byte-identical. */
     private saveContentStore(session: Session): void {
         if (!this.enabled || !session.contentStoreDirty) return;
         session.contentStoreDirty = false;
@@ -394,11 +407,14 @@ export class SessionStore {
             rmSync(abs, { force: true });
             return;
         }
+        const tmp = path.join(path.dirname(abs), `.tmp-${path.basename(abs, ".json")}-${process.pid}-${this.tmpSeq++}`);
         try {
             mkdirSync(path.dirname(abs), { recursive: true });
             const text = JSON.stringify(session.contentStore);
-            writeFileSync(abs, this.codec ? this.codec.encode(text) : text);
+            writeFileSync(tmp, this.codec ? this.codec.encode(text) : text);
+            renameSync(tmp, abs);
         } catch (err) {
+            try { rmSync(tmp, { force: true }); } catch { /* best-effort: a stuck temp is swept at next boot */ }
             session.contentStoreDirty = true;
             this.log("warn", `[persist] content-store write failed for ${session.id}: ${err instanceof Error ? err.message : String(err)}`);
         }
@@ -452,8 +468,11 @@ export class SessionStore {
      *  meet with "skipping corrupt file" + empty-session resume + overwrite,
      *  silently destroying history. Legacy plaintext files keep loading via
      *  the codec's magic dispatch and convert organically on their next save;
-     *  the only thing boot touches is orphaned `.tmp-enc-*` temps from crashed
-     *  writes of previous runs (pure deletion of garbage, never content). */
+     *  the only thing boot touches is orphaned `.tmp-*` temps from crashed
+     *  writes of previous runs (pure deletion of garbage, never content).
+     *  #2674 widened the sweep from `.tmp-enc-*` to EVERY `.tmp-*` name so the
+     *  atomic content-store companion temps (and the kernel session-write
+     *  temps they now sit beside) leave no accumulating orphans. */
     private async sweepStaleTemps(): Promise<void> {
         let files: string[];
         try {
@@ -462,7 +481,7 @@ export class SessionStore {
             return;
         }
         for (const file of files) {
-            if (STALE_ENC_TEMP_RE.test(path.basename(file))) {
+            if (isStaleTempName(path.basename(file))) {
                 await rm(file, { force: true }).catch(() => {});
             }
         }
@@ -1017,11 +1036,15 @@ function persistZstdEnabled(): boolean {
     return knobPersistZstdEnabled();
 }
 
-/** Temp name used by atomic codec writes: `<file>.tmp-enc-<pid>-<ts>`. A
- *  process death between write and rename orphans it; any such name present
- *  at boot is stale by definition (the walk runs before this boot writes
- *  anything) and gets swept. */
-const STALE_ENC_TEMP_RE = /\.tmp-enc-\d+-\d+$/;
+/** True for any temp-file name bili or the kernel leaves in the sessions tree:
+ *  a `.tmp-*` prefix (kernel session-write temps AND the atomic content-store
+ *  companion temps, #2674) or the legacy `<file>.tmp-enc-<pid>-<ts>` codec
+ *  suffix. A process death between write and rename orphans one; any such name
+ *  present at boot is stale by definition (the walk runs before this boot writes
+ *  anything) and gets swept. #2674 widened this from `.tmp-enc-*` to all `.tmp-*`. */
+function isStaleTempName(name: string): boolean {
+    return name.startsWith(".tmp-") || /\.tmp-enc-\d+-\d+$/.test(name);
+}
 
 async function walkJsonFiles(dir: string): Promise<string[]> {
     const entries = await readdir(dir, { withFileTypes: true });
@@ -1030,7 +1053,7 @@ async function walkJsonFiles(dir: string): Promise<string[]> {
         const full = path.join(dir, e.name);
         if (e.isDirectory()) {
             out.push(...(await walkJsonFiles(full)));
-        } else if (e.isFile() && (STALE_ENC_TEMP_RE.test(e.name) || (e.name.endsWith(".json") && !e.name.startsWith(".tmp-")))) {
+        } else if (e.isFile() && (isStaleTempName(e.name) || e.name.endsWith(".json"))) {
             out.push(full);
         }
     }
