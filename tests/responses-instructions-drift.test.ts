@@ -1,15 +1,44 @@
-import { test } from "node:test";
+import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
+import { mkdtempSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { defaultConfig } from "acp-kernel";
-import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
-import { SessionStore, _setStoreForTest } from "../src/persist.ts";
-import { _setForTest as setRegistryForTest } from "../src/registry.ts";
-import { _resetSessionsForTest } from "../src/session.ts";
-import { conversationHeaderSource, instructionsFingerprintApplies } from "../src/session-id.ts";
-import { resetPersonaAnchorsForTest } from "../src/persona-anchor.ts";
+
+// #2668: hermetic XDG roots, set BEFORE importing anything from src/ (the
+// auto-restart.test.ts pattern — several src modules capture XDG-derived
+// paths at import time: update.ts throttle/lock files, registry.ts CACHE_FILE,
+// restart.ts MARKER_FILE). startServer() additionally hydrates the
+// machine-global prefix-affinity snapshot on boot and persists it back on
+// debounce. Without this isolation, a prior run's persisted chain under one
+// of the FIXED ids below (the raw id recorded at its final depth 7) survives
+// into the next run, where the append-only tracking discipline never shrinks
+// it; the drift turn then sees stored depth 7 > incoming 5, persona-anchor
+// migration reads "history does not continue" and forks |sub:<fp> —
+// deterministically red on any machine that has ever run this suite, green on
+// fresh CI runners regardless of Node version.
+const xdgRoot = mkdtempSync(path.join(os.tmpdir(), "bili-instr-drift-"));
+process.env.XDG_STATE_HOME = path.join(xdgRoot, "state");
+process.env.XDG_CACHE_HOME = path.join(xdgRoot, "cache");
+process.env.XDG_DATA_HOME = path.join(xdgRoot, "data");
+process.env.XDG_CONFIG_HOME = path.join(xdgRoot, "config");
+
+const { startServer } = await import("../src/server.ts");
+const { SessionStore, _setStoreForTest } = await import("../src/persist.ts");
+const { _setForTest: setRegistryForTest } = await import("../src/registry.ts");
+const { _resetSessionsForTest } = await import("../src/session.ts");
+const { conversationHeaderSource, instructionsFingerprintApplies } = await import("../src/session-id.ts");
+const { resetPersonaAnchorsForTest } = await import("../src/persona-anchor.ts");
+
+after(() => {
+    delete process.env.XDG_STATE_HOME;
+    delete process.env.XDG_CACHE_HOME;
+    delete process.env.XDG_DATA_HOME;
+    delete process.env.XDG_CONFIG_HOME;
+});
 
 // #1102: opencode's system-context reconcile rewrites `instructions` whenever
 // AGENTS.md is edited mid-session. Its conversation ids are persona-scoped
