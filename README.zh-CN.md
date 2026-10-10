@@ -317,7 +317,7 @@ bili --no-auto-update        # 本次启动禁用自动更新
 
 ### 自动更新
 
-代理启动时和每 3 分钟检查 npm 是否有新版本。发现新版本就原位安装并打印通知 —— **重启 `bili` 才能生效**,除非启用可选自重启(`--auto-restart-on-update` 参数 / `ACP_AUTO_RESTART_ON_UPDATE=1` 环境变量 / 配置 `"autoRestartOnUpdate": true`,默认关闭):零在途请求时校验新安装、停止接收连接、排空、在同一端口拉起替代进程并在其开始接受连接后退出(客户端自动重连;会话状态在磁盘上保留)。安全门:排空窗口全程零在途、re-exec 前安装完整性检查、10 分钟冷却标记防止版本抖动循环重启;任何失败恢复原监听器并回落到普通提醒。运行进程落后于磁盘安装("stale")时,Web UI 显示横幅,`GET /__bili/status` 返回 `{version, diskVersion, stale, autoRestartOnUpdate, advisory, inFlight}` 供脚本使用(`advisory` 为生效中的严重缺陷公告或 `null`,见下节)。永久禁用:配置(`"autoUpdate": false`)或环境变量(`ACP_AUTO_UPDATE=0`)。
+代理启动时和每 3 分钟检查 npm 是否有新版本。发现新版本就原位安装并打印通知。**宿主拉起的常驻代理默认自我激活(#2507)**:所有 dsh/opencode/pi/... 插件或 `bili <client>` launcher lane 都会给代理子进程打上 `BILI_LAUNCHER_LANE`,这些进程在安装后自动自我重启——宿主自身永不重启,没有这一步更新会永远躺在磁盘上。手动 `bili start` 保持 opt-in 自重启(`--auto-restart-on-update` 参数 / `ACP_AUTO_RESTART_ON_UPDATE=1` 环境变量 / 配置 `"autoRestartOnUpdate": true`,该场景默认关闭;任何场景可用 `"autoRestartOnUpdate": false` / `ACP_AUTO_RESTART_ON_UPDATE=0` 禁用)。自重启要求零在途请求,校验新安装、停止接收连接、排空、在同一端口拉起替代进程并在其开始接受连接后退出(客户端自动重连;会话状态在磁盘上保留)。安全门:排空窗口全程零在途、re-exec 前安装完整性检查、10 分钟冷却标记防止版本抖动循环重启;任何失败恢复原监听器并回落到普通提醒。运行进程落后于磁盘安装("stale")时,Web UI 显示横幅,`GET /__bili/status` 返回 `{version, diskVersion, stale, autoRestartOnUpdate, advisory, inFlight}` 供脚本使用(`advisory` 为生效中的严重缺陷公告或 `null`,见下节)。永久禁用:配置(`"autoUpdate": false`)或环境变量(`ACP_AUTO_UPDATE=0`)。
 
 **插件模式**(`bili opencode` / `bili pi` / `bili dsh` —— 代理内嵌在长驻宿主里运行时),"重启 bili"指的是重启**宿主**:内嵌进程无法自行退出,所以一直开着的宿主会持续运行它启动时的那份代码,默默地错过自动更新报告为"已安装"的每一处修复(#1603)。启用 `--auto-restart-on-update` 可让它在安全点自重启;或运行 `/acp`(当前仅 OpenCode 宿主,pi/dsh 覆盖见 #2084)—— 当磁盘安装领先于运行进程时,状态面板会追加一行过期警告(运行版本 vs 已安装版本)。
 

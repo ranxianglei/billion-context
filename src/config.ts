@@ -1274,6 +1274,22 @@ function warnCcrPluginDivergences(routes: ProviderRoutes, globalCompress?: Compr
 
 }
 
+/** #2507: resolution for autoRestartOnUpdate — explicit env > explicit file
+ *  value > lane-aware default. Host-spawned resident proxies (every native /
+ *  lane bootstrap stamps BILI_LAUNCHER_LANE on the child) default ON: their
+ *  host never restarts on its own, so without self-activation an auto-update
+ *  installs files that never take effect (#2507; the #811 opt-in was designed
+ *  back when the typical deployment was a user-managed `bili start`). Manual
+ *  `bili start` keeps the conservative OFF default. Explicit off stays
+ *  available via `"autoRestartOnUpdate": false` or ACP_AUTO_RESTART_ON_UPDATE=0. */
+export function resolveAutoRestartOnUpdate(env: NodeJS.ProcessEnv, fileValue: boolean | undefined): boolean {
+    const e = env.ACP_AUTO_RESTART_ON_UPDATE;
+    if (e !== undefined) return e !== "0";
+    if (fileValue === true) return true;
+    if (fileValue === false) return false;
+    return nonEmpty(env.BILI_LAUNCHER_LANE) !== undefined;
+}
+
 export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions {
     // --- Source 1: JSON config file (~/.config/billion-context/billion-context.json) ---
     // The canonical, user-editable config. Loaded first so env vars below can
@@ -1394,9 +1410,9 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         passthrough: passthrough.enabled,
         passthroughSource: passthrough.source,
         autoUpdate: (env.ACP_AUTO_UPDATE ?? (fileConfig.autoUpdate === false ? "0" : "1")) !== "0",
-        // Default OFF: unlike autoUpdate, self-restart touches process
-        // liveness, so it requires an explicit opt-in (#811).
-        autoRestartOnUpdate: (env.ACP_AUTO_RESTART_ON_UPDATE ?? (fileConfig.autoRestartOnUpdate === true ? "1" : "0")) !== "0",
+        // Lane-aware default (#2507): ON for host-spawned resident proxies,
+        // OFF for manual `bili start` (#811) — see resolveAutoRestartOnUpdate.
+        autoRestartOnUpdate: resolveAutoRestartOnUpdate(env, fileConfig.autoRestartOnUpdate),
         updateTag: (env.ACP_UPDATE_TAG ?? fileConfig.updateTag ?? "latest").trim() || "latest",
         // Default ON: unlike autoRestartOnUpdate, this never touches process
         // liveness — it only installs files and warns (#1481).
