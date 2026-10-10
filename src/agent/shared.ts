@@ -162,11 +162,19 @@ export async function fetchManifest(proxyBase: string, format: "anthropic" | "op
     const { ok, status, json } = await fetchJson(`${proxyBase}/__bili/plugin/manifest`, undefined, MANIFEST_TIMEOUT_MS);
     if (!ok || !json || typeof json !== "object") throw new Error(`manifest fetch failed: ${status}`);
     if (format === "openai") {
-        // OpenAI function style: {name, description, parameters} (plain JSON Schema).
-        const data = json as { tools?: { openai?: { name?: string; description?: string; parameters?: unknown }[] } };
-        const tools = (data.tools?.openai ?? []).filter((t): t is { name: string; description?: string; parameters?: unknown } => typeof t.name === "string");
+        // The proxy serves OpenAI entries NESTED — {type:"function",
+        // function:{name,description,parameters}} — mirroring the wire injector
+        // (#2656). A flat {name,description,parameters} entry is accepted too so
+        // either manifest layout parses; read whichever location carries each field.
+        const data = json as { tools?: { openai?: Array<{ name?: string; description?: string; parameters?: unknown; function?: { name?: string; description?: string; parameters?: unknown } }> } };
+        const tools: ManifestTool[] = [];
+        for (const t of data.tools?.openai ?? []) {
+            const name = t.name ?? t.function?.name;
+            if (typeof name !== "string" || name.length === 0) continue;
+            tools.push({ name, description: t.description ?? t.function?.description, inputSchema: t.parameters ?? t.function?.parameters ?? { type: "object", properties: {} } });
+        }
         if (tools.length === 0) throw new Error("manifest served no openai tools");
-        return tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.parameters ?? { type: "object", properties: {} } }));
+        return tools;
     }
     const data = json as { tools?: { anthropic?: { name?: string; description?: string; input_schema?: unknown }[] } };
     const tools = (data.tools?.anthropic ?? []).filter((t): t is { name: string; description?: string; input_schema?: unknown } => typeof t.name === "string");

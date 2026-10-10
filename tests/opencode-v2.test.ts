@@ -14,7 +14,7 @@ const EXPECTED_TOOLS = [...ACP_TOOLS_OPENAI.map((t) => t.function.name), ABSORB_
 const LONG_PANEL = Array.from({ length: 30 }, (_, i) => `panel line ${String(i + 1).padStart(2, "0")}: ${"x".repeat(38)}`).join("\n");
 const LONG_REPORT = Array.from({ length: 200 }, (_, i) => `report line ${String(i + 1).padStart(3, "0")}: ${"y".repeat(38)}`).join("\n");
 
-function startFakeProxyV2(manifestOpenaiTools?: Array<{ name: string; description?: string; parameters?: unknown }>): Promise<{ origin: string; toolCalls: Array<{ conversationId?: string; tool?: string; args?: unknown }>; compacts: string[]; close: () => Promise<void> }> {
+function startFakeProxyV2(manifestOpenaiTools?: Array<{ name?: string; description?: string; parameters?: unknown; type?: string; function?: { name?: string; description?: string; parameters?: unknown } }>): Promise<{ origin: string; toolCalls: Array<{ conversationId?: string; tool?: string; args?: unknown }>; compacts: string[]; close: () => Promise<void> }> {
     const toolCalls: Array<{ conversationId?: string; tool?: string; args?: unknown }> = [];
     const compacts: string[] = [];
     const server = http.createServer((req, res) => {
@@ -731,10 +731,14 @@ test("v2 /acp: a throwing command editor degrades to no-/acp without killing set
     }
 });
 
-test("fetchManifest openai format maps parameters to inputSchema", async () => {
+test("fetchManifest openai format parses nested (served) and flat entries", async () => {
+    const NESTED_PARAMS = { type: "object", properties: { content: { type: "array" } }, required: ["content"] };
+    const FLAT_PARAMS = { type: "object", properties: {} };
+    // Production serves tools.openai NESTED ({type:"function", function:{…}}); a
+    // flat entry must parse too so either manifest layout works (#2656).
     const MANIFEST_OPENAI = [
-        { name: "compress", description: "Compress a range", parameters: { type: "object", properties: { content: { type: "array" } }, required: ["content"] } },
-        { name: "acp_status", description: "Context status", parameters: { type: "object", properties: {} } },
+        { type: "function", function: { name: "compress", description: "Compress a range", parameters: NESTED_PARAMS } },
+        { name: "acp_status", description: "Context status", parameters: FLAT_PARAMS },
     ];
     const server = http.createServer((req, res) => {
         if ((req.url ?? "") === "/__bili/plugin/manifest" && req.method === "GET") {
@@ -751,7 +755,9 @@ test("fetchManifest openai format maps parameters to inputSchema", async () => {
     try {
         const tools = await fetchManifest(origin, "openai");
         assert.deepEqual(tools.map((t) => t.name), ["compress", "acp_status"]);
-        assert.deepEqual(tools[0].inputSchema, MANIFEST_OPENAI[0].parameters);
+        assert.deepEqual(tools[0].inputSchema, NESTED_PARAMS);
+        assert.equal(tools[0].description, "Compress a range");
+        assert.deepEqual(tools[1].inputSchema, FLAT_PARAMS);
         const anthropic = await fetchManifest(origin, "anthropic").catch((e) => e);
         assert.ok(anthropic instanceof Error, "fake serves no anthropic tools — format must not cross-contaminate");
     } finally {
@@ -761,7 +767,10 @@ test("fetchManifest openai format maps parameters to inputSchema", async () => {
 
 test("#2443: a manifest-advertised conditional tool (acp_retrieve) is registered on first routed request", async () => {
     const rt = retrieveToolsFor(RETRIEVE_TOOL_NAME).openai.function;
-    const proxy = await startFakeProxyV2([{ name: rt.name, description: rt.description, parameters: rt.parameters }]);
+    // Serve the REAL proxy shape — nested {type:"function", function:{…}} — not a
+    // hand-flattened copy. The old flat fixture masked #2656 (fetchManifest dropped
+    // every nested entry), so a faithful fixture is what makes this test bite.
+    const proxy = await startFakeProxyV2([retrieveToolsFor(RETRIEVE_TOOL_NAME).openai]);
     try {
         const fake = makeFakeCtx();
         const cleanup = await biliOpencodePlugin.setup(fake.ctx as never);
