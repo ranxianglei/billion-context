@@ -2,6 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { openaiToCore, coreToOpenai } from "../src/wire/openai.js";
 import type { OpenAIRequestBody } from "../src/wire/openai.js";
+import { googleToCore, coreToGoogle } from "../src/wire/google.js";
+import type { GoogleRequestBody } from "../src/wire/google.js";
 import { hasMediaPayload } from "../src/protected.js";
 import { assignRefs, BLOCKED_REF } from "../src/refs.js";
 import { buildCompressibleRanges } from "../src/recommend.js";
@@ -511,5 +513,298 @@ test("applyCompression keeps a media tool_result and its paired call visible tog
   assert.ok(
     result.result.warnings.some((w) => w.includes("tool call/result pair")),
     `pair-withdrawal warning present, got: ${JSON.stringify(result.result.warnings)}`,
+  );
+});
+
+// --- Google wire fileData (#2609) ---
+
+const FILE_URI = "https://files.example.com/x.png";
+const FILE_DATA_PART = { fileData: { fileUri: FILE_URI, mimeType: "image/png" } };
+
+test("google: [text, fileData] keeps the URL ref on rawGoogleParts and sets no imageBase64", () => {
+  const body: GoogleRequestBody = {
+    model: "test",
+    contents: [
+      {
+        role: "user",
+        parts: [{ text: "what is in this image?" }, FILE_DATA_PART],
+      },
+    ],
+  };
+  const { msgs } = googleToCore(body);
+  assert.equal(msgs.length, 1);
+  const msg = msgs[0]!;
+  assert.equal(msg.text, "what is in this image?");
+  assert.equal(msg.imageBase64, undefined);
+  assert.deepEqual(msg.rawGoogleParts, [
+    { text: "what is in this image?" },
+    FILE_DATA_PART,
+  ]);
+
+  const rebuilt = coreToGoogle([msg]);
+  assert.equal(rebuilt.length, 1);
+  assert.deepEqual(
+    rebuilt[0]?.parts,
+    [{ text: "what is in this image?" }, FILE_DATA_PART],
+    "fileData re-emitted verbatim",
+  );
+});
+
+test("hasMediaPayload detects google fileData/inlineData carriers and ignores signature/tool shapes", () => {
+  // A URL-referenced file is payload outside msg.text (#2609).
+  assert.equal(
+    hasMediaPayload(mediaUserMsg("gd1", "", { rawGoogleParts: [FILE_DATA_PART] })),
+    true,
+    "fileData-only message counts as media",
+  );
+  assert.equal(
+    hasMediaPayload(
+      mediaUserMsg("gd2", "see attached", {
+        rawGoogleParts: [{ text: "see attached" }, FILE_DATA_PART],
+      }),
+    ),
+    true,
+  );
+  // inlineData without an extracted imageBase64 sidecar also counts.
+  assert.equal(
+    hasMediaPayload(
+      mediaUserMsg("gd3", "", {
+        rawGoogleParts: [{ inlineData: { mimeType: "image/png", data: IMG_DATA } }],
+      }),
+    ),
+    true,
+  );
+  // Text parts may carry thoughtSignature (KDD #10) — signature metadata is
+  // not a payload; thinking parts likewise.
+  assert.equal(
+    hasMediaPayload(
+      mediaUserMsg("gd4", "hello", {
+        rawGoogleParts: [{ text: "hello", thoughtSignature: "sig-abc" }],
+      }),
+    ),
+    false,
+    "text + signature must not count",
+  );
+  assert.equal(
+    hasMediaPayload({
+      id: "gd5",
+      role: "assistant",
+      contentType: "reasoning",
+      text: "hmm",
+      rawGoogleParts: [{ text: "hmm", thought: true, thoughtSignature: "sig-def" }],
+      googleThoughtSignature: "sig-def",
+    }),
+    false,
+    "thinking + signature must not count",
+  );
+  // Tool pair members are not media payloads.
+  assert.equal(
+    hasMediaPayload({
+      id: "gd6",
+      role: "assistant",
+      contentType: "tool-call",
+      toolName: "f",
+      toolCallId: "t1",
+      text: "{}",
+      rawGoogleParts: [
+        { functionCall: { name: "f", args: {} }, thoughtSignature: "sig-ghi" },
+      ],
+    }),
+    false,
+  );
+  // Nested media inside a tool response counts — same family as #366.
+  assert.equal(
+    hasMediaPayload({
+      id: "gd7",
+      role: "tool",
+      contentType: "tool-result",
+      toolName: "fetch",
+      toolCallId: "t2",
+      text: "{}",
+      rawGoogleParts: [
+        { functionResponse: { name: "fetch", response: {}, parts: [FILE_DATA_PART] } },
+      ],
+    }),
+    true,
+    "nested fileData in functionResponse.parts counts",
+  );
+  assert.equal(
+    hasMediaPayload({
+      id: "gd8",
+      role: "tool",
+      contentType: "tool-result",
+      toolName: "fetch",
+      toolCallId: "t3",
+      text: "{}",
+      rawGoogleParts: [
+        {
+          functionResponse: { name: "fetch", response: {}, parts: [{ text: "ok" }] },
+        },
+      ],
+    }),
+    false,
+    "nested text-only response must not count",
+  );
+});
+
+test("assignRefs gives a google fileData message a BLOCKED ref", () => {
+  const messages = [
+    textMsg("a", "user", "alpha"),
+    mediaUserMsg("gimg", "", { rawGoogleParts: [FILE_DATA_PART] }),
+    textMsg("b", "assistant", "beta"),
+  ];
+  const state = createInitialState();
+  const res = assignRefs(messages, {
+    existing: state.messageRefs,
+    nextIndex: 1,
+    isProtected: hasMediaPayload,
+  });
+  assert.equal(res.map.byRaw["a"], "m00001");
+  assert.equal(res.map.byRaw["gimg"], BLOCKED_REF);
+  assert.equal(res.map.byRaw["b"], "m00002");
+});
+
+test("buildCompressibleRanges never spans a google fileData message", () => {
+  const messages = [
+    textMsg("a", "user", "alpha ".repeat(50).trim()),
+    mediaUserMsg("gimg", "see attached", {
+      rawGoogleParts: [{ text: "see attached" }, FILE_DATA_PART],
+    }),
+    textMsg("b", "assistant", "beta ".repeat(50).trim()),
+  ];
+  const state = createInitialState();
+  // Numeric refs for every message (legacy session shape) — protection must
+  // hold regardless of ref state.
+  state.messageRefs = assignRefs(messages, {
+    existing: state.messageRefs,
+    nextIndex: 1,
+  }).map;
+  const ranges = buildCompressibleRanges(messages, state, config());
+
+  const refToIndex = new Map(
+    messages.map((m, i) => [state.messageRefs.byRaw[m.id], i]),
+  );
+  const mediaIndex = messages.findIndex((m) => m.id === "gimg");
+  for (const r of ranges.compressible) {
+    const s = refToIndex.get(r.startRef)!;
+    const e = refToIndex.get(r.endRef)!;
+    assert.ok(
+      !(s <= mediaIndex && mediaIndex <= e),
+      `range ${r.startRef}..${r.endRef} must not span the fileData message`,
+    );
+  }
+  for (const r of ranges.protected) {
+    const s = refToIndex.get(r.startRef)!;
+    const e = refToIndex.get(r.endRef)!;
+    assert.ok(
+      !(s <= mediaIndex && mediaIndex <= e),
+      "fileData message must not be advertised as protected either",
+    );
+  }
+  assert.ok(
+    ranges.compressible.length >= 1,
+    "non-media messages stay compressible",
+  );
+});
+
+test("applyCompression excludes a google fileData message from the block and warns", () => {
+  const core = createCore();
+  const state = createInitialState();
+  const messages = [
+    textMsg("u", "user", "the task"),
+    textMsg("t1", "assistant", "thinking out loud"),
+    mediaUserMsg("gimg", "see the screenshot", {
+      rawGoogleParts: [{ text: "see the screenshot" }, FILE_DATA_PART],
+    }),
+    textMsg("t2", "assistant", "analyzing"),
+    textMsg("u2", "user", "and now?"),
+  ];
+  state.messageRefs = assignRefs(messages, {
+    existing: state.messageRefs,
+    nextIndex: 1,
+  }).map;
+
+  const result = core.applyCompression({
+    ranges: [
+      {
+        startRef: "m00001",
+        endRef: "m00004",
+        summary: "task + analysis summarized",
+        topic: "work",
+      },
+    ],
+    messages,
+    state,
+    config: config(),
+  });
+
+  assert.equal(
+    result.result.errors.length,
+    0,
+    JSON.stringify(result.result.errors),
+  );
+  assert.equal(result.state.blocks.length, 1);
+  const block = result.state.blocks[0]!;
+  assert.ok(
+    !block.directMessageIds.includes("gimg"),
+    "fileData message not folded",
+  );
+  assert.ok(
+    !block.effectiveMessageIds.includes("gimg"),
+    "fileData message not recorded as covered",
+  );
+  assert.deepEqual(block.directMessageIds.sort(), ["t1", "t2", "u"]);
+  assert.ok(
+    result.result.warnings.some((w) => w.includes("image/attachment")),
+    `warning present, got: ${JSON.stringify(result.result.warnings)}`,
+  );
+});
+
+test("google: a fileData reference survives a fold of the surrounding range byte-stable", () => {
+  const core = createCore();
+  const state = createInitialState();
+  const messages = [
+    textMsg("u", "user", "the task"),
+    mediaUserMsg("gimg", "see the screenshot", {
+      rawGoogleParts: [{ text: "see the screenshot" }, FILE_DATA_PART],
+    }),
+    textMsg("t2", "assistant", "analyzing"),
+    textMsg("u2", "user", "and now?"),
+  ];
+  state.messageRefs = assignRefs(messages, {
+    existing: state.messageRefs,
+    nextIndex: 1,
+  }).map;
+
+  const result = core.applyCompression({
+    ranges: [
+      {
+        startRef: "m00001",
+        endRef: "m00003",
+        summary: "task + analysis summarized",
+        topic: "work",
+      },
+    ],
+    messages,
+    state,
+    config: config(),
+  });
+
+  assert.equal(
+    result.result.errors.length,
+    0,
+    JSON.stringify(result.result.errors),
+  );
+  const block = result.state.blocks[0]!;
+  assert.ok(!block.directMessageIds.includes("gimg"));
+  assert.ok(!block.effectiveMessageIds.includes("gimg"));
+
+  const folded = new Set([...block.directMessageIds, ...block.effectiveMessageIds]);
+  const survivors = messages.filter((m) => !folded.has(m.id));
+  const flatParts = coreToGoogle(survivors).flatMap((c) => c.parts);
+  assert.deepEqual(
+    flatParts.filter((p) => p.fileData !== undefined),
+    [FILE_DATA_PART],
+    "rebuilt wire still carries the fileData ref verbatim",
   );
 });
