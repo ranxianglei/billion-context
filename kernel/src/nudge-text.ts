@@ -243,7 +243,7 @@ function compact(parts: string[]): string[] {
  *  onto query-only surfaces (acp_status). So the reminder is now ONE static
  *  line — never expanded, never range-aware, identical for every nudge. */
 export const ONE_CALL_HINT =
-  "ONE call, ONE string — fold every range you keep into a single compress call: content entries ({startId, endId, summary, topic?}) or one plain string holding one block per range ('m00150–m00220 topic' header line, then the summary). Ranges you still need can wait — they reappear in later nudges; never split the batch across separate calls.";
+  "ONE call — fold every range you keep into a single compress call: content = [{startId, endId, summary, topic?}, …] entries (strict JSON: every string quoted, internal double quotes written \\\", newlines written \\n), or one quoted string holding one block per range ('m00150–m00220 topic' header line, then the summary — all inside the quotes). Ranges you still need can wait — they reappear in later nudges; never split the batch across separate calls.";
 
 export function renderNudgeText(
   decision: NudgeDecision,
@@ -324,7 +324,7 @@ export function renderNudgeText(
       rangesStr,
       ...(blockMapStr ? ["", blockMapStr] : []),
       "",
-      `💡 If you compress, fold the ranges you keep in ONE call — pass multiple content entries (\`content: [{...}, {...}]\`) or ONE plain string holding every range, each block starting with its 'mNNNNN–mNNNNN topic' header line (most robust through lossy gateways). Ranges the task still needs can wait — they reappear in later nudges.`,
+      `💡 If you compress, fold the ranges you keep in ONE call — content entries (\`content: [{...}, {...}]\`, strict JSON: every string quoted, internal double quotes written \\\", newlines written \\n) or ONE quoted string holding every range, each block starting with its 'mNNNNN–mNNNNN topic' header line inside the quotes. Ranges the task still needs can wait — they reappear in later nudges.`,
     ]).join("\n"),
   };
 }

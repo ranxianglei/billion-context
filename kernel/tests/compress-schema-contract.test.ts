@@ -198,8 +198,8 @@ test("the content description still teaches the line form and the string form", 
       .content.description ?? "";
   assert.ok(desc.includes("m00150–m00220"), "line-form header example kept");
   assert.ok(
-    desc.includes("JSON-encoded array"),
-    "stringified-array form documented",
+    desc.includes("strict JSON rule"),
+    "strict-JSON serialization contract documented (#2587)",
   );
 });
 

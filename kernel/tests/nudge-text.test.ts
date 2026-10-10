@@ -407,7 +407,7 @@ test("#2302: emergency nudge carries the static hint, stays unconditional (#1198
     makeDecision({ contextUsage: 0.99, breakdown: { emergencyOverride: 1 } }),
   );
   assert.ok(
-    emergency.text.includes("ONE call, ONE string"),
+    emergency.text.includes("ONE call —"),
     "static hint rides emergency too",
   );
   assert.ok(
@@ -427,7 +427,7 @@ test("#2302: hint never grows with the range count", () => {
   const many = renderNudgeText(
     makeDecision({ contextUsage: 0.5, compressibleRanges: makeRanges(24) }),
   );
-  const count = (s: string) => (s.match(/ONE call, ONE string/g) ?? []).length;
+  const count = (s: string) => (s.match(/never split the batch across separate calls/g) ?? []).length;
   assert.equal(count(few.text), 0, "gentle hint phrased conditionally");
   assert.equal(count(many.text), 0, "24 ranges — still no expanded skeleton");
   assert.ok(
@@ -440,6 +440,6 @@ test("#2302: tier-2/tier-3 nudges carry no message-ref hint (block refs)", () =>
   const t2 = renderNudgeText(
     makeDecision({ contextUsage: 0.5, tier: 2, tierTargetBlocks: [] }),
   );
-  assert.ok(!t2.text.includes("ONE call, ONE string"), "T2 folds blocks");
+  assert.ok(!t2.text.includes("never split the batch across separate calls"), "T2 folds blocks");
   assert.ok(!t2.text.includes("<write your summary of this range>"));
 });
