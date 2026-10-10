@@ -1,0 +1,82 @@
+{
+  "folded": {
+    "description": "active T1 block, blockContents one:null, folded message tail",
+    "files": [
+      "anthropic/127.0.0.1_29e4587af02d1ed9ae4b0054.json"
+    ],
+    "digest": "122b2bee0fd7917d225c8ada34cd61e860fc7c077b6f0fb035c11395e5b1f1a1"
+  },
+  "tier2": {
+    "description": "superseded T1 + active T2, distinct `one` views, byte-identical pair pins #401 normalize-on-load",
+    "files": [
+      "chat/127.0.0.1_8453ec7a56646bc014ac0d88.json"
+    ],
+    "digest": "460f9ed471e46c7bf4923182b58a8fe0daa038aafae7dbc515f6d5c826117131",
+    "notes": {
+      "t2Block": "b3"
+    }
+  },
+  "deadrefs": {
+    "description": "deadRefs tombstones + ghost raw ids after client edit (#2362/#2370)",
+    "files": [
+      "anthropic/127.0.0.1_e17d4db40407d10867daeb1d.json"
+    ],
+    "digest": "c29c76cdfa77e75897f78478ace6acc25429b39fb6c591953e9a3405324383b8",
+    "notes": {
+      "ghostRef": "m00010"
+    }
+  },
+  "fork-receipt": {
+    "description": "publicForkReceipt: pluginSnapshot + forkContentStore + publicSnapshotStoredRefs union",
+    "files": [
+      "chat/127.0.0.1_bde31987d03ca1ebaeb96ba0.json"
+    ],
+    "digest": "0784a7fdb054dcf08ac715071252877d4397bceb00eafa696ecfcc98ff89ba96"
+  },
+  "fork-retained": {
+    "description": "publicSnapshotRetained only — pluginSnapshot persisted, forkContentStore DROPPED (pins the #2675 ② asymmetry verbatim)",
+    "files": [
+      "chat/127.0.0.1_dec59ddccc0b4b89ff346c9b.json"
+    ],
+    "digest": "29fd3634a8cace83d547aa3f5645daf895c9e20d35dc65c2ebf7e2bb9fdf06e2",
+    "notes": {
+      "expectContentStoreOnLoad": "absent"
+    }
+  },
+  "image": {
+    "description": "base64 image message + image stats + imageShrinks metadata",
+    "files": [
+      "anthropic/127.0.0.1_b139318d5755710735cbf443.json"
+    ],
+    "digest": "56c57f85165d169ec97be6ed69169294247a544e8cabdb1dd74ef928486a977e"
+  },
+  "ccr": {
+    "description": "content-store.json sibling with two CCR originals (#1097 envelope)",
+    "files": [
+      "responses/127.0.0.1_0787df32f3cf98f922f7c0f0.content-store.json",
+      "responses/127.0.0.1_0787df32f3cf98f922f7c0f0.json"
+    ],
+    "digest": "73e5d4039fedabdcee21abe9015ab9a067ae1353379cca9e4c1778e7fc117902"
+  },
+  "twinfile": {
+    "description": "namespaced v2 record + stale FLAT v1 twin for the same id (#2671 ① twin-namespace)",
+    "files": [
+      "6fe5d8f2afee3e83e5360fa8.json",
+      "openai/127.0.0.1_6fe5d8f2afee3e83e5360fa8.json"
+    ],
+    "digest": "54d07a10dc599fe9f024f67385f989e055bde971cca4ab2d838135c791c3da71",
+    "notes": {
+      "flatTwinRequests": 1,
+      "namespacedRequests": 42,
+      "flatFallbackDigest": "ee43014d1c9a1ae3539c72b23ea884eb65aa42104cd36975b98a7f9e28540463",
+      "flatFallbackRequests": 1
+    }
+  },
+  "zstd": {
+    "description": "BILIZSTD1-framed write of the `folded` session — must load to the IDENTICAL digest",
+    "files": [
+      "anthropic/127.0.0.1_29e4587af02d1ed9ae4b0054.json"
+    ],
+    "digest": "122b2bee0fd7917d225c8ada34cd61e860fc7c077b6f0fb035c11395e5b1f1a1"
+  }
+}

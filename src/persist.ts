@@ -19,6 +19,8 @@ import { PersistEpermAlert } from "./persist-eperm.js";
 import { createInitialState, defaultCountTokens, prune, type CompressionState, type CoreMessage, type MessageContentStore } from "acp-kernel";
 import { markDirty } from "./session.js";
 import type { Session, BlockContent, BlockView } from "./session.js";
+import { UnifiedShadow, resolveStorageMode, type StorageMode } from "./storage/shadow.js";
+import { toLegacyLike, type LegacySessionLike } from "./storage/ingest.js";
 import type { WireProtocol } from "./util.js";
 import { currentContextObservation, CALIBRATION_CLAMP_MAX, CALIBRATION_CLAMP_MIN, CALIBRATION_SAMPLE_MAX, CALIBRATION_SAMPLE_MIN, CALIBRATION_SAMPLE_WINDOW } from "./cache-ledger.js";
 
@@ -294,6 +296,8 @@ export class SessionStore {
     private readonly log: Logger;
     private readonly staleWarnAt = new Map<string, number>();
     private readonly codec?: StateStoreCodec;
+    private readonly shadow?: UnifiedShadow;
+    private readonly storageMode: StorageMode;
 
     constructor(opts?: { dir?: string; debounceMs?: number; enabled?: boolean; log?: Logger }) {
         const debounceMs = opts?.debounceMs ?? defaultDebounce();
@@ -320,6 +324,26 @@ export class SessionStore {
             threshold: epermAlertThreshold(),
             repeatMs: epermAlertRepeatMs(),
         });
+        // #2671 Phase 1 dry-run / Phase 1.5 full: with BILI_STORAGE_UNIFIED
+        // set, every committed record is double-ingested into <dir>/index.db
+        // and digest-reconciled against the legacy load view; with
+        // BILI_STORAGE_UNIFIED=full reads additionally go unified-first with
+        // organic import and legacy fallback (drop-in replacement; rollback
+        // = unset the env). Encryption is a hard opt-out: index.db holds the
+        // ingest payload in cleartext, so the sidecar refuses to open while
+        // BILI_ENCRYPTION_KEY is active and the store stays legacy-only.
+        const storageMode = resolveStorageModeSafe();
+        const unifiedBlockedByEncryption = storageMode !== "legacy" && key !== null;
+        if (unifiedBlockedByEncryption) {
+            baseLog("warn", "[storage] unified sidecar DISABLED: BILI_ENCRYPTION_KEY is active and index.db would hold cleartext ingest payloads — staying legacy-only");
+        }
+        this.storageMode = storageMode;
+        this.shadow = this.enabled && !unifiedBlockedByEncryption
+            ? (UnifiedShadow.maybeOpen(this.sessionsDir, process.env, (rec) => {
+                  const s = buildSession(rec as PersistedSession);
+                  return toLegacyLike(s);
+              }) ?? undefined)
+            : undefined;
         this.store = new StateStore<PersistedSession>({
             dir: this.sessionsDir,
             version: PERSIST_VERSION,
@@ -413,7 +437,10 @@ export class SessionStore {
         if (!this.enabled) return out;
         let clamped = 0;
         for (const [id, envelope] of await this.store.loadAll()) {
-            const session = buildSession(envelope.payload);
+            // #2671 full mode: prefer the unified view (importing from the
+            // envelope we already parsed); the file stays the enumeration
+            // base and the fallback when the index has nothing better.
+            const session = this.buildForLoadAll(id, envelope.payload);
             if (hasNegativePersistedTokens(envelope.payload)) {
                 // #408 one-time migration: the in-memory value is already
                 // clamped by buildSession — rewrite the stale file so the
@@ -441,9 +468,23 @@ export class SessionStore {
         await this.applyLegacyMigration(loaded);
         const out = new Map<string, Session>();
         for (const [id, envelope] of loaded) {
-            out.set(id, buildSession(envelope.payload));
+            out.set(id, this.buildForLoadAll(id, envelope.payload));
         }
         return out;
+    }
+
+    /** #2671: per-id session build for the directory walks (loadAll/boot).
+     *  In full mode this imports the just-parsed envelope into the unified
+     *  index and serves the view from there when possible (organic import at
+     *  boot); otherwise it is the plain legacy build. Never throws — an
+     *  import/view failure falls back to the legacy build. */
+    private buildForLoadAll(id: string, payload: PersistedSession): Session {
+        if (this.shadow?.readsUnified) {
+            this.shadow.importRecord(payload);
+            const view = this.shadow.viewFor(id);
+            if (view) return buildSession(viewToRecord(view));
+        }
+        return buildSession(payload);
     }
 
     /** #708/#1080 review: boot NEVER rewrites session file CONTENT. The first
@@ -564,6 +605,9 @@ export class SessionStore {
      *  layout for v2+/v3 files, the _unknown/ fallback, and the flat default
      *  name for pre-envelope v1 files. */
     private async removeLegacyFile(id: string, session: Session): Promise<void> {
+        // #2671 GC parity: when the legacy file goes, the unified sidecar's
+        // rows go with it (deleteSession releases CAS refcounts too).
+        this.shadow?.remove(id);
         const candidates = new Set([
             relPathFor(id, session.meta.protocol, session.meta.upstreamOrigin),
             relPathFor(id),
@@ -600,22 +644,72 @@ export class SessionStore {
      *  body id does not match what we asked for. */
     loadSync(id: string, meta?: { protocol?: string; upstreamOrigin?: string }): Session | null {
         if (!this.enabled) return null;
+        if (this.shadow?.readsUnified) {
+            const unified = this.loadUnified(id);
+            if (unified) return this.afterLoad(id, unified);
+            // Miss (or sidecar failure): organic import from the legacy file,
+            // then serve from the index; fall back to the plain legacy load
+            // when even the import cannot run.
+            const envelope = this.loadEnvelope(id, meta);
+            if (!envelope) return null;
+            const imported = this.shadow.importRecord(envelope.payload);
+            if (imported) {
+                const view = this.shadow.viewFor(id);
+                if (view) return this.afterLoad(id, view);
+            }
+            // Legacy fallback — same single-build semantics as plain legacy
+            // mode (see the note below on why no adapter round-trip here).
+            const session = buildSession(envelope.payload);
+            if (hasNegativePersistedTokens(envelope.payload)) {
+                this.scheduleSave(session);
+                this.log("info", `[persist] clamped negative token stats on reload for ${id} (#408)`);
+            }
+            return session;
+        }
         const envelope = this.loadEnvelope(id, meta);
         if (!envelope) return null;
+        // Legacy path — intentionally the ORIGINAL single buildSession(payload):
+        // wrapping this in the toLegacyLike/viewToRecord adapter (like the
+        // unified branch above) would run the record through a second
+        // normalization round-trip and reshape persisted-state bytes (the
+        // storage-render goldens catch exactly that).
         const session = buildSession(envelope.payload);
         if (hasNegativePersistedTokens(envelope.payload)) {
             // #408: sync context — debounce the stale-file rewrite
             // (buildSession already clamped the in-memory value).
             this.scheduleSave(session);
-            loggerLog("info", `[persist] clamped negative token stats on reload for ${id} (#408)`);
+            this.log("info", `[persist] clamped negative token stats on reload for ${id} (#408)`);
         }
         return session;
+    }
+
+    /** Shared post-load fixups for the unified read path: rebuilds the
+     *  Session from a store view (viewToRecord → buildSession, the same
+     *  forward-compat pass as a legacy load) and applies the #408 clamp
+     *  rewrite. */
+    private afterLoad(id: string, view: LegacySessionLike): Session {
+        const record = viewToRecord(view);
+        const session = buildSession(record);
+        if (hasNegativePersistedTokens(record)) {
+            this.scheduleSave(session);
+            this.log("info", `[persist] clamped negative token stats on reload for ${id} (#408)`);
+        }
+        return session;
+    }
+
+    /** Unified-first view load (full mode). Null on miss. */
+    private loadUnified(id: string): LegacySessionLike | null {
+        return this.shadow ? this.shadow.viewFor(id) : null;
     }
 
     /** Read-only state load for cross-session search (#841): unlike loadSync,
      *  never schedules a save (no #408 clamp-rewrite side effect). */
     loadStateForSearch(id: string): CompressionState | null {
         if (!this.enabled) return null;
+        if (this.shadow?.readsUnified) {
+            const view = this.loadUnified(id);
+            if (view) return mergeState(view.state as unknown as Parameters<typeof mergeState>[0]);
+        }
         const envelope = this.loadEnvelope(id);
         if (!envelope) return null;
         return mergeState(envelope.payload.state);
@@ -693,7 +787,10 @@ export class SessionStore {
         return () => {
             const record = buildRecord(session);
             const disk = this.staleDiskPayload(record);
-            if (disk === null) return record;
+            if (disk === null) {
+                this.shadow?.record(record);
+                return record;
+            }
             const now = Date.now();
             const last = this.staleWarnAt.get(record.id) ?? 0;
             if (now - last >= STALE_WARN_THROTTLE_MS) {
@@ -710,6 +807,7 @@ export class SessionStore {
             // to the live session so serving converges on the same newest-wins
             // arbitration the write side just used.
             this.convergeToDisk(session, disk);
+            this.shadow?.record(disk);
             // Rewrite the disk's own payload: content-identical no-op that
             // preserves the newer state while satisfying the write chain.
             return disk;
@@ -786,6 +884,7 @@ export class SessionStore {
     async flushAll(sessions: Iterable<Session> = []): Promise<void> {
         for (const session of sessions) this.saveContentStore(session);
         await this.store.flushAll();
+        this.shadow?.close();
     }
 
     /** Whether a write is currently pending (debounce timer armed) for a id. */
@@ -995,6 +1094,40 @@ function hasNegativePersistedTokens(parsed: PersistedSession): boolean {
     const last = stats.lastInputTokens ?? parsed.lastInputTokens;
     const ctx = stats.contextTokens ?? parsed.contextTokens;
     return (typeof last === "number" && last < 0) || (typeof ctx === "number" && ctx < 0);
+}
+
+/** #2671 Phase 1.5: adapter that lets buildSession (with its full forward-
+ *  compat pass, incl. mergeState) rebuild a Session from a unified-store
+ *  view. `messagesFolded` is only ever set when `messages` is present — an
+ *  absent messages field means "raw history that still needs export-time
+ *  pruning" in the persisted-record contract, and that semantic must be
+ *  preserved here (false is explicit: folded=false). */
+function viewToRecord(view: LegacySessionLike): PersistedSession {
+    const record: PersistedSession = {
+        version: PERSIST_VERSION,
+        savedAt: view.lastSeen,
+        id: view.id,
+        createdAt: view.createdAt,
+        meta: view.meta as PersistedSession["meta"],
+        stats: view.stats as PersistedSession["stats"],
+        metadata: view.metadata,
+        state: view.state as unknown as CompressionState,
+        blockContents: Object.fromEntries(view.blockContents),
+    };
+    if (view.lastMessages !== undefined) {
+        record.messages = view.lastMessages;
+        record.messagesFolded = view.lastMessagesFolded === true;
+    }
+    if (view.pluginSnapshot !== undefined) record.pluginSnapshot = view.pluginSnapshot;
+    if (view.contentStore !== undefined) record.forkContentStore = view.contentStore as unknown as NonNullable<PersistedSession["forkContentStore"]>;
+    return record;
+}
+
+/** resolveStorageMode guarded for the constructor: env parsing cannot throw
+ *  (resolveStorageMode is total), so this only exists to keep the call site
+ *  honest about the default when the knob is absent. */
+function resolveStorageModeSafe(): StorageMode {
+    return resolveStorageMode(process.env);
 }
 
 function defaultDir(): string {

@@ -26,6 +26,14 @@ entries:
     group: envonly
     desc_en: "Key material for encrypted persisted payloads (secret)."
     desc_zh: "加密持久化载荷的密钥材料（机密）。"
+  - key: BILI_STORAGE_UNIFIED
+    type: "legacy|1|true|shadow|full|unified"
+    default: "unset (legacy)"
+    kind: env-only
+    audience: user
+    group: envonly
+    desc_en: "Tiered storage-migration switch (#2671): 1/true = unified SQLite double-write dry-run with digest reconciliation; full/unified = drop-in read path (unified-first loads with organic import, legacy fallback). Unset = legacy."
+    desc_zh: "分层存储迁移开关（#2671）：1/true = 统一 SQLite 双写干跑 + digest 对账；full/unified = 平替读路径（unified-first 加载 + 有机导入 + legacy 兑底）。不设 = legacy。"
   - key: BILI_TUNNEL_ALLOWED_HOSTS
     type: "string[] (csv)"
     default: "unset"

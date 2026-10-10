@@ -115,6 +115,7 @@
     }
   },
   "optionalDependencies": {
+    "better-sqlite3": "^13.0.3",
     "sharp": "^0.35.4"
   }
 }
