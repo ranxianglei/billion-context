@@ -1158,6 +1158,10 @@ function stampedPriceProfile(session: Session): PriceProfile | undefined {
  *  same discipline as stampedPriceProfile. */
 export interface PriceSourceStamp {
     kind: "config" | "registry";
+    /** #2478 round 2: user-configured ABSOLUTE $/Mtok unit prices (costPerMtok
+     *  config) — the stamped profile is already real money, so scale is 1 and
+     *  no models.dev anchor exists (modelKey absent by construction). */
+    absolute?: boolean;
     /** models.dev catalog key that resolved ("provider/model-id") — display identity. */
     modelKey?: string;
     /** Input list price in $/Mtok — the anchor converting ratio-profile units to $. */
@@ -1175,6 +1179,7 @@ export function parsePriceSourceStamp(raw: unknown): PriceSourceStamp | undefine
     const o = raw as Record<string, unknown>;
     if (o.kind !== "config" && o.kind !== "registry") return undefined;
     const out: PriceSourceStamp = { kind: o.kind };
+    if (o.absolute === true) out.absolute = true;
     if (typeof o.modelKey === "string" && o.modelKey !== "") out.modelKey = o.modelKey;
     for (const key of ["inputPerMtok", "outputPerMtok", "cacheReadPerMtok", "cacheWritePerMtok"] as const) {
         const n = o[key];
@@ -1195,7 +1200,8 @@ function stampedPriceSource(session: Session): PriceSourceStamp | undefined {
  *  summing many folds. Verdict classification mirrors the kernel too:
  *  breakevenTurns = max(0, oneTime)/perTurn when perTurn > 0, paid back iff
  *  requestsAfter reached it, else unobserved. scale maps unit→μ$: 1 for
- *  absolute $/Mtok profiles, the input anchor ($/Mtok) over ratio profiles.
+ *  absolute $/Mtok profiles (models.dev rows OR user costPerMtok config —
+ *  source.absolute), the input anchor ($/Mtok) over ratio profiles.
  *  Returns undefined when the session cannot be priced (no source stamp, or a
  *  ratio profile without an input anchor) — callers keep the token display. */
 export interface PricedFoldSummary {
@@ -1217,7 +1223,7 @@ export function summarizePricedFolds(
     source: PriceSourceStamp | undefined,
 ): PricedFoldSummary | undefined {
     if (source === undefined) return undefined;
-    const scale = source.kind === "registry" ? 1 : source.inputPerMtok;
+    const scale = source.kind === "registry" || source.absolute === true ? 1 : source.inputPerMtok;
     if (typeof scale !== "number" || !Number.isFinite(scale) || !(scale > 0)) return undefined;
     const { w, r, q } = profile;
     let grossUnits = 0;
@@ -1260,6 +1266,15 @@ export function formatPriceSourceLine(src: PriceSourceStamp): string {
         if (src.cacheWritePerMtok !== undefined) parts.push(`write ${money(src.cacheWritePerMtok)}`);
         if (src.outputPerMtok !== undefined) parts.push(`out ${money(src.outputPerMtok)}`);
         return `models.dev ${src.modelKey ?? "?"} @ ${parts.join(" · ")} per Mtok`;
+    }
+    if (src.absolute === true) {
+        // #2478 round 2: user-supplied $/Mtok unit prices — same part order as
+        // the registry line, but no models.dev identity (the user IS the source).
+        const parts = [`in ${money(src.inputPerMtok ?? 0)}`];
+        if (src.cacheReadPerMtok !== undefined) parts.push(`read ${money(src.cacheReadPerMtok)}`);
+        if (src.cacheWritePerMtok !== undefined) parts.push(`write ${money(src.cacheWritePerMtok)}`);
+        if (src.outputPerMtok !== undefined) parts.push(`out ${money(src.outputPerMtok)}`);
+        return `configured costPerMtok @ ${parts.join(" · ")}`;
     }
     const anchor = src.inputPerMtok !== undefined ? ` anchored at ${money(src.inputPerMtok)}/Mtok input${src.modelKey ? ` (models.dev ${src.modelKey})` : ""}` : "";
     return `configured priceProfile (input-ratio)${anchor}`;
@@ -1594,7 +1609,12 @@ function formatPricedEconomics(r: BiliCacheReport): string {
     const p = r.priced;
     if (!p) return "";
     const out: string[] = [`PRICED ECONOMICS (${formatPriceSourceLine(p.source)})`];
-    out.push(`  gross saved ≈ ${fmtUsd(p.grossUsd)} · one-time cost ≈ ${fmtUsd(p.oneTimeUsd)} (re-pay premium + summary output) → net ≈ ${fmtUsd(p.netUsd)}`);
+    // #2478 round 2: pair every $ figure with the kernel's token figures so the
+    // two calibers stay side by side (owner: keep both, money may be off).
+    // One-time cost deliberately has no token twin: its $ value nets the −r·S
+    // cache-read-back credit, which the kernel's repay+summary token sums do not.
+    const e = r.economics;
+    out.push(`  gross saved ≈ ${fmtUsd(p.grossUsd)} (${e.grossSaved} tok) · one-time cost ≈ ${fmtUsd(p.oneTimeUsd)} (re-pay premium + summary output) → net ≈ ${fmtUsd(p.netUsd)} (${e.netTokens} tok)`);
     out.push(`  verdict: ${p.paidBackCount} paid back · ${p.notPaidBackCount} not paid back · ${p.unobservedCount} unobserved`);
     if (r.modelSwitches.count > 0) out.push("  ⚠ prices are the LAST observed model's listing — this session switched models mid-flight, so earlier folds are priced with the later model (mixed caliber)");
     out.push("  list-price estimate (models.dev / configured ratios) — not an actual billing statement");

@@ -340,28 +340,24 @@ export const WEB_CLIENT = `(function () {
     // SAVED column prefers ledger-derived net savings; pre-tagging sessions fall back
     // to the local tokensSaved estimate; neither present => honest dash, never fake 0.
     function savedTd(x) {
-        // #2478: priced sessions read in real money (list-price estimate with
-        // compression costs included); unpriced ones keep the token display.
-        if (x.netSavedUsd != null) {
-            const v = x.netSavedUsd;
-            const tipParts = [
-                x.priceSource ? t("ses.saved_usd_tip", { s: x.priceSource }) : t("ses.saved_usd_tip_plain"),
-                v < 0 ? t("ov.saved_neg_usd_tip") : "",
-                x.coverageLostFolds ? t("ses.covlost_tip", { n: x.coverageLostFolds, x: fmtW(x.coverageLostFrozenTokens || 0) }) : "",
-            ].filter(Boolean).join(" ");
-            const tip = ' title="' + escapeHtml(tipParts) + '"';
-            if (v > 0) return '<td class="num good-num"' + tip + ">≈" + fmtUsd(v) + "</td>";
-            if (v < 0) return '<td class="num"' + tip + ">" + fmtUsd(v) + "</td>";
-            return '<td class="num dim"' + tip + ">≈$0</td>";
-        }
+        // #2478 round 2: tokens stay primary (money is a list-price estimate —
+        // owner keeps both calibers); priced sessions get a small "≈$X" line
+        // under the figure with the price source in the tooltip.
         const v = x.netSaved != null ? x.netSaved : (x.tokensSaved || 0);
+        const priced = x.netSavedUsd != null;
+        const usdLine = priced ? '<br><span class="dim small">≈' + fmtUsd(x.netSavedUsd) + "</span>" : "";
         // #2202: name the frozen share in the tooltip when any fold lost
         // coverage — the number is honest now, but the operator must see it.
         const clTip = x.coverageLostFolds
-            ? ' title="' + escapeHtml(t("ses.covlost_tip", { n: x.coverageLostFolds, x: fmtW(x.coverageLostFrozenTokens || 0) })) + '"'
+            ? t("ses.covlost_tip", { n: x.coverageLostFolds, x: fmtW(x.coverageLostFrozenTokens || 0) })
             : "";
-        if (v > 0) return '<td class="num good-num"' + clTip + ">" + fmtW(v) + "</td>";
-        if (v) return '<td class="num"' + (clTip || ' title="' + escapeHtml(t("ov.saved_neg_tip")) + '"') + ">" + fmtW(v) + "</td>";
+        const usdTip = priced
+            ? [x.priceSource ? t("ses.saved_usd_tip", { s: x.priceSource }) : t("ses.saved_usd_tip_plain"), (v < 0 || x.netSavedUsd < 0) ? t("ov.saved_neg_usd_tip") : ""].filter(Boolean).join(" ")
+            : "";
+        const tips = [usdTip, clTip].filter(Boolean);
+        const tip = tips.length ? ' title="' + escapeHtml(tips.join(" ")) + '"' : "";
+        if (v > 0) return '<td class="num good-num"' + tip + ">" + fmtW(v) + usdLine + "</td>";
+        if (v) return '<td class="num"' + (tip || ' title="' + escapeHtml(t("ov.saved_neg_tip")) + '"') + ">" + fmtW(v) + usdLine + "</td>";
         return '<td class="num dim">' + t("common.none") + "</td>";
     }
     // Compact single-line hit cell: (97.0%/−1.3%/−0.9%/−1.1%) = hit/new/compress/TTL.
@@ -428,28 +424,24 @@ export const WEB_CLIENT = `(function () {
             $("st-sessions").textContent = String(total);
             $("st-sessions-sub").textContent = liveN + " " + t("ov.live_now") + " · " + Math.max(0, total - liveN) + " " + t("ov.hist");
             $("st-reqs").textContent = o.requests ? fmtW(o.requests) : t("common.none");
-            // #2478: when any fold-session is priced the headlines read in real
-            // money (list-price estimate); unpriced sessions stay visible in
-            // tokens so mixed calibers never blend silently.
-            if (o.hasFoldData && o.netSavedUsdTotal != null) {
-                $("st-gross").textContent = "≈" + fmtUsd(o.grossSavedUsdTotal || 0);
-                $("st-gross-sub").textContent = t("ov.gross_priced", { n: o.pricedSessions || 0 })
-                    + ((o.unpricedGrossTokens || 0) > 0 ? " · " + t("ov.unpriced_remainder", { t: fmtW(o.unpricedGrossTokens) }) : "")
-                    + ((o.savedEstimated || 0) > 0 ? " · " + t("ov.saved_from_legacy", { n: fmtW(o.savedEstimated) }) : "");
-                $("st-netsaved").textContent = "≈" + fmtUsd(o.netSavedUsdTotal);
-                $("st-net-sub").textContent = t("ov.net_priced_cost", { c: fmtUsd(o.oneTimeCostTotal || 0) })
-                    + ((o.unpricedNetTokens || 0) !== 0 ? " · " + t("ov.unpriced_remainder", { t: fmtW(o.unpricedNetTokens) }) : "")
-                    + ((o.coverageLostFrozenTotal || 0) > 0 ? " · " + t("ov.covlost_note", { n: o.coverageLostFoldTotal || 0, x: fmtW(o.coverageLostFrozenTotal) }) : "");
-            } else {
-                const grossEl = $("st-gross");
-                grossEl.textContent = o.grossSavedTotal ? fmtW(o.grossSavedTotal) : t("common.none");
-                grossEl.title = o.grossSavedTotal ? String(Math.round(Number(o.grossSavedTotal))) : "";
-                $("st-gross-sub").textContent = t("ov.gross_note") + ((o.savedEstimated || 0) > 0 ? " · " + t("ov.saved_from_legacy", { n: fmtW(o.savedEstimated) }) : "");
-                const netEl = $("st-netsaved");
-                netEl.textContent = o.hasFoldData ? ((o.netSavedTotal || 0) < 0 ? "-" : "") + fmtW(Math.abs(o.netSavedTotal || 0)) : t("common.none");
-                netEl.title = o.hasFoldData && o.netSavedTotal ? String(Math.round(Number(o.netSavedTotal))) : "";
-                $("st-net-sub").textContent = o.hasFoldData ? t("ov.sub_repay", { r: fmtW(o.repayTotal || 0), s: fmtW(o.summaryCostTotal || 0) }) + ((o.savedEstimated || 0) > 0 ? " · " + t("ov.net_excl") : "") + ((o.coverageLostFrozenTotal || 0) > 0 ? " · " + t("ov.covlost_note", { n: o.coverageLostFoldTotal || 0, x: fmtW(o.coverageLostFrozenTotal) }) : "") : "";
-            }
+            // #2478 round 2: token figures stay the headline (owner keeps both
+            // calibers; money is a list-price estimate) — priced sessions add an
+            // "≈$X" clause to the sub-line instead of replacing the tokens.
+            const grossSubPrized = o.netSavedUsdTotal != null
+                ? "≈" + fmtUsd(o.grossSavedUsdTotal || 0) + " · " + t("ov.gross_priced", { n: o.pricedSessions || 0 })
+                : "";
+            $("st-gross").textContent = o.grossSavedTotal ? fmtW(o.grossSavedTotal) : t("common.none");
+            $("st-gross-sub").textContent = (o.hasFoldData ? (grossSubPrized || t("ov.gross_note")) : "")
+                + ((o.savedEstimated || 0) > 0 ? " · " + t("ov.saved_from_legacy", { n: fmtW(o.savedEstimated) }) : "");
+            const netSubPrized = o.netSavedUsdTotal != null
+                ? "≈" + fmtUsd(o.netSavedUsdTotal) + " · " + t("ov.net_priced_cost", { c: fmtUsd(o.oneTimeCostTotal || 0) })
+                : "";
+            $("st-netsaved").textContent = o.hasFoldData ? ((o.netSavedTotal || 0) < 0 ? "-" : "") + fmtW(Math.abs(o.netSavedTotal || 0)) : t("common.none");
+            $("st-net-sub").textContent = o.hasFoldData
+                ? (netSubPrized || t("ov.sub_repay", { r: fmtW(o.repayTotal || 0), s: fmtW(o.summaryCostTotal || 0) }))
+                + ((o.savedEstimated || 0) > 0 ? " · " + t("ov.net_excl") : "")
+                + ((o.coverageLostFrozenTotal || 0) > 0 ? " · " + t("ov.covlost_note", { n: o.coverageLostFoldTotal || 0, x: fmtW(o.coverageLostFrozenTotal) }) : "")
+                : "";
             $("st-hitpct").textContent = o.hitPct == null ? t("common.none") : o.hitPct.toFixed(1) + "%";
             const hs = $("st-hit-split");
             if (hs) {
@@ -1056,20 +1048,19 @@ export const WEB_CLIENT = `(function () {
         if (attrChips.length) hitSub += (hitSub ? " · " : "") + attrChips.join(" · ");
         mini(parts, t("det.hit_pct"), d.cacheHitPct == null ? null : d.cacheHitPct.toFixed(1) + "%", false, hitSub, missArgs ? t("det.miss_split_line", missArgs) : "");
         mini(parts, t("ov.output_tokens"), d.outputTokens ? fmtW(d.outputTokens) : null);
-        if (d.netSavedUsd != null) {
-            // #2478: priced detail reads in money; the token figure stays on the
-            // sub-line so both calibers are visible at once.
-            const dSavedSub = [
-                d.priceSource ? t("ses.saved_usd_tip", { s: d.priceSource }) : t("ses.saved_usd_tip_plain"),
-                t("ov.net_priced_cost", { c: fmtUsd(d.oneTimeCostUsd || 0) }),
-                "tok: " + fmtW(d.netSaved != null ? d.netSaved : 0),
-                d.coverageLostFolds ? t("det.covlost_sub", { n: d.coverageLostFolds, x: fmtW(d.coverageLostFrozenTokens || 0) }) : "",
-            ].filter(Boolean).join(" · ");
-            mini(parts, t("ov.tokens_saved"), "≈" + fmtUsd(d.netSavedUsd), d.netSavedUsd > 0, dSavedSub);
-        } else {
+        // #2478 round 2: the token figure is always primary; a priced session
+        // adds "≈$X · costs" to the sub-line so both calibers stay visible.
+        {
             const dSavedV = d.netSaved != null ? d.netSaved : d.tokensSaved;
-            mini(parts, t("ov.tokens_saved"), dSavedV ? fmtW(dSavedV) : null, dSavedV > 0,
-                d.coverageLostFolds ? t("det.covlost_sub", { n: d.coverageLostFolds, x: fmtW(d.coverageLostFrozenTokens || 0) }) : "");
+            const covSub = d.coverageLostFolds ? t("det.covlost_sub", { n: d.coverageLostFolds, x: fmtW(d.coverageLostFrozenTokens || 0) }) : "";
+            const dSavedSub = d.netSavedUsd != null
+                ? [
+                    d.priceSource ? t("ses.saved_usd_tip", { s: d.priceSource }) : t("ses.saved_usd_tip_plain"),
+                    "≈" + fmtUsd(d.netSavedUsd) + " · " + t("ov.net_priced_cost", { c: fmtUsd(d.oneTimeCostUsd || 0) }),
+                    covSub,
+                ].filter(Boolean).join(" · ")
+                : covSub;
+            mini(parts, t("ov.tokens_saved"), dSavedV ? fmtW(dSavedV) : null, dSavedV > 0, dSavedSub);
         }
         mini(parts, t("det.last_input"), (d.lastInputTokens || 0) > 0 ? fmtW(d.lastInputTokens) : null);
         parts.push("</div>");

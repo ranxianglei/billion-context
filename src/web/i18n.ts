@@ -79,7 +79,6 @@ export const MESSAGES: Record<Locale, Record<string, string>> = {
         "ov.sub_repay": "已扣除压缩复付 {r} 与摘要成本 {s}",
         // #2478: real-money (list-price) variants of the savings headlines.
         "ov.gross_priced": "按模型列表价计价（{n} 个会话，估算值）",
-        "ov.unpriced_remainder": "未计价会话另有 {t} tok（理论上界）",
         "ov.net_priced_cost": "已扣除一次性成本 {c}（复付溢价 + 摘要输出）",
         "ov.saved_neg_usd_tip": "净节省为负：压缩的一次性成本（复付溢价+摘要输出）超过了累计节省——常见于折叠后很快结束的会话",
         "ses.saved_usd_tip": "按 {s} 计价（列表价估算，已计入压缩输出与复付成本）",
@@ -501,7 +500,6 @@ export const MESSAGES: Record<Locale, Record<string, string>> = {
         "ov.sub_repay": "after subtracting re-pay {r} and summary cost {s}",
         // #2478: real-money (list-price) variants of the savings headlines.
         "ov.gross_priced": "priced at model list prices ({n} session(s), estimate)",
-        "ov.unpriced_remainder": "unpriced sessions add {t} tok (theoretical bound)",
         "ov.net_priced_cost": "after one-time costs {c} (re-pay premium + summary output)",
         "ov.saved_neg_usd_tip": "net savings negative: one-time compression costs (re-pay premium + summary output) exceed the accumulated saving — typical for sessions that end soon after a fold",
         "ses.saved_usd_tip": "priced via {s} (list-price estimate; compression output & re-pay costs included)",

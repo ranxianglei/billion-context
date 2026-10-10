@@ -515,8 +515,15 @@ export type CompressSettings = {
      *  unset profile yields byte-identical reports to pre-#1279 behavior. The
      *  last request's effective value is stamped onto the session and used by
      *  every report face. Merged sub-field-wise across the three levels like
-     *  `absorb`. */
-    priceProfile?: { w?: number; r?: number; q?: number };
+     *  `absorb`. [#2478] Also accepts optional ABSOLUTE $/Mtok fields
+     *  (`inputPerMtok` / `outputPerMtok` / `cacheReadPerMtok` /
+     *  `cacheWritePerMtok`): when any is present the profile resolves as
+     *  absolute prices instead of ratios, with the same kernel-convention
+     *  fill-ins as models.dev rows (`w = cacheWrite ?? input`,
+     *  `r = cacheRead ?? 0.1 × w`, `q = output ?? 4 × w`) — absolute mode wins
+     *  over `w`/`r`/`q`, and requires a positive `inputPerMtok` (anything else
+     *  falls back to ratio mode with a one-time warning). */
+    priceProfile?: { w?: number; r?: number; q?: number; inputPerMtok?: number; outputPerMtok?: number; cacheReadPerMtok?: number; cacheWritePerMtok?: number };
     /** [#1921] Fold-state reconciliation — how the proxy reacts when the
      *  resent history no longer contains a folded message's content-hash id
      *  (client restart/resume re-serialized the history, formatting churn on
@@ -2464,7 +2471,7 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
         } else {
             const ppo = pp as Record<string, unknown>;
             const cleaned: NonNullable<CompressSettings["priceProfile"]> = {};
-            for (const key of ["w", "r", "q"] as const) {
+            for (const key of ["w", "r", "q", "inputPerMtok", "outputPerMtok", "cacheReadPerMtok", "cacheWritePerMtok"] as const) {
                 if (!(key in ppo)) continue;
                 const v = ppo[key];
                 if (typeof v !== "number" || !Number.isFinite(v) || v < 0) { ok = false; continue; }

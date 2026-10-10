@@ -473,7 +473,9 @@ test("registry-stamped sessions price fold economics in real money (#2478)", () 
         text,
         /PRICED ECONOMICS \(models\.dev anthropic\/claude-sonnet-4-5 @ in \$3\.00 · read \$0\.30 · out \$15\.0 per Mtok\)/,
     );
-    assert.match(text, /gross saved ≈ \$0\.00 · one-time cost ≈ \$0\.01 \(re-pay premium \+ summary output\) → net ≈ -\$0\.01/);
+    // #2478 round 2: each $ figure pairs its kernel token figure (two-fold
+    // session: grossSaved 8000+900=8900, netTokens 8900−0−1100=7800).
+    assert.match(text, /gross saved ≈ \$0\.00 \(8900 tok\) · one-time cost ≈ \$0\.01 \(re-pay premium \+ summary output\) → net ≈ -\$0\.01 \(7800 tok\)/);
     assert.match(text, /verdict: 0 paid back · 2 not paid back · 0 unobserved/);
     assert.ok(
         text.indexOf("PRICED ECONOMICS") > text.indexOf("FOLD ECONOMICS"),
@@ -499,6 +501,23 @@ test("config-stamped sessions anchor the ratio profile to the models.dev input p
         text,
         /PRICED ECONOMICS \(configured priceProfile \(input-ratio\) anchored at \$3\.00\/Mtok input \(models\.dev anthropic\/claude-sonnet-4-5\)\)/,
     );
+});
+
+test("user costPerMtok config prices folds in real money without a models.dev anchor (#2478)", () => {
+    const s = makeTwoFoldSession();
+    s.metadata.cachePriceProfile = { w: 3, r: 0.3, q: 15 };
+    s.metadata.cachePriceSource = { kind: "config", absolute: true, inputPerMtok: 3, cacheReadPerMtok: 0.3, outputPerMtok: 15 };
+    const r = buildSessionCacheReport(s);
+    const p = r.priced;
+    assert.ok(p);
+    // Absolute user config → scale 1 (no models.dev anchor needed); same unit
+    // math as the registry stamp above.
+    assert.equal(p.scale, 1);
+    assert.equal(p.grossUsd, 2670 / 1e6);
+    assert.equal(p.oneTimeUsd, 14700 / 1e6);
+    assert.equal(p.netUsd, (2670 - 14700) / 1e6);
+    const text = handleAcpCache(s).text;
+    assert.match(text, /PRICED ECONOMICS \(configured costPerMtok @ in \$3\.00 · read \$0\.30 · out \$15\.0\)/);
 });
 
 test("unpriced or corrupt provenance leaves the report token-denominated (#2478)", () => {

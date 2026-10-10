@@ -60,7 +60,7 @@ import { bodyDumpEnabled, isModelDiscoveryPath, logDumpFailure, logUnrecognizedP
 import { handleAdminRoute } from "./admin.js";
 import { ccrPluginWireOk, storeEffectiveCcr, type CcrSettings } from "../store.js";
 import { DEFAULT_DECIDE_MAX_TOKENS } from "../nudge-decide.js";
-import { BodyTooLargeError, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, logRequestCost, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, scrubAnthropicPck, scrubCompatDrop, warnRouteMissIfNew, type Prepared } from "../server.js";
+import { absoluteProfileFromConfig, BodyTooLargeError, forward, forwardUpstreamUrl, googleModelFromPath, googlePathKind, headroomEffectiveLogged, headroomFallbackLogged, headerValue, imageBillingFor, imageReserveFor, imageTokenCapFor, isCountTokensRequest, isPreflightFailFast, logRequestCost, NON_CONVERSATION_RELAY_WARN_CAP, nonConversationRelayWarned, prepareCountTokens, preflightCompressIfNeeded, readBody, resolveKnownOutputCeiling, resolveUpstream, resignSettingsFor, scrubAnthropicPck, scrubCompatDrop, warnRouteMissIfNew, type Prepared } from "../server.js";
 
 export async function handle(
     req: http.IncomingMessage,
@@ -1770,11 +1770,18 @@ export async function handle(
                     // reports read in real money instead of Anthropic-ratio
                     // guesses. Report-only — no trigger impact.
                     // #2478: stamp the profile's SOURCE alongside it — faces must
-                    // tell absolute $/Mtok profiles (models.dev row) apart from
-                    // input-ratio profiles (user config / kernel default), and a
-                    // ratio profile additionally needs the input-price anchor to
-                    // convert its token-equivalent units into dollars. The raw
-                    // cost row also carries the display identity ("provider/model-id").
+                    // tell absolute $/Mtok profiles (models.dev row or user
+                    // costPerMtok config) apart from input-ratio profiles
+                    // (w/r/q config / kernel default), and a ratio profile
+                    // additionally needs the input-price anchor to convert its
+                    // token-equivalent units into dollars. The raw cost row also
+                    // carries the display identity ("provider/model-id").
+                    // #2478 round 2: user-configured absolute $/Mtok unit prices
+                    // (inputPerMtok/outputPerMtok/cacheReadPerMtok/cacheWritePerMtok)
+                    // win over w/r/q when any are set — the profile is derived
+                    // with the same fill-ins as models.dev rows, so reports price
+                    // in real money without needing the model resolvable (relay
+                    // discounts, custom deployments).
                     const priceHost = (() => { try { return new URL(route?.rewrittenUrl ?? upstreamOrigin).host; } catch { return undefined; } })();
                     const costRow = peekRegistryCostRow(requestModel, priceHost);
                     const sourceStamp = costRow !== undefined
@@ -1787,8 +1794,25 @@ export async function handle(
                         }
                         : undefined;
                     if (cs.priceProfile !== undefined && Object.keys(cs.priceProfile).length > 0) {
-                        session.metadata.cachePriceProfile = cs.priceProfile;
-                        session.metadata.cachePriceSource = sourceStamp !== undefined ? { kind: "config" as const, ...sourceStamp } : { kind: "config" as const };
+                        const cfgAbs = absoluteProfileFromConfig(cs.priceProfile);
+                        if (cfgAbs !== undefined) {
+                            session.metadata.cachePriceProfile = cfgAbs.profile;
+                            session.metadata.cachePriceSource = {
+                                kind: "config" as const,
+                                absolute: true,
+                                inputPerMtok: cfgAbs.input,
+                                ...(cfgAbs.output !== undefined ? { outputPerMtok: cfgAbs.output } : {}),
+                                ...(cfgAbs.cacheRead !== undefined ? { cacheReadPerMtok: cfgAbs.cacheRead } : {}),
+                                ...(cfgAbs.cacheWrite !== undefined ? { cacheWritePerMtok: cfgAbs.cacheWrite } : {}),
+                            };
+                        } else {
+                            // The stamp must mirror the profile actually applied: absolute
+                            // fields are inert here (ratio fallback), so strip them.
+                            session.metadata.cachePriceProfile = Object.fromEntries(
+                                Object.entries(cs.priceProfile).filter(([k]) => !k.endsWith("PerMtok")),
+                            );
+                            session.metadata.cachePriceSource = sourceStamp !== undefined ? { kind: "config" as const, ...sourceStamp } : { kind: "config" as const };
+                        }
                     } else {
                         const registryProfile = peekRegistryPriceProfile(requestModel, priceHost);
                         if (registryProfile !== undefined && sourceStamp !== undefined) {

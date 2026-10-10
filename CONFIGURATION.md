@@ -229,7 +229,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.prompts` | Partial<Prompts> | unset (kernel doctrine) | — | Override the kernel doctrine texts; load-bearing for quality — gated behind acknowledgePromptsRisk. |
 | `compress.reasoningGuard` | object | off | — | Auto-repair of reasoning-lattice truncation on gpt-5.x/6.x (up to 3 continue-nudge rounds). |
 | `compress.outputSteering` | object { enabled?, verbosityLevel?, effortRouting? } | enabled false · verbosityLevel 2 | — | Appends a conciseness directive to the system-prompt tail; clamps mechanical continuation requests. |
-| `compress.priceProfile` | { w?, r?, q? } | unset (registry, kernel fallback {1, 0.1, 4}) | — | w/r/q ratios normalized to the input price (write/cache-read/output); report-only — never affects triggers or the wire. |
+| `compress.priceProfile` | { w?, r?, q?, inputPerMtok?, outputPerMtok?, cacheReadPerMtok?, cacheWritePerMtok? } | unset (registry, kernel fallback {1, 0.1, 4}) | — | w/r/q ratios normalized to the input price (write/cache-read/output), or absolute $/Mtok unit prices (any *PerMtok present wins wholesale); report-only — never affects triggers or the wire. |
 | `compress.acknowledgePromptsRisk` | boolean | false | — | Must be true before custom prompts take effect. |
 | `compress.absorb.enabled` | boolean | false | — | Enable the absorb distillation block. |
 | `compress.absorb.minToolTokens` | number | 1000 | — | Minimum estimated token size of a tool result eligible for absorption. |
@@ -1363,11 +1363,12 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 
 #### `priceProfile`
 
-- **Type:** `object` (`{ w?, r?, q? }`, all non-negative numbers)
+- **Type:** `object` (`{ w?, r?, q?, inputPerMtok?, outputPerMtok?, cacheReadPerMtok?, cacheWritePerMtok? }`, all non-negative numbers)
 - **Default:** *(unset — reports then price folds from the request model's models.dev price row in absolute $/Mtok; only models the registry cannot resolve fall back to the kernel's built-in relative ratios `{ w: 1, r: 0.1, q: 4 }`)*
 - **Status:** ACTIVE
 - **Description:** Price profile for the **cache-economics verdicts** in the session cache report (`acp_cache` tool / `/acp-cache` command / `GET /__bili/cache-report`, #800/#1279). The per-fold P&L fields (`oneTimeCostUnits`, `perTurnSavingUnits`, `breakevenTurns`, `paidBack`) are computed from three multipliers over the input-token unit: `w` (cache-write cost), `r` (cache-read cost), `q` (output cost). Two unit conventions coexist, both printed verbatim in the report header (`FOLD ECONOMICS (N folds @ w=.. r=.. q=..)`):
   - **User config** uses **ratios normalized to the input price (p_in = 1)**: `w` = cacheWrite ÷ input, `r` = cacheRead ÷ input, `q` = output ÷ input. Sub-fields merge deepest-wins across the three levels like every other CompressSettings field (set `q` at provider level, refine one field at model level); fields left unset within a partial profile fall back to the kernel ratios `w: 1`, `r: 0.1`, `q: 4`.
+  - **Absolute unit prices (#2478 round 2):** set any of `inputPerMtok` / `outputPerMtok` / `cacheReadPerMtok` / `cacheWritePerMtok` (raw $/Mtok) and **absolute mode wins wholesale** over the w/r/q ratios — use this when your relay's effective rates differ from list prices (discounts/markups). Missing parts get the same fill-ins as models.dev rows: `w = cacheWrite ?? input`, `r = cacheRead ?? 0.1 × w`, `q = output ?? 4 × w`; a positive `inputPerMtok` is required for absolute mode to engage — absolute fields without it fall back to ratio mode with a once-per-process warning instead of silently dropping your numbers.
    - **Registry default** (no level sets the key): derived from the request model's models.dev price row — **absolute $/Mtok**, `w = cost.input`, `r = cost.cache_read ?? 0.1 × w`, `q = cost.output ?? 4 × w` (convention fallbacks for rows without those fields). Direct-to-provider traffic gets that host's own listing; unknown relays get the first matching listing across hosts (with a one-time warning when listings conflict). Live registry wins when reachable, bundled snapshot is the offline floor (#282).
   User config wins wholesale — a profile set at any level is never mixed field-by-field with the registry row. The last request's effective value is stamped onto the session, so every report face prices folds with the profile that governed that session's most recent turn. **Report-only**: the profile never affects compression triggers, cadence, or any wire behavior. User-config examples (override the registry row, e.g. for relays with custom markup):
   ```jsonc
@@ -1375,15 +1376,19 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
   { "providers": { "https://api.deepseek.com": { "compress": { "priceProfile": { "w": 1, "r": 0.1, "q": 1.5 } } } } }
   // OpenAI GPT-4o/o-series: 50% cached-read discount, flat writes, 4× output
   { "providers": { "https://api.openai.com": { "compress": { "priceProfile": { "w": 1, "r": 0.5, "q": 4 } } } } }
-  // Self-hosted / free tier: everything costs zero tokens of your budget
-  { "compress": { "priceProfile": { "w": 0, "r": 0, "q": 0 } } }
-  ```
-   Use list prices relative to the same model's normal input price; relays with custom markup should use their effective rates.
-   **Real-money display (#2478).** When a session's last request resolves a models.dev row, bili stamps the price provenance (`cachePriceSource`: resolved catalog key + raw $/Mtok fields) alongside the profile, and every report face adds a **PRICED ECONOMICS** section next to the token-denominated FOLD ECONOMICS — gross saved, one-time cost (re-pay premium + summary output) and net, in USD: what compression saves AND what it costs are both counted. Conventions:
-   - **Registry stamp** — the profile is already absolute $/Mtok, so the unit math IS microusd (scale 1);
-   - **User config** — ratios anchored to the resolved row's input price (μ$ = units × anchor); if the model cannot be resolved there is no anchor and the report stays token-denominated;
-   - **No stamp** (kernel default ratios) — token-denominated only.
-   The web UI's savings headline switches to ≈$ for priced sessions (token figures stay alongside; unpriced sessions keep the token headline with their remainder shown), `/acp-cache` text and the `GET /__bili/cache-report` JSON gain a `priced` field. Figures are **list-price estimates**, not actual billing (relay markups differ). Report-only invariant unchanged: none of this affects triggers or the wire.
+   // Self-hosted / free tier: everything costs zero tokens of your budget
+   { "compress": { "priceProfile": { "w": 0, "r": 0, "q": 0 } } }
+   // Absolute $/Mtok unit prices (#2478 round 2) — relay at a 30% discount off
+   // claude-sonnet-4-5 list prices: absolute mode wins over any w/r/q present
+   { "providers": { "https://my-relay.example": { "compress": { "priceProfile": { "inputPerMtok": 2.1, "outputPerMtok": 10.5, "cacheReadPerMtok": 0.21 } } } } }
+   ```
+    Use list prices relative to the same model's normal input price; relays with custom markup should use their effective rates (ratios or absolute unit prices).
+    **Real-money display (#2478).** When a session's last request resolves a models.dev row (or uses absolute unit-price config), bili stamps the price provenance (`cachePriceSource`: catalog key + raw $/Mtok fields, or the absolute flag) alongside the profile, and every report face adds a **PRICED ECONOMICS** section next to the token-denominated FOLD ECONOMICS — gross saved, one-time cost (re-pay premium + summary output) and net, in USD, each $ figure paired with its kernel token figure: what compression saves AND what it costs are both counted, in both calibers. Conventions:
+    - **Registry stamp** — the profile is already absolute $/Mtok, so the unit math IS microusd (scale 1);
+    - **User config, ratios** — anchored to the resolved row's input price (μ$ = units × anchor); if the model cannot be resolved there is no anchor and the report stays token-denominated;
+    - **User config, absolute unit prices** — self-anchoring (scale 1), no models.dev row needed;
+    - **No stamp** (kernel default ratios) — token-denominated only.
+    Web UI faces keep TOKENS as the primary figure everywhere (the money estimate may be off) with a small ≈$ line under the overview cards' savings values, the session table's SAVED column, and the detail card; `/acp-cache` text and the `GET /__bili/cache-report` JSON gain a `priced` field. Figures are **list-price estimates** (or your configured unit prices), not actual billing. Report-only invariant unchanged: none of this affects triggers or the wire.
 
 #### `outputSteering`
 
