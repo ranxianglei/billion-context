@@ -319,6 +319,77 @@ test("auto-fold backoff: a failed growth fold arms a cooldown — the next turn 
     assert.ok(text2.includes("final question"), "backed-off turn kept the conversation tail");
 });
 
+test("auto-fold backoff: a pure queue-drop (zero dispatched attempts) does NOT arm the cooldown — the next turn retries", async () => {
+    const main = await startMainUpstream(); trackClose(main.server);
+    const sum = await startSummaryUpstream("ok"); trackClose(sum.server);
+    const server = await startServer({
+        port: 0,
+        host: "127.0.0.1",
+        upstream: main.url,
+        routes: { [main.url]: { models: { "test-model": { context: 50_000 } } } },
+        modelContextLimit: 50_000,
+        kernelConfig: defaultConfig(50_000, { preserveRecentMessages: 0, preserveRecentTokens: 0, compress: { minCompressRange: 100, maxSummaryLength: 20000, minSummaryLength: 50 } }),
+        compress: {
+            injectTool: true,
+            injectNudge: true,
+            externalSummary: { enabled: true, targets: ["sum/sm"], autoFold: true, autoFoldTargetTokens: 8192, budget: { totalTimeoutMs: 500, targetTimeoutMs: 500, maxSummaryBytes: 64 * 1024 } },
+        },
+        namedProviders: { sum: { baseUrl: sum.url, api: "openai", apiKeyEnv: "E2E_SUM_KEY", models: { sm: {} } } },
+        promptCache: { routing: "auto" },
+        sessionHeader: "x-acp-session",
+        log: false,
+        debug: false,
+        passthrough: false,
+        passthroughSource: null,
+        autoUpdate: false,
+        autoRestartOnUpdate: false,
+        updateTag: "latest",
+        advisoryCheck: false,
+        releaseNotesCheck: false,
+        compat: { roles: {} },
+        streamErrorShape: "protocol",
+        mitm: { enabled: false, domains: [] },
+    } as ProxyOptions);
+    trackClose(server);
+    await once(server, "listening");
+    const port = (server.address() as AddressInfo).port;
+    process.env.E2E_SUM_KEY = "k";
+
+    // Saturate the process-wide summary pool (the #2657 congestion shape):
+    // four holders keep every permit busy well past the victim plan's 500ms
+    // batch deadline, so the growth fold's batches die in the queue before a
+    // single candidate call dispatches — attempts=[] with zero HTTP traffic.
+    const { _executorForTest } = await import("../src/external-summary-runtime.ts");
+    const hold = () => _executorForTest.executeBatch(
+        [{ content: "pool holder", instructions: "hold the permit" }],
+        [{ summarize: () => new Promise<string>((resolve) => setTimeout(() => resolve("held"), 2500)) }],
+        { totalTimeoutMs: 30_000, targetTimeoutMs: 20_000, maxSummaryBytes: 64 * 1024 });
+    const holders = [hold(), hold(), hold(), hold()];
+    try {
+        await new Promise((resolve) => setTimeout(resolve, 50)); // permits out
+
+        // Turn 1: every batch is dropped in the queue. The fold makes zero
+        // progress, yet NOTHING was wrong with the chain — under the pre-#2662
+        // policy this still armed the 10-minute cooldown.
+        const turn1 = await postTurn(port, "autofold-qdrop", 36);
+        assert.equal(turn1.status, 200, "queue-dropped fold must still forward (fail-open)");
+        assert.equal(sum.bodies.length, 0, "pure queue-drop: no summary call may reach the endpoint at all");
+        const forwarded1 = main.bodies.at(-1) as { messages?: unknown[] };
+        assert.equal(forwarded1.messages?.length, 73, "nothing folded while every batch died in the queue");
+
+        // The pool frees up: with NO cooldown armed, the very next turn
+        // retries the chain and the fold lands.
+        await Promise.all(holders);
+        const turn2 = await postTurn(port, "autofold-qdrop", 36);
+        assert.equal(turn2.status, 200, "turn 2 must forward");
+        assert.ok(sum.bodies.length >= 1, `backoff must NOT have armed on pure queue-drops; expected external calls on turn 2, got ${sum.bodies.length}`);
+        const forwarded2 = main.bodies.at(-1) as { messages?: unknown[] };
+        assert.ok(forwarded2.messages && forwarded2.messages.length < 73, `expected the fold to land once the pool freed, got ${forwarded2.messages?.length} messages`);
+    } finally {
+        await Promise.all(holders); // release the shared pool for later tests
+    }
+});
+
 // ---------------------------------------------------------------------------
 // growthFoldingArmed unit truth table (#2581 review fix #1)
 // ---------------------------------------------------------------------------

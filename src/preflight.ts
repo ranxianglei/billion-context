@@ -257,6 +257,10 @@ export interface PreflightResult {
     /** Why the loop stopped while the payload still overflows the window.
      *  Undefined when the payload fits. */
     failure?: PreflightFailure;
+    /** #2662: external-chain dispatch telemetry, present only when a chain
+     *  ran; calls > 0 && attempts === 0 = pool dropped every batch before
+     *  dispatch (congestion, not provider failure). */
+    externalDispatch?: { calls: number; attempts: number };
 }
 
 function refMaps(messages: CoreMessage[], state: Session["state"]): { refToIdx: Map<string, number>; idxToRef: Map<number, string> } {
@@ -1916,5 +1920,8 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
     result.savedTokens = Math.max(0, startTokens - currentTokens);
     if (currentTokens >= limit) result.failure = failure;
     result.fitsWindow = baselineKnown ? result.payloadEstimate < limit : finalUpper < limit;
+    if (deps.externalSummary !== undefined) {
+        result.externalDispatch = { calls: deps.externalSummary.stats.calls, attempts: deps.externalSummary.stats.attempts };
+    }
     return result;
 }

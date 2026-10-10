@@ -79,7 +79,7 @@ import { buildIncomingImageIndex, foldAnchoredCutoff, pruneRetrieveImgExports } 
 import { imageCompressionEnabled, storeEffectiveImageCompression, type ImageCompressionSettings } from "./image-compress.js";
 import { rulesEnabled, storeEffectiveRules } from "./rules-feature.js";
 import { storeEffectiveSearchPlanAware } from "./decompress-shared.js";
-import { armAutoFoldBackoff, autoFoldEngaged, AUTO_FOLD_BACKOFF_MS, withExternalSummaryTools } from "./external-summary-surface.js";
+import { armAutoFoldBackoff, autoFoldEngaged, AUTO_FOLD_BACKOFF_MS, externalQueueDroppedAll, withExternalSummaryTools } from "./external-summary-surface.js";
 import { AUTO_FOLD_TARGET_MIN } from "./external-summary-settings.js";
 import { applyRanges } from "./stream.js";
 import { attachSubagentSessions } from "./subagent-sessions.js";
@@ -2727,6 +2727,10 @@ export async function preflightCompressIfNeeded(
     // #726: a preflight that did not end in failure clears any dead-end marker
     // — the state changed (conversation shrank, upstream recovered).
     if (!result.failure) delete session.metadata.preflightDeadEnd;
+    // #2662: zero progress caused purely by queue drops (batches submitted, no
+    // attempt dispatched) is scheduler congestion, not a chain failure — it
+    // must not burn 10 minutes of auto-fold. Undefined for classic preflights.
+    const queueDroppedAll = externalQueueDroppedAll(result.externalDispatch);
     // #330: decide forward/fail on the payload actually forwarded, not
     // result.payloadEstimate — the preflight's relaxed-zone processTurn trims
     // that estimate more than the normal-config prepare does, which can turn a
@@ -2804,10 +2808,18 @@ export async function preflightCompressIfNeeded(
         // it, re-firing the trigger every turn with a guaranteed-400 forward
         // and no recovery (PR #2581 review) — now the straddle arms too, and
         // the forwarded request's 400 arms overflow-shrink with real evidence.
+        // Exception (#2662): when NO attempt was ever dispatched the chain did
+        // not fail — the shared pool dropped every batch in the queue, which
+        // clears on its own; backing off here would cost 10 minutes of
+        // auto-fold exactly while the host is congested.
         if (growthArmed) {
-            log("warn", `[${session.id}] auto-fold made no progress (0 range(s) folded) — forwarding as-is (estimate fits the model window ${limit}); backing off auto-fold for ${Math.round(AUTO_FOLD_BACKOFF_MS / 60_000)}m so classic nudges resume`);
-            armAutoFoldBackoff(session);
-            markDirty(session);
+            if (queueDroppedAll) {
+                log("warn", `[${session.id}] auto-fold made no progress (0 range(s) folded) — no summary attempt was ever dispatched (shared pool saturated / deadline expired before dispatch); congestion, not a chain failure — NOT backing off, auto-fold retries next turn (#2662); forwarding as-is (estimate fits the model window ${limit})`);
+            } else {
+                log("warn", `[${session.id}] auto-fold made no progress (0 range(s) folded) — forwarding as-is (estimate fits the model window ${limit}); backing off auto-fold for ${Math.round(AUTO_FOLD_BACKOFF_MS / 60_000)}m so classic nudges resume`);
+                armAutoFoldBackoff(session);
+                markDirty(session);
+            }
         } else {
             log("warn", `[${session.id}] preflight made no progress but the payload fits; forwarding as-is`);
         }
@@ -2824,10 +2836,17 @@ export async function preflightCompressIfNeeded(
     // next growth-armed request retries the fold (a dead-end cooldown is
     // never armed for growth: the key comparison paths above returned
     // earlier, and the contentDeadEnd arm below is unreachable from here).
+    // Exception (#2662): pure queue drops (no attempt dispatched) are pool
+    // congestion, not a chain failure — they skip the cooldown so the very
+    // next turn retries instead of idling 10 minutes.
     if (growthArmed && payloadFitsWindow) {
-        log("warn", `[${session.id}] auto-fold did not reach the growth target ${compressionTarget} (${result.compressedRanges} range(s) folded) — forwarding anyway (payload fits the model window ${limit}); backing off auto-fold for ${Math.round(AUTO_FOLD_BACKOFF_MS / 60_000)}m so classic nudges resume`);
-        armAutoFoldBackoff(session);
-        markDirty(session);
+        if (queueDroppedAll) {
+            log("warn", `[${session.id}] auto-fold did not reach the growth target ${compressionTarget} (${result.compressedRanges} range(s) folded) — no summary attempt was ever dispatched (shared pool saturated / deadline expired before dispatch); congestion, not a chain failure — NOT backing off, auto-fold retries next turn (#2662); forwarding anyway (payload fits the model window ${limit})`);
+        } else {
+            log("warn", `[${session.id}] auto-fold did not reach the growth target ${compressionTarget} (${result.compressedRanges} range(s) folded) — forwarding anyway (payload fits the model window ${limit}); backing off auto-fold for ${Math.round(AUTO_FOLD_BACKOFF_MS / 60_000)}m so classic nudges resume`);
+            armAutoFoldBackoff(session);
+            markDirty(session);
+        }
         return outbound;
     }
     // #1800: still over-window after compression, but the residual excess is carried
