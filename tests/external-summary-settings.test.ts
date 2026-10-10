@@ -317,6 +317,34 @@ test("autoFold validation: boolean only, target within [8192, 10M]", () => {
     assert.equal(off.autoFold, undefined);
 });
 
+test("concurrency rides both the chain form and the expanded rail form (#2657)", () => {
+    const chain = parseExternalSummaryChain({ enabled: true, targets: ["glm/glm-4.9-flash"], concurrency: 12 });
+    assert.equal(chain.concurrency, 12);
+    const plan = expandExternalSummaryChain(chain, recipes);
+    assert.equal(plan.concurrency, 12);
+    assert.doesNotThrow(() => parseExternalSummarySettings(plan));
+    // Absent → undefined → the executor keeps its base size.
+    const lazy = expandExternalSummaryChain(parseExternalSummaryChain({ enabled: true, targets: ["glm/glm-4.9-flash"] }), recipes);
+    assert.equal(lazy.concurrency, undefined);
+    // Whole-chain replace carries it like every other field.
+    const merged = mergeCompress({ externalSummary: { ...chain, targets: ["remote/resp-model"] } }, {})?.externalSummary;
+    assert.equal(merged?.concurrency, 12);
+});
+
+test("concurrency validation: integer within [1, 32] on both forms (#2657)", () => {
+    assert.doesNotThrow(() => parseExternalSummaryChain({ enabled: true, targets: ["glm/glm-4.9-flash"], concurrency: 1 }));
+    assert.doesNotThrow(() => parseExternalSummaryChain({ enabled: true, targets: ["glm/glm-4.9-flash"], concurrency: 32 }));
+    const plan = expandExternalSummaryChain(parseExternalSummaryChain({ enabled: true, targets: ["glm/glm-4.9-flash"] }), recipes);
+    for (const bad of [0, 33, -4, 2.5, "12"]) {
+        assert.throws(() => parseExternalSummaryChain({ enabled: true, targets: ["glm/glm-4.9-flash"], concurrency: bad }), /concurrency must be an integer between 1 and 32/, JSON.stringify(bad));
+        assert.throws(() => parseExternalSummarySettings({ ...plan, concurrency: bad }), /concurrency must be an integer between 1 and 32/, JSON.stringify(bad));
+    }
+    // A disabled chain never reads the rest of the object (early return).
+    const off = parseExternalSummaryChain({ enabled: false, targets: [], concurrency: "junk" as unknown as number });
+    assert.equal(off.enabled, false);
+    assert.equal(off.concurrency, undefined);
+});
+
 test("autoFold set on a disabled chain warns instead of silently no-oping", () => {
     const warns: string[] = [];
     setLogCapture((level, msg) => { if (level === "warn") warns.push(msg); });

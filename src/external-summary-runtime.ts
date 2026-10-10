@@ -1,12 +1,14 @@
 import { performance } from "node:perf_hooks";
 import { SummaryCredentialStore } from "./external-summary-credentials.js";
 import { createSummaryHttpCandidate } from "./external-summary-http.js";
-import { parseExternalSummarySettings, type ExternalSummarySettings } from "./external-summary-settings.js";
+import { parseExternalSummarySettings, SUMMARY_CONCURRENCY_DEFAULT, type ExternalSummarySettings } from "./external-summary-settings.js";
 import { ExternalSummaryExecutor, type ExternalSummaryBatchResult, type SummaryCandidate, type SummaryWork } from "./external-summary.js";
 import { log as loggerLog } from "./logger.js";
 
-// One shared queue across all sessions and all compression entry points.
-const executor = new ExternalSummaryExecutor(4);
+// One shared queue across all sessions and all compression entry points; its
+// base size is the config default — a chain's `concurrency` resizes it for
+// that batch's lifetime (#2657).
+const executor = new ExternalSummaryExecutor(SUMMARY_CONCURRENCY_DEFAULT);
 
 // The plan is rebuilt on every request, so a persistently-misconfigured chain
 // must not spam a warn line per request — dedupe by (candidate, reason).
@@ -57,7 +59,7 @@ export class ConfiguredSummaryPlan {
         return executor.executeBatch(work, this.candidates, {
             ...this.settings.budget, totalTimeoutMs: remaining,
             targetTimeoutMs: Math.min(remaining, this.settings.budget.targetTimeoutMs),
-        }, signal);
+        }, signal, { concurrency: this.settings.concurrency });
     }
 }
 

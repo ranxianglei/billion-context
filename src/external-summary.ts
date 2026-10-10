@@ -16,6 +16,14 @@ export interface SummaryBudget {
     readonly maxSummaryBytes: number;
 }
 
+/** [#2657] Per-batch pool-size request for the shared queue. The pool grows
+ *  to the LARGEST request among in-flight work and returns to its base size
+ *  once that work settles — one batch never permanently resizes the pool for
+ *  everyone else, so chains with different values can coexist safely. */
+interface SummaryPoolOptions {
+    readonly concurrency?: number;
+}
+
 interface SummaryAttempt {
     readonly targetIndex: number;
     readonly outcome: "success" | "error" | "timeout" | "invalid_summary" | "cancelled";
@@ -64,16 +72,33 @@ function awaitAttempt(operation: Promise<AttemptResult>, signal: AbortSignal): P
 export class ExternalSummaryExecutor {
     private active = 0;
     private readonly waiting: Waiter[] = [];
+    private readonly baseConcurrency: number;
+    private readonly scopedConcurrency = new Map<number, number>();
 
-    constructor(private readonly concurrency: number) {
+    constructor(concurrency: number) {
         if (!positiveInteger(concurrency)) throw new TypeError("Summary concurrency must be a positive integer");
+        this.baseConcurrency = concurrency;
     }
 
-    async execute(work: SummaryWork, candidates: readonly SummaryCandidate[], budget: SummaryBudget, signal?: AbortSignal): Promise<ExternalSummaryResult> {
-        return this.executeUntil(work, candidates, budget, signal);
+    async execute(work: SummaryWork, candidates: readonly SummaryCandidate[], budget: SummaryBudget, signal?: AbortSignal, options?: SummaryPoolOptions): Promise<ExternalSummaryResult> {
+        const endScope = this.beginScope(options);
+        try {
+            return await this.executeUntil(work, candidates, budget, signal);
+        } finally {
+            endScope();
+        }
     }
 
-    async executeBatch(work: readonly SummaryWork[], candidates: readonly SummaryCandidate[], budget: SummaryBudget, signal?: AbortSignal): Promise<ExternalSummaryBatchResult> {
+    async executeBatch(work: readonly SummaryWork[], candidates: readonly SummaryCandidate[], budget: SummaryBudget, signal?: AbortSignal, options?: SummaryPoolOptions): Promise<ExternalSummaryBatchResult> {
+        const endScope = this.beginScope(options);
+        try {
+            return await this.executeBatchInner(work, candidates, budget, signal);
+        } finally {
+            endScope();
+        }
+    }
+
+    private async executeBatchInner(work: readonly SummaryWork[], candidates: readonly SummaryCandidate[], budget: SummaryBudget, signal?: AbortSignal): Promise<ExternalSummaryBatchResult> {
         const results: ExternalSummaryResult[] = [];
         if (signal?.aborted) return { status: "cancelled", results };
         const limits = { ...budget };
@@ -170,6 +195,36 @@ export class ExternalSummaryExecutor {
         }
     }
 
+    /** [#2657] Register one batch's pool-size demand for its lifetime; the
+     *  returned release restores the previous sizing. No-op when the batch
+     *  requests no size (the base pool applies). */
+    private beginScope(options?: SummaryPoolOptions): () => void {
+        const requested = options?.concurrency;
+        if (requested === undefined) return () => {};
+        if (!positiveInteger(requested)) throw new TypeError("Summary concurrency must be a positive integer");
+        const live = this.scopedConcurrency.get(requested) ?? 0;
+        if (live === 0) {
+            this.scopedConcurrency.set(requested, 1);
+            this.drain();
+        } else {
+            this.scopedConcurrency.set(requested, live + 1);
+        }
+        let released = false;
+        return () => {
+            if (released) return;
+            released = true;
+            const remaining = (this.scopedConcurrency.get(requested) ?? 1) - 1;
+            if (remaining > 0) this.scopedConcurrency.set(requested, remaining);
+            else this.scopedConcurrency.delete(requested);
+        };
+    }
+
+    private effectiveConcurrency(): number {
+        let cap = this.baseConcurrency;
+        for (const requested of this.scopedConcurrency.keys()) if (requested > cap) cap = requested;
+        return cap;
+    }
+
     private acquire(signal: AbortSignal): Promise<Release | undefined> {
         if (signal.aborted) return Promise.resolve(undefined);
         return new Promise((resolve) => {
@@ -190,7 +245,7 @@ export class ExternalSummaryExecutor {
     }
 
     private drain(): void {
-        while (this.active < this.concurrency && this.waiting.length > 0) {
+        while (this.active < this.effectiveConcurrency() && this.waiting.length > 0) {
             const waiter = this.waiting.shift();
             if (!waiter) break;
             waiter.signal.removeEventListener("abort", waiter.abort);
