@@ -1274,6 +1274,26 @@ function warnCcrPluginDivergences(routes: ProviderRoutes, globalCompress?: Compr
 
 }
 
+// #2578: MCP-lane hosts (Kimi Code, Claude Code, zcode) expose bili tools
+// under mcp__bili__<name> — "bili" is the fixed shim server name (mcp.ts).
+// The kernel's hard protection matches bare names only (ALWAYS_PROTECTED_TOOLS
+// in kernel/src/protected.ts), so MCP-prefixed compress/acp_rule calls were
+// foldable by T1/T2/T3 compression while their bare-name twins were not.
+// Route the MCP forms through the kernel's host-side isToolProtected hook;
+// identity is the strict mcp__bili__ prefix (same convention as
+// session-self-heal's isBiliToolName), never a suffix match on arbitrary
+// server names.
+const MCP_BILI_TOOL_PREFIX = "mcp__bili__";
+// Mirrors the kernel's ALWAYS_PROTECTED_TOOLS (compress, acp_rule) — the
+// constant is not part of the kernel public API. Keep in lockstep with
+// kernel/src/protected.ts.
+const MCP_HARD_PROTECTED_BARE_NAMES = ["compress", "acp_rule"];
+
+export function isMcpBiliHardProtected(toolName: string): boolean {
+    return toolName.startsWith(MCP_BILI_TOOL_PREFIX) &&
+        MCP_HARD_PROTECTED_BARE_NAMES.includes(toolName.slice(MCP_BILI_TOOL_PREFIX.length));
+}
+
 export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions {
     // --- Source 1: JSON config file (~/.config/billion-context/billion-context.json) ---
     // The canonical, user-editable config. Loaded first so env vars below can
@@ -1374,7 +1394,9 @@ export function loadOptions(env: NodeJS.ProcessEnv = process.env): ProxyOptions 
         proxySource,
         proxyFallback,
         modelContextLimit,
-        kernelConfig: defaultConfig(modelContextLimit),
+        // #2578: host-side extension of the kernel's bare-name hard protection
+        // to the MCP-prefixed forms of bili's own tools.
+        kernelConfig: { ...defaultConfig(modelContextLimit), isToolProtected: isMcpBiliHardProtected },
         compress: {
             ...(fileConfig.compress ?? {}),
             injectTool: (env.ACP_COMPRESS_TOOL ?? (fileConfig.compress?.injectTool === false ? "0" : "1")) !== "0",

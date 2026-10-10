@@ -420,8 +420,18 @@ type AnonymousPrefixAffinityStamp = {
 // settings — so the panel Nudge line showed kernel defaults regardless of user
 // config. Same pattern as absorb.ts's effectiveAbsorb: stamp the last resolved
 // Config per session (latest wins), read it with fallback to the base.
+// #2584: the stamp must stay CLONE-SAFE — fork-adoption structuredClones
+// metadata.effectiveConfig (plugin.ts) and disk persistence JSON-serializes
+// it; a function value throws at the clone site (DataCloneError → 503
+// FORK_FAILED). Function fields are re-resolved at read time: effectiveConfig()
+// merges over the base kernelConfig, which carries them again (isToolProtected
+// #2578; isMessageProtected re-resolves from the lane id below).
 export function storeEffectiveConfig(session: Session, config: Config): void {
-    session.metadata["effectiveConfig"] = config;
+    const cloneSafe: Record<string, unknown> = { ...config };
+    for (const key of Object.keys(cloneSafe)) {
+        if (typeof cloneSafe[key] === "function") delete cloneSafe[key];
+    }
+    session.metadata["effectiveConfig"] = cloneSafe;
 }
 
 export function effectiveConfig(session: Session | undefined, fallback: Config): Config {
