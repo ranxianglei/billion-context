@@ -402,6 +402,8 @@ bili --no-auto-update        # 本次启动禁用自动更新
 | **omp**(经插件)| ✅ 发 | `prompt_cache_key` 提升为稳定身份(#268)|
 | **pi**(裸跑)| ❌ 不发 | 无 → 见下方匿名前缀亲和 |
 
+**omp 注意(#2583):** 较新的 OMP 构建中,默认 Anthropic(`anthropic-messages`)请求经 OMP 的 Cowork 传输以 node:https **直发** —— 到不了 bili 的 fetch 层,因此那条路径上 `prompt_cache_key` 打戳被*主动放弃*(打了戳反而会把字段泄漏进 Anthropic 严格 schema → HTTP 400)。这些请求走直连:不经压缩、对代理匿名;其余 omp 流量保持打戳身份。详见 [TECHNICAL-NOTES.zh-CN.md](TECHNICAL-NOTES.zh-CN.md)。
+
 **无 header 客户端(pi 类):匿名前缀亲和。** 当客户端完全不发任何会话信号时,代理从重放的历史本身解析会话(`src/prefix-affinity.ts`,#309):只有当请求历史从第 0 条开始逐字节复现某已存会话的消息链时,才重新挂回该会话;否则获得一个确定性的新 `pfa-…` 会话。后果(#1262):**恢复(resume)** 的对话重新挂回自己的会话(包括代理重启后,#499);**开头相同的新任务不会继承**另一个会话的 block —— 它拿到全新会话,历史一旦分叉就彻底独立;完全没有任何可用信号时,请求会被显式 400 拒绝,而不是静默与他人状态碰撞。
 
 设计记录与威胁模型:[SESSION-IDENTITY.md](SESSION-IDENTITY.md)。消息粒度的对偶文档(为什么身份由内容派生、而非指派 id)是 [MESSAGE-IDENTITY.zh-CN.md](MESSAGE-IDENTITY.zh-CN.md)。

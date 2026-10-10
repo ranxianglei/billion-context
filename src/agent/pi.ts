@@ -378,6 +378,43 @@ export function replayedMessageCount(ctx: Ctx): number | undefined {
     }
 }
 
+// #2583: OMP's Cowork transport (can1357/oh-my-pi 642892ae, proxy handling
+// e22a5ff2) picks egress PER MODEL: default anthropic/anthropic-messages
+// requests go out over node:https DIRECTLY — stable header order, HTTP/1.1,
+// streaming decompression — and never touch globalThis.fetch, so the
+// fetch-layer routing claim of the native mode does not hold for them. Only
+// an explicit proxy setting (PI_PROXY / PI_PROXY_<PROVIDER>) pushes them back
+// onto Bun's own fetch (which the patch then sees), as do exotic request
+// shapes (Request input, non-record headers, non-string body, non-https).
+// The stamped prompt_cache_key's sole consumer is the proxy itself
+// (#1403/#1579); on the direct path the field rides verbatim into Anthropic's
+// strict schema and 400s every request ("prompt_cache_key: Extra inputs are
+// not permitted"). This mirrors the host's own selection predicate exactly
+// (defaultFetchForModel + getProxyForProvider) — an evidence-permitlist entry
+// with source-level proof, not a URL heuristic. Missing provider/api fields
+// cannot conclude bypass, so they keep today's optimistic stamp (older hosts
+// still route through globalThis.fetch — fail-safe toward #1579).
+export function ompCoworkTransportBypassesFetch(
+    model: { provider?: string; api?: string } | undefined,
+    env: NodeJS.ProcessEnv = process.env,
+): boolean {
+    if (model?.provider !== "anthropic" || model?.api !== "anthropic-messages") return false;
+    // getProxyForProvider("anthropic"): PI_PROXY_ANTHROPIC (raw truthy) || PI_PROXY (trimmed).
+    const hasProviderProxy = (env.PI_PROXY_ANTHROPIC ?? "").length > 0;
+    const hasGlobalProxy = (env.PI_PROXY ?? "").trim().length > 0;
+    return !hasProviderProxy && !hasGlobalProxy;
+}
+
+// Once per process per model — the bypass is a property of the installed host
+// build, not of individual requests, so repeating it per call would spam logs.
+const coworkBypassNoted = new Set<string>();
+function noteOmpCoworkBypass(modelId: string): void {
+    const key = modelId || "<unknown>";
+    if (coworkBypassNoted.has(key) || coworkBypassNoted.size >= 64) return;
+    coworkBypassNoted.add(key);
+    console.warn(`bili-plugin(omp): ${key} leaves this host through the host-native direct TLS transport (OMP Cowork transport, #2583) — those requests bypass bili's fetch interception and go DIRECT (uncompressed, invisible to the proxy). The prompt_cache_key identity stamp is withheld so the field can never leak into the upstream body.`);
+}
+
 // omp's chat-completions payloads carry NO conversation signal (no
 // prompt_cache_key / session / user, and no session header — verified by dump),
 // so the proxy's openai identity falls to a content fingerprint that never
@@ -432,6 +469,19 @@ export function stampPromptCacheKey(event: unknown, ctx: Ctx, agent: string): Re
         const base = ctx.model?.baseUrl ?? "";
         const expanded = /\/v\d+\/?$/.test(base) ? `${base.replace(/\/+$/, "")}/chat/completions` : base;
         if (!isModelApiUrl(base) && !isModelApiUrl(expanded)) return undefined;
+        // #2583: the gates above prove the interceptor WOULD rewrite this URL
+        // at the fetch layer — but OMP's Cowork transport never puts default
+        // anthropic/anthropic-messages traffic ON globalThis.fetch in the
+        // first place (node:https direct unless a proxy env is set), so the
+        // rewrite can never fire and the stamped pck would ride verbatim into
+        // Anthropic's strict schema (400 on every delegation). Withhold the
+        // stamp where the transport is proven direct: those requests go
+        // direct anyway (uncompressed, anonymous to the proxy) — soft
+        // identity loss instead of a guaranteed hard failure (#1403).
+        if (ompCoworkTransportBypassesFetch(ctx.model, process.env)) {
+            noteOmpCoworkBypass(ctx.model?.id ?? base);
+            return undefined;
+        }
     }
     const payload = (event as { payload?: unknown } | undefined)?.payload;
     if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return undefined;

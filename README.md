@@ -514,6 +514,8 @@ Responses/OpenAI/Anthropic wires.
 | **omp** (via plugin) | ✅ yes | `prompt_cache_key` promoted over any fingerprint (#268) |
 | **pi** (bare) | ❌ no | nothing → anonymous prefix affinity below |
 
+**omp caveat (#2583):** on recent OMP builds, default Anthropic (`anthropic-messages`) requests leave the host through OMP's Cowork transport over node:https directly — they never reach bili's fetch layer, so the `prompt_cache_key` stamp is *withheld* there (stamping would leak the field into Anthropic's strict schema → HTTP 400). Those requests run direct: uncompressed and anonymous to the proxy; all other omp traffic keeps its stamped identity. Details: [TECHNICAL-NOTES.md](TECHNICAL-NOTES.md).
+
 **Header-less clients (pi-like): anonymous prefix affinity.** With no conversation signal at all, the proxy resolves the session from the replayed history itself (`src/prefix-affinity.ts`, #309): a request reattaches to a stored session only when its history reproduces that session's message chain byte-exactly from position 0; otherwise it gets its own deterministic `pfa-…` session. Consequences (#1262): a **resumed** conversation reattaches to its own session (even after a proxy restart, #499); a **new task with an identical opener does NOT inherit** another conversation's blocks — it mints a fresh, fully separate session; a request with no usable signal at all gets an explicit 400 instead of silently colliding.
 
 Design record and threat model: [SESSION-IDENTITY.md](SESSION-IDENTITY.md). The
