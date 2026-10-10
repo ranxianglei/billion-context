@@ -164,8 +164,15 @@ async function closeRig(rig: Rig): Promise<void> {
 }
 
 /** Main-lane turn under the dsh persona headers. `system` selects the lane:
- *  MAIN_SYSTEM rides the raw key (anchor), SWITCHED_SYSTEM forks onto |sub:. */
-async function mainTurn(rig: Rig, conv: string, system: string, n: number): Promise<void> {
+ *  MAIN_SYSTEM rides the raw key (anchor), SWITCHED_SYSTEM normally forks onto
+ *  |sub:. With `driftHistory` the first historical message is rewritten — the
+ *  post-#2247 world (anchor migration, #2241/#2250): a system change whose
+ *  history still continues the raw chain BYTE-EXACTLY migrates the anchor
+ *  instead of forking, so a fork requires the switch to break the chain. That
+ *  is exactly the field trigger (#2601: the migration shipped in v0.1.189 yet
+ *  5 forks appeared — dsh's provider/model switch rewrote history or crossed
+ *  lanes, defeating byte-exact continuation on every switch). */
+async function mainTurn(rig: Rig, conv: string, system: string, n: number, driftHistory = false): Promise<void> {
     const url = `http://127.0.0.1:${rig.proxyPort}/bili/http://127.0.0.1:${rig.upstreamPort}/v1/chat/completions`;
     const res = await fetch(url, {
         method: "POST",
@@ -178,7 +185,7 @@ async function mainTurn(rig: Rig, conv: string, system: string, n: number): Prom
                 { role: "system", content: system },
                 ...Array.from({ length: n }, (_, i): { role: string; content: string } => ({
                     role: i % 2 === 0 ? "user" : "assistant",
-                    content: `msg-${i + 1}-` + "z".repeat(6000),
+                    content: `msg-${i + 1}-` + "z".repeat(6000) + (driftHistory && i === 0 ? "\n[provider context rewritten]" : ""),
                 })),
             ],
         }),
@@ -201,13 +208,16 @@ async function callTool(rig: Rig, payload: Record<string, unknown>): Promise<{ s
 const compressArgs = (startId: string, endId: string) => ({ content: [{ startId, endId, summary: SUMMARY }] });
 
 /** Anchor the raw key (12 msgs → refs m00001–m00012), then switch the main
- *  lane's system so it forks (20 msgs → fork refs m00001–m00020). Refs ≥ m00013
- *  exist ONLY in the fork — success-vs-"unknown ref" is the routing oracle,
- *  and m00013–m00015 sits outside the kernel's protected zone (last 5 + most
- *  recent user message) so a correctly-routed compress can actually succeed. */
+ *  lane's system so it forks (20 msgs → fork refs m00001–m00020). The switch
+ *  turn drifts the first historical message so the chain does NOT continue
+ *  byte-exactly — otherwise #2247 would migrate the anchor instead of forking
+ *  (see mainTurn's `driftHistory`). Refs ≥ m00013 exist ONLY in the fork —
+ *  success-vs-"unknown ref" is the routing oracle, and m00013–m00015 sits
+ *  outside the kernel's protected zone (last 5 + most recent user message) so
+ *  a correctly-routed compress can actually succeed. */
 async function anchorThenSwitch(rig: Rig, conv: string): Promise<string> {
     await mainTurn(rig, conv, MAIN_SYSTEM, 12);
-    await mainTurn(rig, conv, SWITCHED_SYSTEM, 20);
+    await mainTurn(rig, conv, SWITCHED_SYSTEM, 20, true);
     const fork = forkKey(conv, SWITCHED_SYSTEM);
     assert.ok(peekSession(conv), "parent session exists under the raw key");
     assert.ok(peekSession(fork), "switched main lane forked onto its |sub: session");
@@ -307,6 +317,35 @@ test("#2241 non-native callers: conflicting witness still fails closed with 409 
         const r = await callTool(rig, { conversationId: CONV, tool: "compress", args: compressArgs("m00013", "m00015") });
         assert.equal(r.status, 409, "model-transcribed ids never yield to a witness");
         assert.equal(r.json.code, "TOOL_CONVERSATION_CONFLICT");
+    } finally {
+        await closeRig(rig);
+    }
+});
+
+// #2601 pins the boundary with #2247's anchor migration: when the switch does
+// NOT break the chain, no fork exists at all — the raw key stays authoritative
+// end-to-end and there is nothing to reroute. The field incident forked 5×
+// precisely because dsh's provider/model switches broke byte-exact
+// continuation; a regression of either side (migration stopping, or reroute
+// firing without a fork) would show up here.
+test("#2241×#2247: byte-stable same-lane switch MIGRATES the anchor (no fork) — bare-id calls stay on the raw key", async () => {
+    const rig = await startRig();
+    const CONV = "dshp2241-migrate";
+    try {
+        // No driftHistory: the switched turn continues the raw chain
+        // byte-exactly → #2247 migrates instead of forking.
+        await mainTurn(rig, CONV, MAIN_SYSTEM, 12);
+        await mainTurn(rig, CONV, SWITCHED_SYSTEM, 20);
+        const fork = forkKey(CONV, SWITCHED_SYSTEM);
+        assert.equal(peekSession(fork), undefined, "no fork: byte-stable switch migrated the anchor (#2247)");
+        assert.ok(Object.keys(peekSession(CONV)!.state.messageRefs.byRaw).length >= 20, "raw key holds the full switched history");
+
+        // Post-switch refs live on the PARENT now — a bare-id native call
+        // resolves there with nothing to reroute to.
+        const r = await callTool(rig, { conversationId: CONV, tool: "compress", args: compressArgs("m00013", "m00015"), nativeCaller: true });
+        assert.equal(r.status, 200, `tool call routed (${r.json.error ?? ""})`);
+        assert.equal(r.json.ok, true, `compress succeeded: ${r.json.result?.slice(0, 200) ?? ""}`);
+        assert.equal(getSession(CONV)?.state.blocks.length, 1, "block landed in the (migrated) parent session");
     } finally {
         await closeRig(rig);
     }
