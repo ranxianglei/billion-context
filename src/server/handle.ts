@@ -6,7 +6,7 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { defaultPrompts, type CompressionCore, type Config, type PackSurface, type Prompts } from "acp-kernel";
 import { conversationSignalAnthropic, conversationSignalGoogle, conversationSignalOpenai, conversationIdentityResponses, conversationSignalResponses, stripHistoricalImages, type AnthropicRequestBody, type GoogleRequestBody, type OpenAIRequestBody, type ResponsesRequestBody } from "acp-kernel/wire";
-import { DEFAULT_STRIP_IMAGES_KEEP_RECENT, resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig } from "../compress-settings.js";
+import { DEFAULT_STRIP_IMAGES_KEEP_RECENT, piProjectPacksAllowed, resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig } from "../compress-settings.js";
 import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveDeclaredProtocol, type ProxyOptions } from "../config.js";
 import { resolveProxyDecision } from "../upstream-proxy.js";
 import { contextFromRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "../registry.js";
@@ -548,7 +548,9 @@ export async function handle(
         resolvedImageCompressionCfg = compressCfg.imageCompression;
             resolvedSearchPlanAware = compressCfg.search?.planAware === true;
             reqPrompts = resolveCompressPrompts(compressCfg);
-            const surfaceRes = resolveCompressSurfaceDetailed(compressCfg);
+            // #2529: untrusted pi projects may not inject project prompt packs — gate the
+            // project source on the per-request trust header (fail closed on anything but "1").
+            const surfaceRes = resolveCompressSurfaceDetailed(compressCfg, undefined, piProjectPacksAllowed(pluginAgentHeader(req.headers), headerValue(req, "x-bili-project-trusted")));
             reqSurface = surfaceRes.surface;
             reqSurfacePack = surfaceRes.packName;
         }
