@@ -145,7 +145,7 @@ async function post(rig: Rig, session: string, messages: Array<{ role: string; c
 const DRAIN = "First-sight digestion";
 const BATCHED = "ONE batched compress call";
 const STAGED = "Smooth-transition guidance";
-const NUDGE_HINT = "ONE call, ONE string"; // rides every rendered nudge (ONE_CALL_HINT)
+const NUDGE_HINT = "never split the batch across separate calls"; // rides every rendered nudge (ONE_CALL_HINT tail, #2587)
 
 async function closeRig(rig: Rig): Promise<void> {
     rig.proxy.close();
