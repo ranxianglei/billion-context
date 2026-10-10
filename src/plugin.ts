@@ -1005,12 +1005,14 @@ function forkSnapshot(session: Session) {
     const indexedHashes = new Set(Object.values(store.byRef).map((entry) => entry.hash));
     if (Object.entries(store.byHash).some(([hash, text]) => !indexedHashes.has(hash) || typeof text !== "string" || createHash("sha256").update(text, "utf8").digest("hex") !== hash)) throw new Error("CCR original payload/index inconsistent");
     if (Object.entries(store.byRef).some(([ref, entry]) => typeof store.byHash[entry.hash] !== "string" || session.state.messageRefs.byRaw[entry.rawId] !== ref || session.state.messageRefs.byRef[ref] !== entry.rawId)) throw new Error("CCR original alias inconsistent");
-    const orderedMessages = messages.map((m): ForkIdentity => {
+    const orderedMessages = messages.map((m, i): ForkIdentity => {
         const ref = session.state.messageRefs.byRaw[m.id];
         // #2620: protected tool calls/results map to the kernel BLOCKED sentinel by design
         // (kernel assignRefs) — no numeric ref exists and byRef never holds it, so the
         // bidirectional check applies only to numeric refs; genuine corruption still fails.
-        if (!ref || (ref !== BLOCKED_REF && session.state.messageRefs.byRef[ref] !== m.id)) throw new Error("raw/ref mapping inconsistent");
+        // #2676: name the offending message in the error — a bare invariant string gave no
+        // clue which of hundreds of snapshot entries broke the mapping.
+        if (!ref || (ref !== BLOCKED_REF && session.state.messageRefs.byRef[ref] !== m.id)) throw new Error(`raw/ref mapping inconsistent (msg ${i + 1}/${messages.length} role=${m.role} tool=${m.toolName ?? "-"} ref=${ref ?? "MISSING"} rawId=${m.id.slice(0, 16)})`);
         const entry = store.byRef[ref];
         const placeholder = m.text ? parseStoredPlaceholder(m.text) : null;
         if ((entry && (entry.rawId !== m.id || typeof store.byHash[entry.hash] !== "string")) || (placeholder && (placeholder.ref !== ref || !entry))) throw new Error("CCR original unavailable or alias inconsistent");
