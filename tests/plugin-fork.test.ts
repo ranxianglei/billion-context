@@ -264,8 +264,10 @@ test("HTTP protected tools keep plain-text snapshots, forks and revisions usable
         const refs = snapshot.body.orderedMessages.map((m) => m.ref);
         assert.equal(refs.length, history.length);
         assert.ok(refs.slice(0, 2).every((ref) => /^m\d{5,}$/.test(ref)), JSON.stringify(refs));
-        // Both protected pairs (tool-call + paired result) carry the kernel sentinel.
-        assert.deepEqual(refs.slice(2, 6), ["BLOCKED", "BLOCKED", "BLOCKED", "BLOCKED"]);
+        // #2620: both protected pairs (tool-call + paired result) are unaddressable —
+        // the wire carries null, and the kernel sentinel must never cross it.
+        assert.deepEqual(refs.slice(2, 6), [null, null, null, null]);
+        assert.ok(!refs.includes("BLOCKED"), JSON.stringify(refs));
         assert.ok(refs.slice(6).every((ref) => /^m\d{5,}$/.test(ref)), JSON.stringify(refs));
         const fork = await h.request("/__bili/plugin/fork", forkRequest(snapshot.body, "child", history.length));
         assert.equal(fork.status, 201, JSON.stringify(fork.body));

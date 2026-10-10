@@ -41,7 +41,9 @@ import { ACP_NAME_ALT } from "../loop/tag-echo-filter.js";
 const SNAPSHOT_TIMEOUT_MS = 15_000;
 const FORK_TIMEOUT_MS = 15_000;
 
-export type ForkIdentity = { rawId: string; ref: string; identityHash: string };
+// #2620: ref null = intentionally unaddressable prefix message (kernel-protected);
+// matching and hashing are identity-based, so null flows through untouched.
+export type ForkIdentity = { rawId: string; ref: string | null; identityHash: string };
 
 type SnapshotResponse = {
     ok?: boolean;
@@ -322,7 +324,7 @@ function snapshotOf(raw: unknown): { parentRevision: string; orderHash: string; 
     const snap = raw as SnapshotResponse;
     if (typeof snap.parentRevision !== "string" || typeof snap.orderHash !== "string" || !Array.isArray(snap.orderedMessages)) return null;
     for (const identity of snap.orderedMessages) {
-        if (identity === null || typeof identity !== "object" || typeof identity.rawId !== "string" || typeof identity.ref !== "string" || typeof identity.identityHash !== "string") return null;
+        if (identity === null || typeof identity !== "object" || typeof identity.rawId !== "string" || (identity.ref !== null && typeof identity.ref !== "string") || typeof identity.identityHash !== "string") return null;
     }
     return { parentRevision: snap.parentRevision, orderHash: snap.orderHash, orderedMessages: snap.orderedMessages };
 }
