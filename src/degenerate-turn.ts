@@ -51,3 +51,24 @@ const DRAFT_CLOSE_TAIL = /\x3c\/(?:summary|analysis)\x3e\s*$/i;
 export function endsWithDraftClose(text: string): boolean {
     return text.length > 0 && DRAFT_CLOSE_TAIL.test(text);
 }
+
+// #2612: a client-native compaction request tells the model to hand-write its
+// answer as plain text — an \x3canalysis\x3e then a \x3csummary\x3e block — and forbids tool
+// calls (Claude Code /compact + auto-compact: "Wrap your summary in
+// \x3csummary\x3e\x3c/summary\x3e tags" / "Do NOT call any tools. Respond with plain text
+// only"). A turn ending \x3c/summary\x3e/\x3c/analysis\x3e on such a request is the CORRECT
+// completion, not a #2303 stalled draft: nudging it wastes a turn and, when the
+// retry ends alike, escalates into the #870 in-band error that aborts the
+// client's own compaction. Callers AND this with endsWithDraftClose on the
+// shipped request text, so a hit means "told to hand-write the summary".
+const CLIENT_SUMMARY_REQUEST = [
+    // "Do NOT call any tools" (+ use/invoke variants) — the no-tools reminder.
+    /\bdo\s+not\s+(?:call|use|invoke)\s+any\s+tools?\b/i,
+    // "Wrap your/its/the summary in <summary>" — the wrap-in-tags instruction.
+    /\bwrap\s+(?:your|its|the)\s+summary\s+in\s+\x3c\x2f?summary\x3e/i,
+    // "<analysis> block followed by a <summary> block" — the answer structure.
+    /\x3c\x2f?analysis\x3e\s*block\s+followed\s+by\s+a\s*\x3c\x2f?summary\x3e/i,
+];
+export function looksLikeClientSummaryRequest(text: string): boolean {
+    return text.length > 0 && CLIENT_SUMMARY_REQUEST.some((re) => re.test(text));
+}

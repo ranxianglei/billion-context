@@ -53,7 +53,7 @@ function tailLooksTerminal(tail: string, protocol: WireProtocol | "responses"): 
     return /event: response\.(?:completed|failed|incomplete)/.test(tail.slice(0, 64)) ||
         /"type"\s*:\s*"response\.(?:completed|failed|incomplete)"/.test(tail);
 }
-import { degenerateTurnWarning, endsWithDraftClose } from "./degenerate-turn.js";
+import { degenerateTurnWarning, endsWithDraftClose, looksLikeClientSummaryRequest } from "./degenerate-turn.js";
 import { PANEL_BOX_FOOTER } from "./acp-panel.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
 import { describeUpdateReady, getUpdateVisibility } from "./update-notes.js";
@@ -1997,6 +1997,10 @@ export async function pipePluginChatWithStrip(
     let inRetry = false;
     let retryIndexOffset = 0;
     let blocksForwarded = 0;
+    // #2612: true when the client asked the model to hand-write a plain-text
+    // summary (Claude Code /compact / auto-compact) — such a turn legitimately
+    // ends in </summary> with no tool call, so the #2303 draft-tail nudge stands down.
+    const clientSummaryRequest = typeof requestText === "string" && looksLikeClientSummaryRequest(requestText);
     /** One-shot re-issue when a turn reaches its terminal with nothing visible:
      *  the tag-echo case, where the filter empties the only text block and the
      *  host aborts an empty completed turn. Returns true when the retry stream
@@ -2011,8 +2015,9 @@ export async function pipePluginChatWithStrip(
         // text — the model wrote a handoff/compression draft in prose instead of
         // issuing the action it described (149 silent stops / 70 sessions, DSH
         // native). Treat it like the empty-turn shape below so at worst the client
-        // gets one extra continuation instead of losing the whole turn.
-        const draftTail = visibleTextChars > 0 && !sawToolUse && endsWithDraftClose(proseAcc);
+        // gets one extra continuation instead of losing the whole turn. #2612: not
+        // so when the client itself asked for a hand-written summary (clientSummaryRequest).
+        const draftTail = !clientSummaryRequest && visibleTextChars > 0 && !sawToolUse && endsWithDraftClose(proseAcc);
         // Markup released from a held span carries nothing the host can act on:
         // an unclosed render tag stalls the turn exactly like an empty one.
         if (!draftTail && (visibleTextChars > releasedMarkupChars || sawToolUse)) return false;
@@ -3010,6 +3015,8 @@ export async function pipePluginResponsesWithStrip(
     let heldEvents: string[] = [];
     /** Text those held events would hand the client, post-strip. */
     let heldVisibleChars = 0;
+    // #2612: responses twin of the chat-pipe gate — stand down the draft-tail nudge on a client hand-written-summary request.
+    const clientSummaryRequest = typeof requestText === "string" && looksLikeClientSummaryRequest(requestText);
     /** The ids the client already holds (first attempt), which the retry's own
      *  created/added events are dropped in favour of. */
     let heldItemId: unknown;
@@ -3217,7 +3224,8 @@ export async function pipePluginResponsesWithStrip(
         if (degenerateRetried || truncationRetried || refetch === undefined) return false;
         // #2303: same shape as the chat-pipe twin — visible prose ending in a
         // compression-draft closing tag with no function call is non-converged.
-        const draftTail = (visibleTextChars > 0 || heldVisibleChars > 0) && !sawFunctionCall && endsWithDraftClose(proseAcc);
+        // #2612: not so on a client hand-written-summary request (clientSummaryRequest).
+        const draftTail = !clientSummaryRequest && (visibleTextChars > 0 || heldVisibleChars > 0) && !sawFunctionCall && endsWithDraftClose(proseAcc);
         if (!draftTail && (visibleTextChars > 0 || heldVisibleChars > 0 || sawFunctionCall)) return false;
         if (status !== "completed") return false;
         if (res.destroyed || res.writableEnded) return false;

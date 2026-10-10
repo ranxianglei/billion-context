@@ -36,7 +36,7 @@ import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoBody } from "../st
 import { log as loggerLog } from "../logger.js";
 import { promptInputTotal, type WireProtocol } from "../util.js";
 import { DEGENERATE_RETRY_NUDGE } from "../degenerate-retry.js";
-import { endsWithDraftClose } from "../degenerate-turn.js";
+import { endsWithDraftClose, looksLikeClientSummaryRequest } from "../degenerate-turn.js";
 import { safePrefix, safeSuffix } from "../text-safe.js";
 
 export const MAX_LOOP_ROUNDS = 10;
@@ -388,6 +388,12 @@ export async function* runCompressLoop(
     let currentUpstream = upstream;
     let roundBody: Record<string, unknown> = requestBody;
     const coreMessages: CoreMessage[] = [...ctx.messages];
+    // #2612: the client's OWN compaction request (Claude Code /compact / auto-compact)
+    // instructs the model to hand-write a plain-text <summary> with no tool call, so a
+    // turn ending </summary> here is the correct completion — stand down the #2303 nudge.
+    const clientSummaryRequest =
+        looksLikeClientSummaryRequest(systemPrompt) ||
+        coreMessages.some((m) => m.text !== undefined && looksLikeClientSummaryRequest(m.text));
     let degradedRetried = false;
     let truncationRetried = false;
     // Independent one-shot for the visible-text continuation retry (#413
@@ -879,6 +885,7 @@ export async function* runCompressLoop(
                     finishReason !== "error" &&
                     (ctx.protocol === "openai" || ctx.protocol === "anthropic") &&
                     !ctx.textProtocol &&
+                    !clientSummaryRequest &&
                     assistantText.length > 0 &&
                     calls.length === 0 &&
                     endsWithDraftClose(assistantText) &&
