@@ -9,7 +9,8 @@ import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, r
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
-import { applyCompactionArchive, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type PendingRetrieval, type Session } from "../session.js";
+import { applyCompactionArchive, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type PendingRetrieval, type Session } from "../session.js";
+import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { ABSORB_TOOL_NAME, IMAGE_FULL_TOOL, RULE_TOOL, absorbToolsFor, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withSummaryBudgetNote } from "../compress-tool.js";
 import { applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, dropRetrievals, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes } from "../store.js";
@@ -159,6 +160,37 @@ export async function prepareAnthropic(
         // stamped per-request — strip `ccr` from the loop config when disarmed
         // (plugin mode / no tool channel) so placeholders never hit the wire.
         const loopConfig = ccrLoopConfig(session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
+        // #2432/#2658: dsh desktop's native compaction can LAND without ever
+        // transiting bili — its summarizer calls ctx.llm.stream() directly and
+        // manual /compact / idle-session paths have no ALS attribution, so the
+        // plugin's takeover gate sends them DIRECT past the proxy. First notice
+        // = this request replaying [checkpoint summary, retained tail…] against
+        // the same session id. The openai/responses lanes rebase on that
+        // signature (#2432/#2451); this lane had the server-side REFUSAL gate
+        // but not the post-landing recovery, so any checkpoint landing here
+        // (direct bypass, allowDshCompaction, future gate mismatch) left the ACP
+        // state permanently unrebased — the cannot-be-anchored death spiral plus
+        // persistent prefix-cache loss (#2596). Same signature+rebase as the
+        // twin lanes: detection runs BEFORE reconcileFoldCoverage/processTurn;
+        // either signal alone stays on the existing paths (framing paste with
+        // intact history has no gap; a gap without framing falls through to
+        // detectUnannouncedHistoryRewrite below). Title-gen side requests are
+        // skipped like on the openai lane (same tiny-budget heuristic).
+        let dshRebased = false;
+        const anthropicTitleGen = typeof parsed.max_tokens === "number" && parsed.max_tokens <= 200;
+        if (!anthropicTitleGen && session.metadata["pluginAgent"] === "dsh" && session.state.blocks.some((b) => b.active)) {
+            const coveredBeforeDshCompact = new Set(session.state.blocks.flatMap((b) => (b.active ? b.effectiveMessageIds : [])));
+            const dshGap = foldCoverage(coveredBeforeDshCompact, msgs.map((m) => m.id));
+            if (dshGap && carriesDshLocalCompactionSummary(msgs)) {
+                const missing = dshGap.expected - dshGap.matched;
+                if (missing >= DSH_LOCAL_COMPACTION_MIN_MISSING && missing * 2 >= dshGap.expected) {
+                    recordConflict(session, "native-compaction", `dsh native compaction: ${missing}/${dshGap.expected} covered id(s) replaced by the compacted history; ACP state rebased (#2432)`);
+                    log("warn", `[${sessionId}] dsh native compaction detected (${dshGap.matched}/${dshGap.expected} covered id(s) retained, checkpoint framing in resent history) — rebasing ACP state onto the compacted history (#2432)`);
+                    markNativeCompactionBoundary(session);
+                    dshRebased = reconcileNativeCompactionBoundary(session);
+                }
+            }
+        }
         // [#1921] re-anchor fold coverage onto churned-but-same messages
         // before the #1195 snapshot, so covered ids surviving a client
         // re-serialization stay covered (src/fold-reconcile.ts).
@@ -202,8 +234,12 @@ export async function prepareAnthropic(
         processedMessages = stripReasoning(stripKernelSummaries(turn.messages, turn.state));
         // #1001: a silent client history rewrite takes the same archive+prune path
         // as an announced /compact boundary — syncBlocks above has already
-        // deactivated the blocks whose sources left the context.
-        {
+        // deactivated the blocks whose sources left the context. Skipped when
+        // the rewrite was just classified as dsh native compaction above
+        // (#2432/#2658): it is already recorded as "native-compaction" and
+        // rebased — a second "unannounced-rewrite" entry beside it would present
+        // the substrate destruction as "another compressor fighting you".
+        if (!dshRebased) {
             const rewrite = detectUnannouncedHistoryRewrite(session, knownRefsBefore, msgs.map((m) => m.id));
             if (rewrite.detected) {
                 log("warn", `[${sessionId}] unannounced client history rewrite detected (${rewrite.knownIncoming}/${rewrite.incomingTotal} incoming message(s) carry pre-turn refs of ${rewrite.knownBefore} known) — marking compaction boundary (#1001)`);
