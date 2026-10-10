@@ -467,7 +467,8 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                     state.toolDeltaReady = true;
                     state.toolDeltaRetryAt = undefined;
                 })
-                .catch(() => {
+                .catch((err) => {
+                    console.error(`bili: opencode conditional-tool manifest fetch failed (${err instanceof Error ? err.message : String(err)}) — acp_retrieve/acp_rule stay unregistered; will retry on the next routed request (#2656)`);
                     state.toolDeltaRetryAt = Date.now() + TOOL_DELTA_RETRY_MS;
                 })
                 .finally(() => {
