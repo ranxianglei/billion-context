@@ -8,6 +8,9 @@ import { log as loggerLog } from "./logger.js";
 // One shared queue across all sessions and all compression entry points.
 const executor = new ExternalSummaryExecutor(4);
 
+// Test seam (#2662): saturate the process-wide pool deterministically.
+export const _executorForTest = executor;
+
 // The plan is rebuilt on every request, so a persistently-misconfigured chain
 // must not spam a warn line per request — dedupe by (candidate, reason).
 const seenCandidateWarnings = new Set<string>();
@@ -16,6 +19,11 @@ export class ConfiguredSummaryPlan {
     private readonly candidates: readonly SummaryCandidate[];
     private readonly settings: ExternalSummarySettings;
     readonly deadline: number;
+    /** #2662: summarize() invocations vs candidate calls actually dispatched —
+     *  calls > 0 && attempts === 0 means no candidate call was ever dispatched
+     *  (shared-pool congestion, or the plan's budget already exhausted before
+     *  reaching the pool — congestion, not a chain failure). */
+    readonly stats = { calls: 0, attempts: 0 };
 
     // `raw` may be an already-parsed chain off the request rail or raw JSON
     // from a hand-edited file — re-parse here so invalid settings fail
@@ -53,11 +61,17 @@ export class ConfiguredSummaryPlan {
 
     async summarize(work: readonly SummaryWork[], signal?: AbortSignal): Promise<ExternalSummaryBatchResult> {
         const remaining = Math.floor(this.deadline - performance.now());
-        if (remaining <= 0) return { status: "deadline", results: [] };
-        return executor.executeBatch(work, this.candidates, {
+        if (remaining <= 0) {
+            this.stats.calls += 1;
+            return { status: "deadline", results: [] };
+        }
+        const batch = await executor.executeBatch(work, this.candidates, {
             ...this.settings.budget, totalTimeoutMs: remaining,
             targetTimeoutMs: Math.min(remaining, this.settings.budget.targetTimeoutMs),
         }, signal);
+        this.stats.calls += 1;
+        for (const item of batch.results) this.stats.attempts += item.attempts.length;
+        return batch;
     }
 }
 

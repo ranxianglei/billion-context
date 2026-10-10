@@ -40,6 +40,15 @@ export function armAutoFoldBackoff(session: { metadata?: Record<string, unknown>
     (session.metadata ?? (session.metadata = {})).autoFoldBackoffUntil = Date.now() + AUTO_FOLD_BACKOFF_MS;
 }
 
+/** #2662: every external-summary batch of this invocation was dropped by the
+ *  shared pool before a single candidate call dispatched. That shape is
+ *  scheduler congestion (transient by nature), NOT evidence the summary chain
+ *  failed — arming the full backoff on it would cost the session 10 minutes
+ *  of auto-fold for a problem the pool itself will clear. */
+export function externalQueueDroppedAll(dispatch: { calls: number; attempts: number } | undefined): boolean {
+    return dispatch !== undefined && dispatch.calls > 0 && dispatch.attempts === 0;
+}
+
 /** Nudge suppression + growth trigger share this gate: auto-fold is only
  *  "engaged" while the chain is on AND not in backoff. */
 export function autoFoldEngaged(config: unknown, session: { metadata?: Record<string, unknown> } | undefined): boolean {

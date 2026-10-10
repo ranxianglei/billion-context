@@ -19,7 +19,8 @@ import { rewriteJsonResponseAsync } from "../src/stream.ts";
 import { rewriteOpenaiJsonResponseAsync } from "../src/stream-openai.ts";
 import { rewriteResponsesJsonResponseAsync } from "../src/stream-responses.ts";
 import { rewriteGoogleJsonResponseAsync } from "../src/stream-google.ts";
-import { withExternalSummaryTools } from "../src/external-summary-surface.ts";
+import { externalQueueDroppedAll, withExternalSummaryTools } from "../src/external-summary-surface.ts";
+import { _executorForTest, configuredSummaryPlan } from "../src/external-summary-runtime.ts";
 import { BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_TOOLS_GOOGLE } from "../src/compress-tool.ts";
 import { rmrf } from "./tmp-rm.ts";
 
@@ -330,6 +331,61 @@ test("four JSON response rewriters execute independent compression with optional
             assert.equal(ctx.session.state.blocks[0]?.summary, SUMMARY);
         }
     }, (_req, res) => success(res));
+});
+
+test("saturated pool drops every batch before dispatch: preflight reports calls>0, attempts=0 (#2662)", async () => {
+    let endpointCalls = 0;
+    await fixture(async (_base, externalSummary) => {
+        const rail = { ...externalSummary, budget: { totalTimeoutMs: 200, targetTimeoutMs: 200 } };
+        const ctx = context(rail);
+        // Saturate the process-wide pool: four holders keep every permit busy
+        // well past the victim plan's 200ms batch deadline, so its batches die
+        // in the queue before any candidate call dispatches.
+        const holders = [0, 1, 2, 3].map(() => _executorForTest.executeBatch(
+            [{ content: "pool holder", instructions: "hold the permit" }],
+            [{ summarize: () => new Promise<string>((resolve) => setTimeout(() => resolve("held"), 1500)) }],
+            { totalTimeoutMs: 30_000, targetTimeoutMs: 20_000, maxSummaryBytes: 65536 }));
+        try {
+            const plan = configuredSummaryPlan(rail);
+            assert.ok(plan, "rail settings must build a plan");
+            ctx.config.modelContextLimit = 1000;
+            ctx.session.stats.lastInputTokens = 10000;
+            const result = await preflightCompress({ core: ctx.core, config: ctx.config, session: ctx.session,
+                prompts: defaultPrompts, protocol: "responses", url: `${_base}/main-must-not-summarize`, headers: {},
+                model: "main-model", log: () => {}, externalSummary: plan }, ctx.messages);
+            assert.equal(result.compressedRanges, 0, JSON.stringify(result.externalDispatch));
+            assert.ok(result.externalDispatch && result.externalDispatch.calls > 0, "batches were submitted");
+            assert.equal(result.externalDispatch?.attempts, 0, "no candidate call may have dispatched");
+            assert.equal(externalQueueDroppedAll(result.externalDispatch), true, "the drop shape must be distinguishable from a provider failure");
+        } finally {
+            await Promise.all(holders); // release the shared pool for later tests
+        }
+    }, (_req, res) => { endpointCalls++; success(res); });
+    assert.equal(endpointCalls, 0, "a pure queue-drop must not touch the summary endpoint");
+});
+
+test("a dispatched-but-failing attempt is NOT a queue drop: attempts>0 keeps the backoff armable (#2662)", async () => {
+    await fixture(async (_base, externalSummary) => {
+        const ctx = context({ ...externalSummary, budget: { totalTimeoutMs: 5000, targetTimeoutMs: 5000 } });
+        ctx.config.modelContextLimit = 1000;
+        ctx.session.stats.lastInputTokens = 10000;
+        const result = await preflightCompress({ core: ctx.core, config: ctx.config, session: ctx.session,
+            prompts: defaultPrompts, protocol: "responses", url: `${_base}/main-must-not-summarize`, headers: {},
+            model: "main-model", log: () => {} }, ctx.messages);
+        assert.equal(result.compressedRanges, 0);
+        assert.ok(result.externalDispatch && result.externalDispatch.calls > 0, "batches were submitted");
+        assert.ok((result.externalDispatch?.attempts ?? 0) >= 1, `attempts were made and failed: ${JSON.stringify(result.externalDispatch)}`);
+        assert.equal(externalQueueDroppedAll(result.externalDispatch), false, "provider failures must stay backoff-eligible");
+    }, (_req, res) => { res.writeHead(503); res.end("private-provider-error"); });
+});
+
+test("externalQueueDroppedAll truth table (#2662)", () => {
+    assert.equal(externalQueueDroppedAll(undefined), false, "no chain ran → classic policy untouched");
+    assert.equal(externalQueueDroppedAll({ calls: 0, attempts: 0 }), false, "nothing submitted → nothing dropped");
+    assert.equal(externalQueueDroppedAll({ calls: 1, attempts: 0 }), true);
+    assert.equal(externalQueueDroppedAll({ calls: 3, attempts: 0 }), true);
+    assert.equal(externalQueueDroppedAll({ calls: 2, attempts: 1 }), false, "any dispatched attempt proves the pool let work through");
+    assert.equal(externalQueueDroppedAll({ calls: 5, attempts: 5 }), false);
 });
 
 test("mode-aware tool schemas relax summary only when enabled without mutating constants", () => {
