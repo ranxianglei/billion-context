@@ -44,7 +44,20 @@
 //   P5 marker/tag hygiene: every content text unit carries exactly one
 //       well-formed head render tag; the marker→ref map is constant across
 //       ALL turns (ids are never reused); refs unique per turn; OPEN/CLOSE
-//       balanced; the system layer is byte-stable across all turns.
+//       balanced; the system layer is byte-stable across all turns. At a
+//       SANCTIONED native-compaction boundary the era splits: refs re-seeded
+//       onto the compacted view belong to a new era and the old-era map does
+//       not constrain them (eraBreak option) — within each era the map stays
+//       constant;
+//   P6 dsh native-compaction rebase (#2596/#2658, all four wires): after a
+//       live fold, the host replaces its history with [checkpoint framing,
+//       retained tail] (the dsh compaction landing — the #2596 cache-loss
+//       lane). The dual-signal gate must rebase in the SAME turn: the
+//       forwarded body carries exactly the compacted view (framing + tail
+//       markers), the dead fold's summary/pair artifacts must NOT re-enter
+//       the wire, and every later turn is APPEND-stable from the compacted
+//       base — a missing lane implementation (the #2658 regression class:
+//       rebase shipped on only 2 of 4 wires) fails here per wire.
 //
 // Scenario (main, all wires): t1=[q1,a1,q2,a2], t2=+q3,a3, t3=+q4,a4,
 // foldA(m00001..m00002)+pairA@t4, t5=+q5,a5, foldB(m00003..m00005)+pairB@t6,
@@ -68,6 +81,8 @@ import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { _resetPluginStateForTest } from "../src/plugin.ts";
+import { getSession } from "../src/session.ts";
+import { DSH_CHECKPOINT_OPEN_TAG, DSH_CHECKPOINT_PREAMBLE_PREFIX } from "../src/server/dsh-compaction-guard.ts";
 import { rmrf } from "./tmp-rm.ts";
 
 const LT = "\x3c";
@@ -256,7 +271,7 @@ function keyOf(u: Unit): string {
     if (u.k === "text") {
         if (u.x.includes(SUM_A)) return "SA";
         if (u.x.includes(SUM_B)) return "SB";
-        const m = u.x.match(/\b([qa][1-8])-marker\b/);
+        const m = u.x.match(/\b([qa][0-9]+)-marker\b/);
         if (m) return m[1]!;
         return "TXT:" + u.x.slice(0, 24);
     }
@@ -307,8 +322,14 @@ function assertSlotsTail(c: Canon, label: string): void {
     assert.ok(kinds === "" || /(?:chain|nudge|imgnote|retrnote)(?:,(?:chain|nudge|imgnote|retrnote))*$/.test(kinds), `${label}: unexpected slot kinds ${kinds}`);
 }
 
-function assertTagPolicy(cans: Canon[], label: string): void {
+function assertTagPolicy(cans: Canon[], label: string, eraBreak?: number): void {
+    // eraBreak: index of the turn whose request is the SANCTIONED
+    // native-compaction boundary. Refs before/after belong to different
+    // eras (the rebase re-seeds the ref space onto the compacted view), so
+    // the marker→ref map is pinned constant WITHIN each era only —
+    // cross-era re-issue is sanctioned, never a bug.
     const seen = new Map<string, string>();
+    const seenNext = new Map<string, string>();
     for (let t = 0; t < cans.length; t++) {
         const c = cans[t]!;
         const occ = c.raw.split(OPEN_TAG).length - 1;
@@ -326,12 +347,13 @@ function assertTagPolicy(cans: Canon[], label: string): void {
             assert.ok(m, `${label} t${t + 1}: content unit missing well-formed head tag: ${JSON.stringify(u.x.slice(0, 60))}`);
             const ref = m[2]!;
             refs.push(ref);
-            const km = u.x.match(/\b([qa][1-8])-marker\b/);
+            const km = u.x.match(/\b([qa][0-9]+)-marker\b/);
             if (km) {
                 const marker = km[1]!;
-                const prevRef = seen.get(marker);
+                const active = eraBreak === undefined || t < eraBreak ? seen : seenNext;
+                const prevRef = active.get(marker);
                 if (prevRef) assert.equal(ref, prevRef, `${label} t${t + 1}: ref reuse — ${marker} was ${prevRef}, now ${ref}`);
-                else seen.set(marker, ref);
+                else active.set(marker, ref);
             }
         }
         assert.equal(new Set(refs).size, refs.length, `${label} t${t + 1}: duplicate refs in one turn`);
@@ -422,11 +444,27 @@ const adapters: Record<Wire, { model: string; path: string; buildBody: (items: C
     },
 };
 
-interface Step { send: CItem[]; fold?: FoldSpec; pairId?: string; dropPair?: string }
+interface Step {
+    send?: CItem[];
+    fold?: FoldSpec;
+    pairId?: string;
+    dropPair?: string;
+    // P6 native-compaction scenario: the host (dsh) replaces its ENTIRE
+    // history with [checkpoint framing, retained tail] — the compacted view
+    // after a native compaction landing. Processed before `send` appends.
+    compact?: CItem[];
+}
 
-async function driveWire(wire: Wire, steps: Step[]): Promise<Canon[]> {
+interface DriveOpts {
+    // Override the x-bili-plugin identity ("dsh" drives the dsh lane gates).
+    pluginAgent?: string;
+    // Deterministic conversation id (default: generated per run).
+    conv?: string;
+}
+
+async function driveWire(wire: Wire, steps: Step[], opts?: DriveOpts): Promise<Canon[]> {
     const adapter = adapters[wire];
-    const conv = `cfp-${wire}-${Date.now().toString(36)}`;
+    const conv = opts?.conv ?? `cfp-${wire}-${Date.now().toString(36)}`;
     const captured: string[] = [];
 
     const upstream = http.createServer((req, res) => {
@@ -469,7 +507,11 @@ async function driveWire(wire: Wire, steps: Step[]): Promise<Canon[]> {
     const hist: CItem[] = [];
     try {
         for (const step of steps) {
-            for (const it of step.send) hist.push(it);
+            if (step.compact) {
+                hist.length = 0;
+                hist.push(...step.compact);
+            }
+            for (const it of step.send ?? []) hist.push(it);
             if (step.fold) {
                 const r = await fetch(`http://127.0.0.1:${proxyPort}/__bili/plugin/tool`, {
                     method: "POST", headers: { "content-type": "application/json" },
@@ -489,7 +531,7 @@ async function driveWire(wire: Wire, steps: Step[]): Promise<Canon[]> {
             }
             const resp = await fetch(base, {
                 method: "POST",
-                headers: { "content-type": "application/json", "x-bili-plugin": "pi-plugin/0.0.1", "x-bili-plugin-conversation": conv },
+                headers: { "content-type": "application/json", "x-bili-plugin": opts?.pluginAgent ?? "pi-plugin/0.0.1", "x-bili-plugin-conversation": conv },
                 body: JSON.stringify(adapter.buildBody(hist)),
             });
             if (resp.status !== 200) {
@@ -734,3 +776,75 @@ testCompat(`cache-friendly plugin matrix: anthropic — 3rd fold prunes oldest p
     // once the oldest anchor re-carries, later turns are append-stable
     assertPrefix(cans[5]!.core, cans[6]!.core, L(6), ["q8", "a8"]);
 }, { timeout: 120_000 });
+
+// P6 (#2596/#2658): the dsh native-compaction rebase lane, per wire. After a
+// live fold the dsh host replaces its ENTIRE history with [checkpoint
+// framing, retained tail] — exactly the landing that, when a lane misses the
+// rebase (#2658 shipped it on openai/responses only), left the ACP state
+// permanently unrebased and the prefix cache dead (#2596 main complaint).
+// Byte-level contract, all four wires:
+//   - the dual-signal gate rebases in the SAME turn (state: boundary
+//     recorded, no active block survives);
+//   - the rebase-turn body carries exactly the compacted view (framing + the
+//     retained tail markers) and NONE of the dead fold's artifacts (no
+//     summary carrier, no pair quotes, no compress pair id/topic);
+//   - every later turn is APPEND-stable from the compacted base (the cache
+//     recovers instead of flapping) — the marker→ref map splits into eras at
+//     the sanctioned boundary and stays constant within each era.
+for (const wire of ["anthropic", "openai", "responses", "google"] as Wire[]) {
+    testCompat(`cache-friendly plugin matrix: ${wire} — dsh native-compaction rebase keeps the wire clean and append-stable (#2596/#2658)`, async () => {
+        const NATIVE_SUM = "Native-compaction fold summary covering m00001..m00009 nuance";
+        const NATIVE_FOLD: FoldSpec = { startId: "m00001", endId: "m00009", topic: "CFP-TOPIC-NATIVE", summary: NATIVE_SUM };
+        const checkpoint: CItem = {
+            role: "user",
+            text: `${DSH_CHECKPOINT_PREAMBLE_PREFIX} of the conversation so far, as context for continuing. The work established the harness, drove one fold, and then dsh compacted natively. Continue the task directly from the messages that follow, without acknowledging this checkpoint.\n\n${DSH_CHECKPOINT_OPEN_TAG}\n## Primary Request and Intent\n- drive a fold, then replay the compacted view`,
+        };
+        const steps: Step[] = [
+            { send: [T(1), A(1), T(2), A(2), T(3), A(3)] },
+            { send: [T(4), A(4), T(5), A(5), T(6), A(6)] },
+            { send: [T(7), A(7)] },
+            { send: [], fold: NATIVE_FOLD, pairId: "nc_pair" },
+            { compact: [checkpoint, T(7), A(7)] },
+            { send: [T(8), A(8)] },
+            { send: [T(9), A(9)] },
+        ];
+        const conv = `cfp-native-${wire}`;
+        const cans = await driveWire(wire, steps, { pluginAgent: "dsh", conv });
+        assert.equal(cans.length, 7, "expected 7 outbound bodies");
+        const L = (i: number) => `cfp-native/${wire} t${i + 1}`;
+
+        // The rebase landed in the SAME turn: boundary recorded, no active
+        // fold survives, refs re-seeded onto the compacted view.
+        const s = getSession(conv)!;
+        assert.ok(s, "session exists under the conversation key");
+        const boundary = s.metadata["nativeCompactionBoundary"] as { pendingRebase?: boolean } | undefined;
+        assert.ok(boundary, "native-compaction boundary recorded");
+        assert.equal(boundary?.pendingRebase, false, "rebase consumed within the rebase turn");
+        assert.equal((s.state.blocks ?? []).filter((b) => b.active).length, 0, "no active fold survives the rebase");
+
+        for (let i = 0; i < cans.length; i++) {
+            assertSlotsTail(cans[i]!, L(i));
+            assert.equal(countOcc(cans[i]!.raw, "acp_loop_"), 0, `${L(i)}: acp_loop_ artifact leaked`);
+        }
+        // eraBreak = 4: the compacted replay (t5) opens era B; refs re-issued
+        // across the boundary are sanctioned, within each era the map is law.
+        assertTagPolicy(cans, `cfp-native/${wire}`, 4);
+
+        // t4 (fold turn): pair rides inbound, anchor stripped (#1567)
+        assert.equal(countOcc(cans[3]!.raw, SUM_MARKER), 0, `${L(3)}: carrier stripped while the pair rides`);
+        assert.equal(countOcc(cans[3]!.raw, NATIVE_SUM), 2, `${L(3)}: pair quotes only`);
+
+        // t5 (rebase turn): exactly the compacted view on the wire
+        const rebase = cans[4]!.raw;
+        assert.ok(rebase.includes(DSH_CHECKPOINT_OPEN_TAG), `${L(4)}: checkpoint framing forwarded upstream`);
+        assert.ok(rebase.includes("q7-marker") && rebase.includes("a7-marker"), `${L(4)}: retained tail forwarded upstream`);
+        assert.equal(countOcc(rebase, SUM_MARKER), 0, `${L(4)}: no summary carrier may linger after the rebase`);
+        assert.equal(countOcc(rebase, NATIVE_SUM), 0, `${L(4)}: the dead fold's summary must not re-enter the wire`);
+        const pairIdOnWire = wire === "google" ? "CFP-TOPIC-NATIVE" : '"nc_pair"';
+        assert.ok(!rebase.includes(pairIdOnWire), `${L(4)}: the dead fold's compress pair must be gone with the compacted history`);
+
+        // t6/t7: growth resumes APPEND-stable from the compacted base
+        assertPrefix(cans[4]!.core, cans[5]!.core, L(5), ["q8", "a8"]);
+        assertPrefix(cans[5]!.core, cans[6]!.core, L(6), ["q9", "a9"]);
+    }, { timeout: 120_000 });
+}

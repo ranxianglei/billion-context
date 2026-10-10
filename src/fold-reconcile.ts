@@ -73,13 +73,31 @@
 // trailing placeholder line stripped/appended against the anchor's
 // normalized identity.
 //
+// Reap (#2695) — ZOMBIE STREAK. When a host deletes or decimates history
+// WITHOUT an announced boundary (no dsh framing, no /compact), the covered
+// substrate of the affected blocks never comes back, but duplicate-content
+// re-derivation keeps a residual id alive so syncBlocks re-activates the
+// block forever: its acp_summary carrier keeps rendering (and flapping)
+// mid-list every turn — a permanent prefix-cache buster. The per-block
+// coverage record (METADATA_FOLD_COVERAGE) now streak-counts passes where a
+// strict MAJORITY of the block's covered ids is absent (2*(p+r) < t), gated
+// on verified presence (e === 1 — never-represent substrates like
+// view-folding hosts keep their #2202 status-quo semantics). After
+// FOLD_DRIFT_ESCALATE_PASSES consecutive majority-loss passes the block is
+// REAPED — removed from state.blocks (not deactivated: syncBlocks would
+// resurrect it) with #395 archive semantics, blockContents retained for the
+// derived-decompress fallback. Proxy mode only: a plugin-mode fold
+// legitimately replaces the covered history (the agent's own compress runs
+// against its private state), so absence there is sanctioned.
+//
 // Modes (config `compress.reconcile`, env BILI_FOLD_RECONCILE):
 //   "off"    — disabled (pre-#1921 behavior).
 //   "warn"   — compute + log only, no rewrite.
 //   "repair" — rewrite block ids (default).
 import { createHash } from "node:crypto";
 import { defaultCountTokens, type CoreMessage } from "acp-kernel";
-import type { Session } from "./session.js";
+import { reapDestroyedSubstrate, type Session } from "./session.js";
+import { recordConflict } from "./conflict-watch.js";
 
 type FoldReconcileMode = "off" | "warn" | "repair";
 
@@ -123,8 +141,8 @@ export const METADATA_FOLD_COVERAGE = "foldCoverageByBlock";
  *  side-requests (#1075: title-gen / WebSearch refinement "carry only a
  *  handful of brand-new messages") — no drift evidence is taken from them.
  *  Same value as REWRITE_MIN_INCOMING_TOTAL (src/session.ts), which the #1195
- *  sibling warn guards with; kept local so this module stays dependency-free
- *  beyond its type import. */
+ *  sibling warn guards with; kept local so the module's only host imports
+ *  stay the #2695 reap/ledger hooks below. */
 const SIDE_REQUEST_MAX_MSGS = 10;
 /** pi's NON_VISION_USER_IMAGE_PLACEHOLDER (pi-stable-ai transform-messages):
  *  replaying a conversation onto a text-only model replaces every image
@@ -219,6 +237,9 @@ interface FoldReconcileResult {
     byNorm: number;
     byTurn: number;
     byImage: number;
+    /** #2695: fold blocks reaped this pass (removed from state.blocks after
+     *  a majority-loss zombie streak). */
+    reaped: number;
     unmatched: number;
 }
 
@@ -240,6 +261,14 @@ export interface FoldBlockCoverage {
      *  accrual) from structural absence (view-folding hosts whose resends never
      *  carry raw originals → unverifiable, keep status-quo booking). */
     e?: 1;
+    /** #2695: consecutive passes with a strict MAJORITY of covered ids absent
+     *  (2*(p+r) < t), counted only for verified substrates (e === 1). A
+     *  healthy proxy-mode fold re-receives its covered originals every turn
+     *  (p+r = t resets this to 0); model-switch churn reclaims most ids via
+     *  anchors (p+r ≈ t likewise). When z reaches FOLD_DRIFT_ESCALATE_PASSES
+     *  the substrate is taken for destroyed by an unannounced client rewrite
+     *  and the block is reaped (reapDestroyedSubstrate, src/session.ts). */
+    z?: number;
 }
 
 const seenInvalidEnv = new Set<string>();
@@ -921,13 +950,13 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     const mode = opts.mode ?? resolveFoldReconcileMode(process.env);
     if (mode === "off") {
         resetFoldDriftState(session);
-        return { kind: "off", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, unmatched: 0 };
+        return { kind: "off", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 };
     }
     const blocks = (session.state?.blocks ?? []) as BlockLike[];
     const covered = coveredIdsOf(blocks);
     if (covered.size === 0) {
         resetFoldDriftState(session);
-        return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, unmatched: 0 };
+        return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 };
     }
     // #2202: auxiliary side-requests (title-gen, WebSearch refinement — #1075)
     // share the conversation id but do not carry the conversation. Reconciling
@@ -940,9 +969,9 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     // the episode state is left exactly as found (the resets above stay
     // reserved for true episode boundaries: reconcile off / no folds at all).
     if (msgs.length < SIDE_REQUEST_MAX_MSGS) {
-        return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, unmatched: 0 };
+        return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 };
     }
-    if (!session.metadata) return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, unmatched: 0 };
+    if (!session.metadata) return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 };
 
     const anchors: Record<string, FoldAnchor> =
         (session.metadata[METADATA_ANCHORS] as Record<string, FoldAnchor> | undefined) ?? {};
@@ -1077,9 +1106,68 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         }
         const rec: FoldBlockCoverage = { p, r, t: ids.length };
         if (prevCov[bid]?.e === 1 || p + r > 0) rec.e = 1;
+        // #2695: zombie streak — strict majority of covered ids absent, only
+        // for VERIFIED substrates (e === 1). Never-represent substrates keep
+        // their #2202 structural-absence semantics (no streak, no reap).
+        const gone = 2 * (p + r) < ids.length;
+        if (gone) {
+            if (rec.e === 1) rec.z = (prevCov[bid]?.z ?? 0) + 1;
+        } else {
+            rec.z = 0;
+        }
         if (covCount >= MAX_ANCHORS) continue;
         nextCov[bid] = rec;
         covCount++;
+    }
+
+    // #2695: reap blocks whose covered substrate stayed majority-absent for
+    // FOLD_DRIFT_ESCALATE_PASSES consecutive passes. REMOVAL from
+    // state.blocks — not deactivation: syncBlocks re-activates any block
+    // whose id set still intersects the wire (kernel/src/sync.ts sets
+    // active=true before the stillPresent check), and duplicate-content
+    // re-derivation keeps exactly that intersection alive forever, which is
+    // how the zombie carrier kept rendering (and flapping) every turn.
+    // Proxy mode only (plugin folds legitimately replace covered history —
+    // the agent's own compress runs against its private state); repair mode
+    // only (warn observes). Runs BEFORE the backbone persistence below so
+    // the reaped ids are stripped from the same objects that get stored.
+    let reapedCount = 0;
+    if (mode === "repair" && session.metadata.pluginAgent === undefined) {
+        const ripe = new Set<string>();
+        for (const block of blocks) {
+            const bid = block.blockId;
+            if (bid !== undefined && (nextCov[bid]?.z ?? 0) >= FOLD_DRIFT_ESCALATE_PASSES) ripe.add(bid);
+        }
+        if (ripe.size > 0) {
+            const liveRawIds = new Set(msgs.map((m) => m.id));
+            const reaped = reapDestroyedSubstrate(session, ripe, liveRawIds, opts.log ?? (() => {}));
+            reapedCount = reaped.length;
+            if (reapedCount > 0) {
+                // Strip the reaped blocks from the coverage/backbone records
+                // this pass persists, so nothing seeds or positions their ids
+                // again (nextOrder is the array METADATA_POSITIONS already
+                // references — mutate in place).
+                const deadIds = new Set<string>();
+                for (const block of blocks) {
+                    if (block.blockId === undefined || !ripe.has(block.blockId)) continue;
+                    delete nextCov[block.blockId];
+                    for (const id of block.effectiveMessageIds ?? []) deadIds.add(id);
+                    for (const id of block.directMessageIds ?? []) deadIds.add(id);
+                }
+                for (const id of deadIds) delete nextAnchors[id];
+                for (let i = nextOrder.length - 1; i >= 0; i--) {
+                    if (deadIds.has(nextOrder[i])) nextOrder.splice(i, 1);
+                }
+                const storedPositions = session.metadata[METADATA_POSITIONS] as { ids?: string[] } | undefined;
+                const positionIds = storedPositions?.ids;
+                if (Array.isArray(positionIds) && positionIds !== nextOrder) {
+                    for (let i = positionIds.length - 1; i >= 0; i--) {
+                        if (deadIds.has(positionIds[i])) positionIds.splice(i, 1);
+                    }
+                }
+                recordConflict(session, "orphan-reap", `reaped ${reapedCount} zombie fold block(s) [${reaped.join(", ")}]: covered substrate majority-absent for ${FOLD_DRIFT_ESCALATE_PASSES} consecutive passes (#2695)`);
+            }
+        }
     }
     session.metadata[METADATA_FOLD_COVERAGE] = nextCov;
 
@@ -1138,7 +1226,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     }
 
     if (plan.unmatched.length === 0 && plan.claims.size === 0) {
-        return { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, unmatched: 0 };
+        return { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: reapedCount, unmatched: 0 };
     }
     if (opts.log !== undefined) {
         if (plan.claims.size > 0 && mode === "repair") {
@@ -1167,6 +1255,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         byNorm: plan.byNorm,
         byTurn: plan.byTurn,
         byImage: plan.byImage,
+        reaped: reapedCount,
         unmatched: plan.unmatched.length,
     };
 }

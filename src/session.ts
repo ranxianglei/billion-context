@@ -1072,21 +1072,7 @@ export function applyCompactionArchive(
     }
 
     const { byRaw, byRef } = session.state.messageRefs;
-    const highestBefore = highestUsedIndex(session.state.messageRefs);
-    const prunedByRaw: Record<string, string> = {};
-    for (const [rawId, ref] of Object.entries(byRaw)) {
-        if (liveRawIds.has(rawId)) prunedByRaw[rawId] = ref;
-    }
-    // The kernel's ref cursor is highestUsedIndex+1, so pruning the top of
-    // the map would hand the freed numbers out again — pin the old high-water
-    // mark (refs are never reused within a session).
-    if (highestBefore > highestUsedIndex({ byRaw: prunedByRaw, byRef: {} })) prunedByRaw[REF_FLOOR_RAW_ID] = indexToRef(highestBefore);
-    const prunedByRef: Record<string, string> = {};
-    for (const [ref, rawId] of Object.entries(byRef)) {
-        if (liveRawIds.has(rawId)) prunedByRef[ref] = rawId;
-    }
-    session.state.messageRefs.byRaw = prunedByRaw;
-    session.state.messageRefs.byRef = prunedByRef;
+    pruneRefsToLiveIds(session, liveRawIds, byRaw, byRef);
 
     session.metadata.compactionBoundary = {
         ...(boundary as Record<string, unknown>),
@@ -1095,7 +1081,71 @@ export function applyCompactionArchive(
         archivedBlocks: deactivated,
     };
     markDirty(session);
-    log("info", `[${session.id}] native compaction boundary: archived ${deactivated.length} pre-compaction block(s)${deactivated.length > 0 ? ` (${deactivated.join(", ")})` : ""}; pruned ref maps to ${Object.keys(prunedByRaw).length} live raw id(s)`);
+    log("info", `[${session.id}] native compaction boundary: archived ${deactivated.length} pre-compaction block(s)${deactivated.length > 0 ? ` (${deactivated.join(", ")})` : ""}; pruned ref maps to ${liveRawIds.size} live raw id(s)`);
+}
+
+/** Prune the ref maps to `liveRawIds` in place (same maps, not new objects:
+ *  session.state stays the object the kernel pipeline mutates). The kernel's
+ *  ref cursor is highestUsedIndex+1, so pruning the top of the map would hand
+ *  the freed numbers out again — the old high-water mark is re-pinned via
+ *  REF_FLOOR_RAW_ID (refs are never reused within a session, Kernel
+ *  Contract). Shared by the announced archive path (#395) and the zombie
+ *  reap (#2695). */
+function pruneRefsToLiveIds(
+    session: Session,
+    liveRawIds: Set<string>,
+    byRaw: Record<string, string>,
+    byRef: Record<string, string>,
+): void {
+    const highestBefore = highestUsedIndex(session.state.messageRefs);
+    const prunedByRaw: Record<string, string> = {};
+    for (const [rawId, ref] of Object.entries(byRaw)) {
+        if (liveRawIds.has(rawId)) prunedByRaw[rawId] = ref;
+    }
+    if (highestBefore > highestUsedIndex({ byRaw: prunedByRaw, byRef: {} })) prunedByRaw[REF_FLOOR_RAW_ID] = indexToRef(highestBefore);
+    const prunedByRef: Record<string, string> = {};
+    for (const [ref, rawId] of Object.entries(byRef)) {
+        if (liveRawIds.has(rawId)) prunedByRef[ref] = rawId;
+    }
+    session.state.messageRefs.byRaw = prunedByRaw;
+    session.state.messageRefs.byRef = prunedByRef;
+}
+
+/** #2695: remove fold blocks whose covered substrate the client demonstrably
+ *  destroyed — a strict majority of each block's covered ids absent from the
+ *  resent history for several consecutive passes (streak tracked in
+ *  src/fold-reconcile.ts, METADATA_FOLD_COVERAGE.z). REMOVAL, not
+ *  deactivation: syncBlocks re-activates every non-consumed, non-expanded
+ *  block whose id set still intersects the wire (kernel/src/sync.ts sets
+ *  active=true before the stillPresent check), and duplicate-content
+ *  re-derivation keeps exactly that intersection alive forever — the zombie
+ *  carrier that renders (and flaps) every turn (#2695). Removing the block
+ *  from state.blocks is sticky: sync/prune/anchors all iterate state.blocks.
+ *  blockContents are kept, so the derived-decompress fallback can still
+ *  restore the summary text; the block is recorded in the #395 pre-compaction
+ *  archive (direct decompress fails loudly with the archive reason); refs are
+ *  pruned to live ids with the same high-water pin as applyCompactionArchive. */
+export function reapDestroyedSubstrate(
+    session: Session,
+    blockIds: ReadonlySet<string>,
+    liveRawIds: Set<string>,
+    log: (level: string, msg: string) => void,
+): string[] {
+    if (blockIds.size === 0 || session.state.blocks.length === 0) return [];
+    const present = new Set(session.state.blocks.map((b) => b.blockId));
+    const reaped = [...blockIds].filter((id) => present.has(id));
+    if (reaped.length === 0) return [];
+    session.state.blocks = session.state.blocks.filter((b) => !blockIds.has(b.blockId));
+    const archive = readPreCompactionArchive(session);
+    const at = Date.now();
+    for (const id of reaped) {
+        archive[id] = { at, reason: "covered substrate destroyed by unannounced client history rewrite (#2695)" };
+    }
+    session.metadata.preCompactionArchive = archive;
+    pruneRefsToLiveIds(session, liveRawIds, session.state.messageRefs.byRaw, session.state.messageRefs.byRef);
+    markDirty(session);
+    log("info", `[${session.id}] zombie fold reap: removed ${reaped.length} block(s) (${reaped.join(", ")}) from ACP state; blockContents retained, refs pruned to live ids (#2695)`);
+    return reaped;
 }
 
 // #1001: clients rewrite session history SILENTLY mid-session (opencode native

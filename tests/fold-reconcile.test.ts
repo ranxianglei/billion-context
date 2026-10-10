@@ -19,6 +19,7 @@ import {
 import { defaultCountTokens } from "acp-kernel";
 import type { CoreMessage } from "acp-kernel";
 import type { Session } from "../src/session.ts";
+import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 
 function msg(id: string, role: string, text: string, extra?: Partial<CoreMessage>): CoreMessage {
     return { id, role, contentType: "text", text, ...extra } as CoreMessage;
@@ -405,9 +406,14 @@ describe("reconcileFoldCoverage drift escalation (#2193)", () => {
 
 describe("reconcileFoldCoverage coverage evidence + side-request guard (#2202)", () => {
     type LogLine = { level: string; msg: string };
+    // #2695: the majority-loss streak reaps blocks on the third consecutive
+    // loss pass — reapDestroyedSubstrate calls markDirty, so a disabled store
+    // must be injected before any mock session flows through it.
+    _setStoreForTest(new SessionStore({ enabled: false }));
     function blockSession(blockId: string, ids: string[]): Session {
         return {
-            state: { blocks: [{ active: true, blockId, effectiveMessageIds: ids }] },
+            id: "s-cov",
+            state: { blocks: [{ active: true, blockId, effectiveMessageIds: ids }], messageRefs: { byRaw: {}, byRef: {} } },
             metadata: {},
         } as unknown as Session;
     }
@@ -429,7 +435,7 @@ describe("reconcileFoldCoverage coverage evidence + side-request guard (#2202)",
         reconcileFoldCoverage(session, first, makeOpts());
         let cov = covOf(session)["blk1"];
         assert.ok(cov, "record written on the first qualifying pass");
-        assert.deepEqual(cov, { p: 5, r: 0, t: 5, e: 1 });
+        assert.deepEqual(cov, { p: 5, r: 0, t: 5, e: 1, z: 0 });
         // Pass 2: x2 churns (claimable via normalized identity), x3 is genuinely
         // edited (unmatchable), the rest ride along verbatim.
         const second = [
@@ -446,11 +452,13 @@ describe("reconcileFoldCoverage coverage evidence + side-request guard (#2202)",
         assert.equal(cov.p, 3, "x1/x4/x5 present verbatim");
         assert.equal(cov.r, 1, "x2 reclaimed through a claim");
         assert.equal(cov.e, 1);
-        // Pass 3: total loss — nothing covered rides the wire anymore.
+        // Pass 3: total loss — nothing covered rides the wire anymore. The
+        // majority-loss zombie streak (#2695) starts counting: z=1 this pass
+        // (pass 2 was fully covered, z reset to 0).
         reconcileFoldCoverage(session, filler("f3"), makeOpts());
         cov = covOf(session)["blk1"];
         assert.ok(cov);
-        assert.deepEqual(cov, { p: 0, r: 0, t: 5, e: 1 });
+        assert.deepEqual(cov, { p: 0, r: 0, t: 5, e: 1, z: 1 });
     });
 
     test("never-present class stays unverifiable (structural absence keeps status quo)", () => {
@@ -486,9 +494,18 @@ describe("reconcileFoldCoverage coverage evidence + side-request guard (#2202)",
         assert.equal(JSON.stringify(session.metadata[METADATA_FOLD_COVERAGE]), covBefore, "coverage records untouched");
         assert.equal(JSON.stringify(session.metadata.foldAnchors), anchorsBefore, "anchors untouched");
         assert.equal(JSON.stringify(session.metadata.foldAnchorOrder), orderBefore, "backbone untouched");
-        // The next conversation-sized total-loss pass escalates on its own merit.
-        reconcileFoldCoverage(session, filler("h3"), opts);
+        // The next conversation-sized total-loss pass escalates on its own merit
+        // AND completes the #2695 zombie streak (z was 2 before the side pass;
+        // h3 makes it 3): the block is reaped — removed from state.blocks, the
+        // loss recorded as a conflict event, blockContents semantics preserved
+        // by the reap helper (kept, so derived decompress still works).
+        const h3 = reconcileFoldCoverage(session, filler("h3"), opts);
         assert.equal(logs.filter((l) => l.level === "error").length, 1);
+        assert.equal(h3.reaped, 1, "third consecutive majority-loss pass reaps the zombie block");
+        assert.equal(session.state.blocks.length, 0, "reaped block removed from state.blocks");
+        assert.ok(!covOf(session)["blk3"], "coverage record for the reaped block dropped");
+        const conflict = (session.metadata.conflictEvents as Array<{ kind: string }>)[0];
+        assert.equal(conflict?.kind, "orphan-reap");
     });
 
     test("short passes do not skew the next pass's alignment", () => {
@@ -658,7 +675,7 @@ describe("reconcileFoldCoverage anchor cap boundary (#2334)", () => {
         const snapshot = JSON.stringify(session.metadata);
         resetNormalizedIdentityWork();
         const second = reconcileFoldCoverage(session, msgs, opts);
-        assert.deepEqual(second, { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, unmatched: 0 });
+        assert.deepEqual(second, { kind: "resend", missing: 0, claims: 0, byPos: 0, byTool: 0, byNorm: 0, byTurn: 0, byImage: 0, reaped: 0, unmatched: 0 });
         assert.equal(normalizedIdentityWorkCount(), 0,
             "the overflow tail must not be normalized+hashed and dropped AGAIN every pass (#2334)");
         assert.equal(JSON.stringify(session.metadata), snapshot, "steady-state resend leaves metadata byte-stable");

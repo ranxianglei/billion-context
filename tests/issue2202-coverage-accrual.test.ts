@@ -73,12 +73,12 @@ test("verified loss freezes accrual; recovery resumes; legacy and never-present 
         }
         assert.equal(led.folds[0].requestsAfter, 3, "full coverage books one request per sample");
         // Re-read after each pass: reconcile REPLACES the record object.
-        const covOf = () => (session.metadata["foldCoverageByBlock"] as Record<string, { p: number; r: number; t: number; e?: 1 }> | undefined);
-        assert.deepEqual(covOf()?.b1, { p: 7, r: 0, t: 7, e: 1 });
+        const covOf = () => (session.metadata["foldCoverageByBlock"] as Record<string, { p: number; r: number; t: number; e?: 1; z?: number }> | undefined);
+        assert.deepEqual(covOf()?.b1, { p: 7, r: 0, t: 7, e: 1, z: 0 });
 
         // ---- shadowed: host drops the covered originals off the wire ----
         reconcileFoldCoverage(session, shadowedPass(), { mode: "repair", sessionId: session.id });
-        assert.deepEqual(covOf()?.b1, { p: 0, r: 0, t: 7, e: 1 }, "ever flag survives the loss");
+        assert.deepEqual(covOf()?.b1, { p: 0, r: 0, t: 7, e: 1, z: 1 }, "ever flag survives the loss; zombie streak starts (#2695)");
         for (let i = 0; i < 3; i++) {
             recordCacheSample(session, { at: T0 + 5000 + i * 1000, input: 10000, cached: 9000 });
         }
