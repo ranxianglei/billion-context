@@ -9,7 +9,7 @@ import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, r
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
-import { applyCompactionArchive, foldCoverage, markDirty, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
+import { applyCompactionArchive, foldCoverage, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
 import { ABSORB_TOOL_NAME, IMAGE_FULL_TOOL_GOOGLE, RULE_TOOL_GOOGLE, absorbToolsFor, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressSystemPrompt, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withSummaryBudgetNote } from "../compress-tool.js";
 import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "../store.js";
@@ -24,6 +24,8 @@ import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, e
 import { estimateCoreMessages } from "../preflight.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { injectGoogleTool, injectTool } from "./inject.js";
+import { recordConflict } from "../conflict-watch.js";
+import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 
 function appendGoogleNudge(contents: GoogleContent[], text: string): GoogleContent[] {
     const last = contents[contents.length - 1];
@@ -112,6 +114,27 @@ export async function prepareGoogle(
         // config stripping — only tool availability matters.
         const rulesActive = rulesEnabled(config) && shouldInject;
         const loopConfig = ccrLoopConfig(session, { ...config, absorb: absorbActive ? absorbBlock : undefined });
+        // #2432/#2658: dsh desktop's native compaction can LAND without ever
+        // transiting bili (its summarizer calls ctx.llm.stream() directly;
+        // manual /compact / idle paths bypass the takeover gate). The openai,
+        // responses and anthropic lanes rebase onto the compacted view in-turn
+        // (#2373 pattern); before this port this wire had no recovery. Same
+        // dual-signal gate as those lanes: either signal alone stays on the
+        // existing paths (framing paste with intact history has no gap; a gap
+        // without framing is ordinary churn).
+        if (!isTitleGen && session.metadata["pluginAgent"] === "dsh" && session.state.blocks.some((b) => b.active)) {
+            const coveredBeforeDshCompact = new Set(session.state.blocks.flatMap((b) => (b.active ? b.effectiveMessageIds : [])));
+            const dshGap = foldCoverage(coveredBeforeDshCompact, msgs.map((m) => m.id));
+            if (dshGap && carriesDshLocalCompactionSummary(msgs)) {
+                const missing = dshGap.expected - dshGap.matched;
+                if (missing >= DSH_LOCAL_COMPACTION_MIN_MISSING && missing * 2 >= dshGap.expected) {
+                    recordConflict(session, "native-compaction", `dsh native compaction: ${missing}/${dshGap.expected} covered id(s) replaced by the compacted history; ACP state rebased (#2432)`);
+                    log("warn", `[${sessionId}] dsh native compaction detected (${dshGap.matched}/${dshGap.expected} covered id(s) retained, checkpoint framing in resent history) — rebasing ACP state onto the compacted history (#2432)`);
+                    markNativeCompactionBoundary(session);
+                    reconcileNativeCompactionBoundary(session);
+                }
+            }
+        }
         // [#1921] re-anchor fold coverage onto churned-but-same messages
         // before the #1195 snapshot, so covered ids surviving a client
         // re-serialization stay covered (src/fold-reconcile.ts).
