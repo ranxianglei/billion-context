@@ -310,7 +310,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `BILI_CLAUDE_UPSTREAM` | string | unset | — | Upstream pin for the claude lane. |
 | `BILI_ATTACH_HEALTH_DEADLINE_MS` | number | (built-in) | — | Deadline for attach health checks when joining an external daemon. |
 | `BILI_ATTACH_EVIDENCE_GRACE_MS` | number | (built-in) | — | Grace period for attach ownership evidence. |
-| `BILI_TOOL_TIMEOUT_MS` | number | 600000 | — | HTTP timeout for plugin tool-lane executes (`compress` etc.), shared by the pi shim and the MCP forwarder. |
+| `BILI_TOOL_TIMEOUT_MS` | number | 600000 | — | HTTP timeout for plugin tool-lane executes (compress etc.), shared by the pi shim and the MCP forwarder. |
 | `BILI_PROVIDER_REWRITES` | string | unset | — | Provider URL rewrite rules applied before routing. |
 | `BILI_MCP_PROXY` | string | unset | — | Spawn channel: MCP proxy target for plugin-hosted tools. |
 | `BILI_PARENT_PID` | number | unset | — | Spawn channel: parent process id for lifecycle supervision. |

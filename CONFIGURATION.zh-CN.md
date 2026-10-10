@@ -310,7 +310,7 @@
 | `BILI_CLAUDE_UPSTREAM` | string | unset | — | claude 车道的上游钉死。 |
 | `BILI_ATTACH_HEALTH_DEADLINE_MS` | number | (built-in) | — | 挂接外部守护进程时健康检查的截止时间。 |
 | `BILI_ATTACH_EVIDENCE_GRACE_MS` | number | (built-in) | — | 挂接归属证据的宽限期。 |
-| `BILI_TOOL_TIMEOUT_MS` | number | 600000 | — | 插件工具车道（`compress` 等）的 HTTP 超时，pi 垫片与 MCP 转发器共用。 |
+| `BILI_TOOL_TIMEOUT_MS` | number | 600000 | — | 插件工具车道（compress 等）的 HTTP 超时，pi 垫片与 MCP 转发器共用。 |
 | `BILI_PROVIDER_REWRITES` | string | unset | — | 路由前应用的 provider URL 重写规则。 |
 | `BILI_MCP_PROXY` | string | unset | — | 派生通道：插件宿主工具的 MCP 代理目标。 |
 | `BILI_PARENT_PID` | number | unset | — | 派生通道：父进程 id，用于生命周期监管。 |
