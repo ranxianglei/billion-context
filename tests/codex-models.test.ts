@@ -6,10 +6,13 @@ process.env.NODE_ENV = "test";
 import {
     CODEX_FALLBACK_CONTEXT_WINDOW,
     _resetCodexTableForTest,
+    _resetLocalCodexSourceForTest,
     _setCodexTableForTest,
+    _setLocalCodexSourceForTest,
     codexAlignedWindow,
     codexWindowForModel,
     isCodexClient,
+    localCodexPerceivedWindow,
     type CodexModelEntry,
 } from "../src/codex-models.ts";
 
@@ -117,5 +120,130 @@ test("test hooks: caller mutation after set does not leak into the table (#1953)
         assert.equal(codexWindowForModel("caller-model"), 12_345, "table holds its own copies of entries");
     } finally {
         _resetCodexTableForTest();
+    }
+});
+
+// #2593: a codex NEW model missing from the release-time bundled snapshot used
+// to clamp to the 272K unknown-model fallback even though THIS codex perceives
+// its real window — under-clamping long sessions into unnecessary preflight
+// compaction / 502. For a LOCAL peer (loopback) the proxy now aligns to its own
+// CODEX_HOME live cache/base-config; remote peers keep the bundled fallback.
+
+const CODEX_LOCAL_UA = { "user-agent": CODEX_UA };
+
+test("#2593 exact repro: live cache raises an unknown slug from 272K to its real window", () => {
+    try {
+        // min(config 1048576, max 872000) * 95% = 828400 — the issue's verified number
+        _setLocalCodexSourceForTest({
+            entries: [{ slug: "gpt-6.1-sol", contextWindow: 373_000, maxContextWindow: 872_000, effectiveContextWindowPercent: 95 }],
+            configContextWindow: 1_048_576,
+        });
+        assert.equal(localCodexPerceivedWindow("gpt-6.1-sol"), 828_400);
+        // LOCAL peer: bili 1.05M is capped at codex's real 828400, not the 272K floor
+        assert.deepEqual(codexAlignedWindow(1_050_000, "gpt-6.1-sol", CODEX_LOCAL_UA, { localPeer: true }),
+            { limit: 828_400, clamped: true });
+        // REMOTE peer (no localPeer): same request still falls to the 272K fallback
+        assert.deepEqual(codexAlignedWindow(1_050_000, "gpt-6.1-sol", CODEX_LOCAL_UA),
+            { limit: 272_000, clamped: true }, "remote proxy must not read this host's cache");
+        // non-codex client: never touched regardless of localPeer
+        assert.deepEqual(codexAlignedWindow(1_050_000, "gpt-6.1-sol", { "user-agent": "node-fetch/3.1" }, { localPeer: true }),
+            { limit: 1_050_000, clamped: false });
+    } finally {
+        _resetLocalCodexSourceForTest();
+    }
+});
+
+test("#2593 no base-config override: context_window × percent applies", () => {
+    try {
+        _setLocalCodexSourceForTest({ entries: [{ slug: "m-noovr", contextWindow: 373_000, effectiveContextWindowPercent: 95 }] });
+        assert.equal(localCodexPerceivedWindow("m-noovr"), Math.floor(373_000 * 95 / 100));
+    } finally {
+        _resetLocalCodexSourceForTest();
+    }
+});
+
+test("#2593 override clamps DOWN to max_context_window (min semantics preserved)", () => {
+    try {
+        _setLocalCodexSourceForTest({
+            entries: [{ slug: "m-clampdown", contextWindow: 272_000, maxContextWindow: 100_000 }],
+            configContextWindow: 1_048_576,
+        });
+        assert.equal(localCodexPerceivedWindow("m-clampdown"), 100_000, "override above max clamps to max");
+    } finally {
+        _resetLocalCodexSourceForTest();
+    }
+});
+
+test("#2593 override RAISES perception up to max (below max), matching codex", () => {
+    try {
+        _setLocalCodexSourceForTest({
+            entries: [{ slug: "m-raise", contextWindow: 100_000, maxContextWindow: 872_000 }],
+            configContextWindow: 500_000,
+        });
+        assert.equal(localCodexPerceivedWindow("m-raise"), 500_000, "override below max applies directly");
+    } finally {
+        _resetLocalCodexSourceForTest();
+    }
+});
+
+test("#2593 override with entry lacking max_context_window applies fully", () => {
+    try {
+        _setLocalCodexSourceForTest({
+            entries: [{ slug: "m-nomax", contextWindow: 100_000 }],
+            configContextWindow: 700_000,
+        });
+        assert.equal(localCodexPerceivedWindow("m-nomax"), 700_000);
+    } finally {
+        _resetLocalCodexSourceForTest();
+    }
+});
+
+test("#2593 model absent from live cache falls back to the bundled snapshot", () => {
+    try {
+        _setLocalCodexSourceForTest({ entries: [{ slug: "other-model", contextWindow: 12_345 }] });
+        assert.equal(localCodexPerceivedWindow("gpt-5.5"), undefined, "no local match → undefined");
+        assert.deepEqual(codexAlignedWindow(400_000, "gpt-5.5", CODEX_LOCAL_UA, { localPeer: true }),
+            { limit: 272_000, clamped: true }, "falls through to bundled gpt-5.5=272K");
+    } finally {
+        _resetLocalCodexSourceForTest();
+    }
+});
+
+test("#2593 null live source (no usable cache/config) keeps the bundled fallback", () => {
+    try {
+        _setLocalCodexSourceForTest(null);
+        assert.equal(localCodexPerceivedWindow("gpt-6.1-sol"), undefined);
+        assert.deepEqual(codexAlignedWindow(1_050_000, "gpt-6.1-sol", CODEX_LOCAL_UA, { localPeer: true }),
+            { limit: 272_000, clamped: true });
+    } finally {
+        _resetLocalCodexSourceForTest();
+    }
+});
+
+test("#2593 live cache uses the same match discipline as the bundled table", () => {
+    try {
+        _setLocalCodexSourceForTest({ entries: [{ slug: "gpt-6.1", contextWindow: 500_000, effectiveContextWindowPercent: 90 }] });
+        // namespaced-suffix retry (custom/gpt-6.1 → gpt-6.1)
+        assert.equal(localCodexPerceivedWindow("custom/gpt-6.1"), Math.floor(500_000 * 90 / 100));
+        _setLocalCodexSourceForTest({ entries: [{ slug: "gpt-6", contextWindow: 300_000 }, { slug: "gpt-6.1", contextWindow: 400_000 }] });
+        // longest-prefix wins (gpt-6.1 over gpt-6)
+        assert.equal(localCodexPerceivedWindow("gpt-6.1-sol"), 400_000);
+        _setLocalCodexSourceForTest({ entries: [{ slug: "m-pct", contextWindow: 250_000 }] });
+        // percent absent → 100%
+        assert.equal(localCodexPerceivedWindow("m-pct"), 250_000);
+    } finally {
+        _resetLocalCodexSourceForTest();
+    }
+});
+
+test("#2593 re-injection replaces the previous source; reset clears it", () => {
+    try {
+        _setLocalCodexSourceForTest({ entries: [{ slug: "m-a", contextWindow: 111_111 }] });
+        assert.equal(localCodexPerceivedWindow("m-a"), 111_111);
+        _setLocalCodexSourceForTest({ entries: [{ slug: "m-b", contextWindow: 222_222 }] });
+        assert.equal(localCodexPerceivedWindow("m-b"), 222_222);
+        assert.equal(localCodexPerceivedWindow("m-a"), undefined, "new injection replaces the old");
+    } finally {
+        _resetLocalCodexSourceForTest();
     }
 });

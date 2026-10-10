@@ -516,19 +516,22 @@ export async function handle(
             }
             if (routeKey === undefined && providerKeys.length > 0) warnRouteMissIfNew(diagOrigin, model, providerKeys, log);
             resolvedNativeWindow = native;
-            // #321 PR-E1: a codex client carries its OWN window perception
-            // (bundled model table + 272K unknown-model fallback) and
+            // #321 PR-E1: a codex client carries its OWN window perception and
             // auto-compacts at 90% of it. If bili's budget exceeds what codex
             // believes, codex's native compaction fires first — the #292
-            // misalignment. Cap the effective window at codex's perception.
+            // misalignment. Cap the effective window at codex's perception. For a
+            // LOCAL codex peer (loopback) with no fresher report that perception
+            // is read from this proxy's own CODEX_HOME live cache/base-config
+            // (#2593); otherwise the release-time bundled table + 272K fallback.
             // An operator's explicit compress.modelContextLimit is exempt
             // (operator tuning is owned by the operator — never floored and
             // never clamped); the clamped value is authoritative for this
             // client (codex's own config), so it also clears the
             // low-confidence fallback flag.
+            const localPeer = isLoopbackAddress(req.socket.remoteAddress);
             const aligned = operatorWindowTuned
                 ? { limit: reqConfig.modelContextLimit, clamped: false }
-                : codexAlignedWindow(reqConfig.modelContextLimit, model, req.headers);
+                : codexAlignedWindow(reqConfig.modelContextLimit, model, req.headers, { localPeer });
             if (aligned.clamped) {
                 const before = reqConfig.modelContextLimit;
                 reqConfig = { ...reqConfig, modelContextLimit: aligned.limit };
