@@ -339,7 +339,7 @@ export async function fetchStaleNotice(proxyBase: string): Promise<string | unde
     const runningCommit = typeof s.commit === "string" && s.commit.length > 0 ? s.commit : undefined;
     const tail = s.autoRestartOnUpdate === true
         ? " — auto-restart is enabled but did not fire this cycle; check the bili log"
-        : " — restart the host to activate (or enable --auto-restart-on-update)";
+        : " — restart the host to activate (or enable autoRestartOnUpdate)";
     return `⚠️ billion-context is stale: running v${running}${runningCommit ? ` (${runningCommit})` : ""} but v${installed} is installed${tail}.`;
 }
 

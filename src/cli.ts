@@ -143,7 +143,7 @@ Options (override config file / env):
   --passthrough                    forward without compression
   --no-passthrough                 force compression on (overrides config)
   --no-auto-update                 disable background self-update this run
-  --auto-restart-on-update         self-restart when a newer version is already installed on disk (default off)
+  --auto-restart-on-update         self-restart when a newer version is already installed on disk (default: off for manual start, on for host-spawned lanes)
 
 Config: ${defaultConfigFile()}
   Set port/host/debug/providers/compress/autoUpdate there. See README §Configuration.
