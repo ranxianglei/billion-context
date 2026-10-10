@@ -145,7 +145,10 @@ async function post(rig: Rig, session: string, messages: Array<{ role: string; c
 const DRAIN = "First-sight digestion";
 const BATCHED = "ONE batched compress call";
 const STAGED = "Smooth-transition guidance";
-const NUDGE_HINT = "ONE call, ONE string"; // rides every rendered nudge (ONE_CALL_HINT)
+// Probes ONE_CALL_HINT's opening clause — it rides the strong-alert voice
+// (usage ≥ maxContextLimitPct renders as the alert form, not the gentle 💡
+// line). #2587 rewrote the old "ONE call, ONE string" framing.
+const NUDGE_HINT = "fold every range you keep into a single compress call";
 
 async function closeRig(rig: Rig): Promise<void> {
     rig.proxy.close();

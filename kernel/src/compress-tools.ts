@@ -95,8 +95,10 @@ export const COMPRESS_PARAMETERS = {
       description: "Optional short title for the compressed range",
     },
     content: {
-      description:
-        "One or more ranges to compress into separate summary blocks. PREFERRED (multi-range batch): ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (plain text survives lossy gateways best; a JSON-encoded array as that string is also accepted). Array form: one entry per range — a line-form string or an object {startId,endId,summary,topic?}. Batch multiple ranges into ONE call — do not split into one call per range. REQUIRED unless the flat single-range form is used.",
+      // #2587/#2579: strict-JSON contract wording (the old "no JSON escaping"
+      // + unquoted-header framing induced malformed tool calls). Kept
+      // byte-identical to the host-side override in PR #2588 — do not drift.
+      description: `One or more ranges to compress into separate summary blocks. A valid JSON value: EITHER an array (PREFERRED) of {startId,endId,summary,topic?} entries — one per range — OR ONE string holding ALL ranges (each block: its mNNNNN–mNNNNN optional-topic header line, then its summary markdown). The strict JSON rule applies to both forms: every string is wrapped in double quotes, and inside any string a double quote is written \\" and a newline is written \\n — in the ONE-string form the header lines and markdown sit INSIDE that single quoted value. Batch multiple ranges into ONE call. REQUIRED unless the flat single-range form is used.`,
       anyOf: [
         {
           type: "array",
@@ -104,8 +106,7 @@ export const COMPRESS_PARAMETERS = {
             anyOf: [
               {
                 type: "string",
-                description:
-                  "Line form: first line 'm00150–m00220 optional topic', remaining lines the summary markdown, verbatim (no JSON escaping). A single string may carry MULTIPLE ranges — each block starts with its own refs header line",
+                description: `Line form (a string entry inside the content array): first line 'm00150–m00220 optional topic', remaining lines the summary markdown — the entry is still a quoted JSON string value: internal double quotes written \\", newlines written \\n. A single string may carry MULTIPLE ranges — each block starts with its own refs header line`,
               },
               {
                 ...COMPRESS_RANGE_OBJECT,
@@ -149,8 +150,7 @@ export const COMPRESS_PARAMETERS = {
 
 export const COMPRESS_TOOL = {
   name: COMPRESS_TOOL_NAME,
-  description:
-    "Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. PREFERRED form: content = ONE plain string holding ALL ranges — each block starts with its 'm00150–m00220 optional topic' header line followed by that block's summary (no JSON structure, no escaping; a JSON-encoded array as that string is also accepted for gateways that stringify arrays). Also accepted: object entries {startId,endId,summary,topic?} in the content array, and a flat single-range call {startId,endId,summary,topic?} without content. Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed. REQUIRED — compress without content or flat range fields is invalid.",
+  description: `Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. Your arguments are parsed as STRICT JSON before anything runs — an unquoted value, or an unescaped quote/newline inside any string, fails the whole call. PREFERRED form: content = an array of objects, one entry per range: {"content":[{"startId":"m00122","endId":"m00127","summary":"...","topic":"..."}]}. Also accepted: content = ONE string holding ALL ranges — each block starts with its m00150–m00220 optional-topic header line followed by that block's summary markdown — but that value is STILL a quoted JSON string (header lines and markdown inside the quotes, internal double quotes written \\", newlines written \\n); and a flat single-range call {startId,endId,summary,topic?} without content. Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed. REQUIRED — compress without content or flat range fields is invalid.`,
   input_schema: COMPRESS_PARAMETERS,
 };
 
@@ -252,7 +252,7 @@ Each message in the conversation is annotated with a <acp tokens="2.1K" type="to
 
 You have five context-management tools:
 
-- compress — Replace consumed conversation ranges with self-contained summaries you write. ONE call carries EVERY range: compress({ content: "m00150–m00220 Auth\\nsummary…\\nm00300–m00350 Deploy\\nsummary…" }) — one plain string, one block per range, each block starting with its 'mNNNNN–mNNNNN optional topic' header line followed by that block's summary (plain text survives lossy gateways best). A single range is the same shape with one block. Object entries {startId,endId,summary,topic?} in the content array are also accepted. Never split a batch into one call per range.
+- compress — Replace consumed conversation ranges with self-contained summaries you write. Your arguments are parsed as STRICT JSON before anything runs — an unquoted value, or an unescaped quote/newline inside any string, fails the whole call. PREFERRED form: content = an array of objects, one entry per range: compress({ content: [{startId:"m00150", endId:"m00220", summary:"...", topic:"..."}] }). Also accepted: content = ONE quoted JSON string holding ALL ranges — each block starts with its m00150–m00220 optional-topic header line followed by that block's summary markdown, all INSIDE the quotes (internal double quotes written \\", newlines written \\n); a single range is the same shape with one entry; and a flat single-range call {startId,endId,summary,topic?} without content. Batch multiple ranges into ONE call — do not split into one call per range.
 - decompress — Restore a previously compressed block's content. By default restores one tier up (T2→T1 summaries, not raw messages). Use full: true to restore all the way to original messages. Use toFile to write to file instead of inflating context. Example: decompress({ blockId: "b5" }) or decompress({ blockId: "b5", toFile: "path" }) or decompress({ blockId: "b5", full: true }).
 - search_context — Search compressed block summaries (and optionally visible messages) by keyword. Use BEFORE decompressing to find the right block. Example: search_context({ query: "auth token refresh" }).
 - acp_status — Context status with compressible ranges. No args = overview + ranges. Use to find what to compress next.`,
@@ -669,8 +669,8 @@ export const COMPRESS_TOOL_GOOGLE = {
   description: COMPRESS_TOOL.description,
   // `anyOf` is rejected by older API revisions, so `content` declares the
   // object form; a JSON-encoded string of that array is still accepted by
-  // parseCompressInput, and the line form (a summary whose first line is
-  // 'm00150–m00220 optional topic') is documented in the description.
+  // parseCompressInput (#2587: the strict-JSON escaping contract lives in the
+  // description itself).
   parameters: {
     type: "object",
     properties: {
@@ -680,8 +680,7 @@ export const COMPRESS_TOOL_GOOGLE = {
       },
       content: {
         type: "array",
-        description:
-          "One or more ranges to compress into separate summary blocks. Object form: {startId,endId,summary,topic?}. A JSON-encoded string of that array is also accepted; in the line form the summary begins with its own first line 'm00150–m00220 optional topic', the rest being the summary markdown verbatim. REQUIRED — compress without content is invalid.",
+        description: `One or more ranges to compress into separate summary blocks — an array of {startId,endId,summary,topic?}, one entry per range. Your arguments are parsed as strict JSON: every string is wrapped in double quotes, and inside any string a double quote is written \\" and a newline is written \\n. A JSON-encoded string of that array is also accepted (the same escaping rules apply inside it). REQUIRED — compress without content is invalid.`,
         items: {
           type: "object",
           properties: {

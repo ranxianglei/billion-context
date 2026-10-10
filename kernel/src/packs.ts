@@ -186,7 +186,7 @@ const LEAN_TOOL_PROMPTS: ToolPrompts = {
       "Replace consumed conversation ranges with self-contained summaries using mNNNNN or bN refs; batch multiple ranges into ONE call (a single string may hold every range).",
     paramDescriptions: {
       content:
-        "ONE plain string holding ALL ranges — one block per range, first line 'm00150–m00220 optional topic', remaining lines the summary markdown; object entries in the content array also accepted.",
+        "One or more ranges — an array of {startId,endId,summary,topic?} entries (PREFERRED) or ONE quoted JSON string holding every range (each block: its mNNNNN–mNNNNN optional-topic header line, then its summary markdown, INSIDE the quotes). Strict JSON: inside any string a double quote is written \\\", a newline is written \\n.",
       startId: "Inclusive first mNNNNN or bN ref.",
       endId: "Inclusive last mNNNNN or bN ref.",
       summary: "Self-contained replacement preserving exact technical details.",

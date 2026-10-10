@@ -242,8 +242,12 @@ function compact(parts: string[]): string[] {
  *  to-do list (eroding the model's own judgment on WHAT to fold), and leaked
  *  onto query-only surfaces (acp_status). So the reminder is now ONE static
  *  line — never expanded, never range-aware, identical for every nudge. */
+// #2587/#2579: rewritten for the strict-JSON contract — the old framing
+// (unquoted 'm00150–m00220 topic' header exemplar, "ONE string" preference)
+// is what models copied into malformed tool calls. Static-line discipline
+// from #2302 unchanged: one line, never range-aware.
 export const ONE_CALL_HINT =
-  "ONE call, ONE string — fold every range you keep into a single compress call: content entries ({startId, endId, summary, topic?}) or one plain string holding one block per range ('m00150–m00220 topic' header line, then the summary). Ranges you still need can wait — they reappear in later nudges; never split the batch across separate calls.";
+  `ONE call — fold every range you keep into a single compress call: content as an OBJECT ARRAY ({"content":[{"startId":"m00150","endId":"m00220","summary":"...","topic":"..."}]}) or ONE quoted JSON string holding every range (each block: its m00150–m00220 topic header line, then that block's summary — all INSIDE the quotes, internal double quotes written \\", newlines written \\n). Ranges you still need can wait — they reappear in later nudges; never split the batch across separate calls.`;
 
 export function renderNudgeText(
   decision: NudgeDecision,
@@ -324,7 +328,7 @@ export function renderNudgeText(
       rangesStr,
       ...(blockMapStr ? ["", blockMapStr] : []),
       "",
-      `💡 If you compress, fold the ranges you keep in ONE call — pass multiple content entries (\`content: [{...}, {...}]\`) or ONE plain string holding every range, each block starting with its 'mNNNNN–mNNNNN topic' header line (most robust through lossy gateways). Ranges the task still needs can wait — they reappear in later nudges.`,
+      `💡 If you compress, fold the ranges you keep in ONE call — pass multiple content entries (\`content: [{...}, {...}]\`) or ONE quoted JSON string holding every range, each block starting with its mNNNNN–mNNNNN topic header line INSIDE the quotes (internal double quotes written \\\", newlines written \\n). Ranges the task still needs can wait — they reappear in later nudges.`,
     ]).join("\n"),
   };
 }
