@@ -20,7 +20,7 @@ const SUMMARY = "The preceding work is summarized here with all decisions and re
 // apply time every message of that positional span is either covered by an active block or
 // carved out as a live carrier -> structurally empty -> permanent "no new compressible
 // messages" rejection loop (#2638).
-export async function buildDeadSpanFixture() {
+async function buildDeadSpanFixture() {
     const core = createCore();
     const config = defaultConfig(1_000_000);
     config.preserveRecentMessages = 0;
