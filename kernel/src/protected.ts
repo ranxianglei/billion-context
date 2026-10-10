@@ -325,18 +325,19 @@ export function isMessageLatestProtected(
 
 /** Wire-sidecar fields carrying media/attachment payloads whose bytes live
  *  OUTSIDE msg.text (images, image blocks inside a structured Anthropic
- *  tool_result, or opaque file refs such as DeepSeek Files API
- *  `{type:"file"}`). Folding such a message into a summary destroys the
- *  payload permanently: hosts rebuild requests from their own history and the
- *  kernel holds no server-side archive (billion-context#1188). Typed
- *  structurally rather than as BiliMessage because core modules must not
- *  import from src/wire/. */
+ *  tool_result, opaque file refs such as DeepSeek Files API
+ *  `{type:"file"}`, or Gemini Files API URL refs `fileData`). Folding such a
+ *  message into a summary destroys the payload permanently: hosts rebuild
+ *  requests from their own history and the kernel holds no server-side
+ *  archive (billion-context#1188/#2609). Typed structurally rather than as
+ *  BiliMessage because core modules must not import from src/wire/. */
 interface MediaSidecar {
   imageBase64?: string;
   rawOpenaiContent?: unknown;
   rawOpenaiContentParts?: unknown[];
   rawAnthropicBlock?: unknown;
   rawResponsesItem?: unknown;
+  rawGoogleParts?: unknown[];
 }
 
 export function hasMediaPayload(msg: CoreMessage): boolean {
@@ -367,7 +368,35 @@ export function hasMediaPayload(msg: CoreMessage): boolean {
       return content.some((p) => isObjWith(p, "type", "input_image"));
     }
   }
+  // rawGoogleParts rides EVERY google-wire core (text, thinking, tool pairs),
+  // so presence alone is not a signal — only payload part variants count.
+  // text/thought/thoughtSignature fields are metadata (KDD #10 signatures),
+  // never bytes; videoMetadata is offset metadata whose bytes ride an
+  // inlineData/fileData part of the same content.
+  if (Array.isArray(m.rawGoogleParts)) {
+    return m.rawGoogleParts.some(googlePartCarriesMedia);
+  }
   return false;
+}
+
+/** True when a Gemini Part carries byte payload outside any `text` field:
+ *  inline bytes (inlineData), Files API URL refs (fileData), or media nested
+ *  in a tool response's parts (same family as the Anthropic tool_result
+ *  check above, #366). */
+function googlePartCarriesMedia(part: unknown): boolean {
+  if (!isPlainObj(part)) return false;
+  const p = part as Record<string, unknown>;
+  if (isPlainObj(p.inlineData) || isPlainObj(p.fileData)) return true;
+  const fr = p.functionResponse;
+  if (isPlainObj(fr)) {
+    const nested = (fr as { parts?: unknown }).parts;
+    if (Array.isArray(nested)) return nested.some(googlePartCarriesMedia);
+  }
+  return false;
+}
+
+function isPlainObj(v: unknown): boolean {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
 function isObjWith(v: unknown, key: string, value: unknown): boolean {
