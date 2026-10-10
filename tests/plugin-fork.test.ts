@@ -148,10 +148,10 @@ test("HTTP exposes a versioned snapshot and forks an exact ordered prefix", asyn
     } finally { await h.close(); }
 });
 
-async function sendIntentModel(h: Awaited<ReturnType<typeof harness>>, conversationId: string, messages: unknown[], tools: unknown[], requestAgent?: string, maxTokens = 256, announcePlugin = true) {
+async function sendIntentModel(h: Awaited<ReturnType<typeof harness>>, conversationId: string, messages: unknown[], tools: unknown[], requestAgent?: string, maxTokens = 256, announcePlugin = true, pluginName = "ekko-agent") {
     const headers: Record<string, string> = { "content-type": "application/json", "x-acp-session": conversationId };
     if (announcePlugin) {
-        headers["x-bili-plugin"] = "ekko-agent";
+        headers["x-bili-plugin"] = pluginName;
         headers["x-bili-plugin-conversation"] = conversationId;
     }
     if (requestAgent !== undefined) headers["x-bili-plugin-agent"] = requestAgent;
@@ -275,6 +275,36 @@ test("HTTP protected tools keep plain-text snapshots, forks and revisions usable
         assert.equal(childSession.state.messageRefs.byRef["BLOCKED"], undefined);
         assert.ok(Object.values(childSession.state.messageRefs.byRaw).includes("BLOCKED"));
         await sendIntentModel(h, "child", [...history, { role: "assistant", content: "child continuation" }], [], "main");
+        assert.ok((await h.request("/__bili/plugin/status?conversationId=parent")).body.sessionRevision);
+    } finally { await h.close(); }
+});
+
+test("HTTP dsh-lane durable guards keep plain-text snapshots, forks and revisions usable (#2676)", async () => {
+    const h = await harness(false, false);
+    try {
+        const history = [
+            { role: "user", content: "Synthetic snapshot test" },
+            { role: "user", content: `Instructions from: /repo/AGENTS.md\n# repo rules\nbehave` },
+            { role: "assistant", content: "Starting" },
+            ...Array.from({ length: 4 }, (_, i) => ({ role: i % 2 ? "assistant" : "user", content: `tail ${i}` })),
+        ];
+        await sendIntentModel(h, "parent", history, [], "main", 256, true, "dsh");
+        const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(snapshot.status, 200, JSON.stringify(snapshot.body));
+        const refs = snapshot.body.orderedMessages.map((m) => m.ref);
+        assert.equal(refs.length, history.length);
+        assert.ok(/^m\d{5,}$/.test(refs[0]), JSON.stringify(refs));
+        // dsh durable-guard lane (#2447) pins this carrier; kernel assigns the BLOCKED sentinel.
+        assert.equal(refs[1], "BLOCKED");
+        assert.ok(refs.slice(2).every((ref) => /^m\d{5,}$/.test(ref)), JSON.stringify(refs));
+        const fork = await h.request("/__bili/plugin/fork", forkRequest(snapshot.body, "child", history.length));
+        assert.equal(fork.status, 201, JSON.stringify(fork.body));
+        const childSnap = (await h.request("/__bili/plugin/snapshot?conversationId=child")).body;
+        assert.deepEqual(childSnap.orderedMessages, snapshot.body.orderedMessages);
+        const childSession = resolveConversation("child").session!;
+        assert.equal(childSession.state.messageRefs.byRef["BLOCKED"], undefined);
+        assert.ok(Object.values(childSession.state.messageRefs.byRaw).includes("BLOCKED"));
+        await sendIntentModel(h, "child", [...history, { role: "assistant", content: "child continuation" }], [], "main", 256, true, "dsh");
         assert.ok((await h.request("/__bili/plugin/status?conversationId=parent")).body.sessionRevision);
     } finally { await h.close(); }
 });
