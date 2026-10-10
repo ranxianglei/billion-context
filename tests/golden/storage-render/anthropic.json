@@ -1,0 +1,101 @@
+{
+ "wire": "anthropic",
+ "turns": [
+  {
+   "i": 0,
+   "sha": "b1d62b56287203f79cb9b40f75d1efa19019473b6a2ed0c20d6239f146f5ca57",
+   "bytes": 22420
+  },
+  {
+   "i": 1,
+   "sha": "aa1bd54e1db4de99d074989ee7e75fbeb5ab2f98db9b75a7c177c2bed409bb39",
+   "bytes": 31130
+  },
+  {
+   "i": 2,
+   "sha": "0829f0a30db19fd55924371f16fadb5885def4c4a77071156fb5bf49e5e13fa9",
+   "bytes": 37029
+  },
+  {
+   "i": 3,
+   "sha": "74ff170ae8d98fb59a444cae6f8c365232e8fc1f9760635c1ceecc0f2c5c2e87",
+   "bytes": 45702
+  },
+  {
+   "i": 4,
+   "sha": "259469ec1c1f3fd79fdd0f6107dbb09d046bd0c11e097344bb990b4a86de6e6e",
+   "bytes": 51564
+  },
+  {
+   "i": 5,
+   "sha": "28b2eb7a8856b3d3797af5c249e95009cd88b2963daf4c608531a4c1ca808885",
+   "bytes": 60237
+  },
+  {
+   "i": 6,
+   "sha": "84e03f45435149bb70adb5633d7b5735de742b80d5ff95dee958c93455eef9de",
+   "bytes": 66099
+  },
+  {
+   "i": 7,
+   "sha": "2fe4930d1149c3f5d508e2809f39408b5e8a39bab0422880d43b87547ac6684f",
+   "bytes": 74772
+  },
+  {
+   "i": 8,
+   "sha": "3acf798ade0a6ace32d69ea43316f68b68e1662862c3adb1815cc5a85f78f899",
+   "bytes": 80634
+  },
+  {
+   "i": 9,
+   "sha": "ff693f1ec2fe0f38bcf166a11dd804668a53e30a81645ed9a2024517a9dcd70f",
+   "bytes": 50071
+  },
+  {
+   "i": 10,
+   "sha": "c1e702b0f641b4eb85755433cbafc46051ce5bfe3f14337b13958054bac9dff8",
+   "bytes": 57203
+  },
+  {
+   "i": 11,
+   "sha": "abeb81ea77affcfb756facea3541c2e44f90e16799a59c67e47b52aa8085a0f6",
+   "bytes": 63025
+  },
+  {
+   "i": 12,
+   "sha": "302f63b4e4f6be0abd1e636f1b7a2b933911e86f21fcf9f1bfe0311f41e81f3c",
+   "bytes": 77163
+  },
+  {
+   "i": 13,
+   "sha": "4a921227e6943db65985e770feb6bd7c5a23e555267cb7f4d070ff20e48f0cbe",
+   "bytes": 82948
+  },
+  {
+   "i": 14,
+   "sha": "23d3b9f0eafdce3bdb1ffa3c12e42bf43d2d079add47dddebbe183cb1310c522",
+   "bytes": 91597
+  }
+ ],
+ "foldAt": 9,
+ "editedAt": 12,
+ "summaryFrom": 9,
+ "stateDigest": "fcc4e6da54cad44daed5e946d7510ed46970f46124c887b97700068ee9c930cd",
+ "stateShape": {
+  "refs": 49,
+  "blocks": 1,
+  "activeBlocks": 1,
+  "deadRefs": 0,
+  "blockContents": 1,
+  "coveredRefSample": [
+   "h_e40995eea3f07d55",
+   "h_5e8c02240a65740e",
+   "h_3926874d9d58f065",
+   "h_0fd8e3acc55625ec",
+   "h_b5b946fa2455d77e",
+   "h_e40995eea3f07d55_1",
+   "h_ce9559b8e1773afc",
+   "h_e40995eea3f07d55_2"
+  ]
+ }
+}
