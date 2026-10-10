@@ -16,6 +16,7 @@ import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveT
 import { applyImageCompressionPass, imageCompressionEnabled, imageFullTrailingNote } from "../image-compress.js";
 import { rulesEnabled, storeEffectiveRules } from "../rules-feature.js";
 import { autoFoldEngaged, externalSummaryEnabled, growthFoldingArmed } from "../external-summary-surface.js";
+import { filterDeadRanges } from "../dead-ranges.js";
 import { attachSubagentSessions } from "../subagent-sessions.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
 import { stripAcpPanelMessages, stripAcpStatusMarkers } from "../acp-panel.js";
@@ -138,7 +139,8 @@ export async function prepareGoogle(
         turn.messages = attachSubagentSessions(turn.messages, session);
         // Drop sub-viability fragments before any consumer sees them (the
         // kernel validates a compress batch atomically).
-        if (turn.nudge) turn.nudge.compressibleRanges = viableRanges(turn.nudge.compressibleRanges);
+        // #2638: also drop remembered structurally-dead spans — a nudge advertising them steers the model into an atomically-refused compress call.
+        if (turn.nudge) turn.nudge.compressibleRanges = filterDeadRanges(session, viableRanges(turn.nudge.compressibleRanges));
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         session.stats.contextTokensSource = tokenCountSource;

@@ -22,6 +22,7 @@ import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveT
 import { applyImageCompressionPass, imageCompressionEnabled, imageFullTrailingNote } from "../image-compress.js";
 import { rulesEnabled, storeEffectiveRules } from "../rules-feature.js";
 import { autoFoldEngaged, externalSummaryEnabled, growthFoldingArmed } from "../external-summary-surface.js";
+import { filterDeadRanges } from "../dead-ranges.js";
 import { attachSubagentSessions } from "../subagent-sessions.js";
 import { estimateCoreMessages, estimateCoreMessagesUpper } from "../preflight.js";
 import { hoistTrappedToolItems } from "../tool-pair-order.js";
@@ -265,7 +266,8 @@ export async function prepareResponses(
         // Drop sub-viability fragments before any consumer sees them: a tiny
         // range in the list makes batched compress attempts fail atomically
         // (kernel validates the whole batch). Mirrors billion-context-pi.
-        if (turn.nudge) turn.nudge.compressibleRanges = viableRanges(turn.nudge.compressibleRanges);
+        // #2638: also drop remembered structurally-dead spans — a nudge advertising them steers the model into an atomically-refused compress call.
+        if (turn.nudge) turn.nudge.compressibleRanges = filterDeadRanges(session, viableRanges(turn.nudge.compressibleRanges));
         nudge = turn.nudge;
         session.stats.contextTokens = tokenCount;
         session.stats.contextTokensSource = tokenCountSource;
