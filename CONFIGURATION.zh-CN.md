@@ -803,8 +803,8 @@
   "fakeCompletion": { "retries": 0, "bufCapBytes": 16777216 },
 
   // 标量
-  "codexCompact": "intercept",            // 或 "pass"
-  "ccrRetrievalTtlMs": 600000,            // 排队 acp_retrieve 的过期时限；0 禁用
+   "codexCompact": "intercept",            // 或 "pass"
+   "ccrRetrievalTtlMs": 600000,            // 排队 acp_retrieve 的过期时限；0 禁用
   "decompressTmpCap": 50                  // 并发 decompress 临时文件上限
 }
 ```
@@ -860,8 +860,8 @@
 
 ### `codexCompact` / `ccrRetrievalTtlMs` / `decompressTmpCap`
 
-- **类型：** `string`（"intercept" | "pass"）/ `number` / `number`
-- **默认：** `"intercept"` / `600000` / `50`
+- **类型：** `string` ("intercept" | "pass") / `string` ("intercept" | "pass") / `number` / `number`
+- **默认值：** `"intercept"` / `"intercept"` / `600000` / `50`
 - **状态：** ACTIVE
 - **说明：** 顶层标量。`codexCompact`：bili 是否拦截 codex 原生 compaction 请求并本地伪造 ACP 交接，还是放行到上游（对应 `BILI_CODEX_COMPACT`；按请求读取，两层任一改动都无需重启）。`ccrRetrievalTtlMs`：排队未送达的 `acp_retrieve` 注入的过期时限，过期大声丢弃（对应 `BILI_CCR_RETRIEVAL_TTL_MS`；`0` 禁用）。`decompressTmpCap`：并发 decompress 临时文件上限（对应 `BILI_DECOMPRESS_TMP_CAP`）。
 

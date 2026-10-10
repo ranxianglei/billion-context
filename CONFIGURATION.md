@@ -803,8 +803,8 @@ Since #2030 every pure-behavior knob has a config-file key alongside its env var
   "fakeCompletion": { "retries": 0, "bufCapBytes": 16777216 },
 
   // Scalars
-  "codexCompact": "intercept",            // or "pass"
-  "ccrRetrievalTtlMs": 600000,            // queued acp_retrieve expiry; 0 disables
+   "codexCompact": "intercept",            // or "pass"
+   "ccrRetrievalTtlMs": 600000,            // queued acp_retrieve expiry; 0 disables
   "decompressTmpCap": 50                  // max concurrent decompress temp files
 }
 ```
@@ -860,8 +860,8 @@ Since #2030 every pure-behavior knob has a config-file key alongside its env var
 
 ### `codexCompact` / `ccrRetrievalTtlMs` / `decompressTmpCap`
 
-- **Type:** `string` ("intercept" | "pass") / `number` / `number`
-- **Default:** `"intercept"` / `600000` / `50`
+- **Type:** `string` ("intercept" | "pass") / `string` ("intercept" | "pass") / `number` / `number`
+- **Default:** `"intercept"` / `"intercept"` / `600000` / `50`
 - **Status:** ACTIVE
 - **Description:** Top-level scalars. `codexCompact`: whether bili intercepts codex native-compaction requests and forges a local ACP handoff, or passes them upstream (twin `BILI_CODEX_COMPACT`; read per request, so either tier flips without restart). `ccrRetrievalTtlMs`: expiry for queued-but-undelivered `acp_retrieve` injections, dropped loudly on expiry (twin `BILI_CCR_RETRIEVAL_TTL_MS`; `0` disables). `decompressTmpCap`: max concurrent decompress temp files (twin `BILI_DECOMPRESS_TMP_CAP`).
 
@@ -1763,6 +1763,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
  | `BILI_CLAUDE_UPSTREAM` | claude direct mode: your relay endpoint, when `ANTHROPIC_BASE_URL` already points at a relay the launcher would otherwise bypass. |
  | `BILI_CLAUDE_NATIVE_PORT` | Pin an **exact** port for the claude native lane's hook-spawned proxy (#964/#1660): strict-port semantics — a squatter on the port is refused loudly instead of hopping — and the baked managed `ANTHROPIC_BASE_URL` points at it. Without it the hook rides the self-managed zone (`BILI_ZONE_PORT` base + per-lane sticky) and re-pins the managed URL to the live origin each session, so port drift self-heals (#1660). |
 | `BILI_CODEX_COMPACT` | Codex native-compaction handling. Default `intercept`: bili intercepts codex's compaction requests and forges a local handoff to the ACP state when the safety gate passes (transform ok + steady-state usage < 90% of the window + at least one active compressed block) — trigger form forges a 2-frame SSE, endpoint form forges `{output}` — and never contacts upstream. Forged ACP summaries are re-injected as a history-borne handoff message (developer-message fallback) so compressed content stays visible after codex truncates its history. Set `pass` to opt out and forward codex's compaction requests upstream (native compaction backstops). On any gate failure the request passes through untouched. Codex client detection (which traffic this applies to, also used for window clamping and session-identity fingerprinting): the User-Agent must either start with a registered prefix (`codex_cli_rs/`, `codex_exec/`, `codex desktop/` — matched case-insensitively, since variants like Codex Desktop send an initial capital, #1169) or contain a whitespace-delimited component starting with lowercase `codex` (unknown variants such as `codex_sdk_ts/…`, #645 — narrowed from a bare substring to a token-level prefix in #1641 so non-codex clients whose UAs merely mention "codex" mid-token or in parens are no longer misclassified; the fallback stays case-sensitive on purpose so "Codex"-shaped relays are excluded, #1106). |
+
 
 ---
 
