@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
-import { ACP_READONLY_TOOLS_RESPONSES, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, DECOMPRESS_TOOL_NAME, SEARCH_CONTEXT_TOOL_NAME, createCore, createInitialState, defaultConfig } from "acp-kernel";
+import { ACP_READONLY_TOOLS_RESPONSES, ACP_TOOLS_ANTHROPIC, ACP_TOOLS_OPENAI, ACP_TOOLS_RESPONSES, COMPRESS_TOOL_NAME, DECOMPRESS_TOOL_NAME, SEARCH_CONTEXT_TOOL_NAME, createCore, createInitialState, defaultConfig } from "acp-kernel";
 import { anthropicToCore, type AnthropicRequestBody } from "acp-kernel/wire";
 import { BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_RESPONSES } from "../src/compress-tool.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
@@ -107,8 +107,16 @@ test("#841 schema: BILI arrays no longer add conversation_id to search_context (
         const decRequired = paramsOf(biliDec).required as string[] | undefined;
         assert.ok(!decRequired?.includes("startId") && !decRequired?.includes("endId"), "range args must stay optional");
 
-        const biliRest = bili.filter((t) => t !== entry && nameOf(t) !== DECOMPRESS_TOOL_NAME);
-        const kernelRest = kernel.filter((t) => t !== kernelEntry && nameOf(t) !== DECOMPRESS_TOOL_NAME);
+        // #2579: compress intentionally diverges in every shape — host-side strict-JSON serialization guidance (exact text pinned in tests/compress-json-surface.test.ts)
+        const descOf = (e: FlatTool): string => (e.function ? e.function.description ?? "" : e.description ?? "");
+        const biliCmp = bili.find((t) => nameOf(t) === COMPRESS_TOOL_NAME) as FlatTool | undefined;
+        const kernelCmp = kernel.find((t) => nameOf(t) === COMPRESS_TOOL_NAME) as FlatTool | undefined;
+        assert.ok(biliCmp && kernelCmp, `compress missing in ${shape} array`);
+        assert.ok(descOf(biliCmp!).includes("STRICT JSON"), "#2579: bili compress advertises the strict-JSON contract");
+        assert.ok(!descOf(kernelCmp!).includes("STRICT JSON"), "kernel default compress description stays untouched");
+
+        const biliRest = bili.filter((t) => t !== entry && nameOf(t) !== DECOMPRESS_TOOL_NAME && nameOf(t) !== COMPRESS_TOOL_NAME);
+        const kernelRest = kernel.filter((t) => t !== kernelEntry && nameOf(t) !== DECOMPRESS_TOOL_NAME && nameOf(t) !== COMPRESS_TOOL_NAME);
         assert.deepEqual(biliRest, kernelRest, "no other tool may change");
     }
     const ro = searchEntry(BILI_ACP_READONLY_TOOLS_RESPONSES, "flat")!;
