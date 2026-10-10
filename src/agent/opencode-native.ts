@@ -66,7 +66,7 @@
 //     (written by the config hook, same as the launcher/installer) is the
 //     owner-switch; no compaction-prompt surgery needed.
 
-import { ACP_TOOLS_OPENAI } from "../compress-tool.js";
+import { ACP_TOOLS_OPENAI, BILI_COMPRESS_TOOL_OPENAI, COMPRESS_TOOL_NAME } from "../compress-tool.js";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, unwrapUpstream, wrapUpstream } from "../launcher.js";
 import { createAcpCommandHooks, showAcpText } from "./opencode-acp-command.js";
 import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
@@ -695,7 +695,8 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
         } else {
             const tools: Record<string, V1Tool> = {};
             if (deps.z !== undefined) {
-                for (const t of ACP_TOOLS_OPENAI) {
+                // #2579: compress gets the strict-JSON description (host override over the kernel default).
+                for (const t of ACP_TOOLS_OPENAI.map((x) => (x.function.name === COMPRESS_TOOL_NAME ? BILI_COMPRESS_TOOL_OPENAI : x))) {
                     const fn = t.function;
                     tools[fn.name] = {
                         description: fn.description ?? fn.name,

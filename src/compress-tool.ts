@@ -46,6 +46,11 @@ import {
     ACP_DECOMPRESS_CLOSE,
     buildCompressSystemPrompt,
     buildCompressHybridSystemPrompt,
+    COMPRESS_TOOL,
+    COMPRESS_TOOL_GOOGLE,
+    COMPRESS_TOOL_NAME,
+    COMPRESS_TOOL_OPENAI,
+    COMPRESS_TOOL_RESPONSES,
     defaultPrompts,
 } from "acp-kernel";
 import type { CompressPromptSections, Prompts, SectionOverride } from "acp-kernel";
@@ -225,10 +230,71 @@ export const BILI_DECOMPRESS_TOOL_OPENAI = { type: "function" as const, function
 export const BILI_DECOMPRESS_TOOL_RESPONSES = { type: "function" as const, name: DECOMPRESS_TOOL_RESPONSES.name, description: DECOMPRESS_TOOL_RESPONSES.description + DECOMPRESS_IMAGE_NOTE, parameters: withImageRestoreParam(withRangeParams(DECOMPRESS_TOOL_RESPONSES.parameters)) };
 export const BILI_DECOMPRESS_TOOL_GOOGLE = { name: DECOMPRESS_TOOL_GOOGLE.name, description: DECOMPRESS_TOOL_GOOGLE.description + DECOMPRESS_IMAGE_NOTE, parameters: withImageRestoreParam(withRangeParams(DECOMPRESS_TOOL_GOOGLE.parameters)) };
 
-export const BILI_ACP_TOOLS_ANTHROPIC = ACP_TOOLS_ANTHROPIC.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_TOOL : t));
-export const BILI_ACP_TOOLS_OPENAI = ACP_TOOLS_OPENAI.map((t) => (t.function.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_OPENAI : t.function.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_TOOL_OPENAI : t));
-export const BILI_ACP_TOOLS_RESPONSES = ACP_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_TOOL_RESPONSES : t));
-export const BILI_ACP_TOOLS_GOOGLE = ACP_TOOLS_GOOGLE.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_GOOGLE : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_TOOL_GOOGLE : t));
+// #2579: the kernel-default compress surface wording framed the string form as
+// "plain text … no JSON structure, no escaping" with UNQUOTED ref-header
+// examples ('m00150–m00220 optional topic'). DeepSeek-class models then
+// streamed content values that are not valid JSON — ~4% of compress calls on
+// DSH desktop: bare unquoted values with real newlines, or unescaped quotes /
+// newlines inside quoted strings — and strict clients reject the tool input at
+// message_stop, failing the WHOLE turn before any host-side salvage can run.
+// The served surface now states the serialization contract explicitly: strict-
+// JSON parsing, object-array PREFERRED, every string quoted with internal \"
+// and \n escaped. The schema is untouched (anyOf array|string stays); only the
+// description text changes. The kernel defaults keep their own text until the
+// in-repo kernel lands the same change (tracked separately per Kernel
+// Boundary); these wrappers override exactly like the decompress extensions
+// above and feed BOTH lanes (wire injection via injectOpenaiTool & co, and the
+// plugin manifest → MCP tools/list).
+const COMPRESS_TOOL_DESCRIPTION_FIXED = `Replace consumed conversation ranges with self-contained summaries you write, identified by their refs. Your arguments are parsed as STRICT JSON before anything runs — an unquoted value, or an unescaped quote/newline inside any string, fails the whole call. PREFERRED form: content = an array of objects, one entry per range: {"content":[{"startId":"m00122","endId":"m00127","summary":"...","topic":"..."}]}. Also accepted: content = ONE string holding ALL ranges — each block starts with its m00150–m00220 optional-topic header line followed by that block's summary markdown — but that value is STILL a quoted JSON string (header lines and markdown inside the quotes, internal double quotes written \\", newlines written \\n); and a flat single-range call {startId,endId,summary,topic?} without content. Batch multiple ranges into ONE call — do not split into one call per range. Use when content is genuinely consumed. REQUIRED — compress without content or flat range fields is invalid.`;
+const COMPRESS_CONTENT_PARAM_FIXED = `One or more ranges to compress into separate summary blocks. A valid JSON value: EITHER an array (PREFERRED) of {startId,endId,summary,topic?} entries — one per range — OR ONE string holding ALL ranges (each block: its mNNNNN–mNNNNN optional-topic header line, then its summary markdown). The strict JSON rule applies to both forms: every string is wrapped in double quotes, and inside any string a double quote is written \\" and a newline is written \\n — in the ONE-string form the header lines and markdown sit INSIDE that single quoted value. Batch multiple ranges into ONE call. REQUIRED unless the flat single-range form is used.`;
+const COMPRESS_LINE_FORM_ITEM_FIXED = `Line form (a string entry inside the content array): first line 'm00150–m00220 optional topic', remaining lines the summary markdown — the entry is still a quoted JSON string value: internal double quotes written \\", newlines written \\n. A single string may carry MULTIPLE ranges — each block starts with its own refs header line`;
+const COMPRESS_CONTENT_PARAM_GOOGLE_FIXED = `One or more ranges to compress into separate summary blocks — an array of {startId,endId,summary,topic?}, one entry per range. Your arguments are parsed as strict JSON: every string is wrapped in double quotes, and inside any string a double quote is written \\" and a newline is written \\n. A JSON-encoded string of that array is also accepted (the same escaping rules apply inside it). REQUIRED — compress without content is invalid.`;
+
+type SchemaNode = { type?: string; description?: string; properties?: Record<string, SchemaNode>; items?: SchemaNode; anyOf?: SchemaNode[]; required?: string[] };
+
+function patchCompressParams(source: unknown): JsonSchemaObject {
+    const s = JSON.parse(JSON.stringify(source)) as SchemaNode;
+    const content = s.properties?.["content"];
+    if (content) {
+        content.description = COMPRESS_CONTENT_PARAM_FIXED;
+        for (const branch of content.anyOf ?? []) {
+            for (const alt of branch.items?.anyOf ?? []) {
+                if (alt.type === "string" && alt.description?.startsWith("Line form")) alt.description = COMPRESS_LINE_FORM_ITEM_FIXED;
+            }
+        }
+    }
+    return s as JsonSchemaObject;
+}
+
+function patchGoogleCompressParams(source: unknown): JsonSchemaObject {
+    const s = JSON.parse(JSON.stringify(source)) as SchemaNode;
+    if (s.properties?.["content"]) s.properties["content"].description = COMPRESS_CONTENT_PARAM_GOOGLE_FIXED;
+    return s as JsonSchemaObject;
+}
+
+const BILI_COMPRESS_TOOL = { name: COMPRESS_TOOL.name, description: COMPRESS_TOOL_DESCRIPTION_FIXED, input_schema: patchCompressParams(COMPRESS_TOOL.input_schema) };
+export const BILI_COMPRESS_TOOL_OPENAI = { type: "function" as const, function: { name: COMPRESS_TOOL_OPENAI.function.name, description: COMPRESS_TOOL_DESCRIPTION_FIXED, parameters: patchCompressParams(COMPRESS_TOOL_OPENAI.function.parameters) } };
+const BILI_COMPRESS_TOOL_RESPONSES = { type: "function" as const, name: COMPRESS_TOOL_RESPONSES.name, description: COMPRESS_TOOL_DESCRIPTION_FIXED, parameters: patchCompressParams(COMPRESS_TOOL_RESPONSES.parameters) };
+const BILI_COMPRESS_TOOL_GOOGLE = { name: COMPRESS_TOOL_GOOGLE.name, description: COMPRESS_TOOL_DESCRIPTION_FIXED, parameters: patchGoogleCompressParams(COMPRESS_TOOL_GOOGLE.parameters) };
+
+// #2579 companion note, appended to every rendered nudge (and the post-compress
+// tail that lists remaining ranges) — the moment the model acts on a nudge is
+// when the malformed-JSON calls happened, and the kernel-rendered nudge text
+// still carries the "plain string … header line" framing until the kernel
+// defaults change. Byte-stable constant (no dynamic values).
+export const COMPRESS_JSON_NOTE = `
+
+[JSON validity: your compress arguments are parsed as strict JSON before anything runs — an unquoted content value, or an unescaped quote/newline inside ANY string, fails the whole turn. Prefer content as an OBJECT ARRAY ({"content":[{"startId":"m00122","endId":"m00127","summary":"..."}]}) — short strings, fixed structure — or as ONE quoted string in which the mNNNNN–mNNNNN header lines and markdown sit INSIDE the quotes, internal double quotes written \\", newlines written \\n.]`;
+
+/** Append the #2579 JSON-validity reminder to rendered nudge text. */
+export function withCompressJsonNote(text: string): string {
+    return text + COMPRESS_JSON_NOTE;
+}
+
+export const BILI_ACP_TOOLS_ANTHROPIC = ACP_TOOLS_ANTHROPIC.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_TOOL : t.name === COMPRESS_TOOL_NAME ? BILI_COMPRESS_TOOL : t));
+export const BILI_ACP_TOOLS_OPENAI = ACP_TOOLS_OPENAI.map((t) => (t.function.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_OPENAI : t.function.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_TOOL_OPENAI : t.function.name === COMPRESS_TOOL_NAME ? BILI_COMPRESS_TOOL_OPENAI : t));
+export const BILI_ACP_TOOLS_RESPONSES = ACP_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_TOOL_RESPONSES : t.name === COMPRESS_TOOL_NAME ? BILI_COMPRESS_TOOL_RESPONSES : t));
+export const BILI_ACP_TOOLS_GOOGLE = ACP_TOOLS_GOOGLE.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_GOOGLE : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_TOOL_GOOGLE : t.name === COMPRESS_TOOL_NAME ? BILI_COMPRESS_TOOL_GOOGLE : t));
 
 // #1712: no-range variants — identical except decompress lacks startId/endId.
 // Served where range restore cannot be armed so the advertised schema never
@@ -238,10 +304,10 @@ const BILI_DECOMPRESS_IMG_ANTHROPIC = { name: DECOMPRESS_TOOL.name, description:
 const BILI_DECOMPRESS_IMG_OPENAI = { type: "function" as const, function: { name: DECOMPRESS_TOOL_OPENAI.function.name, description: DECOMPRESS_TOOL_OPENAI.function.description + DECOMPRESS_IMAGE_NOTE, parameters: withImageRestoreParam(DECOMPRESS_TOOL_OPENAI.function.parameters) } };
 const BILI_DECOMPRESS_IMG_RESPONSES = { type: "function" as const, name: DECOMPRESS_TOOL_RESPONSES.name, description: DECOMPRESS_TOOL_RESPONSES.description + DECOMPRESS_IMAGE_NOTE, parameters: withImageRestoreParam(DECOMPRESS_TOOL_RESPONSES.parameters) };
 const BILI_DECOMPRESS_IMG_GOOGLE = { name: DECOMPRESS_TOOL_GOOGLE.name, description: DECOMPRESS_TOOL_GOOGLE.description + DECOMPRESS_IMAGE_NOTE, parameters: withImageRestoreParam(DECOMPRESS_TOOL_GOOGLE.parameters) };
-export const BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE = ACP_TOOLS_ANTHROPIC.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_IMG_ANTHROPIC : t));
-export const BILI_ACP_TOOLS_OPENAI_NO_RANGE = ACP_TOOLS_OPENAI.map((t) => (t.function.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_OPENAI : t.function.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_IMG_OPENAI : t));
-export const BILI_ACP_TOOLS_RESPONSES_NO_RANGE = ACP_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_IMG_RESPONSES : t));
-export const BILI_ACP_TOOLS_GOOGLE_NO_RANGE = ACP_TOOLS_GOOGLE.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_GOOGLE : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_IMG_GOOGLE : t));
+export const BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE = ACP_TOOLS_ANTHROPIC.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_IMG_ANTHROPIC : t.name === COMPRESS_TOOL_NAME ? BILI_COMPRESS_TOOL : t));
+export const BILI_ACP_TOOLS_OPENAI_NO_RANGE = ACP_TOOLS_OPENAI.map((t) => (t.function.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_OPENAI : t.function.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_IMG_OPENAI : t.function.name === COMPRESS_TOOL_NAME ? BILI_COMPRESS_TOOL_OPENAI : t));
+export const BILI_ACP_TOOLS_RESPONSES_NO_RANGE = ACP_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_IMG_RESPONSES : t.name === COMPRESS_TOOL_NAME ? BILI_COMPRESS_TOOL_RESPONSES : t));
+export const BILI_ACP_TOOLS_GOOGLE_NO_RANGE = ACP_TOOLS_GOOGLE.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_GOOGLE : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_IMG_GOOGLE : t.name === COMPRESS_TOOL_NAME ? BILI_COMPRESS_TOOL_GOOGLE : t));
 export const BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE = ACP_READONLY_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_IMG_RESPONSES : t));
 export const BILI_ACP_READONLY_TOOLS_RESPONSES = ACP_READONLY_TOOLS_RESPONSES.map((t) => (t.name === SEARCH_CONTEXT_TOOL_NAME ? BILI_SEARCH_CONTEXT_TOOL_RESPONSES : t.name === DECOMPRESS_TOOL_NAME ? BILI_DECOMPRESS_TOOL_RESPONSES : t));
 

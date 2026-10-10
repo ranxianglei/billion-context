@@ -3,7 +3,7 @@ import { collectBlockContent, countMessageTokens, defaultCountTokens, formatRang
 import { handleAcpStatus } from "./acp-status.js";
 import { handleAcpCache, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
 import { type Session, cacheBlockContent, markDirty, statusInputBaseline } from "./session.js";
-import { COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME, type ParsedRange } from "./compress-tool.js";
+import { COMPRESS_JSON_NOTE, COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME, type ParsedRange } from "./compress-tool.js";
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "./absorb.js";
 import { executeSearchContextTarget, resolveDecompress } from "./decompress-shared.js";
 import { ONE_CALL_HINT } from "acp-kernel";
@@ -535,7 +535,7 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
         ? base.filter((r) => !submitted.some((s) => spansOverlap(r.startRef, r.endRef, s.startRef, s.endRef)))
         : base;
     if (remaining.length > 0) {
-        return `\n\nCurrent compressible ranges (use these refs exactly as listed):\n${formatRanges(remaining, [])}\n${ONE_CALL_HINT}`;
+        return `\n\nCurrent compressible ranges (use these refs exactly as listed):\n${formatRanges(remaining, [])}\n${ONE_CALL_HINT}${COMPRESS_JSON_NOTE}`;
     }
     // A tier-distillation nudge means block-boundary compress calls (bN..bM) are
     // still actionable — a stop signal there would contradict the tier trigger.

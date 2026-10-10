@@ -10,7 +10,7 @@ import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcil
 import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
 import { applyCompactionArchive, foldCoverage, markDirty, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
-import { ABSORB_TOOL_NAME, IMAGE_FULL_TOOL_GOOGLE, RULE_TOOL_GOOGLE, absorbToolsFor, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressSystemPrompt, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withSummaryBudgetNote } from "../compress-tool.js";
+import { ABSORB_TOOL_NAME, IMAGE_FULL_TOOL_GOOGLE, RULE_TOOL_GOOGLE, absorbToolsFor, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressSystemPrompt, retrieveToolsFor, withCompressJsonNote, withFirstSightDrain, withMarkerIntegrityNote, withSummaryBudgetNote } from "../compress-tool.js";
 import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "../store.js";
 import { applyImageCompressionPass, imageCompressionEnabled, imageFullTrailingNote } from "../image-compress.js";
@@ -195,7 +195,7 @@ export async function prepareGoogle(
                 consumeFallback(session.metadata);
                 try {
                     const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections);
-                    const renderedWithPayload = rendered.text;
+                    const renderedWithPayload = withCompressJsonNote(rendered.text);
                     if (rendered.text) {
                         rebuiltContents = appendGoogleNudge(rebuiltContents, withMarkerIntegrityNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), visibilityMarkers));
                     }
@@ -216,7 +216,7 @@ export async function prepareGoogle(
             } else {
                 try {
                     const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections);
-                    const renderedWithPayload = rendered.text;
+                    const renderedWithPayload = withCompressJsonNote(rendered.text);
                     if (rendered.text) {
                         rebuiltContents = appendGoogleNudge(rebuiltContents, withMarkerIntegrityNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), visibilityMarkers));
                     }

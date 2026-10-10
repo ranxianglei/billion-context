@@ -16,7 +16,7 @@ import { compressBreakerArmed } from "../stream.js";
 import { foldCoverage, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { recordConflict } from "../conflict-watch.js";
-import { ABSORB_TOOL_NAME, BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, IMAGE_FULL_TOOL_RESPONSES, RULE_TOOL_RESPONSES, absorbToolsFor, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressHybridSystemPrompt, buildCompressSystemPrompt, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withSummaryBudgetNote } from "../compress-tool.js";
+import { ABSORB_TOOL_NAME, BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, IMAGE_FULL_TOOL_RESPONSES, RULE_TOOL_RESPONSES, absorbToolsFor, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressHybridSystemPrompt, buildCompressSystemPrompt, retrieveToolsFor, withCompressJsonNote, withFirstSightDrain, withMarkerIntegrityNote, withSummaryBudgetNote } from "../compress-tool.js";
 import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "../store.js";
 import { applyImageCompressionPass, imageCompressionEnabled, imageFullTrailingNote } from "../image-compress.js";
@@ -343,7 +343,7 @@ export async function prepareResponses(
                 consumeFallback(session.metadata);
                 try {
                     const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections);
-                    const renderedWithPayload = rendered.text;
+                    const renderedWithPayload = withCompressJsonNote(rendered.text);
                     if (rendered.text) {
                         const inputItems: ResponseInputItem[] = typeof rebuiltInput === "string"
                             ? [{ type: "message", role: "user", content: rebuiltInput }]
@@ -379,7 +379,7 @@ export async function prepareResponses(
             } else {
                 try {
                     const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections);
-                    const renderedWithPayload = rendered.text;
+                    const renderedWithPayload = withCompressJsonNote(rendered.text);
                     if (rendered.text) {
                         const inputItems: ResponseInputItem[] = typeof rebuiltInput === "string"
                             ? [{ type: "message", role: "user", content: rebuiltInput }]
