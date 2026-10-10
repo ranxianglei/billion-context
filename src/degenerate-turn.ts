@@ -51,3 +51,34 @@ const DRAFT_CLOSE_TAIL = /\x3c\/(?:summary|analysis)\x3e\s*$/i;
 export function endsWithDraftClose(text: string): boolean {
     return text.length > 0 && DRAFT_CLOSE_TAIL.test(text);
 }
+
+// #2612: the #2303 draft-tail shape has a legitimate producer — the CLIENT's
+// own summarization request. Claude Code's compaction (/compact, auto-compact,
+// precomputed compression) instructs the model, in the final user message, to
+// answer with plain text only: "Wrap your summary in <summary></summary>
+// tags" / "Do NOT call any tools. Respond with plain text only — an
+// <analysis> block followed by a <summary> block." A compliant reply
+// NECESSARILY ends with </summary> and carries no tool call, so the #2303
+// verdict reads a correct answer as a stalled handoff draft: the retry
+// re-asks, the retry also complies, and the #870 in-band error breaks the
+// client's compaction entirely ("automatic compaction failed"). Detection
+// matches the two distinctive instruction phrases verbatim (case-insensitive
+// for #1731-style drift) rather than bare "<summary>" — the tag alone also
+// appears in bili's own compress receipts riding the history, which must NOT
+// suppress the retry for ordinary turns.
+const CLIENT_SUMMARY_INSTRUCTION =
+    /(?:Wrap your summary in \x3csummary\x3e\x3c\/summary\x3e tags|\x3canalysis\x3e block followed by a \x3csummary\x3e block)/i;
+export function requestExpectsProseSummary(requestText: string | undefined): boolean {
+    return typeof requestText === "string" && requestText.length > 0 && CLIENT_SUMMARY_INSTRUCTION.test(requestText);
+}
+
+/** #2612 proxy-lane twin: the last user message's text, where a client
+ *  compaction instruction lives (Claude Code puts it in the final user turn).
+ *  Undefined when there is no user message or it carries no text. */
+export function lastUserSummaryInstruction(messages: ReadonlyArray<{ role: string; text?: string }>): string | undefined {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+        const m = messages[i]!;
+        if (m.role === "user") return typeof m.text === "string" ? m.text : undefined;
+    }
+    return undefined;
+}

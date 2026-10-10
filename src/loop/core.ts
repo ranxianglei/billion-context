@@ -36,7 +36,7 @@ import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoBody } from "../st
 import { log as loggerLog } from "../logger.js";
 import { promptInputTotal, type WireProtocol } from "../util.js";
 import { DEGENERATE_RETRY_NUDGE } from "../degenerate-retry.js";
-import { endsWithDraftClose } from "../degenerate-turn.js";
+import { endsWithDraftClose, lastUserSummaryInstruction, requestExpectsProseSummary } from "../degenerate-turn.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogatesOnWire } from "../text-safe.js";
 
 export const MAX_LOOP_ROUNDS = 10;
@@ -893,6 +893,12 @@ export async function* runCompressLoop(
                     assistantText.length > 0 &&
                     calls.length === 0 &&
                     endsWithDraftClose(assistantText) &&
+                    // #2612: the client's own compaction request instructs the
+                    // model to answer with a plain-text summary block and no
+                    // tool call — that compliant reply is a draft tail by
+                    // design, not a stalled handoff; retrying it breaks the
+                    // compaction (the retry complies too → #870 error).
+                    !requestExpectsProseSummary(lastUserSummaryInstruction(coreMessages)) &&
                     !signal?.aborted
                 ) {
                     degenerateRetried = true;
