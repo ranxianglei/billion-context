@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { log as loggerLog } from "./logger.js";
 import { getStore } from "./persist.js";
 import { maxSessions as knobMaxSessions } from "./knobs.js";
-import { durableMessageGuards } from "./durable-message-guards.js";
+import { biliDurableMarkerGuard, durableMessageGuards } from "./durable-message-guards.js";
 import type { WireProtocol } from "./util.js";
 
 export type BlockView = { text: string; count: number };
@@ -433,9 +433,14 @@ export function effectiveConfig(session: Session | undefined, fallback: Config):
     // cannot serialize a function. The lane id is already clone-safe here, so
     // re-resolve the guard from it at read time; every consumer (plugin tool,
     // nudge panel) then sees the same protection the wire path used this turn.
+    // #2555: compose the lane-less bili-durable marker guard in — injector
+    // self-declaration applies to EVERY session (proxy mode carries no lane),
+    // mirroring the wire path's composition in server/handle.ts.
     const lane = typeof session?.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] : undefined;
-    const guard = lane ? durableMessageGuards[lane] : undefined;
-    return guard && !base.isMessageProtected ? { ...base, isMessageProtected: guard } : base;
+    const laneGuard = lane ? durableMessageGuards[lane] : undefined;
+    const guard: (msg: CoreMessage) => boolean =
+        laneGuard ? (msg) => laneGuard(msg) || biliDurableMarkerGuard(msg) : biliDurableMarkerGuard;
+    return !base.isMessageProtected ? { ...base, isMessageProtected: guard } : base;
 }
 
 /** #2029: provenance-aware baseline for STATUS readers — acp_status nudge

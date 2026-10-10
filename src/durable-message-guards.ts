@@ -29,6 +29,23 @@
 // with traffic evidence (shape + stability proof), never enabled wholesale —
 // a message-shape guard applied to every lane would hard-pin arbitrary user
 // prose into context for hosts whose state carriers have no such contract.
+//
+// #2555: the permitlist above is closed-world by construction — it can only
+// grow when a HUMAN ships a bili release, and it structurally cannot fire in
+// proxy mode (no lane identity on the wire) even for the carriers it knows.
+// The lane-less complement is the INJECTOR-side declaration protocol: any
+// host core or third-party plugin that injects durable state stamps the
+// message's FIRST LINE with the namespaced marker \x3cbili-durable\x3e
+// (optional free-text kind attribute, self-closing accepted), and
+// biliDurableMarkerGuard below honors it in EVERY session — plugin lane and
+// proxy mode alike, no registry entry, no evidence bar (the injector opted
+// in; that is the evidence). The marker lives in the content itself, so it
+// survives the whole replay surface where out-of-band protection state dies:
+// fork raw-replay (#2383), machine export, any host re-sending history — the
+// protection travels atomically with the message it protects. The lane table
+// above stays as the legacy fallback for pre-protocol carriers (dsh core's
+// four) and is FROZEN by policy (#2555): new third-party carriers go through
+// the marker, not through more hardcoded predicates.
 
 import type { CoreMessage } from "acp-kernel";
 
@@ -105,6 +122,36 @@ export function dshRuntimeContextGuard(msg: CoreMessage): boolean {
 /** Lane → guard registry. Only lanes with traffic evidence of the
  *  durable-user-message carrier belong here (KDD #9). Keyed by the value of
  *  the x-bili-plugin header / session.metadata.pluginAgent binding. */
+/** #2555: lane-less self-declaration guard — honors the injector-side
+ *  \x3cbili-durable\x3e first-line marker. Deliberately NOT part of the
+ *  durableMessageGuards registry: the registry is the closed-world per-lane
+ *  permitlist (KDD #9), while this predicate is open-world opt-in by whoever
+ *  emitted the message. Anchor on the marker occupying the message's first
+ *  line (starts with \x3cbili-durable, ends with \x3e — covering the
+ *  attributed \x3cbili-durable kind="…"\x3e and self-closing forms); a
+ *  marker appearing mid-prose does NOT pin, which keeps the false-positive
+ *  surface at "the user pasted the literal protocol string as the first line
+ *  of a message" — an explicit-enough act that pinning is the defensible
+ *  reading. Payload (if any) follows from the second line and is protected
+ *  as part of the same message. kind is free text for diagnostics only; it
+ *  is never parsed, so wording churn in it cannot disarm the guard. A CRLF
+ *  line ending terminates the first line — the \r is terminator, not content,
+ *  so it is stripped before the end-of-line anchor; otherwise a CRLF-emitting
+ *  injector's marker would silently fail to pin (the exact failure class this
+ *  protocol exists to close). */
+export function biliDurableMarkerGuard(msg: CoreMessage): boolean {
+    if (msg.contentType !== "text" || typeof msg.text !== "string" || msg.text.length === 0) return false;
+    let firstLine = msg.text.split("\n", 1)[0] ?? "";
+    if (firstLine.endsWith("\r")) firstLine = firstLine.slice(0, -1);
+    if (!firstLine.startsWith("\x3cbili-durable")) return false;
+    // Tag-name boundary: the next char after the marker name must close the
+    // name (plain, self-closing, or attribute list) — \x3cbili-durable-ish\x3e is
+    // a DIFFERENT tag that has not opted into this protocol.
+    const next = firstLine["\x3cbili-durable".length]!;
+    if (next !== "\x3e" && next !== "/" && next !== " " && next !== "\t") return false;
+    return firstLine.endsWith("\x3e");
+}
+
 export const durableMessageGuards: Record<string, DurableMessageGuard> = {
     dsh: (msg) =>
         dshSkillCatalogGuard(msg) || dshWorkspaceInstructionsGuard(msg) || dshRuntimeContextGuard(msg) || dshMcpCatalogGuard(msg),
