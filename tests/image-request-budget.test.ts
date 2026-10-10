@@ -46,7 +46,7 @@ async function fixture(run: (base: string, opts: ProxyOptions, calls: Buffer[]) 
         },
         modelContextLimit: 400_000,
         kernelConfig: defaultConfig(400_000),
-        compress: { injectTool: true, injectNudge: true, stripImages: true, stripImagesKeepRecent: 1 },
+        compress: { injectTool: true, injectNudge: true },
         promptCache: { routing: "auto" },
         sessionHeader: "x-acp-session",
         log: false,
@@ -90,41 +90,26 @@ async function send(base: string, body: Buffer, session: string, headers: Record
     return fetch(`${base}/responses`, { method: "POST", headers: { "content-type": "application/json", "content-encoding": "gzip", "session-id": session, ...headers }, body: new Uint8Array(body) });
 }
 
-test("gzip history above 100 MiB reaches explicit image reduction and preserves recent images, including tool screenshots", async () => {
+test("rebuilt over-budget requests never silently drop images: they stop with a forward-stage 413, including tool screenshots", async () => {
     await fixture(async (base, _opts, calls) => {
         for (const tool of [false, true]) {
-            const r = await send(base, largeBody(tool), `large-strip-${tool}`);
-            assert.equal(r.status, 200, await r.text());
-            const body = JSON.parse(calls.at(-1)!.toString("utf8")) as { input: unknown[] };
-            const text = JSON.stringify(body.input);
-            assert.equal(text.split('"input_image"').length - 1, 1);
-            assert.ok(text.includes("old screenshot"));
-            assert.ok(text.includes(recentImage.image_url));
-            assert.ok(calls.at(-1)!.length < MAX_REQUEST_BYTES);
+            const r = await send(base, largeBody(tool), `large-oversize-${tool}`);
+            assert.equal(r.status, 413);
+            const error = await r.json() as { error: { stage: string; type: string } };
+            assert.equal(error.error.stage, "forward");
+            assert.equal(error.error.type, "request_too_large");
+            assert.equal(calls.length, 0);
         }
-        assert.equal(calls.length, 2);
     });
 });
 
-test("disabled stripping never silently drops images: rebuilt over-budget requests stop with a forward-stage 413", async () => {
-    await fixture(async (base, opts, calls) => {
-        opts.compress.stripImages = false;
-        const r = await send(base, largeBody(false), "large-no-strip");
-        assert.equal(r.status, 413);
-        const error = await r.json() as { error: { stage: string; type: string } };
-        assert.equal(error.error.stage, "forward");
-        assert.equal(error.error.type, "request_too_large");
-        assert.equal(calls.length, 0);
-    });
-});
-
-test("third large decode gets retryable admission error, then succeeds after a slot is released", async () => {
+test("third large decode gets retryable admission error, then proceeds to the forward budget once a slot is released", async () => {
     await fixture(async (base, _opts, calls) => {
         const a = new DecodedRequestAdmission(), b = new DecodedRequestAdmission();
         const compressed = largeBody(false);
         a.observe(MAX_REQUEST_BYTES + 1); b.observe(MAX_REQUEST_BYTES + 1);
         try {
-            const r = await send(base, compressed, "busy-strip");
+            const r = await send(base, compressed, "busy-large");
             assert.equal(r.status, 503);
             assert.equal(r.headers.get("retry-after"), "1");
             assert.equal((await r.json() as { error: { stage: string } }).error.stage, "decode");
@@ -133,9 +118,10 @@ test("third large decode gets retryable admission error, then succeeds after a s
             assert.equal(small.status, 200, await small.text());
             assert.equal(calls.length, 1, "normal traffic must not use the large-body slots");
             a.release();
-            const ok = await send(base, compressed, "busy-strip-retry");
-            assert.equal(ok.status, 200, await ok.text());
-            assert.equal(calls.length, 2);
+            const ok = await send(base, compressed, "busy-large-retry");
+            assert.equal(ok.status, 413);
+            assert.equal((await ok.json() as { error: { stage: string } }).error.stage, "forward");
+            assert.equal(calls.length, 1);
         } finally { a.release(); b.release(); }
     });
 });
