@@ -46,6 +46,7 @@ Fetch once at plugin startup.
     "instructionsMutable": "x-bili-plugin-instructions-mutable"
   },
   "toolEndpoint": "/__bili/plugin/tool",
+  "protectEndpoint": "/__bili/plugin/protect",
   "statusEndpoint": "/__bili/plugin/status",
   "capabilities": {
     "fork": { "protocolVersion": 1, "endpoint": "/__bili/plugin/fork", "snapshotEndpoint": "/__bili/plugin/snapshot" }
@@ -100,7 +101,24 @@ Notes:
 - `compress` mutates state. Inline `decompress` marks a block restored for re-folding; range restores queue content for the next request. Successful restores also update the estimated context footprint. `search_context` / `acp_status` are read-only.
 - Errors: `400` invalid JSON / missing `conversationId` / unknown tool, `404` unknown conversation (no model request has arrived with that conversation id yet), `500` execution failure. A **known but disabled** opt-in tool (`absorb` / `acp_rule`) is not an error: it answers `200` with `ok: true` and a `result` explaining that the feature is off on this proxy (#1192).
 
-### 4. `GET /__bili/plugin/status?conversationId=<id>`
+### 4. `POST /__bili/plugin/protect`
+
+Durable-message registration — the **aux** channel of the durable protocol (#2556). The **primary** channel is the content-embedded first-line `\x3cbili-durable\x3e` marker (#2555): protection that travels inside the message bytes survives fork raw-replay, cross-machine exports and proxy mode, where this session-keyed registration cannot. Use the marker when the injector controls the message text; use this endpoint when the text must stay untouched (zero content pollution) or the message was already emitted unmarked.
+
+```json
+{ "conversationId": "the same value you send as x-bili-plugin-conversation", "refs": ["m00017", "m00018"] }
+```
+
+Response: `{ "ok": true, "action": "protect", "changed": 2, "total": 2 }`. Passing `"clear": true` unregisters the listed refs (`action: "clear"`). Re-registering is idempotent (`changed: 0`). Registration binds the refs' raw content ids into the session's protection set — ids are never reused (kernel contract), so a registration stays pinned to its message even after it dies. Protection takes effect at the next fold; already-folded content is not restored.
+
+Errors: `400` invalid JSON / missing `conversationId` / `refs` not a non-empty array of `mNNNNN` / `clear` not boolean, `400 UNKNOWN_REF` naming the refs never assigned in this conversation, `404` conversation not resident on this proxy instance.
+
+Notes:
+
+- The registration lives in session metadata (persisted across proxy restarts, carried through fork adoption). It is **instance-local truth**: a fork that replays raw history into a fresh conversation, or a host that re-sends history to a new proxy, must re-register — or emit the marker, which needs no registration at all.
+- Registered messages are excluded from fold ranges exactly like marker- and lane-protected ones (same `isMessageProtected` guard, composed in both the wire path and the plugin tool path).
+
+### 5. `GET /__bili/plugin/status?conversationId=<id>`
 
 Context-level visibility for plugin UIs (status bars / slash commands):
 
@@ -134,7 +152,7 @@ Forwarding a new model request replaces the previous observation with an estimat
 
 `compressibleRanges` is the live kernel recommendation as structured `{startRef, endRef, count, ...}` entries for `sessionRevision`, or `null` if it cannot be computed. An empty list means there is no recommended range. Read the exact conversation without `fallback=latest`, match the snapshot revision and ordered refs, and submit manual `compress` with `expectedRevision`; never parse the human panel or guess a fixed prefix. Hosts must exclude their retained first-user anchor from summaries: kernel pruning retains it even if a recommendation spans it. A concurrent mutation is rejected by the revision guard.
 
-### 5. `POST /__bili/plugin/compact`
+### 6. `POST /__bili/plugin/compact`
 
 Notify the proxy that the agent performed an **in-session native compaction** (e.g. omp's `/compact` or its auto threshold): the next model request re-sends a shortened history (compaction summary + retained tail) under the SAME conversation id. Fire-and-forget is fine — a failed notification must never break the agent's compaction.
 
@@ -144,11 +162,11 @@ Notify the proxy that the agent performed an **in-session native compaction** (e
 
 Effect: the proxy marks a one-shot compaction boundary on the session. On the next model request, blocks that were active before the compaction but no longer anchor into the shortened history are downgraded to a pre-compaction archive (listed by `acp_status` with a reason; `decompress` on one returns an explicit "unavailable" error instead of failing silently), and stale `byRaw`/`byRef` mappings are pruned to the live ids. Errors: `400` invalid JSON / missing `conversationId`, `404` unknown conversation.
 
-### 6. MITM transparent-proxy mode
+### 7. MITM transparent-proxy mode
 
 The `/bili/` prefix is absent in MITM mode, so URL-based detection cannot work. Instead the proxy's own launcher (`bili pi` / `bili codex` / `bili claude`) exports `BILLION_CONTEXT_PROXY=http://127.0.0.1:<port>` in the child env, next to the `HTTPS_PROXY` + CA vars it already sets. A plugin detects cooperative mode by reading that env var (the proxy origin for all `/__bili/plugin/*` calls); everything else (headers, tool forwarding, status) is identical — the `x-bili-plugin*` headers pass through the MITM tunnel into the same pipeline. This is also where `x-bili-plugin-context-window` matters most: MITM upstreams are often private relays the models.dev registry doesn't know.
 
-### 7. Lifecycle of one compression (what the plugin does)
+### 8. Lifecycle of one compression (what the plugin does)
 
 1. Model replies with a native `compress` tool call (args contain `startId`/`endId` refs it read from the tag-annotated context).
 2. The agent ends the assistant turn; the plugin's tool handler fires.
@@ -158,7 +176,7 @@ The `/bili/` prefix is absent in MITM mode, so URL-based detection cannot work. 
 
 No special handling is needed for decompression: `decompress` results come back through the same endpoint.
 
-### 8. Public snapshot and fork (protocol 1)
+### 9. Public snapshot and fork (protocol 1)
 
 Discover `capabilities.fork` from the manifest; do not infer support from the package version. No new configuration is required. These endpoints use the same admin gate and request-body limit as the tool API.
 

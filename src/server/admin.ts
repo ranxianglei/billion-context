@@ -13,7 +13,7 @@ import { detectCostAdvisories } from "../plugin-advisory.js";
 import { fetchWithTimeout } from "../fetch-util.js";
 import { log as loggerLog, getLogPath } from "../logger.js";
 import { getBlindTunnelStats } from "../mitm.js";
-import { handlePluginCompact, handlePluginFork, handlePluginManifest, handlePluginRegister, handlePluginRuntimeInfo, handlePluginSessionName, handlePluginSnapshot, handlePluginStatus, handlePluginTool } from "../plugin.js";
+import { handlePluginCompact, handlePluginFork, handlePluginManifest, handlePluginProtect, handlePluginRegister, handlePluginRuntimeInfo, handlePluginSessionName, handlePluginSnapshot, handlePluginStatus, handlePluginTool } from "../plugin.js";
 import { parseAgentProviderReport, recordAgentProviders, agentProviderRecipes } from "../agent-providers.js";
 import { defaultLogFile } from "../paths.js";
 import { getUnrecognizedPathStats } from "./observability.js";
@@ -350,6 +350,19 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         } catch (err) {
             res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
             res.end(JSON.stringify({ ok: false, error: String(err) }));
+            return;
+        }
+    }
+    if (req.method === "POST" && req.url === "/__bili/plugin/protect") {
+        // #2556: durable-registration aux channel (marker stays the durable
+        // truth). Same loopback + trusted-origin gate as the family above.
+        try {
+            const body = await readBody(req);
+            handlePluginProtect(body.toString("utf8"), res, { core, config, log });
+            return;
+        } catch (err) {
+            res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
+            res.end(JSON.stringify({ ok: false, code: "INVALID_REQUEST", error: String(err) }));
             return;
         }
     }

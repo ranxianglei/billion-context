@@ -438,9 +438,22 @@ export function effectiveConfig(session: Session | undefined, fallback: Config):
     // mirroring the wire path's composition in server/handle.ts.
     const lane = typeof session?.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] : undefined;
     const laneGuard = lane ? durableMessageGuards[lane] : undefined;
+    // #2556: the aux-channel registration set (POST /__bili/plugin/protect) —
+    // session-keyed raw ids, persisted via metadata; composes with the marker
+    // (#2555) and lane guards. Same read-time re-resolution as the guards.
+    const registered = registeredProtectedRawIds(session);
     const guard: (msg: CoreMessage) => boolean =
-        laneGuard ? (msg) => laneGuard(msg) || biliDurableMarkerGuard(msg) : biliDurableMarkerGuard;
+        laneGuard ? (msg) => laneGuard(msg) || biliDurableMarkerGuard(msg) || registered.has(msg.id) : (msg) => biliDurableMarkerGuard(msg) || registered.has(msg.id);
     return !base.isMessageProtected ? { ...base, isMessageProtected: guard } : base;
+}
+
+/** #2556: the protect-tool registration as a membership set. Reading it from
+ *  session.metadata at guard-resolution time (never cached across calls) keeps
+ *  POST /__bili/plugin/protect effective for the next fold without any
+ *  config re-stamping, and metadata persistence carries it across restarts. */
+export function registeredProtectedRawIds(session: Session | undefined): Set<string> {
+    const raw = session?.metadata["protectedRawIds"];
+    return new Set(Array.isArray(raw) ? raw.filter((v): v is string => typeof v === "string") : []);
 }
 
 /** #2029: provenance-aware baseline for STATUS readers — acp_status nudge
