@@ -56,7 +56,7 @@ import { FORCE_TEXT_PROTOCOL } from "./server/inject.js";
 export { isChatGptCodexUpstream, isCodexResponsesLite, resolvePromptCacheKey, shouldInjectPromptCacheKey } from "./server/prepare-responses.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "./fold-reconcile.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "./session-self-heal.js";
-import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, reconcileNativeCompactionBoundary, snapshotMessages, applyCompactionArchive, detectUnannouncedHistoryRewrite, markCompactionBoundary, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings, REWRITE_MIN_INCOMING_TOTAL } from "./session.js";
+import { getSession, hasProcessedState, listSessions, peekSession, type PendingRetrieval, type Session, initSessions, markDirty, flushAllSessions, acquireInFlight, releaseInFlight, totalInFlight, snapshotMessages, ensureCanonicalId, storeEffectiveConfig, foldCoverage, postRebuildAnchorTokens, setPostRebuildAnchor, tickPostRebuildAnchor, splitSessionWarnings } from "./session.js";
 import { detectStaleInstall } from "./update.js";
 import { getAdvisoryState, cannotResolveTarget } from "./advisory.js";
 import { PACKAGE_NAME, VERSION } from "./version.js";
