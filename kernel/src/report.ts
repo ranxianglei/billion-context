@@ -3,6 +3,7 @@ import { isToolMessage } from "./message-kind.js";
 import { BLOCKED_REF, orderedRefPair, refForRaw } from "./refs.js";
 import { countMessageTokens } from "./tokenize.js";
 import { segmentGroups } from "./segment.js";
+import { isLiveCheckpointCarrier } from "./state.js";
 import type {
   CompressionBlock,
   CompressionState,
@@ -142,7 +143,11 @@ function collectVisible(
         isUser: message.role === "user",
         gapBefore: pendingGap,
       });
-      pendingGap = false;
+      // #2663: a live checkpoint carrier stays listed (it IS visible mass) but
+      // must not be bridged across by a range row — the apply side refuses to
+      // fold it in a plain range, exactly like buildCompressibleRanges screens
+      // it. Stale carriers keep the old (no-gap) behavior.
+      pendingGap = isLiveCheckpointCarrier(message, state);
       return;
     }
     if (ref !== BLOCKED_REF && tokens > 0) pendingGap = true;

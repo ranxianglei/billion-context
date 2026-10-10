@@ -15,6 +15,11 @@ export interface NodeEffects {
   truncatedCount?: number;
   terminalEscape?: import("./types.js").TerminalEscapeSignal;
   truncationSkipped?: string;
+  /** Pipeline-internal (#2663): the pre-prune resent array, stashed by the
+   *  prune node so downstream nodes (recommend) can judge foldability on the
+   *  same input class the apply side sees. Optional — custom pipelines without
+   *  a prune node simply don't set it and recommend falls back to its input. */
+  originalMessages?: CoreMessage[];
   readonly [key: string]: unknown;
 }
 

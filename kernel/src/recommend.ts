@@ -21,7 +21,7 @@ import type {
 } from "./types.js";
 import type { CompressionState } from "./types.js";
 import { isToolMessage } from "./message-kind.js";
-import { coveredMessageIds } from "./state.js";
+import { coveredMessageIds, isLiveCheckpointCarrier } from "./state.js";
 import { SUMMARY_HEADER } from "./prune.js";
 import {
   collectLatestProtected,
@@ -162,6 +162,12 @@ export function buildCompressibleRanges(
   config: Config,
   protectedZoneRefs?: Set<string>,
   countTokens: (text: string) => number = estimateTextTokens,
+  /** #2663: the array class the fold gate judges at apply time (the full
+   *  resent log — compress.ts passes input.messages). Turn grouping and
+   *  call/result pairing are array-dependent, so integrity withdrawal must be
+   *  computed on it; screening on a pruned view withdraws different messages
+   *  than apply does. Defaults to `messages` for direct callers. */
+  integritySource?: CoreMessage[],
 ): ContextRanges {
   let compressibleMsgs: {
     id: string;
@@ -208,6 +214,21 @@ export function buildCompressibleRanges(
     const ref = state.messageRefs.byRaw[msg.id];
     if (!ref || ref === "BLOCKED") continue;
     if (isSyntheticOrPruned(msg, covered)) {
+      skipSinceCompressible = true;
+      skipSinceProtected = true;
+      continue;
+    }
+
+    // Live checkpoint carriers (#335/#2663): a message rendering the summary
+    // of a still-active block sits outside that block's coverage on purpose
+    // (it stays visible), so pruning keeps it and the apply side refuses to
+    // fold it in a plain message-ref range (compress.ts live-carrier carve).
+    // A span bridging over it drags the covering block in as consumed
+    // coverage while every direct message gets carved out — zero foldable
+    // messages, livelock guard throws every turn (#2638). Screen with the
+    // SAME predicate the apply side uses, and treat it as a gap so no group
+    // bridges across it. Stale carriers fold normally.
+    if (isLiveCheckpointCarrier(msg, state)) {
       skipSinceCompressible = true;
       skipSinceProtected = true;
       continue;
@@ -265,8 +286,10 @@ export function buildCompressibleRanges(
   // it then failed with "Range would split N tool call/result pair(s)". Screen
   // the same messages out here so every advertised range is foldable, and treat
   // each removed message as a gap so no range spans it.
+  // #2663: judge foldability on the same array class apply does (see the
+  // `integritySource` parameter) — grouping/pairing are array-dependent.
   const unfoldedIds = computeIntegrityWithdrawals(
-    messages,
+    integritySource ?? messages,
     new Set(compressibleMsgs.map((info) => info.id)),
   ).withdrawn;
   if (unfoldedIds.size > 0) {
