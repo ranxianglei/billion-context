@@ -156,3 +156,19 @@ export const durableMessageGuards: Record<string, DurableMessageGuard> = {
     dsh: (msg) =>
         dshSkillCatalogGuard(msg) || dshWorkspaceInstructionsGuard(msg) || dshRuntimeContextGuard(msg) || dshMcpCatalogGuard(msg),
 };
+
+/** #2446 方案A: user-configured content markers — the config lane of the
+ *  durable protocol. Unlike everything above this is per-OPERATOR policy,
+ *  not per-lane evidence: the user declares carrier substrings for hosts bili
+ *  has no lane entry for (proxy mode has no client identity at all). The
+ *  factory returns undefined for an empty/absent list so the guard chain
+ *  never grows a dead predicate. Matching is raw substring-anywhere over
+ *  text messages — deliberately the same granularity the built-in lane
+ *  guards use (e.g. "Instructions from:"), so a config marker can reproduce
+ *  any lane entry one-to-one (the documented escape hatch while a host waits
+ *  for lane evidence). */
+export function protectedContentMarkerGuard(markers: readonly string[]): ((msg: CoreMessage) => boolean) | undefined {
+    const list = markers.filter((m) => m.length > 0);
+    if (list.length === 0) return undefined;
+    return (msg) => msg.contentType === "text" && typeof msg.text === "string" && list.some((m) => msg.text!.includes(m));
+}

@@ -87,6 +87,7 @@ export function mergeCompress(
         tiers: pick("tiers"),
         protectedLatestTools: pick("protectedLatestTools"),
         protectedTools: pick("protectedTools"),
+        protectedContentMarkers: pick("protectedContentMarkers"),
         neverPreserveRecentTools: pick("neverPreserveRecentTools"),
         preserveRecentTools: pick("preserveRecentTools"),
         prompts: promptLevels.length > 0 ? Object.assign({}, ...promptLevels) : undefined,
