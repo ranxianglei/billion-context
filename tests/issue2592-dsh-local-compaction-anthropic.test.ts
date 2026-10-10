@@ -161,12 +161,16 @@ async function seedAndFold(rig: Rig, conv: string, headers: (c: string) => Recor
     assert.ok(covered.size >= 8, `fold covers >=8 ids (got ${covered.size})`);
 }
 
-test("unit #2592: carriesDshLocalCompactionSummary matches framing on anthropic-shaped messages", () => {
-    // The predicate is protocol-agnostic ({text}/{content}-shaped), but pin
-    // the anthropic wire shape explicitly: block-array content must be seen.
-    assert.equal(carriesDshLocalCompactionSummary([{ content: [{ type: "text", text: `${DSH_CHECKPOINT_PREAMBLE_PREFIX} of the conversation…` }] }]), true, "preamble inside a block array");
-    assert.equal(carriesDshLocalCompactionSummary([{ content: [{ type: "text", text: `intro\n${DSH_CHECKPOINT_OPEN_TAG}\n## section` }] }]), true, "open tag inside a block array");
-    assert.equal(carriesDshLocalCompactionSummary([{ content: [{ type: "text", text: "ordinary prose" }] }]), false, "ordinary prose");
+test("unit #2592: carriesDshLocalCompactionSummary matches framing on anthropic-shaped user text", () => {
+    // #2621 tightened the guard to user TEXT messages only (quotes from any
+    // other producer must not fire it); pin the anthropic wire shape for that
+    // contract: a user message's block-array content must be seen, while an
+    // anthropic-lane tool result (role=user, contentType=tool-result) quoting
+    // the marker must read false.
+    assert.equal(carriesDshLocalCompactionSummary([{ role: "user", contentType: "text", content: [{ type: "text", text: `${DSH_CHECKPOINT_PREAMBLE_PREFIX} of the conversation…` }] }]), true, "preamble inside a user-text block array");
+    assert.equal(carriesDshLocalCompactionSummary([{ role: "user", contentType: "text", content: [{ type: "text", text: `intro\n${DSH_CHECKPOINT_OPEN_TAG}\n## section` }] }]), true, "open tag inside a user-text block array");
+    assert.equal(carriesDshLocalCompactionSummary([{ role: "user", contentType: "text", content: [{ type: "text", text: "ordinary prose" }] }]), false, "ordinary prose");
+    assert.equal(carriesDshLocalCompactionSummary([{ role: "user", contentType: "tool-result", content: [{ type: "text", text: `${DSH_CHECKPOINT_OPEN_TAG} quoted from a transcript read` }] }]), false, "anthropic-lane tool result quoting the marker (#2621)");
 });
 
 test("e2e #2592: dsh replaying [checkpoint, retained tail] on the ANTHROPIC lane rebases the ACP state instead of drifting forever", async () => {
