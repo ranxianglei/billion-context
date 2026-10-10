@@ -61,6 +61,7 @@
 import { createHash } from "node:crypto";
 import type { CoreMessage } from "acp-kernel";
 import type { Session } from "./session.js";
+import { isResponsesTurnSeparatorId } from "./session.js";
 
 type FoldReconcileMode = "off" | "warn" | "repair";
 
@@ -349,10 +350,16 @@ interface BlockLike {
  *  permanently, inflating the drift warn ~2x (#2293). Same caliber as the
  *  #1195 pre-turn snapshot. */
 function coveredIdsOf(blocks: BlockLike[]): Set<string> {
+    // #2627: outbound-only turn separators (acp_turn_sep_*) are never in any
+    // resent history — counting them here would keep a permanent separator-
+    // only "missing" set alive on every pass. Same real-history caliber as
+    // the #1195 snapshot consumers.
     const covered = new Set<string>();
     for (const block of blocks) {
         if (!block.active) continue;
-        for (const id of block.effectiveMessageIds ?? []) covered.add(id);
+        for (const id of block.effectiveMessageIds ?? []) {
+            if (!isResponsesTurnSeparatorId(id)) covered.add(id);
+        }
     }
     return covered;
 }
@@ -726,7 +733,10 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     for (const block of blocks) {
         const bid = block.blockId;
         if (bid === undefined || bid === "") continue;
-        const ids = block.effectiveMessageIds ?? [];
+        // #2627: evidence counts REAL history only — separator ids can never
+        // be present or claimed, so including them in `t` would stall the
+        // ledger's p+r>=t accrual for polluted blocks forever.
+        const ids = (block.effectiveMessageIds ?? []).filter((id) => !isResponsesTurnSeparatorId(id));
         if (ids.length === 0) continue;
         let p = 0, r = 0;
         for (const id of ids) {

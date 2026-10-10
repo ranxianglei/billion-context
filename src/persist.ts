@@ -17,7 +17,7 @@ import { VERSION } from "./version.js";
 import { createStorageCodec, parseEncryptionKey } from "./encrypt.js";
 import { PersistEpermAlert } from "./persist-eperm.js";
 import { createInitialState, defaultCountTokens, prune, type CompressionState, type CoreMessage, type MessageContentStore } from "acp-kernel";
-import { markDirty } from "./session.js";
+import { markDirty, scrubTurnSeparatorIds } from "./session.js";
 import type { Session, BlockContent, BlockView } from "./session.js";
 import type { WireProtocol } from "./util.js";
 import { currentContextObservation, CALIBRATION_CLAMP_MAX, CALIBRATION_CLAMP_MIN, CALIBRATION_SAMPLE_MAX, CALIBRATION_SAMPLE_MIN, CALIBRATION_SAMPLE_WINDOW } from "./cache-ledger.js";
@@ -199,7 +199,11 @@ type Logger = (level: "info" | "warn" | "error", msg: string) => void;
 function mergeState(parsed: CompressionState): CompressionState {
     const fresh = createInitialState();
     return {
-        blocks: parsed.blocks ?? fresh.blocks,
+        // #2627: heal persisted state written before the turn-separator fix —
+        // those blocks' coverage carries outbound-only acp_turn_sep_* ids that
+        // no resent history can ever contain; scrubbing at hydration is what
+        // stops live long sessions from alarming forever after an upgrade.
+        blocks: (() => { const blocks = parsed.blocks ?? fresh.blocks; scrubTurnSeparatorIds(blocks); return blocks; })(),
         messageRefs: parsed.messageRefs ?? fresh.messageRefs,
         nudge: { ...fresh.nudge, ...(parsed.nudge ?? {}) },
         stats: { ...fresh.stats, ...(parsed.stats ?? {}) },

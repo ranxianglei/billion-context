@@ -2,7 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { collectBlockContent, countMessageTokens, defaultCountTokens, formatRanges, storeCoveredOriginals, viableRanges, type CompressionCore, type Config, type CoreMessage, type CompressionState, type NudgeDecision, type CompressParseDiagnostics } from "acp-kernel";
 import { handleAcpStatus } from "./acp-status.js";
 import { handleAcpCache, recordCacheFoldsFromBlocks } from "./cache-ledger.js";
-import { type Session, cacheBlockContent, markDirty, statusInputBaseline } from "./session.js";
+import { type Session, cacheBlockContent, markDirty, scrubTurnSeparatorIds, statusInputBaseline } from "./session.js";
 import { COMPRESS_TOOL_NAME, parseCompressInput, ABSORB_TOOL_NAME, type ParsedRange } from "./compress-tool.js";
 import { effectiveAbsorbConfig, executeAbsorb, isProxyToolFor } from "./absorb.js";
 import { executeSearchContextTarget, resolveDecompress } from "./decompress-shared.js";
@@ -647,6 +647,15 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         const beforeIds = new Set(ctx.session.state.blocks.map((b) => b.blockId));
         const beforeSummaries = new Map(ctx.session.state.blocks.map((b) => [b.blockId, b.summary] as const));
         ctx.session.state = res.state;
+        // #2627 backstop: no committed state may carry outbound-only turn-
+        // separator ids in coverage (a polluted child would otherwise re-
+        // poison higher folds via effectiveMessageIds inheritance). Runs
+        // before CCR/storeCoveredOriginals and subagent mirroring below so
+        // they see clean coverage.
+        {
+            const scrubbed = scrubTurnSeparatorIds(ctx.session.state.blocks);
+            if (scrubbed > 0) ctx.log(`[acp-proxy: scrubbed ${scrubbed} turn-separator id(s) from fold coverage (#2627)]`);
+        }
         // Cache original content for newly-created blocks. At compress time the
         // source messages are still in ctx.messages (this round's view, before
         // the next processTurn folds them). Storing the text here lets decompress

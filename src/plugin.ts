@@ -1610,6 +1610,13 @@ export async function handlePluginTool(
                 // (same values the wire path used), not the base kernelConfig.
                 config: effectiveConfig(session, deps.config),
                 messages,
+                // #2627: compress against the RAW history, not the processed
+                // outbound view — on the Responses wire that view carries the
+                // synthetic acp_turn_sep_* ordering separators, which would be
+                // registered into new blocks' coverage and read back as
+                // permanent drift against the client's unchanged history
+                // (same split as the relay loop ctx).
+                compressMessages: mem && mem.original.length > 0 ? mem.original : undefined,
                 session,
                 log: (m) => deps.log("info", `[${session.id}] [plugin] ${m}`),
             }, callId, undefined, deps.signal);
