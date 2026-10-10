@@ -160,7 +160,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | Key | Type | Default | Env | Description |
 |-----|------|---------|-----|-------------|
 | `autoUpdate` | boolean | true | ACP_AUTO_UPDATE | Automatic npm version checks (every ~3 min); disable via ACP_AUTO_UPDATE=0 or --no-auto-update. |
-| `autoRestartOnUpdate` | boolean | false (manual start) / true (host-spawned lane proxy, #2507) | ACP_AUTO_RESTART_ON_UPDATE | Restart the daemon automatically once a newer version has been installed. Default ON for host-spawned resident proxies (their host never restarts); OFF for manual `bili start`. |
+| `autoRestartOnUpdate` | boolean | false (manual start) / true (host-spawned lane proxy, #2507) | ACP_AUTO_RESTART_ON_UPDATE | Restart the daemon automatically once a newer version has been installed. Default ON for host-spawned resident proxies (their host never restarts); OFF for a manual bili start. |
 | `updateTag` | string | latest | ACP_UPDATE_TAG | npm dist-tag channel for self-updates: latest (default), dev, or pr. |
 | `update` | object | {} (all defaults) | — | Self-update channel settings. |
 | `update.registry` | string | "npmjs" (registry.npmjs.org) | BILI_UPDATE_REGISTRY | Custom npm registry base URL for self-updates (private mirrors). |
@@ -1569,7 +1569,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 <!-- bili:gen env-map -->
 | Env var | Config key | Default |
 |---------|------------|--------|
-| `ACP_AUTO_RESTART_ON_UPDATE` | `autoRestartOnUpdate` | false (true on host-spawned lane proxies, #2507) |
+| `ACP_AUTO_RESTART_ON_UPDATE` | `autoRestartOnUpdate` | false (manual start) / true (host-spawned lane proxy, #2507) |
 | `ACP_AUTO_UPDATE` | `autoUpdate` | true |
 | `ACP_COMPRESS_NUDGE` | `compress.injectNudge` | true |
 | `ACP_COMPRESS_PROTOCOL` | `diagnostics.compressProtocol` | "tools" |

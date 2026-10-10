@@ -15,15 +15,15 @@ entries:
     site_zh: "<code>autoUpdate</code> —— 自动版本检查（默认开；ACP_AUTO_UPDATE=0 或 --no-auto-update 关闭）。"
   - key: autoRestartOnUpdate
     type: boolean
-    default: "false"
+    default: "false (manual start) / true (host-spawned lane proxy, #2507)"
     env: ACP_AUTO_RESTART_ON_UPDATE
     group: updates
     id: tt.arst
     site_group: diag
-    desc_en: "Restart the daemon automatically once a newer version has been installed."
-    desc_zh: "新版本装好后自动重启守护进程。"
-    site_en: "<code>autoRestartOnUpdate</code> — restart the daemon automatically once a newer version is installed (opt-in)."
-    site_zh: "<code>autoRestartOnUpdate</code> —— 新版本装好后自动重启守护进程（可选开启）。"
+    desc_en: "Restart the daemon automatically once a newer version has been installed. Default ON for host-spawned resident proxies (their host never restarts); OFF for a manual bili start."
+    desc_zh: "新版本装好后自动重启守护进程。宿主拉起的常驻代理默认开启（宿主自身永不重启）；手动 bili start 默认关闭。"
+    site_en: "<code>autoRestartOnUpdate</code> — restart the daemon automatically once a newer version is installed (on by default for host-spawned lane proxies; off for manual start)."
+    site_zh: "<code>autoRestartOnUpdate</code> —— 新版本装好后自动重启守护进程（宿主拉起的 lane 代理默认开；手动启动默认关）。"
   - key: updateTag
     type: string
     default: "latest"

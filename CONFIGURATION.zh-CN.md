@@ -160,7 +160,7 @@
 | Key | Type | Default | Env | Description |
 |-----|------|---------|-----|-------------|
 | `autoUpdate` | boolean | true | ACP_AUTO_UPDATE | 自动 npm 版本检查（约每 3 分钟）；ACP_AUTO_UPDATE=0 或 --no-auto-update 关闭。 |
-| `autoRestartOnUpdate` | boolean | false（手动启动）/ true（宿主拉起的 lane 代理，#2507） | ACP_AUTO_RESTART_ON_UPDATE | 新版本装好后自动重启守护进程。宿主拉起的常驻代理默认开启（宿主自身永不重启）；手动 `bili start` 默认关闭。 |
+| `autoRestartOnUpdate` | boolean | false (manual start) / true (host-spawned lane proxy, #2507) | ACP_AUTO_RESTART_ON_UPDATE | 新版本装好后自动重启守护进程。宿主拉起的常驻代理默认开启（宿主自身永不重启）；手动 bili start 默认关闭。 |
 | `updateTag` | string | latest | ACP_UPDATE_TAG | 自更新的 npm dist-tag 通道：latest（默认）、dev 或 pr。 |
 | `update` | object | {} (all defaults) | — | 自更新通道设置。 |
 | `update.registry` | string | "npmjs" (registry.npmjs.org) | BILI_UPDATE_REGISTRY | 自更新用的自定义 npm registry 基础地址（私有镜像）。 |
@@ -1568,7 +1568,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 <!-- bili:gen env-map -->
 | 环境变量 | 配置文件键 | 默认值 |
 |---------|------------|--------|
-| `ACP_AUTO_RESTART_ON_UPDATE` | `autoRestartOnUpdate` | false（宿主拉起的 lane 代理为 true，#2507） |
+| `ACP_AUTO_RESTART_ON_UPDATE` | `autoRestartOnUpdate` | false (manual start) / true (host-spawned lane proxy, #2507) |
 | `ACP_AUTO_UPDATE` | `autoUpdate` | true |
 | `ACP_COMPRESS_NUDGE` | `compress.injectNudge` | true |
 | `ACP_COMPRESS_PROTOCOL` | `diagnostics.compressProtocol` | "tools" |
