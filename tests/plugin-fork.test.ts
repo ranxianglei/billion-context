@@ -24,6 +24,16 @@ test.after(() => rmSync(testRoot, { recursive: true, force: true }));
 for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = testRoot;
 const hash = (v: unknown) => createHash("sha256").update(JSON.stringify(v)).digest("hex");
 
+type ForkRecord = { forkContentStore?: ReturnType<typeof createContentStore> };
+
+// #2675: session records on disk are kernel envelopes ({version, savedAt, id, payload});
+// unpick like loadSessionFromFile does (src/persist.ts) so tests can reach the record body.
+function readRecord(file: string): { envelope: Record<string, unknown>; record: ForkRecord } {
+    const envelope = JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>;
+    const payload = envelope.payload;
+    return { envelope, record: (payload && typeof payload === "object" ? payload : envelope) as ForkRecord };
+}
+
 interface SnapshotResponse {
     status: string;
     code?: string;
@@ -533,7 +543,7 @@ test("HTTP CCR shared payload deletion fails closed before persistence", async (
     } finally { await h.close(); }
 });
 
-for (const corruption of ["missing-ref", "missing-payload", "orphan-payload", "wrong-raw-alias", "changed-payload"] as const) {
+for (const corruption of ["missing-ref", "missing-payload", "wrong-raw-alias"] as const) {
     test(`HTTP CCR ${corruption} fails closed after cold disk restore`, async () => {
         const h = await harness(true);
         try {
@@ -551,19 +561,25 @@ for (const corruption of ["missing-ref", "missing-payload", "orphan-payload", "w
             assert(h.store.flushSync(parent));
             const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
             const namespace = join(h.dir, "sessions", parent.meta.protocol!);
-            const filename = readdirSync(namespace).find((name) => name.endsWith(".content-store.json"));
+            // #2675: a retained parent now embeds its content store in the session
+            // RECORD too (symmetric with pluginSnapshot), and buildSession restores
+            // the embedded copy OVER any companion — so the embedded copy is the
+            // authoritative one to corrupt here; companion-only loss is masked by
+            // design (see the retention test below). Orphan/byte-level damage moved
+            // to the opt-in whole-store audit (BILI_FORK_STORE_AUDIT, tested below).
+            const filename = readdirSync(namespace).find((name) => name.endsWith(".json") && !name.endsWith(".content-store.json"));
             assert(filename);
             const path = join(namespace, filename);
-            const disk = JSON.parse(readFileSync(path, "utf8")) as typeof store;
+            const { envelope, record } = readRecord(path);
+            assert(record.forkContentStore?.byRef.m00001 && record.forkContentStore.byRef.m00002);
+            const disk = record.forkContentStore!;
             const payloadHash = disk.byRef.m00001!.hash;
             switch (corruption) {
                 case "missing-ref": delete disk.byRef.m00001; break;
                 case "missing-payload": delete disk.byHash[payloadHash]; break;
-                case "orphan-payload": disk.byHash[createHash("sha256").update("orphan").digest("hex")] = "orphan"; break;
                 case "wrong-raw-alias": disk.byRef.m00001!.rawId = parent.pluginSnapshot![1].id; break;
-                case "changed-payload": disk.byHash[payloadHash] = "corrupted original"; break;
             }
-            writeFileSync(path, JSON.stringify(disk));
+            writeFileSync(path, JSON.stringify(envelope));
             h.store.cancelAll();
             _resetSessionsForTest();
             _resetPluginStateForTest();
@@ -578,10 +594,47 @@ for (const corruption of ["missing-ref", "missing-payload", "orphan-payload", "w
             assert.equal(resolveConversation("child").session, undefined);
             assert.equal(h.store.loadSync("child"), null);
             assert.equal(parentState(), before);
-            assert.equal(readFileSync(path, "utf8"), JSON.stringify(disk));
+            assert.equal(readFileSync(path, "utf8"), JSON.stringify(envelope));
         } finally { await h.close(); }
     });
 }
+
+test("HTTP retained parent embeds its content store and survives companion loss", async () => {
+    const h = await harness(true);
+    try {
+        const parent = resolveConversation("parent").session!;
+        let store = createContentStore();
+        for (const [i, message] of parent.pluginSnapshot!.slice(0, 2).entries()) {
+            store = storeOriginal(store, { ref: `m0000${i + 1}`, rawId: message.id, text: "shared payload", kind: "original", tokens: 10, head: "shared" });
+        }
+        parent.contentStore = store;
+        parent.contentStoreDirty = true;
+        parent.metadata.publicSnapshotRetained = true;
+        assert(h.store.flushSync(parent));
+        const namespace = join(h.dir, "sessions", parent.meta.protocol!);
+        const recordName = readdirSync(namespace).find((name) => name.endsWith(".json") && !name.endsWith(".content-store.json"));
+        assert(recordName);
+        const { record } = readRecord(join(namespace, recordName));
+        // #2675 symmetric retention: pre-fix a retained PARENT embedded no store
+        // (only children carrying a publicForkReceipt did), so a restarted parent
+        // kept raw refs whose originals had left the companion and failed closed
+        // forever with "CCR original index unavailable".
+        assert(record.forkContentStore?.byRef.m00001 && record.forkContentStore.byRef.m00002);
+        const companionName = readdirSync(namespace).find((name) => name.endsWith(".content-store.json"));
+        assert(companionName);
+        rmSync(join(namespace, companionName));
+        h.store.cancelAll();
+        _resetSessionsForTest();
+        _resetPluginStateForTest();
+        const restored = getSession("parent");
+        const storeAfter = contentStoreOf(restored);
+        assert(storeAfter.byRef.m00001 && storeAfter.byRef.m00002);
+        const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
+        const fork = await h.request("/__bili/plugin/fork", forkRequest(snapshot));
+        assert.equal(fork.status, 201);
+        assert.equal(fork.body.childConversationId, "child");
+    } finally { await h.close(); }
+});
 
 test("HTTP fork revision and originals survive a new proxy process", async () => {
     const h = await harness(true);

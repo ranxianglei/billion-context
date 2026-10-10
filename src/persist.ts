@@ -829,8 +829,18 @@ function buildRecord(session: Session): PersistedSession {
         // was cut from this one and set the sticky retained flag). Non-forking
         // sessions pay no disk cost; the in-memory copy self-heals on the next
         // model request because plugin agents resend their full history.
+        // #2675: the content store rides on the SAME condition as the snapshot
+        // — the retained flag promises the parent stays forkable after restart,
+        // which requires every ref listed in publicSnapshotStoredRefs to be
+        // retrievable. Persisting only the raw snapshot (the old child-receipt-
+        // only condition) let a restarted parent carry refs whose originals its
+        // companion .content-store.json had since lost (rebase reset deletes it,
+        // a protocol/upstream switch orphans its path), failing forkSnapshot
+        // closed forever with "CCR original index unavailable". The embedded
+        // copy is self-contained: buildSession restores it over any companion,
+        // the same precedence children already have.
         pluginSnapshot: session.metadata.publicForkReceipt !== undefined || session.metadata.publicSnapshotRetained === true ? session.pluginSnapshot : undefined,
-        forkContentStore: session.metadata.publicForkReceipt ? session.contentStore : undefined,
+        forkContentStore: session.metadata.publicForkReceipt !== undefined || session.metadata.publicSnapshotRetained === true ? session.contentStore : undefined,
         // Per-session provenance: record the bili build that wrote this file so the
         // web UI can show which version last touched the session; pre-stamp files
         // load without the key and render an honest dash.
