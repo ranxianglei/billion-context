@@ -48,6 +48,8 @@ interface GoldenRecord {
     editedAt: number;      // body index after the mid-history edit
     summaryFrom: number;   // first body index carrying the fold summary
     stateDigest: string;   // sha256 of the canonicalized persisted session
+    sectionDigests: Record<string, string>; // drift localization (same normalization)
+    stateKeyDigests: Record<string, string>; // per-top-level-state-key digests
     stateShape: {          // human-readable facts baked into the snapshot
         refs: number;
         blocks: number;
@@ -460,6 +462,24 @@ export async function driveWire(wire: Wire, sessionId = `golden-${wire}`, opts: 
             .replace(/127\.0\.0\.1:\d+/g, "127.0.0.1:<PORT>")
             .split(JSON.stringify(sessionId).slice(1, -1)).join("<SID>");
         const stateDigest = sha256(lastView);
+        // Localization aid for cross-machine digest drift: per-section and
+        // per-top-level-state-key digests under the SAME normalization, so a
+        // CI failure message pinpoints the divergent subtree without needing
+        // the golden to carry the full view.
+        const norm = (v: unknown) =>
+            (JSON.stringify(canonicalize(v)) ?? "null")
+                .replace(/127\.0\.0\.1:\d+/g, "127.0.0.1:<PORT>")
+                .split(JSON.stringify(sessionId).slice(1, -1)).join("<SID>");
+        const sectionDigests = {
+            state: sha256(norm(session.state)).slice(0, 16),
+            blockContents: sha256(norm([...session.blockContents.entries()])).slice(0, 16),
+            stats: sha256(norm(session.stats)).slice(0, 16),
+            metadata: sha256(norm(session.metadata)).slice(0, 16),
+        };
+        const stateKeyDigests: Record<string, string> = {};
+        for (const [k, v] of Object.entries(session.state as unknown as Record<string, unknown>)) {
+            stateKeyDigests[k] = sha256(norm(v)).slice(0, 16);
+        }
         if (opts.dumpStateTo) fs.writeFileSync(opts.dumpStateTo, JSON.stringify(JSON.parse(lastView), null, 1));
         const st = session.state as { messageRefs?: { byRaw?: Record<string, string>; byRef?: Record<string, string> }, blocks?: Array<{ blockId: string; active: boolean; effectiveMessageIds?: string[] }>, deadRefs?: string[] };
         const active = st.blocks?.filter((b) => b.active) ?? [];
@@ -470,6 +490,8 @@ export async function driveWire(wire: Wire, sessionId = `golden-${wire}`, opts: 
             editedAt,
             summaryFrom: bodies.findIndex((b) => b.includes(SUMMARY_MARKER)),
             stateDigest,
+            sectionDigests,
+            stateKeyDigests,
             stateShape: {
                 refs: Object.keys(st.messageRefs?.byRaw ?? {}).length,
                 blocks: st.blocks?.length ?? 0,

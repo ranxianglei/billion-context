@@ -37,9 +37,17 @@ for (const wire of WIRES) {
         const actual = JSON.stringify(record, null, 1) + "\n";
         if (actual !== expected) {
             // Pin the most drift-relevant facts in the failure message too.
-            const exp = JSON.parse(expected) as { foldAt: number; editedAt: number; stateDigest: string };
+            const exp = JSON.parse(expected) as { foldAt: number; editedAt: number; stateDigest: string; sectionDigests?: Record<string, string>; stateKeyDigests?: Record<string, string> };
+            const secs = record.sectionDigests && exp.sectionDigests
+                ? ` sections: ${JSON.stringify(record.sectionDigests)} vs golden ${JSON.stringify(exp.sectionDigests)}`
+                : "";
+            const keys = record.stateKeyDigests && exp.stateKeyDigests
+                ? `; state-key divergence: ${Object.keys(record.stateKeyDigests)
+                    .filter((k) => exp.stateKeyDigests?.[k] !== record.stateKeyDigests?.[k])
+                    .map((k) => `${k}=${record.stateKeyDigests?.[k]} (golden ${exp.stateKeyDigests?.[k]})`).join(", ") || "none"}`
+                : "";
             assert.fail(
-                `${wire} render/state drifted. foldAt ${record.foldAt} (golden ${exp.foldAt}), editedAt ${record.editedAt} (golden ${exp.editedAt}), stateDigest ${record.stateDigest.slice(0, 16)} (golden ${exp.stateDigest.slice(0, 16)}). ` +
+                `${wire} render/state drifted. foldAt ${record.foldAt} (golden ${exp.foldAt}), editedAt ${record.editedAt} (golden ${exp.editedAt}), stateDigest ${record.stateDigest.slice(0, 16)} (golden ${exp.stateDigest.slice(0, 16)}).${secs}${keys} ` +
                 `If intentional: run \`node --import tsx scripts/update-storage-render-goldens.ts\`, review the diff, justify in the PR body.`,
             );
         }

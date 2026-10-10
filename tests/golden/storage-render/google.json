@@ -81,6 +81,30 @@
  "editedAt": 12,
  "summaryFrom": 9,
  "stateDigest": "4af446bacadf93b94f07b0143ddb733ce20d3871943aa97054623cc40c2b26ae",
+ "sectionDigests": {
+  "state": "c875a4ab11a32747",
+  "blockContents": "4cc83a808a659f28",
+  "stats": "fdf3b11af13eed6c",
+  "metadata": "069d383dfced7a0b"
+ },
+ "stateKeyDigests": {
+  "blocks": "9adb53303cd4b786",
+  "messageRefs": "88c0c8bd0af470a2",
+  "nudge": "9cde23b7cfa4903a",
+  "stats": "a9fb72796521427d",
+  "nextBlockId": "d4735e3a265e16ee",
+  "nextRunId": "d4735e3a265e16ee",
+  "tokenSnapshot": "7b878c9bb77cf91a",
+  "lastPassIds": "c167fddb9a47e6ca",
+  "hiddenOrphanRefs": "4f53cda18c2baa0c",
+  "deadRefs": "74234e98afe7498f",
+  "terminalStreak": "5feceb66ffc86f38",
+  "nextRuleId": "6b86b273ff34fce1",
+  "absorbed": "4f53cda18c2baa0c",
+  "rules": "4f53cda18c2baa0c",
+  "imageFullRestored": "4f53cda18c2baa0c",
+  "imageShrinks": "4f53cda18c2baa0c"
+ },
  "stateShape": {
   "refs": 42,
   "blocks": 1,
