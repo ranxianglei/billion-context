@@ -27,6 +27,7 @@ const hash = (v: unknown) => createHash("sha256").update(JSON.stringify(v)).dige
 interface SnapshotResponse {
     status: string;
     code?: string;
+    error?: string;
     sessionId: string;
     parentRevision: string;
     orderedMessages: { rawId: string; ref: string; identityHash: string }[];
@@ -70,7 +71,7 @@ async function responseBody<Path extends string>(response: Response, _path: Path
     return body as PluginResponse<Path>;
 }
 
-async function harness(persist = false, seedParent = true) {
+async function harness(persist = false, seedParent = true, compressExtra: Record<string, unknown> = {}) {
     const dir = mkdtempSync(join(testRoot, "run-"));
     for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = dir;
     _resetSessionsForTest();
@@ -96,7 +97,7 @@ async function harness(persist = false, seedParent = true) {
     const addr = upstream.address();
     assert(addr && typeof addr === "object");
     const upstreamUrl = `http://127.0.0.1:${addr.port}`;
-    const proxy = await startServer({ port: 0, host: "127.0.0.1", upstream: upstreamUrl, routes: { [upstreamUrl]: { models: { "claude-test": { context: 400000 } } } }, modelContextLimit: 400000, kernelConfig: defaultConfig(400000), compress: { injectTool: true, injectNudge: true, preserveRecentMessages: 1, preserveRecentTokens: 0, minCompressRangeChars: 100 }, promptCache: { routing: "auto" }, sessionHeader: "x-acp-session", log: false, debug: false, passthrough: false, autoUpdate: false, mitm: { enabled: false, domains: [] } } as ProxyOptions);
+    const proxy = await startServer({ port: 0, host: "127.0.0.1", upstream: upstreamUrl, routes: { [upstreamUrl]: { models: { "claude-test": { context: 400000 } } } }, modelContextLimit: 400000, kernelConfig: defaultConfig(400000), compress: { injectTool: true, injectNudge: true, preserveRecentMessages: 1, preserveRecentTokens: 0, minCompressRangeChars: 100, ...compressExtra }, promptCache: { routing: "auto" }, sessionHeader: "x-acp-session", log: false, debug: false, passthrough: false, autoUpdate: false, mitm: { enabled: false, domains: [] } } as ProxyOptions);
     await once(proxy, "listening");
     const paddr = proxy.address();
     assert(paddr && typeof paddr === "object");
@@ -244,6 +245,53 @@ function forkRequest(snapshot: { parentRevision: string; orderedMessages: unknow
     const orderedMessages = snapshot.orderedMessages.slice(0, count);
     return { protocolVersion: 1, parentConversationId: "parent", childConversationId: child, parentRevision: snapshot.parentRevision, branchPoint: { messageCount: count, orderHash: hash(orderedMessages) }, orderedMessages, idempotencyKey: `fork-${child}` };
 }
+
+test("HTTP protected tools keep plain-text snapshots, forks and revisions usable (#2620)", async () => {
+    const h = await harness(false, false, { protectedTools: ["ask_user_question"] });
+    try {
+        const history = [
+            { role: "user", content: "Synthetic snapshot test" },
+            { role: "assistant", content: "Starting" },
+            { role: "assistant", content: null, tool_calls: [{ id: "q1", type: "function", function: { name: "ask_user_question", arguments: "{}" } }] },
+            { role: "tool", tool_call_id: "q1", content: '{"decision":"continue"}' },
+            { role: "assistant", content: null, tool_calls: [{ id: "q2", type: "function", function: { name: "ask_user_question", arguments: "{}" } }] },
+            { role: "tool", tool_call_id: "q2", content: '{"decision":"retry"}' },
+            ...Array.from({ length: 6 }, (_, i) => ({ role: i % 2 ? "assistant" : "user", content: `tail ${i}` })),
+        ];
+        await sendIntentModel(h, "parent", history, [], "main");
+        const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(snapshot.status, 200, JSON.stringify(snapshot.body));
+        const refs = snapshot.body.orderedMessages.map((m) => m.ref);
+        assert.equal(refs.length, history.length);
+        assert.ok(refs.slice(0, 2).every((ref) => /^m\d{5,}$/.test(ref)), JSON.stringify(refs));
+        // Both protected pairs (tool-call + paired result) carry the kernel sentinel.
+        assert.deepEqual(refs.slice(2, 6), ["BLOCKED", "BLOCKED", "BLOCKED", "BLOCKED"]);
+        assert.ok(refs.slice(6).every((ref) => /^m\d{5,}$/.test(ref)), JSON.stringify(refs));
+        const fork = await h.request("/__bili/plugin/fork", forkRequest(snapshot.body, "child", history.length));
+        assert.equal(fork.status, 201, JSON.stringify(fork.body));
+        const childSnap = (await h.request("/__bili/plugin/snapshot?conversationId=child")).body;
+        assert.deepEqual(childSnap.orderedMessages, snapshot.body.orderedMessages);
+        const childSession = resolveConversation("child").session!;
+        assert.equal(childSession.state.messageRefs.byRef["BLOCKED"], undefined);
+        assert.ok(Object.values(childSession.state.messageRefs.byRaw).includes("BLOCKED"));
+        await sendIntentModel(h, "child", [...history, { role: "assistant", content: "child continuation" }], [], "main");
+        assert.ok((await h.request("/__bili/plugin/status?conversationId=parent")).body.sessionRevision);
+    } finally { await h.close(); }
+});
+
+test("HTTP snapshot still rejects a genuinely inconsistent raw/ref mapping (#2620)", async () => {
+    const h = await harness();
+    try {
+        const session = resolveConversation("parent").session!;
+        const rawId = Object.keys(session.state.messageRefs.byRaw)[0];
+        assert(rawId);
+        session.state.messageRefs.byRaw[rawId] = "m99999";
+        const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(snapshot.status, 409);
+        assert.equal(snapshot.body.code, "SNAPSHOT_UNAVAILABLE");
+        assert.match(String(snapshot.body.error), /raw\/ref mapping inconsistent/);
+    } finally { await h.close(); }
+});
 
 test("HTTP tool witnesses never override explicit parent, child or sibling identities", async () => {
     const h = await harness();

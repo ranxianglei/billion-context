@@ -1,4 +1,4 @@
-import { type CompressionCore, type Config, type CoreMessage, type NudgeDecision, countMessageTokens, parseStoredPlaceholder, prune } from "acp-kernel";
+import { BLOCKED_REF, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, countMessageTokens, parseStoredPlaceholder, prune } from "acp-kernel";
 import { publicSnapshotCapBytes } from "./knobs.js";
 import { buildStatusPanel } from "acp-kernel/panel";
 import { fileURLToPath } from "node:url";
@@ -970,7 +970,9 @@ export function publicForkInputMatches(session: Session, protocol: WireProtocol,
         return incoming !== null && incoming.length >= prefix.length && prefix.every((message, index) => {
             const candidate = incoming[index]!;
             const ref = session.state.messageRefs.byRaw[message.id];
-            return ref !== undefined && session.state.messageRefs.byRef[ref] === message.id
+            // #2620: protected tool calls/results carry the kernel BLOCKED sentinel (no numeric
+            // ref, byRef never holds it) — a legitimate state, not a broken mapping.
+            return ref !== undefined && (ref === BLOCKED_REF || session.state.messageRefs.byRef[ref] === message.id)
                 && candidate.id === message.id && forkMessageIdentityHash(candidate) === forkMessageIdentityHash(message);
         });
     } catch {
@@ -1005,7 +1007,10 @@ function forkSnapshot(session: Session) {
     if (Object.entries(store.byRef).some(([ref, entry]) => typeof store.byHash[entry.hash] !== "string" || session.state.messageRefs.byRaw[entry.rawId] !== ref || session.state.messageRefs.byRef[ref] !== entry.rawId)) throw new Error("CCR original alias inconsistent");
     const orderedMessages = messages.map((m): ForkIdentity => {
         const ref = session.state.messageRefs.byRaw[m.id];
-        if (!ref || session.state.messageRefs.byRef[ref] !== m.id) throw new Error("raw/ref mapping inconsistent");
+        // #2620: protected tool calls/results map to the kernel BLOCKED sentinel by design
+        // (kernel assignRefs) — no numeric ref exists and byRef never holds it, so the
+        // bidirectional check applies only to numeric refs; genuine corruption still fails.
+        if (!ref || (ref !== BLOCKED_REF && session.state.messageRefs.byRef[ref] !== m.id)) throw new Error("raw/ref mapping inconsistent");
         const entry = store.byRef[ref];
         const placeholder = m.text ? parseStoredPlaceholder(m.text) : null;
         if ((entry && (entry.rawId !== m.id || typeof store.byHash[entry.hash] !== "string")) || (placeholder && (placeholder.ref !== ref || !entry))) throw new Error("CCR original unavailable or alias inconsistent");
@@ -1059,7 +1064,8 @@ function parseForkRequest(payload: string): ForkRequest {
     const orderedMessages = b.orderedMessages.map((v: unknown): ForkIdentity => {
         if (!v || typeof v !== "object") throw new Error("invalid ordered identity");
         const item = v as Record<string, unknown>;
-        if (!identifier(item.rawId) || typeof item.ref !== "string" || !/^m\d{5,}$/.test(item.ref) || !hash(item.identityHash)) throw new Error("invalid raw/ref identity");
+        // #2620: the kernel BLOCKED sentinel is a legal snapshot ref for protected tool messages.
+        if (!identifier(item.rawId) || typeof item.ref !== "string" || (item.ref !== BLOCKED_REF && !/^m\d{5,}$/.test(item.ref)) || !hash(item.identityHash)) throw new Error("invalid raw/ref identity");
         return { rawId: item.rawId, ref: item.ref, identityHash: item.identityHash };
     });
     return { protocolVersion: 1, parentConversationId: b.parentConversationId, childConversationId: b.childConversationId, parentRevision: b.parentRevision, branchPoint: { messageCount: point.messageCount as number, orderHash: point.orderHash }, orderedMessages, idempotencyKey: b.idempotencyKey };
@@ -1125,7 +1131,9 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             child.state.messageRefs = structuredClone(parent.state.messageRefs);
             for (const { rawId, ref } of prefix) {
                 child.state.messageRefs.byRaw[rawId] = ref;
-                child.state.messageRefs.byRef[ref] = rawId;
+                // #2620: byRef must never hold the BLOCKED sentinel (kernel invariant; multiple
+                // protected messages share it) — reserve byRaw only, and there is no tokenSnapshot.
+                if (ref !== BLOCKED_REF) child.state.messageRefs.byRef[ref] = rawId;
                 if (parent.state.tokenSnapshot[ref] !== undefined) child.state.tokenSnapshot[ref] = parent.state.tokenSnapshot[ref];
             }
             child.state.nextBlockId = parent.state.nextBlockId;

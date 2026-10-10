@@ -1,5 +1,5 @@
 import { anthropicToCore, googleToCore, openaiToCore } from "acp-kernel/wire";
-import { STORED_PLACEHOLDER_MARKER, highestUsedIndex, type CompressionBlock, type CoreMessage } from "acp-kernel";
+import { BLOCKED_REF, STORED_PLACEHOLDER_MARKER, highestUsedIndex, type CompressionBlock, type CoreMessage } from "acp-kernel";
 import { stripAcpPanelMessages, stripAcpPanelResponsesInput, stripAcpStatusMarkers } from "./acp-panel.js";
 import { normalizeResponsesMessageItems, sanitizeResponsesInputIds, dropWhitespaceResponsesMessages } from "./loop/adapter-responses.js";
 import { responsesToCoreWithToolImages } from "./responses-tool-output.js";
@@ -216,11 +216,13 @@ export function planForkAdoption(
         const ref = parent.state.messageRefs.byRaw[raw];
         if (!ref) continue;
         byRaw[raw] = ref;
-        byRef[ref] = raw;
+        // #2620: the kernel BLOCKED sentinel (protected tool messages) has no numeric
+        // counterpart and is shared by many messages — byRef must never hold it.
+        if (ref !== BLOCKED_REF) byRef[ref] = raw;
         const snap = parent.state.tokenSnapshot[ref];
-        if (typeof snap === "number") tokenSnapshot[ref] = snap;
+        if (typeof snap === "number" && ref !== BLOCKED_REF) tokenSnapshot[ref] = snap;
         const idx = Number(ref.replace(/\D/g, "")) || 0;
-        if (idx > maxIndex) {
+        if (idx > maxIndex && ref !== BLOCKED_REF) {
             maxIndex = idx;
             maxRef = ref;
         }
