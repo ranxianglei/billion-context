@@ -9,7 +9,7 @@ import { createHash } from "node:crypto";
 import { getStore } from "./persist.js";
 import { cloneStoreForRefs } from "./store.js";
 import { acquireInFlight, createSession, getSession, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, statusInputBaseline, withSessionLock, type Session } from "./session.js";
-import { clientConversationHeader } from "./session-id.js";
+import { clientConversationHeader, personaForkLaneApplies } from "./session-id.js";
 import { ABSORB_TOOL_NAME, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, PROXY_TOOL_NAMES, RETRIEVE_TOOL_NAME, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_TOOL_NAME, absorbToolsFor, retrieveToolsFor } from "./compress-tool.js";
 import { externalSummaryEnabled, withExternalSummaryTools } from "./external-summary-surface.js";
 import { absorbEnabled, effectiveAbsorbConfig, isProxyToolFor } from "./absorb.js";
@@ -1434,6 +1434,35 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     }));
 }
 
+/** #2241: a dsh mid-session model switch changes the main lane's system text, so the persona fingerprint forks THAT LANE onto `<id>|sub:<fp>` while the host keeps stamping the bare id on every tool call. The child is the SAME conversation — the suffix is proxy-invented and unknowable to the host — so a host-stamped id resolving to the frozen parent anchor must follow the live child instead of executing against the husk (#2024's native-caller authority covers GENUINE cross-session conflicts only). Candidate order by trust: the outbound witness ring first (it names the exact session that emitted this call), then the persisted conversations map (survives proxy restarts; the child must be STRICTLY fresher than the parent or the parent may still be alive — e.g. the model switched back and re-anchored on the raw key). Lane-gated (personaForkLaneApplies): other hosts reuse the `|sub:` key shape for unrelated splits (Claude Code subagents, #970). */
+function personaForkTarget(
+    conversationId: string,
+    parentSession: Session | undefined,
+    witnessIds: Set<string>,
+): { sessionId: string; via: "witness" | "registry" } | undefined {
+    if (!parentSession || !personaForkLaneApplies(parentSession.metadata.pluginAgent)) return undefined;
+    const prefix = `${conversationId}|sub:`;
+    let best: string | undefined;
+    let bestSeen = -Infinity;
+    for (const w of witnessIds) {
+        const cid = conversationIdForSession(w);
+        if (cid === undefined || !cid.startsWith(prefix)) continue;
+        const seen = peekSession(w)?.lastSeen ?? -Infinity;
+        if (seen > bestSeen || (seen === bestSeen && (best === undefined || cid < best))) {
+            bestSeen = seen;
+            best = cid;
+        }
+    }
+    if (best !== undefined) return { sessionId: best, via: "witness" };
+    const parentSeen = conversations.get(conversationId)?.lastSeen ?? Number.MAX_SAFE_INTEGER;
+    for (const [cid, e] of conversations) {
+        if (!cid.startsWith(prefix) || e.lastSeen <= parentSeen || e.lastSeen <= bestSeen) continue;
+        bestSeen = e.lastSeen;
+        best = cid;
+    }
+    return best !== undefined ? { sessionId: best, via: "registry" } : undefined;
+}
+
 export async function handlePluginTool(
     payload: string,
     res: import("node:http").ServerResponse,
@@ -1466,14 +1495,32 @@ export async function handlePluginTool(
     const witnessIds = tool ? lookupToolWitness(tool, bodyArgs) : new Set<string>();
     let session: Session | undefined;
     let entry: ConversationEntry | undefined;
-    let routedBy: "witness" | "body" | "arb" | "native" = "body";
+    let routedBy: "witness" | "body" | "arb" | "native" | "persona" = "body";
     if (conversationId) {
         session = resolveForkConversation(conversationId);
         entry = conversations.get(conversationId);
         if (session && witnessIds.size > 0 && !witnessIds.has(session.id)) {
             if (!nativeCaller) return forkReply(res, 409, { ok: false, code: "TOOL_CONVERSATION_CONFLICT", error: "outbound tool witness does not match conversationId" });
-            routedBy = "native";
-            deps.log("warn", `[plugin] tool "${tool}": host-stamped native caller "${conversationId}" conflicts with outbound witness — honoring the native caller, refusing the witness (#2024)`);
+            // #2241: a conflicting witness that is THIS id's own persona fork (`<id>|sub:<fp>` — the proxy-invented suffix the host cannot stamp) is the same conversation, not a conflict: the dsh main lane forked off the frozen parent anchor on a mid-session model switch. Follow the fork; #2024's native-caller authority stays for genuine cross-session witnesses.
+            const fork = personaForkTarget(conversationId, session, witnessIds);
+            if (fork) {
+                session = resolveForkConversation(fork.sessionId);
+                entry = conversations.get(fork.sessionId);
+                routedBy = "persona";
+                deps.log("info", `[plugin] tool "${tool}": host-stamped "${conversationId}" follows its persona fork "${fork.sessionId}" (${fork.via}; same conversation, #2241)`);
+            } else {
+                routedBy = "native";
+                deps.log("warn", `[plugin] tool "${tool}": host-stamped native caller "${conversationId}" conflicts with outbound witness — honoring the native caller, refusing the witness (#2024)`);
+            }
+        } else if (session && nativeCaller && witnessIds.size === 0) {
+            // #2241 restart variant: the witness ring is process memory and dies with a proxy restart, but the persona fork survives in the persisted conversations map — a child strictly fresher than the parent anchor is the live lane.
+            const fork = personaForkTarget(conversationId, session, witnessIds);
+            if (fork) {
+                session = resolveForkConversation(fork.sessionId);
+                entry = conversations.get(fork.sessionId);
+                routedBy = "persona";
+                deps.log("info", `[plugin] tool "${tool}": host-stamped "${conversationId}" follows its persona fork "${fork.sessionId}" (no witness on this proxy, registry recency; same conversation, #2241)`);
+            }
         }
     } else if (witnessIds.size === 1) {
         const [wit] = [...witnessIds];
