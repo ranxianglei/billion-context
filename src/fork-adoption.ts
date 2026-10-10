@@ -244,7 +244,7 @@ export function planForkAdoption(
 
 /** Seed a fresh fork session from the plan. Copy-on-fork: every value is a
  *  clone; the parent session is never touched. */
-function applyForkAdoption(session: Session, plan: ForkAdoptionPlan, parent: Session): void {
+export function applyForkAdoption(session: Session, plan: ForkAdoptionPlan, parent: Session): void {
     for (const b of plan.blocks) {
         session.state.blocks.push(b);
         const content = parent.blockContents.get(b.blockId);
@@ -252,7 +252,9 @@ function applyForkAdoption(session: Session, plan: ForkAdoptionPlan, parent: Ses
     }
     for (const [raw, ref] of Object.entries(plan.refs.byRaw)) {
         if (!(raw in session.state.messageRefs.byRaw)) session.state.messageRefs.byRaw[raw] = ref;
-        if (!(ref in session.state.messageRefs.byRef)) session.state.messageRefs.byRef[ref] = raw;
+        // #2620: byRef must never hold the kernel BLOCKED sentinel (shared by many
+        // protected messages) — reserve byRaw only; mirrors planForkAdoption above.
+        if (ref !== BLOCKED_REF && !(ref in session.state.messageRefs.byRef)) session.state.messageRefs.byRef[ref] = raw;
     }
     for (const [ref, tokens] of Object.entries(plan.tokenSnapshot)) {
         if (!(ref in session.state.tokenSnapshot)) session.state.tokenSnapshot[ref] = tokens;
