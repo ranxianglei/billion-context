@@ -222,15 +222,20 @@ export class UnifiedStore {
                 const summaryHash = this.putContent(b.summary);
                 const oneHash = b.one === null ? null : this.putContent(b.one);
                 // Re-ingest of the same block id replaces the row (dry-run
-                // idempotence). Old hashes release their refcounts.
+                // idempotence). Refcount math must distinguish identical
+                // re-ingest (bump then undo) from a true replacement (release
+                // the old hash, keep the new bump) — otherwise identical
+                // re-ingest drives the surviving refcount to zero.
                 const existing = this.db
                     .prepare("SELECT summary_hash, one_hash FROM blocks WHERE block_id = ?")
                     .get(b.blockId) as { summary_hash: string; one_hash: string | null } | undefined;
                 if (existing) {
-                    this.releaseContent(existing.summary_hash);
-                    this.releaseContent(existing.one_hash);
-                    this.releaseContent(summaryHash);
-                    this.releaseContent(oneHash);
+                    if (existing.summary_hash === summaryHash) this.releaseContent(summaryHash);
+                    else this.releaseContent(existing.summary_hash);
+                    if (existing.one_hash !== null) {
+                        if (existing.one_hash === oneHash && oneHash !== null) this.releaseContent(oneHash);
+                        else this.releaseContent(existing.one_hash);
+                    }
                 }
                 this.db
                     .prepare(
@@ -282,9 +287,10 @@ export class UnifiedStore {
 
             for (const e of input.ccrEntries) {
                 const hash = this.putContent(e.content);
-                this.db
-                    .prepare("INSERT INTO ccr_entries (session_id, ord, ccr_key, content_hash) VALUES (?, ?, ?, ?)")
+                const res = this.db
+                    .prepare("INSERT OR IGNORE INTO ccr_entries (session_id, ord, ccr_key, content_hash) VALUES (?, ?, ?, ?)")
                     .run(s.sessionId, e.ord, e.key, hash);
+                if (res.changes === 0) this.releaseContent(hash);
             }
         });
     }

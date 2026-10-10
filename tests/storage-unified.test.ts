@@ -6,7 +6,7 @@ import * as path from "node:path";
 import { SessionStore } from "../src/persist.ts";
 import type { Session } from "../src/session.ts";
 import { canonicalize, sha256 } from "./golden-canonical.ts";
-import { planIngest, loadLegacyView, type LegacySessionLike } from "../src/storage/ingest.ts";
+import { planIngest, loadLegacyView, toLegacyLike } from "../src/storage/ingest.ts";
 import { UnifiedStore } from "../src/storage/store.ts";
 import { setPreferredSqliteEngineForTests, type SqliteEngineName } from "../src/storage/driver.ts";
 
@@ -76,20 +76,7 @@ function sessionDigest(view: ReturnType<typeof loadLegacyView>): string {
 
 function runCase(engine: SqliteEngineName, name: string): void {
     const loaded = loadCase(name);
-    const legacy: LegacySessionLike = {
-        id: loaded.id,
-        createdAt: loaded.createdAt,
-        lastSeen: loaded.lastSeen,
-        meta: loaded.meta,
-        stats: loaded.stats,
-        metadata: loaded.metadata,
-        state: loaded.state as unknown as LegacySessionLike["state"],
-        blockContents: loaded.blockContents,
-        lastMessages: loaded.lastMessages,
-        lastMessagesFolded: loaded.lastMessagesFolded,
-        pluginSnapshot: loaded.pluginSnapshot,
-        contentStore: loaded.contentStore,
-    };
+    const legacy = toLegacyLike(loaded);
 
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-unified-"));
     try {
@@ -132,52 +119,85 @@ test("storage unified: corpus round-trip digests equal the legacy manifest (node
     for (const name of Object.keys(CASE_META)) runCase("node:sqlite", name);
 });
 
-test("storage unified: re-ingest is idempotent (digest stable, no duplicate rows)", () => {
-    const loaded = loadCase("folded");
-    const legacy: LegacySessionLike = {
-        id: loaded.id,
-        createdAt: loaded.createdAt,
-        lastSeen: loaded.lastSeen,
-        meta: loaded.meta,
-        stats: loaded.stats,
-        metadata: loaded.metadata,
-        state: loaded.state as unknown as LegacySessionLike["state"],
-        blockContents: loaded.blockContents,
-        lastMessages: loaded.lastMessages,
-        lastMessagesFolded: loaded.lastMessagesFolded,
-        pluginSnapshot: loaded.pluginSnapshot,
-        contentStore: loaded.contentStore,
-    };
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-unified-"));
-    try {
-        setPreferredSqliteEngineForTests(null);
-        const store = UnifiedStore.open(path.join(dir, "index.db"));
+test("storage unified: re-ingest is idempotent across the whole corpus (digest stable, no duplicate rows)", () => {
+    for (const name of Object.keys(CASE_META)) {
+        const loaded = loadCase(name);
+        const legacy = toLegacyLike(loaded);
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-unified-"));
         try {
-            const before = store.counts();
-            store.ingestSession(planIngest(legacy));
-            const first = store.counts();
-            store.ingestSession(planIngest(legacy));
-            const second = store.counts();
-            assert.equal(second.sessions, first.sessions);
-            assert.equal(second.messages, first.messages);
-            assert.equal(second.blocks, first.blocks);
-            assert.equal(second.refs, first.refs);
-            assert.equal(second.content, first.content); // dedup held across re-ingest
-            assert.ok(first.messages > 0, "sanity: corpus folded case has messages");
-            assert.ok(before.messages === 0, "sanity: started from an empty db");
-
-            const rows = {
-                session: store.getSessionRow(loaded.id)!,
-                messages: store.getMessages(loaded.id),
-                blocks: store.getBlocks(loaded.id),
-                deadRefs: store.getDeadRefs(loaded.id),
-                refs: store.getRefs(loaded.id),
-            };
-            assert.equal(sessionDigest(loadLegacyView(rows)), manifest["folded"]!.digest);
+            const store = UnifiedStore.open(path.join(dir, "index.db"));
+            try {
+                store.ingestSession(planIngest(legacy));
+                const first = store.counts();
+                store.ingestSession(planIngest(legacy));
+                const second = store.counts();
+                assert.equal(second.sessions, first.sessions, `${name}: sessions dup`);
+                assert.equal(second.messages, first.messages, `${name}: messages dup`);
+                assert.equal(second.blocks, first.blocks, `${name}: blocks dup`);
+                assert.equal(second.refs, first.refs, `${name}: refs dup`);
+                assert.equal(second.content, first.content, `${name}: content dup (CAS dedup broken)`);
+                const rows = {
+                    session: store.getSessionRow(loaded.id)!,
+                    messages: store.getMessages(loaded.id),
+                    blocks: store.getBlocks(loaded.id),
+                    deadRefs: store.getDeadRefs(loaded.id),
+                    refs: store.getRefs(loaded.id),
+                };
+                assert.equal(sessionDigest(loadLegacyView(rows)), manifest[name]!.digest, `${name}: digest drift after re-ingest`);
+            } finally {
+                store.close();
+            }
         } finally {
-            store.close();
+            fs.rmSync(dir, { recursive: true, force: true });
+        }
+    }
+});
+
+test("storage shadow (BILI_STORAGE_UNIFIED=1): real persist path double-writes and reconciles", async () => {
+    const prev = process.env.BILI_STORAGE_UNIFIED;
+    process.env.BILI_STORAGE_UNIFIED = "1";
+    try {
+        for (const name of ["folded", "fork-receipt", "deadrefs", "ccr"]) {
+            const meta = CASE_META[name]!;
+            // Copy the corpus case out first: loading in place would converge
+            // lastSeen and save back into the golden corpus (and open a shadow
+            // index.db there). The corpus dir must stay pristine.
+            const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-shadow-"));
+            try {
+                fs.cpSync(path.join(CORPUS_ROOT, name), path.join(dir, name), { recursive: true });
+                const caseDir = path.join(dir, name);
+                const loadStore = new SessionStore({ dir: caseDir, debounceMs: 1, enabled: true });
+                const loaded = loadStore.loadSync(meta.id, { protocol: meta.protocol, upstreamOrigin: "http://127.0.0.1:8199" });
+                assert.ok(loaded, `${name}: loadSync returned null`);
+                loadStore.cancelAll();
+
+                const store = new SessionStore({ dir, debounceMs: 1, enabled: true });
+                await store.writeNow(loaded);
+                store.cancelAll();
+                const unified = UnifiedStore.open(path.join(dir, "index.db"));
+                try {
+                    const rows = {
+                        session: unified.getSessionRow(loaded.id)!,
+                        messages: unified.getMessages(loaded.id),
+                        blocks: unified.getBlocks(loaded.id),
+                        deadRefs: unified.getDeadRefs(loaded.id),
+                        refs: unified.getRefs(loaded.id),
+                    };
+                    assert.ok(rows.session, `${name}: shadow did not ingest the session`);
+                    assert.equal(
+                        sessionDigest(loadLegacyView(rows)),
+                        manifest[name]!.digest,
+                        `${name}: shadow replay digest drift through the REAL write path`,
+                    );
+                } finally {
+                    unified.close();
+                }
+            } finally {
+                fs.rmSync(dir, { recursive: true, force: true });
+            }
         }
     } finally {
-        fs.rmSync(dir, { recursive: true, force: true });
+        if (prev === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = prev;
     }
 });

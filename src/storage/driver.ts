@@ -11,12 +11,12 @@
  * engine-agnostic SQL; nothing below it leaks into the store.
  */
 
-export interface SqliteRunResult {
+interface SqliteRunResult {
     readonly changes: number;
     readonly lastInsertRowid: number | bigint;
 }
 
-export interface SqliteStatement {
+interface SqliteStatement {
     run(...args: unknown[]): SqliteRunResult;
     get(...args: unknown[]): unknown;
     all(...args: unknown[]): unknown[];
@@ -42,7 +42,7 @@ interface BetterSqlite3Database {
 }
 
 /** Errors from this module carry this marker so tests can pin the engine in use. */
-export class SqliteDriverError extends Error {
+class SqliteDriverError extends Error {
     constructor(message: string, readonly engine: SqliteEngineName) {
         super(`[storage:${engine}] ${message}`);
     }
@@ -54,7 +54,7 @@ const require = createRequire(import.meta.url);
 
 export type SqliteEngineName = "better-sqlite3" | "node:sqlite";
 
-export interface OpenedDatabase {
+interface OpenedDatabase {
     readonly db: SqliteDatabase;
     readonly engine: SqliteEngineName;
 }

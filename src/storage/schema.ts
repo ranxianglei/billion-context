@@ -34,7 +34,7 @@
  *    keeps ingest atomic. `algo` names the digest; layout can move later.
  */
 
-export const STORAGE_SCHEMA_VERSION = 1;
+const STORAGE_SCHEMA_VERSION = 1;
 
 export const STORAGE_PRAGMAS = [
     "PRAGMA journal_mode = WAL",
@@ -43,7 +43,7 @@ export const STORAGE_PRAGMAS = [
     "PRAGMA foreign_keys = ON",
 ] as const;
 
-export const STORAGE_DDL_V1 = `
+const STORAGE_DDL_V1 = `
 CREATE TABLE IF NOT EXISTS sessions (
     session_id          TEXT PRIMARY KEY,
     parent_session_id   TEXT,

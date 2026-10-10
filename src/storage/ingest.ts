@@ -32,7 +32,7 @@ import { sha256Hex, type BlockRow, type CcrEntryRow, type IngestSessionInput, ty
 
 /** Field order of mergeState() output (src/persist.ts) — the loader must
  *  rebuild the state object in exactly this order. Keep in sync. */
-export const MERGE_STATE_FIELDS = [
+const MERGE_STATE_FIELDS = [
     "blocks",
     "messageRefs",
     "nudge",
@@ -76,10 +76,43 @@ export interface LegacySessionLike {
     contentStore?: { version: 1; byHash: Record<string, string>; byRef: Record<string, unknown> };
 }
 
-export interface IngestPlan extends IngestSessionInput {
+interface IngestPlan extends IngestSessionInput {
     /** Resolved log seqs for pluginSnapshot entries (null when absent). */
     pluginSnapshotSeqs: number[] | null;
     tailSeqs: number[] | null;
+}
+
+/** Adapts any Session-shaped object (persist loadSync output) to the
+ *  ingest input type. Structural on purpose: no import of src/session.ts
+ *  (avoids a module cycle through persist.ts). */
+export function toLegacyLike(s: {
+    id: string;
+    createdAt: number;
+    lastSeen: number;
+    meta: Record<string, unknown>;
+    stats: Record<string, unknown>;
+    metadata: Record<string, unknown>;
+    state: unknown;
+    blockContents: LegacySessionLike["blockContents"];
+    lastMessages?: LegacySessionLike["lastMessages"];
+    lastMessagesFolded?: boolean;
+    pluginSnapshot?: LegacySessionLike["pluginSnapshot"];
+    contentStore?: LegacySessionLike["contentStore"];
+}): LegacySessionLike {
+    return {
+        id: s.id,
+        createdAt: s.createdAt,
+        lastSeen: s.lastSeen,
+        meta: s.meta,
+        stats: s.stats,
+        metadata: s.metadata,
+        state: s.state as unknown as LegacySessionLike["state"],
+        blockContents: s.blockContents,
+        lastMessages: s.lastMessages,
+        lastMessagesFolded: s.lastMessagesFolded,
+        pluginSnapshot: s.pluginSnapshot,
+        contentStore: s.contentStore,
+    };
 }
 
 /** Builds rows + pointer sequences. Pure: no database touched, so tests can
