@@ -20,7 +20,7 @@ export interface SummaryBudget {
  *  to the LARGEST request among in-flight work and returns to its base size
  *  once that work settles — one batch never permanently resizes the pool for
  *  everyone else, so chains with different values can coexist safely. */
-export interface SummaryPoolOptions {
+interface SummaryPoolOptions {
     readonly concurrency?: number;
 }
 

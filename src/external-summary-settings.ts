@@ -58,8 +58,8 @@ const SUMMARY_DEFAULT_BUDGET: Readonly<SummaryBudget> = {
 
 /** [#2657] Shared summary-queue pool size: one process-wide executor serves
  *  every session, so the knob sizes THAT pool (it cannot be per-session). */
-export const SUMMARY_CONCURRENCY_MIN = 1;
-export const SUMMARY_CONCURRENCY_MAX = 32;
+const SUMMARY_CONCURRENCY_MIN = 1;
+const SUMMARY_CONCURRENCY_MAX = 32;
 export const SUMMARY_CONCURRENCY_DEFAULT = 4;
 
 export function validSummaryCredentialName(value: string): boolean {
