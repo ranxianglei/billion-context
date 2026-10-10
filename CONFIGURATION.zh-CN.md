@@ -300,6 +300,7 @@
 | `BILI_CONFIG_FILE` | string | unset (XDG config path) | — | 覆盖配置文件路径（路径重定位）。 |
 | `BILI_SESSIONS_DIR` | string | unset (XDG state path) | — | 会话记录的存放目录（路径重定位）。 |
 | `BILI_ENCRYPTION_KEY` | string | unset | — | 加密持久化载荷的密钥材料（机密）。 |
+| `BILI_STORAGE_UNIFIED` | legacy\|1\|true\|shadow\|full\|unified | unset (legacy) | — | 分层存储迁移开关（#2671）：1/true = 统一 SQLite 双写干跑 + digest 对账；full/unified = 平替读路径（unified-first 加载 + 有机导入 + legacy 兑底）。不设 = legacy。 |
 | `BILI_TUNNEL_ALLOWED_HOSTS` | string[] (csv) | unset | — | MITM 隧道车道的主机白名单。 |
 | `BILI_RECLAIM_FETCH_PATCH` | boolean-ish | on | — | 进程退出时回收全局 fetch 补丁的开关。 |
 | `BILI_CONFLICT_SCAN` | boolean-ish | off | — | 启用安装车道冲突扫描探针。 |
@@ -1637,7 +1638,6 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_PERSIST_EPERM_ALERT_THRESHOLD` | `persist.epermAlertThreshold` | 5 |
 | `BILI_PERSIST_TAIL_TOKENS` | `persist.tailTokens` | 16384 (0 disables message persistence) |
 | `BILI_PERSIST_ZSTD` | `persist.zstd` | false |
-| `BILI_STORAGE_UNIFIED` | —（干跑 / 平替读） | false |
 | `BILI_POST_RESPONSE_LINGER_MS` | `network.postResponseLingerMs` | 5000 |
 | `BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS` | `network.preflightDeadEndCooldownMs` | 300000 |
 | `BILI_PREFLIGHT_HOLD_MS` | `network.preflightHoldMs` | 30000 |

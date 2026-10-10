@@ -300,6 +300,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `BILI_CONFIG_FILE` | string | unset (XDG config path) | — | Override the config file path (path relocation). |
 | `BILI_SESSIONS_DIR` | string | unset (XDG state path) | — | Where session records are stored (path relocation). |
 | `BILI_ENCRYPTION_KEY` | string | unset | — | Key material for encrypted persisted payloads (secret). |
+| `BILI_STORAGE_UNIFIED` | legacy\|1\|true\|shadow\|full\|unified | unset (legacy) | — | Tiered storage-migration switch (#2671): 1/true = unified SQLite double-write dry-run with digest reconciliation; full/unified = drop-in read path (unified-first loads with organic import, legacy fallback). Unset = legacy. |
 | `BILI_TUNNEL_ALLOWED_HOSTS` | string[] (csv) | unset | — | Host allowlist for the MITM tunnel lane. |
 | `BILI_RECLAIM_FETCH_PATCH` | boolean-ish | on | — | Toggle for reclaiming the global fetch patch on shutdown. |
 | `BILI_CONFLICT_SCAN` | boolean-ish | off | — | Enable the install-lane conflict scanner probe. |
@@ -1638,7 +1639,6 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_PERSIST_EPERM_ALERT_THRESHOLD` | `persist.epermAlertThreshold` | 5 |
 | `BILI_PERSIST_TAIL_TOKENS` | `persist.tailTokens` | 16384 (0 disables message persistence) |
 | `BILI_PERSIST_ZSTD` | `persist.zstd` | false |
-| `BILI_STORAGE_UNIFIED` | — (dry-run / drop-in read) | false |
 | `BILI_POST_RESPONSE_LINGER_MS` | `network.postResponseLingerMs` | 5000 |
 | `BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS` | `network.preflightDeadEndCooldownMs` | 300000 |
 | `BILI_PREFLIGHT_HOLD_MS` | `network.preflightHoldMs` | 30000 |
