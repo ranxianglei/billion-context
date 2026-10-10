@@ -636,6 +636,68 @@ test("HTTP retained parent embeds its content store and survives companion loss"
     } finally { await h.close(); }
 });
 
+test("HTTP parent revision ignores out-of-snapshot content-store growth", async () => {
+    const h = await harness();
+    try {
+        const parent = resolveConversation("parent").session!;
+        // Consistent ref OUTSIDE the snapshot prefix: indexed, aliased, payloaded —
+        // invisible to the snapshot itself.
+        parent.state.messageRefs.byRaw["fab-raw"] = "m00004";
+        parent.state.messageRefs.byRef["m00004"] = "fab-raw";
+        parent.contentStore = storeOriginal(createContentStore(), { ref: "m00004", rawId: "fab-raw", text: "outside-snapshot original", kind: "original", tokens: 10, head: "outside" });
+        const first = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
+        // #2675: the pre-fix revision hashed the ENTIRE store (every payload
+        // re-sha256'd), so this unrelated append changed parentRevision and
+        // invalidated every client cache entry, forcing retry loops on large stores.
+        parent.state.messageRefs.byRaw["fab-raw-2"] = "m00005";
+        parent.state.messageRefs.byRef["m00005"] = "fab-raw-2";
+        parent.contentStore = storeOriginal(parent.contentStore, { ref: "m00005", rawId: "fab-raw-2", text: "yet another original", kind: "original", tokens: 10, head: "another" });
+        const second = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
+        assert.equal(second.parentRevision, first.parentRevision);
+        assert.deepEqual(second.orderedMessages, first.orderedMessages);
+    } finally { await h.close(); }
+});
+
+test("HTTP whole-store integrity audit stays opt-in via BILI_FORK_STORE_AUDIT", async () => {
+    const h = await harness();
+    try {
+        const parent = resolveConversation("parent").session!;
+        parent.state.messageRefs.byRaw["fab-raw"] = "m00004";
+        parent.state.messageRefs.byRef["m00004"] = "fab-raw";
+        const store = storeOriginal(createContentStore(), { ref: "m00004", rawId: "fab-raw", text: "outside-snapshot original", kind: "original", tokens: 10, head: "outside" });
+        parent.contentStore = store;
+        const snap = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(snap.status, 200);
+        const snapshot = snap.body;
+        // Damage OUTSIDE the snapshot prefix: alias roundtrip and payload presence
+        // both still hold, so the scoped structural checks pass — only the sha256
+        // re-hash audit (the pre-#2675 default, now opt-in) can see it.
+        store.byHash[createHash("sha256").update("orphan").digest("hex")] = "orphan";
+        assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).status, 200);
+        process.env.BILI_FORK_STORE_AUDIT = "1";
+        try {
+            const audited = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+            assert.equal(audited.status, 409);
+            assert.equal(audited.body.code, "SNAPSHOT_UNAVAILABLE");
+            const fork = await h.request("/__bili/plugin/fork", forkRequest(snapshot));
+            assert.equal(fork.status, 409);
+            assert.equal(fork.body.status, "unavailable");
+        } finally {
+            delete process.env.BILI_FORK_STORE_AUDIT;
+        }
+        assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).status, 200);
+        store.byHash[store.byRef.m00004!.hash] = "corrupted original";
+        assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).status, 200);
+        process.env.BILI_FORK_STORE_AUDIT = "1";
+        try {
+            assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).status, 409);
+        } finally {
+            delete process.env.BILI_FORK_STORE_AUDIT;
+        }
+        assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).status, 200);
+    } finally { await h.close(); }
+});
+
 test("HTTP fork revision and originals survive a new proxy process", async () => {
     const h = await harness(true);
     let child: ReturnType<typeof spawn> | undefined;

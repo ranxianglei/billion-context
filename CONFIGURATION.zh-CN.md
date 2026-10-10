@@ -187,6 +187,7 @@
 | `diagnostics.noCompressPrompt` | boolean | false | ACP_NO_COMPRESS_PROMPT | 停止向系统提示词附加压缩教条文本。 |
 | `diagnostics.countTokensPassthrough` | boolean | false | ACP_COUNT_TOKENS_PASSTHROUGH | 把 /v1/messages/count_tokens 转发给上游，而不是本地应答。 |
 | `diagnostics.compressProtocol` | "tools" \| "marker" | "tools" | ACP_COMPRESS_PROTOCOL | 压缩的 ACP 注入面：原生工具（默认）或旧版提示词标记。 |
+| `diagnostics.forkStoreAudit` | boolean | false | BILI_FORK_STORE_AUDIT | snapshot/fork 路径上的全量 CCR store 完整性审计（#2675）：重新哈希每条已存 payload 并交叉核对全部索引项，任一不一致即 fail-closed。默认关闭——热路径只审计快照用到的 refs；开启后以 O(store) 代价用于排障。每次请求实时读取。 |
 | `fakeCompletion` | object | {} (all defaults) | — | 末块被截断时重新发起请求的重试环。 |
 | `fakeCompletion.retries` | number | 0 (opt-in) | BILI_FAKE_COMPLETION_RETRIES | 被截断的末块完成可被重新请求的次数；0 禁用该重试环。 |
 | `fakeCompletion.bufCapBytes` | number | 16777216 | BILI_FAKE_BUF_CAP | 重试环累积流缓冲的大小上限。 |
@@ -1619,6 +1620,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_FAKE_COMPLETION_RETRIES` | `fakeCompletion.retries` | 0 (opt-in) |
 | `BILI_FOLD_RECONCILE` | `compress.reconcile` | "repair" |
 | `BILI_FORK_ADOPTION` | `forkAdoption` | false |
+| `BILI_FORK_STORE_AUDIT` | `diagnostics.forkStoreAudit` | false |
 | `BILI_IMAGE_BILLING` | `imageBilling` | auto (resolves to pixels) |
 | `BILI_IMAGE_TOKEN_CAP` | `imageTokenCap` | unset (uncapped) |
 | `BILI_KEEP_ALIVE_TIMEOUT_MS` | `network.keepAliveTimeoutMs` | 5000 |
@@ -1722,6 +1724,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_LOG_MASK_HOSTS` | 设为 `0` 关闭代理日志的 host 脱敏（#897）：非公开目标主机（私有 relay、内网域名）原样记录，而不是 `<private-host>`。默认开启（#255 —— 日志常被整段贴进公开 issue）；凭据头脱敏与之独立、始终开启。真实目标域名不依赖此开关也可查：`GET /__bili/stats` → `blindTunnels`、`GET /__bili/health`（均仅 loopback），以及 `acp_status` 输出。 |
 | `BILI_SUBAGENT_SPLIT` | 设为 `0` 关闭 Claude Code subagent 会话分流（#970）：默认情况下，anthropic 线路上同时携带 `x-claude-code-agent-id` + `x-claude-code-parent-agent-id` 头的请求（后台 subagent）会获得独立的 `<session>\|sub:<agent-id>` 会话 —— 独立的锁链与压缩状态 —— 不再排在主会话的锁后面。默认开启。配置文件中设 `"subagentSplit": false` 效果相同；环境变量优先。 |
 | `BILI_FORK_ADOPTION` | 设为 `1` 开启 fork 块继承（#629）：匿名（prefix-affinity）客户端在会话中途分叉历史（编辑重发 / 从更早轮次重新生成）时，新会话直接继承父会话中"源内容在分叉请求里完整存在"的压缩块 —— 而不是从零开始、把共享前缀重新折叠一遍。默认关闭。带自有 id 的 resume-fork 不受此开关管 —— 它们随 `BILI_RESUME_INHERITANCE` 一并继承压缩块（#1834）。配置文件中设 `"forkAdoption": true` 效果相同；环境变量优先。无论开关如何，匿名 fork 发生时日志都会记录可继承的块清单，便于先评估收益再开启。 |
+| `BILI_FORK_STORE_AUDIT` | 设为 `1` 开启 snapshot/fork 路径上的全量 CCR store 完整性审计（#2675）：对 store 中**每一条**已存 payload 重新计算哈希、并交叉核对全部索引项（孤儿 payload、字节不匹配、别名不一致 —— 不限于快照用到的 refs），任何不一致即 fail-closed（snapshot/fork 返回 `409`）。默认关闭——热路径只审计快照实际用到的 refs（其字节由内容寻址的 `{ref, rawId, hash}` 绑定钉住），本开关以 O(store) 代价恢复 #2675 之前的全量校验面，仅供排障。每次请求实时读取，无需重启。配置文件 `diagnostics` 段下设 `"forkStoreAudit": true` 效果相同；环境变量优先。 |
 | `BILI_AFFINITY_SIMHASH` | 设为 `0` 关闭 simhash 链对齐收养（#2265）：匿名请求的精确哈希链被客户端侧大面积装饰性改写（如 Trae 切模型后给每条 assistant 消息重打模型标签）打断时，重新挂回既有会话并保留压缩状态，而不是每次新铸会话、从零重折。护栏：覆盖率 ≥90%（Hamming ≤10）、变异位置 ≥20%（单点编辑仍走 fork，#629）、至少一条字节相同的用户消息、双候选歧义拒猜。默认开启。配置文件中设 `"affinitySimhash": false` 效果相同；环境变量优先。 |
 | `BILI_RESUME_INHERITANCE` | 设为 `0` 关闭 resume 继承（默认开启）（#1486）：当带自有会话 id 的客户端（如 Claude Code 的 `x-claude-code-session-id`）以**新**会话 id 重放完整历史来续接会话时（`cc --resume` 会 fork 出新 UUID），bili 通过字节级前缀匹配（≥8 条消息、append-only 跟踪）识别出它与该客户端已跟踪历史的父子关系，并在续接会话的首个请求上继承父会话的 ref 分配 —— 模型引用的旧代际 refs 因此命中**原始**消息、而不是错配到重新编号的新消息 —— 同时继承源内容完整存在的压缩块（随本继承一并生效，#1834：resume 丢块会导致被折叠原文重新回到线上、上游请求膨胀；旧的 `forkAdoption` 联动门现仅作用于匿名 fork，#629），并记录 `derivedFrom` 血缘。父会话不受影响；新消息在父会话 ref 空间之上继续编号。resume 必须**严格扩展**父历史 —— 同深度的字节级重放（不同 id）视为重复会话而非 resume。匿名会话不受影响（保留自己的 pfa-* 世界，#309）。配置文件中设 `"resumeInheritance": false` 效果相同；环境变量优先。 |
 | `BILI_STABLE_SYSTEM_ANCHOR` | 设为 `1` 开启稳定 system 锚定（#1085）—— **wire 层兜底（best-effort）**：根治在客户端（会话历史与指令变更的呈现方式由客户端决定），本开关只是阻止代理因头部变化而使整个已缓存前缀失效。**仅限 plain-proxy 模式**：plugin-mode agent（`x-bili-plugin`）自管上下文、永不参与锚定，避免对已自带 cache-friendly 更新注入的客户端（如 claude-code 的 system-reminder）做双重处理。开启后，bili 按会话记住客户端首次发送的头部 system/instructions 块并持续原样重发。**局部变更**（文件式编辑，与当前生效版本共享 ≥70% 行）追加末尾 `[System context update] …` user 注记，内含紧凑行级 diff（`-` 删除 / `+` 新增；每条注记顺序叠加在前一条之上）。**非局部变更**（结构性重排、tool 定义增删、带时间戳的 banner、超 400 行的头部）直接采用新文本 —— 一次有意的缓存失效好过追加会误导模型的噪声 diff。防抖保护：累积超过 8 条注记同样直接替换锚点为最新文本并清空日志。锚点与注记日志随会话持久化，不受压缩/compaction 影响（session metadata 而非 kernel state）。已知残留限制：客户端自放的 `cache_control` 断点在换头后仍可能错位。不参与锚定的请求：标题生成微请求（OpenAI/Google）、Responses compaction-trigger 请求、auto-mode classifier 请求。客户端自身已实现同类机制（稳定 prompt + 历史内更新）时零额外注入 —— 这类更新作为普通历史透传。默认关闭。配置文件中设 `"stableSystemAnchor": true` 效果相同；环境变量优先。 |
