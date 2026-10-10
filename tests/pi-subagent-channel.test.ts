@@ -3,6 +3,9 @@
 // ACP-less child request gets proxy-style wire injection while identity stays
 // plugin-bound — and that every scope boundary (no tag / any granted bili name /
 // non-pi agent) keeps pure plugin mode.
+// #2694: the hardening layer — a marker quoted in HISTORY (tool results,
+// assistant/user text) must not flip a main session's channel, incomplete
+// markers are documentation residue, and namespaced ACP grants count as grants.
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -62,25 +65,59 @@ test("detectPiSubagentChildSignal: complex role names and array-form system bloc
     if (sig.present) assert.equal(sig.agent, "evidence-auditor");
 });
 
-test("detectPiSubagentChildSignal: marker truncated at buffer end still detects, name degrades", () => {
-    const buf = Buffer.from(JSON.stringify({ system: "<active_agent name=" }));
-    const sig = detectPiSubagentChildSignal(buf);
-    assert.equal(sig.present, true);
-    if (sig.present) assert.equal(sig.agent, undefined);
+test("detectPiSubagentChildSignal: incomplete markers are documentation residue, not identity (#2694)", () => {
+    for (const sys of [
+        "<active_agent name=",
+        '<active_agent name="">',
+        '<active_agent name="dele',
+        "the docs mention a child marker <active_agent name= stamped on system prompts",
+    ]) {
+        assert.deepEqual(detectPiSubagentChildSignal(Buffer.from(JSON.stringify({ system: sys }))), { present: false }, sys);
+    }
 });
 
-test("detectPiSubagentChildSignal: marker echoed in history (not system) still counts — capability check is the second gate", () => {
-    const buf = Buffer.from(JSON.stringify({
+test("detectPiSubagentChildSignal: marker quoted in history (not a system carrier) is NOT a child signal (#2694)", () => {
+    const chatBuf = Buffer.from(JSON.stringify({
         model: "claude-test",
         system: "plain system",
         messages: [
             { role: "user", content: "hi" },
             { role: "assistant", content: [{ type: "text", text: tagged("oracle") }] },
+            { role: "tool", content: [{ type: "text", text: "docs say: " + tagged("scout") }] },
             { role: "user", content: "go on" },
         ],
     }));
-    const sig = detectPiSubagentChildSignal(buf);
-    assert.equal(sig.present, true);
+    assert.deepEqual(detectPiSubagentChildSignal(chatBuf), { present: false });
+    // the reported repro shape: responses wire, marker only inside a function_call_output document
+    const respBuf = Buffer.from(JSON.stringify({
+        model: "gpt-test",
+        instructions: "You are a coding agent.",
+        input: [
+            { type: "function_call", call_id: "c1", name: "agent_task", arguments: "{}" },
+            { type: "function_call_output", call_id: "c1", output: "architecture report: children are stamped with " + tagged("delegate") },
+        ],
+        tools: DELEGATE_TOOLS.map((name) => ({ type: "function", name, description: "" })),
+    }));
+    assert.deepEqual(detectPiSubagentChildSignal(respBuf), { present: false });
+});
+
+test("detectPiSubagentChildSignal: detects the marker in every system carrier shape", () => {
+    const carriers: Array<[string, Buffer]> = [
+        ["responses.instructions", Buffer.from(JSON.stringify({ model: "gpt-test", instructions: tagged("delegate"), input: [] }))],
+        ["google.systemInstruction.parts", Buffer.from(JSON.stringify({ systemInstruction: { parts: [{ text: tagged("oracle") }] }, contents: [] }))],
+        ["openai.messages[0].system", Buffer.from(JSON.stringify({ model: "gpt-test", messages: [{ role: "system", content: tagged("scout") }, { role: "user", content: "hi" }] }))],
+        ["responses.developer-in-input", Buffer.from(JSON.stringify({ instructions: "base", input: [{ type: "message", role: "developer", content: [{ type: "input_text", text: tagged("evidence-auditor") }] }] }))],
+    ];
+    for (const [label, buf] of carriers) {
+        const sig = detectPiSubagentChildSignal(buf);
+        assert.equal(sig.present, true, label);
+    }
+});
+
+test("detectPiSubagentChildSignal: unparseable or non-object bodies fail closed (#2694)", () => {
+    assert.deepEqual(detectPiSubagentChildSignal(Buffer.from('{"system":"<active_agent name="delegate"/>')), { present: false });
+    assert.deepEqual(detectPiSubagentChildSignal(Buffer.from("[1,2,3]")), { present: false });
+    assert.deepEqual(detectPiSubagentChildSignal(Buffer.from("not json at all")), { present: false });
 });
 
 // — exposure walker —
@@ -112,6 +149,15 @@ test("exposesBiliInjectableTool: malformed entries are skipped, never thrown", (
     assert.equal(exposesBiliInjectableTool([{ name: "read", function: { name: "decompress" } }]), true);
 });
 
+test("exposesBiliInjectableTool: responses namespace wraps expose their members (#2694)", () => {
+    const ns = (name: string, members: unknown[]) => ({ type: "namespace", name, tools: members });
+    const fn = (name: string) => ({ type: "function", name, description: "" });
+    assert.equal(exposesBiliInjectableTool([ns("bili", [fn("compress")])]), true);
+    assert.equal(exposesBiliInjectableTool([ns("bili", [{ type: "custom", name: "acp_status", format: {} }])]), true);
+    assert.equal(exposesBiliInjectableTool([ns("core", DELEGATE_TOOLS.map(fn))]), false);
+    assert.equal(exposesBiliInjectableTool([fn("read"), ns("bili", [fn("search_context")])]), true);
+});
+
 // — composition gate —
 
 test("piSubagentChannelFallback: delegate/oracle children fall back; granted roles do not", () => {
@@ -122,9 +168,24 @@ test("piSubagentChannelFallback: delegate/oracle children fall back; granted rol
     assert.deepEqual(piSubagentChannelFallback(anthropicBody("plain system", DELEGATE_TOOLS), null), { present: false });
 });
 
-test("piSubagentChannelFallback: unparseable body is lenient (marker decides)", () => {
+test("piSubagentChannelFallback: parsed=null re-parses the buffer (marker decides)", () => {
     const buf = anthropicBody(tagged("scout"), ORACLE_TOOLS);
     assert.ok(piSubagentChannelFallback(buf, null).present);
+});
+
+test("piSubagentChannelFallback: namespaced grants decide like flat ones (#2694)", () => {
+    const nsBody = (members: unknown[]) => Buffer.from(JSON.stringify({
+        model: "gpt-test",
+        instructions: tagged("delegate"),
+        input: [{ type: "message", role: "user", content: [] }],
+        tools: [{ type: "namespace", name: "core", tools: members }],
+    }));
+    const fn = (name: string) => ({ type: "function", name, description: "" });
+    // ACP-less role allowlist wrapped in a namespace — the child still falls back.
+    assert.ok(piSubagentChannelFallback(nsBody(DELEGATE_TOOLS.map(fn)), null).present);
+    // An ACP grant hidden inside a namespace — stays pure plugin mode.
+    const granted = nsBody([...DELEGATE_TOOLS.map(fn), fn("compress")]);
+    assert.deepEqual(piSubagentChannelFallback(granted, JSON.parse(granted.toString("utf8"))), { present: false });
 });
 
 // — server-level: the actual channel decision through the real pipeline —
@@ -239,6 +300,21 @@ test("#2268 server-level: tagged ACP-less delegate child gets proxy-style inject
         assert.equal(await postAnthropic(rig, "sar-2268-d", { ...base, system: tagged("delegate"), tools: toolsOf(DELEGATE_TOOLS) }, "omp"), 200);
         const d = forwardedToolNames(rig.forwards, 3);
         for (const n of CORE_ACP) assert.ok(!d.includes(n), `non-pi agent must stay plugin mode (${n})`);
+
+        // E (#2694): MAIN session whose history merely QUOTES the marker (repo
+        // docs about subagents) — channel stays plugin mode, no injection.
+        assert.equal(await postAnthropic(rig, "sar-2694-e", {
+            ...base,
+            system: "You are a coding agent.",
+            messages: [
+                { role: "user", content: "research the repo" },
+                { role: "assistant", content: [{ type: "text", text: "children are stamped with " + tagged("delegate") }] },
+                { role: "user", content: "go on" },
+            ],
+            tools: toolsOf(DELEGATE_TOOLS),
+        }, "pi"), 200);
+        const e = forwardedToolNames(rig.forwards, 4);
+        for (const n of CORE_ACP) assert.ok(!e.includes(n), `history-quoted marker must stay plugin mode (${n})`);
     } finally {
         rig.proxy.close();
         await once(rig.proxy, "close");
