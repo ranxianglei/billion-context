@@ -122,14 +122,6 @@ entries:
     group: envonly
     desc_en: "Grace period for attach ownership evidence."
     desc_zh: "挂接归属证据的宽限期。"
-  - key: BILI_TOOL_TIMEOUT_MS
-    type: number
-    default: "600000"
-    kind: env-only
-    audience: user
-    group: envonly
-    desc_en: "HTTP timeout for plugin tool-lane executes (compress etc.), shared by the pi shim and the MCP forwarder."
-    desc_zh: "插件工具车道（compress 等）的 HTTP 超时，pi 垫片与 MCP 转发器共用。"
   - key: BILI_PROVIDER_REWRITES
     type: string
     default: "unset"

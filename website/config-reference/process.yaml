@@ -211,3 +211,14 @@ entries:
     desc_zh: "提供给原生插件的 fork API 公共快照大小上限。"
     site_en: "<code>plugin.snapshotCapBytes</code> — fork API snapshot cap (default 100 MiB; 0 disables snapshots)."
     site_zh: "<code>plugin.snapshotCapBytes</code> —— fork API 快照上限（默认 100 MiB；0 禁用快照）。"
+  - key: plugin.toolTimeoutMs
+    type: number
+    default: "600000"
+    env: BILI_TOOL_TIMEOUT_MS
+    group: process
+    id: tt.tooltimeout
+    site_group: proc
+    desc_en: "HTTP timeout for plugin tool-lane executes (compress etc.), shared by the pi shim and the MCP forwarder."
+    desc_zh: "插件工具车道（compress 等）的 HTTP 超时，pi 垫片与 MCP 转发器共用。"
+    site_en: "<code>plugin.toolTimeoutMs</code> — plugin tool-lane HTTP timeout (default 600 s)."
+    site_zh: "<code>plugin.toolTimeoutMs</code> —— 插件工具车道 HTTP 超时（默认 600 秒）。"

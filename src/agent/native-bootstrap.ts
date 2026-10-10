@@ -69,19 +69,6 @@ export function envMillis(env: NodeJS.ProcessEnv, name: string, fallback: number
     return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
 }
 
-/** Plugin tool-lane HTTP timeout, shared by the pi shim (src/agent/shared.ts)
- *  and the MCP forwarder (src/mcp.ts) so both surfaces honor one knob.
- *  Historically a hardcoded 60s — shorter than one legitimate compression
- *  round (external-summary budget alone can run 300s total / 120s per
- *  target), so a slow-but-healthy fold died client-side with
- *  `bili tool error: timeout after 60000ms` while the proxy kept executing
- *  and usually landed the block afterwards. Default raised to 600s. */
-const TOOL_TIMEOUT_ENV = "BILI_TOOL_TIMEOUT_MS";
-const TOOL_TIMEOUT_DEFAULT_MS = 600_000;
-export function resolveToolTimeoutMs(env: NodeJS.ProcessEnv): number {
-    return envMillis(env, TOOL_TIMEOUT_ENV, TOOL_TIMEOUT_DEFAULT_MS);
-}
-
 /** #1774: OMP's SSE watchdog aborts the turn when no PARSED model event arrives
  *  within PI_OPENAI_STREAM_FIRST_EVENT_TIMEOUT_MS (default 300s). A bili preflight
  *  over a large context holds the response for minutes before the first SSE event,

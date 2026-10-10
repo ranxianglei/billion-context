@@ -281,6 +281,7 @@ qwen / mcode / aider / copilot / amp / goose      (full list: bili --help)</code
           <li data-i18n-html="tt.persist"><code>persist</code> — session persistence to disk: <span class='mech'>enabled true · zstd false · debounceMs 500 · tailTokens 16384 · epermAlertThreshold 5 · epermAlertRepeatMs 0</span>.</li>
           <li data-i18n-html="tt.sessions"><code>sessions</code> — <span class='mech'>max 256 (LRU) · gc { enabled false, maxAgeDays 7, maxTokens 1000000, intervalMs 3600000 }</span> — GC is opt-in; user data is never pruned silently.</li>
           <li data-i18n-html="tt.snap"><code>plugin.snapshotCapBytes</code> — fork API snapshot cap (default 100 MiB; 0 disables snapshots).</li>
+          <li data-i18n-html="tt.tooltimeout"><code>plugin.toolTimeoutMs</code> — plugin tool-lane HTTP timeout (default 600 s).</li>
           <li data-i18n-html="tt.update"><code>update</code> — self-update channel: <span class='mech'>registry "npmjs" · checkIntervalMs 180000</span>.</li>
           <li class="tg" data-i18n-html="tg.diag"><strong>Diagnostics &amp; updates</strong></li>
           <li data-i18n-html="tt.diag"><code>diagnostics</code> — local troubleshooting knobs: <span class='mech'>dumpBody false · dumpReq true · rawDumpDir · dump4xx false (+MaxBytes 2 MiB) · renderNone/noInjectTool/noCompressPrompt false · countTokensPassthrough false · compressProtocol "tools"</span>.</li>

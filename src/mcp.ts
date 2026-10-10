@@ -26,7 +26,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { isPidAlive, isProxyInstanceFile, readProxyInstanceFile } from "./instance.js";
-import { resolveToolTimeoutMs } from "./agent/native-bootstrap.js";
+import { toolTimeoutMs } from "./knobs.js";
 
 const VERSION = (() => {
     try {
@@ -74,7 +74,6 @@ export function resolveProxyOrigin(): string {
     return DEFAULT_PROXY_ORIGIN;
 }
 
-const TOOL_TIMEOUT_MS = resolveToolTimeoutMs(process.env); // shared knob with the pi shim — see agent/native-bootstrap.ts
 const CONVERSATION_FROM_ENV = process.env.CLAUDE_CODE_SESSION_ID?.trim() || process.env.BILI_CONVERSATION_ID?.trim() || undefined;
 const IDENTITY_BINDING = Boolean(process.env.CLAUDE_CODE_SESSION_ID?.trim());
 // #656: hosts that resume a session (claude --resume forks a NEW session id)
@@ -124,7 +123,7 @@ function ensureManifest(): Promise<void> {
     return manifestPromise;
 }
 
-export async function forwardTool(tool: string, args: unknown, timeoutMs: number = TOOL_TIMEOUT_MS, conversationIdOverride: string | undefined = undefined, nativeCaller: boolean = false): Promise<{ text: string; failed: boolean }> {
+export async function forwardTool(tool: string, args: unknown, timeoutMs: number = toolTimeoutMs(), conversationIdOverride: string | undefined = undefined, nativeCaller: boolean = false): Promise<{ text: string; failed: boolean }> {
     const effectiveConversationId = conversationIdOverride ?? conversationId;
     for (let attempt = 0; ; attempt++) {
         let res: Response;
@@ -308,7 +307,7 @@ async function handleMessage(msg: {
             // else single-active arbitration) and answers a loud 400 when it
             // genuinely cannot tell. The shim no longer hard-fails here.
             try {
-                const out = await forwardTool(tool, args, TOOL_TIMEOUT_MS, routeOverride, nativeThreadId !== undefined);
+                const out = await forwardTool(tool, args, toolTimeoutMs(), routeOverride, nativeThreadId !== undefined);
                 sendResult(id, { content: [{ type: "text", text: out.text }], isError: out.failed });
             } catch (err) {
                 // Protocol failures are results (isError), not JSON-RPC

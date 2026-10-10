@@ -5,7 +5,8 @@
 // source of truth), (3) forwards tool executes, (4) reads status. Same
 // package as the proxy ⇒ same version ⇒ no kernel-skew bug class.
 
-import { envMillis, resolveToolTimeoutMs } from "./native-bootstrap.js";
+import { toolTimeoutMs } from "../knobs.js";
+import { envMillis } from "./native-bootstrap.js";
 
 export type ManifestTool = {
     name: string;
@@ -14,11 +15,10 @@ export type ManifestTool = {
 };
 
 const MANIFEST_TIMEOUT_MS = 5000;
-// Tool-lane budget (see native-bootstrap.ts): compress folds can legitimately
-// run minutes (external-summary budget 300s total), so the old hardcoded 60s
-// killed slow-but-healthy folds client-side while the proxy kept working.
-// BILI_TOOL_TIMEOUT_MS overrides; finite positive wins, else the default.
-const TOOL_TIMEOUT_MS = resolveToolTimeoutMs(process.env);
+// Tool-lane budget: knobs.toolTimeoutMs() — BILI_TOOL_TIMEOUT_MS >
+// plugin.toolTimeoutMs > 600s. Compress folds can legitimately run minutes
+// (external-summary budget 300s total), so the old hardcoded 60s killed
+// slow-but-healthy folds client-side while the proxy kept working (#2582).
 const STATUS_TIMEOUT_MS = 5000;
 const ATTACH_HEALTH_DEADLINE_MS = 15000;
 const ATTACH_HEALTH_POLL_MS = 250;
@@ -282,7 +282,7 @@ export async function forwardTool(proxyBase: string, conversationId: string, too
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
-    }, TOOL_TIMEOUT_MS, signal);
+    }, toolTimeoutMs(), signal);
     const data = json as { ok?: boolean; result?: string; error?: string; outcome?: string } | undefined;
     if (!ok || !data?.ok) {
         throw new Error(`bili proxy tool ${tool} failed (${status}): ${data?.error ?? "unknown error"}`);

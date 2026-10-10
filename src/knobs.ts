@@ -283,6 +283,22 @@ export function publicSnapshotCapBytes(): number {
     return Number.isFinite(v) && v >= 0 ? v : 104_857_600;
 }
 
+/** BILI_TOOL_TIMEOUT_MS > plugin.toolTimeoutMs > 600000 (#2582). HTTP budget for
+ *  every plugin tool-lane execute — the pi shim (src/agent/shared.ts) and the MCP
+ *  forwarder (src/mcp.ts) both resolve through this one knob, so both surfaces
+ *  honor the same value. Historically a hardcoded 60s — shorter than one
+ *  legitimate compression round (external-summary budget alone can run 300s
+ *  total / 120s per target), so a slow-but-healthy fold died client-side with
+ *  `bili tool error: timeout after 60000ms` while the proxy kept executing and
+ *  usually landed the block afterwards; default raised to 600s. Env tier keeps
+ *  the historical envMillis parsing byte-exact: set (even empty/garbage) wins,
+ *  finite positive floors, anything else falls back WITHOUT consulting the file
+ *  tier. Resolved per call so an edit applies from the next tool execution. */
+export function toolTimeoutMs(): number {
+    const v = tNum("BILI_TOOL_TIMEOUT_MS", loadConfigFile().plugin?.toolTimeoutMs);
+    return Number.isFinite(v) && v > 0 ? Math.floor(v) : 600_000;
+}
+
 /** BILI_CCR_RETRIEVAL_TTL_MS > ccrRetrievalTtlMs > 600000. */
 export function ccrRetrievalTtlMs(): number {
     const envRaw = process.env.BILI_CCR_RETRIEVAL_TTL_MS;

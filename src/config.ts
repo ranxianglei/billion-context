@@ -1711,8 +1711,10 @@ type FileConfig = {
      *  wire-history snapshot retained per plugin session for the public
      *  fork API — beyond the cap the session stops being forkable (409)
      *  instead of retaining an unbounded raw copy. Default 100 MiB; `0`
-     *  disables retention entirely; env BILI_PUBLIC_SNAPSHOT_CAP_BYTES wins. */
-    plugin?: { snapshotCapBytes?: number };
+     *  disables retention entirely; env BILI_PUBLIC_SNAPSHOT_CAP_BYTES wins.
+     *  `toolTimeoutMs` is the HTTP budget for every plugin tool-lane execute
+     *  (pi shim + MCP forwarder); default 600000; env BILI_TOOL_TIMEOUT_MS wins (#2582). */
+    plugin?: { snapshotCapBytes?: number; toolTimeoutMs?: number };
     /** Updater knobs (#2030) — was BILI_UPDATE_REGISTRY / BILI_UPDATE_CHECK_INTERVAL_MS. */
     update?: { registry?: string; checkIntervalMs?: number };
     /** Diagnostics & debug surface (#2030) — was ACP_DUMP_BODY / ACP_DUMP_REQ /
