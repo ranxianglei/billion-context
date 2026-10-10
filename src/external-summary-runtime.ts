@@ -1,4 +1,3 @@
-import { performance } from "node:perf_hooks";
 import { SummaryCredentialStore } from "./external-summary-credentials.js";
 import { createSummaryHttpCandidate } from "./external-summary-http.js";
 import { parseExternalSummarySettings, type ExternalSummarySettings } from "./external-summary-settings.js";
@@ -15,7 +14,6 @@ const seenCandidateWarnings = new Set<string>();
 export class ConfiguredSummaryPlan {
     private readonly candidates: readonly SummaryCandidate[];
     private readonly settings: ExternalSummarySettings;
-    readonly deadline: number;
 
     // `raw` may be an already-parsed chain off the request rail or raw JSON
     // from a hand-edited file — re-parse here so invalid settings fail
@@ -26,7 +24,6 @@ export class ConfiguredSummaryPlan {
         // instead of a credentialRef.
         this.settings = parseExternalSummarySettings(raw, { inlineKeys: true });
         const proxyUrl = env.BILI_UPSTREAM_PROXY?.trim() || undefined;
-        this.deadline = performance.now() + this.settings.budget.totalTimeoutMs;
         this.candidates = this.settings.targets.map((target) => {
             try {
                 const key = target.apiKey !== undefined ? target.apiKey : store.resolve(target.credentialRef ?? "", env);
@@ -52,12 +49,12 @@ export class ConfiguredSummaryPlan {
     }
 
     async summarize(work: readonly SummaryWork[], signal?: AbortSignal): Promise<ExternalSummaryBatchResult> {
-        const remaining = Math.floor(this.deadline - performance.now());
-        if (remaining <= 0) return { status: "deadline", results: [] };
-        return executor.executeBatch(work, this.candidates, {
-            ...this.settings.budget, totalTimeoutMs: remaining,
-            targetTimeoutMs: Math.min(remaining, this.settings.budget.targetTimeoutMs),
-        }, signal);
+        // Deliberately NO cached deadline here: preflight reuses one plan across
+        // many summarize() calls, so each must get the FULL configured budget —
+        // a construction-time clock point went stale mid-round and starved every
+        // later range (#2639). The model-tool path packs all ranges into one call,
+        // where executeBatch's shared deadline still bounds the whole batch.
+        return executor.executeBatch(work, this.candidates, { ...this.settings.budget }, signal);
     }
 }
 
