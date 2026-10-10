@@ -10,13 +10,13 @@
 
 import { parseCompressArgs } from "acp-kernel";
 
-export type CompressArgSalvageAction =
+type CompressArgSalvageAction =
     | "verbatim"        // strict JSON — untouched (#1039 invariant)
     | "canonicalized"   // kernel lenient ladder recovered ranges → strict JSON array form
     | "wrapped"         // bare line-form value after "content": → {"content":"…"}
     | "unrecoverable";  // forwarded as-is (host will reject; diagnostics logged upstream)
 
-export interface CompressArgSalvage {
+interface CompressArgSalvage {
     out: string;
     action: CompressArgSalvageAction;
     kind?: string; // kernel diagnostics kind of the winning parse (rescues only)
