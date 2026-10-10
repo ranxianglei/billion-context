@@ -120,6 +120,33 @@ test("before_agent_start appends the delegate prompt once, after the host prompt
     assert.ok(array.systemPrompt.startsWith("A\nB\n\n"));
 });
 
+test("before_agent_start composes via appendSystemPrompt on newer pi (getter event, #2531)", async () => {
+    const { pi, handlers } = fakePi();
+    (globalThis as Record<symbol, unknown>)[Symbol.for("acp-delegate.embedded")] = false;
+    wirePiSubagents(pi, "pi");
+    (globalThis as Record<symbol, unknown>)[Symbol.for("acp-delegate.embedded")] = true;
+    const ctx = sessionCtx();
+    await handlers.get("session_start")!(undefined, ctx);
+    const handler = handlers.get("before_agent_start")!;
+
+    // pi >= 0.87 hands over a live `get systemPrompt()` getter plus a shared
+    // systemPromptOptions; returning { systemPrompt } there forces the prompt
+    // and silently drops other extensions' appendSystemPrompt (#2531). We must
+    // compose through appendSystemPrompt and return nothing instead.
+    const options: { appendSystemPrompt?: string } = { appendSystemPrompt: "HARNESS APPEND" };
+    const newerEvent = {
+        get systemPrompt() { return "RENDERED BASE"; },
+        systemPromptOptions: options,
+    };
+    const result = handler(newerEvent, ctx) as { systemPrompt?: string } | undefined;
+    assert.equal(result, undefined, "newer pi: no forced replacement returned");
+    assert.ok(options.appendSystemPrompt?.startsWith("HARNESS APPEND\n\n"), "prior extension's append preserved first");
+    assert.ok(options.appendSystemPrompt?.includes("ACP_DELEGATE NOTIFICATIONS"), "delegate appendix composed after it");
+
+    handler(newerEvent, ctx);
+    assert.equal((options.appendSystemPrompt!.match(/ACP_DELEGATE NOTIFICATIONS/g) ?? []).length, 1, "appended exactly once (idempotent)");
+});
+
 test("tool_result dispatches read tracking for read and bash results", async () => {
     const { pi, handlers } = fakePi();
     (globalThis as Record<symbol, unknown>)[Symbol.for("acp-delegate.embedded")] = false;

@@ -25,7 +25,7 @@ import { delegateStatusWidget } from "./fleet-widget.js";
 import { openFleetInspector } from "./fleet-inspector.js";
 import { findPiSubagentsInstalls, resolveAgentDir, DELEGATE_STAND_DOWN_MESSAGE } from "./pi-subagents-detect.js";
 import { closeLogStream, logInfo, logThrow, logWarn, setDebugEnabled } from "./log.js";
-import { formatSystemPromptForEvent } from "./compat.js";
+import { injectSystemPromptAppendix } from "./compat.js";
 import { isDeclaredForkHost, isPiHost } from "./host.js";
 
 declare const CURRENT_VERSION: string;
@@ -182,7 +182,7 @@ export function createSubagentsExtension(inline?: SubagentsAdapterConfig): Exten
       if (!state.policy.enabled || state.stoodDown) return;
       const text = state.delegatePrompt !== undefined ? state.delegatePrompt : ACP_DELEGATE_PROMPT;
       if (text === null) return;
-      return { systemPrompt: formatSystemPromptForEvent(event.systemPrompt, text) };
+      return injectSystemPromptAppendix(event, text);
     });
   };
 }
@@ -219,6 +219,7 @@ export {
   type SubagentsAdapterConfig,
 } from "./config.js";
 export { ACP_DELEGATE_PROMPT } from "./system-prompt.js";
+export { injectSystemPromptAppendix } from "./compat.js";
 export { delegateStatusWidget } from "./fleet-widget.js";
 export { openFleetInspector } from "./fleet-inspector.js";
 export { findPiSubagentsInstalls, resolveAgentDir, DELEGATE_STAND_DOWN_MESSAGE, type PiSubagentsScopes } from "./pi-subagents-detect.js";
