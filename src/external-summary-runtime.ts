@@ -19,9 +19,10 @@ export class ConfiguredSummaryPlan {
     private readonly candidates: readonly SummaryCandidate[];
     private readonly settings: ExternalSummarySettings;
     readonly deadline: number;
-    /** #2662: batches submitted vs candidate calls actually dispatched —
-     *  calls > 0 && attempts === 0 means the shared pool dropped every batch
-     *  before dispatch (congestion, not a chain failure). */
+    /** #2662: summarize() invocations vs candidate calls actually dispatched —
+     *  calls > 0 && attempts === 0 means no candidate call was ever dispatched
+     *  (shared-pool congestion, or the plan's budget already exhausted before
+     *  reaching the pool — congestion, not a chain failure). */
     readonly stats = { calls: 0, attempts: 0 };
 
     // `raw` may be an already-parsed chain off the request rail or raw JSON
