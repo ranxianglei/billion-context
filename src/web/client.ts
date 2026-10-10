@@ -2115,6 +2115,10 @@ export const WEB_CLIENT = `(function () {
                 field(budget, "summary-" + key, label, s.budget && s.budget[key] || fallback, (value) => mutate((v) => { if (!v.budget) v.budget = {}; v.budget[key] = value; }), "number").disabled = !!cfg.parseError;
             });
             box.appendChild(budget);
+            const pool = document.createElement("div"); pool.className = "summary-grid";
+            const conc = field(pool, "summary-concurrency", t("summary.concurrency"), s.concurrency, (value) => mutate((v) => { v.concurrency = value; }), "number");
+            conc.max = "32"; conc.disabled = !!cfg.parseError;
+            box.appendChild(pool);
         }
         render();
         fe.onchange = render;

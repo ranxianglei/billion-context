@@ -1112,6 +1112,7 @@ URL 键通道（或带 `bind` 的命名条目）可以向上游发送**自己的
       "enabled": true,
       "targets": ["glm/glm-4.9-flash", "claude/claude-haiku-4.5"],
       "budget": { "totalTimeoutMs": 50000, "targetTimeoutMs": 25000, "maxSummaryBytes": 65536 },
+      "concurrency": 8,
       "autoFold": true,
       "autoFoldTargetTokens": 40000
     }
@@ -1122,6 +1123,10 @@ URL 键通道（或带 `bind` 的命名条目）可以向上游发送**自己的
 配方包含：`baseUrl`（必须 HTTPS，本地开发可用回环 HTTP；拒绝内嵌凭据、代理递归路径与任意 query 参数）；`api`（`openai` | `anthropic` | `responses` | `google` 四选一，决定线上协议并从 `baseUrl` 推导请求路径）；恰好一个凭据引用 —— `apiKeyEnv: "变量名"`（调用时读环境变量）或 `credentialRef: "名字"`（通过 Web UI 存储的值）；以及 `models` 表，每个模型可设 `contextWindow`（默认 128000）、`outputTokens`（默认 `min(8192, 窗口/4)`）、`stream`（默认 false）。配方也可以像 URL 条目一样拆成 `recipe`/`bind` 路由形态；具名条目未绑定时对路由不生效（routing-inert）。
 
 每条链最多 16 个目标。通过 Web API 保存启用的链时会校验每个引用可解析（未知 provider 或 model → HTTP 400）。运行时遇到不可解析的引用会记录一次警告并禁用整条链直至修复 —— 绝不会回退用主模型写摘要。`secret:` 值单独存储在私有的 `billion-context.json.summary-credentials.json` 文件中，不随主 JSON 配置下发，配置 API 也不会返回。Windows 上请用仅管理员的 ACL 保护该文件及其父目录；确认没有代理进程在写存储后，残留的 `.lock` 文件需手工删除。总预算由全部目标与压缩入口共享；取消或会话状态变化会丢弃已生成但未落盘的结果。
+
+`concurrency`（整数 `1..32`，默认 `4`）决定**进程级摘要队列**的大小：本机所有外部摘要调用 —— *全部* 会话的 preflight 自动折叠加上每次模型发起的 `compress` 调用 —— 共享同一个在途请求池。当你的摘要服务有余量（本地中继、自托管模型、高配额 flash 端点）时调大它；小配额 provider 保持保守默认即可。某条链设置的值只在该链的工作在途期间调整共享池大小；多条不同取值的链并发运行时，池子增长到最大需求，待这些批次结束后回到基础值 —— 任何单个会话都无法永久改变其他会话看到的池大小。
+
+与 budget 的交互：一个批次能达到的折叠速率由池能容纳的并发数（`concurrency`）和每次调用的时限（`targetTimeoutMs`）共同决定 —— 单看 budget 并不能解释结果。池饱和不会表现为可见错误：批次还在排队就耗尽总时限的话，会被整体丢弃为 `batch=deadline` 且没有任何尝试记录（`attempts=[]`），对 auto-fold 而言这会触发下文所述的 10 分钟退避。如果你看到这些日志行、而直接调用目标却很快成功，说明瓶颈是池而不是超时。
 
 两个可选旋钮可把这条链升级为**代理驱动的自动折叠器**（`autoFold`）：`"autoFold": true` 后代理不再等模型调压缩工具 —— 原本只守溢出窗口的零模型折叠引擎同样会在转发前把对话折到 `autoFoldTargetTokens`（默认：模型窗口的一半）以下，范围由内核选定、摘要由外部链完成。主模型完全看不到 nudge，也不会把思考预算花在起草压缩方案上。该旋钮随整链替换语义生效，且只在链本身启用时才起作用——在链未启用（或省略 `enabled`）时设置任一旋钮均无效，并会记录一次警告而非静默失效；`autoFoldTargetTokens` 必须是 `[8192, 10000000]` 内的整数。失败时 fail-open：链在折叠时出错则照常转发请求，退避 10 分钟内暂停自动折叠并恢复经典 advisory nudge。
 
