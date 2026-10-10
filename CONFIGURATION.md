@@ -1779,11 +1779,14 @@ Every upstream transport failure is classified into a `kind=` that leads its log
 | kind | meaning | bili behavior |
 |------|---------|---------------|
 | `client-abort` | downstream client disconnected | nothing (request dead by definition) |
-| `upstream-timeout` | idle budget expired or connect timed out | **not retried** — never stack wait budgets |
-| `proxy-reset` | connection died pre-response **through a proxy** (prime suspect: proxy idle-recycle / payload cap / node churn) | transparent replay, bounded by `BILI_REPLAY_RETRY_MAX` (default 3 total attempts) |
+| `upstream-timeout` | idle budget expired (headers/body read phase) | **not retried** — never stack wait budgets |
+| `connect-timeout` | TCP handshake never completed (`UND_ERR_CONNECT_TIMEOUT`) — blackholed route or downed upstream | transparent replay, bounded by `BILI_REPLAY_RETRY_MAX` (default 3 total attempts) |
+| `proxy-reset` | connection died pre-response **through a proxy** (prime suspect: proxy idle-recycle / payload cap / node churn) | same (bounded by `BILI_REPLAY_RETRY_MAX`) |
 | `upstream-reset` | same, direct connection (suspect upstream/local network) | same (bounded by `BILI_REPLAY_RETRY_MAX`) |
 | `connect-refused` | TCP refused (the proxy when configured, else upstream) | same (bounded by `BILI_REPLAY_RETRY_MAX`) |
-| `dns` / `tls` / `unknown` | resolution / handshake / unclassified | not retried |
+| `upstream-unreachable` | no route to the host (ICMP `EHOSTUNREACH` / `ENETUNREACH` / `EHOSTDOWN`) — routing / ACL / firewall `REJECT` | same (bounded by `BILI_REPLAY_RETRY_MAX`) |
+| `dns` | name resolution failed (`ENOTFOUND` / `EAI_AGAIN`) | same (bounded by `BILI_REPLAY_RETRY_MAX`) |
+| `tls` / `unknown` | TLS/certificate failure / unclassified | not retried |
 
 Handshake-class resilience is paired with a keep-alive cap for proxied connections (`BILI_PROXY_KEEPALIVE_MAX_MS`, default 55s) so bili stops offering proxies sockets they are about to recycle.
 

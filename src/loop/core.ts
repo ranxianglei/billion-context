@@ -130,6 +130,7 @@ const TRANSPORT_FAILURE_LABELS: Record<UpstreamFailureKind, string> = {
     "upstream-reset": "connection reset by the upstream",
     "connect-refused": "connection refused",
     "connect-timeout": "connect timed out",
+    "upstream-unreachable": "no route to the upstream",
     dns: "name resolution failed",
     tls: "TLS handshake failure",
     unknown: "network error",

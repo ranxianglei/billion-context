@@ -456,6 +456,10 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             // feeding the context-free [error] AbortError storm.
             const clientAbort = (e?.name === "AbortError" || /abort/i.test(String(e?.message ?? ""))) && (res.destroyed || res.writableEnded);
             if (clientAbort) log("info", `client aborted mid-stream: ${msg}`);
+            // #2465: classified transport deaths are already fully described on
+            // one line (kind/code/errno/syscall/address/hint) — stack frames
+            // were pure noise in field EHOSTUNREACH storms (305 failures × 7).
+            else if (err instanceof Error && (err as Error & { biliTransportFailure?: boolean }).biliTransportFailure === true) log("error", msg);
             // #806: cap-include the stack on hard failures — the bare message
             // gave no clue where the handler died (wedged-request forensics).
             else if (err instanceof Error && err.stack) log("error", `${msg}\n${err.stack.split("\n").slice(1, 8).join("\n")}`);

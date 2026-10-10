@@ -9,7 +9,9 @@ import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { WEB_CLIENT } from "../src/web/client.ts";
+import { MESSAGES } from "../src/web/i18n.ts";
 import {
+    ALERT_KINDS,
     recordUpstreamAlert,
     clearUpstreamAlertsForHost,
     getUpstreamAlerts,
@@ -85,12 +87,26 @@ test("alert table: every v1 kind enters, keyed by (kind, host)", () => {
         recordUpstreamAlert("http://h4.example.com/", netError("ECONNRESET"), false);
         recordUpstreamAlert("http://h5.example.com/", netError("ENOTFOUND"), false);
         recordUpstreamAlert("https://h6.example.com:8443/", netError("EPROTO"), false);
+        // #2465: ICMP no-route family enters like every other cannot-reach kind
+        recordUpstreamAlert("http://h7.example.com/", netError("EHOSTUNREACH"), false);
         const kinds = getUpstreamAlerts().map((a) => a.kind).sort();
-        assert.deepEqual(kinds, ["connect-refused", "connect-timeout", "dns", "proxy-reset", "tls", "upstream-reset"]);
+        assert.deepEqual(kinds, ["connect-refused", "connect-timeout", "dns", "proxy-reset", "tls", "upstream-reset", "upstream-unreachable"]);
         const tls = getUpstreamAlerts().find((a) => a.kind === "tls");
         assert.equal(tls?.host, "h6.example.com:8443");
     } finally {
         _resetUpstreamAlertsForTest();
+    }
+});
+
+// #2465 P2: nothing used to check the ALERT_KINDS ↔ i18n catalog coupling —
+// a kind could enter the banner path with only the generic "unknown" fallback
+// copy (a copy that can never render its own meaning). Every alertable kind
+// must have a dedicated hint key in BOTH locales.
+test("#2465: every alertable kind has a dedicated i18n hint key in both locales", () => {
+    for (const kind of ALERT_KINDS) {
+        const key = `alert.hint.${kind.replace(/-/g, "_")}`;
+        assert.ok(MESSAGES["zh-CN"][key], `zh catalog missing ${key}`);
+        assert.ok(MESSAGES.en[key], `en catalog missing ${key}`);
     }
 });
 

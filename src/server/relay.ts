@@ -494,7 +494,10 @@ export async function forward(
         // [#1343] no response means the attached full text never reached the model —
         // drop-and-log it (a corrective note surfaces on the next qualifying request).
         if (prepared && prepared.attachedRetrievals && prepared.attachedRetrievals.length > 0) dropRetrievals(prepared.session, prepared.attachedRetrievals.map((i) => i.ref), "upstream network failure");
-        throw new Error(`upstream request failed: ${formatUpstreamError(error, upstreamUrl, proxyUrl)}`, { cause: error });
+        // #2465: tag the classified transport envelope so the dispatch catch
+        // logs it as ONE line — formatUpstreamError already carries
+        // kind/code/errno/syscall/address/port/hint; the stack adds no signal.
+        throw Object.assign(new Error(`upstream request failed: ${formatUpstreamError(error, upstreamUrl, proxyUrl)}`, { cause: error }), { biliTransportFailure: true });
     }
     // #552 learn-on-failure: a converting upstream that rejects a role (codex
     // ≥0.153 sends "developer"; vLLM/SGLang-style backends answer 400
