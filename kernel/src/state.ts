@@ -1,4 +1,8 @@
-import type { CompressionBlock, CompressionState } from "./types.js";
+import type {
+  CompressionBlock,
+  CompressionState,
+  CoreMessage,
+} from "./types.js";
 
 export function createInitialState(): CompressionState {
   return {
@@ -62,6 +66,21 @@ export function coveredMessageIds(state: CompressionState): Set<string> {
     for (const id of block.effectiveMessageIds) covered.add(id);
   }
   return covered;
+}
+
+/** #2663: single source of truth for "live host checkpoint carrier" (#335) —
+ *  a message that renders the visible summary of a still-active block. The
+ *  selector (recommend.ts) and the applier (compress.ts) must judge this with
+ *  the SAME predicate or they advertise spans the apply side structurally
+ *  rejects (a plain range bridging a live carrier resolves to zero foldable
+ *  messages once the covering block is consumed). Stale carriers — block
+ *  inactive or id unknown — are NOT live and fold like ordinary messages. */
+export function isLiveCheckpointCarrier(
+  message: Pick<CoreMessage, "summaryOfBlockId">,
+  state: CompressionState,
+): boolean {
+  const carrierOf = message.summaryOfBlockId;
+  return carrierOf !== undefined && blockById(state, carrierOf)?.active === true;
 }
 
 export function highestActiveTier(state: CompressionState): 0 | 1 | 2 | 3 {

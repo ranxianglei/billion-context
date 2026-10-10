@@ -2,7 +2,12 @@ import { assignRefs, highestUsedIndex, indexToRef } from "./refs.js";
 import { remintCoveredLiveIds } from "./instance-reid.js";
 import { prune, isSummaryMessageId } from "./prune.js";
 import { syncBlocks } from "./sync.js";
-import { advanceSurvival, activeBlocks, blockById } from "./state.js";
+import {
+  advanceSurvival,
+  activeBlocks,
+  blockById,
+  isLiveCheckpointCarrier,
+} from "./state.js";
 import { allocateBlockId, allocateRunId, createInitialState } from "./state.js";
 import { countMessageTokens, defaultCountTokens } from "./tokenize.js";
 import { validateConfig } from "./config.js";
@@ -960,7 +965,13 @@ const syncBlocksNode: PipelineNode = {
 const pruneNode: PipelineNode = {
   name: "prune",
   run(io) {
-    return { ...io, messages: prune(io.messages, io.state) };
+    return {
+      ...io,
+      messages: prune(io.messages, io.state),
+      // #2663: keep the pre-prune resent array reachable so recommend can
+      // judge foldability on the same input class applyCompression sees.
+      effects: { ...io.effects, originalMessages: io.messages },
+    };
   },
 };
 
@@ -1055,6 +1066,7 @@ const recommendNode: PipelineNode = {
       ctx.config,
       protectedRefs,
       ctx.countTokens,
+      io.effects.originalMessages,
     );
     const nothingToCompress = contextRanges.compressible.length === 0;
     const recommendation: Recommendation = {
@@ -1253,10 +1265,10 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
   const plainRange = resolved.boundaryKind !== "block";
   const liveCarrierIds = new Set<string>();
   if (plainRange) {
+    // #2663: the selector screens with this same predicate — one definition,
+    // two call sites, so advertise/validate cannot drift apart again.
     for (const message of input.messages) {
-      const carrierOf = message.summaryOfBlockId;
-      if (carrierOf === undefined) continue;
-      if (blockById(input.state, carrierOf)?.active) {
+      if (isLiveCheckpointCarrier(message, input.state)) {
         liveCarrierIds.add(message.id);
       }
     }
@@ -1345,11 +1357,21 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
     }
   }
 
+  // Media payloads are unrecoverable once folded (#1188): excluded from the
+  // range AND removed from effectiveMessageIds exactly like protected tool
+  // messages above — otherwise the warning below lies and the bytes die
+  // silently under the new block's coverage (#2663).
   const mediaExcluded = directMessageIds.filter((id) => {
     const msg = input.messages.find((m) => m.id === id);
     return !!msg && hasMediaPayload(msg);
   });
   if (mediaExcluded.length > 0) {
+    const kept = new Set(filteredIds);
+    for (const id of mediaExcluded) {
+      kept.delete(id);
+      effectiveMessageIds.delete(id);
+    }
+    filteredIds = [...kept];
     warnings.push(
       `Excluded ${mediaExcluded.length} message(s) carrying image/attachment payload(s) from compression range — their bytes are unrecoverable once folded (billion-context#1188); enable stripImages to release old ones.`,
     );
