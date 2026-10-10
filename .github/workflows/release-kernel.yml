@@ -16,6 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -38,6 +39,23 @@ jobs:
           else
             echo "is_release=false" >> $GITHUB_OUTPUT
           fi
+
+      - name: Full CI dispatch (missing lanes, publish sha)
+        # Policy (2026-10-10, after the v0.1.192 carve-out): every release
+        # channel must run the COMPLETE CI set at the exact publish sha before
+        # npm publish. This merge already ran all lanes as a PR — dispatch only
+        # whatever has no run here (idempotent); the Full CI gate step before
+        # Create tag blocks publish until all lanes are green. EXTRA_MATCH_SHAS
+        # reuses the PR-head green runs (HEAD^2), so a normal PR release pays
+        # zero extra CI — same semantics as branch-protection required checks.
+        if: steps.check.outputs.is_release == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          GITHUB_SHA="$(git rev-parse HEAD)"
+          EXTRA_MATCH_SHAS="$(git rev-parse HEAD^2 2>/dev/null || true)"
+          export GITHUB_SHA EXTRA_MATCH_SHAS
+          node scripts/release-ci-gate.mjs --dispatch
 
       - name: Setup
         if: steps.check.outputs.is_release == 'true'
@@ -80,6 +98,20 @@ jobs:
             echo "tag=latest" >> $GITHUB_OUTPUT
             echo "prerelease=false" >> $GITHUB_OUTPUT
           fi
+
+      - name: Full CI gate (all lanes green at this sha)
+        # Hard precondition for publish: every required lane green at the
+        # publish sha (or reused green PR-head run). Any red lane or timeout
+        # ⇒ release fails, nothing is published.
+        if: steps.check.outputs.is_release == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_GATE_TIMEOUT_MIN: "60"
+        run: |
+          GITHUB_SHA="$(git rev-parse HEAD)"
+          EXTRA_MATCH_SHAS="$(git rev-parse HEAD^2 2>/dev/null || true)"
+          export GITHUB_SHA EXTRA_MATCH_SHAS
+          node scripts/release-ci-gate.mjs --wait
 
       - name: Create tag
         if: steps.check.outputs.is_release == 'true'

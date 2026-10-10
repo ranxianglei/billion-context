@@ -156,6 +156,38 @@ jobs:
           echo "pr_branch=${BR}" >> "$GITHUB_OUTPUT"
           exit 0
 
+      - name: Full CI dispatch (missing lanes at the release commit)
+        # Policy (2026-10-10, after the v0.1.192 carve-out): every release
+        # channel must run the COMPLETE CI set at the exact publish sha before
+        # npm publish. The direct-push commit lands on master via GITHUB_TOKEN,
+        # which fires no push events — nothing runs CI on it. Dispatch every
+        # missing lane at master (idempotent); the Full CI gate step below
+        # blocks publish until all lanes are green.
+        if: steps.push.outputs.direct == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          GITHUB_SHA="$(git rev-parse HEAD)"
+          GITHUB_REF_NAME="master"
+          export GITHUB_SHA GITHUB_REF_NAME
+          node scripts/release-ci-gate.mjs --dispatch
+
+      - name: Full CI gate (all lanes green at the release commit)
+        # Hard precondition for publish: every required lane green at the
+        # publish sha. Any red lane or timeout ⇒ release fails, nothing is
+        # published. NOTE: dispatches above landed at master's head — if
+        # another push lands first, the runs' head_sha no longer matches this
+        # commit, the gate times out and publish is blocked (fail-safe).
+        if: steps.push.outputs.direct == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_GATE_TIMEOUT_MIN: "60"
+        run: |
+          GITHUB_SHA="$(git rev-parse HEAD)"
+          GITHUB_REF_NAME="master"
+          export GITHUB_SHA GITHUB_REF_NAME
+          node scripts/release-ci-gate.mjs --wait
+
       - name: Dispatch CI on fallback branch
         if: steps.push.outputs.needs_pr == 'true'
         continue-on-error: true

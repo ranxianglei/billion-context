@@ -39,6 +39,7 @@ jobs:
     permissions:
       contents: write
       id-token: write
+      actions: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -102,6 +103,19 @@ jobs:
             console.log('release-notes entry ok:', entry.version, '[' + entry.tier + ']', entry.summary.slice(0, 80));
           " "$VER"
 
+      - name: Full CI dispatch (all lanes, publish sha)
+        # Policy (2026-10-10, after the v0.1.192 carve-out): every release
+        # channel must run the COMPLETE CI set at the exact publish sha before
+        # npm publish. This channel has no PR, so nothing else runs CI on this
+        # sha — dispatch every lane that has no run here (idempotent); the
+        # Full CI gate step after the pre-flight blocks publish until green.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          GITHUB_SHA="$(git rev-parse HEAD)"
+          export GITHUB_SHA
+          node scripts/release-ci-gate.mjs --dispatch
+
       - name: Pre-flight gate
         # keep the claude-native live e2e subtests in this pre-publish gate (#1248)
         env:
@@ -111,6 +125,18 @@ jobs:
           npm run typecheck
           npm test
           npm run build
+
+      - name: Full CI gate (all lanes green at this sha)
+        # Hard precondition for publish: lanes dispatched above ran in
+        # parallel with the pre-flight; wait them out now. Any red lane or
+        # timeout ⇒ release fails, nothing is published.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_GATE_TIMEOUT_MIN: "60"
+        run: |
+          GITHUB_SHA="$(git rev-parse HEAD)"
+          export GITHUB_SHA
+          node scripts/release-ci-gate.mjs --wait
 
       - name: Check if prerelease
         id: pre
