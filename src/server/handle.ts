@@ -17,7 +17,7 @@ import { buildIncomingImageIndex, foldAnchoredCutoff, pruneRetrieveImgExports } 
 import { biliDurableMarkerGuard, durableMessageGuards } from "../durable-message-guards.js";
 import { biliToolsDeclaredOnWire, countBiliToolUses, evaluateSelfHealRound, nudgeSuppressed, pluginLaneDegraded, pluginLaneRestore } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
-import { acquireInFlight, getSession, hasProcessedState, markDirty, peekSession, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
+import { acquireInFlight, getSession, hasProcessedState, markDirty, peekSession, registeredProtectedRawIds, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
 import { buildCompressSystemPrompt } from "../compress-tool.js";
 import { storeEffectiveImageCompression, type ImageCompressionSettings } from "../image-compress.js";
 import { storeEffectiveSearchPlanAware } from "../decompress-shared.js";
@@ -1742,8 +1742,12 @@ export async function handle(
         // both guards at read time, so /__bili/plugin/tool sees them too.
         storeEffectiveConfig(session, reqConfig);
         const laneGuard = pluginAgent ? durableMessageGuards[pluginAgent] : undefined;
+        // #2556: fold in the protect-tool registration set — same read-time
+        // resolution as session.ts effectiveConfig, so a registration via POST
+        // /__bili/plugin/protect protects the very next fold on the wire path.
+        const registered = registeredProtectedRawIds(session);
         const durableGuard: (msg: CoreMessage) => boolean =
-            laneGuard ? (msg) => laneGuard(msg) || biliDurableMarkerGuard(msg) : biliDurableMarkerGuard;
+            laneGuard ? (msg) => laneGuard(msg) || biliDurableMarkerGuard(msg) || registered.has(msg.id) : (msg) => biliDurableMarkerGuard(msg) || registered.has(msg.id);
         reqConfig = { ...reqConfig, isMessageProtected: durableGuard };
         // acquireInFlight must precede the lock so evictOldest() cannot flush
         // this session between getSession and lock acquisition (inFlight===0

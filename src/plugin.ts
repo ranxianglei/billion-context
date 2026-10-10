@@ -795,6 +795,65 @@ export function handlePluginSessionName(payload: string, res: import("node:http"
 // arbitration; see tool-ring.ts). Wire-mode injection serves the kernel
 // constants directly, which never carried the param.
 
+/** #2556: server-side durable registration — the AUX channel of the durable
+ *  protocol. The PRIMARY channel is the content-embedded \x3cbili-durable\x3e
+ *  first-line marker (#2555): protection that travels WITH the message bytes
+ *  survives fork raw-replay (#2383), cross-machine exports and proxy mode,
+ *  where this endpoint's session-keyed registration cannot. What registration
+ *  buys instead: zero content pollution (no marker line in host-visible text)
+ *  and post-hoc protection of a message the host did not stamp at emit time.
+ *  Registered raw ids live in session.metadata (persisted, fork-adoption
+ *  clone-safe) and compose into the same isMessageProtected guard as the
+ *  marker and lane guards at BOTH resolution sites (wire path in
+ *  server/handle.ts, read path in session.ts effectiveConfig). Ids are never
+ *  reused (kernel contract), so a registration stays pinned to its message
+ *  even after it dies. */
+export function handlePluginProtect(
+    payload: string,
+    res: import("node:http").ServerResponse,
+    deps: PluginToolDeps,
+): void {
+    let parsed: { conversationId?: unknown; refs?: unknown; clear?: unknown };
+    try {
+        parsed = JSON.parse(payload) as { conversationId?: unknown; refs?: unknown; clear?: unknown };
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("expected object body");
+    } catch {
+        forkReply(res, 400, { ok: false, code: "INVALID_REQUEST", error: "invalid JSON body" });
+        return;
+    }
+    const conversationId = typeof parsed.conversationId === "string" ? parsed.conversationId.trim() : "";
+    if (!conversationId) return forkReply(res, 400, { ok: false, code: "INVALID_REQUEST", error: "conversationId is required" });
+    const clear = parsed.clear === true;
+    if (parsed.clear !== undefined && typeof parsed.clear !== "boolean") return forkReply(res, 400, { ok: false, code: "INVALID_REQUEST", error: "clear must be a boolean" });
+    if (!Array.isArray(parsed.refs) || parsed.refs.length === 0 || parsed.refs.some((r) => typeof r !== "string" || !/^m\d+$/.test(r))) {
+        return forkReply(res, 400, { ok: false, code: "INVALID_REQUEST", error: "refs must be a non-empty array of ref ids (mNNNNN)" });
+    }
+    const refs = [...new Set(parsed.refs as string[])];
+    const session = resolveForkConversation(conversationId);
+    if (!session) {
+        return forkReply(res, 404, { ok: false, code: "NOT_FOUND", error: `conversation "${conversationId}" is not resident on this proxy instance` });
+    }
+    const byRef = session.state.messageRefs.byRef;
+    const unknown = refs.filter((ref) => typeof byRef[ref] !== "string");
+    if (unknown.length > 0) {
+        return forkReply(res, 400, { ok: false, code: "UNKNOWN_REF", error: `unknown refs (never assigned in this conversation): ${unknown.join(", ")}` });
+    }
+    const rawIds = refs.map((ref) => byRef[ref] as string);
+    const existing = Array.isArray(session.metadata["protectedRawIds"]) ? session.metadata["protectedRawIds"].filter((v): v is string => typeof v === "string") : [];
+    const set = new Set(existing);
+    let changed = 0;
+    for (const raw of rawIds) {
+        const before = set.size;
+        if (clear) set.delete(raw); else set.add(raw);
+        if (set.size !== before) changed++;
+    }
+    if (set.size === 0) delete session.metadata["protectedRawIds"];
+    else session.metadata["protectedRawIds"] = [...set];
+    if (!getStore().flushSync(session)) deps.log("warn", `[plugin] protect ${conversationId}: flush failed; the debounced save will retry`);
+    deps.log("info", `[plugin] protect ${conversationId}: ${clear ? "cleared" : "registered"} ${changed} ref(s) (${refs.join(", ")}), total protected ${set.size} (#2556)`);
+    forkReply(res, 200, { ok: true, action: clear ? "clear" : "protect", changed, total: set.size });
+}
+
 export function handlePluginManifest(res: import("node:http").ServerResponse, config: Config): void {
     // #1192: hosts register whatever the manifest serves verbatim (pi/omp/dsh/
     // opencode native plugins, MCP shims), so advertising an opt-in tool this
@@ -843,6 +902,7 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
         },
         headers: { agent: PLUGIN_AGENT_HEADER, conversation: PLUGIN_CONVERSATION_HEADER, contextWindow: PLUGIN_CONTEXT_WINDOW_HEADER, maxOutput: PLUGIN_MAX_OUTPUT_HEADER, model: PLUGIN_MODEL_HEADER, instructionsMutable: PLUGIN_INSTRUCTIONS_MUTABLE_HEADER },
         toolEndpoint: "/__bili/plugin/tool",
+        protectEndpoint: "/__bili/plugin/protect",
         statusEndpoint: "/__bili/plugin/status",
         runtimeInfoEndpoint: "/__bili/plugin/runtime-info",
         capabilities: { ...(externalSummary ? { externalSummary: { enabled: true, summaryOptional: true, submittedSummary: "hint" } } : {}), fork: { protocolVersion: 1, endpoint: "/__bili/plugin/fork", snapshotEndpoint: "/__bili/plugin/snapshot" } },
