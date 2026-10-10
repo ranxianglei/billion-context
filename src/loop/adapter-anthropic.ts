@@ -277,7 +277,22 @@ export function createAnthropicAdapter(requestBody: Record<string, unknown>, ori
             const withNotes = notes && notes.length > 0
                 ? [...messages, ...notes.map((text) => ({ role: "user" as const, content: text }))]
                 : messages;
-            return { ...body, system: stamped, messages: withNotes };
+            const rebuilt: Record<string, unknown> = { ...body, system: stamped, messages: withNotes };
+            // #2701: the rebuild above resends the FULL conversation view
+            // (coreToAnthropic of the whole kernel state), never an increment —
+            // so a Threads `continue` carried over from the client request would
+            // reference a previous_message_id that round 1 already consumed →
+            // upstream 400 "has already been continued", the turn dies and the
+            // fold is undelivered. Rewrite to `create`: it seeds a fresh thread
+            // with the post-fold view, and the host's next continue (referencing
+            // THIS response id) inherits the folded state. Dropping the field
+            // instead would orphan the response from any thread and break that
+            // very continue (#1954's responses-lane strip has no create analog).
+            if (rebuilt.thread !== undefined && typeof rebuilt.thread === "object" && !Array.isArray(rebuilt.thread) && (rebuilt.thread as { type?: unknown }).type === "continue") {
+                loggerLog("info", "[acp-loop] re-request rewrote thread.continue → thread.create (full-view rebuild cannot reuse a consumed previous_message_id, #2701)");
+                rebuilt.thread = { type: "create" };
+            }
+            return rebuilt;
         },
 
         async *parseStream(upstream, round) {
