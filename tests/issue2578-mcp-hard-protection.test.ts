@@ -9,6 +9,7 @@ import { createCore, createInitialState, defaultConfig, refForRaw, coveredMessag
 import { anthropicToCore, type AnthropicRequestBody } from "acp-kernel/wire";
 import { loadOptions, isMcpBiliHardProtected } from "../src/config.ts";
 import { resolveRequestConfig } from "../src/compress-settings.ts";
+import { createSession, effectiveConfig, storeEffectiveConfig } from "../src/session.ts";
 
 // --- Predicate unit behavior ----------------------------------------------
 
@@ -154,4 +155,20 @@ test("parity control: bare acp_rule survives an explicit full-history fold under
     assert.ok(!covered.has(call.id) && !covered.has(result.id), "bare acp_rule pair carved out of the fold");
     const turn2 = core.processTurn({ messages: msgs, state: res.state, config, tokenCount: 9999, renderTags: "text-only" });
     assert.equal(turn2.messages.filter((m) => m.contentType === "tool-call" && m.toolName === "acp_rule").length, 1, "bare acp_rule call survives");
+});
+
+// Review regression (#2584): the hook is a FUNCTION. storeEffectiveConfig stamps
+// the per-request config into session.metadata.effectiveConfig every request,
+// and fork-adoption structuredClones that metadata (plugin.ts) — a function
+// value throws DataCloneError there and fails every fork with 503 FORK_FAILED.
+// The stamp must stay clone-safe; the read path restores the hook from the base.
+test("stamped effectiveConfig stays clone-safe for fork adoption and the hook survives via the read path", () => {
+    const reqConfig = resolveRequestConfig(loadOptions({}).kernelConfig, {}, undefined, "kimi-test", 200000);
+    assert.equal(typeof reqConfig.isToolProtected, "function", "the wire path carries the hook");
+    const session = createSession("fork-clone-check");
+    storeEffectiveConfig(session, reqConfig);
+    const stamped = structuredClone(session.metadata["effectiveConfig"]) as Record<string, unknown>;
+    assert.ok(!("isToolProtected" in stamped), "function fields are stripped before stamping");
+    const restored = effectiveConfig(session, loadOptions({}).kernelConfig);
+    assert.equal(restored.isToolProtected?.("mcp__bili__acp_rule"), true, "read path restores the hook from the base kernelConfig");
 });
