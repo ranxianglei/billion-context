@@ -33,21 +33,24 @@ function makeDecision(overrides: Partial<NudgeDecision> = {}): NudgeDecision {
     } as NudgeDecision;
 }
 
-test("#2302: hint is static — no skeleton markers, fixed shape", () => {
-    assert.ok(ONE_CALL_HINT.includes("ONE call, ONE string"), "framing");
+test("#2302: hint is static — no skeleton markers, fixed shape (#2587 strict-JSON wording)", () => {
+    assert.ok(ONE_CALL_HINT.startsWith("ONE call"), "framing");
+    assert.ok(ONE_CALL_HINT.includes("OBJECT ARRAY"), "object array is the preferred form");
+    assert.ok(ONE_CALL_HINT.includes("quoted JSON string"), "string form stays legal but quoted");
     assert.ok(!ONE_CALL_HINT.includes("<topic>"), "no skeleton header slot");
     assert.ok(!ONE_CALL_HINT.includes("<write your summary"), "no summary slot");
     assert.ok(ONE_CALL_HINT.includes("reappear in later nudges"), "deferral stays licensed");
+    assert.ok(ONE_CALL_HINT.includes("never split the batch across separate calls"), "one-call discipline stays");
 });
 
 test("#2302: emergency nudge carries the hint; it never grows with range count", () => {
     const few = renderNudgeText(makeDecision({ compressibleRanges: [range(1, 2)] }));
     const many = renderNudgeText(makeDecision({ compressibleRanges: Array.from({ length: 24 }, (_, i) => range(i * 10 + 1, i * 10 + 9)) }));
     for (const text of [few.text, many.text]) {
-        assert.ok(text.includes("ONE call, ONE string"), "hint rides");
+        assert.ok(text.includes("fold every range you keep into a single compress call"), "hint rides");
         assert.ok(!text.includes("<write your summary of this range>"), "no expanded skeleton");
     }
-    const occurrences = many.text.split("ONE call, ONE string").length - 1;
+    const occurrences = many.text.split("fold every range you keep into a single compress call").length - 1;
     assert.equal(occurrences, 1, "hint appears exactly once regardless of range count");
 });
 

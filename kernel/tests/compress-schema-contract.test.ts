@@ -192,14 +192,15 @@ test("empty content array passes the schema; the parser degrades gracefully", ()
   assert.equal(parseCompressArgs({ content: [] }).ranges.length, 0);
 });
 
-test("the content description still teaches the line form and the string form", () => {
+test("the content description still teaches both forms under the strict-JSON contract (#2587)", () => {
   const desc =
     (COMPRESS_PARAMETERS.properties as Record<string, { description?: string }>)
       .content.description ?? "";
-  assert.ok(desc.includes("m00150–m00220"), "line-form header example kept");
+  assert.ok(desc.includes("PREFERRED"), "array form marked preferred");
+  assert.ok(desc.includes("mNNNNN–mNNNNN"), "line-form header example kept");
   assert.ok(
-    desc.includes("JSON-encoded array"),
-    "stringified-array form documented",
+    desc.includes("strict JSON rule applies to both forms"),
+    "strict-JSON escaping stated for both forms",
   );
 });
 

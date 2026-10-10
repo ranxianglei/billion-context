@@ -407,7 +407,7 @@ test("#2302: emergency nudge carries the static hint, stays unconditional (#1198
     makeDecision({ contextUsage: 0.99, breakdown: { emergencyOverride: 1 } }),
   );
   assert.ok(
-    emergency.text.includes("ONE call, ONE string"),
+    emergency.text.includes("fold every range you keep into a single compress call"),
     "static hint rides emergency too",
   );
   assert.ok(
@@ -427,9 +427,10 @@ test("#2302: hint never grows with the range count", () => {
   const many = renderNudgeText(
     makeDecision({ contextUsage: 0.5, compressibleRanges: makeRanges(24) }),
   );
-  const count = (s: string) => (s.match(/ONE call, ONE string/g) ?? []).length;
-  assert.equal(count(few.text), 0, "gentle hint phrased conditionally");
-  assert.equal(count(many.text), 0, "24 ranges — still no expanded skeleton");
+  const count = (s: string) =>
+    (s.match(/fold the ranges you keep in ONE call/g) ?? []).length;
+  assert.equal(count(few.text), 1, "static gentle hint rides once");
+  assert.equal(count(many.text), 1, "24 ranges — still one static line, no expansion");
   assert.ok(
     many.text.length < few.text.length + 200 * 22,
     "growth stays bounded by the ranges table, not a skeleton",
@@ -440,6 +441,13 @@ test("#2302: tier-2/tier-3 nudges carry no message-ref hint (block refs)", () =>
   const t2 = renderNudgeText(
     makeDecision({ contextUsage: 0.5, tier: 2, tierTargetBlocks: [] }),
   );
-  assert.ok(!t2.text.includes("ONE call, ONE string"), "T2 folds blocks");
+  assert.ok(
+    !t2.text.includes("fold every range you keep into a single compress call"),
+    "T2 folds blocks",
+  );
+  assert.ok(
+    !t2.text.includes("fold the ranges you keep in ONE call"),
+    "T2 carries no message-ref hint",
+  );
   assert.ok(!t2.text.includes("<write your summary of this range>"));
 });
