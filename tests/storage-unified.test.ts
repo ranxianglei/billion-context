@@ -8,6 +8,7 @@ import type { Session } from "../src/session.ts";
 import { canonicalize, sha256 } from "./golden-canonical.ts";
 import { planIngest, loadLegacyView, toLegacyLike } from "../src/storage/ingest.ts";
 import { UnifiedStore } from "../src/storage/store.ts";
+import { resolveStorageMode } from "../src/storage/shadow.ts";
 import { setPreferredSqliteEngineForTests, type SqliteEngineName } from "../src/storage/driver.ts";
 
 /**
@@ -199,5 +200,116 @@ test("storage shadow (BILI_STORAGE_UNIFIED=1): real persist path double-writes a
     } finally {
         if (prev === undefined) delete process.env.BILI_STORAGE_UNIFIED;
         else process.env.BILI_STORAGE_UNIFIED = prev;
+    }
+});
+
+test("resolveStorageMode maps every env spelling", () => {
+    const cases: Array<[string | undefined, string]> = [
+        [undefined, "legacy"],
+        ["", "legacy"],
+        ["0", "legacy"],
+        ["false", "legacy"],
+        ["legacy", "legacy"],
+        ["garbage", "legacy"],
+        ["1", "shadow"],
+        ["true", "shadow"],
+        ["shadow", "shadow"],
+        ["full", "full"],
+        ["unified", "full"],
+    ];
+    for (const [raw, want] of cases) {
+        const env: NodeJS.ProcessEnv = {};
+        if (raw !== undefined) env.BILI_STORAGE_UNIFIED = raw;
+        assert.equal(resolveStorageMode(env), want, `BILI_STORAGE_UNIFIED=${JSON.stringify(raw)}`);
+    }
+});
+
+test("storage unified FULL mode: read path serves from the index with organic import + GC parity", async () => {
+    const meta = CASE_META["folded"]!;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-full-"));
+    const prev = process.env.BILI_STORAGE_UNIFIED;
+    process.env.BILI_STORAGE_UNIFIED = "full";
+    try {
+        fs.cpSync(path.join(CORPUS_ROOT, "folded"), path.join(dir, "folded"), { recursive: true });
+        const caseDir = path.join(dir, "folded");
+        // First open against a dir that has ONLY the legacy file: loadSync
+        // must organically import and serve the unified view.
+        const store = new SessionStore({ dir: caseDir, debounceMs: 1, enabled: true });
+        const session = store.loadSync(meta.id, { protocol: meta.protocol, upstreamOrigin: "http://127.0.0.1:8199" });
+        assert.ok(session, "full-mode loadSync returned null");
+        assert.equal(sessionDigest(toLegacyLike(session)), manifest["folded"]!.digest, "full-mode read digest drift (organic import)");
+        store.cancelAll();
+        // The import must have populated the index even though writeNow never ran.
+        const probe = UnifiedStore.open(path.join(caseDir, "index.db"));
+        try {
+            assert.ok(probe.getSessionRow(meta.id), "organic import did not populate index.db");
+        } finally {
+            probe.close();
+        }
+        // Second store, same dir: load again — serves from the index, no
+        // import churn, digest still exact.
+        const store2 = new SessionStore({ dir: caseDir, debounceMs: 1, enabled: true });
+        const again = store2.loadSync(meta.id, { protocol: meta.protocol, upstreamOrigin: "http://127.0.0.1:8199" });
+        assert.ok(again, "second full-mode loadSync returned null");
+        assert.equal(sessionDigest(toLegacyLike(again)), manifest["folded"]!.digest, "second full-mode read digest drift");
+        store2.cancelAll();
+    } finally {
+        if (prev === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = prev;
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("storage unified FULL mode: boot() walks files, imports, and #286 rekey removes the old id from the index", async () => {
+    const meta = CASE_META["folded"]!;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-boot-"));
+    const prev = process.env.BILI_STORAGE_UNIFIED;
+    process.env.BILI_STORAGE_UNIFIED = "full";
+    try {
+        fs.cpSync(path.join(CORPUS_ROOT, "folded"), path.join(dir, "folded"), { recursive: true });
+        const caseDir = path.join(dir, "folded");
+        const store = new SessionStore({ dir: caseDir, debounceMs: 1, enabled: true });
+        // corpus-folded's label is "corpus-corpus-folded" (label != id), so
+        // boot()'s #286 migration rekeys to the label id and calls
+        // removeLegacyFile on the old id — the shadow must follow.
+        const sessions = await store.boot();
+        store.cancelAll();
+        assert.ok(sessions.size >= 1, "boot loaded nothing");
+        const probe = UnifiedStore.open(path.join(caseDir, "index.db"));
+        try {
+            assert.ok(!probe.getSessionRow(meta.id), "old id still present in index after #286 rekey GC");
+            assert.ok(probe.listSessionIds().includes("corpus-corpus-folded"), "rekeyed label id missing from index");
+        } finally {
+            probe.close();
+        }
+    } finally {
+        if (prev === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = prev;
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("storage unified: encryption guard keeps the sidecar closed", () => {
+    const meta = CASE_META["folded"]!;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-enc-"));
+    const prevMode = process.env.BILI_STORAGE_UNIFIED;
+    const prevKey = process.env.BILI_ENCRYPTION_KEY;
+    process.env.BILI_STORAGE_UNIFIED = "full";
+    process.env.BILI_ENCRYPTION_KEY = "a".repeat(64); // 32 bytes hex
+    try {
+        fs.cpSync(path.join(CORPUS_ROOT, "folded"), path.join(dir, "folded"), { recursive: true });
+        const caseDir = path.join(dir, "folded");
+        const store = new SessionStore({ dir: caseDir, debounceMs: 1, enabled: true });
+        const session = store.loadSync(meta.id, { protocol: meta.protocol, upstreamOrigin: "http://127.0.0.1:8199" });
+        assert.ok(session, "encrypted legacy loadSync returned null");
+        assert.equal(sessionDigest(toLegacyLike(session)), manifest["folded"]!.digest, "encrypted legacy read digest drift");
+        store.cancelAll();
+        assert.ok(!fs.existsSync(path.join(caseDir, "index.db")), "index.db must NOT exist while encryption is active");
+    } finally {
+        if (prevMode === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = prevMode;
+        if (prevKey === undefined) delete process.env.BILI_ENCRYPTION_KEY;
+        else process.env.BILI_ENCRYPTION_KEY = prevKey;
+        fs.rmSync(dir, { recursive: true, force: true });
     }
 });

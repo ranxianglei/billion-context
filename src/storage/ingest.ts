@@ -249,6 +249,8 @@ export function loadLegacyView(
     },
 ): {
     id: string;
+    createdAt: number;
+    lastSeen: number;
     meta: Record<string, unknown>;
     stats: Record<string, unknown>;
     metadata: Record<string, unknown>;
@@ -321,6 +323,8 @@ export function loadLegacyView(
 
     const out: ReturnType<typeof loadLegacyView> = {
         id: s.sessionId,
+        createdAt: s.createdAt,
+        lastSeen: s.updatedAt,
         meta: JSON.parse(s.metaJson),
         stats: JSON.parse(s.statsJson),
         metadata: JSON.parse(s.metadataJson),

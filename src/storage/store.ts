@@ -269,6 +269,10 @@ export class UnifiedStore {
                     );
             }
 
+            // dead_refs: tombstones can be LIFTED (backing message
+            // reappears) — the array is authoritative, so rows at ords the
+            // incoming set no longer covers are stale and must go.
+            this.db.prepare("DELETE FROM dead_refs WHERE session_id = ? AND ord >= ?").run(s.sessionId, input.deadRefs.length);
             for (const d of input.deadRefs) {
                 this.db
                     .prepare(
@@ -285,13 +289,51 @@ export class UnifiedStore {
                     .run(s.sessionId, r.ord, r.rawId, r.ref, r.refNum);
             }
 
+            // ccr_entries: the content store is a map whose keys can be
+            // dropped — full-replace keeps the table authoritative. Release
+            // every old hash first, then re-insert (idempotent: identical
+            // sets cancel out bump+release).
+            const oldCcr = this.db
+                .prepare("SELECT content_hash FROM ccr_entries WHERE session_id = ?")
+                .all(s.sessionId) as { content_hash: string }[];
+            for (const row of oldCcr) this.releaseContent(row.content_hash);
+            this.db.prepare("DELETE FROM ccr_entries WHERE session_id = ?").run(s.sessionId);
             for (const e of input.ccrEntries) {
                 const hash = this.putContent(e.content);
-                const res = this.db
-                    .prepare("INSERT OR IGNORE INTO ccr_entries (session_id, ord, ccr_key, content_hash) VALUES (?, ?, ?, ?)")
+                this.db
+                    .prepare("INSERT INTO ccr_entries (session_id, ord, ccr_key, content_hash) VALUES (?, ?, ?, ?)")
                     .run(s.sessionId, e.ord, e.key, hash);
-                if (res.changes === 0) this.releaseContent(hash);
             }
+        });
+    }
+
+    /** Deletes one session and releases every CAS refcount it holds
+     *  (GC parity with the legacy path's file removal). Rows that other
+     *  sessions also reference survive via their own refcounts. */
+    deleteSession(sessionId: string): void {
+        this.db.transaction(() => {
+            const refs: string[] = [];
+            for (const m of this.db
+                .prepare("SELECT content_hash FROM messages WHERE session_id = ?")
+                .all(sessionId) as { content_hash: string }[]) refs.push(m.content_hash);
+            for (const b of this.db
+                .prepare("SELECT summary_hash, one_hash FROM blocks WHERE session_id = ?")
+                .all(sessionId) as { summary_hash: string; one_hash: string | null }[]) {
+                refs.push(b.summary_hash);
+                if (b.one_hash !== null) refs.push(b.one_hash);
+            }
+            for (const e of this.db
+                .prepare("SELECT content_hash FROM ccr_entries WHERE session_id = ?")
+                .all(sessionId) as { content_hash: string }[]) refs.push(e.content_hash);
+            this.db.prepare("DELETE FROM messages WHERE session_id = ?").run(sessionId);
+            this.db.prepare("DELETE FROM blocks WHERE session_id = ?").run(sessionId);
+            this.db.prepare("DELETE FROM dead_refs WHERE session_id = ?").run(sessionId);
+            this.db.prepare("DELETE FROM refs WHERE session_id = ?").run(sessionId);
+            this.db.prepare("DELETE FROM ccr_entries WHERE session_id = ?").run(sessionId);
+            this.db.prepare("DELETE FROM sessions WHERE session_id = ?").run(sessionId);
+            for (const hash of refs) this.releaseContent(hash);
+            // CAS rows at zero refcount are unreferenced garbage — collect.
+            this.db.prepare("DELETE FROM content WHERE refcount <= 0").run();
         });
     }
 
