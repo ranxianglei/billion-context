@@ -34,7 +34,7 @@ export function sha256(s: string): string {
 
 /** Canonical JSON → sha256, with a final pass of STRING-level environment
  *  normalization (ports, session ids embedded inside text fields). */
-export function digestOf(value: unknown, extra?: { normalize?: (s: string) => string }): string {
+function digestOf(value: unknown, extra?: { normalize?: (s: string) => string }): string {
     let text = JSON.stringify(canonicalize(value));
     if (extra?.normalize) text = extra.normalize(text);
     return sha256(text);

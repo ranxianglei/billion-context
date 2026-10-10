@@ -40,8 +40,8 @@ const GROW_TURNS = 20; // hard cap for the grow loop
 const SUMMARY_MARKER = "[Compressed conversation section]";
 const EDIT_SENTINEL = "GOLDEN-EDIT-SENTINEL";
 
-export interface GoldenTurn { i: number; sha: string; bytes: number }
-export interface GoldenRecord {
+interface GoldenTurn { i: number; sha: string; bytes: number }
+interface GoldenRecord {
     wire: Wire;
     turns: GoldenTurn[];
     foldAt: number;        // judge-side body index where compress was issued
@@ -90,7 +90,7 @@ const FILLER = (seed: number, kb: number): string => {
 
 /** Volatile ids minted onto the wire (Date.now-based or content-hash) become
  *  placeholders so the hash pins STRUCTURE+CONTENT, not wall-clock time. */
-export function canonicalBody(body: string): string {
+function canonicalBody(body: string): string {
     return body
         .replace(/msg-proxy-\d+(?:-\d+)?/g, "msg-proxy-<MINT>")
         .replace(/marker-\d+(?:-\d+)?/g, "marker-<MINT>")
