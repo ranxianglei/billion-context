@@ -765,6 +765,24 @@ test("F7b (#1876): anthropic buildRequest keeps client system blocks byte-exact,
     assert.equal(blocks[3]?.cache_control, undefined, "appended block carries no breakpoint (client-managed caching wins)");
 });
 
+test("F7c (#2701): anthropic buildRequest rewrites thread.continue → create on full-view rebuild", () => {
+    const systemPrompt = buildCompressSystemPrompt();
+    const adapter = createAnthropicAdapter({ model: "claude" }, undefined);
+    const body = { model: "claude", messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }], thread: { type: "continue", previous_message_id: "msg_consumed_1" } };
+    const rebuilt = adapter.buildRequest([], systemPrompt, body) as Record<string, unknown>;
+    assert.deepEqual(rebuilt.thread, { type: "create" }, "consumed continue rewritten to create (re-request resends the full view, never an increment)");
+    assert.ok(!JSON.stringify(rebuilt).includes("msg_consumed_1"), "previous_message_id dropped from the rebuilt body");
+});
+
+test("F7d (#2701): anthropic buildRequest leaves thread.create / absent thread untouched", () => {
+    const systemPrompt = buildCompressSystemPrompt();
+    const adapter = createAnthropicAdapter({ model: "claude" }, undefined);
+    const created = adapter.buildRequest([], systemPrompt, { model: "claude", messages: [], thread: { type: "create" } }) as Record<string, unknown>;
+    assert.deepEqual(created.thread, { type: "create" }, "create stays create");
+    const plain = adapter.buildRequest([], systemPrompt, { model: "claude", messages: [] }) as Record<string, unknown>;
+    assert.ok(!("thread" in plain), "no thread field invented for non-Threads clients");
+});
+
 function byteStream(chunks: Uint8Array[]): ReadableStream<Uint8Array> {
     return new ReadableStream<Uint8Array>({
         start(controller) {
