@@ -1733,6 +1733,8 @@ type FileConfig = {
          *  oldest-first deletion when exceeded. Unset/0 = off (default). */
         maxTotalBytes?: number;
         maxAgeDays?: number;
+        /** Opt-in whole-CCR-store integrity audit on the snapshot/fork path (#2675) — was BILI_FORK_STORE_AUDIT. */
+        forkStoreAudit?: boolean;
     };
     /** Fake-completion fallback tuning (#2030) — was BILI_FAKE_COMPLETION_RETRIES / BILI_FAKE_BUF_CAP. */
     fakeCompletion?: { retries?: number; bufCapBytes?: number };

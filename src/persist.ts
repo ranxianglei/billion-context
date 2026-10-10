@@ -384,7 +384,10 @@ export class SessionStore {
     /** #1097: persist the content-store envelope when dirty; an emptied store
      *  (rebase reset) deletes the file. Payload-first: runs BEFORE the session
      *  state write so a crash mid-save leaves at worst a retrieve miss, never
-     *  a placeholder whose original is gone. */
+     *  a placeholder whose original is gone. #2675: written atomically (temp
+     *  + rename) like every session write — a crash between the two writes now
+     *  orphans a swept temp instead of truncating the store the loader would
+     *  silently degrade past. */
     private saveContentStore(session: Session): void {
         if (!this.enabled || !session.contentStoreDirty) return;
         session.contentStoreDirty = false;
@@ -397,7 +400,7 @@ export class SessionStore {
         try {
             mkdirSync(path.dirname(abs), { recursive: true });
             const text = JSON.stringify(session.contentStore);
-            writeFileSync(abs, this.codec ? this.codec.encode(text) : text);
+            atomicWriteFileSync(abs, this.codec ? this.codec.encode(text) : text);
         } catch (err) {
             session.contentStoreDirty = true;
             this.log("warn", `[persist] content-store write failed for ${session.id}: ${err instanceof Error ? err.message : String(err)}`);
@@ -826,8 +829,18 @@ function buildRecord(session: Session): PersistedSession {
         // was cut from this one and set the sticky retained flag). Non-forking
         // sessions pay no disk cost; the in-memory copy self-heals on the next
         // model request because plugin agents resend their full history.
+        // #2675: the content store rides on the SAME condition as the snapshot
+        // — the retained flag promises the parent stays forkable after restart,
+        // which requires every ref listed in publicSnapshotStoredRefs to be
+        // retrievable. Persisting only the raw snapshot (the old child-receipt-
+        // only condition) let a restarted parent carry refs whose originals its
+        // companion .content-store.json had since lost (rebase reset deletes it,
+        // a protocol/upstream switch orphans its path), failing forkSnapshot
+        // closed forever with "CCR original index unavailable". The embedded
+        // copy is self-contained: buildSession restores it over any companion,
+        // the same precedence children already have.
         pluginSnapshot: session.metadata.publicForkReceipt !== undefined || session.metadata.publicSnapshotRetained === true ? session.pluginSnapshot : undefined,
-        forkContentStore: session.metadata.publicForkReceipt ? session.contentStore : undefined,
+        forkContentStore: session.metadata.publicForkReceipt !== undefined || session.metadata.publicSnapshotRetained === true ? session.contentStore : undefined,
         // Per-session provenance: record the bili build that wrote this file so the
         // web UI can show which version last touched the session; pre-stamp files
         // load without the key and render an honest dash.
@@ -1020,8 +1033,46 @@ function persistZstdEnabled(): boolean {
 /** Temp name used by atomic codec writes: `<file>.tmp-enc-<pid>-<ts>`. A
  *  process death between write and rename orphans it; any such name present
  *  at boot is stale by definition (the walk runs before this boot writes
- *  anything) and gets swept. */
+ *  anything) and gets swept. The name deliberately does NOT end in .json:
+ *  the kernel record walk and every GC/web walker only pick up *.json, so a
+ *  live temp is invisible to all of them. */
 const STALE_ENC_TEMP_RE = /\.tmp-enc-\d+-\d+$/;
+
+/** Transient fs failures worth retrying an atomic write for (same set as the
+ *  kernel StateStore's retry gate, kernel/src/persist/store.ts). */
+function isTransientFsError(err: unknown): boolean {
+    const code = (err as NodeJS.ErrnoException | null)?.code;
+    return code === "EPERM" || code === "EBUSY" || code === "EACCES" || code === "ENOENT" || code === "ENOTDIR";
+}
+
+/** #2675: atomic file write — fresh temp in the SAME directory + rename over
+ *  the target, so a process death mid-write leaves either the old or the new
+ *  bytes, never a truncated target (a direct writeFileSync of the companion
+ *  content store is exactly how #2671 §3 lost retrievable originals). Temp
+ *  names follow the swept `.tmp-enc-<pid>-<ts>` convention above. Transient
+ *  errors retry with a short bounded backoff (kernel discipline, shrunken —
+ *  this runs on the request path, not the boot path); primitives are
+ *  injectable so tests can simulate the death between write and rename. */
+export function atomicWriteFileSync(abs: string, data: string | Buffer, fsOps?: { write?: typeof writeFileSync; rename?: typeof renameSync }): void {
+    const write = fsOps?.write ?? writeFileSync;
+    const rename = fsOps?.rename ?? renameSync;
+    const attempts = 3;
+    let lastErr: unknown;
+    for (let attempt = 0; attempt < attempts; attempt++) {
+        const tmp = `${abs}.tmp-enc-${process.pid}-${Date.now()}`;
+        try {
+            write(tmp, data);
+            rename(tmp, abs);
+            return;
+        } catch (err) {
+            lastErr = err;
+            try { rmSync(tmp, { force: true }); } catch { /* best-effort */ }
+            if (!isTransientFsError(err) || attempt === attempts - 1) break;
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50 * 2 ** attempt);
+        }
+    }
+    throw lastErr;
+}
 
 async function walkJsonFiles(dir: string): Promise<string[]> {
     const entries = await readdir(dir, { withFileTypes: true });

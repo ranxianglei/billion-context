@@ -1,5 +1,5 @@
 import { type CompressionCore, type Config, type CoreMessage, type NudgeDecision, countMessageTokens, parseStoredPlaceholder, prune } from "acp-kernel";
-import { publicSnapshotCapBytes } from "./knobs.js";
+import { forkStoreAudit, publicSnapshotCapBytes } from "./knobs.js";
 import { buildStatusPanel } from "acp-kernel/panel";
 import { fileURLToPath } from "node:url";
 import type { ServerResponse } from "node:http";
@@ -993,6 +993,51 @@ function sessionRevisionOf(session: Session): string {
     return revision;
 }
 
+/** #2675: opt-in (BILI_FORK_STORE_AUDIT / diagnostics.forkStoreAudit) whole-CCR-store
+ *  integrity audit — re-hashes every stored payload and cross-checks every index
+ *  entry anywhere in the store, restoring the pre-#2675 fail-closed surface at
+ *  O(store) cost for triage. The default hot path audits only the refs the
+ *  snapshot uses (below); content-addressing pins the bytes of those. */
+function forkStoreIntegrityAudit(session: Session): void {
+    const store = contentStoreOf(session);
+    const indexedHashes = new Set(Object.values(store.byRef).map((entry) => entry.hash));
+    if (Object.entries(store.byHash).some(([hash, text]) => !indexedHashes.has(hash) || typeof text !== "string" || createHash("sha256").update(text, "utf8").digest("hex") !== hash)) throw new Error("CCR original payload/index inconsistent");
+    if (Object.entries(store.byRef).some(([ref, entry]) => typeof store.byHash[entry.hash] !== "string" || session.state.messageRefs.byRaw[entry.rawId] !== ref || session.state.messageRefs.byRef[ref] !== entry.rawId)) throw new Error("CCR original alias inconsistent");
+}
+
+/** #2675: the revision input is PREFIX-SCOPED — a pure function of exactly the
+ *  state the fork result depends on, so unrelated CCR appends (store growth for
+ *  messages outside the snapshot) no longer invalidate clients' cached
+ *  parentRevision, and the hot path costs O(snapshot + blocks) instead of
+ *  O(store) sha256 over every payload. Deliberately EXCLUDED, each verified
+ *  safe against handlePluginFork's child construction: CCR payloads
+ *  (content-addressed — the {ref, rawId, hash} binding below pins the bytes;
+ *  byte-integrity triage is the opt-in audit above), blockContents (set once
+ *  per blockId and only deleted when the block deactivates, which flips
+ *  `active` here), messageRefs/tokenSnapshot beyond the snapshot refs (the
+ *  child clones the whole reserved namespace and copies prefix token counts —
+ *  monotonic supersets the child's view ignores), deadRefs/hiddenOrphanRefs
+ *  (monotonic; a live snapshot ref cannot enter them without the snapshot
+ *  itself changing), lastPassIds/stats (child overwrites), full message bodies
+ *  (forkMessageIdentityHash digests exactly the sameSnapshotView field set).
+ *  `scheme` discriminates this projection from the pre-#2675 whole-state hash. */
+function forkRevisionInput(session: Session, store: ReturnType<typeof contentStoreOf>, orderedMessages: ForkIdentity[]) {
+    const state = session.state;
+    return {
+        scheme: 2,
+        sessionId: session.id,
+        orderedMessages,
+        blocks: state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active, expanded: b.expanded === true, effectiveMessageIds: b.effectiveMessageIds, directBlockIds: b.directBlockIds, compressedTokens: b.compressedTokens, summary: b.summary })),
+        rules: state.rules,
+        nextRuleId: state.nextRuleId,
+        absorbed: state.absorbed,
+        nudge: state.nudge,
+        nextBlockId: state.nextBlockId,
+        nextRunId: state.nextRunId,
+        storeRefs: orderedMessages.map((m) => { const entry = store.byRef[m.ref]; return { ref: m.ref, rawId: entry?.rawId ?? null, hash: entry?.hash ?? null }; }),
+    };
+}
+
 function forkSnapshot(session: Session) {
     const messages = session.pluginSnapshot;
     if (!messages) throw new Error(session.metadata.publicSnapshotCapped === true ? "raw snapshot exceeded the retention cap (BILI_PUBLIC_SNAPSHOT_CAP_BYTES); fork is refused rather than retaining an unbounded raw copy" : "raw snapshot unavailable; send a fresh plugin model request");
@@ -1000,9 +1045,7 @@ function forkSnapshot(session: Session) {
     const store = contentStoreOf(session);
     const expectedStoredRefs = session.metadata.publicSnapshotStoredRefs;
     if (Array.isArray(expectedStoredRefs) && expectedStoredRefs.some((ref) => typeof ref !== "string" || !store.byRef[ref])) throw new Error("CCR original index unavailable");
-    const indexedHashes = new Set(Object.values(store.byRef).map((entry) => entry.hash));
-    if (Object.entries(store.byHash).some(([hash, text]) => !indexedHashes.has(hash) || typeof text !== "string" || createHash("sha256").update(text, "utf8").digest("hex") !== hash)) throw new Error("CCR original payload/index inconsistent");
-    if (Object.entries(store.byRef).some(([ref, entry]) => typeof store.byHash[entry.hash] !== "string" || session.state.messageRefs.byRaw[entry.rawId] !== ref || session.state.messageRefs.byRef[ref] !== entry.rawId)) throw new Error("CCR original alias inconsistent");
+    if (forkStoreAudit()) forkStoreIntegrityAudit(session);
     const orderedMessages = messages.map((m): ForkIdentity => {
         const ref = session.state.messageRefs.byRaw[m.id];
         if (!ref || session.state.messageRefs.byRef[ref] !== m.id) throw new Error("raw/ref mapping inconsistent");
@@ -1011,8 +1054,7 @@ function forkSnapshot(session: Session) {
         if ((entry && (entry.rawId !== m.id || typeof store.byHash[entry.hash] !== "string")) || (placeholder && (placeholder.ref !== ref || !entry))) throw new Error("CCR original unavailable or alias inconsistent");
         return { rawId: m.id, ref, identityHash: forkMessageIdentityHash(m) };
     });
-    const state = { ...session.state, imageFullRestored: session.state.imageFullRestored ?? [], imageShrinks: session.state.imageShrinks ?? [] };
-    const parentRevision = forkHash({ sessionId: session.id, messages, state, blockContents: Object.fromEntries(session.blockContents), contentStore: store });
+    const parentRevision = forkHash(forkRevisionInput(session, store, orderedMessages));
     return { protocolVersion: 1, status: "exact", sessionId: session.id, parentRevision, orderHash: forkOrderHash(orderedMessages), orderedMessages, messages: messages.map((m, i) => ({ rawId: m.id, ref: orderedMessages[i]!.ref, role: m.role, text: m.text, toolName: m.toolName, toolCallId: m.toolCallId, contentType: m.contentType, toolIsError: forkToolIsError(m) })) };
 }
 

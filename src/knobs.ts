@@ -416,6 +416,18 @@ export function forceTextProtocol(): boolean {
     return fileDiag().compressProtocol === "text";
 }
 
+/** BILI_FORK_STORE_AUDIT > diagnostics.forkStoreAudit > false (#2675). Opt-in
+ *  whole-CCR-store integrity audit on the fork/snapshot path: re-hashes every
+ *  stored payload and cross-checks every index entry (orphan payloads, byte
+ *  mismatches, alias inconsistencies anywhere in the store). Off by default —
+ *  the hot path only audits the refs the snapshot actually uses; enabling this
+ *  restores the pre-#2675 fail-closed surface at O(store) cost for triage. */
+export function forkStoreAudit(): boolean {
+    const envRaw = process.env.BILI_FORK_STORE_AUDIT;
+    if (envRaw !== undefined) return envRaw === "1";
+    return fileDiag().forkStoreAudit === true;
+}
+
 // --- wire-compat knobs living in the existing compat block ---
 
 /** ACP_KEEP_RESPONSE_ID > compat.keepResponseId > false. */
