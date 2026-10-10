@@ -9,7 +9,8 @@ import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, r
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
-import { applyCompactionArchive, foldCoverage, markDirty, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
+import { applyCompactionArchive, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
+import { recordConflict } from "../conflict-watch.js";
 import { ABSORB_TOOL_NAME, IMAGE_FULL_TOOL_GOOGLE, RULE_TOOL_GOOGLE, absorbToolsFor, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressSystemPrompt, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withSummaryBudgetNote } from "../compress-tool.js";
 import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, retrieveToolName } from "../store.js";
@@ -102,6 +103,9 @@ export async function prepareGoogle(
             googleClientSystem = outcome.outbound;
         }
         originalMessages = msgs;
+        // #1001: pre-turn snapshot — processTurn below assigns fresh refs to every
+        // previously-unknown id, which would make rewrite detection read 1.0.
+        const knownRefsBefore = new Set(Object.keys(session.state.messageRefs.byRaw));
         const { tokens: tokenCount, source: tokenCountSource } = effectiveTokenCount(session, msgs, imageReserveFor(session, "google", parsed, opts, upstreamOrigin));
         const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
         const absorbBlock = effectiveAbsorbBlock(pluginMode, config, opts.compress.absorb);
@@ -150,6 +154,17 @@ export async function prepareGoogle(
         const willInjectNudge = opts.compress.injectNudge && !!turn.nudge && shouldInject && !nudgeSuppressed(session) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig)) && (turn.nudge.shouldInject || emergencyNudge(turn.nudge, undefined, loopConfig.compress.minCompressRange));
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, model, willInjectNudge));
         processedMessages = stripKernelSummaries(turn.messages, turn.state);
+        // #1001: a silent client history rewrite takes the same archive+prune path
+        // as an announced /compact boundary — syncBlocks above has already
+        // deactivated the blocks whose sources left the context.
+        {
+            const rewrite = detectUnannouncedHistoryRewrite(session, knownRefsBefore, msgs.map((m) => m.id));
+            if (rewrite.detected) {
+                log("warn", `[${sessionId}] unannounced client history rewrite detected (${rewrite.knownIncoming}/${rewrite.incomingTotal} incoming message(s) carry pre-turn refs of ${rewrite.knownBefore} known) — marking compaction boundary (#1001)`);
+                recordConflict(session, "unannounced-rewrite", `${rewrite.knownIncoming}/${rewrite.incomingTotal} incoming message(s) carry pre-turn refs of ${rewrite.knownBefore} known`);
+                markCompactionBoundary(session);
+            }
+        }
         applyCompactionArchive(session, activeBefore, new Set(msgs.map((m) => m.id)), log);
         reapOrphansLogged(session, msgs, log, sessionId);
         // [#1095] arrival-time image downscale (see prepareAnthropic).
