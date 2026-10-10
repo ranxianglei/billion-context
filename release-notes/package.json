@@ -12,6 +12,12 @@
     "updated": "2026-10-10",
     "releases": [
       {
+        "version": "0.1.192",
+        "date": "2026-10-10",
+        "tier": "critical",
+        "summary": "DSH desktop: after a native-compaction checkpoint landed on the anthropic/google lanes the prefix cache never recovered — persistent cache misses and heavy token waste (#2658, #2596); v0.1.189 added the rebase fallback only to the openai/responses lanes, this release extends it to anthropic/google (#2664). Restart dsh once after upgrading. 丨 桌面版:DSH 原生压缩的 checkpoint 一旦落到 anthropic/google 线,前缀缓存从此无法恢复、持续 miss、token 大量浪费(#2658、#2596);v0.1.189 只给 openai/responses 线补了 rebase 回落,本版补齐 anthropic/google(#2664)。升级后重启一次 dsh。"
+      },
+      {
         "version": "0.1.191",
         "date": "2026-10-10",
         "tier": "recommended",
