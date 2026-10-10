@@ -173,6 +173,18 @@ test("piSubagentChannelFallback: parsed=null re-parses the buffer (marker decide
     assert.ok(piSubagentChannelFallback(buf, null).present);
 });
 
+test("piSubagentChannelFallback: parsed=null — signal and tools come from the same re-parse (#2696)", () => {
+    // Caller passed no parsed body; the gate must read the grant from the SAME
+    // re-parse that found the marker — not from an invisible `undefined`.
+    const granted = Buffer.from(JSON.stringify({
+        model: "claude-test",
+        system: tagged("delegate"),
+        messages: [{ role: "user", content: "hi" }],
+        tools: [{ type: "namespace", name: "bili", tools: [{ name: "compress", description: "", input_schema: { type: "object" } }] }],
+    }));
+    assert.deepEqual(piSubagentChannelFallback(granted, null), { present: false });
+});
+
 test("piSubagentChannelFallback: namespaced grants decide like flat ones (#2694)", () => {
     const nsBody = (members: unknown[]) => Buffer.from(JSON.stringify({
         model: "gpt-test",

@@ -179,18 +179,23 @@ export function exposesBiliInjectableTool(tools: unknown): boolean {
 /** Full gate: pi-subagents child marker present in a system carrier AND the
  *  role allowlist exposes no bili-injectable tool name. Caller additionally
  *  requires pluginAgent==="pi". Reuses the caller's parsed body when available
- *  (no double parse on the hot path). */
+ *  (no double parse on the hot path), else parses the buffer once here. Signal
+ *  and tools always read from the SAME parsed object; unparseable ⇒ fail closed. */
 export function piSubagentChannelFallback(bodyBuffer: Buffer, parsed: unknown): PiSubagentChildSignal {
-    let signal: PiSubagentChildSignal;
-    let tools: unknown;
+    let rec: Record<string, unknown> | undefined;
     if (typeof parsed === "object" && parsed !== null) {
-        const rec = parsed as Record<string, unknown>;
-        signal = detectInParsed(rec);
-        tools = rec.tools;
+        rec = parsed as Record<string, unknown>;
     } else {
-        signal = detectPiSubagentChildSignal(bodyBuffer);
+        try {
+            const p: unknown = JSON.parse(bodyBuffer.toString("utf8"));
+            if (typeof p === "object" && p !== null) rec = p as Record<string, unknown>;
+        } catch {
+            // unparseable — fail closed below
+        }
     }
+    if (!rec) return { present: false };
+    const signal = detectInParsed(rec);
     if (!signal.present) return signal;
-    if (exposesBiliInjectableTool(tools)) return { present: false };
+    if (exposesBiliInjectableTool(rec.tools)) return { present: false };
     return signal;
 }
