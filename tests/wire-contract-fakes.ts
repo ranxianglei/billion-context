@@ -27,6 +27,14 @@ interface WireRule {
 
 export const WIRE_RULES: readonly WireRule[] = [
     {
+        id: "WC-016",
+        wire: "anthropic",
+        summary:
+            'a cache_control breakpoint with scope:"global" is only valid while every preceding block is ALSO globally scoped — in render order (tool definitions render BEFORE system blocks, then message content blocks), a global breakpoint found after any unmarked or narrower-scope content is a 400; narrowing AFTER a global breakpoint (global → ephemeral) stays legal',
+        provenance:
+            'bili #2648 production 400 (Claude Desktop 2.31226.1 / embedded Claude Code 2.1.295 through cert-MITM proxy mode, beta prompt-caching-scope-2026-01-05): the host notification-classifier side call pinned its system blocks to scope:"global" and sent NO tools array; bili proxy-mode injection appended six unmarked ACP tools, which render ahead of the global system blocks → upstream rejected with \'cache_control.scope: "global" is only valid when every preceding block is also globally scoped. A block with scope: "global" was found after content with a narrower cache scope. Note that tool definitions render before system blocks, so scope: "global" on system[0] is not a true prefix when tools are present.\' Repair (PR #2650): whole-request passthrough when any SYSTEM block pins scope:"global" (hasGlobalScopeSystem, src/server/prepare-anthropic.ts). Boundary (recorded per KDD #9 evidence-permitlist discipline, not fixed here): that gate scans system blocks ONLY — a host pinning a global breakpoint on tools[] with no global system block is not covered yet, and mergeOwnedTools (src/server/inject.ts) appends bili\'s unmarked tools after the client\'s, which would 400 the same way; extend the predicate to tools[] only with traffic evidence (none observed — #2648 main-loop turns were healthy).',
+    },
+    {
         id: "WC-015",
         wire: "responses",
         summary: "a supplied message input item id must begin with msg",
@@ -153,7 +161,7 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
     return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-/** WC-001..WC-003, WC-007, WC-010 on an Anthropic /v1/messages body. Returns violation strings. */
+/** WC-001..WC-003, WC-007, WC-010, WC-016 on an Anthropic /v1/messages body. Returns violation strings. */
 function validateAnthropicBody(body: unknown): string[] {
     const out: string[] = [];
     if (!isPlainObject(body)) return out;
@@ -173,6 +181,31 @@ function validateAnthropicBody(body: unknown): string[] {
         }
     if (breakpoints > 4)
         out.push(`WC-010 ${breakpoints} cache_control breakpoints (system + tools + messages combined) — Anthropic allows at most 4`);
+    // WC-016 runs before the tools early-return: a violating global breakpoint
+    // can sit in system or messages with no tools array at all. Render order is
+    // tools → system → message content blocks (the API renders tool definitions
+    // BEFORE system); a scope:"global" breakpoint stays legal only while every
+    // preceding block is also globally scoped — unmarked blocks default to the
+    // session scope, so they poison every later global breakpoint too (#2648).
+    {
+        let sawNonGlobal = false;
+        const visit = (cc: unknown): void => {
+            const scope = isPlainObject(cc) ? cc.scope : undefined;
+            if (scope === "global") {
+                if (sawNonGlobal)
+                    out.push('WC-016 cache_control.scope:"global" found after content without a global scope — every preceding block must be globally scoped too (tools render before system, #2648)');
+            } else sawNonGlobal = true;
+        };
+        if (Array.isArray(body.tools))
+            for (const t of body.tools) visit(isPlainObject(t) ? t.cache_control : undefined);
+        if (Array.isArray(body.system))
+            for (const b of body.system) visit(isPlainObject(b) ? b.cache_control : undefined);
+        if (Array.isArray(body.messages))
+            for (const m of body.messages) {
+                if (!isPlainObject(m) || !Array.isArray(m.content)) continue;
+                for (const b of m.content) visit(isPlainObject(b) ? b.cache_control : undefined);
+            }
+    }
     if (!Array.isArray(body.tools)) return out;
     body.tools.forEach((t, i) => {
         if (!isPlainObject(t)) {

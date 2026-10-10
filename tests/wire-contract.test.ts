@@ -76,6 +76,34 @@ test("WC-015 validates message-item IDs without constraining provider namespaces
     assert.match(VALIDATORS.responses({ input: [{ type: "message", role: "assistant", id: "marker-1791393957942-2", content: "x" }] })[0], /WC-015/);
 });
 
+test("WC-016 validates global-scope breakpoint ordering (render order: tools → system → messages)", () => {
+    // #2648 shape: unmarked tools render ahead of a global system block.
+    assert.match(VALIDATORS.anthropic({
+        tools: [{ name: "t", input_schema: { type: "object", properties: {} } }],
+        system: [{ type: "text", text: "s", cache_control: { type: "ephemeral", scope: "global" } }],
+    })[0], /WC-016/);
+    // A narrower-scope breakpoint in messages poisons a later global breakpoint.
+    assert.match(VALIDATORS.anthropic({
+        system: [{ type: "text", text: "s", cache_control: { type: "ephemeral", scope: "global" } }],
+        messages: [
+            { role: "user", content: [{ type: "text", text: "u", cache_control: { type: "ephemeral" } }] },
+            { role: "assistant", content: [{ type: "text", text: "a", cache_control: { type: "ephemeral", scope: "global" } }] },
+        ],
+    })[0], /WC-016/);
+    // Legal: everything globally scoped until the first narrowing (global → ephemeral tail).
+    assert.deepEqual(VALIDATORS.anthropic({
+        tools: [{ name: "t", input_schema: { type: "object", properties: {} }, cache_control: { type: "ephemeral", scope: "global" } }],
+        system: [{ type: "text", text: "s", cache_control: { type: "ephemeral", scope: "global" } }],
+        messages: [{ role: "user", content: [{ type: "text", text: "u", cache_control: { type: "ephemeral" } }] }],
+    }), []);
+    // Legal: ordinary ephemeral marks without any global scope, in any order.
+    assert.deepEqual(VALIDATORS.anthropic({
+        system: [{ type: "text", text: "s", cache_control: { type: "ephemeral" } }],
+        tools: [{ name: "t", input_schema: { type: "object", properties: {} } }],
+        messages: [{ role: "user", content: [{ type: "text", text: "u", cache_control: { type: "ephemeral" } }] }],
+    }), []);
+});
+
 function syntheticBody(wire: Wire, tool: unknown): Record<string, unknown> {
     if (wire === "google") return { tools: [{ functionDeclarations: [tool] }] };
     return { tools: [tool] };
@@ -116,6 +144,11 @@ test("wire-contract ledger: every rule has a live enforcement clause", () => {
                 system: [{ type: "text", text: "s", cache_control: { type: "ephemeral" } }],
                 tools: [{ name: "t", input_schema: { type: "object", properties: {} }, cache_control: { type: "ephemeral" } }],
                 messages: [1, 2, 3].map((i) => ({ role: "user", content: [{ type: "text", text: `x${i}`, cache_control: { type: "ephemeral" } }] })),
+            },
+            // WC-016: the #2648 shape — unmarked tools render ahead of a global system block.
+            {
+                tools: [{ name: "t", input_schema: { type: "object", properties: {} } }],
+                system: [{ type: "text", text: "s", cache_control: { type: "ephemeral", scope: "global" } }],
             },
         ],
         "openai-chat": [
