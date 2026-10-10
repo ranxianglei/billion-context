@@ -211,6 +211,10 @@ test("composition: config marker and #2555 first-line marker co-protect in one s
         const body = await post(rig, conv, [...histOf(conv), { role: "user", content: filler("F5") }]);
         assert.ok(body.includes("never force-push master"), "config-marker channel survives");
         assert.ok(body.includes("marked channel"), "#2555 marker channel survives");
+        // "never merge PRs" is CARRIER-unique (the line above matches both carriers):
+        // pins the CONFIG side independently so a config-guard regression under a
+        // co-present #2555 marker is caught, not masked by the durable channel's survival.
+        assert.ok(body.includes("never merge PRs"), "config-marker carrier survives its own token, not just the shared substring");
         assert.ok(body.includes("[Compressed conversation section]"), "the fold happened");
         assert.ok(!body.includes("A1-"), "the pre-protected segment folds — the fold is real");
     } finally {
