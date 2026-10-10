@@ -356,7 +356,13 @@ export function peekRegistryOutputLimit(model: string, host?: string): number | 
  *  on conflicting prices — unlike windows there is no max to take, because
  *  prices are not comparable across deployments. User config at any level
  *  wins wholesale at the stamp site; this is only the unconfigured default. */
-export function peekRegistryPriceProfile(model: string | undefined, host?: string): PriceProfile | undefined {
+/** #2478: shared name→cost-row resolution behind every price lookup —
+ *  roots/variants → provider-prefixed exact keys → cross-host suffix scan
+ *  (unknown relays take the FIRST listing in key order, deterministic per
+ *  snapshot; conflicting prices warn once per name). Returns the winning
+ *  catalog key plus the raw row so callers can derive both the normalized
+ *  profile and the display identity / input-price anchor from one lookup. */
+function resolveCostRow(model: string | undefined, host?: string): { key: string; row: CostRow } | undefined {
     const costs = costCache;
     if (!costs || !model) return undefined;
     const provider = host ? providerFromHost(host) : undefined;
@@ -375,12 +381,11 @@ export function peekRegistryPriceProfile(model: string | undefined, host?: strin
         for (const key of candidates) {
             let row: CostRow | undefined = costs[key];
             if (!row) row = idx.byLower.get(key.toLowerCase())?.value;
-            const profile = priceProfileFromRow(row);
-            if (profile) return profile;
+            if (row && priceProfileFromRow(row)) return { key, row };
         }
         if (provider === undefined) {
             const suffix = `/${name.toLowerCase()}`;
-            let chosen: PriceProfile | undefined;
+            let chosen: { key: string; row: CostRow } | undefined;
             const seen = new Set<string>();
             const parts: string[] = [];
             for (const { lower, key, value: row } of idx.entries) {
@@ -392,7 +397,7 @@ export function peekRegistryPriceProfile(model: string | undefined, host?: strin
                     seen.add(sig);
                     parts.push(`${key}=in:${profile.w}/out:${profile.q}`);
                 }
-                if (!chosen) chosen = profile;
+                if (!chosen) chosen = { key, row };
             }
             if (chosen !== undefined) {
                 if (seen.size > 1 && !warnedPriceConflicts.has(name)) {
@@ -404,6 +409,43 @@ export function peekRegistryPriceProfile(model: string | undefined, host?: strin
         }
     }
     return undefined;
+}
+
+export function peekRegistryPriceProfile(model: string | undefined, host?: string): PriceProfile | undefined {
+    const hit = resolveCostRow(model, host);
+    return hit ? priceProfileFromRow(hit.row) : undefined;
+}
+
+export interface RegistryCostRow {
+    /** Catalog key that won the lookup ("provider/model-id") — display identity. */
+    key: string;
+    /** $/Mtok list price for plain (uncached) input tokens. */
+    input: number;
+    /** $/Mtok output price (absent when models.dev lists none). */
+    output?: number;
+    /** $/Mtok cache-read price (absent when models.dev lists none). */
+    cacheRead?: number;
+    /** $/Mtok cache-write price (absent when the provider charges no write premium). */
+    cacheWrite?: number;
+}
+
+/** #2478: synchronous cache-only RAW cost row ($/Mtok, models.dev) behind the
+ *  SAME name resolution as peekRegistryPriceProfile — lets the stamp site
+ *  record the display identity + the input-price anchor for ratio profiles
+ *  without re-resolving or diverging from the profile it just stamped.
+ *  Residency rules are identical (bundled floor → disk/live upgrade, never
+ *  fetches). */
+export function peekRegistryCostRow(model: string | undefined, host?: string): RegistryCostRow | undefined {
+    const hit = resolveCostRow(model, host);
+    if (!hit) return undefined;
+    const r = hit.row;
+    return {
+        key: hit.key,
+        input: r.input,
+        ...(typeof r.output === "number" && Number.isFinite(r.output) ? { output: r.output } : {}),
+        ...(typeof r.cache_read === "number" && Number.isFinite(r.cache_read) ? { cacheRead: r.cache_read } : {}),
+        ...(typeof r.cache_write === "number" && Number.isFinite(r.cache_write) ? { cacheWrite: r.cache_write } : {}),
+    };
 }
 
 function priceProfileFromRow(row: CostRow | undefined): PriceProfile | undefined {

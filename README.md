@@ -320,11 +320,14 @@ prints a **text summary report right in the client**, headed by a clickable
 hit-rate **line chart** plus per-break **attribution**:
 
 ![web session page: cache hit-rate chart + attribution](docs/cache-web-session.en.png)
-The report has four
+The report has five
 blocks that pin things down at a glance: **GRAND LEDGER** (totals + hit% with
 an explicit `HEALTHY` verdict; misses decomposed into new content /
 compress re-pay / upstream-ttl-or-client-rewrite) · **FOLD ECONOMICS** (per-fold
-economics: net tokens saved, paid-back verdicts) · **LINE ITEMS** (anomalies
+economics: net tokens saved, paid-back verdicts) · **PRICED ECONOMICS** (when the
+model matches models.dev or uses configured unit prices: gross / one-time cost
+/ net savings in real $, each figure paired with its token count — the
+compression output's own cost is counted too; #2478) · **LINE ITEMS** (anomalies
 only: hit<85% or miss≥5000). Rule of thumb: **compression itself costs ≤2%** —
 a healthy session sits at **95–97%**. When you see less, the attribution tells
 you which of the usual suspects it was, in this order: ① upstream cache TTL
@@ -342,9 +345,13 @@ same machinery fingerprints the outbound credential (a 12-hex sha256 of the
 `authorization`/`x-api-key`-family headers — the raw key is never stored) and
 attributes a **key switch** — the relay behind a stable URL rotated to a
 different account — in a dedicated `KEY SWITCHES` section, a `key switch:`
-line in `CACHE INVALIDATION`, and a 🔑 badge in the web sessions column.
-HTTP: `GET /__bili/cache-report`; the raw per-request `[acp-usage]` lines still
-land in the log file for deep dives.
+line in `CACHE INVALIDATION`, and a 🔑 badge in the web sessions column. Since
+#2478 every web face keeps tokens as the primary number and adds a small ≈$
+line under the overview savings cards, the SAVED column and the detail card for
+sessions priced via a models.dev listing or configured unit prices (unpriced
+models stay pure-token), and the report
+JSON carries a matching `priced` field. HTTP: `GET /__bili/cache-report`; the
+raw per-request `[acp-usage]` lines still land in the log file for deep dives.
 
 **What does `/acp` show?** In clients with the native plugin (opencode, dsh),
 `/acp` renders the ACP status panel of the current conversation straight from

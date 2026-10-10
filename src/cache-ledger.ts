@@ -1148,6 +1148,138 @@ function stampedPriceProfile(session: Session): PriceProfile | undefined {
     return Object.keys(out).length > 0 ? out : undefined;
 }
 
+/** #2478: WHERE a stamped price profile came from — report faces must tell
+ *  ABSOLUTE $/Mtok profiles (a models.dev row was stamped; its units are
+ *  already money) apart from INPUT-RATIO profiles (user config / kernel
+ *  defaults; units are input-token-equivalents that need an input-price
+ *  anchor to convert to dollars). Absent on ledgers persisted before #2478 —
+ *  those sessions stay token-denominated rather than guessing. Metadata is
+ *  persisted user-editable JSON, so every field is re-validated on read,
+ *  same discipline as stampedPriceProfile. */
+export interface PriceSourceStamp {
+    kind: "config" | "registry";
+    /** #2478 round 2: user-configured ABSOLUTE $/Mtok unit prices (costPerMtok
+     *  config) — the stamped profile is already real money, so scale is 1 and
+     *  no models.dev anchor exists (modelKey absent by construction). */
+    absolute?: boolean;
+    /** models.dev catalog key that resolved ("provider/model-id") — display identity. */
+    modelKey?: string;
+    /** Input list price in $/Mtok — the anchor converting ratio-profile units to $. */
+    inputPerMtok?: number;
+    /** Output list price in $/Mtok (display only). */
+    outputPerMtok?: number;
+    /** Cache-read list price in $/Mtok (display only). */
+    cacheReadPerMtok?: number;
+    /** Cache-write list price in $/Mtok (display only; absent when no write premium). */
+    cacheWritePerMtok?: number;
+}
+
+export function parsePriceSourceStamp(raw: unknown): PriceSourceStamp | undefined {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+    const o = raw as Record<string, unknown>;
+    if (o.kind !== "config" && o.kind !== "registry") return undefined;
+    const out: PriceSourceStamp = { kind: o.kind };
+    if (o.absolute === true) out.absolute = true;
+    if (typeof o.modelKey === "string" && o.modelKey !== "") out.modelKey = o.modelKey;
+    for (const key of ["inputPerMtok", "outputPerMtok", "cacheReadPerMtok", "cacheWritePerMtok"] as const) {
+        const n = o[key];
+        if (typeof n === "number" && Number.isFinite(n) && n >= 0) out[key] = n;
+    }
+    return out;
+}
+
+function stampedPriceSource(session: Session): PriceSourceStamp | undefined {
+    return parsePriceSourceStamp(session.metadata?.cachePriceSource);
+}
+
+/** #2478: price-weighted fold P&L in real money, mirroring the kernel's
+ *  computeFoldEconomics unit math EXACTLY — one-time cost (w−r)·T + q·σ − r·S
+ *  and per-later-request saving (S−σ)·r — so dollar figures reconcile with
+ *  the ΔC₁/Δs printed per fold. Recomputed here from the RAW fold fields
+ *  because the kernel rounds its own outputs (round1), which would drift when
+ *  summing many folds. Verdict classification mirrors the kernel too:
+ *  breakevenTurns = max(0, oneTime)/perTurn when perTurn > 0, paid back iff
+ *  requestsAfter reached it, else unobserved. scale maps unit→μ$: 1 for
+ *  absolute $/Mtok profiles (models.dev rows OR user costPerMtok config —
+ *  source.absolute), the input anchor ($/Mtok) over ratio profiles.
+ *  Returns undefined when the session cannot be priced (no source stamp, or a
+ *  ratio profile without an input anchor) — callers keep the token display. */
+export interface PricedFoldSummary {
+    source: PriceSourceStamp;
+    /** μ$ per unit of the effective profile (1 = absolute, else input anchor $/Mtok). */
+    scale: number;
+    grossUsd: number;
+    /** Σ one-time fold costs ((w−r)·T re-pay premium + q·σ summary output − r·S read-back credit). */
+    oneTimeUsd: number;
+    netUsd: number;
+    paidBackCount: number;
+    notPaidBackCount: number;
+    unobservedCount: number;
+}
+
+export function summarizePricedFolds(
+    folds: readonly { S: number; sigma: number; T: number; requestsAfter: number }[],
+    profile: Required<PriceProfile>,
+    source: PriceSourceStamp | undefined,
+): PricedFoldSummary | undefined {
+    if (source === undefined) return undefined;
+    const scale = source.kind === "registry" || source.absolute === true ? 1 : source.inputPerMtok;
+    if (typeof scale !== "number" || !Number.isFinite(scale) || !(scale > 0)) return undefined;
+    const { w, r, q } = profile;
+    let grossUnits = 0;
+    let oneTimeUnits = 0;
+    let paidBack = 0;
+    let notPaidBack = 0;
+    let unobserved = 0;
+    for (const f of folds) {
+        const oneTime = (w - r) * f.T + q * f.sigma - r * f.S;
+        oneTimeUnits += oneTime;
+        const perTurn = (f.S - f.sigma) * r;
+        if (perTurn > 0) {
+            grossUnits += perTurn * f.requestsAfter;
+            const breakevenTurns = Math.max(0, oneTime) / perTurn;
+            if (f.requestsAfter >= breakevenTurns) paidBack += 1;
+            else notPaidBack += 1;
+        } else {
+            unobserved += 1;
+        }
+    }
+    const usd = (units: number): number => (units * scale) / 1_000_000;
+    return {
+        source,
+        scale,
+        grossUsd: usd(grossUnits),
+        oneTimeUsd: usd(oneTimeUnits),
+        netUsd: usd(grossUnits - oneTimeUnits),
+        paidBackCount: paidBack,
+        notPaidBackCount: notPaidBack,
+        unobservedCount: unobserved,
+    };
+}
+
+/** #2478: human-readable provenance line shared by /acp-cache and web faces. */
+export function formatPriceSourceLine(src: PriceSourceStamp): string {
+    const money = (n: number): string => `$${n < 10 ? n.toFixed(2) : n.toFixed(n >= 100 ? 0 : 1)}`;
+    if (src.kind === "registry") {
+        const parts = [`in ${money(src.inputPerMtok ?? 0)}`];
+        if (src.cacheReadPerMtok !== undefined) parts.push(`read ${money(src.cacheReadPerMtok)}`);
+        if (src.cacheWritePerMtok !== undefined) parts.push(`write ${money(src.cacheWritePerMtok)}`);
+        if (src.outputPerMtok !== undefined) parts.push(`out ${money(src.outputPerMtok)}`);
+        return `models.dev ${src.modelKey ?? "?"} @ ${parts.join(" · ")} per Mtok`;
+    }
+    if (src.absolute === true) {
+        // #2478 round 2: user-supplied $/Mtok unit prices — same part order as
+        // the registry line, but no models.dev identity (the user IS the source).
+        const parts = [`in ${money(src.inputPerMtok ?? 0)}`];
+        if (src.cacheReadPerMtok !== undefined) parts.push(`read ${money(src.cacheReadPerMtok)}`);
+        if (src.cacheWritePerMtok !== undefined) parts.push(`write ${money(src.cacheWritePerMtok)}`);
+        if (src.outputPerMtok !== undefined) parts.push(`out ${money(src.outputPerMtok)}`);
+        return `configured costPerMtok @ ${parts.join(" · ")}`;
+    }
+    const anchor = src.inputPerMtok !== undefined ? ` anchored at ${money(src.inputPerMtok)}/Mtok input${src.modelKey ? ` (models.dev ${src.modelKey})` : ""}` : "";
+    return `configured priceProfile (input-ratio)${anchor}`;
+}
+
 interface ModelSwitchEvent {
     seq: number;
     at: number;
@@ -1224,6 +1356,9 @@ interface BiliCacheReport extends CacheReport {
     initialBills: { samples: number; inputTokens: number };
     invalidation: InvalidationTokenBreakdown;
     seam: { suspects: number; missed: number; events: SeamEvent[]; providerSide: { count: number; missed: number }; rewinds: { count: number; missed: number }; abortCorrelated: number };
+    /** #2478: real-money P&L when the session carries a usable price source;
+     *  absent on unpriced sessions (token-denominated display stays). */
+    priced?: PricedFoldSummary;
 }
 
 export function buildSessionCacheReport(session: Session): BiliCacheReport {
@@ -1260,6 +1395,9 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
             turnsToNextFold: f.k,
         }, effective),
     );
+    // #2478: real-money P&L from the RAW fold fields (kernel outputs are
+    // rounded; summing them would drift) — undefined when unpriced.
+    const priced = summarizePricedFolds(led.folds, effective, stampedPriceSource(session));
     // Unknown-cache samples are quarantined out of the rendered line set — they
     // carry no measurable hit rate and would show as misleading 0% rows.
     const knownLines = led.lines.filter((l) => l.unk !== 1);
@@ -1396,6 +1534,7 @@ export function buildSessionCacheReport(session: Session): BiliCacheReport {
         invalidation,
         stability,
         seam: { suspects: a.seamSuspects, missed: a.seamMissed, events: led.seamEvents ?? [], providerSide: { count: a.providerSideMisses, missed: a.providerSideMissed }, rewinds: { count: a.rewinds, missed: a.rewindMissed }, abortCorrelated: a.abortCorrelated },
+        ...(priced !== undefined ? { priced } : {}),
     };
 }
 
@@ -1454,11 +1593,42 @@ function formatStability(st: BodyStability): string {
     return out.join("\n");
 }
 
+function fmtUsd(n: number): string {
+    const sign = n < 0 ? "-" : "";
+    const a = Math.abs(n);
+    if (a >= 1_000_000) return `${sign}$${(a / 1_000_000).toFixed(2)}M`;
+    if (a >= 10_000) return `${sign}$${(a / 1_000).toFixed(1)}K`;
+    if (a >= 100) return `${sign}$${a.toFixed(1)}`;
+    return `${sign}$${a.toFixed(2)}`;
+}
+
+/** #2478: the PRICED ECONOMICS block — real-money P&L alongside the kernel's
+ *  token-denominated FOLD ECONOMICS. Rendered only when the session is
+ *  priced; unpriced sessions keep the pre-#2478 byte-identical report. */
+function formatPricedEconomics(r: BiliCacheReport): string {
+    const p = r.priced;
+    if (!p) return "";
+    const out: string[] = [`PRICED ECONOMICS (${formatPriceSourceLine(p.source)})`];
+    // #2478 round 2: pair every $ figure with the kernel's token figures so the
+    // two calibers stay side by side (owner: keep both, money may be off).
+    // One-time cost deliberately has no token twin: its $ value nets the −r·S
+    // cache-read-back credit, which the kernel's repay+summary token sums do not.
+    const e = r.economics;
+    out.push(`  gross saved ≈ ${fmtUsd(p.grossUsd)} (${e.grossSaved} tok) · one-time cost ≈ ${fmtUsd(p.oneTimeUsd)} (re-pay premium + summary output) → net ≈ ${fmtUsd(p.netUsd)} (${e.netTokens} tok)`);
+    out.push(`  verdict: ${p.paidBackCount} paid back · ${p.notPaidBackCount} not paid back · ${p.unobservedCount} unobserved`);
+    if (r.modelSwitches.count > 0) out.push("  ⚠ prices are the LAST observed model's listing — this session switched models mid-flight, so earlier folds are priced with the later model (mixed caliber)");
+    out.push("  list-price estimate (models.dev / configured ratios) — not an actual billing statement");
+    return out.join("\n");
+}
+
 export function handleAcpCache(session: Session, args?: Record<string, unknown>): ProxyToolResult {
     try {
         const detail = args?.detail === "full" ? "full" : "summary";
         const report = buildSessionCacheReport(session);
         const stabilityText = formatStability(report.stability);
+        // #2478: PRICED ECONOMICS sits right after the kernel report (whose
+        // FOLD ECONOMICS it prices), before the switch sections.
+        const pricedJoin = (() => { const t = formatPricedEconomics(report); return t ? "\n\n" + t : ""; })();
         const tail = (base: string): string => base + (stabilityText ? "\n\n" + stabilityText : "") + (formatSeam(report) ? "\n\n" + formatSeam(report) : "");
         // #2131: key switches get their own section only when observed — the
         // common case (one account, no rotation) stays byte-identical.
@@ -1473,9 +1643,9 @@ export function handleAcpCache(session: Session, args?: Record<string, unknown>)
                 session.id,
                 { detail },
             );
-            return toolOk(tail(capped + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + keyText + promptText + "\n\n" + formatInvalidation(report)));
+            return toolOk(tail(capped + pricedJoin + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + keyText + promptText + "\n\n" + formatInvalidation(report)));
         }
-        return toolOk(tail(formatCacheReport(report, session.id, { detail }) + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + keyText + promptText + "\n\n" + formatInvalidation(report)));
+        return toolOk(tail(formatCacheReport(report, session.id, { detail }) + pricedJoin + "\n\n" + formatModelSwitches(report.modelSwitches, detail) + keyText + promptText + "\n\n" + formatInvalidation(report)));
     } catch (err) {
         loggerLog("warn", `[${session.id}] [acp_cache] report failed: ${String(err)}`);
         return toolFail(`[acp_cache FAILED: ${String(err)}]`);

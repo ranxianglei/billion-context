@@ -1290,6 +1290,41 @@ export function resolveKnownOutputCeiling(
     return peekRegistryOutputLimit(model, host);
 }
 
+// #2478 round 2: user-configured ABSOLUTE $/Mtok unit prices → kernel price
+// profile. When any *PerMtok field is valid (>0) absolute mode wins over the
+// w/r/q ratios; missing parts get the SAME fill-ins as models.dev rows
+// (w = cacheWrite ?? input, r = cacheRead ?? 0.1·w, q = output ?? 4·w), so a
+// config row and a registry row for identical prices produce identical stamps.
+// Absolute fields without a positive inputPerMtok cannot anchor the profile —
+// they fall back to ratio mode with a once-per-process warning instead of
+// silently dropping the user's numbers.
+type PriceProfileLike = { w?: number; r?: number; q?: number; inputPerMtok?: number; outputPerMtok?: number; cacheReadPerMtok?: number; cacheWritePerMtok?: number };
+const warnedAbsoluteProfileNoInput = { hit: false };
+export function absoluteProfileFromConfig(pp: PriceProfileLike | undefined): { profile: { w: number; r: number; q: number }; input: number; output?: number; cacheRead?: number; cacheWrite?: number } | undefined {
+    if (pp === undefined) return undefined;
+    const pos = (v: unknown): number | undefined => typeof v === "number" && Number.isFinite(v) && v > 0 ? v : undefined;
+    const input = pos(pp.inputPerMtok);
+    const output = pos(pp.outputPerMtok);
+    const cacheRead = pos(pp.cacheReadPerMtok);
+    const cacheWrite = pos(pp.cacheWritePerMtok);
+    if (input === undefined && (output !== undefined || cacheRead !== undefined || cacheWrite !== undefined)) {
+        if (!warnedAbsoluteProfileNoInput.hit) {
+            warnedAbsoluteProfileNoInput.hit = true;
+            loggerLog("warn", "[acp-price] compress.priceProfile sets absolute $/Mtok fields but no positive inputPerMtok — falling back to ratio mode (w/r/q); add inputPerMtok to price folds in real money");
+        }
+        return undefined;
+    }
+    if (input === undefined) return undefined;
+    const w = cacheWrite ?? input;
+    return {
+        profile: { w, r: cacheRead ?? 0.1 * w, q: output ?? 4 * w },
+        input,
+        ...(output !== undefined ? { output } : {}),
+        ...(cacheRead !== undefined ? { cacheRead } : {}),
+        ...(cacheWrite !== undefined ? { cacheWrite } : {}),
+    };
+}
+
 // #7: how long the shared-proxy watchdog stays up after its LAST watcher
 // died. Long enough for a second session's registration to land when the
 // spawner exits immediately after it starts; short enough that an abandoned

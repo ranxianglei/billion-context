@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { buildCacheReport, type CacheSample, type FoldEvent, type CompressionBlock } from "acp-kernel";
-import { buildSessionCacheReport, getCacheLedger, handleAcpCache, recordCacheFoldsFromBlocks, recordCacheSample, settleUsageReport } from "../src/cache-ledger.ts";
+import { buildSessionCacheReport, getCacheLedger, handleAcpCache, recordCacheFoldsFromBlocks, recordCacheSample, settleUsageReport, summarizePricedFolds } from "../src/cache-ledger.ts";
 import type { Session } from "../src/session.ts";
 
 let seq = 0;
@@ -442,6 +442,122 @@ test("corrupt stamped profile degrades to kernel defaults instead of poisoning t
         assert.deepEqual(r.profile, { w: 1, r: 0.1, q: 4 }, JSON.stringify(bad));
         assert.equal(r.folds[0]!.oneTimeCostUnits, 3500, JSON.stringify(bad));
     }
+});
+
+test("registry-stamped sessions price fold economics in real money (#2478)", () => {
+    const s = makeTwoFoldSession();
+    s.metadata.cachePriceProfile = { w: 3, r: 0.3, q: 15 };
+    s.metadata.cachePriceSource = {
+        kind: "registry",
+        modelKey: "anthropic/claude-sonnet-4-5",
+        inputPerMtok: 3,
+        cacheReadPerMtok: 0.3,
+        outputPerMtok: 15,
+    };
+    const r = buildSessionCacheReport(s);
+    const p = r.priced;
+    assert.ok(p, "registry provenance produces a priced summary");
+    // Absolute $/Mtok profile → kernel unit math IS microusd (scale=1).
+    // Fold #1: oneTime = 15·1000 − 0.3·5000 = 13500, perTurn = 4000·0.3 = 1200,
+    //           gross += 1200·2 = 2400, breakeven 11.25 > ra 2 → not paid back.
+    // Fold #2: oneTime = 15·100 − 0.3·1000 = 1200, perTurn = 900·0.3 = 270,
+    //          gross += 270·1 = 270, breakeven ≈ 4.44 > ra 1 → not paid back.
+    assert.equal(p.scale, 1);
+    assert.equal(p.grossUsd, 2670 / 1e6);
+    assert.equal(p.oneTimeUsd, 14700 / 1e6);
+    assert.equal(p.netUsd, (2670 - 14700) / 1e6);
+    assert.deepEqual([p.paidBackCount, p.notPaidBackCount, p.unobservedCount], [0, 2, 0]);
+
+    const text = handleAcpCache(s).text;
+    assert.match(
+        text,
+        /PRICED ECONOMICS \(models\.dev anthropic\/claude-sonnet-4-5 @ in \$3\.00 · read \$0\.30 · out \$15\.0 per Mtok\)/,
+    );
+    // #2478 round 2: each $ figure pairs its kernel token figure (two-fold
+    // session: grossSaved 8000+900=8900, netTokens 8900−0−1100=7800).
+    assert.match(text, /gross saved ≈ \$0\.00 \(8900 tok\) · one-time cost ≈ \$0\.01 \(re-pay premium \+ summary output\) → net ≈ -\$0\.01 \(7800 tok\)/);
+    assert.match(text, /verdict: 0 paid back · 2 not paid back · 0 unobserved/);
+    assert.ok(
+        text.indexOf("PRICED ECONOMICS") > text.indexOf("FOLD ECONOMICS"),
+        "priced section follows the token-denominated FOLD ECONOMICS block",
+    );
+});
+
+test("config-stamped sessions anchor the ratio profile to the models.dev input price (#2478)", () => {
+    const s = makeTwoFoldSession();
+    s.metadata.cachePriceProfile = { q: 4 };
+    s.metadata.cachePriceSource = { kind: "config", modelKey: "anthropic/claude-sonnet-4-5", inputPerMtok: 3 };
+    const r = buildSessionCacheReport(s);
+    const p = r.priced;
+    assert.ok(p);
+    // Ratio profile {1, 0.1, 4} × $3/Mtok anchor: fold #1 units 3500/400 → gross += 800,
+    // fold #2 units 300/90 → gross += 90; scale 3 turns input-token units into μ$.
+    assert.equal(p.scale, 3);
+    assert.equal(p.grossUsd, 890 * 3 / 1e6);
+    assert.equal(p.oneTimeUsd, 3800 * 3 / 1e6);
+    assert.equal(p.netUsd, (890 - 3800) * 3 / 1e6);
+    const text = handleAcpCache(s).text;
+    assert.match(
+        text,
+        /PRICED ECONOMICS \(configured priceProfile \(input-ratio\) anchored at \$3\.00\/Mtok input \(models\.dev anthropic\/claude-sonnet-4-5\)\)/,
+    );
+});
+
+test("user costPerMtok config prices folds in real money without a models.dev anchor (#2478)", () => {
+    const s = makeTwoFoldSession();
+    s.metadata.cachePriceProfile = { w: 3, r: 0.3, q: 15 };
+    s.metadata.cachePriceSource = { kind: "config", absolute: true, inputPerMtok: 3, cacheReadPerMtok: 0.3, outputPerMtok: 15 };
+    const r = buildSessionCacheReport(s);
+    const p = r.priced;
+    assert.ok(p);
+    // Absolute user config → scale 1 (no models.dev anchor needed); same unit
+    // math as the registry stamp above.
+    assert.equal(p.scale, 1);
+    assert.equal(p.grossUsd, 2670 / 1e6);
+    assert.equal(p.oneTimeUsd, 14700 / 1e6);
+    assert.equal(p.netUsd, (2670 - 14700) / 1e6);
+    const text = handleAcpCache(s).text;
+    assert.match(text, /PRICED ECONOMICS \(configured costPerMtok @ in \$3\.00 · read \$0\.30 · out \$15\.0\)/);
+});
+
+test("unpriced or corrupt provenance leaves the report token-denominated (#2478)", () => {
+    for (const bad of ["junk", { kind: "weird" }, { kind: "config" }, { kind: "config", modelKey: 42 }]) {
+        const s = makeTwoFoldSession();
+        (s.metadata as Record<string, unknown>).cachePriceSource = bad;
+        const r = buildSessionCacheReport(s);
+        assert.equal(r.priced, undefined, JSON.stringify(bad));
+        assert.doesNotMatch(handleAcpCache(s).text, /PRICED ECONOMICS/, JSON.stringify(bad));
+    }
+    // A bare registry source assumes the stamped profile is already absolute
+    // ($/Mtok) — server.ts stamps both together, so scale stays 1.
+    const bare = makeTwoFoldSession();
+    (bare.metadata as Record<string, unknown>).cachePriceSource = { kind: "registry" };
+    assert.equal(buildSessionCacheReport(bare).priced?.scale, 1);
+});
+
+test("summarizePricedFolds mirrors the kernel verdict math in USD (#2478)", () => {
+    // S ≤ σ → perTurn ≤ 0 → unobserved (kernel: breakeven null), cost still counted.
+    // Config anchor $2/Mtok scales the ratio units (scale=2; registry would be 1).
+    const p = summarizePricedFolds(
+        [{ S: 1000, sigma: 1500, T: 0, requestsAfter: 5 }],
+        { w: 1, r: 0.1, q: 4 },
+        { kind: "config", inputPerMtok: 2 },
+    )!;
+    assert.deepEqual([p.paidBackCount, p.notPaidBackCount, p.unobservedCount], [0, 0, 1]);
+    assert.equal(p.grossUsd, 0);
+    assert.equal(p.oneTimeUsd, (4 * 1500 - 0.1 * 1000) * 2 / 1e6);
+    assert.equal(p.netUsd, p.grossUsd - p.oneTimeUsd);
+    // Paid-back boundary: breakeven exactly reached counts as paid back (ra ≥ n*).
+    const pb = summarizePricedFolds(
+        [{ S: 1000, sigma: 0, T: 0, requestsAfter: 10 }],
+        { w: 1, r: 0.1, q: 4 },
+        { kind: "registry", inputPerMtok: 1 },
+    )!;
+    // oneTime = 0, perTurn = 100 → breakeven 0 → paid back at any ra ≥ 0.
+    assert.deepEqual([pb.paidBackCount, pb.notPaidBackCount, pb.unobservedCount], [1, 0, 0]);
+    assert.equal(pb.grossUsd, 100 * 10 / 1e6);
+    // Missing anchor on a ratio source → no pricing at all.
+    assert.equal(summarizePricedFolds([{ S: 1000, sigma: 0, T: 0, requestsAfter: 1 }], { w: 1, r: 0.1, q: 4 }, { kind: "config" }), undefined);
 });
 
 test("model switch flags the first sample after a change and attributes its residual (#1535)", () => {

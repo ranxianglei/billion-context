@@ -39,14 +39,14 @@ async function anthropicUpstream(): Promise<{ port: number; close: () => Promise
     return { port, close: () => new Promise<void>((r) => upstream.close(() => r())) };
 }
 
-function optsFor(upstreamPort: number, withPriceProfile: boolean): ProxyOptions {
+function optsFor(upstreamPort: number, withPriceProfile: boolean, priceProfile: Record<string, unknown> = { q: 1.5 }): ProxyOptions {
     return {
         port: 0,
         host: "127.0.0.1",
         upstream: "http://127.0.0.1",
         routes: {
             [`http://127.0.0.1:${upstreamPort}`]: {
-                ...(withPriceProfile ? { compress: { priceProfile: { q: 1.5 } } } : {}),
+                ...(withPriceProfile ? { compress: { priceProfile } } : {}),
                 models: { "claude-test": { context: 100_000 } },
             },
         },
@@ -102,6 +102,13 @@ test("priceProfile stamp: provider-level priceProfile stamps session.metadata; a
         { q: 1.5 },
         "runPrepare stamped the effective priceProfile on the session",
     );
+    // #2478: the provenance stamp rides along; this test's registry is empty,
+    // so a config profile has no models.dev anchor to record.
+    assert.deepEqual(
+        (stamped.metadata as Record<string, unknown>).cachePriceSource,
+        { kind: "config" },
+        "runPrepare stamped the price provenance alongside the profile",
+    );
 
     // Same conversation through a lane WITHOUT priceProfile: latest-wins must
     // CLEAR the stamp (server.ts deletes on empty), not leave the stale one.
@@ -115,6 +122,11 @@ test("priceProfile stamp: provider-level priceProfile stamps session.metadata; a
         (stamped.metadata as Record<string, unknown>).cachePriceProfile,
         undefined,
         "unstamped lane clears the session priceProfile stamp",
+    );
+    assert.equal(
+        (stamped.metadata as Record<string, unknown>).cachePriceSource,
+        undefined,
+        "unstamped lane clears the provenance stamp with the profile (#2478)",
     );
 
     } finally {
@@ -156,6 +168,13 @@ test("priceProfile stamp: registry pricing is the default when no level configur
             { w: 2, r: 0.2, q: 8 },
             "unconfigured session stamped with the registry's absolute $/Mtok profile",
         );
+        // #2478: provenance carries the resolved catalog key + raw $/Mtok, so
+        // reports can name their price source and stay in real money (scale=1).
+        assert.deepEqual(
+            sa.metadata.cachePriceSource,
+            { kind: "registry", modelKey: "somehost/claude-reg", inputPerMtok: 2, outputPerMtok: 8, cacheReadPerMtok: 0.2 },
+            "registry stamp records the resolved models.dev row",
+        );
 
         const beforeB = new Set(listSessions().map((s) => s.id));
         const rb = await post("claude-noreg", "pp-registry-b");
@@ -166,6 +185,11 @@ test("priceProfile stamp: registry pricing is the default when no level configur
             sb.metadata.cachePriceProfile,
             undefined,
             "unresolvable model leaves no stamp (kernel relative defaults apply downstream)",
+        );
+        assert.equal(
+            sb.metadata.cachePriceSource,
+            undefined,
+            "unresolvable model leaves no provenance either (#2478)",
         );
 
         // User config at any level wins wholesale — no field mixing with the registry row.
@@ -190,11 +214,87 @@ test("priceProfile stamp: registry pricing is the default when no level configur
                 { q: 1.5 },
                 "route-level priceProfile overrides the registry listing wholesale",
             );
+            // #2478: config-stamped sessions are RATIO profiles — provenance still
+            // carries the models.dev row as the input-price anchor for real-money math.
+            assert.deepEqual(
+                sc.metadata.cachePriceSource,
+                { kind: "config", modelKey: "somehost/claude-reg", inputPerMtok: 2, outputPerMtok: 8, cacheReadPerMtok: 0.2 },
+                "user-config lane records the anchor row when the model resolves",
+            );
         } finally {
             if (proxyCfg) await new Promise<void>((r) => proxyCfg!.close(() => r()));
         }
     } finally {
         await new Promise<void>((r) => proxy.close(() => r()));
+        await upstream.close();
+    }
+});
+
+test("priceProfile stamp: absolute costPerMtok config wins over w/r/q and stamps real money (#2478)", async () => {
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    setRegistryForTest({}, {
+        "somehost/claude-reg": { input: 2, output: 8, cache_read: 0.2 },
+    });
+    _resetPluginStateForTest();
+    _resetSessionsForTest();
+
+    const upstream = await anthropicUpstream();
+    // Absolute mode fill-ins: w = cacheWrite ?? input = 3, r = cacheRead = 0.3,
+    // q = output = 15 — the co-present w/r/q ratios are ignored wholesale.
+    const proxyAbs = await startServer(optsFor(upstream.port, true, { w: 1, r: 0.1, q: 1.5, inputPerMtok: 3, outputPerMtok: 15, cacheReadPerMtok: 0.3 }));
+    await once(proxyAbs, "listening");
+    const absPort = (proxyAbs.address() as { port: number }).port;
+    try {
+        const post = (port: number, sessionId: string): Promise<Response> =>
+            fetch(`http://127.0.0.1:${port}/bili/http://127.0.0.1:${upstream.port}/v1/messages`, {
+                method: "POST",
+                headers: { "content-type": "application/json", "x-api-key": "test", "x-acp-session": sessionId },
+                body: JSON.stringify({ model: "claude-reg", max_tokens: 1024, messages: [{ role: "user", content: "hello" }] }),
+            });
+        const beforeA = new Set(listSessions().map((s) => s.id));
+        const ra = await post(absPort, "pp-abs-a");
+        assert.equal(ra.status, 200, "absolute-config lane served");
+        const sa = listSessions().find((s) => !beforeA.has(s.id));
+        assert.ok(sa, "session created for the absolute-config lane");
+        assert.deepEqual(
+            sa.metadata.cachePriceProfile,
+            { w: 3, r: 0.3, q: 15 },
+            "absolute unit prices win over the co-present w/r/q ratios",
+        );
+        assert.deepEqual(
+            sa.metadata.cachePriceSource,
+            { kind: "config", absolute: true, inputPerMtok: 3, outputPerMtok: 15, cacheReadPerMtok: 0.3 },
+            "absolute stamp is self-anchoring — no models.dev row recorded",
+        );
+
+        // Absolute fields without a positive inputPerMtok cannot anchor the
+        // profile — falls back to ratio mode (plus a once-per-process warn).
+        _resetSessionsForTest();
+        let proxyRatio: Awaited<ReturnType<typeof startServer>> | null = null;
+        try {
+            proxyRatio = await startServer(optsFor(upstream.port, true, { w: 1, r: 0.1, q: 1.5, outputPerMtok: 15 }));
+            await once(proxyRatio, "listening");
+            const ratioPort = (proxyRatio.address() as { port: number }).port;
+            const beforeB = new Set(listSessions().map((s) => s.id));
+            const rb = await post(ratioPort, "pp-abs-b");
+            assert.equal(rb.status, 200, "abs-without-input lane served");
+            const sb = listSessions().find((s) => !beforeB.has(s.id));
+            assert.ok(sb, "session created for the fallback lane");
+            assert.deepEqual(
+                sb.metadata.cachePriceProfile,
+                { w: 1, r: 0.1, q: 1.5 },
+                "absolute fields without inputPerMtok fall back to the w/r/q ratios",
+            );
+            assert.deepEqual(
+                sb.metadata.cachePriceSource,
+                { kind: "config", modelKey: "somehost/claude-reg", inputPerMtok: 2, outputPerMtok: 8, cacheReadPerMtok: 0.2 },
+                "fallback keeps the ratio-mode models.dev anchor row",
+            );
+        } finally {
+            if (proxyRatio) await new Promise<void>((r) => proxyRatio!.close(() => r()));
+        }
+    } finally {
+        await new Promise<void>((r) => proxyAbs.close(() => r()));
         await upstream.close();
     }
 });

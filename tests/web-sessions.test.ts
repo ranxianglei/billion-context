@@ -215,6 +215,95 @@ withSessionsDir("buildOverview aggregates totals, hit rate and per-protocol rows
     assert.equal(ov.recent[0].id, "live-1");
 });
 
+withSessionsDir("seeded ledgers with price stamps show real-money savings on rows and overview (#2478)", async (dir) => {
+    const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
+    const T0 = Date.parse("2026-10-01T09:00:00Z");
+
+    const priced = makeSession("pr-a", { protocol: "anthropic" }, { requests: 5, inputTokens: 20000, cachedTokens: 15000 });
+    priced.metadata = {
+        cacheLedger: {
+            v: 1, lastBlockId: null, consumedFoldSeq: 0, sampleSeq: 4, foldSeqCounter: 1,
+            folds: [{ seq: 1, at: T0 + 1000, S: 5000, sigma: 1000, T: 0, requestsAfter: 3 }],
+            lines: [],
+            agg: { requests: 5, input: 20000, cached: 15000, output: 500 },
+        },
+        cachePriceProfile: { w: 3, r: 0.3, q: 15 },
+        cachePriceSource: { kind: "registry", modelKey: "anthropic/claude-sonnet-4-5", inputPerMtok: 3, cacheReadPerMtok: 0.3, outputPerMtok: 15 },
+    };
+    await store.writeNow(priced);
+    setSavedAt(dir, "pr-a", T0 + 9_000);
+
+    const unpriced = makeSession("pr-b", { protocol: "openai" }, { requests: 4, inputTokens: 8000, cachedTokens: 6000 });
+    unpriced.metadata = {
+        cacheLedger: {
+            v: 1, lastBlockId: null, consumedFoldSeq: 0, sampleSeq: 3, foldSeqCounter: 1,
+            folds: [{ seq: 1, at: T0 + 1000, S: 2000, sigma: 500, T: 0, requestsAfter: 2 }],
+            lines: [],
+            agg: { requests: 4, input: 8000, cached: 6000, output: 200 },
+        },
+    };
+    await store.writeNow(unpriced);
+    setSavedAt(dir, "pr-b", T0 + 8_000);
+
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+
+    const list = await buildSessionList();
+    const a = list.find((s) => s.id === "pr-a")!;
+    // Absolute $/Mtok profile → scale 1: oneTime = 15·1000 − 0.3·5000 = 13500 μ$,
+    // perTurn = 4000·0.3 = 1200 μ$/turn × 3 turns = 3600 μ$ gross.
+    assert.equal(a.grossSavedUsd, 3600 / 1e6);
+    assert.equal(a.oneTimeCostUsd, 13500 / 1e6);
+    assert.equal(a.netSavedUsd, (3600 - 13500) / 1e6);
+    assert.ok(a.priceSource?.startsWith("models.dev anthropic/claude-sonnet-4-5 @"), a.priceSource);
+    // Token-denominated figures stay untouched next to the money ones.
+    assert.equal(a.grossSaved, 12000);
+    assert.equal(a.netSaved, 11000);
+    assert.equal(a.foldCount, 1);
+
+    const b = list.find((s) => s.id === "pr-b")!;
+    assert.equal(b.netSavedUsd, undefined, "unpriced session stays token-only");
+    assert.equal(b.grossSaved, 3000);
+    assert.equal(b.netSaved, 2500);
+
+    const ov = await buildOverview();
+    assert.equal(ov.pricedSessions, 1);
+    assert.equal(ov.grossSavedUsdTotal, 3600 / 1e6);
+    assert.equal(ov.oneTimeCostTotal, 13500 / 1e6);
+    assert.equal(ov.netSavedUsdTotal, (3600 - 13500) / 1e6);
+    assert.equal(ov.unpricedGrossTokens, 3000);
+    assert.equal(ov.unpricedNetTokens, 2500);
+});
+
+withSessionsDir("overview keeps the token headline when no session is priced (#2478)", async (dir) => {
+    const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
+    const T0 = Date.parse("2026-10-01T09:00:00Z");
+    const s = makeSession("un-1", { protocol: "openai" }, { requests: 4, inputTokens: 8000, cachedTokens: 6000 });
+    s.metadata = {
+        cacheLedger: {
+            v: 1, lastBlockId: null, consumedFoldSeq: 0, sampleSeq: 3, foldSeqCounter: 1,
+            folds: [{ seq: 1, at: T0 + 1000, S: 2000, sigma: 500, T: 0, requestsAfter: 2 }],
+            lines: [],
+            agg: { requests: 4, input: 8000, cached: 6000, output: 200 },
+        },
+        // Profile without provenance → ratio profile has no anchor → unpriced.
+        cachePriceProfile: { w: 1, r: 0.1, q: 4 },
+    };
+    await store.writeNow(s);
+    setSavedAt(dir, "un-1", T0 + 9_000);
+
+    _setStoreForTest(new SessionStore({ enabled: false }));
+    _resetDiskCacheForTest();
+
+    const ov = await buildOverview();
+    assert.equal(ov.pricedSessions, undefined, "no USD fields when nothing is priced");
+    assert.equal(ov.grossSavedUsdTotal, undefined);
+    assert.equal(ov.unpricedGrossTokens, undefined);
+    const row = (await buildSessionList()).find((x) => x.id === "un-1")!;
+    assert.equal(row.netSaved, 2500);
+    assert.equal(row.netSavedUsd, undefined);
+});
+
 withSessionsDir("buildSessionDetail returns blocks, ledger and rendered handoff", async (dir) => {
     const store = new SessionStore({ dir, debounceMs: 0, enabled: true });
     const s = makeSession("det-1", { protocol: "openai", title: "Det Title" }, { requests: 2, inputTokens: 800, cachedTokens: 200, contextTokens: 300 });

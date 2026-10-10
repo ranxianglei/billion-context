@@ -230,7 +230,7 @@
 | `compress.prompts` | Partial<Prompts> | unset (kernel doctrine) | — | 覆盖内核教条文本；对压缩质量承重要——受 acknowledgePromptsRisk 门控。 |
 | `compress.reasoningGuard` | object | off | — | gpt-5.x/6.x 推理格截断自动修复（最多 3 轮继续提示）。 |
 | `compress.outputSteering` | object { enabled?, verbosityLevel?, effortRouting? } | enabled false · verbosityLevel 2 | — | 向系统提示词尾部附加简洁度指令；只收紧机械延续请求。 |
-| `compress.priceProfile` | { w?, r?, q? } | unset (registry, kernel fallback {1, 0.1, 4}) | — | w/r/q 相对输入价的比率（写入/缓存读/输出）；仅供报告，不影响触发条件或线上行为。 |
+| `compress.priceProfile` | { w?, r?, q?, inputPerMtok?, outputPerMtok?, cacheReadPerMtok?, cacheWritePerMtok? } | unset (registry, kernel fallback {1, 0.1, 4}) | — | w/r/q 相对输入价的比率（写入/缓存读/输出），或绝对 $/Mtok 单价（任一 *PerMtok 存在即整体胜出）；仅供报告，不影响触发条件或线上行为。 |
 | `compress.acknowledgePromptsRisk` | boolean | false | — | 必须先置 true，自定义 prompts 才会生效。 |
 | `compress.absorb.enabled` | boolean | false | — | 启用 absorb 蒸馏块。 |
 | `compress.absorb.minToolTokens` | number | 1000 | — | 可被吸收的工具结果的最小估算 token 大小。 |
@@ -1375,22 +1375,32 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 
 #### `priceProfile`
 
-- **类型：** `object`（`{ w?, r?, q? }`，均为非负数）
+- **类型：** `object`（`{ w?, r?, q?, inputPerMtok?, outputPerMtok?, cacheReadPerMtok?, cacheWritePerMtok? }`，均为非负数）
 - **默认值：** *（未设置 —— 报告改用请求模型在 models.dev 的价格行计价（绝对 $/Mtok）；只有注册表解析不到的模型才回落到内核内置相对比例 `{ w: 1, r: 0.1, q: 4 }`）*
 - **状态：** ACTIVE
 - **说明：** 会话缓存报告（`acp_cache` 工具 / `/acp-cache` 命令 / `GET /__bili/cache-report`，#800/#1279）中**压缩经济学判定**所用的价格档。每个 fold 的损益字段（`oneTimeCostUnits`、`perTurnSavingUnits`、`breakevenTurns`、`paidBack`）由三个基于输入 token 单位的乘数计算得出：`w`（cache 写入成本）、`r`（cache 读取成本）、`q`（output 成本）。两种单位约定并存，且都会原样打印在报告头部（`FOLD ECONOMICS (N folds @ w=.. r=.. q=..)`）：
   - **用户配置**采用**相对输入价归一化（p_in = 1）的比例**：`w` = cacheWrite ÷ input，`r` = cacheRead ÷ input，`q` = output ÷ input。子字段与其他 CompressSettings 字段一样按“深层覆盖”三级合并（provider 层设 `q`、model 层精调单个字段均可）；部分配置中未设置的字段回落到内核比例 `w: 1`、`r: 0.1`、`q: 4`。
-  - **注册表默认**（任何层级都未设置该键时）：由请求模型在 models.dev 的价格行推导——**绝对 $/Mtok**，`w = cost.input`，`r = cost.cache_read ?? 0.1 × input`，`q = cost.output ?? 1.5 × input`（缺这些字段的行用惯例回落值）。直连供应商流量取该 host 自己的挂牌行；未知中转站取跨 host 第一个匹配行（挂牌冲突时一次性告警）。可达时实时注册表优先，随包快照为离线兜底（#282）。
+  - **绝对单价（#2478 round 2）**：设置 `inputPerMtok` / `outputPerMtok` / `cacheReadPerMtok` / `cacheWritePerMtok`（原始 $/Mtok）中的任一项，即**整体胜出**于 w/r/q 比例——中转站实际费率与挂牌价不同（折扣/加成）时用这个。缺失部分沿用 models.dev 行的同一套补全规则：`w = cacheWrite ?? input`，`r = cacheRead ?? 0.1 × w`，`q = output ?? 4 × w`；进入绝对模式必须有正的 `inputPerMtok`——只有其他绝对字段而没有它时回落到比例模式并一次性告警，而不是静默丢掉你的数字。
+   - **注册表默认**（任何层级都未设置该键时）：由请求模型在 models.dev 的价格行推导——**绝对 $/Mtok**，`w = cost.input`，`r = cost.cache_read ?? 0.1 × w`，`q = cost.output ?? 4 × w`（缺这些字段的行用惯例回落值）。直连供应商流量取该 host 自己的挂牌行；未知中转站取跨 host 第一个匹配行（挂牌冲突时一次性告警）。可达时实时注册表优先，随包快照为离线兜底（#282）。
   用户配置整体胜出——任何层级设置了 profile 都不会与注册表行逐字段混用。最近一次请求生效的值会被戳记到会话上，因此所有报告出口都用该会话最近一轮所适用的价格档计价。**纯报表面**：价格档绝不影响压缩触发、频率或任何 wire 行为。用户配置示例（覆盖注册表行，例如中转站有自定义加成时）：
   ```jsonc
   // DeepSeek-V3 ≈ output 倍数低
   { "providers": { "https://api.deepseek.com": { "compress": { "priceProfile": { "w": 1, "r": 0.1, "q": 1.5 } } } } }
   // OpenAI GPT-4o/o 系列：缓存读取五折、写入平价、output 4×
   { "providers": { "https://api.openai.com": { "compress": { "priceProfile": { "w": 1, "r": 0.5, "q": 4 } } } } }
-  // 自托管 / 免费额度：一切不消耗你的 token 预算
-  { "compress": { "priceProfile": { "w": 0, "r": 0, "q": 0 } } }
-  ```
-  请用同一模型正常输入价的相对挂牌价；有自定义加成的中转站应填实际生效费率。
+   // 自托管 / 免费额度：一切不消耗你的 token 预算
+   { "compress": { "priceProfile": { "w": 0, "r": 0, "q": 0 } } }
+   // 绝对 $/Mtok 单价（#2478 round 2）——中转站比 claude-sonnet-4-5 挂牌价便宜 30%：
+   // 绝对模式整体胜出，与是否同时写了 w/r/q 无关
+   { "providers": { "https://my-relay.example": { "compress": { "priceProfile": { "inputPerMtok": 2.1, "outputPerMtok": 10.5, "cacheReadPerMtok": 0.21 } } } } }
+   ```
+    请用同一模型正常输入价的相对挂牌价；有自定义加成的中转站应填实际生效费率（比例或绝对单价均可）。
+    **真实金额展示（#2478）。** 当会话最近一次请求能解析到 models.dev 价格行（或使用了绝对单价配置）时，bili 会把价格出处（`cachePriceSource`：目录键 + 原始 $/Mtok 字段，或绝对标记）与价格档一起戳记到会话上，所有报告出口都会在 token 口径的 FOLD ECONOMICS 旁增加 **PRICED ECONOMICS** 一节——以美元给出累计节省、一次性成本（复付溢价 + 摘要输出）与净节省，每个 $ 数字都配上对应的内核 token 数字：压缩省的钱和费的钱（如摘要输出）两种口径都算进去。约定：
+    - **注册表戳记**——价格档本身已是绝对 $/Mtok，单位数学即微美元（scale=1）；
+    - **用户配置（比例）**——锚定到解析行的输入价（μ$ = units × 锚点）；解析不到模型则无锚点，报告保持 token 口径；
+    - **用户配置（绝对单价）**——自带锚点（scale=1），不依赖 models.dev 行；
+    - **无戳记**（内核默认比例）——仅 token 口径。
+    Web UI 各面一律以 TOKEN 为主显示（金额是估算，可能不准），总览卡片的节省值下方、会话表 SAVED 列、详情卡各加一行小字 ≈$；`/acp-cache` 文本与 `GET /__bili/cache-report` JSON 新增 `priced` 字段。金额为**挂牌价估算**（或你配置的单价），非实际账单。纯报表面不变：均不影响触发条件或 wire。
 
 #### `outputSteering`
 

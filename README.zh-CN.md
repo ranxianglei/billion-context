@@ -264,7 +264,7 @@ curl -s http://localhost:8787/__bili/stats
 **怎么查缓存命中率？** 不用翻日志——`/acp-cache` 直接在客户端里打一份**文字总结报告**，顶部带一个可点击的 **Web UI 链接**，点进去是网页版会话页（**折线图 + 逐断点归因**）：
 
 ![网页会话页：缓存命中率折线图 + 归因（中文界面）](docs/cache-web-session.zh-CN.png)
-报告四块，一眼定位：**GRAND LEDGER**（总账：总输入/总命中/hit%，直接给出 `HEALTHY` 或异常判定；miss 拆解为 new content 新增内容 / compress re-pay 压缩重付 / upstream-ttl-or-client-rewrite 上游 TTL 或客户端重写）· **FOLD ECONOMICS**（每次折叠的经济账：净省多少、是否回本）· **LINE ITEMS**（只列异常行：hit<85% 或 miss≥5000）。经验值：**压缩本身只吃掉 ≤2%**，健康会话稳在 **95–97%**；低于这个值时，归因按概率排序：①上游缓存 TTL 到期（报告里表现为 stable-prefix miss，top spikes 会点出闲置时长）②切换了模型 ③bili 的 bug（带报告页提 issue）④其他/未知。`/acp-cache [full]` 列每一折每一行；HTTP 同款：`GET /__bili/cache-report`；每个请求的 `[acp-usage]` 行仍会落日志，供深挖。
+报告五块，一眼定位：**GRAND LEDGER**（总账：总输入/总命中/hit%，直接给出 `HEALTHY` 或异常判定；miss 拆解为 new content 新增内容 / compress re-pay 压缩重付 / upstream-ttl-or-client-rewrite 上游 TTL 或客户端重写）· **FOLD ECONOMICS**（每次折叠的经济账：净省多少、是否回本）· **PRICED ECONOMICS**（模型能匹配 models.dev 或配置了绝对单价时：按真实美元给出累计节省 / 一次性成本 / 净节省，每个 $ 数字都配上对应 token 数——压缩输出本身的花费也算进去；#2478）· **LINE ITEMS**（只列异常行：hit<85% 或 miss≥5000）。经验值：**压缩本身只吃掉 ≤2%**，健康会话稳在 **95–97%**；低于这个值时，归因按概率排序：①上游缓存 TTL 到期（报告里表现为 stable-prefix miss，top spikes 会点出闲置时长）②切换了模型 ③bili 的 bug（带报告页提 issue）④其他/未知。`/acp-cache [full]` 列每一折每一行；自 #2478 起各 Web 面一律以 TOKEN 为主显示（金额是估算，可能不准）：已计价会话（models.dev 行或配置的绝对单价）在总览卡片节省值下方、SAVED 列、详情卡各加一行小字 ≈$，未计价模型维持纯 token 显示，报告 JSON 带对应 `priced` 字段；HTTP 同款：`GET /__bili/cache-report`；每个请求的 `[acp-usage]` 行仍会落日志，供深挖。
 
 **`/acp` 显示什么?** 带原生插件的客户端(opencode、dsh)里,`/acp` 直接从代理取当前会话的 ACP 状态面板(会话、块、可压缩区间、用量);首个模型请求到来前显示空闲提示。`/acp-cache [full]` 打印上面的缓存报告。
 

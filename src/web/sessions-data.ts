@@ -5,7 +5,8 @@ import { isDisplayOnlyConflictDetail, isSiblingConflictDetail } from "../thirdpa
 import { SessionStore, fileNameMatchesId, isValidRecord, relPathFor } from "../persist.js";
 import { flatFileNameFor } from "acp-kernel/persist";
 import { renderHandoff } from "../export.js";
-import { buildSessionCacheReport } from "../cache-ledger.js";
+import { buildSessionCacheReport, formatPriceSourceLine, parsePriceSourceStamp, summarizePricedFolds } from "../cache-ledger.js";
+import type { PriceProfile } from "acp-kernel";
 import { METADATA_FOLD_COVERAGE } from "../fold-reconcile.js";
 import { markdownToHtml } from "./markdown.js";
 import { log } from "../logger.js";
@@ -101,6 +102,18 @@ interface WebSessionSummary {
     /** #2202: Σ (S−σ)×requestsAfter over coverage-lost folds — the part of
      *  grossSaved that is frozen rather than accruing. */
     coverageLostFrozenTokens?: number;
+    /** #2478: priced P&L in USD — Σ (S−σ)×requestsAfter at the cache-read rate,
+     *  converted through the session's price source. Present only when the
+     *  session has folds AND a usable price source (a models.dev stamp, or
+     *  configured input-ratio profile with an input-price anchor). */
+    grossSavedUsd?: number;
+    /** #2478: Σ one-time fold costs in USD ((w−r)·T re-pay premium + q·σ summary
+     *  output − r·S read-back credit), kernel ΔC₁ math. */
+    oneTimeCostUsd?: number;
+    /** #2478: grossSavedUsd − oneTimeCostUsd; may be negative. */
+    netSavedUsd?: number;
+    /** #2478: human-readable price provenance for tooltips/sub-lines. */
+    priceSource?: string;
 }
 
 interface WebOverview {
@@ -130,6 +143,16 @@ interface WebOverview {
      *  grossSavedTotal whose accrual has stopped (host shadowed the covered
      *  bytes outside bili's knowledge, #2193/#2202). 0 when none. */
     coverageLostFrozenTotal: number;
+    /** #2478: priced totals in USD across PRICED fold-sessions only — present
+     *  (all six) iff at least one session is priced, else absent so faces can
+     *  keep the token-denominated display. The unpriced* siblings keep the
+     *  mixed-caliber remainder visible next to the dollar figures. */
+    netSavedUsdTotal?: number;
+    grossSavedUsdTotal?: number;
+    oneTimeCostTotal?: number;
+    pricedSessions?: number;
+    unpricedGrossTokens?: number;
+    unpricedNetTokens?: number;
     /** Σ genuinely-new missed tokens across ledger sessions (decomposeSample). */
     missNewTotal: number;
     /** Σ compression re-read missed tokens across ledger sessions. */
@@ -545,6 +568,33 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
             coverageLostFrozenTokens += Math.max(0, avoided);
         }
     }
+    // #2478: real-money P&L mirroring /acp-cache's PRICED ECONOMICS — same raw
+    // fold fields, same effective-profile merge as buildSessionCacheReport,
+    // same source-stamp validation. Unpriced sessions stay token-only.
+    let grossSavedUsd: number | undefined, oneTimeCostUsd: number | undefined, netSavedUsd: number | undefined, priceSource: string | undefined;
+    if (hasFolds) {
+        const ppRaw = s.metadata["cachePriceProfile"];
+        let pw: number | undefined, pr: number | undefined, pq: number | undefined;
+        if (ppRaw !== null && typeof ppRaw === "object" && !Array.isArray(ppRaw)) {
+            const pp = ppRaw as Record<string, unknown>;
+            if (typeof pp.w === "number" && Number.isFinite(pp.w) && pp.w >= 0) pw = pp.w;
+            if (typeof pp.r === "number" && Number.isFinite(pp.r) && pp.r >= 0) pr = pp.r;
+            if (typeof pp.q === "number" && Number.isFinite(pp.q) && pp.q >= 0) pq = pp.q;
+        }
+        const eff: Required<PriceProfile> = { w: pw ?? 1, r: pr ?? 0.1, q: pq ?? 4 };
+        const src = parsePriceSourceStamp(s.metadata["cachePriceSource"]);
+        const priced = summarizePricedFolds(
+            (led?.folds ?? []).map((f) => ({ S: f.S ?? 0, sigma: f.sigma ?? 0, T: f.T ?? 0, requestsAfter: f.requestsAfter ?? 0 })),
+            eff,
+            src,
+        );
+        if (priced !== undefined) {
+            grossSavedUsd = priced.grossUsd;
+            oneTimeCostUsd = priced.oneTimeUsd;
+            netSavedUsd = priced.netUsd;
+            priceSource = formatPriceSourceLine(priced.source);
+        }
+    }
     // Untitled sessions: fall back to the first compression block's topic/summary lead.
     let firstBlockHint = "";
     const fb = s.state.blocks.find((b) => b.topic || b.summary);
@@ -595,6 +645,7 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         ...(hasLedger ? { hasLedger: true } : {}),
         ...(firstBlockHint ? { firstBlockHint } : {}),
         ...(hasFolds ? { grossSaved, netSaved, repayCost, summaryCost, foldCount } : {}),
+        ...(netSavedUsd !== undefined ? { grossSavedUsd, oneTimeCostUsd, netSavedUsd, ...(priceSource !== undefined ? { priceSource } : {}) } : {}),
         ...(hasFolds && coverageLostFolds > 0 ? { coverageLostFolds, coverageLostFrozenTokens } : {}),
         ...(hasLedger ? { newContent: agg?.agg?.nc ?? 0, compRepay: agg?.agg?.cr ?? 0, ttlRepay: agg?.agg?.tr ?? 0 } : {}),
         ...(typeof agg?.agg?.input === "number" && agg.agg.input > 0
@@ -680,6 +731,10 @@ export async function buildOverview(): Promise<WebOverview> {
     let requests = 0, input = 0, cached = 0, output = 0, saved = 0, savedEstimated = 0, blocks = 0, live = 0;
     let grossSavedTotal = 0, netSavedTotal = 0, repayTotal = 0, summaryCostTotal = 0, hasFoldData = false;
     let coverageLostFoldTotal = 0, coverageLostFrozenTotal = 0;
+    // #2478: priced (USD) vs unpriced (token) split of the fold sessions —
+    // faces show $ when any session is priced and keep the token remainder.
+    let grossSavedUsdTotal = 0, netSavedUsdTotal = 0, oneTimeCostTotal = 0, pricedSessions = 0;
+    let unpricedGrossTokens = 0, unpricedNetTokens = 0;
     let missNewTotal = 0, missCompTotal = 0, missTtlTotal = 0, missInputTotal = 0;
     const protoMap = new Map<string, { protocol: string; sessions: number; requests: number; inputTokens: number; cachedTokens: number; savedNet: number; folds: number; missNew: number; missComp: number; missTtl: number; missInput: number }>();
     for (const s of all) {
@@ -722,6 +777,15 @@ export async function buildOverview(): Promise<WebOverview> {
             summaryCostTotal += s.summaryCost ?? 0;
             coverageLostFoldTotal += s.coverageLostFolds ?? 0;
             coverageLostFrozenTotal += s.coverageLostFrozenTokens ?? 0;
+            if (s.netSavedUsd != null) {
+                pricedSessions += 1;
+                grossSavedUsdTotal += s.grossSavedUsd ?? 0;
+                netSavedUsdTotal += s.netSavedUsd;
+                oneTimeCostTotal += s.oneTimeCostUsd ?? 0;
+            } else {
+                unpricedGrossTokens += s.grossSaved;
+                unpricedNetTokens += s.netSaved ?? 0;
+            }
         } else if (s.tokensSaved > 0) {
             // Pre-tagging sessions: their local estimate counts toward the compressed side only.
             grossSavedTotal += s.tokensSaved;
@@ -743,6 +807,7 @@ export async function buildOverview(): Promise<WebOverview> {
         summaryCostTotal,
         coverageLostFoldTotal,
         coverageLostFrozenTotal,
+        ...(pricedSessions > 0 ? { grossSavedUsdTotal, netSavedUsdTotal, oneTimeCostTotal, pricedSessions, unpricedGrossTokens, unpricedNetTokens } : {}),
         missNewTotal,
         missCompTotal,
         missTtlTotal,
