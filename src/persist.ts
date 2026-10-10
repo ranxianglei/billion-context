@@ -657,18 +657,40 @@ export class SessionStore {
                 const view = this.shadow.viewFor(id);
                 if (view) return this.afterLoad(id, view);
             }
-            return this.afterLoad(id, toLegacyLike(buildSession(envelope.payload)));
+            // Legacy fallback — same single-build semantics as plain legacy
+            // mode (see the note below on why no adapter round-trip here).
+            const session = buildSession(envelope.payload);
+            if (hasNegativePersistedTokens(envelope.payload)) {
+                this.scheduleSave(session);
+                this.log("info", `[persist] clamped negative token stats on reload for ${id} (#408)`);
+            }
+            return session;
         }
         const envelope = this.loadEnvelope(id, meta);
         if (!envelope) return null;
-        return this.afterLoad(id, toLegacyLike(buildSession(envelope.payload)));
+        // Legacy path — intentionally the ORIGINAL single buildSession(payload):
+        // wrapping this in the toLegacyLike/viewToRecord adapter (like the
+        // unified branch above) would run the record through a second
+        // normalization round-trip and reshape persisted-state bytes (the
+        // storage-render goldens catch exactly that).
+        const session = buildSession(envelope.payload);
+        if (hasNegativePersistedTokens(envelope.payload)) {
+            // #408: sync context — debounce the stale-file rewrite
+            // (buildSession already clamped the in-memory value).
+            this.scheduleSave(session);
+            this.log("info", `[persist] clamped negative token stats on reload for ${id} (#408)`);
+        }
+        return session;
     }
 
-    /** Shared post-load fixups: buildSession-equivalent #408 clamp handling,
-     *  factored so the unified and legacy read paths stay byte-identical. */
+    /** Shared post-load fixups for the unified read path: rebuilds the
+     *  Session from a store view (viewToRecord → buildSession, the same
+     *  forward-compat pass as a legacy load) and applies the #408 clamp
+     *  rewrite. */
     private afterLoad(id: string, view: LegacySessionLike): Session {
-        const session = buildSession(viewToRecord(view));
-        if (hasNegativePersistedTokens(view as unknown as PersistedSession)) {
+        const record = viewToRecord(view);
+        const session = buildSession(record);
+        if (hasNegativePersistedTokens(record)) {
             this.scheduleSave(session);
             this.log("info", `[persist] clamped negative token stats on reload for ${id} (#408)`);
         }
