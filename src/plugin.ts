@@ -1,4 +1,4 @@
-import { type CompressionCore, type Config, type CoreMessage, type NudgeDecision, countMessageTokens, parseStoredPlaceholder, prune } from "acp-kernel";
+import { COMPRESS_TOOL_NAME, type CompressionCore, type Config, type CoreMessage, type NudgeDecision, countMessageTokens, parseStoredPlaceholder, prune } from "acp-kernel";
 import { publicSnapshotCapBytes } from "./knobs.js";
 import { buildStatusPanel } from "acp-kernel/panel";
 import { fileURLToPath } from "node:url";
@@ -11,6 +11,7 @@ import { cloneStoreForRefs } from "./store.js";
 import { acquireInFlight, createSession, getSession, publishForkSession, diagnoseSuccessWithoutUsage, effectiveConfig, findSessionByCanonicalId, listSessions, markCompactionBoundary, markDirty, peekSession, releaseInFlight, statusInputBaseline, withSessionLock, type Session } from "./session.js";
 import { clientConversationHeader } from "./session-id.js";
 import { ABSORB_TOOL_NAME, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, PROXY_TOOL_NAMES, RETRIEVE_TOOL_NAME, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_TOOL_NAME, absorbToolsFor, retrieveToolsFor } from "./compress-tool.js";
+import { salvageCompressArgs } from "./plugin-compress-salvage.js";
 import { externalSummaryEnabled, withExternalSummaryTools } from "./external-summary-surface.js";
 import { absorbEnabled, effectiveAbsorbConfig, isProxyToolFor } from "./absorb.js";
 import { effectiveRulesEnabled, rulesEnabled } from "./rules-feature.js";
@@ -1980,6 +1981,12 @@ export async function pipePluginChatWithStrip(
     // #1039) so settleWitnesses can ring-record each complete tool call for
     // id-less MCP routing.
     const seenToolCalls = new Map<string, { label: string; id: string; name: string; argsLen: number; frags: number; args: string }>();
+    // #2580 (#1518 stage 2): compress argument fragments are held until
+    // content_block_stop so invalid JSON can be salvaged BEFORE the host's
+    // strict JSON.parse aborts the turn; valid bytes are released untouched.
+    const heldCompressBlocks = new Map<number, { id: string; frags: number; json: string }>();
+    const compressDeltaFrame = (index: number, partialJson: string): string =>
+        `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json: partialJson } })}\n\n`;
     const settleWitnesses = () => {
         if (!session) return;
         for (const tc of seenToolCalls.values()) {
@@ -2430,20 +2437,44 @@ export async function pipePluginChatWithStrip(
                 sawToolUse = true;
                 // The start block carries the full name, so absence is final (#1501).
                 const blockIndex = typeof ev["index"] === "number" ? ev["index"] : 0;
+                const tcId = cb && typeof cb["id"] === "string" ? cb["id"] : "";
+                const tcName = cb && typeof cb["name"] === "string" ? cb["name"] : "";
                 seenToolCalls.set(`block:${blockIndex}`, {
                     label: `block=${blockIndex}`,
-                    id: cb && typeof cb["id"] === "string" ? cb["id"] : "",
-                    name: cb && typeof cb["name"] === "string" ? cb["name"] : "",
+                    id: tcId,
+                    name: tcName,
                     argsLen: 0,
                     frags: 1,
                     args: "",
                 });
+                if (tcName === COMPRESS_TOOL_NAME) heldCompressBlocks.set(blockIndex, { id: tcId, frags: 0, json: "" });
             } else if (bt === "thinking" || bt === "redacted_thinking") sawThinking = true;
             // #2248: raw exit — content_block_start payloads never enter the filter.
             auditRawForward(rawEvent);
             return anyPending() ? flushTails() + rawEvent + "\n\n" : rawEvent + "\n\n";
         }
+        if (ev["type"] === "content_block_stop") {
+            const stopIndex = typeof ev["index"] === "number" ? ev["index"] : 0;
+            const held = heldCompressBlocks.get(stopIndex);
+            if (held) {
+                heldCompressBlocks.delete(stopIndex);
+                const salvage = salvageCompressArgs(held.json, held.id || `block=${stopIndex}`);
+                loggerLog(salvage.action === "verbatim" ? "debug" : "warn", `[plugin] compress tool args ${salvage.action}: ${held.json.length} char(s), ${held.frags} fragment(s), ${salvage.ranges} range(s)${salvage.kind ? `, kind=${salvage.kind}` : ""} (#2580)`);
+                return compressDeltaFrame(stopIndex, salvage.out) + rawEvent + "\n\n";
+            }
+        }
         if (ev["type"] !== "content_block_delta") {
+            if ((ev["type"] === "message_delta" || ev["type"] === "message_stop") && heldCompressBlocks.size > 0) {
+                // #1546 parity: drain any held prose tails ahead of the terminal frame.
+                let pre = anyPending() ? flushTails() : "";
+                for (const [idx, held] of [...heldCompressBlocks.entries()]) {
+                    heldCompressBlocks.delete(idx);
+                    const salvage = salvageCompressArgs(held.json, held.id || `block=${idx}`);
+                    loggerLog("warn", `[plugin] compress tool args flushed at terminal without content_block_stop (${salvage.action}, ${held.json.length} char(s)) (#2580)`);
+                    pre += compressDeltaFrame(idx, salvage.out);
+                }
+                return pre + rawEvent + "\n\n";
+            }
             // #2248: raw exit — non-delta events never enter the filter.
             auditRawForward(rawEvent);
             return anyPending() ? flushTails() + rawEvent + "\n\n" : rawEvent + "\n\n";
@@ -2451,12 +2482,21 @@ export async function pipePluginChatWithStrip(
         const d = ev["delta"] as Record<string, unknown> | undefined;
         const index = typeof ev["index"] === "number" ? ev["index"] : 0;
         // input_json_delta (tool-call arguments) is deliberately unmanaged:
-        // #1039 — argument bytes are user intent, forwarded verbatim.
+        // #1039 — argument bytes are user intent, forwarded verbatim. The
+        // compress block is the sanctioned exception (#2580/#1518 stage 2):
+        // fragments are held until block-end so invalid JSON can be salvaged
+        // before the host's strict parse aborts the turn.
         if (d?.["type"] === "input_json_delta") {
             const accTc = seenToolCalls.get(`block:${index}`);
             if (accTc && typeof d["partial_json"] === "string") {
                 accTc.argsLen += d["partial_json"].length;
                 accTc.args += d["partial_json"];
+            }
+            const held = heldCompressBlocks.get(index);
+            if (held && typeof d["partial_json"] === "string") {
+                held.json += d["partial_json"];
+                held.frags += 1;
+                return "";
             }
         }
         const field = d?.["type"] === "thinking_delta" ? "thinking" : d?.["type"] === "text_delta" ? "text" : null;
