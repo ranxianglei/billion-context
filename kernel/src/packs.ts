@@ -239,6 +239,8 @@ KEEP VERBATIM — never paraphrase or abbreviate:
 - Open objectives: user-requested work neither completed nor superseded gets a one-line "Open objectives:" entry with message refs; scan absorbed block summaries too. Last to drop, first to restore at every tier — carrying is not a directive to re-execute unconfirmed.
 - Message refs of key anchors (m00420, m00510–m00520) for decompress.
 
+Time sensitivity: line numbers/code snippets are a fold-time snapshot — files drift after edits. Re-read the file before editing against them; never anchor an edit to an unconfirmed snippet.
+
 DROP — keep the signal, discard the vessel: verbose logs once the error/result is captured; duplicate reads; consumed exploration (search hits, agent returns, successful outputs); dead ends (one lesson line: "tried X, failed because Y"); back-and-forth once the final position is kept; repeated status checks. For each dropped item add one line of CONTENT: what it covers ("probe.py: tests n-gram baseline..."), not where it lives.
 
 PRIORITY when compacting: 1. user goal/evolution/intent/hard constraints · 2. decisions + rationale · 3. exact artifacts (paths, signatures, errors, values) · 4. conclusions · 5. lessons learned (what failed and why).
