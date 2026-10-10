@@ -478,3 +478,63 @@ test("plugin chat emits an in-band error when the retry degenerates too", async 
     // the error's.
     assert.equal((text.match(/\[DONE\]/g) ?? []).length, 2, "the error's terminal, then the retry's trailing terminator");
 });
+
+/** Parse the emitted SSE text back into {event, data} pairs (test-side only). */
+function sseEvents(raw: string): { event: string; data: Record<string, unknown> }[] {
+    return raw.split("\n\n")
+        .map((block) => {
+            const evLine = block.split("\n").find((l) => l.startsWith("event:"));
+            const dataLine = block.split("\n").find((l) => l.startsWith("data:"));
+            if (!evLine || !dataLine) return null;
+            try {
+                return { event: evLine.slice("event: ".length).trim(), data: JSON.parse(dataLine.slice("data: ".length).trim()) as Record<string, unknown> };
+            } catch {
+                return null;
+            }
+        })
+        .filter((e): e is { event: string; data: Record<string, unknown> } => e !== null);
+}
+
+// #2689: the #870 in-band error on the ANTHROPIC wire must be a well-formed
+// block lifecycle at the client's next free index — strict clients (ZCode)
+// validate every content_block_* frame against the Anthropic SSE schema and
+// rejected the old bare delta (no numeric index, no owning content_block_start)
+// for the whole turn. Pipe-level pin: the emitter gets its state from the real
+// pipe counters, not a hand-built argument.
+test("plugin chat (anthropic) #870: the in-band error block is well-formed at the next free index", async () => {
+    const out: string[] = [];
+    const refetch = () => Promise.resolve(streamOf(anthropicEchoOnlyTurn()));
+    await pipePluginChatWithStrip(streamOf(anthropicEchoOnlyTurn()), makeRes(out), "anthropic", makeSession(), undefined, refetch);
+    const text = out.join("");
+    assert.ok(text.includes("[ACP] stream error"), "#870 fired");
+
+    // No re-opening of the message: the retry's own message_start was consumed.
+    assert.equal((text.match(/"type":"message_start"/g) ?? []).length, 1, "exactly one message_start");
+
+    const events = sseEvents(text);
+    // The exact reported defect: EVERY content_block_delta must carry a numeric
+    // index (ZCode's zod validator failed on `index` being undefined).
+    for (const e of events.filter((ev) => ev.event === "content_block_delta")) {
+        assert.equal(typeof e.data["index"], "number", `delta missing numeric index: ${JSON.stringify(e.data)}`);
+    }
+    // The error delta specifically must NOT be an orphan: an owning
+    // content_block_start precedes it and a content_block_stop follows it, all
+    // sharing the same index.
+    const errPos = events.findIndex((e) => e.event === "content_block_delta" && JSON.stringify(e.data).includes("[ACP] stream error"));
+    assert.notEqual(errPos, -1, "error delta present");
+    const idx = events[errPos].data["index"];
+    const startsBefore = events.slice(0, errPos).filter((e) => e.event === "content_block_start" && e.data["index"] === idx).length;
+    const stopsAfter = events.slice(errPos + 1).filter((e) => e.event === "content_block_stop" && e.data["index"] === idx).length;
+    assert.equal(startsBefore, 1, "error delta has an owning content_block_start before it");
+    assert.equal(stopsAfter, 1, "error delta is closed by a content_block_stop after it");
+    // Next-free-index: the error block's index equals the number of distinct
+    // block indices already forwarded to the client BEFORE the error block's
+    // own start (no reuse / collision).
+    let ownStartPos = -1;
+    for (let i = errPos - 1; i >= 0 && ownStartPos === -1; i--) {
+        if (events[i].event === "content_block_start" && events[i].data["index"] === idx) ownStartPos = i;
+    }
+    assert.notEqual(ownStartPos, -1, "owning start located");
+    const priorIndices = new Set(events.slice(0, ownStartPos).filter((e) => e.event === "content_block_start").map((e) => e.data["index"]));
+    assert.equal(idx, priorIndices.size, `error block opened at the next free index (got ${idx}, expected ${priorIndices.size})`);
+});

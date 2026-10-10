@@ -52,11 +52,65 @@ test("emitStreamError: anthropic default = protocol-native error event (no termi
     assert.doesNotMatch(out, /message_stop|message_delta|content_block_delta/);
 });
 
-test("emitStreamError: anthropic errorShape=\"completion\" restores content_block_delta + message_stop", async () => {
+// Parse every SSE event of an emitted stream into its data payload. All
+// legacy-completion frames carry exactly one data line each.
+function parseFrames(out: string): Record<string, unknown>[] {
+    return out.split("\n\n")
+        .filter((b) => b.startsWith("event:"))
+        .map((b) => JSON.parse(b.slice(b.indexOf("data: ") + "data: ".length)) as Record<string, unknown>);
+}
+
+// #2689: the anthropic completion shape must be a WELL-FORMED lifecycle —
+// strict clients (ZCode) validate every frame against the Anthropic SSE
+// schema and rejected the whole turn on the old bare delta (no numeric
+// index, no owning content_block_start). Defaults model a fresh stream:
+// nothing forwarded yet → synthesize message_start, block index 0.
+test("emitStreamError: anthropic errorShape=\"completion\" emits a full well-formed lifecycle (synthetic start + indexed block)", async () => {
     const { res, chunks } = makeCollector();
     emitStreamError(res, "anthropic", "boom", undefined, "completion");
     const out = Buffer.concat(chunks).toString("utf8");
-    assert.match(out, /content_block_delta/);
+    const order = [
+        "message_start",
+        "content_block_start",
+        "content_block_delta",
+        "content_block_stop",
+        "message_delta",
+        "message_stop",
+    ];
+    let cursor = -1;
+    for (const ev of order) {
+        const at = out.indexOf(`event: ${ev}`);
+        assert.notEqual(at, -1, `missing event ${ev}`);
+        assert.ok(at > cursor, `${ev} out of order`);
+        cursor = at;
+    }
+    // Every block-scoped frame carries the same NUMERIC index — the exact
+    // field ZCode's validator failed on before the fix.
+    const frames = parseFrames(out);
+    const blockFrames = frames.filter((f) => f["type"] === "content_block_start" || f["type"] === "content_block_delta" || f["type"] === "content_block_stop");
+    assert.equal(blockFrames.length, 3);
+    for (const f of blockFrames) {
+        assert.equal(typeof f["index"], "number");
+        assert.equal(f["index"], 0);
+    }
+    assert.deepEqual(blockFrames[0], { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
+    assert.deepEqual(blockFrames[1], { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "\n❌ [ACP] stream error: boom" } });
+    assert.deepEqual(blockFrames[2], { type: "content_block_stop", index: 0 });
+    const md = frames.find((f) => f["type"] === "message_delta");
+    assert.deepEqual(md, { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0 } });
+});
+
+test("emitStreamError: anthropic completion honors caller-known stream state (mid-stream index, no re-start)", async () => {
+    const { res, chunks } = makeCollector();
+    emitStreamError(res, "anthropic", "boom", undefined, "completion", { blockIndex: 2, messageStarted: true });
+    const out = Buffer.concat(chunks).toString("utf8");
+    // The client already saw message_start and two blocks: no synthetic start,
+    // and the error block lands at the next free index (2), not 0.
+    assert.doesNotMatch(out, /event: message_start/);
+    const frames = parseFrames(out);
+    const blockFrames = frames.filter((f) => String(f["type"]).startsWith("content_block"));
+    assert.equal(blockFrames.length, 3);
+    for (const f of blockFrames) assert.equal(f["index"], 2);
     assert.match(out, /boom/);
     assert.match(out, /message_stop/);
 });

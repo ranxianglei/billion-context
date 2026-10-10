@@ -56,10 +56,19 @@ function nativeErrorChunk(protocol: Protocol, message: string): string {
     return `event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "server_error", code: "stream_error", message } })}\n\n`;
 }
 
+/** #2689: caller-known state of the anthropic stream a legacy completion
+ *  chunk lands in — `blockIndex` is the next free content-block index (the
+ *  caller already forwarded that many blocks to the client), `messageStarted`
+ *  whether the client already received the message_start that owns them. */
+interface LegacyAnthropicState {
+    blockIndex?: number;
+    messageStarted?: boolean;
+}
+
 // Legacy shapes (#1455 opt-out via compat.streamErrorShape="completion"): the
 // failure text delivered INSIDE a successful completion. Kept for hosts whose
 // SDK cannot surface an in-band error event.
-function legacyCompletionChunk(protocol: Protocol, visible: string): string {
+function legacyCompletionChunk(protocol: Protocol, visible: string, state?: LegacyAnthropicState): string {
     if (protocol === "openai") {
         return `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: visible }, finish_reason: null }] })}\n\n` +
             `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n` +
@@ -84,17 +93,33 @@ function legacyCompletionChunk(protocol: Protocol, visible: string): string {
     if (protocol === "google") {
         return `data: ${JSON.stringify({ error: { code: 500, message: visible, status: "INTERNAL" } })}\n\n`;
     }
-    return `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", delta: { type: "text_delta", text: visible } })}\n\n` +
-        `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" } })}\n\n` +
-        `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`;
+    // #2689: strict clients validate the full Anthropic SSE lifecycle — the old
+    // bare delta had no numeric index and no owning block (orphan), so
+    // schema-validating hosts rejected the whole turn (ZCode). Mirror the
+    // compress-loop adapter's #413 pattern: synthesize message_start when the
+    // stream never began, then a complete text-block lifecycle at the caller's
+    // next free index (same shapes as buildSyntheticMessageStart/buildTextBlock).
+    const blockIndex = state?.blockIndex ?? 0;
+    const parts: string[] = [];
+    if (!state?.messageStarted) {
+        parts.push(`event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: `msg_acp_error_${Date.now()}`, type: "message", role: "assistant", content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } })}\n\n`);
+    }
+    parts.push(
+        `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: blockIndex, content_block: { type: "text", text: "" } })}\n\n` +
+        `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: blockIndex, delta: { type: "text_delta", text: visible } })}\n\n` +
+        `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: blockIndex })}\n\n` +
+        `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0 } })}\n\n` +
+        `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+    );
+    return parts.join("");
 }
 
-export function emitStreamError(res: http.ServerResponse, protocol: Protocol, message: string, log?: (msg: string) => void, errorShape: "protocol" | "completion" = "protocol"): void {
+export function emitStreamError(res: http.ServerResponse, protocol: Protocol, message: string, log?: (msg: string) => void, errorShape: "protocol" | "completion" = "protocol", state?: LegacyAnthropicState): void {
     const visible = `\n\u274C [ACP] stream error: ${message}`;
     log?.(`[acp-proxy: stream aborted mid-response: ${message}]`);
     const chunk = errorShape === "protocol"
         ? nativeErrorChunk(protocol, `[acp-proxy: ${message}]`)
-        : legacyCompletionChunk(protocol, visible);
+        : legacyCompletionChunk(protocol, visible, state);
     try {
         safeWrite(res, chunk);
     } catch {
