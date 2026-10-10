@@ -5,7 +5,7 @@
 // source of truth), (3) forwards tool executes, (4) reads status. Same
 // package as the proxy ⇒ same version ⇒ no kernel-skew bug class.
 
-import { envMillis } from "./native-bootstrap.js";
+import { envMillis, resolveToolTimeoutMs } from "./native-bootstrap.js";
 
 export type ManifestTool = {
     name: string;
@@ -14,7 +14,11 @@ export type ManifestTool = {
 };
 
 const MANIFEST_TIMEOUT_MS = 5000;
-const TOOL_TIMEOUT_MS = 60000;
+// Tool-lane budget (see native-bootstrap.ts): compress folds can legitimately
+// run minutes (external-summary budget 300s total), so the old hardcoded 60s
+// killed slow-but-healthy folds client-side while the proxy kept working.
+// BILI_TOOL_TIMEOUT_MS overrides; finite positive wins, else the default.
+const TOOL_TIMEOUT_MS = resolveToolTimeoutMs(process.env);
 const STATUS_TIMEOUT_MS = 5000;
 const ATTACH_HEALTH_DEADLINE_MS = 15000;
 const ATTACH_HEALTH_POLL_MS = 250;

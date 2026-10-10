@@ -26,6 +26,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { isPidAlive, isProxyInstanceFile, readProxyInstanceFile } from "./instance.js";
+import { resolveToolTimeoutMs } from "./agent/native-bootstrap.js";
 
 const VERSION = (() => {
     try {
@@ -73,7 +74,7 @@ export function resolveProxyOrigin(): string {
     return DEFAULT_PROXY_ORIGIN;
 }
 
-const TOOL_TIMEOUT_MS = 60_000;
+const TOOL_TIMEOUT_MS = resolveToolTimeoutMs(process.env); // shared knob with the pi shim — see agent/native-bootstrap.ts
 const CONVERSATION_FROM_ENV = process.env.CLAUDE_CODE_SESSION_ID?.trim() || process.env.BILI_CONVERSATION_ID?.trim() || undefined;
 const IDENTITY_BINDING = Boolean(process.env.CLAUDE_CODE_SESSION_ID?.trim());
 // #656: hosts that resume a session (claude --resume forks a NEW session id)
