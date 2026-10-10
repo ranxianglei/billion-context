@@ -5,8 +5,10 @@
  * process so the new version actually takes over.
  *
  * Gated by --auto-restart-on-update / ACP_AUTO_RESTART_ON_UPDATE /
- * "autoRestartOnUpdate" in the config file — default OFF, where behavior stays
- * exactly the #808 warn-once reminder.
+ * "autoRestartOnUpdate" in the config file. Default is lane-aware (#2507): ON
+ * for host-spawned resident proxies (BILI_LAUNCHER_LANE set), OFF for manual
+ * `bili start` (#811) — where behavior stays exactly the #808 warn-once
+ * reminder. Resolution: src/config.ts resolveAutoRestartOnUpdate.
  *
  * Safety gates, all applied before the listener is touched:
  *  - zero in-flight requests (session inFlight counters) at decision time AND

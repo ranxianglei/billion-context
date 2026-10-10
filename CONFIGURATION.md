@@ -160,7 +160,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | Key | Type | Default | Env | Description |
 |-----|------|---------|-----|-------------|
 | `autoUpdate` | boolean | true | ACP_AUTO_UPDATE | Automatic npm version checks (every ~3 min); disable via ACP_AUTO_UPDATE=0 or --no-auto-update. |
-| `autoRestartOnUpdate` | boolean | false | ACP_AUTO_RESTART_ON_UPDATE | Restart the daemon automatically once a newer version has been installed. |
+| `autoRestartOnUpdate` | boolean | false (manual start) / true (host-spawned lane proxy, #2507) | ACP_AUTO_RESTART_ON_UPDATE | Restart the daemon automatically once a newer version has been installed. Default ON for host-spawned resident proxies (their host never restarts); OFF for a manual bili start. |
 | `updateTag` | string | latest | ACP_UPDATE_TAG | npm dist-tag channel for self-updates: latest (default), dev, or pr. |
 | `update` | object | {} (all defaults) | — | Self-update channel settings. |
 | `update.registry` | string | "npmjs" (registry.npmjs.org) | BILI_UPDATE_REGISTRY | Custom npm registry base URL for self-updates (private mirrors). |
@@ -582,9 +582,9 @@ Top-level keys that control how the proxy listens and behaves globally.
 ### `autoRestartOnUpdate`
 
 - **Type:** `boolean`
-- **Default:** `false`
+- **Default:** lane-aware (#2507): `true` for host-spawned resident proxies (every dsh/opencode/pi/... native or launcher lane stamps `BILI_LAUNCHER_LANE` on its proxy child), `false` for manual `bili start` (#811)
 - **Status:** ACTIVE
-- **Description:** Opt-in self-restart after an auto-update install (#811): requires zero in-flight requests, passes an install sanity check, and honors a 10-minute cooldown marker; on failure the original listener resumes. Enabled by `ACP_AUTO_RESTART_ON_UPDATE=1` (any non-`0` value).
+- **Description:** Self-restart after an auto-update install (#811): requires zero in-flight requests, passes an install sanity check, and honors a 10-minute cooldown marker; on failure the original listener resumes. The lane-aware default exists because a resident host never restarts on its own — without self-activation an auto-update installs files that never take effect (#2507). Explicit values always win: `"autoRestartOnUpdate": false` / `ACP_AUTO_RESTART_ON_UPDATE=0` disable it anywhere; `true` / any non-`0` env value enable it anywhere.
 
 ### `updateTag`
 
@@ -1569,7 +1569,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 <!-- bili:gen env-map -->
 | Env var | Config key | Default |
 |---------|------------|--------|
-| `ACP_AUTO_RESTART_ON_UPDATE` | `autoRestartOnUpdate` | false |
+| `ACP_AUTO_RESTART_ON_UPDATE` | `autoRestartOnUpdate` | false (manual start) / true (host-spawned lane proxy, #2507) |
 | `ACP_AUTO_UPDATE` | `autoUpdate` | true |
 | `ACP_COMPRESS_NUDGE` | `compress.injectNudge` | true |
 | `ACP_COMPRESS_PROTOCOL` | `diagnostics.compressProtocol` | "tools" |
@@ -1689,7 +1689,7 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `ACP_UPSTREAM` | Override the default upstream base URL. |
 | `ACP_LOG` | Set to `0` to disable request logging. |
 | `ACP_AUTO_UPDATE` | Set to `0` to disable auto-update checks. File-config key: `autoUpdate`. |
-| `ACP_AUTO_RESTART_ON_UPDATE` | Set to `1` (any non-`0` value) to enable self-restart after an auto-update install (#811): the restart requires zero in-flight requests, passes an install sanity check, honors a 10-minute cooldown marker, and resumes the original listener on failure. File-config key: `autoRestartOnUpdate`. |
+| `ACP_AUTO_RESTART_ON_UPDATE` | Set to `1` (any non-`0` value) to enable self-restart after an auto-update install (#811): the restart requires zero in-flight requests, passes an install sanity check, honors a 10-minute cooldown marker, and resumes the original listener on failure. File-config key: `autoRestartOnUpdate`. Default when unset: OFF for manual `bili start`, ON for host-spawned resident proxies (`BILI_LAUNCHER_LANE`) since their host never restarts (#2507). |
 | `ACP_UPDATE_TAG` | Dist-tag channel the auto-updater follows (default `latest`, e.g. `dev`). File-config key: `updateTag`. The rolling `pr` tag tracks the newest PR test build across all PRs; legacy per-PR `pr-N` tags are frozen at that PR's last build and are only followed when explicitly configured. The rolling `master` tag tracks the newest build merged to master — every non-release merge publishes one (#2049); set it to follow merged-but-unreleased state. |
 | `BILI_UPDATE_REGISTRY` | Base URL override for the npm registry used by the auto-updater and `bili update` (default `https://registry.npmjs.org`). Intended for hermetic testing against a loopback registry (the verdaccio instance in the `ACP_TEST_REGISTRY` e2e suite); leave unset in production (#1153). |
 | `BILI_UPDATE_CHECK_INTERVAL_MS` | Auto-update check period in milliseconds (default `180000`, i.e. 3 minutes; values ≤ 0 are ignored and the default applies). Shortened by the hermetic e2e suite so it never waits a full cycle (#1153). |

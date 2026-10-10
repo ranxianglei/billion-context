@@ -160,7 +160,7 @@
 | Key | Type | Default | Env | Description |
 |-----|------|---------|-----|-------------|
 | `autoUpdate` | boolean | true | ACP_AUTO_UPDATE | 自动 npm 版本检查（约每 3 分钟）；ACP_AUTO_UPDATE=0 或 --no-auto-update 关闭。 |
-| `autoRestartOnUpdate` | boolean | false | ACP_AUTO_RESTART_ON_UPDATE | 新版本装好后自动重启守护进程。 |
+| `autoRestartOnUpdate` | boolean | false (manual start) / true (host-spawned lane proxy, #2507) | ACP_AUTO_RESTART_ON_UPDATE | 新版本装好后自动重启守护进程。宿主拉起的常驻代理默认开启（宿主自身永不重启）；手动 bili start 默认关闭。 |
 | `updateTag` | string | latest | ACP_UPDATE_TAG | 自更新的 npm dist-tag 通道：latest（默认）、dev 或 pr。 |
 | `update` | object | {} (all defaults) | — | 自更新通道设置。 |
 | `update.registry` | string | "npmjs" (registry.npmjs.org) | BILI_UPDATE_REGISTRY | 自更新用的自定义 npm registry 基础地址（私有镜像）。 |
@@ -582,9 +582,9 @@
 ### `autoRestartOnUpdate`
 
 - **类型：** `boolean`
-- **默认值：** `false`
+- **默认值：** lane 感知（#2507）：宿主拉起的常驻代理为 `true`（所有 dsh/opencode/pi/... 原生或 launcher lane 都会给代理子进程打上 `BILI_LAUNCHER_LANE`），手动 `bili start` 为 `false`（#811）
 - **状态：** ACTIVE
-- **说明：** 自动更新安装后的 opt-in 自我重启（#811）：要求零在途请求、通过安装自检、遵守 10 分钟冷却标记；失败时恢复原监听器。`ACP_AUTO_RESTART_ON_UPDATE=1`（任意非 `0` 值）开启。
+- **说明：** 自动更新安装后的自我重启（#811）：要求零在途请求、通过安装自检、遵守 10 分钟冷却标记；失败时恢复原监听器。lane 感知默认值的存在是因为常驻宿主自身永不重启——没有自我激活，自动更新装下的文件永远不生效（#2507）。显式取值始终优先：`"autoRestartOnUpdate": false` / `ACP_AUTO_RESTART_ON_UPDATE=0` 在任何场景下关闭；`true` / 任意非 `0` 环境变量值在任何场景下开启。
 
 ### `updateTag`
 
@@ -1568,7 +1568,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 <!-- bili:gen env-map -->
 | 环境变量 | 配置文件键 | 默认值 |
 |---------|------------|--------|
-| `ACP_AUTO_RESTART_ON_UPDATE` | `autoRestartOnUpdate` | false |
+| `ACP_AUTO_RESTART_ON_UPDATE` | `autoRestartOnUpdate` | false (manual start) / true (host-spawned lane proxy, #2507) |
 | `ACP_AUTO_UPDATE` | `autoUpdate` | true |
 | `ACP_COMPRESS_NUDGE` | `compress.injectNudge` | true |
 | `ACP_COMPRESS_PROTOCOL` | `diagnostics.compressProtocol` | "tools" |
@@ -1687,7 +1687,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `ACP_UPSTREAM` | 覆盖默认上游 base URL。 |
 | `ACP_LOG` | 设为 `0` 关闭请求日志。 |
 | `ACP_AUTO_UPDATE` | 设为 `0` 禁用自动更新检查。文件配置键：`autoUpdate`。 |
-| `ACP_AUTO_RESTART_ON_UPDATE` | 设为 `1`（任意非 `0` 值）启用自动更新安装后的自我重启（#811）：重启要求零在途请求、通过安装自检、遵守 10 分钟冷却标记，失败时恢复原监听器。文件配置键：`autoRestartOnUpdate`。 |
+| `ACP_AUTO_RESTART_ON_UPDATE` | 设为 `1`（任意非 `0` 值）启用自动更新安装后的自我重启（#811）：重启要求零在途请求、通过安装自检、遵守 10 分钟冷却标记，失败时恢复原监听器。文件配置键：`autoRestartOnUpdate`。未设置时的默认值：手动 `bili start` 为 OFF，宿主拉起的常驻代理（`BILI_LAUNCHER_LANE`）为 ON——因为其宿主自身永不重启（#2507）。 |
 | `ACP_UPDATE_TAG` | 自动更新跟随的 dist-tag 通道（默认 `latest`，如 `dev`）。文件配置键：`updateTag`。滚动 `pr` tag 指向所有 PR 中最新的测试构建；旧版按 PR 划分的 `pr-N` tag 已冻结在该 PR 的最后一个构建，仅在显式配置时才会被跟随。滚动 `master` tag 指向最新合入 master 的构建——每次非 release 合并都会发布一个（#2049）；设置它即可跟随已合并但未正式发布的状态。 |
 | `BILI_UPDATE_REGISTRY` | 自动更新与 `bili update` 使用的 npm registry base URL 覆盖（默认 `https://registry.npmjs.org`）。仅供 hermetic 测试指向回环 registry（`ACP_TEST_REGISTRY` e2e 套件自带的 verdaccio 实例）；生产环境请勿设置（#1153）。 |
 | `BILI_UPDATE_CHECK_INTERVAL_MS` | 自动更新检查周期（毫秒，默认 `180000` 即 3 分钟；≤ 0 的值被忽略，回退默认）。hermetic e2e 套件用它缩短周期，避免等待完整间隔（#1153）。 |
